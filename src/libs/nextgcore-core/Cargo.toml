@@ -13,6 +13,7 @@ thiserror.workspace = true
 # format the four NFs that already had one all used.
 serde_json.workspace = true
 serde_yaml.workspace = true
+serde.workspace = true
 bytes.workspace = true
 bitflags.workspace = true
 libc.workspace = true

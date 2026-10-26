@@ -43,7 +43,7 @@ That is the complete list — no other YAML field influences the daemon.
 Every other field in the shipped example file is decorative; since the file is only probed for `sbi.oauth2.require`, all other keys are silently ignored:
 
 - **`logger.level` is read.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691).
-- **`dccf.sbi.server[]` (address/advertise/port) is inert.** The SBI bind address and port come from `--sbi-addr`/`--sbi-port`; the docker deployment passes them on the command line.
+- **`dccf.sbi.server[0]` is read (#1312).** The SBI bind is `--sbi-addr`/`--sbi-port`, else `address`/`port` here, else `127.0.0.1` and the default port. The advertised host is `--sbi-advertise`, else `NEXTGCORE_SBI_ADVERTISE`, else `advertise` here, else the bind address when it is not a wildcard; it is used in the NRF registration (`ipv4Addresses`, service `ipEndPoints`). A wildcard is never advertised: with a wildcard bind and nothing set to advertise, the NF does not register and logs why. A config that does not parse fails startup (#1313).
 - **`dccf.nrf.uri` is inert.** The NRF URI comes exclusively from `--nrf-uri` (default `http://127.0.0.1:7777`); the docker deployment passes `--nrf-uri http://172.23.0.10:7777` explicitly.
 - **`dccf.max_subscriptions` is inert.** The subscription cap comes from `--max-subscriptions`; the YAML value `4096` merely mirrors the CLI default.
 
@@ -57,7 +57,8 @@ From the clap `Args` struct in `src/bins/nextgcore-dccfd/src/main.rs`:
 | `-l, --log-file` | path | unset | **Parsed but unused** — declared in `Args` yet never referenced by the binary; logging goes to stderr via `env_logger`. |
 | `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-m, --no-color` | flag | off | **Parsed but unused** — declared in `Args` yet never referenced by the binary. |
-| `--sbi-addr` | string | `127.0.0.1` (loopback, #1308) | SBI server bind address; also advertised as the NF's `ipv4Addresses` in the NRF registration. |
+| `--sbi-addr` | string | `dccf.sbi.server[0].address`, else `127.0.0.1` (#1308) | SBI server bind address; beats the YAML (#1312). |
+| `--sbi-advertise` | string | unset | The advertised SBI host (#1312); then `NEXTGCORE_SBI_ADVERTISE`, then `dccf.sbi.server[0].advertise`, then the bind address when it is not a wildcard. |
 | `--sbi-port` | u16 | `7816` | SBI server port ("TS 29.574 default: 7816" per code comment); docker deployments pass `7777`. |
 | `--tls` | flag | off | Enable TLS on the SBI server. Takes effect only if **both** `--tls-cert` and `--tls-key` are also given; otherwise it is silently ignored. |
 | `--tls-cert` | path | unset | TLS certificate file (no built-in default path). |

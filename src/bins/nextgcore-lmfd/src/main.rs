@@ -73,6 +73,12 @@ struct Args {
     #[arg(long)]
     sbi_addr: Option<String>,
 
+    /// The SBI host advertised in the NRF NFProfile and callback URIs. Without it,
+    /// `NEXTGCORE_SBI_ADVERTISE`, else `lmf.sbi.server[0].advertise`, else the
+    /// bind address; a wildcard is never advertised (#1312).
+    #[arg(long)]
+    sbi_advertise: Option<String>,
+
     #[arg(long)]
     sbi_port: Option<u16>,
 
@@ -223,15 +229,16 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     // #1312: the command line, else `lmf.sbi.server[0]` in the config file,
     // else loopback.
-    let (sbi_addr, sbi_port) = nextgcore_core::sockaddr::resolve_listen(
+    let sbi = nextgcore_core::sockaddr::SbiEndpoint::resolve_from_file(
         args.sbi_addr.as_deref(),
         args.sbi_port,
+        args.sbi_advertise.as_deref(),
         &args.config,
         "lmf",
-        "sbi",
         7816,
     )
     .map_err(|e| anyhow::anyhow!("SBI listen address: {e}"))?;
+    let (sbi_addr, sbi_port) = (sbi.host.clone(), sbi.port);
     init_logging(&nextgcore_core::log::nf_log_level(
         args.log_level.as_deref(),
         Some(&args.config),
@@ -307,13 +314,11 @@ async fn main() -> Result<()> {
 
     // A2: advertise our identity + notify-callback base for the outbound
     // Namf_Communication leg (subscription callback URIs must be reachable
-    // by the AMF, so an unspecified bind address falls back to loopback).
+    // by the AMF, so they use the advertised host, #1312).
     {
-        let advertised_host = if sbi_addr == "0.0.0.0" {
-            "127.0.0.1"
-        } else {
-            sbi_addr.as_str()
-        };
+        // #1312: the advertised host; loopback only when the SBI binds a
+        // wildcard and nothing reachable is configured.
+        let advertised_host = sbi.advertise.as_deref().unwrap_or("127.0.0.1");
         if let Ok(context) = lmf_self().read() {
             context.set_nf_instance_id(nf_instance_id.clone());
             context.set_callback_base(format!(
@@ -357,7 +362,10 @@ async fn main() -> Result<()> {
     // Register with NRF
     let sbi_ctx = global_context();
     sbi_ctx.set_nrf_uri(&args.nrf_uri).await;
-    if let Err(e) = register_with_nrf(&sbi_addr, sbi_port, &nf_instance_id).await {
+    if let Err(e) = match sbi.registration_host() {
+        Ok(host) => register_with_nrf(host, sbi_port, &nf_instance_id).await,
+        Err(why) => Err(why),
+    } {
         log::warn!("NRF registration failed (will operate without NRF): {e}");
     } else {
         // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat

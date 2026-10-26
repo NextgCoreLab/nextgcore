@@ -613,6 +613,256 @@ pub fn resolve_listen(
     Ok((host, cli_port.or(yaml_port).unwrap_or(default_port)))
 }
 
+/// The environment variable naming the SBI host an NF advertises: in its NRF
+/// NFProfile and its callback URIs (#1312). `--sbi-advertise` wins over it.
+pub const SBI_ADVERTISE_ENV: &str = "NEXTGCORE_SBI_ADVERTISE";
+
+/// Whether `host` is an unspecified address (`0.0.0.0`, `::`): bindable, but no
+/// peer can reach it, so it is never advertised.
+pub fn is_wildcard_host(host: &str) -> bool {
+    parse_listen_addr(host, 0).is_ok_and(|a| a.ip().is_unspecified())
+}
+
+/// An SBI listener and what it advertises (#1312).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SbiEndpoint {
+    /// The host the server binds.
+    pub host: String,
+    /// The port it binds, and advertises.
+    pub port: u16,
+    /// The host it registers with the NRF and puts in its callback URIs. `None`
+    /// when the only candidate was a wildcard: nothing reachable to advertise.
+    pub advertise: Option<String>,
+}
+
+impl SbiEndpoint {
+    /// Resolve, field by field:
+    /// - bind host and port: the command line, else the YAML `server[0]`, else
+    ///   [`DEFAULT_LISTEN_HOST`] / `default_port` (#1308, #1311);
+    /// - advertise: `--sbi-advertise`, else [`SBI_ADVERTISE_ENV`], else the YAML
+    ///   `advertise`, else the bind host. A wildcard is skipped at every step.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve(
+        cli_host: Option<&str>,
+        cli_port: Option<u16>,
+        cli_advertise: Option<&str>,
+        yaml_host: Option<&str>,
+        yaml_port: Option<u16>,
+        yaml_advertise: Option<&str>,
+        default_port: u16,
+    ) -> Self {
+        let env = std::env::var(SBI_ADVERTISE_ENV).ok();
+        Self::resolve_with_env(
+            cli_host,
+            cli_port,
+            cli_advertise,
+            env.as_deref(),
+            yaml_host,
+            yaml_port,
+            yaml_advertise,
+            default_port,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_with_env(
+        cli_host: Option<&str>,
+        cli_port: Option<u16>,
+        cli_advertise: Option<&str>,
+        env_advertise: Option<&str>,
+        yaml_host: Option<&str>,
+        yaml_port: Option<u16>,
+        yaml_advertise: Option<&str>,
+        default_port: u16,
+    ) -> Self {
+        let host = cli_host
+            .or(yaml_host)
+            .unwrap_or(DEFAULT_LISTEN_HOST)
+            .to_string();
+        let port = cli_port.or(yaml_port).unwrap_or(default_port);
+        let advertise = [
+            cli_advertise,
+            env_advertise,
+            yaml_advertise,
+            Some(host.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|h| !h.is_empty() && !is_wildcard_host(h))
+        .map(str::to_string);
+        Self {
+            host,
+            port,
+            advertise,
+        }
+    }
+
+    /// As [`resolve`](Self::resolve), with the YAML `<section>.sbi.server[0]` read
+    /// from `config_path` (no file is no config; one that does not parse is an
+    /// error, #1313 review).
+    pub fn resolve_from_file(
+        cli_host: Option<&str>,
+        cli_port: Option<u16>,
+        cli_advertise: Option<&str>,
+        config_path: &str,
+        section: &str,
+        default_port: u16,
+    ) -> Result<Self, ListenAddrError> {
+        let entry = match std::fs::read_to_string(config_path) {
+            Ok(text) => yaml_server_entry(&text, section, "sbi")
+                .map_err(|e| ListenAddrError(format!("{config_path}: {}", e.0)))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => YamlServer::default(),
+            Err(e) => return Err(ListenAddrError(format!("{config_path}: {e}"))),
+        };
+        Ok(Self::resolve(
+            cli_host,
+            cli_port,
+            cli_advertise,
+            entry.address.as_deref(),
+            entry.port,
+            entry.advertise.as_deref(),
+            default_port,
+        ))
+    }
+
+    /// The host to register with the NRF: the advertised one, or why there is none.
+    pub fn registration_host(&self) -> Result<&str, String> {
+        self.advertise.as_deref().ok_or_else(|| {
+            format!(
+                "not registering with the NRF: the SBI binds the wildcard {} and nothing \
+                 reachable is configured to advertise; set --sbi-advertise, {SBI_ADVERTISE_ENV} \
+                 or sbi.server[0].advertise",
+                self.host
+            )
+        })
+    }
+}
+
+/// A YAML `server[0]` entry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct YamlServer {
+    pub address: Option<String>,
+    pub port: Option<u16>,
+    pub advertise: Option<String>,
+}
+
+/// The first `<section>.<iface>.server[]` entry of the YAML config `text`, with
+/// its `advertise` (#1312). YAML that does not parse is an error.
+pub fn yaml_server_entry(
+    text: &str,
+    section: &str,
+    iface: &str,
+) -> Result<YamlServer, ListenAddrError> {
+    let doc = serde_yaml::from_str::<serde_yaml::Value>(text)
+        .map_err(|e| ListenAddrError(format!("config does not parse as YAML: {e}")))?;
+    let entry = &doc[section][iface]["server"][0];
+    Ok(YamlServer {
+        address: entry["address"].as_str().map(str::to_string),
+        port: entry["port"].as_u64().and_then(|p| u16::try_from(p).ok()),
+        advertise: entry["advertise"].as_str().map(str::to_string),
+    })
+}
+
+#[cfg(test)]
+mod tests_sbi_endpoint {
+    use super::SbiEndpoint;
+
+    fn r(
+        cli: Option<&str>,
+        adv: Option<&str>,
+        env: Option<&str>,
+        yaml: Option<&str>,
+        yaml_adv: Option<&str>,
+    ) -> SbiEndpoint {
+        SbiEndpoint::resolve_with_env(cli, None, adv, env, yaml, Some(7788), yaml_adv, 7777)
+    }
+
+    #[test]
+    fn bind_cli_then_yaml_then_loopback() {
+        assert_eq!(r(None, None, None, None, None).host, "127.0.0.1");
+        assert_eq!(r(None, None, None, Some("10.0.0.1"), None).host, "10.0.0.1");
+        assert_eq!(
+            r(Some("0.0.0.0"), None, None, Some("10.0.0.1"), None).host,
+            "0.0.0.0"
+        );
+        assert_eq!(r(None, None, None, None, None).port, 7788);
+    }
+
+    #[test]
+    fn advertise_flag_then_env_then_yaml_then_bind_never_a_wildcard() {
+        let adv = |e: SbiEndpoint| e.advertise;
+        assert_eq!(
+            adv(r(Some("0.0.0.0"), Some("a"), Some("b"), None, Some("c"))),
+            Some("a".into())
+        );
+        assert_eq!(
+            adv(r(Some("0.0.0.0"), None, Some("b"), None, Some("c"))),
+            Some("b".into())
+        );
+        assert_eq!(
+            adv(r(Some("0.0.0.0"), None, None, None, Some("c"))),
+            Some("c".into())
+        );
+        assert_eq!(
+            adv(r(Some("10.0.0.5"), None, None, None, None)),
+            Some("10.0.0.5".into())
+        );
+        assert_eq!(
+            adv(r(Some("0.0.0.0"), None, None, None, None)),
+            None,
+            "a wildcard bind"
+        );
+        assert_eq!(
+            adv(r(Some("::"), Some("0.0.0.0"), Some(""), None, Some("[::]"))),
+            None
+        );
+        let e = r(Some("0.0.0.0"), None, None, None, None);
+        assert!(e
+            .registration_host()
+            .unwrap_err()
+            .contains("not registering"));
+        assert_eq!(
+            r(Some("10.0.0.5"), None, None, None, None).registration_host(),
+            Ok("10.0.0.5")
+        );
+    }
+    /// The YAML `advertise` is read from the file; a file that does not parse is an
+    /// error, and no file is no config.
+    #[test]
+    fn resolve_from_file_reads_the_yaml_advertise() {
+        let dir = std::env::temp_dir().join(format!("sbi-endpoint-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nf.yaml");
+        std::fs::write(
+            &path,
+            "pcf:\n  sbi:\n    server:\n      - address: 0.0.0.0\n        port: 7900\n        advertise: pcf.example\n",
+        )
+        .unwrap();
+        let p = path.to_str().unwrap();
+        let e =
+            SbiEndpoint::resolve_from_file(None, None, Some("10.9.9.9"), p, "pcf", 7777).unwrap();
+        assert_eq!((e.host.as_str(), e.port), ("0.0.0.0", 7900));
+        assert_eq!(
+            e.registration_host(),
+            Ok("10.9.9.9"),
+            "the flag beats the YAML"
+        );
+        let e = SbiEndpoint::resolve_from_file(Some("127.0.0.1"), Some(1), None, p, "pcf", 7777)
+            .unwrap();
+        assert_eq!(
+            (e.host.as_str(), e.port),
+            ("127.0.0.1", 1),
+            "the flags beat the YAML"
+        );
+        let e = SbiEndpoint::resolve_from_file(None, None, None, "/nonexistent.yaml", "pcf", 7777)
+            .unwrap();
+        assert_eq!((e.host.as_str(), e.port), ("127.0.0.1", 7777));
+        std::fs::write(&path, "pcf:\n  sbi: [\n").unwrap();
+        assert!(SbiEndpoint::resolve_from_file(None, None, None, p, "pcf", 7777).is_err());
+    }
+}
+
 #[cfg(test)]
 mod tests_resolve_listen {
     use super::{resolve_listen, yaml_listen_server};

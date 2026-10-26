@@ -82,7 +82,7 @@ All keys live under `mme:`. Every field is optional.
 | `time.t3402.value` / `t3412.value` / `t3423.value` | u64 (s) | built-in | EMM timers signalled to the UE. |
 | `overload.max_ue` | usize | `0` (off) | Above this many attached UEs the MME sends S1AP OVERLOAD START to every eNB, and OVERLOAD STOP when the count falls to 90% of it (TS 36.413 §8.7.6). |
 
-Not read: `logger.*`, `global.max.*`, `mme.metrics.server`.
+Not read: `logger.*`, `global.max.*`. There is no `mme.metrics.server` (removed from the shipped config, #1312): the metrics endpoint is `MME_METRICS_ADDR` / `NEXTGCORE_METRICS_BIND`.
 
 ## Command-line flags
 

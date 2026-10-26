@@ -46,7 +46,7 @@ Because parsing is a stub, **every** field in the shipped example file is inert:
 - **`logger.level` is read; `logger.file.path` is inert.** Logging goes to stderr via `env_logger`. The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691). The `-l/--log-file` flag is also accepted but never used.
 - **`global.max.ue` / `global.max.peer` are inert.** The only session limit is the `--max-sess` flag (and even that is stored, not enforced — see Behavior notes).
 - **`pcrf.freeDiameter` is inert.** Neither the YAML pointer (`/etc/freeDiameter/pcrf.conf`) nor the CLI default (`--diameter-config /etc/nextgcore/freeDiameter/pcrf.conf`) is ever opened. The shipped `docker/rust/configs/epc/freeDiameter/pcrf.conf` (Identity `pcrf.localdomain`, Realm `localdomain`, `ListenOn 172.24.0.9`, `ConnectPeer smf.localdomain`) is mounted into the container but ignored; the daemon's actual identity/realm/listen address come from `--diameter-id`/`--diameter-realm`/`--diameter-addr`, whose defaults happen to match the conf's Identity/Realm. The PCRF never dials out to peers (`ConnectPeer` has no equivalent): it only accepts inbound connections.
-- **`pcrf.metrics.server[]` (address/port) is inert.** No Prometheus/metrics HTTP server is started by this binary; the only telemetry is the optional OTLP trace exporter (env var, see below).
+- **No `pcrf.metrics.server[]`** (removed from the shipped config, #1312): no Prometheus/metrics HTTP server is started by this binary; the only telemetry is the optional OTLP trace exporter (env var, see below).
 
 ## Command-line flags
 

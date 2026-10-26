@@ -104,5 +104,5 @@ Defaults below are the real clap `default_value`s from the source.
 | `upf.pfcp.server` | Ignored — use `--pfcp-addr` / `--pfcp-port`. |
 | `upf.gtpu.server` | Ignored — use `--gtpu-addr` / `--gtpu-port`. |
 | `upf.session` | Ignored — use `--tun-ifname` / `--tun-ip` / `--tun-prefix` (single IPv4 subnet only via CLI; the YAML's IPv6 entry has no CLI equivalent). |
-| `upf.metrics.server` | Ignored — use `UPF_METRICS_PORT`. |
+| `upf.metrics.server` | Not read, and removed from the shipped config (#1312): use `UPF_METRICS_PORT`. |
 | `upf.tls.*` | Ignored. The file's comment names `TLS_ENABLED` / `SBI_SCHEME`, but no code reads them; the UPF serves no SBI listener (it is only an NRF client when `--nrf-uri` is set). |

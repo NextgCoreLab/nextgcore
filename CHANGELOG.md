@@ -40,6 +40,22 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   nwdafd and pind. A missing file is still no configuration (#1312, #1313 review).
 - dccfd, eesd, lmfd, mbsmfd, nsacfd, nwdafd and pind bind `<nf>.sbi.server[0]` from their YAML
   when `--sbi-addr` / `--sbi-port` are not given; the flags still win (#1312).
+- **ausfd, bsfd, nssfd, pcfd, udmd and udrd: `--sbi-addr` / `--sbi-port` now beat
+  `<nf>.sbi.server[0]`**, which used to override them; the order is the flags, then the YAML,
+  then `127.0.0.1` (#1312). No shipped deployment passes the flags, so none changes its bind.
+- The SBI host registered with the NRF and put in callback URIs is set apart from the bind
+  (#1312): `--sbi-advertise`, else `NEXTGCORE_SBI_ADVERTISE`, else `<nf>.sbi.server[0].advertise`,
+  else the bind address when it is not a wildcard. A wildcard is never advertised: an NF that
+  binds `0.0.0.0` or `::` with nothing to advertise does not register with the NRF, and logs
+  why. pcfd then also publishes no self identity, so it builds no callback URI, absolute
+  resourceUri or BSF PcfBinding endpoint on the wildcard (each is skipped). Applies to ausfd, bsfd, nssfd, pcfd, udmd, udrd, dccfd, lmfd, mbsmfd, nsacfd and nwdafd,
+  and to eesd's ECS registration. The k8s manifests, the EKS profiles (which build on them)
+  and the Helm chart set `NEXTGCORE_SBI_ADVERTISE` to the pod IP for the first six.
+- The inert `metrics.server` blocks are gone from the shipped configs and both ConfigMaps: no
+  daemon read them. The metrics listeners are set by environment variables, listed in
+  `docs-book/src/observability.md` (#1312).
+- The shipped-config parse tests also parse each NF config as the Helm chart renders it; CI
+  installs helm for them (#1312, #1317 review).
 - **mmed: S1-MME binds `127.0.0.1:36412` when `mme.s1ap.server` is unset**, where it bound the
   wildcard `0.0.0.0` (#1299). Break risk: a deployment that relied on the implicit wildcard
   (no `mme.s1ap.server`) no longer accepts eNBs from other hosts; it logs a warning and needs
@@ -260,8 +276,9 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   implicit wildcard must now set the address** to one of the host's private addresses (or
   `0.0.0.0`, knowingly):
   - SBI: `--sbi-addr` for ausfd, bsfd, dccfd, easdfd, eesd, lmfd, mbsmfd, nefd, nrfd, nsacfd,
-    nssfd, nwdafd, pcfd, pind, tsctsf, ucmfd, udmd and udrd (ausfd, bsfd, easdfd, nssfd, pcfd,
-    udmd and udrd also take `<nf>.sbi.server[0].address` from the config file; nrfd and the
+    nssfd, nwdafd, pcfd, pind, tsctsf, ucmfd, udmd and udrd (ausfd, bsfd, dccfd, easdfd, eesd,
+    lmfd, mbsmfd, nsacfd, nssfd, nwdafd, pcfd, pind, udmd and udrd also take
+    `<nf>.sbi.server[0].address` from the config file, after the flag (#1312); nrfd and the
     others do not), and `smf.sbi.server[0].address` for smfd. amfd (`AMF_SBI_ADDR`), scpd and
     seppd were loopback already and now warn as well.
   - amfd NGAP: `--ngap-addr` (`ip:port`). `amf.ngap.server` in the config file does not set it.

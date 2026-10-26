@@ -32,10 +32,6 @@ smf:
   gtpu:
     server:
       - address: 172.23.0.4
-  metrics:
-    server:
-      - address: 172.23.0.4
-        port: 9090
   session:
     - subnet: 10.45.0.0/16
       gateway: 10.45.0.1

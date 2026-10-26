@@ -130,7 +130,7 @@ Cargo features: `kernel-sctp` (enables `--sctp-backend kernel`; the Docker build
 - **PLMN flexibility:** `mcc`/`mnc` accept YAML strings or integers; a 2-digit MNC is encoded with the filler digit per standard PLMN encoding.
 - **Empty security lists:** if `security` is omitted, the integrity/ciphering preference lists in the AMF context stay empty; supply explicit orders (as in the example) for deterministic algorithm selection.
 - **Multiple NRF entries** in `sbi.client.nrf` are parsed but only the first is used — additional entries are currently inert.
-- There is no `amf.sbi.server` bind-address key in the typed config; the SBI address comes from `AMF_SBI_ADDR`/`AMF_SBI_PORT` and the NGAP address from `--ngap-addr`, not this YAML file. The `sbi.server`, `ngap.server` and `metrics.server` blocks in `docker/rust/configs/5gc/amf.yaml` are not read.
+- `amf.ngap.server[0]` and `amf.sbi.server[0]` are the NGAP and SBI listen addresses (#1311). `--ngap-addr` and `AMF_SBI_ADDR`/`AMF_SBI_PORT` override them; with neither, loopback (#1308). There is no `amf.metrics.server` (#1312).
 
 ## Unauthenticated emergency service
 

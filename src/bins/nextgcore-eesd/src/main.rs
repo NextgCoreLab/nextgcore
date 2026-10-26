@@ -191,6 +191,12 @@ struct Args {
     #[arg(long)]
     sbi_addr: Option<String>,
 
+    /// The SBI host advertised in the NRF NFProfile and callback URIs. Without it,
+    /// `NEXTGCORE_SBI_ADVERTISE`, else `ees.sbi.server[0].advertise`, else the
+    /// bind address; a wildcard is never advertised (#1312).
+    #[arg(long)]
+    sbi_advertise: Option<String>,
+
     /// SBI server port
     #[arg(long)]
     sbi_port: Option<u16>,
@@ -274,15 +280,16 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     // #1312: the command line, else `ees.sbi.server[0]` in the config file,
     // else loopback.
-    let (sbi_addr, sbi_port) = nextgcore_core::sockaddr::resolve_listen(
+    let sbi = nextgcore_core::sockaddr::SbiEndpoint::resolve_from_file(
         args.sbi_addr.as_deref(),
         args.sbi_port,
+        args.sbi_advertise.as_deref(),
         &args.config,
         "ees",
-        "sbi",
         7814,
     )
     .map_err(|e| anyhow::anyhow!("SBI listen address: {e}"))?;
+    let (sbi_addr, sbi_port) = (sbi.host.clone(), sbi.port);
 
     init_logging(&nextgcore_core::log::nf_log_level(
         args.log_level.as_deref(),
@@ -372,8 +379,20 @@ async fn main() -> Result<()> {
     // request is answered under a different setting from the next.
     ecs_role::init_from_env();
 
-    ecs_registration::start_ecs_registration(args.ecs_uri.as_deref(), &ees_id, &sbi_addr, sbi_port)
-        .await;
+    // #1312: the ECS gets the advertised host, never a wildcard.
+    match sbi.registration_host() {
+        Ok(host) => {
+            ecs_registration::start_ecs_registration(
+                args.ecs_uri.as_deref(),
+                &ees_id,
+                host,
+                sbi_port,
+            )
+            .await
+        }
+        Err(why) if args.ecs_uri.is_some() => log::error!("{why} (ECS registration skipped)"),
+        Err(_) => {}
+    }
 
     // eesd-12: drop lapsed EAS/EEC registrations on a periodic schedule.
     spawn_lifecycle_sweep();

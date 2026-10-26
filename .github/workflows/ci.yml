@@ -66,8 +66,13 @@ jobs:
       # `Location`), and RUST_BACKTRACE frames keep their function names. Local
       # builds are unaffected.
       CARGO_PROFILE_TEST_DEBUG: "0"
+      # #1312 (#1317 review): the shipped-config parse tests also parse each NF
+      # config as the Helm chart renders it (`helm template`). Locally they skip
+      # that without helm; here a missing helm fails them instead.
+      NEXTGCORE_HELM_REQUIRED: "1"
     steps:
       - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
       - name: Add swap headroom
         # Absorbs whatever lib/test overlap is left. On ubuntu-24.04, /mnt is
         # on the 145 GB root disk.

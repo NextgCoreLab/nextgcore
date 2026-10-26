@@ -40,7 +40,7 @@ Note that in the docker deployment the values that actually matter are passed as
 Everything else in the shipped example file is decorative for this binary — the daemon never deserializes it:
 
 - **`logger.level` is read.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691).
-- **`mbsmf.sbi.server[]` (address/advertise/port) is inert.** The SBI bind address and port come exclusively from `--sbi-addr`/`--sbi-port`. No advertise address is read.
+- **`mbsmf.sbi.server[0]` is read (#1312).** The SBI bind is `--sbi-addr`/`--sbi-port`, else `address`/`port` here, else `127.0.0.1` and the default port. The advertised host is `--sbi-advertise`, else `NEXTGCORE_SBI_ADVERTISE`, else `advertise` here, else the bind address when it is not a wildcard; it is used in the NRF registration. A wildcard is never advertised: with a wildcard bind and nothing set to advertise, the NF does not register and logs why. A config that does not parse fails startup (#1313).
 - **`mbsmf.nrf.uri` is inert.** Unlike some other NFs (e.g. NSACF, which falls back YAML→CLI), the MB-SMF takes its NRF URI only from the `--nrf-uri` flag; the docker deployment passes it on the command line and the YAML entry merely mirrors it.
 
 > **Clock:** this NF refuses to start when the local clock reads before 2020-01-01, because its PFCP Recovery Time Stamp would be wrong. See [A set clock is required](overview.md#a-set-clock-is-required-pfcp-nfs) for the remedy on RTC-less hosts.
@@ -55,7 +55,8 @@ Runtime knobs with real defaults from the clap `Args` struct in `main.rs`:
 | `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-l, --log-file` | path | unset | Accepted but currently **unused** — the parsed value is never referenced. |
 | `-m, --no-color` | flag | off | Accepted but currently **unused** — the parsed value is never referenced. |
-| `--sbi-addr` | string | `127.0.0.1` (loopback, #1308) | SBI server bind address (also advertised to the NRF in the NF profile). |
+| `--sbi-addr` | string | `mbsmf.sbi.server[0].address`, else `127.0.0.1` (#1308) | SBI server bind address; beats the YAML (#1312). |
+| `--sbi-advertise` | string | unset | The advertised SBI host (#1312); then `NEXTGCORE_SBI_ADVERTISE`, then `mbsmf.sbi.server[0].advertise`, then the bind address when it is not a wildcard. |
 | `--sbi-port` | u16 | `7812` | SBI server port (docker deployments pass `7777`). |
 | `--tls` | flag | off | Enable TLS on the SBI server. |
 | `--tls-cert` | path | `/etc/nextgcore/tls/server.crt` (when `--tls`) | TLS certificate file. |

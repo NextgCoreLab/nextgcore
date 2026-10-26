@@ -60,7 +60,7 @@ Common sub-blocks seen in the Docker configs:
 
 - `sbi.server` — list of `{address, port}` (port 7777 everywhere)
 - `sbi.client.nrf` — list of `{uri}` pointing at the NRF
-- `metrics.server` — Prometheus endpoint, port 9090 in all shipped configs
+- No `metrics.server`: no daemon reads one, so the shipped configs carry none (#1312). A metrics listener, where a daemon has one, is set by its environment (`MME_METRICS_ADDR`, `NEXTGCORE_METRICS_BIND`, `SMF_METRICS_PORT`, `UPF_METRICS_PORT`, `SGWC_METRICS_PORT`, `SGWU_METRICS_PORT`, `UCMF_METRICS_ADDR`) and binds loopback by default (#1308)
 - `tls` — `enabled` (false by default), `cert`/`key`/`ca` paths, `min_version: "1.2"`. The config comments say `TLS_ENABLED=true SBI_SCHEME=https` turns it on, but no Rust code reads those variables. An NF's SBI listener uses TLS when started with `--tls --tls-cert <pem> --tls-key <pem>` (the SBI NFs other than amfd/smfd) or under the `production` SBI profile (amf/smf/ausf/udm, below)
 - Protocol servers per NF: AMF `ngap` (38412), SMF/UPF `pfcp` (8805), UPF `gtpu` (2152), SMF `gtpc`/`gtpu`
 - SMF/UPF `session` subnets (`10.45.0.0/16` gw `10.45.0.1`, `2001:db8:cafe::/48`), SMF `dns` and `mtu: 1400`

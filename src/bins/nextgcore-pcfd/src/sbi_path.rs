@@ -81,7 +81,12 @@ fn build_pcf_nf_instance(config: &SbiServerConfig) -> NfInstance {
     let nf_id = nextgcore_sbi::nf_instance_id::nf_instance_id(NfType::Pcf).to_string();
     let mut nf_instance = NfInstance::new(&nf_id, NfType::Pcf);
 
-    nf_instance.ipv4_addresses.push(config.addr.clone());
+    // #1312: no address at all rather than an empty or wildcard one.
+    let addrs: Vec<String> = Some(config.addr.clone())
+        .filter(|a| !a.is_empty())
+        .into_iter()
+        .collect();
+    nf_instance.ipv4_addresses.extend(addrs.iter().cloned());
     nf_instance.heartbeat_interval = 10;
 
     let scheme = if config.tls_enabled {
@@ -93,7 +98,7 @@ fn build_pcf_nf_instance(config: &SbiServerConfig) -> NfInstance {
     for (service_type, _allowed) in PCF_SERVICES {
         let mut svc = NfService::new(service_type.to_name(), *service_type);
         svc.scheme = scheme;
-        svc.ip_addresses.push(config.addr.clone());
+        svc.ip_addresses.extend(addrs.iter().cloned());
         svc.port = config.port;
         nf_instance.add_service(svc);
     }
@@ -2249,6 +2254,22 @@ pub fn pcf_self_info_set(info: PcfSelfInfo) -> bool {
     PCF_SELF_INFO.set(info).is_ok()
 }
 
+/// The self identity for `sbi`: its advertised host, never the bind (#1312). `None`
+/// when the bind is a wildcard with nothing to advertise, so no URI is ever built
+/// on `0.0.0.0` / `::`.
+pub fn pcf_self_info_for(
+    sbi: &nextgcore_core::sockaddr::SbiEndpoint,
+    fqdn: Option<String>,
+    nf_instance_id: String,
+) -> Option<PcfSelfInfo> {
+    Some(PcfSelfInfo {
+        sbi_addr: sbi.advertise.clone()?,
+        sbi_port: sbi.port,
+        fqdn,
+        nf_instance_id,
+    })
+}
+
 /// The published PCF identity, if `main` (or a test) has set it.
 pub fn pcf_self_info() -> Option<&'static PcfSelfInfo> {
     PCF_SELF_INFO.get()
@@ -3026,7 +3047,40 @@ mod tests {
 /// #1277: the apiRoot of TS 29.501 §4.4.1.
 #[cfg(test)]
 mod tests_api_root {
-    use super::{pcf_api_root_for, PcfSelfInfo};
+    use super::{build_pcf_binding_body_with, pcf_api_root_for, pcf_self_info_for, PcfSelfInfo};
+
+    /// #1312 review: a wildcard bind with nothing to advertise publishes no self
+    /// identity, so no URI or PcfBinding is built on it; with an advertised host,
+    /// every URI and the binding carry that host and never the wildcard.
+    #[test]
+    fn no_wildcard_reaches_a_uri_or_the_pcf_binding() {
+        use nextgcore_core::sockaddr::SbiEndpoint;
+        for wildcard in ["0.0.0.0", "::"] {
+            let sbi = SbiEndpoint {
+                host: wildcard.into(),
+                port: 7777,
+                advertise: None,
+            };
+            assert!(sbi.registration_host().is_err());
+            assert!(
+                pcf_self_info_for(&sbi, None, "id".into()).is_none(),
+                "{wildcard}: no self info, so every URI builder returns None"
+            );
+        }
+        let sbi = SbiEndpoint {
+            host: "0.0.0.0".into(),
+            port: 7777,
+            advertise: Some("10.1.2.3".into()),
+        };
+        let info = pcf_self_info_for(&sbi, None, "id".into()).unwrap();
+        let root = pcf_api_root_for(&info);
+        let body = build_pcf_binding_body_with(Some(&info), "imsi-1", "internet", 1, None, None)
+            .to_string();
+        for text in [&root, &body] {
+            assert!(text.contains("10.1.2.3"), "{text}");
+            assert!(!text.contains("0.0.0.0"), "{text}");
+        }
+    }
 
     #[test]
     fn the_api_root_prefers_the_fqdn_and_carries_the_port() {

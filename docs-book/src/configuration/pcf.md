@@ -2,7 +2,7 @@
 
 The PCF (Policy Control Function, `nextgcore-pcfd`) makes access-, session-, and application-level policy decisions for the 5G core, per TS 29.507, TS 29.512, TS 29.514 and TS 29.525 (as cited in the daemon's source comments). Its SBI router (`pcf_sbi_request_handler` in `src/bins/nextgcore-pcfd/src/app.rs`) serves five services: `Npcf_AMPolicyControl` (`/npcf-am-policy-control/v1/policies`), `Npcf_SMPolicyControl` (`/npcf-smpolicycontrol/v1/sm-policies`), `Npcf_PolicyAuthorization` (`/npcf-policyauthorization/v1/app-sessions`), `Npcf_UEPolicyControl` (`/npcf-ue-policy-control/v1/policies`), and `Npcf_EventExposure` (`/npcf-eventexposure/v1/subscriptions`, TS 29.523), plus a `N1MessageNotify` callback route (`/npcf-ue-policy-control/v1/notify/{polAssoId}/n1-message-notify`, TS 29.518 per code comments) on which the AMF returns the UE's MANAGE UE POLICY COMPLETE/REJECT. The binary itself is a thin wrapper: `main.rs` only calls `nextgcore_pcfd::run()`; all logic lives in the library crate (`lib.rs`/`app.rs`, Wave-6 lib-targetization).
 
-Configuration is split between a YAML file (default path `/etc/nextgcore/pcf.yaml`, overridable with `-c/--config`), command-line flags, and an unusually large set of environment variables. The YAML file supplies the advertised SBI address/port, an optional FQDN, and the NRF URI; capacities and TLS-related flags are CLI-only; UE-policy delivery, URSP rules, UAV gating, the local PLMN, OAuth2 enforcement, and the OTLP endpoint are env-var driven.
+Configuration is split between a YAML file (default path `/etc/nextgcore/pcf.yaml`, overridable with `-c/--config`), command-line flags, and an unusually large set of environment variables. The YAML file supplies the SBI address/port (after the CLI flags, #1312) and advertised host, an optional FQDN, and the NRF URI; capacities and TLS-related flags are CLI-only; UE-policy delivery, URSP rules, UAV gating, the local PLMN, OAuth2 enforcement, and the OTLP endpoint are env-var driven.
 
 > **Honesty note:** PCF behavior is validated by this project's own unit tests and matched-simulator Docker E2E runs, not by third-party conformance certification. Several pieces are explicitly bespoke or partial: the `urspRules` member the PCF reads from the UDR UePolicySet is a provisioning-side convention of this deployment, never a 3GPP wire field (documented as such in `ue_policy.rs`); the UAV flight-zone gate uses a hardcoded geofence (lat 37–38, lon −123…−122); the `intent_policy` module is Rel-20 research scaffolding not wired to any live handler; the `--tls*` flags do **not** enable TLS on the live HTTP/2 listener (see below); and `-k/--kill` is refused with an error and `-l/--log-file` is accepted but unused (no file logging is wired in `init_logging`).
 
@@ -54,8 +54,9 @@ These are the fields actually deserialized by the daemon (`#[derive(Deserialize)
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `pcf.sbi.server[].address` | string | absent → CLI `--sbi-addr` (`127.0.0.1`, #1308) | Overrides the SBI bind **and** advertised address so the NRF NFProfile carries a routable endpoint (not 0.0.0.0). Only the **first** list entry is read. |
-| `pcf.sbi.server[].port` | u16 | absent → CLI `--sbi-port` (`7777`) | Overrides the SBI bind/advertised port. First entry only. |
+| `pcf.sbi.server[].address` | string | absent → `127.0.0.1` (#1308) | SBI bind address, after `--sbi-addr` (#1312). Only the **first** list entry is read. |
+| `pcf.sbi.server[0].advertise` | string | absent → the bind address, unless it is a wildcard | The host registered in the NRF NFProfile and put in callback URIs (#1312). After `--sbi-advertise` and `NEXTGCORE_SBI_ADVERTISE`. A wildcard is never advertised: with a wildcard bind and nothing set here, the NF does not register with the NRF and logs why. | The PCF also puts it in its BSF PcfBinding `pcfIpEndPoints`.
+| `pcf.sbi.server[].port` | u16 | absent → `7777` | SBI bind/advertised port, after `--sbi-port` (#1312). First entry only. |
 | `pcf.sbi.server[].fqdn` | string | absent (no FQDN) | Optional advertised FQDN, emitted as `pcfFqdn` in TS 29.521 PcfBinding registrations towards the BSF (per code comment); never invented when absent — `pcfIpEndPoints` alone satisfies the spec NOTE. |
 | `pcf.sbi.client.nrf[].uri` | string | absent → no NRF (unless CLI `--nrf-uri`) | NRF base URI seeded into the shared SBI context for NF registration, discovery, heartbeat, and (when OAuth2 is on) token/JWKS. Only the **first** list entry is used. |
 | `<any-section>.sbi.oauth2.require` | bool | `false` | SBI OAuth2 enforcement (TS 33.501 §13.4.1, TS 29.510 §5.4.2 per code comments). Read by `oauth2_required()` via a raw `serde_yaml::Value` traversal that is root-key agnostic: `true` iff *any* top-level section sets `sbi.oauth2.require: true`. When on, incoming requests must carry an NRF-issued token with audience `PCF` (fails closed with 503 when no NRF URI is configured) and outbound SBI calls attach tokens. The env var `NEXTGCORE_SBI_OAUTH2_REQUIRE` takes precedence over the YAML in either direction. Note: no `pcf-oauth2.yaml` overlay ships in `docker/rust/configs/5gc/` — the env var is the practical switch. |
@@ -67,7 +68,7 @@ The daemon deserializes only the fields above; unknown YAML keys are silently ig
 - **`db_uri` is inert.** `nextgcore-pcfd` never calls `nextgcore_dbi_init` — its subscription/session-data lookups through `nextgcore-dbi` therefore error out at runtime and fall back to built-in defaults (see Behavior notes). The key exists for visual consistency with NFs that do open MongoDB.
 - **`logger.level` is read; `logger.file.path` is inert.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691). No file output is wired (the `-l/--log-file` flag is accepted but unused).
 - **`global.max.ue` / `global.max.peer` are inert.** Context capacities come from the CLI flags `--max-ue` (1024) and `--max-sess` (4096).
-- **`pcf.metrics.server[]` is inert.** The daemon starts no metrics HTTP server; its only telemetry export is OpenTelemetry OTLP via `OTEL_EXPORTER_OTLP_ENDPOINT`.
+- **No `pcf.metrics.server[]`** (removed from the shipped config, #1312): the daemon starts no metrics HTTP server; its only telemetry export is OpenTelemetry OTLP via `OTEL_EXPORTER_OTLP_ENDPOINT`.
 - **`pcf.tls.*` is inert.** No code reads this section. Even the CLI `--tls`/`--tls-cert`/`--tls-key` flags only flow into the legacy `SbiServerConfig` (`sbi_path.rs`), where they flip the *advertised* URI scheme to `https` in the legacy NF-instance builder; the live HTTP/2 listener is created from `NextgcoreSbiServerConfig::new(addr)` without any TLS wiring and serves cleartext h2c.
 
 ## Command-line flags
@@ -81,8 +82,9 @@ Runtime knobs with real defaults from the clap `Args` struct in `src/bins/nextgc
 | `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-m, --no-color` | flag | off | Disable color output. |
 | `-k, --kill` | flag | off | Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor. |
-| `--sbi-addr` | string | `127.0.0.1` (loopback, #1308) | SBI bind address; overridden by `pcf.sbi.server[0].address` when the YAML sets one. |
-| `--sbi-port` | u16 | `7777` | SBI port; overridden by `pcf.sbi.server[0].port`. |
+| `--sbi-addr` | string | `pcf.sbi.server[0].address`, else `127.0.0.1` (#1308) | SBI bind address; beats the YAML (#1312). |
+| `--sbi-advertise` | string | unset | The SBI host advertised to the NRF and in callback URIs (#1312); then `NEXTGCORE_SBI_ADVERTISE`, then `pcf.sbi.server[0].advertise`, then the bind address when it is not a wildcard. |
+| `--sbi-port` | u16 | `pcf.sbi.server[0].port`, else `7777` | SBI port; beats the YAML (#1312). |
 | `--tls` | flag | off | Sets the advertised scheme to `https` in the legacy NF-instance builder only; does **not** enable TLS on the live listener. |
 | `--tls-cert` | path | unset | TLS certificate path (stored in the legacy config; not wired to the listener). |
 | `--tls-key` | path | unset | TLS key path (same caveat). |
