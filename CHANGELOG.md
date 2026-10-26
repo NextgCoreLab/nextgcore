@@ -13,6 +13,11 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 ## [Unreleased]
 
 ### Changed
+- pcfd's `resourceUri`, in AM and UE PolicyUpdates (notifications and Update responses) and in
+  SM policy notifications, is now the complete resource URI `{apiRoot}/<apiName>/...` (TS 29.501
+  §4.4.1), with the configured FQDN as host when there is one. Before, it was the bare path. The
+  TS 29.507 / 29.512 / 29.525 notes let a consumer use either the complete URI or its
+  apiSpecificResourceUriPart (#1277).
 - pcfd now acts on a change of the UE's policy data at the UDR (the policy-data notification
   it already subscribes to) for the UE's AM and UE policy associations, not only its SM
   sessions (TS 29.513 §5.1.2.2, §5.6.2.2.2). A changed AM policy is pushed to the AMF with

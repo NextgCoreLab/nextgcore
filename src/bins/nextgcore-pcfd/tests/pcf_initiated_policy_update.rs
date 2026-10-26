@@ -24,6 +24,7 @@ use nextgcore_pcfd::sbi_path::POLICY_DATA_NOTIFY_PATH;
 use nextgcore_sbi::message::{SbiRequest as Req, SbiResponse as Resp};
 
 const SUPI: &str = "imsi-001010000012610";
+const PCF_FQDN: &str = "pcf.5gc.mnc001.mcc001.3gppnetwork.org";
 
 /// What the stub's UDR answers, changed by the test between notifications.
 struct Udr {
@@ -226,6 +227,16 @@ async fn a_policy_data_change_is_pushed_to_the_amf_and_the_ue() {
     // timer expires while the test still watches (#1261 review).
     std::env::set_var("PCF_T3501_SECS", "1");
     nextgcore_pcfd::test_support::init_context();
+    // The published identity gives the apiRoot of the resource URIs (#1277). This
+    // test binary is its own process, so this set-once call is the only one.
+    assert!(nextgcore_pcfd::pcf_self_info_set(
+        nextgcore_pcfd::PcfSelfInfo {
+            sbi_addr: "127.0.0.1".into(),
+            sbi_port: 7777,
+            fqdn: Some(PCF_FQDN.into()),
+            nf_instance_id: "pcf-1261".into(),
+        }
+    ));
     seed_amf_ue(SUPI);
 
     let udr = Arc::new(Udr {
@@ -295,7 +306,8 @@ async fn a_policy_data_change_is_pushed_to_the_amf_and_the_ue() {
     assert_eq!(
         body,
         serde_json::json!({
-            "resourceUri": format!("/npcf-am-policy-control/v1/policies/{am_id}"),
+            // #1277: the complete resource URI, {apiRoot}/... (TS 29.501 §4.4.1).
+            "resourceUri": format!("http://{PCF_FQDN}:7777/npcf-am-policy-control/v1/policies/{am_id}"),
             "rfsp": 7,
         }),
         "only the changed member (TS 29.507 §4.2.3.3.1): the SAR and the triggers did not change"
