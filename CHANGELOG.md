@@ -108,7 +108,9 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   allocation resume, and it is logged once per poisoning rather than at every write. That holds
   with the durable state off too (the default, where no snapshot is taken): every `persist()`
   heals a poisoned context map, and the IPv4 pool uses its bitmap through a poison and clears
-  it at every allocation and release (#1178).
+  it at every allocation and release (#1178). Every lock of the SMF context, and the global
+  context's own, is now taken through a poison and cleared at its next use, so a reader or
+  writer that skipped a poisoned lock no longer waits for anything else to heal it (#1178).
 - smfd answers its own SM Context Create and Update errors as SmContextCreateError /
   SmContextUpdateError (TS 29.502 Tables 6.1.3.2.3.1-3, 6.1.3.3.4.2.2-2): the ProblemDetails is
   under `error`, at `application/json`. A failed activation adds `upCnxState: DEACTIVATED`, and a
