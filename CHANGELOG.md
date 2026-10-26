@@ -33,6 +33,11 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 - smfd sends a restored session's boot "RELEASED" notifications (#193) after boot,
   16 at a time, and writes the snapshot once for all of them. Before, it wrote it once per
   session and waited for each AMF in turn, all before the SMF served anything.
+- smfd's PDU SESSION ESTABLISHMENT REJECT leaves out the Back-off timer value IE for #26 and #69
+  when the request is for emergency services (SmContextCreateData `requestType`
+  INITIAL_EMERGENCY_REQUEST or EXISTING_EMERGENCY_PDU_SESSION). It also leaves it out for #26,
+  #27 and #69 when the AMF reports the UE as a priority user (`priorityUserInd`), so the UE can
+  retry at once (TS 24.501 §6.4.1.4.1). amfd does not send either attribute yet (#1188).
 - smfd's EBI assignment request (`Namf_Communication_EBIAssignment`) now gives the default flow's
   ARP as NOT_PREEMPT / NOT_PREEMPTABLE, the same ARP the N2 default QoS flow carries. Before, it
   said PREEMPTABLE, so the AMF could revoke the EBI for a higher-priority request that the RAN
