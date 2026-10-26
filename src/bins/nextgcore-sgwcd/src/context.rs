@@ -254,8 +254,10 @@ pub struct SgwcSess {
 
 impl SgwcSess {
     /// Whether `ip` is one of the PGW's S5/S8-C F-TEID addresses (#1208).
+    /// An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, how a dual-stack `[::]`
+    /// socket shows an IPv4 peer) is the IPv4 address (#1208 review).
     pub fn anchored_at(&self, ip: std::net::IpAddr) -> bool {
-        match ip {
+        match ip.to_canonical() {
             std::net::IpAddr::V4(v4) => self.pgw_addr == Some(v4),
             std::net::IpAddr::V6(v6) => self.pgw_addr6 == Some(v6),
         }
@@ -807,7 +809,7 @@ impl SgwcContext {
         match self.sgwc_ue_list.read() {
             Ok(list) => list
                 .values()
-                .filter(|ue| ue.mme_addr.map(|a| a.ip()) == Some(ip))
+                .filter(|ue| ue.mme_addr.map(|a| a.ip().to_canonical()) == Some(ip.to_canonical()))
                 .map(|ue| ue.id)
                 .collect(),
             Err(_) => Vec::new(),

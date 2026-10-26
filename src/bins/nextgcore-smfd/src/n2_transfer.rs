@@ -179,6 +179,30 @@ pub(crate) struct Arp {
     pub pre_emptable: bool,
 }
 
+impl Arp {
+    /// The ARP of a session's default QoS flow (#1179): "shall not trigger
+    /// pre-emption", "not pre-emptable". The one source for the N2 default flow and the
+    /// EBI assignment's `arpList` (TS 23.502 §4.11.1.4.1), so the AMF stores the ARP
+    /// the RAN applies.
+    pub(crate) fn default_flow(priority_level: u8) -> Self {
+        Self {
+            priority_level,
+            may_trigger_pre_emption: false,
+            pre_emptable: false,
+        }
+    }
+
+    /// As a TS 29.571 §5.5.4.1 `Arp`, the priority level clamped into
+    /// ArpPriorityLevel 1..=15.
+    pub(crate) fn to_sbi_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "priorityLevel": self.priority_level.clamp(1, 15),
+            "preemptCap": if self.may_trigger_pre_emption { "MAY_PREEMPT" } else { "NOT_PREEMPT" },
+            "preemptVuln": if self.pre_emptable { "PREEMPTABLE" } else { "NOT_PREEMPTABLE" },
+        })
+    }
+}
+
 /// GBR QoS Flow Information (TS 38.413 §9.3.1.18), in bit/s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Gbr {

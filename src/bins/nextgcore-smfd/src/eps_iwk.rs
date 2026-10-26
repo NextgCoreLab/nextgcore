@@ -69,22 +69,16 @@ pub fn set_for_test(on: bool) {
     EPS_IWK_ENABLED.store(on, Ordering::SeqCst);
 }
 
-/// The ARP this SMF supplies for a session's default QoS flow.
+/// The ARP this SMF supplies for a session's default QoS flow, as a TS 29.571 `Arp`.
 ///
-/// `preemptCap` / `preemptVuln` are the conservative pair: a default flow that
-/// cannot pre-empt others and can itself be pre-empted. Chosen rather than derived
-/// because the policy decision this tree makes carries only an ARP **priority
-/// level** (`decision.arp_priority_level`) and no pre-emption members, and the two
-/// are `required` in TS 29.571's `Arp` — so they have to come from somewhere, and a
-/// stated conservative default is better than a value invented per call.
+/// #1179: the same ARP the N2 default flow carries ([`crate::n2_transfer::Arp::default_flow`]:
+/// "shall not trigger pre-emption", "not pre-emptable"). It said PREEMPTABLE, so the AMF
+/// stored a pre-emptable ARP for the EBI (TS 23.502 §4.11.1.4.1 step 3) and could
+/// revoke it for a higher-priority request although the RAN would never pre-empt the
+/// flow. The priority level is the policy decision's; it is clamped into
+/// ArpPriorityLevel 1..=15, which the AMF would (correctly) refuse otherwise.
 pub fn default_flow_arp(priority_level: u8) -> serde_json::Value {
-    serde_json::json!({
-        // ArpPriorityLevel is 1..=15; clamp rather than send an out-of-range value
-        // the AMF would (correctly) refuse with a 400.
-        "priorityLevel": priority_level.clamp(1, 15),
-        "preemptCap": "NOT_PREEMPT",
-        "preemptVuln": "PREEMPTABLE",
-    })
+    crate::n2_transfer::Arp::default_flow(priority_level).to_sbi_json()
 }
 
 /// Request one EBI for a session's default QoS flow.
@@ -1113,6 +1107,46 @@ mod tests {
             serde_json::json!(15)
         );
     }
+    /// #1179: the EBI assignment's ARP is the N2 default flow's, member for member.
+    #[test]
+    fn the_ebi_assignment_arp_is_the_n2_default_flows() {
+        use nextgcore_ngap::transfer::{PreEmptionCapability, PreEmptionVulnerability};
+        let n2 = crate::n2_transfer::setup_request_transfer(&crate::n2_transfer::SetupRequest {
+            ambr: None,
+            ul_tunnel: (1, [10, 45, 0, 1]),
+            data_forwarding_not_possible: false,
+            direct_forwarding_path_availability: false,
+            flows: vec![crate::n2_transfer::QosFlowSetup {
+                qfi: 1,
+                five_qi: 9,
+                arp: crate::n2_transfer::Arp::default_flow(8),
+                gbr: None,
+                e_rab_id: None,
+            }],
+        })
+        .expect("encode");
+        let t = nextgcore_ngap::transfer::PduSessionResourceSetupRequestTransfer::decode(&n2)
+            .expect("decode");
+        let arp = &t.qos_flow_setup_request_list[0]
+            .qos_flow_level_qos_parameters
+            .allocation_and_retention_priority;
+        let sbi = default_flow_arp(8);
+        assert_eq!(
+            sbi["priorityLevel"],
+            serde_json::json!(arp.priority_level_arp)
+        );
+        assert_eq!(
+            sbi["preemptCap"] == "MAY_PREEMPT",
+            arp.pre_emption_capability == PreEmptionCapability::MayTriggerPreEmption
+        );
+        assert_eq!(
+            sbi["preemptVuln"] == "PREEMPTABLE",
+            arp.pre_emption_vulnerability == PreEmptionVulnerability::PreEmptable
+        );
+        assert_eq!(sbi["preemptCap"], "NOT_PREEMPT");
+        assert_eq!(sbi["preemptVuln"], "NOT_PREEMPTABLE");
+    }
+
     /// #117 criterion 2, the wire half: the SMF actually performs
     /// `Namf_Communication_EBIAssignment`, against a loopback AMF that records the
     /// request.
@@ -1160,7 +1194,7 @@ mod tests {
                             "arp": {
                                 "priorityLevel": 8,
                                 "preemptCap": "NOT_PREEMPT",
-                                "preemptVuln": "PREEMPTABLE",
+                                "preemptVuln": "NOT_PREEMPTABLE",
                             },
                         }],
                     }))
