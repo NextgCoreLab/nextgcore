@@ -13,6 +13,9 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 ## [Unreleased]
 
 ### Changed
+- lmfd reads the LPP NR PRS-RSRP of a Multi-RTT or DL-TDOA measurement (`nr-DL-PRS-RSRP-Result`)
+  as `v − 157` dBm, the lower edge of TS 38.133 Table 10.1.24.3.1-1. It read `v − 140`, the
+  E-UTRA RSRP offset, which put every PRS-RSRP 16-17 dB too high (#1278).
 - pcfd's `resourceUri`, in AM and UE PolicyUpdates (notifications and Update responses) and in
   SM policy notifications, is now the complete resource URI `{apiRoot}/<apiName>/...` (TS 29.501
   §4.4.1), with the configured FQDN as host when there is one. Before, it was the bare path. The
