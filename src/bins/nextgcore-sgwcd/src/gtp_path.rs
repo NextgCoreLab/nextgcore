@@ -7124,6 +7124,82 @@ mod tests {
     /// A PGW's Create Bearer Request for one dedicated bearer (TS 29.274 Table 7.2.3-2 on
     /// S5/S8): LBI 5, and a Bearer Context with EBI 0, a TFT, the PGW's S5/S8-U F-TEID
     /// (`pgw_s5u_teid` at 127.0.0.1, instance 1) and a Bearer QoS.
+    /// #1283, TS 23.401 §5.4.1 / Annex F: the PGW's Create Bearer Request arrives
+    /// while the session's Sxa establishment is still in flight (the SGW-U holds its
+    /// answer 300 ms). It is held, not sent to SGW-U SEID 0 and refused; once the
+    /// establishment succeeds it is installed and relayed to the MME, after the
+    /// MME's Create Session Response.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_create_bearer_during_the_sxa_establishment_waits_for_it() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::from_millis(300),
+        )
+        .await;
+        let pgw = with_stand_in_pgw().await;
+        let server = test_server(&ambient, 2000, 1);
+        set_s11_server(server.clone());
+        let mme = client();
+        mme.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x12, 0x83];
+        mme.send_to(&csr(0x1283, &imsi).encode(), server.local_addr())
+            .unwrap();
+        // As a PGW activating a bearer at attach: the CBR right after its CSRsp.
+        let ctx = sgwc_self();
+        let mut sess = None;
+        for _ in 0..300 {
+            if pgw
+                .seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&(Gtp2MessageType::CreateSessionRequest as u8))
+            {
+                sess = ctx
+                    .ue_find_by_imsi(&imsi)
+                    .and_then(|ue| ctx.sess_list_for_ue(ue.id).into_iter().next());
+                if sess.is_some() {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let sess = sess.expect("the session");
+        assert_eq!(sess.sgwu_sxa_seid, 0, "still being established");
+        pgw.sock
+            .send_to(
+                &dedicated_cbr(sess.sgw_s5c_teid, 0x1284, 0x0BEE_F0E1).encode(),
+                server.local_addr(),
+            )
+            .await
+            .unwrap();
+        let csrsp = recv_s11(&mme).await.expect("the Create Session Response");
+        assert_eq!(cause_of(&csrsp), gtp_cause::REQUEST_ACCEPTED);
+        let cbr = recv_s11(&mme)
+            .await
+            .expect("then the Create Bearer Request");
+        assert_eq!(
+            cbr.header.message_type,
+            Gtp2MessageType::CreateBearerRequest as u8
+        );
+        assert!(
+            sgwu.seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|(t, _, _)| *t == 52)
+                .all(|(_, seid, _)| seid.is_some_and(|s| s != 0)),
+            "no Session Modification to SEID 0"
+        );
+        crate::dedicated_bearer::clear_for_test();
+        if let Some(ue) = ctx.ue_find_by_imsi(&imsi) {
+            ctx.ue_remove(ue.id);
+        }
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
     fn dedicated_cbr(sgw_s5c_teid: u32, seq: u32, pgw_s5u_teid: u32) -> Gtp2Message {
         let mut cbr = pgw_request(
             Gtp2MessageType::CreateBearerRequest,
