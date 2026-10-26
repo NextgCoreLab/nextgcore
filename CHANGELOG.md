@@ -23,6 +23,18 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   TS 38.133 Tables 10.1.23.3.1-x, 10.1.25.3.1-x and 13.2.1-x. Before, it took the upper edge,
   a bias of half a reporting step (8 ns, about 2.4 m, at k = 5). NR SS/CSI-RSRP reads as the
   bin's lower edge, `v − 157` dBm (Table 10.1.6.1-1), where it read the upper edge (#1270).
+- pcfd now acts on a change of the UE's policy data at the UDR (the policy-data notification
+  it already subscribes to) for the UE's AM and UE policy associations, not only its SM
+  sessions (TS 29.513 §5.1.2.2, §5.6.2.2.2). A changed AM policy is pushed to the AMF with
+  Npcf_AMPolicyControl_UpdateNotify, `POST {notificationUri}/update`, whose PolicyUpdate carries
+  only the changed `rfsp`/`servAreaRes` (TS 29.507 §4.2.4.2, §4.2.3.3). `ueAmbr` is not sent:
+  this PCF does not negotiate UE-AMBR_Authorization. A changed URSP is delivered to the UE as a
+  new MANAGE UE POLICY COMMAND over N1N2. Nothing is sent when nothing changed, or when the UDR
+  read fails. Before, nothing in pcfd sent a PCF-initiated AM or UE policy change. A new UE policy
+  delivery now stops the T3501 loop of the one it replaces, so the old command is not
+  retransmitted. A UE policy association whose request names no serving PLMN (`servingPlmn` or
+  `guami`) gets no MANAGE UE POLICY COMMAND, where it used to get a section for the test PLMN
+  001-01 (#1261).
 - smfd keeps each SM context's UPF N3 uplink F-TEID in the durable snapshot (`upfUlEndpoints`),
   so a restored PDU session can still have its user plane activated, be paged for downlink data,
   or be handed over (#1230). Before, a restart lost it, and those all failed: activation was
@@ -52,7 +64,9 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   ARP as NOT_PREEMPT / NOT_PREEMPTABLE, the same ARP the N2 default QoS flow carries. Before, it
   said PREEMPTABLE, so the AMF could revoke the EBI for a higher-priority request that the RAN
   would never pre-empt (TS 23.502 §4.11.1.4.1). Both now come from one source,
-  `n2_transfer::Arp::default_flow` (#1179).
+  `n2_transfer::Arp::default_flow` (#1179). Its priority level is clamped into 1..=15 there, so
+  a policy level of 0 or above 15 is the same clamped value on N2 as in the EBI assignment
+  (#1179).
 - smfd (PGW-C) codes EPS bearer rates in kbit/s on S5/S8 and holds them in bit/s, as N4 and N2
   read them (TS 29.274 §8.15, §8.16). The Create Session Request's Bearer QoS and a Bearer
   Resource Command's Flow QoS on an existing bearer were stored unconverted, so their MBR/GBR
@@ -109,7 +123,8 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   Association" (a UPF that restarted after the Association Setup) tears the association down and
   releases that UPF's sessions, so it is set up again (#966). Only the association the request
   was sent on: a late cause 72 answering a request sent before a re-association leaves the
-  association set up since, and its sessions, in place.
+  association set up since, and its sessions, in place. The association is the one the request left on, read as
+  each transmission is sent (#966).
 - smfd takes its durable snapshot through a poisoned lock: the maps and the IPv4 pool are read
   as the panicking writer left them, and the poison is logged. Before, a poisoned map was written
   as empty over the last good snapshot, and the next restart restored nothing (#1178). The
@@ -117,7 +132,9 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   allocation resume, and it is logged once per poisoning rather than at every write. That holds
   with the durable state off too (the default, where no snapshot is taken): every `persist()`
   heals a poisoned context map, and the IPv4 pool uses its bitmap through a poison and clears
-  it at every allocation and release (#1178).
+  it at every allocation and release (#1178). Every lock of the SMF context, and the global
+  context's own, is now taken through a poison and cleared at its next use, so a reader or
+  writer that skipped a poisoned lock no longer waits for anything else to heal it (#1178).
 - smfd answers its own SM Context Create and Update errors as SmContextCreateError /
   SmContextUpdateError (TS 29.502 Tables 6.1.3.2.3.1-3, 6.1.3.3.4.2.2-2): the ProblemDetails is
   under `error`, at `application/json`. A failed activation adds `upCnxState: DEACTIVATED`, and a

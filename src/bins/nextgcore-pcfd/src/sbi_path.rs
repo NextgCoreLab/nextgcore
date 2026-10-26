@@ -541,32 +541,34 @@ pub async fn send_notification_reliably(
     deliver_notification(uri, alternates, suffix, body, what).await
 }
 
-/// Send AM policy control update notify to the AMF over HTTP
-/// (TS 29.507 §4.2.3: POST {notificationUri}/update with PolicyUpdate).
-pub fn pcf_sbi_send_am_policy_control_notify(pcf_ue_am_id: u64) -> bool {
+/// Send a PCF-initiated Npcf_AMPolicyControl_UpdateNotify to the AMF (TS 29.507
+/// §4.2.4.2: `POST {notificationUri}/update` with a PolicyUpdate), carrying
+/// `changes`: only the members the PCF's re-evaluation changed (§4.2.3.3.1 bullet
+/// 6), plus `resourceUri` (#1261). The triggers are not re-sent: they did not
+/// change, and §4.2.3.3.2 sends a new list only when they do.
+///
+/// Only a PCF decision calls this. The AMF's own Update is answered in its 200
+/// (§4.2.3), which is why #1257 removed the call that was there.
+pub fn pcf_sbi_send_am_policy_control_notify(
+    pcf_ue_am_id: u64,
+    changes: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
     // Copy out what we need, then drop the guards (lock-order rule).
     let info = crate::context::pcf_self().read().ok().and_then(|ctx| {
         ctx.ue_am_find_by_id(pcf_ue_am_id).and_then(|ue| {
-            ue.notification_uri.clone().map(|uri| {
-                (
-                    uri,
-                    ue.alt_notif_uris.clone(),
-                    ue.association_id.clone(),
-                    ue.triggers.clone(),
-                    ue.am_policy.clone(),
-                )
-            })
+            ue.notification_uri
+                .clone()
+                .map(|uri| (uri, ue.alt_notif_uris.clone(), ue.association_id.clone()))
         })
     });
-    let Some((uri, alternates, association_id, triggers, am_policy)) = info else {
+    let Some((uri, alternates, association_id)) = info else {
         log::warn!("[ue_am_id={pcf_ue_am_id}] AM policy notify: no notification URI stored");
         return false;
     };
-    let body = build_am_policy_update(&association_id, &triggers, am_policy.as_ref());
-    // TS 29.507 §4.2.4.2: POST the PolicyUpdate to {notificationUri}/update, and
-    // do it reliably — retried, then to the consumer's alternate endpoints
-    // (TS 29.500 §6.10). Before #89 this was a single fire-and-forget POST that
-    // hardcoded `triggers: []`, and nothing called it at all.
+    let changes = serde_json::Value::Object(changes.clone());
+    let body = build_am_policy_update(&association_id, &[], Some(&changes));
+    // Reliable: retried, then to the consumer's alternate endpoints (TS 29.500
+    // §6.10).
     spawn_notification_with_alternates(uri, alternates, "/update", body, "AM policy")
 }
 
@@ -1708,7 +1710,17 @@ pub async fn pcf_udr_get_ue_policy_set(supi: &str) -> Result<Option<serde_json::
     let Some(ep) = pcf_discover_endpoint("UDR", "nudr-dr").await? else {
         return Ok(None);
     };
-    let client = client_for(&ep, NfType::Udr);
+    pcf_udr_get_ue_policy_set_from(&ep, supi).await
+}
+
+/// [`pcf_udr_get_ue_policy_set`] against an already discovered UDR (#1261), so a
+/// re-evaluation tells "not provisioned" (`Ok(None)`, a 404) from "the read failed"
+/// (`Err`), as [`pcf_udr_sm_policy_dnn_data_from`] does.
+pub async fn pcf_udr_get_ue_policy_set_from(
+    ep: &DiscoveredEndpoint,
+    supi: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let client = client_for(ep, NfType::Udr);
     let path = format!(
         "/nudr-dr/v2/policy-data/ues/{}/ue-policy-set",
         percent_encode(supi),
@@ -1758,7 +1770,16 @@ pub async fn pcf_udr_get_am_subscription_data(
     let Some(ep) = pcf_discover_endpoint("UDR", "nudr-dr").await? else {
         return Ok(None);
     };
-    let client = client_for(&ep, NfType::Udr);
+    pcf_udr_get_am_subscription_data_from(&ep, supi).await
+}
+
+/// [`pcf_udr_get_am_subscription_data`] against an already discovered UDR (#1261):
+/// `Ok(None)` only for a 404, `Err` for a failed read.
+pub async fn pcf_udr_get_am_subscription_data_from(
+    ep: &DiscoveredEndpoint,
+    supi: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let client = client_for(ep, NfType::Udr);
     let path = format!(
         "/nudr-dr/v2/subscription-data/{}/provisioned-data/am-data",
         percent_encode(supi),
