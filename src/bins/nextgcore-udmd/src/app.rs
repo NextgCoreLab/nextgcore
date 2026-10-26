@@ -576,7 +576,7 @@ pub async fn run() -> Result<()> {
                     .as_ref()
                     .map(crate::nes_driver::NesSettings::from_yaml),
                 nf_instance_id.clone(),
-                host.to_string(),
+                registration_host.clone().unwrap_or_default().to_string(),
                 sbi.port,
             );
             // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
