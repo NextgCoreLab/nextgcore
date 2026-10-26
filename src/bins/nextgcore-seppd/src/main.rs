@@ -314,6 +314,10 @@ async fn main() -> Result<()> {
     let sbi_server = n32_server::start_sbi_server(&args.sbi_addr, args.sbi_port, n32_tls_opt)
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
+    // #1308: loopback by default; say which setting opens it to remote peers.
+    if let Ok(addr) = nextgcore_core::sockaddr::parse_listen_addr(&args.sbi_addr, args.sbi_port) {
+        nextgcore_core::sockaddr::warn_if_loopback_listener("SBI", &addr, "--sbi-addr");
+    }
     log::info!(
         "SBI server listening on {}:{}",
         args.sbi_addr,
@@ -338,10 +342,9 @@ async fn main() -> Result<()> {
         };
         let local_api_root = match (&args.n32_addr, args.n32_port) {
             (Some(addr), Some(port)) => Some(format!(
-                "{}://{}:{}",
+                "{}://{}",
                 if args.tls { "https" } else { "http" },
-                addr,
-                port
+                nextgcore_sbi::uri_encode::uri_authority(addr, port)
             )),
             _ => None,
         };

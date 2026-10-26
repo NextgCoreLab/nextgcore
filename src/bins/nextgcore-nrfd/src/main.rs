@@ -815,7 +815,7 @@ struct Args {
     kill: bool,
 
     /// SBI server address
-    #[arg(long, default_value = "0.0.0.0")]
+    #[arg(long, default_value = nextgcore_core::sockaddr::DEFAULT_LISTEN_HOST)]
     sbi_addr: String,
 
     /// SBI server port
@@ -999,7 +999,11 @@ async fn main() -> Result<()> {
 
     // Store the NRF's own SBI URI so notification handlers can use it
     let scheme = if args.tls { "https" } else { "http" };
-    let self_uri = format!("{}://{}:{}", scheme, args.sbi_addr, args.sbi_port);
+    let self_uri = format!(
+        "{}://{}",
+        scheme,
+        nextgcore_sbi::uri_encode::uri_authority(&args.sbi_addr, args.sbi_port)
+    );
     NRF_SELF_URI.set(self_uri).ok();
 
     // The NRF's NF Instance ID is the OAuth2 token issuer (TS 29.510
@@ -1172,9 +1176,11 @@ async fn main() -> Result<()> {
     let _server = nrf_sbi_open(Some(sbi_config)).map_err(|e| anyhow::anyhow!(e))?;
 
     // Start actual HTTP/2 SBI server using nextgcore-sbi
-    let sbi_addr: SocketAddr = format!("{}:{}", args.sbi_addr, args.sbi_port)
-        .parse()
-        .context("Invalid SBI address")?;
+    let sbi_addr: SocketAddr =
+        nextgcore_core::sockaddr::parse_listen_addr(&args.sbi_addr, args.sbi_port)
+            .context("Invalid SBI address")?;
+    // #1308: loopback by default; say which setting opens it to remote peers.
+    nextgcore_core::sockaddr::warn_if_loopback_listener("SBI", &sbi_addr, "--sbi-addr");
     let mut sbi_server_config = NextgcoreSbiServerConfig::new(sbi_addr);
 
     // Wire TLS/mTLS configuration from CLI args into the nextgcore-sbi server
@@ -4000,12 +4006,19 @@ mod tests {
         }
     }
 
+    /// #1308: with no flag the SBI listener binds loopback, not every interface.
+    #[test]
+    fn sbi_listener_defaults_to_loopback_1308() {
+        let args = Args::parse_from(["nextgcore-nrfd"]);
+        assert_eq!(args.sbi_addr, "127.0.0.1");
+    }
+
     #[test]
     fn test_args_default() {
         let args = Args::parse_from(["nextgcore-nrfd"]);
         assert_eq!(args.config, "/etc/nextgcore/nrf.yaml");
         assert_eq!(args.log_level, None);
-        assert_eq!(args.sbi_addr, "0.0.0.0");
+        assert_eq!(args.sbi_addr, "127.0.0.1");
         assert_eq!(args.sbi_port, 7777);
         assert!(!args.tls);
         assert_eq!(args.max_ue, 1024);

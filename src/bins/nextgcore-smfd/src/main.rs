@@ -633,7 +633,8 @@ struct SmfConfig {
 impl Default for SmfConfig {
     fn default() -> Self {
         Self {
-            sbi_addr: "0.0.0.0".to_string(),
+            // #1308: loopback unless `smf.sbi.server[0].address` names the address.
+            sbi_addr: nextgcore_core::sockaddr::DEFAULT_LISTEN_HOST.to_string(),
             sbi_port: 7777,
             max_ue: 1024,
             max_sess: 4096,
@@ -646,6 +647,14 @@ impl Default for SmfConfig {
             pcc_rules: Vec::new(),
         }
     }
+}
+
+/// The N4 (PFCP) bind host: `SMF_PFCP_ADDR`, else loopback (#1308). An SMF whose
+/// UPF is on another host sets `SMF_PFCP_ADDR`.
+fn smf_pfcp_bind_host(env: Option<String>) -> String {
+    env.map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| nextgcore_core::sockaddr::DEFAULT_LISTEN_HOST.to_string())
 }
 
 fn load_config(path: &str) -> SmfConfig {
@@ -837,7 +846,10 @@ async fn main() -> Result<()> {
         } else {
             config.sbi_addr.as_str()
         };
-        format!("http://{host}:{}", config.sbi_port)
+        format!(
+            "http://{}",
+            nextgcore_sbi::uri_encode::uri_authority(host, config.sbi_port)
+        )
     });
     log::info!("SBI advertise URI for callbacks: {advertise_uri}");
     let _ = SELF_SBI_URI.set(advertise_uri.clone());
@@ -982,9 +994,15 @@ async fn main() -> Result<()> {
     log::info!("SMF state machine initialized");
 
     // Start SBI HTTP/2 server
-    let sbi_addr: SocketAddr = format!("{}:{}", config.sbi_addr, config.sbi_port)
-        .parse()
-        .context("Invalid SBI address")?;
+    let sbi_addr: SocketAddr =
+        nextgcore_core::sockaddr::parse_listen_addr(&config.sbi_addr, config.sbi_port)
+            .context("Invalid SBI address")?;
+    // #1308: loopback by default; say which setting opens it to remote peers.
+    nextgcore_core::sockaddr::warn_if_loopback_listener(
+        "SBI",
+        &sbi_addr,
+        "smf.sbi.server[0].address in the config file",
+    );
     let mut sbi_server_config = NextgcoreSbiServerConfig::new(sbi_addr);
     // Issue #63: resolve the SBI security profile, PRODUCTION by default. The
     // production profile requires OAuth2, so the outbound token client is
@@ -1050,15 +1068,19 @@ async fn main() -> Result<()> {
     // flow through this one socket so transactions can be matched by
     // sequence number (TS 29.244 7.2.1).
     let pfcp_bind_addr: SocketAddr = {
-        let addr = std::env::var("SMF_PFCP_ADDR").unwrap_or_else(|_| "0.0.0.0".to_string());
+        let addr = smf_pfcp_bind_host(std::env::var("SMF_PFCP_ADDR").ok());
         let port: u16 = std::env::var("SMF_PFCP_PORT")
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(8805);
-        format!("{addr}:{port}")
-            .parse()
+        nextgcore_core::sockaddr::parse_listen_addr(&addr, port)
             .context("Invalid SMF PFCP listen address")?
     };
+    nextgcore_core::sockaddr::warn_if_loopback_listener(
+        "N4 PFCP",
+        &pfcp_bind_addr,
+        "SMF_PFCP_ADDR",
+    );
     // Issue #20: UPF_PFCP_ADDR accepts a comma-separated peer list
     // ("10.0.0.5,10.0.0.6:8806"); an entry without a port uses
     // UPF_PFCP_PORT. A single entry — the default — behaves exactly as the
@@ -1091,8 +1113,11 @@ async fn main() -> Result<()> {
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty())
         };
+        // The bind the socket above uses, so an unset SMF_PFCP_ADDR (loopback, #1308)
+        // is the Node ID and F-SEID address too, never a routed address the socket
+        // does not listen on.
         let (bind, node_id, advertise) = (
-            env("SMF_PFCP_ADDR"),
+            Some(smf_pfcp_bind_host(env("SMF_PFCP_ADDR"))),
             env("SMF_PFCP_NODE_ID"),
             env("SMF_PFCP_ADVERTISE_ADDR"),
         );
@@ -12345,8 +12370,7 @@ mod tests {
             per_round.push(teardowns() - before);
             let left = fx.a.peer_recovery_time_stamp_for_test().await;
             assert!(
-                left.is_none()
-                    || left == Some(nextgcore_pfcp::recovery_time::normalize_received(stamp)),
+                left.is_none() || left == Some(stamp),
                 "round {i}: the teardown's clear, or the new stamp as a baseline: {left:?}"
             );
         }
@@ -25116,5 +25140,39 @@ mod path_switch_ack_tests {
                 .is_none(),
             "an unrelated context ref must not resolve to another session's tunnel"
         );
+    }
+}
+
+#[cfg(test)]
+mod default_bind_tests_1308 {
+    use super::*;
+
+    /// #1308: a config file without `smf.sbi.server` leaves the SBI listener on
+    /// loopback, not every interface; a file that names the address is kept.
+    #[test]
+    fn sbi_listener_defaults_to_loopback() {
+        assert_eq!(SmfConfig::default().sbi_addr, "127.0.0.1");
+        let config = load_config("/nonexistent/smf-1308.yaml");
+        assert_eq!(config.sbi_addr, "127.0.0.1");
+
+        let path = std::env::temp_dir().join(format!("smf-1308-{}.yaml", std::process::id()));
+        std::fs::write(
+            &path,
+            "smf:\n  sbi:\n    server:\n      - address: 0.0.0.0\n        port: 7777\n",
+        )
+        .unwrap();
+        let explicit = load_config(path.to_str().unwrap()).sbi_addr;
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(explicit, "0.0.0.0");
+    }
+
+    /// #1308: with SMF_PFCP_ADDR unset (or empty) N4 binds loopback; a set value is
+    /// kept, the wildcard included.
+    #[test]
+    fn n4_pfcp_listener_defaults_to_loopback() {
+        assert_eq!(smf_pfcp_bind_host(None), "127.0.0.1");
+        assert_eq!(smf_pfcp_bind_host(Some("  ".into())), "127.0.0.1");
+        assert_eq!(smf_pfcp_bind_host(Some("0.0.0.0".into())), "0.0.0.0");
+        assert_eq!(smf_pfcp_bind_host(Some(" 10.0.0.4 ".into())), "10.0.0.4");
     }
 }

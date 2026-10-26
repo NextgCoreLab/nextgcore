@@ -68,6 +68,10 @@ spec:
         - nf-binary
         - -c
         - /run/epc/cfg/hss.yaml
+        # S6a binds --diameter-addr, loopback by default (#1308): every pod
+        # interface, so the MME reaches it. Not exposed beyond the cluster.
+        - --diameter-addr
+        - 0.0.0.0
         env:
         - name: POD_IP
           valueFrom:
@@ -186,6 +190,10 @@ spec:
         - nf-binary
         - -c
         - /run/epc/cfg/pcrf.yaml
+        # Gx/Rx bind --diameter-addr, loopback by default (#1308): every pod
+        # interface, so the PGW-C reaches it. Not exposed beyond the cluster.
+        - --diameter-addr
+        - 0.0.0.0:3868
         env:
         - name: POD_IP
           valueFrom:
@@ -317,6 +325,12 @@ spec:
           value: "0.0.0.0"
         - name: EPC_EXPORT
           value: SGWC_PGW_S5C=pgwc SGWC_GTPU_ADVERTISE=sgwu
+        # S11/S5-C and Sxa bind these, loopback by default (#1308): every pod
+        # interface. sgwc.yaml's addresses are advertised, not bound.
+        - name: SGWC_S11_BIND
+          value: "0.0.0.0:2123"
+        - name: SGWC_PFCP_BIND_ADDR
+          value: "0.0.0.0:8805"
         # TS 23.007 §18: the GTP-C restart counter must survive the restart it
         # signals. The image's /var/lib/nextgcore is the container's writable
         # layer, which a container restart (the liveness probe's remedy) discards,
@@ -743,6 +757,12 @@ spec:
         # rendered sgwu.yaml's literal address with the headless Service name).
         - name: SGWU_PFCP_ALLOWED_PEERS
           value: sgwc.nextg-epc.svc.cluster.local
+        # S1-U/S5-U GTP-U and Sxa bind these, loopback by default (#1308): every
+        # pod interface.
+        - name: SGWU_GTPU_BIND
+          value: "0.0.0.0:2152"
+        - name: PFCP_BIND_ADDR
+          value: "0.0.0.0:8805"
         - name: POD_NAMESPACE
           valueFrom:
             fieldRef:

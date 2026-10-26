@@ -620,6 +620,21 @@ pub fn nr_ue_rx_tx_k5_report_to_ns(v: u16) -> Option<(f64, f64)> {
     Some(((lower + 16.0) * TC_NS, 32.0 * TC_NS))
 }
 
+/// An E-UTRA AoA report (`valueAngleOfArrival-EUTRA`, 0..719, TS 38.455 §9.2.5) as
+/// the clockwise bearing from North in degrees that [`solve_aoa`] takes (#1269).
+///
+/// TS 36.133 §10.2.1 Table 10.2.1-1: AOA_ANGLE_v is `[0.5·v, 0.5·(v+1))` degrees,
+/// 0..360 at 0.5 degree resolution; the bin midpoint is used. TS 36.214 §5.2.7
+/// measures it from geographical North, positive counter-clockwise, so its sign is
+/// flipped. Before, the report value was taken as the angle itself.
+pub fn eutra_aoa_to_bearing_deg(v: u16) -> Option<f64> {
+    if v > 719 {
+        return None;
+    }
+    let ccw = 0.5 * f64::from(v) + 0.25;
+    Some((-ccw).rem_euclid(360.0))
+}
+
 /// An NR UL azimuth angle of arrival report (`UL-AoA.azimuthAoA`, 0..3599, TS
 /// 38.455 §9.2.38) given in the global coordinate system, as the clockwise bearing
 /// from North in degrees that [`solve_aoa`] takes (#859).

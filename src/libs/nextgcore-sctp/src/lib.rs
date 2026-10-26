@@ -45,7 +45,7 @@ pub use kernel::KernelSctpSocket;
 pub mod kernel_server;
 
 #[cfg(all(feature = "kernel", feature = "sctp-proto"))]
-pub use kernel_server::KernelSctpServer;
+pub use kernel_server::{Admission, KernelSctpServer, Refusal};
 
 /// #1142: the answer to an out-of-the-blue packet (RFC 9260 §8.4).
 pub mod ootb;
@@ -83,6 +83,9 @@ pub const NEXTGCORE_SCTP_S1AP_PPID: u32 = 18;
 
 /// X2AP PPID
 pub const NEXTGCORE_SCTP_X2AP_PPID: u32 = 27;
+
+/// SBc-AP (MME - CBC) SCTP payload protocol identifier (TS 29.168 §4.1.3).
+pub const NEXTGCORE_SCTP_SBCAP_PPID: u32 = 24;
 
 /// SGsAP PPID
 pub const NEXTGCORE_SCTP_SGSAP_PPID: u32 = 0;

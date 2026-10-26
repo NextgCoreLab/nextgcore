@@ -1079,6 +1079,15 @@ pub(crate) fn nr_rsrp_dbm(v: u8) -> i16 {
     i16::from(v) - 157
 }
 
+/// TS 38.133 §10.1.24.3.1 Table 10.1.24.3.1-1, the LPP `nr-DL-PRS-RSRP-Result-r16`
+/// (0..126) of a Multi-RTT or DL-TDOA measurement: PRS_RSRP_0 is `< −156` dBm,
+/// PRS_RSRP_v is `[−157 + v, −156 + v)` dBm and PRS_RSRP_126 is `≥ −31` dBm. These
+/// are the SS-RSRP bins, read the same way, as the lower edge (#1278). The old
+/// `v − 140` was the E-UTRA RSRP offset (TS 36.133), 16 dB too high here.
+pub(crate) fn nr_prs_rsrp_dbm(v: u8) -> i16 {
+    nr_rsrp_dbm(v)
+}
+
 /// Map one LPP `NR-MeasuredResultsElement-r16` (TS 37.355 Rel-16
 /// `NR-ECID-SignalMeasurementInformation-r16`) to a [`CellMeasurement`].
 ///
@@ -1157,7 +1166,7 @@ pub fn lpp_nr_ecid_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<CellMe
 /// |---------------------------------|-------------------------|----------------------------------|
 /// | `nr-PhysCellID` (NR PCI)        | `nr_cgi`                | `"pci-<n>"`; `"prs-<id>"` fallback |
 /// | `nr-UE-RxTxTimeDiff` k-arm      | `ue_rx_tx_ns`           | bin midpoint (v·2^k − 2^(k−1) − 985024)·T_c ns, signed (TS 38.133 §10.1.25.3) |
-/// | `nr-DL-PRS-RSRP-Result`         | `rsrp`                  | 0..126 → −140..−14 dBm           |
+/// | `nr-DL-PRS-RSRP-Result`         | `rsrp`                  | 0..126 → `v − 157` dBm ([`nr_prs_rsrp_dbm`], TS 38.133 Table 10.1.24.3.1-1) |
 ///
 /// Returns an empty `Vec` when the message is not a `ProvideLocationInformation`,
 /// carries no `nr-Multi-RTT` body, or its signal measurement information is absent.
@@ -1184,7 +1193,7 @@ pub fn lpp_multi_rtt_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<Cell
             let rsrp = elem
                 .nr_dl_prs_rsrp_result_r16
                 .as_ref()
-                .map(|v| i16::from(v.0) - 140);
+                .map(|v| nr_prs_rsrp_dbm(v.0));
             CellMeasurement {
                 nr_ecid: None,
                 nr_cgi,
@@ -1305,7 +1314,7 @@ pub fn lpp_dl_tdoa_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<CellMe
         let rsrp = elem
             .nr_dl_prs_rsrp_result_r16
             .as_ref()
-            .map(|v| i16::from(v.0) - 140);
+            .map(|v| nr_prs_rsrp_dbm(v.0));
         out.push(CellMeasurement {
             nr_ecid: None,
             nr_cgi,
@@ -1630,7 +1639,8 @@ mod tests {
         let c = &cells[0];
         assert_eq!(c.nr_cgi, "02f839-000000001");
         assert_eq!(c.ecid_rtt_ns, Some(1001.0 * crate::positioning::TS_NS));
-        assert_eq!(c.aoa, Some(90.0));
+        // AOA_ANGLE_090 is [45, 45.5) degrees counter-clockwise (#1269).
+        assert_eq!(c.aoa, Some(314.75));
         // Best RSRP item = 60 → 60 − 140 = −80 dBm.
         assert_eq!(c.rsrp, Some(-80));
     }
@@ -1659,8 +1669,8 @@ mod tests {
         // and not an RTT).
         let c0 = &cells[0];
         assert_eq!(c0.nr_cgi, "pci-123");
-        // nr_dl_prs_rsrp_result=80 → 80 − 140 = −60 dBm.
-        assert_eq!(c0.rsrp, Some(-60));
+        // nr_dl_prs_rsrp_result=80: PRS_RSRP_80 is [−77, −76) dBm (#1278).
+        assert_eq!(c0.rsrp, Some(-77));
         assert_eq!(c0.rtt_ns, None, "the UE half is not an RTT");
         let rx_tx0 = c0.ue_rx_tx_ns.expect("ue_rx_tx_ns cell 0");
         assert!((rx_tx0 - 214_974.0 * TC_NS).abs() < 1e-6, "{rx_tx0}");
@@ -1699,6 +1709,16 @@ mod tests {
         assert!(nrrstd_to_signed_ns(TimeReport { v: 1_970_049, k: 0 }) > 500_000.0);
     }
 
+    /// #1278: TS 38.133 Table 10.1.24.3.1-1, at its edges: PRS_RSRP_0 `< −156`,
+    /// PRS_RSRP_1 `[−156, −155)`, PRS_RSRP_126 `≥ −31` dBm.
+    #[test]
+    fn prs_rsrp_follows_table_10_1_24_3_1_1() {
+        assert_eq!(super::nr_prs_rsrp_dbm(0), -157);
+        assert_eq!(super::nr_prs_rsrp_dbm(1), -156);
+        assert_eq!(super::nr_prs_rsrp_dbm(17), -140);
+        assert_eq!(super::nr_prs_rsrp_dbm(126), -31);
+    }
+
     /// LPP NR-DL-TDOA round-trip: build → UPER encode → decode → adapt.
     /// The reference TRP leads with rstd_ns 0; each element carries its signed RSTD.
     #[test]
@@ -1720,7 +1740,7 @@ mod tests {
         // Element: PCI present → "pci-123"; K0(985_124) is [99, 100) T_c (#1270: the
         // midpoint 99.5·T_c).
         assert_eq!(cells[1].nr_cgi, "pci-123");
-        assert_eq!(cells[1].rsrp, Some(-40)); // 100 − 140
+        assert_eq!(cells[1].rsrp, Some(-57)); // PRS_RSRP_100: [−57, −56) dBm (#1278)
         let rstd = cells[1].rstd_ns.expect("rstd_ns");
         assert!((rstd - 99.5 * TC_NS).abs() < 1e-6, "rstd_ns={rstd}");
     }
@@ -1743,8 +1763,8 @@ mod tests {
         assert_eq!(req_id, 42);
         assert_eq!(cells.len(), 1);
         assert_eq!(cells[0].nr_cgi, "pci-321");
-        // nr_dl_prs_rsrp_result=80 -> 80 - 140 = -60 dBm.
-        assert_eq!(cells[0].rsrp, Some(-60));
+        // nr_dl_prs_rsrp_result=80: PRS_RSRP_80 is [−77, −76) dBm (#1278).
+        assert_eq!(cells[0].rsrp, Some(-77));
         // K1(200_000): [−585_026, −585_024) T_c of UE Rx–Tx, signed (#713), at its
         // midpoint (#1270).
         assert_eq!(cells[0].rtt_ns, None);

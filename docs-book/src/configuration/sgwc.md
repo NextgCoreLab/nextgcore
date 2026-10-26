@@ -74,9 +74,9 @@ From the clap `Args` struct in `src/bins/nextgcore-sgwcd/src/main.rs`:
     a path that only blinked would make a conformant SGW-U drop every session (TS 29.244
     §6.2.6.2.2).
   - A newer Recovery Time Stamp means the SGW-U restarted. The stamp is carried in its
-    Heartbeat Response and in its own Heartbeat Request. It is normalised to NTP seconds
-    (#995), so a pre-#995 SGW-U's Unix seconds do not read as a restart, and an older stamp
-    from a reordered message is ignored. After a restart:
+    Heartbeat Response and in its own Heartbeat Request. It is NTP-era seconds
+    (TS 29.244 §8.2.65), compared as sent (#1033), and an older stamp from a reordered
+    message is ignored. After a restart:
     - the association is set up again;
     - every established PFCP session is established again with the same CP F-SEID, F-TEIDs,
       PDRs and FARs. The SGW-C allocates them all, so the MME and the PGW keep their
@@ -111,12 +111,12 @@ From the clap `Args` struct in `src/bins/nextgcore-sgwcd/src/main.rs`:
 
   | Variable | Default | Effect |
   |---|---|---|
-  | `SGWC_S11_BIND` | `0.0.0.0:2123` | S11 GTPv2-C UDP bind `address:port`. |
+  | `SGWC_S11_BIND` | `127.0.0.1:2123` (loopback, #1308) | S11 GTPv2-C UDP bind `address:port`. |
   | `SGWC_S11_ADVERTISE` | unset | Advertised control-plane IPv4; consulted only when the bound address is a wildcard. Falls back to `sgwc.gtpc.server[0].address`. |
   | `SGWC_GTPU_ADVERTISE` | unset (falls back to the bound or `SGWC_S11_ADVERTISE` address, not the YAML one) | SGW-U user-plane IPv4 placed in S1-U/S5-U F-TEIDs. The EPC compose sets it to the SGW-U (`172.24.0.6`). |
   | `SGWC_PGW_S5C` | unset | PGW-C S5/S8 peer (`ip` or `ip:port`, port `2123` by default). **Unset means the SGW-C refuses an S11 Create Session Request** rather than answering it from local state. The EPC compose sets `172.24.0.4`. |
   | `SGWC_S5C_ADVERTISE` | the S11 address | Dedicated S5-C address, if different from S11. |
-  | `SGWC_PFCP_BIND_ADDR` | `0.0.0.0:8805` | Sxa PFCP bind `address:port`. |
+  | `SGWC_PFCP_BIND_ADDR` | `127.0.0.1:8805` (loopback, #1308) | Sxa PFCP bind `address:port`. |
   | `SGWC_PFCP_NODE_IP` | `sgwc.pfcp.server[0].address`, then `127.0.0.1` | PFCP Node ID (IPv4). |
   | `SGWC_SGWU_ADDR` | `sgwc.pfcp.client.sgwu`, then `127.0.0.1:8805` | SGW-U override (`ip` or `ip:port`). |
   | `SGWC_ECHO_INTERVAL_SECS` | `60` | GTPv2-C Echo interval; `0` disables probing. |

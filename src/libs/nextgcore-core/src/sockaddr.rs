@@ -150,8 +150,10 @@ pub fn nextgcore_addaddrinfo(
     use std::net::ToSocketAddrs;
 
     let host = hostname.unwrap_or("");
+    // No host is loopback, never the wildcard (#1308): a caller that wants every
+    // interface names `0.0.0.0` itself.
     let addr_str = if host.is_empty() {
-        format!("0.0.0.0:{port}")
+        format!("{DEFAULT_LISTEN_HOST}:{port}")
     } else if host.contains(':') {
         // IPv6 address
         format!("[{host}]:{port}")
@@ -557,5 +559,157 @@ mod tests {
 
         let ipsub = nextgcore_ipsubnet("10.0.0.1", None).unwrap();
         assert_eq!(ipsub.family, libc::AF_INET);
+    }
+}
+
+/// The host every nextgcore listener binds when its address is not configured
+/// (#1308): loopback, so a daemon started with its defaults on a bare-metal host
+/// is reachable from that host only. A deployment whose peers are on other hosts
+/// names the address it listens on (a container or pod's own network, or a
+/// private interface of the host).
+pub const DEFAULT_LISTEN_HOST: &str = "127.0.0.1";
+
+/// The startup warning for a listener bound to a loopback address (#1308), naming
+/// `setting`, the option that opens it to peers on other hosts. `None` when `addr`
+/// is not loopback.
+pub fn loopback_listener_warning(
+    listener: &str,
+    addr: &SocketAddr,
+    setting: &str,
+) -> Option<String> {
+    addr.ip().is_loopback().then(|| {
+        format!(
+            "{listener} listens on {addr}, a loopback address: peers on other hosts cannot \
+             reach it. Set {setting} to an address of this host that those peers can reach \
+             (a private network, never a public one) to accept them"
+        )
+    })
+}
+
+/// Log [`loopback_listener_warning`] at warn level, if there is one.
+pub fn warn_if_loopback_listener(listener: &str, addr: &SocketAddr, setting: &str) {
+    if let Some(warning) = loopback_listener_warning(listener, addr, setting) {
+        log::warn!("{warning}");
+    }
+}
+
+/// A listen address given as a host and a port, which is not an IP literal (#1298).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenAddrError(String);
+
+impl std::fmt::Display for ListenAddrError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ListenAddrError {}
+
+/// The socket address to listen on for a configured `host` and `port` (#1298).
+///
+/// `host` must be an IP literal: an IPv4 address, or an IPv6 address with or without
+/// square brackets (`fd00::1` and `[fd00::1]` are the same). Anything else is an error
+/// for the caller to fail on: no name is resolved, and there is no fallback to a
+/// wildcard address, so a bad value never widens what a daemon listens on.
+///
+/// Before, every daemon built `format!("{host}:{port}")` and parsed that, which works
+/// for IPv4 only: `fd00::1:7777` is not a socket address, so an IPv6 address failed
+/// at startup.
+pub fn parse_listen_addr(host: &str, port: u16) -> Result<std::net::SocketAddr, ListenAddrError> {
+    let literal = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    literal
+        .parse::<std::net::IpAddr>()
+        .map(|ip| std::net::SocketAddr::new(ip, port))
+        .map_err(|_| {
+            ListenAddrError(format!(
+                "listen address '{host}' is not an IPv4 or IPv6 address (port {port})"
+            ))
+        })
+}
+
+#[cfg(test)]
+mod tests_parse_listen_addr {
+    use super::parse_listen_addr;
+
+    #[test]
+    fn ipv4_ipv6_and_a_bad_value() {
+        assert_eq!(
+            parse_listen_addr("127.0.0.1", 7777).unwrap().to_string(),
+            "127.0.0.1:7777"
+        );
+        assert_eq!(
+            parse_listen_addr("0.0.0.0", 7777).unwrap().to_string(),
+            "0.0.0.0:7777",
+            "a configured wildcard is kept as it is, not changed"
+        );
+        assert_eq!(
+            parse_listen_addr("fd00::1", 7777).unwrap().to_string(),
+            "[fd00::1]:7777"
+        );
+        assert_eq!(
+            parse_listen_addr("[fd00::1]", 7777).unwrap().to_string(),
+            "[fd00::1]:7777"
+        );
+        assert_eq!(
+            parse_listen_addr("::1", 80).unwrap().to_string(),
+            "[::1]:80"
+        );
+        for bad in [
+            "amf.example.org",
+            "",
+            "300.1.1.1",
+            "10.0.0.1:7777",
+            "[fd00::1",
+            "[10.0.0.1]x",
+        ] {
+            let e = parse_listen_addr(bad, 7777).unwrap_err();
+            assert!(
+                e.to_string().contains("is not an IPv4 or IPv6 address"),
+                "{bad}: {e}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_default_listen_host {
+    use super::*;
+
+    /// #1308: the default listener host is loopback, not the wildcard.
+    #[test]
+    fn the_default_listen_host_is_loopback() {
+        assert_eq!(DEFAULT_LISTEN_HOST, "127.0.0.1");
+        let a = parse_listen_addr(DEFAULT_LISTEN_HOST, 7777).unwrap();
+        assert!(a.ip().is_loopback(), "{a}");
+    }
+
+    /// #1308: a getaddrinfo with no host gives loopback, not 0.0.0.0.
+    #[test]
+    fn no_host_is_loopback() {
+        let sa = nextgcore_getaddrinfo(libc::AF_INET, None, 7777, 0).unwrap();
+        assert_eq!(sa.addr.to_string(), "127.0.0.1:7777");
+    }
+
+    /// #1308: the warning names the listener, the address and the setting, and is
+    /// only given for a loopback bind.
+    #[test]
+    fn the_loopback_warning_names_the_setting() {
+        let lo: SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        let w = loopback_listener_warning("SBI", &lo, "--sbi-addr").unwrap();
+        assert!(w.starts_with("SBI listens on 127.0.0.1:7777"), "{w}");
+        assert!(w.contains("Set --sbi-addr"), "{w}");
+        let lo6: SocketAddr = "[::1]:38412".parse().unwrap();
+        assert!(loopback_listener_warning("NGAP", &lo6, "--ngap-addr").is_some());
+        for other in ["0.0.0.0:7777", "10.0.0.5:7777", "[fd00::1]:7777"] {
+            let a: SocketAddr = other.parse().unwrap();
+            assert_eq!(
+                loopback_listener_warning("SBI", &a, "--sbi-addr"),
+                None,
+                "{other}"
+            );
+        }
     }
 }

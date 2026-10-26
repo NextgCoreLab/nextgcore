@@ -138,7 +138,7 @@ struct Args {
     config: String,
     #[arg(short = 'e', long)]
     log_level: Option<String>,
-    #[arg(long, default_value = "0.0.0.0")]
+    #[arg(long, default_value = nextgcore_core::sockaddr::DEFAULT_LISTEN_HOST)]
     sbi_addr: String,
     #[arg(long, default_value = "7777")]
     sbi_port: u16,
@@ -398,11 +398,16 @@ async fn main() -> Result<()> {
         .context("installing the signal handler")?;
     }
 
-    let addr: SocketAddr = format!("{}:{}", args.sbi_addr, args.sbi_port)
-        .parse()
-        .context("Invalid SBI address")?;
+    let addr: SocketAddr =
+        nextgcore_core::sockaddr::parse_listen_addr(&args.sbi_addr, args.sbi_port)
+            .context("Invalid SBI address")?;
+    // #1308: loopback by default; say which setting opens it to remote peers.
+    nextgcore_core::sockaddr::warn_if_loopback_listener("SBI", &addr, "--sbi-addr");
     let scheme = if args.tls { "https" } else { "http" };
-    let _ = API_ROOT.set(format!("{scheme}://{}:{}", args.sbi_addr, args.sbi_port));
+    let _ = API_ROOT.set(format!(
+        "{scheme}://{}",
+        nextgcore_sbi::uri_encode::uri_authority(&args.sbi_addr, args.sbi_port)
+    ));
 
     let mut sbi_config = NextgcoreSbiServerConfig::new(addr);
     if args.tls {
@@ -2032,6 +2037,13 @@ mod tests {
             (r.status, cause(&r)),
             (500, json!("INSUFFICIENT_RESOURCES"))
         );
+    }
+
+    /// #1308: with no flag the SBI listener binds loopback, not every interface.
+    #[test]
+    fn sbi_listener_defaults_to_loopback_1308() {
+        let args = Args::parse_from(["nextgcore-ucmfd"]);
+        assert_eq!(args.sbi_addr, "127.0.0.1");
     }
 
     #[test]

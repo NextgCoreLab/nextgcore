@@ -1226,8 +1226,8 @@ impl SxaNode {
                     fsm,
                 }
             });
-            // #995: in the NTP reading (a pre-#995 SGW-C sends Unix seconds).
-            let rts = nextgcore_pfcp::recovery_time::normalize_received(req.recovery_time_stamp);
+            // TS 29.244 §8.2.65: NTP-era seconds, kept as sent (#1033).
+            let rts = req.recovery_time_stamp;
             let restarted = matches!(peer.recovery_time_stamp, Some(stored) if stored != rts);
             peer.state = PfcpNodeState::Associated;
             peer.recovery_time_stamp = Some(rts);
@@ -1327,8 +1327,6 @@ impl SxaNode {
 
     /// Record a peer's Recovery Time Stamp, flushing its sessions if it changed.
     async fn note_peer_recovery_time_stamp(&self, from: SocketAddr, rts: u32) {
-        // #995: in the NTP reading, as stored at association.
-        let rts = nextgcore_pfcp::recovery_time::normalize_received(rts);
         let restarted = {
             let mut peers = self.peers.write().await;
             let Some(peer) = peers.get_mut(&from) else {
@@ -2261,15 +2259,26 @@ fn modification_from_lib(
 // PFCP Path Functions
 // ============================================================================
 
+/// The Sxa bind address: `PFCP_BIND_ADDR`, else loopback on the PFCP port (#1308).
+/// An SGW-U whose SGW-C is on another host sets `PFCP_BIND_ADDR`.
+fn sxa_bind(env: Option<String>) -> String {
+    env.filter(|v| !v.trim().is_empty()).unwrap_or_else(|| {
+        format!(
+            "{}:{PFCP_PORT}",
+            nextgcore_core::sockaddr::DEFAULT_LISTEN_HOST
+        )
+    })
+}
+
 /// Open the Sxa PFCP socket and start serving (issue #59).
 ///
 /// Replaces the log-only `pfcp_open`. `PFCP_BIND_ADDR` / `PFCP_NODE_IP` override the
 /// defaults so a test — or a host with several interfaces — can pick both.
 pub async fn pfcp_open() -> Result<Arc<SxaNode>, String> {
-    let bind: SocketAddr = std::env::var("PFCP_BIND_ADDR")
-        .unwrap_or_else(|_| format!("0.0.0.0:{PFCP_PORT}"))
+    let bind: SocketAddr = sxa_bind(std::env::var("PFCP_BIND_ADDR").ok())
         .parse()
         .map_err(|e| format!("PFCP_BIND_ADDR is not a socket address: {e}"))?;
+    nextgcore_core::sockaddr::warn_if_loopback_listener("Sxa PFCP", &bind, "PFCP_BIND_ADDR");
     // The Node ID: PFCP_NODE_IP, then `sgwu.pfcp.server[0].address` (#482), then
     // loopback, which a remote SGW-C cannot use as the association identifier it
     // stores (TS 29.244 §6.2.6.2.2).
@@ -3484,8 +3493,8 @@ mod tests {
 
     /// A bound node plus a socket standing in for the SGW-C.
     /// #995: the SGW-U's own Recovery Time Stamp is NTP-era seconds (TS 29.244
-    /// §8.2.65), and a pre-#995 SGW-C's Unix-seconds stamp is stored in the NTP
-    /// reading, so the same SGW-C re-associating with it is not a restart.
+    /// §8.2.65), and a received stamp is stored as sent (#1033): a Unix-seconds
+    /// stamp (a 0.1.x SGW-C) is not re-read as NTP.
     #[tokio::test]
     async fn recovery_time_stamps_are_ntp_seconds() {
         let (_guard, node, peer) = node_and_peer().await;
@@ -3516,10 +3525,7 @@ mod tests {
             .into_iter()
             .find(|p| p.addr == peer.local_addr().unwrap())
             .and_then(|p| p.recovery_time_stamp);
-        assert_eq!(
-            stored,
-            Some(nextgcore_pfcp::recovery_time::from_unix_secs(unix))
-        );
+        assert_eq!(stored, Some(unix as u32), "as sent, not normalised");
     }
 
     async fn node_and_peer() -> (SxaTestGuard, Arc<SxaNode>, UdpSocket) {
@@ -4945,5 +4951,19 @@ mod tests {
             err.contains("not running"),
             "the error must name why nothing was sent, got {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod default_bind_tests_1308 {
+    use super::sxa_bind;
+
+    /// #1308: with PFCP_BIND_ADDR unset (or empty) Sxa binds loopback, not every
+    /// interface; a set value is kept, the wildcard included.
+    #[test]
+    fn sxa_listener_defaults_to_loopback() {
+        assert_eq!(sxa_bind(None), "127.0.0.1:8805");
+        assert_eq!(sxa_bind(Some(" ".into())), "127.0.0.1:8805");
+        assert_eq!(sxa_bind(Some("0.0.0.0:8805".into())), "0.0.0.0:8805");
     }
 }

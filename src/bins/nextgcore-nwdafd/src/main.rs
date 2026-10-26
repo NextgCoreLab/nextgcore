@@ -61,7 +61,7 @@ struct Args {
     no_color: bool,
 
     /// SBI server address
-    #[arg(long, default_value = "0.0.0.0")]
+    #[arg(long, default_value = nextgcore_core::sockaddr::DEFAULT_LISTEN_HOST)]
     sbi_addr: String,
 
     /// SBI server port
@@ -287,7 +287,10 @@ async fn main() -> Result<()> {
         } else {
             args.sbi_addr.as_str()
         };
-        let base = format!("{scheme}://{host}:{}", args.sbi_port);
+        let base = format!(
+            "{scheme}://{}",
+            nextgcore_sbi::uri_encode::uri_authority(host, args.sbi_port)
+        );
         let ctx = nwdaf_self();
         let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
         guard.set_sbi_base_uri(&base);
@@ -313,9 +316,11 @@ async fn main() -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(shutdown.clone());
 
-    let addr: SocketAddr = format!("{}:{}", args.sbi_addr, args.sbi_port)
-        .parse()
-        .context("Invalid SBI address")?;
+    let addr: SocketAddr =
+        nextgcore_core::sockaddr::parse_listen_addr(&args.sbi_addr, args.sbi_port)
+            .context("Invalid SBI address")?;
+    // #1308: loopback by default; say which setting opens it to remote peers.
+    nextgcore_core::sockaddr::warn_if_loopback_listener("SBI", &addr, "--sbi-addr");
 
     let mut sbi_server_config = NextgcoreSbiServerConfig::new(addr);
     if args.tls {
@@ -376,8 +381,8 @@ async fn main() -> Result<()> {
             guard.set_nrf_collector_config(NrfCollectorConfig {
                 nrf_uri: args.nrf_uri.clone(),
                 callback_uri: format!(
-                    "http://{}:{}/nnwdaf-nfstatus-notify/v1/notify",
-                    args.sbi_addr, args.sbi_port
+                    "http://{}/nnwdaf-nfstatus-notify/v1/notify",
+                    nextgcore_sbi::uri_encode::uri_authority(&args.sbi_addr, args.sbi_port)
                 ),
             });
         }
@@ -721,6 +726,13 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1308: with no flag the SBI listener binds loopback, not every interface.
+    #[test]
+    fn sbi_listener_defaults_to_loopback_1308() {
+        let args = Args::parse_from(["nextgcore-nwdafd"]);
+        assert_eq!(args.sbi_addr, "127.0.0.1");
+    }
 
     #[test]
     fn test_args_default() {

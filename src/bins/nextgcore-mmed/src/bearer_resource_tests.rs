@@ -87,14 +87,12 @@ fn is_brc(sgw: &UdpSocket) -> Gtp2Message {
     recv(sgw, crate::s11_build::message_type::BEARER_RESOURCE_COMMAND).0
 }
 
-/// The plain ESM message `esm_type` of the next DOWNLINK NAS TRANSPORT. Filtered by
-/// type: tests on their own `MmeContext` number their eNBs from 1 as well, and
-/// their S1AP reaches the same tap.
+/// The plain ESM message of the next DOWNLINK NAS TRANSPORT, which must be
+/// `esm_type`. Not filtered: since #1295 no other test's PDUs reach this eNB's tap.
 fn next_dl_esm(ue: &Ue, esm_type: u8) -> Vec<u8> {
-    wait_pdu(ue.enb_id, |pdu| {
-        dl_nas(pdu)
-            .filter(|p| p.first().map(|o| o & 0x0f) == Some(2) && p.get(2) == Some(&esm_type))
-    })
+    let esm = wait_pdu(ue.enb_id, dl_nas);
+    assert_eq!(esm.get(2), Some(&esm_type), "the next DL NAS is {esm:02x?}");
+    esm
 }
 
 fn erab_release_nas(pdu: &g::S1AP_PDU) -> Option<Vec<u8>> {
@@ -198,6 +196,29 @@ fn an_allocation_request_the_mme_refuses_is_rejected_at_once() {
     assert_eq!(&next_dl_esm(&ue, 0xd5)[..4], &[0x02, 9, 0xd5, 43]);
     ue_esm(&ue, &bra(0xff, 5));
     assert_eq!(&next_dl_esm(&ue, 0xd5)[..4], &[0x02, 0xff, 0xd5, 81]);
+    assert!(quiet(&sgw), "no Command");
+    release(&ue);
+}
+
+/// TS 24.301 §6.5.3.6 b) / §6.5.4.6 b): on a PDN connection for emergency bearer
+/// services (request type "emergency", §9.9.4.14) an allocation is rejected #31 and
+/// a modification #30, with no Command (#1292 review MINOR 1).
+#[test]
+fn a_request_on_an_emergency_pdn_connection_is_rejected() {
+    let (_guard, sgw, _route, ue) = setup();
+    with_dedicated(&ue, 6);
+    mme_self()
+        .sess_pool
+        .write()
+        .unwrap()
+        .get_mut(&ue.sess_id)
+        .unwrap()
+        .ue_request_type = 4;
+
+    ue_esm(&ue, &bra(14, 5));
+    assert_eq!(&next_dl_esm(&ue, 0xd5)[..4], &[0x02, 14, 0xd5, 31]);
+    ue_esm(&ue, &brm(15, 6, &TFA_DELETE, true));
+    assert_eq!(&next_dl_esm(&ue, 0xd7)[..4], &[0x02, 15, 0xd7, 30]);
     assert!(quiet(&sgw), "no Command");
     release(&ue);
 }

@@ -2847,6 +2847,7 @@ dependencies = [
  "nextgcore-ngap",
  "nextgcore-s1ap",
  "nextgcore-s1ap-gen",
+ "nextgcore-sbcap-gen",
  "nextgcore-sctp",
  "proptest",
  "serde",

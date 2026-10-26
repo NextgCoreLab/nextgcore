@@ -55,7 +55,7 @@ These are the fields actually deserialized by the daemon (`#[derive(Deserialize)
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `udm.sbi.server[].address` | string | absent → CLI `--sbi-addr` (`0.0.0.0`) | Only the **first** list entry is read. Overrides the CLI bind address and becomes the address advertised in the NRF NFProfile. |
+| `udm.sbi.server[].address` | string | absent → CLI `--sbi-addr` (`127.0.0.1`, #1308) | Only the **first** list entry is read. Overrides the CLI bind address and becomes the address advertised in the NRF NFProfile. |
 | `udm.sbi.server[].port` | u16 | absent → CLI `--sbi-port` (`7777`) | First entry only; overrides the CLI SBI port. |
 | `udm.sbi.client.nrf[].uri` | string | absent → **no NRF registration** | First entry only; seeds the NRF URI in the shared SBI context. If absent, NRF registration is skipped entirely (debug log) and the UDM operates without NRF. |
 | `udm.sbi.oauth2.require` | bool | `false` | SBI OAuth2 enforcement (Wave-6 H8; TS 33.501 §13.4.1, TS 29.510 §5.4.2 per code comments). Read via a raw YAML scan that is root-key agnostic (true iff *any* top-level section sets `sbi.oauth2.require: true`). The env var `NEXTGCORE_SBI_OAUTH2_REQUIRE` takes precedence over the YAML. When on, incoming requests must carry an NRF-issued Bearer token with audience `UDM` (verified against the NRF JWKS; fails closed with 503 when no NRF URI is configured, per code comment) and outbound SBI calls attach tokens. |
@@ -89,7 +89,7 @@ From the clap `Args` struct in `src/bins/nextgcore-udmd/src/app.rs` (the binary'
 | `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-m, --no-color` | flag | off | Disable color output. |
 | `-k, --kill` | flag | off | Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor. |
-| `--sbi-addr` | string | `0.0.0.0` | SBI bind address — **overridden** by `udm.sbi.server[0].address` when present in the YAML. |
+| `--sbi-addr` | string | `127.0.0.1` (loopback, #1308) | SBI bind address — **overridden** by `udm.sbi.server[0].address` when present in the YAML. |
 | `--sbi-port` | u16 | `7777` | SBI port — **overridden** by `udm.sbi.server[0].port` when present in the YAML. |
 | `--tls` | flag | off | Stored only in the legacy `SbiServerConfig` placeholder (affects its reported URI scheme). The HTTP/2 listener's TLS comes from `NEXTGCORE_SBI_PROFILE`: under `production` (the default) it serves mutually-authenticated TLS; under `dev` (what every shipped deployment sets) it is plaintext. |
 | `--tls-cert` | path | unset | Same placeholder-only caveat as `--tls`. |

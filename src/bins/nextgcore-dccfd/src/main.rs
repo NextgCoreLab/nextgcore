@@ -52,7 +52,7 @@ struct Args {
     no_color: bool,
 
     /// SBI bind address
-    #[arg(long, default_value = "0.0.0.0")]
+    #[arg(long, default_value = nextgcore_core::sockaddr::DEFAULT_LISTEN_HOST)]
     sbi_addr: String,
 
     /// SBI port (TS 29.574 default: 7816)
@@ -284,9 +284,11 @@ async fn main() -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(shutdown.clone());
 
-    let bind_addr: SocketAddr = format!("{}:{}", args.sbi_addr, args.sbi_port)
-        .parse()
-        .context("Invalid SBI bind address")?;
+    let bind_addr: SocketAddr =
+        nextgcore_core::sockaddr::parse_listen_addr(&args.sbi_addr, args.sbi_port)
+            .context("Invalid SBI bind address")?;
+    // #1308: loopback by default; say which setting opens it to remote peers.
+    nextgcore_core::sockaddr::warn_if_loopback_listener("SBI", &bind_addr, "--sbi-addr");
     log::info!("DCCF SBI listening on {bind_addr}");
 
     let mut sbi_config = SbiServerConfig::new(bind_addr);
@@ -1437,5 +1439,18 @@ mod data_management_tests {
             "coordination is off by default: no producer is dialled"
         );
         clear_subscriptions();
+    }
+}
+
+#[cfg(test)]
+mod default_bind_tests {
+    use super::Args;
+    use clap::Parser;
+
+    /// #1308: with no flag the SBI listener binds loopback, not every interface.
+    #[test]
+    fn sbi_listener_defaults_to_loopback_1308() {
+        let args = Args::parse_from(["nextgcore-dccfd"]);
+        assert_eq!(args.sbi_addr, "127.0.0.1");
     }
 }

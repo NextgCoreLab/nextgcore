@@ -68,7 +68,7 @@ struct Args {
     #[arg(short = 'm', long)]
     no_color: bool,
 
-    #[arg(long, default_value = "0.0.0.0")]
+    #[arg(long, default_value = nextgcore_core::sockaddr::DEFAULT_LISTEN_HOST)]
     sbi_addr: String,
 
     #[arg(long, default_value = "7816")]
@@ -303,16 +303,21 @@ async fn main() -> Result<()> {
         };
         if let Ok(context) = lmf_self().read() {
             context.set_nf_instance_id(nf_instance_id.clone());
-            context.set_callback_base(format!("http://{advertised_host}:{}", args.sbi_port));
+            context.set_callback_base(format!(
+                "http://{}",
+                nextgcore_sbi::uri_encode::uri_authority(advertised_host, args.sbi_port)
+            ));
         }
     }
 
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(shutdown.clone());
 
-    let addr: SocketAddr = format!("{}:{}", args.sbi_addr, args.sbi_port)
-        .parse()
-        .context("Invalid SBI address")?;
+    let addr: SocketAddr =
+        nextgcore_core::sockaddr::parse_listen_addr(&args.sbi_addr, args.sbi_port)
+            .context("Invalid SBI address")?;
+    // #1308: loopback by default; say which setting opens it to remote peers.
+    nextgcore_core::sockaddr::warn_if_loopback_listener("SBI", &addr, "--sbi-addr");
 
     let mut sbi_server_config = NextgcoreSbiServerConfig::new(addr);
     if args.tls {
@@ -3745,6 +3750,13 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1308: with no flag the SBI listener binds loopback, not every interface.
+    #[test]
+    fn sbi_listener_defaults_to_loopback_1308() {
+        let args = Args::parse_from(["nextgcore-lmfd"]);
+        assert_eq!(args.sbi_addr, "127.0.0.1");
+    }
 
     #[test]
     fn test_args_default() {

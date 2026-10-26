@@ -109,7 +109,7 @@ From the clap `Args` struct in `src/bins/nextgcore-tsctsf/src/main.rs`:
 | `-l, --log-file` | unset | Log file path. |
 | `-e, --log-level` | `info` | Log level. |
 | `-m, --no-color` | off | Disable colour output. |
-| `--sbi-addr` | `0.0.0.0` | SBI bind address. |
+| `--sbi-addr` | `127.0.0.1` (loopback, #1308) | SBI bind address. |
 | `--sbi-port` | `7819` | SBI port. |
 | `--tls`, `--tls-cert`, `--tls-key` | off / unset | TLS for the SBI server. |
 | `--nrf-uri` | `http://127.0.0.1:7777` | NRF location for registration and the OAuth2 JWKS. |

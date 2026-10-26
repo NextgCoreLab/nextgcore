@@ -61,7 +61,7 @@ These are the fields actually deserialized by the daemon (`#[derive(Deserialize)
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `nssf.sbi.server[].address` | string | absent → CLI `--sbi-addr` (`0.0.0.0`) | SBI bind/advertised address. Only the **first** list entry is read; when present it **overrides** the CLI flag so the NRF NFProfile advertises a reachable endpoint (per code comment). |
+| `nssf.sbi.server[].address` | string | absent → CLI `--sbi-addr` (`127.0.0.1`, #1308) | SBI bind/advertised address. Only the **first** list entry is read; when present it **overrides** the CLI flag so the NRF NFProfile advertises a reachable endpoint (per code comment). |
 | `nssf.sbi.server[].port` | u16 | absent → CLI `--sbi-port` (`7777`) | SBI port; same first-entry-only, overrides-CLI semantics. |
 | `nssf.sbi.client.nrf[].uri` | string | absent → **no NRF registration** | NRF base URI (only the first list entry is used). Absent means the daemon skips NRF registration/heartbeat/discovery entirely and runs standalone — there is **no** CLI fallback for the NRF URI in this binary. `uri` is mandatory inside an entry (non-`Option` field). |
 | `nssf.sbi.oauth2.require` | bool | **`true`** (#94) | SBI OAuth2 bearer-token enforcement. When enabled, incoming requests must carry an NRF-issued token whose audience includes `NSSF`, verified against the NRF JWKS (TS 33.501 §13.4.1); with no NRF URI configured the server fails closed (503). Outbound SBI calls (including availability notifications to AMFs) attach tokens. No CLI override exists. **It now DEFAULTS TO ENABLED, and an absent `oauth2` section means enforce.** This knob also governs whether NSSAI-availability writes must be bound to an attested caller (below), because binding is only meaningful against an authenticated identity. Every dev artefact (docker `nssf.yaml`, the k8s and Helm ConfigMaps) was given an explicit `require: false` in the same change as the flip, so nothing silently broke; those deployments log a startup WARNING naming the exposure. |
@@ -94,7 +94,7 @@ From the clap `Args` struct in `src/bins/nextgcore-nssfd/src/main.rs`:
 | `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-m, --no-color` | flag | off | Disable color output. |
 | `-k, --kill` | flag | off | Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor. |
-| `--sbi-addr` | string | `0.0.0.0` | SBI bind address — **overridden** by `nssf.sbi.server[0].address` when the YAML sets it. |
+| `--sbi-addr` | string | `127.0.0.1` (loopback, #1308) | SBI bind address — **overridden** by `nssf.sbi.server[0].address` when the YAML sets it. |
 | `--sbi-port` | u16 | `7777` | SBI port — overridden by `nssf.sbi.server[0].port`. |
 | `--tls` | flag | off | Recorded in the legacy `SbiServerConfig` (`sbi_path.rs`) only; the actual HTTP/2 listener in `main.rs` is built without TLS, so the SBI server always speaks cleartext HTTP/2. |
 | `--tls-cert` | path | unset | Same caveat as `--tls`. |

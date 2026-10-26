@@ -70,7 +70,7 @@ From the clap `Args` struct in `src/bins/nextgcore-hssd/src/main.rs`:
 | `--diameter-config` | string | `/etc/nextgcore/freeDiameter/hss.conf` | **Accepted but unused** — no code reads freeDiameter config files. |
 | `--diameter-id` | string | YAML, then `hss.epc.mnc001.mcc001.3gppnetwork.org` | Origin-Host override. |
 | `--diameter-realm` | string | YAML, then `epc.mnc001.mcc001.3gppnetwork.org` | Origin-Realm override. |
-| `--diameter-addr` | string | YAML, then `0.0.0.0` | S6a listen address override. |
+| `--diameter-addr` | string | YAML, then `127.0.0.1` (loopback, #1308) | S6a listen address override. A value that is not an IP address fails startup. |
 | `--diameter-port` | u16 | YAML, then `3868` | S6a listen port override. |
 | `--max-ue` | usize | `1024` | The only fully wired tuning flag: sizes the identity pools as `max_impi = max_ue`, `max_impu = max_ue * 4` (ratio hard-coded in `main.rs`). |
 | `--db-uri` | string | unset | Subscriber-store MongoDB URI; wins over the YAML `db_uri`. One of the two is required. |

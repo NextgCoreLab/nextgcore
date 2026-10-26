@@ -122,7 +122,11 @@ impl SbiServer {
         } else {
             "http"
         };
-        format!("{}://{}:{}", scheme, self.config.addr, self.config.port)
+        format!(
+            "{}://{}",
+            scheme,
+            nextgcore_sbi::uri_encode::uri_authority(&self.config.addr, self.config.port)
+        )
     }
 }
 

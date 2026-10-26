@@ -70,10 +70,14 @@ pub const SOL_SCTP: c_int = 132;
 /// in nextgsim): one definition, the one `<linux/sctp.h>` is checked against.
 pub use libc::{SCTP_EVENTS, SCTP_INITMSG, SCTP_NODELAY, SCTP_PEER_ADDR_PARAMS, SCTP_RTOINFO};
 
-/// SCTP notification types (`enum sctp_sn_type`). Not in `libc`.
-pub const SCTP_ASSOC_CHANGE: u16 = 1;
-pub const SCTP_PEER_ADDR_CHANGE: u16 = 2;
-pub const SCTP_SHUTDOWN_EVENT: u16 = 5;
+/// SCTP notification types (`enum sctp_sn_type` in `<linux/sctp.h>`). Not in `libc`.
+/// They count up from `SCTP_SN_TYPE_BASE` (1 << 15), the first being
+/// `SCTP_DATA_IO_EVENT`; RFC 6458 §6.1 leaves the values to the implementation.
+/// They were 1, 2 and 5 until #1297, which no notification ever matched.
+const SCTP_SN_TYPE_BASE: u16 = 1 << 15;
+pub const SCTP_ASSOC_CHANGE: u16 = SCTP_SN_TYPE_BASE + 1;
+pub const SCTP_PEER_ADDR_CHANGE: u16 = SCTP_SN_TYPE_BASE + 2;
+pub const SCTP_SHUTDOWN_EVENT: u16 = SCTP_SN_TYPE_BASE + 5;
 
 /// SCTP association change states (`enum sctp_sac_state`). Not in `libc`.
 pub const SCTP_COMM_UP: u16 = 0;
@@ -304,6 +308,31 @@ impl KernelSctpSocket {
             return Err(SctpError::SockoptFailed(io::Error::last_os_error()));
         }
         Ok((status.sstat_instrms, status.sstat_outstrms))
+    }
+
+    /// Make closing this socket abort its association (#1071): `SO_LINGER` on with a
+    /// zero linger time, so `close(2)` sends an SCTP ABORT rather than starting the
+    /// SHUTDOWN exchange (RFC 6458 §8.1.4; RFC 9260 §9.1). `SCTP_ABORT` in
+    /// `sctp_sendmsg` is refused on a one-to-one socket (EINVAL), so this is the
+    /// way to abort one.
+    pub fn set_abort_on_close(&self) -> Result<()> {
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let result = unsafe {
+            libc::setsockopt(
+                self.fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                &linger as *const libc::linger as *const c_void,
+                mem::size_of::<libc::linger>() as socklen_t,
+            )
+        };
+        if result < 0 {
+            return Err(SctpError::SockoptFailed(io::Error::last_os_error()));
+        }
+        Ok(())
     }
 
     /// Shut the association down gracefully (`shutdown(2)` with `SHUT_RDWR`: on a

@@ -5,19 +5,12 @@
 //! section 6 of IETF RFC 5905": seconds since 00:00:00 UTC on 1 January 1900 (NTP era
 //! 0), rolling over into era 1 on 7 February 2036 06:28:16 UTC.
 //!
-//! Every nextgcore PFCP function used to send Unix seconds (since 1970), about
-//! 2,208,988,800 s -- 70 years -- too small. [`now`] produces the right value.
-//!
-//! Peers running an older nextgcore still send Unix seconds, and smfd's durable state
-//! holds stamps it received from them. The two readings of a value are 70 years apart,
-//! more than half the 32-bit serial space, so a comparison across the change is
-//! meaningless: an upgraded UPF's NTP stamp compares as OLDER than its stored Unix
-//! one (RFC 1982), and a Unix stamp compares as different from its NTP rendering.
-//! [`normalize`] maps a stamp to the NTP reading that is closer to the local clock:
-//! a real start time is in the recent past, the other reading is 70 years away. A
-//! function applies it to every stamp it receives or loads, so mixed-version peers
-//! and pre-#995 durable state stay comparable, and an upgrade of one side reads as
-//! what it is (a restart of the side that was restarted) and never as a false one.
+//! [`now`] produces this entity's stamp. A received stamp is used as it is on the wire:
+//! §8.2.65 defines no other reading. nextgcore 0.1.x sent Unix seconds (since 1970);
+//! 0.2.0 carried a transition shim that also read a received stamp as Unix seconds when
+//! that reading was closer to the local clock. It was retired in 0.2.0 (#1033), so a
+//! 0.1.x peer's Unix-seconds stamp now reads as a time about 70 years off. See the
+//! CHANGELOG upgrade notes for the upgrade order.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -46,41 +39,14 @@ pub fn is_newer(a: u32, b: u32) -> bool {
     (a.wrapping_sub(b) as i32) > 0
 }
 
-/// The distance between two stamps on the 32-bit circle.
-fn distance(a: u32, b: u32) -> u32 {
-    let d = a.wrapping_sub(b);
-    d.min(d.wrapping_neg())
-}
-
-/// A received or stored stamp in the NTP reading (#995): `stamp` itself, or, when it is
-/// a pre-#995 Unix-seconds stamp, its NTP equivalent -- whichever is closer to
-/// `now_ntp`. A real NTP stamp less than ~33 years old is never reinterpreted.
-pub fn normalize(stamp: u32, now_ntp: u32) -> u32 {
-    let as_unix = from_unix_secs(u64::from(stamp));
-    if distance(as_unix, now_ntp) < distance(stamp, now_ntp) {
-        as_unix
-    } else {
-        stamp
-    }
-}
-
-/// [`normalize`] against the local clock.
-///
-/// Transitional (#995): the Unix reading exists only for pre-#995 nextgcore peers and
-/// durable state. Tracked for removal in #1033 once mixed-version deployments are gone,
-/// because it also re-reads a third-party NTP stamp when a clock is ~34 years off.
-pub fn normalize_received(stamp: u32) -> u32 {
-    normalize(stamp, now())
-}
-
 /// How far ahead of our clock a peer's start time may plausibly be (clock skew).
 pub const FUTURE_SKEW_SECS: u32 = 86_400;
 
 /// Whether `stamp`, a start time, lies more than [`FUTURE_SKEW_SECS`] in the future
 /// of `now_ntp` (#1004 review). A start time cannot be in the future: such a stamp
-/// came from a clock that was wrong (an RTC-less peer that booted at 1970, its stamp
-/// then read in the Unix branch, ~2040), and an ordering judged against it is
-/// meaningless.
+/// came from a clock that was wrong, or from a peer that does not send NTP-era seconds
+/// (a 0.1.x nextgcore's Unix-seconds stamp reads as ~2096, #1033), and an ordering
+/// judged against it is meaningless.
 pub fn is_in_the_future(stamp: u32, now_ntp: u32) -> bool {
     is_newer(stamp, now_ntp.wrapping_add(FUTURE_SKEW_SECS))
 }
@@ -89,8 +55,7 @@ pub fn is_in_the_future(stamp: u32, now_ntp: u32) -> bool {
 pub const PLAUSIBLE_CLOCK_UNIX: u64 = 1_577_836_800;
 
 /// Refuse to run PFCP with an unset local clock (#1004 review): its Recovery Time
-/// Stamp would read as ~1970, which peers misjudge (and [`normalize`] reads the other
-/// way). The classic RTC-unset check.
+/// Stamp would read as ~1970, which peers misjudge. The classic RTC-unset check.
 pub fn check_local_clock() -> Result<(), String> {
     let unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -138,33 +103,11 @@ mod tests {
             .unwrap()
             .as_secs();
         let n = now();
-        assert!(distance(n, from_unix_secs(unix)) <= 1);
-    }
-
-    /// A pre-#995 Unix stamp is mapped to its NTP value; an NTP stamp is left alone,
-    /// before and after the era wrap and for a peer started years ago.
-    #[test]
-    fn legacy_unix_stamps_are_normalized_and_ntp_ones_are_not() {
-        let now_unix = 1_767_225_600u64; // 2026-01-01
-        let now = from_unix_secs(now_unix);
-        for age in [0u64, 60, 86_400 * 400, 86_400 * 365 * 10] {
-            let started = now_unix - age;
-            let ntp = from_unix_secs(started);
-            assert_eq!(normalize(ntp, now), ntp, "NTP stamp {age} s old");
-            assert_eq!(
-                normalize(started as u32, now),
-                ntp,
-                "Unix stamp {age} s old"
-            );
-        }
-        // Across the 2036 wrap: now in era 1, a peer started in era 0 or era 1.
-        let now_unix = 2_085_978_496u64 + 86_400; // 2036-02-08
-        let now = from_unix_secs(now_unix);
-        for started in [now_unix - 86_400 * 2, now_unix - 60] {
-            let ntp = from_unix_secs(started);
-            assert_eq!(normalize(ntp, now), ntp);
-            assert_eq!(normalize(started as u32, now), ntp);
-        }
+        let expected = from_unix_secs(unix);
+        assert!(
+            n.wrapping_sub(expected) <= 1,
+            "now() {n} is the NTP reading {expected}"
+        );
     }
 
     #[test]
@@ -187,19 +130,28 @@ mod tests {
         assert!(check_local_clock().is_ok(), "this host's clock is set");
     }
 
-    /// Why normalization is needed: across the change the two readings are more than
-    /// half the serial space apart, so an upgraded peer's NTP stamp compares as OLDER
-    /// than its stored Unix one.
+    /// #1033: a 0.1.x peer's Unix-seconds stamp is not an NTP-era start time. Taken as
+    /// sent, it reads as ~2096: in the future of the local clock, so it is never a
+    /// trusted ordering reference, and an upgraded peer's NTP stamp compares as older.
     #[test]
-    fn unnormalized_the_upgrade_compares_backwards() {
-        let started_unix = 1_767_225_600u64;
-        let stored_legacy = started_unix as u32;
-        let restarted_ntp = from_unix_secs(started_unix + 3600);
-        assert!(!is_newer(restarted_ntp, stored_legacy), "the bug");
+    fn a_unix_seconds_stamp_is_a_time_70_years_off() {
+        let started_unix = 1_767_225_600u64; // 2026-01-01
+        let legacy = started_unix as u32;
         let now = from_unix_secs(started_unix + 7200);
-        assert!(
-            is_newer(restarted_ntp, normalize(stored_legacy, now)),
-            "the fix"
-        );
+        assert!(is_in_the_future(legacy, now), "~2096");
+        let restarted_ntp = from_unix_secs(started_unix + 3600);
+        assert!(!is_newer(restarted_ntp, legacy));
+    }
+
+    /// #1033, TS 29.244 §8.2.65: a Heartbeat Request's Recovery Time Stamp IE (type 96,
+    /// length 4) decodes to the NTP-era seconds on the wire, 2026-01-01 here.
+    #[test]
+    fn a_heartbeat_request_decodes_the_ntp_stamp_as_sent() {
+        let body = [0x00, 0x60, 0x00, 0x04, 0xED, 0x00, 0x37, 0x80];
+        assert_eq!(u32::from_be_bytes([0xED, 0x00, 0x37, 0x80]), 3_976_214_400);
+        let req =
+            crate::message::HeartbeatRequest::decode(&mut bytes::Bytes::copy_from_slice(&body))
+                .unwrap();
+        assert_eq!(req.recovery_time_stamp, from_unix_secs(1_767_225_600));
     }
 }

@@ -2142,8 +2142,7 @@ pub fn parse_recovery_time_stamp(payload: &[u8]) -> Option<u32> {
     let ies = ParsedIe::parse_all(payload);
     ParsedIe::find_ie(&ies, pfcp_ie::RECOVERY_TIME_STAMP).and_then(|ie| {
         if ie.value.len() >= 4 {
-            // The wire value: the comparison sites normalize it (#995; a parser that
-            // depends on the clock was a #1004 review minor).
+            // The wire value: NTP-era seconds (TS 29.244 §8.2.65), used as sent (#1033).
             Some(u32::from_be_bytes([
                 ie.value[0],
                 ie.value[1],

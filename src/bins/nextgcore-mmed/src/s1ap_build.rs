@@ -829,7 +829,10 @@ pub fn build_write_replace_warning(
     crate::s1ap_gen::build_write_replace_warning_request(&WriteReplaceWarningRequest {
         message_identifier: sbc_pws.message_id,
         serial_number: sbc_pws.serial_number,
-        warning_area: warning_area_from(sbc_pws, warning_tais)?,
+        warning_area: match &sbc_pws.warning_area {
+            Some(area) => Some(area.clone()),
+            None => warning_area_from(sbc_pws, warning_tais)?,
+        },
         // The SBc-AP fields are wider than the S1AP IEs they feed
         // (RepetitionPeriod is INTEGER(0..4095), NumberofBroadcastRequest is
         // INTEGER(0..65535)), so they are clamped rather than truncated: a
@@ -838,7 +841,7 @@ pub fn build_write_replace_warning(
         repetition_period: sbc_pws.repetition_period.min(PWS_MAX_REPETITION_PERIOD) as u16,
         number_of_broadcast_request: sbc_pws.number_of_broadcast.min(u16::MAX as u32) as u16,
         warning_type: sbc_pws.warning_type.map(|wt| wt.encode()),
-        warning_security_info: None,
+        warning_security_info: sbc_pws.warning_security_info,
         data_coding_scheme: Some(sbc_pws.data_coding_scheme),
         warning_message_contents: (!sbc_pws.message_contents.is_empty())
             .then(|| sbc_pws.message_contents.clone()),
@@ -852,11 +855,16 @@ pub fn build_kill(sbc_pws: &SbcPwsData, warning_tais: &[EpsTai]) -> S1apResult<V
     crate::s1ap_gen::build_kill_request(&KillRequest {
         message_identifier: sbc_pws.message_id,
         serial_number: sbc_pws.serial_number,
-        warning_area: warning_area_from(sbc_pws, warning_tais)?,
+        warning_area: match &sbc_pws.warning_area {
+            Some(area) => Some(area.clone()),
+            None => warning_area_from(sbc_pws, warning_tais)?,
+        },
         // Only this (message id, serial number) is cancelled, never every
         // warning the eNB holds: a Stop Warning Request from the CBC names one
-        // message, so killing them all would cancel unrelated live alerts.
-        kill_all_warning_messages: false,
+        // message, so killing them all would cancel unrelated live alerts,
+        // unless the CBC's Stop-All Indicator asks exactly that (TS 29.168
+        // §4.3.4.3.8, #1071).
+        kill_all_warning_messages: sbc_pws.stop_all,
     })
     .map_err(gen_err)
 }

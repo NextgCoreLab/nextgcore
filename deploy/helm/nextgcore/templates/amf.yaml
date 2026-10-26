@@ -46,7 +46,9 @@ spec:
         - name: amf
           image: {{ include "nextgcore.image" (dict "global" .Values.global "nf" .Values.amf) }}
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
-          args: ["-c", "/etc/nextgcore/amf.yaml"]
+          # NGAP binds --ngap-addr, loopback by default (#1308): every pod
+          # interface, on the port the Service targets.
+          args: ["-c", "/etc/nextgcore/amf.yaml", "--ngap-addr", "0.0.0.0:{{ .Values.amf.service.ngapPort }}"]
           ports:
             - name: sbi
               containerPort: {{ .Values.amf.service.sbiPort }}
