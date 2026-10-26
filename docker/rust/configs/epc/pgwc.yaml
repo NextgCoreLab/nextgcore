@@ -69,10 +69,6 @@ smf:
     server:
       - address: 172.24.0.4
 
-  metrics:
-    server:
-      - address: 172.24.0.4
-        port: 9090
 
   # The PDN Address pool this PGW-C allocates from (TS 23.401 §5.3.2.1 makes
   # address allocation a PGW function). It must match the PGW-U's `--tun-ip` /

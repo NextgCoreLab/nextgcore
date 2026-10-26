@@ -72,14 +72,9 @@ These are the metric names the AMF defines, mirroring Open5GS's `src/amf/metrics
 
 The library's `NfMetrics` helper (`src/libs/nextgcore-metrics/src/otel.rs`) additionally defines a generic per-NF exposition (`nextgcore_<nf>_sbi_request_total`, `_sbi_error_total`, `_active_sessions`, `_uptime_seconds`, `_nrf_registered`) — also not served by any NF.
 
-### The `metrics.server` YAML blocks are deploy-time decoration
+### No `metrics.server` in the YAML (#1312)
 
-Four docker config files — `docker/rust/configs/5gc/amf.yaml`, `pcf.yaml`, `smf.yaml`, `upf.yaml` — contain a `metrics.server` block with `port: 9090`. **None of these four NFs parses it** (smfd and upfd do listen on 9090, but the port comes from their default or `SMF_METRICS_PORT`/`UPF_METRICS_PORT`, not from this block):
-
-- **AMF**: `AmfSection` in `src/bins/nextgcore-amfd/src/lib.rs` deserializes only `amf_name`, `network_name`, `guami`, `tai`, `plmn_support`, `security`, `sbi`, `nas`, `time`, `emergency` — no `metrics` field (serde silently ignores unknown keys).
-- **SMF**: `SmfYaml`/`SmfSection` in `src/bins/nextgcore-smfd/src/main.rs` deserializes only `smf.sbi`, `smf.gtpc`, `smf.dns`, `smf.mtu`.
-- **PCF**: `PcfSection` in `src/bins/nextgcore-pcfd/src/app.rs` deserializes only `pcf.sbi`.
-- **UPF**: `src/bins/nextgcore-upfd/src/main.rs` reads the config file only to log its byte count ("Configuration file loaded (N bytes)") — no YAML deserialization at all; every UPF runtime knob is a CLI flag.
+No daemon reads a `metrics.server` block, and several have no metrics listener at all (hssd, pcfd, pcrfd, amfd). The shipped configs used to carry one anyway (docker `5gc` amf/pcf/smf/upf, `epc` mme/hss/pcrf/pgwc/pgwu, and the k8s and Helm ConfigMaps). A key that is documented but has no effect is misleading, so the blocks were removed rather than wired up: a daemon's metrics listener is set by its environment variable, `MME_METRICS_ADDR`, `NEXTGCORE_METRICS_BIND` (loopback by default, #1308), `SMF_METRICS_PORT`, `UPF_METRICS_PORT`, `SGWC_METRICS_PORT`, `SGWU_METRICS_PORT` or `UCMF_METRICS_ADDR`, and nothing else.
 
 ### The shipped scrape stack
 

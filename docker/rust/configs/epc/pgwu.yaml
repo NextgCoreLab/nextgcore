@@ -56,10 +56,6 @@ upf:
       gateway: 10.45.0.1
       dev: epctun
 
-  metrics:
-    server:
-      - address: 172.24.0.7
-        port: 9090
 
   # No TLS: the UPF exposes no SBI listener in this deployment (`--nrf-uri` is
   # unset, so the SBI/NRF plane is off entirely), and PFCP and GTP-U define no

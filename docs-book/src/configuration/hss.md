@@ -54,7 +54,7 @@ The `--diameter-id`/`--diameter-realm`/`--diameter-addr`/`--diameter-port` flags
 - **`logger.level` is read; `logger.file.path` is inert.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691). `-l/--log-file` is accepted by clap but never used, so logs always go to stderr.
 - **`global.max.ue` and `global.max.peer` are inert.** The identity-pool size comes from the CLI flag `--max-ue` (default `1024`); there is no peer cap in the code.
 - **`hss.freeDiameter` and the `--diameter-config` flag** point at `docker/rust/configs/epc/freeDiameter/hss.conf`, which no code reads.
-- **`hss.metrics.server` is inert.** The daemon starts no metrics HTTP server; its only telemetry export is OpenTelemetry OTLP tracing (`nextgcore_metrics::otel::init_otel` in `main.rs`).
+- **No `hss.metrics.server`** (removed from the shipped config, #1312): the daemon starts no metrics HTTP server; its only telemetry export is OpenTelemetry OTLP tracing (`nextgcore_metrics::otel::init_otel` in `main.rs`).
 
 ## Command-line flags
 

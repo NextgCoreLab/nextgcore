@@ -26,7 +26,3 @@ hss:
   #   realm: epc.mnc001.mcc001.3gppnetwork.org
   #   addr: 172.24.0.8
   #   port: 3868
-  metrics:
-    server:
-      - address: 172.24.0.8
-        port: 9090

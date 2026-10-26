@@ -106,10 +106,6 @@ data:
         client:
           nrf:
             - uri: http://nrf.nextg-system.svc.cluster.local:7777
-      metrics:
-        server:
-          - address: 0.0.0.0
-            port: 9090
 
   nssf.yaml: |
     logger:
@@ -178,10 +174,6 @@ data:
         server:
           - address: 0.0.0.0
             port: 38412
-      metrics:
-        server:
-          - address: 0.0.0.0
-            port: 9090
       guami:
         - plmn_id:
             mcc: 999
@@ -241,10 +233,6 @@ data:
       gtpu:
         server:
           - address: 0.0.0.0
-      metrics:
-        server:
-          - address: 0.0.0.0
-            port: 9090
       session:
         - subnet: 10.45.0.0/16
           gateway: 10.45.0.1
@@ -282,7 +270,3 @@ data:
         - subnet: 2001:db8:cafe::/48
           gateway: 2001:db8:cafe::1
           dev: ogstun
-      metrics:
-        server:
-          - address: 0.0.0.0
-            port: 9090

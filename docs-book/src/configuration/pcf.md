@@ -67,7 +67,7 @@ The daemon deserializes only the fields above; unknown YAML keys are silently ig
 - **`db_uri` is inert.** `nextgcore-pcfd` never calls `nextgcore_dbi_init` — its subscription/session-data lookups through `nextgcore-dbi` therefore error out at runtime and fall back to built-in defaults (see Behavior notes). The key exists for visual consistency with NFs that do open MongoDB.
 - **`logger.level` is read; `logger.file.path` is inert.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691). No file output is wired (the `-l/--log-file` flag is accepted but unused).
 - **`global.max.ue` / `global.max.peer` are inert.** Context capacities come from the CLI flags `--max-ue` (1024) and `--max-sess` (4096).
-- **`pcf.metrics.server[]` is inert.** The daemon starts no metrics HTTP server; its only telemetry export is OpenTelemetry OTLP via `OTEL_EXPORTER_OTLP_ENDPOINT`.
+- **No `pcf.metrics.server[]`** (removed from the shipped config, #1312): the daemon starts no metrics HTTP server; its only telemetry export is OpenTelemetry OTLP via `OTEL_EXPORTER_OTLP_ENDPOINT`.
 - **`pcf.tls.*` is inert.** No code reads this section. Even the CLI `--tls`/`--tls-cert`/`--tls-key` flags only flow into the legacy `SbiServerConfig` (`sbi_path.rs`), where they flip the *advertised* URI scheme to `https` in the legacy NF-instance builder; the live HTTP/2 listener is created from `NextgcoreSbiServerConfig::new(addr)` without any TLS wiring and serves cleartext h2c.
 
 ## Command-line flags
