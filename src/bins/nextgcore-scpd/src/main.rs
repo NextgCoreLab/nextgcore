@@ -311,6 +311,12 @@ async fn main() -> Result<()> {
     let mut http_config =
         nextgcore_sbi::server::SbiServerConfig::with_host_port(&sbi_addr, sbi_port)
             .map_err(|e| anyhow::anyhow!("Invalid SBI listen address: {e}"))?;
+    // #1308: loopback by default; say which setting opens it to remote peers.
+    nextgcore_core::sockaddr::warn_if_loopback_listener(
+        "SBI",
+        &http_config.addr,
+        "--sbi-addr (or SCP_SBI_ADDR, or scp.sbi.server[0].address in the config file)",
+    );
     if tls_enabled {
         match (&tls_key, &tls_cert) {
             (Some(key), Some(cert)) => {

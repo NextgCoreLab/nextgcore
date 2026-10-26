@@ -57,7 +57,7 @@ These are the fields actually deserialized by the daemon (`#[derive(Deserialize)
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `bsf.sbi.server[0].address` | string | absent → CLI `--sbi-addr` (`0.0.0.0`) | Bind **and** advertised SBI address. When present it overrides the CLI value so the NRF NFProfile advertises a reachable endpoint instead of `0.0.0.0` (per code comment). |
+| `bsf.sbi.server[0].address` | string | absent → CLI `--sbi-addr` (`127.0.0.1`, #1308) | Bind **and** advertised SBI address. When present it overrides the CLI value so the NRF NFProfile advertises a reachable endpoint instead of `0.0.0.0` (per code comment). |
 | `bsf.sbi.server[0].port` | u16 | absent → CLI `--sbi-port` (`7777`) | Bind and advertised SBI port; overrides the CLI value when present. |
 | `bsf.sbi.client.nrf[0].uri` | string | absent → CLI `--nrf-uri` (unset → no NRF registration) | NRF base URI, seeded into the global SBI context for NF registration, heartbeat, and (when OAuth2 is on) token issuance/JWKS. `uri` is a **required** field of the list entry — if an `nrf` entry omits it, deserialization of the whole file fails and is silently ignored (the parse is wrapped in `if let Ok(...)`), leaving the BSF unregistered. |
 | `bsf.sbi.oauth2.require` | bool | `false` | SBI OAuth2 bearer-token enforcement. When `true`, incoming requests must carry an NRF-issued token whose audience includes `BSF`, verified against the NRF JWKS (TS 33.501 §13.4.1 per code comment); with no NRF URI configured the server fails closed with 503 (per code comment). Also installs a process-wide OAuth2 client so outbound SBI calls attach tokens. Unlike NSACF, there is **no** CLI override flag for this knob. |
@@ -81,7 +81,7 @@ Runtime knobs with real defaults from the clap `Args` struct in `src/bins/nextgc
 | `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-m, --no-color` | flag | off | Disable color output. |
 | `-k, --kill` | flag | off | Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor. |
-| `--sbi-addr` | string | `0.0.0.0` | SBI server bind address; **overridden** by `bsf.sbi.server[0].address` when the YAML provides one. |
+| `--sbi-addr` | string | `127.0.0.1` (loopback, #1308) | SBI server bind address; **overridden** by `bsf.sbi.server[0].address` when the YAML provides one. |
 | `--sbi-port` | u16 | `7777` | SBI server port; **overridden** by `bsf.sbi.server[0].port` when present. |
 | `--tls` | flag | off | Sets `tls_enabled` in the legacy context config; switches the advertised URI scheme to `https` but does not enable TLS on the HTTP/2 listener (see Behavior notes). |
 | `--tls-cert` | path | unset | TLS certificate path (stored in the legacy context config only). |

@@ -55,7 +55,7 @@ Runtime knobs with real defaults from the clap `Args` struct in `main.rs`:
 | `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-l, --log-file` | path | unset | Accepted but currently **unused** — the parsed value is never referenced. |
 | `-m, --no-color` | flag | off | Accepted but currently **unused** — the parsed value is never referenced. |
-| `--sbi-addr` | string | `0.0.0.0` | SBI server bind address (also advertised to the NRF in the NF profile). |
+| `--sbi-addr` | string | `127.0.0.1` (loopback, #1308) | SBI server bind address (also advertised to the NRF in the NF profile). |
 | `--sbi-port` | u16 | `7812` | SBI server port (docker deployments pass `7777`). |
 | `--tls` | flag | off | Enable TLS on the SBI server. |
 | `--tls-cert` | path | `/etc/nextgcore/tls/server.crt` (when `--tls`) | TLS certificate file. |

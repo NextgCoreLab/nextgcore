@@ -62,7 +62,7 @@ From the clap `Args` struct in `src/bins/nextgcore-pcrfd/src/main.rs`:
 | `--diameter-config` | path | `/etc/nextgcore/freeDiameter/pcrf.conf` | FreeDiameter configuration file — accepted but **never read**. |
 | `--diameter-id` | string | `pcrf.localdomain` | Diameter Origin-Host identity of this PCRF. |
 | `--diameter-realm` | string | `localdomain` | Diameter Origin-Realm. |
-| `--diameter-addr` | socket addr | `0.0.0.0:3868` | Diameter listen address; Gx and Rx share this one listener. Must parse as `host:port` or startup fails with "Invalid --diameter-addr". |
+| `--diameter-addr` | socket addr | `127.0.0.1:3868` (loopback, #1308) | Diameter listen address; Gx and Rx share this one listener. Must parse as `host:port` or startup fails with "Invalid --diameter-addr". |
 | `--max-sess` | usize | `1024` | Maximum number of sessions. Stored in the context and logged at startup, but **no code path enforces it** — `gx_session_add` never checks it. |
 | `--db-uri` | string | unset | MongoDB URI — parsed but never wired to the DB layer. |
 | `--db-name` | string | `nextgcore` | Database name — parsed but never used. |

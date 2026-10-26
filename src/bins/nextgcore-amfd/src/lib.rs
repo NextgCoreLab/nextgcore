@@ -377,8 +377,9 @@ struct Args {
     #[arg(short, long)]
     daemon: bool,
 
-    /// NGAP bind address (e.g., "0.0.0.0:38412")
-    #[arg(long, default_value = "0.0.0.0:38412")]
+    /// NGAP bind address, `ip:port`. Loopback by default (#1308): a gNB on another
+    /// host needs this set to an address of the AMF it can reach.
+    #[arg(long, default_value = "127.0.0.1:38412")]
     ngap_addr: String,
 
     /// SCTP transport backend: "userspace" (sctp-proto over UDP, matched
@@ -1060,6 +1061,7 @@ pub async fn run() -> Result<()> {
         .ngap_addr
         .parse()
         .map_err(|e| anyhow::anyhow!("Invalid NGAP address '{}': {}", args.ngap_addr, e))?;
+    nextgcore_core::sockaddr::warn_if_loopback_listener("NGAP", &ngap_addr, "--ngap-addr");
     let sctp_backend = ngap_path::SctpBackend::parse(&args.sctp_backend)?;
     app.init_ngap(ngap_addr, sctp_backend).await?;
 
@@ -1141,6 +1143,7 @@ pub async fn run() -> Result<()> {
         .unwrap_or(7777);
     let sbi_sock: SocketAddr = nextgcore_core::sockaddr::parse_listen_addr(&sbi_addr, sbi_port)
         .map_err(|e| anyhow::anyhow!("Invalid SBI address '{sbi_addr}:{sbi_port}': {e}"))?;
+    nextgcore_core::sockaddr::warn_if_loopback_listener("SBI", &sbi_sock, "AMF_SBI_ADDR");
     let mut sbi_server_config = nextgcore_sbi::server::SbiServerConfig::new(sbi_sock);
     // Issue #63: resolve the SBI security profile, PRODUCTION by default. The
     // production profile requires OAuth2, so the outbound token client is
@@ -1259,6 +1262,19 @@ pub async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1308 / #1305: with no `--ngap-addr` the NGAP listener binds loopback, not
+    /// every interface, and so does the `amf_ngap_open(None, ..)` default.
+    #[test]
+    fn ngap_listener_defaults_to_loopback() {
+        let args = Args::parse_from(["nextgcore-amfd"]);
+        assert_eq!(args.ngap_addr, "127.0.0.1:38412");
+        let addr: SocketAddr = args.ngap_addr.parse().unwrap();
+        assert!(addr.ip().is_loopback());
+        assert_eq!(ngap_path::DEFAULT_NGAP_ADDR, "127.0.0.1");
+        let explicit = Args::parse_from(["nextgcore-amfd", "--ngap-addr", "0.0.0.0:38412"]);
+        assert_eq!(explicit.ngap_addr, "0.0.0.0:38412");
+    }
 
     /// **#920 follow-up.** A configured S-NSSAI with SST 0 -- not a slice, TS 23.501
     /// §5.15.2.2 -- is refused at load and left out, so it is neither advertised nor handed

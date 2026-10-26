@@ -76,7 +76,7 @@ struct Args {
     #[arg(short = 'm', long)]
     no_color: bool,
 
-    #[arg(long, default_value = "0.0.0.0")]
+    #[arg(long, default_value = nextgcore_core::sockaddr::DEFAULT_LISTEN_HOST)]
     sbi_addr: String,
 
     #[arg(long, default_value = "7818")]
@@ -109,7 +109,7 @@ struct Args {
 
     /// Bind address for the DNS/UDP listener (#276, `dns-udp` feature).
     #[cfg(feature = "dns-udp")]
-    #[arg(long, default_value = "0.0.0.0")]
+    #[arg(long, default_value = nextgcore_core::sockaddr::DEFAULT_LISTEN_HOST)]
     dns_udp_addr: String,
 
     /// Bind port for the DNS/UDP listener. 53 needs `CAP_NET_BIND_SERVICE`;
@@ -322,6 +322,12 @@ async fn main() -> Result<()> {
 
     let addr: SocketAddr = nextgcore_core::sockaddr::parse_listen_addr(&sbi_addr, sbi_port)
         .context("Invalid SBI address")?;
+    // #1308: loopback by default; say which setting opens it to remote peers.
+    nextgcore_core::sockaddr::warn_if_loopback_listener(
+        "SBI",
+        &addr,
+        "--sbi-addr (or easdf.sbi.server[0].address in the config file)",
+    );
 
     let mut sbi_server_config = SbiServerConfig::new(addr);
     if args.tls {
@@ -384,6 +390,11 @@ async fn main() -> Result<()> {
         let port = dns.and_then(|d| d.udp_port).unwrap_or(args.dns_udp_port);
         let bind: SocketAddr = nextgcore_core::sockaddr::parse_listen_addr(&addr, port)
             .context("Invalid DNS/UDP bind address")?;
+        nextgcore_core::sockaddr::warn_if_loopback_listener(
+            "DNS/UDP",
+            &bind,
+            "--dns-udp-addr (or easdf.dns.udp_address in the config file)",
+        );
         let upstream = dns
             .and_then(|d| d.upstream.as_deref())
             .and_then(dns_udp::parse_upstream);
@@ -1051,6 +1062,21 @@ mod tests {
             "pduSessionId": 5,
             "dnsRules": [{"precedence": 1}],
         })
+    }
+
+    /// #1308: with no flag the SBI listener binds loopback, not every interface.
+    #[test]
+    fn sbi_listener_defaults_to_loopback_1308() {
+        let args = Args::parse_from(["nextgcore-easdfd"]);
+        assert_eq!(args.sbi_addr, "127.0.0.1");
+    }
+
+    /// #1308: with no flag the DNS/UDP listener binds loopback, not every interface.
+    #[cfg(feature = "dns-udp")]
+    #[test]
+    fn dns_udp_listener_defaults_to_loopback_1308() {
+        let args = Args::parse_from(["nextgcore-easdfd"]);
+        assert_eq!(args.dns_udp_addr, "127.0.0.1");
     }
 
     #[test]

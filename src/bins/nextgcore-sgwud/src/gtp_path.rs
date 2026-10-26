@@ -23,8 +23,15 @@ use crate::context::{apply_action, sgwu_self, SgwuFar, SgwuPdr};
 use crate::pfcp_path;
 use crate::sxa_build::{LocalFTeid, UserPlaneReport};
 
-/// Default GTP-U bind address (TS 29.281 Section 4.4.2.3)
-const DEFAULT_GTPU_BIND: &str = "0.0.0.0:2152";
+/// Default GTP-U bind address (TS 29.281 Section 4.4.2.3): loopback (#1308). An
+/// SGW-U whose eNBs or PGW-U are on another host sets `SGWU_GTPU_BIND`.
+const DEFAULT_GTPU_BIND: &str = "127.0.0.1:2152";
+
+/// The S1-U/S5-U GTP-U bind address: `SGWU_GTPU_BIND`, else [`DEFAULT_GTPU_BIND`].
+fn gtpu_bind(env: Option<String>) -> String {
+    env.filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_GTPU_BIND.to_string())
+}
 
 // ============================================================================
 // GTP-U Receive Result
@@ -255,8 +262,13 @@ pub fn gtp_open() -> Result<(), String> {
         return Ok(());
     }
 
-    let bind = std::env::var("SGWU_GTPU_BIND").unwrap_or_else(|_| DEFAULT_GTPU_BIND.to_string());
+    let bind = gtpu_bind(std::env::var("SGWU_GTPU_BIND").ok());
     let server = GtpuServer::open(&bind, GTPV1_U_UDP_PORT)?;
+    nextgcore_core::sockaddr::warn_if_loopback_listener(
+        "S1-U/S5-U GTP-U",
+        &server.local_addr(),
+        "SGWU_GTPU_BIND",
+    );
 
     // Advertise the bound address in allocated F-TEIDs, unless a distinct
     // advertise address is configured (e.g. behind NAT or wildcard bind)
@@ -2387,5 +2399,19 @@ mod tests {
         );
 
         ctx.sess_remove(sess.id);
+    }
+}
+
+#[cfg(test)]
+mod default_bind_tests_1308 {
+    use super::gtpu_bind;
+
+    /// #1308: with SGWU_GTPU_BIND unset (or empty) GTP-U binds loopback, not every
+    /// interface; a set value is kept, the wildcard included.
+    #[test]
+    fn gtpu_listener_defaults_to_loopback() {
+        assert_eq!(gtpu_bind(None), "127.0.0.1:2152");
+        assert_eq!(gtpu_bind(Some(String::new())), "127.0.0.1:2152");
+        assert_eq!(gtpu_bind(Some("0.0.0.0:2152".into())), "0.0.0.0:2152");
     }
 }

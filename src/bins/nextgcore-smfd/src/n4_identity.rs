@@ -270,7 +270,8 @@ mod tests {
         assert_eq!(id.f_seid_ipv4, [192, 168, 7, 9]);
         assert!(!id.node_id_explicit);
 
-        // The same with SMF_PFCP_ADDR unset, whose bind default is 0.0.0.0.
+        // No bind address at all. main.rs always passes one (SMF_PFCP_ADDR, else the
+        // loopback default of #1308); this is the function's own contract.
         let id = resolve_n4_identity(&cfg(None, None, None), || Some(Ipv4Addr::LOCALHOST)).unwrap();
         assert_eq!(id.node_id, NodeId::new_ipv4([127, 0, 0, 1]));
     }

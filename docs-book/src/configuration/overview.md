@@ -23,7 +23,7 @@ There are two cooperating layers.
 
 - `-c / --config <path>` — config file, default `/etc/nextgcore/amf.yaml`
 - `--log-level <level>` — `trace|debug|info|warn|error`. Without it, the config file's `logger.level`, else `info`. The short form is `-l` in amfd, mmed, sgwcd and sgwud; most other NFs, smfd included, follow Open5GS and use `-e` for the level and `-l` for `--log-file`. Run `<binary> --help` for the rest of an NF's flags
-- `--ngap-addr` (AMF only) — NGAP bind address, default `0.0.0.0:38412`
+- `--ngap-addr` (AMF only) — NGAP bind address, default `127.0.0.1:38412` (loopback, #1308)
 - `--sctp-backend` (AMF only) — `userspace` (default, sctp-proto over UDP) or `kernel` (Linux kernel SCTP, needs the `kernel-sctp` build feature)
 
 Loading is lenient: if the file is missing or fails to parse, the NF logs a warning and **continues with built-in defaults** rather than aborting.

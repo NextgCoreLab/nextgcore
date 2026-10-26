@@ -63,7 +63,7 @@ These are the fields actually read by the daemon. The serde structs are `UdrYaml
 |---|---|---|---|
 | `db_uri` | string | env `DB_URI`, else `mongodb://172.23.0.2/nextgcore` | MongoDB connection URI for the subscriber database (auth subscriptions, provisioned-data). Precedence: YAML `db_uri` → `DB_URI` env var → hardcoded Docker default. Credentials are masked in logs. If MongoDB init fails the daemon warns and continues with hardcoded defaults. |
 | `udr.sbi.server[]` | list | absent → CLI values used | Only the **first** entry is read; extra entries are ignored. |
-| `udr.sbi.server[0].address` | string | absent → `--sbi-addr` (`0.0.0.0`) | **Overrides** the CLI bind address, and is also the address advertised in the NRF NFProfile — set here so the profile advertises a routable endpoint instead of `0.0.0.0` (per code comment). |
+| `udr.sbi.server[0].address` | string | absent → `--sbi-addr` (`127.0.0.1`, #1308) | **Overrides** the CLI bind address, and is also the address advertised in the NRF NFProfile — set here so the profile advertises a routable endpoint instead of `0.0.0.0` (per code comment). |
 | `udr.sbi.server[0].port` | u16 | absent → `--sbi-port` (`7777`) | **Overrides** the CLI SBI port; used for both bind and NFProfile advertisement. |
 | `udr.sbi.client.nrf[]` | list | absent → NRF registration skipped | Only the **first** entry is used. With no NRF URI the daemon logs "skipping NRF registration" and runs standalone. |
 | `udr.sbi.client.nrf[0].uri` | string | required within the entry | NRF base URI for NF registration, heartbeat, and (when OAuth2 is on) JWKS fetching and token acquisition. There is **no** CLI fallback flag for the NRF URI. |
@@ -88,7 +88,7 @@ From the clap `Args` struct in `src/bins/nextgcore-udrd/src/main.rs`:
 | `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-m, --no-color` | flag | off | Disable color output. |
 | `-k, --kill` | flag | off | Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor. |
-| `--sbi-addr` | string | `0.0.0.0` | SBI server bind address. Overridden by `udr.sbi.server[0].address` when present. |
+| `--sbi-addr` | string | `127.0.0.1` (loopback, #1308) | SBI server bind address. Overridden by `udr.sbi.server[0].address` when present. |
 | `--sbi-port` | u16 | `7777` | SBI server port. Overridden by `udr.sbi.server[0].port` when present. |
 | `--tls` | flag | off | Enable TLS on the SBI server. |
 | `--tls-cert` | path | unset | TLS certificate file. |

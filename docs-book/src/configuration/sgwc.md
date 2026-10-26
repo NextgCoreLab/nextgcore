@@ -111,12 +111,12 @@ From the clap `Args` struct in `src/bins/nextgcore-sgwcd/src/main.rs`:
 
   | Variable | Default | Effect |
   |---|---|---|
-  | `SGWC_S11_BIND` | `0.0.0.0:2123` | S11 GTPv2-C UDP bind `address:port`. |
+  | `SGWC_S11_BIND` | `127.0.0.1:2123` (loopback, #1308) | S11 GTPv2-C UDP bind `address:port`. |
   | `SGWC_S11_ADVERTISE` | unset | Advertised control-plane IPv4; consulted only when the bound address is a wildcard. Falls back to `sgwc.gtpc.server[0].address`. |
   | `SGWC_GTPU_ADVERTISE` | unset (falls back to the bound or `SGWC_S11_ADVERTISE` address, not the YAML one) | SGW-U user-plane IPv4 placed in S1-U/S5-U F-TEIDs. The EPC compose sets it to the SGW-U (`172.24.0.6`). |
   | `SGWC_PGW_S5C` | unset | PGW-C S5/S8 peer (`ip` or `ip:port`, port `2123` by default). **Unset means the SGW-C refuses an S11 Create Session Request** rather than answering it from local state. The EPC compose sets `172.24.0.4`. |
   | `SGWC_S5C_ADVERTISE` | the S11 address | Dedicated S5-C address, if different from S11. |
-  | `SGWC_PFCP_BIND_ADDR` | `0.0.0.0:8805` | Sxa PFCP bind `address:port`. |
+  | `SGWC_PFCP_BIND_ADDR` | `127.0.0.1:8805` (loopback, #1308) | Sxa PFCP bind `address:port`. |
   | `SGWC_PFCP_NODE_IP` | `sgwc.pfcp.server[0].address`, then `127.0.0.1` | PFCP Node ID (IPv4). |
   | `SGWC_SGWU_ADDR` | `sgwc.pfcp.client.sgwu`, then `127.0.0.1:8805` | SGW-U override (`ip` or `ip:port`). |
   | `SGWC_ECHO_INTERVAL_SECS` | `60` | GTPv2-C Echo interval; `0` disables probing. |

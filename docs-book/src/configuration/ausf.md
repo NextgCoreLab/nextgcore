@@ -54,7 +54,7 @@ These are the fields actually deserialized by the daemon (`#[derive(Deserialize)
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `ausf.sbi.server[].address` | string | absent → CLI `--sbi-addr` (`0.0.0.0`) | SBI bind **and** NRF-advertised address. Only the **first** list entry is read; when present it overrides the CLI flag. |
+| `ausf.sbi.server[].address` | string | absent → CLI `--sbi-addr` (`127.0.0.1`, #1308) | SBI bind **and** NRF-advertised address. Only the **first** list entry is read; when present it overrides the CLI flag. |
 | `ausf.sbi.server[].port` | u16 | absent → CLI `--sbi-port` (`7777`) | SBI bind/advertised port. First entry only; overrides the CLI flag. |
 | `ausf.sbi.client.nrf[].uri` | string | absent → **no NRF** | NRF base URI seeded into the SBI context for NF registration, heartbeat, discovery, and (when OAuth2 is on) token/JWKS. First entry only. If absent, NRF registration and discovery are skipped entirely — the AUSF "will operate without NRF". |
 | `ausf.sbi.oauth2.require` | bool | `false` | SBI OAuth2 enforcement (Wave-6 H8; TS 33.501 §13.4.1, TS 29.510 §5.4.2 per code comment). Not part of the typed structs: `oauth2_required()` re-reads the file as a raw YAML value, root-key agnostic (true iff **any** top-level section sets `sbi.oauth2.require: true`). When on, incoming requests need an NRF-issued Bearer token with audience `AUSF` and outbound Nudm calls attach tokens. The `NEXTGCORE_SBI_OAUTH2_REQUIRE` env var, **when set to any value**, wins in both directions. |
@@ -79,7 +79,7 @@ From the clap `Args` struct in `src/bins/nextgcore-ausfd/src/app.rs`:
 | `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-m, --no-color` | flag | off | Disable color output. |
 | `-k, --kill` | flag | off | Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor. |
-| `--sbi-addr` | string | `0.0.0.0` | SBI bind address — **overridden** by `ausf.sbi.server[0].address` when the YAML sets it. |
+| `--sbi-addr` | string | `127.0.0.1` (loopback, #1308) | SBI bind address — **overridden** by `ausf.sbi.server[0].address` when the YAML sets it. |
 | `--sbi-port` | u16 | `7777` | SBI port — **overridden** by `ausf.sbi.server[0].port` when the YAML sets it. |
 | `--tls` | flag | off | Feeds only the inert legacy `ausf_sbi_open` config; the live HTTP/2 server ignores it (see above). |
 | `--tls-cert` | path | unset | Same caveat as `--tls`. |

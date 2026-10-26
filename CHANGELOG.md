@@ -208,6 +208,37 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   config replaces the AMF's list instead of being appended to it (#1070).
 
 ### Upgrade notes
+- **Listeners default to loopback, not every interface (#1308, #1305). This can break a
+  bare-metal deployment.** A daemon started without a listen address used to bind `0.0.0.0`, so it
+  accepted connections on every interface of the host. Now it binds `127.0.0.1` and logs a
+  warning at startup that names the setting a remote peer needs. A peer on another host cannot
+  reach a loopback listener, so **a bare-metal or host-network deployment that relied on the
+  implicit wildcard must now set the address** to one of the host's private addresses (or
+  `0.0.0.0`, knowingly):
+  - SBI: `--sbi-addr` for ausfd, bsfd, dccfd, easdfd, eesd, lmfd, mbsmfd, nefd, nrfd, nsacfd,
+    nssfd, nwdafd, pcfd, pind, tsctsf, ucmfd, udmd and udrd (ausfd, bsfd, easdfd, nssfd, pcfd,
+    udmd and udrd also take `<nf>.sbi.server[0].address` from the config file; nrfd and the
+    others do not), and `smf.sbi.server[0].address` for smfd. amfd (`AMF_SBI_ADDR`), scpd and
+    seppd were loopback already and now warn as well.
+  - amfd NGAP: `--ngap-addr` (`ip:port`). `amf.ngap.server` in the config file does not set it.
+  - smfd N4 PFCP: `SMF_PFCP_ADDR`. Unset, the PFCP Node ID and the CP F-SEID address are now
+    `127.0.0.1` too, not a routed address the socket did not listen on.
+  - sgwcd: `SGWC_S11_BIND` (S11/S5-C GTP-C) and `SGWC_PFCP_BIND_ADDR` (Sxa).
+  - sgwud: `SGWU_GTPU_BIND` (S1-U/S5-U GTP-U) and `PFCP_BIND_ADDR` (Sxa).
+  - hssd S6a: `--diameter-addr` or `hss.diameter.addr`. A value that is not an IP address now
+    fails startup; it used to fall back to `0.0.0.0`.
+  - pcrfd Gx/Rx: `--diameter-addr` (`ip:port`) or `pcrf.diameter.addr`.
+  - easdfd DNS/UDP (`dns-udp` feature): `--dns-udp-addr` or `easdf.dns.udp_address`.
+
+  The `/metrics` listeners (#837), upfd and webui were loopback already. mmed's S1-MME and SBc-AP
+  are changed separately (#1299). Every shipped deployment now passes its binds explicitly, so
+  none of them changes behaviour: `docker/rust/docker-compose.yml` (nrf `--sbi-addr`, amf
+  `--ngap-addr`, also in `docker-compose.kernel-sctp.yml`), `docker/rust/docker-compose-epc.yml`
+  (hss, pcrf, sgwc, sgwu), `k8s/manifests/{nrf,amf}.yaml` (and so the EKS 5G profile, whose
+  amf patch already set `--ngap-addr`), the Helm chart's nrf and amf, and the EKS EPC profile
+  (hss, pcrf, sgwc, sgwu). Those binds stay `0.0.0.0` inside the container or pod, which publishes
+  nothing beyond `127.0.0.1` (compose) or the cluster network. No published port or NodePort
+  changed.
 - **PFCP Recovery Time Stamp: upgrade the user plane and the control plane together
   (#1033).** TS 29.244 §8.2.65 defines the Recovery Time Stamp only as NTP-era seconds (since
   1900-01-01). 0.1.x sent Unix seconds; 0.2.0 sends NTP seconds (#995) and reads a received

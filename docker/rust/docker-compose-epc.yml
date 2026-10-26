@@ -128,7 +128,9 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
-    command: ["-c", "/etc/nextgcore/hss.yaml"]
+    # S6a binds --diameter-addr, loopback by default (#1308): every container
+    # interface inside this private network; no port is published.
+    command: ["-c", "/etc/nextgcore/hss.yaml", "--diameter-addr", "0.0.0.0"]
     volumes:
       - ./configs/epc/hss.yaml:/etc/nextgcore/hss.yaml:ro
       - ./configs/epc/freeDiameter:/etc/freeDiameter:ro
@@ -145,7 +147,9 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
-    command: ["-c", "/etc/nextgcore/pcrf.yaml"]
+    # Gx/Rx bind --diameter-addr, loopback by default (#1308): every container
+    # interface inside this private network; no port is published.
+    command: ["-c", "/etc/nextgcore/pcrf.yaml", "--diameter-addr", "0.0.0.0:3868"]
     volumes:
       - ./configs/epc/pcrf.yaml:/etc/nextgcore/pcrf.yaml:ro
       - ./configs/epc/freeDiameter:/etc/freeDiameter:ro
@@ -180,6 +184,11 @@ services:
       # "No GTP-U address configured" (GTP cause 76). The first real attach (#303)
       # is what surfaced it; bring-up never sent a Create Session.
       SGWC_GTPU_ADVERTISE: "172.24.0.6"
+      # S11/S5-C and Sxa bind these, loopback by default (#1308); sgwc.yaml's
+      # addresses are advertised, not bound. Every container interface inside
+      # this private network; no port is published.
+      SGWC_S11_BIND: "0.0.0.0:2123"
+      SGWC_PFCP_BIND_ADDR: "0.0.0.0:8805"
     command: ["-c", "/etc/nextgcore/sgwc.yaml"]
     volumes:
       - ./configs/epc/sgwc.yaml:/etc/nextgcore/sgwc.yaml:ro
@@ -378,6 +387,10 @@ services:
       start_period: 5s
     environment:
       <<: *common-env
+      # S1-U/S5-U GTP-U and Sxa bind these, loopback by default (#1308): every
+      # container interface inside this private network; no port is published.
+      SGWU_GTPU_BIND: "0.0.0.0:2152"
+      PFCP_BIND_ADDR: "0.0.0.0:8805"
     command: ["-c", "/etc/nextgcore/sgwu.yaml"]
     volumes:
       - ./configs/epc/sgwu.yaml:/etc/nextgcore/sgwu.yaml:ro
