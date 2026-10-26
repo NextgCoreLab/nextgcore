@@ -5305,14 +5305,6 @@ mod tests {
         nextgcore_sbi::test_support::bound_listener()
     }
 
-    /// A loopback port with NOTHING listening on it, for the two tests that
-    /// assert the degrade-open path on a transport error. These deliberately do
-    /// not want a reservation: a bound port would be reachable, which is the
-    /// opposite of what they measure.
-    fn nsacf_free_port() -> u16 {
-        nextgcore_sbi::test_support::free_port()
-    }
-
     /// Stub NSACF: validates the nested UeACRequestData shape (TS 29.536), then
     /// answers by SUPI — "imsi-reject" -> 403 (total failure), "imsi-partial" ->
     /// 200 with an acuFailureList naming that SUPI, otherwise 204 (admitted).
@@ -5430,8 +5422,11 @@ mod tests {
     #[tokio::test]
     async fn nsacf_ue_admission_degrade_open_on_transport_error() {
         // Nothing listening -> degrade-open: admitted=true so registration is
-        // never blocked by a missing/unreachable NSACF.
-        let port = nsacf_free_port();
+        // never blocked by a missing/unreachable NSACF. A port that REFUSES (#1315):
+        // a `free_port` is free, so a sibling test's `bind(:0)` can be handed it, and
+        // this request then landed on that test's server (amfd's event sink, which
+        // counted it as a notification).
+        let port = nextgcore_sbi::test_support::refused_port();
         let r = tokio::time::timeout(
             std::time::Duration::from_secs(8),
             call_nsacf_ue_admission(
@@ -6460,7 +6455,7 @@ mod tests {
     #[tokio::test]
     async fn ue_policy_create_unreachable_is_err() {
         // A port that CANNOT be handed to a sibling test's `bind(:0)`. This used to be
-        // `nsacf_free_port()`, which is free rather than unbindable, and that made this
+        // `free_port()`, which is free rather than unbindable, and that made this
         // test fail about 1 workspace run in 7 -- see `refused_port`.
         let port = nextgcore_sbi::test_support::refused_port();
         let result = call_pcf_ue_policy_create(

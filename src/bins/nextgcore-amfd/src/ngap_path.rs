@@ -36784,10 +36784,18 @@ mod tests {
             ),
             listener,
         );
+        // Only a POST to THIS subscription's notify path is a notification (#1315).
+        // The port is an ephemeral one, and a sibling test that dials a port it took
+        // from `free_port` (free, so the kernel can hand it to this sink's `bind(:0)`)
+        // would otherwise land here and read as a report this test never caused.
+        let notify_path = format!("/notify/{subscription_id}");
         sink.start(move |req: nextgcore_sbi::message::SbiRequest| {
             let tx = tx.clone();
+            let ours = req.header.uri.split('?').next() == Some(notify_path.as_str());
             async move {
-                let _ = tx.send(req.http.content.clone().unwrap_or_default()).await;
+                if ours {
+                    let _ = tx.send(req.http.content.clone().unwrap_or_default()).await;
+                }
                 nextgcore_sbi::message::SbiResponse::no_content()
             }
         })
@@ -36854,6 +36862,58 @@ mod tests {
             out.insert(ty, report);
         }
         out
+    }
+
+    /// #1315: a request to the sink's port that is not this subscription's notify
+    /// path (a sibling test dialling a port the kernel reused for this sink) is not
+    /// counted as a notification; one on the notify path is.
+    #[tokio::test]
+    async fn the_event_sink_counts_only_its_own_notify_path() {
+        // The subscription store is process-global (see `event_sink_for`).
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (sink, mut rx) = event_sink_for(
+            "sub-1315-sink",
+            "imsi-001010000131500",
+            &["LOSS_OF_CONNECTIVITY"],
+        )
+        .await;
+        let port = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            let uri = guard
+                .event_subscription_find("sub-1315-sink")
+                .expect("subscription stored")
+                .notify_uri;
+            guard.event_subscription_remove("sub-1315-sink");
+            uri.rsplit(':')
+                .next()
+                .and_then(|rest| rest.split('/').next())
+                .and_then(|p| p.parse::<u16>().ok())
+                .expect("port in notify uri")
+        };
+        let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", port);
+        for path in [
+            "/nnsacf-nsac/v1/ue-ac",
+            "/notify/sub-other",
+            "/notify/sub-1315-sink",
+        ] {
+            let mut req = nextgcore_sbi::message::SbiRequest::post(path);
+            req.http.content = Some(format!("{{\"path\":\"{path}\"}}"));
+            client.send_request(req).await.expect("the sink answers");
+        }
+        let body = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the notify-path POST arrives")
+            .expect("channel open");
+        assert_eq!(body, "{\"path\":\"/notify/sub-1315-sink\"}");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
+            "nothing else was counted"
+        );
+        sink.stop().await.expect("sink stop");
     }
 
     /// **#397 criterion 1.** The `DEREGISTERED` `REGISTRATION_STATE_REPORT` fires from
@@ -37787,11 +37847,10 @@ mod tests {
                 "a misdirected Command is logged, not an error"
             );
         }
+        let got = tokio::time::timeout(Duration::from_millis(600), rx.recv()).await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(600), rx.recv())
-                .await
-                .is_err(),
-            "no release ran, so no COMMUNICATION_FAILURE_REPORT"
+            got.is_err(),
+            "no release ran, so no COMMUNICATION_FAILURE_REPORT; got {got:?}"
         );
         assert!(
             ngap.ue_auth_state.contains(amf_ue_ngap_id),

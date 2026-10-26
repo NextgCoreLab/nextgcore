@@ -19551,10 +19551,9 @@ mod tests {
     async fn a_release_with_an_unreachable_pcf_completes_without_waiting_for_it() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-        // Bound and dropped: nothing listens there now.
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = closed.local_addr().unwrap().port();
-        drop(closed);
+        // A port that refuses and that no `bind(:0)` can be handed (#1316). A bound and
+        // dropped one could be, and then the "unreachable" PCF answered.
+        let port = nextgcore_sbi::test_support::refused_port();
         std::env::set_var("PCF_URI", format!("http://127.0.0.1:{port}"));
         let reference = "n719-unreachable";
         reactivation_released_session(reference, "pol-719-unreachable").await;
