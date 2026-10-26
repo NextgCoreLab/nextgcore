@@ -6558,10 +6558,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_delete_session_without_oi_or_si_stays_local() {
         let ambient = crate::pfcp_path::process_state_test_guard().await;
-        let sgwu = stand_in_sgwu(
+        // #1281 review: SGW-U SEIDs no other test's session has, so a late
+        // cleanup from another test cannot be counted as this one's deletion.
+        let sgwu = stand_in_sgwu_scripted(
             &ambient,
             crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
             Duration::ZERO,
+            Vec::new(),
+            0x1281_0001,
         )
         .await;
         let pgw = with_stand_in_pgw().await;
@@ -6585,7 +6589,7 @@ mod tests {
             pgw.deletes.lock().unwrap().is_empty(),
             "not relayed without OI"
         );
-        assert!(deleted_at_sgwu(&sgwu, seid), "deleted locally");
+        assert_eq!(deletions_at_sgwu(&sgwu, seid), 1, "deleted locally, once");
         sgwc_self().set_pgw_s5c_peer(None);
         server.close();
     }
@@ -6763,10 +6767,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_detach_delete_session_is_relayed_to_the_pgw() {
         let ambient = crate::pfcp_path::process_state_test_guard().await;
-        let sgwu = stand_in_sgwu(
+        // #1281 review: SGW-U SEIDs no other test's session has, so a late
+        // cleanup from another test cannot be counted as this one's deletion.
+        let sgwu = stand_in_sgwu_scripted(
             &ambient,
             crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
             Duration::ZERO,
+            Vec::new(),
+            0x1281_1001,
         )
         .await;
         let pgw = with_stand_in_pgw().await;
@@ -6802,9 +6810,10 @@ mod tests {
         // #1272: this session's deletion (by its SGW-U SEID): another test's
         // late cleanup may reach the shared stand-in too.
         wait_until(|| deleted_at_sgwu(&sgwu, seid)).await;
-        assert!(
-            deleted_at_sgwu(&sgwu, seid),
-            "the SGW-U's session is deleted"
+        assert_eq!(
+            deletions_at_sgwu(&sgwu, seid),
+            1,
+            "the SGW-U's session is deleted, once"
         );
         let ue = sgwc_self().ue_find_by_imsi(&imsi).unwrap();
         assert!(ue.sess_ids.is_empty(), "the session is gone");
@@ -10120,11 +10129,18 @@ mod tests {
 
     /// Whether the stand-in SGW-U received a Session Deletion Request for `seid`.
     fn deleted_at_sgwu(sgwu: &StandInSgwu, seid: u64) -> bool {
+        deletions_at_sgwu(sgwu, seid) > 0
+    }
+
+    /// How many Session Deletion Requests for `seid` the stand-in SGW-U received
+    /// (#1281 review: one per session, so a duplicate deletion is still caught).
+    fn deletions_at_sgwu(sgwu: &StandInSgwu, seid: u64) -> usize {
         sgwu.seen
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .any(|(t, s, _)| *t == 54 && *s == Some(seid))
+            .filter(|(t, s, _)| *t == 54 && *s == Some(seid))
+            .count()
     }
 
     /// Wait up to 3 s for `done` (#1272): a stand-in records on its own task, so
