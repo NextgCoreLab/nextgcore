@@ -212,6 +212,9 @@ impl GtpcServer {
                             };
                             xact.poll(Instant::now())
                         };
+                        // #1285 review: held Create Bearer Requests nothing else
+                        // settles (session gone, establishment never answered).
+                        crate::dedicated_bearer::sweep_held();
                         for (peer, encoded) in poll.retransmits {
                             log::warn!("S11 T3 expiry: retransmitting to {peer}");
                             if let Err(e) = inner.socket.send_to(&encoded, peer) {
@@ -6555,10 +6558,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_delete_session_without_oi_or_si_stays_local() {
         let ambient = crate::pfcp_path::process_state_test_guard().await;
-        let sgwu = stand_in_sgwu(
+        // #1281 review: SGW-U SEIDs no other test's session has, so a late
+        // cleanup from another test cannot be counted as this one's deletion.
+        let sgwu = stand_in_sgwu_scripted(
             &ambient,
             crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
             Duration::ZERO,
+            Vec::new(),
+            0x1281_0001,
         )
         .await;
         let pgw = with_stand_in_pgw().await;
@@ -6582,7 +6589,7 @@ mod tests {
             pgw.deletes.lock().unwrap().is_empty(),
             "not relayed without OI"
         );
-        assert!(deleted_at_sgwu(&sgwu, seid), "deleted locally");
+        assert_eq!(deletions_at_sgwu(&sgwu, seid), 1, "deleted locally, once");
         sgwc_self().set_pgw_s5c_peer(None);
         server.close();
     }
@@ -6760,10 +6767,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_detach_delete_session_is_relayed_to_the_pgw() {
         let ambient = crate::pfcp_path::process_state_test_guard().await;
-        let sgwu = stand_in_sgwu(
+        // #1281 review: SGW-U SEIDs no other test's session has, so a late
+        // cleanup from another test cannot be counted as this one's deletion.
+        let sgwu = stand_in_sgwu_scripted(
             &ambient,
             crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
             Duration::ZERO,
+            Vec::new(),
+            0x1281_1001,
         )
         .await;
         let pgw = with_stand_in_pgw().await;
@@ -6799,9 +6810,10 @@ mod tests {
         // #1272: this session's deletion (by its SGW-U SEID): another test's
         // late cleanup may reach the shared stand-in too.
         wait_until(|| deleted_at_sgwu(&sgwu, seid)).await;
-        assert!(
-            deleted_at_sgwu(&sgwu, seid),
-            "the SGW-U's session is deleted"
+        assert_eq!(
+            deletions_at_sgwu(&sgwu, seid),
+            1,
+            "the SGW-U's session is deleted, once"
         );
         let ue = sgwc_self().ue_find_by_imsi(&imsi).unwrap();
         assert!(ue.sess_ids.is_empty(), "the session is gone");
@@ -7141,6 +7153,207 @@ mod tests {
         assert_eq!(removals, 1, "and its rules at the SGW-U");
         assert_eq!(crate::dedicated_bearer::pending_count(), 0);
         ctx.ue_remove(ue.id);
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
+    /// CSR from the MME for `imsi`, then (once its session exists, before the SGW-U
+    /// answers) the PGW's Create Bearer Request: the request is held. Returns the
+    /// session.
+    async fn held_cbr(
+        server: &GtpcServer,
+        mme: &UdpSocket,
+        pgw: &StandInPgw,
+        imsi: &[u8],
+        seq: u32,
+    ) -> crate::context::SgwcSess {
+        mme.send_to(&csr(seq, imsi).encode(), server.local_addr())
+            .unwrap();
+        let ctx = sgwc_self();
+        let mut sess = None;
+        for _ in 0..300 {
+            sess = ctx
+                .ue_find_by_imsi(imsi)
+                .and_then(|ue| ctx.sess_list_for_ue(ue.id).into_iter().next())
+                .filter(|s| s.pgw_s5c_teid != 0);
+            if sess.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let sess = sess.expect("the session");
+        pgw.sock
+            .send_to(
+                &dedicated_cbr(sess.sgw_s5c_teid, seq + 1, 0x0BEE_F0E2).encode(),
+                server.local_addr(),
+            )
+            .await
+            .unwrap();
+        for _ in 0..300 {
+            if crate::dedicated_bearer::held_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(crate::dedicated_bearer::held_count(), 1, "held");
+        sess
+    }
+
+    /// #1285 review: the SGW-U never answers the establishment (T1 shortened to
+    /// 100 ms, so N1 runs out quickly). The MME is answered 100, and the held
+    /// Create Bearer Request is refused 64 at once, not left to the PGW's timer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_held_create_bearer_is_refused_when_the_establishment_fails() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let _sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::from_secs(30),
+        )
+        .await;
+        let node = crate::pfcp_path::sxa_node().expect("the Sxa node");
+        node.set_t1_for_test(Duration::from_millis(100));
+        crate::dedicated_bearer::clear_for_test();
+        let pgw = with_stand_in_pgw().await;
+        let server = test_server(&ambient, 2000, 1);
+        set_s11_server(server.clone());
+        let mme = client();
+        mme.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x12, 0x85];
+        let _ = held_cbr(&server, &mme, &pgw, &imsi, 0x1285).await;
+        let csrsp = recv_s11(&mme).await.expect("the MME is answered");
+        assert_eq!(cause_of(&csrsp), gtp_cause::REMOTE_PEER_NOT_RESPONDING);
+        let at_pgw = pgw_wait(&pgw, Gtp2MessageType::CreateBearerResponse, 1).await;
+        assert_eq!(cause_of(&at_pgw[0]), gtp_cause::CONTEXT_NOT_FOUND);
+        assert_eq!(crate::dedicated_bearer::held_count(), 0);
+        node.set_t1_for_test(Duration::from_secs(3));
+        let ctx = sgwc_self();
+        if let Some(ue) = ctx.ue_find_by_imsi(&imsi) {
+            ctx.ue_remove(ue.id);
+        }
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
+    /// #1285 review: a held Create Bearer Request whose session is deleted, or
+    /// that waits past HOLD_MAX, is refused 64 by the periodic sweep.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_held_create_bearer_is_refused_when_its_session_goes_or_it_waits_too_long() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let _sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::from_secs(5),
+        )
+        .await;
+        crate::dedicated_bearer::clear_for_test();
+        let pgw = with_stand_in_pgw().await;
+        let server = test_server(&ambient, 2000, 1);
+        set_s11_server(server.clone());
+        let mme = client();
+        let ctx = sgwc_self();
+
+        // The session goes.
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x12, 0x86];
+        let sess = held_cbr(&server, &mme, &pgw, &imsi, 0x1286).await;
+        ctx.sess_remove(sess.id);
+        let at_pgw = pgw_wait(&pgw, Gtp2MessageType::CreateBearerResponse, 1).await;
+        assert_eq!(cause_of(&at_pgw[0]), gtp_cause::CONTEXT_NOT_FOUND);
+        assert_eq!(
+            at_pgw[0].header.teid,
+            Some(sess.pgw_s5c_teid),
+            "to the PGW's S5/S8-C TEID, kept from when the request was held"
+        );
+        assert_eq!(crate::dedicated_bearer::held_count(), 0);
+
+        // Past HOLD_MAX.
+        let imsi2 = [0x31, 0x31, 0x31, 0x31, 0x31, 0x12, 0x87];
+        let _ = held_cbr(&server, &mme, &pgw, &imsi2, 0x1288).await;
+        crate::dedicated_bearer::age_held_for_test(Duration::from_secs(11));
+        let at_pgw = pgw_wait(&pgw, Gtp2MessageType::CreateBearerResponse, 2).await;
+        assert_eq!(cause_of(&at_pgw[1]), gtp_cause::CONTEXT_NOT_FOUND);
+        assert_eq!(crate::dedicated_bearer::held_count(), 0);
+        for i in [&imsi, &imsi2] {
+            if let Some(ue) = ctx.ue_find_by_imsi(i) {
+                ctx.ue_remove(ue.id);
+            }
+        }
+        sgwc_self().set_pgw_s5c_peer(None);
+        server.close();
+    }
+
+    /// #1283, TS 23.401 §5.4.1 / Annex F: the PGW's Create Bearer Request arrives
+    /// while the session's Sxa establishment is still in flight (the SGW-U holds its
+    /// answer 300 ms). It is held, not sent to SGW-U SEID 0 and refused; once the
+    /// establishment succeeds it is installed and relayed to the MME, after the
+    /// MME's Create Session Response.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_create_bearer_during_the_sxa_establishment_waits_for_it() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::from_millis(300),
+        )
+        .await;
+        let pgw = with_stand_in_pgw().await;
+        let server = test_server(&ambient, 2000, 1);
+        set_s11_server(server.clone());
+        let mme = client();
+        mme.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x12, 0x83];
+        mme.send_to(&csr(0x1283, &imsi).encode(), server.local_addr())
+            .unwrap();
+        // As a PGW activating a bearer at attach: the CBR right after its CSRsp.
+        let ctx = sgwc_self();
+        let mut sess = None;
+        for _ in 0..300 {
+            if pgw
+                .seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&(Gtp2MessageType::CreateSessionRequest as u8))
+            {
+                sess = ctx
+                    .ue_find_by_imsi(&imsi)
+                    .and_then(|ue| ctx.sess_list_for_ue(ue.id).into_iter().next());
+                if sess.is_some() {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let sess = sess.expect("the session");
+        assert_eq!(sess.sgwu_sxa_seid, 0, "still being established");
+        pgw.sock
+            .send_to(
+                &dedicated_cbr(sess.sgw_s5c_teid, 0x1284, 0x0BEE_F0E1).encode(),
+                server.local_addr(),
+            )
+            .await
+            .unwrap();
+        let csrsp = recv_s11(&mme).await.expect("the Create Session Response");
+        assert_eq!(cause_of(&csrsp), gtp_cause::REQUEST_ACCEPTED);
+        let cbr = recv_s11(&mme)
+            .await
+            .expect("then the Create Bearer Request");
+        assert_eq!(
+            cbr.header.message_type,
+            Gtp2MessageType::CreateBearerRequest as u8
+        );
+        assert!(
+            sgwu.seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|(t, _, _)| *t == 52)
+                .all(|(_, seid, _)| seid.is_some_and(|s| s != 0)),
+            "no Session Modification to SEID 0"
+        );
+        crate::dedicated_bearer::clear_for_test();
+        if let Some(ue) = ctx.ue_find_by_imsi(&imsi) {
+            ctx.ue_remove(ue.id);
+        }
         sgwc_self().set_pgw_s5c_peer(None);
         server.close();
     }
@@ -9916,11 +10129,18 @@ mod tests {
 
     /// Whether the stand-in SGW-U received a Session Deletion Request for `seid`.
     fn deleted_at_sgwu(sgwu: &StandInSgwu, seid: u64) -> bool {
+        deletions_at_sgwu(sgwu, seid) > 0
+    }
+
+    /// How many Session Deletion Requests for `seid` the stand-in SGW-U received
+    /// (#1281 review: one per session, so a duplicate deletion is still caught).
+    fn deletions_at_sgwu(sgwu: &StandInSgwu, seid: u64) -> usize {
         sgwu.seen
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .any(|(t, s, _)| *t == 54 && *s == Some(seid))
+            .filter(|(t, s, _)| *t == 54 && *s == Some(seid))
+            .count()
     }
 
     /// Wait up to 3 s for `done` (#1272): a stand-in records on its own task, so

@@ -16,6 +16,11 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 - lmfd reads the LPP NR PRS-RSRP of a Multi-RTT or DL-TDOA measurement (`nr-DL-PRS-RSRP-Result`)
   as `v − 157` dBm, the lower edge of TS 38.133 Table 10.1.24.3.1-1. It read `v − 140`, the
   E-UTRA RSRP offset, which put every PRS-RSRP 16-17 dB too high (#1278).
+- pcfd's `resourceUri`, in AM and UE PolicyUpdates (notifications and Update responses) and in
+  SM policy notifications, is now the complete resource URI `{apiRoot}/<apiName>/...` (TS 29.501
+  §4.4.1), with the configured FQDN as host when there is one. Before, it was the bare path. The
+  TS 29.507 / 29.512 / 29.525 notes let a consumer use either the complete URI or its
+  apiSpecificResourceUriPart (#1277).
 - lmfd decodes the NR E-CID quantities of an NRPPa E-CID report into physical values, so NR
   E-CID against a real NR gNB gives a fix where it gave 500 `POSITIONING_FAILED`. NR-TADV is the
   round trip of TS 38.133 §13.5.1 Table 13.5.1-1, used as the E-CID timing term (bin
@@ -62,8 +67,9 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   when the request is for emergency services (SmContextCreateData `requestType`
   INITIAL_EMERGENCY_REQUEST or EXISTING_EMERGENCY_PDU_SESSION), and for #26, #27 and #69 when the
   UE is configured for high priority access, so the UE can retry at once (TS 24.501 §6.4.1.4.1).
-  High priority access is the AMF's `3gpp-Sbi-Message-Priority` header with a value above the
-  default 24 (TS 23.502 §4.3.2.2.1 step 3, TS 29.500 §6.8.4), which amfd sets for a priority UE
+  High priority access is the AMF's `3gpp-Sbi-Message-Priority` header with a higher priority
+  than the default 24, i.e. a numerically lower value, 0 being the highest (TS 23.502 §4.3.2.2.1
+  step 3, TS 29.500 §5.2.3.2.2, §6.8.4), which amfd sets for a priority UE
   (#1222), or `priorityUserInd` (TS 29.502, home-routed and V-SMF insertion) (#1188).
 - smfd's EBI assignment request (`Namf_Communication_EBIAssignment`) now gives the default flow's
   ARP as NOT_PREEMPT / NOT_PREEMPTABLE, the same ARP the N2 default QoS flow carries. Before, it

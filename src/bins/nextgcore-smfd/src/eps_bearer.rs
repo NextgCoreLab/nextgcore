@@ -853,6 +853,53 @@ fn sgw_peer(sess: &SmfSess) -> Option<std::net::SocketAddr> {
         .map(|ip| std::net::SocketAddr::new(ip, crate::gtp_path::sgw_port()))
 }
 
+/// The dedicated bearers a Delete Bearer Request is in flight for, by (session id, EBI)
+/// (#619 follow-up 3). Once one is, the bearer is being deleted: a second Delete Bearer
+/// Request for it (a Delete Bearer Command, or a Bearer Resource Command removing its last
+/// filter, or a modification's PGW-U failure) is not sent, and a modification's late
+/// acceptance stores nothing for it.
+static DELETING_BEARERS: std::sync::Mutex<std::collections::BTreeSet<(u64, u8)>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// The bearers one Delete Bearer Request claimed; released when it is done.
+struct DeletingBearers(Vec<(u64, u8)>);
+
+impl DeletingBearers {
+    /// Claim `ebis` of session `sess_id`; those another Delete Bearer Request holds are
+    /// left out.
+    fn claim(sess_id: u64, ebis: impl IntoIterator<Item = u8>) -> Self {
+        let mut set = DELETING_BEARERS.lock().unwrap_or_else(|e| e.into_inner());
+        Self(
+            ebis.into_iter()
+                .map(|ebi| (sess_id, ebi))
+                .filter(|key| set.insert(*key))
+                .collect(),
+        )
+    }
+
+    fn holds(&self, ebi: u8) -> bool {
+        self.0.iter().any(|(_, e)| *e == ebi)
+    }
+}
+
+impl Drop for DeletingBearers {
+    fn drop(&mut self) {
+        let mut set = DELETING_BEARERS.lock().unwrap_or_else(|e| e.into_inner());
+        for key in &self.0 {
+            set.remove(key);
+        }
+    }
+}
+
+/// Whether a Delete Bearer Request is in flight for bearer `ebi` of session `sess_id`
+/// (#619 follow-up 3).
+fn being_deleted(sess_id: u64, ebi: u8) -> bool {
+    DELETING_BEARERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&(sess_id, ebi))
+}
+
 /// Delete dedicated `bearers` of a PDN connection (TS 23.401 §5.4.4.1): one Delete
 /// Bearer Request naming their EBIs (TS 29.274 §7.2.9.2: EPS Bearer IDs at instance 1;
 /// the PTI when a Bearer Resource Command asked), then each bearer that the answer
@@ -875,6 +922,21 @@ async fn delete_bearers(
     command: Option<u32>,
     pti: Option<u8>,
 ) -> Result<(), String> {
+    // #619 follow-up 3: one Delete Bearer Request per bearer at a time.
+    let claim = DeletingBearers::claim(sess.id, bearers.iter().map(|b| b.ebi));
+    let bearers: Vec<SmfBearer> = bearers
+        .iter()
+        .filter(|b| claim.holds(b.ebi))
+        .cloned()
+        .collect();
+    if bearers.is_empty() {
+        log::info!(
+            "Delete Bearer Request (LBI {linked_ebi}) not sent: one is already in flight for \
+             each of its bearers"
+        );
+        return Ok(());
+    }
+    let bearers = bearers.as_slice();
     let handle = context::smf_self();
     let mut b = crate::gtp_build::Gtp2MessageBuilder::new(gtp2_message_type::DELETE_BEARER_REQUEST)
         .teid(sess.sgw_s5c_teid);
@@ -1332,7 +1394,8 @@ pub async fn modify_on_command(
     // procedure on it at a time. #619 follow-up 2: a second is refused at once, cause
     // #101 (TS 29.274 §7.2.6), rather than queued past the UE's T3481.
     let (_procedure, free) = BearerProcedures::try_take(sess_id, &[ebi]);
-    if !free {
+    // #619 follow-up 3: nor while its deletion is in flight.
+    if !free || being_deleted(sess_id, ebi) {
         return Err(Refused(
             Gtp2Cause::CollisionWithNetworkInitiatedRequest,
             format!("a bearer procedure is already running on EBI {ebi}"),
@@ -1514,6 +1577,13 @@ pub async fn modify_on_command(
         )));
     }
 
+    // #619 follow-up 3: a Delete Bearer Command's request went out while this one was
+    // outstanding; the bearer is being deleted, so nothing is stored or sent for it.
+    if being_deleted(sess_id, ebi) {
+        return Err(Failed(format!(
+            "bearer EBI {ebi} is being deleted; the accepted modification is dropped"
+        )));
+    }
     // Accepted: the store, then the PGW-U.
     let stored = {
         let ctx = handle
