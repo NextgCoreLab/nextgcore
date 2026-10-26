@@ -160,12 +160,14 @@ struct Args {
     no_color: bool,
 
     /// SBI server address
-    #[arg(long, default_value = nextgcore_core::sockaddr::DEFAULT_LISTEN_HOST)]
-    sbi_addr: String,
+    /// Without it, `nsacf.sbi.server[0].address` from the config file, else
+    /// 127.0.0.1 (#1308, #1312). The port likewise defaults to the file, else 7813.
+    #[arg(long)]
+    sbi_addr: Option<String>,
 
     /// SBI server port
-    #[arg(long, default_value = "7813")]
-    sbi_port: u16,
+    #[arg(long)]
+    sbi_port: Option<u16>,
 
     /// Enable TLS
     #[arg(long)]
@@ -224,6 +226,17 @@ fn with_nsacf_context<T>(f: impl FnOnce(&NsacfContext) -> T) -> Option<T> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    // #1312: the command line, else `nsacf.sbi.server[0]` in the config file,
+    // else loopback.
+    let (sbi_addr, sbi_port) = nextgcore_core::sockaddr::resolve_listen(
+        args.sbi_addr.as_deref(),
+        args.sbi_port,
+        &args.config,
+        "nsacf",
+        "sbi",
+        7813,
+    )
+    .map_err(|e| anyhow::anyhow!("SBI listen address: {e}"))?;
 
     init_logging(&nextgcore_core::log::nf_log_level(
         args.log_level.as_deref(),
@@ -322,9 +335,8 @@ async fn main() -> Result<()> {
     setup_signal_handlers(shutdown.clone());
 
     // Start SBI server
-    let addr: SocketAddr =
-        nextgcore_core::sockaddr::parse_listen_addr(&args.sbi_addr, args.sbi_port)
-            .context("Invalid SBI address")?;
+    let addr: SocketAddr = nextgcore_core::sockaddr::parse_listen_addr(&sbi_addr, sbi_port)
+        .context("Invalid SBI address")?;
     // #1308: loopback by default; say which setting opens it to remote peers.
     nextgcore_core::sockaddr::warn_if_loopback_listener("SBI", &addr, "--sbi-addr");
 
@@ -388,7 +400,7 @@ async fn main() -> Result<()> {
     sbi_ctx
         .set_nrf_uri(nrf_uri_cfg.as_deref().unwrap_or(&args.nrf_uri))
         .await;
-    if let Err(e) = register_with_nrf(&args.sbi_addr, args.sbi_port, &nf_instance_id).await {
+    if let Err(e) = register_with_nrf(&sbi_addr, sbi_port, &nf_instance_id).await {
         log::warn!("NRF registration failed (will operate without NRF): {e}");
     } else {
         // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
@@ -2544,7 +2556,7 @@ nsacf:
     #[test]
     fn sbi_listener_defaults_to_loopback_1308() {
         let args = Args::parse_from(["nextgcore-nsacfd"]);
-        assert_eq!(args.sbi_addr, "127.0.0.1");
+        assert_eq!(args.sbi_addr, None);
     }
 
     #[test]
@@ -2552,7 +2564,7 @@ nsacf:
         let args = Args::parse_from(["nextgcore-nsacfd"]);
         assert_eq!(args.config, "/etc/nextgcore/nsacf.yaml");
         assert_eq!(args.log_level, None);
-        assert_eq!(args.sbi_port, 7813);
+        assert_eq!(args.sbi_port, None);
         assert_eq!(args.max_quotas, 64);
         assert_eq!(args.eac_threshold, 80);
         assert!(args.state_file.is_none());
@@ -2573,7 +2585,7 @@ nsacf:
             "--eac-threshold",
             "90",
         ]);
-        assert_eq!(args.sbi_port, 8813);
+        assert_eq!(args.sbi_port, Some(8813));
         assert_eq!(args.max_quotas, 128);
         assert_eq!(args.nrf_uri, "http://nrf:7777");
         assert_eq!(

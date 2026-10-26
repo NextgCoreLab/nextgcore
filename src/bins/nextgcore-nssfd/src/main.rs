@@ -345,7 +345,12 @@ async fn main() -> Result<()> {
             Ok(content) => {
                 log::debug!("Configuration file loaded ({} bytes)", content.len());
                 // Seed NRF URI into SBI context for NF registration
-                if let Ok(yaml) = serde_yaml::from_str::<NssfYaml>(&content) {
+                {
+                    // #1313 review: a config that does not parse fails startup
+                    // rather than falling back to the defaults (the bind among them).
+                    let yaml: NssfYaml = serde_yaml::from_str(&content).map_err(|e| {
+                        anyhow::anyhow!("configuration file {} does not parse: {e}", args.config)
+                    })?;
                     if let Some(nssf) = yaml.nssf {
                         if let Some(set_id) = nssf.amf_set_id {
                             log::info!("Target AMF Set configured: {set_id}");
@@ -5475,5 +5480,30 @@ nssf:
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
         assert_eq!(pd["cause"], "NOT_AUTHORIZED");
         assert_eq!(pd["status"], 403);
+    }
+}
+
+/// #1313 review: a config that does not parse now fails startup, so every
+/// shipped config of this daemon must parse with its typed structs.
+#[cfg(test)]
+mod shipped_config_tests {
+    #[test]
+    fn the_shipped_configs_parse() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        for rel in [
+            "docker/rust/configs/5gc/nssf.yaml",
+            "docker/rust/configs/5gc/nssf-oauth2.yaml",
+        ] {
+            let text = std::fs::read_to_string(root.join(rel)).unwrap();
+            serde_yaml::from_str::<super::NssfYaml>(&text).unwrap_or_else(|e| panic!("{rel}: {e}"));
+        }
+        let cm: serde_yaml::Value = serde_yaml::from_str(
+            &std::fs::read_to_string(root.join("k8s/manifests/configmap.yaml")).unwrap(),
+        )
+        .unwrap();
+        let text = cm["data"]["nssf.yaml"]
+            .as_str()
+            .expect("the ConfigMap's nssf.yaml");
+        serde_yaml::from_str::<super::NssfYaml>(text).expect("k8s nssf.yaml");
     }
 }

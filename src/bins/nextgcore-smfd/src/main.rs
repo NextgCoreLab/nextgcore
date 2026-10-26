@@ -657,23 +657,22 @@ fn smf_pfcp_bind_host(env: Option<String>) -> String {
         .unwrap_or_else(|| nextgcore_core::sockaddr::DEFAULT_LISTEN_HOST.to_string())
 }
 
-fn load_config(path: &str) -> SmfConfig {
+fn load_config(path: &str) -> anyhow::Result<SmfConfig> {
     let mut config = SmfConfig::default();
 
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
             log::warn!("Could not read SMF config '{path}': {e}. Using defaults.");
-            return config;
+            return Ok(config);
         }
     };
 
+    // #1313 review: a config that does not parse fails startup rather than
+    // falling back to the defaults, the SBI and PFCP binds among them.
     let yaml: SmfYaml = match serde_yaml::from_str(&content) {
         Ok(v) => v,
-        Err(e) => {
-            log::warn!("Failed to parse SMF YAML config '{path}': {e}. Using defaults.");
-            return config;
-        }
+        Err(e) => anyhow::bail!("SMF config '{path}' does not parse: {e}"),
     };
 
     if let Some(smf) = yaml.smf {
@@ -736,7 +735,7 @@ fn load_config(path: &str) -> SmfConfig {
         }
     }
 
-    config
+    Ok(config)
 }
 
 /// DNS servers and link MTU resolved from config, for the ePCO IE the
@@ -809,7 +808,7 @@ async fn main() -> Result<()> {
     .expect("Failed to set Ctrl+C handler");
 
     // Load configuration (the path was resolved before the logger, above).
-    let mut config = load_config(&config_path);
+    let mut config = load_config(&config_path)?;
     log::info!("Loading configuration from {config_path}");
     log::info!(
         "SBI config: address={}, port={}",
@@ -13569,7 +13568,7 @@ mod tests {
             .and_then(|mut f| f.write_all(yaml.as_bytes()))
             .expect("write temp config");
 
-        let config = load_config(path.to_str().unwrap());
+        let config = load_config(path.to_str().unwrap()).unwrap();
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(config.sbi_addr, "127.0.0.1");
@@ -21069,7 +21068,7 @@ mod tests {
              \x20 dns:\n    - 8.8.8.8\n    - 2001:4860:4860::8888\n    - 8.8.4.4\n  mtu: 1400\n",
         )
         .expect("write config");
-        let config = load_config(path.to_str().expect("path"));
+        let config = load_config(path.to_str().expect("path")).unwrap();
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(
@@ -25152,7 +25151,7 @@ mod default_bind_tests_1308 {
     #[test]
     fn sbi_listener_defaults_to_loopback() {
         assert_eq!(SmfConfig::default().sbi_addr, "127.0.0.1");
-        let config = load_config("/nonexistent/smf-1308.yaml");
+        let config = load_config("/nonexistent/smf-1308.yaml").unwrap();
         assert_eq!(config.sbi_addr, "127.0.0.1");
 
         let path = std::env::temp_dir().join(format!("smf-1308-{}.yaml", std::process::id()));
@@ -25161,7 +25160,7 @@ mod default_bind_tests_1308 {
             "smf:\n  sbi:\n    server:\n      - address: 0.0.0.0\n        port: 7777\n",
         )
         .unwrap();
-        let explicit = load_config(path.to_str().unwrap()).sbi_addr;
+        let explicit = load_config(path.to_str().unwrap()).unwrap().sbi_addr;
         let _ = std::fs::remove_file(&path);
         assert_eq!(explicit, "0.0.0.0");
     }
@@ -25174,5 +25173,30 @@ mod default_bind_tests_1308 {
         assert_eq!(smf_pfcp_bind_host(Some("  ".into())), "127.0.0.1");
         assert_eq!(smf_pfcp_bind_host(Some("0.0.0.0".into())), "0.0.0.0");
         assert_eq!(smf_pfcp_bind_host(Some(" 10.0.0.4 ".into())), "10.0.0.4");
+    }
+}
+
+/// #1313 review: a config that does not parse now fails startup, so every
+/// shipped config of this daemon must parse with its typed structs.
+#[cfg(test)]
+mod shipped_config_tests {
+    #[test]
+    fn the_shipped_configs_parse() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        for rel in [
+            "docker/rust/configs/5gc/smf.yaml",
+            "docker/rust/configs/epc/pgwc.yaml",
+        ] {
+            let text = std::fs::read_to_string(root.join(rel)).unwrap();
+            serde_yaml::from_str::<super::SmfYaml>(&text).unwrap_or_else(|e| panic!("{rel}: {e}"));
+        }
+        let cm: serde_yaml::Value = serde_yaml::from_str(
+            &std::fs::read_to_string(root.join("k8s/manifests/configmap.yaml")).unwrap(),
+        )
+        .unwrap();
+        let text = cm["data"]["smf.yaml"]
+            .as_str()
+            .expect("the ConfigMap's smf.yaml");
+        serde_yaml::from_str::<super::SmfYaml>(text).expect("k8s smf.yaml");
     }
 }

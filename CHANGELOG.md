@@ -31,6 +31,15 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   `s1ap_list6` was never filled or read, so such a config fell back to `127.0.0.1:36412`. IPv6
   entries now go in `s1ap_list6`, and the bind takes the first IPv4 entry, else the first IPv6
   one. Loopback remains the default only when nothing is configured (#1299 follow-up).
+  The bracketed-IPv6 parse fix covers every mmed listen address read through the same parser:
+  S11 (`mme.gtpc.server`), N26 (`mme.n26.server`) and SBc-AP (`mme.sbcap.server`, and the CBC
+  allowlist). Those bind the same way: the first IPv4 entry, else the first IPv6 one (#1312).
+- A configuration file that does not parse now fails startup with the parse error, where it
+  was ignored and the daemon fell back to its defaults (loopback binds among them). Affects
+  amfd, nrfd, ausfd, bsfd, nssfd, pcfd, udmd, udrd, smfd, dccfd, eesd, lmfd, mbsmfd, nsacfd,
+  nwdafd and pind. A missing file is still no configuration (#1312, #1313 review).
+- dccfd, eesd, lmfd, mbsmfd, nsacfd, nwdafd and pind bind `<nf>.sbi.server[0]` from their YAML
+  when `--sbi-addr` / `--sbi-port` are not given; the flags still win (#1312).
 - **mmed: S1-MME binds `127.0.0.1:36412` when `mme.s1ap.server` is unset**, where it bound the
   wildcard `0.0.0.0` (#1299). Break risk: a deployment that relied on the implicit wildcard
   (no `mme.s1ap.server`) no longer accepts eNBs from other hosts; it logs a warning and needs
