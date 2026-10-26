@@ -13,6 +13,9 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 ## [Unreleased]
 
 ### Changed
+- lmfd reads the LPP NR PRS-RSRP of a Multi-RTT or DL-TDOA measurement (`nr-DL-PRS-RSRP-Result`)
+  as `v − 157` dBm, the lower edge of TS 38.133 Table 10.1.24.3.1-1. It read `v − 140`, the
+  E-UTRA RSRP offset, which put every PRS-RSRP 16-17 dB too high (#1278).
 - lmfd decodes the NR E-CID quantities of an NRPPa E-CID report into physical values, so NR
   E-CID against a real NR gNB gives a fix where it gave 500 `POSITIONING_FAILED`. NR-TADV is the
   round trip of TS 38.133 §13.5.1 Table 13.5.1-1, used as the E-CID timing term (bin
