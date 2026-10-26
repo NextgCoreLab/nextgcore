@@ -12348,8 +12348,7 @@ mod tests {
             per_round.push(teardowns() - before);
             let left = fx.a.peer_recovery_time_stamp_for_test().await;
             assert!(
-                left.is_none()
-                    || left == Some(nextgcore_pfcp::recovery_time::normalize_received(stamp)),
+                left.is_none() || left == Some(stamp),
                 "round {i}: the teardown's clear, or the new stamp as a baseline: {left:?}"
             );
         }
