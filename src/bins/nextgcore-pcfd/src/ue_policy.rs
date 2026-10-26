@@ -49,7 +49,7 @@ pub enum TrafficDescriptorComponent {
 }
 
 /// Traffic Descriptor: a set of components (AND-logic within, OR across TDs per URSP rule)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TrafficDescriptor {
     pub components: Vec<TrafficDescriptorComponent>,
 }
@@ -81,7 +81,7 @@ pub enum RouteSelectionPduType {
 }
 
 /// Route Selection Descriptor (RSD) — specifies which PDU session to use
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RouteSelectionDescriptor {
     /// Route selection descriptor precedence (lower = higher priority)
     pub precedence: u8,
@@ -131,7 +131,7 @@ impl RouteSelectionDescriptor {
 }
 
 /// URSP Rule: maps traffic descriptors to route selection descriptors
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct UrspRule {
     /// Rule precedence (lower = higher priority, evaluated first)
     pub precedence: u8,
@@ -337,6 +337,12 @@ pub struct UePolicyAssociation {
     /// subscription. Held so the association delete leg can unsubscribe rather than
     /// leaving the AMF pushing CM-state reports at a PCF that no longer cares.
     pub connectivity_subscription_id: Option<String>,
+    /// Which delivery procedure is current (#1261 review): bumped by every
+    /// [`ue_policy_set_delivery`]. A T3501 loop or a delivery task that belongs
+    /// to an earlier one stops when it sees a newer value, so it neither
+    /// retransmits a superseded MANAGE UE POLICY COMMAND nor fails the
+    /// association while the newer delivery is in flight.
+    pub delivery_generation: u64,
 }
 
 /// The serving AMF's GUAMI as carried in a TS 29.525 `PolicyAssociationRequest`
@@ -426,11 +432,20 @@ pub fn ue_policy_add(supi: &str, notification_uri: &str, supp_feat: &str) -> UeP
         guami: None,
         serving_nf_id: None,
         connectivity_subscription_id: None,
+        delivery_generation: 0,
     };
     if let Ok(mut m) = ue_policy_store().lock() {
         m.insert(assoc.pol_asso_id.clone(), assoc.clone());
     }
     assoc
+}
+/// Every UE-policy association of `supi` (#1261): a PCF-initiated change of the
+/// UE's policy data re-evaluates each of them (TS 29.513 §5.6.2.2.2 step 1).
+pub fn ue_policy_find_by_supi(supi: &str) -> Vec<UePolicyAssociation> {
+    ue_policy_store()
+        .lock()
+        .map(|m| m.values().filter(|a| a.supi == supi).cloned().collect())
+        .unwrap_or_default()
 }
 pub fn ue_policy_find(pol_asso_id: &str) -> Option<UePolicyAssociation> {
     ue_policy_store().lock().ok()?.get(pol_asso_id).cloned()
@@ -443,24 +458,38 @@ pub fn ue_policy_remove(pol_asso_id: &str) -> bool {
 }
 
 /// Record the delivery parameters (PTI, UPSC, PLMN, rules) chosen for an
-/// association at create time, leaving `delivery_state = Pending`. No-op if
-/// the association was already deleted (cancel-on-delete).
+/// association, leaving `delivery_state = Pending`, and start a new delivery
+/// generation, which it returns. No-op (`None`) if the association was already
+/// deleted (cancel-on-delete).
+///
+/// A command parked for a CM-IDLE UE belongs to the delivery this one replaces,
+/// so it is dropped (#1261 review): a later wake-up must not send it.
 pub fn ue_policy_set_delivery(
     pol_asso_id: &str,
     pti: u8,
     upsc: u16,
     plmn: Option<(String, String)>,
     rules: Vec<UrspRule>,
-) {
-    if let Ok(mut m) = ue_policy_store().lock() {
-        if let Some(a) = m.get_mut(pol_asso_id) {
-            a.pti = pti;
-            a.upsc = upsc;
-            a.plmn = plmn;
-            a.rules = rules;
-            a.delivery_state = DeliveryState::Pending;
-        }
-    }
+) -> Option<u64> {
+    let generation = {
+        let mut m = ue_policy_store().lock().ok()?;
+        let a = m.get_mut(pol_asso_id)?;
+        a.pti = pti;
+        a.upsc = upsc;
+        a.plmn = plmn;
+        a.rules = rules;
+        a.delivery_state = DeliveryState::Pending;
+        a.delivery_generation += 1;
+        a.delivery_generation
+    };
+    ue_policy_drop_parked_delivery(pol_asso_id);
+    Some(generation)
+}
+
+/// Whether `generation` is still the association's current delivery (#1261
+/// review). `false` once the association is gone.
+pub fn ue_policy_delivery_is_current(pol_asso_id: &str, generation: u64) -> bool {
+    ue_policy_find(pol_asso_id).is_some_and(|a| a.delivery_generation == generation)
 }
 
 /// Update the delivery state of an association. No-op if the association was
@@ -618,14 +647,28 @@ pub fn t3501_on_expiry(retransmissions_done: u8) -> T3501Expiry {
 ///
 /// Generic over an async `resend` closure so it is unit-testable without the
 /// SBI client (and to avoid a `sbi_path`↔`ue_policy` dependency cycle).
-pub async fn run_t3501<F, Fut>(pol_asso_id: &str, duration: std::time::Duration, mut resend: F)
-where
+pub async fn run_t3501<F, Fut>(
+    pol_asso_id: &str,
+    generation: u64,
+    duration: std::time::Duration,
+    mut resend: F,
+) where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
     let mut retransmissions_done: u8 = 0;
     loop {
         tokio::time::sleep(duration).await;
+        // #1261 review: the timer is the one of delivery `generation`. Once a newer
+        // delivery has started, "Pending" is that one's state, and this loop
+        // neither retransmits its own superseded command nor fails the newer one.
+        if !ue_policy_delivery_is_current(pol_asso_id, generation) {
+            log::info!(
+                "[{pol_asso_id}] UE policy: T3501 of a superseded delivery stopped (a newer \
+                 MANAGE UE POLICY COMMAND is in flight)"
+            );
+            return;
+        }
         match ue_policy_delivery_state(pol_asso_id) {
             Some(DeliveryState::Pending) => match t3501_on_expiry(retransmissions_done) {
                 T3501Expiry::Retransmit => {
@@ -2577,12 +2620,18 @@ mod tests {
         let id = seed_pending_assoc(0x81);
         let sends = Arc::new(AtomicUsize::new(0));
         let s = sends.clone();
-        run_t3501(&id, std::time::Duration::from_millis(1), move || {
-            let s = s.clone();
-            async move {
-                s.fetch_add(1, Ordering::SeqCst);
-            }
-        })
+        let generation = ue_policy_find(&id).unwrap().delivery_generation;
+        run_t3501(
+            &id,
+            generation,
+            std::time::Duration::from_millis(1),
+            move || {
+                let s = s.clone();
+                async move {
+                    s.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
         .await;
         assert_eq!(
             sends.load(Ordering::SeqCst),
@@ -2598,6 +2647,52 @@ mod tests {
         );
     }
 
+    /// #1261 review: a T3501 loop of a superseded delivery stops at its next
+    /// expiry. It neither retransmits the old command nor fails the association
+    /// while the newer delivery is Pending.
+    #[tokio::test]
+    async fn t3501_of_a_superseded_delivery_stops() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let id = seed_pending_assoc(0x83);
+        let old = ue_policy_find(&id).unwrap().delivery_generation;
+        let sends = Arc::new(AtomicUsize::new(0));
+        let s = sends.clone();
+        let loop_id = id.clone();
+        let timer = tokio::spawn(async move {
+            run_t3501(
+                &loop_id,
+                old,
+                std::time::Duration::from_millis(50),
+                move || {
+                    let s = s.clone();
+                    async move {
+                        s.fetch_add(1, Ordering::SeqCst);
+                    }
+                },
+            )
+            .await;
+        });
+        // A PCF-initiated re-delivery starts inside the old T3501.
+        let new = ue_policy_set_delivery(&id, 0x84, 1, Some(("001".into(), "01".into())), vec![])
+            .expect("association exists");
+        assert!(new > old);
+        timer.await.expect("timer task");
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            0,
+            "the old command is not retransmitted"
+        );
+        assert_eq!(
+            ue_policy_delivery_state(&id),
+            Some(DeliveryState::Pending),
+            "the newer delivery is not failed by the old timer"
+        );
+        assert!(ue_policy_delivery_is_current(&id, new));
+        assert!(!ue_policy_delivery_is_current(&id, old));
+        ue_policy_remove(&id);
+    }
+
     /// A COMPLETE stops T3501: once the association is Delivered the driver
     /// returns immediately without retransmitting.
     #[tokio::test]
@@ -2608,12 +2703,18 @@ mod tests {
         ue_policy_mark_delivered(&id, 1); // COMPLETE arrived before the first expiry
         let sends = Arc::new(AtomicUsize::new(0));
         let s = sends.clone();
-        run_t3501(&id, std::time::Duration::from_millis(1), move || {
-            let s = s.clone();
-            async move {
-                s.fetch_add(1, Ordering::SeqCst);
-            }
-        })
+        let generation = ue_policy_find(&id).unwrap().delivery_generation;
+        run_t3501(
+            &id,
+            generation,
+            std::time::Duration::from_millis(1),
+            move || {
+                let s = s.clone();
+                async move {
+                    s.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
         .await;
         assert_eq!(
             sends.load(Ordering::SeqCst),
