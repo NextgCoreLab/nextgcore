@@ -1,0 +1,36 @@
+# PROFILE=6g: the 5G profile's 10-NF core plus the nextgsim gNB/UE, in
+# namespace nextg-6g, running binaries built with the runtime 6G / research
+# cargo features (profile.env lists them) and with those features switched ON
+# in config (profile_postrender in profile.env), which the 5G profile leaves
+# off.
+#
+# The 5G overlay is the resource, so every EKS fix made there (addressing,
+# headless Services, ClusterIP monitoring, probes, hnet keys, storage) applies
+# here unchanged; only the namespace differs. The FQDNs inside the NF configs
+# (nrf.nextg-system.svc...) are not namespace fields, so profile_postrender
+# rewrites them and fails the render if a nextg-system reference survives.
+#
+# Rendered without applying:
+#   kubectl kustomize deploy/eks/profiles/6g
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: nextg-6g
+
+resources:
+  - ../5g
+
+patches:
+  # The renamed base Namespace carries the privileged label too, so applying
+  # the render never fights the label deploy-eks.sh sets.
+  - target:
+      kind: Namespace
+    patch: |-
+      - op: add
+        path: /metadata/labels/pod-security.kubernetes.io~1enforce
+        value: privileged
+
+labels:
+  - includeSelectors: false
+    pairs:
+      nextg.io/profile: 6g
