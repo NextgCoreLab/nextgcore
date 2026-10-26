@@ -1226,8 +1226,8 @@ impl SxaNode {
                     fsm,
                 }
             });
-            // #995: in the NTP reading (a pre-#995 SGW-C sends Unix seconds).
-            let rts = nextgcore_pfcp::recovery_time::normalize_received(req.recovery_time_stamp);
+            // TS 29.244 §8.2.65: NTP-era seconds, kept as sent (#1033).
+            let rts = req.recovery_time_stamp;
             let restarted = matches!(peer.recovery_time_stamp, Some(stored) if stored != rts);
             peer.state = PfcpNodeState::Associated;
             peer.recovery_time_stamp = Some(rts);
@@ -1327,8 +1327,6 @@ impl SxaNode {
 
     /// Record a peer's Recovery Time Stamp, flushing its sessions if it changed.
     async fn note_peer_recovery_time_stamp(&self, from: SocketAddr, rts: u32) {
-        // #995: in the NTP reading, as stored at association.
-        let rts = nextgcore_pfcp::recovery_time::normalize_received(rts);
         let restarted = {
             let mut peers = self.peers.write().await;
             let Some(peer) = peers.get_mut(&from) else {
@@ -3484,8 +3482,8 @@ mod tests {
 
     /// A bound node plus a socket standing in for the SGW-C.
     /// #995: the SGW-U's own Recovery Time Stamp is NTP-era seconds (TS 29.244
-    /// §8.2.65), and a pre-#995 SGW-C's Unix-seconds stamp is stored in the NTP
-    /// reading, so the same SGW-C re-associating with it is not a restart.
+    /// §8.2.65), and a received stamp is stored as sent (#1033): a Unix-seconds
+    /// stamp (a 0.1.x SGW-C) is not re-read as NTP.
     #[tokio::test]
     async fn recovery_time_stamps_are_ntp_seconds() {
         let (_guard, node, peer) = node_and_peer().await;
@@ -3516,10 +3514,7 @@ mod tests {
             .into_iter()
             .find(|p| p.addr == peer.local_addr().unwrap())
             .and_then(|p| p.recovery_time_stamp);
-        assert_eq!(
-            stored,
-            Some(nextgcore_pfcp::recovery_time::from_unix_secs(unix))
-        );
+        assert_eq!(stored, Some(unix as u32), "as sent, not normalised");
     }
 
     async fn node_and_peer() -> (SxaTestGuard, Arc<SxaNode>, UdpSocket) {

@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-d0d8730f.js";
+            window.path_to_searchindex_js = "../searchindex-e91a4036.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -295,6 +295,7 @@ amf:
 <tr><td><code>UCMF_SBI_ADDR</code> / <code>UCMF_SBI_PORT</code></td><td>Fallback UCMF for RACS (UE Radio Capability ID resolution) when none is discoverable via the NRF. Port default <code>7777</code>.</td></tr>
 <tr><td><code>AMF_NAMF_LOC_LMF</code></td><td><code>off</code>/<code>0</code>/<code>false</code> makes Namf_Location answer from the stored NGAP cell identity with no LMF round trip. Default on.</td></tr>
 <tr><td><code>AMF_UE_POLICY_ASSOC</code></td><td><code>off</code>/<code>0</code>/<code>false</code> disables the Npcf_UEPolicyControl association at registration. Default on.</td></tr>
+<tr><td><code>AMF_PRIORITY_MESSAGE_PRIORITY</code></td><td>The <code>3gpp-Sbi-Message-Priority</code> (0-31, 0 highest; TS 29.500 §6.8.4) put on the CreateSMContext of a UE that connected with RRC cause mps-PriorityAccess, mcs-PriorityAccess or highPriorityAccess, or holds an MPS/MCX subscription (TS 23.502 §4.3.2.2.1 step 3). Default <code>8</code>. Read once; an invalid value is logged and the default used.</td></tr>
 <tr><td><code>AMF_GUTI_REALLOCATION</code></td><td>Truthy (<code>1</code>/<code>true</code>/<code>yes</code>/<code>on</code>) enables NAS 5G-GUTI reallocation (UE Configuration Update). Default off.</td></tr>
 <tr><td><code>AMF_T3513_SECS</code></td><td>Paging timer T3513, default <code>5</code> s.</td></tr>
 <tr><td><code>AMF_MOBILE_REACHABLE_SECS</code> / <code>AMF_IMPLICIT_DEREG_SECS</code></td><td>Override the mobile-reachable timer (default T3512 + 240 s) and implicit-deregistration timer (default 240 s).</td></tr>

@@ -1424,8 +1424,6 @@ impl PfcpServer {
     /// from any other address says nothing about whether THIS association's
     /// peer restarted.
     async fn check_peer_recovery(&self, src_addr: SocketAddr, rts: u32) {
-        // #995: in the NTP reading, as stored at association.
-        let rts = nextgcore_pfcp::recovery_time::normalize_received(rts);
         let restarted = {
             let assoc = self.association.read().await;
             match assoc.as_ref() {
@@ -1603,8 +1601,8 @@ impl PfcpServer {
                 .map_err(|e| format!("Send error: {e}"))?;
             return Ok(());
         }
-        // #995: kept in the NTP reading (a pre-#995 SMF sends Unix seconds).
-        let rts = nextgcore_pfcp::recovery_time::normalize_received(rts.unwrap());
+        // TS 29.244 §8.2.65: NTP-era seconds, kept as sent (#1033).
+        let rts = rts.unwrap();
         let node_id = ParsedIe::find_ie(&ies, pfcp_ie::NODE_ID)
             .map(|ie| ie.value.clone())
             .unwrap_or_default();
@@ -6783,7 +6781,8 @@ mod tests {
     }
 
     /// #995: the UPF's own Recovery Time Stamp is NTP-era seconds (TS 29.244
-    /// §8.2.65), and a pre-#995 peer's Unix-seconds stamp is read in the NTP reading.
+    /// §8.2.65), and a received stamp is stored as sent (#1033): a Unix-seconds
+    /// stamp (a 0.1.x SMF) is not re-read as NTP.
     #[tokio::test]
     async fn recovery_time_stamps_are_ntp_seconds() {
         let (server, smf, addr, _rx) = spawn_test_server().await;
@@ -6801,7 +6800,7 @@ mod tests {
             Some(unix as u32),
             "the parser returns the wire value"
         );
-        // ... and the association stores it in the NTP reading.
+        // ... and the association stores it as sent.
         let assoc = build_association_setup_request_payload(Some(unix as u32));
         let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
         assert_eq!(
@@ -6812,7 +6811,8 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .recovery_time_stamp,
-            nextgcore_pfcp::recovery_time::from_unix_secs(unix)
+            unix as u32,
+            "as sent, not normalised"
         );
     }
 
