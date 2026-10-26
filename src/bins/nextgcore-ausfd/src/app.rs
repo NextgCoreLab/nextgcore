@@ -260,7 +260,12 @@ pub async fn run() -> Result<()> {
             Ok(content) => {
                 log::debug!("Configuration file loaded ({} bytes)", content.len());
                 // Seed NRF URI into SBI context for NF registration
-                if let Ok(yaml) = serde_yaml::from_str::<AusfYaml>(&content) {
+                {
+                    // #1313 review: a config that does not parse fails startup
+                    // rather than falling back to the defaults (the bind among them).
+                    let yaml: AusfYaml = serde_yaml::from_str(&content).map_err(|e| {
+                        anyhow::anyhow!("configuration file {} does not parse: {e}", args.config)
+                    })?;
                     if let Some(ausf) = yaml.ausf {
                         if let Some(sbi) = ausf.sbi {
                             // Override the advertised/bind SBI address with the
@@ -4069,5 +4074,28 @@ mod oauth2_h8_tests {
         assert_ne!(resp.status, 401, "valid token must not be 401");
         assert_ne!(resp.status, 403, "valid token must not be 403");
         server.stop().await.expect("stop");
+    }
+}
+
+/// #1313 review: a config that does not parse now fails startup, so every
+/// shipped config of this daemon must parse with its typed structs.
+#[cfg(test)]
+mod shipped_config_tests {
+    #[test]
+    fn the_shipped_configs_parse() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        {
+            let rel = "docker/rust/configs/5gc/ausf.yaml";
+            let text = std::fs::read_to_string(root.join(rel)).unwrap();
+            serde_yaml::from_str::<super::AusfYaml>(&text).unwrap_or_else(|e| panic!("{rel}: {e}"));
+        }
+        let cm: serde_yaml::Value = serde_yaml::from_str(
+            &std::fs::read_to_string(root.join("k8s/manifests/configmap.yaml")).unwrap(),
+        )
+        .unwrap();
+        let text = cm["data"]["ausf.yaml"]
+            .as_str()
+            .expect("the ConfigMap's ausf.yaml");
+        serde_yaml::from_str::<super::AusfYaml>(text).expect("k8s ausf.yaml");
     }
 }

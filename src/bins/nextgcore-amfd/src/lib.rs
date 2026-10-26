@@ -183,6 +183,9 @@ struct SbiClientYaml {
 #[derive(Debug, Default, Deserialize)]
 struct SbiYaml {
     client: Option<SbiClientYaml>,
+    /// `amf.sbi.server[]`: the first entry is the SBI listen address unless
+    /// `AMF_SBI_ADDR` / `AMF_SBI_PORT` name one (#1311).
+    server: Option<Vec<ListenServerYaml>>,
 }
 
 /// Wave-6 H9 NAS-security canary knob (`amf.nas.use_nextgcore_security`).
@@ -244,6 +247,9 @@ struct AmfSection {
     plmn_support: Option<Vec<PlmnSupportYaml>>,
     security: Option<SecurityYaml>,
     sbi: Option<SbiYaml>,
+    /// `amf.ngap.server[]`: the first entry is the NGAP listen address unless
+    /// `--ngap-addr` names one (#1311).
+    ngap: Option<ListenIfYaml>,
     nas: Option<NasYaml>,
     time: Option<TimeYaml>,
     emergency: Option<EmergencyYaml>,
@@ -402,37 +408,37 @@ struct ListenIfYaml {
     server: Option<Vec<ListenServerYaml>>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct ListenSectionYaml {
-    ngap: Option<ListenIfYaml>,
-    sbi: Option<ListenIfYaml>,
+/// The listen addresses the config file names (#1311): the first `server` of
+/// `amf.ngap` and of `amf.sbi`, as (address, port).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ConfigListen {
+    ngap: Option<(String, Option<u16>)>,
+    sbi: Option<(String, Option<u16>)>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct ListenYaml {
-    amf: Option<ListenSectionYaml>,
+fn first_server(servers: Option<&Vec<ListenServerYaml>>) -> Option<(String, Option<u16>)> {
+    let entry = servers?.first()?;
+    Some((entry.address.clone()?, entry.port))
 }
 
-/// The first `server` entry of `amf.<if>` in `config`: (address, port).
-fn config_server(config: Option<&str>, ngap: bool) -> Option<(String, Option<u16>)> {
-    let yaml: ListenYaml = serde_yaml::from_str(config?).ok()?;
-    let section = yaml.amf?;
-    let entry = if ngap { section.ngap } else { section.sbi }?
-        .server?
-        .into_iter()
-        .next()?;
-    Some((entry.address?, entry.port))
+impl ConfigListen {
+    fn of(section: &AmfSection) -> Self {
+        Self {
+            ngap: first_server(section.ngap.as_ref().and_then(|n| n.server.as_ref())),
+            sbi: first_server(section.sbi.as_ref().and_then(|s| s.server.as_ref())),
+        }
+    }
 }
 
 /// #1311: the NGAP listen address. `--ngap-addr`, else `amf.ngap.server[0]`, else
 /// `127.0.0.1:38412` (#1308: never a wider default).
-fn resolve_ngap_addr(cli: Option<&str>, config: Option<&str>) -> Result<SocketAddr> {
+fn resolve_ngap_addr(cli: Option<&str>, config: &ConfigListen) -> Result<SocketAddr> {
     if let Some(cli) = cli {
         return cli
             .parse()
             .map_err(|e| anyhow::anyhow!("Invalid NGAP address '{cli}': {e}"));
     }
-    match config_server(config, true) {
+    match config.ngap.clone() {
         Some((address, port)) => {
             nextgcore_core::sockaddr::parse_listen_addr(&address, port.unwrap_or(38412))
                 .map_err(|e| anyhow::anyhow!("Invalid amf.ngap.server address '{address}': {e}"))
@@ -446,9 +452,9 @@ fn resolve_ngap_addr(cli: Option<&str>, config: Option<&str>) -> Result<SocketAd
 fn resolve_sbi_listen(
     env_addr: Option<String>,
     env_port: Option<u16>,
-    config: Option<&str>,
+    config: &ConfigListen,
 ) -> (String, u16) {
-    let yaml = config_server(config, false);
+    let yaml = config.sbi.clone();
     let addr = env_addr
         .or_else(|| yaml.as_ref().map(|(a, _)| a.clone()))
         .unwrap_or_else(|| "127.0.0.1".to_string());
@@ -470,6 +476,8 @@ pub struct AmfApp {
     ngap_event_tx: Option<mpsc::Sender<event::AmfEvent>>,
     /// NGAP event channel receiver
     ngap_event_rx: Option<mpsc::Receiver<event::AmfEvent>>,
+    /// The listen addresses the config file names, read with the rest of it.
+    config_listen: ConfigListen,
 }
 
 impl AmfApp {
@@ -482,6 +490,7 @@ impl AmfApp {
             metrics: metrics::AmfMetrics::new(),
             ngap_event_tx: Some(tx),
             ngap_event_rx: Some(rx),
+            config_listen: ConfigListen::default(),
         }
     }
 
@@ -503,24 +512,23 @@ impl AmfApp {
     }
 
     /// Load configuration from YAML file
-    async fn load_config(&self, config_path: &str) -> Result<()> {
+    async fn load_config(&mut self, config_path: &str) -> Result<()> {
         log::info!("Loading configuration from: {config_path}");
 
+        // #1313 review: no file is no config, but a file that is there and cannot be
+        // read or parsed fails startup. Falling back to the defaults would turn a
+        // typo into an AMF listening on loopback with no warning.
         let config_content = match std::fs::read_to_string(config_path) {
             Ok(content) => content,
-            Err(e) => {
-                log::warn!("Could not read config file '{config_path}': {e}. Using defaults.");
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                log::warn!("Config file '{config_path}' not found. Using defaults.");
                 return Ok(());
             }
+            Err(e) => anyhow::bail!("cannot read the config file '{config_path}': {e}"),
         };
 
-        let yaml: AmfYaml = match serde_yaml::from_str(&config_content) {
-            Ok(v) => v,
-            Err(e) => {
-                log::warn!("Failed to parse YAML config '{config_path}': {e}. Using defaults.");
-                return Ok(());
-            }
-        };
+        let yaml: AmfYaml = serde_yaml::from_str(&config_content)
+            .map_err(|e| anyhow::anyhow!("config file '{config_path}' does not parse: {e}"))?;
 
         let mut amf_section = match yaml.amf {
             Some(s) => s,
@@ -529,6 +537,7 @@ impl AmfApp {
                 return Ok(());
             }
         };
+        self.config_listen = ConfigListen::of(&amf_section);
 
         // #1070 re-review m1: everything that can refuse the configuration is resolved
         // and checked HERE, before the first write to any process-wide state (the NAS
@@ -1128,8 +1137,8 @@ pub async fn run() -> Result<()> {
     // Parse NGAP address + SCTP backend and initialize NGAP server
     // #1311: the listen addresses in the config file are honoured; the command line
     // and the environment override them.
-    let config_text = std::fs::read_to_string(&args.config).ok();
-    let ngap_addr = resolve_ngap_addr(args.ngap_addr.as_deref(), config_text.as_deref())?;
+    let config_listen = app.config_listen.clone();
+    let ngap_addr = resolve_ngap_addr(args.ngap_addr.as_deref(), &config_listen)?;
     nextgcore_core::sockaddr::warn_if_loopback_listener(
         "NGAP",
         &ngap_addr,
@@ -1214,7 +1223,7 @@ pub async fn run() -> Result<()> {
         std::env::var("AMF_SBI_PORT")
             .ok()
             .and_then(|p| p.parse().ok()),
-        config_text.as_deref(),
+        &config_listen,
     );
     let sbi_sock: SocketAddr = nextgcore_core::sockaddr::parse_listen_addr(&sbi_addr, sbi_port)
         .map_err(|e| anyhow::anyhow!("Invalid SBI address '{sbi_addr}:{sbi_port}': {e}"))?;
@@ -1348,7 +1357,7 @@ mod tests {
     fn ngap_listener_defaults_to_loopback() {
         let args = Args::parse_from(["nextgcore-amfd"]);
         assert_eq!(args.ngap_addr, None);
-        let addr = resolve_ngap_addr(None, None).unwrap();
+        let addr = resolve_ngap_addr(None, &ConfigListen::default()).unwrap();
         assert_eq!(addr, "127.0.0.1:38412".parse::<SocketAddr>().unwrap());
         assert_eq!(ngap_path::DEFAULT_NGAP_ADDR, "127.0.0.1");
         let explicit = Args::parse_from(["nextgcore-amfd", "--ngap-addr", "0.0.0.0:38412"]);
@@ -1360,42 +1369,83 @@ mod tests {
     /// address is taken as is (#1306). No YAML: loopback.
     #[test]
     fn the_yaml_listen_addresses_are_bound_unless_overridden_1311() {
-        let yaml = "amf:\n  ngap:\n    server:\n      - address: 10.0.0.5\n        port: 38413\n  sbi:\n    server:\n      - address: fd00::5\n        port: 7778\n";
+        let listen = |yaml: &str| {
+            let y: AmfYaml = serde_yaml::from_str(yaml).unwrap();
+            ConfigListen::of(&y.amf.unwrap())
+        };
+        let cfg = listen(
+            "amf:\n  ngap:\n    server:\n      - address: 10.0.0.5\n        port: 38413\n  sbi:\n    server:\n      - address: fd00::5\n        port: 7778\n",
+        );
         assert_eq!(
-            resolve_ngap_addr(None, Some(yaml)).unwrap(),
+            resolve_ngap_addr(None, &cfg).unwrap(),
             "10.0.0.5:38413".parse::<SocketAddr>().unwrap()
         );
         assert_eq!(
-            resolve_ngap_addr(Some("0.0.0.0:38412"), Some(yaml)).unwrap(),
+            resolve_ngap_addr(Some("0.0.0.0:38412"), &cfg).unwrap(),
             "0.0.0.0:38412".parse::<SocketAddr>().unwrap(),
             "the command line wins"
         );
         assert_eq!(
-            resolve_sbi_listen(None, None, Some(yaml)),
+            resolve_sbi_listen(None, None, &cfg),
             ("fd00::5".to_string(), 7778)
         );
         assert_eq!(
-            resolve_sbi_listen(Some("0.0.0.0".into()), None, Some(yaml)),
+            resolve_sbi_listen(Some("0.0.0.0".into()), None, &cfg),
             ("0.0.0.0".to_string(), 7778),
             "the environment wins, field by field"
         );
-        let no_port = "amf:\n  ngap:\n    server:\n      - address: 10.0.0.5\n";
+        let no_port = listen("amf:\n  ngap:\n    server:\n      - address: 10.0.0.5\n");
+        assert_eq!(resolve_ngap_addr(None, &no_port).unwrap().port(), 38412);
         assert_eq!(
-            resolve_ngap_addr(None, Some(no_port)).unwrap().port(),
-            38412
-        );
-        assert_eq!(
-            resolve_sbi_listen(None, None, Some("amf:\n  guami: []\n")),
+            resolve_sbi_listen(None, None, &ConfigListen::default()),
             ("127.0.0.1".to_string(), 7777)
         );
+        let bogus = listen("amf:\n  ngap:\n    server:\n      - address: bogus\n");
         assert!(
-            resolve_ngap_addr(
-                None,
-                Some("amf:\n  ngap:\n    server:\n      - address: bogus\n")
-            )
-            .is_err(),
+            resolve_ngap_addr(None, &bogus).is_err(),
             "an unparsable address is refused, never widened"
         );
+    }
+
+    /// #1313 review: now that a config that does not parse fails startup, every
+    /// shipped amf.yaml must parse (the compose file, the sample, and the one the
+    /// k8s ConfigMap embeds).
+    #[test]
+    fn the_shipped_configs_parse() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        for rel in ["docker/rust/configs/5gc/amf.yaml", "configs/amf.yaml"] {
+            let text = std::fs::read_to_string(root.join(rel)).unwrap();
+            serde_yaml::from_str::<AmfYaml>(&text).unwrap_or_else(|e| panic!("{rel}: {e}"));
+        }
+        let cm: serde_yaml::Value = serde_yaml::from_str(
+            &std::fs::read_to_string(root.join("k8s/manifests/configmap.yaml")).unwrap(),
+        )
+        .unwrap();
+        let text = cm["data"]["amf.yaml"]
+            .as_str()
+            .expect("the ConfigMap's amf.yaml");
+        serde_yaml::from_str::<AmfYaml>(text).expect("k8s amf.yaml");
+    }
+
+    /// #1313 review: a config file that does not parse fails startup; a missing one
+    /// leaves the defaults.
+    #[tokio::test]
+    async fn a_config_that_does_not_parse_fails_startup() {
+        let dir = std::env::temp_dir().join(format!("amfd-badcfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("amf.yaml");
+        std::fs::write(&bad, "amf:\n  ngap: [\n").unwrap();
+        let mut app = AmfApp::new();
+        let err = app
+            .load_config(bad.to_str().unwrap())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not parse"), "{err}");
+        assert!(AmfApp::new()
+            .load_config("/nonexistent/amf.yaml")
+            .await
+            .is_ok());
     }
 
     /// **#920 follow-up.** A configured S-NSSAI with SST 0 -- not a slice, TS 23.501
@@ -1857,7 +1907,7 @@ amf:
         let ctx_arc = context::amf_self();
         let saved = save_lists(&ctx_arc.read().unwrap_or_else(|e| e.into_inner()));
 
-        let app = AmfApp::new();
+        let mut app = AmfApp::new();
         for load in 1..=2 {
             app.load_config(&path_str)
                 .await

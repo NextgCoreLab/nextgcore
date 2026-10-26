@@ -270,7 +270,8 @@ async fn main() -> Result<()> {
         "dccf",
         "sbi",
         7816,
-    );
+    )
+    .map_err(|e| anyhow::anyhow!("SBI listen address: {e}"))?;
     init_logging(&nextgcore_core::log::nf_log_level(
         args.log_level.as_deref(),
         Some(&args.config),

@@ -355,7 +355,12 @@ pub async fn run() -> Result<()> {
             Ok(content) => {
                 log::debug!("Configuration file loaded ({} bytes)", content.len());
                 // Seed NRF URI into SBI context for NF registration
-                if let Ok(yaml) = serde_yaml::from_str::<PcfYaml>(&content) {
+                {
+                    // #1313 review: a config that does not parse fails startup
+                    // rather than falling back to the defaults (the bind among them).
+                    let yaml: PcfYaml = serde_yaml::from_str(&content).map_err(|e| {
+                        anyhow::anyhow!("configuration file {} does not parse: {e}", args.config)
+                    })?;
                     if let Some(pcf) = yaml.pcf {
                         #[cfg(feature = "intent-loop")]
                         {
@@ -9778,5 +9783,28 @@ mod tests_am_policy_changes {
         let (c, r) = am_policy_changes(Some(&old), &map(json!({"servAreaRes": sar})));
         assert!(c.is_empty());
         assert_eq!(r, vec!["rfsp"]);
+    }
+}
+
+/// #1313 review: a config that does not parse now fails startup, so every
+/// shipped config of this daemon must parse with its typed structs.
+#[cfg(test)]
+mod shipped_config_tests {
+    #[test]
+    fn the_shipped_configs_parse() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        {
+            let rel = "docker/rust/configs/5gc/pcf.yaml";
+            let text = std::fs::read_to_string(root.join(rel)).unwrap();
+            serde_yaml::from_str::<super::PcfYaml>(&text).unwrap_or_else(|e| panic!("{rel}: {e}"));
+        }
+        let cm: serde_yaml::Value = serde_yaml::from_str(
+            &std::fs::read_to_string(root.join("k8s/manifests/configmap.yaml")).unwrap(),
+        )
+        .unwrap();
+        let text = cm["data"]["pcf.yaml"]
+            .as_str()
+            .expect("the ConfigMap's pcf.yaml");
+        serde_yaml::from_str::<super::PcfYaml>(text).expect("k8s pcf.yaml");
     }
 }

@@ -235,7 +235,8 @@ async fn main() -> Result<()> {
         "nsacf",
         "sbi",
         7813,
-    );
+    )
+    .map_err(|e| anyhow::anyhow!("SBI listen address: {e}"))?;
 
     init_logging(&nextgcore_core::log::nf_log_level(
         args.log_level.as_deref(),
