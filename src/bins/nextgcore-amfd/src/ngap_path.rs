@@ -39904,6 +39904,37 @@ mod eps_to_5gs_tests {
         );
     }
 
+    /// **#1274.** A finished preparation's guard does not remove the record of the next
+    /// preparation for the same SUPI. `hand_over_unless_cancelled` removes the record while
+    /// the N26 leg still holds its guard, so a second preparation can start before that
+    /// guard drops. The old guard removed by SUPI, and so dropped the new record: a
+    /// Relocation Cancel Request for the new preparation was then Queued instead of
+    /// marking it. `a_cancel_during_the_smf_round_trips_abandons_the_preparation` hit this
+    /// in CI, when the real leg's guard dropped after the test had started its own.
+    ///
+    /// REVERT-VERIFIED: with the guard removing by SUPI, the cancel is Queued.
+    #[test]
+    fn a_finished_preparations_guard_leaves_the_next_preparation_alone() {
+        let supi = "imsi-001010001274001".to_string();
+        let first = crate::n26_path::PreparationGuard::start(Some(&supi), 0x1274_0001)
+            .expect("the first preparation starts");
+        // It finished and was handed over; its guard is not dropped yet.
+        crate::n26_path::hand_over_record_for_test(&supi);
+        let second = crate::n26_path::PreparationGuard::start(Some(&supi), 0x1274_0002)
+            .expect("the next preparation for the UE starts");
+        drop(first);
+        assert_eq!(
+            crate::n26_path::preparation_in_progress_for_test(&supi),
+            Some((0x1274_0002, false)),
+            "the second preparation is still recorded as running"
+        );
+        drop(second);
+        assert_eq!(
+            crate::n26_path::preparation_in_progress_for_test(&supi),
+            None
+        );
+    }
+
     /// A cancel that arrives while the preparation is still at its SMFs marks it, and the
     /// N26 leg then abandons it instead of handing it to the NGAP layer: the SMF is told
     /// CANCELLED and the Forward Relocation Request refused (#592).

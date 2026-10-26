@@ -660,7 +660,12 @@ struct PreparationInProgress {
     mme_teid: u32,
     /// A Relocation Cancel Request arrived while the preparation ran.
     cancelled: bool,
+    /// #1274: which preparation this record is, so only its own guard removes it.
+    id: u64,
 }
+
+/// #1274: the id of the next preparation record.
+static NEXT_PREPARATION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Preparations in progress on the N26 leg (#592).
 ///
@@ -683,7 +688,14 @@ fn preparations_in_progress(
 }
 
 /// Removes a preparation's in-progress record on every exit of the N26 leg.
-pub(crate) struct PreparationGuard(Option<String>);
+///
+/// #1274: only ITS record, by id. [`hand_over_unless_cancelled`] removes the record
+/// while the leg still holds the guard, so a new preparation for the same SUPI can start
+/// before this guard drops. Removing by SUPI alone then dropped the NEW preparation's
+/// record: a Relocation Cancel Request for it was queued for the NGAP layer instead of
+/// marking it (TS 23.502 §4.11.1.2.2.3), and a third Forward Relocation Request was no
+/// longer refused as concurrent (#755).
+pub(crate) struct PreparationGuard(Option<(String, u64)>);
 
 impl PreparationGuard {
     /// `None` when a preparation for `supi` is already in progress (#755): a second one
@@ -695,22 +707,28 @@ impl PreparationGuard {
             if in_progress.contains_key(supi) {
                 return None;
             }
+            let id = NEXT_PREPARATION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             in_progress.insert(
                 supi.clone(),
                 PreparationInProgress {
                     mme_teid,
                     cancelled: false,
+                    id,
                 },
             );
+            return Some(Self(Some((supi.clone(), id))));
         }
-        Some(Self(supi.cloned()))
+        Some(Self(None))
     }
 }
 
 impl Drop for PreparationGuard {
     fn drop(&mut self) {
-        if let Some(supi) = &self.0 {
-            preparations_in_progress().remove(supi);
+        if let Some((supi, id)) = &self.0 {
+            let mut in_progress = preparations_in_progress();
+            if in_progress.get(supi).is_some_and(|p| p.id == *id) {
+                in_progress.remove(supi);
+            }
         }
     }
 }
@@ -759,6 +777,13 @@ pub(crate) fn hand_over_unless_cancelled(
     // Under the lock: see PREPARATIONS_IN_PROGRESS.
     enqueue_eps_to_5gs_preparation(prep);
     None
+}
+
+/// Test door (#1274): remove `supi`'s record as [`hand_over_unless_cancelled`] does
+/// when it hands a finished preparation over, while its guard is still held.
+#[cfg(test)]
+pub(crate) fn hand_over_record_for_test(supi: &str) {
+    preparations_in_progress().remove(supi);
 }
 
 /// Test door onto the in-progress record (#592).
