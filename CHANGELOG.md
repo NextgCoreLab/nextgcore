@@ -21,6 +21,11 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   (#1293). A Delete Bearer Command whose bearers all have a Delete Bearer Request in flight is now
   answered with a Delete Bearer Failure Indication, cause #101 "Collision with network
   initiated request" (TS 29.274 §7.2.17.2). Before, it got no answer (#619).
+- pcfd's `resourceUri`, in AM and UE PolicyUpdates (notifications and Update responses) and in
+  SM policy notifications, is now the complete resource URI `{apiRoot}/<apiName>/...` (TS 29.501
+  §4.4.1), with the configured FQDN as host when there is one. Before, it was the bare path. The
+  TS 29.507 / 29.512 / 29.525 notes let a consumer use either the complete URI or its
+  apiSpecificResourceUriPart (#1277).
 - lmfd decodes the NR E-CID quantities of an NRPPa E-CID report into physical values, so NR
   E-CID against a real NR gNB gives a fix where it gave 500 `POSITIONING_FAILED`. NR-TADV is the
   round trip of TS 38.133 §13.5.1 Table 13.5.1-1, used as the E-CID timing term (bin

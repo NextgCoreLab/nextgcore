@@ -688,6 +688,7 @@ fn an_indication_omitting_an_erab_being_deactivated_is_not_abnormal() {
             None,
             &[6],
             false,
+            crate::esm_build::PTI_UNASSIGNED,
         ),
         "E-RAB 6 is being deactivated"
     );

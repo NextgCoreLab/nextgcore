@@ -446,15 +446,23 @@ pub fn dispatch_triggered(raw: &[u8], msg_type: u8, sequence_number: u32, peer: 
         }
         // #591: the triggered Request of a Delete Bearer Command / Bearer Resource
         // Command. It closed the Command; it still needs its own answer.
-        mt::DELETE_BEARER_REQUEST => handle_delete_bearer_request(raw, sequence_number, peer),
+        mt::DELETE_BEARER_REQUEST => {
+            // #1282: it may answer the UE's bearer resource request.
+            crate::bearer_resource::on_triggered(sequence_number);
+            handle_delete_bearer_request(raw, sequence_number, peer)
+        }
         // A Bearer Resource Command's triggered Create / Update Bearer Request is
         // handled exactly as the initial one would be.
         mt::CREATE_BEARER_REQUEST | mt::UPDATE_BEARER_REQUEST => {
+            crate::bearer_resource::on_triggered(sequence_number);
             dispatch_initial(raw, msg_type, sequence_number, peer)
         }
-        mt::DELETE_BEARER_FAILURE_INDICATION
-        | mt::BEARER_RESOURCE_FAILURE_INDICATION
-        | mt::MODIFY_BEARER_FAILURE_INDICATION => {
+        // #1282, TS 23.401 §5.4.5 step 5: the UE is told why, with the mapped ESM
+        // cause (TS 29.274 Annex C).
+        mt::BEARER_RESOURCE_FAILURE_INDICATION => {
+            crate::bearer_resource::on_failure_indication(raw, sequence_number, peer)
+        }
+        mt::DELETE_BEARER_FAILURE_INDICATION | mt::MODIFY_BEARER_FAILURE_INDICATION => {
             let cause = failure_indication_cause(raw);
             log::warn!(
                 "S11 Failure Indication type={msg_type} seq={sequence_number} from {peer}: the \
@@ -466,6 +474,20 @@ pub fn dispatch_triggered(raw: &[u8], msg_type: u8, sequence_number: u32, peer: 
              not acted on: this MME has no handler for it"
         ),
     }
+}
+
+/// The PTI of a Delete Bearer Request (#1282, TS 29.274 Table 7.2.9.2-1: present
+/// when it answers the UE's BEARER RESOURCE MODIFICATION REQUEST), else
+/// unassigned.
+fn delete_bearer_request_pti(raw: &[u8]) -> u8 {
+    let mut bytes = bytes::Bytes::copy_from_slice(raw);
+    nextgcore_gtp::v2::Gtp2Message::decode(&mut bytes)
+        .ok()
+        .and_then(|msg| {
+            msg.get_ie(nextgcore_gtp::v2::Gtp2IeType::Pti as u8, 0)
+                .and_then(|ie| ie.value.first().copied())
+        })
+        .unwrap_or(crate::esm_build::PTI_UNASSIGNED)
 }
 
 /// The Cause value of a Failure Indication, if it carries one.
@@ -1415,6 +1437,7 @@ fn handle_delete_bearer_request(raw: &[u8], sequence_number: u32, peer: SocketAd
                     sess_id,
                     &to_deactivate,
                     reactivation,
+                    delete_bearer_request_pti(raw),
                 ) {
                     // Answered when the UE has (step 8).
                     return;

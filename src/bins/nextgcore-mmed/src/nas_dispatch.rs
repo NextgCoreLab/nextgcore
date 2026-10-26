@@ -2322,35 +2322,58 @@ pub fn handle_esm_message(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue: &MmeUe, esm:
                 Err(e) => log::warn!("[{}] PDN Disconnect Request rejected: {e}", mme_ue.imsi_bcd),
             }
         }
+        // #1282, TS 23.401 §5.4.5, TS 24.301 §6.5.3 / §6.5.4: sent on to the Serving GW
+        // as a Bearer Resource Command.
         esm_type::BEARER_RESOURCE_ALLOCATION_REQUEST => {
             match esm_handler::handle_bearer_resource_allocation_request(
                 enb_ue, mme_ue, &sess, &bearer, body,
             ) {
-                Ok(parsed) => log::info!(
-                    "[{}] Bearer Resource Allocation Request (linked ebi={}); the S11 Bearer \
-                     Resource Command to the SGW is not implemented (#51)",
-                    mme_ue.imsi_bcd,
-                    parsed.linked_ebi
-                ),
-                Err(e) => log::warn!(
-                    "[{}] Bearer Resource Allocation Request rejected: {e}",
-                    mme_ue.imsi_bcd
-                ),
+                Ok(parsed) => {
+                    log::info!(
+                        "[{}] Bearer Resource Allocation Request (PTI {pti}, linked ebi={})",
+                        mme_ue.imsi_bcd,
+                        parsed.linked_ebi
+                    );
+                    crate::bearer_resource::on_allocation_request(ctx, mme_ue.id, pti, &parsed);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[{}] Bearer Resource Allocation Request rejected: {e}",
+                        mme_ue.imsi_bcd
+                    );
+                    crate::bearer_resource::on_malformed(
+                        ctx,
+                        mme_ue.id,
+                        crate::bearer_resource::Kind::Allocation,
+                        pti,
+                    );
+                }
             }
         }
         esm_type::BEARER_RESOURCE_MODIFICATION_REQUEST => {
             match esm_handler::handle_bearer_resource_modification_request(
                 enb_ue, mme_ue, &sess, &bearer, body,
             ) {
-                Ok(_) => log::info!(
-                    "[{}] Bearer Resource Modification Request; the S11 Bearer Resource Command \
-                     to the SGW is not implemented (#51)",
-                    mme_ue.imsi_bcd
-                ),
-                Err(e) => log::warn!(
-                    "[{}] Bearer Resource Modification Request rejected: {e}",
-                    mme_ue.imsi_bcd
-                ),
+                Ok(parsed) => {
+                    log::info!(
+                        "[{}] Bearer Resource Modification Request (PTI {pti}, ebi={})",
+                        mme_ue.imsi_bcd,
+                        parsed.ebi_for_pf
+                    );
+                    crate::bearer_resource::on_modification_request(ctx, mme_ue.id, pti, &parsed);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[{}] Bearer Resource Modification Request rejected: {e}",
+                        mme_ue.imsi_bcd
+                    );
+                    crate::bearer_resource::on_malformed(
+                        ctx,
+                        mme_ue.id,
+                        crate::bearer_resource::Kind::Modification,
+                        pti,
+                    );
+                }
             }
         }
         esm_type::ESM_STATUS => match esm_handler::handle_esm_status(enb_ue, mme_ue, body) {
@@ -3053,6 +3076,7 @@ mod tests {
             None,
             &[6],
             false,
+            crate::esm_build::PTI_UNASSIGNED,
         ));
         assert_eq!(crate::bearer_deactivation::pending_count(), 1);
         let enb_ue = ctx.enb_ue_find_by_id(enb_ue_id).unwrap();
@@ -4743,13 +4767,19 @@ mod tests {
             nextgcore_gtp::v2::is_command_sequence(wire),
             "the Delete Bearer Command's number has the MSB set: {wire:#x}"
         );
-        let bearer_id = crate::gtp_path::bearers_of_ue(&ctx, mme_ue_id)
-            .first()
-            .expect("the attach created the default bearer")
-            .id;
-        crate::gtp_path::send_bearer_resource_command(&ctx, bearer_id, 5, 9, &[0x01], None)
-            .expect("Bearer Resource Command sent");
+        let brc_seq = crate::gtp_path::send_bearer_resource_command(
+            &ctx,
+            mme_ue_id,
+            &crate::s11_build::BearerResourceCommandParams {
+                linked_ebi: 5,
+                pti: 9,
+                tad: &[0x01],
+                ..Default::default()
+            },
+        )
+        .expect("Bearer Resource Command sent");
         let wire = recv_command(nextgcore_gtp::v2::Gtp2MessageType::BearerResourceCommand as u8);
+        assert_eq!(wire, brc_seq);
         assert!(
             nextgcore_gtp::v2::is_command_sequence(wire),
             "the Bearer Resource Command's number has the MSB set: {wire:#x}"
