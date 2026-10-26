@@ -66,6 +66,12 @@ struct Args {
     #[arg(long)]
     sbi_addr: Option<String>,
 
+    /// The SBI host advertised in the NRF NFProfile and callback URIs. Without it,
+    /// `NEXTGCORE_SBI_ADVERTISE`, else `nwdaf.sbi.server[0].advertise`, else the
+    /// bind address; a wildcard is never advertised (#1312).
+    #[arg(long)]
+    sbi_advertise: Option<String>,
+
     /// SBI server port
     #[arg(long)]
     sbi_port: Option<u16>,
@@ -219,15 +225,16 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     // #1312: the command line, else `nwdaf.sbi.server[0]` in the config file,
     // else loopback.
-    let (sbi_addr, sbi_port) = nextgcore_core::sockaddr::resolve_listen(
+    let sbi = nextgcore_core::sockaddr::SbiEndpoint::resolve_from_file(
         args.sbi_addr.as_deref(),
         args.sbi_port,
+        args.sbi_advertise.as_deref(),
         &args.config,
         "nwdaf",
-        "sbi",
         7815,
     )
     .map_err(|e| anyhow::anyhow!("SBI listen address: {e}"))?;
+    let (sbi_addr, sbi_port) = (sbi.host.clone(), sbi.port);
 
     init_logging(&nextgcore_core::log::nf_log_level(
         args.log_level.as_deref(),
@@ -290,15 +297,16 @@ async fn main() -> Result<()> {
     // somewhere a consumer can fetch from.
     {
         let scheme = if args.tls { "https" } else { "http" };
-        let host = if sbi_addr == "0.0.0.0" || sbi_addr == "::" {
-            log::warn!(
-                "SBI bound to {} — the ML model URL will advertise 127.0.0.1; set --sbi-addr \
-                 to a reachable address for consumers to download models (issue #109)",
-                sbi_addr
-            );
-            "127.0.0.1"
-        } else {
-            sbi_addr.as_str()
+        let host = match sbi.advertise.as_deref() {
+            Some(host) => host,
+            None => {
+                log::warn!(
+                    "SBI bound to {sbi_addr}: the ML model URL will advertise 127.0.0.1; set \
+                     --sbi-advertise or NEXTGCORE_SBI_ADVERTISE to a reachable address for \
+                     consumers to download models (issue #109, #1312)"
+                );
+                "127.0.0.1"
+            }
         };
         let base = format!(
             "{scheme}://{}",
@@ -363,7 +371,10 @@ async fn main() -> Result<()> {
     // reaching for the global_context() singleton.
     let sbi_ctx = global_context();
     sbi_ctx.set_nrf_uri(&args.nrf_uri).await;
-    if let Err(e) = register_with_nrf(sbi_ctx, &sbi_addr, sbi_port, &nf_instance_id).await {
+    if let Err(e) = match sbi.registration_host() {
+        Ok(host) => register_with_nrf(sbi_ctx, host, sbi_port, &nf_instance_id).await,
+        Err(why) => Err(why),
+    } {
         log::warn!("NRF registration failed (will operate without NRF): {e}");
     } else {
         // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
@@ -393,7 +404,10 @@ async fn main() -> Result<()> {
                 nrf_uri: args.nrf_uri.clone(),
                 callback_uri: format!(
                     "http://{}/nnwdaf-nfstatus-notify/v1/notify",
-                    nextgcore_sbi::uri_encode::uri_authority(&sbi_addr, sbi_port)
+                    nextgcore_sbi::uri_encode::uri_authority(
+                        sbi.advertise.as_deref().unwrap_or("127.0.0.1"),
+                        sbi_port
+                    )
                 ),
             });
         }

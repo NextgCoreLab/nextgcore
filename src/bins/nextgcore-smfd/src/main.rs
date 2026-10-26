@@ -25198,5 +25198,10 @@ mod shipped_config_tests {
             .as_str()
             .expect("the ConfigMap's smf.yaml");
         serde_yaml::from_str::<super::SmfYaml>(text).expect("k8s smf.yaml");
+        // #1312 (#1317 review): and as the Helm chart renders it (CI installs helm
+        // and sets NEXTGCORE_HELM_REQUIRED, so this is never skipped there).
+        if let Some(text) = nextgcore_core::helm_render::helm_rendered_config(&root, "smf.yaml") {
+            serde_yaml::from_str::<super::SmfYaml>(&text).expect("Helm smf.yaml");
+        }
     }
 }

@@ -77,13 +77,20 @@ struct Args {
     #[arg(short = 'k', long)]
     kill: bool,
 
-    /// SBI server address
-    #[arg(long, default_value = nextgcore_core::sockaddr::DEFAULT_LISTEN_HOST)]
-    sbi_addr: String,
+    /// SBI bind address. Without it, `nssf.sbi.server[0].address`, else
+    /// 127.0.0.1 (#1308, #1312): the command line overrides the config file.
+    #[arg(long)]
+    sbi_addr: Option<String>,
 
-    /// SBI server port
-    #[arg(long, default_value = "7777")]
-    sbi_port: u16,
+    /// The SBI host advertised in the NRF NFProfile and callback URIs. Without it,
+    /// `NEXTGCORE_SBI_ADVERTISE`, else `nssf.sbi.server[0].advertise`, else the
+    /// bind address; a wildcard is never advertised (#1312).
+    #[arg(long)]
+    sbi_advertise: Option<String>,
+
+    /// SBI server port. Without it, `nssf.sbi.server[0].port`, else 7777.
+    #[arg(long)]
+    sbi_port: Option<u16>,
 
     /// Enable TLS
     #[arg(long)]
@@ -152,6 +159,8 @@ struct SbiClientYaml {
 struct SbiServerYaml {
     address: Option<String>,
     port: Option<u16>,
+    /// The host advertised to the NRF and in callback URIs (#1312).
+    advertise: Option<String>,
 }
 
 /// SBI OAuth2 enforcement knob (`nssf.sbi.oauth2.require`).
@@ -274,7 +283,7 @@ const NOTIFY_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut args = Args::parse();
+    let args = Args::parse();
 
     // Initialize logging
     init_logging(&args)?;
@@ -339,6 +348,8 @@ async fn main() -> Result<()> {
     // How many NSIs the configuration installed. Checked after the config block
     // so the always-403 condition cannot ship silently (#93).
     let mut configured_nsi_count = 0usize;
+    // #1312: the YAML `server[0]`, used once the command line has had its say.
+    let mut yaml_sbi = nextgcore_core::sockaddr::YamlServer::default();
     if std::path::Path::new(&args.config).exists() {
         log::info!("Loading configuration from {}", args.config);
         match std::fs::read_to_string(&args.config) {
@@ -428,12 +439,11 @@ async fn main() -> Result<()> {
                             // routable address from config so the NRF NFProfile
                             // advertises a reachable endpoint (not 0.0.0.0).
                             if let Some(server) = sbi.server.as_ref().and_then(|s| s.first()) {
-                                if let Some(addr) = &server.address {
-                                    args.sbi_addr = addr.clone();
-                                }
-                                if let Some(port) = server.port {
-                                    args.sbi_port = port;
-                                }
+                                yaml_sbi = nextgcore_core::sockaddr::YamlServer {
+                                    address: server.address.clone(),
+                                    port: server.port,
+                                    advertise: server.advertise.clone(),
+                                };
                             }
                             if let Some(client) = sbi.client {
                                 if let Some(nrf_list) = client.nrf {
@@ -508,9 +518,20 @@ async fn main() -> Result<()> {
     }
 
     // Build SBI server configuration (legacy, for context)
+    // #1312: bind CLI, then YAML, then loopback; advertise --sbi-advertise, then
+    // NEXTGCORE_SBI_ADVERTISE, then the YAML advertise, then the bind (never a wildcard).
+    let sbi = nextgcore_core::sockaddr::SbiEndpoint::resolve(
+        args.sbi_addr.as_deref(),
+        args.sbi_port,
+        args.sbi_advertise.as_deref(),
+        yaml_sbi.address.as_deref(),
+        yaml_sbi.port,
+        yaml_sbi.advertise.as_deref(),
+        7777,
+    );
     let sbi_config = SbiServerConfig {
-        addr: args.sbi_addr.clone(),
-        port: args.sbi_port,
+        addr: sbi.host.clone(),
+        port: sbi.port,
         tls_enabled: args.tls,
         tls_cert: args.tls_cert.clone(),
         tls_key: args.tls_key.clone(),
@@ -520,9 +541,8 @@ async fn main() -> Result<()> {
     nssf_sbi_open(Some(sbi_config)).map_err(|e| anyhow::anyhow!(e))?;
 
     // Start actual HTTP/2 SBI server using nextgcore-sbi
-    let sbi_addr: SocketAddr =
-        nextgcore_core::sockaddr::parse_listen_addr(&args.sbi_addr, args.sbi_port)
-            .context("Invalid SBI address")?;
+    let sbi_addr: SocketAddr = nextgcore_core::sockaddr::parse_listen_addr(&sbi.host, sbi.port)
+        .context("Invalid SBI address")?;
     // #1308: loopback by default; say which setting opens it to remote peers.
     nextgcore_core::sockaddr::warn_if_loopback_listener(
         "SBI",
@@ -580,7 +600,10 @@ async fn main() -> Result<()> {
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
 
     // Register with NRF (B24.3)
-    match register_with_nrf(&args.sbi_addr, args.sbi_port).await {
+    match match sbi.registration_host() {
+        Ok(host) => register_with_nrf(host, sbi.port).await,
+        Err(e) => Err(e),
+    } {
         Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
             // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
             // (NSI count vs configured capacity; TS 29.510 §5.2.2.3.2).
@@ -3226,7 +3249,7 @@ mod tests {
     #[test]
     fn sbi_listener_defaults_to_loopback_1308() {
         let args = Args::parse_from(["nextgcore-nssfd"]);
-        assert_eq!(args.sbi_addr, "127.0.0.1");
+        assert_eq!(args.sbi_addr, None);
     }
 
     #[test]
@@ -3234,8 +3257,8 @@ mod tests {
         let args = Args::parse_from(["nextgcore-nssfd"]);
         assert_eq!(args.config, "/etc/nextgcore/nssf.yaml");
         assert_eq!(args.log_level, None);
-        assert_eq!(args.sbi_addr, "127.0.0.1");
-        assert_eq!(args.sbi_port, 7777);
+        assert_eq!(args.sbi_addr, None);
+        assert_eq!(args.sbi_port, None);
         assert!(!args.tls);
         assert_eq!(args.max_nf, 512);
     }
@@ -3257,8 +3280,8 @@ mod tests {
         ]);
         assert_eq!(args.config, "/custom/nssf.yaml");
         assert_eq!(args.log_level.as_deref(), Some("debug"));
-        assert_eq!(args.sbi_addr, "0.0.0.0");
-        assert_eq!(args.sbi_port, 8080);
+        assert_eq!(args.sbi_addr.as_deref(), Some("0.0.0.0"));
+        assert_eq!(args.sbi_port, Some(8080));
         assert_eq!(args.max_nf, 1024);
     }
 
@@ -5505,5 +5528,10 @@ mod shipped_config_tests {
             .as_str()
             .expect("the ConfigMap's nssf.yaml");
         serde_yaml::from_str::<super::NssfYaml>(text).expect("k8s nssf.yaml");
+        // #1312 (#1317 review): and as the Helm chart renders it (CI installs helm
+        // and sets NEXTGCORE_HELM_REQUIRED, so this is never skipped there).
+        if let Some(text) = nextgcore_core::helm_render::helm_rendered_config(&root, "nssf.yaml") {
+            serde_yaml::from_str::<super::NssfYaml>(&text).expect("Helm nssf.yaml");
+        }
     }
 }

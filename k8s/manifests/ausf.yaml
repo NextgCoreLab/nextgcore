@@ -92,6 +92,13 @@ spec:
               value: "dev"
             - name: RUST_LOG
               value: info
+            - name: NEXTGCORE_SBI_ADVERTISE
+              # #1312: the host registered with the NRF and put in callback
+              # URIs, set apart from the bind so a wildcard bind can never be
+              # advertised. The pod IP, which the init container also binds.
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
             - name: RUST_BACKTRACE
               value: "1"
             - name: UDM_SBI_ADDR

@@ -9,6 +9,7 @@ pub mod distributed_timer;
 pub mod errno; // Error codes (nextgcore-errno.h)
 pub mod fsm; // Finite state machine (nextgcore-fsm.h)
 pub mod hash; // Hash table (nextgcore-hash.h)
+pub mod helm_render; // the Helm chart's rendered NF configs, for config parse tests (#1312)
 pub mod list; // Doubly-linked list (nextgcore-list.h)
 pub mod lockfree; // Lock-free data structures (B2.4 - 6G advanced research)
 pub mod log; // Logging (nextgcore-log.h)

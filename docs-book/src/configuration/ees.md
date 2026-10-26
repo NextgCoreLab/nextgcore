@@ -36,7 +36,7 @@ The docker deployment does its real configuration on the command line: `command:
 Since the YAML file is never parsed, **every** field in the shipped example is decorative:
 
 - **`logger.level` is read.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691).
-- **`ees.sbi.server[]` (address/advertise/port) is inert.** The SBI bind address and port come from `--sbi-addr`/`--sbi-port`; the same values are what the EES advertises in its ECS-registration `EndPoint`.
+- **`ees.sbi.server[0]` is read (#1312).** The SBI bind is `--sbi-addr`/`--sbi-port`, else `address`/`port` here, else `127.0.0.1` and the default port. The advertised host is `--sbi-advertise`, else `NEXTGCORE_SBI_ADVERTISE`, else `advertise` here, else the bind address when it is not a wildcard; it is used in the `EESRegistration` endpoint sent to the ECS (the EES has no NRF registration); with a wildcard bind and nothing to advertise, the ECS registration is skipped and the reason logged. A wildcard is never advertised: with a wildcard bind and nothing set to advertise, the NF does not register and logs why. A config that does not parse fails startup (#1313).
 - **`ees.nrf.uri` is inert and doubly stale.** The EES does not register with the NRF at all (eesd-01); the ECS apiRoot is `--ecs-uri`, a CLI flag only.
 
 The file exists for visual consistency with the other NF configs and to satisfy the compose volume mount.
@@ -51,7 +51,8 @@ From the clap `Args` struct in `src/bins/nextgcore-eesd/src/main.rs`:
 | `-l, --log-file` | path | unset | Log file path. **Parsed but never consumed** — logging goes through `env_logger` regardless. |
 | `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-m, --no-color` | flag | off | Disable color output. **Parsed but never consumed.** |
-| `--sbi-addr` | string | `127.0.0.1` (loopback, #1308) | SBI server bind address; also placed in the `EESRegistration` endpoint sent to the ECS. |
+| `--sbi-addr` | string | `ees.sbi.server[0].address`, else `127.0.0.1` (#1308) | SBI server bind address; beats the YAML (#1312). |
+| `--sbi-advertise` | string | unset | The advertised SBI host (#1312); then `NEXTGCORE_SBI_ADVERTISE`, then `ees.sbi.server[0].advertise`, then the bind address when it is not a wildcard. |
 | `--sbi-port` | u16 | `7814` | SBI server port (docker deployments pass `7777`). |
 | `--tls` | flag | off | Enable TLS on the SBI server. |
 | `--tls-cert` | path | `/etc/nextgcore/tls/server.crt` (when `--tls`) | TLS certificate file. |

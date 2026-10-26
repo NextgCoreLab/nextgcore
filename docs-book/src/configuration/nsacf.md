@@ -62,7 +62,7 @@ These are the fields actually deserialized by the daemon (`#[derive(Deserialize)
 The daemon deserializes only the fields above; unknown YAML keys are silently ignored by serde. In particular, in the shipped example files:
 
 - **`logger.level` is read.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691).
-- **`nsacf.sbi.server[]` (address/port) is inert.** The SBI bind address and port come from the CLI flags `--sbi-addr`/`--sbi-port`; the YAML `server` list exists for visual consistency with other NF configs but is not read by `nextgcore-nsacfd`.
+- **`nsacf.sbi.server[0]` is read (#1312).** The SBI bind is `--sbi-addr`/`--sbi-port`, else `address`/`port` here, else `127.0.0.1` and the default port. The advertised host is `--sbi-advertise`, else `NEXTGCORE_SBI_ADVERTISE`, else `advertise` here, else the bind address when it is not a wildcard; it is used in the NRF registration. A wildcard is never advertised: with a wildcard bind and nothing set to advertise, the NF does not register and logs why. A config that does not parse fails startup (#1313).
 
 ## Command-line flags
 
@@ -74,7 +74,8 @@ Runtime knobs with real defaults from the clap `Args` struct in `main.rs`:
 | `-e, --log-level` | string | `logger.level`, else `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else is `info`). Without the flag, the config's `logger.level`, else `info`; `RUST_LOG` overrides both (#691). |
 | `-l, --log-file` | path | unset | Log file path. |
 | `-m, --no-color` | flag | off | Disable color output. |
-| `--sbi-addr` | string | `127.0.0.1` (loopback, #1308) | SBI server bind address. |
+| `--sbi-addr` | string | `nsacf.sbi.server[0].address`, else `127.0.0.1` (#1308) | SBI server bind address; beats the YAML (#1312). |
+| `--sbi-advertise` | string | unset | The advertised SBI host (#1312); then `NEXTGCORE_SBI_ADVERTISE`, then `nsacf.sbi.server[0].advertise`, then the bind address when it is not a wildcard. |
 | `--sbi-port` | u16 | `7813` | SBI server port (docker deployments pass `7777`). |
 | `--tls` | flag | off | Enable TLS on the SBI server. |
 | `--tls-cert` | path | `/etc/nextgcore/tls/server.crt` (when `--tls`) | TLS certificate file. |

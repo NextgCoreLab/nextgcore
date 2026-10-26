@@ -4102,6 +4102,11 @@ mod tests {
             .as_str()
             .expect("the ConfigMap's nrf.yaml");
         serde_yaml::from_str::<NrfYaml>(text).expect("k8s nrf.yaml");
+        // #1312 (#1317 review): and as the Helm chart renders it (CI installs helm
+        // and sets NEXTGCORE_HELM_REQUIRED, so this is never skipped there).
+        if let Some(text) = nextgcore_core::helm_render::helm_rendered_config(&root, "nrf.yaml") {
+            serde_yaml::from_str::<NrfYaml>(&text).expect("Helm nrf.yaml");
+        }
     }
 
     /// #1313 review: a config that does not parse fails startup; no file is no config.

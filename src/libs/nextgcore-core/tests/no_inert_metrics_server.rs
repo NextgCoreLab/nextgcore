@@ -9,7 +9,10 @@ fn yaml_files(dir: &Path, out: &mut Vec<PathBuf>) {
         let path = entry.unwrap().path();
         if path.is_dir() {
             yaml_files(&path, out);
-        } else if matches!(path.extension().and_then(|e| e.to_str()), Some("yaml" | "yml")) {
+        } else if matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("yaml" | "yml")
+        ) {
             out.push(path);
         }
     }
@@ -39,6 +42,11 @@ fn no_shipped_config_carries_a_metrics_server_block() {
         .iter()
         .filter(|f| has_metrics_server(&std::fs::read_to_string(f).unwrap()))
         .collect();
-    assert!(offenders.is_empty(), "metrics.server is read by no daemon: {offenders:?}");
-    assert!(has_metrics_server("x:\n  metrics:\n    server:\n      - address: a\n"));
+    assert!(
+        offenders.is_empty(),
+        "metrics.server is read by no daemon: {offenders:?}"
+    );
+    assert!(has_metrics_server(
+        "x:\n  metrics:\n    server:\n      - address: a\n"
+    ));
 }

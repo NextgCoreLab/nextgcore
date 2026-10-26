@@ -51,6 +51,13 @@ spec:
               value: {{ .Values.global.sbiProfile | default "dev" | quote }}
             - name: RUST_LOG
               value: {{ .Values.global.logLevel }}
+            - name: NEXTGCORE_SBI_ADVERTISE
+              # #1312: the host registered with the NRF and put in callback
+              # URIs, set apart from the bind so a wildcard bind can never be
+              # advertised. The pod IP, which the init container also binds.
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
       volumes:
         {{- include "nextgcore.configVolumes" . | nindent 8 }}
 ---
