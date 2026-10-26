@@ -1,0 +1,10 @@
+# Privileged: the 6G profile runs the data-plane UPF (a TUN device and NAT to
+# the internet), as nextg-system does with ENABLE_DATAPLANE=true. deploy-eks.sh
+# also (re)applies the label.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nextg-6g
+  labels:
+    app.kubernetes.io/part-of: nextg
+    pod-security.kubernetes.io/enforce: privileged
