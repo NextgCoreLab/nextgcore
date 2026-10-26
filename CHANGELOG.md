@@ -17,6 +17,11 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   10.2.1-1: 0.5 degree bins, counter-clockwise from North (TS 36.214 §5.2.7). It is turned into
   the AoA solver's clockwise bearing, at the bin midpoint. Before, it took the report value as
   the angle, which was both twice too large and the wrong way round (#1269).
+- smfd (PGW-C) picks packet filter precedences under one allocator per PDN connection, and
+  counts the precedences of procedures still in flight. A Bearer Resource Command's added
+  filters are only stored once the SGW-C accepts them. Before, an activation or a Command
+  on another bearer in that window could pick the same precedence, and the UE would delete
+  one of the two filters (TS 24.301 §6.4.2.4 d) 2); #1296 review).
 - An IPv6 SBI address goes in square brackets in the URIs built from it (RFC 3986 §3.2.2):
   pcfd's apiRoot and callback URIs; the apiRoot or self/callback base of amfd, ausfd, lmfd, nefd,
   nrfd, nwdafd, smfd, ucmfd, udmd and udrd; seppd's N32f forward URI; and the SBI client's and
