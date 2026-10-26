@@ -94,11 +94,11 @@ pub struct MmeApp {
     s6a_requests: Option<tokio::sync::mpsc::UnboundedReceiver<fd_path::PendingS6aRequest>>,
 }
 
-/// Where S1-MME binds: `mme.s1ap.server`, or loopback when unset (#1299). Never
-/// the wildcard by default: an unconfigured MME is not reachable from other hosts,
-/// and says so.
+/// Where S1-MME binds: `mme.s1ap.server` (its first IPv4 address, else its first
+/// IPv6 address), or loopback when unset (#1299). Never the wildcard by default: an
+/// unconfigured MME is not reachable from other hosts, and says so.
 fn s1ap_bind_addr(ctx: &context::MmeContext) -> std::net::SocketAddr {
-    match ctx.s1ap_list.first().copied() {
+    match ctx.s1ap_list.first().or(ctx.s1ap_list6.first()).copied() {
         Some(addr) => addr,
         None => {
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], ctx.s1ap_port));
@@ -575,6 +575,23 @@ mod tests {
         assert_eq!(
             super::s1ap_bind_addr(&ctx),
             "127.0.0.1:36412".parse::<std::net::SocketAddr>().unwrap()
+        );
+        ctx.s1ap_list.push("10.0.0.5:36412".parse().unwrap());
+        assert_eq!(
+            super::s1ap_bind_addr(&ctx),
+            "10.0.0.5:36412".parse::<std::net::SocketAddr>().unwrap()
+        );
+    }
+
+    /// An IPv6-only `mme.s1ap.server` binds that address, not IPv4 loopback; with
+    /// both families configured, IPv4 is bound as before.
+    #[test]
+    fn s1_mme_binds_a_configured_ipv6_only_address() {
+        let mut ctx = crate::context::MmeContext::new();
+        ctx.s1ap_list6.push("[fd00::5]:36412".parse().unwrap());
+        assert_eq!(
+            super::s1ap_bind_addr(&ctx),
+            "[fd00::5]:36412".parse::<std::net::SocketAddr>().unwrap()
         );
         ctx.s1ap_list.push("10.0.0.5:36412".parse().unwrap());
         assert_eq!(
