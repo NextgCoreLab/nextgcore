@@ -13,6 +13,31 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 ## [Unreleased]
 
 ### Changed
+- smfd keeps each SM context's UPF N3 uplink F-TEID in the durable snapshot (`upfUlEndpoints`),
+  so a restored PDU session can still have its user plane activated, be paged for downlink data,
+  or be handed over (#1230). Before, a restart lost it, and those all failed: activation was
+  answered 500, and the paging transfer had no UL NG-U tunnel (TS 38.413 §9.3.4.1). A Downlink
+  Data Report for a restored session now pages the UE.
+  **Upgrade:** smfd 0.1.0 had no durable state. The snapshots affected are 0.2.0-dev ones
+  written before #1230, which have no endpoints. No session is released for that. A native
+  5G session's endpoint is recovered from the UPF the first time it is needed: PDR 1 is
+  removed and created again with the UPF choosing the F-TEID, once per session even when
+  requests race. That happens at the UP activation, the paging, a handover preparation or
+  a Modify Indication. For a session that is still connected and handed over before going
+  idle, uplink is lost from that point until the UE has moved. An EPS→5GS-migrated session
+  from such a snapshot is released at boot with #39 "reactivation requested", and its UE
+  re-establishes it (TS 24.501 §6.3.3).
+  **Rollback:** the snapshot version stays 2, and `upfUlEndpoints` is an extra field that a
+  pre-#1230 build ignores. That build reads the file and drops the field at its next write,
+  and the next upgrade recovers the endpoints as above.
+- smfd sends a restored session's boot "RELEASED" notifications (#193) after boot,
+  16 at a time, and writes the snapshot once for all of them. Before, it wrote it once per
+  session and waited for each AMF in turn, all before the SMF served anything.
+- smfd's PDU SESSION ESTABLISHMENT REJECT leaves out the Back-off timer value IE for #26 and #69
+  when the request is for emergency services (SmContextCreateData `requestType`
+  INITIAL_EMERGENCY_REQUEST or EXISTING_EMERGENCY_PDU_SESSION). It also leaves it out for #26,
+  #27 and #69 when the AMF reports the UE as a priority user (`priorityUserInd`), so the UE can
+  retry at once (TS 24.501 §6.4.1.4.1). amfd does not send either attribute yet (#1188).
 - smfd's EBI assignment request (`Namf_Communication_EBIAssignment`) now gives the default flow's
   ARP as NOT_PREEMPT / NOT_PREEMPTABLE, the same ARP the N2 default QoS flow carries. Before, it
   said PREEMPTABLE, so the AMF could revoke the EBI for a higher-priority request that the RAN
@@ -81,7 +106,10 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   as the panicking writer left them, and the poison is logged. Before, a poisoned map was written
   as empty over the last good snapshot, and the next restart restored nothing (#1178). The
   poison is then cleared, so the map's writers (which skip a poisoned lock) and the IPv4 pool's
-  allocation resume, and it is logged once per poisoning rather than at every write.
+  allocation resume, and it is logged once per poisoning rather than at every write. That holds
+  with the durable state off too (the default, where no snapshot is taken): every `persist()`
+  heals a poisoned context map, and the IPv4 pool uses its bitmap through a poison and clears
+  it at every allocation and release (#1178).
 - smfd answers its own SM Context Create and Update errors as SmContextCreateError /
   SmContextUpdateError (TS 29.502 Tables 6.1.3.2.3.1-3, 6.1.3.3.4.2.2-2): the ProblemDetails is
   under `error`, at `application/json`. A failed activation adds `upCnxState: DEACTIVATED`, and a

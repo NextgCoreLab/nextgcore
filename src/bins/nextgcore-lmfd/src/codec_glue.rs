@@ -9,7 +9,8 @@
 //! - [`decode_nrppa_ecid_report`] — E-CID Measurement Report (procedure code 4),
 //!   decoded and adapted by [`crate::nrppa_uplink`] on the generated NRPPa codec:
 //!   serving-cell NG-RAN-CGI → `nr_cgi`; measuredResults CHOICE →
-//!   `ecid_rtt_ns` (TADV, TS 36.133 §10.3.1), `aoa`, `rsrp`, `rsrq`.
+//!   `ecid_rtt_ns` (E-UTRA TADV, TS 36.133 §10.3.1; NR-TADV, TS 38.133 §13.5.1),
+//!   `aoa`, `rsrp`, `rsrq`.
 //!
 //! - [`lpp_multi_rtt_provide_to_measurements`] — ProvideLocationInformation →
 //!   nr-Multi-RTT list: `nr-UE-RxTxTimeDiff` k-arm → `ue_rx_tx_ns` (signed
@@ -1070,7 +1071,7 @@ pub fn decode_lpp_ecid_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasurement>
 /// inner edge. RSRP only ranks cells here (the serving-cell choice) and never
 /// enters a range, so an open-ended value is kept rather than dropped (#834
 /// review: the old comment's "127 is −31 and above" disagreed with this formula).
-fn nr_rsrp_dbm(v: u8) -> i16 {
+pub(crate) fn nr_rsrp_dbm(v: u8) -> i16 {
     i16::from(v) - 156
 }
 
