@@ -414,10 +414,12 @@ async fn main() -> Result<()> {
         nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Nef)
             .to_string();
 
-    let notify_base = args
-        .notify_base
-        .clone()
-        .unwrap_or_else(|| format!("http://{}:{}", args.sbi_addr, args.sbi_port));
+    let notify_base = args.notify_base.clone().unwrap_or_else(|| {
+        format!(
+            "http://{}",
+            nextgcore_sbi::uri_encode::uri_authority(&args.sbi_addr, args.sbi_port)
+        )
+    });
     {
         let ctx = nef_self();
         if let Ok(mut context) = ctx.write() {

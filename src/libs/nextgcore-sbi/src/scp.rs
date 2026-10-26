@@ -52,7 +52,10 @@ impl ScpBinding {
 
     /// Get SCP URI
     pub fn uri(&self) -> String {
-        format!("http://{}:{}", self.scp_addr, self.scp_port)
+        format!(
+            "http://{}",
+            crate::uri_encode::uri_authority(&self.scp_addr, self.scp_port)
+        )
     }
 }
 

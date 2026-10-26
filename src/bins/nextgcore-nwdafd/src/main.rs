@@ -287,7 +287,10 @@ async fn main() -> Result<()> {
         } else {
             args.sbi_addr.as_str()
         };
-        let base = format!("{scheme}://{host}:{}", args.sbi_port);
+        let base = format!(
+            "{scheme}://{}",
+            nextgcore_sbi::uri_encode::uri_authority(host, args.sbi_port)
+        );
         let ctx = nwdaf_self();
         let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
         guard.set_sbi_base_uri(&base);
