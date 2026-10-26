@@ -104,6 +104,8 @@ pub(crate) fn in_flight(pgw_peer: SocketAddr, pgw_seq: u32) -> bool {
 /// right after its Create Session Response, which can beat the SGW-U's answer.
 struct Held {
     sess_id: u64,
+    /// The PGW's S5/S8-C TEID, kept for the refusal: the session may be gone.
+    pgw_teid: u32,
     msg: Gtp2Message,
     pgw_peer: SocketAddr,
     command: Option<(SocketAddr, u32, u32)>,
@@ -155,16 +157,58 @@ pub(crate) fn on_session_failed(sess_id: u64) {
     refuse_held(gone);
 }
 
+/// Settle what nothing else will (#1285 review), from the S11 T3 loop: a held
+/// request whose session is gone (a Delete Session or a detach during the
+/// establishment), or older than [`HOLD_MAX`], is refused 64.
+///
+/// A request whose session got its SGW-U SEID is NOT carried out from here:
+/// `on_session_established` does that after the S11 Create Session Response, and
+/// carrying it out earlier would put the Create Bearer Request ahead of that
+/// response at the MME, the ordering #1283 exists for. If the hook never runs,
+/// HOLD_MAX refuses it.
+pub(crate) fn sweep_held() {
+    let ctx = sgwc_self();
+    let gone: Vec<Held> = {
+        let mut list = held();
+        if list.is_empty() {
+            return;
+        }
+        let (gone, kept): (Vec<_>, Vec<_>) = list
+            .drain(..)
+            .partition(|h| h.at.elapsed() >= HOLD_MAX || ctx.sess_find_by_id(h.sess_id).is_none());
+        *list = kept;
+        gone
+    };
+    refuse_held(gone);
+}
+
+/// Make every held request `by` older. Test-only.
+#[cfg(test)]
+pub(crate) fn age_held_for_test(by: std::time::Duration) {
+    for h in held().iter_mut() {
+        h.at -= by;
+    }
+}
+
+/// The number of held requests (tests).
+#[cfg(test)]
+pub(crate) fn held_count() -> usize {
+    held().len()
+}
+
 fn refuse_held(gone: Vec<Held>) {
     let Some(server) = server() else {
         return;
     };
-    let ctx = sgwc_self();
     for h in gone {
-        let pgw_teid = ctx
-            .sess_find_by_id(h.sess_id)
-            .map(|s| s.pgw_s5c_teid)
-            .unwrap_or(0);
+        log::warn!(
+            "Create Bearer Request from PGW {} (seq {}): session {} was never established; \
+             refused 64",
+            h.pgw_peer,
+            h.msg.header.sequence_number,
+            h.sess_id
+        );
+        let pgw_teid = h.pgw_teid;
         let cause = gtp_cause::CONTEXT_NOT_FOUND;
         answer_pgw(
             &server,
@@ -424,6 +468,7 @@ pub(crate) fn on_pgw_request(
             *list = kept;
             list.push(Held {
                 sess_id: sess.id,
+                pgw_teid: sess.pgw_s5c_teid,
                 msg: msg.clone(),
                 pgw_peer,
                 command,
