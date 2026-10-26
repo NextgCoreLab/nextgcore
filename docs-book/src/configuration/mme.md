@@ -146,12 +146,10 @@ mme:
   - "Tracking area not valid" when every TAI is unknown;
   - otherwise the failure cause.
 - An undecodable PDU, a request without its identifiers, or a message only the MME sends gets an ERROR INDICATION.
+- **PWS restoration** (TS 23.007 §15A.1.2): an eNB's PWS RESTART INDICATION and PWS FAILURE INDICATION (TS 36.413 §8.12.3 / §8.12.4) are validated against the sender's Global eNB ID and relayed to every CBC association as SBc-AP PWS-Restart-Indication / PWS-Failure-Indication (TS 29.168 §4.3.3E / §4.3.3F). They carry the Global eNB ID, the cells, the TAIs and the emergency areas as the eNB sent them. The CBC's reload names the Global eNB ID, so it goes only to that eNB. The MME does not replay its own copy of the warnings. Relayed and unrelayed indications (no SBc-AP configured, no association) are counted in `mme_sbcap_indications_total{result="sent"|"unsent"}`.
 
 **Security.** SBc-AP has no application-layer authentication. Run it on a private network, or under TS 33.210 network domain security (NDS/IP, IPsec), as for S1-MME. The `cbc` allowlist keeps unconfigured peers off; it is not authentication. The Helm chart, the k8s manifests and the compose files publish no port for it (no `ports:` or NodePort for 29168).
 
 ## Not supported
 
-- **SBc-AP toward the CBC is partial (#1071).** Write-Replace Warning and Stop Warning are served (see [SBc-AP](#sbc-ap-cbc-interface)). Still missing:
-  - An eNB's **PWS RESTART INDICATION** (TS 36.413 §8.12.3) and **PWS FAILURE INDICATION** (§8.12.4) are decoded, validated against the sender's Global eNB ID, counted (`mme_s1ap_pws_restart_indications_total`, `mme_s1ap_pws_failure_indications_total`) and logged, but not yet relayed to the CBC (TS 29.168 §4.3.3E / §4.3.3F, TS 23.007 §15A.1.2).
-  - Write-Replace Warning Indication and Stop Warning Indication (TS 29.168 §4.3.3C / §4.3.3D) are not sent; the CBC's "send indication" flags are accepted and not acted on.
-  - The Extended Repetition Period is clamped to the S1AP Repetition Period range (4095 s).
+- **SBc-AP: the Warning Indications (#1071).** Write-Replace Warning Indication and Stop Warning Indication (TS 29.168 §4.3.3C / §4.3.3D, "if supported by the MME") are not sent; the CBC's "send indication" flags are accepted and not acted on. The Extended Repetition Period is clamped to the S1AP Repetition Period range (4095 s).
