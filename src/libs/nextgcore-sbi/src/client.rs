@@ -1624,12 +1624,11 @@ mod tests {
         let ctx = global_context();
         let ttl = Duration::from_secs(3600);
 
-        // A dead endpoint: reserve a port, then release it so nothing listens.
-        let dead_port = std::net::TcpListener::bind("127.0.0.1:0")
-            .expect("bind")
-            .local_addr()
-            .expect("addr")
-            .port();
+        // A dead endpoint: a port held bound but not listening, so it refuses for the
+        // whole test (#1316). Reserving and releasing it let the live server below (or
+        // a sibling test) be handed the same port by `bind(:0)`.
+        let dead = crate::test_support::down_port();
+        let dead_port = dead.port();
         // A live peer that answers 503: an error STATUS, not a transport failure.
         let (server, live) =
             crate::test_support::sbi_server_on_free_port(|_req: SbiRequest| async {
@@ -1697,13 +1696,11 @@ mod tests {
         inst
     }
 
-    /// A port nothing listens on: reserved, then released.
-    fn dead_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .expect("bind")
-            .local_addr()
-            .expect("addr")
-            .port()
+    /// A port nothing listens on, held for as long as the caller keeps the value
+    /// (#1316). It used to be reserved and released, so a `bind(:0)` elsewhere could be
+    /// handed it and the "dead" peer answered.
+    fn dead_port() -> crate::test_support::DownPort {
+        crate::test_support::down_port()
     }
 
     /// #664: the peer restarted at a NEW address. The consumer still holds the
@@ -1723,7 +1720,8 @@ mod tests {
         let ctx = global_context();
         let ttl = Duration::from_secs(3600);
 
-        let old_port = dead_port();
+        let old = dead_port();
+        let old_port = old.port();
         let hits = Arc::new(AtomicUsize::new(0));
         let new_peer = serve_fixed(201, vec![], "{}", hits.clone()).await;
         let (old_id, new_id) = ("smf-0664-old", "smf-0664-new");

@@ -2643,8 +2643,10 @@ mod tests {
     /// peer, so a reservation would defeat them: `bound_listener` keeps the port
     /// bound, which makes it reachable. The stub servers in this module take a
     /// reservation instead (#313); these two deliberately do not.
-    fn free_port() -> u16 {
-        nextgcore_sbi::test_support::free_port()
+    fn closed_port() -> u16 {
+        // #1316: a port that REFUSES. `test_support::free_port` is free after its probe,
+        // so a sibling test's `bind(:0)` could be handed it and the absent peer answered.
+        nextgcore_sbi::test_support::refused_port()
     }
 
     #[tokio::test]
@@ -2972,7 +2974,7 @@ mod tests {
         // Nothing listens on this port — bounded-timeout transport error
         let pcf = PcfEndpoint {
             host: "127.0.0.1".into(),
-            port: free_port(),
+            port: closed_port(),
         };
         let ctx = SmPolicyCreateContext {
             supi: "imsi-001010000000001",
@@ -3081,7 +3083,7 @@ mod tests {
         // Nothing listening -> Unavailable (fail-open at the call site)
         let nsacf = NsacfEndpoint {
             host: "127.0.0.1".into(),
-            port: free_port(),
+            port: closed_port(),
         };
         let res = tokio::time::timeout(
             Duration::from_secs(8),

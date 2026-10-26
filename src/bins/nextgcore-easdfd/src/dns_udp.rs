@@ -684,13 +684,10 @@ mod tests {
         let _g = lock_globals();
         install_context(DnsMissBehavior::Forward("127.0.0.1".to_string()));
 
-        // A bound-then-dropped socket's port: nothing is listening there.
-        let dead = {
-            let s = UdpSocket::bind::<SocketAddr>(([127, 0, 0, 1], 0).into())
-                .await
-                .expect("socket");
-            s.local_addr().expect("addr")
-        };
+        // UDP port 1 on loopback: privileged, so no test's `bind(:0)` can be handed it
+        // and answer (#1316). A bound-then-dropped port could be, for example by
+        // another test's fake upstream.
+        let dead: SocketAddr = ([127, 0, 0, 1], 1).into();
 
         let answer = handle_datagram(
             &query(0xdddd, "www.elsewhere.example.net", qtype::A),
