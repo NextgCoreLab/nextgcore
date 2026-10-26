@@ -194,11 +194,13 @@ fn tadv_ns(v: u16) -> Option<(f64, f64)> {
 }
 
 /// One NR cell of a Result SS-RSRP / SS-RSRQ / CSI-RSRP / CSI-RSRQ list (TS 38.455
-/// §9.2.5): its PCI, NR-ARFCN and cell-level report value (0..127), when given.
+/// §9.2.5): its PCI, NR-ARFCN, NR CGI when given (spelled as the serving cell's
+/// `nr_cgi`), and cell-level report value (0..127), when given.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NrCellResult {
     pub pci: u16,
     pub arfcn: u32,
+    pub cgi: Option<String>,
     pub value: Option<u8>,
 }
 
@@ -206,11 +208,18 @@ pub struct NrCellResult {
 /// 38.455 §9.2.5, Rel-16/17 `MeasuredResultsValue` choice-Extension), held as the
 /// report values they are on the wire (#859).
 ///
-/// They are not physical quantities. Each one's meaning is a report mapping in TS
-/// 38.133 (Value Timing Advance NR, RSRP/RSRQ, AoA) or TS 38.215 (UE Rx-Tx Time
-/// Difference), and neither spec is in this tree's vendored set. So none of them
-/// feeds the solver yet: an NR E-CID fix still needs a timing term, which NR-TADV
-/// would give once its mapping is implemented.
+/// The report mappings that turn them into physical quantities (#859, now that TS
+/// 38.133 and TS 38.215 are vendored):
+/// - Value Timing Advance NR: TS 38.133 §13.5.1, a round trip
+///   ([`crate::positioning::nr_tadv_report_to_ns`]). It is the timing term of an
+///   NR E-CID fix.
+/// - SS/CSI-RSRP: TS 38.133 §10.1.6.1, and SS/CSI-RSRQ: §10.1.11.1. The serving
+///   cell's value ranks the cell as the other adapters do.
+/// - AoA NR: TS 38.133 §13.4.1, read when it is given in the GCS.
+/// - UE Rx-Tx Time Difference: TS 38.133 §10.1.25.3.1, k = 5
+///   ([`Self::ue_rx_tx_ns`]). It is the UE half of an RTT only (TS 38.215
+///   §5.1.30): an E-CID report carries no gNB Rx–Tx to pair it with, so it does
+///   not range anything.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NrEcidReport {
     /// Value Timing Advance NR, `NR-TADV ::= INTEGER (0..7690)` (id 94).
@@ -227,11 +236,78 @@ pub struct NrEcidReport {
     pub csi_rsrq: Vec<NrCellResult>,
     /// Angle of Arrival NR (id 36, UL AoA §9.2.38): azimuth 0..3599, zenith 0..1799.
     pub aoa_nr: Option<(u16, Option<u16>)>,
+    /// `aoa_nr` came with an LCS to GCS Translation, so its angles are in the
+    /// antenna's local coordinate system (TS 38.455 §9.2.38), not bearings.
+    pub aoa_nr_lcs: bool,
+}
+
+/// TS 38.133 Table 10.1.6.1-1: RSRP_127 is "Infinity", a threshold value, not a
+/// measurement report.
+const NR_RSRP_NOT_A_REPORT: u8 = 127;
+
+/// The serving cell's report value in an NR Result list (TS 38.455 §9.2.5): the
+/// item whose NR CGI is `serving`; else, among the items that name no cell, the
+/// strongest, since the list does not otherwise mark the serving cell. An item
+/// that names another cell is a neighbour and never stands in for it. Values
+/// above `max` are not measurements.
+fn serving_value(list: &[NrCellResult], serving: &str, max: u8) -> Option<u8> {
+    let valid = |r: &&NrCellResult| r.value.is_some_and(|v| v <= max);
+    list.iter()
+        .filter(valid)
+        .find(|r| r.cgi.as_deref() == Some(serving))
+        .or_else(|| {
+            list.iter()
+                .filter(valid)
+                .filter(|r| r.cgi.is_none())
+                .max_by_key(|r| r.value)
+        })
+        .and_then(|r| r.value)
 }
 
 impl NrEcidReport {
     fn is_empty(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// The NR-TADV round trip, (midpoint, width) in ns (TS 38.133 §13.5.1).
+    pub fn rtt_ns(&self) -> Option<(f64, f64)> {
+        self.nr_tadv
+            .and_then(crate::positioning::nr_tadv_report_to_ns)
+    }
+
+    /// The UE Rx–Tx Time Difference in signed ns, the bin midpoint (TS 38.133
+    /// §10.1.25.3.1, k = 5). `None` when not reported or open-ended.
+    pub fn ue_rx_tx_ns(&self) -> Option<f64> {
+        self.ue_rx_tx_time_diff
+            .and_then(crate::positioning::nr_ue_rx_tx_k5_report_to_ns)
+            .map(|(mid, _)| mid)
+    }
+
+    /// The serving cell's SS-RSRP, else its CSI-RSRP, in dBm as the LPP NR adapter
+    /// spells it (TS 38.133 §10.1.6.1, [`crate::codec_glue::nr_rsrp_dbm`]).
+    fn serving_rsrp_dbm(&self, serving: &str) -> Option<i16> {
+        serving_value(&self.ss_rsrp, serving, NR_RSRP_NOT_A_REPORT - 1)
+            .or_else(|| serving_value(&self.csi_rsrp, serving, NR_RSRP_NOT_A_REPORT - 1))
+            .map(crate::codec_glue::nr_rsrp_dbm)
+    }
+
+    /// The serving cell's SS-RSRQ, else its CSI-RSRQ, as the raw index 0..127 of
+    /// TS 38.133 §10.1.11.1 (the LPP NR adapter's spelling).
+    fn serving_rsrq(&self, serving: &str) -> Option<i16> {
+        serving_value(&self.ss_rsrq, serving, u8::MAX)
+            .or_else(|| serving_value(&self.csi_rsrq, serving, u8::MAX))
+            .map(i16::from)
+    }
+
+    /// The AoA NR azimuth as a clockwise bearing from North (TS 38.133 §13.4.1,
+    /// TS 38.215 §5.2.4). `None` when it is in an LCS: turning that into a bearing
+    /// needs the antenna orientation of TS 38.901 §7.1, which is not applied.
+    fn bearing_deg(&self) -> Option<f64> {
+        if self.aoa_nr_lcs {
+            return None;
+        }
+        self.aoa_nr
+            .and_then(|(azimuth, _)| crate::positioning::nr_azimuth_aoa_to_bearing_deg(azimuth))
     }
 
     /// Take one Measured Results extension. As for the E-UTRA arms, the first value
@@ -251,6 +327,10 @@ impl NrEcidReport {
                         .map(|i| NrCellResult {
                             pci: i.nr_pci.0,
                             arfcn: i.nr_arfcn.0,
+                            cgi: i
+                                .cgi_nr
+                                .as_ref()
+                                .map(crate::nrppa_positioning::cgi_nr_to_string),
                             value: i.value_ss_rsrp_cell.as_ref().map(|v| v.0),
                         })
                         .collect();
@@ -261,6 +341,10 @@ impl NrEcidReport {
                         .map(|i| NrCellResult {
                             pci: i.nr_pci.0,
                             arfcn: i.nr_arfcn.0,
+                            cgi: i
+                                .cgi_nr
+                                .as_ref()
+                                .map(crate::nrppa_positioning::cgi_nr_to_string),
                             value: i.value_ss_rsrq_cell.as_ref().map(|v| v.0),
                         })
                         .collect();
@@ -271,6 +355,10 @@ impl NrEcidReport {
                         .map(|i| NrCellResult {
                             pci: i.nr_pci.0,
                             arfcn: i.nr_arfcn.0,
+                            cgi: i
+                                .cgi_nr
+                                .as_ref()
+                                .map(crate::nrppa_positioning::cgi_nr_to_string),
                             value: i.value_csi_rsrp_cell.as_ref().map(|v| v.0),
                         })
                         .collect();
@@ -281,13 +369,17 @@ impl NrEcidReport {
                         .map(|i| NrCellResult {
                             pci: i.nr_pci.0,
                             arfcn: i.nr_arfcn.0,
+                            cgi: i
+                                .cgi_nr
+                                .as_ref()
+                                .map(crate::nrppa_positioning::cgi_nr_to_string),
                             value: i.value_csi_rsrq_cell.as_ref().map(|v| v.0),
                         })
                         .collect();
             }
-            X::Id_AngleOfArrivalNR(a) => {
-                self.aoa_nr
-                    .get_or_insert((a.azimuth_ao_a.0, a.zenith_ao_a.as_ref().map(|z| z.0)));
+            X::Id_AngleOfArrivalNR(a) if self.aoa_nr.is_none() => {
+                self.aoa_nr = Some((a.azimuth_ao_a.0, a.zenith_ao_a.as_ref().map(|z| z.0)));
+                self.aoa_nr_lcs = a.lcs_to_gcs_translation.is_some();
             }
             // Repeated lists after the first, and the per-TRP AoA (id 167), which
             // names TRPs rather than the serving cell.
@@ -332,9 +424,8 @@ fn to_cell(result: &nrppa::E_CID_MeasurementResult) -> CellMeasurement {
                         rsrq.get_or_insert(i16::from(best));
                     }
                 }
-                // #859: the NR quantities, kept as report values (see
-                // `NrEcidReport`). The pre-#515 decoder refused the whole report
-                // on them.
+                // #859: the NR quantities (see `NrEcidReport`). The pre-#515
+                // decoder refused the whole report on them.
                 M::Choice_Extension(ext) => nr.note(&ext.value),
             }
         }
@@ -342,15 +433,42 @@ fn to_cell(result: &nrppa::E_CID_MeasurementResult) -> CellMeasurement {
     // #865 review: Type 1 (eNB Rx–Tx + UE Rx–Tx, both measured) is the more
     // accurate (TS 36.305 §8.3), so it is used whenever it is present, whatever
     // the order of the IEs.
-    let tadv = tadv1.or(tadv2);
+    let eutra_tadv = tadv1.or(tadv2);
+    let nr_cgi = cgi_to_string(&result.serving_cell_id);
+    let eutra = matches!(
+        result.serving_cell_id.ng_ra_ncell,
+        nrppa::NG_RANCell::EUTRA_CellID(_)
+    );
+    // #859: a quantity of the serving cell's own RAT comes first, and the other
+    // RAT's stands in only when it is absent. A gNB on NR gives its timing term as
+    // NR-TADV (TS 38.455 §9.2.5, mapping TS 38.133 §13.5.1), an ng-eNB as TADV
+    // Type 1/2.
+    let (tadv, rsrp, rsrq, aoa) = if eutra {
+        (
+            eutra_tadv.or_else(|| nr.rtt_ns()),
+            rsrp.or_else(|| nr.serving_rsrp_dbm(&nr_cgi)),
+            rsrq.or_else(|| nr.serving_rsrq(&nr_cgi)),
+            aoa.or_else(|| nr.bearing_deg()),
+        )
+    } else {
+        (
+            nr.rtt_ns().or(eutra_tadv),
+            nr.serving_rsrp_dbm(&nr_cgi).or(rsrp),
+            nr.serving_rsrq(&nr_cgi).or(rsrq),
+            nr.bearing_deg().or(aoa),
+        )
+    };
     CellMeasurement {
-        nr_cgi: cgi_to_string(&result.serving_cell_id),
+        nr_cgi,
         rsrp,
         rsrq,
         timing_advance: None,
         aoa,
         rtt_ns: None,
         rstd_ns: None,
+        // The NR UE Rx–Tx stays in `nr_ecid`: with no gNB Rx–Tx in an E-CID
+        // report it is not a Multi-RTT half this LMF could pair (TS 38.215
+        // §5.1.30, #713).
         ue_rx_tx_ns: None,
         rstd_reference: None,
         ecid_rtt_ns: tadv.map(|(mid, _)| mid),
@@ -358,10 +476,7 @@ fn to_cell(result: &nrppa::E_CID_MeasurementResult) -> CellMeasurement {
         gnb_rx_tx_ns: None,
         meas_time: None,
         dl_prs_id: None,
-        eutra: matches!(
-            result.serving_cell_id.ng_ra_ncell,
-            nrppa::NG_RANCell::EUTRA_CellID(_)
-        ),
+        eutra,
         nr_ecid: (!nr.is_empty()).then_some(nr),
     }
 }
@@ -562,16 +677,30 @@ pub mod test_support {
 
     /// Result SS-RSRP with one item per `(pci, arfcn, cell value)`.
     pub fn ss_rsrp(items: &[(u16, u32, Option<u8>)]) -> nrppa::MeasuredResultsValue {
+        let items: Vec<_> = items.iter().map(|(p, a, v)| (*p, *a, None, *v)).collect();
+        ss_rsrp_named(&items)
+    }
+
+    /// Result SS-RSRP with one item per `(pci, arfcn, NR cell identity in PLMN
+    /// 02 f8 39, cell value)`.
+    pub fn ss_rsrp_named(
+        items: &[(u16, u32, Option<u64>, Option<u8>)],
+    ) -> nrppa::MeasuredResultsValue {
         nr_ext(
             32,
             nrppa::MeasuredResultsValue_choice_ExtensionValue::Id_ResultSS_RSRP(
                 nrppa::ResultSS_RSRP(
                     items
                         .iter()
-                        .map(|(pci, arfcn, v)| nrppa::ResultSS_RSRP_Item {
+                        .map(|(pci, arfcn, cell, v)| nrppa::ResultSS_RSRP_Item {
                             nr_pci: nrppa::NR_PCI(*pci),
                             nr_arfcn: nrppa::NR_ARFCN(*arfcn),
-                            cgi_nr: None,
+                            cgi_nr: cell.map(|c| {
+                                crate::nrppa_positioning::test_support::cgi_nr(
+                                    [0x02, 0xf8, 0x39],
+                                    c,
+                                )
+                            }),
                             value_ss_rsrp_cell: v.map(nrppa::ValueRSRP_NR),
                             ss_rsrp_per_ssb: None,
                             ie_extensions: None,
@@ -646,12 +775,34 @@ pub mod test_support {
     }
 
     pub fn aoa_nr(azimuth: u16, zenith: Option<u16>) -> nrppa::MeasuredResultsValue {
+        aoa_nr_in(azimuth, zenith, None)
+    }
+
+    /// AoA NR given in an LCS: with an LCS to GCS Translation (TS 38.455 §9.2.38).
+    pub fn aoa_nr_lcs(azimuth: u16) -> nrppa::MeasuredResultsValue {
+        aoa_nr_in(
+            azimuth,
+            None,
+            Some(nrppa::LCS_to_GCS_Translation {
+                alpha: nrppa::LCS_to_GCS_TranslationAlpha(900),
+                beta: nrppa::LCS_to_GCS_TranslationBeta(0),
+                gamma: nrppa::LCS_to_GCS_TranslationGamma(0),
+                ie_extensions: None,
+            }),
+        )
+    }
+
+    fn aoa_nr_in(
+        azimuth: u16,
+        zenith: Option<u16>,
+        lcs: Option<nrppa::LCS_to_GCS_Translation>,
+    ) -> nrppa::MeasuredResultsValue {
         nr_ext(
             36,
             nrppa::MeasuredResultsValue_choice_ExtensionValue::Id_AngleOfArrivalNR(nrppa::UL_AoA {
                 azimuth_ao_a: nrppa::UL_AoAAzimuthAoA(azimuth),
                 zenith_ao_a: zenith.map(nrppa::UL_AoAZenithAoA),
-                lcs_to_gcs_translation: None,
+                lcs_to_gcs_translation: lcs,
                 ie_extensions: None,
             }),
         )
