@@ -33,7 +33,7 @@
 //! filter becomes a Delete Bearer Request (§7.2.9.2). Both are the Command's
 //! Triggered message, carrying the UE's PTI. The MME's Delete Bearer Command
 //! ([`deactivate_on_command`]) shares the deletion. These requests run on the
-//! paging-dependent bearer-procedure N3 of `nextgcore_gtp::v2::xact` (#1228).
+//! paging-dependent bearer-procedure T3 of `nextgcore_gtp::v2::xact` (#1228).
 //!
 //! **Rule ids.** The EBI is unknown until step 4, so the ids come from the bearer's
 //! `eps_rule_index` k (1..=15): UL PDR and QER `0x60 + k`, DL PDR and FAR `0x80 + k`.

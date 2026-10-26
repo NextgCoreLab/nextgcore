@@ -1261,15 +1261,15 @@ impl S5S8Server {
         self.xact.lock().await.outstanding()
     }
 
-    /// Give the bearer procedure Requests `n3` retransmissions, for a test that
-    /// watches one run out (#619).
+    /// Give the bearer procedure Requests a T3 of `t3`, for a test that watches one
+    /// run out (#619).
     #[cfg(test)]
-    pub(crate) async fn set_bearer_n3_for_test(&self, n3: u32) {
+    pub(crate) async fn set_bearer_t3_for_test(&self, t3: std::time::Duration) {
         use nextgcore_gtp::v2::xact::BEARER_PROCEDURE_REQUESTS;
         self.xact
             .lock()
             .await
-            .set_n3_for(&BEARER_PROCEDURE_REQUESTS, n3);
+            .set_t3_for(&BEARER_PROCEDURE_REQUESTS, t3);
     }
 
     /// Forget every outstanding request. Test-only: the process-wide server

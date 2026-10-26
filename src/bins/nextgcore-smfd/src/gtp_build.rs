@@ -1275,11 +1275,10 @@ pub fn build_update_bearer_request(
     let mut builder =
         Gtp2MessageBuilder::new(gtp2_message_type::UPDATE_BEARER_REQUEST).teid(sess.sgw_s5c_teid);
 
-    // AMBR
-    if sess.session_ambr.uplink > 0 || sess.session_ambr.downlink > 0 {
-        let ambr = Ambr::from_bps(sess.session_ambr.uplink, sess.session_ambr.downlink);
-        builder = builder.add_ambr(&ambr);
-    }
+    // APN-AMBR: M in TS 29.274 Table 7.2.15-1 (#619). It was sent only when non-zero,
+    // and an MME answers a request without it with cause 70 and Offending IE 72.
+    let ambr = Ambr::from_bps(sess.session_ambr.uplink, sess.session_ambr.downlink);
+    builder = builder.add_ambr(&ambr);
 
     // PTI
     if let Some(pti_val) = pti {
@@ -1679,6 +1678,67 @@ mod tests {
     /// the Update Bearer Request. Two of the three sent the bit/s values unconverted. A
     /// rate that is not a whole kbit/s rounds up, so a non-zero rate never becomes 0, and
     /// one past the 5-octet field is capped.
+    /// #619, TS 29.274 Table 7.2.15-1: the Update Bearer Request always carries the
+    /// APN-AMBR (M), in kbit/s, also for a session whose AMBR is zero. The Bearer
+    /// Context is at instance 0 with the EBI. The TFT and the Bearer QoS are there
+    /// only when given, and the PTI only when a Command carried one.
+    #[test]
+    fn the_update_bearer_request_always_carries_the_apn_ambr() {
+        let (mut sess, bearer) = golden_session(gtp2_rat_type::EUTRAN);
+        let ambr_of = |msg: Vec<u8>| {
+            let mut bytes = bytes::Bytes::from(msg);
+            let m = nextgcore_gtp::v2::Gtp2Message::decode(&mut bytes).expect("decode");
+            let ambr = m
+                .get_ie(nextgcore_gtp::v2::Gtp2IeType::Ambr as u8, 0)
+                .map(|ie| ie.value.to_vec());
+            let pti = m
+                .get_ie(nextgcore_gtp::v2::Gtp2IeType::Pti as u8, 0)
+                .is_some();
+            let bc = m
+                .bearer_context(0)
+                .unwrap()
+                .expect("Bearer Context at instance 0");
+            let has = |t: nextgcore_gtp::v2::Gtp2IeType| bc.get_ie(t as u8, 0).is_some();
+            (
+                ambr,
+                pti,
+                bc.ebi().unwrap(),
+                has(nextgcore_gtp::v2::Gtp2IeType::BearerTft),
+                has(nextgcore_gtp::v2::Gtp2IeType::BearerQos),
+            )
+        };
+        sess.session_ambr.uplink = 0;
+        sess.session_ambr.downlink = 0;
+        let ebi = bearer.ebi;
+        assert_eq!(
+            ambr_of(build_update_bearer_request(
+                &sess, &bearer, None, None, false
+            )),
+            (Some(vec![0; 8]), false, ebi, false, false),
+            "a zero APN-AMBR is still sent"
+        );
+        sess.session_ambr.uplink = 1_000_000;
+        sess.session_ambr.downlink = 2_000_000;
+        let tft = [0x21, 0x31, 0x10, 0x02, 0x30, 0x11];
+        assert_eq!(
+            ambr_of(build_update_bearer_request(
+                &sess,
+                &bearer,
+                Some(7),
+                Some(&tft),
+                true
+            )),
+            (
+                Some(vec![0, 0, 0x03, 0xe8, 0, 0, 0x07, 0xd0]),
+                true,
+                ebi,
+                true,
+                true
+            ),
+            "kbit/s, with the PTI, TFT and Bearer QoS given"
+        );
+    }
+
     #[test]
     fn every_bearer_qos_sent_is_in_kbps() {
         let (sess, mut bearer) = golden_session(gtp2_rat_type::EUTRAN);

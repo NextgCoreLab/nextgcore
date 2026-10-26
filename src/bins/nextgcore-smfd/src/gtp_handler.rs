@@ -5233,8 +5233,10 @@ mod tests {
         let b = stored_bearer(sess.id, 6).await.unwrap();
         assert_eq!((b.qos.gbr_uplink, b.qos.mbr_uplink), (64_000, 128_000));
 
-        // Unanswered: the request's T3 x (N3 + 1) runs out, shortened to one T3 here.
-        server.set_bearer_n3_for_test(0).await;
+        // Unanswered: the request's T3 x (N3 + 1) runs out, with T3 shortened here.
+        server
+            .set_bearer_t3_for_test(std::time::Duration::from_millis(300))
+            .await;
         sgw.send_to(&brc(0x8073), server.local_addr())
             .await
             .expect("send");
