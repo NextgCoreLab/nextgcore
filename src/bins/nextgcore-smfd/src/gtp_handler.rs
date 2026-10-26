@@ -2552,7 +2552,7 @@ fn new_bearer_request(
 /// request exhausts a /16 silently, and the UE never received it.
 async fn release_and_reject(
     server: &crate::gtp_path::S5S8Server,
-    context: &std::sync::Arc<std::sync::RwLock<crate::context::SmfContext>>,
+    context: &std::sync::Arc<crate::context::HealingRwLock<crate::context::SmfContext>>,
     ue_ipv4: std::net::Ipv4Addr,
     peer: std::net::SocketAddr,
     sequence_number: u32,
