@@ -774,9 +774,20 @@ fn negotiate_features(consumer_hex: Option<&str>, supported: u64) -> String {
 /// outside it is not an `RfspIndex` and forwarding it would push the rejection
 /// onto the AMF.
 async fn provision_am_policy(supi: &str) -> serde_json::Map<String, serde_json::Value> {
+    let am_data = sbi_path::pcf_udr_am_subscription_data(supi).await;
+    am_policy_from(supi, am_data.as_ref())
+}
+
+/// [`provision_am_policy`] from an AM subscription data document already read
+/// (`None`: nothing provisioned), so a re-evaluation that read it itself (#1261)
+/// decides with the same rules.
+fn am_policy_from(
+    supi: &str,
+    am_data: Option<&serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
     let mut policy = serde_json::Map::new();
 
-    if let Some(am_data) = sbi_path::pcf_udr_am_subscription_data(supi).await {
+    if let Some(am_data) = am_data {
         if let Some(ambr) = am_data.get("subscribedUeAmbr") {
             policy.insert("ueAmbr".to_string(), ambr.clone());
         }
@@ -1279,20 +1290,21 @@ pub async fn handle_ue_policy_create(request: &SbiRequest) -> SbiResponse {
 }
 
 /// Extract the source PLMN (mcc, mnc) for the D.6.2 sublist from the
-/// PolicyAssociationRequest (`servingPlmn`, else `guami.plmnId`); default to
-/// the test PLMN 001-01 when neither is present.
-fn ue_policy_source_plmn(data: &serde_json::Value) -> (String, String) {
+/// PolicyAssociationRequest (`servingPlmn`, else `guami.plmnId`). `None` when
+/// neither is present (#1261 review): the PLMN goes into the UE policy section
+/// the UE installs (TS 24.501 D.6.2), so a made-up one is not used.
+fn ue_policy_source_plmn(data: &serde_json::Value) -> Option<(String, String)> {
     for ptr in ["/servingPlmn", "/guami/plmnId"] {
         if let Some(plmn) = data.pointer(ptr) {
             if let (Some(mcc), Some(mnc)) = (
                 plmn.get("mcc").and_then(|v| v.as_str()),
                 plmn.get("mnc").and_then(|v| v.as_str()),
             ) {
-                return (mcc.to_string(), mnc.to_string());
+                return Some((mcc.to_string(), mnc.to_string()));
             }
         }
     }
-    ("001".to_string(), "01".to_string())
+    None
 }
 
 /// Build the URSP MANAGE UE POLICY COMMAND for a new association, record the
@@ -1314,7 +1326,20 @@ fn spawn_ue_policy_redelivery(pol_asso_id: &str, supi: &str, data: &serde_json::
 }
 
 fn spawn_ue_policy_delivery(pol_asso_id: &str, supi: &str, data: &serde_json::Value) {
-    let (mcc, mnc) = ue_policy_source_plmn(data);
+    // An update that omits both members keeps the PLMN the association has.
+    let plmn = ue_policy_source_plmn(data)
+        .or_else(|| ue_policy::ue_policy_find(pol_asso_id).and_then(|a| a.plmn));
+    let Some((mcc, mnc)) = plmn else {
+        log::warn!(
+            "[{pol_asso_id}] UE policy: the request names no serving PLMN (servingPlmn or \
+             guami), so no UE policy section can be built (TS 24.501 D.6.2); not delivering"
+        );
+        ue_policy::ue_policy_update_delivery_state(
+            pol_asso_id,
+            ue_policy::DeliveryState::Failed("no serving PLMN to build the section for".into()),
+        );
+        return;
+    };
     let pti = ue_policy::alloc_pti();
     let upsc: u16 = 1; // first (only) UE policy section of this association
 
@@ -1345,114 +1370,164 @@ fn spawn_ue_policy_delivery(pol_asso_id: &str, supi: &str, data: &serde_json::Va
         // E3: provision the resolved rules into the per-SUPI UE-policy context
         // (the mapping target; E6 reads it to correlate the COMPLETE/REJECT).
         ue_policy::provision_context_ursp(&supi, rules.clone());
-        // Re-record the resolved rules (no-op if identical to the default, or if
-        // the association was deleted meanwhile).
-        ue_policy::ue_policy_set_delivery(
+        // Re-record the resolved rules (no-op if the association was deleted
+        // meanwhile). It starts the delivery generation this task sends for.
+        let Some(generation) = ue_policy::ue_policy_set_delivery(
             &id,
             pti,
             upsc,
             Some((mcc.clone(), mnc.clone())),
             rules.clone(),
-        );
+        ) else {
+            return;
+        };
 
         // #91: only the sections the UE does not already have. `installed` comes from
         // the UE STATE INDICATION in `uePolReq` (or a later uplink one); empty means a
         // full delivery, which is the pre-#91 behaviour and the correct one when the UE
         // reported nothing.
         let installed = ue_policy::installed_upscs_for_plmn(&id, &mcc, &mnc);
-        let built = ue_policy::build_manage_ue_policy_delta(
+        deliver_ue_policy_rules(DeliveryJob {
+            id,
+            supi,
+            generation,
             pti,
             upsc,
-            &mcc,
-            &mnc,
-            &rules,
-            ue_policy::MAX_UE_POLICY_PART_CONTENTS,
-            &installed,
-        );
-        let (pdu, delivered_upscs) = match built {
-            Ok(Some(v)) => v,
-            // Every section is already installed at the UE, so the delta is empty and
-            // there is nothing to send. Marked Delivered rather than left Pending: the
-            // UE HAS the policy, and leaving it Pending would fail the association on
-            // T3501 for a delivery that was correctly not made.
-            Ok(None) => {
-                log::info!(
-                    "[{supi}] UE policy: the UE already has every section {installed:?}; \
-                     nothing to deliver"
-                );
-                ue_policy::ue_policy_update_delivery_state(
-                    &id,
-                    ue_policy::DeliveryState::Delivered,
-                );
-                return;
-            }
-            Err(e) => {
-                log::warn!("[{supi}] UE policy: URSP encode failed ({e}); marking delivery Failed");
-                ue_policy::ue_policy_update_delivery_state(
-                    &id,
-                    ue_policy::DeliveryState::Failed(format!("encode: {e}")),
-                );
-                return;
-            }
-        };
-        ue_policy::ue_policy_set_delivered_upscs(&id, delivered_upscs);
-
-        // Wave-6 E6: SUBSCRIBE to the AMF's uplink UE-policy notifications
-        // BEFORE the transfer (TS 29.525 §4.2.2.2 subscribe→transfer→notify
-        // order) so a MANAGE UE POLICY COMPLETE/REJECT can be delivered back.
-        // A missing PCF self-identity (no callback URI) or an unreachable AMF
-        // is degraded-but-safe: the transfer still runs, but with no result
-        // loop the association will fall to Failed on T3501 (fail-closed).
-        if let Some(callback_uri) = ue_policy_notify_callback_uri(&id) {
-            match sbi_path::pcf_subscribe_ue_policy_notify(&id, &supi, &callback_uri).await {
-                Ok(Some(sub_id)) => {
-                    ue_policy::ue_policy_set_subscription_id(&id, &sub_id);
-                    log::info!("[{supi}] UE policy: N1N2MessageSubscribe (UPDP) ok (sub={sub_id})");
-                }
-                Ok(None) => log::warn!(
-                    "[{supi}] UE policy: no AMF reachable to subscribe UPDP notifications"
-                ),
-                Err(e) => log::warn!("[{supi}] UE policy: N1N2MessageSubscribe failed ({e})"),
-            }
-        } else {
-            log::warn!(
-                "[{supi}] UE policy: no PCF self-identity; skipping UPDP N1N2MessageSubscribe \
-                 (no delivery-result loop for this association)"
-            );
-        }
-
-        match sbi_path::pcf_deliver_ue_policy(&id, &supi, &pdu).await {
-            Ok(()) => {
-                // 200/202 only means the AMF accepted the downlink — the
-                // association stays Pending until the UE returns a MANAGE UE
-                // POLICY COMPLETE (item E6). Do NOT flip to Delivered here.
-                log::info!(
-                    "[{supi}] UE policy: MANAGE UE POLICY COMMAND sent (N1N2 accepted), \
-                     awaiting COMPLETE"
-                );
-                // Wave-6 E6: start T3501. On expiry with the association still
-                // Pending, retransmit the SAME command once (same PTI), then
-                // Failed (TS 24.501 D.2.1.5). A COMPLETE/REJECT (or a delete)
-                // stops the loop.
-                let dur = ue_policy::t3501_duration();
-                let supi_retx = supi.clone();
-                let pdu_retx = pdu.clone();
-                let id_retx = id.clone();
-                ue_policy::run_t3501(&id, dur, move || {
-                    let supi = supi_retx.clone();
-                    let pdu = pdu_retx.clone();
-                    let id = id_retx.clone();
-                    async move {
-                        if let Err(e) = sbi_path::pcf_deliver_ue_policy(&id, &supi, &pdu).await {
-                            log::warn!("[{supi}] UE policy: T3501 retransmission failed ({e})");
-                        }
-                    }
-                })
-                .await;
-            }
-            Err(e) => handle_ue_policy_delivery_failure(&id, &supi, pdu.clone(), e).await,
-        }
+            mcc,
+            mnc,
+            rules,
+            installed,
+        })
+        .await;
     });
+}
+
+/// One UE policy delivery for [`deliver_ue_policy_rules`]: the association, the
+/// delivery generation it belongs to (`ue_policy_set_delivery`), and the command's
+/// parameters.
+struct DeliveryJob {
+    id: String,
+    supi: String,
+    generation: u64,
+    pti: u8,
+    upsc: u16,
+    mcc: String,
+    mnc: String,
+    rules: Vec<ue_policy::UrspRule>,
+    installed: Vec<u16>,
+}
+
+/// Encode `rules` as a MANAGE UE POLICY COMMAND (only the sections not in
+/// `installed`), subscribe to the AMF's UPDP notifications, and transfer it over
+/// Namf N1N2 with T3501 running (TS 29.513 §5.6.1.2 steps 12-15). Shared by the
+/// consumer-driven delivery above and the PCF-initiated one (#1261).
+async fn deliver_ue_policy_rules(job: DeliveryJob) {
+    let DeliveryJob {
+        id,
+        supi,
+        generation,
+        pti,
+        upsc,
+        mcc,
+        mnc,
+        rules,
+        installed,
+    } = job;
+    // #1261 review: a newer delivery (a re-evaluation, an update) may have started
+    // while this one read the UDR. Its command is the one to send.
+    if !ue_policy::ue_policy_delivery_is_current(&id, generation) {
+        log::info!("[{supi}] UE policy: delivery superseded before it was sent; dropped");
+        return;
+    }
+    let built = ue_policy::build_manage_ue_policy_delta(
+        pti,
+        upsc,
+        &mcc,
+        &mnc,
+        &rules,
+        ue_policy::MAX_UE_POLICY_PART_CONTENTS,
+        &installed,
+    );
+    let (pdu, delivered_upscs) = match built {
+        Ok(Some(v)) => v,
+        // Every section is already installed at the UE, so the delta is empty and
+        // there is nothing to send. Marked Delivered rather than left Pending: the
+        // UE HAS the policy, and leaving it Pending would fail the association on
+        // T3501 for a delivery that was correctly not made.
+        Ok(None) => {
+            log::info!(
+                "[{supi}] UE policy: the UE already has every section {installed:?}; \
+                 nothing to deliver"
+            );
+            ue_policy::ue_policy_update_delivery_state(&id, ue_policy::DeliveryState::Delivered);
+            return;
+        }
+        Err(e) => {
+            log::warn!("[{supi}] UE policy: URSP encode failed ({e}); marking delivery Failed");
+            ue_policy::ue_policy_update_delivery_state(
+                &id,
+                ue_policy::DeliveryState::Failed(format!("encode: {e}")),
+            );
+            return;
+        }
+    };
+    ue_policy::ue_policy_set_delivered_upscs(&id, delivered_upscs);
+
+    // Wave-6 E6: SUBSCRIBE to the AMF's uplink UE-policy notifications
+    // BEFORE the transfer (TS 29.525 §4.2.2.2 subscribe→transfer→notify
+    // order) so a MANAGE UE POLICY COMPLETE/REJECT can be delivered back.
+    // A missing PCF self-identity (no callback URI) or an unreachable AMF
+    // is degraded-but-safe: the transfer still runs, but with no result
+    // loop the association will fall to Failed on T3501 (fail-closed).
+    if let Some(callback_uri) = ue_policy_notify_callback_uri(&id) {
+        match sbi_path::pcf_subscribe_ue_policy_notify(&id, &supi, &callback_uri).await {
+            Ok(Some(sub_id)) => {
+                ue_policy::ue_policy_set_subscription_id(&id, &sub_id);
+                log::info!("[{supi}] UE policy: N1N2MessageSubscribe (UPDP) ok (sub={sub_id})");
+            }
+            Ok(None) => {
+                log::warn!("[{supi}] UE policy: no AMF reachable to subscribe UPDP notifications")
+            }
+            Err(e) => log::warn!("[{supi}] UE policy: N1N2MessageSubscribe failed ({e})"),
+        }
+    } else {
+        log::warn!(
+            "[{supi}] UE policy: no PCF self-identity; skipping UPDP N1N2MessageSubscribe \
+             (no delivery-result loop for this association)"
+        );
+    }
+
+    match sbi_path::pcf_deliver_ue_policy(&id, &supi, &pdu).await {
+        Ok(()) => {
+            // 200/202 only means the AMF accepted the downlink — the
+            // association stays Pending until the UE returns a MANAGE UE
+            // POLICY COMPLETE (item E6). Do NOT flip to Delivered here.
+            log::info!(
+                "[{supi}] UE policy: MANAGE UE POLICY COMMAND sent (N1N2 accepted), \
+                 awaiting COMPLETE"
+            );
+            // Wave-6 E6: start T3501. On expiry with the association still
+            // Pending, retransmit the SAME command once (same PTI), then
+            // Failed (TS 24.501 D.2.1.5). A COMPLETE/REJECT (or a delete)
+            // stops the loop.
+            let dur = ue_policy::t3501_duration();
+            let supi_retx = supi.clone();
+            let pdu_retx = pdu.clone();
+            let id_retx = id.clone();
+            ue_policy::run_t3501(&id, generation, dur, move || {
+                let supi = supi_retx.clone();
+                let pdu = pdu_retx.clone();
+                let id = id_retx.clone();
+                async move {
+                    if let Err(e) = sbi_path::pcf_deliver_ue_policy(&id, &supi, &pdu).await {
+                        log::warn!("[{supi}] UE policy: T3501 retransmission failed ({e})");
+                    }
+                }
+            })
+            .await;
+        }
+        Err(e) => handle_ue_policy_delivery_failure(&id, &supi, pdu.clone(), e).await,
+    }
 }
 
 /// Decide what a failed UE-policy delivery means, and act on it (#92).
@@ -2898,6 +2973,13 @@ fn take_terminated_app_session(app_session_id: &str) -> bool {
 /// `SmPolicyUpdateNotify` carrying an unchanged decision is a re-authorisation the SMF
 /// has to process for nothing, and at scale a UDR edit touching one slice would notify
 /// every session of every UE.
+///
+/// **#1261: the UE's AM and UE policy associations are re-evaluated as well**
+/// (TS 29.513 §5.1.2.2 and §5.6.2.2.2, step 1 of each). A changed AM policy is
+/// pushed to the AMF with Npcf_AMPolicyControl_UpdateNotify carrying only the
+/// changed members ([`reevaluate_am_policy`]). A changed UE policy is delivered to
+/// the UE over Namf N1N2 ([`reevaluate_ue_policy`]). Before, nothing in pcfd sent
+/// either: the AMF's own Update is answered in its response (#1257).
 pub async fn handle_policy_data_change_notify(request: &SbiRequest) -> SbiResponse {
     let Some(content) = request.http.content.as_deref() else {
         return send_bad_request("Missing request body", Some("MISSING_BODY"));
@@ -2917,31 +2999,36 @@ pub async fn handle_policy_data_change_notify(request: &SbiRequest) -> SbiRespon
     };
     let report_id = body.get("reportId").and_then(|v| v.as_str()).unwrap_or("");
 
-    // Sessions of this SUPI, resolved before any await: the guard must not be held
-    // across one (the crate's lock rule), and the re-read below is async.
-    let sessions: Vec<crate::context::PcfSess> = {
+    // Associations of this SUPI, resolved before any await: the guard must not be
+    // held across one (the crate's lock rule), and the re-reads below are async.
+    let (sessions, ue_am): (Vec<crate::context::PcfSess>, Option<PcfUeAm>) = {
         let ctx = pcf_self();
         let Ok(guard) = ctx.read() else {
             return SbiResponse::with_status(204);
         };
-        match guard.ue_sm_find_by_supi(ue_id) {
+        let sessions = match guard.ue_sm_find_by_supi(ue_id) {
             Some(ue_sm) => ue_sm
                 .sess_ids
                 .iter()
                 .filter_map(|id| guard.sess_find_by_id(*id))
                 .collect(),
             None => Vec::new(),
-        }
+        };
+        (sessions, guard.ue_am_find_by_supi(ue_id))
     };
-    if sessions.is_empty() {
+    // #1261: the UE's AM and UE policy associations are re-evaluated too. TS 29.513
+    // §5.1.2.2 step 1 and §5.6.2.2.2 step 1 both name "the subscriber policy data of
+    // a UE is changed" as the trigger; before, only the SM sessions were.
+    let ue_policies = ue_policy::ue_policy_find_by_supi(ue_id);
+    if sessions.is_empty() && ue_am.is_none() && ue_policies.is_empty() {
         log::debug!(
-            "Policy-data change for {ue_id} ({report_id}): no live SM policy association, \
-             nothing to re-authorise"
+            "Policy-data change for {ue_id} ({report_id}): no live policy association, \
+             nothing to re-evaluate"
         );
         return SbiResponse::with_status(204);
     }
 
-    // ONE discovery for the whole notification, before the loop: a UE with several PDU
+    // ONE discovery for the whole notification, before the loops: a UE with several PDU
     // sessions would otherwise cost one NRF round trip each. And when no UDR is
     // discoverable there is nothing to re-read the decision FROM, so nothing is touched —
     // sending the old decision as a re-authorisation, or storing the failed read, would
@@ -2951,9 +3038,11 @@ pub async fn handle_policy_data_change_notify(request: &SbiRequest) -> SbiRespon
         Ok(None) => {
             log::warn!(
                 "Policy-data change for {ue_id} ({report_id}): no UDR discoverable, so the \
-                 new decision cannot be read. {} live association(s) keep the policy they \
-                 were authorised with.",
-                sessions.len()
+                 new decision cannot be read. {} live SM association(s), {} AM and {} UE \
+                 policy association(s) keep the policy they were authorised with.",
+                sessions.len(),
+                usize::from(ue_am.is_some()),
+                ue_policies.len()
             );
             return SbiResponse::with_status(204);
         }
@@ -2963,12 +3052,38 @@ pub async fn handle_policy_data_change_notify(request: &SbiRequest) -> SbiRespon
         }
     };
 
+    let reauthorised = reauthorise_sm_sessions(&udr, ue_id, sessions).await;
+    let am_notified = match ue_am {
+        Some(ue_am) => reevaluate_am_policy(&udr, ue_am).await,
+        None => false,
+    };
+    let mut ue_pushed = 0usize;
+    for assoc in ue_policies {
+        if reevaluate_ue_policy(&udr, assoc).await {
+            ue_pushed += 1;
+        }
+    }
+    log::info!(
+        "Policy-data change for {ue_id} ({report_id}): re-authorised {reauthorised} SM policy \
+         association(s); AM policy notified: {am_notified}; UE policy re-delivered to \
+         {ue_pushed} association(s)"
+    );
+    SbiResponse::with_status(204)
+}
+
+/// Re-read each session's SmPolicyDnnData, scoped to its own slice and DNN, and
+/// re-authorise the sessions whose data changed (#299, TS 29.512 §4.2.3.2).
+async fn reauthorise_sm_sessions(
+    udr: &sbi_path::DiscoveredEndpoint,
+    ue_id: &str,
+    sessions: Vec<crate::context::PcfSess>,
+) -> usize {
     let mut reauthorised = 0usize;
     for sess in sessions {
         let dnn = sess.dnn.clone().unwrap_or_else(|| "internet".to_string());
-        // Scoped to THIS session's slice and DNN (see the doc comment).
+        // Scoped to THIS session's slice and DNN (see `handle_policy_data_change_notify`).
         let fresh = match sbi_path::pcf_udr_sm_policy_dnn_data_from(
-            &udr,
+            udr,
             ue_id,
             sess.s_nssai.sst,
             sess.s_nssai.sd,
@@ -3009,11 +3124,209 @@ pub async fn handle_policy_data_change_notify(request: &SbiRequest) -> SbiRespon
             reauthorised += 1;
         }
     }
+    reauthorised
+}
+
+/// How long a PCF-initiated re-evaluation waits for one UDR read: the bound the
+/// live-path reads use, so a stuck UDR cannot hold the notification's answer.
+const UDR_REREAD_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The AM policy members a PCF-initiated PolicyUpdate carries when they change
+/// (TS 29.507 §4.2.3.3.2): the Service Area Restriction and the RFSP index.
+///
+/// `ueAmbr` is not among them: §4.2.3.3.2 includes it only "if the
+/// UE-AMBR_Authorization feature is supported", and this PCF negotiates no AM
+/// feature (`PCF_AM_POLICY_SUPPORTED_FEATURES` is 0).
+const AM_UPDATE_NOTIFY_MEMBERS: [&str; 2] = ["servAreaRes", "rfsp"];
+
+/// The members of a re-evaluated AM policy that a PCF-initiated PolicyUpdate must
+/// carry (#1261): each [`AM_UPDATE_NOTIFY_MEMBERS`] member that was added or whose
+/// value changed, as its complete new value (TS 29.507 §4.2.3.3.1 bullets 3 and 4;
+/// the unchanged ones are not provided, bullet 6), and the names of those that
+/// were removed.
+///
+/// A removal is not encodable. `servAreaRes` and `rfsp` are not nullable in
+/// PolicyUpdate (TS 29.507 Annex A), so the bullet 5 "NULL" does not apply, and
+/// the §4.2.3.3.2 NOTE leaves how a PCF reverts an attribute "out of
+/// specification". So a removal is reported to the caller and not sent.
+fn am_policy_changes(
+    old: Option<&serde_json::Value>,
+    new: &serde_json::Map<String, serde_json::Value>,
+) -> (
+    serde_json::Map<String, serde_json::Value>,
+    Vec<&'static str>,
+) {
+    let mut changes = serde_json::Map::new();
+    let mut removed = Vec::new();
+    for member in AM_UPDATE_NOTIFY_MEMBERS {
+        let was = old.and_then(|o| o.get(member));
+        match (was, new.get(member)) {
+            (was, Some(now)) if was != Some(now) => {
+                changes.insert(member.to_string(), now.clone());
+            }
+            (Some(_), None) => removed.push(member),
+            _ => {}
+        }
+    }
+    (changes, removed)
+}
+
+/// Re-evaluate one AM policy association after the UE's policy data changed, and
+/// push the change to the AMF with Npcf_AMPolicyControl_UpdateNotify (#1261,
+/// TS 29.513 §5.1.2.2 steps 1-3, TS 29.507 §4.2.4.2). Returns whether a
+/// notification was sent.
+///
+/// No notification is sent when the decision did not change (§5.1.2.2 step 3:
+/// only "if the PCF decided to update" the policy), or when the AM subscription
+/// data could not be read: a failed read is not "nothing provisioned", and
+/// deciding from it would revert the UE's restrictions on a transient error.
+async fn reevaluate_am_policy(udr: &sbi_path::DiscoveredEndpoint, ue_am: PcfUeAm) -> bool {
+    let supi = ue_am.supi.clone();
+    let read = tokio::time::timeout(
+        UDR_REREAD_TIMEOUT,
+        sbi_path::pcf_udr_get_am_subscription_data_from(udr, &supi),
+    )
+    .await;
+    let am_data = match read {
+        Ok(Ok(doc)) => doc,
+        Ok(Err(e)) => {
+            log::warn!(
+                "[{supi}] AM policy re-evaluation: reading the AM subscription data failed \
+                 ({e}); association {} keeps its policy",
+                ue_am.association_id
+            );
+            return false;
+        }
+        Err(_) => {
+            log::warn!(
+                "[{supi}] AM policy re-evaluation: the AM subscription data read timed out; \
+                 association {} keeps its policy",
+                ue_am.association_id
+            );
+            return false;
+        }
+    };
+    let policy = am_policy_from(&supi, am_data.as_ref());
+    let (changes, removed) = am_policy_changes(ue_am.am_policy.as_ref(), &policy);
+    if !removed.is_empty() {
+        log::warn!(
+            "[{supi}] AM policy re-evaluation: {removed:?} no longer provisioned. PolicyUpdate \
+             cannot remove them (not nullable, TS 29.507 §4.2.3.3.2 NOTE), so the AMF keeps \
+             the values it has"
+        );
+    }
+    let fresh = (!policy.is_empty()).then_some(serde_json::Value::Object(policy));
+    if fresh == ue_am.am_policy {
+        log::debug!("[{supi}] AM policy re-evaluation: unchanged");
+        return false;
+    }
+    // Stored whatever changed, so the AMF's next Update is answered with the
+    // decision this re-evaluation made (TS 29.507 §4.2.3).
+    let mut updated = ue_am.clone();
+    updated.am_policy = fresh;
+    if let Ok(ctx) = pcf_self().read() {
+        ctx.ue_am_update(&updated);
+    }
+    if changes.is_empty() {
+        log::info!(
+            "[{supi}] AM policy re-evaluation: stored, but no member PolicyUpdate carries \
+             changed; no UpdateNotify"
+        );
+        return false;
+    }
     log::info!(
-        "Policy-data change for {ue_id} ({report_id}): re-authorised {reauthorised} SM policy \
-         association(s)"
+        "[{supi}] AM policy re-evaluation: {:?} changed; sending UpdateNotify for {}",
+        changes.keys().collect::<Vec<_>>(),
+        ue_am.association_id
     );
-    SbiResponse::with_status(204)
+    sbi_path::pcf_sbi_send_am_policy_control_notify(ue_am.id, &changes)
+}
+
+/// Re-evaluate one UE policy association after the UE's policy data changed, and
+/// deliver the new UE policy to the UE when it changed (#1261).
+///
+/// TS 29.513 §5.6.2.2.2: step 4 makes the decision, and step 7 delivers a changed
+/// UE policy as §5.6.1.2 steps 12-15 do, i.e. a MANAGE UE POLICY COMMAND over
+/// Namf_Communication_N1N2MessageTransfer. Step 5's
+/// Npcf_UEPolicyControl_UpdateNotify is for changed request triggers (or an
+/// ANDSP delivery report), and a policy-data change changes neither, so none is
+/// sent (TS 29.525 §4.2.4.2: in the non-roaming case the AMF only enforces
+/// triggers). Returns whether a delivery was started.
+///
+/// The UE's reported UPSIs are not used to skip sections here: the content of
+/// the section the UE holds is what changed, so it is replaced, under the same
+/// UPSC (TS 24.501 Annex D.6.2).
+async fn reevaluate_ue_policy(
+    udr: &sbi_path::DiscoveredEndpoint,
+    assoc: ue_policy::UePolicyAssociation,
+) -> bool {
+    let id = assoc.pol_asso_id.clone();
+    let supi = assoc.supi.clone();
+    if !ue_policy::delivery_enabled() {
+        log::debug!("[{id}] UE policy re-evaluation: delivery is switched off");
+        return false;
+    }
+    let read = tokio::time::timeout(
+        UDR_REREAD_TIMEOUT,
+        sbi_path::pcf_udr_get_ue_policy_set_from(udr, &supi),
+    )
+    .await;
+    let doc = match read {
+        Ok(Ok(doc)) => doc,
+        Ok(Err(e)) => {
+            log::warn!(
+                "[{id}] UE policy re-evaluation: reading the ue-policy-set failed ({e}); the \
+                 UE keeps its policy"
+            );
+            return false;
+        }
+        Err(_) => {
+            log::warn!(
+                "[{id}] UE policy re-evaluation: the ue-policy-set read timed out; the UE \
+                 keeps its policy"
+            );
+            return false;
+        }
+    };
+    let rules = ue_policy::resolve_ursp_rules(doc.as_ref());
+    if rules == assoc.rules {
+        log::debug!("[{id}] UE policy re-evaluation: unchanged");
+        return false;
+    }
+    log::info!("[{id}] UE policy re-evaluation: the URSP changed; delivering it to the UE");
+    // The PLMN the association's section was built for (TS 24.501 D.6.2). None
+    // means the AMF named no serving PLMN, so there is no section to replace.
+    let Some((mcc, mnc)) = assoc.plmn.clone() else {
+        log::warn!("[{id}] UE policy re-evaluation: no serving PLMN known; not delivering");
+        return false;
+    };
+    let upsc = assoc.upsc.max(1);
+    // A fresh PTI: a new UE policy delivery procedure (TS 24.501 D.1.2).
+    let pti = ue_policy::alloc_pti();
+    ue_policy::provision_context_ursp(&supi, rules.clone());
+    // A new delivery generation: the T3501 loop of the delivery this replaces
+    // stops at its next expiry instead of retransmitting the old URSP.
+    let Some(generation) = ue_policy::ue_policy_set_delivery(
+        &id,
+        pti,
+        upsc,
+        Some((mcc.clone(), mnc.clone())),
+        rules.clone(),
+    ) else {
+        return false;
+    };
+    tokio::spawn(deliver_ue_policy_rules(DeliveryJob {
+        id,
+        supi,
+        generation,
+        pti,
+        upsc,
+        mcc,
+        mnc,
+        rules,
+        installed: Vec::new(),
+    }));
+    true
 }
 
 pub async fn handle_sm_policy_update_notify(
@@ -5437,6 +5750,43 @@ mod tests {
         assert!(dec.triggers.contains(&"QOS_NOTIF".to_string()));
     }
 
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn a_ue_policy_create_naming_no_plmn_delivers_nothing() {
+        // #1261 review: the PLMN goes into the section the UE installs (TS 24.501
+        // D.6.2). With neither servingPlmn nor guami there is none to use, and the
+        // test PLMN 001-01 is no longer made up for it.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _delivery = crate::test_support::ue_policy_delivery(true);
+        pcf_context_init(64, 64);
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-ue-policy-control/v1/policies",
+            Some(serde_json::json!({
+                "notificationUri": "http://127.0.0.1:9/namf-callback/v1/ue-policy/1",
+                "supi": "imsi-001010000012611",
+                "suppFeat": "0"
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "the association is still created");
+        let loc = resp.http.get_header("location").expect("Location").clone();
+        let id = loc.rsplit('/').next().unwrap();
+        let assoc = ue_policy::ue_policy_find(id).expect("association");
+        assert_eq!(
+            (assoc.pti, assoc.plmn),
+            (0, None),
+            "no delivery was configured"
+        );
+        assert!(matches!(
+            assoc.delivery_state,
+            ue_policy::DeliveryState::Failed(_)
+        ));
+        ue_policy::ue_policy_remove(id);
+    }
+
     /// pcfd#0: full Npcf_UEPolicyControl lifecycle (TS 29.525).
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
@@ -5464,10 +5814,12 @@ mod tests {
         assert_eq!(resp.status, 400);
 
         // Create -> 201 + Location + PolicyAssociation (suppFeat mandatory, triggers minItems1)
+        // #1261 review: the AMF names the serving PLMN the UE policy section is for.
         let ok = serde_json::json!({
             "notificationUri": "http://127.0.0.1:9/namf-callback/v1/ue-policy/1",
             "supi": "imsi-001010000000070",
-            "suppFeat": "0"
+            "suppFeat": "0",
+            "servingPlmn": { "mcc": "001", "mnc": "01" }
         });
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
@@ -9382,5 +9734,38 @@ mod oauth2_h8_tests {
         assert_ne!(resp.status, 401, "valid token must not be 401");
         assert_ne!(resp.status, 403, "valid token must not be 403");
         server.stop().await.expect("stop");
+    }
+}
+
+/// #1261: what a PCF-initiated AM PolicyUpdate carries (TS 29.507 §4.2.3.3).
+#[cfg(test)]
+mod tests_am_policy_changes {
+    use super::am_policy_changes;
+    use serde_json::json;
+
+    fn map(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        v.as_object().cloned().unwrap()
+    }
+
+    #[test]
+    fn only_added_or_changed_notifiable_members_are_carried() {
+        let sar = json!({"restrictionType": "ALLOWED_AREAS", "areas": [{"tacs": ["000001"]}]});
+        let old = json!({"rfsp": 3, "servAreaRes": sar, "ueAmbr": {"uplink": "1 Mbps"}});
+        // Unchanged: nothing.
+        let (c, r) = am_policy_changes(Some(&old), &map(old.clone()));
+        assert!(c.is_empty() && r.is_empty());
+        // RFSP changed, SAR not, UE-AMBR changed (not carried without
+        // UE-AMBR_Authorization, §4.2.3.3.2).
+        let new = json!({"rfsp": 7, "servAreaRes": sar, "ueAmbr": {"uplink": "2 Mbps"}});
+        let (c, r) = am_policy_changes(Some(&old), &map(new));
+        assert_eq!(serde_json::Value::Object(c), json!({"rfsp": 7}));
+        assert!(r.is_empty());
+        // Added, from no stored policy at all: the complete value (bullet 4).
+        let (c, _) = am_policy_changes(None, &map(json!({"servAreaRes": sar})));
+        assert_eq!(serde_json::Value::Object(c), json!({"servAreaRes": sar}));
+        // Removed: not encodable (not nullable), so reported and not carried.
+        let (c, r) = am_policy_changes(Some(&old), &map(json!({"servAreaRes": sar})));
+        assert!(c.is_empty());
+        assert_eq!(r, vec!["rfsp"]);
     }
 }

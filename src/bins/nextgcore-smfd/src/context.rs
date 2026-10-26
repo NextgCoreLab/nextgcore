@@ -10,7 +10,65 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+/// The SMF context's lock type: every map of [`SmfContext`], and the global context
+/// itself (#1178 follow-up 3).
+type RwLock<T> = HealingRwLock<T>;
+
+/// A `std::sync::RwLock` that recovers from a poison instead of reporting it (#1178
+/// follow-up 3).
+///
+/// A panic while one of the context's locks was held poisoned it, and every caller that
+/// skips on `Err` (`if let Ok(..) = .write()`, `.read().ok()?`, about 170 of them) then
+/// skipped for ever: sessions created after it were never recorded, removals dropped,
+/// and a poisoned global context failed every SMF path. A `HashMap` or `Vec` a panic
+/// interrupted is still a valid one, so the guard is taken through the poison and the
+/// poison is cleared, logged once per poisoning. `read` and `write` keep `RwLock`'s
+/// signatures, so no caller changes; they never return `Err`.
+#[derive(Debug, Default)]
+pub struct HealingRwLock<T: ?Sized>(std::sync::RwLock<T>);
+
+impl<T> HealingRwLock<T> {
+    pub const fn new(value: T) -> Self {
+        Self(std::sync::RwLock::new(value))
+    }
+}
+
+impl<T: ?Sized> HealingRwLock<T> {
+    /// Shared access, through a poison.
+    pub fn read(&self) -> std::sync::LockResult<std::sync::RwLockReadGuard<'_, T>> {
+        Ok(self.0.read().unwrap_or_else(|poisoned| {
+            self.healed();
+            poisoned.into_inner()
+        }))
+    }
+
+    /// Exclusive access, through a poison.
+    pub fn write(&self) -> std::sync::LockResult<std::sync::RwLockWriteGuard<'_, T>> {
+        Ok(self.0.write().unwrap_or_else(|poisoned| {
+            self.healed();
+            poisoned.into_inner()
+        }))
+    }
+
+    pub fn is_poisoned(&self) -> bool {
+        self.0.is_poisoned()
+    }
+
+    pub fn clear_poison(&self) {
+        self.0.clear_poison();
+    }
+
+    fn healed(&self) {
+        log::error!(
+            "SMF state: a context lock ({}) was poisoned by a panic while it was held; \
+             used through the poison, which is cleared",
+            std::any::type_name::<T>()
+        );
+        self.0.clear_poison();
+    }
+}
 
 use crate::session_extensions::Ipv4Pool;
 
@@ -5307,6 +5365,53 @@ mod tests {
         };
         assert!(!ctx.sess_list.is_poisoned() && !ctx.pfcp_sessions.is_poisoned());
         assert!(recorded, "the writer that skips on Err resumes");
+    }
+
+    /// #1178 follow-up 3: a poisoned global context recovers at its next use. Every SMF
+    /// path reads `smf_self()`, and those that skip on `Err` (most) would have skipped
+    /// for ever.
+    #[test]
+    fn a_poisoned_global_context_recovers() {
+        let _state = PROCESS_STATE_TEST_LOCK.blocking_lock();
+        let _seeded = SeededState::track();
+        smf_context_init(64, 256, 512);
+        let _ = std::panic::catch_unwind(|| {
+            let handle = smf_self();
+            let _guard = handle.write().unwrap();
+            panic!("poison the global context");
+        });
+        assert!(smf_self().is_poisoned());
+        let imsi = b"\x09\x91\x07\x00\x00\x11\x78\x03";
+        let added = smf_self()
+            .read()
+            .ok()
+            .and_then(|ctx| ctx.ue_add_by_imsi(imsi))
+            .is_some();
+        let poisoned_after = smf_self().is_poisoned();
+        if let Some(ue) = smf_self().read().unwrap().ue_find_by_imsi(imsi) {
+            smf_self().read().unwrap().ue_remove(ue.id);
+        }
+        assert!(added, "a skip-on-Err path goes on");
+        assert!(!poisoned_after, "and the poison is cleared");
+    }
+
+    /// #1178 follow-up 3: a skip-on-Err writer recovers by itself, without waiting for a
+    /// `persist()` elsewhere to heal the map.
+    #[test]
+    fn a_skip_on_err_writer_recovers_without_a_persist() {
+        let ctx = SmfContext::new();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ctx.cp_n4_seids.write().unwrap();
+            panic!("poison cp_n4_seids");
+        }));
+        let written = if let Ok(mut m) = ctx.cp_n4_seids.write() {
+            m.insert("11784".to_string(), 0x1184);
+            true
+        } else {
+            false
+        };
+        assert!(written);
+        assert!(!ctx.cp_n4_seids.is_poisoned());
     }
 
     /// The whole point of #191: a session created before a restart, and the
