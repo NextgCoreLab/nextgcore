@@ -231,9 +231,12 @@ fn every_report_adapts_as_the_old_adapters_did() {
                 ),
                 v => {
                     let ue = some_f64(v);
+                    // The old adapter took the bin's upper edge, v·2^k·T_c, truncated
+                    // to whole ns. #1270 decodes the midpoint, half a step lower: at
+                    // most 16 T_c (k = 5).
                     let unsigned = ue + 985_024.0 * tc;
                     assert!(
-                        r <= unsigned + 1e-6 && unsigned < r + 1.0,
+                        r <= unsigned + 16.0 * tc + 1e-6 && unsigned < r + 1.0,
                         "Multi-RTT {}: captured rtt_ns {r}, new ue_rx_tx_ns {ue}",
                         f[0]
                     );
@@ -274,6 +277,17 @@ fn every_report_adapts_as_the_old_adapters_did() {
                     f[0]
                 );
                 c_cell.insert("rstd_ns".into(), "None".into());
+            } else if n_cell["rstd_ns"] != "None" && n_cell["rstd_ns"] != c_cell["rstd_ns"] {
+                // #1270: the captured adapter took the bin's upper edge; the new one
+                // takes the midpoint, half a step lower (at most 16 T_c, k = 5).
+                let (x, y) = (some_f64(&c_cell["rstd_ns"]), some_f64(&n_cell["rstd_ns"]));
+                let tc = 1_000_000_000.0 / (480_000.0 * 4_096.0);
+                assert!(
+                    y < x && x - y <= 16.0 * tc + 1e-6,
+                    "DL-TDOA {}: captured {x}, new {y}",
+                    f[0]
+                );
+                c_cell.insert("rstd_ns".into(), n_cell["rstd_ns"].clone());
             }
         }
         assert_eq!(new, captured, "DL-TDOA {}", f[0]);
@@ -291,25 +305,29 @@ fn every_report_adapts_as_the_old_adapters_did() {
 fn rel18_fine_granularity_arms_convert() {
     use codec_glue::{nrrstd_to_signed_ns, ue_rx_tx_to_signed_ns, TimeReport};
     let tc = 1_000_000_000.0 / (480_000.0 * 4_096.0);
-    assert_eq!(
-        nrrstd_to_signed_ns(TimeReport {
+    // #1270: v is the bin [−985024 + 2^k(v − 1), −985024 + 2^k·v) T_c, decoded to
+    // its midpoint. At k = −6, v = 985024·64 is [−1/64, 0) T_c.
+    assert!(
+        (nrrstd_to_signed_ns(TimeReport {
             v: 985_024 * 64,
             k: -6
-        }),
-        0.0
+        }) + tc / 128.0)
+            .abs()
+            < 1e-9
     );
     assert!(
         (nrrstd_to_signed_ns(TimeReport {
             v: 985_024 * 64 + 64,
             k: -6
-        }) - tc)
+        }) - (1.0 - 1.0 / 128.0) * tc)
             .abs()
             < 1e-9
     );
-    // #713: the UE Rx–Tx keeps the same midpoint at the finer step.
+    // #713: the UE Rx–Tx has the same bins at the finer step: k = −1, v = 2000 is
+    // [999.5, 1000) T_c above −985024.
     assert!(
         (ue_rx_tx_to_signed_ns(TimeReport { v: 2_000, k: -1 }).unwrap()
-            - (1_000.0 - 985_024.0) * tc)
+            - (999.75 - 985_024.0) * tc)
             .abs()
             < 1e-6
     );

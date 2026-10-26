@@ -6101,7 +6101,7 @@ lmf:
             .iter()
             .map(|(_, prs, pci, e, n)| {
                 let rstd_ns = (range(*e, *n) - reference_range) / SPEED_OF_LIGHT_M_S * 1e9;
-                (*prs, *pci, (rstd_ns / TC_NS + 985_024.0).round() as u32)
+                (*prs, *pci, ((rstd_ns / TC_NS).floor() + 985_025.0) as u32)
             })
             .collect();
         crate::lpp_fixtures::dl_tdoa_lpp(trps[0].1, &neighbours, txn)
@@ -8421,7 +8421,7 @@ mod positioning_chain_strict_peer {
                 (
                     id_of(*id),
                     Some(*pci),
-                    (rstd / tc_ns + 985_024.0).round() as u32,
+                    ((rstd / tc_ns).floor() + 985_025.0) as u32,
                 )
             })
             .collect();
