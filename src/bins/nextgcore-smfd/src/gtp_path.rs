@@ -1261,6 +1261,17 @@ impl S5S8Server {
         self.xact.lock().await.outstanding()
     }
 
+    /// Give the bearer procedure Requests a T3 of `t3`, for a test that watches one
+    /// run out (#619).
+    #[cfg(test)]
+    pub(crate) async fn set_bearer_t3_for_test(&self, t3: std::time::Duration) {
+        use nextgcore_gtp::v2::xact::BEARER_PROCEDURE_REQUESTS;
+        self.xact
+            .lock()
+            .await
+            .set_t3_for(&BEARER_PROCEDURE_REQUESTS, t3);
+    }
+
     /// Forget every outstanding request. Test-only: the process-wide server
     /// outlives a test whose SGW never answers, and its Delete Bearer Requests
     /// retransmit for 60 s (#1228) into the next test's shutdown drain.
