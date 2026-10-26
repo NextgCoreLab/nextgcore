@@ -399,8 +399,12 @@ fn to_cell(result: &nrppa::E_CID_MeasurementResult) -> CellMeasurement {
         for value in &measured.0 {
             use nrppa::MeasuredResultsValue as M;
             match value {
-                M::ValueAngleOfArrival_EUTRA(deg) => {
-                    aoa.get_or_insert(f64::from(deg.0));
+                // #1269: TS 36.133 Table 10.2.1-1, 0.5 degree bins counter-clockwise
+                // from North (TS 36.214 §5.2.7), as the solver's clockwise bearing.
+                M::ValueAngleOfArrival_EUTRA(v) => {
+                    if aoa.is_none() {
+                        aoa = crate::positioning::eutra_aoa_to_bearing_deg(v.0);
+                    }
                 }
                 // TS 36.133 §10.3.1: TADV Type 1 (eNB Rx–Tx + UE Rx–Tx) and
                 // Type 2 (eNB Rx–Tx with the UE's TA applied) are both the round

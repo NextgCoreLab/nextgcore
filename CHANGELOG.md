@@ -13,6 +13,10 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 ## [Unreleased]
 
 ### Changed
+- lmfd reads an NRPPa E-UTRA AoA (`valueAngleOfArrival-EUTRA`, 0..719) per TS 36.133 Table
+  10.2.1-1: 0.5 degree bins, counter-clockwise from North (TS 36.214 §5.2.7). It is turned into
+  the AoA solver's clockwise bearing, at the bin midpoint. Before, it took the report value as
+  the angle, which was both twice too large and the wrong way round (#1269).
 - lmfd reads the LPP NR PRS-RSRP of a Multi-RTT or DL-TDOA measurement (`nr-DL-PRS-RSRP-Result`)
   as `v − 157` dBm, the lower edge of TS 38.133 Table 10.1.24.3.1-1. It read `v − 140`, the
   E-UTRA RSRP offset, which put every PRS-RSRP 16-17 dB too high (#1278).

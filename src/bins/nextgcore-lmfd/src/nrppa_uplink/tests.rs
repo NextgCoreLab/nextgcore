@@ -98,9 +98,16 @@ fn measured_results_map_to_cell_measurements() {
     assert_eq!(c.ecid_rtt_ns, Some((4096.0 + 8.0 * 5641.0 + 4.0) * ts));
     let c = cell(nr_cgi(PLMN, 1), Some(vec![ta2(7690)]));
     assert_eq!(c.ecid_rtt_ns, None, "TADV_7690 is open-ended");
-    let c = cell(nr_cgi(PLMN, 1), Some(vec![aoa(719)]));
-    assert_eq!(c.aoa, Some(719.0));
-    // RSRP: strongest item of each list, strongest list wins; 0..97 -> -140..-43.
+    // #1269: TS 36.133 Table 10.2.1-1: AOA_ANGLE_v is [0.5v, 0.5v + 0.5) degrees
+    // counter-clockwise from North (TS 36.214 §5.2.7); the solver takes the
+    // clockwise bearing of the bin midpoint.
+    let bearing = |v| cell(nr_cgi(PLMN, 1), Some(vec![aoa(v)])).aoa.unwrap();
+    let close = |got: f64, want: f64| assert!((got - want).abs() < 1e-9, "{got} vs {want}");
+    close(bearing(0), 359.75); // [0, 0.5): just west of North
+    close(bearing(719), 0.25); // [359.5, 360): just east
+    close(bearing(180), 269.75); // [90, 90.5) ccw: west
+    close(bearing(540), 89.75); // [270, 270.5) ccw: east
+                                // RSRP: strongest item of each list, strongest list wins; 0..97 -> -140..-43.
     let c = cell(nr_cgi(PLMN, 1), Some(vec![rsrp(&[0]), rsrp(&[97, 60])]));
     assert_eq!(c.rsrp, Some(-43));
     // RSRQ: strongest item of the FIRST list.
@@ -121,7 +128,7 @@ fn measured_results_map_to_cell_measurements() {
         (c.ecid_rtt_ns, c.aoa, c.rsrp, c.rsrq),
         (
             Some(1001.0 * crate::positioning::TS_NS),
-            Some(90.0),
+            Some(314.75), // AOA_ANGLE_090: [45, 45.5) ccw
             Some(-80),
             Some(10)
         )
