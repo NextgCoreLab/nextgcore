@@ -156,6 +156,55 @@ struct CcaTrustedKeyYaml {
 #[derive(Debug, Default, Deserialize)]
 struct SbiYaml {
     oauth2: Option<SbiOauth2Yaml>,
+    /// `nrf.sbi.server[]` (#1311): the first entry's `address` / `port` is the
+    /// listen address when `--sbi-addr` / `--sbi-port` are not given, and its
+    /// `advertise` the host of the NRF's own URI.
+    server: Option<Vec<SbiServerYaml>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SbiServerYaml {
+    address: Option<String>,
+    advertise: Option<String>,
+    port: Option<u16>,
+}
+
+/// Where the SBI server listens and what the NRF advertises as its own URI host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SbiListen {
+    host: String,
+    port: u16,
+    advertise: String,
+}
+
+/// #1311: the command line, else `nrf.sbi.server[0]`, else loopback port 7777
+/// (#1308: never a wider default). The advertised host is the YAML `advertise`,
+/// else the listen host.
+fn resolve_sbi_listen(
+    cli_addr: Option<&str>,
+    cli_port: Option<u16>,
+    yaml: Option<&NrfYaml>,
+) -> SbiListen {
+    let server = yaml
+        .and_then(|y| y.nrf.as_ref())
+        .and_then(|n| n.sbi.as_ref())
+        .and_then(|s| s.server.as_ref())
+        .and_then(|v| v.first());
+    let host = cli_addr
+        .map(str::to_string)
+        .or_else(|| server.and_then(|s| s.address.clone()))
+        .unwrap_or_else(|| nextgcore_core::sockaddr::DEFAULT_LISTEN_HOST.to_string());
+    let port = cli_port
+        .or_else(|| server.and_then(|s| s.port))
+        .unwrap_or(7777);
+    let advertise = server
+        .and_then(|s| s.advertise.clone())
+        .unwrap_or_else(|| host.clone());
+    SbiListen {
+        host,
+        port,
+        advertise,
+    }
 }
 
 /// nrfd-10: discovery-time policy (SearchResult validityPeriod and the NRF's
@@ -814,13 +863,14 @@ struct Args {
     #[arg(short = 'k', long)]
     kill: bool,
 
-    /// SBI server address
-    #[arg(long, default_value = nextgcore_core::sockaddr::DEFAULT_LISTEN_HOST)]
-    sbi_addr: String,
+    /// SBI server address. Without it, `nrf.sbi.server[0].address` from the
+    /// config file, else 127.0.0.1 (#1308, #1311).
+    #[arg(long)]
+    sbi_addr: Option<String>,
 
-    /// SBI server port
-    #[arg(long, default_value = "7777")]
-    sbi_port: u16,
+    /// SBI server port. Without it, `nrf.sbi.server[0].port`, else 7777.
+    #[arg(long)]
+    sbi_port: Option<u16>,
 
     /// File holding the ES256 access-token signing key (issue #64 gap 4).
     ///
@@ -927,6 +977,15 @@ fn disarm_heartbeat_timer(nf_instance_id: &str) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    // #1311: the config file's SBI listen address, unless the command line names one.
+    let config_yaml: Option<NrfYaml> = std::fs::read_to_string(&args.config)
+        .ok()
+        .and_then(|c| serde_yaml::from_str(&c).ok());
+    let listen = resolve_sbi_listen(
+        args.sbi_addr.as_deref(),
+        args.sbi_port,
+        config_yaml.as_ref(),
+    );
 
     // Initialize logging
     init_logging(&args)?;
@@ -1002,7 +1061,7 @@ async fn main() -> Result<()> {
     let self_uri = format!(
         "{}://{}",
         scheme,
-        nextgcore_sbi::uri_encode::uri_authority(&args.sbi_addr, args.sbi_port)
+        nextgcore_sbi::uri_encode::uri_authority(&listen.advertise, listen.port)
     );
     NRF_SELF_URI.set(self_uri).ok();
 
@@ -1165,8 +1224,8 @@ async fn main() -> Result<()> {
 
     // Build SBI server configuration (legacy, for context)
     let sbi_config = SbiServerConfig {
-        addr: args.sbi_addr.clone(),
-        port: args.sbi_port,
+        addr: listen.host.clone(),
+        port: listen.port,
         tls_enabled: args.tls,
         tls_cert: args.tls_cert.clone(),
         tls_key: args.tls_key.clone(),
@@ -1177,10 +1236,14 @@ async fn main() -> Result<()> {
 
     // Start actual HTTP/2 SBI server using nextgcore-sbi
     let sbi_addr: SocketAddr =
-        nextgcore_core::sockaddr::parse_listen_addr(&args.sbi_addr, args.sbi_port)
+        nextgcore_core::sockaddr::parse_listen_addr(&listen.host, listen.port)
             .context("Invalid SBI address")?;
     // #1308: loopback by default; say which setting opens it to remote peers.
-    nextgcore_core::sockaddr::warn_if_loopback_listener("SBI", &sbi_addr, "--sbi-addr");
+    nextgcore_core::sockaddr::warn_if_loopback_listener(
+        "SBI",
+        &sbi_addr,
+        "--sbi-addr or nrf.sbi.server",
+    );
     let mut sbi_server_config = NextgcoreSbiServerConfig::new(sbi_addr);
 
     // Wire TLS/mTLS configuration from CLI args into the nextgcore-sbi server
@@ -4010,7 +4073,33 @@ mod tests {
     #[test]
     fn sbi_listener_defaults_to_loopback_1308() {
         let args = Args::parse_from(["nextgcore-nrfd"]);
-        assert_eq!(args.sbi_addr, "127.0.0.1");
+        let l = resolve_sbi_listen(args.sbi_addr.as_deref(), args.sbi_port, None);
+        assert_eq!((l.host.as_str(), l.port), ("127.0.0.1", 7777));
+    }
+
+    /// #1311: the YAML `nrf.sbi.server` is the listen address (and `advertise` the
+    /// NRF's URI host) unless the command line names one, which wins.
+    #[test]
+    fn the_yaml_sbi_server_is_bound_unless_the_command_line_overrides_1311() {
+        let yaml: NrfYaml = serde_yaml::from_str(
+            "nrf:\n  sbi:\n    server:\n      - address: 10.0.0.10\n        advertise: nrf.example\n        port: 7788\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_sbi_listen(None, None, Some(&yaml)),
+            SbiListen {
+                host: "10.0.0.10".into(),
+                port: 7788,
+                advertise: "nrf.example".into(),
+            }
+        );
+        let l = resolve_sbi_listen(Some("0.0.0.0"), Some(7777), Some(&yaml));
+        assert_eq!((l.host.as_str(), l.port), ("0.0.0.0", 7777));
+        let none: NrfYaml = serde_yaml::from_str("nrf:\n  sbi: {}\n").unwrap();
+        assert_eq!(
+            resolve_sbi_listen(None, None, Some(&none)).host,
+            "127.0.0.1"
+        );
     }
 
     #[test]
@@ -4018,8 +4107,8 @@ mod tests {
         let args = Args::parse_from(["nextgcore-nrfd"]);
         assert_eq!(args.config, "/etc/nextgcore/nrf.yaml");
         assert_eq!(args.log_level, None);
-        assert_eq!(args.sbi_addr, "127.0.0.1");
-        assert_eq!(args.sbi_port, 7777);
+        assert_eq!(args.sbi_addr, None);
+        assert_eq!(args.sbi_port, None);
         assert!(!args.tls);
         assert_eq!(args.max_ue, 1024);
     }
@@ -4041,8 +4130,8 @@ mod tests {
         ]);
         assert_eq!(args.config, "/custom/nrf.yaml");
         assert_eq!(args.log_level.as_deref(), Some("debug"));
-        assert_eq!(args.sbi_addr, "0.0.0.0");
-        assert_eq!(args.sbi_port, 8080);
+        assert_eq!(args.sbi_addr.as_deref(), Some("0.0.0.0"));
+        assert_eq!(args.sbi_port, Some(8080));
         assert_eq!(args.max_ue, 2048);
     }
 
