@@ -250,6 +250,64 @@ fn default_ebi(ctx: &context::SmfContext, sess: &SmfSess) -> Option<u8> {
 /// activations on one session cannot take the same one.
 static RULE_INDEX_CLAIM: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The packet filter precedences each PDN connection's in-flight procedures hold, by
+/// session id (#1296 review). A Bearer Resource Command's added filters are stored only
+/// once the SGW-C accepts the Update Bearer Request, so until then the store does not
+/// show them. An activation (or a second Command on another bearer) choosing meanwhile
+/// would take the same value, and the UE would delete one of the two (TS 24.301
+/// §6.4.2.4 d) 2)). Every allocation runs under this lock and sees the reservations;
+/// lock order: [`RULE_INDEX_CLAIM`], then this.
+static PRECEDENCE_RESERVATIONS: std::sync::Mutex<
+    std::collections::BTreeMap<u64, Vec<(u64, Vec<u8>)>>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+static NEXT_RESERVATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Precedences one procedure holds on a PDN connection; released when dropped, i.e.
+/// once its filters are stored or it gave up.
+struct PrecedenceReservation {
+    sess_id: u64,
+    token: u64,
+}
+
+impl Drop for PrecedenceReservation {
+    fn drop(&mut self) {
+        let mut map = PRECEDENCE_RESERVATIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(list) = map.get_mut(&self.sess_id) {
+            list.retain(|(t, _)| *t != self.token);
+            if list.is_empty() {
+                map.remove(&self.sess_id);
+            }
+        }
+    }
+}
+
+/// Choose precedences on PDN connection `sess_id` under its allocator (#1296 review).
+/// `choose` gets the precedences other procedures hold and returns its result and the
+/// precedences it now holds, which stay reserved until the returned guard drops. The
+/// caller reads the store inside `choose`, so the store and the reservations are seen
+/// together.
+fn allocate_precedences<R, E>(
+    sess_id: u64,
+    choose: impl FnOnce(&[u8]) -> Result<(R, Vec<u8>), E>,
+) -> Result<(R, PrecedenceReservation), E> {
+    let mut map = PRECEDENCE_RESERVATIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let held: Vec<u8> = map
+        .get(&sess_id)
+        .into_iter()
+        .flatten()
+        .flat_map(|(_, p)| p.iter().copied())
+        .collect();
+    let (result, reserve) = choose(&held)?;
+    let token = NEXT_RESERVATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    map.entry(sess_id).or_default().push((token, reserve));
+    Ok((result, PrecedenceReservation { sess_id, token }))
+}
+
 /// The lowest rule index no other bearer of the session uses.
 fn free_rule_index(ctx: &context::SmfContext, sess: &SmfSess) -> Option<u8> {
     let used: Vec<u8> = sess
@@ -498,14 +556,21 @@ pub async fn activate(
         // across those TFTs: a UE that is handed a duplicate deletes the older filter
         // (TS 24.301 §6.4.2.4 d) 2)), so a second local rule would have taken traffic,
         // or the whole bearer, away from the first.
-        let taken = pdn_precedences(&ctx, &fresh);
-        assign_precedences(&mut req.filters, &taken)
-            .map_err(|e| NotSent(Gtp2Cause::NoResourcesAvailable, e))?;
-        // TS 23.401 §5.4.5 step 5, TS 24.301 §6.4.2.4 c) 2): a dedicated bearer's TFT
-        // holds an uplink filter; a downlink-only one gets the PGW's disallowing filter.
-        ensure_uplink_filter(&mut req.filters, &taken);
-        let tft = eps_tft::encode(eps_tft::op::CREATE_NEW_TFT, &req.filters)
-            .map_err(|e| NotSent(Gtp2Cause::SemanticErrorInTheTadOperation, e))?;
+        // #1296 review: and the ones in-flight procedures hold. The reservation is
+        // dropped at the end of this section, once the filters are stored below.
+        let (tft, _precedences) = allocate_precedences(sess.id, |held| {
+            let mut taken = pdn_precedences(&ctx, &fresh);
+            taken.extend_from_slice(held);
+            assign_precedences(&mut req.filters, &taken)
+                .map_err(|e| NotSent(Gtp2Cause::NoResourcesAvailable, e))?;
+            // TS 23.401 §5.4.5 step 5, TS 24.301 §6.4.2.4 c) 2): a dedicated bearer's
+            // TFT holds an uplink filter; a downlink-only one gets the PGW's disallowing
+            // filter.
+            ensure_uplink_filter(&mut req.filters, &taken);
+            let tft = eps_tft::encode(eps_tft::op::CREATE_NEW_TFT, &req.filters)
+                .map_err(|e| NotSent(Gtp2Cause::SemanticErrorInTheTadOperation, e))?;
+            Ok((tft, req.filters.iter().map(|f| f.precedence).collect()))
+        })?;
         let rule_index = free_rule_index(&ctx, &fresh).ok_or_else(|| {
             NotSent(
                 Gtp2Cause::NoResourcesAvailable,
@@ -1498,7 +1563,7 @@ pub async fn modify_on_command(
         ));
     }
     let handle = context::smf_self();
-    let (sess, linked_ebi, bearer, taken) = {
+    let (sess, linked_ebi, bearer) = {
         let ctx = handle
             .read()
             .map_err(|_| Refused(Gtp2Cause::SystemFailure, "context poisoned".into()))?;
@@ -1540,16 +1605,7 @@ pub async fn modify_on_command(
                 format!("bearer EBI {ebi} was not set up by this PGW-C"),
             ));
         }
-        let taken: Vec<u8> = sess
-            .bearer_ids
-            .iter()
-            .filter(|&&id| id != bearer.id)
-            .filter_map(|&id| ctx.bearer_find_by_id(id))
-            .flat_map(|b| b.pf_ids)
-            .filter_map(|id| ctx.pf_find_by_id(id))
-            .map(|pf| pf.precedence)
-            .collect();
-        (sess, linked, bearer, taken)
+        (sess, linked, bearer)
     };
     let current = stored_filters(&bearer);
 
@@ -1560,7 +1616,34 @@ pub async fn modify_on_command(
         )
     })?)
     .map_err(|e| Refused(Gtp2Cause::SyntacticErrorInTheTadOperation, e))?;
-    let change = apply_tad(&current, &tad, &taken).map_err(|(c, why)| Refused(c, why))?;
+    // #1296 review: the precedences of the PDN connection's other bearers, and those
+    // in-flight procedures hold, read under the allocator. This bearer's new filters
+    // stay reserved until they are stored (or the Command fails), so an activation or
+    // a Command on another bearer meanwhile cannot take them.
+    let (change, _precedences) = allocate_precedences(sess.id, |held| {
+        let ctx = handle
+            .read()
+            .map_err(|_| Refused(Gtp2Cause::SystemFailure, "context poisoned".into()))?;
+        let fresh = ctx
+            .sess_find_by_id(sess.id)
+            .ok_or_else(|| Refused(Gtp2Cause::ContextNotFound, format!("no session {sess_id}")))?;
+        let mut taken: Vec<u8> = fresh
+            .bearer_ids
+            .iter()
+            .filter(|&&id| id != bearer.id)
+            .filter_map(|&id| ctx.bearer_find_by_id(id))
+            .flat_map(|b| b.pf_ids)
+            .filter_map(|id| ctx.pf_find_by_id(id))
+            .map(|pf| pf.precedence)
+            .collect();
+        taken.extend_from_slice(held);
+        let change = apply_tad(&current, &tad, &taken).map_err(|(c, why)| Refused(c, why))?;
+        let holds = match &change {
+            TftChange::Filters(filters, _) => filters.iter().map(|f| f.precedence).collect(),
+            _ => Vec::new(),
+        };
+        Ok((change, holds))
+    })?;
 
     // The QoS the UE asked for, with the bearer's ARP (Flow QoS carries none).
     let new_qos = cmd.flow_qos.as_ref().map(|f| context::Qos {

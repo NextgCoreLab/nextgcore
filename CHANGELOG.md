@@ -13,6 +13,11 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 ## [Unreleased]
 
 ### Changed
+- smfd (PGW-C) picks packet filter precedences under one allocator per PDN connection, and
+  counts the precedences of procedures still in flight. A Bearer Resource Command's added
+  filters are only stored once the SGW-C accepts them. Before, an activation or a Command
+  on another bearer in that window could pick the same precedence, and the UE would delete
+  one of the two filters (TS 24.301 §6.4.2.4 d) 2); #1296 review).
 - smfd (PGW-C) gives the packet filters of a dedicated bearer precedences that no filter of the
   PDN connection uses, keeping their relative order. This applies to local PCC rules and to the
   filters a Bearer Resource Command adds or replaces. Before, every local rule numbered its
