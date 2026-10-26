@@ -3318,10 +3318,14 @@ fn session_setup_flows(
     let mut flows = vec![n2_transfer::QosFlowSetup {
         qfi: binding.qfi,
         five_qi: u16::from(binding.five_qi),
+        // #1179 follow-up: a session migrated from EPS keeps its EPS bearer's pre-emption
+        // flags (TS 23.502 §4.11.1.2.2 / §4.11.1.3.3: the QoS of the moved PDN connection),
+        // not `Arp::default_flow`'s. No EBI assignment is requested on that path, so the
+        // AMF's stored ARP cannot disagree with it; do not "unify" the two.
         arp: default_bearer.map_or(
             n2_transfer::Arp::default_flow(binding.arp_priority_level),
             |b| n2_transfer::Arp {
-                priority_level: binding.arp_priority_level,
+                priority_level: binding.arp_priority_level.clamp(1, 15),
                 ..bearer_arp(b)
             },
         ),

@@ -184,9 +184,13 @@ impl Arp {
     /// pre-emption", "not pre-emptable". The one source for the N2 default flow and the
     /// EBI assignment's `arpList` (TS 23.502 §4.11.1.4.1), so the AMF stores the ARP
     /// the RAN applies.
+    ///
+    /// The priority level is clamped into ArpPriorityLevel 1..=15 here (#1179 follow-up),
+    /// so the N2 encoding and [`Self::to_sbi_json`] carry the same value; the NGAP
+    /// encoder sends it as given.
     pub(crate) fn default_flow(priority_level: u8) -> Self {
         Self {
-            priority_level,
+            priority_level: priority_level.clamp(1, 15),
             may_trigger_pre_emption: false,
             pre_emptable: false,
         }

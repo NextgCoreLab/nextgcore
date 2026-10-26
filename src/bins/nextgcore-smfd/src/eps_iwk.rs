@@ -77,6 +77,11 @@ pub fn set_for_test(on: bool) {
 /// revoke it for a higher-priority request although the RAN would never pre-empt the
 /// flow. The priority level is the policy decision's; it is clamped into
 /// ArpPriorityLevel 1..=15, which the AMF would (correctly) refuse otherwise.
+///
+/// The pre-emption pair is chosen rather than derived: the policy decision this tree
+/// makes carries only an ARP **priority level** (`decision.arp_priority_level`) and no
+/// pre-emption members, and both are `required` in TS 29.571's `Arp`, so they come
+/// from one stated default, the same on N2 and here.
 pub fn default_flow_arp(priority_level: u8) -> serde_json::Value {
     crate::n2_transfer::Arp::default_flow(priority_level).to_sbi_json()
 }
@@ -1108,28 +1113,42 @@ mod tests {
         );
     }
     /// #1179: the EBI assignment's ARP is the N2 default flow's, member for member.
+    /// #1179 follow-up: the N2 side is the flow `handle_sm_context_create` sends
+    /// (`crate::default_flow`), through the production encoder; and a priority level
+    /// out of ArpPriorityLevel's 1..=15 is the same clamped value on both.
     #[test]
     fn the_ebi_assignment_arp_is_the_n2_default_flows() {
         use nextgcore_ngap::transfer::{PreEmptionCapability, PreEmptionVulnerability};
-        let n2 = crate::n2_transfer::setup_request_transfer(&crate::n2_transfer::SetupRequest {
-            ambr: None,
-            ul_tunnel: (1, [10, 45, 0, 1]),
-            data_forwarding_not_possible: false,
-            direct_forwarding_path_availability: false,
-            flows: vec![crate::n2_transfer::QosFlowSetup {
-                qfi: 1,
-                five_qi: 9,
-                arp: crate::n2_transfer::Arp::default_flow(8),
-                gbr: None,
-                e_rab_id: None,
-            }],
-        })
-        .expect("encode");
-        let t = nextgcore_ngap::transfer::PduSessionResourceSetupRequestTransfer::decode(&n2)
-            .expect("decode");
-        let arp = &t.qos_flow_setup_request_list[0]
-            .qos_flow_level_qos_parameters
-            .allocation_and_retention_priority;
+        let n2_arp = |level: u8| {
+            let n2 =
+                crate::n2_transfer::setup_request_transfer(&crate::n2_transfer::SetupRequest {
+                    ambr: None,
+                    ul_tunnel: (1, [10, 45, 0, 1]),
+                    data_forwarding_not_possible: false,
+                    direct_forwarding_path_availability: false,
+                    flows: crate::default_flow(1, 9, level),
+                })
+                .expect("encode");
+            let t = nextgcore_ngap::transfer::PduSessionResourceSetupRequestTransfer::decode(&n2)
+                .expect("decode");
+            t.qos_flow_setup_request_list[0]
+                .qos_flow_level_qos_parameters
+                .allocation_and_retention_priority
+                .clone()
+        };
+        for (level, clamped) in [(0u8, 1u8), (20, 15)] {
+            assert_eq!(
+                n2_arp(level).priority_level_arp,
+                clamped,
+                "N2, level {level}"
+            );
+            assert_eq!(
+                default_flow_arp(level)["priorityLevel"],
+                serde_json::json!(clamped),
+                "SBI, level {level}"
+            );
+        }
+        let arp = &n2_arp(8);
         let sbi = default_flow_arp(8);
         assert_eq!(
             sbi["priorityLevel"],
