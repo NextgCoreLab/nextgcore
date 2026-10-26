@@ -3290,7 +3290,8 @@ mod tests {
     async fn the_bearer_qos_rates_are_kbps_on_s5s8_and_bps_in_the_store() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _seeded = crate::context::SeededState::track();
-        let _upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        upf.clear_seen();
         crate::context::smf_context_init(64, 256, 512);
         let server = crate::gtp_path::S5S8Server::open("127.0.0.1:0".parse().unwrap(), 3)
             .await
@@ -3300,7 +3301,21 @@ mod tests {
             .expect("bind sgw");
         // kbit/s: MBR 128 / 256, GBR 64 / 96.
         let qos = nextgcore_gtp::v2::Gtp2BearerQosIe::new(9, 128, 256, 64, 96);
-        let mut csr = s5c_csr_with_qos(0x79, 0x1165_0001, [10, 99, 99, 99], &qos);
+        let csr = s5c_csr_with_qos(0x79, 0x1165_0001, [10, 99, 99, 99], &qos);
+        // #1221 review: and an APN-AMBR of 1000 / 2000 kbit/s (TS 29.274 §8.7), which
+        // the session's QER enforces at the PGW-U.
+        let mut csr = {
+            let mut b = csr.freeze();
+            let mut msg = nextgcore_gtp::v2::Gtp2Message::decode(&mut b).expect("fixture");
+            let mut ambr = 1000u32.to_be_bytes().to_vec();
+            ambr.extend_from_slice(&2000u32.to_be_bytes());
+            msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
+                Gtp2IeType::Ambr as u8,
+                0,
+                &ambr,
+            ));
+            msg.encode()
+        };
         // IMSI ...0x7a is this test's alone (see `establish_over_the_wire`).
         let imsi_pos = csr
             .windows(8)
@@ -3356,6 +3371,23 @@ mod tests {
             ),
             (128_000, 256_000, 64_000, 96_000),
             "bit/s in the store"
+        );
+        // #1221 review: the QER the PGW-U enforces. The session's QER carries the APN-AMBR
+        // in kbit/s (TS 29.244 §8.2.8), converted from the bit/s the session holds. A
+        // default bearer is Non-GBR (TS 23.401 §4.7.2.1), so its own MBR/GBR make no QER.
+        assert_eq!(
+            (sess.session_ambr.uplink, sess.session_ambr.downlink),
+            (1_000_000, 2_000_000),
+            "the APN-AMBR in bit/s in the store"
+        );
+        let mbr_ie = [
+            0x00, 0x1a, 0x00, 0x0a, 0, 0, 0, 0x03, 0xe8, 0, 0, 0, 0x07, 0xd0,
+        ];
+        assert!(
+            upf.establishment_bodies()
+                .iter()
+                .any(|b| b.windows(mbr_ie.len()).any(|w| w == mbr_ie)),
+            "the session QER's MBR is 1000 / 2000 kbit/s"
         );
         server.close();
     }

@@ -51,8 +51,8 @@ const T3485_RETRANSMISSIONS: u32 = 4;
 /// after it: it removes the bearer at the SGW-U and answers the PDN GW "Remote
 /// peer not responding" (sgwcd `dedicated_bearer::mme_silent`). An answer after
 /// that would set the bearer up in the MME, the eNB and the UE only. sgwcd runs
-/// the paging-dependent bearer Requests with their own N3 (TS 29.274 §7.6),
-/// 3 s x (17 + 1) = 54 s, and the PGW its S5/S8 one for 60 s; the MME answers
+/// the paging-dependent bearer Requests with their own T3 (TS 29.274 §7.6),
+/// 13.5 s x (3 + 1) = 54 s, and the PGW its S5/S8 one for 60 s; the MME answers
 /// within `nextgcore_gtp::v2::xact::MME_BEARER_PROCEDURE_BUDGET` (50 s), which
 /// covers T3485 x 5 (40 s, TS 24.301 §6.4.2.6) and about 10 s of paging.
 /// Whatever is unsettled by then fails, paging "Unable to page UE", anything
@@ -174,8 +174,14 @@ fn ip_of(f: &Gtp2FTeidIe) -> IpAddr {
 
 /// The lowest EPS bearer identity in 5..=15 that `mme_ue_id` does not use.
 fn free_ebi(ctx: &MmeContext, mme_ue_id: u64, taken: &[u8]) -> Option<u8> {
-    (crate::context::MIN_EPS_BEARER_ID..=crate::context::MAX_EPS_BEARER_ID)
-        .find(|e| !taken.contains(e) && ctx.bearer_find_by_ebi(mme_ue_id, *e).is_none())
+    (crate::context::MIN_EPS_BEARER_ID..=crate::context::MAX_EPS_BEARER_ID).find(|e| {
+        !taken.contains(e)
+                && ctx.bearer_find_by_ebi(mme_ue_id, *e).is_none()
+                // #1245 review: an EBI refused while the UE may still answer for
+                // it (a late ACCEPT, or an E-RAB the eNB still holds) is not
+                // handed to a new bearer within REFUSED_HOLD.
+                && !refused_held(mme_ue_id, *e)
+    })
 }
 
 /// Carry out the Serving GW's Create Bearer Request (`raw`, `seq` from `peer`).
@@ -634,7 +640,8 @@ fn requeue_for_handover(ctx: &MmeContext, mme_ue_id: u64, ebi: u8) -> bool {
     p.parked = Parked::Handover;
     p.handover_park = Some((enb_ue_id, Instant::now() + T3485_DURATION));
     log::info!(
-        "UE {mme_ue_id}: E-RAB SETUP for EBI {ebi} refused as handover triggered; re-attempted          after the handover (TS 23.401 §5.5.1.1.2)"
+        "UE {mme_ue_id}: E-RAB SETUP for EBI {ebi} refused as handover triggered; re-attempted \
+         after the handover (TS 23.401 §5.5.1.1.2)"
     );
     true
 }
@@ -991,7 +998,8 @@ pub fn settle_for_pdn(ctx: &MmeContext, mme_ue_id: u64, linked_ebi: u8, cause: G
     };
     for mut p in taken {
         log::info!(
-            "UE {mme_ue_id}: the PDN connection of LBI {linked_ebi} is going; its dedicated              bearer activation (EBIs {:?}) ends (TS 24.301 §6.4.2.6 b)",
+            "UE {mme_ue_id}: the PDN connection of LBI {linked_ebi} is going; its dedicated \
+             bearer activation (EBIs {:?}) ends (TS 24.301 §6.4.2.6 b)",
             ebis_of(&p)
         );
         fail_unsignalled(&mut p, cause);
@@ -1007,6 +1015,18 @@ static REFUSED: Mutex<Vec<(u64, u8, Instant)>> = Mutex::new(Vec::new());
 
 /// How long a refused bearer is remembered: past T3485 x 5.
 const REFUSED_HOLD: Duration = Duration::from_secs(60);
+
+/// Whether `ebi` of `mme_ue_id` was refused within [`REFUSED_HOLD`].
+fn refused_held(mme_ue_id: u64, ebi: u8) -> bool {
+    let now = Instant::now();
+    REFUSED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|(u, e, at)| {
+            *u == mme_ue_id && *e == ebi && now.saturating_duration_since(*at) < REFUSED_HOLD
+        })
+}
 
 fn remember_refused(mme_ue_id: u64, ebi: u8) {
     let now = Instant::now();
@@ -1044,7 +1064,8 @@ pub fn on_unknown_accept(ctx: &MmeContext, mme_ue_id: u64, ebi: u8) -> bool {
     };
     if !known {
         log::warn!(
-            "UE {mme_ue_id}: ACTIVATE DEDICATED EPS BEARER CONTEXT ACCEPT for EBI {ebi}, which              has no bearer; ignored (TS 24.301 §7.3.2 g)"
+            "UE {mme_ue_id}: ACTIVATE DEDICATED EPS BEARER CONTEXT ACCEPT for EBI {ebi}, which \
+             has no bearer; ignored (TS 24.301 §7.3.2 g)"
         );
         return false;
     }
@@ -1069,7 +1090,8 @@ pub fn on_unknown_accept(ctx: &MmeContext, mme_ue_id: u64, ebi: u8) -> bool {
     match sent {
         Ok(_) => {
             log::warn!(
-                "[{}] late ACTIVATE DEDICATED EPS BEARER CONTEXT ACCEPT for EBI {ebi}, whose                  activation was already refused: DEACTIVATE EPS BEARER CONTEXT REQUEST sent",
+                "[{}] late ACTIVATE DEDICATED EPS BEARER CONTEXT ACCEPT for EBI {ebi}, whose \
+                 activation was already refused: DEACTIVATE EPS BEARER CONTEXT REQUEST sent",
                 mme_ue.imsi_bcd
             );
             true
