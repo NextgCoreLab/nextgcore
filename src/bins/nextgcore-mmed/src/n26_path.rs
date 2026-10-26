@@ -1802,7 +1802,7 @@ pub fn n26_open() -> Result<(), String> {
         return Ok(());
     }
     let ctx = mme_self();
-    let Some(bind) = ctx.n26_list.first().copied() else {
+    let Some(bind) = crate::config::preferred_listen(&ctx.n26_list) else {
         log::warn!(
             "{N26_ENV_VAR} is set but no mme.n26.server address is configured: the N26 \
              interface is NOT bound, so an inter-system TAU is still rejected with EMM \

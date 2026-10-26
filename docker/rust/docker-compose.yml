@@ -84,8 +84,9 @@ services:
       TLS_CERT: /etc/nextgcore/certs/nrf.crt
       TLS_KEY: /etc/nextgcore/certs/nrf.key
       TLS_CA: /etc/nextgcore/certs/ca.crt
-    # nrfd takes its SBI bind from --sbi-addr only, and that defaults to loopback
-    # (#1308). Every container interface, inside this private network; the host
+    # nrfd binds --sbi-addr, which overrides nrf.sbi.server in its YAML (#1311);
+    # with neither, loopback (#1308). Every container interface, inside this
+    # private network; the host
     # publish below stays 127.0.0.1.
     command: ["-c", "/etc/nextgcore/nrf.yaml", "--sbi-addr", "0.0.0.0"]
     volumes:

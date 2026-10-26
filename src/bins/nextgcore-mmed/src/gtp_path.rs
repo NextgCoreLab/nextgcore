@@ -1034,7 +1034,7 @@ fn cached_response_for(
 /// that never needed the socket.
 pub fn gtp_open(state: &mut GtpPathState) -> GtpPathResult<()> {
     let ctx = crate::context::mme_self();
-    let Some(bind) = ctx.gtpc_list.first().copied() else {
+    let Some(bind) = crate::config::preferred_listen(&ctx.gtpc_list) else {
         log::warn!(
             "no mme.gtpc.server address configured: the S11 interface is NOT bound, so no \
              Create Session Request can be sent and no EPS bearer can be established"
@@ -1113,7 +1113,7 @@ pub fn send_create_session_request(
     // socket's own rather than whatever configuration says — a mismatch would send
     // the SGW's response to an address nothing is listening on.
     let local_s11 = bound_s11_addr()
-        .or_else(|| ctx.gtpc_list.first().copied())
+        .or_else(|| crate::config::preferred_listen(&ctx.gtpc_list))
         .ok_or_else(|| {
             GtpPathError::InvalidState("no S11 local address to put in the Sender F-TEID".into())
         })?;

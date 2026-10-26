@@ -68,11 +68,13 @@ struct Args {
     #[arg(short = 'm', long)]
     no_color: bool,
 
-    #[arg(long, default_value = nextgcore_core::sockaddr::DEFAULT_LISTEN_HOST)]
-    sbi_addr: String,
+    /// Without it, `lmf.sbi.server[0].address` from the config file, else
+    /// 127.0.0.1 (#1308, #1312). The port likewise defaults to the file, else 7816.
+    #[arg(long)]
+    sbi_addr: Option<String>,
 
-    #[arg(long, default_value = "7816")]
-    sbi_port: u16,
+    #[arg(long)]
+    sbi_port: Option<u16>,
 
     #[arg(long)]
     tls: bool,
@@ -219,6 +221,17 @@ fn apply_oauth2_enforcement(
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    // #1312: the command line, else `lmf.sbi.server[0]` in the config file,
+    // else loopback.
+    let (sbi_addr, sbi_port) = nextgcore_core::sockaddr::resolve_listen(
+        args.sbi_addr.as_deref(),
+        args.sbi_port,
+        &args.config,
+        "lmf",
+        "sbi",
+        7816,
+    )
+    .map_err(|e| anyhow::anyhow!("SBI listen address: {e}"))?;
     init_logging(&nextgcore_core::log::nf_log_level(
         args.log_level.as_deref(),
         Some(&args.config),
@@ -296,16 +309,16 @@ async fn main() -> Result<()> {
     // Namf_Communication leg (subscription callback URIs must be reachable
     // by the AMF, so an unspecified bind address falls back to loopback).
     {
-        let advertised_host = if args.sbi_addr == "0.0.0.0" {
+        let advertised_host = if sbi_addr == "0.0.0.0" {
             "127.0.0.1"
         } else {
-            args.sbi_addr.as_str()
+            sbi_addr.as_str()
         };
         if let Ok(context) = lmf_self().read() {
             context.set_nf_instance_id(nf_instance_id.clone());
             context.set_callback_base(format!(
                 "http://{}",
-                nextgcore_sbi::uri_encode::uri_authority(advertised_host, args.sbi_port)
+                nextgcore_sbi::uri_encode::uri_authority(advertised_host, sbi_port)
             ));
         }
     }
@@ -313,9 +326,8 @@ async fn main() -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(shutdown.clone());
 
-    let addr: SocketAddr =
-        nextgcore_core::sockaddr::parse_listen_addr(&args.sbi_addr, args.sbi_port)
-            .context("Invalid SBI address")?;
+    let addr: SocketAddr = nextgcore_core::sockaddr::parse_listen_addr(&sbi_addr, sbi_port)
+        .context("Invalid SBI address")?;
     // #1308: loopback by default; say which setting opens it to remote peers.
     nextgcore_core::sockaddr::warn_if_loopback_listener("SBI", &addr, "--sbi-addr");
 
@@ -345,7 +357,7 @@ async fn main() -> Result<()> {
     // Register with NRF
     let sbi_ctx = global_context();
     sbi_ctx.set_nrf_uri(&args.nrf_uri).await;
-    if let Err(e) = register_with_nrf(&args.sbi_addr, args.sbi_port, &nf_instance_id).await {
+    if let Err(e) = register_with_nrf(&sbi_addr, sbi_port, &nf_instance_id).await {
         log::warn!("NRF registration failed (will operate without NRF): {e}");
     } else {
         // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
@@ -3755,14 +3767,14 @@ mod tests {
     #[test]
     fn sbi_listener_defaults_to_loopback_1308() {
         let args = Args::parse_from(["nextgcore-lmfd"]);
-        assert_eq!(args.sbi_addr, "127.0.0.1");
+        assert_eq!(args.sbi_addr, None);
     }
 
     #[test]
     fn test_args_default() {
         let args = Args::parse_from(["nextgcore-lmfd"]);
         assert_eq!(args.config, "/etc/nextgcore/lmf.yaml");
-        assert_eq!(args.sbi_port, 7816);
+        assert_eq!(args.sbi_port, None);
         assert_eq!(args.max_measurements, 1024);
         // A7 (lmfd-11): the bespoke/debug ingest routes are OFF by default.
         assert!(!args.debug_endpoints);

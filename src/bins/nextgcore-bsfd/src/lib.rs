@@ -214,7 +214,12 @@ pub async fn run() -> Result<()> {
             Ok(content) => {
                 log::debug!("Configuration file loaded ({} bytes)", content.len());
                 // Seed NRF URI into SBI context for NF registration
-                if let Ok(yaml) = serde_yaml::from_str::<BsfYaml>(&content) {
+                {
+                    // #1313 review: a config that does not parse fails startup
+                    // rather than falling back to the defaults (the bind among them).
+                    let yaml: BsfYaml = serde_yaml::from_str(&content).map_err(|e| {
+                        anyhow::anyhow!("configuration file {} does not parse: {e}", args.config)
+                    })?;
                     if let Some(bsf) = yaml.bsf {
                         if let Some(sbi) = bsf.sbi {
                             // Override the advertised/bind SBI address with the
@@ -5179,5 +5184,30 @@ mod tests {
         // Not an absolute http(s) URI.
         assert_eq!(split_notify_uri("/relative"), None);
         assert_eq!(split_notify_uri("ftp://host/x"), None);
+    }
+}
+
+/// #1313 review: a config that does not parse now fails startup, so every
+/// shipped config of this daemon must parse with its typed structs.
+#[cfg(test)]
+mod shipped_config_tests {
+    #[test]
+    fn the_shipped_configs_parse() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        for rel in [
+            "docker/rust/configs/5gc/bsf.yaml",
+            "docker/rust/configs/5gc/bsf-oauth2.yaml",
+        ] {
+            let text = std::fs::read_to_string(root.join(rel)).unwrap();
+            serde_yaml::from_str::<super::BsfYaml>(&text).unwrap_or_else(|e| panic!("{rel}: {e}"));
+        }
+        let cm: serde_yaml::Value = serde_yaml::from_str(
+            &std::fs::read_to_string(root.join("k8s/manifests/configmap.yaml")).unwrap(),
+        )
+        .unwrap();
+        let text = cm["data"]["bsf.yaml"]
+            .as_str()
+            .expect("the ConfigMap's bsf.yaml");
+        serde_yaml::from_str::<super::BsfYaml>(text).expect("k8s bsf.yaml");
     }
 }

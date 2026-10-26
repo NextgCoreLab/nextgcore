@@ -169,6 +169,24 @@ struct SbiServerYaml {
     port: Option<u16>,
 }
 
+/// The config file, parsed (#1313 review). `None` when there is no file; a file
+/// that cannot be read or does not parse is an error, so a typo does not fall
+/// back silently to the defaults.
+fn load_config(path: &str) -> anyhow::Result<Option<NrfYaml>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            log::debug!("Configuration file not found: {path}");
+            return Ok(None);
+        }
+        Err(e) => anyhow::bail!("cannot read the configuration file {path}: {e}"),
+    };
+    log::info!("Loading configuration from {path}");
+    serde_yaml::from_str(&text)
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("configuration file {path} does not parse: {e}"))
+}
+
 /// Where the SBI server listens and what the NRF advertises as its own URI host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SbiListen {
@@ -978,9 +996,9 @@ fn disarm_heartbeat_timer(nf_instance_id: &str) {
 async fn main() -> Result<()> {
     let args = Args::parse();
     // #1311: the config file's SBI listen address, unless the command line names one.
-    let config_yaml: Option<NrfYaml> = std::fs::read_to_string(&args.config)
-        .ok()
-        .and_then(|c| serde_yaml::from_str(&c).ok());
+    // Read and parsed once (#1313 review); a file that is there but cannot be read
+    // or parsed fails startup rather than falling back to loopback.
+    let config_yaml = load_config(&args.config)?;
     let listen = resolve_sbi_listen(
         args.sbi_addr.as_deref(),
         args.sbi_port,
@@ -1094,28 +1112,15 @@ async fn main() -> Result<()> {
     // conservative `NrfPolicy::default` applies and nothing changes.
     let mut require_oauth2 = false;
     let mut policy = NrfPolicy::default();
-    if std::path::Path::new(&args.config).exists() {
-        log::info!("Loading configuration from {}", args.config);
-        match std::fs::read_to_string(&args.config) {
-            Ok(content) => {
-                log::debug!("Configuration file loaded ({} bytes)", content.len());
-                if let Ok(yaml) = serde_yaml::from_str::<NrfYaml>(&content) {
-                    require_oauth2 = yaml
-                        .nrf
-                        .as_ref()
-                        .and_then(|n| n.sbi.as_ref())
-                        .and_then(|s| s.oauth2.as_ref())
-                        .and_then(|o| o.require)
-                        .unwrap_or(false);
-                    policy = NrfPolicy::from_yaml(&yaml);
-                }
-            }
-            Err(e) => {
-                log::warn!("Failed to read configuration file: {e}");
-            }
-        }
-    } else {
-        log::debug!("Configuration file not found: {}", args.config);
+    if let Some(yaml) = config_yaml.as_ref() {
+        require_oauth2 = yaml
+            .nrf
+            .as_ref()
+            .and_then(|n| n.sbi.as_ref())
+            .and_then(|s| s.oauth2.as_ref())
+            .and_then(|o| o.require)
+            .unwrap_or(false);
+        policy = NrfPolicy::from_yaml(yaml);
     }
     // I2: apply the env-var runtime overrides (default-safe: forces ON only) so
     // the manual host-gate flip is A/B-testable in docker without a code edit.
@@ -4075,6 +4080,40 @@ mod tests {
         let args = Args::parse_from(["nextgcore-nrfd"]);
         let l = resolve_sbi_listen(args.sbi_addr.as_deref(), args.sbi_port, None);
         assert_eq!((l.host.as_str(), l.port), ("127.0.0.1", 7777));
+    }
+
+    /// #1313 review: now that a config that does not parse fails startup, every
+    /// shipped nrf.yaml must parse.
+    #[test]
+    fn the_shipped_configs_parse() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        for rel in [
+            "docker/rust/configs/5gc/nrf.yaml",
+            "docker/rust/configs/5gc/nrf-oauth2.yaml",
+        ] {
+            let text = std::fs::read_to_string(root.join(rel)).unwrap();
+            serde_yaml::from_str::<NrfYaml>(&text).unwrap_or_else(|e| panic!("{rel}: {e}"));
+        }
+        let cm: serde_yaml::Value = serde_yaml::from_str(
+            &std::fs::read_to_string(root.join("k8s/manifests/configmap.yaml")).unwrap(),
+        )
+        .unwrap();
+        let text = cm["data"]["nrf.yaml"]
+            .as_str()
+            .expect("the ConfigMap's nrf.yaml");
+        serde_yaml::from_str::<NrfYaml>(text).expect("k8s nrf.yaml");
+    }
+
+    /// #1313 review: a config that does not parse fails startup; no file is no config.
+    #[test]
+    fn a_config_that_does_not_parse_fails_startup() {
+        let dir = std::env::temp_dir().join(format!("nrfd-badcfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("nrf.yaml");
+        std::fs::write(&bad, "nrf:\n  sbi: [\n").unwrap();
+        let err = load_config(bad.to_str().unwrap()).unwrap_err().to_string();
+        assert!(err.contains("does not parse"), "{err}");
+        assert!(load_config("/nonexistent/nrf.yaml").unwrap().is_none());
     }
 
     /// #1311: the YAML `nrf.sbi.server` is the listen address (and `advertise` the

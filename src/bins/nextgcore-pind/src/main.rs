@@ -70,11 +70,13 @@ struct Args {
     #[arg(short = 'm', long)]
     no_color: bool,
 
-    #[arg(long, default_value = nextgcore_core::sockaddr::DEFAULT_LISTEN_HOST)]
-    sbi_addr: String,
+    /// Without it, `pin.sbi.server[0].address` from the config file, else
+    /// 127.0.0.1 (#1308, #1312). The port likewise defaults to the file, else 7815.
+    #[arg(long)]
+    sbi_addr: Option<String>,
 
-    #[arg(long, default_value = "7815")]
-    sbi_port: u16,
+    #[arg(long)]
+    sbi_port: Option<u16>,
 
     #[arg(long)]
     tls: bool,
@@ -142,6 +144,17 @@ fn setup_signal_handlers(shutdown: Arc<AtomicBool>) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    // #1312: the command line, else `pin.sbi.server[0]` in the config file,
+    // else loopback.
+    let (sbi_addr, sbi_port) = nextgcore_core::sockaddr::resolve_listen(
+        args.sbi_addr.as_deref(),
+        args.sbi_port,
+        &args.config,
+        "pin",
+        "sbi",
+        7815,
+    )
+    .map_err(|e| anyhow::anyhow!("SBI listen address: {e}"))?;
     init_logging(&nextgcore_core::log::nf_log_level(
         args.log_level.as_deref(),
         Some(&args.config),
@@ -185,9 +198,8 @@ async fn main() -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(shutdown.clone());
 
-    let addr: SocketAddr =
-        nextgcore_core::sockaddr::parse_listen_addr(&args.sbi_addr, args.sbi_port)
-            .context("Invalid SBI address")?;
+    let addr: SocketAddr = nextgcore_core::sockaddr::parse_listen_addr(&sbi_addr, sbi_port)
+        .context("Invalid SBI address")?;
     // #1308: loopback by default; say which setting opens it to remote peers.
     nextgcore_core::sockaddr::warn_if_loopback_listener("SBI", &addr, "--sbi-addr");
 
@@ -996,14 +1008,14 @@ mod tests {
     #[test]
     fn sbi_listener_defaults_to_loopback_1308() {
         let args = Args::parse_from(["nextgcore-pind"]);
-        assert_eq!(args.sbi_addr, "127.0.0.1");
+        assert_eq!(args.sbi_addr, None);
     }
 
     #[test]
     fn test_args_default() {
         let args = Args::parse_from(["nextgcore-pind"]);
         assert_eq!(args.config, "/etc/nextgcore/pin.yaml");
-        assert_eq!(args.sbi_port, 7815);
+        assert_eq!(args.sbi_port, None);
         assert_eq!(args.max_pins, 1024);
         // PIND-10: trust is off by default.
         assert!(!args.require_oauth2);

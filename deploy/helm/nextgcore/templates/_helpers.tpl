@@ -71,8 +71,8 @@ and the call fails. A ConfigMap mount is read-only and the pod IP is unknown
 until scheduling, so the rewritten copy lands in an emptyDir.
 
 Call with a dict: {{ include "nextgcore.advertiseInit" (dict "nf" "ausf") }}
-The AMF does NOT use this -- it reads AMF_SBI_ADDR from the environment
-(amfd/src/lib.rs:811) and never consults its YAML for the profile.
+The AMF does not use this: AMF_SBI_ADDR (the pod IP) overrides its
+amf.sbi.server[0].address (#1311), so the env var is set instead.
 */}}
 {{- define "nextgcore.advertiseInit" -}}
 - name: rewrite-advertise-addr

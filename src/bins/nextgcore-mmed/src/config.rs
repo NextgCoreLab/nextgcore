@@ -276,12 +276,14 @@ fn apply(ctx: &mut MmeContext, mme: MmeSection) {
                 None => log::warn!("Ignoring unparsable GTP-C server address '{address}'"),
             }
         }
-        if ctx.gtpc_list.len() > 1 {
+        if let (true, Some(bound)) = (ctx.gtpc_list.len() > 1, preferred_listen(&ctx.gtpc_list)) {
             log::warn!(
-                "{} GTP-C server addresses configured; only the first is bound",
+                "{} S11 GTP-C server addresses configured; only {bound} is bound (the first \
+                 IPv4, else the first IPv6)",
                 ctx.gtpc_list.len()
             );
         }
+
         for peer in gtpc
             .client
             .and_then(|client| client.sgwc)
@@ -330,12 +332,14 @@ fn apply(ctx: &mut MmeContext, mme: MmeSection) {
                 None => log::warn!("Ignoring unparsable N26 server address '{address}'"),
             }
         }
-        if ctx.n26_list.len() > 1 {
+        if let (true, Some(bound)) = (ctx.n26_list.len() > 1, preferred_listen(&ctx.n26_list)) {
             log::warn!(
-                "{} N26 server addresses configured; only the first is bound",
+                "{} N26 server addresses configured; only {bound} is bound (the first IPv4, \
+                 else the first IPv6)",
                 ctx.n26_list.len()
             );
         }
+
         for peer in n26.client.and_then(|client| client.amf).unwrap_or_default() {
             let Some(address) = peer.address else {
                 continue;
@@ -382,14 +386,12 @@ fn apply(ctx: &mut MmeContext, mme: MmeSection) {
             }
         }
         let configured = ctx.s1ap_list.len() + ctx.s1ap_list6.len();
-        if configured > 1 {
-            log::warn!(
-                "{configured} S1AP server addresses configured; only {} is bound",
-                ctx.s1ap_list
-                    .first()
-                    .or(ctx.s1ap_list6.first())
-                    .expect("configured > 1")
-            );
+        // No `expect` in a config-reachable log path (#1314 review).
+        if let (true, Some(bound)) = (
+            configured > 1,
+            ctx.s1ap_list.first().or(ctx.s1ap_list6.first()),
+        ) {
+            log::warn!("{configured} S1AP server addresses configured; only {bound} is bound");
         }
     }
 
@@ -566,13 +568,14 @@ fn sbcap_config(y: SbcapYaml) -> Option<crate::sbcap_path::SbcapConfig> {
             parsed
         })
         .collect();
-    let Some(server) = servers.first().copied() else {
+    let Some(server) = preferred_listen(&servers) else {
         log::error!("mme.sbcap has no server address: SBc-AP is NOT bound (there is no default)");
         return None;
     };
     if servers.len() > 1 {
         log::warn!(
-            "{} SBc-AP server addresses configured; only the first ({server}) is bound",
+            "{} SBc-AP server addresses configured; only {server} is bound (the first IPv4, \
+             else the first IPv6)",
             servers.len()
         );
     }
@@ -582,7 +585,10 @@ fn sbcap_config(y: SbcapYaml) -> Option<crate::sbcap_path::SbcapConfig> {
         .into_iter()
         .filter_map(|c| {
             let address = c.address?;
-            let parsed = address.parse::<std::net::IpAddr>().ok();
+            // Bare or bracketed IPv6, as the listen addresses (#1314 review).
+            let parsed = nextgcore_core::sockaddr::parse_listen_addr(&address, 0)
+                .ok()
+                .map(|a| a.ip());
             if parsed.is_none() {
                 log::warn!("Ignoring unparsable CBC address '{address}'");
             }
@@ -604,6 +610,16 @@ fn sbcap_config(y: SbcapYaml) -> Option<crate::sbcap_path::SbcapConfig> {
         cbc,
         max_associations,
     })
+}
+
+/// The address a listener binds out of its configured list (#1314 review): the first
+/// IPv4 entry, else the first IPv6 one, as S1-MME does (#1314) with its two lists.
+/// S11, N26 and SBc-AP keep both families in one list each.
+pub(crate) fn preferred_listen(list: &[std::net::SocketAddr]) -> Option<std::net::SocketAddr> {
+    list.iter()
+        .find(|a| a.is_ipv4())
+        .or_else(|| list.first())
+        .copied()
 }
 
 /// `address` as `ip:port` (`[v6]:port` for IPv6), or as an IP literal with `port`. An
@@ -885,6 +901,41 @@ mod tests {
                 "{address}"
             );
         }
+    }
+
+    /// #1314 review: S11, N26 and SBc-AP bind the first IPv4 address of their list,
+    /// else the first IPv6 one, as S1-MME does; a bracketed IPv6 address is kept.
+    #[test]
+    fn s11_n26_and_sbcap_bind_ipv4_first_else_ipv6() {
+        assert_eq!(preferred_listen(&[]), None);
+        let v6: std::net::SocketAddr = "[fd00::5]:2123".parse().unwrap();
+        let v4: std::net::SocketAddr = "10.0.0.5:2123".parse().unwrap();
+        assert_eq!(preferred_listen(&[v6]), Some(v6), "IPv6 only");
+        assert_eq!(
+            preferred_listen(&[v6, v4]),
+            Some(v4),
+            "IPv4 first, as S1-MME"
+        );
+
+        let mut ctx = MmeContext::new();
+        let path = write_temp(
+            "nextgcore-mmed-v6-lists.yaml",
+            "mme:\n  gtpc:\n    server:\n      - address: '[fd00::5]'\n  n26:\n    server:\n      \
+             - address: '[fd00::6]'\n      - address: 10.0.0.6\n  sbcap:\n    server:\n      \
+             - address: '[fd00::7]'\n    cbc:\n      - address: '[fd00::9]'\n",
+        );
+        assert!(load_config(&mut ctx, path.to_str().unwrap()));
+        assert_eq!(preferred_listen(&ctx.gtpc_list), Some(v6));
+        assert_eq!(
+            preferred_listen(&ctx.n26_list).map(|a| a.ip()),
+            Some("10.0.0.6".parse().unwrap())
+        );
+        let sbcap = ctx.sbcap.expect("SBc-AP configured");
+        assert_eq!(sbcap.server, "[fd00::7]:29168".parse().unwrap());
+        assert_eq!(
+            sbcap.cbc,
+            vec!["fd00::9".parse::<std::net::IpAddr>().unwrap()]
+        );
     }
 
     #[test]

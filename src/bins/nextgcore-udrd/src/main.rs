@@ -316,6 +316,16 @@ fn oauth2_client() -> Option<Arc<nextgcore_sbi::oauth::OAuth2Client>> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args = Args::parse();
+    // #1313 review: the config is read and parsed first, so a file that does not
+    // parse fails startup at once (not after the MongoDB connect), rather than
+    // falling back to the defaults, the SBI bind among them. No file is no config.
+    let config_yaml: Option<UdrYaml> = match std::fs::read_to_string(&args.config) {
+        Ok(content) => Some(serde_yaml::from_str(&content).map_err(|e| {
+            anyhow::anyhow!("configuration file {} does not parse: {e}", args.config)
+        })?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => anyhow::bail!("cannot read the configuration file {}: {e}", args.config),
+    };
 
     // Initialize logging
     init_logging(&args)?;
@@ -384,8 +394,8 @@ async fn main() -> Result<()> {
     // OAuth2 enforcement knob (udr.sbi.oauth2.require).
     let mut nrf_uri_cfg: Option<String> = None;
     let mut require_oauth2 = false;
-    if let Ok(content) = std::fs::read_to_string(&args.config) {
-        if let Ok(yaml) = serde_yaml::from_str::<UdrYaml>(&content) {
+    if let Some(yaml) = config_yaml {
+        {
             let udr_section = yaml.udr;
             // #87: Nudr_GroupIDmap assignments. Absent config leaves the map
             // empty, so `GET /nf-group-ids` answers 404 DATA_NOT_FOUND rather
@@ -7001,5 +7011,30 @@ udr:
                 "{dnn} must carry no indicator when the operator flagged none"
             );
         }
+    }
+}
+
+/// #1313 review: a config that does not parse now fails startup, so every
+/// shipped config of this daemon must parse with its typed structs.
+#[cfg(test)]
+mod shipped_config_tests {
+    #[test]
+    fn the_shipped_configs_parse() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        for rel in [
+            "docker/rust/configs/5gc/udr.yaml",
+            "docker/rust/configs/5gc/udr-oauth2.yaml",
+        ] {
+            let text = std::fs::read_to_string(root.join(rel)).unwrap();
+            serde_yaml::from_str::<super::UdrYaml>(&text).unwrap_or_else(|e| panic!("{rel}: {e}"));
+        }
+        let cm: serde_yaml::Value = serde_yaml::from_str(
+            &std::fs::read_to_string(root.join("k8s/manifests/configmap.yaml")).unwrap(),
+        )
+        .unwrap();
+        let text = cm["data"]["udr.yaml"]
+            .as_str()
+            .expect("the ConfigMap's udr.yaml");
+        serde_yaml::from_str::<super::UdrYaml>(text).expect("k8s udr.yaml");
     }
 }

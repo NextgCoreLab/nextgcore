@@ -30,7 +30,8 @@ spec:
         - name: nrf
           image: {{ include "nextgcore.image" (dict "global" .Values.global "nf" .Values.nrf) }}
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
-          # nrfd binds --sbi-addr only, loopback by default (#1308): every pod
+          # --sbi-addr overrides nrf.sbi.server (#1311; loopback with neither,
+          # #1308): every pod
           # interface, so the Service and the other NFs reach it.
           args: ["-c", "/etc/nextgcore/nrf.yaml", "--sbi-addr", "0.0.0.0"]
           ports:
