@@ -270,6 +270,120 @@ async fn a_restored_ue_s_service_request_reactivates_its_stored_session() {
     crash(&mut after, sr_id);
 }
 
+/// **#1329.** After its own restart this AMF instance has a new address (its pod IP), but
+/// the UDM, the SMF and the PCF of a restored UE still hold the callback addresses of the
+/// process that stored it. At the UE's first verified message the AMF gives them its
+/// own, as a takeover does (TS 23.501 §5.21.2.3: "the new AMF updates the peer NFs ...
+/// with the new AMF information"), the SMF before the re-activation, so the SMF's
+/// release notification after its own restart reaches this AMF (devtest1 run 4: it went
+/// to the dead pod and the UE kept a PDU session that existed nowhere). The GUAMI is
+/// unchanged, so no new 5G-GUTI is owed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restarted_amf_points_a_restored_ue_s_peers_at_itself_at_its_first_message() {
+    let (_smf, port, seen) = fake_activating_smf().await;
+    let (_selected, selected_port, _selected_seen) = fake_activating_smf().await;
+    let (_udm, udm_port, udm_seen) = fake_activating_smf().await;
+    let (_pcf, pcf_port, pcf_seen) = fake_activating_smf().await;
+    let _env = SmfEnvGuard::acquire(selected_port).await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let backend = Arc::new(MemoryBackend::default());
+    let (old_id, sr_id, tmsi) = (13_290_101u64, 13_290_103u64, 0x1329_0101u32);
+    let supi = "imsi-001010001329101";
+
+    let mut before = storing_server(&backend).await;
+    seed_registered_ue(&mut before, old_id, tmsi, supi, "ref-1329-a", port, false);
+    before.ue_auth_state.with_mut(old_id, |s| {
+        s.amf_ue.policy_association.id = Some("am-pol-1329".to_string());
+        s.policy_association_id = Some("am-pol-1329".to_string());
+        s.amf_ue.ue_policy_association.id = Some("ue-pol-1329".to_string());
+        s.ue_policy_association_id = Some("ue-pol-1329".to_string());
+    });
+    let original = before.ue_auth_state.get(old_id).expect("seeded");
+    store_now(&mut before).await;
+    crash(&mut before, old_id);
+    drop(before);
+
+    // The same instance comes back (no takeover: the record is its own).
+    let backend = only(&backend, supi);
+    let mut after = storing_server(&backend).await;
+    after.udm_override = Some(("127.0.0.1".to_string(), udm_port));
+    after.pcf_override = Some(("127.0.0.1".to_string(), pcf_port));
+    open_with(
+        &mut after,
+        Arc::clone(&backend) as Arc<dyn UeContextBackend>,
+    )
+    .await;
+    let (_, restored) = after.ue_auth_state.find_by_supi(supi).expect("restored");
+    assert!(
+        restored.peers_stale,
+        "the peers are owed this process's addresses"
+    );
+    assert!(!restored.taken_over, "not a takeover");
+    assert!(
+        seen.lock().unwrap().is_empty() && udm_seen.lock().unwrap().is_empty(),
+        "nothing is sent before the UE is back and verified"
+    );
+
+    after.forced_amf_ue_ngap_id = Some(sr_id);
+    let nas = protected_idle_service_request(&restored.amf_ue, tmsi, original.amf_ue.ul_count + 1);
+    after
+        .handle_initial_ue_message(1, &service_request_initial_ue(nas))
+        .await
+        .expect("handled");
+    for _ in 0..3 {
+        settle_offloaded_sbi(&mut after).await;
+    }
+    let instance = nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf);
+
+    let calls = seen.lock().unwrap().clone();
+    let serving = calls
+        .iter()
+        .position(|(uri, body)| {
+            uri.contains("/sm-contexts/ref-1329-a/modify") && body.contains("servingNfId")
+        })
+        .unwrap_or_else(|| panic!("the SMF is given this AMF's addresses: {calls:?}"));
+    let body: serde_json::Value = serde_json::from_str(&calls[serving].1).expect("json");
+    assert_eq!(body["servingNfId"], instance);
+    assert_eq!(
+        body["smContextStatusUri"],
+        crate::sbi_path::sm_context_status_uri(supi, 5)
+    );
+    let activating = calls
+        .iter()
+        .position(|(uri, body)| {
+            uri.contains("/sm-contexts/ref-1329-a/modify") && body.contains("ACTIVATING")
+        })
+        .unwrap_or_else(|| panic!("the session is re-activated: {calls:?}"));
+    assert!(serving < activating, "the SMF learns first: {calls:?}");
+
+    let udm = udm_seen.lock().unwrap().clone();
+    assert!(
+        udm.iter().any(|(uri, _)| uri.ends_with(&format!(
+            "/nudm-uecm/v1/{supi}/registrations/amf-3gpp-access"
+        ))),
+        "the UDM gets a deregCallbackUri of this process: {udm:?}"
+    );
+    let pcf = pcf_seen.lock().unwrap().clone();
+    for suffix in [
+        "/npcf-am-policy-control/v1/policies/am-pol-1329/update",
+        "/npcf-ue-policy-control/v1/policies/ue-pol-1329/update",
+    ] {
+        assert!(
+            pcf.iter().any(|(uri, _)| uri.ends_with(suffix)),
+            "{suffix} at the PCF: {pcf:?}"
+        );
+    }
+
+    let ue = after.ue_auth_state.get(sr_id).expect("resumed");
+    assert!(!ue.peers_stale, "owed once");
+    assert!(
+        !ue.guti_reallocation_owed,
+        "the GUAMI is unchanged: no new 5G-GUTI"
+    );
+    assert_eq!(ue.amf_ue.current_guti, original.amf_ue.current_guti);
+    crash(&mut after, sr_id);
+}
+
 /// **#686.** A UE CM-CONNECTED when stored has no NG connection after the restart: it is
 /// released as an NG Reset would release it (TS 23.502 §4.2.6). Its session's user plane
 /// is DEACTIVATED at the stored SMF, so downlink data is buffered and pages the UE, and

@@ -262,7 +262,9 @@ impl NgapServer {
     }
 
     /// The takeover's peer updates for UE `amf_ue_ngap_id`, once its message verified
-    /// under the taken-over context. They are owed once; a no-op for any other UE.
+    /// under the taken-over context, or under a context this AMF restored after its own
+    /// restart (#1329: same updates, no GUTI reallocation). They are owed once; a no-op
+    /// for any other UE.
     /// Called on the NGAP task before the procedure's own SMF exchanges are queued, so
     /// each SMF learns of the new AMF first.
     pub(super) fn complete_takeover(&mut self, amf_ue_ngap_id: u64, via: TakeoverVia) {
@@ -270,8 +272,15 @@ impl NgapServer {
         let Some(state) = self
             .ue_auth_state
             .with_mut(amf_ue_ngap_id, |s| {
-                if !std::mem::take(&mut s.taken_over) {
+                let taken_over = std::mem::take(&mut s.taken_over);
+                let peers_stale = std::mem::take(&mut s.peers_stale);
+                if !taken_over && !peers_stale {
                     return None;
+                }
+                // #1329: a restart restore keeps its GUAMI, so its 5G-GUTI stays; only
+                // the peers' callback addresses moved.
+                if !taken_over {
+                    return Some((false, s.clone()));
                 }
                 let (plmn, region, set, pointer) = our.clone().unwrap_or((
                     s.amf_ue.nr_tai.plmn_id.clone(),
@@ -291,12 +300,13 @@ impl NgapServer {
                     }
                     TakeoverVia::Service => s.guti_reallocation_owed = true,
                 }
-                Some(s.clone())
+                Some((true, s.clone()))
             })
             .flatten()
         else {
             return;
         };
+        let (taken_over, state) = state;
         let Some(supi) = state.amf_ue.supi.clone() else {
             return;
         };
@@ -314,10 +324,17 @@ impl NgapServer {
         });
         let (guami_mcc, guami_mnc) = plmn_mcc_mnc_strings(&plmn);
         let (serving_mcc, serving_mnc) = plmn_mcc_mnc_strings(&state.amf_ue.nr_tai.plmn_id);
-        log::info!(
-            "UE {amf_ue_ngap_id} ({supi}) taken over: registering with the UDM and telling \
-             its SMFs this AMF serves it"
-        );
+        if taken_over {
+            log::info!(
+                "UE {amf_ue_ngap_id} ({supi}) taken over: registering with the UDM and telling \
+                 its SMFs this AMF serves it"
+            );
+        } else {
+            log::info!(
+                "UE {amf_ue_ngap_id} ({supi}) restored after this AMF's restart: giving the UDM, \
+                 its SMFs and the PCF this process's callback addresses"
+            );
+        }
 
         // The UDM: this AMF is the serving AMF now (TS 29.503 §5.3.2.2.2).
         let udm = self.udm_for_takeover();

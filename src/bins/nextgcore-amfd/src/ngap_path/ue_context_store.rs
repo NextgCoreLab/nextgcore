@@ -897,6 +897,9 @@ impl NgapServer {
                 continue;
             };
             held.insert(rec.supi.clone());
+            // #1329: the peers learn this process's addresses at the UE's first
+            // verified message (`complete_takeover`).
+            self.ue_auth_state.with_mut(id, |s| s.peers_stale = true);
             log::info!(
                 "UE context of {} restored as UE {id}: {} PDU session(s), CM-{} when stored",
                 rec.supi,
