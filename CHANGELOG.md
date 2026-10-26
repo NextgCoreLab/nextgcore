@@ -18,6 +18,11 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   INITIAL_EMERGENCY_REQUEST or EXISTING_EMERGENCY_PDU_SESSION). It also leaves it out for #26,
   #27 and #69 when the AMF reports the UE as a priority user (`priorityUserInd`), so the UE can
   retry at once (TS 24.501 §6.4.1.4.1). amfd does not send either attribute yet (#1188).
+- smfd's EBI assignment request (`Namf_Communication_EBIAssignment`) now gives the default flow's
+  ARP as NOT_PREEMPT / NOT_PREEMPTABLE, the same ARP the N2 default QoS flow carries. Before, it
+  said PREEMPTABLE, so the AMF could revoke the EBI for a higher-priority request that the RAN
+  would never pre-empt (TS 23.502 §4.11.1.4.1). Both now come from one source,
+  `n2_transfer::Arp::default_flow` (#1179).
 - smfd (PGW-C) codes EPS bearer rates in kbit/s on S5/S8 and holds them in bit/s, as N4 and N2
   read them (TS 29.274 §8.15, §8.16). The Create Session Request's Bearer QoS and a Bearer
   Resource Command's Flow QoS on an existing bearer were stored unconverted, so their MBR/GBR
