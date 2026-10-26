@@ -987,19 +987,34 @@ pub fn build_create_indirect_data_forwarding_tunnel_request(
     Ok(msg)
 }
 
+/// What a Bearer Resource Command carries from the UE's request (TS 29.274 Table
+/// 7.2.5-1, TS 23.401 §5.4.5 step 2).
+#[derive(Debug, Clone, Default)]
+pub struct BearerResourceCommandParams<'a> {
+    /// Linked EPS Bearer ID (M): the default bearer of the PDN connection.
+    pub linked_ebi: u8,
+    /// PTI (M): the UE's.
+    pub pti: u8,
+    /// TAD (M on S11): the NAS Traffic flow aggregate, whose coding is the TAD's
+    /// (TS 24.301 §9.9.4.15, TS 24.008 §10.5.6.12).
+    pub tad: &'a [u8],
+    /// Flow QoS (C): when the NAS message had a Required traffic flow QoS.
+    pub qos: Option<&'a Gtp2BearerQos>,
+    /// EPS Bearer ID, instance 1 (C): for a BEARER RESOURCE MODIFICATION REQUEST,
+    /// its "EPS bearer identity for packet filter".
+    pub ebi: Option<u8>,
+    /// PCO and ePCO (O): the UE's, copied transparently.
+    pub pco: Option<&'a [u8]>,
+    pub epco: Option<&'a [u8]>,
+}
+
 /// Build Bearer Resource Command (TS 29.274 §7.2.5)
-#[allow(clippy::too_many_arguments)]
 pub fn build_bearer_resource_command(
-    _bearer: &MmeBearer,
-    _mme_ue: &MmeUe,
     sgw_ue: &SgwUe,
-    linked_bearer_ebi: u8,
-    pti: u8,
-    tad: &[u8],
-    qos: Option<&Gtp2BearerQos>,
+    p: &BearerResourceCommandParams<'_>,
     sequence_number: u32,
 ) -> S11BuildResult<Gtp2Message> {
-    log::debug!("Build Bearer Resource Command, linked EBI={linked_bearer_ebi}");
+    log::debug!("Build Bearer Resource Command, linked EBI={}", p.linked_ebi);
     let mut msg = new_message(
         message_type::BEARER_RESOURCE_COMMAND,
         sgw_ue.sgw_s11_teid,
@@ -1010,19 +1025,15 @@ pub fn build_bearer_resource_command(
     msg.add_ie(Gtp2Ie::from_slice(
         Gtp2IeType::Ebi as u8,
         0,
-        &[linked_bearer_ebi],
+        &[p.linked_ebi],
     ));
     // Procedure Transaction Id (M)
-    msg.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Pti as u8, 0, &[pti]));
-    // Traffic Aggregate Description (C)
-    if !tad.is_empty() {
-        msg.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Tad as u8, 0, tad));
-    }
+    msg.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Pti as u8, 0, &[p.pti]));
     // Flow QoS (C, TS 29.274 §8.16): QCI then the four bit rates, 21 octets. It
     // is the Bearer QoS layout WITHOUT the leading ARP octet, so the library's
     // Bearer QoS is encoded and its first octet dropped (#1186 review: it was
     // sent whole, so the PGW read the ARP octet as the QCI).
-    if let Some(q) = qos {
+    if let Some(q) = p.qos {
         let flow = Gtp2BearerQosIe::new(q.qci, q.ul_mbr, q.dl_mbr, q.ul_gbr, q.dl_gbr);
         let encoded = typed_ie(|buf| flow.encode(buf, 0))?;
         msg.add_ie(Gtp2Ie::from_slice(
@@ -1030,6 +1041,19 @@ pub fn build_bearer_resource_command(
             0,
             &encoded.value[1..],
         ));
+    }
+    // Traffic Aggregate Description (M on S11)
+    msg.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Tad as u8, 0, p.tad));
+    // EPS Bearer ID (C): instance 1
+    if let Some(ebi) = p.ebi {
+        msg.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Ebi as u8, 1, &[ebi]));
+    }
+    // PCO / ePCO (O): copied from the UE
+    if let Some(pco) = p.pco {
+        msg.add_ie(Gtp2Ie::from_slice(ie_type::PCO, 0, pco));
+    }
+    if let Some(epco) = p.epco {
+        msg.add_ie(Gtp2Ie::from_slice(ie_type::EPCO, 0, epco));
     }
 
     Ok(msg)
@@ -1081,13 +1105,14 @@ mod tests {
             ..Default::default()
         };
         let msg = super::build_bearer_resource_command(
-            &crate::context::MmeBearer::default(),
-            &crate::context::MmeUe::default(),
             &crate::context::SgwUe::default(),
-            5,
-            1,
-            &[],
-            Some(&qos),
+            &super::BearerResourceCommandParams {
+                linked_ebi: 5,
+                pti: 1,
+                tad: &[0x21],
+                qos: Some(&qos),
+                ..Default::default()
+            },
             0x1186,
         )
         .unwrap();

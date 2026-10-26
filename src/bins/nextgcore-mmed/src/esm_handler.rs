@@ -114,8 +114,13 @@ pub struct BearerResourceAllocationRequestData {
     pub linked_ebi: u8,
     /// Traffic flow aggregate
     pub tfa: Vec<u8>,
-    /// Required traffic flow QoS
+    /// Required traffic flow QoS (mandatory: `Some` for every parsed request)
     pub required_qos: Option<RequiredQos>,
+    /// Protocol configuration options, copied to the Bearer Resource Command
+    /// (TS 29.274 Table 7.2.5-1)
+    pub pco: Option<Vec<u8>>,
+    /// Extended protocol configuration options, copied likewise
+    pub epco: Option<Vec<u8>>,
 }
 
 /// Bearer resource modification request data
@@ -129,6 +134,10 @@ pub struct BearerResourceModificationRequestData {
     pub required_qos: Option<RequiredQos>,
     /// ESM cause
     pub esm_cause: Option<EsmCause>,
+    /// Protocol configuration options
+    pub pco: Option<Vec<u8>>,
+    /// Extended protocol configuration options
+    pub epco: Option<Vec<u8>>,
 }
 
 /// Required QoS
@@ -330,7 +339,87 @@ pub fn handle_esm_information_response(
     Ok(result)
 }
 
-/// Handle bearer resource allocation request
+/// The non-imperative part of an ESM message (TS 24.301 §8.3, TS 24.007 §11.2.4):
+/// `(IEI, value)` per IE.
+///
+/// - IEI bit 8 set: a type 1 (IEI in the high half octet) or type 2 IE, one octet; the
+///   whole octet is returned as the IEI and the value is empty.
+/// - An IEI in `tv`: a type 3 (TV) IE of that total length, for example ESM cause
+///   (58, two octets).
+/// - IEI 0x7_: TLV-E, two length octets (TS 24.301 IEIs 0x7B ePCO and the like).
+/// - Anything else: TLV, one length octet.
+///
+/// An IE that runs past the end is an error, not a silent stop: the old walkers
+/// skipped every unknown IE as TLV, so a type 1 Device properties (0xC-) or a
+/// TLV-E ePCO desynchronised the rest of the message.
+fn optional_ies<'a>(data: &'a [u8], tv: &[(u8, usize)]) -> EsmResult<Vec<(u8, &'a [u8])>> {
+    let mut ies = Vec::new();
+    let mut offset = 0;
+    while offset < data.len() {
+        let iei = data[offset];
+        offset += 1;
+        if iei & 0x80 != 0 {
+            ies.push((iei, &data[offset..offset]));
+            continue;
+        }
+        if let Some(&(_, total)) = tv.iter().find(|(i, _)| *i == iei) {
+            let Some(value) = data.get(offset..offset + total - 1) else {
+                return Err(EsmError::InvalidMessage(format!(
+                    "IE 0x{iei:02x} truncated"
+                )));
+            };
+            ies.push((iei, value));
+            offset += total - 1;
+            continue;
+        }
+        let len = if iei & 0xf0 == 0x70 {
+            let Some(l) = data.get(offset..offset + 2) else {
+                return Err(EsmError::InvalidMessage(format!(
+                    "IE 0x{iei:02x}: truncated length"
+                )));
+            };
+            offset += 2;
+            usize::from(u16::from_be_bytes([l[0], l[1]]))
+        } else {
+            let Some(&l) = data.get(offset) else {
+                return Err(EsmError::InvalidMessage(format!(
+                    "IE 0x{iei:02x}: truncated length"
+                )));
+            };
+            offset += 1;
+            usize::from(l)
+        };
+        let Some(value) = data.get(offset..offset + len) else {
+            return Err(EsmError::InvalidMessage(format!(
+                "IE 0x{iei:02x}: {len} octets run past the message"
+            )));
+        };
+        ies.push((iei, value));
+        offset += len;
+    }
+    Ok(ies)
+}
+
+/// A mandatory LV IE at `offset`: its value, and the offset after it.
+fn mandatory_lv<'a>(data: &'a [u8], offset: usize, name: &str) -> EsmResult<(&'a [u8], usize)> {
+    let Some(&len) = data.get(offset) else {
+        return Err(EsmError::MissingMandatoryIe(name.to_string()));
+    };
+    let start = offset + 1;
+    let end = start + usize::from(len);
+    let value = data
+        .get(start..end)
+        .ok_or_else(|| EsmError::InvalidMessage(format!("{name}: length exceeds message")))?;
+    Ok((value, end))
+}
+
+/// Handle BEARER RESOURCE ALLOCATION REQUEST (TS 24.301 §8.3.8, Table 8.3.8.1).
+///
+/// `data` is the message after its message type: Linked EPS bearer identity (bits
+/// 1-4) with a spare half octet, Traffic flow aggregate (LV, M), Required traffic
+/// flow QoS (LV, M; it was read as an optional TLV with IEI 0x5B, which this
+/// message does not have), then PCO (27), Device properties (C-), NBIFOM container
+/// (33), ePCO (7B) and Extended EPS QoS (5C).
 pub fn handle_bearer_resource_allocation_request(
     _enb_ue: &EnbUe,
     _mme_ue: &MmeUe,
@@ -338,74 +427,46 @@ pub fn handle_bearer_resource_allocation_request(
     _bearer: &MmeBearer,
     data: &[u8],
 ) -> EsmResult<BearerResourceAllocationRequestData> {
-    // Minimum length: linked EBI (1) + TFA length (1)
-    if data.len() < 2 {
-        return Err(EsmError::InvalidMessage(
-            "Bearer resource allocation request too short".to_string(),
-        ));
-    }
-
-    let mut result = BearerResourceAllocationRequestData::default();
-    let mut offset = 0;
-
-    // Linked EPS bearer identity (4 bits) + spare (4 bits)
-    result.linked_ebi = data[offset] & 0x0f;
-    offset += 1;
-
-    // Traffic flow aggregate
-    if offset >= data.len() {
+    let Some(&first) = data.first() else {
         return Err(EsmError::MissingMandatoryIe(
-            "Traffic flow aggregate".to_string(),
+            "Linked EPS bearer identity".to_string(),
         ));
-    }
-    let tfa_len = data[offset] as usize;
-    offset += 1;
-    if offset + tfa_len > data.len() {
+    };
+    let mut result = BearerResourceAllocationRequestData {
+        linked_ebi: first & 0x0f,
+        ..Default::default()
+    };
+    let (tfa, offset) = mandatory_lv(data, 1, "Traffic flow aggregate")?;
+    if tfa.is_empty() {
         return Err(EsmError::InvalidMessage(
-            "TFA length exceeds message".to_string(),
+            "Traffic flow aggregate is empty".to_string(),
         ));
     }
-    result.tfa = data[offset..offset + tfa_len].to_vec();
-    offset += tfa_len;
-
-    // Parse optional IEs
-    while offset < data.len() {
-        if offset >= data.len() {
-            break;
-        }
-
-        let iei = data[offset];
-        offset += 1;
-
+    result.tfa = tfa.to_vec();
+    let (qos, offset) = mandatory_lv(data, offset, "Required traffic flow QoS")?;
+    if qos.is_empty() {
+        return Err(EsmError::InvalidMessage(
+            "Required traffic flow QoS is empty".to_string(),
+        ));
+    }
+    result.required_qos = Some(parse_required_qos(qos));
+    for (iei, value) in optional_ies(&data[offset..], &[])? {
         match iei {
-            // Required traffic flow QoS
-            0x5b => {
-                if offset >= data.len() {
-                    break;
-                }
-                let len = data[offset] as usize;
-                offset += 1;
-                if offset + len > data.len() {
-                    break;
-                }
-                result.required_qos = Some(parse_required_qos(&data[offset..offset + len]));
-                offset += len;
-            }
-            _ => {
-                // Skip unknown IE
-                if offset >= data.len() {
-                    break;
-                }
-                let len = data[offset] as usize;
-                offset += 1 + len;
-            }
+            0x27 => result.pco = Some(value.to_vec()),
+            0x7b => result.epco = Some(value.to_vec()),
+            _ => {}
         }
     }
-
     Ok(result)
 }
 
-/// Handle bearer resource modification request
+/// Handle BEARER RESOURCE MODIFICATION REQUEST (TS 24.301 §8.3.10, Table 8.3.10.1).
+///
+/// `data` is the message after its message type: EPS bearer identity for packet
+/// filter (bits 1-4) with a spare half octet, Traffic flow aggregate (LV, M), then
+/// Required traffic flow QoS (5B, TLV), ESM cause (58, TV), PCO (27), Device
+/// properties (C-), NBIFOM container (33), Header compression configuration (66),
+/// ePCO (7B) and Extended EPS QoS (5C).
 pub fn handle_bearer_resource_modification_request(
     _enb_ue: &EnbUe,
     _mme_ue: &MmeUe,
@@ -413,79 +474,32 @@ pub fn handle_bearer_resource_modification_request(
     _bearer: &MmeBearer,
     data: &[u8],
 ) -> EsmResult<BearerResourceModificationRequestData> {
-    // Minimum length: EBI for PF (1) + TFA length (1)
-    if data.len() < 2 {
-        return Err(EsmError::InvalidMessage(
-            "Bearer resource modification request too short".to_string(),
-        ));
-    }
-
-    let mut result = BearerResourceModificationRequestData::default();
-    let mut offset = 0;
-
-    // EPS bearer identity for packet filter (4 bits) + spare (4 bits)
-    result.ebi_for_pf = data[offset] & 0x0f;
-    offset += 1;
-
-    // Traffic flow aggregate
-    if offset >= data.len() {
+    let Some(&first) = data.first() else {
         return Err(EsmError::MissingMandatoryIe(
-            "Traffic flow aggregate".to_string(),
+            "EPS bearer identity for packet filter".to_string(),
         ));
-    }
-    let tfa_len = data[offset] as usize;
-    offset += 1;
-    if offset + tfa_len > data.len() {
+    };
+    let mut result = BearerResourceModificationRequestData {
+        ebi_for_pf: first & 0x0f,
+        ..Default::default()
+    };
+    let (tfa, offset) = mandatory_lv(data, 1, "Traffic flow aggregate")?;
+    if tfa.is_empty() {
         return Err(EsmError::InvalidMessage(
-            "TFA length exceeds message".to_string(),
+            "Traffic flow aggregate is empty".to_string(),
         ));
     }
-    result.tfa = data[offset..offset + tfa_len].to_vec();
-    offset += tfa_len;
-
-    // Parse optional IEs
-    while offset < data.len() {
-        if offset >= data.len() {
-            break;
-        }
-
-        let iei = data[offset];
-        offset += 1;
-
+    result.tfa = tfa.to_vec();
+    let ies = optional_ies(&data[offset..], &[(0x58, 2)])?;
+    for (iei, value) in ies {
         match iei {
-            // Required traffic flow QoS
-            0x5b => {
-                if offset >= data.len() {
-                    break;
-                }
-                let len = data[offset] as usize;
-                offset += 1;
-                if offset + len > data.len() {
-                    break;
-                }
-                result.required_qos = Some(parse_required_qos(&data[offset..offset + len]));
-                offset += len;
-            }
-            // ESM cause
-            0x58 => {
-                if offset >= data.len() {
-                    break;
-                }
-                let cause_value = data[offset];
-                offset += 1;
-                result.esm_cause = Some(esm_cause_from_u8(cause_value));
-            }
-            _ => {
-                // Skip unknown IE
-                if offset >= data.len() {
-                    break;
-                }
-                let len = data[offset] as usize;
-                offset += 1 + len;
-            }
+            0x5b if !value.is_empty() => result.required_qos = Some(parse_required_qos(value)),
+            0x58 => result.esm_cause = value.first().map(|c| esm_cause_from_u8(*c)),
+            0x27 => result.pco = Some(value.to_vec()),
+            0x7b => result.epco = Some(value.to_vec()),
+            _ => {}
         }
     }
-
     Ok(result)
 }
 
@@ -845,27 +859,32 @@ fn parse_apn(data: &[u8]) -> String {
 
 /// Parse required QoS
 fn parse_required_qos(data: &[u8]) -> RequiredQos {
-    let mut qos = RequiredQos::default();
-
-    if data.is_empty() {
-        return qos;
-    }
-
-    // QCI
-    qos.qci = data[0];
-
-    // For GBR bearers (QCI 1-4), parse bitrates
-    if data.len() >= 5 && qos.qci >= 1 && qos.qci <= 4 {
-        qos.mbr_ul = decode_bitrate(data[1]);
-        qos.mbr_dl = decode_bitrate(data[2]);
-        qos.gbr_ul = decode_bitrate(data[3]);
-        qos.gbr_dl = decode_bitrate(data[4]);
-    }
-
+    // TS 24.301 §9.9.4.3: QCI, then the four base rate octets (MBR UL, MBR DL, GBR
+    // UL, GBR DL), then their extended and extended-2 octets; 1, 5, 9 or 13
+    // octets of contents. The rates are read whatever the QCI: the PGW decides
+    // what a non-GBR QCI's rates mean (§9.9.4.3: "ignored"). In kbit/s.
+    let mut qos = RequiredQos {
+        qci: data.first().copied().unwrap_or(0),
+        ..Default::default()
+    };
+    let octet = |i: usize| data.get(i).copied().unwrap_or(0);
+    let rate = |i: usize| {
+        if data.len() <= i {
+            return 0;
+        }
+        decode_bitrate_ext2(octet(i + 8))
+            .or_else(|| decode_bitrate_ext(octet(i + 4)))
+            .unwrap_or_else(|| decode_bitrate(octet(i)))
+    };
+    qos.mbr_ul = rate(1);
+    qos.mbr_dl = rate(2);
+    qos.gbr_ul = rate(3);
+    qos.gbr_dl = rate(4);
     qos
 }
 
-/// Decode bitrate value
+/// Decode bitrate value (TS 24.008 Table 10.5.156, base octet), kbit/s. 0xFF is
+/// 0 kbit/s; 0 is "subscribed" from the UE, passed on as 0 (the PGW decides).
 fn decode_bitrate(value: u8) -> u64 {
     if value == 0 || value == 0xff {
         return 0;
@@ -881,6 +900,30 @@ fn decode_bitrate(value: u8) -> u64 {
 
     // 128-254
     576 + ((value - 128) as u64) * 64
+}
+
+/// The extended octet (TS 24.301 Table 9.9.4.3.1), kbit/s; `None` for 0, "use the
+/// base octet".
+fn decode_bitrate_ext(value: u8) -> Option<u64> {
+    let v = u64::from(value);
+    match value {
+        0 => None,
+        0x01..=0x4a => Some(8600 + v * 100),
+        0x4b..=0xba => Some(16_000 + (v - 0x4a) * 1000),
+        _ => Some(128_000 + (v.min(0xfa) - 0xba) * 2000),
+    }
+}
+
+/// The extended-2 octet (TS 24.301 Table 9.9.4.3.1), kbit/s; `None` for 0, "use
+/// the extended octet".
+fn decode_bitrate_ext2(value: u8) -> Option<u64> {
+    let v = u64::from(value);
+    match value {
+        0 => None,
+        0x01..=0x3d => Some(256_000 + v * 4000),
+        0x3e..=0xa1 => Some(500_000 + (v - 0x3d) * 10_000),
+        _ => Some(1_500_000 + (v.min(0xf6) - 0xa1) * 100_000),
+    }
 }
 
 /// Convert u8 to EsmCause
@@ -1064,6 +1107,80 @@ mod tests {
         assert!(data.apn.is_none());
         assert!(data.pco.is_none());
         assert!(data.epco.is_none());
+    }
+
+    /// #1282, TS 24.301 Table 8.3.8.1: the Required traffic flow QoS is a mandatory LV
+    /// after the TFA (it was read as an optional 0x5B TLV, so it was never found), and
+    /// the optional part has a type 1 Device properties (C-) and a TLV-E ePCO (7B)
+    /// that the old walker skipped as TLVs.
+    #[test]
+    fn a_bearer_resource_allocation_request_is_parsed_as_table_8_3_8_1_says() {
+        let body = [
+            0x05, // spare | linked EBI 5
+            0x02, 0x21, 0x31, // TFA
+            0x05, 0x01, 0x48, 0x48, 0x40, 0x40, // QCI 1, MBR 128, GBR 64
+            0xc1, // Device properties
+            0x7b, 0x00, 0x03, 0x80, 0x00, 0x0d, // ePCO
+            0x27, 0x01, 0x80, // PCO
+        ];
+        let r = handle_bearer_resource_allocation_request(
+            &EnbUe::default(),
+            &MmeUe::default(),
+            &MmeSess::default(),
+            &MmeBearer::default(),
+            &body,
+        )
+        .unwrap();
+        assert_eq!(r.linked_ebi, 5);
+        assert_eq!(r.tfa, vec![0x21, 0x31]);
+        let q = r.required_qos.unwrap();
+        assert_eq!(
+            (q.qci, q.mbr_ul, q.mbr_dl, q.gbr_ul, q.gbr_dl),
+            (1, 128, 128, 64, 64)
+        );
+        assert_eq!(r.epco, Some(vec![0x80, 0x00, 0x0d]));
+        assert_eq!(r.pco, Some(vec![0x80]));
+        // Without the mandatory QoS, and with an IE running past the end.
+        for bad in [&body[..4], &body[..18]] {
+            assert!(handle_bearer_resource_allocation_request(
+                &EnbUe::default(),
+                &MmeUe::default(),
+                &MmeSess::default(),
+                &MmeBearer::default(),
+                bad,
+            )
+            .is_err());
+        }
+    }
+
+    /// #1282, TS 24.301 Table 8.3.10.1: Required traffic flow QoS (5B, TLV, here with
+    /// the extended octets: MBR 20 Mbit/s), ESM cause (58, TV), Device properties
+    /// (C-, type 1) and ePCO (7B, TLV-E).
+    #[test]
+    fn a_bearer_resource_modification_request_is_parsed_as_table_8_3_10_1_says() {
+        let body = [
+            0x06, // spare | EBI for packet filter 6
+            0x02, 0xa1, 0x01, // TFA: delete filter 1
+            0xc1, // Device properties
+            0x58, 0x24, // ESM cause #36
+            0x5b, 0x09, 0x01, 0xfe, 0xfe, 0x40, 0x40, 0x4e, 0x4e, 0x00, 0x00, // QoS
+            0x7b, 0x00, 0x01, 0x80, // ePCO
+        ];
+        let r = handle_bearer_resource_modification_request(
+            &EnbUe::default(),
+            &MmeUe::default(),
+            &MmeSess::default(),
+            &MmeBearer::default(),
+            &body,
+        )
+        .unwrap();
+        assert_eq!(r.ebi_for_pf, 6);
+        assert_eq!(r.tfa, vec![0xa1, 0x01]);
+        assert_eq!(r.esm_cause, Some(EsmCause::RegularDeactivation));
+        let q = r.required_qos.unwrap();
+        // 0x4e extended: 16 Mbit/s + (0x4e - 0x4a) x 1 Mbit/s.
+        assert_eq!((q.qci, q.mbr_ul, q.gbr_ul), (1, 20_000, 64));
+        assert_eq!(r.epco, Some(vec![0x80]));
     }
 
     #[test]

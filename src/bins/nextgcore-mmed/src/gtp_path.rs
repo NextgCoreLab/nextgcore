@@ -4,8 +4,7 @@
 
 use crate::context::MmeContext;
 use crate::s11_build::{
-    self, Gtp2BearerQos, GtpCause, GtpCreateAction, GtpDeleteAction, GtpModifyAction,
-    GtpReleaseAction,
+    self, GtpCause, GtpCreateAction, GtpDeleteAction, GtpModifyAction, GtpReleaseAction,
 };
 use bytes::Bytes;
 use nextgcore_gtp::v2::xact::{Gtp2XactConfig, Gtp2XactMgr};
@@ -438,6 +437,12 @@ impl GtpcServer {
                                         crate::s1ap_path::s1ap_send(send);
                                     }
                                 }
+                            }
+                            // #1282: the UE's bearer resource request is
+                            // refused rather than left to its T3480/T3481.
+                            if xact.message_type == s11_build::message_type::BEARER_RESOURCE_COMMAND
+                            {
+                                crate::bearer_resource::on_command_unanswered(xact.sequence_number);
                             }
                             // #736 (and #616's record): nobody waits on an
                             // unanswered Change Notification, but its record
@@ -2056,46 +2061,30 @@ pub fn send_delete_indirect_data_forwarding_tunnel_request(
     })
 }
 
+/// Send the UE's Bearer Resource Command to the Serving GW (#1282, TS 23.401 §5.4.5
+/// step 2, TS 29.274 §7.2.5). Returns its sequence number: a Command's has the
+/// most significant bit set (§7.6), and its triggered message (a Create, Update or
+/// Delete Bearer Request, or a Bearer Resource Failure Indication) carries it back.
 pub fn send_bearer_resource_command(
     ctx: &MmeContext,
-    bearer_id: u64,
-    linked_bearer_ebi: u8,
-    pti: u8,
-    tad: &[u8],
-    qos: Option<&Gtp2BearerQos>,
-) -> GtpPathResult<GtpXactData> {
+    mme_ue_id: u64,
+    params: &s11_build::BearerResourceCommandParams<'_>,
+) -> GtpPathResult<u32> {
     log::debug!("Sending Bearer Resource Command");
 
-    let bearer = ctx
-        .bearer_find_by_id(bearer_id)
-        .ok_or(GtpPathError::ContextNotFound)?;
     let mme_ue = ctx
-        .mme_ue_find_by_id(bearer.mme_ue_id)
+        .mme_ue_find_by_id(mme_ue_id)
         .ok_or(GtpPathError::ContextNotFound)?;
     let sgw_ue = ctx
         .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
         .ok_or(GtpPathError::ContextNotFound)?;
 
     let seq = command_sequence()?;
-    let msg = s11_build::build_bearer_resource_command(
-        &bearer,
-        &mme_ue,
-        &sgw_ue,
-        linked_bearer_ebi,
-        pti,
-        tad,
-        qos,
-        seq,
-    )
-    .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
+    let msg = s11_build::build_bearer_resource_command(&sgw_ue, params, seq)
+        .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
     let xact_id = ctx.next_pool_id() | GTP_CMD_XACT_ID_FLAG;
     send_to_sgwc(ctx, &msg, xact_id)?;
-
-    Ok(GtpXactData {
-        xact_id,
-        local_teid: mme_ue.mme_s11_teid,
-        ..Default::default()
-    })
+    Ok(seq)
 }
 
 // ============================================================================
