@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 pub mod bearer_activation;
 pub mod bearer_deactivation;
+pub mod bearer_resource;
 pub mod config;
 pub mod context;
 pub mod emm_build;
@@ -42,6 +43,8 @@ pub mod sgsap_build;
 pub mod sgsap_handler;
 pub mod sm;
 
+#[cfg(test)]
+mod bearer_resource_tests;
 #[cfg(test)]
 mod detach_tests;
 #[cfg(test)]

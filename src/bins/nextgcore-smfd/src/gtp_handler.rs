@@ -5355,6 +5355,124 @@ mod tests {
         );
     }
 
+    /// #619 follow-up 3: while a Delete Bearer Request is in flight for a bearer, the
+    /// bearer is being deleted. A modification the SGW-C accepts meanwhile stores nothing
+    /// and changes nothing at the PGW-U, and a second Delete Bearer Command for the bearer
+    /// sends no second Delete Bearer Request.
+    #[tokio::test]
+    async fn a_bearer_being_deleted_takes_no_modification_and_no_second_delete() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let (server, sgw, _port, sess, pgw_c_teid) = pdn_with_voice_bearer(0x7c, &upf).await;
+        const VIDEO_DL: &str = "permit out 17 from 198.51.100.7 5008 to assigned";
+        let tad = crate::eps_tft::encode(
+            crate::eps_tft::op::ADD_PACKET_FILTERS,
+            &[crate::eps_tft::PacketFilter {
+                direction: crate::context::FlowDirection::Bidirectional,
+                identifier: 0,
+                precedence: 7,
+                flow_description: VIDEO_DL.into(),
+            }],
+        )
+        .unwrap();
+        let dbc = |seq: u32| {
+            use nextgcore_gtp::v2::{Gtp2BearerContextIe, Gtp2Header, Gtp2Message};
+            let mut m = Gtp2Message::new(Gtp2Header::new(
+                gtp2_message_type::DELETE_BEARER_COMMAND,
+                pgw_c_teid,
+                seq,
+            ));
+            let mut bc = Gtp2BearerContextIe::new();
+            bc.set_ebi(6);
+            m.add_bearer_context(0, &bc);
+            m.encode()
+        };
+        let brc = s5c_bearer_resource_command(0x807e, pgw_c_teid, 6, 4, &tad, None);
+        sgw.send_to(&brc, server.local_addr()).await.expect("send");
+        let (ubr, _) = recv_type(&sgw, gtp2_message_type::UPDATE_BEARER_REQUEST).await;
+        sgw.send_to(&dbc(0x807f), server.local_addr())
+            .await
+            .expect("send");
+        let (dbr, _) = recv_type(&sgw, gtp2_message_type::DELETE_BEARER_REQUEST).await;
+        upf.clear_seen();
+        // The modification is accepted while the Delete Bearer Request is outstanding.
+        sgw.send_to(
+            &s5c_bearer_answer(
+                gtp2_message_type::UPDATE_BEARER_RESPONSE,
+                ubr.header.sequence_number,
+                pgw_c_teid,
+                6,
+                16,
+            ),
+            server.local_addr(),
+        )
+        .await
+        .expect("send");
+        let sgw_addr = sgw.local_addr().unwrap();
+        for _ in 0..400 {
+            if server.command_ended(sgw_addr, 0x807e) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let stored_meanwhile: Vec<String> = stored_filters_of(sess.id, 6)
+            .into_iter()
+            .map(|(_, _, f)| f)
+            .collect();
+        let upf_meanwhile = upf.modification_bodies().len();
+        // A second Delete Bearer Command for the same bearer, under another number.
+        sgw.send_to(&dbc(0x8080), server.local_addr())
+            .await
+            .expect("send");
+        let mut buf = vec![0u8; 4096];
+        let second = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            sgw.recv_from(&mut buf),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .and_then(|(len, _)| crate::gtp_handler::tests::message_type_of(&buf[..len]));
+        sgw.send_to(
+            &s5c_bearer_answer(
+                gtp2_message_type::DELETE_BEARER_RESPONSE,
+                dbr.header.sequence_number,
+                pgw_c_teid,
+                6,
+                16,
+            ),
+            server.local_addr(),
+        )
+        .await
+        .expect("send");
+        for _ in 0..400 {
+            if server.command_ended(sgw_addr, 0x807f) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let gone = stored_bearer(sess.id, 6).await.is_none();
+        server.close();
+
+        assert!(
+            !stored_meanwhile.iter().any(|f| f == VIDEO_DL),
+            "the late modification stored nothing: {stored_meanwhile:?}"
+        );
+        assert_eq!(upf_meanwhile, 0, "nor changed the PGW-U");
+        assert_ne!(
+            second,
+            Some(gtp2_message_type::DELETE_BEARER_REQUEST),
+            "no second Delete Bearer Request"
+        );
+        assert!(gone, "the bearer is deleted once");
+    }
+
+    /// The GTPv2-C message type of an encoded message.
+    pub(crate) fn message_type_of(raw: &[u8]) -> Option<u8> {
+        raw.get(1).copied()
+    }
+
     /// #619: an Update Bearer Request the SGW-C refuses (the MME or the UE did), or one
     /// it never answers, leaves the bearer as it was: its QoS, its filters, and no
     /// PGW-U change.
