@@ -142,9 +142,12 @@ without the EBS CSI driver (no gp3 StorageClass), the PVC stays Pending and
 mongodb never starts; deploy with `EPHEMERAL_STORAGE=true` (an emptyDir, so
 the subscriber data does not survive mongodb-0 being recreated).
 
-`PROFILE=epc ./e2e-internet.sh` checks, from the logs, S1 Setup, EMM-REGISTERED
-and the same default-bearer EBI on the UE and the MME, then the same ping / DNS /
-HTTPS / PGW-U counter steps as the 5G profile, on `lteuetun5`.
+`PROFILE=epc ./e2e-internet.sh` checks, from the logs, S1 Setup, EMM-REGISTERED,
+the same default-bearer EBI on the UE and the MME, and the same dedicated-bearer
+EBI on both (the PGW-C's local PCC rule `rtp` in `docker/rust/configs/epc/pgwc.yaml`:
+QCI 1 GBR, UDP port 5004, activated at every attach, #1336), then the same ping /
+DNS / HTTPS / PGW-U counter steps as the 5G profile, on `lteuetun5` (the default
+bearer: the rule's TFT matches none of that traffic).
 
 **Restarting a pod.** Deleting any one of the nine pods in the table below
 recovers with no manual restart; the next `e2e-internet.sh` passes. Measured on
