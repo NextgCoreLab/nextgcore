@@ -642,10 +642,22 @@ pub fn build_e_rab_modify_request(
     bearer: &MmeBearer,
     nas_pdu: &[u8],
 ) -> S1apResult<Vec<u8>> {
+    build_e_rab_modify_request_with_ambr(enb_ue, bearer, nas_pdu, None)
+}
+
+/// [`build_e_rab_modify_request`] with the UE-AMBR, when the modification
+/// changes it (an APN-AMBR change, TS 23.401 §5.4.2.1 step 4; TS 36.413
+/// §9.1.3.3 UE Aggregate Maximum Bit Rate, O).
+pub fn build_e_rab_modify_request_with_ambr(
+    enb_ue: &EnbUe,
+    bearer: &MmeBearer,
+    nas_pdu: &[u8],
+    ue_ambr: Option<UeAmbr>,
+) -> S1apResult<Vec<u8>> {
     crate::s1ap_gen::build_erab_modify_request(&ErabModifyRequest {
         mme_ue_s1ap_id: enb_ue.mme_ue_s1ap_id,
         enb_ue_s1ap_id: enb_ue.enb_ue_s1ap_id,
-        ue_ambr: None,
+        ue_ambr,
         erab_list: vec![ErabToBeModifiedItem {
             erab_id: bearer.ebi,
             erab_qos: erab_qos_from_bearer(bearer),

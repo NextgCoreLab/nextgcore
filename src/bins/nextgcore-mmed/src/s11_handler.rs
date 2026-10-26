@@ -1075,6 +1075,11 @@ pub fn dispatch_initial(raw: &[u8], msg_type: u8, sequence_number: u32, peer: So
         mt::CREATE_BEARER_REQUEST => {
             crate::bearer_activation::handle_create_bearer_request(raw, sequence_number, peer)
         }
+        // #641's Update half: TS 23.401 §5.4.2 / §5.4.3, network-initiated bearer
+        // modification. It was "not handled" and never answered.
+        mt::UPDATE_BEARER_REQUEST => {
+            crate::bearer_activation::handle_update_bearer_request(raw, sequence_number, peer)
+        }
         other => log::info!(
             "S11 initial message type={other} seq={sequence_number} from {peer} not handled: this \
              MME originates no procedure for it"
