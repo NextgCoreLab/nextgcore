@@ -399,6 +399,136 @@ fn encoded(pdu: &g::SBC_AP_PDU) -> Vec<Vec<u8>> {
     }
 }
 
+fn bits_of(value: u32, n: u8) -> bitvec::vec::BitVec<u8, bitvec::order::Msb0> {
+    let mut b = bitvec::vec::BitVec::from_slice(&(value << (32 - u32::from(n))).to_be_bytes());
+    b.truncate(usize::from(n));
+    b
+}
+
+fn to_global_enb(id: &nextgcore_s1ap::GlobalEnbId) -> g::Global_ENB_ID {
+    use nextgcore_s1ap::EnbId;
+    let bits = bits_of(id.enb_id.value(), id.enb_id.bit_len());
+    g::Global_ENB_ID {
+        plm_nidentity: g::TBCD_STRING(id.plmn_identity.to_vec()),
+        enb_id: match id.enb_id {
+            EnbId::Macro(_) => g::ENB_ID::MacroENB_ID(g::ENB_ID_macroENB_ID(bits)),
+            EnbId::Home(_) => g::ENB_ID::HomeENB_ID(g::ENB_ID_homeENB_ID(bits)),
+            EnbId::ShortMacro(_) => g::ENB_ID::Short_macroENB_ID(g::ENB_ID_short_macroENB_ID(bits)),
+            EnbId::LongMacro(_) => g::ENB_ID::Long_macroENB_ID(g::ENB_ID_long_macroENB_ID(bits)),
+        },
+        ie_extensions: None,
+    }
+}
+
+fn to_ecgi(c: &nextgcore_s1ap::EutranCgi) -> g::EUTRAN_CGI {
+    g::EUTRAN_CGI {
+        plm_nidentity: g::TBCD_STRING(c.plmn_identity.to_vec()),
+        cell_id: g::CellIdentity(bits_of(c.cell_identity, 28)),
+        ie_extensions: None,
+    }
+}
+
+fn to_wire_tai(t: &nextgcore_s1ap::Tai) -> g::TAI {
+    g::TAI {
+        plm_nidentity: g::TBCD_STRING(t.plmn_identity.to_vec()),
+        tac: g::TAC(t.tac.to_be_bytes().to_vec()),
+        ie_extensions: None,
+    }
+}
+
+/// The SBc-AP PWS RESTART INDICATION for an eNB's (TS 29.168 §4.3.3E.2,
+/// Table 4.3.4.2.7-1): its Global eNB ID, E-CGI List for Restart (the
+/// Restarted-Cell-List), TAI List for Restart and, when the eNB sent one, its
+/// Emergency Area ID List for Restart, copied.
+pub fn pws_restart_indication(msg: &crate::s1ap_gen::PwsRestartIndication) -> Option<Vec<u8>> {
+    use g::PWS_Restart_IndicationProtocolIEs_EntryValue as V;
+    let entry = |id: u16, value: V| g::PWS_Restart_IndicationProtocolIEs_Entry {
+        id: g::ProtocolIE_ID(id),
+        criticality: g::Criticality(g::Criticality::REJECT),
+        value,
+    };
+    let mut ies = vec![
+        entry(
+            30,
+            V::Id_Restarted_Cell_List(g::Restarted_Cell_List(
+                msg.ecgi_list.iter().map(to_ecgi).collect(),
+            )),
+        ),
+        entry(28, V::Id_Global_ENB_ID(to_global_enb(&msg.global_enb_id))),
+        entry(
+            31,
+            V::Id_List_of_TAIs_Restart(g::List_of_TAIs_Restart(
+                msg.tai_list
+                    .iter()
+                    .map(|t| g::List_of_TAIs_Restart_Entry {
+                        tai: to_wire_tai(t),
+                    })
+                    .collect(),
+            )),
+        ),
+    ];
+    if !msg.emergency_area_ids.is_empty() {
+        ies.push(entry(
+            32,
+            V::Id_List_of_EAIs_Restart(g::List_of_EAIs_Restart(
+                msg.emergency_area_ids
+                    .iter()
+                    .map(|e| g::Emergency_Area_ID(e.clone()))
+                    .collect(),
+            )),
+        ));
+    }
+    indication(
+        procedure::PWS_RESTART_INDICATION,
+        g::InitiatingMessageValue::Id_PWS_Restart_Indication(g::PWS_Restart_Indication {
+            protocol_i_es: g::PWS_Restart_IndicationProtocolIEs(ies),
+            protocol_extensions: None,
+        }),
+    )
+}
+
+/// The SBc-AP PWS FAILURE INDICATION for an eNB's (TS 29.168 §4.3.3F.2,
+/// Table 4.3.4.2.8-1): its Global eNB ID and failed cells, copied.
+pub fn pws_failure_indication(msg: &crate::s1ap_gen::PwsFailureIndication) -> Option<Vec<u8>> {
+    use g::PWS_Failure_IndicationProtocolIEs_EntryValue as V;
+    let entry = |id: u16, value: V| g::PWS_Failure_IndicationProtocolIEs_Entry {
+        id: g::ProtocolIE_ID(id),
+        criticality: g::Criticality(g::Criticality::REJECT),
+        value,
+    };
+    indication(
+        procedure::PWS_FAILURE_INDICATION,
+        g::InitiatingMessageValue::Id_PWS_Failure_Indication(g::PWS_Failure_Indication {
+            protocol_i_es: g::PWS_Failure_IndicationProtocolIEs(vec![
+                entry(
+                    33,
+                    V::Id_Failed_Cell_List(g::Failed_Cell_List(
+                        msg.failed_ecgi_list.iter().map(to_ecgi).collect(),
+                    )),
+                ),
+                entry(28, V::Id_Global_ENB_ID(to_global_enb(&msg.global_enb_id))),
+            ]),
+            protocol_extensions: None,
+        }),
+    )
+}
+
+/// A Class 2 message of the MME's (criticality ignore, Table 4.3.4.2.7-1).
+fn indication(code: u8, value: g::InitiatingMessageValue) -> Option<Vec<u8>> {
+    let pdu = g::SBC_AP_PDU::InitiatingMessage(g::InitiatingMessage {
+        procedure_code: g::ProcedureCode(code),
+        criticality: g::Criticality(g::Criticality::IGNORE),
+        value,
+    });
+    match nextgcore_sbcap_gen::encode(&pdu) {
+        Ok(b) => Some(b),
+        Err(e) => {
+            log::error!("SBc-AP indication {code} did not encode: {e:?}");
+            None
+        }
+    }
+}
+
 /// Handle one SBc-AP PDU from a CBC; returns the PDUs to send back on its
 /// association.
 pub fn handle_sbcap_pdu(ctx: &MmeContext, bytes: &[u8]) -> Vec<Vec<u8>> {
@@ -846,6 +976,100 @@ mod tests {
             panic!("an S1AP KILL REQUEST");
         };
         assert!(kill.kill_all_warning_messages);
+    }
+
+    fn restart_msg(eais: bool) -> crate::s1ap_gen::PwsRestartIndication {
+        crate::s1ap_gen::PwsRestartIndication {
+            global_enb_id: nextgcore_s1ap::GlobalEnbId {
+                plmn_identity: PLMN,
+                enb_id: nextgcore_s1ap::EnbId::Home(0x0ab_cdef),
+            },
+            ecgi_list: vec![nextgcore_s1ap::EutranCgi {
+                plmn_identity: PLMN,
+                cell_identity: 0x0abc_def1,
+            }],
+            tai_list: vec![nextgcore_s1ap::Tai {
+                plmn_identity: PLMN,
+                tac: 7,
+            }],
+            emergency_area_ids: if eais {
+                vec![vec![1, 2, 3]]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    /// TS 29.168 §4.3.3E.2 / Table 4.3.4.2.7-1: the eNB's Global eNB ID, its E-CGI
+    /// List for Restart, TAI List for Restart and (when sent) Emergency Area ID
+    /// List for Restart are copied into the SBc-AP PWS-Restart-Indication
+    /// (procedure 5, criticality ignore; every IE reject).
+    #[test]
+    fn a_pws_restart_indication_copies_what_the_enb_sent() {
+        use g::PWS_Restart_IndicationProtocolIEs_EntryValue as V;
+        for eais in [true, false] {
+            let bytes = pws_restart_indication(&restart_msg(eais)).unwrap();
+            let g::SBC_AP_PDU::InitiatingMessage(m) = nextgcore_sbcap_gen::decode(&bytes).unwrap()
+            else {
+                panic!("an initiating message");
+            };
+            assert_eq!(m.procedure_code.0, 5);
+            assert_eq!(m.criticality.0, g::Criticality::IGNORE);
+            let g::InitiatingMessageValue::Id_PWS_Restart_Indication(r) = m.value else {
+                panic!("a PWS-Restart-Indication");
+            };
+            let mut seen = Vec::new();
+            for e in r.protocol_i_es.0 {
+                assert_eq!(e.criticality.0, g::Criticality::REJECT);
+                seen.push(e.id.0);
+                match e.value {
+                    V::Id_Restarted_Cell_List(l) => {
+                        assert_eq!(ecgi_of(&l.0[0]).unwrap().cell_identity, 0x0abc_def1)
+                    }
+                    V::Id_Global_ENB_ID(id) => assert_eq!(
+                        global_enb_of(&id).unwrap().1,
+                        nextgcore_s1ap::EnbId::Home(0x0ab_cdef)
+                    ),
+                    V::Id_List_of_TAIs_Restart(l) => assert_eq!(l.0[0].tai.tac.0, vec![0, 7]),
+                    V::Id_List_of_EAIs_Restart(l) => assert_eq!(l.0[0].0, vec![1, 2, 3]),
+                }
+            }
+            let mut want = vec![30, 28, 31];
+            if eais {
+                want.push(32);
+            }
+            assert_eq!(seen, want);
+        }
+    }
+
+    /// TS 29.168 §4.3.3F.2: the failed cells and the Global eNB ID are copied.
+    #[test]
+    fn a_pws_failure_indication_copies_what_the_enb_sent() {
+        let msg = crate::s1ap_gen::PwsFailureIndication {
+            global_enb_id: nextgcore_s1ap::GlobalEnbId {
+                plmn_identity: PLMN,
+                enb_id: nextgcore_s1ap::EnbId::Macro(0x1234),
+            },
+            failed_ecgi_list: vec![nextgcore_s1ap::EutranCgi {
+                plmn_identity: PLMN,
+                cell_identity: 0x0123_4501,
+            }],
+        };
+        let bytes = pws_failure_indication(&msg).unwrap();
+        let g::SBC_AP_PDU::InitiatingMessage(m) = nextgcore_sbcap_gen::decode(&bytes).unwrap()
+        else {
+            panic!("an initiating message");
+        };
+        assert_eq!(m.procedure_code.0, 6);
+        let g::InitiatingMessageValue::Id_PWS_Failure_Indication(f) = m.value else {
+            panic!("a PWS-Failure-Indication");
+        };
+        use g::PWS_Failure_IndicationProtocolIEs_EntryValue as V;
+        let ies: Vec<_> = f.protocol_i_es.0.into_iter().map(|e| e.value).collect();
+        assert!(matches!(&ies[0], V::Id_Failed_Cell_List(l)
+            if ecgi_of(&l.0[0]).unwrap().cell_identity == 0x0123_4501));
+        assert!(matches!(&ies[1], V::Id_Global_ENB_ID(id)
+            if global_enb_of(id).unwrap().1 == nextgcore_s1ap::EnbId::Macro(0x1234)));
     }
 
     /// A PWS RESTART INDICATION is the MME's to send: from a CBC it is answered

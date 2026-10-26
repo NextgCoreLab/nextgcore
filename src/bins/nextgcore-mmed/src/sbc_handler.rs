@@ -1035,6 +1035,8 @@ mod tests {
     #[test]
     fn a_pws_restart_indication_through_the_s1ap_dispatch_is_accepted_and_counted() {
         let _guard = crate::gtp_path::lock_s11();
+        // The indication is relayed to whichever SBc-AP server is bound (#1071).
+        let _sbcap = crate::sbcap_path::SERVER_TEST_LOCK.blocking_lock();
         let ctx = crate::context::mme_self();
         let pool_id = add_setup_enb(ctx, "127.0.0.1:36468", 0x10680);
         let mut warning = etws_warning();
@@ -1151,6 +1153,8 @@ mod tests {
     #[test]
     fn a_pws_failure_indication_through_the_s1ap_dispatch_is_accepted_and_counted() {
         let _guard = crate::gtp_path::lock_s11();
+        // The indication is relayed to whichever SBc-AP server is bound (#1071).
+        let _sbcap = crate::sbcap_path::SERVER_TEST_LOCK.blocking_lock();
         let ctx = crate::context::mme_self();
         let pool_id = add_setup_enb(ctx, "127.0.0.1:36470", 0x10720);
         let other = add_setup_enb(ctx, "127.0.0.1:36471", 0x10721);
