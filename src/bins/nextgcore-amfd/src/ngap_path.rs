@@ -12156,19 +12156,20 @@ impl NgapServer {
         // No `nfId` filter: there is no originating transfer to have named one, so
         // any PWS-RF/PWS subscriber is a legitimate recipient of a node-raised
         // indication.
-        let subscription = {
+        // #686, TS 23.527 §7.3: every CBC, not one of them.
+        let recipients = {
             let ctx = crate::context::amf_self();
             let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
-            guard.non_ue_n2_subscription_find_by_class("PWS-RF", None)
+            guard.non_ue_n2_indication_recipients()
         };
-        let Some(sub) = subscription else {
+        if recipients.is_empty() {
             log::warn!(
                 "PWS indication (procedure {procedure_code:?}) from association \
                  {association_id} has no PWS-RF/PWS subscription; dropped (no ErrorIndication \
                  sent -- the indication is a class-2 procedure the AMF never answers)"
             );
             return Ok(());
-        };
+        }
 
         let ran_node_id = match &global_ran_node_id {
             nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId {
@@ -12198,28 +12199,30 @@ impl NgapServer {
         // `29518-k00.txt:19119-19121`: "The Message Type shall be present and
         // encoded as the first N2 PWS Indication IE ... to enable the receiver to
         // decode the N2 PWS IEs" — and the Message Type is in the container.
-        log::info!(
-            "PWS: forwarding a procedure-{} indication to consumer (sub={}, class={})",
-            procedure_code.unwrap_or(0),
-            sub.subscription_id,
-            sub.n2_information_class,
-        );
-        crate::namf_server::send_non_ue_n2_info_notify(
-            sub.n2_notify_callback_uri,
-            sub.subscription_id,
-            sub.n2_information_class,
-            0,
-            0,
-            ran_node_id,
-            // `bcEmptyAreaList` is about a RESPONSE that omitted its area list
-            // (§5.2.2.4.4.3 item 1). An indication has no area list to omit, so
-            // setting it here would assert something the spec never scopes to
-            // this event.
-            false,
-            None,
-            sub.notif_correlation_id,
-            data.to_vec(),
-        );
+        for sub in recipients {
+            log::info!(
+                "PWS: forwarding a procedure-{} indication to consumer (sub={}, class={})",
+                procedure_code.unwrap_or(0),
+                sub.subscription_id,
+                sub.n2_information_class,
+            );
+            crate::namf_server::send_non_ue_n2_info_notify(
+                sub.n2_notify_callback_uri,
+                sub.subscription_id,
+                sub.n2_information_class,
+                0,
+                0,
+                ran_node_id.clone(),
+                // `bcEmptyAreaList` is about a RESPONSE that omitted its area list
+                // (§5.2.2.4.4.3 item 1). An indication has no area list to omit, so
+                // setting it here would assert something the spec never scopes to
+                // this event.
+                false,
+                None,
+                sub.notif_correlation_id,
+                data.to_vec(),
+            );
+        }
         Ok(())
     }
 
@@ -25126,6 +25129,82 @@ mod tests {
                 .is_err(),
             "with no subscription the AMF must not invent a consumer"
         );
+    }
+
+    /// **#686, TS 23.527 §7.3:** "If the AMF interfaces with multiple CBCs, the AMF shall
+    /// forward the PWS Restart Indication to all CBCs". Two CBCs subscribed; each gets
+    /// the indication once. CBC A also holds a `PWS` subscription beside its `PWS-RF`
+    /// one, and still gets a single copy, on `PWS-RF`.
+    ///
+    /// REVERT-VERIFIED: with the single-subscription lookup, CBC B never receives it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_pws_restart_indication_reaches_every_cbc() {
+        let _ctx_guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let (_a, uri_a, mut rx_a) = start_pws_notify_sink().await;
+        let (_b, uri_b, mut rx_b) = start_pws_notify_sink().await;
+        let subs = [
+            add_pws_subscription("PWS", &uri_a, Some("cbc-686-a"), "sub-686-a-pws"),
+            add_pws_subscription("PWS-RF", &uri_a, Some("cbc-686-a"), "sub-686-a-rf"),
+            add_pws_subscription("PWS-RF", &uri_b, Some("cbc-686-b"), "sub-686-b-rf"),
+        ];
+        let association_id = 6_864u64;
+        insert_pws_test_gnb(
+            &ngap,
+            association_id,
+            0x686,
+            crate::context::RatType::Nr,
+            &[("001", "01", 0x74)],
+        )
+        .await;
+        let restart = nextgcore_ngap::builder::build_pws_restart_indication(
+            &nextgcore_ngap::types::PwsRestartIndication {
+                cell_list: nextgcore_ngap::types::PwsCellList::Nr(vec![
+                    nextgcore_ngap::types::NrCgi {
+                        plmn_identity: [0x00, 0xF1, 0x10],
+                        nr_cell_identity: 0x686,
+                    },
+                ]),
+                global_ran_node_id: nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId {
+                    plmn_identity: [0x00, 0xF1, 0x10],
+                    gnb_id: 0x686,
+                    gnb_id_len: 32,
+                },
+                tai_list_for_restart: vec![nextgcore_ngap::types::TaiListItem {
+                    tai_plmn: [0x00, 0xF1, 0x10],
+                    tai_tac: [0x00, 0x00, 0x74],
+                }],
+                emergency_area_id_list_for_restart: Vec::new(),
+            },
+        )
+        .expect("build PWS RESTART INDICATION");
+        ngap.process_ngap_message(association_id, &restart)
+            .await
+            .expect("dispatch");
+
+        for (cbc, rx) in [("A", &mut rx_a), ("B", &mut rx_b)] {
+            let (_uri, body) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("CBC {cbc} gets the restart indication"))
+                .expect("channel");
+            let json: serde_json::Value = serde_json::from_str(&body).expect("json");
+            assert_eq!(
+                json["n2InfoContainer"]["n2InformationClass"].as_str(),
+                Some("PWS-RF"),
+                "CBC {cbc}"
+            );
+        }
+        // A second copy would arrive at once; the bound is well above loopback latency.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), rx_a.recv())
+                .await
+                .is_err(),
+            "CBC A gets one copy, not one per subscription"
+        );
+        for sub in subs {
+            drop_pws_subscription(&sub);
+        }
     }
 
     /// The two INDICATIONS (procedures 34 and 33) notify on `PWS-RF`, unconditionally
