@@ -865,13 +865,13 @@ impl S5S8Server {
     /// (Create/Update/Delete Bearer) get T3 x (N3 + 1) = 60 s, beyond the SGW's
     /// 54 s S11 transaction (#1228, TS 29.274 §7.6; `nextgcore_gtp::v2::xact`).
     pub async fn open_pgw(bind: SocketAddr, restart_counter: u8) -> Result<Arc<Self>, String> {
-        use nextgcore_gtp::v2::xact::{BEARER_PROCEDURE_REQUESTS, PGW_BEARER_PROCEDURE_N3};
+        use nextgcore_gtp::v2::xact::{BEARER_PROCEDURE_REQUESTS, PGW_BEARER_PROCEDURE_T3};
         let server = Self::open(bind, restart_counter).await?;
         server
             .xact
             .lock()
             .await
-            .set_n3_for(&BEARER_PROCEDURE_REQUESTS, PGW_BEARER_PROCEDURE_N3);
+            .set_t3_for(&BEARER_PROCEDURE_REQUESTS, PGW_BEARER_PROCEDURE_T3);
         Ok(server)
     }
 
@@ -1454,9 +1454,9 @@ mod tests {
     use super::*;
 
     /// #1228: the process's S5/S8 server gives the paging-dependent bearer
-    /// Requests their own N3 (60 s at the default T3); others keep the default.
+    /// Requests their own T3 (60 s at the default N3); others keep the default.
     #[tokio::test]
-    async fn the_s5s8_server_gives_bearer_requests_their_own_n3() {
+    async fn the_s5s8_server_gives_bearer_requests_their_own_t3() {
         let server = S5S8Server::open_pgw("127.0.0.1:0".parse().unwrap(), 3)
             .await
             .unwrap();
@@ -1467,9 +1467,12 @@ mod tests {
                 gtp2_message_type::UPDATE_BEARER_REQUEST,
                 gtp2_message_type::DELETE_BEARER_REQUEST,
             ] {
-                assert_eq!(xact.n3_for(t), 19, "type {t}");
+                assert_eq!(xact.t3_for(t), Duration::from_secs(15), "type {t}");
             }
-            assert_eq!(xact.n3_for(gtp2_message_type::ECHO_REQUEST), 3);
+            assert_eq!(
+                xact.t3_for(gtp2_message_type::ECHO_REQUEST),
+                Duration::from_secs(3)
+            );
         }
         server.running.store(false, Ordering::SeqCst);
     }
