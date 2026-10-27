@@ -176,8 +176,28 @@ UE_IP="$(dbg sh -c "ip -4 -o addr show dev ${TUN} | awk '{print \$4}' | cut -d/ 
   || die "no IPv4 address on ${TUN} in ${UE_POD} (interfaces: $(dbg sh -c "ip -o link show | awk -F': ' '{print \$2}' | tr '\n' ' '")): is the PDU session up?"
 echo "UE IP on ${TUN}: ${UE_IP}"
 
+# The PROFILE=6g PFCP capture container this run created on the smf pod, if any
+# (stopped by cleanup unless the caller set CAPTURE_TTL to keep it).
+CAP_CREATED=""
+CAP_POD=""
+
+# shellcheck disable=SC2317  # invoked by the EXIT trap
+stop_capture() {
+  [[ -n "${CAP_CREATED}" ]] || return 0
+  # The container shares the smf pod's process namespace (--target=smf), so its
+  # PID 1 is not its own: kill exactly the sleep it recorded at start.
+  # shellcheck disable=SC2016  # expanded by the container's shell
+  if "${KUBECTL[@]}" exec "${CAP_POD}" -c "${CAP_CREATED}" -- \
+       sh -c 'kill "$(cat /tmp/e2e-capture.pid)"' >/dev/null 2>&1; then
+    echo "capture container ${CAP_CREATED} stopped"
+  else
+    echo "WARN could not stop capture container ${CAP_CREATED} on ${CAP_POD}; it exits by itself after ${CAPTURE_TTL} s" >&2
+  fi
+}
+
 # shellcheck disable=SC2317  # invoked by the EXIT trap
 cleanup() {
+  stop_capture
   dbg sh -c "ip rule del from ${UE_IP} lookup ${RT_TABLE} priority ${RT_TABLE} 2>/dev/null; \
              ip route flush table ${RT_TABLE} 2>/dev/null; true" >/dev/null 2>&1 \
     && echo "policy route removed" \
@@ -280,11 +300,22 @@ if [[ "${PROFILE}" == 6g ]]; then
   # the SMF pod for two heartbeat periods (the UPF sends one every 10 s).
   #
   # The capture has to run in the smf pod's network namespace, so it is an
-  # ephemeral container, which Kubernetes never removes. One is REUSED while it
-  # runs (CAPTURE_TTL, a day by default), so repeated runs add one per day per
-  # smf pod rather than one per run (#1333 review); a rollout clears them.
+  # ephemeral container, which Kubernetes never removes (a rollout clears them).
+  # A NET_ADMIN container should not outlive the run that needed it (#1329
+  # review): its `sleep` lasts CAPTURE_TTL s, by default one validation run
+  # (1800 s), and the EXIT trap stops it when this run created it. A caller that
+  # sets CAPTURE_TTL explicitly asks for it to outlive the run, so it is kept
+  # until then, and a capture container still running is REUSED within its TTL
+  # rather than adding another (#1333 review).
   SMF_POD="$(running_pod app.kubernetes.io/name=smf)"
-  CAPTURE_TTL="${CAPTURE_TTL:-86400}"
+  if [[ -n "${CAPTURE_TTL:-}" ]]; then
+    CAPTURE_KEEP=true
+  else
+    CAPTURE_KEEP=false
+    CAPTURE_TTL=1800
+  fi
+  [[ "${CAPTURE_TTL}" =~ ^[1-9][0-9]*$ ]] \
+    || die "CAPTURE_TTL must be a whole number of seconds (got '${CAPTURE_TTL}')"
   CAP="$("${KUBECTL[@]}" get pod "${SMF_POD}" -o json 2>/dev/null | python3 -c '
 import json, sys
 st = json.load(sys.stdin).get("status", {}).get("ephemeralContainerStatuses", [])
@@ -297,8 +328,13 @@ print(up[0] if up else "")' 2>/dev/null)"
   elif [[ -n "${SMF_POD}" ]]; then
     CAP="e2e-6g-pfcp-$(date +%s)"
     "${KUBECTL[@]}" debug "${SMF_POD}" --target=smf --profile=netadmin \
-      --image="${DEBUG_IMAGE}" --container="${CAP}" -- sleep "${CAPTURE_TTL}" >/dev/null 2>&1 \
+      --image="${DEBUG_IMAGE}" --container="${CAP}" -- \
+      sh -c "echo \$\$ > /tmp/e2e-capture.pid; exec sleep ${CAPTURE_TTL}" >/dev/null 2>&1 \
       && attached=true
+    if "${attached}" && ! "${CAPTURE_KEEP}"; then
+      CAP_CREATED="${CAP}"
+      CAP_POD="${SMF_POD}"
+    fi
   fi
   if "${attached}"; then
     for _ in $(seq 1 60); do
