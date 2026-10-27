@@ -569,16 +569,19 @@ fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serd
         .unwrap_or(false);
     let services = nwdaf_services(nf_instance_id, sbi_addr, sbi_port, can_provision);
 
-    serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "NWDAF",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": services,
-        "nwdafInfo": nwdaf_info,
-        "allowedNfTypes": ["AMF", "SMF", "PCF", "NEF", "SCP"],
-        "heartBeatTimer": 10
-    })
+    nextgcore_sbi::nf_addressing::classify_profile_host(
+        serde_json::json!({
+            "nfInstanceId": nf_instance_id,
+            "nfType": "NWDAF",
+            "nfStatus": "REGISTERED",
+            "ipv4Addresses": [sbi_addr],
+            "nfServices": services,
+            "nwdafInfo": nwdaf_info,
+            "allowedNfTypes": ["AMF", "SMF", "PCF", "NEF", "SCP"],
+            "heartBeatTimer": 10
+        }),
+        sbi_addr,
+    )
 }
 
 /// Build TS 29.510 `NwdafInfo` for a set of supported analytics (issue #175).
@@ -704,20 +707,20 @@ async fn register_with_nrf(
                 nf_instance_id,
                 nextgcore_sbi::types::NfType::Nwdaf,
             );
-            self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
+            nextgcore_sbi::nf_addressing::set_instance_host(&mut self_instance, sbi_addr);
             let mut svc = nextgcore_sbi::context::NfService::new(
                 "nnwdaf-eventssubscription",
                 nextgcore_sbi::types::SbiServiceType::NnwdafEventssubscription,
             );
             svc.port = sbi_port;
-            svc.ip_addresses = vec![sbi_addr.to_string()];
+            nextgcore_sbi::nf_addressing::set_service_host(&mut svc, sbi_addr);
             self_instance.add_service(svc);
             let mut svc2 = nextgcore_sbi::context::NfService::new(
                 "nnwdaf-analyticsinfo",
                 nextgcore_sbi::types::SbiServiceType::NnwdafAnalyticsinfo,
             );
             svc2.port = sbi_port;
-            svc2.ip_addresses = vec![sbi_addr.to_string()];
+            nextgcore_sbi::nf_addressing::set_service_host(&mut svc2, sbi_addr);
             self_instance.add_service(svc2);
             sbi_ctx.set_self_instance(self_instance).await;
 
@@ -1570,5 +1573,23 @@ mod oauth2_h8_tests {
         assert_ne!(resp.status, 401, "valid token must not be 401");
         assert_ne!(resp.status, 403, "valid token must not be 403");
         server.stop().await.expect("stop");
+    }
+}
+
+/// #1324: the NFProfile carries its host where its type belongs (TS 29.510
+/// §6.1.6.2.2): IPv4 in ipv4Addresses, IPv6 in ipv6Addresses, an FQDN as fqdn, and
+/// the service ipEndPoints likewise.
+#[cfg(test)]
+mod tests_nf_profile_host_kind_1324 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_carries_its_host_by_type() {
+        for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
+            let profile = build_nf_profile("id", host, 7777);
+            let problems =
+                nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
+            assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
+        }
     }
 }

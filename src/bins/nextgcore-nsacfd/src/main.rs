@@ -2421,6 +2421,56 @@ fn emit_reports_for(s_nssai: &SNssai, cause: ReportCause<'_>) {
 /// single place to change.
 const NSACF_API_FULL_VERSION: &str = "1.3.0";
 
+/// The NSACF NFProfile (TS 29.510 §6.1.6.2.2) registered with the NRF; its host
+/// sits where its type belongs (#1324).
+fn build_nsacf_nf_profile(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+) -> serde_json::Value {
+    nextgcore_sbi::nf_addressing::classify_profile_host(
+        serde_json::json!({
+            "nfInstanceId": nf_instance_id,
+            "nfType": "NSACF",
+            "nfStatus": "REGISTERED",
+            "ipv4Addresses": [sbi_addr],
+            "nfServices": [{
+                "serviceInstanceId": format!("{}-nnsacf-nsac", nf_instance_id),
+                "serviceName": nextgcore_sbi::types::SbiServiceType::NnsacfNsac.to_name(),
+                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": NSACF_API_FULL_VERSION}],
+                "scheme": "http",
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
+                // nsacf-11: advertise SupportedFeatures with HNSAC/VHNSAC bits clear
+                // so consumers never expect home/visited delegation (ueAdmissionList).
+                "supportedFeatures": SUPPORTED_FEATURES,
+                // TS 29.510 §6.1.6.2.3: per-service scoping. NSAC is consumed by the
+                // AMF/SMF (and an SCP forwarding for them).
+                "allowedNfTypes": ["AMF", "SMF", "SCP"]
+            }, {
+                "serviceInstanceId": format!("{}-nnsacf-slice-ee", nf_instance_id),
+                // Named from the typed service enum rather than a literal, so the
+                // registered name cannot drift from the one consumers select by.
+                "serviceName": nextgcore_sbi::types::SbiServiceType::NnsacfSliceEe.to_name(),
+                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": NSACF_API_FULL_VERSION}],
+                "scheme": "http",
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
+                "supportedFeatures": SUPPORTED_FEATURES,
+                // #96: AF and DCCF added. TS 29.536 §5.3.2.2.2 names both among the
+                // legitimate Slice-EE consumers, and omitting them meant the NRF would
+                // not issue either a token scoped to this service.
+                "allowedNfTypes": ["NEF", "NWDAF", "AF", "DCCF", "SCP"]
+            }],
+            // The NF-level list is the UNION over the services: a consumer type barred
+            // here can never reach any of them.
+            "allowedNfTypes": ["AMF", "SMF", "SCP", "NEF", "NWDAF", "AF", "DCCF"],
+            "heartBeatTimer": 10
+        }),
+        sbi_addr,
+    )
+}
+
 /// Register NSACF with NRF
 async fn register_with_nrf(
     sbi_addr: &str,
@@ -2443,44 +2493,7 @@ async fn register_with_nrf(
     let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
 
-    let nf_profile = serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "NSACF",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": [{
-            "serviceInstanceId": format!("{}-nnsacf-nsac", nf_instance_id),
-            "serviceName": nextgcore_sbi::types::SbiServiceType::NnsacfNsac.to_name(),
-            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": NSACF_API_FULL_VERSION}],
-            "scheme": "http",
-            "nfServiceStatus": "REGISTERED",
-            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
-            // nsacf-11: advertise SupportedFeatures with HNSAC/VHNSAC bits clear
-            // so consumers never expect home/visited delegation (ueAdmissionList).
-            "supportedFeatures": SUPPORTED_FEATURES,
-            // TS 29.510 §6.1.6.2.3: per-service scoping. NSAC is consumed by the
-            // AMF/SMF (and an SCP forwarding for them).
-            "allowedNfTypes": ["AMF", "SMF", "SCP"]
-        }, {
-            "serviceInstanceId": format!("{}-nnsacf-slice-ee", nf_instance_id),
-            // Named from the typed service enum rather than a literal, so the
-            // registered name cannot drift from the one consumers select by.
-            "serviceName": nextgcore_sbi::types::SbiServiceType::NnsacfSliceEe.to_name(),
-            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": NSACF_API_FULL_VERSION}],
-            "scheme": "http",
-            "nfServiceStatus": "REGISTERED",
-            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
-            "supportedFeatures": SUPPORTED_FEATURES,
-            // #96: AF and DCCF added. TS 29.536 §5.3.2.2.2 names both among the
-            // legitimate Slice-EE consumers, and omitting them meant the NRF would
-            // not issue either a token scoped to this service.
-            "allowedNfTypes": ["NEF", "NWDAF", "AF", "DCCF", "SCP"]
-        }],
-        // The NF-level list is the UNION over the services: a consumer type barred
-        // here can never reach any of them.
-        "allowedNfTypes": ["AMF", "SMF", "SCP", "NEF", "NWDAF", "AF", "DCCF"],
-        "heartBeatTimer": 10
-    });
+    let nf_profile = build_nsacf_nf_profile(nf_instance_id, sbi_addr, sbi_port);
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     log::debug!("NRF registration: PUT {path}");
@@ -2500,13 +2513,13 @@ async fn register_with_nrf(
                 nf_instance_id,
                 nextgcore_sbi::types::NfType::Nsacf,
             );
-            self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
+            nextgcore_sbi::nf_addressing::set_instance_host(&mut self_instance, sbi_addr);
             let mut svc = nextgcore_sbi::context::NfService::new(
                 "nnsacf-nsac",
                 nextgcore_sbi::types::SbiServiceType::NnsacfNsac,
             );
             svc.port = sbi_port;
-            svc.ip_addresses = vec![sbi_addr.to_string()];
+            nextgcore_sbi::nf_addressing::set_service_host(&mut svc, sbi_addr);
             self_instance.add_service(svc);
             sbi_ctx.set_self_instance(self_instance).await;
 
@@ -5070,5 +5083,23 @@ nsacf:
         assert_eq!(resp.status, 405, "GET is not defined on this resource");
 
         with_nsacf_context(|c| c.subscription_remove("sub-96r"));
+    }
+}
+
+/// #1324: the NFProfile carries its host where its type belongs (TS 29.510
+/// §6.1.6.2.2): IPv4 in ipv4Addresses, IPv6 in ipv6Addresses, an FQDN as fqdn, and
+/// the service ipEndPoints likewise.
+#[cfg(test)]
+mod tests_nf_profile_host_kind_1324 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_carries_its_host_by_type() {
+        for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
+            let profile = build_nsacf_nf_profile("id", host, 7777);
+            let problems =
+                nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
+            assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
+        }
     }
 }

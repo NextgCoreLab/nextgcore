@@ -629,9 +629,10 @@ impl SbiClient {
                     .await
                     .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
 
+            let peer = addr.clone();
             tokio::spawn(async move {
                 if let Err(e) = conn.await {
-                    eprintln!("HTTP/2 TLS connection error: {e}");
+                    crate::conn_end::log_conn_end("SBI client HTTP/2 TLS", &peer, &e);
                 }
             });
 
@@ -644,9 +645,10 @@ impl SbiClient {
                     .await
                     .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
 
+            let peer = addr.clone();
             tokio::spawn(async move {
                 if let Err(e) = conn.await {
-                    eprintln!("HTTP/2 connection error: {e}");
+                    crate::conn_end::log_conn_end("SBI client HTTP/2", &peer, &e);
                 }
             });
 
@@ -3176,5 +3178,216 @@ mod tests {
              redialled and sent once: {:?}",
             res.err()
         );
+    }
+
+    // --- #1338: how a pooled connection's end is reported ---
+
+    /// A one-connection HTTP/2 peer that answers every request 200 until
+    /// `kill` fires, then drops the socket WITHOUT a GOAWAY. With `reset` the
+    /// socket has `SO_LINGER = 0`, so the drop is a TCP RST instead of a FIN.
+    async fn one_connection_peer(
+        reset: bool,
+    ) -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (kill, killed) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            if reset {
+                stream.set_linger(Some(Duration::ZERO)).unwrap();
+            }
+            let svc = hyper::service::service_fn(|_req: hyper::Request<Incoming>| async {
+                Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(Bytes::new())))
+            });
+            let conn =
+                hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), svc);
+            let mut conn = std::pin::pin!(conn);
+            tokio::select! {
+                _ = conn.as_mut() => {}
+                _ = killed => {
+                    // Keep reading for a moment first: closing a socket with
+                    // unread bytes (the client's trailing WINDOW_UPDATE) makes
+                    // Linux send RST, not FIN, and the "orderly close" test
+                    // would then see a reset.
+                    let _ = tokio::time::timeout(Duration::from_millis(200), conn.as_mut()).await;
+                } // then drop the connection: no GOAWAY
+            }
+        });
+        (addr, kill)
+    }
+
+    /// Watch the connection-end records for `peer`. The needle is
+    /// `"with <peer> "`, so port 4567 never matches 45678. A watch, not
+    /// `captured`: the shared capture buffer evicts under parallel trace output,
+    /// and that is what made these tests flake (#1360).
+    fn watch_conn_end(peer: &str) -> nextgcore_core::test_log::Watch {
+        nextgcore_core::test_log::watch(format!("with {peer} "))
+    }
+
+    /// The watch's records, once at least one has arrived (5 s budget).
+    async fn conn_end_records(watch: &nextgcore_core::test_log::Watch) -> Vec<String> {
+        crate::test_support::poll_until(Duration::from_secs(5), Duration::from_millis(20), || {
+            let found = watch.records();
+            async move { (!found.is_empty()).then_some(found) }
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// #1338: a peer that drops a pooled connection (EOF, no GOAWAY) is an
+    /// orderly close: `debug`, naming the peer. It used to be the bare stderr
+    /// line `HTTP/2 connection error: connection error`.
+    #[tokio::test]
+    async fn a_peer_closing_a_pooled_connection_is_logged_at_debug_with_the_peer() {
+        assert!(
+            nextgcore_core::test_log::init(),
+            "premise: the capture logger"
+        );
+        let (addr, kill) = one_connection_peer(false).await;
+        let peer = format!("127.0.0.1:{}", addr.port());
+        let watch = watch_conn_end(&peer);
+        let client = SbiClient::new(SbiClientConfig::new("127.0.0.1", addr.port()));
+        let res = client
+            .send_request(SbiRequest::get("/x"))
+            .await
+            .expect("served");
+        assert_eq!(res.status, 200);
+        let _ = kill.send(());
+
+        let records = conn_end_records(&watch).await;
+        assert_eq!(records.len(), 1, "one connection-end record: {records:?}");
+        assert!(
+            records[0].starts_with("DEBUG ")
+                && records[0].contains(&format!("SBI client HTTP/2 connection with {peer}"))
+                && records[0].contains("closed by peer"),
+            "{records:?}"
+        );
+    }
+
+    /// #1338: a genuine I/O error (the peer RESETS the connection) is `warn`,
+    /// naming the peer and the cause hyper's own `Display` leaves out.
+    #[tokio::test]
+    async fn a_reset_pooled_connection_is_logged_at_warn_with_the_peer_and_cause() {
+        assert!(
+            nextgcore_core::test_log::init(),
+            "premise: the capture logger"
+        );
+        let (addr, kill) = one_connection_peer(true).await;
+        let peer = format!("127.0.0.1:{}", addr.port());
+        let watch = watch_conn_end(&peer);
+        let client = SbiClient::new(SbiClientConfig::new("127.0.0.1", addr.port()));
+        let res = client
+            .send_request(SbiRequest::get("/x"))
+            .await
+            .expect("served");
+        assert_eq!(res.status, 200);
+        let _ = kill.send(());
+
+        let records = conn_end_records(&watch).await;
+        assert_eq!(records.len(), 1, "one connection-end record: {records:?}");
+        assert!(
+            records[0].starts_with("WARN ")
+                && records[0].contains(&format!("SBI client HTTP/2 connection with {peer} failed"))
+                && records[0].contains("reset"),
+            "{records:?}"
+        );
+    }
+
+    /// #1338: a server that stops gracefully sends GOAWAY(NO_ERROR) before it
+    /// closes; the client driver must not report that as a failure.
+    #[tokio::test]
+    async fn a_graceful_server_stop_is_not_logged_as_a_failure() {
+        assert!(
+            nextgcore_core::test_log::init(),
+            "premise: the capture logger"
+        );
+        let (server, addr) =
+            crate::test_support::sbi_server_on_free_port(|_req: SbiRequest| async {
+                SbiResponse::with_status(200)
+            })
+            .await;
+        let peer = format!("127.0.0.1:{}", addr.port());
+        let watch = watch_conn_end(&peer);
+        let client =
+            SbiClient::new(SbiClientConfig::new("127.0.0.1", addr.port()).with_pool_size(1));
+        let res = client
+            .send_request(SbiRequest::get("/x"))
+            .await
+            .expect("served");
+        assert_eq!(res.status, 200);
+        server.stop().await.expect("stop");
+
+        // The driver has seen the close once the pooled sender is no longer
+        // ready; only then is the absence of a WARN meaningful.
+        let closed = crate::test_support::poll_until(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || {
+                let pool = client.pool.clone();
+                async move {
+                    let slot = pool[0].lock().await;
+                    (!slot.as_ref().is_some_and(|s| s.sender.is_ready())).then_some(())
+                }
+            },
+        )
+        .await;
+        assert!(
+            closed.is_some(),
+            "premise: the client saw the server go away"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let records = watch.records();
+        assert!(
+            records.iter().all(|r| !r.starts_with("WARN ")),
+            "a GOAWAY(NO_ERROR) close is not a failure: {records:?}"
+        );
+    }
+
+    /// #1338, the other half of the root cause: nothing on the SBI path ends an
+    /// idle pooled connection. Neither end configures a hyper timer, so there is
+    /// no keep-alive ping or idle timeout to fire. Characterisation, not a
+    /// regression test: it passed before the fix too, and pins that the 7.5 s
+    /// churn was not the client or the server dropping an idle connection.
+    /// Idles past one full 7.5 s period.
+    #[tokio::test]
+    async fn an_idle_pooled_connection_to_the_sbi_server_stays_up_and_is_reused() {
+        assert!(
+            nextgcore_core::test_log::init(),
+            "premise: the capture logger"
+        );
+        let (server, addr) =
+            crate::test_support::sbi_server_on_free_port(|_req: SbiRequest| async {
+                SbiResponse::with_status(200)
+            })
+            .await;
+        let peer = format!("127.0.0.1:{}", addr.port());
+        let watch = watch_conn_end(&peer);
+        let client =
+            SbiClient::new(SbiClientConfig::new("127.0.0.1", addr.port()).with_pool_size(1));
+        let res = client
+            .send_request(SbiRequest::get("/x"))
+            .await
+            .expect("served");
+        assert_eq!(res.status, 200);
+
+        tokio::time::sleep(Duration::from_millis(8_000)).await;
+
+        {
+            let slot = client.pool[0].lock().await;
+            let state = slot.as_ref().expect("the slot holds a connection");
+            assert!(
+                state.sender.is_ready(),
+                "the idle connection is still usable"
+            );
+        }
+        let res = client
+            .send_request(SbiRequest::get("/x"))
+            .await
+            .expect("served");
+        assert_eq!(res.status, 200);
+        let ended = watch.records();
+        assert!(ended.is_empty(), "no connection to {peer} ended: {ended:?}");
+        server.stop().await.expect("stop");
     }
 }

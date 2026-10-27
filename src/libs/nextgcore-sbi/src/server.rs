@@ -397,10 +397,16 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
         let server_identity = self.server_identity.clone();
         let overload_reporter = self.overload_reporter.clone();
         let path = req.uri().path().to_string();
+        let method = req.method().as_str().to_string();
+        // #1334: every request this NF serves is counted, whichever branch below
+        // answers it (a size, body, or token rejection included); the probes are not.
+        let probe = path == "/health" || path == "/ready" || path == "/live";
+        let started = std::time::Instant::now();
+        let counted = (!probe).then(|| (method, path.clone()));
 
-        Box::pin(async move {
+        let serve = Box::pin(async move {
             // Health/readiness probe — handled before the NF handler
-            if path == "/health" || path == "/ready" || path == "/live" {
+            if probe {
                 let body = Full::new(Bytes::from(r#"{"status":"healthy"}"#));
                 return Ok(Response::builder()
                     .status(200)
@@ -532,6 +538,18 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
             );
 
             Ok(response)
+        });
+        Box::pin(async move {
+            let result: Result<Self::Response, Self::Error> = serve.await;
+            if let (Some((method, path)), Ok(response)) = (counted, &result) {
+                nextgcore_metrics::nf::record_sbi_request(
+                    &method,
+                    &path,
+                    response.status().as_u16(),
+                    started.elapsed(),
+                );
+            }
+            result
         })
     }
 }
@@ -955,6 +973,41 @@ enum ServerState {
     Running(RunningState),
 }
 
+/// First pause after an accept error (#1338).
+const ACCEPT_BACKOFF_BASE: Duration = Duration::from_millis(10);
+/// Longest pause after consecutive accept errors (#1338): at most one
+/// accept-failure warn per second while the error persists.
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+/// Capped exponential pause after consecutive accept errors (#1338).
+///
+/// `accept()` failing with EMFILE/ENFILE (out of file descriptors) fails again
+/// immediately, because the condition persists until some connection closes.
+/// The accept loop used to retry at once, so it spun on the CPU and wrote one
+/// warn per spin. This doubles the pause from [`ACCEPT_BACKOFF_BASE`] up to
+/// [`ACCEPT_BACKOFF_MAX`], and the next successful accept resets it, the same
+/// shape as the EMFILE handling in hyper's and tokio's accept-loop examples.
+#[derive(Debug, Default)]
+struct AcceptBackoff {
+    consecutive: u32,
+}
+
+impl AcceptBackoff {
+    fn on_success(&mut self) {
+        self.consecutive = 0;
+    }
+
+    /// Record one more failure and return how long to pause before the next
+    /// accept: 10 ms, 20 ms, 40 ms, ... capped at 1 s.
+    fn on_error(&mut self) -> Duration {
+        let pause = ACCEPT_BACKOFF_BASE
+            .saturating_mul(1u32 << self.consecutive.min(16))
+            .min(ACCEPT_BACKOFF_MAX);
+        self.consecutive = self.consecutive.saturating_add(1);
+        pause
+    }
+}
+
 /// Everything `stop()` needs to shut a running server down gracefully (#65).
 struct RunningState {
     /// Breaks the accept loop, so no NEW connection is taken.
@@ -1115,6 +1168,12 @@ impl SbiServer {
                 .map_err(|e| SbiError::ServerError(format!("Failed to bind: {e}")))?,
         };
 
+        // For the accept-failure log line (#1338); the configured address is
+        // `:0` for a test server, so ask the listener.
+        let local_addr = listener
+            .local_addr()
+            .map_or_else(|_| self.config.addr.to_string(), |a| a.to_string());
+
         let tls_acceptor = if self.config.scheme == UriScheme::Https {
             Some(self.build_tls_acceptor()?)
         } else {
@@ -1153,11 +1212,13 @@ impl SbiServer {
 
         // Spawn the server task
         tokio::spawn(async move {
+            let mut accept_backoff = AcceptBackoff::default();
             loop {
                 tokio::select! {
                     result = listener.accept() => {
                         match result {
-                            Ok((stream, _)) => {
+                            Ok((stream, peer)) => {
+                                accept_backoff.on_success();
                                 let handler_ref = handler.clone();
                                 let oauth_ref = oauth.clone();
                                 let http2_limits = http2_limits;
@@ -1236,12 +1297,16 @@ impl SbiServer {
                                                     http2_limits,
                                                     conn_graceful,
                                                     conn_drain,
-                                                    "HTTP/2 TLS",
+                                                    "SBI server HTTP/2 TLS",
+                                                    peer,
                                                 )
                                                 .await;
                                             }
                                             Err(e) => {
-                                                eprintln!("TLS accept error: {e}");
+                                                crate::conn_end::log_tls_accept_error(
+                                                    &peer.to_string(),
+                                                    &e,
+                                                );
                                             }
                                         }
                                     });
@@ -1264,12 +1329,25 @@ impl SbiServer {
                                         http2_limits,
                                         conn_graceful,
                                         conn_drain,
-                                        "HTTP/2",
+                                        "SBI server HTTP/2",
+                                        peer,
                                     ));
                                 }
                             }
                             Err(e) => {
-                                eprintln!("Accept error: {e}");
+                                // A persistent accept error (EMFILE/ENFILE, out of
+                                // fds) is returned again at once; without a pause
+                                // this loop spins and floods the log.
+                                let pause = accept_backoff.on_error();
+                                log::warn!(
+                                    "SBI server on {local_addr}: accept failed: {e} \
+                                     ({} in a row; pausing {pause:?})",
+                                    accept_backoff.consecutive
+                                );
+                                tokio::select! {
+                                    _ = tokio::time::sleep(pause) => {}
+                                    _ = &mut shutdown_rx => break,
+                                }
                             }
                         }
                     }
@@ -1371,6 +1449,7 @@ async fn serve_connection_gracefully<I, H>(
     mut graceful: watch::Receiver<bool>,
     drain_token: mpsc::Sender<()>,
     label: &'static str,
+    peer: SocketAddr,
 ) where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
     H: SbiRequestHandler,
@@ -1400,8 +1479,11 @@ async fn serve_connection_gracefully<I, H>(
             }
         }
     };
+    // #1338: this was `eprintln!("{label} connection error: {e}")`, and a
+    // kubelet `tcpSocket` probe (connect, close, no preface) printed it as the
+    // bare `HTTP/2 connection error: connection error` every 7.5 s in every NF.
     if let Err(e) = drained {
-        eprintln!("{label} connection error: {e}");
+        crate::conn_end::log_conn_end(label, &peer.to_string(), &e);
     }
     drop(drain_token);
 }
@@ -2190,6 +2272,83 @@ mod tests {
         server.stop().await.expect("value expected");
     }
 
+    /// #1334: every request the server answers is counted for `/metrics` by service,
+    /// operation template and status -- the handler's answers and the server's own
+    /// rejections (413 here) alike -- with no subscriber identifier in a label, and the
+    /// health probes are not counted.
+    ///
+    /// REVERT-VERIFIED: without the `record_sbi_request` call in `SbiService::call`
+    /// no `nnef-smcontext` series is rendered and the first assertion fails.
+    #[tokio::test]
+    async fn served_requests_are_counted_by_service_operation_and_status_1334() {
+        use crate::client::SbiClient;
+        let config = SbiServerConfig::default().with_max_request_body_size(64);
+        let (server, port) = start_test_server(config, |req: SbiRequest| async move {
+            if req.header.uri.contains("missing") {
+                SbiResponse::with_status(404)
+            } else {
+                SbiResponse::ok()
+            }
+        })
+        .await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        let supi = "imsi-001017777777777";
+        for (path, want) in [
+            (format!("/nnef-smcontext/v1/{supi}/am-data"), 200),
+            (format!("/nnef-smcontext/v1/{supi}/missing"), 404),
+        ] {
+            let r = client
+                .send_request(SbiRequest::get(&path))
+                .await
+                .expect("answered");
+            assert_eq!(r.status, want);
+        }
+        let big = "x".repeat(10_000);
+        let r = client
+            .send_request(SbiRequest::post("/nnef-smcontext/v1/echo").with_body(&big, "text/plain"))
+            .await
+            .expect("answered");
+        assert_eq!(r.status, 413);
+        let r = client
+            .send_request(SbiRequest::get("/health"))
+            .await
+            .expect("answered");
+        assert_eq!(r.status, 200);
+
+        let mut out = String::new();
+        nextgcore_metrics::nf::render_sbi(&mut out);
+        let value = |series: &str| nextgcore_metrics::nf::sample_value(&out, series);
+        assert_eq!(
+            value(
+                r#"nextgcore_sbi_request_total{service="nnef-smcontext",operation="GET {id}/am-data",status="200"}"#
+            ),
+            Some(1.0),
+            "{out}"
+        );
+        assert_eq!(
+            value(
+                r#"nextgcore_sbi_error_total{service="nnef-smcontext",operation="unmatched",status="404"}"#
+            ),
+            Some(1.0),
+            "{out}"
+        );
+        assert_eq!(
+            value(
+                r#"nextgcore_sbi_error_total{service="nnef-smcontext",operation="unmatched",status="413"}"#
+            ),
+            Some(1.0),
+            "the server's own rejection is counted too: {out}"
+        );
+        assert_eq!(
+            value(r#"nextgcore_sbi_request_duration_seconds_count{service="nnef-smcontext"}"#),
+            Some(3.0),
+            "{out}"
+        );
+        assert!(!out.contains("health"), "probes are not counted: {out}");
+        assert!(!out.contains("7777777777"), "no SUPI in a label: {out}");
+        server.stop().await.expect("stopped");
+    }
+
     // --- T1.3: handler panic guard ---
 
     #[tokio::test]
@@ -2796,5 +2955,221 @@ mod tests {
         assert_eq!(parsed.period_of_validity_secs, Some(75));
 
         server.stop().await.expect("stop");
+    }
+}
+
+/// #1338: a kubelet `tcpSocket` probe against the SBI port.
+#[cfg(test)]
+mod tcp_probe_tests {
+    use crate::message::{SbiRequest, SbiResponse};
+    use std::time::Duration;
+
+    /// The measured symptom, reproduced: a connection that is opened and closed
+    /// without an HTTP/2 preface -- exactly what a `tcpSocket` probe does, four
+    /// times per 30 s under the Helm chart's readiness (10 s) + liveness (30 s)
+    /// probes -- ended the server's connection task with h2's `UnexpectedEof`,
+    /// which was printed as the bare `HTTP/2 connection error: connection error`.
+    /// It is an orderly peer close: one `debug` record naming the prober.
+    #[tokio::test]
+    async fn a_tcp_probe_without_a_preface_is_logged_at_debug_with_the_prober() {
+        assert!(
+            nextgcore_core::test_log::init(),
+            "premise: the capture logger"
+        );
+        let (server, addr) =
+            crate::test_support::sbi_server_on_free_port(|_req: SbiRequest| async {
+                SbiResponse::with_status(200)
+            })
+            .await;
+
+        let probe = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("probe connects");
+        let prober = probe.local_addr().expect("probe address");
+        // A watch, registered before the close that logs: the shared capture
+        // buffer evicts under parallel trace output (#1360).
+        let watch = nextgcore_core::test_log::watch(format!("with {prober} "));
+        drop(probe); // FIN, no preface: a kubelet tcpSocket probe
+
+        let records = crate::test_support::poll_until(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || {
+                let found = watch.records();
+                async move { (!found.is_empty()).then_some(found) }
+            },
+        )
+        .await
+        .unwrap_or_default();
+        assert_eq!(records.len(), 1, "one connection-end record: {records:?}");
+        assert!(
+            records[0].starts_with("DEBUG ")
+                && records[0].contains(&format!("SBI server HTTP/2 connection with {prober}"))
+                && records[0].contains("closed by peer")
+                && records[0].contains("preface"),
+            "{records:?}"
+        );
+        server.stop().await.expect("stop");
+    }
+}
+
+/// #1338 follow-up: the `https` SBI port under a probe, and accept-error backoff.
+#[cfg(test)]
+mod accept_path_tests {
+    use super::{AcceptBackoff, ACCEPT_BACKOFF_MAX};
+    use crate::message::{SbiRequest, SbiResponse};
+    use crate::server::{SbiServer, SbiServerConfig};
+    use std::time::Duration;
+
+    /// The watch's records, once at least one has arrived (5 s budget).
+    async fn records_matching(watch: &nextgcore_core::test_log::Watch) -> Vec<String> {
+        crate::test_support::poll_until(Duration::from_secs(5), Duration::from_millis(20), || {
+            let found = watch.records();
+            async move { (!found.is_empty()).then_some(found) }
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// A self-signed `localhost` certificate and key, written as PEM into a
+    /// temporary directory that is removed when the returned guard drops.
+    /// Returns `(guard, key_path, cert_path)`.
+    fn self_signed_pem() -> (tempfile::TempDir, String, String) {
+        let key = rcgen::KeyPair::generate().expect("key");
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .expect("params")
+            .self_signed(&key)
+            .expect("self-signed cert");
+        let dir = tempfile::Builder::new()
+            .prefix("sbi-1338-tls-probe-")
+            .tempdir()
+            .expect("temp dir");
+        let key_path = dir.path().join("key.pem");
+        let cert_path = dir.path().join("cert.pem");
+        std::fs::write(&key_path, key.serialize_pem()).expect("write key");
+        std::fs::write(&cert_path, cert.pem()).expect("write cert");
+        (
+            dir,
+            key_path.to_string_lossy().into_owned(),
+            cert_path.to_string_lossy().into_owned(),
+        )
+    }
+
+    /// The production profile serves `https`, so a kubelet `tcpSocket` probe
+    /// there ends in the TLS accept, before HTTP/2 starts. A connect and close
+    /// with no ClientHello must be one `debug` record naming the prober, never a
+    /// `warn`: otherwise every TLS NF would warn every 7.5 s.
+    #[tokio::test]
+    async fn a_tcp_probe_on_a_tls_sbi_port_is_logged_at_debug_not_warn() {
+        assert!(
+            nextgcore_core::test_log::init(),
+            "premise: the capture logger"
+        );
+        let (_pem_dir, key, cert) = self_signed_pem();
+        let (server, addr) = crate::test_support::sbi_server_on_free_port_with(
+            |addr| SbiServerConfig::new(addr).with_tls(key, cert),
+            |_req: SbiRequest| async { SbiResponse::with_status(200) },
+        )
+        .await;
+
+        let probe = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("probe connects");
+        let prober = probe.local_addr().expect("probe address");
+        // A watch, registered before the close that logs: the shared capture
+        // buffer evicts under parallel trace output (#1360).
+        let watch = nextgcore_core::test_log::watch(format!("from {prober}"));
+        drop(probe); // FIN, no ClientHello: a kubelet tcpSocket probe
+
+        let records = records_matching(&watch).await;
+        assert_eq!(records.len(), 1, "one TLS-accept record: {records:?}");
+        assert!(
+            records[0].starts_with("DEBUG ")
+                && records[0].contains(&format!("SBI server TLS accept from {prober}"))
+                && records[0].contains("peer closed before the handshake"),
+            "a probe on an https port is an orderly close, not a warning: {records:?}"
+        );
+        server.stop().await.expect("stop");
+    }
+
+    /// The backoff sequence: doubling from 10 ms, capped at 1 s, reset by a
+    /// successful accept.
+    #[test]
+    fn accept_backoff_doubles_to_a_cap_and_resets_on_success() {
+        let mut b = AcceptBackoff::default();
+        let ms: Vec<u128> = (0..10).map(|_| b.on_error().as_millis()).collect();
+        assert_eq!(ms, [10, 20, 40, 80, 160, 320, 640, 1000, 1000, 1000]);
+        for _ in 0..100 {
+            assert_eq!(b.on_error(), ACCEPT_BACKOFF_MAX, "stays capped");
+        }
+        b.on_success();
+        assert_eq!(
+            b.on_error(),
+            Duration::from_millis(10),
+            "reset by a success"
+        );
+    }
+
+    /// Through the real accept loop: a listener whose read side is shut down
+    /// fails every `accept()` at once with EINVAL, as EMFILE would. With the
+    /// backoff it warns at about 0, 10, 30, 70, 150, 310, 630 and 1270 ms, so
+    /// eight times in 1.4 s, and is then inside a 1 s pause. Without the
+    /// backoff the loop spun: 464 warns in 500 ms when revert-checked.
+    #[tokio::test]
+    async fn persistent_accept_errors_are_paced_not_spun() {
+        assert!(
+            nextgcore_core::test_log::init(),
+            "premise: the capture logger"
+        );
+        let (listener, addr) = crate::test_support::bound_listener().into_parts();
+        socket2::SockRef::from(&listener)
+            .shutdown(std::net::Shutdown::Read)
+            .expect("shut the listener's read side");
+        // A watch, registered before the loop starts failing: the shared
+        // capture buffer evicts under parallel trace output, which once left a
+        // single record of eight in CI (#1342, #1360).
+        let watch = nextgcore_core::test_log::watch(format!("SBI server on {addr}: accept failed"));
+        let server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        server
+            .start(|_req: SbiRequest| async { SbiResponse::with_status(200) })
+            .await
+            .expect("start");
+
+        tokio::time::sleep(Duration::from_millis(1_400)).await;
+        let warns: Vec<String> = watch
+            .records()
+            .into_iter()
+            .filter(|r| r.starts_with("WARN "))
+            .collect();
+        let newest = warns
+            .last()
+            .cloned()
+            .expect("premise: accept() fails on a shut-down listener");
+        let in_a_row: u32 = newest
+            .split_once(" in a row")
+            .and_then(|(head, _)| head.rsplit_once(" ("))
+            .and_then(|(_, k)| k.parse().ok())
+            .unwrap_or_else(|| panic!("no '(k in a row' in {newest:?}"));
+        assert!(
+            in_a_row >= 2,
+            "premise: accept() keeps failing on a shut-down listener: {newest:?}"
+        );
+        assert!(
+            in_a_row <= 10,
+            "accept errors are paced, not spun: {in_a_row} errors in 1.4 s"
+        );
+        assert_eq!(
+            warns.len() as u32,
+            in_a_row,
+            "one warn per accept error, none lost: {warns:?}"
+        );
+
+        // stop() waits for the accept task to exit, and the task is now about
+        // 130 ms into a 1 s pause. The pause races the shutdown signal, so
+        // stop() returns at once instead of waiting out the pause.
+        tokio::time::timeout(Duration::from_millis(300), server.stop())
+            .await
+            .expect("stop() is not held up by the accept pause")
+            .expect("stop");
     }
 }

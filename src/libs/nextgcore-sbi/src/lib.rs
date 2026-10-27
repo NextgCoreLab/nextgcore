@@ -54,6 +54,7 @@ pub mod log_redact; // callback tokens never reach a log line (#940)
 pub mod message;
 pub mod multipart;
 pub mod nes; // NES idle/sleep state machine (issue #22, non-normative)
+pub mod nf_addressing; // the NF host in ipv4Addresses / ipv6Addresses / fqdn by type (#1324)
 pub mod nf_instance_id; // This NF's own pinnable nfInstanceId (issue #187)
 pub mod oauth;
 pub mod overload;
@@ -68,6 +69,7 @@ pub mod types; // Event-driven pub-sub (B6.1)
 pub mod uri_encode; // Percent-encoding for URI queries and form bodies (issue #101)
 
 pub mod client;
+mod conn_end; // how an HTTP/2 connection's end is logged (#1338)
 pub mod server;
 
 // Re-export commonly used types

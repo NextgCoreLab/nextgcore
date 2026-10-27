@@ -828,6 +828,7 @@ async fn resolve_ucmf_endpoint() -> Option<(String, u16)> {
             .ip_addresses
             .first()
             .or(inst.ipv4_addresses.first())
+            .or(inst.ipv6_addresses.first())
             .or(svc.fqdn.as_ref())
             .or(inst.fqdn.as_ref())?;
         Some((host.clone(), svc.port))

@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e91a4036.js";
+            window.path_to_searchindex_js = "../searchindex-99ff0175.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -285,7 +285,8 @@ NF’s own invention rather than a name a conformant consumer knows.</p>
 <tr><td><code>-l, --log-file</code></td><td>unset</td><td>Log file path.</td></tr>
 <tr><td><code>-e, --log-level</code></td><td><code>info</code></td><td>Log level.</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>off</td><td>Disable colour output.</td></tr>
-<tr><td><code>--sbi-addr</code></td><td><code>0.0.0.0</code></td><td>SBI bind address.</td></tr>
+<tr><td><code>--sbi-addr</code></td><td><code>127.0.0.1</code> (loopback, #1308)</td><td>SBI bind address.</td></tr>
+<tr><td><code>--sbi-advertise</code></td><td>unset</td><td>The host registered with the NRF (#1322). Then <code>NEXTGCORE_SBI_ADVERTISE</code>, then <code>--sbi-addr</code> when it is not a wildcard; with neither, NRF registration is skipped and logged.</td></tr>
 <tr><td><code>--sbi-port</code></td><td><code>7819</code></td><td>SBI port.</td></tr>
 <tr><td><code>--tls</code>, <code>--tls-cert</code>, <code>--tls-key</code></td><td>off / unset</td><td>TLS for the SBI server.</td></tr>
 <tr><td><code>--nrf-uri</code></td><td><code>http://127.0.0.1:7777</code></td><td>NRF location for registration and the OAuth2 JWKS.</td></tr>

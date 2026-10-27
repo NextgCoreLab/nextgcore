@@ -842,6 +842,16 @@ pub fn reconcile_requested_apn(
         return Err(EsmCause::MissingOrUnknownApn);
     };
 
+    // #1356 review: an APN the NAS Access Point Name IE cannot carry (TS 23.003 §9.1
+    // labels: no empty label, at most 63 octets each, 100 in all) is refused here with
+    // ESM #27 "missing or unknown APN" (TS 24.301 §6.5.1.4), so the attach is rejected
+    // rather than accepted with an empty or malformed APN in ACTIVATE DEFAULT EPS
+    // BEARER CONTEXT REQUEST.
+    if let Err(e) = crate::s11_build::encode_apn_dns(&chosen.apn) {
+        log::warn!("Subscribed APN refused: {e}");
+        return Err(EsmCause::MissingOrUnknownApn);
+    }
+
     // Carry the UE's transaction onto the session that will be activated, so the
     // ESM procedure that follows addresses the subscribed session rather than the
     // placeholder the request created.
@@ -2040,6 +2050,14 @@ mod tests {
         requested_apn: &str,
         pti: u8,
     ) -> (crate::context::MmeContext, u64) {
+        ue_subscribed_to_and_requesting("internet", requested_apn, pti)
+    }
+
+    fn ue_subscribed_to_and_requesting(
+        subscribed_apn: &str,
+        requested_apn: &str,
+        pti: u8,
+    ) -> (crate::context::MmeContext, u64) {
         let ctx = crate::context::MmeContext::new();
         ctx.init();
         let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
@@ -2050,7 +2068,7 @@ mod tests {
             let mme_ue = pool.get_mut(&mme_ue_id).unwrap();
             mme_ue.imsi_bcd = "999990000000125".to_string();
             mme_ue.session = vec![crate::context::SessionData {
-                name: "internet".to_string(),
+                name: subscribed_apn.to_string(),
                 ..Default::default()
             }];
             mme_ue.num_of_session = 1;
@@ -2121,6 +2139,27 @@ mod tests {
         assert_eq!(
             reconcile_requested_apn(&ctx, mme_ue_id),
             Err(crate::esm_build::EsmCause::MissingOrUnknownApn)
+        );
+    }
+
+    /// #1356 review, TS 24.301 §6.5.1.4: a subscribed APN no label encoding can carry
+    /// is refused with ESM #27, whether the UE named it or took the default, so the
+    /// attach is rejected instead of activating a bearer with an empty APN.
+    #[test]
+    fn an_apn_the_nas_ie_cannot_carry_is_refused_with_cause_27() {
+        let long = "x".repeat(64);
+        for requested in [long.as_str(), ""] {
+            let (ctx, mme_ue_id) = ue_subscribed_to_and_requesting(&long, requested, 6);
+            assert_eq!(
+                reconcile_requested_apn(&ctx, mme_ue_id),
+                Err(crate::esm_build::EsmCause::MissingOrUnknownApn),
+                "requested {requested:?}"
+            );
+        }
+        let (ctx, mme_ue_id) = ue_subscribed_to_and_requesting("ims.mnc070.mcc999.gprs", "", 7);
+        assert!(
+            reconcile_requested_apn(&ctx, mme_ue_id).is_ok(),
+            "a valid dotted APN"
         );
     }
 

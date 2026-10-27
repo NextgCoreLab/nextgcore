@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e91a4036.js";
+            window.path_to_searchindex_js = "../searchindex-99ff0175.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -178,7 +178,7 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="mme-configuration"><a class="header" href="#mme-configuration">MME Configuration</a></h1>
-<p>The MME (Mobility Management Entity, <code>nextgcore-mmed</code>) is the 4G/EPS control-plane anchor of the dual 5G+4G core. It serves S1-MME toward eNBs (S1AP encoded and decoded by <code>nextgcore-s1ap-gen</code>, the codec generated from the TS 36.413 ASN.1; the hand-written S1AP codec was removed, #514), NAS EMM/ESM toward UEs (TS 24.301), S11 GTPv2-C toward the SGW-C, S6a Diameter toward the HSS, and optionally N26 GTPv2-C toward an AMF for EPS↔5GS interworking. The crate also carries SGsAP message handling and the SBc-AP warning data structures and handlers; it has no SBc-AP transport (see <a href="#not-supported">Not supported</a>).</p>
+<p>The MME (Mobility Management Entity, <code>nextgcore-mmed</code>) is the 4G/EPS control-plane anchor of the dual 5G+4G core. It serves S1-MME toward eNBs (S1AP encoded and decoded by <code>nextgcore-s1ap-gen</code>, the codec generated from the TS 36.413 ASN.1; the hand-written S1AP codec was removed, #514), NAS EMM/ESM toward UEs (TS 24.301), S11 GTPv2-C toward the SGW-C, S6a Diameter toward the HSS, and optionally N26 GTPv2-C toward an AMF for EPS↔5GS interworking. The crate also carries SGsAP message handling, and SBc-AP toward a Cell Broadcast Centre when configured (see <a href="#sbc-ap-cbc-interface">SBc-AP</a>).</p>
 <p>Configuration comes from a YAML file (default <code>/etc/nextgcore/mme.yaml</code>, <code>-c/--config</code>), the freeDiameter <code>.conf</code> that file names, a few environment variables, and four CLI flags. A missing or malformed file, or one with no <code>mme:</code> section, logs a warning and leaves the built-in defaults in place (<code>src/bins/nextgcore-mmed/src/config.rs</code>).</p>
 <blockquote>
 <p><strong>Honesty note:</strong> the nightly <code>Docker E2E (EPC)</code> job attaches a real LTE UE through nextgsim’s eNB to this MME and pings through the default bearer with 0% loss (<code>docker/rust/epc-attach-check.sh</code>). Dedicated bearers, handover, idle mode/paging and IPv6 PDN are not asserted there. This is the project’s own matched-simulator validation, not third-party certification.</p>
@@ -258,7 +258,7 @@ mme:
 </tbody>
 </table>
 </div>
-<p>Not read: <code>logger.*</code>, <code>global.max.*</code>, <code>mme.metrics.server</code>.</p>
+<p>Not read: <code>logger.*</code>, <code>global.max.*</code>. There is no <code>mme.metrics.server</code> (removed from the shipped config, #1312): the metrics endpoint is <code>MME_METRICS_ADDR</code> / <code>NEXTGCORE_METRICS_BIND</code>.</p>
 <h2 id="command-line-flags"><a class="header" href="#command-line-flags">Command-line flags</a></h2>
 <p>From the clap <code>Args</code> struct in <code>src/bins/nextgcore-mmed/src/main.rs</code>:</p>
 <div class="table-wrapper">
@@ -297,16 +297,42 @@ mme:
 </table>
 </div>
 <p><code>RUST_LOG</code> overrides <code>-l/--log-level</code> when set (the <code>RUST_LOG: info</code> in <code>docker-compose-epc.yml</code> applies).</p>
-<h2 id="not-supported"><a class="header" href="#not-supported">Not supported</a></h2>
+<h2 id="sbc-ap-cbc-interface"><a class="header" href="#sbc-ap-cbc-interface">SBc-AP (CBC interface)</a></h2>
+<p>SBc-AP (TS 29.168) carries ETWS/CMAS warnings from a Cell Broadcast Centre. The CBC establishes the SCTP association (TS 29.168 §4.1.3: port 29168, PPID 24), so the MME listens. The listener needs the <code>kernel-sctp</code> build.</p>
+<p><strong>Off by default.</strong> Without an <code>mme.sbcap</code> block no socket is opened. There is no default bind address, so you must configure the MME’s own address on the CBC network:</p>
+<pre><code class="language-yaml">mme:
+  sbcap:
+    server:
+      - address: 10.10.0.5   # required; only this address is bound
+        port: 29168          # the default
+    cbc:
+      - address: 10.10.0.9   # the CBCs allowed to associate
+    max_associations: 4      # the default
+</code></pre>
 <ul>
-<li><strong>SBc-AP: no CBC interface (#1071).</strong> mmed does not listen for, or connect to, a Cell Broadcast Centre. TS 29.168 SBc-AP runs over SCTP on port 29168 (PPID 24), and mmed has neither that transport nor an SBc-AP codec. As a result:
+<li>Only the first <code>server</code> address is bound. A wildcard (<code>0.0.0.0</code>, <code>::</code>) is accepted but logged as a warning.</li>
+<li>A block without a parsable <code>server</code> or without any <code>cbc</code> binds nothing, and logs an error.</li>
+<li>Any association from an address not in <code>cbc</code>, or beyond <code>max_associations</code>, is answered with an SCTP ABORT at accept. It is counted in <code>mme_sbcap_refused_associations_total{reason="peer"|"limit"}</code> and logged, with the log rate-limited.</li>
+<li>A message longer than 64 KiB is dropped before decode and counted in <code>mme_sbcap_oversized_messages_total</code>. <code>mme_sbcap_received_total</code> counts the PDUs handled.</li>
+</ul>
+<p><strong>Procedures:</strong></p>
 <ul>
-<li>ETWS and CMAS warnings (TS 23.041) cannot be delivered. No Write-Replace Warning or Stop Warning arrives from a CBC, so no WRITE-REPLACE WARNING REQUEST or KILL REQUEST is sent to an eNB. The <code>sbc_handler</code> procedures exist, but nothing calls them in production.</li>
-<li>An eNB’s <strong>PWS RESTART INDICATION</strong> (TS 36.413 §8.12.3) is decoded and validated against the sender’s own Global eNB ID. It is counted in <code>mme_s1ap_pws_restart_indications_total</code> and logged, but not propagated to a CBC. TS 23.007 §15A.1.2 has the CBC reload the restarted cells’ warnings; mmed does not replay its own copy.</li>
-<li>An eNB’s <strong>PWS FAILURE INDICATION</strong> (TS 36.413 §8.12.4) is handled in the same way. It is decoded, validated against the sender, counted in <code>mme_s1ap_pws_failure_indications_total</code>, and logged with its count of failed cells; the cell list itself is logged at debug level. TS 36.413 has the MME act on it as TS 23.041 defines, which means reporting it on to the CBC. mmed does not do that.</li>
-<li>Toward a CBC, mmed sends no SBc-AP PWS Restart Indication, PWS Failure Indication, Write-Replace Warning Indication or Stop Warning Indication.</li>
+<li><strong>Write-Replace Warning</strong> is sent to the eNBs that serve the List of TAIs, to all eNBs if the list is absent, or only to the eNB named by a Global eNB ID. The CBC’s Warning Area List (cells, TAIs or emergency areas) is forwarded as the eNB’s Warning Area List.</li>
+<li><strong>Stop Warning</strong> works the same way. Stop-All maps to Kill-all-Warning-Messages.</li>
+<li>Both are answered at once:
+<ul>
+<li>“Message accepted”, with the Unknown Tracking Area List, when an eNB took the request;</li>
+<li>“Tracking area not valid” when every TAI is unknown;</li>
+<li>otherwise the failure cause.</li>
 </ul>
 </li>
+<li>An undecodable PDU, a request without its identifiers, or a message only the MME sends gets an ERROR INDICATION.</li>
+<li><strong>PWS restoration</strong> (TS 23.007 §15A.1.2): an eNB’s PWS RESTART INDICATION and PWS FAILURE INDICATION (TS 36.413 §8.12.3 / §8.12.4) are validated against the sender’s Global eNB ID and relayed to every CBC association as SBc-AP PWS-Restart-Indication / PWS-Failure-Indication (TS 29.168 §4.3.3E / §4.3.3F). They carry the Global eNB ID, the cells, the TAIs and the emergency areas as the eNB sent them. The CBC’s reload names the Global eNB ID, so it goes only to that eNB. The MME does not replay its own copy of the warnings. Relayed and unrelayed indications (no SBc-AP configured, no association) are counted in <code>mme_sbcap_indications_total{result="sent"|"unsent"}</code>.</li>
+</ul>
+<p><strong>Security.</strong> SBc-AP has no application-layer authentication. Run it on a private network, or under TS 33.210 network domain security (NDS/IP, IPsec), as for S1-MME. The <code>cbc</code> allowlist keeps unconfigured peers off; it is not authentication. The Helm chart, the k8s manifests and the compose files publish no port for it (no <code>ports:</code> or NodePort for 29168).</p>
+<h2 id="not-supported"><a class="header" href="#not-supported">Not supported</a></h2>
+<ul>
+<li><strong>SBc-AP: the Warning Indications (#1071).</strong> Write-Replace Warning Indication and Stop Warning Indication (TS 29.168 §4.3.3C / §4.3.3D, “if supported by the MME”) are not sent; the CBC’s “send indication” flags are accepted and not acted on. The Extended Repetition Period is clamped to the S1AP Repetition Period range (4095 s).</li>
 </ul>
 
                     </main>

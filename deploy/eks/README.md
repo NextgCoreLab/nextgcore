@@ -1,8 +1,9 @@
 # NextG on EKS
 
 An EKS-targeted deployment for the nextgcore 5G control/user plane plus the
-nextgsim gNB/UE (PROFILE=5g), or the nextgcore EPC plus the nextgsim LTE eNB/UE
-(PROFILE=epc). This is a **lab / non-production** deployment. Read
+nextgsim gNB/UE (PROFILE=5g), the nextgcore EPC plus the nextgsim LTE eNB/UE
+(PROFILE=epc), or the 5G stack built with the 6G / research features
+(PROFILE=6g). This is a **lab / non-production** deployment. Read
 "Known limitations" before pointing it at anything shared.
 
 The existing `nextgcore/k8s/` manifests target **Kind** (`deploy.sh` calls
@@ -20,16 +21,20 @@ deploy/eks/
 │   │   ├── kustomization.yaml  overlay (patches k8s/ + nextgsim/k8s/)
 │   │   ├── patches/            per-concern strategic-merge patches
 │   │   └── profile.env         namespace, images, features, rollout hooks
-│   └── epc/                  PROFILE=epc (nextg-epc): EPC + LTE eNB/UE
-│       ├── kustomization.yaml  mongodb + epc.yaml + the unmodified compose configs
-│       ├── epc.yaml            9 Deployments; 8 headless Services (not lte-ue)
-│       ├── namespace.yaml      nextg-epc, pod-security privileged
-│       ├── profile.env         namespace, images, features, rollout hooks
-│       └── scripts/            epc-run.sh (entrypoint), epc-peers-check.sh (liveness)
-├── e2e-internet.sh           UE -> internet check, PROFILE=5g|epc
+│   ├── epc/                  PROFILE=epc (nextg-epc): EPC + LTE eNB/UE
+│   │   ├── kustomization.yaml  mongodb + epc.yaml + the unmodified compose configs
+│   │   ├── epc.yaml            9 Deployments; 8 headless Services (not lte-ue)
+│   │   ├── namespace.yaml      nextg-epc, pod-security privileged
+│   │   ├── profile.env         namespace, images, features, rollout hooks
+│   │   └── scripts/            epc-run.sh (entrypoint), epc-peers-check.sh (liveness)
+│   └── 6g/                   PROFILE=6g (nextg-6g): the 5g overlay, feature build
+│       ├── kustomization.yaml  ../5g in namespace nextg-6g
+│       ├── namespace.yaml      nextg-6g, pod-security privileged
+│       └── profile.env         sources ../5g/profile.env; features, -6g tag, config
+├── e2e-internet.sh           UE -> internet check, PROFILE=5g|epc|6g
 ├── lib/image-tag.sh          git-SHA image tag, shared by both scripts
 ├── lib/profile.sh            PROFILE loader, shared by both scripts
-├── build-and-push.sh         build the profile's images (12 for 5g, 9 for epc), push to ECR
+├── build-and-push.sh         build the profile's images (12 for 5g and 6g, 9 for epc), push to ECR
 ├── deploy-eks.sh             apply the overlay in dependency order
 └── README.md
 ```
@@ -190,6 +195,54 @@ with `/dev/net/tun`. lte-ue gets NET_ADMIN and `/dev/net/tun`. The sysctls
 (`ip_forward`, loose `rp_filter`) are not on the kubelet's safe list, so a
 privileged busybox init container writes them into the pod's network
 namespace. No `hostNetwork`, NodePort or LoadBalancer is used.
+
+## PROFILE=6g
+
+`profiles/6g/` is the 5G profile (its overlay is the resource, and
+`profile.env` sources `../5g/profile.env`) in namespace `nextg-6g`, with two
+differences:
+
+- **Binaries.** The core is built with the runtime 6G / research features of
+  the NFs it runs: `nextgcore-amfd/ntn`, `nextgcore-smfd/compute-aware-upf`,
+  `nextgcore-upfd/compute-aware-upf`, `nextgcore-pcfd/intent-loop`,
+  `nextgcore-udmd/nes`. They go to their own directory (`CORE_BIN_DIR`,
+  default `/tmp/6g-binaries`), never `nextgcore/binaries/`, and the images are
+  tagged `<sha>-6g`. The gNB and UE are the default nextgsim build.
+- **Config.** `profile_postrender` rewrites the `nextg-system` Service FQDNs
+  to `nextg-6g` (and fails if one survives), and switches on the UDM's `nes`
+  block (idle threshold 86400 s, so the UDM never suspends during a run;
+  energy gauges on the pod's loopback, port 9091) and the PCF's `intent`
+  block (slice SST 1, latency target 20 ms; no NWDAF is deployed, so the loop
+  observes `unavailable` and holds the baseline policy).
+
+```bash
+cd src && export CARGO_TARGET_DIR=/tmp/tgt-rel-6g && cargo build --release \
+  -p nextgcore-nrfd -p nextgcore-amfd -p nextgcore-smfd -p nextgcore-upfd \
+  -p nextgcore-ausfd -p nextgcore-udmd -p nextgcore-udrd -p nextgcore-pcfd \
+  -p nextgcore-nssfd -p nextgcore-bsfd \
+  --features nextgcore-amfd/ntn --features nextgcore-smfd/compute-aware-upf \
+  --features nextgcore-upfd/compute-aware-upf --features nextgcore-pcfd/intent-loop \
+  --features nextgcore-udmd/nes
+mkdir -p /tmp/6g-binaries && cp "$CARGO_TARGET_DIR"/release/nextgcore-{nrf,amf,smf,upf,ausf,udm,udr,pcf,nssf,bsf}d /tmp/6g-binaries/
+cd ../deploy/eks
+PROFILE=6g ./build-and-push.sh
+ENABLE_DATAPLANE=true EPHEMERAL_STORAGE=true PROFILE=6g ./deploy-eks.sh
+PROFILE=6g ./e2e-internet.sh
+```
+
+`PROFILE=6g ./e2e-internet.sh` runs the 5G steps, then a 6G feature smoke
+that reads each feature's runtime signature from the running pods, so a
+default build under a `-6g` tag fails it:
+
+| feature | signature |
+|---|---|
+| udmd `nes` | `NES enabled:` in the udm log, and `energy_consumption_watts` served on the udm pod's 127.0.0.1:9091 |
+| pcfd `intent-loop` | `intent-loop: intent translated` and `intent-loop: monitor` in the pcf log |
+| upfd `compute-aware-upf` | the UPF's PFCP Heartbeat Requests carry Load Control Information (captured with tshark in a debug container on the smf pod) |
+
+amfd `ntn` and smfd `compute-aware-upf` have no signature with this RAN and
+one UPF (no NTN access, a pool of one); the run proves those builds still
+register the UE and carry its traffic.
 
 ## Images are tagged by git SHA, not `:latest`
 
@@ -404,6 +457,45 @@ Enable with `EnableDataPlanePrivileges=true` on the stack **and**
 `ENABLE_DATAPLANE=true ./deploy-eks.sh`. Treat it as a separate exercise from
 control-plane bring-up.
 
+## SMF durable state (optional, off by default)
+
+By default smfd keeps its PFCP sessions, policy bindings and IPv4 allocations in
+memory. A graceful SMF restart therefore releases its N4 association and sends
+each UE a PDU Session Release Command #39, and the UE re-establishes its session
+(devtest1: data path back in about 7-16 s). With a state file
+(`NEXTGCORE_SMF_STATE_FILE` or `--state-file`), smfd keeps the association on
+shutdown, and the next incarnation restores the sessions and asks the UPF to
+retain them (PFCP Session Retention Information). No #39 is sent, and the UE
+keeps its session.
+
+The profiles leave it off. To try it, patch the running smf Deployment:
+
+```bash
+kubectl -n nextg-system patch deploy smf --type=json \
+  --patch-file examples/smf-durable-state-emptydir.json
+```
+
+`examples/smf-durable-state-emptydir.json` adds an `emptyDir` at
+`/var/lib/nextgcore-smf` and `NEXTGCORE_SMF_STATE_FILE=/var/lib/nextgcore-smf/state.json`.
+An `emptyDir` survives a **container** restart in the same pod, but not pod
+re-creation. Validated on devtest1 (run 4, nextgcore #1346) with
+`kubectl exec deploy/smf -- sh -c 'kill -TERM 1'`:
+- smfd logs `PFCP association kept on shutdown`, then `SMF durable state restored: 1 PFCP session(s) ...`;
+- upfd logs `PFCP Session Retention Information ...: kept 1 session(s)`;
+- the UE received no #39;
+- the uplink, downlink and paging all worked.
+
+**Surviving pod re-creation** (a delete, a node loss, a rollout) needs the state file on
+a PersistentVolume. Replace the `emptyDir` with a `persistentVolumeClaim` from an
+EBS-CSI (`ebs.csi.aws.com`, ReadWriteOnce, and the replica pinned to one) or EFS
+(`efs.csi.aws.com`) StorageClass. devtest1 has neither: its only class, `gp2`, uses
+the in-tree `kubernetes.io/aws-ebs` provisioner, which needs the EBS CSI driver
+on current EKS. Installing one is a cluster and IAM change.
+
+Remove the patch before re-running `deploy-eks.sh`. `kubectl apply` keeps fields
+that `kubectl patch` added, so delete them with a JSON patch that removes the env
+entry, the volume mount and the volume.
+
 ## Known limitations
 
 Infrastructure (see `Outputs.Caveats` in the template):
@@ -433,8 +525,8 @@ Workload:
   (#1100; no credential is in any manifest). To use your own password, create
   that Secret (key `password`) before the first deploy. To read it:
   `kubectl -n nextg-system get secret grafana-admin -o jsonpath='{.data.password}' | base64 -d`.
-  Grafana, Prometheus and Jaeger are ClusterIP Services on EKS, not the Kind
-  manifests' NodePorts; reach them with `kubectl port-forward`.
+  Grafana, Prometheus, Jaeger and the NRF are ClusterIP Services, in the base
+  manifests as on EKS (#1365); reach them with `kubectl port-forward`.
 - Single replica per NF. The NFs hold per-UE state in a process-global context
   and the NRF is the source of truth for topology; `replicas: 2` has not been
   validated and is not expected to work.

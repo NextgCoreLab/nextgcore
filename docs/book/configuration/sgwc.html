@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e91a4036.js";
+            window.path_to_searchindex_js = "../searchindex-99ff0175.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -314,12 +314,12 @@ bind is loopback unless <code>NEXTGCORE_METRICS_BIND</code> is set (#837). The m
 <tr><th>Variable</th><th>Default</th><th>Effect</th></tr>
 </thead>
 <tbody>
-<tr><td><code>SGWC_S11_BIND</code></td><td><code>0.0.0.0:2123</code></td><td>S11 GTPv2-C UDP bind <code>address:port</code>.</td></tr>
+<tr><td><code>SGWC_S11_BIND</code></td><td><code>127.0.0.1:2123</code> (loopback, #1308)</td><td>S11 GTPv2-C UDP bind <code>address:port</code>.</td></tr>
 <tr><td><code>SGWC_S11_ADVERTISE</code></td><td>unset</td><td>Advertised control-plane IPv4; consulted only when the bound address is a wildcard. Falls back to <code>sgwc.gtpc.server[0].address</code>.</td></tr>
 <tr><td><code>SGWC_GTPU_ADVERTISE</code></td><td>unset (falls back to the bound or <code>SGWC_S11_ADVERTISE</code> address, not the YAML one)</td><td>SGW-U user-plane IPv4 placed in S1-U/S5-U F-TEIDs. The EPC compose sets it to the SGW-U (<code>172.24.0.6</code>).</td></tr>
 <tr><td><code>SGWC_PGW_S5C</code></td><td>unset</td><td>PGW-C S5/S8 peer (<code>ip</code> or <code>ip:port</code>, port <code>2123</code> by default). <strong>Unset means the SGW-C refuses an S11 Create Session Request</strong> rather than answering it from local state. The EPC compose sets <code>172.24.0.4</code>.</td></tr>
 <tr><td><code>SGWC_S5C_ADVERTISE</code></td><td>the S11 address</td><td>Dedicated S5-C address, if different from S11.</td></tr>
-<tr><td><code>SGWC_PFCP_BIND_ADDR</code></td><td><code>0.0.0.0:8805</code></td><td>Sxa PFCP bind <code>address:port</code>.</td></tr>
+<tr><td><code>SGWC_PFCP_BIND_ADDR</code></td><td><code>127.0.0.1:8805</code> (loopback, #1308)</td><td>Sxa PFCP bind <code>address:port</code>.</td></tr>
 <tr><td><code>SGWC_PFCP_NODE_IP</code></td><td><code>sgwc.pfcp.server[0].address</code>, then <code>127.0.0.1</code></td><td>PFCP Node ID (IPv4).</td></tr>
 <tr><td><code>SGWC_SGWU_ADDR</code></td><td><code>sgwc.pfcp.client.sgwu</code>, then <code>127.0.0.1:8805</code></td><td>SGW-U override (<code>ip</code> or <code>ip:port</code>).</td></tr>
 <tr><td><code>SGWC_ECHO_INTERVAL_SECS</code></td><td><code>60</code></td><td>GTPv2-C Echo interval; <code>0</code> disables probing.</td></tr>

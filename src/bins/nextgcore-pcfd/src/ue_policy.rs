@@ -410,6 +410,10 @@ fn ue_policy_store() -> &'static Mutex<HashMap<String, UePolicyAssociation>> {
     static STORE: OnceLock<Mutex<HashMap<String, UePolicyAssociation>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
+/// How many UE policy associations the PCF holds (#1334, `/metrics`).
+pub fn ue_policy_count() -> usize {
+    ue_policy_store().lock().map(|m| m.len()).unwrap_or(0)
+}
 pub fn ue_policy_add(supi: &str, notification_uri: &str, supp_feat: &str) -> UePolicyAssociation {
     let assoc = UePolicyAssociation {
         pol_asso_id: uuid::Uuid::new_v4().to_string(),

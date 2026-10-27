@@ -680,30 +680,38 @@ async fn main() -> Result<()> {
 /// (TS 29.510 §6.1.6.2.10) advertises the N3 (GTP-U) interface endpoint. The
 /// `load` field carries the initial PFCP-session occupancy gauge; it is
 /// refreshed by the heartbeat PATCH (`build_load_patch`, `/load` 0..=100).
+/// The N3 InterfaceUpfInfoItem for `gtpu_addr`, its address by type (#1324).
+fn n3_interface(gtpu_addr: &str) -> serde_json::Value {
+    let mut item = nextgcore_sbi::nf_addressing::interface_upf_endpoint(gtpu_addr);
+    item.insert("interfaceType".into(), "N3".into());
+    serde_json::Value::Object(item)
+}
+
 fn build_upf_nf_profile(
     nf_instance_id: &str,
     pfcp_addr: &str,
     gtpu_addr: &str,
     load: u8,
 ) -> serde_json::Value {
-    serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "UPF",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [pfcp_addr],
-        "load": load,
-        "upfInfo": {
-            "sNssaiUpfInfoList": [{
-                "sNssai": { "sst": 1 },
-                "dnnUpfInfoList": [{ "dnn": "internet" }]
-            }],
-            "interfaceUpfInfoList": [{
-                "interfaceType": "N3",
-                "ipv4EndpointAddresses": [gtpu_addr]
-            }]
-        },
-        "heartBeatTimer": 10
-    })
+    nextgcore_sbi::nf_addressing::classify_profile_host(
+        serde_json::json!({
+            "nfInstanceId": nf_instance_id,
+            "nfType": "UPF",
+            "nfStatus": "REGISTERED",
+            "ipv4Addresses": [pfcp_addr],
+            "load": load,
+            "upfInfo": {
+                "sNssaiUpfInfoList": [{
+                    "sNssai": { "sst": 1 },
+                    "dnnUpfInfoList": [{ "dnn": "internet" }]
+                }],
+                // #1324: the N3 address by type (TS 29.510 §6.1.6.2.12).
+                "interfaceUpfInfoList": [n3_interface(gtpu_addr)]
+            },
+            "heartBeatTimer": 10
+        }),
+        pfcp_addr,
+    )
 }
 
 /// Register the UPF with the NRF via `PUT /nnrf-nfm/v1/nf-instances/{id}`
@@ -980,131 +988,126 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                 let gnb_socket = if let Some(addr) = gnb_addr {
                     SocketAddr::new(IpAddr::V4(addr), GTPU_PORT)
                 } else {
-                    log::warn!("No gNB address provided, using default");
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), GTPU_PORT)
+                    // #1345: no N3 endpoint until the Session Modification brings
+                    // one; DL traffic before then is buffered or counted as
+                    // `no_dl_endpoint`, not sent to the loopback.
+                    log::info!(
+                        "No gNB address at establishment: DL endpoint pending the \
+                         Session Modification"
+                    );
+                    data_plane::NO_DL_ENDPOINT
                 };
 
                 // Extract QFI from QERs
                 let qfi = qers.iter().find_map(|q| q.qfi);
 
-                // Add session with basic info
-                data_plane.add_session_from_pfcp(
-                    upf_seid, smf_seid, ue_ip, ul_teid, dl_teid, gnb_socket, None, qfi,
+                // #1348: every rule the Establishment Request created is built first and
+                // the session is published once, with them (TS 29.244 §5.2.1, §7.5.2).
+                // It used to be published with invented match-all FORW rules that the
+                // SMF's were then written over one lock at a time, so a packet in
+                // between was forwarded, unpoliced and uncharged, even when the SMF's
+                // FAR said BUFF or DROP. No PDR in the request matches nothing.
+                let mut dp_pdrs: Vec<DataPlanePdr> =
+                    pdrs.iter().map(data_plane_pdr_from_parsed).collect();
+                dp_pdrs.sort_by_key(|p| p.precedence);
+                let dp_fars: std::collections::HashMap<u32, data_plane::DataPlaneFar> = fars
+                    .iter()
+                    .map(|f| (f.far_id, data_plane_far_from_parsed(f)))
+                    .collect();
+                // #619 review: the FARs with a tunnel of their own, by the PFCP layer's
+                // rule for an establishment.
+                let own_tunnel_fars = crate::pfcp_path::own_tunnel_fars_established(
+                    &pdrs,
+                    &fars,
+                    (dl_teid, gnb_addr),
                 );
-
-                // Now install the PFCP-provided PDR/FAR/QER/URR rules
-                if let Some(session) = data_plane.sessions.find_by_seid(upf_seid) {
-                    // Install PDRs from PFCP (replace defaults if provided)
-                    if !pdrs.is_empty() {
-                        let mut dp_pdrs: Vec<DataPlanePdr> =
-                            pdrs.iter().map(data_plane_pdr_from_parsed).collect();
-                        dp_pdrs.sort_by_key(|p| p.precedence);
-                        *session.pdrs.write().unwrap() = dp_pdrs;
+                let mut dp_bars = std::collections::HashMap::new();
+                for b in &bars {
+                    dp_bars.insert(
+                        b.bar_id,
+                        DataPlaneBar {
+                            bar_id: b.bar_id,
+                            suggested_buffering_packets_count: b.suggested_buffering_packets_count,
+                            ddn_delay: b.ddn_delay,
+                        },
+                    );
+                }
+                let mut dp_qers = std::collections::HashMap::new();
+                for q in &qers {
+                    let mut qer = DataPlaneQer::new(q.qer_id);
+                    // Reflective QoS / paging policy the SMF asked for.
+                    // Parsed since #81; previously decoded nowhere, so a
+                    // QER requesting them had no effect on the wire.
+                    qer.rqi = q.rqi;
+                    qer.ppi = q.ppi;
+                    qer.ul_gate_open = q.ul_gate == 0;
+                    qer.dl_gate_open = q.dl_gate == 0;
+                    qer.set_mbr(q.ul_mbr, q.dl_mbr);
+                    qer.set_gbr(q.ul_gbr, q.dl_gbr);
+                    if let Some(qfi_val) = q.qfi {
+                        qer.set_qfi(qfi_val);
                     }
-
-                    // #619 review: the FARs with a tunnel of their own, by the PFCP
-                    // layer's rule for an establishment.
-                    *session.own_tunnel_fars.write().unwrap() =
-                        crate::pfcp_path::own_tunnel_fars_established(
-                            &pdrs,
-                            &fars,
-                            (dl_teid, gnb_addr),
+                    if qer.is_xr {
+                        log::info!(
+                            "Installed XR QER {} (5QI={:?}, DSCP={}, GBR UL/DL={}/{} kbps) for SEID={upf_seid:#x}",
+                            qer.qer_id, qer.qfi, qer.dscp, qer.ul_gbr, qer.dl_gbr
                         );
-
-                    // Install FARs from PFCP (replace defaults if provided)
-                    if !fars.is_empty() {
-                        let mut dp_fars = std::collections::HashMap::new();
-                        for f in &fars {
-                            dp_fars.insert(f.far_id, data_plane_far_from_parsed(f));
-                        }
-                        *session.fars.write().unwrap() = dp_fars;
                     }
-
-                    // Install BARs from PFCP
-                    if !bars.is_empty() {
-                        let mut dp_bars = std::collections::HashMap::new();
-                        for b in &bars {
-                            dp_bars.insert(
-                                b.bar_id,
-                                DataPlaneBar {
-                                    bar_id: b.bar_id,
-                                    suggested_buffering_packets_count: b
-                                        .suggested_buffering_packets_count,
-                                    ddn_delay: b.ddn_delay,
-                                },
-                            );
-                        }
-                        *session.bars.write().unwrap() = dp_bars;
-                    }
-
-                    // Install QERs from PFCP
-                    if !qers.is_empty() {
-                        let mut dp_qers = std::collections::HashMap::new();
-                        for q in &qers {
-                            let mut qer = DataPlaneQer::new(q.qer_id);
-                            // Reflective QoS / paging policy the SMF asked for.
-                            // Parsed since #81; previously decoded nowhere, so a
-                            // QER requesting them had no effect on the wire.
-                            qer.rqi = q.rqi;
-                            qer.ppi = q.ppi;
-                            qer.ul_gate_open = q.ul_gate == 0;
-                            qer.dl_gate_open = q.dl_gate == 0;
-                            qer.set_mbr(q.ul_mbr, q.dl_mbr);
-                            qer.set_gbr(q.ul_gbr, q.dl_gbr);
-                            if let Some(qfi_val) = q.qfi {
-                                qer.set_qfi(qfi_val);
-                            }
-                            if qer.is_xr {
-                                log::info!(
-                                    "Installed XR QER {} (5QI={:?}, DSCP={}, GBR UL/DL={}/{} kbps) for SEID={upf_seid:#x}",
-                                    qer.qer_id, qer.qfi, qer.dscp, qer.ul_gbr, qer.dl_gbr
-                                );
-                            }
-                            dp_qers.insert(q.qer_id, qer);
-                        }
-                        *session.qers.write().unwrap() = dp_qers;
-                    }
-
-                    // Install URRs from PFCP
-                    if !urrs.is_empty() {
-                        let mut dp_urrs = std::collections::HashMap::new();
-                        for u in &urrs {
-                            let urr = DataPlaneUrr::new(u.urr_id);
-                            urr.set_reporting(
-                                u.volume_threshold_total,
-                                u.volume_threshold_ul,
-                                u.volume_threshold_dl,
-                                u.time_threshold_secs,
-                                // #306: parsed from the wire since the Measurement
-                                // Period IE is; before that the PERIO trigger flag
-                                // arrived with no cadence behind it.
-                                u.measurement_period_secs,
-                            );
-                            // #80: the quota half. Propagated since Volume Quota (IE
-                            // 73) and Time Quota (IE 74) are now parsed; before that a
-                            // conformant SMF's quota decoded into nothing and the
-                            // subscriber was never gated.
-                            urr.set_quotas(
-                                u.volume_quota_total,
-                                u.volume_quota_ul,
-                                u.volume_quota_dl,
-                                u.time_quota_secs,
-                            );
-                            // #820: how TIME is measured (§5.2.2.2).
-                            // #818: a URR measuring time reports a Duration Measurement.
-                            urr.set_measure_duration(u.measure_duration);
-                            urr.set_time_metering(
-                                u.inactivity_detection_secs,
-                                u.immediate_start_time_metering,
-                            );
-                            dp_urrs.insert(u.urr_id, Arc::new(urr));
-                        }
-                        *session.urrs.write().unwrap() = dp_urrs;
-                    }
-
-                    log::info!(
-                        "Installed rules: {} PDRs, {} FARs, {} QERs, {} URRs for SEID={upf_seid:#x}",
-                        pdrs.len(), fars.len(), qers.len(), urrs.len()
+                    dp_qers.insert(q.qer_id, qer);
+                }
+                let mut dp_urrs = std::collections::HashMap::new();
+                for u in &urrs {
+                    let urr = DataPlaneUrr::new(u.urr_id);
+                    urr.set_reporting(
+                        u.volume_threshold_total,
+                        u.volume_threshold_ul,
+                        u.volume_threshold_dl,
+                        u.time_threshold_secs,
+                        // #306: parsed from the wire since the Measurement
+                        // Period IE is; before that the PERIO trigger flag
+                        // arrived with no cadence behind it.
+                        u.measurement_period_secs,
+                    );
+                    // #80: the quota half. Propagated since Volume Quota (IE
+                    // 73) and Time Quota (IE 74) are now parsed; before that a
+                    // conformant SMF's quota decoded into nothing and the
+                    // subscriber was never gated.
+                    urr.set_quotas(
+                        u.volume_quota_total,
+                        u.volume_quota_ul,
+                        u.volume_quota_dl,
+                        u.time_quota_secs,
+                    );
+                    // #820: how TIME is measured (§5.2.2.2).
+                    // #818: a URR measuring time reports a Duration Measurement.
+                    urr.set_measure_duration(u.measure_duration);
+                    urr.set_time_metering(
+                        u.inactivity_detection_secs,
+                        u.immediate_start_time_metering,
+                    );
+                    dp_urrs.insert(u.urr_id, Arc::new(urr));
+                }
+                data_plane.add_established_session(
+                    upf_seid,
+                    smf_seid,
+                    ue_ip,
+                    ul_teid,
+                    dl_teid,
+                    gnb_socket,
+                    qfi,
+                    data_plane::EstablishedRules {
+                        pdrs: dp_pdrs,
+                        fars: dp_fars,
+                        own_tunnel_fars,
+                        qers: dp_qers,
+                        urrs: dp_urrs,
+                        bars: dp_bars,
+                    },
+                );
+                if pdrs.is_empty() {
+                    log::warn!(
+                        "PFCP Session Establishment SEID={upf_seid:#x} created no PDR: the \
+                         session matches no packet"
                     );
                 }
             } else {
@@ -1413,9 +1416,9 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                 }
             }
 
-            // FAR switched to FORW → flush packets buffered under BUFF
-            // (the session may have been re-created by update_session_from_pfcp,
-            // so re-resolve it inside flush_buffered_dl)
+            // FAR switched to FORW → flush packets buffered under BUFF.
+            // flush_buffered_dl looks the session up by SEID; since #822 it is the
+            // same session object update_session_from_pfcp moved in place.
             if any_far_forwards && !drop_buffered {
                 data_plane.flush_buffered_dl(upf_seid).await;
             }
@@ -1474,6 +1477,150 @@ mod tests {
             }),
             bar_id: None,
         }
+    }
+
+    /// A Create PDR on `source` (0 Access, 1 Core) through `far_id`.
+    fn pdr_through(pdr_id: u16, source: u8, far_id: u32) -> crate::n4_build::ParsedCreatePdr {
+        crate::n4_build::ParsedCreatePdr {
+            pdr_id,
+            precedence: 255,
+            pdi: crate::n4_build::ParsedPdi {
+                source_interface: source,
+                ..Default::default()
+            },
+            outer_header_removal: (source == 0).then_some(0),
+            far_id: Some(far_id),
+            urr_ids: Vec::new(),
+            qer_id: None,
+        }
+    }
+
+    /// The establishment of smfd's 5G session: UL PDR 1 -> FAR 1 FORW to Core, DL PDR
+    /// 2 -> FAR 2 BUFF (no N3 endpoint yet; smfd's `dl_far apply_action: 0x04`).
+    fn established_with_buffering_dl(seid: u64, ue: Ipv4Addr) -> PfcpSessionEvent {
+        let mut dl = far_with_ohc(2, None, None);
+        dl.apply_action = data_plane::FAR_ACTION_BUFF;
+        dl.forwarding_parameters = None;
+        let mut ul = far_with_ohc(1, None, None);
+        ul.forwarding_parameters = Some(crate::n4_build::ParsedForwardingParameters {
+            destination_interface: 1, // Core
+            network_instance: None,
+            outer_header_creation: None,
+        });
+        PfcpSessionEvent::SessionEstablished {
+            upf_seid: seid,
+            smf_seid: seid | 0x1_0000,
+            ue_ipv4: Some(ue),
+            ul_teid: 0x100 + seid as u32,
+            dl_teid: 0,
+            gnb_addr: None,
+            pdrs: vec![pdr_through(1, 0, 1), pdr_through(2, 1, 2)],
+            fars: vec![ul, dl],
+            qers: Vec::new(),
+            urrs: Vec::new(),
+            bars: Vec::new(),
+        }
+    }
+
+    /// **#1348, TS 29.244 §5.2.1 / §7.5.2.** A session is never visible without the
+    /// rules its Establishment Request created. A reader spinning on the UE-IP map (as
+    /// the data-plane loop does) while sessions are established must never find one
+    /// whose DL FAR forwards when the SMF's says BUFF, nor one holding the invented
+    /// match-all PDRs. Before #1348 the session was published with FORW-all defaults
+    /// and the SMF's rules were written over them afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_is_never_visible_without_the_rules_its_establishment_created() {
+        let dp = Arc::new(DataPlane::new(Arc::new(AtomicBool::new(false))));
+        let ue = Ipv4Addr::new(10, 45, 13, 48);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (reader_dp, reader_stop) = (Arc::clone(&dp), Arc::clone(&stop));
+        let reader = std::thread::spawn(move || {
+            let (mut seen, mut bad) = (0u64, Vec::new());
+            while !reader_stop.load(Ordering::Relaxed) {
+                if let Some(sess) = reader_dp.sessions.find_by_ue_ip(ue) {
+                    seen += 1;
+                    let fars = sess.fars.read().unwrap();
+                    let dl_buffers = fars
+                        .get(&2)
+                        .is_some_and(|f| f.apply_action == data_plane::FAR_ACTION_BUFF);
+                    let pdrs = sess.pdrs.read().unwrap().len();
+                    if !dl_buffers || pdrs != 2 {
+                        bad.push(format!(
+                            "SEID {:#x}: FAR 2 {:?}, {pdrs} PDRs",
+                            sess.upf_seid,
+                            fars.get(&2).map(|f| f.apply_action)
+                        ));
+                    }
+                }
+            }
+            (seen, bad)
+        });
+        for i in 0..400u64 {
+            let seid = 0x1348_0000 + i;
+            handle_pfcp_session_event(&dp, established_with_buffering_dl(seid, ue)).await;
+            dp.remove_session_from_pfcp(seid);
+        }
+        stop.store(true, Ordering::Relaxed);
+        let (seen, bad) = reader.join().unwrap();
+        assert!(seen > 0, "the reader observed the sessions at all");
+        assert!(
+            bad.is_empty(),
+            "observed {} of {seen} without their rules: {:?}",
+            bad.len(),
+            &bad[..bad.len().min(3)]
+        );
+    }
+
+    /// **#1348.** Nothing forwards on defaults: an Establishment Request that created
+    /// no PDR gives a session that matches no packet, and holds only the FARs the
+    /// request created (before, invented PDRs 1/2 and FORW FARs 1/2).
+    #[tokio::test]
+    async fn an_establishment_with_no_pdr_forwards_nothing_on_invented_rules() {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        let ue = Ipv4Addr::new(10, 45, 13, 49);
+        let PfcpSessionEvent::SessionEstablished {
+            upf_seid,
+            smf_seid,
+            ue_ipv4,
+            ul_teid,
+            dl_teid,
+            gnb_addr,
+            fars,
+            qers,
+            urrs,
+            bars,
+            ..
+        } = established_with_buffering_dl(0x1349, ue)
+        else {
+            unreachable!()
+        };
+        let only_dl: Vec<_> = fars.into_iter().filter(|f| f.far_id == 2).collect();
+        handle_pfcp_session_event(
+            &dp,
+            PfcpSessionEvent::SessionEstablished {
+                upf_seid,
+                smf_seid,
+                ue_ipv4,
+                ul_teid,
+                dl_teid,
+                gnb_addr,
+                pdrs: Vec::new(),
+                fars: only_dl,
+                qers,
+                urrs,
+                bars,
+            },
+        )
+        .await;
+        let sess = dp.sessions.find_by_ue_ip(ue).expect("established");
+        assert!(sess.pdrs.read().unwrap().is_empty(), "no invented PDR");
+        let fars = sess.fars.read().unwrap();
+        assert_eq!(
+            fars.keys().copied().collect::<Vec<_>>(),
+            vec![2],
+            "only the request's FAR"
+        );
+        assert_eq!(fars[&2].apply_action, data_plane::FAR_ACTION_BUFF);
     }
 
     /// #960 review, MAJOR 1: the PFCP -> data-plane FAR wiring carries an IPv6 gNB
@@ -1858,5 +2005,24 @@ mod tests {
             parse_host_port("http://nrf.local"),
             Some(("nrf.local".to_string(), 80))
         );
+    }
+}
+
+/// #1324: the NFProfile carries its host where its type belongs (TS 29.510
+/// §6.1.6.2.2): IPv4 in ipv4Addresses, IPv6 in ipv6Addresses, an FQDN as fqdn, and
+/// the service ipEndPoints likewise.
+#[cfg(test)]
+mod tests_nf_profile_host_kind_1324 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_carries_its_host_by_type() {
+        for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
+            // The N3 address varies too: it is typed the same way.
+            let profile = build_upf_nf_profile("id", host, host, 0);
+            let problems =
+                nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
+            assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
+        }
     }
 }

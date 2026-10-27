@@ -527,8 +527,19 @@ pub fn build_activate_default_bearer_context_request_with_params(
     );
     buf.write_lv(&eps_qos);
 
-    // Access Point Name
-    buf.write_lv(sess.apn.as_bytes());
+    // Access Point Name (TS 24.301 §9.9.4.1 -> TS 24.008 §10.5.6.1): the APN as
+    // TS 23.003 §9.1 labels, not the dotted string (#1350: the UE read the raw
+    // `internet` as a 105-octet label and got APN ""). An APN no label encoding can
+    // carry is refused at APN selection with ESM #27 (`reconcile_requested_apn`), so
+    // it does not reach here; should one ever, it is logged and sent empty rather than
+    // as wrapped length octets the UE would misread.
+    let apn = crate::s11_build::encode_apn_dns(&sess.apn).unwrap_or_else(|e| {
+        log::error!(
+            "ACTIVATE DEFAULT EPS BEARER CONTEXT REQUEST: {e}; Access Point Name sent empty"
+        );
+        Vec::new()
+    });
+    buf.write_lv(&apn);
 
     // PDN address
     let pdn_addr = encode_pdn_address(&sess.paa);
@@ -991,6 +1002,88 @@ mod tests {
                 .any(|w| w == [0x5e, 0x04, 0xfe, 0xc6, 0x0e, 0x00]),
             "APN-AMBR IE in {msg:02x?}"
         );
+    }
+
+    /// #1350, TS 24.008 §10.5.6.1 / TS 23.003 §9.1: the Access Point Name IE after the
+    /// EPS QoS carries `internet` as one length-prefixed label, and a dotted APN as one
+    /// label per dot-separated part.
+    #[test]
+    fn the_default_bearer_request_carries_the_apn_as_labels() {
+        let bearer = MmeBearer {
+            ebi: 5,
+            ..Default::default()
+        };
+        for (apn, labels) in [
+            ("internet", b"\x08internet".to_vec()),
+            (
+                "ims.mnc070.mcc999.gprs",
+                b"\x03ims\x06mnc070\x06mcc999\x04gprs".to_vec(),
+            ),
+        ] {
+            let sess = MmeSess {
+                apn: apn.to_string(),
+                ..Default::default()
+            };
+            let msg = build_activate_default_bearer_context_request_with_params(
+                &sess,
+                &bearer,
+                CreateAction::InAttachRequest,
+            );
+            // Header (3) + EPS QoS LV, then the APN LV.
+            let qos_len = usize::from(msg[3]);
+            let at = 4 + qos_len;
+            assert_eq!(
+                usize::from(msg[at]),
+                labels.len(),
+                "APN length for {apn}: {msg:02x?}"
+            );
+            assert_eq!(
+                &msg[at + 1..at + 1 + labels.len()],
+                &labels[..],
+                "APN value for {apn}"
+            );
+        }
+    }
+
+    /// #1352 review: APNs no label encoding can carry are refused, not wrapped.
+    #[test]
+    fn an_apn_without_a_valid_label_encoding_is_refused() {
+        use crate::s11_build::encode_apn_dns;
+        assert_eq!(
+            encode_apn_dns("internet").unwrap(),
+            b"\x08internet".to_vec()
+        );
+        assert!(encode_apn_dns("").is_err(), "empty");
+        assert!(encode_apn_dns("a..b").is_err(), "empty label");
+        assert!(encode_apn_dns("internet.").is_err(), "trailing dot");
+        let long = "x".repeat(64);
+        assert!(encode_apn_dns(&long).is_err(), "64-octet label");
+        assert!(encode_apn_dns(&"x".repeat(63)).is_ok(), "63 is the maximum");
+        // Ten 9-octet labels encode to exactly 100 octets; one more is over.
+        assert!(
+            encode_apn_dns(&["abcdefghi"; 10].join(".")).is_ok(),
+            "100 octets"
+        );
+        assert!(
+            encode_apn_dns(&["abcdefghi"; 11].join(".")).is_err(),
+            "over 100 octets"
+        );
+        // The builder sends an empty IE rather than wrapped octets.
+        let sess = MmeSess {
+            apn: "x".repeat(300),
+            ..Default::default()
+        };
+        let bearer = MmeBearer {
+            ebi: 5,
+            ..Default::default()
+        };
+        let msg = build_activate_default_bearer_context_request_with_params(
+            &sess,
+            &bearer,
+            CreateAction::InAttachRequest,
+        );
+        let at = 4 + usize::from(msg[3]);
+        assert_eq!(msg[at], 0, "an empty Access Point Name: {msg:02x?}");
     }
 
     #[test]

@@ -28,6 +28,7 @@ use std::time::Duration;
 pub mod bsf_sm;
 pub mod context;
 pub mod event;
+pub mod metrics;
 pub mod nnrf_handler;
 pub mod sbi_path;
 pub mod sbi_response;
@@ -338,6 +339,15 @@ pub async fn run() -> Result<()> {
 
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
 
+    // #1334: the Prometheus endpoint, on NEXTGCORE_METRICS_BIND (loopback by default,
+    // #837) and BSF_METRICS_PORT (9090). Non-fatal, like smfd's.
+    let _metrics = nextgcore_metrics::nf::serve_nf_metrics(
+        "BSF",
+        "BSF_METRICS_PORT",
+        Arc::new(crate::metrics::render_prometheus),
+    )
+    .await;
+
     // Register with NRF and start heartbeat worker
     match match sbi.registration_host() {
         Ok(host) => register_with_nrf(host, sbi.port, args.tls).await,
@@ -400,6 +410,16 @@ pub async fn run() -> Result<()> {
 /// consumer-built `SbiRequest`s through the real BSF validation/handlers
 /// in-process instead of a lenient mock.
 pub async fn bsf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
+    // #1334: Nbsf_Management operations, counted by outcome.
+    let operation = crate::metrics::classify(&request.header.method, &request.header.uri);
+    let response = bsf_sbi_route(request).await;
+    if let Some(op) = operation {
+        crate::metrics::observe(op, response.status);
+    }
+    response
+}
+
+async fn bsf_sbi_route(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
 
@@ -2714,15 +2734,18 @@ fn bsf_nf_profile_json(
         }
     }
 
-    serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "BSF",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": services,
-        "allowedNfTypes": nf_allowed,
-        "heartBeatTimer": 10
-    })
+    nextgcore_sbi::nf_addressing::classify_profile_host(
+        serde_json::json!({
+            "nfInstanceId": nf_instance_id,
+            "nfType": "BSF",
+            "nfStatus": "REGISTERED",
+            "ipv4Addresses": [sbi_addr],
+            "nfServices": services,
+            "allowedNfTypes": nf_allowed,
+            "heartBeatTimer": 10
+        }),
+        sbi_addr,
+    )
 }
 
 /// Register BSF with NRF — the ONLY NRF registration this BSF performs.
@@ -3027,6 +3050,131 @@ mod tests {
             .await
             .expect("BSF SBI server starts");
         (server, SbiClient::with_host_port("127.0.0.1", addr.port()))
+    }
+
+    /// #1334: the BSF's `/metrics`, scraped over HTTP, follows Nbsf_Management traffic
+    /// over the real SBI server: a binding registered, discovered and deregistered, a
+    /// discovery that matches nothing, each counted by result, the census showing the
+    /// binding while it exists.
+    ///
+    /// REVERT-VERIFIED: without the `crate::metrics::observe` in
+    /// `bsf_sbi_request_handler` the operation counts stay; without
+    /// `render_bsf_families` the series are missing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_scraped_endpoint_follows_nbsf_management_traffic_1334() {
+        let (server, client) = start_bsf().await;
+        let (bound, handle) = nextgcore_metrics::nes_energy::serve_metrics(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(crate::metrics::render_prometheus),
+        )
+        .await
+        .expect("metrics endpoint");
+        let value = |b: &str, s: &str| nextgcore_metrics::nf::sample_value(b, s).unwrap_or(0.0);
+        let op = |o: &str, r: &str| {
+            format!(r#"bsf_binding_operations_total{{binding="pdu",operation="{o}",result="{r}"}}"#)
+        };
+        let watched = [
+            op("register", "success"),
+            op("discovery", "success"),
+            op("deregister", "success"),
+            op("deregister", "failure"),
+        ];
+        let before = nextgcore_metrics::nf::scrape_for_test(bound).await;
+        let b: Vec<f64> = watched.iter().map(|s| value(&before, s)).collect();
+
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings",
+                &json!({
+                    "dnn": "internet", "snssai": {"sst": 1},
+                    "ipv4Addr": "10.45.133.4", "supi": "imsi-001019913340001",
+                    "pcfFqdn": "pcf.example.com"
+                }),
+            )
+            .await
+            .expect("POST");
+        assert_eq!(resp.status, 201);
+        let id = resp
+            .http
+            .get_header("Location")
+            .expect("Location")
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string();
+        let during = nextgcore_metrics::nf::scrape_for_test(bound).await;
+        assert!(
+            value(&during, r#"bsf_pcf_bindings{binding="pdu"}"#) >= 1.0,
+            "{during}"
+        );
+        let resp = client
+            .get("/nbsf-management/v1/pcfBindings?ipv4Addr=10.45.133.4")
+            .await
+            .expect("GET");
+        assert_eq!(resp.status, 200);
+        let resp = client
+            .get("/nbsf-management/v1/pcfBindings?ipv4Addr=10.45.133.99")
+            .await
+            .expect("GET none");
+        assert_eq!(
+            resp.status, 204,
+            "no match is 204 (TS 29.521 §4.2.4.2), a success"
+        );
+        let resp = client
+            .delete(&format!("/nbsf-management/v1/pcfBindings/{id}"))
+            .await
+            .expect("DELETE");
+        assert_eq!(resp.status, 204);
+        let resp = client
+            .delete(&format!("/nbsf-management/v1/pcfBindings/{id}"))
+            .await
+            .expect("DELETE again");
+        assert_eq!(resp.status, 404, "already deregistered");
+
+        // #1334 review: an operation label is admitted on a 2xx, so a made-up resource
+        // of every service this NF serves must be answered with an error, or a client
+        // could mint label values.
+        for service in ["nbsf-management"] {
+            for path in [
+                format!("/{service}/v1/madeup-resource-1334"),
+                format!("/{service}/v1/imsi-001010000000001/madeup-resource-1334"),
+            ] {
+                for request in [
+                    nextgcore_sbi::message::SbiRequest::get(&path),
+                    nextgcore_sbi::message::SbiRequest::post(&path)
+                        .with_body("{}", "application/json"),
+                ] {
+                    let resp = client.send_request(request).await.expect("answered");
+                    assert!(resp.status >= 400, "{path} answered {}", resp.status);
+                }
+            }
+        }
+        let after = nextgcore_metrics::nf::scrape_for_test(bound).await;
+        assert!(
+            !after.contains("madeup"),
+            "no made-up resource in a label: {after}"
+        );
+        for ((s, b), w) in watched.iter().zip(&b).zip([1.0, 2.0, 1.0, 1.0]) {
+            assert!(value(&after, s) >= b + w, "{s}: {b} -> {after}");
+        }
+        for name in [
+            "bsf_pcf_bindings",
+            "bsf_subscriptions",
+            "nextgcore_sbi_request_total",
+            "nextgcore_nrf_registered",
+            "nextgcore_uptime_seconds",
+            "process_resident_memory_bytes",
+        ] {
+            assert!(
+                nextgcore_metrics::nf::has_series(&after, name),
+                "{name}:\n{after}"
+            );
+        }
+        assert!(!after.contains("10.45.133"), "no UE address in a label");
+        assert!(!after.contains("9913340001"), "no SUPI in a label");
+        handle.abort();
+        client.close().await;
+        server.stop().await.expect("stops");
     }
 
     // -----------------------------------------------------------------
@@ -5236,6 +5384,24 @@ mod shipped_config_tests {
         // and sets NEXTGCORE_HELM_REQUIRED, so this is never skipped there).
         if let Some(text) = nextgcore_core::helm_render::helm_rendered_config(&root, "bsf.yaml") {
             serde_yaml::from_str::<super::BsfYaml>(&text).expect("Helm bsf.yaml");
+        }
+    }
+}
+
+/// #1324: the NFProfile carries its host where its type belongs (TS 29.510
+/// §6.1.6.2.2): IPv4 in ipv4Addresses, IPv6 in ipv6Addresses, an FQDN as fqdn, and
+/// the service ipEndPoints likewise.
+#[cfg(test)]
+mod tests_nf_profile_host_kind_1324 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_carries_its_host_by_type() {
+        for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
+            let profile = bsf_nf_profile_json("id", host, 7777, false);
+            let problems =
+                nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
+            assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
         }
     }
 }

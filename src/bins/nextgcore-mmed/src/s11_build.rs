@@ -1063,14 +1063,38 @@ pub fn build_bearer_resource_command(
 // Tests
 // ============================================================================
 
-/// Encode APN to DNS wire format (label-length prefix per TS 23.003)
-fn encode_apn_dns(apn: &str) -> Vec<u8> {
-    let mut result = Vec::new();
+/// Encode an APN as TS 23.003 §9.1 labels (one length octet per dot-separated label),
+/// the APN value of the NAS Access Point Name IE (TS 24.008 §10.5.6.1, #1350).
+///
+/// #1352 review: an APN no label encoding can carry is refused rather than written
+/// wrong: an empty APN or label (`""`, `"a..b"`, a trailing dot), a label over 63
+/// octets (TS 23.003 §9.1 / RFC 1035 §2.3.4; `len as u8` also wrapped past 255), or an
+/// encoding over the IE's 100 octets (TS 24.008 §10.5.6.1).
+pub(crate) fn encode_apn_dns(apn: &str) -> Result<Vec<u8>, String> {
+    if apn.is_empty() {
+        return Err("empty APN".to_string());
+    }
+    let mut result = Vec::with_capacity(apn.len() + 1);
     for label in apn.split('.') {
+        if label.is_empty() {
+            return Err(format!("APN {apn:?} has an empty label"));
+        }
+        if label.len() > 63 {
+            return Err(format!(
+                "APN {apn:?} has a {}-octet label (at most 63)",
+                label.len()
+            ));
+        }
         result.push(label.len() as u8);
         result.extend_from_slice(label.as_bytes());
     }
-    result
+    if result.len() > 100 {
+        return Err(format!(
+            "APN {apn:?} encodes to {} octets (at most 100)",
+            result.len()
+        ));
+    }
+    Ok(result)
 }
 
 #[cfg(test)]

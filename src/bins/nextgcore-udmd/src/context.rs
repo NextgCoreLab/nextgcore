@@ -1417,6 +1417,18 @@ impl UdmContext {
         self.sess_list.read().map(|l| l.len()).unwrap_or(0)
     }
 
+    /// UEs with an AMF registered for 3GPP access (#1334, `/metrics`).
+    pub fn amf_registered_ue_count(&self) -> usize {
+        self.ue_list
+            .read()
+            .map(|l| {
+                l.values()
+                    .filter(|ue| ue.amf_3gpp_access_registration.is_some())
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     /// Get number of SDM subscriptions
     pub fn sdm_subscription_count(&self) -> usize {
         self.sdm_subscription_list
@@ -1433,6 +1445,11 @@ impl Default for UdmContext {
 }
 
 /// Global UDM context (thread-safe singleton)
+// Tests: this context is process-global, and its lock is
+// `crate::test_support::CONTEXT_GUARD` (lib.rs, public so peer crates' tests can take
+// it). Any test that reads or writes the SDM/EE subscription lists, or makes a UECM
+// call that notifies them, holds it. An `anyUE` EE subscription matches every SUPI, so
+// unique per-test SUPIs do not isolate it (#1357).
 static GLOBAL_UDM_CONTEXT: std::sync::OnceLock<Arc<RwLock<UdmContext>>> =
     std::sync::OnceLock::new();
 

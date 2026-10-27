@@ -104,6 +104,9 @@ spec:
           configMap:
             name: grafana-dashboard-provider
 ---
+# ClusterIP, never NodePort (#1365): Grafana's only gate is its admin password,
+# and a NodePort opens it on every node IP. Use
+#   kubectl -n nextg-system port-forward svc/grafana 3000:3000
 apiVersion: v1
 kind: Service
 metadata:
@@ -112,11 +115,10 @@ metadata:
   labels:
     app.kubernetes.io/name: grafana
 spec:
-  type: NodePort
+  type: ClusterIP
   selector:
     app.kubernetes.io/name: grafana
   ports:
     - name: http
       port: 3000
       targetPort: 3000
-      nodePort: 30300

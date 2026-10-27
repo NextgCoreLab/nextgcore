@@ -70,6 +70,7 @@ Defaults below are the real values from `NrfPolicy::default()` and its constants
 - Consumer side: an NF signs its CCA with the ES256 key at `NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE` (resolved process-wide in `nextgcore-sbi`, generated `0600` on first use if absent, and an error — never a silent replacement — if malformed). Its public half must be registered here under `cca_trusted_keys`, keyed by that NF's `nfInstanceId`.
 - **The NRF is not exempt from its own policy.** With `nrf.sbi.oauth2.require = true` the NRF requests tokens from itself for its outbound status notifications, and that request is authenticated like any other: give the NRF a CCA signing key and register its own public key under `cca_trusted_keys`. It deliberately does **not** self-exempt by `nfInstanceId` — a token request arriving over the network claiming to be the NRF is indistinguishable from a spoofed one, so exempting that identity would reopen the bypass this closes.
 - `OTEL_EXPORTER_OTLP_ENDPOINT` sets the OpenTelemetry export target (default `http://jaeger:4317`).
+- `NRF_METRICS_PORT` (default `9090`) and `NEXTGCORE_METRICS_BIND` (default `127.0.0.1`, #837) place the Prometheus `/metrics` endpoint (#1334; families in the Observability chapter). The Kind manifests reach it through the `nrf-metrics` ClusterIP Service; the `nrf` SBI Service is ClusterIP too (#1365), so no node port is opened for either.
 
 ## Honesty notes
 

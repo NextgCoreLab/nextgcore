@@ -105,6 +105,15 @@ impl NfInstance {
     }
 
     /// Find a service by type
+    /// This instance's own host (TS 29.510 §6.1.6.2.2): its first IPv4 address, else
+    /// its first IPv6 address, else its FQDN (#1324).
+    pub fn host(&self) -> Option<&String> {
+        self.ipv4_addresses
+            .first()
+            .or(self.ipv6_addresses.first())
+            .or(self.fqdn.as_ref())
+    }
+
     pub fn find_service(&self, service_type: SbiServiceType) -> Option<&NfService> {
         self.services
             .iter()
@@ -112,16 +121,18 @@ impl NfInstance {
     }
 
     /// The `(host, port)` a consumer dials for `service_type` on this instance:
-    /// the service's own IP, else the instance IPv4, else the service FQDN, else
+    /// the service's own IP, else the instance IPv4, else its IPv6, else the service FQDN, else
     /// the instance FQDN, on the service's port. The one spelling every
     /// consumer uses, so a failed endpoint can be matched back to its profile
     /// (#435, #664).
     pub fn endpoint_for(&self, service_type: SbiServiceType) -> Option<(String, u16)> {
         let svc = self.find_service(service_type)?;
+        // #1324: an IPv6-only instance is reachable too.
         let host = svc
             .ip_addresses
             .first()
             .or(self.ipv4_addresses.first())
+            .or(self.ipv6_addresses.first())
             .or(svc.fqdn.as_ref())
             .or(self.fqdn.as_ref())?;
         Some((host.clone(), svc.port))
@@ -133,6 +144,7 @@ impl NfInstance {
             svc.ip_addresses
                 .iter()
                 .chain(self.ipv4_addresses.iter())
+                .chain(self.ipv6_addresses.iter())
                 .chain(svc.fqdn.iter())
                 .chain(self.fqdn.iter())
                 .map(move |h| (h.as_str(), svc.port))

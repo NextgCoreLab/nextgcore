@@ -12,6 +12,7 @@ pub mod app;
 pub mod av_algorithm; // #115: which f1-f5* algorithm generates a subscriber's AVs
 pub mod context;
 pub mod event;
+pub mod metrics;
 #[cfg(feature = "nes")]
 pub mod nes_driver; // issue #22 Network Energy Saving runtime (off by default)
 pub mod notify; // #83 Nudm_SDM Data Change Notification / Nudm_EE Event Occurrence
@@ -62,6 +63,10 @@ pub mod test_support {
     /// cache (`nextgcore_sbi::context::global_context()`): registering NF profiles,
     /// evicting them, and `udm_sbi_close`, which clears it (#898). A test that does any
     /// of these must hold it.
+    ///
+    /// #1357: it is also the lock of the context's SDM/EE subscription lists. A UECM
+    /// registration or deregistration notifies every subscription covering its SUPI,
+    /// `anyUE` ones included, so a test that makes one holds it too.
     pub static CONTEXT_GUARD: Mutex<()> = Mutex::new(());
 
     /// Initialize the process-global UDM context for in-process strict-peer

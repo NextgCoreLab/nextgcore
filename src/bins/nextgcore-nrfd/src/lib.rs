@@ -9,6 +9,7 @@
 
 pub mod context;
 pub mod event;
+pub mod metrics;
 pub mod nf_sm;
 pub mod nnrf_build;
 pub mod nnrf_handler;

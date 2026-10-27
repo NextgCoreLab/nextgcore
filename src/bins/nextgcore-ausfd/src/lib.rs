@@ -16,6 +16,7 @@ pub mod ausf_sm;
 pub mod context;
 pub mod eap_aka_prime;
 pub mod event;
+pub mod metrics;
 pub mod nausf_handler;
 pub mod nudm_build;
 pub mod nudm_handler;

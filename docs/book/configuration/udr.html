@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e91a4036.js";
+            window.path_to_searchindex_js = "../searchindex-99ff0175.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -179,7 +179,7 @@
                     <main>
                         <h1 id="udr-configuration"><a class="header" href="#udr-configuration">UDR Configuration</a></h1>
 <p>The UDR (Unified Data Repository, <code>nextgcore-udrd</code>) stores and serves subscriber data to the UDM, policy data to the PCF, and exposure/application data, per TS 29.504 and TS 29.505 (as cited in the daemon’s source comments). It serves a single SBI service, <code>Nudr_DataRepository</code> (<code>/nudr-dr/v1/...</code>) — the request router in <code>udr_sbi_request_handler</code> returns 404 for any other service name. Under <code>nudr-dr</code> it implements the <code>subscription-data</code> tree (authentication-subscription, authentication-status, provisioned-data <code>am-data</code>/<code>smf-selection-subscription-data</code>/<code>sm-data</code> incl. the combined GET with <code>dataset-names</code> and the <code>fields</code> partial-retrieval parameter per TS 29.504 §6.1.4.2 code comments, context-data <code>amf-3gpp-access</code> and <code>smf-registrations</code>, and <code>subs-to-notify</code>), the <code>policy-data/ues/{supi}</code> tree (<code>am-data</code>, <code>sm-data</code>, <code>ue-policy-set</code> — TS 29.519 shapes per code comments), and the <code>exposure-data</code> and <code>application-data</code> trees (<code>pfds</code> per TS 29.551 code comment, <code>influenceData</code>, plus their <code>subs-to-notify</code> subscriptions).</p>
-<p>Configuration is split between a YAML file (default path <code>/etc/nextgcore/udr.yaml</code>, overridable with <code>-c/--config</code>), command-line flags, and environment variables. The YAML file is the source for the MongoDB URI, the advertised/bind SBI address and port (which, unlike most NFs, <strong>override</strong> the CLI flags when present), the NRF URI, and OAuth2 enforcement; logging, TLS, and state-file persistence are CLI-flag (or env-var) territory. Two environment variables provide fallbacks: <code>DB_URI</code> (when the YAML has no <code>db_uri</code>) and <code>NEXTGCORE_UDR_STATE_FILE</code> (when <code>--state-file</code> is not given).</p>
+<p>Configuration is split between a YAML file (default path <code>/etc/nextgcore/udr.yaml</code>, overridable with <code>-c/--config</code>), command-line flags, and environment variables. The YAML file is the source for the MongoDB URI, the SBI bind address and port (after the CLI flags, #1312) and the advertised host, the NRF URI, and OAuth2 enforcement; logging, TLS, and state-file persistence are CLI-flag (or env-var) territory. Two environment variables provide fallbacks: <code>DB_URI</code> (when the YAML has no <code>db_uri</code>) and <code>NEXTGCORE_UDR_STATE_FILE</code> (when <code>--state-file</code> is not given).</p>
 <blockquote>
 <p><strong>Honesty note:</strong> UDR behavior is validated by this project’s own unit tests and matched-simulator docker E2E runs, not by third-party conformance certification. The non-subscriber resource trees (context-data, exposure-data, application-data, policy provisioning, subscriptions) are a bespoke in-memory store with an optional JSON snapshot file — not a real database backend; only the subscriber data path goes to MongoDB. Resource shapes mirror TS 29.504/29.505/29.519 terminology as documented in code comments. A legacy ported-C handler/state-machine path (<code>nudr_handler.rs</code>, <code>udr_sm.rs</code>) exists in the crate but is explicitly <em>not wired</em> to the live SBI server (udrd-09 per the <code>lib.rs</code> comment).</p>
 </blockquote>
@@ -234,8 +234,9 @@ udr:
 <tbody>
 <tr><td><code>db_uri</code></td><td>string</td><td>env <code>DB_URI</code>, else <code>mongodb://172.23.0.2/nextgcore</code></td><td>MongoDB connection URI for the subscriber database (auth subscriptions, provisioned-data). Precedence: YAML <code>db_uri</code> → <code>DB_URI</code> env var → hardcoded Docker default. Credentials are masked in logs. If MongoDB init fails the daemon warns and continues with hardcoded defaults.</td></tr>
 <tr><td><code>udr.sbi.server[]</code></td><td>list</td><td>absent → CLI values used</td><td>Only the <strong>first</strong> entry is read; extra entries are ignored.</td></tr>
-<tr><td><code>udr.sbi.server[0].address</code></td><td>string</td><td>absent → <code>--sbi-addr</code> (<code>0.0.0.0</code>)</td><td><strong>Overrides</strong> the CLI bind address, and is also the address advertised in the NRF NFProfile — set here so the profile advertises a routable endpoint instead of <code>0.0.0.0</code> (per code comment).</td></tr>
-<tr><td><code>udr.sbi.server[0].port</code></td><td>u16</td><td>absent → <code>--sbi-port</code> (<code>7777</code>)</td><td><strong>Overrides</strong> the CLI SBI port; used for both bind and NFProfile advertisement.</td></tr>
+<tr><td><code>udr.sbi.server[0].address</code></td><td>string</td><td>absent → <code>127.0.0.1</code> (#1308)</td><td>SBI bind address, after <code>--sbi-addr</code> (#1312).</td></tr>
+<tr><td><code>udr.sbi.server[0].advertise</code></td><td>string</td><td>absent → the bind address, unless it is a wildcard</td><td>The host registered in the NRF NFProfile and put in callback URIs (#1312). After <code>--sbi-advertise</code> and <code>NEXTGCORE_SBI_ADVERTISE</code>. A wildcard is never advertised: with a wildcard bind and nothing set here, the NF does not register with the NRF and logs why.</td></tr>
+<tr><td><code>udr.sbi.server[0].port</code></td><td>u16</td><td>absent → <code>7777</code></td><td>SBI port, after <code>--sbi-port</code> (#1312); used for both bind and NFProfile advertisement.</td></tr>
 <tr><td><code>udr.sbi.client.nrf[]</code></td><td>list</td><td>absent → NRF registration skipped</td><td>Only the <strong>first</strong> entry is used. With no NRF URI the daemon logs “skipping NRF registration” and runs standalone.</td></tr>
 <tr><td><code>udr.sbi.client.nrf[0].uri</code></td><td>string</td><td>required within the entry</td><td>NRF base URI for NF registration, heartbeat, and (when OAuth2 is on) JWKS fetching and token acquisition. There is <strong>no</strong> CLI fallback flag for the NRF URI.</td></tr>
 <tr><td><code>udr.sbi.oauth2.require</code></td><td>bool</td><td><code>false</code></td><td>SBI OAuth2 bearer-token enforcement. When <code>true</code>, incoming requests are verified against the NRF’s JWKS (fails closed if no NRF URI is configured), and a process-wide OAuth2 client is installed so outbound SBI calls attach NRF-issued Bearer tokens (Wave-6 H8 Phase A per code comment). No CLI override exists.</td></tr>
@@ -262,8 +263,9 @@ udr:
 <tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Disable color output.</td></tr>
 <tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td>Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor.</td></tr>
-<tr><td><code>--sbi-addr</code></td><td>string</td><td><code>0.0.0.0</code></td><td>SBI server bind address. Overridden by <code>udr.sbi.server[0].address</code> when present.</td></tr>
-<tr><td><code>--sbi-port</code></td><td>u16</td><td><code>7777</code></td><td>SBI server port. Overridden by <code>udr.sbi.server[0].port</code> when present.</td></tr>
+<tr><td><code>--sbi-addr</code></td><td>string</td><td><code>udr.sbi.server[0].address</code>, else <code>127.0.0.1</code> (#1308)</td><td>SBI server bind address; beats the YAML (#1312).</td></tr>
+<tr><td><code>--sbi-advertise</code></td><td>string</td><td>unset</td><td>The SBI host advertised to the NRF and in callback URIs (#1312); then <code>NEXTGCORE_SBI_ADVERTISE</code>, then <code>udr.sbi.server[0].advertise</code>, then the bind address when it is not a wildcard.</td></tr>
+<tr><td><code>--sbi-port</code></td><td>u16</td><td><code>udr.sbi.server[0].port</code>, else <code>7777</code></td><td>SBI server port; beats the YAML (#1312).</td></tr>
 <tr><td><code>--tls</code></td><td>flag</td><td>off</td><td>Enable TLS on the SBI server.</td></tr>
 <tr><td><code>--tls-cert</code></td><td>path</td><td>unset</td><td>TLS certificate file.</td></tr>
 <tr><td><code>--tls-key</code></td><td>path</td><td>unset</td><td>TLS private key file.</td></tr>
@@ -303,6 +305,8 @@ out.</p>
 <ul>
 <li><strong>Environment variables</strong>: <code>DB_URI</code> (MongoDB URI; read only when the YAML has no <code>db_uri</code> line), <code>NEXTGCORE_UDR_STATE_FILE</code> (state-file path; read only when <code>--state-file</code> is absent — the flag wins), and <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> (OpenTelemetry OTLP exporter endpoint, default <code>http://jaeger:4317</code>).</li>
 </ul>
+<h2 id="metrics-endpoint-1334"><a class="header" href="#metrics-endpoint-1334">Metrics endpoint (#1334)</a></h2>
+<p><code>UDR_METRICS_PORT</code> (default <code>9090</code>) and <code>NEXTGCORE_METRICS_BIND</code> (default <code>127.0.0.1</code>, #837) place the unauthenticated Prometheus <code>/metrics</code> endpoint. The compose file and manifests set <code>0.0.0.0</code> inside the private container/pod network and publish no host port; the Kubernetes Service port is ClusterIP. The series are listed in the <a href="../observability.html">Observability</a> chapter.</p>
 
                     </main>
 

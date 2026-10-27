@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e91a4036.js";
+            window.path_to_searchindex_js = "../searchindex-99ff0175.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -203,7 +203,7 @@
 <ul>
 <li><code>-c / --config &lt;path&gt;</code> — config file, default <code>/etc/nextgcore/amf.yaml</code></li>
 <li><code>--log-level &lt;level&gt;</code> — <code>trace|debug|info|warn|error</code>. Without it, the config file’s <code>logger.level</code>, else <code>info</code>. The short form is <code>-l</code> in amfd, mmed, sgwcd and sgwud; most other NFs, smfd included, follow Open5GS and use <code>-e</code> for the level and <code>-l</code> for <code>--log-file</code>. Run <code>&lt;binary&gt; --help</code> for the rest of an NF’s flags</li>
-<li><code>--ngap-addr</code> (AMF only) — NGAP bind address, default <code>0.0.0.0:38412</code></li>
+<li><code>--ngap-addr</code> (AMF only) — NGAP bind address, default <code>127.0.0.1:38412</code> (loopback, #1308)</li>
 <li><code>--sctp-backend</code> (AMF only) — <code>userspace</code> (default, sctp-proto over UDP) or <code>kernel</code> (Linux kernel SCTP, needs the <code>kernel-sctp</code> build feature)</li>
 </ul>
 <p>Loading is lenient: if the file is missing or fails to parse, the NF logs a warning and <strong>continues with built-in defaults</strong> rather than aborting.</p>
@@ -228,7 +228,7 @@
 <ul>
 <li><code>sbi.server</code> — list of <code>{address, port}</code> (port 7777 everywhere)</li>
 <li><code>sbi.client.nrf</code> — list of <code>{uri}</code> pointing at the NRF</li>
-<li><code>metrics.server</code> — Prometheus endpoint, port 9090 in all shipped configs</li>
+<li>No <code>metrics.server</code>: no daemon reads one, so the shipped configs carry none (#1312). A metrics listener, where a daemon has one, is set by its environment (<code>MME_METRICS_ADDR</code>, <code>NEXTGCORE_METRICS_BIND</code>, <code>SMF_METRICS_PORT</code>, <code>UPF_METRICS_PORT</code>, <code>SGWC_METRICS_PORT</code>, <code>SGWU_METRICS_PORT</code>, <code>UCMF_METRICS_ADDR</code>) and binds loopback by default (#1308)</li>
 <li><code>tls</code> — <code>enabled</code> (false by default), <code>cert</code>/<code>key</code>/<code>ca</code> paths, <code>min_version: "1.2"</code>. The config comments say <code>TLS_ENABLED=true SBI_SCHEME=https</code> turns it on, but no Rust code reads those variables. An NF’s SBI listener uses TLS when started with <code>--tls --tls-cert &lt;pem&gt; --tls-key &lt;pem&gt;</code> (the SBI NFs other than amfd/smfd) or under the <code>production</code> SBI profile (amf/smf/ausf/udm, below)</li>
 <li>Protocol servers per NF: AMF <code>ngap</code> (38412), SMF/UPF <code>pfcp</code> (8805), UPF <code>gtpu</code> (2152), SMF <code>gtpc</code>/<code>gtpu</code></li>
 <li>SMF/UPF <code>session</code> subnets (<code>10.45.0.0/16</code> gw <code>10.45.0.1</code>, <code>2001:db8:cafe::/48</code>), SMF <code>dns</code> and <code>mtu: 1400</code></li>

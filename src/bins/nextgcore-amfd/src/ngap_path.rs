@@ -756,6 +756,12 @@ pub struct UeNasContext {
     /// #686 PR 2: taken over from another AMF of the set; the peer updates are owed until
     /// its first message verifies ([`ue_context_takeover`]).
     taken_over: bool,
+    /// #1329: restored by this AMF instance after its own restart. Its UDM and PCF still
+    /// hold the callback addresses of the process that stored it, whose pod IP is gone,
+    /// so those of the takeover's peer updates are owed until its first message
+    /// verifies, without the GUTI reallocation (the GUAMI is unchanged). Its SMFs are
+    /// told at restore (`point_smfs_at_self`).
+    peers_stale: bool,
     /// #686 PR 2: a 5G-GUTI of this AMF's GUAMI is owed after the Service Accept, whatever
     /// `AMF_GUTI_REALLOCATION` says (TS 23.501 §5.21.2.3).
     guti_reallocation_owed: bool,
@@ -856,6 +862,15 @@ impl UeNasContext {
     }
 }
 
+/// The UE census `/metrics` reports (#1334): (RM-REGISTERED, CM-CONNECTED) UEs in
+/// the live store. A UE restored from the context store after a restart has no NG
+/// association, so it is never CM-CONNECTED until it comes back.
+pub(crate) fn ue_census(store: &crate::ue_store::UeStore<UeNasContext>) -> (usize, usize) {
+    let registered = store.count_matching(|s| s.registered);
+    let connected = store.count_matching(|s| !s.cm_idle && !s.restored);
+    (registered, connected)
+}
+
 impl crate::ue_store::UeIdentity for UeNasContext {
     fn amf_ue(&self) -> &AmfUe {
         &self.amf_ue
@@ -936,6 +951,7 @@ impl UeNasContext {
             cm_idle: false,
             restored: false,
             taken_over: false,
+            peers_stale: false,
             guti_reallocation_owed: false,
         }
     }
@@ -1191,6 +1207,10 @@ pub struct NgapServer {
     outstanding_releases: HashMap<(u64, u64), OutstandingRelease>,
     /// SBI work run off this task (#796 review M1): the re-selection attempts.
     sbi_offload: crate::sbi_offload::SbiOffload,
+    /// #1329 review: the bound on the restore-time serving-AMF updates in flight, per
+    /// SMF and overall, so a restore while an SMF is down leaves the offload's
+    /// permits to regular signalling.
+    restore_peer_limits: std::sync::Arc<ue_context_takeover::RestorePeerLimits>,
     /// #748: the UCMF Assigns in flight for re-assignment, one per (TAC, UE radio
     /// capability), with the UEs waiting on each. A UE joins the one in flight for
     /// its pair instead of asking again, so N UEs of one model cost one Assign and
@@ -1499,6 +1519,15 @@ const RACS_ASSIGN_BACKOFF: Duration = Duration::from_secs(2);
 /// How many SBI exchanges run off the NGAP task at once (#796 review M1).
 const MAX_OFFLOADED_SBI: usize = 16;
 
+/// #1329 review: at most this many restore-time serving-AMF updates hold an offload
+/// permit at once, a quarter of [`MAX_OFFLOADED_SBI`]: a restore of many UEs while an
+/// SMF is blackholed then leaves the rest to regular signalling.
+const RESTORE_PEER_UPDATES_MAX: usize = MAX_OFFLOADED_SBI / 4;
+
+/// #1329 review: and at most this many of them per SMF, so one SMF that is down does
+/// not hold up the restore's updates to the others.
+const RESTORE_PEER_UPDATES_PER_SMF: usize = 2;
+
 /// How long the AMF keeps re-selecting an SMF for an establishment it could not
 /// deliver (#796). Below the UE's T3580 (16 s, TS 24.501 §10.3), so the UE gets
 /// an answer before it retransmits. An SMF restarting in place is back well
@@ -1734,6 +1763,10 @@ impl NgapServer {
             #[cfg(test)]
             last_eps_prepared_ebis: None,
             sbi_offload: crate::sbi_offload::SbiOffload::new(MAX_OFFLOADED_SBI),
+            restore_peer_limits: std::sync::Arc::new(ue_context_takeover::RestorePeerLimits::new(
+                RESTORE_PEER_UPDATES_MAX,
+                RESTORE_PEER_UPDATES_PER_SMF,
+            )),
             contextless_ue_ids: std::collections::VecDeque::new(),
             timer_configs: {
                 // Reachability timers derive from the CONFIGURED T3512
@@ -1792,6 +1825,7 @@ impl NgapServer {
 
     /// Poll for incoming NGAP messages and server events
     pub async fn poll(&mut self) -> Result<bool> {
+        self.publish_gnb_census().await;
         self.process_local_timers().await?;
 
         // Keep the RAN's view of overload in step with the NAS congestion posture.
@@ -2019,6 +2053,8 @@ impl NgapServer {
             log::warn!("NGAP message too short from association {association_id}");
             return Ok(());
         }
+        // #1334: every NGAP PDU received, by procedure and outcome.
+        crate::metrics::observe_ngap(crate::metrics::NgapDirection::Rx, data);
 
         // Log raw message header for debugging
         log::debug!(
@@ -4018,6 +4054,8 @@ impl NgapServer {
         // initial NAS message (InitialUEMessage). Drives the §4.4.6 gate.
         integrity_protected: bool,
     ) -> Result<()> {
+        // #1334: every Registration Request reaches this handler once.
+        crate::metrics::observe_registration_request(nas);
         let Some(req) = parse_registration_request_pdu(nas) else {
             log::error!("Malformed Registration Request: rejecting (#96)");
             let reject =
@@ -5248,6 +5286,7 @@ impl NgapServer {
             .await?;
             return Ok(());
         }
+        crate::metrics::observe_authentication_success();
 
         // #361: 5G-AKA has succeeded, so an emergency registration held for this UE is an
         // AUTHENTICATED one -- promoted here rather than guessed at the Registration Request,
@@ -5471,6 +5510,8 @@ impl NgapServer {
     ) -> Result<()> {
         let cause = nas.get(3).copied().unwrap_or(0);
         log::warn!("Authentication Failure from UE {amf_ue_ngap_id}: 5GMM cause #{cause}");
+        // #1334: TS 28.552 AMF.AuthFail, "on receipt of AUTHENTICATION FAILURE".
+        crate::metrics::observe_ue_authentication_failure();
 
         // Authentication failure parameter (IEI 0x30, TLV, AUTS 14 bytes)
         let mut auts: Option<[u8; 14]> = None;
@@ -12636,6 +12677,9 @@ impl NgapServer {
         )
         .ok_or_else(|| anyhow::anyhow!("Failed to build Downlink NAS Transport"))?;
         self.send_to_association(association_id, &pdu).await?;
+        // #1334: an unprotected 5GMM message is counted here, once it is on the wire
+        // (a protected one was counted when NAS security protected it, and is skipped).
+        crate::metrics::observe_downlink_nas(nas);
         Ok(pdu)
     }
 
@@ -19313,6 +19357,18 @@ impl NgapServer {
 
     /// Send message to a gNB by association ID
     /// NOTE: This method requires &mut self to access the SCTP server
+    /// Publish the gNB census for `/metrics` (#1334): this loop owns the associations,
+    /// so it is the one place their count is read. Every poll, so the gauge is at
+    /// most one poll old.
+    async fn publish_gnb_census(&self) {
+        let sessions = self.sessions.read().await;
+        let ng_setup = sessions
+            .values()
+            .filter(|s| s.gnb.state.ng_setup_success)
+            .count();
+        crate::metrics::set_gnb_census(sessions.len(), ng_setup);
+    }
+
     async fn send_to_association(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
         log::debug!(
             "Sending {} bytes to association {}",
@@ -19329,13 +19385,17 @@ impl NgapServer {
         #[cfg(test)]
         if let Some(sent) = self.sent_ngap.as_mut() {
             sent.push((association_id, stream_id, data.to_vec()));
+            crate::metrics::observe_ngap(crate::metrics::NgapDirection::Tx, data);
             return Ok(());
         }
 
         self.transport
             .send(association_id, stream_id, data)
             .await
-            .map_err(|e| anyhow::anyhow!("SCTP send error: {e}"))
+            .map_err(|e| anyhow::anyhow!("SCTP send error: {e}"))?;
+        // #1334: every NGAP PDU that left, by procedure and outcome.
+        crate::metrics::observe_ngap(crate::metrics::NgapDirection::Tx, data);
+        Ok(())
     }
 
     /// The SCTP stream an NGAP PDU goes out on (TS 38.412 §7, #813).
@@ -19722,7 +19782,12 @@ fn build_sm_context_identity(
         pei: state.and_then(|s| s.amf_ue.pei.clone()),
         guami,
         serving_plmn,
-        serving_nf_id: None,
+        // #1331: M in SmContextCreateData (TS 29.502 Table 6.1.6.2.2-1), the serving
+        // AMF's NF instance identifier.
+        serving_nf_id: Some(
+            nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf)
+                .to_string(),
+        ),
         ue_location,
         // Issue #205: the UE's EXTERNAL identity, stored on the UE context from
         // the `gpsis` array of the `am-data` the AMF retrieves at registration.
@@ -21197,6 +21262,11 @@ fn gmm_cause_from_sbi_error(err: &crate::sbi_path::SbiError) -> GmmCause {
         }
         SbiError::ResponseParseError(_) => GmmCause::SemanticallyIncorrectMessage,
         SbiError::InvalidState => GmmCause::MessageNotCompatibleWithTheProtocolState,
+        // #1329 review: the structured form of a "{what} returned status {status}"
+        // `RequestFailed`, mapped as that text was.
+        SbiError::PeerStatus { what, status, .. } => gmm_cause_from_sbi_error(
+            &SbiError::RequestFailed(format!("{what} returned status {status}")),
+        ),
     }
 }
 
@@ -21552,6 +21622,8 @@ mod tests {
     /// Handler-level tests asserting what amfd SENDS (#760, ...), in their own file.
     mod handler_tests;
     mod initial_registration_tests;
+    /// #1334: the `/metrics` counters follow the NGAP and NAS on the wire.
+    mod metrics_tests;
     mod off_task_smf_tests;
     mod poll_wake_tests;
     mod positioning_reach_tests;
@@ -21754,6 +21826,16 @@ mod tests {
         let without = build_sm_context_identity(Some(&state), None);
         assert_eq!(without.gpsi, None);
         assert_eq!(without.supi.as_deref(), Some("imsi-262011234567890"));
+
+        // #1331: the serving AMF's nfInstanceId, mandatory in SmContextCreateData.
+        assert_eq!(
+            identity.serving_nf_id.as_deref(),
+            Some(
+                nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf)
+                    .to_string()
+                    .as_str()
+            )
+        );
 
         // No UE context at all: every UE-sourced member is absent.
         let none = build_sm_context_identity(None, None);

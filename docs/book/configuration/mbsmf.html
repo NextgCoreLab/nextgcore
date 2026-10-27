@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e91a4036.js";
+            window.path_to_searchindex_js = "../searchindex-99ff0175.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -215,7 +215,7 @@ mbsmf:
 <p>Everything else in the shipped example file is decorative for this binary — the daemon never deserializes it:</p>
 <ul>
 <li><strong><code>logger.level</code> is read.</strong> The log level is <code>-e/--log-level</code> when given, else this file’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code>, when set, overrides all three (#691).</li>
-<li><strong><code>mbsmf.sbi.server[]</code> (address/advertise/port) is inert.</strong> The SBI bind address and port come exclusively from <code>--sbi-addr</code>/<code>--sbi-port</code>. No advertise address is read.</li>
+<li><strong><code>mbsmf.sbi.server[0]</code> is read (#1312).</strong> The SBI bind is <code>--sbi-addr</code>/<code>--sbi-port</code>, else <code>address</code>/<code>port</code> here, else <code>127.0.0.1</code> and the default port. The advertised host is <code>--sbi-advertise</code>, else <code>NEXTGCORE_SBI_ADVERTISE</code>, else <code>advertise</code> here, else the bind address when it is not a wildcard; it is used in the NRF registration. A wildcard is never advertised: with a wildcard bind and nothing set to advertise, the NF does not register and logs why. A config that does not parse fails startup (#1313).</li>
 <li><strong><code>mbsmf.nrf.uri</code> is inert.</strong> Unlike some other NFs (e.g. NSACF, which falls back YAML→CLI), the MB-SMF takes its NRF URI only from the <code>--nrf-uri</code> flag; the docker deployment passes it on the command line and the YAML entry merely mirrors it.</li>
 </ul>
 <blockquote>
@@ -233,7 +233,8 @@ mbsmf:
 <tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td>Accepted but currently <strong>unused</strong> — the parsed value is never referenced.</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Accepted but currently <strong>unused</strong> — the parsed value is never referenced.</td></tr>
-<tr><td><code>--sbi-addr</code></td><td>string</td><td><code>0.0.0.0</code></td><td>SBI server bind address (also advertised to the NRF in the NF profile).</td></tr>
+<tr><td><code>--sbi-addr</code></td><td>string</td><td><code>mbsmf.sbi.server[0].address</code>, else <code>127.0.0.1</code> (#1308)</td><td>SBI server bind address; beats the YAML (#1312).</td></tr>
+<tr><td><code>--sbi-advertise</code></td><td>string</td><td>unset</td><td>The advertised SBI host (#1312); then <code>NEXTGCORE_SBI_ADVERTISE</code>, then <code>mbsmf.sbi.server[0].advertise</code>, then the bind address when it is not a wildcard.</td></tr>
 <tr><td><code>--sbi-port</code></td><td>u16</td><td><code>7812</code></td><td>SBI server port (docker deployments pass <code>7777</code>).</td></tr>
 <tr><td><code>--tls</code></td><td>flag</td><td>off</td><td>Enable TLS on the SBI server.</td></tr>
 <tr><td><code>--tls-cert</code></td><td>path</td><td><code>/etc/nextgcore/tls/server.crt</code> (when <code>--tls</code>)</td><td>TLS certificate file.</td></tr>

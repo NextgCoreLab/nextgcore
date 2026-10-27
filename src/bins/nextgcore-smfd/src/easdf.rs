@@ -290,24 +290,11 @@ fn dnscontext_endpoint(instance: &serde_json::Value) -> Option<(String, u16)> {
             .and_then(|n| n.as_str())
             .is_some_and(|n| n.eq_ignore_ascii_case("neasdf-dnscontext"))
     })?;
-    if let Some(ep) = service
-        .get("ipEndPoints")
-        .and_then(|v| v.as_array())
-        .and_then(|a| a.first())
-    {
-        let host = ep
-            .get("ipv4Address")
-            .and_then(|v| v.as_str())
-            .or_else(|| ep.get("fqdn").and_then(|v| v.as_str()))?;
-        let port = ep.get("port").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
-        return Some((host.to_string(), port));
-    }
-    let host = instance
-        .get("ipv4Addresses")
-        .and_then(|v| v.as_array())
-        .and_then(|a| a.first())
-        .and_then(|v| v.as_str())?;
-    Some((host.to_string(), 80))
+    // #1324: the endpoint's IPv4 or IPv6 address, else the service's or the
+    // EASDF's (IPv4, IPv6, FQDN), on the endpoint port.
+    let host = nextgcore_sbi::nf_addressing::service_host(instance, Some(service))?;
+    let port = nextgcore_sbi::nf_addressing::service_port(Some(service)).unwrap_or(80);
+    Some((host, port))
 }
 
 /// Split `scheme://host:port` into `(host, port)`.
@@ -574,5 +561,24 @@ pub(crate) mod tests {
         set_for_test(None);
         easdf.stop().await.expect("stop");
         nrf.stop().await.expect("stop");
+    }
+}
+
+/// #1324 review: producer to consumer. A peer profile built with an IPv4, IPv6 or
+/// FQDN host (as this codebase's producers build them) resolves to that host.
+#[cfg(test)]
+mod tests_peer_host_kind_1324 {
+    use super::*;
+    use nextgcore_sbi::nf_addressing::{dialled_host, sample_search_result, SAMPLE_HOSTS};
+
+    #[test]
+    fn a_peer_at_any_host_type_is_resolved() {
+        for host in SAMPLE_HOSTS {
+            let r = sample_search_result("EASDF", "neasdf-dnscontext", host, 7794);
+            assert_eq!(
+                dnscontext_endpoint(&r["nfInstances"][0]),
+                Some((dialled_host(host), 7794))
+            );
+        }
     }
 }

@@ -707,7 +707,11 @@ fn nrf_self_uri() -> &'static str {
 /// `authorize_access_token` and the discovery filters read them, and a profile
 /// that omitted them would be a differently-shaped entry from every other NF's.
 fn nrf_self_profile() -> serde_json::Value {
-    let uri = nrf_self_uri();
+    nrf_self_profile_for(nrf_self_uri())
+}
+
+/// [`nrf_self_profile`] for the NRF reached at `uri` (#1324: testable by host type).
+fn nrf_self_profile_for(uri: &str) -> serde_json::Value {
     let (scheme, host_port) = match uri.split_once("://") {
         Some((s, rest)) => (s, rest),
         None => ("http", uri),
@@ -716,20 +720,23 @@ fn nrf_self_profile() -> serde_json::Value {
         Some((h, p)) => (h, p.parse::<u16>().unwrap_or(7777)),
         None => (host_port, 7777),
     };
-    serde_json::json!({
-        "nfInstanceId": nrf_instance_id(),
-        "nfType": NfType::Nrf.to_str(),
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [host],
-        "nfServices": [{
-            "serviceInstanceId": "nnrf-oauth2",
-            "serviceName": "nnrf-oauth2",
-            "versions": [{ "apiVersionInUri": "v1", "apiFullVersion": "1.0.0" }],
-            "scheme": scheme,
-            "nfServiceStatus": "REGISTERED",
-            "ipEndPoints": [{ "ipv4Address": host, "port": port, "transport": "TCP" }],
-        }],
-    })
+    nextgcore_sbi::nf_addressing::classify_profile_host(
+        serde_json::json!({
+            "nfInstanceId": nrf_instance_id(),
+            "nfType": NfType::Nrf.to_str(),
+            "nfStatus": "REGISTERED",
+            "ipv4Addresses": [host],
+            "nfServices": [{
+                "serviceInstanceId": "nnrf-oauth2",
+                "serviceName": "nnrf-oauth2",
+                "versions": [{ "apiVersionInUri": "v1", "apiFullVersion": "1.0.0" }],
+                "scheme": scheme,
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{ "ipv4Address": host, "port": port, "transport": "TCP" }],
+            }],
+        }),
+        host,
+    )
 }
 
 /// Register the NRF in its own registry (issue #187, criterion 5).
@@ -1284,6 +1291,16 @@ async fn main() -> Result<()> {
 
     let scheme = if args.tls { "HTTPS" } else { "HTTP" };
     log::info!("SBI HTTP/2 {scheme} server listening on {sbi_addr}");
+
+    // #1334: the Prometheus endpoint, on NEXTGCORE_METRICS_BIND (loopback by default,
+    // #837) and NRF_METRICS_PORT (9090). Non-fatal: an NRF that cannot expose
+    // metrics still serves the core.
+    let _metrics = nextgcore_metrics::nf::serve_nf_metrics(
+        "NRF",
+        "NRF_METRICS_PORT",
+        Arc::new(nextgcore_nrfd::metrics::render_prometheus),
+    )
+    .await;
     log::info!("NextGCore NRF ready");
 
     // Main event loop (async)
@@ -1396,7 +1413,21 @@ async fn nrf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let _version = parts[1];
     let resource = parts[2];
 
-    match (service, resource, method) {
+    // #1334: the NRF's outcome counters, by what the request was.
+    use nextgcore_nrfd::metrics::{observe, NrfOperation};
+    let operation = match (service, resource, method) {
+        ("nnrf-nfm", "nf-instances", "PUT") if parts.len() >= 4 => Some(NrfOperation::Register),
+        ("nnrf-nfm", "nf-instances", "PATCH") if parts.len() >= 4 => Some(NrfOperation::Update),
+        ("nnrf-nfm", "nf-instances", "DELETE") if parts.len() >= 4 => {
+            Some(NrfOperation::Deregister)
+        }
+        ("nnrf-nfm", "subscriptions", "POST") => Some(NrfOperation::Subscribe),
+        ("nnrf-oauth2", "access-token", "POST") => Some(NrfOperation::AccessToken),
+        _ => None,
+    };
+    let discovery = (service, resource, method) == ("nnrf-disc", "nf-instances", "GET");
+
+    let response = match (service, resource, method) {
         // NF Management Service (nnrf-nfm)
         ("nnrf-nfm", "nf-instances", "PUT") if parts.len() >= 4 => {
             // NF Register/Update: PUT /nnrf-nfm/v1/nf-instances/{nfInstanceId}
@@ -1458,7 +1489,15 @@ async fn nrf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             log::warn!("Unknown NRF request: {method} {uri}");
             send_method_not_allowed(method, uri)
         }
+    };
+    if let Some(op) = operation {
+        observe(op, response.status);
     }
+    // A 200 SearchResult was counted by the handler with its match count.
+    if discovery && response.status != 200 {
+        nextgcore_nrfd::metrics::observe_discovery(None);
+    }
+    response
 }
 
 /// The `NotificationEventType` a `PUT /nf-instances/{id}` must be notified as.
@@ -2728,6 +2767,7 @@ async fn handle_nf_discover(request: &SbiRequest) -> SbiResponse {
 
     let all_matches = discover_profiles(&query);
     let total = all_matches.len();
+    nextgcore_nrfd::metrics::observe_discovery(Some(total));
     let (nf_instances, has_more) = paginate_results(all_matches, page, page_size);
     log::info!(
         "Found {} matching NF instances for type {} (page {page}, size {page_size}, returning {})",
@@ -4842,6 +4882,147 @@ mod tests {
         outcome.expect("deregister test timed out");
     }
 
+    /// #1334: the NRF's `/metrics`, scraped over HTTP, serves every NRF series the
+    /// shipped rules and dashboards use, and the counters follow real Nnrf traffic
+    /// through the production handler: a registration, a heartbeat, a discovery that
+    /// finds it, one that finds nothing, one rejected, a deregistration.
+    ///
+    /// REVERT-VERIFIED: without the router's `observe` the registration / update /
+    /// deregistration counts stay; without `observe_discovery(Some(total))` the
+    /// success count stays; without `render_nrf_families` the series are missing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_scraped_endpoint_follows_nnrf_traffic_1334() {
+        use serde_json::json;
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), listener);
+        server
+            .start(nrf_sbi_request_handler)
+            .await
+            .expect("SBI server starts");
+        let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", addr.port());
+        let (bound, handle) = nextgcore_metrics::nes_energy::serve_metrics(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(nextgcore_nrfd::metrics::render_prometheus),
+        )
+        .await
+        .expect("metrics endpoint");
+        let scrape = || nextgcore_metrics::nf::scrape_for_test(bound);
+        let value =
+            |body: &str, s: &str| nextgcore_metrics::nf::sample_value(body, s).unwrap_or(0.0);
+        // A type no other nrfd test registers or discovers.
+        let nf_id = "13340000-0000-4000-8000-0000000013a4";
+        let path = format!("/nnrf-nfm/v1/nf-instances/{nf_id}");
+        let names = [
+            "nrf_nf_registrations_total",
+            "nrf_nf_updates_total",
+            "nrf_nf_deregistrations_total",
+            "nrf_discovery_success_total",
+            "nrf_discovery_empty_total",
+            "nrf_discovery_failure_total",
+        ];
+        let before = scrape().await;
+        let b: Vec<f64> = names.iter().map(|n| value(&before, n)).collect();
+
+        let resp = client
+            .put_json(
+                &path,
+                &json!({
+                    "nfInstanceId": nf_id, "nfType": "TSCTSF", "nfStatus": "REGISTERED",
+                    "heartBeatTimer": 10, "ipv4Addresses": ["10.13.3.4"]
+                }),
+            )
+            .await
+            .expect("PUT");
+        assert_eq!(resp.status, 201);
+        let mid = scrape().await;
+        assert!(
+            value(
+                &mid,
+                r#"nrf_registered_nf_instances{nf_type="TSCTSF",nf_status="REGISTERED"}"#
+            ) >= 1.0,
+            "{mid}"
+        );
+        let patch = nextgcore_sbi::message::SbiRequest::patch(&path)
+            .with_json_body(&nextgcore_sbi::heartbeat::build_load_patch(5))
+            .expect("body")
+            .with_header("Content-Type", "application/json-patch+json");
+        let resp = client.send_request(patch).await.expect("PATCH");
+        assert!(resp.status == 200 || resp.status == 204, "{}", resp.status);
+        let resp = client
+            .get("/nnrf-disc/v1/nf-instances?target-nf-type=TSCTSF&requester-nf-type=AF")
+            .await
+            .expect("discover");
+        assert_eq!(resp.status, 200);
+        let resp = client
+            .get("/nnrf-disc/v1/nf-instances?target-nf-type=MFAF&requester-nf-type=AF")
+            .await
+            .expect("discover nothing");
+        assert_eq!(resp.status, 200);
+        let resp = client
+            .get("/nnrf-disc/v1/nf-instances?target-nf-type=TSCTSF")
+            .await
+            .expect("discover without requester-nf-type");
+        assert_eq!(resp.status, 400);
+        let resp = client.delete(&path).await.expect("DELETE");
+        assert_eq!(resp.status, 204);
+
+        // #1334 review: an operation label is admitted on a 2xx, so a made-up resource
+        // of every service this NF serves must be answered with an error, or a client
+        // could mint label values.
+        for service in ["nnrf-nfm", "nnrf-disc", "nnrf-oauth2"] {
+            for path in [
+                format!("/{service}/v1/madeup-resource-1334"),
+                format!("/{service}/v1/imsi-001010000000001/madeup-resource-1334"),
+            ] {
+                for request in [
+                    nextgcore_sbi::message::SbiRequest::get(&path),
+                    nextgcore_sbi::message::SbiRequest::post(&path)
+                        .with_body("{}", "application/json"),
+                ] {
+                    let resp = client.send_request(request).await.expect("answered");
+                    assert!(resp.status >= 400, "{path} answered {}", resp.status);
+                }
+            }
+        }
+        let after = scrape().await;
+        assert!(
+            !after.contains("madeup"),
+            "no made-up resource in a label: {after}"
+        );
+        // Discovery: the hit and the empty SearchResult are successes (TS 29.510
+        // §5.3.2.2.2: 200 either way), the rejected query is the failure.
+        for ((name, b), want) in names.iter().zip(&b).zip([1.0, 1.0, 1.0, 2.0, 1.0, 1.0]) {
+            assert!(value(&after, name) >= b + want, "{name}: {b} -> {after}");
+        }
+        for name in [
+            "nrf_registered_nf_count",
+            "nrf_discovery_success_total",
+            "nrf_discovery_failure_total",
+            "nextgcore_sbi_request_total",
+            "nextgcore_sbi_request_duration_seconds_bucket",
+            "nextgcore_uptime_seconds",
+            "process_resident_memory_bytes",
+            "process_cpu_seconds_total",
+        ] {
+            assert!(
+                nextgcore_metrics::nf::has_series(&after, name),
+                "{name}:\n{after}"
+            );
+        }
+        assert!(
+            after.contains(r#"service="nnrf-nfm",operation="PUT nf-instances/{id}",status="201""#),
+            "{after}"
+        );
+        assert!(!after.contains(nf_id), "no instance id in a label");
+        assert!(
+            !nextgcore_metrics::nf::has_series(&after, "nextgcore_nrf_registered"),
+            "the NRF is no NRF client"
+        );
+        handle.abort();
+        client.close().await;
+        server.stop().await.expect("server stops");
+    }
+
     /// #434: when this NRF loses an NF's profile, the NF's own heartbeat worker
     /// gets 404 and re-registers it, rather than warning forever while the NF
     /// stays undiscoverable.
@@ -4928,6 +5109,10 @@ mod tests {
             );
 
             // Unpaused, the worker's next tick gets 404 and must put it back.
+            // #1334: and `/metrics` sees the loss and the re-registration.
+            let lost_before = nextgcore_metrics::nf::nrf_heartbeat_count(
+                nextgcore_metrics::nf::HeartbeatOutcome::NotFound,
+            );
             hb::set_heartbeat_paused(false);
             let restored = nextgcore_sbi::test_support::poll_until(
                 Duration::from_secs(15),
@@ -4942,6 +5127,24 @@ mod tests {
             );
             let resp = client.get(&path).await.expect("GET after re-register");
             assert_eq!(resp.status, 200, "and it must be readable through the API");
+            assert!(
+                nextgcore_metrics::nf::nrf_heartbeat_count(
+                    nextgcore_metrics::nf::HeartbeatOutcome::NotFound
+                ) > lost_before,
+                "the 404 heartbeat is counted (#1334)"
+            );
+            // The next accepted heartbeat (1 s interval) marks it registered again.
+            let registered = nextgcore_sbi::test_support::poll_until(
+                Duration::from_secs(10),
+                Duration::from_millis(50),
+                || async { nextgcore_metrics::nf::is_nrf_registered().then_some(()) },
+            )
+            .await;
+            assert_eq!(
+                registered,
+                Some(()),
+                "nextgcore_nrf_registered returns to 1"
+            );
 
             // Pause again before teardown, so no tick re-registers while the
             // globals are restored below.
@@ -8250,6 +8453,23 @@ mod tests {
             }
             let resp = subscribe(body.clone()).await;
             assert_eq!(resp.status, 400, "{body} must be refused");
+        }
+    }
+}
+
+/// #1324: the NRF's own profile carries its host by type.
+#[cfg(test)]
+mod tests_nrf_self_profile_host_kind_1324 {
+    use super::nrf_self_profile_for;
+
+    #[test]
+    fn the_nrf_profile_carries_its_host_by_type() {
+        for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
+            let authority = nextgcore_sbi::uri_encode::uri_authority(host, 7777);
+            let profile = nrf_self_profile_for(&format!("http://{authority}"));
+            let problems =
+                nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
+            assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
         }
     }
 }

@@ -180,6 +180,14 @@ impl<T: Clone + UeIdentity> UeStore<T> {
         all
     }
 
+    /// How many records satisfy `pred` (#1334: the UE census `/metrics` reports).
+    ///
+    /// `pred` runs **while the read lock is held**, like [`UeStore::with_mut`]'s
+    /// closure: it must only read the record, never touch the store.
+    pub fn count_matching(&self, pred: impl Fn(&T) -> bool) -> usize {
+        self.read().values().filter(|ue| pred(ue)).count()
+    }
+
     /// How many UEs are live.
     pub fn len(&self) -> usize {
         self.read().len()

@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e91a4036.js";
+            window.path_to_searchindex_js = "../searchindex-99ff0175.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -267,7 +267,7 @@ amf:
 <tbody>
 <tr><td><code>-c, --config</code></td><td><code>/etc/nextgcore/amf.yaml</code></td><td>Configuration file path.</td></tr>
 <tr><td><code>-l, --log-level</code></td><td><code>info</code></td><td><code>trace</code>, <code>debug</code>, <code>info</code>, <code>warn</code>, <code>error</code>.</td></tr>
-<tr><td><code>--ngap-addr</code></td><td><code>0.0.0.0:38412</code></td><td>NGAP (N2) bind address.</td></tr>
+<tr><td><code>--ngap-addr</code></td><td><code>127.0.0.1:38412</code></td><td>NGAP (N2) bind address. Loopback by default (#1308): a gNB on another host needs it set; <code>amf.ngap.server</code> does not set it.</td></tr>
 <tr><td><code>--sctp-backend</code></td><td><code>userspace</code></td><td><code>userspace</code> (sctp-proto over UDP, matched nextgsim gNB) or <code>kernel</code> (Linux kernel SCTP for an external RAN; requires the <code>kernel-sctp</code> build feature and libsctp).</td></tr>
 </tbody>
 </table>
@@ -285,7 +285,10 @@ amf:
 <tr><td><code>AMF_NAS_SECURITY</code></td><td>Overrides <code>amf.nas.use_nextgcore_security</code> (truthy: <code>1</code>/<code>true</code>/<code>yes</code>).</td></tr>
 <tr><td><code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code></td><td>Overrides <code>sbi.oauth2.require</code> (truthy: <code>1</code>/<code>true</code>/<code>TRUE</code>/<code>yes</code>); useful for docker overlays without editing the YAML.</td></tr>
 <tr><td><code>AMF_EMERGENCY_ALLOW_UNAUTHENTICATED</code></td><td>Overrides <code>amf.emergency.allow_unauthenticated</code> (truthy: <code>1</code>/<code>true</code>/<code>yes</code>/<code>on</code>). Any other value — including an empty one — reads as <strong>disabled</strong> rather than falling back to the YAML or the default, so a typo in a regulatory setting fails visibly instead of silently reverting.</td></tr>
-<tr><td><code>AMF_SBI_ADDR</code> / <code>AMF_SBI_PORT</code></td><td>Namf SBI bind and advertised address. Default <code>127.0.0.1:7777</code>; the YAML has no SBI server key.</td></tr>
+<tr><td><code>AMF_METRICS_PORT</code></td><td>Port of the Prometheus <code>/metrics</code> endpoint (#1334), default <code>9090</code>.</td></tr>
+<tr><td><code>NEXTGCORE_METRICS_BIND</code></td><td>Host the unauthenticated <code>/metrics</code> listener binds to, default <code>127.0.0.1</code> (#837). The compose file and manifests set <code>0.0.0.0</code> inside the private container/pod network and publish no host port.</td></tr>
+<tr><td><code>AMF_SBI_ADDR</code> / <code>AMF_SBI_PORT</code></td><td>Namf SBI bind address, else <code>amf.sbi.server[0]</code>, else <code>127.0.0.1:7777</code> (#1311).</td></tr>
+<tr><td><code>NEXTGCORE_SBI_ADVERTISE</code></td><td>The host in the NRF NFProfile and every callback URI (#1322). Else <code>amf.sbi.server[0].advertise</code>, else the bind when it is not a wildcard. Before, the callbacks used <code>AMF_SBI_ADDR</code> or <code>127.0.0.1</code> even when the YAML set the bind. A wildcard is never advertised: with a wildcard bind and nothing to advertise, amfd refuses to start.</td></tr>
 <tr><td><code>NRF_URI</code></td><td>NRF URI; when set it is written into the SBI context when the SBI opens, overriding <code>sbi.client.nrf</code>.</td></tr>
 <tr><td><code>AMF_N26_ADDR</code> / <code>AMF_N26_PORT</code></td><td>Opens the N26 GTPv2-C endpoint for EPS↔5GS interworking (idle-mode context transfer, connected-mode handover). Unset = no N26. Port default <code>2124</code>. A bind failure is logged and N26 stays off; the AMF still serves 5GC.</td></tr>
 <tr><td><code>AMF_N26_MME_ADDR</code></td><td>Comma-separated target MME N26 endpoints for 5GS→EPS Forward Relocation; a bare address gets port <code>2123</code>. Malformed entries are skipped with a log.</td></tr>
@@ -320,7 +323,7 @@ amf:
 <li><strong>PLMN flexibility:</strong> <code>mcc</code>/<code>mnc</code> accept YAML strings or integers; a 2-digit MNC is encoded with the filler digit per standard PLMN encoding.</li>
 <li><strong>Empty security lists:</strong> if <code>security</code> is omitted, the integrity/ciphering preference lists in the AMF context stay empty; supply explicit orders (as in the example) for deterministic algorithm selection.</li>
 <li><strong>Multiple NRF entries</strong> in <code>sbi.client.nrf</code> are parsed but only the first is used — additional entries are currently inert.</li>
-<li>There is no <code>amf.sbi.server</code> bind-address key in the typed config; the SBI address comes from <code>AMF_SBI_ADDR</code>/<code>AMF_SBI_PORT</code> and the NGAP address from <code>--ngap-addr</code>, not this YAML file. The <code>sbi.server</code>, <code>ngap.server</code> and <code>metrics.server</code> blocks in <code>docker/rust/configs/5gc/amf.yaml</code> are not read.</li>
+<li><code>amf.ngap.server[0]</code> and <code>amf.sbi.server[0]</code> are the NGAP and SBI listen addresses (#1311). <code>--ngap-addr</code> and <code>AMF_SBI_ADDR</code>/<code>AMF_SBI_PORT</code> override them; with neither, loopback (#1308). There is no <code>amf.metrics.server</code> (#1312); the metrics endpoint is <code>NEXTGCORE_METRICS_BIND</code>:<code>AMF_METRICS_PORT</code>.</li>
 </ul>
 <h2 id="unauthenticated-emergency-service"><a class="header" href="#unauthenticated-emergency-service">Unauthenticated emergency service</a></h2>
 <blockquote>

@@ -230,6 +230,10 @@ ausf:
   service:
     type: ClusterIP
     port: 7777
+  # /metrics (#1334): a ClusterIP Service port, bound in the pod only.
+  metrics:
+    enabled: true
+    port: 9090
 
 # UDM - Unified Data Management
 udm:
@@ -241,6 +245,10 @@ udm:
   service:
     type: ClusterIP
     port: 7777
+  # /metrics (#1334): a ClusterIP Service port, bound in the pod only.
+  metrics:
+    enabled: true
+    port: 9090
 
 # UDR - Unified Data Repository
 udr:
@@ -252,6 +260,10 @@ udr:
   service:
     type: ClusterIP
     port: 7777
+  # /metrics (#1334): a ClusterIP Service port, bound in the pod only.
+  metrics:
+    enabled: true
+    port: 9090
 
 # PCF - Policy Control Function
 pcf:
@@ -277,6 +289,10 @@ nssf:
   service:
     type: ClusterIP
     port: 7777
+  # /metrics (#1334): a ClusterIP Service port, bound in the pod only.
+  metrics:
+    enabled: true
+    port: 9090
 
 # BSF - Binding Support Function
 bsf:
@@ -288,6 +304,10 @@ bsf:
   service:
     type: ClusterIP
     port: 7777
+  # /metrics (#1334): a ClusterIP Service port, bound in the pod only.
+  metrics:
+    enabled: true
+    port: 9090
 
 # Not shipped by this chart. Left here so an operator overriding them sees
 # they are inert rather than silently ineffective. Use k8s/monitoring/.

@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e91a4036.js";
+            window.path_to_searchindex_js = "../searchindex-99ff0175.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -231,7 +231,7 @@ hss:
 <li><strong><code>logger.level</code> is read; <code>logger.file.path</code> is inert.</strong> The log level is <code>-e/--log-level</code> when given, else this file’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code>, when set, overrides all three (#691). <code>-l/--log-file</code> is accepted by clap but never used, so logs always go to stderr.</li>
 <li><strong><code>global.max.ue</code> and <code>global.max.peer</code> are inert.</strong> The identity-pool size comes from the CLI flag <code>--max-ue</code> (default <code>1024</code>); there is no peer cap in the code.</li>
 <li><strong><code>hss.freeDiameter</code> and the <code>--diameter-config</code> flag</strong> point at <code>docker/rust/configs/epc/freeDiameter/hss.conf</code>, which no code reads.</li>
-<li><strong><code>hss.metrics.server</code> is inert.</strong> The daemon starts no metrics HTTP server; its only telemetry export is OpenTelemetry OTLP tracing (<code>nextgcore_metrics::otel::init_otel</code> in <code>main.rs</code>).</li>
+<li><strong>No <code>hss.metrics.server</code></strong> (removed from the shipped config, #1312): the daemon starts no metrics HTTP server; its only telemetry export is OpenTelemetry OTLP tracing (<code>nextgcore_metrics::otel::init_otel</code> in <code>main.rs</code>).</li>
 </ul>
 <h2 id="command-line-flags"><a class="header" href="#command-line-flags">Command-line flags</a></h2>
 <p>From the clap <code>Args</code> struct in <code>src/bins/nextgcore-hssd/src/main.rs</code>:</p>
@@ -249,7 +249,7 @@ hss:
 <tr><td><code>--diameter-config</code></td><td>string</td><td><code>/etc/nextgcore/freeDiameter/hss.conf</code></td><td><strong>Accepted but unused</strong> — no code reads freeDiameter config files.</td></tr>
 <tr><td><code>--diameter-id</code></td><td>string</td><td>YAML, then <code>hss.epc.mnc001.mcc001.3gppnetwork.org</code></td><td>Origin-Host override.</td></tr>
 <tr><td><code>--diameter-realm</code></td><td>string</td><td>YAML, then <code>epc.mnc001.mcc001.3gppnetwork.org</code></td><td>Origin-Realm override.</td></tr>
-<tr><td><code>--diameter-addr</code></td><td>string</td><td>YAML, then <code>0.0.0.0</code></td><td>S6a listen address override.</td></tr>
+<tr><td><code>--diameter-addr</code></td><td>string</td><td>YAML, then <code>127.0.0.1</code> (loopback, #1308)</td><td>S6a listen address override. A value that is not an IP address fails startup.</td></tr>
 <tr><td><code>--diameter-port</code></td><td>u16</td><td>YAML, then <code>3868</code></td><td>S6a listen port override.</td></tr>
 <tr><td><code>--max-ue</code></td><td>usize</td><td><code>1024</code></td><td>The only fully wired tuning flag: sizes the identity pools as <code>max_impi = max_ue</code>, <code>max_impu = max_ue * 4</code> (ratio hard-coded in <code>main.rs</code>).</td></tr>
 <tr><td><code>--db-uri</code></td><td>string</td><td>unset</td><td>Subscriber-store MongoDB URI; wins over the YAML <code>db_uri</code>. One of the two is required.</td></tr>

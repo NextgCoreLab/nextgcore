@@ -138,11 +138,18 @@ pub fn nas_5gs_security_encode(
     message: &[u8],
     security_header_type: u8,
 ) -> Option<Vec<u8>> {
-    if amf_ue.use_nextgcore_nas_security {
+    let encoded = if amf_ue.use_nextgcore_nas_security {
         nas_5gs_security_encode_nextgcore(amf_ue, message, security_header_type)
     } else {
         nas_5gs_security_encode_legacy(amf_ue, message, security_header_type)
+    };
+    // #1334: every protected downlink 5GMM message is protected here, once, so this is
+    // where TS 28.552's "on transmission" counters see it. A PLAIN request returns the
+    // message unprotected; that one is counted when `send_nas_pdu` sends it.
+    if encoded.is_some() && security_header_type != security_header::PLAIN_NAS_MESSAGE {
+        crate::metrics::observe_downlink_nas(message);
     }
+    encoded
 }
 
 /// Hand-rolled NAS security encoder (the pre-nas-06 production path).

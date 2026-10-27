@@ -1,0 +1,5 @@
+[
+  {"op":"add","path":"/spec/template/spec/volumes/-","value":{"name":"smf-state","emptyDir":{}}},
+  {"op":"add","path":"/spec/template/spec/containers/0/volumeMounts/-","value":{"name":"smf-state","mountPath":"/var/lib/nextgcore-smf"}},
+  {"op":"add","path":"/spec/template/spec/containers/0/env/-","value":{"name":"NEXTGCORE_SMF_STATE_FILE","value":"/var/lib/nextgcore-smf/state.json"}}
+]

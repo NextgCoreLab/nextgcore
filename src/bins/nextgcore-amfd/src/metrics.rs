@@ -471,12 +471,636 @@ pub struct MetricsSummary {
 }
 
 // ============================================================================
+// Live Prometheus exposition (#1334)
+// ============================================================================
+//
+// What `/metrics` serves: the families every NF shares (`nextgcore_metrics::nf`),
+// then the AMF's own. Counters are fed from the AMF's choke points, not from each
+// procedure's code:
+//
+// - every NGAP PDU received (`NgapServer::process_ngap_message`) and sent
+//   (`NgapServer::send_to_association`) is counted by direction, procedure (TS 38.413
+//   §9.4.7 procedure code) and outcome (the NGAP-PDU CHOICE);
+// - the 5GMM messages TS 28.552 §5.2.2 counts "on transmission" are counted where
+//   the AMF hands a plain message to NAS security for protection, or puts an
+//   unprotected one in a DOWNLINK NAS TRANSPORT (each message reaches exactly one of
+//   those; a T3550/T3560 retransmission re-sends a stored PDU and is not counted);
+// - Registration Requests at `handle_registration_request_nas`, which every one
+//   reaches, and 5G-AKA results where the AUSF confirmation is evaluated.
+//
+// The UE and session census is read from the live stores at scrape time; the gNB
+// census is published by the NGAP loop, which owns the associations.
+
+use std::sync::atomic::AtomicUsize;
+
+/// Direction of an NGAP PDU, as seen by the AMF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NgapDirection {
+    /// Received from a gNB.
+    Rx,
+    /// Sent to a gNB.
+    Tx,
+}
+
+/// NGAP-PDU CHOICE alternatives (TS 38.413 §9.4.2).
+const NGAP_OUTCOMES: [&str; 3] = ["initiating", "successful", "unsuccessful"];
+
+/// NGAP elementary procedure names by procedure code (TS 38.413 §9.4.7,
+/// `ngap-17.9.asn` `id-*`). The index is the code.
+const NGAP_PROCEDURES: [&str; 76] = [
+    "AMFConfigurationUpdate",
+    "AMFStatusIndication",
+    "CellTrafficTrace",
+    "DeactivateTrace",
+    "DownlinkNASTransport",
+    "DownlinkNonUEAssociatedNRPPaTransport",
+    "DownlinkRANConfigurationTransfer",
+    "DownlinkRANStatusTransfer",
+    "DownlinkUEAssociatedNRPPaTransport",
+    "ErrorIndication",
+    "HandoverCancel",
+    "HandoverNotification",
+    "HandoverPreparation",
+    "HandoverResourceAllocation",
+    "InitialContextSetup",
+    "InitialUEMessage",
+    "LocationReportingControl",
+    "LocationReportingFailureIndication",
+    "LocationReport",
+    "NASNonDeliveryIndication",
+    "NGReset",
+    "NGSetup",
+    "OverloadStart",
+    "OverloadStop",
+    "Paging",
+    "PathSwitchRequest",
+    "PDUSessionResourceModify",
+    "PDUSessionResourceModifyIndication",
+    "PDUSessionResourceRelease",
+    "PDUSessionResourceSetup",
+    "PDUSessionResourceNotify",
+    "PrivateMessage",
+    "PWSCancel",
+    "PWSFailureIndication",
+    "PWSRestartIndication",
+    "RANConfigurationUpdate",
+    "RerouteNASRequest",
+    "RRCInactiveTransitionReport",
+    "TraceFailureIndication",
+    "TraceStart",
+    "UEContextModification",
+    "UEContextRelease",
+    "UEContextReleaseRequest",
+    "UERadioCapabilityCheck",
+    "UERadioCapabilityInfoIndication",
+    "UETNLABindingRelease",
+    "UplinkNASTransport",
+    "UplinkNonUEAssociatedNRPPaTransport",
+    "UplinkRANConfigurationTransfer",
+    "UplinkRANStatusTransfer",
+    "UplinkUEAssociatedNRPPaTransport",
+    "WriteReplaceWarning",
+    "SecondaryRATDataUsageReport",
+    "UplinkRIMInformationTransfer",
+    "DownlinkRIMInformationTransfer",
+    "RetrieveUEInformation",
+    "UEInformationTransfer",
+    "RANCPRelocationIndication",
+    "UEContextResume",
+    "UEContextSuspend",
+    "UERadioCapabilityIDMapping",
+    "HandoverSuccess",
+    "UplinkRANEarlyStatusTransfer",
+    "DownlinkRANEarlyStatusTransfer",
+    "AMFCPRelocationIndication",
+    "ConnectionEstablishmentIndication",
+    "BroadcastSessionModification",
+    "BroadcastSessionRelease",
+    "BroadcastSessionSetup",
+    "DistributionSetup",
+    "DistributionRelease",
+    "MulticastSessionActivation",
+    "MulticastSessionDeactivation",
+    "MulticastSessionUpdate",
+    "MulticastGroupPaging",
+    "BroadcastSessionReleaseRequired",
+];
+
+/// The name of NGAP procedure `code`, `unknown` past the table.
+pub fn ngap_procedure_name(code: u8) -> &'static str {
+    NGAP_PROCEDURES
+        .get(code as usize)
+        .copied()
+        .unwrap_or("unknown")
+}
+
+/// Slots: direction (2) x procedure code (256) x outcome (3).
+fn ngap_counters() -> &'static [AtomicU64] {
+    static COUNTERS: std::sync::OnceLock<Vec<AtomicU64>> = std::sync::OnceLock::new();
+    COUNTERS.get_or_init(|| (0..2 * 256 * 3).map(|_| AtomicU64::new(0)).collect())
+}
+
+fn ngap_slot(direction: NgapDirection, code: u8, outcome: usize) -> usize {
+    let d = match direction {
+        NgapDirection::Rx => 0,
+        NgapDirection::Tx => 1,
+    };
+    (d * 256 + code as usize) * 3 + outcome
+}
+
+/// The outcome index (into [`NGAP_OUTCOMES`]) and procedure code of an APER NGAP
+/// PDU: octet 0 holds the extension bit and the 2-bit CHOICE index, octet 1 the
+/// procedure code.
+fn ngap_header(pdu: &[u8]) -> Option<(usize, u8)> {
+    let (b0, code) = (*pdu.first()?, *pdu.get(1)?);
+    if b0 & 0x80 != 0 {
+        return None; // a CHOICE extension: no alternative this AMF knows
+    }
+    let outcome = usize::from((b0 >> 5) & 0x03);
+    (outcome < NGAP_OUTCOMES.len()).then_some((outcome, code))
+}
+
+/// Count one NGAP PDU received or sent.
+pub fn observe_ngap(direction: NgapDirection, pdu: &[u8]) {
+    if let Some((outcome, code)) = ngap_header(pdu) {
+        ngap_counters()[ngap_slot(direction, code, outcome)].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The count of NGAP PDUs of `procedure_code` / `outcome` (0 initiating, 1
+/// successful, 2 unsuccessful) in `direction`.
+pub fn ngap_count(direction: NgapDirection, procedure_code: u8, outcome: usize) -> u64 {
+    ngap_counters()[ngap_slot(direction, procedure_code, outcome)].load(Ordering::Relaxed)
+}
+
+/// 5GMM message types counted on transmission (TS 24.501 §9.7).
+mod nas_type {
+    pub const REGISTRATION_REQUEST: u8 = 0x41;
+    pub const REGISTRATION_ACCEPT: u8 = 0x42;
+    pub const REGISTRATION_REJECT: u8 = 0x44;
+    pub const AUTHENTICATION_REQUEST: u8 = 0x56;
+    pub const AUTHENTICATION_REJECT: u8 = 0x58;
+}
+
+/// Counters behind the AMF's NAS families.
+#[derive(Debug)]
+struct NasCounters {
+    /// Registration Requests by 5GS registration type value (TS 24.501 §9.11.3.7: 1
+    /// initial, 2 mobility, 3 periodic, 4 emergency, 5 SNPN onboarding; 0, 6, 7
+    /// reserved).
+    registration_requests: [AtomicU64; 8],
+    registration_accepts: AtomicU64,
+    registration_rejects: AtomicU64,
+    /// Registration Rejects by 5GMM cause value.
+    reject_causes: [AtomicU64; 256],
+    auth_requests: AtomicU64,
+    auth_successes: AtomicU64,
+    auth_rejects: AtomicU64,
+    auth_failures_from_ue: AtomicU64,
+}
+
+fn nas_counters() -> &'static NasCounters {
+    static COUNTERS: std::sync::OnceLock<NasCounters> = std::sync::OnceLock::new();
+    COUNTERS.get_or_init(|| NasCounters {
+        registration_requests: Default::default(),
+        registration_accepts: AtomicU64::new(0),
+        registration_rejects: AtomicU64::new(0),
+        reject_causes: std::array::from_fn(|_| AtomicU64::new(0)),
+        auth_requests: AtomicU64::new(0),
+        auth_successes: AtomicU64::new(0),
+        auth_rejects: AtomicU64::new(0),
+        auth_failures_from_ue: AtomicU64::new(0),
+    })
+}
+
+/// Count a plain downlink 5GMM message the AMF is about to send.
+pub fn observe_downlink_nas(plain: &[u8]) {
+    if plain.len() < 3 || plain[0] != 0x7E || plain[1] & 0x0F != 0 {
+        return;
+    }
+    let c = nas_counters();
+    match plain[2] {
+        nas_type::REGISTRATION_ACCEPT => {
+            c.registration_accepts.fetch_add(1, Ordering::Relaxed);
+        }
+        nas_type::REGISTRATION_REJECT => {
+            c.registration_rejects.fetch_add(1, Ordering::Relaxed);
+            if let Some(cause) = plain.get(3) {
+                c.reject_causes[*cause as usize].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        nas_type::AUTHENTICATION_REQUEST => {
+            c.auth_requests.fetch_add(1, Ordering::Relaxed);
+        }
+        nas_type::AUTHENTICATION_REJECT => {
+            c.auth_rejects.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
+/// Count a Registration Request (plain), by its 5GS registration type.
+pub fn observe_registration_request(plain: &[u8]) {
+    if plain.get(2) != Some(&nas_type::REGISTRATION_REQUEST) {
+        return;
+    }
+    if let Some(octet) = plain.get(3) {
+        nas_counters().registration_requests[usize::from(octet & 0x07)]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Count an AUTHENTICATION FAILURE received from a UE (TS 24.501 §5.4.1.3.7).
+pub fn observe_ue_authentication_failure() {
+    nas_counters()
+        .auth_failures_from_ue
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count a 5G-AKA the AUSF confirmed (TS 33.501 §6.1.3.2).
+pub fn observe_authentication_success() {
+    nas_counters()
+        .auth_successes
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+/// The 5GS registration type label of value `v` (TS 24.501 Table 9.11.3.7.1).
+fn registration_type_label(v: usize) -> &'static str {
+    match v {
+        1 => "initial",
+        2 => "mobility",
+        3 => "periodic",
+        4 => "emergency",
+        5 => "snpn_onboarding",
+        _ => "reserved",
+    }
+}
+
+static GNB_ASSOCIATIONS: AtomicUsize = AtomicUsize::new(0);
+static GNB_SETUP: AtomicUsize = AtomicUsize::new(0);
+
+/// Publish the gNB census: NG associations, and those whose NG Setup succeeded.
+pub fn set_gnb_census(associations: usize, ng_setup: usize) {
+    GNB_ASSOCIATIONS.store(associations, Ordering::Relaxed);
+    GNB_SETUP.store(ng_setup, Ordering::Relaxed);
+}
+
+/// The AMF's live state at scrape time.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AmfCensus {
+    /// UEs that completed registration (RM-REGISTERED).
+    pub registered_ues: usize,
+    /// UEs with an N1 signalling connection (CM-CONNECTED), registered or not.
+    pub connected_ues: usize,
+    /// PDU sessions the AMF holds.
+    pub pdu_sessions: usize,
+}
+
+fn census() -> AmfCensus {
+    let ctx = crate::context::amf_self();
+    let Ok(ctx) = ctx.read() else {
+        return AmfCensus::default();
+    };
+    let (registered_ues, connected_ues) = crate::ngap_path::ue_census(&ctx.ue_store());
+    AmfCensus {
+        registered_ues,
+        connected_ues,
+        pdu_sessions: ctx.sess_count(),
+    }
+}
+
+/// Render the AMF-specific families for `census` into `out`.
+pub fn render_amf_families(out: &mut String, census: &AmfCensus) {
+    use nextgcore_metrics::nf::{write_header, write_metric};
+    use std::fmt::Write as _;
+    let c = nas_counters();
+    let get = |a: &AtomicU64| a.load(Ordering::Relaxed);
+
+    write_metric(
+        out,
+        "amf_registered_ue_count",
+        "gauge",
+        "UEs in RM-REGISTERED (Registration Complete received)",
+        census.registered_ues,
+    );
+    write_metric(
+        out,
+        "amf_connected_ue_count",
+        "gauge",
+        "UEs with an N1 NAS signalling connection (CM-CONNECTED)",
+        census.connected_ues,
+    );
+    write_metric(
+        out,
+        "nextgcore_amf_active_sessions",
+        "gauge",
+        "PDU sessions the AMF holds",
+        census.pdu_sessions,
+    );
+    write_metric(
+        out,
+        "amf_gnb_count",
+        "gauge",
+        "NG-RAN nodes whose NG Setup succeeded (TS 38.413 §8.7.1)",
+        GNB_SETUP.load(Ordering::Relaxed),
+    );
+    write_metric(
+        out,
+        "amf_gnb_associations",
+        "gauge",
+        "SCTP associations from NG-RAN nodes, NG Setup or not",
+        GNB_ASSOCIATIONS.load(Ordering::Relaxed),
+    );
+
+    write_header(
+        out,
+        "amf_registration_requests_total",
+        "counter",
+        "Registration Requests received, by 5GS registration type (TS 28.552 §5.2.2.1 RM.Reg*Req)",
+    );
+    for (v, counter) in c.registration_requests.iter().enumerate() {
+        let n = get(counter);
+        if n > 0 || (1..=4).contains(&v) {
+            let _ = writeln!(
+                out,
+                "amf_registration_requests_total{{type=\"{}\"}} {n}",
+                registration_type_label(v)
+            );
+        }
+    }
+    write_metric(
+        out,
+        "amf_registration_success_total",
+        "counter",
+        "Registration Accepts sent (TS 28.552 §5.2.2 RM.Reg*Succ, all types)",
+        get(&c.registration_accepts),
+    );
+    write_metric(
+        out,
+        "amf_registration_failure_total",
+        "counter",
+        "Registration Rejects sent (TS 28.552 §5.2.2 RM.Reg*Fail, all types)",
+        get(&c.registration_rejects),
+    );
+    write_header(
+        out,
+        "amf_registration_reject_cause_total",
+        "counter",
+        "Registration Rejects sent, by 5GMM cause value (TS 24.501 §9.11.3.2)",
+    );
+    for (cause, counter) in c.reject_causes.iter().enumerate() {
+        let n = get(counter);
+        if n > 0 {
+            let _ = writeln!(
+                out,
+                "amf_registration_reject_cause_total{{cause=\"{cause}\"}} {n}"
+            );
+        }
+    }
+    write_metric(
+        out,
+        "amf_auth_request_total",
+        "counter",
+        "Authentication Requests sent (TS 28.552 §5.2.11 AMF.AuthReq)",
+        get(&c.auth_requests),
+    );
+    write_metric(
+        out,
+        "amf_auth_success_total",
+        "counter",
+        "5G-AKA authentications the AUSF confirmed",
+        get(&c.auth_successes),
+    );
+    write_header(
+        out,
+        "amf_auth_failure_total",
+        "counter",
+        "Failed authentications: Authentication Rejects sent (source=network) and \
+         Authentication Failures received (source=ue)",
+    );
+    let _ = writeln!(
+        out,
+        "amf_auth_failure_total{{source=\"network\"}} {}",
+        get(&c.auth_rejects)
+    );
+    let _ = writeln!(
+        out,
+        "amf_auth_failure_total{{source=\"ue\"}} {}",
+        get(&c.auth_failures_from_ue)
+    );
+
+    write_header(
+        out,
+        "amf_ngap_messages_total",
+        "counter",
+        "NGAP PDUs by direction, elementary procedure (TS 38.413 §9.4.7) and outcome",
+    );
+    let mut failures = Vec::new();
+    for (d, dir) in [(NgapDirection::Rx, "rx"), (NgapDirection::Tx, "tx")] {
+        for code in 0..=255u8 {
+            for (o, outcome) in NGAP_OUTCOMES.iter().enumerate() {
+                let n = ngap_count(d, code, o);
+                if n == 0 {
+                    continue;
+                }
+                let name = ngap_procedure_name(code);
+                let _ = writeln!(out,
+                    "amf_ngap_messages_total{{direction=\"{dir}\",procedure=\"{name}\",outcome=\"{outcome}\"}} {n}");
+                if o == 2 {
+                    failures.push((dir, name, n));
+                }
+            }
+        }
+    }
+    write_header(
+        out,
+        "amf_ngap_failures_total",
+        "counter",
+        "NGAP unsuccessful outcomes (procedure failures) by direction and procedure",
+    );
+    for (dir, name, n) in failures {
+        let _ = writeln!(
+            out,
+            "amf_ngap_failures_total{{direction=\"{dir}\",procedure=\"{name}\"}} {n}"
+        );
+    }
+
+    let g = global();
+    for metric in [
+        GlobalMetric::NgResetUeIdled,
+        GlobalMetric::UeAssociatedRefused,
+    ] {
+        write_metric(
+            out,
+            metric.name(),
+            "counter",
+            metric.description(),
+            g.get(metric),
+        );
+    }
+}
+
+/// The whole AMF `/metrics` body.
+pub fn render_prometheus() -> String {
+    let mut out = nextgcore_metrics::nf::render_common(&nextgcore_metrics::nf::NfIdentity {
+        nf: "amf",
+        version: env!("CARGO_PKG_VERSION"),
+        nrf_client: true,
+    });
+    render_amf_families(&mut out, &census());
+    out
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every AMF series the shipped Prometheus rules (`docker/rust/configs/
+    /// observability/alert-rules.yml`) and Grafana dashboards (`.../dashboards/
+    /// overview.json`, `docker/rust/monitoring/grafana/dashboards/nextg-overview.json`)
+    /// query, plus the families every NF shares that they query.
+    const SERIES_THE_RULES_AND_DASHBOARDS_USE: [&str; 14] = [
+        "amf_registration_success_total",
+        "amf_registration_failure_total",
+        "amf_connected_ue_count",
+        "amf_registered_ue_count",
+        "amf_auth_success_total",
+        "amf_auth_failure_total",
+        "nextgcore_amf_active_sessions",
+        "nextgcore_sbi_request_total",
+        "nextgcore_sbi_error_total",
+        "nextgcore_sbi_request_duration_seconds_bucket",
+        "nextgcore_nrf_registered",
+        "nextgcore_uptime_seconds",
+        "process_resident_memory_bytes",
+        "process_cpu_seconds_total",
+    ];
+
+    /// #1334: the AMF's `/metrics`, scraped over HTTP like Prometheus does, serves every
+    /// series the rules and dashboards use, after one real Namf request through the
+    /// production SBI server and handler.
+    ///
+    /// REVERT-VERIFIED: with `render_amf_families` left out of `render_prometheus` the
+    /// `amf_*` series are missing, and without the SBI server's `record_sbi_request`
+    /// the `nextgcore_sbi_*` ones are; either fails the loop.
+    #[tokio::test]
+    async fn the_scraped_endpoint_serves_every_series_the_rules_and_dashboards_use_1334() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        server
+            .start(crate::namf_server::namf_request_handler)
+            .await
+            .expect("Namf server starts");
+        let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", addr.port());
+        let answer = client
+            .send_request(nextgcore_sbi::message::SbiRequest::get(
+                "/namf-comm/v1/ue-contexts/imsi-001019999913340",
+            ))
+            .await
+            .expect("Namf answers");
+        assert!(answer.status >= 400, "no such UE: {}", answer.status);
+
+        // #1334 review: an operation label is admitted on a 2xx, so a made-up resource
+        // of every service this NF serves must be answered with an error, or a client
+        // could mint label values.
+        for (service, version) in [
+            ("namf-comm", "v1"),
+            ("namf-evts", "v1"),
+            ("namf-mt", "v1"),
+            ("namf-loc", "v1"),
+            ("namf-callback", "v1"),
+            ("namf-mbs-comm", "v1"),
+            ("namf-mbs-bc", "v1"),
+        ] {
+            for path in [
+                format!("/{service}/{version}/madeup-resource-1334"),
+                format!("/{service}/{version}/imsi-001010000000001/madeup-resource-1334"),
+            ] {
+                for request in [
+                    nextgcore_sbi::message::SbiRequest::get(&path),
+                    nextgcore_sbi::message::SbiRequest::post(&path)
+                        .with_body("{}", "application/json"),
+                ] {
+                    let resp = client.send_request(request).await.expect("answered");
+                    assert!(resp.status >= 400, "{path} answered {}", resp.status);
+                }
+            }
+        }
+        let (bound, handle) = nextgcore_metrics::nes_energy::serve_metrics(
+            "127.0.0.1:0".parse().unwrap(),
+            std::sync::Arc::new(render_prometheus),
+        )
+        .await
+        .expect("metrics endpoint");
+        let body = nextgcore_metrics::nf::scrape_for_test(bound).await;
+        for name in SERIES_THE_RULES_AND_DASHBOARDS_USE {
+            assert!(
+                nextgcore_metrics::nf::has_series(&body, name),
+                "{name} missing from the AMF exposition:\n{body}"
+            );
+        }
+        assert!(
+            nextgcore_metrics::nf::has_series(&body, "nextgcore_sbi_error_total"),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"service="namf-comm",operation="unmatched""#)
+                || body.contains(r#"service="namf-comm",operation="GET ue-contexts/{id}""#),
+            "the Namf request is counted; a template not yet answered with success \
+             is `unmatched`, never request text: {body}"
+        );
+        assert!(
+            !body.contains("9999913340"),
+            "no SUPI in the exposition: {body}"
+        );
+        assert!(
+            !body.contains("madeup"),
+            "no made-up resource in a label: {body}"
+        );
+        assert!(body.contains("nextgcore_build_info{nf=\"amf\""), "{body}");
+        handle.abort();
+        server.stop().await.expect("stops");
+    }
+
+    /// The census gauges render what the stores hold.
+    #[test]
+    fn the_census_gauges_render_the_values_given() {
+        let mut out = String::new();
+        render_amf_families(
+            &mut out,
+            &AmfCensus {
+                registered_ues: 3,
+                connected_ues: 2,
+                pdu_sessions: 5,
+            },
+        );
+        let v = |s| nextgcore_metrics::nf::sample_value(&out, s);
+        assert_eq!(v("amf_registered_ue_count"), Some(3.0));
+        assert_eq!(v("amf_connected_ue_count"), Some(2.0));
+        assert_eq!(v("nextgcore_amf_active_sessions"), Some(5.0));
+    }
+
+    /// The NGAP header read: CHOICE index from octet 0, procedure code from octet 1.
+    #[test]
+    fn ngap_pdus_are_classified_by_choice_and_procedure_code() {
+        assert_eq!(ngap_header(&[0x00, 0x15, 0x00]), Some((0, 21)));
+        assert_eq!(ngap_header(&[0x20, 0x15, 0x00]), Some((1, 21)));
+        assert_eq!(ngap_header(&[0x40, 0x0e, 0x00]), Some((2, 14)));
+        assert_eq!(ngap_header(&[0x80, 0x15, 0x00]), None, "a CHOICE extension");
+        assert_eq!(ngap_header(&[0x00]), None);
+        assert_eq!(ngap_procedure_name(21), "NGSetup");
+        assert_eq!(ngap_procedure_name(46), "UplinkNASTransport");
+        assert_eq!(ngap_procedure_name(75), "BroadcastSessionReleaseRequired");
+        assert_eq!(ngap_procedure_name(200), "unknown");
+    }
 
     #[test]
     fn test_global_metric_names() {

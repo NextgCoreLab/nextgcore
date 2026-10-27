@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e91a4036.js";
+            window.path_to_searchindex_js = "../searchindex-99ff0175.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -216,7 +216,7 @@ pcrf:
 <li><strong><code>logger.level</code> is read; <code>logger.file.path</code> is inert.</strong> Logging goes to stderr via <code>env_logger</code>. The log level is <code>-e/--log-level</code> when given, else this file’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code>, when set, overrides all three (#691). The <code>-l/--log-file</code> flag is also accepted but never used.</li>
 <li><strong><code>global.max.ue</code> / <code>global.max.peer</code> are inert.</strong> The only session limit is the <code>--max-sess</code> flag (and even that is stored, not enforced — see Behavior notes).</li>
 <li><strong><code>pcrf.freeDiameter</code> is inert.</strong> Neither the YAML pointer (<code>/etc/freeDiameter/pcrf.conf</code>) nor the CLI default (<code>--diameter-config /etc/nextgcore/freeDiameter/pcrf.conf</code>) is ever opened. The shipped <code>docker/rust/configs/epc/freeDiameter/pcrf.conf</code> (Identity <code>pcrf.localdomain</code>, Realm <code>localdomain</code>, <code>ListenOn 172.24.0.9</code>, <code>ConnectPeer smf.localdomain</code>) is mounted into the container but ignored; the daemon’s actual identity/realm/listen address come from <code>--diameter-id</code>/<code>--diameter-realm</code>/<code>--diameter-addr</code>, whose defaults happen to match the conf’s Identity/Realm. The PCRF never dials out to peers (<code>ConnectPeer</code> has no equivalent): it only accepts inbound connections.</li>
-<li><strong><code>pcrf.metrics.server[]</code> (address/port) is inert.</strong> No Prometheus/metrics HTTP server is started by this binary; the only telemetry is the optional OTLP trace exporter (env var, see below).</li>
+<li><strong>No <code>pcrf.metrics.server[]</code></strong> (removed from the shipped config, #1312): no Prometheus/metrics HTTP server is started by this binary; the only telemetry is the optional OTLP trace exporter (env var, see below).</li>
 </ul>
 <h2 id="command-line-flags"><a class="header" href="#command-line-flags">Command-line flags</a></h2>
 <p>From the clap <code>Args</code> struct in <code>src/bins/nextgcore-pcrfd/src/main.rs</code>:</p>
@@ -234,7 +234,7 @@ pcrf:
 <tr><td><code>--diameter-config</code></td><td>path</td><td><code>/etc/nextgcore/freeDiameter/pcrf.conf</code></td><td>FreeDiameter configuration file — accepted but <strong>never read</strong>.</td></tr>
 <tr><td><code>--diameter-id</code></td><td>string</td><td><code>pcrf.localdomain</code></td><td>Diameter Origin-Host identity of this PCRF.</td></tr>
 <tr><td><code>--diameter-realm</code></td><td>string</td><td><code>localdomain</code></td><td>Diameter Origin-Realm.</td></tr>
-<tr><td><code>--diameter-addr</code></td><td>socket addr</td><td><code>0.0.0.0:3868</code></td><td>Diameter listen address; Gx and Rx share this one listener. Must parse as <code>host:port</code> or startup fails with “Invalid –diameter-addr”.</td></tr>
+<tr><td><code>--diameter-addr</code></td><td>socket addr</td><td><code>127.0.0.1:3868</code> (loopback, #1308)</td><td>Diameter listen address; Gx and Rx share this one listener. Must parse as <code>host:port</code> or startup fails with “Invalid –diameter-addr”.</td></tr>
 <tr><td><code>--max-sess</code></td><td>usize</td><td><code>1024</code></td><td>Maximum number of sessions. Stored in the context and logged at startup, but <strong>no code path enforces it</strong> — <code>gx_session_add</code> never checks it.</td></tr>
 <tr><td><code>--db-uri</code></td><td>string</td><td>unset</td><td>MongoDB URI — parsed but never wired to the DB layer.</td></tr>
 <tr><td><code>--db-name</code></td><td>string</td><td><code>nextgcore</code></td><td>Database name — parsed but never used.</td></tr>

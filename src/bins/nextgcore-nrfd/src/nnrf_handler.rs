@@ -1169,6 +1169,20 @@ impl NfInstanceManager {
         removed
     }
 
+    /// Registered profiles by `(nfType, nfStatus)` (#1334: the `/metrics` census).
+    pub fn profile_census(&self) -> Vec<(String, String, usize)> {
+        let mut counts: std::collections::BTreeMap<(String, String), usize> =
+            std::collections::BTreeMap::new();
+        if let Ok(profiles) = self.profiles.read() {
+            for p in profiles.values() {
+                *counts
+                    .entry((p.nf_type.clone(), p.nf_status.clone()))
+                    .or_insert(0) += 1;
+            }
+        }
+        counts.into_iter().map(|((t, s), n)| (t, s, n)).collect()
+    }
+
     /// Get subscription count
     pub fn subscription_count(&self) -> usize {
         self.subscriptions.read().map(|s| s.len()).unwrap_or(0)

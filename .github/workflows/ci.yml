@@ -365,6 +365,38 @@ jobs:
           echo "$out" | grep -q 'amf.replicas > 1 is not supported' \
             || { echo "failed for another reason: $out"; exit 1; }
 
+  observability:
+    # #1334: a Prometheus rule or Grafana panel on a series no NF exports never
+    # fires / is always empty, and looks like coverage. Every series a shipped
+    # rule or dashboard queries must appear in an NF's exposition code, and the
+    # rule and scrape files must pass promtool.
+    name: Observability series
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyYAML
+        run: python3 -m pip install pyyaml
+      - name: Every queried series is exported by some NF
+        run: python3 deploy/observability/check_metric_series.py
+      - name: promtool check rules and config
+        run: |
+          set -euo pipefail
+          # The same image the compose stack runs; no network for the check.
+          img=prom/prometheus:v2.51.0
+          cfg=docker/rust/configs/observability
+          docker run --rm --network none -v "$PWD/$cfg":/cfg:ro -w /cfg \
+            --entrypoint promtool "$img" check rules alert-rules.yml
+          docker run --rm --network none -v "$PWD/$cfg":/cfg:ro -w /cfg \
+            --entrypoint promtool "$img" check config prometheus.yml
+          # The Kind/EKS scrape config lives in a ConfigMap.
+          mkdir -p "$RUNNER_TEMP/k8s-prom"
+          python3 -c 'import sys, yaml; d = [x for x in yaml.safe_load_all(open("k8s/monitoring/prometheus.yaml")) if x and x.get("kind") == "ConfigMap"][0]; open(sys.argv[1], "w").write(d["data"]["prometheus.yml"])' "$RUNNER_TEMP/k8s-prom/prometheus.yml"
+          docker run --rm --network none -v "$RUNNER_TEMP/k8s-prom":/cfg:ro -w /cfg \
+            --entrypoint promtool "$img" check config prometheus.yml
+
   release-images:
     # #420: release.yml publishes exactly docker/release-images.json. A new NF
     # daemon, Dockerfile or deployed image that is not in that list (or in its
@@ -450,10 +482,10 @@ jobs:
           done
           [ "$n" -gt 0 ] || { echo "no profile rendered"; exit 1; }
       - name: EKS Service patches keep the base ports
-        # The 5g profile's Service patches replace whole port lists
-        # (`$patch: replace`), so a port added to a base Service later would
-        # be dropped silently on EKS (#1100 review). Every Service a patch
-        # names must keep the base ports, be ClusterIP, and set no nodePort.
+        # The 5g profile's Service patches restate whole port lists, so a
+        # port they change would differ silently from the base on EKS (#1100
+        # review). Every Service a patch names must keep the base ports, be
+        # ClusterIP, and set no nodePort.
         working-directory: nextgcore
         run: |
           set -euo pipefail
@@ -461,6 +493,37 @@ jobs:
           kubectl kustomize deploy/eks/profiles/5g > "$RUNNER_TEMP/eks-5g.yaml"
           python3 deploy/eks/lib/check_service_ports.py \
             "$RUNNER_TEMP/base.yaml" "$RUNNER_TEMP/eks-5g.yaml" deploy/eks/profiles/5g/patches/*.yaml
+      - uses: azure/setup-helm@v4
+      - name: Nothing publishes a port (ClusterIP only)
+        # #1365: the base NRF and monitoring Services were NodePort, so
+        # applying k8s/ opened the unauthenticated NRF SBI, Prometheus,
+        # Jaeger and Grafana on every node IP. Fails on any NodePort,
+        # LoadBalancer, hostPort, hostNetwork, externalIPs or Ingress/Gateway
+        # route, in the k8s/, deploy/ and helm/ sources and in the rendered
+        # base, every EKS profile (with its own kustomize flags) and the Helm
+        # chart's defaults. Justified exceptions go in the commented allowlist
+        # at the top of deploy/check_no_exposure.py.
+        working-directory: nextgcore
+        run: |
+          set -euo pipefail
+          # The render pass must catch its synthetic inputs first (List
+          # items, init/ephemeral containers, every rule); a check that
+          # silently stopped matching would otherwise pass every render.
+          python3 deploy/check_no_exposure.py --self-test
+          r="$RUNNER_TEMP/exposure"; mkdir -p "$r"
+          args=()
+          kubectl kustomize k8s > "$r/base.yaml"; args+=(--render "$r/base.yaml")
+          kubectl kustomize deploy/eks > "$r/eks.yaml"; args+=(--render "$r/eks.yaml")
+          for d in deploy/eks/profiles/*/; do
+            p="$(basename "$d")"
+            flags="$(sed -n 's/^PROFILE_KUSTOMIZE_FLAGS="\(.*\)"$/\1/p' "$d/profile.env")"
+            # shellcheck disable=SC2086  # flags is a word list
+            kubectl kustomize $flags "$d" > "$r/eks-$p.yaml"
+            args+=(--render "$r/eks-$p.yaml")
+          done
+          helm template ci deploy/helm/nextgcore --set global.siteId=ci > "$r/helm.yaml"
+          args+=(--render "$r/helm.yaml")
+          python3 deploy/check_no_exposure.py "${args[@]}"
 
   fuzz-build:
     name: Fuzz targets build
@@ -758,6 +821,33 @@ jobs:
           curl -sf http://172.23.0.10:7777/healthz || echo "NRF not responding"
           echo "=== AMF health ==="
           curl -sf http://172.23.0.5:7777/healthz || echo "AMF not responding"
+
+      # #1334: every scrape target the shipped Prometheus config names serves
+      # /metrics. A gate, with a bounded wait rather than a sleep: each NF opens its
+      # listener right after its SBI server, inside the compose network (nothing is
+      # published on the host; the runner reaches the bridge addresses directly).
+      - name: Every NF serves /metrics (all scrape targets up)
+        run: |
+          set -euo pipefail
+          # job:address:series that proves it is that NF's exposition
+          targets="nrf:172.23.0.10:nrf_registered_nf_count ausf:172.23.0.11:ausf_ue_authentication_contexts
+            udm:172.23.0.12:udm_ue_contexts udr:172.23.0.20:udr_ue_contexts
+            pcf:172.23.0.13:pcf_policy_associations nssf:172.23.0.14:nssf_nssai_availability_nfs
+            bsf:172.23.0.15:bsf_pcf_bindings amf:172.23.0.5:amf_registered_ue_count
+            smf:172.23.0.4:smf_up upf:172.23.0.7:upf_up"
+          failed=0
+          for t in $targets; do
+            IFS=: read -r nf addr series <<< "$t"
+            ok=false
+            for _ in $(seq 1 30); do
+              if curl -sf --max-time 3 "http://$addr:9090/metrics" | grep -q "^$series"; then
+                ok=true; break
+              fi
+              sleep 2
+            done
+            if $ok; then echo "$nf: /metrics up ($series)"; else echo "$nf: /metrics DOWN at $addr:9090"; failed=1; fi
+          done
+          exit $failed
 
       # ====================================================================
       # Issue #397: the Namf_EventExposure DELIVERY assertion.

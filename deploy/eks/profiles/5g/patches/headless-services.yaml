@@ -77,26 +77,3 @@ spec:
       port: 2152
       targetPort: 2152
       protocol: UDP
----
-# The NRF is NodePort 30777 in the Kind manifests, which exists only so
-# kind-config.yaml can map hostPort 7777. On EKS that opens a port on every
-# node for no reason - use `kubectl port-forward` instead.
-#
-# $patch: replace on ports is required. Without it the list is merged by name
-# and the base's `nodePort: 30777` survives alongside `type: ClusterIP`, which
-# the API server rejects outright:
-#   Service "nrf" is invalid: spec.ports[0].nodePort: Forbidden:
-#   may not be used when `type` is 'ClusterIP'
-apiVersion: v1
-kind: Service
-metadata:
-  name: nrf
-  namespace: nextg-system
-spec:
-  type: ClusterIP
-  ports:
-    - $patch: replace
-    - name: sbi
-      port: 7777
-      targetPort: 7777
-      protocol: TCP

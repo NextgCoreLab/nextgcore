@@ -562,6 +562,16 @@ pub async fn run() -> Result<()> {
 
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
 
+    // #1334: the Prometheus endpoint, on NEXTGCORE_METRICS_BIND (loopback by default,
+    // #837) and UDM_METRICS_PORT (9090). Non-fatal, like smfd's. With the `nes`
+    // feature its energy gauges are served here too.
+    let _metrics = nextgcore_metrics::nf::serve_nf_metrics(
+        "UDM",
+        crate::metrics::METRICS_PORT_ENV,
+        std::sync::Arc::new(crate::metrics::render_prometheus),
+    )
+    .await;
+
     // Register with NRF and start heartbeat worker
     let registration_host = sbi.registration_host();
     match match registration_host {
@@ -647,7 +657,13 @@ pub async fn udm_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     }
     NES_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _guard = InFlightGuard;
-    udm_sbi_route(request).await
+    // #1334: Nudm operations, counted by outcome.
+    let operation = crate::metrics::classify(&request.header.method, &request.header.uri);
+    let response = udm_sbi_route(request).await;
+    if let Some(op) = operation {
+        crate::metrics::observe(op, response.status);
+    }
+    response
 }
 
 /// Every Nudm service name TS 29.503 §5 defines, in the order of the spec.
@@ -4033,6 +4049,18 @@ mod tests {
             let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", udm_port);
             let gen_path =
                 |id: &str| format!("/nudm-ueau/v1/{id}/security-information/generate-auth-data");
+            // #1334: the UDM's /metrics follows this test's generate-auth-data calls.
+            let (metrics_addr, metrics_task) = nextgcore_metrics::nes_energy::serve_metrics(
+                "127.0.0.1:0".parse().unwrap(),
+                std::sync::Arc::new(crate::metrics::render_prometheus),
+            )
+            .await
+            .expect("metrics endpoint");
+            let metric = |b: &str, s: &str| nextgcore_metrics::nf::sample_value(b, s).unwrap_or(0.0);
+            let gen_ok = r#"udm_operations_total{service="nudm-ueau",operation="generate_auth_data",result="success"}"#;
+            let gen_failed = r#"udm_operations_total{service="nudm-ueau",operation="generate_auth_data",result="failure"}"#;
+            let before = nextgcore_metrics::nf::scrape_for_test(metrics_addr).await;
+            let (ok0, failed0) = (metric(&before, gen_ok), metric(&before, gen_failed));
 
             // ---- strict-peer rejections ----
             // Missing servingNetworkName -> 400 MANDATORY_IE_MISSING
@@ -4287,6 +4315,45 @@ mod tests {
                 .await
                 .expect("send");
             assert_eq!(resp.status, 201);
+
+            // #1334: the rejections and the generated vectors above are counted
+            // (REVERT-VERIFIED: without `crate::metrics::observe` in
+            // `udm_sbi_request_handler` both stay where they were).
+            // #1334 review: an operation label is admitted on a 2xx, so a made-up resource
+            // of every service this NF serves must be answered with an error, or a client
+            // could mint label values.
+            for (service, version) in [("nudm-sdm", "v2"), ("nudm-uecm", "v1"), ("nudm-ueau", "v1"), ("nudm-ee", "v1"), ("nudm-pp", "v1"), ("nudm-mt", "v1"), ("nudm-niddau", "v1"), ("nudm-rsds", "v1"), ("nudm-ssau", "v1"), ("nudm-ueid", "v1")] {
+                for path in [
+                    format!("/{service}/{version}/madeup-resource-1334"),
+                    format!("/{service}/{version}/imsi-001010000000001/madeup-resource-1334"),
+                ] {
+                    for request in [
+                        nextgcore_sbi::message::SbiRequest::get(&path),
+                        nextgcore_sbi::message::SbiRequest::post(&path).with_body("{}", "application/json"),
+                    ] {
+                        let resp = client.send_request(request).await.expect("answered");
+                        assert!(resp.status >= 400, "{path} answered {}", resp.status);
+                    }
+                }
+            }
+            let after = nextgcore_metrics::nf::scrape_for_test(metrics_addr).await;
+            assert!(!after.contains("madeup"), "no made-up resource in a label: {after}");
+            assert!(metric(&after, gen_ok) >= ok0 + 1.0, "{after}");
+            assert!(metric(&after, gen_failed) >= failed0 + 2.0, "{after}");
+            for name in [
+                "udm_ue_contexts",
+                "udm_amf_registered_ues",
+                "udm_pdu_sessions",
+                "udm_sdm_subscriptions",
+                "nextgcore_sbi_request_total",
+                "nextgcore_nrf_registered",
+                "nextgcore_uptime_seconds",
+                "process_resident_memory_bytes",
+            ] {
+                assert!(nextgcore_metrics::nf::has_series(&after, name), "{name}:\n{after}");
+            }
+            assert!(!after.contains("imsi-"), "no SUPI in the exposition");
+            metrics_task.abort();
 
             udm_server.stop().await.expect("stop udm");
             udr_server.stop().await.expect("stop udr");

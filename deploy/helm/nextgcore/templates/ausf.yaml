@@ -37,6 +37,11 @@ spec:
             - name: sbi
               containerPort: {{ .Values.ausf.service.port }}
               protocol: TCP
+            {{- if .Values.ausf.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.ausf.metrics.port }}
+              protocol: TCP
+            {{- end }}
           {{- include "nextgcore.sbiProbes" . | nindent 10 }}
           volumeMounts:
             {{- include "nextgcore.configMounts" (dict "nf" "ausf" "rewritten" true) | nindent 12 }}
@@ -50,6 +55,14 @@ spec:
               value: {{ .Values.global.sbiProfile | default "dev" | quote }}
             - name: RUST_LOG
               value: {{ .Values.global.logLevel }}
+            {{- if .Values.ausf.metrics.enabled }}
+            # /metrics (#1334) defaults to 127.0.0.1 (#837); in the pod it must
+            # accept the pod IP for Prometheus. Not exposed beyond the cluster.
+            - name: NEXTGCORE_METRICS_BIND
+              value: "0.0.0.0"
+            - name: AUSF_METRICS_PORT
+              value: "{{ .Values.ausf.metrics.port }}"
+            {{- end }}
             - name: NEXTGCORE_SBI_ADVERTISE
               # #1312: the host registered with the NRF and put in callback
               # URIs, set apart from the bind so a wildcard bind can never be
@@ -78,6 +91,12 @@ spec:
       targetPort: sbi
       protocol: TCP
       name: sbi
+    {{- if .Values.ausf.metrics.enabled }}
+    - port: {{ .Values.ausf.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+    {{- end }}
   selector:
     app.kubernetes.io/name: ausf
     app.kubernetes.io/instance: {{ .Release.Name }}-ausf
