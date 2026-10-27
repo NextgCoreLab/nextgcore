@@ -728,9 +728,16 @@ VERIFY_WAIT="${VERIFY_WAIT:-90}"
 [[ "${VERIFY_WAIT}" =~ ^[0-9]+$ ]] || die "VERIFY_WAIT must be a number of seconds: ${VERIFY_WAIT}"
 verify_deadline=$(( $(date +%s) + VERIFY_WAIT ))
 while :; do
+  # #1354 review: fail closed. Unlisted pods are unverified pods, so a listing that
+  # fails is retried within VERIFY_WAIT like a not-Ready verdict, and then fails the
+  # deploy instead of reporting a success nothing checked.
   if ! kubectl get pods -n "${NAMESPACE}" -o json > "${PODS_JSON}" 2>/dev/null; then
-    warn "could not list pods; skipped image verification"
-    break
+    if [[ "$(date +%s)" -lt "${verify_deadline}" ]]; then
+      warn "could not list pods in ${NAMESPACE}; retrying the image verification..."
+      sleep 5
+      continue
+    fi
+    die "could not list pods in ${NAMESPACE} for ${VERIFY_WAIT}s; the deployed images are unverified"
   fi
   verify_rc=0
   verify_out="$(python3 "${SCRIPT_DIR}/lib/verify_images.py" "${RENDERED}" "${PODS_JSON}" 2>&1)" \
