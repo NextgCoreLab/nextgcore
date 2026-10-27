@@ -474,6 +474,10 @@ jobs:
         working-directory: nextgcore
         run: |
           set -euo pipefail
+          # The render pass must catch its synthetic inputs first (List
+          # items, init/ephemeral containers, every rule); a check that
+          # silently stopped matching would otherwise pass every render.
+          python3 deploy/check_no_exposure.py --self-test
           r="$RUNNER_TEMP/exposure"; mkdir -p "$r"
           args=()
           kubectl kustomize k8s > "$r/base.yaml"; args+=(--render "$r/base.yaml")
