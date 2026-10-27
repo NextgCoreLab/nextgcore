@@ -107,7 +107,7 @@ Counted at the Nsmf_PDUSession_CreateSMContext answer (TS 29.502 §5.2.2.2), mod
 | Metric | Type | Labels | Counts |
 |---|---|---|---|
 | `smf_session_requests_total` | counter | | establishment requests received |
-| `smf_session_success_total` | counter | | answered 201 with PDU SESSION ESTABLISHMENT ACCEPT |
+| `smf_session_success_total` | counter | | answered 201 with PDU SESSION ESTABLISHMENT ACCEPT. This is the SMF's view: a failure on the RAN side after it (the gNB failing the PDU session resource setup) still counts as a success here. Those show in the AMF's NGAP counters, e.g. `amf_ngap_messages_total{procedure="PDUSessionResourceSetup"}` by `outcome` and `amf_ngap_failures_total` |
 | `smf_session_failure_total` | counter | | refused (any other answer) |
 | `smf_session_failure_cause_total` | counter | `cause`: the 5GSM cause of the PDU SESSION ESTABLISHMENT REJECT (0..255, TS 24.501 §9.11.4.2), or `none` when the answer carries no N1 reject | refusals by cause |
 

@@ -1555,7 +1555,27 @@ mod tests {
             Arc::clone(&seen),
             Arc::clone(&started),
         );
-        let reader = std::thread::spawn(move || {
+        // #1373 review: stopped and joined on every exit, a failed bounded wait
+        // included, so a failing test never leaves its reader spinning.
+        struct Reader {
+            stop: Arc<AtomicBool>,
+            handle: Option<std::thread::JoinHandle<Vec<String>>>,
+        }
+        impl Reader {
+            fn finish(mut self) -> Vec<String> {
+                self.stop.store(true, Ordering::Relaxed);
+                self.handle.take().expect("joined once").join().unwrap()
+            }
+        }
+        impl Drop for Reader {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::Relaxed);
+                if let Some(handle) = self.handle.take() {
+                    let _ = handle.join();
+                }
+            }
+        }
+        let reader_handle = std::thread::spawn(move || {
             let mut bad = Vec::new();
             reader_started.store(true, Ordering::Release);
             while !reader_stop.load(Ordering::Relaxed) {
@@ -1577,6 +1597,11 @@ mod tests {
             }
             bad
         });
+        let reader = Reader {
+            stop: Arc::clone(&stop),
+            handle: Some(reader_handle),
+        };
+
         // Wait for the reader to observe `predicate`, bounded so a broken reader fails
         // the test instead of hanging it.
         async fn wait_for(what: &str, predicate: impl Fn() -> bool) {
@@ -1603,8 +1628,7 @@ mod tests {
             }
             dp.remove_session_from_pfcp(seid);
         }
-        stop.store(true, Ordering::Relaxed);
-        let bad = reader.join().unwrap();
+        let bad = reader.finish();
         let seen = seen.load(Ordering::Acquire);
         assert!(
             seen >= 400 / CHECKPOINT,

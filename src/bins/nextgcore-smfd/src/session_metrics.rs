@@ -7,7 +7,10 @@
 //! - every establishment request received is counted (an EPS→5GS handover create,
 //!   TS 29.502 §5.2.2.2.3, is a session moving in, not an establishment, and is not);
 //! - a 201 SmContextCreatedData, which carries the PDU SESSION ESTABLISHMENT ACCEPT, is
-//!   a success;
+//!   a success. This is the SMF's view: a failure on the RAN side after it (the gNB
+//!   failing the PDU session resource setup) is still a success here. Those show in the
+//!   AMF's NGAP counters (`amf_ngap_messages_total{procedure="PDUSessionResourceSetup"}`
+//!   by outcome, `amf_ngap_failures_total`);
 //! - anything else is a failure, by the 5GSM cause of the PDU SESSION ESTABLISHMENT
 //!   REJECT it carries (TS 24.501 §8.3.3, §9.11.4.2), or `none` when the answer carries
 //!   no N1 reject (a malformed request, an SMF that is shutting down).
