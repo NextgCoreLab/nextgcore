@@ -3230,9 +3230,11 @@ impl DataPlaneStats {
     /// Count one dropped packet against `reason` (#1345): the total, the reason, and
     /// the legacy `spoofed`/`oversize` counters for those two reasons.
     ///
-    /// Logs the first drop of each reason at info and later ones at debug, at most
-    /// once per [`DROP_DEBUG_LOG_INTERVAL_MS`] per reason. `detail` (the 5-tuple or
-    /// TEID) is only built when a line is actually emitted.
+    /// Logs the first drop of each reason at info (reason and count only) and later
+    /// ones at debug, at most once per [`DROP_DEBUG_LOG_INTERVAL_MS`] per reason.
+    /// `detail` (the 5-tuple, TEID or endpoint) is subscriber data: it appears on
+    /// debug lines only, and is built only when debug is enabled. See
+    /// [`drop_log_lines`].
     pub fn record_drop(&self, reason: DropReason, detail: impl FnOnce() -> String) {
         self.dropped_packets.fetch_add(1, Ordering::Relaxed);
         match reason {
@@ -3251,16 +3253,9 @@ impl DataPlaneStats {
         }
         let now_ms = self.epoch.elapsed().as_millis() as u64;
         if let Some(level) = self.drop_log_level(reason, prior, now_ms) {
-            let label = reason.label();
-            match level {
-                log::Level::Info => {
-                    log::info!("Data plane drop ({label}, first of its kind): {}", detail())
-                }
-                _ => log::debug!(
-                    "Data plane drop ({label}, {} so far): {}",
-                    prior + 1,
-                    detail()
-                ),
+            let debug = log::log_enabled!(log::Level::Debug);
+            for (level, line) in drop_log_lines(level, reason, prior + 1, debug, detail) {
+                log::log!(level, "{line}");
             }
         }
     }
@@ -3370,6 +3365,39 @@ impl Default for DataPlaneStats {
             epoch: std::time::Instant::now(),
         }
     }
+}
+
+/// The log lines for one drop that [`DataPlaneStats::drop_log_level`] chose to log
+/// at `level` (#1345), `count` being that reason's count including this drop.
+///
+/// The info line carries the reason and its count only. `detail` -- the 5-tuple,
+/// TEID, SEID or endpoint -- names a subscriber's UE address, so it goes on a debug
+/// line, and is built only when `debug_enabled`.
+fn drop_log_lines(
+    level: log::Level,
+    reason: DropReason,
+    count: u64,
+    debug_enabled: bool,
+    detail: impl FnOnce() -> String,
+) -> Vec<(log::Level, String)> {
+    let label = reason.label();
+    let mut lines = Vec::with_capacity(2);
+    if level == log::Level::Info {
+        lines.push((
+            log::Level::Info,
+            format!(
+                "Data plane drop ({label}, first of its kind): {label}={count}; \
+                 the packet's addresses are logged at debug"
+            ),
+        ));
+    }
+    if debug_enabled {
+        lines.push((
+            log::Level::Debug,
+            format!("Data plane drop ({label}, {count} so far): {}", detail()),
+        ));
+    }
+    lines
 }
 
 /// The labelled Prometheus family of [`DataPlaneStats::drops`] (#1345).
@@ -9640,6 +9668,42 @@ mod tests {
             u64::MAX,
             "the first FarDrop claimed its info line"
         );
+    }
+
+    /// UE addresses are subscriber data: the first-of-kind info line names the reason
+    /// and its count, never the packet; the 5-tuple goes on the debug line only, and
+    /// is not even built when debug is off.
+    #[test]
+    fn the_info_drop_line_carries_no_ue_address() {
+        use log::Level::{Debug, Info};
+        let tuple = || "proto=17 10.45.0.7:1234 -> 8.8.8.8:53".to_string();
+
+        let lines = drop_log_lines(Info, DropReason::NoPdrMatch, 1, false, || {
+            panic!("the detail must not be built with debug off")
+        });
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, Info);
+        assert_eq!(
+            lines[0].1,
+            "Data plane drop (no_pdr_match, first of its kind): no_pdr_match=1; \
+             the packet's addresses are logged at debug"
+        );
+
+        let lines = drop_log_lines(Info, DropReason::NoPdrMatch, 1, true, tuple);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].0, Info);
+        assert!(!lines[0].1.contains("10.45.0.7"), "{}", lines[0].1);
+        assert_eq!(lines[1].0, Debug);
+        assert_eq!(
+            lines[1].1,
+            "Data plane drop (no_pdr_match, 1 so far): proto=17 10.45.0.7:1234 -> 8.8.8.8:53"
+        );
+
+        let lines = drop_log_lines(Debug, DropReason::NoPdrMatch, 9, true, tuple);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, Debug);
+        assert!(lines[0].1.contains("9 so far"));
+        assert!(drop_log_lines(Debug, DropReason::NoPdrMatch, 9, false, tuple).is_empty());
     }
 
     /// deploy/eks/e2e-internet.sh parses the stats line with sed. Run ITS expression

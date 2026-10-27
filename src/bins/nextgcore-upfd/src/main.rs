@@ -1427,9 +1427,9 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                 }
             }
 
-            // FAR switched to FORW → flush packets buffered under BUFF
-            // (the session may have been re-created by update_session_from_pfcp,
-            // so re-resolve it inside flush_buffered_dl)
+            // FAR switched to FORW → flush packets buffered under BUFF.
+            // flush_buffered_dl looks the session up by SEID; since #822 it is the
+            // same session object update_session_from_pfcp moved in place.
             if any_far_forwards && !drop_buffered {
                 data_plane.flush_buffered_dl(upf_seid).await;
             }
