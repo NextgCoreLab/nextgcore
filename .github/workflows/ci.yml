@@ -1959,10 +1959,14 @@ jobs:
                     the PGW-C S5/S8 socket serving (from the daemons' own metrics);
                     S1 Setup accepted; a real LTE UE (nextgsim) attached to
                     EMM-REGISTERED with its default EPS bearer activated on the same
-                    EBI at the UE and the MME; and 20 ICMP echoes from the bearer's
-                    PDN address to the PGW-U SGi address with 0% loss.
-          NOT ASSERTED: dedicated bearers, handover, idle-mode/paging, internet
-                    egress beyond the PGW-U, and the IPv6 PDN type.
+                    EBI at the UE and the MME; the PGW-C's local PCC rule
+                    activating a dedicated EPS bearer, again on the same EBI at
+                    the UE and the MME (#1336); and 20 ICMP echoes from the
+                    default bearer's PDN address to the PGW-U SGi address with
+                    0% loss.
+          NOT ASSERTED: dedicated-bearer modification and deletion, handover,
+                    idle-mode/paging, internet egress beyond the PGW-U, and the
+                    IPv6 PDN type.
           NOTE
 
       - name: Collect logs on failure
@@ -1995,8 +1999,9 @@ jobs:
   #
   # SCOPE IS PART OF THE RECORD. The manifest states what was NOT validated as
   # well as what was: the heavy jobs are nightly/dispatch rather than per-PR, and
-  # `docker-e2e-epc` asserts an LTE attach and a 0%-loss default-bearer ping but
-  # NOT dedicated bearers, handover or paging (#303). A release note claiming
+  # `docker-e2e-epc` asserts an LTE attach, a dedicated bearer's activation from
+  # the PGW-C's local PCC rule (#1336) and a 0%-loss default-bearer ping, but NOT
+  # dedicated-bearer modification or deletion, handover or paging (#303). A release note claiming
   # more than the manifest's `scope` would be the #414 defect at release scale --
   # a green tick meaning more than it should.
   # ====================================================================
@@ -2030,7 +2035,7 @@ jobs:
             "validated_by": ["docker-build", "docker-e2e", "docker-e2e-epc"],
             "scope": {
               "5gc_e2e": "Real UE registration over N2 through nextgsim's gNB, plus a Service Request CM-IDLE cycle with Namf event delivery assertions (#397, #403); downlink-triggered paging, before and after a Service Request from CM-IDLE (#648); a UE-triggered Service Request from CM-IDLE with a 20/20 ping; UE-initiated de-registration and re-registration with a 20/20 ping; UDM REREGISTRATION_REQUIRED re-registration without T3510, with the PDU session re-established and a 20/20 ping (docker/rust/ue-flow-check.sh, #649). Not handover or Xn.",
-              "epc_e2e": "Real LTE attach through nextgsim's eNB and UE to EMM-REGISTERED with the default EPS bearer, and a 20-packet 0%-loss ping through S1-U/SGW-U/S5-U/PGW-U (#303). Not dedicated bearers, handover or paging.",
+              "epc_e2e": "Real LTE attach through nextgsim's eNB and UE to EMM-REGISTERED with the default EPS bearer, a dedicated EPS bearer activated from the PGW-C's local PCC rule (#1336), and a 20-packet 0%-loss ping through S1-U/SGW-U/S5-U/PGW-U (#303). Not dedicated-bearer modification or deletion, handover or paging.",
               "not_validated": "These jobs run nightly or on dispatch, NOT per-PR. A commit on main between nightlies has not been through this."
             }
           }

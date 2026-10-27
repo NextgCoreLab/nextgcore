@@ -88,6 +88,25 @@ smf:
     - 8.8.4.4
   mtu: 1400
 
+  # One local PCC rule (TS 23.203 §6.3 predefined rule, #619), so every attach
+  # also activates a dedicated EPS bearer: Create Bearer Request over S5/S8,
+  # relayed by the SGW-C, E-RAB SETUP with ACTIVATE DEDICATED EPS BEARER
+  # CONTEXT REQUEST at the MME, a second DRB at the UE (#1336). Without it no
+  # deployment ran that chain across real binaries. Its TFT is UDP port 5004
+  # only, so ICMP, DNS and HTTPS stay on the default bearer. Rates in bit/s.
+  pcc_rules:
+    - name: rtp
+      apn: internet
+      qci: 1
+      arp: { priority_level: 2, pre_emption_vulnerability: true }
+      mbr: { uplink: 128000, downlink: 128000 }
+      gbr: { uplink: 64000, downlink: 64000 }
+      flows:
+        - direction: downlink
+          description: permit out 17 from any 5004 to assigned
+        - direction: uplink
+          description: permit out 17 from any to assigned 5004
+
   # No TLS: this deployment has no certificates mounted and
   # NEXTGCORE_SBI_PROFILE=dev in the compose file opts the SBI listener out of
   # the production profile. S5/S8 is unaffected either way — TS 29.274 defines no

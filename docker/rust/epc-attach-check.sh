@@ -12,6 +12,8 @@
 #   1. S1 Setup     -- mmed accepted the eNB (TS 36.413 §8.7.3).
 #   2. Attach       -- the UE reached EMM-REGISTERED, and mmed activated the
 #                      default EPS bearer on the SAME EBI the UE reports.
+#                      Then the PGW-C's local PCC rule's dedicated bearer
+#                      (#1336), again on the same EBI at the UE and mmed.
 #   3. User plane   -- a ping from the UE's TUN (the default bearer's PDN
 #                      address) to the PGW-U's SGi address crosses
 #                      UE -> eNB -> S1-U -> SGW-U -> S5-U -> PGW-U and back
@@ -80,6 +82,14 @@ if [ -z "$pdn" ] || [ "$pdn" = "0.0.0.0" ]; then
 fi
 echo "    UE default bearer EBI=${ebi}, PDN address ${pdn}"
 wait_for "$MME" "Default EPS bearer \\(ebi=${ebi}\\) activated" "MME activated the same default bearer (ebi=${ebi})"
+
+# 2b. The dedicated bearer of the PGW-C's local PCC rule (configs/epc/pgwc.yaml
+#     `pcc_rules`, #1336): Create Bearer over S5/S8 and S11, E-RAB SETUP, and the
+#     same EBI activated by the UE and by the MME.
+wait_for "$UE" 'dedicated EPS bearer [0-9]+ activated' "UE activated the PCC rule's dedicated bearer"
+ded=$(docker logs "$UE" 2>&1 | grep -Eo 'dedicated EPS bearer [0-9]+ activated' | tail -1 | awk '{print $4}')
+[ -n "$ded" ] || { echo "FAIL: could not read the dedicated bearer's EBI from the UE"; exit 1; }
+wait_for "$MME" "Dedicated EPS bearer \\(ebi=${ded}\\) activated" "MME activated the same dedicated bearer (ebi=${ded})"
 
 # 3. User plane, 0% loss.
 echo "Pinging ${TARGET} x${COUNT} from the UE's default bearer..."

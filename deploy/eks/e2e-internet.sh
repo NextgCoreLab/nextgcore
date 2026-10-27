@@ -33,7 +33,8 @@
 #
 # Exit status: 0 when every step PASSes, 1 when any step FAILs, 2 on a usage or
 # environment error (no UE pod, no TUN, ...). PROFILE=epc additionally checks
-# the LTE attach (S1 Setup, EMM-REGISTERED, default bearer) from the logs.
+# the LTE attach (S1 Setup, EMM-REGISTERED, default bearer, and the dedicated
+# bearer of the PGW-C's local PCC rule) from the logs.
 # PROFILE=6g runs the 5G checks against nextg-6g plus a 6G feature smoke: each
 # runtime feature the profile builds in shows its signature (see that section).
 set -uo pipefail
@@ -138,6 +139,14 @@ if [[ "${PROFILE}" == epc ]]; then
     pass "default EPS bearer EBI ${EBI} activated on the UE and the MME"
   else
     fail "default EPS bearer: UE EBI '${EBI:-none}' not activated in the mme log"
+  fi
+  # #1336: the PGW-C's local PCC rule (docker/rust/configs/epc/pgwc.yaml) makes
+  # every attach activate a dedicated bearer; the same EBI on both ends.
+  DED="$(grep -Eo 'dedicated EPS bearer [0-9]+ activated' <<<"${UE_LOG}" | tail -n1 | awk '{print $4}')"
+  if [[ -n "${DED}" ]] && grep -Eq "Dedicated EPS bearer \(ebi=${DED}\) activated" <<<"${MME_LOG}"; then
+    pass "dedicated EPS bearer EBI ${DED} activated on the UE and the MME"
+  else
+    fail "dedicated EPS bearer: UE EBI '${DED:-none}' not activated in the mme log (pgwc pcc_rules?)"
   fi
 fi
 
