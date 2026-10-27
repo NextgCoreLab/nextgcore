@@ -2655,6 +2655,38 @@ impl SessionManager {
     }
 }
 
+/// The 5-tuple of a dropped packet for its log line (#1345), or a placeholder when
+/// the packet carried no parsable IPv4 header.
+fn describe_tuple(tuple: Option<&PacketTuple>) -> String {
+    match tuple {
+        Some(t) => format!(
+            "proto={} {}:{} -> {}:{}",
+            t.protocol,
+            Ipv4Addr::from(t.src_ip),
+            t.src_port,
+            Ipv4Addr::from(t.dst_ip),
+            t.dst_port
+        ),
+        None => "no IPv4 5-tuple".to_string(),
+    }
+}
+
+/// Source, destination and next header of an IPv6 packet read from the TUN, for the
+/// `dl_ipv6` drop line (#1345). `None` when the fixed header is truncated.
+fn describe_ipv6(pkt: &[u8]) -> Option<String> {
+    if pkt.len() < 40 {
+        return None;
+    }
+    let src: [u8; 16] = pkt[8..24].try_into().ok()?;
+    let dst: [u8; 16] = pkt[24..40].try_into().ok()?;
+    Some(format!(
+        "next_header={} {} -> {}",
+        pkt[6],
+        Ipv6Addr::from(src),
+        Ipv6Addr::from(dst)
+    ))
+}
+
 /// Packet 5-tuple for SDF filter matching
 #[derive(Debug, Clone, Copy)]
 pub struct PacketTuple {
@@ -3039,24 +3071,217 @@ pub struct DataPlaneStats {
     /// was not delivered (send failure, or abandoned after N1). See
     /// [`DataPlane::restore_urr_usage`].
     pub urr_reports_restored: AtomicU64,
+    /// #1345: `dropped_packets` broken out by [`DropReason`], indexed by
+    /// `reason as usize`. Every drop increments exactly one of these AND
+    /// `dropped_packets`, so they always sum to the total.
+    drops_by_reason: [AtomicU64; DropReason::COUNT],
+    /// #1345: when each reason last logged at debug, in ms since `epoch`
+    /// (`u64::MAX` = never logged; the first drop of a reason logs at info).
+    drop_last_logged_ms: [AtomicU64; DropReason::COUNT],
+    /// Origin of `drop_last_logged_ms`.
+    epoch: std::time::Instant,
 }
+
+/// Why the data plane dropped a packet (#1345). Each [`DataPlaneStats::record_drop`]
+/// call names one, so `dropped=` is always accounted for: the reasons sum to it.
+///
+/// Labels are lowercase on purpose: deploy/eks/e2e-internet.sh reads the stats line
+/// with `sed 's/.*Data plane stats: UL=\([0-9]*\) pkts.*DL=\([0-9]*\) pkts.*/'`, and
+/// its greedy `.*DL=` would latch onto a later uppercase `DL=<n> pkts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropReason {
+    /// N3 datagram whose GTP-U header does not parse, or a G-PDU with no payload.
+    MalformedGtpu,
+    /// G-PDU for a TEID no session holds (incl. TEID 0, TS 29.281 §7.3.1).
+    UnknownTeid,
+    /// The session holds no PDR the packet matches (TS 23.501 §5.8.2).
+    NoPdrMatch,
+    /// TUN-side IPv4 packet for a destination that is no session's UE address.
+    NoSession,
+    /// TUN-side IPv6 packet: the downlink session lookup is IPv4-only, so this is
+    /// typically the kernel's own RS/ND/MLD traffic on the TUN.
+    DlIpv6,
+    /// TUN-side packet that is neither a full IPv4 header nor IPv6.
+    DlUnparsable,
+    /// Uplink source-address validation failed (TS 23.501 §5.6.1).
+    Spoofed,
+    /// Inner packet larger than the TUN MTU.
+    Oversize,
+    /// QER gate closed or MBR exceeded.
+    QerGate,
+    /// FAR Apply Action DROP, no recognised action, or the FAR is not provisioned.
+    FarDrop,
+    /// Uplink packet under a FAR whose action is BUFF (buffering is DL-only).
+    UlFarBuffer,
+    /// DL buffer full under a BUFF FAR (TS 23.501 §5.8.3).
+    BufferOverflow,
+    /// URR quota exhausted (TS 29.244 §5.2.2.2.2).
+    QuotaExhausted,
+    /// A forwarding DL FAR with no N3 endpoint yet: no Outer Header Creation and
+    /// the session has no gNB address (the establishment before the N2 response).
+    NoDlEndpoint,
+    /// The endpoint is IPv6 and no IPv6 GTP-U socket is bound.
+    NoGtpuSocket,
+    /// `send_to` on the GTP-U socket failed.
+    SendError,
+    /// `write` to the TUN failed.
+    TunWriteError,
+}
+
+impl DropReason {
+    /// Number of reasons (the length of [`DropReason::ALL`]).
+    pub const COUNT: usize = 17;
+
+    /// Every reason, in `as usize` order.
+    pub const ALL: [DropReason; DropReason::COUNT] = [
+        DropReason::MalformedGtpu,
+        DropReason::UnknownTeid,
+        DropReason::NoPdrMatch,
+        DropReason::NoSession,
+        DropReason::DlIpv6,
+        DropReason::DlUnparsable,
+        DropReason::Spoofed,
+        DropReason::Oversize,
+        DropReason::QerGate,
+        DropReason::FarDrop,
+        DropReason::UlFarBuffer,
+        DropReason::BufferOverflow,
+        DropReason::QuotaExhausted,
+        DropReason::NoDlEndpoint,
+        DropReason::NoGtpuSocket,
+        DropReason::SendError,
+        DropReason::TunWriteError,
+    ];
+
+    /// The `reason` label in the stats line and on `/metrics`.
+    pub fn label(self) -> &'static str {
+        match self {
+            DropReason::MalformedGtpu => "malformed_gtpu",
+            DropReason::UnknownTeid => "unknown_teid",
+            DropReason::NoPdrMatch => "no_pdr_match",
+            DropReason::NoSession => "no_session",
+            DropReason::DlIpv6 => "dl_ipv6",
+            DropReason::DlUnparsable => "dl_unparsable",
+            DropReason::Spoofed => "spoofed",
+            DropReason::Oversize => "oversize",
+            DropReason::QerGate => "qer_gate",
+            DropReason::FarDrop => "far_drop",
+            DropReason::UlFarBuffer => "ul_far_buffer",
+            DropReason::BufferOverflow => "buffer_overflow",
+            DropReason::QuotaExhausted => "quota_exhausted",
+            DropReason::NoDlEndpoint => "no_dl_endpoint",
+            DropReason::NoGtpuSocket => "no_gtpu_socket",
+            DropReason::SendError => "send_error",
+            DropReason::TunWriteError => "tun_write_error",
+        }
+    }
+}
+
+/// The downlink endpoint of a session established without a gNB/eNB F-TEID (#1345):
+/// the unspecified address, which the forwarding path refuses as
+/// [`DropReason::NoDlEndpoint`]. It used to be 127.0.0.1, which sent such packets to
+/// the UPF's own loopback and counted them as forwarded.
+pub const NO_DL_ENDPOINT: SocketAddr =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), GTPU_PORT);
+
+/// How often a reason's later drops may log at debug (#1345); the first logs at info.
+pub const DROP_DEBUG_LOG_INTERVAL_MS: u64 = 1000;
 
 /// How often the forwarding loop logs [`DataPlaneStats::summary`] (#581).
 pub const STATS_LOG_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 
 impl DataPlaneStats {
     /// One-line summary for the periodic "Data plane stats" log (#581).
+    ///
+    /// The `UL=<n> pkts/<n> B, DL=<n> pkts/<n> B, dropped=<n>` prefix is parsed by
+    /// deploy/eks/e2e-internet.sh and must keep its order and format. #1345 appends
+    /// every other non-zero drop reason inside the parentheses, after the
+    /// always-present `spoofed` and `oversize`.
     pub fn summary(&self) -> String {
+        let mut reasons = format!(
+            "spoofed={}, oversize={}",
+            self.spoofed_packets.load(Ordering::Relaxed),
+            self.oversize_packets.load(Ordering::Relaxed),
+        );
+        for reason in DropReason::ALL {
+            if matches!(reason, DropReason::Spoofed | DropReason::Oversize) {
+                continue;
+            }
+            let n = self.drops(reason);
+            if n > 0 {
+                reasons.push_str(&format!(", {}={n}", reason.label()));
+            }
+        }
         format!(
-            "UL={} pkts/{} B, DL={} pkts/{} B, dropped={} (spoofed={}, oversize={})",
+            "UL={} pkts/{} B, DL={} pkts/{} B, dropped={} ({reasons})",
             self.ul_packets.load(Ordering::Relaxed),
             self.ul_bytes.load(Ordering::Relaxed),
             self.dl_packets.load(Ordering::Relaxed),
             self.dl_bytes.load(Ordering::Relaxed),
             self.dropped_packets.load(Ordering::Relaxed),
-            self.spoofed_packets.load(Ordering::Relaxed),
-            self.oversize_packets.load(Ordering::Relaxed),
         )
+    }
+
+    /// Packets dropped for `reason` since start (#1345).
+    pub fn drops(&self, reason: DropReason) -> u64 {
+        self.drops_by_reason[reason as usize].load(Ordering::Relaxed)
+    }
+
+    /// Count one dropped packet against `reason` (#1345): the total, the reason, and
+    /// the legacy `spoofed`/`oversize` counters for those two reasons.
+    ///
+    /// Logs the first drop of each reason at info and later ones at debug, at most
+    /// once per [`DROP_DEBUG_LOG_INTERVAL_MS`] per reason. `detail` (the 5-tuple or
+    /// TEID) is only built when a line is actually emitted.
+    pub fn record_drop(&self, reason: DropReason, detail: impl FnOnce() -> String) {
+        self.dropped_packets.fetch_add(1, Ordering::Relaxed);
+        match reason {
+            DropReason::Spoofed => {
+                self.spoofed_packets.fetch_add(1, Ordering::Relaxed);
+            }
+            DropReason::Oversize => {
+                self.oversize_packets.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        let prior = self.drops_by_reason[reason as usize].fetch_add(1, Ordering::Relaxed);
+        // The debug half costs a clock read and a CAS; skip it when nobody listens.
+        if prior > 0 && !log::log_enabled!(log::Level::Debug) {
+            return;
+        }
+        let now_ms = self.epoch.elapsed().as_millis() as u64;
+        if let Some(level) = self.drop_log_level(reason, prior, now_ms) {
+            let label = reason.label();
+            match level {
+                log::Level::Info => {
+                    log::info!("Data plane drop ({label}, first of its kind): {}", detail())
+                }
+                _ => log::debug!(
+                    "Data plane drop ({label}, {} so far): {}",
+                    prior + 1,
+                    detail()
+                ),
+            }
+        }
+    }
+
+    /// Whether a drop of `reason`, the `prior`-th before it, gets a log line at
+    /// `now_ms` (#1345): the first one at info, later ones at debug at most once per
+    /// [`DROP_DEBUG_LOG_INTERVAL_MS`] per reason, otherwise none.
+    fn drop_log_level(&self, reason: DropReason, prior: u64, now_ms: u64) -> Option<log::Level> {
+        let slot = &self.drop_last_logged_ms[reason as usize];
+        if prior == 0 {
+            // `fetch_add` hands `prior == 0` to exactly one caller.
+            slot.store(now_ms, Ordering::Relaxed);
+            return Some(log::Level::Info);
+        }
+        let last = slot.load(Ordering::Relaxed);
+        let due = last == u64::MAX || now_ms.saturating_sub(last) >= DROP_DEBUG_LOG_INTERVAL_MS;
+        // The CAS lets one of several concurrent drops claim the line.
+        (due && slot
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok())
+        .then_some(log::Level::Debug)
     }
 
     /// The forwarding counters in Prometheus text format (#581), appended to the
@@ -3112,6 +3337,19 @@ impl DataPlaneStats {
                 v.load(Ordering::Relaxed)
             ));
         }
+        // #1345: the total broken out by cause. Every reason is emitted, zero
+        // included, so a rate() over it has a series from the first scrape.
+        let name = DROPS_BY_REASON_METRIC;
+        out.push_str(&format!(
+            "# HELP {name} User-plane packets dropped by the data plane, by cause; the reasons sum to upf_dataplane_dropped_packets_total\n# TYPE {name} counter\n"
+        ));
+        for reason in DropReason::ALL {
+            out.push_str(&format!(
+                "{name}{{reason=\"{}\"}} {}\n",
+                reason.label(),
+                self.drops(reason)
+            ));
+        }
         out
     }
 }
@@ -3127,9 +3365,15 @@ impl Default for DataPlaneStats {
             spoofed_packets: AtomicU64::new(0),
             oversize_packets: AtomicU64::new(0),
             urr_reports_restored: AtomicU64::new(0),
+            drops_by_reason: std::array::from_fn(|_| AtomicU64::new(0)),
+            drop_last_logged_ms: std::array::from_fn(|_| AtomicU64::new(u64::MAX)),
+            epoch: std::time::Instant::now(),
         }
     }
 }
+
+/// The labelled Prometheus family of [`DataPlaneStats::drops`] (#1345).
+pub const DROPS_BY_REASON_METRIC: &str = "upf_dataplane_dropped_packets_by_reason_total";
 
 impl DataPlane {
     /// Create a new data plane context
@@ -3283,6 +3527,9 @@ impl DataPlane {
     /// left out instead, and that is logged once.
     pub fn probeable_paths(&self, mut in_use: HashSet<SocketAddr>) -> HashSet<SocketAddr> {
         static WARNED: AtomicBool = AtomicBool::new(false);
+        // #1345: a session with no gNB endpoint yet holds `NO_DL_ENDPOINT`; there
+        // is no path to probe.
+        in_use.retain(|p| !p.ip().is_unspecified());
         if self.gtpu_socket6.is_none() {
             let before = in_use.len();
             in_use.retain(|p| p.is_ipv4());
@@ -3479,8 +3726,12 @@ impl DataPlane {
         let header = match parse_gtpu_header(pkt) {
             Ok(h) => h,
             Err(e) => {
-                log::debug!("Failed to parse GTP-U header: {e:?}");
-                self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                self.stats.record_drop(DropReason::MalformedGtpu, || {
+                    format!(
+                        "{}B from {from}: GTP-U header does not parse ({e:?})",
+                        pkt.len()
+                    )
+                });
                 return;
             }
         };
@@ -3575,7 +3826,12 @@ impl DataPlane {
 
         // Extract IP payload
         if pkt.len() <= header.header_len {
-            self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+            self.stats.record_drop(DropReason::MalformedGtpu, || {
+                format!(
+                    "G-PDU with no payload from {from}, TEID=0x{:x}",
+                    header.teid
+                )
+            });
             return;
         }
         let ip_payload = &pkt[header.header_len..];
@@ -3634,7 +3890,9 @@ impl DataPlane {
                          (TS 29.281 §7.3.1)"
                     );
                 }
-                self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                self.stats.record_drop(DropReason::UnknownTeid, || {
+                    format!("G-PDU from {from}, TEID=0x{:x}", header.teid)
+                });
                 return;
             }
         };
@@ -3679,11 +3937,21 @@ impl DataPlane {
                         }
                         Err(e) => {
                             log::warn!("GTP-U forward to {to} failed: {e}");
-                            self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                            self.stats.record_drop(DropReason::SendError, || {
+                                format!(
+                                    "relay from TEID 0x{:x} to {to} TEID 0x{teid:x}: {e}",
+                                    header.teid
+                                )
+                            });
                         }
                     },
                     None => {
-                        self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                        self.stats.record_drop(DropReason::NoGtpuSocket, || {
+                            format!(
+                                "relay from TEID 0x{:x} to {to}: no GTP-U socket for it",
+                                header.teid
+                            )
+                        });
                     }
                 }
                 return;
@@ -3708,8 +3976,13 @@ impl DataPlane {
                         "UL source spoofing on TEID 0x{:x}: inner src {src_ip} != UE IP {ue_ip} — dropped",
                         header.teid
                     );
-                    self.stats.spoofed_packets.fetch_add(1, Ordering::Relaxed);
-                    self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                    self.stats.record_drop(DropReason::Spoofed, || {
+                        format!(
+                            "UL TEID 0x{:x} from {from}: {}",
+                            header.teid,
+                            describe_tuple(pkt_tuple.as_ref())
+                        )
+                    });
                     return;
                 }
             }
@@ -3720,8 +3993,13 @@ impl DataPlane {
             // Check QER gate and extract DSCP
             if let Some(qid) = qer_id {
                 if !session.check_qer_gate(qid, true, payload_len) {
-                    log::debug!("UL packet dropped by QER gate (qer_id={qid})");
-                    self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                    self.stats.record_drop(DropReason::QerGate, || {
+                        format!(
+                            "UL TEID 0x{:x} QER {qid}: {}",
+                            header.teid,
+                            describe_tuple(pkt_tuple.as_ref())
+                        )
+                    });
                     return;
                 }
                 // Get DSCP from QER for marking
@@ -3738,17 +4016,25 @@ impl DataPlane {
                 match session.apply_far(fid) {
                     FarDecision::Forward { .. } => {}
                     FarDecision::Drop => {
-                        log::debug!("UL packet dropped by FAR (far_id={fid})");
-                        self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                        self.stats.record_drop(DropReason::FarDrop, || {
+                            format!(
+                                "UL TEID 0x{:x} FAR {fid}: {}",
+                                header.teid,
+                                describe_tuple(pkt_tuple.as_ref())
+                            )
+                        });
                         return;
                     }
                     FarDecision::Buffer { .. } => {
                         // Buffering is a DL concept; an UL FAR with BUFF is
                         // treated as not-forward (TS 29.244 8.2.26)
-                        log::debug!(
-                            "UL packet buffered-action FAR (far_id={fid}) — not forwarding"
-                        );
-                        self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                        self.stats.record_drop(DropReason::UlFarBuffer, || {
+                            format!(
+                                "UL TEID 0x{:x} FAR {fid} buffers: {}",
+                                header.teid,
+                                describe_tuple(pkt_tuple.as_ref())
+                            )
+                        });
                         return;
                     }
                 }
@@ -3762,11 +4048,14 @@ impl DataPlane {
             if !urr_ids.is_empty() {
                 let (outcome, exhausted_urr) = session.record_urrs(&urr_ids, payload_len, true);
                 if !outcome.may_forward() {
-                    log::debug!(
-                        "UL packet dropped: quota exhausted on SEID 0x{:x} (urr={exhausted_urr:?})",
-                        session.upf_seid
-                    );
-                    self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                    self.stats.record_drop(DropReason::QuotaExhausted, || {
+                        format!(
+                            "UL SEID 0x{:x} TEID 0x{:x} URR {exhausted_urr:?}: {}",
+                            session.upf_seid,
+                            header.teid,
+                            describe_tuple(pkt_tuple.as_ref())
+                        )
+                    });
                     // Reported only on the transition, which the outcome -- not a
                     // second check here -- is what distinguishes.
                     if let (true, Some(urr_id)) = (outcome.needs_report(), exhausted_urr) {
@@ -3782,11 +4071,13 @@ impl DataPlane {
         } else {
             // No PDR matched: discard (TS 23.501 5.8.2 — packets not
             // matching any PDR shall be dropped, not forwarded)
-            log::debug!(
-                "UL packet on TEID 0x{:x} matched no PDR — dropped",
-                header.teid
-            );
-            self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+            self.stats.record_drop(DropReason::NoPdrMatch, || {
+                format!(
+                    "UL TEID 0x{:x} QFI {pkt_qfi:?} from {from}: {}",
+                    header.teid,
+                    describe_tuple(pkt_tuple.as_ref())
+                )
+            });
             return;
         }
 
@@ -3795,13 +4086,13 @@ impl DataPlane {
         // forwarded here (no fragmentation/reassembly in the fast path), so
         // they are dropped and counted rather than truncated.
         if payload_len > TUN_MTU as u64 {
-            log::debug!(
-                "UL inner packet {payload_len}B exceeds TUN MTU {} on TEID 0x{:x} — dropped",
-                TUN_MTU,
-                header.teid
-            );
-            self.stats.oversize_packets.fetch_add(1, Ordering::Relaxed);
-            self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+            self.stats.record_drop(DropReason::Oversize, || {
+                format!(
+                    "UL inner packet {payload_len}B > TUN MTU {TUN_MTU} on TEID 0x{:x}: {}",
+                    header.teid,
+                    describe_tuple(pkt_tuple.as_ref())
+                )
+            });
             return;
         }
 
@@ -3829,8 +4120,11 @@ impl DataPlane {
         };
 
         if ret < 0 {
-            log::error!("TUN write failed: {}", io::Error::last_os_error());
-            self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+            let err = io::Error::last_os_error();
+            log::error!("TUN write failed: {err}");
+            self.stats.record_drop(DropReason::TunWriteError, || {
+                format!("UL TEID 0x{:x}: {err}", header.teid)
+            });
         } else {
             session.ul_packets.fetch_add(1, Ordering::Relaxed);
             session.ul_bytes.fetch_add(payload_len, Ordering::Relaxed);
@@ -3860,12 +4154,12 @@ impl DataPlane {
         // toward the UE without fragmentation (which the fast path does not
         // perform), so drop and count it rather than emit an oversize G-PDU.
         if payload_len > TUN_MTU as u64 {
-            log::debug!(
-                "DL inner packet {payload_len}B exceeds TUN MTU {} — dropped",
-                TUN_MTU
-            );
-            self.stats.oversize_packets.fetch_add(1, Ordering::Relaxed);
-            self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+            self.stats.record_drop(DropReason::Oversize, || {
+                format!(
+                    "DL inner packet {payload_len}B > TUN MTU {TUN_MTU}: {}",
+                    describe_tuple(PacketTuple::from_ipv4_packet(pkt).as_ref())
+                )
+            });
             return;
         }
 
@@ -3894,9 +4188,27 @@ impl DataPlane {
         let session = match session {
             Some(s) => s,
             None => {
-                // No PFCP session for this destination — discard
-                log::debug!("DL: no session for packet to {dst_ip:?} — dropped");
-                self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                // No PFCP session for this destination — discard. #1345: told apart
+                // by what the TUN handed us, because an IPv6 packet (the kernel's own
+                // RS/ND/MLD on the TUN) is not a missing session.
+                match (ip_version, dst_ip) {
+                    (IP_VERSION_4, Some(_)) => {
+                        self.stats.record_drop(DropReason::NoSession, || {
+                            format!("DL {}", describe_tuple(dl_pkt_tuple.as_ref()))
+                        })
+                    }
+                    (IP_VERSION_6, _) if pkt.len() >= 40 => {
+                        self.stats.record_drop(DropReason::DlIpv6, || {
+                            format!("DL {}", describe_ipv6(pkt).unwrap_or_default())
+                        })
+                    }
+                    _ => self.stats.record_drop(DropReason::DlUnparsable, || {
+                        format!(
+                            "DL {}B from the TUN, IP version nibble {ip_version}",
+                            pkt.len()
+                        )
+                    }),
+                }
                 return;
             }
         };
@@ -3908,11 +4220,13 @@ impl DataPlane {
         let (far_id, qer_id, urr_ids) = match matched {
             Some((far_id, qer_id, urr_ids, _ohr)) => (far_id, qer_id, urr_ids),
             None => {
-                log::debug!(
-                    "DL: packet to {dst_ip:?} (SEID 0x{:x}) matched no Core PDR — dropped",
-                    session.upf_seid
-                );
-                self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                self.stats.record_drop(DropReason::NoPdrMatch, || {
+                    format!(
+                        "DL SEID 0x{:x}, no Core PDR: {}",
+                        session.upf_seid,
+                        describe_tuple(dl_pkt_tuple.as_ref())
+                    )
+                });
                 return;
             }
         };
@@ -3920,8 +4234,13 @@ impl DataPlane {
         // Check QER gate/rate and extract DSCP + QFI
         if let Some(qid) = qer_id {
             if !session.check_qer_gate(qid, false, payload_len) {
-                log::debug!("DL packet dropped by QER gate (qer_id={qid})");
-                self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                self.stats.record_drop(DropReason::QerGate, || {
+                    format!(
+                        "DL SEID 0x{:x} QER {qid}: {}",
+                        session.upf_seid,
+                        describe_tuple(dl_pkt_tuple.as_ref())
+                    )
+                });
                 return;
             }
             let qers = session.qers.read().unwrap();
@@ -3949,49 +4268,39 @@ impl DataPlane {
                     (teid, addr)
                 }
                 FarDecision::Drop => {
-                    log::debug!("DL packet dropped by FAR (far_id={fid})");
-                    self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                    self.stats.record_drop(DropReason::FarDrop, || {
+                        format!(
+                            "DL SEID 0x{:x} FAR {fid}: {}",
+                            session.upf_seid,
+                            describe_tuple(dl_pkt_tuple.as_ref())
+                        )
+                    });
                     return;
                 }
                 FarDecision::Buffer { nocp, bar_id } => {
-                    // TS 29.244 5.2.3: BUFF — queue the packet instead of
-                    // dropping. On the first buffered packet with NOCP set,
-                    // notify the CP via a Downlink Data Report.
-                    let (buffered, first) = session.buffer_dl_packet(pkt.to_vec(), bar_id);
-                    if !buffered {
-                        log::debug!(
-                            "DL buffer full for SEID 0x{:x} — packet discarded",
-                            session.upf_seid
-                        );
-                        self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
-                    if first && nocp {
-                        let pdr_id = {
-                            let pdrs = session.pdrs.read().unwrap();
-                            pdrs.iter()
-                                .find(|p| {
-                                    p.source_interface == SRC_INTF_CORE && p.far_id == Some(fid)
-                                })
-                                .map(|p| p.pdr_id)
-                                .unwrap_or(0)
-                        };
-                        self.send_report_event(UpfReportEvent::DownlinkDataReport {
-                            upf_seid: session.upf_seid,
-                            smf_seid: session.smf_seid,
-                            pdr_id,
-                            qfi: qfi_to_apply,
-                        });
-                    }
-                    log::trace!(
-                        "DL packet buffered for SEID 0x{:x} (first={first})",
-                        session.upf_seid
-                    );
+                    self.buffer_downlink(&session, fid, pkt, nocp, bar_id, qfi_to_apply)
+                        .await;
                     return;
                 }
             },
             None => (session.dl_teid(), session.gnb_addr()),
         };
+
+        // #1345: a forwarding FAR with no Outer Header Creation follows the session's
+        // tunnel, and before the N2 response there is none (an establishment without
+        // a gNB F-TEID). This used to be a 127.0.0.1 placeholder, so the packet went
+        // to the UPF's own loopback and was counted as forwarded. Dropped and named,
+        // before the URR charges it.
+        if gnb_addr.ip().is_unspecified() {
+            self.stats.record_drop(DropReason::NoDlEndpoint, || {
+                format!(
+                    "DL SEID 0x{:x} FAR {far_id:?}, no gNB endpoint yet: {}",
+                    session.upf_seid,
+                    describe_tuple(dl_pkt_tuple.as_ref())
+                )
+            });
+            return;
+        }
 
         // Record URR usage AND honour its verdict (#80, TS 29.244 §5.2.2.2.2).
         //
@@ -4002,11 +4311,13 @@ impl DataPlane {
         if !urr_ids.is_empty() {
             let (outcome, exhausted_urr) = session.record_urrs(&urr_ids, payload_len, false);
             if !outcome.may_forward() {
-                log::debug!(
-                    "DL packet dropped: quota exhausted on SEID 0x{:x} (urr={exhausted_urr:?})",
-                    session.upf_seid
-                );
-                self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                self.stats.record_drop(DropReason::QuotaExhausted, || {
+                    format!(
+                        "DL SEID 0x{:x} URR {exhausted_urr:?}: {}",
+                        session.upf_seid,
+                        describe_tuple(dl_pkt_tuple.as_ref())
+                    )
+                });
                 if let (true, Some(urr_id)) = (outcome.needs_report(), exhausted_urr) {
                     self.send_report_event(UpfReportEvent::QuotaExhausted {
                         upf_seid: session.upf_seid,
@@ -4048,7 +4359,13 @@ impl DataPlane {
                         "DL G-PDU to IPv6 gNB {gnb_addr} dropped: no IPv6 GTP-U socket \
                          (start upfd with --gtpu-addr6)"
                     );
-                    self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                    self.stats.record_drop(DropReason::NoGtpuSocket, || {
+                        format!(
+                            "DL SEID 0x{:x} to {gnb_addr} TEID 0x{dl_teid:x}: {}",
+                            session.upf_seid,
+                            describe_tuple(dl_pkt_tuple.as_ref())
+                        )
+                    });
                     return;
                 }
             }
@@ -4069,9 +4386,77 @@ impl DataPlane {
             }
             Err(e) => {
                 log::error!("GTP-U send failed: {e}");
-                self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                self.stats.record_drop(DropReason::SendError, || {
+                    format!(
+                        "DL SEID 0x{:x} to {gnb_addr} TEID 0x{dl_teid:x}: {e}",
+                        session.upf_seid
+                    )
+                });
             }
         }
+    }
+
+    /// Queue a downlink packet under a BUFF FAR (TS 29.244 §5.2.3), raising the
+    /// Downlink Data Report on the first packet of an episode when NOCP is set.
+    ///
+    /// Called once [`DataPlaneSession::apply_far`] said BUFF. Split out of
+    /// [`Self::handle_downlink_packet`] so the race #1345 found -- the FAR switching
+    /// to FORW between that decision and the enqueue -- is reachable from a test.
+    async fn buffer_downlink(
+        &self,
+        session: &Arc<DataPlaneSession>,
+        fid: u32,
+        pkt: &[u8],
+        nocp: bool,
+        bar_id: Option<u8>,
+        qfi: Option<u8>,
+    ) {
+        // TS 29.244 5.2.3: BUFF — queue the packet instead of
+        // dropping. On the first buffered packet with NOCP set,
+        // notify the CP via a Downlink Data Report.
+        let (buffered, first) = session.buffer_dl_packet(pkt.to_vec(), bar_id);
+        if !buffered {
+            self.stats.record_drop(DropReason::BufferOverflow, || {
+                format!(
+                    "DL SEID 0x{:x} FAR {fid}, buffer full: {}",
+                    session.upf_seid,
+                    describe_tuple(PacketTuple::from_ipv4_packet(pkt).as_ref())
+                )
+            });
+            return;
+        }
+        // #1345: the BUFF decision above and this enqueue are not atomic
+        // with the Session Modification that switches the FAR to FORW and
+        // flushes the buffer. If the switch AND its flush ran in between,
+        // this packet -- typically the first downlink packet of a new
+        // session, racing the modification that installs the gNB endpoint
+        // -- would sit in the buffer until the NEXT BUFF->FORW transition,
+        // i.e. be lost. Re-read the FAR after enqueueing: the PFCP side
+        // writes the FAR before it drains, so either its drain sees this
+        // packet or this read sees FORW and flushes it here.
+        if matches!(session.apply_far(fid), FarDecision::Forward { .. }) {
+            self.flush_buffered_dl(session.upf_seid).await;
+            return;
+        }
+        if first && nocp {
+            let pdr_id = {
+                let pdrs = session.pdrs.read().unwrap();
+                pdrs.iter()
+                    .find(|p| p.source_interface == SRC_INTF_CORE && p.far_id == Some(fid))
+                    .map(|p| p.pdr_id)
+                    .unwrap_or(0)
+            };
+            self.send_report_event(UpfReportEvent::DownlinkDataReport {
+                upf_seid: session.upf_seid,
+                smf_seid: session.smf_seid,
+                pdr_id,
+                qfi,
+            });
+        }
+        log::trace!(
+            "DL packet buffered for SEID 0x{:x} (first={first})",
+            session.upf_seid
+        );
     }
 
     /// Flush DL packets buffered under a BUFF FAR after the FAR switched to
@@ -4099,6 +4484,15 @@ impl DataPlane {
             Some(v) => v,
             None => return 0,
         };
+        let teid = ohc_teid.unwrap_or(session.dl_teid());
+        let addr = ohc_addr
+            .map(|ip| SocketAddr::new(ip, GTPU_PORT))
+            .unwrap_or(session.gnb_addr());
+        // #1345: still no N3 endpoint: keep the packets buffered for the
+        // modification that brings one, rather than flush them to nowhere.
+        if addr.ip().is_unspecified() {
+            return 0;
+        }
         let pkts = session.drain_dl_buffer();
         if pkts.is_empty() {
             return 0;
@@ -4107,10 +4501,6 @@ impl DataPlane {
             Some(s) => s.clone(),
             None => return 0,
         };
-        let teid = ohc_teid.unwrap_or(session.dl_teid());
-        let addr = ohc_addr
-            .map(|ip| SocketAddr::new(ip, GTPU_PORT))
-            .unwrap_or(session.gnb_addr());
         let qfi = session.qfi;
         // Buffered packets are flushed against the SESSION's QFI rather than a
         // per-packet PDR/QER match (pre-existing behaviour of this path), so the
@@ -4140,7 +4530,9 @@ impl DataPlane {
             } else {
                 Some(&gtpu)
             }) else {
-                self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                self.stats.record_drop(DropReason::NoGtpuSocket, || {
+                    format!("DL buffer flush, SEID 0x{upf_seid:x} to {addr} TEID 0x{teid:x}")
+                });
                 continue;
             };
             match sock.send_to(&gtpu_pkt, addr).await {
@@ -4153,7 +4545,11 @@ impl DataPlane {
                 }
                 Err(e) => {
                     log::error!("GTP-U send failed while flushing DL buffer: {e}");
-                    self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                    self.stats.record_drop(DropReason::SendError, || {
+                        format!(
+                            "DL buffer flush, SEID 0x{upf_seid:x} to {addr} TEID 0x{teid:x}: {e}"
+                        )
+                    });
                 }
             }
         }
@@ -8857,5 +9253,574 @@ mod tests {
         assert_eq!(octet1 & 0x3F, 9, "QFI still carried");
         assert_eq!(octet1 & 0xC0, 0, "RQI and PPP must both stay clear");
         assert!(rest.is_empty(), "no PPI octet: {rest:02x?}");
+    }
+
+    // ------------------------------------------------------------------
+    // #1345: every drop is counted against a reason.
+    // ------------------------------------------------------------------
+
+    const RIG_SEID: u64 = 0x1345;
+    const RIG_UL_TEID: u32 = 0x13451;
+    const RIG_DL_TEID: u32 = 0x13452;
+
+    /// One session (UE 10.45.13.45) whose downlink reaches a real local "gNB" socket,
+    /// and a writable `/dev/null` standing in for the TUN, so a test can drive both
+    /// directions through the real `handle_*_packet` and see where a packet went.
+    struct DropRig {
+        dp: DataPlane,
+        gnb: TokioUdpSocket,
+        gnb_addr: SocketAddr,
+        gtpu: Arc<TokioUdpSocket>,
+        ue_ip: Ipv4Addr,
+        sink: std::fs::File,
+    }
+
+    async fn drop_rig() -> DropRig {
+        let gtpu = Arc::new(TokioUdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        dp.gtpu_socket = Some(Arc::clone(&gtpu));
+        let gnb = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gnb_addr = gnb.local_addr().unwrap();
+        let ue_ip = Ipv4Addr::new(10, 45, 13, 45);
+        dp.add_session_from_pfcp(
+            RIG_SEID,
+            0x11345,
+            ue_ip,
+            RIG_UL_TEID,
+            RIG_DL_TEID,
+            gnb_addr,
+            Some(1),
+            Some(9),
+        );
+        // Follow the session tunnel, i.e. the gNB socket's ephemeral port.
+        let session = dp.sessions.find_by_seid(RIG_SEID).unwrap();
+        for far in session.fars.write().unwrap().values_mut() {
+            far.ohc_addr = None;
+        }
+        let sink = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("/dev/null must be writable");
+        DropRig {
+            dp,
+            gnb,
+            gnb_addr,
+            gtpu,
+            ue_ip,
+            sink,
+        }
+    }
+
+    impl DropRig {
+        fn session(&self) -> Arc<DataPlaneSession> {
+            self.dp.sessions.find_by_seid(RIG_SEID).unwrap()
+        }
+        fn tun_fd(&self) -> RawFd {
+            std::os::unix::io::AsRawFd::as_raw_fd(&self.sink)
+        }
+        /// An uplink G-PDU on the session's tunnel, inner source `src`.
+        fn ul_gpdu(&self, src: Ipv4Addr) -> Vec<u8> {
+            let mut inner = make_ipv4_udp_packet(src.octets(), [8, 8, 8, 8], 1234, 53);
+            finalize_ipv4(&mut inner);
+            encapsulate_dl_gpdu(&inner, RIG_UL_TEID, None)
+        }
+        /// A downlink IPv4 packet toward `dst`.
+        fn dl_to(&self, dst: Ipv4Addr) -> Vec<u8> {
+            let mut pkt = make_ipv4_udp_packet([8, 8, 8, 8], dst.octets(), 53, 1234);
+            finalize_ipv4(&mut pkt);
+            pkt
+        }
+        async fn ul(&self, pkt: &[u8]) {
+            self.dp
+                .handle_uplink_packet(pkt, self.gnb_addr, self.tun_fd())
+                .await;
+        }
+        async fn dl(&self, pkt: &[u8]) {
+            self.dp.handle_downlink_packet(pkt, &self.gtpu).await;
+        }
+        /// Whether a G-PDU reached the gNB socket within `ms`.
+        async fn gnb_received(&self, ms: u64) -> bool {
+            let mut buf = [0u8; 2048];
+            tokio::time::timeout(
+                std::time::Duration::from_millis(ms),
+                self.gnb.recv_from(&mut buf),
+            )
+            .await
+            .is_ok()
+        }
+        /// Exactly `n` drops, all of them `reason`, and the stats line names it.
+        fn assert_only(&self, reason: DropReason, n: u64) {
+            let stats = &self.dp.stats;
+            assert_eq!(
+                stats.dropped_packets.load(Ordering::Relaxed),
+                n,
+                "total, expecting {n} x {reason:?}: {}",
+                stats.summary()
+            );
+            for other in DropReason::ALL {
+                let want = if other == reason { n } else { 0 };
+                assert_eq!(
+                    stats.drops(other),
+                    want,
+                    "{other:?} while expecting {n} x {reason:?}: {}",
+                    stats.summary()
+                );
+            }
+            let label = format!("{}={n}", reason.label());
+            assert!(
+                stats.summary().contains(&label),
+                "{label} in {}",
+                stats.summary()
+            );
+        }
+    }
+
+    /// The positive control the reason tests lean on: an unmodified rig forwards one
+    /// packet each way and drops nothing, so a drop below is caused by the one
+    /// thing that test changed.
+    #[tokio::test]
+    async fn the_drop_rig_forwards_both_ways_with_no_drop() {
+        let rig = drop_rig().await;
+        rig.ul(&rig.ul_gpdu(rig.ue_ip)).await;
+        rig.dl(&rig.dl_to(rig.ue_ip)).await;
+        assert!(rig.gnb_received(2000).await, "the DL G-PDU reaches the gNB");
+        assert_eq!(rig.dp.stats.ul_packets.load(Ordering::Relaxed), 1);
+        assert_eq!(rig.dp.stats.dl_packets.load(Ordering::Relaxed), 1);
+        assert_eq!(rig.dp.stats.dropped_packets.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn drop_reason_malformed_gtpu() {
+        let rig = drop_rig().await;
+        rig.ul(&[0x30, 0xFF, 0x00]).await; // shorter than a GTP-U header
+        let gpdu = rig.ul_gpdu(rig.ue_ip);
+        rig.ul(&gpdu[..8]).await; // a G-PDU header with no payload
+        rig.assert_only(DropReason::MalformedGtpu, 2);
+    }
+
+    #[tokio::test]
+    async fn drop_reason_unknown_teid() {
+        let rig = drop_rig().await;
+        let mut inner = make_ipv4_udp_packet([10, 99, 0, 1], [8, 8, 8, 8], 1, 2);
+        finalize_ipv4(&mut inner);
+        rig.ul(&encapsulate_dl_gpdu(&inner, 0xDEAD, None)).await;
+        rig.ul(&encapsulate_dl_gpdu(&inner, 0, None)).await;
+        rig.assert_only(DropReason::UnknownTeid, 2);
+    }
+
+    #[tokio::test]
+    async fn drop_reason_no_pdr_match_both_directions() {
+        let rig = drop_rig().await;
+        rig.session().pdrs.write().unwrap().clear();
+        rig.ul(&rig.ul_gpdu(rig.ue_ip)).await;
+        rig.dl(&rig.dl_to(rig.ue_ip)).await;
+        rig.assert_only(DropReason::NoPdrMatch, 2);
+    }
+
+    #[tokio::test]
+    async fn drop_reason_no_session_for_the_dl_destination() {
+        let rig = drop_rig().await;
+        rig.dl(&rig.dl_to(Ipv4Addr::new(10, 45, 99, 99))).await;
+        rig.assert_only(DropReason::NoSession, 1);
+    }
+
+    /// The likely idle-time drops of the issue: the kernel's own IPv6 traffic on the
+    /// TUN (router solicitations, ND, MLD) is not "no session".
+    #[tokio::test]
+    async fn drop_reason_ipv6_from_the_tun() {
+        let rig = drop_rig().await;
+        let mut rs = vec![0u8; 48];
+        rs[0] = 0x60;
+        rs[6] = 58; // ICMPv6
+        rs[8..24].copy_from_slice(&"fe80::1".parse::<Ipv6Addr>().unwrap().octets());
+        rs[24..40].copy_from_slice(&"ff02::2".parse::<Ipv6Addr>().unwrap().octets());
+        rs[40] = 133; // Router Solicitation
+        rig.dl(&rs).await;
+        rig.assert_only(DropReason::DlIpv6, 1);
+        assert_eq!(
+            describe_ipv6(&rs).unwrap(),
+            "next_header=58 fe80::1 -> ff02::2"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_reason_unparsable_from_the_tun() {
+        let rig = drop_rig().await;
+        rig.dl(&[0x45, 0, 0, 10, 0, 0, 0, 0, 64, 17]).await; // truncated IPv4
+        rig.dl(&[0x00; 40]).await; // IP version 0
+        rig.dl(&[0x60; 20]).await; // truncated IPv6
+        rig.assert_only(DropReason::DlUnparsable, 3);
+    }
+
+    /// The legacy `spoofed` counter still moves, and the reason with it.
+    #[tokio::test]
+    async fn drop_reason_spoofed_keeps_the_legacy_counter() {
+        let rig = drop_rig().await;
+        rig.ul(&rig.ul_gpdu(Ipv4Addr::new(10, 45, 0, 250))).await;
+        rig.assert_only(DropReason::Spoofed, 1);
+        assert_eq!(rig.dp.stats.spoofed_packets.load(Ordering::Relaxed), 1);
+        assert!(rig.dp.stats.summary().contains("(spoofed=1, oversize=0)"));
+    }
+
+    #[tokio::test]
+    async fn drop_reason_oversize_keeps_the_legacy_counter() {
+        let rig = drop_rig().await;
+        let mut big = make_ipv4_udp_packet([8, 8, 8, 8], rig.ue_ip.octets(), 53, 1234);
+        big.resize(TUN_MTU as usize + 1, 0);
+        finalize_ipv4(&mut big);
+        rig.dl(&big).await;
+        rig.assert_only(DropReason::Oversize, 1);
+        assert_eq!(rig.dp.stats.oversize_packets.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn drop_reason_qer_gate() {
+        let rig = drop_rig().await;
+        let session = rig.session();
+        let mut qer = DataPlaneQer::new(7);
+        qer.ul_gate_open = false;
+        qer.dl_gate_open = false;
+        session.qers.write().unwrap().insert(7, qer);
+        for pdr in session.pdrs.write().unwrap().iter_mut() {
+            pdr.qer_id = Some(7);
+        }
+        rig.ul(&rig.ul_gpdu(rig.ue_ip)).await;
+        rig.dl(&rig.dl_to(rig.ue_ip)).await;
+        rig.assert_only(DropReason::QerGate, 2);
+    }
+
+    #[tokio::test]
+    async fn drop_reason_far_drop() {
+        let rig = drop_rig().await;
+        for far in rig.session().fars.write().unwrap().values_mut() {
+            far.apply_action = FAR_ACTION_DROP;
+        }
+        rig.ul(&rig.ul_gpdu(rig.ue_ip)).await;
+        rig.dl(&rig.dl_to(rig.ue_ip)).await;
+        rig.assert_only(DropReason::FarDrop, 2);
+    }
+
+    #[tokio::test]
+    async fn drop_reason_ul_far_buffer() {
+        let rig = drop_rig().await;
+        rig.session()
+            .fars
+            .write()
+            .unwrap()
+            .get_mut(&1)
+            .unwrap()
+            .apply_action = FAR_ACTION_BUFF;
+        rig.ul(&rig.ul_gpdu(rig.ue_ip)).await;
+        rig.assert_only(DropReason::UlFarBuffer, 1);
+    }
+
+    #[tokio::test]
+    async fn drop_reason_buffer_overflow() {
+        let rig = drop_rig().await;
+        let session = rig.session();
+        {
+            let mut fars = session.fars.write().unwrap();
+            let far = fars.get_mut(&2).unwrap();
+            far.apply_action = FAR_ACTION_BUFF;
+            far.bar_id = Some(1);
+        }
+        session.bars.write().unwrap().insert(
+            1,
+            DataPlaneBar {
+                bar_id: 1,
+                suggested_buffering_packets_count: Some(1),
+                ddn_delay: None,
+            },
+        );
+        rig.dl(&rig.dl_to(rig.ue_ip)).await; // buffered
+        rig.dl(&rig.dl_to(rig.ue_ip)).await; // over the BAR's count of 1
+        assert_eq!(session.dl_buffer.lock().unwrap().len(), 1);
+        rig.assert_only(DropReason::BufferOverflow, 1);
+    }
+
+    #[tokio::test]
+    async fn drop_reason_quota_exhausted() {
+        let rig = drop_rig().await;
+        provision_quota(&rig.dp, RIG_SEID, 1, 10);
+        rig.dl(&rig.dl_to(rig.ue_ip)).await;
+        rig.assert_only(DropReason::QuotaExhausted, 1);
+    }
+
+    /// A forwarding FAR with no outer header, on a session established without a gNB
+    /// F-TEID: dropped as `no_dl_endpoint` rather than sent to a placeholder.
+    #[tokio::test]
+    async fn drop_reason_no_dl_endpoint() {
+        let rig = drop_rig().await;
+        rig.session().set_dl_tunnel(RIG_DL_TEID, NO_DL_ENDPOINT);
+        rig.dl(&rig.dl_to(rig.ue_ip)).await;
+        rig.assert_only(DropReason::NoDlEndpoint, 1);
+        assert_eq!(rig.dp.stats.dl_packets.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn drop_reason_no_gtpu_socket() {
+        let rig = drop_rig().await;
+        rig.session()
+            .set_dl_tunnel(RIG_DL_TEID, "[::1]:2152".parse().unwrap());
+        rig.dl(&rig.dl_to(rig.ue_ip)).await;
+        rig.assert_only(DropReason::NoGtpuSocket, 1);
+    }
+
+    /// `send_to` refuses the limited broadcast address on a socket without
+    /// SO_BROADCAST, which makes a send error deterministic.
+    #[tokio::test]
+    async fn drop_reason_send_error() {
+        let rig = drop_rig().await;
+        rig.session()
+            .set_dl_tunnel(RIG_DL_TEID, "255.255.255.255:2152".parse().unwrap());
+        rig.dl(&rig.dl_to(rig.ue_ip)).await;
+        rig.assert_only(DropReason::SendError, 1);
+    }
+
+    #[tokio::test]
+    async fn drop_reason_tun_write_error() {
+        let rig = drop_rig().await;
+        rig.dp
+            .handle_uplink_packet(&rig.ul_gpdu(rig.ue_ip), rig.gnb_addr, -1)
+            .await;
+        rig.assert_only(DropReason::TunWriteError, 1);
+    }
+
+    /// The reasons always sum to `dropped`, and every one has its own label.
+    #[tokio::test]
+    async fn drop_reasons_sum_to_the_total_and_have_distinct_labels() {
+        let rig = drop_rig().await;
+        rig.ul(&[0u8; 3]).await;
+        rig.dl(&rig.dl_to(Ipv4Addr::new(10, 45, 99, 99))).await;
+        rig.ul(&rig.ul_gpdu(Ipv4Addr::new(10, 45, 0, 250))).await;
+        let stats = &rig.dp.stats;
+        let sum: u64 = DropReason::ALL.iter().map(|r| stats.drops(*r)).sum();
+        assert_eq!(sum, 3);
+        assert_eq!(sum, stats.dropped_packets.load(Ordering::Relaxed));
+        let labels: HashSet<&str> = DropReason::ALL.iter().map(|r| r.label()).collect();
+        assert_eq!(labels.len(), DropReason::COUNT);
+        for (i, r) in DropReason::ALL.iter().enumerate() {
+            assert_eq!(*r as usize, i, "ALL is in discriminant order");
+        }
+    }
+
+    /// The first drop of a reason logs at info; later ones at debug, at most once per
+    /// interval per reason.
+    #[test]
+    fn the_first_drop_of_a_reason_logs_at_info_and_later_ones_are_rate_limited() {
+        use log::Level::{Debug, Info};
+        let stats = DataPlaneStats::default();
+        let r = DropReason::NoSession;
+        let step = DROP_DEBUG_LOG_INTERVAL_MS;
+        assert_eq!(
+            stats.drop_log_level(r, 0, 5),
+            Some(Info),
+            "first of its kind"
+        );
+        assert_eq!(stats.drop_log_level(r, 1, 6), None, "inside the interval");
+        assert_eq!(stats.drop_log_level(r, 2, 5 + step - 1), None);
+        assert_eq!(
+            stats.drop_log_level(r, 3, 5 + step),
+            Some(Debug),
+            "interval elapsed"
+        );
+        assert_eq!(stats.drop_log_level(r, 4, 5 + step + 1), None);
+        // Per reason: another reason's first drop is still its first.
+        assert_eq!(
+            stats.drop_log_level(DropReason::UnknownTeid, 0, 7),
+            Some(Info)
+        );
+        // And record_drop counts regardless of what was logged.
+        for _ in 0..3 {
+            stats.record_drop(DropReason::FarDrop, String::new);
+        }
+        assert_eq!(stats.drops(DropReason::FarDrop), 3);
+        assert_ne!(
+            stats.drop_last_logged_ms[DropReason::FarDrop as usize].load(Ordering::Relaxed),
+            u64::MAX,
+            "the first FarDrop claimed its info line"
+        );
+    }
+
+    /// deploy/eks/e2e-internet.sh parses the stats line with sed. Run ITS expression
+    /// on a line carrying every reason, so a summary change that breaks the script
+    /// fails here, not on a cluster.
+    #[test]
+    fn the_e2e_script_still_parses_the_stats_line_with_every_reason() {
+        let stats = DataPlaneStats::default();
+        stats.ul_packets.store(87, Ordering::Relaxed);
+        stats.ul_bytes.store(8303, Ordering::Relaxed);
+        stats.dl_packets.store(79, Ordering::Relaxed);
+        stats.dl_bytes.store(21723, Ordering::Relaxed);
+        for r in DropReason::ALL {
+            stats.record_drop(r, String::new);
+        }
+        let summary = stats.summary();
+        assert!(
+            summary.starts_with(&format!(
+                "UL=87 pkts/8303 B, DL=79 pkts/21723 B, dropped={} (spoofed=1, oversize=1, ",
+                DropReason::COUNT
+            )),
+            "{summary}"
+        );
+        for r in DropReason::ALL {
+            assert!(summary.contains(&format!("{}=1", r.label())), "{summary}");
+        }
+
+        let script = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../deploy/eks/e2e-internet.sh"
+        ))
+        .expect("deploy/eks/e2e-internet.sh");
+        let line = script
+            .lines()
+            .find(|l| l.contains("sed -n 's/.*Data plane stats: UL="))
+            .expect("the script's stats sed");
+        let expr = line
+            .split('\'')
+            .nth(1)
+            .expect("a single-quoted sed expression");
+        let out = std::process::Command::new("sed")
+            .args(["-n", expr])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(format!("01:58:03 Data plane stats: {summary}\n").as_bytes())?;
+                child.wait_with_output()
+            })
+            .expect("sed runs");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "87 79\n");
+    }
+
+    #[test]
+    fn drop_reasons_are_labelled_prometheus_counters() {
+        let stats = DataPlaneStats::default();
+        stats.record_drop(DropReason::UnknownTeid, String::new);
+        stats.record_drop(DropReason::UnknownTeid, String::new);
+        stats.record_drop(DropReason::DlIpv6, String::new);
+        let prom = stats.render_prometheus();
+        assert!(
+            prom.contains("upf_dataplane_dropped_packets_total 3"),
+            "{prom}"
+        );
+        assert!(prom.contains(&format!("# TYPE {DROPS_BY_REASON_METRIC} counter")));
+        assert!(prom.contains(&format!(
+            "{DROPS_BY_REASON_METRIC}{{reason=\"unknown_teid\"}} 2"
+        )));
+        assert!(prom.contains(&format!("{DROPS_BY_REASON_METRIC}{{reason=\"dl_ipv6\"}} 1")));
+        // Every reason has a series from the first scrape, zero included.
+        for r in DropReason::ALL {
+            assert!(
+                prom.contains(&format!(
+                    "{DROPS_BY_REASON_METRIC}{{reason=\"{}\"}}",
+                    r.label()
+                )),
+                "{r:?}"
+            );
+        }
+        assert!(prom.contains(&format!(
+            "{DROPS_BY_REASON_METRIC}{{reason=\"no_session\"}} 0"
+        )));
+    }
+
+    /// #1345 item 4: the BUFF decision and the enqueue are not atomic with the
+    /// Session Modification that switches the FAR to FORW and flushes the buffer.
+    /// Here the modification already ran (FAR forwards, buffer flushed and empty)
+    /// when the packet, decided BUFF before it, is enqueued. It must still reach
+    /// the gNB, not wait in the buffer for a BUFF->FORW transition that never comes.
+    #[tokio::test]
+    async fn a_dl_packet_enqueued_after_the_forw_switch_and_flush_is_still_delivered() {
+        let rig = drop_rig().await;
+        let session = rig.session();
+        assert!(matches!(session.apply_far(2), FarDecision::Forward { .. }));
+        assert_eq!(
+            rig.dp.flush_buffered_dl(RIG_SEID).await,
+            0,
+            "flushed: empty"
+        );
+
+        let pkt = rig.dl_to(rig.ue_ip);
+        rig.dp
+            .buffer_downlink(&session, 2, &pkt, true, None, Some(9))
+            .await;
+
+        assert!(
+            rig.gnb_received(2000).await,
+            "the late-enqueued packet must be forwarded"
+        );
+        assert!(session.dl_buffer.lock().unwrap().is_empty(), "not stranded");
+        assert_eq!(rig.dp.stats.dl_packets.load(Ordering::Relaxed), 1);
+        assert_eq!(rig.dp.stats.dropped_packets.load(Ordering::Relaxed), 0);
+    }
+
+    /// The other half: while the FAR still buffers, the packet stays queued.
+    #[tokio::test]
+    async fn a_dl_packet_enqueued_while_the_far_buffers_stays_queued() {
+        let rig = drop_rig().await;
+        let session = rig.session();
+        session
+            .fars
+            .write()
+            .unwrap()
+            .get_mut(&2)
+            .unwrap()
+            .apply_action = FAR_ACTION_BUFF;
+        rig.dl(&rig.dl_to(rig.ue_ip)).await;
+        assert_eq!(session.dl_buffer.lock().unwrap().len(), 1);
+        assert!(!rig.gnb_received(200).await);
+        assert_eq!(rig.dp.stats.dropped_packets.load(Ordering::Relaxed), 0);
+    }
+
+    /// A buffer is not flushed to a session with no gNB endpoint yet; the packets
+    /// wait for the modification that brings one.
+    #[tokio::test]
+    async fn the_dl_buffer_waits_for_a_gnb_endpoint_before_flushing() {
+        let rig = drop_rig().await;
+        let session = rig.session();
+        session.set_dl_tunnel(RIG_DL_TEID, NO_DL_ENDPOINT);
+        session
+            .fars
+            .write()
+            .unwrap()
+            .get_mut(&2)
+            .unwrap()
+            .apply_action = FAR_ACTION_BUFF;
+        rig.dl(&rig.dl_to(rig.ue_ip)).await;
+        assert_eq!(session.dl_buffer.lock().unwrap().len(), 1);
+
+        // FORW, but still no endpoint: nothing flushed, nothing lost.
+        session
+            .fars
+            .write()
+            .unwrap()
+            .get_mut(&2)
+            .unwrap()
+            .apply_action = FAR_ACTION_FORW;
+        assert_eq!(rig.dp.flush_buffered_dl(RIG_SEID).await, 0);
+        assert_eq!(session.dl_buffer.lock().unwrap().len(), 1);
+
+        // The endpoint arrives: the packet goes to the gNB.
+        rig.dp
+            .update_session_from_pfcp(RIG_SEID, Some(RIG_DL_TEID), Some(rig.gnb_addr));
+        for far in session.fars.write().unwrap().values_mut() {
+            far.ohc_addr = None;
+        }
+        assert_eq!(rig.dp.flush_buffered_dl(RIG_SEID).await, 1);
+        assert!(rig.gnb_received(2000).await);
+        assert_eq!(rig.dp.stats.dropped_packets.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_session_with_no_dl_endpoint_is_not_a_path_to_probe() {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        let real: SocketAddr = "10.0.0.9:2152".parse().unwrap();
+        let probed = dp.probeable_paths([NO_DL_ENDPOINT, real].into_iter().collect());
+        assert_eq!(probed, [real].into_iter().collect());
     }
 }
