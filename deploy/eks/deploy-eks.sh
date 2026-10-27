@@ -16,6 +16,8 @@
 #   RECREATE_MONGODB=true ./deploy-eks.sh        # allow recreating the mongodb
 #                                                #   StatefulSet (data loss, see below)
 #   DRY_RUN=true ./deploy-eks.sh                 # render + validate, apply nothing
+#   VERIFY_WAIT=90 ./deploy-eks.sh               # how long not-Ready replacements are
+#                                                #   re-checked before failing (#1353)
 #   PROFILE=epc ./deploy-eks.sh                  # another profile (default 5g)
 set -euo pipefail
 
@@ -717,18 +719,35 @@ log "verifying running pods match the deployed images..."
 PODS_JSON="${RENDERED}.pods.json"
 trap 'rm -f "${RENDERED}" "${RENDERED}.tmp" "${PODS_JSON}" "${PEER_A_JSON}" "${PEER_B_JSON}" "${LIVE_STS_JSON:-}" "${LIVE_DP_JSON:-}"' EXIT
 
-if kubectl get pods -n "${NAMESPACE}" -o json > "${PODS_JSON}" 2>/dev/null; then
+# #1353: "replacements not Ready" (exit 2) can be a pod in a designed restart rather
+# than a failing rollout -- PROFILE=epc's epc-peers-check.sh liveness restarts a pod
+# whose recorded peer moved, which can happen after its rollout wait passed. So exit 2
+# is re-checked for up to VERIFY_WAIT seconds; a real crash-loop is still not Ready at
+# the end. A stale image (exit 1) fails at once.
+VERIFY_WAIT="${VERIFY_WAIT:-90}"
+[[ "${VERIFY_WAIT}" =~ ^[0-9]+$ ]] || die "VERIFY_WAIT must be a number of seconds: ${VERIFY_WAIT}"
+verify_deadline=$(( $(date +%s) + VERIFY_WAIT ))
+while :; do
+  if ! kubectl get pods -n "${NAMESPACE}" -o json > "${PODS_JSON}" 2>/dev/null; then
+    warn "could not list pods; skipped image verification"
+    break
+  fi
   verify_rc=0
-  python3 "${SCRIPT_DIR}/lib/verify_images.py" "${RENDERED}" "${PODS_JSON}" \
+  verify_out="$(python3 "${SCRIPT_DIR}/lib/verify_images.py" "${RENDERED}" "${PODS_JSON}" 2>&1)" \
     || verify_rc=$?
+  if [[ "${verify_rc}" == 2 && "$(date +%s)" -lt "${verify_deadline}" ]]; then
+    log "replacement pods not Ready yet (a restart in progress?); re-checking for up to ${VERIFY_WAIT}s..."
+    sleep 5
+    continue
+  fi
+  printf '%s\n' "${verify_out}"
   case "${verify_rc}" in
     0) ;;
-    2) die "rollout failing: replacement pods are not Ready (see above)" ;;
+    2) die "rollout failing: replacement pods are still not Ready after ${VERIFY_WAIT}s (see above)" ;;
     *) die "image verification failed" ;;
   esac
-else
-  warn "could not list pods; skipped image verification"
-fi
+  break
+done
 
 # --- summary ---------------------------------------------------------------
 
