@@ -58,6 +58,7 @@ mod policy;
 mod property_tests;
 mod restoration; // #193: restoration signalling for resources the UPF no longer holds
 mod session_extensions; // #199-#201: IPv6 dual-stack, SSC modes, Ethernet PDU
+mod session_metrics; // #1368: PDU session establishment counters (TS 28.552 §5.3.1)
 pub mod slicing; // Rel-17: per-slice QoS profiles
 mod smf_sm;
 mod timer;
@@ -122,6 +123,20 @@ fn metrics_addr() -> SocketAddr {
 /// TS 29.244 §6.2.6.2 forbids session signalling without one. Container-reported health
 /// cannot tell those two apart, which is why this is a metric rather than a `kill -0 1`.
 fn render_metrics() -> String {
+    // #1368: the families every NF serves (SBI, NRF client, process), the PDU
+    // session establishment counters, then the SMF's own gauges below.
+    let mut out = nextgcore_metrics::nf::render_common(&nextgcore_metrics::nf::NfIdentity {
+        nf: "smf",
+        version: env!("CARGO_PKG_VERSION"),
+        nrf_client: true,
+    });
+    session_metrics::render(&mut out);
+    out.push_str(&render_smf_families());
+    out
+}
+
+/// The SMF's own gauges and counters (#380 and later).
+fn render_smf_families() -> String {
     let pool = pfcp_path::global_pool();
     let associations = pool.iter().filter(|c| c.is_associated_sync()).count();
     let sessions = smf_self().read().map(|ctx| ctx.sess_count()).unwrap_or(0);
@@ -3982,8 +3997,18 @@ fn validate_sm_context_create_data(body: &serde_json::Value) -> Option<&'static 
     None
 }
 
-/// Handle SM Context Create (from AMF via N11, TS 29.502 §5.2.2.2)
+/// Handle SM Context Create (from AMF via N11, TS 29.502 §5.2.2.2), counting each
+/// PDU session establishment and its outcome for `/metrics` (#1368).
 async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
+    let establishment = session_metrics::is_establishment(request);
+    let response = handle_sm_context_create_inner(request).await;
+    if establishment {
+        session_metrics::observe_establishment(&response);
+    }
+    response
+}
+
+async fn handle_sm_context_create_inner(request: &SbiRequest) -> SbiResponse {
     log::info!("SM Context Create request received");
 
     // #718 review M3: a shutting-down SMF takes no new SM context. Its N4
@@ -21402,6 +21427,84 @@ mod tests {
             "body was {:?}",
             seen_bodies[0]
         );
+    }
+
+    /// #1368: every PDU session establishment is counted with its outcome, as the
+    /// shipped `SmfHighSessionFailureRate` rule and the session-rate panel read them:
+    /// a create the stand-in UPF establishes (201, Accept) is a success, and one asking
+    /// for SSC mode 3 is refused with PDU SESSION ESTABLISHMENT REJECT #68 (TS 24.501
+    /// §8.3.3.1), a failure by that cause. Served on `/metrics` with the shared families.
+    ///
+    /// REVERT-VERIFIED: without `observe_establishment` in `handle_sm_context_create`
+    /// no count moves; without `session_metrics::render` in `render_metrics` the series
+    /// are missing.
+    #[tokio::test]
+    async fn establishments_are_counted_by_outcome_and_cause_1368() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        smf_context_init(64, 256, 512);
+        let watched = [
+            "smf_session_requests_total",
+            "smf_session_success_total",
+            "smf_session_failure_total",
+            r#"smf_session_failure_cause_total{cause="68"}"#,
+        ];
+        let before: Vec<f64> = watched.iter().map(|s| session_metrics::value(s)).collect();
+
+        let ok_psi = 9u8;
+        let ok = n1(
+            ok_psi,
+            1,
+            gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+            &[0x91, 0x00],
+        );
+        let resp =
+            handle_sm_context_create(&create_request("imsi-001010000013680", ok_psi, &ok)).await;
+        assert_eq!(resp.status, 201);
+        let ssc3_psi = 10u8;
+        // Integrity protection maximum data rate (2 octets), PDU session type IPv4
+        // (IEI 9) and SSC mode 3 (IEI A, TS 24.501 Table 8.3.1.1.1).
+        let ssc3 = n1(
+            ssc3_psi,
+            2,
+            gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+            &[0xFF, 0xFF, 0x91, 0xA3],
+        );
+        let resp =
+            handle_sm_context_create(&create_request("imsi-001010000013681", ssc3_psi, &ssc3))
+                .await;
+        assert_eq!(resp.status, 403, "SSC mode 3 is refused");
+
+        for ((s, b), want) in watched.iter().zip(&before).zip([2.0, 1.0, 1.0, 1.0]) {
+            let now = session_metrics::value(s);
+            assert!(now >= b + want, "{s}: {b} -> {now}");
+        }
+        let (bound, handle) = nextgcore_metrics::nes_energy::serve_metrics(
+            "127.0.0.1:0".parse().unwrap(),
+            std::sync::Arc::new(render_metrics),
+        )
+        .await
+        .expect("metrics endpoint");
+        let body = nextgcore_metrics::nf::scrape_for_test(bound).await;
+        for name in [
+            "smf_session_requests_total",
+            "smf_session_success_total",
+            "smf_session_failure_total",
+            "smf_session_failure_cause_total",
+            "smf_sessions",
+            "smf_n4_associations",
+            "nextgcore_nrf_registered",
+            "nextgcore_uptime_seconds",
+            "process_resident_memory_bytes",
+        ] {
+            assert!(
+                nextgcore_metrics::nf::has_series(&body, name),
+                "{name}:\n{body}"
+            );
+        }
+        assert!(!body.contains("001010000013"), "no SUPI in the exposition");
+        handle.abort();
     }
 
     #[tokio::test]
