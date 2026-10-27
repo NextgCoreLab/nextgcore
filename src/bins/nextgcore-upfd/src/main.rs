@@ -674,12 +674,6 @@ async fn main() -> Result<()> {
 // G2-2: NRF registration + heartbeat /load PATCH (opt-in)
 // ---------------------------------------------------------------------------
 
-/// Build the UPF `NFProfile` sent to the NRF on registration
-/// (TS 29.510 §6.1.6.2.2). The UPF exposes no SBI service, so `nfServices` is
-/// omitted — consumers (SMF) reach it over N4/PFCP. `upfInfo`
-/// (TS 29.510 §6.1.6.2.10) advertises the N3 (GTP-U) interface endpoint. The
-/// `load` field carries the initial PFCP-session occupancy gauge; it is
-/// refreshed by the heartbeat PATCH (`build_load_patch`, `/load` 0..=100).
 /// The N3 InterfaceUpfInfoItem for `gtpu_addr`, its address by type (#1324).
 fn n3_interface(gtpu_addr: &str) -> serde_json::Value {
     let mut item = nextgcore_sbi::nf_addressing::interface_upf_endpoint(gtpu_addr);
@@ -687,6 +681,12 @@ fn n3_interface(gtpu_addr: &str) -> serde_json::Value {
     serde_json::Value::Object(item)
 }
 
+/// Build the UPF `NFProfile` sent to the NRF on registration
+/// (TS 29.510 §6.1.6.2.2). The UPF exposes no SBI service, so `nfServices` is
+/// omitted — consumers (SMF) reach it over N4/PFCP. `upfInfo`
+/// (TS 29.510 §6.1.6.2.10) advertises the N3 (GTP-U) interface endpoint. The
+/// `load` field carries the initial PFCP-session occupancy gauge; it is
+/// refreshed by the heartbeat PATCH (`build_load_patch`, `/load` 0..=100).
 fn build_upf_nf_profile(
     nf_instance_id: &str,
     pfcp_addr: &str,

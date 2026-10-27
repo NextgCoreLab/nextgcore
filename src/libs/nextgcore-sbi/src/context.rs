@@ -104,7 +104,6 @@ impl NfInstance {
         self.services.push(service);
     }
 
-    /// Find a service by type
     /// This instance's own host (TS 29.510 §6.1.6.2.2): its first IPv4 address, else
     /// its first IPv6 address, else its FQDN (#1324).
     pub fn host(&self) -> Option<&String> {
@@ -114,6 +113,7 @@ impl NfInstance {
             .or(self.fqdn.as_ref())
     }
 
+    /// Find a service by type
     pub fn find_service(&self, service_type: SbiServiceType) -> Option<&NfService> {
         self.services
             .iter()
