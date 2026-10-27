@@ -622,6 +622,30 @@ services:
       timeout: 5s
       retries: 3
 
+  # MongoDB exporter (#1369): mongodb_up and the MongoDB server families, for the
+  # MongoDbDown rule. Nothing is published: Prometheus scrapes it on the compose
+  # network. Its connection URI comes from the environment, never from this file:
+  # this stack's MongoDB has no credentials, so the default carries none; with
+  # MongoDB authentication enabled, set MONGODB_EXPORTER_URI in .env (not
+  # committed) to the credentialed URI.
+  mongodb-exporter:
+    image: percona/mongodb_exporter:0.40.0
+    container_name: nextgcore-mongodb-exporter
+    <<: *common
+    environment:
+      MONGODB_URI: "${MONGODB_EXPORTER_URI:-mongodb://172.23.0.2:27017}"
+    # Every container interface, inside this private network only.
+    command: ["--web.listen-address=:9216"]
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    networks:
+      core:
+        ipv4_address: 172.23.0.203
+    depends_on:
+      mongodb:
+        condition: service_healthy
+
   grafana:
     image: grafana/grafana:10.4.0
     container_name: nextgcore-grafana

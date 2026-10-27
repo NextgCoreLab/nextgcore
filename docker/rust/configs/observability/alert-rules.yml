@@ -134,8 +134,17 @@ groups:
 
   - name: nextgcore_infrastructure
     rules:
-      # (#1334) No MongoDB rule: the stack runs no MongoDB exporter, so
-      # mongodb_up is a series no target emits (#1369).
+      # MongoDB down, as its exporter sees it (#1369). The exporter's own target
+      # going down is NfInstanceDown on job "mongodb".
+      - alert: MongoDbDown
+        expr: mongodb_up == 0
+        for: 30s
+        labels:
+          severity: critical
+          nf_type: MongoDB
+        annotations:
+          summary: "MongoDB is down"
+          description: "The MongoDB exporter cannot reach MongoDB ({{ $labels.instance }})."
 
       # High memory usage
       - alert: NfHighMemoryUsage

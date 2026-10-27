@@ -1,0 +1,79 @@
+# MongoDB exporter (#1369): serves mongodb_up and the MongoDB server families for
+# the MongoDbDown rule. ClusterIP only, reached by Prometheus inside the cluster;
+# nothing publishes it (#1365). Its connection URI is read from Secret
+# mongodb-exporter (key `uri`), never from a manifest: k8s/deploy.sh and
+# deploy/eks/deploy-eks.sh create it with the in-cluster URI when it is absent
+# (this MongoDB has no credentials), and an operator whose MongoDB requires
+# authentication stores the credentialed URI there instead.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mongodb-exporter
+  namespace: nextg-system
+  labels:
+    app.kubernetes.io/name: mongodb-exporter
+    app.kubernetes.io/part-of: nextgcore
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mongodb-exporter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mongodb-exporter
+        app.kubernetes.io/part-of: nextgcore
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65535
+        runAsGroup: 65535
+      containers:
+        - name: mongodb-exporter
+          image: percona/mongodb_exporter:0.40.0
+          # Every pod interface, so Prometheus reaches it through the Service.
+          args: ["--web.listen-address=:9216"]
+          ports:
+            - containerPort: 9216
+              name: metrics
+          env:
+            - name: MONGODB_URI
+              valueFrom:
+                secretKeyRef:
+                  name: mongodb-exporter
+                  key: uri
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          readinessProbe:
+            tcpSocket:
+              port: 9216
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb-exporter
+  namespace: nextg-system
+  labels:
+    app.kubernetes.io/name: mongodb-exporter
+    app.kubernetes.io/part-of: nextgcore
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: mongodb-exporter
+  ports:
+    - name: metrics
+      port: 9216
+      targetPort: 9216
+      protocol: TCP

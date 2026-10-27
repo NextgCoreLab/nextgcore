@@ -393,6 +393,9 @@ jobs:
           cfg=docker/rust/configs/observability
           docker run --rm --network none -v "$PWD/$cfg":/cfg:ro -w /cfg \
             --entrypoint promtool "$img" check rules alert-rules.yml
+          # #1369: the rules' own unit tests (MongoDbDown fires, and only then).
+          docker run --rm --network none -v "$PWD/$cfg":/cfg:ro -w /cfg \
+            --entrypoint promtool "$img" test rules alert-rules.test.yml
           docker run --rm --network none -v "$PWD/$cfg":/cfg:ro -w /cfg \
             --entrypoint promtool "$img" check config prometheus.yml
           # The Kind/EKS scrape config lives in a ConfigMap.

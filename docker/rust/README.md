@@ -189,6 +189,7 @@ Common ones:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `GRAFANA_ADMIN_PASSWORD` | Grafana `admin` password. **Required**: `docker compose` refuses to start without it (#837); put `GRAFANA_ADMIN_PASSWORD=...` in `docker/rust/.env` (gitignored) | none |
+| `MONGODB_EXPORTER_URI` | The MongoDB URI the MongoDB exporter reads (#1369). Only needed when MongoDB requires authentication: put the credentialed URI in `docker/rust/.env` (gitignored), never in a compose file | `mongodb://172.23.0.2:27017` (this MongoDB has no credentials) |
 | `RUST_LOG` | Log filter for every NF (env_logger syntax, e.g. `info,nextgcore_amfd=debug`). When set and not blank it replaces the NF's level entirely; unset, the level is `--log-level`, else the config's `logger.level`, else `info`, for all targets (#691) | `info` |
 | `NEXTGCORE_SBI_PROFILE` | SBI security profile for amf/smf/ausf/udm; the compose files set `dev` (h2c, no mTLS) | `production` when unset |
 | `NEXTGCORE_SBI_OAUTH2_REQUIRE` | Force OAuth2 enforcement on an NF's SBI server (the `oauth2` overlay sets it) | unset |

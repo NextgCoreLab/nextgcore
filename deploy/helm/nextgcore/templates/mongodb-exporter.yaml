@@ -1,0 +1,103 @@
+{{- if and .Values.mongodb.exporter.enabled (or .Values.mongodb.enabled .Values.mongodb.externalUri .Values.mongodb.exporter.uriSecret.name) }}
+{{/*
+MongoDB exporter (#1369): mongodb_up and the MongoDB server families for the
+MongoDbDown rule. ClusterIP only; nothing publishes it. Its connection URI comes
+from a Secret, never from a values file:
+  - mongodb.exporter.uriSecret.name/key: an operator's Secret, which must be used
+    when MongoDB requires credentials (an externalUri usually does);
+  - otherwise, for the in-chart MongoDB (no credentials), the chart's own Secret
+    holding the in-cluster URI.
+An externalUri with no uriSecret refuses to render: the chart will not copy a
+URI that may carry credentials into a Secret it writes from values.
+*/}}
+{{- $secretName := .Values.mongodb.exporter.uriSecret.name }}
+{{- $secretKey := .Values.mongodb.exporter.uriSecret.key | default "uri" }}
+{{- if not $secretName }}
+{{- if .Values.mongodb.externalUri }}
+{{- fail "mongodb.exporter: set mongodb.exporter.uriSecret.name (a Secret holding the MongoDB URI) when mongodb.externalUri is used, or set mongodb.exporter.enabled=false" }}
+{{- end }}
+{{- $secretName = printf "%s-mongodb-exporter" .Release.Name }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secretName }}
+  labels:
+    app.kubernetes.io/name: mongodb-exporter
+    {{- include "nextgcore.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  # The in-chart MongoDB, which has no credentials.
+  {{ $secretKey }}: mongodb://{{ .Release.Name }}-mongodb.{{ .Release.Namespace }}.svc.cluster.local:27017
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-mongodb-exporter
+  labels:
+    app.kubernetes.io/name: mongodb-exporter
+    {{- include "nextgcore.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mongodb-exporter
+      app.kubernetes.io/instance: {{ .Release.Name }}-mongodb-exporter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mongodb-exporter
+        app.kubernetes.io/instance: {{ .Release.Name }}-mongodb-exporter
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65535
+        runAsGroup: 65535
+      containers:
+        - name: mongodb-exporter
+          image: "{{ .Values.mongodb.exporter.image.repository }}:{{ .Values.mongodb.exporter.image.tag }}"
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          # Every pod interface, so Prometheus reaches it through the Service.
+          args: ["--web.listen-address=:{{ .Values.mongodb.exporter.port }}"]
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.mongodb.exporter.port }}
+              protocol: TCP
+          env:
+            - name: MONGODB_URI
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretName }}
+                  key: {{ $secretKey }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.mongodb.exporter.resources | nindent 12 }}
+          readinessProbe:
+            tcpSocket:
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-mongodb-exporter
+  labels:
+    app.kubernetes.io/name: mongodb-exporter
+    {{- include "nextgcore.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: mongodb-exporter
+    app.kubernetes.io/instance: {{ .Release.Name }}-mongodb-exporter
+  ports:
+    - port: {{ .Values.mongodb.exporter.port }}
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+{{- end }}
