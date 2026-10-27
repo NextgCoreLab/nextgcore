@@ -61,9 +61,17 @@ groups:
 
   - name: nextgcore_smf_alerts
     rules:
-      # (#1334) No PDU session establishment failure-rate rule: smfd exports no
-      # session success/failure counters yet, and a rule on series no process
-      # emits never fires (#1368). smfd's session census is smf_sessions.
+      # PDU session establishment failure rate (#1368: counted at the
+      # Nsmf_PDUSession_CreateSMContext answer, TS 28.552 §5.3.1 style).
+      - alert: SmfHighSessionFailureRate
+        expr: rate(smf_session_failure_total[5m]) / (rate(smf_session_success_total[5m]) + rate(smf_session_failure_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          nf_type: SMF
+        annotations:
+          summary: "SMF session establishment failure rate > 5%"
+          description: "Session failure rate is {{ $value | humanizePercentage }}."
 
       # PFCP association down: N4 peers are configured and none is associated.
       - alert: SmfPfcpAssociationDown

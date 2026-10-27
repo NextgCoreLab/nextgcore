@@ -6492,9 +6492,21 @@ mod tests {
             gtpu_socket: Some(Arc::new(TokioUdpSocket::bind("127.0.0.1:0").await.unwrap())),
             ..dp
         };
-        // The target NG-RAN's DL forwarding endpoint: GTP-U port, on a loopback address
-        // of its own so it cannot collide with another test.
-        let target = TokioUdpSocket::bind("127.58.3.1:2152").await.unwrap();
+        // The target NG-RAN's DL forwarding endpoint. The FAR names an address only, so
+        // the data plane sends to its GTP-U port 2152: the port cannot be ephemeral.
+        // #1373: the first free 127.58.x.1 instead of one fixed address, so concurrent
+        // test processes (several upfd test binaries at once) never collide on it.
+        let (target, target_ip) = {
+            let mut bound = None;
+            for x in 1..=254u8 {
+                let ip = Ipv4Addr::new(127, 58, x, 1);
+                if let Ok(socket) = TokioUdpSocket::bind((ip, GTPU_PORT)).await {
+                    bound = Some((socket, ip));
+                    break;
+                }
+            }
+            bound.expect("a free 127.58.x.1:2152 for the forwarding target")
+        };
         let ue_ip = Ipv4Addr::new(10, 45, 0, 2);
         let sgw = "127.0.0.1:9".parse().unwrap();
         dp.add_session_from_pfcp(0x83, 0x1083, ue_ip, 0x831, 0x832, sgw, Some(5), Some(5));
@@ -6522,7 +6534,7 @@ mod tests {
                 apply_action: FAR_ACTION_FORW,
                 destination_interface: SRC_INTF_ACCESS,
                 ohc_teid: Some(0xF0D),
-                ohc_addr: Some(IpAddr::V4(Ipv4Addr::new(127, 58, 3, 1))),
+                ohc_addr: Some(IpAddr::V4(target_ip)),
                 bar_id: None,
             },
         );

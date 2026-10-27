@@ -360,18 +360,15 @@ async fn main() -> Result<()> {
     let sbi_ctx = nextgcore_sbi::context::global_context();
     sbi_ctx.set_nrf_uri(&nrf_uri).await;
     // #1322: the advertised host, never a wildcard.
-    if let Err(e) = match nextgcore_core::sockaddr::SbiEndpoint::resolve(
-        Some(&sbi_addr),
-        Some(sbi_port),
-        args.sbi_advertise.as_deref(),
-        None,
-        None,
-        None,
+    if let Err(e) = match nrf_registration_host(
+        &sbi_addr,
         sbi_port,
-    )
-    .registration_host()
-    {
-        Ok(host) => register_with_nrf(sbi_ctx, host, sbi_port, &nf_instance_id).await,
+        args.sbi_advertise.as_deref(),
+        std::env::var(nextgcore_core::sockaddr::SBI_ADVERTISE_ENV)
+            .ok()
+            .as_deref(),
+    ) {
+        Ok(host) => register_with_nrf(sbi_ctx, &host, sbi_port, &nf_instance_id).await,
         Err(why) => Err(why),
     } {
         log::warn!("NRF registration failed (will operate without NRF): {e}");
@@ -953,6 +950,29 @@ fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serd
         }),
         sbi_addr,
     )
+}
+
+/// #1322: the host to register with the NRF: `--sbi-advertise`, else
+/// `NEXTGCORE_SBI_ADVERTISE` (`env_advertise`), else the bind when it is not a
+/// wildcard. `Err` (registration skipped, the reason logged) with none of them.
+fn nrf_registration_host(
+    sbi_addr: &str,
+    sbi_port: u16,
+    cli_advertise: Option<&str>,
+    env_advertise: Option<&str>,
+) -> Result<String, String> {
+    nextgcore_core::sockaddr::SbiEndpoint::resolve_with_env(
+        Some(sbi_addr),
+        Some(sbi_port),
+        cli_advertise,
+        env_advertise,
+        None,
+        None,
+        None,
+        sbi_port,
+    )
+    .registration_host()
+    .map(str::to_string)
 }
 
 /// Register EASDF with NRF (PUT /nnrf-nfm/v1/nf-instances/{id}, nwdafd
@@ -1709,6 +1729,36 @@ easdf:
         assert!(
             names.contains(&"neasdf-baselinednspattern"),
             "the second EASDF service must be advertised, got {names:?}"
+        );
+    }
+}
+
+/// #1322 review: easdfd skips NRF registration with a wildcard bind and nothing to
+/// advertise, and registers the advertised host otherwise.
+#[cfg(test)]
+mod tests_nrf_registration_host_1322 {
+    use super::nrf_registration_host;
+
+    #[test]
+    fn a_wildcard_bind_with_nothing_to_advertise_skips_registration() {
+        for wildcard in ["0.0.0.0", "::"] {
+            let why = nrf_registration_host(wildcard, 7777, None, None).unwrap_err();
+            assert!(why.contains("not registering"), "{why}");
+            assert!(nrf_registration_host(wildcard, 7777, Some(""), Some("0.0.0.0")).is_err());
+        }
+        assert_eq!(
+            nrf_registration_host("0.0.0.0", 7777, Some("10.0.0.8"), None).unwrap(),
+            "10.0.0.8"
+        );
+        assert_eq!(
+            nrf_registration_host("0.0.0.0", 7777, None, Some("10.0.0.9")).unwrap(),
+            "10.0.0.9",
+            "NEXTGCORE_SBI_ADVERTISE"
+        );
+        assert_eq!(
+            nrf_registration_host("10.0.0.7", 7777, None, None).unwrap(),
+            "10.0.0.7",
+            "a bind that is not a wildcard is advertised as itself"
         );
     }
 }

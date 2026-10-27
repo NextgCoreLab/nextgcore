@@ -709,8 +709,10 @@ impl SbiEndpoint {
         )
     }
 
+    /// [`resolve`](Self::resolve) with the `NEXTGCORE_SBI_ADVERTISE` value given
+    /// rather than read, so a caller's test does not depend on the environment.
     #[allow(clippy::too_many_arguments)]
-    fn resolve_with_env(
+    pub fn resolve_with_env(
         cli_host: Option<&str>,
         cli_port: Option<u16>,
         cli_advertise: Option<&str>,

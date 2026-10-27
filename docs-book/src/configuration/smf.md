@@ -119,7 +119,7 @@ Every refused datagram increments `smf_pfcp_unauthorized_messages_total`. This i
 | `UDM_SBI_ADDR` / `UDM_SBI_PORT` | unset / `7777` | UDM address for `Nudm_SDM_Get(smf-select-data)`, used only to resolve the **subscribed default DNN** (#204). Tried **after** NRF discovery, so it is the fallback for a deployment with no NRF. With neither available, a `SmContextCreateData` carrying no `dnn` is refused with `500 SYSTEM_FAILURE` (`504 PEER_NOT_RESPONDING` when the UDM does not answer). |
 | `NRF_URI` | unset | NRF URI, used when the YAML names none. |
 | `PCF_URI` / `NSACF_URI` | unset | PCF / NSACF endpoint, tried before NRF discovery. With no NSACF configured or discoverable, slice admission control is skipped. |
-| `SMF_METRICS_PORT` | `9090` | Prometheus endpoint port. |
+| `SMF_METRICS_PORT` | `9090` | Prometheus endpoint port: the shared families, the PDU session establishment counters (#1368) and the SMF gauges; see the Observability chapter. |
 | `NEXTGCORE_METRICS_BIND` | `127.0.0.1` | Host the unauthenticated `/metrics` listener binds to (#837). The compose files and manifests set `0.0.0.0` inside the private container/pod network. |
 | `SMF_UDM` | off | `1`/`true` turns on the UDM interaction of TS 23.502 §4.3.2.2.1 step 4 (UECM registration, SM-data subscription, #79). Off by default because the E2E harness has no conformant UDM. |
 | `SMF_EPS_INTERWORKING` | off | `1`/`true` makes an establishing PDU session request an EPS Bearer Identity from the AMF and send Mapped EPS bearer contexts to the UE, so the session can later move to the EPC (#117). |

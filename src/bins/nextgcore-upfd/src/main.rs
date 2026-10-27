@@ -228,7 +228,14 @@ fn render_metrics() -> String {
         None => data_plane::DataPlaneStats::default().render_prometheus(),
     };
     let unauthorized = pfcp_path::PFCP_UNAUTHORIZED.load(Ordering::Relaxed);
-    let mut body = format!(
+    // #1368: the families every NF serves first (NRF client, process; the UPF serves
+    // no SBI, so its SBI families stay empty), then the UPF's own.
+    let mut body = nextgcore_metrics::nf::render_common(&nextgcore_metrics::nf::NfIdentity {
+        nf: "upf",
+        version: env!("CARGO_PKG_VERSION"),
+        nrf_client: true,
+    });
+    body.push_str(&format!(
         "# HELP upf_pfcp_associations Associated CP peers on N4/Sxb (0 or 1: TS 29.244 6.2.6 scopes an association to one CP/UP function pair)\n\
          # TYPE upf_pfcp_associations gauge\n\
          upf_pfcp_associations {associations}\n\
@@ -241,7 +248,7 @@ fn render_metrics() -> String {
          # HELP upf_up 1 when the UPF runtime is serving\n\
          # TYPE upf_up gauge\n\
          upf_up 1\n"
-    );
+    ));
     body.push_str(&dataplane);
     body
 }
@@ -1548,7 +1555,27 @@ mod tests {
             Arc::clone(&seen),
             Arc::clone(&started),
         );
-        let reader = std::thread::spawn(move || {
+        // #1373 review: stopped and joined on every exit, a failed bounded wait
+        // included, so a failing test never leaves its reader spinning.
+        struct Reader {
+            stop: Arc<AtomicBool>,
+            handle: Option<std::thread::JoinHandle<Vec<String>>>,
+        }
+        impl Reader {
+            fn finish(mut self) -> Vec<String> {
+                self.stop.store(true, Ordering::Relaxed);
+                self.handle.take().expect("joined once").join().unwrap()
+            }
+        }
+        impl Drop for Reader {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::Relaxed);
+                if let Some(handle) = self.handle.take() {
+                    let _ = handle.join();
+                }
+            }
+        }
+        let reader_handle = std::thread::spawn(move || {
             let mut bad = Vec::new();
             reader_started.store(true, Ordering::Release);
             while !reader_stop.load(Ordering::Relaxed) {
@@ -1570,6 +1597,11 @@ mod tests {
             }
             bad
         });
+        let reader = Reader {
+            stop: Arc::clone(&stop),
+            handle: Some(reader_handle),
+        };
+
         // Wait for the reader to observe `predicate`, bounded so a broken reader fails
         // the test instead of hanging it.
         async fn wait_for(what: &str, predicate: impl Fn() -> bool) {
@@ -1596,8 +1628,7 @@ mod tests {
             }
             dp.remove_session_from_pfcp(seid);
         }
-        stop.store(true, Ordering::Relaxed);
-        let bad = reader.join().unwrap();
+        let bad = reader.finish();
         let seen = seen.load(Ordering::Acquire);
         assert!(
             seen >= 400 / CHECKPOINT,
@@ -1923,6 +1954,10 @@ mod tests {
         for expected in [
             "# TYPE upf_pfcp_associations gauge",
             "upf_pfcp_associations 0",
+            // #1368: the shared families.
+            "# TYPE nextgcore_nrf_registered gauge",
+            "# TYPE nextgcore_uptime_seconds gauge",
+            "nextgcore_build_info{nf=\"upf\"",
             "upf_pfcp_sessions 0",
             "upf_up 1",
             "# TYPE upf_dataplane_ul_packets_total counter",
