@@ -157,7 +157,17 @@ echo "[8/9] Deploying Monitoring Stack (Prometheus, Grafana, Jaeger)"
 kubectl apply -f "${SCRIPT_DIR}/monitoring/prometheus.yaml"
 # Grafana's admin password lives in a Secret, never in a manifest (#837). Create
 # it with a generated value the first time; an existing one is kept.
-if ! kubectl get secret grafana-admin -n "${NAMESPACE}" >/dev/null 2>&1; then
+# A Secret that is absent is created; a lookup that FAILS (API, RBAC, auth) stops
+# the deploy rather than being taken for "absent" (#1378 review), as deploy-eks.sh
+# does: --ignore-not-found makes NotFound an empty answer and every other error a
+# non-zero exit.
+secret_absent() {
+  local found
+  found="$(kubectl get secret "$1" -n "${NAMESPACE}" -o name --ignore-not-found)" \
+    || { echo "ERROR: cannot read Secret $1 in ${NAMESPACE}" >&2; exit 1; }
+  [ -z "${found}" ]
+}
+if secret_absent grafana-admin; then
   # Piped, never in argv: an argv value shows in `ps` and under `bash -x`.
   openssl rand -base64 24 | tr -d '\n' \
     | kubectl create secret generic grafana-admin -n "${NAMESPACE}" \
@@ -167,7 +177,7 @@ fi
 # The MongoDB exporter reads its connection URI from a Secret, never from a
 # manifest (#1369). This MongoDB has no credentials, so the in-cluster URI is it;
 # an existing Secret (an operator's credentialed URI) is kept.
-if ! kubectl get secret mongodb-exporter -n "${NAMESPACE}" >/dev/null 2>&1; then
+if secret_absent mongodb-exporter; then
   printf 'mongodb://mongodb.%s.svc.cluster.local:27017' "${NAMESPACE}" \
     | kubectl create secret generic mongodb-exporter -n "${NAMESPACE}" \
         --from-file=uri=/dev/stdin >/dev/null
