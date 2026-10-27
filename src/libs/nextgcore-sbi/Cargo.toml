@@ -70,6 +70,9 @@ nextgcore-core = { workspace = true, features = ["test-log"] }
 # Test-only: shut a listening socket's read side so accept() fails on demand
 # (EINVAL), which is how the accept-error backoff test drives the real loop.
 socket2.workspace = true
+# Test-only: a self-removing directory for the TLS probe test's PEM files.
+# Already in Cargo.lock (transitively).
+tempfile = "3.24"
 # Bench-only: SBA transport benchmark harness (issue #15).
 criterion = "0.8.2"
 proptest.workspace = true

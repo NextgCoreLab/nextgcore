@@ -2933,21 +2933,25 @@ mod accept_path_tests {
         .unwrap_or_default()
     }
 
-    /// A self-signed `localhost` certificate and key, written as PEM to a
-    /// per-test directory. Returns `(key_path, cert_path)`.
-    fn self_signed_pem(tag: &str) -> (String, String) {
+    /// A self-signed `localhost` certificate and key, written as PEM into a
+    /// temporary directory that is removed when the returned guard drops.
+    /// Returns `(guard, key_path, cert_path)`.
+    fn self_signed_pem() -> (tempfile::TempDir, String, String) {
         let key = rcgen::KeyPair::generate().expect("key");
         let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
             .expect("params")
             .self_signed(&key)
             .expect("self-signed cert");
-        let dir = std::env::temp_dir().join(format!("sbi-1338-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let key_path = dir.join("key.pem");
-        let cert_path = dir.join("cert.pem");
+        let dir = tempfile::Builder::new()
+            .prefix("sbi-1338-tls-probe-")
+            .tempdir()
+            .expect("temp dir");
+        let key_path = dir.path().join("key.pem");
+        let cert_path = dir.path().join("cert.pem");
         std::fs::write(&key_path, key.serialize_pem()).expect("write key");
         std::fs::write(&cert_path, cert.pem()).expect("write cert");
         (
+            dir,
             key_path.to_string_lossy().into_owned(),
             cert_path.to_string_lossy().into_owned(),
         )
@@ -2963,7 +2967,7 @@ mod accept_path_tests {
             nextgcore_core::test_log::init(),
             "premise: the capture logger"
         );
-        let (key, cert) = self_signed_pem("tls-probe");
+        let (_pem_dir, key, cert) = self_signed_pem();
         let (server, addr) = crate::test_support::sbi_server_on_free_port_with(
             |addr| SbiServerConfig::new(addr).with_tls(key, cert),
             |_req: SbiRequest| async { SbiResponse::with_status(200) },
@@ -2976,12 +2980,17 @@ mod accept_path_tests {
         let prober = probe.local_addr().expect("probe address");
         drop(probe); // FIN, no ClientHello: a kubelet tcpSocket probe
 
+        // Not `len() == 1`: the shared capture log evicts its older half when
+        // full, and parallel tests can fill it. Assert on what survives instead.
         let records = records_matching(&format!("from {prober}")).await;
-        assert_eq!(records.len(), 1, "one TLS-accept record: {records:?}");
         assert!(
-            records[0].starts_with("DEBUG ")
-                && records[0].contains(&format!("SBI server TLS accept from {prober}"))
-                && records[0].contains("peer closed before the handshake"),
+            !records.is_empty(),
+            "premise: the probe's accept was logged"
+        );
+        assert!(
+            records.iter().all(|r| r.starts_with("DEBUG ")
+                && r.contains(&format!("SBI server TLS accept from {prober}"))
+                && r.contains("peer closed before the handshake")),
             "a probe on an https port is an orderly close, not a warning: {records:?}"
         );
         server.stop().await.expect("stop");
@@ -3027,19 +3036,27 @@ mod accept_path_tests {
             .expect("start");
 
         tokio::time::sleep(Duration::from_millis(1_400)).await;
+        // Read the loop's own "(k in a row" counter from the NEWEST matching
+        // record rather than counting records: the shared capture log evicts
+        // its older half when full, and parallel tests' trace output can fill it
+        // inside this window (that failed CI once with 1 surviving record).
         let needle = format!("SBI server on {addr}: accept failed");
-        let warns: Vec<String> = nextgcore_core::test_log::captured(&needle)
+        let newest = nextgcore_core::test_log::captured(&needle)
             .into_iter()
-            .filter(|r| r.starts_with("WARN "))
-            .collect();
+            .rfind(|r| r.starts_with("WARN "))
+            .expect("premise: accept() fails on a shut-down listener");
+        let in_a_row: u32 = newest
+            .split_once(" in a row")
+            .and_then(|(head, _)| head.rsplit_once(" ("))
+            .and_then(|(_, k)| k.parse().ok())
+            .unwrap_or_else(|| panic!("no '(k in a row' in {newest:?}"));
         assert!(
-            warns.len() >= 2,
-            "premise: accept() keeps failing on a shut-down listener: {warns:?}"
+            in_a_row >= 2,
+            "premise: accept() keeps failing on a shut-down listener: {newest:?}"
         );
         assert!(
-            warns.len() <= 10,
-            "accept errors are paced, not spun: {} warns in 1.4 s",
-            warns.len()
+            in_a_row <= 10,
+            "accept errors are paced, not spun: {in_a_row} errors in 1.4 s"
         );
 
         // stop() waits for the accept task to exit, and the task is now about
