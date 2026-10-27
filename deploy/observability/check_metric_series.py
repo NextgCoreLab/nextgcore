@@ -16,6 +16,9 @@ be one of:
   histogram's `_bucket` / `_sum` / `_count` series match its base name;
 - a series Prometheus itself synthesises for every target (`up`,
   `scrape_duration_seconds`, ...);
+- a series a third-party exporter the stack deploys serves (EXTERNAL_EXPORTERS:
+  `mongodb_up` from the MongoDB exporter, #1369), while that exporter's image is in
+  every deployment listed for it;
 - a name a rule file records (`record:`).
 
 Usage: check_metric_series.py [REPO_ROOT]   (default: the repository root)
@@ -46,6 +49,30 @@ PROMQL_KEYWORDS = {
 }
 
 HISTOGRAM_SUFFIXES = ("_bucket", "_sum", "_count")
+
+# Series a third-party exporter the stack deploys serves, not an NF (#1369). Each is
+# accepted only while the exporter's image is in every deployment named here, so
+# removing the exporter makes its rules fail this check again.
+EXTERNAL_EXPORTERS = {
+    "mongodb_up": (
+        "percona/mongodb_exporter",
+        [
+            "docker/rust/docker-compose.yml",
+            "k8s/monitoring/mongodb-exporter.yaml",
+            "deploy/helm/nextgcore/values.yaml",
+        ],
+    ),
+}
+
+
+def external_exported(root):
+    """The EXTERNAL_EXPORTERS series whose exporter every listed deployment runs."""
+    names = set()
+    for name, (image, files) in EXTERNAL_EXPORTERS.items():
+        texts = [(root / f).read_text() if (root / f).exists() else "" for f in files]
+        if all(image in t for t in texts):
+            names.add(name)
+    return names
 
 SKIP_DIRS = {".git", "target", "node_modules", "vendor", "fuzz"}
 
@@ -274,7 +301,7 @@ def main():
         for expr in dashboard_exprs(json.loads(p.read_text())):
             for name in series_in_expr(expr):
                 queried.setdefault(name, set()).add(str(p.relative_to(root)))
-    exported = exported_names(root)
+    exported = exported_names(root) | external_exported(root)
 
     def ok(name):
         if name in PROMETHEUS_SYNTHETIC or name in recorded or name in exported:

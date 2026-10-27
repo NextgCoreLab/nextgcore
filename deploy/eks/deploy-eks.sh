@@ -648,6 +648,26 @@ if grep -q 'name: grafana-admin$' "${RENDERED}"; then
   fi
 fi
 
+# --- MongoDB exporter URI secret (#1369) ----------------------------------
+
+# k8s/monitoring/mongodb-exporter.yaml reads its MongoDB URI from Secret
+# mongodb-exporter, never from a manifest. Created as k8s/deploy.sh does, only
+# when absent: this MongoDB has no credentials, so the in-cluster URI is it; an
+# existing Secret (an operator's credentialed URI) is never overwritten.
+if grep -q 'name: mongodb-exporter$' "${RENDERED}"; then
+  existing="$(kubectl get secret mongodb-exporter -n "${NAMESPACE}" -o name --ignore-not-found)" \
+    || die "cannot read Secret mongodb-exporter in ${NAMESPACE}"
+  if [[ -n "${existing}" ]]; then
+    log "keeping the existing mongodb-exporter Secret"
+  else
+    log "creating mongodb-exporter Secret with the in-cluster MongoDB URI..."
+    printf 'mongodb://mongodb.%s.svc.cluster.local:27017' "${NAMESPACE}" \
+      | kubectl create secret generic mongodb-exporter -n "${NAMESPACE}" \
+          --from-file=uri=/dev/stdin >/dev/null \
+      || die "could not create Secret mongodb-exporter"
+  fi
+fi
+
 # --- apply -----------------------------------------------------------------
 
 log "applying manifests..."

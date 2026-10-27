@@ -77,6 +77,27 @@ mongodb:
   # Seeds subscribers + indexes. Registration cannot succeed without it.
   init:
     enabled: true
+  # #1369: the MongoDB exporter (mongodb_up, for the MongoDbDown rule). ClusterIP
+  # only. Its URI is read from a Secret, never from values: by default the
+  # chart's own Secret with the in-chart URI (this MongoDB has no credentials).
+  # With mongodb.externalUri, name a Secret of yours in uriSecret (it may hold
+  # credentials); the chart refuses to render otherwise.
+  exporter:
+    enabled: true
+    image:
+      repository: percona/mongodb_exporter
+      tag: "0.40.0"
+    port: 9216
+    uriSecret:
+      name: ""
+      key: uri
+    resources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+      limits:
+        cpu: 100m
+        memory: 64Mi
 
 # Subscriber seeded by the mongodb-init Job. Must match the UE's USIM config.
 subscriber:

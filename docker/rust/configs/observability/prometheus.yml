@@ -81,6 +81,14 @@ scrape_configs:
           nf_type: "UPF"
           instance_name: "upf-1"
 
+  # MongoDB through its exporter (#1369): mongodb_up for MongoDbDown.
+  - job_name: "mongodb"
+    static_configs:
+      - targets: ["172.23.0.203:9216"]
+        labels:
+          nf_type: "MongoDB"
+          instance_name: "mongodb-1"
+
   # Prometheus self-monitoring
   - job_name: "prometheus"
     static_configs:

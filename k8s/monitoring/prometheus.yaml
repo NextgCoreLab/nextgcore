@@ -51,6 +51,11 @@ data:
         static_configs:
           - targets: ["bsf.nextg-system.svc.cluster.local:9090"]
             labels: { nf_type: "BSF" }
+      # #1369: MongoDB through its exporter (mongodb_up, MongoDbDown).
+      - job_name: "mongodb"
+        static_configs:
+          - targets: ["mongodb-exporter.nextg-system.svc.cluster.local:9216"]
+            labels: { nf_type: "MongoDB" }
       - job_name: "prometheus"
         static_configs:
           - targets: ["localhost:9090"]

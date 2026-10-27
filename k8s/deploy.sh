@@ -164,11 +164,21 @@ if ! kubectl get secret grafana-admin -n "${NAMESPACE}" >/dev/null 2>&1; then
         --from-file=password=/dev/stdin >/dev/null
   echo "  Created Secret grafana-admin with a generated Grafana admin password"
 fi
+# The MongoDB exporter reads its connection URI from a Secret, never from a
+# manifest (#1369). This MongoDB has no credentials, so the in-cluster URI is it;
+# an existing Secret (an operator's credentialed URI) is kept.
+if ! kubectl get secret mongodb-exporter -n "${NAMESPACE}" >/dev/null 2>&1; then
+  printf 'mongodb://mongodb.%s.svc.cluster.local:27017' "${NAMESPACE}" \
+    | kubectl create secret generic mongodb-exporter -n "${NAMESPACE}" \
+        --from-file=uri=/dev/stdin >/dev/null
+  echo "  Created Secret mongodb-exporter with the in-cluster MongoDB URI"
+fi
+kubectl apply -f "${SCRIPT_DIR}/monitoring/mongodb-exporter.yaml"
 kubectl apply -f "${SCRIPT_DIR}/monitoring/grafana.yaml"
 kubectl apply -f "${SCRIPT_DIR}/monitoring/jaeger.yaml"
 
 echo "  Waiting for monitoring pods..."
-for dep in prometheus grafana jaeger; do
+for dep in prometheus mongodb-exporter grafana jaeger; do
   kubectl rollout status deployment/${dep} -n "${NAMESPACE}" --timeout=120s
 done
 

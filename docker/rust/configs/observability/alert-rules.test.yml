@@ -1,0 +1,27 @@
+# promtool test rules alert-rules.test.yml (#1369): MongoDbDown fires once the
+# exporter has seen MongoDB down for 30s, and not while it is up.
+rule_files:
+  - alert-rules.yml
+
+evaluation_interval: 15s
+
+tests:
+  - interval: 15s
+    input_series:
+      - series: 'mongodb_up{job="mongodb", instance="172.23.0.203:9216", nf_type="MongoDB"}'
+        values: '1 1 1 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 30s
+        alertname: MongoDbDown
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: MongoDbDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              nf_type: MongoDB
+              job: mongodb
+              instance: "172.23.0.203:9216"
+            exp_annotations:
+              summary: "MongoDB is down"
+              description: "The MongoDB exporter cannot reach MongoDB (172.23.0.203:9216)."

@@ -29,5 +29,6 @@ resources:
   - manifests/smf.yaml
   - manifests/upf.yaml
   - monitoring/prometheus.yaml
+  - monitoring/mongodb-exporter.yaml
   - monitoring/grafana.yaml
   - monitoring/jaeger.yaml
