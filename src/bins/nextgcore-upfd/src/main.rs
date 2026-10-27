@@ -988,8 +988,14 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                 let gnb_socket = if let Some(addr) = gnb_addr {
                     SocketAddr::new(IpAddr::V4(addr), GTPU_PORT)
                 } else {
-                    log::warn!("No gNB address provided, using default");
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), GTPU_PORT)
+                    // #1345: no N3 endpoint until the Session Modification brings
+                    // one; DL traffic before then is buffered or counted as
+                    // `no_dl_endpoint`, not sent to the loopback.
+                    log::info!(
+                        "No gNB address at establishment: DL endpoint pending the \
+                         Session Modification"
+                    );
+                    data_plane::NO_DL_ENDPOINT
                 };
 
                 // Extract QFI from QERs
