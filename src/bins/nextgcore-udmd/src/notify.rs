@@ -506,6 +506,7 @@ mod tests {
         std::env::remove_var("UDM_NOTIFY_DISABLE");
         udm_context_init(64, 64);
         clear_subscriptions_for("imsi-001010000000085");
+        clear_subscriptions_for("imsi-001010000000086");
         clear_subscriptions_for("imsi-001010000000999");
         let (_server, uri, seen) = stub_callback().await;
 
@@ -527,7 +528,27 @@ mod tests {
             notify_ue_context_change("imsi-001010000000085", UeContextEvent::AmfRegistered).await;
         assert_eq!(sdm, 0, "another UE's SDM subscription must not be notified");
         assert_eq!(ee, 1, "an anyUE EE subscription covers every UE");
-        assert_eq!(wait_for(&seen, 1).await.len(), 1);
+        // #1357: an `anyUE` subscription covers EVERY SUPI, so a UECM operation any
+        // concurrently running test makes for its own SUPI is (correctly) reported to
+        // this stub too. Count only the reports for this test's SUPI.
+        let ours = |seen: &[serde_json::Value]| {
+            seen.iter()
+                .filter(|b| b["reportList"][0]["report"]["supi"] == "imsi-001010000000085")
+                .count()
+        };
+        // What a concurrent test does: a UECM event for ANOTHER SUPI. The anyUE
+        // subscription is reported it too, which is right, and must not change the
+        // count for this UE.
+        let (_, other_ee) =
+            notify_ue_context_change("imsi-001010000000086", UeContextEvent::AmfRegistered).await;
+        assert_eq!(other_ee, 1, "anyUE covers the other UE as well");
+        let all = wait_for(&seen, 2).await;
+        assert_eq!(
+            all.len(),
+            2,
+            "both reports reached the anyUE subscriber: {all:?}"
+        );
+        assert_eq!(ours(&all), 1, "one report for this UE");
 
         // An anyUE subscription reaches every SUPI, so it must not outlive this
         // test regardless of what runs next.
