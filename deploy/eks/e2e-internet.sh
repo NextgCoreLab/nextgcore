@@ -252,8 +252,14 @@ if [[ "${PROFILE}" == 6g ]]; then
   else
     fail "UDM NES: no 'NES enabled:' line in the udm log (built without --features nes?)"
   fi
-  NES_OUT="$("${KUBECTL[@]}" exec deployment/udm -c udm -- \
-    curl -fsS -m 5 "http://127.0.0.1:${NES_METRICS_PORT}/metrics" 2>&1)"
+  # Read in the udm container itself: the gauges are on its loopback. curl is in
+  # the core image (Dockerfile.core); wget is the fallback, and with neither the
+  # check says so rather than reporting missing gauges (#1333 review).
+  NES_URL="http://127.0.0.1:${NES_METRICS_PORT}/metrics"
+  NES_OUT="$("${KUBECTL[@]}" exec deployment/udm -c udm -- sh -c "
+    if command -v curl >/dev/null 2>&1; then curl -fsS -m 5 '${NES_URL}'
+    elif command -v wget >/dev/null 2>&1; then wget -qO- -T 5 '${NES_URL}'
+    else echo 'no curl or wget in the udm image'; fi" 2>&1)"
   if grep -q '^energy_consumption_watts{' <<<"${NES_OUT}"; then
     pass "UDM NES gauges on 127.0.0.1:${NES_METRICS_PORT}: $(grep -m1 '^energy_consumption_watts{' <<<"${NES_OUT}")"
   else
@@ -272,10 +278,29 @@ if [[ "${PROFILE}" == 6g ]]; then
   # upfd compute-aware-upf: the UPF's PFCP Heartbeat Requests carry Load
   # Control Information (IE 51), which the SMF's selection reads. Captured on
   # the SMF pod for two heartbeat periods (the UPF sends one every 10 s).
+  #
+  # The capture has to run in the smf pod's network namespace, so it is an
+  # ephemeral container, which Kubernetes never removes. One is REUSED while it
+  # runs (CAPTURE_TTL, a day by default), so repeated runs add one per day per
+  # smf pod rather than one per run (#1333 review); a rollout clears them.
   SMF_POD="$(running_pod app.kubernetes.io/name=smf)"
-  CAP="e2e-6g-pfcp-$(date +%s)"
-  if [[ -n "${SMF_POD}" ]] && "${KUBECTL[@]}" debug "${SMF_POD}" --target=smf --profile=netadmin \
-       --image="${DEBUG_IMAGE}" --container="${CAP}" -- sleep 120 >/dev/null 2>&1; then
+  CAPTURE_TTL="${CAPTURE_TTL:-86400}"
+  CAP="$("${KUBECTL[@]}" get pod "${SMF_POD}" -o json 2>/dev/null | python3 -c '
+import json, sys
+st = json.load(sys.stdin).get("status", {}).get("ephemeralContainerStatuses", [])
+up = [c["name"] for c in st if c["name"].startswith("e2e-6g-pfcp") and "running" in c.get("state", {})]
+print(up[0] if up else "")' 2>/dev/null)"
+  attached=false
+  if [[ -n "${CAP}" ]]; then
+    attached=true
+    echo "reusing capture container ${CAP} on ${SMF_POD}"
+  elif [[ -n "${SMF_POD}" ]]; then
+    CAP="e2e-6g-pfcp-$(date +%s)"
+    "${KUBECTL[@]}" debug "${SMF_POD}" --target=smf --profile=netadmin \
+      --image="${DEBUG_IMAGE}" --container="${CAP}" -- sleep "${CAPTURE_TTL}" >/dev/null 2>&1 \
+      && attached=true
+  fi
+  if "${attached}"; then
     for _ in $(seq 1 60); do
       st="$("${KUBECTL[@]}" get pod "${SMF_POD}" \
         -o jsonpath="{.status.ephemeralContainerStatuses[?(@.name=='${CAP}')].state.running.startedAt}")"
