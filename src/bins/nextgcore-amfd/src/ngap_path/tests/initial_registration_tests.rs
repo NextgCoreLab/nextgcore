@@ -182,6 +182,7 @@ async fn an_initial_registration_releases_the_sessions_of_the_earlier_registrati
     let _env = AusfEnvGuard::acquire(ausf_port).await;
     let mut server = capturing_ngap_server().await;
     let (old, new) = (7_774_001u64, 7_774_002u64);
+    let successes = super::metrics_tests::scraped("amf_auth_success_total");
     earlier_registration(
         &mut server,
         old,
@@ -230,6 +231,9 @@ async fn an_initial_registration_releases_the_sessions_of_the_earlier_registrati
         1,
         "the subscriber resolves to one context"
     );
+    // #1334: the confirmed 5G-AKA is counted (REVERT-VERIFIED: without
+    // `observe_authentication_success` this fails).
+    assert!(super::metrics_tests::scraped("amf_auth_success_total") >= successes + 1.0);
 }
 
 /// An earlier context still CM-CONNECTED on another RAN UE NGAP ID: its N2
@@ -326,6 +330,7 @@ async fn a_failed_authentication_keeps_the_earlier_registration() {
     let _env = AusfEnvGuard::acquire(ausf_port).await;
     let mut server = capturing_ngap_server().await;
     let (old, new) = (7_774_031u64, 7_774_032u64);
+    let rejects = super::metrics_tests::scraped(r#"amf_auth_failure_total{source="network"}"#);
     earlier_registration(&mut server, old, 71, supi, true, &[(1, "774-f1")], smf_port);
     authenticating_ue(
         &mut server,
@@ -342,6 +347,12 @@ async fn a_failed_authentication_keeps_the_earlier_registration() {
     assert_eq!(released_refs(&seen), Vec::<String>::new());
     assert!(server.ue_auth_state.contains(old));
     assert_eq!(session_state(&server, old), (1, 1));
+    // #1334: the Authentication Reject sent is a network-side authentication failure
+    // (REVERT-VERIFIED: without `observe_downlink_nas` in `send_nas_pdu` this fails).
+    assert!(
+        super::metrics_tests::scraped(r#"amf_auth_failure_total{source="network"}"#)
+            >= rejects + 1.0
+    );
 }
 
 /// Only an INITIAL registration supersedes: a mobility registration update that

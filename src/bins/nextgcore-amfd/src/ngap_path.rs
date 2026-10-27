@@ -862,6 +862,15 @@ impl UeNasContext {
     }
 }
 
+/// The UE census `/metrics` reports (#1334): (RM-REGISTERED, CM-CONNECTED) UEs in
+/// the live store. A UE restored from the context store after a restart has no NG
+/// association, so it is never CM-CONNECTED until it comes back.
+pub(crate) fn ue_census(store: &crate::ue_store::UeStore<UeNasContext>) -> (usize, usize) {
+    let registered = store.count_matching(|s| s.registered);
+    let connected = store.count_matching(|s| !s.cm_idle && !s.restored);
+    (registered, connected)
+}
+
 impl crate::ue_store::UeIdentity for UeNasContext {
     fn amf_ue(&self) -> &AmfUe {
         &self.amf_ue
@@ -1816,6 +1825,7 @@ impl NgapServer {
 
     /// Poll for incoming NGAP messages and server events
     pub async fn poll(&mut self) -> Result<bool> {
+        self.publish_gnb_census().await;
         self.process_local_timers().await?;
 
         // Keep the RAN's view of overload in step with the NAS congestion posture.
@@ -2043,6 +2053,8 @@ impl NgapServer {
             log::warn!("NGAP message too short from association {association_id}");
             return Ok(());
         }
+        // #1334: every NGAP PDU received, by procedure and outcome.
+        crate::metrics::observe_ngap(crate::metrics::NgapDirection::Rx, data);
 
         // Log raw message header for debugging
         log::debug!(
@@ -4042,6 +4054,8 @@ impl NgapServer {
         // initial NAS message (InitialUEMessage). Drives the §4.4.6 gate.
         integrity_protected: bool,
     ) -> Result<()> {
+        // #1334: every Registration Request reaches this handler once.
+        crate::metrics::observe_registration_request(nas);
         let Some(req) = parse_registration_request_pdu(nas) else {
             log::error!("Malformed Registration Request: rejecting (#96)");
             let reject =
@@ -5272,6 +5286,7 @@ impl NgapServer {
             .await?;
             return Ok(());
         }
+        crate::metrics::observe_authentication_success();
 
         // #361: 5G-AKA has succeeded, so an emergency registration held for this UE is an
         // AUTHENTICATED one -- promoted here rather than guessed at the Registration Request,
@@ -5495,6 +5510,8 @@ impl NgapServer {
     ) -> Result<()> {
         let cause = nas.get(3).copied().unwrap_or(0);
         log::warn!("Authentication Failure from UE {amf_ue_ngap_id}: 5GMM cause #{cause}");
+        // #1334: TS 28.552 AMF.AuthFail, "on receipt of AUTHENTICATION FAILURE".
+        crate::metrics::observe_ue_authentication_failure();
 
         // Authentication failure parameter (IEI 0x30, TLV, AUTS 14 bytes)
         let mut auts: Option<[u8; 14]> = None;
@@ -12660,6 +12677,9 @@ impl NgapServer {
         )
         .ok_or_else(|| anyhow::anyhow!("Failed to build Downlink NAS Transport"))?;
         self.send_to_association(association_id, &pdu).await?;
+        // #1334: an unprotected 5GMM message is counted here, once it is on the wire
+        // (a protected one was counted when NAS security protected it, and is skipped).
+        crate::metrics::observe_downlink_nas(nas);
         Ok(pdu)
     }
 
@@ -19337,6 +19357,18 @@ impl NgapServer {
 
     /// Send message to a gNB by association ID
     /// NOTE: This method requires &mut self to access the SCTP server
+    /// Publish the gNB census for `/metrics` (#1334): this loop owns the associations,
+    /// so it is the one place their count is read. Every poll, so the gauge is at
+    /// most one poll old.
+    async fn publish_gnb_census(&self) {
+        let sessions = self.sessions.read().await;
+        let ng_setup = sessions
+            .values()
+            .filter(|s| s.gnb.state.ng_setup_success)
+            .count();
+        crate::metrics::set_gnb_census(sessions.len(), ng_setup);
+    }
+
     async fn send_to_association(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
         log::debug!(
             "Sending {} bytes to association {}",
@@ -19353,13 +19385,17 @@ impl NgapServer {
         #[cfg(test)]
         if let Some(sent) = self.sent_ngap.as_mut() {
             sent.push((association_id, stream_id, data.to_vec()));
+            crate::metrics::observe_ngap(crate::metrics::NgapDirection::Tx, data);
             return Ok(());
         }
 
         self.transport
             .send(association_id, stream_id, data)
             .await
-            .map_err(|e| anyhow::anyhow!("SCTP send error: {e}"))
+            .map_err(|e| anyhow::anyhow!("SCTP send error: {e}"))?;
+        // #1334: every NGAP PDU that left, by procedure and outcome.
+        crate::metrics::observe_ngap(crate::metrics::NgapDirection::Tx, data);
+        Ok(())
     }
 
     /// The SCTP stream an NGAP PDU goes out on (TS 38.412 §7, #813).
@@ -21586,6 +21622,8 @@ mod tests {
     /// Handler-level tests asserting what amfd SENDS (#760, ...), in their own file.
     mod handler_tests;
     mod initial_registration_tests;
+    /// #1334: the `/metrics` counters follow the NGAP and NAS on the wire.
+    mod metrics_tests;
     mod off_task_smf_tests;
     mod poll_wake_tests;
     mod positioning_reach_tests;

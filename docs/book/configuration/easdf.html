@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e91a4036.js";
+            window.path_to_searchindex_js = "../searchindex-f1de496b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -242,12 +242,12 @@ the <code>easdf.dns.udp_*</code> keys below are ignored.</li>
 </thead>
 <tbody>
 <tr><td><code>easdf.enabled</code></td><td><code>false</code></td><td>Start the NF. Also settable with <code>--enabled</code>.</td></tr>
-<tr><td><code>easdf.sbi.server[0].address</code> / <code>.port</code></td><td><code>0.0.0.0</code> / <code>7818</code></td><td>SBI bind. Overrides <code>--sbi-addr</code> / <code>--sbi-port</code>.</td></tr>
+<tr><td><code>easdf.sbi.server[0].address</code> / <code>.port</code></td><td><code>127.0.0.1</code> (loopback, #1308) / <code>7818</code></td><td>SBI bind. Overrides <code>--sbi-addr</code> / <code>--sbi-port</code>. The NRF NFProfile gets <code>--sbi-advertise</code>, else <code>NEXTGCORE_SBI_ADVERTISE</code>, else this address when it is not a wildcard; with none, NRF registration is skipped and logged (#1322).</td></tr>
 <tr><td><code>easdf.sbi.client.nrf[0].uri</code></td><td><code>http://127.0.0.1:7777</code></td><td>NRF for registration and heartbeat. Overrides <code>--nrf-uri</code>.</td></tr>
 <tr><td><code>easdf.eas_map[].fqdn</code> / <code>.addresses</code></td><td><em>(empty)</em></td><td>Static edge FQDN → EAS address map.</td></tr>
 <tr><td><code>easdf.dns.miss_action</code></td><td><code>nxdomain</code></td><td><code>forward</code> or <code>nxdomain</code>. <code>forward</code> without <code>upstream</code> warns and falls back to <code>nxdomain</code>.</td></tr>
 <tr><td><code>easdf.dns.upstream</code></td><td><em>(none)</em></td><td>Upstream DNS server. Reported as <code>FORWARD</code> to SBI callers, and <strong>dialled</strong> by the UDP plane.</td></tr>
-<tr><td><code>easdf.dns.udp_address</code></td><td><code>0.0.0.0</code></td><td>UDP listener bind address. <code>dns-udp</code> only; overrides <code>--dns-udp-addr</code>.</td></tr>
+<tr><td><code>easdf.dns.udp_address</code></td><td><code>127.0.0.1</code> (loopback, #1308)</td><td>UDP listener bind address. <code>dns-udp</code> only; overrides <code>--dns-udp-addr</code>.</td></tr>
 <tr><td><code>easdf.dns.udp_port</code></td><td><code>53</code></td><td>UDP listener port. <code>dns-udp</code> only; overrides <code>--dns-udp-port</code>.</td></tr>
 </tbody>
 </table>

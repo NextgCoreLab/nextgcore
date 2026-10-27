@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e91a4036.js";
+            window.path_to_searchindex_js = "../searchindex-f1de496b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -231,7 +231,8 @@ ucmf:
 <tbody>
 <tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/ucmf.yaml</code></td><td>Configuration file path.</td></tr>
 <tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
-<tr><td><code>--sbi-addr</code> / <code>--sbi-port</code></td><td>string / u16</td><td><code>0.0.0.0</code> / <code>7777</code></td><td>SBI bind address and port.</td></tr>
+<tr><td><code>--sbi-addr</code> / <code>--sbi-port</code></td><td>string / u16</td><td><code>127.0.0.1</code> (loopback, #1308) / <code>7777</code></td><td>SBI bind address and port.</td></tr>
+<tr><td><code>--sbi-advertise</code></td><td>string</td><td>unset</td><td>The host in the apiRoot (<code>Location</code> headers, resource URIs) and the NRF NFProfile (#1322). Then <code>NEXTGCORE_SBI_ADVERTISE</code>, then <code>--sbi-addr</code> when it is not a wildcard. A wildcard is never advertised: with a wildcard bind and nothing to advertise, ucmfd refuses to start.</td></tr>
 <tr><td><code>--tls</code>, <code>--tls-cert</code>, <code>--tls-key</code></td><td>flag, path, path</td><td>off</td><td>TLS on the SBI listener.</td></tr>
 <tr><td><code>--nrf-uri</code></td><td>string</td><td><code>http://127.0.0.1:7777</code></td><td>NRF base URI, used when the YAML names none.</td></tr>
 <tr><td><code>--version-id</code></td><td>string</td><td>from YAML</td><td>Overrides <code>ucmf.version_id</code>.</td></tr>

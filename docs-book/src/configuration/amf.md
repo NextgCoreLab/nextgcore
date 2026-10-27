@@ -100,6 +100,8 @@ Cargo features: `kernel-sctp` (enables `--sctp-backend kernel`; the Docker build
 | `AMF_NAS_SECURITY` | Overrides `amf.nas.use_nextgcore_security` (truthy: `1`/`true`/`yes`). |
 | `NEXTGCORE_SBI_OAUTH2_REQUIRE` | Overrides `sbi.oauth2.require` (truthy: `1`/`true`/`TRUE`/`yes`); useful for docker overlays without editing the YAML. |
 | `AMF_EMERGENCY_ALLOW_UNAUTHENTICATED` | Overrides `amf.emergency.allow_unauthenticated` (truthy: `1`/`true`/`yes`/`on`). Any other value — including an empty one — reads as **disabled** rather than falling back to the YAML or the default, so a typo in a regulatory setting fails visibly instead of silently reverting. |
+| `AMF_METRICS_PORT` | Port of the Prometheus `/metrics` endpoint (#1334), default `9090`. |
+| `NEXTGCORE_METRICS_BIND` | Host the unauthenticated `/metrics` listener binds to, default `127.0.0.1` (#837). The compose file and manifests set `0.0.0.0` inside the private container/pod network and publish no host port. |
 | `AMF_SBI_ADDR` / `AMF_SBI_PORT` | Namf SBI bind address, else `amf.sbi.server[0]`, else `127.0.0.1:7777` (#1311). |
 | `NEXTGCORE_SBI_ADVERTISE` | The host in the NRF NFProfile and every callback URI (#1322). Else `amf.sbi.server[0].advertise`, else the bind when it is not a wildcard. Before, the callbacks used `AMF_SBI_ADDR` or `127.0.0.1` even when the YAML set the bind. A wildcard is never advertised: with a wildcard bind and nothing to advertise, amfd refuses to start. |
 | `NRF_URI` | NRF URI; when set it is written into the SBI context when the SBI opens, overriding `sbi.client.nrf`. |
@@ -131,7 +133,7 @@ Cargo features: `kernel-sctp` (enables `--sctp-backend kernel`; the Docker build
 - **PLMN flexibility:** `mcc`/`mnc` accept YAML strings or integers; a 2-digit MNC is encoded with the filler digit per standard PLMN encoding.
 - **Empty security lists:** if `security` is omitted, the integrity/ciphering preference lists in the AMF context stay empty; supply explicit orders (as in the example) for deterministic algorithm selection.
 - **Multiple NRF entries** in `sbi.client.nrf` are parsed but only the first is used — additional entries are currently inert.
-- `amf.ngap.server[0]` and `amf.sbi.server[0]` are the NGAP and SBI listen addresses (#1311). `--ngap-addr` and `AMF_SBI_ADDR`/`AMF_SBI_PORT` override them; with neither, loopback (#1308). There is no `amf.metrics.server` (#1312).
+- `amf.ngap.server[0]` and `amf.sbi.server[0]` are the NGAP and SBI listen addresses (#1311). `--ngap-addr` and `AMF_SBI_ADDR`/`AMF_SBI_PORT` override them; with neither, loopback (#1308). There is no `amf.metrics.server` (#1312); the metrics endpoint is `NEXTGCORE_METRICS_BIND`:`AMF_METRICS_PORT`.
 
 ## Unauthenticated emergency service
 

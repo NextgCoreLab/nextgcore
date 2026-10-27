@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e91a4036.js";
+            window.path_to_searchindex_js = "../searchindex-f1de496b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -245,9 +245,9 @@ sgwu:
 <tr><th>Variable</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>SGWU_GTPU_BIND</code></td><td><code>0.0.0.0:2152</code></td><td>GTP-U bind address:port.</td></tr>
+<tr><td><code>SGWU_GTPU_BIND</code></td><td><code>127.0.0.1:2152</code> (loopback, #1308)</td><td>GTP-U bind address:port.</td></tr>
 <tr><td><code>SGWU_GTPU_ADVERTISE</code></td><td>unset</td><td>IPv4 advertised in UP-allocated F-TEIDs; consulted only when the bound address is a wildcard.</td></tr>
-<tr><td><code>PFCP_BIND_ADDR</code></td><td><code>0.0.0.0:8805</code></td><td>Sxa PFCP bind address:port.</td></tr>
+<tr><td><code>PFCP_BIND_ADDR</code></td><td><code>127.0.0.1:8805</code> (loopback, #1308)</td><td>Sxa PFCP bind address:port.</td></tr>
 <tr><td><code>PFCP_NODE_IP</code></td><td><code>sgwu.pfcp.server[0].address</code>, then loopback</td><td>PFCP Node ID.</td></tr>
 <tr><td><code>SGWU_GTPU_ECHO_INTERVAL_SECS</code></td><td><code>60</code></td><td>GTP-U Echo interval toward peers; <code>0</code> disables path probing.</td></tr>
 <tr><td><code>SGWU_GTPU_N3_REQUESTS</code></td><td><code>3</code></td><td>Unanswered Echoes tolerated before the path is declared down.</td></tr>

@@ -583,6 +583,9 @@ pub fn set_registered_profile(profile: &impl serde::Serialize) {
             return;
         }
     };
+    // #1334: every registering daemon calls this in its NFRegister success arm, so
+    // it is the one place the registration is counted for `/metrics`.
+    nextgcore_metrics::nf::nrf_registration_succeeded();
     match REGISTERED_PROFILE.lock() {
         Ok(mut slot) => *slot = Some(value),
         // Same posture as the instance-ID slot: bookkeeping must not take the
@@ -647,6 +650,7 @@ pub async fn reregister_self(nf_instance_id: &str) -> Result<u16, String> {
     match client.put_json(&path, &profile).await {
         Ok(resp) if resp.status == 200 || resp.status == 201 => {
             REREGISTRATIONS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            nextgcore_metrics::nf::nrf_registration_succeeded();
             Ok(resp.status)
         }
         Ok(resp) => Err(format!("NRF returned status {}", resp.status)),
@@ -670,8 +674,10 @@ pub async fn deregister_nf(nf_instance_id: &str) -> Result<(), String> {
         parse_nrf_host_port(&nrf_uri).ok_or_else(|| format!("invalid NRF URI '{nrf_uri}'"))?;
     let client = SbiClient::with_host_port(&nrf_host, nrf_port);
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
+    // #1334: deleting this process's own profile ends its registration.
+    let own = registered_nf_instance_id().as_deref() == Some(nf_instance_id);
 
-    match client.send_request(SbiRequest::delete(&path)).await {
+    let result = match client.send_request(SbiRequest::delete(&path)).await {
         // TS 29.510 §5.2.2.2.3 specifies 204; 200 is accepted too rather than
         // reported as a failure, since either means the profile is gone.
         Ok(resp) if resp.status == 204 || resp.status == 200 => Ok(()),
@@ -684,7 +690,11 @@ pub async fn deregister_nf(nf_instance_id: &str) -> Result<(), String> {
         }
         Ok(resp) => Err(format!("NRF returned status {}", resp.status)),
         Err(e) => Err(format!("NFDeregister failed: {e}")),
+    };
+    if own && result.is_ok() {
+        nextgcore_metrics::nf::nrf_registered(false);
     }
+    result
 }
 
 /// Deregister this process's own NFProfile from the NRF, for the shutdown path.
@@ -907,6 +917,9 @@ where
 
             match client.send_request(request).await {
                 Ok(resp) if resp.status == 200 || resp.status == 204 => {
+                    nextgcore_metrics::nf::nrf_heartbeat(
+                        nextgcore_metrics::nf::HeartbeatOutcome::Ok,
+                    );
                     log::debug!(
                         "Heartbeat OK for {} (status={}, load={})",
                         nf_instance_id,
@@ -923,6 +936,9 @@ where
                     if heartbeat_paused() {
                         continue;
                     }
+                    nextgcore_metrics::nf::nrf_heartbeat(
+                        nextgcore_metrics::nf::HeartbeatOutcome::NotFound,
+                    );
                     if registered_profile().is_none() {
                         if !warned_no_profile {
                             log::warn!(
@@ -948,6 +964,9 @@ where
                 // Any other status (a 5xx is an NRF fault, not a lost
                 // registration) keeps the pre-#434 behaviour.
                 Ok(resp) => {
+                    nextgcore_metrics::nf::nrf_heartbeat(
+                        nextgcore_metrics::nf::HeartbeatOutcome::Rejected,
+                    );
                     log::warn!(
                         "Heartbeat got unexpected status {} for {}",
                         resp.status,
@@ -955,6 +974,9 @@ where
                     );
                 }
                 Err(e) => {
+                    nextgcore_metrics::nf::nrf_heartbeat(
+                        nextgcore_metrics::nf::HeartbeatOutcome::TransportError,
+                    );
                     log::warn!("Heartbeat failed for {nf_instance_id}: {e}");
                 }
             }

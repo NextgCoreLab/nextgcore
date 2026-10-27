@@ -113,6 +113,14 @@ spec:
             # reads it from env directly (ngap_path.rs:5054), so it must be a
             # routable Service name or the gNB's downlink TEID never reaches
             # the SMF.
+            {{- if .Values.amf.metrics.enabled }}
+            # /metrics (#1334) defaults to 127.0.0.1 (#837); in the pod it must
+            # accept the pod IP for Prometheus. Not exposed beyond the cluster.
+            - name: NEXTGCORE_METRICS_BIND
+              value: "0.0.0.0"
+            - name: AMF_METRICS_PORT
+              value: "{{ .Values.amf.metrics.port }}"
+            {{- end }}
             - name: SMF_SBI_ADDR
               value: {{ .Release.Name }}-smf.{{ .Release.Namespace }}.svc.cluster.local
             - name: SMF_SBI_PORT

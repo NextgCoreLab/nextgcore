@@ -3182,6 +3182,7 @@ dependencies = [
  "hyper-util",
  "log",
  "nextgcore-core",
+ "nextgcore-metrics",
  "p256",
  "proptest",
  "quinn",
