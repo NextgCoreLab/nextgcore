@@ -1201,6 +1201,51 @@ mod tests {
         assert_eq!(admitted, Some(MAX_SBI_OPERATIONS_PER_SERVICE));
     }
 
+    /// #1367 review: only a 2xx admits a template. A redirect or an informational
+    /// answer proves nothing about the resource (a catch-all redirect would admit every
+    /// client path), so a fresh template answered 3xx stays `unmatched`, and is named
+    /// once a 2xx comes.
+    ///
+    /// REVERT-VERIFIED: with the admission test back at `status >= 400`, the 3xx
+    /// admits `GET madeup-redirected` and this fails.
+    #[test]
+    fn a_3xx_answer_admits_no_operation_label() {
+        for status in [301, 302, 307, 100] {
+            record_sbi_request(
+                "GET",
+                "/nmbsmf-tmgi/v1/madeup-redirected",
+                status,
+                Duration::ZERO,
+            );
+        }
+        let admitted = |op: &str| {
+            sbi_registry()
+                .admitted
+                .read()
+                .unwrap()
+                .get("nmbsmf-tmgi")
+                .is_some_and(|o| o.contains_key(op))
+        };
+        assert!(
+            !admitted("GET madeup-redirected"),
+            "a 3xx/1xx admits nothing"
+        );
+        let mut out = String::new();
+        render_sbi(&mut out);
+        assert!(
+            out.contains(r#"service="nmbsmf-tmgi",operation="unmatched",status="302""#),
+            "{out}"
+        );
+        assert!(!out.contains("madeup-redirected"), "{out}");
+        record_sbi_request(
+            "GET",
+            "/nmbsmf-tmgi/v1/madeup-redirected",
+            200,
+            Duration::ZERO,
+        );
+        assert!(admitted("GET madeup-redirected"), "a 2xx admits it");
+    }
+
     /// Recording from many threads at once loses no count (atomics, shared locks).
     #[test]
     fn concurrent_recording_counts_every_request() {

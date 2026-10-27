@@ -365,6 +365,38 @@ jobs:
           echo "$out" | grep -q 'amf.replicas > 1 is not supported' \
             || { echo "failed for another reason: $out"; exit 1; }
 
+  observability:
+    # #1334: a Prometheus rule or Grafana panel on a series no NF exports never
+    # fires / is always empty, and looks like coverage. Every series a shipped
+    # rule or dashboard queries must appear in an NF's exposition code, and the
+    # rule and scrape files must pass promtool.
+    name: Observability series
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyYAML
+        run: python3 -m pip install pyyaml
+      - name: Every queried series is exported by some NF
+        run: python3 deploy/observability/check_metric_series.py
+      - name: promtool check rules and config
+        run: |
+          set -euo pipefail
+          # The same image the compose stack runs; no network for the check.
+          img=prom/prometheus:v2.51.0
+          cfg=docker/rust/configs/observability
+          docker run --rm --network none -v "$PWD/$cfg":/cfg:ro -w /cfg \
+            --entrypoint promtool "$img" check rules alert-rules.yml
+          docker run --rm --network none -v "$PWD/$cfg":/cfg:ro -w /cfg \
+            --entrypoint promtool "$img" check config prometheus.yml
+          # The Kind/EKS scrape config lives in a ConfigMap.
+          mkdir -p "$RUNNER_TEMP/k8s-prom"
+          python3 -c 'import sys, yaml; d = [x for x in yaml.safe_load_all(open("k8s/monitoring/prometheus.yaml")) if x and x.get("kind") == "ConfigMap"][0]; open(sys.argv[1], "w").write(d["data"]["prometheus.yml"])' "$RUNNER_TEMP/k8s-prom/prometheus.yml"
+          docker run --rm --network none -v "$RUNNER_TEMP/k8s-prom":/cfg:ro -w /cfg \
+            --entrypoint promtool "$img" check config prometheus.yml
+
   release-images:
     # #420: release.yml publishes exactly docker/release-images.json. A new NF
     # daemon, Dockerfile or deployed image that is not in that list (or in its
@@ -789,6 +821,33 @@ jobs:
           curl -sf http://172.23.0.10:7777/healthz || echo "NRF not responding"
           echo "=== AMF health ==="
           curl -sf http://172.23.0.5:7777/healthz || echo "AMF not responding"
+
+      # #1334: every scrape target the shipped Prometheus config names serves
+      # /metrics. A gate, with a bounded wait rather than a sleep: each NF opens its
+      # listener right after its SBI server, inside the compose network (nothing is
+      # published on the host; the runner reaches the bridge addresses directly).
+      - name: Every NF serves /metrics (all scrape targets up)
+        run: |
+          set -euo pipefail
+          # job:address:series that proves it is that NF's exposition
+          targets="nrf:172.23.0.10:nrf_registered_nf_count ausf:172.23.0.11:ausf_ue_authentication_contexts
+            udm:172.23.0.12:udm_ue_contexts udr:172.23.0.20:udr_ue_contexts
+            pcf:172.23.0.13:pcf_policy_associations nssf:172.23.0.14:nssf_nssai_availability_nfs
+            bsf:172.23.0.15:bsf_pcf_bindings amf:172.23.0.5:amf_registered_ue_count
+            smf:172.23.0.4:smf_up upf:172.23.0.7:upf_up"
+          failed=0
+          for t in $targets; do
+            IFS=: read -r nf addr series <<< "$t"
+            ok=false
+            for _ in $(seq 1 30); do
+              if curl -sf --max-time 3 "http://$addr:9090/metrics" | grep -q "^$series"; then
+                ok=true; break
+              fi
+              sleep 2
+            done
+            if $ok; then echo "$nf: /metrics up ($series)"; else echo "$nf: /metrics DOWN at $addr:9090"; failed=1; fi
+          done
+          exit $failed
 
       # ====================================================================
       # Issue #397: the Namf_EventExposure DELIVERY assertion.

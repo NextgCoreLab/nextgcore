@@ -61,20 +61,13 @@ groups:
 
   - name: nextgcore_smf_alerts
     rules:
-      # PDU session establishment failure rate
-      - alert: SmfHighSessionFailureRate
-        expr: rate(smf_session_failure_total[5m]) / (rate(smf_session_success_total[5m]) + rate(smf_session_failure_total[5m])) > 0.05
-        for: 5m
-        labels:
-          severity: warning
-          nf_type: SMF
-        annotations:
-          summary: "SMF session establishment failure rate > 5%"
-          description: "Session failure rate is {{ $value | humanizePercentage }}."
+      # (#1334) No PDU session establishment failure-rate rule: smfd exports no
+      # session success/failure counters yet, and a rule on series no process
+      # emits never fires (#1368). smfd's session census is smf_sessions.
 
-      # PFCP association down
+      # PFCP association down: N4 peers are configured and none is associated.
       - alert: SmfPfcpAssociationDown
-        expr: smf_pfcp_association_up == 0
+        expr: smf_n4_peers > 0 and smf_n4_associations == 0
         for: 30s
         labels:
           severity: critical
@@ -87,7 +80,7 @@ groups:
     rules:
       # High packet drop rate
       - alert: UpfHighDropRate
-        expr: rate(upf_packets_dropped_total[5m]) / rate(upf_packets_total[5m]) > 0.01
+        expr: rate(upf_dataplane_dropped_packets_total[5m]) / (rate(upf_dataplane_ul_packets_total[5m]) + rate(upf_dataplane_dl_packets_total[5m]) + rate(upf_dataplane_dropped_packets_total[5m])) > 0.01
         for: 5m
         labels:
           severity: warning
@@ -96,9 +89,9 @@ groups:
           summary: "UPF packet drop rate > 1%"
           description: "Drop rate is {{ $value | humanizePercentage }}."
 
-      # GTP-U tunnel errors
+      # GTP-U tunnel errors: G-PDUs dropped as malformed or for an unknown TEID.
       - alert: UpfGtpTunnelErrors
-        expr: rate(upf_gtp_error_total[5m]) > 5
+        expr: sum by (job, instance, nf_type) (rate(upf_dataplane_dropped_packets_by_reason_total{reason=~"malformed_gtpu|unknown_teid"}[5m])) > 5
         for: 3m
         labels:
           severity: warning
@@ -133,15 +126,8 @@ groups:
 
   - name: nextgcore_infrastructure
     rules:
-      # MongoDB down
-      - alert: MongoDbDown
-        expr: mongodb_up == 0
-        for: 30s
-        labels:
-          severity: critical
-        annotations:
-          summary: "MongoDB is down"
-          description: "MongoDB instance is unreachable."
+      # (#1334) No MongoDB rule: the stack runs no MongoDB exporter, so
+      # mongodb_up is a series no target emits (#1369).
 
       # High memory usage
       - alert: NfHighMemoryUsage
