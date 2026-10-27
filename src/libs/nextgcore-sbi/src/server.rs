@@ -2891,14 +2891,16 @@ mod tcp_probe_tests {
             .await
             .expect("probe connects");
         let prober = probe.local_addr().expect("probe address");
+        // A watch, registered before the close that logs: the shared capture
+        // buffer evicts under parallel trace output (#1360).
+        let watch = nextgcore_core::test_log::watch(format!("with {prober} "));
         drop(probe); // FIN, no preface: a kubelet tcpSocket probe
 
-        let needle = format!("with {prober} ");
         let records = crate::test_support::poll_until(
             Duration::from_secs(5),
             Duration::from_millis(20),
             || {
-                let found = nextgcore_core::test_log::captured(&needle);
+                let found = watch.records();
                 async move { (!found.is_empty()).then_some(found) }
             },
         )
@@ -2924,9 +2926,10 @@ mod accept_path_tests {
     use crate::server::{SbiServer, SbiServerConfig};
     use std::time::Duration;
 
-    async fn records_matching(needle: &str) -> Vec<String> {
+    /// The watch's records, once at least one has arrived (5 s budget).
+    async fn records_matching(watch: &nextgcore_core::test_log::Watch) -> Vec<String> {
         crate::test_support::poll_until(Duration::from_secs(5), Duration::from_millis(20), || {
-            let found = nextgcore_core::test_log::captured(needle);
+            let found = watch.records();
             async move { (!found.is_empty()).then_some(found) }
         })
         .await
@@ -2978,19 +2981,17 @@ mod accept_path_tests {
             .await
             .expect("probe connects");
         let prober = probe.local_addr().expect("probe address");
+        // A watch, registered before the close that logs: the shared capture
+        // buffer evicts under parallel trace output (#1360).
+        let watch = nextgcore_core::test_log::watch(format!("from {prober}"));
         drop(probe); // FIN, no ClientHello: a kubelet tcpSocket probe
 
-        // Not `len() == 1`: the shared capture log evicts its older half when
-        // full, and parallel tests can fill it. Assert on what survives instead.
-        let records = records_matching(&format!("from {prober}")).await;
+        let records = records_matching(&watch).await;
+        assert_eq!(records.len(), 1, "one TLS-accept record: {records:?}");
         assert!(
-            !records.is_empty(),
-            "premise: the probe's accept was logged"
-        );
-        assert!(
-            records.iter().all(|r| r.starts_with("DEBUG ")
-                && r.contains(&format!("SBI server TLS accept from {prober}"))
-                && r.contains("peer closed before the handshake")),
+            records[0].starts_with("DEBUG ")
+                && records[0].contains(&format!("SBI server TLS accept from {prober}"))
+                && records[0].contains("peer closed before the handshake"),
             "a probe on an https port is an orderly close, not a warning: {records:?}"
         );
         server.stop().await.expect("stop");
@@ -3029,6 +3030,10 @@ mod accept_path_tests {
         socket2::SockRef::from(&listener)
             .shutdown(std::net::Shutdown::Read)
             .expect("shut the listener's read side");
+        // A watch, registered before the loop starts failing: the shared
+        // capture buffer evicts under parallel trace output, which once left a
+        // single record of eight in CI (#1342, #1360).
+        let watch = nextgcore_core::test_log::watch(format!("SBI server on {addr}: accept failed"));
         let server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
         server
             .start(|_req: SbiRequest| async { SbiResponse::with_status(200) })
@@ -3036,14 +3041,14 @@ mod accept_path_tests {
             .expect("start");
 
         tokio::time::sleep(Duration::from_millis(1_400)).await;
-        // Read the loop's own "(k in a row" counter from the NEWEST matching
-        // record rather than counting records: the shared capture log evicts
-        // its older half when full, and parallel tests' trace output can fill it
-        // inside this window (that failed CI once with 1 surviving record).
-        let needle = format!("SBI server on {addr}: accept failed");
-        let newest = nextgcore_core::test_log::captured(&needle)
+        let warns: Vec<String> = watch
+            .records()
             .into_iter()
-            .rfind(|r| r.starts_with("WARN "))
+            .filter(|r| r.starts_with("WARN "))
+            .collect();
+        let newest = warns
+            .last()
+            .cloned()
             .expect("premise: accept() fails on a shut-down listener");
         let in_a_row: u32 = newest
             .split_once(" in a row")
@@ -3057,6 +3062,11 @@ mod accept_path_tests {
         assert!(
             in_a_row <= 10,
             "accept errors are paced, not spun: {in_a_row} errors in 1.4 s"
+        );
+        assert_eq!(
+            warns.len() as u32,
+            in_a_row,
+            "one warn per accept error, none lost: {warns:?}"
         );
 
         // stop() waits for the accept task to exit, and the task is now about

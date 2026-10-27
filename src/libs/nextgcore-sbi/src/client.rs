@@ -3217,11 +3217,18 @@ mod tests {
         (addr, kill)
     }
 
-    /// Every captured record containing `needle` (`"with <peer> "`, so port
-    /// 4567 never matches 45678), once at least one does.
-    async fn conn_end_records(needle: &str) -> Vec<String> {
+    /// Watch the connection-end records for `peer`. The needle is
+    /// `"with <peer> "`, so port 4567 never matches 45678. A watch, not
+    /// `captured`: the shared capture buffer evicts under parallel trace output,
+    /// and that is what made these tests flake (#1360).
+    fn watch_conn_end(peer: &str) -> nextgcore_core::test_log::Watch {
+        nextgcore_core::test_log::watch(format!("with {peer} "))
+    }
+
+    /// The watch's records, once at least one has arrived (5 s budget).
+    async fn conn_end_records(watch: &nextgcore_core::test_log::Watch) -> Vec<String> {
         crate::test_support::poll_until(Duration::from_secs(5), Duration::from_millis(20), || {
-            let found = nextgcore_core::test_log::captured(needle);
+            let found = watch.records();
             async move { (!found.is_empty()).then_some(found) }
         })
         .await
@@ -3238,6 +3245,8 @@ mod tests {
             "premise: the capture logger"
         );
         let (addr, kill) = one_connection_peer(false).await;
+        let peer = format!("127.0.0.1:{}", addr.port());
+        let watch = watch_conn_end(&peer);
         let client = SbiClient::new(SbiClientConfig::new("127.0.0.1", addr.port()));
         let res = client
             .send_request(SbiRequest::get("/x"))
@@ -3246,8 +3255,7 @@ mod tests {
         assert_eq!(res.status, 200);
         let _ = kill.send(());
 
-        let peer = format!("127.0.0.1:{}", addr.port());
-        let records = conn_end_records(&format!("with {peer} ")).await;
+        let records = conn_end_records(&watch).await;
         assert_eq!(records.len(), 1, "one connection-end record: {records:?}");
         assert!(
             records[0].starts_with("DEBUG ")
@@ -3266,6 +3274,8 @@ mod tests {
             "premise: the capture logger"
         );
         let (addr, kill) = one_connection_peer(true).await;
+        let peer = format!("127.0.0.1:{}", addr.port());
+        let watch = watch_conn_end(&peer);
         let client = SbiClient::new(SbiClientConfig::new("127.0.0.1", addr.port()));
         let res = client
             .send_request(SbiRequest::get("/x"))
@@ -3274,8 +3284,7 @@ mod tests {
         assert_eq!(res.status, 200);
         let _ = kill.send(());
 
-        let peer = format!("127.0.0.1:{}", addr.port());
-        let records = conn_end_records(&format!("with {peer} ")).await;
+        let records = conn_end_records(&watch).await;
         assert_eq!(records.len(), 1, "one connection-end record: {records:?}");
         assert!(
             records[0].starts_with("WARN ")
@@ -3298,6 +3307,8 @@ mod tests {
                 SbiResponse::with_status(200)
             })
             .await;
+        let peer = format!("127.0.0.1:{}", addr.port());
+        let watch = watch_conn_end(&peer);
         let client =
             SbiClient::new(SbiClientConfig::new("127.0.0.1", addr.port()).with_pool_size(1));
         let res = client
@@ -3326,8 +3337,7 @@ mod tests {
             "premise: the client saw the server go away"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let peer = format!("127.0.0.1:{}", addr.port());
-        let records = nextgcore_core::test_log::captured(&format!("with {peer} "));
+        let records = watch.records();
         assert!(
             records.iter().all(|r| !r.starts_with("WARN ")),
             "a GOAWAY(NO_ERROR) close is not a failure: {records:?}"
@@ -3351,6 +3361,8 @@ mod tests {
                 SbiResponse::with_status(200)
             })
             .await;
+        let peer = format!("127.0.0.1:{}", addr.port());
+        let watch = watch_conn_end(&peer);
         let client =
             SbiClient::new(SbiClientConfig::new("127.0.0.1", addr.port()).with_pool_size(1));
         let res = client
@@ -3374,8 +3386,7 @@ mod tests {
             .await
             .expect("served");
         assert_eq!(res.status, 200);
-        let peer = format!("127.0.0.1:{}", addr.port());
-        let ended = nextgcore_core::test_log::captured(&format!("with {peer} "));
+        let ended = watch.records();
         assert!(ended.is_empty(), "no connection to {peer} ended: {ended:?}");
         server.stop().await.expect("stop");
     }
