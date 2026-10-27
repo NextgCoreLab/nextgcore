@@ -12,8 +12,8 @@ NextGCore ships a Docker-based observability stack (Prometheus, Grafana, Jaeger)
 
 | NF daemon | Metrics served on `/metrics` | Port |
 |---|---|---|
-| `nextgcore-smfd` | `smf_n4_associations`, `smf_n4_peers`, `smf_sessions`, `smf_up` (and the PGW-C S5/S8 binding) | 9090, or `SMF_METRICS_PORT` |
-| `nextgcore-upfd` | `upf_pfcp_associations`, `upf_pfcp_sessions`, `upf_pfcp_unauthorized_messages_total`, `upf_up`, `upf_dataplane_{ul,dl}_{packets,bytes}_total` and dropped/oversize/spoofed packet counters | 9090, or `UPF_METRICS_PORT` |
+| `nextgcore-smfd` | the shared SBI, NRF-client and process families, the PDU session establishment counters (below), `smf_n4_associations`, `smf_n4_peers`, `smf_sessions`, `smf_up` (and the PGW-C S5/S8 binding) | 9090, or `SMF_METRICS_PORT` |
+| `nextgcore-upfd` | the shared NRF-client and process families (#1368), `upf_pfcp_associations`, `upf_pfcp_sessions`, `upf_pfcp_unauthorized_messages_total`, `upf_up`, `upf_dataplane_{ul,dl}_{packets,bytes}_total` and dropped/oversize/spoofed packet counters | 9090, or `UPF_METRICS_PORT` |
 | `nextgcore-sgwud` | `sgwu_pfcp_sessions`, `sgwu_pfcp_associations`, `sgwu_pfcp_unauthorized_messages_total`, `sgwu_up` | 9090, or `SGWU_METRICS_PORT` |
 | `nextgcore-amfd` | the shared SBI, NRF-client and process families (below), and the AMF families (below) | 9090, or `AMF_METRICS_PORT` |
 | `nextgcore-nrfd` | the shared SBI and process families (it is no NRF client), and the NRF families (below) | 9090, or `NRF_METRICS_PORT` |
@@ -100,6 +100,17 @@ Recorded by the shared SBI server and NRF heartbeat worker (`nextgcore-sbi`), so
 
 The NAS counters follow TS 28.552 §5.2.2 "on transmission"/"on receipt": a protected downlink message is counted when NAS security protects it, an unprotected one when it is sent in a DOWNLINK NAS TRANSPORT, and a T3550/T3560 retransmission (a stored PDU sent again) is not counted. The Open5GS-named families still defined in the file (`fivegs_amffunction_*`, `ran_ue`, `amf_session`, `gnb`) are not served: nothing increments them.
 
+### SMF PDU session establishment (`src/bins/nextgcore-smfd/src/session_metrics.rs`, #1368)
+
+Counted at the Nsmf_PDUSession_CreateSMContext answer (TS 29.502 §5.2.2.2), modelled on TS 28.552 §5.3.1 (SM.PduSessionCreationReq / Succ / Fail.cause). An EPS→5GS handover create (§5.2.2.2.3) is a session moving in, not an establishment, and is not counted.
+
+| Metric | Type | Labels | Counts |
+|---|---|---|---|
+| `smf_session_requests_total` | counter | | establishment requests received |
+| `smf_session_success_total` | counter | | answered 201 with PDU SESSION ESTABLISHMENT ACCEPT |
+| `smf_session_failure_total` | counter | | refused (any other answer) |
+| `smf_session_failure_cause_total` | counter | `cause`: the 5GSM cause of the PDU SESSION ESTABLISHMENT REJECT (0..255, TS 24.501 §9.11.4.2), or `none` when the answer carries no N1 reject | refusals by cause |
+
 ### NRF families (`src/bins/nextgcore-nrfd/src/metrics.rs`, #1334)
 
 | Metric | Type | Labels | Counts |
@@ -153,7 +164,7 @@ No daemon reads a `metrics.server` block, and several have no metrics listener a
 
 - **Prometheus** (`prom/prometheus:v2.51.0`, container `nextgcore-prometheus`, `172.23.0.200`, host port `9090`) — config `docker/rust/configs/observability/prometheus.yml`: 15s scrape interval, static targets for 10 NFs (NRF, AUSF, UDM, UDR, PCF, NSSF, BSF, AMF, SMF, UPF) at their fixed `172.23.0.x:9090` addresses, each labeled with `nf_type` and `instance_name`, plus self-scrape. Every NF serves `/metrics` on 9090 inside the compose network (#1334), so all 10 jobs read `up == 1`; none publishes its metrics port on the host.
 - **Grafana** (`grafana/grafana:10.4.0`, `172.23.0.201`, host port `3000`, login `admin`/`nextgcore`) — provisioned datasources (`grafana-datasources.yml`: Prometheus at `http://172.23.0.200:9090`, Jaeger at `http://172.23.0.202:16686`) and dashboards from `configs/observability/dashboards/` with `overview.json` as the home dashboard.
-- **Alert rules** (`configs/observability/alert-rules.yml`): `NfInstanceDown` (`up == 0` for 1m), `NfSlowResponse`, `AmfHighRegistrationFailureRate`, `AmfHighUeCount`, `AmfAuthenticationFailureSpike`, `SmfPfcpAssociationDown` (`smf_n4_peers > 0 and smf_n4_associations == 0`), `UpfHighDropRate` and `UpfGtpTunnelErrors` (on `upf_dataplane_*`), `NrfDiscoveryFailureRate`, `NrfLowRegisteredNfs`, `NfHighMemoryUsage`. Every series they and the dashboards query is exported by some NF. The CI job *Observability series* enforces this with `deploy/observability/check_metric_series.py` and runs `promtool check rules/config` on the rule file and both scrape configs (#1334). Two earlier rules queried series no process emits and were removed: the SMF session failure rate (no session counters yet, #1368) and `MongoDbDown` (no MongoDB exporter, #1369).
+- **Alert rules** (`configs/observability/alert-rules.yml`): `NfInstanceDown` (`up == 0` for 1m), `NfSlowResponse`, `AmfHighRegistrationFailureRate`, `AmfHighUeCount`, `AmfAuthenticationFailureSpike`, `SmfHighSessionFailureRate` (`smf_session_failure_total / (success + failure) > 5%`, #1368), `SmfPfcpAssociationDown` (`smf_n4_peers > 0 and smf_n4_associations == 0`), `UpfHighDropRate` and `UpfGtpTunnelErrors` (on `upf_dataplane_*`), `NrfDiscoveryFailureRate`, `NrfLowRegisteredNfs`, `NfHighMemoryUsage`. Every series they and the dashboards query is exported by some NF. The CI job *Observability series* enforces this with `deploy/observability/check_metric_series.py` and runs `promtool check rules/config` on the rule file and both scrape configs (#1334). `MongoDbDown` queried a series no target emitted and was removed until the MongoDB exporter exists (#1369).
 
 ## Tracing (OpenTelemetry)
 
