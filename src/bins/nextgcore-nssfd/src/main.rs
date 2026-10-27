@@ -27,6 +27,7 @@ use std::time::Duration;
 
 mod context;
 mod event;
+mod metrics;
 mod nnrf_handler;
 mod nnssf_build;
 mod nnssf_handler;
@@ -599,6 +600,15 @@ async fn main() -> Result<()> {
 
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
 
+    // #1334: the Prometheus endpoint, on NEXTGCORE_METRICS_BIND (loopback by default,
+    // #837) and NSSF_METRICS_PORT (9090). Non-fatal, like smfd's.
+    let _metrics = nextgcore_metrics::nf::serve_nf_metrics(
+        "NSSF",
+        "NSSF_METRICS_PORT",
+        std::sync::Arc::new(metrics::render_prometheus),
+    )
+    .await;
+
     // Register with NRF (B24.3)
     match match sbi.registration_host() {
         Ok(host) => register_with_nrf(host, sbi.port).await,
@@ -741,6 +751,16 @@ fn split_uri(uri: &str) -> Option<(String, u16, String)> {
 
 /// SBI request handler for NSSF
 async fn nssf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
+    // #1334: NSSF operations, counted by outcome.
+    let operation = metrics::classify(&request.header.method, &request.header.uri);
+    let response = nssf_sbi_route(request).await;
+    if let Some(op) = operation {
+        metrics::observe(op, response.status);
+    }
+    response
+}
+
+async fn nssf_sbi_route(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.clone();
     let method = method.as_str();
     let uri = request.header.uri.clone();
@@ -3615,6 +3635,93 @@ mod tests {
         let configured = body["configuredNssai"].as_array().unwrap();
         assert_eq!(configured.len(), 2);
 
+        server.stop().await.expect("stop");
+    }
+
+    /// #1334: the NSSF's `/metrics`, scraped over HTTP, follows Nnssf_NSSelection
+    /// traffic over the real SBI server: a registration-time selection that succeeds
+    /// and one missing its mandatory parameters, each counted by result.
+    ///
+    /// REVERT-VERIFIED: without the `metrics::observe` in `nssf_sbi_request_handler`
+    /// the counts stay; without `render_nssf_families` the series are missing.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
+    async fn the_scraped_endpoint_follows_nsselection_traffic_1334() {
+        let _guard = context::nssf_test_guard(512);
+        with_nssf_context(|c| c.set_plmn_supported_snssais(None));
+        let (server, port) = start_nssf_server().await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        let (bound, handle) = nextgcore_metrics::nes_energy::serve_metrics(
+            "127.0.0.1:0".parse().unwrap(),
+            std::sync::Arc::new(metrics::render_prometheus),
+        )
+        .await
+        .expect("metrics endpoint");
+        let value = |b: &str, s: &str| nextgcore_metrics::nf::sample_value(b, s).unwrap_or(0.0);
+        let ok = r#"nssf_selections_total{result="success"}"#;
+        let failed = r#"nssf_selections_total{result="failure"}"#;
+        let before = nextgcore_metrics::nf::scrape_for_test(bound).await;
+        let (ok0, failed0) = (value(&before, ok), value(&before, failed));
+
+        let sir = json!({
+            "subscribedNssai": [{"subscribedSnssai": {"sst": 41}, "defaultIndication": true}],
+            "requestedNssai": [{"sst": 41}]
+        })
+        .to_string();
+        let path = format!(
+            "/nnssf-nsselection/v2/network-slice-information?nf-type=AMF&nf-id=amf-1334&slice-info-request-for-registration={}",
+            enc(&sir)
+        );
+        assert_eq!(client.get(&path).await.expect("response").status, 200);
+        let resp = client
+            .get("/nnssf-nsselection/v2/network-slice-information?nf-type=AMF")
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 400);
+
+        // #1334 review: an operation label is admitted on a 2xx, so a made-up resource
+        // of every service this NF serves must be answered with an error, or a client
+        // could mint label values.
+        for (service, version) in [
+            ("nnssf-nsselection", "v2"),
+            ("nnssf-nssaiavailability", "v1"),
+        ] {
+            for path in [
+                format!("/{service}/{version}/madeup-resource-1334"),
+                format!("/{service}/{version}/imsi-001010000000001/madeup-resource-1334"),
+            ] {
+                for request in [
+                    nextgcore_sbi::message::SbiRequest::get(&path),
+                    nextgcore_sbi::message::SbiRequest::post(&path)
+                        .with_body("{}", "application/json"),
+                ] {
+                    let resp = client.send_request(request).await.expect("answered");
+                    assert!(resp.status >= 400, "{path} answered {}", resp.status);
+                }
+            }
+        }
+        let after = nextgcore_metrics::nf::scrape_for_test(bound).await;
+        assert!(
+            !after.contains("madeup"),
+            "no made-up resource in a label: {after}"
+        );
+        assert!(value(&after, ok) >= ok0 + 1.0, "{after}");
+        assert!(value(&after, failed) >= failed0 + 1.0, "{after}");
+        for name in [
+            "nssf_nssai_availability_nfs",
+            "nssf_subscriptions",
+            "nssf_network_slice_instances",
+            "nextgcore_sbi_request_total",
+            "nextgcore_nrf_registered",
+            "nextgcore_uptime_seconds",
+            "process_resident_memory_bytes",
+        ] {
+            assert!(
+                nextgcore_metrics::nf::has_series(&after, name),
+                "{name}:\n{after}"
+            );
+        }
+        handle.abort();
         server.stop().await.expect("stop");
     }
 

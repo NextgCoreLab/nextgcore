@@ -195,6 +195,100 @@ pub fn labels(pairs: &[(&str, &str)]) -> String {
     format!("{{{}}}", body.join(","))
 }
 
+// ─── NF-specific counter families ───────────────────────────────────────────
+
+/// A counter family whose label values are `'static` strings chosen by the NF's code
+/// (an operation name, a result), never taken from a request, so its cardinality is
+/// bounded by construction.
+///
+/// Like the SBI registry, counting takes a shared read lock and an atomic increment;
+/// the write lock only the first time a label set appears.
+#[derive(Debug)]
+pub struct CounterFamily {
+    name: &'static str,
+    help: &'static str,
+    label_names: &'static [&'static str],
+    values: std::sync::RwLock<std::collections::BTreeMap<Vec<&'static str>, Arc<AtomicU64>>>,
+}
+
+impl CounterFamily {
+    /// A family `name` with `label_names`; usable in a `static`.
+    pub const fn new(
+        name: &'static str,
+        help: &'static str,
+        label_names: &'static [&'static str],
+    ) -> Self {
+        Self {
+            name,
+            help,
+            label_names,
+            values: std::sync::RwLock::new(std::collections::BTreeMap::new()),
+        }
+    }
+
+    /// Add one to the series with `label_values` (one per label name).
+    pub fn inc(&self, label_values: &[&'static str]) {
+        debug_assert_eq!(label_values.len(), self.label_names.len());
+        let counter = self
+            .values
+            .read()
+            .ok()
+            .and_then(|v| v.get(label_values).cloned());
+        let counter = match counter {
+            Some(c) => Some(c),
+            None => self
+                .values
+                .write()
+                .ok()
+                .map(|mut v| v.entry(label_values.to_vec()).or_default().clone()),
+        };
+        if let Some(c) = counter {
+            c.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The value of the series with `label_values`.
+    pub fn get(&self, label_values: &[&'static str]) -> u64 {
+        self.values
+            .read()
+            .ok()
+            .and_then(|v| v.get(label_values).map(|c| c.load(Ordering::Relaxed)))
+            .unwrap_or(0)
+    }
+
+    /// Render the family (its header even with no series yet).
+    pub fn render(&self, out: &mut String) {
+        write_header(out, self.name, "counter", self.help);
+        let Ok(values) = self.values.read() else {
+            return;
+        };
+        for (lv, n) in values.iter() {
+            let pairs: Vec<(&str, &str)> = self
+                .label_names
+                .iter()
+                .copied()
+                .zip(lv.iter().copied())
+                .collect();
+            let _ = writeln!(
+                out,
+                "{}{} {}",
+                self.name,
+                labels(&pairs),
+                n.load(Ordering::Relaxed)
+            );
+        }
+    }
+}
+
+/// `success` for a 2xx `status`, else `failure`: the `result` label value.
+pub fn result_of(status: u16) -> &'static str {
+    if (200..300).contains(&status) {
+        "success"
+    } else {
+        "failure"
+    }
+}
+
 // ─── SBI server requests ────────────────────────────────────────────────────
 
 /// Every SBI service name this tree serves or calls back on, sorted (TS 29.510
@@ -446,7 +540,7 @@ type SeriesKey = (&'static str, Arc<str>, u16);
 struct SbiRegistry {
     requests: std::sync::RwLock<HashMap<SeriesKey, Arc<RequestSeries>>>,
     durations: std::sync::RwLock<HashMap<&'static str, Arc<DurationSeries>>>,
-    /// Operations a service has answered with a non-error status: only these are
+    /// Operations a service has answered with a 2xx: only these are
     /// named in labels, so an operation template exists in the exposition only
     /// once the NF has really served it.
     admitted: std::sync::RwLock<HashMap<&'static str, HashMap<String, Arc<str>>>>,
@@ -459,11 +553,14 @@ fn sbi_registry() -> &'static SbiRegistry {
 
 /// The operation label for `template` on `service` answered with `status`.
 ///
-/// A template is admitted the first time the NF answers it with a non-error status
-/// (below 400), up to [`MAX_SBI_OPERATIONS_PER_SERVICE`] per service. Until then,
-/// and past the cap, it is `unmatched` (an error answer) or `other`. A request for a
-/// resource the NF does not serve is answered 404/405 and so never names one: every
-/// operation label is a resource this NF serves, not a client's text.
+/// A template is admitted the first time the NF answers it with a 2xx, up to
+/// [`MAX_SBI_OPERATIONS_PER_SERVICE`] per service. Until then, and past the cap, it
+/// is `unmatched` (any other answer) or `other`. A request for a resource the NF does
+/// not serve is answered 4xx and so never names one: every operation label is a
+/// resource this NF serves, not a client's text. That rests on the NFs' routers
+/// answering an unknown path with an error, which each NF's `/metrics` test checks
+/// for every service it serves (#1334 review); the per-service cap bounds it either
+/// way.
 fn operation_label(
     reg: &SbiRegistry,
     service: &'static str,
@@ -478,7 +575,7 @@ fn operation_label(
     {
         return known;
     }
-    if status >= 400 || service == "other" {
+    if !(200..300).contains(&status) || service == "other" {
         return Arc::from("unmatched");
     }
     let Ok(mut admitted) = reg.admitted.write() else {
@@ -1248,6 +1345,26 @@ mod tests {
             nf_metrics_addr_from(Some("not-an-ip"), "X_METRICS_PORT", Some("nope")),
             "127.0.0.1:9090".parse().unwrap()
         );
+    }
+
+    #[test]
+    fn a_counter_family_renders_its_series() {
+        static F: CounterFamily =
+            CounterFamily::new("x_ops_total", "ops", &["operation", "result"]);
+        F.inc(&["create", result_of(201)]);
+        F.inc(&["create", result_of(404)]);
+        F.inc(&["create", result_of(201)]);
+        let mut out = String::new();
+        F.render(&mut out);
+        assert_eq!(
+            sample_value(&out, r#"x_ops_total{operation="create",result="success"}"#),
+            Some(2.0)
+        );
+        assert_eq!(
+            sample_value(&out, r#"x_ops_total{operation="create",result="failure"}"#),
+            Some(1.0)
+        );
+        assert_eq!(F.get(&["create", "success"]), 2);
     }
 
     #[test]

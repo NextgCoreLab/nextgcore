@@ -1008,6 +1008,32 @@ mod tests {
             .expect("Namf answers");
         assert!(answer.status >= 400, "no such UE: {}", answer.status);
 
+        // #1334 review: an operation label is admitted on a 2xx, so a made-up resource
+        // of every service this NF serves must be answered with an error, or a client
+        // could mint label values.
+        for (service, version) in [
+            ("namf-comm", "v1"),
+            ("namf-evts", "v1"),
+            ("namf-mt", "v1"),
+            ("namf-loc", "v1"),
+            ("namf-callback", "v1"),
+            ("namf-mbs-comm", "v1"),
+            ("namf-mbs-bc", "v1"),
+        ] {
+            for path in [
+                format!("/{service}/{version}/madeup-resource-1334"),
+                format!("/{service}/{version}/imsi-001010000000001/madeup-resource-1334"),
+            ] {
+                for request in [
+                    nextgcore_sbi::message::SbiRequest::get(&path),
+                    nextgcore_sbi::message::SbiRequest::post(&path)
+                        .with_body("{}", "application/json"),
+                ] {
+                    let resp = client.send_request(request).await.expect("answered");
+                    assert!(resp.status >= 400, "{path} answered {}", resp.status);
+                }
+            }
+        }
         let (bound, handle) = nextgcore_metrics::nes_energy::serve_metrics(
             "127.0.0.1:0".parse().unwrap(),
             std::sync::Arc::new(render_prometheus),
@@ -1034,6 +1060,10 @@ mod tests {
         assert!(
             !body.contains("9999913340"),
             "no SUPI in the exposition: {body}"
+        );
+        assert!(
+            !body.contains("madeup"),
+            "no made-up resource in a label: {body}"
         );
         assert!(body.contains("nextgcore_build_info{nf=\"amf\""), "{body}");
         handle.abort();

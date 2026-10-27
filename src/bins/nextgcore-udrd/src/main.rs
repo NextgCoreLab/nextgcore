@@ -525,6 +525,15 @@ async fn main() -> Result<()> {
 
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
 
+    // #1334: the Prometheus endpoint, on NEXTGCORE_METRICS_BIND (loopback by default,
+    // #837) and UDR_METRICS_PORT (9090). Non-fatal, like smfd's.
+    let _metrics = nextgcore_metrics::nf::serve_nf_metrics(
+        "UDR",
+        "UDR_METRICS_PORT",
+        Arc::new(nextgcore_udrd::metrics::render_prometheus),
+    )
+    .await;
+
     // Register with NRF and start heartbeat worker
     match match sbi.registration_host() {
         Ok(host) => register_with_nrf(host, sbi.port).await,
@@ -587,6 +596,16 @@ async fn main() -> Result<()> {
 
 /// SBI request handler for UDR
 async fn udr_sbi_request_handler(request: SbiRequest) -> SbiResponse {
+    // #1334: Nudr operations, counted by outcome.
+    let operation = nextgcore_udrd::metrics::classify(&request.header.method, &request.header.uri);
+    let response = udr_sbi_route(request).await;
+    if let Some(op) = operation {
+        nextgcore_udrd::metrics::observe(op, response.status);
+    }
+    response
+}
+
+async fn udr_sbi_route(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
 
@@ -4447,6 +4466,93 @@ udr:
             .expect("channel open");
         let value: serde_json::Value = serde_json::from_str(&body).expect("notification JSON");
         (path, value)
+    }
+
+    /// #1334: the UDR's `/metrics`, scraped over HTTP, follows Nudr traffic over the
+    /// real SBI server: a data change subscription created and one rejected, each
+    /// counted by data set, operation and result.
+    ///
+    /// REVERT-VERIFIED: without `nextgcore_udrd::metrics::observe` in
+    /// `udr_sbi_request_handler` the counts stay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_scraped_endpoint_follows_nudr_traffic_1334() {
+        let (udr, client, listener, cb_port, _rx) = start_udr_and_listener().await;
+        let (bound, handle) = nextgcore_metrics::nes_energy::serve_metrics(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(nextgcore_udrd::metrics::render_prometheus),
+        )
+        .await
+        .expect("metrics endpoint");
+        let value = |b: &str, s: &str| nextgcore_metrics::nf::sample_value(b, s).unwrap_or(0.0);
+        let ok = r#"udr_operations_total{data="data_change_subscription",operation="create",result="success"}"#;
+        let failed = r#"udr_operations_total{data="data_change_subscription",operation="create",result="failure"}"#;
+        let before = nextgcore_metrics::nf::scrape_for_test(bound).await;
+        let (ok0, failed0) = (value(&before, ok), value(&before, failed));
+
+        let supi = "imsi-001019913340002";
+        let resp = client
+            .post_json(
+                "/nudr-dr/v2/subscription-data/subs-to-notify",
+                &json!({
+                    "ueId": supi,
+                    "callbackReference": format!("http://127.0.0.1:{cb_port}/cb/1334"),
+                    "monitoredResourceUris": [format!("http://udr/nudr-dr/v2/subscription-data/{supi}/context-data/amf-3gpp-access")]
+                }),
+            )
+            .await
+            .expect("POST");
+        assert_eq!(resp.status, 201);
+        let resp = client
+            .post_json(
+                "/nudr-dr/v2/subscription-data/subs-to-notify",
+                &json!({"monitoredResourceUris": ["/x"]}),
+            )
+            .await
+            .expect("POST bad");
+        assert_eq!(resp.status, 400);
+
+        // #1334 review: an operation label is admitted on a 2xx, so a made-up resource
+        // of every service this NF serves must be answered with an error, or a client
+        // could mint label values.
+        for service in ["nudr-dr", "nudr-group-id-map"] {
+            for path in [
+                format!("/{service}/v1/madeup-resource-1334"),
+                format!("/{service}/v1/imsi-001010000000001/madeup-resource-1334"),
+            ] {
+                for request in [
+                    nextgcore_sbi::message::SbiRequest::get(&path),
+                    nextgcore_sbi::message::SbiRequest::post(&path)
+                        .with_body("{}", "application/json"),
+                ] {
+                    let resp = client.send_request(request).await.expect("answered");
+                    assert!(resp.status >= 400, "{path} answered {}", resp.status);
+                }
+            }
+        }
+        let after = nextgcore_metrics::nf::scrape_for_test(bound).await;
+        assert!(
+            !after.contains("madeup"),
+            "no made-up resource in a label: {after}"
+        );
+        assert!(value(&after, ok) >= ok0 + 1.0, "{after}");
+        assert!(value(&after, failed) >= failed0 + 1.0, "{after}");
+        for name in [
+            "udr_ue_contexts",
+            "nextgcore_sbi_request_total",
+            "nextgcore_nrf_registered",
+            "nextgcore_uptime_seconds",
+            "process_resident_memory_bytes",
+        ] {
+            assert!(
+                nextgcore_metrics::nf::has_series(&after, name),
+                "{name}:\n{after}"
+            );
+        }
+        assert!(!after.contains("9913340002"), "no SUPI in the exposition");
+        handle.abort();
+        client.close().await;
+        udr.stop().await.expect("stop");
+        listener.stop().await.expect("stop");
     }
 
     /// amf-3gpp-access: strict-peer rejection, full registration round-trip,

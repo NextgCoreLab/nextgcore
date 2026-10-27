@@ -1664,7 +1664,6 @@ impl PcfContext {
         }
     }
 
-    #[cfg(test)]
     pub fn event_sub_count(&self) -> usize {
         read_through_poison(&self.event_sub_list).len()
     }

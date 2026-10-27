@@ -479,6 +479,15 @@ pub async fn run() -> Result<()> {
 
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
 
+    // #1334: the Prometheus endpoint, on NEXTGCORE_METRICS_BIND (loopback by default,
+    // #837) and PCF_METRICS_PORT (9090). Non-fatal, like smfd's.
+    let _metrics = nextgcore_metrics::nf::serve_nf_metrics(
+        "PCF",
+        "PCF_METRICS_PORT",
+        std::sync::Arc::new(crate::metrics::render_prometheus),
+    )
+    .await;
+
     // WSB-1/H2: publish this PCF's advertised identity (addr/port, optional
     // FQDN, NF instance id) so build_pcf_binding_body can emit the mandatory
     // PCF address information (TS 29.521 §5.3.2 pcfFqdn|pcfIpEndPoints) and
@@ -637,8 +646,10 @@ pub async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let service = parts[0];
     let _version = parts[1];
     let resource = parts[2];
+    // #1334: policy association operations, counted by outcome below.
+    let policy_op = crate::metrics::classify(&parts, method);
 
-    match (service, resource, method) {
+    let response = match (service, resource, method) {
         // AM Policy Control Service (npcf-am-policy-control, TS 29.507)
         // Note: order matters — guarded sub-resource arms first. The update
         // operation is POST /policies/{polAssoId}/update (TS 29.507 §4.2.4),
@@ -765,7 +776,11 @@ pub async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             log::warn!("Unknown PCF request: {method} {uri}");
             send_method_not_allowed(method, uri)
         }
+    };
+    if let Some((policy, op)) = policy_op {
+        crate::metrics::observe(policy, op, response.status);
     }
+    response
 }
 
 // ---------------------------------------------------------------------------
@@ -4906,6 +4921,127 @@ mod tests {
             "servingNetwork": { "mcc": "001", "mnc": "01" },
             "suppFeat": "0"
         })
+    }
+
+    /// #1334: the PCF's `/metrics`, scraped over HTTP, follows SM policy association
+    /// traffic through the real router: the census shows the association while it
+    /// exists, and each create / update / delete is counted by result.
+    ///
+    /// REVERT-VERIFIED: without the router's `crate::metrics::observe` the operation
+    /// counts stay; without `render_pcf_families` the series are missing.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn the_scraped_endpoint_follows_sm_policy_traffic_1334() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let (bound, handle) = nextgcore_metrics::nes_energy::serve_metrics(
+            "127.0.0.1:0".parse().unwrap(),
+            std::sync::Arc::new(crate::metrics::render_prometheus),
+        )
+        .await
+        .expect("metrics endpoint");
+        let value =
+            |body: &str, s: &str| nextgcore_metrics::nf::sample_value(body, s).unwrap_or(0.0);
+        let op = |o: &str, r: &str| {
+            format!(r#"pcf_policy_operations_total{{policy="sm",operation="{o}",result="{r}"}}"#)
+        };
+        let watched = [
+            op("create", "success"),
+            op("update", "success"),
+            op("delete", "success"),
+            op("create", "failure"),
+        ];
+        let before = nextgcore_metrics::nf::scrape_for_test(bound).await;
+        let b: Vec<f64> = watched.iter().map(|s| value(&before, s)).collect();
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(full_create_body("imsi-001010000013340", 5)),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let pol_id = body["smPolicyId"].as_str().unwrap().to_string();
+        let during = nextgcore_metrics::nf::scrape_for_test(bound).await;
+        assert!(
+            value(&during, r#"pcf_policy_associations{policy="sm"}"#) >= 1.0,
+            "{during}"
+        );
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            &format!("/npcf-smpolicycontrol/v1/sm-policies/{pol_id}/update"),
+            Some(serde_json::json!({})),
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            &format!("/npcf-smpolicycontrol/v1/sm-policies/{pol_id}/delete"),
+            Some(serde_json::json!({})),
+        ))
+        .await;
+        assert!((200..300).contains(&resp.status), "{}", resp.status);
+        let mut bad = full_create_body("imsi-001010000013341", 6);
+        bad.as_object_mut().unwrap().remove("notificationUri");
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(bad),
+        ))
+        .await;
+        assert_eq!(resp.status, 400);
+
+        // #1334 review: an operation label is admitted on a 2xx, so a made-up resource
+        // of every service this NF serves must be answered with an error, or a client
+        // could mint label values.
+        for (service, version) in [
+            ("npcf-am-policy-control", "v1"),
+            ("npcf-smpolicycontrol", "v1"),
+            ("npcf-ue-policy-control", "v1"),
+            ("npcf-policyauthorization", "v1"),
+            ("npcf-eventexposure", "v1"),
+            ("npcf-callback", "v1"),
+        ] {
+            for path in [
+                format!("/{service}/{version}/madeup-resource-1334"),
+                format!("/{service}/{version}/imsi-001010000000001/madeup-resource-1334"),
+            ] {
+                for request in [
+                    nextgcore_sbi::message::SbiRequest::get(&path),
+                    nextgcore_sbi::message::SbiRequest::post(&path)
+                        .with_body("{}", "application/json"),
+                ] {
+                    let resp = pcf_sbi_request_handler(request).await;
+                    assert!(resp.status >= 400, "{path} answered {}", resp.status);
+                }
+            }
+        }
+        let after = nextgcore_metrics::nf::scrape_for_test(bound).await;
+        for (s, b) in watched.iter().zip(&b) {
+            assert!(value(&after, s) >= b + 1.0, "{s}: {b} -> {after}");
+        }
+        for name in [
+            "pcf_policy_associations",
+            "pcf_event_subscriptions",
+            "nextgcore_nrf_registered",
+            "nextgcore_uptime_seconds",
+            "process_resident_memory_bytes",
+            "process_cpu_seconds_total",
+        ] {
+            assert!(
+                nextgcore_metrics::nf::has_series(&after, name),
+                "{name}:\n{after}"
+            );
+        }
+        assert!(
+            !after.contains("0010100000133"),
+            "no SUPI in the exposition"
+        );
+        handle.abort();
     }
 
     #[tokio::test]

@@ -14,7 +14,7 @@ x-common: &common
   environment: &common-env
     RUST_LOG: info
     RUST_BACKTRACE: 1
-    # The /metrics listeners (smfd, upfd, sgwud, amfd and nrfd #1334; udmd/nsacfd when enabled)
+    # The /metrics listeners (smfd, upfd, sgwud, and since #1334 the eight 5GC SBI NFs; udmd/nsacfd when enabled)
     # default to 127.0.0.1 (#837). Inside this private compose network they
     # bind all container interfaces so Prometheus can scrape them; no service
     # publishes its metrics port on the host.

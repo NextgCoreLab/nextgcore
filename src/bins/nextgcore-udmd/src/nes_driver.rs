@@ -248,17 +248,23 @@ pub fn spawn_if_enabled(
 }
 
 async fn run_nes_loop(settings: NesSettings, gauges: Arc<EnergyGauges>, actions: NrfNesActions) {
-    // Live /metrics endpoint (real HTTP/1.1; acceptance criterion).
-    let render_gauges = gauges.clone();
-    // Loopback unless NEXTGCORE_METRICS_BIND says otherwise (#837).
-    let metrics_addr = nextgcore_metrics::nes_energy::metrics_bind_addr(settings.metrics_port);
-    if let Err(e) = serve_metrics(
-        metrics_addr,
-        Arc::new(move || render_gauges.render_prometheus()),
-    )
-    .await
-    {
-        log::warn!("NES metrics endpoint failed to bind {metrics_addr}: {e}");
+    // #1334: the UDM's own /metrics serves the energy gauges. A separate NES
+    // listener is opened only on a different port: on the same one it would only
+    // lose the bind to the UDM endpoint.
+    crate::metrics::set_nes_gauges(gauges.clone());
+    let udm_port = nextgcore_metrics::nf::nf_metrics_addr(crate::metrics::METRICS_PORT_ENV).port();
+    if settings.metrics_port != udm_port {
+        let render_gauges = gauges.clone();
+        // Loopback unless NEXTGCORE_METRICS_BIND says otherwise (#837).
+        let metrics_addr = nextgcore_metrics::nes_energy::metrics_bind_addr(settings.metrics_port);
+        if let Err(e) = serve_metrics(
+            metrics_addr,
+            Arc::new(move || render_gauges.render_prometheus()),
+        )
+        .await
+        {
+            log::warn!("NES metrics endpoint failed to bind {metrics_addr}: {e}");
+        }
     }
 
     let config = NesConfig {

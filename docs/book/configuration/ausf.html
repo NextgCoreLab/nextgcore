@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-1ef47358.js";
+            window.path_to_searchindex_js = "../searchindex-d47bad62.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -276,6 +276,8 @@ ausf:
 <li><strong>No state files — everything is in-memory.</strong> A restart loses all auth contexts and the SoR/UPU anchors/counters. <code>DELETE .../{authCtxId}</code> zeroizes the context’s KAUSF/KSEAF/XRES* (TS 33.501 §6.1.4.1a per code comment) but deliberately keeps the per-SUPI anchor store so SoR/UPU keep working afterwards (TS 33.501 §6.14.1 per code comment).</li>
 <li><strong>Environment variables</strong> read by this binary: <code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code> (checked <em>before</em> the YAML; truthy = <code>1</code>/<code>true</code>/<code>TRUE</code>/<code>yes</code> — any other set value forces OAuth2 <strong>off</strong> even if the YAML says <code>true</code>), <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> (OTLP trace exporter, default <code>http://jaeger:4317</code>), and <code>UDM_SBI_ADDR</code>/<code>UDM_SBI_PORT</code> (UDM fallback only — NRF discovery results take precedence). With OAuth2 enabled but no NRF URI configured, the server fails closed and 503s every request (per the code comment referencing <code>nextgcore-sbi</code> <code>server.rs</code>).</li>
 </ul>
+<h2 id="metrics-endpoint-1334"><a class="header" href="#metrics-endpoint-1334">Metrics endpoint (#1334)</a></h2>
+<p><code>AUSF_METRICS_PORT</code> (default <code>9090</code>) and <code>NEXTGCORE_METRICS_BIND</code> (default <code>127.0.0.1</code>, #837) place the unauthenticated Prometheus <code>/metrics</code> endpoint. The compose file and manifests set <code>0.0.0.0</code> inside the private container/pod network and publish no host port; the Kubernetes Service port is ClusterIP. The series are listed in the <a href="../observability.html">Observability</a> chapter.</p>
 
                     </main>
 

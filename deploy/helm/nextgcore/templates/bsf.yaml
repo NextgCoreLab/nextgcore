@@ -38,6 +38,11 @@ spec:
             - name: sbi
               containerPort: {{ .Values.bsf.service.port }}
               protocol: TCP
+            {{- if .Values.bsf.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.bsf.metrics.port }}
+              protocol: TCP
+            {{- end }}
           {{- include "nextgcore.sbiProbes" . | nindent 10 }}
           volumeMounts:
             {{- include "nextgcore.configMounts" (dict "nf" "bsf" "rewritten" true) | nindent 12 }}
@@ -52,6 +57,14 @@ spec:
               value: {{ .Values.global.sbiProfile | default "dev" | quote }}
             - name: RUST_LOG
               value: {{ .Values.global.logLevel }}
+            {{- if .Values.bsf.metrics.enabled }}
+            # /metrics (#1334) defaults to 127.0.0.1 (#837); in the pod it must
+            # accept the pod IP for Prometheus. Not exposed beyond the cluster.
+            - name: NEXTGCORE_METRICS_BIND
+              value: "0.0.0.0"
+            - name: BSF_METRICS_PORT
+              value: "{{ .Values.bsf.metrics.port }}"
+            {{- end }}
             - name: NEXTGCORE_SBI_ADVERTISE
               # #1312: the host registered with the NRF and put in callback
               # URIs, set apart from the bind so a wildcard bind can never be
@@ -76,6 +89,12 @@ spec:
       targetPort: sbi
       protocol: TCP
       name: sbi
+    {{- if .Values.bsf.metrics.enabled }}
+    - port: {{ .Values.bsf.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+    {{- end }}
   selector:
     app.kubernetes.io/name: bsf
     app.kubernetes.io/instance: {{ .Release.Name }}-bsf

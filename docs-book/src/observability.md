@@ -2,13 +2,13 @@
 
 NextGCore ships a Docker-based observability stack (Prometheus, Grafana, Jaeger) alongside its 28 network-function daemons, plus an in-tree metrics/tracing library (`src/libs/nextgcore-metrics/`). This chapter documents what actually works today — which endpoints exist, which are scaffolding, how logging is really configured per NF — and gives a code-grounded troubleshooting table and the one-command E2E recipe.
 
-> **Honesty note:** NextGCore behavior is validated by this project's own unit tests and matched-simulator docker E2E (run nightly by `.github/workflows/ci.yml`), not by third-party conformance certification. The observability stack described here is exactly what ships in this repo — it is **not** a certified telco OAM system. In particular, the library `MetricsServer` and the OpenTelemetry OTLP exporters in `nextgcore-metrics` are **structural stubs**. smfd, upfd, sgwud, amfd and nrfd serve runtime metrics over HTTP through a separate helper (amfd and nrfd also the families every SBI NF shares, below); every other NF serves no scrapeable metrics yet (#1334 adds them NF by NF), and no NF exports spans. Each gap is called out explicitly below.
+> **Honesty note:** NextGCore behavior is validated by this project's own unit tests and matched-simulator docker E2E (run nightly by `.github/workflows/ci.yml`), not by third-party conformance certification. The observability stack described here is exactly what ships in this repo — it is **not** a certified telco OAM system. In particular, the library `MetricsServer` and the OpenTelemetry OTLP exporters in `nextgcore-metrics` are **structural stubs**. smfd, upfd, sgwud and the eight 5GC SBI NFs (amfd, nrfd, pcfd, ausfd, udmd, udrd, bsfd, nssfd) serve runtime metrics over HTTP through a separate helper (the 5GC SBI NFs also the families every SBI NF shares, below); every other NF serves no scrapeable metrics yet (#1334 adds them NF by NF), and no NF exports spans. Each gap is called out explicitly below.
 
 ## Metrics
 
 ### What the library provides — and what it does not
 
-`src/libs/nextgcore-metrics/src/server.rs` defines a `MetricsServer` documented to serve two HTTP endpoints — `/` (health check, returns "OK") and `/metrics` (Prometheus text exposition) — and `src/libs/nextgcore-metrics/src/lib.rs` defines `DEFAULT_PROMETHEUS_HTTP_PORT: u16 = 9090`. However, `MetricsServer::start()` does **not** bind a socket: it logs `metrics_server() [http://<addr>]:<port>`, flips its state to `Running`, and returns (the code comment reads "In a real implementation, this would start an HTTP server using hyper"). What does serve HTTP is a different, minimal helper: `nextgcore_metrics::nes_energy::serve_metrics(addr, render)` (`src/libs/nextgcore-metrics/src/nes_energy.rs`) binds a TCP listener, logs `metrics endpoint listening on http://<addr>/metrics`, and answers with whatever text the NF's `render` closure returns. Five daemons call it unconditionally, and two more behind off-by-default cargo features:
+`src/libs/nextgcore-metrics/src/server.rs` defines a `MetricsServer` documented to serve two HTTP endpoints — `/` (health check, returns "OK") and `/metrics` (Prometheus text exposition) — and `src/libs/nextgcore-metrics/src/lib.rs` defines `DEFAULT_PROMETHEUS_HTTP_PORT: u16 = 9090`. However, `MetricsServer::start()` does **not** bind a socket: it logs `metrics_server() [http://<addr>]:<port>`, flips its state to `Running`, and returns (the code comment reads "In a real implementation, this would start an HTTP server using hyper"). What does serve HTTP is a different, minimal helper: `nextgcore_metrics::nes_energy::serve_metrics(addr, render)` (`src/libs/nextgcore-metrics/src/nes_energy.rs`) binds a TCP listener, logs `metrics endpoint listening on http://<addr>/metrics`, and answers with whatever text the NF's `render` closure returns. Eleven daemons call it unconditionally, and two more behind off-by-default cargo features:
 
 | NF daemon | Metrics served on `/metrics` | Port |
 |---|---|---|
@@ -17,7 +17,13 @@ NextGCore ships a Docker-based observability stack (Prometheus, Grafana, Jaeger)
 | `nextgcore-sgwud` | `sgwu_pfcp_sessions`, `sgwu_pfcp_associations`, `sgwu_pfcp_unauthorized_messages_total`, `sgwu_up` | 9090, or `SGWU_METRICS_PORT` |
 | `nextgcore-amfd` | the shared SBI, NRF-client and process families (below), and the AMF families (below) | 9090, or `AMF_METRICS_PORT` |
 | `nextgcore-nrfd` | the shared SBI and process families (it is no NRF client), and the NRF families (below) | 9090, or `NRF_METRICS_PORT` |
-| `nextgcore-udmd` | NES energy gauges, only with `--features nes` | NES `metrics_port` (default 9090) |
+| `nextgcore-pcfd` | the shared SBI, NRF-client and process families, and the PCF families (below) | 9090, or `PCF_METRICS_PORT` |
+| `nextgcore-ausfd` | the shared SBI, NRF-client and process families, and the AUSF families (below) | 9090, or `AUSF_METRICS_PORT` |
+| `nextgcore-udmd` | the shared SBI, NRF-client and process families, and the UDM families (below) | 9090, or `UDM_METRICS_PORT` |
+| `nextgcore-udrd` | the shared SBI, NRF-client and process families, and the UDR families (below) | 9090, or `UDR_METRICS_PORT` |
+| `nextgcore-bsfd` | the shared SBI, NRF-client and process families, and the BSF families (below) | 9090, or `BSF_METRICS_PORT` |
+| `nextgcore-nssfd` | the shared SBI, NRF-client and process families, and the NSSF families (below) | 9090, or `NSSF_METRICS_PORT` |
+| `nextgcore-udmd` (NES) | NES energy gauges, only with `--features nes`: served on the UDM endpoint above, and on their own listener only when NES `metrics_port` differs from `UDM_METRICS_PORT` | NES `metrics_port` (default 9090) |
 | `nextgcore-nsacfd` | slice-SLA observe gauges, only with `--features sla-observe` | its `metrics_port` when > 0 |
 
 Every one of these listeners is unauthenticated, so it binds `127.0.0.1` by default (#837): set `NEXTGCORE_METRICS_BIND` (an IP address, e.g. `0.0.0.0`) to widen it. The compose files, the Kind manifests, the Helm chart and the EKS overlays set it to `0.0.0.0` inside the private container or pod network, where Prometheus scrapes by container/pod address; none of them publishes a metrics port on the host. The `k8s/monitoring/*` and `k8s/manifests/nrf.yaml` NodePort Services are for kind only, where the node is the Docker bridge and `kind-config.yaml` maps the ports to 127.0.0.1; on a real cluster a NodePort is open on every node IP, so do not apply them there. The compose host-port publishes (MongoDB, NRF, PFCP, Prometheus, Grafana, Jaeger, OTLP) are bound to `127.0.0.1`; the RAN-facing NGAP/S1AP and GTP-U publishes use `${NEXTGCORE_RAN_PUBLISH_ADDR:-127.0.0.1}`, so an external gNB/eNB needs that set to the host address it reaches.
@@ -28,8 +34,6 @@ The other NF daemons serve **no** Prometheus metrics over HTTP:
 
 | NF daemon | Prometheus metrics served | Notes |
 |---|---|---|
-| `nextgcore-ausfd` | none | Links `nextgcore-metrics`; calls `otel::init_otel` at startup (`src/app.rs`). |
-| `nextgcore-bsfd` | none | Same; `init_otel` in `src/lib.rs`. |
 | `nextgcore-dccfd` | none | Same; `init_otel` in `src/main.rs`. |
 | `nextgcore-eesd` | none | Same. |
 | `nextgcore-hssd` | none | Same. |
@@ -37,16 +41,12 @@ The other NF daemons serve **no** Prometheus metrics over HTTP:
 | `nextgcore-mbsmfd` | none | Same. |
 | `nextgcore-mmed` | none | Same. |
 | `nextgcore-nsacfd` | none by default | Same. SLA-observe gauges with `--features sla-observe` (above). |
-| `nextgcore-nssfd` | none | Same. |
 | `nextgcore-nwdafd` | none | Same. |
-| `nextgcore-pcfd` | none | Same; `init_otel` in `src/app.rs`. |
 | `nextgcore-pcrfd` | none | Same. |
 | `nextgcore-pind` | none | Same. |
 | `nextgcore-scpd` | none | Same. |
 | `nextgcore-seppd` | none | Same. |
 | `nextgcore-sgwcd` | none | Same. |
-| `nextgcore-udmd` | none by default | Same; `init_otel` in `src/app.rs`. NES gauges with `--features nes` (above). |
-| `nextgcore-udrd` | none | Same. |
 | `nextgcore-easdfd`, `nextgcore-nefd`, `nextgcore-tsctsf`, `nextgcore-ucmfd` | none | Same. |
 
 Apart from the `serve_metrics` callers above, the NF crates use `nextgcore-metrics` only for the `init_otel` call (see Tracing).
@@ -68,7 +68,7 @@ Recorded by the shared SBI server and NRF heartbeat worker (`nextgcore-sbi`), so
 | `nextgcore_uptime_seconds` | gauge | | since process start |
 | `nextgcore_build_info` | gauge | `nf`, `version` | constant 1 |
 
-`service` is one of a fixed list of SBI service names (`namf-comm`, `nudm-sdm`, ...; `nnrf-oauth2` for `/oauth2/token`), else `other`: never the request's own text. `operation` is the method and the resource template: the path after the service and version, with every segment that is not a resource name replaced by `{id}` (`GET {id}/am-data`, `PUT nf-instances/{id}`). A template is named only once the NF has answered it with a non-error status, at most 64 per service; before that an error answer is `unmatched`, past the cap `other`. A made-up path is answered 404/405, so no client text becomes a label value, and a SUPI, GPSI, PEI, UUID, IP address or numeric reference never appears in one. Past 1024 label sets, new ones are counted under `service="other",operation="other"`. Recording takes shared locks and atomic increments only, so it never serialises SBI requests.
+`service` is one of a fixed list of SBI service names (`namf-comm`, `nudm-sdm`, ...; `nnrf-oauth2` for `/oauth2/token`), else `other`: never the request's own text. `operation` is the method and the resource template: the path after the service and version, with every segment that is not a resource name replaced by `{id}` (`GET {id}/am-data`, `PUT nf-instances/{id}`). A template is named only once the NF has answered it with a 2xx, at most 64 per service; before that any other answer is `unmatched`, past the cap `other`. A made-up path is answered with an error (each NF's `/metrics` test checks this for every service it serves), so no client text becomes a label value, and a SUPI, GPSI, PEI, UUID, IP address or numeric reference never appears in one. Past 1024 label sets, new ones are counted under `service="other",operation="other"`. Recording takes shared locks and atomic increments only, so it never serialises SBI requests.
 
 ### AMF families (`src/bins/nextgcore-amfd/src/metrics.rs`, #1334)
 
@@ -107,9 +107,38 @@ The NAS counters follow TS 28.552 §5.2.2 "on transmission"/"on receipt": a prot
 | `nrf_discovery_empty_total` | counter | | SearchResults that matched no instance (routine for an optional NF type that is not deployed) |
 | `nrf_access_tokens_total` | counter | `result` (`granted`, `denied`) | access token requests |
 
+### PCF families (`src/bins/nextgcore-pcfd/src/metrics.rs`, #1334)
+
+| Metric | Type | Labels | Counts |
+|---|---|---|---|
+| `pcf_policy_associations` | gauge | `policy` (`am` TS 29.507, `sm` TS 29.512, `ue` TS 29.525, `app_session` TS 29.514) | associations the PCF holds |
+| `pcf_event_subscriptions` | gauge | | Npcf_EventExposure subscriptions held (TS 29.523) |
+| `pcf_policy_operations_total` | counter | `policy`, `operation` (`create`, `update`, `delete`), `result` (`success` = 2xx, `failure`) | association operations answered |
+
+### AUSF, UDM, UDR, BSF and NSSF families (#1334)
+
+Each NF's `metrics.rs`. Every `result` is `success` for a 2xx answer, else `failure`; every other label value is a fixed name in the code, never request data.
+
+| Metric | Type | Labels | Counts |
+|---|---|---|---|
+| `ausf_operations_total` | counter | `operation` (`authenticate`, `5g_aka_confirmation`, `eap_session`, `deregister`, `delete`, `sor_protection`, `upu_protection`), `result` | Nausf operations answered (TS 29.509) |
+| `ausf_authentication_results_total` | counter | `method` (`5g_aka`, `eap_aka_prime`), `result` | verdicts returned, read from `authResult` (a failed authentication is still a 200) |
+| `ausf_ue_authentication_contexts`, `ausf_kausf_anchors` | gauge | | contexts held, KAUSF anchors stored |
+| `udm_operations_total` | counter | `service` (a TS 29.503 Nudm service), `operation` (`generate_auth_data`, `auth_event`, `auth_event_cancel`, `amf_registration`, `amf_registration_update`, `amf_deregistration`, `smf_registration`, `smf_deregistration`, `get_registrations`, `get`, `subscribe`, `unsubscribe`, `modify_subscription`, `other`), `result` | Nudm operations answered |
+| `udm_ue_contexts`, `udm_amf_registered_ues`, `udm_pdu_sessions`, `udm_sdm_subscriptions` | gauge | | UE contexts, UEs with an AMF registered for 3GPP access, SMF-registered PDU sessions, SDM subscriptions |
+| `udr_operations_total` | counter | `data` (`subscription_data`, `policy_data`, `application_data`, `exposure_data`, `data_change_subscription`, `group_id_map`, `other`), `operation` (`query`, `create`, `create_or_replace`, `update`, `delete`), `result` | Nudr operations answered (TS 29.504, TS 29.598) |
+| `udr_ue_contexts` | gauge | | UE contexts held |
+| `bsf_binding_operations_total` | counter | `binding` (`pdu`, `ue`, `mbs`), `operation` (`register`, `discovery`, `retrieve`, `update`, `deregister`), `result` | Nbsf_Management binding operations answered (TS 29.521); a discovery that matches nothing is a 204, a success |
+| `bsf_subscription_operations_total` | counter | `operation` (`subscribe`, `modify`, `unsubscribe`), `result` | event subscription operations |
+| `bsf_pcf_bindings` | gauge | `binding` | bindings held |
+| `bsf_subscriptions` | gauge | | event subscriptions held |
+| `nssf_selections_total` | counter | `result` | Nnssf_NSSelection_Get answered (TS 29.531 §5.2) |
+| `nssf_availability_operations_total` | counter | `operation` (`update`, `patch`, `delete`, `subscribe`, `unsubscribe`, `modify_subscription`), `result` | Nnssf_NSSAIAvailability operations (§5.3) |
+| `nssf_nssai_availability_nfs`, `nssf_subscriptions`, `nssf_network_slice_instances` | gauge | | stored availability documents, subscriptions, configured slice instances |
+
 ### No `metrics.server` in the YAML (#1312)
 
-No daemon reads a `metrics.server` block, and several have no metrics listener at all (hssd, pcfd, pcrfd). The shipped configs used to carry one anyway (docker `5gc` amf/pcf/smf/upf, `epc` mme/hss/pcrf/pgwc/pgwu, and the k8s and Helm ConfigMaps). A key that is documented but has no effect is misleading, so the blocks were removed rather than wired up: a daemon's metrics listener is set by its environment variable, `MME_METRICS_ADDR`, `NEXTGCORE_METRICS_BIND` (loopback by default, #1308), `SMF_METRICS_PORT`, `AMF_METRICS_PORT`, `NRF_METRICS_PORT`, `UPF_METRICS_PORT`, `SGWC_METRICS_PORT`, `SGWU_METRICS_PORT` or `UCMF_METRICS_ADDR`, and nothing else.
+No daemon reads a `metrics.server` block, and several have no metrics listener at all (hssd, pcrfd). The shipped configs used to carry one anyway (docker `5gc` amf/pcf/smf/upf, `epc` mme/hss/pcrf/pgwc/pgwu, and the k8s and Helm ConfigMaps). A key that is documented but has no effect is misleading, so the blocks were removed rather than wired up: a daemon's metrics listener is set by its environment variable, `MME_METRICS_ADDR`, `NEXTGCORE_METRICS_BIND` (loopback by default, #1308), `SMF_METRICS_PORT`, `AMF_METRICS_PORT`, `NRF_METRICS_PORT`, `PCF_METRICS_PORT`, `AUSF_METRICS_PORT`, `UDM_METRICS_PORT`, `UDR_METRICS_PORT`, `BSF_METRICS_PORT`, `NSSF_METRICS_PORT`, `UPF_METRICS_PORT`, `SGWC_METRICS_PORT`, `SGWU_METRICS_PORT` or `UCMF_METRICS_ADDR`, and nothing else.
 
 ### The shipped scrape stack
 

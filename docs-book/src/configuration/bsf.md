@@ -157,3 +157,7 @@ Recorded so the option stays open and costed, rather than being rediscovered:
    protocol addition rather than a storage change;
 4. the durable-snapshot hazards this project has already paid for elsewhere: restore **before** the SBI
    listener accepts, persist removals as well as inserts, and never resurrect a deleted record.
+
+## Metrics endpoint (#1334)
+
+`BSF_METRICS_PORT` (default `9090`) and `NEXTGCORE_METRICS_BIND` (default `127.0.0.1`, #837) place the unauthenticated Prometheus `/metrics` endpoint. The compose file and manifests set `0.0.0.0` inside the private container/pod network and publish no host port; the Kubernetes Service port is ClusterIP. The series are listed in the [Observability](../observability.md) chapter.

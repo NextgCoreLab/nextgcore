@@ -766,6 +766,16 @@ impl BsfContext {
             .unwrap_or(false)
     }
 
+    /// PCF for a UE bindings held (#1334, `/metrics`).
+    pub fn ue_binding_count(&self) -> usize {
+        self.ue_binding_list.read().map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// PCF for an MBS session bindings held (#1334, `/metrics`).
+    pub fn mbs_binding_count(&self) -> usize {
+        self.mbs_binding_list.read().map(|m| m.len()).unwrap_or(0)
+    }
+
     pub fn subscription_count(&self) -> usize {
         self.subscription_list.read().map(|m| m.len()).unwrap_or(0)
     }
