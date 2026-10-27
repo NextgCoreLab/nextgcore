@@ -7,6 +7,7 @@
 pub mod context;
 pub mod data_store;
 pub mod event;
+pub mod metrics;
 /// Non-serving legacy handler/state-machine path (udrd-09).
 ///
 /// `nudr_handler` (and the sibling `udr_sm`/`ue_sm`/`sess_sm` state machines)

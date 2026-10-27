@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-8d7f3631.js";
+            window.path_to_searchindex_js = "../searchindex-3c66c1c2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -313,6 +313,8 @@ pcf:
 <tbody>
 <tr><td><code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code></td><td>unset (follow YAML)</td><td><code>1/true/TRUE/yes</code> forces OAuth2 enforcement on; any other value forces it off. Checked <strong>before</strong> the YAML knob.</td></tr>
 <tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td><td><code>http://jaeger:4317</code></td><td>OTLP endpoint for OpenTelemetry tracing.</td></tr>
+<tr><td><code>PCF_METRICS_PORT</code></td><td><code>9090</code></td><td>Port of the Prometheus <code>/metrics</code> endpoint (#1334).</td></tr>
+<tr><td><code>NEXTGCORE_METRICS_BIND</code></td><td><code>127.0.0.1</code></td><td>Host the unauthenticated <code>/metrics</code> listener binds to (#837). The compose file and manifests set <code>0.0.0.0</code> inside the private container/pod network and publish no host port.</td></tr>
 <tr><td><code>PCF_LOCAL_PLMN</code></td><td><code>001-01</code></td><td>Home PLMN as <code>MCC-MNC</code>; drives V-PCF vs H-PCF role detection per serving PLMN.</td></tr>
 <tr><td><code>PCF_UE_POLICY_DELIVERY</code></td><td>on</td><td>Kill-switch: <code>off/0/false/disabled/no</code> disables URSP N1N2 delivery (association-only, pre-Wave-6 behavior).</td></tr>
 <tr><td><code>PCF_T3501_SECS</code></td><td><code>30</code></td><td>T3501 duration in seconds; zero/invalid falls back to 30.</td></tr>

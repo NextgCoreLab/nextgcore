@@ -4966,7 +4966,29 @@ mod tests {
         let resp = client.delete(&path).await.expect("DELETE");
         assert_eq!(resp.status, 204);
 
+        // #1334 review: an operation label is admitted on a 2xx, so a made-up resource
+        // of every service this NF serves must be answered with an error, or a client
+        // could mint label values.
+        for service in ["nnrf-nfm", "nnrf-disc", "nnrf-oauth2"] {
+            for path in [
+                format!("/{service}/v1/madeup-resource-1334"),
+                format!("/{service}/v1/imsi-001010000000001/madeup-resource-1334"),
+            ] {
+                for request in [
+                    nextgcore_sbi::message::SbiRequest::get(&path),
+                    nextgcore_sbi::message::SbiRequest::post(&path)
+                        .with_body("{}", "application/json"),
+                ] {
+                    let resp = client.send_request(request).await.expect("answered");
+                    assert!(resp.status >= 400, "{path} answered {}", resp.status);
+                }
+            }
+        }
         let after = scrape().await;
+        assert!(
+            !after.contains("madeup"),
+            "no made-up resource in a label: {after}"
+        );
         // Discovery: the hit and the empty SearchResult are successes (TS 29.510
         // §5.3.2.2.2: 200 either way), the rejected query is the failure.
         for ((name, b), want) in names.iter().zip(&b).zip([1.0, 1.0, 1.0, 2.0, 1.0, 1.0]) {

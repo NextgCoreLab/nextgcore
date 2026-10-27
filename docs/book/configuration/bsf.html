@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-8d7f3631.js";
+            window.path_to_searchindex_js = "../searchindex-3c66c1c2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -329,6 +329,8 @@ protocol addition rather than a storage change;</li>
 <li>the durable-snapshot hazards this project has already paid for elsewhere: restore <strong>before</strong> the SBI
 listener accepts, persist removals as well as inserts, and never resurrect a deleted record.</li>
 </ol>
+<h2 id="metrics-endpoint-1334"><a class="header" href="#metrics-endpoint-1334">Metrics endpoint (#1334)</a></h2>
+<p><code>BSF_METRICS_PORT</code> (default <code>9090</code>) and <code>NEXTGCORE_METRICS_BIND</code> (default <code>127.0.0.1</code>, #837) place the unauthenticated Prometheus <code>/metrics</code> endpoint. The compose file and manifests set <code>0.0.0.0</code> inside the private container/pod network and publish no host port; the Kubernetes Service port is ClusterIP. The series are listed in the <a href="../observability.html">Observability</a> chapter.</p>
 
                     </main>
 

@@ -857,6 +857,11 @@ impl NssfContext {
         updated
     }
 
+    /// NFs with an NSSAI availability document stored (#1334, `/metrics`).
+    pub fn nssai_availability_count(&self) -> usize {
+        self.nssai_availability.read().map(|m| m.len()).unwrap_or(0)
+    }
+
     pub fn subscription_count(&self) -> usize {
         self.subscriptions.read().map(|s| s.len()).unwrap_or(0)
     }

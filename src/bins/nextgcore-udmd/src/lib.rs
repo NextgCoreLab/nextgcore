@@ -12,6 +12,7 @@ pub mod app;
 pub mod av_algorithm; // #115: which f1-f5* algorithm generates a subscriber's AVs
 pub mod context;
 pub mod event;
+pub mod metrics;
 #[cfg(feature = "nes")]
 pub mod nes_driver; // issue #22 Network Energy Saving runtime (off by default)
 pub mod notify; // #83 Nudm_SDM Data Change Notification / Nudm_EE Event Occurrence

@@ -370,6 +370,15 @@ pub async fn run() -> Result<()> {
 
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
 
+    // #1334: the Prometheus endpoint, on NEXTGCORE_METRICS_BIND (loopback by default,
+    // #837) and AUSF_METRICS_PORT (9090). Non-fatal, like smfd's.
+    let _metrics = nextgcore_metrics::nf::serve_nf_metrics(
+        "AUSF",
+        "AUSF_METRICS_PORT",
+        std::sync::Arc::new(crate::metrics::render_prometheus),
+    )
+    .await;
+
     // Register with NRF (B23.4)
     match match sbi.registration_host() {
         Ok(host) => register_with_nrf(host, sbi.port).await,
@@ -436,6 +445,16 @@ pub async fn run() -> Result<()> {
 
 /// SBI request handler for AUSF
 pub async fn ausf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
+    // #1334: Nausf operations and authentication results, counted by outcome.
+    let operation = crate::metrics::classify(&request.header.method, &request.header.uri);
+    let response = ausf_sbi_route(request).await;
+    if let Some(op) = operation {
+        crate::metrics::observe(op, &response);
+    }
+    response
+}
+
+async fn ausf_sbi_route(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
 
@@ -2425,6 +2444,24 @@ mod tests {
         let _lock = TEST_MUTEX.lock().await;
         tokio::time::timeout(Duration::from_secs(60), async {
             ausf_context_init(64);
+            // #1334: the AUSF's /metrics follows this test's authentications.
+            let (metrics_addr, metrics_task) = nextgcore_metrics::nes_energy::serve_metrics(
+                "127.0.0.1:0".parse().unwrap(),
+                std::sync::Arc::new(crate::metrics::render_prometheus),
+            )
+            .await
+            .expect("metrics endpoint");
+            let metric =
+                |b: &str, s: &str| nextgcore_metrics::nf::sample_value(b, s).unwrap_or(0.0);
+            let verdicts = [
+                r#"ausf_authentication_results_total{method="5g_aka",result="success"}"#,
+                r#"ausf_authentication_results_total{method="5g_aka",result="failure"}"#,
+                r#"ausf_authentication_results_total{method="eap_aka_prime",result="success"}"#,
+                r#"ausf_operations_total{operation="authenticate",result="success"}"#,
+                r#"ausf_operations_total{operation="5g_aka_confirmation",result="success"}"#,
+            ];
+            let before = nextgcore_metrics::nf::scrape_for_test(metrics_addr).await;
+            let before: Vec<f64> = verdicts.iter().map(|s| metric(&before, s)).collect();
 
             // --- mock UDM on an ephemeral port ---
             let (udm_listener, udm_addr) =
@@ -2768,6 +2805,55 @@ mod tests {
                 Some(crate::nudm_handler::bytes_to_hex(&ue_kseaf).as_str()),
                 "AUSF KSEAF must match the UE-derived KSEAF"
             );
+
+            // #1334: the verdicts above are counted from their authResult
+            // (REVERT-VERIFIED: without `crate::metrics::observe` in
+            // `ausf_sbi_request_handler` these stay where they were).
+            // #1334 review: an operation label is admitted on a 2xx, so a made-up resource
+            // of every service this NF serves must be answered with an error, or a client
+            // could mint label values.
+            for (service, version) in [
+                ("nausf-auth", "v1"),
+                ("nausf-sorprotection", "v1"),
+                ("nausf-upuprotection", "v1"),
+            ] {
+                for path in [
+                    format!("/{service}/{version}/madeup-resource-1334"),
+                    format!("/{service}/{version}/imsi-001010000000001/madeup-resource-1334"),
+                ] {
+                    for request in [
+                        nextgcore_sbi::message::SbiRequest::get(&path),
+                        nextgcore_sbi::message::SbiRequest::post(&path)
+                            .with_body("{}", "application/json"),
+                    ] {
+                        let resp = client.send_request(request).await.expect("answered");
+                        assert!(resp.status >= 400, "{path} answered {}", resp.status);
+                    }
+                }
+            }
+            let after = nextgcore_metrics::nf::scrape_for_test(metrics_addr).await;
+            assert!(
+                !after.contains("madeup"),
+                "no made-up resource in a label: {after}"
+            );
+            for (s, b) in verdicts.iter().zip(&before) {
+                assert!(metric(&after, s) >= b + 1.0, "{s}: {b} -> {after}");
+            }
+            for name in [
+                "ausf_ue_authentication_contexts",
+                "ausf_kausf_anchors",
+                "nextgcore_sbi_request_total",
+                "nextgcore_nrf_registered",
+                "nextgcore_uptime_seconds",
+                "process_resident_memory_bytes",
+            ] {
+                assert!(
+                    nextgcore_metrics::nf::has_series(&after, name),
+                    "{name}:\n{after}"
+                );
+            }
+            assert!(!after.contains("imsi-"), "no SUPI in the exposition");
+            metrics_task.abort();
 
             ausf_server.stop().await.expect("stop ausf");
             udm_server.stop().await.expect("stop udm");

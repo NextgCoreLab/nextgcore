@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-8d7f3631.js";
+            window.path_to_searchindex_js = "../searchindex-3c66c1c2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -287,6 +287,8 @@ udm:
 <li><strong>SoR/UPU acks are MAC-verified, single-use.</strong> When an am-data response carried a protected SoR/UPU payload, the expected XMAC-I_UE is pinned; the UE’s ack MAC is compared constant-time and a match yields 204 <em>and clears the pin</em> (a replayed ack is rejected). Mismatch or missing MAC → 400 (<code>SOR_MAC_FAILURE</code>/<code>UPU_MAC_FAILURE</code>/<code>MANDATORY_IE_MISSING</code>); a MAC with nothing outstanding → 400 <code>UNEXPECTED_MESSAGE</code>. A plain ack with nothing outstanding stays 204 (backward-compatible with the matched sim, which never sends acks, per code comment). <code>ueNotReachable: true</code> is recorded without a MAC check.</li>
 <li><strong>Environment variables</strong> read by this binary: <code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code> (<code>1</code>/<code>true</code>/<code>TRUE</code>/<code>yes</code> = on; checked <em>before</em> and overriding the YAML <code>sbi.oauth2.require</code>), <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> (OTLP tracing endpoint, default <code>http://jaeger:4317</code>), <code>NEXTGCORE_SBI_PROFILE</code> (see <a href="./overview.html">Configuration Overview</a>), and the peer fallbacks <code>UDR_SBI_ADDR</code>/<code>UDR_SBI_PORT</code>, <code>AUSF_SBI_ADDR</code>/<code>AUSF_SBI_PORT</code> and <code>AMF_SBI_ADDR</code>/<code>AMF_SBI_PORT</code> (the AMF that receives UECM deregistration notifications and Namf calls when none is cached) used only when NRF discovery yields no instance.</li>
 </ul>
+<h2 id="metrics-endpoint-1334"><a class="header" href="#metrics-endpoint-1334">Metrics endpoint (#1334)</a></h2>
+<p><code>UDM_METRICS_PORT</code> (default <code>9090</code>) and <code>NEXTGCORE_METRICS_BIND</code> (default <code>127.0.0.1</code>, #837) place the unauthenticated Prometheus <code>/metrics</code> endpoint. The compose file and manifests set <code>0.0.0.0</code> inside the private container/pod network and publish no host port; the Kubernetes Service port is ClusterIP. The series are listed in the <a href="../observability.html">Observability</a> chapter.</p>
 
                     </main>
 

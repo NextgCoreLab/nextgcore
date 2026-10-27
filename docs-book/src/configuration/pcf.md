@@ -113,6 +113,8 @@ Runtime knobs with real defaults from the clap `Args` struct in `src/bins/nextgc
   |---|---|---|
   | `NEXTGCORE_SBI_OAUTH2_REQUIRE` | unset (follow YAML) | `1/true/TRUE/yes` forces OAuth2 enforcement on; any other value forces it off. Checked **before** the YAML knob. |
   | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://jaeger:4317` | OTLP endpoint for OpenTelemetry tracing. |
+  | `PCF_METRICS_PORT` | `9090` | Port of the Prometheus `/metrics` endpoint (#1334). |
+  | `NEXTGCORE_METRICS_BIND` | `127.0.0.1` | Host the unauthenticated `/metrics` listener binds to (#837). The compose file and manifests set `0.0.0.0` inside the private container/pod network and publish no host port. |
   | `PCF_LOCAL_PLMN` | `001-01` | Home PLMN as `MCC-MNC`; drives V-PCF vs H-PCF role detection per serving PLMN. |
   | `PCF_UE_POLICY_DELIVERY` | on | Kill-switch: `off/0/false/disabled/no` disables URSP N1N2 delivery (association-only, pre-Wave-6 behavior). |
   | `PCF_T3501_SECS` | `30` | T3501 duration in seconds; zero/invalid falls back to 30. |

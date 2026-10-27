@@ -1417,6 +1417,18 @@ impl UdmContext {
         self.sess_list.read().map(|l| l.len()).unwrap_or(0)
     }
 
+    /// UEs with an AMF registered for 3GPP access (#1334, `/metrics`).
+    pub fn amf_registered_ue_count(&self) -> usize {
+        self.ue_list
+            .read()
+            .map(|l| {
+                l.values()
+                    .filter(|ue| ue.amf_3gpp_access_registration.is_some())
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     /// Get number of SDM subscriptions
     pub fn sdm_subscription_count(&self) -> usize {
         self.sdm_subscription_list

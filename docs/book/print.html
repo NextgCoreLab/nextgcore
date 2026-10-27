@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-8d7f3631.js";
+            window.path_to_searchindex_js = "searchindex-3c66c1c2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-be5dca41.js"></script>
@@ -1562,6 +1562,8 @@ ausf:
 <li><strong>No state files — everything is in-memory.</strong> A restart loses all auth contexts and the SoR/UPU anchors/counters. <code>DELETE .../{authCtxId}</code> zeroizes the context’s KAUSF/KSEAF/XRES* (TS 33.501 §6.1.4.1a per code comment) but deliberately keeps the per-SUPI anchor store so SoR/UPU keep working afterwards (TS 33.501 §6.14.1 per code comment).</li>
 <li><strong>Environment variables</strong> read by this binary: <code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code> (checked <em>before</em> the YAML; truthy = <code>1</code>/<code>true</code>/<code>TRUE</code>/<code>yes</code> — any other set value forces OAuth2 <strong>off</strong> even if the YAML says <code>true</code>), <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> (OTLP trace exporter, default <code>http://jaeger:4317</code>), and <code>UDM_SBI_ADDR</code>/<code>UDM_SBI_PORT</code> (UDM fallback only — NRF discovery results take precedence). With OAuth2 enabled but no NRF URI configured, the server fails closed and 503s every request (per the code comment referencing <code>nextgcore-sbi</code> <code>server.rs</code>).</li>
 </ul>
+<h2 id="metrics-endpoint-1334"><a class="header" href="#metrics-endpoint-1334">Metrics endpoint (#1334)</a></h2>
+<p><code>AUSF_METRICS_PORT</code> (default <code>9090</code>) and <code>NEXTGCORE_METRICS_BIND</code> (default <code>127.0.0.1</code>, #837) place the unauthenticated Prometheus <code>/metrics</code> endpoint. The compose file and manifests set <code>0.0.0.0</code> inside the private container/pod network and publish no host port; the Kubernetes Service port is ClusterIP. The series are listed in the <a href="#observability--troubleshooting">Observability</a> chapter.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="udm-configuration"><a class="header" href="#udm-configuration">UDM Configuration</a></h1>
 <p>The UDM (Unified Data Management, <code>nextgcore-udmd</code>) is the subscriber-data front-end of the core: it manages UE context registrations, serves subscription data, and generates 5G authentication vectors, backed by the UDR over <code>Nudr_DataRepository</code>. Its SBI router (<code>udm_sbi_request_handler</code> in <code>src/bins/nextgcore-udmd/src/app.rs</code>) routes all ten Nudm services (#85). It implements <code>Nudm_UECM</code> (<code>/nudm-uecm/v1</code> — AMF 3GPP/non-3GPP-access and SMF registrations, <code>dereg-amf</code>, TS 29.503 §5.3.3 per code comments), <code>Nudm_SDM</code> (<code>/nudm-sdm/v2</code> — am-data, sm-data, smf-select-data, nssai, ue-context-in-amf-data, <code>id-translation-result</code>, sdm-subscriptions with SDM notifications, and SoR/UPU acknowledgements; the other per-SUPI data sets are read-throughs that relay the UDR’s answer), <code>Nudm_UEAU</code> (<code>/nudm-ueau/v1</code> — <code>generate-auth-data</code> with 5G-AKA/EAP-AKA’ per TS 33.501 §6.1.2 as cited in the daemon source, plus <code>auth-events</code>), <code>Nudm_EE</code> (<code>/nudm-ee/v1</code> — event-exposure subscriptions with create/modify/delete and notifications, TS 29.503 §5.5 per code comments), <code>Nudm_PP</code> and <code>Nudm_MT</code> (partly: see below). <code>nudm-niddau</code>, <code>nudm-rsds</code>, <code>nudm-ssau</code> and <code>nudm-ueid</code> are recognised and answered <code>501</code>. SUCI deconcealment (SIDF role) is implemented in <code>context.rs</code> per TS 33.501 §6.12 as cited in the source, and Steering-of-Roaming / UE-Parameters-Update injection into am-data goes through the AUSF’s protection services (TS 33.501 §6.14.2.1 / §6.15.2.1 per code comments).</p>
@@ -1673,6 +1675,8 @@ udm:
 <li><strong>SoR/UPU acks are MAC-verified, single-use.</strong> When an am-data response carried a protected SoR/UPU payload, the expected XMAC-I_UE is pinned; the UE’s ack MAC is compared constant-time and a match yields 204 <em>and clears the pin</em> (a replayed ack is rejected). Mismatch or missing MAC → 400 (<code>SOR_MAC_FAILURE</code>/<code>UPU_MAC_FAILURE</code>/<code>MANDATORY_IE_MISSING</code>); a MAC with nothing outstanding → 400 <code>UNEXPECTED_MESSAGE</code>. A plain ack with nothing outstanding stays 204 (backward-compatible with the matched sim, which never sends acks, per code comment). <code>ueNotReachable: true</code> is recorded without a MAC check.</li>
 <li><strong>Environment variables</strong> read by this binary: <code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code> (<code>1</code>/<code>true</code>/<code>TRUE</code>/<code>yes</code> = on; checked <em>before</em> and overriding the YAML <code>sbi.oauth2.require</code>), <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> (OTLP tracing endpoint, default <code>http://jaeger:4317</code>), <code>NEXTGCORE_SBI_PROFILE</code> (see <a href="#configuration-overview">Configuration Overview</a>), and the peer fallbacks <code>UDR_SBI_ADDR</code>/<code>UDR_SBI_PORT</code>, <code>AUSF_SBI_ADDR</code>/<code>AUSF_SBI_PORT</code> and <code>AMF_SBI_ADDR</code>/<code>AMF_SBI_PORT</code> (the AMF that receives UECM deregistration notifications and Namf calls when none is cached) used only when NRF discovery yields no instance.</li>
 </ul>
+<h2 id="metrics-endpoint-1334-1"><a class="header" href="#metrics-endpoint-1334-1">Metrics endpoint (#1334)</a></h2>
+<p><code>UDM_METRICS_PORT</code> (default <code>9090</code>) and <code>NEXTGCORE_METRICS_BIND</code> (default <code>127.0.0.1</code>, #837) place the unauthenticated Prometheus <code>/metrics</code> endpoint. The compose file and manifests set <code>0.0.0.0</code> inside the private container/pod network and publish no host port; the Kubernetes Service port is ClusterIP. The series are listed in the <a href="#observability--troubleshooting">Observability</a> chapter.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="udr-configuration"><a class="header" href="#udr-configuration">UDR Configuration</a></h1>
 <p>The UDR (Unified Data Repository, <code>nextgcore-udrd</code>) stores and serves subscriber data to the UDM, policy data to the PCF, and exposure/application data, per TS 29.504 and TS 29.505 (as cited in the daemon’s source comments). It serves a single SBI service, <code>Nudr_DataRepository</code> (<code>/nudr-dr/v1/...</code>) — the request router in <code>udr_sbi_request_handler</code> returns 404 for any other service name. Under <code>nudr-dr</code> it implements the <code>subscription-data</code> tree (authentication-subscription, authentication-status, provisioned-data <code>am-data</code>/<code>smf-selection-subscription-data</code>/<code>sm-data</code> incl. the combined GET with <code>dataset-names</code> and the <code>fields</code> partial-retrieval parameter per TS 29.504 §6.1.4.2 code comments, context-data <code>amf-3gpp-access</code> and <code>smf-registrations</code>, and <code>subs-to-notify</code>), the <code>policy-data/ues/{supi}</code> tree (<code>am-data</code>, <code>sm-data</code>, <code>ue-policy-set</code> — TS 29.519 shapes per code comments), and the <code>exposure-data</code> and <code>application-data</code> trees (<code>pfds</code> per TS 29.551 code comment, <code>influenceData</code>, plus their <code>subs-to-notify</code> subscriptions).</p>
@@ -1802,6 +1806,8 @@ out.</p>
 <ul>
 <li><strong>Environment variables</strong>: <code>DB_URI</code> (MongoDB URI; read only when the YAML has no <code>db_uri</code> line), <code>NEXTGCORE_UDR_STATE_FILE</code> (state-file path; read only when <code>--state-file</code> is absent — the flag wins), and <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> (OpenTelemetry OTLP exporter endpoint, default <code>http://jaeger:4317</code>).</li>
 </ul>
+<h2 id="metrics-endpoint-1334-2"><a class="header" href="#metrics-endpoint-1334-2">Metrics endpoint (#1334)</a></h2>
+<p><code>UDR_METRICS_PORT</code> (default <code>9090</code>) and <code>NEXTGCORE_METRICS_BIND</code> (default <code>127.0.0.1</code>, #837) place the unauthenticated Prometheus <code>/metrics</code> endpoint. The compose file and manifests set <code>0.0.0.0</code> inside the private container/pod network and publish no host port; the Kubernetes Service port is ClusterIP. The series are listed in the <a href="#observability--troubleshooting">Observability</a> chapter.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="pcf-configuration"><a class="header" href="#pcf-configuration">PCF Configuration</a></h1>
 <p>The PCF (Policy Control Function, <code>nextgcore-pcfd</code>) makes access-, session-, and application-level policy decisions for the 5G core, per TS 29.507, TS 29.512, TS 29.514 and TS 29.525 (as cited in the daemon’s source comments). Its SBI router (<code>pcf_sbi_request_handler</code> in <code>src/bins/nextgcore-pcfd/src/app.rs</code>) serves five services: <code>Npcf_AMPolicyControl</code> (<code>/npcf-am-policy-control/v1/policies</code>), <code>Npcf_SMPolicyControl</code> (<code>/npcf-smpolicycontrol/v1/sm-policies</code>), <code>Npcf_PolicyAuthorization</code> (<code>/npcf-policyauthorization/v1/app-sessions</code>), <code>Npcf_UEPolicyControl</code> (<code>/npcf-ue-policy-control/v1/policies</code>), and <code>Npcf_EventExposure</code> (<code>/npcf-eventexposure/v1/subscriptions</code>, TS 29.523), plus a <code>N1MessageNotify</code> callback route (<code>/npcf-ue-policy-control/v1/notify/{polAssoId}/n1-message-notify</code>, TS 29.518 per code comments) on which the AMF returns the UE’s MANAGE UE POLICY COMPLETE/REJECT. The binary itself is a thin wrapper: <code>main.rs</code> only calls <code>nextgcore_pcfd::run()</code>; all logic lives in the library crate (<code>lib.rs</code>/<code>app.rs</code>, Wave-6 lib-targetization).</p>
@@ -1939,6 +1945,8 @@ pcf:
 <tbody>
 <tr><td><code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code></td><td>unset (follow YAML)</td><td><code>1/true/TRUE/yes</code> forces OAuth2 enforcement on; any other value forces it off. Checked <strong>before</strong> the YAML knob.</td></tr>
 <tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td><td><code>http://jaeger:4317</code></td><td>OTLP endpoint for OpenTelemetry tracing.</td></tr>
+<tr><td><code>PCF_METRICS_PORT</code></td><td><code>9090</code></td><td>Port of the Prometheus <code>/metrics</code> endpoint (#1334).</td></tr>
+<tr><td><code>NEXTGCORE_METRICS_BIND</code></td><td><code>127.0.0.1</code></td><td>Host the unauthenticated <code>/metrics</code> listener binds to (#837). The compose file and manifests set <code>0.0.0.0</code> inside the private container/pod network and publish no host port.</td></tr>
 <tr><td><code>PCF_LOCAL_PLMN</code></td><td><code>001-01</code></td><td>Home PLMN as <code>MCC-MNC</code>; drives V-PCF vs H-PCF role detection per serving PLMN.</td></tr>
 <tr><td><code>PCF_UE_POLICY_DELIVERY</code></td><td>on</td><td>Kill-switch: <code>off/0/false/disabled/no</code> disables URSP N1N2 delivery (association-only, pre-Wave-6 behavior).</td></tr>
 <tr><td><code>PCF_T3501_SECS</code></td><td><code>30</code></td><td>T3501 duration in seconds; zero/invalid falls back to 30.</td></tr>
@@ -2074,6 +2082,8 @@ nssf:
 <li><strong>Config parse errors are silent.</strong> The YAML is parsed with <code>if let Ok(...)</code>: a type mismatch anywhere (e.g. a non-numeric <code>sst</code>) silently discards the <em>entire</em> <code>nssf</code> section and the daemon proceeds on CLI defaults — check the startup log for the expected “NRF URI configured” / “Target AMF Set configured” lines.</li>
 <li><strong>Environment variables:</strong> <code>NEXTGCORE_NSSF_STATE_FILE</code> (state-file path; lower precedence than <code>--state-file</code>) and <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> (OpenTelemetry OTLP exporter endpoint, default <code>http://jaeger:4317</code>). <code>RUST_LOG</code> is <strong>not</strong> honored by this binary.</li>
 </ul>
+<h2 id="metrics-endpoint-1334-3"><a class="header" href="#metrics-endpoint-1334-3">Metrics endpoint (#1334)</a></h2>
+<p><code>NSSF_METRICS_PORT</code> (default <code>9090</code>) and <code>NEXTGCORE_METRICS_BIND</code> (default <code>127.0.0.1</code>, #837) place the unauthenticated Prometheus <code>/metrics</code> endpoint. The compose file and manifests set <code>0.0.0.0</code> inside the private container/pod network and publish no host port; the Kubernetes Service port is ClusterIP. The series are listed in the <a href="#observability--troubleshooting">Observability</a> chapter.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="bsf-configuration"><a class="header" href="#bsf-configuration">BSF Configuration</a></h1>
 <p>The BSF (Binding Support Function, <code>nextgcore-bsfd</code>) stores and serves PCF binding information so that policy consumers (e.g. an AF or NEF via PCF) can find the PCF that owns a given PDU session, UE, or MBS session. It serves the <code>Nbsf_Management</code> API (TS 29.521, as cited throughout the daemon’s source comments): <code>/nbsf-management/v1/pcfBindings</code> (PDU-session bindings, full POST/GET/PATCH/DELETE plus query-based discovery), <code>/nbsf-management/v1/pcf-ue-bindings</code> (UE-policy bindings, TS 29.521 §4.2.2.3/§4.2.4.3 per code comments), and <code>/nbsf-management/v1/pcf-mbs-bindings</code> (MBS-session bindings, TS 29.521 §4.2.2.4/§4.2.4.4 per code comments). It also serves <code>/nbsf-management/v1/subscriptions</code> (event Subscribe/Unsubscribe/Notify, TS 29.521 §4.2.6–§4.2.8) — new in #98, which removed the <code>bsfd-13</code> 501 stub that sat on <code>pcfBindings/.../subscriptions</code>, a path the spec does not define, while the spec’s own top-level resource was unrouted and answered 405. Routing and handlers live in <code>bsf_sbi_request_handler</code> in <code>src/bins/nextgcore-bsfd/src/lib.rs</code> — since the Wave-6 H1 lib-targetization, <code>main.rs</code> is a thin wrapper around <code>nextgcore_bsfd::run()</code>.</p>
@@ -2227,6 +2237,8 @@ protocol addition rather than a storage change;</li>
 <li>the durable-snapshot hazards this project has already paid for elsewhere: restore <strong>before</strong> the SBI
 listener accepts, persist removals as well as inserts, and never resurrect a deleted record.</li>
 </ol>
+<h2 id="metrics-endpoint-1334-4"><a class="header" href="#metrics-endpoint-1334-4">Metrics endpoint (#1334)</a></h2>
+<p><code>BSF_METRICS_PORT</code> (default <code>9090</code>) and <code>NEXTGCORE_METRICS_BIND</code> (default <code>127.0.0.1</code>, #837) place the unauthenticated Prometheus <code>/metrics</code> endpoint. The compose file and manifests set <code>0.0.0.0</code> inside the private container/pod network and publish no host port; the Kubernetes Service port is ClusterIP. The series are listed in the <a href="#observability--troubleshooting">Observability</a> chapter.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="nwdaf-configuration"><a class="header" href="#nwdaf-configuration">NWDAF Configuration</a></h1>
 <p>The NWDAF (Network Data Analytics Function, <code>nextgcore-nwdafd</code>) collects network data from other NFs and serves analytics to consumers (AMF, SMF, PCF, etc.), per TS 23.288 as cited in the daemon’s module docs. Its SBI router serves three producer services: <code>Nnwdaf_AnalyticsInfo</code> (<code>GET /nnwdaf-analyticsinfo/v1/analytics</code> — HTTP GET with an <code>event-id</code> query parameter, TS 29.520 §4.3.2.2.2 per code comment), <code>Nnwdaf_EventsSubscription</code> (<code>POST /nnwdaf-eventssubscription/v1/subscriptions</code> plus <code>GET</code>/<code>PUT</code>/<code>DELETE</code> on <code>/subscriptions/{id}</code>), and <code>Nnwdaf_MLModelProvision</code> (<code>POST /nnwdaf-mlmodelprovision/v1/subscriptions</code> plus <code>PUT</code>/<code>DELETE</code> on <code>/subscriptions/{id}</code> — a Subscribe/Notify resource; the daemon deliberately serves no <code>/models</code> registry). It also exposes one consumer callback, <code>POST /nnwdaf-nfstatus-notify/v1/notify</code>, where the NRF delivers <code>Nnrf_NFManagement</code> NFStatusNotify bodies (TS 29.510 §5.2.2.6 per code comment) that feed the NF_LOAD analytics.</p>
@@ -4270,11 +4282,11 @@ diameter-layer issue; persistence needs nothing from it.</p>
 <h1 id="observability--troubleshooting"><a class="header" href="#observability--troubleshooting">Observability &amp; Troubleshooting</a></h1>
 <p>NextGCore ships a Docker-based observability stack (Prometheus, Grafana, Jaeger) alongside its 28 network-function daemons, plus an in-tree metrics/tracing library (<code>src/libs/nextgcore-metrics/</code>). This chapter documents what actually works today — which endpoints exist, which are scaffolding, how logging is really configured per NF — and gives a code-grounded troubleshooting table and the one-command E2E recipe.</p>
 <blockquote>
-<p><strong>Honesty note:</strong> NextGCore behavior is validated by this project’s own unit tests and matched-simulator docker E2E (run nightly by <code>.github/workflows/ci.yml</code>), not by third-party conformance certification. The observability stack described here is exactly what ships in this repo — it is <strong>not</strong> a certified telco OAM system. In particular, the library <code>MetricsServer</code> and the OpenTelemetry OTLP exporters in <code>nextgcore-metrics</code> are <strong>structural stubs</strong>. smfd, upfd, sgwud, amfd and nrfd serve runtime metrics over HTTP through a separate helper (amfd and nrfd also the families every SBI NF shares, below); every other NF serves no scrapeable metrics yet (#1334 adds them NF by NF), and no NF exports spans. Each gap is called out explicitly below.</p>
+<p><strong>Honesty note:</strong> NextGCore behavior is validated by this project’s own unit tests and matched-simulator docker E2E (run nightly by <code>.github/workflows/ci.yml</code>), not by third-party conformance certification. The observability stack described here is exactly what ships in this repo — it is <strong>not</strong> a certified telco OAM system. In particular, the library <code>MetricsServer</code> and the OpenTelemetry OTLP exporters in <code>nextgcore-metrics</code> are <strong>structural stubs</strong>. smfd, upfd, sgwud and the eight 5GC SBI NFs (amfd, nrfd, pcfd, ausfd, udmd, udrd, bsfd, nssfd) serve runtime metrics over HTTP through a separate helper (the 5GC SBI NFs also the families every SBI NF shares, below); every other NF serves no scrapeable metrics yet (#1334 adds them NF by NF), and no NF exports spans. Each gap is called out explicitly below.</p>
 </blockquote>
 <h2 id="metrics"><a class="header" href="#metrics">Metrics</a></h2>
 <h3 id="what-the-library-provides--and-what-it-does-not"><a class="header" href="#what-the-library-provides--and-what-it-does-not">What the library provides — and what it does not</a></h3>
-<p><code>src/libs/nextgcore-metrics/src/server.rs</code> defines a <code>MetricsServer</code> documented to serve two HTTP endpoints — <code>/</code> (health check, returns “OK”) and <code>/metrics</code> (Prometheus text exposition) — and <code>src/libs/nextgcore-metrics/src/lib.rs</code> defines <code>DEFAULT_PROMETHEUS_HTTP_PORT: u16 = 9090</code>. However, <code>MetricsServer::start()</code> does <strong>not</strong> bind a socket: it logs <code>metrics_server() [http://&lt;addr&gt;]:&lt;port&gt;</code>, flips its state to <code>Running</code>, and returns (the code comment reads “In a real implementation, this would start an HTTP server using hyper”). What does serve HTTP is a different, minimal helper: <code>nextgcore_metrics::nes_energy::serve_metrics(addr, render)</code> (<code>src/libs/nextgcore-metrics/src/nes_energy.rs</code>) binds a TCP listener, logs <code>metrics endpoint listening on http://&lt;addr&gt;/metrics</code>, and answers with whatever text the NF’s <code>render</code> closure returns. Five daemons call it unconditionally, and two more behind off-by-default cargo features:</p>
+<p><code>src/libs/nextgcore-metrics/src/server.rs</code> defines a <code>MetricsServer</code> documented to serve two HTTP endpoints — <code>/</code> (health check, returns “OK”) and <code>/metrics</code> (Prometheus text exposition) — and <code>src/libs/nextgcore-metrics/src/lib.rs</code> defines <code>DEFAULT_PROMETHEUS_HTTP_PORT: u16 = 9090</code>. However, <code>MetricsServer::start()</code> does <strong>not</strong> bind a socket: it logs <code>metrics_server() [http://&lt;addr&gt;]:&lt;port&gt;</code>, flips its state to <code>Running</code>, and returns (the code comment reads “In a real implementation, this would start an HTTP server using hyper”). What does serve HTTP is a different, minimal helper: <code>nextgcore_metrics::nes_energy::serve_metrics(addr, render)</code> (<code>src/libs/nextgcore-metrics/src/nes_energy.rs</code>) binds a TCP listener, logs <code>metrics endpoint listening on http://&lt;addr&gt;/metrics</code>, and answers with whatever text the NF’s <code>render</code> closure returns. Eleven daemons call it unconditionally, and two more behind off-by-default cargo features:</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -4286,7 +4298,13 @@ diameter-layer issue; persistence needs nothing from it.</p>
 <tr><td><code>nextgcore-sgwud</code></td><td><code>sgwu_pfcp_sessions</code>, <code>sgwu_pfcp_associations</code>, <code>sgwu_pfcp_unauthorized_messages_total</code>, <code>sgwu_up</code></td><td>9090, or <code>SGWU_METRICS_PORT</code></td></tr>
 <tr><td><code>nextgcore-amfd</code></td><td>the shared SBI, NRF-client and process families (below), and the AMF families (below)</td><td>9090, or <code>AMF_METRICS_PORT</code></td></tr>
 <tr><td><code>nextgcore-nrfd</code></td><td>the shared SBI and process families (it is no NRF client), and the NRF families (below)</td><td>9090, or <code>NRF_METRICS_PORT</code></td></tr>
-<tr><td><code>nextgcore-udmd</code></td><td>NES energy gauges, only with <code>--features nes</code></td><td>NES <code>metrics_port</code> (default 9090)</td></tr>
+<tr><td><code>nextgcore-pcfd</code></td><td>the shared SBI, NRF-client and process families, and the PCF families (below)</td><td>9090, or <code>PCF_METRICS_PORT</code></td></tr>
+<tr><td><code>nextgcore-ausfd</code></td><td>the shared SBI, NRF-client and process families, and the AUSF families (below)</td><td>9090, or <code>AUSF_METRICS_PORT</code></td></tr>
+<tr><td><code>nextgcore-udmd</code></td><td>the shared SBI, NRF-client and process families, and the UDM families (below)</td><td>9090, or <code>UDM_METRICS_PORT</code></td></tr>
+<tr><td><code>nextgcore-udrd</code></td><td>the shared SBI, NRF-client and process families, and the UDR families (below)</td><td>9090, or <code>UDR_METRICS_PORT</code></td></tr>
+<tr><td><code>nextgcore-bsfd</code></td><td>the shared SBI, NRF-client and process families, and the BSF families (below)</td><td>9090, or <code>BSF_METRICS_PORT</code></td></tr>
+<tr><td><code>nextgcore-nssfd</code></td><td>the shared SBI, NRF-client and process families, and the NSSF families (below)</td><td>9090, or <code>NSSF_METRICS_PORT</code></td></tr>
+<tr><td><code>nextgcore-udmd</code> (NES)</td><td>NES energy gauges, only with <code>--features nes</code>: served on the UDM endpoint above, and on their own listener only when NES <code>metrics_port</code> differs from <code>UDM_METRICS_PORT</code></td><td>NES <code>metrics_port</code> (default 9090)</td></tr>
 <tr><td><code>nextgcore-nsacfd</code></td><td>slice-SLA observe gauges, only with <code>--features sla-observe</code></td><td>its <code>metrics_port</code> when &gt; 0</td></tr>
 </tbody>
 </table>
@@ -4304,8 +4322,6 @@ The other NF daemons serve **no** Prometheus metrics over HTTP:
 
 | NF daemon | Prometheus metrics served | Notes |
 |---|---|---|
-| `nextgcore-ausfd` | none | Links `nextgcore-metrics`; calls `otel::init_otel` at startup (`src/app.rs`). |
-| `nextgcore-bsfd` | none | Same; `init_otel` in `src/lib.rs`. |
 | `nextgcore-dccfd` | none | Same; `init_otel` in `src/main.rs`. |
 | `nextgcore-eesd` | none | Same. |
 | `nextgcore-hssd` | none | Same. |
@@ -4313,16 +4329,12 @@ The other NF daemons serve **no** Prometheus metrics over HTTP:
 | `nextgcore-mbsmfd` | none | Same. |
 | `nextgcore-mmed` | none | Same. |
 | `nextgcore-nsacfd` | none by default | Same. SLA-observe gauges with `--features sla-observe` (above). |
-| `nextgcore-nssfd` | none | Same. |
 | `nextgcore-nwdafd` | none | Same. |
-| `nextgcore-pcfd` | none | Same; `init_otel` in `src/app.rs`. |
 | `nextgcore-pcrfd` | none | Same. |
 | `nextgcore-pind` | none | Same. |
 | `nextgcore-scpd` | none | Same. |
 | `nextgcore-seppd` | none | Same. |
 | `nextgcore-sgwcd` | none | Same. |
-| `nextgcore-udmd` | none by default | Same; `init_otel` in `src/app.rs`. NES gauges with `--features nes` (above). |
-| `nextgcore-udrd` | none | Same. |
 | `nextgcore-easdfd`, `nextgcore-nefd`, `nextgcore-tsctsf`, `nextgcore-ucmfd` | none | Same. |
 
 Apart from the `serve_metrics` callers above, the NF crates use `nextgcore-metrics` only for the `init_otel` call (see Tracing).
@@ -4344,7 +4356,7 @@ Recorded by the shared SBI server and NRF heartbeat worker (`nextgcore-sbi`), so
 | `nextgcore_uptime_seconds` | gauge | | since process start |
 | `nextgcore_build_info` | gauge | `nf`, `version` | constant 1 |
 
-`service` is one of a fixed list of SBI service names (`namf-comm`, `nudm-sdm`, ...; `nnrf-oauth2` for `/oauth2/token`), else `other`: never the request's own text. `operation` is the method and the resource template: the path after the service and version, with every segment that is not a resource name replaced by `{id}` (`GET {id}/am-data`, `PUT nf-instances/{id}`). A template is named only once the NF has answered it with a non-error status, at most 64 per service; before that an error answer is `unmatched`, past the cap `other`. A made-up path is answered 404/405, so no client text becomes a label value, and a SUPI, GPSI, PEI, UUID, IP address or numeric reference never appears in one. Past 1024 label sets, new ones are counted under `service="other",operation="other"`. Recording takes shared locks and atomic increments only, so it never serialises SBI requests.
+`service` is one of a fixed list of SBI service names (`namf-comm`, `nudm-sdm`, ...; `nnrf-oauth2` for `/oauth2/token`), else `other`: never the request's own text. `operation` is the method and the resource template: the path after the service and version, with every segment that is not a resource name replaced by `{id}` (`GET {id}/am-data`, `PUT nf-instances/{id}`). A template is named only once the NF has answered it with a 2xx, at most 64 per service; before that any other answer is `unmatched`, past the cap `other`. A made-up path is answered with an error (each NF's `/metrics` test checks this for every service it serves), so no client text becomes a label value, and a SUPI, GPSI, PEI, UUID, IP address or numeric reference never appears in one. Past 1024 label sets, new ones are counted under `service="other",operation="other"`. Recording takes shared locks and atomic increments only, so it never serialises SBI requests.
 
 ### AMF families (`src/bins/nextgcore-amfd/src/metrics.rs`, #1334)
 
@@ -4383,9 +4395,38 @@ The NAS counters follow TS 28.552 §5.2.2 "on transmission"/"on receipt": a prot
 | `nrf_discovery_empty_total` | counter | | SearchResults that matched no instance (routine for an optional NF type that is not deployed) |
 | `nrf_access_tokens_total` | counter | `result` (`granted`, `denied`) | access token requests |
 
+### PCF families (`src/bins/nextgcore-pcfd/src/metrics.rs`, #1334)
+
+| Metric | Type | Labels | Counts |
+|---|---|---|---|
+| `pcf_policy_associations` | gauge | `policy` (`am` TS 29.507, `sm` TS 29.512, `ue` TS 29.525, `app_session` TS 29.514) | associations the PCF holds |
+| `pcf_event_subscriptions` | gauge | | Npcf_EventExposure subscriptions held (TS 29.523) |
+| `pcf_policy_operations_total` | counter | `policy`, `operation` (`create`, `update`, `delete`), `result` (`success` = 2xx, `failure`) | association operations answered |
+
+### AUSF, UDM, UDR, BSF and NSSF families (#1334)
+
+Each NF's `metrics.rs`. Every `result` is `success` for a 2xx answer, else `failure`; every other label value is a fixed name in the code, never request data.
+
+| Metric | Type | Labels | Counts |
+|---|---|---|---|
+| `ausf_operations_total` | counter | `operation` (`authenticate`, `5g_aka_confirmation`, `eap_session`, `deregister`, `delete`, `sor_protection`, `upu_protection`), `result` | Nausf operations answered (TS 29.509) |
+| `ausf_authentication_results_total` | counter | `method` (`5g_aka`, `eap_aka_prime`), `result` | verdicts returned, read from `authResult` (a failed authentication is still a 200) |
+| `ausf_ue_authentication_contexts`, `ausf_kausf_anchors` | gauge | | contexts held, KAUSF anchors stored |
+| `udm_operations_total` | counter | `service` (a TS 29.503 Nudm service), `operation` (`generate_auth_data`, `auth_event`, `auth_event_cancel`, `amf_registration`, `amf_registration_update`, `amf_deregistration`, `smf_registration`, `smf_deregistration`, `get_registrations`, `get`, `subscribe`, `unsubscribe`, `modify_subscription`, `other`), `result` | Nudm operations answered |
+| `udm_ue_contexts`, `udm_amf_registered_ues`, `udm_pdu_sessions`, `udm_sdm_subscriptions` | gauge | | UE contexts, UEs with an AMF registered for 3GPP access, SMF-registered PDU sessions, SDM subscriptions |
+| `udr_operations_total` | counter | `data` (`subscription_data`, `policy_data`, `application_data`, `exposure_data`, `data_change_subscription`, `group_id_map`, `other`), `operation` (`query`, `create`, `create_or_replace`, `update`, `delete`), `result` | Nudr operations answered (TS 29.504, TS 29.598) |
+| `udr_ue_contexts` | gauge | | UE contexts held |
+| `bsf_binding_operations_total` | counter | `binding` (`pdu`, `ue`, `mbs`), `operation` (`register`, `discovery`, `retrieve`, `update`, `deregister`), `result` | Nbsf_Management binding operations answered (TS 29.521); a discovery that matches nothing is a 204, a success |
+| `bsf_subscription_operations_total` | counter | `operation` (`subscribe`, `modify`, `unsubscribe`), `result` | event subscription operations |
+| `bsf_pcf_bindings` | gauge | `binding` | bindings held |
+| `bsf_subscriptions` | gauge | | event subscriptions held |
+| `nssf_selections_total` | counter | `result` | Nnssf_NSSelection_Get answered (TS 29.531 §5.2) |
+| `nssf_availability_operations_total` | counter | `operation` (`update`, `patch`, `delete`, `subscribe`, `unsubscribe`, `modify_subscription`), `result` | Nnssf_NSSAIAvailability operations (§5.3) |
+| `nssf_nssai_availability_nfs`, `nssf_subscriptions`, `nssf_network_slice_instances` | gauge | | stored availability documents, subscriptions, configured slice instances |
+
 ### No `metrics.server` in the YAML (#1312)
 
-No daemon reads a `metrics.server` block, and several have no metrics listener at all (hssd, pcfd, pcrfd). The shipped configs used to carry one anyway (docker `5gc` amf/pcf/smf/upf, `epc` mme/hss/pcrf/pgwc/pgwu, and the k8s and Helm ConfigMaps). A key that is documented but has no effect is misleading, so the blocks were removed rather than wired up: a daemon's metrics listener is set by its environment variable, `MME_METRICS_ADDR`, `NEXTGCORE_METRICS_BIND` (loopback by default, #1308), `SMF_METRICS_PORT`, `AMF_METRICS_PORT`, `NRF_METRICS_PORT`, `UPF_METRICS_PORT`, `SGWC_METRICS_PORT`, `SGWU_METRICS_PORT` or `UCMF_METRICS_ADDR`, and nothing else.
+No daemon reads a `metrics.server` block, and several have no metrics listener at all (hssd, pcrfd). The shipped configs used to carry one anyway (docker `5gc` amf/pcf/smf/upf, `epc` mme/hss/pcrf/pgwc/pgwu, and the k8s and Helm ConfigMaps). A key that is documented but has no effect is misleading, so the blocks were removed rather than wired up: a daemon's metrics listener is set by its environment variable, `MME_METRICS_ADDR`, `NEXTGCORE_METRICS_BIND` (loopback by default, #1308), `SMF_METRICS_PORT`, `AMF_METRICS_PORT`, `NRF_METRICS_PORT`, `PCF_METRICS_PORT`, `AUSF_METRICS_PORT`, `UDM_METRICS_PORT`, `UDR_METRICS_PORT`, `BSF_METRICS_PORT`, `NSSF_METRICS_PORT`, `UPF_METRICS_PORT`, `SGWC_METRICS_PORT`, `SGWU_METRICS_PORT` or `UCMF_METRICS_ADDR`, and nothing else.
 
 ### The shipped scrape stack
 

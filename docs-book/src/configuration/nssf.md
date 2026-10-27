@@ -120,3 +120,7 @@ From the clap `Args` struct in `src/bins/nextgcore-nssfd/src/main.rs`:
 - **State persistence is per-mutation, not shutdown-only.** With a state file configured, subscriptions and availability documents are atomically rewritten on every add/update/delete and reloaded at startup; a corrupt or missing file is logged and skipped, starting empty.
 - **Config parse errors are silent.** The YAML is parsed with `if let Ok(...)`: a type mismatch anywhere (e.g. a non-numeric `sst`) silently discards the *entire* `nssf` section and the daemon proceeds on CLI defaults — check the startup log for the expected "NRF URI configured" / "Target AMF Set configured" lines.
 - **Environment variables:** `NEXTGCORE_NSSF_STATE_FILE` (state-file path; lower precedence than `--state-file`) and `OTEL_EXPORTER_OTLP_ENDPOINT` (OpenTelemetry OTLP exporter endpoint, default `http://jaeger:4317`). `RUST_LOG` is **not** honored by this binary.
+
+## Metrics endpoint (#1334)
+
+`NSSF_METRICS_PORT` (default `9090`) and `NEXTGCORE_METRICS_BIND` (default `127.0.0.1`, #837) place the unauthenticated Prometheus `/metrics` endpoint. The compose file and manifests set `0.0.0.0` inside the private container/pod network and publish no host port; the Kubernetes Service port is ClusterIP. The series are listed in the [Observability](../observability.md) chapter.

@@ -131,3 +131,7 @@ storage-topology decision rather than a config line, so it is deliberately left
 out.
 
 - **Environment variables**: `DB_URI` (MongoDB URI; read only when the YAML has no `db_uri` line), `NEXTGCORE_UDR_STATE_FILE` (state-file path; read only when `--state-file` is absent — the flag wins), and `OTEL_EXPORTER_OTLP_ENDPOINT` (OpenTelemetry OTLP exporter endpoint, default `http://jaeger:4317`).
+
+## Metrics endpoint (#1334)
+
+`UDR_METRICS_PORT` (default `9090`) and `NEXTGCORE_METRICS_BIND` (default `127.0.0.1`, #837) place the unauthenticated Prometheus `/metrics` endpoint. The compose file and manifests set `0.0.0.0` inside the private container/pod network and publish no host port; the Kubernetes Service port is ClusterIP. The series are listed in the [Observability](../observability.md) chapter.
