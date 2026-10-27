@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-99ff0175.js";
+            window.path_to_searchindex_js = "../searchindex-80dd90d1.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -301,7 +301,7 @@ smf:
 | <code>UDM_SBI_ADDR</code> / <code>UDM_SBI_PORT</code> | unset / <code>7777</code> | UDM address for <code>Nudm_SDM_Get(smf-select-data)</code>, used only to resolve the <strong>subscribed default DNN</strong> (#204). Tried <strong>after</strong> NRF discovery, so it is the fallback for a deployment with no NRF. With neither available, a <code>SmContextCreateData</code> carrying no <code>dnn</code> is refused with <code>500 SYSTEM_FAILURE</code> (<code>504 PEER_NOT_RESPONDING</code> when the UDM does not answer). |
 | <code>NRF_URI</code> | unset | NRF URI, used when the YAML names none. |
 | <code>PCF_URI</code> / <code>NSACF_URI</code> | unset | PCF / NSACF endpoint, tried before NRF discovery. With no NSACF configured or discoverable, slice admission control is skipped. |
-| <code>SMF_METRICS_PORT</code> | <code>9090</code> | Prometheus endpoint port. |
+| <code>SMF_METRICS_PORT</code> | <code>9090</code> | Prometheus endpoint port: the shared families, the PDU session establishment counters (#1368) and the SMF gauges; see the Observability chapter. |
 | <code>NEXTGCORE_METRICS_BIND</code> | <code>127.0.0.1</code> | Host the unauthenticated <code>/metrics</code> listener binds to (#837). The compose files and manifests set <code>0.0.0.0</code> inside the private container/pod network. |
 | <code>SMF_UDM</code> | off | <code>1</code>/<code>true</code> turns on the UDM interaction of TS 23.502 §4.3.2.2.1 step 4 (UECM registration, SM-data subscription, #79). Off by default because the E2E harness has no conformant UDM. |
 | <code>SMF_EPS_INTERWORKING</code> | off | <code>1</code>/<code>true</code> makes an establishing PDU session request an EPS Bearer Identity from the AMF and send Mapped EPS bearer contexts to the UE, so the session can later move to the EPC (#117). |

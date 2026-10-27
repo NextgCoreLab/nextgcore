@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-99ff0175.js";
+            window.path_to_searchindex_js = "searchindex-80dd90d1.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-be5dca41.js"></script>
@@ -899,7 +899,7 @@ smf:
 | <code>UDM_SBI_ADDR</code> / <code>UDM_SBI_PORT</code> | unset / <code>7777</code> | UDM address for <code>Nudm_SDM_Get(smf-select-data)</code>, used only to resolve the <strong>subscribed default DNN</strong> (#204). Tried <strong>after</strong> NRF discovery, so it is the fallback for a deployment with no NRF. With neither available, a <code>SmContextCreateData</code> carrying no <code>dnn</code> is refused with <code>500 SYSTEM_FAILURE</code> (<code>504 PEER_NOT_RESPONDING</code> when the UDM does not answer). |
 | <code>NRF_URI</code> | unset | NRF URI, used when the YAML names none. |
 | <code>PCF_URI</code> / <code>NSACF_URI</code> | unset | PCF / NSACF endpoint, tried before NRF discovery. With no NSACF configured or discoverable, slice admission control is skipped. |
-| <code>SMF_METRICS_PORT</code> | <code>9090</code> | Prometheus endpoint port. |
+| <code>SMF_METRICS_PORT</code> | <code>9090</code> | Prometheus endpoint port: the shared families, the PDU session establishment counters (#1368) and the SMF gauges; see the Observability chapter. |
 | <code>NEXTGCORE_METRICS_BIND</code> | <code>127.0.0.1</code> | Host the unauthenticated <code>/metrics</code> listener binds to (#837). The compose files and manifests set <code>0.0.0.0</code> inside the private container/pod network. |
 | <code>SMF_UDM</code> | off | <code>1</code>/<code>true</code> turns on the UDM interaction of TS 23.502 §4.3.2.2.1 step 4 (UECM registration, SM-data subscription, #79). Off by default because the E2E harness has no conformant UDM. |
 | <code>SMF_EPS_INTERWORKING</code> | off | <code>1</code>/<code>true</code> makes an establishing PDU session request an EPS Bearer Identity from the AMF and send Mapped EPS bearer contexts to the UE, so the session can later move to the EPC (#117). |
@@ -4293,8 +4293,8 @@ diameter-layer issue; persistence needs nothing from it.</p>
 <tr><th>NF daemon</th><th>Metrics served on <code>/metrics</code></th><th>Port</th></tr>
 </thead>
 <tbody>
-<tr><td><code>nextgcore-smfd</code></td><td><code>smf_n4_associations</code>, <code>smf_n4_peers</code>, <code>smf_sessions</code>, <code>smf_up</code> (and the PGW-C S5/S8 binding)</td><td>9090, or <code>SMF_METRICS_PORT</code></td></tr>
-<tr><td><code>nextgcore-upfd</code></td><td><code>upf_pfcp_associations</code>, <code>upf_pfcp_sessions</code>, <code>upf_pfcp_unauthorized_messages_total</code>, <code>upf_up</code>, <code>upf_dataplane_{ul,dl}_{packets,bytes}_total</code> and dropped/oversize/spoofed packet counters</td><td>9090, or <code>UPF_METRICS_PORT</code></td></tr>
+<tr><td><code>nextgcore-smfd</code></td><td>the shared SBI, NRF-client and process families, the PDU session establishment counters (below), <code>smf_n4_associations</code>, <code>smf_n4_peers</code>, <code>smf_sessions</code>, <code>smf_up</code> (and the PGW-C S5/S8 binding)</td><td>9090, or <code>SMF_METRICS_PORT</code></td></tr>
+<tr><td><code>nextgcore-upfd</code></td><td>the shared NRF-client and process families (#1368), <code>upf_pfcp_associations</code>, <code>upf_pfcp_sessions</code>, <code>upf_pfcp_unauthorized_messages_total</code>, <code>upf_up</code>, <code>upf_dataplane_{ul,dl}_{packets,bytes}_total</code> and dropped/oversize/spoofed packet counters</td><td>9090, or <code>UPF_METRICS_PORT</code></td></tr>
 <tr><td><code>nextgcore-sgwud</code></td><td><code>sgwu_pfcp_sessions</code>, <code>sgwu_pfcp_associations</code>, <code>sgwu_pfcp_unauthorized_messages_total</code>, <code>sgwu_up</code></td><td>9090, or <code>SGWU_METRICS_PORT</code></td></tr>
 <tr><td><code>nextgcore-amfd</code></td><td>the shared SBI, NRF-client and process families (below), and the AMF families (below)</td><td>9090, or <code>AMF_METRICS_PORT</code></td></tr>
 <tr><td><code>nextgcore-nrfd</code></td><td>the shared SBI and process families (it is no NRF client), and the NRF families (below)</td><td>9090, or <code>NRF_METRICS_PORT</code></td></tr>
@@ -4381,6 +4381,17 @@ Recorded by the shared SBI server and NRF heartbeat worker (`nextgcore-sbi`), so
 
 The NAS counters follow TS 28.552 §5.2.2 "on transmission"/"on receipt": a protected downlink message is counted when NAS security protects it, an unprotected one when it is sent in a DOWNLINK NAS TRANSPORT, and a T3550/T3560 retransmission (a stored PDU sent again) is not counted. The Open5GS-named families still defined in the file (`fivegs_amffunction_*`, `ran_ue`, `amf_session`, `gnb`) are not served: nothing increments them.
 
+### SMF PDU session establishment (`src/bins/nextgcore-smfd/src/session_metrics.rs`, #1368)
+
+Counted at the Nsmf_PDUSession_CreateSMContext answer (TS 29.502 §5.2.2.2), modelled on TS 28.552 §5.3.1 (SM.PduSessionCreationReq / Succ / Fail.cause). An EPS→5GS handover create (§5.2.2.2.3) is a session moving in, not an establishment, and is not counted.
+
+| Metric | Type | Labels | Counts |
+|---|---|---|---|
+| `smf_session_requests_total` | counter | | establishment requests received |
+| `smf_session_success_total` | counter | | answered 201 with PDU SESSION ESTABLISHMENT ACCEPT |
+| `smf_session_failure_total` | counter | | refused (any other answer) |
+| `smf_session_failure_cause_total` | counter | `cause`: the 5GSM cause of the PDU SESSION ESTABLISHMENT REJECT (0..255, TS 24.501 §9.11.4.2), or `none` when the answer carries no N1 reject | refusals by cause |
+
 ### NRF families (`src/bins/nextgcore-nrfd/src/metrics.rs`, #1334)
 
 | Metric | Type | Labels | Counts |
@@ -4434,7 +4445,7 @@ No daemon reads a `metrics.server` block, and several have no metrics listener a
 
 - **Prometheus** (`prom/prometheus:v2.51.0`, container `nextgcore-prometheus`, `172.23.0.200`, host port `9090`) — config `docker/rust/configs/observability/prometheus.yml`: 15s scrape interval, static targets for 10 NFs (NRF, AUSF, UDM, UDR, PCF, NSSF, BSF, AMF, SMF, UPF) at their fixed `172.23.0.x:9090` addresses, each labeled with `nf_type` and `instance_name`, plus self-scrape. Every NF serves `/metrics` on 9090 inside the compose network (#1334), so all 10 jobs read `up == 1`; none publishes its metrics port on the host.
 - **Grafana** (`grafana/grafana:10.4.0`, `172.23.0.201`, host port `3000`, login `admin`/`nextgcore`) — provisioned datasources (`grafana-datasources.yml`: Prometheus at `http://172.23.0.200:9090`, Jaeger at `http://172.23.0.202:16686`) and dashboards from `configs/observability/dashboards/` with `overview.json` as the home dashboard.
-- **Alert rules** (`configs/observability/alert-rules.yml`): `NfInstanceDown` (`up == 0` for 1m), `NfSlowResponse`, `AmfHighRegistrationFailureRate`, `AmfHighUeCount`, `AmfAuthenticationFailureSpike`, `SmfPfcpAssociationDown` (`smf_n4_peers &gt; 0 and smf_n4_associations == 0`), `UpfHighDropRate` and `UpfGtpTunnelErrors` (on `upf_dataplane_*`), `NrfDiscoveryFailureRate`, `NrfLowRegisteredNfs`, `NfHighMemoryUsage`. Every series they and the dashboards query is exported by some NF. The CI job *Observability series* enforces this with `deploy/observability/check_metric_series.py` and runs `promtool check rules/config` on the rule file and both scrape configs (#1334). Two earlier rules queried series no process emits and were removed: the SMF session failure rate (no session counters yet, #1368) and `MongoDbDown` (no MongoDB exporter, #1369).
+- **Alert rules** (`configs/observability/alert-rules.yml`): `NfInstanceDown` (`up == 0` for 1m), `NfSlowResponse`, `AmfHighRegistrationFailureRate`, `AmfHighUeCount`, `AmfAuthenticationFailureSpike`, `SmfHighSessionFailureRate` (`smf_session_failure_total / (success + failure) &gt; 5%`, #1368), `SmfPfcpAssociationDown` (`smf_n4_peers &gt; 0 and smf_n4_associations == 0`), `UpfHighDropRate` and `UpfGtpTunnelErrors` (on `upf_dataplane_*`), `NrfDiscoveryFailureRate`, `NrfLowRegisteredNfs`, `NfHighMemoryUsage`. Every series they and the dashboards query is exported by some NF. The CI job *Observability series* enforces this with `deploy/observability/check_metric_series.py` and runs `promtool check rules/config` on the rule file and both scrape configs (#1334). `MongoDbDown` queried a series no target emitted and was removed until the MongoDB exporter exists (#1369).
 
 ## Tracing (OpenTelemetry)
 

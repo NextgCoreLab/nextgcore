@@ -238,6 +238,28 @@
       "fieldConfig": {
         "defaults": { "unit": "percentunit", "custom": { "lineWidth": 2 } }
       }
+    },
+    {
+      "title": "SMF - PDU Session Establishment Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 44 },
+      "targets": [
+        {
+          "expr": "rate(smf_session_success_total[5m])",
+          "legendFormat": "Accepted/s"
+        },
+        {
+          "expr": "rate(smf_session_failure_total[5m])",
+          "legendFormat": "Rejected/s"
+        },
+        {
+          "expr": "sum by (cause) (rate(smf_session_failure_cause_total[5m]))",
+          "legendFormat": "5GSM cause {{ cause }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "lineWidth": 2 } }
+      }
     }
   ],
   "schemaVersion": 39,
