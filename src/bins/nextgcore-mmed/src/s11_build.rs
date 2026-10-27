@@ -1063,8 +1063,9 @@ pub fn build_bearer_resource_command(
 // Tests
 // ============================================================================
 
-/// Encode APN to DNS wire format (label-length prefix per TS 23.003)
-fn encode_apn_dns(apn: &str) -> Vec<u8> {
+/// Encode APN to DNS wire format (label-length prefix per TS 23.003 §9.1). Shared by
+/// S11 and the NAS Access Point Name IE (TS 24.008 §10.5.6.1, #1350).
+pub(crate) fn encode_apn_dns(apn: &str) -> Vec<u8> {
     let mut result = Vec::new();
     for label in apn.split('.') {
         result.push(label.len() as u8);
