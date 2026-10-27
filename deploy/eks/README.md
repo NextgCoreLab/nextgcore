@@ -457,6 +457,45 @@ Enable with `EnableDataPlanePrivileges=true` on the stack **and**
 `ENABLE_DATAPLANE=true ./deploy-eks.sh`. Treat it as a separate exercise from
 control-plane bring-up.
 
+## SMF durable state (optional, off by default)
+
+By default smfd keeps its PFCP sessions, policy bindings and IPv4 allocations in
+memory. A graceful SMF restart therefore releases its N4 association and sends
+each UE a PDU Session Release Command #39, and the UE re-establishes its session
+(devtest1: data path back in about 7-16 s). With a state file
+(`NEXTGCORE_SMF_STATE_FILE` or `--state-file`), smfd keeps the association on
+shutdown, and the next incarnation restores the sessions and asks the UPF to
+retain them (PFCP Session Retention Information). No #39 is sent, and the UE
+keeps its session.
+
+The profiles leave it off. To try it, patch the running smf Deployment:
+
+```bash
+kubectl -n nextg-system patch deploy smf --type=json \
+  --patch-file examples/smf-durable-state-emptydir.json
+```
+
+`examples/smf-durable-state-emptydir.json` adds an `emptyDir` at
+`/var/lib/nextgcore-smf` and `NEXTGCORE_SMF_STATE_FILE=/var/lib/nextgcore-smf/state.json`.
+An `emptyDir` survives a **container** restart in the same pod, but not pod
+re-creation. Validated on devtest1 (run 4, nextgcore #1346) with
+`kubectl exec deploy/smf -- sh -c 'kill -TERM 1'`:
+- smfd logs `PFCP association kept on shutdown`, then `SMF durable state restored: 1 PFCP session(s) ...`;
+- upfd logs `PFCP Session Retention Information ...: kept 1 session(s)`;
+- the UE received no #39;
+- the uplink, downlink and paging all worked.
+
+**Surviving pod re-creation** (a delete, a node loss, a rollout) needs the state file on
+a PersistentVolume. Replace the `emptyDir` with a `persistentVolumeClaim` from an
+EBS-CSI (`ebs.csi.aws.com`, ReadWriteOnce, and the replica pinned to one) or EFS
+(`efs.csi.aws.com`) StorageClass. devtest1 has neither: its only class, `gp2`, uses
+the in-tree `kubernetes.io/aws-ebs` provisioner, which needs the EBS CSI driver
+on current EKS. Installing one is a cluster and IAM change.
+
+Remove the patch before re-running `deploy-eks.sh`. `kubectl apply` keeps fields
+that `kubectl patch` added, so delete them with a JSON patch that removes the env
+entry, the volume mount and the volume.
+
 ## Known limitations
 
 Infrastructure (see `Outputs.Caveats` in the template):
