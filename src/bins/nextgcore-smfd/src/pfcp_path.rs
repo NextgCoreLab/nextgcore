@@ -996,12 +996,6 @@ pub async fn client_for_peer(
     }
 }
 
-/// One association attempt for a client that is not associated (#658).
-///
-/// A UPF named by hostname is re-resolved first, every attempt: a restarted UPF
-/// pod comes back at a new address, and the previous one will never answer.
-/// Before #658 the endpoint was fixed at startup, so the SMF retried a dead IP
-/// forever and rejected every PDU session with #26.
 /// The first retry of a refused or unanswered Association Setup (#1341).
 pub const ASSOCIATION_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -1035,33 +1029,47 @@ pub async fn run_association_loop<S: Fn() -> bool>(
     stop: S,
     heartbeat_period: std::time::Duration,
 ) {
-    let mut retry: Option<std::time::Duration> = None;
+    // Per peer (#1343 review): when each unassociated peer is next tried, and the
+    // backoff it is on. A peer that fails later starts again from 1 s, whatever
+    // another peer's backoff has reached.
+    let mut retries: Vec<Option<(tokio::time::Instant, std::time::Duration)>> =
+        vec![None; clients.len()];
     let mut next_heartbeat = tokio::time::Instant::now() + heartbeat_period;
     loop {
         if stop() {
             break;
         }
-        let mut unassociated = false;
-        for client in &clients {
-            if !client.is_associated().await {
-                if let Err(e) = try_associate(client).await {
-                    // Abnormal action on association failure: the UPF is unreachable
-                    // for now. Handled per peer (issue #20 review): one unreachable
-                    // UPF must not starve heartbeats to healthy pool members.
-                    let wait = association_retry_after(retry, heartbeat_period);
-                    log::error!(
-                        "PFCP Association Setup with {} failed: {e}; retrying in {wait:?}",
-                        client.peer()
-                    );
-                }
-                unassociated |= !client.is_associated().await;
+        let now = tokio::time::Instant::now();
+        for (client, retry) in clients.iter().zip(retries.iter_mut()) {
+            if client.is_associated().await {
+                *retry = None;
+                continue;
             }
+            if retry.is_some_and(|(due, _)| now < due) {
+                continue;
+            }
+            if let Err(e) = try_associate(client).await {
+                // Abnormal action on association failure: the UPF is unreachable for
+                // now. Handled per peer (issue #20 review): one unreachable UPF must
+                // not starve heartbeats to healthy pool members.
+                let wait = association_retry_after(retry.map(|(_, d)| d), heartbeat_period);
+                log::error!(
+                    "PFCP Association Setup with {} failed: {e}; retrying in {wait:?}",
+                    client.peer()
+                );
+            }
+            *retry = if client.is_associated().await {
+                None
+            } else {
+                let wait = association_retry_after(retry.map(|(_, d)| d), heartbeat_period);
+                Some((tokio::time::Instant::now() + wait, wait))
+            };
         }
-        retry = unassociated.then(|| association_retry_after(retry, heartbeat_period));
-        let wake = match retry {
-            Some(wait) => (tokio::time::Instant::now() + wait).min(next_heartbeat),
-            None => next_heartbeat,
-        };
+        let wake = retries
+            .iter()
+            .flatten()
+            .map(|(due, _)| *due)
+            .fold(next_heartbeat, std::cmp::min);
         tokio::time::sleep_until(wake).await;
         if stop() {
             break;
@@ -1081,6 +1089,12 @@ pub async fn run_association_loop<S: Fn() -> bool>(
     }
 }
 
+/// One association attempt for a client that is not associated (#658).
+///
+/// A UPF named by hostname is re-resolved first, every attempt: a restarted UPF
+/// pod comes back at a new address, and the previous one will never answer.
+/// Before #658 the endpoint was fixed at startup, so the SMF retried a dead IP
+/// forever and rejected every PDU session with #26.
 pub async fn try_associate(client: &PfcpClient) -> Result<(), PfcpRequestError> {
     client.reresolve_peer().await;
     client.associate().await
@@ -4014,7 +4028,7 @@ mod tests {
 
     /// **#1341.** A retrying peer wakes the loop early, but an associated peer's
     /// heartbeats stay on the heartbeat period. With a 3 s period, the refused peer's
-    /// retries wake the loop at about 1 s and 3 s; over 3.5 s the associated peer sees
+    /// retries wake the loop at about 1 s and 3 s; over 4 s the associated peer sees
     /// exactly one Heartbeat Request (at 3 s), not one per wake.
     #[tokio::test]
     async fn a_retrying_peer_does_not_make_heartbeats_more_frequent() {
@@ -4061,7 +4075,7 @@ mod tests {
             move || stop_loop.load(std::sync::atomic::Ordering::SeqCst),
             Duration::from_secs(3),
         ));
-        tokio::time::sleep(Duration::from_millis(3500)).await;
+        tokio::time::sleep(Duration::from_millis(4000)).await;
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         looping.abort();
         let heartbeats = healthy_task.await.unwrap();
