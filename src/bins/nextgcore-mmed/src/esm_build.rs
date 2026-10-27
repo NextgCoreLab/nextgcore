@@ -530,8 +530,9 @@ pub fn build_activate_default_bearer_context_request_with_params(
     // Access Point Name (TS 24.301 §9.9.4.1 -> TS 24.008 §10.5.6.1): the APN as
     // TS 23.003 §9.1 labels, not the dotted string (#1350: the UE read the raw
     // `internet` as a 105-octet label and got APN ""). An APN no label encoding can
-    // carry was never valid to attach with; it is logged and sent empty, which the UE
-    // rejects visibly, rather than as wrapped length octets it would misread.
+    // carry is refused at APN selection with ESM #27 (`reconcile_requested_apn`), so
+    // it does not reach here; should one ever, it is logged and sent empty rather than
+    // as wrapped length octets the UE would misread.
     let apn = crate::s11_build::encode_apn_dns(&sess.apn).unwrap_or_else(|e| {
         log::error!(
             "ACTIVATE DEFAULT EPS BEARER CONTEXT REQUEST: {e}; Access Point Name sent empty"
