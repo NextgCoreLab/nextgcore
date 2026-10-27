@@ -67,6 +67,9 @@ http = { version = "1.4", optional = true }
 # Test-only: the capturing logger (#1338 asserts the level and peer of the
 # connection-end log line that used to be a bare eprintln).
 nextgcore-core = { workspace = true, features = ["test-log"] }
+# Test-only: shut a listening socket's read side so accept() fails on demand
+# (EINVAL), which is how the accept-error backoff test drives the real loop.
+socket2.workspace = true
 # Bench-only: SBA transport benchmark harness (issue #15).
 criterion = "0.8.2"
 proptest.workspace = true
