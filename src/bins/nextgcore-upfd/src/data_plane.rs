@@ -2310,6 +2310,18 @@ impl DataPlaneUrr {
     }
 }
 
+/// The rules a PFCP Session Establishment Request created (#1348), installed in the
+/// session before it is published.
+#[derive(Default)]
+pub struct EstablishedRules {
+    pub pdrs: Vec<DataPlanePdr>,
+    pub fars: HashMap<u32, DataPlaneFar>,
+    pub own_tunnel_fars: std::collections::HashSet<u32>,
+    pub qers: HashMap<u32, DataPlaneQer>,
+    pub urrs: HashMap<u32, Arc<DataPlaneUrr>>,
+    pub bars: HashMap<u8, DataPlaneBar>,
+}
+
 /// Session entry for data plane forwarding
 #[derive(Debug)]
 pub struct DataPlaneSession {
@@ -4598,7 +4610,9 @@ impl DataPlane {
         }
     }
 
-    /// Add a session from PFCP
+    /// A session with invented match-all FORW rules: a test fixture only. Production
+    /// establishment goes through [`DataPlane::add_established_session`] (#1348).
+    #[cfg(test)]
     pub fn add_session_from_pfcp(
         &self,
         upf_seid: u64,
@@ -4679,6 +4693,69 @@ impl DataPlane {
         log::info!(
             "Added data plane session: SEID={upf_seid:#x}, SMF_SEID={smf_seid:#x}, UE={ue_ip}, UL_TEID=0x{ul_teid:x}, DL_TEID=0x{dl_teid:x}, gNB={gnb_addr}, PDU={pdu_session_id:?}, QFI={qfi:?}"
         );
+    }
+
+    /// #1348: add a session from a PFCP Session Establishment with the SMF's own
+    /// rules, published once they are all in place. TS 29.244 §5.2.1 / §7.5.2: the
+    /// session's packet handling is the PDRs, FARs, QERs, URRs and BARs the
+    /// Establishment Request created, so nothing may see the session before it holds
+    /// them. Before, the session was published with invented match-all FORW rules
+    /// (`add_session_from_pfcp`) and the SMF's rules were written into it one lock
+    /// at a time afterwards, so a packet in between was forwarded, unpoliced and
+    /// uncharged, even when the SMF's FAR said BUFF or DROP. A request with no PDR
+    /// gives a session that matches nothing: no default forwards anything.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_established_session(
+        &self,
+        upf_seid: u64,
+        smf_seid: u64,
+        ue_ip: Ipv4Addr,
+        ul_teid: u32,
+        dl_teid: u32,
+        gnb_addr: SocketAddr,
+        qfi: Option<u8>,
+        rules: EstablishedRules,
+    ) -> Arc<DataPlaneSession> {
+        let session = DataPlaneSession::new_empty(
+            upf_seid,
+            smf_seid,
+            Some(ue_ip),
+            ul_teid,
+            dl_teid,
+            gnb_addr,
+            None,
+            qfi,
+        );
+        let EstablishedRules {
+            mut pdrs,
+            fars,
+            own_tunnel_fars,
+            qers,
+            urrs,
+            bars,
+        } = rules;
+        pdrs.sort_by_key(|p| p.precedence);
+        let counts = (pdrs.len(), fars.len(), qers.len(), urrs.len());
+        *session.pdrs.write().unwrap_or_else(|e| e.into_inner()) = pdrs;
+        *session.fars.write().unwrap_or_else(|e| e.into_inner()) = fars;
+        *session
+            .own_tunnel_fars
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = own_tunnel_fars;
+        *session.qers.write().unwrap_or_else(|e| e.into_inner()) = qers;
+        *session.urrs.write().unwrap_or_else(|e| e.into_inner()) = urrs;
+        *session.bars.write().unwrap_or_else(|e| e.into_inner()) = bars;
+        let published = self.sessions.add_session(session);
+        log::info!(
+            "Added data plane session: SEID={upf_seid:#x}, SMF_SEID={smf_seid:#x}, UE={ue_ip}, \
+             UL_TEID=0x{ul_teid:x}, DL_TEID=0x{dl_teid:x}, gNB={gnb_addr}, QFI={qfi:?}, with its \
+             {} PDRs, {} FARs, {} QERs, {} URRs",
+            counts.0,
+            counts.1,
+            counts.2,
+            counts.3
+        );
+        published
     }
 
     /// Update a session from PFCP modification
