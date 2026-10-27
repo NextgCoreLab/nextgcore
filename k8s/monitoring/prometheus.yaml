@@ -12,7 +12,9 @@ data:
     scrape_configs:
       - job_name: "nextgcore-nrf"
         static_configs:
-          - targets: ["nrf.nextg-system.svc.cluster.local:9090"]
+          # The nrf Service is NodePort (kind); its metrics port has its own
+          # ClusterIP Service, nrf-metrics (#1334).
+          - targets: ["nrf-metrics.nextg-system.svc.cluster.local:9090"]
             labels: { nf_type: "NRF" }
       - job_name: "nextgcore-amf"
         static_configs:

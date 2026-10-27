@@ -17,6 +17,27 @@ spec:
       nodePort: 30777
       protocol: TCP
 ---
+# /metrics (#1334) gets its own ClusterIP Service: adding 9090 to the NodePort
+# Service above would allocate a node port for it on every node. Prometheus
+# scrapes nrf-metrics:9090 from inside the cluster; nothing publishes it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: nrf-metrics
+  namespace: nextg-system
+  labels:
+    app.kubernetes.io/name: nrf
+    app.kubernetes.io/part-of: nextgcore
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: nrf
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+      protocol: TCP
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -51,11 +72,18 @@ spec:
           ports:
             - containerPort: 7777
               name: sbi
+            - containerPort: 9090
+              name: metrics
           env:
             - name: RUST_LOG
               value: info
             - name: RUST_BACKTRACE
               value: "1"
+            # /metrics (#1334) defaults to 127.0.0.1 (#837); in the pod it must
+            # accept the pod IP for Prometheus. Reached only through the
+            # nrf-metrics ClusterIP Service.
+            - name: NEXTGCORE_METRICS_BIND
+              value: "0.0.0.0"
           resources:
             requests:
               cpu: 50m

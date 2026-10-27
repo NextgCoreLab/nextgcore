@@ -2278,7 +2278,7 @@ mod tests {
     /// health probes are not counted.
     ///
     /// REVERT-VERIFIED: without the `record_sbi_request` call in `SbiService::call`
-    /// no `ntest-metrics` series is rendered and the first assertion fails.
+    /// no `nnef-smcontext` series is rendered and the first assertion fails.
     #[tokio::test]
     async fn served_requests_are_counted_by_service_operation_and_status_1334() {
         use crate::client::SbiClient;
@@ -2294,8 +2294,8 @@ mod tests {
         let client = SbiClient::with_host_port("127.0.0.1", port);
         let supi = "imsi-001017777777777";
         for (path, want) in [
-            (format!("/ntest-metrics/v1/{supi}/am-data"), 200),
-            (format!("/ntest-metrics/v1/{supi}/missing"), 404),
+            (format!("/nnef-smcontext/v1/{supi}/am-data"), 200),
+            (format!("/nnef-smcontext/v1/{supi}/missing"), 404),
         ] {
             let r = client
                 .send_request(SbiRequest::get(&path))
@@ -2305,7 +2305,7 @@ mod tests {
         }
         let big = "x".repeat(10_000);
         let r = client
-            .send_request(SbiRequest::post("/ntest-metrics/v1/echo").with_body(&big, "text/plain"))
+            .send_request(SbiRequest::post("/nnef-smcontext/v1/echo").with_body(&big, "text/plain"))
             .await
             .expect("answered");
         assert_eq!(r.status, 413);
@@ -2320,27 +2320,27 @@ mod tests {
         let value = |series: &str| nextgcore_metrics::nf::sample_value(&out, series);
         assert_eq!(
             value(
-                r#"nextgcore_sbi_request_total{service="ntest-metrics",operation="GET {id}/am-data",status="200"}"#
+                r#"nextgcore_sbi_request_total{service="nnef-smcontext",operation="GET {id}/am-data",status="200"}"#
             ),
             Some(1.0),
             "{out}"
         );
         assert_eq!(
             value(
-                r#"nextgcore_sbi_error_total{service="ntest-metrics",operation="GET {id}/missing",status="404"}"#
+                r#"nextgcore_sbi_error_total{service="nnef-smcontext",operation="unmatched",status="404"}"#
             ),
             Some(1.0),
             "{out}"
         );
         assert_eq!(
             value(
-                r#"nextgcore_sbi_error_total{service="ntest-metrics",operation="POST echo",status="413"}"#
+                r#"nextgcore_sbi_error_total{service="nnef-smcontext",operation="unmatched",status="413"}"#
             ),
             Some(1.0),
             "the server's own rejection is counted too: {out}"
         );
         assert_eq!(
-            value(r#"nextgcore_sbi_request_duration_seconds_count{service="ntest-metrics"}"#),
+            value(r#"nextgcore_sbi_request_duration_seconds_count{service="nnef-smcontext"}"#),
             Some(3.0),
             "{out}"
         );

@@ -40,7 +40,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The `/metrics` port an NF uses when its `<NF>_METRICS_PORT` is unset: the port every
@@ -197,10 +197,100 @@ pub fn labels(pairs: &[(&str, &str)]) -> String {
 
 // ─── SBI server requests ────────────────────────────────────────────────────
 
-/// The `service` label of an SBI request path: its first segment when it is an SBI
-/// service name (`namf-comm`, `nudm-sdm`, ...), `nnrf-oauth2` for the NRF's
-/// `/oauth2/token`, else `unknown`.
-pub fn sbi_service(path: &str) -> String {
+/// Every SBI service name this tree serves or calls back on, sorted (TS 29.510
+/// Table 6.1.6.3.11-1 `ServiceName`, plus the callback roots and Rel-17/18 services
+/// the NFs here route). The `service` label is one of these or `other`: it is never
+/// a request's own text, so a client can neither put an identifier in it nor grow it.
+pub const SBI_SERVICE_NAMES: &[&str] = &[
+    "n5g-eir-eic",
+    "naanf-akma",
+    "namf-callback",
+    "namf-comm",
+    "namf-evts",
+    "namf-loc",
+    "namf-mbs-bc",
+    "namf-mbs-comm",
+    "namf-mt",
+    "nausf-auth",
+    "nausf-sorprotection",
+    "nausf-upuprotection",
+    "nbsf-management",
+    "nchf-convergedcharging",
+    "nchf-spendinglimitcontrol",
+    "ndccf-contextmanagement",
+    "ndccf-datamanagement",
+    "neasdf-baselinednspattern",
+    "neasdf-dnscontext",
+    "nees-easregistration",
+    "nees-uecontexttransfer",
+    "ngmlc-loc",
+    "nhss-ee",
+    "nhss-sdm",
+    "nhss-ueau",
+    "nhss-uecm",
+    "nlmf-broadcast",
+    "nlmf-dataexposure",
+    "nlmf-loc",
+    "nmbsmf-mbssession",
+    "nmbsmf-tmgi",
+    "nnef-eventexposure",
+    "nnef-pfdmanagement",
+    "nnef-smcontext",
+    "nnrf-disc",
+    "nnrf-nfm",
+    "nnrf-oauth2",
+    "nnsacf-nsac",
+    "nnsacf-slice-ee",
+    "nnssaaf-nssaa",
+    "nnssf-nssaiavailability",
+    "nnssf-nsselection",
+    "nnwdaf-analyticsinfo",
+    "nnwdaf-datamanagement",
+    "nnwdaf-eventssubscription",
+    "nnwdaf-mlmodelinfo",
+    "nnwdaf-mlmodelprovision",
+    "nnwdaf-nfstatus-notify",
+    "nnwdaf-sensingdata",
+    "npcf-am-policy-control",
+    "npcf-bdtpolicycontrol",
+    "npcf-callback",
+    "npcf-eventexposure",
+    "npcf-mbspolicycontrol",
+    "npcf-policyauthorization",
+    "npcf-smpolicycontrol",
+    "npcf-ue-policy-control",
+    "nsepp-telescopic",
+    "nsmf-callback",
+    "nsmf-event-exposure",
+    "nsmf-nidd",
+    "nsmf-pdusession",
+    "nsmsf-sms",
+    "ntsctsf-asti",
+    "ntsctsf-qos",
+    "ntsctsf-qos-tscai",
+    "ntsctsf-time-sync",
+    "ntsctsf-time-synchronization",
+    "nucmf-provisioning",
+    "nucmf-uecapabilitymanagement",
+    "nucmf-uecm",
+    "nudm-callback",
+    "nudm-ee",
+    "nudm-mt",
+    "nudm-niddau",
+    "nudm-pp",
+    "nudm-rsds",
+    "nudm-sdm",
+    "nudm-ssau",
+    "nudm-ueau",
+    "nudm-uecm",
+    "nudm-ueid",
+    "nudr-dr",
+    "nudr-group-id-map",
+];
+
+/// The `service` label of an SBI request path: its first segment when that is one of
+/// [`SBI_SERVICE_NAMES`], `nnrf-oauth2` for the NRF's `/oauth2/token`, else `other`.
+pub fn sbi_service(path: &str) -> &'static str {
     let first = path
         .split('?')
         .next()
@@ -210,20 +300,12 @@ pub fn sbi_service(path: &str) -> String {
         .next()
         .unwrap_or("");
     if first == "oauth2" {
-        return "nnrf-oauth2".to_string();
+        return "nnrf-oauth2";
     }
-    let valid = first.len() <= 48
-        && first.starts_with('n')
-        && first.contains('-')
-        && !first.ends_with('-')
-        && first
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-    if valid {
-        first.to_string()
-    } else {
-        "unknown".to_string()
-    }
+    SBI_SERVICE_NAMES
+        .binary_search(&first)
+        .map(|i| SBI_SERVICE_NAMES[i])
+        .unwrap_or("other")
 }
 
 /// Prefixes of the TS 29.571 identity encodings that appear as path segments
@@ -324,90 +406,158 @@ pub fn sbi_operation(method: &str, path: &str) -> String {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct SbiKey {
-    service: String,
-    operation: String,
-    status: u16,
+/// Distinct operations kept per service before new ones count as `other`.
+pub const MAX_SBI_OPERATIONS_PER_SERVICE: usize = 64;
+
+/// One (service, operation, status) series: a lock-free counter.
+#[derive(Debug, Default)]
+struct RequestSeries(AtomicU64);
+
+/// One service's duration histogram: lock-free buckets, count and sum (µs).
+#[derive(Debug, Default)]
+struct DurationSeries {
+    buckets: [AtomicU64; SBI_DURATION_BUCKETS.len()],
+    count: AtomicU64,
+    sum_micros: AtomicU64,
 }
 
-#[derive(Debug, Default, Clone)]
-struct Histogram {
-    buckets: [u64; SBI_DURATION_BUCKETS.len()],
-    count: u64,
-    sum: f64,
-}
-
-impl Histogram {
-    fn observe(&mut self, seconds: f64) {
+impl DurationSeries {
+    fn observe(&self, elapsed: Duration) {
+        let secs = elapsed.as_secs_f64();
         for (i, bound) in SBI_DURATION_BUCKETS.iter().enumerate() {
-            if seconds <= *bound {
-                self.buckets[i] += 1;
+            if secs <= *bound {
+                self.buckets[i].fetch_add(1, Ordering::Relaxed);
             }
         }
-        self.count += 1;
-        self.sum += seconds;
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum_micros.fetch_add(
+            u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 }
 
+type SeriesKey = (&'static str, Arc<str>, u16);
+
+/// The SBI request registry. Recording takes only READ locks (shared, never
+/// serialising concurrent requests) and atomic increments; the write lock is taken
+/// only the first time a series appears, which the caps bound.
 #[derive(Debug, Default)]
-struct SbiStats {
-    requests: HashMap<SbiKey, u64>,
-    durations: HashMap<String, Histogram>,
+struct SbiRegistry {
+    requests: std::sync::RwLock<HashMap<SeriesKey, Arc<RequestSeries>>>,
+    durations: std::sync::RwLock<HashMap<&'static str, Arc<DurationSeries>>>,
+    /// Operations a service has answered with a non-error status: only these are
+    /// named in labels, so an operation template exists in the exposition only
+    /// once the NF has really served it.
+    admitted: std::sync::RwLock<HashMap<&'static str, HashMap<String, Arc<str>>>>,
 }
 
-fn sbi_stats() -> &'static Mutex<SbiStats> {
-    static STATS: OnceLock<Mutex<SbiStats>> = OnceLock::new();
-    STATS.get_or_init(|| Mutex::new(SbiStats::default()))
+fn sbi_registry() -> &'static SbiRegistry {
+    static REGISTRY: OnceLock<SbiRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(SbiRegistry::default)
+}
+
+/// The operation label for `template` on `service` answered with `status`.
+///
+/// A template is admitted the first time the NF answers it with a non-error status
+/// (below 400), up to [`MAX_SBI_OPERATIONS_PER_SERVICE`] per service. Until then,
+/// and past the cap, it is `unmatched` (an error answer) or `other`. A request for a
+/// resource the NF does not serve is answered 404/405 and so never names one: every
+/// operation label is a resource this NF serves, not a client's text.
+fn operation_label(
+    reg: &SbiRegistry,
+    service: &'static str,
+    template: String,
+    status: u16,
+) -> Arc<str> {
+    if let Some(known) = reg
+        .admitted
+        .read()
+        .ok()
+        .and_then(|a| a.get(service).and_then(|ops| ops.get(&template).cloned()))
+    {
+        return known;
+    }
+    if status >= 400 || service == "other" {
+        return Arc::from("unmatched");
+    }
+    let Ok(mut admitted) = reg.admitted.write() else {
+        return Arc::from("other");
+    };
+    let ops = admitted.entry(service).or_default();
+    if let Some(known) = ops.get(&template) {
+        return known.clone();
+    }
+    if ops.len() >= MAX_SBI_OPERATIONS_PER_SERVICE {
+        return Arc::from("other");
+    }
+    let label: Arc<str> = Arc::from(template.as_str());
+    ops.insert(template, label.clone());
+    label
 }
 
 /// Count one SBI request this process served and its duration: `method` and the
 /// request `path` (query included or not), the response `status`.
 pub fn record_sbi_request(method: &str, path: &str, status: u16, elapsed: Duration) {
-    let mut key = SbiKey {
-        service: sbi_service(path),
-        operation: sbi_operation(method, path),
-        status,
+    let reg = sbi_registry();
+    let service = sbi_service(path);
+    let operation = operation_label(reg, service, sbi_operation(method, path), status);
+    let mut key: SeriesKey = (service, operation, status);
+    let series = reg.requests.read().ok().and_then(|r| r.get(&key).cloned());
+    let series = match series {
+        Some(s) => Some(s),
+        None => reg.requests.write().ok().map(|mut r| {
+            if !r.contains_key(&key) && r.len() >= MAX_SBI_SERIES {
+                key = ("other", Arc::from("other"), status);
+            }
+            r.entry(key).or_default().clone()
+        }),
     };
-    let Ok(mut stats) = sbi_stats().lock() else {
-        return;
-    };
-    if !stats.requests.contains_key(&key) && stats.requests.len() >= MAX_SBI_SERIES {
-        key.service = "other".to_string();
-        key.operation = "other".to_string();
+    if let Some(s) = series {
+        s.0.fetch_add(1, Ordering::Relaxed);
     }
-    let service = key.service.clone();
-    *stats.requests.entry(key).or_insert(0) += 1;
-    if !stats.durations.contains_key(&service) && stats.durations.len() >= MAX_SBI_SERIES {
-        return;
-    }
-    stats
+    let hist = reg
         .durations
-        .entry(service)
-        .or_default()
-        .observe(elapsed.as_secs_f64());
+        .read()
+        .ok()
+        .and_then(|d| d.get(service).cloned());
+    let hist = match hist {
+        Some(h) => Some(h),
+        None => reg
+            .durations
+            .write()
+            .ok()
+            .map(|mut d| d.entry(service).or_default().clone()),
+    };
+    if let Some(h) = hist {
+        h.observe(elapsed);
+    }
 }
 
 /// Render the SBI request families.
 pub fn render_sbi(out: &mut String) {
-    let Ok(stats) = sbi_stats().lock() else {
-        return;
-    };
-    let mut rows: Vec<(&SbiKey, &u64)> = stats.requests.iter().collect();
-    rows.sort_by(|a, b| {
-        (&a.0.service, &a.0.operation, a.0.status).cmp(&(&b.0.service, &b.0.operation, b.0.status))
-    });
+    let reg = sbi_registry();
+    let mut rows: Vec<(SeriesKey, u64)> = reg
+        .requests
+        .read()
+        .map(|r| {
+            r.iter()
+                .map(|(k, v)| (k.clone(), v.0.load(Ordering::Relaxed)))
+                .collect()
+        })
+        .unwrap_or_default();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
     write_header(
         out,
         "nextgcore_sbi_request_total",
         "counter",
         "SBI requests this NF served, by service, operation (method and resource template) and response status",
     );
-    for (k, v) in &rows {
-        let status = k.status.to_string();
+    for ((service, operation, status), v) in &rows {
+        let status = status.to_string();
         let l = labels(&[
-            ("service", &k.service),
-            ("operation", &k.operation),
+            ("service", service),
+            ("operation", operation),
             ("status", &status),
         ]);
         let _ = writeln!(out, "nextgcore_sbi_request_total{l} {v}");
@@ -418,11 +568,11 @@ pub fn render_sbi(out: &mut String) {
         "counter",
         "SBI requests this NF answered with a 4xx or 5xx status",
     );
-    for (k, v) in rows.iter().filter(|(k, _)| k.status >= 400) {
-        let status = k.status.to_string();
+    for ((service, operation, status), v) in rows.iter().filter(|r| r.0 .2 >= 400) {
+        let status = status.to_string();
         let l = labels(&[
-            ("service", &k.service),
-            ("operation", &k.operation),
+            ("service", service),
+            ("operation", operation),
             ("status", &status),
         ]);
         let _ = writeln!(out, "nextgcore_sbi_error_total{l} {v}");
@@ -433,30 +583,33 @@ pub fn render_sbi(out: &mut String) {
         "histogram",
         "Time this NF took to answer an SBI request, by service",
     );
-    let mut services: Vec<(&String, &Histogram)> = stats.durations.iter().collect();
+    let mut services: Vec<(&'static str, Arc<DurationSeries>)> = reg
+        .durations
+        .read()
+        .map(|d| d.iter().map(|(k, v)| (*k, v.clone())).collect())
+        .unwrap_or_default();
     services.sort_by(|a, b| a.0.cmp(b.0));
-    for (service, h) in services {
-        let s = escape_label(service);
-        for (bound, count) in SBI_DURATION_BUCKETS.iter().zip(h.buckets.iter()) {
+    for (s, h) in services {
+        let count = h.count.load(Ordering::Relaxed);
+        for (bound, n) in SBI_DURATION_BUCKETS.iter().zip(h.buckets.iter()) {
             let _ = writeln!(
                 out,
-                "nextgcore_sbi_request_duration_seconds_bucket{{service=\"{s}\",le=\"{bound}\"}} {count}"
+                "nextgcore_sbi_request_duration_seconds_bucket{{service=\"{s}\",le=\"{bound}\"}} {}",
+                n.load(Ordering::Relaxed)
             );
         }
         let _ = writeln!(
             out,
-            "nextgcore_sbi_request_duration_seconds_bucket{{service=\"{s}\",le=\"+Inf\"}} {}",
-            h.count
+            "nextgcore_sbi_request_duration_seconds_bucket{{service=\"{s}\",le=\"+Inf\"}} {count}"
         );
         let _ = writeln!(
             out,
             "nextgcore_sbi_request_duration_seconds_sum{{service=\"{s}\"}} {}",
-            h.sum
+            h.sum_micros.load(Ordering::Relaxed) as f64 / 1e6
         );
         let _ = writeln!(
             out,
-            "nextgcore_sbi_request_duration_seconds_count{{service=\"{s}\"}} {}",
-            h.count
+            "nextgcore_sbi_request_duration_seconds_count{{service=\"{s}\"}} {count}"
         );
     }
 }
@@ -849,49 +1002,171 @@ mod tests {
     }
 
     #[test]
-    fn the_service_label_is_the_sbi_service_name_or_unknown() {
+    fn the_service_label_is_an_allowlisted_sbi_service_name_or_other() {
+        assert!(
+            SBI_SERVICE_NAMES.windows(2).all(|w| w[0] < w[1]),
+            "sorted, for binary_search"
+        );
         assert_eq!(sbi_service("/namf-comm/v1/ue-contexts"), "namf-comm");
         assert_eq!(
             sbi_service("/npcf-am-policy-control/v1/policies"),
             "npcf-am-policy-control"
         );
         assert_eq!(sbi_service("/oauth2/token"), "nnrf-oauth2");
-        assert_eq!(sbi_service("/imsi-001010000000001/x"), "unknown");
-        assert_eq!(sbi_service("/NAMF-COMM/v1"), "unknown");
-        assert_eq!(sbi_service("/"), "unknown");
+        // #1334 review: a client-chosen first segment is never a label value.
+        assert_eq!(sbi_service("/nai-alice@example.com/v1/x"), "other");
+        assert_eq!(sbi_service("/nai-alice/v1/x"), "other");
+        assert_eq!(sbi_service("/nfoo-bar/v1/x"), "other");
+        assert_eq!(sbi_service("/imsi-001010000000001/x"), "other");
+        assert_eq!(sbi_service("/NAMF-COMM/v1"), "other");
+        assert_eq!(sbi_service("/"), "other");
+    }
+
+    /// #1334 review: a hostile client sending ever-new paths creates no label value
+    /// of its own and no new series: made-up services are `other`, made-up resources
+    /// of a real service are answered 404 and stay `unmatched`.
+    #[test]
+    fn hostile_paths_put_no_request_text_in_labels_and_grow_nothing() {
+        for i in 0..5000 {
+            record_sbi_request(
+                "GET",
+                &format!("/nai-victim{i}/v1/x"),
+                404,
+                Duration::from_millis(1),
+            );
+            record_sbi_request(
+                "POST",
+                &format!("/nnssaaf-nssaa/v1/evil-name-{i}x/more{i}x"),
+                404,
+                Duration::from_millis(1),
+            );
+        }
+        let nssaa_series = sbi_registry()
+            .requests
+            .read()
+            .unwrap()
+            .keys()
+            .filter(|(service, _, _)| *service == "nnssaaf-nssaa")
+            .count();
+        assert_eq!(
+            nssaa_series, 1,
+            "10000 hostile requests, one series: unmatched/404"
+        );
+        let mut out = String::new();
+        render_sbi(&mut out);
+        assert!(!out.contains("victim"), "{out}");
+        assert!(!out.contains("evil"), "{out}");
+        assert!(
+            out.contains(r#"service="nnssaaf-nssaa",operation="unmatched",status="404""#),
+            "{out}"
+        );
+        assert!(sbi_registry()
+            .admitted
+            .read()
+            .unwrap()
+            .get("nnssaaf-nssaa")
+            .is_none_or(|o| o.is_empty()));
+    }
+
+    /// An operation the NF answers successfully is named, and its later errors keep
+    /// the name; at most `MAX_SBI_OPERATIONS_PER_SERVICE` names per service.
+    #[test]
+    fn served_operations_are_admitted_up_to_the_per_service_cap() {
+        record_sbi_request(
+            "PUT",
+            "/nhss-ee/v1/imsi-001010000000001/ee-subscriptions",
+            201,
+            Duration::ZERO,
+        );
+        record_sbi_request(
+            "PUT",
+            "/nhss-ee/v1/imsi-001010000000002/ee-subscriptions",
+            403,
+            Duration::ZERO,
+        );
+        let mut out = String::new();
+        render_sbi(&mut out);
+        assert!(
+            out.contains(r#"nextgcore_sbi_error_total{service="nhss-ee",operation="PUT {id}/ee-subscriptions",status="403"} 1"#),
+            "{out}"
+        );
+        for i in 0..(MAX_SBI_OPERATIONS_PER_SERVICE + 10) {
+            // Letters outside a-f, so no name reads as a hexadecimal identifier.
+            let name = format!("{}{}", "g".repeat(1 + i % 26), "h".repeat(i / 26 + 1));
+            record_sbi_request("GET", &format!("/nhss-sdm/v1/{name}"), 200, Duration::ZERO);
+        }
+        let admitted = sbi_registry()
+            .admitted
+            .read()
+            .unwrap()
+            .get("nhss-sdm")
+            .map(|o| o.len());
+        assert_eq!(admitted, Some(MAX_SBI_OPERATIONS_PER_SERVICE));
+    }
+
+    /// Recording from many threads at once loses no count (atomics, shared locks).
+    #[test]
+    fn concurrent_recording_counts_every_request() {
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..1000 {
+                        record_sbi_request(
+                            "GET",
+                            "/nudm-niddau/v1/x/authorize",
+                            200,
+                            Duration::ZERO,
+                        );
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let mut out = String::new();
+        render_sbi(&mut out);
+        assert_eq!(
+            sample_value(
+                &out,
+                r#"nextgcore_sbi_request_total{service="nudm-niddau",operation="GET x/authorize",status="200"}"#
+            ),
+            Some(8000.0),
+            "{out}"
+        );
     }
 
     #[test]
     fn requests_render_as_request_error_and_duration_families() {
-        let path = "/ntest-render/v1/things/imsi-001019999999999";
+        let path = "/nucmf-uecapabilitymanagement/v1/things/imsi-001019999999999";
         record_sbi_request("GET", path, 200, Duration::from_millis(3));
         record_sbi_request("GET", path, 404, Duration::from_millis(30));
         let mut out = String::new();
         render_sbi(&mut out);
-        let ok = r#"nextgcore_sbi_request_total{service="ntest-render",operation="GET things/{id}",status="200"}"#;
-        let nf = r#"nextgcore_sbi_request_total{service="ntest-render",operation="GET things/{id}",status="404"}"#;
-        let err = r#"nextgcore_sbi_error_total{service="ntest-render",operation="GET things/{id}",status="404"}"#;
+        let ok = r#"nextgcore_sbi_request_total{service="nucmf-uecapabilitymanagement",operation="GET things/{id}",status="200"}"#;
+        let nf = r#"nextgcore_sbi_request_total{service="nucmf-uecapabilitymanagement",operation="GET things/{id}",status="404"}"#;
+        let err = r#"nextgcore_sbi_error_total{service="nucmf-uecapabilitymanagement",operation="GET things/{id}",status="404"}"#;
         assert!(sample_value(&out, ok).unwrap() >= 1.0, "{out}");
         assert!(sample_value(&out, nf).unwrap() >= 1.0, "{out}");
         assert!(sample_value(&out, err).unwrap() >= 1.0, "{out}");
         assert!(
-            sample_value(&out, r#"nextgcore_sbi_error_total{service="ntest-render",operation="GET things/{id}",status="200"}"#).is_none(),
+            sample_value(&out, r#"nextgcore_sbi_error_total{service="nucmf-uecapabilitymanagement",operation="GET things/{id}",status="200"}"#).is_none(),
             "a 200 is no error"
         );
         let count = sample_value(
             &out,
-            r#"nextgcore_sbi_request_duration_seconds_count{service="ntest-render"}"#,
+            r#"nextgcore_sbi_request_duration_seconds_count{service="nucmf-uecapabilitymanagement"}"#,
         )
         .unwrap();
         assert!(count >= 2.0, "{out}");
         let le_5ms = sample_value(
             &out,
-            r#"nextgcore_sbi_request_duration_seconds_bucket{service="ntest-render",le="0.005"}"#,
+            r#"nextgcore_sbi_request_duration_seconds_bucket{service="nucmf-uecapabilitymanagement",le="0.005"}"#,
         )
         .unwrap();
         let le_inf = sample_value(
             &out,
-            r#"nextgcore_sbi_request_duration_seconds_bucket{service="ntest-render",le="+Inf"}"#,
+            r#"nextgcore_sbi_request_duration_seconds_bucket{service="nucmf-uecapabilitymanagement",le="+Inf"}"#,
         )
         .unwrap();
         assert!(le_5ms >= 1.0 && le_inf >= le_5ms + 1.0, "{out}");

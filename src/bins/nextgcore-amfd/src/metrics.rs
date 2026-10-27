@@ -1026,8 +1026,10 @@ mod tests {
             "{body}"
         );
         assert!(
-            body.contains(r#"service="namf-comm",operation="GET ue-contexts/{id}""#),
-            "the Namf request is labelled by its template: {body}"
+            body.contains(r#"service="namf-comm",operation="unmatched""#)
+                || body.contains(r#"service="namf-comm",operation="GET ue-contexts/{id}""#),
+            "the Namf request is counted; a template not yet answered with success \
+             is `unmatched`, never request text: {body}"
         );
         assert!(
             !body.contains("9999913340"),
