@@ -380,7 +380,11 @@ jobs:
       - name: Install PyYAML
         run: python3 -m pip install pyyaml
       - name: Every queried series is exported by some NF
-        run: python3 deploy/observability/check_metric_series.py
+        run: |
+          # The check must still reject what it exists to reject (a log-string
+          # name, a test's expectation) before its verdict on the tree counts.
+          python3 deploy/observability/check_metric_series.py --self-test
+          python3 deploy/observability/check_metric_series.py
       - name: promtool check rules and config
         run: |
           set -euo pipefail
