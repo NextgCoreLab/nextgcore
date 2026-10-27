@@ -1524,7 +1524,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
     async fn test_smf_registration_persists_put_to_udr() {
+        // #1357: an SMF registration notifies every SDM/EE subscription covering the
+        // SUPI, `anyUE` ones included, so it is serialized with the tests that hold
+        // such subscriptions in the process-global UDM context.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let supi = "imsi-001010000000311";
         let body = valid_smf_body();
         let mock = Arc::new(MockUdr::new());
@@ -1725,7 +1732,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
     async fn test_smf_registration_first_put_201_second_put_200() {
+        // #1357: an SMF registration notifies every SDM/EE subscription covering the
+        // SUPI, `anyUE` ones included, so it is serialized with the tests that hold
+        // such subscriptions in the process-global UDM context.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let supi = "imsi-udmd06-0002";
         let mock = Arc::new(MockUdr::new());
         let client = UdrClient::Mock(mock.clone());

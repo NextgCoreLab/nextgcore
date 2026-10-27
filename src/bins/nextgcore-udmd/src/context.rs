@@ -1433,6 +1433,11 @@ impl Default for UdmContext {
 }
 
 /// Global UDM context (thread-safe singleton)
+// Tests: this context is process-global, and its lock is
+// `crate::test_support::CONTEXT_GUARD` (lib.rs, public so peer crates' tests can take
+// it). Any test that reads or writes the SDM/EE subscription lists, or makes a UECM
+// call that notifies them, holds it. An `anyUE` EE subscription matches every SUPI, so
+// unique per-test SUPIs do not isolate it (#1357).
 static GLOBAL_UDM_CONTEXT: std::sync::OnceLock<Arc<RwLock<UdmContext>>> =
     std::sync::OnceLock::new();
 
