@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Check that an overlay's Service patch did not drop or alter any port.
 
-profiles/5g/patches/monitoring-clusterip.yaml (and the NRF entry in
-headless-services.yaml) use `$patch: replace` on `ports`, so the overlay holds
-a copy of the base port list. A port later added to the base Service would be
-silently dropped on EKS. This compares, for every Service named in the patch
-files, the base render's ports with the overlay render's, and requires the
-overlay Service to be ClusterIP with no nodePort (#1100 review).
+profiles/5g/patches/headless-services.yaml restates the amf, upf and gnb port
+lists. Merged by port, so a base port survives, but a port the patch changes
+or adds would make the EKS Service differ from the base silently. This
+compares, for every Service named in the patch files, the base render's ports
+with the overlay render's, and requires the overlay Service to be ClusterIP
+with no nodePort (#1100 review). The NodePort-undo patches it was written for
+are gone: the base Services are ClusterIP (#1365).
 
 BASE_RENDER is every base the overlay includes (k8s/ and nextgsim/k8s/ for
 5g), concatenated. PATCH files may hold other kinds; only Services count.

@@ -121,8 +121,15 @@ bash deploy.sh                     # deploy the stack
 kubectl get pods -n nextg-system   # verify pods are running
 bash e2e-test.sh                   # run the E2E suite against the cluster
 
-kubectl port-forward -n nextg-system svc/jaeger 16686:16686   # traces
+kubectl port-forward -n nextg-system svc/grafana 3000:3000     # dashboards
+kubectl port-forward -n nextg-system svc/prometheus 9090:9090  # metrics
+kubectl port-forward -n nextg-system svc/jaeger 16686:16686    # traces
+kubectl port-forward -n nextg-system svc/nrf 7777:7777         # NRF SBI
 ```
+
+Every Service is ClusterIP: nothing is published on a node port, a load
+balancer or the kind host, and `kubectl port-forward` listens on 127.0.0.1
+only (#1365).
 
 Every NF exposes Prometheus metrics on port 9090 (`/metrics`); monitoring assets are under `k8s/monitoring/` and `docker/rust/monitoring/`. `teardown.sh` removes the deployment.
 

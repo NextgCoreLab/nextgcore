@@ -44,6 +44,9 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
 ---
+# ClusterIP, never NodePort (#1365): Jaeger has no authentication, and a
+# NodePort opens it on every node IP. Use
+#   kubectl -n nextg-system port-forward svc/jaeger 16686:16686
 apiVersion: v1
 kind: Service
 metadata:
@@ -52,14 +55,13 @@ metadata:
   labels:
     app.kubernetes.io/name: jaeger
 spec:
-  type: NodePort
+  type: ClusterIP
   selector:
     app.kubernetes.io/name: jaeger
   ports:
     - name: ui
       port: 16686
       targetPort: 16686
-      nodePort: 31686
     - name: otlp-grpc
       port: 4317
       targetPort: 4317

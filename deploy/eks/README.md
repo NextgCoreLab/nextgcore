@@ -525,8 +525,8 @@ Workload:
   (#1100; no credential is in any manifest). To use your own password, create
   that Secret (key `password`) before the first deploy. To read it:
   `kubectl -n nextg-system get secret grafana-admin -o jsonpath='{.data.password}' | base64 -d`.
-  Grafana, Prometheus and Jaeger are ClusterIP Services on EKS, not the Kind
-  manifests' NodePorts; reach them with `kubectl port-forward`.
+  Grafana, Prometheus, Jaeger and the NRF are ClusterIP Services, in the base
+  manifests as on EKS (#1365); reach them with `kubectl port-forward`.
 - Single replica per NF. The NFs hold per-UE state in a process-global context
   and the NRF is the source of truth for topology; `replicas: 2` has not been
   validated and is not expected to work.

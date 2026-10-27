@@ -33,8 +33,6 @@ patches:
   - path: patches/ue-addressing.yaml
   # Headless Services so the resolvers get pod IPs, not ClusterIPs.
   - path: patches/headless-services.yaml
-  # Monitoring Services ClusterIP, not the Kind manifests' NodePorts (#1100).
-  - path: patches/monitoring-clusterip.yaml
   # Real probes + explicit userspace-SCTP-over-UDP transport for NGAP.
   - path: patches/amf-probes.yaml
   # Mount the SUCI de-concealment keys the Kind manifests forgot.
