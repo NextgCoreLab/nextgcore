@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-f1de496b.js";
+            window.path_to_searchindex_js = "../searchindex-1ef47358.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -247,6 +247,7 @@ nrf:
 <li>Consumer side: an NF signs its CCA with the ES256 key at <code>NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE</code> (resolved process-wide in <code>nextgcore-sbi</code>, generated <code>0600</code> on first use if absent, and an error — never a silent replacement — if malformed). Its public half must be registered here under <code>cca_trusted_keys</code>, keyed by that NF’s <code>nfInstanceId</code>.</li>
 <li><strong>The NRF is not exempt from its own policy.</strong> With <code>nrf.sbi.oauth2.require = true</code> the NRF requests tokens from itself for its outbound status notifications, and that request is authenticated like any other: give the NRF a CCA signing key and register its own public key under <code>cca_trusted_keys</code>. It deliberately does <strong>not</strong> self-exempt by <code>nfInstanceId</code> — a token request arriving over the network claiming to be the NRF is indistinguishable from a spoofed one, so exempting that identity would reopen the bypass this closes.</li>
 <li><code>OTEL_EXPORTER_OTLP_ENDPOINT</code> sets the OpenTelemetry export target (default <code>http://jaeger:4317</code>).</li>
+<li><code>NRF_METRICS_PORT</code> (default <code>9090</code>) and <code>NEXTGCORE_METRICS_BIND</code> (default <code>127.0.0.1</code>, #837) place the Prometheus <code>/metrics</code> endpoint (#1334; families in the Observability chapter). The Kind manifests reach it through the <code>nrf-metrics</code> ClusterIP Service, not the NodePort <code>nrf</code> Service, so no node port is opened for it.</li>
 </ul>
 <h2 id="honesty-notes"><a class="header" href="#honesty-notes">Honesty notes</a></h2>
 <ul>
