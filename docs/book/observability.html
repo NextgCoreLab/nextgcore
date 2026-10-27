@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-d47bad62.js";
+            window.path_to_searchindex_js = "searchindex-3c66c1c2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-be5dca41.js"></script>
@@ -207,201 +207,191 @@
 </tbody>
 </table>
 </div>
-<p>Every one of these listeners is unauthenticated, so it binds <code>127.0.0.1</code> by default (#837): set <code>NEXTGCORE_METRICS_BIND</code> (an IP address, e.g. <code>0.0.0.0</code>) to widen it. The compose files, the Kind manifests, the Helm chart and the EKS overlays set it to <code>0.0.0.0</code> inside the private container or pod network, where Prometheus scrapes by container/pod address; none of them publishes a metrics port on the host. The <code>k8s/monitoring/*</code> and <code>k8s/manifests/nrf.yaml</code> NodePort Services are for kind only, where the node is the Docker bridge and <code>kind-config.yaml</code> maps the ports to 127.0.0.1; on a real cluster a NodePort is open on every node IP, so do not apply them there. The compose host-port publishes (MongoDB, NRF, PFCP, Prometheus, Grafana, Jaeger, OTLP) are bound to <code>127.0.0.1</code>; the RAN-facing NGAP/S1AP and GTP-U publishes use <code>${NEXTGCORE_RAN_PUBLISH_ADDR:-127.0.0.1}</code>, so an external gNB/eNB needs that set to the host address it reaches.</p>
-<p><code>docker-compose-epc.yml</code> uses these endpoints as healthchecks (<code>curl -fsS http://localhost:9090/metrics | grep -q '^smf_up 1$'</code>, likewise <code>upf_up</code>, <code>sgwu_up</code>).</p>
-<p>The other NF daemons serve <strong>no</strong> Prometheus metrics over HTTP:</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>NF daemon</th><th>Prometheus metrics served</th><th>Notes</th></tr>
-</thead>
-<tbody>
-<tr><td><code>nextgcore-dccfd</code></td><td>none</td><td>Same; <code>init_otel</code> in <code>src/main.rs</code>.</td></tr>
-<tr><td><code>nextgcore-eesd</code></td><td>none</td><td>Same.</td></tr>
-<tr><td><code>nextgcore-hssd</code></td><td>none</td><td>Same.</td></tr>
-<tr><td><code>nextgcore-lmfd</code></td><td>none</td><td>Same.</td></tr>
-<tr><td><code>nextgcore-mbsmfd</code></td><td>none</td><td>Same.</td></tr>
-<tr><td><code>nextgcore-mmed</code></td><td>none</td><td>Same.</td></tr>
-<tr><td><code>nextgcore-nsacfd</code></td><td>none by default</td><td>Same. SLA-observe gauges with <code>--features sla-observe</code> (above).</td></tr>
-<tr><td><code>nextgcore-nwdafd</code></td><td>none</td><td>Same.</td></tr>
-<tr><td><code>nextgcore-pcrfd</code></td><td>none</td><td>Same.</td></tr>
-<tr><td><code>nextgcore-pind</code></td><td>none</td><td>Same.</td></tr>
-<tr><td><code>nextgcore-scpd</code></td><td>none</td><td>Same.</td></tr>
-<tr><td><code>nextgcore-seppd</code></td><td>none</td><td>Same.</td></tr>
-<tr><td><code>nextgcore-sgwcd</code></td><td>none</td><td>Same.</td></tr>
-<tr><td><code>nextgcore-easdfd</code>, <code>nextgcore-nefd</code>, <code>nextgcore-tsctsf</code>, <code>nextgcore-ucmfd</code></td><td>none</td><td>Same.</td></tr>
-</tbody>
-</table>
-</div>
-<p>Apart from the <code>serve_metrics</code> callers above, the NF crates use <code>nextgcore-metrics</code> only for the <code>init_otel</code> call (see Tracing).</p>
-<h3 id="families-every-sbi-nf-shares-srclibsnextgcore-metricssrcnfrs-1334"><a class="header" href="#families-every-sbi-nf-shares-srclibsnextgcore-metricssrcnfrs-1334">Families every SBI NF shares (<code>src/libs/nextgcore-metrics/src/nf.rs</code>, #1334)</a></h3>
-<p>Recorded by the shared SBI server and NRF heartbeat worker (<code>nextgcore-sbi</code>), so an NF serves them as soon as it has a <code>/metrics</code> endpoint:</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Metric</th><th>Type</th><th>Labels</th><th>Counts</th></tr>
-</thead>
-<tbody>
-<tr><td><code>nextgcore_sbi_request_total</code></td><td>counter</td><td><code>service</code>, <code>operation</code>, <code>status</code></td><td>SBI requests this NF served</td></tr>
-<tr><td><code>nextgcore_sbi_error_total</code></td><td>counter</td><td><code>service</code>, <code>operation</code>, <code>status</code></td><td>those answered 4xx/5xx</td></tr>
-<tr><td><code>nextgcore_sbi_request_duration_seconds</code></td><td>histogram</td><td><code>service</code></td><td>time to answer</td></tr>
-<tr><td><code>nextgcore_nrf_registered</code></td><td>gauge</td><td></td><td>1 while the NF holds an NRF registration (NFRegister answered, no 404 heartbeat since)</td></tr>
-<tr><td><code>nextgcore_nrf_registrations_total</code></td><td>counter</td><td></td><td>successful NFRegisters, re-registrations included</td></tr>
-<tr><td><code>nextgcore_nrf_heartbeats_total</code></td><td>counter</td><td><code>result</code> (<code>ok</code>, <code>not_found</code>, <code>rejected</code>, <code>transport_error</code>)</td><td>NFUpdate heartbeats</td></tr>
-<tr><td><code>nextgcore_nrf_last_heartbeat_success_timestamp_seconds</code></td><td>gauge</td><td></td><td>last accepted heartbeat</td></tr>
-<tr><td><code>process_cpu_seconds_total</code>, <code>process_resident_memory_bytes</code>, <code>process_virtual_memory_bytes</code>, <code>process_open_fds</code>, <code>process_start_time_seconds</code></td><td></td><td></td><td>from <code>/proc/self</code></td></tr>
-<tr><td><code>nextgcore_uptime_seconds</code></td><td>gauge</td><td></td><td>since process start</td></tr>
-<tr><td><code>nextgcore_build_info</code></td><td>gauge</td><td><code>nf</code>, <code>version</code></td><td>constant 1</td></tr>
-</tbody>
-</table>
-</div>
-<p><code>service</code> is one of a fixed list of SBI service names (<code>namf-comm</code>, <code>nudm-sdm</code>, …; <code>nnrf-oauth2</code> for <code>/oauth2/token</code>), else <code>other</code>: never the request’s own text. <code>operation</code> is the method and the resource template: the path after the service and version, with every segment that is not a resource name replaced by <code>{id}</code> (<code>GET {id}/am-data</code>, <code>PUT nf-instances/{id}</code>). A template is named only once the NF has answered it with a 2xx, at most 64 per service; before that any other answer is <code>unmatched</code>, past the cap <code>other</code>. A made-up path is answered with an error (each NF’s <code>/metrics</code> test checks this for every service it serves), so no client text becomes a label value, and a SUPI, GPSI, PEI, UUID, IP address or numeric reference never appears in one. Past 1024 label sets, new ones are counted under <code>service="other",operation="other"</code>. Recording takes shared locks and atomic increments only, so it never serialises SBI requests.</p>
-<h3 id="amf-families-srcbinsnextgcore-amfdsrcmetricsrs-1334"><a class="header" href="#amf-families-srcbinsnextgcore-amfdsrcmetricsrs-1334">AMF families (<code>src/bins/nextgcore-amfd/src/metrics.rs</code>, #1334)</a></h3>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Metric</th><th>Type</th><th>Labels</th><th>Counts</th></tr>
-</thead>
-<tbody>
-<tr><td><code>amf_registered_ue_count</code></td><td>gauge</td><td></td><td>UEs in RM-REGISTERED (Registration Complete received)</td></tr>
-<tr><td><code>amf_connected_ue_count</code></td><td>gauge</td><td></td><td>UEs with an N1 signalling connection (CM-CONNECTED)</td></tr>
-<tr><td><code>nextgcore_amf_active_sessions</code></td><td>gauge</td><td></td><td>PDU sessions the AMF holds</td></tr>
-<tr><td><code>amf_gnb_count</code></td><td>gauge</td><td></td><td>NG-RAN nodes whose NG Setup succeeded</td></tr>
-<tr><td><code>amf_gnb_associations</code></td><td>gauge</td><td></td><td>SCTP associations from NG-RAN nodes</td></tr>
-<tr><td><code>amf_registration_requests_total</code></td><td>counter</td><td><code>type</code> (<code>initial</code>, <code>mobility</code>, <code>periodic</code>, <code>emergency</code>, <code>snpn_onboarding</code>, <code>reserved</code>)</td><td>Registration Requests received</td></tr>
-<tr><td><code>amf_registration_success_total</code></td><td>counter</td><td></td><td>Registration Accepts sent</td></tr>
-<tr><td><code>amf_registration_failure_total</code></td><td>counter</td><td></td><td>Registration Rejects sent</td></tr>
-<tr><td><code>amf_registration_reject_cause_total</code></td><td>counter</td><td><code>cause</code> (5GMM cause value)</td><td>Registration Rejects by cause</td></tr>
-<tr><td><code>amf_auth_request_total</code></td><td>counter</td><td></td><td>Authentication Requests sent</td></tr>
-<tr><td><code>amf_auth_success_total</code></td><td>counter</td><td></td><td>5G-AKA confirmations the AUSF answered AUTHENTICATION_SUCCESS</td></tr>
-<tr><td><code>amf_auth_failure_total</code></td><td>counter</td><td><code>source</code> (<code>network</code>: Authentication Reject sent; <code>ue</code>: Authentication Failure received)</td><td>failed authentications</td></tr>
-<tr><td><code>amf_ngap_messages_total</code></td><td>counter</td><td><code>direction</code> (<code>rx</code>, <code>tx</code>), <code>procedure</code> (TS 38.413 §9.4.7 name), <code>outcome</code> (<code>initiating</code>, <code>successful</code>, <code>unsuccessful</code>)</td><td>NGAP PDUs</td></tr>
-<tr><td><code>amf_ngap_failures_total</code></td><td>counter</td><td><code>direction</code>, <code>procedure</code></td><td>NGAP unsuccessful outcomes</td></tr>
-<tr><td><code>amf_ng_reset_ue_idled</code></td><td>counter</td><td></td><td>registered UEs an NG Reset moved to CM-IDLE (#754)</td></tr>
-<tr><td><code>amf_ngap_ue_associated_refused</code></td><td>counter</td><td></td><td>UE-associated NGAP messages refused for a UE the sender does not serve (#739)</td></tr>
-</tbody>
-</table>
-</div>
-<p>The NAS counters follow TS 28.552 §5.2.2 “on transmission”/“on receipt”: a protected downlink message is counted when NAS security protects it, an unprotected one when it is sent in a DOWNLINK NAS TRANSPORT, and a T3550/T3560 retransmission (a stored PDU sent again) is not counted. The Open5GS-named families still defined in the file (<code>fivegs_amffunction_*</code>, <code>ran_ue</code>, <code>amf_session</code>, <code>gnb</code>) are not served: nothing increments them.</p>
-<h3 id="nrf-families-srcbinsnextgcore-nrfdsrcmetricsrs-1334"><a class="header" href="#nrf-families-srcbinsnextgcore-nrfdsrcmetricsrs-1334">NRF families (<code>src/bins/nextgcore-nrfd/src/metrics.rs</code>, #1334)</a></h3>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Metric</th><th>Type</th><th>Labels</th><th>Counts</th></tr>
-</thead>
-<tbody>
-<tr><td><code>nrf_registered_nf_count</code></td><td>gauge</td><td></td><td>NF profiles the NRF holds</td></tr>
-<tr><td><code>nrf_registered_nf_instances</code></td><td>gauge</td><td><code>nf_type</code> (a TS 29.510 NFType, else <code>other</code>), <code>nf_status</code></td><td>the same, broken down</td></tr>
-<tr><td><code>nrf_subscriptions</code></td><td>gauge</td><td></td><td>NF status subscriptions held</td></tr>
-<tr><td><code>nrf_nf_registrations_total</code> / <code>nrf_nf_updates_total</code> / <code>nrf_nf_deregistrations_total</code></td><td>counter</td><td></td><td>NFRegister / NFUpdate (heartbeats) / NFDeregister answered 2xx</td></tr>
-<tr><td><code>nrf_subscriptions_created_total</code></td><td>counter</td><td></td><td>NFStatusSubscribe answered 2xx</td></tr>
-<tr><td><code>nrf_discovery_success_total</code></td><td>counter</td><td></td><td>NFDiscover answered with a SearchResult (200), empty ones included</td></tr>
-<tr><td><code>nrf_discovery_failure_total</code></td><td>counter</td><td></td><td>NFDiscover rejected (any other status)</td></tr>
-<tr><td><code>nrf_discovery_empty_total</code></td><td>counter</td><td></td><td>SearchResults that matched no instance (routine for an optional NF type that is not deployed)</td></tr>
-<tr><td><code>nrf_access_tokens_total</code></td><td>counter</td><td><code>result</code> (<code>granted</code>, <code>denied</code>)</td><td>access token requests</td></tr>
-</tbody>
-</table>
-</div>
-<h3 id="pcf-families-srcbinsnextgcore-pcfdsrcmetricsrs-1334"><a class="header" href="#pcf-families-srcbinsnextgcore-pcfdsrcmetricsrs-1334">PCF families (<code>src/bins/nextgcore-pcfd/src/metrics.rs</code>, #1334)</a></h3>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Metric</th><th>Type</th><th>Labels</th><th>Counts</th></tr>
-</thead>
-<tbody>
-<tr><td><code>pcf_policy_associations</code></td><td>gauge</td><td><code>policy</code> (<code>am</code> TS 29.507, <code>sm</code> TS 29.512, <code>ue</code> TS 29.525, <code>app_session</code> TS 29.514)</td><td>associations the PCF holds</td></tr>
-<tr><td><code>pcf_event_subscriptions</code></td><td>gauge</td><td></td><td>Npcf_EventExposure subscriptions held (TS 29.523)</td></tr>
-<tr><td><code>pcf_policy_operations_total</code></td><td>counter</td><td><code>policy</code>, <code>operation</code> (<code>create</code>, <code>update</code>, <code>delete</code>), <code>result</code> (<code>success</code> = 2xx, <code>failure</code>)</td><td>association operations answered</td></tr>
-</tbody>
-</table>
-</div>
-<h3 id="ausf-udm-udr-bsf-and-nssf-families-1334"><a class="header" href="#ausf-udm-udr-bsf-and-nssf-families-1334">AUSF, UDM, UDR, BSF and NSSF families (#1334)</a></h3>
-<p>Each NF’s <code>metrics.rs</code>. Every <code>result</code> is <code>success</code> for a 2xx answer, else <code>failure</code>; every other label value is a fixed name in the code, never request data.</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Metric</th><th>Type</th><th>Labels</th><th>Counts</th></tr>
-</thead>
-<tbody>
-<tr><td><code>ausf_operations_total</code></td><td>counter</td><td><code>operation</code> (<code>authenticate</code>, <code>5g_aka_confirmation</code>, <code>eap_session</code>, <code>deregister</code>, <code>delete</code>, <code>sor_protection</code>, <code>upu_protection</code>), <code>result</code></td><td>Nausf operations answered (TS 29.509)</td></tr>
-<tr><td><code>ausf_authentication_results_total</code></td><td>counter</td><td><code>method</code> (<code>5g_aka</code>, <code>eap_aka_prime</code>), <code>result</code></td><td>verdicts returned, read from <code>authResult</code> (a failed authentication is still a 200)</td></tr>
-<tr><td><code>ausf_ue_authentication_contexts</code>, <code>ausf_kausf_anchors</code></td><td>gauge</td><td></td><td>contexts held, KAUSF anchors stored</td></tr>
-<tr><td><code>udm_operations_total</code></td><td>counter</td><td><code>service</code> (a TS 29.503 Nudm service), <code>operation</code> (<code>generate_auth_data</code>, <code>auth_event</code>, <code>auth_event_cancel</code>, <code>amf_registration</code>, <code>amf_registration_update</code>, <code>amf_deregistration</code>, <code>smf_registration</code>, <code>smf_deregistration</code>, <code>get_registrations</code>, <code>get</code>, <code>subscribe</code>, <code>unsubscribe</code>, <code>modify_subscription</code>, <code>other</code>), <code>result</code></td><td>Nudm operations answered</td></tr>
-<tr><td><code>udm_ue_contexts</code>, <code>udm_amf_registered_ues</code>, <code>udm_pdu_sessions</code>, <code>udm_sdm_subscriptions</code></td><td>gauge</td><td></td><td>UE contexts, UEs with an AMF registered for 3GPP access, SMF-registered PDU sessions, SDM subscriptions</td></tr>
-<tr><td><code>udr_operations_total</code></td><td>counter</td><td><code>data</code> (<code>subscription_data</code>, <code>policy_data</code>, <code>application_data</code>, <code>exposure_data</code>, <code>data_change_subscription</code>, <code>group_id_map</code>, <code>other</code>), <code>operation</code> (<code>query</code>, <code>create</code>, <code>create_or_replace</code>, <code>update</code>, <code>delete</code>), <code>result</code></td><td>Nudr operations answered (TS 29.504, TS 29.598)</td></tr>
-<tr><td><code>udr_ue_contexts</code></td><td>gauge</td><td></td><td>UE contexts held</td></tr>
-<tr><td><code>bsf_binding_operations_total</code></td><td>counter</td><td><code>binding</code> (<code>pdu</code>, <code>ue</code>, <code>mbs</code>), <code>operation</code> (<code>register</code>, <code>discovery</code>, <code>retrieve</code>, <code>update</code>, <code>deregister</code>), <code>result</code></td><td>Nbsf_Management binding operations answered (TS 29.521); a discovery that matches nothing is a 204, a success</td></tr>
-<tr><td><code>bsf_subscription_operations_total</code></td><td>counter</td><td><code>operation</code> (<code>subscribe</code>, <code>modify</code>, <code>unsubscribe</code>), <code>result</code></td><td>event subscription operations</td></tr>
-<tr><td><code>bsf_pcf_bindings</code></td><td>gauge</td><td><code>binding</code></td><td>bindings held</td></tr>
-<tr><td><code>bsf_subscriptions</code></td><td>gauge</td><td></td><td>event subscriptions held</td></tr>
-<tr><td><code>nssf_selections_total</code></td><td>counter</td><td><code>result</code></td><td>Nnssf_NSSelection_Get answered (TS 29.531 §5.2)</td></tr>
-<tr><td><code>nssf_availability_operations_total</code></td><td>counter</td><td><code>operation</code> (<code>update</code>, <code>patch</code>, <code>delete</code>, <code>subscribe</code>, <code>unsubscribe</code>, <code>modify_subscription</code>), <code>result</code></td><td>Nnssf_NSSAIAvailability operations (§5.3)</td></tr>
-<tr><td><code>nssf_nssai_availability_nfs</code>, <code>nssf_subscriptions</code>, <code>nssf_network_slice_instances</code></td><td>gauge</td><td></td><td>stored availability documents, subscriptions, configured slice instances</td></tr>
-</tbody>
-</table>
-</div>
-<h3 id="no-metricsserver-in-the-yaml-1312"><a class="header" href="#no-metricsserver-in-the-yaml-1312">No <code>metrics.server</code> in the YAML (#1312)</a></h3>
-<p>No daemon reads a <code>metrics.server</code> block, and several have no metrics listener at all (hssd, pcrfd). The shipped configs used to carry one anyway (docker <code>5gc</code> amf/pcf/smf/upf, <code>epc</code> mme/hss/pcrf/pgwc/pgwu, and the k8s and Helm ConfigMaps). A key that is documented but has no effect is misleading, so the blocks were removed rather than wired up: a daemon’s metrics listener is set by its environment variable, <code>MME_METRICS_ADDR</code>, <code>NEXTGCORE_METRICS_BIND</code> (loopback by default, #1308), <code>SMF_METRICS_PORT</code>, <code>AMF_METRICS_PORT</code>, <code>NRF_METRICS_PORT</code>, <code>PCF_METRICS_PORT</code>, <code>AUSF_METRICS_PORT</code>, <code>UDM_METRICS_PORT</code>, <code>UDR_METRICS_PORT</code>, <code>BSF_METRICS_PORT</code>, <code>NSSF_METRICS_PORT</code>, <code>UPF_METRICS_PORT</code>, <code>SGWC_METRICS_PORT</code>, <code>SGWU_METRICS_PORT</code> or <code>UCMF_METRICS_ADDR</code>, and nothing else.</p>
-<h3 id="the-shipped-scrape-stack"><a class="header" href="#the-shipped-scrape-stack">The shipped scrape stack</a></h3>
-<p><code>docker compose up -d</code> in <code>docker/rust/</code> starts the full observability trio unconditionally (no compose profile gating):</p>
-<ul>
-<li><strong>Prometheus</strong> (<code>prom/prometheus:v2.51.0</code>, container <code>nextgcore-prometheus</code>, <code>172.23.0.200</code>, host port <code>9090</code>) — config <code>docker/rust/configs/observability/prometheus.yml</code>: 15s scrape interval, static targets for 10 NFs (NRF, AUSF, UDM, UDR, PCF, NSSF, BSF, AMF, SMF, UPF) at their fixed <code>172.23.0.x:9090</code> addresses, each labeled with <code>nf_type</code> and <code>instance_name</code>, plus self-scrape. Only the SMF and UPF listen on 9090, so those two jobs read <code>up == 1</code> and the other <strong>8 NF jobs read <code>up == 0</code></strong> in the current build.</li>
-<li><strong>Grafana</strong> (<code>grafana/grafana:10.4.0</code>, <code>172.23.0.201</code>, host port <code>3000</code>, login <code>admin</code>/<code>nextgcore</code>) — provisioned datasources (<code>grafana-datasources.yml</code>: Prometheus at <code>http://172.23.0.200:9090</code>, Jaeger at <code>http://172.23.0.202:16686</code>) and dashboards from <code>configs/observability/dashboards/</code> with <code>overview.json</code> as the home dashboard.</li>
-<li><strong>Alert rules</strong> (<code>configs/observability/alert-rules.yml</code>) — <code>NfInstanceDown</code> (<code>up == 0</code> for 1m) and <code>NfSlowResponse</code> are generic and will actually evaluate; the NF-specific rules reference metric names (<code>amf_registration_failure_total</code>, <code>amf_connected_ue_count</code>, <code>smf_pfcp_association_up</code>, <code>upf_packets_dropped_total</code>, <code>nrf_registered_nf_count</code>, <code>mongodb_up</code>, …) that <strong>no code in this repo emits</strong> — they are aspirational, written for a future exporter wiring. (The SMF’s real association gauge is <code>smf_n4_associations</code>, which no rule uses yet.)</li>
-</ul>
-<h2 id="tracing-opentelemetry"><a class="header" href="#tracing-opentelemetry">Tracing (OpenTelemetry)</a></h2>
-<p><strong>What exists.</strong> <code>src/libs/nextgcore-metrics/src/otel.rs</code> provides <code>OtelConfig</code> (service name, OTLP endpoint — default <code>http://localhost:4317</code> — 10s export interval, traces/metrics/logs toggles), <code>OtelProvider</code>, W3C <code>traceparent</code> parse/generate helpers (<code>OtelSpanContext::from_traceparent</code>/<code>to_traceparent</code>), an <code>SbiSpan</code> wrapper with <code>nf.type</code>/<code>sbi.service</code>/<code>http.*</code> attributes, and a <code>JaegerConfig</code> (default endpoint <code>http://localhost:14268/api/traces</code>, sampling 1.0).</p>
-<p><strong>Startup wiring.</strong> 27 of the 28 NF daemons call <code>init_otel(OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(...))</code> at startup, taking the endpoint from the <strong><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></strong> environment variable and defaulting to <strong><code>http://jaeger:4317</code></strong> when unset (which resolves to the compose <code>jaeger</code> service). The AMF is the exception — it never calls <code>init_otel</code>. The shared helper <code>nf_common_init</code> in <code>src/libs/nextgcore-app/src/init.rs</code> bundles the same logic (same env var, same default) but is currently not called by any NF binary.</p>
-<p><strong>No-op behavior — the honest part.</strong> <code>OtelProvider::init()</code> is structural: it prints <code>Initializing OpenTelemetry for service '&lt;name&gt;' (endpoint: &lt;url&gt;)</code> and per-signal init lines to stderr, but creates <strong>no</strong> actual OTLP exporters (the code comments read “In a real implementation, this would use the opentelemetry crate”). Initialization failure is deliberately non-fatal (<code>let _ = init_otel(...)</code> / <code>.ok()</code>). Net effect: whether or not a collector is reachable, <strong>no spans, metrics, or logs are ever exported</strong>. The Jaeger all-in-one container in the compose stack (UI on <code>16686</code>, OTLP gRPC <code>4317</code>, OTLP HTTP <code>4318</code>) will show no NextGCore traces.</p>
-<p><strong>What IS real: wire-level trace propagation.</strong> The SBI client (<code>src/libs/nextgcore-sbi/src/client.rs</code>, <code>prepare_request</code>) stamps every outbound SBI request with a W3C <code>traceparent</code> header — respecting a caller-supplied one, otherwise generating a new sampled root span with CSPRNG-random trace/span IDs — and echoes the inbound correlation ID as <code>x-request-id</code>. So cross-NF request correlation works today by grepping IDs across <code>docker logs</code>, even without a trace backend.</p>
-<h2 id="logging"><a class="header" href="#logging">Logging</a></h2>
-<p>All NFs log to <strong>stdout/stderr</strong> via <code>env_logger</code>. Every NF binary uses millisecond timestamps. In the docker deployment, logs are consumed with <code>docker logs &lt;container&gt;</code> / <code>docker compose logs -f amf gnb ue</code>. The compose file’s <code>x-common</code> anchor (<code>docker/rust/docker-compose.yml</code>) sets <code>RUST_LOG: info</code> as the baseline, but four services override it with more verbose crate-level filters: <code>amf</code> (<code>info,nextgcore_amfd=debug</code>), <code>upf</code> (<code>info,nextgcore_upfd=debug</code>), <code>gnb</code> and <code>ue</code>. <code>RUST_BACKTRACE: 1</code> is uniform across all services (merged via <code>&lt;&lt;: *common-env</code>).</p>
-<p><strong>CLI flags vary per NF</strong> — check <code>--help</code> for the daemon you are running. Two verified patterns:</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Pattern</th><th>Flags</th><th>Verified in</th></tr>
-</thead>
-<tbody>
-<tr><td>Open5GS-style</td><td><code>-e, --log-level</code> (default <code>info</code>), <code>-l, --log-file</code>, <code>-m, --no-color</code>; some also have <code>-k, --kill</code> (ausfd, bsfd, hssd, nrfd, nssfd, pcfd, pcrfd, scpd, seppd, udmd, udrd, upfd)</td><td>most SBI and Diameter NFs, e.g. <code>nextgcore-nrfd</code> and <code>nextgcore-nsacfd</code> (no kill flag)</td></tr>
-<tr><td>AMF-style</td><td><code>-l, --log-level</code> (default <code>info</code>), <code>--no-color</code>, <code>-d, --daemon</code> — <strong>no</strong> log-file flag</td><td><code>nextgcore-amfd</code>, <code>nextgcore-mmed</code>, <code>nextgcore-sgwcd</code></td></tr>
-<tr><td>ucmfd</td><td><code>-e, --log-level</code> only; no log-file or no-color flag</td><td><code>nextgcore-ucmfd</code></td></tr>
-</tbody>
-</table>
-</div>
-<p><code>nextgcore-smfd</code> and <code>nextgcore-sgwud</code> have no clap parser. smfd scans <code>std::env::args()</code> for <code>-c/--config</code>, <code>-e/--log-level</code> (and <code>--state-file</code>); sgwud scans for <code>-c</code> and <code>-l/--log-level</code>.</p>
-<p><strong>The level is chosen the same way in every NF.</strong> Every NF builds its logger with <code>nextgcore_core::log::nf_log_builder</code> (#691): <code>RUST_LOG</code>, when set, is the filter; otherwise the level is <code>--log-level</code> when given, else the config file’s <code>logger.level</code>, else <code>info</code> (<code>nextgcore_core::log::nf_log_level</code>; an unknown value means <code>info</code>). <code>RUST_LOG_STYLE</code> sets the colour style; <code>--no-color</code> overrides it.</p>
-<p>Precedence, in full: a set, non-blank <code>RUST_LOG</code> <strong>replaces</strong> the resolved level (<code>--log-level</code> / <code>logger.level</code> / <code>info</code>); they are not merged. So <code>RUST_LOG=nextgcore_amfd=debug</code> alone logs only amfd’s own targets (at debug) and silences every other target. Include a default level, as the compose files do (<code>info,nextgcore_amfd=debug</code>), to keep the rest at <code>info</code>. A blank <code>RUST_LOG=</code> counts as unset. <code>src/libs/nextgcore-core/tests/nf_logging_init.rs</code> fails if a daemon builds its own logger, skips <code>nf_log_level</code>, or gives its <code>log_level</code> flag a clap default (which would hide <code>logger.level</code>).</p>
-<p><strong><code>--log-file</code> is accepted but not wired.</strong> 22 binary crates (ausfd, bsfd, dccfd, easdfd, eesd, hssd, lmfd, mbsmfd, nefd, nrfd, nsacfd, nssfd, nwdafd, pcfd, pcrfd, pind, scpd, seppd, tsctsf, udmd, udrd, upfd — <code>grep -rl log_file src/bins/*/src/*.rs</code>) declare a <code>log_file</code> CLI arg, but in none of them is the parsed value ever consumed by the logging setup — e.g. nrfd’s <code>init_logging()</code> never references <code>args.log_file</code>. Logs always go to stdout/stderr; rely on <code>docker logs</code> or shell redirection.</p>
-<h2 id="troubleshooting"><a class="header" href="#troubleshooting">Troubleshooting</a></h2>
-<p>Every row below is grounded in a specific file in this repo.</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Symptom</th><th>Likely cause</th><th>What to check / fix</th></tr>
-</thead>
-<tbody>
-<tr><td>Prometheus shows NF targets <code>DOWN</code> (<code>up == 0</code>), <code>NfInstanceDown</code> alerts fire for 8 of the 10 NF jobs</td><td><strong>Expected in the current build</strong>: only smfd and upfd serve <code>/metrics</code> on 9090; <code>MetricsServer::start()</code> is a stub that never binds</td><td><code>src/libs/nextgcore-metrics/src/server.rs</code>, <code>nes_energy.rs</code> <code>serve_metrics</code>; scrape targets in <code>docker/rust/configs/observability/prometheus.yml</code></td></tr>
-<tr><td>Grafana/Jaeger show no NF traces despite “Initializing OpenTelemetry” in NF stderr</td><td><code>OtelProvider::init()</code> creates no real OTLP exporter (structural stub); export never happens</td><td><code>src/libs/nextgcore-metrics/src/otel.rs</code> (<code>init_traces</code>/<code>init_metrics</code>/<code>init_logs</code> bodies)</td></tr>
-<tr><td>NF-specific alert rules never fire</td><td>Rules reference metric names (<code>amf_registration_failure_total</code>, <code>smf_pfcp_association_up</code>, …) that no code emits</td><td><code>docker/rust/configs/observability/alert-rules.yml</code>; grep the names in <code>src/</code> — zero hits</td></tr>
-<tr><td>NF starts with built-in defaults although you passed a config file</td><td>Lenient config loading: an unreadable or unparsable YAML logs a <strong>warning</strong> and continues with defaults instead of aborting</td><td>e.g. amfd <code>load_config</code> (<code>src/bins/nextgcore-amfd/src/lib.rs</code>): look for <code>Could not read config file '...'</code> / <code>Failed to parse YAML config '...'. Using defaults.</code> in startup logs</td></tr>
-<tr><td>Editing <code>metrics.server</code> (or other unknown keys) in <code>amf.yaml</code>/<code>smf.yaml</code>/<code>pcf.yaml</code>/<code>upf.yaml</code> changes nothing</td><td>Those NFs deserialize only a small typed subset (UPF parses nothing at all — it only logs the file’s byte count); serde ignores unknown keys silently. Move the SMF/UPF metrics port with <code>SMF_METRICS_PORT</code>/<code>UPF_METRICS_PORT</code></td><td><code>AmfSection</code> in <code>src/bins/nextgcore-amfd/src/lib.rs</code>; <code>SmfYaml</code> in <code>src/bins/nextgcore-smfd/src/main.rs</code>; <code>PcfSection</code> in <code>src/bins/nextgcore-pcfd/src/app.rs</code>; <code>src/bins/nextgcore-upfd/src/main.rs</code> (<code>Configuration file loaded</code>)</td></tr>
-<tr><td>Every NSAC admission fails (per-UE <code>SLICE_NOT_FOUND</code> failures / 403), breaking registration or PDU establishment</td><td><code>nsacf.slice_quotas</code> missing from <code>nsacf.yaml</code> → NSACF starts with an <strong>empty quota table</strong> and no S-NSSAI is provisioned</td><td><code>src/bins/nextgcore-nsacfd/src/main.rs</code> (quota provisioning and failure-reason mapping); add <code>slice_quotas</code> entries as in <code>docker/rust/configs/5gc/nsacf.yaml</code></td></tr>
-<tr><td>SBI calls suddenly return <strong>401</strong> (or <strong>503</strong>) after enabling OAuth2</td><td>Producer now requires an NRF-issued Bearer token (bad/absent token → 401; NRF JWKS unreachable → 503) but a consumer isn’t attaching one</td><td><code>docker/rust/docker-compose.oauth2.yml</code> (per-NF enablement map); <code>NEXTGCORE_SBI_OAUTH2_REQUIRE=1</code> env / <code>--oauth2-require</code> flags; enforcement semantics in <code>src/libs/nextgcore-sbi/src/server.rs</code></td></tr>
-<tr><td>NF log shows <code>NRF registration failed (will operate without NRF)</code></td><td>NRF was unreachable at startup; the startup registration (<code>PUT /nnrf-nfm/v1/nf-instances/{id}</code>) is attempted <strong>once</strong>, with no retry loop, and no heartbeat worker is started</td><td><code>src/bins/nextgcore-amfd/src/lib.rs</code> (<code>amf_nrf_register</code> call in the startup path) + <code>src/bins/nextgcore-amfd/src/sbi_path.rs</code>; ensure NRF is healthy first (compose <code>depends_on</code> does this), else restart the NF</td></tr>
-<tr><td>Repeated <code>Heartbeat failed for &lt;id&gt;</code> / <code>Heartbeat got unexpected status ...</code> warnings</td><td>The heartbeat worker PATCHes <code>/nnrf-nfm/v1/nf-instances/{id}</code> (JSON-Patch <code>/load</code> gauge, every 5s for AMF/SMF) and logs failures. A <strong>404</strong> (the NRF lost the profile, e.g. it restarted) makes the worker re-PUT the profile the NF registered (#434); other failures are only logged. NFs also deregister from the NRF on shutdown (#235)</td><td><code>src/libs/nextgcore-sbi/src/heartbeat.rs</code> <code>spawn_heartbeat_worker_with_load</code></td></tr>
-<tr><td>UDR cannot reach MongoDB (E2E assert <code>MongoDB connected</code> fails)</td><td>Wrong DB URI. Resolution order: <code>db_uri:</code> line in the config file → <code>DB_URI</code> env var → default <code>mongodb://172.23.0.2/nextgcore</code> (the compose MongoDB)</td><td><code>src/bins/nextgcore-udrd/src/main.rs</code> (<code>DB_URI</code> fallback); <code>docker compose ps mongodb</code> health (mongosh ping healthcheck); hssd takes <code>--db-uri</code></td></tr>
-<tr><td>A real/external gNB cannot establish an N2 (NGAP) association with the AMF</td><td>AMF’s default SCTP backend is <code>userspace</code> (sctp-proto over UDP, matched to the nextgsim gNB) — a standard RAN needs native kernel SCTP</td><td><code>--sctp-backend kernel</code> (needs the <code>kernel-sctp</code> build feature + libsctp), see <code>Args</code> in <code>src/bins/nextgcore-amfd/src/lib.rs</code> and <code>docker/rust/docker-compose.kernel-sctp.yml</code>; verify with <code>docker exec nextgcore-amf cat /proc/net/sctp/assocs</code></td></tr>
-<tr><td>Setting <code>RUST_LOG=debug</code> has no visible effect on an NF</td><td><code>RUST_LOG</code> is not reaching the process (check <code>docker inspect</code> / the compose <code>environment:</code>), or the filter names the wrong target (crate names use underscores: <code>nextgcore_amfd=debug</code>)</td><td><code>nextgcore_core::log::nf_log_builder</code> in <code>src/libs/nextgcore-core/src/log.rs</code></td></tr>
-<tr><td><code>TLS_ENABLED=true SBI_SCHEME=https docker compose up</code> doesn’t turn on TLS</td><td>No Rust code reads <code>TLS_ENABLED</code>/<code>SBI_SCHEME</code> — they are compose-level env decoration; real TLS knobs are per-NF CLI flags</td><td>grep in <code>src/</code> returns zero <code>.rs</code> hits; use <code>--tls --tls-cert --tls-key</code> (nrfd also <code>--mtls</code>, <code>--tls-ca-cert</code>), certs from <code>docker/rust/certs/generate-dev-certs.sh</code></td></tr>
-<tr><td>Docker build fails or (worse) Docker Desktop wipes its image store mid-build</td><td>Building under disk pressure — a full rebuild needs ~20 GB; this destroyed the image store once (hazard #269)</td><td><code>docker/rust/preflight.sh</code> refuses to build below the free-space minimum (default 25 GB, checked on host <strong>and</strong> inside the Docker VM) and trims BuildKit cache to 20 GB; don’t use <code>--no-preflight</code> casually</td></tr>
-<tr><td>Manual log-grep “fails” even though the line is present</td><td><code>docker logs | grep -q</code> under <code>pipefail</code> dies via SIGPIPE on first match, turning a match into a false negative</td><td>header note in <code>docker/rust/e2e-test.sh</code>: always capture <code>docker logs</code> to a file, then grep the file (as <code>assert_log_contains</code> does)</td></tr>
-</tbody>
-</table>
-</div>
-<h2 id="running-the-e2e-suite"><a class="header" href="#running-the-e2e-suite">Running the E2E suite</a></h2>
-<p>The single local entrypoint is <code>docker/rust/e2e.sh</code>:</p>
-<pre><code class="language-bash">cd nextgcore/docker/rust
+<p>Every one of these listeners is unauthenticated, so it binds <code>127.0.0.1</code> by default (#837): set <code>NEXTGCORE_METRICS_BIND</code> (an IP address, e.g. <code>0.0.0.0</code>) to widen it. The compose files, the Kind manifests, the Helm chart and the EKS overlays set it to <code>0.0.0.0</code> inside the private container or pod network, where Prometheus scrapes by container/pod address; none of them publishes a metrics port on the host. Every Service in <code>k8s/</code>, the EKS profiles and the Helm chart is ClusterIP (#1365): no NodePort, LoadBalancer, hostPort, hostNetwork or Ingress, and CI fails on any (<code>deploy/check_no_exposure.py</code>). Reach Prometheus, Grafana, Jaeger and the NRF from a workstation with <code>kubectl port-forward</code>, which listens on 127.0.0.1:</p>
+<pre><code class="language-bash">kubectl -n nextg-system port-forward svc/prometheus 9090:9090   # http://localhost:9090
+kubectl -n nextg-system port-forward svc/grafana 3000:3000      # http://localhost:3000
+kubectl -n nextg-system port-forward svc/jaeger 16686:16686     # http://localhost:16686
+kubectl -n nextg-system port-forward svc/nrf 7777:7777          # NRF SBI
+``` The compose host-port publishes (MongoDB, NRF, PFCP, Prometheus, Grafana, Jaeger, OTLP) are bound to `127.0.0.1`; the RAN-facing NGAP/S1AP and GTP-U publishes use `${NEXTGCORE_RAN_PUBLISH_ADDR:-127.0.0.1}`, so an external gNB/eNB needs that set to the host address it reaches.
+
+`docker-compose-epc.yml` uses these endpoints as healthchecks (`curl -fsS http://localhost:9090/metrics | grep -q '^smf_up 1$'`, likewise `upf_up`, `sgwu_up`).
+
+The other NF daemons serve **no** Prometheus metrics over HTTP:
+
+| NF daemon | Prometheus metrics served | Notes |
+|---|---|---|
+| `nextgcore-dccfd` | none | Same; `init_otel` in `src/main.rs`. |
+| `nextgcore-eesd` | none | Same. |
+| `nextgcore-hssd` | none | Same. |
+| `nextgcore-lmfd` | none | Same. |
+| `nextgcore-mbsmfd` | none | Same. |
+| `nextgcore-mmed` | none | Same. |
+| `nextgcore-nsacfd` | none by default | Same. SLA-observe gauges with `--features sla-observe` (above). |
+| `nextgcore-nwdafd` | none | Same. |
+| `nextgcore-pcrfd` | none | Same. |
+| `nextgcore-pind` | none | Same. |
+| `nextgcore-scpd` | none | Same. |
+| `nextgcore-seppd` | none | Same. |
+| `nextgcore-sgwcd` | none | Same. |
+| `nextgcore-easdfd`, `nextgcore-nefd`, `nextgcore-tsctsf`, `nextgcore-ucmfd` | none | Same. |
+
+Apart from the `serve_metrics` callers above, the NF crates use `nextgcore-metrics` only for the `init_otel` call (see Tracing).
+
+### Families every SBI NF shares (`src/libs/nextgcore-metrics/src/nf.rs`, #1334)
+
+Recorded by the shared SBI server and NRF heartbeat worker (`nextgcore-sbi`), so an NF serves them as soon as it has a `/metrics` endpoint:
+
+| Metric | Type | Labels | Counts |
+|---|---|---|---|
+| `nextgcore_sbi_request_total` | counter | `service`, `operation`, `status` | SBI requests this NF served |
+| `nextgcore_sbi_error_total` | counter | `service`, `operation`, `status` | those answered 4xx/5xx |
+| `nextgcore_sbi_request_duration_seconds` | histogram | `service` | time to answer |
+| `nextgcore_nrf_registered` | gauge | | 1 while the NF holds an NRF registration (NFRegister answered, no 404 heartbeat since) |
+| `nextgcore_nrf_registrations_total` | counter | | successful NFRegisters, re-registrations included |
+| `nextgcore_nrf_heartbeats_total` | counter | `result` (`ok`, `not_found`, `rejected`, `transport_error`) | NFUpdate heartbeats |
+| `nextgcore_nrf_last_heartbeat_success_timestamp_seconds` | gauge | | last accepted heartbeat |
+| `process_cpu_seconds_total`, `process_resident_memory_bytes`, `process_virtual_memory_bytes`, `process_open_fds`, `process_start_time_seconds` | | | from `/proc/self` |
+| `nextgcore_uptime_seconds` | gauge | | since process start |
+| `nextgcore_build_info` | gauge | `nf`, `version` | constant 1 |
+
+`service` is one of a fixed list of SBI service names (`namf-comm`, `nudm-sdm`, ...; `nnrf-oauth2` for `/oauth2/token`), else `other`: never the request's own text. `operation` is the method and the resource template: the path after the service and version, with every segment that is not a resource name replaced by `{id}` (`GET {id}/am-data`, `PUT nf-instances/{id}`). A template is named only once the NF has answered it with a 2xx, at most 64 per service; before that any other answer is `unmatched`, past the cap `other`. A made-up path is answered with an error (each NF's `/metrics` test checks this for every service it serves), so no client text becomes a label value, and a SUPI, GPSI, PEI, UUID, IP address or numeric reference never appears in one. Past 1024 label sets, new ones are counted under `service="other",operation="other"`. Recording takes shared locks and atomic increments only, so it never serialises SBI requests.
+
+### AMF families (`src/bins/nextgcore-amfd/src/metrics.rs`, #1334)
+
+| Metric | Type | Labels | Counts |
+|---|---|---|---|
+| `amf_registered_ue_count` | gauge | | UEs in RM-REGISTERED (Registration Complete received) |
+| `amf_connected_ue_count` | gauge | | UEs with an N1 signalling connection (CM-CONNECTED) |
+| `nextgcore_amf_active_sessions` | gauge | | PDU sessions the AMF holds |
+| `amf_gnb_count` | gauge | | NG-RAN nodes whose NG Setup succeeded |
+| `amf_gnb_associations` | gauge | | SCTP associations from NG-RAN nodes |
+| `amf_registration_requests_total` | counter | `type` (`initial`, `mobility`, `periodic`, `emergency`, `snpn_onboarding`, `reserved`) | Registration Requests received |
+| `amf_registration_success_total` | counter | | Registration Accepts sent |
+| `amf_registration_failure_total` | counter | | Registration Rejects sent |
+| `amf_registration_reject_cause_total` | counter | `cause` (5GMM cause value) | Registration Rejects by cause |
+| `amf_auth_request_total` | counter | | Authentication Requests sent |
+| `amf_auth_success_total` | counter | | 5G-AKA confirmations the AUSF answered AUTHENTICATION_SUCCESS |
+| `amf_auth_failure_total` | counter | `source` (`network`: Authentication Reject sent; `ue`: Authentication Failure received) | failed authentications |
+| `amf_ngap_messages_total` | counter | `direction` (`rx`, `tx`), `procedure` (TS 38.413 §9.4.7 name), `outcome` (`initiating`, `successful`, `unsuccessful`) | NGAP PDUs |
+| `amf_ngap_failures_total` | counter | `direction`, `procedure` | NGAP unsuccessful outcomes |
+| `amf_ng_reset_ue_idled` | counter | | registered UEs an NG Reset moved to CM-IDLE (#754) |
+| `amf_ngap_ue_associated_refused` | counter | | UE-associated NGAP messages refused for a UE the sender does not serve (#739) |
+
+The NAS counters follow TS 28.552 §5.2.2 "on transmission"/"on receipt": a protected downlink message is counted when NAS security protects it, an unprotected one when it is sent in a DOWNLINK NAS TRANSPORT, and a T3550/T3560 retransmission (a stored PDU sent again) is not counted. The Open5GS-named families still defined in the file (`fivegs_amffunction_*`, `ran_ue`, `amf_session`, `gnb`) are not served: nothing increments them.
+
+### NRF families (`src/bins/nextgcore-nrfd/src/metrics.rs`, #1334)
+
+| Metric | Type | Labels | Counts |
+|---|---|---|---|
+| `nrf_registered_nf_count` | gauge | | NF profiles the NRF holds |
+| `nrf_registered_nf_instances` | gauge | `nf_type` (a TS 29.510 NFType, else `other`), `nf_status` | the same, broken down |
+| `nrf_subscriptions` | gauge | | NF status subscriptions held |
+| `nrf_nf_registrations_total` / `nrf_nf_updates_total` / `nrf_nf_deregistrations_total` | counter | | NFRegister / NFUpdate (heartbeats) / NFDeregister answered 2xx |
+| `nrf_subscriptions_created_total` | counter | | NFStatusSubscribe answered 2xx |
+| `nrf_discovery_success_total` | counter | | NFDiscover answered with a SearchResult (200), empty ones included |
+| `nrf_discovery_failure_total` | counter | | NFDiscover rejected (any other status) |
+| `nrf_discovery_empty_total` | counter | | SearchResults that matched no instance (routine for an optional NF type that is not deployed) |
+| `nrf_access_tokens_total` | counter | `result` (`granted`, `denied`) | access token requests |
+
+### PCF families (`src/bins/nextgcore-pcfd/src/metrics.rs`, #1334)
+
+| Metric | Type | Labels | Counts |
+|---|---|---|---|
+| `pcf_policy_associations` | gauge | `policy` (`am` TS 29.507, `sm` TS 29.512, `ue` TS 29.525, `app_session` TS 29.514) | associations the PCF holds |
+| `pcf_event_subscriptions` | gauge | | Npcf_EventExposure subscriptions held (TS 29.523) |
+| `pcf_policy_operations_total` | counter | `policy`, `operation` (`create`, `update`, `delete`), `result` (`success` = 2xx, `failure`) | association operations answered |
+
+### AUSF, UDM, UDR, BSF and NSSF families (#1334)
+
+Each NF's `metrics.rs`. Every `result` is `success` for a 2xx answer, else `failure`; every other label value is a fixed name in the code, never request data.
+
+| Metric | Type | Labels | Counts |
+|---|---|---|---|
+| `ausf_operations_total` | counter | `operation` (`authenticate`, `5g_aka_confirmation`, `eap_session`, `deregister`, `delete`, `sor_protection`, `upu_protection`), `result` | Nausf operations answered (TS 29.509) |
+| `ausf_authentication_results_total` | counter | `method` (`5g_aka`, `eap_aka_prime`), `result` | verdicts returned, read from `authResult` (a failed authentication is still a 200) |
+| `ausf_ue_authentication_contexts`, `ausf_kausf_anchors` | gauge | | contexts held, KAUSF anchors stored |
+| `udm_operations_total` | counter | `service` (a TS 29.503 Nudm service), `operation` (`generate_auth_data`, `auth_event`, `auth_event_cancel`, `amf_registration`, `amf_registration_update`, `amf_deregistration`, `smf_registration`, `smf_deregistration`, `get_registrations`, `get`, `subscribe`, `unsubscribe`, `modify_subscription`, `other`), `result` | Nudm operations answered |
+| `udm_ue_contexts`, `udm_amf_registered_ues`, `udm_pdu_sessions`, `udm_sdm_subscriptions` | gauge | | UE contexts, UEs with an AMF registered for 3GPP access, SMF-registered PDU sessions, SDM subscriptions |
+| `udr_operations_total` | counter | `data` (`subscription_data`, `policy_data`, `application_data`, `exposure_data`, `data_change_subscription`, `group_id_map`, `other`), `operation` (`query`, `create`, `create_or_replace`, `update`, `delete`), `result` | Nudr operations answered (TS 29.504, TS 29.598) |
+| `udr_ue_contexts` | gauge | | UE contexts held |
+| `bsf_binding_operations_total` | counter | `binding` (`pdu`, `ue`, `mbs`), `operation` (`register`, `discovery`, `retrieve`, `update`, `deregister`), `result` | Nbsf_Management binding operations answered (TS 29.521); a discovery that matches nothing is a 204, a success |
+| `bsf_subscription_operations_total` | counter | `operation` (`subscribe`, `modify`, `unsubscribe`), `result` | event subscription operations |
+| `bsf_pcf_bindings` | gauge | `binding` | bindings held |
+| `bsf_subscriptions` | gauge | | event subscriptions held |
+| `nssf_selections_total` | counter | `result` | Nnssf_NSSelection_Get answered (TS 29.531 §5.2) |
+| `nssf_availability_operations_total` | counter | `operation` (`update`, `patch`, `delete`, `subscribe`, `unsubscribe`, `modify_subscription`), `result` | Nnssf_NSSAIAvailability operations (§5.3) |
+| `nssf_nssai_availability_nfs`, `nssf_subscriptions`, `nssf_network_slice_instances` | gauge | | stored availability documents, subscriptions, configured slice instances |
+
+### No `metrics.server` in the YAML (#1312)
+
+No daemon reads a `metrics.server` block, and several have no metrics listener at all (hssd, pcrfd). The shipped configs used to carry one anyway (docker `5gc` amf/pcf/smf/upf, `epc` mme/hss/pcrf/pgwc/pgwu, and the k8s and Helm ConfigMaps). A key that is documented but has no effect is misleading, so the blocks were removed rather than wired up: a daemon's metrics listener is set by its environment variable, `MME_METRICS_ADDR`, `NEXTGCORE_METRICS_BIND` (loopback by default, #1308), `SMF_METRICS_PORT`, `AMF_METRICS_PORT`, `NRF_METRICS_PORT`, `PCF_METRICS_PORT`, `AUSF_METRICS_PORT`, `UDM_METRICS_PORT`, `UDR_METRICS_PORT`, `BSF_METRICS_PORT`, `NSSF_METRICS_PORT`, `UPF_METRICS_PORT`, `SGWC_METRICS_PORT`, `SGWU_METRICS_PORT` or `UCMF_METRICS_ADDR`, and nothing else.
+
+### The shipped scrape stack
+
+`docker compose up -d` in `docker/rust/` starts the full observability trio unconditionally (no compose profile gating):
+
+- **Prometheus** (`prom/prometheus:v2.51.0`, container `nextgcore-prometheus`, `172.23.0.200`, host port `9090`) — config `docker/rust/configs/observability/prometheus.yml`: 15s scrape interval, static targets for 10 NFs (NRF, AUSF, UDM, UDR, PCF, NSSF, BSF, AMF, SMF, UPF) at their fixed `172.23.0.x:9090` addresses, each labeled with `nf_type` and `instance_name`, plus self-scrape. Only the SMF and UPF listen on 9090, so those two jobs read `up == 1` and the other **8 NF jobs read `up == 0`** in the current build.
+- **Grafana** (`grafana/grafana:10.4.0`, `172.23.0.201`, host port `3000`, login `admin`/`nextgcore`) — provisioned datasources (`grafana-datasources.yml`: Prometheus at `http://172.23.0.200:9090`, Jaeger at `http://172.23.0.202:16686`) and dashboards from `configs/observability/dashboards/` with `overview.json` as the home dashboard.
+- **Alert rules** (`configs/observability/alert-rules.yml`) — `NfInstanceDown` (`up == 0` for 1m) and `NfSlowResponse` are generic and will actually evaluate; the NF-specific rules reference metric names (`amf_registration_failure_total`, `amf_connected_ue_count`, `smf_pfcp_association_up`, `upf_packets_dropped_total`, `nrf_registered_nf_count`, `mongodb_up`, …) that **no code in this repo emits** — they are aspirational, written for a future exporter wiring. (The SMF's real association gauge is `smf_n4_associations`, which no rule uses yet.)
+
+## Tracing (OpenTelemetry)
+
+**What exists.** `src/libs/nextgcore-metrics/src/otel.rs` provides `OtelConfig` (service name, OTLP endpoint — default `http://localhost:4317` — 10s export interval, traces/metrics/logs toggles), `OtelProvider`, W3C `traceparent` parse/generate helpers (`OtelSpanContext::from_traceparent`/`to_traceparent`), an `SbiSpan` wrapper with `nf.type`/`sbi.service`/`http.*` attributes, and a `JaegerConfig` (default endpoint `http://localhost:14268/api/traces`, sampling 1.0).
+
+**Startup wiring.** 27 of the 28 NF daemons call `init_otel(OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(...))` at startup, taking the endpoint from the **`OTEL_EXPORTER_OTLP_ENDPOINT`** environment variable and defaulting to **`http://jaeger:4317`** when unset (which resolves to the compose `jaeger` service). The AMF is the exception — it never calls `init_otel`. The shared helper `nf_common_init` in `src/libs/nextgcore-app/src/init.rs` bundles the same logic (same env var, same default) but is currently not called by any NF binary.
+
+**No-op behavior — the honest part.** `OtelProvider::init()` is structural: it prints `Initializing OpenTelemetry for service '&lt;name&gt;' (endpoint: &lt;url&gt;)` and per-signal init lines to stderr, but creates **no** actual OTLP exporters (the code comments read "In a real implementation, this would use the opentelemetry crate"). Initialization failure is deliberately non-fatal (`let _ = init_otel(...)` / `.ok()`). Net effect: whether or not a collector is reachable, **no spans, metrics, or logs are ever exported**. The Jaeger all-in-one container in the compose stack (UI on `16686`, OTLP gRPC `4317`, OTLP HTTP `4318`) will show no NextGCore traces.
+
+**What IS real: wire-level trace propagation.** The SBI client (`src/libs/nextgcore-sbi/src/client.rs`, `prepare_request`) stamps every outbound SBI request with a W3C `traceparent` header — respecting a caller-supplied one, otherwise generating a new sampled root span with CSPRNG-random trace/span IDs — and echoes the inbound correlation ID as `x-request-id`. So cross-NF request correlation works today by grepping IDs across `docker logs`, even without a trace backend.
+
+## Logging
+
+All NFs log to **stdout/stderr** via `env_logger`. Every NF binary uses millisecond timestamps. In the docker deployment, logs are consumed with `docker logs &lt;container&gt;` / `docker compose logs -f amf gnb ue`. The compose file's `x-common` anchor (`docker/rust/docker-compose.yml`) sets `RUST_LOG: info` as the baseline, but four services override it with more verbose crate-level filters: `amf` (`info,nextgcore_amfd=debug`), `upf` (`info,nextgcore_upfd=debug`), `gnb` and `ue`. `RUST_BACKTRACE: 1` is uniform across all services (merged via `&lt;&lt;: *common-env`).
+
+**CLI flags vary per NF** — check `--help` for the daemon you are running. Two verified patterns:
+
+| Pattern | Flags | Verified in |
+|---|---|---|
+| Open5GS-style | `-e, --log-level` (default `info`), `-l, --log-file`, `-m, --no-color`; some also have `-k, --kill` (ausfd, bsfd, hssd, nrfd, nssfd, pcfd, pcrfd, scpd, seppd, udmd, udrd, upfd) | most SBI and Diameter NFs, e.g. `nextgcore-nrfd` and `nextgcore-nsacfd` (no kill flag) |
+| AMF-style | `-l, --log-level` (default `info`), `--no-color`, `-d, --daemon` — **no** log-file flag | `nextgcore-amfd`, `nextgcore-mmed`, `nextgcore-sgwcd` |
+| ucmfd | `-e, --log-level` only; no log-file or no-color flag | `nextgcore-ucmfd` |
+
+`nextgcore-smfd` and `nextgcore-sgwud` have no clap parser. smfd scans `std::env::args()` for `-c/--config`, `-e/--log-level` (and `--state-file`); sgwud scans for `-c` and `-l/--log-level`.
+
+**The level is chosen the same way in every NF.** Every NF builds its logger with `nextgcore_core::log::nf_log_builder` (#691): `RUST_LOG`, when set, is the filter; otherwise the level is `--log-level` when given, else the config file's `logger.level`, else `info` (`nextgcore_core::log::nf_log_level`; an unknown value means `info`). `RUST_LOG_STYLE` sets the colour style; `--no-color` overrides it.
+
+Precedence, in full: a set, non-blank `RUST_LOG` **replaces** the resolved level (`--log-level` / `logger.level` / `info`); they are not merged. So `RUST_LOG=nextgcore_amfd=debug` alone logs only amfd's own targets (at debug) and silences every other target. Include a default level, as the compose files do (`info,nextgcore_amfd=debug`), to keep the rest at `info`. A blank `RUST_LOG=` counts as unset. `src/libs/nextgcore-core/tests/nf_logging_init.rs` fails if a daemon builds its own logger, skips `nf_log_level`, or gives its `log_level` flag a clap default (which would hide `logger.level`).
+
+**`--log-file` is accepted but not wired.** 22 binary crates (ausfd, bsfd, dccfd, easdfd, eesd, hssd, lmfd, mbsmfd, nefd, nrfd, nsacfd, nssfd, nwdafd, pcfd, pcrfd, pind, scpd, seppd, tsctsf, udmd, udrd, upfd — `grep -rl log_file src/bins/*/src/*.rs`) declare a `log_file` CLI arg, but in none of them is the parsed value ever consumed by the logging setup — e.g. nrfd's `init_logging()` never references `args.log_file`. Logs always go to stdout/stderr; rely on `docker logs` or shell redirection.
+
+## Troubleshooting
+
+Every row below is grounded in a specific file in this repo.
+
+| Symptom | Likely cause | What to check / fix |
+|---|---|---|
+| Prometheus shows NF targets `DOWN` (`up == 0`), `NfInstanceDown` alerts fire for 8 of the 10 NF jobs | **Expected in the current build**: only smfd and upfd serve `/metrics` on 9090; `MetricsServer::start()` is a stub that never binds | `src/libs/nextgcore-metrics/src/server.rs`, `nes_energy.rs` `serve_metrics`; scrape targets in `docker/rust/configs/observability/prometheus.yml` |
+| Grafana/Jaeger show no NF traces despite "Initializing OpenTelemetry" in NF stderr | `OtelProvider::init()` creates no real OTLP exporter (structural stub); export never happens | `src/libs/nextgcore-metrics/src/otel.rs` (`init_traces`/`init_metrics`/`init_logs` bodies) |
+| NF-specific alert rules never fire | Rules reference metric names (`amf_registration_failure_total`, `smf_pfcp_association_up`, …) that no code emits | `docker/rust/configs/observability/alert-rules.yml`; grep the names in `src/` — zero hits |
+| NF starts with built-in defaults although you passed a config file | Lenient config loading: an unreadable or unparsable YAML logs a **warning** and continues with defaults instead of aborting | e.g. amfd `load_config` (`src/bins/nextgcore-amfd/src/lib.rs`): look for `Could not read config file '...'` / `Failed to parse YAML config '...'. Using defaults.` in startup logs |
+| Editing `metrics.server` (or other unknown keys) in `amf.yaml`/`smf.yaml`/`pcf.yaml`/`upf.yaml` changes nothing | Those NFs deserialize only a small typed subset (UPF parses nothing at all — it only logs the file's byte count); serde ignores unknown keys silently. Move the SMF/UPF metrics port with `SMF_METRICS_PORT`/`UPF_METRICS_PORT` | `AmfSection` in `src/bins/nextgcore-amfd/src/lib.rs`; `SmfYaml` in `src/bins/nextgcore-smfd/src/main.rs`; `PcfSection` in `src/bins/nextgcore-pcfd/src/app.rs`; `src/bins/nextgcore-upfd/src/main.rs` (`Configuration file loaded`) |
+| Every NSAC admission fails (per-UE `SLICE_NOT_FOUND` failures / 403), breaking registration or PDU establishment | `nsacf.slice_quotas` missing from `nsacf.yaml` → NSACF starts with an **empty quota table** and no S-NSSAI is provisioned | `src/bins/nextgcore-nsacfd/src/main.rs` (quota provisioning and failure-reason mapping); add `slice_quotas` entries as in `docker/rust/configs/5gc/nsacf.yaml` |
+| SBI calls suddenly return **401** (or **503**) after enabling OAuth2 | Producer now requires an NRF-issued Bearer token (bad/absent token → 401; NRF JWKS unreachable → 503) but a consumer isn't attaching one | `docker/rust/docker-compose.oauth2.yml` (per-NF enablement map); `NEXTGCORE_SBI_OAUTH2_REQUIRE=1` env / `--oauth2-require` flags; enforcement semantics in `src/libs/nextgcore-sbi/src/server.rs` |
+| NF log shows `NRF registration failed (will operate without NRF)` | NRF was unreachable at startup; the startup registration (`PUT /nnrf-nfm/v1/nf-instances/{id}`) is attempted **once**, with no retry loop, and no heartbeat worker is started | `src/bins/nextgcore-amfd/src/lib.rs` (`amf_nrf_register` call in the startup path) + `src/bins/nextgcore-amfd/src/sbi_path.rs`; ensure NRF is healthy first (compose `depends_on` does this), else restart the NF |
+| Repeated `Heartbeat failed for &lt;id&gt;` / `Heartbeat got unexpected status ...` warnings | The heartbeat worker PATCHes `/nnrf-nfm/v1/nf-instances/{id}` (JSON-Patch `/load` gauge, every 5s for AMF/SMF) and logs failures. A **404** (the NRF lost the profile, e.g. it restarted) makes the worker re-PUT the profile the NF registered (#434); other failures are only logged. NFs also deregister from the NRF on shutdown (#235) | `src/libs/nextgcore-sbi/src/heartbeat.rs` `spawn_heartbeat_worker_with_load` |
+| UDR cannot reach MongoDB (E2E assert `MongoDB connected` fails) | Wrong DB URI. Resolution order: `db_uri:` line in the config file → `DB_URI` env var → default `mongodb://172.23.0.2/nextgcore` (the compose MongoDB) | `src/bins/nextgcore-udrd/src/main.rs` (`DB_URI` fallback); `docker compose ps mongodb` health (mongosh ping healthcheck); hssd takes `--db-uri` |
+| A real/external gNB cannot establish an N2 (NGAP) association with the AMF | AMF's default SCTP backend is `userspace` (sctp-proto over UDP, matched to the nextgsim gNB) — a standard RAN needs native kernel SCTP | `--sctp-backend kernel` (needs the `kernel-sctp` build feature + libsctp), see `Args` in `src/bins/nextgcore-amfd/src/lib.rs` and `docker/rust/docker-compose.kernel-sctp.yml`; verify with `docker exec nextgcore-amf cat /proc/net/sctp/assocs` |
+| Setting `RUST_LOG=debug` has no visible effect on an NF | `RUST_LOG` is not reaching the process (check `docker inspect` / the compose `environment:`), or the filter names the wrong target (crate names use underscores: `nextgcore_amfd=debug`) | `nextgcore_core::log::nf_log_builder` in `src/libs/nextgcore-core/src/log.rs` |
+| `TLS_ENABLED=true SBI_SCHEME=https docker compose up` doesn't turn on TLS | No Rust code reads `TLS_ENABLED`/`SBI_SCHEME` — they are compose-level env decoration; real TLS knobs are per-NF CLI flags | grep in `src/` returns zero `.rs` hits; use `--tls --tls-cert --tls-key` (nrfd also `--mtls`, `--tls-ca-cert`), certs from `docker/rust/certs/generate-dev-certs.sh` |
+| Docker build fails or (worse) Docker Desktop wipes its image store mid-build | Building under disk pressure — a full rebuild needs ~20 GB; this destroyed the image store once (hazard #269) | `docker/rust/preflight.sh` refuses to build below the free-space minimum (default 25 GB, checked on host **and** inside the Docker VM) and trims BuildKit cache to 20 GB; don't use `--no-preflight` casually |
+| Manual log-grep "fails" even though the line is present | `docker logs \| grep -q` under `pipefail` dies via SIGPIPE on first match, turning a match into a false negative | header note in `docker/rust/e2e-test.sh`: always capture `docker logs` to a file, then grep the file (as `assert_log_contains` does) |
+
+## Running the E2E suite
+
+The single local entrypoint is `docker/rust/e2e.sh`:
+
+```bash
+cd nextgcore/docker/rust
 ./e2e.sh                         # preflight + full build + baseline E2E
 ./e2e.sh --quick                 # reuse existing binaries (build.sh --skip-rust)
 ./e2e.sh --overlay oauth2        # baseline suite with OAuth2 enforcement overlay

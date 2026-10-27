@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-d47bad62.js";
+            window.path_to_searchindex_js = "searchindex-3c66c1c2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-be5dca41.js"></script>
@@ -274,8 +274,14 @@ bash deploy.sh                     # deploy the stack
 kubectl get pods -n nextg-system   # verify pods are running
 bash e2e-test.sh                   # run the E2E suite against the cluster
 
-kubectl port-forward -n nextg-system svc/jaeger 16686:16686   # traces
+kubectl port-forward -n nextg-system svc/grafana 3000:3000     # dashboards
+kubectl port-forward -n nextg-system svc/prometheus 9090:9090  # metrics
+kubectl port-forward -n nextg-system svc/jaeger 16686:16686    # traces
+kubectl port-forward -n nextg-system svc/nrf 7777:7777         # NRF SBI
 </code></pre>
+<p>Every Service is ClusterIP: nothing is published on a node port, a load
+balancer or the kind host, and <code>kubectl port-forward</code> listens on 127.0.0.1
+only (#1365).</p>
 <p>Every NF exposes Prometheus metrics on port 9090 (<code>/metrics</code>); monitoring assets are under <code>k8s/monitoring/</code> and <code>docker/rust/monitoring/</code>. <code>teardown.sh</code> removes the deployment.</p>
 <h2 id="where-configs-live"><a class="header" href="#where-configs-live">Where Configs Live</a></h2>
 <p>Per-NF YAML configs for the Docker stack are under <code>docker/rust/configs/</code>:</p>
