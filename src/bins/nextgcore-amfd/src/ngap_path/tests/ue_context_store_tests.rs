@@ -394,9 +394,9 @@ async fn a_restarted_amf_points_a_restored_ue_s_peers_at_itself_at_its_first_mes
 }
 
 /// What a stand-in SMF records: each request as (path, JSON body), and when each
-/// serving-AMF update arrived.
+/// serving-AMF update ("serving") and each ACTIVATING ("activating") arrived.
 type Seen = Arc<std::sync::Mutex<Vec<(String, String)>>>;
-type Arrivals = Arc<std::sync::Mutex<Vec<std::time::Instant>>>;
+type Arrivals = Arc<std::sync::Mutex<Vec<(&'static str, std::time::Instant)>>>;
 
 /// A stand-in SMF that answers its `n`th serving-AMF update (from 1) with
 /// `serving(n)`, an ACTIVATING with an N2 SM transfer, and anything else with `204`.
@@ -424,11 +424,15 @@ async fn scripted_smf(
                 if body.contains("servingNfId") {
                     let n = {
                         let mut times = times.lock().unwrap();
-                        times.push(std::time::Instant::now());
-                        times.len()
+                        times.push(("serving", std::time::Instant::now()));
+                        times.iter().filter(|(what, _)| *what == "serving").count()
                     };
                     serving(n)
                 } else if body.contains("ACTIVATING") {
+                    times
+                        .lock()
+                        .unwrap()
+                        .push(("activating", std::time::Instant::now()));
                     let n2 = base64::engine::general_purpose::STANDARD.encode([0xA5, 0x18, 0x05]);
                     SResp::with_status(200).with_body(
                         serde_json::json!({
@@ -672,7 +676,8 @@ async fn a_definitive_4xx_to_a_serving_amf_update_is_not_retried() {
 /// (300 ms in tests), so the update keeps failing for about 1.2 s.
 ///
 /// REVERT-VERIFIED: with the backoff slept inside the keyed job, the ACTIVATING
-/// reaches the SMF only after the fifth update.
+/// reaches the SMF only after the fifth update; with only the first backoff slept
+/// inside it (then re-queued), the ACTIVATING is a backoff late.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_service_request_s_activating_is_not_held_behind_a_failing_serving_update() {
     let (_smf, port, seen, arrivals) = scripted_smf(|_| {
@@ -722,11 +727,26 @@ async fn a_service_request_s_activating_is_not_held_behind_a_failing_serving_upd
         "the ACTIVATING goes out during the first backoff, not after the update gives up: \
          {calls:?}"
     );
-    let times = arrivals.lock().unwrap().clone();
+    let arrived = arrivals.lock().unwrap().clone();
+    let at = |what: &str| -> Vec<std::time::Instant> {
+        arrived
+            .iter()
+            .filter(|(w, _)| *w == what)
+            .map(|(_, t)| *t)
+            .collect()
+    };
+    let (times, activated) = (at("serving"), at("activating"));
     let gap = times[1] - times[0];
     assert!(
         gap >= Duration::from_millis(250) && gap < Duration::from_millis(900),
         "Retry-After honoured, capped at 300 ms: {gap:?}"
+    );
+    // Review of #1344, MINOR 1: not even one backoff late. Held through the first
+    // backoff (300 ms) the ACTIVATING would still precede the second update.
+    let late = activated[0].saturating_duration_since(times[0]);
+    assert!(
+        late < Duration::from_millis(150),
+        "the ACTIVATING does not wait out the first backoff: {late:?} after the first update"
     );
     let ue = after.ue_auth_state.get(sr_id).expect("resumed");
     assert!(!ue.cm_idle, "CM-CONNECTED again");

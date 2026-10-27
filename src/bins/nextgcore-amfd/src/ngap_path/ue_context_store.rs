@@ -900,7 +900,10 @@ impl NgapServer {
             // #1329: the UDM and the PCF learn this process's addresses at the UE's
             // first verified message (`complete_takeover`); the SMFs now (review M1),
             // so a downlink for an idle UE pages it here. Queued before the release of
-            // a connected UE's sessions below, so each SMF hears of this AMF first.
+            // a connected UE's sessions below, so each SMF normally hears of this AMF
+            // first. (When the restore's share of the offload is in use, the update
+            // waits outside the key and may land after the DEACTIVATED: harmless, the
+            // SMF sends the AMF nothing for a DEACTIVATED.)
             self.ue_auth_state.with_mut(id, |s| s.peers_stale = true);
             self.point_smfs_at_self(id);
             log::info!(
