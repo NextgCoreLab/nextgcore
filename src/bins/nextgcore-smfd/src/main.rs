@@ -1256,41 +1256,12 @@ async fn main() -> Result<()> {
     let shutdown_assoc = shutdown.clone();
     let clients_assoc = pfcp_clients.clone();
     let pfcp_assoc_handle = tokio::spawn(async move {
-        let heartbeat_period = std::time::Duration::from_secs(10);
-        let reassociate_holdoff = std::time::Duration::from_secs(10);
-        loop {
-            if shutdown_assoc.load(Ordering::SeqCst) || SHUTDOWN.load(Ordering::SeqCst) {
-                break;
-            }
-            for client_assoc in &clients_assoc {
-                if !client_assoc.is_associated().await {
-                    if let Err(e) = pfcp_path::try_associate(client_assoc).await {
-                        // Abnormal action on association failure: declare the
-                        // UPF unreachable and retry next cycle. Handled
-                        // per-peer (issue #20 review): one unreachable UPF
-                        // must not starve heartbeats to healthy pool members.
-                        log::error!(
-                            "PFCP Association Setup with {} failed: {e}; retrying in {}s",
-                            client_assoc.peer(),
-                            reassociate_holdoff.as_secs()
-                        );
-                    }
-                }
-            }
-            tokio::time::sleep(heartbeat_period).await;
-            if shutdown_assoc.load(Ordering::SeqCst) || SHUTDOWN.load(Ordering::SeqCst) {
-                break;
-            }
-            for client_assoc in &clients_assoc {
-                if client_assoc.is_associated().await {
-                    if let Err(e) = client_assoc.heartbeat_once().await {
-                        // Exhaustion already marked the association down inside
-                        // the engine; the next loop turn re-associates.
-                        log::error!("PFCP heartbeat to {} failed: {e}", client_assoc.peer());
-                    }
-                }
-            }
-        }
+        pfcp_path::run_association_loop(
+            clients_assoc,
+            move || shutdown_assoc.load(Ordering::SeqCst) || SHUTDOWN.load(Ordering::SeqCst),
+            std::time::Duration::from_secs(10),
+        )
+        .await;
     });
 
     // The Prometheus endpoint (#380). Spawned AFTER the N4 pool and the S5/S8 socket
