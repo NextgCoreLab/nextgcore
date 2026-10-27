@@ -69,6 +69,7 @@ pub mod types; // Event-driven pub-sub (B6.1)
 pub mod uri_encode; // Percent-encoding for URI queries and form bodies (issue #101)
 
 pub mod client;
+mod conn_end; // how an HTTP/2 connection's end is logged (#1338)
 pub mod server;
 
 // Re-export commonly used types

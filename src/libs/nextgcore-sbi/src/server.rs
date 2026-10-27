@@ -1115,6 +1115,12 @@ impl SbiServer {
                 .map_err(|e| SbiError::ServerError(format!("Failed to bind: {e}")))?,
         };
 
+        // For the accept-failure log line (#1338); the configured address is
+        // `:0` for a test server, so ask the listener.
+        let local_addr = listener
+            .local_addr()
+            .map_or_else(|_| self.config.addr.to_string(), |a| a.to_string());
+
         let tls_acceptor = if self.config.scheme == UriScheme::Https {
             Some(self.build_tls_acceptor()?)
         } else {
@@ -1157,7 +1163,7 @@ impl SbiServer {
                 tokio::select! {
                     result = listener.accept() => {
                         match result {
-                            Ok((stream, _)) => {
+                            Ok((stream, peer)) => {
                                 let handler_ref = handler.clone();
                                 let oauth_ref = oauth.clone();
                                 let http2_limits = http2_limits;
@@ -1236,12 +1242,16 @@ impl SbiServer {
                                                     http2_limits,
                                                     conn_graceful,
                                                     conn_drain,
-                                                    "HTTP/2 TLS",
+                                                    "SBI server HTTP/2 TLS",
+                                                    peer,
                                                 )
                                                 .await;
                                             }
                                             Err(e) => {
-                                                eprintln!("TLS accept error: {e}");
+                                                crate::conn_end::log_tls_accept_error(
+                                                    &peer.to_string(),
+                                                    &e,
+                                                );
                                             }
                                         }
                                     });
@@ -1264,12 +1274,13 @@ impl SbiServer {
                                         http2_limits,
                                         conn_graceful,
                                         conn_drain,
-                                        "HTTP/2",
+                                        "SBI server HTTP/2",
+                                        peer,
                                     ));
                                 }
                             }
                             Err(e) => {
-                                eprintln!("Accept error: {e}");
+                                log::warn!("SBI server on {local_addr}: accept failed: {e}");
                             }
                         }
                     }
@@ -1371,6 +1382,7 @@ async fn serve_connection_gracefully<I, H>(
     mut graceful: watch::Receiver<bool>,
     drain_token: mpsc::Sender<()>,
     label: &'static str,
+    peer: SocketAddr,
 ) where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
     H: SbiRequestHandler,
@@ -1400,8 +1412,11 @@ async fn serve_connection_gracefully<I, H>(
             }
         }
     };
+    // #1338: this was `eprintln!("{label} connection error: {e}")`, and a
+    // kubelet `tcpSocket` probe (connect, close, no preface) printed it as the
+    // bare `HTTP/2 connection error: connection error` every 7.5 s in every NF.
     if let Err(e) = drained {
-        eprintln!("{label} connection error: {e}");
+        crate::conn_end::log_conn_end(label, &peer.to_string(), &e);
     }
     drop(drain_token);
 }
@@ -2795,6 +2810,59 @@ mod tests {
         assert_eq!(parsed.reduction_metric, 40);
         assert_eq!(parsed.period_of_validity_secs, Some(75));
 
+        server.stop().await.expect("stop");
+    }
+}
+
+/// #1338: a kubelet `tcpSocket` probe against the SBI port.
+#[cfg(test)]
+mod tcp_probe_tests {
+    use crate::message::{SbiRequest, SbiResponse};
+    use std::time::Duration;
+
+    /// The measured symptom, reproduced: a connection that is opened and closed
+    /// without an HTTP/2 preface -- exactly what a `tcpSocket` probe does, four
+    /// times per 30 s under the Helm chart's readiness (10 s) + liveness (30 s)
+    /// probes -- ended the server's connection task with h2's `UnexpectedEof`,
+    /// which was printed as the bare `HTTP/2 connection error: connection error`.
+    /// It is an orderly peer close: one `debug` record naming the prober.
+    #[tokio::test]
+    async fn a_tcp_probe_without_a_preface_is_logged_at_debug_with_the_prober() {
+        assert!(
+            nextgcore_core::test_log::init(),
+            "premise: the capture logger"
+        );
+        let (server, addr) =
+            crate::test_support::sbi_server_on_free_port(|_req: SbiRequest| async {
+                SbiResponse::with_status(200)
+            })
+            .await;
+
+        let probe = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("probe connects");
+        let prober = probe.local_addr().expect("probe address");
+        drop(probe); // FIN, no preface: a kubelet tcpSocket probe
+
+        let needle = format!("with {prober} ");
+        let records = crate::test_support::poll_until(
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            || {
+                let found = nextgcore_core::test_log::captured(&needle);
+                async move { (!found.is_empty()).then_some(found) }
+            },
+        )
+        .await
+        .unwrap_or_default();
+        assert_eq!(records.len(), 1, "one connection-end record: {records:?}");
+        assert!(
+            records[0].starts_with("DEBUG ")
+                && records[0].contains(&format!("SBI server HTTP/2 connection with {prober}"))
+                && records[0].contains("closed by peer")
+                && records[0].contains("preface"),
+            "{records:?}"
+        );
         server.stop().await.expect("stop");
     }
 }
