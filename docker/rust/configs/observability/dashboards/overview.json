@@ -127,7 +127,7 @@
       "gridPos": { "h": 8, "w": 8, "x": 0, "y": 20 },
       "targets": [
         {
-          "expr": "smf_active_pdu_sessions",
+          "expr": "smf_sessions",
           "legendFormat": "Active Sessions"
         }
       ],
@@ -136,17 +136,17 @@
       }
     },
     {
-      "title": "SMF - Session Create Rate",
+      "title": "SMF - N4 Associations / Peers",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 8, "x": 8, "y": 20 },
       "targets": [
         {
-          "expr": "rate(smf_session_success_total[5m])",
-          "legendFormat": "Success/s"
+          "expr": "smf_n4_associations",
+          "legendFormat": "Associated UPFs"
         },
         {
-          "expr": "rate(smf_session_failure_total[5m])",
-          "legendFormat": "Failure/s"
+          "expr": "smf_n4_peers",
+          "legendFormat": "Configured UPFs"
         }
       ],
       "fieldConfig": {
@@ -159,15 +159,15 @@
       "gridPos": { "h": 8, "w": 8, "x": 16, "y": 20 },
       "targets": [
         {
-          "expr": "rate(upf_packets_total{direction=\"uplink\"}[5m])",
+          "expr": "rate(upf_dataplane_ul_packets_total[5m])",
           "legendFormat": "Uplink pps"
         },
         {
-          "expr": "rate(upf_packets_total{direction=\"downlink\"}[5m])",
+          "expr": "rate(upf_dataplane_dl_packets_total[5m])",
           "legendFormat": "Downlink pps"
         },
         {
-          "expr": "rate(upf_packets_dropped_total[5m])",
+          "expr": "rate(upf_dataplane_dropped_packets_total[5m])",
           "legendFormat": "Dropped pps"
         }
       ],
@@ -181,11 +181,11 @@
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
       "targets": [
         {
-          "expr": "rate(upf_bytes_total{direction=\"uplink\"}[5m]) * 8",
+          "expr": "rate(upf_dataplane_ul_bytes_total[5m]) * 8",
           "legendFormat": "Uplink bps"
         },
         {
-          "expr": "rate(upf_bytes_total{direction=\"downlink\"}[5m]) * 8",
+          "expr": "rate(upf_dataplane_dl_bytes_total[5m]) * 8",
           "legendFormat": "Downlink bps"
         }
       ],
