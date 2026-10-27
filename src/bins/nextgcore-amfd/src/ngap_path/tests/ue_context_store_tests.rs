@@ -393,34 +393,52 @@ async fn a_restarted_amf_points_a_restored_ue_s_peers_at_itself_at_its_first_mes
     crash(&mut after, sr_id);
 }
 
-/// A stand-in SMF that answers `500` to the first `fail` serving-AMF updates, then
-/// `204`; it records every request.
-async fn flaky_smf(
-    fail: usize,
-) -> (
-    nextgcore_sbi::server::SbiServer,
-    u16,
-    Arc<std::sync::Mutex<Vec<(String, String)>>>,
-) {
+/// What a stand-in SMF records: each request as (path, JSON body), and when each
+/// serving-AMF update arrived.
+type Seen = Arc<std::sync::Mutex<Vec<(String, String)>>>;
+type Arrivals = Arc<std::sync::Mutex<Vec<std::time::Instant>>>;
+
+/// A stand-in SMF that answers its `n`th serving-AMF update (from 1) with
+/// `serving(n)`, an ACTIVATING with an N2 SM transfer, and anything else with `204`.
+async fn scripted_smf(
+    serving: impl Fn(usize) -> nextgcore_sbi::message::SbiResponse + Send + Sync + 'static,
+) -> (nextgcore_sbi::server::SbiServer, u16, Seen, Arrivals) {
+    use base64::Engine as _;
     use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
     use nextgcore_sbi::server::{SbiServer as NSbiServer, SbiServerConfig as NSbiCfg};
-    let seen: Arc<std::sync::Mutex<Vec<(String, String)>>> = Arc::default();
-    let sink = Arc::clone(&seen);
+    let seen: Seen = Arc::default();
+    let arrivals: Arrivals = Arc::default();
+    let (sink, times) = (Arc::clone(&seen), Arc::clone(&arrivals));
+    let serving = Arc::new(serving);
     let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
     let server = NSbiServer::on_listener(NSbiCfg::new(addr), listener);
     server
         .start(move |req: SReq| {
-            let sink = Arc::clone(&sink);
+            let (sink, times, serving) =
+                (Arc::clone(&sink), Arc::clone(&times), Arc::clone(&serving));
             async move {
                 let body = req.http.content.clone().unwrap_or_default();
-                let mut seen = sink.lock().unwrap();
-                seen.push((req.header.uri.clone(), body.clone()));
-                let updates = seen
-                    .iter()
-                    .filter(|(_, b)| b.contains("servingNfId"))
-                    .count();
-                if body.contains("servingNfId") && updates <= fail {
-                    SResp::with_status(500)
+                sink.lock()
+                    .unwrap()
+                    .push((req.header.uri.clone(), body.clone()));
+                if body.contains("servingNfId") {
+                    let n = {
+                        let mut times = times.lock().unwrap();
+                        times.push(std::time::Instant::now());
+                        times.len()
+                    };
+                    serving(n)
+                } else if body.contains("ACTIVATING") {
+                    let n2 = base64::engine::general_purpose::STANDARD.encode([0xA5, 0x18, 0x05]);
+                    SResp::with_status(200).with_body(
+                        serde_json::json!({
+                            "upCnxState": "ACTIVATING",
+                            "n2SmInfoType": "PDU_RES_SETUP_REQ",
+                            "n2SmInfo": n2,
+                        })
+                        .to_string(),
+                        "application/json",
+                    )
                 } else {
                     SResp::no_content()
                 }
@@ -434,7 +452,41 @@ async fn flaky_smf(
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    (server, addr.port(), seen)
+    (server, addr.port(), seen, arrivals)
+}
+
+/// A stand-in SMF that answers `500` to the first `fail` serving-AMF updates, then
+/// `204`; it records every request.
+async fn flaky_smf(fail: usize) -> (nextgcore_sbi::server::SbiServer, u16, Seen) {
+    let (server, port, seen, _) = scripted_smf(move |n| {
+        if n <= fail {
+            nextgcore_sbi::message::SbiResponse::with_status(500)
+        } else {
+            nextgcore_sbi::message::SbiResponse::no_content()
+        }
+    })
+    .await;
+    (server, port, seen)
+}
+
+/// How many serving-AMF updates `seen` holds.
+fn serving_updates(seen: &Seen) -> usize {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, b)| b.contains("servingNfId"))
+        .count()
+}
+
+/// Settle and apply the offloaded work until `done` holds (up to about 3 s).
+async fn settle_until(server: &mut NgapServer, mut done: impl FnMut() -> bool) {
+    for _ in 0..60 {
+        settle_offloaded_sbi(server).await;
+        if done() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Store UE `supi` on one AMF, "crash" it, and restore it on a fresh one of the same
@@ -572,6 +624,187 @@ async fn a_refused_serving_amf_update_is_retried_until_the_smf_takes_it() {
     );
     let (id, _) = after.ue_auth_state.find_by_supi(supi).expect("restored");
     crash(&mut after, id);
+}
+
+/// **#1329 follow-up, review MINOR 1.** A definitive 4xx is not asked again: an SMF
+/// that lost the SM context answers 404, and four more tries cannot change that. One
+/// attempt, then the update is given up (and logged). A 5xx is still retried (above).
+///
+/// REVERT-VERIFIED: with every error retryable, the SMF sees 5 updates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_definitive_4xx_to_a_serving_amf_update_is_not_retried() {
+    let (_smf, port, seen, _) =
+        scripted_smf(|_| nextgcore_sbi::message::SbiResponse::with_status(404)).await;
+    let (_udm, udm_port, _) = fake_activating_smf().await;
+    let (_pcf, pcf_port, _) = fake_activating_smf().await;
+    let _env = SmfEnvGuard::acquire(port).await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let supi = "imsi-001010001329501";
+    let (mut after, _) = restarted_with(
+        13_290_501,
+        0x1329_0501,
+        supi,
+        "ref-1329-n",
+        port,
+        udm_port,
+        pcf_port,
+    )
+    .await;
+    // `settle` waits out any retry too; the sleep is longer than the whole test
+    // backoff (20 + 40 + 80 + 160 ms), so a retry would show either way.
+    settle_offloaded_sbi(&mut after).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    settle_offloaded_sbi(&mut after).await;
+    assert_eq!(
+        serving_updates(&seen),
+        1,
+        "a 404 is not retried: {:?}",
+        seen.lock().unwrap()
+    );
+    let (id, _) = after.ue_auth_state.find_by_supi(supi).expect("restored");
+    crash(&mut after, id);
+}
+
+/// **#1329 follow-up, review MINOR 2.** A failing serving-AMF update does not hold its
+/// session's key through its backoff: the restored UE's Service Request re-activates
+/// the session at once, between the update's tries, instead of after all of them. The
+/// SMF answers each update `503` with `Retry-After: 1`, which is honoured but capped
+/// (300 ms in tests), so the update keeps failing for about 1.2 s.
+///
+/// REVERT-VERIFIED: with the backoff slept inside the keyed job, the ACTIVATING
+/// reaches the SMF only after the fifth update.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_service_request_s_activating_is_not_held_behind_a_failing_serving_update() {
+    let (_smf, port, seen, arrivals) = scripted_smf(|_| {
+        nextgcore_sbi::message::SbiResponse::with_status(503).with_header("Retry-After", "1")
+    })
+    .await;
+    let (_udm, udm_port, _) = fake_activating_smf().await;
+    let (_pcf, pcf_port, _) = fake_activating_smf().await;
+    let _env = SmfEnvGuard::acquire(port).await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let (sr_id, tmsi, supi) = (13_290_603u64, 0x1329_0601u32, "imsi-001010001329601");
+    let (mut after, original) = restarted_with(
+        13_290_601,
+        tmsi,
+        supi,
+        "ref-1329-s",
+        port,
+        udm_port,
+        pcf_port,
+    )
+    .await;
+    let (_, restored) = after.ue_auth_state.find_by_supi(supi).expect("restored");
+    after.forced_amf_ue_ngap_id = Some(sr_id);
+    let nas = protected_idle_service_request(&restored.amf_ue, tmsi, original.amf_ue.ul_count + 1);
+    after
+        .handle_initial_ue_message(1, &service_request_initial_ue(nas))
+        .await
+        .expect("handled");
+    settle_until(&mut after, || serving_updates(&seen) >= 5).await;
+
+    let calls = seen.lock().unwrap().clone();
+    let updates: Vec<usize> = calls
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, b))| b.contains("servingNfId"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(updates.len(), 5, "a 503 is retried, 5 tries: {calls:?}");
+    let activating = calls
+        .iter()
+        .position(|(uri, body)| {
+            uri.contains("/sm-contexts/ref-1329-s/modify") && body.contains("ACTIVATING")
+        })
+        .unwrap_or_else(|| panic!("the session is re-activated: {calls:?}"));
+    assert!(
+        activating < updates[1],
+        "the ACTIVATING goes out during the first backoff, not after the update gives up: \
+         {calls:?}"
+    );
+    let times = arrivals.lock().unwrap().clone();
+    let gap = times[1] - times[0];
+    assert!(
+        gap >= Duration::from_millis(250) && gap < Duration::from_millis(900),
+        "Retry-After honoured, capped at 300 ms: {gap:?}"
+    );
+    let ue = after.ue_auth_state.get(sr_id).expect("resumed");
+    assert!(!ue.cm_idle, "CM-CONNECTED again");
+    crash(&mut after, sr_id);
+}
+
+/// **#1329 follow-up, review MINOR 3.** A restore of many UEs while their SMF is
+/// blackholed (it accepts and never answers) holds at most the restore's share of the
+/// offload's permits, so a regular offloaded exchange still runs at once.
+///
+/// REVERT-VERIFIED: without the restore limits all 16 permits hang on the SMF and the
+/// regular exchange waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restore_with_its_smf_blackholed_leaves_the_offload_to_regular_signalling() {
+    const UES: u64 = 20;
+    let (_blackhole, port) = super::handler_tests::hanging_smf();
+    let _env = SmfEnvGuard::acquire(port).await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let supi = |i: u64| format!("imsi-0010100013297{i:02}");
+    let backend = Arc::new(MemoryBackend::default());
+    let mut before = storing_server(&backend).await;
+    for i in 0..UES {
+        seed_registered_ue(
+            &mut before,
+            13_290_700 + i,
+            0x1329_0700 + i as u32,
+            &supi(i),
+            &format!("ref-1329-b{i}"),
+            port,
+            false,
+        );
+    }
+    store_now(&mut before).await;
+    for i in 0..UES {
+        crash(&mut before, 13_290_700 + i);
+    }
+    drop(before);
+    let alone = Arc::new(MemoryBackend::default());
+    for i in 0..UES {
+        alone
+            .put(&backend.get(&supi(i)).expect("stored"))
+            .expect("put");
+    }
+    let mut after = storing_server(&alone).await;
+    open_with(&mut after, Arc::clone(&alone) as Arc<dyn UeContextBackend>).await;
+    let restored: Vec<u64> = (0..UES)
+        .filter_map(|i| after.ue_auth_state.find_by_supi(&supi(i)).map(|(id, _)| id))
+        .collect();
+    assert_eq!(restored.len() as u64, UES, "all restored");
+    // Let the restore's updates reach the blackholed SMF.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let held = after.sbi_offload.in_flight();
+    assert!(
+        held > 0 && held <= super::super::RESTORE_PEER_UPDATES_MAX,
+        "the restore holds at most its share of the permits: {held}"
+    );
+
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&ran);
+    after.sbi_offload.spawn(async move {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        None
+    });
+    let started = std::time::Instant::now();
+    while !ran.load(std::sync::atomic::Ordering::SeqCst)
+        && started.elapsed() < Duration::from_secs(2)
+    {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        ran.load(std::sync::atomic::Ordering::SeqCst)
+            && started.elapsed() < Duration::from_millis(500),
+        "a regular exchange runs at once: {:?}",
+        started.elapsed()
+    );
+    for id in restored {
+        crash(&mut after, id);
+    }
 }
 
 /// **#1329 review.** The restart case through a REGISTRATION REQUEST as the UE's first

@@ -399,7 +399,7 @@ impl NgapServer {
         // procedure's own exchanges for it. #1329 review M1: a restart restore told
         // its SMFs at restore time (`point_smfs_at_self`), so only a takeover here.
         if taken_over {
-            self.spawn_smf_serving_updates(amf_ue_ngap_id, &state);
+            self.spawn_smf_serving_updates(amf_ue_ngap_id, &state, false);
         }
 
         // #1210: the PCF's policy associations now notify this AMF.
@@ -495,10 +495,22 @@ impl NgapServer {
 
     /// Tell each SMF of UE `amf_ue_ngap_id` that this AMF serves its SM context, with
     /// this process's `smContextStatusUri` (TS 29.502 Table 6.1.6.2.2-1): the SMF sends
-    /// its status notifications and N1N2 transfers, paging among them, there. Keyed on
-    /// the session and durable, so it precedes the session's later exchanges and is not
-    /// dropped; bounded by the offload's concurrency; retried with backoff.
-    pub(super) fn spawn_smf_serving_updates(&mut self, amf_ue_ngap_id: u64, state: &UeNasContext) {
+    /// its status notifications and N1N2 transfers, paging among them, there.
+    ///
+    /// Each attempt is keyed on the session and durable, so it is serialised with the
+    /// session's other exchanges and not dropped, and the first precedes the session's
+    /// exchanges queued after it. A failed attempt is retried as
+    /// [`crate::sbi_path::peer_update_retry_wait`] says (not after a definitive 4xx),
+    /// but its backoff holds neither the key nor a permit (#1329 review): the UE's own
+    /// procedures for the session (a Service Request's ACTIVATING, a release) run
+    /// meanwhile, and the retry is queued behind them. `at_restore`: a restart
+    /// restore's update, which also waits its turn at [`RestorePeerLimits`].
+    pub(super) fn spawn_smf_serving_updates(
+        &mut self,
+        amf_ue_ngap_id: u64,
+        state: &UeNasContext,
+        at_restore: bool,
+    ) {
         let Some(supi) = state.amf_ue.supi.clone() else {
             return;
         };
@@ -514,23 +526,18 @@ impl NgapServer {
                 },
                 "servingNetwork": { "mcc": serving_mcc, "mnc": serving_mnc },
             });
+            let update = ServingUpdate {
+                amf_ue_ngap_id,
+                psi,
+                host,
+                port,
+                sm_ref,
+                serving,
+                attempt: 1,
+                limits: at_restore.then(|| Arc::clone(&self.restore_peer_limits)),
+            };
             self.sbi_offload
-                .spawn_keyed_durable((amf_ue_ngap_id, psi), move || async move {
-                    if let Err(e) =
-                        crate::sbi_path::retry_peer_update("SMF serving-AMF update", || {
-                            crate::sbi_path::call_smf_update_serving_amf(
-                                &host, port, &sm_ref, &serving,
-                            )
-                        })
-                        .await
-                    {
-                        log::warn!(
-                            "UE {amf_ue_ngap_id}: PSI {psi}'s SMF was not told of the serving \
-                             AMF: {e}"
-                        );
-                    }
-                    None
-                });
+                .spawn_keyed_requeueable((amf_ue_ngap_id, psi), update.job(None));
         }
     }
 
@@ -544,7 +551,7 @@ impl NgapServer {
         let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) else {
             return;
         };
-        self.spawn_smf_serving_updates(amf_ue_ngap_id, &state);
+        self.spawn_smf_serving_updates(amf_ue_ngap_id, &state, true);
     }
 
     pub(super) fn apply_takeover_uecm(&mut self, answer: TakeoverUecmAnswer) {
@@ -737,4 +744,133 @@ async fn takeover_sdm_resubscribe(
         }
     }
     Some(new)
+}
+
+/// #1329 review: the bound on restart-restore serving-AMF updates in flight, overall
+/// and per SMF. An update takes its permits before its attempt and gives them back
+/// after it (not across a backoff), so with an SMF blackholed a large restore holds at
+/// most `overall` of the offload's permits, and regular signalling keeps the rest.
+#[derive(Debug)]
+pub(crate) struct RestorePeerLimits {
+    overall: Arc<tokio::sync::Semaphore>,
+    per_smf_max: usize,
+    per_smf: std::sync::Mutex<HashMap<(String, u16), Arc<tokio::sync::Semaphore>>>,
+}
+
+/// The permits one restore-time attempt holds.
+type RestorePermits = (
+    tokio::sync::OwnedSemaphorePermit,
+    tokio::sync::OwnedSemaphorePermit,
+);
+
+impl RestorePeerLimits {
+    pub(crate) fn new(overall: usize, per_smf: usize) -> Self {
+        Self {
+            overall: Arc::new(tokio::sync::Semaphore::new(overall.max(1))),
+            per_smf_max: per_smf.max(1),
+            per_smf: std::sync::Mutex::default(),
+        }
+    }
+
+    fn smf(&self, host: &str, port: u16) -> Arc<tokio::sync::Semaphore> {
+        let mut per_smf = self
+            .per_smf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(
+            per_smf
+                .entry((host.to_string(), port))
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(self.per_smf_max))),
+        )
+    }
+
+    /// The permits for one attempt toward `host:port`, if both are free now.
+    fn try_take(&self, host: &str, port: u16) -> Option<RestorePermits> {
+        let smf = self.smf(host, port).try_acquire_owned().ok()?;
+        let all = Arc::clone(&self.overall).try_acquire_owned().ok()?;
+        Some((smf, all))
+    }
+
+    /// Wait for the permits for one attempt toward `host:port`: the SMF's first, so
+    /// every waiter takes them in the same order.
+    async fn take(&self, host: &str, port: u16) -> Option<RestorePermits> {
+        let smf = self.smf(host, port).acquire_owned().await.ok()?;
+        let all = Arc::clone(&self.overall).acquire_owned().await.ok()?;
+        Some((smf, all))
+    }
+}
+
+/// One SM context's serving-AMF update and how far it got.
+struct ServingUpdate {
+    amf_ue_ngap_id: u64,
+    psi: u8,
+    host: String,
+    port: u16,
+    sm_ref: String,
+    serving: serde_json::Value,
+    /// The attempt this job makes, from 1.
+    attempt: u32,
+    /// A restore-time update's limits.
+    limits: Option<Arc<RestorePeerLimits>>,
+}
+
+impl ServingUpdate {
+    /// The keyed job for this attempt. It holds the session's key and an offload
+    /// permit only while it runs; a backoff, or a wait for the restore limits, is
+    /// spent outside both ([`crate::sbi_offload::Requeuer`]).
+    fn job(self, permits: Option<RestorePermits>) -> crate::sbi_offload::RequeueableJob {
+        Box::new(move |requeue| Box::pin(self.run(permits, requeue)))
+    }
+
+    async fn run(
+        mut self,
+        permits: Option<RestorePermits>,
+        requeue: crate::sbi_offload::Requeuer,
+    ) -> Option<crate::sbi_offload::SbiOutcome> {
+        let (amf_ue_ngap_id, psi) = (self.amf_ue_ngap_id, self.psi);
+        let permits = match (&self.limits, permits) {
+            (None, _) => None,
+            (Some(_), Some(p)) => Some(p),
+            (Some(limits), None) => match limits.try_take(&self.host, self.port) {
+                Some(p) => Some(p),
+                None => {
+                    // The restore's share is in use: wait for it without the key.
+                    let limits = Arc::clone(limits);
+                    requeue.requeue_when(async move {
+                        let permits = limits.take(&self.host, self.port).await;
+                        self.job(permits)
+                    });
+                    return None;
+                }
+            },
+        };
+        let result = crate::sbi_path::call_smf_update_serving_amf(
+            &self.host,
+            self.port,
+            &self.sm_ref,
+            &self.serving,
+        )
+        .await;
+        drop(permits);
+        let Err(e) = result else {
+            return None;
+        };
+        let what = format!("UE {amf_ue_ngap_id}: PSI {psi}'s SMF serving-AMF update");
+        match crate::sbi_path::peer_update_retry_wait(self.attempt, &e) {
+            None => crate::sbi_path::log_peer_update_given_up(&what, self.attempt, &e),
+            Some(wait) => {
+                log::warn!(
+                    "{what} failed (attempt {} of {}): {e}; retrying in {wait:?}",
+                    self.attempt,
+                    crate::sbi_path::PEER_UPDATE_ATTEMPTS
+                );
+                self.attempt += 1;
+                requeue.requeue_when(async move {
+                    tokio::time::sleep(wait).await;
+                    self.job(None)
+                });
+            }
+        }
+        None
+    }
 }

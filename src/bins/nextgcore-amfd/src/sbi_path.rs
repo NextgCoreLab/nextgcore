@@ -122,6 +122,17 @@ pub enum SbiError {
     GatewayTimeout,
     /// Invalid state
     InvalidState,
+    /// A peer answered a serving-AMF update (#1329: the SMF, UECM and PCF updates of a
+    /// takeover or a restart restore) with a non-success `status`, and the
+    /// `Retry-After` it sent, if any (delta-seconds, RFC 9110 §10.2.3). Kept
+    /// structured so [`retry_peer_update`] can tell a definitive 4xx from a 5xx, a
+    /// 429 or a 503 (#1329 review). Displayed exactly as the `RequestFailed` text it
+    /// replaced: "Request failed: {what} returned status {status}".
+    PeerStatus {
+        what: String,
+        status: u16,
+        retry_after: Option<std::time::Duration>,
+    },
 }
 
 impl std::fmt::Display for SbiError {
@@ -138,6 +149,9 @@ impl std::fmt::Display for SbiError {
             SbiError::Timeout => write!(f, "Timeout"),
             SbiError::GatewayTimeout => write!(f, "Gateway timeout"),
             SbiError::InvalidState => write!(f, "Invalid state"),
+            SbiError::PeerStatus { what, status, .. } => {
+                write!(f, "Request failed: {what} returned status {status}")
+            }
         }
     }
 }
@@ -1478,29 +1492,106 @@ pub(crate) const PEER_UPDATE_FIRST_BACKOFF: std::time::Duration = std::time::Dur
 pub(crate) const PEER_UPDATE_FIRST_BACKOFF: std::time::Duration =
     std::time::Duration::from_millis(20);
 
-/// Run `attempt` until it succeeds, at most [`PEER_UPDATE_ATTEMPTS`] times, with
-/// exponential backoff from [`PEER_UPDATE_FIRST_BACKOFF`] (#1329 review: a failed peer
-/// update is retried, not dropped). Returns the last error.
+/// The longest a peer's `Retry-After` is honoured for (#1329 review): a 429 or 503
+/// asking for more is retried after this, so one answer cannot park the update.
+#[cfg(not(test))]
+pub(crate) const PEER_UPDATE_RETRY_AFTER_CAP: std::time::Duration =
+    std::time::Duration::from_secs(10);
+#[cfg(test)]
+pub(crate) const PEER_UPDATE_RETRY_AFTER_CAP: std::time::Duration =
+    std::time::Duration::from_millis(300);
+
+/// The error for a peer's non-success `response` to the request `what`, with its
+/// status and its `Retry-After` (delta-seconds; an HTTP-date is not parsed).
+fn peer_status(what: &str, response: &SbiResponse) -> SbiError {
+    SbiError::PeerStatus {
+        what: what.to_string(),
+        status: response.status,
+        retry_after: response
+            .http
+            .get_header("Retry-After")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(std::time::Duration::from_secs),
+    }
+}
+
+/// How long to wait before trying a peer update again after its attempt `n`
+/// (1-based) failed with `e`; `None` when it is not tried again (#1329 review):
+/// - a 5xx, a 429 or a 503, and a transport failure (no answer, a timeout, no
+///   endpoint) are retried, up to [`PEER_UPDATE_ATTEMPTS`] tries, after the backoff
+///   (1, 2, 4, 8 s from [`PEER_UPDATE_FIRST_BACKOFF`]);
+/// - a 429 or a 503 with a `Retry-After` waits that long instead, at most
+///   [`PEER_UPDATE_RETRY_AFTER_CAP`];
+/// - any other status (a definitive 4xx: a 404 for an SM context the SMF no longer
+///   has does not change by asking again) and an answer that does not parse are not.
+pub(crate) fn peer_update_retry_wait(n: u32, e: &SbiError) -> Option<std::time::Duration> {
+    if n >= PEER_UPDATE_ATTEMPTS {
+        return None;
+    }
+    let backoff = PEER_UPDATE_FIRST_BACKOFF * 2u32.saturating_pow(n.saturating_sub(1));
+    let retryable_status = |status: u16| status == 429 || (500..=599).contains(&status);
+    match e {
+        SbiError::PeerStatus {
+            status,
+            retry_after,
+            ..
+        } => {
+            if !retryable_status(*status) {
+                return None;
+            }
+            match retry_after {
+                Some(after) if matches!(status, 429 | 503) => {
+                    Some((*after).min(PEER_UPDATE_RETRY_AFTER_CAP))
+                }
+                _ => Some(backoff),
+            }
+        }
+        SbiError::SmfRefused { status, .. } => retryable_status(*status).then_some(backoff),
+        SbiError::ResponseParseError(_) | SbiError::InvalidState => None,
+        SbiError::RequestFailed(_)
+        | SbiError::Timeout
+        | SbiError::GatewayTimeout
+        | SbiError::NfInstanceNotFound
+        | SbiError::ServiceNotFound(_) => Some(backoff),
+    }
+}
+
+/// Log why a failed peer update `what` is not tried again after attempt `n`.
+pub(crate) fn log_peer_update_given_up(what: &str, n: u32, e: &SbiError) {
+    if n >= PEER_UPDATE_ATTEMPTS {
+        log::warn!("{what} failed (attempt {n} of {PEER_UPDATE_ATTEMPTS}): {e}; giving up");
+    } else {
+        log::warn!("{what} refused definitively (attempt {n}): {e}; not retried");
+    }
+}
+
+/// Run `attempt` until it succeeds, at most [`PEER_UPDATE_ATTEMPTS`] times, waiting
+/// as [`peer_update_retry_wait`] says between tries (#1329 review: a failed peer
+/// update is retried, not dropped, but a definitive refusal is not asked again).
+/// Returns the last error.
 pub(crate) async fn retry_peer_update<T, F, Fut>(what: &str, mut attempt: F) -> SbiResult<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = SbiResult<T>>,
 {
-    let mut backoff = PEER_UPDATE_FIRST_BACKOFF;
     let mut n = 1;
     loop {
         match attempt().await {
             Ok(v) => return Ok(v),
-            Err(e) if n >= PEER_UPDATE_ATTEMPTS => return Err(e),
-            Err(e) => {
-                log::warn!(
-                    "{what} failed (attempt {n} of {PEER_UPDATE_ATTEMPTS}): {e}; retrying in \
-                     {backoff:?}"
-                );
-                tokio::time::sleep(backoff).await;
-                backoff *= 2;
-                n += 1;
-            }
+            Err(e) => match peer_update_retry_wait(n, &e) {
+                None => {
+                    log_peer_update_given_up(what, n, &e);
+                    return Err(e);
+                }
+                Some(wait) => {
+                    log::warn!(
+                        "{what} failed (attempt {n} of {PEER_UPDATE_ATTEMPTS}): {e}; retrying \
+                         in {wait:?}"
+                    );
+                    tokio::time::sleep(wait).await;
+                    n += 1;
+                }
+            },
         }
     }
 }
@@ -1529,10 +1620,7 @@ pub async fn call_smf_update_serving_amf(
         .await
         .map_err(|e| SbiError::RequestFailed(format!("SMF serving-AMF update failed: {e}")))?;
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "SMF serving-AMF update returned status {}",
-            response.status
-        )));
+        return Err(peer_status("SMF serving-AMF update", &response));
     }
     Ok(())
 }
@@ -3501,10 +3589,7 @@ pub async fn call_udm_uecm_registration(
         .map_err(|e| SbiError::RequestFailed(format!("UECM registration failed: {e}")))?;
 
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "UECM registration returned status {}",
-            response.status
-        )));
+        return Err(peer_status("UECM registration", &response));
     }
     log::info!("[{supi}] Nudm_UECM_Registration (amf-3gpp-access) OK");
     Ok(())
@@ -3952,10 +4037,7 @@ pub async fn call_pcf_am_policy_update_serving_amf(
         .await
         .map_err(|e| SbiError::RequestFailed(format!("AM policy update failed: {e}")))?;
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "AM policy update returned status {}",
-            response.status
-        )));
+        return Err(peer_status("AM policy update", &response));
     }
     log::info!("Npcf_AMPolicyControl_Update OK (polAssoId={pol_asso_id}): new serving AMF");
     Ok(())
@@ -3992,10 +4074,7 @@ pub async fn call_pcf_ue_policy_update_serving_amf(
         .await
         .map_err(|e| SbiError::RequestFailed(format!("UE policy update failed: {e}")))?;
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "UE policy update returned status {}",
-            response.status
-        )));
+        return Err(peer_status("UE policy update", &response));
     }
     log::info!("Npcf_UEPolicyControl_Update OK (polAssoId={pol_asso_id}): new serving AMF");
     Ok(())
@@ -4827,6 +4906,88 @@ async fn update_sm_context_ho_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1329 follow-up, review MINOR 1: which failed peer updates are tried again, and
+    /// after how long. A definitive 4xx is not; a 5xx, a 429, a 503 and a transport
+    /// failure are, after the backoff; a 429 / 503 `Retry-After` is honoured, capped.
+    #[test]
+    fn a_peer_update_is_retried_on_5xx_429_503_and_transport_errors_only() {
+        let status = |status: u16, after: Option<u64>| SbiError::PeerStatus {
+            what: "SMF serving-AMF update".to_string(),
+            status,
+            retry_after: after.map(std::time::Duration::from_secs),
+        };
+        let first = PEER_UPDATE_FIRST_BACKOFF;
+        for definitive in [400u16, 403, 404, 409, 410] {
+            assert_eq!(peer_update_retry_wait(1, &status(definitive, None)), None);
+        }
+        assert_eq!(
+            peer_update_retry_wait(1, &SbiError::ResponseParseError("x".into())),
+            None
+        );
+        assert_eq!(peer_update_retry_wait(1, &status(500, None)), Some(first));
+        assert_eq!(
+            peer_update_retry_wait(3, &status(502, None)),
+            Some(first * 4)
+        );
+        assert_eq!(
+            peer_update_retry_wait(2, &status(429, None)),
+            Some(first * 2)
+        );
+        assert_eq!(
+            peer_update_retry_wait(1, &SbiError::RequestFailed("connect refused".into())),
+            Some(first)
+        );
+        assert_eq!(peer_update_retry_wait(1, &SbiError::Timeout), Some(first));
+        // Retry-After on a 429 / 503: honoured, at most the cap; on a 500 not.
+        assert_eq!(
+            peer_update_retry_wait(1, &status(503, Some(0))),
+            Some(std::time::Duration::ZERO)
+        );
+        assert_eq!(
+            peer_update_retry_wait(1, &status(429, Some(3600))),
+            Some(PEER_UPDATE_RETRY_AFTER_CAP)
+        );
+        assert_eq!(
+            peer_update_retry_wait(1, &status(500, Some(0))),
+            Some(first)
+        );
+        // The last attempt is the last.
+        assert_eq!(
+            peer_update_retry_wait(PEER_UPDATE_ATTEMPTS, &status(503, None)),
+            None
+        );
+        // Displayed as the `RequestFailed` text it replaced.
+        assert_eq!(
+            status(404, None).to_string(),
+            "Request failed: SMF serving-AMF update returned status 404"
+        );
+    }
+
+    /// #1329 follow-up: `retry_peer_update` stops at a definitive 4xx at once.
+    ///
+    /// REVERT-VERIFIED: with every error retryable it makes 5 attempts.
+    #[tokio::test]
+    async fn retry_peer_update_stops_at_a_definitive_refusal() {
+        let mut tries = 0;
+        let result: SbiResult<()> = retry_peer_update("UECM registration", || {
+            tries += 1;
+            let n = tries;
+            async move {
+                Err(SbiError::PeerStatus {
+                    what: "UECM registration".to_string(),
+                    status: if n == 1 { 503 } else { 404 },
+                    retry_after: None,
+                })
+            }
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(SbiError::PeerStatus { status: 404, .. })
+        ));
+        assert_eq!(tries, 2, "the 503 is retried, the 404 is not");
+    }
 
     #[test]
     fn test_sbi_service_type_names() {

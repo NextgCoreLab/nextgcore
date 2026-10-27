@@ -1198,6 +1198,10 @@ pub struct NgapServer {
     outstanding_releases: HashMap<(u64, u64), OutstandingRelease>,
     /// SBI work run off this task (#796 review M1): the re-selection attempts.
     sbi_offload: crate::sbi_offload::SbiOffload,
+    /// #1329 review: the bound on the restore-time serving-AMF updates in flight, per
+    /// SMF and overall, so a restore while an SMF is down leaves the offload's
+    /// permits to regular signalling.
+    restore_peer_limits: std::sync::Arc<ue_context_takeover::RestorePeerLimits>,
     /// #748: the UCMF Assigns in flight for re-assignment, one per (TAC, UE radio
     /// capability), with the UEs waiting on each. A UE joins the one in flight for
     /// its pair instead of asking again, so N UEs of one model cost one Assign and
@@ -1506,6 +1510,15 @@ const RACS_ASSIGN_BACKOFF: Duration = Duration::from_secs(2);
 /// How many SBI exchanges run off the NGAP task at once (#796 review M1).
 const MAX_OFFLOADED_SBI: usize = 16;
 
+/// #1329 review: at most this many restore-time serving-AMF updates hold an offload
+/// permit at once, a quarter of [`MAX_OFFLOADED_SBI`]: a restore of many UEs while an
+/// SMF is blackholed then leaves the rest to regular signalling.
+const RESTORE_PEER_UPDATES_MAX: usize = MAX_OFFLOADED_SBI / 4;
+
+/// #1329 review: and at most this many of them per SMF, so one SMF that is down does
+/// not hold up the restore's updates to the others.
+const RESTORE_PEER_UPDATES_PER_SMF: usize = 2;
+
 /// How long the AMF keeps re-selecting an SMF for an establishment it could not
 /// deliver (#796). Below the UE's T3580 (16 s, TS 24.501 §10.3), so the UE gets
 /// an answer before it retransmits. An SMF restarting in place is back well
@@ -1741,6 +1754,10 @@ impl NgapServer {
             #[cfg(test)]
             last_eps_prepared_ebis: None,
             sbi_offload: crate::sbi_offload::SbiOffload::new(MAX_OFFLOADED_SBI),
+            restore_peer_limits: std::sync::Arc::new(ue_context_takeover::RestorePeerLimits::new(
+                RESTORE_PEER_UPDATES_MAX,
+                RESTORE_PEER_UPDATES_PER_SMF,
+            )),
             contextless_ue_ids: std::collections::VecDeque::new(),
             timer_configs: {
                 // Reachability timers derive from the CONFIGURED T3512
@@ -21209,6 +21226,11 @@ fn gmm_cause_from_sbi_error(err: &crate::sbi_path::SbiError) -> GmmCause {
         }
         SbiError::ResponseParseError(_) => GmmCause::SemanticallyIncorrectMessage,
         SbiError::InvalidState => GmmCause::MessageNotCompatibleWithTheProtocolState,
+        // #1329 review: the structured form of a "{what} returned status {status}"
+        // `RequestFailed`, mapped as that text was.
+        SbiError::PeerStatus { what, status, .. } => gmm_cause_from_sbi_error(
+            &SbiError::RequestFailed(format!("{what} returned status {status}")),
+        ),
     }
 }
 
