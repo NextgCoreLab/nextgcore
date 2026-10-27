@@ -4885,7 +4885,7 @@ mod tests {
     /// #1334: the NRF's `/metrics`, scraped over HTTP, serves every NRF series the
     /// shipped rules and dashboards use, and the counters follow real Nnrf traffic
     /// through the production handler: a registration, a heartbeat, a discovery that
-    /// finds it and one that finds nothing, a deregistration.
+    /// finds it, one that finds nothing, one rejected, a deregistration.
     ///
     /// REVERT-VERIFIED: without the router's `observe` the registration / update /
     /// deregistration counts stay; without `observe_discovery(Some(total))` the
@@ -4917,6 +4917,7 @@ mod tests {
             "nrf_nf_updates_total",
             "nrf_nf_deregistrations_total",
             "nrf_discovery_success_total",
+            "nrf_discovery_empty_total",
             "nrf_discovery_failure_total",
         ];
         let before = scrape().await;
@@ -4957,11 +4958,18 @@ mod tests {
             .await
             .expect("discover nothing");
         assert_eq!(resp.status, 200);
+        let resp = client
+            .get("/nnrf-disc/v1/nf-instances?target-nf-type=TSCTSF")
+            .await
+            .expect("discover without requester-nf-type");
+        assert_eq!(resp.status, 400);
         let resp = client.delete(&path).await.expect("DELETE");
         assert_eq!(resp.status, 204);
 
         let after = scrape().await;
-        for ((name, b), want) in names.iter().zip(&b).zip([1.0, 1.0, 1.0, 1.0, 1.0]) {
+        // Discovery: the hit and the empty SearchResult are successes (TS 29.510
+        // §5.3.2.2.2: 200 either way), the rejected query is the failure.
+        for ((name, b), want) in names.iter().zip(&b).zip([1.0, 1.0, 1.0, 2.0, 1.0, 1.0]) {
             assert!(value(&after, name) >= b + want, "{name}: {b} -> {after}");
         }
         for name in [

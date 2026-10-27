@@ -8,9 +8,11 @@
 //!   `nrf_registered_nf_instances{nf_type,nf_status}` and `nrf_subscriptions`;
 //! - NFManagement outcomes (TS 29.510 §5.2.2): registrations, updates (heartbeats),
 //!   deregistrations, subscriptions created;
-//! - NFDiscovery outcomes (§5.3.2): a SearchResult with at least one instance is a
-//!   success, an empty one or a rejected query a failure, the pair the shipped
-//!   `NrfDiscoveryFailureRate` alert divides;
+//! - NFDiscovery outcomes (§5.3.2): a SearchResult (200) is a success, a rejected
+//!   query (any other status) a failure, the pair the shipped
+//!   `NrfDiscoveryFailureRate` alert divides. An empty SearchResult is a success of
+//!   the NRF (nothing of that type is registered, routine for an optional NF such as
+//!   a UCMF or an NSACF) and is also counted on its own;
 //! - AccessToken outcomes (§5.4.2): granted / denied.
 //!
 //! `nf_type` comes from the registrant's profile, so it is kept only when it is a
@@ -26,6 +28,7 @@ static DEREGISTRATIONS: AtomicU64 = AtomicU64::new(0);
 static SUBSCRIPTIONS_CREATED: AtomicU64 = AtomicU64::new(0);
 static DISCOVERY_SUCCESS: AtomicU64 = AtomicU64::new(0);
 static DISCOVERY_FAILURE: AtomicU64 = AtomicU64::new(0);
+static DISCOVERY_EMPTY: AtomicU64 = AtomicU64::new(0);
 static TOKENS_GRANTED: AtomicU64 = AtomicU64::new(0);
 static TOKENS_DENIED: AtomicU64 = AtomicU64::new(0);
 
@@ -59,13 +62,20 @@ pub fn observe(op: NrfOperation, status: u16) {
     counter.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Count one NFDiscovery: `found` instances matched, or `None` when the query was
-/// rejected.
+/// Count one NFDiscovery: answered with `found` matching instances, or `None` when
+/// the query was rejected.
 pub fn observe_discovery(found: Option<usize>) {
     match found {
-        Some(n) if n > 0 => DISCOVERY_SUCCESS.fetch_add(1, Ordering::Relaxed),
-        _ => DISCOVERY_FAILURE.fetch_add(1, Ordering::Relaxed),
-    };
+        Some(n) => {
+            DISCOVERY_SUCCESS.fetch_add(1, Ordering::Relaxed);
+            if n == 0 {
+                DISCOVERY_EMPTY.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        None => {
+            DISCOVERY_FAILURE.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// TS 29.510 §6.1.6.3.3 `NFType` values kept as label values.
@@ -170,15 +180,22 @@ pub fn render_nrf_families(
         out,
         "nrf_discovery_success_total",
         "counter",
-        "NFDiscover requests answered with at least one NF instance",
+        "NFDiscover requests answered with a SearchResult (200), empty ones included",
         get(&DISCOVERY_SUCCESS),
     );
     write_metric(
         out,
         "nrf_discovery_failure_total",
         "counter",
-        "NFDiscover requests rejected, or answered with no NF instance",
+        "NFDiscover requests rejected (any status other than 200)",
         get(&DISCOVERY_FAILURE),
+    );
+    write_metric(
+        out,
+        "nrf_discovery_empty_total",
+        "counter",
+        "NFDiscover SearchResults that matched no NF instance",
+        get(&DISCOVERY_EMPTY),
     );
     write_header(
         out,

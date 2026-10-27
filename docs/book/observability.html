@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-5d2fbb9c.js";
+            window.path_to_searchindex_js = "searchindex-1ef47358.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-be5dca41.js"></script>
@@ -295,8 +295,9 @@
 <tr><td><code>nrf_subscriptions</code></td><td>gauge</td><td></td><td>NF status subscriptions held</td></tr>
 <tr><td><code>nrf_nf_registrations_total</code> / <code>nrf_nf_updates_total</code> / <code>nrf_nf_deregistrations_total</code></td><td>counter</td><td></td><td>NFRegister / NFUpdate (heartbeats) / NFDeregister answered 2xx</td></tr>
 <tr><td><code>nrf_subscriptions_created_total</code></td><td>counter</td><td></td><td>NFStatusSubscribe answered 2xx</td></tr>
-<tr><td><code>nrf_discovery_success_total</code></td><td>counter</td><td></td><td>NFDiscover answered with at least one instance</td></tr>
-<tr><td><code>nrf_discovery_failure_total</code></td><td>counter</td><td></td><td>NFDiscover rejected, or answered with none</td></tr>
+<tr><td><code>nrf_discovery_success_total</code></td><td>counter</td><td></td><td>NFDiscover answered with a SearchResult (200), empty ones included</td></tr>
+<tr><td><code>nrf_discovery_failure_total</code></td><td>counter</td><td></td><td>NFDiscover rejected (any other status)</td></tr>
+<tr><td><code>nrf_discovery_empty_total</code></td><td>counter</td><td></td><td>SearchResults that matched no instance (routine for an optional NF type that is not deployed)</td></tr>
 <tr><td><code>nrf_access_tokens_total</code></td><td>counter</td><td><code>result</code> (<code>granted</code>, <code>denied</code>)</td><td>access token requests</td></tr>
 </tbody>
 </table>

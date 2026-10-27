@@ -102,8 +102,9 @@ The NAS counters follow TS 28.552 §5.2.2 "on transmission"/"on receipt": a prot
 | `nrf_subscriptions` | gauge | | NF status subscriptions held |
 | `nrf_nf_registrations_total` / `nrf_nf_updates_total` / `nrf_nf_deregistrations_total` | counter | | NFRegister / NFUpdate (heartbeats) / NFDeregister answered 2xx |
 | `nrf_subscriptions_created_total` | counter | | NFStatusSubscribe answered 2xx |
-| `nrf_discovery_success_total` | counter | | NFDiscover answered with at least one instance |
-| `nrf_discovery_failure_total` | counter | | NFDiscover rejected, or answered with none |
+| `nrf_discovery_success_total` | counter | | NFDiscover answered with a SearchResult (200), empty ones included |
+| `nrf_discovery_failure_total` | counter | | NFDiscover rejected (any other status) |
+| `nrf_discovery_empty_total` | counter | | SearchResults that matched no instance (routine for an optional NF type that is not deployed) |
 | `nrf_access_tokens_total` | counter | `result` (`granted`, `denied`) | access token requests |
 
 ### No `metrics.server` in the YAML (#1312)
