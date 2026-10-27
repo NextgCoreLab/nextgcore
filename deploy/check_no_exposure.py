@@ -25,6 +25,7 @@ pod network namespace and publishes nothing. It would become one only with
 hostNetwork or a hostPort, which this check rejects.
 
 Usage: check_no_exposure.py [--dir DIR]... [--render FILE]...
+       check_no_exposure.py --self-test
 Exit 0 when clean; 1 listing every hit otherwise.
 """
 import argparse
@@ -117,6 +118,11 @@ def scan_render(path):
     hits = []
     with open(path) as f:
         docs = [d for d in yaml.safe_load_all(f) if isinstance(d, dict)]
+    # A `kind: List` (or SomethingList) carries its objects in items.
+    while any(isinstance(d.get('items'), list) for d in docs):
+        docs = [i for d in docs
+                for i in (d['items'] if isinstance(d.get('items'), list) else [d])
+                if isinstance(i, dict)]
     for d in docs:
         kind = d.get('kind', '?')
         meta = d.get('metadata') or {}
@@ -138,7 +144,8 @@ def scan_render(path):
         for pod in pod_specs(spec):
             if pod.get('hostNetwork'):
                 errs.append('hostNetwork: true')
-            for c in pod.get('containers', []) + pod.get('initContainers', []):
+            for c in (pod.get('containers', []) + pod.get('initContainers', [])
+                      + pod.get('ephemeralContainers', [])):
                 for p in c.get('ports') or []:
                     if 'hostPort' in p:
                         errs.append(f'hostPort: {c.get("name")} {p["hostPort"]}')
@@ -149,11 +156,109 @@ def scan_render(path):
     return hits
 
 
+# --self-test inputs: (name, rendered YAML, number of hits it must produce).
+# Kept here rather than as fixture files because a fixture under deploy/
+# would trip the source pass. Every rule the render pass has, plus the places
+# a pod spec or Service can hide (List items, init and ephemeral containers).
+_POD = """apiVersion: v1
+kind: Pod
+metadata: {{name: p}}
+spec:
+  containers: [{{name: c}}]
+  {key}: [{{name: x, ports: [{{containerPort: 1, hostPort: 1}}]}}]
+"""
+SELF_TEST = [
+    ('clean ClusterIP and headless', """apiVersion: v1
+kind: Service
+metadata: {name: a}
+spec: {ports: [{port: 1}]}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: b}
+spec: {clusterIP: None, type: ClusterIP, ports: [{port: 1}]}
+""", 0),
+    ('NodePort Service', """apiVersion: v1
+kind: Service
+metadata: {name: s}
+spec: {type: NodePort, ports: [{port: 1, nodePort: 30001}]}
+""", 2),
+    ('LoadBalancer Service', """apiVersion: v1
+kind: Service
+metadata: {name: s}
+spec: {type: LoadBalancer, ports: [{port: 1}]}
+""", 1),
+    ('externalIPs', """apiVersion: v1
+kind: Service
+metadata: {name: s}
+spec: {externalIPs: [192.0.2.1], ports: [{port: 1}]}
+""", 1),
+    ('Ingress', """apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: {name: i}
+""", 1),
+    ('hostNetwork in a Deployment', """apiVersion: apps/v1
+kind: Deployment
+metadata: {name: d}
+spec:
+  template:
+    spec: {hostNetwork: true, containers: [{name: c}]}
+""", 1),
+    ('hostPort in containers', """apiVersion: v1
+kind: Pod
+metadata: {name: p}
+spec:
+  containers: [{name: c, ports: [{containerPort: 1, hostPort: 1}]}]
+""", 1),
+    ('hostPort in initContainers', _POD.format(key='initContainers'), 1),
+    ('hostPort in ephemeralContainers', _POD.format(key='ephemeralContainers'), 1),
+    ('NodePort Service inside kind: List', """apiVersion: v1
+kind: List
+items:
+  - apiVersion: v1
+    kind: Service
+    metadata: {name: s}
+    spec: {type: NodePort, ports: [{port: 1}]}
+""", 1),
+    ('hostNetwork pod inside a nested List', """apiVersion: v1
+kind: List
+items:
+  - apiVersion: v1
+    kind: PodList
+    items:
+      - apiVersion: v1
+        kind: Pod
+        metadata: {name: p}
+        spec: {hostNetwork: true, containers: [{name: c}]}
+""", 1),
+]
+
+
+def self_test():
+    import tempfile
+    bad = 0
+    with tempfile.TemporaryDirectory() as d:
+        for i, (name, doc, want) in enumerate(SELF_TEST):
+            path = os.path.join(d, f'{i}.yaml')
+            with open(path, 'w') as f:
+                f.write(doc)
+            got = len(scan_render(path))
+            ok = got == want
+            bad += not ok
+            print(f'{"ok  " if ok else "FAIL"} {name}: {got} hit(s), want {want}')
+    print(f'self-test: {len(SELF_TEST)} case(s), {bad} failure(s)')
+    return 1 if bad else 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--dir', action='append', dest='dirs')
     ap.add_argument('--render', action='append', default=[])
+    ap.add_argument('--self-test', action='store_true',
+                    help='check the render pass catches the built-in synthetic inputs')
     a = ap.parse_args()
+    if a.self_test:
+        return self_test()
     files = tracked(a.dirs or ['k8s', 'deploy', 'helm'])
     hits = scan_source(files)
     for r in a.render:
