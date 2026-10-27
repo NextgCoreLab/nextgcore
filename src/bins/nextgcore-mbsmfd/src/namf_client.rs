@@ -96,23 +96,18 @@ fn parse_amf_search_result(json: &Value) -> Option<DiscoveredAmf> {
                             .and_then(Value::as_str)
                             .is_some_and(|n| n == "namf-mbs-bc")
                     })
+                    // #1324: the endpoint's IPv4 or IPv6 address, else the
+                    // service's or the AMF's (IPv4, IPv6, FQDN), on the endpoint port.
                     .find_map(|s| {
-                        let ep = s.get("ipEndPoints")?.as_array()?.first()?;
-                        let host = ep.get("ipv4Address").and_then(Value::as_str)?.to_owned();
-                        let port = ep.get("port").and_then(Value::as_u64).unwrap_or(80) as u16;
+                        let host = nextgcore_sbi::nf_addressing::service_host(instance, Some(s))?;
+                        let port =
+                            nextgcore_sbi::nf_addressing::service_port(Some(s)).unwrap_or(80);
                         Some((host, port))
                     })
             });
 
-        let endpoint = from_service.or_else(|| {
-            let host = instance
-                .get("ipv4Addresses")?
-                .as_array()?
-                .first()?
-                .as_str()?
-                .to_owned();
-            Some((host, 80))
-        });
+        let endpoint = from_service
+            .or_else(|| Some((nextgcore_sbi::nf_addressing::profile_host(instance)?, 80)));
 
         if let Some((host, port)) = endpoint {
             return Some(DiscoveredAmf {
@@ -298,5 +293,22 @@ mod tests {
             parse_host_port("http://nrf.example"),
             Some(("nrf.example".to_string(), 80))
         );
+    }
+}
+
+/// #1324 review: producer to consumer. A peer profile built with an IPv4, IPv6 or
+/// FQDN host (as this codebase's producers build them) resolves to that host.
+#[cfg(test)]
+mod tests_peer_host_kind_1324 {
+    use super::*;
+    use nextgcore_sbi::nf_addressing::{dialled_host, sample_search_result, SAMPLE_HOSTS};
+
+    #[test]
+    fn a_peer_at_any_host_type_is_resolved() {
+        for host in SAMPLE_HOSTS {
+            let r = sample_search_result("AMF", "namf-mbs-bc", host, 7797);
+            let amf = parse_amf_search_result(&r).expect("an AMF");
+            assert_eq!((amf.host, amf.port), (dialled_host(host), 7797));
+        }
     }
 }

@@ -3635,12 +3635,12 @@ fn build_lmf_nf_instance(
 ) -> nextgcore_sbi::context::NfInstance {
     let mut self_instance =
         nextgcore_sbi::context::NfInstance::new(nf_instance_id, nextgcore_sbi::types::NfType::Lmf);
-    self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
+    nextgcore_sbi::nf_addressing::set_instance_host(&mut self_instance, sbi_addr);
     self_instance.heartbeat_interval = 10;
     for (service_type, _allowed) in LMF_SERVICES {
         let mut svc = nextgcore_sbi::context::NfService::new(service_type.to_name(), *service_type);
         svc.port = sbi_port;
-        svc.ip_addresses = vec![sbi_addr.to_string()];
+        nextgcore_sbi::nf_addressing::set_service_host(&mut svc, sbi_addr);
         self_instance.add_service(svc);
     }
     self_instance
@@ -3681,15 +3681,18 @@ fn build_lmf_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> 
         }
     }
 
-    serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "LMF",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": services,
-        "allowedNfTypes": nf_allowed,
-        "heartBeatTimer": 10
-    })
+    nextgcore_sbi::nf_addressing::classify_profile_host(
+        serde_json::json!({
+            "nfInstanceId": nf_instance_id,
+            "nfType": "LMF",
+            "nfStatus": "REGISTERED",
+            "ipv4Addresses": [sbi_addr],
+            "nfServices": services,
+            "allowedNfTypes": nf_allowed,
+            "heartBeatTimer": 10
+        }),
+        sbi_addr,
+    )
 }
 
 /// Register LMF with NRF
@@ -9072,5 +9075,23 @@ mod positioning_chain_strict_peer {
         let resp = nextgcore_amfd::handle_n1_n2_message_transfer_request(supi, &req);
         assert_eq!(resp.status, 404);
         assert_eq!(body_json(&resp)["cause"], "CONTEXT_NOT_FOUND");
+    }
+}
+
+/// #1324: the NFProfile carries its host where its type belongs (TS 29.510
+/// §6.1.6.2.2): IPv4 in ipv4Addresses, IPv6 in ipv6Addresses, an FQDN as fqdn, and
+/// the service ipEndPoints likewise.
+#[cfg(test)]
+mod tests_nf_profile_host_kind_1324 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_carries_its_host_by_type() {
+        for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
+            let profile = build_lmf_nf_profile("id", host, 7777);
+            let problems =
+                nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
+            assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
+        }
     }
 }

@@ -34,7 +34,8 @@
 # Exit status: 0 when every step PASSes, 1 when any step FAILs, 2 on a usage or
 # environment error (no UE pod, no TUN, ...). PROFILE=epc additionally checks
 # the LTE attach (S1 Setup, EMM-REGISTERED, default bearer) from the logs.
-# PROFILE=6g adds its section when that profile lands.
+# PROFILE=6g runs the 5G checks against nextg-6g plus a 6G feature smoke: each
+# runtime feature the profile builds in shows its signature (see that section).
 set -uo pipefail
 
 PROFILE="${PROFILE:-5g}"
@@ -53,13 +54,20 @@ source "${SCRIPT_DIR}/lib/profile.sh"
 nextg_load_profile "${PROFILE}" || exit 2
 
 case "${PROFILE}" in
-  5g)
+  5g|6g)
+    # PROFILE=6g is the 5G core and gNB/UE built with the 6G features, so the
+    # pods and the TUN are the same.
     NAMESPACE="${NAMESPACE:-${PROFILE_NAMESPACE}}"
     UE_SELECTOR="${UE_SELECTOR:-app.kubernetes.io/name=ue}"
     UE_CONTAINER="${UE_CONTAINER:-ue}"
     UPF_SELECTOR="${UPF_SELECTOR:-app.kubernetes.io/name=upf}"
     UPF_CONTAINER="${UPF_CONTAINER:-upf}"
-    TUN="${TUN:-uesimtun}"
+    # nextgsim's UE names each PDU session's interface <tun_name><N> (nextgsim
+    # #427), so the name depends on its config and on how many sessions it
+    # has. Found below as the first uesimtun* interface with an IPv4 address,
+    # as docker/rust/ue-flow-check.sh does; TUN=<name> pins one (#1326).
+    TUN="${TUN:-}"
+    TUN_PREFIX="${TUN_PREFIX:-uesimtun}"
     ;;
   epc)
     # The LTE UE puts the default bearer's PDN address on lteuetun<EBI>; the
@@ -77,7 +85,7 @@ case "${PROFILE}" in
   # "Data plane stats" line) and container, and the UE tunnel interface.
   # NAMESPACE comes from the profile's profile.env.
   *)
-    echo "PROFILE=${PROFILE} has no e2e-internet section yet (5g, epc)" >&2
+    echo "PROFILE=${PROFILE} has no e2e-internet section yet (5g, epc, 6g)" >&2
     exit 2
     ;;
 esac
@@ -158,9 +166,14 @@ done
 [[ -n "${state:-}" ]] || die "debug container ${DBG} never started"
 dbg() { "${KUBECTL[@]}" exec "${UE_POD}" -c "${DBG}" -- "$@"; }
 
+if [[ -z "${TUN}" ]]; then
+  TUN="$(dbg sh -c "ip -4 -o addr show | awk '\$2 ~ /^${TUN_PREFIX}/ { print \$2; exit }'")"
+  [[ -n "${TUN}" ]] \
+    || die "no ${TUN_PREFIX}* interface with an IPv4 address in ${UE_POD} (interfaces: $(dbg sh -c "ip -o link show | awk -F': ' '{print \$2}' | tr '\n' ' '")): is the PDU session up?"
+fi
 UE_IP="$(dbg sh -c "ip -4 -o addr show dev ${TUN} | awk '{print \$4}' | cut -d/ -f1 | head -n1")"
 [[ "${UE_IP}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] \
-  || die "no IPv4 address on ${TUN} in ${UE_POD}: is the PDU session up?"
+  || die "no IPv4 address on ${TUN} in ${UE_POD} (interfaces: $(dbg sh -c "ip -o link show | awk -F': ' '{print \$2}' | tr '\n' ' '")): is the PDU session up?"
 echo "UE IP on ${TUN}: ${UE_IP}"
 
 # shellcheck disable=SC2317  # invoked by the EXIT trap
@@ -223,6 +236,64 @@ if (( UL1 > UL0 && DL1 > DL0 )); then
   pass "UPF data plane stats: UL ${UL0}->${UL1} pkts, DL ${DL0}->${DL1} pkts"
 else
   fail "UPF data plane stats did not increase within ${STATS_WAIT}s: UL ${UL0}->${UL1}, DL ${DL0}->${DL1}"
+fi
+
+# ---- 6G feature smoke --------------------------------------------------------
+# One runtime signature per feature profiles/6g/profile.env builds in and
+# switches on. Read from the running pods, so a default (featureless) binary
+# under a -6g tag fails here rather than passing the 5G checks above.
+if [[ "${PROFILE}" == 6g ]]; then
+  nf_log() { "${KUBECTL[@]}" logs "deployment/$1" -c "$1" --tail=-1 2>/dev/null; }
+
+  # udmd nes: the NES state machine started, and its energy gauges are served
+  # on the pod's loopback (not on the pod IP: nothing outside the pod reads it).
+  if line="$(grep -m1 'NES enabled:' <<<"$(nf_log udm)")"; then
+    pass "UDM NES: ${line##*NES enabled: }"
+  else
+    fail "UDM NES: no 'NES enabled:' line in the udm log (built without --features nes?)"
+  fi
+  NES_OUT="$("${KUBECTL[@]}" exec deployment/udm -c udm -- \
+    curl -fsS -m 5 "http://127.0.0.1:${NES_METRICS_PORT}/metrics" 2>&1)"
+  if grep -q '^energy_consumption_watts{' <<<"${NES_OUT}"; then
+    pass "UDM NES gauges on 127.0.0.1:${NES_METRICS_PORT}: $(grep -m1 '^energy_consumption_watts{' <<<"${NES_OUT}")"
+  else
+    fail "UDM NES gauges: no energy_consumption_watts on 127.0.0.1:${NES_METRICS_PORT} ($(head -n1 <<<"${NES_OUT}"))"
+  fi
+
+  # pcfd intent-loop: the intent was translated and the loop is monitoring.
+  PCF_LOG="$(nf_log pcf)"
+  if grep -q 'intent-loop: intent translated' <<<"${PCF_LOG}" \
+     && line="$(grep 'intent-loop: monitor' <<<"${PCF_LOG}" | tail -n1)"; then
+    pass "PCF intent loop: ${line##*intent-loop: }"
+  else
+    fail "PCF intent loop: no 'intent translated' + 'monitor' lines in the pcf log (built without --features intent-loop?)"
+  fi
+
+  # upfd compute-aware-upf: the UPF's PFCP Heartbeat Requests carry Load
+  # Control Information (IE 51), which the SMF's selection reads. Captured on
+  # the SMF pod for two heartbeat periods (the UPF sends one every 10 s).
+  SMF_POD="$(running_pod app.kubernetes.io/name=smf)"
+  CAP="e2e-6g-pfcp-$(date +%s)"
+  if [[ -n "${SMF_POD}" ]] && "${KUBECTL[@]}" debug "${SMF_POD}" --target=smf --profile=netadmin \
+       --image="${DEBUG_IMAGE}" --container="${CAP}" -- sleep 120 >/dev/null 2>&1; then
+    for _ in $(seq 1 60); do
+      st="$("${KUBECTL[@]}" get pod "${SMF_POD}" \
+        -o jsonpath="{.status.ephemeralContainerStatuses[?(@.name=='${CAP}')].state.running.startedAt}")"
+      [[ -n "${st}" ]] && break
+      sleep 2
+    done
+    HB="$("${KUBECTL[@]}" exec "${SMF_POD}" -c "${CAP}" -- \
+      tshark -i any -f 'udp port 8805' -a duration:25 -Y 'pfcp.msg_type == 1' -V 2>/dev/null)"
+    if grep -q 'Load Control Information' <<<"${HB}"; then
+      pass "UPF compute-aware-upf: PFCP Heartbeat Request carries Load Control Information ($(grep -m1 -E 'Load Metric|Metric:' <<<"${HB}" | sed 's/^ *//'))"
+    elif grep -q 'Heartbeat Request' <<<"${HB}"; then
+      fail "UPF compute-aware-upf: Heartbeat Requests seen without Load Control Information (built without --features compute-aware-upf?)"
+    else
+      fail "UPF compute-aware-upf: no PFCP Heartbeat Request captured on ${SMF_POD} in 25 s"
+    fi
+  else
+    fail "UPF compute-aware-upf: could not attach a capture container to the smf pod"
+  fi
 fi
 
 echo

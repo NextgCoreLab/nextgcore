@@ -361,14 +361,14 @@ fn allowed_nf_types_for(service_name: &str) -> &'static [&'static str] {
 /// Build this AMF's typed self NF instance from [`AMF_SERVICES`].
 fn build_amf_nf_instance(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> NfInstance {
     let mut nf_instance = NfInstance::new(nf_instance_id, nextgcore_sbi::types::NfType::Amf);
-    nf_instance.ipv4_addresses.push(sbi_addr.to_string());
+    nextgcore_sbi::nf_addressing::set_instance_host(&mut nf_instance, sbi_addr);
     nf_instance.heartbeat_interval = 10;
 
     for (service_type, _allowed) in AMF_SERVICES {
         let mut svc = NfService::new(service_type.to_name(), *service_type);
         svc.versions = vec![api_version::V1.to_string()];
         svc.port = sbi_port;
-        svc.ip_addresses.push(sbi_addr.to_string());
+        nextgcore_sbi::nf_addressing::set_service_host(&mut svc, sbi_addr);
         nf_instance.add_service(svc);
     }
 
@@ -421,15 +421,18 @@ pub fn amf_nf_profile_json(
         }
     }
 
-    let mut nf_profile = serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "AMF",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": services,
-        "allowedNfTypes": nf_allowed,
-        "heartBeatTimer": 10
-    });
+    let mut nf_profile = nextgcore_sbi::nf_addressing::classify_profile_host(
+        serde_json::json!({
+            "nfInstanceId": nf_instance_id,
+            "nfType": "AMF",
+            "nfStatus": "REGISTERED",
+            "ipv4Addresses": [sbi_addr],
+            "nfServices": services,
+            "allowedNfTypes": nf_allowed,
+            "heartBeatTimer": 10
+        }),
+        sbi_addr,
+    );
 
     // #92: publish `amfInfo.guamiList` (TS 29.510 §6.1.6.2.4 `AmfInfo`), the GUAMIs
     // this AMF serves. Without it there is nothing in the AMF's registered profile
@@ -715,15 +718,8 @@ async fn amf_nrf_discover_qualified_at(
 
             let mut instance = NfInstance::new(nf_id, nf_type);
 
-            if let Some(fqdn) = nf_json.get("fqdn").and_then(|v| v.as_str()) {
-                instance.fqdn = Some(fqdn.to_string());
-            }
-            if let Some(addrs) = nf_json.get("ipv4Addresses").and_then(|v| v.as_array()) {
-                instance.ipv4_addresses = addrs
-                    .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect();
-            }
+            // #1324: IPv4, IPv6 and FQDN alike.
+            nextgcore_sbi::nf_addressing::read_instance_addresses(&mut instance, nf_json);
             // NFProfile `priority` and `capacity` (TS 29.510 §6.1.6.2.2, 0..65535): the
             // selection inputs of #997. Absent, the instance keeps its defaults.
             if let Some(p) = nf_json
@@ -752,18 +748,7 @@ async fn amf_nrf_discover_qualified_at(
                         nextgcore_sbi::types::SbiServiceType::from_name(svc_name)
                     {
                         let mut svc = NfService::new(svc_name, svc_type);
-                        if let Some(endpoints) =
-                            svc_json.get("ipEndPoints").and_then(|v| v.as_array())
-                        {
-                            if let Some(ep) = endpoints.first() {
-                                if let Some(addr) = ep.get("ipv4Address").and_then(|v| v.as_str()) {
-                                    svc.ip_addresses.push(addr.to_string());
-                                }
-                                if let Some(port) = ep.get("port").and_then(|v| v.as_u64()) {
-                                    svc.port = port as u16;
-                                }
-                            }
-                        }
+                        nextgcore_sbi::nf_addressing::read_service_addresses(&mut svc, svc_json);
                         instance.add_service(svc);
                     }
                 }
@@ -901,6 +886,7 @@ fn resolve_nf_endpoint(service_type: SbiServiceType) -> SbiResult<(String, u16)>
                         .ip_addresses
                         .first()
                         .or(inst.ipv4_addresses.first())
+                        .or(inst.ipv6_addresses.first())
                         .or(svc.fqdn.as_ref())
                         .or(inst.fqdn.as_ref());
                     if let Some(h) = host {
@@ -2410,30 +2396,9 @@ fn namf_comm_endpoint(inst: &serde_json::Value) -> Option<(String, u16)> {
             .and_then(|v| v.as_str())
             .is_some_and(|n| n.eq_ignore_ascii_case(service_name::NAMF_COMM))
     })?;
-    let endpoint = svc.get("ipEndPoints").and_then(|v| v.as_array());
-    let port = endpoint
-        .and_then(|e| e.first())
-        .and_then(|e| e.get("port"))
-        .and_then(|v| v.as_u64())
-        .and_then(|p| u16::try_from(p).ok())
-        .unwrap_or(7777);
-    let host = endpoint
-        .and_then(|e| e.first())
-        .and_then(|e| e.get("ipv4Address"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .or_else(|| {
-            inst.get("ipv4Addresses")
-                .and_then(|v| v.as_array())
-                .and_then(|a| a.first())
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })
-        .or_else(|| {
-            inst.get("fqdn")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })?;
+    // #1324: the endpoint's IPv4 or IPv6 address, else the NF's (IPv4, IPv6, FQDN).
+    let port = nextgcore_sbi::nf_addressing::service_port(Some(svc)).unwrap_or(7777);
+    let host = nextgcore_sbi::nf_addressing::service_host(inst, Some(svc))?;
     Some((host, port))
 }
 
@@ -2852,6 +2817,7 @@ fn lmf_endpoint(inst: &NfInstance) -> Option<(String, u16)> {
         .ip_addresses
         .first()
         .or(inst.ipv4_addresses.first())
+        .or(inst.ipv6_addresses.first())
         .or(svc.fqdn.as_ref())
         .or(inst.fqdn.as_ref())?;
     Some((host.clone(), svc.port))
@@ -4321,31 +4287,9 @@ fn nsmf_pdusession_endpoint(inst: &serde_json::Value) -> Option<(String, u16)> {
                     .is_some_and(|n| n.eq_ignore_ascii_case(service_name::NSMF_PDUSESSION))
             })
         });
-    let endpoint = svc
-        .and_then(|s| s.get("ipEndPoints"))
-        .and_then(|v| v.as_array())
-        .and_then(|e| e.first());
-    let port = endpoint
-        .and_then(|e| e.get("port"))
-        .and_then(|v| v.as_u64())
-        .and_then(|p| u16::try_from(p).ok())
-        .unwrap_or(7777);
-    let host = endpoint
-        .and_then(|e| e.get("ipv4Address"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .or_else(|| {
-            inst.get("ipv4Addresses")
-                .and_then(|v| v.as_array())
-                .and_then(|a| a.first())
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })
-        .or_else(|| {
-            inst.get("fqdn")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })?;
+    // #1324: the endpoint's IPv4 or IPv6 address, else the NF's (IPv4, IPv6, FQDN).
+    let port = nextgcore_sbi::nf_addressing::service_port(svc).unwrap_or(7777);
+    let host = nextgcore_sbi::nf_addressing::service_host(inst, svc)?;
     Some((host, port))
 }
 
@@ -6960,5 +6904,47 @@ mod tests_no_wildcard_uri_1322 {
         let before = advertised_sbi_host_port();
         set_advertised_sbi("0.0.0.0".into(), 7777);
         assert_eq!(advertised_sbi_host_port(), before);
+    }
+}
+
+/// #1324: the NFProfile carries its host where its type belongs (TS 29.510
+/// §6.1.6.2.2): IPv4 in ipv4Addresses, IPv6 in ipv6Addresses, an FQDN as fqdn, and
+/// the service ipEndPoints likewise.
+#[cfg(test)]
+mod tests_nf_profile_host_kind_1324 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_carries_its_host_by_type() {
+        for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
+            let profile = amf_nf_profile_json("id", host, 7777);
+            let problems =
+                nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
+            assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
+        }
+    }
+}
+
+/// #1324 review: producer to consumer. A peer profile built with an IPv4, IPv6 or
+/// FQDN host (as this codebase's producers build them) resolves to that host.
+#[cfg(test)]
+mod tests_peer_host_kind_1324 {
+    use super::*;
+    use nextgcore_sbi::nf_addressing::{dialled_host, sample_search_result, SAMPLE_HOSTS};
+
+    #[test]
+    fn a_peer_at_any_host_type_is_resolved() {
+        for host in SAMPLE_HOSTS {
+            let r = sample_search_result("AMF", "namf-comm", host, 7791);
+            assert_eq!(
+                namf_comm_endpoint(&r["nfInstances"][0]),
+                Some((dialled_host(host), 7791))
+            );
+            let r = sample_search_result("SMF", "nsmf-pdusession", host, 7792);
+            assert_eq!(
+                nsmf_pdusession_endpoint(&r["nfInstances"][0]),
+                Some((dialled_host(host), 7792))
+            );
+        }
     }
 }

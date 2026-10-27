@@ -418,12 +418,18 @@ pub async fn resolve_pcf_endpoint() -> Option<PcfEndpoint> {
     }
     let body: serde_json::Value = serde_json::from_str(resp.http.content.as_deref()?).ok()?;
     let inst = body.get("nfInstances")?.as_array()?.first()?;
-    let host = inst
-        .get("ipv4Addresses")
-        .and_then(|a| a.as_array())
-        .and_then(|a| a.first())
-        .and_then(|v| v.as_str())?
-        .to_string();
+    // #1324: the smpolicycontrol endpoint's address (IPv4 or IPv6), else the PCF's
+    // (IPv4, IPv6, FQDN).
+    let host = nextgcore_sbi::nf_addressing::service_host(
+        inst,
+        inst.get("nfServices")
+            .and_then(|s| s.as_array())
+            .and_then(|svcs| {
+                svcs.iter().find(|s| {
+                    s.get("serviceName").and_then(|n| n.as_str()) == Some("npcf-smpolicycontrol")
+                })
+            }),
+    )?;
     let port = inst
         .get("nfServices")
         .and_then(|s| s.as_array())
@@ -626,24 +632,12 @@ fn nsacf_serving(
         .and_then(|s| s.get("ipEndPoints"))
         .and_then(|e| e.as_array())
         .and_then(|e| e.first());
-    let str_of = |v: Option<&serde_json::Value>| {
-        v.and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    };
-    let host = str_of(ip_endpoint.and_then(|e| e.get("ipv4Address")))
-        .or_else(|| {
-            str_of(
-                inst.get("ipv4Addresses")
-                    .and_then(|a| a.as_array())
-                    .and_then(|a| a.first()),
-            )
-        })
-        .or_else(|| str_of(service.and_then(|s| s.get("fqdn"))))
-        .or_else(|| str_of(inst.get("fqdn")));
+    // #1324: the endpoint's IPv4 or IPv6 address, else the service's or the
+    // NSACF's (IPv4, IPv6, FQDN).
+    let host = nextgcore_sbi::nf_addressing::service_host(inst, service);
     let Some(host) = host else {
         log::debug!(
-            "NSACF instance {:?} names no IPv4 address or FQDN; trying the next",
+            "NSACF instance {:?} names no address or FQDN; trying the next",
             inst.get("nfInstanceId")
         );
         return None;
@@ -3228,5 +3222,22 @@ mod tests {
             ies.iter().all(|ie| ie.conditional_holds()),
             "every emitted IE must satisfy the NW-TT-port conditional"
         );
+    }
+}
+
+/// #1324 review: producer to consumer. A peer profile built with an IPv4, IPv6 or
+/// FQDN host (as this codebase's producers build them) resolves to that host.
+#[cfg(test)]
+mod tests_peer_host_kind_1324 {
+    use super::*;
+    use nextgcore_sbi::nf_addressing::{dialled_host, sample_search_result, SAMPLE_HOSTS};
+
+    #[test]
+    fn a_peer_at_any_host_type_is_resolved() {
+        for host in SAMPLE_HOSTS {
+            let r = sample_search_result("NSACF", "nnsacf-nsac", host, 7795);
+            let ep = nsacf_serving(&r["nfInstances"][0], None, 1, None).expect("an NSACF");
+            assert_eq!((ep.host, ep.port), (dialled_host(host), 7795));
+        }
     }
 }

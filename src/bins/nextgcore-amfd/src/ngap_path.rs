@@ -19729,7 +19729,12 @@ fn build_sm_context_identity(
         pei: state.and_then(|s| s.amf_ue.pei.clone()),
         guami,
         serving_plmn,
-        serving_nf_id: None,
+        // #1331: M in SmContextCreateData (TS 29.502 Table 6.1.6.2.2-1), the serving
+        // AMF's NF instance identifier.
+        serving_nf_id: Some(
+            nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf)
+                .to_string(),
+        ),
         ue_location,
         // Issue #205: the UE's EXTERNAL identity, stored on the UE context from
         // the `gpsis` array of the `am-data` the AMF retrieves at registration.
@@ -21761,6 +21766,16 @@ mod tests {
         let without = build_sm_context_identity(Some(&state), None);
         assert_eq!(without.gpsi, None);
         assert_eq!(without.supi.as_deref(), Some("imsi-262011234567890"));
+
+        // #1331: the serving AMF's nfInstanceId, mandatory in SmContextCreateData.
+        assert_eq!(
+            identity.serving_nf_id.as_deref(),
+            Some(
+                nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf)
+                    .to_string()
+                    .as_str()
+            )
+        );
 
         // No UE context at all: every UE-sourced member is absent.
         let none = build_sm_context_identity(None, None);
