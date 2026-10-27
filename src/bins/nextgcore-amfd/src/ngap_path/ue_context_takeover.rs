@@ -323,7 +323,6 @@ impl NgapServer {
             pointer,
         });
         let (guami_mcc, guami_mnc) = plmn_mcc_mnc_strings(&plmn);
-        let (serving_mcc, serving_mnc) = plmn_mcc_mnc_strings(&state.amf_ue.nr_tai.plmn_id);
         if taken_over {
             log::info!(
                 "UE {amf_ue_ngap_id} ({supi}) taken over: registering with the UDM and telling \
@@ -331,8 +330,8 @@ impl NgapServer {
             );
         } else {
             log::info!(
-                "UE {amf_ue_ngap_id} ({supi}) restored after this AMF's restart: giving the UDM, \
-                 its SMFs and the PCF this process's callback addresses"
+                "UE {amf_ue_ngap_id} ({supi}) restored after this AMF's restart: giving the UDM \
+                 and the PCF this process's callback addresses (its SMFs had them at restore)"
             );
         }
 
@@ -356,16 +355,18 @@ impl NgapServer {
                 .await
                 .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777)),
             };
-            let result = crate::sbi_path::call_udm_uecm_registration(
-                &host,
-                port,
-                &uecm_supi,
-                &uecm_instance,
-                &token,
-                &uecm_mcc,
-                &uecm_mnc,
-                &uecm_amf_id,
-            )
+            let result = crate::sbi_path::retry_peer_update("UECM registration", || {
+                crate::sbi_path::call_udm_uecm_registration(
+                    &host,
+                    port,
+                    &uecm_supi,
+                    &uecm_instance,
+                    &token,
+                    &uecm_mcc,
+                    &uecm_mnc,
+                    &uecm_amf_id,
+                )
+            })
             .await;
             if let Err(e) = &result {
                 log::warn!("[{uecm_supi}] takeover UECM registration failed: {e}");
@@ -395,30 +396,10 @@ impl NgapServer {
         });
 
         // Each SMF: the new serving AMF, keyed on the session so it precedes the
-        // procedure's own exchanges for it.
-        for (psi, sm_ref, host, port) in self.ue_sm_contexts(amf_ue_ngap_id) {
-            let serving = serde_json::json!({
-                "servingNfId": instance,
-                "smContextStatusUri": crate::sbi_path::sm_context_status_uri(&supi, psi),
-                "guami": {
-                    "plmnId": { "mcc": guami_mcc, "mnc": guami_mnc },
-                    "amfId": amf_id_hex,
-                },
-                "servingNetwork": { "mcc": serving_mcc, "mnc": serving_mnc },
-            });
-            self.sbi_offload
-                .spawn_keyed_durable((amf_ue_ngap_id, psi), move || async move {
-                    if let Err(e) =
-                        crate::sbi_path::call_smf_update_serving_amf(&host, port, &sm_ref, &serving)
-                            .await
-                    {
-                        log::warn!(
-                            "UE {amf_ue_ngap_id}: PSI {psi}'s SMF was not told of the new \
-                             serving AMF: {e}"
-                        );
-                    }
-                    None
-                });
+        // procedure's own exchanges for it. #1329 review M1: a restart restore told
+        // its SMFs at restore time (`point_smfs_at_self`), so only a takeover here.
+        if taken_over {
+            self.spawn_smf_serving_updates(amf_ue_ngap_id, &state);
         }
 
         // #1210: the PCF's policy associations now notify this AMF.
@@ -435,13 +416,15 @@ impl NgapServer {
             );
             self.sbi_offload.spawn(async move {
                 let (host, port) = takeover_pcf(pcf).await;
-                if let Err(e) = crate::sbi_path::call_pcf_am_policy_update_serving_amf(
-                    &host,
-                    port,
-                    &pol_asso_id,
-                    &uri,
-                    &guami,
-                )
+                if let Err(e) = crate::sbi_path::retry_peer_update("AM policy update", || {
+                    crate::sbi_path::call_pcf_am_policy_update_serving_amf(
+                        &host,
+                        port,
+                        &pol_asso_id,
+                        &uri,
+                        &guami,
+                    )
+                })
                 .await
                 {
                     log::warn!(
@@ -456,14 +439,16 @@ impl NgapServer {
             let uri = crate::sbi_path::ue_policy_notification_uri(&supi);
             self.sbi_offload.spawn(async move {
                 let (host, port) = takeover_pcf(pcf).await;
-                if let Err(e) = crate::sbi_path::call_pcf_ue_policy_update_serving_amf(
-                    &host,
-                    port,
-                    &pol_asso_id,
-                    &uri,
-                    &guami,
-                    &instance,
-                )
+                if let Err(e) = crate::sbi_path::retry_peer_update("UE policy update", || {
+                    crate::sbi_path::call_pcf_ue_policy_update_serving_amf(
+                        &host,
+                        port,
+                        &pol_asso_id,
+                        &uri,
+                        &guami,
+                        &instance,
+                    )
+                })
                 .await
                 {
                     log::warn!(
@@ -478,6 +463,90 @@ impl NgapServer {
 
     /// Record the UDM's answer to a takeover's UECM registration: the new
     /// `deregCallbackUri` token is the UE's only once the UDM accepted it (#753).
+    /// The serving-AMF identity this AMF gives a peer for UE `state`: its nfInstanceId,
+    /// its GUAMI's AMF ID (hex) and PLMN, and the UE's serving PLMN.
+    fn serving_identity(
+        &self,
+        state: &UeNasContext,
+    ) -> (String, String, String, String, String, String) {
+        let instance = self.amf_instance();
+        let (plmn, region, set, pointer) = self.served_guamis().first().cloned().unwrap_or((
+            state.amf_ue.nr_tai.plmn_id.clone(),
+            state.amf_ue.current_guti.amf_region_id,
+            state.amf_ue.current_guti.amf_set_id,
+            state.amf_ue.current_guti.amf_pointer,
+        ));
+        let amf_id_hex = crate::sbi_path::amf_id_hex(&crate::context::AmfId {
+            region,
+            set,
+            pointer,
+        });
+        let (guami_mcc, guami_mnc) = plmn_mcc_mnc_strings(&plmn);
+        let (serving_mcc, serving_mnc) = plmn_mcc_mnc_strings(&state.amf_ue.nr_tai.plmn_id);
+        (
+            instance,
+            amf_id_hex,
+            guami_mcc,
+            guami_mnc,
+            serving_mcc,
+            serving_mnc,
+        )
+    }
+
+    /// Tell each SMF of UE `amf_ue_ngap_id` that this AMF serves its SM context, with
+    /// this process's `smContextStatusUri` (TS 29.502 Table 6.1.6.2.2-1): the SMF sends
+    /// its status notifications and N1N2 transfers, paging among them, there. Keyed on
+    /// the session and durable, so it precedes the session's later exchanges and is not
+    /// dropped; bounded by the offload's concurrency; retried with backoff.
+    pub(super) fn spawn_smf_serving_updates(&mut self, amf_ue_ngap_id: u64, state: &UeNasContext) {
+        let Some(supi) = state.amf_ue.supi.clone() else {
+            return;
+        };
+        let (instance, amf_id_hex, guami_mcc, guami_mnc, serving_mcc, serving_mnc) =
+            self.serving_identity(state);
+        for (psi, sm_ref, host, port) in self.ue_sm_contexts(amf_ue_ngap_id) {
+            let serving = serde_json::json!({
+                "servingNfId": instance,
+                "smContextStatusUri": crate::sbi_path::sm_context_status_uri(&supi, psi),
+                "guami": {
+                    "plmnId": { "mcc": guami_mcc, "mnc": guami_mnc },
+                    "amfId": amf_id_hex,
+                },
+                "servingNetwork": { "mcc": serving_mcc, "mnc": serving_mnc },
+            });
+            self.sbi_offload
+                .spawn_keyed_durable((amf_ue_ngap_id, psi), move || async move {
+                    if let Err(e) =
+                        crate::sbi_path::retry_peer_update("SMF serving-AMF update", || {
+                            crate::sbi_path::call_smf_update_serving_amf(
+                                &host, port, &sm_ref, &serving,
+                            )
+                        })
+                        .await
+                    {
+                        log::warn!(
+                            "UE {amf_ue_ngap_id}: PSI {psi}'s SMF was not told of the serving \
+                             AMF: {e}"
+                        );
+                    }
+                    None
+                });
+        }
+    }
+
+    /// #1329 review M1: after this AMF's restart, every restored UE's SMFs learn this
+    /// process's addresses AT RESTORE, not at the UE's next message. An idle UE may send
+    /// nothing for a long time, and the SMF pages it through the `smContextStatusUri`
+    /// it holds (smfd's paging N1N2MessageTransfer): until then that is the dead pod's,
+    /// and downlink data would page nobody. The record is this AMF's own and the GUAMI
+    /// is unchanged, so nothing waits on the UE.
+    pub(super) fn point_smfs_at_self(&mut self, amf_ue_ngap_id: u64) {
+        let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) else {
+            return;
+        };
+        self.spawn_smf_serving_updates(amf_ue_ngap_id, &state);
+    }
+
     pub(super) fn apply_takeover_uecm(&mut self, answer: TakeoverUecmAnswer) {
         if !answer.accepted {
             return;

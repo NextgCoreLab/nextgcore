@@ -1479,6 +1479,46 @@ pub async fn call_smf_deactivate_up_connection(
     Ok(())
 }
 
+/// How many times a peer update (#1329: the serving-AMF updates of a takeover or a
+/// restart restore) is tried before it is given up and logged.
+pub(crate) const PEER_UPDATE_ATTEMPTS: u32 = 5;
+
+/// The wait before the first retry, doubled for each further one: 1 + 2 + 4 + 8 s, so a
+/// peer that is restarting itself (as the AMF's SMFs may be after a node loss) is given
+/// about 15 s. Short in tests.
+#[cfg(not(test))]
+pub(crate) const PEER_UPDATE_FIRST_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(test)]
+pub(crate) const PEER_UPDATE_FIRST_BACKOFF: std::time::Duration =
+    std::time::Duration::from_millis(20);
+
+/// Run `attempt` until it succeeds, at most [`PEER_UPDATE_ATTEMPTS`] times, with
+/// exponential backoff from [`PEER_UPDATE_FIRST_BACKOFF`] (#1329 review: a failed peer
+/// update is retried, not dropped). Returns the last error.
+pub(crate) async fn retry_peer_update<T, F, Fut>(what: &str, mut attempt: F) -> SbiResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = SbiResult<T>>,
+{
+    let mut backoff = PEER_UPDATE_FIRST_BACKOFF;
+    let mut n = 1;
+    loop {
+        match attempt().await {
+            Ok(v) => return Ok(v),
+            Err(e) if n >= PEER_UPDATE_ATTEMPTS => return Err(e),
+            Err(e) => {
+                log::warn!(
+                    "{what} failed (attempt {n} of {PEER_UPDATE_ATTEMPTS}): {e}; retrying in \
+                     {backoff:?}"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+                n += 1;
+            }
+        }
+    }
+}
+
 /// #686 PR 2, an AMF change (TS 29.502 §5.2.2.3.1, Table 6.1.6.2.2-1): tell the SMF that
 /// this AMF now serves the SM context. The UpdateSMContext carries the new AMF's
 /// `servingNfId`, with the `smContextStatusUri`, `guami` and `servingNetwork` the table

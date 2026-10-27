@@ -319,9 +319,18 @@ async fn a_restarted_amf_points_a_restored_ue_s_peers_at_itself_at_its_first_mes
         "the peers are owed this process's addresses"
     );
     assert!(!restored.taken_over, "not a takeover");
+    settle_offloaded_sbi(&mut after).await;
+    // Review M1: the SMF learns this AMF at restore; the UDM and PCF wait for the UE.
     assert!(
-        seen.lock().unwrap().is_empty() && udm_seen.lock().unwrap().is_empty(),
-        "nothing is sent before the UE is back and verified"
+        seen.lock().unwrap().iter().any(|(uri, body)| {
+            uri.contains("/sm-contexts/ref-1329-a/modify") && body.contains("servingNfId")
+        }),
+        "the SMF is told at restore: {:?}",
+        seen.lock().unwrap()
+    );
+    assert!(
+        udm_seen.lock().unwrap().is_empty() && pcf_seen.lock().unwrap().is_empty(),
+        "the UDM and the PCF wait for the UE's verified message"
     );
 
     after.forced_amf_ue_ngap_id = Some(sr_id);
@@ -382,6 +391,256 @@ async fn a_restarted_amf_points_a_restored_ue_s_peers_at_itself_at_its_first_mes
     );
     assert_eq!(ue.amf_ue.current_guti, original.amf_ue.current_guti);
     crash(&mut after, sr_id);
+}
+
+/// A stand-in SMF that answers `500` to the first `fail` serving-AMF updates, then
+/// `204`; it records every request.
+async fn flaky_smf(
+    fail: usize,
+) -> (
+    nextgcore_sbi::server::SbiServer,
+    u16,
+    Arc<std::sync::Mutex<Vec<(String, String)>>>,
+) {
+    use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+    use nextgcore_sbi::server::{SbiServer as NSbiServer, SbiServerConfig as NSbiCfg};
+    let seen: Arc<std::sync::Mutex<Vec<(String, String)>>> = Arc::default();
+    let sink = Arc::clone(&seen);
+    let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let server = NSbiServer::on_listener(NSbiCfg::new(addr), listener);
+    server
+        .start(move |req: SReq| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let body = req.http.content.clone().unwrap_or_default();
+                let mut seen = sink.lock().unwrap();
+                seen.push((req.header.uri.clone(), body.clone()));
+                let updates = seen
+                    .iter()
+                    .filter(|(_, b)| b.contains("servingNfId"))
+                    .count();
+                if body.contains("servingNfId") && updates <= fail {
+                    SResp::with_status(500)
+                } else {
+                    SResp::no_content()
+                }
+            }
+        })
+        .await
+        .expect("stand-in starts");
+    for _ in 0..200 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    (server, addr.port(), seen)
+}
+
+/// Store UE `supi` on one AMF, "crash" it, and restore it on a fresh one of the same
+/// instance, with the UDM and PCF stand-ins pinned. Returns the restarted AMF and the
+/// UE as it was stored.
+async fn restarted_with(
+    id: u64,
+    tmsi: u32,
+    supi: &str,
+    sm_ref: &str,
+    smf_port: u16,
+    udm_port: u16,
+    pcf_port: u16,
+) -> (NgapServer, UeNasContext) {
+    let backend = Arc::new(MemoryBackend::default());
+    let mut before = storing_server(&backend).await;
+    seed_registered_ue(&mut before, id, tmsi, supi, sm_ref, smf_port, false);
+    before.ue_auth_state.with_mut(id, |s| {
+        s.amf_ue.policy_association.id = Some(format!("am-{sm_ref}"));
+        s.policy_association_id = Some(format!("am-{sm_ref}"));
+    });
+    let original = before.ue_auth_state.get(id).expect("seeded");
+    store_now(&mut before).await;
+    crash(&mut before, id);
+    drop(before);
+    let backend = only(&backend, supi);
+    let mut after = storing_server(&backend).await;
+    after.udm_override = Some(("127.0.0.1".to_string(), udm_port));
+    after.pcf_override = Some(("127.0.0.1".to_string(), pcf_port));
+    open_with(
+        &mut after,
+        Arc::clone(&backend) as Arc<dyn UeContextBackend>,
+    )
+    .await;
+    (after, original)
+}
+
+/// **#1329 review M1.** A restored UE that stays CM-IDLE must still be pageable: the SMF
+/// pages it through the `smContextStatusUri` it holds (smfd's paging
+/// N1N2MessageTransfer goes to that URI's authority), and after the restart that was
+/// the dead pod's. So at restore, with no message from the UE, each SMF gets this AMF's
+/// `servingNfId` and an `smContextStatusUri` of THIS process. Nothing goes to the UDM
+/// or the PCF yet, and the UE stays idle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restored_idle_ue_s_smf_is_given_this_amf_at_restore_so_downlink_pages_it_here() {
+    let (_smf, port, seen) = fake_activating_smf().await;
+    let (_udm, udm_port, udm_seen) = fake_activating_smf().await;
+    let (_pcf, pcf_port, pcf_seen) = fake_activating_smf().await;
+    let _env = SmfEnvGuard::acquire(port).await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let supi = "imsi-001010001329201";
+    let (mut after, _) = restarted_with(
+        13_290_201,
+        0x1329_0201,
+        supi,
+        "ref-1329-p",
+        port,
+        udm_port,
+        pcf_port,
+    )
+    .await;
+    settle_offloaded_sbi(&mut after).await;
+
+    let calls = seen.lock().unwrap().clone();
+    let (_, body) = calls
+        .iter()
+        .find(|(uri, body)| {
+            uri.contains("/sm-contexts/ref-1329-p/modify") && body.contains("servingNfId")
+        })
+        .unwrap_or_else(|| panic!("the SMF is told at restore: {calls:?}"));
+    let body: serde_json::Value = serde_json::from_str(body).expect("json");
+    let instance = nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf);
+    assert_eq!(body["servingNfId"], instance);
+    let status_uri = crate::sbi_path::sm_context_status_uri(supi, 5);
+    assert_eq!(body["smContextStatusUri"], status_uri);
+    assert!(
+        status_uri.starts_with("http"),
+        "absolute, this process's authority: {status_uri}"
+    );
+    assert_eq!(body["guami"]["amfId"], "02556a", "the unchanged GUAMI");
+    assert!(
+        udm_seen.lock().unwrap().is_empty() && pcf_seen.lock().unwrap().is_empty(),
+        "the UDM and the PCF wait for the UE"
+    );
+    let (id, ue) = after.ue_auth_state.find_by_supi(supi).expect("restored");
+    assert!(ue.cm_idle && ue.peers_stale, "still idle, UDM/PCF owed");
+    crash(&mut after, id);
+}
+
+/// **#1329 review.** A serving-AMF update the SMF refuses is retried with backoff, not
+/// dropped: two 500s, then it lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_serving_amf_update_is_retried_until_the_smf_takes_it() {
+    let (_smf, port, seen) = flaky_smf(2).await;
+    let (_udm, udm_port, _) = fake_activating_smf().await;
+    let (_pcf, pcf_port, _) = fake_activating_smf().await;
+    let _env = SmfEnvGuard::acquire(port).await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let supi = "imsi-001010001329301";
+    let (mut after, _) = restarted_with(
+        13_290_301,
+        0x1329_0301,
+        supi,
+        "ref-1329-r",
+        port,
+        udm_port,
+        pcf_port,
+    )
+    .await;
+    // Three tries: two backoffs of 20 and 40 ms in tests.
+    for _ in 0..20 {
+        settle_offloaded_sbi(&mut after).await;
+        let n = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, b)| b.contains("servingNfId"))
+            .count();
+        if n >= 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let tries = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, b)| b.contains("servingNfId"))
+        .count();
+    assert_eq!(
+        tries,
+        3,
+        "two refusals, then accepted: {:?}",
+        seen.lock().unwrap()
+    );
+    let (id, _) = after.ue_auth_state.find_by_supi(supi).expect("restored");
+    crash(&mut after, id);
+}
+
+/// **#1329 review.** The restart case through a REGISTRATION REQUEST as the UE's first
+/// message (a periodic registration update): the UDM and the PCF get this process's
+/// addresses, once, and the 5G-GUTI keeps this AMF's unchanged GUAMI.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restored_ue_s_registration_gives_the_udm_and_the_pcf_this_amf() {
+    let (_smf, port, _seen) = fake_activating_smf().await;
+    let (_udm, udm_port, udm_seen) = fake_activating_smf().await;
+    let (_pcf, pcf_port, pcf_seen) = fake_activating_smf().await;
+    let _env = SmfEnvGuard::acquire(port).await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let (tmsi, supi) = (0x1329_0401u32, "imsi-001010001329401");
+    let (mut after, original) = restarted_with(
+        13_290_401,
+        tmsi,
+        supi,
+        "ref-1329-g",
+        port,
+        udm_port,
+        pcf_port,
+    )
+    .await;
+    after.sent_ngap = Some(Vec::new());
+    let rr =
+        guti_registration_request(crate::gmm_build::registration_type::PERIODIC_UPDATING, tmsi);
+    let nas =
+        protected_initial_registration(&original.amf_ue, &rr, &rr, original.amf_ue.ul_count + 1);
+    after
+        .handle_initial_ue_message(1, &service_request_initial_ue(nas))
+        .await
+        .expect("handled");
+    for _ in 0..3 {
+        settle_offloaded_sbi(&mut after).await;
+    }
+    let udm = udm_seen.lock().unwrap().clone();
+    let uecm = udm
+        .iter()
+        .filter(|(uri, _)| {
+            uri.ends_with(&format!(
+                "/nudm-uecm/v1/{supi}/registrations/amf-3gpp-access"
+            ))
+        })
+        .count();
+    assert_eq!(
+        uecm, 1,
+        "one UECM registration with this process's deregCallbackUri: {udm:?}"
+    );
+    let pcf = pcf_seen.lock().unwrap().clone();
+    assert!(
+        pcf.iter()
+            .any(|(uri, _)| uri
+                .ends_with("/npcf-am-policy-control/v1/policies/am-ref-1329-g/update")),
+        "the AM policy association notifies this AMF: {pcf:?}"
+    );
+    let (id, ue) = after.ue_auth_state.find_by_supi(supi).expect("registered");
+    assert!(!ue.peers_stale && !ue.taken_over, "owed once");
+    assert_eq!(
+        (
+            ue.amf_ue.next_guti.amf_set_id,
+            ue.amf_ue.next_guti.amf_pointer
+        ),
+        (
+            original.amf_ue.current_guti.amf_set_id,
+            original.amf_ue.current_guti.amf_pointer
+        ),
+        "the GUAMI is unchanged: no takeover reallocation"
+    );
+    crash(&mut after, id);
 }
 
 /// **#686.** A UE CM-CONNECTED when stored has no NG connection after the restart: it is

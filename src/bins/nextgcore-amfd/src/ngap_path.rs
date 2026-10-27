@@ -756,10 +756,11 @@ pub struct UeNasContext {
     /// #686 PR 2: taken over from another AMF of the set; the peer updates are owed until
     /// its first message verifies ([`ue_context_takeover`]).
     taken_over: bool,
-    /// #1329: restored by this AMF instance after its own restart. Its peers (UDM, SMF,
-    /// PCF) still hold the callback addresses of the process that stored it, whose pod IP
-    /// is gone, so the takeover's peer updates are owed until its first message verifies,
-    /// without the GUTI reallocation (the GUAMI is unchanged).
+    /// #1329: restored by this AMF instance after its own restart. Its UDM and PCF still
+    /// hold the callback addresses of the process that stored it, whose pod IP is gone,
+    /// so those of the takeover's peer updates are owed until its first message
+    /// verifies, without the GUTI reallocation (the GUAMI is unchanged). Its SMFs are
+    /// told at restore (`point_smfs_at_self`).
     peers_stale: bool,
     /// #686 PR 2: a 5G-GUTI of this AMF's GUAMI is owed after the Service Accept, whatever
     /// `AMF_GUTI_REALLOCATION` says (TS 23.501 §5.21.2.3).
