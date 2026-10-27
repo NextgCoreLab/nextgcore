@@ -71,6 +71,7 @@ done
 | `global.plmn` | 999-70 | Must match the simulator's PLMN. |
 | `subscriber.*` | test IMSI | Must match the UE's USIM config. |
 | `amf.service.headless`, `upf.service.headless` | `true` | Leave alone. NGAP and GTP-U are UDP; kube-proxy's per-flow balancing plus a conntrack timeout breaks both. |
+| `<nf>.service.type` | `ClusterIP` | Leave alone (#1365). The SBI and `/metrics` are unauthenticated in the dev profile; NodePort or LoadBalancer opens them on every node IP or to the load balancer's audience. Reach a Service from a workstation with `kubectl -n <ns> port-forward svc/<release>-nrf 7777:7777`, which listens on 127.0.0.1. CI renders the defaults and fails on any non-ClusterIP Service. |
 
 ## Verified
 

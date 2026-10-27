@@ -450,10 +450,10 @@ jobs:
           done
           [ "$n" -gt 0 ] || { echo "no profile rendered"; exit 1; }
       - name: EKS Service patches keep the base ports
-        # The 5g profile's Service patches replace whole port lists
-        # (`$patch: replace`), so a port added to a base Service later would
-        # be dropped silently on EKS (#1100 review). Every Service a patch
-        # names must keep the base ports, be ClusterIP, and set no nodePort.
+        # The 5g profile's Service patches restate whole port lists, so a
+        # port they change would differ silently from the base on EKS (#1100
+        # review). Every Service a patch names must keep the base ports, be
+        # ClusterIP, and set no nodePort.
         working-directory: nextgcore
         run: |
           set -euo pipefail
@@ -461,6 +461,33 @@ jobs:
           kubectl kustomize deploy/eks/profiles/5g > "$RUNNER_TEMP/eks-5g.yaml"
           python3 deploy/eks/lib/check_service_ports.py \
             "$RUNNER_TEMP/base.yaml" "$RUNNER_TEMP/eks-5g.yaml" deploy/eks/profiles/5g/patches/*.yaml
+      - uses: azure/setup-helm@v4
+      - name: Nothing publishes a port (ClusterIP only)
+        # #1365: the base NRF and monitoring Services were NodePort, so
+        # applying k8s/ opened the unauthenticated NRF SBI, Prometheus,
+        # Jaeger and Grafana on every node IP. Fails on any NodePort,
+        # LoadBalancer, hostPort, hostNetwork, externalIPs or Ingress/Gateway
+        # route, in the k8s/, deploy/ and helm/ sources and in the rendered
+        # base, every EKS profile (with its own kustomize flags) and the Helm
+        # chart's defaults. Justified exceptions go in the commented allowlist
+        # at the top of deploy/check_no_exposure.py.
+        working-directory: nextgcore
+        run: |
+          set -euo pipefail
+          r="$RUNNER_TEMP/exposure"; mkdir -p "$r"
+          args=()
+          kubectl kustomize k8s > "$r/base.yaml"; args+=(--render "$r/base.yaml")
+          kubectl kustomize deploy/eks > "$r/eks.yaml"; args+=(--render "$r/eks.yaml")
+          for d in deploy/eks/profiles/*/; do
+            p="$(basename "$d")"
+            flags="$(sed -n 's/^PROFILE_KUSTOMIZE_FLAGS="\(.*\)"$/\1/p' "$d/profile.env")"
+            # shellcheck disable=SC2086  # flags is a word list
+            kubectl kustomize $flags "$d" > "$r/eks-$p.yaml"
+            args+=(--render "$r/eks-$p.yaml")
+          done
+          helm template ci deploy/helm/nextgcore --set global.siteId=ci > "$r/helm.yaml"
+          args+=(--render "$r/helm.yaml")
+          python3 deploy/check_no_exposure.py "${args[@]}"
 
   fuzz-build:
     name: Fuzz targets build

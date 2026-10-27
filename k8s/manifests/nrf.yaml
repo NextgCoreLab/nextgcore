@@ -1,3 +1,6 @@
+# ClusterIP, never NodePort (#1365): the SBI is unauthenticated in the dev
+# profile, and a NodePort opens it on every node IP. From a workstation use
+#   kubectl -n nextg-system port-forward svc/nrf 7777:7777
 apiVersion: v1
 kind: Service
 metadata:
@@ -7,19 +10,17 @@ metadata:
     app.kubernetes.io/name: nrf
     app.kubernetes.io/part-of: nextgcore
 spec:
-  type: NodePort
+  type: ClusterIP
   selector:
     app.kubernetes.io/name: nrf
   ports:
     - name: sbi
       port: 7777
       targetPort: 7777
-      nodePort: 30777
       protocol: TCP
 ---
-# /metrics (#1334) gets its own ClusterIP Service: adding 9090 to the NodePort
-# Service above would allocate a node port for it on every node. Prometheus
-# scrapes nrf-metrics:9090 from inside the cluster; nothing publishes it.
+# /metrics (#1334) has its own ClusterIP Service. Prometheus scrapes
+# nrf-metrics:9090 from inside the cluster; nothing publishes it (#1365).
 apiVersion: v1
 kind: Service
 metadata:
