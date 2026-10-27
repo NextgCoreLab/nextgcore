@@ -674,12 +674,6 @@ async fn main() -> Result<()> {
 // G2-2: NRF registration + heartbeat /load PATCH (opt-in)
 // ---------------------------------------------------------------------------
 
-/// Build the UPF `NFProfile` sent to the NRF on registration
-/// (TS 29.510 §6.1.6.2.2). The UPF exposes no SBI service, so `nfServices` is
-/// omitted — consumers (SMF) reach it over N4/PFCP. `upfInfo`
-/// (TS 29.510 §6.1.6.2.10) advertises the N3 (GTP-U) interface endpoint. The
-/// `load` field carries the initial PFCP-session occupancy gauge; it is
-/// refreshed by the heartbeat PATCH (`build_load_patch`, `/load` 0..=100).
 /// The N3 InterfaceUpfInfoItem for `gtpu_addr`, its address by type (#1324).
 fn n3_interface(gtpu_addr: &str) -> serde_json::Value {
     let mut item = nextgcore_sbi::nf_addressing::interface_upf_endpoint(gtpu_addr);
@@ -687,6 +681,12 @@ fn n3_interface(gtpu_addr: &str) -> serde_json::Value {
     serde_json::Value::Object(item)
 }
 
+/// Build the UPF `NFProfile` sent to the NRF on registration
+/// (TS 29.510 §6.1.6.2.2). The UPF exposes no SBI service, so `nfServices` is
+/// omitted — consumers (SMF) reach it over N4/PFCP. `upfInfo`
+/// (TS 29.510 §6.1.6.2.10) advertises the N3 (GTP-U) interface endpoint. The
+/// `load` field carries the initial PFCP-session occupancy gauge; it is
+/// refreshed by the heartbeat PATCH (`build_load_patch`, `/load` 0..=100).
 fn build_upf_nf_profile(
     nf_instance_id: &str,
     pfcp_addr: &str,
@@ -1533,12 +1533,26 @@ mod tests {
         let dp = Arc::new(DataPlane::new(Arc::new(AtomicBool::new(false))));
         let ue = Ipv4Addr::new(10, 45, 13, 48);
         let stop = Arc::new(AtomicBool::new(false));
-        let (reader_dp, reader_stop) = (Arc::clone(&dp), Arc::clone(&stop));
+        // #1373: how often the reader has found a session, shared so the writer can
+        // wait for it. The reader is a plain thread the scheduler may not run while
+        // the writer establishes and removes 400 sessions; on a loaded CI runner it
+        // once saw none, which proves nothing about the invariant. The writer now
+        // waits for the reader to have started and, every `CHECKPOINT` sessions,
+        // holds a session published until the reader has found it, so the reader
+        // provably runs concurrently with the establishments.
+        let seen = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let started = Arc::new(AtomicBool::new(false));
+        let (reader_dp, reader_stop, reader_seen, reader_started) = (
+            Arc::clone(&dp),
+            Arc::clone(&stop),
+            Arc::clone(&seen),
+            Arc::clone(&started),
+        );
         let reader = std::thread::spawn(move || {
-            let (mut seen, mut bad) = (0u64, Vec::new());
+            let mut bad = Vec::new();
+            reader_started.store(true, Ordering::Release);
             while !reader_stop.load(Ordering::Relaxed) {
                 if let Some(sess) = reader_dp.sessions.find_by_ue_ip(ue) {
-                    seen += 1;
                     let fars = sess.fars.read().unwrap();
                     let dl_buffers = fars
                         .get(&2)
@@ -1551,18 +1565,44 @@ mod tests {
                             fars.get(&2).map(|f| f.apply_action)
                         ));
                     }
+                    reader_seen.fetch_add(1, Ordering::AcqRel);
                 }
             }
-            (seen, bad)
+            bad
         });
+        // Wait for the reader to observe `predicate`, bounded so a broken reader fails
+        // the test instead of hanging it.
+        async fn wait_for(what: &str, predicate: impl Fn() -> bool) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !predicate() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for {what}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+        wait_for("the reader to start", || started.load(Ordering::Acquire)).await;
+        const CHECKPOINT: u64 = 50;
         for i in 0..400u64 {
             let seid = 0x1348_0000 + i;
             handle_pfcp_session_event(&dp, established_with_buffering_dl(seid, ue)).await;
+            if i % CHECKPOINT == 0 {
+                let before = seen.load(Ordering::Acquire);
+                wait_for("the reader to find the published session", || {
+                    seen.load(Ordering::Acquire) > before
+                })
+                .await;
+            }
             dp.remove_session_from_pfcp(seid);
         }
         stop.store(true, Ordering::Relaxed);
-        let (seen, bad) = reader.join().unwrap();
-        assert!(seen > 0, "the reader observed the sessions at all");
+        let bad = reader.join().unwrap();
+        let seen = seen.load(Ordering::Acquire);
+        assert!(
+            seen >= 400 / CHECKPOINT,
+            "the reader observed the sessions: {seen}"
+        );
         assert!(
             bad.is_empty(),
             "observed {} of {seen} without their rules: {:?}",

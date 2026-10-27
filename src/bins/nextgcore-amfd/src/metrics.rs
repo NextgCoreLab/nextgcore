@@ -353,7 +353,10 @@ impl AmfMetrics {
         }
     }
 
-    /// Export metrics in Prometheus format
+    /// Export every family of this registry in Prometheus format, the Open5GS
+    /// names included. Test-only (#1334): nothing serves it; `/metrics` is
+    /// [`render_prometheus`], which renders the families the AMF maintains.
+    #[cfg(test)]
     pub fn export_prometheus(&self) -> String {
         let mut output = String::new();
 
@@ -925,19 +928,24 @@ pub fn render_amf_families(out: &mut String, census: &AmfCensus) {
         );
     }
 
+    // Named here, not through `GlobalMetric::name()`: these two are the only
+    // `GlobalMetric` counters anything increments, and the CI series check reads
+    // served families from exposition calls (#1334).
     let g = global();
-    for metric in [
-        GlobalMetric::NgResetUeIdled,
-        GlobalMetric::UeAssociatedRefused,
-    ] {
-        write_metric(
-            out,
-            metric.name(),
-            "counter",
-            metric.description(),
-            g.get(metric),
-        );
-    }
+    write_metric(
+        out,
+        "amf_ng_reset_ue_idled",
+        "counter",
+        GlobalMetric::NgResetUeIdled.description(),
+        g.get(GlobalMetric::NgResetUeIdled),
+    );
+    write_metric(
+        out,
+        "amf_ngap_ue_associated_refused",
+        "counter",
+        GlobalMetric::UeAssociatedRefused.description(),
+        g.get(GlobalMetric::UeAssociatedRefused),
+    );
 }
 
 /// The whole AMF `/metrics` body.
@@ -1100,6 +1108,27 @@ mod tests {
         assert_eq!(ngap_procedure_name(46), "UplinkNASTransport");
         assert_eq!(ngap_procedure_name(75), "BroadcastSessionReleaseRequired");
         assert_eq!(ngap_procedure_name(200), "unknown");
+    }
+
+    /// The two served `GlobalMetric` counters keep the names `GlobalMetric::name()`
+    /// gives them.
+    #[test]
+    fn the_served_global_counters_keep_their_names() {
+        assert_eq!(GlobalMetric::NgResetUeIdled.name(), "amf_ng_reset_ue_idled");
+        assert_eq!(
+            GlobalMetric::UeAssociatedRefused.name(),
+            "amf_ngap_ue_associated_refused"
+        );
+        let mut out = String::new();
+        render_amf_families(&mut out, &AmfCensus::default());
+        assert!(nextgcore_metrics::nf::has_series(
+            &out,
+            "amf_ng_reset_ue_idled"
+        ));
+        assert!(nextgcore_metrics::nf::has_series(
+            &out,
+            "amf_ngap_ue_associated_refused"
+        ));
     }
 
     #[test]

@@ -9,11 +9,9 @@ in the tree, extracts the metric names their PromQL selects, and requires each t
 be one of:
 
 - a family the non-test source of an NF daemon (`src/bins/*/src`) or of the shared
-  exposition (`src/libs/nextgcore-metrics/src`) renders: the name argument of
-  `write_metric` / `write_header` / `CounterFamily::new`, the name of a `# TYPE`
-  line, or, in a file that renders names it holds in variables, a literal that is
-  exactly a metric name. Any other string (a log message) does not count. A
-  histogram's `_bucket` / `_sum` / `_count` series match its base name;
+  exposition (`src/libs/nextgcore-metrics/src`) renders: a literal in a metric-NAME
+  position (see NAME_IN_CALL). A label value, a log message or any other string does
+  not count. A histogram's `_bucket` / `_sum` / `_count` series match its base name;
 - a series Prometheus itself synthesises for every target (`up`,
   `scrape_duration_seconds`, ...);
 - a series a third-party exporter the stack deploys serves (EXTERNAL_EXPORTERS:
@@ -203,32 +201,35 @@ def strip_rust_tests(src):
 
 METRIC_NAME = r"[a-zA-Z_:][a-zA-Z0-9_:]*"
 
-# A metric family the code renders: the name argument of the exposition helpers,
-# and the name in a `# TYPE` line of a hand-written exposition.
-EXPOSITION_CALLS = [
+# A metric family the code renders. Only literals in a metric-NAME position count,
+# never a label value or any other string (#1371, #1372 review):
+#
+# - the name argument of the shared helpers (`write_metric(out, "x", ..)`,
+#   `write_header(out, "x", ..)`, `CounterFamily::new("x", ..)`);
+# - the name in a `# TYPE x <kind>` line of a hand-written exposition;
+# - a literal followed by its metric type, `"x", "counter"` (a local helper such as
+#   ucmfd's `metric(..)`);
+# - the name of a (name, help) pair in a family table, `("x", "Help text ...")`:
+#   the help is prose, which a label pair's value never is;
+# - a `const ..._METRIC: &str = "x"` naming one family.
+NAME_IN_CALL = [
     re.compile(r"\bwrite_(?:metric|header)\(\s*[\w.&]+\s*,\s*\"(" + METRIC_NAME + r")\""),
     re.compile(r"\bCounterFamily::new\(\s*\"(" + METRIC_NAME + r")\""),
+    re.compile(r"\"(" + METRIC_NAME + r")\"\s*,\s*\"(?:counter|gauge|histogram|summary)\""),
+    re.compile(r"\(\s*\"(" + METRIC_NAME + r")\"\s*,\s*\"[^\"]*\s[^\"]*\""),
+    re.compile(r"\bconst\s+[A-Z0-9_]*_METRIC\s*:\s*&str\s*=\s*\"(" + METRIC_NAME + r")\""),
 ]
 TYPE_LINE = re.compile(r"# TYPE (" + METRIC_NAME + r") ")
-# A file that renders names it holds in variables (`# TYPE {name}`, or an exposition
-# helper whose name argument is not a literal): there, a string literal that is
-# exactly a metric-shaped name is a family name too (a table of names, or a const).
-DYNAMIC_EXPOSITION = re.compile(
-    r"# TYPE \{|\bwrite_(?:metric|header)\(\s*[\w.&]+\s*,\s*[^\"\s]")
-WHOLE_NAME = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)+")
 
 
 def exported_from_source(src):
-    """The metric family names one Rust source file renders (#1371 review: names
-    come only from exposition code, never from any string, a log message say)."""
+    """The metric family names one Rust source file renders (see NAME_IN_CALL)."""
     code, literals = strip_rust_tests(src)
     names = set()
-    for rx in EXPOSITION_CALLS:
+    for rx in NAME_IN_CALL:
         names.update(rx.findall(code))
     for lit in literals:
         names.update(TYPE_LINE.findall(lit))
-    if DYNAMIC_EXPOSITION.search(code):
-        names.update(lit for lit in literals if WHOLE_NAME.fullmatch(lit))
     return names
 
 
@@ -256,8 +257,18 @@ def self_test():
         ('fn f() { let k = "sess_id"; }', "sess_id", False),
         # A test module's expectations are no export.
         ('#[cfg(test)]\nmod tests { fn t() { write_metric(out, "z_total", "c", "h", 1); } }', "z_total", False),
-        # A table of names rendered through a variable is.
-        ('const N: [&str; 1] = ["w_dropped_total"];\nfn r() { for n in N { format!("# TYPE {n} counter"); } }', "w_dropped_total", True),
+        # A (name, help) table rendered through a variable is; so is a local
+        # helper given the name and its type, and a `_METRIC` const.
+        ('const F: [(&str, &str); 1] = [("w_dropped_total", "Packets dropped, any cause")];\nfn r() { format!("# TYPE {n} counter"); }', "w_dropped_total", True),
+        ('fn r() { metric("u_refusals_total", "counter", "Refused", 1); }', "u_refusals_total", True),
+        ('pub const DROPS_METRIC: &str = "v_drops_total";', "v_drops_total", True),
+        # #1372 review: a name table nothing serves is no export, even in a file
+        # that renders other names through variables ...
+        ('fn name(&self) -> &str { match self { Self::A => "fivegs_amffunction_rm_reginitreq" } }\nfn r() { format!("# TYPE {name} counter"); }', "fivegs_amffunction_rm_reginitreq", False),
+        # ... and a label value is no series, as a match arm or as a label pair.
+        ('fn label(&self) -> &str { match self { Self::NoPdr => "no_pdr_match" } }\nfn r() { format!("# TYPE {name} counter"); }', "no_pdr_match", False),
+        ('fn r() { labels(&[("reason", "no_pdr_match")]); }', "no_pdr_match", False),
+        ('fn r() { labels(&[("nf_type", "AMF")]); }', "nf_type", False),
     ]
     failures = 0
     for src, name, want in cases:
