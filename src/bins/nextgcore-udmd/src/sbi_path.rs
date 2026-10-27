@@ -105,15 +105,18 @@ pub fn build_udm_nf_profile(
             })
         })
         .collect();
-    serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "UDM",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": services,
-        "allowedNfTypes": config.allowed_nf_types,
-        "heartBeatTimer": config.heart_beat_timer,
-    })
+    nextgcore_sbi::nf_addressing::classify_profile_host(
+        serde_json::json!({
+            "nfInstanceId": nf_instance_id,
+            "nfType": "UDM",
+            "nfStatus": "REGISTERED",
+            "ipv4Addresses": [sbi_addr],
+            "nfServices": services,
+            "allowedNfTypes": config.allowed_nf_types,
+            "heartBeatTimer": config.heart_beat_timer,
+        }),
+        sbi_addr,
+    )
 }
 
 /// Open SBI server and register with NRF
@@ -127,7 +130,7 @@ pub fn udm_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
     // Build self NF instance for UDM
     let nf_instance_id = nextgcore_sbi::nf_instance_id::nf_instance_id(NfType::Udm).to_string();
     let mut nf_instance = NfInstance::new(&nf_instance_id, NfType::Udm);
-    nf_instance.ipv4_addresses.push(config.addr.clone());
+    nextgcore_sbi::nf_addressing::set_instance_host(&mut nf_instance, &config.addr);
 
     // Register every Nudm service this UDM serves, from the shared table so the
     // self instance and the NRF profile cannot disagree (#85).
@@ -275,13 +278,8 @@ pub async fn udm_nrf_discover(
                 .to_string();
             let mut instance = NfInstance::new(&id, target_nf_type);
 
-            if let Some(addrs) = nf_json.get("ipv4Addresses").and_then(|v| v.as_array()) {
-                for addr in addrs {
-                    if let Some(s) = addr.as_str() {
-                        instance.ipv4_addresses.push(s.to_string());
-                    }
-                }
-            }
+            // #1324: IPv4, IPv6 and FQDN alike.
+            nextgcore_sbi::nf_addressing::read_instance_addresses(&mut instance, nf_json);
 
             // Cache discovered instance in SBI context, bounded by validityPeriod
             sbi_ctx
@@ -345,9 +343,8 @@ pub async fn udm_sbi_send_request(
         .ok_or_else(|| format!("NF instance not found: {nf_instance_id}"))?;
 
     let host = nf_instance
-        .ipv4_addresses
-        .first()
-        .ok_or_else(|| format!("NF instance {nf_instance_id} has no IPv4 address"))?;
+        .host()
+        .ok_or_else(|| format!("NF instance {nf_instance_id} has no address"))?;
 
     // Determine port from first service or default
     let port = nf_instance.services.first().map(|s| s.port).unwrap_or(80);
@@ -415,11 +412,7 @@ pub async fn udm_sbi_discover_and_send_nudr_dr(
     let (host_str, port);
     if let Some(udr) = udr_instances.first() {
         selected_instance_id = Some(udr.id.clone());
-        host_str = udr
-            .ipv4_addresses
-            .first()
-            .ok_or("UDR has no IPv4 address")?
-            .clone();
+        host_str = udr.host().ok_or("UDR has no address")?.clone();
         port = udr
             .find_service(SbiServiceType::NudrDr)
             .map(|s| s.port)
@@ -697,10 +690,7 @@ pub async fn udm_amf_send_mt_ue_context_info(
     let sbi_ctx = global_context();
     let amf_instances = sbi_ctx.find_nf_instances_by_type(NfType::Amf).await;
     if let Some(amf) = amf_instances.first() {
-        let host = amf
-            .ipv4_addresses
-            .first()
-            .ok_or("AMF instance has no IPv4 address")?;
+        let host = amf.host().ok_or("AMF instance has no address")?;
         let port = amf.services.first().map(|s| s.port).unwrap_or(80);
         let client = sbi_ctx.get_client(host, port).await;
         return client
@@ -836,10 +826,7 @@ pub async fn udm_ausf_send_sor_protect(
     // 2. Any cached AUSF instance discovered via NRF.
     let ausf_instances = sbi_ctx.find_nf_instances_by_type(NfType::Ausf).await;
     if let Some(ausf) = ausf_instances.first() {
-        let host = ausf
-            .ipv4_addresses
-            .first()
-            .ok_or("AUSF instance has no IPv4 address")?;
+        let host = ausf.host().ok_or("AUSF instance has no address")?;
         let port = ausf.services.first().map(|s| s.port).unwrap_or(80);
         let client = sbi_ctx.get_client(host, port).await;
         return client
@@ -898,10 +885,7 @@ pub async fn udm_ausf_send_upu_protect(
     // 2. Any cached AUSF instance discovered via NRF.
     let ausf_instances = sbi_ctx.find_nf_instances_by_type(NfType::Ausf).await;
     if let Some(ausf) = ausf_instances.first() {
-        let host = ausf
-            .ipv4_addresses
-            .first()
-            .ok_or("AUSF instance has no IPv4 address")?;
+        let host = ausf.host().ok_or("AUSF instance has no address")?;
         let port = ausf.services.first().map(|s| s.port).unwrap_or(80);
         let client = sbi_ctx.get_client(host, port).await;
         return client
@@ -1287,5 +1271,28 @@ mod tests {
             parse_callback_uri("/namf-callback/v1/imsi-001010000000001/dereg-notify"),
             None
         );
+    }
+}
+
+/// #1324: the NFProfile carries its host where its type belongs (TS 29.510
+/// §6.1.6.2.2): IPv4 in ipv4Addresses, IPv6 in ipv6Addresses, an FQDN as fqdn, and
+/// the service ipEndPoints likewise.
+#[cfg(test)]
+mod tests_nf_profile_host_kind_1324 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_carries_its_host_by_type() {
+        for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
+            let profile = build_udm_nf_profile(
+                "id",
+                host,
+                7777,
+                &crate::context::NfProfileConfig::default(),
+            );
+            let problems =
+                nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
+            assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
+        }
     }
 }

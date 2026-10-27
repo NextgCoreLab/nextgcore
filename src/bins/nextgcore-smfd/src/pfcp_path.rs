@@ -996,6 +996,99 @@ pub async fn client_for_peer(
     }
 }
 
+/// The first retry of a refused or unanswered Association Setup (#1341).
+pub const ASSOCIATION_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The wait before the next Association Setup attempt for a peer still not associated
+/// (#1341): 1 s after the first failure, doubling, capped at `cap` (the heartbeat
+/// period). On k8s a restarted SMF's first Setup routinely loses the race with its own
+/// pod IP reaching the UPF's allowlist (the headless `smf-pfcp` Service's DNS): the UPF
+/// refuses it with cause 64, and a fixed 10 s retry was most of the restart's outage.
+pub fn association_retry_after(
+    previous: Option<std::time::Duration>,
+    cap: std::time::Duration,
+) -> std::time::Duration {
+    match previous {
+        None => ASSOCIATION_RETRY_FIRST.min(cap),
+        Some(d) => (d * 2).min(cap),
+    }
+}
+
+/// N4 association maintenance: establish the PFCP association with each peer
+/// (Node ID + Recovery Time Stamp, TS 29.244 §6.2.6) and keep it alive with
+/// heartbeats every `heartbeat_period`. Heartbeat exhaustion or a changed peer
+/// Recovery Time Stamp tears an association down (stale sessions flushed), and the
+/// loop re-associates.
+///
+/// #1341: a peer that is not associated is retried on [`association_retry_after`]'s
+/// backoff rather than once a heartbeat period, while associated peers keep their
+/// heartbeat period: a pending retry wakes the loop early, but heartbeats go out only
+/// when one is due. Runs until `stop` returns true.
+pub async fn run_association_loop<S: Fn() -> bool>(
+    clients: Vec<Arc<PfcpClient>>,
+    stop: S,
+    heartbeat_period: std::time::Duration,
+) {
+    // Per peer (#1343 review): when each unassociated peer is next tried, and the
+    // backoff it is on. A peer that fails later starts again from 1 s, whatever
+    // another peer's backoff has reached.
+    let mut retries: Vec<Option<(tokio::time::Instant, std::time::Duration)>> =
+        vec![None; clients.len()];
+    let mut next_heartbeat = tokio::time::Instant::now() + heartbeat_period;
+    loop {
+        if stop() {
+            break;
+        }
+        let now = tokio::time::Instant::now();
+        for (client, retry) in clients.iter().zip(retries.iter_mut()) {
+            if client.is_associated().await {
+                *retry = None;
+                continue;
+            }
+            if retry.is_some_and(|(due, _)| now < due) {
+                continue;
+            }
+            if let Err(e) = try_associate(client).await {
+                // Abnormal action on association failure: the UPF is unreachable for
+                // now. Handled per peer (issue #20 review): one unreachable UPF must
+                // not starve heartbeats to healthy pool members.
+                let wait = association_retry_after(retry.map(|(_, d)| d), heartbeat_period);
+                log::error!(
+                    "PFCP Association Setup with {} failed: {e}; retrying in {wait:?}",
+                    client.peer()
+                );
+            }
+            *retry = if client.is_associated().await {
+                None
+            } else {
+                let wait = association_retry_after(retry.map(|(_, d)| d), heartbeat_period);
+                Some((tokio::time::Instant::now() + wait, wait))
+            };
+        }
+        let wake = retries
+            .iter()
+            .flatten()
+            .map(|(due, _)| *due)
+            .fold(next_heartbeat, std::cmp::min);
+        tokio::time::sleep_until(wake).await;
+        if stop() {
+            break;
+        }
+        if tokio::time::Instant::now() >= next_heartbeat {
+            for client in &clients {
+                if client.is_associated().await {
+                    if let Err(e) = client.heartbeat_once().await {
+                        // Exhaustion already marked the association down inside the
+                        // engine; the next loop turn re-associates.
+                        log::error!("PFCP heartbeat to {} failed: {e}", client.peer());
+                    }
+                }
+            }
+            next_heartbeat = tokio::time::Instant::now() + heartbeat_period;
+        }
+    }
+}
+
 /// One association attempt for a client that is not associated (#658).
 ///
 /// A UPF named by hostname is re-resolved first, every attempt: a restarted UPF
@@ -3846,6 +3939,154 @@ mod tests {
         assert!(
             client.is_associated().await,
             "the association itself stands; only the sessions were lost"
+        );
+    }
+
+    /// #1341: 1 s, doubling, capped at the heartbeat period; a cap below 1 s caps the
+    /// first retry too.
+    #[test]
+    fn association_retries_back_off_from_one_second_to_the_heartbeat_period() {
+        let cap = Duration::from_secs(10);
+        let mut seen = Vec::new();
+        let mut prev = None;
+        for _ in 0..6 {
+            let d = association_retry_after(prev, cap);
+            seen.push(d.as_secs());
+            prev = Some(d);
+        }
+        assert_eq!(seen, vec![1, 2, 4, 8, 10, 10]);
+        assert_eq!(
+            association_retry_after(None, Duration::from_millis(300)),
+            Duration::from_millis(300)
+        );
+    }
+
+    /// Answer one Association Setup Request on `upf` with cause `cause`.
+    async fn answer_association_setup_with(
+        upf: &UdpSocket,
+        cause: nextgcore_pfcp::types::PfcpCause,
+    ) {
+        let mut buf = vec![0u8; 4096];
+        let (len, from) = upf.recv_from(&mut buf).await.unwrap();
+        let h = parse_wire_header(&buf[..len]).unwrap();
+        assert_eq!(h.msg_type, pfcp_message_type::ASSOCIATION_SETUP_REQUEST);
+        let resp = AssociationSetupResponse::new(NodeId::new_ipv4([127, 0, 0, 4]), cause, 777);
+        let mut body = bytes::BytesMut::new();
+        PfcpMessage::AssociationSetupResponse(resp).encode_body(&mut body);
+        let pkt = encode_wire_message(
+            pfcp_message_type::ASSOCIATION_SETUP_RESPONSE,
+            None,
+            h.sequence_number,
+            &body,
+        );
+        upf.send_to(&pkt, from).await.unwrap();
+    }
+
+    /// **#1341.** A refused first Association Setup (the UPF's allowlist did not
+    /// resolve the restarted SMF's pod IP yet: cause 64) is retried after about a
+    /// second, not after the 10 s heartbeat period: devtest1 run 4 lost 10 s of an SMF
+    /// restart's 16 s outage to that wait.
+    #[tokio::test]
+    async fn a_refused_association_setup_is_retried_within_seconds_not_a_heartbeat_period() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        clear_pfcp_sessions();
+        let (client, upf) = make_client_with_peer().await;
+        let client = Arc::new(client);
+        let upf_task = tokio::spawn(async move {
+            answer_association_setup_with(&upf, nextgcore_pfcp::types::PfcpCause::RequestRejected)
+                .await;
+            answer_association_setup_on(&upf, 778, false).await;
+            upf
+        });
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_loop = Arc::clone(&stop);
+        let started = tokio::time::Instant::now();
+        let looping = tokio::spawn(run_association_loop(
+            vec![Arc::clone(&client)],
+            move || stop_loop.load(std::sync::atomic::Ordering::SeqCst),
+            Duration::from_secs(10),
+        ));
+        let mut associated_after = None;
+        for _ in 0..80 {
+            if client.is_associated().await {
+                associated_after = Some(started.elapsed());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        looping.abort();
+        // Not awaited: with no retry the stand-in waits for a second Setup forever.
+        upf_task.abort();
+        let after = associated_after.expect("associated within 4 s of a refusal");
+        assert!(
+            after >= Duration::from_millis(900) && after < Duration::from_secs(3),
+            "the retry came about 1 s after the refusal: {after:?}"
+        );
+    }
+
+    /// **#1341.** A retrying peer wakes the loop early, but an associated peer's
+    /// heartbeats stay on the heartbeat period. With a 3 s period, the refused peer's
+    /// retries wake the loop at about 1 s and 3 s; over 4 s the associated peer sees
+    /// exactly one Heartbeat Request (at 3 s), not one per wake.
+    #[tokio::test]
+    async fn a_retrying_peer_does_not_make_heartbeats_more_frequent() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        clear_pfcp_sessions();
+        let (healthy, healthy_upf) = make_client_with_peer().await;
+        let (refused, refused_upf) = make_client_with_peer().await;
+        let (healthy, refused) = (Arc::new(healthy), Arc::new(refused));
+        let healthy_task = tokio::spawn(async move {
+            answer_association_setup_on(&healthy_upf, 900, false).await;
+            let mut heartbeats = 0;
+            while tokio::time::timeout(
+                Duration::from_secs(4),
+                answer_heartbeat_on(&healthy_upf, 900),
+            )
+            .await
+            .is_ok()
+            {
+                heartbeats += 1;
+            }
+            heartbeats
+        });
+        let refused_task = tokio::spawn(async move {
+            let mut refusals = 0;
+            while tokio::time::timeout(
+                Duration::from_secs(4),
+                answer_association_setup_with(
+                    &refused_upf,
+                    nextgcore_pfcp::types::PfcpCause::RequestRejected,
+                ),
+            )
+            .await
+            .is_ok()
+            {
+                refusals += 1;
+            }
+            refusals
+        });
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_loop = Arc::clone(&stop);
+        let looping = tokio::spawn(run_association_loop(
+            vec![Arc::clone(&healthy), Arc::clone(&refused)],
+            move || stop_loop.load(std::sync::atomic::Ordering::SeqCst),
+            Duration::from_secs(3),
+        ));
+        tokio::time::sleep(Duration::from_millis(4000)).await;
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        looping.abort();
+        let heartbeats = healthy_task.await.unwrap();
+        let refusals = refused_task.await.unwrap();
+        assert!(
+            refusals >= 3,
+            "the refused peer is retried on the backoff: {refusals}"
+        );
+        assert_eq!(
+            heartbeats, 1,
+            "the healthy peer keeps its 3 s heartbeat period, not one per retry wake"
         );
     }
 

@@ -24,6 +24,14 @@
 //!   release of a context nobody will use must reach the peer whatever the UE
 //!   does next. Neither `supersede_key`, `settle_key` nor `cancel_ue` drops it,
 //!   so a departed UE's release is still sent.
+//! - [`SbiOffload::spawn_keyed_requeueable`] is durable keyed work that can hand
+//!   its key back while it waits, and re-queue itself for the same key afterwards
+//!   ([`Requeuer::requeue_when`]): a retry's backoff (#1329 review) then holds
+//!   neither the key nor a permit, so the session's own exchanges submitted
+//!   meanwhile (a Service Request's ACTIVATING, a release) run instead of waiting
+//!   behind it. Each attempt is still a keyed job, serialised with the session's
+//!   other exchanges; a re-queued attempt goes behind what was submitted while it
+//!   waited. The re-queue follows a [`SbiOffload::rekey_ue`].
 //!
 //! # Started means holding a permit (#877 re-review M1)
 //! A keyed job is STARTED only once its task holds a concurrency permit: then,
@@ -91,10 +99,85 @@ pub(crate) enum SbiOutcome {
 /// What keyed work is serialised on: (AMF UE NGAP ID, PDU session ID).
 pub(crate) type SbiKey = (u64, u8);
 
-type BoxedWork = Pin<Box<dyn Future<Output = Option<SbiOutcome>> + Send>>;
+pub(crate) type BoxedWork = Pin<Box<dyn Future<Output = Option<SbiOutcome>> + Send>>;
 /// Keyed work is built only when it is its turn, so a superseded exchange is
 /// never even constructed, let alone sent.
 type Job = Box<dyn FnOnce() -> BoxedWork + Send>;
+/// Keyed work that may re-queue itself (see [`SbiOffload::spawn_keyed_requeueable`]).
+pub(crate) type RequeueableJob = Box<dyn FnOnce(Requeuer) -> BoxedWork + Send>;
+
+/// The key a requeueable job re-queues on. Shared with the offload, which moves it
+/// on a [`SbiOffload::rekey_ue`]; read and written only on the NGAP task (the
+/// mutex is for `Send`).
+type KeyCell = Arc<std::sync::Mutex<SbiKey>>;
+
+fn key_of(cell: &KeyCell) -> SbiKey {
+    *cell
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Counts a spawned task as in flight until dropped, so [`SbiOffload::settle`]
+/// waits for it; an aborted task is counted out too.
+struct InFlight(Arc<std::sync::atomic::AtomicUsize>);
+
+impl InFlight {
+    fn new(spawned: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        spawned.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self(Arc::clone(spawned))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Handed to a requeueable job: lets it queue its next attempt for its key once
+/// `wait` is over, without holding the key or a permit meanwhile.
+pub(crate) struct Requeuer {
+    tx: mpsc::UnboundedSender<Report>,
+    spawned: Arc<std::sync::atomic::AtomicUsize>,
+    cell: KeyCell,
+    #[cfg(test)]
+    spawned_tasks: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
+}
+
+impl Requeuer {
+    /// Run `wait` on its own task, holding no permit and not the key, then queue
+    /// the job it yields as durable keyed work for this job's key (as it is then:
+    /// a rekey is followed). The current job should return right after this.
+    pub(crate) fn requeue_when<W>(self, wait: W)
+    where
+        W: Future<Output = RequeueableJob> + Send + 'static,
+    {
+        let Requeuer {
+            tx,
+            spawned,
+            cell,
+            #[cfg(test)]
+            spawned_tasks,
+        } = self;
+        // Counted until the re-queue is applied on the NGAP task, so `settle` never
+        // sees "nothing left" between this task's end and that.
+        let counted = InFlight::new(&spawned);
+        let handle = tokio::spawn(async move {
+            let job = wait.await;
+            let _ = tx.send(Report::Requeue { cell, job, counted });
+        });
+        #[cfg(test)]
+        {
+            let mut tasks = spawned_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            tasks.retain(|t| !t.is_finished());
+            tasks.push(handle.abort_handle());
+        }
+        #[cfg(not(test))]
+        drop(handle);
+    }
+}
 
 /// What a spawned task sends back.
 enum Report {
@@ -102,6 +185,12 @@ enum Report {
     /// The keyed exchange `job` finished (its outcome, if any, was sent first).
     KeyDone {
         job: u64,
+    },
+    /// A requeueable job's wait is over: queue `job` for the key in `cell`.
+    Requeue {
+        cell: KeyCell,
+        job: RequeueableJob,
+        counted: InFlight,
     },
 }
 
@@ -172,6 +261,11 @@ pub(crate) struct SbiOffload {
     ready: VecDeque<SbiOutcome>,
     /// Spawned and not yet finished, permit or not (for [`SbiOffload::settle`]).
     spawned: Arc<std::sync::atomic::AtomicUsize>,
+    /// The keys of requeueable jobs, queued, running or waiting to re-queue, so a
+    /// rekey moves them (dead ones are pruned as the list grows).
+    requeue_keys: Vec<std::sync::Weak<std::sync::Mutex<SbiKey>>>,
+    /// Prune `requeue_keys` once it is this long.
+    requeue_keys_prune_at: usize,
     /// Tasks that have reached the semaphore and not yet taken a permit.
     ///
     /// A test-only observable, and the one the #877 M1 reproduction needs:
@@ -189,7 +283,7 @@ pub(crate) struct SbiOffload {
     /// stand-in and send it a request (#1205). The production server is never
     /// dropped.
     #[cfg(test)]
-    spawned_tasks: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
+    spawned_tasks: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
 }
 
 #[cfg(test)]
@@ -230,10 +324,12 @@ impl SbiOffload {
             next_job: 1,
             ready: VecDeque::new(),
             spawned: Arc::default(),
+            requeue_keys: Vec::new(),
+            requeue_keys_prune_at: 64,
             #[cfg(test)]
             at_the_gate: Arc::default(),
             #[cfg(test)]
-            spawned_tasks: std::sync::Mutex::default(),
+            spawned_tasks: Arc::default(),
         }
     }
 
@@ -290,6 +386,39 @@ impl SbiOffload {
             Box::new(move || Box::pin(make()) as BoxedWork),
             Kind::Durable,
         );
+    }
+
+    /// [`SbiOffload::spawn_keyed_durable`] for work that may hand its key back while
+    /// it waits (a retry's backoff, a turn at a limiter), through the [`Requeuer`]
+    /// it is given: the work queued after it for the key then runs meanwhile, and
+    /// the next attempt is queued behind it. Nothing drops it.
+    pub(crate) fn spawn_keyed_requeueable(&mut self, key: SbiKey, job: RequeueableJob) {
+        let cell: KeyCell = Arc::new(std::sync::Mutex::new(key));
+        if self.requeue_keys.len() >= self.requeue_keys_prune_at {
+            self.requeue_keys.retain(|w| w.strong_count() > 0);
+            self.requeue_keys_prune_at = (self.requeue_keys.len() * 2).max(64);
+        }
+        self.requeue_keys.push(Arc::downgrade(&cell));
+        self.enqueue_requeueable(cell, job);
+    }
+
+    fn enqueue_requeueable(&mut self, cell: KeyCell, job: RequeueableJob) {
+        let key = key_of(&cell);
+        let requeuer = Requeuer {
+            tx: self.tx.clone(),
+            spawned: Arc::clone(&self.spawned),
+            cell,
+            #[cfg(test)]
+            spawned_tasks: Arc::clone(&self.spawned_tasks),
+        };
+        self.enqueue(key, Box::new(move || job(requeuer)), Kind::Durable);
+    }
+
+    /// Apply a [`Report::Requeue`]: the job goes behind what is queued for its key.
+    fn requeue(&mut self, cell: KeyCell, job: RequeueableJob, counted: InFlight) {
+        self.enqueue_requeueable(cell, job);
+        // Only now: the key is busy again before `settle` can see nothing in flight.
+        drop(counted);
     }
 
     fn enqueue(&mut self, key: SbiKey, job: Job, kind: Kind) {
@@ -425,6 +554,19 @@ impl SbiOffload {
                 self.keys.insert((new, key.1), queue);
             }
         }
+        // A requeueable job waiting to re-queue follows too.
+        self.requeue_keys.retain(|w| {
+            let Some(cell) = w.upgrade() else {
+                return false;
+            };
+            let mut key = cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if key.0 == old {
+                key.0 = new;
+            }
+            true
+        });
     }
 
     /// The next outcome ready to apply, without waiting. Starts the next keyed
@@ -437,6 +579,7 @@ impl SbiOffload {
             match report {
                 Report::Outcome(outcome) => return Some(outcome),
                 Report::KeyDone { job } => self.key_done(job),
+                Report::Requeue { cell, job, counted } => self.requeue(cell, job, counted),
             }
         }
         None
@@ -455,6 +598,7 @@ impl SbiOffload {
         match self.rx.recv().await {
             Some(Report::Outcome(outcome)) => self.ready.push_back(outcome),
             Some(Report::KeyDone { job }) => self.key_done(job),
+            Some(Report::Requeue { cell, job, counted }) => self.requeue(cell, job, counted),
             // The sender lives in `self`, so the channel never closes.
             None => std::future::pending().await,
         }
@@ -486,6 +630,7 @@ impl SbiOffload {
                 match report {
                     Report::Outcome(outcome) => self.ready.push_back(outcome),
                     Report::KeyDone { job } => self.key_done(job),
+                    Report::Requeue { cell, job, counted } => self.requeue(cell, job, counted),
                 }
             }
             if self.spawned.load(std::sync::atomic::Ordering::Acquire) == 0 && self.keys.is_empty()
@@ -547,18 +692,9 @@ impl SbiOffload {
     ) -> JoinHandle<()> {
         let tx = self.tx.clone();
         let permits = Arc::clone(&self.permits);
-        let spawned = Arc::clone(&self.spawned);
-        spawned.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        // Decremented on drop, so an aborted task is counted out too.
-        struct Done(Arc<std::sync::atomic::AtomicUsize>);
-        impl Drop for Done {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            }
-        }
         // Built here and moved in, so a task aborted before its first poll (a
         // waiting job that was cancelled) still counts itself out when dropped.
-        let done = Done(spawned);
+        let done = InFlight::new(&self.spawned);
         #[cfg(test)]
         let at_the_gate = Arc::clone(&self.at_the_gate);
         let handle = tokio::spawn(async move {
@@ -1048,6 +1184,87 @@ mod tests {
         assert!(
             aborted > 0 && started > 0,
             "the race was not exercised: aborted {aborted}, started {started} of 1000"
+        );
+    }
+
+    /// #1329 follow-up: a requeueable job that waits (a retry's backoff) hands back
+    /// its key AND its permit meanwhile, so the session's next exchange runs at once
+    /// even with one permit; its next attempt is queued behind that exchange, on the
+    /// UE's key as it is then (a rekey is followed), and `settle` waits for it.
+    ///
+    /// REVERT-VERIFIED: with `rekey_ue` not moving the requeue keys, the retry is
+    /// queued on the old key. (The key handed back during the wait is revert-verified
+    /// end to end by `a_service_request_s_activating_is_not_held_behind_a_failing_\
+    /// serving_update`.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_requeueable_job_hands_its_key_back_while_it_waits_and_follows_a_rekey() {
+        let (old, new) = (1_329_001u64, 1_329_002u64);
+        let mut offload = SbiOffload::new(1);
+        let seen: Arc<std::sync::Mutex<Vec<&'static str>>> = Arc::default();
+        let (release, gate) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        {
+            let (seen, release, gate) =
+                (Arc::clone(&seen), Arc::clone(&release), Arc::clone(&gate));
+            offload.spawn_keyed_requeueable(
+                (old, 5),
+                Box::new(move |requeue| {
+                    Box::pin(async move {
+                        seen.lock().expect("seen").push("first try");
+                        requeue.requeue_when(async move {
+                            release.notified().await;
+                            Box::new(move |_| {
+                                Box::pin(async move {
+                                    gate.notified().await;
+                                    seen.lock().expect("seen").push("retry");
+                                    None
+                                }) as BoxedWork
+                            }) as RequeueableJob
+                        });
+                        None
+                    })
+                }),
+            );
+        }
+        let next = Arc::clone(&seen);
+        offload.spawn_keyed((old, 5), move || async move {
+            next.lock().expect("seen").push("activating");
+            None
+        });
+        let drained = |offload: &mut SbiOffload| while offload.try_recv().is_some() {};
+        for _ in 0..400 {
+            drained(&mut offload);
+            if seen.lock().expect("seen").len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            vec!["first try", "activating"],
+            "the session's next exchange ran while the retry waited"
+        );
+
+        offload.rekey_ue(old, new);
+        release.notify_one();
+        for _ in 0..400 {
+            drained(&mut offload);
+            if offload.key_busy((new, 5)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            offload.key_busy((new, 5)) && !offload.key_busy((old, 5)),
+            "the retry is queued on the UE's new key"
+        );
+        gate.notify_one();
+        offload.settle().await;
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            vec!["first try", "activating", "retry"]
         );
     }
 }

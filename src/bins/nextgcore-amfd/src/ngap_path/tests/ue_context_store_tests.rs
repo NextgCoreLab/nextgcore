@@ -270,6 +270,632 @@ async fn a_restored_ue_s_service_request_reactivates_its_stored_session() {
     crash(&mut after, sr_id);
 }
 
+/// **#1329.** After its own restart this AMF instance has a new address (its pod IP), but
+/// the UDM, the SMF and the PCF of a restored UE still hold the callback addresses of the
+/// process that stored it. At the UE's first verified message the AMF gives them its
+/// own, as a takeover does (TS 23.501 §5.21.2.3: "the new AMF updates the peer NFs ...
+/// with the new AMF information"), the SMF before the re-activation, so the SMF's
+/// release notification after its own restart reaches this AMF (devtest1 run 4: it went
+/// to the dead pod and the UE kept a PDU session that existed nowhere). The GUAMI is
+/// unchanged, so no new 5G-GUTI is owed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restarted_amf_points_a_restored_ue_s_peers_at_itself_at_its_first_message() {
+    let (_smf, port, seen) = fake_activating_smf().await;
+    let (_selected, selected_port, _selected_seen) = fake_activating_smf().await;
+    let (_udm, udm_port, udm_seen) = fake_activating_smf().await;
+    let (_pcf, pcf_port, pcf_seen) = fake_activating_smf().await;
+    let _env = SmfEnvGuard::acquire(selected_port).await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let backend = Arc::new(MemoryBackend::default());
+    let (old_id, sr_id, tmsi) = (13_290_101u64, 13_290_103u64, 0x1329_0101u32);
+    let supi = "imsi-001010001329101";
+
+    let mut before = storing_server(&backend).await;
+    seed_registered_ue(&mut before, old_id, tmsi, supi, "ref-1329-a", port, false);
+    before.ue_auth_state.with_mut(old_id, |s| {
+        s.amf_ue.policy_association.id = Some("am-pol-1329".to_string());
+        s.policy_association_id = Some("am-pol-1329".to_string());
+        s.amf_ue.ue_policy_association.id = Some("ue-pol-1329".to_string());
+        s.ue_policy_association_id = Some("ue-pol-1329".to_string());
+    });
+    let original = before.ue_auth_state.get(old_id).expect("seeded");
+    store_now(&mut before).await;
+    crash(&mut before, old_id);
+    drop(before);
+
+    // The same instance comes back (no takeover: the record is its own).
+    let backend = only(&backend, supi);
+    let mut after = storing_server(&backend).await;
+    after.udm_override = Some(("127.0.0.1".to_string(), udm_port));
+    after.pcf_override = Some(("127.0.0.1".to_string(), pcf_port));
+    open_with(
+        &mut after,
+        Arc::clone(&backend) as Arc<dyn UeContextBackend>,
+    )
+    .await;
+    let (_, restored) = after.ue_auth_state.find_by_supi(supi).expect("restored");
+    assert!(
+        restored.peers_stale,
+        "the peers are owed this process's addresses"
+    );
+    assert!(!restored.taken_over, "not a takeover");
+    settle_offloaded_sbi(&mut after).await;
+    // Review M1: the SMF learns this AMF at restore; the UDM and PCF wait for the UE.
+    assert!(
+        seen.lock().unwrap().iter().any(|(uri, body)| {
+            uri.contains("/sm-contexts/ref-1329-a/modify") && body.contains("servingNfId")
+        }),
+        "the SMF is told at restore: {:?}",
+        seen.lock().unwrap()
+    );
+    assert!(
+        udm_seen.lock().unwrap().is_empty() && pcf_seen.lock().unwrap().is_empty(),
+        "the UDM and the PCF wait for the UE's verified message"
+    );
+
+    after.forced_amf_ue_ngap_id = Some(sr_id);
+    let nas = protected_idle_service_request(&restored.amf_ue, tmsi, original.amf_ue.ul_count + 1);
+    after
+        .handle_initial_ue_message(1, &service_request_initial_ue(nas))
+        .await
+        .expect("handled");
+    for _ in 0..3 {
+        settle_offloaded_sbi(&mut after).await;
+    }
+    let instance = nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf);
+
+    let calls = seen.lock().unwrap().clone();
+    let serving = calls
+        .iter()
+        .position(|(uri, body)| {
+            uri.contains("/sm-contexts/ref-1329-a/modify") && body.contains("servingNfId")
+        })
+        .unwrap_or_else(|| panic!("the SMF is given this AMF's addresses: {calls:?}"));
+    let body: serde_json::Value = serde_json::from_str(&calls[serving].1).expect("json");
+    assert_eq!(body["servingNfId"], instance);
+    assert_eq!(
+        body["smContextStatusUri"],
+        crate::sbi_path::sm_context_status_uri(supi, 5)
+    );
+    let activating = calls
+        .iter()
+        .position(|(uri, body)| {
+            uri.contains("/sm-contexts/ref-1329-a/modify") && body.contains("ACTIVATING")
+        })
+        .unwrap_or_else(|| panic!("the session is re-activated: {calls:?}"));
+    assert!(serving < activating, "the SMF learns first: {calls:?}");
+
+    let udm = udm_seen.lock().unwrap().clone();
+    assert!(
+        udm.iter().any(|(uri, _)| uri.ends_with(&format!(
+            "/nudm-uecm/v1/{supi}/registrations/amf-3gpp-access"
+        ))),
+        "the UDM gets a deregCallbackUri of this process: {udm:?}"
+    );
+    let pcf = pcf_seen.lock().unwrap().clone();
+    for suffix in [
+        "/npcf-am-policy-control/v1/policies/am-pol-1329/update",
+        "/npcf-ue-policy-control/v1/policies/ue-pol-1329/update",
+    ] {
+        assert!(
+            pcf.iter().any(|(uri, _)| uri.ends_with(suffix)),
+            "{suffix} at the PCF: {pcf:?}"
+        );
+    }
+
+    let ue = after.ue_auth_state.get(sr_id).expect("resumed");
+    assert!(!ue.peers_stale, "owed once");
+    assert!(
+        !ue.guti_reallocation_owed,
+        "the GUAMI is unchanged: no new 5G-GUTI"
+    );
+    assert_eq!(ue.amf_ue.current_guti, original.amf_ue.current_guti);
+    crash(&mut after, sr_id);
+}
+
+/// What a stand-in SMF records: each request as (path, JSON body), and when each
+/// serving-AMF update ("serving") and each ACTIVATING ("activating") arrived.
+type Seen = Arc<std::sync::Mutex<Vec<(String, String)>>>;
+type Arrivals = Arc<std::sync::Mutex<Vec<(&'static str, std::time::Instant)>>>;
+
+/// A stand-in SMF that answers its `n`th serving-AMF update (from 1) with
+/// `serving(n)`, an ACTIVATING with an N2 SM transfer, and anything else with `204`.
+async fn scripted_smf(
+    serving: impl Fn(usize) -> nextgcore_sbi::message::SbiResponse + Send + Sync + 'static,
+) -> (nextgcore_sbi::server::SbiServer, u16, Seen, Arrivals) {
+    use base64::Engine as _;
+    use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+    use nextgcore_sbi::server::{SbiServer as NSbiServer, SbiServerConfig as NSbiCfg};
+    let seen: Seen = Arc::default();
+    let arrivals: Arrivals = Arc::default();
+    let (sink, times) = (Arc::clone(&seen), Arc::clone(&arrivals));
+    let serving = Arc::new(serving);
+    let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let server = NSbiServer::on_listener(NSbiCfg::new(addr), listener);
+    server
+        .start(move |req: SReq| {
+            let (sink, times, serving) =
+                (Arc::clone(&sink), Arc::clone(&times), Arc::clone(&serving));
+            async move {
+                let body = req.http.content.clone().unwrap_or_default();
+                sink.lock()
+                    .unwrap()
+                    .push((req.header.uri.clone(), body.clone()));
+                if body.contains("servingNfId") {
+                    let n = {
+                        let mut times = times.lock().unwrap();
+                        times.push(("serving", std::time::Instant::now()));
+                        times.iter().filter(|(what, _)| *what == "serving").count()
+                    };
+                    serving(n)
+                } else if body.contains("ACTIVATING") {
+                    times
+                        .lock()
+                        .unwrap()
+                        .push(("activating", std::time::Instant::now()));
+                    let n2 = base64::engine::general_purpose::STANDARD.encode([0xA5, 0x18, 0x05]);
+                    SResp::with_status(200).with_body(
+                        serde_json::json!({
+                            "upCnxState": "ACTIVATING",
+                            "n2SmInfoType": "PDU_RES_SETUP_REQ",
+                            "n2SmInfo": n2,
+                        })
+                        .to_string(),
+                        "application/json",
+                    )
+                } else {
+                    SResp::no_content()
+                }
+            }
+        })
+        .await
+        .expect("stand-in starts");
+    for _ in 0..200 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    (server, addr.port(), seen, arrivals)
+}
+
+/// A stand-in SMF that answers `500` to the first `fail` serving-AMF updates, then
+/// `204`; it records every request.
+async fn flaky_smf(fail: usize) -> (nextgcore_sbi::server::SbiServer, u16, Seen) {
+    let (server, port, seen, _) = scripted_smf(move |n| {
+        if n <= fail {
+            nextgcore_sbi::message::SbiResponse::with_status(500)
+        } else {
+            nextgcore_sbi::message::SbiResponse::no_content()
+        }
+    })
+    .await;
+    (server, port, seen)
+}
+
+/// How many serving-AMF updates `seen` holds.
+fn serving_updates(seen: &Seen) -> usize {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, b)| b.contains("servingNfId"))
+        .count()
+}
+
+/// Settle and apply the offloaded work until `done` holds (up to about 3 s).
+async fn settle_until(server: &mut NgapServer, mut done: impl FnMut() -> bool) {
+    for _ in 0..60 {
+        settle_offloaded_sbi(server).await;
+        if done() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Store UE `supi` on one AMF, "crash" it, and restore it on a fresh one of the same
+/// instance, with the UDM and PCF stand-ins pinned. Returns the restarted AMF and the
+/// UE as it was stored.
+async fn restarted_with(
+    id: u64,
+    tmsi: u32,
+    supi: &str,
+    sm_ref: &str,
+    smf_port: u16,
+    udm_port: u16,
+    pcf_port: u16,
+) -> (NgapServer, UeNasContext) {
+    let backend = Arc::new(MemoryBackend::default());
+    let mut before = storing_server(&backend).await;
+    seed_registered_ue(&mut before, id, tmsi, supi, sm_ref, smf_port, false);
+    before.ue_auth_state.with_mut(id, |s| {
+        s.amf_ue.policy_association.id = Some(format!("am-{sm_ref}"));
+        s.policy_association_id = Some(format!("am-{sm_ref}"));
+    });
+    let original = before.ue_auth_state.get(id).expect("seeded");
+    store_now(&mut before).await;
+    crash(&mut before, id);
+    drop(before);
+    let backend = only(&backend, supi);
+    let mut after = storing_server(&backend).await;
+    after.udm_override = Some(("127.0.0.1".to_string(), udm_port));
+    after.pcf_override = Some(("127.0.0.1".to_string(), pcf_port));
+    open_with(
+        &mut after,
+        Arc::clone(&backend) as Arc<dyn UeContextBackend>,
+    )
+    .await;
+    (after, original)
+}
+
+/// **#1329 review M1.** A restored UE that stays CM-IDLE must still be pageable: the SMF
+/// pages it through the `smContextStatusUri` it holds (smfd's paging
+/// N1N2MessageTransfer goes to that URI's authority), and after the restart that was
+/// the dead pod's. So at restore, with no message from the UE, each SMF gets this AMF's
+/// `servingNfId` and an `smContextStatusUri` of THIS process. Nothing goes to the UDM
+/// or the PCF yet, and the UE stays idle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restored_idle_ue_s_smf_is_given_this_amf_at_restore_so_downlink_pages_it_here() {
+    let (_smf, port, seen) = fake_activating_smf().await;
+    let (_udm, udm_port, udm_seen) = fake_activating_smf().await;
+    let (_pcf, pcf_port, pcf_seen) = fake_activating_smf().await;
+    let _env = SmfEnvGuard::acquire(port).await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let supi = "imsi-001010001329201";
+    let (mut after, _) = restarted_with(
+        13_290_201,
+        0x1329_0201,
+        supi,
+        "ref-1329-p",
+        port,
+        udm_port,
+        pcf_port,
+    )
+    .await;
+    settle_offloaded_sbi(&mut after).await;
+
+    let calls = seen.lock().unwrap().clone();
+    let (_, body) = calls
+        .iter()
+        .find(|(uri, body)| {
+            uri.contains("/sm-contexts/ref-1329-p/modify") && body.contains("servingNfId")
+        })
+        .unwrap_or_else(|| panic!("the SMF is told at restore: {calls:?}"));
+    let body: serde_json::Value = serde_json::from_str(body).expect("json");
+    let instance = nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf);
+    assert_eq!(body["servingNfId"], instance);
+    let status_uri = crate::sbi_path::sm_context_status_uri(supi, 5);
+    assert_eq!(body["smContextStatusUri"], status_uri);
+    assert!(
+        status_uri.starts_with("http"),
+        "absolute, this process's authority: {status_uri}"
+    );
+    assert_eq!(body["guami"]["amfId"], "02556a", "the unchanged GUAMI");
+    assert!(
+        udm_seen.lock().unwrap().is_empty() && pcf_seen.lock().unwrap().is_empty(),
+        "the UDM and the PCF wait for the UE"
+    );
+    let (id, ue) = after.ue_auth_state.find_by_supi(supi).expect("restored");
+    assert!(ue.cm_idle && ue.peers_stale, "still idle, UDM/PCF owed");
+    crash(&mut after, id);
+}
+
+/// **#1329 review.** A serving-AMF update the SMF refuses is retried with backoff, not
+/// dropped: two 500s, then it lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_serving_amf_update_is_retried_until_the_smf_takes_it() {
+    let (_smf, port, seen) = flaky_smf(2).await;
+    let (_udm, udm_port, _) = fake_activating_smf().await;
+    let (_pcf, pcf_port, _) = fake_activating_smf().await;
+    let _env = SmfEnvGuard::acquire(port).await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let supi = "imsi-001010001329301";
+    let (mut after, _) = restarted_with(
+        13_290_301,
+        0x1329_0301,
+        supi,
+        "ref-1329-r",
+        port,
+        udm_port,
+        pcf_port,
+    )
+    .await;
+    // Three tries: two backoffs of 20 and 40 ms in tests.
+    for _ in 0..20 {
+        settle_offloaded_sbi(&mut after).await;
+        let n = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, b)| b.contains("servingNfId"))
+            .count();
+        if n >= 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let tries = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, b)| b.contains("servingNfId"))
+        .count();
+    assert_eq!(
+        tries,
+        3,
+        "two refusals, then accepted: {:?}",
+        seen.lock().unwrap()
+    );
+    let (id, _) = after.ue_auth_state.find_by_supi(supi).expect("restored");
+    crash(&mut after, id);
+}
+
+/// **#1329 follow-up, review MINOR 1.** A definitive 4xx is not asked again: an SMF
+/// that lost the SM context answers 404, and four more tries cannot change that. One
+/// attempt, then the update is given up (and logged). A 5xx is still retried (above).
+///
+/// REVERT-VERIFIED: with every error retryable, the SMF sees 5 updates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_definitive_4xx_to_a_serving_amf_update_is_not_retried() {
+    let (_smf, port, seen, _) =
+        scripted_smf(|_| nextgcore_sbi::message::SbiResponse::with_status(404)).await;
+    let (_udm, udm_port, _) = fake_activating_smf().await;
+    let (_pcf, pcf_port, _) = fake_activating_smf().await;
+    let _env = SmfEnvGuard::acquire(port).await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let supi = "imsi-001010001329501";
+    let (mut after, _) = restarted_with(
+        13_290_501,
+        0x1329_0501,
+        supi,
+        "ref-1329-n",
+        port,
+        udm_port,
+        pcf_port,
+    )
+    .await;
+    // `settle` waits out any retry too; the sleep is longer than the whole test
+    // backoff (20 + 40 + 80 + 160 ms), so a retry would show either way.
+    settle_offloaded_sbi(&mut after).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    settle_offloaded_sbi(&mut after).await;
+    assert_eq!(
+        serving_updates(&seen),
+        1,
+        "a 404 is not retried: {:?}",
+        seen.lock().unwrap()
+    );
+    let (id, _) = after.ue_auth_state.find_by_supi(supi).expect("restored");
+    crash(&mut after, id);
+}
+
+/// **#1329 follow-up, review MINOR 2.** A failing serving-AMF update does not hold its
+/// session's key through its backoff: the restored UE's Service Request re-activates
+/// the session at once, between the update's tries, instead of after all of them. The
+/// SMF answers each update `503` with `Retry-After: 1`, which is honoured but capped
+/// (300 ms in tests), so the update keeps failing for about 1.2 s.
+///
+/// REVERT-VERIFIED: with the backoff slept inside the keyed job, the ACTIVATING
+/// reaches the SMF only after the fifth update; with only the first backoff slept
+/// inside it (then re-queued), the ACTIVATING is a backoff late.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_service_request_s_activating_is_not_held_behind_a_failing_serving_update() {
+    let (_smf, port, seen, arrivals) = scripted_smf(|_| {
+        nextgcore_sbi::message::SbiResponse::with_status(503).with_header("Retry-After", "1")
+    })
+    .await;
+    let (_udm, udm_port, _) = fake_activating_smf().await;
+    let (_pcf, pcf_port, _) = fake_activating_smf().await;
+    let _env = SmfEnvGuard::acquire(port).await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let (sr_id, tmsi, supi) = (13_290_603u64, 0x1329_0601u32, "imsi-001010001329601");
+    let (mut after, original) = restarted_with(
+        13_290_601,
+        tmsi,
+        supi,
+        "ref-1329-s",
+        port,
+        udm_port,
+        pcf_port,
+    )
+    .await;
+    let (_, restored) = after.ue_auth_state.find_by_supi(supi).expect("restored");
+    after.forced_amf_ue_ngap_id = Some(sr_id);
+    let nas = protected_idle_service_request(&restored.amf_ue, tmsi, original.amf_ue.ul_count + 1);
+    after
+        .handle_initial_ue_message(1, &service_request_initial_ue(nas))
+        .await
+        .expect("handled");
+    settle_until(&mut after, || serving_updates(&seen) >= 5).await;
+
+    let calls = seen.lock().unwrap().clone();
+    let updates: Vec<usize> = calls
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, b))| b.contains("servingNfId"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(updates.len(), 5, "a 503 is retried, 5 tries: {calls:?}");
+    let activating = calls
+        .iter()
+        .position(|(uri, body)| {
+            uri.contains("/sm-contexts/ref-1329-s/modify") && body.contains("ACTIVATING")
+        })
+        .unwrap_or_else(|| panic!("the session is re-activated: {calls:?}"));
+    assert!(
+        activating < updates[1],
+        "the ACTIVATING goes out during the first backoff, not after the update gives up: \
+         {calls:?}"
+    );
+    let arrived = arrivals.lock().unwrap().clone();
+    let at = |what: &str| -> Vec<std::time::Instant> {
+        arrived
+            .iter()
+            .filter(|(w, _)| *w == what)
+            .map(|(_, t)| *t)
+            .collect()
+    };
+    let (times, activated) = (at("serving"), at("activating"));
+    let gap = times[1] - times[0];
+    assert!(
+        gap >= Duration::from_millis(250) && gap < Duration::from_millis(900),
+        "Retry-After honoured, capped at 300 ms: {gap:?}"
+    );
+    // Review of #1344, MINOR 1: not even one backoff late. Held through the first
+    // backoff (300 ms) the ACTIVATING would still precede the second update.
+    let late = activated[0].saturating_duration_since(times[0]);
+    assert!(
+        late < Duration::from_millis(150),
+        "the ACTIVATING does not wait out the first backoff: {late:?} after the first update"
+    );
+    let ue = after.ue_auth_state.get(sr_id).expect("resumed");
+    assert!(!ue.cm_idle, "CM-CONNECTED again");
+    crash(&mut after, sr_id);
+}
+
+/// **#1329 follow-up, review MINOR 3.** A restore of many UEs while their SMF is
+/// blackholed (it accepts and never answers) holds at most the restore's share of the
+/// offload's permits, so a regular offloaded exchange still runs at once.
+///
+/// REVERT-VERIFIED: without the restore limits all 16 permits hang on the SMF and the
+/// regular exchange waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restore_with_its_smf_blackholed_leaves_the_offload_to_regular_signalling() {
+    const UES: u64 = 20;
+    let (_blackhole, port) = super::handler_tests::hanging_smf();
+    let _env = SmfEnvGuard::acquire(port).await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let supi = |i: u64| format!("imsi-0010100013297{i:02}");
+    let backend = Arc::new(MemoryBackend::default());
+    let mut before = storing_server(&backend).await;
+    for i in 0..UES {
+        seed_registered_ue(
+            &mut before,
+            13_290_700 + i,
+            0x1329_0700 + i as u32,
+            &supi(i),
+            &format!("ref-1329-b{i}"),
+            port,
+            false,
+        );
+    }
+    store_now(&mut before).await;
+    for i in 0..UES {
+        crash(&mut before, 13_290_700 + i);
+    }
+    drop(before);
+    let alone = Arc::new(MemoryBackend::default());
+    for i in 0..UES {
+        alone
+            .put(&backend.get(&supi(i)).expect("stored"))
+            .expect("put");
+    }
+    let mut after = storing_server(&alone).await;
+    open_with(&mut after, Arc::clone(&alone) as Arc<dyn UeContextBackend>).await;
+    let restored: Vec<u64> = (0..UES)
+        .filter_map(|i| after.ue_auth_state.find_by_supi(&supi(i)).map(|(id, _)| id))
+        .collect();
+    assert_eq!(restored.len() as u64, UES, "all restored");
+    // Let the restore's updates reach the blackholed SMF.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let held = after.sbi_offload.in_flight();
+    assert!(
+        held > 0 && held <= super::super::RESTORE_PEER_UPDATES_MAX,
+        "the restore holds at most its share of the permits: {held}"
+    );
+
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&ran);
+    after.sbi_offload.spawn(async move {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        None
+    });
+    let started = std::time::Instant::now();
+    while !ran.load(std::sync::atomic::Ordering::SeqCst)
+        && started.elapsed() < Duration::from_secs(2)
+    {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        ran.load(std::sync::atomic::Ordering::SeqCst)
+            && started.elapsed() < Duration::from_millis(500),
+        "a regular exchange runs at once: {:?}",
+        started.elapsed()
+    );
+    for id in restored {
+        crash(&mut after, id);
+    }
+}
+
+/// **#1329 review.** The restart case through a REGISTRATION REQUEST as the UE's first
+/// message (a periodic registration update): the UDM and the PCF get this process's
+/// addresses, once, and the 5G-GUTI keeps this AMF's unchanged GUAMI.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restored_ue_s_registration_gives_the_udm_and_the_pcf_this_amf() {
+    let (_smf, port, _seen) = fake_activating_smf().await;
+    let (_udm, udm_port, udm_seen) = fake_activating_smf().await;
+    let (_pcf, pcf_port, pcf_seen) = fake_activating_smf().await;
+    let _env = SmfEnvGuard::acquire(port).await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let (tmsi, supi) = (0x1329_0401u32, "imsi-001010001329401");
+    let (mut after, original) = restarted_with(
+        13_290_401,
+        tmsi,
+        supi,
+        "ref-1329-g",
+        port,
+        udm_port,
+        pcf_port,
+    )
+    .await;
+    after.sent_ngap = Some(Vec::new());
+    let rr =
+        guti_registration_request(crate::gmm_build::registration_type::PERIODIC_UPDATING, tmsi);
+    let nas =
+        protected_initial_registration(&original.amf_ue, &rr, &rr, original.amf_ue.ul_count + 1);
+    after
+        .handle_initial_ue_message(1, &service_request_initial_ue(nas))
+        .await
+        .expect("handled");
+    for _ in 0..3 {
+        settle_offloaded_sbi(&mut after).await;
+    }
+    let udm = udm_seen.lock().unwrap().clone();
+    let uecm = udm
+        .iter()
+        .filter(|(uri, _)| {
+            uri.ends_with(&format!(
+                "/nudm-uecm/v1/{supi}/registrations/amf-3gpp-access"
+            ))
+        })
+        .count();
+    assert_eq!(
+        uecm, 1,
+        "one UECM registration with this process's deregCallbackUri: {udm:?}"
+    );
+    let pcf = pcf_seen.lock().unwrap().clone();
+    assert!(
+        pcf.iter()
+            .any(|(uri, _)| uri
+                .ends_with("/npcf-am-policy-control/v1/policies/am-ref-1329-g/update")),
+        "the AM policy association notifies this AMF: {pcf:?}"
+    );
+    let (id, ue) = after.ue_auth_state.find_by_supi(supi).expect("registered");
+    assert!(!ue.peers_stale && !ue.taken_over, "owed once");
+    assert_eq!(
+        (
+            ue.amf_ue.next_guti.amf_set_id,
+            ue.amf_ue.next_guti.amf_pointer
+        ),
+        (
+            original.amf_ue.current_guti.amf_set_id,
+            original.amf_ue.current_guti.amf_pointer
+        ),
+        "the GUAMI is unchanged: no takeover reallocation"
+    );
+    crash(&mut after, id);
+}
+
 /// **#686.** A UE CM-CONNECTED when stored has no NG connection after the restart: it is
 /// released as an NG Reset would release it (TS 23.502 §4.2.6). Its session's user plane
 /// is DEACTIVATED at the stored SMF, so downlink data is buffered and pages the UE, and

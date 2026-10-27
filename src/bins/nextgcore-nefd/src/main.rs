@@ -1900,24 +1900,27 @@ fn nef_notify_base(
 }
 
 fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
-    serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "NEF",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": [
-            {
-                "serviceInstanceId": format!("{nf_instance_id}-nnef-eventexposure"),
-                "serviceName": "nnef-eventexposure",
-                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                "scheme": "http",
-                "nfServiceStatus": "REGISTERED",
-                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
-            }
-        ],
-        "allowedNfTypes": ["AF", "AMF", "UDM", "SCP"],
-        "heartBeatTimer": 10
-    })
+    nextgcore_sbi::nf_addressing::classify_profile_host(
+        serde_json::json!({
+            "nfInstanceId": nf_instance_id,
+            "nfType": "NEF",
+            "nfStatus": "REGISTERED",
+            "ipv4Addresses": [sbi_addr],
+            "nfServices": [
+                {
+                    "serviceInstanceId": format!("{nf_instance_id}-nnef-eventexposure"),
+                    "serviceName": "nnef-eventexposure",
+                    "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+                    "scheme": "http",
+                    "nfServiceStatus": "REGISTERED",
+                    "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+                }
+            ],
+            "allowedNfTypes": ["AF", "AMF", "UDM", "SCP"],
+            "heartBeatTimer": 10
+        }),
+        sbi_addr,
+    )
 }
 
 /// Register NEF with NRF (PUT /nnrf-nfm/v1/nf-instances/{id}, nwdafd
@@ -1963,13 +1966,13 @@ async fn register_with_nrf(
                 nf_instance_id,
                 nextgcore_sbi::types::NfType::Nef,
             );
-            self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
+            nextgcore_sbi::nf_addressing::set_instance_host(&mut self_instance, sbi_addr);
             let mut svc = nextgcore_sbi::context::NfService::new(
                 "nnef-eventexposure",
                 nextgcore_sbi::types::SbiServiceType::NnefEventexposure,
             );
             svc.port = sbi_port;
-            svc.ip_addresses = vec![sbi_addr.to_string()];
+            nextgcore_sbi::nf_addressing::set_service_host(&mut svc, sbi_addr);
             self_instance.add_service(svc);
             sbi_ctx.set_self_instance(self_instance).await;
 
@@ -3605,6 +3608,24 @@ mod tests_notify_base_1322 {
         }
         for bad in ["http://0.0.0.0:7817", "http://[::]:7817", "nef.example"] {
             assert!(nef_notify_base(Some(bad), &ep("10.0.0.7", Some("10.0.0.7"))).is_err());
+        }
+    }
+}
+
+/// #1324: the NFProfile carries its host where its type belongs (TS 29.510
+/// §6.1.6.2.2): IPv4 in ipv4Addresses, IPv6 in ipv6Addresses, an FQDN as fqdn, and
+/// the service ipEndPoints likewise.
+#[cfg(test)]
+mod tests_nf_profile_host_kind_1324 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_carries_its_host_by_type() {
+        for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
+            let profile = build_nf_profile("id", host, 7777);
+            let problems =
+                nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
+            assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
         }
     }
 }

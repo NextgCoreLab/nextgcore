@@ -756,6 +756,12 @@ pub struct UeNasContext {
     /// #686 PR 2: taken over from another AMF of the set; the peer updates are owed until
     /// its first message verifies ([`ue_context_takeover`]).
     taken_over: bool,
+    /// #1329: restored by this AMF instance after its own restart. Its UDM and PCF still
+    /// hold the callback addresses of the process that stored it, whose pod IP is gone,
+    /// so those of the takeover's peer updates are owed until its first message
+    /// verifies, without the GUTI reallocation (the GUAMI is unchanged). Its SMFs are
+    /// told at restore (`point_smfs_at_self`).
+    peers_stale: bool,
     /// #686 PR 2: a 5G-GUTI of this AMF's GUAMI is owed after the Service Accept, whatever
     /// `AMF_GUTI_REALLOCATION` says (TS 23.501 §5.21.2.3).
     guti_reallocation_owed: bool,
@@ -936,6 +942,7 @@ impl UeNasContext {
             cm_idle: false,
             restored: false,
             taken_over: false,
+            peers_stale: false,
             guti_reallocation_owed: false,
         }
     }
@@ -1191,6 +1198,10 @@ pub struct NgapServer {
     outstanding_releases: HashMap<(u64, u64), OutstandingRelease>,
     /// SBI work run off this task (#796 review M1): the re-selection attempts.
     sbi_offload: crate::sbi_offload::SbiOffload,
+    /// #1329 review: the bound on the restore-time serving-AMF updates in flight, per
+    /// SMF and overall, so a restore while an SMF is down leaves the offload's
+    /// permits to regular signalling.
+    restore_peer_limits: std::sync::Arc<ue_context_takeover::RestorePeerLimits>,
     /// #748: the UCMF Assigns in flight for re-assignment, one per (TAC, UE radio
     /// capability), with the UEs waiting on each. A UE joins the one in flight for
     /// its pair instead of asking again, so N UEs of one model cost one Assign and
@@ -1499,6 +1510,15 @@ const RACS_ASSIGN_BACKOFF: Duration = Duration::from_secs(2);
 /// How many SBI exchanges run off the NGAP task at once (#796 review M1).
 const MAX_OFFLOADED_SBI: usize = 16;
 
+/// #1329 review: at most this many restore-time serving-AMF updates hold an offload
+/// permit at once, a quarter of [`MAX_OFFLOADED_SBI`]: a restore of many UEs while an
+/// SMF is blackholed then leaves the rest to regular signalling.
+const RESTORE_PEER_UPDATES_MAX: usize = MAX_OFFLOADED_SBI / 4;
+
+/// #1329 review: and at most this many of them per SMF, so one SMF that is down does
+/// not hold up the restore's updates to the others.
+const RESTORE_PEER_UPDATES_PER_SMF: usize = 2;
+
 /// How long the AMF keeps re-selecting an SMF for an establishment it could not
 /// deliver (#796). Below the UE's T3580 (16 s, TS 24.501 §10.3), so the UE gets
 /// an answer before it retransmits. An SMF restarting in place is back well
@@ -1734,6 +1754,10 @@ impl NgapServer {
             #[cfg(test)]
             last_eps_prepared_ebis: None,
             sbi_offload: crate::sbi_offload::SbiOffload::new(MAX_OFFLOADED_SBI),
+            restore_peer_limits: std::sync::Arc::new(ue_context_takeover::RestorePeerLimits::new(
+                RESTORE_PEER_UPDATES_MAX,
+                RESTORE_PEER_UPDATES_PER_SMF,
+            )),
             contextless_ue_ids: std::collections::VecDeque::new(),
             timer_configs: {
                 // Reachability timers derive from the CONFIGURED T3512
@@ -19722,7 +19746,12 @@ fn build_sm_context_identity(
         pei: state.and_then(|s| s.amf_ue.pei.clone()),
         guami,
         serving_plmn,
-        serving_nf_id: None,
+        // #1331: M in SmContextCreateData (TS 29.502 Table 6.1.6.2.2-1), the serving
+        // AMF's NF instance identifier.
+        serving_nf_id: Some(
+            nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf)
+                .to_string(),
+        ),
         ue_location,
         // Issue #205: the UE's EXTERNAL identity, stored on the UE context from
         // the `gpsis` array of the `am-data` the AMF retrieves at registration.
@@ -21197,6 +21226,11 @@ fn gmm_cause_from_sbi_error(err: &crate::sbi_path::SbiError) -> GmmCause {
         }
         SbiError::ResponseParseError(_) => GmmCause::SemanticallyIncorrectMessage,
         SbiError::InvalidState => GmmCause::MessageNotCompatibleWithTheProtocolState,
+        // #1329 review: the structured form of a "{what} returned status {status}"
+        // `RequestFailed`, mapped as that text was.
+        SbiError::PeerStatus { what, status, .. } => gmm_cause_from_sbi_error(
+            &SbiError::RequestFailed(format!("{what} returned status {status}")),
+        ),
     }
 }
 
@@ -21754,6 +21788,16 @@ mod tests {
         let without = build_sm_context_identity(Some(&state), None);
         assert_eq!(without.gpsi, None);
         assert_eq!(without.supi.as_deref(), Some("imsi-262011234567890"));
+
+        // #1331: the serving AMF's nfInstanceId, mandatory in SmContextCreateData.
+        assert_eq!(
+            identity.serving_nf_id.as_deref(),
+            Some(
+                nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf)
+                    .to_string()
+                    .as_str()
+            )
+        );
 
         // No UE context at all: every UE-sourced member is absent.
         let none = build_sm_context_identity(None, None);

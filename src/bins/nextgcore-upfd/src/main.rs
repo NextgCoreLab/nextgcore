@@ -680,30 +680,38 @@ async fn main() -> Result<()> {
 /// (TS 29.510 §6.1.6.2.10) advertises the N3 (GTP-U) interface endpoint. The
 /// `load` field carries the initial PFCP-session occupancy gauge; it is
 /// refreshed by the heartbeat PATCH (`build_load_patch`, `/load` 0..=100).
+/// The N3 InterfaceUpfInfoItem for `gtpu_addr`, its address by type (#1324).
+fn n3_interface(gtpu_addr: &str) -> serde_json::Value {
+    let mut item = nextgcore_sbi::nf_addressing::interface_upf_endpoint(gtpu_addr);
+    item.insert("interfaceType".into(), "N3".into());
+    serde_json::Value::Object(item)
+}
+
 fn build_upf_nf_profile(
     nf_instance_id: &str,
     pfcp_addr: &str,
     gtpu_addr: &str,
     load: u8,
 ) -> serde_json::Value {
-    serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "UPF",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [pfcp_addr],
-        "load": load,
-        "upfInfo": {
-            "sNssaiUpfInfoList": [{
-                "sNssai": { "sst": 1 },
-                "dnnUpfInfoList": [{ "dnn": "internet" }]
-            }],
-            "interfaceUpfInfoList": [{
-                "interfaceType": "N3",
-                "ipv4EndpointAddresses": [gtpu_addr]
-            }]
-        },
-        "heartBeatTimer": 10
-    })
+    nextgcore_sbi::nf_addressing::classify_profile_host(
+        serde_json::json!({
+            "nfInstanceId": nf_instance_id,
+            "nfType": "UPF",
+            "nfStatus": "REGISTERED",
+            "ipv4Addresses": [pfcp_addr],
+            "load": load,
+            "upfInfo": {
+                "sNssaiUpfInfoList": [{
+                    "sNssai": { "sst": 1 },
+                    "dnnUpfInfoList": [{ "dnn": "internet" }]
+                }],
+                // #1324: the N3 address by type (TS 29.510 §6.1.6.2.12).
+                "interfaceUpfInfoList": [n3_interface(gtpu_addr)]
+            },
+            "heartBeatTimer": 10
+        }),
+        pfcp_addr,
+    )
 }
 
 /// Register the UPF with the NRF via `PUT /nnrf-nfm/v1/nf-instances/{id}`
@@ -980,8 +988,14 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                 let gnb_socket = if let Some(addr) = gnb_addr {
                     SocketAddr::new(IpAddr::V4(addr), GTPU_PORT)
                 } else {
-                    log::warn!("No gNB address provided, using default");
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), GTPU_PORT)
+                    // #1345: no N3 endpoint until the Session Modification brings
+                    // one; DL traffic before then is buffered or counted as
+                    // `no_dl_endpoint`, not sent to the loopback.
+                    log::info!(
+                        "No gNB address at establishment: DL endpoint pending the \
+                         Session Modification"
+                    );
+                    data_plane::NO_DL_ENDPOINT
                 };
 
                 // Extract QFI from QERs
@@ -1858,5 +1872,24 @@ mod tests {
             parse_host_port("http://nrf.local"),
             Some(("nrf.local".to_string(), 80))
         );
+    }
+}
+
+/// #1324: the NFProfile carries its host where its type belongs (TS 29.510
+/// §6.1.6.2.2): IPv4 in ipv4Addresses, IPv6 in ipv6Addresses, an FQDN as fqdn, and
+/// the service ipEndPoints likewise.
+#[cfg(test)]
+mod tests_nf_profile_host_kind_1324 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_carries_its_host_by_type() {
+        for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
+            // The N3 address varies too: it is typed the same way.
+            let profile = build_upf_nf_profile("id", host, host, 0);
+            let problems =
+                nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
+            assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
+        }
     }
 }

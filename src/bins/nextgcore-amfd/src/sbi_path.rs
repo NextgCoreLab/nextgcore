@@ -122,6 +122,17 @@ pub enum SbiError {
     GatewayTimeout,
     /// Invalid state
     InvalidState,
+    /// A peer answered a serving-AMF update (#1329: the SMF, UECM and PCF updates of a
+    /// takeover or a restart restore) with a non-success `status`, and the
+    /// `Retry-After` it sent, if any (delta-seconds, RFC 9110 §10.2.3). Kept
+    /// structured so [`retry_peer_update`] can tell a definitive 4xx from a 5xx, a
+    /// 429 or a 503 (#1329 review). Displayed exactly as the `RequestFailed` text it
+    /// replaced: "Request failed: {what} returned status {status}".
+    PeerStatus {
+        what: String,
+        status: u16,
+        retry_after: Option<std::time::Duration>,
+    },
 }
 
 impl std::fmt::Display for SbiError {
@@ -138,6 +149,9 @@ impl std::fmt::Display for SbiError {
             SbiError::Timeout => write!(f, "Timeout"),
             SbiError::GatewayTimeout => write!(f, "Gateway timeout"),
             SbiError::InvalidState => write!(f, "Invalid state"),
+            SbiError::PeerStatus { what, status, .. } => {
+                write!(f, "Request failed: {what} returned status {status}")
+            }
         }
     }
 }
@@ -361,14 +375,14 @@ fn allowed_nf_types_for(service_name: &str) -> &'static [&'static str] {
 /// Build this AMF's typed self NF instance from [`AMF_SERVICES`].
 fn build_amf_nf_instance(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> NfInstance {
     let mut nf_instance = NfInstance::new(nf_instance_id, nextgcore_sbi::types::NfType::Amf);
-    nf_instance.ipv4_addresses.push(sbi_addr.to_string());
+    nextgcore_sbi::nf_addressing::set_instance_host(&mut nf_instance, sbi_addr);
     nf_instance.heartbeat_interval = 10;
 
     for (service_type, _allowed) in AMF_SERVICES {
         let mut svc = NfService::new(service_type.to_name(), *service_type);
         svc.versions = vec![api_version::V1.to_string()];
         svc.port = sbi_port;
-        svc.ip_addresses.push(sbi_addr.to_string());
+        nextgcore_sbi::nf_addressing::set_service_host(&mut svc, sbi_addr);
         nf_instance.add_service(svc);
     }
 
@@ -421,15 +435,18 @@ pub fn amf_nf_profile_json(
         }
     }
 
-    let mut nf_profile = serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "AMF",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": services,
-        "allowedNfTypes": nf_allowed,
-        "heartBeatTimer": 10
-    });
+    let mut nf_profile = nextgcore_sbi::nf_addressing::classify_profile_host(
+        serde_json::json!({
+            "nfInstanceId": nf_instance_id,
+            "nfType": "AMF",
+            "nfStatus": "REGISTERED",
+            "ipv4Addresses": [sbi_addr],
+            "nfServices": services,
+            "allowedNfTypes": nf_allowed,
+            "heartBeatTimer": 10
+        }),
+        sbi_addr,
+    );
 
     // #92: publish `amfInfo.guamiList` (TS 29.510 §6.1.6.2.4 `AmfInfo`), the GUAMIs
     // this AMF serves. Without it there is nothing in the AMF's registered profile
@@ -715,15 +732,8 @@ async fn amf_nrf_discover_qualified_at(
 
             let mut instance = NfInstance::new(nf_id, nf_type);
 
-            if let Some(fqdn) = nf_json.get("fqdn").and_then(|v| v.as_str()) {
-                instance.fqdn = Some(fqdn.to_string());
-            }
-            if let Some(addrs) = nf_json.get("ipv4Addresses").and_then(|v| v.as_array()) {
-                instance.ipv4_addresses = addrs
-                    .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect();
-            }
+            // #1324: IPv4, IPv6 and FQDN alike.
+            nextgcore_sbi::nf_addressing::read_instance_addresses(&mut instance, nf_json);
             // NFProfile `priority` and `capacity` (TS 29.510 §6.1.6.2.2, 0..65535): the
             // selection inputs of #997. Absent, the instance keeps its defaults.
             if let Some(p) = nf_json
@@ -752,18 +762,7 @@ async fn amf_nrf_discover_qualified_at(
                         nextgcore_sbi::types::SbiServiceType::from_name(svc_name)
                     {
                         let mut svc = NfService::new(svc_name, svc_type);
-                        if let Some(endpoints) =
-                            svc_json.get("ipEndPoints").and_then(|v| v.as_array())
-                        {
-                            if let Some(ep) = endpoints.first() {
-                                if let Some(addr) = ep.get("ipv4Address").and_then(|v| v.as_str()) {
-                                    svc.ip_addresses.push(addr.to_string());
-                                }
-                                if let Some(port) = ep.get("port").and_then(|v| v.as_u64()) {
-                                    svc.port = port as u16;
-                                }
-                            }
-                        }
+                        nextgcore_sbi::nf_addressing::read_service_addresses(&mut svc, svc_json);
                         instance.add_service(svc);
                     }
                 }
@@ -901,6 +900,7 @@ fn resolve_nf_endpoint(service_type: SbiServiceType) -> SbiResult<(String, u16)>
                         .ip_addresses
                         .first()
                         .or(inst.ipv4_addresses.first())
+                        .or(inst.ipv6_addresses.first())
                         .or(svc.fqdn.as_ref())
                         .or(inst.fqdn.as_ref());
                     if let Some(h) = host {
@@ -1479,6 +1479,123 @@ pub async fn call_smf_deactivate_up_connection(
     Ok(())
 }
 
+/// How many times a peer update (#1329: the serving-AMF updates of a takeover or a
+/// restart restore) is tried before it is given up and logged.
+pub(crate) const PEER_UPDATE_ATTEMPTS: u32 = 5;
+
+/// The wait before the first retry, doubled for each further one: 1 + 2 + 4 + 8 s, so a
+/// peer that is restarting itself (as the AMF's SMFs may be after a node loss) is given
+/// about 15 s. Short in tests.
+#[cfg(not(test))]
+pub(crate) const PEER_UPDATE_FIRST_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(test)]
+pub(crate) const PEER_UPDATE_FIRST_BACKOFF: std::time::Duration =
+    std::time::Duration::from_millis(20);
+
+/// The longest a peer's `Retry-After` is honoured for (#1329 review): a 429 or 503
+/// asking for more is retried after this, so one answer cannot park the update.
+#[cfg(not(test))]
+pub(crate) const PEER_UPDATE_RETRY_AFTER_CAP: std::time::Duration =
+    std::time::Duration::from_secs(10);
+#[cfg(test)]
+pub(crate) const PEER_UPDATE_RETRY_AFTER_CAP: std::time::Duration =
+    std::time::Duration::from_millis(300);
+
+/// The error for a peer's non-success `response` to the request `what`, with its
+/// status and its `Retry-After` (delta-seconds; an HTTP-date is not parsed).
+fn peer_status(what: &str, response: &SbiResponse) -> SbiError {
+    SbiError::PeerStatus {
+        what: what.to_string(),
+        status: response.status,
+        retry_after: response
+            .http
+            .get_header("Retry-After")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(std::time::Duration::from_secs),
+    }
+}
+
+/// How long to wait before trying a peer update again after its attempt `n`
+/// (1-based) failed with `e`; `None` when it is not tried again (#1329 review):
+/// - a 5xx, a 429 or a 503, and a transport failure (no answer, a timeout, no
+///   endpoint) are retried, up to [`PEER_UPDATE_ATTEMPTS`] tries, after the backoff
+///   (1, 2, 4, 8 s from [`PEER_UPDATE_FIRST_BACKOFF`]);
+/// - a 429 or a 503 with a `Retry-After` waits that long instead, at most
+///   [`PEER_UPDATE_RETRY_AFTER_CAP`];
+/// - any other status (a definitive 4xx: a 404 for an SM context the SMF no longer
+///   has does not change by asking again) and an answer that does not parse are not.
+pub(crate) fn peer_update_retry_wait(n: u32, e: &SbiError) -> Option<std::time::Duration> {
+    if n >= PEER_UPDATE_ATTEMPTS {
+        return None;
+    }
+    let backoff = PEER_UPDATE_FIRST_BACKOFF * 2u32.saturating_pow(n.saturating_sub(1));
+    let retryable_status = |status: u16| status == 429 || (500..=599).contains(&status);
+    match e {
+        SbiError::PeerStatus {
+            status,
+            retry_after,
+            ..
+        } => {
+            if !retryable_status(*status) {
+                return None;
+            }
+            match retry_after {
+                Some(after) if matches!(status, 429 | 503) => {
+                    Some((*after).min(PEER_UPDATE_RETRY_AFTER_CAP))
+                }
+                _ => Some(backoff),
+            }
+        }
+        SbiError::SmfRefused { status, .. } => retryable_status(*status).then_some(backoff),
+        SbiError::ResponseParseError(_) | SbiError::InvalidState => None,
+        SbiError::RequestFailed(_)
+        | SbiError::Timeout
+        | SbiError::GatewayTimeout
+        | SbiError::NfInstanceNotFound
+        | SbiError::ServiceNotFound(_) => Some(backoff),
+    }
+}
+
+/// Log why a failed peer update `what` is not tried again after attempt `n`.
+pub(crate) fn log_peer_update_given_up(what: &str, n: u32, e: &SbiError) {
+    if n >= PEER_UPDATE_ATTEMPTS {
+        log::warn!("{what} failed (attempt {n} of {PEER_UPDATE_ATTEMPTS}): {e}; giving up");
+    } else {
+        log::warn!("{what} refused definitively (attempt {n}): {e}; not retried");
+    }
+}
+
+/// Run `attempt` until it succeeds, at most [`PEER_UPDATE_ATTEMPTS`] times, waiting
+/// as [`peer_update_retry_wait`] says between tries (#1329 review: a failed peer
+/// update is retried, not dropped, but a definitive refusal is not asked again).
+/// Returns the last error.
+pub(crate) async fn retry_peer_update<T, F, Fut>(what: &str, mut attempt: F) -> SbiResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = SbiResult<T>>,
+{
+    let mut n = 1;
+    loop {
+        match attempt().await {
+            Ok(v) => return Ok(v),
+            Err(e) => match peer_update_retry_wait(n, &e) {
+                None => {
+                    log_peer_update_given_up(what, n, &e);
+                    return Err(e);
+                }
+                Some(wait) => {
+                    log::warn!(
+                        "{what} failed (attempt {n} of {PEER_UPDATE_ATTEMPTS}): {e}; retrying \
+                         in {wait:?}"
+                    );
+                    tokio::time::sleep(wait).await;
+                    n += 1;
+                }
+            },
+        }
+    }
+}
+
 /// #686 PR 2, an AMF change (TS 29.502 §5.2.2.3.1, Table 6.1.6.2.2-1): tell the SMF that
 /// this AMF now serves the SM context. The UpdateSMContext carries the new AMF's
 /// `servingNfId`, with the `smContextStatusUri`, `guami` and `servingNetwork` the table
@@ -1503,10 +1620,7 @@ pub async fn call_smf_update_serving_amf(
         .await
         .map_err(|e| SbiError::RequestFailed(format!("SMF serving-AMF update failed: {e}")))?;
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "SMF serving-AMF update returned status {}",
-            response.status
-        )));
+        return Err(peer_status("SMF serving-AMF update", &response));
     }
     Ok(())
 }
@@ -2370,30 +2484,9 @@ fn namf_comm_endpoint(inst: &serde_json::Value) -> Option<(String, u16)> {
             .and_then(|v| v.as_str())
             .is_some_and(|n| n.eq_ignore_ascii_case(service_name::NAMF_COMM))
     })?;
-    let endpoint = svc.get("ipEndPoints").and_then(|v| v.as_array());
-    let port = endpoint
-        .and_then(|e| e.first())
-        .and_then(|e| e.get("port"))
-        .and_then(|v| v.as_u64())
-        .and_then(|p| u16::try_from(p).ok())
-        .unwrap_or(7777);
-    let host = endpoint
-        .and_then(|e| e.first())
-        .and_then(|e| e.get("ipv4Address"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .or_else(|| {
-            inst.get("ipv4Addresses")
-                .and_then(|v| v.as_array())
-                .and_then(|a| a.first())
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })
-        .or_else(|| {
-            inst.get("fqdn")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })?;
+    // #1324: the endpoint's IPv4 or IPv6 address, else the NF's (IPv4, IPv6, FQDN).
+    let port = nextgcore_sbi::nf_addressing::service_port(Some(svc)).unwrap_or(7777);
+    let host = nextgcore_sbi::nf_addressing::service_host(inst, Some(svc))?;
     Some((host, port))
 }
 
@@ -2812,6 +2905,7 @@ fn lmf_endpoint(inst: &NfInstance) -> Option<(String, u16)> {
         .ip_addresses
         .first()
         .or(inst.ipv4_addresses.first())
+        .or(inst.ipv6_addresses.first())
         .or(svc.fqdn.as_ref())
         .or(inst.fqdn.as_ref())?;
     Some((host.clone(), svc.port))
@@ -3495,10 +3589,7 @@ pub async fn call_udm_uecm_registration(
         .map_err(|e| SbiError::RequestFailed(format!("UECM registration failed: {e}")))?;
 
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "UECM registration returned status {}",
-            response.status
-        )));
+        return Err(peer_status("UECM registration", &response));
     }
     log::info!("[{supi}] Nudm_UECM_Registration (amf-3gpp-access) OK");
     Ok(())
@@ -3946,10 +4037,7 @@ pub async fn call_pcf_am_policy_update_serving_amf(
         .await
         .map_err(|e| SbiError::RequestFailed(format!("AM policy update failed: {e}")))?;
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "AM policy update returned status {}",
-            response.status
-        )));
+        return Err(peer_status("AM policy update", &response));
     }
     log::info!("Npcf_AMPolicyControl_Update OK (polAssoId={pol_asso_id}): new serving AMF");
     Ok(())
@@ -3986,10 +4074,7 @@ pub async fn call_pcf_ue_policy_update_serving_amf(
         .await
         .map_err(|e| SbiError::RequestFailed(format!("UE policy update failed: {e}")))?;
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "UE policy update returned status {}",
-            response.status
-        )));
+        return Err(peer_status("UE policy update", &response));
     }
     log::info!("Npcf_UEPolicyControl_Update OK (polAssoId={pol_asso_id}): new serving AMF");
     Ok(())
@@ -4281,31 +4366,9 @@ fn nsmf_pdusession_endpoint(inst: &serde_json::Value) -> Option<(String, u16)> {
                     .is_some_and(|n| n.eq_ignore_ascii_case(service_name::NSMF_PDUSESSION))
             })
         });
-    let endpoint = svc
-        .and_then(|s| s.get("ipEndPoints"))
-        .and_then(|v| v.as_array())
-        .and_then(|e| e.first());
-    let port = endpoint
-        .and_then(|e| e.get("port"))
-        .and_then(|v| v.as_u64())
-        .and_then(|p| u16::try_from(p).ok())
-        .unwrap_or(7777);
-    let host = endpoint
-        .and_then(|e| e.get("ipv4Address"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .or_else(|| {
-            inst.get("ipv4Addresses")
-                .and_then(|v| v.as_array())
-                .and_then(|a| a.first())
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })
-        .or_else(|| {
-            inst.get("fqdn")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })?;
+    // #1324: the endpoint's IPv4 or IPv6 address, else the NF's (IPv4, IPv6, FQDN).
+    let port = nextgcore_sbi::nf_addressing::service_port(svc).unwrap_or(7777);
+    let host = nextgcore_sbi::nf_addressing::service_host(inst, svc)?;
     Some((host, port))
 }
 
@@ -4843,6 +4906,88 @@ async fn update_sm_context_ho_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1329 follow-up, review MINOR 1: which failed peer updates are tried again, and
+    /// after how long. A definitive 4xx is not; a 5xx, a 429, a 503 and a transport
+    /// failure are, after the backoff; a 429 / 503 `Retry-After` is honoured, capped.
+    #[test]
+    fn a_peer_update_is_retried_on_5xx_429_503_and_transport_errors_only() {
+        let status = |status: u16, after: Option<u64>| SbiError::PeerStatus {
+            what: "SMF serving-AMF update".to_string(),
+            status,
+            retry_after: after.map(std::time::Duration::from_secs),
+        };
+        let first = PEER_UPDATE_FIRST_BACKOFF;
+        for definitive in [400u16, 403, 404, 409, 410] {
+            assert_eq!(peer_update_retry_wait(1, &status(definitive, None)), None);
+        }
+        assert_eq!(
+            peer_update_retry_wait(1, &SbiError::ResponseParseError("x".into())),
+            None
+        );
+        assert_eq!(peer_update_retry_wait(1, &status(500, None)), Some(first));
+        assert_eq!(
+            peer_update_retry_wait(3, &status(502, None)),
+            Some(first * 4)
+        );
+        assert_eq!(
+            peer_update_retry_wait(2, &status(429, None)),
+            Some(first * 2)
+        );
+        assert_eq!(
+            peer_update_retry_wait(1, &SbiError::RequestFailed("connect refused".into())),
+            Some(first)
+        );
+        assert_eq!(peer_update_retry_wait(1, &SbiError::Timeout), Some(first));
+        // Retry-After on a 429 / 503: honoured, at most the cap; on a 500 not.
+        assert_eq!(
+            peer_update_retry_wait(1, &status(503, Some(0))),
+            Some(std::time::Duration::ZERO)
+        );
+        assert_eq!(
+            peer_update_retry_wait(1, &status(429, Some(3600))),
+            Some(PEER_UPDATE_RETRY_AFTER_CAP)
+        );
+        assert_eq!(
+            peer_update_retry_wait(1, &status(500, Some(0))),
+            Some(first)
+        );
+        // The last attempt is the last.
+        assert_eq!(
+            peer_update_retry_wait(PEER_UPDATE_ATTEMPTS, &status(503, None)),
+            None
+        );
+        // Displayed as the `RequestFailed` text it replaced.
+        assert_eq!(
+            status(404, None).to_string(),
+            "Request failed: SMF serving-AMF update returned status 404"
+        );
+    }
+
+    /// #1329 follow-up: `retry_peer_update` stops at a definitive 4xx at once.
+    ///
+    /// REVERT-VERIFIED: with every error retryable it makes 5 attempts.
+    #[tokio::test]
+    async fn retry_peer_update_stops_at_a_definitive_refusal() {
+        let mut tries = 0;
+        let result: SbiResult<()> = retry_peer_update("UECM registration", || {
+            tries += 1;
+            let n = tries;
+            async move {
+                Err(SbiError::PeerStatus {
+                    what: "UECM registration".to_string(),
+                    status: if n == 1 { 503 } else { 404 },
+                    retry_after: None,
+                })
+            }
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(SbiError::PeerStatus { status: 404, .. })
+        ));
+        assert_eq!(tries, 2, "the 503 is retried, the 404 is not");
+    }
 
     #[test]
     fn test_sbi_service_type_names() {
@@ -6920,5 +7065,47 @@ mod tests_no_wildcard_uri_1322 {
         let before = advertised_sbi_host_port();
         set_advertised_sbi("0.0.0.0".into(), 7777);
         assert_eq!(advertised_sbi_host_port(), before);
+    }
+}
+
+/// #1324: the NFProfile carries its host where its type belongs (TS 29.510
+/// §6.1.6.2.2): IPv4 in ipv4Addresses, IPv6 in ipv6Addresses, an FQDN as fqdn, and
+/// the service ipEndPoints likewise.
+#[cfg(test)]
+mod tests_nf_profile_host_kind_1324 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_carries_its_host_by_type() {
+        for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
+            let profile = amf_nf_profile_json("id", host, 7777);
+            let problems =
+                nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
+            assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
+        }
+    }
+}
+
+/// #1324 review: producer to consumer. A peer profile built with an IPv4, IPv6 or
+/// FQDN host (as this codebase's producers build them) resolves to that host.
+#[cfg(test)]
+mod tests_peer_host_kind_1324 {
+    use super::*;
+    use nextgcore_sbi::nf_addressing::{dialled_host, sample_search_result, SAMPLE_HOSTS};
+
+    #[test]
+    fn a_peer_at_any_host_type_is_resolved() {
+        for host in SAMPLE_HOSTS {
+            let r = sample_search_result("AMF", "namf-comm", host, 7791);
+            assert_eq!(
+                namf_comm_endpoint(&r["nfInstances"][0]),
+                Some((dialled_host(host), 7791))
+            );
+            let r = sample_search_result("SMF", "nsmf-pdusession", host, 7792);
+            assert_eq!(
+                nsmf_pdusession_endpoint(&r["nfInstances"][0]),
+                Some((dialled_host(host), 7792))
+            );
+        }
     }
 }

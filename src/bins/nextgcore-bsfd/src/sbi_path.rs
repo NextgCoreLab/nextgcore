@@ -98,7 +98,7 @@ fn build_bsf_nf_instance(config: &SbiServerConfig) -> NfInstance {
     let nf_id = nextgcore_sbi::nf_instance_id::nf_instance_id(NfType::Bsf).to_string();
     let mut nf_instance = NfInstance::new(&nf_id, NfType::Bsf);
 
-    nf_instance.ipv4_addresses.push(config.addr.clone());
+    nextgcore_sbi::nf_addressing::set_instance_host(&mut nf_instance, &config.addr);
     nf_instance.heartbeat_interval = 10;
 
     let scheme = if config.tls_enabled {
@@ -110,7 +110,7 @@ fn build_bsf_nf_instance(config: &SbiServerConfig) -> NfInstance {
     for (service_type, _allowed) in BSF_SERVICES {
         let mut svc = NfService::new(service_type.to_name(), *service_type);
         svc.scheme = scheme;
-        svc.ip_addresses.push(config.addr.clone());
+        nextgcore_sbi::nf_addressing::set_service_host(&mut svc, &config.addr);
         svc.port = config.port;
         nf_instance.add_service(svc);
     }

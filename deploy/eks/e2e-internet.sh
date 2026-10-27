@@ -35,7 +35,8 @@
 # environment error (no UE pod, no TUN, ...). PROFILE=epc additionally checks
 # the LTE attach (S1 Setup, EMM-REGISTERED, default bearer, and the dedicated
 # bearer of the PGW-C's local PCC rule) from the logs.
-# PROFILE=6g adds its section when that profile lands.
+# PROFILE=6g runs the 5G checks against nextg-6g plus a 6G feature smoke: each
+# runtime feature the profile builds in shows its signature (see that section).
 set -uo pipefail
 
 PROFILE="${PROFILE:-5g}"
@@ -54,7 +55,9 @@ source "${SCRIPT_DIR}/lib/profile.sh"
 nextg_load_profile "${PROFILE}" || exit 2
 
 case "${PROFILE}" in
-  5g)
+  5g|6g)
+    # PROFILE=6g is the 5G core and gNB/UE built with the 6G features, so the
+    # pods and the TUN are the same.
     NAMESPACE="${NAMESPACE:-${PROFILE_NAMESPACE}}"
     UE_SELECTOR="${UE_SELECTOR:-app.kubernetes.io/name=ue}"
     UE_CONTAINER="${UE_CONTAINER:-ue}"
@@ -83,7 +86,7 @@ case "${PROFILE}" in
   # "Data plane stats" line) and container, and the UE tunnel interface.
   # NAMESPACE comes from the profile's profile.env.
   *)
-    echo "PROFILE=${PROFILE} has no e2e-internet section yet (5g, epc)" >&2
+    echo "PROFILE=${PROFILE} has no e2e-internet section yet (5g, epc, 6g)" >&2
     exit 2
     ;;
 esac
@@ -182,8 +185,28 @@ UE_IP="$(dbg sh -c "ip -4 -o addr show dev ${TUN} | awk '{print \$4}' | cut -d/ 
   || die "no IPv4 address on ${TUN} in ${UE_POD} (interfaces: $(dbg sh -c "ip -o link show | awk -F': ' '{print \$2}' | tr '\n' ' '")): is the PDU session up?"
 echo "UE IP on ${TUN}: ${UE_IP}"
 
+# The PROFILE=6g PFCP capture container this run created on the smf pod, if any
+# (stopped by cleanup unless the caller set CAPTURE_TTL to keep it).
+CAP_CREATED=""
+CAP_POD=""
+
+# shellcheck disable=SC2317  # invoked by the EXIT trap
+stop_capture() {
+  [[ -n "${CAP_CREATED}" ]] || return 0
+  # The container shares the smf pod's process namespace (--target=smf), so its
+  # PID 1 is not its own: kill exactly the sleep it recorded at start.
+  # shellcheck disable=SC2016  # expanded by the container's shell
+  if "${KUBECTL[@]}" exec "${CAP_POD}" -c "${CAP_CREATED}" -- \
+       sh -c 'kill "$(cat /tmp/e2e-capture.pid)"' >/dev/null 2>&1; then
+    echo "capture container ${CAP_CREATED} stopped"
+  else
+    echo "WARN could not stop capture container ${CAP_CREATED} on ${CAP_POD}; it exits by itself after ${CAPTURE_TTL} s" >&2
+  fi
+}
+
 # shellcheck disable=SC2317  # invoked by the EXIT trap
 cleanup() {
+  stop_capture
   dbg sh -c "ip rule del from ${UE_IP} lookup ${RT_TABLE} priority ${RT_TABLE} 2>/dev/null; \
              ip route flush table ${RT_TABLE} 2>/dev/null; true" >/dev/null 2>&1 \
     && echo "policy route removed" \
@@ -242,6 +265,105 @@ if (( UL1 > UL0 && DL1 > DL0 )); then
   pass "UPF data plane stats: UL ${UL0}->${UL1} pkts, DL ${DL0}->${DL1} pkts"
 else
   fail "UPF data plane stats did not increase within ${STATS_WAIT}s: UL ${UL0}->${UL1}, DL ${DL0}->${DL1}"
+fi
+
+# ---- 6G feature smoke --------------------------------------------------------
+# One runtime signature per feature profiles/6g/profile.env builds in and
+# switches on. Read from the running pods, so a default (featureless) binary
+# under a -6g tag fails here rather than passing the 5G checks above.
+if [[ "${PROFILE}" == 6g ]]; then
+  nf_log() { "${KUBECTL[@]}" logs "deployment/$1" -c "$1" --tail=-1 2>/dev/null; }
+
+  # udmd nes: the NES state machine started, and its energy gauges are served
+  # on the pod's loopback (not on the pod IP: nothing outside the pod reads it).
+  if line="$(grep -m1 'NES enabled:' <<<"$(nf_log udm)")"; then
+    pass "UDM NES: ${line##*NES enabled: }"
+  else
+    fail "UDM NES: no 'NES enabled:' line in the udm log (built without --features nes?)"
+  fi
+  # Read in the udm container itself: the gauges are on its loopback. curl is in
+  # the core image (Dockerfile.core); wget is the fallback, and with neither the
+  # check says so rather than reporting missing gauges (#1333 review).
+  NES_URL="http://127.0.0.1:${NES_METRICS_PORT}/metrics"
+  NES_OUT="$("${KUBECTL[@]}" exec deployment/udm -c udm -- sh -c "
+    if command -v curl >/dev/null 2>&1; then curl -fsS -m 5 '${NES_URL}'
+    elif command -v wget >/dev/null 2>&1; then wget -qO- -T 5 '${NES_URL}'
+    else echo 'no curl or wget in the udm image'; fi" 2>&1)"
+  if grep -q '^energy_consumption_watts{' <<<"${NES_OUT}"; then
+    pass "UDM NES gauges on 127.0.0.1:${NES_METRICS_PORT}: $(grep -m1 '^energy_consumption_watts{' <<<"${NES_OUT}")"
+  else
+    fail "UDM NES gauges: no energy_consumption_watts on 127.0.0.1:${NES_METRICS_PORT} ($(head -n1 <<<"${NES_OUT}"))"
+  fi
+
+  # pcfd intent-loop: the intent was translated and the loop is monitoring.
+  PCF_LOG="$(nf_log pcf)"
+  if grep -q 'intent-loop: intent translated' <<<"${PCF_LOG}" \
+     && line="$(grep 'intent-loop: monitor' <<<"${PCF_LOG}" | tail -n1)"; then
+    pass "PCF intent loop: ${line##*intent-loop: }"
+  else
+    fail "PCF intent loop: no 'intent translated' + 'monitor' lines in the pcf log (built without --features intent-loop?)"
+  fi
+
+  # upfd compute-aware-upf: the UPF's PFCP Heartbeat Requests carry Load
+  # Control Information (IE 51), which the SMF's selection reads. Captured on
+  # the SMF pod for two heartbeat periods (the UPF sends one every 10 s).
+  #
+  # The capture has to run in the smf pod's network namespace, so it is an
+  # ephemeral container, which Kubernetes never removes (a rollout clears them).
+  # A NET_ADMIN container should not outlive the run that needed it (#1329
+  # review): its `sleep` lasts CAPTURE_TTL s, by default one validation run
+  # (1800 s), and the EXIT trap stops it when this run created it. A caller that
+  # sets CAPTURE_TTL explicitly asks for it to outlive the run, so it is kept
+  # until then, and a capture container still running is REUSED within its TTL
+  # rather than adding another (#1333 review).
+  SMF_POD="$(running_pod app.kubernetes.io/name=smf)"
+  if [[ -n "${CAPTURE_TTL:-}" ]]; then
+    CAPTURE_KEEP=true
+  else
+    CAPTURE_KEEP=false
+    CAPTURE_TTL=1800
+  fi
+  [[ "${CAPTURE_TTL}" =~ ^[1-9][0-9]*$ ]] \
+    || die "CAPTURE_TTL must be a whole number of seconds (got '${CAPTURE_TTL}')"
+  CAP="$("${KUBECTL[@]}" get pod "${SMF_POD}" -o json 2>/dev/null | python3 -c '
+import json, sys
+st = json.load(sys.stdin).get("status", {}).get("ephemeralContainerStatuses", [])
+up = [c["name"] for c in st if c["name"].startswith("e2e-6g-pfcp") and "running" in c.get("state", {})]
+print(up[0] if up else "")' 2>/dev/null)"
+  attached=false
+  if [[ -n "${CAP}" ]]; then
+    attached=true
+    echo "reusing capture container ${CAP} on ${SMF_POD}"
+  elif [[ -n "${SMF_POD}" ]]; then
+    CAP="e2e-6g-pfcp-$(date +%s)"
+    "${KUBECTL[@]}" debug "${SMF_POD}" --target=smf --profile=netadmin \
+      --image="${DEBUG_IMAGE}" --container="${CAP}" -- \
+      sh -c "echo \$\$ > /tmp/e2e-capture.pid; exec sleep ${CAPTURE_TTL}" >/dev/null 2>&1 \
+      && attached=true
+    if "${attached}" && ! "${CAPTURE_KEEP}"; then
+      CAP_CREATED="${CAP}"
+      CAP_POD="${SMF_POD}"
+    fi
+  fi
+  if "${attached}"; then
+    for _ in $(seq 1 60); do
+      st="$("${KUBECTL[@]}" get pod "${SMF_POD}" \
+        -o jsonpath="{.status.ephemeralContainerStatuses[?(@.name=='${CAP}')].state.running.startedAt}")"
+      [[ -n "${st}" ]] && break
+      sleep 2
+    done
+    HB="$("${KUBECTL[@]}" exec "${SMF_POD}" -c "${CAP}" -- \
+      tshark -i any -f 'udp port 8805' -a duration:25 -Y 'pfcp.msg_type == 1' -V 2>/dev/null)"
+    if grep -q 'Load Control Information' <<<"${HB}"; then
+      pass "UPF compute-aware-upf: PFCP Heartbeat Request carries Load Control Information ($(grep -m1 -E 'Load Metric|Metric:' <<<"${HB}" | sed 's/^ *//'))"
+    elif grep -q 'Heartbeat Request' <<<"${HB}"; then
+      fail "UPF compute-aware-upf: Heartbeat Requests seen without Load Control Information (built without --features compute-aware-upf?)"
+    else
+      fail "UPF compute-aware-upf: no PFCP Heartbeat Request captured on ${SMF_POD} in 25 s"
+    fi
+  else
+    fail "UPF compute-aware-upf: could not attach a capture container to the smf pod"
+  fi
 fi
 
 echo
