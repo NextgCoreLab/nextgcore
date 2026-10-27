@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e91a4036.js";
+            window.path_to_searchindex_js = "../searchindex-f1de496b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -290,7 +290,7 @@ upf:
 <tr><td><code>upf.pfcp.server</code></td><td>Ignored — use <code>--pfcp-addr</code> / <code>--pfcp-port</code>.</td></tr>
 <tr><td><code>upf.gtpu.server</code></td><td>Ignored — use <code>--gtpu-addr</code> / <code>--gtpu-port</code>.</td></tr>
 <tr><td><code>upf.session</code></td><td>Ignored — use <code>--tun-ifname</code> / <code>--tun-ip</code> / <code>--tun-prefix</code> (single IPv4 subnet only via CLI; the YAML’s IPv6 entry has no CLI equivalent).</td></tr>
-<tr><td><code>upf.metrics.server</code></td><td>Ignored — use <code>UPF_METRICS_PORT</code>.</td></tr>
+<tr><td><code>upf.metrics.server</code></td><td>Not read, and removed from the shipped config (#1312): use <code>UPF_METRICS_PORT</code>.</td></tr>
 <tr><td><code>upf.tls.*</code></td><td>Ignored. The file’s comment names <code>TLS_ENABLED</code> / <code>SBI_SCHEME</code>, but no code reads them; the UPF serves no SBI listener (it is only an NRF client when <code>--nrf-uri</code> is set).</td></tr>
 </tbody>
 </table>

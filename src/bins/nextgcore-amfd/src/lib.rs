@@ -1156,6 +1156,9 @@ impl Default for AmfApp {
     }
 }
 
+/// The environment variable naming the AMF's `/metrics` port (#1334).
+pub const METRICS_PORT_ENV: &str = "AMF_METRICS_PORT";
+
 #[tokio::main]
 pub async fn run() -> Result<()> {
     // Parse command line arguments
@@ -1312,6 +1315,16 @@ pub async fn run() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to start Namf SBI server: {e}"))?;
     log::info!("Namf SBI HTTP/2 server listening on {sbi_sock}");
+
+    // #1334: the Prometheus endpoint, on NEXTGCORE_METRICS_BIND (loopback by default,
+    // #837) and AMF_METRICS_PORT (9090). Non-fatal, like smfd's: an AMF that cannot
+    // expose metrics still serves the RAN and its peers.
+    let _metrics = nextgcore_metrics::nf::serve_nf_metrics(
+        "AMF",
+        METRICS_PORT_ENV,
+        std::sync::Arc::new(metrics::render_prometheus),
+    )
+    .await;
 
     // Register with NRF (if configured)
     let mut amf_nf_instance_id = String::new();

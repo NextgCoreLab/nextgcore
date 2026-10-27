@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e91a4036.js";
+            window.path_to_searchindex_js = "../searchindex-f1de496b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -237,7 +237,7 @@ nrf:
 </div>
 <h2 id="parsed-but-inert--non-yaml-settings"><a class="header" href="#parsed-but-inert--non-yaml-settings">Parsed-but-inert / non-YAML settings</a></h2>
 <ul>
-<li><code>logger</code>, <code>global.max.{ue,peer}</code>, <code>nrf.serving[].plmn_id</code>, and <code>nrf.sbi.server[]</code> (address, advertise, port, tls block) are present in the example YAML but ignored by nrfd’s config structs. Equivalent runtime behavior comes from CLI flags: <code>--sbi-addr</code> (default <code>0.0.0.0</code>), <code>--sbi-port</code> (default <code>7777</code>), <code>--max-ue</code> (default <code>1024</code>), <code>--log-level</code> (default <code>info</code>), <code>--log-file</code>, and the TLS/mTLS flags.</li>
+<li><code>logger</code>, <code>global.max.{ue,peer}</code>, <code>nrf.serving[].plmn_id</code>, and <code>nrf.sbi.server[]</code> (address, advertise, port, tls block) are present in the example YAML but ignored by nrfd’s config structs. Equivalent runtime behavior comes from CLI flags: <code>--sbi-addr</code> (default <code>127.0.0.1</code>, loopback since #1308; the YAML address does not set it), <code>--sbi-port</code> (default <code>7777</code>), <code>--max-ue</code> (default <code>1024</code>), <code>--log-level</code> (default <code>info</code>), <code>--log-file</code>, and the TLS/mTLS flags.</li>
 <li><code>--signing-key-file &lt;path&gt;</code> holds the ES256 access-token signing key: generated on first start if absent, then reused. Mount the same file into every NRF replica, or restarts and scale-out invalidate outstanding tokens (#64). <code>--token-expires-in</code> sets the access-token lifetime in seconds (default <code>3600</code>).</li>
 <li><code>-k/--kill</code> is not supported and exits with an error; stop the NRF through its supervisor. <code>-m/--no-color</code> disables colored logs.</li>
 <li><code>--nf-instance-id</code> sets the NRF’s NF Instance ID (OAuth2 <code>iss</code> per TS 29.510 §6.3.5.2.4, per code comments); auto-generated UUID otherwise.</li>

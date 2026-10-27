@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e91a4036.js";
+            window.path_to_searchindex_js = "../searchindex-f1de496b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -216,7 +216,7 @@ lmf:
 <p>Everything else in the shipped example file is decorative — unknown keys are silently ignored:</p>
 <ul>
 <li><strong><code>logger.level</code> is read.</strong> The log level is <code>-e/--log-level</code> when given, else this file’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code>, when set, overrides all three (#691).</li>
-<li><strong><code>lmf.sbi.server[]</code> (address/advertise/port) is inert.</strong> The SBI bind address and port come only from <code>--sbi-addr</code>/<code>--sbi-port</code>; the docker deployment passes them on the command line (<code>--sbi-addr 172.23.0.32 --sbi-port 7777</code>).</li>
+<li><strong><code>lmf.sbi.server[0]</code> is read (#1312).</strong> The SBI bind is <code>--sbi-addr</code>/<code>--sbi-port</code>, else <code>address</code>/<code>port</code> here, else <code>127.0.0.1</code> and the default port. The advertised host is <code>--sbi-advertise</code>, else <code>NEXTGCORE_SBI_ADVERTISE</code>, else <code>advertise</code> here, else the bind address when it is not a wildcard; it is used in the NRF registration and the N1N2 notify callback URIs; the callbacks fall back to <code>127.0.0.1</code> only when the bind is a wildcard and nothing is set to advertise. A wildcard is never advertised: with a wildcard bind and nothing set to advertise, the NF does not register and logs why. A config that does not parse fails startup (#1313).</li>
 <li><strong><code>lmf.nrf.uri</code> is inert.</strong> The NRF URI comes only from the <code>--nrf-uri</code> flag (default <code>http://127.0.0.1:7777</code>). The docker deployment passes <code>--nrf-uri http://172.23.0.10:7777</code> explicitly — setting only the YAML field has no effect.</li>
 </ul>
 <h2 id="command-line-flags"><a class="header" href="#command-line-flags">Command-line flags</a></h2>
@@ -231,7 +231,8 @@ lmf:
 <tr><td><code>-e, --log-level</code></td><td>string</td><td><code>logger.level</code>, else <code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>; anything else is <code>info</code>). Without the flag, the config’s <code>logger.level</code>, else <code>info</code>; <code>RUST_LOG</code> overrides both (#691).</td></tr>
 <tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td>Accepted but currently <strong>unused</strong> — the daemon never reads this field.</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Accepted but currently <strong>unused</strong>.</td></tr>
-<tr><td><code>--sbi-addr</code></td><td>string</td><td><code>0.0.0.0</code></td><td>SBI server bind address. Also used as the advertised host for N1N2 notify callback URIs — <code>0.0.0.0</code> falls back to <code>127.0.0.1</code> (see behavior notes).</td></tr>
+<tr><td><code>--sbi-addr</code></td><td>string</td><td><code>lmf.sbi.server[0].address</code>, else <code>127.0.0.1</code> (#1308)</td><td>SBI server bind address; beats the YAML (#1312).</td></tr>
+<tr><td><code>--sbi-advertise</code></td><td>string</td><td>unset</td><td>The advertised SBI host (#1312); then <code>NEXTGCORE_SBI_ADVERTISE</code>, then <code>lmf.sbi.server[0].advertise</code>, then the bind address when it is not a wildcard.</td></tr>
 <tr><td><code>--sbi-port</code></td><td>u16</td><td><code>7816</code></td><td>SBI server port (docker deployments pass <code>7777</code>).</td></tr>
 <tr><td><code>--tls</code></td><td>flag</td><td>off</td><td>Enable TLS on the SBI server.</td></tr>
 <tr><td><code>--tls-cert</code></td><td>path</td><td><code>/etc/nextgcore/tls/server.crt</code> (when <code>--tls</code>)</td><td>TLS certificate file.</td></tr>
@@ -299,7 +300,7 @@ lmf:
 <p><strong>Response-time budget.</strong> The handler waits <code>min(maxRespTime, QoS bound, 20 s hard cap)</code> for the positioning outcome; <code>responseTime: LOW_DELAY</code> caps the wait at 5 s and <code>NO_DELAY</code> waits not at all (<code>maxRespTime: 0</code> is rejected 504 immediately). SBI client timeouts (2 s connect / 3 s request) nest inside this cap.</p>
 </li>
 <li>
-<p><strong>Callback reachability.</strong> The N1N2 notify callback base advertised to the AMF is <code>http://&lt;sbi-addr&gt;:&lt;sbi-port&gt;</code>; when <code>--sbi-addr</code> is the default <code>0.0.0.0</code> it falls back to <code>127.0.0.1</code>, so in any multi-host or container deployment you must bind to (or pass) a concretely reachable address — the docker compose passes <code>172.23.0.32</code>.</p>
+<p><strong>Callback reachability.</strong> The N1N2 notify callback base advertised to the AMF is <code>http://&lt;advertised host&gt;:&lt;sbi-port&gt;</code> (#1312); with a wildcard bind and nothing set to advertise it falls back to <code>127.0.0.1</code> (the default bind is <code>127.0.0.1</code> since #1308), so in any multi-host or container deployment you must bind to, or advertise, a concretely reachable address — the docker compose passes <code>172.23.0.32</code>.</p>
 </li>
 <li>
 <p><strong>No state file.</strong> All measurement contexts, positioning sessions, LDR registrations, and stored fixes live in memory and are lost on restart; periodic-LDR scheduler tasks are aborted on shutdown, and EventNotify delivery retries exactly once before auto-cancelling the deferred session (no infinite retry).</p>

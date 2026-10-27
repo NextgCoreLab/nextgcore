@@ -397,10 +397,16 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
         let server_identity = self.server_identity.clone();
         let overload_reporter = self.overload_reporter.clone();
         let path = req.uri().path().to_string();
+        let method = req.method().as_str().to_string();
+        // #1334: every request this NF serves is counted, whichever branch below
+        // answers it (a size, body, or token rejection included); the probes are not.
+        let probe = path == "/health" || path == "/ready" || path == "/live";
+        let started = std::time::Instant::now();
+        let counted = (!probe).then(|| (method, path.clone()));
 
-        Box::pin(async move {
+        let serve = Box::pin(async move {
             // Health/readiness probe — handled before the NF handler
-            if path == "/health" || path == "/ready" || path == "/live" {
+            if probe {
                 let body = Full::new(Bytes::from(r#"{"status":"healthy"}"#));
                 return Ok(Response::builder()
                     .status(200)
@@ -532,6 +538,18 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
             );
 
             Ok(response)
+        });
+        Box::pin(async move {
+            let result: Result<Self::Response, Self::Error> = serve.await;
+            if let (Some((method, path)), Ok(response)) = (counted, &result) {
+                nextgcore_metrics::nf::record_sbi_request(
+                    &method,
+                    &path,
+                    response.status().as_u16(),
+                    started.elapsed(),
+                );
+            }
+            result
         })
     }
 }
@@ -2252,6 +2270,83 @@ mod tests {
         assert_eq!(ok.status, 200);
 
         server.stop().await.expect("value expected");
+    }
+
+    /// #1334: every request the server answers is counted for `/metrics` by service,
+    /// operation template and status -- the handler's answers and the server's own
+    /// rejections (413 here) alike -- with no subscriber identifier in a label, and the
+    /// health probes are not counted.
+    ///
+    /// REVERT-VERIFIED: without the `record_sbi_request` call in `SbiService::call`
+    /// no `ntest-metrics` series is rendered and the first assertion fails.
+    #[tokio::test]
+    async fn served_requests_are_counted_by_service_operation_and_status_1334() {
+        use crate::client::SbiClient;
+        let config = SbiServerConfig::default().with_max_request_body_size(64);
+        let (server, port) = start_test_server(config, |req: SbiRequest| async move {
+            if req.header.uri.contains("missing") {
+                SbiResponse::with_status(404)
+            } else {
+                SbiResponse::ok()
+            }
+        })
+        .await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        let supi = "imsi-001017777777777";
+        for (path, want) in [
+            (format!("/ntest-metrics/v1/{supi}/am-data"), 200),
+            (format!("/ntest-metrics/v1/{supi}/missing"), 404),
+        ] {
+            let r = client
+                .send_request(SbiRequest::get(&path))
+                .await
+                .expect("answered");
+            assert_eq!(r.status, want);
+        }
+        let big = "x".repeat(10_000);
+        let r = client
+            .send_request(SbiRequest::post("/ntest-metrics/v1/echo").with_body(&big, "text/plain"))
+            .await
+            .expect("answered");
+        assert_eq!(r.status, 413);
+        let r = client
+            .send_request(SbiRequest::get("/health"))
+            .await
+            .expect("answered");
+        assert_eq!(r.status, 200);
+
+        let mut out = String::new();
+        nextgcore_metrics::nf::render_sbi(&mut out);
+        let value = |series: &str| nextgcore_metrics::nf::sample_value(&out, series);
+        assert_eq!(
+            value(
+                r#"nextgcore_sbi_request_total{service="ntest-metrics",operation="GET {id}/am-data",status="200"}"#
+            ),
+            Some(1.0),
+            "{out}"
+        );
+        assert_eq!(
+            value(
+                r#"nextgcore_sbi_error_total{service="ntest-metrics",operation="GET {id}/missing",status="404"}"#
+            ),
+            Some(1.0),
+            "{out}"
+        );
+        assert_eq!(
+            value(
+                r#"nextgcore_sbi_error_total{service="ntest-metrics",operation="POST echo",status="413"}"#
+            ),
+            Some(1.0),
+            "the server's own rejection is counted too: {out}"
+        );
+        assert_eq!(
+            value(r#"nextgcore_sbi_request_duration_seconds_count{service="ntest-metrics"}"#),
+            Some(3.0),
+            "{out}"
+        );
+        assert!(!out.contains("health"), "probes are not counted: {out}");
+        assert!(!out.contains("7777777777"), "no SUPI in a label: {out}");
+        server.stop().await.expect("stopped");
     }
 
     // --- T1.3: handler panic guard ---

@@ -4935,6 +4935,10 @@ mod tests {
             );
 
             // Unpaused, the worker's next tick gets 404 and must put it back.
+            // #1334: and `/metrics` sees the loss and the re-registration.
+            let lost_before = nextgcore_metrics::nf::nrf_heartbeat_count(
+                nextgcore_metrics::nf::HeartbeatOutcome::NotFound,
+            );
             hb::set_heartbeat_paused(false);
             let restored = nextgcore_sbi::test_support::poll_until(
                 Duration::from_secs(15),
@@ -4949,6 +4953,24 @@ mod tests {
             );
             let resp = client.get(&path).await.expect("GET after re-register");
             assert_eq!(resp.status, 200, "and it must be readable through the API");
+            assert!(
+                nextgcore_metrics::nf::nrf_heartbeat_count(
+                    nextgcore_metrics::nf::HeartbeatOutcome::NotFound
+                ) > lost_before,
+                "the 404 heartbeat is counted (#1334)"
+            );
+            // The next accepted heartbeat (1 s interval) marks it registered again.
+            let registered = nextgcore_sbi::test_support::poll_until(
+                Duration::from_secs(10),
+                Duration::from_millis(50),
+                || async { nextgcore_metrics::nf::is_nrf_registered().then_some(()) },
+            )
+            .await;
+            assert_eq!(
+                registered,
+                Some(()),
+                "nextgcore_nrf_registered returns to 1"
+            );
 
             // Pause again before teardown, so no tick re-registers while the
             // globals are restored below.

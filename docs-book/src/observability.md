@@ -2,19 +2,20 @@
 
 NextGCore ships a Docker-based observability stack (Prometheus, Grafana, Jaeger) alongside its 28 network-function daemons, plus an in-tree metrics/tracing library (`src/libs/nextgcore-metrics/`). This chapter documents what actually works today — which endpoints exist, which are scaffolding, how logging is really configured per NF — and gives a code-grounded troubleshooting table and the one-command E2E recipe.
 
-> **Honesty note:** NextGCore behavior is validated by this project's own unit tests and matched-simulator docker E2E (run nightly by `.github/workflows/ci.yml`), not by third-party conformance certification. The observability stack described here is exactly what ships in this repo — it is **not** a certified telco OAM system. In particular, the library `MetricsServer` and the OpenTelemetry OTLP exporters in `nextgcore-metrics` are **structural stubs**. Three NFs (smfd, upfd, sgwud) now serve a small set of runtime gauges over HTTP through a separate helper; every other NF serves no scrapeable metrics, and no NF exports spans. Each gap is called out explicitly below.
+> **Honesty note:** NextGCore behavior is validated by this project's own unit tests and matched-simulator docker E2E (run nightly by `.github/workflows/ci.yml`), not by third-party conformance certification. The observability stack described here is exactly what ships in this repo — it is **not** a certified telco OAM system. In particular, the library `MetricsServer` and the OpenTelemetry OTLP exporters in `nextgcore-metrics` are **structural stubs**. smfd, upfd, sgwud and amfd serve runtime metrics over HTTP through a separate helper (amfd also the families every SBI NF shares, below); every other NF serves no scrapeable metrics yet (#1334 adds them NF by NF), and no NF exports spans. Each gap is called out explicitly below.
 
 ## Metrics
 
 ### What the library provides — and what it does not
 
-`src/libs/nextgcore-metrics/src/server.rs` defines a `MetricsServer` documented to serve two HTTP endpoints — `/` (health check, returns "OK") and `/metrics` (Prometheus text exposition) — and `src/libs/nextgcore-metrics/src/lib.rs` defines `DEFAULT_PROMETHEUS_HTTP_PORT: u16 = 9090`. However, `MetricsServer::start()` does **not** bind a socket: it logs `metrics_server() [http://<addr>]:<port>`, flips its state to `Running`, and returns (the code comment reads "In a real implementation, this would start an HTTP server using hyper"). What does serve HTTP is a different, minimal helper: `nextgcore_metrics::nes_energy::serve_metrics(addr, render)` (`src/libs/nextgcore-metrics/src/nes_energy.rs`) binds a TCP listener, logs `metrics endpoint listening on http://<addr>/metrics`, and answers with whatever text the NF's `render` closure returns. Three daemons call it unconditionally, and two more behind off-by-default cargo features:
+`src/libs/nextgcore-metrics/src/server.rs` defines a `MetricsServer` documented to serve two HTTP endpoints — `/` (health check, returns "OK") and `/metrics` (Prometheus text exposition) — and `src/libs/nextgcore-metrics/src/lib.rs` defines `DEFAULT_PROMETHEUS_HTTP_PORT: u16 = 9090`. However, `MetricsServer::start()` does **not** bind a socket: it logs `metrics_server() [http://<addr>]:<port>`, flips its state to `Running`, and returns (the code comment reads "In a real implementation, this would start an HTTP server using hyper"). What does serve HTTP is a different, minimal helper: `nextgcore_metrics::nes_energy::serve_metrics(addr, render)` (`src/libs/nextgcore-metrics/src/nes_energy.rs`) binds a TCP listener, logs `metrics endpoint listening on http://<addr>/metrics`, and answers with whatever text the NF's `render` closure returns. Four daemons call it unconditionally, and two more behind off-by-default cargo features:
 
 | NF daemon | Metrics served on `/metrics` | Port |
 |---|---|---|
 | `nextgcore-smfd` | `smf_n4_associations`, `smf_n4_peers`, `smf_sessions`, `smf_up` (and the PGW-C S5/S8 binding) | 9090, or `SMF_METRICS_PORT` |
 | `nextgcore-upfd` | `upf_pfcp_associations`, `upf_pfcp_sessions`, `upf_pfcp_unauthorized_messages_total`, `upf_up`, `upf_dataplane_{ul,dl}_{packets,bytes}_total` and dropped/oversize/spoofed packet counters | 9090, or `UPF_METRICS_PORT` |
 | `nextgcore-sgwud` | `sgwu_pfcp_sessions`, `sgwu_pfcp_associations`, `sgwu_pfcp_unauthorized_messages_total`, `sgwu_up` | 9090, or `SGWU_METRICS_PORT` |
+| `nextgcore-amfd` | the shared SBI, NRF-client and process families (below), and the AMF families (below) | 9090, or `AMF_METRICS_PORT` |
 | `nextgcore-udmd` | NES energy gauges, only with `--features nes` | NES `metrics_port` (default 9090) |
 | `nextgcore-nsacfd` | slice-SLA observe gauges, only with `--features sla-observe` | its `metrics_port` when > 0 |
 
@@ -26,7 +27,6 @@ The other NF daemons serve **no** Prometheus metrics over HTTP:
 
 | NF daemon | Prometheus metrics served | Notes |
 |---|---|---|
-| `nextgcore-amfd` | none | Defines full metric families in `src/bins/nextgcore-amfd/src/metrics.rs` — which the file's own header attributes as a "Port of src/amf/metrics.c", the Open5GS AMF metrics module — with a `export_prometheus()` exposition method (see below), but no HTTP endpoint serves it, and no runtime code path increments the counters (call sites exist only in unit tests). The **only** NF binary that does *not* call `init_otel` at startup. |
 | `nextgcore-ausfd` | none | Links `nextgcore-metrics`; calls `otel::init_otel` at startup (`src/app.rs`). |
 | `nextgcore-bsfd` | none | Same; `init_otel` in `src/lib.rs`. |
 | `nextgcore-dccfd` | none | Same; `init_otel` in `src/main.rs`. |
@@ -49,32 +49,53 @@ The other NF daemons serve **no** Prometheus metrics over HTTP:
 | `nextgcore-udrd` | none | Same. |
 | `nextgcore-easdfd`, `nextgcore-nefd`, `nextgcore-tsctsf`, `nextgcore-ucmfd` | none | Same. |
 
-Apart from the five `serve_metrics` callers above, the NF crates use `nextgcore-metrics` only for the `init_otel` call (see Tracing); the AMF is the one NF with full metric-family definitions, and it serves none of them.
+Apart from the `serve_metrics` callers above, the NF crates use `nextgcore-metrics` only for the `init_otel` call (see Tracing).
 
-### AMF metric families (`src/bins/nextgcore-amfd/src/metrics.rs`)
+### Families every SBI NF shares (`src/libs/nextgcore-metrics/src/nf.rs`, #1334)
 
-These are the metric names the AMF defines, mirroring Open5GS's `src/amf/metrics.c` (the only attribution the file itself gives — TS 28.552 is not cited anywhere in this repo). They are held in an in-process `AmfMetrics` registry with a Prometheus-format `export_prometheus()` method — ready to be wired to an HTTP endpoint, but not yet served or incremented at runtime:
+Recorded by the shared SBI server and NRF heartbeat worker (`nextgcore-sbi`), so an NF serves them as soon as it has a `/metrics` endpoint:
 
-| Metric | Type | Counts |
-|---|---|---|
-| `ran_ue` | gauge | RAN UEs |
-| `amf_session` | gauge | AMF sessions |
-| `gnb` | gauge | gNodeBs |
-| `fivegs_amffunction_rm_reginitreq` / `_reginitsucc` | counter | Initial registration requests / successes |
-| `fivegs_amffunction_rm_regmobreq` / `_regmobsucc` | counter | Mobility registration update requests / successes |
-| `fivegs_amffunction_rm_regperiodreq` / `_regperiodsucc` | counter | Periodic registration update requests / successes |
-| `fivegs_amffunction_rm_regemergreq` / `_regemergsucc` | counter | Emergency registration requests / successes |
-| `fivegs_amffunction_mm_paging5greq` / `_paging5gsucc` | counter | 5G paging procedures initiated / succeeded |
-| `fivegs_amffunction_amf_authreq` / `_authreject` | counter | Authentication requests sent / rejections sent |
-| `fivegs_amffunction_mm_confupdate` / `_confupdatesucc` | counter | UE Configuration Update commands / completes |
-| `fivegs_amffunction_rm_registeredsubnbr{plmn_id,snssai}` | gauge | Registered subscribers per slice |
-| `fivegs_amffunction_rm_reginitfail` / `_regmobfail` / `_regperiodfail` / `_regemergfail` / `_amf_authfail` `{cause}` | counter | Failed registrations / authentication failures, labeled by cause |
+| Metric | Type | Labels | Counts |
+|---|---|---|---|
+| `nextgcore_sbi_request_total` | counter | `service`, `operation`, `status` | SBI requests this NF served |
+| `nextgcore_sbi_error_total` | counter | `service`, `operation`, `status` | those answered 4xx/5xx |
+| `nextgcore_sbi_request_duration_seconds` | histogram | `service` | time to answer |
+| `nextgcore_nrf_registered` | gauge | | 1 while the NF holds an NRF registration (NFRegister answered, no 404 heartbeat since) |
+| `nextgcore_nrf_registrations_total` | counter | | successful NFRegisters, re-registrations included |
+| `nextgcore_nrf_heartbeats_total` | counter | `result` (`ok`, `not_found`, `rejected`, `transport_error`) | NFUpdate heartbeats |
+| `nextgcore_nrf_last_heartbeat_success_timestamp_seconds` | gauge | | last accepted heartbeat |
+| `process_cpu_seconds_total`, `process_resident_memory_bytes`, `process_virtual_memory_bytes`, `process_open_fds`, `process_start_time_seconds` | | | from `/proc/self` |
+| `nextgcore_uptime_seconds` | gauge | | since process start |
+| `nextgcore_build_info` | gauge | `nf`, `version` | constant 1 |
 
-The library's `NfMetrics` helper (`src/libs/nextgcore-metrics/src/otel.rs`) additionally defines a generic per-NF exposition (`nextgcore_<nf>_sbi_request_total`, `_sbi_error_total`, `_active_sessions`, `_uptime_seconds`, `_nrf_registered`) — also not served by any NF.
+`service` is the SBI service name (`namf-comm`, `nudm-sdm`, ...; `nnrf-oauth2` for `/oauth2/token`; `unknown` otherwise). `operation` is the method and the resource template: the path after the service and version, with every segment that is not a resource name replaced by `{id}` (`GET {id}/am-data`, `PUT nf-instances/{id}`). A SUPI, GPSI, PEI, UUID, IP address or numeric reference never appears in a label. Past 1024 label sets, new ones are counted under `service="other",operation="other"`.
+
+### AMF families (`src/bins/nextgcore-amfd/src/metrics.rs`, #1334)
+
+| Metric | Type | Labels | Counts |
+|---|---|---|---|
+| `amf_registered_ue_count` | gauge | | UEs in RM-REGISTERED (Registration Complete received) |
+| `amf_connected_ue_count` | gauge | | UEs with an N1 signalling connection (CM-CONNECTED) |
+| `nextgcore_amf_active_sessions` | gauge | | PDU sessions the AMF holds |
+| `amf_gnb_count` | gauge | | NG-RAN nodes whose NG Setup succeeded |
+| `amf_gnb_associations` | gauge | | SCTP associations from NG-RAN nodes |
+| `amf_registration_requests_total` | counter | `type` (`initial`, `mobility`, `periodic`, `emergency`, `snpn_onboarding`, `reserved`) | Registration Requests received |
+| `amf_registration_success_total` | counter | | Registration Accepts sent |
+| `amf_registration_failure_total` | counter | | Registration Rejects sent |
+| `amf_registration_reject_cause_total` | counter | `cause` (5GMM cause value) | Registration Rejects by cause |
+| `amf_auth_request_total` | counter | | Authentication Requests sent |
+| `amf_auth_success_total` | counter | | 5G-AKA confirmations the AUSF answered AUTHENTICATION_SUCCESS |
+| `amf_auth_failure_total` | counter | `source` (`network`: Authentication Reject sent; `ue`: Authentication Failure received) | failed authentications |
+| `amf_ngap_messages_total` | counter | `direction` (`rx`, `tx`), `procedure` (TS 38.413 §9.4.7 name), `outcome` (`initiating`, `successful`, `unsuccessful`) | NGAP PDUs |
+| `amf_ngap_failures_total` | counter | `direction`, `procedure` | NGAP unsuccessful outcomes |
+| `amf_ng_reset_ue_idled` | counter | | registered UEs an NG Reset moved to CM-IDLE (#754) |
+| `amf_ngap_ue_associated_refused` | counter | | UE-associated NGAP messages refused for a UE the sender does not serve (#739) |
+
+The NAS counters follow TS 28.552 §5.2.2 "on transmission"/"on receipt": a protected downlink message is counted when NAS security protects it, an unprotected one when it is sent in a DOWNLINK NAS TRANSPORT, and a T3550/T3560 retransmission (a stored PDU sent again) is not counted. The Open5GS-named families still defined in the file (`fivegs_amffunction_*`, `ran_ue`, `amf_session`, `gnb`) are not served: nothing increments them.
 
 ### No `metrics.server` in the YAML (#1312)
 
-No daemon reads a `metrics.server` block, and several have no metrics listener at all (hssd, pcfd, pcrfd, amfd). The shipped configs used to carry one anyway (docker `5gc` amf/pcf/smf/upf, `epc` mme/hss/pcrf/pgwc/pgwu, and the k8s and Helm ConfigMaps). A key that is documented but has no effect is misleading, so the blocks were removed rather than wired up: a daemon's metrics listener is set by its environment variable, `MME_METRICS_ADDR`, `NEXTGCORE_METRICS_BIND` (loopback by default, #1308), `SMF_METRICS_PORT`, `UPF_METRICS_PORT`, `SGWC_METRICS_PORT`, `SGWU_METRICS_PORT` or `UCMF_METRICS_ADDR`, and nothing else.
+No daemon reads a `metrics.server` block, and several have no metrics listener at all (hssd, pcfd, pcrfd). The shipped configs used to carry one anyway (docker `5gc` amf/pcf/smf/upf, `epc` mme/hss/pcrf/pgwc/pgwu, and the k8s and Helm ConfigMaps). A key that is documented but has no effect is misleading, so the blocks were removed rather than wired up: a daemon's metrics listener is set by its environment variable, `MME_METRICS_ADDR`, `NEXTGCORE_METRICS_BIND` (loopback by default, #1308), `SMF_METRICS_PORT`, `AMF_METRICS_PORT`, `UPF_METRICS_PORT`, `SGWC_METRICS_PORT`, `SGWU_METRICS_PORT` or `UCMF_METRICS_ADDR`, and nothing else.
 
 ### The shipped scrape stack
 

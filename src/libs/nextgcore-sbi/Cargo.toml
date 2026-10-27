@@ -21,6 +21,9 @@ pqc-tls = ["rustls/aws-lc-rs"]
 
 [dependencies]
 nextgcore-core = { workspace = true }
+# #1334: the SBI server and the NRF heartbeat worker record into the shared
+# per-NF Prometheus families every NF's /metrics serves.
+nextgcore-metrics = { workspace = true }
 log.workspace = true
 thiserror.workspace = true
 hyper.workspace = true
