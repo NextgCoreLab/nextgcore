@@ -17358,6 +17358,12 @@ mod tests {
     /// cannot have fired while the virtual clock is still short of its delay, however
     /// starved the host; and once the clock is moved past it, the writer finds
     /// nothing pending and writes nothing more. The one write is the shutdown's.
+    /// The paused clock errs only one way: if anything inside the shutdown waits on a
+    /// timer (an SM Policy DELETE or #39 fan-out another test leaked into the shared
+    /// state), the clock jumps to the writer's delay and the test fails loudly on
+    /// `took`; it cannot pass without the shutdown's write. (No pre-drain like
+    /// `settle_sm_policy_deletes_for_test` here: its 20 ms polls and 10 s deadline
+    /// are virtual time on this clock, so it would give up at once.)
     ///
     /// REVERT-VERIFIED: without the shutdown's flush nothing is written by the end of
     /// the shutdown, and the one write comes only from the writer, after its delay.
