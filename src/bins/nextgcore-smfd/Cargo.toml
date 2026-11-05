@@ -67,6 +67,9 @@ nextgcore-ngap = { workspace = true }
 nextgcore-asn1c = { workspace = true }
 proptest.workspace = true
 p256 = { workspace = true, features = ["ecdsa"] }
+# #1381: the coalesced-write tests run on a paused tokio clock, so which path wrote
+# (the graceful shutdown or the 200 ms writer) does not depend on the wall clock.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
