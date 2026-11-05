@@ -17352,9 +17352,16 @@ mod tests {
     /// write is written by the graceful shutdown, at once, not lost with the runtime
     /// before the 200 ms writer fires.
     ///
-    /// REVERT-VERIFIED: without the shutdown's flush nothing is written before the
-    /// writer's delay.
-    #[tokio::test]
+    /// #1381: on a paused clock, so the proof does not depend on the wall clock. The
+    /// coalescing writer sleeps on `tokio::time`, and a paused clock moves only when
+    /// the runtime has nothing else to do, straight to the next timer. So the writer
+    /// cannot have fired while the virtual clock is still short of its delay, however
+    /// starved the host; and once the clock is moved past it, the writer finds
+    /// nothing pending and writes nothing more. The one write is the shutdown's.
+    ///
+    /// REVERT-VERIFIED: without the shutdown's flush nothing is written by the end of
+    /// the shutdown, and the one write comes only from the writer, after its delay.
+    #[tokio::test(start_paused = true)]
     async fn the_shutdown_writes_a_pending_coalesced_change() {
         use crate::n4_build::{build_session_modification_request, SessionModificationParams};
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
@@ -17387,7 +17394,7 @@ mod tests {
             .unwrap()
             .persist_writes
             .load(Ordering::Relaxed);
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         assert!(handle
             .read()
             .unwrap()
@@ -17414,18 +17421,35 @@ mod tests {
             tokio::time::Instant::now() + std::time::Duration::from_secs(5),
         )
         .await;
-        let written = handle
+        let writes = || {
+            handle
+                .read()
+                .unwrap()
+                .persist_writes
+                .load(Ordering::Relaxed)
+                - before
+        };
+        let written = writes();
+        // Virtual time: it reaches the writer's delay only by firing the writer.
+        let took = started.elapsed();
+        let still_pending = handle
             .read()
             .unwrap()
-            .persist_writes
-            .load(Ordering::Relaxed)
-            - before;
-        let took = started.elapsed();
+            .persist_pending
+            .load(Ordering::SeqCst);
+        // Past the writer's delay: it wakes, finds nothing pending, writes nothing.
+        tokio::time::sleep(context::PERSIST_COALESCE * 2).await;
+        let written_after_the_writer = writes();
         assert!(
             took < context::PERSIST_COALESCE,
-            "measured before the writer's own delay: {took:?}"
+            "the writer's delay had not passed when the shutdown returned: {took:?}"
         );
         assert_eq!(written, 1, "the shutdown wrote the pending change");
+        assert!(!still_pending, "and cleared it");
+        assert_eq!(
+            written_after_the_writer, 1,
+            "the writer found nothing left to write"
+        );
     }
 
     /// #1075 (#1028 round 2 m2): a burst of FAR-peer changes on durable sessions is
@@ -17433,7 +17457,10 @@ mod tests {
     /// within the coalescing delay.
     ///
     /// REVERT-VERIFIED: persisting per change makes 200 writes.
-    #[tokio::test]
+    ///
+    /// #1381: on a paused clock, so a starved host cannot wake this test and the
+    /// writer in the same turn of the timer and poll the test first.
+    #[tokio::test(start_paused = true)]
     async fn a_burst_of_far_edits_is_written_once() {
         use crate::n4_build::{build_session_modification_request, SessionModificationParams};
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
