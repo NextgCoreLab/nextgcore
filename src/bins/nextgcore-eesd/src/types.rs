@@ -98,8 +98,10 @@ impl EndPoint {
 pub struct EasServiceKpi {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_req_rate: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_resp_time: Option<u32>,
+    /// Maximum response time the EAS advertises, in **milliseconds**
+    /// (TS 29.558 `maxRespTime`, `29558-j70.txt` l.7695-7698).
+    #[serde(rename = "maxRespTime", skip_serializing_if = "Option::is_none")]
+    pub max_resp_time_ms: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub availability: Option<u32>,
     /// Available compute (TS 29.558 `avlComp`).
@@ -237,7 +239,7 @@ impl AppGroupProfile {
         }
         match (
             self.e2e_resp_time,
-            eas.svc_kpi.as_ref().and_then(|k| k.max_resp_time),
+            eas.svc_kpi.as_ref().and_then(|k| k.max_resp_time_ms),
         ) {
             (Some(want), Some(have)) => have <= want,
             _ => true,
