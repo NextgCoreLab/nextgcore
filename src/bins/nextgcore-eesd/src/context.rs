@@ -93,7 +93,7 @@ fn eas_suffices_kpis(eas: &EasProfile, required: Option<&AcServiceKpis>) -> bool
         }
     }
     // Availability and request rate: the EAS must offer at least what is asked.
-    if let (Some(want), Some(have)) = (req.avail, advertised.and_then(|k| k.availability)) {
+    if let (Some(want), Some(have)) = (req.avail, advertised.and_then(|k| k.avail)) {
         if have < want {
             return false;
         }

@@ -637,7 +637,7 @@ mod tests {
             "requestorEndPt":{"fqdn":"ees-src.example.com"},
             "easId":"common-eas.example.com",
             "easEndPt":{"fqdn":"common-eas.edge.example.com","port":443},
-            "serviceKpisList":{"conBdwth":"100 Mbps"},
+            "serviceKpisList":{"connBand":"100 Mbps"},
             "ednInfo":{"ednServiceArea":{"tais":[]}},
             "appGrpId":"grp-1",
             "suppFeat":"1"
