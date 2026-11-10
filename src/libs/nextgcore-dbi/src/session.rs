@@ -28,6 +28,16 @@ pub fn nextgcore_dbi_session_data(
     let supi_id =
         nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
 
+    // #1383: a test that provisioned a subscriber DOCUMENT answers from it, through the
+    // same slice/DNN matching and `parse_session_data` below -- so a pcfd test can seed
+    // a subscriber whose QoS and AMBR differ from the defaults and drive its real
+    // Nudr read. Off unless a test provisioned one, so no other test's view changes.
+    #[cfg(any(test, feature = "test-helpers"))]
+    if crate::test_store::documents_active() {
+        let document = crate::test_store::subscriber_document(supi)?;
+        return session_data_from_document(&document, &supi_id, s_nssai, dnn);
+    }
+
     let collection = get_subscriber_collection()?;
     let query = doc! { &supi_type: &supi_id };
 
@@ -35,6 +45,17 @@ pub fn nextgcore_dbi_session_data(
         .find_one(query, None)?
         .ok_or_else(|| DbiError::SubscriberNotFound(supi.to_string()))?;
 
+    session_data_from_document(&document, &supi_id, s_nssai, dnn)
+}
+
+/// The slice/DNN match over one subscriber document, shared by the MongoDB path and
+/// the test mirror so the two cannot diverge.
+fn session_data_from_document(
+    document: &Document,
+    supi_id: &str,
+    s_nssai: Option<&NextgcoreSNssai>,
+    dnn: &str,
+) -> DbiResult<NextgcoreSessionData> {
     // Find matching session in slice array
     let slice_array = document
         .get_array(NEXTGCORE_SLICE_STRING)

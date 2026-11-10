@@ -33,6 +33,13 @@ static STORE: Mutex<Option<HashMap<String, NextgcoreDbiAuthInfo>>> = Mutex::new(
 /// in Mongo (`subscriber.msisdn` vs `subscriber.security`).
 static IDENTITIES: Mutex<Option<HashMap<String, Vec<String>>>> = Mutex::new(None);
 
+/// Subscriber DOCUMENT mirror (#1383): SUPI -> the subscriber's MongoDB document, as
+/// a test provisioned it. Answers `nextgcore_dbi_session_data`, which then runs the
+/// SAME slice/DNN match and `parse_session_data` it runs over a Mongo document, so a
+/// test seeds the real shape rather than a pre-parsed result. Separate from [`STORE`]
+/// for the reason [`IDENTITIES`] is: enabling one must not change what the others see.
+static DOCUMENTS: Mutex<Option<HashMap<String, mongodb::bson::Document>>> = Mutex::new(None);
+
 /// Enable the in-memory store. Idempotent: an already-enabled store keeps its
 /// contents so parallel tests (using distinct SUPIs) do not clobber each other.
 pub fn enable() {
@@ -46,6 +53,44 @@ pub fn enable() {
 pub fn disable() {
     *STORE.lock().unwrap() = None;
     *IDENTITIES.lock().unwrap() = None;
+    *DOCUMENTS.lock().unwrap() = None;
+}
+
+/// Provision a subscriber's MongoDB document (the `subscribers` collection shape:
+/// `slice: [{ sst, sd?, session: [{ name, qos, ambr, .. }] }]`), so the session-data
+/// read answers from it without MongoDB. Upserts; other SUPIs are untouched, so
+/// parallel tests with distinct SUPIs do not clobber each other.
+pub fn provision_subscriber_document(supi: &str, document: mongodb::bson::Document) {
+    DOCUMENTS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(supi.to_string(), document);
+}
+
+/// Whether any subscriber document has been provisioned.
+pub(crate) fn documents_active() -> bool {
+    DOCUMENTS.lock().unwrap().is_some()
+}
+
+/// Mirror of the `{ <idType>: <idValue> }` `find_one` over the `subscribers`
+/// collection: the provisioned document whose SUPI has the same identity value,
+/// else `SubscriberNotFound`, as Mongo answers an unknown subscriber.
+pub(crate) fn subscriber_document(supi: &str) -> DbiResult<mongodb::bson::Document> {
+    let value = crate::types::nextgcore_id_get_value(supi)
+        .ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    DOCUMENTS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| {
+            m.iter()
+                .find(|(k, _)| {
+                    crate::types::nextgcore_id_get_value(k).as_deref() == Some(value.as_str())
+                })
+                .map(|(_, d)| d.clone())
+        })
+        .ok_or_else(|| DbiError::SubscriberNotFound(supi.to_string()))
 }
 
 /// Provision a subscriber's identities (SUPI + its MSISDN GPSIs), so a handler
@@ -259,5 +304,54 @@ mod tests {
         .expect("re-provision");
         assert!(!created, "existing subscriber must be updated, not created");
         assert_eq!(super::stored_sqn(supi), Some(0x40));
+    }
+    /// #1383: the document mirror answers `nextgcore_dbi_session_data` through the
+    /// REAL slice/DNN match and parser -- a provisioned 5QI and AMBR come back as the
+    /// Mongo path would parse them, another DNN is `SessionNotFound`, an unknown
+    /// subscriber `SubscriberNotFound`, and an empty SUPI still `InvalidSupi`.
+    #[test]
+    fn a_provisioned_subscriber_document_answers_the_session_data_read() {
+        use crate::mongoc::DbiError;
+        use crate::session::nextgcore_dbi_session_data;
+        use crate::types::NextgcoreSNssai;
+        use mongodb::bson::doc;
+
+        let supi = "imsi-999990000001383";
+        super::provision_subscriber_document(
+            supi,
+            doc! {
+                "imsi": "999990000001383",
+                "slice": [{
+                    "sst": 1,
+                    "session": [{
+                        "name": "internet",
+                        "qos": { "index": 7, "arp": { "priority_level": 3,
+                            "pre_emption_capability": 1, "pre_emption_vulnerability": 1 } },
+                        "ambr": { "downlink": { "value": 20, "unit": 2 },
+                                  "uplink": { "value": 10, "unit": 2 } },
+                    }],
+                }],
+            },
+        );
+        let s_nssai = NextgcoreSNssai::new(1, None);
+        let got = nextgcore_dbi_session_data(supi, Some(&s_nssai), "internet")
+            .expect("the provisioned session");
+        assert_eq!(got.session.qos.index, 7);
+        assert_eq!(got.session.qos.arp.priority_level, 3);
+        assert_eq!(got.session.ambr.uplink, 10_000_000);
+        assert_eq!(got.session.ambr.downlink, 20_000_000);
+
+        assert!(matches!(
+            nextgcore_dbi_session_data(supi, Some(&s_nssai), "ims"),
+            Err(DbiError::SessionNotFound)
+        ));
+        assert!(matches!(
+            nextgcore_dbi_session_data("imsi-999990000009999", Some(&s_nssai), "internet"),
+            Err(DbiError::SubscriberNotFound(_))
+        ));
+        assert!(matches!(
+            nextgcore_dbi_session_data("", Some(&s_nssai), "internet"),
+            Err(DbiError::InvalidSupi(_))
+        ));
     }
 }

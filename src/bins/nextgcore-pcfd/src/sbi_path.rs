@@ -722,33 +722,68 @@ pub fn pcf_sbi_send_smpolicycontrol_create_response(sess_id: u64, stream_id: u64
     true
 }
 
-/// Build the SmPolicyNotification body for a session (TS 29.512 §5.6.2.7).
-fn build_sm_policy_notification(sess: &crate::context::PcfSess) -> serde_json::Value {
+/// The SUPI of the UE a PDU session's SM policy belongs to.
+///
+/// `PcfSess` carries no SUPI of its own: it is on the parent `PcfUeSm`, reached
+/// through `pcf_ue_sm_id` (the #310 resolution). `None` for a session whose UE-SM
+/// is gone, or that resolves an empty SUPI -- neither names a subscriber, and the
+/// DB read for one (`nextgcore_dbi_session_data("")`) fails `InvalidSupi` and falls
+/// back to a decision belonging to nobody (#1383).
+pub(crate) fn session_supi(sess: &crate::context::PcfSess) -> Option<String> {
+    crate::context::pcf_self()
+        .read()
+        .ok()
+        .and_then(|ctx| ctx.ue_sm_find_by_id(sess.pcf_ue_sm_id))
+        .map(|ue| ue.supi)
+        .filter(|supi| !supi.is_empty())
+}
+
+/// Build the `SmPolicyNotification` (TS 29.512 §5.6.2.5) a §4.2.3.2 UpdateNotify
+/// carries for a session, its `smPolicyDecision` re-derived from the subscriber's
+/// session data.
+///
+/// `None` when there is no decision to send: the session's SUPI cannot be resolved,
+/// or the session data cannot be read. Before #1383 this read the session data for
+/// an EMPTY SUPI, which fails `InvalidSupi`, so every UpdateNotify carried the DB
+/// fallback (5QI 9, 100 Mbps) -- or `{}` -- and the SMF installed it over the live
+/// session's Session-AMBR and 5QI. Sending nothing leaves the SMF enforcing what it
+/// has, which is the only answer that is not wrong.
+fn build_sm_policy_notification(sess: &crate::context::PcfSess) -> Option<serde_json::Value> {
+    let Some(supi) = session_supi(sess) else {
+        log::warn!(
+            "[sm_policy_id={}] SM policy update notify: the session's UE-SM (id={}) is              gone, so its SUPI cannot be resolved -- no notify is sent and the SMF keeps              the policy it has",
+            sess.sm_policy_id,
+            sess.pcf_ue_sm_id
+        );
+        return None;
+    };
     // Re-evaluate the policy decision for the session from subscription data
     let dnn = sess.dnn.clone().unwrap_or_else(|| "internet".to_string());
-    let decision = crate::nudr_handler::pcf_get_session_data("", None, &sess.s_nssai, &dnn)
-        .map(|sd| {
-            let parts = crate::sm_policy_build::build_sm_policy_decision(&sess.sm_policy_id, &sd);
-            let mut chg_decs = parts.chg_decs;
-            // #299: overlay the UDR's SmPolicyDnnData charging flags, exactly as the
-            // create path does. Without this a re-authorisation rebuilt `chgDecs` from
-            // the local default and silently reverted a subscriber whose policy data
-            // says otherwise -- so the notify LOOKED like a decision and undid one.
-            apply_policy_dnn_charging(&mut chg_decs, sess.policy_dnn_data.as_ref());
-            serde_json::json!({
-                "sessRules": parts.sess_rules,
-                "pccRules": parts.pcc_rules,
-                "qosDecs": parts.qos_decs,
-                "chgDecs": chg_decs,
-                "traffContDecs": parts.traff_cont_decs,
-            })
-        })
-        .unwrap_or_else(|| serde_json::json!({}));
-
-    serde_json::json!({
+    let Some(sd) = crate::nudr_handler::pcf_get_session_data(&supi, None, &sess.s_nssai, &dnn)
+    else {
+        log::warn!(
+            "[{supi}] SM policy update notify for sm_policy_id={}: no session data, so              no notify is sent",
+            sess.sm_policy_id
+        );
+        return None;
+    };
+    let parts = crate::sm_policy_build::build_sm_policy_decision(&sess.sm_policy_id, &sd);
+    let mut chg_decs = parts.chg_decs;
+    // #299: overlay the UDR's SmPolicyDnnData charging flags, exactly as the
+    // create path does. Without this a re-authorisation rebuilt `chgDecs` from
+    // the local default and silently reverted a subscriber whose policy data
+    // says otherwise -- so the notify LOOKED like a decision and undid one.
+    apply_policy_dnn_charging(&mut chg_decs, sess.policy_dnn_data.as_ref());
+    Some(serde_json::json!({
         "resourceUri": pcf_resource_uri(&format!("/npcf-smpolicycontrol/v1/sm-policies/{}", sess.sm_policy_id)),
-        "smPolicyDecision": decision,
-    })
+        "smPolicyDecision": {
+            "sessRules": parts.sess_rules,
+            "pccRules": parts.pcc_rules,
+            "qosDecs": parts.qos_decs,
+            "chgDecs": chg_decs,
+            "traffContDecs": parts.traff_cont_decs,
+        },
+    }))
 }
 
 /// Map a `SmPolicyDnnData`'s `online`/`offline` flags (TS 29.519 §5.6.2.x) onto every
@@ -801,7 +836,9 @@ pub fn pcf_sbi_send_smpolicycontrol_update_notify(sess_id: u64) -> bool {
         log::warn!("[sess_id={sess_id}] SM policy update notify: no notification URI stored");
         return false;
     };
-    let body = build_sm_policy_notification(&sess);
+    let Some(body) = build_sm_policy_notification(&sess) else {
+        return false;
+    };
     spawn_notification(uri, "/update", body, "SM policy update")
 }
 
