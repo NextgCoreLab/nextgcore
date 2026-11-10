@@ -81,14 +81,18 @@ fn query_subscription_data(supi: &str) -> Option<SubscriptionData> {
     }
 }
 
-/// Get session data from database via nextgcore-dbi
-/// In C: pcf_get_session_data()
-pub fn pcf_get_session_data(
+/// Read a subscriber's session data from the database via nextgcore-dbi, REPORTING
+/// a failure (invalid SUPI, unknown subscriber or DNN, DB down) as `Err` rather
+/// than answering a default.
+///
+/// #1383: what a RE-evaluation of a live session reads (the UpdateNotify, the GET).
+/// A default there is not a decision for the subscriber but a reset of it, so the
+/// caller has to be able to tell "the DB says" from "the DB failed".
+pub fn pcf_read_session_data(
     supi: &str,
-    _plmn_id: Option<&crate::context::PlmnId>,
     s_nssai: &crate::context::SNssai,
     dnn: &str,
-) -> Option<SessionData> {
+) -> Result<SessionData, String> {
     log::debug!("Getting session data for SUPI={supi}, S-NSSAI={s_nssai:?}, DNN={dnn}");
 
     let nextgcore_snssai = nextgcore_dbi::NextgcoreSNssai::new(s_nssai.sst, s_nssai.sd);
@@ -132,7 +136,7 @@ pub fn pcf_get_session_data(
                 sess_data.num_of_pcc_rule
             );
 
-            Some(SessionData {
+            Ok(SessionData {
                 qos_index: qos.index,
                 arp_priority_level: qos.arp.priority_level,
                 arp_preempt_cap: qos.arp.pre_emption_capability != 0,
@@ -142,6 +146,25 @@ pub fn pcf_get_session_data(
                 pcc_rules,
             })
         }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Get session data from database via nextgcore-dbi, falling back to the local
+/// default (5QI 9, 100/100 Mbps) when the read fails.
+/// In C: pcf_get_session_data()
+///
+/// For the CREATE only, where there is no previous decision and the documented
+/// fallback is the session's first one. A re-evaluation of a live session reads
+/// [`pcf_read_session_data`] instead (#1383).
+pub fn pcf_get_session_data(
+    supi: &str,
+    _plmn_id: Option<&crate::context::PlmnId>,
+    s_nssai: &crate::context::SNssai,
+    dnn: &str,
+) -> Option<SessionData> {
+    match pcf_read_session_data(supi, s_nssai, dnn) {
+        Ok(sd) => Some(sd),
         Err(e) => {
             log::warn!("[{supi}] Failed to query session data from DB: {e}, using defaults");
             // Fallback to default values when DB is unavailable
@@ -159,7 +182,7 @@ pub fn pcf_get_session_data(
 }
 
 /// Session Data from database
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SessionData {
     pub qos_index: u8,
     pub arp_priority_level: u8,
@@ -171,7 +194,7 @@ pub struct SessionData {
 }
 
 /// PCC Rule
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PccRule {
     pub id: String,
     pub precedence: u32,
@@ -181,14 +204,14 @@ pub struct PccRule {
 }
 
 /// Flow Description
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FlowDescription {
     pub direction: FlowDirection,
     pub description: String,
 }
 
 /// Flow Direction
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum FlowDirection {
     #[default]
     Bidirectional,

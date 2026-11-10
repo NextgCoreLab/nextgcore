@@ -2755,6 +2755,8 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
             if let Ok(ctx) = pcf_self().read() {
                 if let Some(mut stored) = ctx.sess_find_by_id(sess.id) {
                     stored.policy_dnn_data = udr_dnn_data.clone();
+                    // #1383: what a re-evaluation falls back to when its DB read fails.
+                    stored.authorised_session_data = session_data.clone();
                     ctx.sess_update(&stored);
                 }
             }
@@ -2832,7 +2834,9 @@ pub async fn handle_sm_policy_get(sm_policy_id: &str) -> SbiResponse {
                     Some("SYSTEM_FAILURE"),
                 );
             };
-            let Some(session_data) = pcf_get_session_data(&supi, None, &sess.s_nssai, dnn) else {
+            // A failed DB read answers the session data the SMF's decision was built
+            // from, never the local default (`session_data_for_reevaluation`).
+            let Some(session_data) = sbi_path::session_data_for_reevaluation(&sess, &supi) else {
                 return nextgcore_sbi::server::send_error(
                     500,
                     "Internal Server Error",
@@ -6398,6 +6402,11 @@ mod tests {
             "http://127.0.0.1:{smf_port}/nsmf-callback/v1/sm-policy-notify/{psi}"
         ));
         sess.policy_dnn_data = stored;
+        // #1383: what a create stores, which the re-evaluation falls back to when the
+        // DB read fails. With no MongoDB in the test process a create's read fails and
+        // the decision it built -- and stored -- is the documented default.
+        sess.authorised_session_data =
+            pcf_get_session_data("imsi-000000000000000", None, &sess.s_nssai, dnn);
         guard.sess_update(&sess);
         sess.sm_policy_id.clone()
     }
@@ -10082,6 +10091,115 @@ mod tests {
             Vec::<String>::new(),
             "no session-data read may be made for an empty SUPI"
         );
+    }
+
+    /// #1383 review M1: a re-evaluation whose DB read FAILS for a valid SUPI (here the
+    /// subscriber's DNN is no longer provisioned) builds from the session data the
+    /// SMF's decision was built from, never the local default -- on the P-CSCF notify
+    /// and on the GET alike. A session with nothing stored sends no notify and its GET
+    /// answers 500.
+    ///
+    /// REVERT-VERIFIED: with `session_data_for_reevaluation` on `pcf_get_session_data`
+    /// (the fallback) again, the notify and the GET answer (9, "100 Mbps", "100 Mbps"),
+    /// and the session with nothing stored is notified.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn a_failed_db_read_reevaluates_from_the_stored_decision_not_the_default_1383() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
+        let supi = "imsi-001010000041383";
+        seed_subscriber_1383(supi);
+        let pol = create_for_1383(supi, 17, "10.45.13.87", peers.smf_port).await;
+
+        // The subscriber's `internet` session is no longer provisioned: the read fails
+        // SessionNotFound, which is what a DB outage looks like to the re-evaluation.
+        nextgcore_dbi::test_store::provision_subscriber_document(
+            supi,
+            nextgcore_dbi::mongodb::bson::doc! {
+                "imsi": supi.trim_start_matches("imsi-"),
+                "slice": [{ "sst": 1, "session": [{ "name": "ims" }] }],
+            },
+        );
+        assert!(
+            nudr_handler::pcf_read_session_data(supi, &SNssai { sst: 1, sd: None }, "internet")
+                .is_err(),
+            "control: the read now fails"
+        );
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
+            Some(serde_json::json!({ "ueIpv4": "10.45.13.87" })),
+        ))
+        .await;
+        assert_eq!(resp.status, 204);
+        let got = await_notifications(&peers, 1).await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(
+            sess_rule_1383(&got[0].1["smPolicyDecision"]),
+            seeded_rule_1383(),
+            "a failed DB read must re-send the decision the SMF holds, not reset the \
+             session to the local default"
+        );
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "GET",
+            &format!("/npcf-smpolicycontrol/v1/sm-policies/{pol}"),
+            None,
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
+        assert_eq!(sess_rule_1383(&body["policy"]), seeded_rule_1383());
+
+        // Nothing stored (a session restored from a snapshot older than the field):
+        // the policy-data re-authorisation sends no notify and the GET answers 500.
+        let bare = "imsi-001010000051383";
+        let bare_pol = seed_sm_policy_session(bare, 18, 1, "internet", peers.smf_port, None);
+        {
+            let ctx = pcf_self();
+            let context = ctx.read().expect("context");
+            let mut sess = context
+                .sess_find_by_sm_policy_id(&bare_pol)
+                .expect("session");
+            sess.authorised_session_data = None;
+            context.sess_update(&sess);
+        }
+        let mut answers = std::collections::HashMap::new();
+        answers.insert(
+            "\"sst\":1".to_string(),
+            sm_policy_body(1, "internet", true, false),
+        );
+        let reauth_peers = start_policy_data_peers(answers).await;
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            sbi_path::POLICY_DATA_NOTIFY_PATH,
+            Some(serde_json::json!({ "ueId": bare })),
+        ))
+        .await;
+        assert_eq!(resp.status, 204);
+        let after = drain_notifications(&peers, 2).await;
+        assert_eq!(
+            after.len(),
+            1,
+            "with no readable and no stored session data, nothing is sent: {after:?}"
+        );
+        let resp = pcf_sbi_request_handler(make_request(
+            "GET",
+            &format!("/npcf-smpolicycontrol/v1/sm-policies/{bare_pol}"),
+            None,
+        ))
+        .await;
+        assert_eq!(resp.status, 500, "{:?}", resp.http.content);
+
+        reauth_peers.udr.stop().await.ok();
+        reauth_peers.smf.stop().await.ok();
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
     }
 
     /// #1383 criterion 3: the SM-policy GET (TS 29.512 §5.3.3.3.1) answers the

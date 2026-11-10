@@ -738,31 +738,66 @@ pub(crate) fn session_supi(sess: &crate::context::PcfSess) -> Option<String> {
         .filter(|supi| !supi.is_empty())
 }
 
+/// The session data a re-evaluation of a LIVE session (UpdateNotify, GET) builds its
+/// decision from (#1383).
+///
+/// A fresh DB read when it succeeds. When it fails (DB down, subscriber or DNN no
+/// longer provisioned), the session data the decision the SMF holds was built from
+/// (`PcfSess.authorised_session_data`). Never the local default: TS 29.512 §4.2.6.1
+/// makes a notify a change to the last decision, and the default is a reset of it.
+/// `None` when the read fails and nothing was stored, so the caller sends nothing.
+pub(crate) fn session_data_for_reevaluation(
+    sess: &crate::context::PcfSess,
+    supi: &str,
+) -> Option<crate::nudr_handler::SessionData> {
+    let dnn = sess.dnn.as_deref().unwrap_or("internet");
+    match crate::nudr_handler::pcf_read_session_data(supi, &sess.s_nssai, dnn) {
+        Ok(sd) => Some(sd),
+        Err(e) => {
+            let stored = sess.authorised_session_data.clone();
+            log::warn!(
+                "[{supi}] re-evaluating sm_policy_id={}: session data unreadable ({e}); \
+                 {}",
+                sess.sm_policy_id,
+                if stored.is_some() {
+                    "using the session data the current decision was built from"
+                } else {
+                    "nothing stored to fall back to"
+                }
+            );
+            stored
+        }
+    }
+}
+
 /// Build the `SmPolicyNotification` (TS 29.512 §5.6.2.5) a §4.2.3.2 UpdateNotify
 /// carries for a session, its `smPolicyDecision` re-derived from the subscriber's
-/// session data.
+/// session data ([`session_data_for_reevaluation`]), with the session data it was
+/// built from.
 ///
 /// `None` when there is no decision to send: the session's SUPI cannot be resolved,
-/// or the session data cannot be read. Before #1383 this read the session data for
-/// an EMPTY SUPI, which fails `InvalidSupi`, so every UpdateNotify carried the DB
-/// fallback (5QI 9, 100 Mbps) -- or `{}` -- and the SMF installed it over the live
+/// or its session data can neither be read nor was stored. Before #1383 this read
+/// the session data for an EMPTY SUPI, which fails `InvalidSupi`, and the read's
+/// default (5QI 9, 100 Mbps) went out, which the SMF installed over the live
 /// session's Session-AMBR and 5QI. Sending nothing leaves the SMF enforcing what it
 /// has, which is the only answer that is not wrong.
-fn build_sm_policy_notification(sess: &crate::context::PcfSess) -> Option<serde_json::Value> {
+fn build_sm_policy_notification(
+    sess: &crate::context::PcfSess,
+) -> Option<(serde_json::Value, crate::nudr_handler::SessionData)> {
     let Some(supi) = session_supi(sess) else {
         log::warn!(
-            "[sm_policy_id={}] SM policy update notify: the session's UE-SM (id={}) is              gone, so its SUPI cannot be resolved -- no notify is sent and the SMF keeps              the policy it has",
+            "[sm_policy_id={}] SM policy update notify: the session's UE-SM (id={}) is \
+             gone, so its SUPI cannot be resolved -- no notify is sent and the SMF keeps \
+             the policy it has",
             sess.sm_policy_id,
             sess.pcf_ue_sm_id
         );
         return None;
     };
-    // Re-evaluate the policy decision for the session from subscription data
-    let dnn = sess.dnn.clone().unwrap_or_else(|| "internet".to_string());
-    let Some(sd) = crate::nudr_handler::pcf_get_session_data(&supi, None, &sess.s_nssai, &dnn)
-    else {
+    let Some(sd) = session_data_for_reevaluation(sess, &supi) else {
         log::warn!(
-            "[{supi}] SM policy update notify for sm_policy_id={}: no session data, so              no notify is sent",
+            "[{supi}] SM policy update notify for sm_policy_id={}: no session data, so \
+             no notify is sent and the SMF keeps the policy it has",
             sess.sm_policy_id
         );
         return None;
@@ -774,7 +809,7 @@ fn build_sm_policy_notification(sess: &crate::context::PcfSess) -> Option<serde_
     // the local default and silently reverted a subscriber whose policy data
     // says otherwise -- so the notify LOOKED like a decision and undid one.
     apply_policy_dnn_charging(&mut chg_decs, sess.policy_dnn_data.as_ref());
-    Some(serde_json::json!({
+    let body = serde_json::json!({
         "resourceUri": pcf_resource_uri(&format!("/npcf-smpolicycontrol/v1/sm-policies/{}", sess.sm_policy_id)),
         "smPolicyDecision": {
             "sessRules": parts.sess_rules,
@@ -783,7 +818,8 @@ fn build_sm_policy_notification(sess: &crate::context::PcfSess) -> Option<serde_
             "chgDecs": chg_decs,
             "traffContDecs": parts.traff_cont_decs,
         },
-    }))
+    });
+    Some((body, sd))
 }
 
 /// Map a `SmPolicyDnnData`'s `online`/`offline` flags (TS 29.519 §5.6.2.x) onto every
@@ -836,9 +872,16 @@ pub fn pcf_sbi_send_smpolicycontrol_update_notify(sess_id: u64) -> bool {
         log::warn!("[sess_id={sess_id}] SM policy update notify: no notification URI stored");
         return false;
     };
-    let Some(body) = build_sm_policy_notification(&sess) else {
+    let Some((body, sd)) = build_sm_policy_notification(&sess) else {
         return false;
     };
+    // What the SMF is about to hold is what a later re-evaluation falls back to.
+    if let Ok(ctx) = crate::context::pcf_self().read() {
+        if let Some(mut stored) = ctx.sess_find_by_id(sess_id) {
+            stored.authorised_session_data = Some(sd);
+            ctx.sess_update(&stored);
+        }
+    }
     spawn_notification(uri, "/update", body, "SM policy update")
 }
 
