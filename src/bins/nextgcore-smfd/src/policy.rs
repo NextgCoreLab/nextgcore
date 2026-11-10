@@ -1236,17 +1236,60 @@ pub async fn sm_policy_delete(pcf: &PcfEndpoint, sm_policy_id: &str) -> Result<(
 }
 
 /// Parse an SmPolicyDecision JSON body into a [`PolicyDecision`].
+///
+/// For a decision that is the session's FIRST (the create response, TS 29.512
+/// §4.2.2.2) and for an update response, so an attribute it omits takes the config
+/// default. A PCF-initiated UpdateNotify is a delta over what the session already
+/// enforces and goes through [`merge_sm_policy_decision`] instead (#1387).
 pub fn parse_sm_policy_decision(sm_policy_id: &str, json: &serde_json::Value) -> PolicyDecision {
     let mut dec = PolicyDecision {
         sm_policy_id: sm_policy_id.to_string(),
         ..PolicyDecision::config_default()
     };
+    apply_sm_policy_decision(&mut dec, json);
+    dec
+}
+
+/// Apply a PCF-initiated `SmPolicyDecision` (TS 29.512 §4.2.3.2 UpdateNotify) to the
+/// decision the session `current`ly enforces, as the delta it is (#1387).
+///
+/// TS 29.512 §4.2.6.1: an UpdateNotify carries only what changed. A map attribute
+/// (`sessRules`, `pccRules`, ...) carries only the entries added, modified or deleted,
+/// an unmodified entry "no entry needs to be provided", and "attributes that are not
+/// added, modified or deleted do not need to be provided" (bullet 6). §4.2.6.3.1: in
+/// a modified session rule "previously supplied attributes not supplied ... shall
+/// remain valid", and a `null` entry removes the rule.
+///
+/// So an attribute the notify omits keeps the session's current value. Before #1387
+/// the notify went through [`parse_sm_policy_decision`], which starts from
+/// [`PolicyDecision::config_default`], so a conformant notify carrying only PCC
+/// rules (an AF or TSC decision) reset the live Session-AMBR and default 5QI to the
+/// config defaults.
+///
+/// A `null` session rule is removed, never read as one. With no replacement in the
+/// same notify, the session keeps enforcing the values it has: a PDU session always
+/// has a Session-AMBR (TS 23.501 §5.7.2.6), and §4.2.6.3.1 requires the PCF to keep
+/// exactly one session rule enforced, so no value is better than the last one
+/// authorised.
+pub fn merge_sm_policy_decision(
+    current: PolicyDecision,
+    json: &serde_json::Value,
+) -> PolicyDecision {
+    let mut dec = current;
+    apply_sm_policy_decision(&mut dec, json);
+    dec
+}
+
+/// Apply the members `json` carries onto `dec`; members it omits leave `dec` as is.
+fn apply_sm_policy_decision(dec: &mut PolicyDecision, json: &serde_json::Value) {
     dec.is_config_default = false;
     dec.tsc = parse_tsc_containers(json);
 
-    // Session rules: authorized session AMBR + default QoS
+    // Session rules: authorized session AMBR + default QoS. The first rule that is NOT
+    // a removal (`null`, TS 29.512 §4.2.6.3.1): a removal carries no values, and
+    // reading one as a rule found nothing and left the config default in place (#1387).
     if let Some(rules) = json.get("sessRules").and_then(|v| v.as_object()) {
-        if let Some(rule) = rules.values().next() {
+        if let Some(rule) = rules.values().find(|r| !r.is_null()) {
             if let Some(ambr) = rule.get("authSessAmbr") {
                 if let Some(ul) = ambr.get("uplink").and_then(|v| v.as_str()) {
                     dec.sess_ambr_ul_bps = parse_bitrate(ul).unwrap_or(dec.sess_ambr_ul_bps);
@@ -1360,8 +1403,6 @@ pub fn parse_sm_policy_decision(sm_policy_id: &str, json: &serde_json::Value) ->
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
     }
-
-    dec
 }
 
 /// Parse a TS 29.571 BitRate string ("100 Mbps", "1 Gbps", "500 Kbps").
@@ -3221,6 +3262,66 @@ mod tests {
         assert!(
             ies.iter().all(|ie| ie.conditional_holds()),
             "every emitted IE must satisfy the NW-TT-port conditional"
+        );
+    }
+
+    /// #1387: `merge_sm_policy_decision` keeps every value the notify omits, attribute
+    /// by attribute (TS 29.512 §4.2.6.1, §4.2.6.3.1), where `parse_sm_policy_decision`
+    /// -- the first decision of a session -- takes the config default for it.
+    #[test]
+    fn a_notify_decision_is_merged_onto_the_current_one_1387() {
+        let current = PolicyDecision {
+            sm_policy_id: "pol".into(),
+            sess_ambr_ul_bps: 30_000_000,
+            sess_ambr_dl_bps: 70_000_000,
+            def_five_qi: 6,
+            arp_priority_level: 4,
+            ..PolicyDecision::config_default()
+        };
+        let enforced = |d: &PolicyDecision| {
+            (
+                d.sess_ambr_ul_bps,
+                d.sess_ambr_dl_bps,
+                d.def_five_qi,
+                d.arp_priority_level,
+            )
+        };
+
+        // Nothing session-level in the notify.
+        let pcc_only = serde_json::json!({ "pccRules": { "r": { "precedence": 1 } } });
+        assert_eq!(
+            enforced(&merge_sm_policy_decision(current.clone(), &pcc_only)),
+            (30_000_000, 70_000_000, 6, 4)
+        );
+        assert_eq!(
+            enforced(&parse_sm_policy_decision("pol", &pcc_only)),
+            (100_000_000, 100_000_000, 9, 8),
+            "control: the first-decision parser does take the config default"
+        );
+
+        // One direction of the AMBR, the 5QI without an ARP.
+        let partial = serde_json::json!({ "sessRules": { "s": {
+            "authSessAmbr": { "downlink": "90 Mbps" },
+            "authDefQos": { "5qi": 8 },
+        }}});
+        assert_eq!(
+            enforced(&merge_sm_policy_decision(current.clone(), &partial)),
+            (30_000_000, 90_000_000, 8, 4)
+        );
+
+        // A removal is not a rule; with a replacement, the replacement is applied.
+        let removed = serde_json::json!({ "sessRules": { "s": null } });
+        assert_eq!(
+            enforced(&merge_sm_policy_decision(current.clone(), &removed)),
+            (30_000_000, 70_000_000, 6, 4)
+        );
+        let replaced = serde_json::json!({ "sessRules": {
+            "a-old": null,
+            "b-new": { "authSessAmbr": { "uplink": "1 Mbps", "downlink": "2 Mbps" } },
+        }});
+        assert_eq!(
+            enforced(&merge_sm_policy_decision(current, &replaced)),
+            (1_000_000, 2_000_000, 6, 4)
         );
     }
 }

@@ -9927,7 +9927,17 @@ async fn handle_sm_policy_notify(sm_context_ref: &str, request: &SbiRequest) -> 
     // The decision may be nested (smPolicyDecision) or top-level
     let decision_json = body.get("smPolicyDecision").unwrap_or(&body);
     let pol_id = binding.sm_policy_id.clone().unwrap_or_default();
-    let dec = policy::parse_sm_policy_decision(&pol_id, decision_json);
+    // #1387: a delta over what the session ENFORCES (TS 29.512 §4.2.6.1), not a
+    // replacement built from the config default -- see `merge_sm_policy_decision`.
+    let current = policy::PolicyDecision {
+        sm_policy_id: pol_id,
+        sess_ambr_ul_bps: binding.ambr_ul_bps,
+        sess_ambr_dl_bps: binding.ambr_dl_bps,
+        def_five_qi: binding.five_qi,
+        arp_priority_level: binding.arp_priority_level,
+        ..policy::PolicyDecision::config_default()
+    };
+    let dec = policy::merge_sm_policy_decision(current, decision_json);
 
     log::info!(
         "Applying PCF-updated policy to ref={sm_context_ref}: AMBR UL/DL={}/{} bps, 5QI={}",
@@ -24578,6 +24588,205 @@ mod tests {
         );
 
         amf.stop().await.expect("stop");
+    }
+
+    // ---- #1387: an SM policy UpdateNotify is a DELTA over what the session enforces ----
+
+    /// A stub UPF that records each Session Modification Request body and accepts it.
+    async fn modification_recording_upf_1387() -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use pfcp_path::pfcp_message_type as t;
+        let upf = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = upf.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            while let Ok((len, from)) = upf.recv_from(&mut buf).await {
+                let Some(h) = pfcp_path::parse_wire_header(&buf[..len]) else {
+                    continue;
+                };
+                if h.msg_type != t::SESSION_MODIFICATION_REQUEST {
+                    continue;
+                }
+                sink.lock().unwrap().push(buf[h.body_offset..len].to_vec());
+                // Cause (IE 19) 1, Request accepted.
+                let reply = pfcp_path::encode_wire_message(
+                    t::SESSION_MODIFICATION_RESPONSE,
+                    Some(h.seid),
+                    h.sequence_number,
+                    &[0x00, 0x13, 0x00, 0x01, 1],
+                );
+                let _ = upf.send_to(&reply, from).await;
+            }
+        });
+        (addr, seen, task)
+    }
+
+    /// The (UL, DL) MBR, in bit/s, of the Update QER in a Session Modification body
+    /// (TS 29.244 §7.5.4.4 Update QER, §8.2.8 MBR in kbit/s, 5 octets each).
+    fn updated_qer_mbr_1387(body: &[u8]) -> Option<(u64, u64)> {
+        let qer = pfcp_path::find_ie(body, n4_build::pfcp_ie::UPDATE_QER)?;
+        let mbr = pfcp_path::find_ie(qer, n4_build::pfcp_ie::MBR)?;
+        let kbps = |b: &[u8]| b.iter().fold(0u64, |a, x| (a << 8) | u64::from(*x)) * 1000;
+        (mbr.len() == 10).then(|| (kbps(&mbr[..5]), kbps(&mbr[5..])))
+    }
+
+    /// The session the #1387 tests notify: PCF-authorised, with a UPF session, and
+    /// holding a Session-AMBR (30/70 Mbps) and default 5QI (6) that are ALL different
+    /// from the config default (100/100 Mbps, 5QI 9) -- so a reset to it is visible.
+    fn seed_notified_session_1387(supi: &str, psi: u8, upf_seid: u64) -> String {
+        let sm_context_ref = seed_pcf_authorised(supi, psi, "pol-1387");
+        if let Ok(ctx) = smf_self().read() {
+            if let Ok(mut bindings) = ctx.policy_bindings.write() {
+                if let Some(b) = bindings.get_mut(&sm_context_ref) {
+                    b.ambr_ul_bps = 30_000_000;
+                    b.ambr_dl_bps = 70_000_000;
+                    b.five_qi = 6;
+                }
+            }
+            if let Ok(mut sessions) = ctx.pfcp_sessions.write() {
+                sessions.insert(sm_context_ref.clone(), upf_seid);
+            }
+        }
+        sm_context_ref
+    }
+
+    fn policy_notify_1387(sm_context_ref: &str, decision: serde_json::Value) -> SbiRequest {
+        SbiRequest::post(format!(
+            "/nsmf-callback/v1/sm-policy-notify/{sm_context_ref}/update"
+        ))
+        .with_body(
+            serde_json::json!({
+                "resourceUri": "http://pcf/npcf-smpolicycontrol/v1/sm-policies/pol-1387",
+                "smPolicyDecision": decision,
+            })
+            .to_string(),
+            "application/json",
+        )
+    }
+
+    /// The (UL, DL, 5QI) the binding holds: what the update, release and the durable
+    /// snapshot (#191) read.
+    fn enforced_1387(sm_context_ref: &str) -> (u64, u64, u8) {
+        let b = lookup_policy_binding(sm_context_ref).expect("binding");
+        (b.ambr_ul_bps, b.ambr_dl_bps, b.five_qi)
+    }
+
+    /// #1387 criteria 1-3, through the real SBI router and a stub UPF: each
+    /// UpdateNotify is applied as the TS 29.512 §4.2.6.1 delta it is.
+    ///
+    /// 1. Only `pccRules`: Session-AMBR and 5QI unchanged, on the QER and the binding.
+    /// 2. A changed `sessRules` AMBR only: the AMBR changes, the 5QI does not.
+    /// 3. `null` members: a removed PCC rule and a removed session rule change
+    ///    nothing; a removed rule plus its replacement enforces the replacement, even
+    ///    with the `null` entry first in the map.
+    ///
+    /// REVERT-VERIFIED: with the handler on `parse_sm_policy_decision` again, step 1
+    /// fails `left: (100000000, 100000000, 9) right: (30000000, 70000000, 6)`; with
+    /// `values().next()` in place of the non-null find, step 3's replacement fails.
+    #[tokio::test]
+    async fn an_sm_policy_update_notify_is_applied_as_a_delta_1387() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let (upf, seen, upf_task) = modification_recording_upf_1387().await;
+        let (_client, listener) = client_behind_the_real_listener(upf).await;
+        let sm_context_ref = seed_notified_session_1387("imsi-001010000001387", 21, 0x1387);
+
+        let notify = |decision: serde_json::Value| {
+            let reference = sm_context_ref.clone();
+            let seen = seen.clone();
+            async move {
+                seen.lock().unwrap().clear();
+                let status = smf_sbi_request_handler(policy_notify_1387(&reference, decision))
+                    .await
+                    .status;
+                assert_eq!(status, 204);
+                let bodies = seen.lock().unwrap().clone();
+                assert_eq!(bodies.len(), 1, "one QER Session Modification");
+                updated_qer_mbr_1387(&bodies[0]).expect("Update QER with an MBR")
+            }
+        };
+
+        // 1. Only pccRules (an AF / TSC decision): nothing session-level changes.
+        let qer = notify(serde_json::json!({
+            "pccRules": { "PccRule-af-1": {
+                "pccRuleId": "PccRule-af-1", "precedence": 10,
+                "flowInfos": [{ "flowDescription": "permit out ip from any to assigned" }],
+                "refQosData": ["QosDec-af-1"],
+            }},
+            "qosDecs": { "QosDec-af-1": { "qosId": "QosDec-af-1", "5qi": 1 } },
+        }))
+        .await;
+        assert_eq!(
+            enforced_1387(&sm_context_ref),
+            (30_000_000, 70_000_000, 6),
+            "a notify carrying only PCC rules must leave the session's Session-AMBR and \
+             5QI as they were, not reset them to the config default"
+        );
+        assert_eq!(
+            qer,
+            (30_000_000, 70_000_000),
+            "and the QER keeps enforcing that AMBR"
+        );
+
+        // 2. A changed session rule, AMBR only: only the AMBR changes.
+        let qer = notify(serde_json::json!({
+            "sessRules": { "SessRule-pol-1387": {
+                "sessRuleId": "SessRule-pol-1387",
+                "authSessAmbr": { "uplink": "40 Mbps", "downlink": "80 Mbps" },
+            }},
+        }))
+        .await;
+        assert_eq!(
+            enforced_1387(&sm_context_ref),
+            (40_000_000, 80_000_000, 6),
+            "a session rule that modifies only authSessAmbr leaves the default 5QI \
+             (TS 29.512 §4.2.6.3.1: unsupplied attributes remain valid)"
+        );
+        assert_eq!(qer, (40_000_000, 80_000_000));
+
+        // 3a. A removed PCC rule changes nothing session-level.
+        notify(serde_json::json!({ "pccRules": { "PccRule-af-1": null } })).await;
+        assert_eq!(enforced_1387(&sm_context_ref), (40_000_000, 80_000_000, 6));
+
+        // 3b. A removed session rule with no replacement: removed, not read as a rule
+        // and not replaced by the config default.
+        let qer = notify(serde_json::json!({ "sessRules": { "SessRule-pol-1387": null } })).await;
+        assert_eq!(
+            enforced_1387(&sm_context_ref),
+            (40_000_000, 80_000_000, 6),
+            "a null session rule is a removal and carries no values"
+        );
+        assert_eq!(qer, (40_000_000, 80_000_000));
+
+        // 3c. A removal plus its replacement, the null FIRST in the map: the
+        // replacement is enforced.
+        let qer = notify(serde_json::json!({
+            "sessRules": {
+                "A-SessRule-old": null,
+                "B-SessRule-new": {
+                    "sessRuleId": "B-SessRule-new",
+                    "authSessAmbr": { "uplink": "50 Mbps", "downlink": "90 Mbps" },
+                    "authDefQos": { "5qi": 7, "arp": { "priorityLevel": 5 } },
+                },
+            },
+        }))
+        .await;
+        assert_eq!(
+            enforced_1387(&sm_context_ref),
+            (50_000_000, 90_000_000, 7),
+            "the replacing session rule is enforced, whichever order the map has"
+        );
+        assert_eq!(qer, (50_000_000, 90_000_000));
+
+        listener.abort();
+        upf_task.abort();
     }
 }
 
