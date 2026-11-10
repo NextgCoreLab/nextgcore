@@ -2866,28 +2866,6 @@ fn token_error(error: &str, description: &str) -> SbiResponse {
         .with_body(body.to_string(), "application/json")
 }
 
-/// OAuth2 access-token authorization decision (TS 33.501 §13.4.1.1.2 step 2;
-/// TS 29.510 §5.4.2.2.2). The NRF acts as the authorization server and must:
-///   1. verify the asserted consumer `nfType` matches the registered consumer
-///      profile (an identity/parameter mismatch is `invalid_request`); and
-///   2. verify each requested service-name scope is offered by — and permitted
-///      to the consumer by — at least one registered producer of the target NF
-///      type (`allowedNfTypes` profile- and service-level filters, TS 29.510
-///      §6.1.6.2; an empty/absent list is "no restriction").
-///
-/// Returns the granted scope subset, or an RFC 6749 §5.2 error
-/// `(code, description)` carried in the 400 `AccessTokenErr`.
-///
-/// Fail closed (issue #1391): when the NRF holds NO profile of the target NF
-/// type, nothing positively authorizes the scope, so the answer is
-/// `invalid_scope` and no token. TS 33.501 §13.4.1.1.2 step 2 has the NRF check
-/// "whether the NF Service Consumer is authorized to access the requested
-/// service(s)" and says that if it is not, "the NRF shall not issue an access
-/// token" (33501-k20 l.14594-14602). NOTE 1 (l.14619-14622) only says what a
-/// token WITHOUT NSSAI/NSI claims may be used for; it does not license granting
-/// a scope that no registered producer offers. The old conservative grant let a
-/// token minted while the producer was down outlive a restrictive
-/// `allowedNfTypes` the producer registered with afterwards.
 /// Two S-NSSAIs match when sst is equal and sd is equal (an absent sd only
 /// matches an absent sd, per TS 29.571 Snssai).
 fn snssai_eq(a: &serde_json::Value, b: &serde_json::Value) -> bool {
@@ -2935,6 +2913,28 @@ fn producer_eligible(
     true
 }
 
+/// OAuth2 access-token authorization decision (TS 33.501 §13.4.1.1.2 step 2;
+/// TS 29.510 §5.4.2.2.2). The NRF acts as the authorization server and must:
+///   1. verify the asserted consumer `nfType` matches the registered consumer
+///      profile (an identity/parameter mismatch is `invalid_request`); and
+///   2. verify each requested service-name scope is offered by — and permitted
+///      to the consumer by — at least one registered producer of the target NF
+///      type (`allowedNfTypes` profile- and service-level filters, TS 29.510
+///      §6.1.6.2; an empty/absent list is "no restriction").
+///
+/// Returns the granted scope subset, or an RFC 6749 §5.2 error
+/// `(code, description)` carried in the 400 `AccessTokenErr`.
+///
+/// Fail closed (issue #1391): when the NRF holds NO profile of the target NF
+/// type, nothing positively authorizes the scope, so the answer is
+/// `invalid_scope` and no token. TS 33.501 §13.4.1.1.2 step 2 has the NRF check
+/// "whether the NF Service Consumer is authorized to access the requested
+/// service(s)" and says that if it is not, "the NRF shall not issue an access
+/// token" (33501-k20 l.14594-14602). NOTE 1 (l.14619-14622) only says what a
+/// token WITHOUT NSSAI/NSI claims may be used for; it does not license granting
+/// a scope that no registered producer offers. The old conservative grant let a
+/// token minted while the producer was down outlive a restrictive
+/// `allowedNfTypes` the producer registered with afterwards.
 #[allow(clippy::too_many_arguments)]
 fn authorize_access_token(
     consumer: &NfProfile,
@@ -3850,7 +3850,16 @@ async fn handle_access_token_request_with_policy(
     // nrfd-04/-07: resolve the producer set. With targetNfInstanceId, pin the
     // single producer instance and derive its nfType (filling an absent
     // targetNfType); otherwise take all registered producers of the type.
-    let all = manager.list();
+    //
+    // Issue #1391: only a producer whose nfStatus is REGISTERED authorizes a
+    // scope, the same rule discovery applies (nnrf_handler.rs, the `REGISTERED` filter of NF discovery). A
+    // SUSPENDED producer (missed heartbeats) is not discoverable, so it must not
+    // be able to vouch for a token either.
+    let all: Vec<NfProfile> = manager
+        .list()
+        .into_iter()
+        .filter(|p| p.nf_status.eq_ignore_ascii_case("REGISTERED"))
+        .collect();
     let target_instance: Option<NfProfile> = if !target_nf_instance_id.is_empty() {
         let inst = all
             .iter()
@@ -3860,6 +3869,19 @@ async fn handle_access_token_request_with_policy(
             Some(ref p) => {
                 if target_nf_type.is_empty() {
                     target_nf_type = p.nf_type.clone();
+                } else if !p.nf_type.eq_ignore_ascii_case(&target_nf_type) {
+                    // Issue #1391: the two target selectors contradict each
+                    // other. Minting a token whose audience is targetNfType on
+                    // the strength of an instance of a different type would let
+                    // one producer's allowedNfTypes authorize another type.
+                    return token_error(
+                        "invalid_request",
+                        &format!(
+                            "targetNfInstanceId {target_nf_instance_id} is a {} producer, not \
+                             the requested targetNfType {target_nf_type}",
+                            p.nf_type
+                        ),
+                    );
                 }
             }
             // Issue #1391: a pinned producer that is not registered authorizes
@@ -3871,8 +3893,8 @@ async fn handle_access_token_request_with_policy(
                 return token_error(
                     "invalid_scope",
                     &format!(
-                        "targetNfInstanceId {target_nf_instance_id} is not registered with this \
-                         NRF, so it authorizes no service"
+                        "targetNfInstanceId {target_nf_instance_id} is not a REGISTERED NF \
+                         instance of this NRF, so it authorizes no service"
                     ),
                 );
             }
@@ -5769,6 +5791,111 @@ mod tests {
 
         mgr.deregister(consumer_id).ok();
         mgr.deregister(producer_id).ok();
+    }
+
+    /// Issue #1391 review: two more ways a producer could vouch for a scope it
+    /// should not. (a) A pinned instance of a DIFFERENT type than the explicit
+    /// `targetNfType` is `invalid_request` (the selectors contradict). (b) A
+    /// SUSPENDED producer is not discoverable, so it authorizes nothing, pinned
+    /// or by type; once it is REGISTERED again the same request is granted.
+    #[tokio::test]
+    async fn test_1391_mismatched_or_suspended_producer_does_not_authorize() {
+        use serde_json::json;
+        let mgr = nf_manager();
+        let consumer_id = "nrfd1391c-consumer";
+        let producer_id = "nrfd1391c-producer";
+        let other_id = "nrfd1391c-other";
+        mgr.register(
+            NfProfile::from_json(&json!({
+                "nfInstanceId": consumer_id, "nfType": "NRFD1391CC", "nfStatus": "REGISTERED",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let producer = |status: &str| {
+            NfProfile::from_json(&json!({
+                "nfInstanceId": producer_id, "nfType": "NRFD1391CP", "nfStatus": status,
+                "nfServices": [{"serviceInstanceId": "s0", "serviceName": "nrfd1391c-svc"}],
+            }))
+            .unwrap()
+        };
+        mgr.register(producer("REGISTERED")).unwrap();
+        mgr.register(
+            NfProfile::from_json(&json!({
+                "nfInstanceId": other_id, "nfType": "NRFD1391CO", "nfStatus": "REGISTERED",
+                "nfServices": [{"serviceInstanceId": "s0", "serviceName": "nrfd1391c-svc"}],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let policy = policy_without_client_auth();
+        let ask = |body: serde_json::Value| {
+            let mut r = SbiRequest::post("/nnrf-oauth2/v1/access-token");
+            r.http.set_content(body.to_string());
+            r
+        };
+        let base = json!({"grant_type": "client_credentials", "nfInstanceId": consumer_id,
+                          "nfType": "NRFD1391CC", "scope": "nrfd1391c-svc"});
+        let with = |extra: serde_json::Value| {
+            let mut b = base.clone();
+            b.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            b
+        };
+        let call = |body: serde_json::Value| {
+            let req = ask(body);
+            let policy = &policy;
+            async move {
+                let resp = handle_access_token_request_with_policy(&req, policy).await;
+                let b: serde_json::Value =
+                    serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+                (resp.status, b)
+            }
+        };
+
+        // (a) Pinned instance is an NRFD1391CO, the request says NRFD1391CP.
+        let (st, b) = call(with(
+            json!({"targetNfInstanceId": other_id, "targetNfType": "NRFD1391CP"}),
+        ))
+        .await;
+        assert_eq!(
+            (st, b["error"].as_str()),
+            (400, Some("invalid_request")),
+            "{b}"
+        );
+        assert!(b.get("access_token").is_none(), "{b}");
+
+        // (b) The only NRFD1391CP producer is SUSPENDED: by type and pinned.
+        mgr.deregister(producer_id).ok();
+        mgr.register(producer("SUSPENDED")).unwrap();
+        for extra in [
+            json!({"targetNfType": "NRFD1391CP"}),
+            json!({"targetNfInstanceId": producer_id}),
+        ] {
+            let (st, b) = call(with(extra.clone())).await;
+            assert_eq!(
+                (st, b["error"].as_str()),
+                (400, Some("invalid_scope")),
+                "{extra} -> {b}"
+            );
+            assert!(b.get("access_token").is_none(), "{extra} -> {b}");
+        }
+
+        // Control: REGISTERED again -> both shapes are granted.
+        mgr.deregister(producer_id).ok();
+        mgr.register(producer("REGISTERED")).unwrap();
+        for extra in [
+            json!({"targetNfType": "NRFD1391CP"}),
+            json!({"targetNfInstanceId": producer_id}),
+        ] {
+            let (st, b) = call(with(extra.clone())).await;
+            assert_eq!(st, 200, "{extra} -> {b}");
+        }
+
+        mgr.deregister(consumer_id).ok();
+        mgr.deregister(producer_id).ok();
+        mgr.deregister(other_id).ok();
     }
 
     // -----------------------------------------------------------------
