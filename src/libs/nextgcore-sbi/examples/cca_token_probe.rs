@@ -120,7 +120,32 @@ async fn main() {
         );
     }
 
-    match trusted.request_token(target_type, scope).await {
+    // Issue #1391: the NRF now fails closed with `invalid_scope` while no
+    // producer of the target type is registered, where it used to grant the
+    // scope anyway. A probe started right after `docker compose up` can win that
+    // race against the producer's NF registration, so wait for the producer the
+    // way a real consumer does (it retries; failed tokens are never cached),
+    // bounded by CCA_PROBE_WAIT_SECS (default 60). Any other outcome is final.
+    let wait_secs: u64 = std::env::var("CCA_PROBE_WAIT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+    let first = loop {
+        let r = trusted.request_token(target_type, scope).await;
+        match &r {
+            Err(e)
+                if e.to_string().contains("invalid_scope")
+                    && std::time::Instant::now() < deadline =>
+            {
+                println!("waiting for a registered {} producer: {e}", args[5]);
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            _ => break r,
+        }
+    };
+
+    match first {
         Ok(resp) => {
             // A token that is not a JWS is not a token; check shape, not just 200.
             if resp.access_token.split('.').count() != 3 {
@@ -156,7 +181,11 @@ async fn main() {
             // would have sent a reader to the wrong place. Criterion 3 of #187 is
             // specifically about the failure being diagnosable.
             let msg = e.to_string();
-            let hint = if msg.contains("unauthorized_client") {
+            let hint = if msg.contains("invalid_scope") {
+                "authentication SUCCEEDED; no registered producer of the target NF type \
+                 offers the scope (issue #1391: the NRF fails closed). The producer never \
+                 completed NF registration within CCA_PROBE_WAIT_SECS"
+            } else if msg.contains("unauthorized_client") {
                 "authentication SUCCEEDED; the token was withheld by SBA authorization \
                  (allowedNfTypes). If that is the expected outcome for this consumer/producer \
                  pair, set CCA_PROBE_AUTH_ONLY=1"
