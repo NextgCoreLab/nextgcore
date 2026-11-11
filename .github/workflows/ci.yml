@@ -528,9 +528,21 @@ jobs:
             kubectl kustomize $flags "$d" > "$r/eks-$p.yaml"
             args+=(--render "$r/eks-$p.yaml")
           done
+          # #1395: every demo overlay too (the base demo-off one is also
+          # rendered above as profiles/demo; a demo-<key> one only here).
+          for d in deploy/eks/overlays/demo*/; do
+            o="$(basename "$d")"
+            kubectl kustomize "$d" > "$r/overlay-$o.yaml"
+            args+=(--render "$r/overlay-$o.yaml")
+          done
           helm template ci deploy/helm/nextgcore --set global.siteId=ci > "$r/helm.yaml"
           args+=(--render "$r/helm.yaml")
           python3 deploy/check_no_exposure.py "${args[@]}"
+      - name: Demo profile toggles (nextgcore#1395)
+        # The PROFILE=demo post-render that merges a demo overlay's toggles
+        # into the NF configs: fail-closed rules, demo-off untouched.
+        working-directory: nextgcore
+        run: python3 deploy/eks/profiles/demo/demo_toggles.py --self-test
 
   fuzz-build:
     name: Fuzz targets build

@@ -38,6 +38,9 @@ nextg_load_profile() {
   PROFILE_NAMESPACE_MANIFEST=""
   PROFILE_POD_SECURITY=""
   PROFILE_KUSTOMIZE_FLAGS=""
+  # Directory deploy-eks.sh renders; empty means PROFILE_DIR. The demo profile
+  # points it at the deploy/eks/overlays/demo-<key>/ overlay a run selects (#1395).
+  PROFILE_RENDER_DIR=""
   PROFILE_CARGO_FEATURES=""
   PROFILE_TAG_SUFFIX=""
   PROFILE_CORE_NFS=()
@@ -59,7 +62,10 @@ nextg_load_profile() {
   profile_build_hint() { :; }
 
   # shellcheck source=/dev/null
-  source "${PROFILE_DIR}/profile.env"
+  source "${PROFILE_DIR}/profile.env" || {
+    printf 'profile %s: profile.env failed\n' "${name}" >&2
+    return 1
+  }
 
   if [[ -z "${PROFILE_NAMESPACE}" ]]; then
     printf 'profile %s sets no PROFILE_NAMESPACE\n' "${name}" >&2

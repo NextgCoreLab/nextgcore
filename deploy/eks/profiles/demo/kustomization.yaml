@@ -1,0 +1,9 @@
+# PROFILE=demo (nextgcore#1395): what `kubectl kustomize deploy/eks/profiles/demo`
+# renders is the demo-OFF base overlay, so the exposure CI step, which renders
+# every profile directory, covers it. deploy-eks.sh renders the overlay the run
+# selects instead (PROFILE_RENDER_DIR in profile.env, DEMO_OVERLAY).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../overlays/demo

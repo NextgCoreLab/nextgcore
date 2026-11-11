@@ -1,0 +1,29 @@
+# Demo base overlay (nextgcore#1395, nextgsim#458): the 6G profile's core plus
+# gNB/UE, in its own namespace nextg-demo, so a demo run never touches the 5G,
+# 6G or EPC namespaces.
+#
+# This overlay carries NO demo: block. It is the demo-OFF control: deployed on
+# its own it runs the default 6G profile unchanged. A demo switches on only in
+# its own deploy/eks/overlays/demo-<key>/ overlay, which adds a nextg-demo-toggles
+# ConfigMap; deploy/eks/profiles/demo/profile.env merges that into the NF
+# configs at render time (see deploy/eks/overlays/README.md).
+#
+# ClusterIP only: every Service, port and probe comes from the 6G profile,
+# which deploy/check_no_exposure.py checks. Nothing here publishes a port.
+#
+# Rendered without applying:
+#   kubectl kustomize deploy/eks/overlays/demo
+# Deployed:
+#   PROFILE=demo deploy/eks/deploy-eks.sh   (or k8s/demo-check.sh off off)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: nextg-demo
+
+resources:
+  - ../../profiles/6g
+
+labels:
+  - includeSelectors: false
+    pairs:
+      nextg.io/profile: demo
