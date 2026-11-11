@@ -1,0 +1,130 @@
+# D446A gNB-A (nextgsim#483): a second gNB, the coverage cell, a copy of the
+# demo profile's gnb Deployment that reads gnb-a.yaml from nextgsim-configs.
+# A headless ClusterIP Service only; no port is published.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gnb-a
+  namespace: nextg-system
+  labels:
+    app.kubernetes.io/name: gnb-a
+    app.kubernetes.io/part-of: nextgsim
+spec:
+  clusterIP: None
+  ports:
+  - name: rls
+    port: 4997
+    protocol: UDP
+    targetPort: 4997
+  - name: gtpu
+    port: 2152
+    protocol: UDP
+    targetPort: 2152
+  selector:
+    app.kubernetes.io/name: gnb-a
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gnb-a
+  namespace: nextg-system
+  labels:
+    app.kubernetes.io/name: gnb-a
+    app.kubernetes.io/part-of: nextgsim
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gnb-a
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gnb-a
+        app.kubernetes.io/part-of: nextgsim
+    spec:
+      containers:
+      - args:
+        - -c
+        - /etc/nextgsim/gnb.yaml
+        env:
+        - name: RUST_LOG
+          value: info,nextgsim_gnb=debug,nextgsim_sctp=debug,nextgsim_ngap=debug,nextgsim_gtp=debug
+        image: nextgsim-gnb:latest
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - grep -qi ':1385' /proc/net/udp
+          failureThreshold: 3
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        name: gnb
+        ports:
+        - containerPort: 4997
+          name: rls
+          protocol: UDP
+        - containerPort: 2152
+          name: gtpu
+          protocol: UDP
+        readinessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - grep -qi ':1385' /proc/net/udp
+          failureThreshold: 6
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          limits:
+            cpu: 500m
+            memory: 256Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        volumeMounts:
+        - mountPath: /etc/nextgsim
+          name: config-resolved
+          readOnly: true
+      initContainers:
+      - command:
+        - sh
+        - -c
+        - "set -eu\necho \"[wait-amf] waiting for AMF NGAP endpoint...\"\ni=0\nuntil nslookup amf.nextg-system.svc.cluster.local >/dev/null 2>&1; do\n  i=$((i+1))\n  [ \"$i\" -ge 60 ] && { echo \"[wait-amf]\
+          \ FATAL: AMF DNS never resolved\"; exit 1; }\n  sleep 2\ndone\necho \"[wait-amf] AMF DNS resolves.\"\n# NGAP is userspace SCTP over UDP, so a TCP connect check would\n# always fail. Probe the\
+          \ AMF SBI port instead, which is TCP and\n# comes up in the same process.\ni=0\nuntil nc -z amf.nextg-system.svc.cluster.local 7777; do\n  i=$((i+1))\n  [ \"$i\" -ge 60 ] && { echo \"[wait-amf]\
+          \ FATAL: AMF SBI never accepted\"; exit 1; }\n  echo \"[wait-amf] waiting for AMF SBI... ($i/60)\"\n  sleep 2\ndone\necho \"[wait-amf] AMF ready.\"\n"
+        image: busybox:1.36
+        name: wait-amf
+      - command:
+        - sh
+        - -c
+        - "set -eu\n\n# fail fast if the pod IP is not a literal IPv4 address\ncase \"$POD_IP\" in\n  *[0-9].[0-9]*) ;;\n  *) echo \"[resolve-dns] FATAL: POD_IP is not an IPv4 address: '$POD_IP'\" >&2;\
+          \ exit 1 ;;\nesac\necho \"[resolve-dns] pod IP: $POD_IP\"\n\ncp /tmp/config-template/gnb-a.yaml /etc/nextgsim/gnb.yaml\n\n# Bind/advertise addresses only. The AMF and UPF stay Service\n# names:\
+          \ the gNB resolves and re-resolves them itself (#286).\nsed -i \\\n  -e \"s|^\\( *link_ip:\\).*|\\1 $POD_IP|\" \\\n  -e \"s|^\\( *ngap_ip:\\).*|\\1 $POD_IP|\" \\\n  -e \"s|^\\( *gtp_ip:\\).*|\\\
+          1 $POD_IP|\" \\\n  /etc/nextgsim/gnb.yaml\n\nif grep -qE '0\\.0\\.0\\.0' /etc/nextgsim/gnb.yaml; then\n  echo \"[resolve-dns] FATAL: a wildcard bind address survived:\" >&2\n  grep -nE '0\\.0\\\
+          .0\\.0' /etc/nextgsim/gnb.yaml >&2\n  exit 1\nfi\n\necho \"[resolve-dns] final gnb.yaml:\"\ncat /etc/nextgsim/gnb.yaml\n"
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        image: busybox:1.36
+        name: resolve-dns
+        volumeMounts:
+        - mountPath: /tmp/config-template/gnb-a.yaml
+          name: config-template
+          readOnly: true
+          subPath: gnb-a.yaml
+        - mountPath: /etc/nextgsim
+          name: config-resolved
+      volumes:
+      - configMap:
+          name: nextgsim-configs
+        name: config-template
+      - emptyDir: {}
+        name: config-resolved
