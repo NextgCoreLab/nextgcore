@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nextg-demo-toggles
+data:
+  key: d446a-agent-conflict
+  # Both gNBs: gNB-B holds the mode (the arbiter), gNB-A needs the demo active
+  # for lb-1 and the load-balancing cause. amfd reads no block (its log lines
+  # are base core, nextgcore#1418).
+  targets: gnb.yaml gnb-a.yaml

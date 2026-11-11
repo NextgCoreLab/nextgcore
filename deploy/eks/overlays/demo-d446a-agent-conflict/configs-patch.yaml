@@ -1,0 +1,122 @@
+# D446A configs (nextgsim#483): the base gnb.yaml becomes gNB-B, the booster
+# with energy-1; gnb-a.yaml is the second gNB (gnb-a.yaml in this overlay),
+# the coverage cell with lb-1; the UE hears both and camps on gNB-A. The demo:
+# block is merged into gnb.yaml and gnb-a.yaml by the demo post-render
+# (toggles.yaml), with the run's mode.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nextgsim-configs
+  namespace: nextg-system
+data:
+  gnb.yaml: |
+    # D446A gNB-B, the booster (nextgsim#483): NCI 0x010, gNB ID 1, PCI 16; energy-1.
+    nci: 0x000000010
+    gnb_id_length: 32
+    plmn:
+      mcc: 999
+      mnc: 70
+      long_mnc: false
+    tac: 1
+    nssai:
+      - sst: 1
+        sd: null
+    amf_configs:
+      - address: amf.nextg-system.svc.cluster.local
+        port: 38412
+    link_ip: 0.0.0.0
+    ngap_ip: 0.0.0.0
+    gtp_ip: 0.0.0.0
+    ignore_stream_ids: false
+    upf_addr: upf.nextg-system.svc.cluster.local
+    upf_port: 2152
+    # --- D446A (nextgsim#483) ---
+    agent_enabled: true
+    sim_position: { x: 0, y: 0, z: 0 }
+    handover_neighbours:
+      - nci: 0x000000020
+        tac: 1
+    agents:
+      - id: energy-1
+        kind: energy-saving
+        cell: 0x000000010
+        grace_s: 90
+        handback_hold_s: 600
+        peers:
+          - gnb_id: 2
+            agent: lb-1
+  gnb-a.yaml: |
+    # D446A gNB-A, the coverage cell (nextgsim#483): NCI 0x020, gNB ID 2, PCI 32; lb-1.
+    nci: 0x000000020
+    gnb_id_length: 32
+    plmn:
+      mcc: 999
+      mnc: 70
+      long_mnc: false
+    tac: 1
+    nssai:
+      - sst: 1
+        sd: null
+    amf_configs:
+      - address: amf.nextg-system.svc.cluster.local
+        port: 38412
+    link_ip: 0.0.0.0
+    ngap_ip: 0.0.0.0
+    gtp_ip: 0.0.0.0
+    ignore_stream_ids: false
+    upf_addr: upf.nextg-system.svc.cluster.local
+    upf_port: 2152
+    # --- D446A (nextgsim#483) ---
+    agent_enabled: true
+    sim_position: { x: 120, y: 0, z: 0 }
+    handover_neighbours:
+      - nci: 0x000000010
+        tac: 1
+    agents:
+      - id: lb-1
+        kind: load-balancing
+        cell: 0x000000010
+        load_threshold_ues: 1
+  ue.yaml: |
+    # UE Configuration for Kubernetes deployment
+    supi:
+      supi_type: Imsi
+      value: "999700000000001"
+    protection_scheme: 0
+    home_network_public_key_id: 0
+    home_network_public_key: []
+    routing_indicator: null
+    hplmn:
+      mcc: 999
+      mnc: 70
+      long_mnc: false
+    key: [0x46, 0x5B, 0x5C, 0xE8, 0xB1, 0x99, 0xB4, 0x9F, 0xAA, 0x5F, 0x0A, 0x2E, 0xE2, 0x38, 0xA6, 0xBC]
+    op: [0xE8, 0xED, 0x28, 0x9D, 0xEB, 0xA9, 0x52, 0xE4, 0x28, 0x3B, 0x54, 0xE8, 0x8E, 0x6D, 0x83, 0x4D]
+    op_type: Opc
+    amf: [0x80, 0x00]
+    imei: "356938035643803"
+    imei_sv: null
+    supported_algs:
+      nia1: true
+      nia2: true
+      nia3: true
+      nea1: true
+      nea2: true
+      nea3: true
+    gnb_search_list:
+      - "gnb.nextg-system.svc.cluster.local"
+      - "gnb-a.nextg-system.svc.cluster.local"
+    sessions:
+      - type: Ipv4
+        s_nssai:
+          sst: 1
+          sd: null
+        apn: "internet"
+        is_emergency: false
+    configured_nssai:
+      slices:
+        - sst: 1
+          sd: null
+    tun_name: "uesimtun0"
+    # D446A (nextgsim#483): 40 m from gNB-A, 80 m from the booster gNB-B.
+    sim_position: { x: 80, y: 0, z: 0 }
