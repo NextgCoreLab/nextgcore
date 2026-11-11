@@ -1,0 +1,38 @@
+# nextgsim k8s/configmap.yaml's gnb.yaml, plus the NKEF task and its live block
+# (nextgsim#488). A ConfigMap value is one string, so the whole file is
+# replaced: keep the first part in step with nextgsim's k8s/configmap.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nextgsim-configs
+  namespace: nextg-system
+data:
+  gnb.yaml: |
+    # gNB Configuration for Kubernetes deployment
+    nci: 0x000000010
+    gnb_id_length: 32
+    plmn:
+      mcc: 999
+      mnc: 70
+      long_mnc: false
+    tac: 1
+    nssai:
+      - sst: 1
+        sd: null
+    amf_configs:
+      - address: amf.nextg-system.svc.cluster.local
+        port: 38412
+    link_ip: 0.0.0.0
+    ngap_ip: 0.0.0.0
+    gtp_ip: 0.0.0.0
+    ignore_stream_ids: false
+    upf_addr: upf.nextg-system.svc.cluster.local
+    upf_port: 2152
+    nkef_enabled: true
+    nkef_live:
+      supi: imsi-999700000000001
+      amf_sbi_uri: http://amf.nextg-system.svc.cluster.local:7777
+      nrf_uri: http://nrf.nextg-system.svc.cluster.local:7777
+      nrf_poll_secs: 5
+      nf_types: [AMF, SMF, AUSF, UDM, PCF, NSSF, BSF]
+      budget_tokens: 400

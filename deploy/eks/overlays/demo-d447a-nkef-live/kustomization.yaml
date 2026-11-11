@@ -1,0 +1,19 @@
+# Demo d447a-nkef-live (nextgsim#488): the demo base plus the gNB's NKEF.
+#
+# The gNB config gains `nkef_enabled: true` and the `nkef_live:` block (amfd and
+# NRF by Service name; the 6G post-render rewrites .nextg-system. to this
+# namespace). The demo block itself comes from toggles.yaml, merged in by the
+# demo profile's post-render with the run's mode (on | baseline).
+#
+# The gNB image must be built with nextgsim `--features 6g,nkef-sba` and carry
+# nr-cli (SIM_IMAGE_TAG=demo-d447a-<sha>), or the gNB fails startup with
+# DemoConfigError::UnknownKey: a default build does not know the key.
+#
+# ClusterIP only: no Service, port or probe is added. NKEF opens no listener.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../demo
+  - toggles.yaml
+patches:
+  - path: gnb-nkef-config.yaml
