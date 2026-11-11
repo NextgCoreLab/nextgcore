@@ -8,6 +8,8 @@ description = "NextGCore Metrics Collection Library"
 
 [dependencies]
 nextgcore-core = { workspace = true }
+# nextgsim#458 / #1394: the demo-enabled family in render_common.
+nextgcore-demo = { workspace = true }
 prometheus.workspace = true
 log.workspace = true
 serde_yaml.workspace = true
