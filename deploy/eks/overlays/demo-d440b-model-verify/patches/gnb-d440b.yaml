@@ -1,5 +1,5 @@
 # D440B gNB patch (nextgsim#463): the model mount and the pinned ONNX Runtime
-# path. The NWDAF config is gnb-d440b-config.json. The rest of the gNB is the
+# path. The NWDAF config is patches/gnb-d440b-config.yaml. The rest of the gNB is the
 # demo-off base.
 apiVersion: apps/v1
 kind: Deployment

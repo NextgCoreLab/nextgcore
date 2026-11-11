@@ -24,18 +24,25 @@ holds() { local name="$1"; shift; "$@" >/dev/null 2>&1 && ok "${name}" || not_ok
 breaks() { local name="$1"; shift; "$@" >/dev/null 2>&1 && not_ok "${name}" || ok "${name}"; }
 
 ts='2026-11-11T10:00:00.000000Z'
-banner_v="${ts}  WARN DEMO MODE ACTIVE: d440b-model-verify=verify"
-banner_f="${ts}  WARN DEMO MODE ACTIVE: d440b-model-verify=fallback"
-verified="${ts}  INFO NWDAF: model verified id=nwdaf-trajectory-cv version=1.0.0 sha256=${PINNED_SHA256} opset=17 inputs=[x:f32[1,8,2]] outputs=[y:f32[1,1,2]] golden=ok (3 vectors, tolerance 0.0001) path=/opt/nextgsim/models/nwdaf-trajectory-cv.onnx; trajectory predictions use the model"
-audit="${ts}  WARN [demo:d440b-model-verify] audit: rejected set mode=\"bogus\" from nr-cli: demo config: unknown mode \"bogus\"; mode unchanged (verify)"
+banner_v="${ts}  WARN nextgsim_demo: DEMO MODE ACTIVE: d440b-model-verify=verify"
+banner_f="${ts}  WARN nextgsim_demo: DEMO MODE ACTIVE: d440b-model-verify=fallback"
+verified="${ts}  INFO nextgsim_nwdaf: NWDAF: model verified id=nwdaf-trajectory-cv version=1.0.0 sha256=${PINNED_SHA256} opset=13 inputs=[positions:float32[1, -1, 3]] outputs=[next_position:float32[1, 1, 3]] golden=ok (3 vectors, tolerance 0.00001) path=/opt/nextgsim/models/nwdaf-trajectory-cv.onnx; trajectory predictions use the model"
+audit="${ts}  WARN nextgsim_demo: [demo:d440b-model-verify] audit: rejected set mode=\"bogus\" from nr-cli: demo config: unknown mode \"bogus\" for demo \"d440b-model-verify\" (known modes [\"verify\", \"fallback\"]); mode unchanged (verify)"
+to_fb="${ts}  WARN nextgsim_demo: [demo:d440b-model-verify] audit: mode verify -> fallback from nr-cli; applies to the next decision"
+to_v="${ts}  WARN nextgsim_demo: [demo:d440b-model-verify] audit: mode fallback -> verify from nr-cli; applies to the next decision"
 noise="${ts}  INFO NGSetupResponse received"
 put() { local f="${work}/$1"; shift; printf '%s\n' "$@" >"${f}"; echo "${f}"; }
 
-full_v="$(put full-v.log "${noise}" "${banner_v}" "${verified}" "${noise}" "${audit}")"
+# The verify arm's whole chain: the two runtime switches sit before the rejected set.
+switches=("${to_fb}" "${banner_f}" "${to_v}" "${banner_v}")
+full_v="$(put full-v.log "${noise}" "${banner_v}" "${verified}" "${noise}" "${switches[@]}" "${audit}")"
 full_f="$(put full-f.log "${noise}" "${banner_f}" "${noise}" "${audit/verify)/fallback)}")"
 no_banner="$(put no-banner.log "${noise}" "${verified}" "${audit}")"
-no_verified="$(put no-verified.log "${banner_v}" "${noise}" "${audit}")"
-no_audit="$(put no-audit.log "${banner_v}" "${verified}" "${noise}")"
+no_verified="$(put no-verified.log "${banner_v}" "${noise}" "${switches[@]}" "${audit}")"
+no_audit="$(put no-audit.log "${banner_v}" "${verified}" "${switches[@]}" "${noise}")"
+no_to_fb="$(put no-to-fb.log "${banner_v}" "${verified}" "${banner_f}" "${to_v}" "${banner_v}" "${audit}")"
+no_to_v="$(put no-to-v.log "${banner_v}" "${verified}" "${to_fb}" "${banner_f}" "${banner_v}" "${audit}")"
+no_switches="$(put no-switches.log "${banner_v}" "${verified}" "${audit}")"
 empty="$(put empty.log "")"
 
 # --- banner ---------------------------------------------------------------------
@@ -43,7 +50,7 @@ holds  "banner: present (verify)"               d440b_banner "${full_v}" verify
 holds  "banner: present (fallback)"             d440b_banner "${full_f}" fallback
 breaks "banner: missing line fails"             d440b_banner "${no_banner}" verify
 breaks "banner: empty log fails"                d440b_banner "${empty}" verify
-breaks "banner: other mode fails"               d440b_banner "${full_v}" fallback
+breaks "banner: other mode fails"               d440b_banner "${no_switches}" fallback
 breaks "banner: mode prefix is not the mode"    d440b_banner "$(put prefix.log "${banner_v}-x")" verify
 breaks "banner: no log file fails"              d440b_banner "${work}/absent.log" verify
 
@@ -71,6 +78,10 @@ holds  "chain: fallback in order"               d440b_chain "${full_f}" fallback
 breaks "chain: missing banner fails"            d440b_chain "${no_banner}" verify
 breaks "chain: missing model verified fails"    d440b_chain "${no_verified}" verify
 breaks "chain: missing audit fails"             d440b_chain "${no_audit}" verify
+breaks "chain: missing switch to fallback fails" d440b_chain "${no_to_fb}" verify
+breaks "chain: missing switch back fails"       d440b_chain "${no_to_v}" verify
+breaks "chain: verify without the revert arm"   d440b_chain "${no_switches}" verify
+breaks "chain: switches after the reject fail"  d440b_chain "$(put late.log "${banner_v}" "${verified}" "${audit}" "${switches[@]}")" verify
 breaks "chain: empty log fails"                 d440b_chain "${empty}" verify
 breaks "chain: no log file fails"               d440b_chain "${work}/absent.log" verify
 breaks "chain: out of order fails"              d440b_chain "$(put ooo.log "${banner_v}" "${audit}" "${verified}")" verify
@@ -79,8 +90,8 @@ breaks "chain: fallback without audit fails"    d440b_chain "$(put f-noaudit.log
 # matches every line. Prove that d440b_order sets it: a pattern no line has fails.
 breaks "chain: an absent ERE never matches"     d440b_order "${full_v}" 'no such line anywhere'
 out="$(d440b_chain "${full_v}" verify)"
-[[ "$(wc -l <<<"${out}")" == 3 && "${out}" == *"model verified"* ]] \
-  && ok "chain: prints the three matched lines" || not_ok "chain output: ${out}"
+[[ "$(wc -l <<<"${out}")" == 7 && "${out}" == *"model verified"* ]] \
+  && ok "chain: prints the seven matched lines" || not_ok "chain output: ${out}"
 
 # --- counters -------------------------------------------------------------------
 holds  "verify counters: true 12 0"             d440b_verify_counters true 12 0

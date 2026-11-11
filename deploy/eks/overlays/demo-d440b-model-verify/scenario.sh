@@ -18,8 +18,10 @@
 #   fallback  no `model verified`; verified=false, onnx_inferences = 0,
 #             fallback_inferences > 0; the #462-style consumer check fails.
 #   both      the DEMO MODE ACTIVE banner; `set mode=bogus` is rejected with
-#             `unknown mode`, audited, and the mode stays; the gNB log has the
-#             chain banner -> [model verified, verify only] -> audit, in order.
+#             `unknown mode`, audited, and the mode stays; the gNB log has, in
+#             order, the banner -> [verify only: model verified -> audit
+#             verify->fallback -> banner -> audit fallback->verify -> banner]
+#             -> the rejected-set audit.
 #
 # The checks are the d440b_* functions below, over files and values only, so
 # test-scenario.sh proves each one FAILS on input missing its line:
@@ -32,6 +34,8 @@ D440B_MODEL='id=nwdaf-trajectory-cv version=1.0.0'
 D440B_VERIFIED_RE="NWDAF: model verified ${D440B_MODEL} sha256=${PINNED_SHA256} .*golden=ok"
 D440B_AUDIT_RE='\[demo:d440b-model-verify\] audit: rejected set mode="bogus"'
 d440b_banner_re() { echo "DEMO MODE ACTIVE: d440b-model-verify=$1([^a-z0-9-]|\$)"; }
+# A runtime `set mode=` that took: `audit: mode <from> -> <to> from nr-cli`.
+d440b_switch_re() { echo "\\[demo:d440b-model-verify\\] audit: mode $1 -> $2 from nr-cli"; }
 
 # Ordered chain: each ERE must match a line strictly after the previous match.
 # The ERE goes through the environment (the nextgsim scripts/demo/lib.sh
@@ -57,7 +61,10 @@ d440b_no_verified_line() { [[ -f "$1" ]] && ! grep -qF 'model verified' "$1"; } 
 d440b_audit_line() { grep -qE -- "${D440B_AUDIT_RE}" "$1"; }            # LOG
 d440b_chain() {                                                         # LOG MODE
   if [[ "$2" == verify ]]; then
-    d440b_order "$1" "$(d440b_banner_re verify)" "${D440B_VERIFIED_RE}" "${D440B_AUDIT_RE}"
+    # The revert arm's two switches sit between the verify and the rejected set.
+    d440b_order "$1" "$(d440b_banner_re verify)" "${D440B_VERIFIED_RE}" \
+      "$(d440b_switch_re verify fallback)" "$(d440b_banner_re fallback)" \
+      "$(d440b_switch_re fallback verify)" "$(d440b_banner_re verify)" "${D440B_AUDIT_RE}"
   else
     d440b_order "$1" "$(d440b_banner_re "$2")" "${D440B_AUDIT_RE}"
   fi
