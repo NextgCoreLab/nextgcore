@@ -21,6 +21,13 @@ sensing = ["dep:nextgcore-proto", "nextgcore-sbi/6g-extensions"]
 ## default build keeps the OLS baseline and needs no model file.
 ## Enable with: cargo build -p nextgcore-nwdafd --features onnx-model
 onnx-model = []
+## nextgsim#466 (demo d441c-amf-mobility): UE_MOBILITY analytics from AMF
+## LOCATION_REPORT events. Subscribes to Namf_EventExposure, takes the notifies on
+## the existing SBI listener and serves Nnwdaf_AnalyticsInfo UE_MOBILITY, when the
+## demo block's mode is `on` or `nwdaf.amf_mobility.enabled` is true. Also serves
+## /metrics (NEXTGCORE_METRICS_BIND, loopback by default; NWDAF_METRICS_PORT).
+## Off by default; a default build has neither the route nor the listener.
+amf-mobility = []
 
 [dependencies]
 nextgcore-core = { workspace = true }
@@ -29,6 +36,9 @@ nextgcore-sbi = { workspace = true }
 nextgcore-proto = { workspace = true, optional = true }
 nextgcore-metrics = { workspace = true }
 nextgcore-app = { workspace = true }
+# The demo: config block (nextgsim#458). Read by every build, so a demo block
+# naming a demo this build was not compiled with fails start-up.
+nextgcore-demo = { workspace = true }
 log.workspace = true
 env_logger.workspace = true
 tokio.workspace = true
@@ -51,6 +61,9 @@ base64.workspace = true
 # G2-1 strict-peer test: our REAL nrfd (registry + NF_PROFILE_CHANGED notify
 # builder + HTTP sender) is the conformant peer — no mocks.
 nextgcore-nrfd = { path = "../nextgcore-nrfd" }
+# nextgsim#466: the amf-mobility end-to-end test subscribes at amfd's REAL
+# Namf_EventExposure handler and takes amfd's REAL LOCATION_REPORT notify.
+nextgcore-amfd = { path = "../nextgcore-amfd" }
 
 [lints]
 workspace = true

@@ -1,0 +1,83 @@
+# The base gNB ("west") and UE configs for the N2 handover of demo
+# d441c-amf-mobility (nextgsim#466), as nextgsim#456's compose stack sets them
+# (nextgsim config/gnb.yaml, config/ue-n2ho.yaml): the base nextgsim-configs
+# entries plus
+#   gnb.yaml  sim_position x 0 and gnb-east (NCI 0x020) as handover neighbour;
+#   ue.yaml   both gNBs in gnb_search_list, start 35 m from west, and 20 s after
+#             start walk east at 2.5 m/s to x 85. Past x 62 east's cell beats
+#             west's by the A3 margin and west starts the N2 handover.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nextgsim-configs
+  namespace: nextg-demo
+data:
+  gnb.yaml: |
+    nci: 0x000000010
+    gnb_id_length: 32
+    plmn:
+      mcc: 999
+      mnc: 70
+      long_mnc: false
+    tac: 1
+    nssai:
+      - sst: 1
+        sd: null
+    amf_configs:
+      - address: amf.nextg-system.svc.cluster.local
+        port: 38412
+    link_ip: 0.0.0.0
+    ngap_ip: 0.0.0.0
+    gtp_ip: 0.0.0.0
+    ignore_stream_ids: false
+    upf_addr: upf.nextg-system.svc.cluster.local
+    upf_port: 2152
+    sim_position: { x: 0, y: 0, z: 0 }
+    handover_neighbours:
+      - nci: 0x000000020
+        tac: 1
+  ue.yaml: |
+    supi:
+      supi_type: Imsi
+      value: "999700000000001"
+    protection_scheme: 0
+    home_network_public_key_id: 0
+    home_network_public_key: []
+    routing_indicator: null
+    hplmn:
+      mcc: 999
+      mnc: 70
+      long_mnc: false
+    key: [0x46, 0x5B, 0x5C, 0xE8, 0xB1, 0x99, 0xB4, 0x9F, 0xAA, 0x5F, 0x0A, 0x2E, 0xE2, 0x38, 0xA6, 0xBC]
+    op: [0xE8, 0xED, 0x28, 0x9D, 0xEB, 0xA9, 0x52, 0xE4, 0x28, 0x3B, 0x54, 0xE8, 0x8E, 0x6D, 0x83, 0x4D]
+    op_type: Opc
+    amf: [0x80, 0x00]
+    imei: "356938035643803"
+    imei_sv: null
+    supported_algs:
+      nia1: true
+      nia2: true
+      nia3: true
+      nea1: true
+      nea2: true
+      nea3: true
+    gnb_search_list:
+      - "gnb.nextg-system.svc.cluster.local"
+      - "gnb-east.nextg-system.svc.cluster.local"
+    sim_position: { x: 35, y: 0, z: 0 }
+    sim_movement:
+      target: { x: 85, y: 0, z: 0 }
+      speed_mps: 2.5
+      start_after_secs: 20
+    sessions:
+      - type: Ipv4
+        s_nssai:
+          sst: 1
+          sd: null
+        apn: "internet"
+        is_emergency: false
+    configured_nssai:
+      slices:
+        - sst: 1
+          sd: null
+    tun_name: "uesimtun"
