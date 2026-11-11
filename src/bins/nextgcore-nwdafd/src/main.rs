@@ -612,6 +612,11 @@ const SPEC_ALLOWED_NF_TYPES: &[&str] = &[
     "PCF", "NSSF", "AMF", "SMF", "NEF", "AF", "LMF", "NWDAF", "DCCF", "ADRF", "UDM", "NRF", "SCP",
 ];
 
+/// The NF service consumers of Nnwdaf_MLModelProvision, TS 29.520 §4.5.1.3.2:
+/// the NWDAF (containing an AnLF or MTLF) and the LMF. Set as that service's
+/// `NFService.allowedNfTypes`, which nrfd checks together with the NF-level list.
+const MLMODELPROVISION_ALLOWED_NF_TYPES: &[&str] = &["NWDAF", "LMF"];
+
 /// [`SPEC_ALLOWED_NF_TYPES`] as owned strings.
 fn spec_allowed_nf_types() -> Vec<String> {
     SPEC_ALLOWED_NF_TYPES
@@ -624,8 +629,8 @@ fn spec_allowed_nf_types() -> Vec<String> {
 /// `nwdaf.sbi.nrf_profile.allowed_nf_types` in the config file, the same knob
 /// udmd has (#85), else [`SPEC_ALLOWED_NF_TYPES`].
 ///
-/// An absent file, section or key means the default, as for the other file
-/// knobs here. A PRESENT key must be a non-empty list of `NFType` tokens
+/// A missing file, section or key means the default, as for the other file
+/// knobs here; a file that exists but cannot be read or parsed fails. A PRESENT key must be a non-empty list of `NFType` tokens
 /// (uppercase letters, digits and `_`, as TS 29.510 spells them); anything else
 /// fails startup. This is access control, so a typo must not silently bar a
 /// consumer, and an empty list must not silently mean "everyone": TS 29.510
@@ -633,12 +638,13 @@ fn spec_allowed_nf_types() -> Vec<String> {
 /// operator writing `[]` meant either way. Duplicates are dropped, order kept.
 fn allowed_nf_types_from_config(config_path: &str) -> Result<Vec<String>, String> {
     let default = spec_allowed_nf_types;
-    let Ok(content) = std::fs::read_to_string(config_path) else {
-        return Ok(default());
+    let content = match std::fs::read_to_string(config_path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(default()),
+        Err(e) => return Err(format!("cannot read {config_path}: {e}")),
     };
-    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&content) else {
-        return Ok(default());
-    };
+    let value = serde_yaml::from_str::<serde_yaml::Value>(&content)
+        .map_err(|e| format!("{config_path} is not valid YAML: {e}"))?;
     let Some(list) = value
         .get("nwdaf")
         .and_then(|n| n.get("sbi"))
@@ -747,7 +753,11 @@ fn nwdaf_services(
             "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
             "scheme": "http",
             "nfServiceStatus": "REGISTERED",
-            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
+            // TS 29.520 §4.5.1.3.2: only the NWDAF and the LMF consume this
+            // service. The NF-level list (#1412) is wider, and nrfd ANDs the two
+            // levels, so without this every AnalyticsInfo consumer could get it.
+            "allowedNfTypes": MLMODELPROVISION_ALLOWED_NF_TYPES
         }));
     } else {
         log::warn!(
@@ -1834,6 +1844,43 @@ mod allowed_nf_types_1412_tests {
             (true, false),
             "a type TS 29.520 §4.3.1.3.2 does not list stays barred (unauthorized_client)"
         );
+    }
+
+    /// MLModelProvision keeps its own, narrower consumer list (§4.5.1.3.2): the
+    /// wider NF-level list must not open it to the AnalyticsInfo consumers.
+    #[test]
+    fn nrfd_authorizes_mlmodelprovision_only_for_nwdaf_and_lmf() {
+        let mut doc = profile_json("nwdaf-1412-mlmp", &spec_allowed_nf_types());
+        doc["nfServices"] =
+            serde_json::Value::Array(nwdaf_services("nwdaf-1412-mlmp", "127.0.0.1", 7815, true));
+        let producer = NfProfile::from_json(&doc).expect("nrfd accepts the profile");
+        for consumer in ["NWDAF", "LMF"] {
+            assert_eq!(
+                producer.authorizes_service(consumer, "nnwdaf-mlmodelprovision"),
+                (true, true),
+                "{consumer} is a §4.5.1.3.2 consumer"
+            );
+        }
+        for consumer in [
+            "AF", "NSSF", "UDM", "NRF", "DCCF", "ADRF", "AMF", "SMF", "PCF", "NEF", "SCP",
+        ] {
+            assert_eq!(
+                producer.authorizes_service(consumer, "nnwdaf-mlmodelprovision"),
+                (true, false),
+                "{consumer} is not a §4.5.1.3.2 consumer"
+            );
+            assert_eq!(
+                producer.authorizes_service(consumer, "nnwdaf-analyticsinfo"),
+                (true, true),
+                "{consumer} still gets AnalyticsInfo"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unparseable_config_fails_instead_of_defaulting() {
+        let err = from_config("badyaml", "nwdaf: [unclosed\n").expect_err("invalid YAML");
+        assert!(err.contains("not valid YAML"), "{err}");
     }
 
     /// The discovery path: nrfd's SearchNFInstances filter (TS 29.510 §6.2)
