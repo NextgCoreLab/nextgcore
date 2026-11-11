@@ -8962,6 +8962,9 @@ enum N1SmIntent {
     ModificationRequested { psi: u8, pti: u8 },
     /// The UE completed a network-requested modification: stop T3591.
     ModificationComplete,
+    /// The UE rejected a network-requested modification (TS 24.501 §6.3.2.4,
+    /// PDU SESSION MODIFICATION COMMAND REJECT): stop T3591 (#1385 review M1).
+    ModificationCommandRejected { cause: Option<u8> },
     /// The UE completed a network-requested release: stop T3592, drop the context.
     ReleaseComplete,
     /// 5GSM STATUS (§6.5): the UE reports an error condition.
@@ -8993,6 +8996,9 @@ fn classify_n1_sm_message(n1: &[u8]) -> Option<N1SmIntent> {
         }
         gsm_build::message_type::PDU_SESSION_MODIFICATION_COMPLETE => {
             N1SmIntent::ModificationComplete
+        }
+        gsm_build::message_type::PDU_SESSION_MODIFICATION_COMMAND_REJECT => {
+            N1SmIntent::ModificationCommandRejected { cause }
         }
         gsm_build::message_type::PDU_SESSION_RELEASE_COMPLETE => N1SmIntent::ReleaseComplete,
         gsm_build::message_type::GSM_STATUS => N1SmIntent::Status { cause },
@@ -9090,6 +9096,19 @@ async fn handle_n1_sm_message(sm_context_ref: &str, n1: &[u8]) -> SbiResponse {
         }
 
         N1SmIntent::ModificationComplete => {
+            cancel_gsm_timer(sm_context_ref, timer::SmfTimerId::T3591);
+            SbiResponse::with_status(204)
+        }
+
+        // TS 24.501 §6.3.2.4: "Upon receipt of a PDU SESSION MODIFICATION COMMAND
+        // REJECT message with 5GSM cause value ..., the SMF shall stop timer T3591 ...
+        // and abort the PDU session modification procedure." Before #1385 review M1
+        // this was Unhandled, so T3591 retransmitted the rejected command to exhaustion.
+        N1SmIntent::ModificationCommandRejected { cause } => {
+            log::warn!(
+                "ref={sm_context_ref}: the UE rejected the PDU SESSION MODIFICATION COMMAND \
+                 (5GSM cause {cause:?}); T3591 stopped, the modification aborted"
+            );
             cancel_gsm_timer(sm_context_ref, timer::SmfTimerId::T3591);
             SbiResponse::with_status(204)
         }
@@ -9942,11 +9961,38 @@ fn signal_policy_change(sm_context_ref: &str, before: &context::PolicyBinding) {
     };
     let ambr_changed =
         (after.ambr_ul_bps, after.ambr_dl_bps) != (before.ambr_ul_bps, before.ambr_dl_bps);
-    let five_qi_changed = after.five_qi != before.five_qi;
+    let mut five_qi_changed = after.five_qi != before.five_qi;
     if !ambr_changed && !five_qi_changed {
         log::debug!(
             "ref={sm_context_ref}: the policy change leaves the Session-AMBR and the default \
              5QI as they were; no PDU Session Modification toward the UE"
+        );
+        return;
+    }
+    // #1385 review M2: not while another 5GSM procedure owns the session. During a
+    // release (T3592 armed until RELEASE COMPLETE) a MODIFICATION COMMAND would be
+    // sent for a session going away, and arming T3591 would REPLACE T3592: the release
+    // would no longer be retransmitted nor locally completed on exhaustion (#667). The
+    // QER and the binding already hold the change. A T3591 (an earlier modification)
+    // is superseded, as the UE-requested path does. Nor for a session in Exception.
+    // (The binding FSM is not a usable ACTIVE marker here: on the live path it is left
+    // at WaitPfcpEstablishment, so the armed timer is the reliable signal.)
+    let other_procedure = gsm_procedure_timers()
+        .lock()
+        .ok()
+        .and_then(|t| t.get(sm_context_ref).map(|e| e.timer_id))
+        .filter(|id| *id != timer::SmfTimerId::T3591);
+    if let Some(id) = other_procedure {
+        log::warn!(
+            "ref={sm_context_ref}: the Session-AMBR or 5QI changed while {} is running; \
+             no PDU Session Modification is sent during that procedure",
+            id.name()
+        );
+        return;
+    }
+    if after.fsm.state == gsm_sm::GsmState::Exception {
+        log::warn!(
+            "ref={sm_context_ref}: the session is in Exception; no PDU Session Modification"
         );
         return;
     }
@@ -9957,17 +10003,53 @@ fn signal_policy_change(sm_context_ref: &str, before: &context::PolicyBinding) {
         );
         return;
     };
+    let mut flows: Vec<_> = session_setup_flows(sm_context_ref, &after)
+        .into_iter()
+        .filter(|f| f.qfi == after.qfi)
+        .collect();
+    // #1385 review B1: a GBR default 5QI needs its four bit rates, on N1 (TS 24.501
+    // §6.3.2.4 b) case 8: a GBR description lacking one is rejected) and on N2 (TS
+    // 38.413 §9.3.1.12: GBR QoS Flow Information "shall be present" for a GBR flow).
+    // They come from the session's bearer for the default QFI. Without them neither
+    // leg can describe the flow validly, so the flow is left out of both and only the
+    // Session-AMBR is signalled.
+    let gbr_5qi = context::QosCharacteristics::from_5qi(after.five_qi).is_some_and(|c| c.is_gbr());
+    let gbr = gbr_5qi
+        .then(|| default_flow_bit_rates(sm_context_ref, after.qfi))
+        .flatten();
+    if gbr_5qi {
+        match gbr {
+            Some(rates) => {
+                for f in &mut flows {
+                    f.gbr = Some(rates);
+                }
+            }
+            None => {
+                log::error!(
+                    "ref={sm_context_ref}: default 5QI {} is a GBR 5QI but no GFBR/MFBR is \
+                     known for QFI {}; the flow cannot be described, so only the \
+                     Session-AMBR is signalled",
+                    after.five_qi,
+                    after.qfi
+                );
+                flows.clear();
+                five_qi_changed = false;
+                if !ambr_changed {
+                    return;
+                }
+            }
+        }
+    }
     let n1 = policy::build_network_modification_command(
         after.psi,
         after.ambr_dl_bps,
         after.ambr_ul_bps,
         after.qfi,
-        five_qi_changed.then_some(after.five_qi),
+        five_qi_changed.then_some(policy::ModifiedFlowQos {
+            five_qi: after.five_qi,
+            gbr: gbr.map(|g| (g.gfbr_ul, g.gfbr_dl, g.mfbr_ul, g.mfbr_dl)),
+        }),
     );
-    let flows: Vec<_> = session_setup_flows(sm_context_ref, &after)
-        .into_iter()
-        .filter(|f| f.qfi == after.qfi)
-        .collect();
     let paged = flows.first().map(|f| (f.five_qi, f.arp));
     let n2 = match n2_transfer::modify_request_transfer_with_qos(
         (after.ambr_dl_bps, after.ambr_ul_bps),
@@ -10013,6 +10095,26 @@ fn signal_policy_change(sm_context_ref: &str, before: &context::PolicyBinding) {
         )
         .await;
     });
+}
+
+/// The GFBR/MFBR of the session's bearer for the default QFI, when it carries any
+/// (#1385 review B1). `None` when the session holds no such bearer, or one with no
+/// rates.
+fn default_flow_bit_rates(sm_context_ref: &str, qfi: u8) -> Option<n2_transfer::Gbr> {
+    let sess = smf_self()
+        .read()
+        .ok()
+        .and_then(|ctx| ctx.sess_find_by_sm_context_ref(sm_context_ref))?;
+    eps_to_5gs::session_bearers(&sess)
+        .into_iter()
+        .find(|b| (if b.qfi != 0 { b.qfi } else { b.ebi }) == qfi)
+        .map(|b| n2_transfer::Gbr {
+            mfbr_dl: b.qos.mbr_downlink,
+            mfbr_ul: b.qos.mbr_uplink,
+            gfbr_dl: b.qos.gbr_downlink,
+            gfbr_ul: b.qos.gbr_uplink,
+        })
+        .filter(|g| g.gfbr_dl > 0 || g.gfbr_ul > 0 || g.mfbr_dl > 0 || g.mfbr_ul > 0)
 }
 
 /// N1N2MessageTransfer carrying an N1 PDU SESSION MODIFICATION COMMAND and an N2
@@ -25334,12 +25436,12 @@ mod tests {
         assert_eq!(got.len(), 2, "{got:?}");
         let (_, _, n1_cmd, n2) = &got[1];
         // ... AMBR as before, then the Authorized QoS flow descriptions (0x79, TLV-E,
-        // §9.11.4.12): QFI 1, operation "modify" (3 << 5), E=1 with one parameter, the
+        // §9.11.4.12): QFI 1, operation "create new" (1 << 5, review B1), E=1 with one parameter, the
         // 5QI (0x01) of length 1 = 8.
         assert_eq!(
             &n1_cmd[..],
             &[
-                0x2E, psi, 0, 0xCB, 0x2A, 6, 0x06, 0, 80, 0x06, 0, 40, 0x79, 0, 6, 1, 0x60, 0x41,
+                0x2E, psi, 0, 0xCB, 0x2A, 6, 0x06, 0, 80, 0x06, 0, 40, 0x79, 0, 6, 1, 0x20, 0x41,
                 0x01, 1, 8
             ][..]
         );
@@ -25351,6 +25453,198 @@ mod tests {
         amf.stop().await.ok();
         listener.abort();
         upf_task.abort();
+    }
+
+    /// #1385 review B1: the 5QI change is a "Create new QoS flow description" -- also
+    /// for the usual session whose default QFI equals its 5QI, where the accept sent the
+    /// UE NO description, so a "Modify existing" would be TS 24.501 §6.3.2.4 b) case 13
+    /// and the whole command rejected. And a GBR default 5QI carries its four bit rates
+    /// (case 8) on N1 and its GBR QoS Flow Information on N2 (TS 38.413 §9.3.1.12).
+    ///
+    /// REVERT-VERIFIED: with the "modify" code back, the first N1 ends `09 60 41 ..`;
+    /// without the GBR rates, the GBR N1 carries only the 5QI and N2 no GBR information.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_5qi_change_creates_the_flow_description_with_gbr_rates_1385() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (amf, amf_port, posts) = n1n2_recording_amf_1385(false).await;
+        let psi = 26;
+        let sm_context_ref = seed_pcf_authorised("imsi-001010000031385", psi, "pol-1385");
+        set_amf_1385(&sm_context_ref, amf_port);
+        // The common case: default QFI 9 == 5QI 9, so the accept sent no description.
+        if let Ok(ctx) = smf_self().read() {
+            if let Some(b) = ctx
+                .policy_bindings
+                .write()
+                .unwrap()
+                .get_mut(&sm_context_ref)
+            {
+                b.qfi = 9;
+                b.five_qi = 9;
+            }
+        }
+        let notify_5qi = |five_qi: u8| {
+            policy_notify_1387(
+                &sm_context_ref,
+                serde_json::json!({ "sessRules": { "SessRule-pol-1387": {
+                    "authDefQos": { "5qi": five_qi },
+                }}}),
+            )
+        };
+        assert_eq!(smf_sbi_request_handler(notify_5qi(8)).await.status, 204);
+        let got = await_n1n2_1385(&posts, 1).await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(
+            &got[0].2[12..],
+            &[0x79, 0, 6, 9, 0x20, 0x41, 0x01, 1, 8][..],
+            "QFI 9, operation \"create new\" (case 12: the UE replaces any old one)"
+        );
+        cancel_gsm_timer(&sm_context_ref, timer::SmfTimerId::T3591);
+
+        // A GBR default 5QI (82, an XR one) with the session's bearer for QFI 9 holding
+        // GFBR 2/4 Mbps and MFBR 6/8 Mbps (UL/DL).
+        if let Ok(ctx) = smf_self().read() {
+            let sess = ctx
+                .sess_find_by_sm_context_ref(&sm_context_ref)
+                .expect("session");
+            let mut bearer = ctx.bearer_add(sess.id).expect("bearer");
+            bearer.qfi = 9;
+            bearer.qos.gbr_uplink = 2_000_000;
+            bearer.qos.gbr_downlink = 4_000_000;
+            bearer.qos.mbr_uplink = 6_000_000;
+            bearer.qos.mbr_downlink = 8_000_000;
+            ctx.bearer_update(&bearer);
+        }
+        assert_eq!(smf_sbi_request_handler(notify_5qi(82)).await.status, 204);
+        let got = await_n1n2_1385(&posts, 2).await;
+        assert_eq!(got.len(), 2, "{got:?}");
+        let (_, _, n1_cmd, n2) = &got[1];
+        // 5QI 82, then GFBR UL (0x02), GFBR DL (0x03), MFBR UL (0x04), MFBR DL (0x05),
+        // each 3 octets: unit 0 (1 kbps) and the value in kbps.
+        assert_eq!(
+            &n1_cmd[12..],
+            &[
+                0x79, 0, 26, 9, 0x20, 0x45, 0x01, 1, 82, 0x02, 3, 0, 0x07, 0xD0, 0x03, 3, 0, 0x0F,
+                0xA0, 0x04, 3, 0, 0x17, 0x70, 0x05, 3, 0, 0x1F, 0x40
+            ][..],
+            "a GBR flow description carries all four bit rates (§6.3.2.4 b) case 8)"
+        );
+        let t = nextgcore_ngap::transfer::PduSessionResourceModifyRequestTransfer::decode(n2)
+            .expect("N2 decodes");
+        let gbr = t.qos_flow_add_or_modify_request_list[0]
+            .qos_flow_level_qos_parameters
+            .as_ref()
+            .and_then(|q| q.gbr_qos_information.as_ref())
+            .expect("GBR QoS Flow Information for a GBR flow");
+        assert_eq!(
+            (
+                gbr.guaranteed_flow_bit_rate_ul,
+                gbr.guaranteed_flow_bit_rate_dl,
+                gbr.maximum_flow_bit_rate_ul,
+                gbr.maximum_flow_bit_rate_dl
+            ),
+            (2_000_000, 4_000_000, 6_000_000, 8_000_000)
+        );
+
+        amf.stop().await.ok();
+    }
+
+    /// #1385 review M1: PDU SESSION MODIFICATION COMMAND REJECT stops T3591 (TS 24.501
+    /// §6.3.2.4); it used to be Unhandled, and T3591 retransmitted the rejected command.
+    ///
+    /// REVERT-VERIFIED: with 0xCD classified Unhandled again, T3591 is still armed.
+    #[tokio::test]
+    async fn a_modification_command_reject_stops_t3591_1385() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let reference = "n1385-reject";
+        seed_binding(reference, 7);
+        arm_gsm_timer(
+            reference,
+            timer::SmfTimerId::T3591,
+            &[0x2E, 7, 0, 0xCB],
+            "imsi-001010000001385",
+            7,
+            None,
+        );
+        let mut request = SbiRequest::post(format!(
+            "/nsmf-pdusession/v1/sm-contexts/{reference}/modify"
+        ));
+        request.http.content =
+            Some(serde_json::json!({ "n1SmMsg": { "contentId": "n1SmMsg" } }).to_string());
+        request
+            .http
+            .parts
+            .push(nextgcore_sbi::message::SbiPart::with_content(
+                "n1SmMsg",
+                nextgcore_sbi::constants::content_type::APPLICATION_5GNAS,
+                bytes::Bytes::copy_from_slice(&n1(
+                    7,
+                    0,
+                    gsm_build::message_type::PDU_SESSION_MODIFICATION_COMMAND_REJECT,
+                    &[83],
+                )),
+            ));
+        let resp = handle_sm_context_update(reference, &request).await;
+        assert_eq!(resp.status, 204, "{:?}", resp.http.content);
+        assert!(
+            !gsm_procedure_timers()
+                .lock()
+                .unwrap()
+                .contains_key(reference),
+            "a COMMAND REJECT must stop T3591"
+        );
+    }
+
+    /// #1385 review M2: a policy change during a release (T3592 armed) sends no
+    /// MODIFICATION COMMAND and leaves T3592 armed.
+    ///
+    /// REVERT-VERIFIED: without the other-procedure check, T3591 replaces T3592 and a
+    /// transfer is sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_policy_change_during_a_release_sends_nothing_1385() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (amf, amf_port, posts) = n1n2_recording_amf_1385(false).await;
+        let sm_context_ref = seed_pcf_authorised("imsi-001010000041385", 27, "pol-1385");
+        set_amf_1385(&sm_context_ref, amf_port);
+        let release = policy::build_release_command(27, 0, 36);
+        arm_gsm_timer(
+            &sm_context_ref,
+            timer::SmfTimerId::T3592,
+            &release,
+            "imsi-001010000041385",
+            27,
+            Some(&format!("http://127.0.0.1:{amf_port}")),
+        );
+        let status = smf_sbi_request_handler(policy_notify_1387(
+            &sm_context_ref,
+            serde_json::json!({ "sessRules": { "SessRule-pol-1387": {
+                "authSessAmbr": { "uplink": "10 Mbps", "downlink": "20 Mbps" },
+            }}}),
+        ))
+        .await
+        .status;
+        assert_eq!(status, 204);
+        assert!(
+            settled_n1n2_1385(&posts).await.is_empty(),
+            "no MODIFICATION COMMAND for a session being released"
+        );
+        assert_eq!(
+            gsm_procedure_timers()
+                .lock()
+                .unwrap()
+                .get(&sm_context_ref)
+                .map(|t| t.timer_id),
+            Some(timer::SmfTimerId::T3592),
+            "the release keeps its timer"
+        );
+        cancel_gsm_timer(&sm_context_ref, timer::SmfTimerId::T3592);
+        amf.stop().await.ok();
     }
 
     /// #1385 criterion 4: a transfer the AMF refuses because it is paging the UE (409

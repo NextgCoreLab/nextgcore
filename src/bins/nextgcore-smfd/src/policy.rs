@@ -1957,37 +1957,68 @@ pub fn build_modification_command(psi: u8, pti: u8, ambr_dl_bps: u64, ambr_ul_bp
     msg
 }
 
+/// The default flow's new QoS for a network-requested modification's QoS flow
+/// description (#1385): its 5QI and, for a GBR 5QI, the four bit rates TS 24.501
+/// §6.3.2.4 b) case 8 requires of a GBR flow description (GFBR UL/DL, MFBR UL/DL),
+/// in bit/s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModifiedFlowQos {
+    pub five_qi: u8,
+    /// (GFBR UL, GFBR DL, MFBR UL, MFBR DL), present for a GBR 5QI.
+    pub gbr: Option<(u64, u64, u64, u64)>,
+}
+
 /// Build the PDU SESSION MODIFICATION COMMAND of a NETWORK-requested modification
 /// (#1385, TS 24.501 §6.3.2.2; TS 23.502 §4.3.3.2 step 3b), for a policy change the
 /// PCF made.
 ///
 /// PTI 0: §6.3.2.2 has the SMF set "the PTI IE to 'No procedure transaction identity
 /// assigned'" for a network-requested modification. It always carries the
-/// (new) Session-AMBR. When the default flow's 5QI changed (`five_qi`), it also carries
-/// the Authorized QoS flow descriptions IE (IEI 0x79, §9.11.4.12) with one
-/// "modify existing QoS flow description" entry for `qfi`, its 5QI parameter, so the
-/// UE learns the new 5QI as well as the AMBR.
+/// (new) Session-AMBR. When the default flow's 5QI changed (`flow`), it also carries
+/// the Authorized QoS flow descriptions IE (IEI 0x79, §9.11.4.12) for `qfi`.
+///
+/// The operation is "Create new QoS flow description", with the complete
+/// description (#1385 review B1). The UE often holds NO description for the default
+/// flow: the establishment accept omits it when QFI == 5QI. A "Modify existing" for
+/// a description the UE does not have is §6.3.2.4 b) case 13, which rejects the WHOLE
+/// command with #83 (Session-AMBR included). A "Create" where one exists is case 12:
+/// "the UE shall not diagnose an error ... and delete the old QoS flow description".
+/// So "Create" is correct in both cases.
 pub fn build_network_modification_command(
     psi: u8,
     ambr_dl_bps: u64,
     ambr_ul_bps: u64,
     qfi: u8,
-    five_qi: Option<u8>,
+    flow: Option<ModifiedFlowQos>,
 ) -> Vec<u8> {
     let mut msg = build_modification_command(psi, 0, ambr_dl_bps, ambr_ul_bps);
-    if let Some(five_qi) = five_qi {
+    if let Some(flow) = flow {
         use crate::gsm_build::{
-            encode_qos_flow_descriptions, qos_flow_description_code, qos_flow_param_id,
-            QosFlowDescription, QosFlowParam,
+            encode_bitrate, encode_qos_flow_descriptions, qos_flow_description_code,
+            qos_flow_param_id, QosFlowDescription, QosFlowParam,
         };
+        let mut params = vec![QosFlowParam {
+            identifier: qos_flow_param_id::FIVE_QI,
+            data: vec![flow.five_qi],
+        }];
+        if let Some((gfbr_ul, gfbr_dl, mfbr_ul, mfbr_dl)) = flow.gbr {
+            for (identifier, bps) in [
+                (qos_flow_param_id::GFBR_UPLINK, gfbr_ul),
+                (qos_flow_param_id::GFBR_DOWNLINK, gfbr_dl),
+                (qos_flow_param_id::MFBR_UPLINK, mfbr_ul),
+                (qos_flow_param_id::MFBR_DOWNLINK, mfbr_dl),
+            ] {
+                params.push(QosFlowParam {
+                    identifier,
+                    data: encode_bitrate(bps),
+                });
+            }
+        }
         let descriptions = encode_qos_flow_descriptions(&[QosFlowDescription {
             identifier: qfi,
-            code: qos_flow_description_code::MODIFY_NEW_QOS_FLOW_DESCRIPTION,
+            code: qos_flow_description_code::CREATE_NEW_QOS_FLOW_DESCRIPTION,
             e_bit: true,
-            params: vec![QosFlowParam {
-                identifier: qos_flow_param_id::FIVE_QI,
-                data: vec![five_qi],
-            }],
+            params,
         }]);
         // TLV-E (§9.11.4.12): IEI, a 2-octet length, the descriptions.
         msg.push(0x79);

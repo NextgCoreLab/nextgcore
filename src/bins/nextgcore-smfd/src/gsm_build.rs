@@ -701,7 +701,7 @@ pub fn encode_qos_flow_description(qos_flow: &SmfBearer, code: u8) -> QosFlowDes
 }
 
 /// Encode bitrate to NAS format (unit + value)
-fn encode_bitrate(bitrate: u64) -> Vec<u8> {
+pub(crate) fn encode_bitrate(bitrate: u64) -> Vec<u8> {
     // NAS bitrate encoding: 1 byte unit + 2 bytes value
     // Unit: 0=1kbps, 1=4kbps, 2=16kbps, 3=64kbps, 4=256kbps, 5=1Mbps, 6=4Mbps, 7=16Mbps, etc.
     let (unit, value) = if bitrate == 0 {
