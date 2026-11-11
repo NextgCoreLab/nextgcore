@@ -2836,7 +2836,9 @@ pub async fn handle_sm_policy_get(sm_policy_id: &str) -> SbiResponse {
             };
             // A failed DB read answers the session data the SMF's decision was built
             // from, never the local default (`session_data_for_reevaluation`).
-            let Some(session_data) = sbi_path::session_data_for_reevaluation(&sess, &supi) else {
+            let Some(session_data) =
+                sbi_path::session_data_for_reevaluation(&sess, &supi, "SM Policy Get")
+            else {
                 return nextgcore_sbi::server::send_error(
                     500,
                     "Internal Server Error",
@@ -3708,7 +3710,9 @@ pub async fn handle_sm_policy_update_notify(
                         sess.pcf_ue_sm_id
                     );
                     serde_json::json!({})
-                } else if let Some(sd) = sbi_path::session_data_for_reevaluation(&sess, &supi) {
+                } else if let Some(sd) =
+                    sbi_path::session_data_for_reevaluation(&sess, &supi, "SE_AMBR_CH")
+                {
                     // #1403: a failed DB read bounds the session data the SMF's
                     // decision was built from, never the local default -- answering
                     // min(100 Mbps, bound) during a DB outage would RAISE a session the
@@ -5413,6 +5417,55 @@ mod tests {
             report_se_ambr_ch(&pol, bound()).await,
             Some((SEEDED_UL_1383.to_string(), SEEDED_DL_1383.to_string())),
             "a failed read must bound the stored 11/22 Mbps, not the 100 Mbps default"
+        );
+
+        // #1403 review M1: the BOUNDED value is what is stored. With the DB readable
+        // again, a 5/5 bound authorises 5/5; once the read fails, a later
+        // re-evaluation (here the GET; the notify reads the same helper) answers that
+        // 5/5 -- not the Create-time 11/22, which would raise the session above the
+        // subscribed AMBR.
+        seed_subscriber_1383(supi);
+        let tight = Some(serde_json::json!({ "uplink": "5 Mbps", "downlink": "5 Mbps" }));
+        assert_eq!(
+            report_se_ambr_ch(&pol, tight).await,
+            Some(("5 Mbps".to_string(), "5 Mbps".to_string()))
+        );
+        let stored = pcf_self()
+            .read()
+            .expect("context")
+            .sess_find_by_sm_policy_id(&pol)
+            .expect("session")
+            .authorised_session_data
+            .expect("stored");
+        assert_eq!(
+            (stored.ambr_uplink, stored.ambr_downlink),
+            (5_000_000, 5_000_000),
+            "the bounded value the SMF now holds is stored"
+        );
+        nextgcore_dbi::test_store::provision_subscriber_document(
+            supi,
+            nextgcore_dbi::mongodb::bson::doc! {
+                "imsi": supi.trim_start_matches("imsi-"),
+                "slice": [{ "sst": 1, "session": [{ "name": "ims" }] }],
+            },
+        );
+        let resp = pcf_sbi_request_handler(make_request(
+            "GET",
+            &format!("/npcf-smpolicycontrol/v1/sm-policies/{pol}"),
+            None,
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
+        assert_eq!(
+            sess_rule_1383(&body["policy"]),
+            (
+                SEEDED_5QI_1383 as i64,
+                "5 Mbps".to_string(),
+                "5 Mbps".to_string()
+            ),
+            "a failed read falls back to the BOUNDED value, not the Create-time one"
         );
 
         // Nothing stored and nothing readable: no session rule at all.
