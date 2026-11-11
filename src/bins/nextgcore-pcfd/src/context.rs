@@ -574,6 +574,17 @@ pub struct PcfSess {
     /// for the same snapshot reason as `access_type`.
     #[serde(default)]
     pub origination_ms: Option<i64>,
+    /// The session data the decision the SMF holds was last built from (#1383): the
+    /// create's, then each UpdateNotify's.
+    ///
+    /// What a re-evaluation falls back to when the DB read fails. Without it the only
+    /// fallback was the local default (5QI 9, 100/100 Mbps), so a P-CSCF restoration
+    /// or a policy-data re-authorisation during a DB outage reset every live session
+    /// to it -- TS 29.512 §4.2.6.1 makes a notify a CHANGE to the last decision, and
+    /// a DB error is not one. `#[serde(default)]` for the same snapshot reason as
+    /// `access_type`.
+    #[serde(default)]
+    pub authorised_session_data: Option<crate::nudr_handler::SessionData>,
 }
 
 impl PcfSess {
@@ -607,6 +618,7 @@ impl PcfSess {
             policy_dnn_data: None,
             tsc_containers: Default::default(),
             origination_ms: None,
+            authorised_session_data: None,
         }
     }
 
