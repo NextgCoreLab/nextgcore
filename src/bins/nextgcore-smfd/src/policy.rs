@@ -1957,6 +1957,46 @@ pub fn build_modification_command(psi: u8, pti: u8, ambr_dl_bps: u64, ambr_ul_bp
     msg
 }
 
+/// Build the PDU SESSION MODIFICATION COMMAND of a NETWORK-requested modification
+/// (#1385, TS 24.501 §6.3.2.2; TS 23.502 §4.3.3.2 step 3b), for a policy change the
+/// PCF made.
+///
+/// PTI 0: §6.3.2.2 has the SMF set "the PTI IE to 'No procedure transaction identity
+/// assigned'" for a network-requested modification. It always carries the
+/// (new) Session-AMBR. When the default flow's 5QI changed (`five_qi`), it also carries
+/// the Authorized QoS flow descriptions IE (IEI 0x79, §9.11.4.12) with one
+/// "modify existing QoS flow description" entry for `qfi`, its 5QI parameter, so the
+/// UE learns the new 5QI as well as the AMBR.
+pub fn build_network_modification_command(
+    psi: u8,
+    ambr_dl_bps: u64,
+    ambr_ul_bps: u64,
+    qfi: u8,
+    five_qi: Option<u8>,
+) -> Vec<u8> {
+    let mut msg = build_modification_command(psi, 0, ambr_dl_bps, ambr_ul_bps);
+    if let Some(five_qi) = five_qi {
+        use crate::gsm_build::{
+            encode_qos_flow_descriptions, qos_flow_description_code, qos_flow_param_id,
+            QosFlowDescription, QosFlowParam,
+        };
+        let descriptions = encode_qos_flow_descriptions(&[QosFlowDescription {
+            identifier: qfi,
+            code: qos_flow_description_code::MODIFY_NEW_QOS_FLOW_DESCRIPTION,
+            e_bit: true,
+            params: vec![QosFlowParam {
+                identifier: qos_flow_param_id::FIVE_QI,
+                data: vec![five_qi],
+            }],
+        }]);
+        // TLV-E (§9.11.4.12): IEI, a 2-octet length, the descriptions.
+        msg.push(0x79);
+        msg.extend_from_slice(&(descriptions.len() as u16).to_be_bytes());
+        msg.extend_from_slice(&descriptions);
+    }
+    msg
+}
+
 /// Build a PDU Session Release Command (TS 24.501 §8.3.13).
 pub fn build_release_command(psi: u8, pti: u8, cause_5gsm: u8) -> Vec<u8> {
     vec![
