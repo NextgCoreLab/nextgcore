@@ -2325,6 +2325,7 @@ mod tests {
                 remote_gtpu_peers: vec![RemoteGtpUPeer {
                     ipv4: Some([10, 45, 0, 7]),
                     ipv6: None,
+                    ..Default::default()
                 }],
             }),
             user_plane_path_recovery_report: None,
@@ -2359,6 +2360,7 @@ mod tests {
                 remote_gtpu_peers: vec![RemoteGtpUPeer {
                     ipv4: Some([10, 45, 0, 9]),
                     ipv6: None,
+                    ..Default::default()
                 }],
             }),
         };

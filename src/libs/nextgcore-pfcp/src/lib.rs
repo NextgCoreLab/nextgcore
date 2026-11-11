@@ -30,6 +30,7 @@ pub mod header;
 pub mod ie;
 pub mod message;
 pub mod peer_policy;
+pub mod qos_monitoring;
 pub mod recovery_time;
 pub mod types;
 

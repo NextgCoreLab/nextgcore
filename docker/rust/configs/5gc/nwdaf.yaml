@@ -8,6 +8,12 @@ nwdaf:
       - address: 0.0.0.0
         advertise: 172.23.0.30
         port: 7777
+    # NRF NFProfile (#1412): the NF types the NRF lets discover this NWDAF and
+    # get an nnwdaf-* access token. Omit it for the TS 29.520 §4.3.1.3.2
+    # consumer list: PCF, NSSF, AMF, SMF, NEF, AF, LMF, NWDAF, DCCF, ADRF, UDM,
+    # NRF, SCP. A present list must be non-empty NFType tokens, or startup fails.
+    # nrf_profile:
+    #   allowed_nf_types: [PCF, NSSF, AMF, SMF, NEF, AF, LMF, NWDAF, DCCF, ADRF, UDM, NRF, SCP]
   nrf:
     uri: http://172.23.0.10:7777
   analytics:

@@ -37,6 +37,8 @@
 # bearer of the PGW-C's local PCC rule) from the logs.
 # PROFILE=6g runs the 5G checks against nextg-6g plus a 6G feature smoke: each
 # runtime feature the profile builds in shows its signature (see that section).
+# PROFILE=demo (#1395) is the 6G profile in nextg-demo and runs the same checks;
+# k8s/demo-check.sh uses it as every demo run's base e2e.
 set -uo pipefail
 
 PROFILE="${PROFILE:-5g}"
@@ -55,9 +57,9 @@ source "${SCRIPT_DIR}/lib/profile.sh"
 nextg_load_profile "${PROFILE}" || exit 2
 
 case "${PROFILE}" in
-  5g|6g)
+  5g|6g|demo)
     # PROFILE=6g is the 5G core and gNB/UE built with the 6G features, so the
-    # pods and the TUN are the same.
+    # pods and the TUN are the same; PROFILE=demo is the 6G profile.
     NAMESPACE="${NAMESPACE:-${PROFILE_NAMESPACE}}"
     UE_SELECTOR="${UE_SELECTOR:-app.kubernetes.io/name=ue}"
     UE_CONTAINER="${UE_CONTAINER:-ue}"
@@ -86,7 +88,7 @@ case "${PROFILE}" in
   # "Data plane stats" line) and container, and the UE tunnel interface.
   # NAMESPACE comes from the profile's profile.env.
   *)
-    echo "PROFILE=${PROFILE} has no e2e-internet section yet (5g, epc, 6g)" >&2
+    echo "PROFILE=${PROFILE} has no e2e-internet section yet (5g, epc, 6g, demo)" >&2
     exit 2
     ;;
 esac
@@ -271,7 +273,7 @@ fi
 # One runtime signature per feature profiles/6g/profile.env builds in and
 # switches on. Read from the running pods, so a default (featureless) binary
 # under a -6g tag fails here rather than passing the 5G checks above.
-if [[ "${PROFILE}" == 6g ]]; then
+if [[ "${PROFILE}" == 6g || "${PROFILE}" == demo ]]; then
   nf_log() { "${KUBECTL[@]}" logs "deployment/$1" -c "$1" --tail=-1 2>/dev/null; }
 
   # udmd nes: the NES state machine started, and its energy gauges are served

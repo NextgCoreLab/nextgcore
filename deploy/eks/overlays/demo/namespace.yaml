@@ -1,0 +1,11 @@
+# The demo namespace (nextgcore#1395). Privileged pod security for the same
+# reason as nextg-6g: the data-plane UPF needs NET_ADMIN and /dev/net/tun in
+# its own pod network namespace. It publishes nothing (no hostNetwork, no
+# hostPort, no NodePort or LoadBalancer).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nextg-demo
+  labels:
+    nextg.io/profile: demo
+    pod-security.kubernetes.io/enforce: privileged
