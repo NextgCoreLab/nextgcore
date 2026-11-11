@@ -257,9 +257,11 @@ pub struct AcServiceKpis {
     /// Required request rate.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub req_rate: Option<u32>,
-    /// Required response time (`DurationSec`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resp_time: Option<u32>,
+    /// Required response time, in **seconds**: `respTime` is a `DurationSec`
+    /// (TS 24.558 Table 8.2.5.2.6-1, `24558-k00.txt` l.3476). The EAS side it is
+    /// compared with, `maxRespTime`, is in milliseconds (#1384).
+    #[serde(rename = "respTime", skip_serializing_if = "Option::is_none")]
+    pub resp_time_s: Option<u32>,
     /// Required availability.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub avail: Option<u32>,
@@ -323,7 +325,7 @@ mod tests {
                 eass: Some(vec![EasDetail {
                     eas_id: "eas1".into(),
                     minimum_req_svc_kpis: Some(AcServiceKpis {
-                        resp_time: Some(20),
+                        resp_time_s: Some(20),
                         ..Default::default()
                     }),
                     ..Default::default()

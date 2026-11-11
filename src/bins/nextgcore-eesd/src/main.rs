@@ -3876,8 +3876,9 @@ mod tests {
         ees_context_init(512);
         let sk = signing_key();
         auth::set_auth_jwks(jwks_for(&sk, "k1"));
+        // maxRespTime is in ms (TS 29.558); respTime below is in s (TS 24.558).
         register_eas_with_kpis(&sk, "eas-105-fast.example.com", 10);
-        register_eas_with_kpis(&sk, "eas-105-slow.example.com", 500);
+        register_eas_with_kpis(&sk, "eas-105-slow.example.com", 1500);
 
         // One profile matched, one naming an unregistered EAS -> 201 with the
         // SINGULAR member (NOTE 2: exactly one unfulfilled profile).
@@ -3910,13 +3911,14 @@ mod tests {
             "a single entry must use the singular member (NOTE 2)"
         );
 
-        // The KPI half: the easId IS registered but too slow for the profile.
+        // The KPI half: the easId IS registered but too slow for the profile
+        // (1500 ms against a required 1 s).
         let resp = post_eec_registration(
             &sk,
             r#"{"eecId":"eec-105-b.example.com","acProfs":[
                 {"acId":"ac-ok","eass":[{"easId":"eas-105-fast.example.com"}]},
                 {"acId":"ac-slow","eass":[{"easId":"eas-105-slow.example.com",
-                    "minimumReqSvcKPIs":{"respTime":20}}]}
+                    "minimumReqSvcKPIs":{"respTime":1}}]}
             ]}"#,
         );
         assert_eq!(resp.status, 201);
@@ -3931,14 +3933,14 @@ mod tests {
             "a registered EAS that misses the KPIs is NOT 'EAS not available'"
         );
 
-        // Same EAS, a requirement it DOES meet -> nothing reported at all. Without
-        // this half the guard also passes for an implementation that reports every
-        // profile carrying `minimumReqSvcKPIs`.
+        // Same EAS, a requirement it DOES meet (1500 ms within 2 s) -> nothing
+        // reported at all. Without this half the guard also passes for an
+        // implementation that reports every profile carrying `minimumReqSvcKPIs`.
         let resp = post_eec_registration(
             &sk,
             r#"{"eecId":"eec-105-c.example.com","acProfs":[
                 {"acId":"ac-slow","eass":[{"easId":"eas-105-slow.example.com",
-                    "minimumReqSvcKPIs":{"respTime":900}}]}
+                    "minimumReqSvcKPIs":{"respTime":2}}]}
             ]}"#,
         );
         assert_eq!(resp.status, 201);
@@ -3946,6 +3948,76 @@ mod tests {
         assert!(
             !body.contains("unfulfil"),
             "a fulfilled profile must report nothing; got {body}"
+        );
+
+        auth::clear_auth_jwks();
+    }
+
+    /// #1384: the AC's `respTime` is a DurationSec (TS 24.558, `24558-k00.txt`
+    /// l.3476) and the EAS's `maxRespTime` is in milliseconds (TS 29.558,
+    /// `29558-j70.txt` l.7695-7698), so `respTime: 1` admits EASes at 500 and
+    /// 1000 ms (the boundary is inclusive) and refuses one at 1500 ms. Each EAS is
+    /// named by its own AC profile, so the unfulfilled report says exactly which
+    /// candidates the filter rejected. Before the fix the raw `1500 > 1` compare
+    /// rejected all three.
+    ///
+    /// Also: a `respTime` of `u32::MAX` seconds is ~4.3e12 ms, which overflows a
+    /// u32 multiply (a debug-build panic, a wrapped compare in release); it must
+    /// simply admit the EAS.
+    #[test]
+    fn ac_resp_time_in_seconds_is_compared_with_eas_max_resp_time_in_ms() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+        register_eas_with_kpis(&sk, "eas-1384-500.example.com", 500);
+        register_eas_with_kpis(&sk, "eas-1384-1000.example.com", 1000);
+        register_eas_with_kpis(&sk, "eas-1384-1500.example.com", 1500);
+
+        let resp = post_eec_registration(
+            &sk,
+            r#"{"eecId":"eec-1384-a.example.com","acProfs":[
+                {"acId":"ac-500","eass":[{"easId":"eas-1384-500.example.com",
+                    "minimumReqSvcKPIs":{"respTime":1}}]},
+                {"acId":"ac-1000","eass":[{"easId":"eas-1384-1000.example.com",
+                    "minimumReqSvcKPIs":{"respTime":1}}]},
+                {"acId":"ac-1500","eass":[{"easId":"eas-1384-1500.example.com",
+                    "minimumReqSvcKPIs":{"respTime":1}}]}
+            ]}"#,
+        );
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        let stored: EecRegistration =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let rejected: Vec<_> = stored
+            .unfulfilled()
+            .iter()
+            .map(|u| u.ac_id.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            rejected,
+            vec!["ac-1500".to_string()],
+            "respTime 1 s keeps the 500 and 1000 ms EASes and rejects only 1500 ms"
+        );
+        assert_eq!(
+            stored.unfulfilled()[0].reason.as_deref(),
+            Some(eec::unfulfill_reason::REQ_UNFULFILLED)
+        );
+
+        // No overflow: u32::MAX seconds admits even the slowest EAS.
+        let resp = post_eec_registration(
+            &sk,
+            r#"{"eecId":"eec-1384-b.example.com","acProfs":[
+                {"acId":"ac-huge","eass":[{"easId":"eas-1384-1500.example.com",
+                    "minimumReqSvcKPIs":{"respTime":4294967295}}]}
+            ]}"#,
+        );
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        let body = resp.http.content.as_deref().unwrap();
+        assert!(
+            !body.contains("unfulfil"),
+            "u32::MAX seconds must admit a 1500 ms EAS; got {body}"
         );
 
         auth::clear_auth_jwks();

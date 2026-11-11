@@ -96,9 +96,10 @@ impl EndPoint {
 ///
 /// The members below whose key `rename_all` would not derive correctly carry an
 /// explicit `rename` to their key in `TS29558_Eees_EASRegistration.yaml`
-/// EASServiceKPI (l.429-448). Three Rust names (`availability`, `avl_stor`, `con_bdwth`) used
-/// to serialise as keys the schema does not have (`availability`, `avlStor`,
-/// `conBdwth`), so conformant registrations never populated them (#1388). The
+/// EASServiceKPI (l.429-448). Three Rust names (`availability`, `avl_stor`,
+/// `con_bdwth`) used to serialise as keys the schema does not have
+/// (`availability`, `avlStor`, `conBdwth`), so conformant registrations never
+/// populated them (#1388). The
 /// old keys are not accepted: eesd keeps no persisted EAS state that could hold
 /// them, and no emitter in nextgcore or nextgsim produces them.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -106,8 +107,10 @@ impl EndPoint {
 pub struct EasServiceKpi {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_req_rate: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_resp_time: Option<u32>,
+    /// Maximum response time the EAS advertises, in **milliseconds**
+    /// (TS 29.558 `maxRespTime`, `29558-j70.txt` l.7695-7698).
+    #[serde(rename = "maxRespTime", skip_serializing_if = "Option::is_none")]
+    pub max_resp_time_ms: Option<u32>,
     /// Advertised percentage of time the EAS is available, 0..=100 (`avail`).
     #[serde(rename = "avail", skip_serializing_if = "Option::is_none")]
     pub avail: Option<u32>,
@@ -246,7 +249,7 @@ impl AppGroupProfile {
         }
         match (
             self.e2e_resp_time,
-            eas.svc_kpi.as_ref().and_then(|k| k.max_resp_time),
+            eas.svc_kpi.as_ref().and_then(|k| k.max_resp_time_ms),
         ) {
             (Some(want), Some(have)) => have <= want,
             _ => true,
