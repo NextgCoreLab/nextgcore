@@ -155,6 +155,11 @@ pub struct StoredUeContext {
     pub guti: Guti5gs,
     pub tai: Tai5gs,
     pub cgi: NrCgi,
+    /// When `tai`/`cgi` were acquired (`AmfUe::ue_location_timestamp`, seconds; 0 =
+    /// unknown). Defaulted, so a record an AMF without the field wrote still reads,
+    /// with the age unknown (nextgsim#488).
+    #[serde(default)]
+    pub location_timestamp: u64,
     pub access_type: u8,
     pub registration_type: u8,
     pub requested_nssai: Vec<SNssai>,
@@ -706,6 +711,7 @@ impl NgapServer {
             guti: ue.current_guti.clone(),
             tai: ue.nr_tai.clone(),
             cgi: ue.nr_cgi.clone(),
+            location_timestamp: ue.ue_location_timestamp,
             access_type: ue.access_type,
             registration_type: ue.registration_type,
             requested_nssai: ue.requested_nssai.clone(),
@@ -1053,6 +1059,8 @@ fn restored_ue(amf_ue_ngap_id: u64, rec: &StoredUeContext) -> Option<UeNasContex
     ue.current_m_tmsi = Some(rec.guti.tmsi);
     ue.nr_tai = rec.tai.clone();
     ue.nr_cgi = rec.cgi.clone();
+    // The restored location is as old as when it was acquired, not when restored.
+    ue.ue_location_timestamp = rec.location_timestamp;
     ue.access_type = rec.access_type;
     ue.registration_type = rec.registration_type;
     ue.requested_nssai = rec.requested_nssai.clone();

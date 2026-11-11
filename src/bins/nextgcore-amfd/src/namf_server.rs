@@ -977,12 +977,19 @@ fn tai_json(tai: &Tai5gs) -> Value {
 
 /// NrLocation user-location JSON for a UE (TS 29.571 UserLocation)
 fn nr_location_json(ue: &AmfUe) -> Value {
-    json!({
-        "nrLocation": {
-            "tai": tai_json(&ue.nr_tai),
-            "ncgi": ncgi_json(&ue.nr_cgi),
-        }
-    })
+    let mut nr_location = json!({
+        "tai": tai_json(&ue.nr_tai),
+        "ncgi": ncgi_json(&ue.nr_cgi),
+    });
+    // TS 29.571 §5.4.4.9 `NrLocation.ueLocationTimestamp` (O, DateTime): "the UTC time
+    // when the UeLocation information was acquired". Omitted while unknown, rather than
+    // claiming the epoch (nextgsim#488).
+    if ue.ue_location_timestamp > 0 {
+        nr_location["ueLocationTimestamp"] = json!(system_time_to_rfc3339(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(ue.ue_location_timestamp)
+        ));
+    }
+    json!({ "nrLocation": nr_location })
 }
 
 // ============================================================================
@@ -1042,7 +1049,7 @@ fn rfc3339_now() -> String {
 
 /// Parse an RFC 3339 timestamp ("YYYY-MM-DDTHH:MM:SS[.frac](Z|±hh:mm)") into
 /// a SystemTime. Returns None on malformed input (never panics).
-fn rfc3339_to_system_time(s: &str) -> Option<std::time::SystemTime> {
+pub(crate) fn rfc3339_to_system_time(s: &str) -> Option<std::time::SystemTime> {
     let bytes = s.as_bytes();
     if bytes.len() < 20 {
         return None;
