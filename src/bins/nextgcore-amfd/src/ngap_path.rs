@@ -19603,7 +19603,7 @@ impl NgapServer {
 
         match assoc_id {
             Some(assoc_id) => {
-                log::debug!("Sending {} bytes to gNB {}", data.len(), gnb_id);
+                log::trace!("Sending {} bytes to gNB {}", data.len(), gnb_id);
                 self.send_to_association(assoc_id, data).await
             }
             None => Err(anyhow::anyhow!("gNB {gnb_id} not found")),

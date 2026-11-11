@@ -93,7 +93,7 @@ pub fn s1ap_send(message: S1apSend) -> bool {
     let len = message.pdu.len();
     match tx.send(message) {
         Ok(()) => {
-            log::debug!("S1AP PDU queued for eNB {enb_id} ({len} bytes)");
+            log::trace!("S1AP PDU queued for eNB {enb_id} ({len} bytes)");
             true
         }
         Err(_) => {

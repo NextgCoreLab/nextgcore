@@ -253,7 +253,7 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
-      RUST_LOG: info,nextgcore_amfd=debug
+      RUST_LOG: info
       # #753: a stable nfInstanceId, so a restarted AMF is the same AMF to the UDM.
       NEXTGCORE_AMF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-000000000af0
       AMF_SBI_ADDR: 172.23.0.5
@@ -357,7 +357,7 @@ services:
       - net.ipv4.ip_forward=1
     environment:
       <<: *common-env
-      RUST_LOG: info,nextgcore_upfd=debug
+      RUST_LOG: info
       TLS_CERT: /etc/nextgcore/certs/upf.crt
       TLS_KEY: /etc/nextgcore/certs/upf.key
       TLS_CA: /etc/nextgcore/certs/ca.crt
@@ -389,7 +389,7 @@ services:
     container_name: nextgsim-gnb
     <<: *common
     environment:
-      RUST_LOG: info,nextgsim_gnb=debug,nextgsim_sctp=debug,nextgsim_ngap=debug
+      RUST_LOG: info
     command: ["-c", "/etc/nextgsim/gnb.yaml"]
     volumes:
       - ../../../nextgsim/config:/etc/nextgsim:ro
@@ -413,7 +413,7 @@ services:
     container_name: nextgsim-ue
     <<: *common
     environment:
-      RUST_LOG: info,nextgsim_ue=debug,nextgsim_nas=debug
+      RUST_LOG: info
     command: ["-c", "/etc/nextgsim/ue.yaml"]
     cap_add:
       - NET_ADMIN

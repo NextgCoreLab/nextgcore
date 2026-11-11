@@ -181,7 +181,7 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
-      RUST_LOG: info,nextgcore_amfd=debug
+      RUST_LOG: info
       NEXTGCORE_AMF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-000000000af0
       AMF_SBI_ADDR: 172.23.0.5
       AMF_SBI_PORT: "7777"
@@ -252,7 +252,7 @@ services:
       - net.ipv4.ip_forward=1
     environment:
       <<: *common-env
-      RUST_LOG: info,nextgcore_upfd=debug
+      RUST_LOG: info
     command: ["-c", "/etc/nextgcore/upf.yaml", "--pfcp-addr", "172.23.0.7", "--gtpu-addr", "172.23.0.7", "--tun-ip", "10.45.0.1", "--tun-prefix", "16", "--pfcp-allowed-peers", "172.23.0.4"]
     volumes:
       - ./configs/5gc/upf.yaml:/etc/nextgcore/upf.yaml:ro
@@ -274,7 +274,7 @@ services:
     image: nextgsim-gnb:latest
     <<: *common
     environment:
-      RUST_LOG: info,nextgsim_gnb=debug,nextgsim_sctp=debug,nextgsim_ngap=debug
+      RUST_LOG: info
     command: ["-c", "/etc/nextgsim/gnb.yaml"]
     volumes:
       - ${NEXTGSIM_DIR:-../../../nextgsim}/config:/etc/nextgsim:ro
@@ -299,7 +299,7 @@ services:
     image: nextgsim-gnb:latest
     <<: *common
     environment:
-      RUST_LOG: info,nextgsim_gnb=debug,nextgsim_sctp=debug,nextgsim_ngap=debug
+      RUST_LOG: info
     command: ["-c", "/etc/nextgsim/gnb-n2ho-target.yaml"]
     volumes:
       - ${NEXTGSIM_DIR:-../../../nextgsim}/config:/etc/nextgsim:ro
@@ -323,7 +323,7 @@ services:
     image: nextgsim-ue:latest
     <<: *common
     environment:
-      RUST_LOG: info,nextgsim_ue=debug,nextgsim_nas=debug
+      RUST_LOG: info
     command: ["-c", "/etc/nextgsim/ue-n2ho.yaml"]
     cap_add:
       - NET_ADMIN

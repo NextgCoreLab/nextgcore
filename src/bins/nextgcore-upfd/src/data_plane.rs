@@ -2900,7 +2900,7 @@ impl DataPlaneSession {
             // No recognised action bits — treat as Drop (fail closed)
             FarDecision::Drop
         } else {
-            log::debug!("FAR {far_id} not provisioned — dropping packet");
+            log::trace!("FAR {far_id} not provisioned — dropping packet");
             FarDecision::Drop
         }
     }
@@ -3672,7 +3672,7 @@ impl DataPlane {
                 match gtpu_recv.recv_from(&mut buf).await {
                     Ok((len, from)) => {
                         if len > 0 {
-                            log::debug!("GTP-U received {len} bytes from {from}");
+                            log::trace!("GTP-U received {len} bytes from {from}");
                             let _ = ul_tx_clone.send((buf[..len].to_vec(), from)).await;
                         }
                     }
@@ -3888,7 +3888,7 @@ impl DataPlane {
                 // Process G-PDU below
             }
             _ => {
-                log::debug!("Ignoring GTP-U message type {}", header.msg_type);
+                log::trace!("Ignoring GTP-U message type {}", header.msg_type);
                 return;
             }
         }
@@ -3954,7 +3954,7 @@ impl DataPlane {
                         let _ = sock.send_to(&err_ind, from).await;
                     }
                 } else {
-                    log::debug!(
+                    log::trace!(
                         "G-PDU with TEID=0 from {from} — dropped without Error Indication \
                          (TS 29.281 §7.3.1)"
                     );
@@ -3998,7 +3998,7 @@ impl DataPlane {
                             self.stats
                                 .dl_bytes
                                 .fetch_add(payload_len, Ordering::Relaxed);
-                            log::debug!(
+                            log::trace!(
                                 "Forwarded {payload_len}B from TEID 0x{:x} to {to} TEID \
                                  0x{teid:x} QFI={qfi:?}",
                                 header.teid
@@ -4449,7 +4449,7 @@ impl DataPlane {
                 self.stats
                     .dl_bytes
                     .fetch_add(payload_len, Ordering::Relaxed);
-                log::debug!(
+                log::trace!(
                     "DL forwarded: {payload_len}B to gNB {gnb_addr} TEID=0x{dl_teid:x} QFI={qfi_to_apply:?}"
                 );
             }

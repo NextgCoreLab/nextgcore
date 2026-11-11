@@ -888,7 +888,7 @@ fn apply_far_once(
             // Direction from the PDI: ACCESS-sourced traffic is uplink.
             let uplink = pdr.source_interface == crate::sxa_handler::pfcp_interface::ACCESS;
             if qer.gate_is_closed(uplink) {
-                log::debug!(
+                log::trace!(
                     "DROP per QER {} closed gate ({} direction)",
                     qer.qer_id,
                     if uplink { "UL" } else { "DL" }
@@ -897,7 +897,7 @@ fn apply_far_once(
             }
             let mbr = qer.mbr_bps(uplink);
             if mbr > 0 && !mbr_allows(ctx, pdr.sess_id, qer.qer_id, uplink, mbr, payload.len()) {
-                log::debug!("DROP per QER {} MBR {mbr} bps exceeded", qer.qer_id);
+                log::trace!("DROP per QER {} MBR {mbr} bps exceeded", qer.qer_id);
                 return GtpuRecvResult::Dropped("QER MBR exceeded".to_string());
             }
         }
@@ -920,12 +920,12 @@ fn apply_far_once(
             if retried {
                 return GtpuRecvResult::Dropped("FAR action changed twice".to_string());
             }
-            log::debug!("FAR {far_id} left BUFF while this packet was in flight: re-applying");
+            log::trace!("FAR {far_id} left BUFF while this packet was in flight: re-applying");
             return apply_far_once(server, pdr, payload, true);
         }
         let count = outcome.map(|o| o.buffered()).unwrap_or(0);
         let accepted = outcome.is_some_and(|o| o.accepted());
-        log::debug!("BUFF per FAR {far_id} (buffered={count}/{capacity}, accepted={accepted})");
+        log::trace!("BUFF per FAR {far_id} (buffered={count}/{capacity}, accepted={accepted})");
         // #215: a buffered packet HAS been handled by the UP function -- it was
         // accepted and will be delivered when the buffer flushes -- so it counts.
         // Counting it again on flush would double-bill, which is why the flush path
@@ -973,7 +973,7 @@ fn apply_far_once(
                                 log::error!("Delayed Session Report (DLDR) failed: {e}");
                             }
                         })
-                        .map(|_| log::debug!("DLDR delayed by {delay:?} per BAR"))
+                        .map(|_| log::trace!("DLDR delayed by {delay:?} per BAR"))
                         .unwrap_or_else(|e| {
                             // A thread we cannot spawn must not silently swallow
                             // the notification: send it undelayed instead.
