@@ -1,0 +1,17 @@
+# Applied by scenario.sh mid-run (not a kustomize resource): the expiry arm of
+# demo d447a-nkef-live (nextgsim#488). Denies all egress from the BSF pod, so
+# bsfd stops heartbeating to the NRF without the NFDeregister that a graceful
+# stop sends (bsfd lib.rs, #235): the NRF suspends it for a missed heartbeat.
+# Lives only in the run's temporary namespace, which demo-check.sh deletes.
+# It opens nothing: an egress deny-all, no ingress rule.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nkef-demo-bsf-no-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: bsf
+  policyTypes:
+    - Egress
+  egress: []
