@@ -18,6 +18,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(feature = "amf-mobility")]
+pub mod amf_mobility; // nextgsim#466: UE_MOBILITY from AMF LOCATION_REPORT events
 pub mod analytics;
 mod context;
 pub mod federation;
@@ -252,6 +254,23 @@ async fn main() -> Result<()> {
     log::info!("NextGCore NWDAF v{}", env!("CARGO_PKG_VERSION"));
     log::info!("Network Data Analytics Function (3GPP TS 23.288)");
 
+    // nextgsim#458: the demo: block. Checked against the demos this build was
+    // compiled with, so an unknown key or mode, or a demo whose cargo feature is
+    // not built, fails start-up. With no demo active nothing below changes.
+    let config_root = config_root(&args.config).map_err(|e| anyhow::anyhow!("{e}"))?;
+    nextgcore_demo::init_from_root(&config_root, &demo_registry())
+        .map_err(|e| anyhow::anyhow!("{e} ({e:?})"))?;
+    // nextgsim#466: decided once, before the NRF registration below, so the
+    // profile advertises UE_MOBILITY exactly when it is served.
+    #[cfg(feature = "amf-mobility")]
+    let amf_mobility_plan = {
+        let knob =
+            amf_mobility::knob_from_root(&config_root).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let plan = amf_mobility::resolve(nextgcore_demo::active_mode(amf_mobility::DEMO_KEY), knob);
+        amf_mobility::install(plan);
+        plan
+    };
+
     // Issue #187: the flag seeds the shared resolver (so it still wins) and the
     // fallback resolves there rather than minting an id no operator can pin.
     if let Some(id) = args.nf_instance_id.as_deref() {
@@ -300,8 +319,8 @@ async fn main() -> Result<()> {
     // Issue #109: the model URL notified to MLModelProvision consumers has to
     // resolve back to this NF, so record our own SBI base. Uses the advertised
     // address rather than the bind address: `0.0.0.0` is what we listen on, not
-    // somewhere a consumer can fetch from.
-    {
+    // somewhere a consumer can fetch from. nextgsim#466's eventNotifyUri uses it too.
+    let sbi_base = {
         let scheme = if args.tls { "https" } else { "http" };
         let host = match sbi.advertise.as_deref() {
             Some(host) => host,
@@ -322,7 +341,10 @@ async fn main() -> Result<()> {
         let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
         guard.set_sbi_base_uri(&base);
         log::info!("SBI base URI for model provisioning: {base}");
-    }
+        base
+    };
+    #[cfg(not(feature = "amf-mobility"))]
+    let _ = &sbi_base;
 
     // Issue #26: optional prediction-model selection. Default (env unset) is
     // the OLS baseline — behavior-identical to the pre-#26 inline math.
@@ -420,6 +442,27 @@ async fn main() -> Result<()> {
             });
         }
         nrf_collector::subscribe_nf_status(&ctx).await;
+    }
+
+    // nextgsim#466: Namf_EventExposure_Subscribe (LOCATION_REPORT, any UE) to an
+    // AMF discovered at the NRF, retried in the background until it is accepted;
+    // and this NWDAF's /metrics. Mode `baseline` and the default plan do neither
+    // subscription nor serving; a default build has neither.
+    #[cfg(feature = "amf-mobility")]
+    {
+        if amf_mobility_plan.serves() {
+            amf_mobility::spawn_subscriber(
+                args.nrf_uri.clone(),
+                sbi_base.clone(),
+                nf_instance_id.clone(),
+            );
+        }
+        let _metrics = nextgcore_metrics::nf::serve_nf_metrics(
+            "NWDAF",
+            "NWDAF_METRICS_PORT",
+            Arc::new(render_prometheus),
+        )
+        .await;
     }
 
     // Spawn the notification dispatcher background task (T5.3).
@@ -529,6 +572,16 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             _ => send_method_not_allowed(method, "notify"),
         },
 
+        // nextgsim#466: Namf_EventExposure Notify from the AMF this NWDAF
+        // subscribed to, on the eventNotifyUri it gave (`amf_mobility`).
+        #[cfg(feature = "amf-mobility")]
+        ["nnwdaf-callback", "v1", segment, token] if *segment == amf_mobility::CALLBACK_SEGMENT => {
+            match method {
+                "POST" => amf_mobility::handle_location_notify(&nwdaf_self(), token, &request),
+                _ => send_method_not_allowed(method, "amf-location-notify/{token}"),
+            }
+        }
+
         // Issue #16 (non-normative 6G ISAC, no frozen Stage-3): sensing-result
         // collection endpoint, feature-gated and off by default.
         #[cfg(feature = "sensing")]
@@ -574,7 +627,15 @@ fn build_nf_profile(
     sbi_port: u16,
     allowed_nf_types: &[String],
 ) -> serde_json::Value {
-    let nwdaf_info = nwdaf_info(SUPPORTED_EVENTS);
+    #[allow(unused_mut)]
+    let mut nwdaf_info = nwdaf_info(SUPPORTED_EVENTS);
+    // nextgsim#466: UE_MOBILITY is advertised for Nnwdaf_AnalyticsInfo
+    // (`eventIds`, the EventId spelling) only while it is served; not in
+    // `nwdafEvents`, because the EventsSubscription surface does not serve it.
+    #[cfg(feature = "amf-mobility")]
+    if AnalyticsId::UeMobility.is_served_by_analytics_info() {
+        advertise_analytics_info_event(&mut nwdaf_info, AnalyticsId::UeMobility);
+    }
 
     let can_provision = nwdaf_self()
         .read()
@@ -713,6 +774,56 @@ fn nwdaf_info(events: &[AnalyticsId]) -> serde_json::Value {
         info.insert("nwdafEvents".to_string(), serde_json::json!(nwdaf_events));
     }
     serde_json::Value::Object(info)
+}
+
+/// Add `event` to `nwdafInfo.eventIds` (nextgsim#466).
+#[cfg(feature = "amf-mobility")]
+fn advertise_analytics_info_event(info: &mut serde_json::Value, event: AnalyticsId) {
+    let Some(token) = event.as_event_id() else {
+        return;
+    };
+    let ids = info
+        .as_object_mut()
+        .map(|o| o.entry("eventIds").or_insert_with(|| serde_json::json!([])));
+    if let Some(serde_json::Value::Array(ids)) = ids {
+        if !ids.iter().any(|v| v == token) {
+            ids.push(serde_json::json!(token));
+        }
+    }
+}
+
+/// The YAML root of the config file, for the `demo:` block (nextgsim#458) and
+/// the `amf-mobility` knob. A missing file is an empty root, as for the other
+/// file knobs here; one that cannot be read or parsed fails start-up.
+fn config_root(config_path: &str) -> Result<serde_yaml::Value, String> {
+    match std::fs::read_to_string(config_path) {
+        Ok(content) => serde_yaml::from_str(&content)
+            .map_err(|e| format!("{config_path} is not valid YAML: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(serde_yaml::Value::Null),
+        Err(e) => Err(format!("cannot read {config_path}: {e}")),
+    }
+}
+
+/// The demos this build can run: `d441c-amf-mobility` under the `amf-mobility`
+/// feature, none otherwise.
+fn demo_registry() -> nextgcore_demo::DemoRegistry {
+    #[cfg(feature = "amf-mobility")]
+    return nextgcore_demo::DemoRegistry::new(&[amf_mobility::DEMO_SPEC]);
+    #[cfg(not(feature = "amf-mobility"))]
+    nextgcore_demo::DemoRegistry::default()
+}
+
+/// The `/metrics` body of an `amf-mobility` build: the families every NF shares
+/// (including `nextg_demo_enabled` while a demo is active) and the module's own.
+#[cfg(feature = "amf-mobility")]
+fn render_prometheus() -> String {
+    let mut out = nextgcore_metrics::nf::render_common(&nextgcore_metrics::nf::NfIdentity {
+        nf: "nwdaf",
+        version: env!("CARGO_PKG_VERSION"),
+        nrf_client: true,
+    });
+    amf_mobility::render_metrics(&mut out);
+    out
 }
 
 /// The `nfServices[]` this NWDAF advertises.

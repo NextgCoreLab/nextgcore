@@ -165,6 +165,9 @@ pub struct AnalyticsEngine {
     nf_meta: HashMap<String, NfProfileMeta>,
     /// UE mobility history: last observed cell per SUPI
     ue_cells: HashMap<String, Vec<(u64, u64)>>, // (cell_id, timestamp)
+    /// The TS 29.571 `UserLocation` last reported for each cell id, so a
+    /// UE_MOBILITY answer can name the cell the way the AMF did (nextgsim#466).
+    cell_locations: HashMap<u64, serde_json::Value>,
     /// Anomaly scores per SUPI
     anomaly_scores: HashMap<String, Vec<AbnormalBehaviourRecord>>,
     /// Active prediction model for NF_LOAD (issue #26): defaults to the OLS
@@ -310,6 +313,34 @@ impl AnalyticsEngine {
             buf.remove(0);
         }
         buf.push((cell_id, timestamp));
+    }
+
+    /// Records a UE location reported by the AMF (nextgsim#466): the cell goes
+    /// into the history [`ingest_ue_cell`](Self::ingest_ue_cell) keeps, and `loc`
+    /// (the report's TS 29.571 `UserLocation`) is kept per cell so the answer can
+    /// carry it back verbatim.
+    pub fn ingest_ue_location(
+        &mut self,
+        supi: &str,
+        cell_id: u64,
+        loc: serde_json::Value,
+        timestamp: u64,
+    ) {
+        self.ingest_ue_cell(supi, cell_id, timestamp);
+        self.cell_locations.insert(cell_id, loc);
+    }
+
+    /// The `(cell_id, unix seconds)` history of `supi`, oldest first.
+    pub fn ue_cell_history(&self, supi: &str) -> Option<&[(u64, u64)]> {
+        self.ue_cells
+            .get(supi)
+            .map(Vec::as_slice)
+            .filter(|h| !h.is_empty())
+    }
+
+    /// The `UserLocation` last reported for `cell_id`.
+    pub fn cell_location(&self, cell_id: u64) -> Option<&serde_json::Value> {
+        self.cell_locations.get(&cell_id)
     }
 
     /// Returns a mobility prediction for a UE (simplified: next cell = most-visited)

@@ -1,13 +1,16 @@
 //! Redaction of callback URIs before they reach a log line (#940 review).
 //!
 //! Some callback URIs carry a bearer secret in their path: the AMF's NF status
-//! notification URI (`.../nf-status-notify/{token}`, #940) and its UECM
-//! deregistration callback (`.../dereg-notify/{token}`, #753). Anyone who reads
+//! notification URI (`.../nf-status-notify/{token}`, #940), its UECM
+//! deregistration callback (`.../dereg-notify/{token}`, #753) and the NWDAF's
+//! AMF location-report callback (`.../amf-location-notify/{token}`,
+//! nextgsim#466). Anyone who reads
 //! the log could use the token to forge a notification, and logs are shipped and
 //! retained far more widely than the NF that holds the token.
 
 /// Path segments whose NEXT segment is a callback token.
-pub const CALLBACK_TOKEN_SEGMENTS: [&str; 2] = ["nf-status-notify", "dereg-notify"];
+pub const CALLBACK_TOKEN_SEGMENTS: [&str; 3] =
+    ["nf-status-notify", "dereg-notify", "amf-location-notify"];
 
 /// What a redacted segment is replaced with.
 pub const REDACTED: &str = "<redacted>";
@@ -73,6 +76,11 @@ mod tests {
                 "http://amf:7777/namf-callback/v1/imsi-001/dereg-notify/feed?x=1"
             ),
             "http://amf:7777/namf-callback/v1/imsi-001/dereg-notify/<redacted>?x=1"
+        );
+        // nextgsim#466: the NWDAF's AMF location-report callback.
+        assert_eq!(
+            redact_callback_tokens("/nnwdaf-callback/v1/amf-location-notify/9f0e1d2c"),
+            "/nnwdaf-callback/v1/amf-location-notify/<redacted>"
         );
         assert_eq!(
             redact_callback_tokens("/namf-callback/v1/nf-status-notify"),

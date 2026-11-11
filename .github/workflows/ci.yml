@@ -284,6 +284,7 @@ jobs:
         nextgcore-sbi:pqc-tls
         nextgcore-nwdafd:sensing
         nextgcore-nwdafd:onnx-model
+        nextgcore-nwdafd:amf-mobility
         nextgcore-pcfd:intent-loop
         nextgcore-amfd:ntn
         nextgcore-nsacfd:sla-observe
