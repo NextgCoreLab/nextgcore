@@ -43,6 +43,7 @@ pub mod gtp_path;
 pub mod mcast;
 pub mod n4_build;
 pub mod n4_handler;
+pub mod n6_delay;
 pub mod path_qos;
 pub mod pfcp_path;
 pub mod pfcp_sm;
@@ -170,6 +171,21 @@ struct Args {
     /// `--gtpu-path-qos-monitoring`).
     #[arg(long, default_value = "1000")]
     gtpu_path_qos_probe_interval_ms: u64,
+
+    /// N6 delay measurement and reporting (TS 29.244 §5.33.8, UN6DM; #1389).
+    /// Off by default: only when set does this UPF advertise UN6DM (the UP
+    /// Function Features IE then grows to 10 octets) and STAMP, and act on the
+    /// N6 Delay Measurement Control Information an SMF provisions, probing the
+    /// measurement endpoints as an unauthenticated STAMP Session-Sender (RFC 8762)
+    /// and reporting the one-way delay in Node Reports.
+    /// `UPF_N6_DELAY_MEASUREMENT=true` is read when the flag is not given.
+    #[arg(long, default_value = "false")]
+    n6_delay_measurement: bool,
+
+    /// Interval between STAMP probes to a healthy measurement endpoint, in
+    /// milliseconds (with `--n6-delay-measurement`).
+    #[arg(long, default_value = "1000")]
+    n6_delay_probe_interval_ms: u64,
 }
 
 /// The PFCP peer allowlist (#968): `--pfcp-allowed-peers`, else `UPF_PFCP_ALLOWED_PEERS`.
@@ -439,6 +455,9 @@ async fn main() -> Result<()> {
     let path_qos_monitoring = args.gtpu_path_qos_monitoring
         || std::env::var("UPF_GTPU_PATH_QOS_MONITORING").is_ok_and(|v| v == "true" || v == "1");
     pfcp_server.set_path_qos_monitoring(path_qos_monitoring);
+    let n6_delay_measurement = args.n6_delay_measurement
+        || std::env::var("UPF_N6_DELAY_MEASUREMENT").is_ok_and(|v| v == "true" || v == "1");
+    pfcp_server.set_n6_delay_measurement(n6_delay_measurement);
     let pfcp_server = Arc::new(pfcp_server);
 
     // #325: point the NFProfile/LCI load gauge at the N4 session census. It used to
@@ -530,6 +549,12 @@ async fn main() -> Result<()> {
                         log::warn!("GTP-U path QoS report was NOT sent: {e}");
                     }
                 }
+                // #1389 part 2: N6 delay -> PFCP Node Report with N6DR (§5.33.8.3).
+                data_plane::UpfReportEvent::N6DelayReport { reports } => {
+                    if let Err(e) = pfcp_for_reports.send_n6_delay_report(&reports).await {
+                        log::warn!("N6 delay measurement report was NOT sent: {e}");
+                    }
+                }
                 data_plane::UpfReportEvent::PathReport { failure, peers } => {
                     if let Err(e) = pfcp_for_reports.send_node_report(failure, &peers).await {
                         log::warn!("User-plane path report for {peers:?} was NOT sent: {e}");
@@ -588,6 +613,16 @@ async fn main() -> Result<()> {
             std::time::Duration::from_millis(args.gtpu_path_qos_probe_interval_ms.max(100));
         tokio::spawn(async move {
             dp_for_qos.run_path_qos_monitoring(interval).await;
+        });
+    }
+
+    // #1389 part 2: the STAMP Session-Sender, only when the operator enabled N6
+    // delay measurement. It needs no TUN data plane.
+    if n6_delay_measurement {
+        let dp_for_n6 = data_plane.clone();
+        let interval = std::time::Duration::from_millis(args.n6_delay_probe_interval_ms.max(100));
+        tokio::spawn(async move {
+            n6_delay::run_n6_delay_measurement(dp_for_n6, interval).await;
         });
     }
 

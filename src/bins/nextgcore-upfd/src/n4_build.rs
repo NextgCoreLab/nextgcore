@@ -1951,27 +1951,57 @@ pub fn build_heartbeat_request_with_load(
     builder.build()
 }
 
+/// The optional UP Function Features the operator enabled (#1389). Both are
+/// off by default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OptionalFeatures {
+    /// GPQM: per GTP-U path QoS monitoring (§5.24.5), `--gtpu-path-qos-monitoring`.
+    pub gpqm: bool,
+    /// UN6DM: N6 delay measurement and reporting (§5.33.8),
+    /// `--n6-delay-measurement`.
+    pub un6dm: bool,
+}
+
 /// UP Function Features actually implemented by this UPF.
 ///
 /// Only features with working code paths are advertised (TS 29.244 8.2.25):
 /// - FTUP: F-TEID allocation in the UP function (CHOOSE flag handling)
 /// - EMPU: sending of End Marker packets
-/// - GPQM: per GTP-U path QoS monitoring (§5.24.5), only when `gpqm` is set, i.e.
-///   the operator enabled it (`--gtpu-path-qos-monitoring`, #1389)
+/// - GPQM and UN6DM, only when the operator enabled them ([`OptionalFeatures`]).
 ///
 /// Encoded with the nextgcore-pfcp library codec at minimal length: 8 feature
-/// octets (GPQM is octet 9, so it does not grow the IE).
-pub fn upf_function_features(gpqm: bool) -> Vec<u8> {
+/// octets (GPQM is octet 9, so it does not grow the IE), and 10 only when UN6DM
+/// (octet 14 bit 2) is set.
+pub fn upf_function_features(opt: OptionalFeatures) -> Vec<u8> {
     use bytes::BytesMut;
     let features = nextgcore_pfcp::types::UpFunctionFeatures {
         ftup: true,
         empu: true,
-        gpqm,
+        gpqm: opt.gpqm,
+        un6dm: opt.un6dm,
         ..Default::default()
     };
-    let mut buf = BytesMut::with_capacity(nextgcore_pfcp::types::UpFunctionFeatures::ENCODED_LEN);
+    let mut buf = BytesMut::with_capacity(features.encoded_len());
     features.encode(&mut buf);
     buf.to_vec()
+}
+
+/// The UP Function Features IE, then (with UN6DM) the N6 Delay Measurement
+/// Protocols IE 354 naming STAMP, the one protocol this UPF implements: "should
+/// be present if the UPF sends this message and if the UPF indicates support of
+/// the UN6DM feature" (Tables 7.4.4.2-1, 7.4.4.4-1).
+fn add_up_features(builder: &mut PfcpMessageBuilder, opt: OptionalFeatures) {
+    builder.add_tlv(pfcp_ie::UP_FUNCTION_FEATURES, &upf_function_features(opt));
+    if opt.un6dm {
+        use nextgcore_pfcp::qos_monitoring::{N6DelayMeasurementProtocols, TypedIe};
+        let mut v = bytes::BytesMut::new();
+        N6DelayMeasurementProtocols {
+            stamp: true,
+            ..Default::default()
+        }
+        .encode_value(&mut v);
+        builder.add_tlv(N6DelayMeasurementProtocols::IE_TYPE as u16, &v);
+    }
 }
 
 /// A PFCP Node Report Request reporting N3/N9 user-plane path FAILURE (`failure`)
@@ -2054,17 +2084,52 @@ pub fn parse_gtpu_path_qos_control_information(
         .collect()
 }
 
+/// A PFCP Node Report Request carrying N6 delay measurement reports (#1389 part
+/// 2, TS 29.244 §5.33.8.3, §7.4.5.1): Node ID, Node Report Type with N6DR (bit
+/// 7, §8.2.69) and one N6 Delay Measurement Report IE (Table 7.4.5.1.8-1) per
+/// report.
+pub fn build_n6_delay_node_report(
+    node_id: &NodeId,
+    reports: &[nextgcore_pfcp::qos_monitoring::N6DelayMeasurementReport],
+) -> Vec<u8> {
+    use nextgcore_pfcp::qos_monitoring::TypedIe;
+    let mut b = PfcpMessageBuilder::new();
+    b.add_node_id(node_id);
+    b.add_u8(pfcp_ie::NODE_REPORT_TYPE, 0x40);
+    let mut body = b.build();
+    let mut buf = bytes::BytesMut::new();
+    for r in reports {
+        r.encode_ie(&mut buf);
+    }
+    body.extend_from_slice(&buf);
+    body
+}
+
+/// The raw values of the N6 Delay Measurement Control Information IEs (355) of
+/// an Association Setup or Update Request (#1389 part 2, Table 7.4.4.1.4-1),
+/// in order. Raw, because an Update may carry one with a null length (stop
+/// all) or with only its ID (stop that instance), which the full decoder
+/// rejects (§5.33.8.2).
+pub fn n6_delay_control_values(payload: &[u8]) -> Vec<Vec<u8>> {
+    use nextgcore_pfcp::qos_monitoring::{N6DelayMeasurementControlInformation, TypedIe};
+    ParsedIe::parse_all(payload)
+        .into_iter()
+        .filter(|ie| ie.ie_type == N6DelayMeasurementControlInformation::IE_TYPE as u16)
+        .map(|ie| ie.value)
+        .collect()
+}
+
 /// Association Update Response (TS 29.244 §7.4.4.4): Node ID, Cause and the UP
 /// Function Features.
 pub fn build_association_update_response(
     node_id: &NodeId,
     cause: PfcpCause,
-    gpqm: bool,
+    opt: OptionalFeatures,
 ) -> Vec<u8> {
     let mut builder = PfcpMessageBuilder::new();
     builder.add_node_id(node_id);
     builder.add_cause(cause);
-    builder.add_tlv(pfcp_ie::UP_FUNCTION_FEATURES, &upf_function_features(gpqm));
+    add_up_features(&mut builder, opt);
     builder.build()
 }
 
@@ -2079,14 +2144,14 @@ pub fn build_association_setup_response(
     recovery_time_stamp: u32,
     cause: PfcpCause,
     sessions_retained: bool,
-    gpqm: bool,
+    opt: OptionalFeatures,
 ) -> Vec<u8> {
     let mut builder = PfcpMessageBuilder::new();
     builder.add_node_id(node_id);
     builder.add_cause(cause);
     builder.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, recovery_time_stamp);
     // UP Function Features — only the bits this UPF really implements
-    builder.add_tlv(pfcp_ie::UP_FUNCTION_FEATURES, &upf_function_features(gpqm));
+    add_up_features(&mut builder, opt);
     if sessions_retained {
         builder.add_u8(pfcp_ie::PFCPASRSP_FLAGS, 0x01); // PSREI
     }
