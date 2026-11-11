@@ -569,6 +569,12 @@ jobs:
           # removed on every exit path, every artefact is scrubbed, and a
           # surviving token fails the run.
           k8s/demo-check-selftest.sh
+          # nextgsim#463: each demo overlay's scenario self-test, which proves
+          # every scenario assertion fails on input missing its line.
+          for t in deploy/eks/overlays/demo-*/test-scenario.sh; do
+            [ -e "$t" ] || continue
+            echo "::group::$t"; "$t"; echo "::endgroup::"
+          done
 
   fuzz-build:
     name: Fuzz targets build

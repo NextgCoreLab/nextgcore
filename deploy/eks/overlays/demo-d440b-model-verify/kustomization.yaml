@@ -1,0 +1,47 @@
+# Demo D440B, verified OAM-style model loading with serving counters
+# (nextgsim#463; the convention is on nextgsim#458). Run with:
+#   k8s/demo-check.sh d440b-model-verify verify
+#   k8s/demo-check.sh d440b-model-verify fallback
+#
+# A gNB-only demo: no NF changes. On top of the demo-off base it:
+#   - ships the pinned reference model and its manifest (model/, copied from
+#     nextgsim tools/d440b-model/) as the ConfigMap d440b-model, mounted
+#     read-only at /opt/nextgsim/models in the gNB;
+#   - turns the gNB NWDAF task on and points nwdaf_model_path at the model
+#     (patches/gnb-d440b-config.yaml, patches/gnb-d440b.yaml);
+#   - adds the demo block to gnb.yaml through the toggles (toggles.yaml).
+#
+# The gNB image must be the demo build: nr-gnb with `6g,model-registry`, plus
+# nr-cli and the pinned ONNX Runtime (build-gnb-image.sh). It is pushed under a
+# demo-d440b-model-verify-<sha> tag and passed as SIM_IMAGE_TAG; it is never a
+# published image.
+#
+# ClusterIP only: nothing here adds a Service, a port or a listener. The gNB's CLI
+# socket binds 127.0.0.1 inside the pod, and scenario.sh reads it with
+# `kubectl exec`.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# The base sets it for its own resources only; without it here the generated
+# d440b-model ConfigMap lands in the kubectl context's namespace.
+namespace: nextg-demo
+
+resources:
+  - ../demo
+  - toggles.yaml
+
+configMapGenerator:
+  - name: d440b-model
+    files:
+      - model/nwdaf-trajectory-cv.onnx
+      - model/nwdaf-trajectory-cv.manifest.json
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+patches:
+  - path: patches/gnb-d440b.yaml
+  - path: patches/gnb-d440b-config.yaml
+    target:
+      kind: Deployment
+      name: gnb

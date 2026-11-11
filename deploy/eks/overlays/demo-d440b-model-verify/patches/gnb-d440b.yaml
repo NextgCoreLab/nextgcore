@@ -1,0 +1,25 @@
+# D440B gNB patch (nextgsim#463): the model mount and the pinned ONNX Runtime
+# path. The NWDAF config is gnb-d440b-config.json. The rest of the gNB is the
+# demo-off base.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gnb
+  namespace: nextg-demo
+spec:
+  template:
+    spec:
+      containers:
+        - name: gnb
+          env:
+            # The demo image ships ONNX Runtime 1.23.2 here (build-gnb-image.sh).
+            - name: ORT_DYLIB_PATH
+              value: /usr/local/lib/onnxruntime/libonnxruntime.so.1.23.2
+          volumeMounts:
+            - name: d440b-model
+              mountPath: /opt/nextgsim/models
+              readOnly: true
+      volumes:
+        - name: d440b-model
+          configMap:
+            name: d440b-model
