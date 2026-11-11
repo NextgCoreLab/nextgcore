@@ -309,6 +309,51 @@ enum MbsOutcome {
     Unsuccessful,
 }
 
+/// A gNB id for a log line: the number, or `unknown` (nextgsim#483).
+struct GnbIdLog(Option<u32>);
+
+impl std::fmt::Display for GnbIdLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(id) => write!(f, "{id}"),
+            None => f.write_str("unknown"),
+        }
+    }
+}
+
+/// The HandoverRequired log line. nextgsim#483: the source gNB and the cause are
+/// appended AFTER the original parenthesised text, so every existing grep for
+/// `HandoverRequired (amf_ue_ngap_id=…, type=…)` keeps matching.
+fn handover_required_log_line(
+    required: &nextgcore_ngap::types::HandoverRequired,
+    source_gnb_id: Option<u32>,
+) -> String {
+    format!(
+        "HandoverRequired (amf_ue_ngap_id={}, ran_ue_ngap_id={}, type={:?}) \
+         source_gnb_id={} cause={:?}",
+        required.amf_ue_ngap_id,
+        required.ran_ue_ngap_id,
+        required.handover_type,
+        GnbIdLog(source_gnb_id),
+        required.cause
+    )
+}
+
+/// The HandoverFailure log line; nextgsim#483 appends the refusing target's gNB id.
+fn handover_failure_log_line(
+    association_id: u64,
+    failure: &nextgcore_ngap::types::HandoverFailure,
+    gnb_id: Option<u32>,
+) -> String {
+    format!(
+        "HandoverFailure from association {association_id} (amf_ue_ngap_id={}, cause={:?}) \
+         gnb_id={}",
+        failure.amf_ue_ngap_id,
+        failure.cause,
+        GnbIdLog(gnb_id)
+    )
+}
+
 /// Connected gNB session
 #[derive(Debug)]
 pub struct GnbSession {
@@ -14149,11 +14194,14 @@ impl NgapServer {
                 return Ok(());
             }
         };
+        // nextgsim#483: the cause and the source gNB are appended AFTER the
+        // closing parenthesis, so a grep for the original text keeps matching.
         log::info!(
-            "HandoverRequired (amf_ue_ngap_id={}, ran_ue_ngap_id={}, type={:?})",
-            required.amf_ue_ngap_id,
-            required.ran_ue_ngap_id,
-            required.handover_type
+            "{}",
+            handover_required_log_line(
+                &required,
+                self.global_gnb_id_for_association(association_id).await
+            )
         );
 
         // Inter-system handover (TS 38.413 §9.3.1.22 HandoverType): decide on the
@@ -15673,10 +15721,14 @@ impl NgapServer {
                     .await
             }
         };
+        // nextgsim#483: the refusing target's gNB id, appended after the parenthesis.
         log::warn!(
-            "HandoverFailure from association {association_id} (amf_ue_ngap_id={}, cause={:?})",
-            failure.amf_ue_ngap_id,
-            failure.cause
+            "{}",
+            handover_failure_log_line(
+                association_id,
+                &failure,
+                self.global_gnb_id_for_association(association_id).await
+            )
         );
         // #418: the target gNB refused an EPS→5GS handover. TS 23.502 §4.11.1.2.2.2 step 14:
         // "In the case of Handover Failure in step 10, the target AMF provides to the MME the
@@ -19052,6 +19104,17 @@ impl NgapServer {
         }
 
         Ok(())
+    }
+
+    /// The Global gNB ID's gNB-ID (TS 38.413 §9.3.1.6) that this association announced
+    /// in NG Setup, or `None` before NG Setup or for an ng-eNB. Log-only (nextgsim#483).
+    async fn global_gnb_id_for_association(&self, association_id: u64) -> Option<u32> {
+        self.sessions
+            .read()
+            .await
+            .get(&association_id)
+            .filter(|g| g.gnb.gnb_id_presence)
+            .map(|g| g.gnb.gnb_id)
     }
 
     /// The gNB id this association belongs to, or 0 when the association has no
@@ -28966,6 +29029,73 @@ mod tests {
         gnb.gnb_id_len = 22;
         gnb.gnb_id_presence = true;
         gnb.plmn_id = PlmnId::new("001", "01");
+    }
+
+    /// **nextgsim#483.** The HandoverRequired line names the SOURCE gNB (its Global gNB
+    /// ID from NG Setup, TS 38.413 §9.3.1.6) and the decoded cause, appended after the
+    /// original parenthesised text so nextgsim's `n2ho-check.sh` regex
+    /// (`HandoverRequired \(amf_ue_ngap_id=…, type=Intra5gs\)`) still matches. The
+    /// HandoverFailure line names the refusing target's gNB id. Decoded from real
+    /// HANDOVER REQUIRED / HANDOVER FAILURE bytes; before NG Setup the id is `unknown`.
+    #[tokio::test]
+    async fn handover_log_lines_name_the_gnb_and_the_cause() {
+        let (etx, _erx) = mpsc::channel(64);
+        let server = NgapServer::new("127.0.0.1:0".parse().unwrap(), SctpBackend::Userspace, etx)
+            .await
+            .expect("NGAP test server");
+        let (source, target, no_setup) = (48301u64, 48302u64, 48303u64);
+        seed_gnb_session_with_id(&server, source, 2).await;
+        seed_gnb_session_with_id(&server, target, 1).await;
+        seed_gnb_session(&server, no_setup).await;
+        assert_eq!(server.global_gnb_id_for_association(source).await, Some(2));
+        assert_eq!(server.global_gnb_id_for_association(no_setup).await, None);
+        assert_eq!(server.global_gnb_id_for_association(48399).await, None);
+
+        let mut required = match crate::ngap_asn1::decode_handover_required_asn1(
+            &handover_required_pdu(7, 3, 1, &[1]),
+        ) {
+            crate::ngap_asn1::NasTransportDecode::Proceed { message, .. } => message,
+            _ => panic!("HandoverRequired decodes"),
+        };
+        required.cause = nextgcore_ngap::types::Cause::RadioNetwork(
+            nextgcore_ngap::types::CauseRadioNetwork::ReduceLoadInServingCell,
+        );
+        let line = handover_required_log_line(
+            &required,
+            server.global_gnb_id_for_association(source).await,
+        );
+        assert_eq!(
+            line,
+            "HandoverRequired (amf_ue_ngap_id=7, ran_ue_ngap_id=3, type=Intra5gs) \
+             source_gnb_id=2 cause=RadioNetwork(ReduceLoadInServingCell)"
+        );
+        assert!(line
+            .starts_with("HandoverRequired (amf_ue_ngap_id=7, ran_ue_ngap_id=3, type=Intra5gs)"));
+        assert!(handover_required_log_line(&required, None).contains(" source_gnb_id=unknown "));
+
+        let bytes = nextgcore_ngap::builder::build_handover_failure(
+            &nextgcore_ngap::types::HandoverFailure {
+                amf_ue_ngap_id: 7,
+                cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                    nextgcore_ngap::types::CauseRadioNetwork::CellNotAvailable,
+                ),
+                criticality_diagnostics: None,
+            },
+        )
+        .expect("build HandoverFailure");
+        let failure = match crate::ngap_asn1::decode_handover_failure_asn1(&bytes) {
+            crate::ngap_asn1::NasTransportDecode::Proceed { message, .. } => message,
+            _ => panic!("HandoverFailure decodes"),
+        };
+        assert_eq!(
+            handover_failure_log_line(
+                target,
+                &failure,
+                server.global_gnb_id_for_association(target).await
+            ),
+            "HandoverFailure from association 48302 (amf_ue_ngap_id=7, \
+             cause=RadioNetwork(CellNotAvailable)) gnb_id=1"
+        );
     }
 
     /// **#742.** A handover preparation that ends without a HandoverNotify -- Cancel
