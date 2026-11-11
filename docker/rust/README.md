@@ -166,6 +166,7 @@ flags.
 | `docker-compose.oauth2.yml` | Overlay: OAuth2 SBI enforcement (`./e2e.sh --overlay oauth2`) |
 | `docker-compose.kernel-sctp.yml` | Overlay: native kernel-SCTP N2 (`./e2e.sh --overlay kernel-sctp`) |
 | `docker-compose.features.yml` | Overlay: Rel-17/18 feature harness (`./e2e.sh --overlay features`) |
+| `docker-compose.demo-n2ho.yml` | **Standalone** (never `-f` with the base): two-gNB N2 handover stack, no published ports (nextgsim#456; run by nextgsim's nightly `demo-n2ho` job) |
 
 ### Starting a subset
 
