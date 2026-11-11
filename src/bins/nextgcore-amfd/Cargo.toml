@@ -76,6 +76,7 @@ hex.workspace = true
 mongodb = { workspace = true }
 
 [dev-dependencies]
+nextgcore-core = { workspace = true, features = ["test-log"] }
 nextgcore-asn1c = { workspace = true }
 proptest.workspace = true
 p256 = { workspace = true, features = ["ecdsa"] }
