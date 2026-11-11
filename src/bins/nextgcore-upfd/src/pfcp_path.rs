@@ -3064,11 +3064,32 @@ impl PfcpServer {
         src_addr: SocketAddr,
     ) -> Result<(), String> {
         let ies = ParsedIe::parse_all(payload);
-        let cause = if ParsedIe::find_ie(&ies, pfcp_ie::NODE_ID).is_some() {
-            self.apply_path_qos_control(payload, false);
-            PfcpCause::RequestAccepted
-        } else {
-            PfcpCause::MandatoryIeMissing
+        let node_id = ParsedIe::find_ie(&ies, pfcp_ie::NODE_ID).map(|ie| ie.value.clone());
+        // §6.2.7.2.2: an Update from a Node ID with no established association is
+        // answered "No established PFCP Association" (cause 72) and changes nothing
+        // (#1417 review M1). Only the associated CP function may update it.
+        let associated = match &node_id {
+            Some(id) => self
+                .association
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|a| &a.node_id == id),
+            None => false,
+        };
+        let cause = match (&node_id, associated) {
+            (None, _) => PfcpCause::MandatoryIeMissing,
+            (Some(_), false) => {
+                note_refusal(format_args!(
+                    "PFCP Association Update Request from {src_addr} whose Node ID has no \
+                     established association: rejected (cause 72)"
+                ));
+                PfcpCause::NoEstablishedPfcpAssociation
+            }
+            (Some(_), true) => {
+                self.apply_path_qos_control(payload, false);
+                PfcpCause::RequestAccepted
+            }
         };
         let mut resp_payload = crate::n4_build::build_association_update_response(
             &self.local_node_id,
@@ -3950,6 +3971,30 @@ mod tests {
         assert!(!dp.path_qos.lock().unwrap().is_active());
     }
 
+    /// #1417 review M1, §6.2.7.2.2: with no association, an Association Update
+    /// Request is answered cause 72 and changes nothing, also with GPQM enabled.
+    #[tokio::test]
+    async fn association_update_without_an_association_is_cause_72() {
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        server.set_path_qos_monitoring(true);
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        server.set_data_plane(dp.clone());
+        let mut upd = crate::n4_build::PfcpMessageBuilder::new();
+        upd.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        let mut upd = upd.build();
+        upd.extend_from_slice(&path_qos_control_ie());
+        let resp = exchange(&smf, addr, &encode_pfcp(7, None, 1, &upd)).await;
+        assert_eq!(resp[1], pfcp_type::ASSOCIATION_UPDATE_RESPONSE);
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::NoEstablishedPfcpAssociation as u8
+        );
+        assert!(!dp.path_qos.lock().unwrap().is_active());
+        assert!(!server.is_associated().await);
+    }
+
     /// #1389 (TS 29.244 §5.24.5.1-2, §7.4.4.3): enabled, the UPF advertises GPQM
     /// (octet 9 bit 3, still 8 octets) and applies IE 238 from the Association
     /// Setup; an Association Update replaces it, one without IE 238 keeps it, and
@@ -4015,6 +4060,23 @@ mod tests {
         // Node ID is M in the Update (Table 7.4.4.3-1).
         let resp = exchange(&smf, addr, &encode_pfcp(7, None, 4, &[])).await;
         assert_eq!(response_cause(&resp), PfcpCause::MandatoryIeMissing as u8);
+
+        // #1417 review M1, §6.2.7.2.2: an Update from another Node ID is cause 72
+        // and leaves the provisioning alone, even when it carries IE 238.
+        let mut other = crate::n4_build::PfcpMessageBuilder::new();
+        other.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 1)));
+        let mut other = other.build();
+        other.extend_from_slice(&path_qos_control_ie());
+        let resp = exchange(&smf, addr, &encode_pfcp(7, None, 6, &other)).await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::NoEstablishedPfcpAssociation as u8
+        );
+        assert_eq!(
+            dp.path_qos.lock().unwrap().controls()[0].peers,
+            vec!["10.0.0.9".parse::<IpAddr>().unwrap()],
+            "a foreign Update must not replace the provisioning"
+        );
 
         // Release clears it.
         let mut rel = crate::n4_build::PfcpMessageBuilder::new();

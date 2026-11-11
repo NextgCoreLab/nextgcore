@@ -186,8 +186,10 @@ impl GtpuPathTable {
             // Issue the next Echo Request.
             let seq = self.next_seq;
             self.next_seq = self.next_seq.wrapping_add(1);
-            if self.next_seq == 0 {
-                self.next_seq = 1; // keep non-zero
+            // Non-zero, and below 0x8000: the GTP-U path QoS probes (#1389) use
+            // 0x8000..=0xFFFF, so the two never share a sequence number.
+            if self.next_seq == 0 || self.next_seq >= 0x8000 {
+                self.next_seq = 1;
             }
             state.pending_seq = Some(seq);
             to_send.push((*peer, seq));
@@ -5066,42 +5068,29 @@ impl DataPlane {
         }
     }
 
-    /// GTP-U N3 path management periodic task (upfd-04).
-    ///
-    /// The IP addresses of the N3 (gNB) peers of the live sessions.
-    fn n3_peer_ips(&self) -> HashSet<std::net::IpAddr> {
-        let map = self.sessions.seid_map.read().unwrap();
-        map.values()
-            .map(|s| s.gnb_addr())
-            .filter(|a| !a.ip().is_unspecified())
-            .map(|a| a.ip().to_canonical())
-            .collect()
-    }
-
     /// #1389: an Echo Response that answers one of the QoS-monitoring probes
     /// becomes a delay sample (RTT/2, TS 29.244 §5.24.5.2); any report it
     /// triggers (immediate, threshold) goes to the CP function. Returns whether
     /// it answered a probe.
     pub fn on_path_qos_echo_response(&self, from: SocketAddr, seq: u16) -> bool {
         let now = std::time::Instant::now();
-        let rtt = self
-            .path_qos
-            .lock()
-            .unwrap()
-            .on_echo_response(from, seq, now);
-        let Some(rtt) = rtt else {
-            return false;
+        // One lock and no session-table scan: this runs on the GTP-U receive path
+        // (#1417 review M2). Whether the peer is N3 was recorded with the probe.
+        let reports = {
+            let mut m = self.path_qos.lock().unwrap();
+            let Some((rtt, n3)) = m.on_echo_response(from, seq, now) else {
+                return false;
+            };
+            let delay = crate::path_qos::path_delay_ms(rtt);
+            log::debug!("GTP-U path QoS probe to {from}: RTT {rtt:?}, path delay {delay} ms");
+            m.on_sample(
+                from.ip().to_canonical(),
+                delay,
+                n3,
+                now,
+                std::time::SystemTime::now(),
+            )
         };
-        let delay = crate::path_qos::path_delay_ms(rtt);
-        log::debug!("GTP-U path QoS probe to {from}: RTT {rtt:?}, path delay {delay} ms");
-        let n3 = self.n3_peer_ips();
-        let reports = self.path_qos.lock().unwrap().on_sample(
-            from.ip().to_canonical(),
-            delay,
-            &n3,
-            now,
-            std::time::SystemTime::now(),
-        );
         if !reports.is_empty() {
             self.send_report_event(UpfReportEvent::PathQosReport { reports });
         }
@@ -5125,7 +5114,10 @@ impl DataPlane {
             }
             m.targets(&n3_in_use)
                 .into_iter()
-                .map(|peer| (peer, m.probe_sent(peer, now)))
+                .map(|peer| {
+                    let n3 = n3_in_use.contains(&peer);
+                    (peer, m.probe_sent(peer, now, n3))
+                })
                 .collect()
         };
         for (peer, seq) in probes {
@@ -5136,12 +5128,11 @@ impl DataPlane {
                 log::debug!("GTP-U path QoS probe to {peer} failed: {e}");
             }
         }
-        let n3 = self.n3_peer_ips();
-        let reports =
-            self.path_qos
-                .lock()
-                .unwrap()
-                .due_periodic(&n3, now, std::time::SystemTime::now());
+        let reports = self
+            .path_qos
+            .lock()
+            .unwrap()
+            .due_periodic(now, std::time::SystemTime::now());
         if !reports.is_empty() {
             self.send_report_event(UpfReportEvent::PathQosReport { reports });
         }
@@ -5160,6 +5151,8 @@ impl DataPlane {
         }
     }
 
+    /// GTP-U N3 path management periodic task (upfd-04).
+    ///
     /// Sends Echo Requests to all active gNB addresses at `echo_interval_secs`
     /// intervals and tracks responses. Declares path failure after
     /// `miss_threshold` consecutive missed responses per peer. This runs as a
@@ -10169,6 +10162,9 @@ mod tests {
         ];
         gnb.send_to(&resp, from).await.unwrap();
 
+        // #1417 review M2: the N3 flag was taken with the probe; the session going
+        // before the answer arrives does not change the report.
+        dp.remove_session_from_pfcp(0x77);
         // The UPF's receive path.
         let mut rbuf = [0u8; 64];
         let (n, src) = upf_sock.recv_from(&mut rbuf).await.unwrap();
@@ -10191,5 +10187,16 @@ mod tests {
             (20..=35).contains(&d),
             "path delay {d} ms for a 40 ms round trip"
         );
+    }
+    /// #1417 review m2: the §7.2 path table's sequence numbers stay below 0x8000,
+    /// the range the GTP-U path QoS probes use.
+    #[test]
+    fn path_table_sequence_numbers_stay_below_the_probe_range() {
+        let peer: SocketAddr = "10.0.0.2:2152".parse().unwrap();
+        let mut pt = GtpuPathTable::default();
+        pt.add_peer(peer);
+        pt.next_seq = 0x7ffe;
+        let seqs: Vec<u16> = (0..4).map(|_| pt.tick().0[0].1).collect();
+        assert_eq!(seqs, vec![0x7ffe, 0x7fff, 1, 2]);
     }
 }

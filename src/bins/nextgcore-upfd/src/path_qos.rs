@@ -128,8 +128,8 @@ impl PathQosControl {
         }
     }
 
-    fn covers(&self, peer: IpAddr, n3_peers: &HashSet<IpAddr>) -> bool {
-        self.peers.contains(&peer) || (self.n3 && n3_peers.contains(&peer))
+    fn covers(&self, peer: IpAddr, n3: bool) -> bool {
+        self.peers.contains(&peer) || (self.n3 && n3)
     }
 }
 
@@ -169,18 +169,29 @@ impl Window {
 #[derive(Debug, Clone)]
 struct PeerState {
     window: Window,
+    /// The last [`THR_SAMPLES`] samples: threshold reporting judges the recent
+    /// average and minimum, not an ever-growing window (#1417 review m1).
+    recent: std::collections::VecDeque<u32>,
+    /// Whether this peer is an N3 (gNB) path, as known when it was probed.
+    n3: bool,
     period_start: Instant,
     immediate_sent: bool,
     /// When the last threshold report of each kind (avg, min, max) went out.
     last_thr: [Option<Instant>; 3],
 }
 
+/// Samples the threshold judgement of the average and minimum delay covers.
+pub const THR_SAMPLES: usize = 10;
+
 /// The monitor: what to probe, the outstanding probes, and the statistics.
 #[derive(Debug, Default)]
 pub struct PathQosMonitor {
     controls: Vec<PathQosControl>,
     state: HashMap<(usize, IpAddr), PeerState>,
-    pending: HashMap<(SocketAddr, u16), Instant>,
+    /// Outstanding probes: when sent, and whether the peer is an N3 path. The
+    /// N3 flag is decided when the probe is built, off the receive path
+    /// (#1417 review M2), so a response needs no session-table scan.
+    pending: HashMap<(SocketAddr, u16), (Instant, bool)>,
     next_seq: u16,
 }
 
@@ -243,26 +254,28 @@ impl PathQosMonitor {
         out
     }
 
-    /// Allocate the sequence number of a probe to `peer`, sent at `now`.
-    pub fn probe_sent(&mut self, peer: SocketAddr, now: Instant) -> u16 {
+    /// Allocate the sequence number of a probe to `peer`, sent at `now`;
+    /// `n3` says whether the peer is the gNB of a live session.
+    pub fn probe_sent(&mut self, peer: SocketAddr, now: Instant, n3: bool) -> u16 {
         self.pending
-            .retain(|_, sent| now.duration_since(*sent) < PROBE_TIMEOUT);
+            .retain(|_, (sent, _)| now.duration_since(*sent) < PROBE_TIMEOUT);
         let seq = SEQ_BASE | (self.next_seq & 0x7fff);
         self.next_seq = self.next_seq.wrapping_add(1);
-        self.pending.insert((peer, seq), now);
+        self.pending.insert((peer, seq), (now, n3));
         seq
     }
 
     /// An Echo Response from `peer` with `seq`, received at `now`. Returns
-    /// the measured round trip when it answers one of our probes.
+    /// the measured round trip, and the probe's N3 flag, when it answers one of
+    /// our probes.
     pub fn on_echo_response(
         &mut self,
         peer: SocketAddr,
         seq: u16,
         now: Instant,
-    ) -> Option<Duration> {
-        let sent = self.pending.remove(&(peer, seq))?;
-        Some(now.saturating_duration_since(sent))
+    ) -> Option<(Duration, bool)> {
+        let (sent, n3) = self.pending.remove(&(peer, seq))?;
+        Some((now.saturating_duration_since(sent), n3))
     }
 
     /// Record a delay sample for `peer` and return the reports it triggers:
@@ -271,23 +284,29 @@ impl PathQosMonitor {
         &mut self,
         peer: IpAddr,
         delay_ms: u32,
-        n3_peers: &HashSet<IpAddr>,
+        n3: bool,
         now: Instant,
         wall: SystemTime,
     ) -> Vec<GtpUPathQosReport> {
         let mut out = Vec::new();
         for (i, c) in self.controls.iter().enumerate() {
-            if !c.covers(peer, n3_peers) {
+            if !c.covers(peer, n3) {
                 continue;
             }
             let st = self.state.entry((i, peer)).or_insert_with(|| PeerState {
                 window: Window::new(wall),
+                recent: std::collections::VecDeque::with_capacity(THR_SAMPLES),
+                n3,
                 period_start: now,
                 immediate_sent: false,
                 last_thr: [None; 3],
             });
+            st.n3 = n3;
             st.window.add(delay_ms);
-            let n3 = n3_peers.contains(&peer);
+            if st.recent.len() == THR_SAMPLES {
+                st.recent.pop_front();
+            }
+            st.recent.push_back(delay_ms);
             if c.trigger.ire && !st.immediate_sent {
                 st.immediate_sent = true;
                 out.push(report(
@@ -302,10 +321,12 @@ impl PathQosMonitor {
                 ));
             }
             if c.trigger.thr {
-                let w = &st.window;
+                let n = st.recent.len().max(1) as u64;
+                let recent_avg = (st.recent.iter().map(|&d| d as u64).sum::<u64>() / n) as u32;
+                let recent_min = st.recent.iter().copied().min().unwrap_or(delay_ms);
                 let exceeded = [
-                    c.avg_threshold_ms.is_some_and(|t| w.avg_ms() > t),
-                    c.min_threshold_ms.is_some_and(|t| w.min_ms > t),
+                    c.avg_threshold_ms.is_some_and(|t| recent_avg > t),
+                    c.min_threshold_ms.is_some_and(|t| recent_min > t),
                     c.max_threshold_ms.is_some_and(|t| delay_ms > t),
                 ];
                 let mut fire = false;
@@ -338,12 +359,7 @@ impl PathQosMonitor {
     }
 
     /// The periodic reports due at `now`; each one starts a new window.
-    pub fn due_periodic(
-        &mut self,
-        n3_peers: &HashSet<IpAddr>,
-        now: Instant,
-        wall: SystemTime,
-    ) -> Vec<GtpUPathQosReport> {
+    pub fn due_periodic(&mut self, now: Instant, wall: SystemTime) -> Vec<GtpUPathQosReport> {
         let mut out = Vec::new();
         for ((i, peer), st) in self.state.iter_mut() {
             let c = &self.controls[*i];
@@ -357,7 +373,7 @@ impl PathQosMonitor {
             if st.window.count > 0 {
                 out.push(report(
                     *peer,
-                    n3_peers.contains(peer),
+                    st.n3,
                     QosReportTrigger {
                         per: true,
                         ..Default::default()
@@ -499,7 +515,7 @@ mod tests {
         let mut m = PathQosMonitor::default();
         let peer: SocketAddr = "10.0.0.5:2152".parse().unwrap();
         let t0 = Instant::now();
-        let seq = m.probe_sent(peer, t0);
+        let seq = m.probe_sent(peer, t0, true);
         assert!(seq >= SEQ_BASE);
         // Another peer, or another seq, answers nothing.
         assert_eq!(
@@ -508,7 +524,7 @@ mod tests {
         );
         assert_eq!(m.on_echo_response(peer, seq ^ 1, t0), None);
         let rtt = m.on_echo_response(peer, seq, t0 + Duration::from_millis(30));
-        assert_eq!(rtt, Some(Duration::from_millis(30)));
+        assert_eq!(rtt, Some((Duration::from_millis(30), true)));
         // Answered once only.
         assert_eq!(
             m.on_echo_response(peer, seq, t0 + Duration::from_millis(31)),
@@ -530,21 +546,19 @@ mod tests {
         );
         c.measurement_period = Some(10);
         m.configure(&[c]);
-        let n3 = HashSet::new();
+        let n3 = false;
         let t0 = Instant::now();
         let w0 = SystemTime::now();
-        let first = m.on_sample(ip("10.0.0.9"), 20, &n3, t0, w0);
+        let first = m.on_sample(ip("10.0.0.9"), 20, n3, t0, w0);
         assert_eq!(first.len(), 1);
         assert!(first[0].qos_report_trigger.ire);
         assert_eq!(first[0].qos_information[0].average_packet_delay, 20);
-        assert!(m.on_sample(ip("10.0.0.9"), 30, &n3, t0, w0).is_empty());
+        assert!(m.on_sample(ip("10.0.0.9"), 30, n3, t0, w0).is_empty());
         // A peer no control names is not measured.
-        assert!(m.on_sample(ip("10.9.9.9"), 99, &n3, t0, w0).is_empty());
+        assert!(m.on_sample(ip("10.9.9.9"), 99, n3, t0, w0).is_empty());
         // Not due before the period.
-        assert!(m
-            .due_periodic(&n3, t0 + Duration::from_secs(9), w0)
-            .is_empty());
-        let per = m.due_periodic(&n3, t0 + Duration::from_secs(10), w0);
+        assert!(m.due_periodic(t0 + Duration::from_secs(9), w0).is_empty());
+        let per = m.due_periodic(t0 + Duration::from_secs(10), w0);
         assert_eq!(per.len(), 1);
         let q = &per[0].qos_information[0];
         assert!(per[0].qos_report_trigger.per);
@@ -557,9 +571,7 @@ mod tests {
             (25, Some(20), Some(30))
         );
         // The next window starts empty: nothing measured, nothing reported.
-        assert!(m
-            .due_periodic(&n3, t0 + Duration::from_secs(20), w0)
-            .is_empty());
+        assert!(m.due_periodic(t0 + Duration::from_secs(20), w0).is_empty());
     }
 
     #[test]
@@ -577,24 +589,23 @@ mod tests {
         c.minimum_waiting_time = Some(Timer { unit: 0, value: 5 }); // 10 s
         m.configure(&[c]);
         let gnb = ip("10.0.0.5");
-        let n3 = HashSet::from([gnb]);
         let t0 = Instant::now();
         let w = SystemTime::now();
-        assert!(m.on_sample(gnb, 20, &n3, t0, w).is_empty());
-        let r = m.on_sample(gnb, 30, &n3, t0 + Duration::from_secs(1), w);
+        assert!(m.on_sample(gnb, 20, true, t0, w).is_empty());
+        let r = m.on_sample(gnb, 30, true, t0 + Duration::from_secs(1), w);
         assert_eq!(r.len(), 1);
         assert!(r[0].qos_report_trigger.thr);
         assert_eq!(r[0].gtpu_path_interface_type.map(|t| t.n3), Some(true));
         assert!(m
-            .on_sample(gnb, 40, &n3, t0 + Duration::from_secs(5), w)
+            .on_sample(gnb, 40, true, t0 + Duration::from_secs(5), w)
             .is_empty());
         assert_eq!(
-            m.on_sample(gnb, 40, &n3, t0 + Duration::from_secs(11), w)
+            m.on_sample(gnb, 40, true, t0 + Duration::from_secs(11), w)
                 .len(),
             1
         );
-        // A gNB not in use is not covered by an N3-by-type control.
-        assert!(m.on_sample(ip("10.0.0.6"), 99, &n3, t0, w).is_empty());
+        // A peer that is not an N3 path is not covered by an N3-by-type control.
+        assert!(m.on_sample(ip("10.0.0.6"), 99, false, t0, w).is_empty());
     }
 
     #[test]
@@ -616,5 +627,39 @@ mod tests {
         m.configure(&ies);
         assert_eq!(m.controls().len(), MAX_CONTROLS);
         assert_eq!(m.controls()[0].peers.len(), MAX_PEERS_PER_CONTROL);
+    }
+    /// #1417 review m1: the average threshold judges the last THR_SAMPLES
+    /// samples, so a rise after a long quiet run is still seen.
+    #[test]
+    fn average_threshold_follows_recent_samples() {
+        let mut m = PathQosMonitor::default();
+        let mut c = ctl(
+            vec![],
+            true,
+            QosReportTrigger {
+                thr: true,
+                ..Default::default()
+            },
+        );
+        c.average_packet_delay_threshold = Some(30);
+        m.configure(&[c]);
+        let gnb = ip("10.0.0.5");
+        let t0 = Instant::now();
+        let w = SystemTime::now();
+        for i in 0..1000 {
+            assert!(m
+                .on_sample(gnb, 5, true, t0 + Duration::from_millis(i), w)
+                .is_empty());
+        }
+        let fired: usize = (0..THR_SAMPLES as u64)
+            .map(|i| {
+                m.on_sample(gnb, 60, true, t0 + Duration::from_secs(2 + i), w)
+                    .len()
+            })
+            .sum();
+        // No minimum waiting time: every sample from the 5th 60 ms one on (recent
+        // average 32.5 ms) is over 30 ms, so 6 of the 10 fire. A cumulative window
+        // (1000 x 5 ms first) would never cross it.
+        assert_eq!(fired, 6);
     }
 }
