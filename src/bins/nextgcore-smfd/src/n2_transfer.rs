@@ -252,52 +252,60 @@ fn setup_item(
     what: &str,
     flow: &QosFlowSetup,
 ) -> Result<g::QosFlowSetupRequestItem, TransferError> {
+    Ok(g::QosFlowSetupRequestItem {
+        qos_flow_identifier: qfi(what, flow.qfi)?,
+        qos_flow_level_qos_parameters: flow_qos_parameters(what, flow)?,
+        e_rab_id: flow.e_rab_id.map(g::E_RAB_ID),
+        ie_extensions: None,
+    })
+}
+
+/// A flow's QoS Flow Level QoS Parameters (TS 38.413 §9.3.1.12): its 5QI, ARP and,
+/// for a GBR flow, its bit rates. Shared by the Setup and the Modify Request Transfer
+/// (#1385) so the two describe a flow the same way.
+fn flow_qos_parameters(
+    what: &str,
+    flow: &QosFlowSetup,
+) -> Result<g::QosFlowLevelQosParameters, TransferError> {
     // FiveQI is INTEGER (0..255, ...) and the generated type a u8: a 5QI past
     // 255 cannot be carried.
     let five_qi = u8::try_from(flow.five_qi)
         .map_err(|_| TransferError(format!("{what}: 5QI {} > 255", flow.five_qi)))?;
-    Ok(g::QosFlowSetupRequestItem {
-        qos_flow_identifier: qfi(what, flow.qfi)?,
-        qos_flow_level_qos_parameters: g::QosFlowLevelQosParameters {
-            qos_characteristics: g::QosCharacteristics::NonDynamic5QI(g::NonDynamic5QIDescriptor {
-                five_qi: g::FiveQI(five_qi),
-                priority_level_qos: None,
-                averaging_window: None,
-                maximum_data_burst_volume: None,
-                ie_extensions: None,
+    Ok(g::QosFlowLevelQosParameters {
+        qos_characteristics: g::QosCharacteristics::NonDynamic5QI(g::NonDynamic5QIDescriptor {
+            five_qi: g::FiveQI(five_qi),
+            priority_level_qos: None,
+            averaging_window: None,
+            maximum_data_burst_volume: None,
+            ie_extensions: None,
+        }),
+        allocation_and_retention_priority: g::AllocationAndRetentionPriority {
+            // The codec refuses a Priority Level ARP outside 1..15.
+            priority_level_arp: g::PriorityLevelARP(flow.arp.priority_level),
+            pre_emption_capability: g::Pre_emptionCapability(if flow.arp.may_trigger_pre_emption {
+                g::Pre_emptionCapability::MAY_TRIGGER_PRE_EMPTION
+            } else {
+                g::Pre_emptionCapability::SHALL_NOT_TRIGGER_PRE_EMPTION
             }),
-            allocation_and_retention_priority: g::AllocationAndRetentionPriority {
-                // The codec refuses a Priority Level ARP outside 1..15.
-                priority_level_arp: g::PriorityLevelARP(flow.arp.priority_level),
-                pre_emption_capability: g::Pre_emptionCapability(
-                    if flow.arp.may_trigger_pre_emption {
-                        g::Pre_emptionCapability::MAY_TRIGGER_PRE_EMPTION
-                    } else {
-                        g::Pre_emptionCapability::SHALL_NOT_TRIGGER_PRE_EMPTION
-                    },
-                ),
-                pre_emption_vulnerability: g::Pre_emptionVulnerability(if flow.arp.pre_emptable {
-                    g::Pre_emptionVulnerability::PRE_EMPTABLE
-                } else {
-                    g::Pre_emptionVulnerability::NOT_PRE_EMPTABLE
-                }),
-                ie_extensions: None,
-            },
-            gbr_qos_information: flow.gbr.map(|gbr| g::GBR_QosInformation {
-                maximum_flow_bit_rate_dl: nextgcore_ngap_gen::bit_rate(gbr.mfbr_dl),
-                maximum_flow_bit_rate_ul: nextgcore_ngap_gen::bit_rate(gbr.mfbr_ul),
-                guaranteed_flow_bit_rate_dl: nextgcore_ngap_gen::bit_rate(gbr.gfbr_dl),
-                guaranteed_flow_bit_rate_ul: nextgcore_ngap_gen::bit_rate(gbr.gfbr_ul),
-                notification_control: None,
-                maximum_packet_loss_rate_dl: None,
-                maximum_packet_loss_rate_ul: None,
-                ie_extensions: None,
+            pre_emption_vulnerability: g::Pre_emptionVulnerability(if flow.arp.pre_emptable {
+                g::Pre_emptionVulnerability::PRE_EMPTABLE
+            } else {
+                g::Pre_emptionVulnerability::NOT_PRE_EMPTABLE
             }),
-            reflective_qos_attribute: None,
-            additional_qos_flow_information: None,
             ie_extensions: None,
         },
-        e_rab_id: flow.e_rab_id.map(g::E_RAB_ID),
+        gbr_qos_information: flow.gbr.map(|gbr| g::GBR_QosInformation {
+            maximum_flow_bit_rate_dl: nextgcore_ngap_gen::bit_rate(gbr.mfbr_dl),
+            maximum_flow_bit_rate_ul: nextgcore_ngap_gen::bit_rate(gbr.mfbr_ul),
+            guaranteed_flow_bit_rate_dl: nextgcore_ngap_gen::bit_rate(gbr.gfbr_dl),
+            guaranteed_flow_bit_rate_ul: nextgcore_ngap_gen::bit_rate(gbr.gfbr_ul),
+            notification_control: None,
+            maximum_packet_loss_rate_dl: None,
+            maximum_packet_loss_rate_ul: None,
+            ie_extensions: None,
+        }),
+        reflective_qos_attribute: None,
+        additional_qos_flow_information: None,
         ie_extensions: None,
     })
 }
@@ -403,6 +411,52 @@ pub(crate) fn modify_request_transfer(
                     qos_flow_identifier: qfi(WHAT, q)?,
                     qos_flow_level_qos_parameters: None,
                     e_rab_id: None,
+                    ie_extensions: None,
+                })
+            })
+            .collect::<Result<Vec<_>, TransferError>>()?;
+        ies.push(Entry {
+            id: ProtocolIE_ID(g::ID_QOS_FLOW_ADD_OR_MODIFY_REQUEST_LIST),
+            criticality: reject(),
+            value: Ie::Id_QosFlowAddOrModifyRequestList(g::QosFlowAddOrModifyRequestList(items)),
+        });
+    }
+    encode(
+        WHAT,
+        &g::PDUSessionResourceModifyRequestTransfer {
+            protocol_i_es: g::PDUSessionResourceModifyRequestTransferProtocolIEs(ies),
+        },
+    )
+}
+
+/// `PDUSessionResourceModifyRequestTransfer` (TS 38.413 §9.3.4.3) for an
+/// SMF-requested modification (#1385, TS 23.502 §4.3.3.2 step 3b: "N2 SM information
+/// (PDU Session ID, QFI(s), QoS Profile(s), ..., Session-AMBR)"): the Session-AMBR and
+/// each modified flow WITH its QoS Flow Level QoS Parameters, so the NG-RAN learns
+/// the flow's new 5QI and ARP and not only that it was touched.
+pub(crate) fn modify_request_transfer_with_qos(
+    session_ambr: (u64, u64),
+    flows: &[QosFlowSetup],
+) -> Result<Vec<u8>, TransferError> {
+    use g::{
+        PDUSessionResourceModifyRequestTransferProtocolIEs_Entry as Entry,
+        PDUSessionResourceModifyRequestTransferProtocolIEs_EntryValue as Ie, ProtocolIE_ID,
+    };
+    const WHAT: &str = "PDUSessionResourceModifyRequestTransfer";
+    let reject = || g::Criticality(g::Criticality::REJECT);
+    let mut ies = vec![Entry {
+        id: ProtocolIE_ID(g::ID_PDU_SESSION_AGGREGATE_MAXIMUM_BIT_RATE),
+        criticality: reject(),
+        value: Ie::Id_PDUSessionAggregateMaximumBitRate(ambr(session_ambr)),
+    }];
+    if !flows.is_empty() {
+        let items = flows
+            .iter()
+            .map(|f| {
+                Ok(g::QosFlowAddOrModifyRequestItem {
+                    qos_flow_identifier: qfi(WHAT, f.qfi)?,
+                    qos_flow_level_qos_parameters: Some(flow_qos_parameters(WHAT, f)?),
+                    e_rab_id: f.e_rab_id.map(g::E_RAB_ID),
                     ie_extensions: None,
                 })
             })
