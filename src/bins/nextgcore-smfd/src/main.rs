@@ -6504,8 +6504,22 @@ struct GsmProcedureTimer {
     psi: u8,
     /// The AMF callback authority to reach (from `smContextStatusUri`).
     amf_uri: Option<String>,
+    /// #1409: the N2 SM information the first N1N2MessageTransfer carried with the
+    /// command (a network-requested modification, TS 23.502 §4.3.3.2 step 3b). A
+    /// retransmission resends it with the command, so a lost first transfer still
+    /// reaches the NG-RAN. `None` for an N1-only procedure.
+    n2: Option<GsmN2>,
     attempts: u32,
     deadline: std::time::Instant,
+}
+
+/// The N2 part of a 5GSM command's transfer (#1409): the
+/// PDUSessionResourceModifyRequestTransfer bytes, sent again verbatim, and the
+/// 5QI and ARP given to the AMF for paging (TS 29.518 §6.1.6.2.18).
+#[derive(Debug, Clone)]
+struct GsmN2 {
+    transfer: Vec<u8>,
+    paged: Option<(u16, n2_transfer::Arp)>,
 }
 
 /// Armed 5GSM procedure timers, keyed by SM context reference.
@@ -6561,6 +6575,20 @@ fn arm_gsm_timer(
     psi: u8,
     amf_uri: Option<&str>,
 ) {
+    arm_gsm_timer_with_n2(sm_context_ref, timer_id, command, supi, psi, amf_uri, None);
+}
+
+/// [`arm_gsm_timer`] for a command sent together with N2 SM information, which every
+/// retransmission resends with it (#1409).
+fn arm_gsm_timer_with_n2(
+    sm_context_ref: &str,
+    timer_id: timer::SmfTimerId,
+    command: &[u8],
+    supi: &str,
+    psi: u8,
+    amf_uri: Option<&str>,
+    n2: Option<GsmN2>,
+) {
     let configs = timer::SmfTimerConfigs::default();
     let duration = configs
         .get(timer_id)
@@ -6572,6 +6600,7 @@ fn arm_gsm_timer(
         supi: supi.to_string(),
         psi,
         amf_uri: amf_uri.map(str::to_string),
+        n2,
         attempts: 0,
         deadline: std::time::Instant::now() + duration,
     };
@@ -7979,14 +8008,33 @@ async fn run_gsm_timer_tick() {
                         );
                         return;
                     }
-                    send_n1_n2_message_transfer(
-                        entry.amf_uri.as_deref(),
-                        &entry.supi,
-                        entry.psi,
-                        &entry.command,
-                        &sm_ref,
-                    )
-                    .await;
+                    // #1409, TS 23.502 §4.3.3.2 step 3b: a command that went out with
+                    // N2 SM information goes out with it again. Resent N1-only, a lost
+                    // first transfer left the NG-RAN on the old Session-AMBR and QoS.
+                    match (&entry.n2, entry.amf_uri.as_deref()) {
+                        (Some(n2), Some(amf_uri)) => {
+                            send_n1_n2_modify_transfer(
+                                amf_uri,
+                                &entry.supi,
+                                entry.psi,
+                                &entry.command,
+                                &n2.transfer,
+                                n2.paged,
+                                &sm_ref,
+                            )
+                            .await;
+                        }
+                        _ => {
+                            send_n1_n2_message_transfer(
+                                entry.amf_uri.as_deref(),
+                                &entry.supi,
+                                entry.psi,
+                                &entry.command,
+                                &sm_ref,
+                            )
+                            .await;
+                        }
+                    }
                 });
             }
             GsmTimerExpiry::Exhausted => {
@@ -9962,10 +10010,16 @@ fn signal_policy_change(sm_context_ref: &str, before: &context::PolicyBinding) {
     let ambr_changed =
         (after.ambr_ul_bps, after.ambr_dl_bps) != (before.ambr_ul_bps, before.ambr_dl_bps);
     let mut five_qi_changed = after.five_qi != before.five_qi;
-    if !ambr_changed && !five_qi_changed {
+    // #1409: the ARP is not UE-facing (TS 24.501 §9.11.4.12 has no ARP parameter), but
+    // the NG-RAN holds it in the flow's QoS profile (TS 38.413 §9.3.1.12), so an
+    // ARP-only change is signalled too. Step 3b carries an N1 SM container in every
+    // SMF-requested modification, so the command goes with it (its Session-AMBR
+    // restated, no QoS flow description).
+    let arp_changed = after.arp_priority_level != before.arp_priority_level;
+    if !ambr_changed && !five_qi_changed && !arp_changed {
         log::debug!(
-            "ref={sm_context_ref}: the policy change leaves the Session-AMBR and the default \
-             5QI as they were; no PDU Session Modification toward the UE"
+            "ref={sm_context_ref}: the policy change leaves the Session-AMBR, the default \
+             5QI and its ARP as they were; no PDU Session Modification toward the UE"
         );
         return;
     }
@@ -10034,6 +10088,7 @@ fn signal_policy_change(sm_context_ref: &str, before: &context::PolicyBinding) {
                 );
                 flows.clear();
                 five_qi_changed = false;
+                // Without the flow there is no ARP to carry either.
                 if !ambr_changed {
                     return;
                 }
@@ -10066,21 +10121,27 @@ fn signal_policy_change(sm_context_ref: &str, before: &context::PolicyBinding) {
     };
     log::info!(
         "ref={sm_context_ref}: network-requested PDU Session Modification (AMBR UL/DL \
-         {}/{} -> {}/{} bps, 5QI {} -> {})",
+         {}/{} -> {}/{} bps, 5QI {} -> {}, ARP PL {} -> {})",
         before.ambr_ul_bps,
         before.ambr_dl_bps,
         after.ambr_ul_bps,
         after.ambr_dl_bps,
         before.five_qi,
-        after.five_qi
+        after.five_qi,
+        before.arp_priority_level,
+        after.arp_priority_level
     );
-    arm_gsm_timer(
+    arm_gsm_timer_with_n2(
         sm_context_ref,
         timer::SmfTimerId::T3591,
         &n1,
         &after.supi,
         after.psi,
         Some(&amf_uri),
+        Some(GsmN2 {
+            transfer: n2.clone(),
+            paged,
+        }),
     );
     let sm_context_ref = sm_context_ref.to_string();
     tokio::spawn(async move {
@@ -20037,6 +20098,7 @@ mod tests {
                         supi: format!("imsi-0010100000874{i:02}"),
                         psi: 5,
                         amf_uri: Some(amf_uri.to_string()),
+                        n2: None,
                         attempts,
                         deadline: std::time::Instant::now() - std::time::Duration::from_millis(1),
                     },
@@ -20324,6 +20386,7 @@ mod tests {
                     supi: "imsi-001010000011451".to_string(),
                     psi: 5,
                     amf_uri: None,
+                    n2: None,
                     attempts: 0,
                     deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
                 },
@@ -25449,6 +25512,118 @@ mod tests {
             decode_modify_transfer_1385(n2),
             ((80_000_000, 40_000_000), vec![(1, 8, 8)])
         );
+
+        amf.stop().await.ok();
+        listener.abort();
+        upf_task.abort();
+    }
+
+    /// #1409 (TS 23.502 §4.3.3.2 step 3b; TS 24.501 §6.3.2.5): T3591 expiry resends
+    /// the PDU SESSION MODIFICATION COMMAND in an N1N2MessageTransfer that carries the
+    /// SAME PDUSessionResourceModifyRequestTransfer as the first one, so a lost first
+    /// transfer still reaches the NG-RAN. And an ARP-only policy change is signalled:
+    /// N2 carries the new ARP in the flow's QoS profile; N1 restates the Session-AMBR
+    /// with no QoS flow description (ARP is not UE-facing, TS 24.501 §9.11.4.12).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn t3591_resends_the_n2_and_an_arp_change_is_signalled_1409() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (upf, _qers, upf_task) = modification_recording_upf_1387().await;
+        let (_client, listener) = client_behind_the_real_listener(upf).await;
+        let (amf, amf_port, posts) = n1n2_recording_amf_1385(false).await;
+        let supi = "imsi-001010000001409";
+        let psi = 24;
+        let sm_context_ref = seed_notified_session_1387(supi, psi, 0x1409);
+        set_amf_1385(&sm_context_ref, amf_port);
+
+        // ---- the AMBR changes; then T3591 expires: N1 and the same N2 again ----
+        let status = smf_sbi_request_handler(policy_notify_1387(
+            &sm_context_ref,
+            serde_json::json!({ "sessRules": { "SessRule-pol-1387": {
+                "authSessAmbr": { "uplink": "40 Mbps", "downlink": "80 Mbps" },
+            }}}),
+        ))
+        .await
+        .status;
+        assert_eq!(status, 204);
+        let got = await_n1n2_1385(&posts, 1).await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        let (_, first_body, first_n1, first_n2) = got[0].clone();
+        assert!(!first_n2.is_empty());
+        if let Ok(mut timers) = gsm_procedure_timers().lock() {
+            let t = timers.get_mut(&sm_context_ref).expect("T3591 armed");
+            assert_eq!(t.timer_id, timer::SmfTimerId::T3591);
+            t.deadline = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        }
+        run_gsm_timer_tick().await;
+        let got = await_n1n2_1385(&posts, 2).await;
+        assert_eq!(got.len(), 2, "the T3591 retransmission, got {got:?}");
+        let (path, body, n1_again, n2_again) = &got[1];
+        assert_eq!(
+            path,
+            &format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages")
+        );
+        assert_eq!(n1_again, &first_n1, "the same command, verbatim");
+        assert_eq!(
+            n2_again, &first_n2,
+            "the retransmission carries the same N2 Modify Request Transfer"
+        );
+        assert_eq!(
+            body["n2InfoContainer"]["smInfo"]["n2InfoContent"]["ngapIeType"],
+            "PDU_RES_MOD_REQ"
+        );
+        assert_eq!(body["5qi"], first_body["5qi"], "paging info kept");
+        assert_eq!(
+            decode_modify_transfer_1385(n2_again),
+            ((80_000_000, 40_000_000), vec![(1, 6, 8)])
+        );
+        let resp = handle_n1_sm_message(
+            &sm_context_ref,
+            &n1(
+                psi,
+                0,
+                gsm_build::message_type::PDU_SESSION_MODIFICATION_COMPLETE,
+                &[],
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 204);
+
+        // ---- the ARP alone changes: N2 carries it, N1 restates the AMBR ----
+        let status = smf_sbi_request_handler(policy_notify_1387(
+            &sm_context_ref,
+            serde_json::json!({ "sessRules": { "SessRule-pol-1387": {
+                "authDefQos": { "arp": { "priorityLevel": 3 } },
+            }}}),
+        ))
+        .await
+        .status;
+        assert_eq!(status, 204);
+        let got = await_n1n2_1385(&posts, 3).await;
+        assert_eq!(got.len(), 3, "an ARP-only change is signalled, got {got:?}");
+        let (_, _, n1_arp, n2_arp) = &got[2];
+        assert_eq!(
+            decode_modify_transfer_1385(n2_arp),
+            ((80_000_000, 40_000_000), vec![(1, 6, 3)]),
+            "N2 carries the new ARP priority level"
+        );
+        assert_eq!(
+            n1_arp,
+            &vec![0x2E, psi, 0, 0xCB, 0x2A, 6, 0x06, 0, 80, 0x06, 0, 40],
+            "N1: the AMBR restated, no QoS flow description"
+        );
+        assert_eq!(
+            gsm_procedure_timers()
+                .lock()
+                .unwrap()
+                .get(&sm_context_ref)
+                .map(|t| t.timer_id),
+            Some(timer::SmfTimerId::T3591)
+        );
+        assert!(cancel_gsm_timer_for_test(&sm_context_ref));
 
         amf.stop().await.ok();
         listener.abort();
