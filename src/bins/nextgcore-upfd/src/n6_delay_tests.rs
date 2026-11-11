@@ -371,6 +371,32 @@ fn association_update_is_per_instance() {
     assert!(!m.is_active());
 }
 
+/// #1429 review (b), §5.33.8.2: an Update instance that names an existing ID
+/// replaces it, so one this UPF cannot use (invalid, or undecodable with a
+/// readable ID) stops that instance; the others are kept.
+#[test]
+fn an_unusable_replacement_stops_the_instance() {
+    let mut m = monitor(&[
+        ctl(1, reporting(false, false, true)),
+        ctl(2, reporting(false, false, true)),
+        ctl(3, reporting(false, false, true)),
+    ]);
+    let mut invalid = ctl(1, reporting(true, true, false)); // PER+EVT
+    invalid.measurement_period = Some(10);
+    let mut b = bytes::BytesMut::new();
+    invalid.encode_value(&mut b);
+    m.apply_update(&[b.to_vec()]);
+    let ids: Vec<u16> = m.controls().map(|c| c.id).collect();
+    assert_eq!(ids, vec![2, 3], "the invalid replacement stops instance 1");
+    // ID 2 and a Network Instance, but no endpoint address: does not decode.
+    let undecodable = vec![
+        0x01, 0x79, 0x00, 0x02, 0x00, 0x02, 0x00, 0x16, 0x00, 0x01, 0x00,
+    ];
+    m.apply_update(&[undecodable]);
+    let ids: Vec<u16> = m.controls().map(|c| c.id).collect();
+    assert_eq!(ids, vec![3], "the undecodable replacement stops instance 2");
+}
+
 #[test]
 fn at_most_max_controls_are_kept() {
     let ies: Vec<_> = (0..MAX_CONTROLS as u16 + 3)

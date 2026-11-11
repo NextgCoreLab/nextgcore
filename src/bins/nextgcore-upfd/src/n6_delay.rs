@@ -414,7 +414,26 @@ impl N6DelayMonitor {
             }
             match N6DelayMeasurementControlInformation::decode_value(v) {
                 Ok(ie) => self.upsert(&ie),
-                Err(e) => log::warn!("N6 Delay Measurement Control Information ignored: {e}"),
+                Err(e) => {
+                    // #1429 review (b): an instance naming an existing ID replaces it
+                    // (§5.33.8.2), so one that cannot be used stops it rather than
+                    // leaving the old provisioning running.
+                    let id = members
+                        .iter()
+                        .find(|m| m.ie_type == id_type && m.value.len() >= 2)
+                        .map(|m| u16::from_be_bytes([m.value[0], m.value[1]]));
+                    log::warn!(
+                        "N6 Delay Measurement Control Information {id:?} ignored: {e}{}",
+                        if id.is_some() {
+                            "; that instance is stopped"
+                        } else {
+                            ""
+                        }
+                    );
+                    if let Some(id) = id {
+                        self.remove(id);
+                    }
+                }
             }
         }
     }
@@ -423,10 +442,14 @@ impl N6DelayMonitor {
         let ctl = match N6Control::from_ie(ie) {
             Ok(c) => c,
             Err(e) => {
+                // #1429 review (b): it replaces any instance with this ID, so that
+                // instance stops (§5.33.8.2).
                 log::warn!(
-                    "N6 Delay Measurement Control Information {} ignored: {e}",
+                    "N6 Delay Measurement Control Information {} ignored: {e}; that instance \
+                     is stopped",
                     ie.id
                 );
+                self.remove(ie.id);
                 return;
             }
         };
@@ -795,6 +818,8 @@ pub async fn run_n6_delay_measurement(
             let mut buf = [0u8; 1500];
             while !dp.shutdown.load(Ordering::Relaxed) {
                 let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                    // #1429 review (a): a persistent socket error must not spin.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 };
                 let reports = dp.n6_delay.lock().unwrap().on_reply(
