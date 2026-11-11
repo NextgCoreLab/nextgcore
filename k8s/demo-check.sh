@@ -31,6 +31,10 @@
 #   ENABLE_DATAPLANE   default true (the e2e needs the data-plane UPF)
 #   EPHEMERAL_STORAGE  default true (devtest1 has no EBS CSI StorageClass)
 #   CORE_IMAGE_TAG / SIM_IMAGE_TAG / IMAGE_TAG   passed to deploy-eks.sh
+#   SIM_SHA            the nextgsim commit the gnb/ue images were built from,
+#                      recorded as sim= in verdict.txt (default: unrecorded).
+#                      The images' own references are recorded as core_image=
+#                      and sim_image=, read from the deployed pods.
 #
 # Private by default: nothing here publishes a port or opens a port-forward.
 # Metrics are read with `kubectl exec` inside each pod; the artefacts hold no
@@ -218,9 +222,15 @@ else
     || FAILS+=("no nextg_demo_enabled{demo=${DEMO_KEY},mode=${DEMO_MODE}} series")
 fi
 
+# The image of the first pod of a Deployment, from images.txt ("<pod>\t<image> ").
+image_of() { awk -F'\t' -v d="$1" 'index($1, d "-") == 1 { split($2, i, " "); print i[1]; exit }' "${OUT}/images.txt"; }
 {
   echo "key=${KEY} mode=${MODE} overlay=${OVERLAY} cluster=${KUBE_CONTEXT} namespace=${NS} at=${STAMP}"
-  echo "core=$(git -C "${CORE_DIR}" rev-parse --short=12 HEAD) sim=$(git -C "${CORE_DIR}/../nextgsim" rev-parse --short=12 HEAD 2>/dev/null)"
+  # sim= is never read from a checkout: ../nextgsim need not be the tree the
+  # images were built from (git -C resolves it from CORE_DIR's physical path),
+  # so the deployed image references are the record, plus SIM_SHA if passed.
+  echo "core=$(git -C "${CORE_DIR}" rev-parse --short=12 HEAD) sim=${SIM_SHA:-unrecorded}"
+  echo "core_image=$(image_of amf) sim_image=$(image_of gnb)"
   echo "deploy=${DEPLOY_OK} e2e_rc=${E2E_RC} scenario_rc=${SCEN_RC} scrapes=${scrapes}"
   echo "demo_banner_lines=${banner_hits} demo_prefix_lines=${prefix_hits} nextg_demo_enabled_series=${metric_hits}"
   if [[ ${#FAILS[@]} -eq 0 ]]; then echo "VERDICT: PASS"; else printf 'FAIL: %s\n' "${FAILS[@]}"; echo "VERDICT: FAIL"; fi

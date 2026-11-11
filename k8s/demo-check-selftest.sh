@@ -9,6 +9,8 @@
 #   3. a run whose deploy/e2e logs and pod log carry a Bearer token and a JWT
 #                                     -> every artefact scrubbed, VERDICT: PASS,
 #                                        teardown=ok, artefacts mode 600
+#                                        and sim=/core_image=/sim_image= taken
+#                                        from SIM_SHA and the deployed pods
 #   4. the same run with scrubbing disabled -> VERDICT: FAIL naming the leak
 # Needs bash, python3 and coreutils only. Exit 0 when all hold.
 # shellcheck disable=SC2016,SC2317  # check() evals its single-quoted conditions
@@ -35,6 +37,7 @@ case "$*" in
   "cluster-info") ;;
   "get namespace nextg-demo") [[ -f "${FAKE_NS}" ]] || exit 1 ;;
   "delete namespace"*) rm -f "${FAKE_NS}" ;;
+  *"{.image}"*) printf 'amf-1\treg/nextg/amf:core-tag \ngnb-1\treg/nextg/gnb:sim-tag \n' ;;
   *"get pods -o jsonpath={.items[*].metadata.name}"*) echo "amf-1" ;;
   *"{.spec.initContainers[*].name} {.spec.containers[*].name}"*) echo "amf" ;;
   *"logs amf-1 -c amf"*) echo "2026-11-11T00:00:00Z amf up, Bearer zzzzzzzzzzzzzzzzzz" ;;
@@ -62,9 +65,13 @@ check "namespace exists: kubeconfig removed" '[[ $(kcfgs) == 0 ]]'
 check "namespace exists: namespace not deleted" '[[ -f ${T}/ns ]]'
 rm -f "${T}/ns"
 
-YES=true run "${T}/k8s/demo-check.sh" off off >/dev/null 2>&1; rc=$?
+YES=true SIM_SHA=feedc0de1234 run "${T}/k8s/demo-check.sh" off off >/dev/null 2>&1; rc=$?
 L="${T}/out/off/off/latest"
 check "scrubbed run: exit 0" '[[ ${rc} == 0 ]]'
+check "scrubbed run: sim= is the passed SIM_SHA, not a checkout's HEAD" \
+  'grep -q " sim=feedc0de1234$" "${L}/verdict.txt"'
+check "scrubbed run: the deployed images are recorded" \
+  'grep -qx "core_image=reg/nextg/amf:core-tag sim_image=reg/nextg/gnb:sim-tag" "${L}/verdict.txt"'
 check "scrubbed run: VERDICT: PASS, teardown=ok" 'grep -q "VERDICT: PASS" "${L}/verdict.txt" && grep -q "teardown=ok" "${L}/verdict.txt"'
 check "scrubbed run: no token or JWT in any artefact" \
   '! grep -rqE "Bearer [A-Za-z0-9]{8,}|eyJ[A-Za-z0-9_-]+\." "${L}/"'
