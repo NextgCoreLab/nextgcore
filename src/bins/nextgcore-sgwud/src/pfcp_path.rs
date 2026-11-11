@@ -2411,10 +2411,12 @@ fn peer_list(peers: &[IpAddr]) -> LibUserPlanePathFailureReport {
                 IpAddr::V4(v4) => LibRemoteGtpUPeer {
                     ipv4: Some(v4.octets()),
                     ipv6: None,
+                    ..Default::default()
                 },
                 IpAddr::V6(v6) => LibRemoteGtpUPeer {
                     ipv4: None,
                     ipv6: Some(v6.octets()),
+                    ..Default::default()
                 },
             })
             .collect(),

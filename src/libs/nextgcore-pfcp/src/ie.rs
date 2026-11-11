@@ -277,9 +277,23 @@ pub enum IeType {
     /// differently, which is why the SBI-side member is `tsnBridgeManCont` while
     /// the IE is "User Plane Node Management Information Container".
     UserPlaneNodeManagementInformationContainer = 266,
+    /// TS 29.244 Table 7.5.2.2-6 (in a UL Create PDR, GTP-U path monitoring).
+    TransportDelayReporting = 271,
     PfcpSessionChangeInfo = 290,
     GroupId = 291,
     CpIpAddress = 292,
+    /// N6 delay measurement (TS 29.244 §5.33.8), node-level IEs 354-358 and the
+    /// members of their grouped IEs (375-379).
+    N6DelayMeasurementProtocols = 354,
+    N6DelayMeasurementControlInformation = 355,
+    N6DelayMeasurementReport = 356,
+    N6DelayMeasurementInformation = 357,
+    MeasurementEndpointAddress = 358,
+    MeasurementReportingType = 375,
+    N6DelayMeasurementFailureInformation = 376,
+    N6DelayMeasurementControlInformationId = 377,
+    ProtocolSpecificConfigurationParameters = 378,
+    MeasurementEndpointPortNumber = 379,
     PfdPartialFailureInformation = 397,
 }
 

@@ -2275,6 +2275,7 @@ mod tests {
                     .map(|ip| RemoteGtpUPeer {
                         ipv4: Some(*ip),
                         ipv6: None,
+                        ..Default::default()
                     })
                     .collect(),
             })
