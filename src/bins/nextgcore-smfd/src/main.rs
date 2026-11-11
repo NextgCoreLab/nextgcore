@@ -10008,7 +10008,7 @@ fn signal_policy_change(sm_context_ref: &str, before: &context::PolicyBinding) {
         .filter(|f| f.qfi == after.qfi)
         .collect();
     // #1385 review B1: a GBR default 5QI needs its four bit rates, on N1 (TS 24.501
-    // §6.3.2.4 b) case 8: a GBR description lacking one is rejected) and on N2 (TS
+    // §6.3.2.4 a) case 8: a GBR description lacking one is rejected) and on N2 (TS
     // 38.413 §9.3.1.12: GBR QoS Flow Information "shall be present" for a GBR flow).
     // They come from the session's bearer for the default QFI. Without them neither
     // leg can describe the flow validly, so the flow is left out of both and only the
@@ -25457,7 +25457,7 @@ mod tests {
 
     /// #1385 review B1: the 5QI change is a "Create new QoS flow description" -- also
     /// for the usual session whose default QFI equals its 5QI, where the accept sent the
-    /// UE NO description, so a "Modify existing" would be TS 24.501 §6.3.2.4 b) case 13
+    /// UE NO description, so a "Modify existing" would be TS 24.501 §6.3.2.4 a) case 13
     /// and the whole command rejected. And a GBR default 5QI carries its four bit rates
     /// (case 8) on N1 and its GBR QoS Flow Information on N2 (TS 38.413 §9.3.1.12).
     ///
@@ -25522,14 +25522,15 @@ mod tests {
         assert_eq!(got.len(), 2, "{got:?}");
         let (_, _, n1_cmd, n2) = &got[1];
         // 5QI 82, then GFBR UL (0x02), GFBR DL (0x03), MFBR UL (0x04), MFBR DL (0x05),
-        // each 3 octets: unit 0 (1 kbps) and the value in kbps.
+        // each 3 octets in TS 24.501 §9.11.4.12 units: unit 0x06 (1 Mbps, review B2 --
+        // never 0, "value is not used") and the value.
         assert_eq!(
             &n1_cmd[12..],
             &[
-                0x79, 0, 26, 9, 0x20, 0x45, 0x01, 1, 82, 0x02, 3, 0, 0x07, 0xD0, 0x03, 3, 0, 0x0F,
-                0xA0, 0x04, 3, 0, 0x17, 0x70, 0x05, 3, 0, 0x1F, 0x40
+                0x79, 0, 26, 9, 0x20, 0x45, 0x01, 1, 82, 0x02, 3, 0x06, 0, 2, 0x03, 3, 0x06, 0, 4,
+                0x04, 3, 0x06, 0, 6, 0x05, 3, 0x06, 0, 8
             ][..],
-            "a GBR flow description carries all four bit rates (§6.3.2.4 b) case 8)"
+            "a GBR flow description carries all four bit rates (§6.3.2.4 a) case 8)"
         );
         let t = nextgcore_ngap::transfer::PduSessionResourceModifyRequestTransfer::decode(n2)
             .expect("N2 decodes");

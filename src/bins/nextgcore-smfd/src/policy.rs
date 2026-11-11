@@ -1959,7 +1959,7 @@ pub fn build_modification_command(psi: u8, pti: u8, ambr_dl_bps: u64, ambr_ul_bp
 
 /// The default flow's new QoS for a network-requested modification's QoS flow
 /// description (#1385): its 5QI and, for a GBR 5QI, the four bit rates TS 24.501
-/// §6.3.2.4 b) case 8 requires of a GBR flow description (GFBR UL/DL, MFBR UL/DL),
+/// §6.3.2.4 a) case 8 requires of a GBR flow description (GFBR UL/DL, MFBR UL/DL),
 /// in bit/s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModifiedFlowQos {
@@ -1980,7 +1980,7 @@ pub struct ModifiedFlowQos {
 /// The operation is "Create new QoS flow description", with the complete
 /// description (#1385 review B1). The UE often holds NO description for the default
 /// flow: the establishment accept omits it when QFI == 5QI. A "Modify existing" for
-/// a description the UE does not have is §6.3.2.4 b) case 13, which rejects the WHOLE
+/// a description the UE does not have is §6.3.2.4 a) case 13, which rejects the WHOLE
 /// command with #83 (Session-AMBR included). A "Create" where one exists is case 12:
 /// "the UE shall not diagnose an error ... and delete the old QoS flow description".
 /// So "Create" is correct in both cases.
