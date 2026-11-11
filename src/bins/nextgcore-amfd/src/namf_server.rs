@@ -2113,7 +2113,9 @@ async fn deliver_event_notification(sub: EventSubscription, report: Value) -> Re
         .map_err(|e| format!("notify POST to {} failed: {e}", sub.notify_uri))?;
 
     if response.is_success() {
-        log::debug!(
+        // INFO, like N1MessageNotify's delivery line: the operator's record
+        // that a Namf_EventExposure notify reached its consumer (#1433).
+        log::info!(
             "Event notification delivered: sub={}, status={}",
             sub.subscription_id,
             response.status
@@ -7458,6 +7460,11 @@ mod tests {
             .as_str()
             .expect("subscriptionId")
             .to_string();
+        // #1433: the delivery line is the operator's record of the notify, so
+        // it is INFO, not compiled out or filtered with DEBUG.
+        nextgcore_core::test_log::init();
+        let delivered =
+            nextgcore_core::test_log::watch(format!("Event notification delivered: sub={sub_id},"));
 
         // Fire the event the AMF tracks; delivery happens on a spawned task
         fire_amf_event(
@@ -7482,6 +7489,18 @@ mod tests {
         assert_eq!(report["reachability"].as_str(), Some("REACHABLE"));
         assert!(report["timeStamp"].as_str().is_some());
         assert_eq!(report["state"]["active"].as_bool(), Some(true));
+
+        // amfd logs the delivery once the consumer has answered.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while delivered.records().is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let records = delivered.records();
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert!(
+            records[0].starts_with("INFO nextgcore_amfd::namf_server: "),
+            "{records:?}"
+        );
 
         let _ = namf_request_handler(SbiRequest::delete(format!(
             "/namf-evts/v1/subscriptions/{sub_id}"
