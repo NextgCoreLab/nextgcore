@@ -6,7 +6,7 @@ manifests, the deploy/ trees (EKS, Helm, observability), the default docker
 compose and the configs it mounts, and the configs/ samples carry no `demo:`
 block. A demo run uses its own overlay, which is the only place one may appear:
 
-  * k8s/overlays/demo*/            (kustomize overlays, nextgcore#1395)
+  * deploy/eks/overlays/demo*/     (kustomize overlays, nextgcore#1395)
   * docker/rust/docker-compose.demo*.yml
   * docker/rust/configs/demo*/
 
@@ -32,7 +32,7 @@ DEFAULT_PATHS = ['k8s', 'deploy', 'docker/rust', 'configs']
 # Where a demo block belongs. Kept narrow on purpose: everything else is a
 # shipped profile.
 DEMO_ALLOW = [
-    'k8s/overlays/demo*/*',
+    'deploy/eks/overlays/demo*/*',
     'docker/rust/docker-compose.demo*.yml',
     'docker/rust/configs/demo*/*',
 ]
@@ -88,7 +88,7 @@ def self_test():
         put('configs/sample.yaml', '"demo" : {}\n')
         bad = ['k8s/base/nrf.yaml', 'docker/rust/configs/5gc/amf.yaml',
                'deploy/helm/values.json', 'configs/sample.yaml']
-        put('k8s/overlays/demo-x/patch.yaml', 'demo:\n  enabled: true\n')
+        put('deploy/eks/overlays/demo-x/patch.yaml', 'demo:\n  enabled: true\n')
         put('docker/rust/docker-compose.demo-x.yml', 'demo:\n')
         put('k8s/base/comment.yaml', '# demo:\n  # demo: true\ndemolition: 1\nnodemo: x\n')
         put('k8s/README.md', 'demo:\n')
@@ -115,7 +115,7 @@ def main():
     hits = scan(tracked(a.path or DEFAULT_PATHS, a.root), a.root)
     if hits:
         print('A `demo:` block is in a shipped profile (nextgsim#458: demos run only from '
-              'their own overlay, e.g. k8s/overlays/demo-<key>/):')
+              'their own overlay, e.g. deploy/eks/overlays/demo-<key>/):')
         for h in hits:
             print(f'  {h}')
         return 1
