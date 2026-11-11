@@ -456,6 +456,7 @@ async fn an_uplink_nas_transports_location_reaches_namf_with_the_time_it_was_acq
         stamp,
         "{report}"
     );
+    delete_subscription(&body).await;
     server.forget_ue(ue);
 }
 
@@ -490,4 +491,78 @@ async fn an_unstamped_location_omits_its_timestamp() {
         json_of(&resp)
     );
     server.forget_ue(ue);
+}
+
+/// nextgsim#488 review: a stamp that is no plausible time (a corrupt store record,
+/// `u64::MAX` or the BSON maximum) is "no timestamp". Every Namf reader still
+/// answers 200 and omits the field, rather than panicking in the `SystemTime`
+/// arithmetic.
+///
+/// REVERT-VERIFIED: `UNIX_EPOCH + Duration::from_secs(..)` in place of
+/// `location_acquired_at` panics here ("overflow when adding duration").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_corrupt_location_stamp_is_omitted_and_never_panics() {
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran, supi) = (7_488_003u64, 97, "imsi-001010004880003");
+    live_ue(&mut server, ue, ran, supi);
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    for corrupt in [u64::MAX, i64::MAX as u64, epoch_secs_now() + 10 * 86_400] {
+        server
+            .ue_auth_state
+            .with_mut(ue, |s| s.amf_ue.ue_location_timestamp = corrupt);
+
+        let req = nextgcore_sbi::SbiRequest::post(format!("/namf-loc/v1/{supi}/provide-loc-info"));
+        let resp = crate::namf_request_handler(req).await;
+        assert_eq!(resp.status, 200, "{corrupt}: {}", json_of(&resp));
+        let body = json_of(&resp);
+        assert!(
+            body["location"]["nrLocation"]
+                .get("ueLocationTimestamp")
+                .is_none()
+                && body.get("locationAge").is_none(),
+            "{corrupt}: {body}"
+        );
+
+        let req = nextgcore_sbi::SbiRequest::get(format!("/namf-mt/v1/ue-contexts/{supi}"))
+            .with_param("info-class", "TADS");
+        let resp = crate::namf_request_handler(req).await;
+        assert_eq!(resp.status, 200, "{corrupt}");
+        assert!(json_of(&resp).get("lastActTime").is_none(), "{corrupt}");
+
+        let req = nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions".to_string())
+            .with_json_body(&serde_json::json!({
+                "subscription": {
+                    "eventList": [{ "type": "LOCATION_REPORT", "immediateFlag": true }],
+                    "eventNotifyUri": "http://127.0.0.1:9/notify",
+                    "notifyCorrelationId": "corr-488-corrupt",
+                    "nfId": "3fa85f64-5717-4562-b3fc-2c9630004883",
+                    "supi": supi,
+                }
+            }))
+            .expect("json");
+        let resp = crate::namf_request_handler(req).await;
+        assert_eq!(resp.status, 201, "{corrupt}: {}", json_of(&resp));
+        let body = json_of(&resp);
+        let report = body["reportList"]
+            .as_array()
+            .and_then(|r| r.iter().find(|r| r["type"] == "LOCATION_REPORT"))
+            .cloned()
+            .unwrap_or_else(|| panic!("an immediate LOCATION_REPORT: {body}"));
+        assert!(
+            report["location"]["nrLocation"]
+                .get("ueLocationTimestamp")
+                .is_none(),
+            "{corrupt}: {report}"
+        );
+        delete_subscription(&body).await;
+    }
+    server.forget_ue(ue);
+}
+
+/// DELETE the subscription a subscribe answer created.
+async fn delete_subscription(answer: &serde_json::Value) {
+    let id = answer["subscriptionId"].as_str().expect("subscriptionId");
+    let req = nextgcore_sbi::SbiRequest::delete(format!("/namf-evts/v1/subscriptions/{id}"));
+    let resp = crate::namf_request_handler(req).await;
+    assert_eq!(resp.status, 204, "{}", json_of(&resp));
 }

@@ -1060,7 +1060,11 @@ fn restored_ue(amf_ue_ngap_id: u64, rec: &StoredUeContext) -> Option<UeNasContex
     ue.nr_tai = rec.tai.clone();
     ue.nr_cgi = rec.cgi.clone();
     // The restored location is as old as when it was acquired, not when restored.
+    // A stamp that is no plausible time (a corrupt record) restores as unknown.
     ue.ue_location_timestamp = rec.location_timestamp;
+    if crate::namf_server::location_acquired_at(ue).is_none() {
+        ue.ue_location_timestamp = 0;
+    }
     ue.access_type = rec.access_type;
     ue.registration_type = rec.registration_type;
     ue.requested_nssai = rec.requested_nssai.clone();

@@ -2400,6 +2400,24 @@ async fn a_restored_ue_keeps_the_time_its_location_was_acquired() {
     );
     crash(&mut after, new_id);
 
+    // A corrupt stamp (the BSON maximum) restores as unknown, not as a time.
+    let corrupt = StoredUeContext {
+        location_timestamp: i64::MAX as u64,
+        ..rec.clone()
+    };
+    let corrupt_id = after.install_restored(&corrupt).expect("restored");
+    assert_eq!(
+        after
+            .ue_auth_state
+            .get(corrupt_id)
+            .expect("installed")
+            .amf_ue
+            .ue_location_timestamp,
+        0,
+        "an implausible stamp is no timestamp"
+    );
+    crash(&mut after, corrupt_id);
+
     let mut legacy = mongodb::bson::to_document(&rec).expect("encodes");
     assert!(legacy.remove("location_timestamp").is_some());
     let old: StoredUeContext =
