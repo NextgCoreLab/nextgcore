@@ -45,7 +45,7 @@ arm() {
   local name=$1 delay=$2 expect=$3 want=$4; shift 4
   tc qdisc replace dev qos0 root netem delay "${delay}ms"
   ip netns exec qosfar tc qdisc replace dev qos1 root netem delay "${delay}ms"
-  echo "=== arm $name: netem ${delay} ms each way, flags: ${*:-none}" | tee -a "$OUT/summary.txt"
+  echo "=== arm $name: netem ${delay} ms each way (injected one-way ${delay} ms), expected ${expect}, flags: ${*:-none}" | tee -a "$OUT/summary.txt"
   ip netns exec qosfar ping -c 3 -q 10.89.0.1 | tail -1 | tee -a "$OUT/summary.txt"
   "$BIN" --pfcp-addr 127.0.0.1 --pfcp-port 8805 --pfcp-allowed-peers 127.0.0.1 \
     --gtpu-addr 10.89.0.1 --tun-ifname qostun --tun-ip 10.46.0.1 \

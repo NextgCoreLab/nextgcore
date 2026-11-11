@@ -87,6 +87,6 @@ else:
     for name, xs in (("GTP-U path (GPQM)", gpqm_ms), ("N6 (UN6DM)", n6_ms)):
         good = bool(xs) and all(EXPECT <= x <= EXPECT + TOL for x in xs)
         ok &= good
-        print(f"{name}: injected one-way {EXPECT} ms, reported {xs}, tolerance "
+        print(f"{name}: expected one-way {EXPECT} ms, reported {xs}, tolerance "
               f"[{EXPECT}, {EXPECT + TOL}] ms: {'PASS' if good else 'FAIL'}")
 sys.exit(0 if ok else 1)
