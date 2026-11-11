@@ -38,6 +38,8 @@
 #
 # Exit: 0 PASS, 1 FAIL, 2 usage or environment error.
 set -uo pipefail
+# Artefacts hold subscriber identities (IMSIs in NF logs): owner-only.
+umask 077
 
 usage() { sed -n '2,40p' "$0"; exit 2; }
 [[ $# -eq 2 ]] || usage
@@ -74,6 +76,7 @@ fail_env() { printf '\033[0;31m[demo-check]\033[0m %s\n' "$*" | tee -a "${OUT}/r
 # the current context) cannot land on whatever context the shell had.
 KCFG="$(mktemp -t nextg-demo-kcfg-XXXXXX)"
 chmod 600 "${KCFG}"
+trap 'rm -f "${KCFG}"' EXIT   # replaced by on_exit below, which also removes it
 kubectl config view --minify --flatten --context "${KUBE_CONTEXT}" > "${KCFG}" 2>/dev/null \
   || fail_env "kubeconfig has no context ${KUBE_CONTEXT}"
 export KUBECONFIG="${KCFG}"
@@ -81,6 +84,9 @@ K=(kubectl -n "${NS}")
 
 TORN_DOWN=false
 TEARDOWN=kept
+# The flattened kubeconfig can hold client keys or tokens: removed on every
+# exit path, whether or not teardown has anything to do.
+on_exit() { teardown; rm -f "${KCFG}"; }
 teardown() {
   [[ "${TORN_DOWN}" == true ]] && return
   TORN_DOWN=true
@@ -96,10 +102,11 @@ teardown() {
       TEARDOWN=ok
       log "teardown: namespace ${NS} gone"
     fi
+  else
+    TEARDOWN=ok   # nothing of ours left to delete
   fi
-  rm -f "${KCFG}"
 }
-trap teardown EXIT
+trap on_exit EXIT
 
 kubectl cluster-info >/dev/null 2>&1 || fail_env "cannot reach cluster ${KUBE_CONTEXT}"
 if kubectl get namespace "${NS}" >/dev/null 2>&1; then
@@ -178,8 +185,19 @@ if [[ -n "${DEMO_KEY}" ]]; then
   grep -E "DEMO MODE ACTIVE|\[demo:${DEMO_KEY}\]" "${OUT}/log-chain.txt" >"${OUT}/demo-chain.txt"
 fi
 
+# Every text artefact, not only the pod logs and events: deploy.log,
+# e2e-internet.log, scenario.log (which a demo scenario writes) and anything a
+# scenario put under OUT. Then FAIL the run if a credential pattern survived.
+while IFS= read -r -d '' f; do
+  scrub <"${f}" >"${f}.scrub" && mv "${f}.scrub" "${f}"
+done < <(find "${OUT}" -type f -print0)
+
 # --- 4. verdict ----------------------------------------------------------------
 FAILS=()
+LEAK_RE='Bearer [A-Za-z0-9._~+/=-]{8,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+'
+if leaks="$(grep -rlE "${LEAK_RE}" "${OUT}" 2>/dev/null)" && [[ -n "${leaks}" ]]; then
+  FAILS+=("credential pattern left in: ${leaks//$'\n'/ }")
+fi
 [[ "${DEPLOY_OK}" == true ]] || FAILS+=("deploy")
 [[ "${E2E_RC}" == 0 ]] || FAILS+=("base e2e (rc ${E2E_RC})")
 [[ "${SCEN_RC}" == none || "${SCEN_RC}" == 0 ]] || FAILS+=("scenario (rc ${SCEN_RC})")

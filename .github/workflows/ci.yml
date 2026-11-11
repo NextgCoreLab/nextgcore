@@ -562,7 +562,13 @@ jobs:
         # The PROFILE=demo post-render that merges a demo overlay's toggles
         # into the NF configs: fail-closed rules, demo-off untouched.
         working-directory: nextgcore
-        run: python3 deploy/eks/profiles/demo/demo_toggles.py --self-test
+        run: |
+          set -euo pipefail
+          python3 deploy/eks/profiles/demo/demo_toggles.py --self-test
+          # k8s/demo-check.sh against a fake cluster: the private kubeconfig is
+          # removed on every exit path, every artefact is scrubbed, and a
+          # surviving token fails the run.
+          k8s/demo-check-selftest.sh
 
   fuzz-build:
     name: Fuzz targets build
