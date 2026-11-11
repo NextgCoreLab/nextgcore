@@ -263,6 +263,12 @@ async fn main() -> Result<()> {
 
     nwdaf_context_init(nf_instance_id.clone(), args.max_subscriptions);
 
+    // Issue #1412: who the NRF lets discover this NWDAF and get a token for it.
+    // A malformed configured list fails startup rather than registering one.
+    let allowed_nf_types =
+        allowed_nf_types_from_config(&args.config).map_err(|e| anyhow::anyhow!("{e}"))?;
+    log::info!("NFProfile allowedNfTypes: {allowed_nf_types:?}");
+
     // Issue #66/#192: restore durable state AFTER the context knows its capacity
     // cap and BEFORE the SBI server can accept a subscription, so a restored
     // record is never shadowed by a fresh one. Precedence matches the other NFs:
@@ -372,7 +378,9 @@ async fn main() -> Result<()> {
     let sbi_ctx = global_context();
     sbi_ctx.set_nrf_uri(&args.nrf_uri).await;
     if let Err(e) = match sbi.registration_host() {
-        Ok(host) => register_with_nrf(sbi_ctx, host, sbi_port, &nf_instance_id).await,
+        Ok(host) => {
+            register_with_nrf(sbi_ctx, host, sbi_port, &nf_instance_id, &allowed_nf_types).await
+        }
         Err(why) => Err(why),
     } {
         log::warn!("NRF registration failed (will operate without NRF): {e}");
@@ -560,7 +568,12 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 /// no `EventId` consumer could match. `eventIds` is omitted entirely rather than
 /// emitted empty if no supported event has an `EventId` value (it has
 /// `minItems: 1`).
-fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
+fn build_nf_profile(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+    allowed_nf_types: &[String],
+) -> serde_json::Value {
     let nwdaf_info = nwdaf_info(SUPPORTED_EVENTS);
 
     let can_provision = nwdaf_self()
@@ -577,11 +590,96 @@ fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serd
             "ipv4Addresses": [sbi_addr],
             "nfServices": services,
             "nwdafInfo": nwdaf_info,
-            "allowedNfTypes": ["AMF", "SMF", "PCF", "NEF", "SCP"],
+            "allowedNfTypes": allowed_nf_types,
             "heartBeatTimer": 10
         }),
         sbi_addr,
     )
+}
+
+/// The NF service consumers of Nnwdaf_AnalyticsInfo, TS 29.520 §4.3.1.3.2
+/// (29520-k00): PCF, NSSF, AMF, SMF, NEF, AF, LMF, OAM, NWDAF, DCCF, ADRF, UDM,
+/// NRF and SCP, in the clause's order. OAM is left out because it is not a
+/// TS 29.510 `NFType` (TS29510_Nnrf_NFManagement.yaml), so no NF profile, token
+/// request or discovery query can name it.
+///
+/// The default NF-level `allowedNfTypes` (issue #1412). The old list, AMF, SMF,
+/// PCF, NEF and SCP, made the NRF hide this NWDAF from, and refuse an
+/// `nnwdaf-*` token to, every other consumer the clause names: a trusted AF
+/// (TS 23.288 §6.1), an NSSF, an LMF or a UDM got `nfInstances: []` and
+/// `unauthorized_client`.
+const SPEC_ALLOWED_NF_TYPES: &[&str] = &[
+    "PCF", "NSSF", "AMF", "SMF", "NEF", "AF", "LMF", "NWDAF", "DCCF", "ADRF", "UDM", "NRF", "SCP",
+];
+
+/// The NF service consumers of Nnwdaf_MLModelProvision, TS 29.520 §4.5.1.3.2:
+/// the NWDAF (containing an AnLF or MTLF) and the LMF. Set as that service's
+/// `NFService.allowedNfTypes`, which nrfd checks together with the NF-level list.
+const MLMODELPROVISION_ALLOWED_NF_TYPES: &[&str] = &["NWDAF", "LMF"];
+
+/// [`SPEC_ALLOWED_NF_TYPES`] as owned strings.
+fn spec_allowed_nf_types() -> Vec<String> {
+    SPEC_ALLOWED_NF_TYPES
+        .iter()
+        .map(|t| t.to_string())
+        .collect()
+}
+
+/// The NF-level `allowedNfTypes` this NWDAF registers with (issue #1412):
+/// `nwdaf.sbi.nrf_profile.allowed_nf_types` in the config file, the same knob
+/// udmd has (#85), else [`SPEC_ALLOWED_NF_TYPES`].
+///
+/// A missing file, section or key means the default, as for the other file
+/// knobs here; a file that exists but cannot be read or parsed fails. A PRESENT key must be a non-empty list of `NFType` tokens
+/// (uppercase letters, digits and `_`, as TS 29.510 spells them); anything else
+/// fails startup. This is access control, so a typo must not silently bar a
+/// consumer, and an empty list must not silently mean "everyone": TS 29.510
+/// reads an absent `allowedNfTypes` as no restriction, which is not what an
+/// operator writing `[]` meant either way. Duplicates are dropped, order kept.
+fn allowed_nf_types_from_config(config_path: &str) -> Result<Vec<String>, String> {
+    let default = spec_allowed_nf_types;
+    let content = match std::fs::read_to_string(config_path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(default()),
+        Err(e) => return Err(format!("cannot read {config_path}: {e}")),
+    };
+    let value = serde_yaml::from_str::<serde_yaml::Value>(&content)
+        .map_err(|e| format!("{config_path} is not valid YAML: {e}"))?;
+    let Some(list) = value
+        .get("nwdaf")
+        .and_then(|n| n.get("sbi"))
+        .and_then(|s| s.get("nrf_profile"))
+        .and_then(|p| p.get("allowed_nf_types"))
+    else {
+        return Ok(default());
+    };
+    let key = "nwdaf.sbi.nrf_profile.allowed_nf_types";
+    let items = list
+        .as_sequence()
+        .ok_or_else(|| format!("{key} must be a list of NF types, got {list:?}"))?;
+    if items.is_empty() {
+        return Err(format!(
+            "{key} is empty; list the NF types allowed to consume this NWDAF, or omit the key \
+             for the TS 29.520 §4.3.1.3.2 default {SPEC_ALLOWED_NF_TYPES:?}"
+        ));
+    }
+    let mut types: Vec<String> = Vec::with_capacity(items.len());
+    for item in items {
+        let t = item
+            .as_str()
+            .filter(|t| {
+                !t.is_empty()
+                    && t.bytes()
+                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+            })
+            .ok_or_else(|| {
+                format!("{key}: {item:?} is not a TS 29.510 NFType (e.g. \"AF\", \"5G_EIR\")")
+            })?;
+        if !types.iter().any(|seen| seen == t) {
+            types.push(t.to_string());
+        }
+    }
+    Ok(types)
 }
 
 /// Build TS 29.510 `NwdafInfo` for a set of supported analytics (issue #175).
@@ -655,7 +753,11 @@ fn nwdaf_services(
             "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
             "scheme": "http",
             "nfServiceStatus": "REGISTERED",
-            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
+            // TS 29.520 §4.5.1.3.2: only the NWDAF and the LMF consume this
+            // service. The NF-level list (#1412) is wider, and nrfd ANDs the two
+            // levels, so without this every AnalyticsInfo consumer could get it.
+            "allowedNfTypes": MLMODELPROVISION_ALLOWED_NF_TYPES
         }));
     } else {
         log::warn!(
@@ -672,6 +774,7 @@ async fn register_with_nrf(
     sbi_addr: &str,
     sbi_port: u16,
     nf_instance_id: &str,
+    allowed_nf_types: &[String],
 ) -> Result<(), String> {
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
     let nrf_uri = match nrf_uri {
@@ -687,7 +790,7 @@ async fn register_with_nrf(
     let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
 
-    let nf_profile = build_nf_profile(nf_instance_id, sbi_addr, sbi_port);
+    let nf_profile = build_nf_profile(nf_instance_id, sbi_addr, sbi_port, allowed_nf_types);
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     log::debug!("NRF registration: PUT {path}");
@@ -817,7 +920,14 @@ mod tests {
         // register_with_nrf reads the *injected* context rather than the
         // global_context() singleton (which a parallel test might have set).
         let ctx = SbiContext::new_isolated();
-        let result = register_with_nrf(ctx, "127.0.0.1", 7815, "nwdaf-test").await;
+        let result = register_with_nrf(
+            ctx,
+            "127.0.0.1",
+            7815,
+            "nwdaf-test",
+            &spec_allowed_nf_types(),
+        )
+        .await;
         assert!(
             result.is_ok(),
             "no NRF URI on the injected context should skip registration: {result:?}"
@@ -835,7 +945,12 @@ mod tests {
     /// happens to be spelled the same in both enums.
     #[test]
     fn test_honesty_profile_advertises_supported_event_ids() {
-        let profile = build_nf_profile("nwdaf-contract-test", "127.0.0.1", 7815);
+        let profile = build_nf_profile(
+            "nwdaf-contract-test",
+            "127.0.0.1",
+            7815,
+            &spec_allowed_nf_types(),
+        );
 
         let member = |name: &str| -> Vec<String> {
             profile
@@ -1171,7 +1286,7 @@ mod tests {
     #[tokio::test]
     async fn test_default_build_advertises_mlmodelprovision() {
         nwdaf_context_init("nwdaf-test".to_string(), 1024);
-        let profile = build_nf_profile("nwdaf-test", "10.0.0.5", 7777);
+        let profile = build_nf_profile("nwdaf-test", "10.0.0.5", 7777, &spec_allowed_nf_types());
         let names: Vec<&str> = profile["nfServices"]
             .as_array()
             .expect("nfServices")
@@ -1586,10 +1701,219 @@ mod tests_nf_profile_host_kind_1324 {
     #[test]
     fn the_nf_profile_carries_its_host_by_type() {
         for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
-            let profile = build_nf_profile("id", host, 7777);
+            let profile = build_nf_profile("id", host, 7777, &spec_allowed_nf_types());
             let problems =
                 nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
             assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
+        }
+    }
+}
+
+/// Issue #1412: the NF-level `allowedNfTypes` is TS 29.520 §4.3.1.3.2's consumer
+/// list by default, configurable, and is what the real nrfd's discovery filter
+/// and access-token decision act on.
+#[cfg(test)]
+mod allowed_nf_types_1412_tests {
+    use super::*;
+    use nextgcore_nrfd::{discover_profiles, nf_manager, DiscoveryQuery, NfProfile};
+
+    /// The consumers the issue found barred, and the ones that already worked.
+    const NEWLY_ALLOWED: &[&str] = &["AF", "NSSF", "LMF", "UDM", "NWDAF", "DCCF", "ADRF", "NRF"];
+    const ALREADY_ALLOWED: &[&str] = &["AMF", "SMF", "PCF", "NEF", "SCP"];
+
+    fn profile_json(id: &str, allowed: &[String]) -> serde_json::Value {
+        build_nf_profile(id, "127.0.0.1", 7815, allowed)
+    }
+
+    fn write_config(tag: &str, body: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("nwdaf-1412-{tag}-{}.yaml", std::process::id()));
+        std::fs::write(&path, body).expect("write config");
+        path
+    }
+
+    fn from_config(tag: &str, body: &str) -> Result<Vec<String>, String> {
+        let path = write_config(tag, body);
+        let out = allowed_nf_types_from_config(path.to_str().expect("utf-8 path"));
+        let _ = std::fs::remove_file(&path);
+        out
+    }
+
+    #[test]
+    fn the_default_profile_lists_the_ts29520_4_3_1_3_2_consumers() {
+        let profile = profile_json("nwdaf-1412-default", &spec_allowed_nf_types());
+        let listed: Vec<&str> = profile["allowedNfTypes"]
+            .as_array()
+            .expect("allowedNfTypes array")
+            .iter()
+            .map(|v| v.as_str().expect("string"))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                "PCF", "NSSF", "AMF", "SMF", "NEF", "AF", "LMF", "NWDAF", "DCCF", "ADRF", "UDM",
+                "NRF", "SCP"
+            ],
+            "TS 29.520 §4.3.1.3.2, in the clause's order, without OAM (not an NFType)"
+        );
+        assert!(!listed.contains(&"OAM"));
+    }
+
+    #[test]
+    fn the_shipped_compose_config_registers_the_spec_default() {
+        let shipped = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../docker/rust/configs/5gc/nwdaf.yaml"
+        );
+        assert!(std::path::Path::new(shipped).exists(), "{shipped}");
+        assert_eq!(
+            allowed_nf_types_from_config(shipped),
+            Ok(spec_allowed_nf_types())
+        );
+    }
+
+    #[test]
+    fn absent_file_section_or_key_means_the_spec_default() {
+        assert_eq!(
+            allowed_nf_types_from_config("/nonexistent/nwdaf-1412.yaml"),
+            Ok(spec_allowed_nf_types())
+        );
+        assert_eq!(
+            from_config("nosection", "logger:\n  level: info\n"),
+            Ok(spec_allowed_nf_types())
+        );
+        assert_eq!(
+            from_config(
+                "nokey",
+                "nwdaf:\n  sbi:\n    nrf_profile:\n      heartbeat_timer: 10\n"
+            ),
+            Ok(spec_allowed_nf_types())
+        );
+    }
+
+    #[test]
+    fn a_configured_list_replaces_the_default_deduplicated_in_order() {
+        let body =
+            "nwdaf:\n  sbi:\n    nrf_profile:\n      allowed_nf_types: [NEF, AF, NEF, 5G_EIR]\n";
+        assert_eq!(
+            from_config("custom", body),
+            Ok(vec![
+                "NEF".to_string(),
+                "AF".to_string(),
+                "5G_EIR".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn a_malformed_configured_list_fails_instead_of_registering() {
+        for (tag, value) in [
+            ("empty", "[]"),
+            ("scalar", "AF"),
+            ("lower", "[af]"),
+            ("blank", "[\"\"]"),
+            ("spaced", "[\"AF \"]"),
+            ("number", "[42]"),
+        ] {
+            let body =
+                format!("nwdaf:\n  sbi:\n    nrf_profile:\n      allowed_nf_types: {value}\n");
+            let err = from_config(tag, &body).expect_err(tag);
+            assert!(
+                err.contains("nwdaf.sbi.nrf_profile.allowed_nf_types"),
+                "{tag}: {err}"
+            );
+        }
+    }
+
+    /// The token path: nrfd's `authorize_access_token` grants a scope when a
+    /// producer profile's `authorizes_service` permits the consumer type
+    /// (TS 33.501 §13.4.1.1.2 step 2). Run on the profile nwdafd registers.
+    #[test]
+    fn nrfd_authorizes_an_analyticsinfo_token_for_every_listed_consumer() {
+        let doc = profile_json("nwdaf-1412-token", &spec_allowed_nf_types());
+        let producer = NfProfile::from_json(&doc).expect("nrfd accepts the profile");
+        for consumer in NEWLY_ALLOWED.iter().chain(ALREADY_ALLOWED) {
+            assert_eq!(
+                producer.authorizes_service(consumer, "nnwdaf-analyticsinfo"),
+                (true, true),
+                "{consumer} must get an nnwdaf-analyticsinfo token"
+            );
+        }
+        assert_eq!(
+            producer.authorizes_service("CHF", "nnwdaf-analyticsinfo"),
+            (true, false),
+            "a type TS 29.520 §4.3.1.3.2 does not list stays barred (unauthorized_client)"
+        );
+    }
+
+    /// MLModelProvision keeps its own, narrower consumer list (§4.5.1.3.2): the
+    /// wider NF-level list must not open it to the AnalyticsInfo consumers.
+    #[test]
+    fn nrfd_authorizes_mlmodelprovision_only_for_nwdaf_and_lmf() {
+        let mut doc = profile_json("nwdaf-1412-mlmp", &spec_allowed_nf_types());
+        doc["nfServices"] =
+            serde_json::Value::Array(nwdaf_services("nwdaf-1412-mlmp", "127.0.0.1", 7815, true));
+        let producer = NfProfile::from_json(&doc).expect("nrfd accepts the profile");
+        for consumer in ["NWDAF", "LMF"] {
+            assert_eq!(
+                producer.authorizes_service(consumer, "nnwdaf-mlmodelprovision"),
+                (true, true),
+                "{consumer} is a §4.5.1.3.2 consumer"
+            );
+        }
+        for consumer in [
+            "AF", "NSSF", "UDM", "NRF", "DCCF", "ADRF", "AMF", "SMF", "PCF", "NEF", "SCP",
+        ] {
+            assert_eq!(
+                producer.authorizes_service(consumer, "nnwdaf-mlmodelprovision"),
+                (true, false),
+                "{consumer} is not a §4.5.1.3.2 consumer"
+            );
+            assert_eq!(
+                producer.authorizes_service(consumer, "nnwdaf-analyticsinfo"),
+                (true, true),
+                "{consumer} still gets AnalyticsInfo"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unparseable_config_fails_instead_of_defaulting() {
+        let err = from_config("badyaml", "nwdaf: [unclosed\n").expect_err("invalid YAML");
+        assert!(err.contains("not valid YAML"), "{err}");
+    }
+
+    /// The discovery path: nrfd's SearchNFInstances filter (TS 29.510 §6.2)
+    /// returns the NWDAF to a requester type its profile allows, and only then.
+    #[test]
+    fn nrfd_discovery_returns_this_nwdaf_to_every_listed_consumer() {
+        let id = format!("6b1d7e3c-1412-4000-8000-{:012x}", std::process::id());
+        let doc = profile_json(&id, &spec_allowed_nf_types());
+        nf_manager()
+            .register(NfProfile::from_json(&doc).expect("valid profile"))
+            .expect("register at nrfd");
+        let found = |requester: &str| {
+            discover_profiles(&DiscoveryQuery {
+                target_nf_type: "NWDAF".to_string(),
+                requester_nf_type: requester.to_string(),
+                target_nf_instance_id: Some(id.clone()),
+                ..Default::default()
+            })
+            .len()
+        };
+        let results: Vec<(&str, usize)> = NEWLY_ALLOWED
+            .iter()
+            .chain(ALREADY_ALLOWED)
+            .chain(&["CHF"])
+            .map(|t| (*t, found(t)))
+            .collect();
+        let _ = nf_manager().deregister(&id);
+        for (requester, n) in results {
+            let want = usize::from(requester != "CHF");
+            assert_eq!(
+                n, want,
+                "discovery of NWDAF by requester-nf-type={requester}"
+            );
         }
     }
 }
