@@ -3666,10 +3666,6 @@ pub async fn handle_sm_policy_update_notify(
             // replacing it — `min` per direction, independently, because a subscription
             // that lowers only the uplink must not touch the downlink.
             let sess_rules = if triggers.iter().any(|t| t == "SE_AMBR_CH") {
-                let s_nssai = SNssai {
-                    sst: sess.s_nssai.sst,
-                    sd: sess.s_nssai.sd,
-                };
                 let dnn = sess.dnn.as_deref().unwrap_or("internet");
                 // The real SUPI. Resolved through the session's parent UE-SM, which is
                 // the only place this PCF holds it.
@@ -3712,7 +3708,13 @@ pub async fn handle_sm_policy_update_notify(
                         sess.pcf_ue_sm_id
                     );
                     serde_json::json!({})
-                } else if let Some(sd) = pcf_get_session_data(&supi, None, &s_nssai, dnn) {
+                } else if let Some(sd) = sbi_path::session_data_for_reevaluation(&sess, &supi) {
+                    // #1403: a failed DB read bounds the session data the SMF's
+                    // decision was built from, never the local default -- answering
+                    // min(100 Mbps, bound) during a DB outage would RAISE a session the
+                    // PCF had authorised lower. The cost: with the DB down, a raised
+                    // subscription cannot raise the AMBR past the stored value until
+                    // the DB answers again.
                     let bound_bps = bound
                         .as_ref()
                         .map(|a| (parse_bitrate(&a.uplink), parse_bitrate(&a.downlink)));
@@ -3737,6 +3739,18 @@ pub async fn handle_sm_policy_update_notify(
                         sd.ambr_downlink,
                         bound.as_ref().map(|a| (&a.uplink, &a.downlink)),
                     );
+                    // What the SMF will hold, so a later re-evaluation whose read fails
+                    // falls back to it rather than to the pre-bound value.
+                    if let Ok(context) = ctx.read() {
+                        if let Some(mut stored) = context.sess_find_by_sm_policy_id(sm_policy_id) {
+                            stored.authorised_session_data = Some(nudr_handler::SessionData {
+                                ambr_uplink: auth_ul,
+                                ambr_downlink: auth_dl,
+                                ..sd.clone()
+                            });
+                            context.sess_update(&stored);
+                        }
+                    }
                     let sess_rule_id = format!("SessRule-{}", sess.sm_policy_id);
                     serde_json::json!({
                         &sess_rule_id: {
@@ -3748,6 +3762,13 @@ pub async fn handle_sm_policy_update_notify(
                         }
                     })
                 } else {
+                    // Neither readable nor stored: no session rule, and the SMF keeps
+                    // the AMBR it has (TS 29.512 §4.2.6.1: no entry, no change).
+                    log::warn!(
+                        "SE_AMBR_CH for {supi} (smPolicyId={sm_policy_id}): no session \
+                         data -- no session rule is authorised and the SMF keeps the AMBR \
+                         it has"
+                    );
                     serde_json::json!({})
                 }
             } else {
@@ -5358,6 +5379,54 @@ mod tests {
             "with no resolvable SUPI the arm must authorise NO session rule rather \
              than answer with the subscriber-less DB default, which is what \
              pcf_get_session_data(\"\") did for every session"
+        );
+    }
+
+    /// #1403 (#1383 review n1): the `SE_AMBR_CH` arm's re-evaluation, when its DB read FAILS
+    /// for a valid SUPI, bounds the session data the SMF's decision was built from,
+    /// not the local default. A session with nothing stored is authorised no session
+    /// rule.
+    ///
+    /// REVERT-VERIFIED: with the arm on `pcf_get_session_data` (the fallback) again,
+    /// the first assertion answers min(100, 40/60) = 40/60 -- a RAISE above the stored
+    /// 11/22 -- and the session with nothing stored gets the default.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
+    async fn se_ambr_ch_with_a_failed_db_read_bounds_the_stored_decision_1403() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let supi = "imsi-001010000061383";
+        seed_subscriber_1383(supi);
+        let pol = create_with_subs_ambr(supi, 19, None).await;
+        // The subscriber's `internet` session is no longer provisioned: the read fails.
+        nextgcore_dbi::test_store::provision_subscriber_document(
+            supi,
+            nextgcore_dbi::mongodb::bson::doc! {
+                "imsi": supi.trim_start_matches("imsi-"),
+                "slice": [{ "sst": 1, "session": [{ "name": "ims" }] }],
+            },
+        );
+        let bound = || Some(serde_json::json!({ "uplink": "40 Mbps", "downlink": "60 Mbps" }));
+        assert_eq!(
+            report_se_ambr_ch(&pol, bound()).await,
+            Some((SEEDED_UL_1383.to_string(), SEEDED_DL_1383.to_string())),
+            "a failed read must bound the stored 11/22 Mbps, not the 100 Mbps default"
+        );
+
+        // Nothing stored and nothing readable: no session rule at all.
+        {
+            let ctx = pcf_self();
+            let context = ctx.read().expect("context");
+            let mut sess = context.sess_find_by_sm_policy_id(&pol).expect("session");
+            sess.authorised_session_data = None;
+            context.sess_update(&sess);
+        }
+        assert_eq!(
+            report_se_ambr_ch(&pol, bound()).await,
+            None,
+            "with no session data, the SMF keeps the AMBR it has"
         );
     }
 

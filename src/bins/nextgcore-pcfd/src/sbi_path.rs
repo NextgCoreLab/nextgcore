@@ -876,6 +876,10 @@ pub fn pcf_sbi_send_smpolicycontrol_update_notify(sess_id: u64) -> bool {
         return false;
     };
     // What the SMF is about to hold is what a later re-evaluation falls back to.
+    // Stored at send, not on the SMF's 2xx: delivery is at-least-once and retried
+    // (TS 29.500 §6.10), so a notify whose answer was lost may well have been
+    // applied, and a re-send of the same decision is harmless where a stale
+    // fallback would not be.
     if let Ok(ctx) = crate::context::pcf_self().read() {
         if let Some(mut stored) = ctx.sess_find_by_id(sess_id) {
             stored.authorised_session_data = Some(sd);
