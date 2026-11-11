@@ -18,7 +18,7 @@
 #   3. the bundle's amf_nf_instance equals the AMF nfInstanceId a separate NRF
 #      discovery returns (curl from inside the amf pod: no extra pod or image);
 #   4. external replies: `area-1 congestion=Low` at idle and `Medium|High`
-#      during a ping burst over the UE's PDU session, with no `imsi-`, `ncgi`,
+#      during a ping burst over the UE's PDU session (from the UE container), with no `imsi-`, `ncgi`,
 #      `nrCellId`, `tac`, `nci`, `ngap_id`, dotted-quad IP or UUID in either;
 #   5. `set mode=bogus` is refused, audited (`[demo:d447a-nkef-live] audit:
 #      rejected set mode="bogus"`) and the mode stays `on`;
@@ -129,7 +129,7 @@ nkef_main() {
   set -uo pipefail
   : "${NAMESPACE:?}" "${DEMO_MODE:?}" "${OUT:?}"
   local K=(kubectl -n "${NAMESPACE}") D="${OUT}/nkef" FAILS=() POD="" NODE="" rc
-  local here q started_loc hb bound t0 t1 bsf burst ue dbg tun
+  local here q started_loc hb bound t0 t1 bsf burst ue tun
   here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || return 2
   q='is my route congested and which core functions serve me?'
   mkdir -p "${D}" "${OUT}/metrics" || return 2
@@ -193,22 +193,15 @@ nkef_main() {
     ask external-idle.txt --as external "${q}"
     nkef_level "${D}/external-idle.txt" Low && pass "external idle: Low" || fail "external idle is not Low"
     nkef_no_leak "${D}/external-idle.txt" && pass "external idle: no leak" || fail "external idle leaks (or is empty)"
-    # The UE image has no ping: a netshoot debug container in the UE pod (the
-    # base e2e's DEBUG_IMAGE), set up before the burst so it is not timed.
-    ue="$(running ue)"; dbg="nkef-burst-$(date +%s)"; tun=""
-    if [[ -n "${ue}" ]] && "${K[@]}" debug "${ue}" --target=ue --profile=netadmin \
-        --image="${DEBUG_IMAGE:-nicolaka/netshoot:v0.13}" --container="${dbg}" -- sleep 180 >"${D}/burst-debug.txt" 2>&1; then
-      for _ in $(seq 1 60); do
-        "${K[@]}" exec "${ue}" -c "${dbg}" -- true >/dev/null 2>&1 && break
-        sleep 2
-      done
-      tun="$("${K[@]}" exec "${ue}" -c "${dbg}" -- sh -c \
-        "ip -4 -o addr show | awk '\$2 ~ /^uesimtun/ { print \$2; exit }'" 2>/dev/null)"
-    fi
+    # The burst runs in the UE container itself (nextgsim's Dockerfile.ue-local
+    # carries iputils-ping and iproute2), bound to its PDU session interface.
+    ue="$(running ue)"; tun=""
+    [[ -n "${ue}" ]] && tun="$("${K[@]}" exec "${ue}" -c ue -- sh -c \
+      "ip -4 -o addr show | awk '\$2 ~ /^uesimtun/ { print \$2; exit }'" 2>/dev/null)"
     if [[ -z "${tun}" ]]; then
-      fail "no burst: UE pod '${ue}', debug container or uesimtun interface missing (burst-debug.txt)"
+      fail "no burst: no Running UE pod ('${ue}') or no uesimtun interface in it"
     else
-      "${K[@]}" exec "${ue}" -c "${dbg}" -- ping -I "${tun}" -i 0.01 -s 1200 -c 1000 -q "${PING_TARGET:-8.8.8.8}" \
+      "${K[@]}" exec "${ue}" -c ue -- ping -I "${tun}" -i 0.01 -s 1200 -c 1000 -q "${PING_TARGET:-8.8.8.8}" \
         >"${D}/ping-burst.txt" 2>&1 &
       burst=$!
       sleep 5  # one full RLS load window under the burst
