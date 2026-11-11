@@ -1,0 +1,15 @@
+[package]
+name = "nextgcore-demo"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore demo toggle convention (nextgsim#458): the demo: config block, its errors, banner, metric and log prefix"
+
+[dependencies]
+serde_yaml.workspace = true
+log.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

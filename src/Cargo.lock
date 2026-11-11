@@ -2597,6 +2597,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextgcore-demo"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "serde_yaml",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "nextgcore-diameter"
 version = "0.1.0"
 dependencies = [
@@ -2817,6 +2826,7 @@ dependencies = [
  "hex",
  "log",
  "nextgcore-core",
+ "nextgcore-demo",
  "prometheus",
  "proptest",
  "serde_yaml",

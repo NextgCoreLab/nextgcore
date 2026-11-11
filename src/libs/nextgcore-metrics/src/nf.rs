@@ -13,6 +13,10 @@
 //!   client library exports (resident memory, CPU seconds, open descriptors, start
 //!   time), read from `/proc/self`, and `nextgcore_uptime_seconds`.
 //! - `nextgcore_build_info{nf,version}`.
+//! - `nextg_demo_enabled{demo,mode}`, only while a demo is active
+//!   ([`nextgcore_demo::render_installed_metrics`], nextgsim#458). Only in the
+//!   NFs that render through [`render_common`]; one that renders its own body
+//!   appends that call itself.
 //!
 //! # No subscriber identifiers in labels
 //!
@@ -987,12 +991,50 @@ pub fn render_common(id: &NfIdentity) -> String {
     if id.nrf_client {
         render_nrf_client(&mut out);
     }
+    // nextgsim#458 / #1394: `nextg_demo_enabled{demo,mode}` while a demo is
+    // active. Writes nothing (no header either) when none is, so a demo-off
+    // scrape is byte-identical to one without demos.
+    nextgcore_demo::render_installed_metrics(&mut out);
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// nextgsim#458 / #1394: every NF's common families carry
+    /// `nextg_demo_enabled` exactly while a demo is installed active, and nothing
+    /// demo-related before. The ONLY test in this binary that installs demo state
+    /// (it is process-global and write-once), so the absent half runs first.
+    #[test]
+    fn render_common_carries_the_demo_family_only_once_a_demo_is_active() {
+        let id = NfIdentity {
+            nf: "test",
+            version: "0",
+            nrf_client: false,
+        };
+        assert!(
+            !render_common(&id).contains("nextg_demo"),
+            "a demo-off scrape exports nothing demo-related"
+        );
+
+        const SPEC: nextgcore_demo::DemoSpec = nextgcore_demo::DemoSpec {
+            key: "d1394-sample",
+            modes: &["on"],
+            requires: &[],
+        };
+        let root: serde_yaml::Value = serde_yaml::from_str(
+            "demo:\n  enabled: true\n  d1394-sample:\n    enabled: true\n    mode: on\n",
+        )
+        .unwrap();
+        nextgcore_demo::init_from_root(&root, &nextgcore_demo::DemoRegistry::new(&[SPEC])).unwrap();
+        let body = render_common(&id);
+        assert!(
+            body.contains("# TYPE nextg_demo_enabled gauge\n")
+                && body.contains("nextg_demo_enabled{demo=\"d1394-sample\",mode=\"on\"} 1\n"),
+            "{body}"
+        );
+    }
 
     #[test]
     fn the_operation_label_keeps_resource_names_and_drops_every_identifier() {

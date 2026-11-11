@@ -531,6 +531,23 @@ jobs:
           helm template ci deploy/helm/nextgcore --set global.siteId=ci > "$r/helm.yaml"
           args+=(--render "$r/helm.yaml")
           python3 deploy/check_no_exposure.py "${args[@]}"
+          # #1394: the same renders, structurally: no ConfigMap config with a
+          # root demo: key, however a shipped profile pulled it in.
+          python3 deploy/check_no_demo_block.py "${args[@]}"
+      - name: No demo block in a shipped profile (nextgsim#458)
+        # #1394: demos run only from their own overlay (deploy/eks/overlays/demo*/,
+        # docker-compose.demo*.yml, docker/rust/configs/demo*/). Fails on a
+        # `demo:` key anywhere else under k8s/, deploy/, docker/rust/ (the
+        # default compose and the configs it mounts) or configs/, including
+        # one embedded in a ConfigMap, and on any reference to a demo-only path
+        # from a shipped file. The render pass runs in the exposure step above,
+        # over its renders. The self-test plants blocks first, so a scan that
+        # silently stopped matching cannot pass.
+        working-directory: nextgcore
+        run: |
+          set -euo pipefail
+          python3 deploy/check_no_demo_block.py --self-test
+          python3 deploy/check_no_demo_block.py
 
   fuzz-build:
     name: Fuzz targets build

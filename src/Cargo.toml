@@ -27,6 +27,7 @@ members = [
     "libs/nextgcore-dbi",
     "libs/nextgcore-app",
     "libs/nextgcore-metrics",
+    "libs/nextgcore-demo",
     "libs/nextgcore-proto",
     "libs/nextgcore-ipfw",
     "libs/nextgcore-tun",
@@ -214,6 +215,7 @@ nextgcore-sbcap-gen = { path = "libs/nextgcore-sbcap-gen" }
 nextgcore-dbi = { path = "libs/nextgcore-dbi" }
 nextgcore-app = { path = "libs/nextgcore-app" }
 nextgcore-metrics = { path = "libs/nextgcore-metrics" }
+nextgcore-demo = { path = "libs/nextgcore-demo" }
 nextgcore-proto = { path = "libs/nextgcore-proto" }
 nextgcore-ipfw = { path = "libs/nextgcore-ipfw" }
 nextgcore-tun = { path = "libs/nextgcore-tun" }
