@@ -87,8 +87,14 @@ fn eas_suffices_kpis(eas: &EasProfile, required: Option<&AcServiceKpis>) -> bool
     };
     let advertised = eas.svc_kpi.as_ref();
     // Response time: the EAS's guaranteed maximum must be within what the AC asks.
-    if let (Some(want), Some(have)) = (req.resp_time, advertised.and_then(|k| k.max_resp_time)) {
-        if have > want {
+    // The units differ (#1384): the AC's `respTime` is a DurationSec (TS 24.558)
+    // and the EAS's `maxRespTime` is in milliseconds (TS 29.558), so the request
+    // is brought to ms first. In u64, because u32::MAX seconds is ~4.3e12 ms and
+    // would overflow a u32 multiply.
+    if let (Some(want_s), Some(have_ms)) =
+        (req.resp_time_s, advertised.and_then(|k| k.max_resp_time_ms))
+    {
+        if u64::from(have_ms) > u64::from(want_s) * 1000 {
             return false;
         }
     }

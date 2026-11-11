@@ -2755,6 +2755,8 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
             if let Ok(ctx) = pcf_self().read() {
                 if let Some(mut stored) = ctx.sess_find_by_id(sess.id) {
                     stored.policy_dnn_data = udr_dnn_data.clone();
+                    // #1383: what a re-evaluation falls back to when its DB read fails.
+                    stored.authorised_session_data = session_data.clone();
                     ctx.sess_update(&stored);
                 }
             }
@@ -2803,32 +2805,46 @@ pub async fn handle_sm_policy_get(sm_policy_id: &str) -> SbiResponse {
             // (TS 29.512 §5.3 Individual SM Policy resource) rather than empty
             // maps (pcfd-11). The decision is rebuilt from the same subscription
             // data used at create so the GET body matches the create response.
-            let dnn = sess.dnn.as_deref().unwrap_or("internet");
-            let session_data =
-                pcf_get_session_data("", None, &sess.s_nssai, dnn).unwrap_or_else(|| {
-                    nudr_handler::SessionData {
-                        qos_index: 9,
-                        arp_priority_level: 8,
-                        arp_preempt_cap: false,
-                        arp_preempt_vuln: true,
-                        ambr_uplink: 100_000_000,
-                        ambr_downlink: 100_000_000,
-                        pcc_rules: vec![],
-                    }
-                });
-            let decision = build_sm_policy_decision(&sess.sm_policy_id, &session_data);
+            //
             // TS 29.512 §5.3: the Individual SM Policy resource is an
             // `SmPolicyControl`, whose two REQUIRED members are `context`
             // (SmPolicyContextData, carrying the SUPI) and `policy`
             // (SmPolicyDecision). Before #89 this answered a flat
             // SmPolicyDecision-shaped object with no context at all, so a strict
             // SMF could not parse it and never learned whose session it was.
-            let supi = ctx
-                .read()
-                .ok()
-                .and_then(|context| context.ue_sm_find_by_id(sess.pcf_ue_sm_id))
-                .map(|ue| ue.supi)
-                .unwrap_or_default();
+            //
+            // #1383: the SUPI is resolved FIRST and the decision read for it. This
+            // used to read the session data for an empty SUPI, which fails
+            // `InvalidSupi`, so every GET answered the DB fallback (5QI 9,
+            // 100 Mbps) whatever the subscriber holds.
+            let dnn = sess.dnn.as_deref().unwrap_or("internet");
+            let Some(supi) = sbi_path::session_supi(&sess) else {
+                // A session whose UE-SM is gone has neither a `context.supi` nor a
+                // decision this PCF can derive; answering one would describe a
+                // policy that belongs to no subscriber. TS 29.500 Table 5.2.7.2-1.
+                log::warn!(
+                    "SM Policy Get {sm_policy_id}: the session's UE-SM (id={}) is gone, \
+                     so its SUPI and policy cannot be resolved",
+                    sess.pcf_ue_sm_id
+                );
+                return nextgcore_sbi::server::send_error(
+                    500,
+                    "Internal Server Error",
+                    &format!("SM Policy {sm_policy_id} has no resolvable subscriber"),
+                    Some("SYSTEM_FAILURE"),
+                );
+            };
+            // A failed DB read answers the session data the SMF's decision was built
+            // from, never the local default (`session_data_for_reevaluation`).
+            let Some(session_data) = sbi_path::session_data_for_reevaluation(&sess, &supi) else {
+                return nextgcore_sbi::server::send_error(
+                    500,
+                    "Internal Server Error",
+                    &format!("SM Policy {sm_policy_id}: no session data for {supi}"),
+                    Some("SYSTEM_FAILURE"),
+                );
+            };
+            let decision = build_sm_policy_decision(&sess.sm_policy_id, &session_data);
             let mut context_data = serde_json::Map::new();
             context_data.insert("supi".to_string(), serde_json::json!(supi));
             context_data.insert("pduSessionId".to_string(), serde_json::json!(sess.psi));
@@ -6386,6 +6402,11 @@ mod tests {
             "http://127.0.0.1:{smf_port}/nsmf-callback/v1/sm-policy-notify/{psi}"
         ));
         sess.policy_dnn_data = stored;
+        // #1383: what a create stores, which the re-evaluation falls back to when the
+        // DB read fails. With no MongoDB in the test process a create's read fails and
+        // the decision it built -- and stored -- is the documented default.
+        sess.authorised_session_data =
+            pcf_get_session_data("imsi-000000000000000", None, &sess.s_nssai, dnn);
         guard.sess_update(&sess);
         sess.sm_policy_id.clone()
     }
@@ -9785,6 +9806,450 @@ mod tests {
         assert_eq!(got[0]["eventNotifs"][0]["accType"], "NON_3GPP_ACCESS");
 
         consumer.stop().await.expect("stop stub consumer");
+    }
+
+    // ---- #1383: the UpdateNotify and the GET read the session's REAL subscriber ----
+
+    /// The subscriber #1383's tests provision: a 5QI, an ARP and a Session-AMBR that are
+    /// ALL different from the DB fallback (5QI 9, ARP 8, 100/100 Mbps), so a decision
+    /// read for the wrong SUPI cannot coincide with the right one.
+    const SEEDED_5QI_1383: i32 = 7;
+    const SEEDED_UL_1383: &str = "11 Mbps";
+    const SEEDED_DL_1383: &str = "22 Mbps";
+
+    /// Provision `supi`'s subscriber document in the dbi test mirror, in the MongoDB
+    /// `subscribers` shape, for slice 1 / `internet`. The PCF's real Nudr read
+    /// (`pcf_get_session_data` -> `nextgcore_dbi_session_data`) then answers it.
+    fn seed_subscriber_1383(supi: &str) {
+        use nextgcore_dbi::mongodb::bson::doc;
+        nextgcore_dbi::test_store::provision_subscriber_document(
+            supi,
+            doc! {
+                "imsi": supi.trim_start_matches("imsi-"),
+                "slice": [{
+                    "sst": 1,
+                    "session": [{
+                        "name": "internet",
+                        "qos": {
+                            "index": SEEDED_5QI_1383,
+                            "arp": { "priority_level": 2, "pre_emption_capability": 1,
+                                     "pre_emption_vulnerability": 1 },
+                        },
+                        "ambr": { "uplink": { "value": 11, "unit": 2 },
+                                  "downlink": { "value": 22, "unit": 2 } },
+                    }],
+                }],
+            },
+        );
+    }
+
+    /// SM policy create for `supi` through the real router, its notificationUri on the
+    /// stub SMF and its UE address `ipv4`; answers the smPolicyId.
+    async fn create_for_1383(supi: &str, psi: u8, ipv4: &str, smf_port: u16) -> String {
+        let mut create = full_create_body(supi, psi);
+        let obj = create.as_object_mut().unwrap();
+        obj.insert("ipv4Address".to_string(), serde_json::json!(ipv4));
+        obj.insert(
+            "notificationUri".to_string(),
+            serde_json::json!(format!(
+                "http://127.0.0.1:{smf_port}/nsmf-callback/v1/sm-policy-notify/{psi}"
+            )),
+        );
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(create),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "SM policy create for {supi}");
+        sm_policy_id_of(ipv4)
+    }
+
+    /// Repoint a session at a UE-SM that does not exist: the SUPI is then unresolvable.
+    /// Not `ue_sm_remove`, which cascades and would delete the session too.
+    fn orphan_1383(sm_policy_id: &str) {
+        let ctx = pcf_self();
+        let context = ctx.read().expect("context");
+        let mut sess = context
+            .sess_find_by_sm_policy_id(sm_policy_id)
+            .expect("session");
+        sess.pcf_ue_sm_id = u64::MAX;
+        context.sess_update(&sess);
+    }
+
+    /// The single session rule of an `SmPolicyDecision`, as (5QI, uplink, downlink).
+    fn sess_rule_1383(decision: &serde_json::Value) -> (i64, String, String) {
+        let rules = decision["sessRules"]
+            .as_object()
+            .unwrap_or_else(|| panic!("sessRules present: {decision}"));
+        assert_eq!(rules.len(), 1, "one session rule: {decision}");
+        let rule = rules.values().next().unwrap();
+        (
+            rule["authDefQos"]["5qi"].as_i64().expect("5qi"),
+            rule["authSessAmbr"]["uplink"]
+                .as_str()
+                .expect("ul")
+                .to_string(),
+            rule["authSessAmbr"]["downlink"]
+                .as_str()
+                .expect("dl")
+                .to_string(),
+        )
+    }
+
+    /// Watch for the line `pcf_get_session_data` logs when its DB read fails for an
+    /// EMPTY SUPI -- the #1383 defect's signature (`InvalidSupi`, then the fallback).
+    fn empty_supi_read_watch_1383() -> nextgcore_core::test_log::Watch {
+        nextgcore_core::test_log::init();
+        nextgcore_core::test_log::watch("[] Failed to query session data from DB")
+    }
+
+    fn seeded_rule_1383() -> (i64, String, String) {
+        (
+            SEEDED_5QI_1383 as i64,
+            SEEDED_UL_1383.to_string(),
+            SEEDED_DL_1383.to_string(),
+        )
+    }
+
+    /// #1383 path 1 of 3, P-CSCF restoration (TS 29.514 §4.2.5): the UpdateNotify it
+    /// triggers carries the SUBSCRIBER's Session-AMBR and 5QI, not the DB fallback --
+    /// and an orphaned session triggers no notify at all.
+    ///
+    /// REVERT-VERIFIED: with `build_sm_policy_notification` reading `""` again the
+    /// sessRules come back 9 / 100 Mbps / 100 Mbps and the first assertion fails; with
+    /// the orphan arm answering `{}` again the absence assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn pcscf_restoration_notifies_the_subscribers_ambr_and_5qi_1383() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let empty_supi_reads = empty_supi_read_watch_1383();
+        let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
+        let supi = "imsi-001010000001383";
+        seed_subscriber_1383(supi);
+        let pol = create_for_1383(supi, 13, "10.45.13.83", peers.smf_port).await;
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
+            Some(serde_json::json!({ "ueIpv4": "10.45.13.83" })),
+        ))
+        .await;
+        assert_eq!(resp.status, 204);
+        let got = await_notifications(&peers, 1).await;
+        assert_eq!(got.len(), 1, "P-CSCF restoration notifies the SMF: {got:?}");
+        assert_eq!(got[0].0, "/nsmf-callback/v1/sm-policy-notify/13/update");
+        assert_eq!(
+            got[0].1["resourceUri"],
+            serde_json::json!(format!("/npcf-smpolicycontrol/v1/sm-policies/{pol}"))
+        );
+        assert_eq!(
+            sess_rule_1383(&got[0].1["smPolicyDecision"]),
+            seeded_rule_1383(),
+            "the notify must carry the subscriber's 5QI and Session-AMBR, not the \
+             fallback a read for an empty SUPI answers"
+        );
+
+        // Orphaned: the same trigger sends NOTHING rather than a decision for nobody.
+        orphan_1383(&pol);
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
+            Some(serde_json::json!({ "ueIpv4": "10.45.13.83" })),
+        ))
+        .await;
+        assert_eq!(resp.status, 204);
+        let after = drain_notifications(&peers, 2).await;
+        assert_eq!(
+            after.len(),
+            1,
+            "an orphaned session must send no UpdateNotify, got {after:?}"
+        );
+        assert!(
+            !sbi_path::pcf_sbi_send_smpolicycontrol_update_notify(
+                pcf_self()
+                    .read()
+                    .unwrap()
+                    .sess_find_by_sm_policy_id(&pol)
+                    .unwrap()
+                    .id
+            ),
+            "and the sender reports that it sent nothing"
+        );
+
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
+        assert_eq!(
+            empty_supi_reads.records(),
+            Vec::<String>::new(),
+            "no session-data read may be made for an empty SUPI"
+        );
+    }
+
+    /// #1383 path 2 of 3, policy-data re-authorisation (TS 29.519 policy-data change ->
+    /// TS 29.512 §4.2.3.2): the notify carries the subscriber's Session-AMBR and 5QI
+    /// alongside the #299 `chgDecs` overlay, which until now was the only member checked.
+    ///
+    /// REVERT-VERIFIED with the same revert as the P-CSCF test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn a_policy_data_reauthorisation_notifies_the_subscribers_ambr_and_5qi_1383() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let empty_supi_reads = empty_supi_read_watch_1383();
+        let supi = "imsi-001010000011383";
+        seed_subscriber_1383(supi);
+        let mut answers = std::collections::HashMap::new();
+        answers.insert(
+            "\"sst\":1".to_string(),
+            sm_policy_body(1, "internet", true, false),
+        );
+        let peers = start_policy_data_peers(answers).await;
+        seed_sm_policy_session(
+            supi,
+            14,
+            1,
+            "internet",
+            peers.smf_port,
+            Some(serde_json::json!({ "dnn": "internet", "online": false, "offline": false })),
+        );
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            sbi_path::POLICY_DATA_NOTIFY_PATH,
+            Some(serde_json::json!({ "ueId": supi })),
+        ))
+        .await;
+        assert_eq!(resp.status, 204);
+        let got = await_notifications(&peers, 1).await;
+        assert_eq!(got.len(), 1, "the association is re-authorised: {got:?}");
+        let decision = &got[0].1["smPolicyDecision"];
+        assert_eq!(
+            sess_rule_1383(decision),
+            seeded_rule_1383(),
+            "a re-authorisation must not reset the session to the fallback AMBR/5QI"
+        );
+        for (_id, dec) in decision["chgDecs"].as_object().expect("chgDecs") {
+            assert_eq!(dec["online"], serde_json::json!(true), "#299 still holds");
+        }
+
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
+        assert_eq!(
+            empty_supi_reads.records(),
+            Vec::<String>::new(),
+            "no session-data read may be made for an empty SUPI"
+        );
+    }
+
+    /// #1383 path 3 of 3, an AF app session with no media components (TS 29.514
+    /// §4.2.2.2), which takes the generic subscription-derived notify.
+    ///
+    /// REVERT-VERIFIED with the same revert as the P-CSCF test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn an_af_session_without_media_notifies_the_subscribers_ambr_and_5qi_1383() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let empty_supi_reads = empty_supi_read_watch_1383();
+        let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
+        let supi = "imsi-001010000021383";
+        seed_subscriber_1383(supi);
+        create_for_1383(supi, 15, "10.45.13.85", peers.smf_port).await;
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions",
+            Some(serde_json::json!({
+                "notifUri": "http://127.0.0.1:9/af-notif/1383",
+                "suppFeat": "0",
+                "ueIpv4": "10.45.13.85",
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        let got = await_notifications(&peers, 1).await;
+        assert_eq!(got.len(), 1, "the AF bind notifies the SMF: {got:?}");
+        assert_eq!(got[0].0, "/nsmf-callback/v1/sm-policy-notify/15/update");
+        assert_eq!(
+            sess_rule_1383(&got[0].1["smPolicyDecision"]),
+            seeded_rule_1383(),
+            "an AF bind must not reset the session to the fallback AMBR/5QI"
+        );
+
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
+        assert_eq!(
+            empty_supi_reads.records(),
+            Vec::<String>::new(),
+            "no session-data read may be made for an empty SUPI"
+        );
+    }
+
+    /// #1383 review M1: a re-evaluation whose DB read FAILS for a valid SUPI (here the
+    /// subscriber's DNN is no longer provisioned) builds from the session data the
+    /// SMF's decision was built from, never the local default -- on the P-CSCF notify
+    /// and on the GET alike. A session with nothing stored sends no notify and its GET
+    /// answers 500.
+    ///
+    /// REVERT-VERIFIED: with `session_data_for_reevaluation` on `pcf_get_session_data`
+    /// (the fallback) again, the notify and the GET answer (9, "100 Mbps", "100 Mbps"),
+    /// and the session with nothing stored is notified.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn a_failed_db_read_reevaluates_from_the_stored_decision_not_the_default_1383() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
+        let supi = "imsi-001010000041383";
+        seed_subscriber_1383(supi);
+        let pol = create_for_1383(supi, 17, "10.45.13.87", peers.smf_port).await;
+
+        // The subscriber's `internet` session is no longer provisioned: the read fails
+        // SessionNotFound, which is what a DB outage looks like to the re-evaluation.
+        nextgcore_dbi::test_store::provision_subscriber_document(
+            supi,
+            nextgcore_dbi::mongodb::bson::doc! {
+                "imsi": supi.trim_start_matches("imsi-"),
+                "slice": [{ "sst": 1, "session": [{ "name": "ims" }] }],
+            },
+        );
+        assert!(
+            nudr_handler::pcf_read_session_data(supi, &SNssai { sst: 1, sd: None }, "internet")
+                .is_err(),
+            "control: the read now fails"
+        );
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
+            Some(serde_json::json!({ "ueIpv4": "10.45.13.87" })),
+        ))
+        .await;
+        assert_eq!(resp.status, 204);
+        let got = await_notifications(&peers, 1).await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(
+            sess_rule_1383(&got[0].1["smPolicyDecision"]),
+            seeded_rule_1383(),
+            "a failed DB read must re-send the decision the SMF holds, not reset the \
+             session to the local default"
+        );
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "GET",
+            &format!("/npcf-smpolicycontrol/v1/sm-policies/{pol}"),
+            None,
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
+        assert_eq!(sess_rule_1383(&body["policy"]), seeded_rule_1383());
+
+        // Nothing stored (a session restored from a snapshot older than the field):
+        // the policy-data re-authorisation sends no notify and the GET answers 500.
+        let bare = "imsi-001010000051383";
+        let bare_pol = seed_sm_policy_session(bare, 18, 1, "internet", peers.smf_port, None);
+        {
+            let ctx = pcf_self();
+            let context = ctx.read().expect("context");
+            let mut sess = context
+                .sess_find_by_sm_policy_id(&bare_pol)
+                .expect("session");
+            sess.authorised_session_data = None;
+            context.sess_update(&sess);
+        }
+        let mut answers = std::collections::HashMap::new();
+        answers.insert(
+            "\"sst\":1".to_string(),
+            sm_policy_body(1, "internet", true, false),
+        );
+        let reauth_peers = start_policy_data_peers(answers).await;
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            sbi_path::POLICY_DATA_NOTIFY_PATH,
+            Some(serde_json::json!({ "ueId": bare })),
+        ))
+        .await;
+        assert_eq!(resp.status, 204);
+        let after = drain_notifications(&peers, 2).await;
+        assert_eq!(
+            after.len(),
+            1,
+            "with no readable and no stored session data, nothing is sent: {after:?}"
+        );
+        let resp = pcf_sbi_request_handler(make_request(
+            "GET",
+            &format!("/npcf-smpolicycontrol/v1/sm-policies/{bare_pol}"),
+            None,
+        ))
+        .await;
+        assert_eq!(resp.status, 500, "{:?}", resp.http.content);
+
+        reauth_peers.udr.stop().await.ok();
+        reauth_peers.smf.stop().await.ok();
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
+    }
+
+    /// #1383 criterion 3: the SM-policy GET (TS 29.512 §5.3.3.3.1) answers the
+    /// subscriber's decision, and an orphaned session answers 500 SYSTEM_FAILURE
+    /// rather than a decision belonging to no subscriber.
+    ///
+    /// REVERT-VERIFIED: with the GET reading `""` again `policy.sessRules` is
+    /// 9 / 100 Mbps and the first assertion fails.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn sm_policy_get_answers_the_subscribers_ambr_and_5qi_1383() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let empty_supi_reads = empty_supi_read_watch_1383();
+        let supi = "imsi-001010000031383";
+        seed_subscriber_1383(supi);
+        let pol = create_for_1383(supi, 16, "10.45.13.86", 9).await;
+
+        let get = || async {
+            pcf_sbi_request_handler(make_request(
+                "GET",
+                &format!("/npcf-smpolicycontrol/v1/sm-policies/{pol}"),
+                None,
+            ))
+            .await
+        };
+        let resp = get().await;
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
+        assert_eq!(body["context"]["supi"], serde_json::json!(supi));
+        assert_eq!(
+            sess_rule_1383(&body["policy"]),
+            seeded_rule_1383(),
+            "the GET must answer the subscriber's policy, not the fallback"
+        );
+
+        orphan_1383(&pol);
+        let resp = get().await;
+        assert_eq!(resp.status, 500, "{:?}", resp.http.content);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
+        assert_eq!(body["cause"], serde_json::json!("SYSTEM_FAILURE"));
+        assert_eq!(
+            empty_supi_reads.records(),
+            Vec::<String>::new(),
+            "no session-data read may be made for an empty SUPI"
+        );
     }
 }
 

@@ -59,6 +59,12 @@ base64.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# #1383: the in-memory subscriber-document mirror, so a test can seed a subscriber
+# whose QoS and Session-AMBR differ from the defaults and drive the real Nudr read.
+nextgcore-dbi = { workspace = true, features = ["test-helpers"] }
+# #1383: the capturing test logger, so a test can assert that no read for an empty
+# SUPI was logged.
+nextgcore-core = { workspace = true, features = ["test-log"] }
 p256 = { workspace = true, features = ["ecdsa"] }
 base64.workspace = true
 # WSB-1/H2 strict-peer tests: drive the REAL bsfd SBI request handler
