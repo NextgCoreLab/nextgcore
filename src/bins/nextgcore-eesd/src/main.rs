@@ -3760,7 +3760,7 @@ mod tests {
     fn register_eas_with_kpis(sk: &SigningKey, eas_id: &str, max_resp_time: u32) -> String {
         let body = format!(
             r#"{{"easProf":{{"easId":"{eas_id}","endPt":{{"fqdn":"{eas_id}"}},
-                "svcKpi":{{"maxRespTime":{max_resp_time},"availability":90}}}}}}"#
+                "svcKpi":{{"maxRespTime":{max_resp_time},"avail":90}}}}}}"#
         );
         let req = SbiRequest::post("/eees-easregistration/v1/registrations")
             .with_header("Authorization", bearer(sk, "k1", "eees-easregistration"))
@@ -4018,6 +4018,51 @@ mod tests {
         assert!(
             !body.contains("unfulfil"),
             "u32::MAX seconds must admit a 1500 ms EAS; got {body}"
+        );
+
+        auth::clear_auth_jwks();
+    }
+
+    /// #1388: the availability filter reads the EAS's spec-keyed `avail`
+    /// (TS 29.558 EASServiceKPI). `register_eas_with_kpis` advertises
+    /// `"avail":90`; an AC asking `avail: 95` is unfulfilled and one asking 90
+    /// (inclusive) is not. Before the fix the EAS's `avail` was dropped on
+    /// deserialisation, so the filter never fired and both were fulfilled.
+    #[test]
+    fn the_availability_filter_keeps_or_rejects_by_the_spec_avail_key() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+        register_eas_with_kpis(&sk, "eas-1388.example.com", 10);
+
+        let resp = post_eec_registration(
+            &sk,
+            r#"{"eecId":"eec-1388-a.example.com","acProfs":[
+                {"acId":"ac-90","eass":[{"easId":"eas-1388.example.com",
+                    "minimumReqSvcKPIs":{"avail":90}}]},
+                {"acId":"ac-95","eass":[{"easId":"eas-1388.example.com",
+                    "minimumReqSvcKPIs":{"avail":95}}]}
+            ]}"#,
+        );
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        let stored: EecRegistration =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let rejected: Vec<_> = stored
+            .unfulfilled()
+            .iter()
+            .map(|u| u.ac_id.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            rejected,
+            vec!["ac-95".to_string()],
+            "an EAS at avail 90 serves 90 and refuses 95"
+        );
+        assert_eq!(
+            stored.unfulfilled()[0].reason.as_deref(),
+            Some(eec::unfulfill_reason::REQ_UNFULFILLED)
         );
 
         auth::clear_auth_jwks();

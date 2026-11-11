@@ -93,6 +93,15 @@ impl EndPoint {
 }
 
 /// `EASServiceKPI` (TS 29.558 §8.1.5.x) — a representative subset.
+///
+/// The members below whose key `rename_all` would not derive correctly carry an
+/// explicit `rename` to their key in `TS29558_Eees_EASRegistration.yaml`
+/// EASServiceKPI (l.429-448). Three Rust names (`availability`, `avl_stor`,
+/// `con_bdwth`) used to serialise as keys the schema does not have
+/// (`availability`, `avlStor`, `conBdwth`), so conformant registrations never
+/// populated them (#1388). The
+/// old keys are not accepted: eesd keeps no persisted EAS state that could hold
+/// them, and no emitter in nextgcore or nextgsim produces them.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct EasServiceKpi {
@@ -102,8 +111,9 @@ pub struct EasServiceKpi {
     /// (TS 29.558 `maxRespTime`, `29558-j70.txt` l.7695-7698).
     #[serde(rename = "maxRespTime", skip_serializing_if = "Option::is_none")]
     pub max_resp_time_ms: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub availability: Option<u32>,
+    /// Advertised percentage of time the EAS is available, 0..=100 (`avail`).
+    #[serde(rename = "avail", skip_serializing_if = "Option::is_none")]
+    pub avail: Option<u32>,
     /// Available compute (TS 29.558 `avlComp`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub avl_comp: Option<u32>,
@@ -113,12 +123,12 @@ pub struct EasServiceKpi {
     /// Available memory.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub avl_mem: Option<u32>,
-    /// Available storage.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub avl_stor: Option<u32>,
-    /// Connection bandwidth (`BitRate` string, e.g. "100 Mbps").
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub con_bdwth: Option<String>,
+    /// Available storage (`avlStrg`).
+    #[serde(rename = "avlStrg", skip_serializing_if = "Option::is_none")]
+    pub avl_strg: Option<u32>,
+    /// Connection bandwidth (`connBand`, a `BitRate` string, e.g. "100 Mbps").
+    #[serde(rename = "connBand", skip_serializing_if = "Option::is_none")]
+    pub conn_band: Option<String>,
 }
 
 /// `ServiceArea` (TS 29.558) — simplified subset. The full GeographicalService
@@ -770,7 +780,7 @@ mod tests {
                 ac_ids: Some(vec!["ac1".into()]),
                 svc_area: None,
                 svc_kpi: Some(EasServiceKpi {
-                    availability: Some(99),
+                    avail: Some(99),
                     ..Default::default()
                 }),
             },
@@ -944,5 +954,28 @@ mod tests {
         assert_eq!(s, "2000-01-01T00:00:00Z");
         let back = parse_rfc3339_to_epoch(&s).unwrap();
         assert_eq!(back, 946_684_800);
+    }
+
+    /// #1388: an EASServiceKPI written with the schema's own keys
+    /// (`TS29558_Eees_EASRegistration.yaml` l.429-448, hand-typed here, not built
+    /// from our structs) populates every member, and serialises back under the
+    /// same keys, never the old `availability` / `avlStor` / `conBdwth`.
+    #[test]
+    fn eas_service_kpi_round_trips_the_spec_keys() {
+        let wire = r#"{"maxReqRate":10,"maxRespTime":20,"avail":99,"avlComp":4,
+            "avlGraComp":2,"avlMem":512,"avlStrg":1024,"connBand":"100 Mbps"}"#;
+        let kpi: EasServiceKpi = serde_json::from_str(wire).unwrap();
+        assert_eq!(kpi.avail, Some(99));
+        assert_eq!(kpi.avl_strg, Some(1024));
+        assert_eq!(kpi.conn_band.as_deref(), Some("100 Mbps"));
+        assert_eq!(kpi.max_req_rate, Some(10));
+        assert_eq!(kpi.avl_mem, Some(512));
+
+        let back = serde_json::to_value(&kpi).unwrap();
+        let want: serde_json::Value = serde_json::from_str(wire).unwrap();
+        assert_eq!(back, want, "serialises under exactly the spec keys");
+        for old in ["availability", "avlStor", "conBdwth"] {
+            assert!(back.get(old).is_none(), "{old} is not an EASServiceKPI key");
+        }
     }
 }
