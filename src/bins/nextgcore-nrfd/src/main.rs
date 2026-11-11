@@ -2964,7 +2964,7 @@ fn authorize_access_token(
         return Err((
             "invalid_scope",
             format!(
-                "no {target_nf_type} producer is registered with this NRF, so no producer \
+                "no operative {target_nf_type} producer is registered with this NRF, so no producer \
                  authorizes the requested service(s) {requested_scopes:?}"
             ),
         ));
@@ -3851,14 +3851,21 @@ async fn handle_access_token_request_with_policy(
     // single producer instance and derive its nfType (filling an absent
     // targetNfType); otherwise take all registered producers of the type.
     //
-    // Issue #1391: only a producer whose nfStatus is REGISTERED authorizes a
-    // scope, the same rule discovery applies (nnrf_handler.rs, the `REGISTERED` filter of NF discovery). A
-    // SUSPENDED producer (missed heartbeats) is not discoverable, so it must not
-    // be able to vouch for a token either.
+    // Issue #1391: only an OPERATIVE producer authorizes a scope. TS 29.510
+    // Table 6.1.6.3.7-1 (29510-k00 l.17705-17760): REGISTERED, UNDISCOVERABLE
+    // and CANARY_RELEASE are all "registered in NRF" and "operative" (an
+    // UNDISCOVERABLE NF still serves its existing resources, so a consumer
+    // already bound to it must be able to refresh its token); SUSPENDED is "not
+    // operative" (e.g. heartbeat failure), so it cannot vouch for a token. An
+    // unknown status is treated as not operative.
     let all: Vec<NfProfile> = manager
         .list()
         .into_iter()
-        .filter(|p| p.nf_status.eq_ignore_ascii_case("REGISTERED"))
+        .filter(|p| {
+            ["REGISTERED", "UNDISCOVERABLE", "CANARY_RELEASE"]
+                .iter()
+                .any(|s| p.nf_status.eq_ignore_ascii_case(s))
+        })
         .collect();
     let target_instance: Option<NfProfile> = if !target_nf_instance_id.is_empty() {
         let inst = all
@@ -3893,8 +3900,8 @@ async fn handle_access_token_request_with_policy(
                 return token_error(
                     "invalid_scope",
                     &format!(
-                        "targetNfInstanceId {target_nf_instance_id} is not a REGISTERED NF \
-                         instance of this NRF, so it authorizes no service"
+                        "targetNfInstanceId {target_nf_instance_id} is not an operative NF \
+                         instance registered with this NRF, so it authorizes no service"
                     ),
                 );
             }
@@ -4485,7 +4492,11 @@ mod tests {
             authorize_access_token(&consumer, "SMF", "UDM", &["nudm-sdm".into()], &[], &[], &[])
                 .expect_err("no producer registered must not grant a scope");
         assert_eq!(err.0, "invalid_scope");
-        assert!(err.1.contains("no UDM producer is registered"), "{}", err.1);
+        assert!(
+            err.1.contains("no operative UDM producer is registered"),
+            "{}",
+            err.1
+        );
     }
 
     #[test]
@@ -5796,8 +5807,9 @@ mod tests {
     /// Issue #1391 review: two more ways a producer could vouch for a scope it
     /// should not. (a) A pinned instance of a DIFFERENT type than the explicit
     /// `targetNfType` is `invalid_request` (the selectors contradict). (b) A
-    /// SUSPENDED producer is not discoverable, so it authorizes nothing, pinned
-    /// or by type; once it is REGISTERED again the same request is granted.
+    /// SUSPENDED producer is "not operative" (TS 29.510 Table 6.1.6.3.7-1), so it
+    /// authorizes nothing, pinned or by type; REGISTERED, UNDISCOVERABLE and
+    /// CANARY_RELEASE are operative and are granted.
     #[tokio::test]
     async fn test_1391_mismatched_or_suspended_producer_does_not_authorize() {
         use serde_json::json;
@@ -5882,15 +5894,19 @@ mod tests {
             assert!(b.get("access_token").is_none(), "{extra} -> {b}");
         }
 
-        // Control: REGISTERED again -> both shapes are granted.
-        mgr.deregister(producer_id).ok();
-        mgr.register(producer("REGISTERED")).unwrap();
-        for extra in [
-            json!({"targetNfType": "NRFD1391CP"}),
-            json!({"targetNfInstanceId": producer_id}),
-        ] {
-            let (st, b) = call(with(extra.clone())).await;
-            assert_eq!(st, 200, "{extra} -> {b}");
+        // Control: every OPERATIVE status (TS 29.510 Table 6.1.6.3.7-1) is
+        // granted in both shapes. UNDISCOVERABLE is operative and still serves
+        // consumers already bound to it, so their token refresh must work.
+        for status in ["REGISTERED", "UNDISCOVERABLE", "CANARY_RELEASE"] {
+            mgr.deregister(producer_id).ok();
+            mgr.register(producer(status)).unwrap();
+            for extra in [
+                json!({"targetNfType": "NRFD1391CP"}),
+                json!({"targetNfInstanceId": producer_id}),
+            ] {
+                let (st, b) = call(with(extra.clone())).await;
+                assert_eq!(st, 200, "{status} {extra} -> {b}");
+            }
         }
 
         mgr.deregister(consumer_id).ok();
