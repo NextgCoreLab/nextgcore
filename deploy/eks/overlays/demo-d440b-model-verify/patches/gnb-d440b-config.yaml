@@ -1,0 +1,25 @@
+# Appended (JSON patch `/-`), so it runs AFTER resolve-dns, which writes the
+# final /etc/nextgsim/gnb.yaml; a strategic merge would put it first, and
+# resolve-dns would then overwrite what it wrote. The shipped gnb.yaml sets
+# neither key, so they are appended; a template that already sets one fails here
+# rather than run with two values.
+- op: add
+  path: /spec/template/spec/initContainers/-
+  value:
+    name: d440b-config
+    image: busybox:1.36
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        f=/etc/nextgsim/gnb.yaml
+        if grep -qE '^(nwdaf_enabled|nwdaf_model_path):' "$f"; then
+          echo "[d440b-config] FATAL: $f already sets nwdaf_enabled/nwdaf_model_path" >&2
+          exit 1
+        fi
+        printf '\n# d440b-model-verify (nextgsim#463)\nnwdaf_enabled: true\nnwdaf_model_path: /opt/nextgsim/models/nwdaf-trajectory-cv.onnx\n' >>"$f"
+        grep -nE '^(nwdaf_|demo:)' -A3 "$f"
+    volumeMounts:
+      - name: config-resolved
+        mountPath: /etc/nextgsim

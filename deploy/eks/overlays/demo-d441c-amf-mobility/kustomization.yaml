@@ -1,0 +1,30 @@
+# Demo d441c-amf-mobility (nextgsim#466): nwdafd UE_MOBILITY from amfd
+# LOCATION_REPORT events, over the demo-OFF base.
+#
+# Adds what the base lacks for this demo, ClusterIP only:
+#   nwdaf.yaml     nwdafd (built with --features amf-mobility), its ConfigMap
+#                  nwdaf-config (the toggle target) and a ClusterIP Service.
+#   gnb-east.yaml  a second gNB (NCI 0x020, gNB ID 2, same TAC) so the UE can
+#                  do an N2 handover, the nextgsim#456 compose topology.
+#   amf-log.yaml   amfd namf_server at debug, for the notify-delivery line.
+#   sim-n2ho.yaml  the base gNB/UE configs with the handover neighbour, the
+#                  positions and the UE's walk from west to east.
+#
+# The demo block goes into nwdaf.yaml only (toggles.yaml): amfd's
+# LOCATION_REPORT on HANDOVER NOTIFY is ungated base-core behaviour.
+#
+# No OAuth2-require on nwdafd: TS 33.501 §13.4.1 says OAuth 2.0 "does not apply
+# to the notification operation", so amfd's notify carries no token and an
+# OAuth2-required listener would reject it. The notify is authenticated by the
+# random token in the callback URI instead (nextgsim#466 spec note).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: nextg-demo
+resources:
+  - ../demo
+  - toggles.yaml
+  - nwdaf.yaml
+  - gnb-east.yaml
+patches:
+  - path: sim-n2ho.yaml
+  - path: amf-log.yaml

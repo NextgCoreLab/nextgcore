@@ -284,6 +284,7 @@ jobs:
         nextgcore-sbi:pqc-tls
         nextgcore-nwdafd:sensing
         nextgcore-nwdafd:onnx-model
+        nextgcore-nwdafd:amf-mobility
         nextgcore-pcfd:intent-loop
         nextgcore-amfd:ntn
         nextgcore-nsacfd:sla-observe
@@ -569,12 +570,15 @@ jobs:
           # removed on every exit path, every artefact is scrubbed, and a
           # surviving token fails the run.
           k8s/demo-check-selftest.sh
-          # Every overlay scenario with a --self-test runs it, so a log-order
-          # assertion that cannot fail is caught here (nextgsim#488).
-          for sc in deploy/eks/overlays/demo-*/scenario.sh; do
-            [ -x "$sc" ] || continue
-            if grep -q -- '--self-test' "$sc"; then "$sc" --self-test; fi
+          # nextgsim#463: each demo overlay's scenario self-test, which proves
+          # every scenario assertion fails on input missing its line.
+          n=0
+          for t in deploy/eks/overlays/demo-*/test-scenario.sh; do
+            [ -e "$t" ] || continue
+            echo "::group::$t"; "$t"; echo "::endgroup::"
+            n=$((n + 1))
           done
+          [ "$n" -gt 0 ] || { echo "::error::no demo overlay test-scenario.sh found"; exit 1; }
       - name: Demo compose stacks publish no port (nextgsim#456)
         # The demo stacks are standalone files, never `-f` overlays of
         # docker-compose.yml: compose merges `ports:` lists, so the base file's

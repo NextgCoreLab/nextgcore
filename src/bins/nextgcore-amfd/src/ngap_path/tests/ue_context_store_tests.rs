@@ -1180,6 +1180,7 @@ fn the_mongodb_backend_stores_loads_and_deletes() {
         },
         tai: Default::default(),
         cgi: Default::default(),
+        location_timestamp: 0,
         access_type: 1,
         registration_type: 1,
         requested_nssai: Vec::new(),
@@ -2360,4 +2361,66 @@ async fn a_takeover_points_the_sdm_subscription_and_the_policy_associations_at_t
     assert_eq!(uep["servingNfId"], instance);
     let (id, _) = peer.ue_auth_state.find_by_supi(supi).expect("taken over");
     crash(&mut peer, id);
+}
+
+/// nextgsim#488: the time the stored location was acquired survives a restart, so a
+/// restored UE's `ueLocationTimestamp`, `lastActTime` and location age stay those of
+/// the location, not of the restore. A record an AMF without the field wrote still
+/// reads, with the age unknown (0).
+///
+/// REVERT-VERIFIED: dropping `ue.ue_location_timestamp = rec.location_timestamp` from
+/// `restored_ue` fails the restore assertion (0).
+#[tokio::test]
+async fn a_restored_ue_keeps_the_time_its_location_was_acquired() {
+    crate::context::amf_context_init(64, 1024, 4096);
+    let backend = Arc::new(MemoryBackend::default());
+    let mut server = storing_server(&backend).await;
+    let (id, supi) = (6_860_601u64, "imsi-001010004880601");
+    seed_registered_ue(&mut server, id, 0x0488_0601, supi, "ref-488-a", 7777, false);
+    let acquired = 1_794_000_488u64;
+    server
+        .ue_auth_state
+        .with_mut(id, |s| s.amf_ue.ue_location_timestamp = acquired);
+    store_now(&mut server).await;
+    crash(&mut server, id);
+    let rec = backend.get(supi).expect("stored");
+    assert_eq!(rec.location_timestamp, acquired, "persisted");
+
+    let mut after = restoring_server().await;
+    let new_id = after.install_restored(&rec).expect("restored");
+    assert_eq!(
+        after
+            .ue_auth_state
+            .get(new_id)
+            .expect("installed")
+            .amf_ue
+            .ue_location_timestamp,
+        acquired,
+        "restored as acquired, not as of the restore"
+    );
+    crash(&mut after, new_id);
+
+    // A corrupt stamp (the BSON maximum) restores as unknown, not as a time.
+    let corrupt = StoredUeContext {
+        location_timestamp: i64::MAX as u64,
+        ..rec.clone()
+    };
+    let corrupt_id = after.install_restored(&corrupt).expect("restored");
+    assert_eq!(
+        after
+            .ue_auth_state
+            .get(corrupt_id)
+            .expect("installed")
+            .amf_ue
+            .ue_location_timestamp,
+        0,
+        "an implausible stamp is no timestamp"
+    );
+    crash(&mut after, corrupt_id);
+
+    let mut legacy = mongodb::bson::to_document(&rec).expect("encodes");
+    assert!(legacy.remove("location_timestamp").is_some());
+    let old: StoredUeContext =
+        mongodb::bson::from_document(legacy).expect("a record without the field decodes");
+    assert_eq!(old.location_timestamp, 0, "age unknown");
 }

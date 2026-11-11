@@ -277,6 +277,23 @@ impl AnalyticsId {
         SUPPORTED_EVENTS.contains(self)
     }
 
+    /// Whether `Nnwdaf_AnalyticsInfo` serves this event in this process: the
+    /// [`SUPPORTED_EVENTS`], plus UE_MOBILITY while the `amf-mobility` feature
+    /// is serving it (nextgsim#466, decided at start-up). The EventsSubscription
+    /// surface keeps [`is_supported`](Self::is_supported): it has no `tgtUe`, which
+    /// TS 29.520 §4.2.2.2.2 requires for UE_MOBILITY (`29520-k00.txt:3217-3221`),
+    /// so it would accept a subscription it could never notify.
+    pub fn is_served_by_analytics_info(&self) -> bool {
+        if self.is_supported() {
+            return true;
+        }
+        #[cfg(feature = "amf-mobility")]
+        if *self == Self::UeMobility && crate::amf_mobility::serving() {
+            return true;
+        }
+        false
+    }
+
     /// The per-event payload member name in a TS 29.520 `EventNotification`
     /// body, i.e. what `Nnwdaf_EventsSubscription_Notify` emits.
     ///

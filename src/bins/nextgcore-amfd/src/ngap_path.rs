@@ -3428,6 +3428,8 @@ impl NgapServer {
                         plmn_id: initial_ue.plmn_id.clone(),
                         cell_id: initial_ue.nr_cell_identity,
                     };
+                    // nextgsim#488: the InitialUEMessage's ULI was acquired now.
+                    state.amf_ue.stamp_location_now();
                     state.amf_ue.access_type = 1; // 3GPP access
                     self.ue_auth_state.insert(amf_ue_ngap_id, state);
                 }
@@ -7402,6 +7404,8 @@ impl NgapServer {
             plmn_id: initial_ue.plmn_id.clone(),
             cell_id: initial_ue.nr_cell_identity,
         };
+        // nextgsim#488: the InitialUEMessage's ULI was acquired now.
+        state.amf_ue.stamp_location_now();
         // #1102, TS 24.501 §5.6.2.2.1: a verified REGISTRATION REQUEST answers a page
         // as a SERVICE REQUEST does, so PAGING stops here. Unanswered, the page kept
         // going out for the old connection until it was abandoned, and its requester
@@ -7552,6 +7556,8 @@ impl NgapServer {
             plmn_id: initial_ue.plmn_id.clone(),
             cell_id: initial_ue.nr_cell_identity,
         };
+        // nextgsim#488: the InitialUEMessage's ULI was acquired now.
+        state.amf_ue.stamp_location_now();
 
         // Answering a page stops T3513 and hands over what was waiting.
         let paging = {
@@ -15883,6 +15889,15 @@ impl NgapServer {
             .map(|s| (s.association_id, s.ran_ue_ngap_id))
             .filter(|pair| *pair != (association_id, notify.ran_ue_ngap_id));
 
+        // nextgsim#466: where the UE was, so the LOCATION_REPORT below goes only to
+        // the subscriptions whose `locationFilterList` covers what changed.
+        let located_before = self.ue_auth_state.get(notify.amf_ue_ngap_id).map(|s| {
+            (
+                s.amf_ue.nr_tai.clone(),
+                s.amf_ue.nr_cgi.clone(),
+                s.association_id,
+            )
+        });
         let updated = self.ue_auth_state.with_mut(notify.amf_ue_ngap_id, |state| {
             // Move the serving association/RAN-UE-NGAP-ID and location to the
             // target now that the UE has arrived (TS 23.502 Section 4.9.1.3).
@@ -15957,7 +15972,29 @@ impl NgapServer {
         // identity and logged it). `namf_server::ue_ncgi_is_known` still guards a DEFAULT
         // cell id, but the reason is now "never learned" in general rather than "no
         // handover yet".
+        //
+        // nextgsim#466: LOCATION_REPORT fires here too. TS 29.518 Table 6.2.6.3.3-1
+        // has the consumer receive the *"Updated Location of the UE ... when AMF becomes
+        // aware of a location change of the UE"* (`29518-k00.txt:23958-23966`), and the
+        // HandoverNotify's `UserLocationInformation` is exactly that moment for an N2
+        // handover. Fired only when the Notify carried an NR location: without one the
+        // `with_mut` above left the stored location as it was, so there is no location
+        // the AMF has become aware of, and re-reporting the source cell would be wrong.
+        // And only to the subscriptions whose `locationFilterList` covers a dimension
+        // that changed (Table 6.2.6.2.3-1: absent means TA changes only), so an
+        // intra-TA handover does not reach a filter-less subscriber. Same snapshot as
+        // the presence report, read after the location write.
         if let Some(state) = self.ue_auth_state.get(notify.amf_ue_ngap_id) {
+            if let (Some(_), Some((tai, cgi, assoc))) =
+                (&notify.user_location_info, &located_before)
+            {
+                let change = crate::context::LocationChange {
+                    tai: *tai != state.amf_ue.nr_tai,
+                    cell: *cgi != state.amf_ue.nr_cgi,
+                    ran_node: *assoc != state.association_id,
+                };
+                crate::namf_server::fire_location_change_report(&state.amf_ue, change);
+            }
             crate::namf_server::fire_presence_in_aoi_report(&state.amf_ue);
         }
         // A relocation can move a UE into or out of a counted area, so the per-area
@@ -17668,6 +17705,14 @@ impl NgapServer {
                 // target (#406: `UserLocationInformation` is mandatory here, TS 38.413
                 // §9.2.3.8, and an Xn handover produces no HandoverNotify, so this is the
                 // AMF's only notice that the UE relocated). `with_mut`, so it persists.
+                // nextgsim#466: where the UE was, for the LOCATION_REPORT filter below.
+                let located_before = self.ue_auth_state.get(amf_ue_ngap_id).map(|s| {
+                    (
+                        s.amf_ue.nr_tai.clone(),
+                        s.amf_ue.nr_cgi.clone(),
+                        s.association_id,
+                    )
+                });
                 self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
                     let committed = state.amf_ue.advance_next_hop();
                     debug_assert_eq!(committed, (ncc, nh), "the previewed NH is the one sent");
@@ -17677,6 +17722,26 @@ impl NgapServer {
                         apply_user_location(&mut state.amf_ue, uli);
                     }
                 });
+                // nextgsim#466: an Xn handover produces no HandoverNotify, so this is
+                // the only point at which the AMF becomes aware the UE moved, and
+                // TS 29.518 Table 6.2.6.3.3-1 makes that the LOCATION_REPORT trigger
+                // (*"Updated Location ... when AMF becomes aware of a location change of
+                // the UE"*, `29518-k00.txt:23958-23966`). Read after the `with_mut`, so it reports
+                // the TARGET cell; only for an Acknowledge, because a Failure leaves the
+                // UE where it was; and only to subscriptions whose `locationFilterList`
+                // covers what changed (absent = TA only).
+                if let (Some(_), Some((tai, cgi, assoc)), Some(state)) = (
+                    &req.user_location_info,
+                    &located_before,
+                    self.ue_auth_state.get(amf_ue_ngap_id),
+                ) {
+                    let change = crate::context::LocationChange {
+                        tai: *tai != state.amf_ue.nr_tai,
+                        cell: *cgi != state.amf_ue.nr_cgi,
+                        ran_node: *assoc != state.association_id,
+                    };
+                    crate::namf_server::fire_location_change_report(&state.amf_ue, change);
+                }
                 // #570: the UE Radio Capability ID, when the UE has one (TS 38.413 §9.2.3.9).
                 let bytes = crate::racs::add_capability_ies(bytes, racs_id.as_deref(), None);
                 self.send_to_association(association_id, &bytes).await?;
@@ -21273,6 +21338,7 @@ fn apply_user_location(
     amf_ue.nr_tai.plmn_id = plmn_id_from_ngap_bytes(tai_plmn);
     amf_ue.nr_tai.tac =
         ((tai_tac[0] as u32) << 16) | ((tai_tac[1] as u32) << 8) | tai_tac[2] as u32;
+    amf_ue.stamp_location_now();
 }
 
 /// Convert a configured algorithm preference order into a support mask;
@@ -33486,6 +33552,327 @@ mod tests {
         sink.stop().await.expect("sink stop");
     }
 
+    /// A real LOCATION_REPORT subscriber over HTTP/2 for `supi`: an in-process
+    /// `SbiServer` that forwards every notify body, subscribed through the production
+    /// `namf_request_handler`. nextgsim#466.
+    async fn location_report_sink(
+        supi: &str,
+        tag: &str,
+    ) -> (nextgcore_sbi::SbiServer, mpsc::Receiver<String>) {
+        location_report_sink_filtered(supi, tag, None).await
+    }
+
+    /// [`location_report_sink`] with a `locationFilterList` on the event.
+    async fn location_report_sink_filtered(
+        supi: &str,
+        tag: &str,
+        filters: Option<&[&str]>,
+    ) -> (nextgcore_sbi::SbiServer, mpsc::Receiver<String>) {
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let (tx, rx) = mpsc::channel::<String>(16);
+        let sink = nextgcore_sbi::SbiServer::on_listener(
+            nextgcore_sbi::SbiServerConfig::new(format!("127.0.0.1:{port}").parse().expect("addr")),
+            listener,
+        );
+        sink.start(move |req: nextgcore_sbi::SbiRequest| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(req.http.content.clone().unwrap_or_default()).await;
+                nextgcore_sbi::SbiResponse::no_content()
+            }
+        })
+        .await
+        .expect("sink start");
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let resp = crate::namf_server::namf_request_handler(
+            nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&serde_json::json!({
+                    "subscription": {
+                        "eventList": [match filters {
+                            None => serde_json::json!({ "type": "LOCATION_REPORT" }),
+                            Some(f) => serde_json::json!({
+                                "type": "LOCATION_REPORT",
+                                "locationFilterList": f,
+                            }),
+                        }],
+                        "eventNotifyUri": format!("http://127.0.0.1:{port}/notify/{tag}"),
+                        "notifyCorrelationId": format!("corr-{tag}"),
+                        "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                        "supi": supi,
+                    }
+                }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 201, "the subscription must be created first");
+        (sink, rx)
+    }
+
+    /// The first LOCATION_REPORT body `rx` receives, as `(supi, tac, nrCellId)`.
+    async fn next_location_report(rx: &mut mpsc::Receiver<String>) -> (String, String, String) {
+        let body = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .expect("a LOCATION_REPORT must be delivered")
+            .expect("channel closed");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        let report = &v["reportList"][0];
+        assert_eq!(
+            report["type"].as_str(),
+            Some("LOCATION_REPORT"),
+            "body was {v}"
+        );
+        let nr = &report["location"]["nrLocation"];
+        (
+            report["supi"].as_str().unwrap_or_default().to_string(),
+            nr["tai"]["tac"].as_str().unwrap_or_default().to_string(),
+            nr["ncgi"]["nrCellId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        )
+    }
+
+    /// **nextgsim#466, TS 29.518 Table 6.2.6.3.3-1** (`29518-k00.txt:23958-23966`):
+    /// LOCATION_REPORT carries the *"Updated Location ... when AMF becomes aware of a
+    /// location change of the UE"*. For an N2 handover that moment is the HANDOVER
+    /// NOTIFY, whose `UserLocationInformation` names the target cell. Driven through
+    /// the production handler with a real APER PDU and observed at a real subscriber.
+    ///
+    /// The UE starts at cell 0x3_3333 / TAC 0x0466 and the Notify carries cell 0x42 /
+    /// TAC 0x0001, so a report of the source cell (an emitter placed before the
+    /// location write) fails the cell assertion.
+    ///
+    /// REVERT-VERIFIED: deleting the `fire_location_report` call from
+    /// `handle_handover_notify` times the recv out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handover_notify_reports_the_target_cell_as_a_location_report() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        let mut server = test_ngap_server().await;
+        // Ids of this test's own: 94_00x is the #400 sibling above, 78_00x the #70 tests.
+        let (source, target) = (94_661u64, 94_662u64);
+        let amf_ue_ngap_id = 78_466u64;
+        let supi = "imsi-001010000466001";
+        seed_gnb_session(&server, source).await;
+        seed_gnb_session(&server, target).await;
+
+        let mut state = UeNasContext::new(amf_ue_ngap_id, 41u32, source, false);
+        state.amf_ue.supi = Some(supi.to_string());
+        state.amf_ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        state.amf_ue.nr_tai.tac = 0x0466;
+        state.amf_ue.nr_cgi.plmn_id = PlmnId::new("001", "01");
+        state.amf_ue.nr_cgi.cell_id = 0x0003_3333;
+        let ue_snapshot = state.amf_ue.clone();
+        server.ue_auth_state.insert(amf_ue_ngap_id, state);
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_publish(&ue_snapshot, 41, source);
+        }
+        let (sink, mut rx) = location_report_sink(supi, "466-ho").await;
+        // An inter-TA handover changes the cell too, so a [CELL_ID] subscriber
+        // gets it as well as the filter-less (= [TAI]) one.
+        let (cell_sink, mut cell_rx) =
+            location_report_sink_filtered(supi, "466-ho-cell", Some(&["CELL_ID"])).await;
+
+        server
+            .handover_target_assoc
+            .insert(amf_ue_ngap_id, (target, 42));
+        server
+            .handle_handover_notify(target, &handover_notify_pdu(amf_ue_ngap_id, 42))
+            .await
+            .expect("handled");
+
+        let (got_supi, tac, cell) = next_location_report(&mut rx).await;
+        assert_eq!(got_supi, supi, "the report names THIS UE");
+        assert_eq!(
+            (tac.as_str(), cell.as_str()),
+            ("0001", "000000042"),
+            "the TARGET's TAI and cell, from the HandoverNotify's ULI, not the source's \
+             TAC 0466 / cell 000033333"
+        );
+        let (_, tac, cell) = next_location_report(&mut cell_rx).await;
+        assert_eq!((tac.as_str(), cell.as_str()), ("0001", "000000042"));
+        sink.stop().await.expect("sink stop");
+        cell_sink.stop().await.expect("sink stop");
+    }
+
+    /// **nextgsim#466, TS 29.518 Table 6.2.6.2.3-1** (`29518-k00.txt:21398-21404`): a
+    /// LOCATION_REPORT subscription without `locationFilterList` asks for TA changes
+    /// only. An INTRA-TA handover (same TAC 0x0001, cell 0x3_3333 to 0x42) therefore
+    /// reaches a `[CELL_ID]` subscriber and not a filter-less one. The CELL_ID report
+    /// is the positive control: both deliveries are spawned by the same fire, so once
+    /// it has arrived a filter-less one would have too.
+    ///
+    /// REVERT-VERIFIED: firing the unfiltered `fire_location_report` from
+    /// `handle_handover_notify` delivers to the filter-less subscriber and fails the
+    /// last assertion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_intra_ta_handover_reaches_only_a_cell_id_subscriber() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        let mut server = test_ngap_server().await;
+        let (source, target) = (94_663u64, 94_664u64);
+        let amf_ue_ngap_id = 78_467u64;
+        let supi = "imsi-001010000466003";
+        seed_gnb_session(&server, source).await;
+        seed_gnb_session(&server, target).await;
+        let mut state = UeNasContext::new(amf_ue_ngap_id, 41u32, source, false);
+        state.amf_ue.supi = Some(supi.to_string());
+        state.amf_ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        state.amf_ue.nr_tai.tac = 0x0001; // the target's TAC: intra-TA
+        state.amf_ue.nr_cgi.plmn_id = PlmnId::new("001", "01");
+        state.amf_ue.nr_cgi.cell_id = 0x0003_3333;
+        let ue_snapshot = state.amf_ue.clone();
+        server.ue_auth_state.insert(amf_ue_ngap_id, state);
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_publish(&ue_snapshot, 41, source);
+        }
+        let (plain, mut plain_rx) = location_report_sink(supi, "466-intra-plain").await;
+        let (cell, mut cell_rx) =
+            location_report_sink_filtered(supi, "466-intra-cell", Some(&["CELL_ID"])).await;
+
+        server
+            .handover_target_assoc
+            .insert(amf_ue_ngap_id, (target, 42));
+        server
+            .handle_handover_notify(target, &handover_notify_pdu(amf_ue_ngap_id, 42))
+            .await
+            .expect("handled");
+
+        let (_, tac, nci) = next_location_report(&mut cell_rx).await;
+        assert_eq!((tac.as_str(), nci.as_str()), ("0001", "000000042"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), plain_rx.recv())
+                .await
+                .is_err(),
+            "a subscription without locationFilterList asked for TA changes only"
+        );
+        plain.stop().await.expect("sink stop");
+        cell.stop().await.expect("sink stop");
+    }
+
+    /// nextgsim#466: the `locationFilterList` matrix (Table 6.2.6.3.5-1).
+    #[test]
+    fn location_filters_select_the_changed_dimensions() {
+        use crate::context::LocationChange;
+        let sub = |f: &[&str]| crate::context::EventSubscription {
+            subscription_id: "sub-466-matrix".to_string(),
+            notify_uri: "http://127.0.0.1:1/n".to_string(),
+            notify_correlation_id: String::new(),
+            nf_id: String::new(),
+            event_types: vec!["LOCATION_REPORT".to_string()],
+            supi: None,
+            gpsi: None,
+            pei: None,
+            group_id: None,
+            any_ue: true,
+            expiry: None,
+            subs_change_notify_uri: None,
+            subs_change_notify_correlation_id: None,
+            areas: Vec::new(),
+            reported_presence: std::collections::HashMap::new(),
+            reporting_threshold: None,
+            location_filters: f.iter().map(|s| s.to_string()).collect(),
+        };
+        let cell_only = LocationChange {
+            cell: true,
+            ran_node: true,
+            ..Default::default()
+        };
+        let ta = LocationChange {
+            tai: true,
+            cell: true,
+            ran_node: true,
+        };
+        assert!(
+            !sub(&[]).wants_location_change(cell_only),
+            "absent = TAI only"
+        );
+        assert!(sub(&[]).wants_location_change(ta));
+        assert!(sub(&["CELL_ID"]).wants_location_change(cell_only));
+        assert!(sub(&["RAN_NODE"]).wants_location_change(cell_only));
+        assert!(!sub(&["TAI"]).wants_location_change(cell_only));
+        assert!(
+            !sub(&["N3IWF"]).wants_location_change(ta),
+            "not observable here"
+        );
+        assert!(!sub(&["CELL_ID"]).wants_location_change(LocationChange::default()));
+    }
+
+    /// **nextgsim#466**, the Xn half: an Xn handover produces no HandoverNotify, so the
+    /// PATH SWITCH REQUEST is the AMF's only notice that the UE moved (TS 23.502
+    /// §4.9.1.2.2 step 1b), and its Acknowledge is where the LOCATION_REPORT fires
+    /// (TS 29.518 Table 6.2.6.3.3-1). A stand-in SMF switches the session, so the
+    /// outcome is an Acknowledge and the relocation is committed.
+    ///
+    /// REVERT-VERIFIED: deleting the `fire_location_report` call from
+    /// `finish_path_switch` times the recv out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_path_switch_acknowledge_reports_the_target_cell_as_a_location_report() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let amf_ue_ngap_id = 7_466_002u64;
+        let supi = "imsi-001010000466002";
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 76, 1, false);
+        ue_ctx.registered = true;
+        ue_ctx.amf_ue.supi = Some(supi.to_string());
+        ue_ctx.amf_ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        ue_ctx.amf_ue.nr_tai.tac = 0x000466;
+        ue_ctx.amf_ue.nr_cgi.plmn_id = PlmnId::new("001", "01");
+        ue_ctx.amf_ue.nr_cgi.cell_id = 0x0003_3333;
+        let ue_snapshot = ue_ctx.amf_ue.clone();
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_publish(&ue_snapshot, 76, 1);
+        }
+        let (sink, mut rx) = location_report_sink(supi, "466-ps").await;
+
+        let pdu = nextgcore_ngap::builder::build_path_switch_request(
+            &nextgcore_ngap::types::PathSwitchRequest {
+                ran_ue_ngap_id: 88,
+                source_amf_ue_ngap_id: amf_ue_ngap_id,
+                user_location_info: test_user_location(0x0E0F10, 0x0007_7777),
+                ue_security_capabilities: nextgcore_ngap::types::UeSecurityCapabilities {
+                    nr_encryption_algorithms: 0x8000,
+                    nr_integrity_algorithms: 0x8000,
+                    eutra_encryption_algorithms: 0,
+                    eutra_integrity_algorithms: 0,
+                },
+                pdu_session_list: vec![nextgcore_ngap::types::PduSessionResourceSwitchItem {
+                    pdu_session_id: 1,
+                    transfer: vec![0x00],
+                }],
+                failed_list: None,
+            },
+        )
+        .expect("encode a PathSwitchRequest");
+        let (_smf, smf_port, _calls) = handler_tests::path_switch_smf().await;
+        ngap.sm_context_refs
+            .insert((amf_ue_ngap_id, 1), "ps466-1".to_string());
+        ngap.sm_context_smfs
+            .insert((amf_ue_ngap_id, 1), ("127.0.0.1".to_string(), smf_port));
+        ngap.sent_ngap = Some(Vec::new());
+        let _ = ngap.handle_path_switch_request(2, &pdu).await;
+        drive_sbi(&mut ngap).await;
+        let sent = take_sent_ngap(&mut ngap);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].1[0], 0x20, "a PATH SWITCH REQUEST ACKNOWLEDGE");
+
+        let (got_supi, tac, cell) = next_location_report(&mut rx).await;
+        assert_eq!(got_supi, supi, "the report names THIS UE");
+        assert_eq!(
+            (tac.as_str(), cell.as_str()),
+            ("0E0F10", "000077777"),
+            "the TARGET's TAI and cell from the PATH SWITCH REQUEST, not the source's"
+        );
+        sink.stop().await.expect("sink stop");
+    }
+
     /// An ERROR INDICATION's `(amf id, ran id, radio-network cause)`; `None` otherwise.
     fn decoded_error_indication_ids(pdu: &[u8]) -> Option<(Option<u64>, Option<u32>, Option<u8>)> {
         use nextgcore_ngap_gen::generated as g;
@@ -34870,6 +35257,16 @@ mod tests {
         assert_eq!(
             state.amf_ue.nr_tai.tac, reg_tac,
             "the TAI is still stored at registration too"
+        );
+        // nextgsim#488: the ULI is stamped as acquired now (seconds since the epoch).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_secs();
+        assert!(
+            (now.saturating_sub(5)..=now).contains(&state.amf_ue.ue_location_timestamp),
+            "ue_location_timestamp {} is not this message's arrival",
+            state.amf_ue.ue_location_timestamp
         );
     }
 
@@ -36914,6 +37311,7 @@ mod tests {
                 areas: Vec::new(),
                 reported_presence: std::collections::HashMap::new(),
                 reporting_threshold: None,
+                location_filters: Vec::new(),
             });
         }
 
@@ -37040,6 +37438,7 @@ mod tests {
                 areas: Vec::new(),
                 reported_presence: std::collections::HashMap::new(),
                 reporting_threshold: None,
+                location_filters: Vec::new(),
             });
         }
         (sink, rx)

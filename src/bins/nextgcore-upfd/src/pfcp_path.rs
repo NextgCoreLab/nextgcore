@@ -607,6 +607,9 @@ fn note_refusal(what: std::fmt::Arguments<'_>) {
     }
 }
 
+/// #1389 part 2: N6 Delay Measurement Report IEs per Node Report Request.
+pub const N6_REPORTS_PER_NODE_REPORT: usize = 16;
+
 /// Async PFCP server for handling SMF requests
 pub struct PfcpServer {
     socket: Arc<UdpSocket>,
@@ -649,6 +652,8 @@ pub struct PfcpServer {
     /// (`--gtpu-path-qos-monitoring`). Only then is GPQM advertised and GTP-U
     /// Path QoS Control Information acted on.
     gpqm: AtomicBool,
+    /// #1389 part 2: N6 delay measurement (UN6DM) enabled.
+    un6dm: AtomicBool,
     /// UPF-initiated requests awaiting a response, tracked by sequence number
     /// for T1/N1 retransmission (TS 29.244 §7.2.2.3). Currently used for
     /// Session Report Requests (Downlink Data / Error Indication Reports).
@@ -984,6 +989,7 @@ impl PfcpServer {
             associated: Arc::new(AtomicBool::new(false)),
             data_plane: std::sync::RwLock::new(None),
             gpqm: AtomicBool::new(false),
+            un6dm: AtomicBool::new(false),
             pending_reports: tokio::sync::Mutex::new(HashMap::new()),
             heartbeat: tokio::sync::Mutex::new(HeartbeatState::default()),
             allowed_peers: std::sync::RwLock::new(PeerAllowlist::default()),
@@ -1132,6 +1138,7 @@ impl PfcpServer {
             self.publish_associated(&association);
         }
         self.clear_path_qos_control();
+        self.clear_n6_delay_control();
         self.delete_association_sessions(peer, reason).await;
     }
 
@@ -1707,13 +1714,15 @@ impl PfcpServer {
         // #1389: a new association replaces the GTP-U path QoS monitoring with
         // what this request provisions (none clears it).
         self.apply_path_qos_control(payload, true);
+        // #1389 part 2: likewise the N6 delay measurement (§5.33.8.2).
+        self.apply_n6_delay_control(payload, true);
 
         let resp_payload = build_association_setup_response(
             &self.local_node_id,
             self.recovery_time_stamp,
             PfcpCause::RequestAccepted,
             sessions_retained,
-            self.gpqm(),
+            self.optional_features(),
         );
 
         let response = self.build_response(
@@ -1741,7 +1750,7 @@ impl PfcpServer {
             self.recovery_time_stamp,
             PfcpCause::RequestRejected,
             false,
-            self.gpqm(),
+            self.optional_features(),
         );
         let response = self.build_response(
             pfcp_type::ASSOCIATION_SETUP_RESPONSE,
@@ -2979,6 +2988,135 @@ impl PfcpServer {
         self.gpqm.load(Ordering::Relaxed)
     }
 
+    /// #1389 part 2: enable N6 delay measurement and reporting (UN6DM, TS 29.244
+    /// §5.33.8).
+    pub fn set_n6_delay_measurement(&self, enabled: bool) {
+        self.un6dm.store(enabled, Ordering::Relaxed);
+    }
+
+    fn un6dm(&self) -> bool {
+        self.un6dm.load(Ordering::Relaxed)
+    }
+
+    fn optional_features(&self) -> crate::n4_build::OptionalFeatures {
+        crate::n4_build::OptionalFeatures {
+            gpqm: self.gpqm(),
+            un6dm: self.un6dm(),
+        }
+    }
+
+    /// #1389 part 2: apply the N6 Delay Measurement Control Information of an
+    /// Association Setup (`setup`: replaces everything) or Update Request
+    /// (§5.33.8.2: per instance). Ignored unless UN6DM is enabled: a UPF that did
+    /// not advertise the feature does not act on it.
+    fn apply_n6_delay_control(&self, payload: &[u8], setup: bool) {
+        if !self.un6dm() {
+            return;
+        }
+        let values = crate::n4_build::n6_delay_control_values(payload);
+        let Some(dp) = self.data_plane.read().unwrap().clone() else {
+            return;
+        };
+        let mut m = dp.n6_delay.lock().unwrap();
+        if setup {
+            use nextgcore_pfcp::qos_monitoring::{N6DelayMeasurementControlInformation, TypedIe};
+            let ies: Vec<_> = values
+                .iter()
+                .filter_map(
+                    |v| match N6DelayMeasurementControlInformation::decode_value(v) {
+                        Ok(ie) => Some(ie),
+                        Err(e) => {
+                            log::warn!("N6 Delay Measurement Control Information ignored: {e}");
+                            None
+                        }
+                    },
+                )
+                .collect();
+            m.configure(&ies);
+        } else if !values.is_empty() {
+            m.apply_update(&values);
+        }
+    }
+
+    /// #1389 part 2: stop N6 delay measurement (the association is gone).
+    fn clear_n6_delay_control(&self) {
+        if let Some(dp) = self.data_plane.read().unwrap().as_ref() {
+            dp.n6_delay.lock().unwrap().clear();
+        }
+    }
+
+    /// #1389 part 2: report N6 delay measurements to the CP function in PFCP
+    /// Node Report Requests with N6DR (§5.33.8.3, §7.4.5.1), at most
+    /// [`N6_REPORTS_PER_NODE_REPORT`] IEs each so a message stays well under the
+    /// path MTU, each tracked for T1/N1 retransmission.
+    pub async fn send_n6_delay_report(
+        &self,
+        reports: &[nextgcore_pfcp::qos_monitoring::N6DelayMeasurementReport],
+    ) -> Result<(), String> {
+        if reports.is_empty() {
+            return Err("no N6 delay measurement reports".to_string());
+        }
+        for chunk in reports.chunks(N6_REPORTS_PER_NODE_REPORT) {
+            let payload = crate::n4_build::build_n6_delay_node_report(&self.local_node_id, chunk);
+            let peer = self.send_tracked_node_report(&payload).await?;
+            for r in chunk {
+                let a = r.measurement_endpoint_address;
+                let endpoint = a
+                    .ipv4
+                    .map(IpAddr::from)
+                    .or(a.ipv6.map(IpAddr::from))
+                    .map_or_else(|| "?".to_string(), |ip| ip.to_string());
+                let t = r.measurement_reporting_type;
+                let kind = [(t.per, "PER"), (t.evt, "EVT"), (t.ire, "IRE")]
+                    .iter()
+                    .filter(|(on, _)| *on)
+                    .map(|(_, k)| *k)
+                    .collect::<Vec<_>>()
+                    .join("+");
+                match (r.information, r.failure_information) {
+                    (Some(i), _) => log::info!(
+                        "N6 delay report to {peer}: endpoint {endpoint} {kind} avg {} ms \
+                         min {:?} max {:?}",
+                        i.average_packet_delay,
+                        i.minimum_packet_delay,
+                        i.maximum_packet_delay
+                    ),
+                    (None, f) => log::info!(
+                        "N6 delay report to {peer}: endpoint {endpoint} {kind} FAILURE cause {:?}",
+                        f.map(|f| f.cause)
+                    ),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Send a UPF-initiated Node Report Request with `payload` to the associated
+    /// CP function, tracked for T1/N1 retransmission. Returns the peer.
+    async fn send_tracked_node_report(&self, payload: &[u8]) -> Result<SocketAddr, String> {
+        let Some(peer) = self.association.read().await.as_ref().map(|a| a.peer_addr) else {
+            return Err("no PFCP association: no CP function to report to".to_string());
+        };
+        let seq = self.alloc_seq();
+        let message = self.build_response(pfcp_type::NODE_REPORT_REQUEST, 0, seq, payload, false);
+        self.pending_reports.lock().await.insert(
+            seq,
+            PendingReport {
+                message: message.clone(),
+                dest: peer,
+                upf_seid: 0,
+                attempts: 0,
+                last_sent: std::time::Instant::now(),
+                usage: Vec::new(),
+            },
+        );
+        if let Err(e) = self.socket.send_to(&message, peer).await {
+            self.pending_reports.lock().await.remove(&seq);
+            return Err(format!("Failed to send Node Report Request: {e}"));
+        }
+        Ok(peer)
+    }
+
     /// #1389: apply the GTP-U Path QoS Control Information of an Association
     /// Setup or Update Request (§5.24.5.2). Ignored unless GPQM is enabled: a
     /// UPF that did not advertise the feature does not act on it.
@@ -3017,28 +3155,9 @@ impl PfcpServer {
         if reports.is_empty() {
             return Err("no GTP-U path QoS reports".to_string());
         }
-        let Some(peer) = self.association.read().await.as_ref().map(|a| a.peer_addr) else {
-            return Err("no PFCP association: no CP function to report to".to_string());
-        };
         let payload =
             crate::n4_build::build_gtpu_path_qos_node_report(&self.local_node_id, reports);
-        let seq = self.alloc_seq();
-        let message = self.build_response(pfcp_type::NODE_REPORT_REQUEST, 0, seq, &payload, false);
-        self.pending_reports.lock().await.insert(
-            seq,
-            PendingReport {
-                message: message.clone(),
-                dest: peer,
-                upf_seid: 0,
-                attempts: 0,
-                last_sent: std::time::Instant::now(),
-                usage: Vec::new(),
-            },
-        );
-        if let Err(e) = self.socket.send_to(&message, peer).await {
-            self.pending_reports.lock().await.remove(&seq);
-            return Err(format!("Failed to send Node Report Request: {e}"));
-        }
+        let peer = self.send_tracked_node_report(&payload).await?;
         for r in reports {
             log::info!(
                 "GTP-U path QoS report to {peer}: peer {:?}{:?} trigger {:?} avg {} ms",
@@ -3088,13 +3207,14 @@ impl PfcpServer {
             }
             (Some(_), true) => {
                 self.apply_path_qos_control(payload, false);
+                self.apply_n6_delay_control(payload, false);
                 PfcpCause::RequestAccepted
             }
         };
         let mut resp_payload = crate::n4_build::build_association_update_response(
             &self.local_node_id,
             cause,
-            self.gpqm(),
+            self.optional_features(),
         );
         if cause == PfcpCause::MandatoryIeMissing {
             let mut offending = crate::n4_build::PfcpMessageBuilder::new();
@@ -4151,6 +4271,236 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         panic!("the Node Report Response did not stop retransmission");
+    }
+
+    /// IE 355 for one STAMP endpoint, immediate reporting (#1389 part 2).
+    fn n6_delay_control_ie(id: u16, endpoint: [u8; 4]) -> Vec<u8> {
+        use nextgcore_pfcp::qos_monitoring::{
+            MeasurementEndpointAddress, MeasurementReportingType,
+            N6DelayMeasurementControlInformation, N6DelayMeasurementProtocols, TypedIe,
+        };
+        let mut buf = bytes::BytesMut::new();
+        N6DelayMeasurementControlInformation {
+            id,
+            measurement_endpoint_addresses: vec![MeasurementEndpointAddress {
+                ipv4: Some(endpoint),
+                ipv6: None,
+            }],
+            network_instance: b"\x08internet".to_vec(),
+            measurement_protocols: vec![N6DelayMeasurementProtocols {
+                stamp: true,
+                ..Default::default()
+            }],
+            measurement_reporting_type: MeasurementReportingType {
+                ire: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .encode_ie(&mut buf);
+        buf.to_vec()
+    }
+
+    fn n6_ids(dp: &crate::data_plane::DataPlane) -> Vec<u16> {
+        dp.n6_delay
+            .lock()
+            .unwrap()
+            .controls()
+            .map(|c| c.id)
+            .collect()
+    }
+
+    fn find(resp: &[u8], ie: u16) -> Option<Vec<u8>> {
+        let (_, body) = ParsedPfcpHeader::parse(resp).unwrap();
+        ParsedIe::find_ie(&ParsedIe::parse_all(body), ie).map(|i| i.value.clone())
+    }
+
+    /// #1389 part 2: OFF by default. An SMF that provisions N6 Delay Measurement
+    /// Control Information to a UPF without `--n6-delay-measurement` gets the same
+    /// 8-octet features as before, no N6 Delay Measurement Protocols IE, and
+    /// nothing is measured.
+    #[tokio::test]
+    async fn n6_delay_control_is_ignored_unless_enabled() {
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        server.set_data_plane(dp.clone());
+        let mut payload = build_association_setup_request_payload(Some(0x5000_0000));
+        payload.extend_from_slice(&n6_delay_control_ie(1, [10, 0, 0, 1]));
+        let resp = exchange(&smf, addr, &encode_pfcp(5, None, 1, &payload)).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(up_features(&resp), vec![0x10, 0x01, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(find(&resp, 354), None);
+        assert!(!dp.n6_delay.lock().unwrap().is_active());
+        let mut upd = crate::n4_build::PfcpMessageBuilder::new();
+        upd.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        let mut upd = upd.build();
+        upd.extend_from_slice(&n6_delay_control_ie(2, [10, 0, 0, 2]));
+        let resp = exchange(&smf, addr, &encode_pfcp(7, None, 2, &upd)).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(up_features(&resp), vec![0x10, 0x01, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(find(&resp, 354), None);
+        assert!(!dp.n6_delay.lock().unwrap().is_active());
+    }
+
+    /// #1389 part 2 (TS 29.244 §5.33.8.1-2, §8.2.25): enabled, the UPF advertises
+    /// UN6DM (octet 14 bit 2, so 10 octets) and STAMP in IE 354, applies IE 355
+    /// from the Association Setup, updates it per instance, ignores a foreign
+    /// Update (cause 72), and the release clears it.
+    #[tokio::test]
+    async fn n6_delay_control_follows_setup_update_and_release() {
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        server.set_n6_delay_measurement(true);
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        server.set_data_plane(dp.clone());
+        let mut payload = build_association_setup_request_payload(Some(0x5000_0000));
+        payload.extend_from_slice(&n6_delay_control_ie(1, [10, 0, 0, 1]));
+        let resp = exchange(&smf, addr, &encode_pfcp(5, None, 1, &payload)).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(
+            up_features(&resp),
+            vec![0x10, 0x01, 0, 0, 0, 0, 0, 0, 0, 0x02]
+        );
+        assert_eq!(find(&resp, 354), Some(vec![0x04]), "STAMP");
+        assert_eq!(n6_ids(&dp), vec![1]);
+
+        // The Update adds instance 2 and keeps 1.
+        let node = |b: &mut crate::n4_build::PfcpMessageBuilder| {
+            b.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        };
+        let mut upd = crate::n4_build::PfcpMessageBuilder::new();
+        node(&mut upd);
+        let mut upd = upd.build();
+        upd.extend_from_slice(&n6_delay_control_ie(2, [10, 0, 0, 2]));
+        let resp = exchange(&smf, addr, &encode_pfcp(7, None, 2, &upd)).await;
+        assert_eq!(resp[1], pfcp_type::ASSOCIATION_UPDATE_RESPONSE);
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(up_features(&resp).len(), 10);
+        assert_eq!(find(&resp, 354), Some(vec![0x04]));
+        assert_eq!(n6_ids(&dp), vec![1, 2]);
+
+        // A foreign Node ID: cause 72, nothing changes.
+        let mut other = crate::n4_build::PfcpMessageBuilder::new();
+        other.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 1)));
+        let mut other = other.build();
+        other.extend_from_slice(&[0x01, 0x63, 0x00, 0x00]); // IE 355, null length
+        let resp = exchange(&smf, addr, &encode_pfcp(7, None, 3, &other)).await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::NoEstablishedPfcpAssociation as u8
+        );
+        assert_eq!(n6_ids(&dp), vec![1, 2]);
+
+        // ID alone stops instance 1.
+        let mut stop1 = crate::n4_build::PfcpMessageBuilder::new();
+        node(&mut stop1);
+        let mut stop1 = stop1.build();
+        stop1.extend_from_slice(&[0x01, 0x63, 0x00, 0x06, 0x01, 0x79, 0x00, 0x02, 0x00, 0x01]);
+        let resp = exchange(&smf, addr, &encode_pfcp(7, None, 4, &stop1)).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(n6_ids(&dp), vec![2]);
+
+        // An Update without IE 355 keeps it; one with a null-length IE 355 stops all.
+        let mut bare = crate::n4_build::PfcpMessageBuilder::new();
+        node(&mut bare);
+        exchange(&smf, addr, &encode_pfcp(7, None, 5, &bare.build())).await;
+        assert_eq!(n6_ids(&dp), vec![2]);
+        let mut all = crate::n4_build::PfcpMessageBuilder::new();
+        node(&mut all);
+        let mut all = all.build();
+        all.extend_from_slice(&[0x01, 0x63, 0x00, 0x00]);
+        exchange(&smf, addr, &encode_pfcp(7, None, 6, &all)).await;
+        assert!(n6_ids(&dp).is_empty());
+
+        // Provision again, then the release clears it.
+        let mut again = crate::n4_build::PfcpMessageBuilder::new();
+        node(&mut again);
+        let mut again = again.build();
+        again.extend_from_slice(&n6_delay_control_ie(3, [10, 0, 0, 3]));
+        exchange(&smf, addr, &encode_pfcp(7, None, 7, &again)).await;
+        assert_eq!(n6_ids(&dp), vec![3]);
+        let mut rel = crate::n4_build::PfcpMessageBuilder::new();
+        node(&mut rel);
+        let resp = exchange(&smf, addr, &encode_pfcp(9, None, 8, &rel.build())).await;
+        assert_eq!(resp[1], pfcp_type::ASSOCIATION_RELEASE_RESPONSE);
+        assert!(!dp.n6_delay.lock().unwrap().is_active());
+    }
+
+    /// #1389 part 2, mixed versions: the Association Setup Response of a UPF with
+    /// UN6DM on (10-octet features, IE 354) decodes with the shared library
+    /// decoder an unchanged smfd uses (`AssociationSetupResponse::decode`), with
+    /// FTUP and EMPU intact; the extra IE is skipped.
+    #[tokio::test]
+    async fn un6dm_setup_response_decodes_in_an_unchanged_smf() {
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        server.set_n6_delay_measurement(true);
+        let payload = build_association_setup_request_payload(Some(0x5000_0000));
+        let resp = exchange(&smf, addr, &encode_pfcp(5, None, 1, &payload)).await;
+        let (_, body) = ParsedPfcpHeader::parse(&resp).unwrap();
+        let mut b = bytes::Bytes::copy_from_slice(body);
+        let decoded = nextgcore_pfcp::message::AssociationSetupResponse::decode(&mut b).unwrap();
+        let f = decoded.up_function_features.expect("features");
+        assert!(f.ftup && f.empu && f.un6dm && !f.gpqm);
+        assert_eq!(decoded.cause as u8, PfcpCause::RequestAccepted as u8);
+    }
+
+    /// #1389 part 2: N6 delay reports go out as Node Report Requests with N6DR
+    /// (bit 7) and IE 356, at most 16 per message, each tracked until answered.
+    #[tokio::test]
+    async fn n6_delay_reports_go_out_as_node_reports() {
+        use nextgcore_pfcp::qos_monitoring::{
+            MeasurementEndpointAddress, MeasurementReportingType, N6DelayMeasurementInformation,
+            N6DelayMeasurementReport, TypedIe,
+        };
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        let payload = build_association_setup_request_payload(Some(0x5000_0000));
+        exchange(&smf, addr, &encode_pfcp(5, None, 1, &payload)).await;
+        let report = |i: u8| N6DelayMeasurementReport {
+            measurement_endpoint_address: MeasurementEndpointAddress {
+                ipv4: Some([10, 0, 1, i]),
+                ipv6: None,
+            },
+            network_instance: b"\x08internet".to_vec(),
+            measurement_reporting_type: MeasurementReportingType {
+                ire: true,
+                ..Default::default()
+            },
+            time_stamp: 0xe8a0_0000,
+            information: Some(N6DelayMeasurementInformation {
+                average_packet_delay: 21,
+                minimum_packet_delay: Some(21),
+                maximum_packet_delay: Some(21),
+            }),
+            ..Default::default()
+        };
+        let reports: Vec<_> = (0..20).map(report).collect();
+        server.send_n6_delay_report(&reports).await.unwrap();
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 4096];
+        for _ in 0..2 {
+            let (n, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), smf.recv_from(&mut buf))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(buf[1], pfcp_type::NODE_REPORT_REQUEST);
+            let (_, body) = ParsedPfcpHeader::parse(&buf[..n]).unwrap();
+            let ies = ParsedIe::parse_all(body);
+            let t = ParsedIe::find_ie(&ies, pfcp_ie::NODE_REPORT_TYPE).unwrap();
+            assert_eq!(t.value, vec![0x40], "N6DR (bit 7)");
+            let these: Vec<_> = ies
+                .iter()
+                .filter(|ie| ie.ie_type == 356)
+                .map(|ie| N6DelayMeasurementReport::decode_value(&ie.value).unwrap())
+                .collect();
+            assert!(these.len() <= N6_REPORTS_PER_NODE_REPORT);
+            got.extend(these);
+        }
+        assert_eq!(got, reports);
+        assert_eq!(server.pending_report_count().await, 2);
     }
 
     /// #935 (TS 29.244 §7.4.5.1, Tables 7.4.5.1.2-1/7.4.5.1.3-1) on the wire: a path

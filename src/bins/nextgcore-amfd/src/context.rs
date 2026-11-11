@@ -1215,6 +1215,52 @@ pub struct EventSubscription {
     /// Retained rather than dropped so the subscription echo round-trips what the
     /// consumer sent, for the reason the `gpsi` echo exists.
     pub reporting_threshold: Option<i64>,
+    /// `locationFilterList` of the subscription's LOCATION_REPORT event, as
+    /// `LocationFilter` tokens (`TAI`, `CELL_ID`, `RAN_NODE`, ...). nextgsim#466.
+    ///
+    /// TS 29.518 Table 6.2.6.2.3-1 (`29518-k00.txt:21398-21404`): *"If this
+    /// attribute is not present in the request, it indicates the change of the TA
+    /// used by the UE should be reported"*. So empty means `[TAI]`; see
+    /// [`EventSubscription::wants_location_change`].
+    pub location_filters: Vec<String>,
+}
+
+/// Which parts of a UE's location a relocation changed, for the
+/// `locationFilterList` of LOCATION_REPORT subscriptions (TS 29.518
+/// Table 6.2.6.3.5-1, `29518-k00.txt:24227-24245`). nextgsim#466.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LocationChange {
+    /// The TAI changed (`TAI`).
+    pub tai: bool,
+    /// The NR cell changed (`CELL_ID`).
+    pub cell: bool,
+    /// The serving RAN node changed (`RAN_NODE`).
+    pub ran_node: bool,
+}
+
+impl LocationChange {
+    /// Whether anything changed.
+    pub fn any(&self) -> bool {
+        self.tai || self.cell || self.ran_node
+    }
+}
+
+impl EventSubscription {
+    /// Whether this subscription's `locationFilterList` asks for a report of
+    /// `change`: any listed dimension that changed, with an absent list meaning
+    /// `[TAI]` (Table 6.2.6.2.3-1). Tokens this AMF cannot observe (`N3IWF`,
+    /// `UE_IP`, ...) never match.
+    pub fn wants_location_change(&self, change: LocationChange) -> bool {
+        if self.location_filters.is_empty() {
+            return change.tai;
+        }
+        self.location_filters.iter().any(|f| match f.as_str() {
+            "TAI" => change.tai,
+            "CELL_ID" => change.cell,
+            "RAN_NODE" => change.ran_node,
+            _ => false,
+        })
+    }
 }
 
 /// AMFStatusChange subscription stored in the AMF context (TS 29.518 §5.2.2.5.1,
@@ -3674,7 +3720,10 @@ pub struct AmfUe {
     pub nr_tai: Tai5gs,
     /// NR CGI
     pub nr_cgi: NrCgi,
-    /// UE location timestamp
+    /// When `nr_tai`/`nr_cgi` were last learnt from the RAN, in seconds since the
+    /// Unix epoch; 0 while unknown. Written by [`AmfUe::stamp_location_now`]; read as
+    /// `NrLocation.ueLocationTimestamp` (TS 29.571 §5.4.4.9), `lastActTime` and the
+    /// NGAP location age.
     pub ue_location_timestamp: u64,
     /// Last visited PLMN ID
     pub last_visited_plmn_id: PlmnId,
@@ -4093,6 +4142,19 @@ pub enum SnpnOnboardingState {
 }
 
 impl AmfUe {
+    /// Record that the UE's location (`nr_tai`/`nr_cgi`) was acquired now.
+    ///
+    /// Called wherever the AMF stores a User Location Information the RAN just
+    /// reported (nextgsim#488). TS 29.571 §5.4.4.9: `ueLocationTimestamp` is "the UTC
+    /// time when the UeLocation information was acquired". Seconds, the unit every
+    /// reader of `ue_location_timestamp` assumes.
+    pub fn stamp_location_now(&mut self) {
+        self.ue_location_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+    }
+
     /// Clear every piece of long-lived key material this UE context holds
     /// (#115, TS 33.501 §5.9 / §6.2).
     ///

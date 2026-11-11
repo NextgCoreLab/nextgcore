@@ -1,0 +1,19 @@
+# Demo D446A (nextgsim#483): load-balancing vs energy-saving agents over a
+# booster cell. The demo base (deploy/eks/overlays/demo) plus a second gNB and
+# the demo's gNB/UE configs. The gNB image must be built with
+# `--features demo-d446a-agent-conflict` (SIM_IMAGE_TAG=demo-d446a-<sha>).
+# ClusterIP only.
+#
+#   k8s/demo-check.sh d446a-agent-conflict load-balancing|energy-saving
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: nextg-demo
+
+resources:
+  - ../demo
+  - toggles.yaml
+  - gnb-a.yaml
+
+patches:
+  - path: configs-patch.yaml

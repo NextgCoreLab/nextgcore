@@ -977,12 +977,41 @@ fn tai_json(tai: &Tai5gs) -> Value {
 
 /// NrLocation user-location JSON for a UE (TS 29.571 UserLocation)
 fn nr_location_json(ue: &AmfUe) -> Value {
-    json!({
-        "nrLocation": {
-            "tai": tai_json(&ue.nr_tai),
-            "ncgi": ncgi_json(&ue.nr_cgi),
-        }
-    })
+    let mut nr_location = json!({
+        "tai": tai_json(&ue.nr_tai),
+        "ncgi": ncgi_json(&ue.nr_cgi),
+    });
+    // TS 29.571 §5.4.4.9 `NrLocation.ueLocationTimestamp` (O, DateTime): "the UTC time
+    // when the UeLocation information was acquired". Omitted while unknown, rather than
+    // claiming the epoch (nextgsim#488).
+    if let Some(acquired) = location_acquired_at(ue) {
+        nr_location["ueLocationTimestamp"] = json!(system_time_to_rfc3339(acquired));
+    }
+    json!({ "nrLocation": nr_location })
+}
+
+/// How far ahead of now a stored location stamp may be and still be believed:
+/// clock skew between an AMF that wrote a record and the one restoring it.
+pub(crate) const LOCATION_STAMP_FUTURE_SLACK_SECS: u64 = 86_400;
+
+/// When `ue`'s stored location was acquired, or `None` when that is unknown: the
+/// stamp is 0, or it is not a plausible time (later than now plus
+/// [`LOCATION_STAMP_FUTURE_SLACK_SECS`], or beyond what a `SystemTime` holds). A
+/// corrupt stamp, from a damaged store record for instance, is "no timestamp",
+/// never a panic in the `SystemTime` arithmetic (nextgsim#488 review).
+pub(crate) fn location_acquired_at(ue: &AmfUe) -> Option<std::time::SystemTime> {
+    let secs = ue.ue_location_timestamp;
+    if secs == 0 {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if secs > now.saturating_add(LOCATION_STAMP_FUTURE_SLACK_SECS) {
+        return None;
+    }
+    std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(secs))
 }
 
 // ============================================================================
@@ -1042,7 +1071,7 @@ fn rfc3339_now() -> String {
 
 /// Parse an RFC 3339 timestamp ("YYYY-MM-DDTHH:MM:SS[.frac](Z|±hh:mm)") into
 /// a SystemTime. Returns None on malformed input (never panics).
-fn rfc3339_to_system_time(s: &str) -> Option<std::time::SystemTime> {
+pub(crate) fn rfc3339_to_system_time(s: &str) -> Option<std::time::SystemTime> {
     let bytes = s.as_bytes();
     if bytes.len() < 20 {
         return None;
@@ -1403,6 +1432,9 @@ fn subscription_echo_json(sub: &EventSubscription) -> Value {
         "eventList": sub.event_types.iter()
             .map(|t| {
                 let mut event = json!({"type": t});
+                if t == "LOCATION_REPORT" && !sub.location_filters.is_empty() {
+                    event["locationFilterList"] = json!(sub.location_filters);
+                }
                 if !area_list.is_empty()
                     && matches!(t.as_str(), "PRESENCE_IN_AOI_REPORT" | "UES_IN_AREA_REPORT")
                 {
@@ -1501,6 +1533,8 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
     // the union, which is the only reading that reports every area it asked about.
     let mut areas: Vec<EventArea> = Vec::new();
     let mut reporting_threshold: Option<i64> = None;
+    // nextgsim#466: the LOCATION_REPORT event's `locationFilterList`.
+    let mut location_filters: Vec<String> = Vec::new();
     for event in event_list {
         let Some(event_type) = event.get("type").and_then(Value::as_str) else {
             return mandatory_ie_missing("subscription.eventList[].type");
@@ -1521,6 +1555,9 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
         areas.extend(parse_event_areas(event));
         if let Some(t) = event.get("reportingThreshold").and_then(Value::as_i64) {
             reporting_threshold = Some(t);
+        }
+        if event_type == "LOCATION_REPORT" {
+            location_filters = parse_location_filters(event);
         }
         // #400: the AOIEF filter IEs (`29518-k00.txt:21630-21707`, feature AOIEF) are
         // ACCEPTED and logged, never refused — they are optional IEs on a conformant
@@ -1702,6 +1739,7 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
         areas,
         reported_presence: std::collections::HashMap::new(),
         reporting_threshold,
+        location_filters,
     };
 
     // Immediate reports for events with immediateFlag (current state)
@@ -1916,6 +1954,12 @@ fn handle_event_subscription_modify(subscription_id: &str, request: &SbiRequest)
                 if event_types.is_empty() {
                     return mandatory_ie_incorrect("value", "eventList must not be empty");
                 }
+                // nextgsim#466: the replacement list carries its own filter.
+                sub.location_filters = list
+                    .iter()
+                    .find(|e| e.get("type").and_then(Value::as_str) == Some("LOCATION_REPORT"))
+                    .map(parse_location_filters)
+                    .unwrap_or_default();
                 sub.event_types = event_types;
             }
             ("replace", "/subscription/options/expiry") => {
@@ -2105,13 +2149,30 @@ pub fn fire_amf_event_for(
     pei: Option<&str>,
     extra: Value,
 ) {
+    fire_amf_event_matching(event_type, supi, gpsi, pei, extra, |_| true);
+}
+
+/// [`fire_amf_event_for`], delivered only to the matching subscriptions that
+/// `wants` accepts.
+fn fire_amf_event_matching(
+    event_type: &str,
+    supi: Option<&str>,
+    gpsi: Option<&str>,
+    pei: Option<&str>,
+    extra: Value,
+    wants: impl Fn(&EventSubscription) -> bool,
+) {
     let ctx = amf_self();
-    let subs = {
+    let subs: Vec<EventSubscription> = {
         let Ok(guard) = ctx.read() else {
             return;
         };
         guard.event_subscriptions_remove_expired();
-        guard.event_subscriptions_matching_ue(event_type, supi, gpsi, pei)
+        guard
+            .event_subscriptions_matching_ue(event_type, supi, gpsi, pei)
+            .into_iter()
+            .filter(|s| wants(s))
+            .collect()
     };
     if subs.is_empty() {
         return;
@@ -2156,6 +2217,42 @@ pub fn fire_location_report(ue: &AmfUe) {
         "LOCATION_REPORT",
         json!({ "location": nr_location_json(ue) }),
     );
+}
+
+/// Fire a LOCATION_REPORT for a relocation the AMF observed (HANDOVER NOTIFY,
+/// PATH SWITCH), only to the subscriptions whose `locationFilterList` covers a
+/// dimension `change` changed. nextgsim#466.
+///
+/// TS 29.518 Table 6.2.6.2.3-1 (`29518-k00.txt:21398-21404`): an absent filter
+/// means *"the change of the TA used by the UE should be reported"*, so an
+/// intra-TA handover reaches only `CELL_ID` / `RAN_NODE` subscribers.
+pub fn fire_location_change_report(ue: &AmfUe, change: crate::context::LocationChange) {
+    if !change.any() {
+        return;
+    }
+    fire_amf_event_matching(
+        "LOCATION_REPORT",
+        ue.supi.as_deref(),
+        ue.gpsi.as_deref(),
+        ue.pei.as_deref(),
+        json!({ "location": nr_location_json(ue) }),
+        |sub| sub.wants_location_change(change),
+    );
+}
+
+/// The `locationFilterList` of one `AmfEvent` as `LocationFilter` tokens
+/// (Table 6.2.6.3.5-1). Non-string entries are dropped. nextgsim#466.
+fn parse_location_filters(event: &Value) -> Vec<String> {
+    event
+        .get("locationFilterList")
+        .and_then(Value::as_array)
+        .map(|l| {
+            l.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Fire a REGISTRATION_STATE_REPORT (REGISTERED / DEREGISTERED)
@@ -3021,6 +3118,16 @@ fn take_over_transferred_event_subscriptions(
                         .find_map(|e| e.get("reportingThreshold").and_then(Value::as_i64))
                 },
             ),
+            location_filters: entry
+                .get("eventList")
+                .and_then(Value::as_array)
+                .and_then(|events| {
+                    events
+                        .iter()
+                        .find(|e| e.get("type").and_then(Value::as_str) == Some("LOCATION_REPORT"))
+                })
+                .map(parse_location_filters)
+                .unwrap_or_default(),
         };
 
         let added = ctx
@@ -5711,10 +5818,8 @@ fn handle_mt_ue_context_info(ue_context_id: &str, request: &SbiRequest) -> SbiRe
         "accessType": "3GPP_ACCESS",
         "ratType": "NR",
     });
-    if connected && ue.ue_location_timestamp > 0 {
-        response_body["lastActTime"] = json!(system_time_to_rfc3339(
-            std::time::UNIX_EPOCH + std::time::Duration::from_secs(ue.ue_location_timestamp)
-        ));
+    if let Some(acquired) = location_acquired_at(&ue).filter(|_| connected) {
+        response_body["lastActTime"] = json!(system_time_to_rfc3339(acquired));
     }
     match SbiResponse::ok().with_json_body(&response_body) {
         Ok(resp) => resp,
@@ -5730,9 +5835,8 @@ fn handle_mt_ue_context_info(ue_context_id: &str, request: &SbiRequest) -> SbiRe
 ///
 /// Clamped to the `AgeOfLocationEstimate` range (TS 29.572: 0..32767).
 fn ngap_location_age_secs(ue: &AmfUe) -> Option<u64> {
-    if ue.ue_location_timestamp == 0 {
-        return None;
-    }
+    // An unknown or implausible stamp has no age (nextgsim#488 review).
+    location_acquired_at(ue)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -7314,6 +7418,7 @@ mod tests {
             areas: Vec::new(),
             reported_presence: std::collections::HashMap::new(),
             reporting_threshold: None,
+            location_filters: Vec::new(),
         };
         assert!(guard.event_subscription_add(sub));
         // Expired subscriptions never match (other tests may add unrelated

@@ -3000,6 +3000,12 @@ pub enum UpfReportEvent {
     PathQosReport {
         reports: Vec<nextgcore_pfcp::qos_monitoring::GtpUPathQosReport>,
     },
+    /// N6 delay measurement reports (#1389 part 2, TS 29.244 §5.33.8.3) → PFCP
+    /// Node Report Request with N6DR and one N6 Delay Measurement Report IE per
+    /// report.
+    N6DelayReport {
+        reports: Vec<nextgcore_pfcp::qos_monitoring::N6DelayMeasurementReport>,
+    },
     /// First DL packet buffered under a BUFF+NOCP FAR → Downlink Data Report
     /// (TS 29.244 7.5.8.2 / 8.2.39)
     DownlinkDataReport {
@@ -3075,6 +3081,10 @@ pub struct DataPlane {
     /// the SMF provisions GTP-U Path QoS Control Information and the feature is
     /// enabled (`--gtpu-path-qos-monitoring`).
     pub path_qos: std::sync::Mutex<crate::path_qos::PathQosMonitor>,
+    /// #1389 part 2: N6 delay measurement (TS 29.244 §5.33.8, UN6DM). Inert
+    /// unless the SMF provisions N6 Delay Measurement Control Information and
+    /// the feature is enabled (`--n6-delay-measurement`).
+    pub n6_delay: std::sync::Mutex<crate::n6_delay::N6DelayMonitor>,
 }
 
 /// Data plane statistics
@@ -3443,6 +3453,7 @@ impl DataPlane {
             local_gtpu_addr6: RwLock::new(None),
             path_table: RwLock::new(GtpuPathTable::default()),
             path_qos: std::sync::Mutex::new(crate::path_qos::PathQosMonitor::default()),
+            n6_delay: std::sync::Mutex::new(crate::n6_delay::N6DelayMonitor::default()),
         }
     }
 
@@ -3453,7 +3464,7 @@ impl DataPlane {
     }
 
     /// Raise a report event toward the PFCP layer (best effort).
-    fn send_report_event(&self, event: UpfReportEvent) {
+    pub(crate) fn send_report_event(&self, event: UpfReportEvent) {
         let tx = self.report_tx.read().unwrap().clone();
         if let Some(tx) = tx {
             if let Err(e) = tx.try_send(event) {

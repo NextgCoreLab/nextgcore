@@ -229,6 +229,28 @@ async fn an_idle_service_request_to_a_blackholed_smf_does_not_hold_the_ngap_task
         .handle_initial_ue_message(1, &service_request_initial_ue(nas))
         .await
         .expect("handled");
+    // nextgsim#488: the ULI is stamped as acquired now (seconds since the epoch).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs();
+    assert!(
+        (now.saturating_sub(5)..=now).contains(
+            &server
+                .ue_auth_state
+                .get(new)
+                .expect("resumed")
+                .amf_ue
+                .ue_location_timestamp
+        ),
+        "ue_location_timestamp {} is not this message's arrival",
+        server
+            .ue_auth_state
+            .get(new)
+            .expect("resumed")
+            .amf_ue
+            .ue_location_timestamp
+    );
     assert!(
         started.elapsed() < AT_ONCE,
         "the handler waited {:?} for the SMF",

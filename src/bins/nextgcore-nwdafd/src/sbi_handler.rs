@@ -541,8 +541,16 @@ pub async fn handle_analytics_info_query_with_ctx(
     // Content (TS 29.520 §4.3.2.2.2), NOT 400/501 and never an empty-200.
     // Unrecognised tokens were already rejected above with 400
     // INVALID_ANALYTICS_TYPE. Derived from context::SUPPORTED_EVENTS.
-    if !analytics_id.is_supported() {
+    //
+    // nextgsim#466: `is_served_by_analytics_info` is that same set, plus
+    // UE_MOBILITY while the `amf-mobility` feature serves it; a default build, and
+    // the feature's `baseline` mode, answer 204 here exactly as before.
+    if !analytics_id.is_served_by_analytics_info() {
         return SbiResponse::with_status(204);
+    }
+    #[cfg(feature = "amf-mobility")]
+    if analytics_id == AnalyticsId::UeMobility {
+        return ue_mobility_response(ctx, target_ue.as_ref(), target_period, now);
     }
 
     // event-filter (G2-1): nfInstanceIds/nfTypes are honored; malformed JSON
@@ -679,6 +687,87 @@ pub async fn handle_analytics_info_query_with_ctx(
 
     SbiResponse::with_status(200)
         .with_json_body(&serde_json::Value::Object(analytics_data))
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
+}
+
+/// nextgsim#466: the `Nnwdaf_AnalyticsInfo` answer for UE_MOBILITY, served from
+/// the AMF LOCATION_REPORT history (`amf_mobility`).
+///
+/// TS 29.520 §4.3.2.2.2 (`29520-k00.txt:5174-5178`): for UE_MOBILITY the consumer
+/// *"shall provide ... identification of target UE(s) ... by "supis" or
+/// "intGroupIds" attribute in the "tgt-ue" attribute"*. So:
+///
+/// - no `tgt-ue`, or one with neither: 400 `MANDATORY_QUERY_PARAM_INCORRECT`;
+/// - `intGroupIds` only: 204, because this NWDAF resolves no group membership;
+/// - `supis`: one `UeMobility` per SUPI with data; none → 204, or for a past
+///   `ana-req` period 500 `UNAVAILABLE_DATA`, the NF_LOAD rules.
+///
+/// A past (or absent) `ana-req` period is statistics over the observed history,
+/// a future one a prediction (NOTE 7 on `AnalyticsData`).
+#[cfg(feature = "amf-mobility")]
+fn ue_mobility_response(
+    ctx: &Arc<RwLock<NwdafContext>>,
+    target_ue: Option<&TargetUeInfo>,
+    target_period: Option<AnalyticsTargetPeriod>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> SbiResponse {
+    use crate::amf_mobility::{ue_mobility_infos, Ask};
+    let Some(target) = target_ue.filter(|t| !t.supis.is_empty() || !t.int_group_ids.is_empty())
+    else {
+        return send_bad_request(
+            "UE_MOBILITY requires tgt-ue with supis or intGroupIds (TS 29.520 §4.3.2.2.2)",
+            Some("MANDATORY_QUERY_PARAM_INCORRECT"),
+        );
+    };
+    if target.supis.is_empty() {
+        log::info!(
+            "AnalyticsInfo UE_MOBILITY: tgt-ue names only intGroupIds and this NWDAF resolves \
+             no group membership → 204"
+        );
+        return SbiResponse::with_status(204);
+    }
+    let unix = |t: chrono::DateTime<chrono::Utc>| t.timestamp().max(0) as u64;
+    let ask = match target_period {
+        Some(p) if p.is_statistics(now) => Ask::Statistics(Some(p.observation_window())),
+        Some(p) => Ask::Prediction {
+            start: unix(p.start),
+            end: unix(p.end),
+        },
+        None => Ask::Statistics(None),
+    };
+    let infos = match ctx.read() {
+        Ok(guard) => ue_mobility_infos(&guard.lock_engine(), &target.supis, ask),
+        Err(e) => {
+            log::error!("ue_mobility_response: failed to read context: {e}");
+            return nextgcore_sbi::server::send_internal_error("context unavailable");
+        }
+    };
+    if infos.is_empty() {
+        if let Ask::Statistics(Some(_)) = ask {
+            return send_error(
+                500,
+                "Internal Server Error",
+                "no UE location was collected inside the requested analytics target period",
+                Some("UNAVAILABLE_DATA"),
+            );
+        }
+        return SbiResponse::with_status(204);
+    }
+    let (start, expiry) = match target_period {
+        Some(p) => (p.start, p.end),
+        None => (
+            now,
+            now + chrono::Duration::seconds(DEFAULT_ANALYTICS_VALIDITY_SECS),
+        ),
+    };
+    let body = serde_json::json!({
+        "ueMobs": infos,
+        "start": start.to_rfc3339(),
+        "expiry": expiry.to_rfc3339(),
+        "timeStampGen": now.to_rfc3339(),
+    });
+    SbiResponse::with_status(200)
+        .with_json_body(&body)
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 

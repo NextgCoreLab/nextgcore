@@ -326,3 +326,243 @@ async fn an_unbound_ue_context_is_not_connected() {
     );
     server.forget_ue(ue);
 }
+
+/// Seconds since the Unix epoch, now.
+fn epoch_secs_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs()
+}
+
+/// An RFC 3339 DateTime as seconds since the Unix epoch.
+fn rfc3339_secs(v: &serde_json::Value) -> u64 {
+    let s = v
+        .as_str()
+        .unwrap_or_else(|| panic!("a DateTime string, got {v}"));
+    crate::namf_server::rfc3339_to_system_time(s)
+        .unwrap_or_else(|| panic!("{s} is RFC 3339"))
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs()
+}
+
+/// nextgsim#488: an Uplink NAS Transport's User Location Information is stamped with
+/// the time the AMF learnt it, and every Namf reader of that stamp now answers from it
+/// on the default path, with no test write of `ue_location_timestamp`:
+/// - Namf_Location ProvideLocationInfo `location.nrLocation.ueLocationTimestamp`
+///   (TS 29.571 §5.4.4.9, "the UTC time when the UeLocation information was acquired")
+///   and its `locationAge` (seconds, `ngap_location_age_secs`);
+/// - Namf_MT ProvideDomainSelectionInfo `lastActTime`;
+/// - an immediate LOCATION_REPORT's `reportList` (TS 29.518, "Last Known Location (if
+///   the immediateFlag is set)").
+///
+/// REVERT-VERIFIED: dropping `amf_ue.stamp_location_now()` from `apply_user_location`
+/// fails the first assertion (the stamp stays 0).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_uplink_nas_transports_location_reaches_namf_with_the_time_it_was_acquired() {
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran, supi) = (7_488_001u64, 95, "imsi-001010004880001");
+    live_ue(&mut server, ue, ran, supi);
+    assert_eq!(
+        server
+            .ue_auth_state
+            .get(ue)
+            .expect("live")
+            .amf_ue
+            .ue_location_timestamp,
+        0,
+        "the precondition: no location has been reported yet"
+    );
+
+    let before = epoch_secs_now();
+    let ul_pdu = nextgcore_ngap::builder::build_uplink_nas_transport(
+        &nextgcore_ngap::types::UplinkNasTransport {
+            amf_ue_ngap_id: ue,
+            ran_ue_ngap_id: ran,
+            nas_pdu: vec![
+                0x7E,
+                security_header::PLAIN_NAS_MESSAGE,
+                message_type::CONFIGURATION_UPDATE_COMPLETE,
+            ],
+            user_location_info: super::test_user_location(0x04_88_01, 0x0004_8801),
+        },
+    )
+    .expect("encode an Uplink NAS Transport");
+    server
+        .handle_uplink_nas_transport(1, &ul_pdu)
+        .await
+        .expect("handled");
+    let after = epoch_secs_now();
+
+    let stamp = server
+        .ue_auth_state
+        .get(ue)
+        .expect("live")
+        .amf_ue
+        .ue_location_timestamp;
+    assert!(
+        (before..=after).contains(&stamp),
+        "the ULI is stamped when it is stored, in seconds: {before} <= {stamp} <= {after}"
+    );
+
+    let req = nextgcore_sbi::SbiRequest::post(format!("/namf-loc/v1/{supi}/provide-loc-info"));
+    let resp = crate::namf_request_handler(req).await;
+    assert_eq!(resp.status, 200, "{}", json_of(&resp));
+    let body = json_of(&resp);
+    assert_eq!(
+        body["location"]["nrLocation"]["ncgi"]["nrCellId"], "000048801",
+        "{body}"
+    );
+    assert_eq!(
+        rfc3339_secs(&body["location"]["nrLocation"]["ueLocationTimestamp"]),
+        stamp,
+        "{body}"
+    );
+    let age = body["locationAge"].as_u64().expect("locationAge");
+    assert!(
+        age <= epoch_secs_now() - stamp,
+        "the age is in seconds since the stamp, not since the epoch: {age}"
+    );
+
+    let req = nextgcore_sbi::SbiRequest::get(format!("/namf-mt/v1/ue-contexts/{supi}"))
+        .with_param("info-class", "TADS");
+    let resp = crate::namf_request_handler(req).await;
+    assert_eq!(resp.status, 200, "{}", json_of(&resp));
+    assert_eq!(rfc3339_secs(&json_of(&resp)["lastActTime"]), stamp);
+
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let req = nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions".to_string())
+        .with_json_body(&serde_json::json!({
+            "subscription": {
+                "eventList": [{ "type": "LOCATION_REPORT", "immediateFlag": true }],
+                "eventNotifyUri": "http://127.0.0.1:9/notify",
+                "notifyCorrelationId": "corr-488",
+                "nfId": "3fa85f64-5717-4562-b3fc-2c9630004880",
+                "supi": supi,
+            }
+        }))
+        .expect("json");
+    let resp = crate::namf_request_handler(req).await;
+    assert_eq!(resp.status, 201, "{}", json_of(&resp));
+    let body = json_of(&resp);
+    let report = body["reportList"]
+        .as_array()
+        .and_then(|r| r.iter().find(|r| r["type"] == "LOCATION_REPORT"))
+        .cloned()
+        .unwrap_or_else(|| panic!("an immediate LOCATION_REPORT: {body}"));
+    assert_eq!(
+        rfc3339_secs(&report["location"]["nrLocation"]["ueLocationTimestamp"]),
+        stamp,
+        "{report}"
+    );
+    delete_subscription(&body).await;
+    server.forget_ue(ue);
+}
+
+/// nextgsim#488: a location the AMF never learnt carries no `ueLocationTimestamp`
+/// (the IE is optional, TS 29.571 §5.4.4.9) rather than the epoch, and no
+/// `lastActTime`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unstamped_location_omits_its_timestamp() {
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran, supi) = (7_488_002u64, 96, "imsi-001010004880002");
+    live_ue(&mut server, ue, ran, supi);
+
+    let req = nextgcore_sbi::SbiRequest::post(format!("/namf-loc/v1/{supi}/provide-loc-info"));
+    let resp = crate::namf_request_handler(req).await;
+    assert_eq!(resp.status, 200, "{}", json_of(&resp));
+    let body = json_of(&resp);
+    assert!(body["location"]["nrLocation"].is_object(), "{body}");
+    assert!(
+        body["location"]["nrLocation"]
+            .get("ueLocationTimestamp")
+            .is_none(),
+        "{body}"
+    );
+    assert!(body.get("locationAge").is_none(), "{body}");
+
+    let req = nextgcore_sbi::SbiRequest::get(format!("/namf-mt/v1/ue-contexts/{supi}"))
+        .with_param("info-class", "TADS");
+    let resp = crate::namf_request_handler(req).await;
+    assert!(
+        json_of(&resp).get("lastActTime").is_none(),
+        "{}",
+        json_of(&resp)
+    );
+    server.forget_ue(ue);
+}
+
+/// nextgsim#488 review: a stamp that is no plausible time (a corrupt store record,
+/// `u64::MAX` or the BSON maximum) is "no timestamp". Every Namf reader still
+/// answers 200 and omits the field, rather than panicking in the `SystemTime`
+/// arithmetic.
+///
+/// REVERT-VERIFIED: `UNIX_EPOCH + Duration::from_secs(..)` in place of
+/// `location_acquired_at` panics here ("overflow when adding duration").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_corrupt_location_stamp_is_omitted_and_never_panics() {
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran, supi) = (7_488_003u64, 97, "imsi-001010004880003");
+    live_ue(&mut server, ue, ran, supi);
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    for corrupt in [u64::MAX, i64::MAX as u64, epoch_secs_now() + 10 * 86_400] {
+        server
+            .ue_auth_state
+            .with_mut(ue, |s| s.amf_ue.ue_location_timestamp = corrupt);
+
+        let req = nextgcore_sbi::SbiRequest::post(format!("/namf-loc/v1/{supi}/provide-loc-info"));
+        let resp = crate::namf_request_handler(req).await;
+        assert_eq!(resp.status, 200, "{corrupt}: {}", json_of(&resp));
+        let body = json_of(&resp);
+        assert!(
+            body["location"]["nrLocation"]
+                .get("ueLocationTimestamp")
+                .is_none()
+                && body.get("locationAge").is_none(),
+            "{corrupt}: {body}"
+        );
+
+        let req = nextgcore_sbi::SbiRequest::get(format!("/namf-mt/v1/ue-contexts/{supi}"))
+            .with_param("info-class", "TADS");
+        let resp = crate::namf_request_handler(req).await;
+        assert_eq!(resp.status, 200, "{corrupt}");
+        assert!(json_of(&resp).get("lastActTime").is_none(), "{corrupt}");
+
+        let req = nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions".to_string())
+            .with_json_body(&serde_json::json!({
+                "subscription": {
+                    "eventList": [{ "type": "LOCATION_REPORT", "immediateFlag": true }],
+                    "eventNotifyUri": "http://127.0.0.1:9/notify",
+                    "notifyCorrelationId": "corr-488-corrupt",
+                    "nfId": "3fa85f64-5717-4562-b3fc-2c9630004883",
+                    "supi": supi,
+                }
+            }))
+            .expect("json");
+        let resp = crate::namf_request_handler(req).await;
+        assert_eq!(resp.status, 201, "{corrupt}: {}", json_of(&resp));
+        let body = json_of(&resp);
+        let report = body["reportList"]
+            .as_array()
+            .and_then(|r| r.iter().find(|r| r["type"] == "LOCATION_REPORT"))
+            .cloned()
+            .unwrap_or_else(|| panic!("an immediate LOCATION_REPORT: {body}"));
+        assert!(
+            report["location"]["nrLocation"]
+                .get("ueLocationTimestamp")
+                .is_none(),
+            "{corrupt}: {report}"
+        );
+        delete_subscription(&body).await;
+    }
+    server.forget_ue(ue);
+}
+
+/// DELETE the subscription a subscribe answer created.
+async fn delete_subscription(answer: &serde_json::Value) {
+    let id = answer["subscriptionId"].as_str().expect("subscriptionId");
+    let req = nextgcore_sbi::SbiRequest::delete(format!("/namf-evts/v1/subscriptions/{id}"));
+    let resp = crate::namf_request_handler(req).await;
+    assert_eq!(resp.status, 204, "{}", json_of(&resp));
+}
