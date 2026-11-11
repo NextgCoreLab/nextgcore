@@ -3428,6 +3428,8 @@ impl NgapServer {
                         plmn_id: initial_ue.plmn_id.clone(),
                         cell_id: initial_ue.nr_cell_identity,
                     };
+                    // nextgsim#488: the InitialUEMessage's ULI was acquired now.
+                    state.amf_ue.stamp_location_now();
                     state.amf_ue.access_type = 1; // 3GPP access
                     self.ue_auth_state.insert(amf_ue_ngap_id, state);
                 }
@@ -7402,6 +7404,8 @@ impl NgapServer {
             plmn_id: initial_ue.plmn_id.clone(),
             cell_id: initial_ue.nr_cell_identity,
         };
+        // nextgsim#488: the InitialUEMessage's ULI was acquired now.
+        state.amf_ue.stamp_location_now();
         // #1102, TS 24.501 §5.6.2.2.1: a verified REGISTRATION REQUEST answers a page
         // as a SERVICE REQUEST does, so PAGING stops here. Unanswered, the page kept
         // going out for the old connection until it was abandoned, and its requester
@@ -7552,6 +7556,8 @@ impl NgapServer {
             plmn_id: initial_ue.plmn_id.clone(),
             cell_id: initial_ue.nr_cell_identity,
         };
+        // nextgsim#488: the InitialUEMessage's ULI was acquired now.
+        state.amf_ue.stamp_location_now();
 
         // Answering a page stops T3513 and hands over what was waiting.
         let paging = {
@@ -21273,6 +21279,7 @@ fn apply_user_location(
     amf_ue.nr_tai.plmn_id = plmn_id_from_ngap_bytes(tai_plmn);
     amf_ue.nr_tai.tac =
         ((tai_tac[0] as u32) << 16) | ((tai_tac[1] as u32) << 8) | tai_tac[2] as u32;
+    amf_ue.stamp_location_now();
 }
 
 /// Convert a configured algorithm preference order into a support mask;
@@ -34870,6 +34877,16 @@ mod tests {
         assert_eq!(
             state.amf_ue.nr_tai.tac, reg_tac,
             "the TAI is still stored at registration too"
+        );
+        // nextgsim#488: the ULI is stamped as acquired now (seconds since the epoch).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_secs();
+        assert!(
+            (now.saturating_sub(5)..=now).contains(&state.amf_ue.ue_location_timestamp),
+            "ue_location_timestamp {} is not this message's arrival",
+            state.amf_ue.ue_location_timestamp
         );
     }
 

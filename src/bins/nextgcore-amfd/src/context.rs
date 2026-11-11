@@ -3674,7 +3674,10 @@ pub struct AmfUe {
     pub nr_tai: Tai5gs,
     /// NR CGI
     pub nr_cgi: NrCgi,
-    /// UE location timestamp
+    /// When `nr_tai`/`nr_cgi` were last learnt from the RAN, in seconds since the
+    /// Unix epoch; 0 while unknown. Written by [`AmfUe::stamp_location_now`]; read as
+    /// `NrLocation.ueLocationTimestamp` (TS 29.571 §5.4.4.9), `lastActTime` and the
+    /// NGAP location age.
     pub ue_location_timestamp: u64,
     /// Last visited PLMN ID
     pub last_visited_plmn_id: PlmnId,
@@ -4093,6 +4096,19 @@ pub enum SnpnOnboardingState {
 }
 
 impl AmfUe {
+    /// Record that the UE's location (`nr_tai`/`nr_cgi`) was acquired now.
+    ///
+    /// Called wherever the AMF stores a User Location Information the RAN just
+    /// reported (nextgsim#488). TS 29.571 §5.4.4.9: `ueLocationTimestamp` is "the UTC
+    /// time when the UeLocation information was acquired". Seconds, the unit every
+    /// reader of `ue_location_timestamp` assumes.
+    pub fn stamp_location_now(&mut self) {
+        self.ue_location_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+    }
+
     /// Clear every piece of long-lived key material this UE context holds
     /// (#115, TS 33.501 §5.9 / §6.2).
     ///

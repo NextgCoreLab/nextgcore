@@ -977,12 +977,41 @@ fn tai_json(tai: &Tai5gs) -> Value {
 
 /// NrLocation user-location JSON for a UE (TS 29.571 UserLocation)
 fn nr_location_json(ue: &AmfUe) -> Value {
-    json!({
-        "nrLocation": {
-            "tai": tai_json(&ue.nr_tai),
-            "ncgi": ncgi_json(&ue.nr_cgi),
-        }
-    })
+    let mut nr_location = json!({
+        "tai": tai_json(&ue.nr_tai),
+        "ncgi": ncgi_json(&ue.nr_cgi),
+    });
+    // TS 29.571 §5.4.4.9 `NrLocation.ueLocationTimestamp` (O, DateTime): "the UTC time
+    // when the UeLocation information was acquired". Omitted while unknown, rather than
+    // claiming the epoch (nextgsim#488).
+    if let Some(acquired) = location_acquired_at(ue) {
+        nr_location["ueLocationTimestamp"] = json!(system_time_to_rfc3339(acquired));
+    }
+    json!({ "nrLocation": nr_location })
+}
+
+/// How far ahead of now a stored location stamp may be and still be believed:
+/// clock skew between an AMF that wrote a record and the one restoring it.
+pub(crate) const LOCATION_STAMP_FUTURE_SLACK_SECS: u64 = 86_400;
+
+/// When `ue`'s stored location was acquired, or `None` when that is unknown: the
+/// stamp is 0, or it is not a plausible time (later than now plus
+/// [`LOCATION_STAMP_FUTURE_SLACK_SECS`], or beyond what a `SystemTime` holds). A
+/// corrupt stamp, from a damaged store record for instance, is "no timestamp",
+/// never a panic in the `SystemTime` arithmetic (nextgsim#488 review).
+pub(crate) fn location_acquired_at(ue: &AmfUe) -> Option<std::time::SystemTime> {
+    let secs = ue.ue_location_timestamp;
+    if secs == 0 {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if secs > now.saturating_add(LOCATION_STAMP_FUTURE_SLACK_SECS) {
+        return None;
+    }
+    std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(secs))
 }
 
 // ============================================================================
@@ -1042,7 +1071,7 @@ fn rfc3339_now() -> String {
 
 /// Parse an RFC 3339 timestamp ("YYYY-MM-DDTHH:MM:SS[.frac](Z|±hh:mm)") into
 /// a SystemTime. Returns None on malformed input (never panics).
-fn rfc3339_to_system_time(s: &str) -> Option<std::time::SystemTime> {
+pub(crate) fn rfc3339_to_system_time(s: &str) -> Option<std::time::SystemTime> {
     let bytes = s.as_bytes();
     if bytes.len() < 20 {
         return None;
@@ -5711,10 +5740,8 @@ fn handle_mt_ue_context_info(ue_context_id: &str, request: &SbiRequest) -> SbiRe
         "accessType": "3GPP_ACCESS",
         "ratType": "NR",
     });
-    if connected && ue.ue_location_timestamp > 0 {
-        response_body["lastActTime"] = json!(system_time_to_rfc3339(
-            std::time::UNIX_EPOCH + std::time::Duration::from_secs(ue.ue_location_timestamp)
-        ));
+    if let Some(acquired) = location_acquired_at(&ue).filter(|_| connected) {
+        response_body["lastActTime"] = json!(system_time_to_rfc3339(acquired));
     }
     match SbiResponse::ok().with_json_body(&response_body) {
         Ok(resp) => resp,
@@ -5730,9 +5757,8 @@ fn handle_mt_ue_context_info(ue_context_id: &str, request: &SbiRequest) -> SbiRe
 ///
 /// Clamped to the `AgeOfLocationEstimate` range (TS 29.572: 0..32767).
 fn ngap_location_age_secs(ue: &AmfUe) -> Option<u64> {
-    if ue.ue_location_timestamp == 0 {
-        return None;
-    }
+    // An unknown or implausible stamp has no age (nextgsim#488 review).
+    location_acquired_at(ue)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

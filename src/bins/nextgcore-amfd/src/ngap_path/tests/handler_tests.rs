@@ -4854,6 +4854,16 @@ async fn a_registration_update_from_cm_idle_answers_the_page_and_sets_its_sessio
     );
     let resumed = server.ue_auth_state.get(new_id).expect("the resumed UE");
     assert_eq!(resumed.ics_requested_psis, vec![1]);
+    // nextgsim#488: the ULI is stamped as acquired now (seconds since the epoch).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs();
+    assert!(
+        (now.saturating_sub(5)..=now).contains(&resumed.amf_ue.ue_location_timestamp),
+        "ue_location_timestamp {} is not this message's arrival",
+        resumed.amf_ue.ue_location_timestamp
+    );
     drop(resumed);
     forget_update_test(&mut server, old_id, new_id);
 }

@@ -13,6 +13,14 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 ## [Unreleased]
 
 ### Added
+- amfd records when it learnt a UE's location (nextgsim#488). Every User Location Information
+  the RAN reports (InitialUEMessage, Uplink NAS Transport, Handover Notify, Path Switch) stamps
+  `ue_location_timestamp`, so on the default path `NrLocation.ueLocationTimestamp` (TS 29.571
+  §5.4.4.9) appears in LOCATION_REPORT and ProvideLocationInfo, ProvideLocationInfo reports
+  `locationAge`, and Namf_MT domain selection info reports `lastActTime` for a connected UE. All
+  three are optional fields, omitted while the time is unknown. The UE context store persists the
+  stamp (`location_timestamp`, defaulted, so older records still load); a corrupt or implausible
+  stamp is treated as unknown.
 - Releases publish their container images to Docker Hub (#420). On a version tag, `release.yml`
   pushes every image in `docker/release-images.json` as `<namespace>/<image>:<version>`, then
   moves `latest` once every versioned push has succeeded. The images are `nextgcore-core`, one
