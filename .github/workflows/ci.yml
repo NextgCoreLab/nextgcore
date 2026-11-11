@@ -548,6 +548,37 @@ jobs:
           set -euo pipefail
           python3 deploy/check_no_demo_block.py --self-test
           python3 deploy/check_no_demo_block.py
+      - name: Demo compose stacks publish no port (nextgsim#456)
+        # The demo stacks are standalone files, never `-f` overlays of
+        # docker-compose.yml: compose merges `ports:` lists, so the base file's
+        # loopback publishes (2152/udp, 38412/udp, 7777, ...) would leak in, and
+        # two gNBs plus a UPF would collide on host port 2152. This renders each
+        # stack with `docker compose config`, the exact model `up` would run, and
+        # fails on any published port or host networking. A planted stack with
+        # one port runs first, so a check that silently stopped matching fails.
+        working-directory: nextgcore/docker/rust
+        run: |
+          set -euo pipefail
+          exposed() { # <compose file> -> prints "service: why" per exposure
+            docker compose -f "$1" config --format json | jq -r '
+              .services | to_entries[]
+              | select(((.value.ports // []) | length) > 0 or .value.network_mode == "host")
+              | "\(.key): ports=\(.value.ports // [] | map(.published // "") | join(",")) network_mode=\(.value.network_mode // "")"'
+          }
+          planted="$RUNNER_TEMP/planted.yml"
+          printf 'services:\n  x:\n    image: busybox\n    ports: ["127.0.0.1:2152:2152/udp"]\n' > "$planted"
+          [ -n "$(exposed "$planted")" ] || { echo "::error::the check missed a planted published port"; exit 1; }
+          n=0
+          for f in docker-compose.demo*.yml; do
+            [ -e "$f" ] || continue
+            hits="$(exposed "$f")"
+            if [ -n "$hits" ]; then
+              echo "::error::$f exposes a service on the host:"; echo "$hits"; exit 1
+            fi
+            echo "$f: no published port, no host networking"
+            n=$((n + 1))
+          done
+          [ "$n" -gt 0 ] || { echo "::error::no demo compose stack found"; exit 1; }
 
   fuzz-build:
     name: Fuzz targets build
