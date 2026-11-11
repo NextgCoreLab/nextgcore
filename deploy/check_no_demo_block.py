@@ -55,6 +55,7 @@ SELF = 'deploy/check_no_demo_block.py'
 REF_ALLOW = [
     'deploy/eks/profiles/demo/*',
     'k8s/demo-check.sh',
+    'k8s/demo-check-selftest.sh',
 ]
 
 # `demo:` as a YAML mapping key (optionally quoted) at the start of a line, or

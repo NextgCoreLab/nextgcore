@@ -528,9 +528,19 @@ jobs:
             kubectl kustomize $flags "$d" > "$r/eks-$p.yaml"
             args+=(--render "$r/eks-$p.yaml")
           done
+          # #1395: every demo overlay too (the base demo-off one is also
+          # rendered above as profiles/demo; a demo-<key> one only here). In
+          # their own list: they go through the exposure check, but not the
+          # no-demo-block render pass, since a demo overlay may carry demo config.
+          overlays=()
+          for d in deploy/eks/overlays/demo*/; do
+            o="$(basename "$d")"
+            kubectl kustomize "$d" > "$r/overlay-$o.yaml"
+            overlays+=(--render "$r/overlay-$o.yaml")
+          done
           helm template ci deploy/helm/nextgcore --set global.siteId=ci > "$r/helm.yaml"
           args+=(--render "$r/helm.yaml")
-          python3 deploy/check_no_exposure.py "${args[@]}"
+          python3 deploy/check_no_exposure.py "${args[@]}" "${overlays[@]}"
           # #1394: the same renders, structurally: no ConfigMap config with a
           # root demo: key, however a shipped profile pulled it in.
           python3 deploy/check_no_demo_block.py "${args[@]}"
@@ -548,6 +558,17 @@ jobs:
           set -euo pipefail
           python3 deploy/check_no_demo_block.py --self-test
           python3 deploy/check_no_demo_block.py
+      - name: Demo profile toggles (nextgcore#1395)
+        # The PROFILE=demo post-render that merges a demo overlay's toggles
+        # into the NF configs: fail-closed rules, demo-off untouched.
+        working-directory: nextgcore
+        run: |
+          set -euo pipefail
+          python3 deploy/eks/profiles/demo/demo_toggles.py --self-test
+          # k8s/demo-check.sh against a fake cluster: the private kubeconfig is
+          # removed on every exit path, every artefact is scrubbed, and a
+          # surviving token fails the run.
+          k8s/demo-check-selftest.sh
 
   fuzz-build:
     name: Fuzz targets build

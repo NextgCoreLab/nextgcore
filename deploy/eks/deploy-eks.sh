@@ -16,6 +16,7 @@
 #   RECREATE_MONGODB=true ./deploy-eks.sh        # allow recreating the mongodb
 #                                                #   StatefulSet (data loss, see below)
 #   DRY_RUN=true ./deploy-eks.sh                 # render + validate, apply nothing
+#   CORE_IMAGE_TAG=<t> SIM_IMAGE_TAG=<t> ./deploy-eks.sh  # deploy already-pushed tags
 #   VERIFY_WAIT=90 ./deploy-eks.sh               # how long not-Ready replacements are
 #                                                #   re-checked before failing (#1353)
 #   PROFILE=epc ./deploy-eks.sh                  # another profile (default 5g)
@@ -89,6 +90,11 @@ else
   CORE_TAG="${CORE_TAG}${PROFILE_TAG_SUFFIX}"
   SIM_TAG="${SIM_TAG}${PROFILE_TAG_SUFFIX}"
 fi
+# Per-group overrides (#1395): deploy already-pushed images whose two repos sit
+# at different commits, e.g. a demo-off run reusing the 6G profile's images,
+# where IMAGE_TAG (one tag for both groups) cannot name them.
+CORE_TAG="${CORE_IMAGE_TAG:-${CORE_TAG}}"
+SIM_TAG="${SIM_IMAGE_TAG:-${SIM_TAG}}"
 
 # --- preflight -------------------------------------------------------------
 
@@ -171,7 +177,7 @@ trap 'rm -f "${RENDERED}" "${RENDERED}.tmp" "${LIVE_STS_JSON:-}" "${LIVE_DP_JSON
 
 log "rendering kustomize overlay..."
 # shellcheck disable=SC2086  # PROFILE_KUSTOMIZE_FLAGS is a word list
-kubectl kustomize ${PROFILE_KUSTOMIZE_FLAGS} "${PROFILE_DIR}" > "${RENDERED}" \
+kubectl kustomize ${PROFILE_KUSTOMIZE_FLAGS} "${PROFILE_RENDER_DIR:-${PROFILE_DIR}}" > "${RENDERED}" \
   || die "kustomize render failed"
 
 # Profile-specific transforms of the rendered manifests, in place (a no-op for
