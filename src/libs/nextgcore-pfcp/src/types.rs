@@ -1644,16 +1644,36 @@ pub struct UpFunctionFeatures {
     pub mbsn4: bool,    // Support of MBS N4
     pub psuprm: bool,   // Support of Per Slice UP Resource Management
     pub eppi: bool,     // Support of Enhanced PDI for Paging Policy Indication
+    pub qmdrm: bool,    // Support of QoS monitoring for data rate (octet 13 bit 3)
+    pub un6dm: bool,    // Support of N6 Delay Measurement (octet 14 bit 2)
 }
 
 impl UpFunctionFeatures {
-    /// Number of feature octets emitted on the wire (octets 5-12 of the IE)
+    /// Number of feature octets emitted on the wire by default (octets 5-12 of
+    /// the IE). This is what every peer in this tree has always sent.
     pub const ENCODED_LEN: usize = 8;
+
+    /// Feature octets emitted when a bit in IE octets 13-14 (Additional
+    /// Supported-Features 4: QMDRM, UN6DM) is set. Never sent otherwise, so a
+    /// UP function that does not configure those features keeps the 8-octet
+    /// wire format older CP functions were tested against (#1386).
+    pub const EXTENDED_LEN: usize = 10;
 
     /// Minimum feature octets accepted from a peer (octets 5-10, Rel-16)
     pub const MIN_LEN: usize = 6;
 
-    /// Encode the full 8-octet bitmask (TS 29.244 Section 8.2.25)
+    /// Number of value octets [`Self::encode`] emits: [`Self::ENCODED_LEN`]
+    /// unless an octet-13/14 bit is set, then [`Self::EXTENDED_LEN`].
+    pub fn encoded_len(&self) -> usize {
+        if self.qmdrm || self.un6dm {
+            Self::EXTENDED_LEN
+        } else {
+            Self::ENCODED_LEN
+        }
+    }
+
+    /// Encode the bitmask at its minimal length (TS 29.244 Section 8.2.25):
+    /// 8 octets, growing to 10 only when a bit in IE octets 13-14 is set.
     ///
     /// Octet 5:  TREU HEEU PFDM FTUP TRST DLBD DDND BUCP
     /// Octet 6:  EPFAR PFDE FRRT TRACE QUOAC UDBC PDIU EMPU
@@ -1663,6 +1683,8 @@ impl UpFunctionFeatures {
     /// Octet 10: DNSTS IPREP RESPS UPBER L2TP NSPOC QUASF RTTWP
     /// Octet 11: spare(4) EPPI PSUPRM MBSN4 DRQOS
     /// Octet 12: spare
+    /// Octet 13: spare(5) QMDRM spare(2)      (only when QMDRM or UN6DM is set)
+    /// Octet 14: spare(6) UN6DM spare(1)      (only when QMDRM or UN6DM is set)
     pub fn encode(&self, buf: &mut BytesMut) {
         let b0 = ((self.treu as u8) << 7)
             | ((self.heeu as u8) << 6)
@@ -1717,13 +1739,20 @@ impl UpFunctionFeatures {
             | ((self.mbsn4 as u8) << 1)
             | (self.drqos as u8);
         buf.put_slice(&[b0, b1, b2, b3, b4, b5, b6, 0]);
+        if self.encoded_len() == Self::EXTENDED_LEN {
+            let b8 = (self.qmdrm as u8) << 2;
+            let b9 = (self.un6dm as u8) << 1;
+            buf.put_slice(&[b8, b9]);
+        }
     }
 
     /// Decode from bytes
     ///
     /// Strict on length: at least the 6 octets of the Rel-16 bitmask are
-    /// required; legacy 2/4-octet encodings are rejected. The Rel-17
-    /// additional octets (11-12) are parsed when present.
+    /// required; legacy 2/4-octet encodings are rejected. The additional
+    /// octets 11-14 are parsed when present; any octet beyond (up to octet 16
+    /// in Rel-20, or later ones a newer peer sends) is left unread, and spare
+    /// or unmodelled bits are ignored, as §8.2.25 requires of the receiver.
     pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
         if buf.remaining() < Self::MIN_LEN {
             return Err(PfcpError::BufferTooShort {
@@ -1737,11 +1766,17 @@ impl UpFunctionFeatures {
         let b3 = buf.get_u8();
         let b4 = buf.get_u8();
         let b5 = buf.get_u8();
-        let b6 = if buf.remaining() >= 1 {
-            buf.get_u8()
-        } else {
-            0
+        let mut next = || {
+            if buf.remaining() >= 1 {
+                buf.get_u8()
+            } else {
+                0
+            }
         };
+        let b6 = next();
+        let _b7 = next(); // octet 12: no modelled bit
+        let b8 = next();
+        let b9 = next();
 
         Ok(Self {
             bucp: b0 & 0x01 != 0,
@@ -1796,6 +1831,8 @@ impl UpFunctionFeatures {
             mbsn4: (b6 >> 1) & 0x01 != 0,
             psuprm: (b6 >> 2) & 0x01 != 0,
             eppi: (b6 >> 3) & 0x01 != 0,
+            qmdrm: (b8 >> 2) & 0x01 != 0,
+            un6dm: (b9 >> 1) & 0x01 != 0,
         })
     }
 }
@@ -3483,20 +3520,37 @@ impl NodeReportType {
     }
 }
 
-/// Remote GTP-U Peer (TS 29.244 §8.2.83). Models the V4/V6 peer address; the
-/// optional Destination Interface / Network Instance fields are not emitted.
+/// Remote GTP-U Peer (TS 29.244 §8.2.70, Figure 8.2.70-1).
+///
+/// The V4/V6 address plus the optional Destination Interface, Network Instance
+/// and Recovery Timestamp fields (DI/NI/RTS flags). Each optional field is only
+/// emitted when it is `Some`, so a peer built from just an address encodes to
+/// exactly the octets it always did. The DI/NI fields matter to the GTP-U path
+/// QoS IEs (238/239, 271), where the Remote GTP-U Peer "includes the network
+/// instance used towards the remote GTP-U peer if available".
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RemoteGtpUPeer {
     pub ipv4: Option<[u8; 4]>,
     pub ipv6: Option<[u8; 16]>,
+    /// DI: the Destination Interface value (§8.2.24 octet 5, low nibble).
+    pub destination_interface: Option<u8>,
+    /// NI: the Network Instance octets (§8.2.4 encoding).
+    pub network_instance: Option<Vec<u8>>,
+    /// RTS: the remote peer's Recovery Timestamp (NTP seconds).
+    pub recovery_time_stamp: Option<u32>,
 }
 
 impl RemoteGtpUPeer {
-    /// TS 29.244 §8.2.70 (Figure 8.2.70-1), octet 5: bit 1 is V6, bit 2 is V4; the
-    /// IPv4 address field comes first when both are present (#1028 review B1: the
-    /// two bits were swapped, so a conformant peer's IPv4 report decoded as none).
+    /// TS 29.244 §8.2.70 (Figure 8.2.70-1), octet 5: bit 1 V6, bit 2 V4, bit 3 DI,
+    /// bit 4 NI, bit 5 RTS; the fields follow in that figure order (IPv4 before
+    /// IPv6, #1028 review B1: the two address bits were once swapped). DI and NI
+    /// are each preceded by a 2-octet length.
     pub fn encode(&self, buf: &mut BytesMut) {
-        let flags = (self.ipv6.is_some() as u8) | ((self.ipv4.is_some() as u8) << 1);
+        let flags = (self.ipv6.is_some() as u8)
+            | ((self.ipv4.is_some() as u8) << 1)
+            | ((self.destination_interface.is_some() as u8) << 2)
+            | ((self.network_instance.is_some() as u8) << 3)
+            | ((self.recovery_time_stamp.is_some() as u8) << 4);
         buf.put_u8(flags);
         if let Some(v4) = self.ipv4 {
             buf.put_slice(&v4);
@@ -3504,44 +3558,81 @@ impl RemoteGtpUPeer {
         if let Some(v6) = self.ipv6 {
             buf.put_slice(&v6);
         }
+        if let Some(di) = self.destination_interface {
+            buf.put_u16(1);
+            buf.put_u8(di & 0x0f);
+        }
+        if let Some(ni) = &self.network_instance {
+            buf.put_u16(ni.len() as u16);
+            buf.put_slice(ni);
+        }
+        if let Some(rts) = self.recovery_time_stamp {
+            buf.put_u32(rts);
+        }
     }
 
     pub fn decode(data: &[u8]) -> PfcpResult<Self> {
-        let mut buf = Bytes::copy_from_slice(data);
-        if buf.remaining() < 1 {
-            return Err(PfcpError::BufferTooShort {
-                needed: 1,
-                available: 0,
-            });
-        }
-        let flags = buf.get_u8();
-        let v6 = flags & 0x01 != 0;
-        let v4 = flags & 0x02 != 0;
-        let mut peer = RemoteGtpUPeer::default();
-        if v4 {
-            if buf.remaining() < 4 {
+        fn need(buf: &Bytes, n: usize) -> PfcpResult<()> {
+            if buf.remaining() < n {
                 return Err(PfcpError::BufferTooShort {
-                    needed: 4,
+                    needed: n,
                     available: buf.remaining(),
                 });
             }
+            Ok(())
+        }
+        let mut buf = Bytes::copy_from_slice(data);
+        need(&buf, 1)?;
+        let flags = buf.get_u8();
+        let mut peer = RemoteGtpUPeer::default();
+        if flags & 0x02 != 0 {
+            need(&buf, 4)?;
             let mut a = [0u8; 4];
             buf.copy_to_slice(&mut a);
             peer.ipv4 = Some(a);
         }
-        if v6 {
-            if buf.remaining() < 16 {
-                return Err(PfcpError::BufferTooShort {
-                    needed: 16,
-                    available: buf.remaining(),
-                });
-            }
+        if flags & 0x01 != 0 {
+            need(&buf, 16)?;
             let mut a = [0u8; 16];
             buf.copy_to_slice(&mut a);
             peer.ipv6 = Some(a);
         }
+        // DI / NI / RTS. The pre-#1386 decoder ignored everything after the
+        // addresses, so a peer whose trailing fields are truncated or empty
+        // still decodes (to its addresses, as it always did) rather than
+        // failing the whole report: only complete fields are taken.
+        let mut rest = buf;
+        if flags & 0x04 != 0 {
+            match take_lv(&mut rest) {
+                Some(di) if !di.is_empty() => peer.destination_interface = Some(di[0] & 0x0f),
+                _ => return Ok(peer),
+            }
+        }
+        if flags & 0x08 != 0 {
+            match take_lv(&mut rest) {
+                Some(ni) => peer.network_instance = Some(ni.to_vec()),
+                None => return Ok(peer),
+            }
+        }
+        if flags & 0x10 != 0 && rest.remaining() >= 4 {
+            peer.recovery_time_stamp = Some(rest.get_u32());
+        }
         Ok(peer)
     }
+}
+
+/// A 2-octet-length-prefixed field of the Remote GTP-U Peer, or `None` when
+/// the length or the field is truncated.
+fn take_lv(buf: &mut Bytes) -> Option<Bytes> {
+    if buf.remaining() < 2 {
+        return None;
+    }
+    let len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+    if buf.remaining() < 2 + len {
+        return None;
+    }
+    buf.advance(2);
+    Some(buf.copy_to_bytes(len))
 }
 
 /// User Plane Path Failure Report grouped IE (TS 29.244 §7.4.5.1.2): one or
@@ -4892,6 +4983,9 @@ mod tests {
             mbsn4: true,
             psuprm: true,
             eppi: true,
+            // The octet-13/14 bits grow the IE; this test pins the 8-octet form.
+            qmdrm: false,
+            un6dm: false,
         };
         let mut buf = BytesMut::new();
         features.encode(&mut buf);
@@ -4938,6 +5032,129 @@ mod tests {
         let features = UpFunctionFeatures::decode(&mut bytes).unwrap();
         assert!(features.ftup && features.empu);
         assert!(!features.drqos);
+    }
+
+    /// #1386: TS 29.244 §8.2.25 grew to 12 feature octets (IE octets 5-16) in
+    /// Rel-20. A receiver must accept every length a peer may send and ignore
+    /// spare bits: 6 (Rel-16), 8 (this tree's default), 10 (with octet 13-14
+    /// bits) and 16 (a Rel-20 peer advertising everything).
+    #[test]
+    fn test_up_function_features_decode_6_8_10_16_octets() {
+        // FTUP (5/5) + EMPU (6/1) in every vector; QFQM (9/2) from 8 octets on.
+        let six = [0x10, 0x01, 0x00, 0x00, 0x00, 0x00];
+        let eight = [0x10, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00];
+        // + QMDRM (13/3) and UN6DM (14/2).
+        let ten = [0x10, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x04, 0x02];
+        // Every bit of octets 11-16 set: the named ones decode, the rest
+        // (RATP..MPQUIC-UDP, octet 12, the rest of 13-14, 15-16) are ignored.
+        let sixteen = [
+            0x10, 0x01, 0x00, 0x00, 0x02, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        ];
+        let d6 = UpFunctionFeatures::decode(&mut Bytes::copy_from_slice(&six)).unwrap();
+        assert!(d6.ftup && d6.empu && !d6.qfqm && !d6.un6dm && !d6.qmdrm);
+        let d8 = UpFunctionFeatures::decode(&mut Bytes::copy_from_slice(&eight)).unwrap();
+        assert!(d8.ftup && d8.empu && d8.qfqm && !d8.un6dm && !d8.qmdrm);
+        let d10 = UpFunctionFeatures::decode(&mut Bytes::copy_from_slice(&ten)).unwrap();
+        assert!(d10.ftup && d10.empu && d10.qfqm && d10.un6dm && d10.qmdrm);
+        let d16 = UpFunctionFeatures::decode(&mut Bytes::copy_from_slice(&sixteen)).unwrap();
+        assert_eq!(
+            d16,
+            UpFunctionFeatures {
+                ftup: true,
+                empu: true,
+                qfqm: true,
+                drqos: true,
+                mbsn4: true,
+                psuprm: true,
+                eppi: true,
+                qmdrm: true,
+                un6dm: true,
+                ..Default::default()
+            }
+        );
+        // A spare-only octet 13-14 sets nothing.
+        let spare = [0x10, 0x01, 0, 0, 0, 0, 0, 0, 0xfb, 0xfd];
+        let ds = UpFunctionFeatures::decode(&mut Bytes::copy_from_slice(&spare)).unwrap();
+        assert!(!ds.qmdrm && !ds.un6dm);
+    }
+
+    /// #1386: minimal-length encoding. 8 octets unless an octet 13-14 bit is
+    /// set, so a UPF that configures neither keeps the exact wire bytes the
+    /// CP functions in this tree (and older releases) were tested against.
+    #[test]
+    fn test_up_function_features_grow_only_for_octet_13_14_bits() {
+        let base = UpFunctionFeatures {
+            ftup: true,
+            empu: true,
+            qfqm: true,
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        base.encode(&mut buf);
+        assert_eq!(buf.len(), UpFunctionFeatures::ENCODED_LEN);
+        assert_eq!(base.encoded_len(), UpFunctionFeatures::ENCODED_LEN);
+        assert_eq!(
+            buf.as_ref(),
+            &[0x10, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00]
+        );
+
+        let un6dm = UpFunctionFeatures {
+            un6dm: true,
+            ..base
+        };
+        let mut buf = BytesMut::new();
+        un6dm.encode(&mut buf);
+        assert_eq!(buf.len(), UpFunctionFeatures::EXTENDED_LEN);
+        // UN6DM = octet 14 bit 2.
+        assert_eq!(
+            buf.as_ref(),
+            &[0x10, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02]
+        );
+        assert_eq!(
+            UpFunctionFeatures::decode(&mut buf.freeze()).unwrap(),
+            un6dm
+        );
+
+        let qmdrm = UpFunctionFeatures {
+            qmdrm: true,
+            ..base
+        };
+        let mut buf = BytesMut::new();
+        qmdrm.encode(&mut buf);
+        // QMDRM = octet 13 bit 3.
+        assert_eq!(
+            buf.as_ref(),
+            &[0x10, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x04, 0x00]
+        );
+        assert_eq!(
+            UpFunctionFeatures::decode(&mut buf.freeze()).unwrap(),
+            qmdrm
+        );
+    }
+
+    /// #1386 mixed-version, at the codec: a 10-octet feature IE from a new
+    /// UPF still decodes in a pre-#1386 CP function, whose decoder read
+    /// octets 5-11 and stopped. Reproduce that decoder's view (the first 7
+    /// octets) and check the common features agree.
+    #[test]
+    fn test_up_function_features_extended_form_is_compatible_with_7_octet_readers() {
+        let new = UpFunctionFeatures {
+            ftup: true,
+            empu: true,
+            qfqm: true,
+            un6dm: true,
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        new.encode(&mut buf);
+        let old_view = UpFunctionFeatures::decode(&mut Bytes::copy_from_slice(&buf[..7])).unwrap();
+        assert_eq!(
+            old_view,
+            UpFunctionFeatures {
+                un6dm: false,
+                ..new
+            }
+        );
     }
 
     #[test]
@@ -5079,6 +5296,7 @@ mod tests {
         let v4 = RemoteGtpUPeer {
             ipv4: Some([10, 0, 0, 5]),
             ipv6: None,
+            ..Default::default()
         };
         let mut buf = BytesMut::new();
         v4.encode(&mut buf);
