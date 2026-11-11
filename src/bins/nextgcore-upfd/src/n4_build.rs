@@ -1956,13 +1956,17 @@ pub fn build_heartbeat_request_with_load(
 /// Only features with working code paths are advertised (TS 29.244 8.2.25):
 /// - FTUP: F-TEID allocation in the UP function (CHOOSE flag handling)
 /// - EMPU: sending of End Marker packets
+/// - GPQM: per GTP-U path QoS monitoring (§5.24.5), only when `gpqm` is set, i.e.
+///   the operator enabled it (`--gtpu-path-qos-monitoring`, #1389)
 ///
-/// Encoded with the nextgcore-pfcp library codec (full 8 feature octets).
-pub fn upf_function_features() -> Vec<u8> {
+/// Encoded with the nextgcore-pfcp library codec at minimal length: 8 feature
+/// octets (GPQM is octet 9, so it does not grow the IE).
+pub fn upf_function_features(gpqm: bool) -> Vec<u8> {
     use bytes::BytesMut;
     let features = nextgcore_pfcp::types::UpFunctionFeatures {
         ftup: true,
         empu: true,
+        gpqm,
         ..Default::default()
     };
     let mut buf = BytesMut::with_capacity(nextgcore_pfcp::types::UpFunctionFeatures::ENCODED_LEN);
@@ -2008,6 +2012,62 @@ pub fn build_node_report_request(
     b.build()
 }
 
+/// A PFCP Node Report Request carrying GTP-U path QoS reports (#1389, TS 29.244
+/// §7.4.5.1): Node ID, Node Report Type with GPQR (bit 4, §8.2.69) and one GTP-U
+/// Path QoS Report IE (Table 7.4.5.1.5-1) per report.
+pub fn build_gtpu_path_qos_node_report(
+    node_id: &NodeId,
+    reports: &[nextgcore_pfcp::qos_monitoring::GtpUPathQosReport],
+) -> Vec<u8> {
+    use nextgcore_pfcp::qos_monitoring::TypedIe;
+    let mut b = PfcpMessageBuilder::new();
+    b.add_node_id(node_id);
+    b.add_u8(pfcp_ie::NODE_REPORT_TYPE, 0x08);
+    let mut body = b.build();
+    let mut buf = bytes::BytesMut::new();
+    for r in reports {
+        r.encode_ie(&mut buf);
+    }
+    body.extend_from_slice(&buf);
+    body
+}
+
+/// The GTP-U Path QoS Control Information IEs (238) of an Association Setup or
+/// Update Request (#1389, Table 7.4.4.1.3-1). One that does not decode is
+/// skipped and logged, so a malformed instance does not lose the others.
+pub fn parse_gtpu_path_qos_control_information(
+    payload: &[u8],
+) -> Vec<nextgcore_pfcp::qos_monitoring::GtpUPathQosControlInformation> {
+    use nextgcore_pfcp::qos_monitoring::{GtpUPathQosControlInformation, TypedIe};
+    ParsedIe::parse_all(payload)
+        .iter()
+        .filter(|ie| ie.ie_type == GtpUPathQosControlInformation::IE_TYPE as u16)
+        .filter_map(
+            |ie| match GtpUPathQosControlInformation::decode_value(&ie.value) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    log::warn!("GTP-U Path QoS Control Information ignored: {e}");
+                    None
+                }
+            },
+        )
+        .collect()
+}
+
+/// Association Update Response (TS 29.244 §7.4.4.4): Node ID, Cause and the UP
+/// Function Features.
+pub fn build_association_update_response(
+    node_id: &NodeId,
+    cause: PfcpCause,
+    gpqm: bool,
+) -> Vec<u8> {
+    let mut builder = PfcpMessageBuilder::new();
+    builder.add_node_id(node_id);
+    builder.add_cause(cause);
+    builder.add_tlv(pfcp_ie::UP_FUNCTION_FEATURES, &upf_function_features(gpqm));
+    builder.build()
+}
+
 /// Build Association Setup Response
 ///
 /// `sessions_retained` sets PSREI in a PFCPASRsp-Flags IE (TS 29.244 §6.2.6.2.2,
@@ -2019,13 +2079,14 @@ pub fn build_association_setup_response(
     recovery_time_stamp: u32,
     cause: PfcpCause,
     sessions_retained: bool,
+    gpqm: bool,
 ) -> Vec<u8> {
     let mut builder = PfcpMessageBuilder::new();
     builder.add_node_id(node_id);
     builder.add_cause(cause);
     builder.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, recovery_time_stamp);
     // UP Function Features — only the bits this UPF really implements
-    builder.add_tlv(pfcp_ie::UP_FUNCTION_FEATURES, &upf_function_features());
+    builder.add_tlv(pfcp_ie::UP_FUNCTION_FEATURES, &upf_function_features(gpqm));
     if sessions_retained {
         builder.add_u8(pfcp_ie::PFCPASRSP_FLAGS, 0x01); // PSREI
     }
