@@ -27,7 +27,9 @@ mkdir -p "${OUT}/d446a" "${OUT}/metrics"
 fails=0
 fail() { echo "DEMO CHECK FAILED: $*"; fails=$((fails + 1)); }
 
-logs() { "${K[@]}" logs "deploy/$1" -c "$1" 2>/dev/null > "${OUT}/d446a/$2.log"; }
+# logs DEPLOY NAME: the gNB container of DEPLOY. Both gNB Deployments (gnb, the
+# booster, and gnb-a) name their container `gnb`; `-c gnb-a` read nothing.
+logs() { "${K[@]}" logs "deploy/$1" -c gnb 2>/dev/null > "${OUT}/d446a/$2.log"; }
 wait_for() {   # wait_for DEPLOY NAME ERE
     local t=0
     while (( t < TIMEOUT )); do
@@ -77,7 +79,12 @@ case "${DEMO_MODE}" in
     energy-saving)  wait_for gnb gnb-b 'off the air: [0-9]+ heartbeat' || fail "no dropped heartbeat in ${TIMEOUT}s" ;;
     *) echo "unknown mode ${DEMO_MODE}"; exit 2 ;;
 esac
-logs gnb gnb-b; logs gnb-a gnb-a; logs amf amf
+logs gnb gnb-b; logs gnb-a gnb-a
+"${K[@]}" logs deploy/amf -c amf 2>/dev/null > "${OUT}/d446a/amf.log"
+# An empty capture would make every "absent" assertion pass vacuously.
+for f in gnb-b gnb-a amf; do
+    [[ -s "${OUT}/d446a/${f}.log" ]] || fail "[${f}] captured log is empty"
+done
 west="${OUT}/d446a/gnb-b.log" east="${OUT}/d446a/gnb-a.log" amf="${OUT}/d446a/amf.log"
 
 case "${DEMO_MODE}" in
