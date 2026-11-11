@@ -5536,26 +5536,42 @@ fn handover_allocation_failed_response(sm_context_ref: &str, alloc_fail: &[u8]) 
     )
 }
 
-/// The per-SM-context lock of [`recover_upf_ul_endpoint`] (#1230 review 2). The entry
-/// goes when the last holder or waiter does, as `eps_to_5gs`'s handover lock does.
-struct UlRecoveryLock {
+/// A per-SM-context single-flight lock (an async mutex, so it may be held across the
+/// N4 and SBI awaits it serialises). The map entry goes when the last holder or waiter
+/// does, as `eps_to_5gs`'s handover lock does.
+///
+/// One map per purpose, so two procedures that do not conflict do not wait on each
+/// other: [`ul_recovery_locks`] (#1230 review 2) and [`policy_apply_locks`] (#1387
+/// review).
+struct SmContextLock {
+    map: &'static SmContextLockMap,
     key: String,
     lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
-fn ul_recovery_locks() -> &'static std::sync::Mutex<
-    std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
-> {
-    static LOCKS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
-    > = std::sync::OnceLock::new();
+type SmContextLockMap =
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>;
+
+/// The locks of [`recover_upf_ul_endpoint`] (#1230 review 2).
+fn ul_recovery_locks() -> &'static SmContextLockMap {
+    static LOCKS: std::sync::OnceLock<SmContextLockMap> = std::sync::OnceLock::new();
     LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-impl UlRecoveryLock {
-    async fn acquire(sm_context_ref: &str) -> Self {
-        let lock = ul_recovery_locks()
+/// The locks that serialise applying a policy change to one session (#1387 review m1):
+/// [`handle_sm_policy_notify`] and the SDM arm of [`handle_sdm_notification`]. Each
+/// reads the binding, awaits the UPF's QER answer, then writes the binding back. Two
+/// of them interleaved across that await both merged onto the same `current`, and the
+/// later write-back silently undid the earlier change.
+fn policy_apply_locks() -> &'static SmContextLockMap {
+    static LOCKS: std::sync::OnceLock<SmContextLockMap> = std::sync::OnceLock::new();
+    LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+impl SmContextLock {
+    async fn acquire(map: &'static SmContextLockMap, sm_context_ref: &str) -> Self {
+        let lock = map
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .entry(sm_context_ref.to_string())
@@ -5563,6 +5579,7 @@ impl UlRecoveryLock {
             .clone();
         let guard = lock.clone().lock_owned().await;
         Self {
+            map,
             key: sm_context_ref.to_string(),
             lock,
             guard: Some(guard),
@@ -5570,12 +5587,10 @@ impl UlRecoveryLock {
     }
 }
 
-impl Drop for UlRecoveryLock {
+impl Drop for SmContextLock {
     fn drop(&mut self) {
         self.guard.take();
-        let mut locks = ul_recovery_locks()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut locks = self.map.lock().unwrap_or_else(|e| e.into_inner());
         // The map's reference and this one: nobody else holds or awaits it.
         if std::sync::Arc::strong_count(&self.lock) == 2 {
             locks.remove(&self.key);
@@ -5610,7 +5625,7 @@ async fn recover_upf_ul_endpoint(sm_context_ref: &str) -> Option<(u32, [u8; 4])>
     // arrive together must not both remove PDR 1 and choose a TEID: the second removal
     // would take away the TEID the first one handed to the gNB. The later callers wait
     // here and then find the endpoint the first one recorded.
-    let _recovering = UlRecoveryLock::acquire(sm_context_ref).await;
+    let _recovering = SmContextLock::acquire(ul_recovery_locks(), sm_context_ref).await;
     if let Some(known) = lookup_upf_ul_endpoint(sm_context_ref) {
         return Some(known);
     }
@@ -9917,6 +9932,9 @@ async fn handle_sm_policy_notify(sm_context_ref: &str, request: &SbiRequest) -> 
         return problem_400("INVALID_MSG_FORMAT", "SmPolicyNotification body required");
     };
 
+    // #1387 review m1: one policy change at a time per session, taken BEFORE the
+    // binding is read, so the merge below is onto what the previous change wrote.
+    let _applying = SmContextLock::acquire(policy_apply_locks(), sm_context_ref).await;
     let Some(binding) = lookup_policy_binding(sm_context_ref) else {
         return send_not_found(
             &format!("No SM context for ref={sm_context_ref}"),
@@ -9985,14 +10003,30 @@ async fn handle_sm_policy_notify(sm_context_ref: &str, request: &SbiRequest) -> 
         }
     }
 
-    // Persist the updated AMBR in the binding
+    // Persist the merged session-rule members in the binding, and the AMBR on the
+    // session too.
+    //
+    // #1387 review M1: the ARP as well. It is merged from `authDefQos.arp` (TS 29.512
+    // §4.2.6.3.3), and a re-activation rebuilds the Setup Request Transfer from the
+    // binding's ARP (#518), so dropping it here answered 204 and then lost the change.
+    // And `SmfSess.session_ambr`, which the Retrieve and the EPS/GTP-C encoders read,
+    // as the SDM arm already does: left stale, an EPS move carried the AMBR from
+    // establishment.
     if let Ok(ctx) = smf_self().read() {
         if let Ok(mut bindings) = ctx.policy_bindings.write() {
             if let Some(b) = bindings.get_mut(sm_context_ref) {
                 b.ambr_ul_bps = dec.sess_ambr_ul_bps;
                 b.ambr_dl_bps = dec.sess_ambr_dl_bps;
                 b.five_qi = dec.def_five_qi;
+                b.arp_priority_level = dec.arp_priority_level;
             }
+        }
+        if let Some(mut sess) = ctx.sess_find_by_sm_context_ref(sm_context_ref) {
+            sess.session_ambr = context::SessionAmbr {
+                uplink: dec.sess_ambr_ul_bps,
+                downlink: dec.sess_ambr_dl_bps,
+            };
+            ctx.sess_update(&sess);
         }
         // Issue #191: durable too, not just in memory.
         ctx.persist();
@@ -10193,6 +10227,12 @@ async fn handle_sdm_notification(sm_context_ref: &str, request: &SbiRequest) -> 
             decision.def_five_qi
         );
     }
+
+    // #1387 review m1: the apply (N4 then the write-back) is serialised with the PCF's
+    // UpdateNotify for the same session. Taken only HERE, after the PCF has answered:
+    // a PCF that notifies this session while answering the SE_AMBR_CH update would
+    // otherwise wait on a lock held across its own answer.
+    let _applying = SmContextLock::acquire(policy_apply_locks(), sm_context_ref).await;
 
     // The N4 QER, through the SAME function the PCF-update path uses: a second way to
     // change a live session's QoS is a second thing to keep correct, and #293 asks
@@ -24598,6 +24638,18 @@ mod tests {
         std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
         tokio::task::JoinHandle<()>,
     ) {
+        modification_recording_upf_delayed_1387(std::time::Duration::ZERO).await
+    }
+
+    /// [`modification_recording_upf_1387`], answering each request after `delay` on its
+    /// own task, so two modifications can be in flight together.
+    async fn modification_recording_upf_delayed_1387(
+        delay: std::time::Duration,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         use pfcp_path::pfcp_message_type as t;
         let upf = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let addr = upf.local_addr().unwrap();
@@ -24620,10 +24672,39 @@ mod tests {
                     h.sequence_number,
                     &[0x00, 0x13, 0x00, 0x01, 1],
                 );
-                let _ = upf.send_to(&reply, from).await;
+                let upf = upf.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let _ = upf.send_to(&reply, from).await;
+                });
             }
         });
         (addr, seen, task)
+    }
+
+    /// The session's `session_ambr` (what Retrieve and the EPS/GTP-C encoders read) and
+    /// the APN-AMBR an Update Bearer Request built from it carries, in kbit/s
+    /// (TS 29.274 §8.7).
+    fn session_and_eps_ambr_1387(sm_context_ref: &str) -> ((u64, u64), (u32, u32)) {
+        let sess = smf_self()
+            .read()
+            .expect("context")
+            .sess_find_by_sm_context_ref(sm_context_ref)
+            .expect("session");
+        let bearer = context::SmfBearer::new(1, sess.id);
+        let msg = gtp_build::build_update_bearer_request(&sess, &bearer, None, None, false);
+        let mut bytes = bytes::Bytes::from(msg);
+        let m = nextgcore_gtp::v2::Gtp2Message::decode(&mut bytes).expect("decode");
+        let ambr = m
+            .get_ie(nextgcore_gtp::v2::Gtp2IeType::Ambr as u8, 0)
+            .expect("APN-AMBR")
+            .value
+            .to_vec();
+        let be = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+        (
+            (sess.session_ambr.uplink, sess.session_ambr.downlink),
+            (be(&ambr[..4]), be(&ambr[4..8])),
+        )
     }
 
     /// The (UL, DL) MBR, in bit/s, of the Update QER in a Session Modification body
@@ -24734,6 +24815,11 @@ mod tests {
             (30_000_000, 70_000_000),
             "and the QER keeps enforcing that AMBR"
         );
+        assert_eq!(
+            session_and_eps_ambr_1387(&sm_context_ref),
+            ((30_000_000, 70_000_000), (30_000, 70_000)),
+            "the session, and the EPS encoder reading it, hold the enforced AMBR"
+        );
 
         // 2. A changed session rule, AMBR only: only the AMBR changes.
         let qer = notify(serde_json::json!({
@@ -24750,6 +24836,11 @@ mod tests {
              (TS 29.512 §4.2.6.3.1: unsupplied attributes remain valid)"
         );
         assert_eq!(qer, (40_000_000, 80_000_000));
+        assert_eq!(
+            session_and_eps_ambr_1387(&sm_context_ref),
+            ((40_000_000, 80_000_000), (40_000, 80_000)),
+            "a PCF-changed AMBR reaches the session, so an EPS move carries it"
+        );
 
         // 3a. A removed PCC rule changes nothing session-level.
         notify(serde_json::json!({ "pccRules": { "PccRule-af-1": null } })).await;
@@ -24784,6 +24875,64 @@ mod tests {
             "the replacing session rule is enforced, whichever order the map has"
         );
         assert_eq!(qer, (50_000_000, 90_000_000));
+        assert_eq!(
+            lookup_policy_binding(&sm_context_ref)
+                .expect("binding")
+                .arp_priority_level,
+            5,
+            "the merged ARP is written back (TS 29.512 §4.2.6.3.3): a re-activation \
+             rebuilds the Setup Request Transfer from it"
+        );
+        assert_eq!(
+            session_and_eps_ambr_1387(&sm_context_ref),
+            ((50_000_000, 90_000_000), (50_000, 90_000))
+        );
+
+        listener.abort();
+        upf_task.abort();
+    }
+
+    /// #1387 review m1: two UpdateNotifies for one session in flight together are
+    /// applied one after the other, so neither undoes the other. The UPF answers each
+    /// QER modification after 200 ms, which puts the second notify inside the first's
+    /// await.
+    ///
+    /// REVERT-VERIFIED: without the `policy_apply_locks` guard both merge onto the same
+    /// (30M, 70M, 6) and the later write-back wins, so the binding ends at either
+    /// (40M, 80M, 6) or (30M, 70M, 8), never both changes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_update_notifies_for_one_session_are_serialised_1387() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let (upf, _seen, upf_task) =
+            modification_recording_upf_delayed_1387(std::time::Duration::from_millis(200)).await;
+        let (_client, listener) = client_behind_the_real_listener(upf).await;
+        let sm_context_ref = seed_notified_session_1387("imsi-001010000011387", 22, 0x11387);
+
+        let ambr_change = policy_notify_1387(
+            &sm_context_ref,
+            serde_json::json!({ "sessRules": { "SessRule-pol-1387": {
+                "authSessAmbr": { "uplink": "40 Mbps", "downlink": "80 Mbps" },
+            }}}),
+        );
+        let five_qi_change = policy_notify_1387(
+            &sm_context_ref,
+            serde_json::json!({ "sessRules": { "SessRule-pol-1387": {
+                "authDefQos": { "5qi": 8 },
+            }}}),
+        );
+        let first = tokio::spawn(smf_sbi_request_handler(ambr_change));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let second = tokio::spawn(smf_sbi_request_handler(five_qi_change));
+        assert_eq!(first.await.expect("first").status, 204);
+        assert_eq!(second.await.expect("second").status, 204);
+        assert_eq!(
+            enforced_1387(&sm_context_ref),
+            (40_000_000, 80_000_000, 8),
+            "both changes must survive: the second notify merges onto what the first wrote"
+        );
 
         listener.abort();
         upf_task.abort();

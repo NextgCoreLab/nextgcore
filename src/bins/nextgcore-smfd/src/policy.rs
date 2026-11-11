@@ -1266,6 +1266,12 @@ pub fn parse_sm_policy_decision(sm_policy_id: &str, json: &serde_json::Value) ->
 /// rules (an AF or TSC decision) reset the live Session-AMBR and default 5QI to the
 /// config defaults.
 ///
+/// Only the SESSION-RULE members (Session-AMBR, default 5QI, ARP) are merged: they are
+/// the members a session holds between notifies (on its policy binding). PCC rules and
+/// the TSC containers are taken from the notify as they stand -- the binding stores
+/// neither, so there is nothing to merge them onto; the TSC containers are acted on
+/// only when the notify carries some, which makes "as they stand" the delta.
+///
 /// A `null` session rule is removed, never read as one. With no replacement in the
 /// same notify, the session keeps enforcing the values it has: a PDU session always
 /// has a Session-AMBR (TS 23.501 §5.7.2.6), and §4.2.6.3.1 requires the PCF to keep
@@ -1283,6 +1289,9 @@ pub fn merge_sm_policy_decision(
 /// Apply the members `json` carries onto `dec`; members it omits leave `dec` as is.
 fn apply_sm_policy_decision(dec: &mut PolicyDecision, json: &serde_json::Value) {
     dec.is_config_default = false;
+    // Replaced, not merged, also for a notify (#1387 review m2): the TSC containers are
+    // not held between decisions, and the notify path sends them to N4 only when this
+    // decision carries some, so an absent member here is "no TSC change" as it should be.
     dec.tsc = parse_tsc_containers(json);
 
     // Session rules: authorized session AMBR + default QoS. The first rule that is NOT
