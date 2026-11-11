@@ -15831,6 +15831,15 @@ impl NgapServer {
             .map(|s| (s.association_id, s.ran_ue_ngap_id))
             .filter(|pair| *pair != (association_id, notify.ran_ue_ngap_id));
 
+        // nextgsim#466: where the UE was, so the LOCATION_REPORT below goes only to
+        // the subscriptions whose `locationFilterList` covers what changed.
+        let located_before = self.ue_auth_state.get(notify.amf_ue_ngap_id).map(|s| {
+            (
+                s.amf_ue.nr_tai.clone(),
+                s.amf_ue.nr_cgi.clone(),
+                s.association_id,
+            )
+        });
         let updated = self.ue_auth_state.with_mut(notify.amf_ue_ngap_id, |state| {
             // Move the serving association/RAN-UE-NGAP-ID and location to the
             // target now that the UE has arrived (TS 23.502 Section 4.9.1.3).
@@ -15913,10 +15922,20 @@ impl NgapServer {
         // handover. Fired only when the Notify carried an NR location: without one the
         // `with_mut` above left the stored location as it was, so there is no location
         // the AMF has become aware of, and re-reporting the source cell would be wrong.
-        // Same snapshot as the presence report, read after the location write.
+        // And only to the subscriptions whose `locationFilterList` covers a dimension
+        // that changed (Table 6.2.6.2.3-1: absent means TA changes only), so an
+        // intra-TA handover does not reach a filter-less subscriber. Same snapshot as
+        // the presence report, read after the location write.
         if let Some(state) = self.ue_auth_state.get(notify.amf_ue_ngap_id) {
-            if notify.user_location_info.is_some() {
-                crate::namf_server::fire_location_report(&state.amf_ue);
+            if let (Some(_), Some((tai, cgi, assoc))) =
+                (&notify.user_location_info, &located_before)
+            {
+                let change = crate::context::LocationChange {
+                    tai: *tai != state.amf_ue.nr_tai,
+                    cell: *cgi != state.amf_ue.nr_cgi,
+                    ran_node: *assoc != state.association_id,
+                };
+                crate::namf_server::fire_location_change_report(&state.amf_ue, change);
             }
             crate::namf_server::fire_presence_in_aoi_report(&state.amf_ue);
         }
@@ -17628,6 +17647,14 @@ impl NgapServer {
                 // target (#406: `UserLocationInformation` is mandatory here, TS 38.413
                 // §9.2.3.8, and an Xn handover produces no HandoverNotify, so this is the
                 // AMF's only notice that the UE relocated). `with_mut`, so it persists.
+                // nextgsim#466: where the UE was, for the LOCATION_REPORT filter below.
+                let located_before = self.ue_auth_state.get(amf_ue_ngap_id).map(|s| {
+                    (
+                        s.amf_ue.nr_tai.clone(),
+                        s.amf_ue.nr_cgi.clone(),
+                        s.association_id,
+                    )
+                });
                 self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
                     let committed = state.amf_ue.advance_next_hop();
                     debug_assert_eq!(committed, (ncc, nh), "the previewed NH is the one sent");
@@ -17643,11 +17670,19 @@ impl NgapServer {
                 // (*"Updated Location ... when AMF becomes aware of a location change of
                 // the UE"*, `29518-k00.txt:23958-23966`). Read after the `with_mut`, so it reports
                 // the TARGET cell; only for an Acknowledge, because a Failure leaves the
-                // UE where it was.
-                if req.user_location_info.is_some() {
-                    if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
-                        crate::namf_server::fire_location_report(&state.amf_ue);
-                    }
+                // UE where it was; and only to subscriptions whose `locationFilterList`
+                // covers what changed (absent = TA only).
+                if let (Some(_), Some((tai, cgi, assoc)), Some(state)) = (
+                    &req.user_location_info,
+                    &located_before,
+                    self.ue_auth_state.get(amf_ue_ngap_id),
+                ) {
+                    let change = crate::context::LocationChange {
+                        tai: *tai != state.amf_ue.nr_tai,
+                        cell: *cgi != state.amf_ue.nr_cgi,
+                        ran_node: *assoc != state.association_id,
+                    };
+                    crate::namf_server::fire_location_change_report(&state.amf_ue, change);
                 }
                 // #570: the UE Radio Capability ID, when the UE has one (TS 38.413 §9.2.3.9).
                 let bytes = crate::racs::add_capability_ies(bytes, racs_id.as_deref(), None);
@@ -33387,6 +33422,15 @@ mod tests {
         supi: &str,
         tag: &str,
     ) -> (nextgcore_sbi::SbiServer, mpsc::Receiver<String>) {
+        location_report_sink_filtered(supi, tag, None).await
+    }
+
+    /// [`location_report_sink`] with a `locationFilterList` on the event.
+    async fn location_report_sink_filtered(
+        supi: &str,
+        tag: &str,
+        filters: Option<&[&str]>,
+    ) -> (nextgcore_sbi::SbiServer, mpsc::Receiver<String>) {
         let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let port = addr.port();
         let (tx, rx) = mpsc::channel::<String>(16);
@@ -33408,7 +33452,13 @@ mod tests {
             nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
                 .with_json_body(&serde_json::json!({
                     "subscription": {
-                        "eventList": [{ "type": "LOCATION_REPORT" }],
+                        "eventList": [match filters {
+                            None => serde_json::json!({ "type": "LOCATION_REPORT" }),
+                            Some(f) => serde_json::json!({
+                                "type": "LOCATION_REPORT",
+                                "locationFilterList": f,
+                            }),
+                        }],
                         "eventNotifyUri": format!("http://127.0.0.1:{port}/notify/{tag}"),
                         "notifyCorrelationId": format!("corr-{tag}"),
                         "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
@@ -33483,6 +33533,10 @@ mod tests {
             guard.amf_ue_publish(&ue_snapshot, 41, source);
         }
         let (sink, mut rx) = location_report_sink(supi, "466-ho").await;
+        // An inter-TA handover changes the cell too, so a [CELL_ID] subscriber
+        // gets it as well as the filter-less (= [TAI]) one.
+        let (cell_sink, mut cell_rx) =
+            location_report_sink_filtered(supi, "466-ho-cell", Some(&["CELL_ID"])).await;
 
         server
             .handover_target_assoc
@@ -33500,7 +33554,114 @@ mod tests {
             "the TARGET's TAI and cell, from the HandoverNotify's ULI, not the source's \
              TAC 0466 / cell 000033333"
         );
+        let (_, tac, cell) = next_location_report(&mut cell_rx).await;
+        assert_eq!((tac.as_str(), cell.as_str()), ("0001", "000000042"));
         sink.stop().await.expect("sink stop");
+        cell_sink.stop().await.expect("sink stop");
+    }
+
+    /// **nextgsim#466, TS 29.518 Table 6.2.6.2.3-1** (`29518-k00.txt:21398-21404`): a
+    /// LOCATION_REPORT subscription without `locationFilterList` asks for TA changes
+    /// only. An INTRA-TA handover (same TAC 0x0001, cell 0x3_3333 to 0x42) therefore
+    /// reaches a `[CELL_ID]` subscriber and not a filter-less one. The CELL_ID report
+    /// is the positive control: both deliveries are spawned by the same fire, so once
+    /// it has arrived a filter-less one would have too.
+    ///
+    /// REVERT-VERIFIED: firing the unfiltered `fire_location_report` from
+    /// `handle_handover_notify` delivers to the filter-less subscriber and fails the
+    /// last assertion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_intra_ta_handover_reaches_only_a_cell_id_subscriber() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        let mut server = test_ngap_server().await;
+        let (source, target) = (94_663u64, 94_664u64);
+        let amf_ue_ngap_id = 78_467u64;
+        let supi = "imsi-001010000466003";
+        seed_gnb_session(&server, source).await;
+        seed_gnb_session(&server, target).await;
+        let mut state = UeNasContext::new(amf_ue_ngap_id, 41u32, source, false);
+        state.amf_ue.supi = Some(supi.to_string());
+        state.amf_ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        state.amf_ue.nr_tai.tac = 0x0001; // the target's TAC: intra-TA
+        state.amf_ue.nr_cgi.plmn_id = PlmnId::new("001", "01");
+        state.amf_ue.nr_cgi.cell_id = 0x0003_3333;
+        let ue_snapshot = state.amf_ue.clone();
+        server.ue_auth_state.insert(amf_ue_ngap_id, state);
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_publish(&ue_snapshot, 41, source);
+        }
+        let (plain, mut plain_rx) = location_report_sink(supi, "466-intra-plain").await;
+        let (cell, mut cell_rx) =
+            location_report_sink_filtered(supi, "466-intra-cell", Some(&["CELL_ID"])).await;
+
+        server
+            .handover_target_assoc
+            .insert(amf_ue_ngap_id, (target, 42));
+        server
+            .handle_handover_notify(target, &handover_notify_pdu(amf_ue_ngap_id, 42))
+            .await
+            .expect("handled");
+
+        let (_, tac, nci) = next_location_report(&mut cell_rx).await;
+        assert_eq!((tac.as_str(), nci.as_str()), ("0001", "000000042"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), plain_rx.recv())
+                .await
+                .is_err(),
+            "a subscription without locationFilterList asked for TA changes only"
+        );
+        plain.stop().await.expect("sink stop");
+        cell.stop().await.expect("sink stop");
+    }
+
+    /// nextgsim#466: the `locationFilterList` matrix (Table 6.2.6.3.5-1).
+    #[test]
+    fn location_filters_select_the_changed_dimensions() {
+        use crate::context::LocationChange;
+        let sub = |f: &[&str]| crate::context::EventSubscription {
+            subscription_id: "sub-466-matrix".to_string(),
+            notify_uri: "http://127.0.0.1:1/n".to_string(),
+            notify_correlation_id: String::new(),
+            nf_id: String::new(),
+            event_types: vec!["LOCATION_REPORT".to_string()],
+            supi: None,
+            gpsi: None,
+            pei: None,
+            group_id: None,
+            any_ue: true,
+            expiry: None,
+            subs_change_notify_uri: None,
+            subs_change_notify_correlation_id: None,
+            areas: Vec::new(),
+            reported_presence: std::collections::HashMap::new(),
+            reporting_threshold: None,
+            location_filters: f.iter().map(|s| s.to_string()).collect(),
+        };
+        let cell_only = LocationChange {
+            cell: true,
+            ran_node: true,
+            ..Default::default()
+        };
+        let ta = LocationChange {
+            tai: true,
+            cell: true,
+            ran_node: true,
+        };
+        assert!(
+            !sub(&[]).wants_location_change(cell_only),
+            "absent = TAI only"
+        );
+        assert!(sub(&[]).wants_location_change(ta));
+        assert!(sub(&["CELL_ID"]).wants_location_change(cell_only));
+        assert!(sub(&["RAN_NODE"]).wants_location_change(cell_only));
+        assert!(!sub(&["TAI"]).wants_location_change(cell_only));
+        assert!(
+            !sub(&["N3IWF"]).wants_location_change(ta),
+            "not observable here"
+        );
+        assert!(!sub(&["CELL_ID"]).wants_location_change(LocationChange::default()));
     }
 
     /// **nextgsim#466**, the Xn half: an Xn handover produces no HandoverNotify, so the
@@ -37003,6 +37164,7 @@ mod tests {
                 areas: Vec::new(),
                 reported_presence: std::collections::HashMap::new(),
                 reporting_threshold: None,
+                location_filters: Vec::new(),
             });
         }
 
@@ -37129,6 +37291,7 @@ mod tests {
                 areas: Vec::new(),
                 reported_presence: std::collections::HashMap::new(),
                 reporting_threshold: None,
+                location_filters: Vec::new(),
             });
         }
         (sink, rx)

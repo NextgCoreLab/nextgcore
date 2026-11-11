@@ -735,6 +735,17 @@ pub fn handle_event_subscribe(
         areas: Vec::new(),
         reported_presence: std::collections::HashMap::new(),
         reporting_threshold: None,
+        location_filters: subscription
+            .location_filter_list
+            .iter()
+            .flatten()
+            .map(|f| match f {
+                LocationFilter::Tai => "TAI",
+                LocationFilter::CellId => "CELL_ID",
+                LocationFilter::RanNodeId => "RAN_NODE",
+            })
+            .map(String::from)
+            .collect(),
     };
 
     let ctx = amf_self();
