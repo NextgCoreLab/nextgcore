@@ -2993,6 +2993,11 @@ impl Default for SessionManager {
 /// Requests are built and sent by the PFCP server task).
 #[derive(Debug, Clone)]
 pub enum UpfReportEvent {
+    /// GTP-U path QoS reports (#1389, TS 29.244 §5.24.5.2) → PFCP Node Report
+    /// Request with GPQR and one GTP-U Path QoS Report IE per report.
+    PathQosReport {
+        reports: Vec<nextgcore_pfcp::qos_monitoring::GtpUPathQosReport>,
+    },
     /// First DL packet buffered under a BUFF+NOCP FAR → Downlink Data Report
     /// (TS 29.244 7.5.8.2 / 8.2.39)
     DownlinkDataReport {
@@ -3064,6 +3069,10 @@ pub struct DataPlane {
     /// GTP-U N3 path management state: per-gNB Echo/Recovery tracking.
     /// Access is infrequent (once per 60 s tick), never on the forwarding path.
     pub path_table: RwLock<GtpuPathTable>,
+    /// Per GTP-U path QoS monitoring (#1389, TS 29.244 §5.24.5): inactive until
+    /// the SMF provisions GTP-U Path QoS Control Information and the feature is
+    /// enabled (`--gtpu-path-qos-monitoring`).
+    pub path_qos: std::sync::Mutex<crate::path_qos::PathQosMonitor>,
 }
 
 /// Data plane statistics
@@ -3431,6 +3440,7 @@ impl DataPlane {
             gtpu_tclass: AtomicU64::new(GTPU_TOS_UNSET),
             local_gtpu_addr6: RwLock::new(None),
             path_table: RwLock::new(GtpuPathTable::default()),
+            path_qos: std::sync::Mutex::new(crate::path_qos::PathQosMonitor::default()),
         }
     }
 
@@ -3829,12 +3839,18 @@ impl DataPlane {
                      (ignored, TS 29.281 §8.2)",
                     header.seq_num
                 );
+                // #1389: a response to a QoS-monitoring probe is timed. Checked
+                // independently of the §7.2 path table, which keeps its own requests.
+                let probed = header
+                    .seq_num
+                    .is_some_and(|seq| self.on_path_qos_echo_response(from, seq));
                 let outcome = self
                     .path_table
                     .write()
                     .unwrap()
                     .on_echo_response(from, header.seq_num);
                 match outcome {
+                    EchoResponse::Unsolicited if probed => {}
                     EchoResponse::Unsolicited => log::debug!(
                         "GTP-U Echo Response from {from} answers nothing we sent: ignored"
                     ),
@@ -5052,6 +5068,98 @@ impl DataPlane {
 
     /// GTP-U N3 path management periodic task (upfd-04).
     ///
+    /// The IP addresses of the N3 (gNB) peers of the live sessions.
+    fn n3_peer_ips(&self) -> HashSet<std::net::IpAddr> {
+        let map = self.sessions.seid_map.read().unwrap();
+        map.values()
+            .map(|s| s.gnb_addr())
+            .filter(|a| !a.ip().is_unspecified())
+            .map(|a| a.ip().to_canonical())
+            .collect()
+    }
+
+    /// #1389: an Echo Response that answers one of the QoS-monitoring probes
+    /// becomes a delay sample (RTT/2, TS 29.244 §5.24.5.2); any report it
+    /// triggers (immediate, threshold) goes to the CP function. Returns whether
+    /// it answered a probe.
+    pub fn on_path_qos_echo_response(&self, from: SocketAddr, seq: u16) -> bool {
+        let now = std::time::Instant::now();
+        let rtt = self
+            .path_qos
+            .lock()
+            .unwrap()
+            .on_echo_response(from, seq, now);
+        let Some(rtt) = rtt else {
+            return false;
+        };
+        let delay = crate::path_qos::path_delay_ms(rtt);
+        log::debug!("GTP-U path QoS probe to {from}: RTT {rtt:?}, path delay {delay} ms");
+        let n3 = self.n3_peer_ips();
+        let reports = self.path_qos.lock().unwrap().on_sample(
+            from.ip().to_canonical(),
+            delay,
+            &n3,
+            now,
+            std::time::SystemTime::now(),
+        );
+        if !reports.is_empty() {
+            self.send_report_event(UpfReportEvent::PathQosReport { reports });
+        }
+        true
+    }
+
+    /// #1389: one round of GTP-U path QoS monitoring. Sends an Echo Request
+    /// probe to every monitored path and hands the periodic reports that are
+    /// due to the CP function. Does nothing while no control is provisioned.
+    pub async fn path_qos_round(&self) {
+        let n3_in_use: HashSet<SocketAddr> = {
+            let map = self.sessions.seid_map.read().unwrap();
+            map.values().map(|s| s.gnb_addr()).collect()
+        };
+        let n3_in_use = self.probeable_paths(n3_in_use);
+        let now = std::time::Instant::now();
+        let probes: Vec<(SocketAddr, u16)> = {
+            let mut m = self.path_qos.lock().unwrap();
+            if !m.is_active() {
+                return;
+            }
+            m.targets(&n3_in_use)
+                .into_iter()
+                .map(|peer| (peer, m.probe_sent(peer, now)))
+                .collect()
+        };
+        for (peer, seq) in probes {
+            let Some(sock) = self.socket_for(&peer) else {
+                continue;
+            };
+            if let Err(e) = sock.send_to(&build_gtpu_echo_request(seq), peer).await {
+                log::debug!("GTP-U path QoS probe to {peer} failed: {e}");
+            }
+        }
+        let n3 = self.n3_peer_ips();
+        let reports =
+            self.path_qos
+                .lock()
+                .unwrap()
+                .due_periodic(&n3, now, std::time::SystemTime::now());
+        if !reports.is_empty() {
+            self.send_report_event(UpfReportEvent::PathQosReport { reports });
+        }
+    }
+
+    /// #1389: run [`Self::path_qos_round`] every `interval` until shutdown.
+    pub async fn run_path_qos_monitoring(&self, interval: std::time::Duration) {
+        log::info!("GTP-U path QoS monitoring enabled (probe interval {interval:?})");
+        let mut tick = tokio::time::interval(interval);
+        loop {
+            tick.tick().await;
+            if self.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            self.path_qos_round().await;
+        }
+    }
+
     /// Sends Echo Requests to all active gNB addresses at `echo_interval_secs`
     /// intervals and tracks responses. Declares path failure after
     /// `miss_threshold` consecutive missed responses per peer. This runs as a
@@ -9975,5 +10083,113 @@ mod tests {
         let real: SocketAddr = "10.0.0.9:2152".parse().unwrap();
         let probed = dp.probeable_paths([NO_DL_ENDPOINT, real].into_iter().collect());
         assert_eq!(probed, [real].into_iter().collect());
+    }
+
+    /// #1389 (TS 29.244 §5.24.5.2): with GTP-U path QoS monitoring provisioned for
+    /// N3 paths by interface type, the UPF probes the gNB of a live session with an
+    /// Echo Request, times the Echo Response that the real receive handler takes in,
+    /// and reports RTT/2 as the path delay. The gNB stand-in holds each answer for
+    /// 40 ms (the injected delay), so the reported delay is 20 ms plus scheduling.
+    #[tokio::test]
+    async fn path_qos_probe_reports_half_the_injected_round_trip() {
+        use nextgcore_pfcp::qos_monitoring::{
+            GtpUPathInterfaceType, GtpUPathQosControlInformation, QosReportTrigger,
+        };
+        use std::time::Duration;
+        let gnb = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gnb_addr = gnb.local_addr().unwrap();
+        let upf_sock = Arc::new(TokioUdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let dp = DataPlane {
+            gtpu_socket: Some(upf_sock.clone()),
+            ..DataPlane::new(Arc::new(AtomicBool::new(false)))
+        };
+        dp.add_session_from_pfcp(
+            0x77,
+            0x1077,
+            Ipv4Addr::new(10, 45, 0, 7),
+            0x77,
+            0x277,
+            gnb_addr,
+            Some(1),
+            Some(9),
+        );
+        let (tx, mut rx) = mpsc::channel(8);
+        dp.set_report_channel(tx);
+
+        // Not provisioned: a round probes nothing.
+        dp.path_qos_round().await;
+        let mut buf = [0u8; 64];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), gnb.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "no probe before the SMF provisions monitoring"
+        );
+
+        dp.path_qos
+            .lock()
+            .unwrap()
+            .configure(&[GtpUPathQosControlInformation {
+                gtpu_path_interface_type: Some(GtpUPathInterfaceType {
+                    n9: false,
+                    n3: true,
+                }),
+                qos_report_trigger: QosReportTrigger {
+                    ire: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }]);
+        dp.path_qos_round().await;
+
+        // The gNB: answer the Echo Request with its sequence number, 40 ms later.
+        let (n, from) = tokio::time::timeout(Duration::from_secs(2), gnb.recv_from(&mut buf))
+            .await
+            .expect("the probe reaches the gNB")
+            .unwrap();
+        assert_eq!(buf[1], gtpu_msg_type::ECHO_REQUEST);
+        assert_eq!(n, 12);
+        let seq = [buf[8], buf[9]];
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let resp = [
+            0x32,
+            gtpu_msg_type::ECHO_RESPONSE,
+            0,
+            6,
+            0,
+            0,
+            0,
+            0,
+            seq[0],
+            seq[1],
+            0,
+            0,
+            GTPU_IE_RECOVERY,
+            0,
+        ];
+        gnb.send_to(&resp, from).await.unwrap();
+
+        // The UPF's receive path.
+        let mut rbuf = [0u8; 64];
+        let (n, src) = upf_sock.recv_from(&mut rbuf).await.unwrap();
+        dp.handle_uplink_packet(&rbuf[..n], src, -1).await;
+
+        let ev = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("an immediate report")
+            .unwrap();
+        let UpfReportEvent::PathQosReport { reports } = ev else {
+            panic!("expected a GTP-U path QoS report");
+        };
+        assert_eq!(reports.len(), 1);
+        let r = &reports[0];
+        assert!(r.qos_report_trigger.ire);
+        assert_eq!(r.remote_gtpu_peer.ipv4, Some([127, 0, 0, 1]));
+        assert_eq!(r.gtpu_path_interface_type.map(|t| t.n3), Some(true));
+        let d = r.qos_information[0].average_packet_delay;
+        assert!(
+            (20..=35).contains(&d),
+            "path delay {d} ms for a 40 ms round trip"
+        );
     }
 }

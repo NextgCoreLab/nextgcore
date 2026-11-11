@@ -43,6 +43,7 @@ pub mod gtp_path;
 pub mod mcast;
 pub mod n4_build;
 pub mod n4_handler;
+pub mod path_qos;
 pub mod pfcp_path;
 pub mod pfcp_sm;
 pub mod programmable_plane;
@@ -156,6 +157,19 @@ struct Args {
     /// path is unchanged.
     #[arg(long, default_value = "")]
     nrf_uri: String,
+
+    /// Per GTP-U path QoS monitoring (TS 29.244 §5.24.5, GPQM; #1389). Off by
+    /// default: only when set does this UPF advertise GPQM and act on the GTP-U
+    /// Path QoS Control Information an SMF provisions, timing Echo Request probes
+    /// of the monitored N3 paths and reporting the delay (RTT/2) in Node Reports.
+    /// `UPF_GTPU_PATH_QOS_MONITORING=true` is read when the flag is not given.
+    #[arg(long, default_value = "false")]
+    gtpu_path_qos_monitoring: bool,
+
+    /// Interval between GTP-U path QoS probes, in milliseconds (with
+    /// `--gtpu-path-qos-monitoring`).
+    #[arg(long, default_value = "1000")]
+    gtpu_path_qos_probe_interval_ms: u64,
 }
 
 /// The PFCP peer allowlist (#968): `--pfcp-allowed-peers`, else `UPF_PFCP_ALLOWED_PEERS`.
@@ -422,6 +436,9 @@ async fn main() -> Result<()> {
     // Host-name entries are re-resolved off the receive path (#968).
     allowed_peers.spawn_host_refresh(std::time::Duration::from_secs(10));
     pfcp_server.set_allowed_peers(allowed_peers);
+    let path_qos_monitoring = args.gtpu_path_qos_monitoring
+        || std::env::var("UPF_GTPU_PATH_QOS_MONITORING").is_ok_and(|v| v == "true" || v == "1");
+    pfcp_server.set_path_qos_monitoring(path_qos_monitoring);
     let pfcp_server = Arc::new(pfcp_server);
 
     // #325: point the NFProfile/LCI load gauge at the N4 session census. It used to
@@ -507,6 +524,12 @@ async fn main() -> Result<()> {
                 // also set), so the report cannot be lost, only duplicated -- and a
                 // duplicate carries its own UR-SEQN, which is what §8.2.60 exists for.
                 // #935: N3 path failure/recovery -> PFCP Node Report (§7.4.5.1).
+                // #1389: GTP-U path QoS -> PFCP Node Report with GPQR (§5.24.5.2).
+                data_plane::UpfReportEvent::PathQosReport { reports } => {
+                    if let Err(e) = pfcp_for_reports.send_gtpu_path_qos_report(&reports).await {
+                        log::warn!("GTP-U path QoS report was NOT sent: {e}");
+                    }
+                }
                 data_plane::UpfReportEvent::PathReport { failure, peers } => {
                     if let Err(e) = pfcp_for_reports.send_node_report(failure, &peers).await {
                         log::warn!("User-plane path report for {peers:?} was NOT sent: {e}");
@@ -558,6 +581,15 @@ async fn main() -> Result<()> {
     let path_mgmt_handle = tokio::spawn(async move {
         dp_for_path.run_path_management().await;
     });
+    // #1389: GTP-U path QoS monitoring probes, only when the operator enabled it.
+    if path_qos_monitoring {
+        let dp_for_qos = data_plane.clone();
+        let interval =
+            std::time::Duration::from_millis(args.gtpu_path_qos_probe_interval_ms.max(100));
+        tokio::spawn(async move {
+            dp_for_qos.run_path_qos_monitoring(interval).await;
+        });
+    }
 
     let data_plane_handle = if data_plane_enabled {
         log::info!("Starting data plane task...");

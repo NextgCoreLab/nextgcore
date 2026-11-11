@@ -645,6 +645,10 @@ pub struct PfcpServer {
     associated: Arc<AtomicBool>,
     /// Data plane handle for pulling final URR counters on session deletion
     data_plane: std::sync::RwLock<Option<Arc<crate::data_plane::DataPlane>>>,
+    /// #1389: per GTP-U path QoS monitoring is enabled by the operator
+    /// (`--gtpu-path-qos-monitoring`). Only then is GPQM advertised and GTP-U
+    /// Path QoS Control Information acted on.
+    gpqm: AtomicBool,
     /// UPF-initiated requests awaiting a response, tracked by sequence number
     /// for T1/N1 retransmission (TS 29.244 §7.2.2.3). Currently used for
     /// Session Report Requests (Downlink Data / Error Indication Reports).
@@ -979,6 +983,7 @@ impl PfcpServer {
             association: tokio::sync::RwLock::new(None),
             associated: Arc::new(AtomicBool::new(false)),
             data_plane: std::sync::RwLock::new(None),
+            gpqm: AtomicBool::new(false),
             pending_reports: tokio::sync::Mutex::new(HashMap::new()),
             heartbeat: tokio::sync::Mutex::new(HeartbeatState::default()),
             allowed_peers: std::sync::RwLock::new(PeerAllowlist::default()),
@@ -1126,6 +1131,7 @@ impl PfcpServer {
             *association = None;
             self.publish_associated(&association);
         }
+        self.clear_path_qos_control();
         self.delete_association_sessions(peer, reason).await;
     }
 
@@ -1356,6 +1362,10 @@ impl PfcpServer {
             }
             pfcp_type::ASSOCIATION_RELEASE_REQUEST => {
                 self.handle_association_release_request(&header, src_addr)
+                    .await?;
+            }
+            pfcp_type::ASSOCIATION_UPDATE_REQUEST => {
+                self.handle_association_update_request(&header, payload, src_addr)
                     .await?;
             }
             pfcp_type::SESSION_ESTABLISHMENT_REQUEST => {
@@ -1694,11 +1704,16 @@ impl PfcpServer {
             self.publish_associated(&association);
         }
 
+        // #1389: a new association replaces the GTP-U path QoS monitoring with
+        // what this request provisions (none clears it).
+        self.apply_path_qos_control(payload, true);
+
         let resp_payload = build_association_setup_response(
             &self.local_node_id,
             self.recovery_time_stamp,
             PfcpCause::RequestAccepted,
             sessions_retained,
+            self.gpqm(),
         );
 
         let response = self.build_response(
@@ -1726,6 +1741,7 @@ impl PfcpServer {
             self.recovery_time_stamp,
             PfcpCause::RequestRejected,
             false,
+            self.gpqm(),
         );
         let response = self.build_response(
             pfcp_type::ASSOCIATION_SETUP_RESPONSE,
@@ -2954,6 +2970,130 @@ impl PfcpServer {
         *self.data_plane.write().unwrap() = Some(dp);
     }
 
+    /// #1389: enable per GTP-U path QoS monitoring (GPQM, TS 29.244 §5.24.5).
+    pub fn set_path_qos_monitoring(&self, enabled: bool) {
+        self.gpqm.store(enabled, Ordering::Relaxed);
+    }
+
+    fn gpqm(&self) -> bool {
+        self.gpqm.load(Ordering::Relaxed)
+    }
+
+    /// #1389: apply the GTP-U Path QoS Control Information of an Association
+    /// Setup or Update Request (§5.24.5.2). Ignored unless GPQM is enabled: a
+    /// UPF that did not advertise the feature does not act on it.
+    fn apply_path_qos_control(&self, payload: &[u8], replace_when_absent: bool) {
+        if !self.gpqm() {
+            return;
+        }
+        let controls = crate::n4_build::parse_gtpu_path_qos_control_information(payload);
+        if controls.is_empty() && !replace_when_absent {
+            return;
+        }
+        if let Some(dp) = self.data_plane.read().unwrap().as_ref() {
+            dp.path_qos.lock().unwrap().configure(&controls);
+        }
+        if !controls.is_empty() {
+            log::info!(
+                "GTP-U path QoS monitoring provisioned: {} control instance(s)",
+                controls.len()
+            );
+        }
+    }
+
+    /// #1389: stop GTP-U path QoS monitoring (the association is gone).
+    fn clear_path_qos_control(&self) {
+        if let Some(dp) = self.data_plane.read().unwrap().as_ref() {
+            dp.path_qos.lock().unwrap().clear();
+        }
+    }
+
+    /// #1389: report GTP-U path QoS to the CP function in a PFCP Node Report
+    /// Request (§5.24.5.2, §7.4.5.1), tracked for T1/N1 retransmission.
+    pub async fn send_gtpu_path_qos_report(
+        &self,
+        reports: &[nextgcore_pfcp::qos_monitoring::GtpUPathQosReport],
+    ) -> Result<(), String> {
+        if reports.is_empty() {
+            return Err("no GTP-U path QoS reports".to_string());
+        }
+        let Some(peer) = self.association.read().await.as_ref().map(|a| a.peer_addr) else {
+            return Err("no PFCP association: no CP function to report to".to_string());
+        };
+        let payload =
+            crate::n4_build::build_gtpu_path_qos_node_report(&self.local_node_id, reports);
+        let seq = self.alloc_seq();
+        let message = self.build_response(pfcp_type::NODE_REPORT_REQUEST, 0, seq, &payload, false);
+        self.pending_reports.lock().await.insert(
+            seq,
+            PendingReport {
+                message: message.clone(),
+                dest: peer,
+                upf_seid: 0,
+                attempts: 0,
+                last_sent: std::time::Instant::now(),
+                usage: Vec::new(),
+            },
+        );
+        if let Err(e) = self.socket.send_to(&message, peer).await {
+            self.pending_reports.lock().await.remove(&seq);
+            return Err(format!("Failed to send Node Report Request: {e}"));
+        }
+        for r in reports {
+            log::info!(
+                "GTP-U path QoS report to {peer}: peer {:?}{:?} trigger {:?} avg {} ms",
+                r.remote_gtpu_peer.ipv4,
+                r.remote_gtpu_peer.ipv6,
+                r.qos_report_trigger,
+                r.qos_information
+                    .first()
+                    .map_or(0, |q| q.average_packet_delay)
+            );
+        }
+        Ok(())
+    }
+
+    /// Handle an Association Update Request (TS 29.244 §7.4.4.3) from the
+    /// associated CP function (#1389): acknowledged with the UP Function
+    /// Features, and its GTP-U Path QoS Control Information applied. An update
+    /// without one leaves the current monitoring as it is.
+    async fn handle_association_update_request(
+        &self,
+        header: &ParsedPfcpHeader,
+        payload: &[u8],
+        src_addr: SocketAddr,
+    ) -> Result<(), String> {
+        let ies = ParsedIe::parse_all(payload);
+        let cause = if ParsedIe::find_ie(&ies, pfcp_ie::NODE_ID).is_some() {
+            self.apply_path_qos_control(payload, false);
+            PfcpCause::RequestAccepted
+        } else {
+            PfcpCause::MandatoryIeMissing
+        };
+        let mut resp_payload = crate::n4_build::build_association_update_response(
+            &self.local_node_id,
+            cause,
+            self.gpqm(),
+        );
+        if cause == PfcpCause::MandatoryIeMissing {
+            let mut offending = crate::n4_build::PfcpMessageBuilder::new();
+            offending.add_u16(pfcp_ie::OFFENDING_IE, pfcp_ie::NODE_ID);
+            resp_payload.extend_from_slice(&offending.build());
+        }
+        let response = self.build_response(
+            pfcp_type::ASSOCIATION_UPDATE_RESPONSE,
+            0,
+            header.sequence_number,
+            &resp_payload,
+            false,
+        );
+        self.socket
+            .send_to(&response, src_addr)
+            .await
+            .map_err(|e| format!("Send error: {e}"))?;
+        Ok(())
+    }
+
     /// Republish the session count from the map's own length.
     ///
     /// Takes the write guard so it can only be called from inside a critical section
@@ -3760,6 +3900,195 @@ mod tests {
         // Recovery Time Stamp must be present and non-zero
         let rts = crate::n4_build::parse_recovery_time_stamp(body).unwrap();
         assert!(rts > 0, "recovery time stamp must be real, not hardcoded 0");
+    }
+
+    /// IE 238 for N3 paths by type, immediate reporting (#1389).
+    fn path_qos_control_ie() -> Vec<u8> {
+        use nextgcore_pfcp::qos_monitoring::{
+            GtpUPathInterfaceType, GtpUPathQosControlInformation, QosReportTrigger, TypedIe,
+        };
+        let mut buf = bytes::BytesMut::new();
+        GtpUPathQosControlInformation {
+            gtpu_path_interface_type: Some(GtpUPathInterfaceType {
+                n9: false,
+                n3: true,
+            }),
+            qos_report_trigger: QosReportTrigger {
+                ire: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .encode_ie(&mut buf);
+        buf.to_vec()
+    }
+
+    fn up_features(resp: &[u8]) -> Vec<u8> {
+        let (_, body) = ParsedPfcpHeader::parse(resp).unwrap();
+        let ies = ParsedIe::parse_all(body);
+        ParsedIe::find_ie(&ies, pfcp_ie::UP_FUNCTION_FEATURES)
+            .expect("UP Function Features")
+            .value
+            .clone()
+    }
+
+    /// #1389: OFF by default. An SMF that provisions GTP-U Path QoS Control
+    /// Information to a UPF without `--gtpu-path-qos-monitoring` gets the same
+    /// 8-octet features as before (no GPQM) and nothing is monitored.
+    #[tokio::test]
+    async fn path_qos_control_is_ignored_unless_enabled() {
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        server.set_data_plane(dp.clone());
+        let mut payload = build_association_setup_request_payload(Some(0x5000_0000));
+        payload.extend_from_slice(&path_qos_control_ie());
+        let resp = exchange(&smf, addr, &encode_pfcp(5, None, 1, &payload)).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(up_features(&resp), vec![0x10, 0x01, 0, 0, 0, 0, 0, 0]);
+        assert!(!dp.path_qos.lock().unwrap().is_active());
+    }
+
+    /// #1389 (TS 29.244 §5.24.5.1-2, §7.4.4.3): enabled, the UPF advertises GPQM
+    /// (octet 9 bit 3, still 8 octets) and applies IE 238 from the Association
+    /// Setup; an Association Update replaces it, one without IE 238 keeps it, and
+    /// the release of the association clears it.
+    #[tokio::test]
+    async fn path_qos_control_follows_setup_update_and_release() {
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        server.set_path_qos_monitoring(true);
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        server.set_data_plane(dp.clone());
+
+        let mut payload = build_association_setup_request_payload(Some(0x5000_0000));
+        payload.extend_from_slice(&path_qos_control_ie());
+        let resp = exchange(&smf, addr, &encode_pfcp(5, None, 1, &payload)).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(up_features(&resp), vec![0x10, 0x01, 0, 0, 0x04, 0, 0, 0]);
+        assert!(dp.path_qos.lock().unwrap().controls()[0].n3);
+
+        // Association Update with a periodic control on an explicit peer.
+        use nextgcore_pfcp::qos_monitoring::{
+            GtpUPathQosControlInformation, QosReportTrigger, TypedIe,
+        };
+        let mut upd = crate::n4_build::PfcpMessageBuilder::new();
+        upd.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        let mut upd = upd.build();
+        let mut ie = bytes::BytesMut::new();
+        GtpUPathQosControlInformation {
+            remote_gtpu_peers: vec![nextgcore_pfcp::types::RemoteGtpUPeer {
+                ipv4: Some([10, 0, 0, 9]),
+                ..Default::default()
+            }],
+            qos_report_trigger: QosReportTrigger {
+                per: true,
+                ..Default::default()
+            },
+            measurement_period: Some(5),
+            ..Default::default()
+        }
+        .encode_ie(&mut ie);
+        upd.extend_from_slice(&ie);
+        let resp = exchange(&smf, addr, &encode_pfcp(7, None, 2, &upd)).await;
+        assert_eq!(resp[1], pfcp_type::ASSOCIATION_UPDATE_RESPONSE);
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(up_features(&resp)[4], 0x04, "GPQM");
+        {
+            let m = dp.path_qos.lock().unwrap();
+            assert_eq!(m.controls().len(), 1);
+            assert_eq!(
+                m.controls()[0].peers,
+                vec!["10.0.0.9".parse::<IpAddr>().unwrap()]
+            );
+        }
+
+        // An update without IE 238 keeps what was provisioned.
+        let mut bare = crate::n4_build::PfcpMessageBuilder::new();
+        bare.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        let resp = exchange(&smf, addr, &encode_pfcp(7, None, 3, &bare.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert!(dp.path_qos.lock().unwrap().is_active());
+
+        // Node ID is M in the Update (Table 7.4.4.3-1).
+        let resp = exchange(&smf, addr, &encode_pfcp(7, None, 4, &[])).await;
+        assert_eq!(response_cause(&resp), PfcpCause::MandatoryIeMissing as u8);
+
+        // Release clears it.
+        let mut rel = crate::n4_build::PfcpMessageBuilder::new();
+        rel.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        let resp = exchange(&smf, addr, &encode_pfcp(9, None, 5, &rel.build())).await;
+        assert_eq!(resp[1], pfcp_type::ASSOCIATION_RELEASE_RESPONSE);
+        assert!(!dp.path_qos.lock().unwrap().is_active());
+    }
+
+    /// #1389: a GTP-U path QoS report goes out as a Node Report Request with GPQR
+    /// and the GTP-U Path QoS Report IE, tracked until its response.
+    #[tokio::test]
+    async fn path_qos_reports_go_out_as_node_reports() {
+        use nextgcore_pfcp::qos_monitoring::{
+            GtpUPathQosReport, QosInformationInGtpUPathQosReport, QosReportTrigger, TypedIe,
+        };
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        let payload = build_association_setup_request_payload(Some(0x5000_0000));
+        exchange(&smf, addr, &encode_pfcp(5, None, 1, &payload)).await;
+        let report = GtpUPathQosReport {
+            remote_gtpu_peer: nextgcore_pfcp::types::RemoteGtpUPeer {
+                ipv4: Some([10, 0, 0, 5]),
+                ..Default::default()
+            },
+            qos_report_trigger: QosReportTrigger {
+                per: true,
+                ..Default::default()
+            },
+            time_stamp: 0xe8a0_0000,
+            qos_information: vec![QosInformationInGtpUPathQosReport {
+                average_packet_delay: 21,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        server
+            .send_gtpu_path_qos_report(std::slice::from_ref(&report))
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 2048];
+        let (n, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), smf.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(buf[1], pfcp_type::NODE_REPORT_REQUEST);
+        let (hdr, body) = ParsedPfcpHeader::parse(&buf[..n]).unwrap();
+        let ies = ParsedIe::parse_all(body);
+        let t = ParsedIe::find_ie(&ies, pfcp_ie::NODE_REPORT_TYPE).unwrap();
+        assert_eq!(t.value, vec![0x08], "GPQR (bit 4)");
+        let r = ParsedIe::find_ie(&ies, 239).expect("GTP-U Path QoS Report");
+        assert_eq!(GtpUPathQosReport::decode_value(&r.value).unwrap(), report);
+        assert_eq!(server.pending_report_count().await, 1);
+        let mut ack = crate::n4_build::PfcpMessageBuilder::new();
+        ack.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        ack.add_cause(PfcpCause::RequestAccepted);
+        smf.send_to(
+            &encode_pfcp(
+                pfcp_type::NODE_REPORT_RESPONSE,
+                None,
+                hdr.sequence_number,
+                &ack.build(),
+            ),
+            addr,
+        )
+        .await
+        .unwrap();
+        for _ in 0..50 {
+            if server.pending_report_count().await == 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the Node Report Response did not stop retransmission");
     }
 
     /// #935 (TS 29.244 §7.4.5.1, Tables 7.4.5.1.2-1/7.4.5.1.3-1) on the wire: a path
