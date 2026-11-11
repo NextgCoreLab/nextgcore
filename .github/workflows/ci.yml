@@ -655,7 +655,7 @@ jobs:
           workspaces: src
       - name: build upfd
         run: cd src && cargo build -p nextgcore-upfd
-      - name: netem arms (off, 20 ms, 50 ms)
+      - name: netem arms (off, 20 ms, 50 ms, negative controls)
         run: |
           sudo modprobe sch_netem || true
           sudo TOL_MS=5 bash docker/qos-delay-netem/run.sh src/target/debug/nextgcore-upfd /tmp/qos-delay-netem
