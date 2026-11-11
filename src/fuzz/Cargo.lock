@@ -102,7 +102,7 @@ dependencies = [
 [[package]]
 name = "asn1-codecs"
 version = "0.7.2"
-source = "git+https://github.com/NextgCoreLab/asn1-codegen.git?rev=6d75c4962d09dcdb75eee7e4b8c03b14def2f123#6d75c4962d09dcdb75eee7e4b8c03b14def2f123"
+source = "git+https://github.com/NextgCoreLab/asn1-codegen.git?rev=aa0db6ca391a9df6d8143d9be30051bb13317c9b#aa0db6ca391a9df6d8143d9be30051bb13317c9b"
 dependencies = [
  "bitvec",
  "log",
@@ -113,7 +113,7 @@ dependencies = [
 [[package]]
 name = "asn1-compiler"
 version = "0.7.2"
-source = "git+https://github.com/NextgCoreLab/asn1-codegen.git?rev=6d75c4962d09dcdb75eee7e4b8c03b14def2f123#6d75c4962d09dcdb75eee7e4b8c03b14def2f123"
+source = "git+https://github.com/NextgCoreLab/asn1-codegen.git?rev=aa0db6ca391a9df6d8143d9be30051bb13317c9b#aa0db6ca391a9df6d8143d9be30051bb13317c9b"
 dependencies = [
  "anyhow",
  "bitvec",
@@ -131,7 +131,7 @@ dependencies = [
 [[package]]
 name = "asn1_codecs_derive"
 version = "0.7.2"
-source = "git+https://github.com/NextgCoreLab/asn1-codegen.git?rev=6d75c4962d09dcdb75eee7e4b8c03b14def2f123#6d75c4962d09dcdb75eee7e4b8c03b14def2f123"
+source = "git+https://github.com/NextgCoreLab/asn1-codegen.git?rev=aa0db6ca391a9df6d8143d9be30051bb13317c9b#aa0db6ca391a9df6d8143d9be30051bb13317c9b"
 dependencies = [
  "asn1-codecs 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "bitvec",
@@ -968,7 +968,7 @@ dependencies = [
 name = "nextgcore-lpp-gen"
 version = "0.1.0"
 dependencies = [
- "asn1-codecs 0.7.2 (git+https://github.com/NextgCoreLab/asn1-codegen.git?rev=6d75c4962d09dcdb75eee7e4b8c03b14def2f123)",
+ "asn1-codecs 0.7.2 (git+https://github.com/NextgCoreLab/asn1-codegen.git?rev=aa0db6ca391a9df6d8143d9be30051bb13317c9b)",
  "asn1-compiler",
  "asn1_codecs_derive",
  "bitvec",
@@ -979,7 +979,7 @@ dependencies = [
 name = "nextgcore-lte-rrc-gen"
 version = "0.1.0"
 dependencies = [
- "asn1-codecs 0.7.2 (git+https://github.com/NextgCoreLab/asn1-codegen.git?rev=6d75c4962d09dcdb75eee7e4b8c03b14def2f123)",
+ "asn1-codecs 0.7.2 (git+https://github.com/NextgCoreLab/asn1-codegen.git?rev=aa0db6ca391a9df6d8143d9be30051bb13317c9b)",
  "asn1-compiler",
  "asn1_codecs_derive",
  "bitvec",
@@ -1001,7 +1001,7 @@ dependencies = [
 name = "nextgcore-ngap-gen"
 version = "0.1.0"
 dependencies = [
- "asn1-codecs 0.7.2 (git+https://github.com/NextgCoreLab/asn1-codegen.git?rev=6d75c4962d09dcdb75eee7e4b8c03b14def2f123)",
+ "asn1-codecs 0.7.2 (git+https://github.com/NextgCoreLab/asn1-codegen.git?rev=aa0db6ca391a9df6d8143d9be30051bb13317c9b)",
  "asn1-compiler",
  "asn1_codecs_derive",
  "bitvec",
@@ -1012,7 +1012,7 @@ dependencies = [
 name = "nextgcore-nr-rrc-gen"
 version = "0.1.0"
 dependencies = [
- "asn1-codecs 0.7.2 (git+https://github.com/NextgCoreLab/asn1-codegen.git?rev=6d75c4962d09dcdb75eee7e4b8c03b14def2f123)",
+ "asn1-codecs 0.7.2 (git+https://github.com/NextgCoreLab/asn1-codegen.git?rev=aa0db6ca391a9df6d8143d9be30051bb13317c9b)",
  "asn1-compiler",
  "asn1_codecs_derive",
  "bitvec",
@@ -1023,7 +1023,7 @@ dependencies = [
 name = "nextgcore-nrppa-gen"
 version = "0.1.0"
 dependencies = [
- "asn1-codecs 0.7.2 (git+https://github.com/NextgCoreLab/asn1-codegen.git?rev=6d75c4962d09dcdb75eee7e4b8c03b14def2f123)",
+ "asn1-codecs 0.7.2 (git+https://github.com/NextgCoreLab/asn1-codegen.git?rev=aa0db6ca391a9df6d8143d9be30051bb13317c9b)",
  "asn1-compiler",
  "asn1_codecs_derive",
  "bitvec",
@@ -1044,7 +1044,7 @@ dependencies = [
 name = "nextgcore-s1ap-gen"
 version = "0.1.0"
 dependencies = [
- "asn1-codecs 0.7.2 (git+https://github.com/NextgCoreLab/asn1-codegen.git?rev=6d75c4962d09dcdb75eee7e4b8c03b14def2f123)",
+ "asn1-codecs 0.7.2 (git+https://github.com/NextgCoreLab/asn1-codegen.git?rev=aa0db6ca391a9df6d8143d9be30051bb13317c9b)",
  "asn1-compiler",
  "asn1_codecs_derive",
  "bitvec",
@@ -1055,7 +1055,7 @@ dependencies = [
 name = "nextgcore-sbcap-gen"
 version = "0.1.0"
 dependencies = [
- "asn1-codecs 0.7.2 (git+https://github.com/NextgCoreLab/asn1-codegen.git?rev=6d75c4962d09dcdb75eee7e4b8c03b14def2f123)",
+ "asn1-codecs 0.7.2 (git+https://github.com/NextgCoreLab/asn1-codegen.git?rev=aa0db6ca391a9df6d8143d9be30051bb13317c9b)",
  "asn1-compiler",
  "asn1_codecs_derive",
  "bitvec",

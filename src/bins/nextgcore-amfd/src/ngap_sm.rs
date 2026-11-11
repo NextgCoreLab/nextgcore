@@ -117,7 +117,7 @@ impl NgapFsm {
     fn handle_ngap_message(&mut self, event: &AmfEvent) -> NgapFsmResult {
         if let Some(ref ngap) = event.ngap {
             if let Some(ref _pkbuf) = ngap.pkbuf {
-                log::debug!("NGAP message received for gNB {}", self.gnb_id);
+                log::trace!("NGAP message received for gNB {}", self.gnb_id);
                 // Note: Decode NGAP message and handle based on procedure code
                 // NGAP message decoding handled by ngap_asn1 module, dispatch by ngap_handler:
                 // Initiating messages:

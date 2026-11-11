@@ -217,7 +217,7 @@ for i in $(seq 1 "$UE_COUNT"); do
         --ip "$UE_IP" \
         --cap-add NET_ADMIN \
         --device /dev/net/tun \
-        -e RUST_LOG=info,nextgsim_ue=debug,nextgsim_nas=debug \
+        -e RUST_LOG=info \
         -v "$SCRIPT_DIR/configs/ue-multi/ue${i}.yaml:/etc/nextgsim/ue.yaml:ro" \
         nextgsim-ue:latest \
         -c /etc/nextgsim/ue.yaml

@@ -1241,7 +1241,7 @@ impl PfcpServer {
             match recv_result {
                 Ok(Ok((len, src_addr))) => {
                     let data = &buf[..len];
-                    log::debug!("PFCP received {len} bytes from {src_addr}");
+                    log::trace!("PFCP received {len} bytes from {src_addr}");
 
                     if let Err(e) = self.handle_message(data, src_addr).await {
                         log::error!("PFCP message handling error: {e}");
@@ -1271,7 +1271,7 @@ impl PfcpServer {
     async fn handle_message(&self, data: &[u8], src_addr: SocketAddr) -> Result<(), String> {
         let (header, payload) = ParsedPfcpHeader::parse(data).map_err(|e| e.to_string())?;
 
-        log::debug!(
+        log::trace!(
             "PFCP message: type={}, seq={}, seid={:#x}",
             header.msg_type,
             header.sequence_number,
