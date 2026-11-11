@@ -14,7 +14,9 @@
 //!   time), read from `/proc/self`, and `nextgcore_uptime_seconds`.
 //! - `nextgcore_build_info{nf,version}`.
 //! - `nextg_demo_enabled{demo,mode}`, only while a demo is active
-//!   ([`nextgcore_demo::render_installed_metrics`], nextgsim#458).
+//!   ([`nextgcore_demo::render_installed_metrics`], nextgsim#458). Only in the
+//!   NFs that render through [`render_common`]; one that renders its own body
+//!   appends that call itself.
 //!
 //! # No subscriber identifiers in labels
 //!

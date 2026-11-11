@@ -35,8 +35,22 @@
 //! - [`install`] logs `WARN DEMO MODE ACTIVE: <key>=<mode>,...` once at startup.
 //! - [`render_installed_metrics`] writes `nextg_demo_enabled{demo,mode} 1` per
 //!   active demo, and nothing at all when none is active. `nextgcore-metrics`
-//!   calls it from `render_common`, so every NF's `/metrics` carries it.
+//!   calls it from `nf::render_common`, so the NFs that render their `/metrics`
+//!   through that (amfd, ausfd, bsfd, nrfd, nssfd, pcfd, smfd, udmd, udrd, upfd
+//!   at the time of writing) carry it with no extra code. An NF that renders
+//!   its own body (eesd, nwdafd, ...) must call [`render_installed_metrics`]
+//!   itself when it is wired for a demo.
 //! - [`demo_log!`] prefixes a demo's log lines with `[demo:<key>]`.
+//!
+//! # Wiring an NF for a demo
+//!
+//! 1. Under the demo's cargo feature, register its [`DemoSpec`] in the NF's
+//!    [`DemoRegistry`] (a default build registers nothing).
+//! 2. At startup, call [`init_from_root`] on the parsed config root and fail
+//!    startup on its error.
+//! 3. Read [`active_mode`] at each decision, and log with [`demo_log!`].
+//! 4. If the NF does not render `/metrics` through `nextgcore-metrics`'
+//!    `nf::render_common`, append [`render_installed_metrics`] to its body.
 //!
 //! # Switching
 //!
@@ -158,6 +172,10 @@ pub enum DemoConfigError {
     /// an enabled demo without a mode.
     #[error("demo config: {detail}")]
     Malformed { detail: String },
+    /// [`init_from_root`] ran a second time in this process: a programming
+    /// error, not a config error (the state is write-once).
+    #[error("demo config: demo state is already installed for this process")]
+    AlreadyInstalled,
 }
 
 fn malformed(detail: impl Into<String>) -> DemoConfigError {
@@ -406,7 +424,7 @@ pub fn init_from_root(
     registry: &DemoRegistry,
 ) -> Result<&'static ActiveDemos, DemoConfigError> {
     let active = DemoConfig::from_root(root)?.validate(registry)?;
-    install(active).map_err(|e| malformed(e.to_string()))
+    install(active).map_err(|AlreadyInstalled| DemoConfigError::AlreadyInstalled)
 }
 
 /// The installed state, or `None` before [`install`].

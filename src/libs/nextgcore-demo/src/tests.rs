@@ -273,6 +273,10 @@ fn install_logs_the_banner_once_and_feeds_the_metric_and_the_log_prefix() {
 
     // Write-once: no runtime switching.
     assert_eq!(install(ActiveDemos::default()), Err(AlreadyInstalled));
+    assert_eq!(
+        init_from_root(&root, &registry()),
+        Err(DemoConfigError::AlreadyInstalled)
+    );
     assert_eq!(active_mode("d441a-congestion-loop"), Some("closed-loop"));
 
     let logs = CAPTURE.0.lock().unwrap().clone();
