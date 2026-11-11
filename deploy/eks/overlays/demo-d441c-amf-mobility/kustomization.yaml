@@ -6,6 +6,7 @@
 #                  nwdaf-config (the toggle target) and a ClusterIP Service.
 #   gnb-east.yaml  a second gNB (NCI 0x020, gNB ID 2, same TAC) so the UE can
 #                  do an N2 handover, the nextgsim#456 compose topology.
+#   amf-log.yaml   amfd namf_server at debug, for the notify-delivery line.
 #   sim-n2ho.yaml  the base gNB/UE configs with the handover neighbour, the
 #                  positions and the UE's walk from west to east.
 #
@@ -26,3 +27,4 @@ resources:
   - gnb-east.yaml
 patches:
   - path: sim-n2ho.yaml
+  - path: amf-log.yaml

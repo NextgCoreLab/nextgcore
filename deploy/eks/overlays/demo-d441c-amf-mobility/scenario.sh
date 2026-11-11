@@ -10,9 +10,12 @@
 #   3. ask nwdafd for UE_MOBILITY for the UE's SUPI, and the NRF for nwdafd's
 #      profile; send one notify on a forged callback token.
 #
-#   on        ordered chain: "subscribed to AMF LOCATION_REPORT id=", then
-#             "ue-mobility ingest supi=<supi> cell=99970-000000010", then
-#             "... cell=99970-000000020"; the GET is 200 with ueMobs[0].locInfos
+#   on        ordered chain, nwdafd and amfd lines by kubelet timestamp:
+#             amfd "Event subscription created: id=<id>", nwdafd "subscribed to
+#             AMF LOCATION_REPORT id=<id>", nwdafd "ue-mobility ingest
+#             supi=<supi> cell=99970-000000010" with an amfd "Event notification
+#             delivered: sub=<id>" for it, then "... cell=99970-000000020" with
+#             its delivery; the GET is 200 with ueMobs[0].locInfos
 #             holding both cells, a schema-valid UeMobility; the profile lists
 #             UE_MOBILITY in eventIds; the forged notify is 404.
 #   baseline  no "subscribed to AMF" line; the GET is 204; the profile does not
@@ -82,7 +85,7 @@ in_nwdaf sh -c "curl -s --http2-prior-knowledge --max-time 10 'http://nrf.${NAME
 FORGED="$(in_nwdaf sh -c "curl -s --http2-prior-knowledge --max-time 10 -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' --data '{\"reportList\":[]}' http://127.0.0.1:7777/nnwdaf-callback/v1/amf-location-notify/00000000000000000000000000000000")"
 echo "${FORGED}" >"${S}/forged-notify.status"
 nwdaf_log | grep -E 'subscribed to AMF LOCATION_REPORT|ue-mobility' >"${S}/nwdaf-chain.txt"
-amf_log | grep -E 'HandoverNotify from association|Event subscription created' >"${S}/amf-chain.txt"
+amf_log | grep -E 'HandoverNotify from association|Event subscription created|Event notification delivered' >"${S}/amf-chain.txt"
 ADVERTISED="$(python3 - "${S}/nrf-nwdaf-profile.json" <<'PY'
 import json, sys
 try:
@@ -110,19 +113,50 @@ cells = [l["loc"]["nrLocation"]["ncgi"]["nrCellId"] for l in m["locInfos"]]
 assert a in cells and b in cells, cells
 print("[scenario] ueMobs[0].locInfos cells:", cells)
 PY
-  # The ordered chain, by kubelet timestamp.
-  python3 - "${S}/nwdaf-chain.txt" "${SUPI}" "${CELL_A}" "${CELL_B}" <<'PY' || FAILS=$((FAILS+1))
-import sys
-lines = open(sys.argv[1]).read().splitlines(); supi, a, b = sys.argv[2:5]
-def first(pat, after=-1):
-    for i, l in enumerate(lines):
-        if i > after and pat in l:
-            return i
-    raise SystemExit(f"[scenario] FAIL: missing in order: {pat}")
-s = first("subscribed to AMF LOCATION_REPORT id=")
-ia = first(f"ue-mobility ingest supi={supi} cell={a}", s)
-ib = first(f"ue-mobility ingest supi={supi} cell={b}", ia)
-print("[scenario] ordered chain ok:", lines[s].split(' ', 1)[0], lines[ia].split(' ', 1)[0], lines[ib].split(' ', 1)[0])
+  # The ordered chain across nwdafd and amfd, by kubelet timestamp.
+  python3 - "${S}/nwdaf-chain.txt" "${S}/amf-chain.txt" "${SUPI}" "${CELL_A}" "${CELL_B}" <<'PY' || FAILS=$((FAILS+1))
+import re, sys
+from datetime import datetime
+def load(path, who):
+    out = []
+    for l in open(path).read().splitlines():
+        ts, _, msg = l.partition(" ")
+        # kubelet: 2026-11-11T10:00:00.123456789Z; keep microseconds.
+        m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z$", ts)
+        if not m:
+            continue
+        frac = (m.group(2) or "0")[:6].ljust(6, "0")
+        out.append((datetime.strptime(f"{m.group(1)}.{frac}", "%Y-%m-%dT%H:%M:%S.%f"), who, msg))
+    return out
+nwdaf = load(sys.argv[1], "nwdaf"); amf = load(sys.argv[2], "amf")
+supi, a, b = sys.argv[3:6]
+def fail(msg):
+    raise SystemExit(f"[scenario] FAIL: {msg}")
+subs = [(t, m) for t, _, m in nwdaf if "subscribed to AMF LOCATION_REPORT id=" in m]
+if not subs:
+    fail("no nwdafd subscription line")
+t_sub, m_sub = subs[-1]
+sub_id = re.search(r"id=(\S+)", m_sub).group(1)
+created = [t for t, _, m in amf if f"Event subscription created: id={sub_id}" in m]
+if not created or created[0] > t_sub:
+    fail(f"amfd did not create subscription {sub_id} before nwdafd logged it")
+def ingest(cell, after):
+    for t, _, m in nwdaf:
+        if t >= after and f"ue-mobility ingest supi={supi} cell={cell}" in m:
+            return t
+    fail(f"no ingest of {cell} after {after.isoformat()}")
+t_a = ingest(a, t_sub)
+t_b = ingest(b, t_a)
+deliveries = sorted(t for t, _, m in amf if f"Event notification delivered: sub={sub_id}," in m)
+# amfd logs the delivery once nwdafd has answered, so each lands at or just after its ingest.
+for name, t in (("A", t_a), ("B", t_b)):
+    if not any(t <= d for d in deliveries):
+        fail(f"no amfd delivery to {sub_id} at or after the cell {name} ingest")
+if not any(t_sub <= d <= t_b for d in deliveries):
+    fail("no amfd delivery between the subscription and the cell B ingest")
+print(f"[scenario] ordered chain ok: created {created[0].isoformat()} <= subscribed "
+      f"{t_sub.isoformat()} < ingest A {t_a.isoformat()} < ingest B {t_b.isoformat()}; "
+      f"{len(deliveries)} amfd deliveries to {sub_id}")
 PY
   [[ "${ADVERTISED}" == yes ]] || bad "the NRF profile does not list UE_MOBILITY"
   [[ "${FORGED}" == 404 ]] || bad "forged-token notify answered ${FORGED}, expected 404"

@@ -214,7 +214,7 @@ pub fn notify_uri(sbi_base: &str) -> String {
 
 /// The TS 29.518 `AmfCreateEventSubscription` body: LOCATION_REPORT for any UE,
 /// on TA and cell changes.
-pub fn subscription_body(notify_uri: &str, nf_id: &str) -> Value {
+pub fn subscription_body(notify_uri: &str, nf_id: &str, expiry: u64) -> Value {
     json!({
         "subscription": {
             // TS 29.518 Table 6.2.6.2.3-1: without a filter the AMF reports TA
@@ -229,8 +229,85 @@ pub fn subscription_body(notify_uri: &str, nf_id: &str) -> Value {
             "notifyCorrelationId": NOTIFY_CORRELATION_ID,
             "nfId": nf_id,
             "anyUE": true,
+            // TS 29.518 AmfEventMode: a bounded subscription, renewed by
+            // [`maintain_subscription`], so one left behind by a restarted NWDAF
+            // (whose token is gone) expires at the AMF instead of being notified
+            // forever.
+            "options": { "trigger": "CONTINUOUS", "expiry": rfc3339(expiry) },
         }
     })
+}
+
+/// A subscription the AMF accepted: its `subscriptionId` and the AMF that holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmfSubscription {
+    pub id: String,
+    pub host: String,
+    pub port: u16,
+}
+
+/// How long a subscription is asked for, and how often it is renewed.
+#[derive(Debug, Clone, Copy)]
+pub struct Lifetime {
+    /// `options.expiry` = now + this.
+    pub ttl: Duration,
+    /// Renew (PATCH the expiry) this often; well inside `ttl`.
+    pub renew_every: Duration,
+}
+
+impl Lifetime {
+    /// Production: a 10-minute subscription renewed every 2 minutes, so an AMF
+    /// that lost it (restart) is re-subscribed within 2 minutes.
+    pub const DEFAULT: Lifetime = Lifetime {
+        ttl: Duration::from_secs(600),
+        renew_every: Duration::from_secs(120),
+    };
+}
+
+/// The subscription this process currently holds, for `/metrics` and tests.
+static CURRENT: std::sync::Mutex<Option<AmfSubscription>> = std::sync::Mutex::new(None);
+
+/// The subscription this process currently holds at the AMF, if any.
+pub fn current_subscription() -> Option<AmfSubscription> {
+    CURRENT.lock().map(|g| g.clone()).unwrap_or(None)
+}
+
+fn set_current(sub: Option<AmfSubscription>) {
+    if let Ok(mut g) = CURRENT.lock() {
+        *g = sub;
+    }
+}
+
+/// Why a renewal failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenewError {
+    /// The AMF no longer holds the subscription (404): re-subscribe.
+    Gone,
+    /// Anything else: retry the renewal.
+    Other(String),
+}
+
+/// PATCH the subscription's `options/expiry` (TS 29.518 §5.3.2.4, the
+/// `AmfUpdateEventSubscriptionItem` array).
+pub async fn renew_once(sub: &AmfSubscription, expiry: u64) -> Result<(), RenewError> {
+    let mut amf = crate::notification_dispatcher::notify_client(&sub.host, sub.port);
+    if let Some(oauth2) = crate::oauth2_client() {
+        amf = amf.with_oauth2(oauth2, nextgcore_sbi::types::NfType::Amf);
+    }
+    let body = json!([{
+        "op": "replace",
+        "path": "/subscription/options/expiry",
+        "value": rfc3339(expiry),
+    }]);
+    let resp = amf
+        .patch_json(&format!("/namf-evts/v1/subscriptions/{}", sub.id), &body)
+        .await
+        .map_err(|e| RenewError::Other(e.to_string()))?;
+    match resp.status {
+        200..=299 => Ok(()),
+        404 => Err(RenewError::Gone),
+        s => Err(RenewError::Other(format!("the AMF answered {s}"))),
+    }
 }
 
 /// The `namf-evts` endpoint of the first AMF in a TS 29.510 `SearchResult`: the
@@ -279,7 +356,12 @@ pub fn amf_endpoint_from_search_result(result: &Value) -> Option<(String, u16)> 
 
 /// One subscribe attempt: discover the AMF at `nrf_uri`, then POST the
 /// subscription. The AMF's `subscriptionId` on success.
-pub async fn subscribe_once(nrf_uri: &str, sbi_base: &str, nf_id: &str) -> Result<String, String> {
+pub async fn subscribe_once(
+    nrf_uri: &str,
+    sbi_base: &str,
+    nf_id: &str,
+    expiry: u64,
+) -> Result<AmfSubscription, String> {
     let (nrf_host, nrf_port, nrf_base) = crate::notification_dispatcher::parse_notify_uri(nrf_uri)
         .ok_or_else(|| format!("invalid NRF URI {nrf_uri:?}"))?;
     let nrf = crate::notification_dispatcher::notify_client(&nrf_host, nrf_port);
@@ -304,7 +386,7 @@ pub async fn subscribe_once(nrf_uri: &str, sbi_base: &str, nf_id: &str) -> Resul
     if let Some(oauth2) = crate::oauth2_client() {
         amf = amf.with_oauth2(oauth2, nextgcore_sbi::types::NfType::Amf);
     }
-    let body = subscription_body(&notify_uri(sbi_base), nf_id);
+    let body = subscription_body(&notify_uri(sbi_base), nf_id, expiry);
     let resp = amf
         .post_json("/namf-evts/v1/subscriptions", &body)
         .await
@@ -317,35 +399,93 @@ pub async fn subscribe_once(nrf_uri: &str, sbi_base: &str, nf_id: &str) -> Resul
     }
     let created: Value = serde_json::from_str(resp.http.content.as_deref().unwrap_or(""))
         .map_err(|e| format!("subscription answer is not JSON: {e}"))?;
-    created
+    let id = created
         .get("subscriptionId")
         .and_then(Value::as_str)
-        .map(String::from)
-        .ok_or_else(|| "the 201 carries no subscriptionId".to_string())
+        .ok_or("the 201 carries no subscriptionId")?;
+    Ok(AmfSubscription {
+        id: id.to_string(),
+        host,
+        port,
+    })
 }
 
-/// Subscribe in the background, retrying (2 s doubling to 30 s) until the AMF
-/// accepts. Logs `subscribed to AMF LOCATION_REPORT id=<id>` once.
-pub fn spawn_subscriber(nrf_uri: String, sbi_base: String, nf_id: String) {
-    tokio::spawn(async move {
-        let mut backoff = Duration::from_secs(2);
-        loop {
-            match subscribe_once(&nrf_uri, &sbi_base, &nf_id).await {
-                Ok(id) => {
-                    line(
-                        demo_active(),
-                        &format!("subscribed to AMF LOCATION_REPORT id={id}"),
-                    );
-                    return;
-                }
+/// Hold an AMF LOCATION_REPORT subscription for the life of the process:
+/// subscribe (retrying 2 s doubling to 30 s), then renew every
+/// `lifetime.renew_every`. A renewal answered 404 means the AMF lost it (an AMF
+/// restart keeps subscriptions in memory only), so this subscribes again; any
+/// other failure is retried at the next renewal, and once the expiry has passed
+/// the subscription is treated as lost too.
+pub async fn maintain_subscription(
+    nrf_uri: String,
+    sbi_base: String,
+    nf_id: String,
+    lifetime: Lifetime,
+) {
+    loop {
+        let mut backoff = Duration::from_secs(2).min(lifetime.renew_every);
+        let sub = loop {
+            match subscribe_once(
+                &nrf_uri,
+                &sbi_base,
+                &nf_id,
+                unix_now() + lifetime.ttl.as_secs(),
+            )
+            .await
+            {
+                Ok(sub) => break sub,
                 Err(e) => {
                     log::warn!("ue-mobility: AMF LOCATION_REPORT subscription: {e}; retrying");
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(30));
                 }
             }
+        };
+        line(
+            demo_active(),
+            &format!("subscribed to AMF LOCATION_REPORT id={}", sub.id),
+        );
+        set_current(Some(sub.clone()));
+        let mut valid_until = unix_now() + lifetime.ttl.as_secs();
+        loop {
+            tokio::time::sleep(lifetime.renew_every).await;
+            let expiry = unix_now() + lifetime.ttl.as_secs();
+            match renew_once(&sub, expiry).await {
+                Ok(()) => valid_until = expiry,
+                Err(RenewError::Gone) => {
+                    log::warn!(
+                        "ue-mobility: the AMF no longer holds subscription {}; subscribing again",
+                        sub.id
+                    );
+                    break;
+                }
+                Err(RenewError::Other(e)) if unix_now() >= valid_until => {
+                    log::warn!(
+                        "ue-mobility: subscription {} expired unrenewed ({e}); subscribing again",
+                        sub.id
+                    );
+                    break;
+                }
+                Err(RenewError::Other(e)) => {
+                    log::warn!(
+                        "ue-mobility: renewing subscription {}: {e}; retrying",
+                        sub.id
+                    );
+                }
+            }
         }
-    });
+        set_current(None);
+    }
+}
+
+/// [`maintain_subscription`] with [`Lifetime::DEFAULT`], on a background task.
+pub fn spawn_subscriber(nrf_uri: String, sbi_base: String, nf_id: String) {
+    tokio::spawn(maintain_subscription(
+        nrf_uri,
+        sbi_base,
+        nf_id,
+        Lifetime::DEFAULT,
+    ));
 }
 
 /// One `LOCATION_REPORT` as ingested: `(supi, cell id, UserLocation, unix s)`.
@@ -403,7 +543,11 @@ pub fn handle_location_notify(
     token: &str,
     request: &SbiRequest,
 ) -> SbiResponse {
-    if !serving() || CALLBACK_TOKEN.get().map(String::as_str) != Some(token) {
+    if !serving()
+        || !CALLBACK_TOKEN
+            .get()
+            .is_some_and(|t| token_matches(t, token))
+    {
         REFUSED.fetch_add(1, Ordering::Relaxed);
         log::warn!(
             "ue-mobility: location notify on a subscription this NWDAF does not hold; refused"
@@ -442,6 +586,13 @@ pub fn handle_location_notify(
         }
     }
     SbiResponse::with_status(204)
+}
+
+/// Constant-time comparison of the callback token, so its bytes cannot be
+/// learned from response timing.
+fn token_matches(expected: &str, got: &str) -> bool {
+    let (e, g) = (expected.as_bytes(), got.as_bytes());
+    e.len() == g.len() && e.iter().zip(g).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 fn unix_now() -> u64 {
@@ -550,6 +701,13 @@ pub fn render_metrics(out: &mut String) {
         "gauge",
         "1 when UE_MOBILITY analytics are served from AMF LOCATION_REPORTs (nextgsim#466)",
         u8::from(serving()),
+    );
+    nextgcore_metrics::nf::write_metric(
+        out,
+        "nwdaf_ue_mobility_amf_subscribed",
+        "gauge",
+        "1 while this NWDAF holds an AMF LOCATION_REPORT subscription (nextgsim#466)",
+        u8::from(current_subscription().is_some()),
     );
     nextgcore_metrics::nf::write_header(
         out,

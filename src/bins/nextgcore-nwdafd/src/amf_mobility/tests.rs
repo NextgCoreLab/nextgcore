@@ -153,7 +153,7 @@ fn the_subscription_is_location_report_for_any_ue_on_the_callback() {
         )
     );
     assert_eq!(callback_token().len(), 32, "128 random bits, hex");
-    let body = subscription_body(&uri, "nwdaf-1");
+    let body = subscription_body(&uri, "nwdaf-1", 1_794_391_200);
     let s = &body["subscription"];
     assert_eq!(
         s["eventList"],
@@ -163,6 +163,11 @@ fn the_subscription_is_location_report_for_any_ue_on_the_callback() {
     assert_eq!(s["eventNotifyUri"].as_str(), Some(uri.as_str()));
     assert_eq!(s["nfId"].as_str(), Some("nwdaf-1"));
     assert!(s["notifyCorrelationId"].is_string());
+    assert_eq!(
+        s["options"],
+        json!({ "trigger": "CONTINUOUS", "expiry": "2026-11-11T10:00:00+00:00" }),
+        "a bounded subscription, so an orphan expires at the AMF"
+    );
 }
 
 /// Discovery reads amfd's REAL registered profile (`amf_nf_profile_json`), so the
@@ -444,51 +449,23 @@ async fn amfd_location_reports_reach_ue_mobility_over_http() {
     crate::nwdaf_context_init("nwdaf-466-e2e".to_string(), 1024);
     let supi = "imsi-001010000466200";
 
-    async fn serve<F, Fut>(handler: F) -> (nextgcore_sbi::SbiServer, u16)
-    where
-        F: Fn(SbiRequest) -> Fut + Send + Sync + Clone + 'static,
-        Fut: std::future::Future<Output = SbiResponse> + Send + 'static,
-    {
-        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
-        let server = nextgcore_sbi::SbiServer::on_listener(
-            nextgcore_sbi::SbiServerConfig::new(addr),
-            listener,
-        );
-        server.start(handler).await.expect("start");
-        (server, addr.port())
-    }
-
-    let (amf, amf_port) = serve(nextgcore_amfd::namf_server::namf_request_handler).await;
-    let profile =
-        nextgcore_amfd::sbi_path::amf_nf_profile_json("amf-466-e2e", "127.0.0.1", amf_port);
-    let (nrf, nrf_port) = serve(move |req: SbiRequest| {
-        let profile = profile.clone();
-        async move {
-            let uri = &req.header.uri;
-            let p = &req.http.params;
-            let asks_for_amf_evts = p.get("target-nf-type").map(String::as_str) == Some("AMF")
-                && p.get("requester-nf-type").map(String::as_str) == Some("NWDAF")
-                && p.get("service-names").map(String::as_str) == Some("namf-evts");
-            if uri.starts_with("/nnrf-disc/v1/nf-instances") && asks_for_amf_evts {
-                SbiResponse::with_status(200)
-                    .with_json_body(&json!({ "nfInstances": [profile] }))
-                    .expect("json")
-            } else {
-                SbiResponse::with_status(404)
-            }
-        }
-    })
-    .await;
+    let (amf, amf_port, nrf, nrf_port) = amf_and_nrf("amf-466-e2e").await;
     let (nwdaf, nwdaf_port) = serve(crate::nwdaf_sbi_request_handler).await;
 
-    let id = subscribe_once(
+    let sub = subscribe_once(
         &format!("http://127.0.0.1:{nrf_port}"),
         &format!("http://127.0.0.1:{nwdaf_port}"),
         "nwdaf-466-e2e",
+        unix_now() + 600,
     )
     .await
     .expect("amfd accepts the subscription");
-    assert!(id.starts_with("sub-"), "amfd's subscriptionId: {id}");
+    assert!(
+        sub.id.starts_with("sub-"),
+        "amfd's subscriptionId: {}",
+        sub.id
+    );
+    assert_eq!(sub.port, amf_port);
 
     let mut ue = nextgcore_amfd::context::AmfUe::new(466_200, 0);
     ue.supi = Some(supi.to_string());
@@ -520,4 +497,105 @@ async fn amfd_location_reports_reach_ue_mobility_over_http() {
     for s in [nwdaf, nrf, amf] {
         s.stop().await.expect("stop");
     }
+}
+
+async fn serve<F, Fut>(handler: F) -> (nextgcore_sbi::SbiServer, u16)
+where
+    F: Fn(SbiRequest) -> Fut + Send + Sync + Clone + 'static,
+    Fut: std::future::Future<Output = SbiResponse> + Send + 'static,
+{
+    let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let server =
+        nextgcore_sbi::SbiServer::on_listener(nextgcore_sbi::SbiServerConfig::new(addr), listener);
+    server.start(handler).await.expect("start");
+    (server, addr.port())
+}
+
+/// amfd's real Namf handler, and a stand-in NRF that answers this NWDAF's AMF
+/// discovery with amfd's real profile.
+async fn amf_and_nrf(
+    amf_id: &'static str,
+) -> (nextgcore_sbi::SbiServer, u16, nextgcore_sbi::SbiServer, u16) {
+    let (amf, amf_port) = serve(nextgcore_amfd::namf_server::namf_request_handler).await;
+    let profile = nextgcore_amfd::sbi_path::amf_nf_profile_json(amf_id, "127.0.0.1", amf_port);
+    let (nrf, nrf_port) = serve(move |req: SbiRequest| {
+        let profile = profile.clone();
+        async move {
+            let uri = &req.header.uri;
+            let p = &req.http.params;
+            let asks_for_amf_evts = p.get("target-nf-type").map(String::as_str) == Some("AMF")
+                && p.get("requester-nf-type").map(String::as_str) == Some("NWDAF")
+                && p.get("service-names").map(String::as_str) == Some("namf-evts");
+            if uri.starts_with("/nnrf-disc/v1/nf-instances") && asks_for_amf_evts {
+                SbiResponse::with_status(200)
+                    .with_json_body(&json!({ "nfInstances": [profile] }))
+                    .expect("json")
+            } else {
+                SbiResponse::with_status(404)
+            }
+        }
+    })
+    .await;
+    (amf, amf_port, nrf, nrf_port)
+}
+
+/// The expiry amfd holds for subscription `id`.
+fn amfd_expiry(id: &str) -> Option<std::time::SystemTime> {
+    let ctx = nextgcore_amfd::context::amf_self();
+    let guard = ctx.read().expect("amf ctx");
+    guard.event_subscription_find(id).and_then(|s| s.expiry)
+}
+
+/// **Review MAJOR (#1425): the subscription is maintained.** It is created with
+/// an `options.expiry` amfd stores, the expiry is renewed by PATCH, and when amfd
+/// no longer holds it (an AMF restart keeps subscriptions in memory only; here a
+/// DELETE through amfd's real handler) the renewal's 404 makes this NWDAF
+/// subscribe again, under a new id.
+///
+/// REVERT-VERIFIED: treating `RenewError::Gone` like `Other` (no re-subscribe)
+/// times the last wait out.
+#[tokio::test]
+async fn a_lost_amf_subscription_is_renewed_and_then_replaced() {
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    nextgcore_amfd::context::amf_context_init(64, 1024, 4096);
+    let (amf, amf_port, nrf, nrf_port) = amf_and_nrf("amf-466-renew").await;
+    let lifetime = Lifetime {
+        ttl: Duration::from_secs(60),
+        renew_every: Duration::from_millis(300),
+    };
+    let task = tokio::spawn(maintain_subscription(
+        format!("http://127.0.0.1:{nrf_port}"),
+        "http://127.0.0.1:1".to_string(),
+        "nwdaf-466-renew".to_string(),
+        lifetime,
+    ));
+    async fn until<T>(mut f: impl FnMut() -> Option<T>) -> T {
+        for _ in 0..200 {
+            if let Some(v) = f() {
+                return v;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("condition not reached within 5 s");
+    }
+    let first = until(current_subscription).await;
+    assert_eq!(first.port, amf_port, "held at the discovered AMF");
+    let created = amfd_expiry(&first.id).expect("amfd stores the subscription's expiry");
+    // A renewal moves the expiry forward (RFC 3339 has 1 s resolution).
+    until(|| amfd_expiry(&first.id).filter(|e| *e > created)).await;
+
+    let del = nextgcore_amfd::namf_server::namf_request_handler(SbiRequest::delete(format!(
+        "/namf-evts/v1/subscriptions/{}",
+        first.id
+    )))
+    .await;
+    assert!(del.status / 100 == 2, "amfd drops it: {}", del.status);
+    let second = until(|| current_subscription().filter(|s| s.id != first.id)).await;
+    assert!(
+        amfd_expiry(&second.id).is_some(),
+        "the replacement is a real subscription at amfd"
+    );
+    task.abort();
+    amf.stop().await.expect("stop");
+    nrf.stop().await.expect("stop");
 }
