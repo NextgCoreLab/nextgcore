@@ -569,6 +569,12 @@ jobs:
           # removed on every exit path, every artefact is scrubbed, and a
           # surviving token fails the run.
           k8s/demo-check-selftest.sh
+          # Every overlay scenario with a --self-test runs it, so a log-order
+          # assertion that cannot fail is caught here (nextgsim#488).
+          for sc in deploy/eks/overlays/demo-*/scenario.sh; do
+            [ -x "$sc" ] || continue
+            if grep -q -- '--self-test' "$sc"; then "$sc" --self-test; fi
+          done
       - name: Demo compose stacks publish no port (nextgsim#456)
         # The demo stacks are standalone files, never `-f` overlays of
         # docker-compose.yml: compose merges `ports:` lists, so the base file's

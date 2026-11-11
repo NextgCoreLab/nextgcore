@@ -14,6 +14,30 @@
 #             refused; after scaling bsf to 0 its fact gets expired_at.
 #   baseline  the bundle carries no live domain; amf logs no subscription.
 set -uo pipefail
+
+# ordered FILE ERE1 ERE2: ERE2 matches a line strictly after ERE1's first match.
+# grep -E with the patterns as arguments (never through awk), so a missing line
+# FAILS. `scenario.sh --self-test` proves both halves.
+ordered() {
+  local first second
+  first="$(grep -nE -- "$2" "$1" | head -1 | cut -d: -f1)"
+  [[ -n "${first}" ]] || return 1
+  second="$(tail -n "+$((first + 1))" "$1" | grep -nE -- "$3" | head -1 | cut -d: -f1)"
+  [[ -n "${second}" ]]
+}
+if [[ "${1:-}" == --self-test ]]; then
+  t="$(mktemp)"; trap 'rm -f "${t}"' EXIT
+  printf 'a\nEvent subscription created: id=1\nb\nEvent subscription removed: 1\n' > "${t}"
+  ordered "${t}" 'Event subscription created' 'Event subscription removed' || { echo "self-test: in order not seen"; exit 1; }
+  printf 'Event subscription created: id=1\n' > "${t}"
+  if ordered "${t}" 'Event subscription created' 'Event subscription removed'; then echo "self-test: missing line passed"; exit 1; fi
+  printf 'Event subscription removed: 1\nEvent subscription created: id=1\n' > "${t}"
+  if ordered "${t}" 'Event subscription created' 'Event subscription removed'; then echo "self-test: out of order passed"; exit 1; fi
+  : > "${t}"
+  if ordered "${t}" 'x' 'y'; then echo "self-test: empty log passed"; exit 1; fi
+  echo "scenario.sh self-test: ok"; exit 0
+fi
+
 NS="${NAMESPACE:?}"; MODE="${DEMO_MODE:?}"; OUT="${OUT:?}"
 D="${OUT}/nkef"; mkdir -p "${D}"
 Q='is my route congested and which core functions serve me?'
@@ -40,9 +64,8 @@ fi
 
 grep -qE '^NKEF bundle consumer=internal domains=ran,n2,sba consistent=true path=ue>cell>gnb>amf>nf-instance cm=CONNECTED stale=false ' \
   "${D}/internal.txt" || bad "internal header: $(head -1 "${D}/internal.txt")"
-created="$(grep -n 'Event subscription created' "${D}/amf.log" | head -1 | cut -d: -f1)"
-removed="$(grep -n 'Event subscription removed' "${D}/amf.log" | head -1 | cut -d: -f1)"
-[[ -n "${created}" && -n "${removed}" && "${removed}" -gt "${created}" ]] || bad "amf: created/removed not in order"
+ordered "${D}/amf.log" 'Event subscription created: id=[^,]+, events=.*LOCATION_REPORT' 'Event subscription removed: ' \
+  || bad "amf: Event subscription created -> removed not in order"
 
 bundle_nf="$(grep -oE 'amf_nf_instance=[0-9a-f-]+' "${D}/internal.txt" | head -1 | cut -d= -f2)"
 kubectl -n "${NS}" run "nkef-nrf-curl-$$" --rm -i --restart=Never --image=curlimages/curl:8.11.1 --quiet -- \
