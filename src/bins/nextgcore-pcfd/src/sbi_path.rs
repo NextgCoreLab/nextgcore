@@ -749,6 +749,7 @@ pub(crate) fn session_supi(sess: &crate::context::PcfSess) -> Option<String> {
 pub(crate) fn session_data_for_reevaluation(
     sess: &crate::context::PcfSess,
     supi: &str,
+    what: &str,
 ) -> Option<crate::nudr_handler::SessionData> {
     let dnn = sess.dnn.as_deref().unwrap_or("internet");
     match crate::nudr_handler::pcf_read_session_data(supi, &sess.s_nssai, dnn) {
@@ -756,7 +757,7 @@ pub(crate) fn session_data_for_reevaluation(
         Err(e) => {
             let stored = sess.authorised_session_data.clone();
             log::warn!(
-                "[{supi}] re-evaluating sm_policy_id={}: session data unreadable ({e}); \
+                "[{supi}] {what} for sm_policy_id={}: session data unreadable ({e}); \
                  {}",
                 sess.sm_policy_id,
                 if stored.is_some() {
@@ -794,7 +795,7 @@ fn build_sm_policy_notification(
         );
         return None;
     };
-    let Some(sd) = session_data_for_reevaluation(sess, &supi) else {
+    let Some(sd) = session_data_for_reevaluation(sess, &supi, "SM policy update notify") else {
         log::warn!(
             "[{supi}] SM policy update notify for sm_policy_id={}: no session data, so \
              no notify is sent and the SMF keeps the policy it has",
@@ -876,6 +877,10 @@ pub fn pcf_sbi_send_smpolicycontrol_update_notify(sess_id: u64) -> bool {
         return false;
     };
     // What the SMF is about to hold is what a later re-evaluation falls back to.
+    // Stored at send, not on the SMF's 2xx: delivery is at-least-once and retried
+    // (TS 29.500 §6.10), so a notify whose answer was lost may well have been
+    // applied, and a re-send of the same decision is harmless where a stale
+    // fallback would not be.
     if let Ok(ctx) = crate::context::pcf_self().read() {
         if let Some(mut stored) = ctx.sess_find_by_id(sess_id) {
             stored.authorised_session_data = Some(sd);
