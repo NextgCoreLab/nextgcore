@@ -1432,6 +1432,9 @@ fn subscription_echo_json(sub: &EventSubscription) -> Value {
         "eventList": sub.event_types.iter()
             .map(|t| {
                 let mut event = json!({"type": t});
+                if t == "LOCATION_REPORT" && !sub.location_filters.is_empty() {
+                    event["locationFilterList"] = json!(sub.location_filters);
+                }
                 if !area_list.is_empty()
                     && matches!(t.as_str(), "PRESENCE_IN_AOI_REPORT" | "UES_IN_AREA_REPORT")
                 {
@@ -1530,6 +1533,8 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
     // the union, which is the only reading that reports every area it asked about.
     let mut areas: Vec<EventArea> = Vec::new();
     let mut reporting_threshold: Option<i64> = None;
+    // nextgsim#466: the LOCATION_REPORT event's `locationFilterList`.
+    let mut location_filters: Vec<String> = Vec::new();
     for event in event_list {
         let Some(event_type) = event.get("type").and_then(Value::as_str) else {
             return mandatory_ie_missing("subscription.eventList[].type");
@@ -1550,6 +1555,9 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
         areas.extend(parse_event_areas(event));
         if let Some(t) = event.get("reportingThreshold").and_then(Value::as_i64) {
             reporting_threshold = Some(t);
+        }
+        if event_type == "LOCATION_REPORT" {
+            location_filters = parse_location_filters(event);
         }
         // #400: the AOIEF filter IEs (`29518-k00.txt:21630-21707`, feature AOIEF) are
         // ACCEPTED and logged, never refused — they are optional IEs on a conformant
@@ -1731,6 +1739,7 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
         areas,
         reported_presence: std::collections::HashMap::new(),
         reporting_threshold,
+        location_filters,
     };
 
     // Immediate reports for events with immediateFlag (current state)
@@ -1945,6 +1954,12 @@ fn handle_event_subscription_modify(subscription_id: &str, request: &SbiRequest)
                 if event_types.is_empty() {
                     return mandatory_ie_incorrect("value", "eventList must not be empty");
                 }
+                // nextgsim#466: the replacement list carries its own filter.
+                sub.location_filters = list
+                    .iter()
+                    .find(|e| e.get("type").and_then(Value::as_str) == Some("LOCATION_REPORT"))
+                    .map(parse_location_filters)
+                    .unwrap_or_default();
                 sub.event_types = event_types;
             }
             ("replace", "/subscription/options/expiry") => {
@@ -2134,13 +2149,30 @@ pub fn fire_amf_event_for(
     pei: Option<&str>,
     extra: Value,
 ) {
+    fire_amf_event_matching(event_type, supi, gpsi, pei, extra, |_| true);
+}
+
+/// [`fire_amf_event_for`], delivered only to the matching subscriptions that
+/// `wants` accepts.
+fn fire_amf_event_matching(
+    event_type: &str,
+    supi: Option<&str>,
+    gpsi: Option<&str>,
+    pei: Option<&str>,
+    extra: Value,
+    wants: impl Fn(&EventSubscription) -> bool,
+) {
     let ctx = amf_self();
-    let subs = {
+    let subs: Vec<EventSubscription> = {
         let Ok(guard) = ctx.read() else {
             return;
         };
         guard.event_subscriptions_remove_expired();
-        guard.event_subscriptions_matching_ue(event_type, supi, gpsi, pei)
+        guard
+            .event_subscriptions_matching_ue(event_type, supi, gpsi, pei)
+            .into_iter()
+            .filter(|s| wants(s))
+            .collect()
     };
     if subs.is_empty() {
         return;
@@ -2185,6 +2217,42 @@ pub fn fire_location_report(ue: &AmfUe) {
         "LOCATION_REPORT",
         json!({ "location": nr_location_json(ue) }),
     );
+}
+
+/// Fire a LOCATION_REPORT for a relocation the AMF observed (HANDOVER NOTIFY,
+/// PATH SWITCH), only to the subscriptions whose `locationFilterList` covers a
+/// dimension `change` changed. nextgsim#466.
+///
+/// TS 29.518 Table 6.2.6.2.3-1 (`29518-k00.txt:21398-21404`): an absent filter
+/// means *"the change of the TA used by the UE should be reported"*, so an
+/// intra-TA handover reaches only `CELL_ID` / `RAN_NODE` subscribers.
+pub fn fire_location_change_report(ue: &AmfUe, change: crate::context::LocationChange) {
+    if !change.any() {
+        return;
+    }
+    fire_amf_event_matching(
+        "LOCATION_REPORT",
+        ue.supi.as_deref(),
+        ue.gpsi.as_deref(),
+        ue.pei.as_deref(),
+        json!({ "location": nr_location_json(ue) }),
+        |sub| sub.wants_location_change(change),
+    );
+}
+
+/// The `locationFilterList` of one `AmfEvent` as `LocationFilter` tokens
+/// (Table 6.2.6.3.5-1). Non-string entries are dropped. nextgsim#466.
+fn parse_location_filters(event: &Value) -> Vec<String> {
+    event
+        .get("locationFilterList")
+        .and_then(Value::as_array)
+        .map(|l| {
+            l.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Fire a REGISTRATION_STATE_REPORT (REGISTERED / DEREGISTERED)
@@ -3050,6 +3118,16 @@ fn take_over_transferred_event_subscriptions(
                         .find_map(|e| e.get("reportingThreshold").and_then(Value::as_i64))
                 },
             ),
+            location_filters: entry
+                .get("eventList")
+                .and_then(Value::as_array)
+                .and_then(|events| {
+                    events
+                        .iter()
+                        .find(|e| e.get("type").and_then(Value::as_str) == Some("LOCATION_REPORT"))
+                })
+                .map(parse_location_filters)
+                .unwrap_or_default(),
         };
 
         let added = ctx
@@ -7340,6 +7418,7 @@ mod tests {
             areas: Vec::new(),
             reported_presence: std::collections::HashMap::new(),
             reporting_threshold: None,
+            location_filters: Vec::new(),
         };
         assert!(guard.event_subscription_add(sub));
         // Expired subscriptions never match (other tests may add unrelated
