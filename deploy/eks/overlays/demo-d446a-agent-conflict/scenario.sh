@@ -43,12 +43,33 @@ in_order() {
     local from=0 n=0 re line
     for re in "$@"; do
         n=$((n + 1))
-        line="$(awk -v from="${from}" 'NR > from && $0 ~ ENVIRON["RE"] { print NR; exit }' RE="${re}" "${file}")"
+        # The ERE goes through the ENVIRONMENT (as nextgsim scripts/demo/lib.sh
+        # assert_log_order does): an operand `RE=...` after the program is an awk
+        # variable, so ENVIRON["RE"] would be empty and match every line.
+        line="$(DEMO_RE="${re}" awk -v from="${from}" 'NR > from && $0 ~ ENVIRON["DEMO_RE"] { print NR; exit }' "${file}")"
         if [[ -z "${line}" ]]; then fail "[${label}] step ${n}/$# missing: ${re}"; return; fi
         from="${line}"
     done
     echo "[${label}] chain of $# in order"
 }
+# Positive control: the chain matcher must FAIL on a log missing a step and on
+# one in the wrong order, or every assertion below would pass vacuously.
+selftest_in_order() {
+    local f; f="$(mktemp)"
+    printf '%s\n' 'alpha one' 'beta two' > "${f}"
+    local before=${fails}
+    in_order "${f}" selftest 'alpha' 'gamma' >/dev/null
+    in_order "${f}" selftest 'beta' 'alpha' >/dev/null
+    local caught=$((fails - before))
+    fails=${before}
+    in_order "${f}" selftest 'alpha' 'beta' >/dev/null
+    rm -f "${f}"
+    if (( caught != 2 || fails != before )); then
+        echo "DEMO CHECK FAILED: in_order self-test (caught ${caught}/2 bad chains)"; exit 1
+    fi
+}
+selftest_in_order
+
 lb_required='HandoverRequired \(amf_ue_ngap_id=[0-9]+, ran_ue_ngap_id=[0-9]+, type=Intra5gs\) source_gnb_id=2 cause=RadioNetwork\(ReduceLoadInServingCell\)'
 
 case "${DEMO_MODE}" in
