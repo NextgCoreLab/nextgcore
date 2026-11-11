@@ -700,32 +700,21 @@ pub fn encode_qos_flow_description(qos_flow: &SmfBearer, code: u8) -> QosFlowDes
     desc
 }
 
-/// Encode bitrate to NAS format (unit + value)
-fn encode_bitrate(bitrate: u64) -> Vec<u8> {
-    // NAS bitrate encoding: 1 byte unit + 2 bytes value
-    // Unit: 0=1kbps, 1=4kbps, 2=16kbps, 3=64kbps, 4=256kbps, 5=1Mbps, 6=4Mbps, 7=16Mbps, etc.
-    let (unit, value) = if bitrate == 0 {
-        (0u8, 0u16)
-    } else if bitrate <= 65535 * 1000 {
-        (0, (bitrate / 1000) as u16)
-    } else if bitrate <= 65535 * 4000 {
-        (1, (bitrate / 4000) as u16)
-    } else if bitrate <= 65535 * 16000 {
-        (2, (bitrate / 16000) as u16)
-    } else if bitrate <= 65535 * 64000 {
-        (3, (bitrate / 64000) as u16)
-    } else if bitrate <= 65535 * 256000 {
-        (4, (bitrate / 256000) as u16)
-    } else if bitrate <= 65535 * 1000000 {
-        (5, (bitrate / 1000000) as u16)
-    } else if bitrate <= 65535 * 4000000 {
-        (6, (bitrate / 4000000) as u16)
-    } else if bitrate <= 65535 * 16000000 {
-        (7, (bitrate / 16000000) as u16)
-    } else {
-        (7, 65535)
-    };
-
+/// Encode a QoS flow description's GFBR / MFBR parameter contents (TS 24.501
+/// §9.11.4.12): one unit octet, then a 2-octet value.
+///
+/// The units are §9.11.4.12's table, which is the Session-AMBR one (§9.11.4.14):
+/// 0 = "value is not used", 1 = 1 Kbps, 2 = 4 Kbps, 3 = 16 Kbps, 4 = 64 Kbps,
+/// 5 = 256 Kbps, 6 = 1 Mbps, 7 = 4 Mbps, ... So the encoding is
+/// [`crate::policy::encode_ambr_component`]'s: an exact 1 Gbps / 1 Mbps / 1 Kbps value
+/// as it is, otherwise the finest unit that fits, rounded up.
+///
+/// #1408 / #1385 review B2: this used to number the units from 0 (0 = 1 Kbps, ...,
+/// 5 = 1 Mbps), one below the spec, so every rate up to 65.5 Mbps went out with unit 0,
+/// "value is not used". A UE then saw a GBR flow description with no GFBR/MFBR, which
+/// §6.3.2.4 a) case 8 rejects (#83). Higher rates went out at a quarter of their value.
+pub(crate) fn encode_bitrate(bitrate: u64) -> Vec<u8> {
+    let (unit, value) = crate::policy::encode_ambr_component(bitrate);
     let mut data = vec![unit];
     data.extend_from_slice(&value.to_be_bytes());
     data
@@ -1444,21 +1433,103 @@ mod tests {
         );
     }
 
+    /// #1408 / #1385 review B2: the GFBR/MFBR units are TS 24.501 §9.11.4.12's,
+    /// 1 = 1 Kbps ... 6 = 1 Mbps ... 0x0B = 1 Gbps, never 0 ("value is not used").
+    /// Known-good vectors at each unit boundary, then a sweep checking each encoding
+    /// decodes, through the spec table, to the smallest step at or above the rate.
     #[test]
     fn test_encode_bitrate() {
-        // Test 0 bitrate
-        let result = encode_bitrate(0);
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0], 0); // Unit
+        for (bps, want) in [
+            (0, [0x01, 0x00, 0x00]),             // 0 Kbps -- not unit 0
+            (1_000, [0x01, 0x00, 0x01]),         // 1 Kbps
+            (1_500, [0x01, 0x00, 0x02]),         // rounded up to 2 Kbps
+            (65_535_000, [0x01, 0xFF, 0xFF]),    // the top of the 1 Kbps unit
+            (1_000_000, [0x06, 0x00, 0x01]),     // 1 Mbps, exact
+            (2_000_000, [0x06, 0x00, 0x02]),     // 2 Mbps (review B2's example)
+            (65_536_000, [0x02, 0x40, 0x00]),    // past 1 Kbps: 16384 x 4 Kbps
+            (262_144_000, [0x03, 0x40, 0x00]),   // 16384 x 16 Kbps
+            (1_048_576_000, [0x04, 0x40, 0x00]), // 16384 x 64 Kbps
+            (4_194_304_000, [0x05, 0x40, 0x00]), // 16384 x 256 Kbps
+            (100_000_000, [0x06, 0x00, 0x64]),   // 100 Mbps
+            (1_000_000_000, [0x0B, 0x00, 0x01]), // 1 Gbps
+        ] {
+            assert_eq!(encode_bitrate(bps), want.to_vec(), "{bps} bit/s");
+        }
+        // §9.11.4.12 / §9.11.4.14 unit steps, in bit/s, unit 1 at index 1.
+        const STEP: [u64; 12] = [
+            0,
+            1_000,
+            4_000,
+            16_000,
+            64_000,
+            256_000,
+            1_000_000,
+            4_000_000,
+            16_000_000,
+            64_000_000,
+            256_000_000,
+            1_000_000_000,
+        ];
+        let mut bps = 1u64;
+        while bps < 60_000_000_000 {
+            let e = encode_bitrate(bps);
+            let unit = e[0] as usize;
+            assert!((1..STEP.len()).contains(&unit), "{bps}: unit {unit}");
+            let value = u64::from(u16::from_be_bytes([e[1], e[2]]));
+            let decoded = value * STEP[unit];
+            assert!(
+                decoded >= bps && decoded - bps < STEP[unit],
+                "{bps} bit/s encoded as {value} x {} bit/s",
+                STEP[unit]
+            );
+            bps = bps * 3 + 7;
+        }
+    }
 
-        // Test 1 Mbps
-        let result = encode_bitrate(1_000_000);
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0], 0); // Unit 0 = 1kbps
-
-        // Test 100 Mbps
-        let result = encode_bitrate(100_000_000);
-        assert_eq!(result.len(), 3);
+    /// #1408: a dedicated GBR flow's description carries its GFBR/MFBR in spec units.
+    #[test]
+    fn a_gbr_flow_description_encodes_its_bit_rates_in_spec_units_1408() {
+        let mut bearer = create_test_bearer();
+        bearer.qos.index = 1;
+        bearer.qos.gbr_uplink = 2_000_000;
+        bearer.qos.gbr_downlink = 4_000_000;
+        bearer.qos.mbr_uplink = 6_000_000;
+        bearer.qos.mbr_downlink = 300_000;
+        let desc = encode_qos_flow_description(
+            &bearer,
+            qos_flow_description_code::CREATE_NEW_QOS_FLOW_DESCRIPTION,
+        );
+        assert_eq!(
+            encode_qos_flow_descriptions(&[desc]),
+            [
+                bearer.qfi & 0x3F,
+                qos_flow_description_code::CREATE_NEW_QOS_FLOW_DESCRIPTION << 5,
+                0x45, // E=1, five parameters
+                qos_flow_param_id::FIVE_QI,
+                1,
+                1,
+                qos_flow_param_id::GFBR_UPLINK,
+                3,
+                0x06,
+                0x00,
+                0x02, // 2 Mbps
+                qos_flow_param_id::GFBR_DOWNLINK,
+                3,
+                0x06,
+                0x00,
+                0x04, // 4 Mbps
+                qos_flow_param_id::MFBR_UPLINK,
+                3,
+                0x06,
+                0x00,
+                0x06, // 6 Mbps
+                qos_flow_param_id::MFBR_DOWNLINK,
+                3,
+                0x01,
+                0x01,
+                0x2C, // 300 Kbps
+            ]
+        );
     }
 
     #[test]

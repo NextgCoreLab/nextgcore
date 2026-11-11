@@ -529,15 +529,35 @@ jobs:
             args+=(--render "$r/eks-$p.yaml")
           done
           # #1395: every demo overlay too (the base demo-off one is also
-          # rendered above as profiles/demo; a demo-<key> one only here).
+          # rendered above as profiles/demo; a demo-<key> one only here). In
+          # their own list: they go through the exposure check, but not the
+          # no-demo-block render pass, since a demo overlay may carry demo config.
+          overlays=()
           for d in deploy/eks/overlays/demo*/; do
             o="$(basename "$d")"
             kubectl kustomize "$d" > "$r/overlay-$o.yaml"
-            args+=(--render "$r/overlay-$o.yaml")
+            overlays+=(--render "$r/overlay-$o.yaml")
           done
           helm template ci deploy/helm/nextgcore --set global.siteId=ci > "$r/helm.yaml"
           args+=(--render "$r/helm.yaml")
-          python3 deploy/check_no_exposure.py "${args[@]}"
+          python3 deploy/check_no_exposure.py "${args[@]}" "${overlays[@]}"
+          # #1394: the same renders, structurally: no ConfigMap config with a
+          # root demo: key, however a shipped profile pulled it in.
+          python3 deploy/check_no_demo_block.py "${args[@]}"
+      - name: No demo block in a shipped profile (nextgsim#458)
+        # #1394: demos run only from their own overlay (deploy/eks/overlays/demo*/,
+        # docker-compose.demo*.yml, docker/rust/configs/demo*/). Fails on a
+        # `demo:` key anywhere else under k8s/, deploy/, docker/rust/ (the
+        # default compose and the configs it mounts) or configs/, including
+        # one embedded in a ConfigMap, and on any reference to a demo-only path
+        # from a shipped file. The render pass runs in the exposure step above,
+        # over its renders. The self-test plants blocks first, so a scan that
+        # silently stopped matching cannot pass.
+        working-directory: nextgcore
+        run: |
+          set -euo pipefail
+          python3 deploy/check_no_demo_block.py --self-test
+          python3 deploy/check_no_demo_block.py
       - name: Demo profile toggles (nextgcore#1395)
         # The PROFILE=demo post-render that merges a demo overlay's toggles
         # into the NF configs: fail-closed rules, demo-off untouched.
