@@ -214,16 +214,21 @@ struct Args {
 
     /// DN prefixes NOT source-NATed (#1455): comma-separated IPv4 prefixes or
     /// addresses (e.g. `10.60.0.0/24`). Traffic from the UE subnet to them leaves
-    /// with the UE's own address (an ACCEPT ahead of the MASQUERADE), so a DN
-    /// server can identify the UE by it. Unset (the default): everything is
-    /// masqueraded, as before. A bad entry refuses to start.
+    /// with the UE's own address (ACCEPTs in the `UPF-NAT-EXCLUDE` nat chain,
+    /// jumped to from the head of POSTROUTING, so they also win over a MASQUERADE
+    /// installed before the UPF), so a DN server can identify the UE by it. The DN
+    /// must route the UE subnet back via the UPF. Unset (the default): everything
+    /// is masqueraded, as before. A bad entry, or a rule that cannot be installed,
+    /// refuses to start.
     /// `UPF_NAT_EXCLUDE` is read when the flag is not given.
     #[arg(long, default_value = "")]
     nat_exclude: String,
 
     /// Per-session byte counters on `/metrics` (#1455): `off` (the default; the
     /// endpoint is unchanged), `seid` (`upf_session_{ul,dl}_bytes_total{seid}`) or
-    /// `seid-ue-ip` (also a `ue_ipv4` label). Never a SUPI.
+    /// `seid-ue-ip` (also a `ue_ipv4` label, which puts UE addresses on the
+    /// unauthenticated `/metrics`). Never a SUPI. One series per live session,
+    /// unbounded: opt-in for small deployments.
     /// `UPF_SESSION_METRICS` is read when the flag is not given.
     #[arg(long)]
     session_metrics: Option<String>,
@@ -2214,8 +2219,16 @@ mod tests {
         session_metrics::set_mode(session_metrics::Mode::SeidUeIp);
         assert!(render_metrics()
             .contains("upf_session_ul_bytes_total{seid=\"0x1455\",ue_ipv4=\"10.45.0.55\"} 4200\n"));
+        // A deleted session's series is gone from the next scrape (the render reads
+        // the live table; PFCP Session Deletion and peer failure both remove from it).
+        session_metrics::set_mode(session_metrics::Mode::Seid);
+        assert!(dp.sessions.remove_session_by_seid(0x1455));
+        let after = render_metrics();
+        assert!(
+            !after.contains("seid=\"0x1455\""),
+            "the deleted session's series must go, in:\n{after}"
+        );
         session_metrics::set_mode(session_metrics::Mode::Off);
-        dp.sessions.remove_session_by_seid(0x1455);
     }
 
     #[test]

@@ -2185,8 +2185,11 @@ jobs:
     # reaches a DN namespace. The DN must see the UPF's N6 address without the
     # flag and the UE's own address with `--nat-exclude <dn prefix>`, and
     # `--session-metrics seid` must report upf_session_ul_bytes_total equal to the
-    # inner bytes sent (none when off). Two negative controls: excluding another
-    # prefix still masquerades; no series without the flag. Needs NET_ADMIN
+    # inner bytes sent (none when off). Also: a MASQUERADE installed BEFORE upfd
+    # (the k8s/Helm/EKS wrapper) must not defeat the exclusion, and a restart with
+    # a changed list must leave no stale exclusion. Two negative controls:
+    # excluding another prefix still masquerades; no series without the flag.
+    # Needs NET_ADMIN
     # (netns, veth, iptables) and a TUN, hence sudo. Nightly and on demand, like
     # the netem leg.
     runs-on: ubuntu-latest
@@ -2201,7 +2204,7 @@ jobs:
           workspaces: src
       - name: build upfd
         run: cd src && cargo build -p nextgcore-upfd
-      - name: arms (off, excluded + seid series, negative controls)
+      - name: arms (off, excluded + seid series, wrapper MASQUERADE, restart, negative controls)
         run: sudo bash docker/nat-exclude/run.sh src/target/debug/nextgcore-upfd /tmp/nat-exclude
       - name: upload the leg logs
         if: always()

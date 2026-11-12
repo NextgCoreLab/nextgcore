@@ -9,7 +9,12 @@
 //! `seid-ue-ip` mode also by the UE's IPv4 address, for a deployment that must join
 //! a session to the source address a DN server saw. Never by SUPI: the UPF does
 //! not hold one (TS 29.244 carries none), and resolving a UE address to a
-//! subscriber is the NEF's job. The series count is bounded by `--max-sessions`.
+//! subscriber is the NEF's job.
+//!
+//! Cardinality is UNBOUNDED: one series per live PFCP session, however many there
+//! are (`--max-sessions` does not cap the session table). Hence opt-in: turn it
+//! on where the session count is known to be small (a demo), not on a production
+//! UPF scraped by a shared Prometheus.
 
 use crate::data_plane::DataPlaneSession;
 use std::sync::atomic::{AtomicU8, Ordering};

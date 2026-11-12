@@ -7,10 +7,11 @@
       FAR (FORW to Core). Prints "UPF SEID 0x<seid>" and stays bound to answer
       nothing more (exits once the session is up).
 
-  nat_exclude_smf.py send <n3-ip> <teid> <ue-ip> <dn-ip> <count>
+  nat_exclude_smf.py send <n3-ip> <teid> <ue-ip> <dn-ip> <count> [<ue-port>]
       Sends <count> G-PDUs to <n3-ip>:2152, each carrying one inner IPv4/UDP
-      datagram <ue-ip>:40000 -> <dn-ip>:9999 with a 100-byte payload (128 inner IP
-      bytes). Prints the inner byte total.
+      datagram <ue-ip>:<ue-port, default 40000> -> <dn-ip>:9999 with a 100-byte
+      payload (128 inner IP bytes). A new port is a new flow (conntrack). Prints
+      the inner byte total.
 
   nat_exclude_smf.py dn <listen-ip> <count> <secs>
       A DN server: prints "src=<ip> len=<n>" per datagram received on <ip>:9999,
@@ -76,9 +77,9 @@ def checksum(b):
     return ~s & 0xffff
 
 
-def send(n3, teid, ue, dn, count):
+def send(n3, teid, ue, dn, count, sport):
     payload = b"N" * 100
-    udp = struct.pack("!HHHH", 40000, 9999, 8 + len(payload), 0) + payload
+    udp = struct.pack("!HHHH", sport, 9999, 8 + len(payload), 0) + payload
     total = 20 + len(udp)
     ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, total, 1, 0, 64, 17, 0,
                      socket.inet_aton(ue), socket.inet_aton(dn))
@@ -110,7 +111,8 @@ cmd = sys.argv[1]
 if cmd == "establish":
     establish(sys.argv[2], sys.argv[3], int(sys.argv[4], 0), sys.argv[5])
 elif cmd == "send":
-    send(sys.argv[2], int(sys.argv[3], 0), sys.argv[4], sys.argv[5], int(sys.argv[6]))
+    send(sys.argv[2], int(sys.argv[3], 0), sys.argv[4], sys.argv[5], int(sys.argv[6]),
+         int(sys.argv[7]) if len(sys.argv) > 7 else 40000)
 elif cmd == "dn":
     dn(sys.argv[2], int(sys.argv[3]), float(sys.argv[4]))
 else:

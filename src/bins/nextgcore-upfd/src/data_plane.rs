@@ -344,46 +344,6 @@ impl TunDevice {
         ))
     }
 
-    /// Set up NAT/masquerading for the subnet
-    #[cfg(target_os = "linux")]
-    ///
-    /// #1455: `nat_exclude` prefixes get an ACCEPT ahead of the MASQUERADE, so the
-    /// UE's own address reaches them; empty, the one MASQUERADE of before.
-    pub fn setup_nat(
-        &self,
-        subnet: Ipv4Addr,
-        prefix_len: u8,
-        nat_exclude: &[crate::nat_exclude::Prefix],
-    ) -> io::Result<()> {
-        use std::process::Command;
-
-        let subnet_str = format!("{}/{}", subnet, prefix_len);
-
-        for args in crate::nat_exclude::postrouting_rules(&subnet_str, &self.name, nat_exclude) {
-            let output = Command::new("iptables").args(&args).output()?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                log::warn!("iptables NAT setup warning: {}", stderr);
-            }
-        }
-        for p in nat_exclude {
-            log::info!("NAT: {subnet_str} toward {p} keeps the UE source address (--nat-exclude)");
-        }
-
-        log::info!("NAT configured for subnet {}", subnet_str);
-        Ok(())
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub fn setup_nat(
-        &self,
-        _subnet: Ipv4Addr,
-        _prefix_len: u8,
-        _nat_exclude: &[crate::nat_exclude::Prefix],
-    ) -> io::Result<()> {
-        Ok(()) // No-op on non-Linux
-    }
-
     /// Get the interface name
     pub fn name(&self) -> &str {
         &self.name
@@ -2664,7 +2624,6 @@ impl SessionManager {
         }
     }
 
-    /// Get session count
     /// Every live session (#1455: the per-session `/metrics` families).
     pub fn sessions_snapshot(&self) -> Vec<Arc<DataPlaneSession>> {
         self.seid_map
@@ -2673,6 +2632,7 @@ impl SessionManager {
             .unwrap_or_default()
     }
 
+    /// Get session count
     pub fn session_count(&self) -> usize {
         self.seid_map.read().unwrap().len()
     }
@@ -3628,7 +3588,13 @@ impl DataPlane {
         // Setup NAT for UE subnet
         let subnet = Ipv4Addr::new(tun_ip.octets()[0], tun_ip.octets()[1], 0, 0);
         log::info!("Setting up NAT for subnet: {subnet}/{tun_prefix}");
-        tun.setup_nat(subnet, tun_prefix, &self.nat_exclude)?;
+        #[cfg(target_os = "linux")]
+        self.install_nat(
+            tun.name(),
+            subnet,
+            tun_prefix,
+            &mut crate::nat_exclude::SystemIptables,
+        )?;
 
         self.tun = Some(tun);
 
@@ -3642,6 +3608,20 @@ impl DataPlane {
 
         log::info!("Data plane initialized");
         Ok(())
+    }
+
+    /// Install the N6 NAT for the UE subnet `subnet/prefix` on `tun`: this data
+    /// plane's `--nat-exclude` prefixes, then the MASQUERADE (#1455; see
+    /// [`crate::nat_exclude::install`]). An exclusion that cannot be installed
+    /// refuses to start.
+    pub fn install_nat(
+        &self,
+        tun: &str,
+        subnet: Ipv4Addr,
+        prefix: u8,
+        ipt: &mut impl crate::nat_exclude::Iptables,
+    ) -> io::Result<()> {
+        crate::nat_exclude::install(&format!("{subnet}/{prefix}"), tun, &self.nat_exclude, ipt)
     }
 
     /// The GTP-U socket for a destination of `dst`'s address family (#918).
