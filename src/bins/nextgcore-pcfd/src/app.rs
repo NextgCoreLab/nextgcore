@@ -360,8 +360,8 @@ pub async fn run() -> Result<()> {
         let restored_caps = crate::sbi_path::pcf_restore_demo_capped_sessions();
         if restored_caps > 0 {
             log::warn!(
-                "PCF boot: {restored_caps} demo-capped session(s) re-notified with the \
-                 subscribed Session-AMBR"
+                "PCF boot: {restored_caps} demo-capped session(s) to restore to the subscribed \
+                 Session-AMBR; each is logged once the SMF confirms it"
             );
         }
         if notified + unnotifiable > 0 {
@@ -10623,9 +10623,12 @@ mod tests {
     /// subscribed 11/22 Mbps and clears the record. A released session's cap
     /// is forgotten too.
     ///
-    /// REVERT-VERIFIED: skipping `pcf_restore_demo_capped_sessions` at start-up
-    /// (here: making it return before notifying) leaves no notify and fails the
-    /// wait.
+    /// Round 2: with the SMF unreachable the restore fails and KEEPS the record;
+    /// once the SMF is back it is delivered and only then cleared.
+    ///
+    /// REVERT-VERIFIED: clearing the record before the send (round 1's order)
+    /// fails the "keeps the record" assertion; not forgetting on release fails
+    /// the last one.
     #[cfg(feature = "demo-d441a-congestion-loop")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context
@@ -10676,7 +10679,38 @@ mod tests {
         // The restart: the in-memory layer is empty; the record survives.
         crate::ambr_override::forget(&pol);
         peers.notified.lock().unwrap().clear();
-        assert_eq!(sbi_path::pcf_restore_demo_capped_sessions(), 1);
+        let quick = sbi_path::RestoreRetry {
+            rounds: 2,
+            first: Duration::from_millis(10),
+            max: Duration::from_millis(10),
+        };
+        // Round-2 MAJOR 1: the SMF is unreachable. Nothing is delivered and the
+        // record is KEPT, so the cap is not lost.
+        let held = nextgcore_sbi::test_support::down_port();
+        let live_uri = sess().notification_uri.clone();
+        let mut down = sess();
+        down.notification_uri = Some(format!(
+            "http://127.0.0.1:{}/nsmf-callback/v1/sm-policy-notify/3",
+            held.port()
+        ));
+        pcf_self().read().unwrap().sess_update(&down);
+        assert_eq!(
+            sbi_path::restore_demo_cap(down.id, quick).await,
+            sbi_path::RestoreOutcome::Failed
+        );
+        assert!(
+            sess().demo_ambr_cap.is_some(),
+            "an undelivered restore keeps the record"
+        );
+        drop(held);
+        // The SMF is back: delivered, the subscribed 11/22 Mbps, the record cleared.
+        let mut up = sess();
+        up.notification_uri = live_uri;
+        pcf_self().read().unwrap().sess_update(&up);
+        assert_eq!(
+            sbi_path::restore_demo_cap(up.id, quick).await,
+            sbi_path::RestoreOutcome::Delivered
+        );
         let got = await_notifications(&peers, 1).await;
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(
@@ -10684,7 +10718,11 @@ mod tests {
             seeded_rule_1383()
         );
         assert_eq!(sess().demo_ambr_cap, None);
-        assert_eq!(sbi_path::pcf_restore_demo_capped_sessions(), 0, "once");
+        assert_eq!(
+            sbi_path::pcf_restore_demo_capped_sessions(),
+            0,
+            "nothing left to restore"
+        );
 
         // Release: a capped session's cap leaves with it.
         crate::ambr_override::set(

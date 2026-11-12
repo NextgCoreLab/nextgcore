@@ -102,6 +102,7 @@ static UNAUTHORIZED: AtomicU64 = AtomicU64::new(0);
 static FORBIDDEN: AtomicU64 = AtomicU64::new(0);
 static MALFORMED: AtomicU64 = AtomicU64::new(0);
 static UNAVAILABLE: AtomicU64 = AtomicU64::new(0);
+static LIMITED: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 thread_local! {
@@ -570,9 +571,7 @@ pub async fn ingest_report(
             p.occupancy_pct, p.confidence, p.horizon_ms
         )
     });
-    nextgcore_demo::demo_log!(
-        info,
-        DEMO_KEY,
+    let line = format!(
         "ran-ingest cell={} tai={} occupancy={:.1}% served_kbps={}/{} connected_ues={} \
          amf_ues_in_area={amf}{predicted} from={sub}",
         report.cell,
@@ -584,7 +583,12 @@ pub async fn ingest_report(
     );
     let tai = report.tai.clone();
     if !store.ingest(report) {
-        MALFORMED.fetch_add(1, Ordering::Relaxed);
+        LIMITED.fetch_add(1, Ordering::Relaxed);
+        nextgcore_demo::demo_log!(
+            warn,
+            DEMO_KEY,
+            "ran-ingest refused (429): a new cell beyond {MAX_CELLS}; nothing ingested"
+        );
         return done(nextgcore_sbi::server::send_error(
             429,
             "Too Many Requests",
@@ -592,6 +596,7 @@ pub async fn ingest_report(
             None,
         ));
     }
+    nextgcore_demo::demo_log!(info, DEMO_KEY, "{line}");
     let new_tai = store.first_sight(&tai).then_some(tai);
     INGESTED.fetch_add(1, Ordering::Relaxed);
     Ingested {
@@ -1081,6 +1086,7 @@ pub fn render_metrics(out: &mut String) {
         ("forbidden", &FORBIDDEN),
         ("malformed", &MALFORMED),
         ("unavailable", &UNAVAILABLE),
+        ("limited", &LIMITED),
     ] {
         let _ = writeln!(
             out,

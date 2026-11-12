@@ -12,6 +12,10 @@
 #                       mount; scenario.sh adds the gNB exporter's own JWK.
 #   gnb-config.yaml     gnb.yaml with the exporter block (C = 5 Mbps, NRF, the
 #                       exporter's nfInstanceId and key paths).
+#   pcf-state.yaml      pcfd's durable state on its `logs` emptyDir, so a
+#                       restarted container undoes a cap it recorded. A pod
+#                       re-creation loses it (no usable StorageClass): redeploy
+#                       the arm or re-authorise UE-B after one mid-throttle.
 #   ue-b.yaml           UE-B (imsi-...002), scaled up by scenario.sh after its
 #                       subscriber is seeded. The base UE is UE-V.
 #
@@ -37,3 +41,4 @@ patches:
   - path: core-configs.yaml
   - path: nrf-cca-mount.yaml
   - path: gnb-config.yaml
+  - path: pcf-state.yaml

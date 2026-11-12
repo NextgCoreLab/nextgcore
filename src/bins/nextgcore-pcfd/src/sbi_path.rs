@@ -984,8 +984,130 @@ pub fn pcf_sbi_send_smpolicycontrol_delete_notify(sess_id: u64, app_session_id: 
 /// boot would terminate an association the SMF released long ago.
 ///
 /// Returns `(notified, unnotifiable)`.
-/// nextgsim#465: at start-up, tell the SMF the subscribed Session-AMBR again for
-/// every restored session that a demo had capped ([`crate::context::PcfSess::demo_ambr_cap`]).
+/// How [`restore_demo_cap`] retries an undelivered restore.
+#[derive(Debug, Clone, Copy)]
+pub struct RestoreRetry {
+    /// Rounds of delivery, each one a full [`send_notification_post`].
+    pub rounds: u32,
+    /// The wait before the second round; doubled each round up to `max`.
+    pub first: std::time::Duration,
+    pub max: std::time::Duration,
+}
+
+impl RestoreRetry {
+    /// Production: 40 rounds, 2 s doubling to 60 s (about 35 minutes), then the
+    /// record is left for the next start-up.
+    pub const DEFAULT: RestoreRetry = RestoreRetry {
+        rounds: 40,
+        first: std::time::Duration::from_secs(2),
+        max: std::time::Duration::from_secs(60),
+    };
+}
+
+/// What [`restore_demo_cap`] came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreOutcome {
+    /// The SMF answered 2xx: it holds the subscribed value; the record is cleared.
+    Delivered,
+    /// The SMF answered 404 (it has no such association any more), or the PCF
+    /// session is gone: there is no cap left to undo; the record is cleared.
+    Gone,
+    /// A demo capped the session again meanwhile; the controller owns it now.
+    Superseded,
+    /// Undelivered after every round: the record is KEPT, so the next start-up
+    /// tries again.
+    Failed,
+}
+
+/// nextgsim#465: tell the SMF the subscribed Session-AMBR again for a restored
+/// session that a demo had capped ([`crate::context::PcfSess::demo_ambr_cap`]),
+/// and clear the record **only once the SMF confirmed it** (2xx, or a 404 for an
+/// association it no longer has). Until then the record stays, in memory and in
+/// the durable state, so neither a failed send nor a crash in between loses the
+/// only trace of a cap the SMF and the UPF QER still enforce.
+pub async fn restore_demo_cap(sess_id: u64, retry: RestoreRetry) -> RestoreOutcome {
+    let mut wait = retry.first;
+    for round in 0..retry.rounds.max(1) {
+        if round > 0 {
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(retry.max);
+        }
+        let Some(sess) = crate::context::pcf_self()
+            .read()
+            .ok()
+            .and_then(|ctx| ctx.sess_find_by_id(sess_id))
+        else {
+            return RestoreOutcome::Gone;
+        };
+        let Some(recorded) = sess.demo_ambr_cap.clone() else {
+            return RestoreOutcome::Gone;
+        };
+        #[cfg(feature = "demo-d441a-congestion-loop")]
+        if crate::ambr_override::get(&sess.sm_policy_id).is_some() {
+            return RestoreOutcome::Superseded;
+        }
+        let Some(uri) = sess.notification_uri.clone() else {
+            log::warn!(
+                "[sm_policy_id={}] demo cap restore: no notification URI; keeping the record",
+                sess.sm_policy_id
+            );
+            return RestoreOutcome::Failed;
+        };
+        let Some((body, sd)) = build_sm_policy_notification(&sess) else {
+            continue;
+        };
+        let status = send_notification_post(&uri, "/update", &body).await;
+        let outcome = match status {
+            Ok(s) if (200..300).contains(&s) => RestoreOutcome::Delivered,
+            Ok(404) => RestoreOutcome::Gone,
+            Ok(s) => {
+                log::warn!(
+                    "[sm_policy_id={}] demo cap restore: the SMF answered {s} (round {round})",
+                    sess.sm_policy_id
+                );
+                continue;
+            }
+            Err(e) => {
+                log::warn!(
+                    "[sm_policy_id={}] demo cap restore: {e} (round {round})",
+                    sess.sm_policy_id
+                );
+                continue;
+            }
+        };
+        // Confirmed: clear the record, unless a demo wrote a new one meanwhile.
+        if let Ok(ctx) = crate::context::pcf_self().read() {
+            if let Some(mut stored) = ctx.sess_find_by_id(sess_id) {
+                if stored.demo_ambr_cap.as_ref() == Some(&recorded) {
+                    stored.demo_ambr_cap = None;
+                }
+                if outcome == RestoreOutcome::Delivered {
+                    stored.authorised_session_data = Some(sd);
+                }
+                ctx.sess_update(&stored);
+            }
+        }
+        log::warn!(
+            "[sm_policy_id={}] demo cap {recorded:?} undone: the SMF {} (nextgsim#465)",
+            sess.sm_policy_id,
+            if outcome == RestoreOutcome::Delivered {
+                "holds the subscribed Session-AMBR again"
+            } else {
+                "no longer has the association"
+            }
+        );
+        return outcome;
+    }
+    log::error!(
+        "[sess_id={sess_id}] demo cap restore undelivered after {} rounds; the record is kept \
+         and the next start-up tries again (nextgsim#465)",
+        retry.rounds
+    );
+    RestoreOutcome::Failed
+}
+
+/// nextgsim#465: at start-up, start [`restore_demo_cap`] for every restored
+/// session a demo had capped.
 ///
 /// The cap itself lived in memory and died with the previous process, and so did
 /// the controller that would have restored it; the SMF and the UPF QER still
@@ -994,34 +1116,26 @@ pub fn pcf_sbi_send_smpolicycontrol_delete_notify(sess_id: u64, app_session_id: 
 /// restored, whatever the new configuration: if its demo is still active and the
 /// cell still congested, the controller throttles it again on its own evidence.
 ///
-/// Runs in every build: a default build never writes the field, but it may restore
-/// a snapshot a demo build wrote. Returns how many notifies were sent.
+/// Runs in every build that restores durable state: a default build never
+/// writes the field, but it may restore a snapshot a demo build wrote. Returns
+/// how many restores were started; each logs its own confirmed outcome.
 pub fn pcf_restore_demo_capped_sessions() -> usize {
-    let capped: Vec<crate::context::PcfSess> = match crate::context::pcf_self().read() {
+    let capped: Vec<u64> = match crate::context::pcf_self().read() {
         Ok(ctx) => ctx
             .sess_all()
             .into_iter()
             .filter(|s| s.demo_ambr_cap.is_some())
+            .map(|s| s.id)
             .collect(),
         Err(_) => return 0,
     };
-    let mut sent = 0;
-    for mut sess in capped {
-        let cap = sess.demo_ambr_cap.take();
-        if let Ok(ctx) = crate::context::pcf_self().read() {
-            ctx.sess_update(&sess);
-        }
-        log::warn!(
-            "[sm_policy_id={}] restoring the subscribed Session-AMBR: the session held a \
-             demo cap {:?} from before this start-up (nextgsim#465)",
-            sess.sm_policy_id,
-            cap
-        );
-        if pcf_sbi_send_smpolicycontrol_update_notify(sess.id) {
-            sent += 1;
-        }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return 0;
+    };
+    for id in &capped {
+        handle.spawn(restore_demo_cap(*id, RestoreRetry::DEFAULT));
     }
-    sent
+    capped.len()
 }
 
 pub fn pcf_notify_unrestorable_associations() -> (usize, usize) {
