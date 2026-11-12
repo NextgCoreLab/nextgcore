@@ -515,6 +515,16 @@ pub async fn run() -> Result<()> {
         yaml_sbi.advertise.as_deref(),
         7777,
     );
+    // #1440: the base of the subscription-change callback this UDM hands the AMF
+    // (TS 23.502 §4.15.3.2.3 step 3a). None when nothing reachable is
+    // advertised: then no change endpoint is offered, never a wildcard one.
+    crate::ee_amf::set_notify_base(sbi.registration_host().ok().map(|host| {
+        format!(
+            "{}://{}",
+            if args.tls { "https" } else { "http" },
+            nextgcore_sbi::uri_encode::uri_authority(host, sbi.port)
+        )
+    }));
     let sbi_config = SbiServerConfig {
         addr: sbi.host.clone(),
         port: sbi.port,
@@ -746,6 +756,8 @@ async fn udm_sbi_route(request: SbiRequest) -> SbiResponse {
         "nudm-ee" => route_nudm_ee(&parts, method, &request, uri).await,
         "nudm-pp" => route_nudm_pp(&parts, method, &request, uri).await,
         "nudm-mt" => route_nudm_mt(&parts, method, &request, uri).await,
+        // Callback endpoints this UDM hands its peers; not a Nudm service.
+        "nudm-callback" => route_nudm_callback(&parts, method, &request, uri).await,
         // Defined by TS 29.503 but not implemented here: the operation is
         // recognised and answered 501, so a consumer can tell "this UDM does not
         // do that yet" from "that is not a Nudm operation".
@@ -1014,6 +1026,30 @@ async fn route_nudm_ee(
             handle_ee_modify(ue_identity, id, request).await
         }
         _ => unmatched(ee_allowed_methods(parts), method, uri),
+    }
+}
+
+/// Callbacks this UDM hands its peers (#1440):
+/// - `POST /nudm-callback/v1/{eeSubscriptionId}/ee-amf-subs-change/{token}`, the
+///   `subsChangeNotifyUri` of the UDM's Namf_EventExposure subscriptions
+///   (TS 23.502 §4.15.3.2.3 step 3a).
+///
+/// Served on the SBI listener and so behind its OAuth2 gate, like every route;
+/// the token additionally ties the call to the AMF this UDM gave the URI to.
+async fn route_nudm_callback(
+    parts: &[&str],
+    method: &str,
+    request: &SbiRequest,
+    uri: &str,
+) -> SbiResponse {
+    match (parts, method) {
+        ([_, "v1", ee_id, crate::ee_amf::SUBS_CHANGE_SEGMENT, token], "POST") => {
+            crate::ee_amf::handle_subs_change(ee_id, token, request).await
+        }
+        ([_, "v1", _, crate::ee_amf::SUBS_CHANGE_SEGMENT, _], _) => {
+            unmatched(Some(&["POST"]), method, uri)
+        }
+        _ => unmatched(None, method, uri),
     }
 }
 
@@ -2436,6 +2472,10 @@ pub async fn handle_ee_subscribe(ue_identity: &str, request: &SbiRequest) -> Sbi
             context.ee_subscription_insert(sub);
         };
     }
+    // #1440 (TS 23.502 §4.15.3.2.3 step 3a): an AMF-detected event is subscribed
+    // at the UE's serving AMF before this answers (step 4 follows step 3a). A
+    // refusal there does not fail this subscription; see `ee_amf`.
+    crate::ee_amf::reconcile(&subscription_id).await;
     // CreatedEeSubscription requires the echoed eeSubscription (yaml:409-413).
     let mut echoed = ee_sub;
     if let Some(obj) = echoed.as_object_mut() {
@@ -2467,10 +2507,17 @@ pub async fn handle_ee_unsubscribe(ue_identity: &str, subscription_id: &str) -> 
     if !exists {
         return send_problem(404, "NOT_FOUND", "Subscription not found");
     }
-    let ctx = udm_self();
-    if let Ok(context) = ctx.read() {
-        context.ee_subscription_remove(subscription_id);
+    let removed = {
+        let ctx = udm_self();
+        let guard = ctx.read().ok();
+        guard
+            .as_ref()
+            .and_then(|c| c.ee_subscription_remove(subscription_id))
     };
+    // #1440: and the subscription this UDM held at the AMF for it.
+    if let Some(sub) = removed {
+        crate::ee_amf::release(&sub).await;
+    }
     SbiResponse::with_status(204)
 }
 
@@ -2544,6 +2591,8 @@ pub async fn handle_ee_modify(
     if !updated {
         return send_problem(404, "NOT_FOUND", "Subscription not found");
     }
+    // #1440: the patch may add or drop an AMF-detected event.
+    crate::ee_amf::reconcile(subscription_id).await;
     SbiResponse::with_status(204)
 }
 

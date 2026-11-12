@@ -107,7 +107,16 @@ pub fn build_modification_notification(supi: &str, event: UeContextEvent) -> Val
     })
 }
 
-/// Build the `MonitoringReport` body (TS 29.503 §6.4.6.2.x).
+/// The `LossOfConnectivityReason` (TS 29.518 §6.2.6.3.12) of a loss of
+/// connectivity the UDM itself detects: the serving AMF deregistered the UE.
+pub const UDM_DETECTED_LOSS_REASON: &str = "DEREGISTERED";
+
+/// Build the `MonitoringReport` body (TS 29.503 §6.4.6.2.4).
+///
+/// `timeStamp` is a member of the MonitoringReport (M). A
+/// `LOSS_OF_CONNECTIVITY` report carries the `LossConnectivityReport` its
+/// `report` must hold (§6.4.6.2.17, `lossOfConnectReason` M), #1444. The other
+/// event types keep the `report.supi` this UDM has always sent.
 pub fn build_monitoring_report(
     supi: &str,
     reference_ids: &[&str],
@@ -120,13 +129,17 @@ pub fn build_monitoring_report(
     let reports: Vec<Value> = reference_ids
         .iter()
         .map(|reference_id| {
+            let report = match event {
+                UeContextEvent::AmfDeregistered => {
+                    json!({ "lossOfConnectReason": UDM_DETECTED_LOSS_REASON })
+                }
+                _ => json!({ "supi": supi }),
+            };
             json!({
                 "referenceId": reference_id,
                 "eventType": event.ee_event_type(),
-                "report": {
-                    "supi": supi,
-                    "timeStamp": timestamp,
-                },
+                "timeStamp": timestamp,
+                "report": report,
             })
         })
         .collect();
@@ -219,6 +232,17 @@ pub async fn notify_ue_context_change(supi: &str, event: UeContextEvent) -> (usi
         // configured. This loop used to post every event to every subscription,
         // so a LOSS_OF_CONNECTIVITY subscriber heard about every registration.
         let configurations = sub.configurations_for(event.ee_event_type());
+        // #1440: while the UDM holds a subscription at the serving AMF for this
+        // event, the AMF reports it to the consumer itself, with its own reason;
+        // raising it here too would report one loss twice.
+        if !configurations.is_empty() && crate::ee_amf::amf_reports(sub, event.ee_event_type()) {
+            log::debug!(
+                "EE subscription {}: {} is reported by the serving AMF; not raised here",
+                sub.id,
+                event.ee_event_type()
+            );
+            continue;
+        }
         if configurations.is_empty() {
             log::debug!(
                 "EE subscription {} does not monitor {}; not notified",
@@ -433,8 +457,25 @@ mod tests {
         // #1438: the configuration key, as the consumer gave it.
         assert_eq!(report["referenceId"], "loc-1");
         assert_eq!(report["eventType"], "LOSS_OF_CONNECTIVITY");
+        // #1444: timeStamp is a MonitoringReport member (§6.4.6.2.4, M), and a LoC
+        // report's `report` is exactly a LossConnectivityReport (§6.4.6.2.17).
+        assert_eq!(report["timeStamp"], "2026-09-07T12:00:00Z");
+        assert_eq!(
+            report["report"],
+            json!({ "lossOfConnectReason": "DEREGISTERED" })
+        );
+
+        // The other event types keep their report body, with the same timeStamp.
+        let r = build_monitoring_report(
+            "imsi-001010000000001",
+            &["r-1"],
+            UeContextEvent::AmfRegistered,
+            "2026-09-07T12:00:00Z",
+        );
+        let report = &r["reportList"][0];
+        assert_eq!(report["eventType"], "UE_REACHABILITY_FOR_DATA");
+        assert_eq!(report["timeStamp"], "2026-09-07T12:00:00Z");
         assert_eq!(report["report"]["supi"], "imsi-001010000000001");
-        assert_eq!(report["report"]["timeStamp"], "2026-09-07T12:00:00Z");
     }
 
     #[test]

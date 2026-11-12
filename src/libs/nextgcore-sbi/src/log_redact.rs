@@ -9,8 +9,13 @@
 //! retained far more widely than the NF that holds the token.
 
 /// Path segments whose NEXT segment is a callback token.
-pub const CALLBACK_TOKEN_SEGMENTS: [&str; 3] =
-    ["nf-status-notify", "dereg-notify", "amf-location-notify"];
+pub const CALLBACK_TOKEN_SEGMENTS: [&str; 4] = [
+    "nf-status-notify",
+    "dereg-notify",
+    "amf-location-notify",
+    // udmd's Namf_EventExposure subsChangeNotifyUri (nextgcore#1440).
+    "ee-amf-subs-change",
+];
 
 /// What a redacted segment is replaced with.
 pub const REDACTED: &str = "<redacted>";

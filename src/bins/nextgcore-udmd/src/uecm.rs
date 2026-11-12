@@ -569,6 +569,13 @@ pub async fn process_amf_registration(
     // Local cache (UDR is the system of record).
     cache_amf_registration(supi, Some(body), access);
 
+    // #1440 (TS 23.502 §4.15.3.2.3 step 3a): the serving AMF is now known, or
+    // has changed, so AMF-detected EE events are subscribed there. Only the 3GPP
+    // registration is the cached serving AMF `ee_amf` reads.
+    if access == UecmAccess::ThreeGpp {
+        crate::ee_amf::on_amf_registered(supi).await;
+    }
+
     // #83: the UE's AMF context data set just changed, so SDM subscribers
     // monitoring it get a ModificationNotification and EE subscribers get a
     // MonitoringReport. Awaited rather than spawned so the notification is
@@ -1204,7 +1211,7 @@ pub struct MockUdr {
 
 #[cfg(test)]
 impl MockUdr {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             stored: std::sync::Mutex::new(std::collections::HashMap::new()),
             put_status: 201,
@@ -1924,7 +1931,13 @@ mod tests {
     async fn test_dereg_notify_strict_peer_amfd_accepts_udmd_body() {
         use nextgcore_sbi::message::SbiRequest;
 
-        // Capture udmd's production notify body BEFORE taking the amf guard.
+        // Hold the guard across the capture too: it makes a real UECM
+        // registration, which notifies every EE subscription covering the SUPI,
+        // `anyUE` ones included (#1357). Taken after it, a sibling's anyUE
+        // subscriber counted this registration as its own (found looping #1440).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (uri, body) = capture_udmd_dereg_body().await;
 
         // Reverse-shape pins on udmd's production body: absolute URI + both
@@ -1944,12 +1957,9 @@ mod tests {
         );
 
         let supi = "imsi-001010000000399";
-        // Hold the guard across seed + real handler + drain so a parallel test
-        // cannot re-init (wipe) the global amf context in between — that race
-        // was the intermittent "0 vs 1 enqueued" failure.
-        let _guard = crate::test_support::CONTEXT_GUARD
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        // The guard (taken above) is held across seed + real handler + drain so a
+        // parallel test cannot re-init (wipe) the global amf context in between --
+        // that race was the intermittent "0 vs 1 enqueued" failure.
         nextgcore_amfd::test_support::init_context();
         let ue_id = seed_amf_ue(supi, 60_100);
 

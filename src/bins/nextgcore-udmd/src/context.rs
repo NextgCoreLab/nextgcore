@@ -462,6 +462,21 @@ pub struct UdmEeSubscription {
     /// these types are reported to it. Kept in step with `raw`: re-derive it with
     /// [`UdmEeSubscription::set_raw`] whenever the body changes.
     pub monitoring_configurations: Vec<EeMonitoringConfiguration>,
+    /// The Namf_EventExposure subscription this UDM holds at the serving AMF for
+    /// the AMF-detected events of this subscription (TS 23.502 §4.15.3.2.3 step
+    /// 3a, #1440). `None` while none is held; see [`crate::ee_amf`].
+    pub amf_leg: Option<AmfEeLeg>,
+}
+
+/// The UDM's subscription at an AMF on behalf of one Nudm_EE subscription
+/// (#1440): where it lives, so it can be deleted, and the capability token in the
+/// UDM's own subscription-change callback, so a forged change is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmfEeLeg {
+    /// Absolute URI of the AMF's subscription resource (TS 29.518 §6.2.3.3.2).
+    pub subscription_uri: String,
+    /// The token in this leg's `subsChangeNotifyUri`.
+    pub change_token: String,
 }
 
 impl UdmEeSubscription {
@@ -479,6 +494,7 @@ impl UdmEeSubscription {
             callback_reference: callback_reference.into(),
             raw: String::new(),
             monitoring_configurations: Vec::new(),
+            amf_leg: None,
         };
         sub.set_raw(raw);
         sub
@@ -1440,6 +1456,21 @@ impl UdmContext {
                 .cloned()
                 .collect(),
             Err(_) => Vec::new(),
+        }
+    }
+
+    /// Set only the AMF leg of EE subscription `id` (#1440), so a concurrent PATCH
+    /// of its body is not overwritten. `false` when it is not there.
+    pub fn ee_subscription_set_amf_leg(&self, id: &str, leg: Option<AmfEeLeg>) -> bool {
+        let Ok(mut list) = self.ee_subscription_list.write() else {
+            return false;
+        };
+        match list.get_mut(id) {
+            Some(sub) => {
+                sub.amf_leg = leg;
+                true
+            }
+            None => false,
         }
     }
 
