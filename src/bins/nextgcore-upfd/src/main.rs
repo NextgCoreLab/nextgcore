@@ -44,11 +44,13 @@ pub mod mcast;
 pub mod n4_build;
 pub mod n4_handler;
 pub mod n6_delay;
+pub mod nat_exclude;
 pub mod path_qos;
 pub mod pfcp_path;
 pub mod pfcp_sm;
 pub mod programmable_plane;
 pub mod rule_match;
+pub mod session_metrics;
 pub mod timer;
 pub mod tsn_bridge;
 pub mod upf_sm;
@@ -186,6 +188,22 @@ struct Args {
     /// milliseconds (with `--n6-delay-measurement`).
     #[arg(long, default_value = "1000")]
     n6_delay_probe_interval_ms: u64,
+
+    /// DN prefixes NOT source-NATed (#1455): comma-separated IPv4 prefixes or
+    /// addresses (e.g. `10.60.0.0/24`). Traffic from the UE subnet to them leaves
+    /// with the UE's own address (an ACCEPT ahead of the MASQUERADE), so a DN
+    /// server can identify the UE by it. Unset (the default): everything is
+    /// masqueraded, as before. A bad entry refuses to start.
+    /// `UPF_NAT_EXCLUDE` is read when the flag is not given.
+    #[arg(long, default_value = "")]
+    nat_exclude: String,
+
+    /// Per-session byte counters on `/metrics` (#1455): `off` (the default; the
+    /// endpoint is unchanged), `seid` (`upf_session_{ul,dl}_bytes_total{seid}`) or
+    /// `seid-ue-ip` (also a `ue_ipv4` label). Never a SUPI.
+    /// `UPF_SESSION_METRICS` is read when the flag is not given.
+    #[arg(long)]
+    session_metrics: Option<String>,
 }
 
 /// The PFCP peer allowlist (#968): `--pfcp-allowed-peers`, else `UPF_PFCP_ALLOWED_PEERS`.
@@ -257,6 +275,13 @@ fn render_metrics() -> String {
         Some(src) => src.data_plane.stats.render_prometheus(),
         None => data_plane::DataPlaneStats::default().render_prometheus(),
     };
+    // #1455: the per-session families, only when `--session-metrics` asks for them.
+    let per_session = match (session_metrics::mode(), METRICS_SOURCES.get()) {
+        (session_metrics::Mode::Off, _) | (_, None) => String::new(),
+        (mode, Some(src)) => {
+            session_metrics::render(mode, &src.data_plane.sessions.sessions_snapshot())
+        }
+    };
     let unauthorized = pfcp_path::PFCP_UNAUTHORIZED.load(Ordering::Relaxed);
     // #1368: the families every NF serves first (NRF client, process; the UPF serves
     // no SBI, so its SBI families stay empty), then the UPF's own.
@@ -280,6 +305,7 @@ fn render_metrics() -> String {
          upf_up 1\n"
     ));
     body.push_str(&dataplane);
+    body.push_str(&per_session);
     body
 }
 
@@ -400,6 +426,17 @@ async fn main() -> Result<()> {
     // Initialize data plane (optional based on --no-dataplane flag)
     let mut data_plane = DataPlane::new(shutdown.clone());
     let data_plane_enabled = !args.no_dataplane;
+    // #1455: both refuse to start on a bad value rather than run with less than asked.
+    data_plane.nat_exclude =
+        nat_exclude::setting(&args.nat_exclude, std::env::var("UPF_NAT_EXCLUDE").ok())
+            .map_err(|e| anyhow::anyhow!("--nat-exclude: {e}"))?;
+    session_metrics::set_mode(
+        session_metrics::Mode::setting(
+            args.session_metrics.as_deref(),
+            std::env::var("UPF_SESSION_METRICS").ok(),
+        )
+        .map_err(|e| anyhow::anyhow!(e))?,
+    );
 
     if data_plane_enabled {
         // Initialize data plane (TUN + GTP-U socket)
@@ -2084,6 +2121,50 @@ mod tests {
             render_metrics().contains("upf_dataplane_dl_packets_total 20"),
             "the data-plane counters must be re-read on every scrape"
         );
+
+        // #1455: the per-session families. In this test because they read the same
+        // once-installed `METRICS_SOURCES`.
+        let _mode = session_metrics::MODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let session = dp
+            .sessions
+            .add_session(data_plane::DataPlaneSession::new_empty(
+                0x1455,
+                1,
+                Some(std::net::Ipv4Addr::new(10, 45, 0, 55)),
+                0x1455,
+                0x2455,
+                SocketAddr::from(([127, 0, 0, 1], 2152)),
+                Some(1),
+                Some(9),
+            ));
+        session.ul_bytes.store(4200, Ordering::Relaxed);
+        session_metrics::set_mode(session_metrics::Mode::Off);
+        let off = render_metrics();
+        assert!(
+            !off.contains("upf_session_"),
+            "off (the default): no per-session family at all, in:\n{off}"
+        );
+        session_metrics::set_mode(session_metrics::Mode::Seid);
+        let on = render_metrics();
+        assert!(
+            on.contains("upf_session_ul_bytes_total{seid=\"0x1455\"} 4200\n"),
+            "in:\n{on}"
+        );
+        // Appended after every family the endpoint already had (the process gauges
+        // move between scrapes, so the bodies are compared by position, not bytes).
+        assert!(
+            on.find("# HELP upf_session_ul_bytes_total")
+                > on.find("upf_dataplane_ul_packets_total"),
+            "the families come last, in:\n{on}"
+        );
+        assert!(!on.contains("10.45.0.55"), "seid mode carries no address");
+        session_metrics::set_mode(session_metrics::Mode::SeidUeIp);
+        assert!(render_metrics()
+            .contains("upf_session_ul_bytes_total{seid=\"0x1455\",ue_ipv4=\"10.45.0.55\"} 4200\n"));
+        session_metrics::set_mode(session_metrics::Mode::Off);
+        dp.sessions.remove_session_by_seid(0x1455);
     }
 
     #[test]
