@@ -6544,6 +6544,10 @@ struct GsmProcedureTimer {
 struct GsmN2 {
     transfer: Vec<u8>,
     paged: Option<(u16, n2_transfer::Arp)>,
+    /// A QoS Monitoring Request (#1390): its retransmissions go through the
+    /// session's `qos_mon` RAN-leg owner, so none can overtake a later request
+    /// (#1390 review round 4).
+    qos_monitoring: bool,
 }
 
 /// Armed 5GSM procedure timers, keyed by SM context reference.
@@ -8022,6 +8026,13 @@ async fn run_gsm_timer_tick() {
                 // with a blackholed AMF each transfer waits its connect and request
                 // timeouts; awaited here, they held the tick, and every other timer and
                 // the shutdown check, for that long times N.
+                // #1390 review round 4: a QoS Monitoring Request is resent by the
+                // session's RAN-leg owner, after whatever it is sending, so the
+                // retransmission cannot reach the AMF after a later request.
+                if entry.n2.as_ref().is_some_and(|n2| n2.qos_monitoring) {
+                    qos_mon::retransmit_due(&sm_context_ref, attempt);
+                    continue;
+                }
                 let sm_ref = sm_context_ref.clone();
                 let timer_id = entry.timer_id;
                 spawn_gsm_expiry(async move {
@@ -8051,6 +8062,7 @@ async fn run_gsm_timer_tick() {
                                 &n2.transfer,
                                 n2.paged,
                                 &sm_ref,
+                                PagingRetries::Spawned,
                             )
                             .await;
                         }
@@ -8377,7 +8389,14 @@ async fn send_n1_n2_paging_request(
     let config = nextgcore_sbi::security::sbi_peer_client_config(&host, port)
         .with_connect_timeout(std::time::Duration::from_secs(2))
         .with_request_timeout(std::time::Duration::from_secs(3));
-    match send_n1n2_honouring_paging_conflict(config, request, sm_context_ref.to_string()).await {
+    match send_n1n2_honouring_paging_conflict(
+        config,
+        request,
+        sm_context_ref.to_string(),
+        PagingRetries::Spawned,
+    )
+    .await
+    {
         Ok(resp) => log::info!(
             "N1N2MessageTransfer (paging, SUPI {supi}, PSI {psi}, QFI {qfi:?}) → \
              {host}:{port}: status={}",
@@ -8429,27 +8448,43 @@ fn n1n2_paging_conflict_retry_after(
 /// the UE has answered the paging and the transfer reaches it CM-CONNECTED, or it
 /// is still being paged.
 ///
-/// The retries run on their own task (#1079 review): the callers sit on the N4
-/// receive loop (a DLDR's Session Report) and the 5GSM timer tick, which serve
-/// every UE, so waiting there would stall N4, heartbeat answers included. The
-/// first answer is returned as is.
+/// With [`PagingRetries::Spawned`] the retries run on their own task (#1079
+/// review): the callers sit on the N4 receive loop (a DLDR's Session Report) and
+/// the 5GSM timer tick, which serve every UE, so waiting there would stall N4,
+/// heartbeat answers included. The first answer is returned as is.
 async fn send_n1n2_honouring_paging_conflict(
     config: nextgcore_sbi::client::SbiClientConfig,
     request: nextgcore_sbi::message::SbiRequest,
     sm_context_ref: String,
+    retries: PagingRetries,
 ) -> nextgcore_sbi::SbiResult<nextgcore_sbi::message::SbiResponse> {
     let resp = nextgcore_sbi::client::SbiClient::new(config.clone())
         .send_request(request.clone())
         .await?;
     if let Some(wait) = n1n2_paging_conflict_retry_after(&resp) {
-        tokio::spawn(retry_n1n2_after_paging_conflict(
-            config,
-            request,
-            sm_context_ref,
-            wait,
-        ));
+        let retry = retry_n1n2_after_paging_conflict(config, request, sm_context_ref, wait);
+        match retries {
+            PagingRetries::Spawned => {
+                tokio::spawn(retry);
+            }
+            PagingRetries::Awaited => {
+                retry.await;
+            }
+        }
     }
     Ok(resp)
+}
+
+/// Where [`send_n1n2_honouring_paging_conflict`] runs the retries of a refused
+/// transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PagingRetries {
+    /// On their own task: the caller serves other UEs and must not wait.
+    Spawned,
+    /// Inline, before returning (#1390 review round 4): the caller is the one
+    /// task sending the session's QoS Monitoring Requests, and a retry spawned
+    /// past its return could reach the AMF after a later request.
+    Awaited,
 }
 
 /// How a refused N1N2MessageTransfer's retries ended (#749), for the log and the
@@ -9017,7 +9052,14 @@ async fn send_n1_n2_message_transfer(
     let config = nextgcore_sbi::security::sbi_peer_client_config(&host, port)
         .with_connect_timeout(std::time::Duration::from_secs(2))
         .with_request_timeout(std::time::Duration::from_secs(3));
-    match send_n1n2_honouring_paging_conflict(config, request, sm_context_ref.to_string()).await {
+    match send_n1n2_honouring_paging_conflict(
+        config,
+        request,
+        sm_context_ref.to_string(),
+        PagingRetries::Spawned,
+    )
+    .await
+    {
         Ok(resp) => log::info!(
             "N1N2MessageTransfer (SUPI {supi}, PSI {psi}, {} bytes) → {host}:{port}: status={}",
             n1.len(),
@@ -10121,12 +10163,70 @@ pub(crate) async fn signal_qos_monitoring(
         Some(GsmN2 {
             transfer: n2.clone(),
             paged,
+            qos_monitoring: true,
         }),
     );
     // Awaited, not spawned (#1390 review round 3): `qos_mon` sends one at a time
-    // per session, so the AMF receives them in the order they were decided.
-    send_n1_n2_modify_transfer(&amf_uri, &b.supi, b.psi, &n1, &n2, paged, sm_context_ref).await;
+    // per session, so the AMF receives them in the order they were decided. Its
+    // 409 retries too (round 4).
+    send_n1_n2_modify_transfer(
+        &amf_uri,
+        &b.supi,
+        b.psi,
+        &n1,
+        &n2,
+        paged,
+        sm_context_ref,
+        PagingRetries::Awaited,
+    )
+    .await;
     QosMonitoringSignal::Sent
+}
+
+/// Whether a QoS Monitoring Request for the session would be held back now
+/// ([`QosMonitoringSignal::Deferred`]): another 5GSM procedure than T3591 runs,
+/// or the session is in Exception.
+pub(crate) fn qos_monitoring_held_back(sm_context_ref: &str) -> bool {
+    let other_procedure = gsm_procedure_timers()
+        .lock()
+        .ok()
+        .and_then(|t| t.get(sm_context_ref).map(|e| e.timer_id))
+        .is_some_and(|id| id != timer::SmfTimerId::T3591);
+    other_procedure
+        || lookup_policy_binding(sm_context_ref)
+            .is_some_and(|b| b.fsm.state == gsm_sm::GsmState::Exception)
+}
+
+/// Send T3591's retransmission `attempt` of a QoS Monitoring Request (#1390
+/// review round 4), from the session's `qos_mon` RAN-leg owner, awaited with its
+/// 409 retries. Not sent when the timer moved on meanwhile: a later request
+/// re-armed it, or the procedure ended.
+pub(crate) async fn retransmit_qos_monitoring(sm_context_ref: &str, attempt: u32) {
+    let entry = gsm_procedure_timers().lock().ok().and_then(|t| {
+        t.get(sm_context_ref)
+            .filter(|e| e.timer_id == timer::SmfTimerId::T3591 && e.attempts == attempt)
+            .cloned()
+    });
+    let Some(entry) = entry else {
+        log::info!(
+            "T3591 attempt {attempt} for ref={sm_context_ref} not sent: a later QoS \
+             Monitoring Request or the procedure's end superseded it"
+        );
+        return;
+    };
+    if let (Some(n2), Some(amf_uri)) = (&entry.n2, entry.amf_uri.as_deref()) {
+        send_n1_n2_modify_transfer(
+            amf_uri,
+            &entry.supi,
+            entry.psi,
+            &entry.command,
+            &n2.transfer,
+            n2.paged,
+            sm_context_ref,
+            PagingRetries::Awaited,
+        )
+        .await;
+    }
 }
 
 /// What [`signal_qos_monitoring`] did with a QoS Monitoring Request (#1390).
@@ -10298,6 +10398,7 @@ fn signal_policy_change(sm_context_ref: &str, before: &context::PolicyBinding) {
         Some(GsmN2 {
             transfer: n2.clone(),
             paged,
+            qos_monitoring: false,
         }),
     );
     let sm_context_ref = sm_context_ref.to_string();
@@ -10310,6 +10411,7 @@ fn signal_policy_change(sm_context_ref: &str, before: &context::PolicyBinding) {
             &n2,
             paged,
             &sm_context_ref,
+            PagingRetries::Spawned,
         )
         .await;
     });
@@ -10338,6 +10440,7 @@ fn default_flow_bit_rates(sm_context_ref: &str, qfi: u8) -> Option<n2_transfer::
 /// N1N2MessageTransfer carrying an N1 PDU SESSION MODIFICATION COMMAND and an N2
 /// PDUSessionResourceModifyRequestTransfer (`ngapIeType` PDU_RES_MOD_REQ, TS 29.518
 /// §6.1.6.3.x), for [`signal_policy_change`].
+#[allow(clippy::too_many_arguments)]
 async fn send_n1_n2_modify_transfer(
     amf_uri: &str,
     supi: &str,
@@ -10346,6 +10449,7 @@ async fn send_n1_n2_modify_transfer(
     n2: &[u8],
     paged: Option<(u16, n2_transfer::Arp)>,
     sm_context_ref: &str,
+    retries: PagingRetries,
 ) {
     use nextgcore_sbi::constants::content_type;
     use nextgcore_sbi::message::{SbiPart, SbiRequest as SReq};
@@ -10397,7 +10501,9 @@ async fn send_n1_n2_modify_transfer(
     let config = nextgcore_sbi::security::sbi_peer_client_config(&host, port)
         .with_connect_timeout(std::time::Duration::from_secs(2))
         .with_request_timeout(std::time::Duration::from_secs(3));
-    match send_n1n2_honouring_paging_conflict(config, request, sm_context_ref.to_string()).await {
+    match send_n1n2_honouring_paging_conflict(config, request, sm_context_ref.to_string(), retries)
+        .await
+    {
         Ok(resp) => log::info!(
             "N1N2MessageTransfer (policy modification, SUPI {supi}, PSI {psi}) → \
              {host}:{port}: status={}",
@@ -27088,6 +27194,113 @@ mod tests {
         forget_seeded_session(&reference);
         event_exposure::clear_for_test();
         amf.stop().await.ok();
+    }
+
+    /// #1390 review round 4: an AMF paging the UE refuses a QoS Monitoring
+    /// Request with 409 HIGHER_PRIORITY_REQUEST_ONGOING (`retryAfter` 1 s), and
+    /// the subscriptions change while it waits. The retry is the session's RAN-leg
+    /// owner's, awaited, so the last request the AMF receives still matches the
+    /// session's monitoring: (A) `both` refused, then the DELETE: `stop` last;
+    /// (B) `stop` refused, then a new subscription: `both` last; (C) T3591's
+    /// retransmission of `both` refused, then the DELETE: `stop` last.
+    ///
+    /// REVERT-VERIFIED: with the 409 retry spawned (`PagingRetries::Spawned` in
+    /// `signal_qos_monitoring`), the old request's retry lands last in A and B;
+    /// with T3591's retransmission sent from the tick rather than by the owner,
+    /// in C.
+    // The event-store lock is held across awaits, as the other event tests do
+    // (event_exposure::STORE_LOCK).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_qos_monitoring_request_is_not_resent_after_a_later_one_1390() {
+        use nextgcore_ngap_gen::generated::QosMonitoringRequest as Q;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _q = qos_mon::TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _e = event_exposure::lock_store();
+        event_exposure::clear_for_test();
+        qos_mon::clear_for_test();
+        let supi = "imsi-001010000013915";
+        let (_upf, reference, amf, posts) = qos_mon_session_1390(supi, 5, true).await;
+        // The QoS Monitoring Requests an AMF received, once the RAN leg is idle
+        // and a spawned 1 s retry would have landed.
+        async fn requests(
+            reference: &str,
+            posts: &std::sync::Mutex<Vec<N1n2Post>>,
+        ) -> Vec<Option<u8>> {
+            wait_until(|| qos_mon::ran_idle_for_test(reference)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            wait_until(|| qos_mon::ran_idle_for_test(reference)).await;
+            posts
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|p| n2_monitoring_1390(&p.3).first().and_then(|f| f.1))
+                .collect()
+        }
+
+        // (A) `both` refused, then X is deleted.
+        let (amf_a, port_a, posts_a) = n1n2_recording_amf_1385(true).await;
+        set_amf_1385(&reference, port_a);
+        let x = qos_mon_subscription_1390(supi, &["QOS_MON"], "http://127.0.0.1:9/x");
+        qos_mon::subscribed(&x).await;
+        assert_eq!(await_n1n2_1385(&posts_a, 1).await.len(), 1);
+        event_exposure::remove(&x.id);
+        qos_mon::unsubscribed(&x.id).await;
+        let got = requests(&reference, &posts_a).await;
+        assert!(!qos_mon::active_on(&reference));
+        assert_eq!(got.last(), Some(&Some(Q::STOP)), "(A) {got:?}");
+        assert_eq!(got.first(), Some(&Some(Q::BOTH)), "(A) {got:?}");
+
+        // (B) the NG-RAN measures for X2; X2's `stop` is refused, then Y comes.
+        let (amf_ok, port_ok, _posts_ok) = n1n2_recording_amf_1385(false).await;
+        set_amf_1385(&reference, port_ok);
+        let x2 = qos_mon_subscription_1390(supi, &["QOS_MON"], "http://127.0.0.1:9/x2");
+        qos_mon::subscribed(&x2).await;
+        wait_until(|| qos_mon::ran_idle_for_test(&reference)).await;
+        assert!(qos_mon::active_on(&reference));
+        let (amf_b, port_b, posts_b) = n1n2_recording_amf_1385(true).await;
+        set_amf_1385(&reference, port_b);
+        event_exposure::remove(&x2.id);
+        qos_mon::unsubscribed(&x2.id).await;
+        assert_eq!(await_n1n2_1385(&posts_b, 1).await.len(), 1);
+        let y = qos_mon_subscription_1390(supi, &["QOS_MON"], "http://127.0.0.1:9/y");
+        qos_mon::subscribed(&y).await;
+        let got = requests(&reference, &posts_b).await;
+        assert!(qos_mon::active_on(&reference));
+        assert_eq!(got.first(), Some(&Some(Q::STOP)), "(B) {got:?}");
+        assert_eq!(got.last(), Some(&Some(Q::BOTH)), "(B) {got:?}");
+
+        // (C) T3591 expires on Y's `both`; its retransmission is refused, then Y
+        // is deleted.
+        let (amf_c, port_c, posts_c) = n1n2_recording_amf_1385(true).await;
+        if let Ok(mut timers) = gsm_procedure_timers().lock() {
+            let t = timers.get_mut(&reference).expect("T3591 armed");
+            assert_eq!(t.timer_id, timer::SmfTimerId::T3591);
+            // The retransmission goes to the AMF the command was armed with.
+            t.amf_uri = Some(format!("http://127.0.0.1:{port_c}/sm-status"));
+            t.deadline = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        }
+        set_amf_1385(&reference, port_c);
+        run_gsm_timer_tick().await;
+        assert_eq!(await_n1n2_1385(&posts_c, 1).await.len(), 1);
+        event_exposure::remove(&y.id);
+        qos_mon::unsubscribed(&y.id).await;
+        let got = requests(&reference, &posts_c).await;
+        assert!(!qos_mon::active_on(&reference));
+        assert_eq!(got.first(), Some(&Some(Q::BOTH)), "(C) {got:?}");
+        assert_eq!(got.last(), Some(&Some(Q::STOP)), "(C) {got:?}");
+
+        cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
+        qos_mon::forget(&reference);
+        qos_mon::quiesce_for_test().await;
+        cancel_gsm_timer_for_test(&reference);
+        forget_seeded_session(&reference);
+        event_exposure::clear_for_test();
+        for srv in [amf, amf_a, amf_ok, amf_b, amf_c] {
+            srv.stop().await.ok();
+        }
+        drop(posts);
     }
 
     /// #1390 review m4: subscribe first, then the session's user plane comes up:

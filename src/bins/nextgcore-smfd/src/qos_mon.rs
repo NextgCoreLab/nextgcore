@@ -29,8 +29,9 @@
 //! Remove SRR when the subscription is gone or no longer covers the session). A
 //! PUT reconciles the SRRs it holds the same way.
 //! The RAN leg is serialised per session: one task sends the QoS Monitoring
-//! Requests, awaiting each N1N2MessageTransfer and re-deciding when it returns,
-//! so the last request the AMF receives matches the session's SRRs.
+//! Requests, awaiting each N1N2MessageTransfer (with its 409 retries) and
+//! re-deciding when it returns, and sends T3591's retransmissions too, so the
+//! last request the AMF receives matches the session's SRRs.
 //!
 //! Not modelled, stated: the PCC-rule path (TS 29.512 QosMonitoringData, the
 //! UPEAS `appIds` / `defQosSupp` matching), Event Triggered reporting with
@@ -100,6 +101,9 @@ struct SessionMon {
     /// `both` must be sent even if the NG-RAN was last asked for it: a new gNB
     /// (Xn path switch), or a request held back.
     n2_force: bool,
+    /// T3591 expired at this attempt (#1390 review round 4): [`drive_ran`]
+    /// resends the armed request, unless a newer one goes out first.
+    n2_retransmit: Option<u32>,
 }
 
 impl SessionMon {
@@ -140,9 +144,9 @@ fn with<T>(f: impl FnOnce(&mut HashMap<String, SessionMon>) -> T) -> T {
 
 /// Drop a session's entry once it holds nothing.
 fn tidy(m: &mut HashMap<String, SessionMon>, r: &str) {
-    if m.get(r)
-        .is_some_and(|s| s.srrs.is_empty() && !s.ran_on && !s.n2_deferred && !s.n2_busy)
-    {
+    if m.get(r).is_some_and(|s| {
+        s.srrs.is_empty() && !s.ran_on && !s.n2_deferred && !s.n2_busy && s.n2_retransmit.is_none()
+    }) {
         m.remove(r);
     }
 }
@@ -163,14 +167,17 @@ pub fn forget(sm_context_ref: &str) {
 #[cfg(test)]
 static DRIVES_FOR_TEST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Wait (at most 15 s) until no [`drive_ran`] task runs, for tests to call
-/// before they release their locks.
+/// Wait until no [`drive_ran`] task runs, for tests to call before they
+/// release their locks. Panics after 15 s: a drive that hangs is a failure, not
+/// something to wait out (#1390 review round 4).
 #[cfg(test)]
 pub(crate) async fn quiesce_for_test() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    while DRIVES_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst) > 0
-        && std::time::Instant::now() < deadline
-    {
+    while DRIVES_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a qos_mon RAN-leg task still runs after 15 s"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
@@ -411,9 +418,23 @@ fn ran_wanted(s: &mut SessionMon) -> Option<QosMonitoringRequest> {
 /// before a `both` cannot reach the AMF after it, and the last request sent
 /// always matches [`active_on`].
 fn want_ran(r: &str, force: bool) {
+    claim_ran(r, |s| s.n2_force |= force);
+}
+
+/// T3591 expired for the session's QoS Monitoring Request at `attempt` (#1390
+/// review round 4): its owner resends it, after the transfer it may have in
+/// flight, so a retransmission of an older request cannot reach the AMF after a
+/// newer one.
+pub fn retransmit_due(r: &str, attempt: u32) {
+    claim_ran(r, |s| s.n2_retransmit = Some(attempt));
+}
+
+/// Note what the session's RAN leg needs (`note`) and start its owner,
+/// [`drive_ran`], unless one runs: it sees the note on its next pass.
+fn claim_ran(r: &str, note: impl FnOnce(&mut SessionMon)) {
     let start = with(|m| {
         let s = m.entry(r.to_string()).or_default();
-        s.n2_force |= force;
+        note(s);
         let start = !s.n2_busy;
         s.n2_busy = true;
         start
@@ -430,20 +451,38 @@ fn want_ran(r: &str, force: bool) {
     }
 }
 
+/// One step of [`drive_ran`].
+enum RanStep {
+    /// Decide and send this request.
+    Send(QosMonitoringRequest),
+    /// Resend T3591's armed request at this attempt.
+    Resend(u32),
+}
+
 /// The task owning a session's RAN leg (see [`want_ran`]).
 async fn drive_ran(r: &str) {
     loop {
-        let want = with(|m| {
+        let step = with(|m| {
             let s = m.get_mut(r)?;
-            let want = ran_wanted(s);
-            if want.is_none() {
-                s.n2_busy = false;
-                tidy(m, r);
+            // A new request supersedes a due retransmission: it re-arms T3591.
+            if let Some(want) = ran_wanted(s) {
+                s.n2_retransmit = None;
+                return Some(RanStep::Send(want));
             }
-            want
+            if let Some(attempt) = s.n2_retransmit.take() {
+                return Some(RanStep::Resend(attempt));
+            }
+            s.n2_busy = false;
+            tidy(m, r);
+            None
         });
-        let Some(want) = want else {
-            return;
+        let want = match step {
+            None => return,
+            Some(RanStep::Resend(attempt)) => {
+                crate::retransmit_qos_monitoring(r, attempt).await;
+                continue;
+            }
+            Some(RanStep::Send(want)) => want,
         };
         let outcome = crate::signal_qos_monitoring(r, want).await;
         let stop = with(|m| {
@@ -459,6 +498,10 @@ async fn drive_ran(r: &str) {
                 // m5: sent from `on_gsm_idle` once the procedure ends.
                 crate::QosMonitoringSignal::Deferred | crate::QosMonitoringSignal::NotSent => {
                     s.n2_deferred |= outcome == crate::QosMonitoringSignal::Deferred;
+                    // A retransmission that fell due meanwhile is dropped with
+                    // the owner: Deferred means another procedure replaced T3591,
+                    // and otherwise its next expiry asks again.
+                    s.n2_retransmit = None;
                     s.n2_busy = false;
                     tidy(m, r);
                     true
@@ -466,6 +509,15 @@ async fn drive_ran(r: &str) {
             }
         });
         if stop {
+            // Review round 4 m3: the procedure that held the request back may
+            // have ended before `n2_deferred` was set, its `on_gsm_idle` finding
+            // nothing to send. Looked at again now it is set: either that call
+            // or this one sends it.
+            if outcome == crate::QosMonitoringSignal::Deferred
+                && !crate::qos_monitoring_held_back(r)
+            {
+                on_gsm_idle(r);
+            }
             return;
         }
     }
