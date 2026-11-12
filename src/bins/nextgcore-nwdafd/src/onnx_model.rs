@@ -241,6 +241,140 @@ impl InferenceModel for OnnxLinearRegressor {
     }
 }
 
+/// One graph input or output: name, element type and shape, in the terms the
+/// nextgsim#463 model manifest uses (`dtype` like `float32`; `-1` for a
+/// symbolic dimension).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorSig {
+    pub name: String,
+    pub dtype: String,
+    pub shape: Vec<i64>,
+}
+
+/// What a `ModelProto` declares about itself (nextgsim#468): the default-domain
+/// opset it imports and its graph inputs and outputs. Read from the bytes, so a
+/// manifest built from it describes the artefact rather than our intentions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnnxSignature {
+    /// The `ai.onnx` (empty-domain) opset import, if any.
+    pub default_opset: Option<i64>,
+    pub inputs: Vec<TensorSig>,
+    pub outputs: Vec<TensorSig>,
+}
+
+/// The ONNX `TensorProto.DataType` names the manifest uses.
+fn dtype_name(elem_type: u64) -> String {
+    match elem_type {
+        1 => "float32".into(),
+        6 => "int32".into(),
+        7 => "int64".into(),
+        11 => "float64".into(),
+        other => format!("onnx_type_{other}"),
+    }
+}
+
+fn read_value_info(vi: &[u8]) -> Result<TensorSig, String> {
+    let mut name = String::new();
+    let mut ty: Option<&[u8]> = None;
+    walk_fields(vi, |field, payload| {
+        match field {
+            1 => name = payload.require_str()?,
+            2 => ty = Some(payload.require_len()?),
+            _ => {}
+        }
+        Ok(())
+    })?;
+    let mut tensor: Option<&[u8]> = None;
+    if let Some(ty) = ty {
+        walk_fields(ty, |field, payload| {
+            if field == 1 {
+                tensor = Some(payload.require_len()?);
+            }
+            Ok(())
+        })?;
+    }
+    let tensor = tensor.ok_or_else(|| format!("value {name:?} is not a tensor"))?;
+    let mut elem_type = 0;
+    let mut shape: Option<&[u8]> = None;
+    walk_fields(tensor, |field, payload| {
+        match (field, payload) {
+            (1, Payload::Varint(v)) => elem_type = v,
+            (2, p) => shape = Some(p.require_len()?),
+            _ => {}
+        }
+        Ok(())
+    })?;
+    let mut dims = Vec::new();
+    if let Some(shape) = shape {
+        let mut raw: Vec<&[u8]> = Vec::new();
+        walk_fields(shape, |field, payload| {
+            if field == 1 {
+                raw.push(payload.require_len()?);
+            }
+            Ok(())
+        })?;
+        for dim in raw {
+            let mut value: i64 = -1;
+            walk_fields(dim, |field, payload| {
+                if let (1, Payload::Varint(v)) = (field, payload) {
+                    value = i64::try_from(v).map_err(|_| "dim_value overflow")?;
+                }
+                Ok(())
+            })?;
+            dims.push(value);
+        }
+    }
+    Ok(TensorSig {
+        name,
+        dtype: dtype_name(elem_type),
+        shape: dims,
+    })
+}
+
+/// Read a `ModelProto`'s opset imports and graph inputs/outputs.
+pub fn signature(bytes: &[u8]) -> Result<OnnxSignature, String> {
+    let mut default_opset = None;
+    let mut graph: Option<&[u8]> = None;
+    walk_fields(bytes, |field, payload| {
+        match field {
+            7 => graph = Some(payload.require_len()?),
+            8 => {
+                let mut domain = String::new();
+                let mut version: Option<u64> = None;
+                walk_fields(payload.require_len()?, |f, p| {
+                    match (f, p) {
+                        (1, p) => domain = p.require_str()?,
+                        (2, Payload::Varint(v)) => version = Some(v),
+                        _ => {}
+                    }
+                    Ok(())
+                })?;
+                if domain.is_empty() || domain == "ai.onnx" {
+                    default_opset = version.and_then(|v| i64::try_from(v).ok());
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })?;
+    let graph = graph.ok_or("ONNX ModelProto has no graph")?;
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    walk_fields(graph, |field, payload| {
+        match field {
+            11 => inputs.push(read_value_info(payload.require_len()?)?),
+            12 => outputs.push(read_value_info(payload.require_len()?)?),
+            _ => {}
+        }
+        Ok(())
+    })?;
+    Ok(OnnxSignature {
+        default_opset,
+        inputs,
+        outputs,
+    })
+}
+
 /// One decoded field payload.
 enum Payload<'a> {
     Varint(u64),

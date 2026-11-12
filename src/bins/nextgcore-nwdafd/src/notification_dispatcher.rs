@@ -668,21 +668,33 @@ pub async fn dispatch_notifications(ctx: Arc<RwLock<NwdafContext>>) {
     }
 }
 
-/// Deliver the one-shot "model available" `Nnwdaf_MLModelProvision` callbacks.
+/// Deliver `Nnwdaf_MLModelProvision` callbacks: one per subscription per model
+/// version.
 ///
-/// For each subscription that has not yet been notified, POST an array of
-/// `NwdafMLModelProvNotif` (built by [`crate::ml_service::build_ml_model_prov_notif_body`])
-/// to its `notifUri` and, on success, mark it delivered so it is not re-sent.
+/// For each subscription not yet notified of the active model version, POST an
+/// array of `NwdafMLModelProvNotif` (built by
+/// [`crate::ml_service::build_ml_model_prov_notif_body`]) to its `notifUri` and,
+/// on success, record that version as delivered. A new version (the predictor
+/// changed) makes every subscription pending again, once: TS 23.288 §6.2E.2
+/// step 13, "sends new or re-trained ML Model ... by invoking
+/// Nnwdaf_MLModelProvision_Notify" (nextgsim#468). With no exportable model
+/// nothing is sent, since an `MLEventNotif` must carry a model address.
 /// This reuses the same URI parsing + client plumbing as the analytics path.
 async fn dispatch_ml_prov_notifications(ctx: Arc<RwLock<NwdafContext>>) {
     // The model URL must resolve back to this NF, and is only emitted when the
     // active predictor is actually exportable (issue #109). Both are read once
     // here, under the same guard as the pending list, rather than per
     // subscription.
-    let (pending, model_base_uri) = match ctx.read() {
+    let (pending, base_uri, model) = match ctx.read() {
         Ok(guard) => {
-            let base = guard.can_provision_model().then(|| guard.sbi_base_uri());
-            (guard.get_pending_ml_prov_subscriptions(), base)
+            let Some(model) = guard.current_model_version() else {
+                return;
+            };
+            (
+                guard.get_pending_ml_prov_subscriptions(&model.sha256),
+                guard.sbi_base_uri(),
+                model,
+            )
         }
         Err(e) => {
             log::error!("dispatch_ml_prov_notifications: failed to read context: {e}");
@@ -691,8 +703,7 @@ async fn dispatch_ml_prov_notifications(ctx: Arc<RwLock<NwdafContext>>) {
     };
 
     for sub in &pending {
-        let body =
-            crate::ml_service::build_ml_model_prov_notif_body(sub, model_base_uri.as_deref());
+        let body = crate::ml_service::build_ml_model_prov_notif_body(sub, &base_uri, &model);
 
         let (host, port, path) = match parse_notify_uri(&sub.notif_uri) {
             Some(t) => t,
@@ -709,8 +720,14 @@ async fn dispatch_ml_prov_notifications(ctx: Arc<RwLock<NwdafContext>>) {
         let client = notify_client(&host, port);
         match client.post_json(&path, &body).await {
             Ok(resp) if resp.is_success() => {
+                log::info!(
+                    "MLModelProvision: model v{} provisioned sha256={} sub={}",
+                    model.version,
+                    model.sha256,
+                    sub.subscription_id
+                );
                 if let Ok(guard) = ctx.read() {
-                    guard.mark_ml_prov_notified(&sub.subscription_id);
+                    guard.mark_ml_prov_notified(&sub.subscription_id, &model.sha256);
                 }
             }
             Ok(resp) => log::warn!(
@@ -848,7 +865,11 @@ mod tests {
             None,
             vec![AnalyticsId::NfLoad],
         );
-        let ml_body = crate::ml_service::build_ml_model_prov_notif_body(&ml_sub, None);
+        let model = ctx
+            .current_model_version()
+            .expect("the default predictor is exportable");
+        let ml_body =
+            crate::ml_service::build_ml_model_prov_notif_body(&ml_sub, "http://x", &model);
 
         assert!(events_body.is_array(), "EventsSubscription notify");
         assert!(ml_body.is_array(), "MLModelProvision notify");
@@ -1645,6 +1666,170 @@ mod tests {
             infos.as_array().map(Vec::len),
             Some(0),
             "a deregistered instance must not be reported"
+        );
+    }
+}
+
+/// nextgsim#468: `Nnwdaf_MLModelProvision_Notify` once per subscription per
+/// model version, over real HTTP to a consumer, and the notified URLs serve
+/// exactly the notified bytes.
+#[cfg(test)]
+mod ml_prov_version_tests {
+    use super::*;
+    use crate::context::{MlProvSubscription, NwdafContext};
+    use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+    use std::sync::Mutex;
+
+    type Seen = Arc<Mutex<Vec<Value>>>;
+
+    /// A consumer that records every notify body and answers 204.
+    async fn consumer() -> (nextgcore_sbi::SbiServer, u16, Seen) {
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = nextgcore_sbi::SbiServer::on_listener(
+            nextgcore_sbi::SbiServerConfig::new(addr),
+            listener,
+        );
+        server
+            .start(move |req: SbiRequest| {
+                let sink = sink.clone();
+                async move {
+                    if let Some(v) = req
+                        .http
+                        .content
+                        .as_deref()
+                        .and_then(|c| serde_json::from_str::<Value>(c).ok())
+                    {
+                        sink.lock().unwrap().push(v);
+                    }
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await
+            .expect("consumer starts");
+        (server, addr.port(), seen)
+    }
+
+    fn mtlf(port: u16, sub_id: &str) -> Arc<RwLock<NwdafContext>> {
+        let mut ctx = NwdafContext::new("nwdaf-mtlf-468".to_string());
+        ctx.init(16);
+        ctx.set_sbi_base_uri("http://10.0.0.5:7777");
+        ctx.add_ml_prov_subscription(MlProvSubscription::new(
+            sub_id.to_string(),
+            format!("http://127.0.0.1:{port}/anlf/ml-notify"),
+            None,
+            vec![AnalyticsId::NfLoad],
+        ))
+        .expect("subscription added");
+        Arc::new(RwLock::new(ctx))
+    }
+
+    fn url_of(body: &Value) -> String {
+        body[0]["eventNotifs"][0]["mLFileAddr"]["mLModelUrl"]
+            .as_str()
+            .expect("mLModelUrl")
+            .to_string()
+    }
+
+    /// GET a notified URL through the real route handler.
+    fn fetch(ctx: &Arc<RwLock<NwdafContext>>, url: &str) -> SbiResponse {
+        let path = url.strip_prefix("http://10.0.0.5:7777").expect("own base");
+        let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+        assert_eq!(parts[..3], ["nnwdaf-mlmodelprovision", "v1", "models"]);
+        let guard = ctx.read().unwrap();
+        crate::sbi_handler::handle_ml_model_download_with_ctx(&guard, parts[3], parts[4])
+    }
+
+    fn a_different_linear_model() -> Box<dyn crate::ml_service::InferenceModel> {
+        let bytes = crate::onnx_export::encode_linear_regressor(&[0.1, 0.2, 0.3, 0.4], 0.0);
+        Box::new(
+            crate::onnx_model::OnnxLinearRegressor::from_bytes(&bytes, "refit").expect("parses"),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_new_model_version_is_notified_once_and_the_old_url_keeps_its_bytes() {
+        let (server, port, seen) = consumer().await;
+        let ctx = mtlf(port, "mlsub-468-a");
+
+        dispatch_ml_prov_notifications(ctx.clone()).await;
+        dispatch_ml_prov_notifications(ctx.clone()).await;
+        let bodies = seen.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 1, "v1 is notified once, not per tick");
+        let v1_url = url_of(&bodies[0]);
+        let v1 = fetch(&ctx, &v1_url);
+        assert_eq!(v1.status, 200);
+        let v1_bytes = v1.http.binary_content.clone().expect("v1 bytes");
+        assert_eq!(
+            v1_url.rsplit('/').next(),
+            Some(crate::model_store::sha256_hex(&v1_bytes).as_str()),
+            "the URL names the sha256 of the bytes it serves"
+        );
+
+        // The MTLF's model changes (PR 4's refit does exactly this).
+        ctx.read()
+            .unwrap()
+            .lock_engine()
+            .set_predictor(a_different_linear_model());
+        dispatch_ml_prov_notifications(ctx.clone()).await;
+        dispatch_ml_prov_notifications(ctx.clone()).await;
+        let bodies = seen.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2, "v2 is notified once more, and only once");
+        let v2_url = url_of(&bodies[1]);
+        assert_ne!(v1_url, v2_url);
+        assert_eq!(bodies[1][0]["subscriptionId"], "mlsub-468-a");
+
+        let v2 = fetch(&ctx, &v2_url);
+        assert_eq!(v2.status, 200);
+        let v2_bytes = v2.http.binary_content.clone().expect("v2 bytes");
+        assert_ne!(v1_bytes, v2_bytes);
+        assert_eq!(
+            fetch(&ctx, &v1_url).http.binary_content,
+            Some(v1_bytes),
+            "after v2, the v1 URL still serves v1's bytes"
+        );
+        let manifest: Value = fetch(&ctx, &format!("{v2_url}.manifest.json"))
+            .json_body()
+            .expect("v2 manifest");
+        assert_eq!(manifest["version"], "2");
+        assert_eq!(
+            manifest["sha256"],
+            crate::model_store::sha256_hex(&v2_bytes)
+        );
+
+        server.stop().await.expect("stop");
+    }
+
+    /// With no exportable model there is nothing an `MLEventNotif` could carry
+    /// (`oneOf [mLFileAddr, mLModelAdrf]`), so nothing is sent.
+    #[tokio::test]
+    async fn no_exportable_model_sends_no_notification() {
+        let (server, port, seen) = consumer().await;
+        let ctx = mtlf(port, "mlsub-468-b");
+        ctx.read()
+            .unwrap()
+            .lock_engine()
+            .set_predictor(Box::new(crate::ml_service::EwmaModel::default()));
+        dispatch_ml_prov_notifications(ctx.clone()).await;
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(ctx.read().unwrap().current_model_version().is_none());
+        server.stop().await.expect("stop");
+    }
+
+    /// A failed delivery leaves the subscription pending for the next tick.
+    #[tokio::test]
+    async fn a_failed_delivery_is_retried() {
+        let down = nextgcore_sbi::test_support::down_port();
+        let ctx = mtlf(down.addr().port(), "mlsub-468-c");
+        dispatch_ml_prov_notifications(ctx.clone()).await;
+        let guard = ctx.read().unwrap();
+        let active = guard.current_model_version().unwrap();
+        assert_eq!(
+            guard
+                .get_pending_ml_prov_subscriptions(&active.sha256)
+                .len(),
+            1
         );
     }
 }
