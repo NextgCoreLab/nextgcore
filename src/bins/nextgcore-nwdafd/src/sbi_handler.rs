@@ -1564,6 +1564,21 @@ fn ml_prov_request_json(
 /// at `/nnwdaf-mlmodelprovision/v1/subscriptions/{subscriptionId}` and echoes
 /// the subscription representation. There is no `/models` resource.
 pub async fn handle_ml_prov_subscription_create(request: &SbiRequest) -> SbiResponse {
+    let ctx = nwdaf_self();
+    let Ok(context) = ctx.read() else {
+        return send_bad_request(
+            "Failed to create ML-provision subscription",
+            Some("SUBSCRIPTION_FAILED"),
+        );
+    };
+    handle_ml_prov_subscription_create_with_ctx(&context, request)
+}
+
+/// [`handle_ml_prov_subscription_create`] on a given context.
+pub fn handle_ml_prov_subscription_create_with_ctx(
+    context: &NwdafContext,
+    request: &SbiRequest,
+) -> SbiResponse {
     log::info!("ML Model Provision subscribe");
 
     let data = match ml_prov_request_json(request) {
@@ -1577,21 +1592,9 @@ pub async fn handle_ml_prov_subscription_create(request: &SbiRequest) -> SbiResp
     };
 
     let subscription_id = format!("mlsub-{}", uuid::Uuid::new_v4());
-    let sub = MlProvSubscription::new(
-        subscription_id.clone(),
-        parsed.notif_uri,
-        parsed.notif_corr_id,
-        parsed.ml_events,
-    );
+    let sub = MlProvSubscription::from_parsed(subscription_id.clone(), parsed);
 
-    let ctx = nwdaf_self();
-    let result = if let Ok(context) = ctx.read() {
-        context.add_ml_prov_subscription(sub.clone())
-    } else {
-        None
-    };
-
-    match result {
+    match context.add_ml_prov_subscription(sub.clone()) {
         Some(sub_id) => SbiResponse::with_status(201)
             .with_header(
                 "Location",
@@ -1625,12 +1628,7 @@ pub async fn handle_ml_prov_subscription_update(
         Err(detail) => return send_bad_request(&detail, Some("MANDATORY_IE_MISSING")),
     };
 
-    let sub = MlProvSubscription::new(
-        subscription_id.to_string(),
-        parsed.notif_uri,
-        parsed.notif_corr_id,
-        parsed.ml_events,
-    );
+    let sub = MlProvSubscription::from_parsed(subscription_id.to_string(), parsed);
 
     let ctx = nwdaf_self();
     let updated = if let Ok(context) = ctx.read() {

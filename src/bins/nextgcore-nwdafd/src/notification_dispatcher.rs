@@ -680,7 +680,7 @@ pub async fn dispatch_notifications(ctx: Arc<RwLock<NwdafContext>>) {
 /// Nnwdaf_MLModelProvision_Notify" (nextgsim#468). With no exportable model
 /// nothing is sent, since an `MLEventNotif` must carry a model address.
 /// This reuses the same URI parsing + client plumbing as the analytics path.
-async fn dispatch_ml_prov_notifications(ctx: Arc<RwLock<NwdafContext>>) {
+pub(crate) async fn dispatch_ml_prov_notifications(ctx: Arc<RwLock<NwdafContext>>) {
     // The model URL must resolve back to this NF, and is only emitted when the
     // active predictor is actually exportable (issue #109). Both are read once
     // here, under the same guard as the pending list, rather than per

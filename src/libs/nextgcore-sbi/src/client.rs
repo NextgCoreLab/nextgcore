@@ -1426,6 +1426,16 @@ impl SbiClient {
                 None => {
                     sbi_response.http.content =
                         Some(String::from_utf8_lossy(&body_bytes).to_string());
+                    // nextgsim#468: an `application/octet-stream` body (an ML
+                    // model file) is also kept byte-exact; `content` above is
+                    // lossy for non-UTF-8 bytes. Nothing else changes.
+                    if sbi_response
+                        .http
+                        .get_header(crate::constants::header::CONTENT_TYPE)
+                        .is_some_and(|ct| is_octet_stream(ct))
+                    {
+                        sbi_response.http.binary_content = Some(body_bytes.clone());
+                    }
                 }
             }
         }
@@ -1494,6 +1504,15 @@ fn derive_scope_from_uri(uri: &str) -> String {
     crate::message::UriComponents::parse(uri)
         .api_name
         .unwrap_or_default()
+}
+
+/// Whether a Content-Type names `application/octet-stream` (parameters and
+/// case ignored).
+fn is_octet_stream(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .is_some_and(|t| t.trim().eq_ignore_ascii_case("application/octet-stream"))
 }
 
 /// sbi-04: decide the next hop for a 307/308 response.
@@ -1601,6 +1620,39 @@ pub(crate) mod test_hooks {
 
 #[cfg(test)]
 mod tests {
+
+    /// nextgsim#468: an `application/octet-stream` body reaches the caller
+    /// byte-exact in `binary_content` (an ML model file is not UTF-8), and a
+    /// JSON body is decoded exactly as before, with no `binary_content`.
+    #[tokio::test]
+    async fn an_octet_stream_body_is_kept_byte_exact() {
+        const BYTES: &[u8] = &[0x08, 0xff, 0x00, 0x80, 0xc3, 0x28, 0xfe];
+        let (server, addr) =
+            crate::test_support::sbi_server_on_free_port(|req: SbiRequest| async move {
+                if req.header.uri.ends_with("/bin") {
+                    let mut r = SbiResponse::with_status(200);
+                    r.http
+                        .set_header("Content-Type", "Application/Octet-Stream; x=1");
+                    r.http.binary_content = Some(BYTES.to_vec().into());
+                    r
+                } else {
+                    SbiResponse::with_status(200)
+                        .with_json_body(&serde_json::json!({"a": 1}))
+                        .unwrap()
+                }
+            })
+            .await;
+        let client = SbiClient::new(SbiClientConfig::new("127.0.0.1", addr.port()));
+        let bin = client.get("/nx-test/v1/bin").await.expect("bin");
+        assert_eq!(bin.http.binary_content.as_deref(), Some(BYTES));
+        let json = client.get("/nx-test/v1/json").await.expect("json");
+        assert!(json.http.binary_content.is_none());
+        assert_eq!(json.http.content.as_deref(), Some(r#"{"a":1}"#));
+        assert!(is_octet_stream("application/octet-stream"));
+        assert!(!is_octet_stream("application/json"));
+        server.stop().await.expect("stop");
+    }
+
     use super::*;
 
     /// #435, through the real send path: a request to a dead endpoint evicts the

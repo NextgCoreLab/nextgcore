@@ -37,6 +37,14 @@ amf-mobility = []
 ## Nnwdaf_AnalyticsInfo USER_DATA_CONGESTION arm. Active only with the demo:
 ## block on as well. Off by default.
 demo-d441a-congestion-loop = ["amf-mobility"]
+## nextgsim#468 (demo d441e-model-retrain): the AnLF side of MTLF->AnLF model
+## provisioning. With `nwdaf.role: anlf` and the demo: block on, subscribes to an
+## MTLF's Nnwdaf_MLModelProvision (ModelProvisionExt, accuracy threshold), takes
+## the Notify on the existing SBI listener, verifies the model against its
+## nextgsim#463 manifest and loads it. Also serves /metrics
+## (NEXTGCORE_METRICS_BIND, loopback by default; NWDAF_METRICS_PORT). Off by
+## default.
+demo-d441e-model-retrain = []
 
 [dependencies]
 nextgcore-core = { workspace = true }

@@ -367,6 +367,61 @@ impl FeedbackRegistry {
 // nwafd-05: Nnwdaf_MLModelProvision Subscribe/Notify wire codec (TS 29.520)
 // ============================================================================
 
+/// TS 29.520 Table 5.4.8-1 feature 4, `ModelProvisionExt`: "provisioning the
+/// ML model file address ... and additional ML Model Information". With it, a
+/// notification carries `modelUniqueId` and a subscription may set
+/// `mlEvRepCon.mlAccuracyThreshold` (nextgsim#468).
+pub const FEATURE_MODEL_PROVISION_EXT: u32 = 4;
+
+/// The Nnwdaf_MLModelProvision features this NWDAF supports, as a TS 29.571
+/// `SupportedFeatures` string: feature 4 only.
+pub const MLMODELPROVISION_SUPPORTED_FEATURES: &str = "8";
+
+/// The TS 29.500 §6.6.2 negotiation: the features both the consumer's
+/// `suppFeats` and [`MLMODELPROVISION_SUPPORTED_FEATURES`] name, as a
+/// `SupportedFeatures` string (TS 29.571 Table 5.2.2-1: hex, the last character
+/// is features 1-4). "0" when none is shared.
+///
+/// # Errors
+/// A string that is empty or not hexadecimal.
+pub fn negotiate_supp_feats(client: &str) -> Result<String, String> {
+    if client.is_empty() || !client.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "suppFeats {client:?} is not a SupportedFeatures hex string"
+        ));
+    }
+    let ours = u8::from_str_radix(MLMODELPROVISION_SUPPORTED_FEATURES, 16).unwrap_or(0);
+    let theirs_low = client
+        .chars()
+        .last()
+        .and_then(|c| c.to_digit(16))
+        .unwrap_or(0) as u8;
+    Ok(format!("{:x}", ours & theirs_low))
+}
+
+/// Whether a `SupportedFeatures` string has feature `n` (numbered from 1).
+pub fn supp_feats_has(feats: &str, n: u32) -> bool {
+    if n == 0 {
+        return false;
+    }
+    let idx = ((n - 1) / 4) as usize;
+    let bit = (n - 1) % 4;
+    feats
+        .chars()
+        .rev()
+        .nth(idx)
+        .and_then(|c| c.to_digit(16))
+        .is_some_and(|d| d & (1 << bit) != 0)
+}
+
+/// An `mLEventSubscs[].mlEvRepCon.mlAccuracyThreshold` (TS 29.520
+/// Table 5.4.6.2.11-1: Uinteger 0..100, applicable with ModelProvisionExt).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EventAccuracyThreshold {
+    pub event: AnalyticsId,
+    pub threshold: u8,
+}
+
 /// Parsed result of an `NwdafMLModelProvSubsc` request body.
 #[derive(Debug, Clone)]
 pub struct ParsedMlProvSubsc {
@@ -376,6 +431,10 @@ pub struct ParsedMlProvSubsc {
     pub notif_corr_id: Option<String>,
     /// Distinct `mLEventSubscs[].mLEvent` values.
     pub ml_events: Vec<AnalyticsId>,
+    /// The negotiated `suppFeats`, when the consumer sent one.
+    pub supp_feats: Option<String>,
+    /// Accuracy thresholds, kept only when ModelProvisionExt is negotiated.
+    pub accuracy_thresholds: Vec<EventAccuracyThreshold>,
 }
 
 /// Parse a TS 29.520 `NwdafMLModelProvSubsc` JSON body.
@@ -412,10 +471,52 @@ pub fn parse_ml_model_prov_subsc(body: &Value) -> Result<ParsedMlProvSubsc, Stri
         .and_then(|v| v.as_str())
         .map(String::from);
 
+    let supp_feats = match body.get("suppFeats") {
+        None => None,
+        Some(Value::String(s)) => Some(negotiate_supp_feats(s)?),
+        Some(_) => return Err("suppFeats must be a SupportedFeatures string".to_string()),
+    };
+    let ext = supp_feats
+        .as_deref()
+        .is_some_and(|f| supp_feats_has(f, FEATURE_MODEL_PROVISION_EXT));
+
+    // MLRepEventCondition is a ModelProvisionExt data type (Table 5.4.6.1-1):
+    // without the feature it is ignored, as TS 29.500 §6.6.2 has a producer do
+    // with attributes of an unsupported feature.
+    let mut accuracy_thresholds = Vec::new();
+    if ext {
+        for es in event_subs {
+            let cond = es.get("mlEvRepCon");
+            let Some(t) = cond.and_then(|c| c.get("mlAccuracyThreshold")) else {
+                continue;
+            };
+            if cond.is_some_and(|c| c.get("mlLossThreshold").is_some()) {
+                return Err(
+                    "mlAccuracyThreshold and mlLossThreshold are mutually exclusive".to_string(),
+                );
+            }
+            let threshold = t
+                .as_u64()
+                .filter(|v| *v <= 100)
+                .ok_or_else(|| format!("mlAccuracyThreshold {t} is not an integer 0..100"))?;
+            let event = es
+                .get("mLEvent")
+                .and_then(Value::as_str)
+                .and_then(AnalyticsId::from_str)
+                .ok_or("mlAccuracyThreshold without an mLEvent")?;
+            accuracy_thresholds.push(EventAccuracyThreshold {
+                event,
+                threshold: threshold as u8,
+            });
+        }
+    }
+
     Ok(ParsedMlProvSubsc {
         notif_uri,
         notif_corr_id,
         ml_events,
+        supp_feats,
+        accuracy_thresholds,
     })
 }
 
@@ -432,9 +533,20 @@ pub fn ml_prov_subsc_json(sub: &MlProvSubscription) -> Value {
         json!(sub
             .ml_events
             .iter()
-            .map(|e| json!({ "mLEvent": e.as_str() }))
+            .map(|e| {
+                let mut es = json!({ "mLEvent": e.as_str() });
+                if let Some(t) = sub.accuracy_thresholds.iter().find(|t| t.event == *e) {
+                    es["mlEvRepCon"] = json!({ "mlAccuracyThreshold": t.threshold });
+                }
+                es
+            })
             .collect::<Vec<_>>()),
     );
+    // TS 29.500 §6.6.2: the negotiated features, in the representation that
+    // confirms the creation.
+    if let Some(feats) = &sub.supp_feats {
+        obj.insert("suppFeats".to_string(), json!(feats));
+    }
     // Convenience echo of the resource id (also conveyed in the Location header).
     obj.insert("subscriptionId".to_string(), json!(sub.subscription_id));
     Value::Object(obj)
@@ -461,8 +573,10 @@ pub fn ml_prov_subsc_json(sub: &MlProvSubscription) -> Value {
 /// Taking the version (not an `Option`) is what keeps that `oneOf`: with no
 /// model there is no body to build, and the dispatcher sends nothing
 /// (nextgsim#468; before, the body went out with `mLFileAddr` omitted).
-/// `modelUniqueId` (ModelProvisionExt) and `modelUpdateInd` (EnModelProvision)
-/// are not sent: they belong to features this NWDAF does not negotiate.
+/// `modelUniqueId` is sent when the subscription negotiated ModelProvisionExt
+/// (Table 5.4.6.2.6-1: "shall be provided only if the ModelProvisionExt feature
+/// is supported"; nextgsim#468). `modelUpdateInd` (EnModelProvision) is not:
+/// this NWDAF does not support that feature.
 pub fn build_ml_model_prov_notif_body(
     sub: &MlProvSubscription,
     base_uri: &str,
@@ -481,6 +595,9 @@ pub fn build_ml_model_prov_notif_body(
                 "mLFileAddr".to_string(),
                 json!({ "mLModelUrl": model.url(base_uri, *ev) }),
             );
+            if sub.model_provision_ext() {
+                notif.insert("modelUniqueId".to_string(), json!(model.unique_id()));
+            }
             Value::Object(notif)
         })
         .collect();
@@ -732,6 +849,82 @@ mod tests {
         // No bespoke registry keys leak into the notification.
         assert!(notif.get("modelCount").is_none());
         assert!(notif.get("accuracy").is_none());
+    }
+
+    /// TS 29.500 §6.6.2 negotiation for Table 5.4.8-1: only feature 4
+    /// (ModelProvisionExt) is ours.
+    #[test]
+    fn supp_feats_negotiation_keeps_only_model_provision_ext() {
+        assert_eq!(negotiate_supp_feats("8").unwrap(), "8");
+        assert_eq!(negotiate_supp_feats("F").unwrap(), "8");
+        assert_eq!(negotiate_supp_feats("1f").unwrap(), "8");
+        assert_eq!(negotiate_supp_feats("7").unwrap(), "0");
+        assert_eq!(negotiate_supp_feats("10").unwrap(), "0");
+        assert!(negotiate_supp_feats("").is_err());
+        assert!(negotiate_supp_feats("x8").is_err());
+        assert!(supp_feats_has("8", FEATURE_MODEL_PROVISION_EXT));
+        assert!(supp_feats_has("10", 5));
+        assert!(!supp_feats_has("0", FEATURE_MODEL_PROVISION_EXT));
+        assert!(!supp_feats_has("8", 0));
+    }
+
+    fn subsc(supp: Option<&str>, cond: Value) -> Value {
+        let mut b = json!({
+            "notifUri": "http://anlf/cb",
+            "mLEventSubscs": [{ "mLEvent": "NF_LOAD", "mLEventFilter": {}, "mlEvRepCon": cond }],
+        });
+        if let Some(f) = supp {
+            b["suppFeats"] = json!(f);
+        }
+        b
+    }
+
+    /// `mlAccuracyThreshold` is kept only with ModelProvisionExt, and checked.
+    #[test]
+    fn the_accuracy_threshold_needs_the_feature_and_a_valid_value() {
+        let t = json!({ "mlAccuracyThreshold": 70 });
+        let with = parse_ml_model_prov_subsc(&subsc(Some("8"), t.clone())).unwrap();
+        assert_eq!(with.accuracy_thresholds.len(), 1);
+        assert_eq!(with.supp_feats.as_deref(), Some("8"));
+        let without = parse_ml_model_prov_subsc(&subsc(None, t.clone())).unwrap();
+        assert!(without.accuracy_thresholds.is_empty() && without.supp_feats.is_none());
+        let other = parse_ml_model_prov_subsc(&subsc(Some("1"), t)).unwrap();
+        assert!(other.accuracy_thresholds.is_empty());
+        assert_eq!(other.supp_feats.as_deref(), Some("0"));
+        for bad in [
+            json!({ "mlAccuracyThreshold": 101 }),
+            json!({ "mlAccuracyThreshold": "70" }),
+            json!({ "mlAccuracyThreshold": 70, "mlLossThreshold": {} }),
+        ] {
+            assert!(
+                parse_ml_model_prov_subsc(&subsc(Some("8"), bad.clone())).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(parse_ml_model_prov_subsc(&json!({
+            "notifUri": "http://a", "mLEventSubscs": [{ "mLEvent": "NF_LOAD" }], "suppFeats": 8
+        }))
+        .is_err());
+    }
+
+    /// `modelUniqueId` appears exactly when ModelProvisionExt was negotiated.
+    #[test]
+    fn model_unique_id_follows_the_negotiation() {
+        let model = v1();
+        let mut sub = MlProvSubscription::new(
+            "s".into(),
+            "http://a/cb".into(),
+            None,
+            vec![AnalyticsId::NfLoad],
+        );
+        let body = build_ml_model_prov_notif_body(&sub, "http://m", &model);
+        assert!(body[0]["eventNotifs"][0].get("modelUniqueId").is_none());
+        sub.supp_feats = Some("8".into());
+        let body = build_ml_model_prov_notif_body(&sub, "http://m", &model);
+        let id = body[0]["eventNotifs"][0]["modelUniqueId"].as_u64().unwrap();
+        assert_eq!(id, model.unique_id());
+        assert_eq!(format!("{id:012x}"), model.sha256[..12]);
+        assert!(id < (1 << 53));
     }
 
     /// The two baselines differ in whether they can be provisioned at all, and
