@@ -48,6 +48,7 @@ pub mod path_qos;
 pub mod pfcp_path;
 pub mod pfcp_sm;
 pub mod programmable_plane;
+pub mod qos_flow_mon;
 pub mod rule_match;
 pub mod timer;
 pub mod tsn_bridge;
@@ -186,6 +187,28 @@ struct Args {
     /// milliseconds (with `--n6-delay-measurement`).
     #[arg(long, default_value = "1000")]
     n6_delay_probe_interval_ms: u64,
+
+    /// Per QoS flow per UE QoS monitoring for packet delay (TS 29.244 §5.24.4,
+    /// QFQM; #1389 part 3). Off by default: only when set does this UPF advertise
+    /// QFQM and act on the QoS Monitoring per QoS flow Control Information of an
+    /// SRR, marking downlink G-PDUs (or dummy G-PDUs) of the monitored flows with
+    /// QMP and a time stamp, measuring the delay from the NG-RAN's answer and
+    /// reporting it in Session Reports. `UPF_QOS_FLOW_MONITORING=true` is read
+    /// when the flag is not given.
+    #[arg(long, default_value = "false")]
+    qos_flow_monitoring: bool,
+
+    /// Interval between QoS Monitoring Packets on a monitored QoS flow, in
+    /// milliseconds (with `--qos-flow-monitoring`).
+    #[arg(long, default_value = "1000")]
+    qos_flow_monitoring_probe_interval_ms: u64,
+
+    /// The NG-RAN and this UPF are time synchronised (with
+    /// `--qos-flow-monitoring`): the one-way N3 delays are then T2-T1 and T4-T3.
+    /// Without it they are taken as equal, (T2-T1+T4-T3)/2 (TS 23.501 §5.33.3.2).
+    /// `UPF_QOS_FLOW_MONITORING_CLOCK_SYNCED=true` is read when not given.
+    #[arg(long, default_value = "false")]
+    qos_flow_monitoring_clock_synced: bool,
 }
 
 /// The PFCP peer allowlist (#968): `--pfcp-allowed-peers`, else `UPF_PFCP_ALLOWED_PEERS`.
@@ -458,6 +481,12 @@ async fn main() -> Result<()> {
     let n6_delay_measurement = args.n6_delay_measurement
         || std::env::var("UPF_N6_DELAY_MEASUREMENT").is_ok_and(|v| v == "true" || v == "1");
     pfcp_server.set_n6_delay_measurement(n6_delay_measurement);
+    let qos_flow_monitoring = args.qos_flow_monitoring
+        || std::env::var("UPF_QOS_FLOW_MONITORING").is_ok_and(|v| v == "true" || v == "1");
+    pfcp_server.set_qos_flow_monitoring(qos_flow_monitoring);
+    let qos_flow_clock_synced = args.qos_flow_monitoring_clock_synced
+        || std::env::var("UPF_QOS_FLOW_MONITORING_CLOCK_SYNCED")
+            .is_ok_and(|v| v == "true" || v == "1");
     let pfcp_server = Arc::new(pfcp_server);
 
     // #325: point the NFProfile/LCI load gauge at the N4 session census. It used to
@@ -555,6 +584,16 @@ async fn main() -> Result<()> {
                         log::warn!("N6 delay measurement report was NOT sent: {e}");
                     }
                 }
+                // #1389 part 3: per QoS flow QoS monitoring -> PFCP Session Report
+                // with SESR (§5.24.4.3).
+                data_plane::UpfReportEvent::QosMonitoringReport { upf_seid, reports } => {
+                    if let Err(e) = pfcp_for_reports
+                        .send_qos_monitoring_report(upf_seid, &reports)
+                        .await
+                    {
+                        log::warn!("QoS monitoring report was NOT sent: {e}");
+                    }
+                }
                 data_plane::UpfReportEvent::PathReport { failure, peers } => {
                     if let Err(e) = pfcp_for_reports.send_node_report(failure, &peers).await {
                         log::warn!("User-plane path report for {peers:?} was NOT sent: {e}");
@@ -613,6 +652,18 @@ async fn main() -> Result<()> {
             std::time::Duration::from_millis(args.gtpu_path_qos_probe_interval_ms.max(100));
         tokio::spawn(async move {
             dp_for_qos.run_path_qos_monitoring(interval).await;
+        });
+    }
+
+    // #1389 part 3: the QoS Monitoring Packet rounds, only when the operator
+    // enabled per QoS flow monitoring.
+    if qos_flow_monitoring {
+        data_plane.set_qos_flow_clock_synced(qos_flow_clock_synced);
+        let dp_for_qfm = data_plane.clone();
+        let interval =
+            std::time::Duration::from_millis(args.qos_flow_monitoring_probe_interval_ms.max(100));
+        tokio::spawn(async move {
+            dp_for_qfm.run_qos_flow_monitoring(interval).await;
         });
     }
 

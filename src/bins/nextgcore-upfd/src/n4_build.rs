@@ -210,6 +210,13 @@ pub mod pfcp_ie {
     /// TSC Management Information within a Session Report Request
     /// (TS 29.244 §7.5.8.5), #321.
     pub const TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_REPORT_REQUEST: u16 = 201;
+    /// #1389 part 3: Session Reporting Rules (TS 29.244 §7.5.2.9, §7.5.4.19-20,
+    /// §7.5.8.6) and the SRR ID (§8.2.151).
+    pub const REMOVE_SRR: u16 = 211;
+    pub const CREATE_SRR: u16 = 212;
+    pub const UPDATE_SRR: u16 = 213;
+    pub const SESSION_REPORT: u16 = 214;
+    pub const SRR_ID: u16 = 215;
 }
 
 /// PFCPSMReq-Flags bit values (TS 29.244 8.2.50)
@@ -1960,6 +1967,9 @@ pub struct OptionalFeatures {
     /// UN6DM: N6 delay measurement and reporting (§5.33.8),
     /// `--n6-delay-measurement`.
     pub un6dm: bool,
+    /// QFQM: per QoS flow per UE QoS monitoring for packet delay (§5.24.4),
+    /// `--qos-flow-monitoring` (#1389 part 3).
+    pub qfqm: bool,
 }
 
 /// UP Function Features actually implemented by this UPF.
@@ -1967,10 +1977,10 @@ pub struct OptionalFeatures {
 /// Only features with working code paths are advertised (TS 29.244 8.2.25):
 /// - FTUP: F-TEID allocation in the UP function (CHOOSE flag handling)
 /// - EMPU: sending of End Marker packets
-/// - GPQM and UN6DM, only when the operator enabled them ([`OptionalFeatures`]).
+/// - GPQM, UN6DM and QFQM, only when the operator enabled them ([`OptionalFeatures`]).
 ///
 /// Encoded with the nextgcore-pfcp library codec at minimal length: 8 feature
-/// octets (GPQM is octet 9, so it does not grow the IE), and 10 only when UN6DM
+/// octets (GPQM and QFQM are octet 9, so they do not grow the IE), and 10 only when UN6DM
 /// (octet 14 bit 2) is set.
 pub fn upf_function_features(opt: OptionalFeatures) -> Vec<u8> {
     use bytes::BytesMut;
@@ -1979,6 +1989,7 @@ pub fn upf_function_features(opt: OptionalFeatures) -> Vec<u8> {
         empu: true,
         gpqm: opt.gpqm,
         un6dm: opt.un6dm,
+        qfqm: opt.qfqm,
         ..Default::default()
     };
     let mut buf = BytesMut::with_capacity(features.encoded_len());
@@ -2082,6 +2093,87 @@ pub fn parse_gtpu_path_qos_control_information(
             },
         )
         .collect()
+}
+
+/// #1389 part 3: a Create SRR (Table 7.5.2.9-1) or Update SRR (Table
+/// 7.5.4.20-1): the SRR ID and its QoS Monitoring per QoS flow Control
+/// Information IEs (IE 242). Other members (Access Availability, Traffic
+/// Parameter Measurement, Direct Reporting Information, ...) are not modelled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedSrr {
+    pub srr_id: u8,
+    pub qos_controls:
+        Vec<nextgcore_pfcp::qos_monitoring::QosMonitoringPerQosFlowControlInformation>,
+}
+
+/// Parse a Create SRR or Update SRR value. The SRR ID is mandatory; a
+/// malformed IE 242 makes the whole SRR malformed rather than silently
+/// monitoring less than was asked.
+pub fn parse_srr(value: &[u8]) -> Result<ParsedSrr, &'static str> {
+    use nextgcore_pfcp::qos_monitoring::{QosMonitoringPerQosFlowControlInformation, TypedIe};
+    let ies = ParsedIe::parse_all(value);
+    let srr_id = parse_srr_id(&ies).ok_or("SRR ID missing")?;
+    let mut qos_controls = Vec::new();
+    for ie in ParsedIe::find_all_ies(
+        &ies,
+        QosMonitoringPerQosFlowControlInformation::IE_TYPE as u16,
+    ) {
+        match QosMonitoringPerQosFlowControlInformation::decode_value(&ie.value) {
+            Ok(c) => qos_controls.push(c),
+            Err(e) => {
+                log::warn!(
+                    "SRR {srr_id}: malformed QoS Monitoring per QoS flow Control Information: {e}"
+                );
+                return Err("malformed QoS Monitoring per QoS flow Control Information");
+            }
+        }
+    }
+    Ok(ParsedSrr {
+        srr_id,
+        qos_controls,
+    })
+}
+
+/// The SRR ID of a Remove SRR (Table 7.5.4.19-1), if present.
+pub fn parse_remove_srr(value: &[u8]) -> Option<u8> {
+    parse_srr_id(&ParsedIe::parse_all(value))
+}
+
+fn parse_srr_id(ies: &[ParsedIe]) -> Option<u8> {
+    ParsedIe::find_ie(ies, pfcp_ie::SRR_ID).and_then(|ie| ie.value.first().copied())
+}
+
+/// #1389 part 3: the body of a PFCP Session Report Request carrying QoS
+/// monitoring reports (§5.24.4.3, Table 7.5.8.1-1): Report Type with SESR
+/// (§8.2.21 bit 6), then one Session Report IE (Table 7.5.8.6-1) per SRR, with
+/// its SRR ID and a QoS Monitoring Report IE (IE 247) per report, in order.
+pub fn build_qos_monitoring_session_report(
+    reports: &[(u8, nextgcore_pfcp::qos_monitoring::QosMonitoringReport)],
+) -> Vec<u8> {
+    use nextgcore_pfcp::qos_monitoring::TypedIe;
+    let mut b = PfcpMessageBuilder::new();
+    b.add_report_type(&ReportType {
+        session_report: true,
+        ..Default::default()
+    });
+    let mut srr_ids: Vec<u8> = Vec::new();
+    for (id, _) in reports {
+        if !srr_ids.contains(id) {
+            srr_ids.push(*id);
+        }
+    }
+    for id in srr_ids {
+        let mut inner = PfcpMessageBuilder::new();
+        inner.add_u8(pfcp_ie::SRR_ID, id);
+        let mut body = inner.build();
+        for (_, r) in reports.iter().filter(|(i, _)| *i == id) {
+            let mut v = bytes::BytesMut::new();
+            r.encode_ie(&mut v);
+            body.extend_from_slice(&v);
+        }
+        b.add_tlv(pfcp_ie::SESSION_REPORT, &body);
+    }
+    b.build()
 }
 
 /// A PFCP Node Report Request carrying N6 delay measurement reports (#1389 part
@@ -2209,6 +2301,8 @@ pub enum FailedRule {
     Qer(u32),
     Urr(u32),
     Bar(u8),
+    /// #1389 part 3: Rule ID Type 6, the SRR ID (1 octet, §8.2.151).
+    Srr(u8),
 }
 
 impl FailedRule {
@@ -2235,6 +2329,10 @@ impl FailedRule {
             }
             Self::Bar(id) => {
                 v.push(4);
+                v.push(id);
+            }
+            Self::Srr(id) => {
+                v.push(6);
                 v.push(id);
             }
         }
