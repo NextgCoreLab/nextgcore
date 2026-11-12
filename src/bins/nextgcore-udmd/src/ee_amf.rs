@@ -105,6 +105,31 @@ fn drop_leg_lock(id: &str) {
     }
 }
 
+/// How many per-subscription locks exist (tests: the map must not grow from
+/// wire input, #1449 review 10).
+#[cfg(test)]
+fn leg_lock_count() -> usize {
+    LEG_LOCKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map_or(0, HashMap::len)
+}
+
+/// The stored subscription `id`, if any.
+fn find_subscription(id: &str) -> Option<UdmEeSubscription> {
+    let ctx = udm_self();
+    let guard = ctx.read().ok()?;
+    guard.ee_subscription_find_by_id(id)
+}
+
+/// Whether `token` is the change token of `id`'s stored leg.
+fn token_matches(id: &str, token: &str) -> bool {
+    find_subscription(id)
+        .and_then(|s| s.amf_leg)
+        .is_some_and(|l| tokens_equal(&l.change_token, token))
+}
+
 /// The path segment of the UDM's subscription-change callback; the capability
 /// token follows it, so the shared log redaction hides it.
 pub const SUBS_CHANGE_SEGMENT: &str = "ee-amf-subs-change";
@@ -213,9 +238,15 @@ async fn amf_client(host: &str, port: u16) -> Arc<nextgcore_sbi::client::SbiClie
 async fn resolve_amf(amf_instance_id: &str) -> Option<String> {
     let ctx = nextgcore_sbi::context::global_context();
     if ctx.get_nf_instance(amf_instance_id).await.is_none() {
-        if let Err(e) =
-            crate::sbi_path::udm_nrf_discover_instance(NfType::Amf, amf_instance_id).await
-        {
+        // Under the same cap as the AMF calls: it runs holding the leg lock
+        // (#1449 review 11).
+        let discovered = tokio::time::timeout(
+            amf_call_timeout(),
+            crate::sbi_path::udm_nrf_discover_instance(NfType::Amf, amf_instance_id),
+        )
+        .await
+        .unwrap_or_else(|_| Err("NRF discovery timed out".to_string()));
+        if let Err(e) = discovered {
             log::warn!("AMF {amf_instance_id} is not known and could not be discovered: {e}");
             return None;
         }
@@ -387,6 +418,9 @@ pub async fn wait_idle() {
 /// unreachable AMF drops any stale leg so the UECM-derived fallback applies, and
 /// is logged.
 pub async fn reconcile(id: &str) {
+    if find_subscription(id).is_none() {
+        return;
+    }
     let lock = leg_lock(id);
     let _held = lock.lock().await;
     let (sub, serving_amf) = {
@@ -395,6 +429,9 @@ pub async fn reconcile(id: &str) {
             return;
         };
         let Some(sub) = context.ee_subscription_find_by_id(id) else {
+            // Removed meanwhile; `release` may already have dropped the entry.
+            drop(context);
+            drop_leg_lock(id);
             return;
         };
         let serving = context
@@ -523,24 +560,29 @@ pub async fn handle_subs_change(
     token: &str,
     request: &SbiRequest,
 ) -> SbiResponse {
-    let lock = leg_lock(ee_subscription_id);
-    let _held = lock.lock().await;
-    let sub = {
-        let ctx = udm_self();
-        let guard = ctx.read().ok();
-        guard
-            .as_ref()
-            .and_then(|c| c.ee_subscription_find_by_id(ee_subscription_id))
-    };
-    let leg = sub.as_ref().and_then(|s| s.amf_leg.clone());
-    let authorised = leg
-        .as_ref()
-        .is_some_and(|l| tokens_equal(&l.change_token, token));
-    let (Some(_), Some(leg), true) = (sub, leg, authorised) else {
-        return nextgcore_sbi::server::send_not_found(
+    let not_found = || {
+        nextgcore_sbi::server::send_not_found(
             "No such subscription-change endpoint",
             Some("RESOURCE_URI_NOT_FOUND"),
-        );
+        )
+    };
+    // Refuse an unknown id or a wrong token BEFORE a lock entry exists for it:
+    // the id is wire input, and an entry per forged id grew the map without
+    // bound (#1449 review 10).
+    if !token_matches(ee_subscription_id, token) {
+        return not_found();
+    }
+    let lock = leg_lock(ee_subscription_id);
+    let _held = lock.lock().await;
+    // Re-read under the lock: a reconcile or release may have run meanwhile.
+    let Some(leg) = find_subscription(ee_subscription_id)
+        .and_then(|s| s.amf_leg)
+        .filter(|l| tokens_equal(&l.change_token, token))
+    else {
+        if find_subscription(ee_subscription_id).is_none() {
+            drop_leg_lock(ee_subscription_id);
+        }
+        return not_found();
     };
     let Some(body) = request
         .http
@@ -1469,6 +1511,100 @@ mod tests {
         let resp = crate::app::udm_sbi_request_handler(change("tok-4440", &dup)).await;
         assert_eq!(resp.status, 204);
         assert_eq!(leg_of(&id).map(|l| l.subscription_uri), Some(new));
+        clear(supi);
+    }
+
+    /// **#1449 review 10.** Forged subscription-change calls (unknown ids, and a
+    /// real id with a wrong token) are refused without creating a lock entry, so
+    /// wire input cannot grow the lock map.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn forged_subscription_changes_leave_the_lock_map_unchanged() {
+        let supi = "imsi-001010000010449";
+        let _guard = setup(supi);
+        let mut sub = UdmEeSubscription::for_ue(
+            supi,
+            "http://nef.example.org/notify",
+            json!({ "callbackReference": "http://nef.example.org/notify", "monitoringConfigurations": loc() })
+                .to_string(),
+        );
+        sub.amf_leg = Some(AmfEeLeg {
+            subscription_uri: "http://127.0.0.1:9/namf-evts/v1/subscriptions/s".to_string(),
+            change_token: "tok-10449".to_string(),
+            amf_instance_id: Some("amf-10449".to_string()),
+            notify_uri: "http://nef.example.org/notify".to_string(),
+            events: vec!["LOSS_OF_CONNECTIVITY".to_string()],
+        });
+        let id = sub.id.clone();
+        udm_self()
+            .read()
+            .expect("context")
+            .ee_subscription_insert(sub);
+        let before = leg_lock_count();
+        let post = |path: String| {
+            let mut req = SbiRequest::post(path);
+            req.http.content = Some(json!({ "reportList": [] }).to_string());
+            req
+        };
+        for n in 0..1000 {
+            let resp = crate::app::udm_sbi_request_handler(post(subs_change_path(
+                &format!("forged-{n}"),
+                "x",
+            )))
+            .await;
+            assert_eq!(resp.status, 404);
+        }
+        let resp = crate::app::udm_sbi_request_handler(post(subs_change_path(&id, "wrong"))).await;
+        assert_eq!(resp.status, 404);
+        assert_eq!(
+            leg_lock_count(),
+            before,
+            "forged calls must not add lock entries"
+        );
+        clear(supi);
+    }
+
+    /// **#1449 review 11.** NRF discovery of an unknown serving AMF runs under the
+    /// same cap as the AMF calls: an NRF that never answers does not hold the
+    /// subscription's lock for the client's 30 s default.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn a_silent_nrf_is_bounded_by_the_amf_call_cap() {
+        let supi = "imsi-001010000011449";
+        let _guard = setup(supi);
+        AMF_CALL_TIMEOUT_MS.store(300, Ordering::Relaxed);
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let ctx = global_context();
+        ctx.set_nrf_uri(format!("http://{}", silent.local_addr().expect("addr")))
+            .await;
+        let client = mock_udr();
+        let id = ee_subscribe(supi, "http://nef.example.org/notify", loc()).await;
+        let resp = process_amf_registration(
+            supi,
+            &amf_registration("amf-undiscovered-11449"),
+            &client,
+            UecmAccess::ThreeGpp,
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let started = std::time::Instant::now();
+        wait_idle().await;
+        let took = started.elapsed();
+        // The process-wide NRF URI cannot be unset: leave it at a refused port, which
+        // fails at once exactly as "no NRF" does for every later test.
+        ctx.set_nrf_uri(format!(
+            "http://127.0.0.1:{}",
+            nextgcore_sbi::test_support::refused_port()
+        ))
+        .await;
+        assert!(
+            took < Duration::from_secs(2),
+            "the discovery must give up at the cap: took {took:?}"
+        );
+        assert!(leg_of(&id).is_none());
+        drop(silent);
         clear(supi);
     }
 
