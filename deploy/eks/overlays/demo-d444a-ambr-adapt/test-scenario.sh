@@ -65,7 +65,20 @@ breaks "raw: a pca row" d444a_raw_row "${rowb}" 230
 
 prom="$(put m.prom '# HELP x' 'upf_dataplane_dropped_packets_by_reason_total{reason="far_drop"} 4' 'upf_dataplane_dropped_packets_by_reason_total{reason="qer_gate"} 17')"
 [[ "$(d444a_qer_gate "${prom}")" == 17 ]] && ok "qer_gate counter" || not_ok "qer_gate counter"
-[[ "$(d444a_qer_gate "$(put m2.prom 'x 1')")" == 0 ]] && ok "absent qer_gate reads 0" || not_ok "absent qer_gate"
+breaks "absent qer_gate series fails (a failed scrape is not zero drops)" d444a_qer_gate "$(put m2.prom 'x 1')"
+breaks "an empty scrape fails" d444a_qer_gate "$(put m3.prom)"
+[[ "$(d444a_qer_gate "$(put m4.prom 'upf_dataplane_dropped_packets_by_reason_total{reason="qer_gate"} 0')")" == 0 ]] \
+  && ok "a present zero reads 0" || not_ok "present zero"
+
+[[ "$(d444a_ul_value "$(put ul.json '{"value":1,"unit":3}')")" == "1 3" ]] && ok "UL AMBR original parsed" || not_ok "UL parse"
+[[ -z "$(d444a_ul_value "$(put ul2.json 'MongoServerError: x')")" ]] && ok "an error is not a UL value" || not_ok "UL error"
+orig="$(put sm.json '{"smPolicySnssaiData":{"1":{"snssai":{"sst":1},"smPolicyDnnData":{"internet":{"dnn":"internet","online":true}}}}}')"
+[[ "$(d444a_flip_online "${orig}")" == '{"smPolicySnssaiData":{"1":{"snssai":{"sst":1},"smPolicyDnnData":{"internet":{"dnn":"internet","online":false}}}}}' ]] \
+  && ok "throttle flips online on the original document" || not_ok "flip online"
+bare="$(put sm2.json '{"smPolicySnssaiData":{"1":{"snssai":{"sst":1}}}}')"
+d444a_flip_online "${bare}" | grep -qF '"internet":{"dnn":"internet","online":true}' \
+  && ok "throttle adds the internet entry when absent" || not_ok "flip adds entry"
+breaks "flip refuses a non-SmPolicyData body" d444a_flip_online "$(put sm3.json '{"cause":"DATA_NOT_FOUND"}')"
 holds "metric" d444a_metric "$(put d.prom 'nextg_demo_enabled{demo="d444a-ambr-adapt",mode="raw"} 1')" raw
 breaks "metric, other mode" d444a_metric "$(put d2.prom 'nextg_demo_enabled{demo="d444a-ambr-adapt",mode="raw"} 1')" semantic
 echo "1..${n}"

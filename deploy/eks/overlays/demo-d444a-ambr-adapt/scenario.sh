@@ -39,10 +39,6 @@
 # shellcheck disable=SC2015
 
 D444A_IMSI="${D444A_IMSI:-999700000000001}"
-# The provisioned session AMBR the restore returns to (k8s/manifests/mongodb-init.yaml:
-# value 1, unit 3 = 1 Gbps in the subscriber document's units).
-D444A_RESTORE_VALUE="${D444A_RESTORE_VALUE:-1}"
-D444A_RESTORE_UNIT="${D444A_RESTORE_UNIT:-3}"
 # An epoch is 500 datagrams (the UE's and the sink's epoch_datagrams).
 D444A_LOSS_MAX=2       # 0.5 % of an epoch
 D444A_ACC_FLOOR=0.90   # nextgsim-semantic PINNED_ACCURACY_FLOOR_KEEP40
@@ -118,16 +114,42 @@ d444a_raw_row() {                                                       # ROW QE
 d444a_metric() {                                                        # PROMFILE MODE
   grep -qF "nextg_demo_enabled{demo=\"d444a-ambr-adapt\",mode=\"$2\"} 1" "$1"
 }
-# upfd's qer_gate drop counter out of a /metrics body; 0 when the series is absent.
+# upfd's qer_gate drop counter out of a /metrics body. FAILS (prints nothing)
+# when the series is absent: upfd emits every drop reason, zero included, so
+# a missing series means the scrape failed, not that nothing was dropped.
 d444a_qer_gate() {
-  awk '/^upf_dataplane_dropped_packets_by_reason_total\{.*reason="qer_gate".*\} / { v = $NF } END { print v + 0 }' "$1"
+  awk '/^upf_dataplane_dropped_packets_by_reason_total\{.*reason="qer_gate".*\} [0-9]+$/ { v = $NF; seen = 1 }
+       END { if (!seen) exit 1; print v }' "$1"
+}
+# The subscriber's session UL AMBR as mongosh prints it: {"value":N,"unit":U}.
+d444a_ul_value() { sed -nE 's/^\{"value":([0-9]+),"unit":([0-9]+)\}$/\1 \2/p' "$1"; }   # FILE -> "N U"
+# The throttle's SmPolicyData: the original document with `online` flipped on
+# every DNN entry named internet (added when absent), so the PCF is sure to see
+# a changed SmPolicyDnnData and re-authorise. Fails on a body that is not an
+# SmPolicyData object.
+d444a_flip_online() {                                                   # ORIGFILE
+  python3 - "$1" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+snssai = doc.get("smPolicySnssaiData") if isinstance(doc, dict) else None
+if not isinstance(snssai, dict) or not snssai:
+    sys.exit("not an SmPolicyData with smPolicySnssaiData")
+for entry in snssai.values():
+    dnns = entry.setdefault("smPolicyDnnData", {})
+    d = dnns.setdefault("internet", {"dnn": "internet"})
+    d["online"] = not d.get("online", False)
+print(json.dumps(doc, separators=(",", ":")))
+PY
 }
 
 d444a_main() {
   set -uo pipefail
   : "${NAMESPACE:?}" "${DEMO_KEY:?}" "${DEMO_MODE:?}" "${OUT:?}"
-  local K=(kubectl -n "${NAMESPACE}") D="${OUT}/d444a" FAILS=() UE UPF SMF GNB PCF MONGO NODE
-  local s before after row line_no q0 q1 t
+  # Globals, not locals: the EXIT trap that restores the subscriber runs after
+  # this function has returned, and needs K, D, the pods and the originals.
+  K=(kubectl -n "${NAMESPACE}") D="${OUT}/d444a" UE='' UPF='' SMF='' GNB='' PCF='' MONGO=''
+  SMDATA='' ORIG_UL_VALUE='' ORIG_UL_UNIT='' RESTORED=true
+  local FAILS=() NODE s before after row line_no q0='' q1='' t
   mkdir -p "${D}" "${OUT}/metrics"
   fail() { echo "FAIL: $*"; FAILS+=("$*"); }
   pass() { echo "ok:   $*"; }
@@ -148,18 +170,47 @@ d444a_main() {
     while (( SECONDS < deadline )); do (( $(rows) > $1 )) && return 0; sleep 5; done
     return 1
   }
-  qer() { "${K[@]}" exec "${UPF}" -c upf -- sh -c 'curl -s --max-time 5 http://127.0.0.1:9090/metrics' >"${D}/upf.prom" 2>/dev/null; d444a_qer_gate "${D}/upf.prom"; }
-  set_ul() {    # VALUE UNIT ONLINE: the subscriber's session UL AMBR, then the re-authorisation
+  qer() {      # prints the counter; fails when the scrape or the series is missing
+    "${K[@]}" exec "${UPF}" -c upf -- sh -c 'curl -sf --max-time 5 http://127.0.0.1:9090/metrics' \
+      >"${D}/upf.prom" 2>/dev/null || return 1
+    d444a_qer_gate "${D}/upf.prom"
+  }
+  SMDATA="http://udr:7777/nudr-dr/v2/policy-data/ues/imsi-${D444A_IMSI}/sm-data"
+  mongo_ul() {  # VALUE UNIT: the subscriber's session UL AMBR in the UDR's database
     "${K[@]}" exec "${MONGO}" -- mongosh --quiet nextgcore --eval \
       "db.subscribers.updateOne({imsi:'${D444A_IMSI}'},{\$set:{'slice.0.session.0.ambr.uplink':{value:$1,unit:$2}}}).matchedCount" \
       >"${D}/mongo-$1-$2.txt" 2>&1
     grep -qx 1 "${D}/mongo-$1-$2.txt" || { echo "subscriber ${D444A_IMSI} not updated: $(head -c 200 "${D}/mongo-$1-$2.txt")"; return 1; }
-    "${K[@]}" exec "${PCF}" -c pcf -- curl -s --http2-prior-knowledge --max-time 10 -o /dev/null -w '%{http_code}' \
-      -X PUT -H 'content-type: application/json' \
-      --data "{\"smPolicySnssaiData\":{\"1\":{\"snssai\":{\"sst\":1},\"smPolicyDnnData\":{\"internet\":{\"dnn\":\"internet\",\"online\":$3}}}}}" \
-      "http://udr:7777/nudr-dr/v2/policy-data/ues/imsi-${D444A_IMSI}/sm-data" >"${D}/udr-put-$1.txt" 2>&1
-    grep -qE '^20[14]$' "${D}/udr-put-$1.txt" || { echo "UDR sm-data PUT: $(cat "${D}/udr-put-$1.txt")"; return 1; }
   }
+  udr_put() {   # FILE TAG: PUT the SmPolicyData in FILE; the UDR notifies the PCF
+    "${K[@]}" exec -i "${PCF}" -c pcf -- curl -s --http2-prior-knowledge --max-time 10 -o /dev/null \
+      -w '%{http_code}' -X PUT -H 'content-type: application/json' --data-binary @- "${SMDATA}" \
+      <"$1" >"${D}/udr-put-$2.txt" 2>&1
+    grep -qE '^20[14]$' "${D}/udr-put-$2.txt" || { echo "UDR sm-data PUT ($2): $(cat "${D}/udr-put-$2.txt")"; return 1; }
+  }
+  # The originals, so the run leaves the shared namespace as it found it.
+  "${K[@]}" exec "${MONGO}" -- mongosh --quiet nextgcore --eval \
+    "JSON.stringify(db.subscribers.findOne({imsi:'${D444A_IMSI}'}).slice[0].session[0].ambr.uplink)" \
+    >"${D}/orig-ul.json" 2>&1
+  read -r ORIG_UL_VALUE ORIG_UL_UNIT <<<"$(d444a_ul_value "${D}/orig-ul.json")"
+  [[ -n "${ORIG_UL_VALUE:-}" ]] || { echo "cannot read the subscriber's UL AMBR: $(head -c 200 "${D}/orig-ul.json")"; return 1; }
+  "${K[@]}" exec "${PCF}" -c pcf -- curl -sf --http2-prior-knowledge --max-time 10 "${SMDATA}" \
+    >"${D}/orig-sm-data.json" 2>/dev/null \
+    || { echo "cannot GET the UE's sm-data"; return 1; }
+  d444a_flip_online "${D}/orig-sm-data.json" >"${D}/throttle-sm-data.json" \
+    || { echo "sm-data is not an SmPolicyData: $(head -c 200 "${D}/orig-sm-data.json")"; return 1; }
+  RESTORED=false
+  # Restore on every exit from here on: success, failure, or an interrupt.
+  # udrd has no DELETE for sm-data, so the original document is PUT back. GET
+  # returned it (stored or derived from the subscription), so reads see the same
+  # document as before.
+  d444a_restore() {
+    [[ "${RESTORED}" == true ]] && return 0
+    RESTORED=true
+    mongo_ul "${ORIG_UL_VALUE}" "${ORIG_UL_UNIT}" && udr_put "${D}/orig-sm-data.json" restore
+  }
+  trap 'd444a_restore >/dev/null 2>&1' EXIT
+  trap 'exit 130' INT TERM HUP
 
   # The stream is running: the sink has scored at least one epoch.
   wait_rows 0 120 && pass "the sink is scoring the UE's stream" || { fail "no sink row in 120 s"; return 1; }
@@ -173,7 +224,8 @@ d444a_main() {
   fi
 
   # Throttle.
-  set_ul 64 1 true && pass "UL session AMBR 64 Kbps provisioned and re-authorised" || fail "throttle"
+  mongo_ul 64 1 && udr_put "${D}/throttle-sm-data.json" throttle \
+    && pass "UL session AMBR 64 Kbps provisioned and re-authorised" || fail "throttle"
   t=$((SECONDS + 60))
   until d444a_chain "${D}/merged.log" "${DEMO_MODE}" >"${D}/chain.txt" 2>&1 || (( SECONDS > t )); do sleep 5; collect; done
   d444a_chain "${D}/merged.log" "${DEMO_MODE}" >"${D}/chain.txt" \
@@ -184,21 +236,21 @@ d444a_main() {
   line_no="$(grep -nE "${D444A_UE_RATE_RE}|${D444A_UE_RAW_RE}" "${D}/merged.log" | head -1 | cut -d: -f1)"
   before="$(rows)"
   wait_rows "${before}" 40 || fail "no sink row after the throttle"
-  q0="$(qer)"
+  q0="$(qer)" || fail "upfd /metrics scrape (qer_gate) failed at the start of epoch B"
   wait_rows "$((before + 1))" 40 || fail "no second sink row after the throttle"
-  q1="$(qer)"
+  q1="$(qer)" || fail "upfd /metrics scrape (qer_gate) failed at the end of epoch B"
   echo "qer_gate ${q0} -> ${q1}" >"${D}/qer-gate.txt"
   grep -E "${D444A_ROW_RE}" "${D}/sink.log" >"${D}/sink-rows.txt"
   row="$(d444a_epoch_b "${D}/merged.log" "${line_no:-0}")"
   if [[ "${DEMO_MODE}" == semantic ]]; then
-    s="$(d444a_semantic_row "${row}" "$((q1 - q0))")" && pass "epoch B: ${s}" || fail "epoch B: ${s}"
+    s="$(d444a_semantic_row "${row}" "$(( ${q1:-0} - ${q0:-0} ))")" && pass "epoch B: ${s}" || fail "epoch B: ${s}"
   else
-    s="$(d444a_raw_row "${row}" "$((q1 - q0))")" && pass "epoch B: ${s}" || fail "epoch B: ${s}"
+    s="$(d444a_raw_row "${row}" "$(( ${q1:-0} - ${q0:-0} ))")" && pass "epoch B: ${s}" || fail "epoch B: ${s}"
   fi
 
   # Restore.
   after="$(wc -l <"${D}/merged.log")"
-  set_ul "${D444A_RESTORE_VALUE}" "${D444A_RESTORE_UNIT}" false && pass "UL session AMBR restored" || fail "restore"
+  d444a_restore && pass "UL session AMBR and sm-data restored to the originals" || fail "restore"
   sleep 20; collect
   tail -n "+$((after + 1))" "${D}/merged.log" >"${D}/restore.log"
   if [[ "${DEMO_MODE}" == semantic ]]; then

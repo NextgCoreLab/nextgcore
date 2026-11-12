@@ -25,7 +25,8 @@ TAG="demo-d444a-ambr-adapt-$(git -C "${SIM_DIR}" rev-parse --short=12 HEAD)"
 # Tracked changes would make the tag lie about what was built.
 [[ -z "$(git -C "${SIM_DIR}" status --porcelain --untracked-files=no)" ]] \
   || { echo "nextgsim tree has uncommitted changes" >&2; exit 1; }
-# Outside the source tree, so the build leaves nextgsim untouched.
+# The cargo target dir is outside the source tree. The binaries are then copied
+# into nextgsim's binaries/ (gitignored), the build context Dockerfile.*-local expect.
 TARGET_DIR="${D444A_TARGET_DIR:-/tmp/nextg-d444a-target}"
 mkdir -p "${TARGET_DIR}"
 

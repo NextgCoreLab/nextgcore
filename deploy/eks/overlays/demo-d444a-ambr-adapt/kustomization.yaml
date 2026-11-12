@@ -19,6 +19,11 @@
 # demo-d444a-ambr-adapt-<sha> tag and passed as SIM_IMAGE_TAG; the sink container
 # names nextgsim-ue:latest, which deploy-eks.sh rewrites to that same image.
 #
+# The sink has no probe. If it exits (a config error, or no 10.45.0.1 within
+# 180 s because the data plane is off) it crash-loops, and the UPF pod reports
+# NotReady: in this overlay "UPF not ready" can mean the sink failed. Read
+# `kubectl logs deploy/upf -c semantic-sink` first.
+#
 # ClusterIP only: no Service, no port. The sink is reachable only from inside
 # the UPF's netns, i.e. by UE traffic that crossed a PDU session; scenario.sh
 # reads everything with `kubectl exec` and `kubectl logs`.
