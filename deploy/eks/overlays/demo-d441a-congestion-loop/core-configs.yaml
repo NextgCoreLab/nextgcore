@@ -11,13 +11,15 @@
 #             throttle to 1000 kbps at congLevel >= 80, restore after 15
 #             consecutive polls below 3 (nextgcore#1480). With C = 5 Mbps a
 #             throttled UE-B (1 Mbps) can fill at most 20 % of the cell, and the
-#             throttle alone brought the served occupancy down to 5.9-17.7 % on
-#             devtest1. In prediction mode the fit extrapolated that drop to
-#             congLevel < 3 for up to 6 polls in a row. restore_below 10 /
-#             restore_after_polls 3 sat inside that band and restored UE-B mid-load.
-#             3 is half the measured throttled floor, and 15 polls are over twice
-#             the longest in-load dip; scenario.sh's d441a_restore_hysteresis
-#             checks both against the gNB's C and refuses the old values.
+#             throttle itself lowers the served occupancy: congLevel went down
+#             to 1 in statistics, and in prediction mode the fit extrapolated
+#             the drop to 0, under 3 for up to 6 polls in a row. No
+#             restore_below lies under that floor; the 15-poll count (over twice
+#             the longest in-load dip) is what keeps the restore after the load.
+#             restore_after_polls 3 restored UE-B mid-load. restore_below 3 only
+#             keeps a quiet cell near idle. scenario.sh's
+#             d441a_restore_hysteresis checks both against the gNB's C and
+#             refuses the old values (10, 3).
 #
 # The demo: block is merged into pcf.yaml (and gnb.yaml, nwdaf.yaml) at render
 # time by the demo post-render (toggles.yaml), with the run's mode.
