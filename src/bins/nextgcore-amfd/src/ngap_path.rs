@@ -10256,9 +10256,45 @@ impl NgapServer {
                         ))
                     });
             }
-            // PDU Session Modification Complete
-            0xCD => {
-                log::info!("PDU Session Modification Complete from UE: PSI={psi}");
+            // PDU Session Modification Complete (0xCC) and PDU Session Modification
+            // Command Reject (0xCD), TS 24.501 Table 9.7.2. #1465: relayed to the SMF
+            // (TS 23.502 §4.3.3.2 step 7, Nsmf_PDUSession_UpdateSMContext with the N1 SM
+            // container), which stops T3591 (TS 24.501 §6.3.2.3 / §6.3.2.4). Before, the
+            // arm matched only 0xCD under the COMPLETE's label and logged it, so neither
+            // reached the SMF and T3591 retransmitted every network-requested
+            // modification to exhaustion.
+            0xCC | 0xCD => {
+                let what = if sm_msg_type == 0xCC {
+                    "PDU Session Modification Complete"
+                } else {
+                    "PDU Session Modification Command Reject"
+                };
+                log::info!("{what} from UE: PSI={psi}, PTI={pti}");
+                match self.sm_context_refs.get(&(amf_ue_ngap_id, psi)).cloned() {
+                    Some(sm_context_ref) => {
+                        // #922: relayed off the NGAP task, keyed on the session.
+                        let n1 = sm_pdu.to_vec();
+                        self.sbi_offload
+                            .spawn_keyed((amf_ue_ngap_id, psi), move || async move {
+                                let (host, port) = smf_or_selected(owner).await;
+                                if let Err(e) = crate::sbi_path::call_smf_update_sm_context_n1_only(
+                                    &host,
+                                    port,
+                                    &sm_context_ref,
+                                    &n1,
+                                )
+                                .await
+                                {
+                                    log::warn!("{what} for PSI={psi}: SMF update failed: {e}");
+                                }
+                                None
+                            });
+                    }
+                    None => log::info!(
+                        "{what} for UE {amf_ue_ngap_id} PSI {psi}: no SM context (released \
+                         already)"
+                    ),
+                }
             }
             // PDU Session Release Request
             0xD1 => {
@@ -34430,6 +34466,97 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         (server, addr.port(), seen)
+    }
+
+    /// A stand-in SMF recording each request as `(uri, json body, n1SmMsg part)` and
+    /// answering `204 No Content` (#1465). Keep the server alive.
+    #[allow(clippy::type_complexity)]
+    async fn n1_recording_smf_1465() -> (
+        nextgcore_sbi::server::SbiServer,
+        u16,
+        Arc<std::sync::Mutex<Vec<(String, String, Vec<u8>)>>>,
+    ) {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let seen: Arc<std::sync::Mutex<Vec<(String, String, Vec<u8>)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        server
+            .start(move |req: nextgcore_sbi::SbiRequest| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    let n1 = req
+                        .http
+                        .parts
+                        .iter()
+                        .find(|p| p.content_id.as_deref() == Some("n1SmMsg"))
+                        .map(|p| p.data.to_vec())
+                        .unwrap_or_default();
+                    sink.lock().expect("sink").push((
+                        req.header.uri.clone(),
+                        req.http.content.clone().unwrap_or_default(),
+                        n1,
+                    ));
+                    nextgcore_sbi::SbiResponse::no_content()
+                }
+            })
+            .await
+            .expect("recording SMF starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (server, addr.port(), seen)
+    }
+
+    /// **#1465.** The UE's PDU SESSION MODIFICATION COMPLETE (0xCC) and PDU SESSION
+    /// MODIFICATION COMMAND REJECT (0xCD), TS 24.501 Table 9.7.2, reach the SMF holding
+    /// the session as an Nsmf_PDUSession_UpdateSMContext carrying the N1 SM container
+    /// byte for byte (TS 23.502 §4.3.3.2 step 7), so it stops T3591. Before, 0xCC was
+    /// "Unhandled" and 0xCD only logged: T3591 retransmitted every network-requested
+    /// modification. A session the AMF no longer knows sends nothing.
+    ///
+    /// REVERT-VERIFIED: with the arm back to `0xCD => log`, no request reaches the SMF.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_ue_s_modification_complete_and_command_reject_reach_the_smf_1465() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (_smf, port, seen) = n1_recording_smf_1465().await;
+        let mut ngap = test_ngap_server().await;
+        let ue = 7_146_501u64;
+        ngap.sm_context_refs
+            .insert((ue, 5), "smctx-1465".to_string());
+        ngap.sm_context_smfs
+            .insert((ue, 5), ("127.0.0.1".to_string(), port));
+
+        let complete = [0x2E, 5, 0, 0xCC];
+        let reject = [0x2E, 5, 0, 0xCD, 83];
+        ngap.handle_5gsm_message(1, ue, 72, &complete, None)
+            .await
+            .expect("handled");
+        settle_offloaded_sbi(&mut ngap).await;
+        ngap.handle_5gsm_message(1, ue, 72, &reject, None)
+            .await
+            .expect("handled");
+        settle_offloaded_sbi(&mut ngap).await;
+        // No SM context for PSI 6: nothing to relay to.
+        ngap.handle_5gsm_message(1, ue, 72, &[0x2E, 6, 0, 0xCC], None)
+            .await
+            .expect("handled");
+        settle_offloaded_sbi(&mut ngap).await;
+
+        let got = seen.lock().expect("seen").clone();
+        assert_eq!(got.len(), 2, "one UpdateSMContext each: {got:?}");
+        for ((uri, body, n1), want) in got.iter().zip([&complete[..], &reject[..]]) {
+            assert_eq!(uri, "/nsmf-pdusession/v1/sm-contexts/smctx-1465/modify");
+            assert!(body.contains("n1SmMsg"), "{body}");
+            assert_eq!(n1.as_slice(), want, "the N1 SM container, byte for byte");
+        }
     }
 
     /// **#738.** After an N2 handover the SOURCE gNB's UE Context Release Complete ends
