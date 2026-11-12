@@ -122,7 +122,7 @@ pub fn build_udm_nf_profile(
 /// Open SBI server and register with NRF
 ///
 /// Port of udm_sbi_open()
-pub fn udm_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
+pub async fn udm_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
     let config = config.unwrap_or_default();
 
     log::info!("Opening UDM SBI server on {}:{}", config.addr, config.port);
@@ -145,12 +145,11 @@ pub fn udm_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
         .map(|ctx| ctx.nf_profile_config().heart_beat_timer)
         .unwrap_or(10);
 
-    // Store self NF instance in global SBI context
-    // Use spawn to avoid blocking the runtime (block_on panics inside async)
-    let sbi_ctx = global_context();
-    tokio::spawn(async move {
-        sbi_ctx.set_self_instance(nf_instance.clone()).await;
-    });
+    // Store self NF instance in global SBI context.
+    // #1479: awaited, not spawned, so it is in place when this returns: a
+    // spawned write could still be pending when the first reader looked (pcfd
+    // ran unregistered for its whole life on exactly that race).
+    global_context().set_self_instance(nf_instance).await;
 
     SBI_RUNNING.store(true, Ordering::SeqCst);
 
@@ -1241,11 +1240,40 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         assert!(!udm_sbi_is_running());
 
-        udm_sbi_open(None).unwrap();
+        udm_sbi_open(None).await.unwrap();
         assert!(udm_sbi_is_running());
 
         udm_sbi_close().await;
         assert!(!udm_sbi_is_running());
+    }
+
+    /// #1479: the self instance is in place the moment `udm_sbi_open` returns.
+    /// On the current-thread runtime nothing else runs until this task yields,
+    /// so a spawned publication has deterministically not happened yet at the
+    /// read. The sentinel keeps the real `nfInstanceId` but carries no services,
+    /// which the instance `udm_sbi_open` builds always does.
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
+    async fn the_self_instance_is_published_before_udm_sbi_open_returns() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let id = nextgcore_sbi::nf_instance_id::nf_instance_id(NfType::Udm).to_string();
+        let ctx = global_context();
+        ctx.set_self_instance(NfInstance::new(&id, NfType::Udm))
+            .await;
+
+        udm_sbi_open(None).await.expect("udm_sbi_open");
+        // No yield between the open and this read.
+        let published = ctx.get_self_instance().await.expect("self instance");
+        udm_sbi_close().await;
+
+        assert_eq!(published.id, id);
+        assert!(
+            !published.services.is_empty(),
+            "the instance read straight after udm_sbi_open must be the one it built, \
+             not whatever was there before"
+        );
     }
 
     /// #898: the NF-instance cache is empty when `udm_sbi_close` returns, not at

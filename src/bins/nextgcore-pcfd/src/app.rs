@@ -299,6 +299,26 @@ async fn apply_oauth2_enforcement(mut cfg: NextgcoreSbiServerConfig) -> Nextgcor
     cfg
 }
 
+/// The `nfInstanceId` `pcf_sbi_open` published as this PCF's self instance.
+///
+/// The NRF registration, the heartbeat and the BSF `pcfId` all take their id
+/// from here, so a fresh UUID is never substituted: that would reintroduce the
+/// two-id split of #90. An absent instance is a startup error rather than a
+/// reason to run unregistered (#1479): TS 29.510 §5.2.2.2.1 NFRegister is what
+/// makes the NRF mark an NF "available to be discovered by other NFs".
+async fn published_self_instance_id() -> anyhow::Result<String> {
+    nextgcore_sbi::context::global_context()
+        .get_self_instance()
+        .await
+        .map(|instance| instance.id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "PCF self instance not published by pcf_sbi_open; refusing to start \
+                 without an NRF registration identity"
+            )
+        })
+}
+
 #[tokio::main]
 pub async fn run() -> Result<()> {
     let args = Args::parse();
@@ -556,7 +576,9 @@ pub async fn run() -> Result<()> {
     sbi_path::set_sbi_tls_active(sbi_config.tls_enabled);
 
     // Open legacy SBI server (for context initialization)
-    pcf_sbi_open(Some(sbi_config)).map_err(|e| anyhow::anyhow!(e))?;
+    pcf_sbi_open(Some(sbi_config))
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     // Start actual HTTP/2 SBI server using nextgcore-sbi
     let sbi_addr: SocketAddr = nextgcore_core::sockaddr::parse_listen_addr(&sbi.host, sbi.port)
@@ -600,22 +622,11 @@ pub async fn run() -> Result<()> {
     // naming one of them and the other never heartbeaten. Taking it from the
     // context makes `pcfId == nfInstanceId` true, as the comment above always
     // claimed it was.
-    let nf_instance_id = match nextgcore_sbi::context::global_context()
-        .get_self_instance()
-        .await
-    {
-        Some(instance) => instance.id,
-        None => {
-            // pcf_sbi_open publishes the instance from a spawned task, so on a
-            // very cold start it can lose the race. Falling back to a fresh id
-            // would silently reintroduce the two-id split, so this is loud.
-            log::error!(
-                "PCF self instance not published by pcf_sbi_open; NRF registration and BSF \
-                 pcfId would disagree. Continuing without NRF registration."
-            );
-            String::new()
-        }
-    };
+    // #1479: `pcf_sbi_open` has awaited the publication, so this cannot miss it.
+    // It used to be read here while a spawned task was still publishing, and the
+    // miss was logged and then lived with: no NRF registration for the life of
+    // the process. A miss now fails startup, so it is restarted, not degraded.
+    let nf_instance_id = published_self_instance_id().await?;
     // #1312: only an advertised host is published. With a wildcard bind and
     // nothing to advertise there is no self info, so every callback URI,
     // resourceUri and PcfBinding builder skips (each returns None) rather than
@@ -10026,21 +10037,14 @@ mod tests {
             nrf_uri: Some(format!("http://127.0.0.1:{port}")),
         };
         crate::sbi_path::pcf_sbi_close();
-        crate::sbi_path::pcf_sbi_open(Some(sbi_config)).expect("pcf_sbi_open");
+        crate::sbi_path::pcf_sbi_open(Some(sbi_config))
+            .await
+            .expect("pcf_sbi_open");
 
-        // pcf_sbi_open publishes the self-instance from a spawned task.
-        let mut self_id = None;
-        for _ in 0..200 {
-            if let Some(inst) = nextgcore_sbi::context::global_context()
-                .get_self_instance()
-                .await
-            {
-                self_id = Some(inst.id);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let self_id = self_id.expect("self instance published");
+        // #1479: published before pcf_sbi_open returned, so read it straight away.
+        let self_id = published_self_instance_id()
+            .await
+            .expect("self instance published");
 
         // Give any stray registration from pcf_sbi_open time to land, so the
         // count below would catch it rather than racing past it.
