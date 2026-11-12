@@ -214,9 +214,20 @@ fn context(id: &str) -> Ctx {
     Arc::new(RwLock::new(ctx))
 }
 
-/// The MTLF: the real create handler and artefact routes on `ctx`. With
-/// `flip`, the model body has its last byte flipped (the revert arm).
-async fn mtlf_server(ctx: Ctx, flip: bool) -> (nextgcore_sbi::SbiServer, u16) {
+/// How the test MTLF misbehaves when serving the model body.
+#[derive(Clone, Copy, PartialEq)]
+enum Serve {
+    Honest,
+    /// The last byte flipped (the ticket's revert arm).
+    Flip,
+    /// A body over `MAX_MODEL_BYTES`.
+    Oversize,
+    /// No answer for 30 s.
+    Stall,
+}
+
+/// The MTLF: the real create handler and artefact routes on `ctx`.
+async fn mtlf_server(ctx: Ctx, serve: Serve) -> (nextgcore_sbi::SbiServer, u16) {
     let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
     let server =
         nextgcore_sbi::SbiServer::on_listener(nextgcore_sbi::SbiServerConfig::new(addr), listener);
@@ -226,6 +237,19 @@ async fn mtlf_server(ctx: Ctx, flip: bool) -> (nextgcore_sbi::SbiServer, u16) {
             async move {
                 let path = req.header.uri.split('?').next().unwrap_or("").to_string();
                 let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+                let model_get = parts.len() == 5
+                    && parts[2] == "models"
+                    && !parts[4].ends_with(crate::model_store::MANIFEST_SUFFIX);
+                if model_get && serve == Serve::Stall {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+                if model_get && serve == Serve::Oversize {
+                    let mut r = SbiResponse::with_status(200);
+                    r.http
+                        .set_header("Content-Type", crate::onnx_export::ONNX_CONTENT_TYPE);
+                    r.http.binary_content = Some(vec![0u8; MAX_MODEL_BYTES + 1].into());
+                    return r;
+                }
                 let guard = ctx.read().unwrap();
                 match parts.as_slice() {
                     ["nnwdaf-mlmodelprovision", "v1", "subscriptions"] => {
@@ -236,7 +260,7 @@ async fn mtlf_server(ctx: Ctx, flip: bool) -> (nextgcore_sbi::SbiServer, u16) {
                     ["nnwdaf-mlmodelprovision", "v1", "models", ev, art] => {
                         let mut resp =
                             crate::sbi_handler::handle_ml_model_download_with_ctx(&guard, ev, art);
-                        if flip && !art.ends_with(crate::model_store::MANIFEST_SUFFIX) {
+                        if serve == Serve::Flip && model_get {
                             if let Some(b) = resp.http.binary_content.take() {
                                 let mut b = b.to_vec();
                                 let last = b.len() - 1;
@@ -308,7 +332,7 @@ fn ewma_anlf(id: &str) -> Ctx {
 #[tokio::test]
 async fn the_anlf_subscribes_verifies_and_loads_v1_then_v2() {
     let mtlf_ctx = context("mtlf-468");
-    let (mtlf, mtlf_port) = mtlf_server(mtlf_ctx.clone(), false).await;
+    let (mtlf, mtlf_port) = mtlf_server(mtlf_ctx.clone(), Serve::Honest).await;
     mtlf_ctx
         .read()
         .unwrap()
@@ -382,24 +406,31 @@ async fn the_anlf_subscribes_verifies_and_loads_v1_then_v2() {
     anlf_srv.stop().await.unwrap();
 }
 
-/// The revert arm: a one-byte-flipped artefact is refused (sha256 mismatch)
-/// and the AnLF keeps the model it had.
-#[tokio::test]
-async fn a_flipped_byte_is_refused_and_the_model_kept() {
-    let mtlf_ctx = context("mtlf-468-flip");
-    let (mtlf, mtlf_port) = mtlf_server(mtlf_ctx.clone(), true).await;
-    let base = format!("http://127.0.0.1:{mtlf_port}");
+/// An MTLF serving `serve`, an AnLF subscribed to it running its own (EWMA)
+/// model, and the v1 URL.
+async fn misbehaving(
+    serve: Serve,
+    tag: &str,
+) -> (nextgcore_sbi::SbiServer, &'static Anlf, Ctx, Ctx, String) {
+    let mtlf_ctx = context(&format!("mtlf-{tag}"));
+    let (mtlf, port) = mtlf_server(mtlf_ctx.clone(), serve).await;
     let anlf: &'static Anlf = Box::leak(Box::new(Anlf::new()));
-    let anlf_ctx = ewma_anlf("anlf-468-flip");
+    anlf.set_mtlf("127.0.0.1", port);
     let url = mtlf_ctx
         .read()
         .unwrap()
         .current_model_version()
         .unwrap()
-        .url(&base, AnalyticsId::NfLoad);
+        .url(&format!("http://127.0.0.1:{port}"), AnalyticsId::NfLoad);
+    (mtlf, anlf, ewma_anlf(&format!("anlf-{tag}")), mtlf_ctx, url)
+}
 
-    let refusal = fetch_verify_load(anlf, &anlf_ctx, &url).await.unwrap_err();
-    assert_eq!(refusal.kind(), "sha256 mismatch");
+/// The refusal for one misbehaviour, with the AnLF's model unchanged.
+async fn refused(serve: Serve, tag: &str, timeout: Duration) -> Refusal {
+    let (mtlf, anlf, anlf_ctx, _mtlf_ctx, url) = misbehaving(serve, tag).await;
+    let refusal = fetch_verify_load(anlf, &anlf_ctx, &url, 1, timeout)
+        .await
+        .unwrap_err();
     assert!(anlf.loaded().is_none());
     assert_eq!(anlf.counts(), (0, 1));
     assert!(
@@ -407,6 +438,117 @@ async fn a_flipped_byte_is_refused_and_the_model_kept() {
         "the AnLF still runs its own (EWMA) model"
     );
     mtlf.stop().await.unwrap();
+    refusal
+}
+
+/// The revert arm: a one-byte-flipped artefact is refused (sha256 mismatch)
+/// and the AnLF keeps the model it had.
+#[tokio::test]
+async fn a_flipped_byte_is_refused_and_the_model_kept() {
+    let r = refused(Serve::Flip, "468-flip", FETCH_TIMEOUT).await;
+    assert_eq!(r.kind(), "sha256 mismatch", "{r}");
+}
+
+/// A body over the cap is refused before it is held in memory.
+#[tokio::test]
+async fn an_oversized_model_is_refused() {
+    let r = refused(Serve::Oversize, "468-big", FETCH_TIMEOUT).await;
+    assert_eq!(r.kind(), "unreachable", "{r}");
+    assert!(r.to_string().contains("limit"), "{r}");
+}
+
+/// A stalled MTLF is given up on within the timeout.
+#[tokio::test]
+async fn a_stalled_download_times_out() {
+    let started = Instant::now();
+    let r = refused(Serve::Stall, "468-stall", Duration::from_millis(300)).await;
+    assert_eq!(r.kind(), "unreachable", "{r}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// Only the subscribed MTLF's origin is fetched from.
+#[tokio::test]
+async fn a_model_on_another_host_is_refused() {
+    let (mtlf, anlf, anlf_ctx, _m, url) = misbehaving(Serve::Honest, "468-foreign").await;
+    anlf.set_mtlf("127.0.0.1", 1);
+    let r = fetch_verify_load(anlf, &anlf_ctx, &url, 1, FETCH_TIMEOUT)
+        .await
+        .unwrap_err();
+    assert_eq!(r.kind(), "foreign host", "{r}");
+    assert!(anlf.loaded().is_none());
+    mtlf.stop().await.unwrap();
+}
+
+/// A fetch for an earlier Notify that finishes after a later one is dropped:
+/// a late v1 does not replace v2.
+#[tokio::test]
+async fn a_late_earlier_model_does_not_replace_a_newer_one() {
+    let (mtlf, anlf, anlf_ctx, mtlf_ctx, v1_url) = misbehaving(Serve::Honest, "468-order").await;
+    let base = v1_url.split("/nnwdaf").next().unwrap().to_string();
+    let refit = crate::onnx_export::encode_linear_regressor(&[0.1, 0.2, 0.3, 0.4], 0.02);
+    mtlf_ctx
+        .read()
+        .unwrap()
+        .lock_engine()
+        .set_predictor(Box::new(
+            crate::onnx_model::OnnxLinearRegressor::from_bytes(&refit, "refit").unwrap(),
+        ));
+    let v2 = mtlf_ctx.read().unwrap().current_model_version().unwrap();
+    let (s1, s2) = (anlf.next_seq(), anlf.next_seq());
+    let got = fetch_verify_load(
+        anlf,
+        &anlf_ctx,
+        &v2.url(&base, AnalyticsId::NfLoad),
+        s2,
+        FETCH_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    assert_eq!(got.map(|l| l.version), Some("2".to_string()));
+    let late = fetch_verify_load(anlf, &anlf_ctx, &v1_url, s1, FETCH_TIMEOUT)
+        .await
+        .unwrap();
+    assert_eq!(late, None, "superseded");
+    assert_eq!(anlf.loaded().unwrap().sha256, v2.sha256);
+    assert_eq!(exported_sha(&anlf_ctx), v2.sha256);
+    mtlf.stop().await.unwrap();
+}
+
+/// A golden with no rows, or an output shape other than [rows, 1], is not a
+/// check and is refused.
+#[test]
+fn a_vacuous_golden_is_refused() {
+    let v = published(&[0.1, 0.2, 0.3, 0.4], 0.05);
+    for (input_shape, output_shape, input, output) in [
+        (json!([0, 4]), json!([0, 1]), json!([]), json!([])),
+        (
+            json!([1, 4]),
+            json!([1, 2]),
+            json!([0.1, 0.1, 0.1, 0.1]),
+            json!([0.1, 0.1]),
+        ),
+        (
+            json!([4]),
+            json!([1]),
+            json!([0.1, 0.1, 0.1, 0.1]),
+            json!([0.1]),
+        ),
+    ] {
+        let mut m = v.manifest.clone();
+        m["golden"] = json!([{ "input_shape": input_shape, "input": input,
+                               "output_shape": output_shape, "output": output }]);
+        assert!(
+            matches!(
+                Manifest::from_json(&m.to_string()),
+                Err(Refusal::ManifestInvalid(_))
+            ),
+            "{m}"
+        );
+    }
 }
 
 #[test]

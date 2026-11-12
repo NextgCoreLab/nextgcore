@@ -13,8 +13,9 @@
 //!    (§6.2E.2 step 2: "may include an ML Model accuracy threshold"), retried
 //!    until accepted, under the OAuth2 client when one is configured.
 //! 3. **Takes the Notify** on `/nnwdaf-callback/v1/mtlf-model-notify/{token}`
-//!    on the existing SBI listener (204; an unknown token is 404). The token is
-//!    redacted from logs (`log_redact::CALLBACK_TOKEN_SEGMENTS`).
+//!    on the existing SBI listener (204; an unknown token is 404). The token
+//!    (a v4 UUID, 122 random bits) is redacted from logs
+//!    (`log_redact::CALLBACK_TOKEN_SEGMENTS`).
 //! 4. **Downloads and verifies** `mLFileAddr.mLModelUrl` and
 //!    `<url>.manifest.json` with nextgsim#463's checks, in order: manifest
 //!    shape, sha256 of the bytes, opset and graph inputs/outputs, the ONNX
@@ -25,6 +26,20 @@
 //! # Modes
 //! `retrain` and `no-retrain` select what the MTLF does on an accuracy drop
 //! (PR 4). The AnLF behaves the same in both; this PR logs the mode.
+//!
+//! # Limitation: the callback under OAuth2 enforcement
+//! TS 33.501 §13.4.1 (33501-k20 l.14458): "The OAuth 2.0 framework does not
+//! apply to the notification operation". The callback authenticates by its
+//! 122-bit token (a v4 UUID), and the MTLF sends no bearer. But
+//! `nextgcore-sbi`'s `require_oauth2` checks every route, so an AnLF with
+//! `NEXTGCORE_SBI_OAUTH2_REQUIRE=1` answers the Notify with 401 and never gets
+//! a model. That is nextgcore#1421, the same as the #465/#466 callbacks, and is
+//! fixed there; until then the AnLF must run without SBI OAuth2 enforcement.
+//!
+//! # Download limits
+//! Models are fetched only from the subscribed MTLF's `host:port`, each GET
+//! (body included) within [`FETCH_TIMEOUT`] and [`MAX_MODEL_BYTES`]. Loads apply
+//! in Notify order: a fetch finished after a later Notify's is dropped.
 //!
 //! # Honesty
 //! The manifest comes from the same MTLF as the bytes, so the sha256 proves the
@@ -63,6 +78,13 @@ pub const DEFAULT_ACCURACY_THRESHOLD: u8 = 70;
 
 /// The event the AnLF asks a model for: the one nwdafd's predictor serves.
 pub const MODEL_EVENT: AnalyticsId = AnalyticsId::NfLoad;
+
+/// The largest model or manifest body the AnLF reads. A real artefact is a few
+/// hundred bytes (the reader caps the window at `MAX_SAMPLES`).
+pub const MAX_MODEL_BYTES: usize = 1024 * 1024;
+
+/// How long one GET (head and body) may take before the model is refused.
+pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The `nwdaf.anlf` block.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,11 +196,24 @@ pub struct Loaded {
 /// The AnLF's state: its callback token, what it loaded, and counters.
 #[derive(Debug)]
 pub struct Anlf {
+    /// A v4 UUID: 122 random bits.
     token: String,
-    loaded: Mutex<Option<Loaded>>,
+    /// What is loaded, and the sequence number of the Notify that loaded it.
+    state: Mutex<LoadState>,
+    /// Sequence numbers handed to Notifies, in arrival order.
+    next_seq: AtomicU64,
+    /// `host:port` of the MTLF subscribed to: the only origin models are
+    /// fetched from.
+    mtlf: Mutex<Option<(String, u16)>>,
     subscribed: AtomicBool,
     verified: AtomicU64,
     refused: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct LoadState {
+    loaded: Option<Loaded>,
+    applied_seq: u64,
 }
 
 impl Default for Anlf {
@@ -191,7 +226,9 @@ impl Anlf {
     pub fn new() -> Self {
         Self {
             token: uuid::Uuid::new_v4().simple().to_string(),
-            loaded: Mutex::new(None),
+            state: Mutex::new(LoadState::default()),
+            next_seq: AtomicU64::new(0),
+            mtlf: Mutex::new(None),
             subscribed: AtomicBool::new(false),
             verified: AtomicU64::new(0),
             refused: AtomicU64::new(0),
@@ -208,10 +245,25 @@ impl Anlf {
     }
 
     pub fn loaded(&self) -> Option<Loaded> {
-        self.loaded
+        self.state
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+            .loaded
             .clone()
+    }
+
+    /// The next Notify sequence number (1, 2, ...).
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Record the MTLF subscribed to; models are fetched only from it.
+    pub fn set_mtlf(&self, host: &str, port: u16) {
+        *self.mtlf.lock().unwrap_or_else(|p| p.into_inner()) = Some((host.to_string(), port));
+    }
+
+    fn mtlf(&self) -> Option<(String, u16)> {
+        self.mtlf.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     pub fn counts(&self) -> (u64, u64) {
@@ -380,6 +432,7 @@ pub async fn subscribe_once(
         .is_some_and(|f| {
             crate::ml_service::supp_feats_has(f, crate::ml_service::FEATURE_MODEL_PROVISION_EXT)
         });
+    anlf.set_mtlf(&target.host, target.port);
     anlf.subscribed.store(true, Ordering::Relaxed);
     if ext {
         nextgcore_demo::demo_log!(
@@ -492,8 +545,11 @@ pub fn handle_model_notify(
     };
     for url in urls {
         let ctx = ctx.clone();
+        // Numbered in arrival order, so a slow earlier fetch cannot replace a
+        // model a later Notify already loaded.
+        let seq = anlf.next_seq();
         tokio::spawn(async move {
-            let _ = fetch_verify_load(anlf, &ctx, &url).await;
+            let _ = fetch_verify_load(anlf, &ctx, &url, seq, FETCH_TIMEOUT).await;
         });
     }
     SbiResponse::with_status(204)
@@ -503,6 +559,8 @@ pub fn handle_model_notify(
 /// applies to a `LinearRegressor` read without ONNX Runtime).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Refusal {
+    /// The URL names another origin than the MTLF subscribed to.
+    ForeignHost(String),
     Unreachable(String),
     ManifestInvalid(String),
     Sha256Mismatch {
@@ -526,6 +584,7 @@ impl Refusal {
     /// The short form logged in `model refused (<kind>)`.
     pub fn kind(&self) -> &'static str {
         match self {
+            Refusal::ForeignHost(_) => "foreign host",
             Refusal::Unreachable(_) => "unreachable",
             Refusal::ManifestInvalid(_) => "manifest invalid",
             Refusal::Sha256Mismatch { .. } => "sha256 mismatch",
@@ -540,7 +599,10 @@ impl Refusal {
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Refusal::Unreachable(e) | Refusal::ManifestInvalid(e) | Refusal::NotOnnx(e) => {
+            Refusal::ForeignHost(e)
+            | Refusal::Unreachable(e)
+            | Refusal::ManifestInvalid(e)
+            | Refusal::NotOnnx(e) => {
                 write!(f, "{}: {e}", self.kind())
             }
             Refusal::SignatureMismatch(e) => write!(f, "{}: {e}", self.kind()),
@@ -622,6 +684,18 @@ impl Manifest {
             return bad("golden must hold at least one vector".into());
         }
         for (i, g) in m.golden.iter().enumerate() {
+            // One row of `width` inputs per output, at least one row: a
+            // zero-row golden would make the golden check vacuous.
+            let shaped = matches!(
+                (g.input_shape.as_slice(), g.output_shape.as_slice()),
+                ([r, w], [ro, 1]) if *r >= 1 && *w >= 1 && ro == r
+            );
+            if !shaped {
+                return bad(format!(
+                    "golden[{i}] shapes {:?} -> {:?} are not [rows>=1, n] -> [rows, 1]",
+                    g.input_shape, g.output_shape
+                ));
+            }
             for (what, shape, len) in [
                 ("input", &g.input_shape, g.input.len()),
                 ("output", &g.output_shape, g.output.len()),
@@ -704,48 +778,80 @@ pub fn verify(
     Ok(model)
 }
 
-/// Fetch `url` and `<url>.manifest.json` from the MTLF.
-pub async fn fetch(url: &str) -> Result<(Vec<u8>, String), Refusal> {
+/// Fetch `url` and `<url>.manifest.json` from the MTLF: each GET, body
+/// included, within `timeout`, and each body within [`MAX_MODEL_BYTES`].
+pub async fn fetch(url: &str, timeout: Duration) -> Result<(Vec<u8>, String), Refusal> {
     let (host, port, path) = crate::notification_dispatcher::parse_notify_uri(url)
         .ok_or_else(|| Refusal::Unreachable(format!("{url:?} is not an http(s) URL")))?;
-    let c = client(&host, port);
-    let model = c
-        .get(&path)
-        .await
-        .map_err(|e| Refusal::Unreachable(format!("GET model: {e}")))?;
-    if model.status != 200 {
-        return Err(Refusal::Unreachable(format!(
-            "GET model answered {}",
-            model.status
-        )));
+    let mut c = nextgcore_sbi::SbiClient::new(
+        nextgcore_sbi::SbiClientConfig::new(&host, port)
+            .with_connect_timeout(timeout)
+            .with_request_timeout(timeout)
+            .with_max_response_body(MAX_MODEL_BYTES),
+    );
+    if let Some(oauth2) = crate::oauth2_client() {
+        c = c.with_oauth2(oauth2, nextgcore_sbi::types::NfType::Nwdaf);
     }
+    let get = |what: &'static str, path: String| {
+        let c = &c;
+        async move {
+            match tokio::time::timeout(timeout, c.get(&path)).await {
+                Err(_) => Err(Refusal::Unreachable(format!(
+                    "GET {what} did not complete within {timeout:?}"
+                ))),
+                Ok(Err(e)) => Err(Refusal::Unreachable(format!("GET {what}: {e}"))),
+                Ok(Ok(r)) if r.status != 200 => Err(Refusal::Unreachable(format!(
+                    "GET {what} answered {}",
+                    r.status
+                ))),
+                Ok(Ok(r)) => Ok(r),
+            }
+        }
+    };
+    let model = get("model", path.clone()).await?;
     let bytes = model
         .http
         .binary_content
         .map(|b| b.to_vec())
         .ok_or_else(|| Refusal::Unreachable("the model is not application/octet-stream".into()))?;
-    let manifest = c
-        .get(&format!("{path}{}", crate::model_store::MANIFEST_SUFFIX))
-        .await
-        .map_err(|e| Refusal::Unreachable(format!("GET manifest: {e}")))?;
-    if manifest.status != 200 {
-        return Err(Refusal::Unreachable(format!(
-            "GET manifest answered {}",
-            manifest.status
-        )));
-    }
+    let manifest = get(
+        "manifest",
+        format!("{path}{}", crate::model_store::MANIFEST_SUFFIX),
+    )
+    .await?;
     Ok((bytes, manifest.http.content.unwrap_or_default()))
 }
 
 /// Fetch, verify and, on a pass, load the model at `url` into `ctx`. A refusal
 /// keeps the model in use.
+///
+/// `seq` is the Notify's arrival number ([`Anlf::next_seq`]): a result older
+/// than the model already loaded is dropped (`Ok(None)`), so a late v1 cannot
+/// replace v2. Only the subscribed MTLF's `host:port` is fetched from.
 pub async fn fetch_verify_load(
     anlf: &Anlf,
     ctx: &RwLock<NwdafContext>,
     url: &str,
-) -> Result<Loaded, Refusal> {
+    seq: u64,
+    timeout: Duration,
+) -> Result<Option<Loaded>, Refusal> {
     let outcome = async {
-        let (bytes, manifest) = fetch(url).await?;
+        let origin = crate::notification_dispatcher::parse_notify_uri(url)
+            .map(|(h, p, _)| (h, p))
+            .ok_or_else(|| Refusal::Unreachable(format!("{url:?} is not an http(s) URL")))?;
+        match anlf.mtlf() {
+            Some(mtlf) if mtlf == origin => {}
+            mtlf => {
+                return Err(Refusal::ForeignHost(format!(
+                    "{}:{} is not the subscribed MTLF {}",
+                    origin.0,
+                    origin.1,
+                    mtlf.map(|(h, p)| format!("{h}:{p}"))
+                        .unwrap_or_else(|| "(none)".into())
+                )))
+            }
+        }
+        let (bytes, manifest) = fetch(url, timeout).await?;
         let manifest = Manifest::from_json(&manifest)?;
         let model = verify(&bytes, &manifest)?;
         Ok::<_, Refusal>((manifest, model))
@@ -763,14 +869,37 @@ pub async fn fetch_verify_load(
                 sha256: manifest.sha256.clone(),
                 url: url.to_string(),
             };
-            if anlf.loaded().is_some_and(|l| l.sha256 == loaded.sha256) {
-                return Ok(loaded);
+            // Check the order and swap under one lock, so two fetches that
+            // finish together apply in Notify order.
+            let mut state = anlf.state.lock().unwrap_or_else(|p| p.into_inner());
+            if seq < state.applied_seq {
+                nextgcore_demo::demo_log!(
+                    info,
+                    DEMO_KEY,
+                    "model v{} from {url} superseded by a later notify; keeping v{}",
+                    loaded.version,
+                    state
+                        .loaded
+                        .as_ref()
+                        .map(|l| l.version.as_str())
+                        .unwrap_or("?")
+                );
+                return Ok(None);
+            }
+            state.applied_seq = seq;
+            if state
+                .loaded
+                .as_ref()
+                .is_some_and(|l| l.sha256 == loaded.sha256)
+            {
+                return Ok(Some(loaded));
             }
             {
                 let guard = ctx.read().unwrap_or_else(|p| p.into_inner());
                 guard.lock_engine().set_predictor(Box::new(model));
             }
-            *anlf.loaded.lock().unwrap_or_else(|p| p.into_inner()) = Some(loaded.clone());
+            state.loaded = Some(loaded.clone());
+            drop(state);
             anlf.verified.fetch_add(1, Ordering::Relaxed);
             nextgcore_demo::demo_log!(
                 info,
@@ -779,7 +908,7 @@ pub async fn fetch_verify_load(
                 loaded.version,
                 loaded.sha256
             );
-            Ok(loaded)
+            Ok(Some(loaded))
         }
         Err(refusal) => {
             anlf.refused.fetch_add(1, Ordering::Relaxed);

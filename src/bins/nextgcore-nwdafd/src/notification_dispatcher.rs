@@ -681,6 +681,20 @@ pub async fn dispatch_notifications(ctx: Arc<RwLock<NwdafContext>>) {
 /// nothing is sent, since an `MLEventNotif` must carry a model address.
 /// This reuses the same URI parsing + client plumbing as the analytics path.
 pub(crate) async fn dispatch_ml_prov_notifications(ctx: Arc<RwLock<NwdafContext>>) {
+    dispatch_ml_prov_notifications_as(ctx, crate::role::current()).await;
+}
+
+/// [`dispatch_ml_prov_notifications`] for a given role. An AnLF-only NWDAF
+/// (nextgsim#468) contains no MTLF, so it notifies nothing, not even
+/// subscriptions restored from a snapshot it wrote as `both`: their URLs would
+/// 404 on this instance.
+pub(crate) async fn dispatch_ml_prov_notifications_as(
+    ctx: Arc<RwLock<NwdafContext>>,
+    role: crate::role::Role,
+) {
+    if !role.serves_mtlf() {
+        return;
+    }
     // The model URL must resolve back to this NF, and is only emitted when the
     // active predictor is actually exportable (issue #109). Both are read once
     // here, under the same guard as the pending list, rather than per
@@ -1814,6 +1828,19 @@ mod ml_prov_version_tests {
         dispatch_ml_prov_notifications(ctx.clone()).await;
         assert!(seen.lock().unwrap().is_empty());
         assert!(ctx.read().unwrap().current_model_version().is_none());
+        server.stop().await.expect("stop");
+    }
+
+    /// nextgsim#468: an AnLF-only NWDAF does not notify its (restored)
+    /// ML-provision subscriptions; the same context as an MTLF does.
+    #[tokio::test]
+    async fn an_anlf_role_dispatches_no_ml_provision_notifies() {
+        let (server, port, seen) = consumer().await;
+        let ctx = mtlf(port, "mlsub-468-role");
+        dispatch_ml_prov_notifications_as(ctx.clone(), crate::role::Role::Anlf).await;
+        assert!(seen.lock().unwrap().is_empty());
+        dispatch_ml_prov_notifications_as(ctx.clone(), crate::role::Role::Mtlf).await;
+        assert_eq!(seen.lock().unwrap().len(), 1);
         server.stop().await.expect("stop");
     }
 
