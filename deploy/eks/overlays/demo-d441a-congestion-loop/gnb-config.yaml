@@ -1,0 +1,46 @@
+# nextgsim k8s/configmap.yaml's gnb.yaml, plus the D441A exporter block
+# (nextgsim#465). A ConfigMap value is one string, so the whole file is
+# replaced: keep the first part in step with nextgsim's k8s/configmap.yaml.
+#
+# congestion_export is read only while the demo is active (a gNB built with
+# --features demo-d441a-congestion-loop and the demo: block on, merged in by the
+# demo post-render). C = 5 Mbps (a simulator construct); the downlink FIFO's
+# 200 kB limit is 320 ms at C. The exporter registers at the NRF as an AF with
+# nf_instance_id below, generates its own CCA key, and publishes the public JWK
+# in /tmp/d441a-cca/, from where scenario.sh hands it to the NRF.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nextgsim-configs
+  namespace: nextg-system
+data:
+  gnb.yaml: |
+    # gNB Configuration for Kubernetes deployment
+    nci: 0x000000010
+    gnb_id_length: 32
+    plmn:
+      mcc: 999
+      mnc: 70
+      long_mnc: false
+    tac: 1
+    nssai:
+      - sst: 1
+        sd: null
+    amf_configs:
+      - address: amf.nextg-system.svc.cluster.local
+        port: 38412
+    link_ip: 0.0.0.0
+    ngap_ip: 0.0.0.0
+    gtp_ip: 0.0.0.0
+    ignore_stream_ids: false
+    upf_addr: upf.nextg-system.svc.cluster.local
+    upf_port: 2152
+    congestion_export:
+      cell_capacity_mbps: 5.0
+      queue_limit_bytes: 200000
+      window_ms: 1000
+      prediction_horizon_ms: 5000
+      nrf_uri: http://nrf.nextg-system.svc.cluster.local:7777
+      nf_instance_id: 6b1d7e3c-0000-4000-8000-00000000465a
+      cca_key_file: /tmp/d441a-cca/exporter.key
+      cca_public_jwk_dir: /tmp/d441a-cca

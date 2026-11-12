@@ -27,6 +27,12 @@ path = "src/lib.rs"
 ## ignored (only an inert raw-YAML field capture is unconditional).
 ## Enable with: cargo build -p nextgcore-pcfd --features intent-loop
 intent-loop = []
+## nextgsim#465 (demo d441a-congestion-loop): the User Data Congestion
+## Session-AMBR controller (TS 23.503 §6.1.1.3) and the per-session override
+## layer every subscription-derived SM policy decision consults. Active only
+## with the demo: block on and a pcf.congestion_loop block. Off by default; a
+## build without it has neither, and its decisions are built exactly as before.
+demo-d441a-congestion-loop = ["intent-loop"]
 
 [dependencies]
 nextgcore-core = { workspace = true }
@@ -34,6 +40,9 @@ nextgcore-sbi = { workspace = true }
 nextgcore-metrics = { workspace = true }
 nextgcore-dbi = { workspace = true }
 nextgcore-app = { workspace = true }
+# The demo: config block (nextgsim#458). Read by every build, so a demo block
+# naming a demo this build was not compiled with fails start-up.
+nextgcore-demo = { workspace = true }
 # Wave-6 E4: the UE-policy-delivery (UPDP) codec (TS 24.501 Annex D +
 # TS 24.526 §5.2) lives in nextgcore-nas; pcfd encodes the MANAGE UE POLICY
 # COMMAND it delivers over Namf N1N2 through it (item E2).

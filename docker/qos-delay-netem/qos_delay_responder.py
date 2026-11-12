@@ -7,17 +7,50 @@ namespace whose link carries the injected netem delay.
 - GTP-U Echo responder (TS 29.281 §7.2.2) on UDP <addr>:2152: answers an Echo
   Request with an Echo Response carrying the same sequence number and a
   Recovery IE.
-Usage: qos_delay_responder.py <addr>
+- #1389 part 3: a stand-in NG-RAN for per QoS flow QoS monitoring, on the same
+  GTP-U socket. A downlink G-PDU on TEID 0x2002 whose PDU Session Container has
+  QMP set (TS 38.415 §5.5.2.1) is answered at once with a dummy uplink G-PDU (no
+  T-PDU, TS 29.281 §5.2.2.7) on TEID 0x1001 carrying QMP, T1 repeated, T2 (DL
+  received), T3 (UL sent) and the stated RAN DL/UL Delay Results (§5.5.2.2),
+  the way nextgsim's gNB does with `qos_monitoring.ran_*_delay_ms` set. The RAN
+  delays are configured values, not measurements.
+Usage: qos_delay_responder.py <addr> [<ran-dl-ms> <ran-ul-ms>]
 """
 import selectors, socket, struct, sys, time
 
 ADDR = sys.argv[1]
+RAN_DL = int(sys.argv[2]) if len(sys.argv) > 3 else 0
+RAN_UL = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+DL_TEID, UL_TEID = 0x2002, 0x1001
 NTP_OFFSET = 2208988800
 
 
 def ntp64():
     t = time.time() + NTP_OFFSET
     return (int(t) << 32) | int((t - int(t)) * (1 << 32))
+
+
+def qmp_answer(sock, pkt, peer):
+    t2 = ntp64()
+    teid = struct.unpack("!I", pkt[4:8])[0]
+    n = pkt[12] * 4
+    c = pkt[13:12 + n - 1]
+    if teid != DL_TEID or len(c) < 2 or c[0] >> 4 != 0 or not c[0] & 0x08:
+        return
+    qfi = c[1] & 0x3F
+    at = 3 if c[1] & 0x80 else 2  # skip the PPI octet when PPP is set
+    t1 = c[at:at + 8]
+    tpdu = len(pkt) - 12 - n
+    ind = 0x04 | 0x02  # DL and UL Delay Ind.
+    content = bytes([0x10 | 0x08 | ind, qfi]) + t1 + struct.pack("!Q", t2)
+    t3 = ntp64()
+    content += struct.pack("!QII", t3, RAN_DL, RAN_UL)
+    while (len(content) + 2) % 4:
+        content += b"\x00"
+    ext = bytes([(len(content) + 2) // 4]) + content + b"\x00"
+    hdr = struct.pack("!BBHI", 0x34, 0xFF, 4 + len(ext), UL_TEID) + b"\x00\x00\x00\x85"
+    sock.sendto(hdr + ext, peer)
+    print(f"QMP qfi={qfi} tpdu={tpdu} answered", flush=True)
 
 
 stamp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -48,6 +81,9 @@ while True:
             r[4:12] = struct.pack("!Q", ntp64())
             sock.sendto(bytes(r), peer)
         else:
+            if len(pkt) >= 16 and pkt[1] == 0xFF and pkt[0] & 0x04 and pkt[11] == 0x85:
+                qmp_answer(sock, pkt, peer)
+                continue
             # GTPv1-U, E/S/PN flags; Echo Request = type 1 with S set.
             if len(pkt) < 12 or pkt[1] != 1:
                 continue

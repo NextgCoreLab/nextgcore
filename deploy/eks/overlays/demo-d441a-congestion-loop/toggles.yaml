@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nextg-demo-toggles
+data:
+  key: d441a-congestion-loop
+  targets: gnb.yaml nwdaf.yaml pcf.yaml

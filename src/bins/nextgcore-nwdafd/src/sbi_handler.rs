@@ -552,6 +552,20 @@ pub async fn handle_analytics_info_query_with_ctx(
     if analytics_id == AnalyticsId::UeMobility {
         return ue_mobility_response(ctx, target_ue.as_ref(), target_period, now);
     }
+    // nextgsim#465: USER_DATA_CONGESTION from RAN cell reports.
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    if analytics_id == AnalyticsId::UserDataCongestion {
+        return crate::ran_congestion::udc_response(
+            crate::ran_congestion::store(),
+            target_ue.as_ref().is_some_and(|t| t.any_ue),
+            target_ue
+                .as_ref()
+                .is_some_and(TargetUeInfo::names_specific_ues),
+            params.get("event-filter").map(String::as_str),
+            target_period.map(|p| (p.start, p.end, p.is_statistics(now))),
+            now,
+        );
+    }
 
     // event-filter (G2-1): nfInstanceIds/nfTypes are honored; malformed JSON
     // fails closed with 400.

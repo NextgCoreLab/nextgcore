@@ -3070,6 +3070,7 @@ dependencies = [
  "nextgcore-bsfd",
  "nextgcore-core",
  "nextgcore-dbi",
+ "nextgcore-demo",
  "nextgcore-metrics",
  "nextgcore-nas",
  "nextgcore-sbi",

@@ -34,6 +34,10 @@ pub mod onnx_export; // issue #109: export the active model as an ONNX artefact
                      // the `onnx-model` feature.
 pub mod model_store; // nextgsim#468: versioned, content-addressed model artefacts
 pub mod onnx_model; // issue #26: zero-dep ONNX LinearRegressor subset backend
+
+/// nextgsim#465: USER_DATA_CONGESTION from RAN cell reports.
+#[cfg(feature = "demo-d441a-congestion-loop")]
+pub mod ran_congestion;
 mod sbi_handler;
 
 pub use context::*;
@@ -271,6 +275,13 @@ async fn main() -> Result<()> {
         amf_mobility::install(plan);
         plan
     };
+    // nextgsim#465: the ingest route and USER_DATA_CONGESTION, decided once here,
+    // before the NRF registration, like UE_MOBILITY above.
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    ran_congestion::install(
+        nextgcore_demo::active_mode(ran_congestion::DEMO_KEY),
+        &args.nrf_uri,
+    );
 
     // Issue #187: the flag seeds the shared resolver (so it still wins) and the
     // fallback resolves there rather than minting an id no operator can pin.
@@ -464,6 +475,12 @@ async fn main() -> Result<()> {
     // AMF discovered at the NRF, retried in the background until it is accepted;
     // and this NWDAF's /metrics. Mode `baseline` and the default plan do neither
     // subscription nor serving; a default build has neither.
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    ran_congestion::set_amf_sub_context(ran_congestion::AmfSubContext {
+        nrf_uri: args.nrf_uri.clone(),
+        sbi_base: sbi_base.clone(),
+        nf_id: nf_instance_id.clone(),
+    });
     #[cfg(feature = "amf-mobility")]
     {
         if amf_mobility_plan.serves() {
@@ -598,6 +615,29 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             }
         }
 
+        // nextgsim#465 (non-normative): RAN cell reports from the gNB, standing in
+        // for OAM PM (TS 23.288 §6.2.3). The route checks its own OAuth2 token.
+        #[cfg(feature = "demo-d441a-congestion-loop")]
+        ["nnwdaf-randata", "v1", "cell-reports"] => match method {
+            "POST" => ran_congestion::handle_cell_report(&request).await,
+            _ => send_method_not_allowed(method, "cell-reports"),
+        },
+        // nextgsim#465: the AMF's UES_IN_AREA_REPORT notify, on the
+        // eventNotifyUri this NWDAF gave it (token-authenticated like #466's).
+        #[cfg(feature = "demo-d441a-congestion-loop")]
+        ["nnwdaf-callback", "v1", segment, token]
+            if *segment == ran_congestion::CALLBACK_SEGMENT =>
+        {
+            match method {
+                "POST" => ran_congestion::handle_ues_in_area_notify(
+                    ran_congestion::store(),
+                    token,
+                    &request,
+                ),
+                _ => send_method_not_allowed(method, "amf-ues-in-area-notify/{token}"),
+            }
+        }
+
         // Issue #16 (non-normative 6G ISAC, no frozen Stage-3): sensing-result
         // collection endpoint, feature-gated and off by default.
         #[cfg(feature = "sensing")]
@@ -652,12 +692,28 @@ fn build_nf_profile(
     if AnalyticsId::UeMobility.is_served_by_analytics_info() {
         advertise_analytics_info_event(&mut nwdaf_info, AnalyticsId::UeMobility);
     }
+    // nextgsim#465: USER_DATA_CONGESTION likewise, only while served, and only in
+    // `eventIds` (the EventsSubscription surface does not serve it).
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    if AnalyticsId::UserDataCongestion.is_served_by_analytics_info() {
+        advertise_analytics_info_event(&mut nwdaf_info, AnalyticsId::UserDataCongestion);
+    }
 
     let can_provision = nwdaf_self()
         .read()
         .map(|ctx| ctx.can_provision_model())
         .unwrap_or(false);
-    let services = nwdaf_services(nf_instance_id, sbi_addr, sbi_port, can_provision);
+    #[allow(unused_mut)]
+    let mut services = nwdaf_services(nf_instance_id, sbi_addr, sbi_port, can_provision);
+    // nextgsim#465: the ingest service, so the NRF can grant its token.
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    if ran_congestion::serving() {
+        services.push(ran_congestion::nf_service(
+            nf_instance_id,
+            sbi_addr,
+            sbi_port,
+        ));
+    }
 
     nextgcore_sbi::nf_addressing::classify_profile_host(
         serde_json::json!({
@@ -823,7 +879,12 @@ fn config_root(config_path: &str) -> Result<serde_yaml::Value, String> {
 /// The demos this build can run: `d441c-amf-mobility` under the `amf-mobility`
 /// feature, none otherwise.
 fn demo_registry() -> nextgcore_demo::DemoRegistry {
-    #[cfg(feature = "amf-mobility")]
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    return nextgcore_demo::DemoRegistry::new(&[
+        amf_mobility::DEMO_SPEC,
+        ran_congestion::DEMO_SPEC,
+    ]);
+    #[cfg(all(feature = "amf-mobility", not(feature = "demo-d441a-congestion-loop")))]
     return nextgcore_demo::DemoRegistry::new(&[amf_mobility::DEMO_SPEC]);
     #[cfg(not(feature = "amf-mobility"))]
     nextgcore_demo::DemoRegistry::default()
@@ -839,6 +900,8 @@ fn render_prometheus() -> String {
         nrf_client: true,
     });
     amf_mobility::render_metrics(&mut out);
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    ran_congestion::render_metrics(&mut out);
     out
 }
 

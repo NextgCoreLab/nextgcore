@@ -28,6 +28,15 @@ onnx-model = []
 ## /metrics (NEXTGCORE_METRICS_BIND, loopback by default; NWDAF_METRICS_PORT).
 ## Off by default; a default build has neither the route nor the listener.
 amf-mobility = []
+## nextgsim#465 (demo d441a-congestion-loop): USER_DATA_CONGESTION analytics
+## (TS 23.288 §6.8) from RAN cell reports. A non-normative ingest route,
+## POST /nnwdaf-randata/v1/cell-reports, on the existing SBI listener, which
+## verifies an NRF-issued OAuth2 token (scope nnwdaf-randata) itself; a
+## UES_IN_AREA_REPORT subscription at the AMF per reported TAI (on #466's
+## Namf_EventExposure client, hence amf-mobility); and the
+## Nnwdaf_AnalyticsInfo USER_DATA_CONGESTION arm. Active only with the demo:
+## block on as well. Off by default.
+demo-d441a-congestion-loop = ["amf-mobility"]
 
 [dependencies]
 nextgcore-core = { workspace = true }

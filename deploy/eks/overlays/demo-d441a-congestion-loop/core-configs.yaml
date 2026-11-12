@@ -1,0 +1,78 @@
+# D441A core configs (nextgsim#465). A ConfigMap value is one string, so each
+# file is replaced whole: keep the first part of each in step with
+# k8s/manifests/configmap.yaml.
+#
+#   nrf.yaml  trusts the CCA public keys in /etc/nextgcore/cca-trusted, where
+#             scenario.sh publishes the gNB exporter's own JWK (nrf-cca.yaml);
+#             the NRF re-reads the directory on an unknown issuer (#187), so a
+#             key published after the NRF started is found.
+#   pcf.yaml  gains pcf.congestion_loop: the AoI (the gNB's cell, NCI 0x010),
+#             UE-V (imsi-...001) protected, UE-B (imsi-...002) best effort,
+#             throttle to 1000 kbps at congLevel >= 80, restore below 10.
+#             With C = 5 Mbps a throttled UE-B (1 Mbps) is about 20 % plus UE-V's
+#             pings, inside the band, so the restore waits for UE-B to stop.
+#
+# The demo: block is merged into pcf.yaml (and gnb.yaml, nwdaf.yaml) at render
+# time by the demo post-render (toggles.yaml), with the run's mode.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nextgcore-configs
+  namespace: nextg-system
+data:
+  nrf.yaml: |
+    logger:
+      file:
+        path: /var/log/nextgcore/nrf.log
+      level: info
+    global:
+      max:
+        ue: 1024
+        peer: 64
+    nrf:
+      serving:
+        - plmn_id:
+            mcc: 999
+            mnc: 70
+      sbi:
+        server:
+          - address: 0.0.0.0
+            advertise: nrf.nextg-system.svc.cluster.local
+            port: 7777
+        oauth2:
+          cca_trusted_keys_dir: /etc/nextgcore/cca-trusted
+  pcf.yaml: |
+    db_uri: mongodb://mongodb.nextg-system.svc.cluster.local:27017/nextgcore
+    logger:
+      file:
+        path: /var/log/nextgcore/pcf.log
+      level: info
+    global:
+      max:
+        ue: 1024
+        peer: 64
+    pcf:
+      sbi:
+        server:
+          - address: 0.0.0.0
+            port: 7777
+        client:
+          nrf:
+            - uri: http://nrf.nextg-system.svc.cluster.local:7777
+      congestion_loop:
+        cells:
+          - {mcc: '999', mnc: '70', nr_cell_id: '000000010'}
+        sst: 1
+        dnn: internet
+        protected_supis: [imsi-999700000000001]
+        best_effort_supis: [imsi-999700000000002]
+        throttle_kbps: 1000
+        floor_kbps: 500
+        throttle_at: 80
+        restore_below: 10
+        restore_after_polls: 3
+        min_hold_secs: 10
+        fail_open_secs: 30
+        max_sessions: 1
+        poll_ms: 1000
+        prediction_horizon_secs: 5

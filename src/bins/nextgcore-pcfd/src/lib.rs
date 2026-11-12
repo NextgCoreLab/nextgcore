@@ -11,7 +11,13 @@
 /// `main.rs` for Wave-6 H1 lib-targetization; the binary is now a thin wrapper
 /// around [`app::run`]. Peer NF crates drive `pcf_sbi_request_handler` (and the
 /// AM/SM/UE-policy sub-handlers below) in-process for strict-peer tests.
+/// nextgsim#465: the per-session Session-AMBR override layer (demo-only).
+#[cfg(feature = "demo-d441a-congestion-loop")]
+pub mod ambr_override;
 pub mod app;
+/// nextgsim#465: the User Data Congestion Session-AMBR controller (demo-only).
+#[cfg(feature = "demo-d441a-congestion-loop")]
+pub mod congestion_loop;
 pub mod context;
 pub mod event;
 /// Issue #24: intent-driven closed-loop policy controller (non-normative 6G

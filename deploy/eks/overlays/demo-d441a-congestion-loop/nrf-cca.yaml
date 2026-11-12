@@ -1,0 +1,10 @@
+# The NRF's CCA trusted-key directory (nextgsim#465). Empty at deploy:
+# scenario.sh copies the JWK the gNB exporter publishes at start-up into this
+# ConfigMap, and the kubelet syncs it into the mounted directory. No private key
+# is in git; the gNB generates its own.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: d441a-cca-trusted
+  namespace: nextg-system
+data: {}

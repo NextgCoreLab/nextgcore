@@ -291,6 +291,12 @@ impl AnalyticsId {
         if *self == Self::UeMobility && crate::amf_mobility::serving() {
             return true;
         }
+        // nextgsim#465: USER_DATA_CONGESTION from RAN cell reports, while the
+        // d441a demo is active.
+        #[cfg(feature = "demo-d441a-congestion-loop")]
+        if *self == Self::UserDataCongestion && crate::ran_congestion::serving() {
+            return true;
+        }
         false
     }
 
