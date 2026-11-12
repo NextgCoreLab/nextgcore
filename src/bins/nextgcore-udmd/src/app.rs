@@ -2422,19 +2422,9 @@ pub async fn handle_ee_subscribe(ue_identity: &str, request: &SbiRequest) -> Sbi
             )
         }
     };
-    let has_moni = ee_sub
-        .get("monitoringConfigurations")
-        .and_then(|v| v.as_object())
-        .map(|m| !m.is_empty())
-        .unwrap_or(false);
-    if !has_moni {
-        return send_bad_request(
-            "monitoringConfigurations is mandatory",
-            Some("MANDATORY_IE_MISSING"),
-        );
-    }
-    // #1438: each configuration's eventType is mandatory (TS 29.503 §6.4.6.2.3)
-    // and is what decides which events this subscriber is sent.
+    // #1438: monitoringConfigurations (M, 1..N, TS 29.503 §6.4.6.2.2) and each
+    // configuration's eventType (M, §6.4.6.2.3) decide which events this
+    // subscriber is sent; one check for both, shared with PATCH.
     if let Err(detail) = crate::context::ee_monitoring_configurations(&ee_sub) {
         return send_bad_request(&detail, Some("MANDATORY_IE_MISSING"));
     }
@@ -2533,9 +2523,14 @@ pub async fn handle_ee_modify(
         sub.callback_reference = cb.to_string();
     }
     // #1438: the monitored event types are cached too, so a patched
-    // monitoringConfigurations must re-derive them, and must stay valid.
+    // monitoringConfigurations must re-derive them, and must stay valid. The
+    // patch leaves a mandatory IE missing, so the cause is the one create uses
+    // for the same body, MANDATORY_IE_MISSING (400, TS 29.500 §5.2.7.2).
+    // §5.5.2.5.2 offers 403 for a modification that "cannot be accepted"; a
+    // patch whose result is malformed is a protocol error rather than a policy
+    // refusal, so 400 is kept and create and PATCH answer alike.
     if let Err(detail) = crate::context::ee_monitoring_configurations(&stored) {
-        return send_bad_request(&detail, Some("INVALID_MSG_FORMAT"));
+        return send_bad_request(&detail, Some("MANDATORY_IE_MISSING"));
     }
     sub.set_raw(stored.to_string());
 

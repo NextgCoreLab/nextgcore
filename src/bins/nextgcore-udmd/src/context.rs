@@ -413,17 +413,22 @@ pub struct EeMonitoringConfiguration {
 
 /// The monitoring configurations of an `EeSubscription` body, in key order (#1438).
 ///
-/// `Err` names the first entry that is not an object with a non-empty string
-/// `eventType`: that IE is mandatory, and a configuration with no event type
-/// cannot be matched against anything.
+/// `Err` when `monitoringConfigurations` is absent, not an object or empty (it is
+/// M, cardinality 1..N, TS 29.503 §6.4.6.2.2), or names the first entry that is
+/// not an object with a non-empty string `eventType` (M, §6.4.6.2.3). Either way
+/// the subscription would monitor nothing, so `Ok` is never empty. Create and
+/// PATCH both validate through here, so they agree on what a valid body is.
 pub fn ee_monitoring_configurations(
     ee_subscription: &serde_json::Value,
 ) -> Result<Vec<EeMonitoringConfiguration>, String> {
     let Some(map) = ee_subscription
         .get("monitoringConfigurations")
         .and_then(|v| v.as_object())
+        .filter(|m| !m.is_empty())
     else {
-        return Ok(Vec::new());
+        return Err(
+            "monitoringConfigurations is mandatory and must be a non-empty map".to_string(),
+        );
     };
     let mut out = Vec::with_capacity(map.len());
     for (reference_id, config) in map {
