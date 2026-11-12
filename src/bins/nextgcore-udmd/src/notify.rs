@@ -110,20 +110,27 @@ pub fn build_modification_notification(supi: &str, event: UeContextEvent) -> Val
 /// Build the `MonitoringReport` body (TS 29.503 §6.4.6.2.x).
 pub fn build_monitoring_report(
     supi: &str,
-    subscription_id: &str,
+    reference_ids: &[&str],
     event: UeContextEvent,
     timestamp: &str,
 ) -> Value {
-    json!({
-        "reportList": [{
-            "referenceId": subscription_id,
-            "eventType": event.ee_event_type(),
-            "report": {
-                "supi": supi,
-                "timeStamp": timestamp,
-            },
-        }],
-    })
+    // #1438: one MonitoringReport per configuration that monitors this event,
+    // each echoing its configuration key as `referenceId` (TS 29.503 §6.4.6.2.4).
+    // This used to echo the subscription id, which is not a key the consumer gave.
+    let reports: Vec<Value> = reference_ids
+        .iter()
+        .map(|reference_id| {
+            json!({
+                "referenceId": reference_id,
+                "eventType": event.ee_event_type(),
+                "report": {
+                    "supi": supi,
+                    "timeStamp": timestamp,
+                },
+            })
+        })
+        .collect();
+    json!({ "reportList": reports })
 }
 
 // The RFC 3339 migration: udmd's own `epoch_to_rfc3339` used to live here. It is
@@ -208,7 +215,23 @@ pub async fn notify_ue_context_change(supi: &str, event: UeContextEvent) -> (usi
     let timestamp = epoch_to_rfc3339(now);
     let mut ee_delivered = 0usize;
     for sub in &ee_subs {
-        let body = build_monitoring_report(supi, &sub.id, event, &timestamp);
+        // #1438 (TS 29.503 §5.5.2.2): a subscriber is sent only the events it
+        // configured. This loop used to post every event to every subscription,
+        // so a LOSS_OF_CONNECTIVITY subscriber heard about every registration.
+        let configurations = sub.configurations_for(event.ee_event_type());
+        if configurations.is_empty() {
+            log::debug!(
+                "EE subscription {} does not monitor {}; not notified",
+                sub.id,
+                event.ee_event_type()
+            );
+            continue;
+        }
+        let reference_ids: Vec<&str> = configurations
+            .iter()
+            .map(|c| c.reference_id.as_str())
+            .collect();
+        let body = build_monitoring_report(supi, &reference_ids, event, &timestamp);
         match crate::sbi_path::udm_sbi_send_callback_notification(&sub.callback_reference, &body)
             .await
         {
@@ -252,6 +275,19 @@ mod tests {
     /// lock that sibling already takes.
     fn notify_env_lock() -> &'static Mutex<()> {
         &crate::test_support::CONTEXT_GUARD
+    }
+
+    /// A real `EeSubscription` body monitoring `(referenceId, eventType)` pairs.
+    fn ee_body(configs: &[(&str, &str)]) -> String {
+        let monitoring: serde_json::Map<String, serde_json::Value> = configs
+            .iter()
+            .map(|(r, e)| (r.to_string(), serde_json::json!({ "eventType": e })))
+            .collect();
+        serde_json::json!({
+            "callbackReference": "http://consumer.example.com/ee",
+            "monitoringConfigurations": monitoring,
+        })
+        .to_string()
     }
 
     /// A stub consumer that records every notification body it is POSTed.
@@ -389,12 +425,13 @@ mod tests {
 
         let r = build_monitoring_report(
             "imsi-001010000000001",
-            "sub-9",
+            &["loc-1"],
             UeContextEvent::AmfDeregistered,
             "2026-09-07T12:00:00Z",
         );
         let report = &r["reportList"][0];
-        assert_eq!(report["referenceId"], "sub-9");
+        // #1438: the configuration key, as the consumer gave it.
+        assert_eq!(report["referenceId"], "loc-1");
         assert_eq!(report["eventType"], "LOSS_OF_CONNECTIVITY");
         assert_eq!(report["report"]["supi"], "imsi-001010000000001");
         assert_eq!(report["report"]["timeStamp"], "2026-09-07T12:00:00Z");
@@ -435,7 +472,7 @@ mod tests {
             guard.ee_subscription_insert(UdmEeSubscription::for_ue(
                 supi,
                 ee_uri.clone(),
-                r#"{"callbackReference":"x","monitoringConfigurations":{}}"#,
+                ee_body(&[("r1", "UE_REACHABILITY_FOR_DATA")]),
             ));
         }
 
@@ -521,7 +558,11 @@ mod tests {
                 Vec::new(),
             ));
             // EE subscription scoped to every UE.
-            guard.ee_subscription_insert(UdmEeSubscription::for_ue("anyUE", uri.clone(), "{}"));
+            guard.ee_subscription_insert(UdmEeSubscription::for_ue(
+                "anyUE",
+                uri.clone(),
+                ee_body(&[("r1", "UE_REACHABILITY_FOR_DATA")]),
+            ));
         }
 
         let (sdm, ee) =
@@ -600,7 +641,11 @@ mod tests {
                 Some(uri.clone()),
                 Vec::new(),
             ));
-            guard.ee_subscription_insert(UdmEeSubscription::for_ue(supi, uri.clone(), "{}"));
+            guard.ee_subscription_insert(UdmEeSubscription::for_ue(
+                supi,
+                uri.clone(),
+                ee_body(&[("r1", "UE_REACHABILITY_FOR_DATA")]),
+            ));
         }
 
         std::env::remove_var("UDM_NOTIFY_DISABLE");

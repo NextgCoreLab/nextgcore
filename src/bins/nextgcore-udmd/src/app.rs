@@ -2433,6 +2433,11 @@ pub async fn handle_ee_subscribe(ue_identity: &str, request: &SbiRequest) -> Sbi
             Some("MANDATORY_IE_MISSING"),
         );
     }
+    // #1438: each configuration's eventType is mandatory (TS 29.503 §6.4.6.2.3)
+    // and is what decides which events this subscriber is sent.
+    if let Err(detail) = crate::context::ee_monitoring_configurations(&ee_sub) {
+        return send_bad_request(&detail, Some("MANDATORY_IE_MISSING"));
+    }
     let sub = UdmEeSubscription::for_ue(ue_identity, callback_reference, body.clone());
     let subscription_id = sub.id.clone();
     {
@@ -2527,7 +2532,12 @@ pub async fn handle_ee_modify(
     if let Some(cb) = stored.get("callbackReference").and_then(|v| v.as_str()) {
         sub.callback_reference = cb.to_string();
     }
-    sub.raw = stored.to_string();
+    // #1438: the monitored event types are cached too, so a patched
+    // monitoringConfigurations must re-derive them, and must stay valid.
+    if let Err(detail) = crate::context::ee_monitoring_configurations(&stored) {
+        return send_bad_request(&detail, Some("INVALID_MSG_FORMAT"));
+    }
+    sub.set_raw(stored.to_string());
 
     let updated = {
         let ctx = udm_self();
@@ -4668,7 +4678,7 @@ mod tests {
                 content: Some(
                     serde_json::json!({
                         "callbackReference": "http://nef.example.org/ee-notify",
-                        "monitoringConfigurations": {"1": {}}
+                        "monitoringConfigurations": {"1": {"eventType": "LOSS_OF_CONNECTIVITY"}}
                     })
                     .to_string(),
                 ),
