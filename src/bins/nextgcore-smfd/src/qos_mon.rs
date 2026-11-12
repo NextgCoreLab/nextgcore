@@ -429,6 +429,16 @@ pub fn retransmit_due(r: &str, attempt: u32) {
     claim_ran(r, |s| s.n2_retransmit = Some(attempt));
 }
 
+/// T3591 expired at `attempt` and a resend of `both` is wanted (as after a path
+/// switch), both before the owner's next pass, for tests (#1390 follow-up).
+#[cfg(test)]
+pub(crate) fn retransmit_due_with_a_new_request_for_test(r: &str, attempt: u32) {
+    claim_ran(r, |s| {
+        s.n2_retransmit = Some(attempt);
+        s.n2_force = true;
+    });
+}
+
 /// Note what the session's RAN leg needs (`note`) and start its owner,
 /// [`drive_ran`], unless one runs: it sees the note on its next pass.
 fn claim_ran(r: &str, note: impl FnOnce(&mut SessionMon)) {
@@ -462,11 +472,14 @@ enum RanStep {
 /// The task owning a session's RAN leg (see [`want_ran`]).
 async fn drive_ran(r: &str) {
     loop {
+        // A retransmission due when a new request is decided is held aside
+        // while the request goes out: a Sent request supersedes it (it re-arms
+        // T3591), a NotSent one does not, and it is resent then.
+        let mut due = None;
         let step = with(|m| {
             let s = m.get_mut(r)?;
-            // A new request supersedes a due retransmission: it re-arms T3591.
             if let Some(want) = ran_wanted(s) {
-                s.n2_retransmit = None;
+                due = s.n2_retransmit.take();
                 return Some(RanStep::Send(want));
             }
             if let Some(attempt) = s.n2_retransmit.take() {
@@ -485,42 +498,70 @@ async fn drive_ran(r: &str) {
             Some(RanStep::Send(want)) => want,
         };
         let outcome = crate::signal_qos_monitoring(r, want).await;
-        let stop = with(|m| {
+        let next = with(|m| {
             let Some(s) = m.get_mut(r) else {
-                return true;
+                return After::Stop;
             };
             match outcome {
                 crate::QosMonitoringSignal::Sent => {
                     s.ran_on = want == QosMonitoringRequest::Both;
                     s.n2_deferred = false;
-                    false
+                    After::Next
                 }
-                // m5: sent from `on_gsm_idle` once the procedure ends.
-                crate::QosMonitoringSignal::Deferred | crate::QosMonitoringSignal::NotSent => {
-                    s.n2_deferred |= outcome == crate::QosMonitoringSignal::Deferred;
-                    // A retransmission that fell due meanwhile is dropped with
-                    // the owner: Deferred means another procedure replaced T3591,
-                    // and otherwise its next expiry asks again.
+                // #1390 follow-up: nothing was armed, so T3591 still runs on the
+                // request before and its retransmission is due: the one held
+                // aside, or a later attempt that fell due during the Send.
+                crate::QosMonitoringSignal::NotSent => match s.n2_retransmit.take().or(due) {
+                    Some(attempt) => After::Resend(attempt),
+                    None => {
+                        s.n2_busy = false;
+                        tidy(m, r);
+                        After::Stop
+                    }
+                },
+                // m5: sent from `on_gsm_idle` once the procedure ends. A
+                // retransmission due is dropped: another procedure replaced
+                // T3591.
+                crate::QosMonitoringSignal::Deferred => {
+                    s.n2_deferred = true;
                     s.n2_retransmit = None;
                     s.n2_busy = false;
                     tidy(m, r);
-                    true
+                    After::Stop
                 }
             }
         });
-        if stop {
-            // Review round 4 m3: the procedure that held the request back may
-            // have ended before `n2_deferred` was set, its `on_gsm_idle` finding
-            // nothing to send. Looked at again now it is set: either that call
-            // or this one sends it.
-            if outcome == crate::QosMonitoringSignal::Deferred
-                && !crate::qos_monitoring_held_back(r)
-            {
-                on_gsm_idle(r);
+        match next {
+            After::Next => {}
+            After::Resend(attempt) => {
+                // Then one more pass: what is wanted may have changed, and a
+                // request NotSent again ends it.
+                crate::retransmit_qos_monitoring(r, attempt).await;
             }
-            return;
+            After::Stop => {
+                // Review round 4 m3: the procedure that held the request back
+                // may have ended before `n2_deferred` was set, its `on_gsm_idle`
+                // finding nothing to send. Looked at again now it is set: either
+                // that call or this one sends it.
+                if outcome == crate::QosMonitoringSignal::Deferred
+                    && !crate::qos_monitoring_held_back(r)
+                {
+                    on_gsm_idle(r);
+                }
+                return;
+            }
         }
     }
+}
+
+/// What [`drive_ran`] does after a request's outcome.
+enum After {
+    /// Look again.
+    Next,
+    /// Resend T3591's armed request at this attempt, then look again.
+    Resend(u32),
+    /// The owner is released.
+    Stop,
 }
 
 /// The session's 5GSM procedure ended (its T3591 / T3592 stopped or was
