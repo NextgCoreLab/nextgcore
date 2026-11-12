@@ -1658,40 +1658,77 @@ pub async fn handle_ml_prov_subscription_delete(subscription_id: &str) -> SbiRes
 }
 
 /// Serve the ML model artefact a `Nnwdaf_MLModelProvision` notification pointed
-/// at (issue #109, TS 29.520 §4.2.2.5).
+/// at (issue #109, TS 29.520 §4.5.2.4.2 `mLFileAddr.mLModelUrl`), or its
+/// manifest.
 ///
-/// Returns the active predictor serialized as an ONNX `ai.onnx.ml
-/// LinearRegressor` — bytes that reproduce this NWDAF's own prediction, not a
-/// stand-in. Before #109 the notified URL was a fabricated `http://nwdaf/...`
-/// that no route served, so a consumer following it got a 404.
+/// The last path segment selects (nextgsim#468):
+/// - `{sha256}`: that model version's ONNX bytes, exactly, for as long as the
+///   version is retained ([`crate::model_store::MAX_RETAINED_VERSIONS`]); then
+///   404. Never another version's bytes.
+/// - `{sha256}.manifest.json`: that version's nextgsim#463 model manifest.
+/// - anything else: the legacy issue #109 `{subscriptionId}` segment, which an
+///   older build notified; it serves the active version.
 ///
-/// A 404 here means this NWDAF's active predictor has no exportable
-/// fixed-window linear form (e.g. EWMA), which is also the state in which the
-/// service is not advertised and no URL is emitted — so a conformant consumer
-/// should never reach this branch.
-pub async fn handle_ml_model_download() -> SbiResponse {
+/// `{event}` must be an `NwdafEvent`. A 404 with no version at all means this
+/// NWDAF's active predictor has no exportable fixed-window linear form (e.g.
+/// EWMA), the state in which the service is not advertised and nothing is
+/// notified.
+pub async fn handle_ml_model_download(event: &str, artefact: &str) -> SbiResponse {
     let ctx = nwdaf_self();
-    let bytes = match ctx.read() {
-        Ok(context) => context.active_model_onnx(),
-        Err(e) => {
-            log::error!("ML model download: failed to read context: {e}");
-            None
-        }
+    let Ok(context) = ctx.read() else {
+        log::error!("ML model download: failed to read context");
+        return send_not_found("ML model store unavailable", Some("MODEL_NOT_AVAILABLE"));
     };
+    handle_ml_model_download_with_ctx(&context, event, artefact)
+}
 
-    match bytes {
-        Some(bytes) => {
-            log::debug!("Serving ONNX model artefact ({} bytes)", bytes.len());
+/// [`handle_ml_model_download`] on a given context.
+pub fn handle_ml_model_download_with_ctx(
+    context: &NwdafContext,
+    event: &str,
+    artefact: &str,
+) -> SbiResponse {
+    if AnalyticsId::from_str(event).is_none() {
+        return send_not_found(
+            &format!("no ML model for event {event:?}"),
+            Some("MODEL_NOT_AVAILABLE"),
+        );
+    }
+    if let Some(sha) = artefact.strip_suffix(crate::model_store::MANIFEST_SUFFIX) {
+        return match context.model_version(sha) {
+            Some(version) => SbiResponse::with_status(200)
+                .with_json_body(&version.manifest)
+                .unwrap_or_else(|_| SbiResponse::with_status(500)),
+            None => send_not_found(
+                &format!("no model manifest {artefact}"),
+                Some("MODEL_NOT_AVAILABLE"),
+            ),
+        };
+    }
+    let version = if crate::model_store::is_sha256_hex(artefact) {
+        context.model_version(artefact)
+    } else {
+        context.current_model_version()
+    };
+    match version {
+        Some(version) => {
+            log::debug!(
+                "Serving ONNX model v{} sha256={} ({} bytes)",
+                version.version,
+                version.sha256,
+                version.bytes.len()
+            );
             let mut response = SbiResponse::with_status(200);
             response
                 .http
                 .set_header("Content-Type", crate::onnx_export::ONNX_CONTENT_TYPE);
-            response.http.binary_content = Some(bytes.into());
+            response.http.binary_content = Some(version.bytes.to_vec().into());
             response
         }
         None => send_not_found(
-            "this NWDAF's active prediction model has no exportable form, so no \
-             model artefact can be provisioned",
+            "no such model version: it was never provisioned here, has been \
+             superseded and evicted, or this NWDAF's active prediction model has \
+             no exportable form",
             Some("MODEL_NOT_AVAILABLE"),
         ),
     }

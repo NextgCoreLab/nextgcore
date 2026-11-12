@@ -32,6 +32,7 @@ pub mod onnx_export; // issue #109: export the active model as an ONNX artefact
                      // and reproduce our own prediction. Reading *operator-supplied* files stays the
                      // opt-in part — the `onnx:<path>` arm of `ml_service::load_model` is still behind
                      // the `onnx-model` feature.
+pub mod model_store; // nextgsim#468: versioned, content-addressed model artefacts
 pub mod onnx_model; // issue #26: zero-dep ONNX LinearRegressor subset backend
 mod sbi_handler;
 
@@ -362,6 +363,21 @@ async fn main() -> Result<()> {
         }
     }
 
+    // nextgsim#468: publish the boot model (v1) now the predictor is chosen, and
+    // record ML-provision subscriptions restored from an older build's snapshot
+    // as holding it, so an upgrade does not re-notify every consumer.
+    {
+        let ctx = nwdaf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        let adopted = guard.adopt_legacy_ml_prov_deliveries();
+        if adopted > 0 {
+            log::info!("MLModelProvision: {adopted} restored subscription(s) adopted as holding the active model");
+        }
+        if guard.current_model_version().is_none() {
+            log::info!("MLModelProvision: the active prediction model has no exportable form; no model is provisioned");
+        }
+    }
+
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(shutdown.clone());
 
@@ -544,12 +560,12 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 
         // Nnwdaf_MLModelProvision model artefact (issue #109). The Subscribe/
         // Notify half notifies an `mLFileAddr.mLModelUrl`; this is the route it
-        // resolves to, serving the active predictor as an ONNX LinearRegressor.
-        // The path segments identify the notification, not distinct models —
-        // there is one active predictor, so each URL serves the same artefact.
-        ["nnwdaf-mlmodelprovision", "v1", "models", _event, _sub_id] => match method {
-            "GET" => handle_ml_model_download().await,
-            _ => send_method_not_allowed(method, "models/{event}/{subscriptionId}"),
+        // resolves to. nextgsim#468: the last segment is the model version's
+        // sha256 (or `{sha256}.manifest.json`), so each URL serves one fixed
+        // artefact; the #109 `{subscriptionId}` form serves the active one.
+        ["nnwdaf-mlmodelprovision", "v1", "models", event, artefact] => match method {
+            "GET" => handle_ml_model_download(event, artefact).await,
+            _ => send_method_not_allowed(method, "models/{event}/{artefact}"),
         },
 
         // Nnwdaf_MLModelProvision service — TS 29.520 is a Subscribe/Notify
@@ -1320,8 +1336,14 @@ mod tests {
     async fn test_ml_model_url_serves_a_real_downloadable_artefact() {
         nwdaf_context_init("nwdaf-test".to_string(), 1024);
 
-        // Exactly the path a notification advertises.
-        let url = ml_service::model_url("http://x", "mlsub-1", AnalyticsId::NfLoad);
+        // Exactly the path a notification advertises (nextgsim#468: the
+        // version's sha256 address).
+        let model = nwdaf_self()
+            .read()
+            .unwrap()
+            .current_model_version()
+            .expect("the default predictor is provisioned");
+        let url = model.url("http://x", AnalyticsId::NfLoad);
         let path = url.strip_prefix("http://x").expect("built from the base");
         let resp = nwdaf_sbi_request_handler(SbiRequest::get(path)).await;
 
@@ -1350,6 +1372,58 @@ mod tests {
             (expected - actual).abs() < 1e-6,
             "the downloaded model must reproduce the NWDAF's own prediction \
              (expected {expected}, got {actual})"
+        );
+    }
+
+    /// nextgsim#468: the served bytes ARE the notified version (sha256), its
+    /// manifest is served beside it, the #109 URL an older build notified still
+    /// resolves, and anything else is a 404 rather than some model.
+    #[tokio::test]
+    async fn test_ml_model_routes_serve_the_addressed_version() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        let model = nwdaf_self()
+            .read()
+            .unwrap()
+            .current_model_version()
+            .expect("provisioned");
+        let get =
+            |path: String| async move { nwdaf_sbi_request_handler(SbiRequest::get(&path)).await };
+        let base = "/nnwdaf-mlmodelprovision/v1/models";
+
+        let resp = get(format!("{base}/NF_LOAD/{}", model.sha256)).await;
+        assert_eq!(resp.status, 200);
+        let bytes = resp.http.binary_content.as_ref().expect("bytes");
+        assert_eq!(model_store::sha256_hex(bytes), model.sha256);
+
+        let resp = get(format!("{base}/NF_LOAD/{}.manifest.json", model.sha256)).await;
+        assert_eq!(resp.status, 200);
+        let manifest: serde_json::Value = resp.json_body().expect("manifest JSON");
+        assert_eq!(manifest["sha256"], model.sha256);
+        assert_eq!(manifest["id"], model_store::MODEL_ID);
+
+        let resp = get(format!("{base}/NF_LOAD/mlsub-legacy")).await;
+        assert_eq!(
+            resp.status, 200,
+            "the #109 URL form serves the active model"
+        );
+        assert_eq!(
+            model_store::sha256_hex(resp.http.binary_content.as_ref().unwrap()),
+            model.sha256
+        );
+
+        let unknown = model_store::sha256_hex(b"never provisioned");
+        assert_eq!(get(format!("{base}/NF_LOAD/{unknown}")).await.status, 404);
+        assert_eq!(
+            get(format!("{base}/NF_LOAD/{unknown}.manifest.json"))
+                .await
+                .status,
+            404
+        );
+        assert_eq!(
+            get(format!("{base}/NOT_AN_EVENT/{}", model.sha256))
+                .await
+                .status,
+            404
         );
     }
 

@@ -1,4 +1,4 @@
-//! NWDAF ML Model Provisioning Service (TS 23.288 §6.12, Rel-17)
+//! NWDAF ML Model Provisioning Service (TS 23.288 §6.2A)
 //!
 //! Implements the Nnwdaf_MLModelProvision service as a TS 29.520 **Subscribe /
 //! Notify** resource (nwafd-05):
@@ -215,7 +215,7 @@ impl MlModelRegistry {
 }
 
 // ============================================================================
-// G14: Accuracy Feedback Loop (TS 23.288 §6.12.3, Rel-17)
+// G14: Accuracy Feedback Loop (cf. TS 23.288 §6.2E, MTLF-based accuracy monitoring)
 // ============================================================================
 
 /// A single feedback sample: predicted value vs observed ground truth
@@ -440,24 +440,20 @@ pub fn ml_prov_subsc_json(sub: &MlProvSubscription) -> Value {
     Value::Object(obj)
 }
 
-/// The model-file address advertised in a notification.
+/// The legacy (issue #109) model-file address,
+/// `.../models/{event}/{subscriptionId}`.
 ///
-/// SCOPE NOTE (issue #109): this NWDAF is a linear-regression analytics engine,
-/// not an MTLF with a training pipeline. What it *can* do honestly is export the
-/// predictor it actually runs: the URL below resolves to a live route on this NF
-/// serving an ONNX `LinearRegressor` whose output equals this NWDAF's own
-/// prediction (see [`crate::onnx_export`]). It replaced a fabricated
-/// `http://nwdaf/...` placeholder that no route served, so a consumer that
-/// dereferenced it got a 404.
+/// No longer advertised: nextgsim#468 notifies a content-addressed URL per
+/// model version ([`crate::model_store::ModelVersion::url`]). It is still
+/// served, as the active version, because a subscription notified by an older
+/// build holds it.
 ///
-/// `Nnwdaf_MLModelMonitor`, `Nnwdaf_MLModelInfo` and `/transfers` subscription
-/// continuity (`prevSub` / `consNfInfo`) remain **unimplemented** and are out of
-/// scope for #109, which tracks only the MLModelProvision artefact.
-///
-/// The `{event}`/`{sub_id}` segments identify the notification, not distinct
-/// models: there is one active predictor, so every URL serves the same artefact.
-/// They are kept because a consumer echoes back the URL it was given.
-pub fn model_url(base: &str, sub_id: &str, event: AnalyticsId) -> String {
+/// SCOPE NOTE (issue #109): this NWDAF is a linear-regression analytics engine.
+/// What it provisions is the predictor it actually runs, exported as an ONNX
+/// `LinearRegressor` whose output equals this NWDAF's own prediction (see
+/// [`crate::onnx_export`]). There is one predictor, so every subscribed event is
+/// notified the same model.
+pub fn legacy_model_url(base: &str, sub_id: &str, event: AnalyticsId) -> String {
     format!(
         "{}/nnwdaf-mlmodelprovision/v1/models/{}/{}",
         base.trim_end_matches('/'),
@@ -466,39 +462,23 @@ pub fn model_url(base: &str, sub_id: &str, event: AnalyticsId) -> String {
     )
 }
 
-/// The ONNX bytes this NWDAF serves for its active predictor, or `None` when the
-/// predictor has no fixed-window linear form and therefore cannot be provisioned.
-///
-/// `None` is what makes the advertisement honest: the caller must then neither
-/// register `nnwdaf-mlmodelprovision` in the NF profile nor emit an
-/// `mLFileAddr.mLModelUrl`.
-pub fn active_model_onnx(model: &dyn InferenceModel) -> Option<Vec<u8>> {
-    let (coefficients, intercept) = model.linear_form()?;
-    if coefficients.is_empty() {
-        return None;
-    }
-    Some(crate::onnx_export::encode_linear_regressor(
-        &coefficients,
-        intercept,
-    ))
-}
-
 /// Build the `Nnwdaf_MLModelProvision` notification callback body for a
-/// subscription.
+/// subscription and the model version it is notified of.
 ///
 /// Per TS 29.520 the callback payload is an **array** of `NwdafMLModelProvNotif`
 /// (minItems 1); each carries the required `subscriptionId` and `eventNotifs[]`
 /// of `MLEventNotif`, where every `MLEventNotif` satisfies the `oneOf` by
-/// supplying `mLFileAddr.mLModelUrl`.
+/// supplying `mLFileAddr.mLModelUrl` (§4.5.2.4.2).
 ///
-/// `model_base_uri` is `None` when this NWDAF's active predictor has no
-/// exportable form, in which case `mLFileAddr` is omitted rather than pointing
-/// at a URL that would 404 — the defect #109 fixed. A build in that state also
-/// does not advertise the service, so a conformant consumer never subscribes and
-/// never sees the truncated notification.
+/// Taking the version (not an `Option`) is what keeps that `oneOf`: with no
+/// model there is no body to build, and the dispatcher sends nothing
+/// (nextgsim#468; before, the body went out with `mLFileAddr` omitted).
+/// `modelUniqueId` (ModelProvisionExt) and `modelUpdateInd` (EnModelProvision)
+/// are not sent: they belong to features this NWDAF does not negotiate.
 pub fn build_ml_model_prov_notif_body(
     sub: &MlProvSubscription,
-    model_base_uri: Option<&str>,
+    base_uri: &str,
+    model: &crate::model_store::ModelVersion,
 ) -> Value {
     let event_notifs: Vec<Value> = sub
         .ml_events
@@ -509,12 +489,10 @@ pub fn build_ml_model_prov_notif_body(
             if let Some(corr) = &sub.notif_corr_id {
                 notif.insert("notifCorreId".to_string(), json!(corr));
             }
-            if let Some(base) = model_base_uri {
-                notif.insert(
-                    "mLFileAddr".to_string(),
-                    json!({ "mLModelUrl": model_url(base, &sub.subscription_id, *ev) }),
-                );
-            }
+            notif.insert(
+                "mLFileAddr".to_string(),
+                json!({ "mLModelUrl": model.url(base_uri, *ev) }),
+            );
             Value::Object(notif)
         })
         .collect();
@@ -717,6 +695,14 @@ mod tests {
         assert!(parse_ml_model_prov_subsc(&bad_event).is_err());
     }
 
+    fn v1() -> crate::model_store::ModelVersion {
+        let (c, i) = OlsLinearModel.linear_form().expect("exportable");
+        crate::model_store::ModelStore::new()
+            .publish(&c, i, "nwdaf-test")
+            .expect("publishes")
+            .0
+    }
+
     /// The notify callback body deserializes as the TS 29.520 array-of-
     /// `NwdafMLModelProvNotif` shape: `subscriptionId` + `eventNotifs[]`, each
     /// `MLEventNotif` carrying `event` and `mLFileAddr.mLModelUrl`.
@@ -728,7 +714,8 @@ mod tests {
             Some("corr-9".to_string()),
             vec![AnalyticsId::NfLoad],
         );
-        let body = build_ml_model_prov_notif_body(&sub, Some("http://10.0.0.5:7777"));
+        let model = v1();
+        let body = build_ml_model_prov_notif_body(&sub, "http://10.0.0.5:7777", &model);
 
         let arr = body.as_array().expect("callback body is an array");
         assert_eq!(arr.len(), 1, "minItems 1 array of NwdafMLModelProvNotif");
@@ -741,33 +728,22 @@ mod tests {
         assert_eq!(evns.len(), 1);
         assert_eq!(evns[0]["event"].as_str(), Some("NF_LOAD"));
         assert_eq!(evns[0]["notifCorreId"].as_str(), Some("corr-9"));
-        // Issue #109: the URL must point at THIS NF's live route, not the old
-        // fabricated `http://nwdaf/...` that nothing served.
+        // Issue #109: the URL points at THIS NF's live route; nextgsim#468: at
+        // the notified version's bytes, by their sha256.
+        let expected = format!(
+            "http://10.0.0.5:7777/nnwdaf-mlmodelprovision/v1/models/NF_LOAD/{}",
+            model.sha256
+        );
         assert_eq!(
             evns[0]["mLFileAddr"]["mLModelUrl"].as_str(),
-            Some("http://10.0.0.5:7777/nnwdaf-mlmodelprovision/v1/models/NF_LOAD/mlsub-9")
+            Some(expected.as_str())
         );
+        // Feature-gated members of features this NWDAF does not negotiate.
+        assert!(evns[0].get("modelUniqueId").is_none());
+        assert!(evns[0].get("modelUpdateInd").is_none());
         // No bespoke registry keys leak into the notification.
         assert!(notif.get("modelCount").is_none());
         assert!(notif.get("accuracy").is_none());
-    }
-
-    /// With no exportable model there is no URL to advertise, so `mLFileAddr` is
-    /// omitted rather than pointing somewhere that would 404 — the #109 defect.
-    #[test]
-    fn test_notif_body_omits_model_addr_when_nothing_is_exportable() {
-        let sub = MlProvSubscription::new(
-            "mlsub-10".to_string(),
-            "http://anlf.local/ml-cb".to_string(),
-            None,
-            vec![AnalyticsId::NfLoad],
-        );
-        let body = build_ml_model_prov_notif_body(&sub, None);
-        let evns = body[0]["eventNotifs"].as_array().expect("eventNotifs");
-        assert!(
-            evns[0].get("mLFileAddr").is_none(),
-            "a URL that cannot be served must not be emitted at all"
-        );
     }
 
     /// The two baselines differ in whether they can be provisioned at all, and
@@ -784,7 +760,6 @@ mod tests {
         for (got, want) in coefs.iter().zip(expected) {
             assert!((got - want).abs() < 1e-9, "got {coefs:?}");
         }
-        assert!(active_model_onnx(&OlsLinearModel).is_some());
 
         // EWMA's weights span the whole observed series, so no fixed-window
         // artefact could reproduce it; exporting a truncation would ship bytes
@@ -793,7 +768,6 @@ mod tests {
             EwmaModel::default().linear_form().is_none(),
             "EWMA must report no exportable form rather than a truncated one"
         );
-        assert!(active_model_onnx(&EwmaModel::default()).is_none());
     }
 }
 

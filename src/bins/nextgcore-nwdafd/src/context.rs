@@ -874,8 +874,8 @@ impl AnalyticsSubscription {
 /// `NwdafMLModelProvNotif` callback carrying the model file address(es).
 ///
 /// PERSISTED (issue #66/#192) — see [`EventSubscription`] for the rule on adding
-/// a field. `notified` is persisted because it is what makes the callback
-/// one-shot: losing it re-POSTs "model available" to every consumer after every
+/// a field. `notified` and `delivered_sha256` are persisted because they are
+/// what stops a delivered model being re-POSTed to every consumer after every
 /// restart.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MlProvSubscription {
@@ -888,9 +888,16 @@ pub struct MlProvSubscription {
     pub notif_corr_id: Option<String>,
     /// Subscribed ML events (`mLEventSubscs[].mLEvent`, minItems 1).
     pub ml_events: Vec<AnalyticsId>,
-    /// Whether the (one-shot, "model available") callback has been dispatched.
+    /// Whether a "model available" callback has been dispatched at least once.
+    /// Kept for snapshots written before `delivered_sha256` existed.
     #[serde(default)]
     pub notified: bool,
+    /// The sha256 of the model version this consumer was last notified of
+    /// (nextgsim#468). The subscription is pending while this is not the active
+    /// version's, so a new model is notified once per subscription
+    /// (TS 23.288 §6.2E.2 step 13).
+    #[serde(default)]
+    pub delivered_sha256: Option<String>,
 }
 
 impl MlProvSubscription {
@@ -906,6 +913,7 @@ impl MlProvSubscription {
             notif_corr_id,
             ml_events,
             notified: false,
+            delivered_sha256: None,
         }
     }
 }
@@ -1015,6 +1023,10 @@ pub struct NwdafContext {
     /// URL that must resolve back to *this* NF (issue #109); the placeholder it
     /// replaced was a hardcoded `http://nwdaf/...` that nothing served.
     sbi_base_uri: RwLock<Option<String>>,
+    /// The MTLF's provisioned model versions (nextgsim#468), following the
+    /// active predictor. LOCK ORDER: taken after `engine` is RELEASED, never
+    /// while holding it.
+    model_store: Mutex<crate::model_store::ModelStore>,
     /// Next internal ID generator
     next_id: AtomicUsize,
     /// Maximum subscriptions
@@ -1060,6 +1072,7 @@ impl NwdafContext {
             nrf_status_subscription: RwLock::new(None),
             nrf_collector_config: RwLock::new(None),
             sbi_base_uri: RwLock::new(None),
+            model_store: Mutex::new(crate::model_store::ModelStore::new()),
             next_id: AtomicUsize::new(1),
             max_subscriptions: 0,
             initialized: AtomicBool::new(false),
@@ -1249,15 +1262,55 @@ impl NwdafContext {
             .unwrap_or_else(|| "http://127.0.0.1:7777".to_string())
     }
 
-    /// The ONNX artefact for the active prediction model, or `None` when that
-    /// model has no fixed-window linear form and so cannot be provisioned
-    /// (issue #109).
+    /// The model version provisioned for the active prediction model, or
+    /// `None` when that model has no fixed-window linear form and so cannot be
+    /// provisioned (issue #109).
     ///
-    /// `None` is the signal that `nnwdaf-mlmodelprovision` must not be
-    /// advertised and no `mLModelUrl` emitted.
-    pub fn active_model_onnx(&self) -> Option<Vec<u8>> {
-        let engine = self.lock_engine();
-        crate::ml_service::active_model_onnx(engine.predictor())
+    /// nextgsim#468: publishes a new version into the store when the active
+    /// predictor's export differs from the newest version, so a predictor
+    /// swapped at runtime becomes v2 and is notified. `None` is the signal that
+    /// `nnwdaf-mlmodelprovision` must not be advertised and no notification
+    /// sent.
+    pub fn current_model_version(&self) -> Option<crate::model_store::ModelVersion> {
+        let (coefficients, intercept) = {
+            let engine = self.lock_engine();
+            engine.predictor().linear_form()?
+        };
+        if coefficients.is_empty() {
+            return None;
+        }
+        let mut store = self
+            .model_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match store.publish(&coefficients, intercept, &self.nf_instance_id) {
+            Ok((version, true)) => {
+                log::info!(
+                    "MLModelProvision: model v{} published sha256={} ({} bytes)",
+                    version.version,
+                    version.sha256,
+                    version.bytes.len()
+                );
+                Some(version)
+            }
+            Ok((version, false)) => Some(version),
+            Err(e) => {
+                log::error!("MLModelProvision: the active model cannot be published: {e}");
+                None
+            }
+        }
+    }
+
+    /// A retained model version by its sha256 address (nextgsim#468). The
+    /// active predictor is published first, so its address resolves even
+    /// before the first notification.
+    pub fn model_version(&self, sha256: &str) -> Option<crate::model_store::ModelVersion> {
+        let _ = self.current_model_version();
+        self.model_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(sha256)
+            .cloned()
     }
 
     /// Whether this NWDAF can currently provision a model artefact.
@@ -1667,25 +1720,34 @@ impl NwdafContext {
         removed
     }
 
-    /// All ML-provision subscriptions that have not yet had their (one-shot)
-    /// "model available" callback dispatched. Used by the dispatcher.
-    pub fn get_pending_ml_prov_subscriptions(&self) -> Vec<MlProvSubscription> {
+    /// The ML-provision subscriptions that have not been notified of the model
+    /// version `active_sha256` (nextgsim#468). Used by the dispatcher.
+    pub fn get_pending_ml_prov_subscriptions(
+        &self,
+        active_sha256: &str,
+    ) -> Vec<MlProvSubscription> {
         self.ml_prov_subscriptions
             .read()
-            .map(|subs| subs.values().filter(|s| !s.notified).cloned().collect())
+            .map(|subs| {
+                subs.values()
+                    .filter(|s| s.delivered_sha256.as_deref() != Some(active_sha256))
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
-    /// Mark an ML-provision subscription's callback as delivered.
+    /// Mark an ML-provision subscription as notified of model `sha256`.
     ///
     /// Durable, but written by the dispatcher's end-of-tick flush rather than
     /// here — see [`flush_state_if_dirty`](Self::flush_state_if_dirty).
-    pub fn mark_ml_prov_notified(&self, subscription_id: &str) {
+    pub fn mark_ml_prov_notified(&self, subscription_id: &str, sha256: &str) {
         let changed = {
             match self.ml_prov_subscriptions.write() {
                 Ok(mut subs) => match subs.get_mut(subscription_id) {
                     Some(sub) => {
                         sub.notified = true;
+                        sub.delivered_sha256 = Some(sha256.to_string());
                         true
                     }
                     None => false,
@@ -1696,6 +1758,31 @@ impl NwdafContext {
         if changed {
             self.mark_dirty();
         }
+    }
+
+    /// Adopt subscriptions restored from a snapshot written before
+    /// `delivered_sha256` existed (nextgsim#468): one marked `notified` holds a
+    /// `.../models/{event}/{subscriptionId}` URL, which serves the active model,
+    /// so it is recorded as holding the active version rather than re-notified
+    /// on upgrade. Called once at startup, after the predictor is selected.
+    /// Returns how many were adopted.
+    pub fn adopt_legacy_ml_prov_deliveries(&self) -> usize {
+        let Some(active) = self.current_model_version() else {
+            return 0;
+        };
+        let adopted = match self.ml_prov_subscriptions.write() {
+            Ok(mut subs) => subs
+                .values_mut()
+                .filter(|s| s.notified && s.delivered_sha256.is_none())
+                .map(|s| s.delivered_sha256 = Some(active.sha256.clone()))
+                .count(),
+            Err(_) => 0,
+        };
+        if adopted > 0 {
+            self.mark_dirty();
+            self.flush_state_if_dirty();
+        }
+        adopted
     }
 
     pub fn ml_prov_subscription_count(&self) -> usize {
@@ -3183,5 +3270,113 @@ mod tests {
 
         let mobility_subs = ctx.get_analytics(AnalyticsId::UeMobility);
         assert_eq!(mobility_subs.len(), 1);
+    }
+}
+
+/// nextgsim#468: per-version ML-provision delivery state across a restart.
+#[cfg(test)]
+mod ml_prov_delivery_468_tests {
+    use super::*;
+
+    fn temp_state_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "nextgcore-nwdaf-468-{}-{tag}-{nanos}.json",
+            std::process::id()
+        ))
+    }
+
+    fn restored(tag: &str, notified: bool) -> (NwdafContext, std::path::PathBuf) {
+        let doc = serde_json::json!({
+            "version": 1,
+            "analyticsSubscriptions": [],
+            "mlProvSubscriptions": [{
+                "subscription_id": "legacy-ml",
+                "notif_uri": "http://anlf.local/n",
+                "ml_events": ["NF_LOAD"],
+                "notified": notified
+            }]
+        });
+        let path = temp_state_path(tag);
+        std::fs::write(&path, doc.to_string()).expect("write");
+        let mut ctx = NwdafContext::new("nwdaf-468".to_string());
+        ctx.init(16);
+        ctx.set_state_file(path.clone()).expect("restore");
+        (ctx, path)
+    }
+
+    /// A subscription an older build already notified (it holds the #109 URL,
+    /// which serves the active model) is not re-notified on upgrade, and the
+    /// adoption is written to the snapshot.
+    #[test]
+    fn a_legacy_notified_record_is_adopted_not_renotified() {
+        let (ctx, path) = restored("adopt", true);
+        let active = ctx.current_model_version().expect("v1");
+        assert_eq!(
+            ctx.get_pending_ml_prov_subscriptions(&active.sha256).len(),
+            1
+        );
+
+        assert_eq!(ctx.adopt_legacy_ml_prov_deliveries(), 1);
+        assert!(ctx
+            .get_pending_ml_prov_subscriptions(&active.sha256)
+            .is_empty());
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            doc["mlProvSubscriptions"][0]["delivered_sha256"],
+            active.sha256.as_str()
+        );
+        assert_eq!(ctx.adopt_legacy_ml_prov_deliveries(), 0, "idempotent");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// One the older build never got through to stays pending.
+    #[test]
+    fn a_legacy_undelivered_record_stays_pending() {
+        let (ctx, path) = restored("pending", false);
+        assert_eq!(ctx.adopt_legacy_ml_prov_deliveries(), 0);
+        let active = ctx.current_model_version().expect("v1");
+        assert_eq!(
+            ctx.get_pending_ml_prov_subscriptions(&active.sha256).len(),
+            1
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The delivered version survives a restart, so the same model is not
+    /// re-POSTed; a different model after the restart is.
+    #[test]
+    fn the_delivered_version_survives_a_restart() {
+        let path = temp_state_path("restart");
+        let sha = {
+            let mut ctx = NwdafContext::new("nwdaf-468".to_string());
+            ctx.init(16);
+            ctx.set_state_file(path.clone()).expect("arm");
+            ctx.add_ml_prov_subscription(MlProvSubscription::new(
+                "ml-r".into(),
+                "http://anlf.local/n".into(),
+                None,
+                vec![AnalyticsId::NfLoad],
+            ));
+            let v1 = ctx.current_model_version().unwrap();
+            ctx.mark_ml_prov_notified("ml-r", &v1.sha256);
+            ctx.flush_state_if_dirty();
+            v1.sha256
+        };
+        let mut ctx = NwdafContext::new("nwdaf-468".to_string());
+        ctx.init(16);
+        ctx.set_state_file(path.clone()).expect("restore");
+        let v1 = ctx.current_model_version().unwrap();
+        assert_eq!(v1.sha256, sha, "the same predictor is the same address");
+        assert!(ctx.get_pending_ml_prov_subscriptions(&v1.sha256).is_empty());
+        assert_eq!(
+            ctx.get_pending_ml_prov_subscriptions("another-model").len(),
+            1
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
