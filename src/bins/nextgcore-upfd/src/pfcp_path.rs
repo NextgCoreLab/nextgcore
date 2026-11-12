@@ -654,6 +654,10 @@ pub struct PfcpServer {
     gpqm: AtomicBool,
     /// #1389 part 2: N6 delay measurement (UN6DM) enabled.
     un6dm: AtomicBool,
+    /// #1389 part 3: per QoS flow per UE QoS monitoring (QFQM) enabled
+    /// (`--qos-flow-monitoring`). Only then is QFQM advertised and an SRR's QoS
+    /// Monitoring per QoS flow Control Information acted on.
+    qfqm: AtomicBool,
     /// UPF-initiated requests awaiting a response, tracked by sequence number
     /// for T1/N1 retransmission (TS 29.244 §7.2.2.3). Currently used for
     /// Session Report Requests (Downlink Data / Error Indication Reports).
@@ -907,6 +911,8 @@ pub struct SessionRuleIds {
     /// bearer's S5/S8-U tunnel (Core PDR, TS 23.401 §5.4.1). An Update FAR on one of
     /// these moves that FAR only, never the session's tunnel.
     pub own_tunnel_far_ids: std::collections::HashSet<u32>,
+    /// #1389 part 3: the SRRs the session holds (only with QFQM enabled).
+    pub srr_ids: std::collections::HashSet<u8>,
 }
 
 /// The time IEs of a usage report, from the times taken with its usage (#818, TS
@@ -990,6 +996,7 @@ impl PfcpServer {
             data_plane: std::sync::RwLock::new(None),
             gpqm: AtomicBool::new(false),
             un6dm: AtomicBool::new(false),
+            qfqm: AtomicBool::new(false),
             pending_reports: tokio::sync::Mutex::new(HashMap::new()),
             heartbeat: tokio::sync::Mutex::new(HeartbeatState::default()),
             allowed_peers: std::sync::RwLock::new(PeerAllowlist::default()),
@@ -1156,6 +1163,12 @@ impl PfcpServer {
             n
         };
         log::warn!("Cleared {count} PFCP sessions of the association with {peer} ({reason})");
+        // #1451 review m5: every session's QoS monitoring goes with them here,
+        // including one whose data-plane install never happened (the data plane
+        // only removes the sessions it holds).
+        if let Some(dp) = self.data_plane.read().unwrap().clone() {
+            dp.with_qos_flow_monitor(|m| m.clear());
+        }
         let _ = self
             .session_tx
             .send(PfcpSessionEvent::PeerFailure { peer })
@@ -2188,6 +2201,18 @@ impl PfcpServer {
             }
         }
 
+        // #1389 part 3: Create SRR (Table 7.5.2.9-1), acted on only with QFQM. A
+        // malformed one is logged and skipped, as a malformed PDR is above.
+        let mut parsed_srrs = Vec::new();
+        if self.qfqm() {
+            for srr_ie in ParsedIe::find_all_ies(&ies, pfcp_ie::CREATE_SRR) {
+                match crate::n4_build::parse_srr(&srr_ie.value) {
+                    Ok(srr) => parsed_srrs.push(srr),
+                    Err(e) => log::warn!("Failed to parse Create SRR: {e}"),
+                }
+            }
+        }
+
         // Build response
         let f_seid = FSeid {
             seid: upf_seid,
@@ -2241,6 +2266,7 @@ impl PfcpServer {
                     &parsed_fars,
                     (dl_teid, gnb_addr),
                 ),
+                srr_ids: parsed_srrs.iter().map(|r| r.srr_id).collect(),
             },
             // #321: no bridge until the SMF configures one. An establishment
             // deliberately does not create an empty one — `Some(empty bridge)` and
@@ -2254,6 +2280,7 @@ impl PfcpServer {
             sessions.insert(upf_seid, session_info.clone());
             self.publish_session_count(&sessions);
         }
+        self.apply_srrs(upf_seid, &[], &parsed_srrs, &[]);
 
         // Notify data plane with full rule set
         let event = PfcpSessionEvent::SessionEstablished {
@@ -2470,6 +2497,41 @@ impl PfcpServer {
             crate::n4_build::parse_create_urr,
             &mut failure,
         );
+        // #1389 part 3: Remove / Create / Update SRR (Tables 7.5.4.19-1, 7.5.2.9-1,
+        // 7.5.4.20-1), acted on only with QFQM: a UPF that did not advertise it
+        // ignores them, as before.
+        let (removed_srr_ids, created_srrs, mod_srrs) = if self.qfqm() {
+            let removes = ParsedIe::find_all_ies(&ies, pfcp_ie::REMOVE_SRR);
+            let removed: Vec<u8> = removes
+                .iter()
+                .filter_map(|ie| crate::n4_build::parse_remove_srr(&ie.value))
+                .collect();
+            if removed.len() < removes.len() {
+                log::warn!("a Remove SRR carried no SRR ID");
+                note_first_failure(
+                    &mut failure,
+                    PfcpCause::MandatoryIeMissing,
+                    pfcp_ie::REMOVE_SRR,
+                );
+            }
+            (
+                removed,
+                parse_rule_list(
+                    &ies,
+                    pfcp_ie::CREATE_SRR,
+                    crate::n4_build::parse_srr,
+                    &mut failure,
+                ),
+                parse_rule_list(
+                    &ies,
+                    pfcp_ie::UPDATE_SRR,
+                    crate::n4_build::parse_srr,
+                    &mut failure,
+                ),
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
 
         // The DL tunnel this session forwards on is whatever the LAST Outer Header
         // Creation on the message names, from a Create or an Update alike. Creates
@@ -2640,6 +2702,26 @@ impl PfcpServer {
                 }
                 for u in &created_urrs {
                     session.rules.urr_ids.insert(u.urr_id);
+                }
+                for id in &removed_srr_ids {
+                    if !session.rules.srr_ids.remove(id) {
+                        log::debug!("Remove SRR {id}: not held by SEID {upf_seid:#x}, idempotent");
+                    }
+                }
+                for r in &created_srrs {
+                    session.rules.srr_ids.insert(r.srr_id);
+                }
+                for r in &mod_srrs {
+                    if !session.rules.srr_ids.contains(&r.srr_id) {
+                        log::warn!(
+                            "Update SRR {}: no such rule on SEID {upf_seid:#x}",
+                            r.srr_id
+                        );
+                        note_first_rule_failure(
+                            &mut failure,
+                            crate::n4_build::FailedRule::Srr(r.srr_id),
+                        );
+                    }
                 }
 
                 // Updating a rule the session does NOT hold is a different case from
@@ -2850,6 +2932,18 @@ impl PfcpServer {
             return Ok(());
         }
 
+        // #1389 part 3: what a stopped QoS monitoring measured is reported once
+        // more (§5.24.4.3), after the response.
+        let stop_reports = self.apply_srrs(upf_seid, &removed_srr_ids, &created_srrs, &mod_srrs);
+        if !stop_reports.is_empty() {
+            if let Err(e) = self
+                .send_qos_monitoring_report(upf_seid, &stop_reports)
+                .await
+            {
+                log::warn!("QoS monitoring stop report was NOT sent: {e}");
+            }
+        }
+
         // Notify data plane
         let has_changes = updated_dl_teid.is_some()
             || updated_gnb_addr.is_some()
@@ -2998,11 +3092,128 @@ impl PfcpServer {
         self.un6dm.load(Ordering::Relaxed)
     }
 
+    /// #1389 part 3: enable per QoS flow per UE QoS monitoring for packet delay
+    /// (QFQM, TS 29.244 §5.24.4).
+    pub fn set_qos_flow_monitoring(&self, enabled: bool) {
+        self.qfqm.store(enabled, Ordering::Relaxed);
+    }
+
+    fn qfqm(&self) -> bool {
+        self.qfqm.load(Ordering::Relaxed)
+    }
+
     fn optional_features(&self) -> crate::n4_build::OptionalFeatures {
         crate::n4_build::OptionalFeatures {
             gpqm: self.gpqm(),
             un6dm: self.un6dm(),
+            qfqm: self.qfqm(),
         }
+    }
+
+    /// #1389 part 3: apply an establishment's or modification's SRR operations to
+    /// the per QoS flow monitor, in §7.5.4's order (remove, create, update).
+    /// Returns the stop reports of the monitoring that ended.
+    fn apply_srrs(
+        &self,
+        upf_seid: u64,
+        removed: &[u8],
+        created: &[crate::n4_build::ParsedSrr],
+        updated: &[crate::n4_build::ParsedSrr],
+    ) -> Vec<crate::qos_flow_mon::SrrReport> {
+        if removed.is_empty() && created.is_empty() && updated.is_empty() {
+            return Vec::new();
+        }
+        let Some(dp) = self.data_plane.read().unwrap().clone() else {
+            return Vec::new();
+        };
+        let now = std::time::Instant::now();
+        let wall = std::time::SystemTime::now();
+        let mut out = Vec::new();
+        dp.with_qos_flow_monitor(|m| {
+            for id in removed {
+                out.extend(m.remove_srr(upf_seid, *id, wall));
+            }
+            for r in created {
+                let controls = crate::qos_flow_mon::controls_of(&r.qos_controls);
+                if !controls.is_empty() {
+                    log::info!(
+                        "SEID {upf_seid:#x}: SRR {} provisions QoS monitoring of QFI(s) {:?}",
+                        r.srr_id,
+                        controls
+                            .iter()
+                            .flat_map(|c| c.qfis.clone())
+                            .collect::<Vec<_>>()
+                    );
+                }
+                // A Create of an SRR ID already held replaces it: what it measured
+                // is reported, as for a removal.
+                out.extend(m.remove_srr(upf_seid, r.srr_id, wall));
+                m.create_srr(upf_seid, r.srr_id, controls, now, wall);
+            }
+            for r in updated {
+                let controls = crate::qos_flow_mon::controls_of(&r.qos_controls);
+                out.extend(m.update_srr(upf_seid, r.srr_id, controls, now, wall));
+            }
+        });
+        out
+    }
+
+    /// #1389 part 3: report per QoS flow QoS monitoring to the CP function in a
+    /// PFCP Session Report Request (§5.24.4.3, Report Type SESR, Session Report
+    /// IE per SRR), tracked for T1/N1 retransmission.
+    pub async fn send_qos_monitoring_report(
+        &self,
+        upf_seid: u64,
+        reports: &[crate::qos_flow_mon::SrrReport],
+    ) -> Result<(), String> {
+        if reports.is_empty() {
+            return Err("no QoS monitoring reports".to_string());
+        }
+        let (smf_seid, smf_addr) = {
+            let sessions = self.sessions.read().await;
+            sessions.get(&upf_seid).map(|s| (s.smf_seid, s.smf_addr))
+        }
+        .ok_or_else(|| {
+            // A monitor entry that outlived its PFCP session reports nothing
+            // further (#1451 review m5).
+            if let Some(dp) = self.data_plane.read().unwrap().clone() {
+                dp.with_qos_flow_monitor(|m| m.remove_session(upf_seid));
+            }
+            format!("Session {upf_seid:#x} not found for a QoS monitoring report")
+        })?;
+        // A message stays well under the path MTU: 16 reports of at most ~50 octets.
+        for chunk in reports.chunks(16) {
+            let payload = crate::n4_build::build_qos_monitoring_session_report(chunk);
+            self.send_and_track_report(
+                upf_seid,
+                smf_seid,
+                smf_addr,
+                &payload,
+                "QoS Monitoring Report",
+                Vec::new(),
+            )
+            .await?;
+        }
+        for (srr, r) in reports {
+            let m = r.qos_monitoring_measurement;
+            if m.packet_delay_measurement_failure {
+                log::info!(
+                    "QoS monitoring report to {smf_addr}: SEID {upf_seid:#x} SRR {srr} QFI {} \
+                     packet delay measurement FAILURE",
+                    r.qfi
+                );
+            } else {
+                log::info!(
+                    "QoS monitoring report to {smf_addr}: SEID {upf_seid:#x} SRR {srr} QFI {} \
+                     DL {:?} ms UL {:?} ms RTT {:?} ms",
+                    r.qfi,
+                    m.downlink_packet_delay,
+                    m.uplink_packet_delay,
+                    m.round_trip_packet_delay
+                );
+            }
+        }
+        Ok(())
     }
 
     /// #1389 part 2: apply the N6 Delay Measurement Control Information of an
@@ -8289,5 +8500,397 @@ mod tests {
             HEARTBEAT_MAX_MISSES, 3,
             "three rounds at the ~10s cadence is ~30s of silence"
         );
+    }
+
+    // ---- #1389 part 3: per QoS flow per UE QoS monitoring (QFQM) over N4 ----
+
+    /// A Create/Update SRR value: SRR ID, then one IE 242 for `qfis` (DL+UL
+    /// packet delay, Event Triggered at 1 ms, no Minimum Wait Time).
+    fn srr_body(srr_id: u8, qfis: &[u8]) -> Vec<u8> {
+        use nextgcore_pfcp::qos_monitoring::{
+            PacketDelayThresholds, QosMonitoringPerQosFlowControlInformation, ReportingFrequency,
+            RequestedQosMonitoring, TypedIe,
+        };
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_u8(pfcp_ie::SRR_ID, srr_id);
+        let mut v = b.build();
+        let mut ie = bytes::BytesMut::new();
+        QosMonitoringPerQosFlowControlInformation {
+            qfis: qfis.to_vec(),
+            requested_qos_monitoring: RequestedQosMonitoring {
+                dlpd: true,
+                ulpd: true,
+                ..Default::default()
+            },
+            reporting_frequency: ReportingFrequency {
+                evett: true,
+                perio: false,
+            },
+            packet_delay_thresholds: Some(PacketDelayThresholds {
+                downlink: Some(1),
+                ..Default::default()
+            }),
+            minimum_wait_time: Some(0),
+            measurement_period: None,
+            extra: Vec::new(),
+        }
+        .encode_ie(&mut ie);
+        v.extend_from_slice(&ie);
+        v
+    }
+
+    fn srr_id_body(srr_id: u8) -> Vec<u8> {
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_u8(pfcp_ie::SRR_ID, srr_id);
+        b.build()
+    }
+
+    async fn modify(
+        smf: &UdpSocket,
+        addr: SocketAddr,
+        seid: u64,
+        seq: u32,
+        ies: &[(u16, Vec<u8>)],
+    ) -> Vec<u8> {
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        for (t, v) in ies {
+            b.add_tlv(*t, v);
+        }
+        exchange(smf, addr, &encode_pfcp(52, Some(seid), seq, &b.build())).await
+    }
+
+    /// Give the monitor one answered probe of `qfi` on `seid` (10 ms N3 each way).
+    fn measure_once(dp: &crate::data_plane::DataPlane, seid: u64, qfi: u8) {
+        let now = std::time::Instant::now();
+        let wall = std::time::SystemTime::now();
+        dp.with_qos_flow_monitor(|m| {
+            let r = m.round(now, wall);
+            let p = r
+                .dummies
+                .iter()
+                .find(|p| p.upf_seid == seid && p.qfi == qfi)
+                .unwrap();
+            let ms = (1u64 << 32) / 1000;
+            let answer = crate::qos_flow_mon::QmpAnswer {
+                t1: p.t1,
+                t2: p.t1 + 10 * ms,
+                t3: p.t1 + 11 * ms,
+                t4: p.t1 + 21 * ms,
+                dl_ran_ms: None,
+                ul_ran_ms: None,
+            };
+            m.on_answer(seid, &answer, now, wall)
+                .expect("answers the probe");
+        });
+    }
+
+    #[tokio::test]
+    async fn qfqm_is_advertised_only_with_qos_flow_monitoring() {
+        for on in [false, true] {
+            let (server, smf, addr, _rx) = spawn_test_server().await;
+            server.set_qos_flow_monitoring(on);
+            let payload = build_association_setup_request_payload(Some(1));
+            let resp = exchange(&smf, addr, &encode_pfcp(5, None, 1, &payload)).await;
+            let f = up_features(&resp);
+            assert_eq!(f.len(), 8, "QFQM is octet 9: the IE does not grow");
+            assert_eq!(f[4] & 0x02 != 0, on, "QFQM, octet 9 bit 2 (§8.2.25)");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_srr_is_not_acted_on_without_qos_flow_monitoring() {
+        let (_server, smf, addr, _rx, dp, upf_seid) = established_session().await;
+        let resp = modify(
+            &smf,
+            addr,
+            upf_seid,
+            3,
+            &[(pfcp_ie::CREATE_SRR, srr_body(1, &[5]))],
+        )
+        .await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert!(
+            !dp.with_qos_flow_monitor(|m| m.is_active()),
+            "nothing monitored"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_update_and_remove_srr_drive_monitoring_and_the_stop_report_reaches_the_smf() {
+        use nextgcore_pfcp::qos_monitoring::{QosMonitoringReport, TypedIe};
+        let (server, smf, addr, _rx, dp, upf_seid) = established_session().await;
+        server.set_qos_flow_monitoring(true);
+
+        let resp = modify(
+            &smf,
+            addr,
+            upf_seid,
+            3,
+            &[(pfcp_ie::CREATE_SRR, srr_body(3, &[5]))],
+        )
+        .await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(
+            dp.with_qos_flow_monitor(|m| m.monitored_qfis(upf_seid)),
+            vec![5]
+        );
+        measure_once(&dp, upf_seid, 5);
+
+        // Update SRR: QFI 6 replaces QFI 5, so QFI 5's monitoring stops and what
+        // it measured is reported after the response (§5.24.4.3).
+        let resp = modify(
+            &smf,
+            addr,
+            upf_seid,
+            4,
+            &[(pfcp_ie::UPDATE_SRR, srr_body(3, &[6]))],
+        )
+        .await;
+        assert_eq!(resp[1], pfcp_type::SESSION_MODIFICATION_RESPONSE);
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(
+            dp.with_qos_flow_monitor(|m| m.monitored_qfis(upf_seid)),
+            vec![6]
+        );
+        let mut buf = vec![0u8; 2048];
+        let (n, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), smf.recv_from(&mut buf))
+                .await
+                .expect("a Session Report Request")
+                .unwrap();
+        assert_eq!(buf[1], pfcp_type::SESSION_REPORT_REQUEST);
+        let (hdr, body) = ParsedPfcpHeader::parse(&buf[..n]).unwrap();
+        assert_eq!(hdr.seid, 0x4242, "the SMF's SEID");
+        let ies = ParsedIe::parse_all(body);
+        assert_eq!(
+            ParsedIe::find_ie(&ies, pfcp_ie::REPORT_TYPE).unwrap().value,
+            vec![0x20],
+            "SESR only (§8.2.21 bit 6)"
+        );
+        let sr = ParsedIe::find_ie(&ies, pfcp_ie::SESSION_REPORT).expect("Session Report IE 214");
+        let members = ParsedIe::parse_all(&sr.value);
+        assert_eq!(
+            ParsedIe::find_ie(&members, pfcp_ie::SRR_ID).unwrap().value,
+            vec![3]
+        );
+        let qmr = ParsedIe::find_ie(&members, 247).expect("QoS Monitoring Report IE 247");
+        let rep = QosMonitoringReport::decode_value(&qmr.value).unwrap();
+        assert_eq!(rep.qfi, 5);
+        assert_eq!(
+            rep.qos_monitoring_measurement.downlink_packet_delay,
+            Some(10)
+        );
+        assert_eq!(rep.qos_monitoring_measurement.uplink_packet_delay, Some(10));
+        assert_eq!(server.pending_report_count().await, 1, "tracked for T1/N1");
+
+        // Remove SRR: monitoring ends. Nothing was measured on QFI 6, so there is
+        // nothing to report.
+        let resp = modify(
+            &smf,
+            addr,
+            upf_seid,
+            5,
+            &[(pfcp_ie::REMOVE_SRR, srr_id_body(3))],
+        )
+        .await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert!(!dp.with_qos_flow_monitor(|m| m.is_active()));
+    }
+
+    #[tokio::test]
+    async fn an_update_of_an_srr_the_session_does_not_hold_is_refused_with_its_failed_rule_id() {
+        let (server, smf, addr, _rx, dp, upf_seid) = established_session().await;
+        server.set_qos_flow_monitoring(true);
+        let resp = modify(
+            &smf,
+            addr,
+            upf_seid,
+            3,
+            &[(pfcp_ie::UPDATE_SRR, srr_body(9, &[5]))],
+        )
+        .await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::RuleCreationModificationFailure as u8
+        );
+        assert_eq!(
+            failed_rule_id(&resp),
+            Some(vec![6, 9]),
+            "Rule ID Type 6 = SRR (§8.2.80)"
+        );
+        assert!(
+            !dp.with_qos_flow_monitor(|m| m.is_active()),
+            "a refused modification applies nothing"
+        );
+        // A Create SRR with no SRR ID is malformed, not accepted.
+        let mut no_id = srr_body(1, &[5]);
+        no_id.drain(..5);
+        let resp = modify(&smf, addr, upf_seid, 4, &[(pfcp_ie::CREATE_SRR, no_id)]).await;
+        assert_eq!(response_cause(&resp), PfcpCause::MandatoryIeIncorrect as u8);
+        assert!(!dp.with_qos_flow_monitor(|m| m.is_active()));
+    }
+
+    #[tokio::test]
+    async fn an_establishment_s_create_srr_provisions_monitoring_and_deletion_ends_it() {
+        let (server, smf, addr, mut rx) = spawn_test_server().await;
+        server.set_qos_flow_monitoring(true);
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        server.set_data_plane(dp.clone());
+        let assoc = build_association_setup_request_payload(Some(1));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        b.add_f_seid(&crate::n4_build::FSeid {
+            seid: 0x4343,
+            ipv4: Some(Ipv4Addr::new(127, 0, 0, 9)),
+            ipv6: None,
+        });
+        b.add_tlv(pfcp_ie::CREATE_PDR, &pdr_body(1, 100, 1, 1, 1));
+        b.add_tlv(pfcp_ie::CREATE_FAR, &far_body(1, 0x02));
+        b.add_tlv(pfcp_ie::CREATE_QER, &qer_body(1, 5));
+        b.add_tlv(pfcp_ie::CREATE_SRR, &srr_body(2, &[5, 7]));
+        let resp = exchange(&smf, addr, &encode_pfcp(50, Some(0), 2, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        let upf_seid = *server.sessions.read().await.keys().next().unwrap();
+        assert_eq!(
+            dp.with_qos_flow_monitor(|m| m.monitored_qfis(upf_seid)),
+            vec![5, 7]
+        );
+        assert_eq!(dp.with_qos_flow_monitor(|m| m.srr_ids(upf_seid)), vec![2]);
+        let evt = rx.recv().await.unwrap();
+        crate::handle_pfcp_session_event(&dp, evt).await;
+
+        let resp = exchange(&smf, addr, &encode_pfcp(54, Some(upf_seid), 3, &[])).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        assert!(
+            !dp.with_qos_flow_monitor(|m| m.is_active()),
+            "the session is gone"
+        );
+    }
+
+    #[test]
+    fn a_qos_monitoring_session_report_groups_its_reports_by_srr() {
+        use nextgcore_pfcp::qos_monitoring::{QosMonitoringMeasurement, QosMonitoringReport};
+        let rep = |qfi| QosMonitoringReport {
+            qfi,
+            qos_monitoring_measurement: QosMonitoringMeasurement {
+                round_trip_packet_delay: Some(40),
+                ..Default::default()
+            },
+            time_stamp: 0xe8a0_0001,
+            start_time: None,
+            extra: Vec::new(),
+        };
+        let body = crate::n4_build::build_qos_monitoring_session_report(&[
+            (1, rep(5)),
+            (2, rep(6)),
+            (1, rep(7)),
+        ]);
+        let ies = ParsedIe::parse_all(&body);
+        assert_eq!(ies[0].ie_type, pfcp_ie::REPORT_TYPE);
+        let srs = ParsedIe::find_all_ies(&ies, pfcp_ie::SESSION_REPORT);
+        assert_eq!(srs.len(), 2);
+        let first = ParsedIe::parse_all(&srs[0].value);
+        assert_eq!(
+            first[0].ie_type,
+            pfcp_ie::SRR_ID,
+            "SRR ID first (Table 7.5.8.6-1)"
+        );
+        assert_eq!(first[0].value, vec![1]);
+        assert_eq!(ParsedIe::find_all_ies(&first, 247).len(), 2, "QFIs 5 and 7");
+        // Golden bytes of one QoS Monitoring Report IE: QFI 5, RPPD 40 ms, Time Stamp.
+        assert_eq!(
+            first[1].value,
+            vec![
+                0x00, 0x7c, 0x00, 0x01, 0x05, // QFI
+                0x00, 0xf8, 0x00, 0x05, 0x04, 0x00, 0x00, 0x00, 0x28, // IE 248: RPPD, 40
+                0x00, 0x9c, 0x00, 0x04, 0xe8, 0xa0, 0x00, 0x01, // Time Stamp (156)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_establishment_s_create_srr_is_not_acted_on_without_qos_flow_monitoring() {
+        // #1451 review m4: the establishment twin of the modification gate.
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        server.set_data_plane(dp.clone());
+        let assoc = build_association_setup_request_payload(Some(1));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        b.add_f_seid(&crate::n4_build::FSeid {
+            seid: 0x4444,
+            ipv4: Some(Ipv4Addr::new(127, 0, 0, 9)),
+            ipv6: None,
+        });
+        b.add_tlv(pfcp_ie::CREATE_PDR, &pdr_body(1, 100, 1, 1, 1));
+        b.add_tlv(pfcp_ie::CREATE_FAR, &far_body(1, 0x02));
+        b.add_tlv(pfcp_ie::CREATE_SRR, &srr_body(2, &[5]));
+        let resp = exchange(&smf, addr, &encode_pfcp(50, Some(0), 2, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        let upf_seid = *server.sessions.read().await.keys().next().unwrap();
+        assert!(server.sessions.read().await[&upf_seid]
+            .rules
+            .srr_ids
+            .is_empty());
+        assert!(
+            !dp.with_qos_flow_monitor(|m| m.is_active()),
+            "nothing monitored"
+        );
+    }
+
+    #[tokio::test]
+    async fn losing_the_association_ends_monitoring_with_no_data_plane_session() {
+        // #1451 review m5: a monitored SEID whose data-plane install never
+        // happened is still cleared when the association goes.
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        server.set_qos_flow_monitoring(true);
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        server.set_data_plane(dp.clone());
+        let assoc = build_association_setup_request_payload(Some(100));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        let srr = crate::n4_build::parse_srr(&srr_body(1, &[5])).unwrap();
+        server.apply_srrs(0x77, &[], &[srr], &[]);
+        assert!(dp.with_qos_flow_monitor(|m| m.is_active()));
+        assert!(
+            dp.sessions.find_by_seid(0x77).is_none(),
+            "no data-plane session"
+        );
+        // A heartbeat with a new Recovery Time Stamp: the peer restarted.
+        let mut hb = crate::n4_build::PfcpMessageBuilder::new();
+        hb.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, 200);
+        let _ = exchange(&smf, addr, &encode_pfcp(1, None, 2, &hb.build())).await;
+        for _ in 0..50 {
+            if !dp.with_qos_flow_monitor(|m| m.is_active()) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the monitor outlived the association");
+    }
+
+    #[tokio::test]
+    async fn a_report_for_a_session_gone_from_the_pfcp_table_ends_its_monitoring() {
+        let (server, _smf, _addr, _rx) = spawn_test_server().await;
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        server.set_data_plane(dp.clone());
+        let srr = crate::n4_build::parse_srr(&srr_body(1, &[5])).unwrap();
+        server.apply_srrs(0x78, &[], &[srr], &[]);
+        let rep = nextgcore_pfcp::qos_monitoring::QosMonitoringReport::default();
+        assert!(server
+            .send_qos_monitoring_report(0x78, &[(1, rep)])
+            .await
+            .is_err());
+        assert!(!dp.with_qos_flow_monitor(|m| m.is_active()));
     }
 }

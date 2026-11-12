@@ -643,8 +643,13 @@ jobs:
     # The GTP-U path delay (GPQM, TS 29.244 §5.24.5) and the N6 delay (UN6DM,
     # §5.33.8) upfd reports in PFCP Node Reports must be within TOL_MS of the
     # injected one-way delay, at 20 ms and 50 ms. The demo-off arm runs upfd with
-    # neither flag: 8-octet UP Function Features, no IE 354, no report. Needs
-    # NET_ADMIN (netns, veth, netem) and a TUN for the data plane, hence sudo.
+    # neither flag: 8-octet UP Function Features, no IE 354, no report.
+    # #1389 part 3 (QFQM, §5.24.4): the far end also answers QoS Monitoring
+    # Packets as a stand-in NG-RAN (T2/T3, stated RAN delays 2/3 ms); the per
+    # QoS flow DL/UL/RTT delays upfd reports in Session Reports must match the
+    # per-direction netem delay plus the RAN part (symmetric unsynced, asymmetric
+    # clock-synced), with an off arm and negative controls. Needs NET_ADMIN
+    # (netns, veth, netem) and a TUN for the data plane, hence sudo.
     runs-on: ubuntu-latest
     needs: check
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
@@ -657,7 +662,7 @@ jobs:
           workspaces: src
       - name: build upfd
         run: cd src && cargo build -p nextgcore-upfd
-      - name: netem arms (off, 20 ms, 50 ms, negative controls)
+      - name: netem arms (off, 20 ms, 50 ms, QFQM per flow, negative controls)
         run: |
           sudo modprobe sch_netem || true
           sudo TOL_MS=5 bash docker/qos-delay-netem/run.sh src/target/debug/nextgcore-upfd /tmp/qos-delay-netem
