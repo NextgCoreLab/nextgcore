@@ -385,6 +385,16 @@ impl FeedbackRegistry {
         ))
     }
 
+    /// Drops a model's collector (nextgsim#468: a registration ended).
+    pub fn unregister_model(&mut self, model_id: &str) -> bool {
+        self.collectors.remove(model_id).is_some()
+    }
+
+    /// How many collectors the registry holds.
+    pub fn collector_count(&self) -> usize {
+        self.collectors.len()
+    }
+
     /// The collector for a model.
     pub fn collector(&self, model_id: &str) -> Option<&FeedbackCollector> {
         self.collectors.get(model_id)

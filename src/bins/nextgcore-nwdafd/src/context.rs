@@ -911,6 +911,11 @@ pub struct MlProvSubscription {
     /// `mlEvRepCon.mlAccuracyThreshold` per event, kept with ModelProvisionExt.
     #[serde(default)]
     pub accuracy_thresholds: Vec<crate::ml_service::EventAccuracyThreshold>,
+    /// The subscribing NWDAF's instance id, from its `User-Agent:
+    /// NWDAF-<nfInstanceId>` (TS 29.500 Table 5.2.2.2-1), when it sent one
+    /// (nextgsim#468: the threshold of the AnLF that registers a model).
+    #[serde(default)]
+    pub consumer_id: Option<String>,
 }
 
 impl MlProvSubscription {
@@ -929,6 +934,7 @@ impl MlProvSubscription {
             delivered_sha256: None,
             supp_feats: None,
             accuracy_thresholds: Vec::new(),
+            consumer_id: None,
         }
     }
 
@@ -1377,13 +1383,16 @@ impl NwdafContext {
             .cloned()
     }
 
-    /// The lowest `mlAccuracyThreshold` (percent) any ML-provision
-    /// subscription set for `event` (nextgsim#468), if any.
-    pub fn ml_prov_accuracy_threshold(&self, event: AnalyticsId) -> Option<u8> {
+    /// The `mlAccuracyThreshold` (percent) NWDAF `consumer_id`'s own
+    /// ML-provision subscription set for `event` (nextgsim#468), if any; the
+    /// lowest when it holds several (an older one left by a restart, #1474).
+    /// Other consumers' subscriptions do not count.
+    pub fn ml_prov_accuracy_threshold(&self, event: AnalyticsId, consumer_id: &str) -> Option<u8> {
         self.ml_prov_subscriptions
             .read()
             .ok()?
             .values()
+            .filter(|s| s.consumer_id.as_deref() == Some(consumer_id))
             .flat_map(|s| s.accuracy_thresholds.iter())
             .filter(|t| t.event == event)
             .map(|t| t.threshold)

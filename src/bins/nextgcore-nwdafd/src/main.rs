@@ -389,13 +389,17 @@ async fn main() -> Result<()> {
     match &model_retrain_plan {
         model_retrain::Plan::Off => {}
         model_retrain::Plan::On { mode, role } => {
-            model_monitor::install(model_monitor::Monitor::new(
+            let m = model_monitor::install(model_monitor::Monitor::new(
                 mode,
                 *role,
                 &sbi_base,
                 &nf_instance_id,
                 &args.nrf_uri,
             ));
+            // Audit idle registrations and expire stale ones (#1473 review).
+            if role.serves_mtlf() {
+                model_monitor::spawn_upkeep(m);
+            }
         }
         model_retrain::Plan::Client { mode, .. } => {
             let m = model_monitor::install(model_monitor::Monitor::new(

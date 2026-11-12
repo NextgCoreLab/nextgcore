@@ -347,9 +347,15 @@ async fn the_anlf_subscribes_verifies_and_loads_v1_then_v2() {
         port: mtlf_port,
         id: "mtlf-468".into(),
     };
-    let created = subscribe_once(anlf, &target, &format!("http://127.0.0.1:{anlf_port}"), 70)
-        .await
-        .expect("the MTLF accepts the AnLF's subscription");
+    let created = subscribe_once(
+        anlf,
+        &target,
+        &format!("http://127.0.0.1:{anlf_port}"),
+        "anlf-468",
+        70,
+    )
+    .await
+    .expect("the MTLF accepts the AnLF's subscription");
     assert_eq!(created["suppFeats"], "8");
     let sub_id = created["subscriptionId"].as_str().unwrap().to_string();
     let stored = mtlf_ctx
@@ -359,6 +365,11 @@ async fn the_anlf_subscribes_verifies_and_loads_v1_then_v2() {
         .unwrap();
     assert!(stored.model_provision_ext());
     assert_eq!(stored.accuracy_thresholds[0].threshold, 70);
+    assert_eq!(
+        stored.consumer_id.as_deref(),
+        Some("anlf-468"),
+        "the MTLF knows whose threshold this is (User-Agent)"
+    );
 
     // The MTLF's dispatcher notifies v1; the AnLF verifies and loads it.
     crate::notification_dispatcher::dispatch_ml_prov_notifications(mtlf_ctx.clone()).await;
