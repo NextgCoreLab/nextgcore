@@ -491,11 +491,28 @@ pub fn build_gtpu_header_with_marking(
     rqi: bool,
     ppi: Option<u8>,
 ) -> Vec<u8> {
+    build_gtpu_header_dl(teid, payload_len, qfi, rqi, ppi, None)
+}
+
+/// The one place a downlink G-PDU header with a PDU Session Container is laid
+/// out. `qmp`: the DL Sending Time Stamp of a QoS Monitoring Packet (TS 38.415
+/// §5.5.2.1, #1389 part 3); `None` leaves the header exactly as before.
+pub fn build_gtpu_header_dl(
+    teid: u32,
+    payload_len: u16,
+    qfi: u8,
+    rqi: bool,
+    ppi: Option<u8>,
+    qmp: Option<u64>,
+) -> Vec<u8> {
     use bytes::BytesMut;
     use nextgcore_gtp::v1::types::{ExtensionHeaderType, Gtp1ExtHeader, PduSessionContainer};
 
-    let ext =
-        Gtp1ExtHeader::pdu_session_container(&PduSessionContainer::dl_with_marking(qfi, rqi, ppi));
+    let mut container = PduSessionContainer::dl_with_marking(qfi, rqi, ppi);
+    if let (Some(ts), PduSessionContainer::Dl(dl)) = (qmp, &mut container) {
+        dl.dl_sending_timestamp = Some(ts);
+    }
+    let ext = Gtp1ExtHeader::pdu_session_container(&container);
     let ext_len = ext.encoded_len();
 
     let mut header = Vec::with_capacity(12 + ext_len);
@@ -3006,6 +3023,13 @@ pub enum UpfReportEvent {
     N6DelayReport {
         reports: Vec<nextgcore_pfcp::qos_monitoring::N6DelayMeasurementReport>,
     },
+    /// Per QoS flow QoS monitoring reports of one session (#1389 part 3, TS
+    /// 29.244 §5.24.4.3) → PFCP Session Report Request with SESR and a Session
+    /// Report IE per SRR.
+    QosMonitoringReport {
+        upf_seid: u64,
+        reports: Vec<crate::qos_flow_mon::SrrReport>,
+    },
     /// First DL packet buffered under a BUFF+NOCP FAR → Downlink Data Report
     /// (TS 29.244 7.5.8.2 / 8.2.39)
     DownlinkDataReport {
@@ -3085,6 +3109,14 @@ pub struct DataPlane {
     /// unless the SMF provisions N6 Delay Measurement Control Information and
     /// the feature is enabled (`--n6-delay-measurement`).
     pub n6_delay: std::sync::Mutex<crate::n6_delay::N6DelayMonitor>,
+    /// #1389 part 3: per QoS flow per UE QoS monitoring (TS 29.244 §5.24.4,
+    /// QFQM). Inert unless the SMF provisions an SRR with QoS Monitoring per QoS
+    /// flow Control Information and the feature is enabled
+    /// (`--qos-flow-monitoring`).
+    qos_flow: std::sync::Mutex<crate::qos_flow_mon::QosFlowMonitor>,
+    /// Whether [`Self::qos_flow`] monitors anything: read on every G-PDU, so the
+    /// forwarding path takes no lock while no flow is monitored.
+    qos_flow_active: AtomicBool,
 }
 
 /// Data plane statistics
@@ -3454,7 +3486,33 @@ impl DataPlane {
             path_table: RwLock::new(GtpuPathTable::default()),
             path_qos: std::sync::Mutex::new(crate::path_qos::PathQosMonitor::default()),
             n6_delay: std::sync::Mutex::new(crate::n6_delay::N6DelayMonitor::default()),
+            qos_flow: std::sync::Mutex::new(crate::qos_flow_mon::QosFlowMonitor::default()),
+            qos_flow_active: AtomicBool::new(false),
         }
+    }
+
+    /// #1389 part 3: whether the NG-RAN and this UPF are time synchronised, so
+    /// the one-way N3 delays are T2-T1 and T4-T3 (TS 23.501 §5.33.3.2). Set at
+    /// startup; it resets the monitor.
+    pub fn set_qos_flow_clock_synced(&self, synced: bool) {
+        *self.qos_flow.lock().unwrap() = crate::qos_flow_mon::QosFlowMonitor::new(synced);
+        self.qos_flow_active.store(false, Ordering::Release);
+    }
+
+    /// #1389 part 3: run `f` on the per QoS flow monitor, keeping the forwarding
+    /// path's "anything monitored" flag in step with it.
+    pub fn with_qos_flow_monitor<R>(
+        &self,
+        f: impl FnOnce(&mut crate::qos_flow_mon::QosFlowMonitor) -> R,
+    ) -> R {
+        let mut m = self.qos_flow.lock().unwrap();
+        let r = f(&mut m);
+        self.qos_flow_active.store(m.is_active(), Ordering::Release);
+        r
+    }
+
+    fn qos_flow_active(&self) -> bool {
+        self.qos_flow_active.load(Ordering::Acquire)
     }
 
     /// Attach the channel used to raise Session Report triggers to the PFCP
@@ -3891,6 +3949,18 @@ impl DataPlane {
                 log::trace!("Ignoring GTP-U message type {}", header.msg_type);
                 return;
             }
+        }
+
+        // #1389 part 3: the NG-RAN's answer to a QoS Monitoring Packet, in the UL
+        // PDU Session Container of a G-PDU or of a dummy G-PDU with no T-PDU
+        // (TS 38.415 §5.5.2.2, TS 29.281 §5.2.2.7). A dummy is consumed here: it is
+        // neither forwarded to the data network nor counted (TS 29.244 §5.24.4.3
+        // NOTE). Looked at only while some flow is monitored.
+        if self.qos_flow_active()
+            && self.on_qmp_answer(pkt, header.teid, from)
+            && pkt.len() <= header.header_len
+        {
+            return;
         }
 
         // Extract IP payload
@@ -4416,8 +4486,35 @@ impl DataPlane {
         // Build GTP-U encapsulated packet, carrying the QFI in a PDU Session
         // Container extension header on N3 (TS 38.415 / TS 29.281 5.2.2.7). The
         // inner IP packet is forwarded byte-for-byte intact.
-        let gtpu_pkt =
-            encapsulate_dl_gpdu_marked(pkt, dl_teid, qfi_to_apply, rqi_to_apply, ppi_to_apply);
+        //
+        // #1389 part 3: a QoS Monitoring Packet due on this flow rides on this
+        // packet, with T1 as its DL Sending Time Stamp (TS 29.244 §5.24.4.3).
+        let qmp = match qfi_to_apply {
+            Some(q) if self.qos_flow_active() => self.with_qos_flow_monitor(|m| {
+                m.on_downlink(
+                    session.upf_seid,
+                    q,
+                    std::time::Instant::now(),
+                    std::time::SystemTime::now(),
+                )
+            }),
+            _ => None,
+        };
+        let gtpu_pkt = match (qmp, qfi_to_apply) {
+            (Some(t1), Some(q)) => {
+                let mut out = build_gtpu_header_dl(
+                    dl_teid,
+                    pkt.len() as u16,
+                    q,
+                    rqi_to_apply,
+                    ppi_to_apply,
+                    Some(t1),
+                );
+                out.extend_from_slice(pkt);
+                out
+            }
+            _ => encapsulate_dl_gpdu_marked(pkt, dl_teid, qfi_to_apply, rqi_to_apply, ppi_to_apply),
+        };
 
         // Send to gNB -- on the IPv6 socket for an IPv6 gNB (#918).
         let sock = if gnb_addr.is_ipv6() {
@@ -4855,6 +4952,9 @@ impl DataPlane {
 
     /// Remove a session from PFCP deletion
     pub fn remove_session_from_pfcp(&self, upf_seid: u64) {
+        if self.qos_flow_active() {
+            self.with_qos_flow_monitor(|m| m.remove_session(upf_seid));
+        }
         self.sessions.forget_ul_teids(upf_seid);
         if self.sessions.remove_session_by_seid(upf_seid) {
             log::info!("Removed data plane session: SEID={upf_seid:#x}");
@@ -5149,6 +5249,104 @@ impl DataPlane {
         }
     }
 
+    /// #1389 part 3: a G-PDU from the NG-RAN on `teid`. Returns whether its UL
+    /// PDU Session Container carries a QoS Monitoring Packet answer (QMP); one
+    /// that answers a probe of the session is measured, and any report it
+    /// triggers goes to the CP function.
+    fn on_qmp_answer(&self, pkt: &[u8], teid: u32, from: SocketAddr) -> bool {
+        use nextgcore_gtp::v1::types::PduSessionContainer;
+        let t4 = crate::qos_flow_mon::ntp64(std::time::SystemTime::now());
+        let Some(PduSessionContainer::Ul(ul)) = pdu_session_container_of(pkt) else {
+            return false;
+        };
+        let Some(ts) = ul.qos_monitoring else {
+            return false;
+        };
+        let Some(session) = self.sessions.find_by_ul_teid(teid) else {
+            log::debug!("QMP answer from {from} on unknown TEID {teid:#x}: ignored");
+            return true;
+        };
+        let answer = crate::qos_flow_mon::QmpAnswer {
+            t1: ts.dl_sending_timestamp_repeated,
+            t2: ts.dl_received_timestamp,
+            t3: ts.ul_sending_timestamp,
+            t4,
+            dl_ran_ms: ul.dl_delay_result,
+            ul_ran_ms: ul.ul_delay_result,
+        };
+        let now = std::time::Instant::now();
+        let wall = std::time::SystemTime::now();
+        let seid = session.upf_seid;
+        match self.with_qos_flow_monitor(|m| m.on_answer(seid, &answer, now, wall)) {
+            Some((qfi, d, reports)) => {
+                log::debug!(
+                    "QoS monitoring SEID {seid:#x} QFI {qfi} (answered on QFI {}): DL {} ms \
+                     UL {} ms RTT {} ms (RAN part DL {:?} UL {:?})",
+                    ul.qfi,
+                    d.dl,
+                    d.ul,
+                    d.rp,
+                    ul.dl_delay_result,
+                    ul.ul_delay_result
+                );
+                if !reports.is_empty() {
+                    self.send_report_event(UpfReportEvent::QosMonitoringReport {
+                        upf_seid: seid,
+                        reports,
+                    });
+                }
+            }
+            None => log::debug!(
+                "QMP answer from {from} SEID {seid:#x} answers no outstanding probe: ignored"
+            ),
+        }
+        true
+    }
+
+    /// #1389 part 3: one round of per QoS flow QoS monitoring: a dummy G-PDU
+    /// (no T-PDU, with QMP and T1) to every monitored flow that carried no
+    /// downlink traffic since the last round, and the reports that are due.
+    pub async fn qos_flow_round(&self) {
+        if !self.qos_flow_active() {
+            return;
+        }
+        let round = self.with_qos_flow_monitor(|m| {
+            m.round(std::time::Instant::now(), std::time::SystemTime::now())
+        });
+        for p in round.dummies {
+            let Some(session) = self.sessions.find_by_seid(p.upf_seid) else {
+                continue;
+            };
+            let (teid, gnb) = session.dl_tunnel();
+            if gnb.ip().is_unspecified() {
+                continue;
+            }
+            let Some(sock) = self.socket_for(&gnb) else {
+                continue;
+            };
+            let dummy = build_gtpu_header_dl(teid, 0, p.qfi, false, None, Some(p.t1));
+            if let Err(e) = sock.send_to(&dummy, gnb).await {
+                log::debug!("QoS monitoring dummy G-PDU to {gnb} failed: {e}");
+            }
+        }
+        for (upf_seid, reports) in round.reports {
+            self.send_report_event(UpfReportEvent::QosMonitoringReport { upf_seid, reports });
+        }
+    }
+
+    /// #1389 part 3: run [`Self::qos_flow_round`] every `interval` until shutdown.
+    pub async fn run_qos_flow_monitoring(&self, interval: std::time::Duration) {
+        log::info!("Per QoS flow QoS monitoring enabled (probe interval {interval:?})");
+        let mut tick = tokio::time::interval(interval);
+        loop {
+            tick.tick().await;
+            if self.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            self.qos_flow_round().await;
+        }
+    }
+
     /// #1389: run [`Self::path_qos_round`] every `interval` until shutdown.
     pub async fn run_path_qos_monitoring(&self, interval: std::time::Duration) {
         log::info!("GTP-U path QoS monitoring enabled (probe interval {interval:?})");
@@ -5389,6 +5587,31 @@ pub fn extract_qfi_from_gtp_header(gtp_bytes: &[u8]) -> Option<u8> {
         // Next extension header type is at the last byte of this extension
         next_ext_type = gtp_bytes[offset + ext_len - 1];
         offset += ext_len;
+    }
+    None
+}
+
+/// The PDU Session Container (extension header 0x85, TS 29.281 §5.2.2.7) of a
+/// G-PDU, decoded (TS 38.415 §5.5.2), if it has one that decodes.
+pub fn pdu_session_container_of(
+    gtp_bytes: &[u8],
+) -> Option<nextgcore_gtp::v1::types::PduSessionContainer> {
+    if gtp_bytes.len() < 12 || gtp_bytes[0] & 0x04 == 0 {
+        return None;
+    }
+    let mut next = gtp_bytes[11];
+    let mut offset = 12usize;
+    while next != 0 {
+        let len = *gtp_bytes.get(offset)? as usize * 4;
+        if len < 4 || offset + len > gtp_bytes.len() {
+            return None;
+        }
+        if next == 0x85 {
+            let content = &gtp_bytes[offset + 1..offset + len - 1];
+            return nextgcore_gtp::v1::types::PduSessionContainer::decode_content(content).ok();
+        }
+        next = gtp_bytes[offset + len - 1];
+        offset += len;
     }
     None
 }
@@ -10211,3 +10434,7 @@ mod tests {
         assert_eq!(seqs, vec![0x7ffe, 0x7fff, 1, 2]);
     }
 }
+
+#[cfg(test)]
+#[path = "qos_flow_dp_tests.rs"]
+mod qos_flow_dp_tests;
