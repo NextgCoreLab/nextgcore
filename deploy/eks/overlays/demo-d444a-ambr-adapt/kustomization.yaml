@@ -1,0 +1,48 @@
+# Demo D444A, app adaptation to a network-signalled Session-AMBR (nextgsim#477;
+# the convention is on nextgsim#458). Run with:
+#   k8s/demo-check.sh d444a-ambr-adapt semantic
+#   k8s/demo-check.sh d444a-ambr-adapt raw
+#
+# No NF code or config changes: smfd's step 3b (nextgcore#1385) is base-core,
+# spec-mandated behaviour. On top of the demo-off base this overlay:
+#   - adds semantic-sink as a second container of the upf pod, so it shares the
+#     UPF's network namespace and binds 10.45.0.1, the UE subnet's gateway on
+#     the UPF's TUN (patches/upf-sink.yaml). Its config comes from the ConfigMap
+#     d444a-sink (sink-config.yaml) through an env var, not a volume: the UPF
+#     data-plane swap in deploy-eks.sh replaces the pod's volume list;
+#   - appends semantic_comm_enabled and the semantic_stream block to the UE's
+#     resolved config (patches/ue-d444a-config.yaml);
+#   - adds the demo block to ue.yaml and sink.yaml through the toggles.
+#
+# The UE image is the demo build (build-images.sh): nr-ue with
+# `6g,demo-d444a-ambr-adapt`, plus nr-cli and semantic-sink. It is pushed under a
+# demo-d444a-ambr-adapt-<sha> tag and passed as SIM_IMAGE_TAG; the sink container
+# names nextgsim-ue:latest, which deploy-eks.sh rewrites to that same image.
+#
+# The sink has no probe. If it exits (a config error, or no 10.45.0.1 within
+# 180 s because the data plane is off) it crash-loops, and the UPF pod reports
+# NotReady: in this overlay "UPF not ready" can mean the sink failed. Read
+# `kubectl logs deploy/upf -c semantic-sink` first.
+#
+# ClusterIP only: no Service, no port. The sink is reachable only from inside
+# the UPF's netns, i.e. by UE traffic that crossed a PDU session; scenario.sh
+# reads everything with `kubectl exec` and `kubectl logs`.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: nextg-demo
+
+resources:
+  - ../demo
+  - toggles.yaml
+  - sink-config.yaml
+
+patches:
+  - path: patches/upf-sink.yaml
+    target:
+      kind: Deployment
+      name: upf
+  - path: patches/ue-d444a-config.yaml
+    target:
+      kind: Deployment
+      name: ue

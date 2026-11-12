@@ -1,0 +1,13 @@
+# semantic-sink's config (nextgsim#477). The demo block is added by the toggles
+# post-render. seed / rate_hz / epoch_datagrams must equal the UE's
+# semantic_stream block (patches/ue-d444a-config.yaml).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: d444a-sink
+data:
+  sink.yaml: |
+    listen: 10.45.0.1:5444
+    seed: 444
+    rate_hz: 50
+    epoch_datagrams: 500

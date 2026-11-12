@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nextg-demo-toggles
+data:
+  key: d444a-ambr-adapt
+  # The UE (encoder selection) and the sink (row labels). No NF reads it: the
+  # pcfd dependency check on d441a-congestion-loop lands with nextgsim#465.
+  targets: ue.yaml sink.yaml

@@ -1,0 +1,31 @@
+# semantic-sink in the upf pod (nextgsim#477). Appended (JSON patch `/-`) so the
+# UPF stays containers[0], which deploy-eks.sh's data-plane swap and
+# demo-check.sh's /metrics scrape both address by index.
+- op: add
+  path: /spec/template/spec/containers/-
+  value:
+    name: semantic-sink
+    image: nextgsim-ue:latest
+    imagePullPolicy: IfNotPresent
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        printf '%s\n' "${D444A_SINK_YAML}" >/tmp/sink.yaml
+        exec semantic-sink -c /tmp/sink.yaml
+    env:
+      - name: D444A_SINK_YAML
+        valueFrom:
+          configMapKeyRef:
+            name: d444a-sink
+            key: sink.yaml
+      - name: RUST_LOG
+        value: info
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 500m
+        memory: 128Mi

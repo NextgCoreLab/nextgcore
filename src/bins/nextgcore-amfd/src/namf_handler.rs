@@ -901,6 +901,9 @@ pub(crate) fn initiate_paging_for_idle_ue(
         ),
         supi: amf_ue.supi.clone(),
         answered_by: None,
+        // #1442: the RAN's recommendation from the release that made this UE idle
+        // (empty unless `paging.strategy: recommended-first`).
+        recommended: amf_ue.recommended_paging.clone(),
     };
 
     // Mark session as paging ongoing; keep the consumer's failure-notify

@@ -238,6 +238,14 @@ struct TimeYaml {
     t3512: Option<TimerValueYaml>,
 }
 
+/// The `amf.paging` block (#1442).
+#[derive(Debug, Default, Deserialize)]
+struct PagingYaml {
+    /// `registration-area` (the default) or `recommended-first`. Any other value
+    /// fails the parse, and so startup.
+    strategy: Option<context::PagingStrategy>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct AmfSection {
     amf_name: Option<String>,
@@ -253,6 +261,7 @@ struct AmfSection {
     nas: Option<NasYaml>,
     time: Option<TimeYaml>,
     emergency: Option<EmergencyYaml>,
+    paging: Option<PagingYaml>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -749,6 +758,13 @@ impl AmfApp {
         // and this function already holds the write guard.
         let timers = amf_section.time.unwrap_or_default();
         Self::apply_timer_conf(&mut ctx, &timers);
+
+        // #1442: the paging strategy. A configuration that leaves it out keeps the
+        // default, `registration-area`, today's behaviour.
+        if let Some(strategy) = amf_section.paging.and_then(|p| p.strategy) {
+            ctx.paging_strategy = strategy;
+        }
+        log::info!("Paging strategy: {}", ctx.paging_strategy.as_str());
 
         log::info!(
             "AMF configuration loaded: {} GUAMI, {} TAI, {} PLMN support, T3512={}s",
@@ -1549,6 +1565,88 @@ mod tests {
             .load_config("/nonexistent/amf.yaml")
             .await
             .is_ok());
+    }
+
+    /// **#1442.** `amf.paging.strategy` takes exactly the two spellings; an unknown
+    /// value fails the parse (so `load_config` refuses it, as any parse error), and a
+    /// configuration without the key keeps `registration-area`.
+    #[test]
+    fn the_paging_strategy_parses_and_an_unknown_value_is_refused() {
+        let parse = |yaml: &str| serde_yaml::from_str::<AmfYaml>(yaml);
+        let strategy = |yaml: &str| {
+            parse(yaml)
+                .expect("parses")
+                .amf
+                .and_then(|a| a.paging)
+                .and_then(|p| p.strategy)
+        };
+        assert_eq!(
+            strategy("amf:\n  paging:\n    strategy: recommended-first\n"),
+            Some(context::PagingStrategy::RecommendedFirst)
+        );
+        assert_eq!(
+            strategy("amf:\n  paging:\n    strategy: registration-area\n"),
+            Some(context::PagingStrategy::RegistrationArea)
+        );
+        assert_eq!(strategy("amf:\n  amf_name: x\n"), None);
+        assert_eq!(
+            context::PagingStrategy::default(),
+            context::PagingStrategy::RegistrationArea,
+            "the default is today's behaviour"
+        );
+        let err = parse("amf:\n  paging:\n    strategy: nearest\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown variant"), "{err}");
+    }
+
+    /// **#1442.** `load_config` applies `amf.paging.strategy` to the context the
+    /// NGAP path reads, and refuses an unknown value.
+    #[tokio::test]
+    async fn the_config_loader_applies_the_paging_strategy() {
+        use std::io::Write;
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        context::amf_context_init(64, 1024, 4096);
+        let strategy = || {
+            context::amf_self()
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .paging_strategy
+        };
+        assert_eq!(strategy(), context::PagingStrategy::RegistrationArea);
+
+        let path = unique_fixture_path("nextgcore-amfd-1442-paging-strategy.yaml");
+        let write = |yaml: &str| {
+            let mut f = std::fs::File::create(&path).expect("write the fixture config");
+            f.write_all(yaml.as_bytes())
+                .expect("write the fixture config");
+        };
+        write("amf:\n  amf_name: amf-1442\n  paging:\n    strategy: nearest\n");
+        let err = AmfApp::new()
+            .load_config(path.to_str().expect("utf-8"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not parse"), "{err}");
+        assert_eq!(
+            strategy(),
+            context::PagingStrategy::RegistrationArea,
+            "a refused load changes nothing"
+        );
+
+        write("amf:\n  amf_name: amf-1442\n  paging:\n    strategy: recommended-first\n");
+        let loaded = AmfApp::new()
+            .load_config(path.to_str().expect("utf-8"))
+            .await;
+        let applied = strategy();
+        // Restore before asserting, so a failure cannot leak the strategy.
+        context::amf_self()
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .paging_strategy = context::PagingStrategy::default();
+        remove_fixture(&path);
+        loaded.expect("the fixture config must load");
+        assert_eq!(applied, context::PagingStrategy::RecommendedFirst);
     }
 
     /// **#920 follow-up.** A configured S-NSSAI with SST 0 -- not a slice, TS 23.501

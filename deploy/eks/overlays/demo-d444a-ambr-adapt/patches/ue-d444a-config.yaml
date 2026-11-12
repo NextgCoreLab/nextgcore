@@ -1,0 +1,39 @@
+# Appended (JSON patch `/-`), so it runs AFTER resolve-dns, which writes the
+# final /etc/nextgsim/ue.yaml (the d440b precedent). The shipped ue.yaml sets
+# neither key, so they are appended; a template that already sets one fails here
+# rather than run with two values.
+- op: add
+  path: /spec/template/spec/initContainers/-
+  value:
+    name: d444a-config
+    image: busybox:1.36
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        f=/etc/nextgsim/ue.yaml
+        if grep -qE '^(semantic_comm_enabled|semantic_stream):' "$f"; then
+          echo "[d444a-config] FATAL: $f already sets semantic_comm_enabled/semantic_stream" >&2
+          exit 1
+        fi
+        # tun_name is a prefix (nextgsim#432): the first session's TUN is <prefix>0.
+        prefix="$(sed -nE 's/^tun_name:[[:space:]]*"?([^"[:space:]]+)"?.*/\1/p' "$f")"
+        dev="${prefix:-uesimtun}0"
+        cat >>"$f" <<YAML
+
+        # d444a-ambr-adapt (nextgsim#477)
+        semantic_comm_enabled: true
+        semantic_stream:
+          sink: 10.45.0.1:5444
+          device: ${dev}
+          psi: 1
+          rate_hz: 50
+          epoch_datagrams: 500
+          seed: 444
+          follow_session_ambr: true
+        YAML
+        grep -nE '^(semantic_|demo:)' -A3 "$f"
+    volumeMounts:
+      - name: config-resolved
+        mountPath: /etc/nextgsim

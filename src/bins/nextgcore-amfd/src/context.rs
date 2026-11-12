@@ -564,6 +564,9 @@ pub struct AmfContext {
     /// `gmm_build::encode_gprs_timer3_seconds`, which requires the value to be
     /// exactly representable as `n x unit` with `n <= 31`.
     pub t3512_value: u64,
+    /// Which (R)AN nodes a CM-IDLE UE is paged on (`amf.paging.strategy`, #1442).
+    /// TS 23.501 §5.4.3.1 leaves the paging strategy to local configuration.
+    pub paging_strategy: PagingStrategy,
 
     // ID generators
     /// Next gNB ID
@@ -1327,6 +1330,7 @@ impl AmfContext {
             // emitted IE, a stale default would silently change the timer every
             // UE receives, so it is corrected to the value actually in use.
             t3512_value: 540,
+            paging_strategy: PagingStrategy::default(),
             next_gnb_id: AtomicUsize::new(1),
             next_ran_ue_id: AtomicUsize::new(1),
             next_sess_id: AtomicUsize::new(1),
@@ -3725,6 +3729,12 @@ pub struct AmfUe {
     /// `NrLocation.ueLocationTimestamp` (TS 29.571 §5.4.4.9), `lastActTime` and the
     /// NGAP location age.
     pub ue_location_timestamp: u64,
+    /// The Recommended RAN Nodes for Paging the RAN reported in the UE CONTEXT
+    /// RELEASE COMPLETE that made this UE CM-IDLE (TS 38.413 §8.3.3.2, #1442), in
+    /// the RAN's order. Stored only under [`PagingStrategy::RecommendedFirst`];
+    /// empty otherwise, and cleared by every release that carries none, so it
+    /// always describes the current idle period.
+    pub recommended_paging: Vec<RecommendedPagingTarget>,
     /// Last visited PLMN ID
     pub last_visited_plmn_id: PlmnId,
     /// Requested NSSAI
@@ -4532,6 +4542,7 @@ impl AmfUe {
             guami_index: None,
             gnb_ostream_id: 0,
             nr_tai: Tai5gs::default(),
+            recommended_paging: Vec::new(),
             nr_cgi: NrCgi::default(),
             ue_location_timestamp: 0,
             last_visited_plmn_id: PlmnId::default(),
@@ -4812,6 +4823,46 @@ impl Default for AmfUe {
 // AmfSess - PDU Session Context
 // ============================================================================
 
+/// The paging strategy (`amf.paging.strategy`, #1442).
+///
+/// TS 23.501 §5.4.3.1 leaves it to local configuration. TS 38.413 §8.3.3.2 makes
+/// storing the Information on Recommended Cells and RAN Nodes for Paging optional
+/// ("shall, if supported, store it"), so the default stays today's behaviour.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PagingStrategy {
+    /// Page every gNB serving the UE's registration area, on every attempt. The
+    /// IE is decoded but not stored.
+    #[default]
+    RegistrationArea,
+    /// Store the IE at UE CONTEXT RELEASE COMPLETE. Page the recommended (R)AN
+    /// nodes on the first attempt, then the whole registration area on every
+    /// T3513 retransmission (TS 23.502 §4.2.3.3: when the information is
+    /// available the AMF "shall take that information into account").
+    RecommendedFirst,
+}
+
+impl PagingStrategy {
+    /// The configuration spelling, for the startup log.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RegistrationArea => "registration-area",
+            Self::RecommendedFirst => "recommended-first",
+        }
+    }
+}
+
+/// One entry of the Recommended RAN Nodes for Paging (TS 38.413 §9.3.1.101): the
+/// CHOICE AMF Paging Target, either an NG-RAN node or a TAI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecommendedPagingTarget {
+    /// A Global RAN Node ID (§9.3.1.5), matched against the identity each gNB or
+    /// ng-eNB gave at NG Setup.
+    RanNode(nextgcore_ngap::types::GlobalRanNodeId),
+    /// A TAI (§9.3.3.11): the nodes serving it.
+    Tai(PlmnId, u32),
+}
+
 /// Paging context for tracking UEs awaiting paging response (TS 23.502 4.2.3.3)
 #[derive(Debug, Clone)]
 pub struct PagingContext {
@@ -4872,6 +4923,12 @@ pub struct PagingContext {
     /// ([`AmfContext::paging_take_answered`]); one never taken runs out on T3513's
     /// schedule and is abandoned, so its requester is still told.
     pub answered_by: Option<u64>,
+    /// #1442: the UE's stored Recommended RAN Nodes for Paging, copied when paging
+    /// starts. Non-empty only under [`PagingStrategy::RecommendedFirst`]. The first
+    /// attempt goes to the recommended nodes that serve the registration area;
+    /// every retransmission, and a first attempt none of them resolves, goes to
+    /// the whole registration area (TS 23.502 §4.2.3.3).
+    pub recommended: Vec<RecommendedPagingTarget>,
 }
 
 /// What one paging pump pass decided (TS 24.501 §5.6.2.2.1 / §5.6.2.2.2).
@@ -4909,6 +4966,7 @@ impl Default for PagingContext {
             n1n2_msg_data_uri: String::new(),
             supi: None,
             answered_by: None,
+            recommended: Vec::new(),
         }
     }
 }

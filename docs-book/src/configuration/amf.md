@@ -39,6 +39,10 @@ amf:
     integrity_order: ["NIA2", "NIA1", "NIA0"]
     ciphering_order: ["NEA2", "NEA1", "NEA0"]
 
+  # Which gNBs a CM-IDLE UE is paged on; see "Paging strategy" below.
+  # paging:
+  #   strategy: registration-area
+
   # REGULATORY switch, default true. Read "Unauthenticated emergency service"
   # below before changing it: this key decides whether an emergency call
   # connects when the AUSF is unreachable, and the correct value is a matter of
@@ -77,6 +81,7 @@ All keys live under the top-level `amf:` section. Types and defaults below come 
 | `time.t3512.value` | u64 (seconds) | `540` | Periodic registration update timer sent to the UE in the Registration Accept (GPRS Timer 3). The mobile-reachable timer is derived from it (T3512 + 240 s) unless `AMF_MOBILE_REACHABLE_SECS` overrides it. |
 | `time.t3502.value` | u64 (seconds) | none | Parsed and stored, but not yet signalled to the UE. |
 | `emergency.allow_unauthenticated` | bool | **`true`** | Whether an EMERGENCY registration the network could not authenticate (e.g. the AUSF is unreachable) proceeds as an unauthenticated, emergency-only registration, or is refused. **This is a regulatory setting** — see [Unauthenticated emergency service](#unauthenticated-emergency-service) below. `AMF_EMERGENCY_ALLOW_UNAUTHENTICATED` overrides it. |
+| `paging.strategy` | `registration-area` or `recommended-first` | `registration-area` | Which gNBs a CM-IDLE UE is paged on (#1442). `registration-area` pages every gNB serving the UE's registration area on every attempt. `recommended-first` pages the gNBs the RAN recommended at the UE's last release first. See [Paging strategy](#paging-strategy). Any other value fails startup. Read at startup only: a change needs a restart. |
 
 ## Command-line flags
 
@@ -134,6 +139,22 @@ Cargo features: `kernel-sctp` (enables `--sctp-backend kernel`; the Docker build
 - **Empty security lists:** if `security` is omitted, the integrity/ciphering preference lists in the AMF context stay empty; supply explicit orders (as in the example) for deterministic algorithm selection.
 - **Multiple NRF entries** in `sbi.client.nrf` are parsed but only the first is used — additional entries are currently inert.
 - `amf.ngap.server[0]` and `amf.sbi.server[0]` are the NGAP and SBI listen addresses (#1311). `--ngap-addr` and `AMF_SBI_ADDR`/`AMF_SBI_PORT` override them; with neither, loopback (#1308). There is no `amf.metrics.server` (#1312); the metrics endpoint is `NEXTGCORE_METRICS_BIND`:`AMF_METRICS_PORT`.
+
+## Paging strategy
+
+`amf.paging.strategy` decides which NG-RAN nodes receive the NGAP PAGING for a CM-IDLE UE. TS 23.501 §5.4.3.1 leaves this to local configuration. The AMF logs the value in effect at startup, as `Paging strategy: <value>`.
+
+- **`registration-area`** (the default) sends the PAGING to every gNB whose Supported TA List serves the UE's registration area, on the first attempt and on every T3513 retransmission. This is the behaviour before #1442. The Information on Recommended Cells and RAN Nodes for Paging IE is decoded and not stored. TS 38.413 §8.3.3.2 makes storing it optional ("shall, if supported, store it"), so this is conformant.
+- **`recommended-first`**:
+  - **Storing.** The AMF stores the *Recommended RAN Nodes for Paging* (TS 38.413 §9.3.1.101) from the UE CONTEXT RELEASE COMPLETE that moves the UE to CM-IDLE. They are kept in the RAN's order: visited nodes, most recent first, each followed by its associated non-visited nodes.
+  - **Matching.** A RAN node matches a gNB or ng-eNB by the whole Global RAN Node ID (PLMN, gNB ID and its bit length) it gave at NG Setup. A TAI entry matches the nodes serving that TAI. An N3IWF entry is ignored.
+  - **First attempt.** The PAGING goes only to the recommended nodes that also serve the registration area, in that order. A recommended node outside the area is not paged, because the PAGING names the area's TAI. TS 23.502 §4.2.3.3: when the information is available the AMF "shall take that information into account".
+  - **Retransmissions.** Every T3513 retransmission (`AMF_T3513_SECS`) widens to the whole registration area.
+  - **Falling back.** If the recommendation matches no connected node in the area, the first attempt already pages the whole area. The same applies when the RAN sent no recommendation, and when the release or its IE was unusable.
+  - **Clearing.** The stored list belongs to one idle period. A release whose Complete carries no IE clears it. A CM-IDLE entry with no UE CONTEXT RELEASE COMPLETE also clears it: NG Reset, loss of the gNB's association, or an Initial Context Setup Failure.
+  - The *Recommended Cells for Paging* are transparent to the 5GC (§9.3.1.71) and are not kept. Paging Attempt Information and Assistance Data for Recommended Cells are not sent.
+
+The paging log line keeps its prefix in both modes: `Paging sent to N/M gNB(s) serving the registration area: ...`, and `... recommended by the RAN in the registration area: ...` for a recommended first attempt.
 
 ## Unauthenticated emergency service
 
