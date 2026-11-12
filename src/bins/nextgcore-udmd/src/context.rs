@@ -402,6 +402,51 @@ impl UdmSdmSubscription {
     }
 }
 
+/// One entry of an `EeSubscription.monitoringConfigurations` map (TS 29.503
+/// §6.4.6.2.3): the map key, which a MonitoringReport echoes as its
+/// `referenceId` (§6.4.6.2.4), and the mandatory `eventType`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EeMonitoringConfiguration {
+    pub reference_id: String,
+    pub event_type: String,
+}
+
+/// The monitoring configurations of an `EeSubscription` body, in key order (#1438).
+///
+/// `Err` when `monitoringConfigurations` is absent, not an object or empty (it is
+/// M, cardinality 1..N, TS 29.503 §6.4.6.2.2), or names the first entry that is
+/// not an object with a non-empty string `eventType` (M, §6.4.6.2.3). Either way
+/// the subscription would monitor nothing, so `Ok` is never empty. Create and
+/// PATCH both validate through here, so they agree on what a valid body is.
+pub fn ee_monitoring_configurations(
+    ee_subscription: &serde_json::Value,
+) -> Result<Vec<EeMonitoringConfiguration>, String> {
+    let Some(map) = ee_subscription
+        .get("monitoringConfigurations")
+        .and_then(|v| v.as_object())
+        .filter(|m| !m.is_empty())
+    else {
+        return Err(
+            "monitoringConfigurations is mandatory and must be a non-empty map".to_string(),
+        );
+    };
+    let mut out = Vec::with_capacity(map.len());
+    for (reference_id, config) in map {
+        match config.get("eventType").and_then(|v| v.as_str()) {
+            Some(event_type) if !event_type.is_empty() => out.push(EeMonitoringConfiguration {
+                reference_id: reference_id.clone(),
+                event_type: event_type.to_string(),
+            }),
+            _ => {
+                return Err(format!(
+                    "monitoringConfigurations[{reference_id}].eventType is mandatory"
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// udmd#0: A stored Nudm_EE (Event Exposure) subscription (TS 29.503 6.4).
 #[derive(Debug, Clone)]
 pub struct UdmEeSubscription {
@@ -413,20 +458,47 @@ pub struct UdmEeSubscription {
     pub callback_reference: String,
     /// Raw EeSubscription JSON as received.
     pub raw: String,
+    /// What the subscription monitors, parsed from `raw` (#1438). Only events of
+    /// these types are reported to it. Kept in step with `raw`: re-derive it with
+    /// [`UdmEeSubscription::set_raw`] whenever the body changes.
+    pub monitoring_configurations: Vec<EeMonitoringConfiguration>,
 }
 
 impl UdmEeSubscription {
+    /// A subscription for `ue_identity` whose monitored events come from `raw`.
+    /// An unparseable `raw`, or one with an invalid configuration, monitors
+    /// nothing; the handlers validate the body before calling this.
     pub fn for_ue(
         ue_identity: impl Into<String>,
         callback_reference: impl Into<String>,
         raw: impl Into<String>,
     ) -> Self {
-        Self {
+        let mut sub = Self {
             id: Uuid::new_v4().to_string(),
             ue_identity: ue_identity.into(),
             callback_reference: callback_reference.into(),
-            raw: raw.into(),
-        }
+            raw: String::new(),
+            monitoring_configurations: Vec::new(),
+        };
+        sub.set_raw(raw);
+        sub
+    }
+
+    /// Replace the stored body and re-derive the monitored configurations.
+    pub fn set_raw(&mut self, raw: impl Into<String>) {
+        self.raw = raw.into();
+        self.monitoring_configurations = serde_json::from_str(&self.raw)
+            .ok()
+            .and_then(|v| ee_monitoring_configurations(&v).ok())
+            .unwrap_or_default();
+    }
+
+    /// The configurations of this subscription that monitor `event_type`.
+    pub fn configurations_for(&self, event_type: &str) -> Vec<&EeMonitoringConfiguration> {
+        self.monitoring_configurations
+            .iter()
+            .filter(|c| c.event_type == event_type)
+            .collect()
     }
 }
 

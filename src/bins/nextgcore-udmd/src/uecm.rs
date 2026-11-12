@@ -2324,7 +2324,11 @@ mod tests {
             context.ee_subscription_insert(crate::context::UdmEeSubscription::for_ue(
                 supi,
                 uri.clone(),
-                "{}",
+                json!({
+                    "callbackReference": uri,
+                    "monitoringConfigurations": { "1": { "eventType": "UE_REACHABILITY_FOR_DATA" } },
+                })
+                .to_string(),
             ));
         }
 
@@ -2376,6 +2380,360 @@ mod tests {
             for sub in context.ee_subscriptions_for_supi(supi) {
                 context.ee_subscription_remove(&sub.id);
             }
+        }
+    }
+
+    /// A loopback stub consumer recording every body POSTed to it. The server is
+    /// returned so the caller holds it: dropping it closes the listener.
+    async fn ee_stub() -> (
+        nextgcore_sbi::server::SbiServer,
+        String,
+        Arc<std::sync::Mutex<Vec<Value>>>,
+    ) {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        let seen: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+        let sink = Arc::clone(&seen);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        server
+            .start(move |req: nextgcore_sbi::message::SbiRequest| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    if let Some(v) = req
+                        .http
+                        .content
+                        .as_deref()
+                        .and_then(|b| serde_json::from_str::<Value>(b).ok())
+                    {
+                        sink.lock().expect("sink").push(v);
+                    }
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await
+            .expect("stub starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        (server, format!("http://127.0.0.1:{}/ee", addr.port()), seen)
+    }
+
+    /// How many notifications `seen` received. A POST with an empty `reportList`
+    /// is still a POST, and `reported` alone would not see it.
+    fn posts(seen: &std::sync::Mutex<Vec<Value>>) -> usize {
+        seen.lock().expect("sink").len()
+    }
+
+    /// The event types each recorded MonitoringReport body carries, in order.
+    fn reported(seen: &std::sync::Mutex<Vec<Value>>) -> Vec<(String, String)> {
+        seen.lock()
+            .expect("sink")
+            .iter()
+            .flat_map(|b| b["reportList"].as_array().cloned().unwrap_or_default())
+            .map(|r| {
+                (
+                    r["eventType"].as_str().unwrap_or("").to_string(),
+                    r["referenceId"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// **#1438.** Nudm_EE delivers only the subscribed event types (TS 29.503
+    /// §5.5.2.2, §6.4.6.2.3), driven end to end: subscriptions created through
+    /// the real `handle_ee_subscribe` with real `EeSubscription` bodies, events
+    /// raised by the real UECM AMF registration and deregistration, reports read
+    /// off loopback consumers.
+    ///
+    /// - a LOSS_OF_CONNECTIVITY-only subscriber hears nothing on registration;
+    /// - a UE_REACHABILITY_FOR_DATA-only subscriber hears nothing on deregistration;
+    /// - a subscriber with both hears both, each report echoing its own
+    ///   configuration key as `referenceId`;
+    /// - a PDN_CONNECTIVITY_STATUS subscriber hears only the PDU session event;
+    /// - a PATCH of `monitoringConfigurations` changes what is delivered.
+    ///
+    /// Every UECM operation awaits its notifications, and a delivery returns only
+    /// after the consumer answered, so "nothing" is read right after the
+    /// operation, with no sleep.
+    ///
+    /// Revert-verified: removing the `configurations_for` filter in
+    /// `notify_ue_context_change` fails this test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn ee_subscribers_get_only_their_subscribed_event_types() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        std::env::remove_var("UDM_NOTIFY_DISABLE");
+        crate::context::udm_context_init(1024, 4096);
+        let supi = "imsi-001010000001438";
+        {
+            let ctx = udm_self();
+            let context = ctx.read().expect("context");
+            for sub in context.ee_subscriptions_for_supi(supi) {
+                context.ee_subscription_remove(&sub.id);
+            }
+            for sub in context.sdm_subscriptions_for_supi(supi) {
+                context.sdm_subscription_remove(&sub.id);
+            }
+        }
+
+        let (_loc_srv, loc_uri, loc_seen) = ee_stub().await;
+        let (_reach_srv, reach_uri, reach_seen) = ee_stub().await;
+        let (_both_srv, both_uri, both_seen) = ee_stub().await;
+        let (_pdn_srv, pdn_uri, pdn_seen) = ee_stub().await;
+        let subscribe = |uri: &str, configs: Value| {
+            let mut req = nextgcore_sbi::message::SbiRequest::post(format!(
+                "/nudm-ee/v1/{supi}/ee-subscriptions"
+            ));
+            req.http.content = Some(
+                json!({ "callbackReference": uri, "monitoringConfigurations": configs })
+                    .to_string(),
+            );
+            req
+        };
+        let mut ids = Vec::new();
+        for (uri, configs) in [
+            (
+                &loc_uri,
+                json!({ "loc": { "eventType": "LOSS_OF_CONNECTIVITY" } }),
+            ),
+            (
+                &reach_uri,
+                json!({ "reach": { "eventType": "UE_REACHABILITY_FOR_DATA" } }),
+            ),
+            (
+                &both_uri,
+                json!({
+                    "b-loc": { "eventType": "LOSS_OF_CONNECTIVITY" },
+                    "b-reach": { "eventType": "UE_REACHABILITY_FOR_DATA" },
+                }),
+            ),
+            (
+                &pdn_uri,
+                json!({ "pdn": { "eventType": "PDN_CONNECTIVITY_STATUS" } }),
+            ),
+        ] {
+            let resp = crate::app::handle_ee_subscribe(supi, &subscribe(uri, configs)).await;
+            assert_eq!(resp.status, 201);
+            let body: Value =
+                serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
+            ids.push(
+                body["eeSubscription"]["subscriptionId"]
+                    .as_str()
+                    .expect("id")
+                    .to_string(),
+            );
+        }
+
+        let mock = Arc::new(MockUdr::new());
+        let client = UdrClient::Mock(mock.clone());
+
+        // Registration: reachable for data.
+        let resp =
+            process_amf_registration(supi, &valid_amf_body(), &client, UecmAccess::ThreeGpp).await;
+        assert_eq!(resp.status, 201);
+        let reach = ("UE_REACHABILITY_FOR_DATA".to_string(), "reach".to_string());
+        assert_eq!(
+            posts(&loc_seen),
+            0,
+            "LoC-only: no POST at all on registration"
+        );
+        assert_eq!(posts(&pdn_seen), 0, "PDN-only: no POST on registration");
+        assert_eq!(reported(&reach_seen), vec![reach.clone()]);
+        let b_reach = (
+            "UE_REACHABILITY_FOR_DATA".to_string(),
+            "b-reach".to_string(),
+        );
+        assert_eq!(reported(&both_seen), vec![b_reach.clone()]);
+        assert_eq!((posts(&reach_seen), posts(&both_seen)), (1, 1));
+
+        // Deregistration: loss of connectivity.
+        let resp = process_amf_deregistration(supi, &client, UecmAccess::ThreeGpp).await;
+        assert_eq!(resp.status, 204);
+        let loc = ("LOSS_OF_CONNECTIVITY".to_string(), "loc".to_string());
+        assert_eq!(reported(&loc_seen), vec![loc.clone()]);
+        assert_eq!(
+            reported(&reach_seen),
+            vec![reach.clone()],
+            "reachability-only: nothing on deregistration"
+        );
+        let b_loc = ("LOSS_OF_CONNECTIVITY".to_string(), "b-loc".to_string());
+        assert_eq!(reported(&both_seen), vec![b_reach, b_loc]);
+        assert_eq!(
+            (
+                posts(&loc_seen),
+                posts(&reach_seen),
+                posts(&both_seen),
+                posts(&pdn_seen)
+            ),
+            (1, 1, 2, 0),
+            "one POST per matching event, none to the others"
+        );
+
+        // A PDU session event (the SMF UECM triggers raise PDN_CONNECTIVITY_STATUS)
+        // reaches only the PDN subscriber.
+        crate::notify::notify_ue_context_change(supi, crate::notify::UeContextEvent::SmfRegistered)
+            .await;
+        assert_eq!(
+            reported(&pdn_seen),
+            vec![("PDN_CONNECTIVITY_STATUS".to_string(), "pdn".to_string())]
+        );
+        assert_eq!(
+            (posts(&loc_seen), posts(&reach_seen), posts(&both_seen)),
+            (1, 1, 2),
+            "nobody else hears a PDU session event"
+        );
+
+        // PATCH the LoC-only subscription to monitor reachability instead: the
+        // next registration reaches it, under the new key.
+        let mut req = nextgcore_sbi::message::SbiRequest::patch(format!(
+            "/nudm-ee/v1/{supi}/ee-subscriptions/{}",
+            ids[0]
+        ));
+        req.http.content = Some(
+            json!([{
+                "op": "replace",
+                "path": "/monitoringConfigurations",
+                "value": { "now-reach": { "eventType": "UE_REACHABILITY_FOR_DATA" } },
+            }])
+            .to_string(),
+        );
+        assert_eq!(
+            crate::app::handle_ee_modify(supi, &ids[0], &req)
+                .await
+                .status,
+            204
+        );
+        let resp =
+            process_amf_registration(supi, &valid_amf_body(), &client, UecmAccess::ThreeGpp).await;
+        assert_eq!(resp.status, 201);
+        assert_eq!(
+            reported(&loc_seen),
+            vec![
+                loc,
+                (
+                    "UE_REACHABILITY_FOR_DATA".to_string(),
+                    "now-reach".to_string()
+                )
+            ]
+        );
+        assert_eq!(posts(&loc_seen), 2);
+
+        {
+            let ctx = udm_self();
+            let context = ctx.read().expect("context");
+            for sub in context.ee_subscriptions_for_supi(supi) {
+                context.ee_subscription_remove(&sub.id);
+            }
+        }
+    }
+
+    /// **#1438.** A monitoring configuration without its mandatory `eventType`
+    /// (TS 29.503 §6.4.6.2.3) is refused at subscribe and at PATCH: it could
+    /// never be matched, so accepting it would be a subscription to nothing that
+    /// reports success.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn ee_configuration_without_event_type_is_refused() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::udm_context_init(1024, 4096);
+        let supi = "imsi-001010000002438";
+        let mut req = nextgcore_sbi::message::SbiRequest::post(format!(
+            "/nudm-ee/v1/{supi}/ee-subscriptions"
+        ));
+        req.http.content = Some(
+            json!({
+                "callbackReference": "http://consumer.example.com/ee",
+                "monitoringConfigurations": { "1": { "immediateFlag": true } },
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            crate::app::handle_ee_subscribe(supi, &req).await.status,
+            400
+        );
+
+        req.http.content = Some(
+            json!({
+                "callbackReference": "http://consumer.example.com/ee",
+                "monitoringConfigurations": { "1": { "eventType": "LOSS_OF_CONNECTIVITY" } },
+            })
+            .to_string(),
+        );
+        let resp = crate::app::handle_ee_subscribe(supi, &req).await;
+        assert_eq!(resp.status, 201);
+        let body: Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
+        let id = body["eeSubscription"]["subscriptionId"]
+            .as_str()
+            .expect("id")
+            .to_string();
+        // Every PATCH whose result monitors nothing is refused with create's
+        // cause and leaves the stored subscription as it was: a configuration
+        // with no eventType, or the map removed, emptied or not a map (M, 1..N,
+        // TS 29.503 §6.4.6.2.2).
+        for (label, ops) in [
+            (
+                "configuration without eventType",
+                json!([{
+                    "op": "replace",
+                    "path": "/monitoringConfigurations",
+                    "value": { "1": { "immediateFlag": true } },
+                }]),
+            ),
+            (
+                "map removed",
+                json!([{ "op": "remove", "path": "/monitoringConfigurations" }]),
+            ),
+            (
+                "map emptied",
+                json!([{ "op": "replace", "path": "/monitoringConfigurations", "value": {} }]),
+            ),
+            (
+                "map not an object",
+                json!([{ "op": "replace", "path": "/monitoringConfigurations", "value": "x" }]),
+            ),
+        ] {
+            let mut patch = nextgcore_sbi::message::SbiRequest::patch(format!(
+                "/nudm-ee/v1/{supi}/ee-subscriptions/{id}"
+            ));
+            patch.http.content = Some(ops.to_string());
+            let resp = crate::app::handle_ee_modify(supi, &id, &patch).await;
+            assert_eq!(resp.status, 400, "{label}");
+            assert!(
+                resp.http
+                    .content
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("MANDATORY_IE_MISSING"),
+                "{label}: create's cause, got {:?}",
+                resp.http.content
+            );
+            let stored = {
+                let ctx = udm_self();
+                let context = ctx.read().expect("context");
+                context.ee_subscription_find_by_id(&id).expect("stored")
+            };
+            assert_eq!(
+                stored.monitoring_configurations,
+                vec![crate::context::EeMonitoringConfiguration {
+                    reference_id: "1".to_string(),
+                    event_type: "LOSS_OF_CONNECTIVITY".to_string(),
+                }],
+                "{label}: a refused PATCH leaves the subscription as it was"
+            );
+        }
+        {
+            let ctx = udm_self();
+            let context = ctx.read().expect("context");
+            context.ee_subscription_remove(&id);
         }
     }
 
