@@ -4,13 +4,18 @@
 //! notification URI (`.../nf-status-notify/{token}`, #940), its UECM
 //! deregistration callback (`.../dereg-notify/{token}`, #753) and the NWDAF's
 //! AMF location-report callback (`.../amf-location-notify/{token}`,
-//! nextgsim#466). Anyone who reads
+//! nextgsim#466) and its AMF UES_IN_AREA callback
+//! (`.../amf-ues-in-area-notify/{token}`, nextgsim#465). Anyone who reads
 //! the log could use the token to forge a notification, and logs are shipped and
 //! retained far more widely than the NF that holds the token.
 
 /// Path segments whose NEXT segment is a callback token.
-pub const CALLBACK_TOKEN_SEGMENTS: [&str; 3] =
-    ["nf-status-notify", "dereg-notify", "amf-location-notify"];
+pub const CALLBACK_TOKEN_SEGMENTS: [&str; 4] = [
+    "nf-status-notify",
+    "dereg-notify",
+    "amf-location-notify",
+    "amf-ues-in-area-notify",
+];
 
 /// What a redacted segment is replaced with.
 pub const REDACTED: &str = "<redacted>";
@@ -81,6 +86,11 @@ mod tests {
         assert_eq!(
             redact_callback_tokens("/nnwdaf-callback/v1/amf-location-notify/9f0e1d2c"),
             "/nnwdaf-callback/v1/amf-location-notify/<redacted>"
+        );
+        // nextgsim#465: the NWDAF's AMF UES_IN_AREA callback.
+        assert_eq!(
+            redact_callback_tokens("/nnwdaf-callback/v1/amf-ues-in-area-notify/0a1b2c3d"),
+            "/nnwdaf-callback/v1/amf-ues-in-area-notify/<redacted>"
         );
         assert_eq!(
             redact_callback_tokens("/namf-callback/v1/nf-status-notify"),

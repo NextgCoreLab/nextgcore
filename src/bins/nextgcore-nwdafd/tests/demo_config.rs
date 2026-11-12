@@ -206,3 +206,100 @@ fn the_kill_switch_and_an_absent_block_are_demo_off() {
         assert!(!err.contains("[demo:"), "{tag}: {err}");
     }
 }
+
+/// nextgsim#465: a build without `demo-d441a-congestion-loop` does not know the
+/// key, so the block fails start-up.
+#[cfg(not(feature = "demo-d441a-congestion-loop"))]
+#[test]
+fn the_d441a_key_fails_startup_in_a_build_without_its_feature() {
+    let cfg = config(
+        "d441a-no-feature",
+        "demo:\n  enabled: true\n  d441a-congestion-loop:\n    enabled: true\n    mode: statistics\n",
+    );
+    let (ok, err) = run_to_exit(&cfg);
+    assert!(!ok, "start-up must fail");
+    assert!(err.contains("UnknownKey"), "{err}");
+}
+
+/// nextgsim#465 invalid-mode criterion: `mode: bogus` fails nwdafd start-up with
+/// `DemoConfigError::UnknownMode { key: "d441a-congestion-loop", mode: "bogus" }`.
+#[cfg(feature = "demo-d441a-congestion-loop")]
+#[test]
+fn d441a_mode_bogus_fails_startup_with_unknown_mode() {
+    let cfg = config(
+        "d441a-bogus",
+        "demo:\n  enabled: true\n  d441a-congestion-loop:\n    enabled: true\n    mode: bogus\n",
+    );
+    let (ok, err) = run_to_exit(&cfg);
+    assert!(!ok, "no fallback: start-up must fail");
+    assert!(
+        err.contains(r#"UnknownMode { demo: "d441a-congestion-loop", mode: "bogus""#),
+        "{err}"
+    );
+}
+
+/// nextgsim#465: each mode logs the banner and its own prefixed line and exports
+/// the metric; the three demo-off shapes export none and serve nothing.
+#[cfg(feature = "demo-d441a-congestion-loop")]
+#[test]
+fn d441a_modes_and_demo_off_shapes() {
+    let read_err = |child: &mut Killed| {
+        let _ = child.0.kill();
+        let mut err = String::new();
+        child
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut err)
+            .unwrap();
+        err
+    };
+    for mode in ["statistics", "prediction", "no-loop"] {
+        let cfg = config(
+            &format!("d441a-{mode}"),
+            &format!(
+                "demo:\n  enabled: true\n  d441a-congestion-loop:\n    enabled: true\n    mode: {mode}\n"
+            ),
+        );
+        let port = free_port();
+        let mut child = spawn(&cfg, port);
+        let body = scrape(port, Duration::from_secs(20)).expect("/metrics");
+        assert!(
+            body.contains(&format!(
+                r#"nextg_demo_enabled{{demo="d441a-congestion-loop",mode="{mode}"}} 1"#
+            )),
+            "{body}"
+        );
+        assert!(body.contains("nwdaf_udc_serving 1"), "{body}");
+        let err = read_err(&mut child);
+        assert!(
+            err.contains(&format!("DEMO MODE ACTIVE: d441a-congestion-loop={mode}")),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!(
+                "[demo:d441a-congestion-loop] user-data-congestion: on (mode={mode};"
+            )),
+            "{err}"
+        );
+    }
+    for (tag, demo) in [
+        ("d441a-absent", ""),
+        ("d441a-off", "demo:\n  enabled: false\n"),
+        (
+            "d441a-killswitch",
+            "demo:\n  enabled: false\n  d441a-congestion-loop:\n    enabled: true\n    mode: statistics\n",
+        ),
+    ] {
+        let cfg = config(tag, demo);
+        let port = free_port();
+        let mut child = spawn(&cfg, port);
+        let body = scrape(port, Duration::from_secs(20)).expect("/metrics");
+        assert!(!body.contains("nextg_demo_enabled"), "{tag}: {body}");
+        assert!(body.contains("nwdaf_udc_serving 0"), "{tag}: {body}");
+        let err = read_err(&mut child);
+        assert!(!err.contains("DEMO MODE ACTIVE"), "{tag}: {err}");
+        assert!(!err.contains("[demo:"), "{tag}: {err}");
+    }
+}

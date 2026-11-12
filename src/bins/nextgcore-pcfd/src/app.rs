@@ -184,6 +184,26 @@ struct PcfYaml {
 /// Global shutdown flag
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// The YAML root of the config file, for the `demo:` block (nextgsim#458). A
+/// missing or unreadable file is an empty root, as the rest of start-up treats
+/// it; one that does not parse fails start-up.
+fn demo_config_root(path: &str) -> Result<serde_yaml::Value> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => serde_yaml::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("configuration file {path} does not parse: {e}")),
+        Err(_) => Ok(serde_yaml::Value::Null),
+    }
+}
+
+/// The demos this build can run: `d441a-congestion-loop` under its feature, none
+/// otherwise (a demo block then fails start-up with `UnknownKey`).
+fn demo_registry() -> nextgcore_demo::DemoRegistry {
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    return nextgcore_demo::DemoRegistry::new(&[crate::congestion_loop::DEMO_SPEC]);
+    #[cfg(not(feature = "demo-d441a-congestion-loop"))]
+    nextgcore_demo::DemoRegistry::default()
+}
+
 // ---------------------------------------------------------------------------
 // OAuth2 rollout (Wave-6 H8): opt-in producer verification + outbound consumer
 // token install. Default OFF so the matched-sim E2E path is byte-unchanged;
@@ -336,6 +356,14 @@ pub async fn run() -> Result<()> {
         // holds. Terminate it (TS 29.512 §4.2.4) before the SBI server accepts
         // anything, so no update arrives for a policy that is already gone.
         let (notified, unnotifiable) = crate::sbi_path::pcf_notify_unrestorable_associations();
+        // nextgsim#465: a demo cap that outlived its process is undone.
+        let restored_caps = crate::sbi_path::pcf_restore_demo_capped_sessions();
+        if restored_caps > 0 {
+            log::warn!(
+                "PCF boot: {restored_caps} demo-capped session(s) to restore to the subscribed \
+                 Session-AMBR; each is logged once the SMF confirms it"
+            );
+        }
         if notified + unnotifiable > 0 {
             log::warn!(
                 "PCF boot restoration signalling: {notified} association(s) terminated toward \
@@ -353,6 +381,37 @@ pub async fn run() -> Result<()> {
     let mut pcf_sm = PcfSmContext::new();
     pcf_sm.init();
     log::info!("PCF state machine initialized");
+
+    // nextgsim#458: the demo: block, checked against the demos this build was
+    // compiled with, so an unknown key or mode, or a demo whose cargo feature is
+    // not built, fails start-up. With no demo active nothing below changes.
+    let config_root = demo_config_root(&args.config)?;
+    nextgcore_demo::init_from_root(&config_root, &demo_registry())
+        .map_err(|e| anyhow::anyhow!("{e} ({e:?})"))?;
+    // nextgsim#465: the congestion loop's settings, resolved before anything is
+    // served; an active demo with no (or a bad) pcf.congestion_loop block fails.
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    let congestion_loop = {
+        let active: Vec<&str> = nextgcore_demo::installed()
+            .map(|a| a.entries().map(|(k, _)| k).collect())
+            .unwrap_or_default();
+        crate::ambr_override::check_writers(crate::ambr_override::WRITERS, &active)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        match nextgcore_demo::active_mode(crate::congestion_loop::DEMO_KEY) {
+            Some(mode) => {
+                let settings = crate::congestion_loop::settings_from_root(&config_root)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "demo d441a-congestion-loop is active but pcf.congestion_loop is \
+                             absent: the controller has no area or guardrails to run with"
+                        )
+                    })?;
+                Some((settings, mode))
+            }
+            None => None,
+        }
+    };
 
     // Parse configuration (if file exists) and seed NRF URI
     let mut sbi_fqdn: Option<String> = None;
@@ -578,6 +637,12 @@ pub async fn run() -> Result<()> {
             .as_ref()
             .map(crate::intent_loop::IntentSettings::from_yaml),
     );
+
+    // nextgsim#465: the User Data Congestion Session-AMBR controller.
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    if let Some((settings, mode)) = congestion_loop {
+        crate::congestion_loop::spawn(settings, mode);
+    }
 
     // Main event loop (async)
     run_event_loop_async(&mut pcf_sm, shutdown).await?;
@@ -2846,7 +2911,11 @@ pub async fn handle_sm_policy_get(sm_policy_id: &str) -> SbiResponse {
                     Some("SYSTEM_FAILURE"),
                 );
             };
-            let decision = build_sm_policy_decision(&sess.sm_policy_id, &session_data);
+            // nextgsim#465: the decision in force carries any active override cap.
+            let decision = build_sm_policy_decision(
+                &sess.sm_policy_id,
+                &sbi_path::effective_session_data(&sess.sm_policy_id, &session_data),
+            );
             let mut context_data = serde_json::Map::new();
             context_data.insert("supi".to_string(), serde_json::json!(supi));
             context_data.insert("pduSessionId".to_string(), serde_json::json!(sess.psi));
@@ -3755,6 +3824,16 @@ pub async fn handle_sm_policy_update_notify(
                             context.sess_update(&stored);
                         }
                     }
+                    // nextgsim#465: an active override cap lowers what is
+                    // authorised (never what is stored above, which stays the
+                    // subscription-bounded value a later re-evaluation re-caps).
+                    let bounded = nudr_handler::SessionData {
+                        ambr_uplink: auth_ul,
+                        ambr_downlink: auth_dl,
+                        ..sd.clone()
+                    };
+                    let capped = sbi_path::effective_session_data(&sess.sm_policy_id, &bounded);
+                    let (auth_ul, auth_dl) = (capped.ambr_uplink, capped.ambr_downlink);
                     let sess_rule_id = format!("SessRule-{}", sess.sm_policy_id);
                     serde_json::json!({
                         &sess_rule_id: {
@@ -10372,6 +10451,293 @@ mod tests {
             Vec::<String>::new(),
             "no session-data read may be made for an empty SUPI"
         );
+    }
+
+    /// nextgsim#465, criteria "one throttle and one restore per session", "UE-V
+    /// is never throttled" and "a subscription-derived re-notify during the
+    /// throttle (e.g. re-auth) keeps the cap", through the PCF's real UpdateNotify
+    /// sender to a stub SMF, with UE-V and UE-B seeded at 11/22 Mbps in the UDR
+    /// mirror. The controller decides on an observed ramp; `execute` writes the
+    /// override and notifies.
+    ///
+    /// REVERT-VERIFIED: building the notify from `&sd` instead of
+    /// `effective_session_data` in `build_sm_policy_notification` makes the
+    /// throttle notify (and the re-notify) carry 11/22 Mbps.
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context
+    async fn the_congestion_loop_caps_ue_b_keeps_the_cap_and_restores_465() {
+        use crate::congestion_loop::{
+            Action, Candidate, Controller, LoopYaml, Observation, Settings,
+        };
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
+        let (ue_v, ue_b) = ("imsi-001010000465001", "imsi-001010000465002");
+        seed_subscriber_1383(ue_v);
+        seed_subscriber_1383(ue_b);
+        let pol_v = create_for_1383(ue_v, 1, "10.45.65.1", peers.smf_port).await;
+        let pol_b = create_for_1383(ue_b, 2, "10.45.65.2", peers.smf_port).await;
+        peers.notified.lock().unwrap().clear();
+
+        let s = Settings::from_yaml(&LoopYaml {
+            cells: Some(vec![crate::congestion_loop::CellYaml {
+                mcc: "001".into(),
+                mnc: "01".into(),
+                nr_cell_id: "000000010".into(),
+            }]),
+            protected_supis: Some(vec![ue_v.into()]),
+            best_effort_supis: Some(vec![ue_b.into()]),
+            min_hold_secs: Some(0),
+            ..LoopYaml::default()
+        })
+        .unwrap();
+        let sess = |pol: &str| {
+            pcf_self()
+                .read()
+                .unwrap()
+                .sess_find_by_sm_policy_id(pol)
+                .unwrap()
+        };
+        let candidates: Vec<Candidate> = [(ue_v, &pol_v), (ue_b, &pol_b)]
+            .into_iter()
+            .map(|(supi, pol)| Candidate {
+                sess_id: sess(pol).id,
+                sm_policy_id: pol.clone(),
+                supi: supi.into(),
+                sst: 1,
+                dnn: Some("internet".into()),
+                has_notification_uri: true,
+            })
+            .collect();
+        let obs = |n| {
+            Some(Observation {
+                cong_level: n,
+                confidence: None,
+            })
+        };
+        let mut c = Controller::default();
+
+        // The ramp crosses throttle_at: one throttle, of UE-B.
+        let actions = c.step(&s, obs(96), &candidates, 0).unwrap();
+        assert!(matches!(&actions[..], [Action::Throttle { supi, .. }] if supi == ue_b));
+        crate::congestion_loop::execute(&s, &actions[0], obs(96));
+        let got = await_notifications(&peers, 1).await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, "/nsmf-callback/v1/sm-policy-notify/2/update");
+        let (_, ul, dl) = sess_rule_1383(&got[0].1["smPolicyDecision"]);
+        assert_eq!(
+            (ul.as_str(), dl.as_str()),
+            ("1 Mbps", "1 Mbps"),
+            "UE-B capped"
+        );
+
+        // A subscription-derived re-notify (P-CSCF restoration re-reads the UDR)
+        // during the throttle keeps the cap.
+        peers.notified.lock().unwrap().clear();
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
+            Some(serde_json::json!({ "ueIpv4": "10.45.65.2" })),
+        ))
+        .await;
+        assert_eq!(resp.status, 204);
+        let got = await_notifications(&peers, 1).await;
+        let (_, ul, dl) = sess_rule_1383(&got[0].1["smPolicyDecision"]);
+        assert_eq!(
+            (ul.as_str(), dl.as_str()),
+            ("1 Mbps", "1 Mbps"),
+            "re-notify keeps the cap"
+        );
+
+        // The SM-policy GET reports the decision in force.
+        let get = pcf_sbi_request_handler(make_request(
+            "GET",
+            &format!("/npcf-smpolicycontrol/v1/sm-policies/{pol_b}"),
+            None,
+        ))
+        .await;
+        assert_eq!(get.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(get.http.content.as_deref().unwrap()).unwrap();
+        let (_, ul, _) = sess_rule_1383(&body["policy"]);
+        assert_eq!(ul, "1 Mbps");
+
+        // Review MAJOR 2: an SMF-reported SE_AMBR_CH while throttled is answered
+        // with the cap, through the real router, not the subscribed 11/22 Mbps.
+        assert_eq!(
+            report_se_ambr_ch(&pol_b, None).await,
+            Some(("1 Mbps".to_string(), "1 Mbps".to_string())),
+            "the SE_AMBR_CH answer keeps the cap"
+        );
+        // Review MAJOR 1: the cap the SMF holds is recorded on the session.
+        assert_eq!(
+            sess(&pol_b)
+                .demo_ambr_cap
+                .map(|c| (c.uplink_bps, c.downlink_bps)),
+            Some((1_000_000, 1_000_000))
+        );
+        assert_eq!(sess(&pol_v).demo_ambr_cap, None);
+
+        // Still congested: no second throttle.
+        assert!(c.step(&s, obs(97), &candidates, 1000).is_err());
+        // UE-B stops: one restore, to the subscribed 11/22 Mbps; UE-V untouched.
+        peers.notified.lock().unwrap().clear();
+        let mut restores = Vec::new();
+        for t in 2..6 {
+            if let Ok(a) = c.step(&s, obs(10), &candidates, t * 1000) {
+                restores.extend(a);
+            }
+        }
+        assert!(matches!(&restores[..], [Action::Restore { supi, .. }] if supi == ue_b));
+        crate::congestion_loop::execute(&s, &restores[0], obs(10));
+        let got = await_notifications(&peers, 1).await;
+        assert_eq!(got[0].0, "/nsmf-callback/v1/sm-policy-notify/2/update");
+        assert_eq!(
+            sess_rule_1383(&got[0].1["smPolicyDecision"]),
+            seeded_rule_1383()
+        );
+        assert!(
+            drain_notifications(&peers, 2)
+                .await
+                .iter()
+                .all(|(p, _)| !p.contains("/sm-policy-notify/1/")),
+            "UE-V's session is never notified"
+        );
+        assert_eq!(crate::ambr_override::get(&pol_b), None);
+        assert_eq!(
+            sess(&pol_b).demo_ambr_cap,
+            None,
+            "restored: no cap recorded"
+        );
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
+    }
+
+    /// nextgsim#465 review MAJOR 1: a throttle does not outlive pcfd. A session
+    /// capped by the controller, then a "restart" (the in-memory cap and the
+    /// controller are gone; the session, restored from durable state, still
+    /// records the cap): the start-up restore sends ONE UpdateNotify with the
+    /// subscribed 11/22 Mbps and clears the record. A released session's cap
+    /// is forgotten too.
+    ///
+    /// Round 2: with the SMF unreachable the restore fails and KEEPS the record;
+    /// once the SMF is back it is delivered and only then cleared.
+    ///
+    /// REVERT-VERIFIED: clearing the record before the send (round 1's order)
+    /// fails the "keeps the record" assertion; not forgetting on release fails
+    /// the last one.
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context
+    async fn a_restart_restores_a_demo_capped_session_465() {
+        use crate::congestion_loop::{Action, LoopYaml, Observation, Settings};
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
+        let ue_b = "imsi-001010000465012";
+        seed_subscriber_1383(ue_b);
+        let pol = create_for_1383(ue_b, 3, "10.45.65.12", peers.smf_port).await;
+        let s = Settings::from_yaml(&LoopYaml {
+            cells: Some(vec![crate::congestion_loop::CellYaml {
+                mcc: "001".into(),
+                mnc: "01".into(),
+                nr_cell_id: "000000010".into(),
+            }]),
+            ..LoopYaml::default()
+        })
+        .unwrap();
+        let sess = || {
+            pcf_self()
+                .read()
+                .unwrap()
+                .sess_find_by_sm_policy_id(&pol)
+                .unwrap()
+        };
+        peers.notified.lock().unwrap().clear();
+        crate::congestion_loop::execute(
+            &s,
+            &Action::Throttle {
+                sess_id: sess().id,
+                sm_policy_id: pol.clone(),
+                supi: ue_b.into(),
+            },
+            Some(Observation {
+                cong_level: 99,
+                confidence: None,
+            }),
+        );
+        let got = await_notifications(&peers, 1).await;
+        let (_, ul, _) = sess_rule_1383(&got[0].1["smPolicyDecision"]);
+        assert_eq!(ul, "1 Mbps");
+        assert!(sess().demo_ambr_cap.is_some());
+
+        // The restart: the in-memory layer is empty; the record survives.
+        crate::ambr_override::forget(&pol);
+        peers.notified.lock().unwrap().clear();
+        let quick = sbi_path::RestoreRetry {
+            rounds: 2,
+            first: Duration::from_millis(10),
+            max: Duration::from_millis(10),
+        };
+        // Round-2 MAJOR 1: the SMF is unreachable. Nothing is delivered and the
+        // record is KEPT, so the cap is not lost.
+        let held = nextgcore_sbi::test_support::down_port();
+        let live_uri = sess().notification_uri.clone();
+        let mut down = sess();
+        down.notification_uri = Some(format!(
+            "http://127.0.0.1:{}/nsmf-callback/v1/sm-policy-notify/3",
+            held.port()
+        ));
+        pcf_self().read().unwrap().sess_update(&down);
+        assert_eq!(
+            sbi_path::restore_demo_cap(down.id, quick).await,
+            sbi_path::RestoreOutcome::Failed
+        );
+        assert!(
+            sess().demo_ambr_cap.is_some(),
+            "an undelivered restore keeps the record"
+        );
+        drop(held);
+        // The SMF is back: delivered, the subscribed 11/22 Mbps, the record cleared.
+        let mut up = sess();
+        up.notification_uri = live_uri;
+        pcf_self().read().unwrap().sess_update(&up);
+        assert_eq!(
+            sbi_path::restore_demo_cap(up.id, quick).await,
+            sbi_path::RestoreOutcome::Delivered
+        );
+        let got = await_notifications(&peers, 1).await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(
+            sess_rule_1383(&got[0].1["smPolicyDecision"]),
+            seeded_rule_1383()
+        );
+        assert_eq!(sess().demo_ambr_cap, None);
+        assert_eq!(
+            sbi_path::pcf_restore_demo_capped_sessions(),
+            0,
+            "nothing left to restore"
+        );
+
+        // Release: a capped session's cap leaves with it.
+        crate::ambr_override::set(
+            &pol,
+            crate::congestion_loop::DEMO_KEY,
+            crate::ambr_override::Cap {
+                uplink_bps: 1,
+                downlink_bps: 1,
+            },
+        );
+        let id = sess().id;
+        let _apps = pcf_self().read().unwrap().sess_remove_with_apps(id);
+        assert_eq!(crate::ambr_override::get(&pol), None);
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
     }
 }
 
