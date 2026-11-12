@@ -2844,6 +2844,83 @@ pub fn build_paging_asn1(
     plmn_id: &crate::context::PlmnId,
     tac: u32,
 ) -> Option<Vec<u8>> {
+    build_paging_with_attempt_asn1(amf_set_id, amf_pointer, tmsi, plmn_id, tac, None)
+}
+
+/// The Paging Attempt Information of one PAGING attempt (TS 38.413 §9.3.1.72,
+/// nextgsim#464). TS 38.300 §9.2.5: the count "shall be increased by one at each
+/// new paging attempt", and every node paged in one attempt gets the same value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagingAttempt {
+    /// Paging Attempt Count, 1..16.
+    pub count: u8,
+    /// Intended Number of Paging Attempts, 1..16.
+    pub intended: u8,
+    /// Next Paging Area Scope: `Some(true)` = changed, `Some(false)` = same,
+    /// `None` = absent (the last attempt, after which there is no next one).
+    pub next_scope_changed: Option<bool>,
+}
+
+impl PagingAttempt {
+    /// Attempt `attempt` (1-based) of `intended`, both clamped into 1..16 with the
+    /// count never above the intended number. `next_changes` says whether the
+    /// next attempt pages a different area; it is dropped on the last attempt.
+    pub fn new(attempt: u32, intended: u32, next_changes: bool) -> Self {
+        let intended = intended.clamp(1, 16) as u8;
+        let count = (attempt.clamp(1, 16) as u8).min(intended);
+        Self {
+            count,
+            intended,
+            next_scope_changed: (count < intended).then_some(next_changes),
+        }
+    }
+}
+
+/// An `AssistanceDataForPaging` (TS 38.413 §9.3.1.69) carrying only `attempt`'s
+/// Paging Attempt Information, APER-encoded as [`Paging::assistance_data`] takes it.
+pub fn paging_attempt_assistance_aper(attempt: &PagingAttempt) -> Option<Vec<u8>> {
+    let value = ngap_gen::AssistanceDataForPaging {
+        assistance_data_for_recommended_cells: None,
+        paging_attempt_information: Some(ngap_gen::PagingAttemptInformation {
+            paging_attempt_count: ngap_gen::PagingAttemptCount(attempt.count),
+            intended_number_of_paging_attempts: ngap_gen::IntendedNumberOfPagingAttempts(
+                attempt.intended,
+            ),
+            next_paging_area_scope: attempt.next_scope_changed.map(|changed| {
+                ngap_gen::NextPagingAreaScope(if changed {
+                    ngap_gen::NextPagingAreaScope::CHANGED
+                } else {
+                    ngap_gen::NextPagingAreaScope::SAME
+                })
+            }),
+            ie_extensions: None,
+        }),
+        ie_extensions: None,
+    };
+    match nextgcore_ngap_gen::encode_contained(&value) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            log::error!("Paging: failed to encode AssistanceDataForPaging: {e:?}");
+            None
+        }
+    }
+}
+
+/// [`build_paging_asn1`] with the Assistance Data for Paging carrying `attempt`'s
+/// Paging Attempt Information when it is `Some` (nextgsim#464). `None` builds
+/// exactly the PAGING [`build_paging_asn1`] does.
+pub fn build_paging_with_attempt_asn1(
+    amf_set_id: u16,
+    amf_pointer: u8,
+    tmsi: u32,
+    plmn_id: &crate::context::PlmnId,
+    tac: u32,
+    attempt: Option<&PagingAttempt>,
+) -> Option<Vec<u8>> {
+    let assistance_data = match attempt {
+        Some(a) => Some(paging_attempt_assistance_aper(a)?),
+        None => None,
+    };
     let msg = Paging {
         ue_paging_identity: UePagingIdentity::FiveGSTmsi {
             amf_set_id,
@@ -2858,7 +2935,7 @@ pub fn build_paging_asn1(
         paging_priority: None,
         ue_radio_capability: None,
         paging_origin: None,
-        assistance_data: None,
+        assistance_data,
     };
     let bytes = build_paging_generated(&msg)?;
     log::debug!(
@@ -7561,6 +7638,79 @@ pub(crate) mod tests {
     /// #417 Paging stage: the generated Paging is byte-identical to the
     /// hand-written one across the whole matrix, and both refuse the same
     /// inputs (an empty or 17-entry TAI list).
+    /// The Paging Attempt Information in a PAGING, as (count, intended, scope).
+    fn paging_attempt_of(pdu: &[u8]) -> Option<(u8, u8, Option<u8>)> {
+        use nextgcore_ngap_gen::generated as g;
+        let g::NGAP_PDU::InitiatingMessage(m) = nextgcore_ngap_gen::decode(pdu).ok()? else {
+            return None;
+        };
+        let g::InitiatingMessageValue::Id_Paging(paging) = m.value else {
+            return None;
+        };
+        paging.protocol_i_es.0.iter().find_map(|e| match &e.value {
+            g::PagingProtocolIEs_EntryValue::Id_AssistanceDataForPaging(a) => {
+                assert!(a.assistance_data_for_recommended_cells.is_none());
+                let pai = a.paging_attempt_information.as_ref()?;
+                Some((
+                    pai.paging_attempt_count.0,
+                    pai.intended_number_of_paging_attempts.0,
+                    pai.next_paging_area_scope.as_ref().map(|s| s.0),
+                ))
+            }
+            _ => None,
+        })
+    }
+
+    /// nextgsim#464, TS 38.413 §9.3.1.72: the PAGING's Assistance Data for Paging
+    /// carries Paging Attempt Information alone, and decodes to what was built.
+    /// Without an attempt the PAGING is byte-identical to `build_paging_asn1`'s.
+    #[test]
+    fn paging_attempt_information_round_trips_in_the_paging() {
+        use nextgcore_ngap_gen::generated::NextPagingAreaScope as Scope;
+        let plmn = PlmnId::new("001", "01");
+        let with = |a: PagingAttempt| {
+            build_paging_with_attempt_asn1(1, 2, 0x0464_0001, &plmn, 0x464, Some(&a))
+                .expect("paging")
+        };
+        assert_eq!(
+            paging_attempt_of(&with(PagingAttempt::new(1, 5, true))),
+            Some((1, 5, Some(Scope::CHANGED)))
+        );
+        assert_eq!(
+            paging_attempt_of(&with(PagingAttempt::new(2, 5, false))),
+            Some((2, 5, Some(Scope::SAME)))
+        );
+        assert_eq!(
+            paging_attempt_of(&with(PagingAttempt::new(5, 5, false))),
+            Some((5, 5, None)),
+            "no next attempt, so no Next Paging Area Scope"
+        );
+        let plain =
+            build_paging_with_attempt_asn1(1, 2, 0x0464_0001, &plmn, 0x464, None).expect("paging");
+        assert_eq!(
+            plain,
+            build_paging_asn1(1, 2, 0x0464_0001, &plmn, 0x464).expect("paging")
+        );
+        assert_eq!(paging_attempt_of(&plain), None);
+    }
+
+    /// `PagingAttempt::new` keeps both values in INTEGER (1..16) and the count at or
+    /// below the intended number, and drops the scope on the last attempt.
+    #[test]
+    fn paging_attempt_values_are_clamped_to_their_ranges() {
+        let a = PagingAttempt::new(20, 30, true);
+        assert_eq!((a.count, a.intended, a.next_scope_changed), (16, 16, None));
+        let a = PagingAttempt::new(0, 0, true);
+        assert_eq!((a.count, a.intended, a.next_scope_changed), (1, 1, None));
+        let a = PagingAttempt::new(6, 5, true);
+        assert_eq!((a.count, a.intended, a.next_scope_changed), (5, 5, None));
+        let a = PagingAttempt::new(1, 5, true);
+        assert_eq!(
+            (a.count, a.intended, a.next_scope_changed),
+            (1, 5, Some(true))
+        );
+    }
+
     #[test]
     fn paging_generated_matches_hand_written() {
         let cases = paging_cases();

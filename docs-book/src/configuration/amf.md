@@ -153,7 +153,7 @@ Cargo features: `kernel-sctp` (enables `--sctp-backend kernel`; the Docker build
   - **Retransmissions.** Every T3513 retransmission (`AMF_T3513_SECS`) widens to the whole registration area.
   - **Falling back.** If the recommendation matches no connected node in the area, the first attempt already pages the whole area. The same applies when the RAN sent no recommendation, and when the release or its IE was unusable.
   - **Clearing.** The stored list belongs to one idle period. A release whose Complete carries no IE clears it. A CM-IDLE entry with no UE CONTEXT RELEASE COMPLETE also clears it: NG Reset, loss of the gNB's association, or an Initial Context Setup Failure.
-  - The *Recommended Cells for Paging* are transparent to the 5GC (§9.3.1.71) and are not kept. Paging Attempt Information and Assistance Data for Recommended Cells are not sent.
+  - The *Recommended Cells for Paging* are transparent to the 5GC (§9.3.1.71) and are not kept. Assistance Data for Recommended Cells is not sent. Paging Attempt Information is sent; see [Paging Attempt Information](#paging-attempt-information).
 
 - **`nwdaf-mobility`** (nextgsim#464). TS 23.501 §5.4.3.1: "If NWDAF is deployed, the AMF may also use analytics ... on the UE's mobility as provided by NWDAF". The AMF is the UE Mobility consumer of TS 23.288 §6.7.2.
   - **Asking.** When a page is queued for a UE with a SUPI, the AMF sends `Nnwdaf_AnalyticsInfo_Request` to an NWDAF: `GET /nnwdaf-analyticsinfo/v1/analytics?event-id=UE_MOBILITY&tgt-ue={"supis":[..]}&ana-req={"startTs":now,"endTs":now+30s}` (TS 29.520 §4.3.2.2.2). Because the window is in the future, the NWDAF returns a prediction.
@@ -175,12 +175,22 @@ Cargo features: `kernel-sctp` (enables `--sctp-backend kernel`; the Docker build
     - the answer arrives after the first PAGING. A late answer is not used for that page.
   - **RAN sharing.** A cell whose NCGI carries a broadcast PLMN other than the Global gNB ID's PLMN matches no gNB, so it falls back as above.
   - **Observability.** `amf_paging_nwdaf_hints_total{outcome}`, with outcome `predicted`, `no_prediction`, `error`, `timeout`, `cap_full` or `late`, is exported only under this strategy. The info lines `NWDAF UE mobility: ue=<supi> predicted=(<plmn>, 0x<nci>) confidence=<n>%` and `... <role> cell 0x.. is served by gNB 0x..` show the prediction and the gNBs it mapped to.
-  - Assistance Data for Recommended Cells and Paging Attempt Information are not sent.
+  - Assistance Data for Recommended Cells is not sent. Paging Attempt Information is sent; see [Paging Attempt Information](#paging-attempt-information).
 
 The paging log line keeps its prefix in every mode:
 - `Paging sent to N/M gNB(s) serving the registration area: ...`;
 - `... recommended by the RAN in the registration area: ...` for a recommended first attempt;
-- `... predicted by NWDAF UE mobility in the registration area: ...` for an NWDAF-steered first attempt.
+- `... predicted by NWDAF UE mobility in the registration area: ...` for an NWDAF-steered first attempt that pages a predicted gNB;
+- `... at the UE's last known cell in the registration area (no gNB owns the NWDAF prediction): ...` when no gNB in the area owns the prediction and only the last known cell's gNB is paged.
+
+### Paging Attempt Information
+
+Under `recommended-first` and `nwdaf-mobility`, every PAGING carries an *Assistance Data for Paging* IE holding only *Paging Attempt Information* (TS 38.413 §9.3.1.69, §9.3.1.72; nextgsim#464). Its fields are:
+- **Paging Attempt Count**: the attempt number, 1 for the first PAGING. Each T3513 retransmission adds one (TS 38.300 §9.2.5).
+- **Intended Number of Paging Attempts**: the first attempt plus the T3513 retransmissions (5 by default).
+- **Next Paging Area Scope**: `changed` when this attempt pages fewer gNBs than the registration area (a recommended or predicted first attempt), since the next attempt pages the whole area. Otherwise `same`. It is left out on the last attempt, after which there is no next one.
+
+Each attempt is a single PDU sent to every gNB paged in that attempt, so they all receive the same value (TS 23.502 §4.2.3.3). Both values stay within INTEGER (1..16). The default `registration-area` strategy sends no Assistance Data for Paging, and its PAGING is unchanged.
 
 ## Unauthenticated emergency service
 
