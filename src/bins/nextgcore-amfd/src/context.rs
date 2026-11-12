@@ -4992,6 +4992,12 @@ pub struct PagingContext {
     /// nextgsim#464: the NWDAF's prediction, set before the first transmission.
     /// Read on the first attempt only.
     pub nwdaf_predicted: Option<PredictedCell>,
+    /// nextgsim#464: the UE's last known NR cell (PLMN, NCI) when the page was
+    /// queued under [`PagingStrategy::NwdafMobility`]. Attempt 1 pages its gNB as
+    /// well as the predicted one: the NWDAF predicts the most likely NEXT cell, so
+    /// a UE that has not moved since it went idle is still under the gNB it was
+    /// last seen on.
+    pub nwdaf_last_cell: Option<(PlmnId, u64)>,
 }
 
 /// What one paging pump pass decided (TS 24.501 §5.6.2.2.1 / §5.6.2.2.2).
@@ -5032,6 +5038,7 @@ impl Default for PagingContext {
             recommended: Vec::new(),
             nwdaf_wait_until: None,
             nwdaf_predicted: None,
+            nwdaf_last_cell: None,
         }
     }
 }

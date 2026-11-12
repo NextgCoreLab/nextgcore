@@ -49,12 +49,130 @@ pub const PREDICTION_WINDOW: Duration = Duration::from_secs(30);
 /// rather than queueing behind a slow NWDAF.
 pub const MAX_IN_FLIGHT: usize = 64;
 
+/// The in-flight bound. Process-global; a test that takes its permits holds
+/// `test_support::CONTEXT_GUARD`, as every test that queues a page does, so no
+/// other test's query competes for them.
 static IN_FLIGHT: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
 
 fn in_flight() -> Arc<Semaphore> {
     IN_FLIGHT
         .get_or_init(|| Arc::new(Semaphore::new(MAX_IN_FLIGHT)))
         .clone()
+}
+
+/// Test-only: the in-flight bound, so a test can fill it. Hold
+/// `test_support::CONTEXT_GUARD` while holding its permits.
+#[doc(hidden)]
+pub fn in_flight_for_test() -> Arc<Semaphore> {
+    in_flight()
+}
+
+/// What became of one query, for `amf_paging_nwdaf_hints_total{outcome}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HintOutcome {
+    /// A predicted NR cell reached the page before its first PAGING.
+    Predicted,
+    /// The NWDAF answered with no usable cell (204, or no NR cell in the body).
+    NoPrediction,
+    /// No NWDAF, a refused connection, a non-200, or a malformed body.
+    Error,
+    /// No answer within [`HINT_TIMEOUT`].
+    Timeout,
+    /// Not started: [`MAX_IN_FLIGHT`] queries were already running.
+    CapFull,
+    /// An answer for a page whose first PAGING had already gone.
+    Late,
+}
+
+impl HintOutcome {
+    const ALL: [HintOutcome; 6] = [
+        HintOutcome::Predicted,
+        HintOutcome::NoPrediction,
+        HintOutcome::Error,
+        HintOutcome::Timeout,
+        HintOutcome::CapFull,
+        HintOutcome::Late,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            HintOutcome::Predicted => "predicted",
+            HintOutcome::NoPrediction => "no_prediction",
+            HintOutcome::Error => "error",
+            HintOutcome::Timeout => "timeout",
+            HintOutcome::CapFull => "cap_full",
+            HintOutcome::Late => "late",
+        }
+    }
+}
+
+static OUTCOMES: [std::sync::atomic::AtomicU64; 6] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+fn count(outcome: HintOutcome) {
+    OUTCOMES[outcome as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The count of `outcome` so far.
+pub fn outcome_count(outcome: HintOutcome) -> u64 {
+    OUTCOMES[outcome as usize].load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `amf_paging_nwdaf_hints_total{outcome}`, only under `nwdaf-mobility`, so the
+/// default `/metrics` is unchanged.
+pub fn render_metrics(out: &mut String) {
+    use std::fmt::Write as _;
+    let strategy = crate::context::amf_self()
+        .read()
+        .map(|c| c.paging_strategy)
+        .unwrap_or_default();
+    if strategy != crate::context::PagingStrategy::NwdafMobility {
+        return;
+    }
+    nextgcore_metrics::nf::write_header(
+        out,
+        "amf_paging_nwdaf_hints_total",
+        "counter",
+        "NWDAF UE mobility queries for paging (nextgsim#464), by outcome; every outcome but \
+         predicted pages the registration area on attempt 1",
+    );
+    for o in HintOutcome::ALL {
+        let _ = writeln!(
+            out,
+            "amf_paging_nwdaf_hints_total{{outcome=\"{}\"}} {}",
+            o.label(),
+            outcome_count(o)
+        );
+    }
+}
+
+/// The cap-full warning is logged at most once per this interval, with the
+/// number of pages it covers.
+const CAP_FULL_WARN_EVERY: Duration = Duration::from_secs(10);
+static CAP_FULL_LAST_WARN_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CAP_FULL_SUPPRESSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn warn_cap_full(amf_ue_ngap_id: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = CAP_FULL_LAST_WARN_SECS.load(Relaxed);
+    if now >= last + CAP_FULL_WARN_EVERY.as_secs()
+        && CAP_FULL_LAST_WARN_SECS
+            .compare_exchange(last, now, Relaxed, Relaxed)
+            .is_ok()
+    {
+        let suppressed = CAP_FULL_SUPPRESSED.swap(0, Relaxed);
+        log::warn!(
+            "NWDAF UE mobility: {MAX_IN_FLIGHT} queries already in flight; paging UE \
+             {amf_ue_ngap_id} in the registration area ({suppressed} more since the last \
+             warning; see amf_paging_nwdaf_hints_total{{outcome=\"cap_full\"}})"
+        );
+    } else {
+        CAP_FULL_SUPPRESSED.fetch_add(1, Relaxed);
+    }
 }
 
 /// The NWDAF a test points [`resolve_nwdaf_endpoint`] at, declared beside its one
@@ -209,23 +327,28 @@ pub fn spawn_hint(amf_ue_ngap_id: u64, supi: String) -> bool {
         return false;
     };
     let Ok(permit) = in_flight().try_acquire_owned() else {
-        log::warn!(
-            "NWDAF UE mobility: {MAX_IN_FLIGHT} queries already in flight; paging UE \
-             {amf_ue_ngap_id} in the registration area"
-        );
+        count(HintOutcome::CapFull);
+        warn_cap_full(amf_ue_ngap_id);
         return false;
     };
     handle.spawn(async move {
         let _permit = permit;
         let outcome = match tokio::time::timeout(HINT_TIMEOUT, query_prediction(&supi)).await {
-            Ok(Ok(p)) => p,
+            Ok(Ok(p)) => {
+                if p.is_none() {
+                    count(HintOutcome::NoPrediction);
+                }
+                p
+            }
             Ok(Err(e)) => {
+                count(HintOutcome::Error);
                 log::info!(
                     "NWDAF UE mobility: ue={supi} no prediction ({e}); paging the registration area"
                 );
                 None
             }
             Err(_) => {
+                count(HintOutcome::Timeout);
                 log::info!(
                     "NWDAF UE mobility: ue={supi} no answer within {} ms; paging the \
                      registration area",
@@ -246,9 +369,16 @@ pub fn spawn_hint(amf_ue_ngap_id: u64, supi: String) -> bool {
         }
         let ctx = crate::context::amf_self();
         let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
-        if !guard.paging_set_nwdaf_hint(amf_ue_ngap_id, outcome) {
+        let predicted = outcome.is_some();
+        if guard.paging_set_nwdaf_hint(amf_ue_ngap_id, outcome) {
+            if predicted {
+                count(HintOutcome::Predicted);
+            }
+        } else {
+            count(HintOutcome::Late);
             log::info!(
-                "NWDAF UE mobility: ue={supi} answer arrived after the first PAGING; not used"
+                "NWDAF UE mobility: ue={supi} answer not used: the first PAGING had gone, or the \
+                 page was replaced by a newer one"
             );
         }
     });

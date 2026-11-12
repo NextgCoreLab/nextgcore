@@ -913,6 +913,7 @@ pub(crate) fn initiate_paging_for_idle_ue(
         recommended: amf_ue.recommended_paging.clone(),
         nwdaf_wait_until: None,
         nwdaf_predicted: None,
+        nwdaf_last_cell: None,
     };
     let mut paging_ctx = paging_ctx;
     // nextgsim#464, TS 23.501 §5.4.3.1: under `nwdaf-mobility`, the first PAGING
@@ -925,6 +926,11 @@ pub(crate) fn initiate_paging_for_idle_ue(
     if ask_nwdaf.is_some() {
         paging_ctx.nwdaf_wait_until =
             Some(std::time::Instant::now() + crate::nwdaf_mobility::HINT_TIMEOUT);
+        // 0 is the never-learned default NCI (`namf_server::parse_ncgi`).
+        if amf_ue.nr_cgi.cell_id != 0 {
+            paging_ctx.nwdaf_last_cell =
+                Some((amf_ue.nr_cgi.plmn_id.clone(), amf_ue.nr_cgi.cell_id));
+        }
     }
 
     // Mark session as paging ongoing; keep the consumer's failure-notify

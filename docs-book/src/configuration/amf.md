@@ -81,7 +81,7 @@ All keys live under the top-level `amf:` section. Types and defaults below come 
 | `time.t3512.value` | u64 (seconds) | `540` | Periodic registration update timer sent to the UE in the Registration Accept (GPRS Timer 3). The mobile-reachable timer is derived from it (T3512 + 240 s) unless `AMF_MOBILE_REACHABLE_SECS` overrides it. |
 | `time.t3502.value` | u64 (seconds) | none | Parsed and stored, but not yet signalled to the UE. |
 | `emergency.allow_unauthenticated` | bool | **`true`** | Whether an EMERGENCY registration the network could not authenticate (e.g. the AUSF is unreachable) proceeds as an unauthenticated, emergency-only registration, or is refused. **This is a regulatory setting** — see [Unauthenticated emergency service](#unauthenticated-emergency-service) below. `AMF_EMERGENCY_ALLOW_UNAUTHENTICATED` overrides it. |
-| `paging.strategy` | `registration-area` or `recommended-first` | `registration-area` | Which gNBs a CM-IDLE UE is paged on (#1442). `registration-area` pages every gNB serving the UE's registration area on every attempt. `recommended-first` pages the gNBs the RAN recommended at the UE's last release first. See [Paging strategy](#paging-strategy). Any other value fails startup. Read at startup only: a change needs a restart. |
+| `paging.strategy` | `registration-area`, `recommended-first` or `nwdaf-mobility` | `registration-area` | Which gNBs a CM-IDLE UE is paged on (#1442, nextgsim#464). `registration-area` pages every gNB serving the UE's registration area on every attempt. `recommended-first` first pages the gNBs the RAN recommended at the UE's last release. `nwdaf-mobility` first pages the gNB of the cell the NWDAF predicts and the gNB of the UE's last known cell. See [Paging strategy](#paging-strategy). Any other value fails startup. Read at startup only: a change needs a restart. |
 
 ## Command-line flags
 
@@ -115,6 +115,7 @@ Cargo features: `kernel-sctp` (enables `--sctp-backend kernel`; the Docker build
 | `AMF_RESTART_COUNTER` | TS 23.007 restart counter sent on N26 (u8, default `0` = not available). |
 | `AMF_PEER_SBI_ADDR` / `AMF_PEER_SBI_PORT` | Fallback peer AMF (UE context transfer by 5G-GUTI) when the NRF cannot discover one. Port default `7777`. |
 | `LMF_SBI_ADDR` / `LMF_SBI_PORT` | Fallback LMF when none is discoverable via the NRF. |
+| `NWDAF_SBI_ADDR` / `NWDAF_SBI_PORT` | Fallback NWDAF for `paging.strategy: nwdaf-mobility` when none serving `nnwdaf-analyticsinfo` is discoverable via the NRF (logged when used). Port default `7777`. |
 | `UCMF_SBI_ADDR` / `UCMF_SBI_PORT` | Fallback UCMF for RACS (UE Radio Capability ID resolution) when none is discoverable via the NRF. Port default `7777`. |
 | `AMF_NAMF_LOC_LMF` | `off`/`0`/`false` makes Namf_Location answer from the stored NGAP cell identity with no LMF round trip. Default on. |
 | `AMF_UE_POLICY_ASSOC` | `off`/`0`/`false` disables the Npcf_UEPolicyControl association at registration. Default on. |
@@ -154,7 +155,32 @@ Cargo features: `kernel-sctp` (enables `--sctp-backend kernel`; the Docker build
   - **Clearing.** The stored list belongs to one idle period. A release whose Complete carries no IE clears it. A CM-IDLE entry with no UE CONTEXT RELEASE COMPLETE also clears it: NG Reset, loss of the gNB's association, or an Initial Context Setup Failure.
   - The *Recommended Cells for Paging* are transparent to the 5GC (§9.3.1.71) and are not kept. Paging Attempt Information and Assistance Data for Recommended Cells are not sent.
 
-The paging log line keeps its prefix in both modes: `Paging sent to N/M gNB(s) serving the registration area: ...`, and `... recommended by the RAN in the registration area: ...` for a recommended first attempt.
+- **`nwdaf-mobility`** (nextgsim#464). TS 23.501 §5.4.3.1: "If NWDAF is deployed, the AMF may also use analytics ... on the UE's mobility as provided by NWDAF". The AMF is the UE Mobility consumer of TS 23.288 §6.7.2.
+  - **Asking.** When a page is queued for a UE with a SUPI, the AMF sends `Nnwdaf_AnalyticsInfo_Request` to an NWDAF: `GET /nnwdaf-analyticsinfo/v1/analytics?event-id=UE_MOBILITY&tgt-ue={"supis":[..]}&ana-req={"startTs":now,"endTs":now+30s}` (TS 29.520 §4.3.2.2.2). Because the window is in the future, the NWDAF returns a prediction.
+    - The NWDAF is found in the discovery cache, then by NRF discovery for `nnwdaf-analyticsinfo`, then through `NWDAF_SBI_ADDR`/`NWDAF_SBI_PORT`.
+    - The request carries an OAuth2 token when `sbi.oauth2` is configured.
+    - The query runs off the NGAP task.
+  - **The NWDAF must serve UE Mobility.** In this repository that means nwdafd built with `--features amf-mobility` and run with `nwdaf.amf_mobility.enabled: true` (or demo `d441c-amf-mobility` mode `on`). It learns cells from this AMF's LOCATION_REPORT events, sent on Handover Notify and Path Switch. Without it, nwdafd answers 204 and every page falls back to the registration area, after up to 300 ms.
+  - **Holding.** Only that UE's *first* PAGING waits for the answer, for at most **300 ms**, NRF discovery included. The pump does not wait on the NWDAF, and every other page goes out as usual. At most **64** queries are in flight. Past that, a page is released at once to the registration area. A warning is logged at most once every 10 s, with the count of pages it covers.
+  - **First attempt.** The PAGING goes to the connected gNBs that own the predicted cell, then to the gNB that owns the UE's last known cell, each once and only if it serves the registration area. A gNB owns a cell when its Global gNB ID (PLMN, and gNB ID at its own bit length) equals the NCGI's PLMN and the leftmost gNB-ID-length bits of the NCI (TS 38.413 §9.3.1.7). The last known cell is paged as well because the NWDAF predicts the most likely *next* cell: a UE that has not moved since it went idle is still where the AMF last saw it.
+  - **Retransmissions.** Every T3513 retransmission widens to the whole registration area.
+  - **Falling back.** In each of these cases the first attempt pages the whole registration area:
+    - the UE has no SUPI;
+    - the 64-query cap is full;
+    - no NWDAF is found;
+    - the connection is refused, or there is no answer within 300 ms;
+    - the answer is not 200 (204: no data);
+    - the body names no NR cell;
+    - neither the predicted cell nor the last known one is owned by a connected gNB in the area;
+    - the answer arrives after the first PAGING. A late answer is not used for that page.
+  - **RAN sharing.** A cell whose NCGI carries a broadcast PLMN other than the Global gNB ID's PLMN matches no gNB, so it falls back as above.
+  - **Observability.** `amf_paging_nwdaf_hints_total{outcome}`, with outcome `predicted`, `no_prediction`, `error`, `timeout`, `cap_full` or `late`, is exported only under this strategy. The info lines `NWDAF UE mobility: ue=<supi> predicted=(<plmn>, 0x<nci>) confidence=<n>%` and `... <role> cell 0x.. is served by gNB 0x..` show the prediction and the gNBs it mapped to.
+  - Assistance Data for Recommended Cells and Paging Attempt Information are not sent.
+
+The paging log line keeps its prefix in every mode:
+- `Paging sent to N/M gNB(s) serving the registration area: ...`;
+- `... recommended by the RAN in the registration area: ...` for a recommended first attempt;
+- `... predicted by NWDAF UE mobility in the registration area: ...` for an NWDAF-steered first attempt.
 
 ## Unauthenticated emergency service
 
