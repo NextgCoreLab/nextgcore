@@ -42,6 +42,8 @@ amf:
   # known cell's gNB first, then the whole area. Any failure pages the area at
   # once. The NWDAF must serve UE Mobility (nwdafd --features amf-mobility,
   # nwdaf.amf_mobility.enabled: true), or every page falls back after <= 300 ms.
+  # Both staged strategies also send Paging Attempt Information (count, intended
+  # attempts, next paging area scope; TS 38.413 §9.3.1.72) in every PAGING.
   # See docs-book/src/configuration/amf.md "Paging strategy".
   # paging:
   #   strategy: registration-area
