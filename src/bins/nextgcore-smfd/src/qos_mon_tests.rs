@@ -190,7 +190,7 @@ fn a_qos_mon_notification_has_one_delay_each_or_pdmf() {
         &serde_json::json!({
             "notifId": "n-1390", "notifUri": "http://127.0.0.1:1/cb",
             "eventSubs": [{ "event": "QOS_MON" }], "supi": "imsi-001010000001390",
-            "notifMethod": "PERIODIC", "repPeriod": 4,
+            "notifMethod": "PERIODIC", "repPeriod": 4, "supportedFeatures": "80010",
         }),
         "s".into(),
     )
@@ -203,7 +203,8 @@ fn a_qos_mon_notification_has_one_delay_each_or_pdmf() {
         ..Default::default()
     };
     let n =
-        event_exposure::build_qos_mon_notification(&sub, "imsi-001010000001390", 5, &result_of(&m));
+        event_exposure::build_qos_mon_notification(&sub, "imsi-001010000001390", 5, &result_of(&m))
+            .unwrap();
     let e = &n["eventNotifs"][0];
     assert_eq!(n["notifId"], "n-1390");
     assert_eq!(e["event"], "QOS_MON");
@@ -217,7 +218,8 @@ fn a_qos_mon_notification_has_one_delay_each_or_pdmf() {
         ..Default::default()
     };
     let n =
-        event_exposure::build_qos_mon_notification(&sub, "imsi-001010000001390", 5, &result_of(&f));
+        event_exposure::build_qos_mon_notification(&sub, "imsi-001010000001390", 5, &result_of(&f))
+            .unwrap();
     let e = &n["eventNotifs"][0];
     assert_eq!(e["pdmf"], true);
     assert!(e.get("dlDelays").is_none());
@@ -228,4 +230,76 @@ fn a_qos_mon_notification_has_one_delay_each_or_pdmf() {
     )
     .unwrap();
     assert_eq!(event_exposure::periodic_rep_period(&on_event), None);
+}
+
+/// #1390 review m7, TS 29.508 §5.8 / Table 5.8-1 and TS 29.500 §6.6.2: the
+/// QoSMonitoring (5) and PacketDelayFailureReport (20) features are negotiated
+/// from the consumer's `supportedFeatures`, the answer carries the intersection,
+/// and a notification carries only what was negotiated (§4.2.3.2 items 12, 12d).
+#[test]
+fn qos_monitoring_and_packet_delay_failure_report_are_negotiated() {
+    use event_exposure::feature::{
+        self, PACKET_DELAY_FAILURE_REPORT as PDFR, QOS_MONITORING as QM,
+    };
+    assert_eq!(feature::negotiate(Some("80010")), QM | PDFR);
+    assert_eq!(feature::negotiate(Some("FFFFFFFF")), QM | PDFR);
+    assert_eq!(feature::negotiate(Some("10")), QM);
+    assert_eq!(
+        feature::negotiate(Some("80000")),
+        0,
+        "PDFR requires QoSMonitoring"
+    );
+    assert_eq!(feature::negotiate(Some("1")), 0);
+    assert_eq!(feature::negotiate(Some("zz")), 0);
+    assert_eq!(feature::negotiate(None), 0);
+    assert_eq!(feature::to_hex(QM | PDFR), "80010");
+
+    let parse = |extra: serde_json::Value| {
+        let mut doc = serde_json::json!({
+            "notifId": "n", "notifUri": "http://127.0.0.1:1/cb",
+            "eventSubs": [{ "event": "QOS_MON" }],
+        });
+        doc.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        event_exposure::parse_subscription(&doc, "s".into()).unwrap()
+    };
+    // The stored (and echoed) document carries the negotiated set.
+    let all = parse(serde_json::json!({ "supportedFeatures": "fffff" }));
+    assert_eq!(all.features, QM | PDFR);
+    assert_eq!(all.document["supportedFeatures"], "80010");
+    let qm = parse(serde_json::json!({ "supportedFeatures": "10" }));
+    assert_eq!(qm.document["supportedFeatures"], "10");
+    // No supportedFeatures: none negotiated, and none echoed.
+    let none = parse(serde_json::json!({}));
+    assert_eq!(none.features, 0);
+    assert!(none.document.get("supportedFeatures").is_none());
+
+    let delays = QosMonResult {
+        dl_delay: Some(3),
+        ..Default::default()
+    };
+    let failure = QosMonResult {
+        failure: true,
+        ..Default::default()
+    };
+    let build = |s: &EventSubscription, r: &QosMonResult| {
+        event_exposure::build_qos_mon_notification(s, "imsi-001010000001390", 5, r)
+    };
+    assert!(
+        build(&none, &delays).is_none(),
+        "no QoSMonitoring: no delays"
+    );
+    assert_eq!(
+        build(&qm, &delays).unwrap()["eventNotifs"][0]["dlDelays"],
+        serde_json::json!([3])
+    );
+    assert!(
+        build(&qm, &failure).is_none(),
+        "no PacketDelayFailureReport: no pdmf"
+    );
+    assert_eq!(
+        build(&all, &failure).unwrap()["eventNotifs"][0]["pdmf"],
+        true
+    );
 }

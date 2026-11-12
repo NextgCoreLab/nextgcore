@@ -389,7 +389,11 @@ proptest! {
 
 /// A generated-codec PathSwitchRequestTransfer, optionally carrying User Plane
 /// Security Information.
-fn generated_path_switch_request(dl: (u32, [u8; 4]), qfis: &[u8], security: bool) -> Vec<u8> {
+pub(crate) fn generated_path_switch_request(
+    dl: (u32, [u8; 4]),
+    qfis: &[u8],
+    security: bool,
+) -> Vec<u8> {
     encode(
         "test",
         &g::PathSwitchRequestTransfer {

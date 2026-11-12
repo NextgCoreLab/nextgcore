@@ -1161,6 +1161,12 @@ pub struct SessionModificationParams {
     )>,
     /// #1390: SRRs to remove (Table 7.5.4.19-1), by SRR ID.
     pub remove_srr_ids: Vec<u8>,
+    /// #1390 review: SRRs to update (Table 7.5.4.20-1): an SRR ID and the QoS
+    /// Monitoring per QoS flow Control Information IEs that replace its own.
+    pub update_srrs: Vec<(
+        u8,
+        Vec<nextgcore_pfcp::qos_monitoring::QosMonitoringPerQosFlowControlInformation>,
+    )>,
 }
 
 /// Build PFCP Session Modification Request
@@ -1278,17 +1284,23 @@ pub fn build_session_modification_request(params: &SessionModificationParams) ->
         srr.add_u8(pfcp_ie::SRR_ID, *id);
         builder.add_tlv(pfcp_ie::REMOVE_SRR, &srr.build());
     }
-    for (id, controls) in &params.create_srrs {
+    let srr_with = |id: u8, controls: &[nextgcore_pfcp::qos_monitoring::QosMonitoringPerQosFlowControlInformation]| {
         use nextgcore_pfcp::qos_monitoring::TypedIe;
         let mut srr = PfcpMessageBuilder::new();
-        srr.add_u8(pfcp_ie::SRR_ID, *id);
+        srr.add_u8(pfcp_ie::SRR_ID, id);
         let mut body = srr.build();
         for c in controls {
             let mut v = bytes::BytesMut::new();
             c.encode_ie(&mut v);
             body.extend_from_slice(&v);
         }
-        builder.add_tlv(pfcp_ie::CREATE_SRR, &body);
+        body
+    };
+    for (id, controls) in &params.create_srrs {
+        builder.add_tlv(pfcp_ie::CREATE_SRR, &srr_with(*id, controls));
+    }
+    for (id, controls) in &params.update_srrs {
+        builder.add_tlv(pfcp_ie::UPDATE_SRR, &srr_with(*id, controls));
     }
 
     builder.build()

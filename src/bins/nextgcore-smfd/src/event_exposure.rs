@@ -22,13 +22,14 @@
 //! `NsmfEventExposureNotification` to `notifUri`, carrying the subscription's own
 //! `notifId` so the consumer can correlate it with the subscription it made.
 //!
-//! Which events are emitted, and why only these two: `PDU_SES_EST` and
-//! `PDU_SES_REL` are the two occurrences the live establishment and release paths
-//! actually reach. The other twenty values in `SmfEvent` name occurrences this SMF
-//! does not detect (`UP_PATH_CH`, `QOS_MON`, `DISPERSION`, …); subscribing to one
-//! is accepted and stored — refusing it would reject a conformant request — and it
-//! simply never fires. That is stated here rather than left for a consumer to infer
-//! from silence.
+//! Which events are emitted: `PDU_SES_EST` and `PDU_SES_REL`, the two occurrences
+//! the live establishment and release paths reach, and `QOS_MON` (#1390, the
+//! `qos_mon` module) for a consumer that negotiated the QoSMonitoring feature
+//! ([`feature`]). The other values in `SmfEvent` name occurrences this SMF does
+//! not detect (`UP_PATH_CH`, `DISPERSION`, …); subscribing to one is accepted and
+//! stored — refusing it would reject a conformant request — and it simply never
+//! fires, as does `QOS_MON` without QoSMonitoring. That is stated here rather than
+//! left for a consumer to infer from silence.
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -50,6 +51,48 @@ pub mod event {
     pub const QOS_MON: &str = "QOS_MON";
 }
 
+/// The optional features of the Nsmf_EventExposure API this SMF supports (TS
+/// 29.508 Table 5.8-1), as SupportedFeatures bits (TS 29.571 §5.2.2: feature
+/// n is bit n-1). Negotiated per TS 29.500 §6.6.2 (#1390 review m7).
+pub mod feature {
+    /// Feature 5, QoSMonitoring: the QOS_MON event's `ulDelays` / `dlDelays` /
+    /// `rtDelays` (§4.2.3.2 item 12; Table 5.8-1 NOTE 3: negotiable explicitly
+    /// in the Subscribe).
+    pub const QOS_MONITORING: u64 = 1 << 4;
+    /// Feature 20, PacketDelayFailureReport: `pdmf` (item 12d). It requires
+    /// QoSMonitoring.
+    pub const PACKET_DELAY_FAILURE_REPORT: u64 = 1 << 19;
+    /// Every optional feature this SMF implements.
+    pub const SUPPORTED: u64 = QOS_MONITORING | PACKET_DELAY_FAILURE_REPORT;
+
+    /// The features both sides support: the consumer's `supportedFeatures`
+    /// (hex) intersected with [`SUPPORTED`]. Absent or unreadable: none (TS
+    /// 29.500 §6.6.2). PacketDelayFailureReport without QoSMonitoring is
+    /// dropped, as Table 5.8-1 makes the one require the other.
+    pub fn negotiate(consumer_hex: Option<&str>) -> u64 {
+        let consumer = consumer_hex
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|s| {
+                // A SupportedFeatures string may be longer than 16 hex digits:
+                // only the low 64 features matter here.
+                let tail = &s[s.len().saturating_sub(16)..];
+                u64::from_str_radix(tail, 16).ok()
+            })
+            .unwrap_or(0);
+        let mut n = consumer & SUPPORTED;
+        if n & QOS_MONITORING == 0 {
+            n &= !PACKET_DELAY_FAILURE_REPORT;
+        }
+        n
+    }
+
+    /// `features` as a SupportedFeatures string (TS 29.571 §5.2.2).
+    pub fn to_hex(features: u64) -> String {
+        format!("{features:x}")
+    }
+}
+
 /// A stored subscription: the parsed document plus the id this SMF assigned.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventSubscription {
@@ -65,6 +108,9 @@ pub struct EventSubscription {
     pub supi: Option<String>,
     /// PDU session id filter, when scoped to one session.
     pub pdu_session_id: Option<u8>,
+    /// The optional features negotiated with the consumer ([`feature`]); 0 when
+    /// its document carried no `supportedFeatures`.
+    pub features: u64,
     /// The document as received, so `GET` returns what was stored rather than a
     /// re-serialisation of the subset this SMF models. A consumer that sent
     /// `sampRatio` or `partitionCriteria` gets them back.
@@ -93,6 +139,11 @@ impl EventSubscription {
             }
         }
         true
+    }
+
+    /// Whether the consumer negotiated `f` ([`feature`]).
+    pub fn supports(&self, f: u64) -> bool {
+        self.features & f == f
     }
 }
 
@@ -178,6 +229,16 @@ pub fn parse_subscription(body: &Value, id: String) -> Result<EventSubscription,
         return Err(ParseError::NoEvent);
     }
 
+    // TS 29.500 §6.6.2: the consumer lists the features it supports, and the
+    // answer (here the stored and echoed document) carries those the SMF
+    // supports too.
+    let consumer_features = obj.get("supportedFeatures").and_then(Value::as_str);
+    let features = feature::negotiate(consumer_features);
+    let mut document = body.clone();
+    if consumer_features.is_some() {
+        document["supportedFeatures"] = Value::String(feature::to_hex(features));
+    }
+
     Ok(EventSubscription {
         id,
         notif_id,
@@ -188,7 +249,8 @@ pub fn parse_subscription(body: &Value, id: String) -> Result<EventSubscription,
             .get("pduSeId")
             .and_then(Value::as_u64)
             .and_then(|v| u8::try_from(v).ok()),
-        document: body.clone(),
+        features,
+        document,
     })
 }
 
@@ -346,28 +408,35 @@ pub struct QosMonResult {
 
 /// The `NsmfEventExposureNotification` of one QOS_MON report (#1390, TS 29.508
 /// §4.2.3.2 item 12): one element in each of `ulDelays`, `dlDelays`, `rtDelays`
-/// (NOTE 8: the UPF reports one measurement per report), or `pdmf: true`.
+/// (NOTE 8: the UPF reports one measurement per report) when QoSMonitoring was
+/// negotiated, and `pdmf: true` when PacketDelayFailureReport was (item 12d).
+/// `None` when the report carries nothing the consumer negotiated.
 pub fn build_qos_mon_notification(
     sub: &EventSubscription,
     supi: &str,
     psi: u8,
     r: &QosMonResult,
-) -> Value {
+) -> Option<Value> {
     let mut n = build_notification(sub, event::QOS_MON, supi, psi);
     let e = &mut n["eventNotifs"][0];
-    if let Some(v) = r.ul_delay {
-        e["ulDelays"] = serde_json::json!([v]);
+    let mut any = false;
+    if sub.supports(feature::QOS_MONITORING) {
+        for (name, v) in [
+            ("ulDelays", r.ul_delay),
+            ("dlDelays", r.dl_delay),
+            ("rtDelays", r.rt_delay),
+        ] {
+            if let Some(v) = v {
+                e[name] = serde_json::json!([v]);
+                any = true;
+            }
+        }
     }
-    if let Some(v) = r.dl_delay {
-        e["dlDelays"] = serde_json::json!([v]);
-    }
-    if let Some(v) = r.rt_delay {
-        e["rtDelays"] = serde_json::json!([v]);
-    }
-    if r.failure {
+    if r.failure && sub.supports(feature::PACKET_DELAY_FAILURE_REPORT) {
         e["pdmf"] = serde_json::json!(true);
+        any = true;
     }
-    n
+    any.then_some(n)
 }
 
 /// POST `body` to `sub`'s `notifUri`; failures are logged and swallowed.

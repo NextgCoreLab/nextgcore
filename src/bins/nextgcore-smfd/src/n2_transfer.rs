@@ -890,4 +890,4 @@ pub(crate) fn parse_handover_request_acknowledge_transfer(
 }
 
 #[cfg(test)]
-mod oracle_tests;
+pub(crate) mod oracle_tests;

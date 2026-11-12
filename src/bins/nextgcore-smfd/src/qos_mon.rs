@@ -19,7 +19,15 @@
 //!   QOS_MON with `ulDelays` / `dlDelays` / `rtDelays` (one element each,
 //!   §4.2.3.2 item 12 NOTE 8), or `pdmf` for a measurement failure.
 //!
-//! No `QOS_MON` subscription: nothing is requested on N4 or N2.
+//! No `QOS_MON` subscription, or one that did not negotiate the QoSMonitoring
+//! feature (TS 29.508 Table 5.8-1): nothing is requested on N4 or N2.
+//!
+//! Lifecycle (#1390 review): an SRR is reserved before its Create is awaited, so
+//! concurrent installs on a session take distinct SRR IDs; the task with an N4
+//! request in flight for an SRR owns it and, when the request returns, settles it
+//! against the subscription as stored then (Update SRR on a new `repPeriod`,
+//! Remove SRR when the subscription is gone or no longer covers the session). A
+//! PUT reconciles the SRRs it holds the same way.
 //!
 //! Not modelled, stated: the PCC-rule path (TS 29.512 QosMonitoringData, the
 //! UPEAS `appIds` / `defQosSupp` matching), Event Triggered reporting with
@@ -43,11 +51,51 @@ pub const DEFAULT_PERIOD_SECS: u32 = 10;
 /// the PDU Session Resource Setup it is in the middle of.
 const AFTER_ACTIVATION: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Where an SRR is in its life.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SrrState {
+    /// Reserved: a task owns it and has an N4 request for it in flight (Create,
+    /// Update or Remove). When that returns, the owner reconciles it with the
+    /// subscription as it is then ([`settle`]); nobody else sends N4 for it.
+    Pending,
+    /// At the UPF with `period`; no N4 request in flight.
+    Installed,
+}
+
+/// One SRR of a session: the subscription it serves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Srr {
+    sub: String,
+    id: u8,
+    /// The Measurement Period last sent to the UPF, in seconds.
+    period: u32,
+    state: SrrState,
+    /// The subscription changed (PUT, DELETE) while the SRR was [`Pending`]:
+    /// its owner looks again before settling it.
+    ///
+    /// [`Pending`]: SrrState::Pending
+    recheck: bool,
+}
+
 /// The monitoring of one session: its SRRs, one per subscription.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SessionMon {
-    /// (subscription id, SRR ID).
-    srrs: Vec<(String, u8)>,
+    srrs: Vec<Srr>,
+    /// The NG-RAN was last asked to measure (`both`), not to stop.
+    ran_on: bool,
+    /// An N2 QoS Monitoring Request was held back by another 5GSM procedure:
+    /// sent when the session is idle again ([`on_gsm_idle`]).
+    n2_deferred: bool,
+}
+
+impl SessionMon {
+    fn installed(&self) -> bool {
+        self.srrs.iter().any(|e| e.state == SrrState::Installed)
+    }
+
+    fn position(&self, sub: &str, id: u8) -> Option<usize> {
+        self.srrs.iter().position(|e| e.sub == sub && e.id == id)
+    }
 }
 
 /// Monitored sessions, by SM context reference. Its lock is the mutex itself;
@@ -63,10 +111,19 @@ fn with<T>(f: impl FnOnce(&mut HashMap<String, SessionMon>) -> T) -> T {
     f(g.get_or_insert_with(HashMap::new))
 }
 
+/// Drop a session's entry once it holds nothing.
+fn tidy(m: &mut HashMap<String, SessionMon>, r: &str) {
+    if m.get(r)
+        .is_some_and(|s| s.srrs.is_empty() && !s.ran_on && !s.n2_deferred)
+    {
+        m.remove(r);
+    }
+}
+
 /// Whether the session's default flow is monitored: its Setup Request Transfers
 /// then carry the QoS Monitoring Request.
 pub fn active_on(sm_context_ref: &str) -> bool {
-    with(|m| m.get(sm_context_ref).is_some_and(|s| !s.srrs.is_empty()))
+    with(|m| m.get(sm_context_ref).is_some_and(SessionMon::installed))
 }
 
 /// The session is released: its SRRs went with the N4 session.
@@ -83,7 +140,13 @@ pub(crate) fn clear_for_test() {
 pub fn srr_ids(sm_context_ref: &str) -> Vec<u8> {
     let mut v: Vec<u8> = with(|m| {
         m.get(sm_context_ref)
-            .map(|s| s.srrs.iter().map(|(_, id)| *id).collect())
+            .map(|s| {
+                s.srrs
+                    .iter()
+                    .filter(|e| e.state == SrrState::Installed)
+                    .map(|e| e.id)
+                    .collect()
+            })
             .unwrap_or_default()
     });
     v.sort_unstable();
@@ -96,8 +159,8 @@ fn subscription_of(sm_context_ref: &str, srr_id: u8) -> Option<String> {
         m.get(sm_context_ref)?
             .srrs
             .iter()
-            .find(|(_, id)| *id == srr_id)
-            .map(|(sub, _)| sub.clone())
+            .find(|e| e.id == srr_id)
+            .map(|e| e.sub.clone())
     })
 }
 
@@ -122,6 +185,37 @@ pub fn control_for(qfi: u8, period_secs: u32) -> QosMonitoringPerQosFlowControlI
     }
 }
 
+/// Whether `sub` asks for QoS monitoring this SMF can report: QOS_MON, with
+/// the QoSMonitoring feature negotiated (TS 29.508 §4.2.3.2 item 12: the delays
+/// are reported "if the QoSMonitoring feature is supported").
+fn monitors(sub: &EventSubscription) -> bool {
+    sub.events
+        .iter()
+        .any(|e| e == event_exposure::event::QOS_MON)
+        && sub.supports(event_exposure::feature::QOS_MONITORING)
+}
+
+/// Whether `sub` monitors the session `r` (its SUPI / PDU session filters).
+fn covers(sub: &EventSubscription, r: &str) -> bool {
+    monitors(sub)
+        && crate::lookup_policy_binding(r)
+            .is_some_and(|b| sub.matches(event_exposure::event::QOS_MON, &b.supi, b.psi))
+}
+
+/// The Measurement Period `sub` asks for.
+fn period_of(sub: &EventSubscription) -> u32 {
+    event_exposure::periodic_rep_period(sub).unwrap_or(DEFAULT_PERIOD_SECS)
+}
+
+/// What the SRR serving `sub_id` on `r` should be now: its Measurement Period,
+/// or `None` when it should not exist (the subscription is gone, no longer asks
+/// for QoS monitoring, or no longer covers the session).
+fn desired(sub_id: &str, r: &str) -> Option<u32> {
+    event_exposure::find(sub_id)
+        .filter(|sub| covers(sub, r))
+        .map(|sub| period_of(&sub))
+}
+
 /// The sessions (SM context references, sorted) a QOS_MON subscription covers.
 fn sessions_for(sub: &EventSubscription) -> Vec<String> {
     let mut v: Vec<String> = crate::context::smf_self()
@@ -140,8 +234,8 @@ fn sessions_for(sub: &EventSubscription) -> Vec<String> {
     v
 }
 
-/// A new (or replaced) QOS_MON subscription: monitoring on every session it
-/// covers that has its user plane.
+/// A new QOS_MON subscription: monitoring on every session it covers that has
+/// its user plane.
 pub async fn subscribed(sub: &EventSubscription) {
     if !sub
         .events
@@ -150,53 +244,57 @@ pub async fn subscribed(sub: &EventSubscription) {
     {
         return;
     }
+    if !monitors(sub) {
+        log::info!(
+            "QOS_MON subscription {} did not negotiate the QoSMonitoring feature (TS 29.508 \
+             §4.2.3.2 item 12, Table 5.8-1): stored, but nothing can be reported to it",
+            sub.id
+        );
+        return;
+    }
     for r in sessions_for(sub) {
         if install(&r, sub).await {
-            crate::signal_qos_monitoring(&r, QosMonitoringRequest::Both);
+            signal(&r, QosMonitoringRequest::Both);
         }
     }
 }
 
-/// A QOS_MON subscription is gone (DELETE, or a PUT without QOS_MON): its SRRs
-/// are removed, and the NG-RAN is told to stop where no other remains.
+/// A QOS_MON subscription was replaced (PUT, #1390 review M2): the SRRs it holds
+/// are reconciled with the new document (removed where it no longer covers the
+/// session or asks for QOS_MON, updated where the period changed), and the
+/// sessions it newly covers are installed.
+pub async fn replaced(sub: &EventSubscription) {
+    reconcile(&sub.id).await;
+    subscribed(sub).await;
+}
+
+/// A QOS_MON subscription is gone (DELETE): its SRRs are removed, and the
+/// NG-RAN is told to stop where no other remains.
 pub async fn unsubscribed(sub_id: &str) {
-    let affected: Vec<(String, u8)> = with(|m| {
-        m.iter()
-            .filter_map(|(r, s)| {
-                s.srrs
-                    .iter()
-                    .find(|(sub, _)| sub == sub_id)
-                    .map(|(_, id)| (r.clone(), *id))
-            })
-            .collect()
+    reconcile(sub_id).await;
+}
+
+/// Bring every SRR serving `sub_id` in line with the subscription as stored now.
+/// An SRR another task owns ([`SrrState::Pending`]) is flagged for its owner to
+/// look again; the rest are taken over and settled here.
+async fn reconcile(sub_id: &str) {
+    let mine: Vec<(String, u8, u32)> = with(|m| {
+        let mut out = Vec::new();
+        for (r, s) in m.iter_mut() {
+            for e in s.srrs.iter_mut().filter(|e| e.sub == sub_id) {
+                match e.state {
+                    SrrState::Pending => e.recheck = true,
+                    SrrState::Installed => {
+                        e.state = SrrState::Pending;
+                        out.push((r.clone(), e.id, e.period));
+                    }
+                }
+            }
+        }
+        out
     });
-    for (r, srr_id) in affected {
-        let params = crate::n4_build::SessionModificationParams {
-            remove_srr_ids: vec![srr_id],
-            ..Default::default()
-        };
-        if let Some(upf_seid) = crate::lookup_upf_seid(&r) {
-            if let Err(e) =
-                crate::pfcp_modify_with(crate::smf_n4_seid_for(&r), upf_seid, &params).await
-            {
-                log::warn!(
-                    "ref={r}: Remove SRR {srr_id} (QOS_MON subscription {sub_id}) failed: {e}"
-                );
-            }
-        }
-        let last = with(|m| {
-            let s = m.entry(r.clone()).or_default();
-            s.srrs.retain(|(sub, _)| sub != sub_id);
-            let empty = s.srrs.is_empty();
-            if empty {
-                m.remove(&r);
-            }
-            empty
-        });
-        log::info!("ref={r}: QoS monitoring SRR {srr_id} removed (subscription {sub_id})");
-        if last {
-            crate::signal_qos_monitoring(&r, QosMonitoringRequest::Stop);
-        }
+    for (r, id, period) in mine {
+        settle(&r, sub_id, id, period).await;
     }
 }
 
@@ -208,7 +306,10 @@ pub fn on_user_plane_active(sm_context_ref: &str) {
         return;
     };
     let subs: Vec<EventSubscription> =
-        event_exposure::matching(event_exposure::event::QOS_MON, &b.supi, b.psi);
+        event_exposure::matching(event_exposure::event::QOS_MON, &b.supi, b.psi)
+            .into_iter()
+            .filter(monitors)
+            .collect();
     if subs.is_empty() {
         return;
     }
@@ -220,17 +321,82 @@ pub fn on_user_plane_active(sm_context_ref: &str) {
             any |= install(&r, sub).await;
         }
         if any {
-            crate::signal_qos_monitoring(&r, QosMonitoringRequest::Both);
+            signal(&r, QosMonitoringRequest::Both);
         }
     });
 }
 
-/// Install `sub`'s SRR on the session, unless it is there already. Returns
+/// An Xn handover moved the session to another gNB (PATH_SWITCH_REQ, #1390
+/// review m6). The Path Switch Request Acknowledge Transfer carries no QoS flow
+/// parameters, and the target learns the source's QoS Monitoring Request only if
+/// its XnAP carried it, so a monitored session asks the new gNB again (after
+/// [`AFTER_ACTIVATION`], so the AMF has finished the path switch).
+pub fn on_path_switch(sm_context_ref: &str) {
+    if !active_on(sm_context_ref) {
+        return;
+    }
+    let r = sm_context_ref.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(AFTER_ACTIVATION).await;
+        if active_on(&r) {
+            signal(&r, QosMonitoringRequest::Both);
+        }
+    });
+}
+
+/// Ask the NG-RAN to start or stop, remembering what it was asked and whether
+/// the request had to wait for another 5GSM procedure (#1390 review m5).
+fn signal(r: &str, request: QosMonitoringRequest) {
+    let outcome = crate::signal_qos_monitoring(r, request);
+    with(|m| {
+        let s = m.entry(r.to_string()).or_default();
+        match outcome {
+            crate::QosMonitoringSignal::Sent => {
+                s.ran_on = request == QosMonitoringRequest::Both;
+                s.n2_deferred = false;
+            }
+            crate::QosMonitoringSignal::Deferred => s.n2_deferred = true,
+            crate::QosMonitoringSignal::NotSent => {}
+        }
+        tidy(m, r);
+    });
+}
+
+/// The session's 5GSM procedure ended (its T3591 / T3592 stopped or was
+/// exhausted, #1390 review m5): an N2 QoS Monitoring Request it held back is
+/// sent now, for what the session needs then: `both` while an SRR is installed,
+/// `stop` if the NG-RAN was measuring and none is.
+pub fn on_gsm_idle(sm_context_ref: &str) {
+    let want = with(|m| {
+        let s = m.get_mut(sm_context_ref)?;
+        if !std::mem::take(&mut s.n2_deferred) {
+            return None;
+        }
+        let want = if s.installed() {
+            Some(QosMonitoringRequest::Both)
+        } else if s.ran_on {
+            Some(QosMonitoringRequest::Stop)
+        } else {
+            None
+        };
+        tidy(m, sm_context_ref);
+        want
+    });
+    if let Some(want) = want {
+        log::info!(
+            "ref={sm_context_ref}: the 5GSM procedure ended; sending the QoS Monitoring \
+             Request {want:?} it held back"
+        );
+        signal(sm_context_ref, want);
+    }
+}
+
+/// Install `sub`'s SRR on the session, unless it has one already. Returns
 /// whether it was newly installed.
 async fn install(sm_context_ref: &str, sub: &EventSubscription) -> bool {
     if with(|m| {
         m.get(sm_context_ref)
-            .is_some_and(|s| s.srrs.iter().any(|(id, _)| *id == sub.id))
+            .is_some_and(|s| s.srrs.iter().any(|e| e.sub == sub.id))
     }) {
         return false;
     }
@@ -259,47 +425,199 @@ async fn install(sm_context_ref: &str, sub: &EventSubscription) -> bool {
         );
         return false;
     }
-    let srr_id = with(|m| {
-        let used: Vec<u8> = m
-            .get(sm_context_ref)
-            .map(|s| s.srrs.iter().map(|(_, id)| *id).collect())
-            .unwrap_or_default();
-        (1..=u8::MAX).find(|id| !used.contains(id))
+    let period = period_of(sub);
+    // #1390 review M1: the SRR ID is reserved under the lock, before the N4
+    // request is awaited, so a concurrent install on the session (another
+    // subscription, or the same one from a PDU_RES_SETUP_RSP) picks another.
+    let reserved = with(|m| {
+        let s = m.entry(sm_context_ref.to_string()).or_default();
+        if s.srrs.iter().any(|e| e.sub == sub.id) {
+            return Err(None);
+        }
+        let id = (1..=u8::MAX)
+            .find(|id| !s.srrs.iter().any(|e| e.id == *id))
+            .ok_or(Some(()))?;
+        s.srrs.push(Srr {
+            sub: sub.id.clone(),
+            id,
+            period,
+            state: SrrState::Pending,
+            recheck: false,
+        });
+        Ok(id)
     });
-    let Some(srr_id) = srr_id else {
-        log::warn!(
-            "ref={sm_context_ref}: no free SRR ID for subscription {}",
-            sub.id
-        );
-        return false;
+    let srr_id = match reserved {
+        Ok(id) => id,
+        Err(None) => return false,
+        Err(Some(())) => {
+            log::warn!(
+                "ref={sm_context_ref}: no free SRR ID for subscription {}",
+                sub.id
+            );
+            return false;
+        }
     };
-    let period = event_exposure::periodic_rep_period(sub).unwrap_or(DEFAULT_PERIOD_SECS);
     let params = crate::n4_build::SessionModificationParams {
         create_srrs: vec![(srr_id, vec![control_for(b.qfi, period)])],
         ..Default::default()
     };
     match crate::pfcp_modify_with(smf_seid, upf_seid, &params).await {
         Ok(_) => {
-            with(|m| {
-                m.entry(sm_context_ref.to_string())
-                    .or_default()
-                    .srrs
-                    .push((sub.id.clone(), srr_id))
-            });
             log::info!(
                 "ref={sm_context_ref}: QoS monitoring of QFI {} requested from the UPF: SRR \
                  {srr_id}, Periodic every {period} s (QOS_MON subscription {})",
                 b.qfi,
                 sub.id
             );
-            true
+            // #1390 review M3: a DELETE (or a PUT) may have come while the Create
+            // was in flight: settle against the subscription as it is now.
+            settle(sm_context_ref, &sub.id, srr_id, period).await
         }
         Err(e) => {
             log::warn!(
                 "ref={sm_context_ref}: Create SRR for QOS_MON subscription {} failed: {e}",
                 sub.id
             );
+            // The reservation is rolled back.
+            with(|m| {
+                if let Some(s) = m.get_mut(sm_context_ref) {
+                    if let Some(i) = s.position(&sub.id, srr_id) {
+                        s.srrs.remove(i);
+                    }
+                }
+                tidy(m, sm_context_ref);
+            });
             false
+        }
+    }
+}
+
+/// What [`settle`] does next with an SRR it owns.
+enum Next {
+    /// It matches the subscription: installed.
+    Done,
+    /// The subscription wants another period.
+    Update(u32),
+    /// The subscription no longer wants it (or the session forgot it).
+    Remove { last: bool },
+}
+
+/// Settle the SRR `id` serving `sub_id` on `r`, owned by the caller (state
+/// [`SrrState::Pending`]) with `sent` the period the UPF holds: Update SRR
+/// while the subscription wants another period, Remove SRR (and `stop` to the
+/// NG-RAN when it was the session's last) when it wants none. Returns whether
+/// the SRR ends installed.
+async fn settle(r: &str, sub_id: &str, id: u8, mut sent: u32) -> bool {
+    // Each Update is followed by another look; a subscription replaced faster
+    // than the UPF answers is followed, not chased forever.
+    for _ in 0..8 {
+        let want = desired(sub_id, r);
+        let next = with(|m| {
+            let Some(s) = m.get_mut(r) else {
+                return Next::Remove { last: false };
+            };
+            let Some(i) = s.position(sub_id, id) else {
+                return Next::Remove { last: false };
+            };
+            let e = &mut s.srrs[i];
+            if std::mem::take(&mut e.recheck) {
+                // The subscription changed after `want` was read: read it again.
+                return Next::Update(sent);
+            }
+            match want {
+                Some(p) if p == sent => {
+                    e.period = p;
+                    e.state = SrrState::Installed;
+                    Next::Done
+                }
+                Some(p) => Next::Update(p),
+                None => {
+                    s.srrs.remove(i);
+                    Next::Remove {
+                        last: !s.installed() && s.ran_on,
+                    }
+                }
+            }
+        });
+        match next {
+            Next::Done => return true,
+            Next::Update(p) if p == sent => continue,
+            Next::Update(p) => {
+                if send_update(r, id, p).await {
+                    log::info!(
+                        "ref={r}: QoS monitoring SRR {id} now Periodic every {p} s \
+                         (subscription {sub_id} replaced)"
+                    );
+                    sent = p;
+                }
+                // A failed Update leaves the UPF on `sent`: settled there, and the
+                // next PUT tries again.
+                else if with(|m| {
+                    m.get_mut(r)
+                        .and_then(|s| {
+                            let i = s.position(sub_id, id)?;
+                            s.srrs[i].period = sent;
+                            s.srrs[i].state = SrrState::Installed;
+                            Some(())
+                        })
+                        .is_some()
+                }) {
+                    return true;
+                }
+            }
+            Next::Remove { last } => {
+                send_remove(r, id, sub_id).await;
+                if last {
+                    signal(r, QosMonitoringRequest::Stop);
+                }
+                with(|m| tidy(m, r));
+                return false;
+            }
+        }
+    }
+    with(|m| {
+        if let Some(s) = m.get_mut(r) {
+            if let Some(i) = s.position(sub_id, id) {
+                s.srrs[i].period = sent;
+                s.srrs[i].state = SrrState::Installed;
+            }
+        }
+    });
+    true
+}
+
+/// Update SRR `id` on `r` to `period` (TS 29.244 Table 7.5.4.20-1).
+async fn send_update(r: &str, id: u8, period: u32) -> bool {
+    let (Some(b), Some(upf_seid)) = (crate::lookup_policy_binding(r), crate::lookup_upf_seid(r))
+    else {
+        return false;
+    };
+    let params = crate::n4_build::SessionModificationParams {
+        update_srrs: vec![(id, vec![control_for(b.qfi, period)])],
+        ..Default::default()
+    };
+    match crate::pfcp_modify_with(crate::smf_n4_seid_for(r), upf_seid, &params).await {
+        Ok(_) => true,
+        Err(e) => {
+            log::warn!("ref={r}: Update SRR {id} failed: {e}");
+            false
+        }
+    }
+}
+
+/// Remove SRR `id` on `r` (TS 29.244 Table 7.5.4.19-1).
+async fn send_remove(r: &str, id: u8, sub_id: &str) {
+    let params = crate::n4_build::SessionModificationParams {
+        remove_srr_ids: vec![id],
+        ..Default::default()
+    };
+    let Some(upf_seid) = crate::lookup_upf_seid(r) else {
+        return;
+    };
+    match crate::pfcp_modify_with(crate::smf_n4_seid_for(r), upf_seid, &params).await {
+        Ok(_) => log::info!("ref={r}: QoS monitoring SRR {id} removed (subscription {sub_id})"),
+        Err(e) => {
+            log::warn!("ref={r}: Remove SRR {id} (QOS_MON subscription {sub_id}) failed: {e}")
         }
     }
 }
@@ -396,11 +714,26 @@ pub async fn on_session_report(smf_seid: u64, payload: &[u8]) {
             result.rt_delay,
             if result.failure { " (measurement failure)" } else { "" }
         );
-        let Some(sub) = subscription_of(&r, srr_id).and_then(|id| event_exposure::find(&id)) else {
-            log::info!("ref={r}: SRR {srr_id} serves no live QOS_MON subscription: not notified");
+        // #1390 review M2: the subscription as it is now must still cover the
+        // session (a PUT may have narrowed it while the SRR was being removed).
+        let Some(sub) = subscription_of(&r, srr_id)
+            .and_then(|id| event_exposure::find(&id))
+            .filter(|sub| {
+                monitors(sub) && sub.matches(event_exposure::event::QOS_MON, &b.supi, b.psi)
+            })
+        else {
+            log::info!("ref={r}: SRR {srr_id} serves no live QOS_MON subscription covering the session: not notified");
             continue;
         };
-        let body = event_exposure::build_qos_mon_notification(&sub, &b.supi, b.psi, &result);
+        let Some(body) = event_exposure::build_qos_mon_notification(&sub, &b.supi, b.psi, &result)
+        else {
+            log::info!(
+                "ref={r}: SRR {srr_id}: a measurement failure, but subscription {} did not \
+                 negotiate PacketDelayFailureReport: not notified",
+                sub.id
+            );
+            continue;
+        };
         event_exposure::deliver(&sub, &body, event_exposure::event::QOS_MON, &b.supi, b.psi).await;
     }
 }
