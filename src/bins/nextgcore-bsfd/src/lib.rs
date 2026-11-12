@@ -291,7 +291,9 @@ pub async fn run() -> Result<()> {
     };
 
     // Open legacy SBI server (for context initialization)
-    bsf_sbi_open(Some(sbi_config)).map_err(|e| anyhow::anyhow!(e))?;
+    bsf_sbi_open(Some(sbi_config))
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     // Start actual HTTP/2 SBI server using nextgcore-sbi
     let sbi_addr: SocketAddr = nextgcore_core::sockaddr::parse_listen_addr(&sbi.host, sbi.port)

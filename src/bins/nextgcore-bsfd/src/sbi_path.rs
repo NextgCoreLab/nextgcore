@@ -34,6 +34,12 @@ impl Default for SbiServerConfig {
 /// SBI server state
 static SBI_SERVER_RUNNING: AtomicBool = AtomicBool::new(false);
 
+/// Serialises the tests that open and close the SBI context: they share
+/// [`SBI_SERVER_RUNNING`] and the process-global SBI context's self instance and
+/// NRF URI. Declared beside the global it guards, not in a test module.
+#[cfg(test)]
+pub(crate) static SBI_OPEN_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Parse host and port from a URI string (e.g., "http://127.0.0.1:7777")
 fn parse_uri_host_port(uri_str: &str) -> Result<(String, u16), String> {
     let stripped = uri_str
@@ -135,7 +141,7 @@ fn build_bsf_nf_instance(config: &SbiServerConfig) -> NfInstance {
 /// Registration therefore happens exactly once, from `lib.rs`'s
 /// `register_with_nrf`, after the listener accepts. This is the same treatment
 /// PR #237 applied to `pcfd`.
-pub fn bsf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
+pub async fn bsf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
     if SBI_SERVER_RUNNING.load(Ordering::SeqCst) {
         return Err("SBI server already running".to_string());
     }
@@ -146,20 +152,17 @@ pub fn bsf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
 
     let nf_instance = build_bsf_nf_instance(&config);
     let nf_id = nf_instance.id.clone();
-    let nrf_uri_clone = config.nrf_uri.clone();
 
+    // #1479: awaited, not spawned. `lib.rs` registers with the NRF straight
+    // after, reading the NRF URI from the context; with --nrf-uri and no YAML
+    // `bsf.sbi.client.nrf`, a spawned publication that had not run yet made it
+    // find none and skip registration for the life of the process.
     let sbi_ctx = global_context();
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(async move {
-            sbi_ctx.set_self_instance(nf_instance).await;
-            if let Some(ref nrf_uri) = nrf_uri_clone {
-                sbi_ctx.set_nrf_uri(nrf_uri).await;
-            } else {
-                log::info!("No NRF URI configured, BSF running in standalone mode");
-            }
-        });
-    } else {
-        log::debug!("No tokio runtime available, skipping self-instance publication");
+    sbi_ctx.set_self_instance(nf_instance).await;
+    if let Some(ref nrf_uri) = config.nrf_uri {
+        sbi_ctx.set_nrf_uri(nrf_uri).await;
+    } else if sbi_ctx.get_nrf_uri().await.is_none() {
+        log::info!("No NRF URI configured, BSF running in standalone mode");
     }
 
     log::info!("BSF NF instance built (id={nf_id})");
@@ -244,20 +247,56 @@ mod tests {
         assert!(!config.tls_enabled);
     }
 
-    #[test]
-    fn test_sbi_open_close() {
+    #[tokio::test]
+    async fn test_sbi_open_close() {
+        let _guard = SBI_OPEN_TEST_LOCK.lock().await;
         // Reset state
         SBI_SERVER_RUNNING.store(false, Ordering::SeqCst);
 
-        let result = bsf_sbi_open(None);
+        let result = bsf_sbi_open(None).await;
         assert!(result.is_ok());
         assert!(bsf_sbi_is_running());
 
         // Try to open again while running - should fail
-        let result = bsf_sbi_open(None);
+        let result = bsf_sbi_open(None).await;
         assert!(result.is_err());
 
         bsf_sbi_close();
         assert!(!bsf_sbi_is_running());
+    }
+
+    /// #1479: the self instance and the --nrf-uri are readable the moment
+    /// `bsf_sbi_open` returns, which is when `lib.rs` registers. On the
+    /// current-thread runtime nothing else runs until this task yields, so a
+    /// spawned publication has deterministically not happened yet at the read.
+    #[tokio::test(flavor = "current_thread")]
+    async fn self_instance_and_nrf_uri_are_published_before_bsf_sbi_open_returns() {
+        let _guard = SBI_OPEN_TEST_LOCK.lock().await;
+        let ctx = global_context();
+        ctx.clear_nrf_uri().await;
+        SBI_SERVER_RUNNING.store(false, Ordering::SeqCst);
+
+        let nrf_uri = "http://nrf-1479.invalid:7777";
+        bsf_sbi_open(Some(SbiServerConfig {
+            addr: "192.0.2.148".to_string(),
+            nrf_uri: Some(nrf_uri.to_string()),
+            ..SbiServerConfig::default()
+        }))
+        .await
+        .expect("bsf_sbi_open");
+
+        // No yield between the open and these reads, as in lib.rs.
+        let published = ctx.get_self_instance().await;
+        let published_nrf = ctx.get_nrf_uri().await;
+        SBI_SERVER_RUNNING.store(false, Ordering::SeqCst);
+        ctx.clear_nrf_uri().await;
+
+        let instance = published.expect("self instance published before bsf_sbi_open returns");
+        assert_eq!(instance.ipv4_addresses, vec!["192.0.2.148".to_string()]);
+        assert_eq!(
+            published_nrf.as_deref(),
+            Some(nrf_uri),
+            "with the URI unpublished, register_with_nrf finds none and skips registration"
+        );
     }
 }

@@ -257,9 +257,16 @@ async fn register_with_nrf(nrf_uri: &str, nf_instance: &NfInstance) -> Result<()
     }
 }
 
-/// Open SBI server and register with NRF
+/// Open the SBI context: publish the self NF instance and the NRF URI.
 /// Port of pcf_sbi_open() from sbi-path.c
-pub fn pcf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
+///
+/// #1479: both are published BEFORE this returns. They used to be set from a
+/// spawned task, and `app.rs` reads the self instance straight after: when the
+/// task had not yet been scheduled (1 start in 7 on a cold EKS pod), the read
+/// saw `None` and the PCF ran its whole life without an NRF registration, so
+/// every `Npcf_AMPolicyControl_Create` failed and no UE could register.
+/// Awaiting the two writes here is what makes the read deterministic.
+pub async fn pcf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
     let config = config.unwrap_or_default();
 
     if SBI_SERVER_RUNNING.load(Ordering::SeqCst) {
@@ -268,14 +275,9 @@ pub fn pcf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
 
     log::info!("Opening PCF SBI server on {}:{}", config.addr, config.port);
 
-    // Build and register the PCF NF instance
+    // Build the PCF NF instance
     let nf_instance = build_pcf_nf_instance(&config);
-
-    // Store self instance and NRF URI in SBI context
-    let sbi_ctx = global_context();
     let nf_id = nf_instance.id.clone();
-    let nrf_uri_clone = config.nrf_uri.clone();
-    let nf_clone = nf_instance.clone();
 
     // Publish the instance and the NRF URI, but do NOT register here.
     //
@@ -285,21 +287,17 @@ pub fn pcf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
     // happens ONCE, from `pcf_register_with_nrf`, called after the SBI listener
     // is actually up — registering before the port accepts advertises an
     // endpoint that would refuse the first consumer to dial it.
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(async move {
-            sbi_ctx.set_self_instance(nf_clone).await;
-            if let Some(ref nrf_uri) = nrf_uri_clone {
-                sbi_ctx.set_nrf_uri(nrf_uri).await;
-            } else {
-                log::info!("No NRF URI configured, PCF running in standalone mode");
-            }
-        });
-    } else {
-        log::debug!("No tokio runtime available, skipping SBI context publication");
+    let sbi_ctx = global_context();
+    sbi_ctx.set_self_instance(nf_instance).await;
+    if let Some(ref nrf_uri) = config.nrf_uri {
+        sbi_ctx.set_nrf_uri(nrf_uri).await;
+    } else if sbi_ctx.get_nrf_uri().await.is_none() {
+        // A `None` here only means no --nrf-uri: the YAML `pcf.sbi.client.nrf`
+        // seeds the context directly, so "standalone" is only true when that is
+        // absent too. (Before #1479 this line was printed on every YAML-only
+        // deployment, including ones that then registered.)
+        log::info!("No NRF URI configured, PCF running in standalone mode");
     }
-    // `nf_instance` is retained by the closure above only as a clone; the local
-    // binding is what the id log below reads.
-    let _ = &nf_instance;
 
     log::info!("PCF NF instance built (id={nf_id})");
 
@@ -2957,18 +2955,22 @@ mod tests {
         assert!(!config.tls_enabled);
     }
 
-    #[test]
-    fn test_sbi_open_close_and_config() {
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_sbi_open_close_and_config() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Reset state
         SBI_SERVER_RUNNING.store(false, Ordering::SeqCst);
 
         // Open with default config
-        let result = pcf_sbi_open(None);
+        let result = pcf_sbi_open(None).await;
         assert!(result.is_ok());
         assert!(pcf_sbi_is_running());
 
         // Try to open again - should fail
-        let result = pcf_sbi_open(None);
+        let result = pcf_sbi_open(None).await;
         assert!(result.is_err());
 
         pcf_sbi_close();
@@ -2984,10 +2986,89 @@ mod tests {
             nrf_uri: None,
         };
 
-        let result = pcf_sbi_open(Some(config));
+        let result = pcf_sbi_open(Some(config)).await;
         assert!(result.is_ok());
 
         pcf_sbi_close();
+    }
+
+    /// #1479: the self instance and the NRF URI are readable the moment
+    /// `pcf_sbi_open` returns, which is when `app.rs` reads them to register.
+    ///
+    /// On the current-thread runtime nothing else runs until this task yields, so
+    /// this is the losing order of the EKS race made deterministic: publication
+    /// from a spawned task has not happened yet at the read, and the PCF then ran
+    /// unregistered for its whole life. The address and the NRF URI are unique to
+    /// this test, so an instance or URI another test left in the process-global
+    /// context cannot pass for this one.
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn self_instance_and_nrf_uri_are_published_before_pcf_sbi_open_returns() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ctx = global_context();
+        ctx.clear_nrf_uri().await;
+        SBI_SERVER_RUNNING.store(false, Ordering::SeqCst);
+
+        let nrf_uri = "http://nrf-1479.invalid:7777";
+        let config = SbiServerConfig {
+            addr: "192.0.2.147".to_string(),
+            port: 7777,
+            nrf_uri: Some(nrf_uri.to_string()),
+            ..SbiServerConfig::default()
+        };
+        pcf_sbi_open(Some(config)).await.expect("pcf_sbi_open");
+
+        // No yield between the open and these reads, as in app.rs.
+        let published = ctx.get_self_instance().await;
+        let published_nrf = ctx.get_nrf_uri().await;
+        SBI_SERVER_RUNNING.store(false, Ordering::SeqCst);
+        ctx.clear_nrf_uri().await;
+
+        let instance = published.expect(
+            "the self instance must be published before pcf_sbi_open returns; app.rs reads \
+             it next and, without it, the PCF never registers with the NRF",
+        );
+        assert_eq!(
+            instance.ipv4_addresses,
+            vec!["192.0.2.147".to_string()],
+            "the instance read must be the one this open built, not a leftover"
+        );
+        assert_eq!(
+            published_nrf.as_deref(),
+            Some(nrf_uri),
+            "the --nrf-uri must be published before pcf_sbi_open returns, or \
+             pcf_register_with_nrf finds none and skips registration"
+        );
+    }
+
+    /// #1479: with no --nrf-uri, the open leaves a YAML-seeded NRF URI in place
+    /// (that is how most deployments configure it), so the registration that
+    /// follows still finds it. A guard on the fix's shape, not a reproduction:
+    /// the spawned publication never cleared the URI either.
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn pcf_sbi_open_without_a_cli_nrf_uri_keeps_the_yaml_one() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ctx = global_context();
+        let yaml_uri = "http://nrf-yaml-1479.invalid:7777";
+        ctx.set_nrf_uri(yaml_uri).await;
+        SBI_SERVER_RUNNING.store(false, Ordering::SeqCst);
+
+        pcf_sbi_open(Some(SbiServerConfig {
+            nrf_uri: None,
+            ..SbiServerConfig::default()
+        }))
+        .await
+        .expect("pcf_sbi_open");
+        let after = ctx.get_nrf_uri().await;
+        SBI_SERVER_RUNNING.store(false, Ordering::SeqCst);
+        ctx.clear_nrf_uri().await;
+
+        assert_eq!(after.as_deref(), Some(yaml_uri));
     }
 
     #[test]

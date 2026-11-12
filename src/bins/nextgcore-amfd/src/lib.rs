@@ -568,7 +568,7 @@ impl AmfApp {
         sbi_path::set_advertised_sbi(host, port);
 
         // Initialize SBI
-        sbi_path::amf_sbi_open()?;
+        sbi_path::amf_sbi_open().await?;
 
         log::info!("AMF initialized successfully");
         Ok(())

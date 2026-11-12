@@ -480,7 +480,7 @@ pub fn amf_nf_profile_json(
 }
 
 /// Initialize AMF SBI - build self NF instance and store in SBI context
-pub fn amf_sbi_open() -> SbiResult<()> {
+pub async fn amf_sbi_open() -> SbiResult<()> {
     log::info!("AMF SBI opening...");
 
     // Build self NF instance for AMF
@@ -493,18 +493,15 @@ pub fn amf_sbi_open() -> SbiResult<()> {
     // NRF profile does (#392).
     let nf_instance = build_amf_nf_instance(&nf_instance_id, &sbi_addr, sbi_port);
 
-    // Store self NF instance in global SBI context
+    // Store self NF instance in global SBI context, and the NRF_URI override.
+    // #1479: awaited, not spawned, so both are in place when this returns. A
+    // spawned write raced every reader after `init`: the NRF registration and
+    // the OAuth2/security profile read the NRF URI, and an NRF_URI-only
+    // deployment whose write had not run yet skipped registration altogether.
     let sbi_ctx = global_context();
-    tokio::spawn(async move {
-        sbi_ctx.set_self_instance(nf_instance).await;
-    });
-
-    // Set NRF URI if configured via env var
+    sbi_ctx.set_self_instance(nf_instance).await;
     if let Ok(nrf_uri) = std::env::var("NRF_URI") {
-        let sbi_ctx = global_context();
-        tokio::spawn(async move {
-            sbi_ctx.set_nrf_uri(nrf_uri).await;
-        });
+        sbi_ctx.set_nrf_uri(nrf_uri).await;
     }
 
     log::info!("AMF SBI opened (nf_instance_id={nf_instance_id}, addr={sbi_addr}:{sbi_port})");
@@ -5677,12 +5674,39 @@ mod tests {
         // and client pool from a spawned task, after any lock this test held was
         // released.
         let _cache = nf_cache_test_lock().lock().await;
-        assert!(amf_sbi_open().is_ok());
+        assert!(amf_sbi_open().await.is_ok());
         amf_sbi_close_async().await;
         assert!(global_context()
             .find_nf_instances_by_service(nextgcore_sbi::types::SbiServiceType::NsmfPdusession)
             .await
             .is_empty());
+    }
+
+    /// #1479: the self instance is in place the moment `amf_sbi_open` returns.
+    /// On the current-thread runtime nothing else runs until this task yields,
+    /// so a spawned publication has deterministically not happened yet at the
+    /// read. The sentinel keeps the real `nfInstanceId` (so a concurrent test
+    /// filtering "this AMF" out of NRF results is not disturbed) but carries no
+    /// services, which the instance `amf_sbi_open` builds always does.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_self_instance_is_published_before_amf_sbi_open_returns() {
+        let _cache = nf_cache_test_lock().lock().await;
+        let id = nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf)
+            .to_string();
+        let ctx = global_context();
+        ctx.set_self_instance(NfInstance::new(&id, nextgcore_sbi::types::NfType::Amf))
+            .await;
+
+        amf_sbi_open().await.expect("amf_sbi_open");
+        // No yield between the open and this read.
+        let published = ctx.get_self_instance().await.expect("self instance");
+
+        assert_eq!(published.id, id);
+        assert!(
+            !published.services.is_empty(),
+            "the instance read straight after amf_sbi_open must be the one it built \
+             (with the AMF_SERVICES table), not whatever was there before"
+        );
     }
 
     // ------------------------------------------------------------------
