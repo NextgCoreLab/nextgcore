@@ -1,0 +1,44 @@
+# Demo d441a-congestion-loop (nextgsim#465): RAN-fed User Data Congestion loop
+# from the gNB through nwdafd and pcfd to Session-AMBR at the UPF, over the
+# demo-OFF base. ClusterIP only: nothing here adds a Service port beyond
+# nwdafd's ClusterIP SBI and metrics.
+#
+#   nwdaf.yaml          nwdafd (built with --features demo-d441a-congestion-loop),
+#                       ConfigMap nwdaf-config (a toggle target) and its Service.
+#   core-configs.yaml   nrf.yaml (CCA trusted-key directory) and pcf.yaml (the
+#                       pcf.congestion_loop block: AoI, UE-V protected, UE-B best
+#                       effort, 1000 kbps cap, floor 500 kbps).
+#   nrf-cca*.yaml       the NRF's trusted-key ConfigMap, empty at deploy, and its
+#                       mount; scenario.sh adds the gNB exporter's own JWK.
+#   gnb-config.yaml     gnb.yaml with the exporter block (C = 5 Mbps, NRF, the
+#                       exporter's nfInstanceId and key paths).
+#   pcf-state.yaml      pcfd's durable state on its `logs` emptyDir, so a
+#                       restarted container undoes a cap it recorded. A pod
+#                       re-creation loses it (no usable StorageClass): redeploy
+#                       the arm or re-authorise UE-B after one mid-throttle.
+#   ue-b.yaml           UE-B (imsi-...002), scaled up by scenario.sh after its
+#                       subscriber is seeded. The base UE is UE-V.
+#
+# Images: pcfd and nwdafd with --features demo-d441a-congestion-loop
+# (profiles/demo/profile.env adds them for this overlay); the gNB with nextgsim
+# --features demo-d441a-congestion-loop (SIM_IMAGE_TAG=demo-d441a-<sha>), or the
+# gNB fails startup with DemoConfigError::UnknownKey.
+#
+# No OAuth2-require on nwdafd's listener: amfd's UES_IN_AREA notify carries no
+# token (TS 33.501 §13.4.1), and nextgcore-sbi's require_oauth2 covers every
+# route (nextgcore#1421). The ingest route checks its own token whatever the
+# listener does, so a tokenless report is 401 (scenario.sh asserts it).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: nextg-demo
+resources:
+  - ../demo
+  - toggles.yaml
+  - nwdaf.yaml
+  - nrf-cca.yaml
+  - ue-b.yaml
+patches:
+  - path: core-configs.yaml
+  - path: nrf-cca-mount.yaml
+  - path: gnb-config.yaml
+  - path: pcf-state.yaml
