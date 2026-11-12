@@ -10275,9 +10275,54 @@ impl NgapServer {
                         ))
                     });
             }
-            // PDU Session Modification Complete
-            0xCD => {
-                log::info!("PDU Session Modification Complete from UE: PSI={psi}");
+            // PDU Session Modification Complete (0xCC) and PDU Session Modification
+            // Command Reject (0xCD), TS 24.501 Table 9.7.2. #1465: relayed to the SMF
+            // (TS 23.502 §4.3.3.2 step 11, 23502-k20.txt:13502-13505:
+            // Nsmf_PDUSession_UpdateSMContext with the N1 SM container and the User
+            // Location Information), which stops T3591 (TS 24.501 §6.3.2.3 / §6.3.2.4). Before, the
+            // arm matched only 0xCD under the COMPLETE's label and logged it, so neither
+            // reached the SMF and T3591 retransmitted every network-requested
+            // modification to exhaustion.
+            0xCC | 0xCD => {
+                let what = if sm_msg_type == 0xCC {
+                    "PDU Session Modification Complete"
+                } else {
+                    "PDU Session Modification Command Reject"
+                };
+                log::info!("{what} from UE: PSI={psi}, PTI={pti}");
+                match self.sm_context_refs.get(&(amf_ue_ngap_id, psi)).cloned() {
+                    Some(sm_context_ref) => {
+                        // #922: relayed off the NGAP task, keyed on the session.
+                        let n1 = sm_pdu.to_vec();
+                        // The UE's serving TAI as TS 29.571 UserLocation, built as for
+                        // the CreateSMContext.
+                        let ue_location = build_sm_context_identity(
+                            self.ue_auth_state.get(amf_ue_ngap_id).as_ref(),
+                            None,
+                        )
+                        .ue_location;
+                        self.sbi_offload
+                            .spawn_keyed((amf_ue_ngap_id, psi), move || async move {
+                                let (host, port) = smf_or_selected(owner).await;
+                                if let Err(e) = crate::sbi_path::call_smf_update_sm_context_n1_at(
+                                    &host,
+                                    port,
+                                    &sm_context_ref,
+                                    &n1,
+                                    ue_location,
+                                )
+                                .await
+                                {
+                                    log::warn!("{what} for PSI={psi}: SMF update failed: {e}");
+                                }
+                                None
+                            });
+                    }
+                    None => log::info!(
+                        "{what} for UE {amf_ue_ngap_id} PSI {psi}: no SM context (released \
+                         already)"
+                    ),
+                }
             }
             // PDU Session Release Request
             0xD1 => {
@@ -20228,20 +20273,35 @@ fn build_sm_context_identity(
             ),
         })
     });
-    // TS 29.571 UserLocation: the serving NR TAI.
-    let ue_location = state.map(|s| &s.amf_ue.nr_tai).map(|tai| {
-        serde_json::json!({
-            "nrLocation": {
-                "tai": {
-                    "plmnId": {
-                        "mcc": tai.plmn_id.mcc(),
-                        "mnc": tai.plmn_id.mnc(),
+    // TS 29.571 UserLocation: `nrLocation` (NrLocation) REQUIRES both `tai` and
+    // `ncgi`, so it is sent only when the AMF knows both: the serving TAI (a PLMN
+    // learned) and the serving NR CGI (NCI 0 is the never-learned default, as in
+    // `namf_server::parse_ncgi`). One without the other would be schema-invalid
+    // (#1470 review). `nrCellId` is 9 hex digits (36 bits), as the LMF's `ncgi` is.
+    let ue_location = state
+        .map(|s| &s.amf_ue)
+        .filter(|ue| ue.nr_tai.plmn_id != PlmnId::default() && ue.nr_cgi.cell_id != 0)
+        .map(|ue| {
+            let (tai, cgi) = (&ue.nr_tai, &ue.nr_cgi);
+            serde_json::json!({
+                "nrLocation": {
+                    "tai": {
+                        "plmnId": {
+                            "mcc": tai.plmn_id.mcc(),
+                            "mnc": tai.plmn_id.mnc(),
+                        },
+                        "tac": format!("{:06x}", tai.tac),
                     },
-                    "tac": format!("{:06x}", tai.tac),
+                    "ncgi": {
+                        "plmnId": {
+                            "mcc": cgi.plmn_id.mcc(),
+                            "mnc": cgi.plmn_id.mnc(),
+                        },
+                        "nrCellId": format!("{:09X}", cgi.cell_id & 0xF_FFFF_FFFF),
+                    },
                 }
-            }
-        })
-    });
+            })
+        });
     crate::sbi_path::SmContextIdentity {
         supi: state.and_then(|s| s.amf_ue.supi.clone()),
         pei: state.and_then(|s| s.amf_ue.pei.clone()),
@@ -22259,6 +22319,43 @@ mod tests {
         assert_eq!(handle.num_gnbs().await, 0);
     }
 
+    /// **#1470 review.** The CreateSMContext body's `ueLocation` is a schema-valid
+    /// TS 29.571 UserLocation: `nrLocation` carries both of NrLocation's required
+    /// members, `tai` and `ncgi`, and is left out while the AMF has not learned the
+    /// cell or the TAI. Built through `build_sm_context_identity`, the shared builder
+    /// the 0xCC/0xCD relay (#1465) uses too.
+    ///
+    /// REVERT-VERIFIED: with `ncgi` dropped from the builder, or the both-known
+    /// filter removed, this fails.
+    #[test]
+    fn the_create_sm_context_ue_location_has_tai_and_ncgi_or_is_absent_1470() {
+        let body = |state: &UeNasContext| -> serde_json::Value {
+            let identity = build_sm_context_identity(Some(state), None);
+            let request = crate::sbi_path::build_create_sm_context_request_for_test(&identity);
+            serde_json::from_str(request.http.content.as_deref().unwrap()).unwrap()
+        };
+        let mut state = UeNasContext::new(1, 2, 3, false);
+        state.amf_ue.supi = Some("imsi-999700000001470".to_string());
+        state.amf_ue.nr_tai.plmn_id = PlmnId::new("999", "70");
+        state.amf_ue.nr_tai.tac = 1;
+        // The cell is not known yet (NCI 0): no `ueLocation` at all.
+        assert!(
+            body(&state).get("ueLocation").is_none(),
+            "TAI alone is not a NrLocation"
+        );
+        state.amf_ue.nr_cgi.plmn_id = PlmnId::new("999", "70");
+        state.amf_ue.nr_cgi.cell_id = 0x0_0000_0010;
+        let b = body(&state);
+        let nr = &b["ueLocation"]["nrLocation"];
+        assert_eq!(nr["tai"]["tac"], "000001");
+        assert_eq!(nr["tai"]["plmnId"]["mcc"], "999");
+        assert_eq!(nr["ncgi"]["nrCellId"], "000000010", "9 hex digits, 36 bits");
+        assert_eq!(nr["ncgi"]["plmnId"]["mnc"], "70");
+        // A TAI never learned (default PLMN) is not sent either.
+        state.amf_ue.nr_tai.plmn_id = PlmnId::default();
+        assert!(body(&state).get("ueLocation").is_none());
+    }
+
     /// **Issue #205.** The N11 identity is assembled FROM the UE context, so a
     /// GPSI the AMF stored at registration reaches `SmContextCreateData`.
     ///
@@ -22273,6 +22370,9 @@ mod tests {
         state.amf_ue.gpsi = Some("msisdn-491234567890".to_string());
         state.amf_ue.nr_tai.plmn_id = PlmnId::new("262", "01");
         state.amf_ue.nr_tai.tac = 1;
+        // #1470 review: NrLocation needs the cell as well as the TAI.
+        state.amf_ue.nr_cgi.plmn_id = PlmnId::new("262", "01");
+        state.amf_ue.nr_cgi.cell_id = 0x1_2345_6789;
 
         let identity = build_sm_context_identity(Some(&state), None);
         assert_eq!(identity.supi.as_deref(), Some("imsi-262011234567890"));
@@ -22285,6 +22385,10 @@ mod tests {
         assert_eq!(
             identity.ue_location.as_ref().unwrap()["nrLocation"]["tai"]["tac"].as_str(),
             Some("000001")
+        );
+        assert_eq!(
+            identity.ue_location.as_ref().unwrap()["nrLocation"]["ncgi"]["nrCellId"].as_str(),
+            Some("123456789")
         );
 
         // A UE the AMF holds no GPSI for yields none — not a SUPI-derived one.
@@ -34881,6 +34985,123 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         (server, addr.port(), seen)
+    }
+
+    /// A stand-in SMF recording each request as `(uri, json body, n1SmMsg part)` and
+    /// answering `204 No Content` (#1465). Keep the server alive.
+    #[allow(clippy::type_complexity)]
+    async fn n1_recording_smf_1465() -> (
+        nextgcore_sbi::server::SbiServer,
+        u16,
+        Arc<std::sync::Mutex<Vec<(String, String, Vec<u8>)>>>,
+    ) {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let seen: Arc<std::sync::Mutex<Vec<(String, String, Vec<u8>)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        server
+            .start(move |req: nextgcore_sbi::SbiRequest| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    let n1 = req
+                        .http
+                        .parts
+                        .iter()
+                        .find(|p| p.content_id.as_deref() == Some("n1SmMsg"))
+                        .map(|p| p.data.to_vec())
+                        .unwrap_or_default();
+                    sink.lock().expect("sink").push((
+                        req.header.uri.clone(),
+                        req.http.content.clone().unwrap_or_default(),
+                        n1,
+                    ));
+                    nextgcore_sbi::SbiResponse::no_content()
+                }
+            })
+            .await
+            .expect("recording SMF starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (server, addr.port(), seen)
+    }
+
+    /// **#1465.** The UE's PDU SESSION MODIFICATION COMPLETE (0xCC) and PDU SESSION
+    /// MODIFICATION COMMAND REJECT (0xCD), TS 24.501 Table 9.7.2, reach the SMF holding
+    /// the session as an Nsmf_PDUSession_UpdateSMContext carrying the N1 SM container
+    /// byte for byte and the User Location Information (TS 23.502 §4.3.3.2 step 11,
+    /// 23502-k20.txt:13502-13505), so it stops T3591. Before, 0xCC was
+    /// "Unhandled" and 0xCD only logged: T3591 retransmitted every network-requested
+    /// modification. A session the AMF no longer knows sends nothing.
+    ///
+    /// REVERT-VERIFIED: with the arm back to `0xCD => log`, no request reaches the SMF.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_ue_s_modification_complete_and_command_reject_reach_the_smf_1465() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (_smf, port, seen) = n1_recording_smf_1465().await;
+        let mut ngap = test_ngap_server().await;
+        let ue = 7_146_501u64;
+        // The UE's serving TAI, which step 11's User Location Information carries.
+        let mut state = UeNasContext::new(ue, 72, 1, false);
+        state.amf_ue.nr_tai.plmn_id = PlmnId::new("999", "70");
+        state.amf_ue.nr_tai.tac = 0x1465;
+        state.amf_ue.nr_cgi.plmn_id = PlmnId::new("999", "70");
+        state.amf_ue.nr_cgi.cell_id = 0x0_0001_4651;
+        ngap.ue_auth_state.insert(ue, state);
+        ngap.sm_context_refs
+            .insert((ue, 5), "smctx-1465".to_string());
+        ngap.sm_context_smfs
+            .insert((ue, 5), ("127.0.0.1".to_string(), port));
+
+        let complete = [0x2E, 5, 0, 0xCC];
+        let reject = [0x2E, 5, 0, 0xCD, 83];
+        ngap.handle_5gsm_message(1, ue, 72, &complete, None)
+            .await
+            .expect("handled");
+        settle_offloaded_sbi(&mut ngap).await;
+        ngap.handle_5gsm_message(1, ue, 72, &reject, None)
+            .await
+            .expect("handled");
+        settle_offloaded_sbi(&mut ngap).await;
+        // No SM context for PSI 6: nothing to relay to.
+        ngap.handle_5gsm_message(1, ue, 72, &[0x2E, 6, 0, 0xCC], None)
+            .await
+            .expect("handled");
+        settle_offloaded_sbi(&mut ngap).await;
+
+        let got = seen.lock().expect("seen").clone();
+        assert_eq!(got.len(), 2, "one UpdateSMContext each: {got:?}");
+        for ((uri, body, n1), want) in got.iter().zip([&complete[..], &reject[..]]) {
+            assert_eq!(uri, "/nsmf-pdusession/v1/sm-contexts/smctx-1465/modify");
+            assert!(body.contains("n1SmMsg"), "{body}");
+            assert_eq!(n1.as_slice(), want, "the N1 SM container, byte for byte");
+            let json: serde_json::Value = serde_json::from_str(body).expect("JSON body");
+            assert_eq!(
+                json["ueLocation"]["nrLocation"]["tai"]["tac"], "001465",
+                "with the User Location Information (step 11): {body}"
+            );
+            assert_eq!(
+                json["ueLocation"]["nrLocation"]["tai"]["plmnId"]["mcc"],
+                "999"
+            );
+            // TS 29.571 NrLocation requires `ncgi` beside `tai` (#1470 review).
+            assert_eq!(
+                json["ueLocation"]["nrLocation"]["ncgi"]["nrCellId"], "000014651",
+                "{body}"
+            );
+            assert_eq!(
+                json["ueLocation"]["nrLocation"]["ncgi"]["plmnId"]["mnc"],
+                "70"
+            );
+        }
     }
 
     /// **#738.** After an N2 handover the SOURCE gNB's UE Context Release Complete ends

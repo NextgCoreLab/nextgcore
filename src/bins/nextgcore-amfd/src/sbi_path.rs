@@ -1772,11 +1772,28 @@ pub async fn call_smf_update_sm_context_n1_only(
     sm_context_ref: &str,
     n1_sm_msg: &[u8],
 ) -> SbiResult<()> {
+    call_smf_update_sm_context_n1_at(smf_host, smf_port, sm_context_ref, n1_sm_msg, None).await
+}
+
+/// [`call_smf_update_sm_context_n1_only`] with the UE's User Location Information as
+/// `ueLocation` (TS 29.502 SmContextUpdateData), when the AMF has it: TS 23.502
+/// §4.3.3.2 step 11 forwards the N1 SM container "and User Location Information
+/// received from the AN" (#1465).
+pub async fn call_smf_update_sm_context_n1_at(
+    smf_host: &str,
+    smf_port: u16,
+    sm_context_ref: &str,
+    n1_sm_msg: &[u8],
+    ue_location: Option<serde_json::Value>,
+) -> SbiResult<()> {
     let client = crate::attach_oauth2(
         SbiClient::for_peer(smf_host, smf_port),
         nextgcore_sbi::types::NfType::Smf,
     );
-    let body = serde_json::json!({ "n1SmMsg": { "contentId": "n1SmMsg" } });
+    let mut body = serde_json::json!({ "n1SmMsg": { "contentId": "n1SmMsg" } });
+    if let Some(loc) = ue_location {
+        body["ueLocation"] = loc;
+    }
     let path = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/modify");
     let request = SbiRequest::post(&path)
         .with_body(body.to_string(), content_type::APPLICATION_JSON)
