@@ -94,6 +94,26 @@ breaks "UE-B's throttle N1 missing: only the restore's (a rotated UE log)" d441a
 defaults; NW[4]="$(at 50:00 "$(ingest 1.0 1)")"
 breaks "AMF numberOfUes differs on the last accepted report" d441a_chain "$(mkdir_run amf)" "${CELL}" "${UE_V}" "${UE_B}" statistics
 
+# --- restore hysteresis (nextgcore#1480) --------------------------------------------
+# The overlay's own knobs pass; the devtest1 values that restored UE-B mid-load
+# (restore_below 10, restore_after_polls 3) fail on each count.
+holds "the overlay's restore knobs clear the throttled band" d441a_restore_hysteresis "${here}/core-configs.yaml" "${here}/gnb-config.yaml"
+sed -E 's/^( +restore_below:).*/\1 10/' "${here}/core-configs.yaml" >"${work}/rb10.yaml"
+breaks "restore_below 10 lies inside the throttled band" d441a_restore_hysteresis "${work}/rb10.yaml" "${here}/gnb-config.yaml"
+sed -E 's/^( +restore_after_polls:).*/\1 3/' "${here}/core-configs.yaml" >"${work}/rp3.yaml"
+breaks "restore_after_polls 3 is shorter than an in-load prediction dip" d441a_restore_hysteresis "${work}/rp3.yaml" "${here}/gnb-config.yaml"
+sed -E -e 's/^( +restore_below:).*/\1 10/' -e 's/^( +restore_after_polls:).*/\1 3/' "${here}/core-configs.yaml" >"${work}/old.yaml"
+breaks "the 2026-11-12 knobs (10, 3) fail" d441a_restore_hysteresis "${work}/old.yaml" "${here}/gnb-config.yaml"
+sed -E 's/^( +restore_after_polls:).*/\1 90/' "${here}/core-configs.yaml" >"${work}/rp90.yaml"
+breaks "a restore longer than the scenario's wait fails" d441a_restore_hysteresis "${work}/rp90.yaml" "${here}/gnb-config.yaml"
+sed -E 's/^( +cell_capacity_mbps:).*/\1 20.0/' "${here}/gnb-config.yaml" >"${work}/c20.yaml"
+breaks "the same restore_below fails when C grows to 20 Mbps (the band is derived, not fixed)" d441a_restore_hysteresis "${here}/core-configs.yaml" "${work}/c20.yaml"
+breaks "missing knobs fail" d441a_restore_hysteresis "$(put noknobs.yaml 'pcf:')" "${here}/gnb-config.yaml"
+# UE-B unthrottled: one throttle and as many restores; none, or an open throttle, is not.
+holds "throttle then restore is unthrottled" d441a_unthrottled "$(put u1.log "$(throttle "${UE_B}")" "$(restore "${UE_B}")")"
+breaks "an open throttle is not" d441a_unthrottled "$(put u2.log "$(throttle "${UE_B}")")"
+breaks "no throttle at all is not" d441a_unthrottled "$(put u3.log "$(restore "${UE_B}")")"
+
 # --- saturation ----------------------------------------------------------------------
 status_sample() { printf '=== 2026-11-12T13:00:%02d.0Z\n{\n  "capacity_kbps": 5000,\n  "last_occupancy_pct": %s,\n  "queue_drops": 0,\n  "schema": "nextgsim.congestion-status/1"\n}\n' "$1" "$2"; }
 st="${work}/status.txt"
