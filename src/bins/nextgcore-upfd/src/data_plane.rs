@@ -3835,7 +3835,7 @@ impl DataPlane {
     }
 
     /// Handle uplink packet (from gNB via GTP-U, to TUN)
-    async fn handle_uplink_packet(&self, pkt: &[u8], from: SocketAddr, tun_fd: RawFd) {
+    pub(crate) async fn handle_uplink_packet(&self, pkt: &[u8], from: SocketAddr, tun_fd: RawFd) {
         // Parse GTP-U header
         let header = match parse_gtpu_header(pkt) {
             Ok(h) => h,
