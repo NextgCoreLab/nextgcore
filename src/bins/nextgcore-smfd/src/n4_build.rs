@@ -2597,6 +2597,42 @@ mod tests {
         assert!(!data.is_empty());
     }
 
+    /// #1475, TS 29.244 §8.2.8 / §8.2.9: QerParams carries bit/s; the MBR and GBR
+    /// IEs carry kbit/s, rounded up. These are the exact bytes upfd's
+    /// `create_qer_keeps_the_spec_kbps_mbr_and_gbr_1475` parses back as kbit/s.
+    #[test]
+    fn create_qer_encodes_mbr_and_gbr_in_kbps_1475() {
+        let data = build_create_qer(&QerParams {
+            qer_id: 1,
+            gate_status: (0, 0),
+            mbr: Some((64_000, 1_000_000_000)),
+            gbr: Some((32_000, 1)),
+            qfi: Some(9),
+        });
+        let find = |ie_type: u16| -> Vec<u8> {
+            let mut off = 0;
+            while off + 4 <= data.len() {
+                let t = u16::from_be_bytes([data[off], data[off + 1]]);
+                let l = u16::from_be_bytes([data[off + 2], data[off + 3]]) as usize;
+                if t == ie_type {
+                    return data[off + 4..off + 4 + l].to_vec();
+                }
+                off += 4 + l;
+            }
+            panic!("IE {ie_type} missing");
+        };
+        assert_eq!(
+            find(pfcp_ie::MBR),
+            [0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x0F, 0x42, 0x40],
+            "UL 64 kbps, DL 1 000 000 kbps"
+        );
+        assert_eq!(
+            find(pfcp_ie::GBR),
+            [0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x01],
+            "UL 32 kbps; DL 1 bit/s rounds UP to 1 kbps"
+        );
+    }
+
     #[test]
     fn test_build_remove_qer() {
         let data = build_remove_qer(1);

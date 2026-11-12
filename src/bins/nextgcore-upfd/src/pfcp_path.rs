@@ -5017,6 +5017,197 @@ mod tests {
         crate::handle_pfcp_session_event(dp, evt).await;
     }
 
+    // ------------------------------------------------------------------
+    // #1475: the QER MBR is policed at the rate the SMF put on the wire.
+    // ------------------------------------------------------------------
+
+    /// A Create/Update QER body as smfd's `build_create_qer` encodes the
+    /// Session-AMBR QER: QER ID, Gate Status (both OPEN), MBR, QFI. The MBR IE
+    /// is spelled out byte for byte: TS 29.244 §8.2.8, two 5-octet binary
+    /// fields in kbit/s (1 kbps = 1000 bps), UL then DL.
+    fn ambr_qer_body_1475(id: u32, ul_kbps: u64, dl_kbps: u64) -> Vec<u8> {
+        let mut mbr = Vec::new();
+        mbr.extend_from_slice(&ul_kbps.to_be_bytes()[3..8]);
+        mbr.extend_from_slice(&dl_kbps.to_be_bytes()[3..8]);
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_u32(pfcp_ie::QER_ID, id);
+        b.add_u8(25, 0x00); // Gate Status (§8.2.7): UL and DL OPEN
+        b.add_tlv(26, &mbr); // MBR (§8.2.8)
+        b.add_u8(pfcp_ie::QFI, 9);
+        b.build()
+    }
+
+    /// UL G-PDU from UE 10.45.0.42 on TEID 0x1234 (the F-TEID `pdr_body` sets),
+    /// carrying an IPv4/UDP packet of exactly `len` bytes.
+    fn ul_gpdu_1475(len: usize) -> Vec<u8> {
+        let mut ip = vec![0u8; len];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+        ip[8] = 64;
+        ip[9] = 17; // UDP
+        ip[12..16].copy_from_slice(&[10, 45, 0, 42]);
+        ip[16..20].copy_from_slice(&[8, 8, 8, 8]);
+        let csum = crate::data_plane::ipv4_header_checksum(&ip[..20]);
+        ip[10..12].copy_from_slice(&csum.to_be_bytes());
+        ip[20..22].copy_from_slice(&1234u16.to_be_bytes());
+        ip[22..24].copy_from_slice(&53u16.to_be_bytes());
+        ip[24..26].copy_from_slice(&((len - 20) as u16).to_be_bytes());
+        crate::data_plane::encapsulate_dl_gpdu(&ip, 0x1234, None)
+    }
+
+    /// Offer `len`-byte UL packets every `gap` for `dur` through the real
+    /// `handle_uplink_packet`; returns (packets sent, qer_gate drops, elapsed s).
+    async fn offer_ul_1475(
+        dp: &crate::data_plane::DataPlane,
+        tun: &std::fs::File,
+        len: usize,
+        gap: std::time::Duration,
+        dur: std::time::Duration,
+    ) -> (u64, u64, f64) {
+        use crate::data_plane::DropReason;
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(tun);
+        let gnb: SocketAddr = "127.0.0.1:2152".parse().unwrap();
+        let pkt = ul_gpdu_1475(len);
+        let drops_before = dp.stats.drops(DropReason::QerGate);
+        let start = std::time::Instant::now();
+        let mut sent = 0u64;
+        while start.elapsed() < dur {
+            dp.handle_uplink_packet(&pkt, gnb, fd).await;
+            sent += 1;
+            if !gap.is_zero() {
+                tokio::time::sleep(gap).await;
+            }
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        (
+            sent,
+            dp.stats.drops(DropReason::QerGate) - drops_before,
+            elapsed,
+        )
+    }
+
+    /// **#1475, TS 29.244 §8.2.8 / §5.4.** A Session-AMBR QER installed through
+    /// the real N4 path (Establishment, then the Update QER smfd sends when the
+    /// PCF lowers the AMBR, as in demo d444a) is policed at the rate on the wire.
+    ///
+    /// upfd used to scale the kbit/s field to bit/s and hand that to a policer
+    /// that takes kbit/s, so 64 kbps was policed as 64 Mbps and nothing was ever
+    /// dropped (the EKS run's `qer_gate` stayed 0).
+    #[tokio::test]
+    async fn a_64_kbps_session_ambr_drops_above_64_kbps_as_qer_gate_1475() {
+        use crate::data_plane::DropReason;
+        let ms = std::time::Duration::from_millis;
+        let (_server, smf, addr, mut rx) = spawn_test_server().await;
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        let tun = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("/dev/null stands in for the TUN");
+
+        let assoc = build_association_setup_request_payload(Some(1));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+
+        // PDR 1 (UL, Access) -> FAR 1 FORW, QER 1 = the subscribed 1 Gbps AMBR.
+        let mut pdr = crate::n4_build::PfcpMessageBuilder::new();
+        let mut pdi = crate::n4_build::PfcpMessageBuilder::new();
+        pdi.add_u8(pfcp_ie::SOURCE_INTERFACE, 0);
+        pdi.add_f_teid(&crate::n4_build::FTeid {
+            teid: 0x1234,
+            ipv4: Some(Ipv4Addr::new(127, 0, 0, 4)),
+            ipv6: None,
+            choose: false,
+            choose_id: None,
+        });
+        pdi.add_ue_ip_address(
+            &crate::n4_build::UeIpAddress {
+                ipv4: Some(Ipv4Addr::new(10, 45, 0, 42)),
+                ipv6: None,
+                ipv6_prefix_len: 0,
+            },
+            false,
+        );
+        pdr.add_pdr_id(1);
+        pdr.add_u32(pfcp_ie::PRECEDENCE, 100);
+        pdr.add_tlv(pfcp_ie::PDI, &pdi.build());
+        pdr.add_u32(pfcp_ie::FAR_ID, 1);
+        pdr.add_u32(pfcp_ie::QER_ID, 1);
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        b.add_f_seid(&crate::n4_build::FSeid {
+            seid: 0x1475,
+            ipv4: Some(Ipv4Addr::new(127, 0, 0, 9)),
+            ipv6: None,
+        });
+        b.add_tlv(pfcp_ie::CREATE_PDR, &pdr.build());
+        b.add_tlv(pfcp_ie::CREATE_FAR, &far_body(1, 0x02));
+        b.add_tlv(
+            pfcp_ie::CREATE_QER,
+            &ambr_qer_body_1475(1, 1_000_000, 1_000_000),
+        );
+        let resp = exchange(&smf, addr, &encode_pfcp(50, Some(0), 2, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        let (hdr, _) = ParsedPfcpHeader::parse(&resp).unwrap();
+        let _ = hdr;
+        apply_next(&mut rx, &dp).await;
+        let upf_seid = dp
+            .sessions
+            .find_by_ul_teid(0x1234)
+            .expect("the data plane holds the established session")
+            .upf_seid;
+
+        // At 1 Gbps, 20 ms of back-to-back 500 B packets pass untouched (a
+        // policer reading the field 1000x too LOW would drop them).
+        let (sent, drops, _) = offer_ul_1475(&dp, &tun, 500, ms(0), ms(20)).await;
+        assert!(sent > 0);
+        assert_eq!(drops, 0, "1 Gbps AMBR must not drop {sent} x 500 B");
+
+        // The PCF lowers UL Session-AMBR to 64 kbps: smfd sends Update QER with
+        // UL MBR = 64 (kbit/s) on the wire.
+        let mut m = crate::n4_build::PfcpMessageBuilder::new();
+        m.add_tlv(pfcp_ie::UPDATE_QER, &ambr_qer_body_1475(1, 64, 1_000_000));
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &m.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+
+        // Below the AMBR: 200 B every 50 ms = 32 kbps offered, all of it passes.
+        let (sent, drops, _) = offer_ul_1475(&dp, &tun, 200, ms(50), ms(1000)).await;
+        assert!(sent >= 5, "the below-rate leg ran ({sent} packets)");
+        assert_eq!(drops, 0, "32 kbps under a 64 kbps AMBR must all pass");
+
+        // Above it: 500 B every 5 ms = 800 kbps offered for 1 s.
+        let (sent, drops, secs) = offer_ul_1475(&dp, &tun, 500, ms(5), ms(1000)).await;
+        let offered_bps = (sent * 500 * 8) as f64 / secs;
+        assert!(
+            offered_bps > 2.0 * 64_000.0,
+            "the above-rate leg offered only {offered_bps:.0} bit/s"
+        );
+        assert!(
+            drops > 0,
+            "traffic above a 64 kbps AMBR must be dropped as qer_gate ({sent} sent)"
+        );
+        // What passed is the 64 kbps refill plus the 1500 B burst, ~1 packet slack.
+        let passed_bytes = ((sent - drops) * 500) as f64;
+        let ceiling = 1500.0 + 8000.0 * secs + 500.0;
+        assert!(
+            passed_bytes <= ceiling,
+            "passed {passed_bytes} B in {secs:.3} s: above 64 kbps (ceiling {ceiling:.0} B)"
+        );
+        assert!(
+            passed_bytes >= 0.5 * 8000.0 * secs,
+            "passed only {passed_bytes} B in {secs:.3} s: policed well below 64 kbps"
+        );
+        assert_eq!(
+            dp.stats
+                .dropped_packets
+                .load(std::sync::atomic::Ordering::Relaxed),
+            dp.stats.drops(DropReason::QerGate),
+            "every drop is qer_gate: {}",
+            dp.stats.summary()
+        );
+    }
+
     fn usage_reports_in(resp: &[u8]) -> Vec<(u32, u64)> {
         usage_reports_of(resp, pfcp_ie::USAGE_REPORT_SMR)
     }

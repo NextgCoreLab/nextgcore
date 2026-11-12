@@ -1578,8 +1578,10 @@ pub fn parse_create_qer(data: &[u8]) -> Result<ParsedCreateQer, &'static str> {
         }
     }
 
-    // MBR (IE type 26). TS 29.244 §8.2.8: the 5-octet fields are kbit/s;
-    // convert to bit/s for the internal rate policer.
+    // MBR (IE type 26). TS 29.244 §8.2.8: the 5-octet UL/DL fields are
+    // kbit/s. Kept in kbit/s: every upfd consumer (DataPlaneQer::set_mbr,
+    // TokenBucket::from_mbr_kbps, the install logs) takes kbit/s. Scaling to
+    // bit/s here policed every MBR 1000x too loosely (#1475).
     if let Some(ie) = ParsedIe::find_ie(&ies, 26) {
         if ie.value.len() >= 10 {
             qer.ul_mbr = u64::from_be_bytes([
@@ -1591,8 +1593,7 @@ pub fn parse_create_qer(data: &[u8]) -> Result<ParsedCreateQer, &'static str> {
                 ie.value[2],
                 ie.value[3],
                 ie.value[4],
-            ])
-            .saturating_mul(1000);
+            ]);
             qer.dl_mbr = u64::from_be_bytes([
                 0,
                 0,
@@ -1602,12 +1603,12 @@ pub fn parse_create_qer(data: &[u8]) -> Result<ParsedCreateQer, &'static str> {
                 ie.value[7],
                 ie.value[8],
                 ie.value[9],
-            ])
-            .saturating_mul(1000);
+            ]);
         }
     }
 
-    // GBR (IE type 27). TS 29.244 §8.2.9: kbit/s on the wire -> bit/s internal.
+    // GBR (IE type 27). TS 29.244 §8.2.9: kbit/s on the wire, kept in kbit/s
+    // (DataPlaneQer::set_gbr takes kbit/s; #1475).
     if let Some(ie) = ParsedIe::find_ie(&ies, 27) {
         if ie.value.len() >= 10 {
             qer.ul_gbr = u64::from_be_bytes([
@@ -1619,8 +1620,7 @@ pub fn parse_create_qer(data: &[u8]) -> Result<ParsedCreateQer, &'static str> {
                 ie.value[2],
                 ie.value[3],
                 ie.value[4],
-            ])
-            .saturating_mul(1000);
+            ]);
             qer.dl_gbr = u64::from_be_bytes([
                 0,
                 0,
@@ -1630,8 +1630,7 @@ pub fn parse_create_qer(data: &[u8]) -> Result<ParsedCreateQer, &'static str> {
                 ie.value[7],
                 ie.value[8],
                 ie.value[9],
-            ])
-            .saturating_mul(1000);
+            ]);
         }
     }
 
@@ -1669,9 +1668,13 @@ pub struct ParsedCreateQer {
     pub qer_id: u32,
     pub ul_gate: u8, // 0=OPEN, 1=CLOSED
     pub dl_gate: u8,
-    pub ul_mbr: u64, // kbps
+    /// Uplink MBR in kbit/s, as on the wire (TS 29.244 §8.2.8); 0 = absent.
+    pub ul_mbr: u64,
+    /// Downlink MBR in kbit/s (TS 29.244 §8.2.8); 0 = absent.
     pub dl_mbr: u64,
+    /// Uplink GBR in kbit/s (TS 29.244 §8.2.9); 0 = absent.
     pub ul_gbr: u64,
+    /// Downlink GBR in kbit/s (TS 29.244 §8.2.9); 0 = absent.
     pub dl_gbr: u64,
     pub qfi: Option<u8>,
     /// Reflective QoS Indicator (TS 29.244 §8.2.88): set on downlink packets
@@ -3255,6 +3258,41 @@ mod tests {
         // the bit to 0 to turn reflective QoS off for the flow).
         let explicit_off = parse_create_qer(&qer_ies(&[ie(123, &[0x00])])).expect("QER parses");
         assert!(!explicit_off.rqi);
+    }
+
+    /// #1475, TS 29.244 §8.2.8 / §8.2.9: the UL/DL MBR and GBR fields are kbit/s
+    /// (1 kbps = 1000 bps) in 5-octet binary, and upfd keeps them in kbit/s, the
+    /// unit `DataPlaneQer::set_mbr` / `TokenBucket::from_mbr_kbps` take. The MBR
+    /// bytes are exactly what smfd's `add_mbr(64_000, 1_000_000_000)` (bit/s in)
+    /// puts on the wire.
+    #[test]
+    fn create_qer_keeps_the_spec_kbps_mbr_and_gbr_1475() {
+        let mbr = ie(
+            26,
+            &[
+                0x00, 0x00, 0x00, 0x00, 0x40, // UL MBR = 64 kbps
+                0x00, 0x00, 0x0F, 0x42, 0x40, // DL MBR = 1 000 000 kbps (1 Gbps)
+            ],
+        );
+        let gbr = ie(
+            27,
+            &[
+                0x00, 0x00, 0x00, 0x00, 0x20, // UL GBR = 32 kbps
+                0x01, 0x00, 0x00, 0x00, 0x01, // DL GBR = 2^32 + 1 kbps (all 5 octets)
+            ],
+        );
+        let qer = parse_create_qer(&qer_ies(&[mbr, gbr])).expect("QER parses");
+        assert_eq!(qer.ul_mbr, 64, "UL MBR is 64 kbit/s, not 64 000");
+        assert_eq!(qer.dl_mbr, 1_000_000);
+        assert_eq!(qer.ul_gbr, 32);
+        assert_eq!(qer.dl_gbr, (1u64 << 32) + 1, "all five octets are read");
+
+        // Absent IEs: 0 = unlimited / no guarantee.
+        let bare = parse_create_qer(&qer_ies(&[])).expect("QER parses");
+        assert_eq!(
+            (bare.ul_mbr, bare.dl_mbr, bare.ul_gbr, bare.dl_gbr),
+            (0, 0, 0, 0)
+        );
     }
 
     /// #953 review: an Update URR changes DURAT only when it carries a Measurement
