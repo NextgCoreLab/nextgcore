@@ -232,8 +232,12 @@ async fn a_flow_with_traffic_carries_the_qmp_on_a_real_packet_left_intact() {
     let r = rig().await;
     monitor_dl(&r.dp, QFI, 1);
     let pkt = r.dl_packet();
-    r.dp.qos_flow_round().await;
-    let _dummy = r.recv_gnb().await.expect("first round: idle, dummy");
+    assert_eq!(
+        r.dp.qos_flow_round().await,
+        1,
+        "first round: idle, one dummy"
+    );
+    let _dummy = r.recv_gnb().await.expect("the dummy G-PDU");
     r.dp.handle_downlink_packet(&pkt, &r.gtpu).await;
     let plain = r.recv_gnb().await.unwrap();
     assert_eq!(
@@ -241,8 +245,7 @@ async fn a_flow_with_traffic_carries_the_qmp_on_a_real_packet_left_intact() {
         None,
         "none due yet"
     );
-    r.dp.qos_flow_round().await;
-    assert!(r.recv_gnb().await.is_none(), "traffic flows: no dummy");
+    assert_eq!(r.dp.qos_flow_round().await, 0, "traffic flows: no dummy");
     r.dp.handle_downlink_packet(&pkt, &r.gtpu).await;
     let marked = r.recv_gnb().await.unwrap();
     assert!(
@@ -325,8 +328,45 @@ async fn a_removed_session_ends_its_monitoring() {
     let r = rig().await;
     monitor_dl(&r.dp, QFI, 1);
     assert!(r.dp.qos_flow_active());
+    assert_eq!(r.dp.qos_flow_round().await, 1, "monitored: a dummy");
     r.dp.remove_session_from_pfcp(SEID);
     assert!(!r.dp.qos_flow_active());
-    r.dp.qos_flow_round().await;
-    assert!(r.recv_gnb().await.is_none());
+    assert_eq!(r.dp.qos_flow_round().await, 0, "removed: none");
+}
+
+#[tokio::test]
+async fn a_payload_less_answer_on_an_unknown_teid_is_a_malformed_drop() {
+    // #1451 review m7: with monitoring on, it is still counted.
+    let r = rig().await;
+    monitor_dl(&r.dp, QFI, 1);
+    let mut pkt = ul_answer(ntp64(std::time::SystemTime::now()), 1, &[]);
+    pkt[4..8].copy_from_slice(&0xDEADu32.to_be_bytes());
+    r.ul(&pkt).await;
+    assert_eq!(
+        r.dp.stats.drops(DropReason::MalformedGtpu),
+        1,
+        "{}",
+        r.dp.stats.summary()
+    );
+}
+
+#[tokio::test]
+async fn an_answer_from_another_address_than_the_sessions_gnb_is_not_measured() {
+    // #1451 review m8: after a path switch, the old gNB's answers in flight.
+    let mut r = rig().await;
+    monitor_dl(&r.dp, QFI, 1);
+    assert_eq!(r.dp.qos_flow_round().await, 1);
+    let t1 = dl_container(&r.recv_gnb().await.unwrap())
+        .dl_sending_timestamp
+        .unwrap();
+    let old_gnb: SocketAddr = "127.0.0.77:2152".parse().unwrap();
+    r.dp.handle_uplink_packet(&ul_answer(t1, 1, &[]), old_gnb, r.tun_fd())
+        .await;
+    assert!(r.reports.try_recv().is_err(), "not measured");
+    // The probe is still outstanding: the session's gNB's answer measures it.
+    r.ul(&ul_answer(t1, 1, &[])).await;
+    assert!(matches!(
+        r.reports.try_recv(),
+        Ok(UpfReportEvent::QosMonitoringReport { .. })
+    ));
 }

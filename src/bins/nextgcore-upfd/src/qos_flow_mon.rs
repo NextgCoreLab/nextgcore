@@ -109,11 +109,14 @@ impl QmpAnswer {
     pub fn delays(&self, clock_synced: bool) -> Delays {
         let dl_n3 = ntp_diff_us(self.t2, self.t1);
         let ul_n3 = ntp_diff_us(self.t4, self.t3);
+        // The N3 round trip (T2-T1)+(T4-T3) is free of any clock offset: taken
+        // raw, so a skewed clock that clamps one direction does not inflate it.
+        let rtt_n3 = (dl_n3 + ul_n3).max(0);
         let (dl_n3, ul_n3) = if clock_synced {
             (dl_n3.max(0), ul_n3.max(0))
         } else {
             // (T2-T1+T4-T3)/2: the clock offset cancels in the sum.
-            let half = (dl_n3 + ul_n3).max(0) / 2;
+            let half = rtt_n3 / 2;
             (half, half)
         };
         let dl_ran = self.dl_ran_ms.unwrap_or(0);
@@ -121,7 +124,7 @@ impl QmpAnswer {
         Delays {
             dl: ms_ceil(dl_n3).saturating_add(dl_ran),
             ul: ms_ceil(ul_n3).saturating_add(ul_ran),
-            rp: ms_ceil(dl_n3 + ul_n3)
+            rp: ms_ceil(rtt_n3)
                 .saturating_add(dl_ran)
                 .saturating_add(ul_ran),
         }
@@ -308,6 +311,22 @@ struct SessionMon {
 }
 
 impl SessionMon {
+    /// A T1 for `wall` that no outstanding probe of this session holds, so an
+    /// answer names exactly one probe even when two go out in the same instant.
+    /// Unique per session only, never forced ahead of the clock: after a clock
+    /// step back, T1 is the clock again (#1451 review m3).
+    fn fresh_t1(&self, wall: SystemTime) -> u64 {
+        let mut t1 = ntp64(wall);
+        while self
+            .probes
+            .values()
+            .any(|p| p.outstanding.iter().any(|(t, _)| *t == t1))
+        {
+            t1 = t1.wrapping_add(1);
+        }
+        t1
+    }
+
     fn monitored_qfis(&self) -> Vec<u8> {
         let mut out: Vec<u8> = Vec::new();
         for (_, ctls) in &self.srrs {
@@ -355,9 +374,6 @@ pub struct Round {
 pub struct QosFlowMonitor {
     sessions: HashMap<u64, SessionMon>,
     clock_synced: bool,
-    /// The last T1 issued: each probe gets a T1 of its own, so an answer
-    /// names exactly one probe even when two go out in the same instant.
-    last_t1: u64,
 }
 
 /// Decode the controls of one SRR, keeping those this UPF acts on.
@@ -396,20 +412,11 @@ impl QosFlowMonitor {
         Self {
             sessions: HashMap::new(),
             clock_synced,
-            last_t1: 0,
         }
     }
 
     pub fn is_active(&self) -> bool {
         !self.sessions.is_empty()
-    }
-
-    /// A fresh T1 for `wall`: later than every T1 issued before (by at most a
-    /// few 2^-32 s, far below the 1 ms the delays are reported in).
-    fn next_t1(&mut self, wall: SystemTime) -> u64 {
-        let t1 = ntp64(wall).max(self.last_t1.wrapping_add(1));
-        self.last_t1 = t1;
-        t1
     }
 
     /// The QFIs monitored on `upf_seid` (sorted), for tests and logs.
@@ -564,6 +571,11 @@ impl QosFlowMonitor {
         out
     }
 
+    /// The association is gone: every session's monitoring is dropped.
+    pub fn clear(&mut self) {
+        self.sessions.clear();
+    }
+
     /// The session is gone: everything about it is dropped.
     pub fn remove_session(&mut self, upf_seid: u64) {
         self.sessions.remove(&upf_seid);
@@ -578,15 +590,15 @@ impl QosFlowMonitor {
         now: Instant,
         wall: SystemTime,
     ) -> Option<u64> {
-        let p = self.sessions.get_mut(&upf_seid)?.probes.get_mut(&qfi)?;
+        let sess = self.sessions.get_mut(&upf_seid)?;
+        let p = sess.probes.get_mut(&qfi)?;
         p.dl_seen = true;
         if !p.due {
             return None;
         }
         p.due = false;
-        let t1 = self.next_t1(wall);
-        let p = self.sessions.get_mut(&upf_seid)?.probes.get_mut(&qfi)?;
-        push_outstanding(p, t1, now);
+        let t1 = sess.fresh_t1(wall);
+        push_outstanding(sess.probes.get_mut(&qfi)?, t1, now);
         Some(t1)
     }
 
@@ -645,15 +657,11 @@ impl QosFlowMonitor {
     /// report held back by the Minimum Wait Time, a measurement failure).
     pub fn round(&mut self, now: Instant, wall: SystemTime) -> Round {
         let mut out = Round::default();
-        let mut last_t1 = self.last_t1;
-        let mut next_t1 = || {
-            last_t1 = ntp64(wall).max(last_t1.wrapping_add(1));
-            last_t1
-        };
         for (seid, sess) in self.sessions.iter_mut() {
             let mut qfis: Vec<u8> = sess.probes.keys().copied().collect();
             qfis.sort_unstable();
             for q in qfis {
+                let t1 = sess.fresh_t1(wall);
                 let p = sess.probes.get_mut(&q).expect("listed above");
                 p.outstanding
                     .retain(|(_, sent)| now.saturating_duration_since(*sent) < PROBE_TIMEOUT);
@@ -664,7 +672,6 @@ impl QosFlowMonitor {
                 let recent = std::mem::take(&mut p.dl_seen);
                 if p.due || !recent {
                     p.due = false;
-                    let t1 = next_t1();
                     push_outstanding(p, t1, now);
                     out.dummies.push(DummyProbe {
                         upf_seid: *seid,
@@ -714,8 +721,15 @@ impl QosFlowMonitor {
                             }
                             st.sum = (0, 0, 0);
                             st.count = 0;
-                            st.period_start = now;
-                            st.period_start_wall = wall;
+                            // Anchored, not reset to `now`: the round's
+                            // scheduling jitter must not push the next report a
+                            // whole probe interval late (#1451 review M1, as
+                            // #772 for URRs). After a stall, catch up to the
+                            // period containing `now`.
+                            while now.saturating_duration_since(st.period_start) >= period {
+                                st.period_start += period;
+                                st.period_start_wall += period;
+                            }
                         } else if !c.cfg.periodic
                             && !st.failure_reported
                             && now.saturating_duration_since(st.silent_since) > period
@@ -732,7 +746,6 @@ impl QosFlowMonitor {
                 out.reports.push((*seid, reports));
             }
         }
-        self.last_t1 = last_t1;
         out.reports.sort_by_key(|(s, _)| *s);
         out
     }

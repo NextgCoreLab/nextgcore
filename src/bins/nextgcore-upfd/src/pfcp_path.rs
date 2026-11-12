@@ -1163,6 +1163,12 @@ impl PfcpServer {
             n
         };
         log::warn!("Cleared {count} PFCP sessions of the association with {peer} ({reason})");
+        // #1451 review m5: every session's QoS monitoring goes with them here,
+        // including one whose data-plane install never happened (the data plane
+        // only removes the sessions it holds).
+        if let Some(dp) = self.data_plane.read().unwrap().clone() {
+            dp.with_qos_flow_monitor(|m| m.clear());
+        }
         let _ = self
             .session_tx
             .send(PfcpSessionEvent::PeerFailure { peer })
@@ -3167,7 +3173,14 @@ impl PfcpServer {
             let sessions = self.sessions.read().await;
             sessions.get(&upf_seid).map(|s| (s.smf_seid, s.smf_addr))
         }
-        .ok_or_else(|| format!("Session {upf_seid:#x} not found for a QoS monitoring report"))?;
+        .ok_or_else(|| {
+            // A monitor entry that outlived its PFCP session reports nothing
+            // further (#1451 review m5).
+            if let Some(dp) = self.data_plane.read().unwrap().clone() {
+                dp.with_qos_flow_monitor(|m| m.remove_session(upf_seid));
+            }
+            format!("Session {upf_seid:#x} not found for a QoS monitoring report")
+        })?;
         // A message stays well under the path MTU: 16 reports of at most ~50 octets.
         for chunk in reports.chunks(16) {
             let payload = crate::n4_build::build_qos_monitoring_session_report(chunk);
@@ -8797,5 +8810,87 @@ mod tests {
                 0x00, 0x9c, 0x00, 0x04, 0xe8, 0xa0, 0x00, 0x01, // Time Stamp (156)
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn an_establishment_s_create_srr_is_not_acted_on_without_qos_flow_monitoring() {
+        // #1451 review m4: the establishment twin of the modification gate.
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        server.set_data_plane(dp.clone());
+        let assoc = build_association_setup_request_payload(Some(1));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        b.add_f_seid(&crate::n4_build::FSeid {
+            seid: 0x4444,
+            ipv4: Some(Ipv4Addr::new(127, 0, 0, 9)),
+            ipv6: None,
+        });
+        b.add_tlv(pfcp_ie::CREATE_PDR, &pdr_body(1, 100, 1, 1, 1));
+        b.add_tlv(pfcp_ie::CREATE_FAR, &far_body(1, 0x02));
+        b.add_tlv(pfcp_ie::CREATE_SRR, &srr_body(2, &[5]));
+        let resp = exchange(&smf, addr, &encode_pfcp(50, Some(0), 2, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        let upf_seid = *server.sessions.read().await.keys().next().unwrap();
+        assert!(server.sessions.read().await[&upf_seid]
+            .rules
+            .srr_ids
+            .is_empty());
+        assert!(
+            !dp.with_qos_flow_monitor(|m| m.is_active()),
+            "nothing monitored"
+        );
+    }
+
+    #[tokio::test]
+    async fn losing_the_association_ends_monitoring_with_no_data_plane_session() {
+        // #1451 review m5: a monitored SEID whose data-plane install never
+        // happened is still cleared when the association goes.
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        server.set_qos_flow_monitoring(true);
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        server.set_data_plane(dp.clone());
+        let assoc = build_association_setup_request_payload(Some(100));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        let srr = crate::n4_build::parse_srr(&srr_body(1, &[5])).unwrap();
+        server.apply_srrs(0x77, &[], &[srr], &[]);
+        assert!(dp.with_qos_flow_monitor(|m| m.is_active()));
+        assert!(
+            dp.sessions.find_by_seid(0x77).is_none(),
+            "no data-plane session"
+        );
+        // A heartbeat with a new Recovery Time Stamp: the peer restarted.
+        let mut hb = crate::n4_build::PfcpMessageBuilder::new();
+        hb.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, 200);
+        let _ = exchange(&smf, addr, &encode_pfcp(1, None, 2, &hb.build())).await;
+        for _ in 0..50 {
+            if !dp.with_qos_flow_monitor(|m| m.is_active()) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the monitor outlived the association");
+    }
+
+    #[tokio::test]
+    async fn a_report_for_a_session_gone_from_the_pfcp_table_ends_its_monitoring() {
+        let (server, _smf, _addr, _rx) = spawn_test_server().await;
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        server.set_data_plane(dp.clone());
+        let srr = crate::n4_build::parse_srr(&srr_body(1, &[5])).unwrap();
+        server.apply_srrs(0x78, &[], &[srr], &[]);
+        let rep = nextgcore_pfcp::qos_monitoring::QosMonitoringReport::default();
+        assert!(server
+            .send_qos_monitoring_report(0x78, &[(1, rep)])
+            .await
+            .is_err());
+        assert!(!dp.with_qos_flow_monitor(|m| m.is_active()));
     }
 }

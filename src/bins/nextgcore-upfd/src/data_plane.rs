@@ -5249,10 +5249,12 @@ impl DataPlane {
         }
     }
 
-    /// #1389 part 3: a G-PDU from the NG-RAN on `teid`. Returns whether its UL
-    /// PDU Session Container carries a QoS Monitoring Packet answer (QMP); one
-    /// that answers a probe of the session is measured, and any report it
-    /// triggers goes to the CP function.
+    /// #1389 part 3: a G-PDU from the NG-RAN on `teid`. Returns whether it is a
+    /// QoS Monitoring Packet answer (UL QMP) for a session of this UPF, sent from
+    /// that session's current gNB; one that answers a probe of the session is
+    /// measured, and any report it triggers goes to the CP function. An answer on
+    /// an unknown TEID is not one: it takes the ordinary path (an Error
+    /// Indication, a MalformedGtpu drop when it has no T-PDU).
     fn on_qmp_answer(&self, pkt: &[u8], teid: u32, from: SocketAddr) -> bool {
         use nextgcore_gtp::v1::types::PduSessionContainer;
         let t4 = crate::qos_flow_mon::ntp64(std::time::SystemTime::now());
@@ -5263,9 +5265,19 @@ impl DataPlane {
             return false;
         };
         let Some(session) = self.sessions.find_by_ul_teid(teid) else {
-            log::debug!("QMP answer from {from} on unknown TEID {teid:#x}: ignored");
-            return true;
+            log::debug!("QMP answer from {from} on unknown TEID {teid:#x}: not measured");
+            return false;
         };
+        // After an N3 path switch, answers still in flight from the old gNB are
+        // not measured into the new path's figures (#1451 review m8).
+        if from.ip().to_canonical() != session.gnb_addr().ip().to_canonical() {
+            log::debug!(
+                "QMP answer from {from} SEID {:#x}: not the session's gNB {}, not measured",
+                session.upf_seid,
+                session.gnb_addr()
+            );
+            return true;
+        }
         let answer = crate::qos_flow_mon::QmpAnswer {
             t1: ts.dl_sending_timestamp_repeated,
             t2: ts.dl_received_timestamp,
@@ -5306,10 +5318,12 @@ impl DataPlane {
     /// #1389 part 3: one round of per QoS flow QoS monitoring: a dummy G-PDU
     /// (no T-PDU, with QMP and T1) to every monitored flow that carried no
     /// downlink traffic since the last round, and the reports that are due.
-    pub async fn qos_flow_round(&self) {
+    /// Returns how many dummy G-PDUs went out.
+    pub async fn qos_flow_round(&self) -> usize {
         if !self.qos_flow_active() {
-            return;
+            return 0;
         }
+        let mut sent = 0;
         let round = self.with_qos_flow_monitor(|m| {
             m.round(std::time::Instant::now(), std::time::SystemTime::now())
         });
@@ -5325,13 +5339,15 @@ impl DataPlane {
                 continue;
             };
             let dummy = build_gtpu_header_dl(teid, 0, p.qfi, false, None, Some(p.t1));
-            if let Err(e) = sock.send_to(&dummy, gnb).await {
-                log::debug!("QoS monitoring dummy G-PDU to {gnb} failed: {e}");
+            match sock.send_to(&dummy, gnb).await {
+                Ok(_) => sent += 1,
+                Err(e) => log::debug!("QoS monitoring dummy G-PDU to {gnb} failed: {e}"),
             }
         }
         for (upf_seid, reports) in round.reports {
             self.send_report_event(UpfReportEvent::QosMonitoringReport { upf_seid, reports });
         }
+        sent
     }
 
     /// #1389 part 3: run [`Self::qos_flow_round`] every `interval` until shutdown.

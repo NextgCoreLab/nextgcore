@@ -542,3 +542,90 @@ fn every_probe_gets_a_t1_of_its_own_even_in_the_same_instant() {
         .unwrap();
     assert_eq!(qfi, 1);
 }
+
+#[test]
+fn periodic_reports_keep_their_cadence_under_round_jitter() {
+    // #1451 review M1: rounds every 1 s with scheduling jitter, Measurement
+    // Period 2 s. A period reset to the (late) round time made a later, less
+    // late round fall just short, so one "2 s" period lasted 3 s.
+    let mut m = QosFlowMonitor::new(false);
+    let t0 = Instant::now();
+    let wall = SystemTime::now();
+    m.create_srr(
+        SEID,
+        1,
+        vec![ctl(ie(&[5], true, false, false, false, true))],
+        t0,
+        wall,
+    );
+    let jitter_us = [300u64, 100, 400, 50, 500, 200, 450, 0, 350, 150, 250, 20];
+    let mut reported = Vec::new();
+    for (k, j) in jitter_us.iter().enumerate() {
+        let at = Duration::from_millis(1000 * k as u64) + Duration::from_micros(*j);
+        let r = m.round(t0 + at, wall + at);
+        if !r.reports.is_empty() {
+            reported.push(k);
+            let start = r.reports[0].1[0].1.start_time.unwrap();
+            let want = crate::data_plane::ntp_secs(wall + Duration::from_secs(k as u64 - 2));
+            assert_eq!(start, want, "round {k}: the period starts on its anchor");
+        }
+    }
+    assert_eq!(reported, vec![2, 4, 6, 8, 10], "one report every 2 s");
+}
+
+#[test]
+fn a_stalled_round_catches_up_to_the_current_period() {
+    let mut m = QosFlowMonitor::new(false);
+    let t0 = Instant::now();
+    let wall = SystemTime::now();
+    m.create_srr(
+        SEID,
+        1,
+        vec![ctl(ie(&[5], true, false, false, false, true))],
+        t0,
+        wall,
+    );
+    // Nothing ran for 7 s: one report, then the cadence resumes at 8 s.
+    assert_eq!(m.round(t0 + ms(7000), wall).reports.len(), 1);
+    assert!(m.round(t0 + ms(7500), wall).reports.is_empty());
+    assert_eq!(m.round(t0 + ms(8000), wall).reports.len(), 1);
+}
+
+#[test]
+fn with_clock_sync_a_skewed_clock_does_not_inflate_the_round_trip() {
+    // #1451 review m2: true 10/10 ms, the NG-RAN clock 15 ms behind. The one-way
+    // DL clamps to 0, but the round trip is offset-free: 20 ms, not 25.
+    let base = ntp64(SystemTime::now());
+    let t2 = base - 5 * MS; // T1 + 10 ms - 15 ms
+    let a = QmpAnswer {
+        t1: base,
+        t2,
+        t3: t2 + MS,
+        t4: base + 21 * MS,
+        dl_ran_ms: None,
+        ul_ran_ms: None,
+    };
+    let d = a.delays(true);
+    assert_eq!(d.dl, 0);
+    assert_eq!(d.rp, 20);
+}
+
+#[test]
+fn after_a_clock_step_back_t1_is_the_clock_again() {
+    // #1451 review m3: T1 is unique among a session's outstanding probes, not a
+    // global high-water mark that would stay ahead of a clock stepped back.
+    let mut m = QosFlowMonitor::new(false);
+    let now = Instant::now();
+    let wall = SystemTime::now();
+    m.create_srr(
+        SEID,
+        1,
+        vec![ctl(ie(&[5], true, false, false, false, true))],
+        now,
+        wall,
+    );
+    let ahead = m.round(now, wall + Duration::from_secs(10)).dummies[0].t1;
+    assert_eq!(ahead, ntp64(wall + Duration::from_secs(10)));
+    let after_step = m.round(now, wall).dummies[0].t1;
+    assert_eq!(after_step, ntp64(wall));
+}
