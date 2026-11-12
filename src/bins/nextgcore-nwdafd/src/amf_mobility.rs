@@ -362,6 +362,25 @@ pub async fn subscribe_once(
     nf_id: &str,
     expiry: u64,
 ) -> Result<AmfSubscription, String> {
+    let body = subscription_body(&notify_uri(sbi_base), nf_id, expiry);
+    subscribe_with_body(nrf_uri, &body).await
+}
+
+/// Discover an AMF at `nrf_uri`, then POST `body` (an
+/// `AmfCreateEventSubscription`) to it. Shared with nextgsim#465's
+/// UES_IN_AREA_REPORT subscription.
+pub async fn subscribe_with_body(nrf_uri: &str, body: &Value) -> Result<AmfSubscription, String> {
+    subscribe_with_body_answer(nrf_uri, body)
+        .await
+        .map(|(sub, _)| sub)
+}
+
+/// [`subscribe_with_body`], also returning the AMF's 201 body, whose
+/// `reportList` carries the immediate reports (TS 29.518 §5.3.2.2.2).
+pub async fn subscribe_with_body_answer(
+    nrf_uri: &str,
+    body: &Value,
+) -> Result<(AmfSubscription, Value), String> {
     let (nrf_host, nrf_port, nrf_base) = crate::notification_dispatcher::parse_notify_uri(nrf_uri)
         .ok_or_else(|| format!("invalid NRF URI {nrf_uri:?}"))?;
     let nrf = crate::notification_dispatcher::notify_client(&nrf_host, nrf_port);
@@ -386,9 +405,8 @@ pub async fn subscribe_once(
     if let Some(oauth2) = crate::oauth2_client() {
         amf = amf.with_oauth2(oauth2, nextgcore_sbi::types::NfType::Amf);
     }
-    let body = subscription_body(&notify_uri(sbi_base), nf_id, expiry);
     let resp = amf
-        .post_json("/namf-evts/v1/subscriptions", &body)
+        .post_json("/namf-evts/v1/subscriptions", body)
         .await
         .map_err(|e| format!("Namf_EventExposure_Subscribe to {host}:{port} failed: {e}"))?;
     if resp.status != 201 {
@@ -403,11 +421,12 @@ pub async fn subscribe_once(
         .get("subscriptionId")
         .and_then(Value::as_str)
         .ok_or("the 201 carries no subscriptionId")?;
-    Ok(AmfSubscription {
+    let sub = AmfSubscription {
         id: id.to_string(),
         host,
         port,
-    })
+    };
+    Ok((sub, created))
 }
 
 /// Hold an AMF LOCATION_REPORT subscription for the life of the process:

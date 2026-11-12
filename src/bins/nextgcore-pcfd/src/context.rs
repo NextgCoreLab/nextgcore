@@ -2652,6 +2652,15 @@ impl PcfContext {
             .collect()
     }
 
+    /// Every session, by id (nextgsim#465's controller scans them each poll).
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    pub fn sess_all(&self) -> Vec<PcfSess> {
+        let sess_list = read_through_poison(&self.sess_list);
+        let mut all: Vec<PcfSess> = sess_list.values().cloned().collect();
+        all.sort_by_key(|s| s.id);
+        all
+    }
+
     pub fn sess_find_by_id(&self, id: u64) -> Option<PcfSess> {
         let sess_list = read_through_poison(&self.sess_list);
         sess_list.get(&id).cloned()

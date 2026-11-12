@@ -803,7 +803,11 @@ fn build_sm_policy_notification(
         );
         return None;
     };
-    let parts = crate::sm_policy_build::build_sm_policy_decision(&sess.sm_policy_id, &sd);
+    // nextgsim#465: the decision carries min(subscribed, active demo caps); the
+    // returned session data stays the subscription-derived one, so a later
+    // fallback re-evaluation re-applies whatever cap is then in force.
+    let effective = effective_session_data(&sess.sm_policy_id, &sd);
+    let parts = crate::sm_policy_build::build_sm_policy_decision(&sess.sm_policy_id, &effective);
     let mut chg_decs = parts.chg_decs;
     // #299: overlay the UDR's SmPolicyDnnData charging flags, exactly as the
     // create path does. Without this a re-authorisation rebuilt `chgDecs` from
@@ -821,6 +825,28 @@ fn build_sm_policy_notification(
         },
     });
     Some((body, sd))
+}
+
+/// The session data a decision for `sm_policy_id` is built from: `sd` with its
+/// Session-AMBR lowered to any active override cap (nextgsim#465,
+/// [`crate::ambr_override`]).
+#[cfg(feature = "demo-d441a-congestion-loop")]
+pub(crate) fn effective_session_data(
+    sm_policy_id: &str,
+    sd: &crate::nudr_handler::SessionData,
+) -> crate::nudr_handler::SessionData {
+    crate::ambr_override::apply(sm_policy_id, sd)
+}
+
+/// The session data a decision for `sm_policy_id` is built from: without the
+/// nextgsim#465 demo feature there is no override layer, so `sd` unchanged.
+#[cfg(not(feature = "demo-d441a-congestion-loop"))]
+#[inline]
+pub(crate) fn effective_session_data(
+    _sm_policy_id: &str,
+    sd: &crate::nudr_handler::SessionData,
+) -> crate::nudr_handler::SessionData {
+    sd.clone()
 }
 
 /// Map a `SmPolicyDnnData`'s `online`/`offline` flags (TS 29.519 §5.6.2.x) onto every
