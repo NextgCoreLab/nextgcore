@@ -45,6 +45,9 @@ pub mod event {
     pub const PDU_SES_EST: &str = "PDU_SES_EST";
     /// PDU session release.
     pub const PDU_SES_REL: &str = "PDU_SES_REL";
+    /// QoS monitoring (#1390): the per QoS flow packet delays the UPF measures
+    /// and reports over N4 (TS 29.244 §5.24.4.3), §4.2.3.2 item 12.
+    pub const QOS_MON: &str = "QOS_MON";
 }
 
 /// A stored subscription: the parsed document plus the id this SMF assigned.
@@ -268,7 +271,7 @@ pub fn resource_path(id: &str) -> String {
 }
 
 /// Every subscription that matches an occurrence.
-fn matching(event: &str, supi: &str, psi: u8) -> Vec<EventSubscription> {
+pub(crate) fn matching(event: &str, supi: &str, psi: u8) -> Vec<EventSubscription> {
     SUBSCRIPTIONS
         .read()
         .ok()
@@ -317,37 +320,88 @@ pub async fn notify(event: &str, supi: &str, psi: u8) {
     }
     for sub in subs {
         let body = build_notification(&sub, event, supi, psi);
-        let Some((host, port)) = crate::policy::split_host_port(&sub.notif_uri) else {
-            log::warn!(
-                "subscription {} has an unusable notifUri '{}': the {event} \
-                 notification for {supi} cannot be delivered",
-                sub.id,
-                nextgcore_sbi::log_redact::redact_last_segment(&sub.notif_uri)
-            );
-            continue;
-        };
-        let path = notify_path(&sub.notif_uri);
-        let request = nextgcore_sbi::message::SbiRequest::post(path).with_body(
-            body.to_string(),
-            nextgcore_sbi::constants::content_type::APPLICATION_JSON,
+        deliver(&sub, &body, event, supi, psi).await;
+    }
+}
+
+/// The `repPeriod` (seconds) of a subscription whose `notifMethod` is PERIODIC
+/// (TS 29.508 Table 5.6.2.2-1), else `None`.
+pub fn periodic_rep_period(sub: &EventSubscription) -> Option<u32> {
+    (sub.document.get("notifMethod").and_then(Value::as_str) == Some("PERIODIC"))
+        .then(|| sub.document.get("repPeriod").and_then(Value::as_u64))
+        .flatten()
+        .filter(|p| *p > 0)
+        .map(|p| p.min(u32::MAX as u64) as u32)
+}
+
+/// One QoS monitoring result for a QOS_MON notification, in ms (§4.2.3.2 item 12).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QosMonResult {
+    pub ul_delay: Option<u32>,
+    pub dl_delay: Option<u32>,
+    pub rt_delay: Option<u32>,
+    /// Packet delay measurement failure (`pdmf`).
+    pub failure: bool,
+}
+
+/// The `NsmfEventExposureNotification` of one QOS_MON report (#1390, TS 29.508
+/// §4.2.3.2 item 12): one element in each of `ulDelays`, `dlDelays`, `rtDelays`
+/// (NOTE 8: the UPF reports one measurement per report), or `pdmf: true`.
+pub fn build_qos_mon_notification(
+    sub: &EventSubscription,
+    supi: &str,
+    psi: u8,
+    r: &QosMonResult,
+) -> Value {
+    let mut n = build_notification(sub, event::QOS_MON, supi, psi);
+    let e = &mut n["eventNotifs"][0];
+    if let Some(v) = r.ul_delay {
+        e["ulDelays"] = serde_json::json!([v]);
+    }
+    if let Some(v) = r.dl_delay {
+        e["dlDelays"] = serde_json::json!([v]);
+    }
+    if let Some(v) = r.rt_delay {
+        e["rtDelays"] = serde_json::json!([v]);
+    }
+    if r.failure {
+        e["pdmf"] = serde_json::json!(true);
+    }
+    n
+}
+
+/// POST `body` to `sub`'s `notifUri`; failures are logged and swallowed.
+pub async fn deliver(sub: &EventSubscription, body: &Value, event: &str, supi: &str, psi: u8) {
+    let Some((host, port)) = crate::policy::split_host_port(&sub.notif_uri) else {
+        log::warn!(
+            "subscription {} has an unusable notifUri '{}': the {event} \
+             notification for {supi} cannot be delivered",
+            sub.id,
+            nextgcore_sbi::log_redact::redact_last_segment(&sub.notif_uri)
         );
-        let client = nextgcore_sbi::client::SbiClient::new(
-            nextgcore_sbi::security::sbi_peer_client_config(&host, port)
-                .with_connect_timeout(std::time::Duration::from_secs(2))
-                .with_request_timeout(std::time::Duration::from_secs(3)),
-        );
-        match client.send_request(request).await {
-            Ok(resp) => log::info!(
-                "Nsmf_EventExposure_Notify {event} (SUPI {supi}, PSI {psi}) → \
-                 subscription {}: status={}",
-                sub.id,
-                resp.status
-            ),
-            Err(e) => log::warn!(
-                "Nsmf_EventExposure_Notify {event} to subscription {} failed: {e}",
-                sub.id
-            ),
-        }
+        return;
+    };
+    let path = notify_path(&sub.notif_uri);
+    let request = nextgcore_sbi::message::SbiRequest::post(path).with_body(
+        body.to_string(),
+        nextgcore_sbi::constants::content_type::APPLICATION_JSON,
+    );
+    let client = nextgcore_sbi::client::SbiClient::new(
+        nextgcore_sbi::security::sbi_peer_client_config(&host, port)
+            .with_connect_timeout(std::time::Duration::from_secs(2))
+            .with_request_timeout(std::time::Duration::from_secs(3)),
+    );
+    match client.send_request(request).await {
+        Ok(resp) => log::info!(
+            "Nsmf_EventExposure_Notify {event} (SUPI {supi}, PSI {psi}) → \
+             subscription {}: status={}",
+            sub.id,
+            resp.status
+        ),
+        Err(e) => log::warn!(
+            "Nsmf_EventExposure_Notify {event} to subscription {} failed: {e}",
+            sub.id
+        ),
     }
 }
 

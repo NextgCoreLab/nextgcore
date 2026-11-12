@@ -56,6 +56,7 @@ mod pfcp_sm;
 mod policy;
 #[cfg(test)]
 mod property_tests;
+mod qos_mon; // #1390: QOS_MON through per QoS flow QoS monitoring (N4 SRR, N2 id 181)
 mod restoration; // #193: restoration signalling for resources the UPF no longer holds
 mod session_extensions; // #199-#201: IPv6 dual-stack, SSC modes, Ethernet PDU
 mod session_metrics; // #1368: PDU session establishment counters (TS 28.552 §5.3.1)
@@ -1598,6 +1599,12 @@ async fn handle_pfcp_session_report_from(
             }
         }
         pfcp_path::record_tsc_report(seid, reports);
+    }
+
+    // Session Report (SESR, bit 0x20 — §8.2.21 bit 6), #1390: per QoS flow QoS
+    // monitoring reports (§5.24.4.3), exposed as QOS_MON.
+    if report_type & 0x20 != 0 {
+        qos_mon::on_session_report(seid, payload).await;
     }
 
     let mut offset = 0;
@@ -3371,6 +3378,7 @@ fn session_setup_flows(
     // it (#1147 review m1, M1).
     let default_bearer = bearers.iter().find(|b| qfi_of(b) == binding.qfi);
     let mut flows = vec![n2_transfer::QosFlowSetup {
+        qos_monitoring: None,
         qfi: binding.qfi,
         five_qi: u16::from(binding.five_qi),
         // #1179 follow-up: a session migrated from EPS keeps its EPS bearer's pre-emption
@@ -3391,12 +3399,19 @@ fn session_setup_flows(
             .mapped_eps_bearer_id
             .or(default_bearer.map(|b| b.ebi).filter(|&e| e != 0)),
     }];
+    // #1390: a monitored default flow keeps its QoS Monitoring Request in every
+    // Setup Request Transfer (re-activation, handover): the NG-RAN's state for it
+    // does not outlive the resource.
+    if qos_mon::active_on(sm_context_ref) {
+        flows[0].qos_monitoring = Some(n2_transfer::QosMonitoringRequest::Both);
+    }
     for bearer in &bearers {
         let qfi = qfi_of(bearer);
         if qfi == 0 || flows.iter().any(|f| f.qfi == qfi) {
             continue;
         }
         flows.push(n2_transfer::QosFlowSetup {
+            qos_monitoring: None,
             qfi,
             five_qi: u16::from(bearer.qos.index),
             arp: bearer_arp(bearer),
@@ -3479,6 +3494,7 @@ fn build_setup_request_transfer(
 /// other flow yet).
 fn default_flow(qfi: u8, five_qi: u16, arp_priority_level: u8) -> Vec<n2_transfer::QosFlowSetup> {
     vec![n2_transfer::QosFlowSetup {
+        qos_monitoring: None,
         qfi,
         five_qi,
         arp: n2_transfer::Arp::default_flow(arp_priority_level),
@@ -6069,6 +6085,11 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                     log::info!(
                         "PFCP Session Modified: DL FAR activated with gNB TEID=0x{gnb_teid:08x}"
                     );
+                    // #1390: a QOS_MON subscription covering the session, not yet
+                    // installed on it, is now.
+                    if n2_sm_info_type == "PDU_RES_SETUP_RSP" {
+                        qos_mon::on_user_plane_active(sm_context_ref);
+                    }
                 }
                 Err(e) => {
                     log::error!("PFCP Session Modification failed: {e}");
@@ -7498,6 +7519,8 @@ fn spawn_release_side_effects_with(
     announce: bool,
 ) {
     let reference = sm_context_ref.to_string();
+    // #1390: the session's SRRs went with its N4 session.
+    qos_mon::forget(sm_context_ref);
     let in_flight =
         ReleaseInFlight::begin_with(&binding.supi, binding.psi, nsac_release_of(&binding));
     RELEASE_SIDE_EFFECTS_RUNNING.fetch_add(1, Ordering::SeqCst);
@@ -9899,7 +9922,11 @@ async fn handle_event_subscribe(request: &SbiRequest) -> SbiResponse {
         nextgcore_sbi::log_redact::redact_last_segment(&sub.notif_uri),
         event_exposure::count() + 1
     );
+    let qos_mon_sub = sub.clone();
     let document = event_exposure::insert(sub);
+    // #1390: a QOS_MON subscription requests monitoring on the sessions it covers,
+    // after the 201 (the N4 and N2 legs are their own transactions).
+    tokio::spawn(async move { qos_mon::subscribed(&qos_mon_sub).await });
     SbiResponse::with_status(201)
         .with_header("Location", event_exposure::resource_path(&id))
         .with_json_body(&document)
@@ -9947,10 +9974,24 @@ async fn handle_event_subscription_put(subscription_id: &str, request: &SbiReque
         Ok(sub) => sub,
         Err(e) => return send_bad_request(&e.detail(), Some(e.cause())),
     };
+    let qos_mon_sub = sub.clone();
     if !event_exposure::replace(subscription_id, sub) {
         return event_subscription_not_found(subscription_id);
     }
     log::info!("Event subscription {subscription_id} replaced");
+    // #1390: a replacement without QOS_MON ends its monitoring; with it, sessions
+    // not monitored yet are.
+    tokio::spawn(async move {
+        if qos_mon_sub
+            .events
+            .iter()
+            .any(|e| e == event_exposure::event::QOS_MON)
+        {
+            qos_mon::subscribed(&qos_mon_sub).await;
+        } else {
+            qos_mon::unsubscribed(&qos_mon_sub.id).await;
+        }
+    });
     handle_event_subscription_get(subscription_id).await
 }
 
@@ -9965,6 +10006,9 @@ async fn handle_event_unsubscribe(subscription_id: &str) -> SbiResponse {
     match event_exposure::remove(subscription_id) {
         Some(_) => {
             log::info!("Event subscription {subscription_id} removed");
+            // #1390: its QoS monitoring stops (Remove SRR; `stop` to the NG-RAN).
+            let id = subscription_id.to_string();
+            tokio::spawn(async move { qos_mon::unsubscribed(&id).await });
             SbiResponse::with_status(204)
         }
         None => event_subscription_not_found(subscription_id),
@@ -9983,6 +10027,106 @@ fn event_subscription_not_found(subscription_id: &str) -> SbiResponse {
 // =============================================================================
 // Callback Handlers
 // =============================================================================
+
+/// #1390: tell the NG-RAN to start (`Both`) or stop the RAN part of the default
+/// flow's packet delay measurement (TS 23.501 §5.33.3.2): an SMF-requested PDU
+/// Session Modification (TS 23.502 §4.3.3.2 step 3b) whose N2 Modify Request
+/// Transfer carries the flow's QoS Flow Level QoS Parameters with the QoS
+/// Monitoring Request (TS 38.413 §9.3.1.12, id 181), and whose N1 restates the
+/// Session-AMBR, as the #1409 ARP-only change does. Under T3591, with the same
+/// guards as [`signal_policy_change`].
+pub(crate) fn signal_qos_monitoring(
+    sm_context_ref: &str,
+    request: n2_transfer::QosMonitoringRequest,
+) {
+    let Some(b) = lookup_policy_binding(sm_context_ref) else {
+        return;
+    };
+    let other_procedure = gsm_procedure_timers()
+        .lock()
+        .ok()
+        .and_then(|t| t.get(sm_context_ref).map(|e| e.timer_id))
+        .filter(|id| *id != timer::SmfTimerId::T3591);
+    if let Some(id) = other_procedure {
+        log::warn!(
+            "ref={sm_context_ref}: QoS Monitoring Request {request:?} not sent to the NG-RAN \
+             while {} is running",
+            id.name()
+        );
+        return;
+    }
+    if b.fsm.state == gsm_sm::GsmState::Exception {
+        return;
+    }
+    let Some(amf_uri) = b.sm_context_status_uri.clone() else {
+        log::warn!(
+            "ref={sm_context_ref}: no AMF callback URI; the NG-RAN cannot be sent the QoS \
+             Monitoring Request"
+        );
+        return;
+    };
+    let mut flows: Vec<_> = session_setup_flows(sm_context_ref, &b)
+        .into_iter()
+        .filter(|f| f.qfi == b.qfi)
+        .collect();
+    if context::QosCharacteristics::from_5qi(b.five_qi).is_some_and(|c| c.is_gbr()) {
+        match default_flow_bit_rates(sm_context_ref, b.qfi) {
+            Some(rates) => flows.iter_mut().for_each(|f| f.gbr = Some(rates)),
+            None => {
+                log::error!(
+                    "ref={sm_context_ref}: GBR default 5QI {} with no known rates; the QoS \
+                     Monitoring Request cannot describe the flow",
+                    b.five_qi
+                );
+                return;
+            }
+        }
+    }
+    if flows.is_empty() {
+        return;
+    }
+    for f in &mut flows {
+        f.qos_monitoring = Some(request);
+    }
+    let n1 = policy::build_network_modification_command(
+        b.psi,
+        b.ambr_dl_bps,
+        b.ambr_ul_bps,
+        b.qfi,
+        None,
+    );
+    let paged = flows.first().map(|f| (f.five_qi, f.arp));
+    let n2 =
+        match n2_transfer::modify_request_transfer_with_qos((b.ambr_dl_bps, b.ambr_ul_bps), &flows)
+        {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                log::error!("ref={sm_context_ref}: Modify Request Transfer did not encode ({e:?})");
+                return;
+            }
+        };
+    log::info!(
+        "ref={sm_context_ref}: QoS Monitoring Request {request:?} for QFI {} to the NG-RAN \
+         (PDU Session Modification)",
+        b.qfi
+    );
+    arm_gsm_timer_with_n2(
+        sm_context_ref,
+        timer::SmfTimerId::T3591,
+        &n1,
+        &b.supi,
+        b.psi,
+        Some(&amf_uri),
+        Some(GsmN2 {
+            transfer: n2.clone(),
+            paged,
+        }),
+    );
+    let r = sm_context_ref.to_string();
+    tokio::spawn(async move {
+        send_n1_n2_modify_transfer(&amf_uri, &b.supi, b.psi, &n1, &n2, paged, &r).await;
+    });
+}
 
 /// Tell the UE and the NG-RAN about a policy change the session now enforces (#1385,
 /// TS 23.502 §4.3.3.2 step 3b): one Namf_Communication_N1N2MessageTransfer carrying
@@ -23425,6 +23569,7 @@ mod tests {
                 data_forwarding_not_possible: false,
                 direct_forwarding_path_availability: direct,
                 flows: vec![n2_transfer::QosFlowSetup {
+                    qos_monitoring: None,
                     qfi: 1,
                     five_qi: 9,
                     arp: n2_transfer::Arp {
@@ -25944,6 +26089,419 @@ mod tests {
 
         listener.abort();
         upf_task.abort();
+    }
+
+    // ---- #1390: QOS_MON through per QoS flow QoS monitoring ----
+
+    /// A session toward a QFQM (or not) stand-in UPF, its default flow QFI 9 / 5QI 9,
+    /// and an AMF recording N1N2MessageTransfers.
+    async fn qos_mon_session_1390(
+        supi: &str,
+        psi: u8,
+        qfqm: bool,
+    ) -> (
+        pfcp_path::stand_in::StandInUpf,
+        String,
+        nextgcore_sbi::server::SbiServer,
+        std::sync::Arc<std::sync::Mutex<Vec<N1n2Post>>>,
+    ) {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let upf = pfcp_path::stand_in::associated_upf_with_features(
+            nextgcore_pfcp::types::UpFunctionFeatures {
+                ftup: true,
+                qfqm,
+                ..Default::default()
+            },
+        )
+        .await;
+        let (amf, amf_port, posts) = n1n2_recording_amf_1385(false).await;
+        let reference = session_toward_gnb(&upf, supi, psi, amf_port).await;
+        if let Ok(ctx) = smf_self().read() {
+            if let Some(b) = ctx.policy_bindings.write().unwrap().get_mut(&reference) {
+                b.qfi = 9;
+                b.five_qi = 9;
+                b.arp_priority_level = 8;
+                b.ambr_ul_bps = 1_000_000;
+                b.ambr_dl_bps = 2_000_000;
+            }
+        }
+        (upf, reference, amf, posts)
+    }
+
+    fn qos_mon_subscription_1390(
+        supi: &str,
+        events: &[&str],
+        notif_uri: &str,
+    ) -> event_exposure::EventSubscription {
+        let sub = event_exposure::parse_subscription(
+            &serde_json::json!({
+                "notifId": "notif-1390",
+                "notifUri": notif_uri,
+                "eventSubs": events.iter().map(|e| serde_json::json!({ "event": e })).collect::<Vec<_>>(),
+                "supi": supi,
+                "notifMethod": "PERIODIC",
+                "repPeriod": 3,
+            }),
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .unwrap();
+        event_exposure::insert(sub.clone());
+        sub
+    }
+
+    /// The SRR operations (Create: SRR ID + IE 242s; Remove: SRR ID) of an N4 body.
+    fn srr_ops_1390(
+        body: &[u8],
+    ) -> (
+        Vec<(
+            u8,
+            Vec<nextgcore_pfcp::qos_monitoring::QosMonitoringPerQosFlowControlInformation>,
+        )>,
+        Vec<u8>,
+    ) {
+        use nextgcore_pfcp::qos_monitoring::{
+            QosMonitoringPerQosFlowControlInformation as C, TypedIe,
+        };
+        let mut creates = Vec::new();
+        let mut removes = Vec::new();
+        let ies = |d: &[u8]| {
+            let mut out = Vec::new();
+            let mut at = 0;
+            while at + 4 <= d.len() {
+                let t = u16::from_be_bytes([d[at], d[at + 1]]);
+                let l = u16::from_be_bytes([d[at + 2], d[at + 3]]) as usize;
+                out.push((t, d[at + 4..at + 4 + l].to_vec()));
+                at += 4 + l;
+            }
+            out
+        };
+        for (t, v) in ies(body) {
+            let m = ies(&v);
+            let id = m.iter().find(|(t, _)| *t == 215).map(|(_, v)| v[0]);
+            match t {
+                212 => creates.push((
+                    id.unwrap(),
+                    m.iter()
+                        .filter(|(t, _)| *t == 242)
+                        .map(|(_, v)| C::decode_value(v).unwrap())
+                        .collect(),
+                )),
+                211 => removes.push(id.unwrap()),
+                _ => {}
+            }
+        }
+        (creates, removes)
+    }
+
+    /// The QoS Monitoring Request of each flow in an N2 Modify Request Transfer.
+    fn n2_monitoring_1390(n2: &[u8]) -> Vec<(u8, Option<u8>)> {
+        use nextgcore_ngap_gen::generated as g;
+        let t =
+            nextgcore_ngap_gen::decode_contained::<g::PDUSessionResourceModifyRequestTransfer>(n2)
+                .expect("the N2 decodes");
+        let mut out = Vec::new();
+        for ie in t.protocol_i_es.0 {
+            if let g::PDUSessionResourceModifyRequestTransferProtocolIEs_EntryValue::Id_QosFlowAddOrModifyRequestList(l) = ie.value {
+                for item in l.0 {
+                    let req = item
+                        .qos_flow_level_qos_parameters
+                        .and_then(|p| p.ie_extensions)
+                        .and_then(|e| e.0.into_iter().find_map(|x| match x.extension_value {
+                            g::QosFlowLevelQosParametersIE_Extensions_EntryExtensionValue::Id_QosMonitoringRequest(r) => Some(r.0),
+                            _ => None,
+                        }));
+                    out.push((item.qos_flow_identifier.0, req));
+                }
+            }
+        }
+        out
+    }
+
+    /// Criteria 1 and 3 (#1390): subscribing to QOS_MON installs an SRR on the UPF
+    /// (IE 242 for the default QFI: DL/UL/RTT, Periodic every `repPeriod`) and asks
+    /// the NG-RAN to measure (id 181 = both); the session's Setup Request Transfers
+    /// then keep it. Unsubscribing removes the SRR and tells the NG-RAN to stop.
+    ///
+    /// REVERT-VERIFIED: see the PR.
+    // The event-store lock is held across awaits, as the other event tests do
+    // (event_exposure::STORE_LOCK).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribing_to_qos_mon_provisions_the_upf_and_the_ng_ran_1390() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _q = qos_mon::TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _e = event_exposure::lock_store();
+        event_exposure::clear_for_test();
+        qos_mon::clear_for_test();
+        let supi = "imsi-001010000013901";
+        let (upf, reference, amf, posts) = qos_mon_session_1390(supi, 5, true).await;
+        let mods_before = upf.modification_bodies().len();
+        let sub = qos_mon_subscription_1390(supi, &["QOS_MON"], "http://127.0.0.1:9/cb");
+
+        qos_mon::subscribed(&sub).await;
+        let bodies = upf.modification_bodies();
+        assert_eq!(bodies.len(), mods_before + 1, "one Session Modification");
+        let (creates, removes) = srr_ops_1390(bodies.last().unwrap());
+        assert!(removes.is_empty());
+        assert_eq!(creates.len(), 1);
+        assert_eq!(creates[0].1, vec![qos_mon::control_for(9, 3)]);
+        let srr_id = creates[0].0;
+        let got = await_n1n2_1385(&posts, 1).await;
+        assert_eq!(got.len(), 1, "one N1N2MessageTransfer");
+        assert_eq!(
+            got[0].1["n2InfoContainer"]["smInfo"]["n2InfoContent"]["ngapIeType"],
+            "PDU_RES_MOD_REQ"
+        );
+        assert_eq!(
+            n2_monitoring_1390(&got[0].3),
+            vec![(
+                9,
+                Some(nextgcore_ngap_gen::generated::QosMonitoringRequest::BOTH)
+            )]
+        );
+        assert_eq!(
+            got[0].2[3],
+            gsm_build::message_type::PDU_SESSION_MODIFICATION_COMMAND
+        );
+        assert!(qos_mon::active_on(&reference));
+        let b = lookup_policy_binding(&reference).unwrap();
+        assert_eq!(
+            session_setup_flows(&reference, &b)[0].qos_monitoring,
+            Some(n2_transfer::QosMonitoringRequest::Both),
+            "a re-activation's Setup Request Transfer keeps id 181"
+        );
+        // Subscribing again changes nothing.
+        qos_mon::subscribed(&sub).await;
+        assert_eq!(upf.modification_bodies().len(), mods_before + 1);
+        cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
+
+        qos_mon::unsubscribed(&sub.id).await;
+        let bodies = upf.modification_bodies();
+        let (creates, removes) = srr_ops_1390(bodies.last().unwrap());
+        assert!(creates.is_empty());
+        assert_eq!(removes, vec![srr_id], "Remove SRR");
+        let got = await_n1n2_1385(&posts, 2).await;
+        assert_eq!(
+            n2_monitoring_1390(&got[1].3),
+            vec![(
+                9,
+                Some(nextgcore_ngap_gen::generated::QosMonitoringRequest::STOP)
+            )]
+        );
+        assert!(!qos_mon::active_on(&reference));
+        assert_eq!(session_setup_flows(&reference, &b)[0].qos_monitoring, None);
+
+        cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
+        forget_seeded_session(&reference);
+        event_exposure::clear_for_test();
+        amf.stop().await.ok();
+    }
+
+    /// Criterion 3 (#1390): no QOS_MON subscription, no monitoring: another event's
+    /// subscription, and a session whose user plane activates, request nothing.
+    // The event-store lock is held across awaits, as the other event tests do
+    // (event_exposure::STORE_LOCK).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_qos_mon_subscription_requests_no_monitoring_1390() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _q = qos_mon::TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _e = event_exposure::lock_store();
+        event_exposure::clear_for_test();
+        qos_mon::clear_for_test();
+        let supi = "imsi-001010000013902";
+        let (upf, reference, amf, posts) = qos_mon_session_1390(supi, 5, true).await;
+        let mods_before = upf.modification_bodies().len();
+        let sub = qos_mon_subscription_1390(supi, &["PDU_SES_EST"], "http://127.0.0.1:9/cb");
+        qos_mon::subscribed(&sub).await;
+        qos_mon::on_user_plane_active(&reference);
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        assert_eq!(
+            upf.modification_bodies().len(),
+            mods_before,
+            "no Session Modification"
+        );
+        assert!(posts.lock().unwrap().is_empty(), "no N1N2MessageTransfer");
+        assert!(!qos_mon::active_on(&reference));
+        forget_seeded_session(&reference);
+        event_exposure::clear_for_test();
+        amf.stop().await.ok();
+    }
+
+    /// TS 29.244 §5.24.4.1: a UPF that did not advertise QFQM is not asked, and so
+    /// neither is the NG-RAN.
+    // The event-store lock is held across awaits, as the other event tests do
+    // (event_exposure::STORE_LOCK).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_upf_without_qfqm_is_not_asked_for_qos_monitoring_1390() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _q = qos_mon::TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _e = event_exposure::lock_store();
+        event_exposure::clear_for_test();
+        qos_mon::clear_for_test();
+        let supi = "imsi-001010000013903";
+        let (upf, reference, amf, posts) = qos_mon_session_1390(supi, 5, false).await;
+        let mods_before = upf.modification_bodies().len();
+        let sub = qos_mon_subscription_1390(supi, &["QOS_MON"], "http://127.0.0.1:9/cb");
+        qos_mon::subscribed(&sub).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(upf.modification_bodies().len(), mods_before);
+        assert!(posts.lock().unwrap().is_empty());
+        assert!(!qos_mon::active_on(&reference));
+        forget_seeded_session(&reference);
+        event_exposure::clear_for_test();
+        amf.stop().await.ok();
+    }
+
+    /// A session whose user plane activates after the subscription (a new session,
+    /// #1390) is provisioned then.
+    // The event-store lock is held across awaits, as the other event tests do
+    // (event_exposure::STORE_LOCK).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_activated_after_the_subscription_is_provisioned_1390() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _q = qos_mon::TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _e = event_exposure::lock_store();
+        event_exposure::clear_for_test();
+        qos_mon::clear_for_test();
+        let supi = "imsi-001010000013904";
+        let sub = qos_mon_subscription_1390(supi, &["QOS_MON"], "http://127.0.0.1:9/cb");
+        let (upf, reference, amf, posts) = qos_mon_session_1390(supi, 6, true).await;
+        let mods_before = upf.modification_bodies().len();
+        qos_mon::on_user_plane_active(&reference);
+        let got = await_n1n2_1385(&posts, 1).await;
+        assert_eq!(got.len(), 1);
+        let bodies = upf.modification_bodies();
+        assert_eq!(bodies.len(), mods_before + 1);
+        assert_eq!(
+            srr_ops_1390(bodies.last().unwrap()).0.len(),
+            1,
+            "Create SRR"
+        );
+        assert!(qos_mon::srr_ids(&reference).len() == 1);
+        let _ = sub;
+        cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
+        qos_mon::forget(&reference);
+        forget_seeded_session(&reference);
+        event_exposure::clear_for_test();
+        amf.stop().await.ok();
+    }
+
+    /// Criterion 2 (#1390): a UPF Session Report with SESR (its QoS Monitoring
+    /// Report for the SRR) produces a QOS_MON notify carrying the measured delays,
+    /// to the subscription that SRR serves, and the report is accepted.
+    // The event-store lock is held across awaits, as the other event tests do
+    // (event_exposure::STORE_LOCK).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_qos_monitoring_session_report_is_notified_with_the_measured_delay_1390() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _q = qos_mon::TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _e = event_exposure::lock_store();
+        event_exposure::clear_for_test();
+        qos_mon::clear_for_test();
+        let supi = "imsi-001010000013905";
+        let (upf, reference, amf, _posts) = qos_mon_session_1390(supi, 5, true).await;
+        let notified = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let sink = notified.clone();
+        let (consumer, caddr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let sink = sink.clone();
+                async move {
+                    if let Some(v) = req
+                        .http
+                        .content
+                        .as_deref()
+                        .and_then(|c| serde_json::from_str(c).ok())
+                    {
+                        sink.lock().unwrap().push(v);
+                    }
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await;
+        let sub = qos_mon_subscription_1390(
+            supi,
+            &["QOS_MON"],
+            &format!("http://127.0.0.1:{}/qos-cb", caddr.port()),
+        );
+        qos_mon::subscribed(&sub).await;
+        let srr_id = qos_mon::srr_ids(&reference)[0];
+        cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
+
+        let body = qos_mon::tests::sesr_body(
+            srr_id,
+            nextgcore_pfcp::qos_monitoring::QosMonitoringMeasurement {
+                downlink_packet_delay: Some(22),
+                uplink_packet_delay: Some(23),
+                round_trip_packet_delay: Some(45),
+                ..Default::default()
+            },
+        );
+        let seid = smf_n4_seid_for(&reference);
+        let mut pkt = vec![0x21, 56];
+        pkt.extend_from_slice(&((body.len() + 12) as u16).to_be_bytes());
+        pkt.extend_from_slice(&seid.to_be_bytes());
+        pkt.extend_from_slice(&[0, 0x13, 0x90, 0]);
+        pkt.extend_from_slice(&body);
+        // From the UPF's address, as a report from its own session must be (#971);
+        // the response goes back to `sock`'s peer, read from the recording socket.
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        handle_pfcp_session_report(&sock, &pkt, upf.client.peer()).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while notified.lock().unwrap().is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let got = notified.lock().unwrap().clone();
+        assert_eq!(got.len(), 1, "one QOS_MON notify: {got:?}");
+        let e = &got[0]["eventNotifs"][0];
+        assert_eq!(got[0]["notifId"], "notif-1390");
+        assert_eq!(e["event"], "QOS_MON");
+        assert_eq!(e["supi"], supi);
+        assert_eq!(e["pduSeId"], 5);
+        assert_eq!(e["dlDelays"], serde_json::json!([22]));
+        assert_eq!(e["ulDelays"], serde_json::json!([23]));
+        assert_eq!(e["rtDelays"], serde_json::json!([45]));
+
+        qos_mon::forget(&reference);
+        forget_seeded_session(&reference);
+        event_exposure::clear_for_test();
+        consumer.stop().await.ok();
+        amf.stop().await.ok();
+    }
+
+    /// A released session forgets its monitoring: its SRRs went with the N4 session,
+    /// so a later Setup Request Transfer for the reference must not carry id 181.
+    // The event-store lock is held across awaits, as the other event tests do
+    // (event_exposure::STORE_LOCK).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_released_session_forgets_its_qos_monitoring_1390() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _q = qos_mon::TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _e = event_exposure::lock_store();
+        event_exposure::clear_for_test();
+        qos_mon::clear_for_test();
+        let supi = "imsi-001010000013906";
+        let (_upf, reference, amf, _posts) = qos_mon_session_1390(supi, 5, true).await;
+        let sub = qos_mon_subscription_1390(supi, &["QOS_MON"], "http://127.0.0.1:9/cb");
+        qos_mon::subscribed(&sub).await;
+        assert!(qos_mon::active_on(&reference));
+        cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
+        let binding = lookup_policy_binding(&reference).unwrap();
+        spawn_release_side_effects_with(&reference, binding, false);
+        assert!(!qos_mon::active_on(&reference), "forgotten at release");
+        forget_seeded_session(&reference);
+        event_exposure::clear_for_test();
+        amf.stop().await.ok();
     }
 }
 

@@ -171,6 +171,7 @@ fn flow() -> impl Strategy<Value = QosFlowSetup> {
     )
         .prop_map(
             |(qfi, five_qi, (priority_level, cap, vuln), gbr, e_rab_id)| QosFlowSetup {
+                qos_monitoring: None,
                 qfi,
                 five_qi,
                 arp: Arp {
@@ -576,6 +577,7 @@ fn out_of_range_values_are_refused_as_before() {
         data_forwarding_not_possible: false,
         direct_forwarding_path_availability: false,
         flows: vec![QosFlowSetup {
+            qos_monitoring: None,
             qfi: 1,
             five_qi: 9,
             arp: Arp {
