@@ -55,6 +55,13 @@ struct Args {
     #[arg(long)]
     state_file: Option<String>,
 
+    /// Subscriber store (MongoDB) URI, the source of every SM policy's QoS,
+    /// Session-AMBR and PCC rules. Without it, the config file's top-level
+    /// `db_uri` (#1457). A configured store that cannot be reached FAILS
+    /// STARTUP; with none configured, every session gets the local default.
+    #[arg(long)]
+    db_uri: Option<String>,
+
     /// Log file path
     #[arg(short = 'l', long)]
     log_file: Option<String>,
@@ -327,6 +334,27 @@ pub async fn run() -> Result<()> {
         args.max_ue,
         args.max_sess
     );
+
+    // #1457: open the subscriber store BEFORE anything can read it -- the boot
+    // restoration below re-evaluates restored sessions, and the SBI server answers
+    // SM policy creates from it. Until this call pcfd parsed no db_uri at all, so
+    // every session-data read failed "Database not initialized" and every session
+    // was authorised the local default (5QI 9, 100/100 Mbps) whatever the
+    // subscriber was provisioned with (TS 29.512 §4.2.2.2: the PCF authorises the
+    // Session-AMBR from the subscription). A store that is configured but cannot be
+    // reached is fatal, as in hssd (#478): a PCF that silently answers the default
+    // for every subscriber looks healthy and is wrong for all of them.
+    match resolve_db_uri(args.db_uri.as_deref(), &args.config) {
+        Some(db_uri) => {
+            open_subscriber_store(&db_uri, STORE_CONNECT_ATTEMPTS, STORE_CONNECT_BACKOFF).await?;
+        }
+        None => log::warn!(
+            "No subscriber store configured (--db-uri or a top-level db_uri in {}): every SM \
+             policy is authorised the local default (5QI 9, Session-AMBR 100/100 Mbps) and \
+             every AM policy without a UDR ueAmbr the local default",
+            args.config
+        ),
+    }
 
     // Issue #66/#192: restore durable state AFTER the context knows its capacity
     // caps and BEFORE the SBI server can accept a request, so a restored
@@ -683,8 +711,75 @@ pub async fn run() -> Result<()> {
     pcf_context_final();
     log::info!("PCF context finalized");
 
+    nextgcore_dbi::nextgcore_dbi_final();
+
     log::info!("NextGCore PCF stopped");
     Ok(())
+}
+
+/// How many times startup tries to reach the subscriber store before giving up
+/// (#1457). Each attempt already waits out the driver's server-selection timeout, so
+/// a store that comes up a little after the PCF (docker compose, a pod restart) is
+/// still found. The same bound as hssd's (#478).
+const STORE_CONNECT_ATTEMPTS: u32 = 5;
+
+/// The pause between two store connection attempts.
+const STORE_CONNECT_BACKOFF: Duration = Duration::from_secs(2);
+
+/// The subscriber-store URI (#1457): `--db-uri` wins over the config file's top-level
+/// `db_uri` (the key every shipped pcf.yaml -- docker, k8s, Helm, EKS -- sets), the
+/// same CLI-over-YAML precedence as hssd. `None` when neither names one, or when the
+/// config is absent; a config that does not parse fails startup later, on its own.
+fn resolve_db_uri(cli: Option<&str>, config_path: &str) -> Option<String> {
+    if let Some(uri) = cli.map(str::trim).filter(|u| !u.is_empty()) {
+        return Some(uri.to_string());
+    }
+    #[derive(Deserialize)]
+    struct TopLevel {
+        db_uri: Option<String>,
+    }
+    let content = std::fs::read_to_string(config_path).ok()?;
+    serde_yaml::from_str::<TopLevel>(&content)
+        .ok()?
+        .db_uri
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+}
+
+/// Open nextgcore-dbi's subscriber collection (#1457), retrying only the "server not
+/// reachable yet" failure. A malformed URI fails on the first attempt, and an
+/// unreachable store fails after `attempts`: either way startup stops, so the PCF
+/// never serves policy it would have to invent.
+async fn open_subscriber_store(db_uri: &str, attempts: u32, backoff: Duration) -> Result<()> {
+    let mut attempt = 1;
+    loop {
+        match nextgcore_dbi::nextgcore_dbi_init_async(db_uri.to_string()).await {
+            Ok(()) => {
+                log::info!("Subscriber store opened");
+                return Ok(());
+            }
+            Err(nextgcore_dbi::mongoc::DbiError::Retry) if attempt < attempts => {
+                log::warn!(
+                    "Subscriber store not reachable (attempt {attempt}/{attempts}); retrying"
+                );
+                attempt += 1;
+                tokio::time::sleep(backoff).await;
+            }
+            Err(e) => {
+                // `Retry` displays as "Retry needed", which reads as advice rather
+                // than as the reason startup stopped.
+                let why = match e {
+                    nextgcore_dbi::mongoc::DbiError::Retry => {
+                        "the server did not answer".to_string()
+                    }
+                    other => other.to_string(),
+                };
+                return Err(anyhow::anyhow!(
+                    "cannot open the subscriber store after {attempt} attempt(s): {why}"
+                ));
+            }
+        }
+    }
 }
 
 /// SBI request handler for PCF
@@ -10933,6 +11028,65 @@ mod shipped_config_tests {
         // and sets NEXTGCORE_HELM_REQUIRED, so this is never skipped there).
         if let Some(text) = nextgcore_core::helm_render::helm_rendered_config(&root, "pcf.yaml") {
             serde_yaml::from_str::<super::PcfYaml>(&text).expect("Helm pcf.yaml");
+        }
+    }
+}
+
+/// #1457: where the subscriber-store URI comes from.
+#[cfg(test)]
+mod db_uri_tests_1457 {
+    use super::resolve_db_uri;
+
+    fn config(name: &str, body: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("pcfd-1457-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pcf.yaml");
+        std::fs::write(&path, body).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn the_flag_beats_the_yaml_and_blank_is_unset() {
+        let path = config("both", "db_uri: mongodb://yaml/nextgcore\npcf: {}\n");
+        assert_eq!(
+            resolve_db_uri(Some("mongodb://cli/nextgcore"), &path).as_deref(),
+            Some("mongodb://cli/nextgcore")
+        );
+        assert_eq!(
+            resolve_db_uri(Some("  "), &path).as_deref(),
+            Some("mongodb://yaml/nextgcore"),
+            "a blank flag falls through to the YAML"
+        );
+        assert_eq!(
+            resolve_db_uri(None, &path).as_deref(),
+            Some("mongodb://yaml/nextgcore")
+        );
+        let blank = config("blank", "db_uri: \"\"\npcf: {}\n");
+        assert_eq!(resolve_db_uri(None, &blank), None);
+        assert_eq!(resolve_db_uri(None, "/nonexistent/pcf.yaml"), None);
+    }
+
+    /// Every shipped pcf.yaml names its store, so every deployment opens it.
+    #[test]
+    fn every_shipped_config_names_a_store() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let docker = root.join("docker/rust/configs/5gc/pcf.yaml");
+        assert!(
+            resolve_db_uri(None, docker.to_str().unwrap()).is_some(),
+            "docker pcf.yaml"
+        );
+        let cm: serde_yaml::Value = serde_yaml::from_str(
+            &std::fs::read_to_string(root.join("k8s/manifests/configmap.yaml")).unwrap(),
+        )
+        .unwrap();
+        let k8s = config(
+            "k8s",
+            cm["data"]["pcf.yaml"].as_str().expect("k8s pcf.yaml"),
+        );
+        assert!(resolve_db_uri(None, &k8s).is_some(), "k8s pcf.yaml");
+        if let Some(text) = nextgcore_core::helm_render::helm_rendered_config(&root, "pcf.yaml") {
+            let helm = config("helm", &text);
+            assert!(resolve_db_uri(None, &helm).is_some(), "Helm pcf.yaml");
         }
     }
 }
