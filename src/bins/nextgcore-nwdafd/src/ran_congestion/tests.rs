@@ -498,3 +498,31 @@ fn the_profile_offers_the_ingest_service_only_while_serving() {
         "not on the EventsSubscription surface, which does not serve it"
     );
 }
+
+/// Review MINOR 6: one process tracks at most MAX_CELLS cells and starts at most
+/// MAX_TAIS AMF subscriptions, whatever an authenticated client sends.
+#[test]
+fn the_store_is_bounded() {
+    let store = CellStore::default();
+    let now = unix_now_ms();
+    for i in 0..MAX_CELLS {
+        let cell = format!("{:09X}", 0x465000 + i);
+        assert!(store.ingest(parse_report(&report_body(&cell, "000001", 1.0, now, false)).unwrap()));
+    }
+    assert!(
+        !store.ingest(parse_report(&report_body("0000FFFFF", "000001", 1.0, now, false)).unwrap())
+    );
+    assert!(
+        store.ingest(parse_report(&report_body("000465000", "000001", 2.0, now, false)).unwrap()),
+        "a known cell is still updated"
+    );
+    let tai = |n: usize| TaiKey {
+        mcc: "999".into(),
+        mnc: "70".into(),
+        tac: format!("{n:06X}"),
+    };
+    let firsts = (0..MAX_TAIS + 4)
+        .filter(|n| store.first_sight(&tai(*n)))
+        .count();
+    assert_eq!(firsts, MAX_TAIS);
+}

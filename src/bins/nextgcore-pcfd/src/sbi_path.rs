@@ -984,6 +984,46 @@ pub fn pcf_sbi_send_smpolicycontrol_delete_notify(sess_id: u64, app_session_id: 
 /// boot would terminate an association the SMF released long ago.
 ///
 /// Returns `(notified, unnotifiable)`.
+/// nextgsim#465: at start-up, tell the SMF the subscribed Session-AMBR again for
+/// every restored session that a demo had capped ([`crate::context::PcfSess::demo_ambr_cap`]).
+///
+/// The cap itself lived in memory and died with the previous process, and so did
+/// the controller that would have restored it; the SMF and the UPF QER still
+/// police at it. Restarting is how a demo is switched off (or its mode changed),
+/// so without this a throttle would outlive the demo. Every capped session is
+/// restored, whatever the new configuration: if its demo is still active and the
+/// cell still congested, the controller throttles it again on its own evidence.
+///
+/// Runs in every build: a default build never writes the field, but it may restore
+/// a snapshot a demo build wrote. Returns how many notifies were sent.
+pub fn pcf_restore_demo_capped_sessions() -> usize {
+    let capped: Vec<crate::context::PcfSess> = match crate::context::pcf_self().read() {
+        Ok(ctx) => ctx
+            .sess_all()
+            .into_iter()
+            .filter(|s| s.demo_ambr_cap.is_some())
+            .collect(),
+        Err(_) => return 0,
+    };
+    let mut sent = 0;
+    for mut sess in capped {
+        let cap = sess.demo_ambr_cap.take();
+        if let Ok(ctx) = crate::context::pcf_self().read() {
+            ctx.sess_update(&sess);
+        }
+        log::warn!(
+            "[sm_policy_id={}] restoring the subscribed Session-AMBR: the session held a \
+             demo cap {:?} from before this start-up (nextgsim#465)",
+            sess.sm_policy_id,
+            cap
+        );
+        if pcf_sbi_send_smpolicycontrol_update_notify(sess.id) {
+            sent += 1;
+        }
+    }
+    sent
+}
+
 pub fn pcf_notify_unrestorable_associations() -> (usize, usize) {
     let pending = match crate::context::pcf_self().read() {
         Ok(ctx) => ctx.take_unrestorable_associations(),

@@ -71,6 +71,11 @@ pub fn get(sm_policy_id: &str) -> Option<Cap> {
     })
 }
 
+/// Drop every cap on `sm_policy_id`: the session was released.
+pub fn forget(sm_policy_id: &str) {
+    caps().remove(sm_policy_id);
+}
+
 /// The `sm_policy_id`s `writer` holds a cap on.
 pub fn held_by(writer: &'static str) -> Vec<String> {
     caps()
@@ -91,9 +96,10 @@ pub fn apply(sm_policy_id: &str, sd: &SessionData) -> SessionData {
     out
 }
 
-/// Fail start-up when more than one demo that writes this layer is active.
-pub fn check_writers(active: &[&str]) -> Result<(), String> {
-    let on: Vec<&str> = WRITERS
+/// Fail start-up when more than one of `writers` (the demos that write this
+/// layer, [`WRITERS`] at start-up) is active.
+pub fn check_writers(writers: &[&str], active: &[&str]) -> Result<(), String> {
+    let on: Vec<&str> = writers
         .iter()
         .copied()
         .filter(|w| active.contains(w))
@@ -151,7 +157,25 @@ mod tests {
 
     #[test]
     fn two_writers_fail_and_one_is_fine() {
-        assert!(check_writers(&[WRITERS[0]]).is_ok());
-        assert!(check_writers(&[]).is_ok());
+        assert!(check_writers(WRITERS, &[WRITERS[0]]).is_ok());
+        assert!(check_writers(WRITERS, &[]).is_ok());
+        let err = check_writers(&["d-a", "d-b", "d-c"], &["d-a", "d-c"]).unwrap_err();
+        assert!(err.contains("d-a") && err.contains("d-c"), "{err}");
+        assert!(check_writers(&["d-a", "d-b"], &["d-b", "other"]).is_ok());
+    }
+
+    #[test]
+    fn a_released_session_forgets_its_cap() {
+        let id = "ambr-override-forget-465";
+        set(
+            id,
+            WRITERS[0],
+            Cap {
+                uplink_bps: 1,
+                downlink_bps: 1,
+            },
+        );
+        forget(id);
+        assert_eq!(get(id), None);
     }
 }

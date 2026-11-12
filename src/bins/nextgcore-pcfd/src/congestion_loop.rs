@@ -182,7 +182,10 @@ impl Settings {
     /// The cap a throttle installs on a session subscribed at `subscribed_bps`:
     /// `throttle_kbps`, never below `floor_kbps`, never above the subscription.
     pub fn cap_for(&self, subscribed_bps: u64) -> u64 {
-        (self.throttle_kbps.max(self.floor_kbps) * 1000).min(subscribed_bps)
+        self.throttle_kbps
+            .max(self.floor_kbps)
+            .saturating_mul(1000)
+            .min(subscribed_bps)
     }
 }
 
@@ -498,6 +501,14 @@ pub fn execute(s: &Settings, action: &Action, obs: Option<Observation>) {
                 return;
             }
             ambr_override::set(sm_policy_id, DEMO_KEY, cap);
+            persist_cap(
+                *sess_id,
+                Some(crate::context::DemoAmbrCap {
+                    writer: DEMO_KEY.to_string(),
+                    uplink_bps: cap.uplink_bps,
+                    downlink_bps: cap.downlink_bps,
+                }),
+            );
             crate::sbi_path::pcf_sbi_send_smpolicycontrol_update_notify(*sess_id);
         }
         Action::Restore {
@@ -518,8 +529,20 @@ pub fn execute(s: &Settings, action: &Action, obs: Option<Observation>) {
                 return;
             }
             if ambr_override::clear(sm_policy_id, DEMO_KEY) {
+                persist_cap(*sess_id, None);
                 crate::sbi_path::pcf_sbi_send_smpolicycontrol_update_notify(*sess_id);
             }
+        }
+    }
+}
+
+/// Record on the session (and so in the durable state) the cap the SMF is about
+/// to hold, so a pcfd restart can undo it ([`crate::sbi_path::pcf_restore_demo_capped_sessions`]).
+fn persist_cap(sess_id: u64, cap: Option<crate::context::DemoAmbrCap>) {
+    if let Ok(ctx) = crate::context::pcf_self().read() {
+        if let Some(mut sess) = ctx.sess_find_by_id(sess_id) {
+            sess.demo_ambr_cap = cap;
+            ctx.sess_update(&sess);
         }
     }
 }

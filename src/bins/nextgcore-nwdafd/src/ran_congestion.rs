@@ -85,6 +85,11 @@ pub const STALE_WINDOWS: u64 = 3;
 pub const MIN_STALENESS_MS: u64 = 3_000;
 /// Reports kept per cell, for a statistics window.
 pub const HISTORY: usize = 120;
+/// Cells and TAIs one process tracks. The ingest is AF-only behind an NRF
+/// token, but one authenticated client must not grow the store (and the AMF
+/// subscription tasks, one per TAI) without bound.
+pub const MAX_CELLS: usize = 64;
+pub const MAX_TAIS: usize = 16;
 
 static SERVING: AtomicBool = AtomicBool::new(false);
 static CALLBACK_TOKEN: OnceLock<String> = OnceLock::new();
@@ -360,16 +365,22 @@ pub struct CellStore {
 }
 
 impl CellStore {
-    /// Keep `report`, newest last, at most [`HISTORY`] per cell.
-    pub fn ingest(&self, report: CellReport) {
+    /// Keep `report`, newest last, at most [`HISTORY`] per cell. False (and
+    /// nothing kept) for a new cell beyond [`MAX_CELLS`].
+    pub fn ingest(&self, report: CellReport) -> bool {
         if let Ok(mut cells) = self.cells.lock() {
+            if !cells.contains_key(&report.cell) && cells.len() >= MAX_CELLS {
+                return false;
+            }
             let list = cells.entry(report.cell.clone()).or_default();
             list.push(report);
             if list.len() > HISTORY {
                 let excess = list.len() - HISTORY;
                 list.drain(..excess);
             }
+            return true;
         }
+        false
     }
 
     /// The newest report per cell.
@@ -418,11 +429,17 @@ impl CellStore {
         }
     }
 
-    /// True the first time `tai` is seen, so the caller starts its subscription.
+    /// True the first time `tai` is seen, so the caller starts its subscription;
+    /// false beyond [`MAX_TAIS`].
     fn first_sight(&self, tai: &TaiKey) -> bool {
         self.subscribed
             .lock()
-            .map(|mut s| s.insert(tai.clone()))
+            .map(|mut s| {
+                if s.contains(tai) || s.len() >= MAX_TAIS {
+                    return false;
+                }
+                s.insert(tai.clone())
+            })
             .unwrap_or(false)
     }
 }
@@ -565,8 +582,17 @@ pub async fn ingest_report(
         report.capacity_kbps,
         report.connected_ues,
     );
-    let new_tai = store.first_sight(&report.tai).then(|| report.tai.clone());
-    store.ingest(report);
+    let tai = report.tai.clone();
+    if !store.ingest(report) {
+        MALFORMED.fetch_add(1, Ordering::Relaxed);
+        return done(nextgcore_sbi::server::send_error(
+            429,
+            "Too Many Requests",
+            &format!("this NWDAF tracks at most {MAX_CELLS} cells"),
+            None,
+        ));
+    }
+    let new_tai = store.first_sight(&tai).then_some(tai);
     INGESTED.fetch_add(1, Ordering::Relaxed);
     Ingested {
         response: SbiResponse::with_status(204),
@@ -601,7 +627,7 @@ pub fn set_amf_sub_context(ctx: AmfSubContext) {
     let _ = AMF_SUB_CTX.set(ctx);
 }
 
-/// This process's callback token: 128 random bits, hex.
+/// This process's callback token: a UUID v4, so 122 random bits, as hex.
 pub fn callback_token() -> &'static str {
     CALLBACK_TOKEN.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
 }

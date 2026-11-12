@@ -26,15 +26,16 @@ pub mod federation;
 pub mod ml_service;
 pub mod notification_dispatcher;
 pub mod nrf_collector;
-pub mod onnx_export;
-#[cfg(feature = "demo-d441a-congestion-loop")]
-pub mod ran_congestion; // nextgsim#465: USER_DATA_CONGESTION from RAN cell reports // issue #109: export the active model as an ONNX artefact
-                        // The reader is no longer gated at the module level: #109 serves an ONNX model
-                        // built by `onnx_export`, and the reader is how we prove those bytes round-trip
-                        // and reproduce our own prediction. Reading *operator-supplied* files stays the
-                        // opt-in part — the `onnx:<path>` arm of `ml_service::load_model` is still behind
-                        // the `onnx-model` feature.
+pub mod onnx_export; // issue #109: export the active model as an ONNX artefact
+                     // The reader is no longer gated at the module level: #109 serves an ONNX model
+                     // built by `onnx_export`, and the reader is how we prove those bytes round-trip
+                     // and reproduce our own prediction. Reading *operator-supplied* files stays the
+                     // opt-in part — the `onnx:<path>` arm of `ml_service::load_model` is still behind
+                     // the `onnx-model` feature.
 pub mod onnx_model; // issue #26: zero-dep ONNX LinearRegressor subset backend
+                    // nextgsim#465: USER_DATA_CONGESTION from RAN cell reports.
+#[cfg(feature = "demo-d441a-congestion-loop")]
+pub mod ran_congestion;
 mod sbi_handler;
 
 pub use context::*;
