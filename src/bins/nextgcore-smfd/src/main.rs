@@ -20883,6 +20883,12 @@ mod tests {
             // (correctly) not sent at all, so a create test that omitted it could not
             // exercise the UDM leg.
             "guami": { "plmnId": { "mcc": "001", "mnc": "01" } },
+            // nextgcore#1470: the UserLocation amfd now sends, NrLocation with both of
+            // its required members, so every create test runs with it.
+            "ueLocation": { "nrLocation": {
+                "tai": { "plmnId": { "mcc": "001", "mnc": "01" }, "tac": "000001" },
+                "ncgi": { "plmnId": { "mcc": "001", "mnc": "01" }, "nrCellId": "000000010" },
+            }},
             "n1SmMsg": { "contentId": "n1SmMsg" },
         });
         SbiRequest::post("/nsmf-pdusession/v1/sm-contexts")
@@ -25725,6 +25731,60 @@ mod tests {
         );
 
         amf.stop().await.ok();
+    }
+
+    /// nextgcore#1465/#1470: the UpdateSMContext amfd relays a UE's PDU SESSION
+    /// MODIFICATION COMPLETE in, the N1 SM container plus `ueLocation` (TS 23.502
+    /// §4.3.3.2 step 11), is accepted (204) and stops T3591.
+    #[tokio::test]
+    async fn a_relayed_modification_complete_with_its_ue_location_stops_t3591_1465() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let reference = "n1465-complete";
+        seed_binding(reference, 7);
+        arm_gsm_timer(
+            reference,
+            timer::SmfTimerId::T3591,
+            &[0x2E, 7, 0, 0xCB],
+            "imsi-001010000001465",
+            7,
+            None,
+        );
+        let mut request = SbiRequest::post(format!(
+            "/nsmf-pdusession/v1/sm-contexts/{reference}/modify"
+        ));
+        request.http.content = Some(
+            serde_json::json!({
+                "n1SmMsg": { "contentId": "n1SmMsg" },
+                "ueLocation": { "nrLocation": {
+                    "tai": { "plmnId": { "mcc": "999", "mnc": "70" }, "tac": "001465" },
+                    "ncgi": { "plmnId": { "mcc": "999", "mnc": "70" }, "nrCellId": "000014651" },
+                }},
+            })
+            .to_string(),
+        );
+        request
+            .http
+            .parts
+            .push(nextgcore_sbi::message::SbiPart::with_content(
+                "n1SmMsg",
+                nextgcore_sbi::constants::content_type::APPLICATION_5GNAS,
+                bytes::Bytes::copy_from_slice(&n1(
+                    7,
+                    0,
+                    gsm_build::message_type::PDU_SESSION_MODIFICATION_COMPLETE,
+                    &[],
+                )),
+            ));
+        let resp = handle_sm_context_update(reference, &request).await;
+        assert_eq!(resp.status, 204, "{:?}", resp.http.content);
+        assert!(
+            !gsm_procedure_timers()
+                .lock()
+                .unwrap()
+                .contains_key(reference),
+            "the COMPLETE stops T3591"
+        );
     }
 
     /// #1385 review M1: PDU SESSION MODIFICATION COMMAND REJECT stops T3591 (TS 24.501

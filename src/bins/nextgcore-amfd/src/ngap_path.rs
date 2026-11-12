@@ -20148,20 +20148,35 @@ fn build_sm_context_identity(
             ),
         })
     });
-    // TS 29.571 UserLocation: the serving NR TAI.
-    let ue_location = state.map(|s| &s.amf_ue.nr_tai).map(|tai| {
-        serde_json::json!({
-            "nrLocation": {
-                "tai": {
-                    "plmnId": {
-                        "mcc": tai.plmn_id.mcc(),
-                        "mnc": tai.plmn_id.mnc(),
+    // TS 29.571 UserLocation: `nrLocation` (NrLocation) REQUIRES both `tai` and
+    // `ncgi`, so it is sent only when the AMF knows both: the serving TAI (a PLMN
+    // learned) and the serving NR CGI (NCI 0 is the never-learned default, as in
+    // `namf_server::parse_ncgi`). One without the other would be schema-invalid
+    // (#1470 review). `nrCellId` is 9 hex digits (36 bits), as the LMF's `ncgi` is.
+    let ue_location = state
+        .map(|s| &s.amf_ue)
+        .filter(|ue| ue.nr_tai.plmn_id != PlmnId::default() && ue.nr_cgi.cell_id != 0)
+        .map(|ue| {
+            let (tai, cgi) = (&ue.nr_tai, &ue.nr_cgi);
+            serde_json::json!({
+                "nrLocation": {
+                    "tai": {
+                        "plmnId": {
+                            "mcc": tai.plmn_id.mcc(),
+                            "mnc": tai.plmn_id.mnc(),
+                        },
+                        "tac": format!("{:06x}", tai.tac),
                     },
-                    "tac": format!("{:06x}", tai.tac),
+                    "ncgi": {
+                        "plmnId": {
+                            "mcc": cgi.plmn_id.mcc(),
+                            "mnc": cgi.plmn_id.mnc(),
+                        },
+                        "nrCellId": format!("{:09X}", cgi.cell_id & 0xF_FFFF_FFFF),
+                    },
                 }
-            }
-        })
-    });
+            })
+        });
     crate::sbi_path::SmContextIdentity {
         supi: state.and_then(|s| s.amf_ue.supi.clone()),
         pei: state.and_then(|s| s.amf_ue.pei.clone()),
@@ -22179,6 +22194,43 @@ mod tests {
         assert_eq!(handle.num_gnbs().await, 0);
     }
 
+    /// **#1470 review.** The CreateSMContext body's `ueLocation` is a schema-valid
+    /// TS 29.571 UserLocation: `nrLocation` carries both of NrLocation's required
+    /// members, `tai` and `ncgi`, and is left out while the AMF has not learned the
+    /// cell or the TAI. Built through `build_sm_context_identity`, the shared builder
+    /// the 0xCC/0xCD relay (#1465) uses too.
+    ///
+    /// REVERT-VERIFIED: with `ncgi` dropped from the builder, or the both-known
+    /// filter removed, this fails.
+    #[test]
+    fn the_create_sm_context_ue_location_has_tai_and_ncgi_or_is_absent_1470() {
+        let body = |state: &UeNasContext| -> serde_json::Value {
+            let identity = build_sm_context_identity(Some(state), None);
+            let request = crate::sbi_path::build_create_sm_context_request_for_test(&identity);
+            serde_json::from_str(request.http.content.as_deref().unwrap()).unwrap()
+        };
+        let mut state = UeNasContext::new(1, 2, 3, false);
+        state.amf_ue.supi = Some("imsi-999700000001470".to_string());
+        state.amf_ue.nr_tai.plmn_id = PlmnId::new("999", "70");
+        state.amf_ue.nr_tai.tac = 1;
+        // The cell is not known yet (NCI 0): no `ueLocation` at all.
+        assert!(
+            body(&state).get("ueLocation").is_none(),
+            "TAI alone is not a NrLocation"
+        );
+        state.amf_ue.nr_cgi.plmn_id = PlmnId::new("999", "70");
+        state.amf_ue.nr_cgi.cell_id = 0x0_0000_0010;
+        let b = body(&state);
+        let nr = &b["ueLocation"]["nrLocation"];
+        assert_eq!(nr["tai"]["tac"], "000001");
+        assert_eq!(nr["tai"]["plmnId"]["mcc"], "999");
+        assert_eq!(nr["ncgi"]["nrCellId"], "000000010", "9 hex digits, 36 bits");
+        assert_eq!(nr["ncgi"]["plmnId"]["mnc"], "70");
+        // A TAI never learned (default PLMN) is not sent either.
+        state.amf_ue.nr_tai.plmn_id = PlmnId::default();
+        assert!(body(&state).get("ueLocation").is_none());
+    }
+
     /// **Issue #205.** The N11 identity is assembled FROM the UE context, so a
     /// GPSI the AMF stored at registration reaches `SmContextCreateData`.
     ///
@@ -22193,6 +22245,9 @@ mod tests {
         state.amf_ue.gpsi = Some("msisdn-491234567890".to_string());
         state.amf_ue.nr_tai.plmn_id = PlmnId::new("262", "01");
         state.amf_ue.nr_tai.tac = 1;
+        // #1470 review: NrLocation needs the cell as well as the TAI.
+        state.amf_ue.nr_cgi.plmn_id = PlmnId::new("262", "01");
+        state.amf_ue.nr_cgi.cell_id = 0x1_2345_6789;
 
         let identity = build_sm_context_identity(Some(&state), None);
         assert_eq!(identity.supi.as_deref(), Some("imsi-262011234567890"));
@@ -22205,6 +22260,10 @@ mod tests {
         assert_eq!(
             identity.ue_location.as_ref().unwrap()["nrLocation"]["tai"]["tac"].as_str(),
             Some("000001")
+        );
+        assert_eq!(
+            identity.ue_location.as_ref().unwrap()["nrLocation"]["ncgi"]["nrCellId"].as_str(),
+            Some("123456789")
         );
 
         // A UE the AMF holds no GPSI for yields none — not a SUPI-derived one.
@@ -34543,6 +34602,8 @@ mod tests {
         let mut state = UeNasContext::new(ue, 72, 1, false);
         state.amf_ue.nr_tai.plmn_id = PlmnId::new("999", "70");
         state.amf_ue.nr_tai.tac = 0x1465;
+        state.amf_ue.nr_cgi.plmn_id = PlmnId::new("999", "70");
+        state.amf_ue.nr_cgi.cell_id = 0x0_0001_4651;
         ngap.ue_auth_state.insert(ue, state);
         ngap.sm_context_refs
             .insert((ue, 5), "smctx-1465".to_string());
@@ -34579,6 +34640,15 @@ mod tests {
             assert_eq!(
                 json["ueLocation"]["nrLocation"]["tai"]["plmnId"]["mcc"],
                 "999"
+            );
+            // TS 29.571 NrLocation requires `ncgi` beside `tai` (#1470 review).
+            assert_eq!(
+                json["ueLocation"]["nrLocation"]["ncgi"]["nrCellId"], "000014651",
+                "{body}"
+            );
+            assert_eq!(
+                json["ueLocation"]["nrLocation"]["ncgi"]["plmnId"]["mnc"],
+                "70"
             );
         }
     }
