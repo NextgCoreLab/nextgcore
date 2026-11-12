@@ -81,8 +81,15 @@ d444a_no_rate_target() { [[ -f "$1" ]] && ! grep -qF 'rate target' "$1"; }  # LO
 d444a_field() {
   awk -v k="$2=" '{ for (i = 1; i <= NF; i++) if (index($i, k) == 1) { print substr($i, length(k) + 1); exit } }' <<<"$1"
 }
-# Epoch B: the second sink row after line AFTER of the merged log.   LOG AFTER
-d444a_epoch_b() { awk -v after="$2" 'NR > after && /\[demo:d444a-ambr-adapt\] epoch=[0-9]+ /' "$1" | sed -n 2p; }
+# Lines of the merged log stamped strictly after TS, by the kubelet timestamp in
+# field 1, never by line number: the merged log is re-collected between the
+# reads, and a container log that kubelet rotated in between comes back shorter,
+# so a line number from an earlier collect points past the lines it meant.
+# RFC 3339 UTC stamps compare as strings (kubelet trims trailing zeros of the
+# fraction, which can misorder two stamps less than a microsecond apart only).
+d444a_since() { awk -v t="$2" '$1 > t' "$1"; }                         # LOG TS
+# Epoch B: the second sink row stamped after TS (the UE's adapt line). LOG TS
+d444a_epoch_b() { d444a_since "$1" "$2" | awk '/\[demo:d444a-ambr-adapt\] epoch=[0-9]+ /' | sed -n 2p; }
 # Baseline accuracies, as the row prints them.
 d444a_baseline() { sed -nE "s/.* $2 acc=([0-9.]+).*/\\1/p" <<<"$1" | head -1; }
 d444a_le() { awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 <= b + 0) }'; }
@@ -149,7 +156,7 @@ d444a_main() {
   # this function has returned, and needs K, D, the pods and the originals.
   K=(kubectl -n "${NAMESPACE}") D="${OUT}/d444a" UE='' UPF='' SMF='' GNB='' PCF='' MONGO=''
   SMDATA='' ORIG_UL_VALUE='' ORIG_UL_UNIT='' RESTORED=true
-  local FAILS=() NODE s before after row line_no q0='' q1='' t
+  local FAILS=() NODE s before since row ue_ts q0='' q1='' t
   mkdir -p "${D}" "${OUT}/metrics"
   fail() { echo "FAIL: $*"; FAILS+=("$*"); }
   pass() { echo "ok:   $*"; }
@@ -233,7 +240,7 @@ d444a_main() {
   [[ "${DEMO_MODE}" == raw ]] && { d444a_no_rate_target "${D}/ue.log" && pass "raw: no rate target line" || fail "raw: a rate target line"; }
 
   # Epoch B, with the upfd qer_gate counter read at its two ends.
-  line_no="$(grep -nE "${D444A_UE_RATE_RE}|${D444A_UE_RAW_RE}" "${D}/merged.log" | head -1 | cut -d: -f1)"
+  ue_ts="$(grep -E "${D444A_UE_RATE_RE}|${D444A_UE_RAW_RE}" "${D}/merged.log" | head -1 | awk '{ print $1 }')"
   before="$(rows)"
   wait_rows "${before}" 40 || fail "no sink row after the throttle"
   q0="$(qer)" || fail "upfd /metrics scrape (qer_gate) failed at the start of epoch B"
@@ -241,7 +248,7 @@ d444a_main() {
   q1="$(qer)" || fail "upfd /metrics scrape (qer_gate) failed at the end of epoch B"
   echo "qer_gate ${q0} -> ${q1}" >"${D}/qer-gate.txt"
   grep -E "${D444A_ROW_RE}" "${D}/sink.log" >"${D}/sink-rows.txt"
-  row="$(d444a_epoch_b "${D}/merged.log" "${line_no:-0}")"
+  row="$(d444a_epoch_b "${D}/merged.log" "${ue_ts:-0}")"
   if [[ "${DEMO_MODE}" == semantic ]]; then
     s="$(d444a_semantic_row "${row}" "$(( ${q1:-0} - ${q0:-0} ))")" && pass "epoch B: ${s}" || fail "epoch B: ${s}"
   else
@@ -249,10 +256,13 @@ d444a_main() {
   fi
 
   # Restore.
-  after="$(wc -l <"${D}/merged.log")"
+  # Host clock, 2 s early for skew against the nodes' kubelet stamps: a line
+  # from just before the restore cannot satisfy the chain, which starts at the
+  # 64000 -> provisioned modification.
+  since="$(date -u -d '-2 seconds' +%Y-%m-%dT%H:%M:%S.%NZ)"
   d444a_restore && pass "UL session AMBR and sm-data restored to the originals" || fail "restore"
   sleep 20; collect
-  tail -n "+$((after + 1))" "${D}/merged.log" >"${D}/restore.log"
+  d444a_since "${D}/merged.log" "${since}" >"${D}/restore.log"
   if [[ "${DEMO_MODE}" == semantic ]]; then
     d444a_order "${D}/restore.log" 'network-requested PDU Session Modification \(AMBR UL/DL 64000/' \
       "${D444A_UE_COMPLETE_RE}" "${D444A_UE_RESTORE_RE}" >"${D}/restore-chain.txt" \

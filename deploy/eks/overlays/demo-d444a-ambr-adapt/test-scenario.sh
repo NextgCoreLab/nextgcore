@@ -49,7 +49,20 @@ breaks "raw: a rate target line fails" d444a_no_rate_target "$(put r2.log "${rat
 [[ "$(d444a_field "${rowb}" acc)" == 0.966 ]] && ok "field takes the first acc=" || not_ok "field acc"
 [[ "$(d444a_baseline "${rowb}" top-variance-raw)" == 0.832 ]] && ok "baseline top" || not_ok "baseline top"
 [[ "$(d444a_baseline "${rowb}" mean-pool)" == 0.661 ]] && ok "baseline pool" || not_ok "baseline pool"
-[[ "$(d444a_epoch_b "${full}" 5)" == "${rowb}" ]] && ok "epoch B is the second row after the UE line" || not_ok "epoch B"
+# Timestamped: the slices are by kubelet stamp, so a log whose head was rotated
+# away between two collects selects the same lines (the devtest1 failure).
+st() { local s; s="$(printf '%02d' "$1")"; printf '%s' "${2/T10:00:00./T10:00:${s}.}"; }   # SECOND LINE
+t_ue="$(st 5 "${rate}")"
+tlog="$(put t.log "$(st 1 "${smf}")" "$(st 2 "${req}")" "$(st 3 "${rsp}")" "$(st 4 "${cmp}")" "${t_ue}" \
+  "$(st 6 "${rowa}")" "$(st 7 "${rowb}")" "$(st 8 "${rowa}")")"
+tue="${t_ue%% *}"
+[[ "$(d444a_epoch_b "${tlog}" "${tue}")" == "$(st 7 "${rowb}")" ]] && ok "epoch B is the second row after the UE line" || not_ok "epoch B"
+rot="$(put rot.log "$(sed -n '4,$p' "${tlog}")")"
+[[ "$(d444a_epoch_b "${rot}" "${tue}")" == "$(st 7 "${rowb}")" ]] && ok "epoch B survives a rotated-away log head" || not_ok "epoch B rotated"
+[[ "$(d444a_since "${tlog}" "2026-11-12T10:00:06.5Z" | wc -l)" == 2 ]] && ok "since: only lines stamped after TS" || not_ok "since"
+[[ "$(d444a_since "${rot}" "2026-11-12T10:00:06.5Z")" == "$(d444a_since "${tlog}" "2026-11-12T10:00:06.5Z")" ]] \
+  && ok "since: a rotated-away head does not shift the slice" || not_ok "since rotated"
+[[ -z "$(d444a_since "${tlog}" "2026-11-12T10:00:09Z")" ]] && ok "since: nothing after the last stamp" || not_ok "since empty"
 
 holds "semantic epoch B" d444a_semantic_row "${rowb}" 0
 breaks "semantic: keep 128..40 is not epoch B" d444a_semantic_row "${rowa}" 0
