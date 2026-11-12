@@ -662,10 +662,16 @@ pub async fn run() -> Result<()> {
     // #299: subscribe to the UDR for policy-data changes, AFTER the SBI server is
     // listening. The ordering is the point: the subscription advertises this PCF's own
     // callback URI, and a UDR that notified before the route existed would post into a
-    // 404 -- the same constraint #293 hit on the SMF's SDM subscribe. Best effort: with
-    // no UDR or no NRF the PCF behaves exactly as it did before, which is the gap this
-    // closes rather than a startup failure.
-    let policy_data_subscription = sbi_path::pcf_subscribe_udr_policy_data().await;
+    // 404 -- the same constraint #293 hit on the SMF's SDM subscribe.
+    // #1458: on its own task, which retries until it succeeds and then keeps the
+    // subscription alive (expiry, UDR restart or replacement). It used to be one
+    // attempt here, lost whenever the UDR registered after the PCF looked.
+    let policy_data_maintainer = {
+        let shutdown = shutdown.clone();
+        crate::policy_data_sub::spawn(move || {
+            shutdown.load(Ordering::SeqCst) || SHUTDOWN.load(Ordering::SeqCst)
+        })
+    };
 
     log::info!("NextGCore PCF ready");
 
@@ -696,9 +702,20 @@ pub async fn run() -> Result<()> {
     // same reason as the NRF deregistration below -- a UDR still holding it would post
     // notifications at a socket that has closed, and udrd only logs a delivery failure,
     // so the subscription would linger for the life of that UDR.
-    if let Some(resource) = policy_data_subscription {
-        sbi_path::pcf_unsubscribe_udr_policy_data(&resource).await;
+    // #1458: the maintainer sees the same shutdown flags and stops within
+    // `policy_data_sub::STOP_POLL` plus the request in flight (each is bounded at 3 s,
+    // discovery included, and none is started once stopping); wait for it, so it
+    // cannot re-create the subscription after the DELETE, and so it is never aborted
+    // between the UDR creating a subscription and the PCF recording it.
+    let mut policy_data_maintainer = policy_data_maintainer;
+    if tokio::time::timeout(Duration::from_secs(8), &mut policy_data_maintainer)
+        .await
+        .is_err()
+    {
+        log::warn!("Policy-data subscription maintainer did not stop within 8 s; aborted");
+        policy_data_maintainer.abort();
     }
+    crate::policy_data_sub::unsubscribe().await;
 
     // #235: NFDeregister (TS 29.510 5.2.2.2.3) BEFORE the listener goes
     // away, so the NRF stops handing this profile to consumers instead of
