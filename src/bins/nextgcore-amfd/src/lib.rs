@@ -27,6 +27,7 @@ pub mod ngap_mcast; // MBS: NGAP multicast session procedures (TS 38.413 / TS 23
 pub mod ngap_path;
 pub mod ngap_sm;
 pub mod nrf_subscription; // #668: NF status subscriptions at the NRF (TS 29.510 §5.2.2.5)
+pub mod nwdaf_mobility; // nextgsim#464: UE Mobility analytics for paging (TS 23.501 §5.4.3.1)
 pub mod positioning; // LCS: LMF positioning relay (NRPPa N2 / LPP N1) — TS 23.273
 pub mod racs; // #570: RACS on the AMF (TS 23.501 §5.4.4.1a, TS 29.673)
 pub(crate) mod sbi_offload; // #796: SBI work off the NGAP task
@@ -241,8 +242,8 @@ struct TimeYaml {
 /// The `amf.paging` block (#1442).
 #[derive(Debug, Default, Deserialize)]
 struct PagingYaml {
-    /// `registration-area` (the default) or `recommended-first`. Any other value
-    /// fails the parse, and so startup.
+    /// `registration-area` (the default), `recommended-first` or `nwdaf-mobility`
+    /// (nextgsim#464). Any other value fails the parse, and so startup.
     strategy: Option<context::PagingStrategy>,
 }
 
@@ -1587,6 +1588,14 @@ mod tests {
         assert_eq!(
             strategy("amf:\n  paging:\n    strategy: registration-area\n"),
             Some(context::PagingStrategy::RegistrationArea)
+        );
+        assert_eq!(
+            strategy("amf:\n  paging:\n    strategy: nwdaf-mobility\n"),
+            Some(context::PagingStrategy::NwdafMobility)
+        );
+        assert_eq!(
+            context::PagingStrategy::NwdafMobility.as_str(),
+            "nwdaf-mobility"
         );
         assert_eq!(strategy("amf:\n  amf_name: x\n"), None);
         assert_eq!(

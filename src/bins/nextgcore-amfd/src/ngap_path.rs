@@ -12943,7 +12943,8 @@ impl NgapServer {
             crate::context::PagingStrategy::RecommendedFirst => {
                 recommended_paging.unwrap_or_default()
             }
-            crate::context::PagingStrategy::RegistrationArea => Vec::new(),
+            crate::context::PagingStrategy::RegistrationArea
+            | crate::context::PagingStrategy::NwdafMobility => Vec::new(),
         };
         let (amf_ue_ngap_id, ran_ue_ngap_id) = match amf_ue_ngap_id {
             Some(id) => {
@@ -19464,13 +19465,55 @@ impl NgapServer {
         } else {
             Vec::new()
         };
-        let (targets, scope) = if recommended.is_empty() {
-            (area, "serving the registration area")
-        } else {
+        // nextgsim#464, TS 23.501 §5.4.3.1: under `nwdaf-mobility` the first attempt
+        // goes to the gNB(s) that own the cell the NWDAF predicted and serve the
+        // registration area; retransmissions, and a prediction no such gNB owns,
+        // page the whole area.
+        // The NWDAF predicts the most likely NEXT cell, so attempt 1 also pages the
+        // gNB of the UE's last known cell: a UE that has not moved since it went
+        // idle is still there (TS 23.501 §5.4.3.1 makes the analytics an input to
+        // the strategy, not the whole of it).
+        let predicted = match (&paging.nwdaf_predicted, paging.retransmit_count) {
+            (Some(cell), 0) => {
+                let mut gnbs = self
+                    .cell_owner_associations(&cell.plmn_id, cell.nci, "predicted", &area)
+                    .await;
+                if let Some((plmn, nci)) = &paging.nwdaf_last_cell {
+                    for assoc in self
+                        .cell_owner_associations(plmn, *nci, "last known", &area)
+                        .await
+                    {
+                        if !gnbs.contains(&assoc) {
+                            gnbs.push(assoc);
+                        }
+                    }
+                }
+                if gnbs.is_empty() {
+                    log::info!(
+                        "NWDAF UE mobility: ue={} neither predicted=({}, 0x{:09x}) nor the \
+                         last known cell is owned by a connected gNB serving the registration \
+                         area; paging the area",
+                        paging.supi.as_deref().unwrap_or("unknown"),
+                        crate::nwdaf_mobility::plmn_label(&cell.plmn_id),
+                        cell.nci
+                    );
+                }
+                gnbs
+            }
+            _ => Vec::new(),
+        };
+        let (targets, scope) = if !recommended.is_empty() {
             (
                 recommended,
                 "recommended by the RAN in the registration area",
             )
+        } else if !predicted.is_empty() {
+            (
+                predicted,
+                "predicted by NWDAF UE mobility in the registration area",
+            )
+        } else {
+            (area, "serving the registration area")
         };
         let mut sent = 0usize;
         for assoc_id in &targets {
@@ -19489,6 +19532,41 @@ impl NgapServer {
             u32::from(paging.retransmit_count) + 1
         );
         Ok(sent)
+    }
+
+    /// The associations among `area`'s whose gNB owns the NR cell (`plmn`, `nci`)
+    /// (nextgsim#464): the same PLMN, and a Global gNB ID equal to the NCI's
+    /// leftmost gNB-ID-length bits (TS 38.413 §9.3.1.7). NG Setup carries no
+    /// served-cell list here, so this is how a cell is mapped to its gNB. `role`
+    /// names the cell in the log line.
+    async fn cell_owner_associations(
+        &self,
+        plmn: &crate::context::PlmnId,
+        nci: u64,
+        role: &str,
+        area: &[u64],
+    ) -> Vec<u64> {
+        let sessions = self.sessions.read().await;
+        let mut out: Vec<(u64, u32)> = sessions
+            .iter()
+            .filter(|(assoc, s)| {
+                area.contains(assoc)
+                    && s.gnb.ng_enb_id.is_none()
+                    && s.gnb.gnb_id_presence
+                    && s.gnb.plmn_id == *plmn
+                    && crate::nwdaf_mobility::gnb_id_of_nci(nci, s.gnb.gnb_id_len)
+                        == Some(s.gnb.gnb_id)
+            })
+            .map(|(assoc, s)| (*assoc, s.gnb.gnb_id))
+            .collect();
+        out.sort_unstable();
+        for (assoc, gnb_id) in &out {
+            log::info!(
+                "NWDAF UE mobility: {role} cell 0x{nci:09x} is served by gNB 0x{gnb_id:x} \
+                 (association {assoc})"
+            );
+        }
+        out.into_iter().map(|(assoc, _)| assoc).collect()
     }
 
     /// The associations of `recommended` (TS 38.413 §9.3.1.101) that are among
@@ -24004,6 +24082,533 @@ mod tests {
             !after.paging.ongoing,
             "abandonment clears the session's paging state"
         );
+    }
+
+    // ---- nextgsim#464: nwdaf-mobility paging (TS 23.501 §5.4.3.1, TS 23.288 §6.7.2) --
+
+    /// The registration area of the nextgsim#464 tests, a TAC no other test pages.
+    const NWDAF_TAC: u32 = 0x0464;
+
+    /// Five 22-bit gNBs on one server, association ids `base + n`:
+    /// - 1, 2 and 3 serve (001-01, [`NWDAF_TAC`]), Global gNB IDs 1, 2, 3 in 001-01;
+    /// - 4 serves another TAC;
+    /// - 5 serves the area too (it broadcasts 001-01), but its Global gNB ID is gNB 2
+    ///   in PLMN 002-02: a different node from gNB 2 of 001-01 (TS 38.413 §9.3.1.6).
+    async fn nwdaf_grid(ngap: &NgapServer, base: u64) {
+        for n in 1..=5u32 {
+            let (gnb_id, tac) = match n {
+                4 => (4, NWDAF_TAC + 1),
+                5 => (2, NWDAF_TAC),
+                _ => (n, NWDAF_TAC),
+            };
+            insert_pws_test_gnb(
+                ngap,
+                base + u64::from(n),
+                gnb_id,
+                crate::context::RatType::Nr,
+                &[("001", "01", tac)],
+            )
+            .await;
+            let mut sessions = ngap.sessions.write().await;
+            let gnb = &mut sessions.get_mut(&(base + u64::from(n))).expect("gNB").gnb;
+            gnb.gnb_id_len = 22;
+            if n == 5 {
+                gnb.plmn_id = PlmnId::new("002", "02");
+            }
+        }
+    }
+
+    /// The NR Cell Identity of cell 1 of 22-bit gNB `gnb`, as nextgsim numbers it.
+    fn nwdaf_nci(gnb: u32) -> u64 {
+        (u64::from(gnb) << 14) | 1
+    }
+
+    fn nwdaf_cell_of(gnb: u32) -> String {
+        format!("{:09X}", nwdaf_nci(gnb))
+    }
+
+    /// A registered UE in (001-01, [`NWDAF_TAC`]), 5G-TMSI = its id, last seen in
+    /// cell 1 of gNB `last_gnb` (`None`: no cell learned).
+    fn insert_nwdaf_ue(
+        ngap: &NgapServer,
+        ue: u64,
+        association_id: u64,
+        supi: Option<&str>,
+        last_gnb: Option<u32>,
+    ) {
+        let mut state = UeNasContext::new(ue, ue as u32, association_id, false);
+        state.registered = true;
+        state.amf_ue.supi = supi.map(str::to_string);
+        state.amf_ue.current_guti.amf_set_id = 0x155;
+        state.amf_ue.current_guti.amf_pointer = 0x2A;
+        state.amf_ue.current_guti.tmsi = ue as u32;
+        state.amf_ue.current_guti.plmn_id = PlmnId::new("001", "01");
+        state.amf_ue.nr_tai = crate::context::Tai5gs {
+            plmn_id: PlmnId::new("001", "01"),
+            tac: NWDAF_TAC,
+        };
+        if let Some(gnb) = last_gnb {
+            state.amf_ue.nr_cgi.plmn_id = PlmnId::new("001", "01");
+            state.amf_ue.nr_cgi.cell_id = nwdaf_nci(gnb);
+        }
+        ngap.ue_auth_state.insert(ue, state);
+    }
+
+    /// A stand-in NWDAF: answers 200 with `body`, or 204 (nwdafd without UE
+    /// mobility data) when `body` is `None`. It waits `delay` first, for every
+    /// request or, with `delay_only_for`, only for one naming that SUPI. Each
+    /// request is recorded with its decoded query parameters.
+    async fn nwdaf_standin(
+        body: Option<serde_json::Value>,
+        delay: Duration,
+        delay_only_for: Option<&'static str>,
+    ) -> (
+        nextgcore_sbi::server::SbiServer,
+        u16,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+        // A plaintext loopback peer is a dev-profile deployment (the
+        // `set_sbi_profile_override` contract; benign for parallel tests).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let sink = Arc::clone(&seen);
+        let (server, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SReq| {
+                let sink = Arc::clone(&sink);
+                let body = body.clone();
+                async move {
+                    let param = |k: &str| req.http.params.get(k).cloned().unwrap_or_default();
+                    let tgt_ue = param("tgt-ue");
+                    sink.lock().expect("sink").push(format!(
+                        "{} event-id={} tgt-ue={} ana-req={}",
+                        req.header.uri,
+                        param("event-id"),
+                        tgt_ue,
+                        param("ana-req")
+                    ));
+                    if delay_only_for.is_none_or(|supi| tgt_ue.contains(supi)) {
+                        tokio::time::sleep(delay).await;
+                    }
+                    match body {
+                        Some(b) => SResp::with_status(200)
+                            .with_json_body(&b)
+                            .expect("json body"),
+                        None => SResp::no_content(),
+                    }
+                }
+            })
+            .await;
+        (server, addr.port(), seen)
+    }
+
+    /// nwdafd's prediction body (`amf_mobility::ue_mobility_infos`) naming `nci`.
+    fn nwdafd_predicts(nci: &str) -> serde_json::Value {
+        serde_json::json!({
+            "ueMobs": [{
+                "ts": "2026-11-12T10:00:00Z",
+                "duration": 30,
+                "locInfos": [{
+                    "loc": { "nrLocation": {
+                        "tai": { "plmnId": { "mcc": "001", "mnc": "01" }, "tac": "000464" },
+                        "ncgi": { "plmnId": { "mcc": "001", "mnc": "01" }, "nrCellId": nci }
+                    }},
+                    "confidence": 67
+                }]
+            }],
+            "start": "2026-11-12T10:00:00Z",
+            "expiry": "2026-11-12T10:00:30Z",
+            "timeStampGen": "2026-11-12T10:00:00Z"
+        })
+    }
+
+    /// Points the NWDAF resolver at a stand-in for one test, and back on drop.
+    struct NwdafEndpointOverride;
+
+    impl NwdafEndpointOverride {
+        fn set(port: u16) -> Self {
+            crate::nwdaf_mobility::set_nwdaf_endpoint_for_test(Some((
+                "127.0.0.1".to_string(),
+                port,
+            )));
+            Self
+        }
+    }
+
+    impl Drop for NwdafEndpointOverride {
+        fn drop(&mut self) {
+            crate::nwdaf_mobility::set_nwdaf_endpoint_for_test(None);
+        }
+    }
+
+    /// Wait (bounded) until UE `ue`'s queued page no longer waits for the NWDAF.
+    async fn nwdaf_answer_applied(ue: u64) -> bool {
+        nextgcore_sbi::test_support::poll_until(
+            Duration::from_secs(10),
+            Duration::from_millis(5),
+            || async move {
+                crate::context::amf_self()
+                    .read()
+                    .unwrap()
+                    .paging_find(ue)
+                    .filter(|p| p.nwdaf_wait_until.is_none())
+                    .map(|_| ())
+            },
+        )
+        .await
+        .is_some()
+    }
+
+    fn sorted(mut v: Vec<u64>) -> Vec<u64> {
+        v.sort_unstable();
+        v
+    }
+
+    /// **nextgsim#464**, TS 23.501 §5.4.3.1, through the production N1N2 builder and
+    /// the T3513 pump. The AMF asks the NWDAF for a UE_MOBILITY prediction for the
+    /// paged SUPI. Attempt 1 goes to the gNB that owns the predicted cell (2), then
+    /// the gNB of the UE's last known cell (1). The retransmission goes to the whole
+    /// registration area. gNB 4 (another TAC) is never paged. gNB 5 carries the same
+    /// 22-bit gNB ID 2 in another PLMN and serves the area: the prediction does not
+    /// name it, so attempt 1 skips it, and the retransmission pages it.
+    #[tokio::test]
+    async fn nwdaf_mobility_pages_the_predicted_gnb_then_widens_to_the_area() {
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::NwdafMobility);
+        let (_nwdaf, port, seen) = nwdaf_standin(
+            Some(nwdafd_predicts(&nwdaf_cell_of(2))),
+            Duration::ZERO,
+            None,
+        )
+        .await;
+        let _ep = NwdafEndpointOverride::set(port);
+        let mut ngap = capturing_ngap_server().await;
+        let base = 4_640u64;
+        nwdaf_grid(&ngap, base).await;
+        let ue = 464_001u64;
+        insert_nwdaf_ue(&ngap, ue, base + 1, Some("imsi-001010000464001"), Some(1));
+        let predicted_before =
+            crate::nwdaf_mobility::outcome_count(crate::nwdaf_mobility::HintOutcome::Predicted);
+
+        queue_paging(&ngap, ue);
+        assert!(
+            nwdaf_answer_applied(ue).await,
+            "the NWDAF answer reaches the page"
+        );
+        let uris = seen.lock().unwrap().clone();
+        assert_eq!(uris.len(), 1, "{uris:?}");
+        assert!(
+            uris[0].starts_with("/nnwdaf-analyticsinfo/v1/analytics event-id=UE_MOBILITY "),
+            "{uris:?}"
+        );
+        assert!(
+            uris[0].contains(r#"tgt-ue={"supis":["imsi-001010000464001"]}"#),
+            "{uris:?}"
+        );
+        assert!(
+            uris[0].contains(r#"ana-req={"startTs":"#) && uris[0].contains(r#""endTs":"#),
+            "a future window, so a prediction: {uris:?}"
+        );
+        assert!(
+            crate::nwdaf_mobility::outcome_count(crate::nwdaf_mobility::HintOutcome::Predicted)
+                > predicted_before,
+            "counted as predicted"
+        );
+
+        take_sent_ngap(&mut ngap);
+        ngap.process_paging_with(Duration::from_secs(3600)).await;
+        assert_eq!(
+            paged_on(&take_sent_ngap(&mut ngap), ue as u32),
+            vec![base + 2, base + 1],
+            "attempt 1: the predicted cell's gNB, then the last known cell's; not gNB 5 \
+             (same gNB ID, other PLMN)"
+        );
+
+        ngap.process_paging_with(Duration::ZERO).await;
+        assert_eq!(
+            sorted(paged_on(&take_sent_ngap(&mut ngap), ue as u32)),
+            vec![base + 1, base + 2, base + 3, base + 5],
+            "the T3513 retransmission widens to every gNB serving the registration area"
+        );
+        crate::context::amf_self().read().unwrap().paging_remove(ue);
+    }
+
+    /// **nextgsim#464**, review M3: nwdafd predicts the most likely NEXT cell, never
+    /// the current one. A UE that went idle under gNB 1 and stayed there must still
+    /// be reached on attempt 1. Its page goes to the predicted gNB 3 and to gNB 1,
+    /// and not to gNB 2. When the prediction is the last known cell, its gNB is
+    /// paged once.
+    #[tokio::test]
+    async fn a_stationary_ue_is_paged_at_its_own_gnb_on_the_first_attempt() {
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::NwdafMobility);
+        let mut ngap = capturing_ngap_server().await;
+        let base = 4_680u64;
+        nwdaf_grid(&ngap, base).await;
+        for (i, (predicted, expect)) in [(3u32, vec![base + 3, base + 1]), (1, vec![base + 1])]
+            .into_iter()
+            .enumerate()
+        {
+            let (_nwdaf, port, _) = nwdaf_standin(
+                Some(nwdafd_predicts(&nwdaf_cell_of(predicted))),
+                Duration::ZERO,
+                None,
+            )
+            .await;
+            let _ep = NwdafEndpointOverride::set(port);
+            let ue = 464_041u64 + i as u64;
+            insert_nwdaf_ue(
+                &ngap,
+                ue,
+                base + 1,
+                Some(&format!("imsi-00101000046404{i}")),
+                Some(1),
+            );
+            queue_paging(&ngap, ue);
+            assert!(nwdaf_answer_applied(ue).await, "released");
+            take_sent_ngap(&mut ngap);
+            ngap.process_paging_with(Duration::from_secs(3600)).await;
+            assert_eq!(
+                paged_on(&take_sent_ngap(&mut ngap), ue as u32),
+                expect,
+                "predicted gNB {predicted}: attempt 1 reaches the UE's own gNB 1"
+            );
+            crate::context::amf_self().read().unwrap().paging_remove(ue);
+        }
+    }
+
+    /// **nextgsim#464** fail-open: an NWDAF slower than the deadline holds only its
+    /// own UE's first PAGING. A second UE with a SUPI, whose own query the same
+    /// NWDAF answers at once, is paged while the first is still held. The held page
+    /// goes to the whole registration area once the deadline passes, long before
+    /// the NWDAF would have answered.
+    #[tokio::test]
+    async fn a_slow_nwdaf_delays_no_other_page_and_its_own_only_until_the_deadline() {
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::NwdafMobility);
+        let (_nwdaf, port, seen) = nwdaf_standin(
+            Some(nwdafd_predicts(&nwdaf_cell_of(2))),
+            Duration::from_secs(5),
+            Some("imsi-001010000464011"),
+        )
+        .await;
+        let _ep = NwdafEndpointOverride::set(port);
+        let mut ngap = capturing_ngap_server().await;
+        let base = 4_650u64;
+        nwdaf_grid(&ngap, base).await;
+        let slow = 464_011u64;
+        let fast = 464_012u64;
+        insert_nwdaf_ue(&ngap, slow, base + 1, Some("imsi-001010000464011"), Some(1));
+        insert_nwdaf_ue(&ngap, fast, base + 3, Some("imsi-001010000464012"), Some(3));
+
+        let started = Instant::now();
+        queue_paging(&ngap, slow);
+        queue_paging(&ngap, fast);
+        assert!(
+            nwdaf_answer_applied(fast).await,
+            "the fast UE's answer lands"
+        );
+        take_sent_ngap(&mut ngap);
+        ngap.process_paging_with(Duration::from_secs(3600)).await;
+        let first = take_sent_ngap(&mut ngap);
+        assert_eq!(
+            paged_on(&first, fast as u32),
+            vec![base + 2, base + 3],
+            "the fast UE is paged (predicted gNB 2, last known gNB 3) while the slow one waits"
+        );
+        assert!(
+            paged_on(&first, slow as u32).is_empty(),
+            "the slow UE's first PAGING waits for the NWDAF"
+        );
+        let timeouts_before =
+            crate::nwdaf_mobility::outcome_count(crate::nwdaf_mobility::HintOutcome::Timeout);
+
+        let mut slow_paged = Vec::new();
+        while slow_paged.is_empty() && started.elapsed() < Duration::from_secs(4) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ngap.process_paging_with(Duration::from_secs(3600)).await;
+            slow_paged = paged_on(&take_sent_ngap(&mut ngap), slow as u32);
+        }
+        let waited = started.elapsed();
+        assert_eq!(
+            sorted(slow_paged),
+            vec![base + 1, base + 2, base + 3, base + 5],
+            "at the deadline the page goes to the whole registration area"
+        );
+        assert!(
+            waited >= crate::nwdaf_mobility::HINT_TIMEOUT && waited < Duration::from_secs(4),
+            "paged after the {:?} deadline and before the NWDAF's 5 s answer: {waited:?}",
+            crate::nwdaf_mobility::HINT_TIMEOUT
+        );
+        assert_eq!(seen.lock().unwrap().len(), 2, "both UEs were asked about");
+        let timed_out = nextgcore_sbi::test_support::poll_until(
+            Duration::from_secs(4),
+            Duration::from_millis(10),
+            || async move {
+                (crate::nwdaf_mobility::outcome_count(crate::nwdaf_mobility::HintOutcome::Timeout)
+                    > timeouts_before)
+                    .then_some(())
+            },
+        )
+        .await;
+        assert!(
+            timed_out.is_some(),
+            "the slow query is counted as a timeout"
+        );
+        let ctx = crate::context::amf_self();
+        ctx.read().unwrap().paging_remove(slow);
+        ctx.read().unwrap().paging_remove(fast);
+    }
+
+    /// **nextgsim#464**: each of these pages the whole area on attempt 1:
+    /// - an NWDAF with no UE mobility data (204: the default nwdafd, and the demo's
+    ///   revert arm);
+    /// - an unreachable NWDAF;
+    /// - for a UE with no known cell, a prediction naming a gNB outside the area.
+    #[tokio::test]
+    async fn no_usable_prediction_pages_the_area_on_the_first_attempt() {
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::NwdafMobility);
+        let mut ngap = capturing_ngap_server().await;
+        let base = 4_660u64;
+        nwdaf_grid(&ngap, base).await;
+        let down = nextgcore_sbi::test_support::down_port();
+        let (_no_data, no_data_port, _) = nwdaf_standin(None, Duration::ZERO, None).await;
+        let (_outside, outside_port, _) = nwdaf_standin(
+            Some(nwdafd_predicts(&nwdaf_cell_of(4))),
+            Duration::ZERO,
+            None,
+        )
+        .await;
+        let arms = [
+            ("204", no_data_port, Some(1)),
+            ("refused", down.port(), Some(1)),
+            ("outside the area", outside_port, None),
+        ];
+        for (i, (arm, port, last_gnb)) in arms.into_iter().enumerate() {
+            let _ep = NwdafEndpointOverride::set(port);
+            let ue = 464_021u64 + i as u64;
+            insert_nwdaf_ue(
+                &ngap,
+                ue,
+                base + 1,
+                Some(&format!("imsi-00101000046402{i}")),
+                last_gnb,
+            );
+            queue_paging(&ngap, ue);
+            assert!(nwdaf_answer_applied(ue).await, "{arm}: released");
+            take_sent_ngap(&mut ngap);
+            ngap.process_paging_with(Duration::from_secs(3600)).await;
+            assert_eq!(
+                sorted(paged_on(&take_sent_ngap(&mut ngap), ue as u32)),
+                vec![base + 1, base + 2, base + 3, base + 5],
+                "{arm}: attempt 1 goes to the whole registration area"
+            );
+            crate::context::amf_self().read().unwrap().paging_remove(ue);
+        }
+    }
+
+    /// **nextgsim#464**, review M2: with every query permit taken, the page is
+    /// released at once, not after the deadline. Its first pump pass pages the area.
+    #[tokio::test]
+    async fn a_full_query_cap_releases_the_page_at_once() {
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::NwdafMobility);
+        let (_nwdaf, port, seen) = nwdaf_standin(
+            Some(nwdafd_predicts(&nwdaf_cell_of(2))),
+            Duration::ZERO,
+            None,
+        )
+        .await;
+        let _ep = NwdafEndpointOverride::set(port);
+        let mut ngap = capturing_ngap_server().await;
+        let base = 4_690u64;
+        nwdaf_grid(&ngap, base).await;
+        let ue = 464_051u64;
+        insert_nwdaf_ue(&ngap, ue, base + 1, Some("imsi-001010000464051"), Some(1));
+        let cap_full_before =
+            crate::nwdaf_mobility::outcome_count(crate::nwdaf_mobility::HintOutcome::CapFull);
+
+        let permits = crate::nwdaf_mobility::in_flight_for_test()
+            .acquire_many_owned(crate::nwdaf_mobility::MAX_IN_FLIGHT as u32)
+            .await
+            .expect("every permit");
+        queue_paging(&ngap, ue);
+        let queued = crate::context::amf_self()
+            .read()
+            .unwrap()
+            .paging_find(ue)
+            .expect("queued");
+        assert!(
+            queued.nwdaf_wait_until.is_none(),
+            "released at once, without waiting for the deadline"
+        );
+        take_sent_ngap(&mut ngap);
+        ngap.process_paging_with(Duration::from_secs(3600)).await;
+        assert_eq!(
+            sorted(paged_on(&take_sent_ngap(&mut ngap), ue as u32)),
+            vec![base + 1, base + 2, base + 3, base + 5],
+            "the first pass pages the whole area"
+        );
+        drop(permits);
+        assert!(seen.lock().unwrap().is_empty(), "no query was started");
+        assert_eq!(
+            crate::nwdaf_mobility::outcome_count(crate::nwdaf_mobility::HintOutcome::CapFull),
+            cap_full_before + 1
+        );
+        crate::context::amf_self().read().unwrap().paging_remove(ue);
+    }
+
+    /// **nextgsim#464** demo-off: the default strategy queues no wait, sends no
+    /// NWDAF request, renders no hint counter, and pages the area on the first
+    /// pass, as before the feature.
+    #[tokio::test]
+    async fn the_default_strategy_makes_no_nwdaf_request() {
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::default());
+        let (_nwdaf, port, seen) = nwdaf_standin(
+            Some(nwdafd_predicts(&nwdaf_cell_of(2))),
+            Duration::ZERO,
+            None,
+        )
+        .await;
+        let _ep = NwdafEndpointOverride::set(port);
+        let mut ngap = capturing_ngap_server().await;
+        let base = 4_670u64;
+        nwdaf_grid(&ngap, base).await;
+        let ue = 464_031u64;
+        insert_nwdaf_ue(&ngap, ue, base + 1, Some("imsi-001010000464031"), Some(1));
+
+        queue_paging(&ngap, ue);
+        let queued = crate::context::amf_self()
+            .read()
+            .unwrap()
+            .paging_find(ue)
+            .expect("queued");
+        assert!(
+            queued.nwdaf_wait_until.is_none()
+                && queued.nwdaf_predicted.is_none()
+                && queued.nwdaf_last_cell.is_none()
+        );
+        take_sent_ngap(&mut ngap);
+        ngap.process_paging_with(Duration::from_secs(3600)).await;
+        assert_eq!(
+            sorted(paged_on(&take_sent_ngap(&mut ngap), ue as u32)),
+            vec![base + 1, base + 2, base + 3, base + 5]
+        );
+        let mut metrics = String::new();
+        crate::nwdaf_mobility::render_metrics(&mut metrics);
+        assert!(metrics.is_empty(), "no hint counter by default: {metrics}");
+        // An absence: give a (wrongly) spawned query time to land before checking.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(seen.lock().unwrap().is_empty(), "no NWDAF request");
+        crate::context::amf_self().read().unwrap().paging_remove(ue);
     }
 
     // ---- #1442: recommended-first paging (TS 38.413 §8.3.3.2, TS 23.502 §4.2.3.3) --
