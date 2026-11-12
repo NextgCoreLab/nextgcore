@@ -10258,8 +10258,9 @@ impl NgapServer {
             }
             // PDU Session Modification Complete (0xCC) and PDU Session Modification
             // Command Reject (0xCD), TS 24.501 Table 9.7.2. #1465: relayed to the SMF
-            // (TS 23.502 §4.3.3.2 step 7, Nsmf_PDUSession_UpdateSMContext with the N1 SM
-            // container), which stops T3591 (TS 24.501 §6.3.2.3 / §6.3.2.4). Before, the
+            // (TS 23.502 §4.3.3.2 step 11, 23502-k20.txt:13502-13505:
+            // Nsmf_PDUSession_UpdateSMContext with the N1 SM container and the User
+            // Location Information), which stops T3591 (TS 24.501 §6.3.2.3 / §6.3.2.4). Before, the
             // arm matched only 0xCD under the COMPLETE's label and logged it, so neither
             // reached the SMF and T3591 retransmitted every network-requested
             // modification to exhaustion.
@@ -10274,14 +10275,22 @@ impl NgapServer {
                     Some(sm_context_ref) => {
                         // #922: relayed off the NGAP task, keyed on the session.
                         let n1 = sm_pdu.to_vec();
+                        // The UE's serving TAI as TS 29.571 UserLocation, built as for
+                        // the CreateSMContext.
+                        let ue_location = build_sm_context_identity(
+                            self.ue_auth_state.get(amf_ue_ngap_id).as_ref(),
+                            None,
+                        )
+                        .ue_location;
                         self.sbi_offload
                             .spawn_keyed((amf_ue_ngap_id, psi), move || async move {
                                 let (host, port) = smf_or_selected(owner).await;
-                                if let Err(e) = crate::sbi_path::call_smf_update_sm_context_n1_only(
+                                if let Err(e) = crate::sbi_path::call_smf_update_sm_context_n1_at(
                                     &host,
                                     port,
                                     &sm_context_ref,
                                     &n1,
+                                    ue_location,
                                 )
                                 .await
                                 {
@@ -34518,7 +34527,8 @@ mod tests {
     /// **#1465.** The UE's PDU SESSION MODIFICATION COMPLETE (0xCC) and PDU SESSION
     /// MODIFICATION COMMAND REJECT (0xCD), TS 24.501 Table 9.7.2, reach the SMF holding
     /// the session as an Nsmf_PDUSession_UpdateSMContext carrying the N1 SM container
-    /// byte for byte (TS 23.502 §4.3.3.2 step 7), so it stops T3591. Before, 0xCC was
+    /// byte for byte and the User Location Information (TS 23.502 §4.3.3.2 step 11,
+    /// 23502-k20.txt:13502-13505), so it stops T3591. Before, 0xCC was
     /// "Unhandled" and 0xCD only logged: T3591 retransmitted every network-requested
     /// modification. A session the AMF no longer knows sends nothing.
     ///
@@ -34529,6 +34539,11 @@ mod tests {
         let (_smf, port, seen) = n1_recording_smf_1465().await;
         let mut ngap = test_ngap_server().await;
         let ue = 7_146_501u64;
+        // The UE's serving TAI, which step 11's User Location Information carries.
+        let mut state = UeNasContext::new(ue, 72, 1, false);
+        state.amf_ue.nr_tai.plmn_id = PlmnId::new("999", "70");
+        state.amf_ue.nr_tai.tac = 0x1465;
+        ngap.ue_auth_state.insert(ue, state);
         ngap.sm_context_refs
             .insert((ue, 5), "smctx-1465".to_string());
         ngap.sm_context_smfs
@@ -34556,6 +34571,15 @@ mod tests {
             assert_eq!(uri, "/nsmf-pdusession/v1/sm-contexts/smctx-1465/modify");
             assert!(body.contains("n1SmMsg"), "{body}");
             assert_eq!(n1.as_slice(), want, "the N1 SM container, byte for byte");
+            let json: serde_json::Value = serde_json::from_str(body).expect("JSON body");
+            assert_eq!(
+                json["ueLocation"]["nrLocation"]["tai"]["tac"], "001465",
+                "with the User Location Information (step 11): {body}"
+            );
+            assert_eq!(
+                json["ueLocation"]["nrLocation"]["tai"]["plmnId"]["mcc"],
+                "999"
+            );
         }
     }
 
