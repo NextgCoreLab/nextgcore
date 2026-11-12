@@ -49,6 +49,7 @@ D444A_GNB_MODRSP_RE='PDU Session Resource Modify Response sent to AMF'
 D444A_UE_COMPLETE_RE='Sending PDU Session Modification Complete: PSI=1, PTI=0'
 D444A_UE_RATE_RE='\[demo:d444a-ambr-adapt\] rate target 51200 bps from session-AMBR \(PSI 1\), keep 128->40'
 D444A_UE_RAW_RE='\[demo:d444a-ambr-adapt\] session-AMBR \(PSI 1\) UL 64000 bps not followed: mode raw'
+D444A_SMF_RESTORE_RE='network-requested PDU Session Modification \(AMBR UL/DL 64000/'
 D444A_UE_RESTORE_RE='\[demo:d444a-ambr-adapt\] rate target [0-9]+ bps from session-AMBR \(PSI 1\), keep 40->128'
 D444A_ROW_RE='\[demo:d444a-ambr-adapt\] epoch=[0-9]+ '
 
@@ -74,6 +75,16 @@ d444a_chain() {                                                         # LOG MO
   d444a_order "$1" "${D444A_SMF_THROTTLE_RE}" "${D444A_GNB_MODREQ_RE}" \
     "${D444A_GNB_MODRSP_RE}" "${D444A_UE_COMPLETE_RE}" "${adapt}"
 }
+# The restore chain over the slice after the restore. It anchors on the
+# 64000 -> provisioned modification, which smfd logs only on the restore, so
+# lines from before it cannot satisfy it.
+d444a_restore_chain() {                                                 # LOG MODE
+  if [[ "$2" == semantic ]]; then
+    d444a_order "$1" "${D444A_SMF_RESTORE_RE}" "${D444A_UE_COMPLETE_RE}" "${D444A_UE_RESTORE_RE}"
+  else
+    d444a_order "$1" "${D444A_SMF_RESTORE_RE}" "${D444A_UE_COMPLETE_RE}"
+  fi
+}
 d444a_no_rate_target() { [[ -f "$1" ]] && ! grep -qF 'rate target' "$1"; }  # LOG
 
 # The FIRST `key=value` token of a sink row; empty when absent. First, because
@@ -85,9 +96,11 @@ d444a_field() {
 # field 1, never by line number: the merged log is re-collected between the
 # reads, and a container log that kubelet rotated in between comes back shorter,
 # so a line number from an earlier collect points past the lines it meant.
-# RFC 3339 UTC stamps compare as strings (kubelet trims trailing zeros of the
-# fraction, which can misorder two stamps less than a microsecond apart only).
-d444a_since() { awk -v t="$2" '$1 > t' "$1"; }                         # LOG TS
+# RFC 3339 UTC stamps compare as strings. Kubelet trims trailing zeros of the
+# fraction, so two stamps that differ only within the trimmed digits can
+# misorder (a whole-second `...:05Z` sorts after `...:05.9Z`). An empty TS
+# FAILS rather than select every line.
+d444a_since() { [[ -n "$2" ]] || return 1; awk -v t="$2" '$1 > t' "$1"; }   # LOG TS
 # Epoch B: the second sink row stamped after TS (the UE's adapt line). LOG TS
 d444a_epoch_b() { d444a_since "$1" "$2" | awk '/\[demo:d444a-ambr-adapt\] epoch=[0-9]+ /' | sed -n 2p; }
 # Baseline accuracies, as the row prints them.
@@ -248,7 +261,12 @@ d444a_main() {
   q1="$(qer)" || fail "upfd /metrics scrape (qer_gate) failed at the end of epoch B"
   echo "qer_gate ${q0} -> ${q1}" >"${D}/qer-gate.txt"
   grep -E "${D444A_ROW_RE}" "${D}/sink.log" >"${D}/sink-rows.txt"
-  row="$(d444a_epoch_b "${D}/merged.log" "${ue_ts:-0}")"
+  row=''
+  if [[ -n "${ue_ts}" ]]; then
+    row="$(d444a_epoch_b "${D}/merged.log" "${ue_ts}")"
+  else
+    fail "no UE adapt line stamp in the merged log: epoch B cannot be placed"
+  fi
   if [[ "${DEMO_MODE}" == semantic ]]; then
     s="$(d444a_semantic_row "${row}" "$(( ${q1:-0} - ${q0:-0} ))")" && pass "epoch B: ${s}" || fail "epoch B: ${s}"
   else
@@ -259,19 +277,15 @@ d444a_main() {
   # Host clock, 2 s early for skew against the nodes' kubelet stamps: a line
   # from just before the restore cannot satisfy the chain, which starts at the
   # 64000 -> provisioned modification.
-  since="$(date -u -d '-2 seconds' +%Y-%m-%dT%H:%M:%S.%NZ)"
+  since="$(date -u -d '-2 seconds' +%Y-%m-%dT%H:%M:%S.%NZ 2>/dev/null)" || since=''
+  [[ "${since}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{9}Z$ ]] \
+    || { fail "no host stamp for the restore slice (date gave '${since}'; GNU date needed)"; since=''; }
   d444a_restore && pass "UL session AMBR and sm-data restored to the originals" || fail "restore"
   sleep 20; collect
-  d444a_since "${D}/merged.log" "${since}" >"${D}/restore.log"
-  if [[ "${DEMO_MODE}" == semantic ]]; then
-    d444a_order "${D}/restore.log" 'network-requested PDU Session Modification \(AMBR UL/DL 64000/' \
-      "${D444A_UE_COMPLETE_RE}" "${D444A_UE_RESTORE_RE}" >"${D}/restore-chain.txt" \
-      && pass "restore chain" || fail "restore chain: $(tail -1 "${D}/restore-chain.txt")"
-  else
-    d444a_order "${D}/restore.log" 'network-requested PDU Session Modification \(AMBR UL/DL 64000/' \
-      "${D444A_UE_COMPLETE_RE}" >"${D}/restore-chain.txt" \
-      && pass "restore chain" || fail "restore chain: $(tail -1 "${D}/restore-chain.txt")"
-  fi
+  # An empty since (failed above) leaves restore.log empty, so the chain fails too.
+  d444a_since "${D}/merged.log" "${since}" >"${D}/restore.log" || : >"${D}/restore.log"
+  d444a_restore_chain "${D}/restore.log" "${DEMO_MODE}" >"${D}/restore-chain.txt" \
+    && pass "restore chain" || fail "restore chain: $(tail -1 "${D}/restore-chain.txt")"
 
   if [[ ${#FAILS[@]} -eq 0 ]]; then echo "d444a scenario: PASS"; return 0; fi
   echo "d444a scenario: FAIL (${#FAILS[@]})"; return 1

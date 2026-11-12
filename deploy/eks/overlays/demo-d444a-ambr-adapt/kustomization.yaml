@@ -13,8 +13,9 @@
 #   - appends semantic_comm_enabled and the semantic_stream block to the UE's
 #     resolved config (patches/ue-d444a-config.yaml);
 #   - adds the demo block to ue.yaml and sink.yaml through the toggles;
-#   - quietens the UE's per-packet log targets (patches/ue-log-level.yaml), so
-#     its log is not rotated away under the 50 Hz stream before it is captured.
+#   - quietens the UE's and the gNB's per-packet log targets
+#     (patches/ue-log-level.yaml, patches/gnb-log-level.yaml), so their logs are
+#     not rotated away under the 50 Hz stream before they are captured.
 #
 # The UE image is the demo build (build-images.sh): nr-ue with
 # `6g,demo-d444a-ambr-adapt`, plus nr-cli and semantic-sink. It is pushed under a
@@ -52,3 +53,7 @@ patches:
     target:
       kind: Deployment
       name: ue
+  - path: patches/gnb-log-level.yaml
+    target:
+      kind: Deployment
+      name: gnb

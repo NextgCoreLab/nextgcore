@@ -50,19 +50,43 @@ breaks "raw: a rate target line fails" d444a_no_rate_target "$(put r2.log "${rat
 [[ "$(d444a_baseline "${rowb}" top-variance-raw)" == 0.832 ]] && ok "baseline top" || not_ok "baseline top"
 [[ "$(d444a_baseline "${rowb}" mean-pool)" == 0.661 ]] && ok "baseline pool" || not_ok "baseline pool"
 # Timestamped: the slices are by kubelet stamp, so a log whose head was rotated
-# away between two collects selects the same lines (the devtest1 failure).
+# away between two collects selects the same lines (the devtest1 failure). The
+# epoch-A rows (keep 128, before the throttle) are what tell "after the UE
+# line" from "after some line number": without them every slice agrees.
 st() { local s; s="$(printf '%02d' "$1")"; printf '%s' "${2/T10:00:00./T10:00:${s}.}"; }   # SECOND LINE
-t_ue="$(st 5 "${rate}")"
-tlog="$(put t.log "$(st 1 "${smf}")" "$(st 2 "${req}")" "$(st 3 "${rsp}")" "$(st 4 "${cmp}")" "${t_ue}" \
-  "$(st 6 "${rowa}")" "$(st 7 "${rowb}")" "$(st 8 "${rowa}")")"
+row5="${rowa/epoch=7/epoch=5}"; row5="${row5/keep=128..40/keep=128}"
+row6="${row5/epoch=5/epoch=6}"
+t_ue="$(st 7 "${rate}")"
 tue="${t_ue%% *}"
-[[ "$(d444a_epoch_b "${tlog}" "${tue}")" == "$(st 7 "${rowb}")" ]] && ok "epoch B is the second row after the UE line" || not_ok "epoch B"
-rot="$(put rot.log "$(sed -n '4,$p' "${tlog}")")"
-[[ "$(d444a_epoch_b "${rot}" "${tue}")" == "$(st 7 "${rowb}")" ]] && ok "epoch B survives a rotated-away log head" || not_ok "epoch B rotated"
-[[ "$(d444a_since "${tlog}" "2026-11-12T10:00:06.5Z" | wc -l)" == 2 ]] && ok "since: only lines stamped after TS" || not_ok "since"
-[[ "$(d444a_since "${rot}" "2026-11-12T10:00:06.5Z")" == "$(d444a_since "${tlog}" "2026-11-12T10:00:06.5Z")" ]] \
+tlog="$(put t.log "$(st 1 "${row5}")" "$(st 2 "${smf}")" "$(st 3 "${req}")" "$(st 4 "${row6}")" \
+  "$(st 5 "${rsp}")" "$(st 6 "${cmp}")" "${t_ue}" "$(st 8 "${rowa}")" "$(st 9 "${rowb}")" "$(st 10 "${rowa}")")"
+rot="$(put rot.log "$(sed -n '2,$p' "${tlog}")")"   # the epoch=5 row rotated away
+[[ "$(d444a_epoch_b "${tlog}" "${tue}")" == "$(st 9 "${rowb}")" ]] && ok "epoch B is the second row after the UE line" || not_ok "epoch B"
+[[ "$(d444a_epoch_b "${rot}" "${tue}")" == "$(st 9 "${rowb}")" ]] && ok "epoch B survives a rotated-away log head" || not_ok "epoch B rotated"
+[[ -z "$(d444a_epoch_b "${tlog}" "")" ]] && ok "epoch B: no UE stamp selects nothing" || not_ok "epoch B empty stamp"
+[[ "$(d444a_since "${tlog}" "2026-11-12T10:00:08.5Z" | wc -l)" == 2 ]] && ok "since: only lines stamped after TS" || not_ok "since"
+[[ "$(d444a_since "${rot}" "2026-11-12T10:00:03.5Z")" == "$(d444a_since "${tlog}" "2026-11-12T10:00:03.5Z")" ]] \
   && ok "since: a rotated-away head does not shift the slice" || not_ok "since rotated"
-[[ -z "$(d444a_since "${tlog}" "2026-11-12T10:00:09Z")" ]] && ok "since: nothing after the last stamp" || not_ok "since empty"
+[[ -z "$(d444a_since "${tlog}" "2026-11-12T10:00:11Z")" ]] && ok "since: nothing after the last stamp" || not_ok "since empty"
+breaks "since: an empty TS fails (never selects every line)" d444a_since "${tlog}" ""
+
+# The restore chain over a since-slice, end to end: the throttle part of the log
+# is before the stamp, the restore after it, and the head is rotated away.
+rsmf="${ts} [INFO] ref=1: network-requested PDU Session Modification (AMBR UL/DL 64000/1000000000 -> 1000000000/1000000000 bps, 5QI 9 -> 9, ARP PL 8 -> 8)"
+rrate="${ts}  INFO nextgsim_ue: [demo:d444a-ambr-adapt] rate target 800000000 bps from session-AMBR (PSI 1), keep 40->128 (UL Session-AMBR 1000000000 bps, 50 Hz, 300 B per datagram)"
+rlog="$(put rl.log "$(st 1 "${smf}")" "$(st 2 "${cmp}")" "$(st 3 "${rate}")" "$(st 4 "${rowb}")" \
+  "$(st 6 "${rsmf}")" "$(st 7 "${cmp}")" "$(st 8 "${rrate}")" "$(st 9 "${rowa}")")"
+rrot="$(put rrot.log "$(sed -n '4,$p' "${rlog}")")"
+since_ts="2026-11-12T10:00:05.000000000Z"
+d444a_since "${rlog}" "${since_ts}" >"${work}/rs.log"
+d444a_since "${rrot}" "${since_ts}" >"${work}/rrs.log"
+holds "restore chain over the since-slice (semantic)" d444a_restore_chain "${work}/rs.log" semantic
+holds "restore chain over the slice of a rotated-head log" d444a_restore_chain "${work}/rrs.log" semantic
+holds "restore chain (raw) needs no keep line" d444a_restore_chain "${work}/rrs.log" raw
+breaks "restore chain: an empty slice fails" d444a_restore_chain "$(put empty.log)" semantic
+d444a_since "${rlog}" "2026-11-12T10:00:00Z" | sed -n '1,4p' >"${work}/pre.log"
+breaks "restore chain: the throttle lines alone do not satisfy it" d444a_restore_chain "${work}/pre.log" semantic
+breaks "restore chain: no keep 40->128 line fails (semantic)" d444a_restore_chain "$(put nr.log "$(st 6 "${rsmf}")" "$(st 7 "${cmp}")")" semantic
 
 holds "semantic epoch B" d444a_semantic_row "${rowb}" 0
 breaks "semantic: keep 128..40 is not epoch B" d444a_semantic_row "${rowa}" 0
