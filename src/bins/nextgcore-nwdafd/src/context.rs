@@ -904,6 +904,13 @@ pub struct MlProvSubscription {
     /// (TS 23.288 §6.2E.2 step 13).
     #[serde(default)]
     pub delivered_sha256: Option<String>,
+    /// The negotiated `suppFeats` (TS 29.500 §6.6.2), when the consumer sent
+    /// one (nextgsim#468).
+    #[serde(default)]
+    pub supp_feats: Option<String>,
+    /// `mlEvRepCon.mlAccuracyThreshold` per event, kept with ModelProvisionExt.
+    #[serde(default)]
+    pub accuracy_thresholds: Vec<crate::ml_service::EventAccuracyThreshold>,
 }
 
 impl MlProvSubscription {
@@ -920,7 +927,32 @@ impl MlProvSubscription {
             ml_events,
             notified: false,
             delivered_sha256: None,
+            supp_feats: None,
+            accuracy_thresholds: Vec::new(),
         }
+    }
+
+    /// A subscription from a parsed `NwdafMLModelProvSubsc`.
+    pub fn from_parsed(
+        subscription_id: String,
+        parsed: crate::ml_service::ParsedMlProvSubsc,
+    ) -> Self {
+        let mut sub = Self::new(
+            subscription_id,
+            parsed.notif_uri,
+            parsed.notif_corr_id,
+            parsed.ml_events,
+        );
+        sub.supp_feats = parsed.supp_feats;
+        sub.accuracy_thresholds = parsed.accuracy_thresholds;
+        sub
+    }
+
+    /// Whether this subscription negotiated ModelProvisionExt (feature 4).
+    pub fn model_provision_ext(&self) -> bool {
+        self.supp_feats.as_deref().is_some_and(|f| {
+            crate::ml_service::supp_feats_has(f, crate::ml_service::FEATURE_MODEL_PROVISION_EXT)
+        })
     }
 }
 

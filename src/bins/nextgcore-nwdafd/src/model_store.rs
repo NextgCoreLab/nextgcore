@@ -76,6 +76,13 @@ pub struct ModelVersion {
 }
 
 impl ModelVersion {
+    /// TS 29.520 `modelUniqueId` (Uinteger, "unique within 5GC scope"): the
+    /// first 48 bits of the sha256, so the same bytes have the same id in any
+    /// process and the value stays exact in a JSON number (< 2^53).
+    pub fn unique_id(&self) -> u64 {
+        u64::from_str_radix(&self.sha256[..12], 16).unwrap_or(0)
+    }
+
     /// The artefact URL a notification for `event` advertises.
     pub fn url(&self, base: &str, event: AnalyticsId) -> String {
         format!(

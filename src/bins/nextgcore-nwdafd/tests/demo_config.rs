@@ -81,7 +81,7 @@ fn run_to_exit(config: &std::path::Path) -> (bool, String) {
     }
 }
 
-#[cfg(feature = "amf-mobility")]
+#[cfg(any(feature = "amf-mobility", feature = "demo-d441e-model-retrain"))]
 fn scrape(port: u16, within: Duration) -> Option<String> {
     use std::io::Write;
     let deadline = Instant::now() + within;
@@ -298,6 +298,184 @@ fn d441a_modes_and_demo_off_shapes() {
         let body = scrape(port, Duration::from_secs(20)).expect("/metrics");
         assert!(!body.contains("nextg_demo_enabled"), "{tag}: {body}");
         assert!(body.contains("nwdaf_udc_serving 0"), "{tag}: {body}");
+        let err = read_err(&mut child);
+        assert!(!err.contains("DEMO MODE ACTIVE"), "{tag}: {err}");
+        assert!(!err.contains("[demo:"), "{tag}: {err}");
+    }
+}
+
+// ── nextgsim#468: nwdaf.role and demo d441e-model-retrain ──────────────────
+
+/// `nwdaf.role` is a deployment setting: anything but mtlf/anlf/both fails
+/// start-up, in every build.
+#[test]
+fn an_unknown_nwdaf_role_fails_startup() {
+    let path = std::env::temp_dir().join(format!(
+        "nwdafd-role-bogus-{}-{}.yaml",
+        std::process::id(),
+        free_port()
+    ));
+    std::fs::write(
+        &path,
+        format!(
+            "nwdaf:\n  role: bogus\n  sbi:\n    server:\n      - address: 127.0.0.1\n        port: {}\n",
+            free_port()
+        ),
+    )
+    .unwrap();
+    let (ok, err) = run_to_exit(&path);
+    assert!(!ok, "start-up must fail");
+    assert!(err.contains("nwdaf.role must be one of"), "{err}");
+}
+
+/// An AnLF-only NWDAF contains no MTLF: Nnwdaf_MLModelProvision is not served
+/// (404), while the default role serves it (201).
+#[test]
+fn an_anlf_role_serves_no_mlmodelprovision() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for (role, expected) in [("anlf", 404u16), ("both", 201)] {
+        let sbi_port = free_port();
+        let path = std::env::temp_dir().join(format!(
+            "nwdafd-role-{role}-{}-{sbi_port}.yaml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            format!(
+                "nwdaf:\n  role: {role}\n  sbi:\n    server:\n      - address: 127.0.0.1\n        port: {sbi_port}\n"
+            ),
+        )
+        .unwrap();
+        let mut child = spawn(&path, free_port());
+        let status = rt.block_on(async {
+            let client = nextgcore_sbi::SbiClient::new(nextgcore_sbi::SbiClientConfig::new(
+                "127.0.0.1",
+                sbi_port,
+            ));
+            let body = serde_json::json!({
+                "notifUri": "http://127.0.0.1:1/cb",
+                "mLEventSubscs": [{ "mLEvent": "NF_LOAD", "mLEventFilter": {} }]
+            });
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                match client
+                    .post_json("/nnwdaf-mlmodelprovision/v1/subscriptions", &body)
+                    .await
+                {
+                    Ok(resp) => return resp.status,
+                    Err(_) if Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(100)).await
+                    }
+                    Err(e) => panic!("nwdafd never answered: {e}"),
+                }
+            }
+        });
+        assert_eq!(status, expected, "role {role}");
+        let _ = child.0.kill();
+    }
+}
+
+/// Without `demo-d441e-model-retrain` the key is unknown.
+#[cfg(not(feature = "demo-d441e-model-retrain"))]
+#[test]
+fn the_d441e_key_fails_startup_in_a_build_without_its_feature() {
+    let cfg = config(
+        "d441e-no-feature",
+        "demo:\n  enabled: true\n  d441e-model-retrain:\n    enabled: true\n    mode: retrain\n",
+    );
+    let (ok, err) = run_to_exit(&cfg);
+    assert!(!ok, "start-up must fail");
+    assert!(err.contains("UnknownKey"), "{err}");
+}
+
+/// nextgsim#468 invalid-mode criterion: no fallback.
+#[cfg(feature = "demo-d441e-model-retrain")]
+#[test]
+fn d441e_mode_bogus_fails_startup_with_unknown_mode() {
+    let cfg = config(
+        "d441e-bogus",
+        "demo:\n  enabled: true\n  d441e-model-retrain:\n    enabled: true\n    mode: bogus\n",
+    );
+    let (ok, err) = run_to_exit(&cfg);
+    assert!(!ok, "no fallback: start-up must fail");
+    assert!(
+        err.contains(r#"UnknownMode { demo: "d441e-model-retrain", mode: "bogus""#),
+        "{err}"
+    );
+}
+
+/// Each mode on an AnLF: the banner, the prefixed line, the metric and the
+/// client. The three demo-off shapes on the same AnLF: none of it, and the
+/// client does not start.
+#[cfg(feature = "demo-d441e-model-retrain")]
+#[test]
+fn d441e_modes_and_demo_off_shapes() {
+    let anlf = "nwdaf:\n  role: anlf\n  anlf:\n    mtlf_uri: http://127.0.0.1:1\n";
+    let read_err = |child: &mut Killed| {
+        let _ = child.0.kill();
+        let mut err = String::new();
+        child
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut err)
+            .unwrap();
+        err
+    };
+    let cfg_with = |tag: &str, demo: &str| {
+        let path = config(tag, demo);
+        let text = std::fs::read_to_string(&path).unwrap();
+        // config() writes `nwdaf:\n  sbi: ...`; put role and anlf under it.
+        std::fs::write(&path, text.replacen("nwdaf:\n", anlf, 1)).unwrap();
+        path
+    };
+    for mode in ["retrain", "no-retrain"] {
+        let cfg = cfg_with(
+            &format!("d441e-{mode}"),
+            &format!(
+                "demo:\n  enabled: true\n  d441e-model-retrain:\n    enabled: true\n    mode: {mode}\n"
+            ),
+        );
+        let port = free_port();
+        let mut child = spawn(&cfg, port);
+        let body = scrape(port, Duration::from_secs(20)).expect("/metrics");
+        assert!(
+            body.contains(&format!(
+                r#"nextg_demo_enabled{{demo="d441e-model-retrain",mode="{mode}"}} 1"#
+            )),
+            "{body}"
+        );
+        assert!(body.contains("nwdaf_anlf_client_active 1"), "{body}");
+        let err = read_err(&mut child);
+        assert!(
+            err.contains(&format!("DEMO MODE ACTIVE: d441e-model-retrain={mode}")),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!(
+                "[demo:d441e-model-retrain] model-retrain: on (mode={mode}, role=anlf; AnLF client to http://127.0.0.1:1"
+            )),
+            "{err}"
+        );
+    }
+    for (tag, demo) in [
+        ("d441e-absent", ""),
+        ("d441e-off", "demo:\n  enabled: false\n"),
+        (
+            "d441e-killswitch",
+            "demo:\n  enabled: false\n  d441e-model-retrain:\n    enabled: true\n    mode: retrain\n",
+        ),
+    ] {
+        let cfg = cfg_with(tag, demo);
+        let port = free_port();
+        let mut child = spawn(&cfg, port);
+        let body = scrape(port, Duration::from_secs(20)).expect("/metrics");
+        assert!(!body.contains("nextg_demo_enabled"), "{tag}: {body}");
+        assert!(body.contains("nwdaf_anlf_client_active 0"), "{tag}: {body}");
         let err = read_err(&mut child);
         assert!(!err.contains("DEMO MODE ACTIVE"), "{tag}: {err}");
         assert!(!err.contains("[demo:"), "{tag}: {err}");
