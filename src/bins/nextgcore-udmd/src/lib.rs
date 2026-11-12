@@ -11,6 +11,7 @@
 pub mod app;
 pub mod av_algorithm; // #115: which f1-f5* algorithm generates a subscriber's AVs
 pub mod context;
+pub mod ee_amf; // #1440 TS 23.502 §4.15.3.2.3 step 3a: AMF-detected EE events subscribed at the AMF
 pub mod event;
 pub mod metrics;
 #[cfg(feature = "nes")]

@@ -297,6 +297,67 @@ pub async fn udm_nrf_discover(
     Ok(instances)
 }
 
+/// Discover ONE NF instance by id (TS 29.510 §6.2.3.2.3.1 `target-nf-instance-id`)
+/// and cache it with its services, so a later request reaches the instance that
+/// was asked for rather than any of its type (#1440: the AMF serving a UE).
+///
+/// Unlike [`udm_nrf_discover`], the profile's `nfServices` are read too, since
+/// the caller needs a service endpoint, not only the instance address.
+pub async fn udm_nrf_discover_instance(
+    target_nf_type: NfType,
+    nf_instance_id: &str,
+) -> Result<(), String> {
+    let sbi_ctx = global_context();
+    let nrf_uri = sbi_ctx.get_nrf_uri().await.ok_or("no NRF configured")?;
+    let (host, port, _) =
+        parse_callback_uri(&nrf_uri).ok_or_else(|| format!("bad NRF URI {nrf_uri}"))?;
+    let client = sbi_ctx.get_client(&host, port).await;
+    let request = SbiRequest::get("/nnrf-disc/v1/nf-instances")
+        .with_param("target-nf-type", target_nf_type.to_str())
+        .with_param("requester-nf-type", "UDM")
+        .with_param("target-nf-instance-id", nf_instance_id);
+    let response = client
+        .send_request(request)
+        .await
+        .map_err(|e| format!("NRF discovery request failed: {e}"))?;
+    if !response.is_success() {
+        return Err(format!("NRF discovery returned {}", response.status));
+    }
+    let result: serde_json::Value = response
+        .http
+        .content
+        .as_deref()
+        .and_then(|b| serde_json::from_str(b).ok())
+        .ok_or("NRF discovery response is not JSON")?;
+    let validity = nextgcore_sbi::context::search_result_validity(&result);
+    let profile = result["nfInstances"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|p| p["nfInstanceId"] == nf_instance_id)
+        .ok_or_else(|| format!("NRF knows no instance {nf_instance_id}"))?;
+    let mut instance = NfInstance::new(nf_instance_id, target_nf_type);
+    nextgcore_sbi::nf_addressing::read_instance_addresses(&mut instance, profile);
+    for svc in profile["nfServices"].as_array().into_iter().flatten() {
+        let Some(name) = svc["serviceName"].as_str() else {
+            continue;
+        };
+        let Some(service_type) = SbiServiceType::from_name(name) else {
+            continue;
+        };
+        let mut service = NfService::new(name, service_type);
+        nextgcore_sbi::nf_addressing::read_service_addresses(&mut service, svc);
+        if svc["scheme"] == "https" {
+            service.scheme = nextgcore_sbi::types::UriScheme::Https;
+        }
+        instance.add_service(service);
+    }
+    sbi_ctx
+        .add_nf_instance_with_validity(instance, validity)
+        .await;
+    Ok(())
+}
+
 // #235: `udm_nrf_deregister(nrf_host, nrf_port)` used to live here — a per-NF
 // copy of NFDeregister that had NO caller, so udmd never actually deregistered
 // despite owning the only client in the workspace. The one client is now
