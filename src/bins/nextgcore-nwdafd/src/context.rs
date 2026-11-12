@@ -1289,8 +1289,9 @@ impl NwdafContext {
             .model_store
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        use crate::model_store::Publish;
         match store.publish(&coefficients, intercept, &self.nf_instance_id) {
-            Ok((version, true)) => {
+            Ok((version, Publish::New)) => {
                 log::info!(
                     "MLModelProvision: model v{} published sha256={} ({} bytes)",
                     version.version,
@@ -1299,9 +1300,24 @@ impl NwdafContext {
                 );
                 Some(version)
             }
-            Ok((version, false)) => Some(version),
+            Ok((version, Publish::Reactivated)) => {
+                log::info!(
+                    "MLModelProvision: model v{} active again sha256={}",
+                    version.version,
+                    version.sha256
+                );
+                Some(version)
+            }
+            Ok((version, Publish::Unchanged)) => Some(version),
             Err(e) => {
-                log::error!("MLModelProvision: the active model cannot be published: {e}");
+                // Logged once per failing export, not on every tick and GET.
+                if e.first {
+                    log::error!(
+                        "MLModelProvision: the active model cannot be published, so none is \
+                         provisioned or advertised: {}",
+                        e.reason
+                    );
+                }
                 None
             }
         }
@@ -1319,10 +1335,12 @@ impl NwdafContext {
             .cloned()
     }
 
-    /// Whether this NWDAF can currently provision a model artefact.
+    /// Whether this NWDAF can currently provision a model artefact: exactly
+    /// when [`current_model_version`](Self::current_model_version) has one, so
+    /// the NF profile never advertises `nnwdaf-mlmodelprovision` for a model
+    /// that could not be published.
     pub fn can_provision_model(&self) -> bool {
-        let engine = self.lock_engine();
-        engine.predictor().linear_form().is_some()
+        self.current_model_version().is_some()
     }
 
     pub fn set_nrf_collector_config(&self, config: NrfCollectorConfig) {
@@ -3338,6 +3356,30 @@ mod ml_prov_delivery_468_tests {
         );
         assert_eq!(ctx.adopt_legacy_ml_prov_deliveries(), 0, "idempotent");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A predictor whose export cannot be published is not advertised either:
+    /// the profile gate and the provisioning path agree (review of #1454).
+    #[test]
+    fn an_unpublishable_model_is_not_advertised() {
+        struct TooWide;
+        impl crate::ml_service::InferenceModel for TooWide {
+            fn model_id(&self) -> &str {
+                "too-wide"
+            }
+            fn predict_series(&self, _: &[f64]) -> Option<(f64, f64)> {
+                None
+            }
+            fn linear_form(&self) -> Option<(Vec<f64>, f64)> {
+                Some((vec![0.01; crate::analytics::MAX_SAMPLES + 1], 0.0))
+            }
+        }
+        let mut ctx = NwdafContext::new("nwdaf-468".to_string());
+        ctx.init(16);
+        assert!(ctx.can_provision_model(), "the default OLS predictor");
+        ctx.lock_engine().set_predictor(Box::new(TooWide));
+        assert!(ctx.current_model_version().is_none());
+        assert!(!ctx.can_provision_model());
     }
 
     /// One the older build never got through to stays pending.

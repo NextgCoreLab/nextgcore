@@ -20,9 +20,16 @@
 //! The store follows the predictor. [`ModelStore::publish`] takes the active
 //! predictor's linear form and returns the current version, adding one only when
 //! the exported bytes differ from the newest. So a predictor swapped at runtime
-//! is re-provisioned with no other wiring. Version numbers (`v1`, `v2`) are for
-//! logs and the manifest only; they restart at 1 with the process, while the
-//! sha256 addresses stay stable for the same bytes.
+//! is re-provisioned with no other wiring. A predictor that returns to an
+//! earlier model reactivates that version rather than adding a duplicate.
+//!
+//! Version labels (`v1`, `v2`, the manifest's `version`) are per process: they
+//! restart at 1 with nwdafd, so after a restart the same label can name
+//! different bytes, and the same bytes can carry a different label. The sha256
+//! is the identity; consumers verify against it, never against the label.
+//! Persisting the counter alone would not help: the store itself (the bytes) is
+//! memory-only, so a persisted label would describe a version that no longer
+//! exists.
 //!
 //! The manifest is nextgsim#463's format (`ModelManifest`, which denies unknown
 //! fields), so the same verifier logic applies: sha256, the default-domain
@@ -93,11 +100,33 @@ pub fn is_sha256_hex(segment: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// The bounded, append-only list of versions; the newest is the active one.
+/// What [`ModelStore::publish`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Publish {
+    /// The bytes are the active version's.
+    Unchanged,
+    /// The bytes are a retained earlier version's, which is active again.
+    Reactivated,
+    /// The bytes are new: a new version.
+    New,
+}
+
+/// Why [`ModelStore::publish`] refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishError {
+    pub reason: String,
+    /// False when the same bytes already failed the previous attempt, so the
+    /// caller can log once instead of every tick and every GET.
+    pub first: bool,
+}
+
+/// The bounded list of versions; the last is the active one.
 #[derive(Debug, Default)]
 pub struct ModelStore {
     versions: VecDeque<ModelVersion>,
     last_version: u32,
+    /// sha256 of the last export that failed to publish.
+    failed_sha256: Option<String>,
 }
 
 impl ModelStore {
@@ -105,27 +134,41 @@ impl ModelStore {
         Self::default()
     }
 
-    /// The version for the given linear form, publishing it if its bytes are
-    /// not the newest version's. Returns the version and whether it is new.
+    /// The version for the given linear form, making it the active one:
+    /// unchanged when it already is, reactivated when an earlier retained
+    /// version has the same bytes, otherwise published as a new version.
     ///
     /// # Errors
-    /// When the exported bytes do not read back (an internal fault: the
-    /// exporter and the reader disagree), nothing is published.
+    /// When the exported bytes do not read back (the exporter and the reader
+    /// disagree, or the window exceeds the reader's cap), nothing is published.
     pub fn publish(
         &mut self,
         coefficients: &[f64],
         intercept: f64,
         producer: &str,
-    ) -> Result<(ModelVersion, bool), String> {
+    ) -> Result<(ModelVersion, Publish), PublishError> {
         let bytes = crate::onnx_export::encode_linear_regressor(coefficients, intercept);
         let sha256 = sha256_hex(&bytes);
         if let Some(active) = self.versions.back() {
             if active.sha256 == sha256 {
-                return Ok((active.clone(), false));
+                return Ok((active.clone(), Publish::Unchanged));
             }
         }
+        if let Some(pos) = self.versions.iter().position(|v| v.sha256 == sha256) {
+            let entry = self.versions.remove(pos).expect("position is in range");
+            self.versions.push_back(entry.clone());
+            return Ok((entry, Publish::Reactivated));
+        }
         let version = self.last_version + 1;
-        let manifest = build_manifest(&bytes, &sha256, version, producer)?;
+        let manifest = match build_manifest(&bytes, &sha256, version, producer) {
+            Ok(m) => m,
+            Err(reason) => {
+                let first = self.failed_sha256.as_deref() != Some(sha256.as_str());
+                self.failed_sha256 = Some(sha256);
+                return Err(PublishError { reason, first });
+            }
+        };
+        self.failed_sha256 = None;
         let entry = ModelVersion {
             version,
             sha256,
@@ -137,7 +180,7 @@ impl ModelStore {
         while self.versions.len() > MAX_RETAINED_VERSIONS {
             self.versions.pop_front();
         }
-        Ok((entry, true))
+        Ok((entry, Publish::New))
     }
 
     /// The newest version, if any was published.
@@ -161,6 +204,18 @@ impl ModelStore {
     }
 }
 
+/// `intercept + Σ coef·x` in float32 over the bytes' own (float32)
+/// coefficients: what an ONNX runtime computes for one row.
+fn linear_regressor_f32(model: &crate::onnx_model::OnnxLinearRegressor, x: &[f32]) -> f32 {
+    let (coefficients, intercept) = model
+        .linear_form()
+        .expect("an OnnxLinearRegressor always has a linear form");
+    coefficients
+        .iter()
+        .zip(x)
+        .fold(intercept as f32, |acc, (c, x)| acc + (*c as f32) * x)
+}
+
 /// The manifest for `bytes`, in nextgsim#463's `ModelManifest` shape.
 fn build_manifest(
     bytes: &[u8],
@@ -175,17 +230,14 @@ fn build_manifest(
         .ok_or("exported model has no linear form")?;
     let width = coefficients.len();
 
-    // A fixed, non-degenerate window; the golden output is what the served
-    // bytes compute for it. `predict_series` clamps to [0, 1], which a general
-    // ONNX runtime does not, so the input keeps the output inside that range.
-    let input: Vec<f64> = (0..width).map(|i| 0.3 + 0.05 * i as f64).collect();
-    let (output, _) = model
-        .predict_series(&input)
-        .ok_or("exported model does not predict on its own window")?;
-    if !(0.0..1.0).contains(&output) {
-        return Err(format!(
-            "golden output {output} is clamped; the window is not representative"
-        ));
+    // A fixed window; the golden output is what the served bytes compute for
+    // it under ONNX `LinearRegressor` semantics: `intercept + Σ coef·x` in
+    // float32, with no clamp. (`predict_series` clamps to [0, 1] for analytics;
+    // a runtime running the artefact does not, so the golden must not either.)
+    let input: Vec<f32> = (0..width).map(|i| 0.3 + 0.05 * i as f32).collect();
+    let output = linear_regressor_f32(&model, &input);
+    if !output.is_finite() {
+        return Err(format!("golden output {output} is not finite"));
     }
 
     let tensors = |list: &[crate::onnx_model::TensorSig]| -> Vec<Value> {
@@ -202,9 +254,9 @@ fn build_manifest(
         "outputs": tensors(&sig.outputs),
         "golden": [{
             "input_shape": [1, width],
-            "input": input.iter().map(|v| *v as f32).collect::<Vec<f32>>(),
+            "input": input,
             "output_shape": [1, 1],
-            "output": [output as f32],
+            "output": [output],
         }],
         "tolerance": GOLDEN_TOLERANCE,
         // TS 28.105 mLTrainingType.
@@ -226,12 +278,16 @@ mod tests {
     fn same_bytes_are_one_version() {
         let mut store = ModelStore::new();
         let (c, i) = ols();
-        let (v1, new) = store.publish(&c, i, "nwdaf-1").unwrap();
-        assert!(new);
+        let (v1, how) = store.publish(&c, i, "nwdaf-1").unwrap();
+        assert_eq!(how, Publish::New);
         assert_eq!(v1.version, 1);
         assert_eq!(v1.sha256, sha256_hex(&v1.bytes));
-        let (again, new) = store.publish(&c, i, "nwdaf-1").unwrap();
-        assert!(!new, "re-exporting the same predictor is not a new model");
+        let (again, how) = store.publish(&c, i, "nwdaf-1").unwrap();
+        assert_eq!(
+            how,
+            Publish::Unchanged,
+            "re-exporting the same predictor is not a new model"
+        );
         assert_eq!(again.sha256, v1.sha256);
         assert_eq!(store.len(), 1);
     }
@@ -241,8 +297,8 @@ mod tests {
         let mut store = ModelStore::new();
         let (c, i) = ols();
         let (v1, _) = store.publish(&c, i, "p").unwrap();
-        let (v2, new) = store.publish(&[0.1, 0.2, 0.3, 0.4], 0.0, "p").unwrap();
-        assert!(new);
+        let (v2, how) = store.publish(&[0.1, 0.2, 0.3, 0.4], 0.0, "p").unwrap();
+        assert_eq!(how, Publish::New);
         assert_eq!(v2.version, 2);
         assert_ne!(v1.sha256, v2.sha256);
         assert_eq!(store.active().unwrap().sha256, v2.sha256);
@@ -253,6 +309,77 @@ mod tests {
         );
         assert_eq!(v2.manifest["training_type"], "RE_TRAINING");
         assert_eq!(v1.manifest["training_type"], "INITIAL_TRAINING");
+    }
+
+    /// A→B→A reactivates A's entry: no duplicate under A's address, and A's
+    /// manifest keeps A's label.
+    #[test]
+    fn returning_to_an_earlier_model_reactivates_it() {
+        let mut store = ModelStore::new();
+        let (c, i) = ols();
+        let (a, _) = store.publish(&c, i, "p").unwrap();
+        let (b, _) = store.publish(&[0.1, 0.2, 0.3, 0.4], 0.0, "p").unwrap();
+        let (again, how) = store.publish(&c, i, "p").unwrap();
+        assert_eq!(how, Publish::Reactivated);
+        assert_eq!(again.version, a.version);
+        assert_eq!(again.sha256, a.sha256);
+        assert_eq!(store.len(), 2, "no duplicate entry");
+        assert_eq!(store.active().unwrap().sha256, a.sha256);
+        assert!(store.get(&b.sha256).is_some(), "B is still retained");
+        // The next new model continues the sequence.
+        let (c3, how) = store.publish(&[0.2, 0.2, 0.2, 0.2], 0.1, "p").unwrap();
+        assert_eq!((c3.version, how), (3, Publish::New));
+    }
+
+    fn golden_output(v: &ModelVersion) -> f32 {
+        v.manifest["golden"][0]["output"][0].as_f64().unwrap() as f32
+    }
+
+    fn golden_input(v: &ModelVersion) -> Vec<f32> {
+        v.manifest["golden"][0]["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap() as f32)
+            .collect()
+    }
+
+    /// The served LinearRegressor does not clamp, so neither does the golden.
+    /// The reviewer's reproductions: a negative raw output (was golden 0.0)
+    /// and an output above 1 (was a publish error).
+    #[test]
+    fn golden_is_the_unclamped_linear_output() {
+        for (coef, icpt) in [([0.1f64; 4], -0.6f64), ([0.5; 4], 0.5)] {
+            let mut store = ModelStore::new();
+            let (v, how) = store
+                .publish(&coef, icpt, "p")
+                .expect("any finite linear model publishes");
+            assert_eq!(how, Publish::New);
+            let x = golden_input(&v);
+            let expected = x
+                .iter()
+                .fold(icpt as f32, |acc, xi| acc + coef[0] as f32 * xi);
+            let got = golden_output(&v);
+            assert!(
+                (got - expected).abs() <= GOLDEN_TOLERANCE,
+                "golden {got} vs unclamped {expected} for {coef:?}/{icpt}"
+            );
+            assert!(
+                !(0.0..=1.0).contains(&got),
+                "the case exercises the clamp: {got}"
+            );
+        }
+    }
+
+    /// A failure is reported once per export, not per call.
+    #[test]
+    fn a_failing_export_reports_first_once() {
+        let mut store = ModelStore::new();
+        let too_wide = vec![0.01; crate::analytics::MAX_SAMPLES + 1];
+        let e1 = store.publish(&too_wide, 0.0, "p").unwrap_err();
+        let e2 = store.publish(&too_wide, 0.0, "p").unwrap_err();
+        assert!(e1.first && !e2.first, "{e1:?} {e2:?}");
+        assert!(store.is_empty());
     }
 
     #[test]

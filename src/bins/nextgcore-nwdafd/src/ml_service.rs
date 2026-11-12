@@ -440,27 +440,15 @@ pub fn ml_prov_subsc_json(sub: &MlProvSubscription) -> Value {
     Value::Object(obj)
 }
 
-/// The legacy (issue #109) model-file address,
-/// `.../models/{event}/{subscriptionId}`.
-///
-/// No longer advertised: nextgsim#468 notifies a content-addressed URL per
-/// model version ([`crate::model_store::ModelVersion::url`]). It is still
-/// served, as the active version, because a subscription notified by an older
-/// build holds it.
-///
-/// SCOPE NOTE (issue #109): this NWDAF is a linear-regression analytics engine.
-/// What it provisions is the predictor it actually runs, exported as an ONNX
-/// `LinearRegressor` whose output equals this NWDAF's own prediction (see
-/// [`crate::onnx_export`]). There is one predictor, so every subscribed event is
-/// notified the same model.
-pub fn legacy_model_url(base: &str, sub_id: &str, event: AnalyticsId) -> String {
-    format!(
-        "{}/nnwdaf-mlmodelprovision/v1/models/{}/{}",
-        base.trim_end_matches('/'),
-        event.as_str(),
-        sub_id
-    )
-}
+// The issue #109 address `.../models/{event}/{subscriptionId}` is no longer
+// notified (nextgsim#468 notifies `ModelVersion::url`); the route still serves
+// it, as the active version, for subscriptions an older build notified.
+//
+// SCOPE NOTE (issue #109): this NWDAF is a linear-regression analytics engine.
+// What it provisions is the predictor it actually runs, exported as an ONNX
+// `LinearRegressor` whose output equals this NWDAF's own prediction (see
+// `crate::onnx_export`). There is one predictor, so every subscribed event is
+// notified the same model (nextgcore #1452).
 
 /// Build the `Nnwdaf_MLModelProvision` notification callback body for a
 /// subscription and the model version it is notified of.
