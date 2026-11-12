@@ -14,7 +14,7 @@
 //!   it names.
 //! - **Log lines**, `[demo:d440c-nwdaf-paging]`, info level so a release build
 //!   keeps them:
-//!   - `Paging sent to N/M scope=<scope> targets=[gNB 0x..,..] attempt K`, after
+//!   - `Paging sent to N/M ue=<supi> scope=<scope> targets=[gNB 0x..,..] attempt K`, after
 //!     the base `Paging sent to ...` line, which is unchanged. `<scope>` is one
 //!     of `nwdaf-mobility`, `last-known`, `recommended` or `registration-area`.
 //!   - `page answered ue=<supi> via gNB 0x.. attempt K`, when a Service Request
@@ -123,11 +123,21 @@ impl Scope {
     }
 }
 
-/// `Paging sent to N/M scope=<scope> targets=[gNB 0x..,..] attempt K`.
-pub fn paging_sent_line(sent: usize, scope: Scope, gnb_ids: &[u32], attempt: u32) -> String {
-    let targets: Vec<String> = gnb_ids.iter().map(|g| format!("gNB 0x{g:x}")).collect();
+/// `Paging sent to N/M ue=<supi> scope=<scope> targets=[gNB 0x..,..] attempt K`.
+/// A target whose gNB ID is unknown is `gNB ?`.
+pub fn paging_sent_line(
+    sent: usize,
+    supi: &str,
+    scope: Scope,
+    gnb_ids: &[Option<u32>],
+    attempt: u32,
+) -> String {
+    let targets: Vec<String> = gnb_ids
+        .iter()
+        .map(|g| g.map_or_else(|| "gNB ?".to_string(), |g| format!("gNB 0x{g:x}")))
+        .collect();
     format!(
-        "Paging sent to {sent}/{} scope={} targets=[{}] attempt {attempt}",
+        "Paging sent to {sent}/{} ue={supi} scope={} targets=[{}] attempt {attempt}",
         gnb_ids.len(),
         scope.as_str(),
         targets.join(",")
@@ -244,16 +254,21 @@ mod tests {
     #[test]
     fn the_demo_lines_carry_scope_targets_and_attempt() {
         assert_eq!(
-            paging_sent_line(1, Scope::NwdafMobility, &[0x2], 1),
-            "Paging sent to 1/1 scope=nwdaf-mobility targets=[gNB 0x2] attempt 1"
+            paging_sent_line(1, "imsi-1", Scope::NwdafMobility, &[Some(0x2)], 1),
+            "Paging sent to 1/1 ue=imsi-1 scope=nwdaf-mobility targets=[gNB 0x2] attempt 1"
         );
         assert_eq!(
-            paging_sent_line(2, Scope::RegistrationArea, &[0x1, 0x3], 2),
-            "Paging sent to 2/2 scope=registration-area targets=[gNB 0x1,gNB 0x3] attempt 2"
+            paging_sent_line(2, "imsi-1", Scope::RegistrationArea, &[Some(0x0), None], 2),
+            "Paging sent to 2/2 ue=imsi-1 scope=registration-area targets=[gNB 0x0,gNB ?] attempt 2",
+            "gNB ID 0 is a real ID; an unknown one is `?`"
         );
         assert_eq!(
             page_answered_line("imsi-001010000000001", Some(0x2), 1),
             "page answered ue=imsi-001010000000001 via gNB 0x2 attempt 1"
+        );
+        assert_eq!(
+            page_answered_line("imsi-1", Some(0x0), 1),
+            "page answered ue=imsi-1 via gNB 0x0 attempt 1"
         );
     }
 

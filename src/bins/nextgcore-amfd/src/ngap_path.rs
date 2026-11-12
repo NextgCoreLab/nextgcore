@@ -7862,14 +7862,19 @@ impl NgapServer {
         }
         #[cfg(feature = "demo-d440c-nwdaf-paging")]
         if let (Some(p), Some(_)) = (&paging, crate::demo_d440c::mode()) {
-            let gnb = self.gnb_ids_of(&[association_id]).await.first().copied();
+            let gnb = self
+                .gnb_ids_of(&[association_id])
+                .await
+                .first()
+                .copied()
+                .flatten();
             nextgcore_demo::demo_log!(
                 info,
                 crate::demo_d440c::DEMO_KEY,
                 "{}",
                 crate::demo_d440c::page_answered_line(
                     p.supi.as_deref().unwrap_or("unknown"),
-                    gnb.filter(|g| *g != 0),
+                    gnb,
                     u32::from(p.retransmit_count) + 1
                 )
             );
@@ -16316,6 +16321,29 @@ pub enum EpsHandoverStart {
 /// (PLMN, ngENB-ID alternative, value); two ids of equal value and different
 /// lengths are different ng-eNBs. Shared by handover target resolution and
 /// recommended-first paging (#1442).
+/// Which gNBs an `nwdaf-mobility` first attempt pages (nextgsim#464).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NwdafFirstAttempt {
+    /// At least one gNB that owns the NWDAF's predicted cell (and maybe the
+    /// last known cell's gNB).
+    Predicted,
+    /// Only the last known cell's gNB: no gNB in the area owns the prediction.
+    LastKnownOnly,
+}
+
+impl NwdafFirstAttempt {
+    /// The scope phrase of the base `Paging sent to ...` line.
+    pub(crate) fn scope_phrase(self) -> &'static str {
+        match self {
+            Self::Predicted => "predicted by NWDAF UE mobility in the registration area",
+            Self::LastKnownOnly => {
+                "at the UE's last known cell in the registration area (no gNB owns the NWDAF \
+                 prediction)"
+            }
+        }
+    }
+}
+
 fn session_is_ran_node(session: &GnbSession, id: &nextgcore_ngap::types::GlobalRanNodeId) -> bool {
     use nextgcore_ngap::types::GlobalRanNodeId;
     let gnb = &session.gnb;
@@ -19476,10 +19504,12 @@ impl NgapServer {
         // gNB of the UE's last known cell: a UE that has not moved since it went
         // idle is still there (TS 23.501 §5.4.3.1 makes the analytics an input to
         // the strategy, not the whole of it).
-        let (predicted, predicted_scope) = match (&paging.nwdaf_predicted, paging.retransmit_count)
-        {
-            (Some(cell), 0) => self.nwdaf_first_attempt_targets(paging, cell, &area).await,
-            _ => (Vec::new(), ""),
+        let (predicted, predicted_kind) = match (&paging.nwdaf_predicted, paging.retransmit_count) {
+            (Some(cell), 0) => {
+                let (targets, kind) = self.nwdaf_first_attempt_targets(paging, cell, &area).await;
+                (targets, Some(kind))
+            }
+            _ => (Vec::new(), None),
         };
         let area_len = area.len();
         #[cfg(feature = "demo-d440c-nwdaf-paging")]
@@ -19487,18 +19517,19 @@ impl NgapServer {
             crate::demo_d440c::Scope::Recommended
         } else if predicted.is_empty() {
             crate::demo_d440c::Scope::RegistrationArea
-        } else if predicted_scope.starts_with("predicted") {
-            crate::demo_d440c::Scope::NwdafMobility
         } else {
-            crate::demo_d440c::Scope::LastKnown
+            match predicted_kind {
+                Some(NwdafFirstAttempt::LastKnownOnly) => crate::demo_d440c::Scope::LastKnown,
+                _ => crate::demo_d440c::Scope::NwdafMobility,
+            }
         };
         let (targets, scope) = if !recommended.is_empty() {
             (
                 recommended,
                 "recommended by the RAN in the registration area",
             )
-        } else if !predicted.is_empty() {
-            (predicted, predicted_scope)
+        } else if let (false, Some(kind)) = (predicted.is_empty(), predicted_kind) {
+            (predicted, kind.scope_phrase())
         } else {
             (area, "serving the registration area")
         };
@@ -19597,6 +19628,7 @@ impl NgapServer {
                 "{}",
                 crate::demo_d440c::paging_sent_line(
                     sent,
+                    paging.supi.as_deref().unwrap_or("unknown"),
                     demo_scope,
                     &gnb_ids,
                     u32::from(paging.retransmit_count) + 1
@@ -19606,14 +19638,19 @@ impl NgapServer {
         Ok(sent)
     }
 
-    /// The Global gNB ID of each association in `assocs`, in order; 0 for one
-    /// that is gone (demo d440c-nwdaf-paging log lines).
+    /// The Global gNB ID of each association in `assocs`, in order; `None` for
+    /// one that is gone or gave no gNB ID (demo d440c-nwdaf-paging log lines).
     #[cfg(feature = "demo-d440c-nwdaf-paging")]
-    async fn gnb_ids_of(&self, assocs: &[u64]) -> Vec<u32> {
+    async fn gnb_ids_of(&self, assocs: &[u64]) -> Vec<Option<u32>> {
         let sessions = self.sessions.read().await;
         assocs
             .iter()
-            .map(|a| sessions.get(a).map_or(0, |s| s.gnb.gnb_id))
+            .map(|a| {
+                sessions
+                    .get(a)
+                    .filter(|s| s.gnb.gnb_id_presence)
+                    .map(|s| s.gnb.gnb_id)
+            })
             .collect()
     }
 
@@ -19629,15 +19666,14 @@ impl NgapServer {
         paging: &crate::context::PagingContext,
         cell: &crate::context::PredictedCell,
         area: &[u64],
-    ) -> (Vec<u64>, &'static str) {
+    ) -> (Vec<u64>, NwdafFirstAttempt) {
         let mut gnbs = self
             .cell_owner_associations(&cell.plmn_id, cell.nci, "predicted", area)
             .await;
         let scope = if gnbs.is_empty() {
-            "at the UE's last known cell in the registration area (no gNB owns the NWDAF \
-             prediction)"
+            NwdafFirstAttempt::LastKnownOnly
         } else {
-            "predicted by NWDAF UE mobility in the registration area"
+            NwdafFirstAttempt::Predicted
         };
         if let Some((plmn, nci)) = &paging.nwdaf_last_cell {
             for assoc in self
@@ -24350,6 +24386,18 @@ mod tests {
         })
     }
 
+    /// The requests the stand-in recorded for `supi`. The strategy and the NWDAF
+    /// endpoint override are process-global, so a page another test queues at the
+    /// same moment can reach this stand-in too. Each test counts only its own UEs.
+    fn requests_for(seen: &Arc<std::sync::Mutex<Vec<String>>>, supi: &str) -> Vec<String> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.contains(&format!("\"{supi}\"")))
+            .cloned()
+            .collect()
+    }
+
     /// Points the NWDAF resolver at a stand-in for one test, and back on drop.
     struct NwdafEndpointOverride;
 
@@ -24424,7 +24472,7 @@ mod tests {
             nwdaf_answer_applied(ue).await,
             "the NWDAF answer reaches the page"
         );
-        let uris = seen.lock().unwrap().clone();
+        let uris = requests_for(&seen, "imsi-001010000464001");
         assert_eq!(uris.len(), 1, "{uris:?}");
         assert!(
             uris[0].starts_with("/nnwdaf-analyticsinfo/v1/analytics event-id=UE_MOBILITY "),
@@ -24571,7 +24619,12 @@ mod tests {
             "paged after the {:?} deadline and before the NWDAF's 5 s answer: {waited:?}",
             crate::nwdaf_mobility::HINT_TIMEOUT
         );
-        assert_eq!(seen.lock().unwrap().len(), 2, "both UEs were asked about");
+        assert_eq!(
+            requests_for(&seen, "imsi-001010000464011").len()
+                + requests_for(&seen, "imsi-001010000464012").len(),
+            2,
+            "both UEs were asked about, once each"
+        );
         let timed_out = nextgcore_sbi::test_support::poll_until(
             Duration::from_secs(4),
             Duration::from_millis(10),
@@ -24684,7 +24737,10 @@ mod tests {
             "the first pass pages the whole area"
         );
         drop(permits);
-        assert!(seen.lock().unwrap().is_empty(), "no query was started");
+        assert!(
+            requests_for(&seen, "imsi-001010000464051").is_empty(),
+            "no query was started"
+        );
         assert_eq!(
             crate::nwdaf_mobility::outcome_count(crate::nwdaf_mobility::HintOutcome::CapFull),
             cap_full_before + 1
@@ -24735,7 +24791,10 @@ mod tests {
         assert!(metrics.is_empty(), "no hint counter by default: {metrics}");
         // An absence: give a (wrongly) spawned query time to land before checking.
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(seen.lock().unwrap().is_empty(), "no NWDAF request");
+        assert!(
+            requests_for(&seen, "imsi-001010000464031").is_empty(),
+            "no NWDAF request"
+        );
         crate::context::amf_self().read().unwrap().paging_remove(ue);
     }
 
@@ -24944,17 +25003,23 @@ mod tests {
             .nwdaf_first_attempt_targets(&paging(Some(1)), &cell(4), &area)
             .await;
         assert_eq!(targets, vec![base + 1]);
+        assert_eq!(scope, NwdafFirstAttempt::LastKnownOnly);
         assert!(
-            scope.starts_with("at the UE's last known cell") && !scope.contains("predicted by"),
-            "{scope}"
+            scope
+                .scope_phrase()
+                .starts_with("at the UE's last known cell")
+                && !scope.scope_phrase().contains("predicted by"),
+            "{}",
+            scope.scope_phrase()
         );
 
         let (targets, scope) = ngap
             .nwdaf_first_attempt_targets(&paging(Some(1)), &cell(2), &area)
             .await;
         assert_eq!(targets, vec![base + 2, base + 1]);
+        assert_eq!(scope, NwdafFirstAttempt::Predicted);
         assert_eq!(
-            scope,
+            scope.scope_phrase(),
             "predicted by NWDAF UE mobility in the registration area"
         );
 
@@ -25040,18 +25105,15 @@ mod tests {
         let base = 4_720u64;
         nwdaf_grid(&ngap, base).await;
 
+        nextgcore_core::test_log::init();
         for (i, demo_on) in [true, false].into_iter().enumerate() {
             let _mode = demo_on.then(|| {
                 crate::demo_d440c::ModeOnThisThread::set(crate::demo_d440c::MODE_NWDAF_MOBILITY)
             });
             let ue = 464_301u64 + i as u64;
-            insert_nwdaf_ue(
-                &ngap,
-                ue,
-                base + 1,
-                Some(&format!("imsi-00101000046430{i}")),
-                Some(1),
-            );
+            let supi = format!("imsi-00101000046430{i}");
+            let lines = nextgcore_core::test_log::watch(format!("ue={supi} "));
+            insert_nwdaf_ue(&ngap, ue, base + 1, Some(&supi), Some(1));
             queue_paging(&ngap, ue);
             assert!(nwdaf_answer_applied(ue).await, "released");
             take_sent_ngap(&mut ngap);
@@ -25081,7 +25143,152 @@ mod tests {
                     .all(|(_, c)| c.is_empty()),
                 "the retransmission carries no recommended cells"
             );
+            // The success-signal lines, where they are emitted.
+            let demo: Vec<String> = lines
+                .records()
+                .into_iter()
+                .filter(|r| r.contains("[demo:d440c-nwdaf-paging]"))
+                .collect();
+            if demo_on {
+                assert_eq!(demo.len(), 2, "{demo:?}");
+                assert!(
+                    demo[0].ends_with(&format!(
+                        "[demo:d440c-nwdaf-paging] Paging sent to 2/2 ue={supi} \
+                         scope=nwdaf-mobility targets=[gNB 0x2,gNB 0x1] attempt 1"
+                    )),
+                    "{demo:?}"
+                );
+                assert!(
+                    demo[1].contains(&format!(
+                        "[demo:d440c-nwdaf-paging] Paging sent to 4/4 ue={supi} \
+                         scope=registration-area targets=["
+                    )) && demo[1].ends_with("] attempt 2"),
+                    "{demo:?}"
+                );
+            } else {
+                assert!(demo.is_empty(), "demo off: no [demo: line: {demo:?}");
+            }
             crate::context::amf_self().read().unwrap().paging_remove(ue);
+        }
+    }
+
+    /// **demo d440c-nwdaf-paging**: when no gNB in the area owns the prediction,
+    /// attempt 1 pages the last known cell's gNB, and the demo line names it
+    /// `scope=last-known`, not `nwdaf-mobility`.
+    #[cfg(feature = "demo-d440c-nwdaf-paging")]
+    #[tokio::test]
+    async fn demo_line_names_a_last_known_only_first_attempt() {
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::NwdafMobility);
+        let _mode =
+            crate::demo_d440c::ModeOnThisThread::set(crate::demo_d440c::MODE_NWDAF_MOBILITY);
+        let (_nwdaf, port, _) = nwdaf_standin(
+            Some(nwdafd_predicts(&nwdaf_cell_of(4))),
+            Duration::ZERO,
+            None,
+        )
+        .await;
+        let _ep = NwdafEndpointOverride::set(port);
+        let mut ngap = capturing_ngap_server().await;
+        let base = 4_740u64;
+        nwdaf_grid(&ngap, base).await;
+        let ue = 464_321u64;
+        let supi = "imsi-001010000464321";
+        nextgcore_core::test_log::init();
+        let lines = nextgcore_core::test_log::watch(format!("ue={supi} "));
+        insert_nwdaf_ue(&ngap, ue, base + 1, Some(supi), Some(1));
+        queue_paging(&ngap, ue);
+        assert!(nwdaf_answer_applied(ue).await, "released");
+        take_sent_ngap(&mut ngap);
+        ngap.process_paging_with(Duration::from_secs(3600)).await;
+        assert_eq!(
+            paged_on(&take_sent_ngap(&mut ngap), ue as u32),
+            vec![base + 1]
+        );
+        let demo: Vec<String> = lines
+            .records()
+            .into_iter()
+            .filter(|r| r.contains("[demo:d440c-nwdaf-paging]"))
+            .collect();
+        assert_eq!(demo.len(), 1, "{demo:?}");
+        assert!(
+            demo[0].ends_with(&format!(
+                "[demo:d440c-nwdaf-paging] Paging sent to 1/1 ue={supi} scope=last-known \
+                 targets=[gNB 0x1] attempt 1"
+            )),
+            "{demo:?}"
+        );
+        crate::context::amf_self().read().unwrap().paging_remove(ue);
+    }
+
+    /// **demo d440c-nwdaf-paging**, the success signal's last line, through a real
+    /// Service Request in an Initial UE Message from gNB 0x7: `page answered
+    /// ue=<supi> via gNB 0x7 attempt 2`, for a page on its first retransmission.
+    /// With the demo off, the same answer writes no `[demo:` line.
+    #[cfg(feature = "demo-d440c-nwdaf-paging")]
+    #[tokio::test]
+    async fn demo_logs_the_gnb_and_attempt_that_answered_the_page() {
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        // The Initial Context Setup that carries the Service Accept needs a served
+        // GUAMI; `served_guami` is process-global, so this holds CONTEXT_GUARD.
+        serve_only_local_guami();
+        nextgcore_core::test_log::init();
+        for (i, demo_on) in [true, false].into_iter().enumerate() {
+            let _mode = demo_on.then(|| {
+                crate::demo_d440c::ModeOnThisThread::set(crate::demo_d440c::MODE_NWDAF_MOBILITY)
+            });
+            let mut ngap = capturing_ngap_server().await;
+            let assoc = 4_750u64 + i as u64;
+            insert_pws_test_gnb(
+                &ngap,
+                assoc,
+                0x7,
+                crate::context::RatType::Nr,
+                &[("001", "01", 0x74)],
+            )
+            .await;
+            let old_id = 4_640_501u64 + 10 * i as u64;
+            let new_id = old_id + 1;
+            let supi = format!("imsi-00101000046450{i}");
+            ngap.forced_amf_ue_ngap_id = Some(new_id);
+            let mut idle = idle_registered_ue(old_id);
+            idle.amf_ue.allowed_nssai = vec![crate::context::SNssai { sst: 1, sd: None }];
+            ngap.ue_auth_state.insert(old_id, idle);
+            let mut paging = paged_ue(old_id, 4);
+            paging.supi = Some(supi.clone());
+            paging.retransmit_count = 1;
+            crate::context::amf_self()
+                .read()
+                .unwrap()
+                .paging_add(paging);
+            let lines = nextgcore_core::test_log::watch(format!("page answered ue={supi} "));
+
+            let pdu = service_request_initial_ue(protected_service_request([0; 4], old_id as u32));
+            let _ = ngap.handle_initial_ue_message(assoc, &pdu).await;
+            assert!(
+                crate::context::amf_self()
+                    .read()
+                    .unwrap()
+                    .paging_find(old_id)
+                    .is_none(),
+                "precondition: the Service Request answered the page"
+            );
+            let answered = lines.records();
+            if demo_on {
+                assert_eq!(answered.len(), 1, "{answered:?}");
+                assert!(
+                    answered[0].ends_with(&format!(
+                        "[demo:d440c-nwdaf-paging] page answered ue={supi} via gNB 0x7 attempt 2"
+                    )),
+                    "{answered:?}"
+                );
+            } else {
+                assert!(answered.is_empty(), "demo off: {answered:?}");
+            }
+            ngap.ue_auth_state.remove(new_id);
+            ngap.ue_auth_state.remove(old_id);
         }
     }
 
