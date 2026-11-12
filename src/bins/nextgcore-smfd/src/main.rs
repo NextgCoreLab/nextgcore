@@ -8028,7 +8028,9 @@ async fn run_gsm_timer_tick() {
                 // the shutdown check, for that long times N.
                 // #1390 review round 4: a QoS Monitoring Request is resent by the
                 // session's RAN-leg owner, after whatever it is sending, so the
-                // retransmission cannot reach the AMF after a later request.
+                // retransmission cannot reach the AMF after a later request. The
+                // owner takes a fan-out slot for it (`retransmit_qos_monitoring`),
+                // as `spawn_gsm_expiry` does for the others.
                 if entry.n2.as_ref().is_some_and(|n2| n2.qos_monitoring) {
                     qos_mon::retransmit_due(&sm_context_ref, attempt);
                     continue;
@@ -8467,7 +8469,11 @@ async fn send_n1n2_honouring_paging_conflict(
             PagingRetries::Spawned => {
                 tokio::spawn(retry);
             }
-            PagingRetries::Awaited => {
+            PagingRetries::Awaited(slot) => {
+                // A 5GSM expiry slot bounds the transfers in flight, not the
+                // `retryAfter` waits (#1390 follow-up): the Spawned retries do
+                // not hold one either.
+                drop(slot);
                 retry.await;
             }
         }
@@ -8477,14 +8483,22 @@ async fn send_n1n2_honouring_paging_conflict(
 
 /// Where [`send_n1n2_honouring_paging_conflict`] runs the retries of a refused
 /// transfer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum PagingRetries {
     /// On their own task: the caller serves other UEs and must not wait.
     Spawned,
     /// Inline, before returning (#1390 review round 4): the caller is the one
     /// task sending the session's QoS Monitoring Requests, and a retry spawned
     /// past its return could reach the AMF after a later request.
-    Awaited,
+    ///
+    /// The caller waits for all of them: the first transfer (2 s connect + 3 s
+    /// request) and up to [`N1N2_PAGING_CONFLICT_RETRIES`] retries, each after
+    /// up to [`N1N2_RETRY_AFTER_MAX_S`] and with the same timeouts, about 330 s
+    /// in all. The session's later QoS Monitoring Requests wait that long.
+    ///
+    /// The [`GSM_EXPIRY_FANOUT`] slot a T3591 retransmission holds (#874) is
+    /// released once the first transfer is answered, before the retries.
+    Awaited(Option<tokio::sync::OwnedSemaphorePermit>),
 }
 
 /// How a refused N1N2MessageTransfer's retries ended (#749), for the log and the
@@ -10177,7 +10191,7 @@ pub(crate) async fn signal_qos_monitoring(
         &n2,
         paged,
         sm_context_ref,
-        PagingRetries::Awaited,
+        PagingRetries::Awaited(None),
     )
     .await;
     QosMonitoringSignal::Sent
@@ -10201,7 +10215,15 @@ pub(crate) fn qos_monitoring_held_back(sm_context_ref: &str) -> bool {
 /// review round 4), from the session's `qos_mon` RAN-leg owner, awaited with its
 /// 409 retries. Not sent when the timer moved on meanwhile: a later request
 /// re-armed it, or the procedure ended.
+///
+/// It takes one of the [`GSM_EXPIRY_FANOUT`] slots, as every other 5GSM
+/// retransmission does (#874), so N monitored sessions expiring on one tick do
+/// not open N AMF connections at once. The owner waits for the slot, so the
+/// session's requests stay in order. The timer is checked after the wait.
 pub(crate) async fn retransmit_qos_monitoring(sm_context_ref: &str, attempt: u32) {
+    let Ok(slot) = gsm_expiry_permits().clone().acquire_owned().await else {
+        return;
+    };
     let entry = gsm_procedure_timers().lock().ok().and_then(|t| {
         t.get(sm_context_ref)
             .filter(|e| e.timer_id == timer::SmfTimerId::T3591 && e.attempts == attempt)
@@ -10223,7 +10245,7 @@ pub(crate) async fn retransmit_qos_monitoring(sm_context_ref: &str, attempt: u32
             &n2.transfer,
             n2.paged,
             sm_context_ref,
-            PagingRetries::Awaited,
+            PagingRetries::Awaited(Some(slot)),
         )
         .await;
     }
@@ -27361,6 +27383,155 @@ mod tests {
             srv.stop().await.ok();
         }
         drop(posts);
+    }
+
+    /// The session's T3591 is due now: the next tick retransmits, toward
+    /// `amf_port`.
+    fn t3591_due_1390(reference: &str, amf_port: u16) {
+        let mut timers = gsm_procedure_timers().lock().unwrap();
+        let t = timers.get_mut(reference).expect("T3591 armed");
+        assert_eq!(t.timer_id, timer::SmfTimerId::T3591);
+        t.amf_uri = Some(format!("http://127.0.0.1:{amf_port}/sm-status"));
+        t.deadline = std::time::Instant::now() - std::time::Duration::from_millis(1);
+    }
+
+    /// #1390 follow-up (review round 4 m1, #874): a QoS Monitoring T3591
+    /// retransmission takes one of the GSM_EXPIRY_FANOUT slots, as every other
+    /// 5GSM retransmission does, so N monitored sessions expiring on one tick
+    /// do not open N AMF connections at once. With every slot taken, it waits;
+    /// once one is free it is sent. A 409's `retryAfter` wait does not hold the
+    /// slot.
+    ///
+    /// REVERT-VERIFIED: without the slot in `retransmit_qos_monitoring`, the
+    /// retransmission reaches the AMF while all 16 are taken; with the slot held
+    /// through the retries, none is free during the 1 s `retryAfter`.
+    // The event-store lock is held across awaits, as the other event tests do
+    // (event_exposure::STORE_LOCK).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_qos_monitoring_retransmission_takes_a_5gsm_expiry_slot_1390() {
+        use nextgcore_ngap_gen::generated::QosMonitoringRequest as Q;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _q = qos_mon::TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _e = event_exposure::lock_store();
+        event_exposure::clear_for_test();
+        qos_mon::clear_for_test();
+        let supi = "imsi-001010000013916";
+        let (_upf, reference, amf, posts) = qos_mon_session_1390(supi, 5, true).await;
+        let x = qos_mon_subscription_1390(supi, &["QOS_MON"], "http://127.0.0.1:9/x");
+        qos_mon::subscribed(&x).await;
+        assert_eq!(await_n1n2_1385(&posts, 1).await.len(), 1);
+        wait_until(|| qos_mon::ran_idle_for_test(&reference)).await;
+
+        // The retransmission's AMF refuses it once (409, retryAfter 1 s).
+        let (amf_c, port_c, posts_c) = n1n2_recording_amf_1385(true).await;
+        t3591_due_1390(&reference, port_c);
+        let slots = gsm_expiry_permits()
+            .clone()
+            .acquire_many_owned(GSM_EXPIRY_FANOUT as u32)
+            .await
+            .expect("the slots");
+        run_gsm_timer_tick().await;
+        let while_taken = settled_n1n2_1385(&posts_c).await.len();
+        drop(slots);
+        let refused = await_n1n2_1385(&posts_c, 1).await.len();
+        // The 409's retry is 1 s away: the slot is free meanwhile.
+        wait_until(|| gsm_expiry_permits().available_permits() == GSM_EXPIRY_FANOUT).await;
+        let free_while_waiting = (
+            gsm_expiry_permits().available_permits(),
+            posts_c.lock().unwrap().len(),
+        );
+        let got = await_n1n2_1385(&posts_c, 2).await;
+        wait_until(|| qos_mon::ran_idle_for_test(&reference)).await;
+
+        assert_eq!(
+            while_taken, 0,
+            "sent while every 5GSM expiry slot was taken"
+        );
+        assert_eq!(refused, 1, "sent once a slot was free");
+        assert_eq!(
+            free_while_waiting,
+            (GSM_EXPIRY_FANOUT, 1),
+            "the slot is free while the refused retransmission waits its retryAfter"
+        );
+        assert_eq!(got.len(), 2, "the refused retransmission is retried");
+        for p in &got {
+            assert_eq!(n2_monitoring_1390(&p.3), vec![(9, Some(Q::BOTH))]);
+        }
+
+        cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
+        qos_mon::forget(&reference);
+        qos_mon::quiesce_for_test().await;
+        cancel_gsm_timer_for_test(&reference);
+        forget_seeded_session(&reference);
+        event_exposure::clear_for_test();
+        for srv in [amf, amf_c] {
+            srv.stop().await.ok();
+        }
+    }
+
+    /// #1390 follow-up (review round 4 m2): T3591 falls due on the armed `both`,
+    /// and a new request is decided (as after a path switch) before the owner
+    /// looks. The new request is NotSent (the session has lost its AMF callback
+    /// URI), so nothing re-arms T3591, and its retransmission still goes out, to
+    /// the AMF it was armed with.
+    ///
+    /// REVERT-VERIFIED: with the due retransmission cleared when the new request
+    /// is decided, or when it comes back NotSent, the AMF receives nothing.
+    // The event-store lock is held across awaits, as the other event tests do
+    // (event_exposure::STORE_LOCK).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_not_sent_request_keeps_the_t3591_retransmission_due_1390() {
+        use nextgcore_ngap_gen::generated::QosMonitoringRequest as Q;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _q = qos_mon::TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _e = event_exposure::lock_store();
+        event_exposure::clear_for_test();
+        qos_mon::clear_for_test();
+        let supi = "imsi-001010000013917";
+        let (_upf, reference, amf, posts) = qos_mon_session_1390(supi, 5, true).await;
+        let x = qos_mon_subscription_1390(supi, &["QOS_MON"], "http://127.0.0.1:9/x");
+        qos_mon::subscribed(&x).await;
+        let first = await_n1n2_1385(&posts, 1).await;
+        assert_eq!(first.len(), 1);
+        wait_until(|| qos_mon::ran_idle_for_test(&reference)).await;
+
+        let (amf_c, port_c, posts_c) = n1n2_recording_amf_1385(false).await;
+        t3591_due_1390(&reference, port_c);
+        // The expiry, as the tick takes it, without the tick's hand-off.
+        let attempt = expire_gsm_timers(std::time::Instant::now())
+            .into_iter()
+            .find_map(|(r, _, e)| match e {
+                GsmTimerExpiry::Retransmit { attempt } if r == reference => Some(attempt),
+                _ => None,
+            })
+            .expect("T3591 retransmits");
+        if let Ok(ctx) = smf_self().read() {
+            if let Some(b) = ctx.policy_bindings.write().unwrap().get_mut(&reference) {
+                b.sm_context_status_uri = None;
+            }
+        }
+        qos_mon::retransmit_due_with_a_new_request_for_test(&reference, attempt);
+        let got = await_n1n2_1385(&posts_c, 1).await;
+        wait_until(|| qos_mon::ran_idle_for_test(&reference)).await;
+
+        assert_eq!(got.len(), 1, "the due T3591 retransmission is sent");
+        assert_eq!(n2_monitoring_1390(&got[0].3), vec![(9, Some(Q::BOTH))]);
+        assert_eq!(got[0].3, first[0].3, "the armed request, as first sent");
+        assert_eq!(posts.lock().unwrap().len(), 1, "nothing else is sent");
+
+        cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
+        qos_mon::forget(&reference);
+        qos_mon::quiesce_for_test().await;
+        cancel_gsm_timer_for_test(&reference);
+        forget_seeded_session(&reference);
+        event_exposure::clear_for_test();
+        for srv in [amf, amf_c] {
+            srv.stop().await.ok();
+        }
     }
 
     /// #1390 review m4: subscribe first, then the session's user plane comes up:
