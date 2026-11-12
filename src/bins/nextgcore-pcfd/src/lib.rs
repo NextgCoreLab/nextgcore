@@ -39,6 +39,7 @@ pub mod npcf_eventexposure; // TS 29.523: policy-control event exposure
 pub mod npcf_handler;
 pub mod nudr_handler;
 pub mod pcf_sm;
+pub mod policy_data_sub; // #1458: the UDR policy-data subscription maintainer
 pub mod sbi_path;
 pub mod sm_policy_build;
 pub mod timer;

@@ -1753,96 +1753,12 @@ pub fn policy_data_subscription_body(notification_uri: &str) -> serde_json::Valu
     })
 }
 
-/// Subscribe to the UDR for policy-data changes (TS 23.502 §4.16.11, TS 29.519 §5.2).
-///
-/// Called from `main` AFTER the SBI server is listening, so the URI in the subscription
-/// is already being served when the UDR can first use it. Best-effort: no UDR, no NRF,
-/// or a refusal leaves the PCF behaving exactly as it did before #299 — an operator's
-/// edit then reaches a live session through no path, which is the gap, not a crash.
-///
-/// Returns the created subscription's resource URI when the UDR reported one, so
-/// shutdown can delete it.
-pub async fn pcf_subscribe_udr_policy_data() -> Option<String> {
-    let notification_uri = policy_data_notify_uri()?;
-    let ep = match pcf_discover_endpoint("UDR", "nudr-dr").await {
-        Ok(Some(ep)) => ep,
-        Ok(None) => {
-            log::info!(
-                "No UDR discoverable: not subscribing to policy-data changes. An operator \
-                 edit will reach a live SM policy association through no path (#299)."
-            );
-            return None;
-        }
-        Err(e) => {
-            log::warn!("UDR discovery for the policy-data subscription failed: {e}");
-            return None;
-        }
-    };
-    let client = client_for(&ep, NfType::Udr);
-    let body = policy_data_subscription_body(&notification_uri);
-    match client
-        .post_json("/nudr-dr/v2/policy-data/subs-to-notify", &body)
-        .await
-    {
-        Ok(resp) if resp.status == 201 => {
-            let location = resp
-                .http
-                .headers
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("location"))
-                .map(|(_, v)| v.clone());
-            log::info!(
-                "Subscribed to UDR policy-data changes; notifications arrive at \
-                 {notification_uri} (subscription {})",
-                location.as_deref().unwrap_or("<no Location>"),
-                notification_uri =
-                    nextgcore_sbi::log_redact::redact_last_segment(&notification_uri)
-            );
-            location
-        }
-        Ok(resp) => {
-            log::warn!(
-                "UDR refused the policy-data subscription: status {} — subscription changes \
-                 will not reach live SM policy associations",
-                resp.status
-            );
-            None
-        }
-        Err(e) => {
-            log::warn!("UDR policy-data subscription failed: {e}");
-            None
-        }
-    }
-}
-
-/// Delete this PCF's policy-data subscription at shutdown (#299).
-///
-/// `resource` is the `Location` the UDR returned. Best effort and logged: a UDR that
-/// keeps the subscription only logs a delivery failure per notification, so failing
-/// loudly here would be noise, but staying silent would hide a leak that outlives the
-/// process.
-pub async fn pcf_unsubscribe_udr_policy_data(resource: &str) {
-    let Ok(Some(ep)) = pcf_discover_endpoint("UDR", "nudr-dr").await else {
-        log::warn!("No UDR discoverable at shutdown: policy-data subscription {resource} leaks");
-        return;
-    };
-    let client = client_for(&ep, NfType::Udr);
-    let path = uri_path_only(resource);
-    match client.delete(&path).await {
-        Ok(resp) if (200..300).contains(&resp.status) => {
-            log::info!("Policy-data subscription {resource} deleted");
-        }
-        Ok(resp) => log::warn!(
-            "UDR answered {} to DELETE {path}: the policy-data subscription may linger",
-            resp.status
-        ),
-        Err(e) => log::warn!("DELETE {path} failed: {e}; the policy-data subscription may linger"),
-    }
-}
+// #1458: subscribing, keeping the subscription alive and deleting it at shutdown
+// live in `crate::policy_data_sub`.
 
 /// The path part of a possibly-absolute resource URI, so a `Location` given either way
 /// can be used as a request target.
-fn uri_path_only(uri: &str) -> String {
+pub(crate) fn uri_path_only(uri: &str) -> String {
     match uri.find("://") {
         Some(i) => match uri[i + 3..].find('/') {
             Some(j) => uri[i + 3 + j..].to_string(),
