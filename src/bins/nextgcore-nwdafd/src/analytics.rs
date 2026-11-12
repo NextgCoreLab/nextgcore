@@ -259,6 +259,27 @@ impl AnalyticsEngine {
         self.compute_nf_load_in_window(nf_instance_id, None)
     }
 
+    /// One-step-ahead backtest of the active predictor over the newest `last`
+    /// points of each NF's CPU-load series (nextgsim#468, the AnLF's accuracy
+    /// monitoring): `(sum of |prediction - observed|, points)`. Each point is
+    /// predicted from the samples before it, exactly as the analytics path
+    /// would have predicted it with this model.
+    #[cfg(feature = "demo-d441e-model-retrain")]
+    pub fn backtest_nf_load(&self, last: usize) -> (f64, usize) {
+        let (mut sum, mut n) = (0.0, 0usize);
+        for samples in self.nf_samples.values() {
+            let series: Vec<f64> = samples.iter().map(|s| s.cpu_usage).collect();
+            let from = series.len().saturating_sub(last).max(1);
+            for t in from..series.len() {
+                if let Some((p, _)) = self.predictor.0.predict_series(&series[..t]) {
+                    sum += (p - series[t]).abs().clamp(0.0, 1.0);
+                    n += 1;
+                }
+            }
+        }
+        (sum, n)
+    }
+
     /// Compute NF load analytics from the samples inside `window` only
     /// (issue #171).
     ///

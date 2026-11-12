@@ -1547,6 +1547,15 @@ pub async fn handle_subscription_delete(subscription_id: &str) -> SbiResponse {
 /// Parse the request body of an ML-provision subscription POST/PUT into JSON.
 /// On failure returns a small `(detail, cause)` pair the caller turns into a
 /// 400 `ProblemDetails` (keeps the `Err` variant tiny — `clippy::result_large_err`).
+/// The NF instance id of an NWDAF consumer from its `User-Agent`
+/// (`NWDAF-<nfInstanceId>`, TS 29.500 Table 5.2.2.2-1; the NF type is case
+/// insensitive, NOTE 1), if it sent one.
+pub fn nwdaf_consumer_of(request: &SbiRequest) -> Option<String> {
+    let ua = request.http.get_header("User-Agent")?;
+    let (nf_type, id) = ua.split_once('-')?;
+    (nf_type.eq_ignore_ascii_case("NWDAF") && !id.is_empty()).then(|| id.to_string())
+}
+
 fn ml_prov_request_json(
     request: &SbiRequest,
 ) -> Result<serde_json::Value, (&'static str, &'static str)> {
@@ -1592,7 +1601,8 @@ pub fn handle_ml_prov_subscription_create_with_ctx(
     };
 
     let subscription_id = format!("mlsub-{}", uuid::Uuid::new_v4());
-    let sub = MlProvSubscription::from_parsed(subscription_id.clone(), parsed);
+    let mut sub = MlProvSubscription::from_parsed(subscription_id.clone(), parsed);
+    sub.consumer_id = nwdaf_consumer_of(request);
 
     match context.add_ml_prov_subscription(sub.clone()) {
         Some(sub_id) => SbiResponse::with_status(201)
@@ -1628,7 +1638,8 @@ pub async fn handle_ml_prov_subscription_update(
         Err(detail) => return send_bad_request(&detail, Some("MANDATORY_IE_MISSING")),
     };
 
-    let sub = MlProvSubscription::from_parsed(subscription_id.to_string(), parsed);
+    let mut sub = MlProvSubscription::from_parsed(subscription_id.to_string(), parsed);
+    sub.consumer_id = nwdaf_consumer_of(request);
 
     let ctx = nwdaf_self();
     let updated = if let Ok(context) = ctx.read() {

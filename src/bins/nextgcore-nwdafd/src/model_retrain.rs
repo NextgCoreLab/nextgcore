@@ -473,10 +473,14 @@ pub async fn subscribe_once(
     anlf: &Anlf,
     target: &MtlfTarget,
     sbi_base: &str,
+    own_id: &str,
     threshold: u8,
 ) -> Result<Value, String> {
     let body = subscription_body(&anlf.notify_uri(sbi_base), threshold);
+    // `User-Agent: NWDAF-<own id>` (TS 29.500 Table 5.2.2.2-1) lets the MTLF
+    // find this AnLF's threshold when it registers a model (PR 3).
     let resp = client(&target.host, target.port)
+        .with_client_identity(nextgcore_sbi::types::NfType::Nwdaf, own_id)
         .post_json("/nnwdaf-mlmodelprovision/v1/subscriptions", &body)
         .await
         .map_err(|e| {
@@ -528,7 +532,7 @@ pub async fn run_client(config: AnlfConfig, nrf_uri: String, sbi_base: String, o
     loop {
         let attempt = async {
             let target = find_mtlf(&config, &nrf_uri, &own_id).await?;
-            subscribe_once(anlf, &target, &sbi_base, config.accuracy_threshold).await
+            subscribe_once(anlf, &target, &sbi_base, &own_id, config.accuracy_threshold).await
         };
         match attempt.await {
             Ok(_) => return,
@@ -973,6 +977,8 @@ pub async fn fetch_verify_load(
                 loaded.version,
                 loaded.sha256
             );
+            // PR 3: register the use of this model at the MTLF (§6.2E.3.2).
+            crate::model_monitor::on_model_loaded(anlf.mtlf(), &loaded.sha256);
             Ok(Some(loaded))
         }
         Err(refusal) => {

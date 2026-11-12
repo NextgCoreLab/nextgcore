@@ -80,7 +80,7 @@ impl ModelVersion {
     /// first 48 bits of the sha256, so the same bytes have the same id in any
     /// process and the value stays exact in a JSON number (< 2^53).
     pub fn unique_id(&self) -> u64 {
-        u64::from_str_radix(&self.sha256[..12], 16).unwrap_or(0)
+        unique_id_of(&self.sha256)
     }
 
     /// The artefact URL a notification for `event` advertises.
@@ -92,6 +92,14 @@ impl ModelVersion {
             self.sha256
         )
     }
+}
+
+/// The `modelUniqueId` of the artefact with this sha256: its first 48 bits.
+pub fn unique_id_of(sha256: &str) -> u64 {
+    sha256
+        .get(..12)
+        .and_then(|p| u64::from_str_radix(p, 16).ok())
+        .unwrap_or(0)
 }
 
 /// Lowercase hex sha256.
@@ -198,6 +206,11 @@ impl ModelStore {
     /// A retained version by its sha256 address.
     pub fn get(&self, sha256: &str) -> Option<&ModelVersion> {
         self.versions.iter().find(|v| v.sha256 == sha256)
+    }
+
+    /// A retained version by its `modelUniqueId`.
+    pub fn get_by_unique_id(&self, id: u64) -> Option<&ModelVersion> {
+        self.versions.iter().find(|v| v.unique_id() == id)
     }
 
     /// How many versions are retained.

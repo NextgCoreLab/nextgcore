@@ -12,7 +12,7 @@
 //! retained far more widely than the NF that holds the token.
 
 /// Path segments whose NEXT segment is a callback token.
-pub const CALLBACK_TOKEN_SEGMENTS: [&str; 6] = [
+pub const CALLBACK_TOKEN_SEGMENTS: [&str; 7] = [
     "nf-status-notify",
     "dereg-notify",
     "amf-location-notify",
@@ -21,6 +21,8 @@ pub const CALLBACK_TOKEN_SEGMENTS: [&str; 6] = [
     "ee-amf-subs-change",
     // The AnLF's Nnwdaf_MLModelProvision notifUri (nextgsim#468).
     "mtlf-model-notify",
+    // The MTLF's Nnwdaf_MLModelMonitor notificationUri (nextgsim#468).
+    "mlmodel-monitor-notify",
 ];
 
 /// What a redacted segment is replaced with.
@@ -106,6 +108,11 @@ mod tests {
         assert_eq!(
             redact_callback_tokens("/nnwdaf-callback/v1/amf-ues-in-area-notify/0a1b2c3d"),
             "/nnwdaf-callback/v1/amf-ues-in-area-notify/<redacted>"
+        );
+        // nextgsim#468: the MTLF's MLModelMonitor notify callback.
+        assert_eq!(
+            redact_callback_tokens("/nnwdaf-callback/v1/mlmodel-monitor-notify/abc1"),
+            "/nnwdaf-callback/v1/mlmodel-monitor-notify/<redacted>"
         );
         // nextgsim#468: the AnLF's MLModelProvision notify callback.
         assert_eq!(
