@@ -2432,7 +2432,17 @@ impl AmfContext {
             // never takes is abandoned on time, but it is not sent again.
             let send = ctx.answered_by.is_none();
             match ctx.last_sent {
+                // nextgsim#464: the first PAGING waits for the NWDAF's answer, at most
+                // until the deadline. Only this context is held; every other one in
+                // this pass is decided as usual, and nothing here awaits.
+                None if ctx.nwdaf_wait_until.is_some_and(|t| now < t) => {}
                 None => {
+                    if ctx.nwdaf_wait_until.take().is_some() {
+                        log::info!(
+                            "[UE NGAP ID: {id}] NWDAF UE mobility: no answer within the \
+                             deadline; paging the registration area"
+                        );
+                    }
                     ctx.last_sent = Some(now);
                     if send {
                         due.send.push(ctx.clone());
@@ -2462,6 +2472,29 @@ impl AmfContext {
             }
         }
         due
+    }
+
+    /// nextgsim#464: apply the NWDAF's UE mobility answer to a queued page whose
+    /// first PAGING has not gone out yet, and release that first PAGING. `None` is
+    /// "no prediction" (fail-open). Returns whether it was applied: an answer for a
+    /// page already sent, answered or gone is moot, because only the first attempt
+    /// is targeted.
+    pub fn paging_set_nwdaf_hint(
+        &self,
+        amf_ue_ngap_id: u64,
+        predicted: Option<PredictedCell>,
+    ) -> bool {
+        let Ok(mut paging_map) = self.paging_map.write() else {
+            return false;
+        };
+        match paging_map.get_mut(&amf_ue_ngap_id) {
+            Some(ctx) if ctx.last_sent.is_none() && ctx.nwdaf_wait_until.is_some() => {
+                ctx.nwdaf_wait_until = None;
+                ctx.nwdaf_predicted = predicted;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Remove and return the paging context for the UE identified by this
@@ -4840,6 +4873,14 @@ pub enum PagingStrategy {
     /// T3513 retransmission (TS 23.502 §4.2.3.3: when the information is
     /// available the AMF "shall take that information into account").
     RecommendedFirst,
+    /// nextgsim#464: when paging starts, ask the NWDAF for the UE's mobility
+    /// prediction (Nnwdaf_AnalyticsInfo UE_MOBILITY, TS 23.288 §6.7.2) and page
+    /// the gNB serving the predicted cell on the first attempt, then the whole
+    /// registration area on every T3513 retransmission. TS 23.501 §5.4.3.1: "If
+    /// NWDAF is deployed, the AMF may also use analytics ... on the UE's mobility
+    /// as provided by NWDAF". Fails open: no answer in time, or a prediction that
+    /// names no gNB serving the area, pages the area from the first attempt.
+    NwdafMobility,
 }
 
 impl PagingStrategy {
@@ -4848,8 +4889,21 @@ impl PagingStrategy {
         match self {
             Self::RegistrationArea => "registration-area",
             Self::RecommendedFirst => "recommended-first",
+            Self::NwdafMobility => "nwdaf-mobility",
         }
     }
+}
+
+/// The NWDAF's UE mobility prediction for a paged UE (nextgsim#464): the NR cell
+/// a TS 29.520 `UeMobility` names with the highest confidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredictedCell {
+    /// The NCGI's PLMN.
+    pub plmn_id: PlmnId,
+    /// The 36-bit NR Cell Identity.
+    pub nci: u64,
+    /// `confidence` in percent, when the NWDAF gave one.
+    pub confidence: Option<u8>,
 }
 
 /// One entry of the Recommended RAN Nodes for Paging (TS 38.413 §9.3.1.101): the
@@ -4929,6 +4983,15 @@ pub struct PagingContext {
     /// every retransmission, and a first attempt none of them resolves, goes to
     /// the whole registration area (TS 23.502 §4.2.3.3).
     pub recommended: Vec<RecommendedPagingTarget>,
+    /// nextgsim#464: while `Some` and in the future, the first PAGING is held for
+    /// the NWDAF's UE mobility answer ([`PagingStrategy::NwdafMobility`]). The pump
+    /// skips only this context's first transmission meanwhile; at the deadline it
+    /// goes out to the registration area (fail-open). Cleared when the answer
+    /// arrives.
+    pub nwdaf_wait_until: Option<std::time::Instant>,
+    /// nextgsim#464: the NWDAF's prediction, set before the first transmission.
+    /// Read on the first attempt only.
+    pub nwdaf_predicted: Option<PredictedCell>,
 }
 
 /// What one paging pump pass decided (TS 24.501 §5.6.2.2.1 / §5.6.2.2.2).
@@ -4967,6 +5030,8 @@ impl Default for PagingContext {
             supi: None,
             answered_by: None,
             recommended: Vec::new(),
+            nwdaf_wait_until: None,
+            nwdaf_predicted: None,
         }
     }
 }
@@ -5883,6 +5948,64 @@ mod tests {
 
         sess.clear_session_context();
         assert!(!sess.session_context_in_smf());
+    }
+
+    /// nextgsim#464: a first PAGING waiting for the NWDAF is held, alone. Another
+    /// UE's page in the same pass goes out. The answer releases the held one with
+    /// its prediction; the deadline releases another with none (fail-open). An
+    /// answer for a page already sent is not applied.
+    #[test]
+    fn a_page_waiting_for_the_nwdaf_is_held_alone_until_the_answer_or_the_deadline() {
+        let mut ctx = AmfContext::new();
+        ctx.init(64, 1024, 4096);
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let t3513 = std::time::Duration::from_secs(3600);
+        ctx.paging_add(PagingContext {
+            amf_ue_ngap_id: 1,
+            nwdaf_wait_until: Some(far),
+            ..Default::default()
+        });
+        ctx.paging_add(PagingContext {
+            amf_ue_ngap_id: 2,
+            ..Default::default()
+        });
+        ctx.paging_add(PagingContext {
+            amf_ue_ngap_id: 3,
+            nwdaf_wait_until: Some(std::time::Instant::now()),
+            ..Default::default()
+        });
+        let ids = |due: &PagingDue| {
+            let mut v: Vec<u64> = due.send.iter().map(|p| p.amf_ue_ngap_id).collect();
+            v.sort_unstable();
+            v
+        };
+        let due = ctx.paging_take_due(t3513);
+        assert_eq!(
+            ids(&due),
+            vec![2, 3],
+            "UE 1 is held; UE 2 is not delayed; UE 3's deadline passed, so it pages"
+        );
+        assert!(due.send.iter().all(|p| p.nwdaf_predicted.is_none()));
+        assert!(ctx.paging_take_due(t3513).send.is_empty(), "still held");
+
+        let cell = PredictedCell {
+            plmn_id: PlmnId::new("001", "01"),
+            nci: 0x8005,
+            confidence: Some(67),
+        };
+        assert!(ctx.paging_set_nwdaf_hint(1, Some(cell.clone())));
+        let due = ctx.paging_take_due(t3513);
+        assert_eq!(ids(&due), vec![1], "the answer releases it");
+        assert_eq!(due.send[0].nwdaf_predicted, Some(cell.clone()));
+        assert!(
+            !ctx.paging_set_nwdaf_hint(1, Some(cell.clone())),
+            "an answer after the first PAGING is not applied"
+        );
+        assert!(
+            !ctx.paging_set_nwdaf_hint(2, Some(cell)),
+            "UE 2 never waited"
+        );
+        assert!(!ctx.paging_set_nwdaf_hint(99, None), "no such page");
     }
 
     /// #1102 (#1105 review m1): a page a registration answered is not sent again,

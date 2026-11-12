@@ -1045,7 +1045,7 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 }
 
 /// Format a SystemTime as an RFC 3339 UTC timestamp
-fn system_time_to_rfc3339(t: std::time::SystemTime) -> String {
+pub(crate) fn system_time_to_rfc3339(t: std::time::SystemTime) -> String {
     let secs = t
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -1273,7 +1273,7 @@ fn parse_tai(v: &Value) -> Option<Tai5gs> {
 /// indistinguishable from the default `NrCgi` that [`ue_ncgi_is_known`] uses to mean
 /// "never learned", so accepting it would make an area that matches every
 /// location-less UE.
-fn parse_ncgi(v: &Value) -> Option<NrCgi> {
+pub(crate) fn parse_ncgi(v: &Value) -> Option<NrCgi> {
     let nr_cell_id = v.get("nrCellId").and_then(Value::as_str)?;
     if nr_cell_id.len() != 9 || !nr_cell_id.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
