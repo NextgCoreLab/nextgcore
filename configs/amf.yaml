@@ -30,6 +30,15 @@ amf:
     integrity_order: ["NIA2", "NIA1", "NIA0"]
     ciphering_order: ["NEA2", "NEA1", "NEA0"]
 
+  # Paging strategy (#1442; TS 23.501 §5.4.3.1 makes it local policy).
+  # `registration-area` (the default) pages every gNB serving the UE's
+  # registration area on every attempt. `recommended-first` stores the RAN's
+  # Recommended RAN Nodes for Paging from UE CONTEXT RELEASE COMPLETE (TS 38.413
+  # §8.3.3.2) and pages those gNBs first, then the whole area on every T3513
+  # retransmission. See docs-book/src/configuration/amf.md "Paging strategy".
+  # paging:
+  #   strategy: registration-area
+
   # Emergency services (#361, TS 33.501 §10.2.2 / §5.1.2).
   #
   # REGULATORY setting, not a tuning knob. `true` (the default, shown explicitly

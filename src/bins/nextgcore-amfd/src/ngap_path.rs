@@ -525,13 +525,6 @@ fn integrity_failure_action(msg_type: u8, has_context: bool) -> IntegrityFailure
 /// T3513, the paging timer (TS 24.501 §5.6.2.2.1, Table 10.2.2: "network
 /// dependent"). 5 s unless `AMF_T3513_SECS` overrides it; `AMF_T3513_MILLIS`
 /// exists so tests can run the full retransmission ladder quickly.
-/// The configured paging strategy (`amf.paging.strategy`, #1442).
-fn paging_strategy() -> crate::context::PagingStrategy {
-    let ctx = crate::context::amf_self();
-    let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
-    guard.paging_strategy
-}
-
 fn paging_t3513() -> Duration {
     if let Some(ms) = std::env::var("AMF_T3513_MILLIS")
         .ok()
@@ -544,6 +537,13 @@ fn paging_t3513() -> Duration {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(5);
     Duration::from_secs(secs)
+}
+
+/// The configured paging strategy (`amf.paging.strategy`, #1442).
+fn paging_strategy() -> crate::context::PagingStrategy {
+    let ctx = crate::context::amf_self();
+    let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+    guard.paging_strategy
 }
 
 /// The plain SERVICE REQUEST inside an initial NAS message, if that is what it is:
@@ -24352,13 +24352,16 @@ mod tests {
                 vec![base + 3],
             ),
             (
-                "a TAI target: its serving gNBs",
-                vec![RecommendedPagingTarget::Tai(
-                    PlmnId::new("001", "01"),
-                    RECO_TAC,
-                )],
+                // Ordered, not sorted: gNB 2 first, then the TAI's other serving gNBs,
+                // so a TAI arm resolving to nothing (the fallback would page the same
+                // SET) fails on the order.
+                "a TAI target after a gNB: the TAI's serving gNBs, in order",
+                vec![
+                    node(2),
+                    RecommendedPagingTarget::Tai(PlmnId::new("001", "01"), RECO_TAC),
+                ],
                 0,
-                area.clone(),
+                vec![base + 2, base + 1, base + 3],
             ),
             ("a retransmission", vec![node(2)], 1, area.clone()),
         ];
@@ -24366,15 +24369,143 @@ mod tests {
         // always falling back.
         cases.push(("one recommended gNB", vec![node(2)], 0, vec![base + 2]));
         for (why, recommended, retransmit_count, expected) in cases {
+            // A recommendation is paged in its own order; the whole area (a HashMap
+            // walk) in none, so only a whole-area result is compared as a set.
+            let ordered = expected != area;
             ngap.send_paging(&page(recommended, retransmit_count))
                 .await
                 .expect("sent");
             let mut got = paged_on(&take_sent_ngap(&mut ngap), 1_442_003);
-            if expected.len() > 1 {
+            if !ordered {
                 got.sort_unstable();
             }
             assert_eq!(got, expected, "{why}");
         }
+    }
+
+    /// #1442 review: a CM-CONNECTED UE holding a recommendation stored at an earlier
+    /// release. The release stores it; the test then marks the UE connected again, as a
+    /// Service Request would. The stored list is asserted non-empty.
+    async fn connected_ue_with_a_stored_recommendation(base: u64, ue: u64, ran: u32) -> NgapServer {
+        let mut ngap = capturing_ngap_server().await;
+        reco_grid(&ngap, base).await;
+        insert_connected_ue(&ngap, ue, ran, base + 1);
+        ngap.handle_ue_context_release_complete(
+            base + 1,
+            &release_complete_with(ue, ran, Some(recommendation_of(&[3]))),
+        )
+        .await
+        .expect("handled");
+        settle_offloaded_sbi(&mut ngap).await;
+        ngap.ue_auth_state.with_mut(ue, |s| s.cm_idle = false);
+        let state = ngap.ue_auth_state.get(ue).expect("UE");
+        assert!(!state.is_cm_idle(), "precondition: CM-CONNECTED again");
+        assert_eq!(
+            state.amf_ue.recommended_paging.len(),
+            1,
+            "precondition: gNB 3 is stored"
+        );
+        take_sent_ngap(&mut ngap);
+        ngap
+    }
+
+    /// After a CM-IDLE entry with no Release Complete, the stored list is gone and the
+    /// first page reaches the whole registration area, not the stale gNB 3 alone.
+    async fn assert_no_stale_recommendation(ngap: &mut NgapServer, base: u64, ue: u64) {
+        let state = ngap.ue_auth_state.get(ue).expect("UE");
+        assert!(state.is_cm_idle(), "precondition: the UE went CM-IDLE");
+        assert!(
+            state.amf_ue.recommended_paging.is_empty(),
+            "the stale recommendation is cleared: {:?}",
+            state.amf_ue.recommended_paging
+        );
+        queue_paging(ngap, ue);
+        let paging = crate::context::amf_self()
+            .read()
+            .unwrap()
+            .paging_remove(ue)
+            .expect("queued");
+        take_sent_ngap(ngap);
+        ngap.send_paging(&paging).await.expect("sent");
+        let mut first = paged_on(&take_sent_ngap(ngap), ue as u32);
+        first.sort_unstable();
+        assert_eq!(
+            first,
+            vec![base + 1, base + 2, base + 3],
+            "attempt 1 pages the whole registration area"
+        );
+    }
+
+    /// **#1442 review (M1)**: an NG Reset moves the UE to CM-IDLE with no Release
+    /// Complete to replace the stored recommendation, so `release_ng_connections`
+    /// clears it. Otherwise a UE now camped on gNB 1 would be paged on the stale gNB 3
+    /// only, and reached one T3513 later at best.
+    #[tokio::test]
+    async fn an_ng_reset_clears_a_stored_recommendation() {
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _strategy =
+            PagingStrategyOverride::set(crate::context::PagingStrategy::RecommendedFirst);
+        let (base, ue) = (14_460u64, 1_442_005u64);
+        let mut ngap = connected_ue_with_a_stored_recommendation(base, ue, 65).await;
+        ngap.handle_ng_reset(
+            base + 1,
+            &ng_reset_pdu(nextgcore_ngap::types::ResetType::NgInterface),
+        )
+        .await
+        .expect("handled");
+        settle_offloaded_sbi(&mut ngap).await;
+        assert_no_stale_recommendation(&mut ngap, base, ue).await;
+    }
+
+    /// **#1442 review (M1)**: the loss of the gNB's association releases its UEs as
+    /// by an NG Reset (`reset_ue_associations_of`), through the same clear.
+    #[tokio::test]
+    async fn an_association_loss_clears_a_stored_recommendation() {
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _strategy =
+            PagingStrategyOverride::set(crate::context::PagingStrategy::RecommendedFirst);
+        let (base, ue) = (14_470u64, 1_442_006u64);
+        let mut ngap = connected_ue_with_a_stored_recommendation(base, ue, 66).await;
+        ngap.reset_ue_associations_of(base + 1, "SCTP association lost (test)")
+            .await;
+        settle_offloaded_sbi(&mut ngap).await;
+        assert_no_stale_recommendation(&mut ngap, base, ue).await;
+    }
+
+    /// **#1442 review (M1)**: an Initial Context Setup Failure for a registered UE
+    /// marks it CM-IDLE before its Release Command is answered. A page in that window
+    /// must not follow the earlier release's recommendation.
+    #[tokio::test]
+    async fn an_initial_context_setup_failure_clears_a_stored_recommendation() {
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _strategy =
+            PagingStrategyOverride::set(crate::context::PagingStrategy::RecommendedFirst);
+        let (base, ue) = (14_480u64, 1_442_007u64);
+        let mut ngap = connected_ue_with_a_stored_recommendation(base, ue, 67).await;
+        let failure = nextgcore_ngap::builder::build_initial_context_setup_failure(
+            &nextgcore_ngap::types::InitialContextSetupFailure {
+                amf_ue_ngap_id: ue,
+                ran_ue_ngap_id: 67,
+                cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                    nextgcore_ngap::types::CauseRadioNetwork::Unspecified,
+                ),
+            },
+        )
+        .expect("encode an Initial Context Setup Failure");
+        ngap.handle_initial_context_setup_failure(base + 1, &failure)
+            .await
+            .expect("handled");
+        settle_offloaded_sbi(&mut ngap).await;
+        assert!(
+            take_sent_ngap(&mut ngap)
+                .iter()
+                .any(|(_, pdu)| decoded_release_command(pdu).is_some()),
+            "precondition: the failure was handled (Release Command sent)"
+        );
+        assert_no_stale_recommendation(&mut ngap, base, ue).await;
     }
 
     /// **#1442**: a later release that carries no recommendation clears the stored
