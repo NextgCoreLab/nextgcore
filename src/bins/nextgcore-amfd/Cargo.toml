@@ -29,9 +29,20 @@ kernel-sctp = ["nextgcore-sctp/kernel"]
 ## from a per-UE TimingAdvance, falling back to a per-AMF default set via the
 ## AMF_NTN_TIMING_ADVANCE_US env var. Off by default: --features ntn
 ntn = ["dep:nextgcore-proto"]
+## nextgsim#464 (demo d440c-nwdaf-paging): the demo layer over the base
+## `paging.strategy: nwdaf-mobility`. Adds the `[demo:d440c-nwdaf-paging]` log
+## lines (scope, targets, the answering gNB), the modes (`nwdaf-mobility`,
+## `registration-area`), which force the effective paging strategy, and the
+## non-normative Assistance Data for Recommended Cells built from the NWDAF
+## prediction on a targeted first attempt. Active only with the `demo:` block on
+## as well. Off by default.
+demo-d440c-nwdaf-paging = []
 
 [dependencies]
 nextgcore-core = { workspace = true }
+# nextgsim#458: the shared `demo:` block. Linked in every build, so a block
+# naming a demo this build was not compiled with fails start-up.
+nextgcore-demo = { workspace = true }
 nextgcore-crypt = { workspace = true }
 # #115: TS 33.501 §5.9 — long-lived NAS/AS key material must not outlive the UE
 # context in recoverable memory. Already in this crate's dependency graph via

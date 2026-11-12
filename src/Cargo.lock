@@ -2419,6 +2419,7 @@ dependencies = [
  "nextgcore-asn1c",
  "nextgcore-core",
  "nextgcore-crypt",
+ "nextgcore-demo",
  "nextgcore-gtp",
  "nextgcore-metrics",
  "nextgcore-nas",
