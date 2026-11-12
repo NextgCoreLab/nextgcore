@@ -1,0 +1,56 @@
+# The D441A gNB pod (nextgsim#465): log level, CPU headroom, and nr-cli.
+#
+#   RUST_LOG=info   The base gnb.yaml runs nextgsim_gnb/sctp/ngap/gtp at debug,
+#                   one line per packet. Under UE-B's load (2C and more of
+#                   downlink) kubelet rotated the container log within the run on
+#                   devtest1, and `kubectl logs` returns only the newest file, so
+#                   the banner and `export: off` dropped out of the capture. Every
+#                   gNB line the scenario and demo-check.sh assert is at info or
+#                   warn: `[demo:d441a-congestion-loop] export: …` / `ran-export …`
+#                   (demo_log!(info), nextgsim_gnb::congestion::exporter) and
+#                   `DEMO MODE ACTIVE` (tracing::warn!, nextgsim_demo).
+#   cpu 1000m       the gNB forwards UE-B's whole offered load through its
+#                   capacity-C queue; the base 500m limit is not sized for it.
+#   nr-cli          scenario.sh reads `congestion-status` (the measured occupancy,
+#                   which the gNB logs nowhere in mode no-loop) through nr-cli in
+#                   the gNB container. The gNB image carries only nr-gnb, so an
+#                   initContainer copies nr-cli from the UE image (nextgsim's
+#                   Dockerfile.ue-local ships it when binaries/nr-cli is built).
+#                   Without it the pod fails to start, loudly.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gnb
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: d441a-nr-cli
+          image: nextgsim-ue:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              p="$(command -v nr-cli || true)"
+              [ -n "$p" ] || { echo "[d441a-nr-cli] FATAL: the UE image carries no nr-cli; build nextgsim-cli into nextgsim/binaries/ before build-and-push.sh"; exit 1; }
+              cp "$p" /opt/d441a/nr-cli
+          volumeMounts:
+            - name: d441a-tools
+              mountPath: /opt/d441a
+      containers:
+        - name: gnb
+          env:
+            - name: RUST_LOG
+              value: info
+          resources:
+            limits:
+              cpu: 1000m
+          volumeMounts:
+            - name: d441a-tools
+              mountPath: /opt/d441a
+              readOnly: true
+      volumes:
+        - name: d441a-tools
+          emptyDir: {}

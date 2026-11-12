@@ -1,0 +1,20 @@
+# UE-V's log level in this overlay (nextgsim#465), as #1472 does for d444a. The
+# base ue.yaml runs nextgsim_ue/nas/rls at debug, and even at info two targets
+# log per packet or per broadcast: nr_ue (`TUN uplink data`) and
+# nextgsim_ue::rrc (SIB lines). Both go to warn so kubelet does not rotate the
+# log within the run. No UE-V log line is asserted (the e2e and scenario.sh
+# read UE-V through `ip addr` and ping only); UE-B carries the same level in
+# ue-b.yaml, where `network set Session-AMBR` (info!, nextgsim_ue::app::task)
+# is asserted.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ue
+spec:
+  template:
+    spec:
+      containers:
+        - name: ue
+          env:
+            - name: RUST_LOG
+              value: info,nr_ue=warn,nextgsim_ue::rrc=warn

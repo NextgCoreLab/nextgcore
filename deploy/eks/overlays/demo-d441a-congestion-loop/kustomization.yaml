@@ -18,11 +18,19 @@
 #                       the arm or re-authorise UE-B after one mid-throttle.
 #   ue-b.yaml           UE-B (imsi-...002), scaled up by scenario.sh after its
 #                       subscriber is seeded. The base UE is UE-V.
+#   patches/gnb-d441a.yaml   the gNB at RUST_LOG=info and 1000m CPU, and nr-cli
+#                       copied in from the UE image (scenario.sh reads
+#                       congestion-status through it).
+#   patches/ue-log-level.yaml   UE-V without its per-packet log lines.
+#   At debug, kubelet rotated the gNB and UE logs within a run on devtest1 and
+#   the captures lost asserted lines; every asserted line is info or warn.
 #
 # Images: pcfd and nwdafd with --features demo-d441a-congestion-loop
 # (profiles/demo/profile.env adds them for this overlay); the gNB with nextgsim
 # --features demo-d441a-congestion-loop (SIM_IMAGE_TAG=demo-d441a-<sha>), or the
-# gNB fails startup with DemoConfigError::UnknownKey.
+# gNB fails startup with DemoConfigError::UnknownKey. The UE image must carry
+# nr-cli (build nextgsim-cli into nextgsim/binaries/ too), or the gNB pod's
+# d441a-nr-cli initContainer fails.
 #
 # No OAuth2-require on nwdafd's listener: amfd's UES_IN_AREA notify carries no
 # token (TS 33.501 §13.4.1), and nextgcore-sbi's require_oauth2 covers every
@@ -42,3 +50,11 @@ patches:
   - path: nrf-cca-mount.yaml
   - path: gnb-config.yaml
   - path: pcf-state.yaml
+  - path: patches/gnb-d441a.yaml
+    target:
+      kind: Deployment
+      name: gnb
+  - path: patches/ue-log-level.yaml
+    target:
+      kind: Deployment
+      name: ue
