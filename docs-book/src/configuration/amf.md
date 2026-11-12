@@ -192,6 +192,16 @@ Under `recommended-first` and `nwdaf-mobility`, every PAGING carries an *Assista
 
 Each attempt is a single PDU sent to every gNB paged in that attempt, so they all receive the same value (TS 23.502 §4.2.3.3). Both values stay within INTEGER (1..16). The default `registration-area` strategy sends no Assistance Data for Paging, and its PAGING is unchanged.
 
+## Demo block
+
+amfd reads the shared `demo:` block at the root of its config file (nextgsim#458). Its `enabled` key is the process kill switch, and each demo is configured under its own key with `enabled` and `mode`. The block is checked against the demos the binary was built with. An unknown key fails startup, as does an unknown mode or a demo whose cargo feature is not built. A default build registers no demo, so any `demo.<key>` entry there fails startup. With no demo active, amfd is unchanged.
+
+| Key | Cargo feature | Modes | Effect |
+|---|---|---|---|
+| `d440c-nwdaf-paging` (nextgsim#464) | `demo-d440c-nwdaf-paging` | `nwdaf-mobility`, `registration-area` | The mode sets the effective paging strategy and supersedes `paging.strategy`; amfd logs `[demo:d440c-nwdaf-paging] Paging strategy: ...` at startup. Adds `[demo:d440c-nwdaf-paging] Paging sent to N/M scope=<scope> targets=[gNB 0x..] attempt K` and `... page answered ue=<supi> via gNB 0x.. attempt K` lines. On an NWDAF-steered first attempt, the PAGING carries the last known and the predicted cells as Assistance Data for Recommended Cells. This is **non-normative**: TS 38.413 §9.3.1.71 makes that IE transparent to the 5GC. `ran-recommendation` is not accepted yet (`UnknownMode`). |
+
+When a demo is active, amfd logs `WARN DEMO MODE ACTIVE: <key>=<mode>` and exports `nextg_demo_enabled{demo,mode} 1` on `/metrics`. The demo switches only by config plus restart.
+
 ## Unauthenticated emergency service
 
 > **Set this key deliberately.** `amf.emergency.allow_unauthenticated` decides whether an emergency call connects when the AMF cannot authenticate the caller. In some jurisdictions the answer is legally mandatory; in others the feature is forbidden. The shipped default is `true`, and it is not the right value everywhere.

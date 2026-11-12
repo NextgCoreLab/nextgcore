@@ -7860,6 +7860,20 @@ impl NgapServer {
             )
             .await?;
         }
+        #[cfg(feature = "demo-d440c-nwdaf-paging")]
+        if let (Some(p), Some(_)) = (&paging, crate::demo_d440c::mode()) {
+            let gnb = self.gnb_ids_of(&[association_id]).await.first().copied();
+            nextgcore_demo::demo_log!(
+                info,
+                crate::demo_d440c::DEMO_KEY,
+                "{}",
+                crate::demo_d440c::page_answered_line(
+                    p.supi.as_deref().unwrap_or("unknown"),
+                    gnb.filter(|g| *g != 0),
+                    u32::from(p.retransmit_count) + 1
+                )
+            );
+        }
         log::info!(
             "Service Request from CM-IDLE: UE {old_id} -> {amf_ue_ngap_id}, Service Accept in \
              Initial Context Setup with {} PDU session(s){}",
@@ -19468,6 +19482,16 @@ impl NgapServer {
             _ => (Vec::new(), ""),
         };
         let area_len = area.len();
+        #[cfg(feature = "demo-d440c-nwdaf-paging")]
+        let demo_scope = if !recommended.is_empty() {
+            crate::demo_d440c::Scope::Recommended
+        } else if predicted.is_empty() {
+            crate::demo_d440c::Scope::RegistrationArea
+        } else if predicted_scope.starts_with("predicted") {
+            crate::demo_d440c::Scope::NwdafMobility
+        } else {
+            crate::demo_d440c::Scope::LastKnown
+        };
         let (targets, scope) = if !recommended.is_empty() {
             (
                 recommended,
@@ -19498,14 +19522,53 @@ impl NgapServer {
                 ))
             }
         };
-        let Some(paging_bytes) = crate::ngap_asn1::build_paging_with_attempt_asn1(
+        #[cfg(not(feature = "demo-d440c-nwdaf-paging"))]
+        let built = crate::ngap_asn1::build_paging_with_attempt_asn1(
             paging.amf_set_id,
             paging.amf_pointer,
             paging.tmsi,
             &plmn_id,
             tac,
             attempt_info.as_ref(),
-        ) else {
+        );
+        // Demo d440c-nwdaf-paging, non-normative: an NWDAF-steered first attempt
+        // also carries the last known and the predicted cells as Assistance Data
+        // for Recommended Cells (TS 38.413 §9.3.1.70-71).
+        #[cfg(feature = "demo-d440c-nwdaf-paging")]
+        let built = {
+            let cells = match (crate::demo_d440c::mode(), demo_scope) {
+                (
+                    Some(crate::demo_d440c::MODE_NWDAF_MOBILITY),
+                    crate::demo_d440c::Scope::NwdafMobility | crate::demo_d440c::Scope::LastKnown,
+                ) => crate::demo_d440c::recommended_cells(
+                    paging.nwdaf_last_cell.as_ref(),
+                    paging.nwdaf_predicted.as_ref(),
+                ),
+                _ => Vec::new(),
+            };
+            match (&attempt_info, cells.is_empty()) {
+                (Some(a), false) => crate::ngap_asn1::paging_assistance_with_cells_aper(a, &cells)
+                    .and_then(|assistance| {
+                        crate::ngap_asn1::build_paging_with_assistance_asn1(
+                            paging.amf_set_id,
+                            paging.amf_pointer,
+                            paging.tmsi,
+                            &plmn_id,
+                            tac,
+                            Some(assistance),
+                        )
+                    }),
+                _ => crate::ngap_asn1::build_paging_with_attempt_asn1(
+                    paging.amf_set_id,
+                    paging.amf_pointer,
+                    paging.tmsi,
+                    &plmn_id,
+                    tac,
+                    attempt_info.as_ref(),
+                ),
+            }
+        };
+        let Some(paging_bytes) = built else {
             log::error!("Failed to build Paging message");
             return Err(anyhow::anyhow!("Failed to build Paging message"));
         };
@@ -19525,7 +19588,33 @@ impl NgapServer {
             paging.tmsi,
             u32::from(paging.retransmit_count) + 1
         );
+        #[cfg(feature = "demo-d440c-nwdaf-paging")]
+        if crate::demo_d440c::mode().is_some() {
+            let gnb_ids = self.gnb_ids_of(&targets).await;
+            nextgcore_demo::demo_log!(
+                info,
+                crate::demo_d440c::DEMO_KEY,
+                "{}",
+                crate::demo_d440c::paging_sent_line(
+                    sent,
+                    demo_scope,
+                    &gnb_ids,
+                    u32::from(paging.retransmit_count) + 1
+                )
+            );
+        }
         Ok(sent)
+    }
+
+    /// The Global gNB ID of each association in `assocs`, in order; 0 for one
+    /// that is gone (demo d440c-nwdaf-paging log lines).
+    #[cfg(feature = "demo-d440c-nwdaf-paging")]
+    async fn gnb_ids_of(&self, assocs: &[u64]) -> Vec<u32> {
+        let sessions = self.sessions.read().await;
+        assocs
+            .iter()
+            .map(|a| sessions.get(a).map_or(0, |s| s.gnb.gnb_id))
+            .collect()
     }
 
     /// The first attempt under `nwdaf-mobility` (nextgsim#464), and the scope its
@@ -24873,6 +24962,161 @@ mod tests {
             .nwdaf_first_attempt_targets(&paging(None), &cell(4), &area)
             .await;
         assert!(targets.is_empty(), "nothing in the area: page the area");
+    }
+
+    /// The Recommended Cells for Paging NR cell identities in each PAGING for
+    /// `tmsi`, by association (demo d440c-nwdaf-paging).
+    #[cfg(feature = "demo-d440c-nwdaf-paging")]
+    fn recommended_cells_on(sent: &[(u64, Vec<u8>)], tmsi: u32) -> Vec<(u64, Vec<u64>)> {
+        use bitvec::prelude::*;
+        use nextgcore_ngap_gen::generated as g;
+        sent.iter()
+            .filter_map(|(assoc, pdu)| {
+                let Ok(g::NGAP_PDU::InitiatingMessage(m)) = nextgcore_ngap_gen::decode(pdu) else {
+                    return None;
+                };
+                let g::InitiatingMessageValue::Id_Paging(paging) = m.value else {
+                    return None;
+                };
+                let ies = &paging.protocol_i_es.0;
+                let ours = ies.iter().any(|e| {
+                    matches!(
+                        &e.value,
+                        g::PagingProtocolIEs_EntryValue::Id_UEPagingIdentity(
+                            g::UEPagingIdentity::FiveG_S_TMSI(s)
+                        ) if s.five_g_tmsi.0 == tmsi.to_be_bytes()
+                    )
+                });
+                if !ours {
+                    return None;
+                }
+                let cells = ies
+                    .iter()
+                    .find_map(|e| match &e.value {
+                        g::PagingProtocolIEs_EntryValue::Id_AssistanceDataForPaging(a) => {
+                            a.assistance_data_for_recommended_cells.as_ref().map(|c| {
+                                c.recommended_cells_for_paging
+                                    .recommended_cell_list
+                                    .0
+                                    .iter()
+                                    .map(|item| match &item.ngran_cgi {
+                                        g::NGRAN_CGI::NR_CGI(nr) => {
+                                            nr.nr_cell_identity.0.load_be::<u64>()
+                                        }
+                                        other => panic!("not NR: {other:?}"),
+                                    })
+                                    .collect()
+                            })
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                Some((*assoc, cells))
+            })
+            .collect()
+    }
+
+    /// **nextgsim#464, demo d440c-nwdaf-paging**, mode `nwdaf-mobility`, through
+    /// the N1N2 builder, a stand-in NWDAF and the pump. The first attempt to
+    /// [predicted gNB 2, last known gNB 1] carries the non-normative Assistance
+    /// Data for Recommended Cells [last known cell (visited), predicted cell], next
+    /// to the Paging Attempt Information. The retransmission to the area carries
+    /// Paging Attempt Information only. The same page with the demo off carries no
+    /// recommended cells.
+    #[cfg(feature = "demo-d440c-nwdaf-paging")]
+    #[tokio::test]
+    async fn demo_nwdaf_mobility_sends_the_predicted_cells_on_the_first_attempt() {
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::NwdafMobility);
+        let (_nwdaf, port, _) = nwdaf_standin(
+            Some(nwdafd_predicts(&nwdaf_cell_of(2))),
+            Duration::ZERO,
+            None,
+        )
+        .await;
+        let _ep = NwdafEndpointOverride::set(port);
+        let mut ngap = capturing_ngap_server().await;
+        let base = 4_720u64;
+        nwdaf_grid(&ngap, base).await;
+
+        for (i, demo_on) in [true, false].into_iter().enumerate() {
+            let _mode = demo_on.then(|| {
+                crate::demo_d440c::ModeOnThisThread::set(crate::demo_d440c::MODE_NWDAF_MOBILITY)
+            });
+            let ue = 464_301u64 + i as u64;
+            insert_nwdaf_ue(
+                &ngap,
+                ue,
+                base + 1,
+                Some(&format!("imsi-00101000046430{i}")),
+                Some(1),
+            );
+            queue_paging(&ngap, ue);
+            assert!(nwdaf_answer_applied(ue).await, "released");
+            take_sent_ngap(&mut ngap);
+            ngap.process_paging_with(Duration::from_secs(3600)).await;
+            let first = take_sent_ngap(&mut ngap);
+            let cells = if demo_on {
+                vec![nwdaf_nci(1), nwdaf_nci(2)]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                recommended_cells_on(&first, ue as u32),
+                vec![(base + 2, cells.clone()), (base + 1, cells)],
+                "demo on={demo_on}: attempt 1"
+            );
+            assert!(
+                paging_attempts_on(&first, ue as u32)
+                    .iter()
+                    .all(|(_, p)| *p == Some((1, 5, Some(CHANGED)))),
+                "Paging Attempt Information rides along"
+            );
+            ngap.process_paging_with(Duration::ZERO).await;
+            let again = take_sent_ngap(&mut ngap);
+            assert!(
+                recommended_cells_on(&again, ue as u32)
+                    .iter()
+                    .all(|(_, c)| c.is_empty()),
+                "the retransmission carries no recommended cells"
+            );
+            crate::context::amf_self().read().unwrap().paging_remove(ue);
+        }
+    }
+
+    /// **demo d440c-nwdaf-paging**, mode `registration-area` (the baseline): the
+    /// strategy it forces sends no recommended cells and no Paging Attempt
+    /// Information, and pages the whole area, exactly as the default does.
+    #[cfg(feature = "demo-d440c-nwdaf-paging")]
+    #[tokio::test]
+    async fn demo_registration_area_pages_like_the_default() {
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let forced = crate::demo_d440c::effective_strategy(
+            crate::context::PagingStrategy::NwdafMobility,
+            Some(crate::demo_d440c::MODE_REGISTRATION_AREA),
+        );
+        let _strategy = PagingStrategyOverride::set(forced);
+        let _mode =
+            crate::demo_d440c::ModeOnThisThread::set(crate::demo_d440c::MODE_REGISTRATION_AREA);
+        let mut ngap = capturing_ngap_server().await;
+        let base = 4_730u64;
+        nwdaf_grid(&ngap, base).await;
+        let ue = 464_311u64;
+        insert_nwdaf_ue(&ngap, ue, base + 1, Some("imsi-001010000464311"), Some(1));
+        queue_paging(&ngap, ue);
+        take_sent_ngap(&mut ngap);
+        ngap.process_paging_with(Duration::from_secs(3600)).await;
+        let sent = take_sent_ngap(&mut ngap);
+        assert_eq!(
+            sorted(paged_on(&sent, ue as u32)),
+            vec![base + 1, base + 2, base + 3, base + 5]
+        );
+        assert!(paging_attempts_on(&sent, ue as u32)
+            .iter()
+            .all(|(_, p)| p.is_none()));
+        crate::context::amf_self().read().unwrap().paging_remove(ue);
     }
 
     // ---- #1442: recommended-first paging (TS 38.413 §8.3.3.2, TS 23.502 §4.2.3.3) --

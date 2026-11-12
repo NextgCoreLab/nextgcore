@@ -2879,22 +2879,16 @@ impl PagingAttempt {
 /// An `AssistanceDataForPaging` (TS 38.413 §9.3.1.69) carrying only `attempt`'s
 /// Paging Attempt Information, APER-encoded as [`Paging::assistance_data`] takes it.
 pub fn paging_attempt_assistance_aper(attempt: &PagingAttempt) -> Option<Vec<u8>> {
+    encode_assistance(paging_attempt_information(attempt), None)
+}
+
+fn encode_assistance(
+    pai: ngap_gen::PagingAttemptInformation,
+    cells: Option<ngap_gen::AssistanceDataForRecommendedCells>,
+) -> Option<Vec<u8>> {
     let value = ngap_gen::AssistanceDataForPaging {
-        assistance_data_for_recommended_cells: None,
-        paging_attempt_information: Some(ngap_gen::PagingAttemptInformation {
-            paging_attempt_count: ngap_gen::PagingAttemptCount(attempt.count),
-            intended_number_of_paging_attempts: ngap_gen::IntendedNumberOfPagingAttempts(
-                attempt.intended,
-            ),
-            next_paging_area_scope: attempt.next_scope_changed.map(|changed| {
-                ngap_gen::NextPagingAreaScope(if changed {
-                    ngap_gen::NextPagingAreaScope::CHANGED
-                } else {
-                    ngap_gen::NextPagingAreaScope::SAME
-                })
-            }),
-            ie_extensions: None,
-        }),
+        assistance_data_for_recommended_cells: cells,
+        paging_attempt_information: Some(pai),
         ie_extensions: None,
     };
     match nextgcore_ngap_gen::encode_contained(&value) {
@@ -2903,6 +2897,59 @@ pub fn paging_attempt_assistance_aper(attempt: &PagingAttempt) -> Option<Vec<u8>
             log::error!("Paging: failed to encode AssistanceDataForPaging: {e:?}");
             None
         }
+    }
+}
+
+/// Demo `d440c-nwdaf-paging` (nextgsim#464), **non-normative**: an
+/// `AssistanceDataForPaging` with `attempt`'s Paging Attempt Information and an
+/// Assistance Data for Recommended Cells listing `cells` (NR CGIs, in order,
+/// at most 16, TS 38.413 §9.3.1.71). §9.3.1.71 says the IE is transparent to
+/// the 5GC; the demo fills it from the NWDAF prediction. `None` for an empty list.
+#[cfg(feature = "demo-d440c-nwdaf-paging")]
+pub fn paging_assistance_with_cells_aper(
+    attempt: &PagingAttempt,
+    cells: &[(crate::context::PlmnId, u64)],
+) -> Option<Vec<u8>> {
+    if cells.is_empty() {
+        return None;
+    }
+    let items = cells
+        .iter()
+        .take(16)
+        .map(|(plmn, nci)| ngap_gen::RecommendedCellItem {
+            ngran_cgi: ngap_gen::NGRAN_CGI::NR_CGI(ngap_gen::NR_CGI {
+                plmn_identity: ngap_gen::PLMNIdentity(encode_plmn_id(plmn).to_vec()),
+                nr_cell_identity: ngap_gen::NRCellIdentity(low_bits(*nci, 36)),
+                ie_extensions: None,
+            }),
+            time_stayed_in_cell: None,
+            ie_extensions: None,
+        })
+        .collect();
+    let cells = ngap_gen::AssistanceDataForRecommendedCells {
+        recommended_cells_for_paging: ngap_gen::RecommendedCellsForPaging {
+            recommended_cell_list: ngap_gen::RecommendedCellList(items),
+            ie_extensions: None,
+        },
+        ie_extensions: None,
+    };
+    encode_assistance(paging_attempt_information(attempt), Some(cells))
+}
+
+fn paging_attempt_information(attempt: &PagingAttempt) -> ngap_gen::PagingAttemptInformation {
+    ngap_gen::PagingAttemptInformation {
+        paging_attempt_count: ngap_gen::PagingAttemptCount(attempt.count),
+        intended_number_of_paging_attempts: ngap_gen::IntendedNumberOfPagingAttempts(
+            attempt.intended,
+        ),
+        next_paging_area_scope: attempt.next_scope_changed.map(|changed| {
+            ngap_gen::NextPagingAreaScope(if changed {
+                ngap_gen::NextPagingAreaScope::CHANGED
+            } else {
+                ngap_gen::NextPagingAreaScope::SAME
+            })
+        }),
+        ie_extensions: None,
     }
 }
 
@@ -2921,6 +2968,19 @@ pub fn build_paging_with_attempt_asn1(
         Some(a) => Some(paging_attempt_assistance_aper(a)?),
         None => None,
     };
+    build_paging_with_assistance_asn1(amf_set_id, amf_pointer, tmsi, plmn_id, tac, assistance_data)
+}
+
+/// [`build_paging_asn1`] with `assistance_data`, an APER-encoded
+/// `AssistanceDataForPaging`, when it is `Some`.
+pub fn build_paging_with_assistance_asn1(
+    amf_set_id: u16,
+    amf_pointer: u8,
+    tmsi: u32,
+    plmn_id: &crate::context::PlmnId,
+    tac: u32,
+    assistance_data: Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
     let msg = Paging {
         ue_paging_identity: UePagingIdentity::FiveGSTmsi {
             amf_set_id,

@@ -9,6 +9,8 @@
 pub mod amf_sm;
 pub mod congestion; // NAS-level congestion control posture (TS 24.501 §5.3.5)
 pub mod context;
+#[cfg(feature = "demo-d440c-nwdaf-paging")]
+pub mod demo_d440c; // nextgsim#464: demo d440c-nwdaf-paging over paging.strategy nwdaf-mobility
 pub mod emergency; // #203: Emergency services (TS 23.167)
 pub mod event;
 pub mod gmm_build;
@@ -1176,6 +1178,50 @@ impl Default for AmfApp {
 /// The environment variable naming the AMF's `/metrics` port (#1334).
 pub const METRICS_PORT_ENV: &str = "AMF_METRICS_PORT";
 
+/// The demos this build can run: `d440c-nwdaf-paging` under its feature, none
+/// otherwise.
+pub fn demo_registry() -> nextgcore_demo::DemoRegistry {
+    #[cfg(feature = "demo-d440c-nwdaf-paging")]
+    return nextgcore_demo::DemoRegistry::new(&[demo_d440c::DEMO_SPEC]);
+    #[cfg(not(feature = "demo-d440c-nwdaf-paging"))]
+    nextgcore_demo::DemoRegistry::default()
+}
+
+/// The config file's root, for the `demo:` block. A missing file is no block,
+/// as for the rest of the config (`load_config`).
+fn config_root(config_path: &str) -> Result<serde_yaml::Value> {
+    match std::fs::read_to_string(config_path) {
+        Ok(content) => serde_yaml::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("config file '{config_path}' does not parse: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(serde_yaml::Value::Null),
+        Err(e) => anyhow::bail!("cannot read the config file '{config_path}': {e}"),
+    }
+}
+
+/// Validate and install the `demo:` block, once per process, then apply what an
+/// active demo changes: `d440c-nwdaf-paging` forces the effective paging
+/// strategy, which is logged.
+fn init_demos(config_path: &str) -> Result<()> {
+    let root = config_root(config_path)?;
+    nextgcore_demo::init_from_root(&root, &demo_registry())
+        .map_err(|e| anyhow::anyhow!("{e} ({e:?})"))?;
+    #[cfg(feature = "demo-d440c-nwdaf-paging")]
+    if let Some(mode) = demo_d440c::mode() {
+        let ctx = context::amf_self();
+        let mut guard = ctx.write().unwrap_or_else(|e| e.into_inner());
+        let configured = guard.paging_strategy;
+        guard.paging_strategy = demo_d440c::effective_strategy(configured, Some(mode));
+        nextgcore_demo::demo_log!(
+            warn,
+            demo_d440c::DEMO_KEY,
+            "Paging strategy: {} (mode {mode} supersedes amf.paging.strategy: {})",
+            guard.paging_strategy.as_str(),
+            configured.as_str()
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 pub async fn run() -> Result<()> {
     // Parse command line arguments
@@ -1204,6 +1250,11 @@ pub async fn run() -> Result<()> {
 
     // Initialize (async)
     app.init(&args.config).await?;
+
+    // nextgsim#458: the `demo:` block. Checked against the demos this build was
+    // compiled with, so an unknown key or mode, or a demo whose cargo feature is
+    // not built, fails start-up. With no demo active nothing changes.
+    init_demos(&args.config)?;
 
     // Parse NGAP address + SCTP backend and initialize NGAP server
     // #1311: the listen addresses in the config file are honoured; the command line
