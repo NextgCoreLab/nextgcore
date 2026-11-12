@@ -8,9 +8,16 @@
 #             key published after the NRF started is found.
 #   pcf.yaml  gains pcf.congestion_loop: the AoI (the gNB's cell, NCI 0x010),
 #             UE-V (imsi-...001) protected, UE-B (imsi-...002) best effort,
-#             throttle to 1000 kbps at congLevel >= 80, restore below 10.
-#             With C = 5 Mbps a throttled UE-B (1 Mbps) is about 20 % plus UE-V's
-#             pings, inside the band, so the restore waits for UE-B to stop.
+#             throttle to 1000 kbps at congLevel >= 80, restore after 15
+#             consecutive polls below 3 (nextgcore#1480). With C = 5 Mbps a
+#             throttled UE-B (1 Mbps) can fill at most 20 % of the cell, and the
+#             throttle alone brought the served occupancy down to 5.9-17.7 % on
+#             devtest1. In prediction mode the fit extrapolated that drop to
+#             congLevel < 3 for up to 6 polls in a row. restore_below 10 /
+#             restore_after_polls 3 sat inside that band and restored UE-B mid-load.
+#             3 is half the measured throttled floor, and 15 polls are over twice
+#             the longest in-load dip; scenario.sh's d441a_restore_hysteresis
+#             checks both against the gNB's C and refuses the old values.
 #
 # The demo: block is merged into pcf.yaml (and gnb.yaml, nwdaf.yaml) at render
 # time by the demo post-render (toggles.yaml), with the run's mode.
@@ -69,8 +76,8 @@ data:
         throttle_kbps: 1000
         floor_kbps: 500
         throttle_at: 80
-        restore_below: 10
-        restore_after_polls: 3
+        restore_below: 3
+        restore_after_polls: 15
         min_hold_secs: 10
         fail_open_secs: 30
         max_sessions: 1

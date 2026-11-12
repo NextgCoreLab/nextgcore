@@ -12,7 +12,8 @@
 #   3. UE-V pings the UPF gateway 10 times a second for the whole run; UE-B
 #      loads the downlink with echo requests whose replies are the downlink: a
 #      ramp of ten 4 s steps from ~0.2C to ~1.6C, then a 12 s hold at ~3C
-#      (C = 5 Mbps), then it stops; 40 s are left for the restore. The gNB's
+#      (C = 5 Mbps), then it stops. In the loop modes the run then waits (at most
+#      D441A_RESTORE_WAIT_SECS) until UE-B is restored, before the captures. The gNB's
 #      `congestion-status` (the measured occupancy) is sampled once a second
 #      throughout, through nr-cli in the gNB container (patches/gnb-d441a.yaml);
 #   4. an unauthenticated POST to the ingest route.
@@ -62,6 +63,24 @@ D441A_SATURATION_PCT=90
 D441A_RAMP_SIZES="97 222 347 472 597 722 847 972 1097 1222"
 D441A_HOLD_SIZE=1222
 D441A_HOLD_PINGS=2
+
+# Restore hysteresis (nextgcore#1480). pcfd sees the occupancy the gNB SERVES,
+# and the throttle itself lowers it: with UE-B capped at throttle_kbps the cell
+# can carry at most throttle_kbps / C of UE-B, and on devtest1 it carried
+# 5.9 % to 17.7 % (UDC congLevel 6 to 37) under a 20 % ceiling (statistics
+# 20261112T164134Z). In prediction mode the gNB's least-squares fit extrapolates
+# the throttle-induced drop: congLevel stayed under 3 for up to 6 consecutive
+# polls while UE-B still loaded the cell (prediction 20261112T165042Z and
+# 20261112T170200Z). With restore_below 10 / restore_after_polls 3 either arm
+# could restore UE-B mid-load (prediction did, in both runs; statistics passed
+# by one poll). d441a_restore_hysteresis derives the throttled band from the
+# config and requires:
+#   restore_below <= half the measured throttled floor (0.30 x the ceiling);
+#   restore_after_polls x poll_ms >= twice the longest measured in-load dip;
+#   the restore fits in the scenario's restore wait.
+D441A_THROTTLED_FLOOR_FRAC=0.30   # measured min congLevel 6 / ceiling 20
+D441A_INLOAD_LOW_RUN_POLLS=6      # measured longest in-load run under 3 (prediction)
+D441A_RESTORE_WAIT_SECS=60
 
 # Lines of LOG stamped strictly after TS (kubelet RFC 3339 stamp in field 1).  LOG TS
 d441a_since() { awk -v t="$2" '$1 > t' "$1"; }
@@ -183,6 +202,44 @@ if kind == "prediction":
 PY
 }
 
+# The numeric value of `key: N` in FILE (first match); empty when absent. FILE KEY
+d441a_knob() { sed -nE "s/^[[:space:]]+$2:[[:space:]]*([0-9.]+)[[:space:]]*(#.*)?$/\1/p" "$1" | head -1; }
+# The pcf.congestion_loop restore knobs in PCF_CFG against the throttled band the
+# gNB block in GNB_CFG implies. Prints the verdict; fails with every reason.  PCF_CFG GNB_CFG
+d441a_restore_hysteresis() {
+  local tk rb rp pm mh cap win
+  tk="$(d441a_knob "$1" throttle_kbps)" rb="$(d441a_knob "$1" restore_below)"
+  rp="$(d441a_knob "$1" restore_after_polls)" pm="$(d441a_knob "$1" poll_ms)"
+  mh="$(d441a_knob "$1" min_hold_secs)" cap="$(d441a_knob "$2" cell_capacity_mbps)"
+  win="$(d441a_knob "$2" window_ms)"
+  [[ -n "${tk}" && -n "${rb}" && -n "${rp}" && -n "${pm}" && -n "${mh}" && -n "${cap}" && -n "${win}" ]] \
+    || { echo "restore knobs or the gNB capacity/window not found (throttle_kbps=${tk} restore_below=${rb} restore_after_polls=${rp} poll_ms=${pm} min_hold_secs=${mh} cell_capacity_mbps=${cap} window_ms=${win})"; return 1; }
+  python3 - "${tk}" "${rb}" "${rp}" "${pm}" "${mh}" "${cap}" "${win}" \
+    "${D441A_THROTTLED_FLOOR_FRAC}" "${D441A_INLOAD_LOW_RUN_POLLS}" "${D441A_RESTORE_WAIT_SECS}" <<'PY'
+import sys
+tk, rb, rp, pm, mh, cap, win, frac, run, wait = map(float, sys.argv[1:])
+ceiling = 100.0 * tk / (cap * 1000.0)          # % of C a throttled UE-B can fill
+floor = frac * ceiling                          # the measured throttled floor
+bad = []
+if rb > floor / 2:
+    bad.append(f"restore_below {rb:g} > {floor / 2:g} (half the throttled floor {floor:g} % of a {ceiling:g} % ceiling): the throttle alone can restore")
+need = 2 * run * win
+if rp * pm < need:
+    bad.append(f"restore_after_polls x poll_ms = {rp * pm:g} ms < {need:g} ms (twice the longest in-load dip, {run:g} windows of {win:g} ms)")
+if max(rp * pm / 1000.0, mh) + 5 > wait:
+    bad.append(f"the restore needs {max(rp * pm / 1000.0, mh) + 5:g} s > the scenario's {wait:g} s restore wait")
+if bad:
+    print("restore hysteresis: " + "; ".join(bad)); sys.exit(1)
+print(f"restore hysteresis ok: restore_below {rb:g} <= {floor / 2:g}, {rp:g} polls x {pm:g} ms >= {need:g} ms, ceiling {ceiling:g} %")
+PY
+}
+# UE-B is not throttled now: pcfd logged at least one throttle and as many restores. LOG
+d441a_unthrottled() {
+  local t r
+  t="$(grep -c 'action=throttle(' "$1" || true)" r="$(grep -c 'action=restore(' "$1" || true)"
+  [[ "${t}" -gt 0 && "${r}" -ge "${t}" ]]
+}
+
 d441a_main() {
   set -uo pipefail
   : "${NAMESPACE:?}" "${DEMO_MODE:?}" "${OUT:?}"
@@ -206,6 +263,13 @@ d441a_main() {
       sleep 3
     done
   }
+
+  # --- 0. the restore knobs (nextgcore#1480) -------------------------------------
+  local here
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  d441a_restore_hysteresis "${here}/core-configs.yaml" "${here}/gnb-config.yaml" >"${S}/restore-hysteresis.txt" 2>&1 \
+    || bad "$(cat "${S}/restore-hysteresis.txt")"
+  say "$(cat "${S}/restore-hysteresis.txt")"
 
   # --- 1. the exporter's CCA key -----------------------------------------------
   wait_for 180 "${K[@]}" exec deploy/gnb -c gnb -- test -s "${JWK_PATH}" \
@@ -280,6 +344,17 @@ d441a_main() {
   touch "${S}/.load-done"
   [[ -z "${POLL_PID}" ]] || wait "${POLL_PID}"
   rm -f "${S}/.load-done"
+
+  # The restore needs restore_after_polls quiet polls after UE-B stops, which can
+  # outlast UE-V's ping: wait for it, so the captures below hold it.
+  if [[ "${DEMO_MODE}" != no-loop ]]; then
+    local end=$(( $(date +%s) + D441A_RESTORE_WAIT_SECS ))
+    until "${K[@]}" logs deploy/pcf -c pcf >"${S}/.pcf-now.log" 2>/dev/null && d441a_unthrottled "${S}/.pcf-now.log"; do
+      [[ $(date +%s) -ge ${end} ]] && { say "UE-B not restored within ${D441A_RESTORE_WAIT_SECS} s of the load's end"; break; }
+      sleep 2
+    done
+    rm -f "${S}/.pcf-now.log"
+  fi
 
   # --- 4. the tokenless POST ----------------------------------------------------
   THROTTLES_BEFORE="$("${K[@]}" logs deploy/pcf -c pcf 2>/dev/null | grep -c 'action=throttle(' || true)"
