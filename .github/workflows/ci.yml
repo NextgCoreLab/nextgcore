@@ -70,6 +70,10 @@ jobs:
       # config as the Helm chart renders it (`helm template`). Locally they skip
       # that without helm; here a missing helm fails them instead.
       NEXTGCORE_HELM_REQUIRED: "1"
+      # #1457: pcfd's subscriber-store test runs the real binary against a
+      # throwaway mongo:6.0 container. Locally it skips without docker; here a
+      # missing docker fails it instead.
+      NEXTGCORE_DOCKER_REQUIRED: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v4
