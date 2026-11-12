@@ -186,6 +186,7 @@ fn build_handover_setup_request_transfer(
     let flows = bearers
         .iter()
         .map(|b| QosFlowSetup {
+            qos_monitoring: None,
             qfi: b.ebi,
             // TS 23.501 §5.7.4: the standardized QCIs 1..9 and their 5QIs share values,
             // which is what lets a PGW-C+SMF map one onto the other.

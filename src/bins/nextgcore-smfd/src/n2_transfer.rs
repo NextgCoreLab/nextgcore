@@ -216,6 +216,28 @@ pub(crate) struct Gbr {
     pub gfbr_ul: u64,
 }
 
+/// QoS Monitoring Request (TS 38.413 §9.3.1.12, ext id 181, #1390): the SMF's
+/// request to the NG-RAN to perform the RAN part of the per QoS flow packet delay
+/// measurement (TS 23.501 §5.33.3.2), or to stop it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QosMonitoringRequest {
+    Ul,
+    Dl,
+    Both,
+    Stop,
+}
+
+impl QosMonitoringRequest {
+    fn generated(self) -> g::QosMonitoringRequest {
+        g::QosMonitoringRequest(match self {
+            Self::Ul => g::QosMonitoringRequest::UL,
+            Self::Dl => g::QosMonitoringRequest::DL,
+            Self::Both => g::QosMonitoringRequest::BOTH,
+            Self::Stop => g::QosMonitoringRequest::STOP,
+        })
+    }
+}
+
 /// One QoS Flow Setup Request Item, with a standardized (non-dynamic) 5QI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct QosFlowSetup {
@@ -225,6 +247,9 @@ pub(crate) struct QosFlowSetup {
     pub gbr: Option<Gbr>,
     /// The E-RAB ID an EPS→5GS handover maps the flow from.
     pub e_rab_id: Option<u8>,
+    /// #1390: the QoS Monitoring Request for the flow, `None` when the flow is
+    /// not monitored (the IE is then absent, so the transfer is unchanged).
+    pub qos_monitoring: Option<QosMonitoringRequest>,
 }
 
 /// The members of a `PDUSessionResourceSetupRequestTransfer` this SMF sends.
@@ -306,7 +331,19 @@ fn flow_qos_parameters(
         }),
         reflective_qos_attribute: None,
         additional_qos_flow_information: None,
-        ie_extensions: None,
+        // #1390: id-QosMonitoringRequest, criticality ignore (the object set's).
+        ie_extensions: flow.qos_monitoring.map(|req| {
+            g::QosFlowLevelQosParametersIE_Extensions(vec![
+                g::QosFlowLevelQosParametersIE_Extensions_Entry {
+                    id: g::ProtocolExtensionID(g::ID_QOS_MONITORING_REQUEST),
+                    criticality: g::Criticality(g::Criticality::IGNORE),
+                    extension_value:
+                        g::QosFlowLevelQosParametersIE_Extensions_EntryExtensionValue::Id_QosMonitoringRequest(
+                            req.generated(),
+                        ),
+                },
+            ])
+        }),
     })
 }
 
@@ -853,4 +890,4 @@ pub(crate) fn parse_handover_request_acknowledge_transfer(
 }
 
 #[cfg(test)]
-mod oracle_tests;
+pub(crate) mod oracle_tests;

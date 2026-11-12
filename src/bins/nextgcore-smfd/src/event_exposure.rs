@@ -22,13 +22,14 @@
 //! `NsmfEventExposureNotification` to `notifUri`, carrying the subscription's own
 //! `notifId` so the consumer can correlate it with the subscription it made.
 //!
-//! Which events are emitted, and why only these two: `PDU_SES_EST` and
-//! `PDU_SES_REL` are the two occurrences the live establishment and release paths
-//! actually reach. The other twenty values in `SmfEvent` name occurrences this SMF
-//! does not detect (`UP_PATH_CH`, `QOS_MON`, `DISPERSION`, …); subscribing to one
-//! is accepted and stored — refusing it would reject a conformant request — and it
-//! simply never fires. That is stated here rather than left for a consumer to infer
-//! from silence.
+//! Which events are emitted: `PDU_SES_EST` and `PDU_SES_REL`, the two occurrences
+//! the live establishment and release paths reach, and `QOS_MON` (#1390, the
+//! `qos_mon` module) for a consumer that negotiated the QoSMonitoring feature
+//! ([`feature`]). The other values in `SmfEvent` name occurrences this SMF does
+//! not detect (`UP_PATH_CH`, `DISPERSION`, …); subscribing to one is accepted and
+//! stored — refusing it would reject a conformant request — and it simply never
+//! fires, as does `QOS_MON` without QoSMonitoring. That is stated here rather than
+//! left for a consumer to infer from silence.
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -45,6 +46,51 @@ pub mod event {
     pub const PDU_SES_EST: &str = "PDU_SES_EST";
     /// PDU session release.
     pub const PDU_SES_REL: &str = "PDU_SES_REL";
+    /// QoS monitoring (#1390): the per QoS flow packet delays the UPF measures
+    /// and reports over N4 (TS 29.244 §5.24.4.3), §4.2.3.2 item 12.
+    pub const QOS_MON: &str = "QOS_MON";
+}
+
+/// The optional features of the Nsmf_EventExposure API this SMF supports (TS
+/// 29.508 Table 5.8-1), as SupportedFeatures bits (TS 29.571 §5.2.2: feature
+/// n is bit n-1). Negotiated per TS 29.500 §6.6.2 (#1390 review m7).
+pub mod feature {
+    /// Feature 5, QoSMonitoring: the QOS_MON event's `ulDelays` / `dlDelays` /
+    /// `rtDelays` (§4.2.3.2 item 12; Table 5.8-1 NOTE 3: negotiable explicitly
+    /// in the Subscribe).
+    pub const QOS_MONITORING: u64 = 1 << 4;
+    /// Feature 20, PacketDelayFailureReport: `pdmf` (item 12d). It requires
+    /// QoSMonitoring.
+    pub const PACKET_DELAY_FAILURE_REPORT: u64 = 1 << 19;
+    /// Every optional feature this SMF implements.
+    pub const SUPPORTED: u64 = QOS_MONITORING | PACKET_DELAY_FAILURE_REPORT;
+
+    /// The features both sides support: the consumer's `supportedFeatures`
+    /// (hex) intersected with [`SUPPORTED`]. Absent or unreadable: none (TS
+    /// 29.500 §6.6.2). PacketDelayFailureReport without QoSMonitoring is
+    /// dropped, as Table 5.8-1 makes the one require the other.
+    pub fn negotiate(consumer_hex: Option<&str>) -> u64 {
+        let consumer = consumer_hex
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|s| {
+                // A SupportedFeatures string may be longer than 16 hex digits:
+                // only the low 64 features matter here.
+                let tail = &s[s.len().saturating_sub(16)..];
+                u64::from_str_radix(tail, 16).ok()
+            })
+            .unwrap_or(0);
+        let mut n = consumer & SUPPORTED;
+        if n & QOS_MONITORING == 0 {
+            n &= !PACKET_DELAY_FAILURE_REPORT;
+        }
+        n
+    }
+
+    /// `features` as a SupportedFeatures string (TS 29.571 §5.2.2).
+    pub fn to_hex(features: u64) -> String {
+        format!("{features:x}")
+    }
 }
 
 /// A stored subscription: the parsed document plus the id this SMF assigned.
@@ -62,6 +108,9 @@ pub struct EventSubscription {
     pub supi: Option<String>,
     /// PDU session id filter, when scoped to one session.
     pub pdu_session_id: Option<u8>,
+    /// The optional features negotiated with the consumer ([`feature`]); 0 when
+    /// its document carried no `supportedFeatures`.
+    pub features: u64,
     /// The document as received, so `GET` returns what was stored rather than a
     /// re-serialisation of the subset this SMF models. A consumer that sent
     /// `sampRatio` or `partitionCriteria` gets them back.
@@ -90,6 +139,11 @@ impl EventSubscription {
             }
         }
         true
+    }
+
+    /// Whether the consumer negotiated `f` ([`feature`]).
+    pub fn supports(&self, f: u64) -> bool {
+        self.features & f == f
     }
 }
 
@@ -175,6 +229,16 @@ pub fn parse_subscription(body: &Value, id: String) -> Result<EventSubscription,
         return Err(ParseError::NoEvent);
     }
 
+    // TS 29.500 §6.6.2: the consumer lists the features it supports, and the
+    // answer (here the stored and echoed document) carries those the SMF
+    // supports too.
+    let consumer_features = obj.get("supportedFeatures").and_then(Value::as_str);
+    let features = feature::negotiate(consumer_features);
+    let mut document = body.clone();
+    if consumer_features.is_some() {
+        document["supportedFeatures"] = Value::String(feature::to_hex(features));
+    }
+
     Ok(EventSubscription {
         id,
         notif_id,
@@ -185,7 +249,8 @@ pub fn parse_subscription(body: &Value, id: String) -> Result<EventSubscription,
             .get("pduSeId")
             .and_then(Value::as_u64)
             .and_then(|v| u8::try_from(v).ok()),
-        document: body.clone(),
+        features,
+        document,
     })
 }
 
@@ -268,7 +333,7 @@ pub fn resource_path(id: &str) -> String {
 }
 
 /// Every subscription that matches an occurrence.
-fn matching(event: &str, supi: &str, psi: u8) -> Vec<EventSubscription> {
+pub(crate) fn matching(event: &str, supi: &str, psi: u8) -> Vec<EventSubscription> {
     SUBSCRIPTIONS
         .read()
         .ok()
@@ -317,37 +382,95 @@ pub async fn notify(event: &str, supi: &str, psi: u8) {
     }
     for sub in subs {
         let body = build_notification(&sub, event, supi, psi);
-        let Some((host, port)) = crate::policy::split_host_port(&sub.notif_uri) else {
-            log::warn!(
-                "subscription {} has an unusable notifUri '{}': the {event} \
-                 notification for {supi} cannot be delivered",
-                sub.id,
-                nextgcore_sbi::log_redact::redact_last_segment(&sub.notif_uri)
-            );
-            continue;
-        };
-        let path = notify_path(&sub.notif_uri);
-        let request = nextgcore_sbi::message::SbiRequest::post(path).with_body(
-            body.to_string(),
-            nextgcore_sbi::constants::content_type::APPLICATION_JSON,
-        );
-        let client = nextgcore_sbi::client::SbiClient::new(
-            nextgcore_sbi::security::sbi_peer_client_config(&host, port)
-                .with_connect_timeout(std::time::Duration::from_secs(2))
-                .with_request_timeout(std::time::Duration::from_secs(3)),
-        );
-        match client.send_request(request).await {
-            Ok(resp) => log::info!(
-                "Nsmf_EventExposure_Notify {event} (SUPI {supi}, PSI {psi}) → \
-                 subscription {}: status={}",
-                sub.id,
-                resp.status
-            ),
-            Err(e) => log::warn!(
-                "Nsmf_EventExposure_Notify {event} to subscription {} failed: {e}",
-                sub.id
-            ),
+        deliver(&sub, &body, event, supi, psi).await;
+    }
+}
+
+/// The `repPeriod` (seconds) of a subscription whose `notifMethod` is PERIODIC
+/// (TS 29.508 Table 5.6.2.2-1), else `None`.
+pub fn periodic_rep_period(sub: &EventSubscription) -> Option<u32> {
+    (sub.document.get("notifMethod").and_then(Value::as_str) == Some("PERIODIC"))
+        .then(|| sub.document.get("repPeriod").and_then(Value::as_u64))
+        .flatten()
+        .filter(|p| *p > 0)
+        .map(|p| p.min(u32::MAX as u64) as u32)
+}
+
+/// One QoS monitoring result for a QOS_MON notification, in ms (§4.2.3.2 item 12).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QosMonResult {
+    pub ul_delay: Option<u32>,
+    pub dl_delay: Option<u32>,
+    pub rt_delay: Option<u32>,
+    /// Packet delay measurement failure (`pdmf`).
+    pub failure: bool,
+}
+
+/// The `NsmfEventExposureNotification` of one QOS_MON report (#1390, TS 29.508
+/// §4.2.3.2 item 12): one element in each of `ulDelays`, `dlDelays`, `rtDelays`
+/// (NOTE 8: the UPF reports one measurement per report) when QoSMonitoring was
+/// negotiated, and `pdmf: true` when PacketDelayFailureReport was (item 12d).
+/// `None` when the report carries nothing the consumer negotiated.
+pub fn build_qos_mon_notification(
+    sub: &EventSubscription,
+    supi: &str,
+    psi: u8,
+    r: &QosMonResult,
+) -> Option<Value> {
+    let mut n = build_notification(sub, event::QOS_MON, supi, psi);
+    let e = &mut n["eventNotifs"][0];
+    let mut any = false;
+    if sub.supports(feature::QOS_MONITORING) {
+        for (name, v) in [
+            ("ulDelays", r.ul_delay),
+            ("dlDelays", r.dl_delay),
+            ("rtDelays", r.rt_delay),
+        ] {
+            if let Some(v) = v {
+                e[name] = serde_json::json!([v]);
+                any = true;
+            }
         }
+    }
+    if r.failure && sub.supports(feature::PACKET_DELAY_FAILURE_REPORT) {
+        e["pdmf"] = serde_json::json!(true);
+        any = true;
+    }
+    any.then_some(n)
+}
+
+/// POST `body` to `sub`'s `notifUri`; failures are logged and swallowed.
+pub async fn deliver(sub: &EventSubscription, body: &Value, event: &str, supi: &str, psi: u8) {
+    let Some((host, port)) = crate::policy::split_host_port(&sub.notif_uri) else {
+        log::warn!(
+            "subscription {} has an unusable notifUri '{}': the {event} \
+             notification for {supi} cannot be delivered",
+            sub.id,
+            nextgcore_sbi::log_redact::redact_last_segment(&sub.notif_uri)
+        );
+        return;
+    };
+    let path = notify_path(&sub.notif_uri);
+    let request = nextgcore_sbi::message::SbiRequest::post(path).with_body(
+        body.to_string(),
+        nextgcore_sbi::constants::content_type::APPLICATION_JSON,
+    );
+    let client = nextgcore_sbi::client::SbiClient::new(
+        nextgcore_sbi::security::sbi_peer_client_config(&host, port)
+            .with_connect_timeout(std::time::Duration::from_secs(2))
+            .with_request_timeout(std::time::Duration::from_secs(3)),
+    );
+    match client.send_request(request).await {
+        Ok(resp) => log::info!(
+            "Nsmf_EventExposure_Notify {event} (SUPI {supi}, PSI {psi}) → \
+             subscription {}: status={}",
+            sub.id,
+            resp.status
+        ),
+        Err(e) => log::warn!(
+            "Nsmf_EventExposure_Notify {event} to subscription {} failed: {e}",
+            sub.id
+        ),
     }
 }
 

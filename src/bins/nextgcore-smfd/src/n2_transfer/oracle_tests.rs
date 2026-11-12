@@ -171,6 +171,7 @@ fn flow() -> impl Strategy<Value = QosFlowSetup> {
     )
         .prop_map(
             |(qfi, five_qi, (priority_level, cap, vuln), gbr, e_rab_id)| QosFlowSetup {
+                qos_monitoring: None,
                 qfi,
                 five_qi,
                 arp: Arp {
@@ -388,7 +389,11 @@ proptest! {
 
 /// A generated-codec PathSwitchRequestTransfer, optionally carrying User Plane
 /// Security Information.
-fn generated_path_switch_request(dl: (u32, [u8; 4]), qfis: &[u8], security: bool) -> Vec<u8> {
+pub(crate) fn generated_path_switch_request(
+    dl: (u32, [u8; 4]),
+    qfis: &[u8],
+    security: bool,
+) -> Vec<u8> {
     encode(
         "test",
         &g::PathSwitchRequestTransfer {
@@ -576,6 +581,7 @@ fn out_of_range_values_are_refused_as_before() {
         data_forwarding_not_possible: false,
         direct_forwarding_path_availability: false,
         flows: vec![QosFlowSetup {
+            qos_monitoring: None,
             qfi: 1,
             five_qi: 9,
             arp: Arp {
