@@ -346,7 +346,21 @@ pub async fn run() -> Result<()> {
     // for every subscriber looks healthy and is wrong for all of them.
     match resolve_db_uri(args.db_uri.as_deref(), &args.config) {
         Some(db_uri) => {
-            open_subscriber_store(&db_uri, STORE_CONNECT_ATTEMPTS, STORE_CONNECT_BACKOFF).await?;
+            let stopping = {
+                let shutdown = shutdown.clone();
+                move || shutdown.load(Ordering::SeqCst) || SHUTDOWN.load(Ordering::SeqCst)
+            };
+            let opened = open_subscriber_store(
+                &db_uri,
+                STORE_CONNECT_ATTEMPTS,
+                STORE_CONNECT_BACKOFF,
+                stopping,
+            )
+            .await?;
+            if !opened {
+                log::info!("Shutdown requested before the subscriber store opened");
+                return Ok(());
+            }
         }
         None => log::warn!(
             "No subscriber store configured (--db-uri or a top-level db_uri in {}): every SM \
@@ -718,13 +732,51 @@ pub async fn run() -> Result<()> {
 }
 
 /// How many times startup tries to reach the subscriber store before giving up
-/// (#1457). Each attempt already waits out the driver's server-selection timeout, so
-/// a store that comes up a little after the PCF (docker compose, a pod restart) is
-/// still found. The same bound as hssd's (#478).
+/// (#1457), so a store that comes up a little after the PCF (docker compose, a pod
+/// restart) is still found. The same count as hssd's (#478).
 const STORE_CONNECT_ATTEMPTS: u32 = 5;
 
 /// The pause between two store connection attempts.
 const STORE_CONNECT_BACKOFF: Duration = Duration::from_secs(2);
+
+/// The server-selection and connect timeout pcfd gives the store client when the
+/// URI sets none (#1457 review). The driver's default is 30 s, and no shipped URI
+/// sets one, so each startup attempt waited 30 s (158 s to give up, past the k8s
+/// liveness probe) and, with the store down, every SM/AM policy read held its
+/// request for 30 s while the SMF gives up after 3 s. With 1 s, startup gives up in
+/// about 13 s and a failed read answers well inside the SMF's budget. A URI that
+/// sets either option keeps its own value.
+const STORE_TIMEOUT_MS: u64 = 1000;
+
+/// `db_uri` with [`STORE_TIMEOUT_MS`] as its `serverSelectionTimeoutMS` and
+/// `connectTimeoutMS`, for each one the URI does not set itself. MongoDB URI option
+/// names are case-insensitive.
+fn bounded_db_uri(db_uri: &str) -> String {
+    let lower = db_uri.to_ascii_lowercase();
+    let extra: Vec<String> = ["serverSelectionTimeoutMS", "connectTimeoutMS"]
+        .iter()
+        .filter(|opt| !lower.contains(&format!("{}=", opt.to_ascii_lowercase())))
+        .map(|opt| format!("{opt}={STORE_TIMEOUT_MS}"))
+        .collect();
+    if extra.is_empty() {
+        return db_uri.to_string();
+    }
+    let extra = extra.join("&");
+    match db_uri.find('?') {
+        Some(q) if q + 1 == db_uri.len() || db_uri.ends_with('&') => format!("{db_uri}{extra}"),
+        Some(_) => format!("{db_uri}&{extra}"),
+        None => {
+            // Options follow the "/" that ends the host list; a bare
+            // `mongodb://host` has none yet.
+            let hosts = db_uri.find("://").map_or(0, |i| i + 3);
+            if db_uri[hosts..].contains('/') {
+                format!("{db_uri}?{extra}")
+            } else {
+                format!("{db_uri}/?{extra}")
+            }
+        }
+    }
+}
 
 /// The subscriber-store URI (#1457): `--db-uri` wins over the config file's top-level
 /// `db_uri` (the key every shipped pcf.yaml -- docker, k8s, Helm, EKS -- sets), the
@@ -749,21 +801,38 @@ fn resolve_db_uri(cli: Option<&str>, config_path: &str) -> Option<String> {
 /// Open nextgcore-dbi's subscriber collection (#1457), retrying only the "server not
 /// reachable yet" failure. A malformed URI fails on the first attempt, and an
 /// unreachable store fails after `attempts`: either way startup stops, so the PCF
-/// never serves policy it would have to invent.
-async fn open_subscriber_store(db_uri: &str, attempts: u32, backoff: Duration) -> Result<()> {
+/// never serves policy it would have to invent. `Ok(false)` when `stopping` turned
+/// true between attempts (a SIGTERM during the wait), so the caller exits cleanly
+/// rather than being killed at the end of its grace period.
+async fn open_subscriber_store(
+    db_uri: &str,
+    attempts: u32,
+    backoff: Duration,
+    stopping: impl Fn() -> bool,
+) -> Result<bool> {
+    let db_uri = bounded_db_uri(db_uri);
     let mut attempt = 1;
     loop {
-        match nextgcore_dbi::nextgcore_dbi_init_async(db_uri.to_string()).await {
+        match nextgcore_dbi::nextgcore_dbi_init_async(db_uri.clone()).await {
             Ok(()) => {
                 log::info!("Subscriber store opened");
-                return Ok(());
+                return Ok(true);
             }
             Err(nextgcore_dbi::mongoc::DbiError::Retry) if attempt < attempts => {
                 log::warn!(
                     "Subscriber store not reachable (attempt {attempt}/{attempts}); retrying"
                 );
                 attempt += 1;
-                tokio::time::sleep(backoff).await;
+                let until = tokio::time::Instant::now() + backoff;
+                while tokio::time::Instant::now() < until {
+                    if stopping() {
+                        return Ok(false);
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                if stopping() {
+                    return Ok(false);
+                }
             }
             Err(e) => {
                 // `Retry` displays as "Retry needed", which reads as advice rather
@@ -11087,6 +11156,63 @@ mod db_uri_tests_1457 {
         if let Some(text) = nextgcore_core::helm_render::helm_rendered_config(&root, "pcf.yaml") {
             let helm = config("helm", &text);
             assert!(resolve_db_uri(None, &helm).is_some(), "Helm pcf.yaml");
+        }
+    }
+}
+
+/// #1457 review: every attempt and every read is bounded even when the URI is not.
+#[cfg(test)]
+mod bounded_db_uri_tests_1457 {
+    use super::bounded_db_uri;
+
+    #[test]
+    fn the_timeouts_are_added_only_where_the_uri_sets_none() {
+        let both = "serverSelectionTimeoutMS=1000&connectTimeoutMS=1000";
+        assert_eq!(
+            bounded_db_uri("mongodb://172.23.0.2/nextgcore"),
+            format!("mongodb://172.23.0.2/nextgcore?{both}")
+        );
+        assert_eq!(
+            bounded_db_uri("mongodb://mongodb.ns.svc:27017"),
+            format!("mongodb://mongodb.ns.svc:27017/?{both}")
+        );
+        assert_eq!(
+            bounded_db_uri("mongodb://u:p@h1,h2/db?replicaSet=rs0"),
+            format!("mongodb://u:p@h1,h2/db?replicaSet=rs0&{both}")
+        );
+        assert_eq!(
+            bounded_db_uri("mongodb://h/db?"),
+            format!("mongodb://h/db?{both}")
+        );
+        // An operator's own value wins, whatever its case.
+        assert_eq!(
+            bounded_db_uri("mongodb://h/db?serverselectiontimeoutms=5000"),
+            "mongodb://h/db?serverselectiontimeoutms=5000&connectTimeoutMS=1000"
+        );
+        let own = "mongodb://h/db?connectTimeoutMS=3000&serverSelectionTimeoutMS=4000";
+        assert_eq!(bounded_db_uri(own), own);
+    }
+
+    /// The driver accepts what this produces for every shipped URI shape.
+    #[test]
+    fn the_bounded_uris_parse() {
+        for uri in [
+            "mongodb://172.23.0.2/nextgcore",
+            "mongodb://mongodb.nextg-system.svc.cluster.local:27017/nextgcore",
+            "mongodb://mongodb:27017",
+        ] {
+            let opts = nextgcore_dbi::mongodb::options::ClientOptions::parse(bounded_db_uri(uri))
+                .unwrap_or_else(|e| panic!("{uri}: {e}"));
+            assert_eq!(
+                opts.server_selection_timeout,
+                Some(std::time::Duration::from_millis(1000)),
+                "{uri}"
+            );
+            assert_eq!(
+                opts.connect_timeout,
+                Some(std::time::Duration::from_millis(1000)),
+                "{uri}"
+            );
         }
     }
 }

@@ -4,6 +4,24 @@
 //! lookups used by the live handlers in `app`. The C port's FSM-routed
 //! `pcf_nudr_dr_handle_query_*` handlers were unreachable (#655) and deleted.
 
+/// Run a subscriber-store read so it does not hold a tokio worker (#1457 review).
+///
+/// nextgcore-dbi reads through `mongodb::sync`, which blocks the calling thread for
+/// the whole round trip -- up to the server-selection timeout when the store is
+/// down. Called from an SBI handler on a runtime worker, that froze every other task
+/// on the worker (SM/AM requests, the heartbeat, `/metrics`). On the multi-thread
+/// runtime pcfd runs on, `block_in_place` hands the worker's other tasks to another
+/// thread for the duration. A current-thread runtime (unit tests) cannot do that and
+/// runs the read inline; with no runtime there is nothing to protect.
+pub(crate) fn off_runtime<T>(read: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(read)
+        }
+        _ => read(),
+    }
+}
+
 /// SM Policy Data from UDR
 #[derive(Debug, Clone, Default)]
 pub struct SmPolicyData {
@@ -57,7 +75,7 @@ pub fn query_subscription_data_pub(supi: &str) -> Option<SubscriptionData> {
 fn query_subscription_data(supi: &str) -> Option<SubscriptionData> {
     log::debug!("Querying subscription data for SUPI: {supi}");
 
-    match nextgcore_dbi::nextgcore_dbi_subscription_data(supi) {
+    match off_runtime(|| nextgcore_dbi::nextgcore_dbi_subscription_data(supi)) {
         Ok(sub_data) => {
             log::debug!(
                 "[{}] Subscription data: AMBR up={}, down={}",
@@ -97,7 +115,9 @@ pub fn pcf_read_session_data(
 
     let nextgcore_snssai = nextgcore_dbi::NextgcoreSNssai::new(s_nssai.sst, s_nssai.sd);
 
-    match nextgcore_dbi::nextgcore_dbi_session_data(supi, Some(&nextgcore_snssai), dnn) {
+    match off_runtime(|| {
+        nextgcore_dbi::nextgcore_dbi_session_data(supi, Some(&nextgcore_snssai), dnn)
+    }) {
         Ok(sess_data) => {
             let qos = &sess_data.session.qos;
             let ambr = &sess_data.session.ambr;
