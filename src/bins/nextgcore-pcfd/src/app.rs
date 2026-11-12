@@ -55,6 +55,13 @@ struct Args {
     #[arg(long)]
     state_file: Option<String>,
 
+    /// Subscriber store (MongoDB) URI, the source of every SM policy's QoS,
+    /// Session-AMBR and PCC rules. Without it, the config file's top-level
+    /// `db_uri` (#1457). A configured store that cannot be reached FAILS
+    /// STARTUP; with none configured, every session gets the local default.
+    #[arg(long)]
+    db_uri: Option<String>,
+
     /// Log file path
     #[arg(short = 'l', long)]
     log_file: Option<String>,
@@ -327,6 +334,41 @@ pub async fn run() -> Result<()> {
         args.max_ue,
         args.max_sess
     );
+
+    // #1457: open the subscriber store BEFORE anything can read it -- the boot
+    // restoration below re-evaluates restored sessions, and the SBI server answers
+    // SM policy creates from it. Until this call pcfd parsed no db_uri at all, so
+    // every session-data read failed "Database not initialized" and every session
+    // was authorised the local default (5QI 9, 100/100 Mbps) whatever the
+    // subscriber was provisioned with (TS 29.512 §4.2.2.2: the PCF authorises the
+    // Session-AMBR from the subscription). A store that is configured but cannot be
+    // reached is fatal, as in hssd (#478): a PCF that silently answers the default
+    // for every subscriber looks healthy and is wrong for all of them.
+    match resolve_db_uri(args.db_uri.as_deref(), &args.config) {
+        Some(db_uri) => {
+            let stopping = {
+                let shutdown = shutdown.clone();
+                move || shutdown.load(Ordering::SeqCst) || SHUTDOWN.load(Ordering::SeqCst)
+            };
+            let opened = open_subscriber_store(
+                &db_uri,
+                STORE_CONNECT_ATTEMPTS,
+                STORE_CONNECT_BACKOFF,
+                stopping,
+            )
+            .await?;
+            if !opened {
+                log::info!("Shutdown requested before the subscriber store opened");
+                return Ok(());
+            }
+        }
+        None => log::warn!(
+            "No subscriber store configured (--db-uri or a top-level db_uri in {}): every SM \
+             policy is authorised the local default (5QI 9, Session-AMBR 100/100 Mbps) and \
+             every AM policy without a UDR ueAmbr the local default",
+            args.config
+        ),
+    }
 
     // Issue #66/#192: restore durable state AFTER the context knows its capacity
     // caps and BEFORE the SBI server can accept a request, so a restored
@@ -683,8 +725,130 @@ pub async fn run() -> Result<()> {
     pcf_context_final();
     log::info!("PCF context finalized");
 
+    nextgcore_dbi::nextgcore_dbi_final();
+
     log::info!("NextGCore PCF stopped");
     Ok(())
+}
+
+/// How many times startup tries to reach the subscriber store before giving up
+/// (#1457), so a store that comes up a little after the PCF (docker compose, a pod
+/// restart) is still found. The same count as hssd's (#478).
+const STORE_CONNECT_ATTEMPTS: u32 = 5;
+
+/// The pause between two store connection attempts.
+const STORE_CONNECT_BACKOFF: Duration = Duration::from_secs(2);
+
+/// The server-selection and connect timeout pcfd gives the store client when the
+/// URI sets none (#1457 review). The driver's default is 30 s, and no shipped URI
+/// sets one, so each startup attempt waited 30 s (158 s to give up, past the k8s
+/// liveness probe) and, with the store down, every SM/AM policy read held its
+/// request for 30 s while the SMF gives up after 3 s. With 1 s, startup gives up in
+/// about 13 s and a failed read answers well inside the SMF's budget. A URI that
+/// sets either option keeps its own value.
+const STORE_TIMEOUT_MS: u64 = 1000;
+
+/// `db_uri` with [`STORE_TIMEOUT_MS`] as its `serverSelectionTimeoutMS` and
+/// `connectTimeoutMS`, for each one the URI does not set itself. MongoDB URI option
+/// names are case-insensitive.
+fn bounded_db_uri(db_uri: &str) -> String {
+    let lower = db_uri.to_ascii_lowercase();
+    let extra: Vec<String> = ["serverSelectionTimeoutMS", "connectTimeoutMS"]
+        .iter()
+        .filter(|opt| !lower.contains(&format!("{}=", opt.to_ascii_lowercase())))
+        .map(|opt| format!("{opt}={STORE_TIMEOUT_MS}"))
+        .collect();
+    if extra.is_empty() {
+        return db_uri.to_string();
+    }
+    let extra = extra.join("&");
+    match db_uri.find('?') {
+        Some(q) if q + 1 == db_uri.len() || db_uri.ends_with('&') => format!("{db_uri}{extra}"),
+        Some(_) => format!("{db_uri}&{extra}"),
+        None => {
+            // Options follow the "/" that ends the host list; a bare
+            // `mongodb://host` has none yet.
+            let hosts = db_uri.find("://").map_or(0, |i| i + 3);
+            if db_uri[hosts..].contains('/') {
+                format!("{db_uri}?{extra}")
+            } else {
+                format!("{db_uri}/?{extra}")
+            }
+        }
+    }
+}
+
+/// The subscriber-store URI (#1457): `--db-uri` wins over the config file's top-level
+/// `db_uri` (the key every shipped pcf.yaml -- docker, k8s, Helm, EKS -- sets), the
+/// same CLI-over-YAML precedence as hssd. `None` when neither names one, or when the
+/// config is absent; a config that does not parse fails startup later, on its own.
+fn resolve_db_uri(cli: Option<&str>, config_path: &str) -> Option<String> {
+    if let Some(uri) = cli.map(str::trim).filter(|u| !u.is_empty()) {
+        return Some(uri.to_string());
+    }
+    #[derive(Deserialize)]
+    struct TopLevel {
+        db_uri: Option<String>,
+    }
+    let content = std::fs::read_to_string(config_path).ok()?;
+    serde_yaml::from_str::<TopLevel>(&content)
+        .ok()?
+        .db_uri
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+}
+
+/// Open nextgcore-dbi's subscriber collection (#1457), retrying only the "server not
+/// reachable yet" failure. A malformed URI fails on the first attempt, and an
+/// unreachable store fails after `attempts`: either way startup stops, so the PCF
+/// never serves policy it would have to invent. `Ok(false)` when `stopping` turned
+/// true between attempts (a SIGTERM during the wait), so the caller exits cleanly
+/// rather than being killed at the end of its grace period.
+async fn open_subscriber_store(
+    db_uri: &str,
+    attempts: u32,
+    backoff: Duration,
+    stopping: impl Fn() -> bool,
+) -> Result<bool> {
+    let db_uri = bounded_db_uri(db_uri);
+    let mut attempt = 1;
+    loop {
+        match nextgcore_dbi::nextgcore_dbi_init_async(db_uri.clone()).await {
+            Ok(()) => {
+                log::info!("Subscriber store opened");
+                return Ok(true);
+            }
+            Err(nextgcore_dbi::mongoc::DbiError::Retry) if attempt < attempts => {
+                log::warn!(
+                    "Subscriber store not reachable (attempt {attempt}/{attempts}); retrying"
+                );
+                attempt += 1;
+                let until = tokio::time::Instant::now() + backoff;
+                while tokio::time::Instant::now() < until {
+                    if stopping() {
+                        return Ok(false);
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                if stopping() {
+                    return Ok(false);
+                }
+            }
+            Err(e) => {
+                // `Retry` displays as "Retry needed", which reads as advice rather
+                // than as the reason startup stopped.
+                let why = match e {
+                    nextgcore_dbi::mongoc::DbiError::Retry => {
+                        "the server did not answer".to_string()
+                    }
+                    other => other.to_string(),
+                };
+                return Err(anyhow::anyhow!(
+                    "cannot open the subscriber store after {attempt} attempt(s): {why}"
+                ));
+            }
+        }
+    }
 }
 
 /// SBI request handler for PCF
@@ -10933,6 +11097,122 @@ mod shipped_config_tests {
         // and sets NEXTGCORE_HELM_REQUIRED, so this is never skipped there).
         if let Some(text) = nextgcore_core::helm_render::helm_rendered_config(&root, "pcf.yaml") {
             serde_yaml::from_str::<super::PcfYaml>(&text).expect("Helm pcf.yaml");
+        }
+    }
+}
+
+/// #1457: where the subscriber-store URI comes from.
+#[cfg(test)]
+mod db_uri_tests_1457 {
+    use super::resolve_db_uri;
+
+    fn config(name: &str, body: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("pcfd-1457-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pcf.yaml");
+        std::fs::write(&path, body).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn the_flag_beats_the_yaml_and_blank_is_unset() {
+        let path = config("both", "db_uri: mongodb://yaml/nextgcore\npcf: {}\n");
+        assert_eq!(
+            resolve_db_uri(Some("mongodb://cli/nextgcore"), &path).as_deref(),
+            Some("mongodb://cli/nextgcore")
+        );
+        assert_eq!(
+            resolve_db_uri(Some("  "), &path).as_deref(),
+            Some("mongodb://yaml/nextgcore"),
+            "a blank flag falls through to the YAML"
+        );
+        assert_eq!(
+            resolve_db_uri(None, &path).as_deref(),
+            Some("mongodb://yaml/nextgcore")
+        );
+        let blank = config("blank", "db_uri: \"\"\npcf: {}\n");
+        assert_eq!(resolve_db_uri(None, &blank), None);
+        assert_eq!(resolve_db_uri(None, "/nonexistent/pcf.yaml"), None);
+    }
+
+    /// Every shipped pcf.yaml names its store, so every deployment opens it.
+    #[test]
+    fn every_shipped_config_names_a_store() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let docker = root.join("docker/rust/configs/5gc/pcf.yaml");
+        assert!(
+            resolve_db_uri(None, docker.to_str().unwrap()).is_some(),
+            "docker pcf.yaml"
+        );
+        let cm: serde_yaml::Value = serde_yaml::from_str(
+            &std::fs::read_to_string(root.join("k8s/manifests/configmap.yaml")).unwrap(),
+        )
+        .unwrap();
+        let k8s = config(
+            "k8s",
+            cm["data"]["pcf.yaml"].as_str().expect("k8s pcf.yaml"),
+        );
+        assert!(resolve_db_uri(None, &k8s).is_some(), "k8s pcf.yaml");
+        if let Some(text) = nextgcore_core::helm_render::helm_rendered_config(&root, "pcf.yaml") {
+            let helm = config("helm", &text);
+            assert!(resolve_db_uri(None, &helm).is_some(), "Helm pcf.yaml");
+        }
+    }
+}
+
+/// #1457 review: every attempt and every read is bounded even when the URI is not.
+#[cfg(test)]
+mod bounded_db_uri_tests_1457 {
+    use super::bounded_db_uri;
+
+    #[test]
+    fn the_timeouts_are_added_only_where_the_uri_sets_none() {
+        let both = "serverSelectionTimeoutMS=1000&connectTimeoutMS=1000";
+        assert_eq!(
+            bounded_db_uri("mongodb://172.23.0.2/nextgcore"),
+            format!("mongodb://172.23.0.2/nextgcore?{both}")
+        );
+        assert_eq!(
+            bounded_db_uri("mongodb://mongodb.ns.svc:27017"),
+            format!("mongodb://mongodb.ns.svc:27017/?{both}")
+        );
+        assert_eq!(
+            bounded_db_uri("mongodb://u:p@h1,h2/db?replicaSet=rs0"),
+            format!("mongodb://u:p@h1,h2/db?replicaSet=rs0&{both}")
+        );
+        assert_eq!(
+            bounded_db_uri("mongodb://h/db?"),
+            format!("mongodb://h/db?{both}")
+        );
+        // An operator's own value wins, whatever its case.
+        assert_eq!(
+            bounded_db_uri("mongodb://h/db?serverselectiontimeoutms=5000"),
+            "mongodb://h/db?serverselectiontimeoutms=5000&connectTimeoutMS=1000"
+        );
+        let own = "mongodb://h/db?connectTimeoutMS=3000&serverSelectionTimeoutMS=4000";
+        assert_eq!(bounded_db_uri(own), own);
+    }
+
+    /// The driver accepts what this produces for every shipped URI shape.
+    #[test]
+    fn the_bounded_uris_parse() {
+        for uri in [
+            "mongodb://172.23.0.2/nextgcore",
+            "mongodb://mongodb.nextg-system.svc.cluster.local:27017/nextgcore",
+            "mongodb://mongodb:27017",
+        ] {
+            let opts = nextgcore_dbi::mongodb::options::ClientOptions::parse(bounded_db_uri(uri))
+                .unwrap_or_else(|e| panic!("{uri}: {e}"));
+            assert_eq!(
+                opts.server_selection_timeout,
+                Some(std::time::Duration::from_millis(1000)),
+                "{uri}"
+            );
+            assert_eq!(
+                opts.connect_timeout,
+                Some(std::time::Duration::from_millis(1000)),
+                "{uri}"
+            );
         }
     }
 }

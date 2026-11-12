@@ -149,6 +149,10 @@ services:
     depends_on:
       nrf:
         condition: service_healthy
+      # #1457: pcfd opens its subscriber store at startup and refuses to start
+      # without it.
+      mongodb:
+        condition: service_healthy
 
   nssf:
     image: nextgcore-rust/nssf:latest

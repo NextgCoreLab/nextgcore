@@ -77,6 +77,8 @@ Defaults below are the real clap `default_value`s from the source.
 | `--max-sessions` | usize | `1024` | Maximum number of PFCP sessions (sizes the UPF context). |
 | `--no-dataplane` | bool | `false` | Disable the TUN data plane; control-plane-only mode (no user traffic forwarding). |
 | `--nrf-uri` | string | `""` (empty = disabled) | Opt-in NRF base URI (e.g. `http://127.0.0.10:7777`). When set, the UPF registers a UPF NFProfile and PATCHes a real PFCP-session `/load` gauge on each heartbeat (code comment cites TS 29.510 §5.2.2.3.2). Empty disables the SBI/NRF plane entirely; NRF failures are log-only and never affect packet forwarding. |
+| `--nat-exclude` | list | empty | DN prefixes the UE subnet is **not** source-NATed toward (#1455): comma-separated IPv4 prefixes or addresses, e.g. `10.60.0.0/24`; `UPF_NAT_EXCLUDE` when the flag is not given. Traffic to them leaves with the UE's own address, so a DN server, EAS or AF can identify the UE by it (TS 23.502 §4.15.10). The exclusions go in a nat chain of their own, `UPF-NAT-EXCLUDE`, flushed and refilled at every start and jumped to from the head of `POSTROUTING`, so they also win over a MASQUERADE a container wrapper installed first (the k8s, Helm and EKS manifests do). Any exclusion that cannot be installed refuses startup. Empty: the single MASQUERADE as before (the UPF only flushes a `UPF-NAT-EXCLUDE` an earlier run left). Duplicates are merged; `0.0.0.0/0` turns NAT off everywhere and is logged as a warning. See the notes below. |
+| `--session-metrics` | `off`\|`seid`\|`seid-ue-ip` | `off` | Per-session byte counters on `/metrics` (#1455): `upf_session_ul_bytes_total` / `upf_session_dl_bytes_total`, one series per live PFCP session, labelled `seid="0x.."` (the UPF SEID as upfd logs it); `seid-ue-ip` also adds `ue_ipv4`. Never a SUPI. `UPF_SESSION_METRICS` when the flag is not given; an unknown value refuses startup. **Unbounded cardinality** (one series per session; `--max-sessions` does not cap it): opt-in, for deployments with few sessions. Off: `/metrics` is unchanged. |
 
 ### Environment variables
 
@@ -84,6 +86,8 @@ Defaults below are the real clap `default_value`s from the source.
 |----------|---------|-------------|
 | `UPF_METRICS_PORT` | `9090` | Prometheus `/metrics` port, including the TUN-path data-plane counters (#581). |
 | `NEXTGCORE_METRICS_BIND` | `127.0.0.1` | Host the unauthenticated `/metrics` listener binds to (#837). The compose files and manifests set `0.0.0.0` inside the private container/pod network. |
+| `UPF_NAT_EXCLUDE` | empty | `--nat-exclude` when the flag is not given. |
+| `UPF_SESSION_METRICS` | `off` | `--session-metrics` when the flag is not given. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://jaeger:4317` | OTLP endpoint for OpenTelemetry tracing (initialization is best-effort; failure is ignored). |
 
 > **Clock:** this NF refuses to start when the local clock reads before 2020-01-01, because its PFCP Recovery Time Stamp would be wrong. See [A set clock is required](overview.md#a-set-clock-is-required-pfcp-nfs) for the remedy on RTC-less hosts.
@@ -93,6 +97,9 @@ Defaults below are the real clap `default_value`s from the source.
 - **PFCP heartbeats:** the UPF also initiates PFCP heartbeats toward the associated CP function every 10 seconds (code comment cites TS 29.244 §6.2.2: either node may initiate).
 - **Reports:** the data plane emits Downlink Data Reports (on first buffered downlink packet) and Error Indication Reports over N4. URRs provisioned by the SMF are measured and enforced (Volume/Time Quota, #80), Usage Reports are sent, and an explicit Query URR IE is honoured (#428).
 - **EPC role:** the EPC compose runs a dedicated upfd as PGW-U (`docker/rust/configs/epc/pgwu.yaml`, which it does not parse either; the flags in `docker-compose-epc.yml` drive it).
+- **`--nat-exclude` needs a return route.** The DN sees the UE's own address, so it must route the UE subnet (e.g. `10.45.0.0/16`) back via the UPF's N6 address; without that route the replies go nowhere, and a strict reverse-path filter on the DN may drop even the requests. This is the ordinary "UPF without NAT" DN.
+- **`--nat-exclude` applies to new flows.** NAT is decided on a connection's first packet, so a flow that was already masqueraded (for instance across a UPF restart that added the exclusion) stays NATed while its conntrack entry lives. Flush conntrack, or wait for the flow to end.
+- **`--session-metrics seid-ue-ip` puts UE addresses on `/metrics`.** The listener is unauthenticated. It binds loopback by default (`NEXTGCORE_METRICS_BIND`), but the shipped compose files and manifests set `0.0.0.0` inside the container or pod network, so anything that can reach the pod can read them. Use `seid` unless the deployment needs to join a session to the address a DN saw.
 - **Validation status:** UPF behavior has been exercised in the project's matched-simulator Docker E2E suite (UE→UPF GTP-U traffic). This is internal test validation, not third-party conformance certification.
 
 ## Parsed-but-inert summary

@@ -19440,17 +19440,6 @@ impl NgapServer {
             .first()
             .cloned()
             .unwrap_or((paging.plmn_id.clone(), paging.tac));
-        let Some(paging_bytes) = crate::ngap_asn1::build_paging_asn1(
-            paging.amf_set_id,
-            paging.amf_pointer,
-            paging.tmsi,
-            &plmn_id,
-            tac,
-        ) else {
-            log::error!("Failed to build Paging message");
-            return Err(anyhow::anyhow!("Failed to build Paging message"));
-        };
-
         let area = self.paging_target_associations(&tais).await;
         // #1442, TS 23.502 §4.2.3.3: when the RAN's recommendation is available the
         // AMF "shall take that information into account to determine the (R)AN
@@ -19473,47 +19462,52 @@ impl NgapServer {
         // gNB of the UE's last known cell: a UE that has not moved since it went
         // idle is still there (TS 23.501 §5.4.3.1 makes the analytics an input to
         // the strategy, not the whole of it).
-        let predicted = match (&paging.nwdaf_predicted, paging.retransmit_count) {
-            (Some(cell), 0) => {
-                let mut gnbs = self
-                    .cell_owner_associations(&cell.plmn_id, cell.nci, "predicted", &area)
-                    .await;
-                if let Some((plmn, nci)) = &paging.nwdaf_last_cell {
-                    for assoc in self
-                        .cell_owner_associations(plmn, *nci, "last known", &area)
-                        .await
-                    {
-                        if !gnbs.contains(&assoc) {
-                            gnbs.push(assoc);
-                        }
-                    }
-                }
-                if gnbs.is_empty() {
-                    log::info!(
-                        "NWDAF UE mobility: ue={} neither predicted=({}, 0x{:09x}) nor the \
-                         last known cell is owned by a connected gNB serving the registration \
-                         area; paging the area",
-                        paging.supi.as_deref().unwrap_or("unknown"),
-                        crate::nwdaf_mobility::plmn_label(&cell.plmn_id),
-                        cell.nci
-                    );
-                }
-                gnbs
-            }
-            _ => Vec::new(),
+        let (predicted, predicted_scope) = match (&paging.nwdaf_predicted, paging.retransmit_count)
+        {
+            (Some(cell), 0) => self.nwdaf_first_attempt_targets(paging, cell, &area).await,
+            _ => (Vec::new(), ""),
         };
+        let area_len = area.len();
         let (targets, scope) = if !recommended.is_empty() {
             (
                 recommended,
                 "recommended by the RAN in the registration area",
             )
         } else if !predicted.is_empty() {
-            (
-                predicted,
-                "predicted by NWDAF UE mobility in the registration area",
-            )
+            (predicted, predicted_scope)
         } else {
             (area, "serving the registration area")
+        };
+        // The targets are a subset of the area, which every retransmission pages: the
+        // next paging area changes exactly when this attempt pages fewer nodes.
+        let targeted = targets.len() < area_len;
+
+        // nextgsim#464, TS 38.413 §9.3.1.72 / TS 38.300 §9.2.5: under a staged
+        // strategy the PAGING carries Paging Attempt Information. It is one PDU for
+        // every node paged in this attempt, so each receives the same value, as
+        // TS 23.502 §4.2.3.3 requires. The default strategy sends none, and its
+        // PAGING is unchanged.
+        let attempt_info = match paging_strategy() {
+            crate::context::PagingStrategy::RegistrationArea => None,
+            crate::context::PagingStrategy::RecommendedFirst
+            | crate::context::PagingStrategy::NwdafMobility => {
+                Some(crate::ngap_asn1::PagingAttempt::new(
+                    u32::from(paging.retransmit_count) + 1,
+                    u32::from(paging.max_retransmit) + 1,
+                    targeted,
+                ))
+            }
+        };
+        let Some(paging_bytes) = crate::ngap_asn1::build_paging_with_attempt_asn1(
+            paging.amf_set_id,
+            paging.amf_pointer,
+            paging.tmsi,
+            &plmn_id,
+            tac,
+            attempt_info.as_ref(),
+        ) else {
+            log::error!("Failed to build Paging message");
+            return Err(anyhow::anyhow!("Failed to build Paging message"));
         };
         let mut sent = 0usize;
         for assoc_id in &targets {
@@ -19532,6 +19526,51 @@ impl NgapServer {
             u32::from(paging.retransmit_count) + 1
         );
         Ok(sent)
+    }
+
+    /// The first attempt under `nwdaf-mobility` (nextgsim#464), and the scope its
+    /// log line names: the gNB(s) owning the predicted cell, then the gNB owning
+    /// the UE's last known cell, each once and within `area`. The NWDAF predicts
+    /// the most likely NEXT cell, so a UE that has not moved since it went idle is
+    /// under the last known one (TS 23.501 §5.4.3.1 makes the analytics an input
+    /// to the strategy, not the whole of it). The scope says "predicted" only when
+    /// a predicted gNB is among the targets. Empty means: page the whole area.
+    async fn nwdaf_first_attempt_targets(
+        &self,
+        paging: &crate::context::PagingContext,
+        cell: &crate::context::PredictedCell,
+        area: &[u64],
+    ) -> (Vec<u64>, &'static str) {
+        let mut gnbs = self
+            .cell_owner_associations(&cell.plmn_id, cell.nci, "predicted", area)
+            .await;
+        let scope = if gnbs.is_empty() {
+            "at the UE's last known cell in the registration area (no gNB owns the NWDAF \
+             prediction)"
+        } else {
+            "predicted by NWDAF UE mobility in the registration area"
+        };
+        if let Some((plmn, nci)) = &paging.nwdaf_last_cell {
+            for assoc in self
+                .cell_owner_associations(plmn, *nci, "last known", area)
+                .await
+            {
+                if !gnbs.contains(&assoc) {
+                    gnbs.push(assoc);
+                }
+            }
+        }
+        if gnbs.is_empty() {
+            log::info!(
+                "NWDAF UE mobility: ue={} neither predicted=({}, 0x{:09x}) nor the last \
+                 known cell is owned by a connected gNB serving the registration area; \
+                 paging the area",
+                paging.supi.as_deref().unwrap_or("unknown"),
+                crate::nwdaf_mobility::plmn_label(&cell.plmn_id),
+                cell.nci
+            );
+        }
+        (gnbs, scope)
     }
 
     /// The associations among `area`'s whose gNB owns the NR cell (`plmn`, `nci`)
@@ -24609,6 +24648,231 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(seen.lock().unwrap().is_empty(), "no NWDAF request");
         crate::context::amf_self().read().unwrap().paging_remove(ue);
+    }
+
+    // ---- nextgsim#464 PR 2: Paging Attempt Information (TS 38.413 §9.3.1.72) --
+
+    /// The Paging Attempt Information of each PAGING for 5G-TMSI `tmsi`, by
+    /// association: (count, intended, Next Paging Area Scope), or `None` when the
+    /// PAGING carries no Assistance Data for Paging.
+    fn paging_attempts_on(
+        sent: &[(u64, Vec<u8>)],
+        tmsi: u32,
+    ) -> Vec<(u64, Option<(u8, u8, Option<u8>)>)> {
+        use nextgcore_ngap_gen::generated as g;
+        sent.iter()
+            .filter_map(|(assoc, pdu)| {
+                let Ok(g::NGAP_PDU::InitiatingMessage(m)) = nextgcore_ngap_gen::decode(pdu) else {
+                    return None;
+                };
+                let g::InitiatingMessageValue::Id_Paging(paging) = m.value else {
+                    return None;
+                };
+                let ies = &paging.protocol_i_es.0;
+                let ours = ies.iter().any(|e| {
+                    matches!(
+                        &e.value,
+                        g::PagingProtocolIEs_EntryValue::Id_UEPagingIdentity(
+                            g::UEPagingIdentity::FiveG_S_TMSI(s)
+                        ) if s.five_g_tmsi.0 == tmsi.to_be_bytes()
+                    )
+                });
+                if !ours {
+                    return None;
+                }
+                let pai = ies.iter().find_map(|e| match &e.value {
+                    g::PagingProtocolIEs_EntryValue::Id_AssistanceDataForPaging(a) => {
+                        a.paging_attempt_information.as_ref().map(|p| {
+                            (
+                                p.paging_attempt_count.0,
+                                p.intended_number_of_paging_attempts.0,
+                                p.next_paging_area_scope.as_ref().map(|s| s.0),
+                            )
+                        })
+                    }
+                    _ => None,
+                });
+                Some((*assoc, pai))
+            })
+            .collect()
+    }
+
+    const SAME: u8 = nextgcore_ngap_gen::generated::NextPagingAreaScope::SAME;
+    const CHANGED: u8 = nextgcore_ngap_gen::generated::NextPagingAreaScope::CHANGED;
+
+    /// **nextgsim#464 PR 2**, TS 38.300 §9.2.5 / TS 38.413 §9.3.1.72, through the
+    /// real release, N1N2 builder and T3513 pump under `recommended-first`. Each
+    /// attempt's PAGING carries the same Paging Attempt Information on every node:
+    /// - attempt 1 (recommended gNBs only): count 1 of 5, scope changed;
+    /// - attempts 2..4 (the area): scope same;
+    /// - attempt 5, the last: no scope.
+    #[tokio::test]
+    async fn recommended_first_signals_the_paging_attempt_on_every_attempt() {
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _strategy =
+            PagingStrategyOverride::set(crate::context::PagingStrategy::RecommendedFirst);
+        let mut ngap = capturing_ngap_server().await;
+        let base = 14_640u64;
+        reco_grid(&ngap, base).await;
+        let ue = 1_464_201u64;
+        insert_connected_ue(&ngap, ue, 71, base + 1);
+        ngap.handle_ue_context_release_complete(
+            base + 1,
+            &release_complete_with(ue, 71, Some(nextgsim_recommendation())),
+        )
+        .await
+        .expect("handled");
+        settle_offloaded_sbi(&mut ngap).await;
+        queue_paging(&ngap, ue);
+        take_sent_ngap(&mut ngap);
+
+        ngap.process_paging_with(Duration::from_secs(3600)).await;
+        assert_eq!(
+            paging_attempts_on(&take_sent_ngap(&mut ngap), ue as u32),
+            vec![
+                (base + 1, Some((1, 5, Some(CHANGED)))),
+                (base + 2, Some((1, 5, Some(CHANGED)))),
+            ],
+            "attempt 1, recommended gNBs only: the next area changes"
+        );
+        for attempt in 2..=5u8 {
+            ngap.process_paging_with(Duration::ZERO).await;
+            let sent = paging_attempts_on(&take_sent_ngap(&mut ngap), ue as u32);
+            let scope = if attempt < 5 { Some(SAME) } else { None };
+            assert_eq!(sent.len(), 3, "attempt {attempt} pages the area: {sent:?}");
+            assert!(
+                sent.iter().all(|(_, p)| *p == Some((attempt, 5, scope))),
+                "attempt {attempt}: {sent:?}"
+            );
+        }
+        crate::context::amf_self().read().unwrap().paging_remove(ue);
+    }
+
+    /// **nextgsim#464 PR 2** under `nwdaf-mobility`:
+    /// - a targeted attempt 1 signals scope changed;
+    /// - an attempt 1 that falls back to the area (204) signals scope same.
+    /// The default strategy sends no Assistance Data for Paging on any attempt.
+    #[tokio::test]
+    async fn nwdaf_mobility_signals_the_attempt_and_the_default_does_not() {
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = capturing_ngap_server().await;
+        let base = 4_700u64;
+        nwdaf_grid(&ngap, base).await;
+        let area = [base + 1, base + 2, base + 3, base + 5];
+
+        {
+            let _strategy =
+                PagingStrategyOverride::set(crate::context::PagingStrategy::NwdafMobility);
+            let (_hit, hit_port, _) = nwdaf_standin(
+                Some(nwdafd_predicts(&nwdaf_cell_of(2))),
+                Duration::ZERO,
+                None,
+            )
+            .await;
+            let (_none, none_port, _) = nwdaf_standin(None, Duration::ZERO, None).await;
+            for (i, (port, expect)) in [
+                (
+                    hit_port,
+                    vec![
+                        (base + 2, Some((1, 5, Some(CHANGED)))),
+                        (base + 1, Some((1, 5, Some(CHANGED)))),
+                    ],
+                ),
+                (
+                    none_port,
+                    area.iter()
+                        .map(|a| (*a, Some((1, 5, Some(SAME)))))
+                        .collect(),
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let _ep = NwdafEndpointOverride::set(port);
+                let ue = 464_201u64 + i as u64;
+                insert_nwdaf_ue(
+                    &ngap,
+                    ue,
+                    base + 1,
+                    Some(&format!("imsi-00101000046420{i}")),
+                    Some(1),
+                );
+                queue_paging(&ngap, ue);
+                assert!(nwdaf_answer_applied(ue).await, "released");
+                take_sent_ngap(&mut ngap);
+                ngap.process_paging_with(Duration::from_secs(3600)).await;
+                let mut sent = paging_attempts_on(&take_sent_ngap(&mut ngap), ue as u32);
+                let mut expect = expect;
+                if i == 1 {
+                    sent.sort_unstable();
+                    expect.sort_unstable();
+                }
+                assert_eq!(sent, expect, "case {i}");
+                crate::context::amf_self().read().unwrap().paging_remove(ue);
+            }
+        }
+
+        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::default());
+        let ue = 464_211u64;
+        insert_nwdaf_ue(&ngap, ue, base + 1, Some("imsi-001010000464211"), Some(1));
+        queue_paging(&ngap, ue);
+        take_sent_ngap(&mut ngap);
+        ngap.process_paging_with(Duration::from_secs(3600)).await;
+        ngap.process_paging_with(Duration::ZERO).await;
+        let sent = paging_attempts_on(&take_sent_ngap(&mut ngap), ue as u32);
+        assert_eq!(sent.len(), 8, "two attempts to the area: {sent:?}");
+        assert!(
+            sent.iter().all(|(_, p)| p.is_none()),
+            "the default sends no Assistance Data for Paging: {sent:?}"
+        );
+        crate::context::amf_self().read().unwrap().paging_remove(ue);
+    }
+
+    /// **nextgsim#464** (round-2 review m9): when the prediction is owned by no gNB
+    /// in the area but the last known cell is, attempt 1 pages only that gNB, and
+    /// the scope does not claim an NWDAF prediction.
+    #[tokio::test]
+    async fn only_the_last_known_gnb_is_not_logged_as_predicted() {
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let ngap = capturing_ngap_server().await;
+        let base = 4_710u64;
+        nwdaf_grid(&ngap, base).await;
+        let area = vec![base + 1, base + 2, base + 3, base + 5];
+        let paging = |last: Option<u32>| crate::context::PagingContext {
+            nwdaf_last_cell: last.map(|g| (PlmnId::new("001", "01"), nwdaf_nci(g))),
+            ..Default::default()
+        };
+        let cell = |gnb: u32| crate::context::PredictedCell {
+            plmn_id: PlmnId::new("001", "01"),
+            nci: nwdaf_nci(gnb),
+            confidence: Some(50),
+        };
+
+        let (targets, scope) = ngap
+            .nwdaf_first_attempt_targets(&paging(Some(1)), &cell(4), &area)
+            .await;
+        assert_eq!(targets, vec![base + 1]);
+        assert!(
+            scope.starts_with("at the UE's last known cell") && !scope.contains("predicted by"),
+            "{scope}"
+        );
+
+        let (targets, scope) = ngap
+            .nwdaf_first_attempt_targets(&paging(Some(1)), &cell(2), &area)
+            .await;
+        assert_eq!(targets, vec![base + 2, base + 1]);
+        assert_eq!(
+            scope,
+            "predicted by NWDAF UE mobility in the registration area"
+        );
+
+        let (targets, _) = ngap
+            .nwdaf_first_attempt_targets(&paging(None), &cell(4), &area)
+            .await;
+        assert!(targets.is_empty(), "nothing in the area: page the area");
     }
 
     // ---- #1442: recommended-first paging (TS 38.413 §8.3.3.2, TS 23.502 §4.2.3.3) --
