@@ -525,6 +525,13 @@ fn integrity_failure_action(msg_type: u8, has_context: bool) -> IntegrityFailure
 /// T3513, the paging timer (TS 24.501 §5.6.2.2.1, Table 10.2.2: "network
 /// dependent"). 5 s unless `AMF_T3513_SECS` overrides it; `AMF_T3513_MILLIS`
 /// exists so tests can run the full retransmission ladder quickly.
+/// The configured paging strategy (`amf.paging.strategy`, #1442).
+fn paging_strategy() -> crate::context::PagingStrategy {
+    let ctx = crate::context::amf_self();
+    let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+    guard.paging_strategy
+}
+
 fn paging_t3513() -> Duration {
     if let Some(ms) = std::env::var("AMF_T3513_MILLIS")
         .ok()
@@ -3038,6 +3045,8 @@ impl NgapServer {
                     s.registered.then(|| {
                         let went_idle = !s.cm_idle;
                         s.cm_idle = true;
+                        // #1442: no Release Complete, so no recommendation.
+                        s.amf_ue.recommended_paging.clear();
                         (went_idle, abort_on_ng_release(amf_ue_ngap_id, s))
                     })
                 })
@@ -12817,11 +12826,12 @@ impl NgapServer {
         data: &[u8],
     ) -> Result<()> {
         use crate::ngap_asn1::UeContextReleaseCompleteDecode::{Complete, Failed, Undecodable};
-        let (amf_ue_ngap_id, ran_ue_ngap_id) =
+        let (amf_ue_ngap_id, ran_ue_ngap_id, recommended_paging) =
             match crate::ngap_asn1::decode_ue_context_release_complete_asn1(data) {
                 Complete {
                     amf_ue_ngap_id,
                     ran_ue_ngap_id,
+                    recommended_paging,
                     error_indication,
                 } => {
                     // Best effort: the report must not stop the supervision below.
@@ -12833,7 +12843,7 @@ impl NgapServer {
                             log::warn!("Failed to send ErrorIndication: {e}");
                         }
                     }
-                    (amf_ue_ngap_id, ran_ue_ngap_id)
+                    (amf_ue_ngap_id, ran_ue_ngap_id, recommended_paging)
                 }
                 Failed(diagnostics) => {
                     log::warn!(
@@ -12841,7 +12851,7 @@ impl NgapServer {
                      ({diagnostics:?}); the release is unsuccessfully terminated (TS 38.413 \
                      §10.3.4.2), handled locally"
                     );
-                    (None, None)
+                    (None, None, None)
                 }
                 // #999, TS 38.413 §10.2; then the same local handling as any
                 // Release Complete that names no usable UE (#802).
@@ -12851,11 +12861,16 @@ impl NgapServer {
                         "UE Context Release Complete",
                     )
                     .await?;
-                    (None, None)
+                    (None, None, None)
                 }
             };
-        self.apply_release_complete(association_id, amf_ue_ngap_id, ran_ue_ngap_id)
-            .await
+        self.apply_release_complete(
+            association_id,
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            recommended_paging,
+        )
+        .await
     }
 
     /// Record a UE Context Release Command sent on `association_id` for a UE the
@@ -12901,6 +12916,8 @@ impl NgapServer {
                     association_id,
                     Some(amf_ue_ngap_id),
                     Some(r.ran_ue_ngap_id),
+                    // A release completed locally carries no recommendation.
+                    None,
                 )
                 .await
             {
@@ -12918,7 +12935,16 @@ impl NgapServer {
         association_id: u64,
         amf_ue_ngap_id: Option<u64>,
         ran_ue_ngap_id: Option<u32>,
+        recommended_paging: Option<Vec<crate::context::RecommendedPagingTarget>>,
     ) -> Result<()> {
+        // #1442, TS 38.413 §8.3.3.2: the IE is stored only when the paging strategy
+        // uses it; otherwise it is decoded and dropped, as before.
+        let recommended_paging = match paging_strategy() {
+            crate::context::PagingStrategy::RecommendedFirst => {
+                recommended_paging.unwrap_or_default()
+            }
+            crate::context::PagingStrategy::RegistrationArea => Vec::new(),
+        };
         let (amf_ue_ngap_id, ran_ue_ngap_id) = match amf_ue_ngap_id {
             Some(id) => {
                 self.outstanding_releases.remove(&(association_id, id));
@@ -12980,6 +13006,10 @@ impl NgapServer {
                 let went_idle = s.registered && !s.cm_idle;
                 if s.registered {
                     s.cm_idle = true;
+                    // #1442: the recommendation of THIS release replaces any earlier
+                    // one, and a release with none clears it, so a page in this
+                    // idle period never follows a stale one.
+                    s.amf_ue.recommended_paging = recommended_paging;
                 }
                 // #885: the N1 connection's release is a lower layer failure to the
                 // NAS procedure running on it (TS 24.501), as for an NG Reset (#848):
@@ -16262,6 +16292,40 @@ pub enum EpsHandoverStart {
     },
 }
 
+/// Whether `session`'s node is the one `id` names, as it named itself at NG Setup.
+///
+/// #1140, TS 38.413 §9.3.1.6: the whole Global gNB ID -- PLMN, gNB ID and its bit
+/// length -- the match the NG Setup replacement (#1039) and the EPS→5GS target
+/// lookup already make. A gNB ID is unique only within its PLMN and at its own
+/// length, and a gNB never matches an ng-eNB (#876). For an ng-eNB, §9.3.1.8:
+/// (PLMN, ngENB-ID alternative, value); two ids of equal value and different
+/// lengths are different ng-eNBs. Shared by handover target resolution and
+/// recommended-first paging (#1442).
+fn session_is_ran_node(session: &GnbSession, id: &nextgcore_ngap::types::GlobalRanNodeId) -> bool {
+    use nextgcore_ngap::types::GlobalRanNodeId;
+    let gnb = &session.gnb;
+    match id {
+        GlobalRanNodeId::GlobalGnbId {
+            plmn_identity,
+            gnb_id,
+            gnb_id_len,
+        } => {
+            gnb.ng_enb_id.is_none()
+                && gnb.gnb_id_presence
+                && gnb.gnb_id == *gnb_id
+                && gnb.gnb_id_len == *gnb_id_len
+                && gnb.plmn_id == crate::ngap_asn1::decode_plmn_id(plmn_identity)
+        }
+        GlobalRanNodeId::GlobalNgEnbId {
+            plmn_identity,
+            ng_enb_id,
+        } => {
+            gnb.ng_enb_id == Some(*ng_enb_id)
+                && gnb.plmn_id == crate::ngap_asn1::decode_plmn_id(plmn_identity)
+        }
+    }
+}
+
 /// The connected gNB a Forward Relocation Request's Target Identification names (#418).
 ///
 /// Matched on the **whole** Global gNB ID — PLMN, gNB ID and its bit length — because a gNB
@@ -17778,7 +17842,6 @@ impl NgapServer {
         &self,
         target_id: &nextgcore_ngap::types::TargetId,
     ) -> Option<u64> {
-        use nextgcore_ngap::types::GlobalRanNodeId;
         let nextgcore_ngap::types::TargetId::TargetRanNodeId {
             global_ran_node_id, ..
         } = target_id
@@ -17789,34 +17852,7 @@ impl NgapServer {
         let sessions = self.sessions.read().await;
         sessions
             .iter()
-            .find(|(_, s)| match global_ran_node_id {
-                // #1140, TS 38.413 §9.3.1.6: the whole Global gNB ID -- PLMN, gNB ID and
-                // its bit length -- as the gNB named itself at NG Setup, the match the NG
-                // Setup replacement (#1039) and the EPS→5GS target lookup already make. A
-                // gNB ID is unique only within its PLMN and at its own length. A gNB
-                // target never matches an ng-eNB (#876).
-                GlobalRanNodeId::GlobalGnbId {
-                    plmn_identity,
-                    gnb_id,
-                    gnb_id_len,
-                } => {
-                    s.gnb.ng_enb_id.is_none()
-                        && s.gnb.gnb_id_presence
-                        && s.gnb.gnb_id == *gnb_id
-                        && s.gnb.gnb_id_len == *gnb_id_len
-                        && s.gnb.plmn_id == crate::ngap_asn1::decode_plmn_id(plmn_identity)
-                }
-                // #876, TS 38.413 §9.3.1.8: (PLMN, ngENB-ID alternative, value), as the
-                // ng-eNB named itself at NG Setup. Two ids of equal value and different
-                // lengths are different ng-eNBs.
-                GlobalRanNodeId::GlobalNgEnbId {
-                    plmn_identity,
-                    ng_enb_id,
-                } => {
-                    s.gnb.ng_enb_id == Some(*ng_enb_id)
-                        && s.gnb.plmn_id == crate::ngap_asn1::decode_plmn_id(plmn_identity)
-                }
-            })
+            .find(|(_, s)| session_is_ran_node(s, global_ran_node_id))
             .map(|(assoc, _)| *assoc)
     }
 
@@ -18128,6 +18164,9 @@ impl NgapServer {
                 state.initial_context_setup_request_sent = false;
                 state.initial_context_setup_response_received = false;
                 state.cm_idle = true;
+                // #1442: a recommendation from an earlier release is stale; the
+                // Release Complete answering the command below brings the new one.
+                state.amf_ue.recommended_paging.clear();
             });
             self.deactivate_up_connections(amf_ue_ngap_id).await;
             if let Some(cmd) = crate::ngap_asn1::build_ue_context_release_command_asn1(
@@ -19411,7 +19450,28 @@ impl NgapServer {
             return Err(anyhow::anyhow!("Failed to build Paging message"));
         };
 
-        let targets = self.paging_target_associations(&tais).await;
+        let area = self.paging_target_associations(&tais).await;
+        // #1442, TS 23.502 §4.2.3.3: when the RAN's recommendation is available the
+        // AMF "shall take that information into account to determine the (R)AN
+        // nodes for paging". The first attempt goes to the recommended nodes that
+        // serve the registration area (the PAGING names its TAI, so a node outside
+        // it would discard the page); every T3513 retransmission widens to the
+        // whole area. A recommendation that resolves to no such node pages the
+        // area from the first attempt.
+        let recommended = if paging.retransmit_count == 0 && !paging.recommended.is_empty() {
+            self.recommended_paging_associations(&paging.recommended, &area)
+                .await
+        } else {
+            Vec::new()
+        };
+        let (targets, scope) = if recommended.is_empty() {
+            (area, "serving the registration area")
+        } else {
+            (
+                recommended,
+                "recommended by the RAN in the registration area",
+            )
+        };
         let mut sent = 0usize;
         for assoc_id in &targets {
             match self.send_to_association(*assoc_id, &paging_bytes).await {
@@ -19420,7 +19480,7 @@ impl NgapServer {
             }
         }
         log::info!(
-            "Paging sent to {sent}/{} gNB(s) serving the registration area: \
+            "Paging sent to {sent}/{} gNB(s) {scope}: \
              5G-S-TMSI=({}, {}, 0x{:08x}), attempt {}",
             targets.len(),
             paging.amf_set_id,
@@ -19429,6 +19489,41 @@ impl NgapServer {
             u32::from(paging.retransmit_count) + 1
         );
         Ok(sent)
+    }
+
+    /// The associations of `recommended` (TS 38.413 §9.3.1.101) that are among
+    /// `area`'s, in the recommendation's order and each once (#1442). A RAN node
+    /// matches by the identity it gave at NG Setup; a TAI by the nodes serving it.
+    async fn recommended_paging_associations(
+        &self,
+        recommended: &[crate::context::RecommendedPagingTarget],
+        area: &[u64],
+    ) -> Vec<u64> {
+        use crate::context::RecommendedPagingTarget;
+        let mut out: Vec<u64> = Vec::new();
+        for target in recommended {
+            let mut matched: Vec<u64> = match target {
+                RecommendedPagingTarget::RanNode(id) => self
+                    .sessions
+                    .read()
+                    .await
+                    .iter()
+                    .filter(|(_, s)| session_is_ran_node(s, id))
+                    .map(|(assoc, _)| *assoc)
+                    .collect(),
+                RecommendedPagingTarget::Tai(plmn, tac) => {
+                    self.paging_target_associations(&[(plmn.clone(), *tac)])
+                        .await
+                }
+            };
+            matched.sort_unstable();
+            for assoc in matched {
+                if area.contains(&assoc) && !out.contains(&assoc) {
+                    out.push(assoc);
+                }
+            }
+        }
+        out
     }
 
     /// The paging pump (#512): transmit due PAGINGs and abandon expired ones.
@@ -23846,6 +23941,9 @@ mod tests {
     /// session's paging state so the next transfer is not refused as ongoing.
     #[tokio::test]
     async fn t3513_retransmits_the_paging_then_abandons_it() {
+        // The paging map is part of the process-global AMF context, and this pump
+        // takes EVERY due page in it: serialised with the #1442 pump tests.
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;
         let ue_id = 5_120_001u64;
@@ -23906,6 +24004,417 @@ mod tests {
             !after.paging.ongoing,
             "abandonment clears the session's paging state"
         );
+    }
+
+    // ---- #1442: recommended-first paging (TS 38.413 §8.3.3.2, TS 23.502 §4.2.3.3) --
+
+    /// The registration area of the #1442 tests: (001-01, TAC 0x1442), a TAC no
+    /// other test pages, so a page from another test never targets these gNBs.
+    const RECO_TAC: u32 = 0x1442;
+
+    /// Sets `amf.paging.strategy` on the process-global context for one test and
+    /// puts the default back on drop, even on a panic. Hold `CONTEXT_GUARD` for as
+    /// long as it lives: the strategy is a field of that global.
+    struct PagingStrategyOverride;
+
+    impl PagingStrategyOverride {
+        fn set(strategy: crate::context::PagingStrategy) -> Self {
+            crate::context::amf_self()
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .paging_strategy = strategy;
+            Self
+        }
+    }
+
+    impl Drop for PagingStrategyOverride {
+        fn drop(&mut self) {
+            crate::context::amf_self()
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .paging_strategy = crate::context::PagingStrategy::default();
+        }
+    }
+
+    /// Four gNBs on one server: 1, 2 and 3 serve the registration area; 4 serves
+    /// another TAC. Association ids are `base + gNB id`.
+    async fn reco_grid(ngap: &NgapServer, base: u64) {
+        for gnb in 1..=3u32 {
+            insert_pws_test_gnb(
+                ngap,
+                base + u64::from(gnb),
+                gnb,
+                crate::context::RatType::Nr,
+                &[("001", "01", RECO_TAC)],
+            )
+            .await;
+        }
+        insert_pws_test_gnb(
+            ngap,
+            base + 4,
+            4,
+            crate::context::RatType::Nr,
+            &[("001", "01", RECO_TAC + 1)],
+        )
+        .await;
+    }
+
+    /// The Information on Recommended Cells and RAN Nodes for Paging IE as NEXTGSIM
+    /// encoded it (`NEXTGSIM_RELEASE_COMPLETE_WITH_RECOMMENDATION`: gNB 1 visited,
+    /// then gNB 2), taken out of its Release Complete unchanged.
+    fn nextgsim_recommendation(
+    ) -> nextgcore_ngap_gen::generated::InfoOnRecommendedCellsAndRANNodesForPaging {
+        use nextgcore_ngap_gen::generated as g;
+        let g::NGAP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+            value: g::SuccessfulOutcomeValue::Id_UEContextRelease(complete),
+            ..
+        }) = nextgcore_ngap_gen::decode(
+            &crate::ngap_asn1::NEXTGSIM_RELEASE_COMPLETE_WITH_RECOMMENDATION,
+        )
+        .expect("the nextgsim sample decodes")
+        else {
+            panic!("a Release Complete");
+        };
+        complete
+            .protocol_i_es
+            .0
+            .into_iter()
+            .find_map(|e| match e.value {
+                g::UEContextReleaseCompleteProtocolIEs_EntryValue::Id_InfoOnRecommendedCellsAndRANNodesForPaging(
+                    info,
+                ) => Some(info),
+                _ => None,
+            })
+            .expect("the sample carries the IE")
+    }
+
+    /// The same recommendation naming only these 32-bit gNB ids of 001-01.
+    fn recommendation_of(
+        gnbs: &[u32],
+    ) -> nextgcore_ngap_gen::generated::InfoOnRecommendedCellsAndRANNodesForPaging {
+        use nextgcore_ngap_gen::generated as g;
+        let mut info = nextgsim_recommendation();
+        let template = info
+            .recommend_ran_nodes_for_paging
+            .recommended_ran_node_list
+            .0[0]
+            .clone();
+        info.recommend_ran_nodes_for_paging
+            .recommended_ran_node_list
+            .0 = gnbs
+            .iter()
+            .map(|id| {
+                let mut item = template.clone();
+                let g::AMFPagingTarget::GlobalRANNodeID(g::GlobalRANNodeID::GlobalGNB_ID(gnb)) =
+                    &mut item.amf_paging_target
+                else {
+                    panic!("the sample's first node is a gNB");
+                };
+                gnb.gnb_id = g::GNB_ID::GNB_ID(g::GNB_ID_gNB_ID(
+                    (0..32).rev().map(|i| (id >> i) & 1 == 1).collect(),
+                ));
+                item
+            })
+            .collect();
+        info
+    }
+
+    /// A UE CONTEXT RELEASE COMPLETE for this UE, carrying `info` when given.
+    fn release_complete_with(
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        info: Option<nextgcore_ngap_gen::generated::InfoOnRecommendedCellsAndRANNodesForPaging>,
+    ) -> Vec<u8> {
+        use g::UEContextReleaseCompleteProtocolIEs_EntryValue as Ie;
+        use nextgcore_ngap_gen::generated as g;
+        let entry = |id: u16, value| g::UEContextReleaseCompleteProtocolIEs_Entry {
+            id: g::ProtocolIE_ID(id),
+            criticality: g::Criticality(g::Criticality::IGNORE),
+            value,
+        };
+        let mut ies = vec![
+            entry(
+                g::ID_AMF_UE_NGAP_ID,
+                Ie::Id_AMF_UE_NGAP_ID(g::AMF_UE_NGAP_ID(amf_ue_ngap_id)),
+            ),
+            entry(
+                g::ID_RAN_UE_NGAP_ID,
+                Ie::Id_RAN_UE_NGAP_ID(g::RAN_UE_NGAP_ID(ran_ue_ngap_id)),
+            ),
+        ];
+        if let Some(info) = info {
+            ies.push(entry(
+                g::ID_INFO_ON_RECOMMENDED_CELLS_AND_RAN_NODES_FOR_PAGING,
+                Ie::Id_InfoOnRecommendedCellsAndRANNodesForPaging(info),
+            ));
+        }
+        nextgcore_ngap_gen::encode(&g::NGAP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+            procedure_code: g::ProcedureCode(g::ID_UE_CONTEXT_RELEASE),
+            criticality: g::Criticality(g::Criticality::REJECT),
+            value: g::SuccessfulOutcomeValue::Id_UEContextRelease(g::UEContextReleaseComplete {
+                protocol_i_es: g::UEContextReleaseCompleteProtocolIEs(ies),
+            }),
+        }))
+        .expect("encode")
+    }
+
+    /// A registered, CM-CONNECTED UE on `association_id`, its 5G-TMSI its NGAP
+    /// id (unique per test), registered in (001-01, [`RECO_TAC`]).
+    fn insert_connected_ue(ngap: &NgapServer, ue: u64, ran: u32, association_id: u64) {
+        let mut state = UeNasContext::new(ue, ran, association_id, false);
+        state.registered = true;
+        state.amf_ue.current_guti.amf_set_id = 0x155;
+        state.amf_ue.current_guti.amf_pointer = 0x2A;
+        state.amf_ue.current_guti.tmsi = ue as u32;
+        state.amf_ue.current_guti.plmn_id = PlmnId::new("001", "01");
+        state.amf_ue.nr_tai = crate::context::Tai5gs {
+            plmn_id: PlmnId::new("001", "01"),
+            tac: RECO_TAC,
+        };
+        ngap.ue_auth_state.insert(ue, state);
+    }
+
+    /// The paging the N1N2 path queues for this idle UE, through the production
+    /// builder, so the copy from the UE context is the one under test.
+    fn queue_paging(ngap: &NgapServer, ue: u64) {
+        let amf_ue = ngap.ue_auth_state.get(ue).expect("UE").amf_ue;
+        crate::namf_handler::initiate_paging_for_idle_ue(
+            &amf_ue,
+            None,
+            None,
+            None,
+            crate::namf_handler::PagedN2::Setup,
+            None,
+            None,
+        );
+    }
+
+    /// The associations the PAGINGs for 5G-TMSI `tmsi` went out on, in send order.
+    fn paged_on(sent: &[(u64, Vec<u8>)], tmsi: u32) -> Vec<u64> {
+        use nextgcore_ngap_gen::generated as g;
+        sent.iter()
+            .filter(|(_, pdu)| {
+                let Ok(g::NGAP_PDU::InitiatingMessage(m)) = nextgcore_ngap_gen::decode(pdu) else {
+                    return false;
+                };
+                let g::InitiatingMessageValue::Id_Paging(paging) = m.value else {
+                    return false;
+                };
+                paging.protocol_i_es.0.iter().any(|e| {
+                    matches!(
+                        &e.value,
+                        g::PagingProtocolIEs_EntryValue::Id_UEPagingIdentity(
+                            g::UEPagingIdentity::FiveG_S_TMSI(s)
+                        ) if s.five_g_tmsi.0 == tmsi.to_be_bytes()
+                    )
+                })
+            })
+            .map(|(assoc, _)| *assoc)
+            .collect()
+    }
+
+    /// **#1442**, TS 38.413 §8.3.3.2 + TS 23.502 §4.2.3.3, end to end through the
+    /// real handlers: the Release Complete (carrying NEXTGSIM's encoding of the IE)
+    /// stores the recommendation, N1N2 paging copies it, and the T3513 pump pages
+    /// only the recommended gNBs on attempt 1, then the whole registration area on
+    /// the retransmission. gNB 4 (another TAC) is paged on neither.
+    #[tokio::test]
+    async fn recommended_first_pages_the_recommended_gnbs_then_widens_to_the_area() {
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _strategy =
+            PagingStrategyOverride::set(crate::context::PagingStrategy::RecommendedFirst);
+        let mut ngap = capturing_ngap_server().await;
+        let base = 14_420u64;
+        reco_grid(&ngap, base).await;
+        let ue = 1_442_001u64;
+        insert_connected_ue(&ngap, ue, 61, base + 1);
+
+        ngap.handle_ue_context_release_complete(
+            base + 1,
+            &release_complete_with(ue, 61, Some(nextgsim_recommendation())),
+        )
+        .await
+        .expect("handled");
+        settle_offloaded_sbi(&mut ngap).await;
+        let stored = ngap.ue_auth_state.get(ue).expect("UE kept");
+        assert!(
+            stored.is_cm_idle(),
+            "precondition: the release idled the UE"
+        );
+        assert_eq!(
+            stored.amf_ue.recommended_paging.len(),
+            2,
+            "the recommendation is STORED: {:?}",
+            stored.amf_ue.recommended_paging
+        );
+
+        queue_paging(&ngap, ue);
+        take_sent_ngap(&mut ngap);
+        ngap.process_paging_with(Duration::from_secs(3600)).await;
+        assert_eq!(
+            paged_on(&take_sent_ngap(&mut ngap), ue as u32),
+            vec![base + 1, base + 2],
+            "attempt 1 goes to the recommended gNBs only, in the RAN's order"
+        );
+
+        ngap.process_paging_with(Duration::ZERO).await;
+        let mut retransmitted = paged_on(&take_sent_ngap(&mut ngap), ue as u32);
+        retransmitted.sort_unstable();
+        assert_eq!(
+            retransmitted,
+            vec![base + 1, base + 2, base + 3],
+            "the T3513 retransmission widens to every gNB serving the registration area"
+        );
+        crate::context::amf_self().read().unwrap().paging_remove(ue);
+    }
+
+    /// **#1442**: the default, `registration-area`, does not store the IE, so the
+    /// same release and the same page reach the whole registration area on attempt
+    /// 1, exactly as before the feature.
+    #[tokio::test]
+    async fn the_default_strategy_ignores_the_recommendation_and_pages_the_area() {
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::default());
+        let mut ngap = capturing_ngap_server().await;
+        let base = 14_430u64;
+        reco_grid(&ngap, base).await;
+        let ue = 1_442_002u64;
+        insert_connected_ue(&ngap, ue, 62, base + 1);
+
+        ngap.handle_ue_context_release_complete(
+            base + 1,
+            &release_complete_with(ue, 62, Some(nextgsim_recommendation())),
+        )
+        .await
+        .expect("handled");
+        settle_offloaded_sbi(&mut ngap).await;
+        assert!(
+            ngap.ue_auth_state
+                .get(ue)
+                .expect("UE")
+                .amf_ue
+                .recommended_paging
+                .is_empty(),
+            "decoded, not stored"
+        );
+
+        queue_paging(&ngap, ue);
+        take_sent_ngap(&mut ngap);
+        ngap.process_paging_with(Duration::from_secs(3600)).await;
+        let mut first = paged_on(&take_sent_ngap(&mut ngap), ue as u32);
+        first.sort_unstable();
+        assert_eq!(first, vec![base + 1, base + 2, base + 3]);
+        crate::context::amf_self().read().unwrap().paging_remove(ue);
+    }
+
+    /// **#1442**, the fall-backs under `recommended-first`, at `send_paging`:
+    /// a recommendation of gNBs that are not connected, or that do not serve the
+    /// registration area, pages the area from attempt 1; a mixed one keeps only the
+    /// recommended gNBs that serve it; and a retransmission always pages the area.
+    #[tokio::test]
+    async fn an_unusable_recommendation_falls_back_to_the_registration_area() {
+        use crate::context::RecommendedPagingTarget;
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = capturing_ngap_server().await;
+        let base = 14_440u64;
+        reco_grid(&ngap, base).await;
+        let node = |gnb_id| {
+            RecommendedPagingTarget::RanNode(nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId {
+                plmn_identity: [0x00, 0xF1, 0x10],
+                gnb_id,
+                gnb_id_len: 32,
+            })
+        };
+        let page = |recommended: Vec<RecommendedPagingTarget>, retransmit_count: u8| {
+            crate::context::PagingContext {
+                amf_ue_ngap_id: 1_442_003,
+                tmsi: 1_442_003,
+                plmn_id: PlmnId::new("001", "01"),
+                tac: RECO_TAC,
+                tai_list: vec![(PlmnId::new("001", "01"), RECO_TAC)],
+                retransmit_count,
+                recommended,
+                ..Default::default()
+            }
+        };
+        let area = vec![base + 1, base + 2, base + 3];
+        let mut cases: Vec<(&str, Vec<RecommendedPagingTarget>, u8, Vec<u64>)> = vec![
+            ("no recommendation", vec![], 0, area.clone()),
+            ("an unknown gNB", vec![node(9)], 0, area.clone()),
+            ("a gNB outside the area", vec![node(4)], 0, area.clone()),
+            (
+                "mixed: only the in-area gNB",
+                vec![node(4), node(3)],
+                0,
+                vec![base + 3],
+            ),
+            (
+                "a TAI target: its serving gNBs",
+                vec![RecommendedPagingTarget::Tai(
+                    PlmnId::new("001", "01"),
+                    RECO_TAC,
+                )],
+                0,
+                area.clone(),
+            ),
+            ("a retransmission", vec![node(2)], 1, area.clone()),
+        ];
+        // The positive arm, last, so a broken matcher cannot pass the arms above by
+        // always falling back.
+        cases.push(("one recommended gNB", vec![node(2)], 0, vec![base + 2]));
+        for (why, recommended, retransmit_count, expected) in cases {
+            ngap.send_paging(&page(recommended, retransmit_count))
+                .await
+                .expect("sent");
+            let mut got = paged_on(&take_sent_ngap(&mut ngap), 1_442_003);
+            if expected.len() > 1 {
+                got.sort_unstable();
+            }
+            assert_eq!(got, expected, "{why}");
+        }
+    }
+
+    /// **#1442**: a later release that carries no recommendation clears the stored
+    /// one, so a page in that idle period follows no stale recommendation.
+    #[tokio::test]
+    async fn a_release_without_the_ie_clears_a_stored_recommendation() {
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _strategy =
+            PagingStrategyOverride::set(crate::context::PagingStrategy::RecommendedFirst);
+        let mut ngap = capturing_ngap_server().await;
+        let base = 14_450u64;
+        reco_grid(&ngap, base).await;
+        let ue = 1_442_004u64;
+        insert_connected_ue(&ngap, ue, 64, base + 1);
+        let stored = |ngap: &NgapServer| {
+            ngap.ue_auth_state
+                .get(ue)
+                .expect("UE")
+                .amf_ue
+                .recommended_paging
+                .len()
+        };
+
+        ngap.handle_ue_context_release_complete(
+            base + 1,
+            &release_complete_with(ue, 64, Some(recommendation_of(&[3]))),
+        )
+        .await
+        .expect("handled");
+        settle_offloaded_sbi(&mut ngap).await;
+        assert_eq!(stored(&ngap), 1, "the first release stores gNB 3");
+
+        // Back to CM-CONNECTED on the same association, then released again with no IE.
+        ngap.ue_auth_state.with_mut(ue, |s| s.cm_idle = false);
+        ngap.handle_ue_context_release_complete(base + 1, &release_complete_with(ue, 64, None))
+            .await
+            .expect("handled");
+        settle_offloaded_sbi(&mut ngap).await;
+        assert_eq!(stored(&ngap), 0, "a release with no IE clears it");
     }
 
     /// A registered UE in CM-IDLE, as the release left it, with NIA0 so the test

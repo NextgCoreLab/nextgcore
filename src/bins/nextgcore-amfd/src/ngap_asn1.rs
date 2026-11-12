@@ -3575,6 +3575,12 @@ pub enum UeContextReleaseCompleteDecode {
         amf_ue_ngap_id: Option<u64>,
         /// The RAN UE NGAP ID the gNB names.
         ran_ue_ngap_id: Option<u32>,
+        /// The Recommended RAN Nodes for Paging of the Information on Recommended
+        /// Cells and RAN Nodes for Paging IE (§9.3.1.100/.101), in the RAN's order
+        /// (#1442); `None` when the IE is absent. An entry this AMF cannot page
+        /// (an N3IWF, or a choice extension) is left out. The Recommended Cells
+        /// are "transparent to the 5GC" (§9.3.1.71) and are not kept.
+        recommended_paging: Option<Vec<crate::context::RecommendedPagingTarget>>,
         /// The Error Indication to send, if any.
         error_indication: Option<CriticalityErrorIndication>,
     },
@@ -3585,6 +3591,57 @@ pub enum UeContextReleaseCompleteDecode {
     /// Not decodable.
     Undecodable,
 }
+
+/// The Recommended RAN Nodes for Paging (TS 38.413 §9.3.1.101) as paging targets,
+/// in the list's order: visited nodes most recent first, each followed by the
+/// non-visited nodes associated with it (#1442).
+///
+/// An N3IWF or a choice extension cannot be paged over NG and is left out; a TAI
+/// target keeps its TAI, whose serving nodes the paging pump resolves.
+pub(crate) fn recommended_paging_targets(
+    info: &ngap_gen::InfoOnRecommendedCellsAndRANNodesForPaging,
+) -> Vec<crate::context::RecommendedPagingTarget> {
+    use crate::context::RecommendedPagingTarget;
+    info.recommend_ran_nodes_for_paging
+        .recommended_ran_node_list
+        .0
+        .iter()
+        .filter_map(|item| match &item.amf_paging_target {
+            ngap_gen::AMFPagingTarget::GlobalRANNodeID(id) => {
+                hand_written_global_ran_node_id(id).map(RecommendedPagingTarget::RanNode)
+            }
+            ngap_gen::AMFPagingTarget::TAI(tai) => Some(RecommendedPagingTarget::Tai(
+                decode_plmn_id(&tai.plmn_identity.0),
+                tai.tac
+                    .0
+                    .iter()
+                    .fold(0u32, |tac, b| (tac << 8) | u32::from(*b)),
+            )),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        })
+        .collect()
+}
+
+/// #1442: a UE CONTEXT RELEASE COMPLETE carrying Information on Recommended
+/// Cells and RAN Nodes for Paging (TS 38.413 §9.3.1.100), ENCODED BY NEXTGSIM:
+/// its own `build_ue_context_release_complete` (nextgsim
+/// `nextgsim-ngap/src/procedures/ue_context_release.rs`, at 486ee47) with the
+/// IE appended through nextgsim's generated types and its `encode_ngap_pdu`.
+/// The bytes are checked in as captured, so this pins the decode against the
+/// other codebase's encoder rather than against this one's.
+///
+/// Content, in the §9.3.1.71/.101 order (F3 of the #462 plan): AMF UE NGAP ID
+/// 7, RAN UE NGAP ID 3; cells NR CGI 001/01 NCI 0x10 (visited, 30 s) then NCI
+/// 0x20 (non-visited); RAN nodes gNB 1 (visited) then gNB 2 (non-visited),
+/// both PLMN 001/01 with a 32-bit gNB ID.
+#[cfg(test)]
+pub(crate) const NEXTGSIM_RELEASE_COMPLETE_WITH_RECOMMENDATION: [u8; 63] = [
+    0x20, 0x29, 0x00, 0x3b, 0x00, 0x00, 0x03, 0x00, 0x0a, 0x40, 0x02, 0x00, 0x07, 0x00, 0x55, 0x40,
+    0x02, 0x00, 0x03, 0x00, 0x20, 0x40, 0x28, 0x01, 0x40, 0x00, 0xf1, 0x10, 0x00, 0x00, 0x00, 0x01,
+    0x00, 0x00, 0x1e, 0x00, 0x00, 0xf1, 0x10, 0x00, 0x00, 0x00, 0x02, 0x00, 0x40, 0x00, 0x00, 0xf1,
+    0x10, 0x50, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0xf1, 0x10, 0x50, 0x00, 0x00, 0x00, 0x02,
+];
 
 /// Decode a UE Context Release Complete (gNB -> AMF, TS 38.413 §9.2.2.6) with
 /// the GENERATED codec (#417 stage 4), applying the §10.3.4.2 rules for a
@@ -3626,13 +3683,18 @@ pub fn decode_ue_context_release_complete_asn1(data: &[u8]) -> UeContextReleaseC
 
     let mut amf_ue_ngap_id = None;
     let mut ran_ue_ngap_id = None;
+    let mut recommended_paging = None;
     for entry in complete.protocol_i_es.0 {
         match entry.value {
             Ie::Id_AMF_UE_NGAP_ID(v) => amf_ue_ngap_id = Some(v.0),
             Ie::Id_RAN_UE_NGAP_ID(v) => ran_ue_ngap_id = Some(v.0),
+            // TS 38.413 §8.3.3.2: the AMF "shall, if supported, store it" (#1442).
+            // Whether it is stored is the paging strategy's call, at the caller.
+            Ie::Id_InfoOnRecommendedCellsAndRANNodesForPaging(info) => {
+                recommended_paging = Some(recommended_paging_targets(&info));
+            }
             // Comprehended, and not used by the AMF.
             Ie::Id_UserLocationInformation(_)
-            | Ie::Id_InfoOnRecommendedCellsAndRANNodesForPaging(_)
             | Ie::Id_PDUSessionResourceListCxtRelCpl(_)
             | Ie::Id_CriticalityDiagnostics(_)
             | Ie::Id_PagingAssisDataforCEcapabUE(_) => {}
@@ -3656,6 +3718,7 @@ pub fn decode_ue_context_release_complete_asn1(data: &[u8]) -> UeContextReleaseC
     Complete {
         amf_ue_ngap_id,
         ran_ue_ngap_id,
+        recommended_paging,
         error_indication,
     }
 }
@@ -9270,6 +9333,10 @@ pub(crate) mod tests {
                     Ie::Id_PDUSessionResourceListCxtRelCpl(_) => {
                         (ngap_gen::ID_PDU_SESSION_RESOURCE_LIST_CXT_REL_CPL, 0)
                     }
+                    Ie::Id_InfoOnRecommendedCellsAndRANNodesForPaging(_) => (
+                        ngap_gen::ID_INFO_ON_RECOMMENDED_CELLS_AND_RAN_NODES_FOR_PAGING,
+                        1,
+                    ),
                     other => panic!("not used by these tests: {other:?}"),
                 };
                 ngap_gen::UEContextReleaseCompleteProtocolIEs_Entry {
@@ -9572,6 +9639,123 @@ pub(crate) mod tests {
         ));
     }
 
+    fn gnb_node(gnb_id: u32) -> crate::context::RecommendedPagingTarget {
+        crate::context::RecommendedPagingTarget::RanNode(GlobalRanNodeId::GlobalGnbId {
+            plmn_identity: [0x00, 0xF1, 0x10],
+            gnb_id,
+            gnb_id_len: 32,
+        })
+    }
+
+    #[test]
+    fn a_nextgsim_encoded_recommendation_decodes_in_the_rans_order() {
+        let UeContextReleaseCompleteDecode::Complete {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            recommended_paging,
+            error_indication,
+        } = decode_ue_context_release_complete_asn1(&NEXTGSIM_RELEASE_COMPLETE_WITH_RECOMMENDATION)
+        else {
+            panic!("the nextgsim-encoded Release Complete must decode");
+        };
+        assert_eq!((amf_ue_ngap_id, ran_ue_ngap_id), (Some(7), Some(3)));
+        assert_eq!(
+            recommended_paging,
+            Some(vec![gnb_node(1), gnb_node(2)]),
+            "visited gNB 1 first, then non-visited gNB 2 (TS 38.413 §9.3.1.101)"
+        );
+        assert!(
+            error_indication.is_none(),
+            "the IE is comprehended: nothing to report"
+        );
+    }
+
+    /// #1442: the CHOICE AMF Paging Target's TAI alternative keeps its TAI, a
+    /// node this AMF cannot page over NG (an N3IWF) is left out, and a gNB ID is
+    /// kept at its own bit length; the order of what remains is the RAN's.
+    #[test]
+    fn recommended_tai_targets_decode_and_an_n3iwf_is_left_out() {
+        use crate::context::RecommendedPagingTarget;
+        use ngap_gen::UEContextReleaseCompleteProtocolIEs_EntryValue as Ie;
+        fn bits(value: u32, len: usize) -> bitvec::vec::BitVec<u8, bitvec::order::Msb0> {
+            (0..len).rev().map(|i| (value >> i) & 1 == 1).collect()
+        }
+        let plmn = || ngap_gen::PLMNIdentity(vec![0x00, 0xF1, 0x10]);
+        let item = |amf_paging_target| ngap_gen::RecommendedRANNodeItem {
+            amf_paging_target,
+            ie_extensions: None,
+        };
+        let info = ngap_gen::InfoOnRecommendedCellsAndRANNodesForPaging {
+            recommended_cells_for_paging: ngap_gen::RecommendedCellsForPaging {
+                recommended_cell_list: ngap_gen::RecommendedCellList(vec![
+                    ngap_gen::RecommendedCellItem {
+                        ngran_cgi: ngap_gen::NGRAN_CGI::NR_CGI(ngap_gen::NR_CGI {
+                            plmn_identity: plmn(),
+                            nr_cell_identity: ngap_gen::NRCellIdentity(
+                                (0..36).map(|i| i == 35).collect(),
+                            ),
+                            ie_extensions: None,
+                        }),
+                        time_stayed_in_cell: None,
+                        ie_extensions: None,
+                    },
+                ]),
+                ie_extensions: None,
+            },
+            recommend_ran_nodes_for_paging: ngap_gen::RecommendedRANNodesForPaging {
+                recommended_ran_node_list: ngap_gen::RecommendedRANNodeList(vec![
+                    item(ngap_gen::AMFPagingTarget::TAI(ngap_gen::TAI {
+                        plmn_identity: plmn(),
+                        tac: ngap_gen::TAC(vec![0x00, 0x00, 0x07]),
+                        ie_extensions: None,
+                    })),
+                    item(ngap_gen::AMFPagingTarget::GlobalRANNodeID(
+                        ngap_gen::GlobalRANNodeID::GlobalN3IWF_ID(ngap_gen::GlobalN3IWF_ID {
+                            plmn_identity: plmn(),
+                            n3iwf_id: ngap_gen::N3IWF_ID::N3IWF_ID(ngap_gen::N3IWF_ID_n3IWF_ID(
+                                bits(5, 16),
+                            )),
+                            ie_extensions: None,
+                        }),
+                    )),
+                    item(ngap_gen::AMFPagingTarget::GlobalRANNodeID(
+                        ngap_gen::GlobalRANNodeID::GlobalGNB_ID(ngap_gen::GlobalGNB_ID {
+                            plmn_identity: plmn(),
+                            gnb_id: ngap_gen::GNB_ID::GNB_ID(ngap_gen::GNB_ID_gNB_ID(bits(
+                                0x3FFFFF, 22,
+                            ))),
+                            ie_extensions: None,
+                        }),
+                    )),
+                ]),
+                ie_extensions: None,
+            },
+            ie_extensions: None,
+        };
+        let data = generated_release_complete(vec![
+            Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(7)),
+            Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(9)),
+            Ie::Id_InfoOnRecommendedCellsAndRANNodesForPaging(info),
+        ]);
+        let UeContextReleaseCompleteDecode::Complete {
+            recommended_paging, ..
+        } = decode_ue_context_release_complete_asn1(&data)
+        else {
+            panic!("expected Complete");
+        };
+        assert_eq!(
+            recommended_paging,
+            Some(vec![
+                RecommendedPagingTarget::Tai(decode_plmn_id(&[0x00, 0xF1, 0x10]), 7),
+                RecommendedPagingTarget::RanNode(GlobalRanNodeId::GlobalGnbId {
+                    plmn_identity: [0x00, 0xF1, 0x10],
+                    gnb_id: 0x3FFFFF,
+                    gnb_id_len: 22,
+                }),
+            ])
+        );
+    }
+
     /// A Release Complete is a response, so §10.3.4.2 reports a "notify" IE in
     /// an Error Indication -- Triggering Message successful-outcome, Procedure
     /// Criticality reject -- and names the UE all the same.
@@ -9581,6 +9765,7 @@ pub(crate) mod tests {
         let UeContextReleaseCompleteDecode::Complete {
             amf_ue_ngap_id: Some(7),
             ran_ue_ngap_id: Some(9),
+            recommended_paging: None,
             error_indication: Some(report),
         } = decode_ue_context_release_complete_asn1(&data)
         else {
@@ -9620,6 +9805,7 @@ pub(crate) mod tests {
             UeContextReleaseCompleteDecode::Complete {
                 amf_ue_ngap_id: Some(7),
                 ran_ue_ngap_id: None,
+                recommended_paging: None,
                 error_indication: None,
             }
         ));
