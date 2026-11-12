@@ -28,6 +28,9 @@
 //! against the subscription as stored then (Update SRR on a new `repPeriod`,
 //! Remove SRR when the subscription is gone or no longer covers the session). A
 //! PUT reconciles the SRRs it holds the same way.
+//! The RAN leg is serialised per session: one task sends the QoS Monitoring
+//! Requests, awaiting each N1N2MessageTransfer and re-deciding when it returns,
+//! so the last request the AMF receives matches the session's SRRs.
 //!
 //! Not modelled, stated: the PCC-rule path (TS 29.512 QosMonitoringData, the
 //! UPEAS `appIds` / `defQosSupp` matching), Event Triggered reporting with
@@ -90,6 +93,13 @@ struct SessionMon {
     /// An N2 QoS Monitoring Request was held back by another 5GSM procedure:
     /// sent when the session is idle again ([`on_gsm_idle`]).
     n2_deferred: bool,
+    /// A task owns the session's RAN leg ([`drive_ran`]): it alone sends the
+    /// QoS Monitoring Requests, one awaited N1N2MessageTransfer at a time, so
+    /// they reach the AMF in the order they were decided (#1390 review round 3).
+    n2_busy: bool,
+    /// `both` must be sent even if the NG-RAN was last asked for it: a new gNB
+    /// (Xn path switch), or a request held back.
+    n2_force: bool,
 }
 
 impl SessionMon {
@@ -131,7 +141,7 @@ fn with<T>(f: impl FnOnce(&mut HashMap<String, SessionMon>) -> T) -> T {
 /// Drop a session's entry once it holds nothing.
 fn tidy(m: &mut HashMap<String, SessionMon>, r: &str) {
     if m.get(r)
-        .is_some_and(|s| s.srrs.is_empty() && !s.ran_on && !s.n2_deferred)
+        .is_some_and(|s| s.srrs.is_empty() && !s.ran_on && !s.n2_deferred && !s.n2_busy)
     {
         m.remove(r);
     }
@@ -146,6 +156,29 @@ pub fn active_on(sm_context_ref: &str) -> bool {
 /// The session is released: its SRRs went with the N4 session.
 pub fn forget(sm_context_ref: &str) {
     with(|m| m.remove(sm_context_ref));
+}
+
+/// The [`drive_ran`] tasks running, for tests: one must not outlive its test,
+/// whose locks guard the 5GSM timers it arms (#723).
+#[cfg(test)]
+static DRIVES_FOR_TEST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Wait (at most 15 s) until no [`drive_ran`] task runs, for tests to call
+/// before they release their locks.
+#[cfg(test)]
+pub(crate) async fn quiesce_for_test() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while DRIVES_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst) > 0
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Whether no task is sending the session's QoS Monitoring Requests, for tests.
+#[cfg(test)]
+pub(crate) fn ran_idle_for_test(sm_context_ref: &str) -> bool {
+    with(|m| m.get(sm_context_ref).is_none_or(|s| !s.n2_busy))
 }
 
 #[cfg(test)]
@@ -270,9 +303,8 @@ pub async fn subscribed(sub: &EventSubscription) {
         return;
     }
     for r in sessions_for(sub) {
-        if install(&r, sub).await {
-            signal(&r, QosMonitoringRequest::Both);
-        }
+        install(&r, sub).await;
+        want_ran(&r, false);
     }
 }
 
@@ -338,9 +370,7 @@ pub fn on_user_plane_active(sm_context_ref: &str) {
         for sub in &subs {
             any |= install(&r, sub).await;
         }
-        if any {
-            signal(&r, QosMonitoringRequest::Both);
-        }
+        want_ran(&r, any);
     });
 }
 
@@ -356,34 +386,89 @@ pub fn on_path_switch(sm_context_ref: &str) {
     let r = sm_context_ref.to_string();
     tokio::spawn(async move {
         tokio::time::sleep(AFTER_ACTIVATION).await;
-        if active_on(&r) {
-            signal(&r, QosMonitoringRequest::Both);
-        }
+        want_ran(&r, true);
     });
 }
 
-/// Ask the NG-RAN to start or stop, remembering what it was asked and whether
-/// the request had to wait for another 5GSM procedure (#1390 review m5).
-fn signal(r: &str, request: QosMonitoringRequest) {
-    // `stop` only while no SRR is installed or being installed: an install that
-    // started meanwhile sends `both` itself (#1390 review round 2).
-    if request == QosMonitoringRequest::Stop && with(|m| m.get(r).is_some_and(SessionMon::live)) {
-        log::info!("ref={r}: QoS monitoring still wanted on the session: no stop");
-        return;
+/// The QoS Monitoring Request the session's NG-RAN needs now, from its SRRs
+/// under the lock: `both` while one is installed (unless the NG-RAN was last
+/// asked for it, and nothing forces a resend), `stop` once none is installed or
+/// being installed and the NG-RAN was measuring, else nothing. An SRR still
+/// being installed asks again when it settles.
+fn ran_wanted(s: &mut SessionMon) -> Option<QosMonitoringRequest> {
+    if s.installed() {
+        let force = std::mem::take(&mut s.n2_force);
+        (force || !s.ran_on).then_some(QosMonitoringRequest::Both)
+    } else {
+        s.n2_force = false;
+        (s.ran_on && !s.live()).then_some(QosMonitoringRequest::Stop)
     }
-    let outcome = crate::signal_qos_monitoring(r, request);
-    with(|m| {
+}
+
+/// The session's SRRs changed (or its gNB did, `force`): bring the NG-RAN in
+/// line (#1390 review round 3). One task per session sends, awaiting each
+/// N1N2MessageTransfer and looking again when it returns, so a `stop` decided
+/// before a `both` cannot reach the AMF after it, and the last request sent
+/// always matches [`active_on`].
+fn want_ran(r: &str, force: bool) {
+    let start = with(|m| {
         let s = m.entry(r.to_string()).or_default();
-        match outcome {
-            crate::QosMonitoringSignal::Sent => {
-                s.ran_on = request == QosMonitoringRequest::Both;
-                s.n2_deferred = false;
-            }
-            crate::QosMonitoringSignal::Deferred => s.n2_deferred = true,
-            crate::QosMonitoringSignal::NotSent => {}
-        }
-        tidy(m, r);
+        s.n2_force |= force;
+        let start = !s.n2_busy;
+        s.n2_busy = true;
+        start
     });
+    if start {
+        let r = r.to_string();
+        #[cfg(test)]
+        DRIVES_FOR_TEST.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tokio::spawn(async move {
+            drive_ran(&r).await;
+            #[cfg(test)]
+            DRIVES_FOR_TEST.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+}
+
+/// The task owning a session's RAN leg (see [`want_ran`]).
+async fn drive_ran(r: &str) {
+    loop {
+        let want = with(|m| {
+            let s = m.get_mut(r)?;
+            let want = ran_wanted(s);
+            if want.is_none() {
+                s.n2_busy = false;
+                tidy(m, r);
+            }
+            want
+        });
+        let Some(want) = want else {
+            return;
+        };
+        let outcome = crate::signal_qos_monitoring(r, want).await;
+        let stop = with(|m| {
+            let Some(s) = m.get_mut(r) else {
+                return true;
+            };
+            match outcome {
+                crate::QosMonitoringSignal::Sent => {
+                    s.ran_on = want == QosMonitoringRequest::Both;
+                    s.n2_deferred = false;
+                    false
+                }
+                // m5: sent from `on_gsm_idle` once the procedure ends.
+                crate::QosMonitoringSignal::Deferred | crate::QosMonitoringSignal::NotSent => {
+                    s.n2_deferred |= outcome == crate::QosMonitoringSignal::Deferred;
+                    s.n2_busy = false;
+                    tidy(m, r);
+                    true
+                }
+            }
+        });
+        if stop {
+            return;
+        }
+    }
 }
 
 /// The session's 5GSM procedure ended (its T3591 / T3592 stopped or was
@@ -391,27 +476,16 @@ fn signal(r: &str, request: QosMonitoringRequest) {
 /// sent now, for what the session needs then: `both` while an SRR is installed,
 /// `stop` if the NG-RAN was measuring and none is.
 pub fn on_gsm_idle(sm_context_ref: &str) {
-    let want = with(|m| {
-        let s = m.get_mut(sm_context_ref)?;
-        if !std::mem::take(&mut s.n2_deferred) {
-            return None;
-        }
-        let want = if s.installed() {
-            Some(QosMonitoringRequest::Both)
-        } else if s.ran_on && !s.live() {
-            Some(QosMonitoringRequest::Stop)
-        } else {
-            None
-        };
-        tidy(m, sm_context_ref);
-        want
+    let deferred = with(|m| {
+        m.get_mut(sm_context_ref)
+            .is_some_and(|s| std::mem::take(&mut s.n2_deferred))
     });
-    if let Some(want) = want {
+    if deferred {
         log::info!(
             "ref={sm_context_ref}: the 5GSM procedure ended; sending the QoS Monitoring \
-             Request {want:?} it held back"
+             Request it held back"
         );
-        signal(sm_context_ref, want);
+        want_ran(sm_context_ref, true);
     }
 }
 
@@ -509,6 +583,10 @@ async fn install(sm_context_ref: &str, sub: &EventSubscription) -> bool {
                 }
                 tidy(m, sm_context_ref);
             });
+            // Another removal may have held back its `stop` for this install.
+            if with(|m| m.get(sm_context_ref).is_some_and(|s| s.ran_on)) {
+                want_ran(sm_context_ref, false);
+            }
             false
         }
     }
@@ -598,19 +676,18 @@ async fn settle(r: &str, sub_id: &str, id: u8, mut sent: u32) -> bool {
                 send_remove(r, id, sub_id).await;
                 // #1390 review round 2: only now is the SRR ID free, and `stop`
                 // is decided now, counting SRRs installed or being installed.
-                let last = with(|m| {
+                let known = with(|m| {
                     let Some(s) = m.get_mut(r) else {
                         return false;
                     };
                     if let Some(i) = s.position(sub_id, id) {
                         s.srrs.remove(i);
                     }
-                    let last = s.ran_on && !s.live();
-                    tidy(m, r);
-                    last
+                    true
                 });
-                if last {
-                    signal(r, QosMonitoringRequest::Stop);
+                // `stop` if this was the last SRR installed or being installed.
+                if known {
+                    want_ran(r, false);
                 }
                 return false;
             }

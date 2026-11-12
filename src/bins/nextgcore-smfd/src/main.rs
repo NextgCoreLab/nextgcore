@@ -10036,7 +10036,7 @@ fn event_subscription_not_found(subscription_id: &str) -> SbiResponse {
 /// Monitoring Request (TS 38.413 §9.3.1.12, id 181), and whose N1 restates the
 /// Session-AMBR, as the #1409 ARP-only change does. Under T3591, with the same
 /// guards as [`signal_policy_change`].
-pub(crate) fn signal_qos_monitoring(
+pub(crate) async fn signal_qos_monitoring(
     sm_context_ref: &str,
     request: n2_transfer::QosMonitoringRequest,
 ) -> QosMonitoringSignal {
@@ -10123,17 +10123,16 @@ pub(crate) fn signal_qos_monitoring(
             paged,
         }),
     );
-    let r = sm_context_ref.to_string();
-    tokio::spawn(async move {
-        send_n1_n2_modify_transfer(&amf_uri, &b.supi, b.psi, &n1, &n2, paged, &r).await;
-    });
+    // Awaited, not spawned (#1390 review round 3): `qos_mon` sends one at a time
+    // per session, so the AMF receives them in the order they were decided.
+    send_n1_n2_modify_transfer(&amf_uri, &b.supi, b.psi, &n1, &n2, paged, sm_context_ref).await;
     QosMonitoringSignal::Sent
 }
 
 /// What [`signal_qos_monitoring`] did with a QoS Monitoring Request (#1390).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QosMonitoringSignal {
-    /// Sent (an SMF-requested modification under T3591).
+    /// Sent (an SMF-requested modification under T3591), the transfer answered.
     Sent,
     /// Held back: another 5GSM procedure owns the session, or it is in
     /// Exception. `qos_mon` sends it when the procedure ends (review m5).
@@ -26323,6 +26322,8 @@ mod tests {
         assert_eq!(session_setup_flows(&reference, &b)[0].qos_monitoring, None);
 
         cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
+        qos_mon::quiesce_for_test().await;
+        cancel_gsm_timer_for_test(&reference);
         forget_seeded_session(&reference);
         event_exposure::clear_for_test();
         amf.stop().await.ok();
@@ -26367,6 +26368,8 @@ mod tests {
         );
         assert!(posts.lock().unwrap().is_empty(), "no N1N2MessageTransfer");
         assert!(!qos_mon::active_on(&reference));
+        qos_mon::quiesce_for_test().await;
+        cancel_gsm_timer_for_test(&reference);
         forget_seeded_session(&reference);
         event_exposure::clear_for_test();
         amf.stop().await.ok();
@@ -26394,6 +26397,8 @@ mod tests {
         assert_eq!(upf.modification_bodies().len(), mods_before);
         assert!(posts.lock().unwrap().is_empty());
         assert!(!qos_mon::active_on(&reference));
+        qos_mon::quiesce_for_test().await;
+        cancel_gsm_timer_for_test(&reference);
         forget_seeded_session(&reference);
         event_exposure::clear_for_test();
         amf.stop().await.ok();
@@ -26430,6 +26435,8 @@ mod tests {
         let _ = sub;
         cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
         qos_mon::forget(&reference);
+        qos_mon::quiesce_for_test().await;
+        cancel_gsm_timer_for_test(&reference);
         forget_seeded_session(&reference);
         event_exposure::clear_for_test();
         amf.stop().await.ok();
@@ -26513,6 +26520,8 @@ mod tests {
         assert_eq!(e["rtDelays"], serde_json::json!([45]));
 
         qos_mon::forget(&reference);
+        qos_mon::quiesce_for_test().await;
+        cancel_gsm_timer_for_test(&reference);
         forget_seeded_session(&reference);
         event_exposure::clear_for_test();
         consumer.stop().await.ok();
@@ -26541,6 +26550,8 @@ mod tests {
         let binding = lookup_policy_binding(&reference).unwrap();
         spawn_release_side_effects_with(&reference, binding, false);
         assert!(!qos_mon::active_on(&reference), "forgotten at release");
+        qos_mon::quiesce_for_test().await;
+        cancel_gsm_timer_for_test(&reference);
         forget_seeded_session(&reference);
         event_exposure::clear_for_test();
         amf.stop().await.ok();
@@ -26703,6 +26714,8 @@ mod tests {
 
         cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
         qos_mon::forget(&reference);
+        qos_mon::quiesce_for_test().await;
+        cancel_gsm_timer_for_test(&reference);
         forget_seeded_session(&reference);
         event_exposure::clear_for_test();
         amf.stop().await.ok();
@@ -26814,6 +26827,9 @@ mod tests {
         cancel_gsm_timer(&ref6, timer::SmfTimerId::T3591);
         qos_mon::forget(&ref5);
         qos_mon::forget(&ref6);
+        qos_mon::quiesce_for_test().await;
+        cancel_gsm_timer_for_test(&ref5);
+        cancel_gsm_timer_for_test(&ref6);
         forget_seeded_session(&ref5);
         forget_seeded_session(&ref6);
         event_exposure::clear_for_test();
@@ -26898,6 +26914,8 @@ mod tests {
 
         cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
         qos_mon::forget(&reference);
+        qos_mon::quiesce_for_test().await;
+        cancel_gsm_timer_for_test(&reference);
         forget_seeded_session(&reference);
         event_exposure::clear_for_test();
         amf.stop().await.ok();
@@ -26952,13 +26970,8 @@ mod tests {
             "Y's SRR is created and never removed: {ops:?}"
         );
         assert!(qos_mon::active_on(&reference));
-        let got = await_n1n2_1385(&posts, posted + 1).await;
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let got = if posts.lock().unwrap().len() > got.len() {
-            posts.lock().unwrap().clone()
-        } else {
-            got
-        };
+        wait_until(|| qos_mon::ran_idle_for_test(&reference)).await;
+        let got = posts.lock().unwrap().clone();
         let requests: Vec<_> = got[posted..]
             .iter()
             .flat_map(|p| n2_monitoring_1390(&p.3))
@@ -26970,16 +26983,108 @@ mod tests {
             )),
             "no stop while Y is installed: {requests:?}"
         );
-        assert_eq!(
-            requests.last(),
-            Some(&(
-                9,
-                Some(nextgcore_ngap_gen::generated::QosMonitoringRequest::BOTH)
-            ))
+        // The NG-RAN was measuring for X and still is for Y: nothing need be sent,
+        // and anything that is, is `both`.
+        assert!(
+            requests.iter().all(|r| r
+                == &(
+                    9,
+                    Some(nextgcore_ngap_gen::generated::QosMonitoringRequest::BOTH)
+                )),
+            "{requests:?}"
         );
 
         cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
         qos_mon::forget(&reference);
+        qos_mon::quiesce_for_test().await;
+        cancel_gsm_timer_for_test(&reference);
+        forget_seeded_session(&reference);
+        event_exposure::clear_for_test();
+        amf.stop().await.ok();
+    }
+
+    /// #1390 review round 3: whatever the interleaving of a DELETE with a new
+    /// subscription on one session, the last QoS Monitoring Request the AMF
+    /// receives matches the session's monitoring (`both` while an SRR is
+    /// installed, `stop` once none is): one awaited N1N2MessageTransfer at a time
+    /// per session, re-decided when it returns. 120 rounds over three
+    /// interleavings, a third of them a DELETE alone.
+    ///
+    /// REVERT-VERIFIED: with the transfer spawned rather than awaited (round 2),
+    /// a `stop` decided before a `both` arrives after it in some rounds.
+    // The event-store lock is held across awaits, as the other event tests do
+    // (event_exposure::STORE_LOCK).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_last_qos_monitoring_request_matches_the_sessions_monitoring_1390() {
+        use nextgcore_ngap_gen::generated::QosMonitoringRequest as Q;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _q = qos_mon::TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _e = event_exposure::lock_store();
+        event_exposure::clear_for_test();
+        qos_mon::clear_for_test();
+        let supi = "imsi-001010000013914";
+        let (_upf, reference, amf, posts) = qos_mon_session_1390(supi, 5, true).await;
+        let mut held: Option<event_exposure::EventSubscription> = None;
+        let mut wrong = Vec::new();
+        for round in 0..120usize {
+            let mode = round % 3;
+            // Every third round deletes without a new subscription.
+            let alone = round % 9 >= 6 && held.is_some();
+            let next = (!alone)
+                .then(|| qos_mon_subscription_1390(supi, &["QOS_MON"], "http://127.0.0.1:9/cb"));
+            let old = held.take();
+            if let Some(o) = &old {
+                event_exposure::remove(&o.id);
+            }
+            let delete = async {
+                if let Some(o) = &old {
+                    qos_mon::unsubscribed(&o.id).await;
+                }
+            };
+            let subscribe = async {
+                match mode {
+                    1 => tokio::task::yield_now().await,
+                    2 => tokio::time::sleep(std::time::Duration::from_micros(200)).await,
+                    _ => {}
+                }
+                if let Some(n) = &next {
+                    qos_mon::subscribed(n).await;
+                }
+            };
+            tokio::join!(delete, subscribe);
+            held = next;
+            wait_until(|| qos_mon::ran_idle_for_test(&reference)).await;
+            let last = posts
+                .lock()
+                .unwrap()
+                .last()
+                .map(|p| n2_monitoring_1390(&p.3));
+            let want = if qos_mon::active_on(&reference) {
+                Q::BOTH
+            } else {
+                Q::STOP
+            };
+            if last.as_ref().and_then(|l| l.first()).map(|f| f.1) != Some(Some(want)) {
+                wrong.push((round, mode, want, last));
+            }
+            assert_eq!(
+                qos_mon::active_on(&reference),
+                held.is_some(),
+                "round {round}"
+            );
+        }
+        assert!(
+            wrong.is_empty(),
+            "the last N2 did not match the monitoring in {} of 120 rounds: {wrong:?}",
+            wrong.len()
+        );
+
+        cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
+        qos_mon::forget(&reference);
+        qos_mon::quiesce_for_test().await;
+        cancel_gsm_timer_for_test(&reference);
         forget_seeded_session(&reference);
         event_exposure::clear_for_test();
         amf.stop().await.ok();
@@ -27040,6 +27145,8 @@ mod tests {
 
         cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
         qos_mon::forget(&reference);
+        qos_mon::quiesce_for_test().await;
+        cancel_gsm_timer_for_test(&reference);
         forget_seeded_session(&reference);
         event_exposure::clear_for_test();
         amf.stop().await.ok();
@@ -27100,6 +27207,8 @@ mod tests {
 
         cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
         qos_mon::forget(&reference);
+        qos_mon::quiesce_for_test().await;
+        cancel_gsm_timer_for_test(&reference);
         forget_seeded_session(&reference);
         event_exposure::clear_for_test();
         amf.stop().await.ok();
@@ -27158,6 +27267,8 @@ mod tests {
 
         cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
         qos_mon::forget(&reference);
+        qos_mon::quiesce_for_test().await;
+        cancel_gsm_timer_for_test(&reference);
         forget_seeded_session(&reference);
         event_exposure::clear_for_test();
         amf.stop().await.ok();
