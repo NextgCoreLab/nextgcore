@@ -13,13 +13,15 @@
 //!   and stays there. A UDR that is late, or an NRF that is late, is picked up at the
 //!   next attempt.
 //! - **Expiry** (TS 29.519 §5.4.2.10 `expiry`): when the UDR confirms an expiry time,
-//!   the subscription is renewed with a PUT on the individual resource (§5.2.11.3.2)
+//!   the subscription is renewed with a PUT on the individual resource (§5.2.11.3.1)
 //!   before it lapses. See [`renew_at`]. A 404 on that PUT means the UDR no longer
 //!   holds it, and a new one is created.
 //! - **UDR re-registration**: every [`audit_interval`] it checks two things. First, it
-//!   re-discovers the UDR: a UDR now registered at a different endpoint is a new
-//!   instance, so it subscribes there. Second, it GETs the individual subscription
-//!   (§5.2.11.3.1): a 404 means the UDR restarted and lost it, as udrd does without a
+//!   re-discovers the UDRs. While the subscription's UDR is listed anywhere in the
+//!   result it is kept (the NRF's order is not stable); when the NRF lists other UDRs
+//!   and not this one, the old subscription is DELETEd there, best effort, and a new
+//!   one is made. Second, it GETs the individual subscription
+//!   (§5.2.11.3.3): a 404 means the UDR restarted and lost it, as udrd does without a
 //!   state file, so it subscribes again.
 //!   A failure to reach the NRF or the UDR leaves the subscription in place, because a
 //!   transient error is not evidence that it is gone.
@@ -27,8 +29,9 @@
 //! # Off every request path
 //!
 //! The maintainer is its own task, spawned after the SBI server is listening. Each
-//! request is bounded by `client_for`'s 3 s timeout. Startup does not wait for it,
-//! and it checks the shutdown flags at least every [`STOP_POLL`].
+//! request is bounded at 3 s: the UDR ones by `client_for`, the NRF discovery by
+//! [`DISCOVERY_TIMEOUT`]. Startup does not wait for it, it checks the shutdown flags
+//! at least every [`STOP_POLL`], and it starts no POST once shutdown is requested.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -37,7 +40,7 @@ use nextgcore_sbi::datetime::{now_epoch_secs, rfc3339_to_epoch};
 use nextgcore_sbi::types::NfType;
 
 use crate::sbi_path::{
-    client_for, pcf_discover_endpoint, policy_data_notify_uri, policy_data_subscription_body,
+    client_for, pcf_discover_endpoints, policy_data_notify_uri, policy_data_subscription_body,
     uri_path_only, DiscoveredEndpoint,
 };
 
@@ -55,6 +58,11 @@ pub const AUDIT_ENV: &str = "PCF_POLICY_DATA_AUDIT_SECS";
 
 /// How often a waiting maintainer checks the shutdown flags.
 pub const STOP_POLL: Duration = Duration::from_millis(100);
+
+/// The bound on one UDR discovery at the NRF (#1458 review): the shared NRF client
+/// waits 30 s, which would hold an audit past a due renewal, and a shutdown past
+/// its join.
+pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The most a renewal is moved ahead of the confirmed expiry, in seconds.
 const RENEW_LEAD_MAX_SECS: u64 = 60;
@@ -131,15 +139,24 @@ pub enum Attempt {
 }
 
 /// Discover a UDR and POST the policy-data subscription (TS 29.519 §5.2.10.3.1).
-pub async fn subscribe_once() -> Attempt {
+///
+/// `stopping` is checked between the discovery and the POST, so a shutdown that
+/// arrives during a slow discovery never creates a subscription at the UDR that the
+/// PCF would then have no time to record and delete.
+pub async fn subscribe_once(stopping: &impl Fn() -> bool) -> Attempt {
     let Some(notification_uri) = policy_data_notify_uri() else {
         return Attempt::NotYet("no advertised SBI address for the notification URI");
     };
-    let udr = match pcf_discover_endpoint("UDR", "nudr-dr").await {
-        Ok(Some(ep)) => ep,
-        Ok(None) => return Attempt::NotYet("no UDR discoverable"),
+    let udr = match pcf_discover_endpoints("UDR", "nudr-dr", DISCOVERY_TIMEOUT).await {
+        Ok(found) => match found.into_iter().next() {
+            Some(ep) => ep,
+            None => return Attempt::NotYet("no UDR discoverable"),
+        },
         Err(e) => return Attempt::Failed(format!("UDR discovery failed: {e}")),
     };
+    if stopping() {
+        return Attempt::NotYet("shutting down");
+    }
     let body = policy_data_subscription_body(&notification_uri);
     let resp = match client_for(&udr, NfType::Udr)
         .post_json("/nudr-dr/v2/policy-data/subs-to-notify", &body)
@@ -184,7 +201,7 @@ pub enum Check {
     Unknown(String),
 }
 
-/// Renew `sub` with a PUT on its individual resource (TS 29.519 §5.2.11.3.2).
+/// Renew `sub` with a PUT on its individual resource (TS 29.519 §5.2.11.3.1).
 pub async fn renew(sub: &Subscription) -> Check {
     let Some(resource) = sub.resource.as_deref() else {
         return Check::Held(sub.expiry);
@@ -200,22 +217,37 @@ pub async fn renew(sub: &Subscription) -> Check {
         Ok(resp) if resp.status == 200 => {
             Check::Held(confirmed_expiry(resp.http.content.as_deref()))
         }
-        Ok(resp) if resp.status == 204 => Check::Held(None),
+        // 204 confirms the update and nothing else (no body, so no expiry). The
+        // lifetime the UDR confirmed before still applies, from now; reading it as
+        // "unlimited" would stop the renewals and let the subscription lapse.
+        Ok(resp) if resp.status == 204 => Check::Held(
+            sub.expiry
+                .map(|expiry| now_epoch_secs() + expiry.saturating_sub(sub.granted_at)),
+        ),
         Ok(resp) if resp.status == 404 => Check::Lost("the UDR no longer holds it".into()),
         Ok(resp) => Check::Unknown(format!("the UDR answered {} to the renewal", resp.status)),
         Err(e) => Check::Unknown(format!("renewal failed: {e}")),
     }
 }
 
-/// Check that `sub` is still the live one: the registered UDR is the one it was made
-/// at, and that UDR still holds it (TS 29.519 §5.2.11.3.1).
+/// Check that `sub` is still the live one: its UDR is still registered, and still
+/// holds it (TS 29.519 §5.2.11.3.3).
+///
+/// "Still registered" means *listed anywhere* in the discovery result, not listed
+/// first: the NRF's order is not stable, and treating a reordering as a switch made
+/// the PCF subscribe again at every audit (#1458 review). Only when the NRF lists
+/// UDRs and this one is not among them has the UDR been replaced; the old
+/// subscription is then deleted, best effort, before a new one is made.
 pub async fn audit(sub: &Subscription) -> Check {
-    match pcf_discover_endpoint("UDR", "nudr-dr").await {
-        Ok(Some(ep)) if ep != sub.udr => {
+    match pcf_discover_endpoints("UDR", "nudr-dr", DISCOVERY_TIMEOUT).await {
+        Ok(found) if !found.is_empty() && !found.contains(&sub.udr) => {
+            delete_at(sub).await;
             return Check::Lost(format!(
-                "the registered UDR is now {}:{}, not {}:{}",
-                ep.host, ep.port, sub.udr.host, sub.udr.port
-            ))
+                "UDR {}:{} is no longer registered ({} other UDR(s) are)",
+                sub.udr.host,
+                sub.udr.port,
+                found.len()
+            ));
         }
         Ok(_) => {}
         Err(e) => return Check::Unknown(format!("UDR discovery failed: {e}")),
@@ -296,7 +328,7 @@ pub async fn maintain(stopping: impl Fn() -> bool) {
             return;
         }
         let Some(mut sub) = current() else {
-            let stop = match subscribe_once().await {
+            let stop = match subscribe_once(&stopping).await {
                 Attempt::Subscribed(sub) => {
                     if failures > 0 {
                         log::info!(
@@ -378,20 +410,25 @@ pub fn spawn(stopping: impl Fn() -> bool + Send + Sync + 'static) -> tokio::task
 }
 
 /// Delete the held subscription at the UDR it was made at (#299), at shutdown.
-///
-/// Best effort and logged: a UDR that keeps the subscription only logs a delivery
-/// failure per notification, so failing loudly here would be noise, but staying
-/// silent would hide a leak that outlives the process.
 pub async fn unsubscribe() {
     let Some(sub) = current() else {
         return;
     };
     set_current(None);
-    let Some(resource) = sub.resource else {
+    delete_at(&sub).await;
+}
+
+/// DELETE `sub` at its own UDR (TS 29.519 §5.2.11.3.2), bounded by `client_for`.
+///
+/// Best effort and logged: a UDR that keeps the subscription only logs a delivery
+/// failure per notification, so failing loudly here would be noise, but staying
+/// silent would hide a leak that outlives the process.
+async fn delete_at(sub: &Subscription) {
+    let Some(resource) = sub.resource.as_deref() else {
         log::warn!("Policy-data subscription has no Location: it cannot be deleted and leaks");
         return;
     };
-    let path = uri_path_only(&resource);
+    let path = uri_path_only(resource);
     match client_for(&sub.udr, NfType::Udr).delete(&path).await {
         Ok(resp) if (200..300).contains(&resp.status) => {
             log::info!("Policy-data subscription {resource} deleted");

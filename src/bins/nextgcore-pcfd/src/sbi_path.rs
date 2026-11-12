@@ -1669,6 +1669,57 @@ pub async fn pcf_discover_endpoint(
     Ok(parse_first_endpoint(&json, service_name))
 }
 
+/// Every `service_name` endpoint the NRF lists for `target_nf_type`, in the NRF's
+/// order, with the whole discovery bounded by `within` (#1458 review).
+///
+/// TS 29.510 gives a `SearchResult` no order, and nrfd builds it from a `HashMap`,
+/// so "the first one" changes between two identical queries. A caller that holds
+/// state at one instance must therefore ask whether that instance is *listed*, not
+/// whether it is first. The shared NRF client waits 30 s for an answer, longer than
+/// such a caller can afford, hence the bound.
+pub async fn pcf_discover_endpoints(
+    target_nf_type: &str,
+    service_name: &str,
+    within: std::time::Duration,
+) -> Result<Vec<DiscoveredEndpoint>, String> {
+    let query = async {
+        let ctx = global_context();
+        let Some(nrf_uri) = ctx.get_nrf_uri().await else {
+            return Ok(Vec::new());
+        };
+        let (nrf_host, nrf_port) = parse_uri_host_port(&nrf_uri)?;
+        let client = ctx.get_client(&nrf_host, nrf_port).await;
+        let path = format!(
+            "/nnrf-disc/v1/nf-instances?target-nf-type={target_nf_type}&requester-nf-type=PCF&service-names={service_name}"
+        );
+        let response = client
+            .get(&path)
+            .await
+            .map_err(|e| format!("NRF discovery failed: {e}"))?;
+        if response.status != 200 {
+            return Err(format!("NRF discovery returned status {}", response.status));
+        }
+        let body = response
+            .http
+            .content
+            .ok_or("Empty NRF discovery response")?;
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| format!("Invalid NRF discovery response: {e}"))?;
+        Ok(json
+            .get("nfInstances")
+            .and_then(|v| v.as_array())
+            .map(|nfs| {
+                nfs.iter()
+                    .filter_map(|nf| parse_instance_endpoint(nf, service_name))
+                    .collect()
+            })
+            .unwrap_or_default())
+    };
+    tokio::time::timeout(within, query)
+        .await
+        .map_err(|_| format!("NRF discovery did not answer within {within:?}"))?
+}
+
 /// Build a bounded-timeout SBI client for a discovered endpoint. Attaches an
 /// NRF-issued Bearer token scoped to `target` when OAuth2 enforcement is on
 /// (Wave-6 H8 Phase A, TS 33.501 §13.4.1); a no-op otherwise so the matched-sim

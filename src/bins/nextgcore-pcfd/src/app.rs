@@ -703,14 +703,16 @@ pub async fn run() -> Result<()> {
     // notifications at a socket that has closed, and udrd only logs a delivery failure,
     // so the subscription would linger for the life of that UDR.
     // #1458: the maintainer sees the same shutdown flags and stops within
-    // `policy_data_sub::STOP_POLL` plus one bounded request; wait for it, so it cannot
-    // re-create the subscription after the DELETE.
+    // `policy_data_sub::STOP_POLL` plus the request in flight (each is bounded at 3 s,
+    // discovery included, and none is started once stopping); wait for it, so it
+    // cannot re-create the subscription after the DELETE, and so it is never aborted
+    // between the UDR creating a subscription and the PCF recording it.
     let mut policy_data_maintainer = policy_data_maintainer;
-    if tokio::time::timeout(Duration::from_secs(5), &mut policy_data_maintainer)
+    if tokio::time::timeout(Duration::from_secs(8), &mut policy_data_maintainer)
         .await
         .is_err()
     {
-        log::warn!("Policy-data subscription maintainer did not stop within 5 s; aborted");
+        log::warn!("Policy-data subscription maintainer did not stop within 8 s; aborted");
         policy_data_maintainer.abort();
     }
     crate::policy_data_sub::unsubscribe().await;

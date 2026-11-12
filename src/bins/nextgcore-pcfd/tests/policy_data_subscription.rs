@@ -16,6 +16,11 @@
 //! - with `renew` never taken (always the audit), the expiry test fails;
 //! - with the stop check removed from `wait_or_stop`,
 //!   `a_sigterm_while_no_udr_is_registered_exits_promptly` fails.
+//! - review round 1: without the DELETE on a switch, the replacement test fails;
+//!   comparing against the first listed UDR instead of any, the reordered-result
+//!   test fails; with a 30 s discovery bound, the hung-NRF test fails; with a 204
+//!   renewal read as "unlimited", the 204 test fails; without the stop check between
+//!   discovery and POST, the SIGTERM-during-discovery test fails.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -34,8 +39,10 @@ impl Drop for Killed {
     }
 }
 
+/// Serve `handler` on a loopback listener. The handler answers a response and how
+/// long to hold it before sending (zero for most).
 fn serve(
-    handler: impl Fn(SbiRequest) -> SbiResponse + Send + Sync + 'static,
+    handler: impl Fn(SbiRequest) -> (Duration, SbiResponse) + Send + Sync + 'static,
 ) -> impl std::future::Future<Output = (SbiServer, SocketAddr)> {
     let handler = Arc::new(handler);
     async move {
@@ -44,7 +51,13 @@ fn serve(
         server
             .start(move |req: SbiRequest| {
                 let handler = handler.clone();
-                async move { handler(req) }
+                async move {
+                    let (hold, resp) = handler(req);
+                    if !hold.is_zero() {
+                        tokio::time::sleep(hold).await;
+                    }
+                    resp
+                }
             })
             .await
             .expect("stub server");
@@ -63,6 +76,8 @@ struct UdrState {
     next_id: u32,
     /// Confirm this many seconds of lifetime on every POST and PUT.
     expiry_secs: Option<u64>,
+    /// Answer a renewal PUT 204 with no body, so it confirms no expiry.
+    put_204: bool,
     /// The latest expiry confirmed (epoch seconds), and when it was confirmed.
     confirmed: Option<(u64, Instant)>,
 }
@@ -80,7 +95,7 @@ impl Udr {
             ..Default::default()
         }));
         let s = state.clone();
-        let (server, addr) = serve(move |req| udr_answer(&s, &req)).await;
+        let (server, addr) = serve(move |req| (Duration::ZERO, udr_answer(&s, &req))).await;
         Udr {
             state,
             port: addr.port(),
@@ -132,7 +147,9 @@ fn udr_answer(state: &Mutex<UdrState>, req: &SbiRequest) -> SbiResponse {
                 }
                 "PUT" => {
                     st.puts.push(Instant::now());
-                    if held {
+                    if held && st.put_204 {
+                        SbiResponse::with_status(204)
+                    } else if held {
                         let b = body(&mut st);
                         SbiResponse::with_status(200).with_body(b, "application/json")
                     } else {
@@ -156,6 +173,11 @@ fn udr_answer(state: &Mutex<UdrState>, req: &SbiRequest) -> SbiResponse {
 struct Nrf {
     udrs: Arc<Mutex<Vec<u16>>>,
     udr_discoveries: Arc<Mutex<usize>>,
+    /// Rotate the UDR list by one on every discovery: TS 29.510 gives a
+    /// SearchResult no order, and nrfd's comes from a HashMap.
+    rotate: Arc<Mutex<bool>>,
+    /// Hold every UDR discovery answer this long.
+    discovery_hold: Arc<Mutex<Duration>>,
     port: u16,
     _server: SbiServer,
 }
@@ -164,10 +186,17 @@ impl Nrf {
     async fn start() -> Nrf {
         let udrs: Arc<Mutex<Vec<u16>>> = Arc::default();
         let udr_discoveries: Arc<Mutex<usize>> = Arc::default();
-        let (u, d) = (udrs.clone(), udr_discoveries.clone());
+        let rotate: Arc<Mutex<bool>> = Arc::default();
+        let discovery_hold: Arc<Mutex<Duration>> = Arc::default();
+        let (u, d, r, h) = (
+            udrs.clone(),
+            udr_discoveries.clone(),
+            rotate.clone(),
+            discovery_hold.clone(),
+        );
         let (server, addr) = serve(move |req| {
             let uri = req.header.uri.clone();
-            match req.header.method.as_str() {
+            let resp = match req.header.method.as_str() {
                 "PUT" if uri.starts_with("/nnrf-nfm/v1/nf-instances/") => {
                     SbiResponse::with_status(201).with_body(
                         req.http.content.clone().unwrap_or_else(|| "{}".into()),
@@ -179,24 +208,43 @@ impl Nrf {
                     // The query may arrive in the URI or parsed into `params`.
                     let wants_udr = uri.contains("target-nf-type=UDR")
                         || req.http.params.get("target-nf-type").map(String::as_str) == Some("UDR");
-                    let instances: Vec<serde_json::Value> = if wants_udr {
-                        *d.lock().unwrap() += 1;
-                        u.lock().unwrap().iter().map(|p| udr_profile(*p)).collect()
-                    } else {
-                        vec![]
+                    if !wants_udr {
+                        return (
+                            Duration::ZERO,
+                            SbiResponse::with_status(200)
+                                .with_body(r#"{"nfInstances":[]}"#, "application/json"),
+                        );
+                    }
+                    let n = {
+                        let mut d = d.lock().unwrap();
+                        *d += 1;
+                        *d
                     };
-                    SbiResponse::with_status(200).with_body(
-                        serde_json::json!({ "nfInstances": instances }).to_string(),
-                        "application/json",
-                    )
+                    let mut list = u.lock().unwrap().clone();
+                    if *r.lock().unwrap() && !list.is_empty() {
+                        let k = n % list.len();
+                        list.rotate_left(k);
+                    }
+                    let instances: Vec<serde_json::Value> =
+                        list.iter().map(|p| udr_profile(*p)).collect();
+                    return (
+                        *h.lock().unwrap(),
+                        SbiResponse::with_status(200).with_body(
+                            serde_json::json!({ "nfInstances": instances }).to_string(),
+                            "application/json",
+                        ),
+                    );
                 }
                 _ => SbiResponse::with_status(404),
-            }
+            };
+            (Duration::ZERO, resp)
         })
         .await;
         Nrf {
             udrs,
             udr_discoveries,
+            rotate,
+            discovery_hold,
             port: addr.port(),
             _server: server,
         }
@@ -204,6 +252,15 @@ impl Nrf {
 
     fn register_only(&self, udr_port: u16) {
         *self.udrs.lock().unwrap() = vec![udr_port];
+    }
+
+    fn register_rotating(&self, udr_ports: &[u16]) {
+        *self.udrs.lock().unwrap() = udr_ports.to_vec();
+        *self.rotate.lock().unwrap() = true;
+    }
+
+    fn hold_discovery(&self, hold: Duration) {
+        *self.discovery_hold.lock().unwrap() = hold;
     }
 
     fn udr_discoveries(&self) -> usize {
@@ -380,6 +437,18 @@ async fn a_replacement_udr_gets_the_subscription() {
         || second.with(|s| s.posts) == 1,
     )
     .await;
+    // The first UDR is still up: the subscription it holds is deleted there, not
+    // left to send a second copy of every notification.
+    eventually(
+        Duration::from_secs(10),
+        "a DELETE at the replaced UDR",
+        || first.with(|s| s.deletes) == 1,
+    )
+    .await;
+    assert!(
+        first.with(|s| s.held.is_empty()),
+        "the replaced UDR holds nothing"
+    );
     first.server.stop().await.ok();
     second.server.stop().await.ok();
 }
@@ -458,4 +527,103 @@ async fn a_sigterm_while_no_udr_is_registered_exits_promptly() {
     sigterm(&pcfd.0);
     let status = exits_within(&mut pcfd.0, Duration::from_secs(3)).await;
     assert!(status.success(), "{status:?}");
+}
+
+/// Two healthy UDRs, listed in a different order at every discovery. The
+/// subscription's UDR is always listed, so it is kept: one POST over many audits,
+/// and no DELETE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reordered_discovery_result_keeps_the_subscription() {
+    let nrf = Nrf::start().await;
+    let a = Udr::start(None).await;
+    let b = Udr::start(None).await;
+    nrf.register_rotating(&[a.port, b.port]);
+    let (_pcfd, _dir) = spawn_pcfd("rotating", &nrf, Some(1));
+    let posts = || a.with(|s| s.posts) + b.with(|s| s.posts);
+    eventually(Duration::from_secs(30), "the subscription", || posts() == 1).await;
+    let seen = nrf.udr_discoveries();
+    eventually(Duration::from_secs(15), "six more audits", || {
+        nrf.udr_discoveries() >= seen + 6
+    })
+    .await;
+    assert_eq!(posts(), 1, "one subscription across every reordering");
+    assert_eq!(a.with(|s| s.deletes) + b.with(|s| s.deletes), 0);
+    a.server.stop().await.ok();
+    b.server.stop().await.ok();
+}
+
+/// A UDR that answers a renewal 204 confirms no new expiry; the lifetime it
+/// confirmed on the POST still applies, so the PCF keeps renewing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_204_renewal_keeps_the_confirmed_lifetime() {
+    let nrf = Nrf::start().await;
+    let udr = Udr::start(Some(4)).await;
+    udr.with(|s| s.put_204 = true);
+    nrf.register_only(udr.port);
+    let (_pcfd, _dir) = spawn_pcfd("put204", &nrf, None);
+    eventually(Duration::from_secs(30), "the subscription", || {
+        udr.with(|s| s.posts) == 1
+    })
+    .await;
+    eventually(Duration::from_secs(4), "a first renewal", || {
+        udr.with(|s| s.puts.len()) == 1
+    })
+    .await;
+    let first_put = udr.with(|s| s.puts[0]);
+    eventually(
+        Duration::from_secs(4),
+        "a second renewal within the lifetime",
+        || udr.with(|s| s.puts.len()) >= 2,
+    )
+    .await;
+    assert!(udr.with(|s| s.puts[1]).duration_since(first_put) < Duration::from_secs(4));
+    assert_eq!(udr.with(|s| s.posts), 1, "renewed, not re-created");
+    udr.server.stop().await.ok();
+}
+
+/// An NRF that stops answering discovery must not hold the audit past a due
+/// renewal: discovery is bounded, so the PUT still lands within the 8 s lifetime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hung_nrf_does_not_delay_a_due_renewal() {
+    let nrf = Nrf::start().await;
+    let udr = Udr::start(Some(8)).await;
+    nrf.register_only(udr.port);
+    let (_pcfd, _dir) = spawn_pcfd("hungnrf", &nrf, Some(1));
+    eventually(Duration::from_secs(30), "the subscription", || {
+        udr.with(|s| s.posts) == 1
+    })
+    .await;
+    nrf.hold_discovery(Duration::from_secs(25));
+    let (_, confirmed_at) = udr.with(|s| s.confirmed).expect("an expiry");
+    eventually(
+        Duration::from_secs(8),
+        "a renewal within the lifetime",
+        || udr.with(|s| s.puts.iter().any(|p| *p > confirmed_at)),
+    )
+    .await;
+    udr.server.stop().await.ok();
+}
+
+/// SIGTERM while the subscribe's discovery is in flight: no POST follows it, so
+/// there is no subscription at the UDR that the PCF never recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sigterm_during_discovery_creates_no_subscription() {
+    let nrf = Nrf::start().await;
+    let udr = Udr::start(None).await;
+    nrf.register_only(udr.port);
+    nrf.hold_discovery(Duration::from_secs(2));
+    let (mut pcfd, _dir) = spawn_pcfd("stopdisc", &nrf, None);
+    eventually(Duration::from_secs(30), "the first UDR discovery", || {
+        nrf.udr_discoveries() >= 1
+    })
+    .await;
+    sigterm(&pcfd.0);
+    let status = exits_within(&mut pcfd.0, Duration::from_secs(8)).await;
+    assert!(status.success(), "{status:?}");
+    assert_eq!(
+        udr.with(|s| s.posts),
+        0,
+        "no subscribe once shutdown was requested"
+    );
+    udr.server.stop().await.ok();
 }
