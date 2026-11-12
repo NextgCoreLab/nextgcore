@@ -344,44 +344,6 @@ impl TunDevice {
         ))
     }
 
-    /// Set up NAT/masquerading for the subnet
-    #[cfg(target_os = "linux")]
-    pub fn setup_nat(&self, subnet: Ipv4Addr, prefix_len: u8) -> io::Result<()> {
-        use std::process::Command;
-
-        let subnet_str = format!("{}/{}", subnet, prefix_len);
-
-        // Add iptables MASQUERADE rule
-        let output = Command::new("iptables")
-            .args([
-                "-t",
-                "nat",
-                "-A",
-                "POSTROUTING",
-                "-s",
-                &subnet_str,
-                "!",
-                "-o",
-                &self.name,
-                "-j",
-                "MASQUERADE",
-            ])
-            .output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            log::warn!("iptables NAT setup warning: {}", stderr);
-        }
-
-        log::info!("NAT configured for subnet {}", subnet_str);
-        Ok(())
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub fn setup_nat(&self, _subnet: Ipv4Addr, _prefix_len: u8) -> io::Result<()> {
-        Ok(()) // No-op on non-Linux
-    }
-
     /// Get the interface name
     pub fn name(&self) -> &str {
         &self.name
@@ -2662,6 +2624,14 @@ impl SessionManager {
         }
     }
 
+    /// Every live session (#1455: the per-session `/metrics` families).
+    pub fn sessions_snapshot(&self) -> Vec<Arc<DataPlaneSession>> {
+        self.seid_map
+            .read()
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// Get session count
     pub fn session_count(&self) -> usize {
         self.seid_map.read().unwrap().len()
@@ -3073,6 +3043,8 @@ pub enum UpfReportEvent {
 pub struct DataPlane {
     /// TUN device
     pub tun: Option<TunDevice>,
+    /// #1455: DN prefixes not source-NATed (`--nat-exclude`); read by [`Self::init`].
+    pub nat_exclude: Vec<crate::nat_exclude::Prefix>,
     /// GTP-U socket
     pub gtpu_socket: Option<Arc<TokioUdpSocket>>,
     /// IPv6 GTP-U socket, when the UPF has an IPv6 N3 address (`--gtpu-addr6`, #918).
@@ -3473,6 +3445,7 @@ impl DataPlane {
     pub fn new(shutdown: Arc<AtomicBool>) -> Self {
         Self {
             tun: None,
+            nat_exclude: Vec::new(),
             gtpu_socket: None,
             gtpu_socket6: None,
             sessions: SessionManager::new(),
@@ -3615,7 +3588,13 @@ impl DataPlane {
         // Setup NAT for UE subnet
         let subnet = Ipv4Addr::new(tun_ip.octets()[0], tun_ip.octets()[1], 0, 0);
         log::info!("Setting up NAT for subnet: {subnet}/{tun_prefix}");
-        tun.setup_nat(subnet, tun_prefix)?;
+        #[cfg(target_os = "linux")]
+        self.install_nat(
+            tun.name(),
+            subnet,
+            tun_prefix,
+            &mut crate::nat_exclude::SystemIptables,
+        )?;
 
         self.tun = Some(tun);
 
@@ -3629,6 +3608,20 @@ impl DataPlane {
 
         log::info!("Data plane initialized");
         Ok(())
+    }
+
+    /// Install the N6 NAT for the UE subnet `subnet/prefix` on `tun`: this data
+    /// plane's `--nat-exclude` prefixes, then the MASQUERADE (#1455; see
+    /// [`crate::nat_exclude::install`]). An exclusion that cannot be installed
+    /// refuses to start.
+    pub fn install_nat(
+        &self,
+        tun: &str,
+        subnet: Ipv4Addr,
+        prefix: u8,
+        ipt: &mut impl crate::nat_exclude::Iptables,
+    ) -> io::Result<()> {
+        crate::nat_exclude::install(&format!("{subnet}/{prefix}"), tun, &self.nat_exclude, ipt)
     }
 
     /// The GTP-U socket for a destination of `dst`'s address family (#918).

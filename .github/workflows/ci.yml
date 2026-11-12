@@ -2180,3 +2180,40 @@ jobs:
           # Long enough that a release can be cut from a pair validated a while
           # ago; #423 reads this artifact rather than re-deriving the pair.
           retention-days: 90
+
+  nat-exclude:
+    name: upfd --nat-exclude and per-session counters (#1455)
+    # #1455 acceptance against the real upfd binary, all inside network
+    # namespaces of its own (the runner's nat table is never touched): a stand-in
+    # SMF establishes a PFCP session, a G-PDU from the UE address 10.46.0.2
+    # reaches a DN namespace. The DN must see the UPF's N6 address without the
+    # flag and the UE's own address with `--nat-exclude <dn prefix>`, and
+    # `--session-metrics seid` must report upf_session_ul_bytes_total equal to the
+    # inner bytes sent (none when off). Also: a MASQUERADE installed BEFORE upfd
+    # (the k8s/Helm/EKS wrapper) must not defeat the exclusion, and a restart with
+    # a changed list must leave no stale exclusion. Two negative controls:
+    # excluding another prefix still masquerades; no series without the flag.
+    # Needs NET_ADMIN
+    # (netns, veth, iptables) and a TUN, hence sudo. Nightly and on demand, like
+    # the netem leg.
+    runs-on: ubuntu-latest
+    needs: check
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src
+      - name: build upfd
+        run: cd src && cargo build -p nextgcore-upfd
+      - name: arms (off, excluded + seid series, wrapper MASQUERADE, restart, negative controls)
+        run: sudo bash docker/nat-exclude/run.sh src/target/debug/nextgcore-upfd /tmp/nat-exclude
+      - name: upload the leg logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nat-exclude
+          path: /tmp/nat-exclude
+          if-no-files-found: warn
