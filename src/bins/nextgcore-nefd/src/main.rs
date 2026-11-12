@@ -1227,7 +1227,12 @@ async fn handle_producer_notification(nef_sub_id: &str, request: &SbiRequest) ->
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    let notification = build_monitoring_notification(&sub, &producer_body);
+    // #1439: nothing the AF subscribed to is in this body (every report was of
+    // another type), so nothing is sent. The producer still gets 204: it
+    // delivered correctly, and an error would only make it retry.
+    let Some(notification) = build_monitoring_notification(&sub, &producer_body) else {
+        return SbiResponse::no_content();
+    };
     let destination = sub.notification_destination.clone();
     tokio::spawn(async move {
         forward_notification_to_af(destination, notification).await;
@@ -1757,10 +1762,76 @@ async fn southbound_unsubscribe(producer_uri: Option<String>, southbound: Southb
     }
 }
 
+/// Producer reports the NEF received but did not forward (issue #1439), by why.
+///
+/// `mismatched_type`: the report names an event of a different MonitoringType than
+/// the subscription it arrived on. `unrecognised_type`: the report names no event
+/// type this NEF maps onto a TS 29.122 MonitoringType, or none at all (both
+/// `AmfEventReport.type` and `MonitoringReport.eventType` are mandatory). nefd has
+/// no `/metrics` listener yet, so this is read in-process (tests) and every drop is
+/// also logged.
+pub static DROPPED_PRODUCER_REPORTS: nextgcore_metrics::nf::CounterFamily =
+    nextgcore_metrics::nf::CounterFamily::new(
+        "nef_producer_reports_dropped_total",
+        "Producer event reports not forwarded to the AF, by reason",
+        &["reason"],
+    );
+
+/// The TS 29.122 MonitoringType a producer report is ABOUT, read from the report's
+/// own event type (issue #1439), with the reachability type when it has one.
+///
+/// - Namf_EventExposure `AmfEventReport.type` (TS 29.518 §6.2.6.2.5, mandatory):
+///   `LOCATION_REPORT`, `REACHABILITY_REPORT`, `LOSS_OF_CONNECTIVITY`.
+/// - Nudm_EE `MonitoringReport.eventType` (TS 29.503 §6.4.6.2.4, mandatory):
+///   `LOCATION_REPORTING`, `UE_REACHABILITY_FOR_DATA`, `UE_REACHABILITY_FOR_SMS`,
+///   `LOSS_OF_CONNECTIVITY`, `PDN_CONNECTIVITY_STATUS`.
+///
+/// `None` for anything else, including a report with no type: the NEF reports the
+/// event that occurred and must not guess one.
+fn report_monitoring_type(
+    report: &serde_json::Value,
+) -> Option<(&'static str, Option<&'static str>)> {
+    let reported = report
+        .get("type")
+        .or_else(|| report.get("eventType"))
+        .and_then(|v| v.as_str())?;
+    match reported {
+        "LOCATION_REPORT" | "LOCATION_REPORTING" => Some(("LOCATION_REPORTING", None)),
+        "REACHABILITY_REPORT" => {
+            // AMF `reachability`: REACHABLE / UNREACHABLE / REGULATION_ONLY. Only
+            // REACHABLE means reachable for data.
+            let data = report.get("reachability").and_then(|v| v.as_str()) == Some("REACHABLE");
+            Some(("UE_REACHABILITY", data.then_some("DATA")))
+        }
+        "UE_REACHABILITY_FOR_DATA" => Some(("UE_REACHABILITY", Some("DATA"))),
+        "UE_REACHABILITY_FOR_SMS" => Some(("UE_REACHABILITY", Some("SMS"))),
+        "LOSS_OF_CONNECTIVITY" => Some(("LOSS_OF_CONNECTIVITY", None)),
+        // A TS 29.122 MonitoringType this NEF does not accept a subscription for,
+        // but udmd reports it, so it is named (and dropped as mismatched) rather
+        // than unrecognised.
+        "PDN_CONNECTIVITY_STATUS" => Some(("PDN_CONNECTIVITY_STATUS", None)),
+        _ => None,
+    }
+}
+
 /// Build the TS 29.122 §5.3 MonitoringNotification forwarded to the AF's
 /// notificationDestination from a producer notification body (AMF
-/// AmfEventNotification `reportList`; UDM Nudm_EE bodies fall through to a
-/// bare monitoringType report).
+/// `AmfEventNotification.reportList` or UDM Nudm_EE `reportList`).
+///
+/// # Each report keeps the event it reports (issue #1439)
+///
+/// Every report is labelled with the MonitoringType of ITS OWN producer event type
+/// ([`report_monitoring_type`]), never with the subscription's. A report whose type
+/// differs from what the subscription monitors, or that names no type this NEF
+/// knows, is dropped and counted in [`DROPPED_PRODUCER_REPORTS`]. When nothing is
+/// left the result is `None` and the AF is sent nothing: this used to stamp the
+/// subscribed type on every report and to synthesise one bare report from an empty
+/// body, so an AF watching for `LOSS_OF_CONNECTIVITY` was told "loss of
+/// connectivity" when the UE re-registered.
+///
+/// `lossOfConnectReason` is carried through for a `LOSS_OF_CONNECTIVITY` report:
+/// top level in an AMF report, inside `report` (TS 29.503 `LossConnectivityReport`)
+/// in a UDM one.
 ///
 /// # The SUPI never crosses this boundary (issue #110)
 ///
@@ -1783,7 +1854,7 @@ async fn southbound_unsubscribe(producer_uri: Option<String>, southbound: Southb
 fn build_monitoring_notification(
     sub: &NefMonitoringSubscription,
     producer_body: &serde_json::Value,
-) -> serde_json::Value {
+) -> Option<serde_json::Value> {
     let self_link = format!(
         "/3gpp-monitoring-event/v1/{}/subscriptions/{}",
         sub.scs_as_id, sub.id
@@ -1796,36 +1867,67 @@ fn build_monitoring_notification(
         .map(|t| (t.member(), serde_json::json!(t.value())));
 
     let mut reports = Vec::new();
-    if let Some(report_list) = producer_body.get("reportList").and_then(|v| v.as_array()) {
-        for report in report_list {
-            let mut out = serde_json::json!({ "monitoringType": sub.monitoring_type });
-            if let Some(location) = report.get("location") {
-                out["locationInfo"] = location.clone();
-            }
-            if report.get("reachability").and_then(|v| v.as_str()) == Some("REACHABLE") {
-                out["reachabilityType"] = serde_json::json!("DATA");
-            }
-            // `report["supi"]` is deliberately NOT read. The producer sends the
-            // internal identity; forwarding it is the leak this function exists
-            // to prevent. Do not "restore" this for debugging convenience --
-            // `af_bound_notification_never_contains_supi` fails if you do.
-            if let Some((member, value)) = &af_identity {
-                out[*member] = value.clone();
-            }
-            reports.push(out);
+    let report_list = producer_body
+        .get("reportList")
+        .and_then(|v| v.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for report in report_list {
+        let reported = report
+            .get("type")
+            .or_else(|| report.get("eventType"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("<none>");
+        let Some((monitoring_type, reachability_type)) = report_monitoring_type(report) else {
+            DROPPED_PRODUCER_REPORTS.inc(&["unrecognised_type"]);
+            log::info!(
+                "subscription {}: producer report of type {reported} has no TS 29.122 \
+                 MonitoringType; not forwarded",
+                sub.id
+            );
+            continue;
+        };
+        if monitoring_type != sub.monitoring_type {
+            DROPPED_PRODUCER_REPORTS.inc(&["mismatched_type"]);
+            log::info!(
+                "subscription {} monitors {}: producer report of type {reported} \
+                 ({monitoring_type}) not forwarded",
+                sub.id,
+                sub.monitoring_type
+            );
+            continue;
         }
+        let mut out = serde_json::json!({ "monitoringType": monitoring_type });
+        if let Some(location) = report.get("location") {
+            out["locationInfo"] = location.clone();
+        }
+        if let Some(reachability_type) = reachability_type {
+            out["reachabilityType"] = serde_json::json!(reachability_type);
+        }
+        if monitoring_type == "LOSS_OF_CONNECTIVITY" {
+            if let Some(reason) = report
+                .get("lossOfConnectReason")
+                .or_else(|| report.pointer("/report/lossOfConnectReason"))
+            {
+                out["lossOfConnectReason"] = reason.clone();
+            }
+        }
+        // `report["supi"]` is deliberately NOT read. The producer sends the
+        // internal identity; forwarding it is the leak this function exists
+        // to prevent. Do not "restore" this for debugging convenience --
+        // `af_bound_notification_never_contains_supi` fails if you do.
+        if let Some((member, value)) = &af_identity {
+            out[*member] = value.clone();
+        }
+        reports.push(out);
     }
     if reports.is_empty() {
-        let mut bare = serde_json::json!({ "monitoringType": sub.monitoring_type });
-        if let Some((member, value)) = &af_identity {
-            bare[*member] = value.clone();
-        }
-        reports.push(bare);
+        return None;
     }
-    serde_json::json!({
+    Some(serde_json::json!({
         "subscription": self_link,
         "monitoringEventReports": reports,
-    })
+    }))
 }
 
 /// POST a MonitoringNotification to the AF's notificationDestination
@@ -3036,7 +3138,8 @@ mod tests {
                 }
             ]
         });
-        let notification = build_monitoring_notification(&sub, &producer_body);
+        let notification = build_monitoring_notification(&sub, &producer_body)
+            .expect("a REACHABILITY_REPORT on a UE_REACHABILITY subscription is forwarded");
         assert_eq!(
             notification["subscription"],
             "/3gpp-monitoring-event/v1/af1/subscriptions/sub-fixed"
@@ -3058,7 +3161,7 @@ mod tests {
     }
 
     #[test]
-    fn build_monitoring_notification_location_and_empty_fallback() {
+    fn build_monitoring_notification_location_report() {
         let sub = NefMonitoringSubscription::new(
             "af2",
             "LOCATION_REPORTING",
@@ -3070,17 +3173,251 @@ mod tests {
                 { "type": "LOCATION_REPORT", "location": {"nrLocation": {"tai": {}}} }
             ]
         });
-        let notification = build_monitoring_notification(&sub, &producer_body);
+        let notification = build_monitoring_notification(&sub, &producer_body)
+            .expect("a LOCATION_REPORT on a LOCATION_REPORTING subscription is forwarded");
         let report = &notification["monitoringEventReports"][0];
         assert_eq!(report["monitoringType"], "LOCATION_REPORTING");
-        assert!(report.get("locationInfo").is_some());
-
-        // A body with no reportList still yields one bare report.
-        let bare = build_monitoring_notification(&sub, &serde_json::json!({}));
         assert_eq!(
-            bare["monitoringEventReports"][0]["monitoringType"],
-            "LOCATION_REPORTING"
+            report["locationInfo"],
+            serde_json::json!({"nrLocation": {"tai": {}}})
         );
+    }
+
+    /// **Issue #1439.** A report is labelled with ITS OWN event type, and a report
+    /// of another type is dropped and counted, never relabelled with the
+    /// subscription's type. A body with nothing left yields no notification at all
+    /// (it used to yield one bare report of the subscribed type).
+    ///
+    /// The bodies are the shapes udmd and amfd actually send: udmd
+    /// `notify::build_monitoring_report` (`reportList[].eventType`) and amfd
+    /// `fire_ue_event` (`reportList[].type`).
+    ///
+    /// Revert-verified: stamping `sub.monitoring_type` on every report again (the
+    /// pre-#1439 builder) fails the mismatch assertions.
+    #[test]
+    fn build_monitoring_notification_keeps_the_reported_type_and_drops_mismatches() {
+        let sub = NefMonitoringSubscription::new(
+            "af3",
+            "LOSS_OF_CONNECTIVITY",
+            "http://af.example.com/cb",
+            "{}",
+        )
+        .with_af_target(Some(AfTarget::Msisdn("491700000003".to_string())));
+        let udm = |event: &str| {
+            serde_json::json!({
+                "reportList": [{
+                    "referenceId": "1",
+                    "eventType": event,
+                    "report": {"supi": "imsi-001010000000003", "timeStamp": "2026-11-12T00:00:00Z"},
+                }]
+            })
+        };
+        let mismatched = DROPPED_PRODUCER_REPORTS.get(&["mismatched_type"]);
+        let unrecognised = DROPPED_PRODUCER_REPORTS.get(&["unrecognised_type"]);
+
+        // The UE re-registered, and set up a PDU session: neither is a loss of
+        // connectivity, and the AF hears nothing.
+        assert_eq!(
+            build_monitoring_notification(&sub, &udm("UE_REACHABILITY_FOR_DATA")),
+            None
+        );
+        assert_eq!(
+            build_monitoring_notification(&sub, &udm("PDN_CONNECTIVITY_STATUS")),
+            None
+        );
+        // An empty or untyped body is not an event either.
+        assert_eq!(
+            build_monitoring_notification(&sub, &serde_json::json!({})),
+            None
+        );
+        assert_eq!(
+            build_monitoring_notification(
+                &sub,
+                &serde_json::json!({"reportList": [{"supi": "imsi-001010000000003"}]})
+            ),
+            None
+        );
+        // Two reports of another type and one untyped report were dropped (the
+        // empty body has no report to count). The counter is process-global and
+        // other tests drop reports too, so assert at-least deltas.
+        assert!(DROPPED_PRODUCER_REPORTS.get(&["mismatched_type"]) >= mismatched + 2);
+        assert!(DROPPED_PRODUCER_REPORTS.get(&["unrecognised_type"]) > unrecognised);
+
+        // The real loss of connectivity from the UDM is forwarded, with its
+        // TS 29.503 LossConnectivityReport reason.
+        let mut loc = udm("LOSS_OF_CONNECTIVITY");
+        loc["reportList"][0]["report"]["lossOfConnectReason"] = serde_json::json!("DEREGISTERED");
+        let notification =
+            build_monitoring_notification(&sub, &loc).expect("a matching UDM report is forwarded");
+        let reports = notification["monitoringEventReports"].as_array().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0]["monitoringType"], "LOSS_OF_CONNECTIVITY");
+        assert_eq!(reports[0]["lossOfConnectReason"], "DEREGISTERED");
+        assert_eq!(reports[0]["msisdn"], "491700000003");
+
+        // An AMF body mixing types keeps only the matching report, with the AMF's
+        // top-level reason.
+        let amf = serde_json::json!({
+            "notifyCorrelationId": "c1",
+            "reportList": [
+                {"type": "REACHABILITY_REPORT", "state": {"active": true}, "reachability": "REACHABLE"},
+                {"type": "LOSS_OF_CONNECTIVITY", "state": {"active": true},
+                 "lossOfConnectReason": "MAX_DETECTION_TIME_EXPIRED"},
+            ]
+        });
+        let notification =
+            build_monitoring_notification(&sub, &amf).expect("the LoC report is forwarded");
+        let reports = notification["monitoringEventReports"].as_array().unwrap();
+        assert_eq!(
+            reports.len(),
+            1,
+            "the reachability report is dropped: {notification}"
+        );
+        assert_eq!(reports[0]["monitoringType"], "LOSS_OF_CONNECTIVITY");
+        assert_eq!(
+            reports[0]["lossOfConnectReason"],
+            "MAX_DETECTION_TIME_EXPIRED"
+        );
+        assert!(reports[0].get("reachabilityType").is_none());
+    }
+
+    /// **Issue #1439, the reverse direction.** UDM reachability event types map to
+    /// TS 29.122 `UE_REACHABILITY` with their own reachability type, and a LoC
+    /// report on a reachability subscription is dropped.
+    #[test]
+    fn build_monitoring_notification_maps_udm_reachability() {
+        let sub = NefMonitoringSubscription::new(
+            "af4",
+            "UE_REACHABILITY",
+            "http://af.example.com/cb",
+            "{}",
+        );
+        for (event, reachability) in [
+            ("UE_REACHABILITY_FOR_DATA", "DATA"),
+            ("UE_REACHABILITY_FOR_SMS", "SMS"),
+        ] {
+            let body =
+                serde_json::json!({"reportList": [{"referenceId": "1", "eventType": event}]});
+            let notification = build_monitoring_notification(&sub, &body)
+                .unwrap_or_else(|| panic!("{event} is a UE_REACHABILITY report"));
+            let report = &notification["monitoringEventReports"][0];
+            assert_eq!(report["monitoringType"], "UE_REACHABILITY");
+            assert_eq!(report["reachabilityType"], reachability);
+        }
+        let loc = serde_json::json!({"reportList": [{"referenceId": "1", "eventType": "LOSS_OF_CONNECTIVITY",
+            "report": {"lossOfConnectReason": "DEREGISTERED"}}]});
+        assert_eq!(build_monitoring_notification(&sub, &loc), None);
+    }
+
+    /// **Issue #1439, at the handler.** A producer notification whose reports are
+    /// all of another type is answered 204 and forwards NOTHING to the AF; the
+    /// matching one is delivered to the AF's notificationDestination over the
+    /// wire, labelled with its own type and carrying the reason.
+    ///
+    /// The mismatched bodies are sent first. Since a dropped body never spawns a
+    /// forward, the stub's first and only delivery being the LoC report shows the
+    /// drops sent nothing, without a fixed sleep.
+    #[test]
+    fn producer_notification_forwards_only_the_subscribed_event_to_the_af() {
+        let _guard = lock_globals();
+        reset_context();
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                // A loopback plaintext AF stub: declare the dev profile rather than
+                // inherit whatever the process last set.
+                nextgcore_sbi::security::set_sbi_profile_override(
+                    nextgcore_sbi::security::SbiProfile::Dev,
+                );
+                let seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
+                let sink = Arc::clone(&seen);
+                let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+                let af = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+                af.start(move |req: SbiRequest| {
+                    let sink = Arc::clone(&sink);
+                    async move {
+                        if let Some(v) = req
+                            .http
+                            .content
+                            .as_deref()
+                            .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+                        {
+                            sink.lock().expect("sink").push(v);
+                        }
+                        SbiResponse::with_status(204)
+                    }
+                })
+                .await
+                .expect("AF stub starts");
+                for _ in 0..200 {
+                    if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+
+                let mut sub = NefMonitoringSubscription::new(
+                    "af-1439",
+                    "LOSS_OF_CONNECTIVITY",
+                    format!("http://127.0.0.1:{}/t8/cb", addr.port()),
+                    "{}",
+                )
+                .with_af_target(Some(AfTarget::Msisdn("491700001439".to_string())));
+                sub.id = "sub-1439".to_string();
+                nef_self()
+                    .read()
+                    .expect("ctx")
+                    .subscription_insert(sub)
+                    .expect("insert");
+
+                let post = |event: &str, reason: Option<&str>| {
+                    let mut report = serde_json::json!({
+                        "referenceId": "1",
+                        "eventType": event,
+                        "report": {"supi": "imsi-001010000001439", "timeStamp": "2026-11-12T00:00:00Z"},
+                    });
+                    if let Some(r) = reason {
+                        report["report"]["lossOfConnectReason"] = serde_json::json!(r);
+                    }
+                    SbiRequest::post("/nnef-eventexposure/v1/notify/sub-1439")
+                        .with_json_body(&serde_json::json!({"reportList": [report]}))
+                        .expect("serialize")
+                };
+                for event in ["UE_REACHABILITY_FOR_DATA", "PDN_CONNECTIVITY_STATUS"] {
+                    let response = handle_producer_notification("sub-1439", &post(event, None)).await;
+                    assert_eq!(response.status, 204, "{event}");
+                }
+                let response = handle_producer_notification(
+                    "sub-1439",
+                    &post("LOSS_OF_CONNECTIVITY", Some("DEREGISTERED")),
+                )
+                .await;
+                assert_eq!(response.status, 204);
+
+                let mut delivered = Vec::new();
+                for _ in 0..500 {
+                    delivered = seen.lock().expect("sink").clone();
+                    if !delivered.is_empty() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert_eq!(delivered.len(), 1, "exactly one delivery: {delivered:?}");
+                let reports = delivered[0]["monitoringEventReports"].as_array().unwrap();
+                assert_eq!(reports.len(), 1);
+                assert_eq!(reports[0]["monitoringType"], "LOSS_OF_CONNECTIVITY");
+                assert_eq!(reports[0]["lossOfConnectReason"], "DEREGISTERED");
+                assert_eq!(reports[0]["msisdn"], "491700001439");
+                assert_eq!(
+                    delivered[0]["subscription"],
+                    "/3gpp-monitoring-event/v1/af-1439/subscriptions/sub-1439"
+                );
+                drop(af);
+            });
+        reset_context();
     }
 
     // ── Issue #110: northbound privacy and authorisation ────────────────────
@@ -3243,12 +3580,16 @@ mod tests {
             // with the SUPI.
             None,
         ];
+        // Every shape that FORWARDS on a UE_REACHABILITY subscription: AMF and UDM
+        // reachability reports, each carrying the SUPI (#1439 removed the bare
+        // fallback, so a body that forwards nothing cannot leak anything).
         let producer_bodies = [
-            serde_json::json!({"reportList": [{"supi": "imsi-001010000000001", "reachability": "REACHABLE"}]}),
-            serde_json::json!({"reportList": [{"supi": "imsi-001010000000001", "location": {"nrLocation": {}}}]}),
-            // No reportList: the bare-report fallback path.
-            serde_json::json!({"supi": "imsi-001010000000001"}),
-            serde_json::json!({}),
+            serde_json::json!({"reportList": [{"type": "REACHABILITY_REPORT",
+                "supi": "imsi-001010000000001", "reachability": "REACHABLE"}]}),
+            serde_json::json!({"reportList": [{"type": "REACHABILITY_REPORT",
+                "supi": "imsi-001010000000001", "location": {"nrLocation": {}}}]}),
+            serde_json::json!({"reportList": [{"eventType": "UE_REACHABILITY_FOR_DATA",
+                "report": {"supi": "imsi-001010000000001"}}]}),
         ];
 
         for target in &targets {
@@ -3260,7 +3601,8 @@ mod tests {
                     "{}",
                 )
                 .with_af_target(target.clone());
-                let notification = build_monitoring_notification(&sub, producer_body);
+                let notification = build_monitoring_notification(&sub, producer_body)
+                    .expect("every body here forwards");
                 let serialised = notification.to_string();
                 assert!(
                     !serialised.contains("supi"),
