@@ -35,9 +35,13 @@ pub mod onnx_export; // issue #109: export the active model as an ONNX artefact
 pub mod model_store; // nextgsim#468: versioned, content-addressed model artefacts
 pub mod onnx_model; // issue #26: zero-dep ONNX LinearRegressor subset backend
 
+/// nextgsim#468: the AnLF model client (demo d441e-model-retrain).
+#[cfg(feature = "demo-d441e-model-retrain")]
+pub mod model_retrain;
 /// nextgsim#465: USER_DATA_CONGESTION from RAN cell reports.
 #[cfg(feature = "demo-d441a-congestion-loop")]
 pub mod ran_congestion;
+pub mod role; // nextgsim#468: nwdaf.role (mtlf | anlf | both)
 mod sbi_handler;
 
 pub use context::*;
@@ -282,6 +286,23 @@ async fn main() -> Result<()> {
         nextgcore_demo::active_mode(ran_congestion::DEMO_KEY),
         &args.nrf_uri,
     );
+    // nextgsim#468: which logical functions this NWDAF contains. An unknown
+    // role fails start-up. Decided before the NRF registration, which
+    // advertises nnwdaf-mlmodelprovision only for an MTLF.
+    let nwdaf_role = role::from_root(&config_root).map_err(|e| anyhow::anyhow!("{e}"))?;
+    role::install(nwdaf_role);
+    log::info!("NWDAF role: {}", nwdaf_role.as_str());
+    #[cfg(feature = "demo-d441e-model-retrain")]
+    let model_retrain_plan = {
+        let plan = model_retrain::resolve(
+            nextgcore_demo::active_mode(model_retrain::DEMO_KEY),
+            nwdaf_role,
+            &config_root,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        model_retrain::announce(&plan);
+        plan
+    };
 
     // Issue #187: the flag seeds the shared resolver (so it still wins) and the
     // fallback resolves there rather than minting an id no operator can pin.
@@ -355,7 +376,7 @@ async fn main() -> Result<()> {
         log::info!("SBI base URI for model provisioning: {base}");
         base
     };
-    #[cfg(not(feature = "amf-mobility"))]
+    #[cfg(not(any(feature = "amf-mobility", feature = "demo-d441e-model-retrain")))]
     let _ = &sbi_base;
 
     // Issue #26: optional prediction-model selection. Default (env unset) is
@@ -490,13 +511,26 @@ async fn main() -> Result<()> {
                 nf_instance_id.clone(),
             );
         }
-        let _metrics = nextgcore_metrics::nf::serve_nf_metrics(
-            "NWDAF",
-            "NWDAF_METRICS_PORT",
-            Arc::new(render_prometheus),
-        )
-        .await;
     }
+    // nextgsim#468: the AnLF subscribes to an MTLF for its model, retried in the
+    // background, when the demo is on and this NWDAF's role is `anlf`.
+    #[cfg(feature = "demo-d441e-model-retrain")]
+    if let model_retrain::Plan::Client { config, .. } = &model_retrain_plan {
+        model_retrain::spawn_client(
+            config.clone(),
+            args.nrf_uri.clone(),
+            sbi_base.clone(),
+            nf_instance_id.clone(),
+        );
+    }
+    // This NWDAF's /metrics, in a build with a demo that exports any.
+    #[cfg(any(feature = "amf-mobility", feature = "demo-d441e-model-retrain"))]
+    let _metrics = nextgcore_metrics::nf::serve_nf_metrics(
+        "NWDAF",
+        "NWDAF_METRICS_PORT",
+        Arc::new(render_prometheus),
+    )
+    .await;
 
     // Spawn the notification dispatcher background task (T5.3).
     // It wakes every DEFAULT_DISPATCH_INTERVAL_SECS (30 s), computes analytics,
@@ -575,6 +609,12 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             _ => send_method_not_allowed(method, "subscriptions/{id}"),
         },
 
+        // nextgsim#468: an AnLF-only NWDAF (`nwdaf.role: anlf`) contains no
+        // MTLF, so it serves no part of Nnwdaf_MLModelProvision.
+        ["nnwdaf-mlmodelprovision", ..] if !role::current().serves_mtlf() => {
+            send_not_found("this NWDAF contains no MTLF (nwdaf.role: anlf)", None)
+        }
+
         // Nnwdaf_MLModelProvision model artefact (issue #109). The Subscribe/
         // Notify half notifies an `mLFileAddr.mLModelUrl`; this is the route it
         // resolves to. nextgsim#468: the last segment is the model version's
@@ -635,6 +675,23 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
                     &request,
                 ),
                 _ => send_method_not_allowed(method, "amf-ues-in-area-notify/{token}"),
+            }
+        }
+
+        // nextgsim#468: Nnwdaf_MLModelProvision_Notify from the MTLF this AnLF
+        // subscribed to, on the notifUri it gave (`model_retrain`).
+        #[cfg(feature = "demo-d441e-model-retrain")]
+        ["nnwdaf-callback", "v1", segment, token]
+            if *segment == model_retrain::CALLBACK_SEGMENT =>
+        {
+            match method {
+                "POST" => model_retrain::handle_model_notify(
+                    model_retrain::anlf(),
+                    nwdaf_self(),
+                    token,
+                    &request,
+                ),
+                _ => send_method_not_allowed(method, "mtlf-model-notify/{token}"),
             }
         }
 
@@ -702,7 +759,9 @@ fn build_nf_profile(
     let can_provision = nwdaf_self()
         .read()
         .map(|ctx| ctx.can_provision_model())
-        .unwrap_or(false);
+        .unwrap_or(false)
+        // nextgsim#468: an AnLF-only NWDAF contains no MTLF.
+        && role::current().serves_mtlf();
     #[allow(unused_mut)]
     let mut services = nwdaf_services(nf_instance_id, sbi_addr, sbi_port, can_provision);
     // nextgsim#465: the ingest service, so the NRF can grant its token.
@@ -879,27 +938,30 @@ fn config_root(config_path: &str) -> Result<serde_yaml::Value, String> {
 /// The demos this build can run: `d441c-amf-mobility` under the `amf-mobility`
 /// feature, none otherwise.
 fn demo_registry() -> nextgcore_demo::DemoRegistry {
+    #[allow(unused_mut)]
+    let mut specs: Vec<nextgcore_demo::DemoSpec> = Vec::new();
+    #[cfg(feature = "amf-mobility")]
+    specs.push(amf_mobility::DEMO_SPEC);
     #[cfg(feature = "demo-d441a-congestion-loop")]
-    return nextgcore_demo::DemoRegistry::new(&[
-        amf_mobility::DEMO_SPEC,
-        ran_congestion::DEMO_SPEC,
-    ]);
-    #[cfg(all(feature = "amf-mobility", not(feature = "demo-d441a-congestion-loop")))]
-    return nextgcore_demo::DemoRegistry::new(&[amf_mobility::DEMO_SPEC]);
-    #[cfg(not(feature = "amf-mobility"))]
-    nextgcore_demo::DemoRegistry::default()
+    specs.push(ran_congestion::DEMO_SPEC);
+    #[cfg(feature = "demo-d441e-model-retrain")]
+    specs.push(model_retrain::DEMO_SPEC);
+    nextgcore_demo::DemoRegistry::new(&specs)
 }
 
-/// The `/metrics` body of an `amf-mobility` build: the families every NF shares
-/// (including `nextg_demo_enabled` while a demo is active) and the module's own.
-#[cfg(feature = "amf-mobility")]
+/// The `/metrics` body of a build with a demo: the families every NF shares
+/// (including `nextg_demo_enabled` while a demo is active) and the modules' own.
+#[cfg(any(feature = "amf-mobility", feature = "demo-d441e-model-retrain"))]
 fn render_prometheus() -> String {
     let mut out = nextgcore_metrics::nf::render_common(&nextgcore_metrics::nf::NfIdentity {
         nf: "nwdaf",
         version: env!("CARGO_PKG_VERSION"),
         nrf_client: true,
     });
+    #[cfg(feature = "amf-mobility")]
     amf_mobility::render_metrics(&mut out);
+    #[cfg(feature = "demo-d441e-model-retrain")]
+    model_retrain::render_metrics(&mut out);
     #[cfg(feature = "demo-d441a-congestion-loop")]
     ran_congestion::render_metrics(&mut out);
     out
@@ -947,7 +1009,10 @@ fn nwdaf_services(
             // TS 29.520 §4.5.1.3.2: only the NWDAF and the LMF consume this
             // service. The NF-level list (#1412) is wider, and nrfd ANDs the two
             // levels, so without this every AnalyticsInfo consumer could get it.
-            "allowedNfTypes": MLMODELPROVISION_ALLOWED_NF_TYPES
+            "allowedNfTypes": MLMODELPROVISION_ALLOWED_NF_TYPES,
+            // TS 29.510 NFService.supportedFeatures; nextgsim#468: feature 4,
+            // ModelProvisionExt (TS 29.520 Table 5.4.8-1).
+            "supportedFeatures": ml_service::MLMODELPROVISION_SUPPORTED_FEATURES
         }));
     } else {
         log::warn!(
@@ -1542,6 +1607,14 @@ mod tests {
             .filter_map(|s| s["serviceName"].as_str())
             .collect();
         assert!(names.contains(&"nnwdaf-mlmodelprovision"), "{names:?}");
+        // nextgsim#468: it declares ModelProvisionExt (TS 29.520 Table 5.4.8-1).
+        let ml = profile["nfServices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["serviceName"] == "nnwdaf-mlmodelprovision")
+            .unwrap();
+        assert_eq!(ml["supportedFeatures"], "8");
     }
 
     #[tokio::test]

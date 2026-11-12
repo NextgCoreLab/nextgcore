@@ -231,6 +231,11 @@ pub struct SbiClientConfig {
     pub client_key: Option<String>,
     /// Number of pooled HTTP/2 connections to the target (min 1).
     pub pool_size: usize,
+    /// Largest response body accepted, in bytes; `None` (the default) is
+    /// unlimited, as before. A larger body, announced by `Content-Length` or
+    /// found while reading, fails the request with `InvalidResponse`
+    /// (nextgsim#468: a model download must not exhaust memory).
+    pub max_response_body: Option<usize>,
 }
 
 impl Default for SbiClientConfig {
@@ -246,6 +251,7 @@ impl Default for SbiClientConfig {
             client_cert: None,
             client_key: None,
             pool_size: DEFAULT_POOL_SIZE,
+            max_response_body: None,
         }
     }
 }
@@ -281,6 +287,12 @@ impl SbiClientConfig {
     /// Set request timeout
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
+        self
+    }
+
+    /// Cap response bodies at `bytes` (see [`SbiClientConfig::max_response_body`]).
+    pub fn with_max_response_body(mut self, bytes: usize) -> Self {
+        self.max_response_body = Some(bytes);
         self
     }
 
@@ -1395,13 +1407,38 @@ impl SbiClient {
         }
         let headers = http_headers.headers;
 
-        // Read body
-        let body_bytes = response
-            .into_body()
-            .collect()
-            .await
-            .map_err(|e| SbiError::InvalidResponse(e.to_string()))?
-            .to_bytes();
+        // Read body, bounded when the caller set `max_response_body`: refused
+        // up front on a larger `Content-Length`, and while reading otherwise.
+        let body_bytes = match self.config.max_response_body {
+            None => response
+                .into_body()
+                .collect()
+                .await
+                .map_err(|e| SbiError::InvalidResponse(e.to_string()))?
+                .to_bytes(),
+            Some(max) => {
+                let announced = response
+                    .headers()
+                    .get(hyper::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.trim().parse::<u64>().ok());
+                if announced.is_some_and(|n| n > max as u64) {
+                    return Err(SbiError::InvalidResponse(format!(
+                        "response body of {} bytes exceeds the {max}-byte limit",
+                        announced.unwrap_or(0)
+                    )));
+                }
+                http_body_util::Limited::new(response.into_body(), max)
+                    .collect()
+                    .await
+                    .map_err(|e| {
+                        SbiError::InvalidResponse(format!(
+                            "response body over the {max}-byte limit or unreadable: {e}"
+                        ))
+                    })?
+                    .to_bytes()
+            }
+        };
 
         let mut sbi_response = SbiResponse::with_status(status);
         sbi_response.http.headers = headers;
@@ -1426,6 +1463,16 @@ impl SbiClient {
                 None => {
                     sbi_response.http.content =
                         Some(String::from_utf8_lossy(&body_bytes).to_string());
+                    // nextgsim#468: an `application/octet-stream` body (an ML
+                    // model file) is also kept byte-exact; `content` above is
+                    // lossy for non-UTF-8 bytes. Nothing else changes.
+                    if sbi_response
+                        .http
+                        .get_header(crate::constants::header::CONTENT_TYPE)
+                        .is_some_and(|ct| is_octet_stream(ct))
+                    {
+                        sbi_response.http.binary_content = Some(body_bytes.clone());
+                    }
                 }
             }
         }
@@ -1494,6 +1541,15 @@ fn derive_scope_from_uri(uri: &str) -> String {
     crate::message::UriComponents::parse(uri)
         .api_name
         .unwrap_or_default()
+}
+
+/// Whether a Content-Type names `application/octet-stream` (parameters and
+/// case ignored).
+fn is_octet_stream(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .is_some_and(|t| t.trim().eq_ignore_ascii_case("application/octet-stream"))
 }
 
 /// sbi-04: decide the next hop for a 307/308 response.
@@ -1601,6 +1657,144 @@ pub(crate) mod test_hooks {
 
 #[cfg(test)]
 mod tests {
+
+    /// nextgsim#468: `max_response_body` refuses a body over the cap and
+    /// accepts one at it; the default stays unlimited.
+    #[tokio::test]
+    async fn max_response_body_caps_the_body() {
+        let (server, addr) =
+            crate::test_support::sbi_server_on_free_port(|_req: SbiRequest| async move {
+                let mut r = SbiResponse::with_status(200);
+                r.http
+                    .set_header("Content-Type", "application/octet-stream");
+                r.http.binary_content = Some(vec![7u8; 4096].into());
+                r
+            })
+            .await;
+        let capped = |max| {
+            SbiClient::new(
+                SbiClientConfig::new("127.0.0.1", addr.port()).with_max_response_body(max),
+            )
+        };
+        let err = capped(4095)
+            .get("/nx-test/v1/big")
+            .await
+            .expect_err("a 4096-byte body over a 4095-byte cap");
+        assert!(
+            matches!(&err, SbiError::InvalidResponse(m) if m.contains("4095-byte limit")),
+            "{err:?}"
+        );
+        let ok = capped(4096)
+            .get("/nx-test/v1/big")
+            .await
+            .expect("at the cap");
+        assert_eq!(ok.http.binary_content.map(|b| b.len()), Some(4096));
+        let unlimited = SbiClient::new(SbiClientConfig::new("127.0.0.1", addr.port()));
+        assert_eq!(unlimited.config().max_response_body, None);
+        assert!(unlimited.get("/nx-test/v1/big").await.is_ok());
+        server.stop().await.expect("stop");
+    }
+
+    /// A body streamed in chunks with no size hint, so hyper sends no
+    /// `Content-Length` and only the streamed cap can stop it.
+    struct Chunked(std::collections::VecDeque<bytes::Bytes>);
+
+    impl hyper::body::Body for Chunked {
+        type Data = bytes::Bytes;
+        type Error = std::convert::Infallible;
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+            std::task::Poll::Ready(self.0.pop_front().map(|b| Ok(hyper::body::Frame::data(b))))
+        }
+    }
+
+    /// nextgsim#468 review: with no `Content-Length`, the cap is enforced
+    /// while reading (`http_body_util::Limited`), not only by the pre-check.
+    #[tokio::test]
+    async fn max_response_body_caps_a_streamed_body_without_content_length() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let svc = hyper::service::service_fn(|_req: hyper::Request<Incoming>| async {
+                        let chunks = (0..8)
+                            .map(|_| bytes::Bytes::from(vec![9u8; 1024]))
+                            .collect();
+                        let mut resp = hyper::Response::new(Chunked(chunks));
+                        resp.headers_mut().insert(
+                            hyper::header::CONTENT_TYPE,
+                            "application/octet-stream".parse().unwrap(),
+                        );
+                        Ok::<_, std::convert::Infallible>(resp)
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(io, svc)
+                    .await;
+                });
+            }
+        });
+        let client = |max| {
+            SbiClient::new(
+                SbiClientConfig::new("127.0.0.1", addr.port()).with_max_response_body(max),
+            )
+        };
+        let ok = client(8192)
+            .get("/nx-test/v1/stream")
+            .await
+            .expect("at the cap");
+        assert!(
+            ok.http.get_header("content-length").is_none(),
+            "premise: the body is streamed with no Content-Length"
+        );
+        assert_eq!(ok.http.binary_content.map(|b| b.len()), Some(8192));
+        let err = client(8191)
+            .get("/nx-test/v1/stream")
+            .await
+            .expect_err("8192 streamed bytes over an 8191-byte cap");
+        assert!(
+            matches!(&err, SbiError::InvalidResponse(m) if m.contains("over the 8191-byte limit")),
+            "{err:?}"
+        );
+    }
+
+    /// nextgsim#468: an `application/octet-stream` body reaches the caller
+    /// byte-exact in `binary_content` (an ML model file is not UTF-8), and a
+    /// JSON body is decoded exactly as before, with no `binary_content`.
+    #[tokio::test]
+    async fn an_octet_stream_body_is_kept_byte_exact() {
+        const BYTES: &[u8] = &[0x08, 0xff, 0x00, 0x80, 0xc3, 0x28, 0xfe];
+        let (server, addr) =
+            crate::test_support::sbi_server_on_free_port(|req: SbiRequest| async move {
+                if req.header.uri.ends_with("/bin") {
+                    let mut r = SbiResponse::with_status(200);
+                    r.http
+                        .set_header("Content-Type", "Application/Octet-Stream; x=1");
+                    r.http.binary_content = Some(BYTES.to_vec().into());
+                    r
+                } else {
+                    SbiResponse::with_status(200)
+                        .with_json_body(&serde_json::json!({"a": 1}))
+                        .unwrap()
+                }
+            })
+            .await;
+        let client = SbiClient::new(SbiClientConfig::new("127.0.0.1", addr.port()));
+        let bin = client.get("/nx-test/v1/bin").await.expect("bin");
+        assert_eq!(bin.http.binary_content.as_deref(), Some(BYTES));
+        let json = client.get("/nx-test/v1/json").await.expect("json");
+        assert!(json.http.binary_content.is_none());
+        assert_eq!(json.http.content.as_deref(), Some(r#"{"a":1}"#));
+        assert!(is_octet_stream("application/octet-stream"));
+        assert!(!is_octet_stream("application/json"));
+        server.stop().await.expect("stop");
+    }
+
     use super::*;
 
     /// #435, through the real send path: a request to a dead endpoint evicts the
