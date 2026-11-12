@@ -1,0 +1,21 @@
+# The UE's log level in this overlay (nextgsim#477). The base ue.yaml runs
+# nextgsim_ue/nas/rls at debug, and even at info two targets log per packet or
+# per broadcast: nr_ue (`TUN uplink data`, one line per datagram) and
+# nextgsim_ue::rrc (MIB/SIB). At the stream's 50 datagrams per second kubelet
+# rotates the container log within minutes, and `kubectl logs` then returns
+# only the last file, so the UE's banner and chain lines dropped out of the
+# capture on devtest1. Both targets go to warn. Every UE line the scenario and
+# demo-check.sh assert comes from nextgsim_demo, nextgsim_ue::nas or
+# nextgsim_ue::semantic_codec, at info or warn.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ue
+spec:
+  template:
+    spec:
+      containers:
+        - name: ue
+          env:
+            - name: RUST_LOG
+              value: info,nr_ue=warn,nextgsim_ue::rrc=warn
