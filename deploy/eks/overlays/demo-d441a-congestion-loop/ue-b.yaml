@@ -47,7 +47,11 @@ spec:
           args: ["-c", "/etc/nextgsim/ue.yaml", "-i", "999700000000002"]
           env:
             - name: RUST_LOG
-              value: "info,nextgsim_ue=debug,nextgsim_nas=debug"
+              # info, with the per-packet nr_ue and per-SIB nextgsim_ue::rrc at
+              # warn (patches/ue-log-level.yaml): at debug kubelet rotated this
+              # log during the load and lost `network set Session-AMBR`
+              # (info!, nextgsim_ue::app::task), which scenario.sh asserts.
+              value: "info,nr_ue=warn,nextgsim_ue::rrc=warn"
           securityContext:
             privileged: true
             capabilities:
@@ -58,7 +62,9 @@ spec:
               cpu: 100m
               memory: 128Mi
             limits:
-              cpu: 500m
+              # UE-B generates the load: ping at ~800 pps per process, two at
+              # the hold, plus nr-ue's own per-packet TUN/RLS path.
+              cpu: 1000m
               memory: 256Mi
           volumeMounts:
             - name: config
