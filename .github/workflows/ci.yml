@@ -285,7 +285,9 @@ jobs:
         nextgcore-nwdafd:sensing
         nextgcore-nwdafd:onnx-model
         nextgcore-nwdafd:amf-mobility
+        nextgcore-nwdafd:demo-d441a-congestion-loop
         nextgcore-pcfd:intent-loop
+        nextgcore-pcfd:demo-d441a-congestion-loop
         nextgcore-amfd:ntn
         nextgcore-nsacfd:sla-observe
         nextgcore-smfd:compute-aware-upf

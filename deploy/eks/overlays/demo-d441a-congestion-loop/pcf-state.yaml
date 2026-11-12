@@ -1,0 +1,24 @@
+# pcfd durable state for demo d441a-congestion-loop (nextgsim#465).
+#
+# A throttle's cap is recorded with the session; a restarted pcfd that restores
+# its durable state re-notifies the subscribed Session-AMBR for every capped
+# session and clears the record only once the SMF confirms it. This points the
+# state file at the pod's existing `logs` emptyDir.
+#
+# PRECONDITION: an emptyDir survives a CONTAINER restart, not a pod re-creation
+# (devtest1 has no usable StorageClass, DECISIONS 2026-10-27). After a pod is
+# re-created (a rollout, a config change, a node move) mid-throttle, pcfd has no
+# record of the cap: redeploy the arm (smfd included) or re-authorise UE-B.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pcf
+  namespace: nextg-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: pcf
+          env:
+            - name: NEXTGCORE_PCF_STATE_FILE
+              value: /var/log/nextgcore/pcf-state.json

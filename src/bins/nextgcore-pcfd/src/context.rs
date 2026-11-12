@@ -585,6 +585,23 @@ pub struct PcfSess {
     /// `access_type`.
     #[serde(default)]
     pub authorised_session_data: Option<crate::nudr_handler::SessionData>,
+    /// A demo Session-AMBR cap the SMF currently holds for this session
+    /// (nextgsim#465's override layer). Persisted so that a pcfd restart, the way
+    /// demos are switched off, can tell the SMF the subscribed value again
+    /// ([`crate::sbi_path::pcf_restore_demo_capped_sessions`]); in memory the cap
+    /// lives in the override layer. Always `None` in a build without a demo that
+    /// writes it. `#[serde(default)]` for older snapshots.
+    #[serde(default)]
+    pub demo_ambr_cap: Option<DemoAmbrCap>,
+}
+
+/// The cap a demo installed on a session ([`PcfSess::demo_ambr_cap`]).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DemoAmbrCap {
+    /// The demo key that wrote it.
+    pub writer: String,
+    pub uplink_bps: u64,
+    pub downlink_bps: u64,
 }
 
 impl PcfSess {
@@ -619,6 +636,7 @@ impl PcfSess {
             tsc_containers: Default::default(),
             origination_ms: None,
             authorised_session_data: None,
+            demo_ambr_cap: None,
         }
     }
 
@@ -2590,6 +2608,9 @@ impl PcfContext {
 
             // The ONLY `None` this function may return: the session was not there.
             let sess = sess_list.remove(&id)?;
+            // nextgsim#465: a released session's override cap goes with it.
+            #[cfg(feature = "demo-d441a-congestion-loop")]
+            crate::ambr_override::forget(&sess.sm_policy_id);
             sm_policy_id_hash.remove(&sess.sm_policy_id);
             if sess.ipv4addr != 0 {
                 ipv4addr_hash.remove(&sess.ipv4addr);
@@ -2650,6 +2671,15 @@ impl PcfContext {
             .filter_map(|id| self.sess_remove_inner(id))
             .flat_map(|(_sess, apps)| apps)
             .collect()
+    }
+
+    /// Every session, by id (nextgsim#465: the controller's poll, and the
+    /// start-up restore of demo-capped sessions).
+    pub fn sess_all(&self) -> Vec<PcfSess> {
+        let sess_list = read_through_poison(&self.sess_list);
+        let mut all: Vec<PcfSess> = sess_list.values().cloned().collect();
+        all.sort_by_key(|s| s.id);
+        all
     }
 
     pub fn sess_find_by_id(&self, id: u64) -> Option<PcfSess> {
