@@ -2947,7 +2947,10 @@ async fn deliver_subscription_id_change(
         .subs_change_notify_uri
         .as_deref()
         .ok_or("no subsChangeNotifyUri")?;
-    let (host, port, path) = parse_http_uri(uri).ok_or_else(|| format!("bad URI {uri}"))?;
+    // The consumer's URI may carry its capability token (udmd's does,
+    // nextgcore#1440); these errors are logged, so they name it redacted.
+    let logged = nextgcore_sbi::log_redact::redact_callback_tokens(uri);
+    let (host, port, path) = parse_http_uri(uri).ok_or_else(|| format!("bad URI {logged}"))?;
 
     let mut report = json!({
         "type": event_type,
@@ -2972,12 +2975,12 @@ async fn deliver_subscription_id_change(
     let response = notify_client(&host, port)
         .post_json(&path, &body)
         .await
-        .map_err(|e| format!("subsChange POST to {uri} failed: {e}"))?;
+        .map_err(|e| format!("subsChange POST to {logged} failed: {e}"))?;
     if response.is_success() {
         Ok(())
     } else {
         Err(format!(
-            "subsChange POST to {uri} returned {}",
+            "subsChange POST to {logged} returned {}",
             response.status
         ))
     }
@@ -3145,7 +3148,12 @@ fn take_over_transferred_event_subscriptions(
         created += 1;
 
         // §6.2.6.2.5: an ABSOLUTE URI to the created resource, per §6.2.3.3.2.
-        let subscription_uri = format!("/namf-evts/v1/subscriptions/{subscription_id}");
+        // It was the bare path, which a consumer (udmd, nextgcore#1440) cannot
+        // tell apart from another AMF's and so refused.
+        let subscription_uri = format!(
+            "{}/namf-evts/v1/subscriptions/{subscription_id}",
+            crate::sbi_path::advertised_sbi_base()
+        );
         // Group subscription -> ADDITION, UE-specific -> CHANGE (Table 6.2.6.2.5-1).
         let event_type = if group_id.is_some() {
             "SUBSCRIPTION_ID_ADDITION"
@@ -3177,6 +3185,8 @@ fn take_over_transferred_event_subscriptions(
         handle.spawn(async move {
             if let Err(e) = deliver_subscription_id_change(sub, event_type, subscription_uri).await
             {
+                // The error names the subsChangeNotifyUri, whose last segments may
+                // carry the consumer's capability token (udmd's does, #1440).
                 log::warn!("{event_type} delivery failed: {e}");
             }
         });
@@ -14090,6 +14100,47 @@ mod tests {
     /// up, not one: asserting on the `subsChangeNotifyUri` sink proves §6.2.5.2.1's
     /// routing rule — *"this callback URI shall be the `subsChangeNotifyUri`... Otherwise
     /// ... the `eventNotifyUri`"* — rather than merely that something was delivered.
+    /// nextgcore#1440 review: a failed SUBSCRIPTION_ID_CHANGE delivery is logged at
+    /// WARN with this error, and the consumer's `subsChangeNotifyUri` may carry a
+    /// capability token (udmd's does). The error names the URI redacted, and keeps
+    /// the reason.
+    #[tokio::test]
+    async fn a_failed_subscription_id_change_names_the_token_redacted() {
+        let down = nextgcore_sbi::test_support::down_port();
+        let sub = EventSubscription {
+            subscription_id: "sub-1440-redact".to_string(),
+            notify_uri: "http://127.0.0.1:9/cb".to_string(),
+            notify_correlation_id: "c".to_string(),
+            nf_id: "n".to_string(),
+            event_types: vec!["LOSS_OF_CONNECTIVITY".to_string()],
+            supi: Some("imsi-001010000014401".to_string()),
+            gpsi: None,
+            pei: None,
+            group_id: None,
+            any_ue: false,
+            expiry: None,
+            subs_change_notify_uri: Some(format!(
+                "http://127.0.0.1:{}/nudm-callback/v1/ee-1/ee-amf-subs-change/secret1440",
+                down.addr().port()
+            )),
+            subs_change_notify_correlation_id: Some("ee-1".to_string()),
+            areas: Vec::new(),
+            reported_presence: std::collections::HashMap::new(),
+            reporting_threshold: None,
+            location_filters: Vec::new(),
+        };
+        let err = deliver_subscription_id_change(
+            sub,
+            "SUBSCRIPTION_ID_CHANGE",
+            "http://amf/namf-evts/v1/subscriptions/x".to_string(),
+        )
+        .await
+        .expect_err("nothing listens there");
+        assert!(!err.contains("secret1440"), "the token is logged: {err}");
+        assert!(err.contains("ee-amf-subs-change/<redacted>"), "{err}");
+        assert!(err.contains("failed"), "the reason is kept: {err}");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_ue_context_takes_over_subscriptions_and_fires_subscription_id_change() {
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
@@ -14153,7 +14204,10 @@ mod tests {
             .as_str()
             .expect("`subscriptionId` is what this notification exists to carry");
         assert!(
-            subscription_id.starts_with("/namf-evts/v1/subscriptions/sub-"),
+            subscription_id.starts_with(&format!(
+                "{}/namf-evts/v1/subscriptions/sub-",
+                crate::sbi_path::advertised_sbi_base()
+            )),
             "§6.2.6.2.5 requires the URI of the created subscription RESOURCE per \
              §6.2.3.3.2, not the bare id -- got {subscription_id}"
         );

@@ -167,10 +167,13 @@ pub async fn notify_ue_context_change(supi: &str, event: UeContextEvent) -> (usi
     }
 
     let ctx = crate::context::udm_self();
-    let (sdm_subs, ee_subs) = match ctx.read() {
+    let (sdm_subs, ee_subs, serving_amf) = match ctx.read() {
         Ok(context) => (
             context.sdm_subscriptions_for_supi(supi),
             context.ee_subscriptions_for_supi(supi),
+            context
+                .ue_find_by_supi(supi)
+                .and_then(|ue| ue.amf_instance_id),
         ),
         Err(_) => {
             log::error!("UDM context lock poisoned; cannot notify for {supi}");
@@ -232,10 +235,12 @@ pub async fn notify_ue_context_change(supi: &str, event: UeContextEvent) -> (usi
         // configured. This loop used to post every event to every subscription,
         // so a LOSS_OF_CONNECTIVITY subscriber heard about every registration.
         let configurations = sub.configurations_for(event.ee_event_type());
-        // #1440: while the UDM holds a subscription at the serving AMF for this
-        // event, the AMF reports it to the consumer itself, with its own reason;
-        // raising it here too would report one loss twice.
-        if !configurations.is_empty() && crate::ee_amf::amf_reports(sub, event.ee_event_type()) {
+        // #1440: while the UDM's subscription at the serving AMF is confirmed for
+        // this subscriber as it is now, the AMF reports the event itself, with its
+        // own reason; raising it here too would report one loss twice.
+        if !configurations.is_empty()
+            && crate::ee_amf::amf_reports(sub, event.ee_event_type(), serving_amf.as_deref())
+        {
             log::debug!(
                 "EE subscription {}: {} is reported by the serving AMF; not raised here",
                 sub.id,

@@ -220,8 +220,24 @@ static OAUTH2_CLIENT: std::sync::OnceLock<Option<Arc<nextgcore_sbi::oauth::OAuth
 /// The shared OAuth2 client, if SBI OAuth2 enforcement is enabled (Wave-6 H8
 /// Phase A). Outbound SBI clients attach a token via [`peer_client`].
 pub(crate) fn oauth2_client() -> Option<Arc<nextgcore_sbi::oauth::OAuth2Client>> {
+    #[cfg(test)]
+    if let Some(client) = OAUTH2_CLIENT_TEST_OVERRIDE
+        .read()
+        .ok()
+        .and_then(|o| o.clone())
+    {
+        return Some(client);
+    }
     OAUTH2_CLIENT.get().and_then(|opt| opt.clone())
 }
+
+/// Tests: an OAuth2 client [`oauth2_client`] returns instead of the once-set
+/// production one, so a test can drive the enforcement-on path without turning
+/// it on for the whole process. Test lock: `crate::test_support::CONTEXT_GUARD`.
+#[cfg(test)]
+pub(crate) static OAUTH2_CLIENT_TEST_OVERRIDE: std::sync::RwLock<
+    Option<Arc<nextgcore_sbi::oauth::OAuth2Client>>,
+> = std::sync::RwLock::new(None);
 
 /// Build an outbound peer SBI client for `host:port` (Wave-6 H8 Phase A).
 ///
@@ -2473,9 +2489,9 @@ pub async fn handle_ee_subscribe(ue_identity: &str, request: &SbiRequest) -> Sbi
         };
     }
     // #1440 (TS 23.502 §4.15.3.2.3 step 3a): an AMF-detected event is subscribed
-    // at the UE's serving AMF before this answers (step 4 follows step 3a). A
-    // refusal there does not fail this subscription; see `ee_amf`.
-    crate::ee_amf::reconcile(&subscription_id).await;
+    // at the UE's serving AMF, after this answers, so the consumer's timeout is
+    // never spent on the AMF; until the AMF confirms, the UDM reports it itself.
+    crate::ee_amf::spawn_reconcile(&subscription_id);
     // CreatedEeSubscription requires the echoed eeSubscription (yaml:409-413).
     let mut echoed = ee_sub;
     if let Some(obj) = echoed.as_object_mut() {
@@ -2591,8 +2607,9 @@ pub async fn handle_ee_modify(
     if !updated {
         return send_problem(404, "NOT_FOUND", "Subscription not found");
     }
-    // #1440: the patch may add or drop an AMF-detected event.
-    crate::ee_amf::reconcile(subscription_id).await;
+    // #1440: the patch may add or drop an AMF-detected event, or move the
+    // callback the AMF notifies.
+    crate::ee_amf::spawn_reconcile(subscription_id);
     SbiResponse::with_status(204)
 }
 

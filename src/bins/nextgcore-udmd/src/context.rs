@@ -469,14 +469,22 @@ pub struct UdmEeSubscription {
 }
 
 /// The UDM's subscription at an AMF on behalf of one Nudm_EE subscription
-/// (#1440): where it lives, so it can be deleted, and the capability token in the
-/// UDM's own subscription-change callback, so a forged change is refused.
+/// (#1440): where it lives, so it can be deleted; what it was made for, so a
+/// change of serving AMF, callback or events is noticed; and the capability token
+/// in the UDM's own subscription-change callback, so a forged change is refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AmfEeLeg {
     /// Absolute URI of the AMF's subscription resource (TS 29.518 §6.2.3.3.2).
     pub subscription_uri: String,
     /// The token in this leg's `subsChangeNotifyUri`.
     pub change_token: String,
+    /// The serving AMF the leg is confirmed at. `None` after an AMF reported a
+    /// take-over the UDM has not yet matched to a serving AMF.
+    pub amf_instance_id: Option<String>,
+    /// The `eventNotifyUri` the AMF was given: the consumer's callback then.
+    pub notify_uri: String,
+    /// The Namf event types subscribed.
+    pub events: Vec<String>,
 }
 
 impl UdmEeSubscription {
@@ -1482,7 +1490,11 @@ impl UdmContext {
         };
         match list.get_mut(&sub.id) {
             Some(existing) => {
+                // #1440: the AMF leg is owned by `ee_amf` alone; a write-back of a
+                // clone read before an await must not restore an older leg.
+                let leg = existing.amf_leg.take();
                 *existing = sub;
+                existing.amf_leg = leg;
                 true
             }
             None => false,

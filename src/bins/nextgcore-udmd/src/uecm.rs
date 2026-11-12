@@ -573,7 +573,7 @@ pub async fn process_amf_registration(
     // has changed, so AMF-detected EE events are subscribed there. Only the 3GPP
     // registration is the cached serving AMF `ee_amf` reads.
     if access == UecmAccess::ThreeGpp {
-        crate::ee_amf::on_amf_registered(supi).await;
+        crate::ee_amf::on_amf_registered(supi);
     }
 
     // #83: the UE's AMF context data set just changed, so SDM subscribers
