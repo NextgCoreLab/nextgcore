@@ -60,6 +60,10 @@ enum SrrState {
     Pending,
     /// At the UPF with `period`; no N4 request in flight.
     Installed,
+    /// Its Remove SRR is in flight (#1390 review round 2). The entry keeps its
+    /// SRR ID until the Remove returns, so no install can reuse the ID and have
+    /// its Create overtaken by this Remove at the UPF. It serves nobody.
+    Removing,
 }
 
 /// One SRR of a session: the subscription it serves.
@@ -91,6 +95,19 @@ struct SessionMon {
 impl SessionMon {
     fn installed(&self) -> bool {
         self.srrs.iter().any(|e| e.state == SrrState::Installed)
+    }
+
+    /// Whether an SRR is installed or being installed: the NG-RAN must not be
+    /// told to stop.
+    fn live(&self) -> bool {
+        self.srrs.iter().any(|e| e.state != SrrState::Removing)
+    }
+
+    /// Whether `sub` holds an SRR that is not being removed.
+    fn serves(&self, sub: &str) -> bool {
+        self.srrs
+            .iter()
+            .any(|e| e.sub == sub && e.state != SrrState::Removing)
     }
 
     fn position(&self, sub: &str, id: u8) -> Option<usize> {
@@ -159,7 +176,7 @@ fn subscription_of(sm_context_ref: &str, srr_id: u8) -> Option<String> {
         m.get(sm_context_ref)?
             .srrs
             .iter()
-            .find(|e| e.id == srr_id)
+            .find(|e| e.id == srr_id && e.state != SrrState::Removing)
             .map(|e| e.sub.clone())
     })
 }
@@ -288,6 +305,7 @@ async fn reconcile(sub_id: &str) {
                         e.state = SrrState::Pending;
                         out.push((r.clone(), e.id, e.period));
                     }
+                    SrrState::Removing => {}
                 }
             }
         }
@@ -347,6 +365,12 @@ pub fn on_path_switch(sm_context_ref: &str) {
 /// Ask the NG-RAN to start or stop, remembering what it was asked and whether
 /// the request had to wait for another 5GSM procedure (#1390 review m5).
 fn signal(r: &str, request: QosMonitoringRequest) {
+    // `stop` only while no SRR is installed or being installed: an install that
+    // started meanwhile sends `both` itself (#1390 review round 2).
+    if request == QosMonitoringRequest::Stop && with(|m| m.get(r).is_some_and(SessionMon::live)) {
+        log::info!("ref={r}: QoS monitoring still wanted on the session: no stop");
+        return;
+    }
     let outcome = crate::signal_qos_monitoring(r, request);
     with(|m| {
         let s = m.entry(r.to_string()).or_default();
@@ -374,7 +398,7 @@ pub fn on_gsm_idle(sm_context_ref: &str) {
         }
         let want = if s.installed() {
             Some(QosMonitoringRequest::Both)
-        } else if s.ran_on {
+        } else if s.ran_on && !s.live() {
             Some(QosMonitoringRequest::Stop)
         } else {
             None
@@ -394,10 +418,7 @@ pub fn on_gsm_idle(sm_context_ref: &str) {
 /// Install `sub`'s SRR on the session, unless it has one already. Returns
 /// whether it was newly installed.
 async fn install(sm_context_ref: &str, sub: &EventSubscription) -> bool {
-    if with(|m| {
-        m.get(sm_context_ref)
-            .is_some_and(|s| s.srrs.iter().any(|e| e.sub == sub.id))
-    }) {
+    if with(|m| m.get(sm_context_ref).is_some_and(|s| s.serves(&sub.id))) {
         return false;
     }
     let Some(b) = crate::lookup_policy_binding(sm_context_ref) else {
@@ -431,9 +452,10 @@ async fn install(sm_context_ref: &str, sub: &EventSubscription) -> bool {
     // subscription, or the same one from a PDU_RES_SETUP_RSP) picks another.
     let reserved = with(|m| {
         let s = m.entry(sm_context_ref.to_string()).or_default();
-        if s.srrs.iter().any(|e| e.sub == sub.id) {
+        if s.serves(&sub.id) {
             return Err(None);
         }
+        // An ID whose Remove SRR is still in flight (Removing) is not free.
         let id = (1..=u8::MAX)
             .find(|id| !s.srrs.iter().any(|e| e.id == *id))
             .ok_or(Some(()))?;
@@ -498,49 +520,56 @@ enum Next {
     Done,
     /// The subscription wants another period.
     Update(u32),
-    /// The subscription no longer wants it (or the session forgot it).
-    Remove { last: bool },
+    /// The subscription no longer wants it: Remove SRR (the entry is
+    /// [`SrrState::Removing`] until it returns).
+    Remove,
+    /// The session forgot it (released): nothing to send.
+    Gone,
 }
+
+/// How many Updates [`settle`] follows before it stops chasing a subscription
+/// replaced faster than the UPF answers.
+const SETTLE_PASSES: usize = 8;
 
 /// Settle the SRR `id` serving `sub_id` on `r`, owned by the caller (state
 /// [`SrrState::Pending`]) with `sent` the period the UPF holds: Update SRR
 /// while the subscription wants another period, Remove SRR (and `stop` to the
-/// NG-RAN when it was the session's last) when it wants none. Returns whether
-/// the SRR ends installed.
+/// NG-RAN when the session has no other SRR installed or being installed) when
+/// it wants none. Returns whether the SRR ends installed.
 async fn settle(r: &str, sub_id: &str, id: u8, mut sent: u32) -> bool {
-    // Each Update is followed by another look; a subscription replaced faster
-    // than the UPF answers is followed, not chased forever.
-    for _ in 0..8 {
+    for pass in 0..=SETTLE_PASSES {
         let want = desired(sub_id, r);
+        let last_pass = pass == SETTLE_PASSES;
         let next = with(|m| {
             let Some(s) = m.get_mut(r) else {
-                return Next::Remove { last: false };
+                return Next::Gone;
             };
             let Some(i) = s.position(sub_id, id) else {
-                return Next::Remove { last: false };
+                return Next::Gone;
             };
             let e = &mut s.srrs[i];
-            if std::mem::take(&mut e.recheck) {
+            if std::mem::take(&mut e.recheck) && !last_pass {
                 // The subscription changed after `want` was read: read it again.
                 return Next::Update(sent);
             }
             match want {
-                Some(p) if p == sent => {
-                    e.period = p;
+                // The last pass settles on what the UPF holds (review round 2
+                // minor: but never keeps an SRR nobody wants).
+                Some(p) if p == sent || last_pass => {
                     e.state = SrrState::Installed;
+                    e.period = sent;
                     Next::Done
                 }
                 Some(p) => Next::Update(p),
                 None => {
-                    s.srrs.remove(i);
-                    Next::Remove {
-                        last: !s.installed() && s.ran_on,
-                    }
+                    e.state = SrrState::Removing;
+                    Next::Remove
                 }
             }
         });
         match next {
             Next::Done => return true,
+            Next::Gone => return false,
             Next::Update(p) if p == sent => continue,
             Next::Update(p) => {
                 if send_update(r, id, p).await {
@@ -565,25 +594,29 @@ async fn settle(r: &str, sub_id: &str, id: u8, mut sent: u32) -> bool {
                     return true;
                 }
             }
-            Next::Remove { last } => {
+            Next::Remove => {
                 send_remove(r, id, sub_id).await;
+                // #1390 review round 2: only now is the SRR ID free, and `stop`
+                // is decided now, counting SRRs installed or being installed.
+                let last = with(|m| {
+                    let Some(s) = m.get_mut(r) else {
+                        return false;
+                    };
+                    if let Some(i) = s.position(sub_id, id) {
+                        s.srrs.remove(i);
+                    }
+                    let last = s.ran_on && !s.live();
+                    tidy(m, r);
+                    last
+                });
                 if last {
                     signal(r, QosMonitoringRequest::Stop);
                 }
-                with(|m| tidy(m, r));
                 return false;
             }
         }
     }
-    with(|m| {
-        if let Some(s) = m.get_mut(r) {
-            if let Some(i) = s.position(sub_id, id) {
-                s.srrs[i].period = sent;
-                s.srrs[i].state = SrrState::Installed;
-            }
-        }
-    });
-    true
+    unreachable!("the last pass always settles")
 }
 
 /// Update SRR `id` on `r` to `period` (TS 29.244 Table 7.5.4.20-1).

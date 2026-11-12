@@ -26903,6 +26903,88 @@ mod tests {
         amf.stop().await.ok();
     }
 
+    /// #1390 review round 2: a DELETE of X interleaved with a new subscription Y
+    /// on the same session. X's SRR ID stays taken until its Remove SRR returns,
+    /// so Y's Create cannot carry the ID that Remove is about to remove at the
+    /// UPF; and X's removal does not tell the NG-RAN to stop while Y is being
+    /// installed.
+    ///
+    /// REVERT-VERIFIED: with the entry dropped before the Remove is awaited (the
+    /// round-1 settle), Y's Create reuses X's SRR ID; with `last` / `stop`
+    /// counting only installed SRRs, a `stop` goes out while Y is installed.
+    // The event-store lock is held across awaits, as the other event tests do
+    // (event_exposure::STORE_LOCK).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delete_interleaved_with_a_new_subscription_keeps_the_new_srr_1390() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _q = qos_mon::TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _e = event_exposure::lock_store();
+        event_exposure::clear_for_test();
+        qos_mon::clear_for_test();
+        let supi = "imsi-001010000013913";
+        let (upf, reference, amf, posts) = qos_mon_session_1390(supi, 5, true).await;
+        let x = qos_mon_subscription_1390(supi, &["QOS_MON"], "http://127.0.0.1:9/x");
+        qos_mon::subscribed(&x).await;
+        let x_srr = qos_mon::srr_ids(&reference)[0];
+        await_n1n2_1385(&posts, 1).await;
+        cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
+        let from = upf.modification_bodies().len();
+        let posted = posts.lock().unwrap().len();
+
+        let y = qos_mon_subscription_1390(supi, &["QOS_MON"], "http://127.0.0.1:9/y");
+        event_exposure::remove(&x.id);
+        tokio::join!(qos_mon::unsubscribed(&x.id), qos_mon::subscribed(&y));
+
+        let ops = srr_history_1390(&upf, from);
+        let held = qos_mon::srr_ids(&reference);
+        assert_eq!(held.len(), 1, "Y's SRR is held: {ops:?}");
+        let y_srr = held[0];
+        assert_ne!(y_srr, x_srr, "X's SRR ID was still being removed: {ops:?}");
+        assert!(ops.contains(&('R', x_srr, None)), "{ops:?}");
+        assert_eq!(
+            ops.iter()
+                .filter(|o| o.1 == y_srr)
+                .map(|o| o.0)
+                .collect::<Vec<_>>(),
+            vec!['C'],
+            "Y's SRR is created and never removed: {ops:?}"
+        );
+        assert!(qos_mon::active_on(&reference));
+        let got = await_n1n2_1385(&posts, posted + 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let got = if posts.lock().unwrap().len() > got.len() {
+            posts.lock().unwrap().clone()
+        } else {
+            got
+        };
+        let requests: Vec<_> = got[posted..]
+            .iter()
+            .flat_map(|p| n2_monitoring_1390(&p.3))
+            .collect();
+        assert!(
+            !requests.contains(&(
+                9,
+                Some(nextgcore_ngap_gen::generated::QosMonitoringRequest::STOP)
+            )),
+            "no stop while Y is installed: {requests:?}"
+        );
+        assert_eq!(
+            requests.last(),
+            Some(&(
+                9,
+                Some(nextgcore_ngap_gen::generated::QosMonitoringRequest::BOTH)
+            ))
+        );
+
+        cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
+        qos_mon::forget(&reference);
+        forget_seeded_session(&reference);
+        event_exposure::clear_for_test();
+        amf.stop().await.ok();
+    }
+
     /// #1390 review m4: subscribe first, then the session's user plane comes up:
     /// the PDU_RES_SETUP_RSP through `handle_sm_context_update` installs the SRR
     /// and asks the NG-RAN to measure.
