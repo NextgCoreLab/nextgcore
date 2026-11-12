@@ -5055,35 +5055,49 @@ mod tests {
         crate::data_plane::encapsulate_dl_gpdu(&ip, 0x1234, None)
     }
 
-    /// Offer `len`-byte UL packets every `gap` for `dur` through the real
-    /// `handle_uplink_packet`; returns (packets sent, qer_gate drops, elapsed s).
+    /// How `offer_ul_1475` spaces its packets.
+    #[derive(Clone, Copy)]
+    enum Pace1475 {
+        /// Back-to-back, as fast as the runner goes.
+        Flat,
+        /// At least this long between packets (sleep after each send). A
+        /// stalled runner only widens the gaps, so the offer never exceeds
+        /// the nominal rate and never bunches.
+        MinGap(std::time::Duration),
+        /// Packet `i` at `start + i * gap`. A stalled runner catches up in a
+        /// burst, so the offer never falls below the nominal rate.
+        Deadline(std::time::Duration),
+    }
+
+    /// Offer exactly `count` UL packets of `len` bytes through the real
+    /// `handle_uplink_packet`. The volume is fixed, never "as many as fit in a
+    /// wall-clock window", so the outcome depends on the bytes offered and the
+    /// elapsed time returned, not on how fast the runner is.
+    /// Returns (qer_gate drops, elapsed s).
     async fn offer_ul_1475(
         dp: &crate::data_plane::DataPlane,
         tun: &std::fs::File,
         len: usize,
-        gap: std::time::Duration,
-        dur: std::time::Duration,
-    ) -> (u64, u64, f64) {
+        count: u32,
+        pace: Pace1475,
+    ) -> (u64, f64) {
         use crate::data_plane::DropReason;
         let fd = std::os::unix::io::AsRawFd::as_raw_fd(tun);
         let gnb: SocketAddr = "127.0.0.1:2152".parse().unwrap();
         let pkt = ul_gpdu_1475(len);
         let drops_before = dp.stats.drops(DropReason::QerGate);
-        let start = std::time::Instant::now();
-        let mut sent = 0u64;
-        while start.elapsed() < dur {
-            dp.handle_uplink_packet(&pkt, gnb, fd).await;
-            sent += 1;
-            if !gap.is_zero() {
-                tokio::time::sleep(gap).await;
+        let start = tokio::time::Instant::now();
+        for i in 0..count {
+            match pace {
+                Pace1475::Flat => {}
+                Pace1475::MinGap(gap) if i > 0 => tokio::time::sleep(gap).await,
+                Pace1475::MinGap(_) => {}
+                Pace1475::Deadline(gap) => tokio::time::sleep_until(start + gap * i).await,
             }
+            dp.handle_uplink_packet(&pkt, gnb, fd).await;
         }
         let elapsed = start.elapsed().as_secs_f64();
-        (
-            sent,
-            dp.stats.drops(DropReason::QerGate) - drops_before,
-            elapsed,
-        )
+        (dp.stats.drops(DropReason::QerGate) - drops_before, elapsed)
     }
 
     /// **#1475, TS 29.244 §8.2.8 / §5.4.** A Session-AMBR QER installed through
@@ -5157,11 +5171,20 @@ mod tests {
             .expect("the data plane holds the established session")
             .upf_seid;
 
-        // At 1 Gbps, 20 ms of back-to-back 500 B packets pass untouched (a
-        // policer reading the field 1000x too LOW would drop them).
-        let (sent, drops, _) = offer_ul_1475(&dp, &tun, 500, ms(0), ms(20)).await;
-        assert!(sent > 0);
-        assert_eq!(drops, 0, "1 Gbps AMBR must not drop {sent} x 500 B");
+        // At 1 Gbps (125 MB/s, a 1.25 MB burst that starts full), 1 MB offered
+        // back-to-back fits inside the burst and passes untouched however fast
+        // the runner offers it (#1487: a fixed-duration offer reached 1.5 Gbps
+        // on a fast runner and was rightly policed). A policer reading the
+        // field 1000x too LOW (1 Mbps: 125 kB/s, 1500 B burst) would pass only
+        // 1500 B + 125 kB/s x elapsed, so it drops here whenever the offer ran
+        // above 1 Mbps; asserting 2 Mbps keeps that guard meaningful.
+        let (drops, secs) = offer_ul_1475(&dp, &tun, 500, 2000, Pace1475::Flat).await;
+        let offered_bps = (2000 * 500 * 8) as f64 / secs;
+        assert!(
+            offered_bps > 2.0 * 1_000_000.0,
+            "the 1 Gbps leg offered only {offered_bps:.0} bit/s: cannot tell 1 Gbps from 1 Mbps"
+        );
+        assert_eq!(drops, 0, "1 Gbps AMBR must not drop 1 MB (2000 x 500 B)");
 
         // The PCF lowers UL Session-AMBR to 64 kbps: smfd sends Update QER with
         // UL MBR = 64 (kbit/s) on the wire.
@@ -5171,13 +5194,20 @@ mod tests {
         assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
         apply_next(&mut rx, &dp).await;
 
-        // Below the AMBR: 200 B every 50 ms = 32 kbps offered, all of it passes.
-        let (sent, drops, _) = offer_ul_1475(&dp, &tun, 200, ms(50), ms(1000)).await;
-        assert!(sent >= 5, "the below-rate leg ran ({sent} packets)");
+        // Below the AMBR: 10 x 200 B at least 50 ms apart (<= 32 kbps). Each gap
+        // refills a 64 kbps bucket (8000 B/s, 1500 B cap) by >= 400 B, more
+        // than the 200 B the next packet takes, so all of it passes however
+        // slow the runner is.
+        let (drops, _) = offer_ul_1475(&dp, &tun, 200, 10, Pace1475::MinGap(ms(50))).await;
         assert_eq!(drops, 0, "32 kbps under a 64 kbps AMBR must all pass");
 
-        // Above it: 500 B every 5 ms = 800 kbps offered for 1 s.
-        let (sent, drops, secs) = offer_ul_1475(&dp, &tun, 500, ms(5), ms(1000)).await;
+        // Above it: 200 x 500 B on a 5 ms schedule (800 kbps) for about 1 s. A
+        // late runner catches up, so the offer stays above 64 kbps; the 100 kB
+        // offered exceeds what the bucket can pass (1500 B + 8000 B/s) unless
+        // the leg takes over 12 s.
+        let sent = 200u64;
+        let (drops, secs) =
+            offer_ul_1475(&dp, &tun, 500, sent as u32, Pace1475::Deadline(ms(5))).await;
         let offered_bps = (sent * 500 * 8) as f64 / secs;
         assert!(
             offered_bps > 2.0 * 64_000.0,
