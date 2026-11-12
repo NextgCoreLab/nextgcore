@@ -37,7 +37,9 @@
 //! fixed there; until then the AnLF must run without SBI OAuth2 enforcement.
 //!
 //! # Download limits
-//! Models are fetched only from the subscribed MTLF's `host:port`, each GET
+//! Models are fetched only from the subscribed MTLF: the same port, and the same
+//! host or a resolved address in common (a configured hostname against the
+//! MTLF's IP-based URLs). Each GET
 //! (body included) within [`FETCH_TIMEOUT`] and [`MAX_MODEL_BYTES`]. Loads apply
 //! in Notify order: a fetch finished after a later Notify's is dropped.
 //!
@@ -85,6 +87,9 @@ pub const MAX_MODEL_BYTES: usize = 1024 * 1024;
 
 /// How long one GET (head and body) may take before the model is refused.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long resolving a host for the origin check may take.
+pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The `nwdaf.anlf` block.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,6 +210,8 @@ pub struct Anlf {
     /// `host:port` of the MTLF subscribed to: the only origin models are
     /// fetched from.
     mtlf: Mutex<Option<(String, u16)>>,
+    /// The MTLF host's resolved addresses, re-resolved on a mismatch.
+    mtlf_addrs: Mutex<Vec<std::net::IpAddr>>,
     subscribed: AtomicBool,
     verified: AtomicU64,
     refused: AtomicU64,
@@ -229,6 +236,7 @@ impl Anlf {
             state: Mutex::new(LoadState::default()),
             next_seq: AtomicU64::new(0),
             mtlf: Mutex::new(None),
+            mtlf_addrs: Mutex::new(Vec::new()),
             subscribed: AtomicBool::new(false),
             verified: AtomicU64::new(0),
             refused: AtomicU64::new(0),
@@ -260,6 +268,50 @@ impl Anlf {
     /// Record the MTLF subscribed to; models are fetched only from it.
     pub fn set_mtlf(&self, host: &str, port: u16) {
         *self.mtlf.lock().unwrap_or_else(|p| p.into_inner()) = Some((host.to_string(), port));
+        self.mtlf_addrs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+    }
+
+    /// Whether `origin` (from an `mLModelUrl`) is the subscribed MTLF: the
+    /// same port, and the same host or a resolved address in common. A
+    /// configured `mtlf_uri` names the MTLF as the operator spells it (e.g.
+    /// `nwdaf-mtlf`), while the MTLF builds its URLs from its own advertise
+    /// address (e.g. an IP), so the strings alone are not the identity. The
+    /// MTLF's addresses are cached and re-resolved once on a mismatch, so a
+    /// changed DNS answer is picked up.
+    pub async fn is_mtlf_origin(&self, origin: &(String, u16)) -> bool {
+        let Some((host, port)) = self.mtlf() else {
+            return false;
+        };
+        if port != origin.1 {
+            return false;
+        }
+        if host.eq_ignore_ascii_case(&origin.0) {
+            return true;
+        }
+        let theirs = resolve_host(&origin.0, origin.1).await;
+        if theirs.is_empty() {
+            return false;
+        }
+        let cached = self
+            .mtlf_addrs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if cached.iter().any(|a| theirs.contains(a)) {
+            return true;
+        }
+        let fresh = resolve_host(&host, port).await;
+        let hit = fresh.iter().any(|a| theirs.contains(a));
+        *self.mtlf_addrs.lock().unwrap_or_else(|p| p.into_inner()) = fresh;
+        hit
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_cached_mtlf_addrs(&self, addrs: Vec<std::net::IpAddr>) {
+        *self.mtlf_addrs.lock().unwrap_or_else(|p| p.into_inner()) = addrs;
     }
 
     fn mtlf(&self) -> Option<(String, u16)> {
@@ -271,6 +323,21 @@ impl Anlf {
             self.verified.load(Ordering::Relaxed),
             self.refused.load(Ordering::Relaxed),
         )
+    }
+}
+
+/// The addresses `host` resolves to, within [`RESOLVE_TIMEOUT`]; none on a
+/// failure or a timeout.
+async fn resolve_host(host: &str, port: u16) -> Vec<std::net::IpAddr> {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    match tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host((host, port))).await {
+        Ok(Ok(addrs)) => {
+            let mut v: Vec<std::net::IpAddr> = addrs.map(|a| a.ip()).collect();
+            v.sort();
+            v.dedup();
+            v
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -839,17 +906,15 @@ pub async fn fetch_verify_load(
         let origin = crate::notification_dispatcher::parse_notify_uri(url)
             .map(|(h, p, _)| (h, p))
             .ok_or_else(|| Refusal::Unreachable(format!("{url:?} is not an http(s) URL")))?;
-        match anlf.mtlf() {
-            Some(mtlf) if mtlf == origin => {}
-            mtlf => {
-                return Err(Refusal::ForeignHost(format!(
-                    "{}:{} is not the subscribed MTLF {}",
-                    origin.0,
-                    origin.1,
-                    mtlf.map(|(h, p)| format!("{h}:{p}"))
-                        .unwrap_or_else(|| "(none)".into())
-                )))
-            }
+        if !anlf.is_mtlf_origin(&origin).await {
+            return Err(Refusal::ForeignHost(format!(
+                "{}:{} is not the subscribed MTLF {}",
+                origin.0,
+                origin.1,
+                anlf.mtlf()
+                    .map(|(h, p)| format!("{h}:{p}"))
+                    .unwrap_or_else(|| "(none)".into())
+            )));
         }
         let (bytes, manifest) = fetch(url, timeout).await?;
         let manifest = Manifest::from_json(&manifest)?;

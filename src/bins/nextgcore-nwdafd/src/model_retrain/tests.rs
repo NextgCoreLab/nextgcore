@@ -483,6 +483,51 @@ async fn a_model_on_another_host_is_refused() {
     mtlf.stop().await.unwrap();
 }
 
+/// A configured `mtlf_uri` hostname matches the MTLF's IP-based URL through a
+/// shared resolved address (review finding 9): `localhost` vs `127.0.0.1`.
+#[tokio::test]
+async fn a_configured_hostname_matches_the_mtlfs_ip_urls() {
+    let (mtlf, anlf, anlf_ctx, _m, url) = misbehaving(Serve::Honest, "468-name").await;
+    let port = url
+        .split("127.0.0.1:")
+        .nth(1)
+        .and_then(|r| r.split('/').next())
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap();
+    anlf.set_mtlf("localhost", port);
+    let got = fetch_verify_load(anlf, &anlf_ctx, &url, 1, FETCH_TIMEOUT)
+        .await
+        .expect("localhost is 127.0.0.1");
+    assert_eq!(got.map(|l| l.version), Some("1".to_string()));
+    mtlf.stop().await.unwrap();
+}
+
+/// The origin rules: same port and a common address; a stale cached address
+/// is re-resolved; another address or port is not the MTLF.
+#[tokio::test]
+async fn the_origin_check_resolves_and_re_resolves() {
+    let anlf = Anlf::new();
+    let o = |h: &str, p: u16| (h.to_string(), p);
+    anlf.set_mtlf("localhost", 7777);
+    assert!(anlf.is_mtlf_origin(&o("127.0.0.1", 7777)).await);
+    assert!(anlf.is_mtlf_origin(&o("LOCALHOST", 7777)).await);
+    assert!(!anlf.is_mtlf_origin(&o("127.0.0.1", 7778)).await, "port");
+    assert!(!anlf.is_mtlf_origin(&o("127.0.0.2", 7777)).await, "address");
+    assert!(
+        !anlf.is_mtlf_origin(&o("no-such-host.invalid", 7777)).await,
+        "unresolvable"
+    );
+    // A cache from an old DNS answer does not lock the MTLF out.
+    anlf.set_cached_mtlf_addrs(vec!["10.9.9.9".parse().unwrap()]);
+    assert!(anlf.is_mtlf_origin(&o("127.0.0.1", 7777)).await);
+    // IP-configured MTLF (and NRF discovery, whose host is the profile's
+    // advertise address) still matches by string.
+    anlf.set_mtlf("127.0.0.1", 7777);
+    assert!(anlf.is_mtlf_origin(&o("127.0.0.1", 7777)).await);
+    let none = Anlf::new();
+    assert!(!none.is_mtlf_origin(&o("127.0.0.1", 7777)).await, "no MTLF");
+}
+
 /// A fetch for an earlier Notify that finishes after a later one is dropped:
 /// a late v1 does not replace v2.
 #[tokio::test]

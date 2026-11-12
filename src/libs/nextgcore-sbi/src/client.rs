@@ -1695,6 +1695,74 @@ mod tests {
         server.stop().await.expect("stop");
     }
 
+    /// A body streamed in chunks with no size hint, so hyper sends no
+    /// `Content-Length` and only the streamed cap can stop it.
+    struct Chunked(std::collections::VecDeque<bytes::Bytes>);
+
+    impl hyper::body::Body for Chunked {
+        type Data = bytes::Bytes;
+        type Error = std::convert::Infallible;
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+            std::task::Poll::Ready(self.0.pop_front().map(|b| Ok(hyper::body::Frame::data(b))))
+        }
+    }
+
+    /// nextgsim#468 review: with no `Content-Length`, the cap is enforced
+    /// while reading (`http_body_util::Limited`), not only by the pre-check.
+    #[tokio::test]
+    async fn max_response_body_caps_a_streamed_body_without_content_length() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let svc = hyper::service::service_fn(|_req: hyper::Request<Incoming>| async {
+                        let chunks = (0..8)
+                            .map(|_| bytes::Bytes::from(vec![9u8; 1024]))
+                            .collect();
+                        let mut resp = hyper::Response::new(Chunked(chunks));
+                        resp.headers_mut().insert(
+                            hyper::header::CONTENT_TYPE,
+                            "application/octet-stream".parse().unwrap(),
+                        );
+                        Ok::<_, std::convert::Infallible>(resp)
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(io, svc)
+                    .await;
+                });
+            }
+        });
+        let client = |max| {
+            SbiClient::new(
+                SbiClientConfig::new("127.0.0.1", addr.port()).with_max_response_body(max),
+            )
+        };
+        let ok = client(8192)
+            .get("/nx-test/v1/stream")
+            .await
+            .expect("at the cap");
+        assert!(
+            ok.http.get_header("content-length").is_none(),
+            "premise: the body is streamed with no Content-Length"
+        );
+        assert_eq!(ok.http.binary_content.map(|b| b.len()), Some(8192));
+        let err = client(8191)
+            .get("/nx-test/v1/stream")
+            .await
+            .expect_err("8192 streamed bytes over an 8191-byte cap");
+        assert!(
+            matches!(&err, SbiError::InvalidResponse(m) if m.contains("over the 8191-byte limit")),
+            "{err:?}"
+        );
+    }
+
     /// nextgsim#468: an `application/octet-stream` body reaches the caller
     /// byte-exact in `binary_content` (an ML model file is not UTF-8), and a
     /// JSON body is decoded exactly as before, with no `binary_content`.
