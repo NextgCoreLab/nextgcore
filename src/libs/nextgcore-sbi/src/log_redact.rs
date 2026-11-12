@@ -12,11 +12,14 @@
 //! retained far more widely than the NF that holds the token.
 
 /// Path segments whose NEXT segment is a callback token.
-pub const CALLBACK_TOKEN_SEGMENTS: [&str; 5] = [
+pub const CALLBACK_TOKEN_SEGMENTS: [&str; 6] = [
     "nf-status-notify",
     "dereg-notify",
     "amf-location-notify",
     "amf-ues-in-area-notify",
+    // udmd's Namf_EventExposure subsChangeNotifyUri (nextgcore#1440).
+    "ee-amf-subs-change",
+    // The AnLF's Nnwdaf_MLModelProvision notifUri (nextgsim#468).
     "mtlf-model-notify",
 ];
 
@@ -72,6 +75,15 @@ pub fn redact_last_segment(uri: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// nextgcore#1440: udmd's subsChangeNotifyUri token.
+    #[test]
+    fn the_udm_subscription_change_token_is_redacted() {
+        assert_eq!(
+            redact_callback_tokens("http://udm:7777/nudm-callback/v1/ee-1/ee-amf-subs-change/f00d"),
+            "http://udm:7777/nudm-callback/v1/ee-1/ee-amf-subs-change/<redacted>"
+        );
+    }
 
     #[test]
     fn callback_tokens_are_redacted_and_the_rest_kept() {

@@ -839,6 +839,13 @@ pub fn send_event_notification(
 // Paging Trigger (TS 23.502 4.2.3.3)
 // ============================================================================
 
+/// The configured paging strategy (`amf.paging.strategy`).
+fn paging_strategy() -> crate::context::PagingStrategy {
+    let ctx = amf_self();
+    let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+    guard.paging_strategy
+}
+
 /// What a paged N2 SM transfer is, for its delivery after the Service Request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PagedN2 {
@@ -904,7 +911,27 @@ pub(crate) fn initiate_paging_for_idle_ue(
         // #1442: the RAN's recommendation from the release that made this UE idle
         // (empty unless `paging.strategy: recommended-first`).
         recommended: amf_ue.recommended_paging.clone(),
+        nwdaf_wait_until: None,
+        nwdaf_predicted: None,
+        nwdaf_last_cell: None,
     };
+    let mut paging_ctx = paging_ctx;
+    // nextgsim#464, TS 23.501 §5.4.3.1: under `nwdaf-mobility`, the first PAGING
+    // waits (bounded) for the NWDAF's UE mobility prediction. The query starts
+    // below, once the context is queued, so its answer always finds it.
+    let ask_nwdaf = match (paging_strategy(), amf_ue.supi.as_deref()) {
+        (crate::context::PagingStrategy::NwdafMobility, Some(supi)) => Some(supi.to_string()),
+        _ => None,
+    };
+    if ask_nwdaf.is_some() {
+        paging_ctx.nwdaf_wait_until =
+            Some(std::time::Instant::now() + crate::nwdaf_mobility::HINT_TIMEOUT);
+        // 0 is the never-learned default NCI (`namf_server::parse_ncgi`).
+        if amf_ue.nr_cgi.cell_id != 0 {
+            paging_ctx.nwdaf_last_cell =
+                Some((amf_ue.nr_cgi.plmn_id.clone(), amf_ue.nr_cgi.cell_id));
+        }
+    }
 
     // Mark session as paging ongoing; keep the consumer's failure-notify
     // URI so a paging timeout can trigger N1N2MsgTxfrFailureNotification
@@ -915,6 +942,14 @@ pub(crate) fn initiate_paging_for_idle_ue(
     let ctx = amf_self();
     if let Ok(context) = ctx.read() {
         context.paging_add(paging_ctx);
+    }
+    if let Some(supi) = ask_nwdaf {
+        if !crate::nwdaf_mobility::spawn_hint(amf_ue.id, supi) {
+            // Not started: release the first PAGING now, to the registration area.
+            if let Ok(context) = ctx.read() {
+                context.paging_set_nwdaf_hint(amf_ue.id, None);
+            }
+        }
     }
     if let Some(sess) = sess {
         sess.store_paging_info(&location, failure_notify_uri);

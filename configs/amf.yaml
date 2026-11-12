@@ -35,7 +35,14 @@ amf:
   # registration area on every attempt. `recommended-first` stores the RAN's
   # Recommended RAN Nodes for Paging from UE CONTEXT RELEASE COMPLETE (TS 38.413
   # §8.3.3.2) and pages those gNBs first, then the whole area on every T3513
-  # retransmission. See docs-book/src/configuration/amf.md "Paging strategy".
+  # retransmission. `nwdaf-mobility` (nextgsim#464, TS 23.501 §5.4.3.1) asks the
+  # NWDAF for the UE's UE_MOBILITY prediction when paging starts (first PAGING
+  # held at most 300 ms, at most 64 queries in flight; NWDAF from the NRF, else
+  # NWDAF_SBI_ADDR/PORT) and pages the predicted cell's gNB plus the UE's last
+  # known cell's gNB first, then the whole area. Any failure pages the area at
+  # once. The NWDAF must serve UE Mobility (nwdafd --features amf-mobility,
+  # nwdaf.amf_mobility.enabled: true), or every page falls back after <= 300 ms.
+  # See docs-book/src/configuration/amf.md "Paging strategy".
   # paging:
   #   strategy: registration-area
 
