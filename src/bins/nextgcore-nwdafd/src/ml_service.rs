@@ -264,6 +264,31 @@ impl FeedbackCollector {
     /// and if it falls below the threshold the retrain flag is set.
     pub fn record(&mut self, predicted: f64, actual: f64) {
         let error = (predicted - actual).abs().clamp(0.0, 1.0);
+        if self.push_error(error) {
+            log::warn!(
+                "[NWDAF FeedbackLoop] model={} rolling_accuracy={:.3} < threshold={:.3} → retrain requested",
+                self.model_id,
+                self.rolling_accuracy(),
+                self.accuracy_threshold,
+            );
+        }
+    }
+
+    /// Records a reported accuracy in [0.0, 1.0] (nextgsim#468: an AnLF's
+    /// `MLModelAccuracyInfo.mlModelAcc` / 100) as the error `1 - accuracy`.
+    /// Returns whether this report first took the rolling accuracy below the
+    /// threshold. Logs nothing: the caller decides what the crossing means.
+    pub fn record_accuracy(&mut self, accuracy: f64) -> bool {
+        self.push_error((1.0 - accuracy).clamp(0.0, 1.0))
+    }
+
+    /// The accuracy threshold.
+    pub fn threshold(&self) -> f64 {
+        self.accuracy_threshold
+    }
+
+    /// Push one error; true when the retrain flag is newly raised.
+    fn push_error(&mut self, error: f64) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or(std::time::Duration::ZERO)
@@ -279,14 +304,10 @@ impl FeedbackCollector {
 
         // Trigger retraining if rolling accuracy drops
         if self.rolling_accuracy() < self.accuracy_threshold && !self.retrain_requested {
-            log::warn!(
-                    "[NWDAF FeedbackLoop] model={} rolling_accuracy={:.3} < threshold={:.3} → retrain requested",
-                    self.model_id,
-                    self.rolling_accuracy(),
-                    self.accuracy_threshold,
-                );
             self.retrain_requested = true;
+            return true;
         }
+        false
     }
 
     /// Returns the rolling accuracy (1 - mean_error) over the window.
@@ -337,6 +358,36 @@ impl FeedbackRegistry {
         self.collectors
             .entry(model_id.clone())
             .or_insert_with(|| FeedbackCollector::new(model_id, 100, 0.70));
+    }
+
+    /// Creates a collector with its own window and threshold, if none exists.
+    pub fn register_model_with(&mut self, model_id: String, window: usize, threshold: f64) {
+        self.collectors
+            .entry(model_id.clone())
+            .or_insert_with(|| FeedbackCollector::new(model_id, window, threshold));
+    }
+
+    /// Records a reported accuracy for a registered model (nextgsim#468).
+    /// `(rolling accuracy, samples, threshold, newly crossed)`, or `None` for an
+    /// unregistered model.
+    pub fn record_accuracy(
+        &mut self,
+        model_id: &str,
+        accuracy: f64,
+    ) -> Option<(f64, usize, f64, bool)> {
+        let c = self.collectors.get_mut(model_id)?;
+        let crossed = c.record_accuracy(accuracy);
+        Some((
+            c.rolling_accuracy(),
+            c.sample_count(),
+            c.threshold(),
+            crossed,
+        ))
+    }
+
+    /// The collector for a model.
+    pub fn collector(&self, model_id: &str) -> Option<&FeedbackCollector> {
+        self.collectors.get(model_id)
     }
 
     /// Records feedback for a model.
@@ -925,6 +976,23 @@ mod tests {
         assert_eq!(id, model.unique_id());
         assert_eq!(format!("{id:012x}"), model.sha256[..12]);
         assert!(id < (1 << 53));
+    }
+
+    /// nextgsim#468: reported accuracies feed the collector; the crossing is
+    /// reported once, and the registry exposes rolling accuracy and threshold.
+    #[test]
+    fn reported_accuracies_feed_the_registry() {
+        let mut reg = FeedbackRegistry::new();
+        assert!(reg.record_accuracy("m", 0.5).is_none(), "unregistered");
+        reg.register_model_with("m".into(), 3, 0.70);
+        assert_eq!(reg.record_accuracy("m", 0.95), Some((0.95, 1, 0.70, false)));
+        let (r, n, _, crossed) = reg.record_accuracy("m", 0.40).unwrap();
+        assert!((r - 0.675).abs() < 1e-9 && n == 2 && crossed);
+        let (_, n, _, crossed) = reg.record_accuracy("m", 0.30).unwrap();
+        assert!(n == 2 + 1 && !crossed, "crossed once");
+        assert!(reg.collector("m").unwrap().retrain_requested());
+        let (_, n, _, _) = reg.record_accuracy("m", 0.30).unwrap();
+        assert_eq!(n, 3, "the window is 3 reports");
     }
 
     /// The two baselines differ in whether they can be provisioned at all, and

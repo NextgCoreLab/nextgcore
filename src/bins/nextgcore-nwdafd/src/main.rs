@@ -35,6 +35,9 @@ pub mod onnx_export; // issue #109: export the active model as an ONNX artefact
 pub mod model_store; // nextgsim#468: versioned, content-addressed model artefacts
 pub mod onnx_model; // issue #26: zero-dep ONNX LinearRegressor subset backend
 
+/// nextgsim#468: Nnwdaf_MLModelMonitor (demo d441e-model-retrain).
+#[cfg(feature = "demo-d441e-model-retrain")]
+pub mod model_monitor;
 /// nextgsim#468: the AnLF model client (demo d441e-model-retrain).
 #[cfg(feature = "demo-d441e-model-retrain")]
 pub mod model_retrain;
@@ -378,6 +381,33 @@ async fn main() -> Result<()> {
     };
     #[cfg(not(any(feature = "amf-mobility", feature = "demo-d441e-model-retrain")))]
     let _ = &sbi_base;
+    // nextgsim#468: Nnwdaf_MLModelMonitor, while the demo is on: an MTLF takes
+    // registrations and subscribes at AnLFs; an AnLF serves the subscriptions
+    // and reports accuracy. Installed before the NRF registration, which
+    // advertises the service.
+    #[cfg(feature = "demo-d441e-model-retrain")]
+    match &model_retrain_plan {
+        model_retrain::Plan::Off => {}
+        model_retrain::Plan::On { mode, role } => {
+            model_monitor::install(model_monitor::Monitor::new(
+                mode,
+                *role,
+                &sbi_base,
+                &nf_instance_id,
+                &args.nrf_uri,
+            ));
+        }
+        model_retrain::Plan::Client { mode, .. } => {
+            let m = model_monitor::install(model_monitor::Monitor::new(
+                mode,
+                role::Role::Anlf,
+                &sbi_base,
+                &nf_instance_id,
+                &args.nrf_uri,
+            ));
+            model_monitor::spawn_reporter(m);
+        }
+    }
 
     // Issue #26: optional prediction-model selection. Default (env unset) is
     // the OLS baseline — behavior-identical to the pre-#26 inline math.
@@ -678,6 +708,28 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             }
         }
 
+        // nextgsim#468: Nnwdaf_MLModelMonitor (registrations at an MTLF,
+        // subscriptions at an AnLF). 404 with the demo off.
+        #[cfg(feature = "demo-d441e-model-retrain")]
+        ["nnwdaf-mlmodelmonitor", "v1", rest @ ..] => model_monitor::route(
+            model_monitor::monitor(),
+            &nwdaf_self(),
+            method,
+            rest,
+            &request,
+        ),
+        // nextgsim#468: an AnLF's Nnwdaf_MLModelMonitor_Notify, on the
+        // notificationUri this MTLF gave it (`model_monitor`).
+        #[cfg(feature = "demo-d441e-model-retrain")]
+        ["nnwdaf-callback", "v1", segment, token]
+            if *segment == model_monitor::CALLBACK_SEGMENT =>
+        {
+            match method {
+                "POST" => model_monitor::handle_notify(model_monitor::monitor(), token, &request),
+                _ => send_method_not_allowed(method, "mlmodel-monitor-notify/{token}"),
+            }
+        }
+
         // nextgsim#468: Nnwdaf_MLModelProvision_Notify from the MTLF this AnLF
         // subscribed to, on the notifUri it gave (`model_retrain`).
         #[cfg(feature = "demo-d441e-model-retrain")]
@@ -764,6 +816,15 @@ fn build_nf_profile(
         && role::current().serves_mtlf();
     #[allow(unused_mut)]
     let mut services = nwdaf_services(nf_instance_id, sbi_addr, sbi_port, can_provision);
+    // nextgsim#468: Nnwdaf_MLModelMonitor, only while the demo is on.
+    #[cfg(feature = "demo-d441e-model-retrain")]
+    if model_monitor::monitor().is_some() {
+        services.push(model_monitor::nf_service(
+            nf_instance_id,
+            sbi_addr,
+            sbi_port,
+        ));
+    }
     // nextgsim#465: the ingest service, so the NRF can grant its token.
     #[cfg(feature = "demo-d441a-congestion-loop")]
     if ran_congestion::serving() {
@@ -962,6 +1023,8 @@ fn render_prometheus() -> String {
     amf_mobility::render_metrics(&mut out);
     #[cfg(feature = "demo-d441e-model-retrain")]
     model_retrain::render_metrics(&mut out);
+    #[cfg(feature = "demo-d441e-model-retrain")]
+    model_monitor::render_metrics(&mut out);
     #[cfg(feature = "demo-d441a-congestion-loop")]
     ran_congestion::render_metrics(&mut out);
     out

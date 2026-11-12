@@ -973,6 +973,8 @@ pub async fn fetch_verify_load(
                 loaded.version,
                 loaded.sha256
             );
+            // PR 3: register the use of this model at the MTLF (§6.2E.3.2).
+            crate::model_monitor::on_model_loaded(anlf.mtlf(), &loaded.sha256);
             Ok(Some(loaded))
         }
         Err(refusal) => {

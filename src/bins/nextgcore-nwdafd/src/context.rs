@@ -1367,6 +1367,29 @@ impl NwdafContext {
             .cloned()
     }
 
+    /// A retained model version by its `modelUniqueId` (nextgsim#468).
+    pub fn model_version_by_unique_id(&self, id: u64) -> Option<crate::model_store::ModelVersion> {
+        let _ = self.current_model_version();
+        self.model_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_by_unique_id(id)
+            .cloned()
+    }
+
+    /// The lowest `mlAccuracyThreshold` (percent) any ML-provision
+    /// subscription set for `event` (nextgsim#468), if any.
+    pub fn ml_prov_accuracy_threshold(&self, event: AnalyticsId) -> Option<u8> {
+        self.ml_prov_subscriptions
+            .read()
+            .ok()?
+            .values()
+            .flat_map(|s| s.accuracy_thresholds.iter())
+            .filter(|t| t.event == event)
+            .map(|t| t.threshold)
+            .min()
+    }
+
     /// Whether this NWDAF can currently provision a model artefact: exactly
     /// when [`current_model_version`](Self::current_model_version) has one, so
     /// the NF profile never advertises `nnwdaf-mlmodelprovision` for a model

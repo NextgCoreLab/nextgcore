@@ -481,3 +481,68 @@ fn d441e_modes_and_demo_off_shapes() {
         assert!(!err.contains("[demo:"), "{tag}: {err}");
     }
 }
+
+/// nextgsim#468 PR 3 criterion: with the feature built but the block off, the
+/// MLModelMonitor routes return 404; with it on they are served (a malformed
+/// registration is a 400, not a 404). A build without the feature: 404 always.
+#[test]
+fn mlmodelmonitor_routes_follow_the_demo_block() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let on =
+        "demo:\n  enabled: true\n  d441e-model-retrain:\n    enabled: true\n    mode: retrain\n";
+    let mut arms = vec![
+        ("mm-absent", "", 404u16),
+        ("mm-off", "demo:\n  enabled: false\n", 404),
+    ];
+    // A build without the feature refuses the key itself (UnknownKey).
+    if cfg!(feature = "demo-d441e-model-retrain") {
+        arms.push((
+            "mm-killswitch",
+            "demo:\n  enabled: false\n  d441e-model-retrain:\n    enabled: true\n    mode: retrain\n",
+            404,
+        ));
+        arms.push(("mm-on", on, 400));
+    }
+    for (tag, demo, expected) in arms {
+        let sbi_port = free_port();
+        let path = std::env::temp_dir().join(format!(
+            "nwdafd-{tag}-{}-{sbi_port}.yaml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            format!(
+                "nwdaf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n        port: {sbi_port}\n{demo}"
+            ),
+        )
+        .unwrap();
+        let mut child = spawn(&path, free_port());
+        let status = rt.block_on(async {
+            let client = nextgcore_sbi::SbiClient::new(nextgcore_sbi::SbiClientConfig::new(
+                "127.0.0.1",
+                sbi_port,
+            ));
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                match client
+                    .post_json(
+                        "/nnwdaf-mlmodelmonitor/v1/registrations",
+                        &serde_json::json!({}),
+                    )
+                    .await
+                {
+                    Ok(resp) => return resp.status,
+                    Err(_) if Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(100)).await
+                    }
+                    Err(e) => panic!("nwdafd never answered: {e}"),
+                }
+            }
+        });
+        assert_eq!(status, expected, "{tag}");
+        let _ = child.0.kill();
+    }
+}
