@@ -64,7 +64,17 @@ pod_of() {
     2>/dev/null | awk 'NF == 1 { print $1; exit }'
 }
 logs_of() { "${K[@]}" logs "$1" -c "$2" --timestamps 2>/dev/null; }
-grep_log() { logs_of "$1" "$2" | grep -qE -- "$3"; }
+# Through a file, never `logs | grep -q`: under pipefail grep's early exit
+# SIGPIPEs kubectl and turns a match into a failure (a UE log is ~35k lines).
+grep_log() {
+  local f
+  f="$(mktemp)"
+  logs_of "$1" "$2" >"${f}"
+  grep -qE -- "$3" "${f}"
+  local rc=$?
+  rm -f "${f}"
+  return "${rc}"
+}
 UE_POD=""
 CAPTURED=false
 capture() {
