@@ -1,0 +1,28 @@
+# nwdafd as the AnLF of demo d441e-model-retrain (nextgsim#468): discovers the
+# MTLF at the NRF (no mtlf_uri), subscribes for an NF_LOAD model with a 0.70
+# accuracy threshold, verifies and loads it, registers it for monitoring and
+# reports its accuracy on the seeded series. Same series config as the MTLF.
+logger:
+  level: info
+
+nwdaf:
+  role: anlf
+  sbi:
+    server:
+      - address: 0.0.0.0
+        advertise: nwdaf-anlf
+        port: 7777
+  anlf:
+    accuracy_threshold: 70
+  retrain_series:
+    enabled: true
+    seed: 468
+    step_secs: 1
+    cycle_steps: 600
+    change_at_step: 120
+
+demo:
+  enabled: true
+  d441e-model-retrain:
+    enabled: true
+    mode: retrain
