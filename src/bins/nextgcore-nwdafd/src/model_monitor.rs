@@ -27,7 +27,8 @@
 //!    (rolling over [`FEEDBACK_WINDOW`] reports). When the rolling accuracy
 //!    first drops below the threshold the MTLF logs `retrain requested` in
 //!    mode `retrain`, or that it will not retrain in mode `no-retrain`. The
-//!    refit itself is PR 4.
+//!    refit and the re-provisioning of the new version are `model_refit`
+//!    (PR 4), run from the MTLF's upkeep.
 //!
 //! **Bounds and peer restarts** (review of #1473):
 //!
@@ -185,6 +186,11 @@ pub struct Monitor {
     /// A reporter-started Register is in flight.
     reconciling: AtomicBool,
     sent: AtomicU64,
+    /// The NF instance whose series the AnLF judges its model on and the MTLF
+    /// retrains on (PR 4's seeded series); `None` = every NF series.
+    pub series: Option<String>,
+    /// The MTLF's retrains (PR 4).
+    pub(crate) refit: Mutex<crate::model_refit::RefitState>,
 }
 
 impl Monitor {
@@ -213,7 +219,15 @@ impl Monitor {
             registering: tokio::sync::Mutex::new(()),
             reconciling: AtomicBool::new(false),
             sent: AtomicU64::new(0),
+            series: None,
+            refit: Mutex::new(crate::model_refit::RefitState::default()),
         }
+    }
+
+    /// The same, judging and retraining on NF instance `series` only.
+    pub fn with_series(mut self, series: Option<&str>) -> Self {
+        self.series = series.map(str::to_string);
+        self
     }
 
     /// The same, with another map cap and Notify time box (tests).
@@ -318,6 +332,33 @@ impl Monitor {
     /// threshold, in mode `retrain`. Mode `no-retrain` never requests one.
     pub fn retrain_requested(&self, model_id: u64) -> bool {
         self.mode == "retrain" && self.below_threshold(model_id)
+    }
+
+    /// A live registration `id` of `model_id` with its collector (tests).
+    #[cfg(test)]
+    pub(crate) fn insert_registration_for_test(&self, id: &str, model_id: u64) {
+        lock(&self.registrations).insert(
+            id.to_string(),
+            Registration {
+                consumer_id: None,
+                model_id,
+                threshold: crate::model_retrain::DEFAULT_ACCURACY_THRESHOLD,
+                anlf_subscription: None,
+                last_seen: unix_now(),
+                auditing: false,
+            },
+        );
+        lock(&self.feedback).register_model_with(
+            id.to_string(),
+            FEEDBACK_WINDOW,
+            f64::from(crate::model_retrain::DEFAULT_ACCURACY_THRESHOLD) / 100.0,
+        );
+    }
+
+    /// Record an accuracy report for registration `id` (tests).
+    #[cfg(test)]
+    pub(crate) fn record_for_test(&self, id: &str, accuracy: f64) {
+        lock(&self.feedback).record_accuracy(id, accuracy);
     }
 
     pub fn counts(&self) -> (u64, u64) {
@@ -782,13 +823,15 @@ pub async fn audit_tick(m: &'static Monitor, now: u64) -> usize {
     dropped
 }
 
-/// Run the MTLF upkeep every 5 s for the life of the process (demo on).
-pub fn spawn_upkeep(m: &'static Monitor) {
+/// Run the MTLF upkeep on `ctx` every 5 s for the life of the process (demo
+/// on): audits, expiry, and (PR 4) the retrain of a model below the threshold.
+pub fn spawn_upkeep(m: &'static Monitor, ctx: std::sync::Arc<RwLock<NwdafContext>>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
         loop {
             tick.tick().await;
             audit_tick(m, unix_now()).await;
+            crate::model_refit::refit_tick(m, &ctx);
         }
     });
 }
@@ -1172,10 +1215,11 @@ pub fn handle_unsubscribe(m: &Monitor, id: &str) -> SbiResponse {
 }
 
 /// The accuracy of the AnLF's current model on its own recent data: `(percent,
-/// points)`, or `None` with no point to judge it on.
-pub fn measure(ctx: &RwLock<NwdafContext>) -> Option<(u8, usize)> {
+/// points)`, or `None` with no point to judge it on. `only` restricts it to one
+/// NF instance's series (the monitor's [`Monitor::series`]).
+pub fn measure(ctx: &RwLock<NwdafContext>, only: Option<&str>) -> Option<(u8, usize)> {
     let guard = ctx.read().unwrap_or_else(|p| p.into_inner());
-    let (sum, n) = guard.lock_engine().backtest_nf_load(BACKTEST_POINTS);
+    let (sum, n) = guard.lock_engine().backtest_nf_load(BACKTEST_POINTS, only);
     if n == 0 {
         return None;
     }
@@ -1233,7 +1277,7 @@ pub async fn report_tick(
     if due.is_empty() {
         return 0;
     }
-    let Some((pct, n)) = measure(ctx) else {
+    let Some((pct, n)) = measure(ctx, m.series.as_deref()) else {
         return 0;
     };
     let mut set = tokio::task::JoinSet::new();
@@ -1354,6 +1398,7 @@ pub fn render_metrics(out: &mut String) {
         "Nnwdaf_MLModelMonitor registrations this MTLF holds (nextgsim#468)",
         monitor().map(|m| lock(&m.registrations).len()).unwrap_or(0),
     );
+    crate::model_refit::render_metrics(out, monitor());
 }
 
 #[cfg(test)]

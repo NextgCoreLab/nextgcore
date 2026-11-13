@@ -434,7 +434,7 @@ async fn register_subscribe_report_and_request_a_retrain() {
 
     // Good data: accuracy ~1.00 and no retrain.
     ingest(&p.anlf_ctx, "amf-1", &RAMP);
-    let (pct, n) = measure(&p.anlf_ctx).expect("points to judge on");
+    let (pct, n) = measure(&p.anlf_ctx, None).expect("points to judge on");
     assert!(pct >= 99 && n > 0, "{pct} {n}");
     assert_eq!(
         report_tick(p.anlf, &p.anlf_ctx, Some(model_id), 10_000).await,
@@ -457,7 +457,7 @@ async fn register_subscribe_report_and_request_a_retrain() {
     // The regime change: accuracy collapses; after enough reports the rolling
     // accuracy is below 0.70 and a retrain is requested.
     ingest(&p.anlf_ctx, "amf-1", &CHOPPY);
-    let (low, _) = measure(&p.anlf_ctx).unwrap();
+    let (low, _) = measure(&p.anlf_ctx, None).unwrap();
     assert!(low < 70, "{low}");
     for k in 1..=FEEDBACK_WINDOW as u64 {
         report_tick(p.anlf, &p.anlf_ctx, Some(model_id), 10_000 + k * 100).await;

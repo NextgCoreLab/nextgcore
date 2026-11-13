@@ -38,6 +38,9 @@ pub mod onnx_model; // issue #26: zero-dep ONNX LinearRegressor subset backend
 /// nextgsim#468: Nnwdaf_MLModelMonitor (demo d441e-model-retrain).
 #[cfg(feature = "demo-d441e-model-retrain")]
 pub mod model_monitor;
+/// nextgsim#468: the MTLF's retrain and the seeded series (demo d441e-model-retrain).
+#[cfg(feature = "demo-d441e-model-retrain")]
+pub mod model_refit;
 /// nextgsim#468: the AnLF model client (demo d441e-model-retrain).
 #[cfg(feature = "demo-d441e-model-retrain")]
 pub mod model_retrain;
@@ -306,6 +309,14 @@ async fn main() -> Result<()> {
         model_retrain::announce(&plan);
         plan
     };
+    // nextgsim#468 PR 4: the seeded series both NWDAFs judge and retrain on,
+    // while the demo is on. A malformed `nwdaf.retrain_series` fails start-up.
+    #[cfg(feature = "demo-d441e-model-retrain")]
+    let retrain_series = match &model_retrain_plan {
+        model_retrain::Plan::Off => None,
+        _ => model_refit::series_config_from_root(&config_root)
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+    };
 
     // Issue #187: the flag seeds the shared resolver (so it still wins) and the
     // fallback resolves there rather than minting an id no operator can pin.
@@ -389,28 +400,33 @@ async fn main() -> Result<()> {
     match &model_retrain_plan {
         model_retrain::Plan::Off => {}
         model_retrain::Plan::On { mode, role } => {
-            let m = model_monitor::install(model_monitor::Monitor::new(
-                mode,
-                *role,
-                &sbi_base,
-                &nf_instance_id,
-                &args.nrf_uri,
-            ));
+            let m = model_monitor::install(
+                model_monitor::Monitor::new(mode, *role, &sbi_base, &nf_instance_id, &args.nrf_uri)
+                    .with_series(retrain_series.map(|_| model_refit::SERIES_NF_INSTANCE)),
+            );
             // Audit idle registrations and expire stale ones (#1473 review).
             if role.serves_mtlf() {
-                model_monitor::spawn_upkeep(m);
+                model_monitor::spawn_upkeep(m, nwdaf_self());
             }
         }
         model_retrain::Plan::Client { mode, .. } => {
-            let m = model_monitor::install(model_monitor::Monitor::new(
-                mode,
-                role::Role::Anlf,
-                &sbi_base,
-                &nf_instance_id,
-                &args.nrf_uri,
-            ));
+            let m = model_monitor::install(
+                model_monitor::Monitor::new(
+                    mode,
+                    role::Role::Anlf,
+                    &sbi_base,
+                    &nf_instance_id,
+                    &args.nrf_uri,
+                )
+                .with_series(retrain_series.map(|_| model_refit::SERIES_NF_INSTANCE)),
+            );
             model_monitor::spawn_reporter(m);
         }
+    }
+    #[cfg(feature = "demo-d441e-model-retrain")]
+    if let Some(cfg) = retrain_series {
+        model_refit::announce(&cfg);
+        model_refit::spawn_series(cfg, nwdaf_self());
     }
 
     // Issue #26: optional prediction-model selection. Default (env unset) is

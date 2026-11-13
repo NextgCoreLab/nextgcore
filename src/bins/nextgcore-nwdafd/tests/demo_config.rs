@@ -546,3 +546,87 @@ fn mlmodelmonitor_routes_follow_the_demo_block() {
         let _ = child.0.kill();
     }
 }
+
+/// nextgsim#468 PR 4: with the demo on, the binary feeds the seeded series
+/// (an NF_LOAD analytics target) and logs its disclosed regime change;
+/// `retrain_series.enabled: false` feeds nothing; a malformed block fails
+/// start-up.
+#[cfg(feature = "demo-d441e-model-retrain")]
+#[test]
+fn the_seeded_series_follows_its_block() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let on =
+        "demo:\n  enabled: true\n  d441e-model-retrain:\n    enabled: true\n    mode: retrain\n";
+    let filter = "%7B%22nfInstanceIds%22%3A%5B%22d441e000-0468-4000-8000-000000000468%22%5D%7D";
+    for (tag, series, expected) in [
+        ("series-on", "", 200u16),
+        ("series-off", "  retrain_series:\n    enabled: false\n", 204),
+    ] {
+        let sbi_port = free_port();
+        let path = std::env::temp_dir().join(format!(
+            "nwdafd-{tag}-{}-{sbi_port}.yaml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            format!(
+                "nwdaf:\n  role: mtlf\n{series}  sbi:\n    server:\n      - address: 127.0.0.1\n        port: {sbi_port}\n{on}"
+            ),
+        )
+        .unwrap();
+        let mut child = spawn(&path, free_port());
+        let status = rt.block_on(async {
+            let client = nextgcore_sbi::SbiClient::new(nextgcore_sbi::SbiClientConfig::new(
+                "127.0.0.1",
+                sbi_port,
+            ));
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                match client
+                    .get(&format!(
+                        "/nnwdaf-analyticsinfo/v1/analytics?event-id=NF_LOAD&event-filter={filter}"
+                    ))
+                    .await
+                {
+                    Ok(resp) => return resp.status,
+                    Err(_) if Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(100)).await
+                    }
+                    Err(e) => panic!("nwdafd never answered: {e}"),
+                }
+            }
+        });
+        let _ = child.0.kill();
+        let mut err = String::new();
+        child
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut err)
+            .unwrap();
+        assert_eq!(status, expected, "{tag}: {err}");
+        assert_eq!(
+            err.contains("[demo:d441e-model-retrain] seeded series nf=d441e000-0468-4000-8000-000000000468 seed=468"),
+            expected == 200,
+            "{tag}: {err}"
+        );
+    }
+    let cfg = config("series-bad", on);
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(
+        &cfg,
+        text.replacen(
+            "nwdaf:\n",
+            "nwdaf:\n  retrain_series:\n    step_secs: 0\n",
+            1,
+        ),
+    )
+    .unwrap();
+    let (ok, err) = run_to_exit(&cfg);
+    assert!(!ok, "a malformed retrain_series fails start-up");
+    assert!(err.contains("nwdaf.retrain_series.step_secs"), "{err}");
+}
