@@ -12,6 +12,14 @@ static SELECTIONS: CounterFamily = CounterFamily::new(
     &["result"],
 );
 
+static SELECTION_REFUSALS: CounterFamily = CounterFamily::new(
+    "nssf_selection_refusals_total",
+    "Nnssf_NSSelection_Get requests the NSSF declined to serve, by reason \
+     (a 403 SNSSAI_NOT_SUPPORTED per TS 29.531 §5.2.2.2.2 / §5.2.2.2.3 step 2b, \
+     or a refused mandatory IE)",
+    &["reason"],
+);
+
 static AVAILABILITY_OPERATIONS: CounterFamily = CounterFamily::new(
     "nssf_availability_operations_total",
     "Nnssf_NSSAIAvailability operations answered (TS 29.531 §5.3), by operation and result",
@@ -65,6 +73,15 @@ pub fn observe(op: NssfOperation, status: u16) {
     }
 }
 
+/// Count a selection the NSSF declined to serve, under `reason`.
+///
+/// `nssf_selections_total{result}` is derived from the status, so it cannot tell
+/// a refusal apart from any other 4xx on the resource, nor say which check
+/// declined. This family carries that reason.
+pub fn observe_refusal(reason: &'static str) {
+    SELECTION_REFUSALS.inc(&[reason]);
+}
+
 /// The NSSF's state at scrape time.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NssfCensus {
@@ -97,6 +114,7 @@ pub fn render_nssf_families(out: &mut String, census: &NssfCensus) {
         census.slice_instances,
     );
     SELECTIONS.render(out);
+    SELECTION_REFUSALS.render(out);
     AVAILABILITY_OPERATIONS.render(out);
 }
 
