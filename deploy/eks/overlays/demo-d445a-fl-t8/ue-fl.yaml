@@ -43,6 +43,9 @@ data:
       member: ${FL_MEMBER}
       clients: ${clients}
       seed: 480
+      # Longer than any hold (the gates arm holds up to 900 s): an idle reconnect
+      # would make a second join and a second T8 subscription mid-arm.
+      idle_timeout_s: 1200
     YAML
     if [ "${FL_LEAK_RAW:-false}" = true ]; then
       echo "  leak_raw: true" >>"$f"

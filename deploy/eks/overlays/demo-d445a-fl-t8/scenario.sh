@@ -213,6 +213,13 @@ YAML
         || bad "udmd logged fewer than ${subscribed} AMF legs ('${legs_re}') after ue${n}'s join"
     fi
   done
+  # Every arm but nat-on and eth0 (which refuse members by design) runs with all
+  # members: say so here rather than as an obscure failure later.
+  case "${ARM}" in
+    nat-on|eth0) ;;
+    *) wait_for 120 af_has "joined ${members}/${members} members" \
+         || bad "the AF did not log joined ${members}/${members} members" ;;
+  esac
 
   case "${ARM}" in
     nat-on|eth0)
@@ -230,7 +237,11 @@ YAML
       wait_for 300 af_has 'hold before round=4 until=member-excluded' || bad "no hold before round 4"
       # udmd forwards each member's LoC subscription to the AMF after the NEF's 201
       # (#1449 review 5): deregister only once all three legs are up.
-      if [[ "${ARM}" == udm-fallback ]]; then
+      if [[ "${ARM}" == no-t8 ]]; then
+        # --no-t8: the AF subscribes nothing, so udmd has no EE subscription and
+        # no leg (checks.py makes that a precondition); nothing to wait for.
+        :
+      elif [[ "${ARM}" == udm-fallback ]]; then
         # The AMF is unreachable to udmd: each leg ends in its fallback warning.
         wait_for 180 sh -c "[ \$(kubectl -n ${NAMESPACE} logs deploy/udm -c udm | grep -cE 'EE subscription [^ ]+: ') -ge 3 ]" \
           || bad "udmd logged fewer than 3 AMF-leg failures (NetworkPolicy not enforced?)"
@@ -245,9 +256,9 @@ YAML
       fi
       say "deregistering ue3"
       "${K[@]}" exec deploy/ue-3 -c ue -- nr-ue-deregister >"${S}/ue3-deregister.txt" 2>&1 || bad "ue3 deregistration"
-      # Without the exclusion (no-t8, nefd-down) the hold before 4 runs out (240 s) and
-      # round 4 waits T for ue3.
-      wait_for 420 af_has 'hold before round=7 until=members-full' || bad "no hold before round 7"
+      # Without the exclusion (no-t8, nefd-down) the hold before 4 runs out (240 s),
+      # and rounds 4-6 each wait T (30 s) for ue3: about 330 s.
+      wait_for 600 af_has 'hold before round=7 until=members-full' || bad "no hold before round 7"
       say "power-cycling ue3"
       "${K[@]}" logs deploy/ue-3 -c ue --timestamps >"${S}/ue-3-first.log" 2>/dev/null
       "${K[@]}" delete pod -l app.kubernetes.io/name=ue-3 --wait=false >/dev/null

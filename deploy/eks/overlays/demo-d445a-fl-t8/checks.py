@@ -241,8 +241,9 @@ def check_chain(r, d, deadline_ms):
     if t_acc is None:
         return fail('no amfd "Deregistration Accept sent to UE" after the hold')
     fwd, leg, why = ue3_legs(udm, t_acc)
-    if len(fwd) < 3:
-        return fail(f'{len(fwd)} udmd "forwarded to AMF" LoC line(s) before the Deregistration Accept, need 3')
+    legs = {x[2].group(1) for x in fwd}
+    if len(legs) < 3:
+        return fail(f'{len(legs)} distinct udmd LoC leg(s) forwarded to AMF before the Deregistration Accept, need 3')
     if leg is None:
         return fail(why)
     exc = first(af, rf'member_selection excluded={re.escape(gpsi(3))} member=ue3 reason=nef_event '
@@ -565,6 +566,8 @@ def run(arm, d):
         if arm == 'no-t8':
             j = [x for x in joins(af) if x['label'] == 'ue3' and not x['readmit']]
             pre.append(('ue3 joined with t8=off', bool(j) and j[0]['loc'] is None))
+            pre.append(('the AF subscribed nothing: no udmd EE Subscribe, no forwarded leg',
+                        not every(udm, r'EE Subscribe: ') and not fwd))
         amf = load(d, 'amf.log')
         if arm == 'nefd-down':
             pre.append(('udmd forwarded x3', len(fwd) >= 3))
@@ -711,7 +714,7 @@ def _pcap(path, pkts):
             f.write(frame)
 
 
-MAIN_FAILS = {'no udmd forwarded lines': 'chain', 'only two forwarded lines': 'chain', 'no Deregistration Accept': 'chain', 'the amfd delivery is not 2xx': 'chain', 'the amfd delivery names an unknown subscription': 'chain', 'no nefd T8 delivery': 'chain', 'nefd delivered another subscription': 'chain', 'nefd delivered no reason': 'chain', 'no AF exclusion': 'chain', 'the exclusion carries no reason': 'chain', 'round 4 at participants=3': 'chain', 'round 4 too slow': 'chain', 'ue3 resolved to another GPSI': 'sources', 'a source outside 10.45.0.0/16': 'sources', 'a member never joined': 'sources', 'scorecard over 0.5x round 1': 'scorecard', 'oracle not bit-identical': 'scorecard', 'no readmission': 'readmission', 'round 9 at participants=2': 'readmission', 'a canary row': 'canary', 'a FIN from ue3': 'no_fin', 'an RST from ue3': 'no_fin', 'UL delta below the AF bytes': 'ul_delta', 'no per-session series': 'ul_delta', "the amfd delivery on another member's leg": 'chain', 'a second amfd delivery on another leg': 'chain', 'no udmd EE Subscribe for ue3': 'chain', 'the exclusion before the Deregistration Accept': 'chain', 'round 4 before the exclusion': 'chain', 'the scorecard ran 5 rounds': 'scorecard', 'bytes to the AF from an address with no session': 'ul_delta', 'the AF kept its bounding set': 'af_unprivileged', 'the AF ran as root': 'af_unprivileged', 'no AF status captured': 'af_unprivileged'}
+MAIN_FAILS = {'no udmd forwarded lines': 'chain', 'only two forwarded lines': 'chain', 'no Deregistration Accept': 'chain', 'the amfd delivery is not 2xx': 'chain', 'the amfd delivery names an unknown subscription': 'chain', 'no nefd T8 delivery': 'chain', 'nefd delivered another subscription': 'chain', 'nefd delivered no reason': 'chain', 'no AF exclusion': 'chain', 'the exclusion carries no reason': 'chain', 'round 4 at participants=3': 'chain', 'round 4 too slow': 'chain', 'ue3 resolved to another GPSI': 'sources', 'a source outside 10.45.0.0/16': 'sources', 'a member never joined': 'sources', 'scorecard over 0.5x round 1': 'scorecard', 'oracle not bit-identical': 'scorecard', 'no readmission': 'readmission', 'round 9 at participants=2': 'readmission', 'a canary row': 'canary', 'a FIN from ue3': 'no_fin', 'an RST from ue3': 'no_fin', 'UL delta below the AF bytes': 'ul_delta', 'no per-session series': 'ul_delta', "the amfd delivery on another member's leg": 'chain', 'a second amfd delivery on another leg': 'chain', 'no udmd EE Subscribe for ue3': 'chain', 'the exclusion before the Deregistration Accept': 'chain', 'round 4 before the exclusion': 'chain', 'the scorecard ran 5 rounds': 'scorecard', 'bytes to the AF from an address with no session': 'ul_delta', 'the AF kept its bounding set': 'af_unprivileged', 'the AF ran as root': 'af_unprivileged', 'no AF status captured': 'af_unprivileged', 'three forwarded lines but two legs (a re-forward)': 'chain'}
 
 
 def self_test():
@@ -793,6 +796,7 @@ def self_test():
         ('the exclusion before the Deregistration Accept', edit('amf.log', '06:00:29.100Z', '06:00:31.900Z')),
         ('round 4 before the exclusion', edit('af.log', '06:00:32.400Z', '06:00:31.100Z')),
         ('the scorecard ran 5 rounds', edit('af.log', 'rounds=10 r1_mse', 'rounds=5 r1_mse')),
+        ('three forwarded lines but two legs (a re-forward)', edit('udm.log', 'EE subscription usub2 ', 'EE subscription usub1 ')),
         ('the AF kept its bounding set', edit('af-status.txt', 'CapBnd:\t0000000000000000', 'CapBnd:\t00000000002030c1')),
         ('the AF ran as root', edit('af-status.txt', 'Uid:\t65534', 'Uid:\t0')),
         ('no AF status captured', lambda d: (_fixture(d), os.remove(os.path.join(d, 'af-status.txt')))),
@@ -852,6 +856,8 @@ def self_test():
     # Revert arms hold only when their target check fails AND every precondition
     # holds; each wrong-reason case below must not hold.
     def strag(d, accept=True, t8='off', fwd=3, excl=False, failed=True):
+        """t8='off' is the no-t8 shape (no T8 subscription, so udmd has nothing);
+        t8='on' keeps the members' legs (nefd-down)."""
         _fixture(d)
         p_ = os.path.join(d, 'af.log')
         a_ = open(p_).read()
@@ -870,12 +876,22 @@ def self_test():
                 + ('2026-11-13T06:00:29.500Z x Event notification delivery failed (sub=asub3): connection refused\n'
                    if failed else ''))
         u_ = os.path.join(d, 'udm.log')
-        keep = [x for x in open(u_).read().splitlines() if 'forwarded' not in x or any(f'usub{n} ' in x for n in range(1, fwd + 1))]
+        if t8 == 'off':
+            keep = []
+        else:
+            keep = [x for x in open(u_).read().splitlines()
+                    if 'forwarded' not in x or any(f'usub{n} ' in x for n in range(1, fwd + 1))]
         open(u_, 'w').write('\n'.join(keep) + '\n')
     expect('no-t8 does not hold on a good run', 'no-t8', base(), False)
     expect('no-t8 holds: t8=off, ue3 straggles to T', 'no-t8', strag, True)
     expect('no-t8 does not hold without the Deregistration Accept', 'no-t8', lambda d: strag(d, accept=False), False)
     expect('no-t8 does not hold with a T8 subscription', 'no-t8', lambda d: strag(d, t8='on'), False)
+
+    def subscribed_anyway(d):
+        strag(d)
+        open(os.path.join(d, 'udm.log'), 'w').write(
+            '2026-11-13T06:00:04.000Z x EE Subscribe: ueIdentity=imsi-999700000000003\n')
+    expect('no-t8 does not hold when udmd shows a subscribe', 'no-t8', subscribed_anyway, False)
     expect('nefd-down holds: legs up, Accept, no delivery, straggler', 'nefd-down', lambda d: strag(d, t8='on'), True)
     expect('nefd-down does not hold without the Accept', 'nefd-down', lambda d: strag(d, t8='on', accept=False), False)
     expect('nefd-down does not hold with two legs', 'nefd-down', lambda d: strag(d, t8='on', fwd=2), False)
