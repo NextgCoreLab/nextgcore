@@ -326,10 +326,13 @@ d445a_gates() {
   local body="{\"afId\":\"d445a-gates\",\"ueIpAddr\":{\"ipv4Addr\":\"${ip1}\"}}"
   # curl from the nrf pod (core image); -i for the status and WWW-Authenticate.
   retrieve() {   # TOKEN|-  -> HTTP status line, WWW-Authenticate, body
-    local auth=()
+    # scenario.sh runs under `set -u`; an empty "${auth[@]}" is unbound on some
+    # bash versions. Only define the array in the with-token branch, and expand
+    # it conditionally so the no-token call sends no Authorization header.
+    local auth
     [[ "$1" == - ]] || auth=(-H "Authorization: Bearer $1")
     "${K[@]}" exec deploy/nrf -c nrf -- curl -s -i --http2-prior-knowledge --max-time 10 \
-      -X POST -H 'Content-Type: application/json' "${auth[@]}" -d "${body}" \
+      -X POST -H 'Content-Type: application/json' ${auth[@]+"${auth[@]}"} -d "${body}" \
       "http://${nef_ip}:7777/3gpp-ueid/v1/retrieve" 2>&1
   }
   status() { awk 'NR==1{print $2}' <<<"$1" | tr -d '\r'; }
