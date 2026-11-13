@@ -63,7 +63,10 @@ def af_config(arm, mode, text):
     c = yaml.safe_load(text)
     if not isinstance(c, dict) or c.get('demo', {}).get('d445a-fl-t8', {}).get('mode') != mode:
         sys.exit(f'af-config: the rendered af.yaml is not in mode {mode}')
-    if arm in ('main', 'no-t8', 'nefd-down'):
+    # scenario.sh starts the UEs one at a time after the AF (serialised joins):
+    # five can take several minutes.
+    c['join_timeout_s'] = 900
+    if arm in ('main', 'no-t8', 'nefd-down', 'udm-fallback', 'eth0'):
         pass                     # the overlay's holds: before 4 (excluded), before 7 (full)
     elif arm == 'probe':
         c['rounds'] = 22
@@ -89,6 +92,7 @@ def self_test():
     assert p['rounds'] == 22 and len(p['holds']) == 20 and p['holds'][-1]['before_round'] == 21, p
     assert 'holds' not in yaml.safe_load(af_config('poisoned', 't8-exclusion', base))
     assert yaml.safe_load(af_config('main', 't8-exclusion', base))['holds'][0]['before_round'] == 4
+    assert yaml.safe_load(af_config('eth0', 't8-exclusion', base))['join_timeout_s'] == 900
     try:
         af_config('main', 'poisoned-ue', base)
         raise AssertionError('a mode mismatch passed')

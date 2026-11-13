@@ -185,26 +185,35 @@ def ue3_departure(d):
 
 
 def ue3_legs(udm, before):
-    """The udmd AMF legs that can be ue3's, and whether the tie is exact.
+    """ue3's udmd AMF leg, exact or nothing: (forwarded LoC legs before `before`,
+    ue3's leg or None, why).
 
-    udmd logs no line holding both an EE subscription id and its SUPI, and amfd
-    redacts the notify URI, so the tie is by order: a leg forwarded before ue3's
-    own `EE Subscribe: ueIdentity=imsi-...003` cannot be ue3's. When no other EE
-    Subscribe falls between ue3's and the next forwarded leg, that leg is ue3's
-    exactly; otherwise every leg forwarded after ue3's subscribe is a candidate."""
+    udmd logs no line holding both an EE id and its SUPI, and forwards each leg
+    asynchronously after its 201 (spawn_reconcile), so the tie is by count, and
+    fails closed. It is exact only when, at ue3's own `EE Subscribe`, every earlier
+    EE Subscribe already has its own forwarded line (as many distinct EE ids as
+    subscribes), and no later EE Subscribe comes before the next new EE id, which is
+    then ue3's. scenario.sh serialises the joins so that this holds on a correct run."""
     subs = every(udm, r'EE Subscribe: ueIdentity=(imsi-\d+)')
     fwd = [x for x in every(udm, r'EE subscription (\S+) \(.*LOSS_OF_CONNECTIVITY.*\) forwarded to AMF (\S+): (\S+)')
            if x[0] < before]
-    mine = [x for x in subs if x[2].group(1) == UE3_SUPI]
+    mine = [x for x in subs if x[2].group(1) == UE3_SUPI and x[0] < before]
     if not mine:
-        return fwd, [], False
+        return fwd, None, f'no udmd EE Subscribe for {UE3_SUPI}'
     t3 = mine[0][0]
-    after = [x for x in fwd if x[0] > t3]
-    if not after:
-        return fwd, [], False
-    others = [x for x in subs if t3 < x[0] < after[0][0]]
-    exact = not others
-    return fwd, ([after[0]] if exact else after), exact
+    earlier = [x for x in subs if x[0] < t3]
+    seen = {x[2].group(1) for x in fwd if x[0] < t3}
+    if len(seen) != len(earlier):
+        return fwd, None, (f"ue3's leg is ambiguous: {len(earlier)} EE Subscribe(s) before ue3's, "
+                           f"{len(seen)} forwarded by then")
+    new = [x for x in fwd if x[0] > t3 and x[2].group(1) not in seen]
+    if not new:
+        return fwd, None, "no udmd leg forwarded after ue3's EE Subscribe"
+    later = [x for x in subs if t3 < x[0] < new[0][0]]
+    if later:
+        return fwd, None, (f"ue3's leg is ambiguous: another EE Subscribe ({later[0][2].group(1)}) "
+                           "before the next forwarded leg")
+    return fwd, new[0], 'exact'
 
 
 UE3_SUPI = 'imsi-999700000000003'
@@ -231,11 +240,11 @@ def check_chain(r, d, deadline_ms):
         return fail('no AF hold before round 4')
     if t_acc is None:
         return fail('no amfd "Deregistration Accept sent to UE" after the hold')
-    fwd, legs, exact = ue3_legs(udm, t_acc)
+    fwd, leg, why = ue3_legs(udm, t_acc)
     if len(fwd) < 3:
         return fail(f'{len(fwd)} udmd "forwarded to AMF" LoC line(s) before the Deregistration Accept, need 3')
-    if not legs:
-        return fail(f'no udmd leg forwarded after ue3\'s EE Subscribe ({UE3_SUPI})')
+    if leg is None:
+        return fail(why)
     exc = first(af, rf'member_selection excluded={re.escape(gpsi(3))} member=ue3 reason=nef_event '
                     r'lossOfConnectReason=(\S+) subscription=(\S+)', t_acc)
     if not exc:
@@ -254,15 +263,15 @@ def check_chain(r, d, deadline_ms):
     dur = int(done[2].group(1))
     if dur >= 0.3 * deadline_ms:
         return fail(f'round 4 dur_ms={dur} >= 0.3 T ({0.3 * deadline_ms:.0f})')
-    leg_ids = {sub_id(x[2].group(3)): x[2].group(1) for x in legs}
+    leg3 = sub_id(leg[2].group(3))
     dls = [x for x in every(amf, r'Event notification delivered: sub=([^,\s]+), status=(\d+)')
            if t_acc < x[0] < rnd[0] and x[2].group(2).startswith('2')]
-    mine = [x for x in dls if x[2].group(1) in leg_ids]
+    mine = [x for x in dls if x[2].group(1) == leg3]
     if not mine:
-        return fail(f'no amfd 2xx delivery on ue3\'s leg {sorted(leg_ids)} between the Accept and round 4')
-    others = [x for x in dls if x[2].group(1) not in leg_ids]
+        return fail(f"no amfd 2xx delivery on ue3's leg {leg3} between the Accept and round 4")
+    others = [x for x in dls if x[2].group(1) != leg3]
     if others:
-        return fail(f'amfd also delivered on {[x[2].group(1) for x in others]}, not ue3\'s leg')
+        return fail(f"amfd also delivered on {[x[2].group(1) for x in others]}, not ue3's leg")
     dl = mine[0]
     nd = None
     for t, m, x in every(nef, r'\[demo:d445a-fl-t8\] T8 delivery sub=(\S+) monitoringType=LOSS_OF_CONNECTIVITY '
@@ -277,8 +286,7 @@ def check_chain(r, d, deadline_ms):
                     f'AF saw {reason}')
     ms = lambda t: f'{(t - t_acc) / 1e6:+.1f} ms'
     return r.add('chain', True,
-                 f'udmd forwarded x{len(fwd)} (ue3\'s leg {dl[2].group(1)}, tie '
-                 f'{"exact" if exact else f"by order, {len(legs)} candidate(s)"}); from the Accept: '
+                 f'udmd forwarded x{len(fwd)} (ue3\'s leg {leg[2].group(1)} -> {leg3}, tie exact); from the Accept: '
                  f'amfd delivered {ms(dl[0])}, nefd T8 sub={s3} {ms(nd[0])}, AF excluded {gpsi(3)} '
                  f'(lossOfConnectReason={reason}) {ms(exc[0])}, round 4 participants=2 {ms(rnd[0])}, '
                  f'dur_ms={dur} (< {0.3 * deadline_ms:.0f})')
@@ -480,6 +488,23 @@ def check_ul_delta(r, d):
     return r.add('ul_delta', not bad, '; '.join(bad) if bad else '; '.join(ev))
 
 
+def check_af_unprivileged(r, d):
+    """nr-fl-server, the one listener UEs reach, ran as nobody with no
+    capabilities, an empty bounding set and no_new_privs (its /proc status, which
+    scenario.sh captures)."""
+    p = os.path.join(d, 'af-status.txt')
+    st = {}
+    if os.path.exists(p):
+        for line in open(p).read().splitlines():
+            k, _, v = line.partition(':')
+            st[k.strip()] = v.split()
+    want = {'Uid': ['65534'] * 4, 'Gid': ['65534'] * 4, 'CapEff': ['0000000000000000'],
+            'CapPrm': ['0000000000000000'], 'CapBnd': ['0000000000000000'], 'NoNewPrivs': ['1']}
+    bad = [f'{k}={" ".join(st.get(k, ["?"]))}' for k, v in want.items() if st.get(k) != v]
+    return r.add('af_unprivileged', not bad, '; '.join(bad) if bad else
+                 'uid/gid 65534, CapEff/CapPrm/CapBnd 0, NoNewPrivs 1')
+
+
 def check_gates(r, d):
     p = os.path.join(d, 'gates.txt')
     rows = open(p).read().splitlines() if os.path.exists(p) else []
@@ -519,6 +544,7 @@ def run(arm, d):
         check_canary(r, d)
         check_no_fin(r, d)
         check_ul_delta(r, d)
+        check_af_unprivileged(r, d)
         verdict = all(ok for _, ok, _ in r.rows)
     elif arm == 'poisoned':
         check_sources(r, d, members)
@@ -539,13 +565,30 @@ def run(arm, d):
         if arm == 'no-t8':
             j = [x for x in joins(af) if x['label'] == 'ue3' and not x['readmit']]
             pre.append(('ue3 joined with t8=off', bool(j) and j[0]['loc'] is None))
+        amf = load(d, 'amf.log')
         if arm == 'nefd-down':
             pre.append(('udmd forwarded x3', len(fwd) >= 3))
             pre.append(('no AF exclusion of ue3', not first(af, r'member_selection excluded=')))
+            _, leg, why = ue3_legs(udm, t_acc if t_acc is not None else 0)
+            leg3 = sub_id(leg[2].group(3)) if leg else None
+            after = [x for x in amf if t_acc is not None and x[0] > t_acc]
+            failed = bool(leg3) and any(f'Event notification delivery failed (sub={leg3})' in m for _, m in after)
+            ok2xx = bool(leg3) and any(re.search(rf'Event notification delivered: sub={re.escape(leg3)}, status=2', m)
+                                       for _, m in after)
+            pre.append((f"amfd fired LoC at the down nefd: delivery failed on ue3's leg {leg3 or '(' + why + ')'}",
+                        failed and not ok2xx))
         if arm == 'udm-fallback':
             warns = every(udm, r'EE subscription \S+: ')
             pre.append(('udmd could not reach the AMF (EE subscription <id>: <error>)', len(warns) >= 3))
             pre.append(('udmd forwarded no leg', not fwd))
+            dl = [m for t, m in amf if t_acc is not None and t > t_acc
+                  and re.search(r'Event notification delivered: sub=\S+, status=2', m)]
+            pre.append(('no amfd 2xx LoC delivery after the Accept (no AMF leg carried it)', not dl))
+            exc = first(af, rf'member_selection excluded={re.escape(gpsi(3))} member=ue3 reason=nef_event '
+                            r'lossOfConnectReason=(\S+)')
+            print('INFO udm-fallback: ' + (f'ue3 still excluded through udmd\'s UECM fallback, '
+                                           f'lossOfConnectReason={exc[2].group(1)}' if exc else
+                                           'no exclusion of ue3 reached the AF'))
         if arm != 'udm-fallback':
             check_straggler(r, d, T)
         for name, ok in pre:
@@ -554,8 +597,8 @@ def run(arm, d):
     elif arm == 'freeze-global':
         check_scorecard(r, d)
         sc = scorecards(load(d, 'af.log')).get('fedavg')
-        frozen = bool(sc) and float(sc.group(3)) > 0.5
-        r.add('precondition', frozen, 'a fedavg scorecard with last/r1 > 0.5 (the global never moved)')
+        frozen = bool(sc) and 0.95 <= float(sc.group(3)) <= 1.05
+        r.add('precondition', frozen, 'a fedavg scorecard with 0.95 <= last/r1 <= 1.05 (the global never moved)')
         verdict = r.failed('scorecard') and frozen
     elif arm == 'leak-raw':
         check_canary(r, d)
@@ -578,6 +621,12 @@ def run(arm, d):
         unres = bool(eth) and bool(first(load(d, 'af.log'), rf'identity_unresolved member=ue2 peer={re.escape(eth)}:'))
         r.add('precondition', bool(eth) and seen, f'ue2 on eth0 ({eth or "no eth0_ip"}) reached the AF in the pcap')
         r.add('precondition', unres, f'identity_unresolved member=ue2 peer={eth}')
+        named = any(n == 'ul_delta' and not o and f'bytes reached the AF from {eth}, which has no PDU session' in ev
+                    for n, o, ev in r.rows) if eth else False
+        members_series = any(k[1] in {ip for ips in ue_ips(d).values() for ip in ips}
+                             for k in (ul_series(os.path.join(d, 'metrics-after.prom')) or {}))
+        r.add('precondition', named, f'ul_delta fails on the bytes from {eth} (no PDU session)')
+        r.add('precondition', members_series, 'the UPF metrics hold member session series')
         verdict = r.failed('ul_delta') and r.failed('sources') and r.ok('precondition')
     else:
         sys.exit(f'unknown arm {arm}')
@@ -624,6 +673,9 @@ def _fixture(d, af=None, nef=None, udm=None, amf=None, extra=None):
         f.write('ue1 10.45.0.2\nue2 10.45.0.3\nue3 10.45.0.4\nue3 10.45.0.9\n')
     with open(os.path.join(d, 'meta.txt'), 'w') as f:
         f.write('deadline_ms=30000\nmembers=3\nrounds=10\n')
+    with open(os.path.join(d, 'af-status.txt'), 'w') as f:
+        f.write('Uid:\t65534\t65534\t65534\t65534\nGid:\t65534\t65534\t65534\t65534\nCapPrm:\t0000000000000000\n'
+                'CapEff:\t0000000000000000\nCapBnd:\t0000000000000000\nNoNewPrivs:\t1\n')
     # pcap: ue3's first connection carries data and never closes; every member
     # sends to the AF after the first scrape (t = 06:00:05).
     t0 = ns('2026-11-13T06:00:05Z') / 1e9
@@ -659,7 +711,7 @@ def _pcap(path, pkts):
             f.write(frame)
 
 
-MAIN_FAILS = {'no udmd forwarded lines': 'chain', 'only two forwarded lines': 'chain', 'no Deregistration Accept': 'chain', 'the amfd delivery is not 2xx': 'chain', 'the amfd delivery names an unknown subscription': 'chain', 'no nefd T8 delivery': 'chain', 'nefd delivered another subscription': 'chain', 'nefd delivered no reason': 'chain', 'no AF exclusion': 'chain', 'the exclusion carries no reason': 'chain', 'round 4 at participants=3': 'chain', 'round 4 too slow': 'chain', 'ue3 resolved to another GPSI': 'sources', 'a source outside 10.45.0.0/16': 'sources', 'a member never joined': 'sources', 'scorecard over 0.5x round 1': 'scorecard', 'oracle not bit-identical': 'scorecard', 'no readmission': 'readmission', 'round 9 at participants=2': 'readmission', 'a canary row': 'canary', 'a FIN from ue3': 'no_fin', 'an RST from ue3': 'no_fin', 'UL delta below the AF bytes': 'ul_delta', 'no per-session series': 'ul_delta', "the amfd delivery on another member's leg": 'chain', 'a second amfd delivery on another leg': 'chain', 'no udmd EE Subscribe for ue3': 'chain', 'the exclusion before the Deregistration Accept': 'chain', 'round 4 before the exclusion': 'chain', 'the scorecard ran 5 rounds': 'scorecard', 'bytes to the AF from an address with no session': 'ul_delta'}
+MAIN_FAILS = {'no udmd forwarded lines': 'chain', 'only two forwarded lines': 'chain', 'no Deregistration Accept': 'chain', 'the amfd delivery is not 2xx': 'chain', 'the amfd delivery names an unknown subscription': 'chain', 'no nefd T8 delivery': 'chain', 'nefd delivered another subscription': 'chain', 'nefd delivered no reason': 'chain', 'no AF exclusion': 'chain', 'the exclusion carries no reason': 'chain', 'round 4 at participants=3': 'chain', 'round 4 too slow': 'chain', 'ue3 resolved to another GPSI': 'sources', 'a source outside 10.45.0.0/16': 'sources', 'a member never joined': 'sources', 'scorecard over 0.5x round 1': 'scorecard', 'oracle not bit-identical': 'scorecard', 'no readmission': 'readmission', 'round 9 at participants=2': 'readmission', 'a canary row': 'canary', 'a FIN from ue3': 'no_fin', 'an RST from ue3': 'no_fin', 'UL delta below the AF bytes': 'ul_delta', 'no per-session series': 'ul_delta', "the amfd delivery on another member's leg": 'chain', 'a second amfd delivery on another leg': 'chain', 'no udmd EE Subscribe for ue3': 'chain', 'the exclusion before the Deregistration Accept': 'chain', 'round 4 before the exclusion': 'chain', 'the scorecard ran 5 rounds': 'scorecard', 'bytes to the AF from an address with no session': 'ul_delta', 'the AF kept its bounding set': 'af_unprivileged', 'the AF ran as root': 'af_unprivileged', 'no AF status captured': 'af_unprivileged'}
 
 
 def self_test():
@@ -741,6 +793,9 @@ def self_test():
         ('the exclusion before the Deregistration Accept', edit('amf.log', '06:00:29.100Z', '06:00:31.900Z')),
         ('round 4 before the exclusion', edit('af.log', '06:00:32.400Z', '06:00:31.100Z')),
         ('the scorecard ran 5 rounds', edit('af.log', 'rounds=10 r1_mse', 'rounds=5 r1_mse')),
+        ('the AF kept its bounding set', edit('af-status.txt', 'CapBnd:\t0000000000000000', 'CapBnd:\t00000000002030c1')),
+        ('the AF ran as root', edit('af-status.txt', 'Uid:\t65534', 'Uid:\t0')),
+        ('no AF status captured', lambda d: (_fixture(d), os.remove(os.path.join(d, 'af-status.txt')))),
         ('bytes to the AF from an address with no session', lambda d: _fixture(d, extra=[
             (ns('2026-11-13T06:00:20Z') / 1e9, '10.10.5.5', 46000, 0x18, 300)])),
     ]:
@@ -756,12 +811,47 @@ def self_test():
             assert old_ in text, (name, old_)
             open(pth, 'w').write(text.replace(old_, new_))
     out = expect('the delivery lines may fall either side of the exclusion', 'main', late, True)
+
+    # udmd's legs land asynchronously: Sub(ue1) fwd1 Sub(ue2) Sub(ue3) fwd2 fwd3.
+    # ue3's leg cannot be told apart, so the chain FAILS closed, whichever leg
+    # amfd delivered on (the reviewer's false fail and false pass).
+    def interleaved(d, sub='asub3'):
+        _fixture(d)
+        U = ['EE Subscribe: ueIdentity=imsi-999700000000001', 'fwd 1', 'EE Subscribe: ueIdentity=imsi-999700000000002',
+             'EE Subscribe: ueIdentity=imsi-999700000000003', 'fwd 2', 'fwd 3']
+        rows = []
+        for k, u in enumerate(U):
+            if u.startswith('fwd'):
+                n = u[-1]
+                u = (f'EE subscription usub{n} (["LOSS_OF_CONNECTIVITY"]) forwarded to AMF amf-1: '
+                     f'http://amf:7777/namf-evts/v1/subscriptions/asub{n}')
+            rows.append(f'2026-11-13T06:00:0{k + 2}.000Z x {u}')
+        open(os.path.join(d, 'udm.log'), 'w').write('\n'.join(rows) + '\n')
+        a = os.path.join(d, 'amf.log')
+        text = open(a).read()
+        open(a, 'w').write(text.replace('sub=asub3', f'sub={sub}'))
+    for sub in ('asub3', 'asub2'):
+        o = expect(f'interleaved legs, amfd on {sub}: ambiguous, fails', 'main',
+                   lambda d, sub=sub: interleaved(d, sub), False, fails='chain')
+        assert "ue3's leg is ambiguous" in o, o
+    # Serialised (every earlier subscribe forwarded before ue3's): exact.
+    def serial_late(d):
+        _fixture(d)   # the default fixture is serialised: Sub1 fwd1 Sub2 fwd2 Sub3 fwd3
+    expect('serialised legs: exact', 'main', serial_late, True)
+    def later_sub(d):
+        _fixture(d)
+        u = os.path.join(d, 'udm.log')
+        lines = open(u).read().splitlines()
+        lines.insert(5, '2026-11-13T06:00:06.900Z x EE Subscribe: ueIdentity=imsi-999700000000004')
+        open(u, 'w').write('\n'.join(lines) + '\n')
+    o = expect("a later subscribe before ue3's leg: ambiguous", 'main', later_sub, False, fails='chain')
+    assert "ue3's leg is ambiguous" in o, o
     # The pcap reader must see the fixture's segments; an empty capture fails.
     expect('an empty pcap fails no_fin', 'main', lambda d: (_fixture(d), _pcap(os.path.join(d, 'fl-dn.pcap'), [])), False)
 
     # Revert arms hold only when their target check fails AND every precondition
     # holds; each wrong-reason case below must not hold.
-    def strag(d, accept=True, t8='off', fwd=3, excl=False):
+    def strag(d, accept=True, t8='off', fwd=3, excl=False, failed=True):
         _fixture(d)
         p_ = os.path.join(d, 'af.log')
         a_ = open(p_).read()
@@ -775,7 +865,10 @@ def self_test():
         if not accept:
             open(os.path.join(d, 'amf.log'), 'w').write('')
         else:
-            open(os.path.join(d, 'amf.log'), 'w').write('2026-11-13T06:00:29.100Z x Deregistration Accept sent to UE 3\n')
+            open(os.path.join(d, 'amf.log'), 'w').write(
+                '2026-11-13T06:00:29.100Z x Deregistration Accept sent to UE 3\n'
+                + ('2026-11-13T06:00:29.500Z x Event notification delivery failed (sub=asub3): connection refused\n'
+                   if failed else ''))
         u_ = os.path.join(d, 'udm.log')
         keep = [x for x in open(u_).read().splitlines() if 'forwarded' not in x or any(f'usub{n} ' in x for n in range(1, fwd + 1))]
         open(u_, 'w').write('\n'.join(keep) + '\n')
@@ -787,6 +880,8 @@ def self_test():
     expect('nefd-down does not hold without the Accept', 'nefd-down', lambda d: strag(d, t8='on', accept=False), False)
     expect('nefd-down does not hold with two legs', 'nefd-down', lambda d: strag(d, t8='on', fwd=2), False)
     expect('nefd-down does not hold when ue3 was excluded', 'nefd-down', lambda d: strag(d, t8='on', excl=True), False)
+    expect('nefd-down does not hold when amfd never tried to deliver', 'nefd-down',
+           lambda d: strag(d, t8='on', failed=False), False)
 
     def fallback(d, enforced=True):
         _fixture(d)
@@ -794,15 +889,22 @@ def self_test():
         if not enforced:
             rows += [x for x in open(os.path.join(d, 'udm.log')).read().splitlines() if 'forwarded' in x]
         open(os.path.join(d, 'udm.log'), 'w').write('\n'.join(rows) + '\n')
+        open(os.path.join(d, 'amf.log'), 'w').write('2026-11-13T06:00:29.100Z x Deregistration Accept sent to UE 3\n')
     expect('udm-fallback holds: no leg reached the AMF, chain fails', 'udm-fallback', fallback, True)
     expect('udm-fallback does not hold when the legs were forwarded', 'udm-fallback',
            lambda d: fallback(d, enforced=False), False)
     expect('udm-fallback does not hold on a good run', 'udm-fallback', base(), False)
+    expect('udm-fallback does not hold with an amfd 2xx delivery after the Accept', 'udm-fallback',
+           lambda d: (fallback(d), open(os.path.join(d, 'amf.log'), 'a').write(
+               '2026-11-13T06:00:30.000Z x Event notification delivered: sub=asub3, status=204\n')), False)
 
     expect('freeze-global does not hold on a good scorecard', 'freeze-global', base(), False)
     expect('freeze-global holds on a frozen scorecard', 'freeze-global',
            edit('af.log', 'last/r1=0.184', 'last/r1=1.000'), True)
     expect('freeze-global does not hold without a scorecard', 'freeze-global', without('af.log', 'scorecard'), False)
+    for v in ('0.600', '3.000', 'inf'):
+        expect(f'freeze-global does not hold at last/r1={v} (moved or diverged)', 'freeze-global',
+               edit('af.log', 'last/r1=0.184', f'last/r1={v}'), False)
     expect('leak-raw does not hold on a clean run', 'leak-raw', base(), False)
 
     def leak(d, rows='1'):
@@ -835,6 +937,8 @@ def self_test():
     expect('eth0 does not hold without its packets in the pcap', 'eth0', lambda d: eth0(d, pcap=False), False)
     expect('eth0 does not hold without identity_unresolved', 'eth0', lambda d: eth0(d, unres=False), False)
     expect('eth0 does not hold on a good run', 'eth0', base(), False)
+    expect('eth0 does not hold when ul_delta fails only for empty metrics', 'eth0',
+           lambda d: (eth0(d), open(os.path.join(d, 'metrics-after.prom'), 'w').write('')), False)
 
     # poisoned
     def pois(d, fed='1860000.000', med='0.937', kr=10):

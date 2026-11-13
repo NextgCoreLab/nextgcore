@@ -93,12 +93,13 @@ REGISTRY="${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com"
 # (throttling, an expired session, the network) stops the run, since the repos are
 # MUTABLE and a push over an existing tag would move it.                REPO TAG
 absent() {
-  local err
-  if err="$(aws ecr describe-images --region "${REGION}" --repository-name "${REPO_PREFIX}/$1" \
-              --image-ids imageTag="$2" 2>&1 >/dev/null)"; then
-    die "${REPO_PREFIX}/$1:$2 already exists; not overwriting"
-  fi
-  [[ "${err}" == *ImageNotFoundException* ]] || die "describe-images ${REPO_PREFIX}/$1:$2 failed: ${err}"
+  local err rc=0
+  err="$(aws ecr describe-images --region "${REGION}" --repository-name "${REPO_PREFIX}/$1" \
+           --image-ids imageTag="$2" 2>&1 >/dev/null)" || rc=$?
+  (( rc != 0 )) || die "${REPO_PREFIX}/$1:$2 already exists; not overwriting"
+  # The CLI's service-error exit (254) with that exact error code, nothing looser.
+  [[ "${rc}" == 254 && "${err}" == *"(ImageNotFoundException)"* ]] \
+    || die "describe-images ${REPO_PREFIX}/$1:$2 failed (rc ${rc}): ${err}"
 }
 repo() {   # REPO: must exist; only RepositoryNotFoundException means it does not
   local err

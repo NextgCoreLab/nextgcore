@@ -106,7 +106,10 @@ d445a_main() {
   upf_ip="$("${K[@]}" get pod -l app.kubernetes.io/name=upf -o jsonpath='{.items[0].status.podIP}')"
   if [[ "${ARM}" == eth0 ]]; then
     # The client on the pod network, not the PDU session: an arm-only DNAT in the
-    # UPF's namespace hands <upf pod IP>:7480 to the AF.
+    # UPF's namespace hands <upf pod IP>:7480 to the AF. For this arm the FL
+    # listener is reachable from any pod in the cluster (cluster-internal, a
+    # temporary namespace, and the AF refuses every identity the NEF cannot
+    # resolve); no other arm has the rule.
     fl_env FL_DEVICE eth0
     fl_env FL_SERVER "${upf_ip}:7480"
     "${K[@]}" exec deploy/upf -c upf -- iptables -t nat -A PREROUTING -d "${upf_ip}" -p tcp --dport 7480 \
@@ -135,18 +138,21 @@ spec:
             except: [$("${K[@]}" get pod -l app.kubernetes.io/name=udm -o jsonpath='{.items[0].status.podIP}')/32]
 YAML
   fi
-  for n in $(seq 2 "${members}"); do "${K[@]}" scale "deploy/ue-${n}" --replicas=1 >/dev/null; done
   : >"${S}/ue-ips.txt"
-  for n in $(seq 1 "${members}"); do
-    local dep; dep="$(ue_dep "${n}")"
+  # UE n up: scaled (n > 1), its PDU session there, its address recorded.
+  ue_up() {
+    local n="$1" dep; dep="$(ue_dep "$1")"
+    (( n == 1 )) || "${K[@]}" scale "deploy/${dep}" --replicas=1 >/dev/null
     "${K[@]}" rollout status "deploy/${dep}" --timeout=300s >/dev/null || bad "${dep} rollout"
     wait_for 240 sh -c "[ -n \"\$(kubectl -n ${NAMESPACE} exec deploy/${dep} -c ue -- ip -4 -o addr show uesimtun0 2>/dev/null)\" ]" \
       || bad "${dep} has no PDU session (uesimtun0) within 240 s"
     echo "ue${n} $(tun_ip "${dep}")" >>"${S}/ue-ips.txt"
-  done
-  if [[ "${ARM}" == eth0 ]]; then
-    echo "eth0_ip=$("${K[@]}" get pod -l app.kubernetes.io/name=ue-2 -o jsonpath='{.items[0].status.podIP}')" >>"${S}/meta.txt"
-  fi
+    if [[ "${ARM}" == eth0 && "${n}" == 2 ]]; then
+      echo "eth0_ip=$("${K[@]}" get pod -l app.kubernetes.io/name=ue-2 -o jsonpath='{.items[0].status.podIP}')" >>"${S}/meta.txt"
+    fi
+  }
+  # ue1 (the base UE) is up before the AF; the others join one at a time after it.
+  ue_up 1
   say "UEs: $(tr '\n' ' ' <"${S}/ue-ips.txt")"
 
   # --- 2. the AF's CCA key, trusted at the NRF ----------------------------------
@@ -189,6 +195,24 @@ YAML
   echo "${start}" | "${K[@]}" exec -i deploy/upf -c fl-af -- sh -c 'cat >/tmp/d445a/start.tmp && mv /tmp/d445a/start.tmp /tmp/d445a/start' \
     || bad "AF start"
   say "AF started: ${start}"
+  # Serialised joins: UE n+1 starts only once UE n has joined (or been refused)
+  # and, for each member that subscribed, udmd has logged its leg (forwarded, or
+  # in udm-fallback its failure). udmd forwards legs asynchronously, so joins at
+  # once would interleave the legs and leave ue3's ambiguous (checks.py fails
+  # closed on that).
+  local legs_re='forwarded to AMF'
+  [[ "${ARM}" == udm-fallback ]] && legs_re='EE subscription [^ ]+: '
+  for n in $(seq 1 "${members}"); do
+    (( n == 1 )) || ue_up "${n}"
+    wait_for 240 af_has "(member_joined member=ue${n} |identity_unresolved member=ue${n} )" \
+      || bad "ue${n} neither joined nor was refused within 240 s"
+    local subscribed
+    subscribed="$(af_count 'member_joined member=ue[0-9]+ .* t8=subscribed ')"
+    if (( subscribed > 0 )); then
+      wait_for 180 sh -c "[ \$(kubectl -n ${NAMESPACE} logs deploy/udm -c udm | grep -cE '${legs_re}') -ge ${subscribed} ]" \
+        || bad "udmd logged fewer than ${subscribed} AMF legs ('${legs_re}') after ue${n}'s join"
+    fi
+  done
 
   case "${ARM}" in
     nat-on|eth0)
@@ -242,6 +266,10 @@ YAML
   "${K[@]}" exec deploy/upf -c fl-af -- cat /tmp/d445a/fl-dn.pcap >"${S}/fl-dn.pcap" 2>/dev/null || bad "pcap copy"
   "${K[@]}" exec deploy/upf -c fl-af -- cat /tmp/d445a/tcpdump.log >"${S}/tcpdump.log" 2>/dev/null
   aflog >"${S}/af.log"
+  # nr-fl-server's privileges, from its /proc status (checks.py af_unprivileged).
+  # shellcheck disable=SC2016  # expanded by the container's sh
+  "${K[@]}" exec deploy/upf -c fl-af -- sh -c 'for p in /proc/[0-9]*; do case "$(tr "\0" " " <"$p/cmdline" 2>/dev/null)" in nr-fl-server*) grep -E "^(Uid|Gid|CapPrm|CapEff|CapBnd|NoNewPrivs):" "$p/status"; break;; esac; done' \
+    >"${S}/af-status.txt" 2>/dev/null
   for nf in nef udm amf nrf; do "${K[@]}" logs "deploy/${nf}" -c "${nf}" --timestamps >"${S}/${nf}.log" 2>/dev/null; done
   for n in $(seq 1 "${members}"); do
     "${K[@]}" logs "deploy/$(ue_dep "${n}")" -c ue --timestamps >"${S}/ue-${n}.log" 2>/dev/null
@@ -348,7 +376,7 @@ d445a_gates() {
   # The UE's bogus mode at startup: a second, one-shot nr-ue on the same config
   # with mode bogus must fail with UnknownMode before it does anything.
   # shellcheck disable=SC2016  # expanded by the container's sh
-  r="$("${K[@]}" exec deploy/ue -c ue -- sh -c 'sed "s/mode: t8-exclusion/mode: bogus/" /etc/nextgsim/ue.yaml >/tmp/bogus.yaml; timeout 20 nr-ue -c /tmp/bogus.yaml; echo "rc=$?"' 2>&1)"
+  r="$("${K[@]}" exec deploy/ue -c ue -- sh -c 'sed "s/mode: t8-exclusion/mode: bogus/" /etc/nextgsim/ue.yaml >/tmp/bogus.yaml; grep -q "mode: bogus" /tmp/bogus.yaml || { echo rc=99; exit 0; }; timeout 20 nr-ue -c /tmp/bogus.yaml; echo "rc=$?"' 2>&1)"
   if grep -qiE 'unknown mode \\?"bogus\\?"|UnknownMode' <<<"${r}" && ! grep -qE 'rc=(0|124)$' <<<"${r}"; then
     gate PASS "nr-ue with mode bogus fails startup: $(grep -m1 -oiE 'unknown mode[^,]*|UnknownMode[^)]*' <<<"${r}"), $(grep -o 'rc=[0-9]*' <<<"${r}" | tail -1)"
   else gate FAIL "nr-ue bogus mode: $(tr '\n' ' ' <<<"${r}" | tail -c 300)"; fi
@@ -364,7 +392,7 @@ d445a_gates() {
   else gate FAIL "T8 port from ue1: ${upf_ip}:7481 rc=${c1}, 10.46.0.10:7481 rc=${c2}, 10.46.0.10:7480 rc=${c3} (want 28, 28, connected)"; fi
   # The AF's bogus mode fails startup with UnknownMode (a one-shot second process).
   # shellcheck disable=SC2016  # expanded by the container's sh
-  r="$("${K[@]}" exec deploy/upf -c fl-af -- sh -c 'sed "s/mode: t8-exclusion/mode: bogus/" /tmp/d445a/af.yaml >/tmp/d445a/bogus.yaml; chmod 0644 /tmp/d445a/bogus.yaml; ip netns exec fl-dn setpriv --reuid=65534 --regid=65534 --clear-groups --inh-caps=-all --bounding-set=-all --no-new-privs timeout 20 nr-fl-server -c /tmp/d445a/bogus.yaml; echo "rc=$?"' 2>&1)"
+  r="$("${K[@]}" exec deploy/upf -c fl-af -- sh -c 'sed "s/mode: t8-exclusion/mode: bogus/" /tmp/d445a/af.yaml >/tmp/d445a/bogus.yaml; grep -q "mode: bogus" /tmp/d445a/bogus.yaml || { echo rc=99; exit 0; }; chmod 0644 /tmp/d445a/bogus.yaml; ip netns exec fl-dn setpriv --reuid=65534 --regid=65534 --clear-groups --inh-caps=-all --bounding-set=-all --no-new-privs timeout 20 nr-fl-server -c /tmp/d445a/bogus.yaml; echo "rc=$?"' 2>&1)"
   if grep -q 'unknown mode "bogus" for demo "d445a-fl-t8"' <<<"${r}" && grep -q 'rc=1' <<<"${r}"; then
     gate PASS "AF with mode bogus: $(grep -o 'unknown mode "bogus" for demo "d445a-fl-t8"' <<<"${r}" | head -1), rc=1"
   else gate FAIL "AF bogus mode: $(tr '\n' ' ' <<<"${r}" | head -c 300)"; fi

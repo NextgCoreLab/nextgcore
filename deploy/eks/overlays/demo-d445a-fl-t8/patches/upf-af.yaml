@@ -17,6 +17,11 @@
   value:
     name: UPF_SESSION_METRICS
     value: seid-ue-ip
+# No service-account token in the pod: nothing in it calls the API server, and a
+# projected token is readable by the nobody AF.
+- op: add
+  path: /spec/template/spec/automountServiceAccountToken
+  value: false
 - op: add
   path: /spec/template/spec/containers/-
   value:
@@ -46,23 +51,30 @@
             fieldPath: status.podIP
       - name: RUST_LOG
         value: info
-    # Not privileged. The sidecar's root shell gets only what it uses:
+    # Not privileged: every capability dropped, then only what the sidecar's root
+    # shell uses:
     #   NET_ADMIN  veth, addresses, routes, iptables in the pod's network namespace;
     #   SYS_ADMIN  `ip netns add` / `ip netns exec` (unshare, the bind mount);
     #   NET_RAW    tcpdump on fl-up;
-    #   CHOWN, SETUID, SETGID  handing the key to nobody, and the drop to it
-    #              (setpriv; tcpdump -Z).
-    # Over the runtime's default set (deploy-eks.sh's validator refuses `drop:
-    # [ALL]` beside `add`), so these last four are listed for the record.
+    #   CHOWN      handing the AF's key to nobody;
+    #   SETUID, SETGID, SETPCAP  setpriv's drop to nobody and of the bounding set
+    #              (without SETPCAP `--bounding-set=-all` silently keeps it).
     # nr-fl-server itself, the one listener UEs reach, runs as nobody with no
-    # capabilities and no_new_privs (setpriv, sidecar.sh). Whether `ip netns add`
-    # works unprivileged on devtest1's nodes is a live-run question: if it fails,
-    # the fallback is privileged: true here, with the AF still dropped to nobody.
+    # capabilities, an empty bounding set and no_new_privs (setpriv, sidecar.sh);
+    # scenario.sh records its /proc status and checks.py asserts it.
+    # Whether `ip netns add` works unprivileged on devtest1's nodes is a live-run
+    # question. If it does not, the fallback is `privileged: true` on this
+    # container only, which ALSO means removing `allowPrivilegeEscalation: false`
+    # (the API server refuses the pair) and the capabilities block; the AF is
+    # still dropped to nobody by setpriv.
     securityContext:
       privileged: false
       allowPrivilegeEscalation: false
       runAsUser: 0
+      seccompProfile:
+        type: RuntimeDefault
       capabilities:
+        drop: [ALL]
         add:
           - NET_ADMIN
           - SYS_ADMIN
@@ -70,6 +82,7 @@
           - CHOWN
           - SETUID
           - SETGID
+          - SETPCAP
     resources:
       requests:
         cpu: 100m

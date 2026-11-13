@@ -330,6 +330,8 @@ services:
       - CHOWN
       - SETUID
       - SETGID
+      # setpriv --bounding-set=-all needs it, or it silently keeps the set.
+      - SETPCAP
     environment:
       RUST_LOG: info
       D445A_MODE: ${D445A_MODE:-t8-exclusion}

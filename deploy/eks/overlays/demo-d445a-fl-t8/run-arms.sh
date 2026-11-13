@@ -11,8 +11,8 @@
 # kubeconfig context KUBE_CONTEXT (default devtest1) that may deploy; python3
 # with `cryptography` and PyYAML; docker; the toolchains of both repos.
 #
-# 1. release binaries from CORE_SRC and SIM_SRC (TARGET_DIR, default
-#    /tmp/tgt-d445a; the revert-hooks builds are copied aside);
+# 1. release binaries from CORE_SRC and SIM_SRC (TARGET_DIR, default a fresh
+#    mktemp dir; cargo clean it afterwards; the revert-hooks builds are copied aside);
 # 2. build-images.sh (the tags come from the two trees' HEADs);
 # 3. every arm, one demo-check.sh run per hold of /tmp/eks-nextg-demo.lock;
 #    artefacts under /tmp/eks-val/demos/d445a-<arm>/. Default arms: all.
@@ -20,7 +20,10 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CORE_DIR="$(cd "${HERE}/../../../.." && pwd)"
 : "${CORE_SRC:?}" "${SIM_SRC:?}"
-T="${TARGET_DIR:-/tmp/tgt-d445a}"
+# A target dir of this run unless given: a shared one could be overwritten by
+# another builder between the build and build-images.sh.
+T="${TARGET_DIR:-$(mktemp -d -t tgt-d445a-XXXXXX)}"
+echo "run-arms: target dir ${T} (cargo clean it afterwards)"
 ARMS=("$@")
 [[ ${#ARMS[@]} -gt 0 ]] || ARMS=(off:off main:t8-exclusion poisoned:poisoned-ue probe:t8-exclusion
   gates:t8-exclusion no-t8:t8-exclusion freeze-global:t8-exclusion leak-raw:t8-exclusion
