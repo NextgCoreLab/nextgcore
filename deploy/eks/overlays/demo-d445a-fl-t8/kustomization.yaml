@@ -2,7 +2,8 @@
 # PDU sessions, with NEF T8 member exclusion. Over the demo-OFF base. Run with
 #   flock /tmp/eks-nextg-demo.lock k8s/demo-check.sh d445a-fl-t8 t8-exclusion
 #   flock /tmp/eks-nextg-demo.lock k8s/demo-check.sh d445a-fl-t8 poisoned-ue
-# and the extra arms of scenario.sh (D445A_ARM=...; its header lists them).
+# and the extra arms of scenario.sh (D445A_ARM=...; its header lists them), or all
+# of them, built and pushed first, with run-arms.sh.
 #
 #   nef.yaml            nefd (built with --features demo-d445a-fl-t8), its
 #                       ConfigMap nef-config (a toggle target) and Service.
