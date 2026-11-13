@@ -940,6 +940,19 @@ def self_test():
            edit('amf.log', '06:00:30.200Z', '06:00:28.000Z'), False, fails='chain')
     expect('the nefd T8 delivery before the Deregistration Accept', 'main',
            edit('nef.log', '06:00:31.300Z', '06:00:28.500Z'), False, fails='chain')
+    # With the round-4 bound gone, only the identity pin ties amfd's line to ue3's
+    # leg. The only 2xx is on ue2's leg and stamped past round 4, so the "no other
+    # leg" window cannot catch it either: it must still fail.
+    def ue2_leg_late(d):
+        _fixture(d)
+        p_ = os.path.join(d, 'amf.log')
+        t_ = open(p_).read()
+        old_ = '06:00:30.200Z 2026-11-13T06:00:00Z INFO x: Event notification delivered: sub=asub3'
+        assert old_ in t_, old_
+        open(p_, 'w').write(t_.replace(old_, '06:00:34.600Z 2026-11-13T06:00:00Z INFO x: '
+                                             'Event notification delivered: sub=asub2'))
+    o = expect("the only amfd 2xx is on ue2's leg, after round 4", 'main', ue2_leg_late, False, fails='chain')
+    assert "no amfd 2xx delivery on ue3's leg" in o, o
 
     # udmd's legs land asynchronously: Sub(ue1) fwd1 Sub(ue2) Sub(ue3) fwd2 fwd3.
     # ue3's leg cannot be told apart, so the chain FAILS closed, whichever leg

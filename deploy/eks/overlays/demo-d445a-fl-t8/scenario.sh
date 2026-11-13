@@ -319,7 +319,13 @@ d445a_gates() {
   local S="$1" keys="$2" K=(kubectl -n "${NAMESPACE}") ip1 nef_ip nrf
   local G="${S}/gates.txt"; : >"${G}"
   local HERE; HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  gate() { printf '%s %s\n' "$1" "$2" >>"${G}"; echo "[scenario] gate $1 $2"; }
+  # One row per gate, whatever the text: a newline inside it (grep -o printing
+  # several matches, a multi-line body) would make checks.py read the rest as
+  # a verdict-less row, which it FAILs.
+  gate() {
+    local t; t="$(tr '\n\r' '  ' <<<"$2")"; t="${t% }"
+    printf '%s %s\n' "$1" "${t}" >>"${G}"; echo "[scenario] gate $1 ${t}"
+  }
   ip1="$(awk '$1=="ue1"{print $2; exit}' "${S}/ue-ips.txt")"
   nrf="http://nrf.${NAMESPACE}.svc.cluster.local:7777"
   nef_ip="$("${K[@]}" get pod -l app.kubernetes.io/name=nef -o jsonpath='{.items[0].status.podIP}')"
@@ -407,7 +413,7 @@ d445a_gates() {
   # shellcheck disable=SC2016  # expanded by the container's sh
   r="$("${K[@]}" exec deploy/ue -c ue -- sh -c 'sed "s/mode: t8-exclusion/mode: bogus/" /etc/nextgsim/ue.yaml >/tmp/bogus.yaml; grep -q "mode: bogus" /tmp/bogus.yaml || { echo rc=99; exit 0; }; timeout 20 nr-ue -c /tmp/bogus.yaml; echo "rc=$?"' 2>&1)"
   if grep -qiE 'unknown mode \\?"bogus\\?"|UnknownMode' <<<"${r}" && ! grep -qE 'rc=(0|124)$' <<<"${r}"; then
-    gate PASS "nr-ue with mode bogus fails startup: $(grep -m1 -oiE 'unknown mode[^,]*|UnknownMode[^)]*' <<<"${r}"), $(grep -o 'rc=[0-9]*' <<<"${r}" | tail -1)"
+    gate PASS "nr-ue with mode bogus fails startup: $(grep -m1 -oiE 'unknown mode[^,]*|UnknownMode[^)]*' <<<"${r}" | head -1), $(grep -o 'rc=[0-9]*' <<<"${r}" | tail -1)"
   else gate FAIL "nr-ue bogus mode: $(tr '\n' ' ' <<<"${r}" | tail -c 300)"; fi
   # A UE cannot reach the AF's T8 listener (DNATed pod port or fl-dn address),
   # while the same UE does reach the FL listener: the denial is the FORWARD rule,
@@ -485,8 +491,8 @@ d445a_probe() {
     wait_for 240 af_has "hold before round=${hold1} until=member-excluded" || { ok=FAIL; why+=" no hold ${hold1};"; }
     # ue3's current membership carries a T8 subscription made after a UE ID lookup.
     # Not "(A|B) " - that trailing space requires a space after `gpsi=`,
-  # which never happens (`gpsi=extid-ue003@fl.nextg`). Match either line as-is.
-  local j; j="$(aflog | grep -E "member_joined member=ue3 gpsi=|member_selection readmitted=extid-ue003@fl\.nextg member=ue3" | tail -1)"
+    # which never happens (`gpsi=extid-ue003@fl.nextg`). Match either line as-is.
+    local j; j="$(aflog | grep -E "member_joined member=ue3 gpsi=|member_selection readmitted=extid-ue003@fl\.nextg member=ue3" | tail -1)"
     grep -q 'gpsi=extid-ue003@fl.nextg\|readmitted=extid-ue003@fl.nextg' <<<"${j}" || { ok=FAIL; why+=" ue3 not resolved to extid-ue003@fl.nextg;"; }
     grep -q 't8=subscribed ' <<<"${j}" || { ok=FAIL; why+=" no T8 subscription;"; }
     wait_for 120 sh -c "[ \$(kubectl -n ${NAMESPACE} logs deploy/udm -c udm | grep -c 'forwarded to AMF') -ge $((2 + i)) ]" \

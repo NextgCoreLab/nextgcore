@@ -169,8 +169,10 @@ for pod in $("${K[@]}" get pods -o jsonpath='{.items[*].metadata.name}' 2>/dev/n
     "${K[@]}" logs "${pod}" -c "${c}" --timestamps 2>/dev/null | scrub >"${OUT}/logs/${pod}_${c}.log"
     [[ -s "${OUT}/logs/${pod}_${c}.log" ]] || rm -f "${OUT}/logs/${pod}_${c}.log"
   done
-  if "${K[@]}" get pod "${pod}" -o jsonpath='{.spec.containers[0].ports[*].containerPort}' 2>/dev/null \
-      | tr ' ' '\n' | grep -qx 9090; then
+  # Captured, not piped into grep -q: under pipefail a producer that exits
+  # non-zero (or takes SIGPIPE) would turn a match into a miss.
+  ports="$("${K[@]}" get pod "${pod}" -o jsonpath='{.spec.containers[0].ports[*].containerPort}' 2>/dev/null || true)"
+  if grep -qx 9090 <<<"${ports// /$'\n'}"; then
     ip="$("${K[@]}" get pod "${pod}" -o jsonpath='{.status.podIP}')"
     c0="$("${K[@]}" get pod "${pod}" -o jsonpath='{.spec.containers[0].name}')"
     "${K[@]}" exec "${pod}" -c "${c0}" -- sh -c \
