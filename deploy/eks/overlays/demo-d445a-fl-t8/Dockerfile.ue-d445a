@@ -1,0 +1,27 @@
+# The demo d445a-fl-t8 UE image (nextgsim#480), built by build-images.sh. It is
+# nextgsim's Dockerfile.ue-local (same pinned base) plus what the demo needs:
+#   nr-ue                       --features demo-d445a-fl-t8 (the FL client)
+#   nr-ue-revert-hooks          --features revert-hooks (the leak-raw arm only)
+#   nr-cli, nr-ue-deregister    fl-status, demo set mode=, deregistration
+#   nr-fl-server                the AF (--features demo-d445a-fl-t8)
+#   nr-fl-server-revert-hooks   --features revert-hooks (--no-t8, --freeze-global)
+#   iptables, tcpdump           the upf-pod sidecar's fl-dn and its pcap
+# Demo image for devtest1 only, never published.
+FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    iputils-ping \
+    iproute2 \
+    iptables \
+    tcpdump \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY nr-ue nr-ue-revert-hooks nr-cli nr-fl-server nr-fl-server-revert-hooks /usr/local/bin/
+COPY nr-ue-deregister.sh /usr/local/bin/nr-ue-deregister
+
+RUN mkdir -p /etc/nextgsim
+WORKDIR /etc/nextgsim
+ENV RUST_LOG=info
+ENTRYPOINT ["nr-ue"]
+CMD ["-c", "/etc/nextgsim/ue.yaml"]

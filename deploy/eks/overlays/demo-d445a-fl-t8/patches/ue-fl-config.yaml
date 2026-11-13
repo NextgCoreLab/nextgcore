@@ -1,0 +1,24 @@
+# The base UE (imsi-...001) is FL member 1 (nextgsim#480). Appended (JSON
+# patch `/-`), so it runs AFTER resolve-dns, which writes the final
+# /etc/nextgsim/ue.yaml (the d444a precedent).
+- op: add
+  path: /spec/template/spec/initContainers/-
+  value:
+    name: d445a-fl-config
+    image: busybox:1.36
+    command: ["sh", "/d445a/fl-config.sh", "/etc/nextgsim/ue.yaml"]
+    env:
+      - name: FL_MEMBER
+        value: "1"
+    volumeMounts:
+      - name: config-resolved
+        mountPath: /etc/nextgsim
+      - name: d445a-ue-fl
+        mountPath: /d445a
+        readOnly: true
+- op: add
+  path: /spec/template/spec/volumes/-
+  value:
+    name: d445a-ue-fl
+    configMap:
+      name: d445a-ue-fl

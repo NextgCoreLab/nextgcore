@@ -1,0 +1,24 @@
+# The NRF of the D445A compose stack (nextgsim#480): configs/5gc/nrf.yaml plus
+# the CCA trusted-key directory the AF publishes its public JWK into (the
+# d445a-cca volume), so the AF gets NRF tokens as an nfType AF consumer. The NRF
+# re-reads the directory on an unknown issuer (#187).
+logger:
+  file:
+    path: /var/log/nextgcore/nrf.log
+  level: info
+global:
+  max:
+    ue: 1024
+    peer: 64
+nrf:
+  serving:
+    - plmn_id:
+        mcc: 999
+        mnc: 70
+  sbi:
+    server:
+      - address: 0.0.0.0
+        advertise: 172.23.0.10
+        port: 7777
+    oauth2:
+      cca_trusted_keys_dir: /etc/nextgcore/cca-trusted

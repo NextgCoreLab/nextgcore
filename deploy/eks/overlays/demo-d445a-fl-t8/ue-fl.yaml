@@ -1,0 +1,48 @@
+# The UEs' FL client config (nextgsim#480). fl-config.sh appends, to the UE's
+# final ue.yaml (the base ConfigMap's, with the demo: block the toggles merged
+# in), `federated_learning_enabled: true` and an `fl:` block for member
+# $FL_MEMBER:
+#   server   10.46.0.10:7480, the AF on fl-dn, reached through the PDU session;
+#   device   the session's TUN (uesimtun0), so the socket rides the session;
+#   clients  3 in t8-exclusion, 5 in poisoned-ue (read from the demo block);
+#   leak_raw only when $FL_LEAK_RAW=true (the leak-raw revert arm; a
+#            revert-hooks nr-ue refuses it otherwise).
+# A template that already sets either key fails here rather than run with two.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: d445a-ue-fl
+  labels:
+    app.kubernetes.io/part-of: nextgsim
+data:
+  fl-config.sh: |
+    set -eu
+    src="$1"; f=/etc/nextgsim/ue.yaml
+    [ "$src" = "$f" ] || cp "$src" "$f"
+    : "${FL_MEMBER:?}"
+    if grep -qE '^(federated_learning_enabled|fl):' "$f"; then
+      echo "[d445a-fl-config] FATAL: $f already sets federated_learning_enabled/fl" >&2
+      exit 1
+    fi
+    mode="$(sed -nE '/^demo:/,$ s/^    mode: *([a-z0-9-]+).*/\1/p' "$f" | head -1)"
+    case "$mode" in
+      t8-exclusion) clients=3 ;;
+      poisoned-ue) clients=5 ;;
+      *) echo "[d445a-fl-config] FATAL: demo mode '$mode' unknown here" >&2; exit 1 ;;
+    esac
+    prefix="$(sed -nE 's/^tun_name:[[:space:]]*"?([^"[:space:]]+)"?.*/\1/p' "$f")"
+    cat >>"$f" <<YAML
+
+    # d445a-fl-t8 (nextgsim#480)
+    federated_learning_enabled: true
+    fl:
+      server: 10.46.0.10:7480
+      device: ${prefix:-uesimtun}0
+      member: ${FL_MEMBER}
+      clients: ${clients}
+      seed: 480
+    YAML
+    if [ "${FL_LEAK_RAW:-false}" = true ]; then
+      echo "  leak_raw: true" >>"$f"
+    fi
+    grep -nE '^(federated_learning_enabled|fl:|demo:)' -A7 "$f"

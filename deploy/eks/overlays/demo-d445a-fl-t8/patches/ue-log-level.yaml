@@ -1,0 +1,16 @@
+# The UE at info, without the per-packet nr_ue and per-SIB nextgsim_ue::rrc
+# lines (the d441a/d444a precedent): kubelet rotation would otherwise take the
+# asserted lines out of `kubectl logs`. Every asserted UE line is nextgsim_demo
+# or nextgsim_ue::nas, info or warn.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ue
+spec:
+  template:
+    spec:
+      containers:
+        - name: ue
+          env:
+            - name: RUST_LOG
+              value: info,nr_ue=warn,nextgsim_ue::rrc=warn

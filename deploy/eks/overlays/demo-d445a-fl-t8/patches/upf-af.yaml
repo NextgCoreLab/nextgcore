@@ -1,0 +1,63 @@
+# The AF and fl-dn in the upf pod (nextgsim#480; af.yaml says why). Appended
+# (JSON patch `/-`) so the UPF stays containers[0], which deploy-eks.sh's
+# data-plane swap and demo-check.sh's /metrics scrape address by index.
+#
+# The UPF itself gets two settings, both from #1455 and both off by default:
+#   UPF_NAT_EXCLUDE=10.46.0.0/24   no source NAT toward fl-dn, so the AF sees
+#                                  the UE's 10.45.0.0/16 address;
+#   UPF_SESSION_METRICS=seid-ue-ip upf_session_{ul,dl}_bytes_total{seid,ue_ipv4}
+#                                  on /metrics, for the per-session UL check.
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: UPF_NAT_EXCLUDE
+    value: 10.46.0.0/24
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: UPF_SESSION_METRICS
+    value: seid-ue-ip
+- op: add
+  path: /spec/template/spec/containers/-
+  value:
+    name: fl-af
+    # The demo UE image (build-images.sh): nr-fl-server, its revert-hooks
+    # build, iproute2, iptables and tcpdump. deploy-eks.sh rewrites the name.
+    image: nextgsim-ue:latest
+    imagePullPolicy: IfNotPresent
+    command:
+      - sh
+      - -c
+      - printf '%s\n' "${D445A_SIDECAR_SH}" >/tmp/d445a-sidecar.sh && exec sh /tmp/d445a-sidecar.sh
+    env:
+      - name: D445A_SIDECAR_SH
+        valueFrom:
+          configMapKeyRef:
+            name: d445a-af
+            key: sidecar.sh
+      - name: D445A_AF_YAML
+        valueFrom:
+          configMapKeyRef:
+            name: d445a-af
+            key: af.yaml
+      - name: POD_IP
+        valueFrom:
+          fieldRef:
+            fieldPath: status.podIP
+      - name: RUST_LOG
+        value: info
+    # ip netns, veth and iptables in the pod's network namespace.
+    securityContext:
+      privileged: true
+      runAsUser: 0
+      capabilities:
+        add:
+          - NET_ADMIN
+          - SYS_ADMIN
+    resources:
+      requests:
+        cpu: 100m
+        memory: 64Mi
+      limits:
+        cpu: 1000m
+        memory: 256Mi

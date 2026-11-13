@@ -1,0 +1,21 @@
+# Mounts d445a-cca-trusted (nrf-cca.yaml) at the directory core-configs.yaml
+# names in nrf.sbi.oauth2.cca_trusted_keys_dir (nextgsim#480).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nrf
+  namespace: nextg-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: nrf
+          volumeMounts:
+            - name: cca-trusted
+              mountPath: /etc/nextgcore/cca-trusted
+              readOnly: true
+      volumes:
+        - name: cca-trusted
+          configMap:
+            name: d445a-cca-trusted
+            optional: true
