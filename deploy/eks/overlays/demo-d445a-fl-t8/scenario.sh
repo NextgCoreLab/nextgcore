@@ -272,6 +272,14 @@ YAML
   esac
 
   # --- 4. captures ------------------------------------------------------------------
+  if [[ "${ARM}" == nefd-down ]]; then
+    # nef was scaled back to 1 after the power cycle: its log must exist before
+    # the captures read it.
+    "${K[@]}" rollout status deploy/nef --timeout=180s >/dev/null || bad "nef did not come back"
+  fi
+  # The pcap's window is [after the first scrape, before the last]: a packet in
+  # it is in both the pcap and the counter delta (checks.py counts only those).
+  d445a_now_epoch >"${S}/metrics-after.ts"
   "${K[@]}" exec deploy/upf -c upf -- sh -c 'curl -s --max-time 5 http://127.0.0.1:9090/metrics' >"${S}/metrics-after.prom" 2>/dev/null
   sleep 2   # tcpdump -U has flushed; the pcap is read while it still runs
   "${K[@]}" exec deploy/upf -c fl-af -- cat /tmp/d445a/fl-dn.pcap >"${S}/fl-dn.pcap" 2>/dev/null || bad "pcap copy"
@@ -281,13 +289,14 @@ YAML
   # shellcheck disable=SC2016  # expanded by the container's sh
   "${K[@]}" exec deploy/upf -c fl-af -- sh -c 'for p in /proc/[0-9]*; do case "$(tr "\0" " " <"$p/cmdline" 2>/dev/null)" in nr-fl-server*) grep -E "^(Uid|Gid|CapPrm|CapEff|CapBnd|NoNewPrivs):" "$p/status"; break;; esac; done' \
     >"${S}/af-status.txt" 2>/dev/null
-  for nf in nef udm amf nrf; do "${K[@]}" logs "deploy/${nf}" -c "${nf}" --timestamps >"${S}/${nf}.log" 2>/dev/null; done
+  # upf: its `Session added/removed` lines tie each pcap packet to its PDU session.
+  for nf in nef udm amf nrf upf; do "${K[@]}" logs "deploy/${nf}" -c "${nf}" --timestamps >"${S}/${nf}.log" 2>/dev/null; done
   for n in $(seq 1 "${members}"); do
     "${K[@]}" logs "deploy/$(ue_dep "${n}")" -c ue --timestamps >"${S}/ue-${n}.log" 2>/dev/null
   done
   "${K[@]}" exec deploy/nef -c nef -- sh -c 'curl -s --max-time 5 http://127.0.0.1:9090/metrics' >"${S}/nef-metrics.prom" 2>/dev/null
   # A capture a check needs must not be empty (an empty log reads as "no such line").
-  for f in af.log nef.log udm.log amf.log; do [[ -s "${S}/${f}" ]] || bad "empty capture ${f}"; done
+  for f in af.log nef.log udm.log amf.log upf.log; do [[ -s "${S}/${f}" ]] || bad "empty capture ${f}"; done
   grep -E '\[demo:d445a-fl-t8\] (member_|round=|scorecard|robustness|hold |straggler|all arms|identity_|frame_refused|T8 )' \
     "${S}/af.log" >"${S}/af-chain.txt"
 

@@ -241,6 +241,9 @@ def check_chain(r, d, deadline_ms):
     if t_acc is None:
         return fail('no amfd "Deregistration Accept sent to UE" after the hold')
     fwd, leg, why = ue3_legs(udm, t_acc)
+    # Distinct EE ids, so a re-forward (an AMF change) is not a second leg. With 3
+    # members the exact tie below fails on the same inputs, so this guard is not
+    # separately pinned by a self-test; it names the failure.
     legs = {x[2].group(1) for x in fwd}
     if len(legs) < 3:
         return fail(f'{len(legs)} distinct udmd LoC leg(s) forwarded to AMF before the Deregistration Accept, need 3')
@@ -413,7 +416,12 @@ FIN, RST = 0x01, 0x04
 def check_no_fin(r, d):
     """ue3's first FL connection is never closed from the UE side: after the
     deregistration and the power cycle no user plane is left to carry a FIN or
-    RST. The pcap must show that connection carrying data first."""
+    RST. The pcap must show that connection carrying data first.
+
+    Only UE-side FIN/RST BEFORE the AF's own close (FIN or RST from the AF) on that
+    4-tuple count. smfd hands ue3 the same address back (lowest free), so the AF's
+    FIN on readmission reaches ue3's NEW pod, whose kernel answers it with an RST
+    from the old 4-tuple: an answer to the AF's close, not the UE closing."""
     pk = read_pcap(os.path.join(d, 'fl-dn.pcap'))
     if pk is None:
         return r.add('no_fin', False, 'no fl-dn.pcap')
@@ -424,11 +432,16 @@ def check_no_fin(r, d):
     conn = [p for p in pk if p[1] == ip and p[2] == port and p[3] == AF_IP and p[4] == AF_PORT]
     if not conn:
         return r.add('no_fin', False, f'no packet of ue3 {ip}:{port} in the pcap (capture empty?)')
+    af_close = [p[0] for p in pk if p[1] == AF_IP and p[2] == AF_PORT and p[3] == ip and p[4] == port
+                and p[5] & (FIN | RST)]
+    cut = min(af_close) if af_close else None
     data = [p for p in conn if p[6] > 52]
-    closes = [p for p in conn if p[5] & (FIN | RST)]
+    closes = [p for p in conn if p[5] & (FIN | RST) and (cut is None or p[0] < cut)]
+    answers = [p for p in conn if p[5] & (FIN | RST) and cut is not None and p[0] >= cut]
     ok = bool(data) and not closes
     return r.add('no_fin', ok, f'ue3 {ip}:{port} -> {AF_IP}:{AF_PORT}: {len(conn)} segments '
-                               f'({len(data)} with data), {len(closes)} FIN/RST from the UE; '
+                               f'({len(data)} with data), {len(closes)} FIN/RST from the UE before the AF\'s '
+                               f'close ({"none" if cut is None else "seen"}; {len(answers)} after it, ignored); '
                                f'{len(pk)} segments in the pcap')
 
 
@@ -447,44 +460,76 @@ def ul_series(path):
     return out
 
 
+SESSION_ADD = re.compile(r'Session added: SEID=(0x[0-9a-f]+), .*UE_IP=Some\(([\d.]+)\)')
+SESSION_DEL = re.compile(r'Session removed: SEID=(0x[0-9a-f]+)')
+
+
+def upf_sessions(d):
+    """[(seid, ue_ipv4, t_added, t_removed or None)] from upfd's own lines."""
+    out, by = [], {}
+    for t, m in load(d, 'upf.log'):
+        x = SESSION_ADD.search(m)
+        if x:
+            by[x.group(1)] = len(out)
+            out.append([x.group(1), x.group(2), t, None])
+            continue
+        x = SESSION_DEL.search(m)
+        if x and x.group(1) in by:
+            out[by[x.group(1)]][3] = t
+    return [tuple(x) for x in out]
+
+
 def check_ul_delta(r, d):
-    """Per session: the UPF's UL byte delta over the run is at least the bytes the
-    fl-dn pcap saw from that UE address to the AF in the same window."""
+    """Per PDU session: the UPF's UL byte delta over the run is at least the bytes
+    the fl-dn pcap saw that session carry to the AF. Each packet goes to the
+    session that owned its source address at that moment (upfd's `Session added`
+    / `Session removed` lines, on the UPF pod's clock like the pcap), not to the
+    address alone: smfd reuses addresses (ue3 comes back on the same one).
+    Packets count between the two scrapes (metrics-before.ts, metrics-after.ts)."""
     before = ul_series(os.path.join(d, 'metrics-before.prom'))
     after = ul_series(os.path.join(d, 'metrics-after.prom'))
     pk = read_pcap(os.path.join(d, 'fl-dn.pcap'))
-    tsf = os.path.join(d, 'metrics-before.ts')
-    if before is None or after is None or pk is None or not os.path.exists(tsf):
-        return r.add('ul_delta', False, 'missing metrics or pcap capture')
-    t0 = int(round(float(open(tsf).read().strip()) * 1e9))
+    ts0, ts1 = (os.path.join(d, f'metrics-{w}.ts') for w in ('before', 'after'))
+    if before is None or after is None or pk is None or not os.path.exists(ts0) or not os.path.exists(ts1):
+        return r.add('ul_delta', False, 'missing metrics, their timestamps, or the pcap')
+    t0, t1 = (int(round(float(open(f).read().strip()) * 1e9)) for f in (ts0, ts1))
     if not after:
         return r.add('ul_delta', False, 'no upf_session_ul_bytes_total series (UPF_SESSION_METRICS off?)')
-    sent = {}
+    sess = upf_sessions(d)
+    if not sess:
+        return r.add('ul_delta', False, 'no upfd "Session added" lines (upf.log)')
+    sent, orphan = {}, {}
     for t, src, _, dst, dport, _, tot in pk:
-        if t >= t0 and dst == AF_IP and dport == AF_PORT:
-            sent[src] = sent.get(src, 0) + tot
+        if not (t0 <= t <= t1 and dst == AF_IP and dport == AF_PORT):
+            continue
+        owner = [s_ for s_ in sess if s_[1] == src and s_[2] <= t and (s_[3] is None or t < s_[3])]
+        if owner:
+            key = (owner[-1][0], src)
+            sent[key] = sent.get(key, 0) + tot
+        else:
+            orphan[src] = orphan.get(src, 0) + tot
     bad, ev = [], []
     members = {ip for ips in ue_ips(d).values() for ip in ips}
-    covered = set()
-    for (seid, ip), v in sorted(after.items(), key=lambda kv: kv[0][1] or ''):
-        delta = v - before.get((seid, ip), 0)
-        b = sent.get(ip, 0)
-        if ip in members:
-            covered.add(ip)
-        ev.append(f'{ip} seid={seid} UL+{delta} >= AF {b}')
-        if delta < b:
-            bad.append(f'{ip} seid={seid}: UL delta {delta} < {b} bytes to the AF')
-    unseen = [ip for ip in sent if ip not in {k[1] for k in after}]
-    for ip in unseen:
-        if ip in members and ipaddress.ip_address(ip) in UE_NET:
-            # A session released during the run has no series at the end (ue3's first).
-            ev.append(f'{ip} released before the last scrape ({sent[ip]} bytes to the AF)')
+    after_by_seid = {k[0]: (k[1], v) for k, v in after.items()}
+    before_by_seid = {k[0]: v for k, v in before.items()}
+    for (seid, ip), b in sorted(sent.items(), key=lambda kv: (kv[0][1], kv[0][0])):
+        if seid in after_by_seid:
+            delta = after_by_seid[seid][1] - before_by_seid.get(seid, 0)
+            ev.append(f'{ip} seid={seid} UL+{delta} >= AF {b}')
+            if delta < b:
+                bad.append(f'{ip} seid={seid}: UL delta {delta} < {b} bytes to the AF')
         else:
-            bad.append(f'{sent[ip]} bytes reached the AF from {ip}, which has no PDU session')
+            removed = any(s_[0] == seid and s_[3] is not None and s_[3] <= t1 for s_ in sess)
+            if removed:
+                ev.append(f'{ip} seid={seid} released before the last scrape ({b} bytes to the AF)')
+            else:
+                bad.append(f'{ip} seid={seid}: live per upfd, but no series in the last scrape')
+    for ip, b in orphan.items():
+        bad.append(f'{b} bytes reached the AF from {ip}, which has no PDU session')
     for ip in members:
-        if ip not in sent:
+        if not any(k[1] == ip for k in sent):
             bad.append(f'member address {ip} sent nothing to the AF in the pcap')
-    if not covered:
+    if not any(k[1] in members for k in after):
         bad.append('no member session in the UPF metrics')
     return r.add('ul_delta', not bad, '; '.join(bad) if bad else '; '.join(ev))
 
@@ -654,7 +699,7 @@ def _fixture(d, af=None, nef=None, udm=None, amf=None, extra=None):
           (31, f'{P}member_selection excluded={gpsi(3)} member=ue3 reason=nef_event lossOfConnectReason=DEREGISTERED subscription={loc(3)}'),
           (32, f'{P}round=4 arm=1 rule=fedavg participants=2 selected=ue1,ue2 excluded={gpsi(3)}(ue3)'),
           (33, f'{P}round=4 done arm=1 rule=fedavg updates=2 from=ue1,ue2 dur_ms=12 mse=0.5'),
-          (40, f'{P}member_selection readmitted={gpsi(3)} member=ue3 peer=10.45.0.9:45000 t8=subscribed {loc(9)}')]
+          (40, f'{P}member_selection readmitted={gpsi(3)} member=ue3 peer=10.45.0.4:45000 t8=subscribed {loc(9)}')]
     A += [(41 + k, f'{P}round={k} arm=1 rule=fedavg participants=3 selected=ue1,ue2,ue3 excluded=-') for k in (7, 8, 9, 10)]
     A += [(60, f'{P}scorecard rule=fedavg seed=480 rounds=10 r1_mse=1 last_mse=0.2 local_only_mse=0.4 pooled_mse=0.19 '
                'last/r1=0.184 last/local=0.465 last/pooled=1.069 oracle_bit_identical=true'),
@@ -672,49 +717,70 @@ def _fixture(d, af=None, nef=None, udm=None, amf=None, extra=None):
         with open(os.path.join(d, name), 'w') as f:
             for s, line in rows:
                 f.write(f'{st(s)} 2026-11-13T06:00:00Z INFO x: {line}\n')
+    # As the real system does it: smfd allocates the lowest free address, so ue3
+    # gets 10.45.0.4 back after its release; only ue1's session exists at the first
+    # scrape (UEs 2-3 join one at a time after the AF starts).
     with open(os.path.join(d, 'ue-ips.txt'), 'w') as f:
-        f.write('ue1 10.45.0.2\nue2 10.45.0.3\nue3 10.45.0.4\nue3 10.45.0.9\n')
+        f.write('ue1 10.45.0.2\nue2 10.45.0.3\nue3 10.45.0.4\nue3 10.45.0.4\n')
     with open(os.path.join(d, 'meta.txt'), 'w') as f:
         f.write('deadline_ms=30000\nmembers=3\nrounds=10\n')
     with open(os.path.join(d, 'af-status.txt'), 'w') as f:
         f.write('Uid:\t65534\t65534\t65534\t65534\nGid:\t65534\t65534\t65534\t65534\nCapPrm:\t0000000000000000\n'
                 'CapEff:\t0000000000000000\nCapBnd:\t0000000000000000\nNoNewPrivs:\t1\n')
-    # pcap: ue3's first connection carries data and never closes; every member
-    # sends to the AF after the first scrape (t = 06:00:05).
+    # upfd's session lines: ue1 before the AF, ue2 and ue3 after, ue3's first
+    # removed at its deregistration (29.5), its second on the same address at 38.
+    upf = [(0, '0x1', '10.45.0.2'), (2, '0x2', '10.45.0.3'), (3, '0x3', '10.45.0.4'), (38, '0x4', '10.45.0.4')]
+    with open(os.path.join(d, 'upf.log'), 'w') as f:
+        for s_, seid, ip in upf:
+            f.write(f'{st(s_)} [INFO nextgcore_upfd::data_plane] Session added: SEID={seid}, UL_TEID=0x1, '
+                    f'DL_TEID=0x1, UE_IP=Some({ip}), gNB=10.0.0.1:2152\n')
+            if seid == '0x3':
+                f.write('2026-11-13T06:00:29.500Z [INFO nextgcore_upfd::data_plane] Session removed: SEID=0x3\n')
+    # pcap: every member sends to the AF after the first scrape (06:00:05) and
+    # before the last (06:01:10). ue3's first connection carries data and never
+    # closes from the UE; on readmission (40) the AF closes it, and ue3's new pod,
+    # now on that address, answers the AF's FIN with an RST from the old 4-tuple.
     t0 = ns('2026-11-13T06:00:05Z') / 1e9
     with open(os.path.join(d, 'metrics-before.ts'), 'w') as f:
         f.write(f'{t0:.6f}\n')
+    with open(os.path.join(d, 'metrics-after.ts'), 'w') as f:
+        f.write(f'{ns("2026-11-13T06:01:10Z") / 1e9:.6f}\n')
     pkts = []
-    for n, ip, port in ((1, '10.45.0.2', 41000), (2, '10.45.0.3', 42000), (3, '10.45.0.4', 43000),
-                        (3, '10.45.0.9', 45000)):
-        pkts.append((t0 + 1 + n, ip, port, 0x18, 1040))
-        pkts.append((t0 + 2 + n, ip, port, 0x10, 52))
+    for sec, ip, port in ((6, '10.45.0.2', 41000), (7, '10.45.0.3', 42000), (8, '10.45.0.4', 43000),
+                          (41, '10.45.0.4', 45000)):
+        pkts.append((t0 + sec - 5, ip, port, 0x18, 1040))
+        pkts.append((t0 + sec - 4, ip, port, 0x10, 52))
+    pkts.append((t0 + 35.0, AF_IP, AF_PORT, '10.45.0.4', 43000, 0x11, 52))   # the AF's FIN, at 40
+    pkts.append((t0 + 35.1, '10.45.0.4', 43000, 0x04, 40))                  # the new pod's RST
     for e in (extra or []):
         pkts.append(e)
     _pcap(os.path.join(d, 'fl-dn.pcap'), pkts)
     with open(os.path.join(d, 'metrics-before.prom'), 'w') as f:
-        f.write('upf_session_ul_bytes_total{seid="0x1",ue_ipv4="10.45.0.2"} 100\n'
-                'upf_session_ul_bytes_total{seid="0x2",ue_ipv4="10.45.0.3"} 100\n'
-                'upf_session_ul_bytes_total{seid="0x3",ue_ipv4="10.45.0.4"} 100\n')
+        f.write('upf_session_ul_bytes_total{seid="0x1",ue_ipv4="10.45.0.2"} 100\n')
     with open(os.path.join(d, 'metrics-after.prom'), 'w') as f:
         f.write('# HELP x\nupf_session_ul_bytes_total{seid="0x1",ue_ipv4="10.45.0.2"} 5000\n'
                 'upf_session_ul_bytes_total{seid="0x2",ue_ipv4="10.45.0.3"} 5000\n'
-                'upf_session_ul_bytes_total{seid="0x4",ue_ipv4="10.45.0.9"} 2000\n')
+                'upf_session_ul_bytes_total{seid="0x4",ue_ipv4="10.45.0.4"} 2000\n')
 
 
 def _pcap(path, pkts):
     with open(path, 'wb') as f:
         f.write(struct.pack('<IHHiIII', 0xa1b2c3d4, 2, 4, 0, 0, 262144, 1))
-        for t, ip, port, flags, tot in pkts:
+        for pkt in pkts:
+            if len(pkt) == 5:
+                t, ip, port, flags, tot = pkt
+                src, sport, dst, dport = ip, port, AF_IP, AF_PORT
+            else:
+                t, src, sport, dst, dport, flags, tot = pkt
             iph = struct.pack('>BBHHHBBH4s4s', 0x45, 0, tot, 0, 0, 64, 6, 0,
-                              bytes(map(int, ip.split('.'))), bytes(map(int, AF_IP.split('.'))))
-            tcp = struct.pack('>HHIIBBHHH', port, AF_PORT, 0, 0, 0x50, flags, 0, 0, 0)
+                              bytes(map(int, src.split('.'))), bytes(map(int, dst.split('.'))))
+            tcp = struct.pack('>HHIIBBHHH', sport, dport, 0, 0, 0x50, flags, 0, 0, 0)
             frame = b'\0' * 12 + b'\x08\x00' + iph + tcp
             f.write(struct.pack('<IIII', int(t), int((t - int(t)) * 1e6), len(frame), len(frame)))
             f.write(frame)
 
 
-MAIN_FAILS = {'no udmd forwarded lines': 'chain', 'only two forwarded lines': 'chain', 'no Deregistration Accept': 'chain', 'the amfd delivery is not 2xx': 'chain', 'the amfd delivery names an unknown subscription': 'chain', 'no nefd T8 delivery': 'chain', 'nefd delivered another subscription': 'chain', 'nefd delivered no reason': 'chain', 'no AF exclusion': 'chain', 'the exclusion carries no reason': 'chain', 'round 4 at participants=3': 'chain', 'round 4 too slow': 'chain', 'ue3 resolved to another GPSI': 'sources', 'a source outside 10.45.0.0/16': 'sources', 'a member never joined': 'sources', 'scorecard over 0.5x round 1': 'scorecard', 'oracle not bit-identical': 'scorecard', 'no readmission': 'readmission', 'round 9 at participants=2': 'readmission', 'a canary row': 'canary', 'a FIN from ue3': 'no_fin', 'an RST from ue3': 'no_fin', 'UL delta below the AF bytes': 'ul_delta', 'no per-session series': 'ul_delta', "the amfd delivery on another member's leg": 'chain', 'a second amfd delivery on another leg': 'chain', 'no udmd EE Subscribe for ue3': 'chain', 'the exclusion before the Deregistration Accept': 'chain', 'round 4 before the exclusion': 'chain', 'the scorecard ran 5 rounds': 'scorecard', 'bytes to the AF from an address with no session': 'ul_delta', 'the AF kept its bounding set': 'af_unprivileged', 'the AF ran as root': 'af_unprivileged', 'no AF status captured': 'af_unprivileged', 'three forwarded lines but two legs (a re-forward)': 'chain'}
+MAIN_FAILS = {'no udmd forwarded lines': 'chain', 'only two forwarded lines': 'chain', 'no Deregistration Accept': 'chain', 'the amfd delivery is not 2xx': 'chain', 'the amfd delivery names an unknown subscription': 'chain', 'no nefd T8 delivery': 'chain', 'nefd delivered another subscription': 'chain', 'nefd delivered no reason': 'chain', 'no AF exclusion': 'chain', 'the exclusion carries no reason': 'chain', 'round 4 at participants=3': 'chain', 'round 4 too slow': 'chain', 'ue3 resolved to another GPSI': 'sources', 'a source outside 10.45.0.0/16': 'sources', 'a member never joined': 'sources', 'scorecard over 0.5x round 1': 'scorecard', 'oracle not bit-identical': 'scorecard', 'no readmission': 'readmission', 'round 9 at participants=2': 'readmission', 'a canary row': 'canary', 'a FIN from ue3': 'no_fin', 'an RST from ue3 before the AF closed': 'no_fin', 'UL delta below the AF bytes': 'ul_delta', 'no per-session series': 'ul_delta', "the amfd delivery on another member's leg": 'chain', 'a second amfd delivery on another leg': 'chain', 'no udmd EE Subscribe for ue3': 'chain', 'the exclusion before the Deregistration Accept': 'chain', 'round 4 before the exclusion': 'chain', 'the scorecard ran 5 rounds': 'scorecard', 'bytes to the AF from an address with no session': 'ul_delta', 'the AF kept its bounding set': 'af_unprivileged', 'the AF ran as root': 'af_unprivileged', 'no AF status captured': 'af_unprivileged', 'three forwarded lines but two legs (a re-forward)': 'chain', "a UL shortfall on ue3's second session": 'ul_delta', 'no upfd session lines': 'ul_delta', "ue3's address between its sessions": 'ul_delta', 'a packet after the last scrape is not counted, but a live session with no series fails': 'ul_delta'}
 
 
 def self_test():
@@ -743,7 +809,10 @@ def self_test():
     def base(**kw):
         return lambda d: _fixture(d, **kw)
 
-    out = expect('the complete fixture holds', 'main', base(), True)
+    out = expect('the complete fixture holds (ue3 back on 10.45.0.4, the RST answering the AF\'s FIN)', 'main', base(), True)
+    assert '1 after it, ignored' in out and 'released before the last scrape' in out, out
+    expect('packets after the last scrape are not counted', 'main', lambda d: _fixture(d, extra=[
+        (ns('2026-11-13T06:01:20Z') / 1e9, '10.45.0.4', 45000, 0x18, 9000)]), True)
     assert 'FAIL' not in out, out
     # Each mutation breaks the check it names.
 
@@ -785,8 +854,8 @@ def self_test():
         ('no readmission', without('af.log', 'readmitted=')),
         ('round 9 at participants=2', edit('af.log', 'round=9 arm=1 rule=fedavg participants=3', 'round=9 arm=1 rule=fedavg participants=2')),
         ('a canary row', edit('af.log', 'canary_rows=0', 'canary_rows=1')),
-        ('a FIN from ue3', lambda d: _fixture(d, extra=[(ns('2026-11-13T06:00:30Z') / 1e9, '10.45.0.4', 43000, 0x11, 52)])),
-        ('an RST from ue3', lambda d: _fixture(d, extra=[(ns('2026-11-13T06:00:40Z') / 1e9, '10.45.0.4', 43000, 0x04, 40)])),
+        ('a FIN from ue3', lambda d: _fixture(d, extra=[(ns('2026-11-13T06:00:20Z') / 1e9, '10.45.0.4', 43000, 0x11, 52)])),
+        ('an RST from ue3 before the AF closed', lambda d: _fixture(d, extra=[(ns('2026-11-13T06:00:25Z') / 1e9, '10.45.0.4', 43000, 0x04, 40)])),
         ('UL delta below the AF bytes', edit('metrics-after.prom', 'ue_ipv4="10.45.0.2"} 5000', 'ue_ipv4="10.45.0.2"} 1000')),
         ('no per-session series', lambda d: (_fixture(d), open(os.path.join(d, 'metrics-after.prom'), 'w').write('x 1\n'))),
         ("the amfd delivery on another member's leg", edit('amf.log', 'sub=asub3', 'sub=asub1')),
@@ -797,6 +866,12 @@ def self_test():
         ('round 4 before the exclusion', edit('af.log', '06:00:32.400Z', '06:00:31.100Z')),
         ('the scorecard ran 5 rounds', edit('af.log', 'rounds=10 r1_mse', 'rounds=5 r1_mse')),
         ('three forwarded lines but two legs (a re-forward)', edit('udm.log', 'EE subscription usub2 ', 'EE subscription usub1 ')),
+        ("a UL shortfall on ue3's second session", edit('metrics-after.prom', 'ue_ipv4="10.45.0.4"} 2000', 'ue_ipv4="10.45.0.4"} 500')),
+        ('no upfd session lines', lambda d: (_fixture(d), open(os.path.join(d, 'upf.log'), 'w').write(''))),
+        ("ue3's address between its sessions", lambda d: _fixture(d, extra=[
+            (ns('2026-11-13T06:00:33Z') / 1e9, '10.45.0.4', 44000, 0x02, 60)])),
+        ('a packet after the last scrape is not counted, but a live session with no series fails',
+         edit('metrics-after.prom', 'upf_session_ul_bytes_total{seid="0x4",ue_ipv4="10.45.0.4"} 2000\n', '')),
         ('the AF kept its bounding set', edit('af-status.txt', 'CapBnd:\t0000000000000000', 'CapBnd:\t00000000002030c1')),
         ('the AF ran as root', edit('af-status.txt', 'Uid:\t65534', 'Uid:\t0')),
         ('no AF status captured', lambda d: (_fixture(d), os.remove(os.path.join(d, 'af-status.txt')))),
@@ -973,6 +1048,10 @@ def self_test():
         _pcap(os.path.join(d, 'fl-dn.pcap'), [(t0 + n, f'10.45.0.{n + 1}', 40000 + n, 0x18, 500) for n in range(1, 6)])
         open(os.path.join(d, 'metrics-after.prom'), 'w').write(
             ''.join(f'upf_session_ul_bytes_total{{seid="0x{n}",ue_ipv4="10.45.0.{n + 1}"}} 9000\n' for n in range(1, 6)))
+        # Five sessions, the lowest free addresses in order (smfd), ue1's before the AF.
+        open(os.path.join(d, 'upf.log'), 'w').write(''.join(
+            f'2026-11-13T06:00:0{n}.000Z [INFO nextgcore_upfd::data_plane] Session added: SEID=0x{n}, '
+            f'UL_TEID=0x{n}, DL_TEID=0x{n}, UE_IP=Some(10.45.0.{n + 1}), gNB=10.0.0.1:2152\n' for n in range(1, 6)))
     expect('the poisoned fixture holds', 'poisoned', pois, True)
     expect('fedavg did not diverge', 'poisoned', lambda d: pois(d, fed='3.0'), False)
     expect('median over 1.1x', 'poisoned', lambda d: pois(d, med='1.2'), False)
