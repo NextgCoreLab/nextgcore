@@ -15,7 +15,8 @@
 # merge in). Nothing is published and the network is `internal` (no route off
 # the host); CI asserts that from `docker compose config`.
 #
-# Both nwdafd images must be built with `--features demo-d441e-model-retrain`,
+# The nwdafd image (default name nextgcore-demo/nwdaf-d441e:local: a demo build,
+# never a published image) must be built with `--features demo-d441e-model-retrain`,
 # or the demo: block fails start-up (DemoConfigError::UnknownKey). The configs
 # carry mode `retrain`; configs/demo-d441e/check.sh copies them to a run
 # directory per arm (D441E_CONFIG_DIR) and sets the mode or removes the block.
@@ -35,7 +36,7 @@
 name: nextg-demo-d441e
 
 x-nwdaf: &nwdaf
-  image: ${D441E_NWDAF_IMAGE:-nextgcore-rust/nwdaf-d441e:latest}
+  image: ${D441E_NWDAF_IMAGE:-nextgcore-demo/nwdaf-d441e:local}
   # A start-up failure (an unknown mode) must stay a failure, not a restart loop.
   restart: "no"
   healthcheck:

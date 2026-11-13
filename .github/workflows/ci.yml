@@ -2249,7 +2249,7 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     timeout-minutes: 120
     env:
-      D441E_NWDAF_IMAGE: nextgcore-rust/nwdaf-d441e:ci
+      D441E_NWDAF_IMAGE: nextgcore-demo/nwdaf-d441e:ci
       D441E_NRF_IMAGE: nextgcore-rust/nrf:d441e-ci
       D441E_CORE_IMAGE: nextgcore-core:latest
       CARGO_TARGET_DIR: ${{ github.workspace }}/target-d441e

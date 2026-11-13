@@ -50,7 +50,7 @@ for arm in ${ARMS:-flip-v2-byte no-feedback-feed}; do
   git diff --quiet HEAD -- || { echo "reverts: tree not restored after ${arm}" >&2; exit 3; }
   ctx="$(mktemp -d)"; mkdir -p "${ctx}/binaries"
   cp "${target}/release/nextgcore-nwdafd" "${ctx}/binaries/"
-  image="nextgcore-rust/nwdaf-d441e:revert-${arm}"
+  image="nextgcore-demo/nwdaf-d441e:revert-${arm}"
   docker build -q -f "${root}/docker/rust/Dockerfile.nf" \
     --build-arg "CORE_IMAGE=${D441E_CORE_IMAGE:-nextgcore-core:latest}" \
     --build-arg NF_NAME=nextgcore-nwdafd -t "${image}" "${ctx}" >/dev/null
