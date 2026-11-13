@@ -1,0 +1,21 @@
+# NRF of the D441E stack (nextgsim#468): the configs/5gc/nrf.yaml settings,
+# advertised under its compose service name instead of the base stack's
+# 172.23.0.10 (this stack has its own network).
+logger:
+  level: info
+
+global:
+  max:
+    ue: 1024
+    peer: 64
+
+nrf:
+  serving:
+    - plmn_id:
+        mcc: 999
+        mnc: 70
+  sbi:
+    server:
+      - address: 0.0.0.0
+        advertise: nrf
+        port: 7777

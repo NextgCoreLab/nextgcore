@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nextg-demo-toggles
+data:
+  key: d441e-model-retrain
+  targets: nwdaf-mtlf.yaml nwdaf-anlf.yaml

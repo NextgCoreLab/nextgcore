@@ -1,0 +1,18 @@
+diff --git a/src/bins/nextgcore-nwdafd/src/model_monitor.rs b/src/bins/nextgcore-nwdafd/src/model_monitor.rs
+index 3914a5b0..62bf1dc6 100644
+--- a/src/bins/nextgcore-nwdafd/src/model_monitor.rs
++++ b/src/bins/nextgcore-nwdafd/src/model_monitor.rs
+@@ -891,9 +891,10 @@ pub fn handle_notify(m: Option<&Monitor>, token: &str, request: &SbiRequest) ->
+             continue;
+         }
+         let accuracy = acc as f64 / 100.0;
+-        let Some((rolling, n, threshold, crossed)) =
+-            lock(&m.feedback).record_accuracy(corr, accuracy)
+-        else {
++        // d441e revert arm (no-feedback-feed): the report never reaches the
++        // FeedbackRegistry.
++        let _ = accuracy;
++        let Some((rolling, n, threshold, crossed)) = None::<(f64, usize, f64, bool)> else {
+             continue;
+         };
+         nextgcore_demo::demo_log!(

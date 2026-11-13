@@ -1,0 +1,27 @@
+# Demo d441e-model-retrain (nextgsim#468): MTLF -> AnLF model provisioning with
+# an accuracy-triggered retrain, between two nwdafd instances of one image
+# (built with --features demo-d441e-model-retrain; profiles/demo/profile.env
+# adds it for this overlay), over the demo-OFF base. ClusterIP only: nothing
+# here adds a Service port beyond the two NWDAFs' ClusterIP SBI and metrics.
+#
+#   nwdaf-mtlf.yaml   role mtlf: ConfigMap nwdaf-mtlf-config (a toggle target),
+#                     Service and Deployment
+#   nwdaf-anlf.yaml   role anlf: the same, discovering the MTLF at the NRF
+#   scenario.sh       the seeded run: restarts both NWDAFs 25-60 s into a
+#                     600 s cycle of the seeded series and asserts the chain
+#                     (docker/rust/configs/demo-d441e/chain.py) by kubelet
+#                     timestamp; see its header
+#   test-scenario.sh  chain.py's self-test (CI runs every overlay's)
+#
+# The NWDAFs do not touch the base core: no base NF subscribes to them, and
+# their only peer is the NRF. No OAuth2-require on either listener: each answers
+# the other's token-less notifications, which nextgcore-sbi's require_oauth2
+# refuses (nextgcore#1421).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: nextg-demo
+resources:
+  - ../demo
+  - toggles.yaml
+  - nwdaf-mtlf.yaml
+  - nwdaf-anlf.yaml
