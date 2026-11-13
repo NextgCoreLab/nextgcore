@@ -575,6 +575,9 @@ jobs:
         run: |
           set -euo pipefail
           python3 deploy/eks/profiles/demo/demo_toggles.py --self-test
+          # nextgsim#480: profile_rollout waits on every rendered Deployment
+          # (d445a's nef, d441e's nwdaf-mtlf/-anlf), against a stub kubectl.
+          deploy/eks/profiles/demo/test-rollout.sh
           # k8s/demo-check.sh against a fake cluster: the private kubeconfig is
           # removed on every exit path, every artefact is scrubbed, and a
           # surviving token fails the run.
