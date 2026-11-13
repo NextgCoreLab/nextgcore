@@ -25,6 +25,11 @@ The mode is a run parameter, not part of the overlay, so one overlay serves ever
 mode (k8s/demo-check.sh <key> <mode>). The toggles ConfigMap itself is removed
 from the render: it is input to this step, not something the cluster needs.
 
+DEMO_MODE=off (k8s/demo-check.sh <key> off) is the demo's own demo-off arm: the
+overlay's topology and images, but no target gets a block, so the run is the
+base core on that topology. The render must then hold no `demo:` key anywhere,
+as for the demo-off base overlay. No demo may register a mode named `off`.
+
 Fail-closed rules:
   * The demo-off base overlay ("demo") must have no toggles ConfigMap, and the
     render must then contain no `demo:` key in any config. That is the demo-off
@@ -62,6 +67,13 @@ def has_demo_block(text):
     return isinstance(doc, dict) and 'demo' in doc
 
 
+def assert_no_demo_block(configmaps, what):
+    for cm in configmaps:
+        for f, text in (cm.get('data') or {}).items():
+            if has_demo_block(text):
+                fail(f'{what} render has a demo: block in {cm["metadata"]["name"]}/{f}')
+
+
 def apply(docs, overlay, key, mode):
     """Return the transformed document list, or exit with a named error."""
     toggles = [d for d in docs if d.get('kind') == 'ConfigMap'
@@ -74,11 +86,7 @@ def apply(docs, overlay, key, mode):
             fail(f'the demo-off overlay must not carry a {TOGGLES} ConfigMap')
         if key or mode:
             fail('DEMO_KEY/DEMO_MODE are set but DEMO_OVERLAY is the demo-off base')
-        for cm in configmaps:
-            for f, text in (cm.get('data') or {}).items():
-                if has_demo_block(text):
-                    fail(f'demo-off render has a demo: block in '
-                         f'{cm["metadata"]["name"]}/{f}')
+        assert_no_demo_block(configmaps, 'demo-off')
         return docs
 
     if len(toggles) != 1:
@@ -100,6 +108,13 @@ def apply(docs, overlay, key, mode):
     extra = set(data) - {'key', 'targets'}
     if extra:
         fail(f'{TOGGLES} has unknown data keys {sorted(extra)} (expected key, targets)')
+
+    if mode == 'off':
+        for target in targets:
+            if sum(target in (cm.get('data') or {}) for cm in configmaps) != 1:
+                fail(f'target {target} is not in exactly 1 ConfigMap')
+        assert_no_demo_block(configmaps, f'{overlay} DEMO_MODE=off')
+        return [d for d in docs if d not in toggles]
 
     block = {'enabled': True, tkey: {'enabled': True, 'mode': mode}}
     for target in targets:
@@ -152,6 +167,11 @@ def self_test():
             return
         raise AssertionError(f'not refused: {why}')
 
+    # DEMO_MODE=off on a demo overlay: no block anywhere, toggles removed.
+    out = apply(fresh(tog), 'demo-d1-x', 'd1-x', 'off')
+    assert not any(d['metadata']['name'] == TOGGLES for d in out)
+    assert out == fresh(), 'DEMO_MODE=off must leave every config as the overlay has it'
+
     planted = fresh()
     planted[0]['data']['amf.yaml'] = 'amf: {}\ndemo:\n  enabled: false\n'
     refused(planted, 'demo', '', '', 'demo-off render has a demo: block')
@@ -167,6 +187,9 @@ def self_test():
     extra = dict(tog, data={'key': 'd1-x', 'targets': 'amf.yaml', 'mode': 'a'})
     refused(fresh(extra), 'demo-d1-x', 'd1-x', 'a', 'unknown data keys')
     refused(planted + [tog], 'demo-d1-x', 'd1-x', 'a', 'already has a demo: block')
+    refused(planted + [tog], 'demo-d1-x', 'd1-x', 'off', 'DEMO_MODE=off render has a demo: block')
+    refused(fresh(bad_target), 'demo-d1-x', 'd1-x', 'off', 'not in exactly 1 ConfigMap')
+    refused(fresh(tog), 'demo-d1-x', 'd1-y', 'off', 'does not match')
     print('demo_toggles self-test ok')
     return 0
 

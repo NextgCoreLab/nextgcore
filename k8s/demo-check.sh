@@ -3,6 +3,9 @@
 #
 #   k8s/demo-check.sh <key> <mode>      deploy/eks/overlays/demo-<key>, mode <mode>
 #   k8s/demo-check.sh off off           the demo-OFF control: deploy/eks/overlays/demo
+#   k8s/demo-check.sh <key> off         a demo's own demo-off arm: its overlay
+#                                       (topology, images, scenario) with no
+#                                       demo: block anywhere
 #
 # Steps:
 #   1. deploy the overlay with PROFILE=demo deploy/eks/deploy-eks.sh into its own
@@ -18,6 +21,7 @@
 # Assertions every run makes, on top of the e2e and the scenario:
 #   off      no process logged "DEMO MODE ACTIVE", no "[demo:" line, and no scrape
 #            has a nextg_demo_enabled series: the demo-off arm is the base core.
+#            The same for <key> off.
 #   <key>    some process logged "DEMO MODE ACTIVE: ...<key>=<mode>..." and some
 #            scrape has nextg_demo_enabled{demo="<key>",mode="<mode>"} 1.
 #
@@ -31,6 +35,10 @@
 #   ENABLE_DATAPLANE   default true (the e2e needs the data-plane UPF)
 #   EPHEMERAL_STORAGE  default true (devtest1 has no EBS CSI StorageClass)
 #   CORE_IMAGE_TAG / SIM_IMAGE_TAG / IMAGE_TAG   passed to deploy-eks.sh
+#   DEMO_VARIANT       optional [a-z0-9-]+: a scenario arm that is not a mode
+#                      (for example a fault injected by the scenario). Passed to
+#                      scenario.sh, recorded in verdict.txt, and the artefacts go
+#                      to <key>/<mode>+<variant>/ so arms never share a directory.
 #   SIM_SHA            the nextgsim commit the gnb/ue images were built from,
 #                      recorded as sim= in verdict.txt (default: unrecorded).
 #                      The images' own references are recorded as core_image=
@@ -45,7 +53,7 @@ set -uo pipefail
 # Artefacts hold subscriber identities (IMSIs in NF logs): owner-only.
 umask 077
 
-usage() { sed -n '2,40p' "$0"; exit 2; }
+usage() { sed -n '2,/^# Exit:/p' "$0"; exit 2; }
 [[ $# -eq 2 ]] || usage
 KEY="$1"; MODE="$2"
 NAME_RE='^[a-z0-9][a-z0-9-]*$'
@@ -57,8 +65,12 @@ CORE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 EKS_DIR="${CORE_DIR}/deploy/eks"
 NS="nextg-demo"
 
+VARIANT="${DEMO_VARIANT:-}"
+[[ -z "${VARIANT}" || "${VARIANT}" =~ ${NAME_RE} ]] \
+  || { echo "DEMO_VARIANT must be [a-z0-9-]+" >&2; exit 2; }
 if [[ "${KEY}" == off ]]; then
   [[ "${MODE}" == off ]] || { echo "the demo-off control is: $0 off off" >&2; exit 2; }
+  [[ -z "${VARIANT}" ]] || { echo "the demo-off control takes no DEMO_VARIANT" >&2; exit 2; }
   OVERLAY="demo"; DEMO_KEY=""; DEMO_MODE=""
 else
   OVERLAY="demo-${KEY}"; DEMO_KEY="${KEY}"; DEMO_MODE="${MODE}"
@@ -69,9 +81,10 @@ fi
 KUBE_CONTEXT="${KUBE_CONTEXT:-devtest1}"
 OUT_ROOT="${OUT_ROOT:-/tmp/eks-val/demos}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-OUT="${OUT_ROOT}/${KEY}/${MODE}/${STAMP}"
+ARM="${MODE}${VARIANT:++${VARIANT}}"
+OUT="${OUT_ROOT}/${KEY}/${ARM}/${STAMP}"
 mkdir -p "${OUT}/logs" "${OUT}/metrics" || exit 2
-ln -sfn "${STAMP}" "${OUT_ROOT}/${KEY}/${MODE}/latest"
+ln -sfn "${STAMP}" "${OUT_ROOT}/${KEY}/${ARM}/latest"
 
 log()  { printf '\033[0;32m[demo-check]\033[0m %s\n' "$*" | tee -a "${OUT}/run.log"; }
 fail_env() { printf '\033[0;31m[demo-check]\033[0m %s\n' "$*" | tee -a "${OUT}/run.log" >&2; exit 2; }
@@ -118,7 +131,7 @@ if kubectl get namespace "${NS}" >/dev/null 2>&1; then
   fail_env "namespace ${NS} already exists (another demo run?). Delete it or wait."
 fi
 
-log "cluster=${KUBE_CONTEXT} namespace=${NS} overlay=${OVERLAY} key=${KEY} mode=${MODE}"
+log "cluster=${KUBE_CONTEXT} namespace=${NS} overlay=${OVERLAY} key=${KEY} mode=${MODE}${VARIANT:+ variant=${VARIANT}}"
 log "artefacts: ${OUT}"
 if [[ "${YES:-false}" != true ]]; then
   read -r -p "Deploy ${OVERLAY} into ${KUBE_CONTEXT}/${NS}? [y/N] " reply
@@ -148,7 +161,7 @@ if [[ "${DEPLOY_OK}" == true ]]; then
   SCEN="${EKS_DIR}/overlays/${OVERLAY}/scenario.sh"
   if [[ -x "${SCEN}" ]]; then
     log "demo scenario ${OVERLAY}/scenario.sh (log: scenario.log)"
-    NAMESPACE="${NS}" DEMO_KEY="${DEMO_KEY}" DEMO_MODE="${DEMO_MODE}" OUT="${OUT}" \
+    NAMESPACE="${NS}" DEMO_KEY="${DEMO_KEY}" DEMO_MODE="${DEMO_MODE}" DEMO_VARIANT="${VARIANT}" OUT="${OUT}" \
       "${SCEN}" >"${OUT}/scenario.log" 2>&1; SCEN_RC=$?
   fi
 fi
@@ -185,7 +198,7 @@ for f in "${OUT}"/logs/*.log; do
   b="$(basename "${f}" .log)"
   sed "s/^\([^ ]*\) /\1 [${b}] /" "${f}"
 done | sort -s -k1,1 >"${OUT}/log-chain.txt"
-if [[ -n "${DEMO_KEY}" ]]; then
+if [[ -n "${DEMO_KEY}" && "${DEMO_MODE}" != off ]]; then
   grep -E "DEMO MODE ACTIVE|\[demo:${DEMO_KEY}\]" "${OUT}/log-chain.txt" >"${OUT}/demo-chain.txt"
 fi
 
@@ -210,7 +223,7 @@ banner_hits="$(grep -c 'DEMO MODE ACTIVE' "${OUT}/log-chain.txt" || true)"
 prefix_hits="$(grep -c '\[demo:' "${OUT}/log-chain.txt" || true)"
 scrapes="$(find "${OUT}/metrics" -name '*.prom' | wc -l)"
 [[ "${scrapes}" -gt 0 ]] || FAILS+=("no /metrics scrape captured")
-if [[ -z "${DEMO_KEY}" ]]; then
+if [[ -z "${DEMO_KEY}" || "${DEMO_MODE}" == off ]]; then
   [[ "${banner_hits}" == 0 ]] || FAILS+=("demo-off: ${banner_hits} DEMO MODE ACTIVE line(s)")
   [[ "${prefix_hits}" == 0 ]] || FAILS+=("demo-off: ${prefix_hits} [demo: line(s)")
   [[ "${metric_hits}" == 0 ]] || FAILS+=("demo-off: ${metric_hits} nextg_demo_enabled series")
@@ -225,7 +238,7 @@ fi
 # The image of the first pod of a Deployment, from images.txt ("<pod>\t<image> ").
 image_of() { awk -F'\t' -v d="$1" 'index($1, d "-") == 1 { split($2, i, " "); print i[1]; exit }' "${OUT}/images.txt"; }
 {
-  echo "key=${KEY} mode=${MODE} overlay=${OVERLAY} cluster=${KUBE_CONTEXT} namespace=${NS} at=${STAMP}"
+  echo "key=${KEY} mode=${MODE} variant=${VARIANT:-none} overlay=${OVERLAY} cluster=${KUBE_CONTEXT} namespace=${NS} at=${STAMP}"
   # sim= is never read from a checkout: ../nextgsim need not be the tree the
   # images were built from (git -C resolves it from CORE_DIR's physical path),
   # so the deployed image references are the record, plus SIM_SHA if passed.

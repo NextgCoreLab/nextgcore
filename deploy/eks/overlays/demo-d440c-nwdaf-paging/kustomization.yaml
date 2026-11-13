@@ -1,0 +1,32 @@
+# Demo d440c-nwdaf-paging (nextgsim#464): amfd pages an idle UE at the gNB that
+# nwdafd's UE_MOBILITY prediction names (plus the UE's last known cell's gNB),
+# over the demo-OFF base. ClusterIP only.
+#
+# Adds what the base lacks for this demo:
+#   nwdaf.yaml    nwdafd built with --features amf-mobility, serving UE_MOBILITY
+#                 from amfd's LOCATION_REPORTs through its base knob
+#                 nwdaf.amf_mobility.enabled (nextgsim#466). Not a demo block:
+#                 one demo per run, and the knob is the producer's normal switch.
+#   gnb-b.yaml    gNB B (NCI 0x020, gNB ID 2) and
+#   gnb-c.yaml    gNB C (NCI 0x030, gNB ID 3), same TAC as the base gNB, which
+#                 is gNB A (NCI 0x010, gNB ID 1);
+#   sim-lap.yaml  gNB A's config and the UE's seeded commuter lap.
+#
+# The configs are nextgsim's config/demo-nwdaf-paging/ (gnb-a/b/c.yaml,
+# ue-lap.yaml) with the compose addresses replaced by Service names and their
+# demo block removed: the block comes from toggles.yaml with the run's mode.
+# test-scenario.sh checks that nothing else differs.
+#
+# Images: build-images.sh (amfd with demo-d440c-nwdaf-paging, nwdafd with
+# amf-mobility, the gNB with demo-d440c-nwdaf-paging, nr-cli in the gNB image).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: nextg-demo
+resources:
+  - ../demo
+  - toggles.yaml
+  - nwdaf.yaml
+  - gnb-b.yaml
+  - gnb-c.yaml
+patches:
+  - path: sim-lap.yaml
