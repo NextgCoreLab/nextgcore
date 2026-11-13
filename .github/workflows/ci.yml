@@ -2253,7 +2253,6 @@ jobs:
       D441E_NRF_IMAGE: nextgcore-rust/nrf:d441e-ci
       D441E_CORE_IMAGE: nextgcore-core:latest
       CARGO_TARGET_DIR: ${{ github.workspace }}/target-d441e
-      DEMO_ARTEFACTS: ${{ runner.temp }}/d441e
     steps:
       - uses: actions/checkout@v4
       - name: chain.py self-test (every assertion fails on input missing its line)
@@ -2272,6 +2271,8 @@ jobs:
           chmod +x "$w"
           mkdir -p "$RUNNER_TEMP/cargo-home"
           echo "D441E_CARGO=$w" >> "$GITHUB_ENV"
+          # Job-level env cannot read the runner context.
+          echo "DEMO_ARTEFACTS=$RUNNER_TEMP/d441e" >> "$GITHUB_ENV"
       - name: build nrfd and nwdafd (--features demo-d441e-model-retrain) and their images
         run: |
           set -euo pipefail
