@@ -456,7 +456,10 @@ d445a_gates() {
   "${K[@]}" logs "${pod}" -c nef >"${S}/nef-bogus.log" 2>&1
   "${K[@]}" logs "${pod}" -c nef --previous >>"${S}/nef-bogus.log" 2>&1
   if grep -qE 'UnknownMode|unknown mode "bogus"' "${S}/nef-bogus.log"; then
-    gate PASS "nefd with mode bogus fails startup: $(grep -m1 -oE 'UnknownMode[^"]*"[^"]*"[^"]*"[^"]*"|unknown mode "bogus"[^,]*' "${S}/nef-bogus.log")"
+    # grep -oE with alternation prints every match on the line; both patterns
+    # hit the same log line, so the output spans two lines and checks.py reads
+    # the second as a new gate row. Collapse the match to one line.
+    gate PASS "nefd with mode bogus fails startup: $(grep -m1 -oE 'UnknownMode[^"]*"[^"]*"[^"]*"[^"]*"|unknown mode "bogus"[^,]*' "${S}/nef-bogus.log" | head -1)"
   else gate FAIL "nefd bogus mode: $(tail -3 "${S}/nef-bogus.log" | tr '\n' ' ')"; fi
   nef_with "${S}/nef-on.yaml"
   "${K[@]}" rollout status deploy/nef --timeout=180s >/dev/null || gate FAIL "nefd did not come back on"
