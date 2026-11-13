@@ -91,9 +91,11 @@ def build(arm):
         f["nwdaf"].append(core(t, "nwdafd::sbi_handler", "Analytics Info Query: /nnwdaf-analyticsinfo/v1/analytics"))
 
     # The deploy's first UE (before the restart), its route parked: it registers
-    # on A and stays there, so nwdafd's history starts A, A (the restarted UE's
-    # registration): one A -> A transition beside the laps' three A -> B, which
-    # makes the prediction B at 75%.
+    # on A and stays there. When nwdafd ingests that registration (as here), its
+    # history starts A, A (the restarted UE's registration): one A -> A beside
+    # the laps' three A -> B, so the prediction is B at 75%. Without that ingest
+    # every transition out of A is A -> B and it is B at 100%; analyze.py checks
+    # the predicted cell, not the confidence.
     amf(-200, "Decoded Initial UE Message: ran_ue_ngap_id=1, nas_pdu_len=23, nci=0x10, tac=1, cause=3")
     amf(-200, "Initial UE Message: ran_ue_ngap_id=1, nas_pdu_len=23, tac=1, nci=0x10")
     if arm != "revert":
