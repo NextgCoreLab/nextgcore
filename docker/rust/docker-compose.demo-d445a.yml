@@ -318,13 +318,18 @@ services:
         condition: service_healthy
 
   # The FL application server (AF). Its FL listener is on fl-dn, its T8 listener
-  # on core. It publishes its CCA JWK into d445a_cca, which the NRF trusts.
+  # on core. It publishes its CCA JWK into d445a_cca, which the NRF trusts. Root
+  # only to add the return route; nr-fl-server runs as nobody (setpriv).
   fl-af:
     image: ${NEXTGSIM_IMAGE_PREFIX:-nextgsim}-ue:${NEXTGSIM_TAG:-latest}
     <<: *common
     user: root
+    cap_drop: [ALL]
     cap_add:
       - NET_ADMIN
+      - CHOWN
+      - SETUID
+      - SETGID
     environment:
       RUST_LOG: info
       D445A_MODE: ${D445A_MODE:-t8-exclusion}
@@ -333,7 +338,9 @@ services:
       - >-
         ip route replace 10.45.0.0/16 via 10.46.0.2 &&
         sed "s/@MODE@/$$D445A_MODE/" /etc/nextgsim/af.yaml.in >/tmp/af.yaml &&
-        exec nr-fl-server -c /tmp/af.yaml
+        mkdir -p /var/lib/d445a/cca && chown -R 65534:65534 /var/lib/d445a &&
+        exec setpriv --reuid=65534 --regid=65534 --clear-groups --inh-caps=-all
+        --bounding-set=-all --no-new-privs nr-fl-server -c /tmp/af.yaml
     volumes:
       - ./configs/demo-d445a/af.yaml:/etc/nextgsim/af.yaml.in:ro
       - d445a_cca:/var/lib/d445a/cca

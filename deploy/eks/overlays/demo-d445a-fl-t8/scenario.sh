@@ -16,15 +16,26 @@
 #                 T8 subscription by externalId, one LoC with a reason on
 #                 deregistration, none within 20 s of the power cycle that follows).
 #   gates         t8-exclusion. UE ID retrieval auth (401/403, no identity), the
-#                 nefd kill switch and bogus mode, the AF's bogus mode, and the
-#                 UE's runtime `demo set mode=bogus`.
-# Revert arms (each must FAIL the check it targets; the arm holds when it does):
+#                 nefd kill switch and bogus mode, the AF's and the UE's bogus mode
+#                 at startup, the UE's runtime `demo set mode=bogus`, and that a UE
+#                 cannot reach the T8 port (while it does reach the FL port).
+# Revert arms (each holds only when the check it targets FAILS and its
+# preconditions hold; checks.py names both):
 #   no-t8         the AF with --no-t8 (revert-hooks build): chain fails, straggler.
 #   freeze-global the AF with --freeze-global: scorecard fails.
 #   leak-raw      ue2 runs nr-ue-revert-hooks with fl.leak_raw: canary fails.
 #   nat-on        the DN NATed again (a MASQUERADE ahead of upfd's exclusion):
 #                 sources fail (identity_unresolved).
 #   nefd-down     nefd scaled to 0 after the joins: chain fails, straggler.
+#   udm-fallback  udmd step 3a disabled by deployment only: a NetworkPolicy keeps
+#                 udm off amf, so the AMF is unreachable to udmd, which takes its
+#                 tested fallback (drop_leg) and reports LoC itself: chain fails
+#                 (no forwarded leg). Needs a CNI that enforces NetworkPolicy; the
+#                 precondition (udmd's "EE subscription <id>: <error>" x3, no
+#                 forwarded line) says whether it did.
+#   eth0          ue2's FL client on eth0, to <upf pod IP>:7480 (an arm-only DNAT
+#                 to the AF): bytes reach the AF without a PDU session; sources
+#                 (identity_unresolved) and ul_delta fail.
 set -uo pipefail
 
 D445A_AF_ID="6b1d7e3c-0000-4000-8000-00000000480a"
@@ -46,7 +57,8 @@ d445a_main() {
   esac
   case "${ARM}:${DEMO_MODE}" in
     poisoned:poisoned-ue|main:t8-exclusion|probe:t8-exclusion|gates:t8-exclusion) ;;
-    no-t8:t8-exclusion|freeze-global:t8-exclusion|leak-raw:t8-exclusion|nat-on:t8-exclusion|nefd-down:t8-exclusion) ;;
+    no-t8:t8-exclusion|freeze-global:t8-exclusion|leak-raw:t8-exclusion|nat-on:t8-exclusion) ;;
+    nefd-down:t8-exclusion|udm-fallback:t8-exclusion|eth0:t8-exclusion) ;;
     *) echo "[scenario] FAIL: arm ${ARM} does not run in mode ${DEMO_MODE}"; return 1 ;;
   esac
   say()  { printf '[scenario] %s\n' "$*"; }
@@ -65,18 +77,63 @@ d445a_main() {
   tun_ip() { "${K[@]}" exec "deploy/$1" -c ue -- sh -c "ip -4 -o addr show uesimtun0 2>/dev/null | awk '{print \$4}' | cut -d/ -f1" 2>/dev/null; }
   ue_dep() { if [[ "$1" == 1 ]]; then echo ue; else echo "ue-$1"; fi; }
   say "arm=${ARM} mode=${DEMO_MODE} members=${members}"
-  printf 'arm=%s\nmode=%s\nmembers=%s\ndeadline_ms=%s\n' "${ARM}" "${DEMO_MODE}" "${members}" "${D445A_DEADLINE_MS}" >"${S}/meta.txt"
+  local rounds=10
+  [[ "${ARM}" == probe ]] && rounds=22
+  printf 'arm=%s\nmode=%s\nmembers=%s\ndeadline_ms=%s\nrounds=%s\n' "${ARM}" "${DEMO_MODE}" "${members}" \
+    "${D445A_DEADLINE_MS}" "${rounds}" >"${S}/meta.txt"
 
   # --- 1. subscribers and UEs ---------------------------------------------------
   "${K[@]}" wait --for=condition=complete job/d445a-subscribers --timeout=300s >/dev/null \
     || bad "the d445a-subscribers Job did not complete"
   "${K[@]}" logs job/d445a-subscribers -c seed >"${S}/seed.txt" 2>&1
+  # ue-2's fl-config initContainer (initContainers[1], ue-members.yaml) takes an
+  # env var, by explicit JSON patch path.
+  fl_env() {   # NAME VALUE
+    "${K[@]}" patch deploy/ue-2 --type json -p \
+      "[{\"op\":\"add\",\"path\":\"/spec/template/spec/initContainers/1/env/-\",\"value\":{\"name\":\"$1\",\"value\":\"$2\"}}]" \
+      >/dev/null || bad "ue-2 env $1"
+  }
+  [[ "$("${K[@]}" get deploy/ue-2 -o jsonpath='{.spec.template.spec.initContainers[1].name}')" == d445a-fl-config ]] \
+    || bad "ue-2 initContainers[1] is not d445a-fl-config"
   if [[ "${ARM}" == leak-raw ]]; then
     # ue2 runs the revert-hooks nr-ue with fl.leak_raw (refused by a default build).
-    "${K[@]}" set env deploy/ue-2 -c d445a-fl-config FL_LEAK_RAW=true >/dev/null
+    fl_env FL_LEAK_RAW true
     "${K[@]}" patch deploy/ue-2 --type json \
       -p '[{"op":"add","path":"/spec/template/spec/containers/0/command","value":["nr-ue-revert-hooks"]}]' >/dev/null \
       || bad "ue-2 revert-hooks patch"
+  fi
+  local upf_ip
+  upf_ip="$("${K[@]}" get pod -l app.kubernetes.io/name=upf -o jsonpath='{.items[0].status.podIP}')"
+  if [[ "${ARM}" == eth0 ]]; then
+    # The client on the pod network, not the PDU session: an arm-only DNAT in the
+    # UPF's namespace hands <upf pod IP>:7480 to the AF.
+    fl_env FL_DEVICE eth0
+    fl_env FL_SERVER "${upf_ip}:7480"
+    "${K[@]}" exec deploy/upf -c upf -- iptables -t nat -A PREROUTING -d "${upf_ip}" -p tcp --dport 7480 \
+      -j DNAT --to-destination 10.46.0.10:7480 || bad "eth0 DNAT"
+  fi
+  if [[ "${ARM}" == udm-fallback ]]; then
+    # udmd step 3a disabled by deployment only: udm may not reach amf.
+    "${K[@]}" apply -f - >/dev/null <<YAML || bad "udm-fallback NetworkPolicy"
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: d445a-udm-not-to-amf
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: amf
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - {key: app.kubernetes.io/name, operator: NotIn, values: [udm]}
+    - from:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [$("${K[@]}" get pod -l app.kubernetes.io/name=udm -o jsonpath='{.items[0].status.podIP}')/32]
+YAML
   fi
   for n in $(seq 2 "${members}"); do "${K[@]}" scale "deploy/ue-${n}" --replicas=1 >/dev/null; done
   : >"${S}/ue-ips.txt"
@@ -87,6 +144,9 @@ d445a_main() {
       || bad "${dep} has no PDU session (uesimtun0) within 240 s"
     echo "ue${n} $(tun_ip "${dep}")" >>"${S}/ue-ips.txt"
   done
+  if [[ "${ARM}" == eth0 ]]; then
+    echo "eth0_ip=$("${K[@]}" get pod -l app.kubernetes.io/name=ue-2 -o jsonpath='{.items[0].status.podIP}')" >>"${S}/meta.txt"
+  fi
   say "UEs: $(tr '\n' ' ' <"${S}/ue-ips.txt")"
 
   # --- 2. the AF's CCA key, trusted at the NRF ----------------------------------
@@ -131,7 +191,7 @@ d445a_main() {
   say "AF started: ${start}"
 
   case "${ARM}" in
-    nat-on)
+    nat-on|eth0)
       wait_for 120 af_has 'identity_unresolved' || bad "no identity_unresolved within 120 s"
       sleep 20 ;;
     gates)
@@ -142,12 +202,18 @@ d445a_main() {
       d445a_probe "${S}" ;;
     poisoned|leak-raw|freeze-global)
       wait_for 900 af_has 'all arms done' || bad "the AF did not finish within 900 s" ;;
-    main|no-t8|nefd-down)
+    main|no-t8|nefd-down|udm-fallback)
       wait_for 300 af_has 'hold before round=4 until=member-excluded' || bad "no hold before round 4"
       # udmd forwards each member's LoC subscription to the AMF after the NEF's 201
       # (#1449 review 5): deregister only once all three legs are up.
-      wait_for 120 sh -c "[ \$(kubectl -n ${NAMESPACE} logs deploy/udm -c udm | grep -c 'forwarded to AMF') -ge 3 ]" \
-        || bad "fewer than 3 udmd 'forwarded to AMF' lines"
+      if [[ "${ARM}" == udm-fallback ]]; then
+        # The AMF is unreachable to udmd: each leg ends in its fallback warning.
+        wait_for 180 sh -c "[ \$(kubectl -n ${NAMESPACE} logs deploy/udm -c udm | grep -cE 'EE subscription [^ ]+: ') -ge 3 ]" \
+          || bad "udmd logged fewer than 3 AMF-leg failures (NetworkPolicy not enforced?)"
+      else
+        wait_for 120 sh -c "[ \$(kubectl -n ${NAMESPACE} logs deploy/udm -c udm | grep -c 'forwarded to AMF') -ge 3 ]" \
+          || bad "fewer than 3 udmd 'forwarded to AMF' lines"
+      fi
       if [[ "${ARM}" == nefd-down ]]; then
         "${K[@]}" scale deploy/nef --replicas=0 >/dev/null
         wait_for 120 sh -c "[ -z \"\$(kubectl -n ${NAMESPACE} get pods -l app.kubernetes.io/name=nef -o name)\" ]" || bad "nefd still up"
@@ -279,9 +345,26 @@ d445a_gates() {
   if grep -qiE 'unknown mode|bogus' <<<"${r}" && grep -q 't8-exclusion' <<<"${r}"; then
     gate PASS "nr-cli demo d445a-fl-t8 set mode=bogus: rejected, mode stays ($(tr '\n' ' ' <<<"${r}" | head -c 300))"
   else gate FAIL "UE bogus mode: $(tr '\n' ' ' <<<"${r}" | head -c 300)"; fi
+  # The UE's bogus mode at startup: a second, one-shot nr-ue on the same config
+  # with mode bogus must fail with UnknownMode before it does anything.
+  # shellcheck disable=SC2016  # expanded by the container's sh
+  r="$("${K[@]}" exec deploy/ue -c ue -- sh -c 'sed "s/mode: t8-exclusion/mode: bogus/" /etc/nextgsim/ue.yaml >/tmp/bogus.yaml; timeout 20 nr-ue -c /tmp/bogus.yaml; echo "rc=$?"' 2>&1)"
+  if grep -qiE 'unknown mode \\?"bogus\\?"|UnknownMode' <<<"${r}" && ! grep -qE 'rc=(0|124)$' <<<"${r}"; then
+    gate PASS "nr-ue with mode bogus fails startup: $(grep -m1 -oiE 'unknown mode[^,]*|UnknownMode[^)]*' <<<"${r}"), $(grep -o 'rc=[0-9]*' <<<"${r}" | tail -1)"
+  else gate FAIL "nr-ue bogus mode: $(tr '\n' ' ' <<<"${r}" | tail -c 300)"; fi
+  # A UE cannot reach the AF's T8 listener (DNATed pod port or fl-dn address),
+  # while the same UE does reach the FL listener: the denial is the FORWARD rule,
+  # not a broken path.
+  local upf_ip c1 c2 c3
+  upf_ip="$("${K[@]}" get pod -l app.kubernetes.io/name=upf -o jsonpath='{.items[0].status.podIP}')"
+  probe_tcp() { "${K[@]}" exec deploy/ue -c ue -- curl --interface uesimtun0 -s -o /dev/null --connect-timeout 3 --max-time 4 "$1" >/dev/null 2>&1; echo $?; }
+  c1="$(probe_tcp "http://${upf_ip}:7481/")"; c2="$(probe_tcp "http://10.46.0.10:7481/")"; c3="$(probe_tcp "http://10.46.0.10:7480/")"
+  if [[ "${c1}" == 28 && "${c2}" == 28 && "${c3}" != 28 && "${c3}" != 7 ]]; then
+    gate PASS "ue1 via uesimtun0: ${upf_ip}:7481 and 10.46.0.10:7481 time out (curl rc 28), 10.46.0.10:7480 connects (rc ${c3})"
+  else gate FAIL "T8 port from ue1: ${upf_ip}:7481 rc=${c1}, 10.46.0.10:7481 rc=${c2}, 10.46.0.10:7480 rc=${c3} (want 28, 28, connected)"; fi
   # The AF's bogus mode fails startup with UnknownMode (a one-shot second process).
   # shellcheck disable=SC2016  # expanded by the container's sh
-  r="$("${K[@]}" exec deploy/upf -c fl-af -- sh -c 'sed "s/mode: t8-exclusion/mode: bogus/" /tmp/d445a/af.yaml >/tmp/d445a/bogus.yaml; ip netns exec fl-dn timeout 20 nr-fl-server -c /tmp/d445a/bogus.yaml; echo "rc=$?"' 2>&1)"
+  r="$("${K[@]}" exec deploy/upf -c fl-af -- sh -c 'sed "s/mode: t8-exclusion/mode: bogus/" /tmp/d445a/af.yaml >/tmp/d445a/bogus.yaml; chmod 0644 /tmp/d445a/bogus.yaml; ip netns exec fl-dn setpriv --reuid=65534 --regid=65534 --clear-groups --inh-caps=-all --bounding-set=-all --no-new-privs timeout 20 nr-fl-server -c /tmp/d445a/bogus.yaml; echo "rc=$?"' 2>&1)"
   if grep -q 'unknown mode "bogus" for demo "d445a-fl-t8"' <<<"${r}" && grep -q 'rc=1' <<<"${r}"; then
     gate PASS "AF with mode bogus: $(grep -o 'unknown mode "bogus" for demo "d445a-fl-t8"' <<<"${r}" | head -1), rc=1"
   else gate FAIL "AF bogus mode: $(tr '\n' ' ' <<<"${r}" | head -c 300)"; fi
@@ -333,6 +416,8 @@ d445a_gates() {
 # no LoC within 20 s, and ue3 is readmitted. Results in S/probe.txt.
 d445a_probe() {
   local S="$1" K=(kubectl -n "${NAMESPACE}") i exc0 exc1 t_pc ok why
+  # Every LoC the AF reports for ue3: an exclusion, or a repeat while excluded.
+  local LOC='member_selection excluded=extid-ue003@fl\.nextg member=ue3 |T8 LOSS_OF_CONNECTIVITY for ue3 again'
   local P="${S}/probe.txt"; : >"${P}"
   for i in $(seq 1 10); do
     ok=PASS; why=""
@@ -344,18 +429,20 @@ d445a_probe() {
     grep -q 't8=subscribed ' <<<"${j}" || { ok=FAIL; why+=" no T8 subscription;"; }
     wait_for 120 sh -c "[ \$(kubectl -n ${NAMESPACE} logs deploy/udm -c udm | grep -c 'forwarded to AMF') -ge $((2 + i)) ]" \
       || { ok=FAIL; why+=" udmd leg $((2 + i)) not forwarded;"; }
-    exc0="$(af_count 'member_selection excluded=extid-ue003@fl\.nextg member=ue3 reason=nef_event lossOfConnectReason=[A-Z_0-9]+ ')"
+    exc0="$(af_count "${LOC}")"
     "${K[@]}" exec deploy/ue-3 -c ue -- nr-ue-deregister >>"${S}/probe-deregister.txt" 2>&1 || { ok=FAIL; why+=" deregister;"; }
-    wait_for 60 sh -c "[ \$(kubectl -n ${NAMESPACE} logs deploy/upf -c fl-af | grep -cE 'member_selection excluded=extid-ue003@fl\.nextg member=ue3 reason=nef_event lossOfConnectReason=[A-Z_0-9]+ ') -gt ${exc0} ]" \
-      || { ok=FAIL; why+=" no LoC with a reason within 60 s;"; }
+    wait_for 60 sh -c "[ \$(kubectl -n ${NAMESPACE} logs deploy/upf -c fl-af | grep -cE '${LOC}') -gt ${exc0} ]" \
+      || { ok=FAIL; why+=" no LoC within 60 s;"; }
     sleep 5
-    exc1="$(af_count 'member_selection excluded=extid-ue003|T8 LOSS_OF_CONNECTIVITY for ue3 again')"
+    exc1="$(af_count "${LOC}")"
+    aflog | grep -E "${LOC}" | tail -1 | grep -qE 'reason=nef_event lossOfConnectReason=[A-Z_0-9]+ ' \
+      || { ok=FAIL; why+=" the LoC is not an exclusion with a reason;"; }
     [[ "${exc1}" == $((exc0 + 1)) ]] || { ok=FAIL; why+=" ${exc1} LoC lines, expected $((exc0 + 1));"; }
     wait_for 120 af_has "hold before round=${hold2} until=members-full" || { ok=FAIL; why+=" no hold ${hold2};"; }
     "${K[@]}" delete pod -l app.kubernetes.io/name=ue-3 --wait=false >/dev/null
     t_pc="$(date +%s)"
     sleep 20
-    local exc2; exc2="$(af_count 'member_selection excluded=extid-ue003|T8 LOSS_OF_CONNECTIVITY for ue3 again')"
+    local exc2; exc2="$(af_count "${LOC}")"
     [[ "${exc2}" == "${exc1}" ]] || { ok=FAIL; why+=" a LoC within 20 s of the power cycle;"; }
     local re0; re0="$(af_count 'member_selection readmitted=extid-ue003@fl\.nextg member=ue3 ')"
     wait_for 300 sh -c "[ \$(kubectl -n ${NAMESPACE} logs deploy/upf -c fl-af | grep -c 'member_selection readmitted=extid-ue003@fl.nextg member=ue3 ') -ge ${i} ]" \

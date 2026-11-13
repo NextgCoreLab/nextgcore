@@ -6,7 +6,9 @@
 #   device   the session's TUN (uesimtun0), so the socket rides the session;
 #   clients  3 in t8-exclusion, 5 in poisoned-ue (read from the demo block);
 #   leak_raw only when $FL_LEAK_RAW=true (the leak-raw revert arm; a
-#            revert-hooks nr-ue refuses it otherwise).
+#            nr-ue without revert-hooks refuses it).
+# $FL_DEVICE / $FL_SERVER override device and server for the eth0 revert arm only
+# (the client on the pod network, not the PDU session).
 # A template that already sets either key fails here rather than run with two.
 apiVersion: v1
 kind: ConfigMap
@@ -36,8 +38,8 @@ data:
     # d445a-fl-t8 (nextgsim#480)
     federated_learning_enabled: true
     fl:
-      server: 10.46.0.10:7480
-      device: ${prefix:-uesimtun}0
+      server: ${FL_SERVER:-10.46.0.10:7480}
+      device: ${FL_DEVICE:-${prefix:-uesimtun}0}
       member: ${FL_MEMBER}
       clients: ${clients}
       seed: 480

@@ -46,14 +46,30 @@
             fieldPath: status.podIP
       - name: RUST_LOG
         value: info
-    # ip netns, veth and iptables in the pod's network namespace.
+    # Not privileged. The sidecar's root shell gets only what it uses:
+    #   NET_ADMIN  veth, addresses, routes, iptables in the pod's network namespace;
+    #   SYS_ADMIN  `ip netns add` / `ip netns exec` (unshare, the bind mount);
+    #   NET_RAW    tcpdump on fl-up;
+    #   CHOWN, SETUID, SETGID  handing the key to nobody, and the drop to it
+    #              (setpriv; tcpdump -Z).
+    # Over the runtime's default set (deploy-eks.sh's validator refuses `drop:
+    # [ALL]` beside `add`), so these last four are listed for the record.
+    # nr-fl-server itself, the one listener UEs reach, runs as nobody with no
+    # capabilities and no_new_privs (setpriv, sidecar.sh). Whether `ip netns add`
+    # works unprivileged on devtest1's nodes is a live-run question: if it fails,
+    # the fallback is privileged: true here, with the AF still dropped to nobody.
     securityContext:
-      privileged: true
+      privileged: false
+      allowPrivilegeEscalation: false
       runAsUser: 0
       capabilities:
         add:
           - NET_ADMIN
           - SYS_ADMIN
+          - NET_RAW
+          - CHOWN
+          - SETUID
+          - SETGID
     resources:
       requests:
         cpu: 100m

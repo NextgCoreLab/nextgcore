@@ -24,8 +24,15 @@ T="${TARGET_DIR:-/tmp/tgt-d445a}"
 ARMS=("$@")
 [[ ${#ARMS[@]} -gt 0 ]] || ARMS=(off:off main:t8-exclusion poisoned:poisoned-ue probe:t8-exclusion
   gates:t8-exclusion no-t8:t8-exclusion freeze-global:t8-exclusion leak-raw:t8-exclusion
-  nat-on:t8-exclusion nefd-down:t8-exclusion)
+  nat-on:t8-exclusion nefd-down:t8-exclusion udm-fallback:t8-exclusion eth0:t8-exclusion)
 set -e
+# What the binaries are built from, read BEFORE the build and checked unchanged
+# after it; build-images.sh refuses bin dirs whose BUILT_FROM is not the HEAD its
+# tag names.
+CORE_HEAD="$(git -C "${CORE_SRC}" rev-parse HEAD)"; SIM_HEAD="$(git -C "${SIM_SRC}" rev-parse HEAD)"
+for d in "${CORE_SRC}" "${SIM_SRC}"; do
+  [[ -z "$(git -C "${d}" status --porcelain)" ]] || { echo "run-arms: ${d} is not clean" >&2; exit 1; }
+done
 (cd "${CORE_SRC}/src" && CARGO_TARGET_DIR="${T}/core" cargo build --release --locked \
   -p nextgcore-nrfd -p nextgcore-amfd -p nextgcore-smfd -p nextgcore-upfd -p nextgcore-ausfd \
   -p nextgcore-udmd -p nextgcore-udrd -p nextgcore-pcfd -p nextgcore-nssfd -p nextgcore-bsfd \
@@ -43,6 +50,10 @@ mkdir -p "${T}/simbin"
   cargo build --release --locked -p nextgsim-fl --features revert-hooks --bin nr-fl-server &&
   cp "${T}/sim/release/nr-ue" "${T}/simbin/nr-ue-revert-hooks" &&
   cp "${T}/sim/release/nr-fl-server" "${T}/simbin/nr-fl-server-revert-hooks")
+[[ "$(git -C "${CORE_SRC}" rev-parse HEAD)" == "${CORE_HEAD}" && "$(git -C "${SIM_SRC}" rev-parse HEAD)" == "${SIM_HEAD}" ]] \
+  || { echo "run-arms: a source tree moved during the build" >&2; exit 1; }
+echo "${CORE_HEAD}" >"${T}/core/release/BUILT_FROM"
+echo "${SIM_HEAD}" >"${T}/simbin/BUILT_FROM"
 tags="$(CORE_SRC="${CORE_SRC}" SIM_SRC="${SIM_SRC}" CORE_BIN_DIR="${T}/core/release" \
   SIM_BIN_DIR="${T}/simbin" "${HERE}/build-images.sh" | grep -E '^(CORE|SIM)_IMAGE_TAG=')"
 eval "${tags}"

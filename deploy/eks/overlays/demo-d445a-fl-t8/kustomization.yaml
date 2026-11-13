@@ -8,7 +8,8 @@
 #   nef.yaml            nefd (built with --features demo-d445a-fl-t8), its
 #                       ConfigMap nef-config (a toggle target) and Service.
 #   af.yaml             the AF's config (a toggle target) and the upf-pod
-#                       sidecar that builds the fl-dn DN and runs nr-fl-server.
+#                       sidecar (not privileged) that builds the fl-dn DN and
+#                       runs nr-fl-server as nobody.
 #   patches/upf-af.yaml the sidecar, plus upfd's UPF_NAT_EXCLUDE=10.46.0.0/24
 #                       and UPF_SESSION_METRICS=seid-ue-ip (#1455).
 #   subscribers.yaml    imsi-...001-005 with extid ueNNN@fl.nextg (#1490).

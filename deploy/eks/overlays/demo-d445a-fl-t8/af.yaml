@@ -1,8 +1,8 @@
 # The FL application server (AF, nr-fl-server) of demo d445a-fl-t8
 # (nextgsim#480) and its N6 data network "fl-dn". No Service, no port.
 #
-# Where it runs: a second container of the upf pod (patches/upf-af.yaml), in a
-# network namespace of its own, fl-dn, joined to the UPF's namespace by a veth
+# Where it runs: a second container of the upf pod (patches/upf-af.yaml, not
+# privileged; nr-fl-server runs as nobody), in a network namespace of its own, fl-dn, joined to the UPF's namespace by a veth
 # pair:
 #
 #     UE --GTP-U--> upfd --ogstun--> [UPF netns] fl-up 10.46.0.1/24
@@ -107,6 +107,11 @@ data:
     for f in ${flags:-}; do
       case "$f" in --no-t8|--freeze-global) ;; *) say "FATAL: flag $f"; exit 1 ;; esac
     done
-    say "starting $bin ${flags:-} in fl-dn"
+    # The AF parses UE-supplied frames: it runs as nobody, with no capabilities,
+    # no supplementary groups and no_new_privs. It reads its config and key only.
+    chmod 0711 "$D"; chmod 0644 "$D/af.yaml"
+    chown -R 65534:65534 "$D/cca"
+    say "starting $bin ${flags:-} in fl-dn as uid 65534"
     # shellcheck disable=SC2086
-    exec ip netns exec fl-dn "$bin" -c "$D/af.yaml" ${flags:-}
+    exec ip netns exec fl-dn setpriv --reuid=65534 --regid=65534 --clear-groups \
+      --inh-caps=-all --bounding-set=-all --no-new-privs "$bin" -c "$D/af.yaml" ${flags:-}
