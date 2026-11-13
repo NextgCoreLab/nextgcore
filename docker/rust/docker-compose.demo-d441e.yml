@@ -1,0 +1,95 @@
+# Demo d441e-model-retrain stack (nextgsim#468): one NRF and two nwdafd
+# instances of the same binary in different roles, the TS 23.288 §6.2A/§6.2E
+# split between an MTLF and an AnLF.
+#
+#   service     role   what it does
+#   nrf         -      registration and discovery (Nnrf_NFManagement/NFDiscovery)
+#   nwdaf-mtlf  mtlf   trains and serves the NF_LOAD model (v1 at start-up),
+#                      takes Nnwdaf_MLModelMonitor registrations, refits on an
+#                      accuracy drop (mode retrain) and provisions v2
+#   nwdaf-anlf  anlf   discovers the MTLF, subscribes for a model with a 0.70
+#                      accuracy threshold, verifies and loads it, registers it
+#                      for monitoring and reports its accuracy
+#
+# STANDALONE, NOT AN OVERLAY of docker-compose.yml (whose `ports:` lists would
+# merge in). Nothing is published and the network is `internal` (no route off
+# the host); CI asserts that from `docker compose config`.
+#
+# The nwdafd image (default name nextgcore-demo/nwdaf-d441e:local: a demo build,
+# never a published image) must be built with `--features demo-d441e-model-retrain`,
+# or the demo: block fails start-up (DemoConfigError::UnknownKey). The configs
+# carry mode `retrain`; configs/demo-d441e/check.sh copies them to a run
+# directory per arm (D441E_CONFIG_DIR) and sets the mode or removes the block.
+#
+# No SBI OAuth2 enforcement. The ticket wants NEXTGCORE_SBI_OAUTH2_REQUIRE=1,
+# but nextgcore-sbi's require_oauth2 covers every route, so each NWDAF would
+# answer the other's token-less notifications (MLModelProvision Notify to the
+# AnLF, MLModelMonitor Notify to the MTLF; TS 33.501 §13.4.1 exempts them) with
+# 401, and nwdafd fetches tokens only when its own listener enforces. That is
+# nextgcore#1421; the OAuth2 arm waits for it.
+#
+# Usage (images and config dir as check.sh sets them):
+#   D441E_NWDAF_IMAGE=... D441E_NRF_IMAGE=... \
+#     docker compose -f docker-compose.demo-d441e.yml up -d
+#   configs/demo-d441e/check.sh retrain     # the whole seeded arm, see its header
+
+name: nextg-demo-d441e
+
+x-nwdaf: &nwdaf
+  image: ${D441E_NWDAF_IMAGE:-nextgcore-demo/nwdaf-d441e:local}
+  # A start-up failure (an unknown mode) must stay a failure, not a restart loop.
+  restart: "no"
+  healthcheck:
+    test: ["CMD-SHELL", "kill -0 1"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 5s
+  depends_on:
+    nrf:
+      condition: service_healthy
+  networks: [d441e]
+
+services:
+  nrf:
+    image: ${D441E_NRF_IMAGE:-nextgcore-rust/nrf:latest}
+    restart: "no"
+    environment:
+      RUST_LOG: info
+      NEXTGCORE_SBI_PROFILE: "dev"
+    command: ["-c", "/etc/nextgcore/nrf.yaml"]
+    volumes:
+      - ${D441E_CONFIG_DIR:-./configs/demo-d441e}/nrf.yaml:/etc/nextgcore/nrf.yaml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    networks: [d441e]
+
+  nwdaf-mtlf:
+    <<: *nwdaf
+    environment:
+      RUST_LOG: info
+      NEXTGCORE_SBI_PROFILE: "dev"
+    # A pinned instance id: the AnLF registers with it as its MTLF, and the
+    # MTLF finds the AnLF at the NRF by the AnLF's.
+    command: ["-c", "/etc/nextgcore/nwdaf.yaml", "--nrf-uri", "http://nrf:7777",
+              "--nf-instance-id", "d441e000-0468-4000-8000-00000000f001"]
+    volumes:
+      - ${D441E_CONFIG_DIR:-./configs/demo-d441e}/nwdaf-mtlf.yaml:/etc/nextgcore/nwdaf.yaml:ro
+
+  nwdaf-anlf:
+    <<: *nwdaf
+    environment:
+      RUST_LOG: info
+      NEXTGCORE_SBI_PROFILE: "dev"
+    command: ["-c", "/etc/nextgcore/nwdaf.yaml", "--nrf-uri", "http://nrf:7777",
+              "--nf-instance-id", "d441e000-0468-4000-8000-00000000a001"]
+    volumes:
+      - ${D441E_CONFIG_DIR:-./configs/demo-d441e}/nwdaf-anlf.yaml:/etc/nextgcore/nwdaf.yaml:ro
+
+networks:
+  d441e:
+    internal: true

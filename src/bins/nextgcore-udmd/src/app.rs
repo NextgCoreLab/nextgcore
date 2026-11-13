@@ -1276,6 +1276,11 @@ pub async fn handle_id_translation_result(ue_id: &str, request: &SbiRequest) -> 
         Ok(resp) if resp.status == 404 => {
             log::debug!("[{ue_id}] UDR has no identity-data; trying am-data gpsis");
         }
+        // The UDR refused the identifier itself (e.g. an unsupported ueId type):
+        // the consumer's request is at fault, not the UDR.
+        Ok(resp) if resp.status == 400 => {
+            return send_problem(400, "MANDATORY_IE_INCORRECT", "Unsupported ueId");
+        }
         Ok(resp) => {
             log::error!("[{ue_id}] UDR identity-data GET returned {}", resp.status);
             return nextgcore_sbi::server::send_service_unavailable("UDR identity-data failed");
@@ -6627,6 +6632,54 @@ mod tests {
             .expect("GET");
         assert_eq!(resp.status, 404);
         assert_eq!(json_body(&resp)["cause"], "USER_NOT_FOUND");
+
+        udm_server.stop().await.expect("stop udm");
+        udr_server.stop().await.expect("stop udr");
+    }
+
+    /// A ueId the UDR refuses as malformed is the consumer's error: 400, not 503.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn id_translation_unsupported_ue_id_is_bad_request() {
+        let _udr_env = crate::sbi_path::UDR_ENV_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        nextgcore_core::test_log::init();
+        udm_context_init(64, 64);
+
+        // A UDR that answers identity-data as the real one does for an
+        // identifier whose type it cannot look up.
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let udr_server = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), port_listener);
+        udr_server
+            .start(|_req: SbiRequest| async move {
+                nextgcore_sbi::server::send_bad_request(
+                    "Unsupported ueId type",
+                    Some("MANDATORY_IE_INCORRECT"),
+                )
+            })
+            .await
+            .expect("mock UDR starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        std::env::set_var("UDR_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("UDR_SBI_PORT", port.to_string());
+        let (udm_server, client) = start_real_udm().await;
+
+        let resp = client
+            .get("/nudm-sdm/v2/foo-491721075423/id-translation-result")
+            .await
+            .expect("GET");
+        assert_eq!(resp.status, 400, "{:?}", resp.http.content);
+        assert_eq!(json_body(&resp)["cause"], "MANDATORY_IE_INCORRECT");
 
         udm_server.stop().await.expect("stop udm");
         udr_server.stop().await.expect("stop udr");

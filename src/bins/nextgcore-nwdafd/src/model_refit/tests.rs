@@ -127,22 +127,78 @@ fn the_series_is_a_function_of_seed_and_step() {
     assert_eq!(sa[sa.len() - sb.len()..], sb[..]);
 }
 
-/// Least squares recovers a known AR process (oldest lag first).
+/// Least squares recovers a known AR process (oldest lag first), whatever
+/// the noise realisation: the noise comes from fixed local seeds, not the
+/// series default, and the tolerance (0.06, about 3 sigma of the estimate at
+/// N = 4000) holds at every one of them (#1491 review, MINOR 1: 0.03 held at
+/// seed 468 only).
 #[test]
 fn fit_ar_recovers_a_known_process() {
-    let cfg = SeriesConfig::default();
-    let mut y = vec![0.3, 0.4, 0.5, 0.4, 0.3];
-    for k in 5..4000u64 {
-        let t = y.len();
-        y.push(0.1 + 0.6 * y[t - 1] - 0.2 * y[t - 3] + 0.1 * cfg.noise(k));
+    for seed in [1, 5, 7, 42, 468, 100_000] {
+        let noise = SeriesConfig {
+            seed,
+            ..SeriesConfig::default()
+        };
+        let mut y = vec![0.3, 0.4, 0.5, 0.4, 0.3];
+        for k in 5..4000u64 {
+            let t = y.len();
+            y.push(0.1 + 0.6 * y[t - 1] - 0.2 * y[t - 3] + 0.1 * noise.noise(k));
+        }
+        let (w, c) = fit_ar(&y, 5).unwrap();
+        let want = [0.0, 0.0, -0.2, 0.0, 0.6];
+        for (got, want) in w.iter().zip(want) {
+            assert!((got - want).abs() < 0.06, "seed {seed}: {w:?}");
+        }
+        assert!((c - 0.1).abs() < 0.06, "seed {seed}: {c}");
     }
-    let (w, c) = fit_ar(&y, 5).unwrap();
-    let want = [0.0, 0.0, -0.2, 0.0, 0.6];
-    for (got, want) in w.iter().zip(want) {
-        assert!((got - want).abs() < 0.03, "{w:?}");
+    let y = [0.3, 0.4, 0.5, 0.4, 0.3];
+    assert!(fit_ar(&y, 5).is_err());
+}
+
+/// The one-step predictions of an AR fit `(w, c)` over `series`.
+fn ar_predictions(series: &[f64], w: &[f64], c: f64) -> Vec<f64> {
+    (w.len()..series.len())
+        .map(|t| {
+            c + w
+                .iter()
+                .zip(&series[t - w.len()..t])
+                .map(|(w, x)| w * x)
+                .sum::<f64>()
+        })
+        .collect()
+}
+
+/// The ridge term's degenerate cases (#1491 review, MINOR 2). A constant
+/// series (a flat real NF with `retrain_series.enabled: false`) has a zero
+/// lag covariance: without the ridge it never fits and the retrain defers
+/// for ever; with it, it fits the mean.
+#[test]
+fn fit_ar_fits_a_constant_series_to_its_mean() {
+    let y = vec![0.42; REFIT_WINDOW];
+    let (w, c) = fit_ar(&y, AR_ORDER).expect("a constant series fits");
+    assert!(w.iter().all(|w| w.abs() < 1e-9), "{w:?}");
+    assert!((c - 0.42).abs() < 1e-9, "{c}");
+    for p in ar_predictions(&y, &w, c) {
+        assert!((p - 0.42).abs() < 1e-9, "{p}");
     }
-    assert!((c - 0.1).abs() < 0.03, "{c}");
-    assert!(fit_ar(&y[..5], 5).is_err());
+}
+
+/// A noise-free period-2 series makes the odd lags identical and the even
+/// lags identical: the normal equations are singular without the ridge.
+/// With it the fit exists and predicts every next point.
+#[test]
+fn fit_ar_fits_a_noise_free_period_2_series() {
+    let y: Vec<f64> = (0..REFIT_WINDOW)
+        .map(|k| if k % 2 == 0 { 0.2 } else { 0.8 })
+        .collect();
+    let (w, c) = fit_ar(&y, AR_ORDER).expect("a period-2 series fits");
+    for (t, p) in (AR_ORDER..y.len()).zip(ar_predictions(&y, &w, c)) {
+        assert!(
+            (p - y[t]).abs() < 1e-3,
+            "step {t}: {p} vs {} ({w:?}, {c})",
+            y[t]
+        );
+    }
 }
 
 /// The demo's arithmetic in one place: v1 follows the calm part, scores 0.6x
