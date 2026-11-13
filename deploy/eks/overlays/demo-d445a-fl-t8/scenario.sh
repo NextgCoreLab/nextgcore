@@ -478,7 +478,9 @@ d445a_probe() {
     local hold1=$((2 * i)) hold2=$((2 * i + 1))
     wait_for 240 af_has "hold before round=${hold1} until=member-excluded" || { ok=FAIL; why+=" no hold ${hold1};"; }
     # ue3's current membership carries a T8 subscription made after a UE ID lookup.
-    local j; j="$(aflog | grep -E "(member_joined member=ue3 gpsi=|member_selection readmitted=extid-ue003@fl\.nextg member=ue3) " | tail -1)"
+    # Not "(A|B) " - that trailing space requires a space after `gpsi=`,
+  # which never happens (`gpsi=extid-ue003@fl.nextg`). Match either line as-is.
+  local j; j="$(aflog | grep -E "member_joined member=ue3 gpsi=|member_selection readmitted=extid-ue003@fl\.nextg member=ue3" | tail -1)"
     grep -q 'gpsi=extid-ue003@fl.nextg\|readmitted=extid-ue003@fl.nextg' <<<"${j}" || { ok=FAIL; why+=" ue3 not resolved to extid-ue003@fl.nextg;"; }
     grep -q 't8=subscribed ' <<<"${j}" || { ok=FAIL; why+=" no T8 subscription;"; }
     wait_for 120 sh -c "[ \$(kubectl -n ${NAMESPACE} logs deploy/udm -c udm | grep -c 'forwarded to AMF') -ge $((2 + i)) ]" \
