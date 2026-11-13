@@ -10,6 +10,14 @@ description = "NextGCore NEF (Network Exposure Function, TS 23.501 6.2.5 / TS 29
 name = "nextgcore-nefd"
 path = "src/main.rs"
 
+[features]
+default = []
+## nextgsim#480 (demo d445a-fl-t8): TS 29.522 UE ID retrieval for an AF
+## (POST /3gpp-ueid/v1/retrieve: BSF by UE address, then the UDM's EXT_ID
+## GPSI), the demo's T8 delivery line, and /metrics while the demo is on. Served
+## only with the demo: block active as well. Off by default.
+demo-d445a-fl-t8 = []
+
 [dependencies]
 nextgcore-core = { workspace = true }
 nextgcore-sbi = { workspace = true }
@@ -29,12 +37,17 @@ base64.workspace = true
 uuid.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
+# The demo: config block (nextgsim#458). Read by every build, so a demo block
+# naming a demo this build was not compiled with fails start-up.
+nextgcore-demo = { workspace = true }
 
 [dev-dependencies]
 proptest.workspace = true
 # Issue #110: the strict-peer northbound OAuth2 test signs an ES256 token
 # against a served JWKS, so the real listener verification path runs.
 p256 = { workspace = true, features = ["ecdsa"] }
+# nextgsim#480: the demo's T8 delivery line is asserted from the captured log.
+nextgcore-core = { workspace = true, features = ["test-log"] }
 
 [lints]
 workspace = true

@@ -860,10 +860,10 @@ async fn handle_identity_data(ue_id: &str, method: &str, request: &SbiRequest) -
 
 /// Build a TS 29.505 `IdentityData` from a subscriber record.
 ///
-/// `supiList` carries the record's IMSI in `imsi-` form and `gpsiList` its
-/// MSISDNs in `msisdn-` form — the same GPSI spelling `am-data` uses, so a
-/// consumer sees one identity vocabulary across both resources. Both members
-/// have `minItems: 1`, so an empty list is omitted rather than emitted empty.
+/// `supiList` carries the record's IMSI in `imsi-` form and `gpsiList` its GPSIs
+/// ([`subscriber_gpsis`]) — the same GPSI spelling `am-data` uses, so a consumer
+/// sees one identity vocabulary across both resources. Both members have
+/// `minItems: 1`, so an empty list is omitted rather than emitted empty.
 fn build_identity_data(
     data: &nextgcore_dbi::types::NextgcoreSubscriptionData,
 ) -> serde_json::Value {
@@ -874,15 +874,37 @@ fn build_identity_data(
             serde_json::json!([format!("imsi-{imsi}")]),
         );
     }
-    if data.num_of_msisdn > 0 {
-        let gpsis: Vec<serde_json::Value> = data
-            .msisdn
-            .iter()
-            .map(|m| serde_json::Value::String(format!("msisdn-{}", m.bcd)))
-            .collect();
+    let gpsis = subscriber_gpsis(data);
+    if !gpsis.is_empty() {
         doc.insert("gpsiList".to_string(), serde_json::Value::Array(gpsis));
     }
     serde_json::Value::Object(doc)
+}
+
+/// A subscriber's GPSIs in TS 29.571 `Gpsi` form: each MSISDN as `msisdn-<digits>`,
+/// then each External Identifier as `extid-<username@realm>` (nextgsim#480).
+///
+/// One list for `identity-data`'s `gpsiList` and `am-data`'s `gpsis`, so the two
+/// resources cannot disagree about who the subscriber is. The External
+/// Identifiers are what a NEF hands an AF (TS 23.502 §4.15.10 steps 9-10, via the
+/// UDM's `requested-gpsi-type=EXT_ID`), and the AF names the UE by them in a T8
+/// request, which the UDM then resolves back through `identity-data` keyed by
+/// that `extid-` GPSI.
+fn subscriber_gpsis(
+    data: &nextgcore_dbi::types::NextgcoreSubscriptionData,
+) -> Vec<serde_json::Value> {
+    // `num_of_msisdn` gates the MSISDNs, as it always has here.
+    let msisdns = if data.num_of_msisdn > 0 {
+        data.msisdn.as_slice()
+    } else {
+        &[]
+    };
+    msisdns
+        .iter()
+        .map(|m| format!("msisdn-{}", m.bcd))
+        .chain(data.external_ids.iter().map(|e| format!("extid-{e}")))
+        .map(serde_json::Value::String)
+        .collect()
 }
 
 /// `GET`/`PATCH /subscription-data/{ueId}/pp-data` — TS 29.505 §5.2.13.
@@ -3625,12 +3647,8 @@ fn handle_application_dataset(
 
 fn build_am_data(data: &nextgcore_dbi::types::NextgcoreSubscriptionData) -> serde_json::Value {
     let mut am = serde_json::Map::new();
-    if data.num_of_msisdn > 0 {
-        let gpsis: Vec<serde_json::Value> = data
-            .msisdn
-            .iter()
-            .map(|m| serde_json::Value::String(format!("msisdn-{}", m.bcd)))
-            .collect();
+    let gpsis = subscriber_gpsis(data);
+    if !gpsis.is_empty() {
         am.insert("gpsis".to_string(), serde_json::Value::Array(gpsis));
     }
     if data.ambr.uplink > 0 || data.ambr.downlink > 0 {
@@ -6420,6 +6438,58 @@ udr:
         udr.stop().await.expect("stop");
     }
 
+    /// **nextgsim#480**: identity-data answers for an `extid-` GPSI, the key a
+    /// NEF's T8 `externalId` reaches the UDR with (via the UDM's
+    /// id-translation-result), and lists the External Identifier among the GPSIs
+    /// when asked by SUPI (the direction the NEF's UE ID retrieval reads). The
+    /// mirror's `extid` lookup is the Mongo `{extid: <value>}` query.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_identity_data_by_external_id() {
+        let (udr, client, _listener, _cb, _rx) = start_udr_and_listener().await;
+        let _dbi = DbiTestStore::enable().await;
+        let supi = "imsi-001019900004801";
+        let ext = "ue4801@fl.nextg";
+        nextgcore_dbi::test_store::provision_subscriber_with_external_ids(
+            supi,
+            &["491721074801"],
+            &[ext],
+        );
+        let gpsis = json!(["msisdn-491721074801", format!("extid-{ext}")]);
+        for id in [supi.to_string(), format!("extid-{ext}")] {
+            let resp = client
+                .get(&format!("/nudr-dr/v2/subscription-data/{id}/identity-data"))
+                .await
+                .expect("GET identity-data");
+            assert_eq!(
+                resp.status, 200,
+                "identity-data must resolve {id}: {:?}",
+                resp.http.content
+            );
+            let doc = json_of(&resp);
+            assert_eq!(doc["supiList"], json!([supi]), "supiList for {id}");
+            assert_eq!(doc["gpsiList"], gpsis, "gpsiList for {id}");
+        }
+        // am-data's gpsis carry it too.
+        let resp = client
+            .get(&format!(
+                "/nudr-dr/v2/subscription-data/{supi}/provisioned-data/am-data"
+            ))
+            .await
+            .expect("GET am-data");
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        assert_eq!(json_of(&resp)["gpsis"], gpsis);
+        // An External Identifier nobody holds is a 404, and an MSISDN's digits
+        // under extid- match nothing: the lookup is by the extid field only.
+        for id in ["extid-nobody@fl.nextg", "extid-491721074801"] {
+            let resp = client
+                .get(&format!("/nudr-dr/v2/subscription-data/{id}/identity-data"))
+                .await
+                .expect("GET unknown identity-data");
+            assert_eq!(resp.status, 404, "{id}");
+        }
+        udr.stop().await.expect("stop");
+    }
+
     /// #87 gap 3: policy-data PATCH, the snssai/dnn filter, the documents that
     /// were absent, and a subs-to-notify round trip.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6866,6 +6936,45 @@ udr:
                 "gpsiList": ["msisdn-491721075400"]
             }),
             "both lists use the same identity spelling as am-data's gpsis"
+        );
+    }
+
+    /// **nextgsim#480**: a subscriber's External Identifiers are GPSIs too, in
+    /// `extid-<username@realm>` form, in both `identity-data`'s `gpsiList` and
+    /// `am-data`'s `gpsis`. Before, both lists carried only MSISDNs, so the UDM's
+    /// `requested-gpsi-type=EXT_ID` had nothing to return and a NEF could never
+    /// hand an AF an External Identifier.
+    #[test]
+    fn test_external_ids_are_extid_gpsis_in_identity_and_am_data() {
+        let mut data = nextgcore_dbi::types::NextgcoreSubscriptionData::new();
+        data.imsi = Some("001010000000480".to_string());
+        let mut msisdn = nextgcore_dbi::types::NextgcoreMsisdn::default();
+        msisdn.bcd = "491721075480".to_string();
+        data.msisdn.push(msisdn);
+        data.num_of_msisdn = 1;
+        data.external_ids = vec!["ue013@fl.nextg".to_string(), "alt@fl.nextg".to_string()];
+        let gpsis = json!([
+            "msisdn-491721075480",
+            "extid-ue013@fl.nextg",
+            "extid-alt@fl.nextg"
+        ]);
+        assert_eq!(
+            build_identity_data(&data),
+            json!({"supiList": ["imsi-001010000000480"], "gpsiList": gpsis})
+        );
+        assert_eq!(build_am_data(&data)["gpsis"], gpsis);
+
+        // An External Identifier alone is enough for a gpsiList.
+        data.msisdn.clear();
+        data.num_of_msisdn = 0;
+        data.external_ids = vec!["ue013@fl.nextg".to_string()];
+        assert_eq!(
+            build_identity_data(&data)["gpsiList"],
+            json!(["extid-ue013@fl.nextg"])
+        );
+        assert_eq!(
+            build_am_data(&data)["gpsis"],
+            json!(["extid-ue013@fl.nextg"])
         );
     }
 

@@ -27,11 +27,20 @@ use crate::types::{nextgcore_ascii_to_hex, NEXTGCORE_MAX_SQN};
 /// `None` = store disabled (production Mongo path is used).
 static STORE: Mutex<Option<HashMap<String, NextgcoreDbiAuthInfo>>> = Mutex::new(None);
 
-/// Subscriber identity mirror: SUPI -> the subscriber's GPSIs, as MSISDN BCD
-/// digits. Separate from [`STORE`] because the identity documents and the
-/// authentication documents are provisioned independently, exactly as they are
-/// in Mongo (`subscriber.msisdn` vs `subscriber.security`).
-static IDENTITIES: Mutex<Option<HashMap<String, Vec<String>>>> = Mutex::new(None);
+/// One subscriber's GPSIs in the identity mirror: MSISDN BCD digits
+/// (`subscriber.msisdn`) and External Identifiers (`subscriber.extid`,
+/// nextgsim#480).
+#[derive(Debug, Clone, Default)]
+struct Identities {
+    msisdns: Vec<String>,
+    external_ids: Vec<String>,
+}
+
+/// Subscriber identity mirror: SUPI -> the subscriber's GPSIs. Separate from
+/// [`STORE`] because the identity documents and the authentication documents are
+/// provisioned independently, exactly as they are in Mongo (`subscriber.msisdn`
+/// vs `subscriber.security`).
+static IDENTITIES: Mutex<Option<HashMap<String, Identities>>> = Mutex::new(None);
 
 /// Subscriber DOCUMENT mirror (#1383): SUPI -> the subscriber's MongoDB document, as
 /// a test provisioned it. Answers `nextgcore_dbi_session_data`, which then runs the
@@ -98,12 +107,21 @@ pub(crate) fn subscriber_document(supi: &str) -> DbiResult<mongodb::bson::Docume
 /// exercised without MongoDB. `msisdns` are BCD digit strings, i.e. the value
 /// inside a `msisdn-<digits>` GPSI. Enables the store if it is not already on.
 pub fn provision_subscriber(supi: &str, msisdns: &[&str]) {
+    provision_subscriber_with_external_ids(supi, msisdns, &[]);
+}
+
+/// [`provision_subscriber`] with the subscriber's External Identifiers too
+/// (`username@realm`, the value inside an `extid-<value>` GPSI; nextgsim#480).
+pub fn provision_subscriber_with_external_ids(supi: &str, msisdns: &[&str], external_ids: &[&str]) {
     enable();
     let mut guard = IDENTITIES.lock().unwrap();
     let map = guard.get_or_insert_with(HashMap::new);
     map.insert(
         supi.to_string(),
-        msisdns.iter().map(|m| m.to_string()).collect(),
+        Identities {
+            msisdns: msisdns.iter().map(|m| m.to_string()).collect(),
+            external_ids: external_ids.iter().map(|e| e.to_string()).collect(),
+        },
     );
 }
 
@@ -137,23 +155,33 @@ pub(crate) fn subscription_data(id: &str) -> DbiResult<crate::types::NextgcoreSu
         .ok_or_else(|| DbiError::SubscriberNotFound(id.to_string()))?;
     let value = crate::types::nextgcore_id_get_value(id)
         .ok_or_else(|| DbiError::InvalidSupi(id.to_string()))?;
+    // `{extid: <value>}` reads only the `extid` field in Mongo, so an `extid-`
+    // identifier matches only External Identifiers (and nothing else matches
+    // them).
+    let by_extid = crate::types::nextgcore_id_get_type(id).as_deref()
+        == Some(crate::types::NEXTGCORE_EXTID_STRING);
     let hit = map
         .iter()
-        .find(|(supi, msisdns)| {
-            crate::types::nextgcore_id_get_value(supi).as_deref() == Some(value.as_str())
-                || msisdns.iter().any(|m| m == &value)
+        .find(|(supi, ids)| {
+            if by_extid {
+                ids.external_ids.iter().any(|e| e == &value)
+            } else {
+                crate::types::nextgcore_id_get_value(supi).as_deref() == Some(value.as_str())
+                    || ids.msisdns.iter().any(|m| m == &value)
+            }
         })
-        .map(|(supi, msisdns)| (supi.clone(), msisdns.clone()))
+        .map(|(supi, ids)| (supi.clone(), ids.clone()))
         .ok_or_else(|| DbiError::SubscriberNotFound(id.to_string()))?;
 
     let mut data = crate::types::NextgcoreSubscriptionData::new();
     data.imsi = crate::types::nextgcore_id_get_value(&hit.0);
-    for bcd in &hit.1 {
+    for bcd in &hit.1.msisdns {
         let mut msisdn = crate::types::NextgcoreMsisdn::default();
         msisdn.bcd = bcd.clone();
         data.msisdn.push(msisdn);
     }
     data.num_of_msisdn = data.msisdn.len();
+    data.external_ids = hit.1.external_ids;
     Ok(data)
 }
 
