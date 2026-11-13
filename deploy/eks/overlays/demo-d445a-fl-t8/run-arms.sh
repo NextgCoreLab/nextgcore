@@ -3,6 +3,8 @@
 #
 #   CORE_SRC=<clean nextgcore worktree> SIM_SRC=<clean nextgsim worktree> \
 #     deploy/eks/overlays/demo-d445a-fl-t8/run-arms.sh [ARM:MODE ...]
+#   With CORE_IMAGE_TAG and SIM_IMAGE_TAG set (an earlier run's tags, which must
+#   name those trees' HEADs and be in ECR), nothing is built or pushed.
 #
 # Prerequisites: the ECR repos nextg/<nf> for every core NF, nef included, plus
 # nextg/gnb and nextg/ue (this script creates none); the tags
@@ -29,6 +31,23 @@ ARMS=("$@")
   gates:t8-exclusion no-t8:t8-exclusion freeze-global:t8-exclusion leak-raw:t8-exclusion
   nat-on:t8-exclusion nefd-down:t8-exclusion udm-fallback:t8-exclusion eth0:t8-exclusion)
 set -e
+if [[ -n "${CORE_IMAGE_TAG:-}" && -n "${SIM_IMAGE_TAG:-}" ]]; then
+  # Images already pushed by an earlier run: reuse them, but only tags that name
+  # these trees' HEADs and exist in ECR. Nothing is built or pushed.
+  [[ "${CORE_IMAGE_TAG}" == "demo-d445a-fl-t8-$(git -C "${CORE_SRC}" rev-parse --short=12 HEAD)" \
+     && "${SIM_IMAGE_TAG}" == "demo-d445a-fl-t8-$(git -C "${SIM_SRC}" rev-parse --short=12 HEAD)" ]] \
+    || { echo "run-arms: the given tags do not name CORE_SRC/SIM_SRC at HEAD" >&2; exit 1; }
+  for r in nrf amf smf upf ausf udm udr pcf nssf bsf nef; do
+    aws ecr describe-images --repository-name "nextg/${r}" --image-ids imageTag="${CORE_IMAGE_TAG}" >/dev/null \
+      || { echo "run-arms: nextg/${r}:${CORE_IMAGE_TAG} is not in ECR" >&2; exit 1; }
+  done
+  for r in gnb ue; do
+    aws ecr describe-images --repository-name "nextg/${r}" --image-ids imageTag="${SIM_IMAGE_TAG}" >/dev/null \
+      || { echo "run-arms: nextg/${r}:${SIM_IMAGE_TAG} is not in ECR" >&2; exit 1; }
+  done
+  SKIP_BUILD=true
+fi
+if [[ "${SKIP_BUILD:-}" != true ]]; then
 # What the binaries are built from, read BEFORE the build and checked unchanged
 # after it; build-images.sh refuses bin dirs whose BUILT_FROM is not the HEAD its
 # tag names.
@@ -60,6 +79,7 @@ echo "${SIM_HEAD}" >"${T}/simbin/BUILT_FROM"
 tags="$(CORE_SRC="${CORE_SRC}" SIM_SRC="${SIM_SRC}" CORE_BIN_DIR="${T}/core/release" \
   SIM_BIN_DIR="${T}/simbin" "${HERE}/build-images.sh" | grep -E '^(CORE|SIM)_IMAGE_TAG=')"
 eval "${tags}"
+fi
 set +e
 SIM_SHA="$(git -C "${SIM_SRC}" rev-parse --short=12 HEAD)"
 export CORE_IMAGE_TAG SIM_IMAGE_TAG SIM_SHA YES=true
