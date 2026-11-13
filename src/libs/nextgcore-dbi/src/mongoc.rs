@@ -24,6 +24,10 @@ pub enum DbiError {
     NotInitialized,
     #[error("Invalid SUPI format: {0}")]
     InvalidSupi(String),
+    /// The `{ueId}` type prefix is not one the subscriber store is keyed by
+    /// ([`crate::types::NEXTGCORE_UE_ID_TYPES`]). A request error, not a storage one.
+    #[error("Unsupported ueId type: {0}")]
+    UnsupportedUeIdType(String),
     #[error("Subscriber not found: {0}")]
     SubscriberNotFound(String),
     #[error("Field not found: {0}")]

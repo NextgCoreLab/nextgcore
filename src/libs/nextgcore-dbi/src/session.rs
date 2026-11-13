@@ -23,10 +23,7 @@ pub fn nextgcore_dbi_session_data(
     s_nssai: Option<&NextgcoreSNssai>,
     dnn: &str,
 ) -> DbiResult<NextgcoreSessionData> {
-    let supi_type =
-        nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
-    let supi_id =
-        nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let (supi_type, supi_id) = nextgcore_ue_id_key(supi)?;
 
     // #1383: a test that provisioned a subscriber DOCUMENT answers from it, through the
     // same slice/DNN matching and `parse_session_data` below -- so a pcfd test can seed
@@ -39,7 +36,7 @@ pub fn nextgcore_dbi_session_data(
     }
 
     let collection = get_subscriber_collection()?;
-    let query = doc! { &supi_type: &supi_id };
+    let query = doc! { supi_type: &supi_id };
 
     let document = collection
         .find_one(query, None)?
