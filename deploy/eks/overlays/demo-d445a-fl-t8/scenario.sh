@@ -254,6 +254,10 @@ YAML
         wait_for 120 sh -c "[ -z \"\$(kubectl -n ${NAMESPACE} get pods -l app.kubernetes.io/name=nef -o name)\" ]" || bad "nefd still up"
         say "nefd scaled to 0"
       fi
+      # A scrape just before ue3 leaves: the counter of ue3's first session, which
+      # is released before the last scrape (checks.py ul_delta).
+      d445a_now_epoch >"${S}/metrics-mid.ts"
+      "${K[@]}" exec deploy/upf -c upf -- sh -c 'curl -s --max-time 5 http://127.0.0.1:9090/metrics' >"${S}/metrics-mid.prom" 2>/dev/null
       say "deregistering ue3"
       "${K[@]}" exec deploy/ue-3 -c ue -- nr-ue-deregister >"${S}/ue3-deregister.txt" 2>&1 || bad "ue3 deregistration"
       # Without the exclusion (no-t8, nefd-down) the hold before 4 runs out (240 s),
