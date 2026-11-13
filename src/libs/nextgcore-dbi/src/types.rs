@@ -31,6 +31,9 @@ pub const NEXTGCORE_IPV6_LEN: usize = 16;
 
 // Array limits
 pub const NEXTGCORE_MAX_NUM_OF_MSISDN: usize = 2;
+/// External Identifiers kept per subscriber (nextgsim#480). Further entries are
+/// ignored, as further MSISDNs are past [`NEXTGCORE_MAX_NUM_OF_MSISDN`].
+pub const NEXTGCORE_MAX_NUM_OF_EXTID: usize = 4;
 pub const NEXTGCORE_MAX_NUM_OF_SLICE: usize = 8;
 pub const NEXTGCORE_MAX_NUM_OF_SESS: usize = 4;
 pub const NEXTGCORE_MAX_NUM_OF_PCC_RULE: usize = 8;
@@ -45,6 +48,13 @@ pub const NEXTGCORE_S_NSSAI_NO_SD_VALUE: u32 = 0xFFFFFF;
 // MongoDB field names (matching C implementation)
 pub const NEXTGCORE_IMSI_STRING: &str = "imsi";
 pub const NEXTGCORE_MSISDN_STRING: &str = "msisdn";
+/// The subscriber's External Identifier(s) (TS 23.003 §19.7.2, `username@realm`),
+/// a string or an array of strings on the subscriber document (nextgsim#480).
+///
+/// Named after the TS 29.571 GPSI prefix (`extid-<value>`), so the identity
+/// lookup `{<idType>: <idValue>}` resolves an `extid-` GPSI with no special case,
+/// exactly as `msisdn-` resolves through [`NEXTGCORE_MSISDN_STRING`].
+pub const NEXTGCORE_EXTID_STRING: &str = "extid";
 pub const NEXTGCORE_IMEISV_STRING: &str = "imeisv";
 pub const NEXTGCORE_SECURITY_STRING: &str = "security";
 pub const NEXTGCORE_K_STRING: &str = "k";
@@ -301,6 +311,10 @@ pub struct NextgcoreSubscriptionData {
     pub imsi: Option<String>,
     pub msisdn: Vec<NextgcoreMsisdn>,
     pub num_of_msisdn: usize,
+    /// The subscriber's External Identifiers, `username@realm`, as provisioned
+    /// under [`NEXTGCORE_EXTID_STRING`] (nextgsim#480). Each is a GPSI in its
+    /// `extid-<value>` form (TS 29.571 `Gpsi`), alongside the MSISDNs.
+    pub external_ids: Vec<String>,
     pub access_restriction_data: i32,
     pub subscriber_status: i32,
     pub operator_determined_barring: i32,
@@ -333,6 +347,7 @@ impl NextgcoreSubscriptionData {
         self.imsi = None;
         self.msisdn.clear();
         self.num_of_msisdn = 0;
+        self.external_ids.clear();
         for slice in &mut self.slice {
             for session in &mut slice.session {
                 session.name = None;

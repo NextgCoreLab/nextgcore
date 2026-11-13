@@ -56,6 +56,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod context;
+/// nextgsim#480 (demo d445a-fl-t8): TS 29.522 UE ID retrieval for an AF.
+#[cfg(feature = "demo-d445a-fl-t8")]
+mod ueid;
 
 pub use context::*;
 
@@ -192,6 +195,13 @@ struct Args {
     /// Maximum stored device triggering transactions.
     #[arg(long, default_value = "4096")]
     max_transactions: usize,
+
+    /// BSF SBI base URI for UE ID retrieval's Nbsf_Management_Discovery
+    /// (TS 23.502 §4.15.10 steps 7-8; demo d445a-fl-t8, nextgsim#480). Required
+    /// while that demo is active.
+    #[cfg(feature = "demo-d445a-fl-t8")]
+    #[arg(long)]
+    bsf_uri: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -379,6 +389,23 @@ async fn main() -> Result<()> {
     log::info!("NextGCore NEF v{}", env!("CARGO_PKG_VERSION"));
     log::info!("Network Exposure Function (TS 23.501 6.2.5; TS 29.122 northbound)");
 
+    // nextgsim#458: the demo: block. Checked against the demos this build was
+    // compiled with, so an unknown key or mode, or a demo whose cargo feature is
+    // not built, fails start-up. With no demo active nothing below changes.
+    let config_root = config_root(&args.config).map_err(|e| anyhow::anyhow!("{e}"))?;
+    nextgcore_demo::init_from_root(&config_root, &demo_registry())
+        .map_err(|e| anyhow::anyhow!("{e} ({e:?})"))?;
+    // nextgsim#480: UE ID retrieval, decided once here, before the route can be
+    // reached and before the NRF registration that advertises it.
+    #[cfg(feature = "demo-d445a-fl-t8")]
+    ueid::install(
+        nextgcore_demo::active_mode(ueid::DEMO_KEY),
+        args.bsf_uri.clone(),
+        args.udm_sdm_uri.clone().or_else(|| args.udm_uri.clone()),
+        &args.nrf_uri,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+
     nef_context_init(args.max_subscriptions, args.max_transactions);
 
     // Issue #66/#192: restore durable state BEFORE the SBI server can accept a
@@ -515,6 +542,21 @@ async fn main() -> Result<()> {
         );
     }
 
+    // nextgsim#480: this NEF's /metrics (nextg_demo_enabled and the UE ID
+    // outcomes), only while the demo is active. NEXTGCORE_METRICS_BIND, loopback
+    // by default.
+    #[cfg(feature = "demo-d445a-fl-t8")]
+    let _metrics = if ueid::serving() {
+        nextgcore_metrics::nf::serve_nf_metrics(
+            "NEF",
+            "NEF_METRICS_PORT",
+            Arc::new(render_prometheus),
+        )
+        .await
+    } else {
+        None
+    };
+
     let sbi_server = SbiServer::new(sbi_server_config);
     log::info!("Starting NEF SBI server on {addr}");
     sbi_server
@@ -630,6 +672,10 @@ async fn nef_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             "POST" => handle_producer_notification(nef_sub_id, &request).await,
             _ => send_method_not_allowed(method, "notify/{subscriptionId}"),
         },
+        // nextgsim#480: TS 29.522 UE ID retrieval. The router's own 404 unless
+        // demo d445a-fl-t8 is active.
+        #[cfg(feature = "demo-d445a-fl-t8")]
+        ["3gpp-ueid", "v1", "retrieve"] => ueid::route(method, path, &request).await,
         _ => send_not_found(&format!("Resource not found: {path}"), None),
     }
 }
@@ -1234,8 +1280,9 @@ async fn handle_producer_notification(nef_sub_id: &str, request: &SbiRequest) ->
         return SbiResponse::no_content();
     };
     let destination = sub.notification_destination.clone();
+    let sub_id = sub.id.clone();
     tokio::spawn(async move {
-        forward_notification_to_af(destination, notification).await;
+        forward_notification_to_af(&sub_id, destination, notification).await;
     });
 
     SbiResponse::no_content()
@@ -1500,12 +1547,10 @@ fn build_southbound_subscribe(
 /// `anyUE` subscription: a request the NEF could not satisfy became a request for
 /// far more than was asked.
 ///
-/// **Known gap, not a defect here:** this repo's own `udmd` answers this
-/// operation `501 Not Implemented`
-/// (`bins/nextgcore-udmd/src/app.rs:641-642`, tagged `udmd-12`), so against
-/// nextgcore's UDM every GPSI-targeted monitoring request is refused. That is the
-/// honest outcome and strictly better than the covert widening it replaces;
-/// making it *succeed* needs the UDM side, which belongs to #85.
+/// udmd serves the operation (#85) from the UDR's `identity-data`, keyed by the
+/// GPSI. An `extid-` GPSI resolves once the subscriber record carries the
+/// External Identifier (`extid`, nextgsim#480), which is what lets a T8 request
+/// name the UE by the `externalId` UE ID retrieval handed the AF.
 async fn resolve_gpsi_to_supi(udm_uri: Option<String>, gpsi: &str) -> Option<String> {
     let Some(uri) = udm_uri else {
         log::warn!(
@@ -1767,9 +1812,10 @@ async fn southbound_unsubscribe(producer_uri: Option<String>, southbound: Southb
 /// `mismatched_type`: the report names an event of a different MonitoringType than
 /// the subscription it arrived on. `unrecognised_type`: the report names no event
 /// type this NEF maps onto a TS 29.122 MonitoringType, or none at all (both
-/// `AmfEventReport.type` and `MonitoringReport.eventType` are mandatory). nefd has
-/// no `/metrics` listener yet, so this is read in-process (tests) and every drop is
-/// also logged.
+/// `AmfEventReport.type` and `MonitoringReport.eventType` are mandatory). nefd
+/// serves `/metrics` only in a `demo-d445a-fl-t8` build with that demo on
+/// (nextgsim#480); otherwise this is read in-process (tests). Every drop is also
+/// logged.
 pub static DROPPED_PRODUCER_REPORTS: nextgcore_metrics::nf::CounterFamily =
     nextgcore_metrics::nf::CounterFamily::new(
         "nef_producer_reports_dropped_total",
@@ -1932,7 +1978,11 @@ fn build_monitoring_notification(
 
 /// POST a MonitoringNotification to the AF's notificationDestination
 /// (best-effort, bounded timeouts; failures are logged, no retry).
-async fn forward_notification_to_af(destination: String, notification: serde_json::Value) {
+async fn forward_notification_to_af(
+    sub_id: &str,
+    destination: String,
+    notification: serde_json::Value,
+) {
     let Some((host, port, path)) = parse_http_uri(&destination) else {
         log::warn!(
             "invalid notificationDestination '{destination}'; notification dropped",
@@ -1943,8 +1993,22 @@ async fn forward_notification_to_af(destination: String, notification: serde_jso
     let client = bounded_client(&host, port);
     match client.post_json(&path, &notification).await {
         Ok(response) if response.is_success() => {
+            // nextgsim#480: the nefd step of the demo's ordered amfd -> nefd -> AF
+            // chain, at info while the demo is on. Debug otherwise, as before.
+            #[cfg(feature = "demo-d445a-fl-t8")]
+            if ueid::serving() {
+                nextgcore_demo::demo_log!(
+                    info,
+                    ueid::DEMO_KEY,
+                    "T8 delivery sub={sub_id} {} status={} to {destination}",
+                    delivered_reports_summary(&notification),
+                    response.status,
+                    destination = nextgcore_sbi::log_redact::redact_last_segment(&destination)
+                );
+                return;
+            }
             log::debug!(
-                "monitoring notification delivered to {destination}",
+                "monitoring notification {sub_id} delivered to {destination}",
                 destination = nextgcore_sbi::log_redact::redact_last_segment(&destination)
             );
         }
@@ -1962,6 +2026,70 @@ async fn forward_notification_to_af(destination: String, notification: serde_jso
             );
         }
     }
+}
+
+/// `monitoringType=… lossOfConnectReason=…` of each report in a delivered
+/// MonitoringNotification, for the demo's delivery line (nextgsim#480).
+#[cfg(feature = "demo-d445a-fl-t8")]
+fn delivered_reports_summary(notification: &serde_json::Value) -> String {
+    let reports = notification
+        .get("monitoringEventReports")
+        .and_then(|r| r.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    reports
+        .iter()
+        .map(|r| {
+            let field = |k: &str| match r.get(k) {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(serde_json::Value::Null) | None => "-".to_string(),
+                Some(other) => other.to_string(),
+            };
+            format!(
+                "monitoringType={} lossOfConnectReason={}",
+                field("monitoringType"),
+                field("lossOfConnectReason")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The NF config file's YAML root, or `Null` when the file does not exist (the
+/// nwdafd pattern). An unreadable or invalid file fails startup: its `demo:`
+/// block cannot be checked.
+fn config_root(config_path: &str) -> Result<serde_yaml::Value, String> {
+    match std::fs::read_to_string(config_path) {
+        Ok(content) => serde_yaml::from_str(&content)
+            .map_err(|e| format!("{config_path} is not valid YAML: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(serde_yaml::Value::Null),
+        Err(e) => Err(format!("cannot read {config_path}: {e}")),
+    }
+}
+
+/// The demos this build can run: `d445a-fl-t8` under its cargo feature, none
+/// otherwise.
+fn demo_registry() -> nextgcore_demo::DemoRegistry {
+    #[allow(unused_mut)]
+    let mut specs: Vec<nextgcore_demo::DemoSpec> = Vec::new();
+    #[cfg(feature = "demo-d445a-fl-t8")]
+    specs.push(ueid::DEMO_SPEC);
+    nextgcore_demo::DemoRegistry::new(&specs)
+}
+
+/// The `/metrics` body of a build with a demo: the families every NF shares
+/// (including `nextg_demo_enabled` while a demo is active), the dropped
+/// producer reports, and the UE ID outcomes.
+#[cfg(feature = "demo-d445a-fl-t8")]
+fn render_prometheus() -> String {
+    let mut out = nextgcore_metrics::nf::render_common(&nextgcore_metrics::nf::NfIdentity {
+        nf: "nef",
+        version: env!("CARGO_PKG_VERSION"),
+        nrf_client: true,
+    });
+    DROPPED_PRODUCER_REPORTS.render(&mut out);
+    ueid::render_metrics(&mut out);
+    out
 }
 
 /// Build an SBI client with bounded connect/request timeouts (amfd
@@ -2002,8 +2130,8 @@ fn nef_notify_base(
 }
 
 fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
-    nextgcore_sbi::nf_addressing::classify_profile_host(
-        serde_json::json!({
+    #[allow(unused_mut)]
+    let mut profile = serde_json::json!({
             "nfInstanceId": nf_instance_id,
             "nfType": "NEF",
             "nfStatus": "REGISTERED",
@@ -2020,9 +2148,16 @@ fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serd
             ],
             "allowedNfTypes": ["AF", "AMF", "UDM", "SCP"],
             "heartBeatTimer": 10
-        }),
-        sbi_addr,
-    )
+    });
+    // nextgsim#480: offer nnef-ueid to AF consumers only, so the NRF mints that
+    // scope for nothing else.
+    #[cfg(feature = "demo-d445a-fl-t8")]
+    if ueid::serving() {
+        if let Some(services) = profile["nfServices"].as_array_mut() {
+            services.push(ueid::nf_service(nf_instance_id, sbi_addr, sbi_port));
+        }
+    }
+    nextgcore_sbi::nf_addressing::classify_profile_host(profile, sbi_addr)
 }
 
 /// Register NEF with NRF (PUT /nnrf-nfm/v1/nf-instances/{id}, nwdafd
@@ -3307,6 +3442,91 @@ mod tests {
         let loc = serde_json::json!({"reportList": [{"referenceId": "1", "eventType": "LOSS_OF_CONNECTIVITY",
             "report": {"lossOfConnectReason": "DEREGISTERED"}}]});
         assert_eq!(build_monitoring_notification(&sub, &loc), None);
+    }
+
+    /// **nextgsim#480**: a T8 request naming the UE by `externalId` (what UE ID
+    /// retrieval hands the AF) is resolved through the UDM's
+    /// id-translation-result keyed by the `extid-` GPSI, and the southbound
+    /// Nudm_EE subscription targets the SUPI the UDM answered. Before this test
+    /// nothing exercised a successful GPSI resolution.
+    #[test]
+    fn a_t8_request_by_external_id_resolves_through_the_udm() {
+        let _guard = lock_globals();
+        reset_context();
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                nextgcore_sbi::security::set_sbi_profile_override(
+                    nextgcore_sbi::security::SbiProfile::Dev,
+                );
+                let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+                let sink = Arc::clone(&seen);
+                let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+                let udm = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+                udm.start(move |req: SbiRequest| {
+                    let sink = Arc::clone(&sink);
+                    async move {
+                        let path = req.header.uri.split('?').next().unwrap_or("").to_string();
+                        sink.lock().expect("seen").push(path.clone());
+                        if path == "/nudm-sdm/v2/extid-ue480@fl.nextg/id-translation-result" {
+                            SbiResponse::with_status(200)
+                                .with_json_body(&serde_json::json!({
+                                    "supi": "imsi-999700000000480",
+                                    "gpsi": "extid-ue480@fl.nextg"
+                                }))
+                                .expect("json")
+                        } else if path == "/nudm-ee/v1/imsi-999700000000480/ee-subscriptions" {
+                            SbiResponse::with_status(201).with_header(
+                                "Location",
+                                "/nudm-ee/v1/imsi-999700000000480/ee-subscriptions/ee-480",
+                            )
+                        } else {
+                            SbiResponse::with_status(404)
+                        }
+                    }
+                })
+                .await
+                .expect("UDM stub starts");
+                let udm_uri = format!("http://127.0.0.1:{}", addr.port());
+                if let Ok(mut c) = nef_self().write() {
+                    c.set_endpoints(
+                        None,
+                        Some(udm_uri.clone()),
+                        Some("http://127.0.0.1:7817".to_string()),
+                        Some("nef-480".to_string()),
+                    );
+                    c.set_udm_sdm_uri(Some(udm_uri));
+                }
+                let response = handle_monitoring_subscription_create(
+                    "fl-af",
+                    &monitoring_request(serde_json::json!({
+                        "monitoringType": "LOSS_OF_CONNECTIVITY",
+                        "externalId": "ue480@fl.nextg",
+                        "notificationDestination": "http://127.0.0.1:9/fl-af/v1/t8-notify/x"
+                    })),
+                    NorthboundApi::T8MonitoringEvent,
+                )
+                .await;
+                assert_eq!(response.status, 201, "{:?}", response.http.content);
+                assert_eq!(
+                    seen.lock().expect("seen").clone(),
+                    vec![
+                        "/nudm-sdm/v2/extid-ue480@fl.nextg/id-translation-result".to_string(),
+                        "/nudm-ee/v1/imsi-999700000000480/ee-subscriptions".to_string(),
+                    ]
+                );
+                let echoed: serde_json::Value =
+                    serde_json::from_str(response.http.content.as_deref().unwrap()).unwrap();
+                assert!(
+                    !echoed.to_string().contains("imsi-"),
+                    "the SUPI never reaches the AF: {echoed}"
+                );
+                drop(udm);
+            });
+        reset_context();
     }
 
     /// **Issue #1439, at the handler.** A producer notification whose reports are

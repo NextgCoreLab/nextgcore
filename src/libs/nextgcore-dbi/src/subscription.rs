@@ -532,6 +532,9 @@ pub fn nextgcore_dbi_subscription_data(supi: &str) -> DbiResult<NextgcoreSubscri
         }
     }
 
+    // Parse the External Identifier(s) (nextgsim#480): a string or an array.
+    subscription_data.external_ids = parse_external_ids(&document);
+
     // Parse access restriction data
     if let Ok(ard) = document.get_i32(NEXTGCORE_ACCESS_RESTRICTION_DATA_STRING) {
         subscription_data.access_restriction_data = ard;
@@ -701,6 +704,28 @@ pub async fn nextgcore_dbi_policy_subscription_async(
                 "spawn_blocking panicked: {e}"
             )))
         })
+}
+
+/// The subscriber document's External Identifiers (nextgsim#480).
+///
+/// `extid` may be one string or an array of strings: the identity lookup
+/// `{extid: <value>}` matches either shape, so both are accepted here too.
+/// Empty and non-string entries are skipped, and at most
+/// [`NEXTGCORE_MAX_NUM_OF_EXTID`] are kept.
+pub(crate) fn parse_external_ids(document: &Document) -> Vec<String> {
+    let values: Vec<&Bson> = match document.get(NEXTGCORE_EXTID_STRING) {
+        Some(Bson::Array(a)) => a.iter().collect(),
+        Some(v @ Bson::String(_)) => vec![v],
+        _ => Vec::new(),
+    };
+    values
+        .into_iter()
+        .filter_map(|v| match v {
+            Bson::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+            _ => None,
+        })
+        .take(NEXTGCORE_MAX_NUM_OF_EXTID)
+        .collect()
 }
 
 /// Parse AMBR from BSON document
@@ -966,6 +991,42 @@ pub fn nextgcore_dbi_policy_subscription(supi: &str) -> DbiResult<NextgcoreSubsc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **nextgsim#480**: the subscriber document's `extid` is read as the
+    /// subscriber's External Identifiers, as one string or an array, so udrd can
+    /// emit them as `extid-` GPSIs. Without it the field was never read and no
+    /// `extid-` GPSI existed anywhere.
+    #[test]
+    fn parse_external_ids_reads_a_string_or_an_array() {
+        let mut one = Document::new();
+        one.insert(NEXTGCORE_EXTID_STRING, "ue013@fl.nextg");
+        assert_eq!(parse_external_ids(&one), vec!["ue013@fl.nextg"]);
+
+        let mut many = Document::new();
+        many.insert(
+            NEXTGCORE_EXTID_STRING,
+            vec![
+                Bson::String("a@realm".into()),
+                Bson::Int32(7),
+                Bson::String("  ".into()),
+                Bson::String("b@realm".into()),
+            ],
+        );
+        assert_eq!(
+            parse_external_ids(&many),
+            vec!["a@realm", "b@realm"],
+            "non-string and blank entries are skipped"
+        );
+
+        let capped: Vec<Bson> = (0..NEXTGCORE_MAX_NUM_OF_EXTID + 3)
+            .map(|i| Bson::String(format!("u{i}@realm")))
+            .collect();
+        let mut over = Document::new();
+        over.insert(NEXTGCORE_EXTID_STRING, capped);
+        assert_eq!(parse_external_ids(&over).len(), NEXTGCORE_MAX_NUM_OF_EXTID);
+
+        assert!(parse_external_ids(&Document::new()).is_empty());
+    }
 
     // ================================================================
     // #264: the per-DNN default marker survives the BSON round trip
