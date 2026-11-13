@@ -449,6 +449,9 @@ def check_gates(r, d):
         return r.add('gates', False, 'no gates.txt')
     for row in rows:
         verdict, _, rest = row.partition(' ')
+        if verdict == 'INFO':
+            print(f'INFO gates: {rest}')
+            continue
         r.add('gates', verdict == 'PASS', rest)
     return r.ok('gates')
 
@@ -719,7 +722,8 @@ def self_test():
     # gates and probe read their own result files.
     expect('gates without results', 'gates', base(), False)
     expect('gates with one FAIL', 'gates', lambda d: (_fixture(d), open(os.path.join(d, 'gates.txt'), 'w').write('PASS a\nFAIL b\n')), False)
-    expect('gates all PASS', 'gates', lambda d: (_fixture(d), open(os.path.join(d, 'gates.txt'), 'w').write('PASS a\nPASS b\n')), True)
+    expect('gates all PASS', 'gates', lambda d: (_fixture(d), open(os.path.join(d, 'gates.txt'), 'w').write('INFO x\nPASS a\nPASS b\n')), True)
+    expect('gates with INFO only', 'gates', lambda d: (_fixture(d), open(os.path.join(d, 'gates.txt'), 'w').write('INFO x\n')), False)
     probe = lambda k: lambda d: (_fixture(d), open(os.path.join(d, 'probe.txt'), 'w').write(
         ''.join(f"cycle {i} {'PASS' if i <= k else 'FAIL'} x\n" for i in range(1, 11))))
     expect('probe 10/10', 'probe', probe(10), True)

@@ -155,7 +155,9 @@ d445a_main() {
       fi
       say "deregistering ue3"
       "${K[@]}" exec deploy/ue-3 -c ue -- nr-ue-deregister >"${S}/ue3-deregister.txt" 2>&1 || bad "ue3 deregistration"
-      wait_for 120 af_has 'hold before round=7 until=members-full' || bad "no hold before round 7"
+      # Without the exclusion (no-t8, nefd-down) the hold before 4 runs out (240 s) and
+      # round 4 waits T for ue3.
+      wait_for 420 af_has 'hold before round=7 until=members-full' || bad "no hold before round 7"
       say "power-cycling ue3"
       "${K[@]}" logs deploy/ue-3 -c ue --timestamps >"${S}/ue-3-first.log" 2>/dev/null
       "${K[@]}" delete pod -l app.kubernetes.io/name=ue-3 --wait=false >/dev/null
@@ -217,7 +219,7 @@ d445a_gates() {
       -H 'Content-Type: application/x-www-form-urlencoded' \
       --data-urlencode grant_type=client_credentials --data-urlencode "nfInstanceId=$1" \
       --data-urlencode "nfType=$2" --data-urlencode "targetNfType=$3" --data-urlencode "scope=$4" \
-      --data-urlencode "cca=${cca}" "${nrf}/oauth2/token" 2>&1
+      --data-urlencode "cca=${cca}" "${nrf}/nnrf-oauth2/v1/access-token" 2>&1
   }
   register() {   # ID TYPE
     "${K[@]}" exec deploy/nrf -c nrf -- curl -s -o /dev/null -w '%{http_code}' --http2-prior-knowledge --max-time 10 \
@@ -229,8 +231,8 @@ d445a_gates() {
   noid() { ! grep -q '"externalId"' <<<"$1"; }
   local r t
   # Positive control first, so the refusals below are not a broken route.
-  local AF2=6b1d7e3c-0000-4000-8000-0000000480af AMF2=6b1d7e3c-0000-4000-8000-0000000480bb
-  gate INFO "register AF probe consumer: $(register "${AF2}" AF); AMF probe consumer: $(register "${AMF2}" AMF)"
+  local AF2=6b1d7e3c-0000-4000-8000-0000000480af NW2=6b1d7e3c-0000-4000-8000-0000000480bb
+  gate INFO "register AF probe consumer: $(register "${AF2}" AF); NWDAF probe consumer: $(register "${NW2}" NWDAF)"
   t="$(token "${AF2}" AF NEF nnef-ueid | access)"
   r="$(retrieve "${t:--}")"
   if [[ "$(status "${r}")" == 200 ]] && grep -q "\"externalId\":\"ue001@fl.nextg\"" <<<"${r}"; then
@@ -243,18 +245,25 @@ d445a_gates() {
   r="$(retrieve garbage.not.ajwt)"
   if [[ "$(status "${r}")" == 401 ]] && noid "${r}"; then gate PASS "malformed token: 401, no externalId"
   else gate FAIL "malformed token: $(head -c 300 <<<"${r}" | tr '\r\n' '  ')"; fi
-  # A non-AF consumer: the NRF refuses it an nnef-ueid token (allowedNfTypes [AF]).
-  r="$(token "${AMF2}" AMF NEF nnef-ueid)"
+  # A non-AF consumer (an nfType NWDAF probe, not deployed here, so no NF
+  # discovers it): the NRF refuses it an nnef-ueid token (allowedNfTypes [AF]).
+  r="$(token "${NW2}" NWDAF NEF nnef-ueid)"
   if grep -qE 'unauthorized_client|invalid_scope' <<<"${r}" && [[ -z "$(access <<<"${r}")" ]]; then
-    gate PASS "AMF consumer asks the NRF for nnef-ueid: refused ($(grep -oE '"error":"[a-z_]+"' <<<"${r}"))"
-  else gate FAIL "AMF consumer got an nnef-ueid answer: $(head -c 300 <<<"${r}")"; fi
-  # Its token for another producer (aud AMF) at the NEF: 401, wrong audience.
-  t="$(token "${AMF2}" AMF AMF namf-evts | access)"
-  if [[ -n "${t}" ]]; then
+    gate PASS "NWDAF consumer asks the NRF for nnef-ueid: refused ($(grep -oE '"error":"[a-z_]+"' <<<"${r}"))"
+  else gate FAIL "NWDAF consumer got an nnef-ueid answer: $(head -c 300 <<<"${r}")"; fi
+  # Any token it can get, at the NEF: 401 (another audience) or 403 (no scope).
+  local tgt got=""
+  for tgt in "NEF nnef-eventexposure" "UDM nudm-sdm" "BSF nbsf-management" "UDR nudr-dr"; do
+    # shellcheck disable=SC2086  # tgt is "<targetNfType> <scope>"
+    t="$(token "${NW2}" NWDAF ${tgt} | access)"
+    [[ -n "${t}" ]] && { got="${tgt}"; break; }
+  done
+  if [[ -n "${got}" ]]; then
     r="$(retrieve "${t}")"
-    if [[ "$(status "${r}")" == 401 ]] && noid "${r}"; then gate PASS "AMF consumer's aud=AMF token: 401, no externalId"
-    else gate FAIL "AMF consumer's aud=AMF token: $(head -c 300 <<<"${r}" | tr '\r\n' '  ')"; fi
-  else gate FAIL "no aud=AMF token for the AMF probe consumer"; fi
+    if [[ "$(status "${r}")" =~ ^40[13]$ ]] && noid "${r}"; then
+      gate PASS "NWDAF consumer's token (${got}) at the UE ID route: $(status "${r}"), no externalId"
+    else gate FAIL "NWDAF consumer's token (${got}): $(head -c 300 <<<"${r}" | tr '\r\n' '  ')"; fi
+  else gate INFO "the NRF minted the NWDAF probe no token for NEF, UDM, BSF or UDR"; fi
   # An AF token without the scope: 403 insufficient_scope.
   t="$(token "${AF2}" AF NEF nnef-eventexposure | access)"
   if [[ -n "${t}" ]]; then

@@ -4,8 +4,8 @@
 #   CORE_BIN_DIR=<dir> SIM_BIN_DIR=<dir> \
 #     deploy/eks/overlays/demo-d445a-fl-t8/build-images.sh
 #
-# Prebuilt binaries, from clean trees at the commits the tags name (CORE_REV,
-# SIM_REV; default HEAD):
+# Prebuilt binaries, from clean trees at the commits the tags name (CORE_SRC,
+# SIM_SRC; their HEAD names the tag):
 #   CORE_BIN_DIR   nextgcore, the 6G profile's features plus nefd's demo feature:
 #       cd src && cargo build --release --locked -p nextgcore-{nrfd,amfd,smfd,upfd,
 #         ausfd,udmd,udrd,pcfd,nssfd,bsfd,nefd} --features nextgcore-amfd/ntn
@@ -37,20 +37,24 @@ REPO_PREFIX="${REPO_PREFIX:-nextg}"
 : "${CORE_BIN_DIR:?set CORE_BIN_DIR}" "${SIM_BIN_DIR:?set SIM_BIN_DIR}"
 die() { echo "build-images: $*" >&2; exit 1; }
 
-# The commits the binaries were built from (default HEAD), e.g. CORE_REV=origin/main
-# when this script runs from a branch that only adds deploy files: the tag names
-# that commit, so its sources and Dockerfiles must equal this tree's.
-CORE_REV="${CORE_REV:-HEAD}"; SIM_REV="${SIM_REV:-HEAD}"
-for d in "${CORE_DIR}:${CORE_REV}" "${SIM_DIR}:${SIM_REV}"; do
-  dir="${d%%:*}" rev="${d#*:}"
-  [[ -z "$(git -C "${dir}" status --porcelain --untracked-files=no -- src docker 'Dockerfile*' 'nextgsim-*' scripts)" ]] \
-    || die "${dir} has uncommitted source changes: the tag would not describe the build"
-  git -C "${dir}" diff --quiet "${rev}" HEAD -- src docker 'Dockerfile*' 'nextgsim-*' scripts Cargo.lock \
-    || die "${dir}: sources differ between ${rev} and HEAD"
+# The source trees the binaries were built from (default: this checkout and its
+# sibling nextgsim). Run from a branch that only adds deploy files, point
+# CORE_SRC at a clean worktree of the built commit. Each tag is that tree's HEAD,
+# asserted again right before the push.
+CORE_SRC="$(cd "${CORE_SRC:-${CORE_DIR}}" && pwd)"; SIM_SRC="$(cd "${SIM_SRC:-${SIM_DIR}}" && pwd)"
+for dir in "${CORE_SRC}" "${SIM_SRC}"; do
+  [[ -z "$(git -C "${dir}" status --porcelain --untracked-files=no)" ]] \
+    || die "${dir} has uncommitted changes: the tag would not describe the build"
 done
-CORE_TAG="demo-d445a-fl-t8-$(git -C "${CORE_DIR}" rev-parse --short=12 "${CORE_REV}")"
-SIM_TAG="demo-d445a-fl-t8-$(git -C "${SIM_DIR}" rev-parse --short=12 "${SIM_REV}")"
-
+CORE_SHA="$(git -C "${CORE_SRC}" rev-parse --short=12 HEAD)"
+SIM_SHA="$(git -C "${SIM_SRC}" rev-parse --short=12 HEAD)"
+CORE_TAG="demo-d445a-fl-t8-${CORE_SHA}"
+SIM_TAG="demo-d445a-fl-t8-${SIM_SHA}"
+# The tag's SHA is the tree's HEAD, now and at push time.                 TAG DIR
+assert_tag() {
+  [[ "${1##*-}" == "$(git -C "$2" rev-parse --short=12 HEAD)" ]] \
+    || die "tag $1 is not $2 at HEAD ($(git -C "$2" rev-parse --short=12 HEAD)); not pushing"
+}
 CORE_NFS=(nrf:nextgcore-nrfd amf:nextgcore-amfd smf:nextgcore-smfd upf:nextgcore-upfd
           ausf:nextgcore-ausfd udm:nextgcore-udmd udr:nextgcore-udrd pcf:nextgcore-pcfd
           nssf:nextgcore-nssfd bsf:nextgcore-bsfd nef:nextgcore-nefd)
@@ -87,24 +91,26 @@ done
 
 ctx="$(mktemp -d -t d445a-ctx-XXXXXX)"
 trap 'rm -rf "${ctx}"' EXIT
-docker build -f "${CORE_DIR}/docker/rust/Dockerfile.core" -t nextgcore-core:latest "${CORE_DIR}/docker/rust"
+docker build -f "${CORE_SRC}/docker/rust/Dockerfile.core" -t nextgcore-core:latest "${CORE_SRC}/docker/rust"
 mkdir -p "${ctx}/core/binaries"
 for e in "${CORE_NFS[@]}"; do
   cp "${CORE_BIN_DIR}/${e#*:}" "${ctx}/core/binaries/"
-  docker build -f "${CORE_DIR}/docker/rust/Dockerfile.nf" --build-arg CORE_IMAGE=nextgcore-core:latest \
+  docker build -f "${CORE_SRC}/docker/rust/Dockerfile.nf" --build-arg CORE_IMAGE=nextgcore-core:latest \
     --build-arg "NF_NAME=${e#*:}" -t "${REGISTRY}/${REPO_PREFIX}/${e%%:*}:${CORE_TAG}" "${ctx}/core"
 done
 mkdir -p "${ctx}/sim/binaries"
 cp "${SIM_BIN_DIR}/nr-gnb" "${ctx}/sim/binaries/"
-docker build -f "${SIM_DIR}/Dockerfile.gnb-local" -t "${REGISTRY}/${REPO_PREFIX}/gnb:${SIM_TAG}" "${ctx}/sim"
+docker build -f "${SIM_SRC}/Dockerfile.gnb-local" -t "${REGISTRY}/${REPO_PREFIX}/gnb:${SIM_TAG}" "${ctx}/sim"
 mkdir -p "${ctx}/ue"
 for b in nr-ue nr-ue-revert-hooks nr-cli nr-fl-server nr-fl-server-revert-hooks; do cp "${SIM_BIN_DIR}/${b}" "${ctx}/ue/"; done
-cp "${SIM_DIR}/scripts/nr-ue-deregister.sh" "${ctx}/ue/"
+cp "${SIM_SRC}/scripts/nr-ue-deregister.sh" "${ctx}/ue/"
 docker build -f "${HERE}/Dockerfile.ue-d445a" -t "${REGISTRY}/${REPO_PREFIX}/ue:${SIM_TAG}" "${ctx}/ue"
 docker run --rm --entrypoint sh "${REGISTRY}/${REPO_PREFIX}/ue:${SIM_TAG}" -c \
   'for c in nr-ue nr-cli nr-fl-server nr-fl-server-revert-hooks nr-ue-revert-hooks nr-ue-deregister ip iptables tcpdump; do command -v $c >/dev/null || { echo "missing $c"; exit 1; }; done' \
   || die "ue image is incomplete"
 
+assert_tag "${CORE_TAG}" "${CORE_SRC}"
+assert_tag "${SIM_TAG}" "${SIM_SRC}"
 aws ecr get-login-password --region "${REGION}" | docker login --username AWS --password-stdin "${REGISTRY}" >/dev/null
 for e in "${CORE_NFS[@]}"; do docker push "${REGISTRY}/${REPO_PREFIX}/${e%%:*}:${CORE_TAG}" >/dev/null; done
 docker push "${REGISTRY}/${REPO_PREFIX}/gnb:${SIM_TAG}" >/dev/null
