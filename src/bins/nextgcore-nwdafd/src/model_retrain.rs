@@ -24,8 +24,9 @@
 //! 5. **Loads** a verified model as this NWDAF's NF_LOAD predictor.
 //!
 //! # Modes
-//! `retrain` and `no-retrain` select what the MTLF does on an accuracy drop
-//! (PR 4). The AnLF behaves the same in both; this PR logs the mode.
+//! `retrain` and `no-retrain` select what the MTLF does on an accuracy drop:
+//! refit and provision the next version, or nothing (`model_refit`). The AnLF
+//! behaves the same in both.
 //!
 //! # Limitation: the callback under OAuth2 enforcement
 //! TS 33.501 §13.4.1 (33501-k20 l.14458): "The OAuth 2.0 framework does not

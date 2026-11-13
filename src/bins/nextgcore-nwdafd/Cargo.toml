@@ -41,7 +41,9 @@ demo-d441a-congestion-loop = ["amf-mobility"]
 ## provisioning. With `nwdaf.role: anlf` and the demo: block on, subscribes to an
 ## MTLF's Nnwdaf_MLModelProvision (ModelProvisionExt, accuracy threshold), takes
 ## the Notify on the existing SBI listener, verifies the model against its
-## nextgsim#463 manifest and loads it. Also serves /metrics
+## nextgsim#463 manifest and loads it. The MLModelMonitor accuracy loop and, in
+## mode `retrain`, the MTLF's AR refit and re-provisioning of the next version,
+## over a seeded series (`nwdaf.retrain_series`). Also serves /metrics
 ## (NEXTGCORE_METRICS_BIND, loopback by default; NWDAF_METRICS_PORT). Off by
 ## default.
 demo-d441e-model-retrain = []

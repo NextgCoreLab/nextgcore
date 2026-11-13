@@ -263,11 +263,15 @@ impl AnalyticsEngine {
     /// points of each NF's CPU-load series (nextgsim#468, the AnLF's accuracy
     /// monitoring): `(sum of |prediction - observed|, points)`. Each point is
     /// predicted from the samples before it, exactly as the analytics path
-    /// would have predicted it with this model.
+    /// would have predicted it with this model. `only` restricts the backtest
+    /// to one NF instance (PR 4: the demo's seeded series), `None` covers all.
     #[cfg(feature = "demo-d441e-model-retrain")]
-    pub fn backtest_nf_load(&self, last: usize) -> (f64, usize) {
+    pub fn backtest_nf_load(&self, last: usize, only: Option<&str>) -> (f64, usize) {
         let (mut sum, mut n) = (0.0, 0usize);
-        for samples in self.nf_samples.values() {
+        for (id, samples) in &self.nf_samples {
+            if only.is_some_and(|o| o != id) {
+                continue;
+            }
             let series: Vec<f64> = samples.iter().map(|s| s.cpu_usage).collect();
             let from = series.len().saturating_sub(last).max(1);
             for t in from..series.len() {
@@ -278,6 +282,24 @@ impl AnalyticsEngine {
             }
         }
         (sum, n)
+    }
+
+    /// The CPU-load series an MTLF retrains on (nextgsim#468 PR 4): that of
+    /// `only`, or with `None` the NF instance with the most samples (the lowest
+    /// id on a tie). `(instance, values oldest first)`; `None` with no samples.
+    #[cfg(feature = "demo-d441e-model-retrain")]
+    pub fn nf_load_series(&self, only: Option<&str>) -> Option<(String, Vec<f64>)> {
+        let (id, samples) = match only {
+            Some(o) => self.nf_samples.get_key_value(o)?,
+            None => self
+                .nf_samples
+                .iter()
+                .max_by(|a, b| a.1.len().cmp(&b.1.len()).then_with(|| b.0.cmp(a.0)))?,
+        };
+        if samples.is_empty() {
+            return None;
+        }
+        Some((id.clone(), samples.iter().map(|s| s.cpu_usage).collect()))
     }
 
     /// Compute NF load analytics from the samples inside `window` only
