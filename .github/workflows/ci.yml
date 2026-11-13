@@ -2296,7 +2296,9 @@ jobs:
       - name: retrain and no-retrain (one seeded run each, concurrently)
         timeout-minutes: 25
         run: |
-          set -uo pipefail
+          # Not -e (the step shell's default): a failed arm must still print
+          # both outputs and write the summary before the step fails.
+          set +e -uo pipefail
           c=docker/rust/configs/demo-d441e/check.sh
           DEMO_ARTEFACTS="$DEMO_ARTEFACTS/retrain" "$c" retrain > "$RUNNER_TEMP/retrain.out" 2>&1 & a=$!
           DEMO_ARTEFACTS="$DEMO_ARTEFACTS/no-retrain" "$c" no-retrain > "$RUNNER_TEMP/no-retrain.out" 2>&1 & b=$!

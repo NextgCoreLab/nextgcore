@@ -13,7 +13,8 @@ and asserts, by those timestamps:
   both modes (S1-S7)
     S1 AnLF  subscribed to MTLF <id> threshold=0.70
     S2 MTLF  MLModelProvision: model v1 provisioned sha256=<S1>
-    S3 AnLF  model v1 verified sha256=<S1> from <url ending in /<S1>>
+    S3 AnLF  model v1 verified sha256=<S1> from <url ending in /<S1>> (after S1;
+             S2 is logged on the Notify's 204, which can come after the verify)
     S4 AnLF  MLModelMonitor registered at MTLF ... modelId=<M1>
     S5 MTLF  MLModelMonitor subscribed at AnLF ... modelId=<M1> threshold=0.70
     S6 AnLF  accuracy >= 0.70 reported for modelId=<M1> (a calm report)
@@ -23,7 +24,7 @@ and asserts, by those timestamps:
     S9  MTLF retrain: AR(5) least-squares refit of v1 ... held-out MAE ...
     S10 MTLF retrain: model v2 published sha256=<S2> modelId=<M2> (replaces v1)
     S11 MTLF MLModelProvision: model v2 provisioned sha256=<S2>
-    S12 AnLF model v2 verified sha256=<S2>
+    S12 AnLF model v2 verified sha256=<S2> (after S10, for the same reason)
     S13 AnLF accuracy >= 0.70 reported for modelId=<M2>, and every v2 report is
     plus exactly one "retrain requested" and no "model refused".
   mode no-retrain (S8)
@@ -101,7 +102,10 @@ def check(mode, mtlf, anlf):
     t2, m = first(mtlf, r'MLModelProvision: model v1 provisioned sha256=' + SHA, t1 - SKEW, 'S2 (MTLF notified v1)')
     sha1 = m.group(1)
     note('S2', t2, 'MTLF', m.group(0))
-    t3, m = first(anlf, r'model v1 verified sha256=' + SHA + r' from (\S+)', t2 - SKEW, 'S3 (AnLF verified v1)')
+    # The MTLF logs `provisioned` when the Notify's 204 comes back, and the AnLF
+    # may verify before or after that (seen both ways on the real stack), so S3
+    # follows the subscription and is tied to S2 by the sha256, not by time.
+    t3, m = first(anlf, r'model v1 verified sha256=' + SHA + r' from (\S+)', t1, 'S3 (AnLF verified v1)')
     if m.group(1) != sha1:
         raise Fail(f'step S3: the AnLF verified sha256={m.group(1)}, the MTLF notified {sha1}')
     url1 = m.group(2)
@@ -149,7 +153,9 @@ def check(mode, mtlf, anlf):
         t11, m = first(mtlf, rf'MLModelProvision: model v2 provisioned sha256={sha2}', t10,
                        'S11 (MTLF notified v2)')
         note('S11', t11, 'MTLF', m.group(0))
-        t12, m = first(anlf, rf'model v2 verified sha256={sha2} from (\S+)', t11 - SKEW, 'S12 (AnLF verified v2)')
+        # As S3: after the publish, tied to S10/S11 by the sha256 (CI saw the
+        # AnLF's verify 39 ms before the MTLF's `provisioned`).
+        t12, m = first(anlf, rf'model v2 verified sha256={sha2} from (\S+)', t10 - SKEW, 'S12 (AnLF verified v2)')
         url2 = m.group(1)
         note('S12', t12, 'AnLF', m.group(0))
         v2 = [(t, a) for t, a, mid in reports if mid == m2 and t >= t12]
@@ -330,12 +336,13 @@ def self_test():
             expect('no calm report', mode, m, [x for x in a if '0.98' not in x[1]], 'S6')
             expect('the only pre-change reports < 0.70', mode, m,
                    edit(a, 'accuracy 0.98', lambda s, t: (s, t.replace('0.98', '0.65'))), 'S6')
-            # S3 ordering: v1 verified well before its notify. Within SKEW it passes.
-            expect('v1 verified 10 s before the notify', mode, m,
+            # S3 ordering: v1 verified before the subscription fails; before the
+            # MTLF's `provisioned` line (the 204 race) passes.
+            expect('v1 verified before the subscription', mode, m,
                    edit(a, 'v1 verified', lambda s, t: (30, t)), 'S3')
-            why = outcome(mode, m, sorted(edit(a, 'v1 verified', lambda s, t: (39, t)), key=lambda x: x[0]))
+            why = outcome(mode, edit(m, 'v1 provisioned', lambda s, t: (42, t)), a)
             if why is not None:
-                failures.append(f'{mode}: v1 verified 1 s before the notify (inside SKEW) failed: {why}')
+                failures.append(f'{mode}: v1 verified before the 204-time provisioned line failed: {why}')
             # S3 content: the URL must end in the sha256 it was verified as.
             expect('v1 URL not ending in its sha256', mode, m,
                    edit(a, 'v1 verified', lambda s, t: (s, t.replace(f'{URL}{S1_}', f'{URL}{S2_}'))), 'S3')
@@ -356,8 +363,11 @@ def self_test():
         expect('only a v1 report after v2 verified', 'retrain', m,
                [x for x in a if 'reported for modelId=222' not in x[1]]
                + [(197, P + 'accuracy 0.99 (n=20) reported for modelId=111 sub=m1')], 'S13')
-        expect('v2 verified 6 s before provisioned', 'retrain', m,
+        expect('v2 verified before v2 was published', 'retrain', m,
                edit(a, 'v2 verified', lambda s, t: (190, t)), 'S12')
+        why = outcome('retrain', edit(m, 'v2 provisioned', lambda s, t: (197, t)), a)
+        if why is not None:
+            failures.append(f'retrain: v2 verified before the 204-time provisioned line failed: {why}')
         expect('v2 provisioned under another sha256', 'retrain',
                edit(m, 'v2 provisioned', lambda s, t: (s, t.replace(S2_, 'c' * 64))), a, 'S11')
         expect('two retrain requests', 'retrain',
