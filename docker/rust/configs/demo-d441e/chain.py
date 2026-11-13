@@ -44,9 +44,14 @@ import os
 import re
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 
 THRESHOLD = 0.70
+# A step on one NWDAF that follows a step on the other is compared with this
+# much slack: the two lines carry two hosts' clocks (on EKS the pods can sit on
+# different nodes). Each such step is also tied to its predecessor by content
+# (the sha256, the modelId), which is what makes the order causal.
+SKEW = timedelta(seconds=2)
 NO_RETRAIN_REPORTS = 2
 SHA = r'([0-9a-f]{64})'
 TS = re.compile(r'^(?:\S+\s+\|\s+)?(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?Z\s(.*)$')
@@ -93,10 +98,10 @@ def check(mode, mtlf, anlf):
 
     t1, m = first(anlf, r'subscribed to MTLF (\S+) threshold=0\.70\b', step='S1 (AnLF subscribed to the MTLF)')
     note('S1', t1, 'AnLF', m.group(0))
-    t2, m = first(mtlf, r'MLModelProvision: model v1 provisioned sha256=' + SHA, t1, 'S2 (MTLF notified v1)')
+    t2, m = first(mtlf, r'MLModelProvision: model v1 provisioned sha256=' + SHA, t1 - SKEW, 'S2 (MTLF notified v1)')
     sha1 = m.group(1)
     note('S2', t2, 'MTLF', m.group(0))
-    t3, m = first(anlf, r'model v1 verified sha256=' + SHA + r' from (\S+)', t2, 'S3 (AnLF verified v1)')
+    t3, m = first(anlf, r'model v1 verified sha256=' + SHA + r' from (\S+)', t2 - SKEW, 'S3 (AnLF verified v1)')
     if m.group(1) != sha1:
         raise Fail(f'step S3: the AnLF verified sha256={m.group(1)}, the MTLF notified {sha1}')
     url1 = m.group(2)
@@ -107,18 +112,21 @@ def check(mode, mtlf, anlf):
                   'S4 (AnLF registered v1 for monitoring)')
     m1 = m.group(1)
     note('S4', t4, 'AnLF', m.group(0))
-    t5, m = first(mtlf, rf'MLModelMonitor subscribed at AnLF \S+ sub=\S+ modelId={m1} threshold=0\.70\b', t4,
+    t5, m = first(mtlf, rf'MLModelMonitor subscribed at AnLF \S+ sub=\S+ modelId={m1} threshold=0\.70\b', t4 - SKEW,
                   'S5 (MTLF subscribed at the AnLF)')
     note('S5', t5, 'MTLF', m.group(0))
     rep = re.compile(r'accuracy (\d\.\d\d) \(n=\d+\) reported for modelId=(\d+) ')
     reports = [(t, float(r.group(1)), r.group(2)) for t, _, msg in anlf for r in [rep.search(msg)] if r]
-    calm = [(t, a) for t, a, mid in reports if mid == m1 and t >= t5 and a >= THRESHOLD]
+    # S7 first: S6 must be a report of the calm part, before the change.
+    t7, m7 = first(mtlf, r'seeded series: regime alternating from step (\d+) \(scripted regime change\)',
+                   t5 - SKEW, 'S7 (the scripted regime change)')
+    calm = [(t, a) for t, a, mid in reports if mid == m1 and t5 - SKEW <= t <= t7 and a >= THRESHOLD]
     if not calm:
-        raise Fail(f'step S6 missing: no AnLF accuracy report >= {THRESHOLD:.2f} for modelId={m1}')
+        raise Fail(f'step S6 missing: no AnLF accuracy report >= {THRESHOLD:.2f} for modelId={m1} '
+                   f'before the regime change')
     t6, a6 = calm[0]
     note('S6', t6, 'AnLF', f'accuracy {a6:.2f} reported for modelId={m1}')
-    t7, m = first(mtlf, r'seeded series: regime alternating from step (\d+) \(scripted regime change\)', t6,
-                  'S7 (the scripted regime change)')
+    m = m7
     note('S7', t7, 'MTLF', m.group(0))
     facts.update(v1_sha256=sha1, v1_url=url1, v1_model_id=m1, v1_calm_accuracy=f'{a6:.2f}',
                  change_at=t7.isoformat())
@@ -141,7 +149,7 @@ def check(mode, mtlf, anlf):
         t11, m = first(mtlf, rf'MLModelProvision: model v2 provisioned sha256={sha2}', t10,
                        'S11 (MTLF notified v2)')
         note('S11', t11, 'MTLF', m.group(0))
-        t12, m = first(anlf, rf'model v2 verified sha256={sha2} from (\S+)', t11, 'S12 (AnLF verified v2)')
+        t12, m = first(anlf, rf'model v2 verified sha256={sha2} from (\S+)', t11 - SKEW, 'S12 (AnLF verified v2)')
         url2 = m.group(1)
         note('S12', t12, 'AnLF', m.group(0))
         v2 = [(t, a) for t, a, mid in reports if mid == m2 and t >= t12]
@@ -301,48 +309,78 @@ def self_test():
                     why = outcome(mode, cut if side == 'm' else m, a if side == 'm' else cut)
                     if why is None:
                         failures.append(f'{mode}: passed without {side}[{i}] {text!r}')
-            # No calm report at all (S6).
-            if outcome(mode, m, [x for x in a if '0.98' not in x[1]]) is None:
-                failures.append(f'{mode}: passed with no calm report')
-            # The ordered part: v1 verified before its notify fails.
-            a2 = [(39, t) if 'v1 verified' in t else (s, t) for s, t in a]
-            if outcome(mode, m, sorted(a2, key=lambda x: x[0])) is None:
-                failures.append(f'{mode}: passed with v1 verified before the notify')
-            # The drop has to come after the scripted change.
-            m2 = [(110, t) if ('retrain requested' in t or 'no retrain' in t) else (s, t) for s, t in m]
-            if outcome(mode, sorted(m2, key=lambda x: x[0]), a) is None:
-                failures.append(f'{mode}: passed with the drop before the regime change')
+        def expect(label, mode, m, a, step):
+            """A negative control: the check must fail, and name `step`."""
+            why = outcome(mode, sorted(m, key=lambda x: x[0]), sorted(a, key=lambda x: x[0]))
+            if why is None or step not in why:
+                failures.append(f'{mode}: {label}: expected a failure naming {step!r}, got {why!r}')
+
+        def edit(lines, needle, f):
+            return [f(s, t) if needle in t else (s, t) for s, t in lines]
+
+        for mode in ('retrain', 'no-retrain'):
+            m, a = fixture(mode)
+            # S1: the subscription must carry the 0.70 threshold.
+            expect('subscribed with threshold 0.50', mode, m,
+                   edit(a, 'subscribed to MTLF', lambda s, t: (s, t.replace('0.70', '0.50'))), 'S1')
+            # S2 must follow the subscription.
+            expect('v1 provisioned 30 s before the subscription', mode,
+                   edit(m, 'v1 provisioned', lambda s, t: (10, t)), a, 'S2')
+            # S6: no calm report at all, or only reports below 0.70 before the change.
+            expect('no calm report', mode, m, [x for x in a if '0.98' not in x[1]], 'S6')
+            expect('the only pre-change reports < 0.70', mode, m,
+                   edit(a, 'accuracy 0.98', lambda s, t: (s, t.replace('0.98', '0.65'))), 'S6')
+            # S3 ordering: v1 verified well before its notify. Within SKEW it passes.
+            expect('v1 verified 10 s before the notify', mode, m,
+                   edit(a, 'v1 verified', lambda s, t: (30, t)), 'S3')
+            why = outcome(mode, m, sorted(edit(a, 'v1 verified', lambda s, t: (39, t)), key=lambda x: x[0]))
+            if why is not None:
+                failures.append(f'{mode}: v1 verified 1 s before the notify (inside SKEW) failed: {why}')
+            # S3 content: the URL must end in the sha256 it was verified as.
+            expect('v1 URL not ending in its sha256', mode, m,
+                   edit(a, 'v1 verified', lambda s, t: (s, t.replace(f'{URL}{S1_}', f'{URL}{S2_}'))), 'S3')
+            expect('v1 verified under a sha256 never notified', mode, m,
+                   edit(a, 'v1 verified', lambda s, t: (s, t.replace(f'sha256={S1_}', f'sha256={S2_}'))), 'S3')
+            # S5: the MTLF's Subscribe must name the registered modelId.
+            expect('S5 for another modelId', mode,
+                   edit(m, 'subscribed at AnLF', lambda s, t: (s, t.replace('modelId=111', 'modelId=333'))), a, 'S5')
+            # S8 must follow the scripted change. The report between is cut so
+            # nothing else can trip first.
+            moved = edit(m, 'retrain requested' if mode == 'retrain' else 'no retrain', lambda s, t: (110, t))
+            expect('the drop before the regime change', mode, moved,
+                   [x for x in a if '0.75' not in x[1]], 'S8')
         # retrain-specific rules.
         m, a = fixture('retrain')
-        if outcome('retrain', m, a + [(198, P + 'accuracy 0.62 (n=20) reported for modelId=222 sub=m2')]) is None:
-            failures.append('retrain: passed with a v2 report below 0.70')
-        if outcome('retrain', m + [(250, P + 'accuracy 0.60 < 0.70: retrain requested (modelId=222)')], a) is None:
-            failures.append('retrain: passed with two retrain requests')
+        expect('a v2 report below 0.70', 'retrain', m,
+               a + [(198, P + 'accuracy 0.62 (n=20) reported for modelId=222 sub=m2')], 'S13')
+        expect('only a v1 report after v2 verified', 'retrain', m,
+               [x for x in a if 'reported for modelId=222' not in x[1]]
+               + [(197, P + 'accuracy 0.99 (n=20) reported for modelId=111 sub=m1')], 'S13')
+        expect('v2 verified 6 s before provisioned', 'retrain', m,
+               edit(a, 'v2 verified', lambda s, t: (190, t)), 'S12')
+        expect('v2 provisioned under another sha256', 'retrain',
+               edit(m, 'v2 provisioned', lambda s, t: (s, t.replace(S2_, 'c' * 64))), a, 'S11')
+        expect('two retrain requests', 'retrain',
+               m + [(250, P + 'accuracy 0.60 < 0.70: retrain requested (modelId=222)')], a, 'exactly one')
         refused = P + f'model refused (sha256 mismatch) from {URL}{S2_}: x; keeping v1'
-        if outcome('retrain', m, a + [(199, refused)]) is None:
-            failures.append('retrain: passed with a refused model')
-        bad = [(s, t.replace(f'v1 verified sha256={S1_}', f'v1 verified sha256={S2_}')) for s, t in a]
-        if outcome('retrain', m, bad) is None:
-            failures.append('retrain: passed with a v1 sha256 the MTLF never notified')
+        expect('a refused model', 'retrain', m, a + [(199, refused)], 'refused a model')
         # The flipped-byte revert's log: v2 refused, kept v1 -> fails at S12.
-        a3 = [(s, t) for s, t in a if 'v2 verified' not in t and 'modelId=222' not in t] + [(196, refused)]
-        why = outcome('retrain', m, sorted(a3, key=lambda x: x[0]))
-        if why is None or 'S12' not in why:
-            failures.append(f'retrain: the flipped-byte log did not fail at S12: {why}')
+        expect('the flipped-byte revert log', 'retrain', m,
+               [(s, t) for s, t in a if 'v2 verified' not in t and 'modelId=222' not in t] + [(196, refused)], 'S12')
         # The feed-patched-out revert's log: no rolling lines -> fails at S8.
-        m3 = [(s, t) for s, t in m if not re.search(r'retrain requested|retrain: |v2', t)]
-        why = outcome('retrain', m3, [(s, t) for s, t in a if '222' not in t and 'v2' not in t])
-        if why is None or 'S8' not in why:
-            failures.append(f'retrain: the no-feed log did not fail at S8: {why}')
+        expect('the no-feed revert log', 'retrain',
+               [(s, t) for s, t in m if not re.search(r'retrain requested|retrain: |v2', t)],
+               [(s, t) for s, t in a if '222' not in t and 'v2' not in t], 'S8')
         # no-retrain-specific rules.
         m, a = fixture('no-retrain')
-        if outcome('no-retrain', m, a + [(281, P + 'accuracy 0.71 (n=20) reported for modelId=111 sub=m1')]) is None:
-            failures.append('no-retrain: passed with a report >= 0.70 after the drop')
-        if outcome('no-retrain', m, a[:-1]) is None:
-            failures.append('no-retrain: passed with one report after the drop')
-        if outcome('no-retrain', m + [(200, P + f'retrain: model v2 published sha256={S2_} modelId=2 (replaces v1)')],
-                   a) is None:
-            failures.append('no-retrain: passed with a v2')
+        expect('a report >= 0.70 after the drop', 'no-retrain', m,
+               a + [(281, P + 'accuracy 0.71 (n=20) reported for modelId=111 sub=m1')], '>= 0.70 after the drop')
+        expect('one report after the drop', 'no-retrain', m, a[:-1], 'report(s) after the drop')
+        expect('a v2', 'no-retrain',
+               m + [(200, P + f'retrain: model v2 published sha256={S2_} modelId=2 (replaces v1)')], a,
+               'the MTLF logged')
+        expect('a retrain request', 'no-retrain',
+               m + [(200, P + 'accuracy 0.60 < 0.70: retrain requested (modelId=111)')], a, 'retrain requested')
         # An empty capture is a failure, never "no such line".
         open(mp, 'w').close()
         write(fixture('retrain')[1], ap, False)
@@ -355,7 +393,7 @@ def self_test():
         print('chain.py self-test FAILED:\n  ' + '\n  '.join(failures), file=sys.stderr)
         return 1
     print('chain.py self-test: good logs pass in both modes and both log formats; every needed '
-          'line taken out, a reordering, a v2 below 0.70, a refusal and both revert logs fail')
+          'line taken out fails, and each negative control fails at the step it targets')
     return 0
 
 
