@@ -28,7 +28,8 @@ from the render: it is input to this step, not something the cluster needs.
 DEMO_MODE=off (k8s/demo-check.sh <key> off) is the demo's own demo-off arm: the
 overlay's topology and images, but no target gets a block, so the run is the
 base core on that topology. The render must then hold no `demo:` key anywhere,
-as for the demo-off base overlay. No demo may register a mode named `off`.
+as for the demo-off base overlay. No demo can register a mode named
+`off`: nextgcore-demo's and nextgsim-demo's DemoRegistry refuse it.
 
 Fail-closed rules:
   * The demo-off base overlay ("demo") must have no toggles ConfigMap, and the

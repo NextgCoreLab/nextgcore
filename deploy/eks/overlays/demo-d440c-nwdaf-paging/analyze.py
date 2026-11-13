@@ -244,13 +244,14 @@ def analyze(d, mode, variant):
         pass
     r.result["nwdaf_hints"] = hits
 
-    # scenario.sh's own GET, after the reselection and before the downlink: what
-    # the producer would answer amfd at the page.
+    # scenario.sh's own GET, after the reselection and before the downlink.
+    # Corroboration only: a separate request with its own window, not amfd's
+    # exchange (amfd's `predicted=` line and hint counter are that evidence).
     if variant == "revert":
-        r.check(http[0].strip() == "204", "revert: scenario's own UE_MOBILITY GET is 204 (got %s)" % http[0].strip())
+        r.check(http[0].strip() == "204", "revert: corroboration: scenario's own UE_MOBILITY GET is 204 (got %s)" % http[0].strip())
     else:
         r.check(http[0].strip() == "200" and predicts(http[1], CELL["B"]),
-                "scenario's own UE_MOBILITY GET before the downlink: 200 predicting cell %s (got %s)"
+                "corroboration: scenario's own UE_MOBILITY GET before the downlink: 200 predicting cell %s (got %s)"
                 % (CELL["B"], http[0].strip()))
 
     want_answer = (r"page answered ue=%s via gNB 0x2 attempt 1" % SUPI)
@@ -294,8 +295,8 @@ def analyze(d, mode, variant):
                 down = ""
             r.check("nwdaf pods before the downlink: 0" in down,
                     "nwdaf-down: no nwdaf pod was left when the downlink started (%s)" % down.strip())
-            r.check(hits.get("error", 0) + hits.get("timeout", 0) == 1,
-                    "nwdaf-down: one error or timeout hint outcome (%s)" % hits)
+            r.check(hits.get("error", 0) + hits.get("timeout", 0) == 1 and not hits.get("predicted"),
+                    "nwdaf-down: one error or timeout hint outcome, none predicted (%s)" % hits)
         else:
             r.check(fail_open is None and predicted is None,
                     "revert: amfd logged neither a prediction nor a failure (nwdafd answered without a cell)")

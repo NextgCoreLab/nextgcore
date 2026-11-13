@@ -21,7 +21,9 @@
 #      gNB A's `nr-cli ue-release`;
 #   4. wait for its idle reselection away from A and for the end of its route
 #      (276 s, 22 m from B), then ask nwdafd for its UE_MOBILITY prediction
-#      (ue-mobility.http): what amfd will be told;
+#      (ue-mobility.http). Corroboration only: a separate request seconds
+#      before amfd's, with its own window; amfd's `predicted=` line and its
+#      hint counter are the evidence for amfd's own exchange (nextgcore#1494);
 #   5. nwdaf-down only: scale nwdafd to 0 and wait until no pod is left;
 #   6. downlink: 20 pings from the UPF to the UE's address, so smfd's
 #      N1N2MessageTransfer makes amfd page it; wait for the Service Request;
@@ -41,6 +43,9 @@ K=(kubectl -n "${NAMESPACE}")
 S="${OUT}/scenario"
 mkdir -p "${S}"
 SUPI="imsi-999700000000001"
+# nextgsim's committed start_after_secs (config/demo-nwdaf-paging/ue-lap.yaml);
+# test-scenario.sh checks the two agree.
+ROUTE_START_SECS=60
 say() { printf '[scenario] %s\n' "$*"; }
 die() { printf '[scenario] FAIL: %s\n' "$*"; capture; exit 1; }
 # wait_for <seconds> <command...>: poll until the command succeeds.
@@ -126,8 +131,12 @@ json.dump(cm, sys.stdout)' >"${S}/nwdaf-config-revert.json" || die "cannot edit 
   "${K[@]}" replace -f "${S}/nwdaf-config-revert.json" >/dev/null || die "cannot replace nwdaf-config"
   "${K[@]}" rollout restart deployment/nwdaf >/dev/null
   "${K[@]}" rollout status deployment/nwdaf --timeout=180s >/dev/null || die "nwdafd rollout"
-  wait_for 120 sh -c "kubectl -n ${NAMESPACE} logs deploy/nwdaf | grep -q 'NWDAF registered with NRF'" \
-    || die "the restarted nwdafd never registered with the NRF"
+  # The new pod's own line: `logs deploy/nwdaf` could still read the old,
+  # terminating pod, which logged it at deploy.
+  for _ in $(seq 1 30); do NWDAF_POD="$(pod_of nwdaf)"; [[ -n "${NWDAF_POD}" ]] && break; sleep 2; done
+  [[ -n "${NWDAF_POD}" ]] || die "no restarted nwdafd pod"
+  wait_for 120 grep_log "${NWDAF_POD}" nwdaf 'NWDAF registered with NRF' \
+    || die "the restarted nwdafd (${NWDAF_POD}) never registered with the NRF"
 else
   wait_for 180 sh -c "kubectl -n ${NAMESPACE} logs deploy/nwdaf | grep -q 'subscribed to AMF LOCATION_REPORT id='" \
     || die "nwdafd never subscribed to amfd's LOCATION_REPORT"
@@ -141,7 +150,20 @@ NODE="$("${K[@]}" exec "${GNB_A}" -c gnb -- /tmp/nr-cli --dump 2>/dev/null | hea
 [[ -n "${NODE}" ]] || die "nr-cli --dump lists no node in ${GNB_A}"
 cli() { "${K[@]}" exec "${GNB_A}" -c gnb -- /tmp/nr-cli "${NODE}" --exec "$*" 2>&1; }
 
-say "restarting the UE"
+# The deployed route is parked (sim-lap.yaml): write nextgsim's committed
+# start_after_secs back, so the restarted UE rides the seed-464 route. The new
+# pod mounts the ConfigMap as it is now; route_times reads it too.
+say "unparking the route (start_after_secs ${ROUTE_START_SECS}) and restarting the UE"
+"${K[@]}" get configmap nextgsim-configs -o json | python3 -c '
+import json, re, sys
+cm = json.load(sys.stdin)
+ue, n = re.subn(r"(?m)^(\s*start_after_secs:)\s*86400\b.*$", r"\g<1> " + sys.argv[1], cm["data"]["ue.yaml"])
+assert n == 1, "the deployed route is not parked at 86400"
+cm["data"]["ue.yaml"] = ue
+for k in ("resourceVersion", "uid", "creationTimestamp", "managedFields"):
+    cm["metadata"].pop(k, None)
+json.dump(cm, sys.stdout)' "${ROUTE_START_SECS}" >"${S}/nextgsim-configs-unparked.json" || die "cannot unpark the route"
+"${K[@]}" replace -f "${S}/nextgsim-configs-unparked.json" >/dev/null || die "cannot replace nextgsim-configs"
 "${K[@]}" rollout restart deployment/ue >/dev/null
 "${K[@]}" rollout status deployment/ue --timeout=300s >/dev/null || die "UE rollout"
 for _ in $(seq 1 30); do
@@ -161,8 +183,18 @@ RELEASE_AT="$(python3 -c "print('%.3f' % ($(epoch_of "${MOTION_TS}") + ${FAR}))"
 END_AT="$(python3 -c "print('%.3f' % ($(epoch_of "${MOTION_TS}") + ${END}))")"
 say "route started ${MOTION_TS}; release at +${FAR} s, route ends at +${END} s"
 python3 -c "import time; time.sleep(max(0.0, ${RELEASE_AT} - time.time()))"
-UE_ID="$(cli ue-list | grep -oE 'ue_id: [0-9]+' | head -1 | grep -oE '[0-9]+')"
-[[ -n "${UE_ID}" ]] || die "gNB A holds no UE context at the dwell (the UE is not on A)"
+# The context to release: the one gNB A holds for the restarted UE, by the AMF
+# UE NGAP ID of its last handover (into A), never the first of a list.
+AMF_UE_ID="$(logs_of "$(pod_of amf)" amf | grep 'HandoverNotify from association' | tail -1 | sed -nE 's/.*amf_ue_ngap_id=([0-9]+),.*/\1/p')"
+cli ue-list >"${S}/ue-list.txt"
+UE_ID="$(python3 -c '
+import sys, yaml
+want = int(sys.argv[2])
+text = open(sys.argv[1]).read()
+ues = (yaml.safe_load(text[text.index("ues:"):]) or {}).get("ues") or []
+ids = [u["ue_id"] for u in ues if u.get("amf_ngap_id") == want]
+print(ids[0] if len(ids) == 1 else "")' "${S}/ue-list.txt" "${AMF_UE_ID:-0}" 2>/dev/null)"
+[[ -n "${UE_ID}" ]] || die "gNB A holds no single context with amf_ngap_id ${AMF_UE_ID:-?} at the dwell ($(tr '\n' ' ' <"${S}/ue-list.txt"))"
 cli "ue-release ${UE_ID}" >"${S}/ue-release.txt"
 say "ue-release ${UE_ID} on gNB A at $(date -u +%FT%T.%3NZ)"
 wait_for 30 grep_log "${UE_POD}" ue 'Received RRC Release from cell' || die "the UE never got its RRC Release"

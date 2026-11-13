@@ -53,8 +53,15 @@ def sim(t, module, msg):
 
 
 def build(arm):
-    # "<arm>+paged-c": gNB C also gets the attempt-1 PAGING; "<arm>+late-b": gNB
-    # B logs the assistance after the answer (negative controls).
+    # Negative controls, "<arm>+<extra>":
+    #   paged-c      gNB C also gets the attempt-1 PAGING
+    #   unpaged-c    gNB C logs no PAGING although amfd paged it
+    #   late-b       gNB B logs the assistance after the answer
+    #   late-resel   the idle reselection is stamped after the page
+    #   attempt2     attempt 1 goes unanswered; attempt 2 (whole area) is answered
+    #   queried      amfd asks nwdafd and logs a prediction (and a hint series)
+    #   nwdaf-on     the revert arm's nwdafd still logs `ue-mobility: on`
+    #   timeout      the revert arm's amfd logs a timeout instead of a 204
     arm, _, extra = arm.partition("+")
     demo = arm != "off"
     mode = {"off": None, "registration-area": "registration-area"}.get(arm, "nwdaf-mobility")
@@ -74,6 +81,8 @@ def build(arm):
         gnb(g, -289, "Received NG Setup Response from AMF 0: name=nextgcore-amf0")
     if arm == "revert":
         nwdaf(-20, "NWDAF registered with NRF successfully (id=8c2f0b7e-0000-4000-8000-00000000da01)")
+        if extra == "nwdaf-on":
+            nwdaf(-19, "ue-mobility: on (subscribing to AMF LOCATION_REPORT; UE_MOBILITY served)")
     else:
         nwdaf(-280, "ue-mobility: on (subscribing to AMF LOCATION_REPORT; UE_MOBILITY served)")
         nwdaf(-250, "subscribed to AMF LOCATION_REPORT id=sub-0b6e1d2a-1111-4c2e-9e3a-5f0d2c7e9a10")
@@ -81,14 +90,14 @@ def build(arm):
     for t in range(-300, 320, 10):
         f["nwdaf"].append(core(t, "nwdafd::sbi_handler", "Analytics Info Query: /nnwdaf-analyticsinfo/v1/analytics"))
 
-    # The deploy's first UE (before the restart): registration on A, one
-    # handover to B, its ingests and its session address.
+    # The deploy's first UE (before the restart), its route parked: it registers
+    # on A and stays there, so nwdafd's history starts A, A (the restarted UE's
+    # registration): one A -> A transition beside the laps' three A -> B, which
+    # makes the prediction B at 75%.
     amf(-200, "Decoded Initial UE Message: ran_ue_ngap_id=1, nas_pdu_len=23, nci=0x10, tac=1, cause=3")
     amf(-200, "Initial UE Message: ran_ue_ngap_id=1, nas_pdu_len=23, tac=1, nci=0x10")
-    amf(-120, "HandoverNotify from association 2 (amf_ue_ngap_id=1, ran_ue_ngap_id=1)")
     if arm != "revert":
         nwdaf(-200, "ue-mobility ingest supi=%s cell=99970-000000010 tac=0001" % SUPI)
-        nwdaf(-120, "ue-mobility ingest supi=%s cell=99970-000000020 tac=0001" % SUPI)
 
     # The restarted UE: t = 0 is its first line.
     # Cell ids are the UE's RLS discovery order, not the NCI: here B is 0.
@@ -116,15 +125,23 @@ def build(arm):
     ue(233.2, "nextgsim_ue::rrc::task", "Received RRC Release from cell 1")
     ue(233.2, "nextgsim_ue::app::task", "CM state changed to: CM-IDLE")
     ue(235.7, "nextgsim_ue::rrc::cell_selection", "Cell reselection: id=1, plmn=999-70, tac=1, category=SuitableCell")
-    ue(262.4, "nextgsim_ue::rrc::cell_selection", "Cell reselection: id=0, plmn=999-70, tac=1, category=SuitableCell")
+    ue(281.0 if extra == "late-resel" else 262.4, "nextgsim_ue::rrc::cell_selection",
+       "Cell reselection: id=0, plmn=999-70, tac=1, category=SuitableCell")
 
     # The downlink at 280 s.
     f["smf"].append(core(-310, "smfd", "NextGCore SMF v0.1.0 starting..."))
     f["smf"].append(core(280.10, "smfd", "PFCP Session Report Request: SEID=0x0000000000000002, seq=7, peer=10.0.4.17:8805"))
     f["smf"].append(core(280.11, "smfd", "PFCP Session Report Response sent: SEID=0x0000000000000002, seq=7, peer=10.0.4.17:8805"))
     third = {"registration-area": "registration-area", "off": None}.get(arm, "nwdaf")
+    if arm == "nwdaf-mobility" or extra == "queried":
+        amfn(280.13, "NWDAF UE mobility: ue=%s predicted=(999-70, 0x000000020) confidence=75%%" % SUPI)
+    if arm == "revert" and extra == "timeout":
+        amfn(280.42, "NWDAF UE mobility: ue=%s no answer within 300 ms; paging the registration area" % SUPI)
     if arm == "nwdaf-mobility":
-        amfn(280.13, "NWDAF UE mobility: ue=%s predicted=(999-70, 0x000000020) confidence=100%%" % SUPI)
+        # send_paging maps each cell to the gNB that owns it (ngap_path.rs
+        # cell_owner_associations), the predicted cell first.
+        amf(280.19, "NWDAF UE mobility: predicted cell 0x000000020 is served by gNB 0x2 (association 2)")
+        amf(280.19, "NWDAF UE mobility: last known cell 0x000000010 is served by gNB 0x1 (association 1)")
         targets, base = ["gnb-b", "gnb-a"], "predicted by NWDAF UE mobility in the registration area"
     elif arm == "nwdaf-down":
         amfn(280.12, "NWDAF UE mobility: ue=%s no prediction (no NWDAF (NRF discovery found none, "
@@ -139,7 +156,10 @@ def build(arm):
         scope = "nwdaf-mobility" if arm == "nwdaf-mobility" else "registration-area"
         amfd(280.20, "Paging sent to %d/%d ue=%s scope=%s targets=[%s] attempt 1" % (
             len(targets), len(targets), SUPI, scope, ",".join("gNB " + gid[g] for g in targets)))
-    for g in targets + (["gnb-c"] if extra == "paged-c" else []):
+    paged = targets + (["gnb-c"] if extra == "paged-c" else [])
+    if extra == "unpaged-c":
+        paged = [g for g in paged if g != "gnb-c"]
+    for g in paged:
         # The gNB's receipt can be stamped before amfd's `Paging sent`, which
         # amfd logs after its send loop.
         gnb(g, 280.199, "PAGING from AMF[0]: matched 1 served TAI(s); triggering RRC Paging")
@@ -148,16 +168,26 @@ def build(arm):
             nxt = "changed" if arm == "nwdaf-mobility" else "same"
             late = extra == "late-b" and g == "gnb-b"
             gnb(g, 280.5 if late else 280.199, "[demo:%s] PAGING assistance: cells=[%s] attempt 1/5 next-scope=%s" % (KEY, cellsl, nxt))
-    ue(280.25, "nextgsim_ue::rrc::task", "Paged by cell 0 in RRC_IDLE: 5G-S-TMSI [01, 00, c0, 00, 00, 02]")
-    ue(280.26, "nextgsim_ue::nas::mm::orchestrator", "Sending Service Request (MobileTerminatedServices), T3517 started")
-    gnb("gnb-b", 280.30, "Sending Initial UE Message: ue_id=0, ran_ue_ngap_id=1, amf_id=0, stream=1, len=44")
-    amf(280.31, "Decoded Initial UE Message: ran_ue_ngap_id=1, nas_pdu_len=21, nci=0x20, tac=1, cause=4")
-    amf(280.31, "Initial UE Message: ran_ue_ngap_id=1, nas_pdu_len=21, tac=1, nci=0x20")
-    amf(280.33, "Service Request from CM-IDLE: UE 2 -> 3, Service Accept in Initial Context Setup with 1 "
+    t_ans = 0.0
+    if extra == "attempt2":
+        # T3513 (5 s) expires unanswered; attempt 2 pages the whole area.
+        t_ans = 5.0
+        all3 = ["gnb-a", "gnb-b", "gnb-c"]
+        amf(285.20, "Paging sent to 3/3 gNB(s) serving the registration area: 5G-S-TMSI=(1, 0, 0xc0000002), attempt 2")
+        if demo:
+            amfd(285.20, "Paging sent to 3/3 ue=%s scope=registration-area targets=[gNB 0x1,gNB 0x2,gNB 0x3] attempt 2" % SUPI)
+        for g in all3:
+            gnb(g, 285.199, "PAGING from AMF[0]: matched 1 served TAI(s); triggering RRC Paging")
+    ue(280.25 + t_ans, "nextgsim_ue::rrc::task", "Paged by cell 0 in RRC_IDLE: 5G-S-TMSI [01, 00, c0, 00, 00, 02]")
+    ue(280.26 + t_ans, "nextgsim_ue::nas::mm::orchestrator", "Sending Service Request (MobileTerminatedServices), T3517 started")
+    gnb("gnb-b", 280.30 + t_ans, "Sending Initial UE Message: ue_id=0, ran_ue_ngap_id=1, amf_id=0, stream=1, len=44")
+    amf(280.31 + t_ans, "Decoded Initial UE Message: ran_ue_ngap_id=1, nas_pdu_len=21, nci=0x20, tac=1, cause=4")
+    amf(280.31 + t_ans, "Initial UE Message: ran_ue_ngap_id=1, nas_pdu_len=21, tac=1, nci=0x20")
+    amf(280.33 + t_ans, "Service Request from CM-IDLE: UE 2 -> 3, Service Accept in Initial Context Setup with 1 "
                 "PDU session(s) (page answered, T3513 stopped)")
     if demo:
-        amfd(280.33, "page answered ue=%s via gNB 0x2 attempt 1" % SUPI)
-    ue(280.40, "nextgsim_ue::nas::mm::orchestrator", "Service Accept received")
+        amfd(280.33 + t_ans, "page answered ue=%s via gNB 0x2 attempt %d" % (SUPI, 2 if t_ans else 1))
+    ue(280.40 + t_ans, "nextgsim_ue::nas::mm::orchestrator", "Service Accept received")
     files = {"%s.log" % k: "\n".join(v) + "\n" for k, v in f.items()}
     files["ping.txt"] = ("PING 10.45.0.2 (10.45.0.2) 56(84) bytes of data.\n"
                          "--- 10.45.0.2 ping statistics ---\n"
@@ -169,14 +199,14 @@ def build(arm):
         body = {"ueMobs": [{"ts": stamp(2.5)[:19] + "+00:00", "duration": 202, "locInfos": [
             {"loc": {"nrLocation": {"ncgi": {"plmnId": {"mcc": "999", "mnc": "70"}, "nrCellId": "000000020"},
                                     "tai": {"plmnId": {"mcc": "999", "mnc": "70"}, "tac": "0001"}}},
-             "confidence": 100}]}]}
+             "confidence": 75}]}]}
         files["ue-mobility.http"] = "200\n" + json.dumps(body) + "\n"
     prom = ['nextgcore_build_info{nf="amf"} 1']
     if mode:
         prom.append('nextg_demo_enabled{demo="%s",mode="%s"} 1' % (KEY, mode))
-    if mode == "nwdaf-mobility":
-        n = {"predicted": int(arm == "nwdaf-mobility"), "no_prediction": int(arm == "revert"),
-             "error": int(arm == "nwdaf-down"), "timeout": 0, "late": 0, "cap_full": 0}
+    if mode == "nwdaf-mobility" or extra == "queried":
+        n = {"predicted": int(arm == "nwdaf-mobility" or extra == "queried"), "no_prediction": int(arm == "revert" and extra != "timeout"),
+             "error": int(arm == "nwdaf-down"), "timeout": int(extra == "timeout"), "late": 0, "cap_full": 0}
         prom.append("# TYPE amf_paging_nwdaf_hints_total counter")
         prom += ['amf_paging_nwdaf_hints_total{outcome="%s"} %d' % kv for kv in sorted(n.items())]
     files["amf.prom"] = "\n".join(prom) + "\n"

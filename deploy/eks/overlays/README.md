@@ -31,8 +31,8 @@ DEMO_VARIANT=<arm> k8s/demo-check.sh <key> <mode>   # a scenario arm that is not
 
 `<key> off` is a demo's own demo-off arm: the post-render drops the toggles
 and refuses a `demo:` block anywhere, and demo-check makes the demo-off
-assertions (no banner, no `[demo:` line, no `nextg_demo_enabled`). No demo
-registers a mode named `off`. `DEMO_VARIANT` reaches `scenario.sh` (for
+assertions (no banner, no `[demo:` line, no `nextg_demo_enabled`). No demo can
+register a mode named `off`: `nextgcore-demo` and `nextgsim-demo` refuse it. `DEMO_VARIANT` reaches `scenario.sh` (for
 example a fault it injects), is recorded in `verdict.txt`, and the artefacts
 go to `<key>/<mode>+<variant>/`.
 
