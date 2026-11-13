@@ -225,10 +225,13 @@ def check_chain(r, d, deadline_ms):
     by the NEF < round 4 at participants=2 with dur_ms < 0.3 T. Linked by
     content: udmd forwarded every member's LoC leg (x3) before the Accept; amfd
     delivered LoC (2xx) on ue3's leg, and nefd delivered T8 (2xx) on ue3's
-    subscription with the reason the AF logged, both inside (Accept, round 4).
+    subscription with the reason the AF logged, both after the Accept.
     amfd and nefd log on the 204 they get back, and nefd answers amfd before it
-    forwards, so neither delivery line is ordered against the exclusion; their
-    offsets are reported, not gated. Each line is also stamped by its own node."""
+    forwards, so neither delivery line is ordered against the exclusion or round 4;
+    their offsets are reported, not gated. Each line is also stamped by its own
+    node. The leg and subscription ids are of this departure alone (readmission
+    creates new ones), so identity, not a window, is what pins each line to it.
+    The live run of 2026-11-13 stamped nefd's T8 line 364 us after round 4."""
     af, nef, udm, amf = (load(d, f) for f in ('af.log', 'nef.log', 'udm.log', 'amf.log'))
     fail = lambda why: r.add('chain', False, why)
     js = [j for j in joins(af) if j['label'] == 'ue3' and not j['readmit']]
@@ -269,22 +272,23 @@ def check_chain(r, d, deadline_ms):
         return fail(f'round 4 dur_ms={dur} >= 0.3 T ({0.3 * deadline_ms:.0f})')
     leg3 = sub_id(leg[2].group(3))
     dls = [x for x in every(amf, r'Event notification delivered: sub=([^,\s]+), status=(\d+)')
-           if t_acc < x[0] < rnd[0] and x[2].group(2).startswith('2')]
+           if t_acc < x[0] and x[2].group(2).startswith('2')]
     mine = [x for x in dls if x[2].group(1) == leg3]
     if not mine:
-        return fail(f"no amfd 2xx delivery on ue3's leg {leg3} between the Accept and round 4")
-    others = [x for x in dls if x[2].group(1) != leg3]
+        return fail(f"no amfd 2xx delivery on ue3's leg {leg3} after the Accept")
+    # Only this window can say nobody else was delivered during the departure.
+    others = [x for x in dls if x[2].group(1) != leg3 and x[0] < rnd[0]]
     if others:
         return fail(f"amfd also delivered on {[x[2].group(1) for x in others]}, not ue3's leg")
     dl = mine[0]
     nd = None
     for t, m, x in every(nef, r'\[demo:d445a-fl-t8\] T8 delivery sub=(\S+) monitoringType=LOSS_OF_CONNECTIVITY '
                               r'lossOfConnectReason=(\S+) status=(\d+)'):
-        if t_acc < t < rnd[0] and x.group(1) == s3:
+        if t_acc < t and x.group(1) == s3:
             nd = (t, m, x)
             break
     if not nd:
-        return fail(f'no nefd T8 delivery on sub={s3} between the Accept and round 4')
+        return fail(f'no nefd T8 delivery on sub={s3} after the Accept')
     if nd[2].group(2) != reason or not nd[2].group(3).startswith('2'):
         return fail(f'nefd delivered lossOfConnectReason={nd[2].group(2)} status={nd[2].group(3)}, '
                     f'AF saw {reason}')
@@ -918,6 +922,24 @@ def self_test():
             assert old_ in text, (name, old_)
             open(pth, 'w').write(text.replace(old_, new_))
     out = expect('the delivery lines may fall either side of the exclusion', 'main', late, True)
+
+    # The live ordering of 2026-11-13: the AF answers 204, excludes ue3 and runs
+    # round 4 before either logger records its line, so both land after round 4.
+    def after_round4(d):
+        _fixture(d)
+        for name, old_, new_ in (('amf.log', '06:00:30.200Z', '06:00:33.900Z'),
+                                 ('nef.log', '06:00:31.300Z', '06:00:34.000Z')):
+            pth = os.path.join(d, name)
+            text = open(pth).read()
+            assert old_ in text, (name, old_)
+            open(pth, 'w').write(text.replace(old_, new_))
+    out = expect('both delivery lines after round 4 (the live ordering) still hold', 'main', after_round4, True)
+    assert 'amfd delivered +4800.0 ms' in out and 'nefd T8 sub=nsub3 +4900.0 ms' in out, out
+    # The lower bound stays: a delivery before the Accept is not this departure's.
+    expect('the amfd delivery before the Deregistration Accept', 'main',
+           edit('amf.log', '06:00:30.200Z', '06:00:28.000Z'), False, fails='chain')
+    expect('the nefd T8 delivery before the Deregistration Accept', 'main',
+           edit('nef.log', '06:00:31.300Z', '06:00:28.500Z'), False, fails='chain')
 
     # udmd's legs land asynchronously: Sub(ue1) fwd1 Sub(ue2) Sub(ue3) fwd2 fwd3.
     # ue3's leg cannot be told apart, so the chain FAILS closed, whichever leg
