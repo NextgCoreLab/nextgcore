@@ -82,9 +82,13 @@ has "${SIM_BIN_DIR}/nr-ue-revert-hooks" "no FL client in this UE"
   || die "nr-ue-revert-hooks is not a revert-hooks build"
 has "${SIM_BIN_DIR}/nr-fl-server" "nr-fl-server runs only with demo"
 # The AF's knobs: refused by the demo build, accepted by the revert-hooks one.
-"${SIM_BIN_DIR}/nr-fl-server" -c /nonexistent --no-t8 2>&1 | grep -q "needs a revert-hooks build" \
+# Both exit 1 here (no config), so capture the output: under pipefail a pipe
+# into grep would take that exit status and fail even on a match.
+out="$("${SIM_BIN_DIR}/nr-fl-server" -c /nonexistent --no-t8 2>&1 || true)"
+grep -qF "needs a revert-hooks build" <<<"${out}" \
   || die "nr-fl-server accepts --no-t8: it is a revert-hooks build"
-"${SIM_BIN_DIR}/nr-fl-server-revert-hooks" -c /nonexistent --no-t8 2>&1 | grep -q "No such file" \
+out="$("${SIM_BIN_DIR}/nr-fl-server-revert-hooks" -c /nonexistent --no-t8 2>&1 || true)"
+grep -qF "No such file" <<<"${out}" \
   || die "nr-fl-server-revert-hooks refuses --no-t8: not a revert-hooks build"
 
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"

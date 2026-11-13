@@ -72,7 +72,9 @@ d445a_main() {
     done
   }
   aflog() { "${K[@]}" logs deploy/upf -c fl-af --timestamps 2>/dev/null; }
-  af_has() { aflog | grep -qE "$1"; }
+  # Not grep -q: it exits on the first match, kubectl takes SIGPIPE on a long
+  # log, and pipefail turns the match into a failure.
+  af_has() { aflog | grep -E "$1" >/dev/null; }
   af_count() { aflog | grep -cE "$1" || true; }
   tun_ip() { "${K[@]}" exec "deploy/$1" -c ue -- sh -c "ip -4 -o addr show uesimtun0 2>/dev/null | awk '{print \$4}' | cut -d/ -f1" 2>/dev/null; }
   ue_dep() { if [[ "$1" == 1 ]]; then echo ue; else echo "ue-$1"; fi; }

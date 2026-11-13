@@ -217,8 +217,8 @@ if [[ -z "${DEMO_KEY}" ]]; then
 else
   grep -q "DEMO MODE ACTIVE:.*\b${DEMO_KEY}=${DEMO_MODE}\b" "${OUT}/log-chain.txt" \
     || FAILS+=("no DEMO MODE ACTIVE banner for ${DEMO_KEY}=${DEMO_MODE}")
-  cat "${OUT}"/metrics/*.prom 2>/dev/null \
-    | grep -qF "nextg_demo_enabled{demo=\"${DEMO_KEY}\",mode=\"${DEMO_MODE}\"} 1" \
+  # No cat | grep -q: an early match SIGPIPEs cat, which pipefail reports as a miss.
+  grep -qF "nextg_demo_enabled{demo=\"${DEMO_KEY}\",mode=\"${DEMO_MODE}\"} 1" "${OUT}"/metrics/*.prom 2>/dev/null \
     || FAILS+=("no nextg_demo_enabled{demo=${DEMO_KEY},mode=${DEMO_MODE}} series")
 fi
 
