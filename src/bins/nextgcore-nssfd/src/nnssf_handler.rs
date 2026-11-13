@@ -321,9 +321,12 @@ pub struct RegistrationSelection {
 
 /// Authorize the registration-scenario NSSAIs (TS 29.531 §5.2.3.2.3).
 ///
-/// - allowed = requested NSSAIs restricted to the subscription and to the
-///   S-NSSAIs available in the UE's TA; when the AMF sends no requestedNssai
-///   the default subscribed S-NSSAIs are used.
+/// - allowed = requested NSSAIs restricted to the subscribed S-NSSAIs the AMF
+///   supplied and to the S-NSSAIs available in the UE's TA; when the AMF sends
+///   no requestedNssai the default subscribed S-NSSAIs are used
+///   (TS 23.501 §5.15.5.2.1 (B)). An empty `info.subscribed` permits nothing:
+///   every requested S-NSSAI is then rejected in the PLMN. The HTTP layer
+///   refuses a request without subscribedNssai before reaching this function.
 /// - configured = subscribed S-NSSAIs applicable in the serving PLMN, i.e.
 ///   restricted by the CONFIGURED PLMN S-NSSAI set when one exists (#346), never
 ///   by what individual AMFs happen to have reported as available.
@@ -359,11 +362,11 @@ pub fn nssf_nsselection_handle_registration(
         }
     };
 
-    // Subscription check (only meaningful when the AMF supplied the
-    // subscription; otherwise authorize against availability only).
+    // Subscription check: a requested S-NSSAI is permitted only when it is one
+    // of the Subscribed S-NSSAIs (TS 23.501 §5.15.5.2.1 (B)).
     let mut allowed: Vec<SNssai> = Vec::new();
     for c in &candidates {
-        if subscribed.is_empty() || subscribed.contains(c) {
+        if subscribed.contains(c) {
             if !allowed.contains(c) {
                 allowed.push(c.clone());
             }
@@ -412,12 +415,7 @@ pub fn nssf_nsselection_handle_registration(
     // (TS 24.501 Annex C.1), so that consequence outlives the report that caused
     // it. It is also what made a passing nssfd suite order-dependent: a sibling
     // test's availability document decided this member.
-    let configured_src: Vec<SNssai> = if subscribed.is_empty() {
-        allowed.clone()
-    } else {
-        subscribed.clone()
-    };
-    for s in &configured_src {
+    for s in &subscribed {
         let applicable_in_plmn = match &snapshot.plmn_snssai_restriction {
             Some(configured) => configured.contains(s),
             None => true,
@@ -532,54 +530,6 @@ pub fn query_nrf_slice_availability(
         nrf_id: nrf_uri.to_string(),
         available: nf_count > 0,
     }
-}
-
-/// Validate a requested S-NSSAI against subscription data and NRF availability (TS 29.531)
-///
-/// Returns true if the UE is subscribed to the slice AND the network can serve it.
-pub fn validate_slice_selection(s_nssai: &SNssai, supi: Option<&str>, nrf_uri: &str) -> bool {
-    // Step 1: Check subscription if SUPI available
-    if let Some(supi) = supi {
-        match nextgcore_dbi::nextgcore_dbi_subscription_data(supi) {
-            Ok(sub_data) => {
-                let subscribed = sub_data.slice.iter().any(|s| {
-                    s.s_nssai.sst == s_nssai.sst && {
-                        let sd_val = s.s_nssai.sd.v;
-                        if sd_val == 0xFFFFFF {
-                            s_nssai.sd.is_none()
-                        } else {
-                            s_nssai.sd == Some(sd_val)
-                        }
-                    }
-                });
-                if !subscribed {
-                    log::info!(
-                        "[{}] S-NSSAI[SST:{} SD:{:?}] not in subscription",
-                        supi,
-                        s_nssai.sst,
-                        s_nssai.sd
-                    );
-                    return false;
-                }
-            }
-            Err(e) => {
-                log::debug!("Subscription check skipped for {supi}: {e}");
-            }
-        }
-    }
-
-    // Step 2: Check NRF availability
-    let availability = query_nrf_slice_availability(nrf_uri, s_nssai, "SMF");
-    if !availability.available {
-        log::warn!(
-            "S-NSSAI[SST:{} SD:{:?}] has no available NF instances in NRF",
-            s_nssai.sst,
-            s_nssai.sd
-        );
-        return false;
-    }
-
-    true
 }
 
 #[cfg(test)]
@@ -755,6 +705,24 @@ mod tests {
         // configured = full subscription (no availability data)
         assert_eq!(sel.configured.len(), 2);
         assert!(sel.candidate_amf_list.is_empty());
+    }
+
+    /// With no Subscribed S-NSSAI nothing is permitted: every requested
+    /// S-NSSAI is rejected in the PLMN and none is allowed or configured.
+    #[test]
+    fn selection_with_no_subscribed_snssai_permits_no_requested_snssai() {
+        let info = reg_info(vec![], vec![1, 2]);
+        let sel = nssf_nsselection_handle_registration(
+            "amf-1",
+            &info,
+            &RegistrationContextSnapshot::default(),
+        );
+        assert!(sel.allowed.is_empty(), "{:?}", sel.allowed);
+        assert!(sel.configured.is_empty(), "{:?}", sel.configured);
+        assert_eq!(
+            sel.rejected_in_plmn,
+            vec![SNssai::new(1, None), SNssai::new(2, None)]
+        );
     }
 
     #[test]

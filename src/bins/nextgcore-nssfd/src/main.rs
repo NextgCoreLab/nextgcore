@@ -908,6 +908,21 @@ async fn handle_ns_selection(request: &SbiRequest) -> SbiResponse {
     let nf_id = nf_id.expect("checked above");
     let nf_type = nf_type.expect("checked above");
 
+    // `supi` is not a TS 29.531 query parameter of this operation; this NSSF
+    // accepts it as an extension (see `handle_ns_selection_pdu_session`). When
+    // supplied it must be a SUPI the subscriber store is keyed by.
+    let supi = get_param("supi");
+    if let Some(ref value) = supi {
+        if !supi_query_param_is_valid(value) {
+            return problem_details(
+                400,
+                "Bad Request",
+                "Invalid supi query parameter: expected imsi-<5..15 digits> or nai-<value>",
+                Some("MANDATORY_IE_INCORRECT"),
+            );
+        }
+    }
+
     let tai = get_param("tai")
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .and_then(|v| context::tai_from_json(&v));
@@ -962,7 +977,6 @@ async fn handle_ns_selection(request: &SbiRequest) -> SbiResponse {
                 )
             }
         };
-        let supi = get_param("supi");
         return handle_ns_selection_pdu_session(
             &nf_id,
             &nf_type,
@@ -993,6 +1007,42 @@ async fn handle_ns_selection(request: &SbiRequest) -> SbiResponse {
          slice-info-request-for-other-purpose is required",
         Some("MANDATORY_QUERY_PARAM_MISSING"),
     )
+}
+
+/// Whether a `supi` query parameter names a SUPI the subscriber store can be
+/// queried by.
+///
+/// The type prefix is resolved by `nextgcore_dbi::nextgcore_ue_id_key`, the
+/// same check the UDR applies to `{ueId}`; of the types it accepts only the SUPI
+/// ones (`imsi`, `nai`) are valid here, since `msisdn`/`extid` are GPSIs. An IMSI
+/// value follows the TS 29.571 `Supi` pattern (`imsi-[0-9]{5,15}`).
+fn supi_query_param_is_valid(supi: &str) -> bool {
+    match nextgcore_dbi::nextgcore_ue_id_key(supi) {
+        Ok((nextgcore_dbi::NEXTGCORE_IMSI_STRING, value)) => {
+            (5..=15).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_digit())
+        }
+        Ok((nextgcore_dbi::NEXTGCORE_NAI_STRING, value)) => !value.is_empty(),
+        _ => false,
+    }
+}
+
+/// Whether a subscription lookup result confirms `snssai` as a Subscribed
+/// S-NSSAI. Only a successful lookup that lists the S-NSSAI confirms it; a
+/// failed lookup or one that lists no S-NSSAI does not.
+fn subscription_lists_snssai(
+    snssai: &context::SNssai,
+    lookup: &nextgcore_dbi::DbiResult<nextgcore_dbi::NextgcoreSubscriptionData>,
+) -> bool {
+    match lookup {
+        Ok(data) => data.slice.iter().any(|s| {
+            let sd = (s.s_nssai.sd.v != 0xFFFFFF).then_some(s.s_nssai.sd.v);
+            s.s_nssai.sst == snssai.sst && sd == snssai.sd
+        }),
+        Err(e) => {
+            log::debug!("subscription lookup failed ({e}); S-NSSAI not confirmed");
+            false
+        }
+    }
 }
 
 /// Parse a SliceInfoForRegistration / SliceInfoForUEConfigurationUpdate document
@@ -1049,12 +1099,30 @@ fn handle_ns_selection_registration(
 ) -> SbiResponse {
     let info = parse_registration_slice_info(info_json);
 
-    if info.subscribed.is_empty() && info.requested.is_empty() {
+    // The Allowed NSSAI is the set of requested S-NSSAIs permitted by the
+    // Subscribed S-NSSAIs the AMF supplies (TS 23.501 §5.15.5.2.1 (B); TS 29.531
+    // §5.2.2.2.2 step 1, Table 6.1.6.2.10-1). Without subscribedNssai there is
+    // nothing to compare the requested S-NSSAIs against, so the request is
+    // refused rather than answered from the requested set alone.
+    let subscribed_ie_present = info_json
+        .get("subscribedNssai")
+        .and_then(|x| x.as_array())
+        .is_some_and(|a| !a.is_empty());
+    if !subscribed_ie_present {
         return problem_details(
             400,
             "Bad Request",
-            "sliceInfoRequestForRegistration must contain subscribedNssai and/or requestedNssai",
+            "subscribedNssai is required to determine the Allowed NSSAI \
+             (TS 29.531 §5.2.2.2.2, TS 23.501 §5.15.5.2.1)",
             Some("MANDATORY_IE_MISSING"),
+        );
+    }
+    if info.subscribed.is_empty() {
+        return problem_details(
+            400,
+            "Bad Request",
+            "subscribedNssai contains no valid SubscribedSnssai entry",
+            Some("MANDATORY_IE_INCORRECT"),
         );
     }
 
@@ -1641,13 +1709,10 @@ async fn handle_ns_selection_pdu_session(
 
     match result {
         nnssf_handler::NsSelectionResult::Success(info) => {
-            // Snapshot everything we need from the NSSF context into OWNED data
-            // and drop the read-lock BEFORE the async DB call below (DANGER-ZONES B1).
-            let ctx = nssf_self();
-            let (mut allowed_snssai_list, supported_for_tai): (
-                Vec<serde_json::Value>,
-                Vec<(u8, Option<u32>)>,
-            ) = {
+            // Snapshot the TAI-supported S-NSSAIs into OWNED data and drop the
+            // read-lock BEFORE the async DB call below (DANGER-ZONES B1).
+            let supported_for_tai: Option<Vec<context::SNssai>> = {
+                let ctx = nssf_self();
                 let context = match ctx.read() {
                     Ok(c) => c,
                     Err(_) => {
@@ -1659,113 +1724,53 @@ async fn handle_ns_selection_pdu_session(
                         )
                     }
                 };
+                tai.map(|t| context.get_supported_snssai_for_tai(t))
+                    .filter(|supported| !supported.is_empty())
+            }; // <- context read-lock released here, before any await
 
-                // nssfd-04: seed allowedNssaiList from the validated requested
-                // S-NSSAI only (TS 29.531 §5.2.2.2.3 step 2a: "the allowed
-                // NSSAI corresponds to the requested S-NSSAI, not the full
-                // catalogue"). For home-routed roaming include the mapped home
-                // S-NSSAI when present. The subscription + availability retain
-                // filters below apply as defence-in-depth narrowing.
+            // nssfd-04: the allowed S-NSSAI echoes the requested S-NSSAI only,
+            // never the full NSI catalogue. TS 29.531 §5.2.2.2.3 requires the
+            // NRF / NSI of the response, not an Allowed NSSAI, so the entry is
+            // emitted only when every check below confirms it.
+            let mut allowed = true;
+
+            // Subscription confirmation (extension): when the consumer passes a
+            // `supi`, the S-NSSAI is confirmed against the subscriber's
+            // Subscribed S-NSSAIs. The subscription lists HPLMN S-NSSAIs, so the
+            // home S-NSSAI is compared when one is given. Only a lookup that
+            // lists the S-NSSAI confirms it; a failed lookup, an unknown
+            // subscriber or a subscription without it leaves the S-NSSAI out.
+            if let Some(ref supi_val) = supi {
+                let lookup =
+                    nextgcore_dbi::nextgcore_dbi_subscription_data_async(supi_val.to_string())
+                        .await;
+                let subscribed_snssai = param.home_snssai.as_ref().unwrap_or(&snssai);
+                allowed &= subscription_lists_snssai(subscribed_snssai, &lookup);
+            }
+
+            // NSSAI availability in the UE's TA (TS 29.531 §6.1.3.2.3.1 `tai`).
+            if let Some(ref supported) = supported_for_tai {
+                allowed &= supported.contains(&snssai);
+            }
+
+            let mut response = serde_json::json!({ "supportedFeatures": "1" });
+            if allowed {
                 let mut allowed_item = serde_json::json!({
                     "allowedSnssai": context::snssai_to_json(&snssai)
                 });
                 if let Some(ref hs) = param.home_snssai {
                     allowed_item["mappedHomeSnssai"] = context::snssai_to_json(hs);
                 }
-                let list = vec![allowed_item];
-
-                // Snapshot TAI-supported S-NSSAIs as owned (sst, sd) tuples
-                // (TS 29.531 6.1.3.2.3.2) so we can filter after dropping the lock.
-                let supported = if let Some(t) = tai {
-                    context
-                        .get_supported_snssai_for_tai(t)
-                        .iter()
-                        .map(|s| (s.sst, s.sd))
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-
-                (list, supported)
-            }; // <- context read-lock released here, before any await
-
-            // Subscription-based filtering: if SUPI provided, query UDR for
-            // subscribed NSSAIs and filter (TS 29.531 6.1.3.2.3.1).
-            if let Some(ref supi_val) = supi {
-                match nextgcore_dbi::nextgcore_dbi_subscription_data_async(supi_val.to_string())
-                    .await
-                {
-                    Ok(sub_data) => {
-                        let subscribed: Vec<(u8, Option<u32>)> = sub_data
-                            .slice
-                            .iter()
-                            .map(|s| {
-                                (
-                                    s.s_nssai.sst,
-                                    if s.s_nssai.sd.v == 0xFFFFFF {
-                                        None
-                                    } else {
-                                        Some(s.s_nssai.sd.v)
-                                    },
-                                )
-                            })
-                            .collect();
-
-                        if !subscribed.is_empty() {
-                            allowed_snssai_list.retain(|item| {
-                                let sst = item
-                                    .get("allowedSnssai")
-                                    .and_then(|s| s.get("sst"))
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0) as u8;
-                                let sd = item
-                                    .get("allowedSnssai")
-                                    .and_then(|s| s.get("sd"))
-                                    .and_then(|v| v.as_str())
-                                    .and_then(|s| u32::from_str_radix(s, 16).ok());
-                                subscribed
-                                    .iter()
-                                    .any(|(sub_sst, sub_sd)| *sub_sst == sst && *sub_sd == sd)
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        log::debug!(
-                            "UDR subscription query unavailable for SUPI ({e}), allowing all NSSAIs"
-                        );
-                    }
-                }
-            }
-
-            // Also filter against the NSSAI-availability snapshot taken above
-            if !supported_for_tai.is_empty() {
-                allowed_snssai_list.retain(|item| {
-                    let sst = item
-                        .get("allowedSnssai")
-                        .and_then(|s| s.get("sst"))
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u8;
-                    let sd = item
-                        .get("allowedSnssai")
-                        .and_then(|s| s.get("sd"))
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| u32::from_str_radix(s, 16).ok());
-                    supported_for_tai
-                        .iter()
-                        .any(|(s_sst, s_sd)| *s_sst == sst && *s_sd == sd)
-                });
-            }
-
-            let mut response = serde_json::json!({
-                "allowedNssaiList": [{
-                    "allowedSnssaiList": allowed_snssai_list,
+                // AllowedNssai.allowedSnssaiList has minItems 1, so the member
+                // is omitted rather than emitted empty.
+                response["allowedNssaiList"] = serde_json::json!([{
+                    "allowedSnssaiList": [allowed_item],
                     // SliceInfoForPDUSession carries no accessType, so this is
                     // the documented default rather than a derived value; see
                     // DEFAULT_ACCESS_TYPE.
                     "accessType": DEFAULT_ACCESS_TYPE
-                }],
-                "supportedFeatures": "1"
-            });
+                }]);
+            }
 
             // nsiInformation is the spec response attribute for the PDU
             // session scenario; nsiInformationList is kept for back-compat.
@@ -5644,5 +5649,273 @@ mod tests_nf_profile_host_kind_1324 {
                 nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
             assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
         }
+    }
+}
+
+/// Allowed NSSAI derivation and request validation for Nnssf_NSSelection
+/// (TS 29.531 §5.2.2.2.2 / §5.2.2.2.3, TS 23.501 §5.15.5.2.1).
+#[cfg(test)]
+mod tests_allowed_nssai_derivation {
+    use super::*;
+    use nextgcore_sbi::client::SbiClient;
+    use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+    use serde_json::json;
+
+    fn body_of(resp: &SbiResponse) -> serde_json::Value {
+        resp.http
+            .content
+            .as_deref()
+            .and_then(|c| serde_json::from_str(c).ok())
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    fn ssts(v: &serde_json::Value, key: Option<&str>) -> Vec<u64> {
+        v.as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| match key {
+                        Some(k) => e[k]["sst"].as_u64(),
+                        None => e["sst"].as_u64(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn enc(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() * 3);
+        for b in s.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    out.push(b as char)
+                }
+                _ => out.push_str(&format!("%{b:02X}")),
+            }
+        }
+        out
+    }
+
+    async fn start_server() -> (SbiServer, u16) {
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let server = SbiServer::on_listener(
+            SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+            listener,
+        );
+        server
+            .start(nssf_sbi_request_handler)
+            .await
+            .expect("server start");
+        (server, port)
+    }
+
+    /// Allowed = requested ∩ subscribed ∩ available in the TA; the remainder is
+    /// reported as rejected in the PLMN (not subscribed) or in the TA.
+    #[test]
+    fn allowed_nssai_is_requested_and_subscribed_and_available_in_the_ta() {
+        let _guard = context::nssf_test_guard(512);
+        let tai_json = json!({"plmnId": {"mcc": "999", "mnc": "70"}, "tac": "0001a4"});
+        let doc = json!({
+            "supportedNssaiAvailabilityData": [{
+                "tai": tai_json,
+                "supportedSnssaiList": [{"sst": 1}, {"sst": 2}]
+            }]
+        });
+        with_nssf_context(|c| {
+            c.set_plmn_supported_snssais(None);
+            c.set_nssai_availability(
+                "amf-ta-report",
+                context::availability_info_from_doc("amf-ta-report", doc),
+            )
+        })
+        .expect("context available");
+        let tai = context::tai_from_json(&tai_json).expect("tai parses");
+
+        let info = json!({
+            "subscribedNssai": [
+                {"subscribedSnssai": {"sst": 1}, "defaultIndication": true},
+                {"subscribedSnssai": {"sst": 2}},
+                {"subscribedSnssai": {"sst": 3}}
+            ],
+            "requestedNssai": [{"sst": 1}, {"sst": 3}, {"sst": 9}]
+        });
+        let resp = handle_ns_selection_registration("amf-requester", &info, Some(&tai));
+        assert_eq!(resp.status, 200);
+        let body = body_of(&resp);
+        assert_eq!(
+            ssts(
+                &body["allowedNssaiList"][0]["allowedSnssaiList"],
+                Some("allowedSnssai")
+            ),
+            vec![1],
+            "{body}"
+        );
+        assert_eq!(ssts(&body["rejectedNssaiInTa"], None), vec![3], "{body}");
+        assert_eq!(ssts(&body["rejectedNssaiInPlmn"], None), vec![9], "{body}");
+    }
+
+    /// Registration and UE configuration update without subscribedNssai are
+    /// refused with MANDATORY_IE_MISSING; no Allowed NSSAI is returned.
+    #[test]
+    fn selection_without_subscribed_nssai_is_refused_as_mandatory_ie_missing() {
+        let _guard = context::nssf_test_guard(512);
+        with_nssf_context(|c| c.set_plmn_supported_snssais(None)).expect("context available");
+
+        for info in [
+            json!({"requestedNssai": [{"sst": 1}, {"sst": 2}]}),
+            json!({"subscribedNssai": [], "requestedNssai": [{"sst": 1}]}),
+        ] {
+            for resp in [
+                handle_ns_selection_registration("amf-no-sub", &info, None),
+                handle_ns_selection_ue_cu("amf-no-sub", &info, None),
+            ] {
+                let body = body_of(&resp);
+                assert_eq!(resp.status, 400, "{info} -> {body}");
+                assert_eq!(body["cause"], "MANDATORY_IE_MISSING", "{body}");
+                assert!(body.get("allowedNssaiList").is_none(), "{body}");
+            }
+        }
+
+        // Present but with no parseable entry: incorrect rather than missing.
+        let info = json!({
+            "subscribedNssai": [{"defaultIndication": true}],
+            "requestedNssai": [{"sst": 1}]
+        });
+        let resp = handle_ns_selection_registration("amf-bad-sub", &info, None);
+        assert_eq!(resp.status, 400);
+        assert_eq!(body_of(&resp)["cause"], "MANDATORY_IE_INCORRECT");
+    }
+
+    /// Only a lookup that lists the S-NSSAI confirms it.
+    #[test]
+    fn subscription_confirmation_requires_a_lookup_listing_the_snssai() {
+        let wanted = context::SNssai::new(1, Some(0x010203));
+        let slice = |sst: u8, sd: u32| nextgcore_dbi::NextgcoreSliceData {
+            s_nssai: nextgcore_dbi::NextgcoreSNssai {
+                sst,
+                sd: nextgcore_dbi::NextgcoreUint24 { v: sd },
+            },
+            ..Default::default()
+        };
+        let data = |slices: Vec<nextgcore_dbi::NextgcoreSliceData>| {
+            let mut d = nextgcore_dbi::NextgcoreSubscriptionData::new();
+            d.num_of_slice = slices.len();
+            d.slice = slices;
+            Ok(d)
+        };
+
+        assert!(subscription_lists_snssai(
+            &wanted,
+            &data(vec![slice(1, 0x010203)])
+        ));
+        assert!(subscription_lists_snssai(
+            &context::SNssai::new(2, None),
+            &data(vec![slice(2, 0xFFFFFF)])
+        ));
+        assert!(!subscription_lists_snssai(
+            &wanted,
+            &data(vec![slice(1, 0x0000aa)])
+        ));
+        assert!(!subscription_lists_snssai(&wanted, &data(vec![])));
+        for err in [
+            nextgcore_dbi::DbiError::NotInitialized,
+            nextgcore_dbi::DbiError::SubscriberNotFound("imsi-001010000000001".into()),
+            nextgcore_dbi::DbiError::UnsupportedUeIdType("x-1".into()),
+        ] {
+            assert!(!subscription_lists_snssai(&wanted, &Err(err)));
+        }
+    }
+
+    /// PDU session selection with a `supi` whose subscription cannot be read
+    /// (no subscriber store in unit tests) lists no allowed S-NSSAI, while the
+    /// NRF / NSI information of the configured slice is still returned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
+    async fn pdu_session_selection_with_an_unconfirmed_subscription_lists_no_allowed_snssai() {
+        let _guard = context::nssf_test_guard(512);
+        with_nssf_context(|c| {
+            c.nsi_add("http://nrf-slice-5:7777", 5, None);
+        })
+        .expect("context available");
+        assert!(
+            nextgcore_dbi::nextgcore_dbi_subscription_data("imsi-001010000000005").is_err(),
+            "precondition: the subscription lookup fails in this process"
+        );
+
+        let si = json!({"sNssai": {"sst": 5}, "roamingIndication": "NON_ROAMING"});
+        let resp = handle_ns_selection_pdu_session(
+            "amf-pdu",
+            "AMF",
+            &si,
+            None,
+            Some("imsi-001010000000005".to_string()),
+            None,
+        )
+        .await;
+        let body = body_of(&resp);
+        assert_eq!(resp.status, 200, "{body}");
+        assert!(body.get("allowedNssaiList").is_none(), "{body}");
+        assert_eq!(body["nsiInformation"]["nrfId"], "http://nrf-slice-5:7777");
+
+        with_nssf_context(|c| c.nsi_remove_all());
+    }
+
+    #[test]
+    fn supi_query_parameter_validation_follows_the_supi_types() {
+        for ok in ["imsi-00101", "imsi-001010000000001", "nai-user@realm"] {
+            assert!(supi_query_param_is_valid(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "imsi",
+            "imsi-",
+            "imsi-1234",
+            "imsi-1234567890123456",
+            "imsi-00101abc",
+            "nai-",
+            "msisdn-15551234567",
+            "extid-user@realm",
+            "foo-001010000000001",
+            "001010000000001",
+        ] {
+            assert!(!supi_query_param_is_valid(bad), "{bad}");
+        }
+    }
+
+    /// A malformed `supi` query parameter is answered 400 MANDATORY_IE_INCORRECT
+    /// over the SBI server; a well-formed one is not refused for it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
+    async fn a_malformed_supi_query_parameter_is_mandatory_ie_incorrect() {
+        let _guard = context::nssf_test_guard(512);
+        let (server, port) = start_server().await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        let sip =
+            enc(&json!({"sNssai": {"sst": 1}, "roamingIndication": "NON_ROAMING"}).to_string());
+
+        for supi in ["imsi-12", "msisdn-15551234567", "foo-1", "nosep"] {
+            let path = format!(
+                "/nnssf-nsselection/v2/network-slice-information?nf-type=AMF&nf-id=amf-s&supi={}&slice-info-request-for-pdu-session={sip}",
+                enc(supi)
+            );
+            let resp = tokio::time::timeout(Duration::from_secs(5), client.get(&path))
+                .await
+                .expect("bounded")
+                .expect("response");
+            let body = body_of(&resp);
+            assert_eq!(resp.status, 400, "{supi} -> {body}");
+            assert_eq!(body["cause"], "MANDATORY_IE_INCORRECT", "{supi} -> {body}");
+        }
+
+        let path = format!(
+            "/nnssf-nsselection/v2/network-slice-information?nf-type=AMF&nf-id=amf-s&supi=imsi-001010000000001&slice-info-request-for-pdu-session={sip}"
+        );
+        let resp = tokio::time::timeout(Duration::from_secs(5), client.get(&path))
+            .await
+            .expect("bounded")
+            .expect("response");
+        assert_ne!(resp.status, 400, "{}", body_of(&resp));
+
+        server.stop().await.expect("stop");
     }
 }
