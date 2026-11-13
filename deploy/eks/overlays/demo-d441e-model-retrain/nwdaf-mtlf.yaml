@@ -1,0 +1,135 @@
+# The MTLF of demo d441e-model-retrain (nextgsim#468): trains and serves the
+# NF_LOAD model, takes MLModelMonitor registrations and, in mode retrain, refits
+# on an accuracy drop and provisions v2. ClusterIP only. Host names say
+# nextg-system; the 6G post-render rewrites them to this namespace.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nwdaf-mtlf-config
+  labels:
+    app.kubernetes.io/part-of: nextgcore
+data:
+  # A toggle target (toggles.yaml): the post-render merges the demo: block in.
+  nwdaf-mtlf.yaml: |
+    logger:
+      level: info
+    nwdaf:
+      role: mtlf
+      sbi:
+        server:
+          - address: 0.0.0.0
+            port: 7777
+      # The seeded series (model_refit.rs), the defaults written out:
+      # every 600 s of unix time, calm for 120 s, then alternating.
+      retrain_series:
+        enabled: true
+        seed: 468
+        step_secs: 1
+        cycle_steps: 600
+        change_at_step: 120
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nwdaf-mtlf
+  labels:
+    app.kubernetes.io/name: nwdaf-mtlf
+    app.kubernetes.io/part-of: nextgcore
+spec:
+  selector:
+    app.kubernetes.io/name: nwdaf-mtlf
+  ports:
+    - name: sbi
+      port: 7777
+      targetPort: 7777
+    # /metrics, cluster-internal: this Service is ClusterIP.
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nwdaf-mtlf
+  labels:
+    app.kubernetes.io/name: nwdaf-mtlf
+    app.kubernetes.io/part-of: nextgcore
+spec:
+  replicas: 1
+  # Never two of one role at once: scenario.sh restarts both NWDAFs at a chosen
+  # point of the series, and an old pod must be gone before the new one starts.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nwdaf-mtlf
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nwdaf-mtlf
+        app.kubernetes.io/part-of: nextgcore
+    spec:
+      initContainers:
+        - name: wait-nrf
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z nrf.nextg-system.svc.cluster.local 7777; do echo waiting for nrf; sleep 2; done']
+      containers:
+        - name: nwdaf
+          image: nextgcore-rust/nwdaf:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "-c"
+            - "/etc/nextgcore/nwdaf.yaml"
+            - "--nrf-uri"
+            - "http://nrf.nextg-system.svc.cluster.local:7777"
+            # Pinned, so a restarted pod re-registers under the same NRF
+            # profile (the old pod's address is replaced, not left beside it).
+            - "--nf-instance-id"
+            - "d441e000-0468-4000-8000-00000000f001"
+          ports:
+            - containerPort: 7777
+              name: sbi
+            - containerPort: 9090
+              name: metrics
+          env:
+            - name: NEXTGCORE_SBI_PROFILE
+              value: "dev"
+            - name: RUST_LOG
+              value: info
+            # /metrics on the pod IP for the in-pod scrape; reached through the
+            # ClusterIP Service only.
+            - name: NEXTGCORE_METRICS_BIND
+              value: "0.0.0.0"
+            # Registered with the NRF; used in the model URLs and callback URIs.
+            - name: NEXTGCORE_SBI_ADVERTISE
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: RUST_BACKTRACE
+              value: "1"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nextgcore/nwdaf.yaml
+              subPath: nwdaf-mtlf.yaml
+              readOnly: true
+          readinessProbe:
+            tcpSocket:
+              port: 7777
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 7777
+            initialDelaySeconds: 15
+            periodSeconds: 30
+      volumes:
+        - name: config
+          configMap:
+            name: nwdaf-mtlf-config

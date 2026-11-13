@@ -2220,3 +2220,112 @@ jobs:
           name: nat-exclude
           path: /tmp/nat-exclude
           if-no-files-found: warn
+
+  # ====================================================================
+  # Demo d441e-model-retrain (nextgsim#468): MTLF -> AnLF model provisioning
+  # with an accuracy-triggered retrain, on the standalone compose stack
+  # docker/rust/docker-compose.demo-d441e.yml (an NRF and two nwdafd of one
+  # image, roles mtlf and anlf). Nightly and on demand: each seeded arm waits
+  # for its point in the series' 600 s cycle.
+  #
+  # Arms (docker/rust/configs/demo-d441e/check.sh, header there):
+  #   bogus-mode, off-absent, off-disabled, off-key-only   start-up failure and
+  #     the three demo-off shapes (no demo line, no nextg_demo_enabled, the
+  #     MLModelMonitor routes 404, no AnLF client);
+  #   retrain and no-retrain, concurrently (the series is a function of unix
+  #     time, so both see the same change): the ordered chain (chain.py);
+  #   the revert arms (reverts.sh): a flipped v2 byte must fail at S12 with
+  #     "model refused (sha256 mismatch) ...; keeping v1", the FeedbackRegistry
+  #     feed patched out must fail at S8 with no "retrain requested".
+  # The binaries are built in rust:1.95.0-bookworm (Dockerfile.builder's base),
+  # so they match the bookworm runtime image. Private: the stack publishes no
+  # port (check.sh asserts it from `docker compose config`) and its network is
+  # internal. The OAuth2-require arm waits for #1421.
+  # ====================================================================
+  demo-d441e:
+    name: Demo d441e-model-retrain (MTLF/AnLF provisioning and retrain)
+    runs-on: ubuntu-latest
+    needs: check
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 120
+    env:
+      D441E_NWDAF_IMAGE: nextgcore-demo/nwdaf-d441e:ci
+      D441E_NRF_IMAGE: nextgcore-rust/nrf:d441e-ci
+      D441E_CORE_IMAGE: nextgcore-core:latest
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-d441e
+    steps:
+      - uses: actions/checkout@v4
+      - name: chain.py self-test (every assertion fails on input missing its line)
+        run: deploy/eks/overlays/demo-d441e-model-retrain/test-scenario.sh
+      - name: bookworm cargo (the runtime image's glibc)
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            'FROM rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1' \
+            'RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev cmake g++ protobuf-compiler libstdc++-12-dev libclang-dev clang libsctp-dev && rm -rf /var/lib/apt/lists/*' \
+            | docker build -q -t d441e-cargo - >/dev/null
+          w="$RUNNER_TEMP/bookworm-cargo"
+          printf '%s\n' '#!/bin/sh' \
+            "exec docker run --rm -u $(id -u):$(id -g) -e HOME=/tmp -e CARGO_HOME=$RUNNER_TEMP/cargo-home -e CARGO_TARGET_DIR -v $GITHUB_WORKSPACE:$GITHUB_WORKSPACE -v $RUNNER_TEMP:$RUNNER_TEMP -w \"\$PWD\" d441e-cargo cargo \"\$@\"" \
+            > "$w"
+          chmod +x "$w"
+          mkdir -p "$RUNNER_TEMP/cargo-home"
+          echo "D441E_CARGO=$w" >> "$GITHUB_ENV"
+          # Job-level env cannot read the runner context.
+          echo "DEMO_ARTEFACTS=$RUNNER_TEMP/d441e" >> "$GITHUB_ENV"
+      - name: build nrfd and nwdafd (--features demo-d441e-model-retrain) and their images
+        run: |
+          set -euo pipefail
+          (cd src && "$D441E_CARGO" build --release -p nextgcore-nrfd -p nextgcore-nwdafd \
+            --features nextgcore-nwdafd/demo-d441e-model-retrain)
+          docker build -q -f docker/rust/Dockerfile.core -t "$D441E_CORE_IMAGE" docker/rust
+          ctx="$RUNNER_TEMP/ctx"; mkdir -p "$ctx/binaries"
+          cp "$CARGO_TARGET_DIR/release/nextgcore-nrfd" "$CARGO_TARGET_DIR/release/nextgcore-nwdafd" "$ctx/binaries/"
+          docker build -q -f docker/rust/Dockerfile.nf --build-arg CORE_IMAGE="$D441E_CORE_IMAGE" \
+            --build-arg NF_NAME=nextgcore-nrfd -t "$D441E_NRF_IMAGE" "$ctx"
+          docker build -q -f docker/rust/Dockerfile.nf --build-arg CORE_IMAGE="$D441E_CORE_IMAGE" \
+            --build-arg NF_NAME=nextgcore-nwdafd -t "$D441E_NWDAF_IMAGE" "$ctx"
+      - name: start-up failure and the demo-off arms
+        run: |
+          set -euo pipefail
+          for arm in bogus-mode off-absent off-disabled off-key-only; do
+            echo "::group::$arm"
+            DEMO_ARTEFACTS="$DEMO_ARTEFACTS/$arm" docker/rust/configs/demo-d441e/check.sh "$arm"
+            echo "::endgroup::"
+          done
+      - name: retrain and no-retrain (one seeded run each, concurrently)
+        timeout-minutes: 25
+        run: |
+          # Not -e (the step shell's default): a failed arm must still print
+          # both outputs and write the summary before the step fails.
+          set +e -uo pipefail
+          c=docker/rust/configs/demo-d441e/check.sh
+          DEMO_ARTEFACTS="$DEMO_ARTEFACTS/retrain" "$c" retrain > "$RUNNER_TEMP/retrain.out" 2>&1 & a=$!
+          DEMO_ARTEFACTS="$DEMO_ARTEFACTS/no-retrain" "$c" no-retrain > "$RUNNER_TEMP/no-retrain.out" 2>&1 & b=$!
+          wait "$a"; ra=$?; wait "$b"; rb=$?
+          cat "$RUNNER_TEMP/retrain.out" "$RUNNER_TEMP/no-retrain.out"
+          {
+            echo "### Demo d441e-model-retrain"
+            echo '```'; cat "$DEMO_ARTEFACTS"/retrain/results.txt "$DEMO_ARTEFACTS"/no-retrain/results.txt 2>/dev/null; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "$ra" = 0 ] && [ "$rb" = 0 ]
+      - name: revert arms (flipped v2 byte, FeedbackRegistry feed patched out)
+        timeout-minutes: 50
+        run: docker/rust/configs/demo-d441e/reverts.sh
+      - name: the revert arms left the checkout clean
+        if: always()
+        run: git diff --quiet HEAD -- || { echo "::error::tracked files differ from HEAD"; git status --short; exit 1; }
+      - name: upload the captured logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-d441e
+          path: ${{ runner.temp }}/d441e
+          if-no-files-found: warn
+          retention-days: 14
+      - name: teardown
+        if: always()
+        run: |
+          for p in $(docker compose ls -a -q | grep '^nextg-d441e' || true); do
+            docker compose -p "$p" down -v --remove-orphans || true
+          done
