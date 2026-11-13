@@ -21,9 +21,34 @@ impl SNssai {
 
     /// Create S-NSSAI from SST and SD values
     pub fn from_sst_sd(sst: u8, sd: u32) -> Self {
-        let sd_opt = if sd == 0xFFFFFF { None } else { Some(sd) };
-        Self { sst, sd: sd_opt }
+        Self {
+            sst,
+            sd: sd_or_none(sd),
+        }
     }
+}
+
+/// The reserved SD value meaning "no SD value associated with the SST"
+/// (TS 23.003 §28.4.2: "defined as hexadecimal FFFFFF. In certain protocols, the
+/// SD field is not included to indicate that no SD value is associated with the
+/// SST").
+pub const SD_NONE: u32 = 0xFF_FFFF;
+
+/// An SD value as this NSSF stores it: the reserved `FFFFFF` is the same slice
+/// as an absent SD, so both are `None`.
+///
+/// Every place an SD enters the NSSF -- wire JSON, YAML configuration, the
+/// subscriber store -- goes through this, so the comparisons between them
+/// (subscription, TA availability, NSI lookup, PLMN restriction) agree on which
+/// spelling is which slice.
+pub fn sd_or_none(sd: u32) -> Option<u32> {
+    (sd != SD_NONE).then_some(sd)
+}
+
+/// Parse a 6-hex-digit SD, normalizing the reserved value (see [`sd_or_none`]).
+/// `None` = the text is not hex at all.
+pub fn sd_from_hex(hex: &str) -> Option<Option<u32>> {
+    u32::from_str_radix(hex, 16).ok().map(sd_or_none)
 }
 
 /// PLMN ID
@@ -294,7 +319,7 @@ pub fn snssai_from_json(v: &serde_json::Value) -> Option<SNssai> {
         return None;
     }
     let sd = match v.get("sd") {
-        Some(serde_json::Value::String(s)) => Some(u32::from_str_radix(s, 16).ok()?),
+        Some(serde_json::Value::String(s)) => sd_from_hex(s)?,
         Some(serde_json::Value::Null) | None => None,
         _ => return None,
     };

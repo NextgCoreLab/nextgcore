@@ -331,7 +331,8 @@ pub struct RegistrationSelection {
 /// - the default-marked subscribed S-NSSAIs are considered both when no
 ///   requestedNssai was sent and when none of the requested ones is permitted or
 ///   available in the TA — the two cases the same clause names. Only an explicit
-///   `defaultIndication` marks one.
+///   `defaultIndication` marks one (TS 23.501 §5.15.3: the subscription "shall
+///   include at least one default S-NSSAI").
 /// - an empty `info.subscribed` permits nothing: every requested S-NSSAI is then
 ///   rejected in the PLMN and `sel.allowed` comes back empty, which the HTTP
 ///   layer answers 403 SNSSAI_NOT_SUPPORTED (TS 29.531 §5.2.2.2.2 step 2b).
@@ -367,22 +368,40 @@ pub fn nssf_nsselection_handle_registration(
     // The mapping half matters for inbound roaming, where `subscribedNssai`
     // carries HPLMN values (TS 29.531 Table 6.1.6.2.10-1) while `requestedNssai`
     // carries serving-PLMN ones: comparing the raw serving value against an HPLMN
-    // subscription rejects every slice a roamer asks for. `mappingOfNssai` was
-    // parsed and used only to decorate the response.
+    // subscription rejects every slice a roamer asks for.
+    //
     // Either spelling of the same slice is accepted: the value as requested, or
-    // the HPLMN value the consumer's own `mappingOfNssai` gives for it. Which one
-    // `subscribedNssai` is expressed in depends on the case -- HPLMN values for
-    // inbound roaming, serving-PLMN values otherwise -- and the consumer supplies
-    // both the mapping and the subscription, so neither spelling reaches past the
-    // subscription it was checked against.
+    // the HPLMN value the consumer's own `mappingOfNssai` gives for it. The
+    // clause states the disjunction itself, in (A) and (B) alike: the Allowed
+    // NSSAI is determined from "the list of S-NSSAI(s) in the Requested NSSAI
+    // permitted based on the Subscribed S-NSSAIs AND/OR the list of S-NSSAI(s)
+    // for the Serving PLMN which are mapped to the HPLMN S-NSSAI(s) provided in
+    // the mapping of Requested NSSAI permitted based on the Subscribed S-NSSAIs".
+    // And a mapping being present does not say which spelling the subscription
+    // uses: `mappingOfNssai` may also be present during EPS-to-5GS and intra-5GS
+    // handover, where `subscribedNssai` may carry serving-PLMN values.
+    //
+    // The one widening this admits, stated so it is not mistaken for an
+    // oversight: when the subscription is in HPLMN values, a requested
+    // serving-PLMN S-NSSAI that HAPPENS TO EQUAL a subscribed HPLMN value is
+    // permitted on that coincidence, even if the request's own `mappingOfNssai`
+    // maps it to a home value that is not subscribed. It is bounded by the
+    // request itself -- the consumer supplies both the mapping and the
+    // subscription, so the result never reaches past the subscription it was
+    // checked against -- and nothing in the request tells the NSSF which spelling
+    // `subscribedNssai` uses, so neither reading can be refused on the request's
+    // own evidence.
     let is_subscribed = |s: &SNssai| -> bool {
         subscribed.contains(s) || mapped(s).is_some_and(|home| subscribed.contains(&home))
     };
 
     // The default-marked Subscribed S-NSSAIs. Only an explicit
-    // `defaultIndication: true` marks one -- the member is optional, so treating
-    // its absence as "all subscribed are default" would hand a consumer that
-    // never sends it the whole subscription as the default set.
+    // `defaultIndication: true` marks one. TS 23.501 §5.15.3: "The subscription
+    // information shall include at least one default S-NSSAI" (and again for
+    // what the UDM sends the AMF). A `subscribedNssai` with no default marked is
+    // therefore not a conformant subscription, and reading the gap as "every
+    // subscribed S-NSSAI is a default" would hand a consumer that never sends
+    // `defaultIndication` the whole subscription as its default set.
     let default_marked: Vec<SNssai> = info
         .subscribed
         .iter()

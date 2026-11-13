@@ -151,7 +151,7 @@ Each NF's `metrics.rs`. Every `result` is `success` for a 2xx answer, else `fail
 | `bsf_pcf_bindings` | gauge | `binding` | bindings held |
 | `bsf_subscriptions` | gauge | | event subscriptions held |
 | `nssf_selections_total` | counter | `result` | Nnssf_NSSelection_Get answered (TS 29.531 §5.2) |
-| `nssf_selection_refusals_total` | counter | `reason` | Nnssf_NSSelection_Get declined, by reason (`subscribed_nssai_missing`, `no_permitted_snssai`, `subscription_unconfirmed`, `unavailable_in_ta`, `no_snssai_mapping`) |
+| `nssf_selection_refusals_total` | counter | `reason` | Nnssf_NSSelection_Get refusals: every 403 `SNSSAI_NOT_SUPPORTED` (each scenario's TS 29.531 step 2b) and every 400 for a missing or incorrect `subscribedNssai`, `sNssaiForMapping` or `supi`, by reason (`subscribed_nssai_missing`, `subscribed_nssai_incorrect`, `snssai_for_mapping_missing`, `supi_incorrect`, `no_permitted_snssai`, `subscription_unconfirmed`, `unavailable_in_ta`, `no_nsi_for_snssai`, `no_snssai_mapping`). Generic request errors are in `nssf_selections_total` only |
 | `nssf_availability_operations_total` | counter | `operation` (`update`, `patch`, `delete`, `subscribe`, `unsubscribe`, `modify_subscription`), `result` | Nnssf_NSSAIAvailability operations (§5.3) |
 | `nssf_nssai_availability_nfs`, `nssf_subscriptions`, `nssf_network_slice_instances` | gauge | | stored availability documents, subscriptions, configured slice instances |
 
