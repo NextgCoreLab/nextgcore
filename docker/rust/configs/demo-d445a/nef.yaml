@@ -1,0 +1,9 @@
+# nefd of the D445A compose stack (nextgsim#480). @MODE@ is the run's mode
+# (D445A_MODE, default t8-exclusion), substituted at container start.
+logger:
+  level: info
+demo:
+  enabled: true
+  d445a-fl-t8:
+    enabled: true
+    mode: @MODE@

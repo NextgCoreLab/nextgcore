@@ -516,8 +516,17 @@ for d in docs:
             if sc.get('runAsNonRoot') and sc.get('privileged'):
                 errors.append(f'{where}/{c["name"]}: runAsNonRoot with privileged')
             caps = sc.get('capabilities', {})
-            if 'ALL' in caps.get('drop', []) and caps.get('add'):
-                errors.append(f'{where}/{c["name"]}: drops ALL but adds {caps["add"]}')
+            # drop ALL then add is the least-privilege shape (the CRI applies the
+            # drop first). It is a mistake only on a non-root container, which
+            # cannot use the added caps: the upf-nodataplane merge accident
+            # (profiles/5g/patches/upf-nodataplane.yaml). Non-root by the
+            # container's or the pod's runAsNonRoot, or a non-zero runAsUser
+            # (the container's wins over the pod's).
+            psc = pod.get('securityContext', {}) or {}
+            uid = sc.get('runAsUser', psc.get('runAsUser'))
+            nonroot = bool(sc.get('runAsNonRoot', psc.get('runAsNonRoot'))) or (uid is not None and uid != 0)
+            if 'ALL' in caps.get('drop', []) and caps.get('add') and nonroot:
+                errors.append(f'{where}/{c["name"]}: non-root container drops ALL but adds {caps["add"]}')
         # Issue #63: every SBI NF defaults to the PRODUCTION SBI profile. amf,
         # ausf, smf and udm then exit at startup without
         # /etc/nextgcore/tls/server.crt; udr, pcf, nssf and bsf start but cannot

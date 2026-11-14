@@ -1,0 +1,11 @@
+# The NRF's CCA trusted-key directory (nextgsim#480). Empty at deploy:
+# scenario.sh generates the AF's CCA key (and, in the auth arm, two probe
+# consumers' keys) outside the artefacts, and puts only the public JWKs here;
+# the kubelet syncs them into the mounted directory, and the NRF re-reads it on
+# an unknown issuer (#187). No private key is in git.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: d445a-cca-trusted
+  namespace: nextg-system
+data: {}

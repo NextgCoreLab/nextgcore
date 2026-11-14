@@ -1,0 +1,478 @@
+# D445A compose stack (nextgsim#480): network-assisted federated learning over
+# real PDU sessions, with NEF T8 member exclusion. The 5GC, nefd (UE ID
+# retrieval, T8), one gNB, three UEs (five with the poisoned profile) and the FL
+# application server (AF, nr-fl-server) on its own data network, fl-dn.
+#
+# STANDALONE, NOT AN OVERLAY (the docker-compose.demo-n2ho.yml rule): the base
+# file publishes host ports, and compose merges `ports:` lists. This file
+# publishes nothing, and both networks are `internal` (no route off the host).
+# It shares the base stack's 172.23.0.0/24, so the two cannot run at once.
+#
+#   network  subnet          who
+#   core     172.23.0.0/24   the 5GC, nefd .31, the AF's T8 listener .60, gNB .100, UEs .101-.105
+#   fl-dn    10.46.0.0/24    the UPF's N6 leg .2, the AF's FL listener .10
+#
+# The UE's FL socket rides its PDU session (uesimtun0) to the UPF, which routes
+# it onto fl-dn WITHOUT source NAT (UPF_NAT_EXCLUDE=10.46.0.0/24), so the AF sees
+# the UE's 10.45.0.0/16 address and asks nefd who that is (TS 23.502 §4.15.10).
+# The AF routes 10.45.0.0/16 back through the UPF. nefd posts T8 notifications
+# to the AF on the core network, never on fl-dn.
+#
+# Mode: D445A_MODE=t8-exclusion (default) or poisoned-ue (with --profile
+# poisoned, which adds UEs 4 and 5). Every demo: block is in this file's configs
+# (configs/demo-d445a/), none in the shared ones.
+#
+# Images: the core NFs with the 6G profile's features and nefd with
+# --features demo-d445a-fl-t8, the default nr-gnb, and the demo UE image (nr-ue
+# with demo-d445a-fl-t8, nr-cli, nr-fl-server, iproute2; deploy/eks/overlays/
+# demo-d445a-fl-t8/Dockerfile.ue-d445a). NEXTGCORE_TAG / NEXTGSIM_TAG pick the
+# tags (default latest), NEXTGSIM_DIR the nextgsim checkout.
+#
+# Usage:
+#   docker compose -f docker-compose.demo-d445a.yml up -d
+#   docker compose -f docker-compose.demo-d445a.yml logs -f fl-af nef
+#   docker compose -f docker-compose.demo-d445a.yml exec ue3 nr-ue-deregister   # ue3 leaves
+#   docker compose -f docker-compose.demo-d445a.yml restart ue3                 # and rejoins
+#   docker compose -f docker-compose.demo-d445a.yml down -v
+
+name: nextg-demo-d445a
+
+x-common: &common
+  restart: on-failure:5
+  environment: &common-env
+    RUST_LOG: info
+    RUST_BACKTRACE: 1
+    # The local development profile, as in docker-compose.yml: cleartext h2c SBI.
+    NEXTGCORE_SBI_PROFILE: "dev"
+    TLS_ENABLED: "false"
+    SBI_SCHEME: "http"
+
+x-nf-healthcheck: &nf-healthcheck
+  healthcheck:
+    test: ["CMD-SHELL", "kill -0 1"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 5s
+
+services:
+  mongodb:
+    image: mongo:6.0
+    <<: *common
+    environment:
+      MONGO_INITDB_DATABASE: nextgcore
+    volumes:
+      - mongodb_data:/data/db
+      - ../../docs/assets/webui/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
+      - ./configs/demo-d445a/mongo-d445a.js:/docker-entrypoint-initdb.d/mongo-z-d445a.js:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.2
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  nrf:
+    image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/nrf:${NEXTGCORE_TAG:-latest}
+    <<: [*common, *nf-healthcheck]
+    command: ["-c", "/etc/nextgcore/nrf.yaml", "--sbi-addr", "0.0.0.0"]
+    volumes:
+      - ./configs/demo-d445a/nrf.yaml:/etc/nextgcore/nrf.yaml:ro
+      - d445a_cca:/etc/nextgcore/cca-trusted:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.10
+    depends_on:
+      mongodb:
+        condition: service_healthy
+
+  ausf:
+    image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/ausf:${NEXTGCORE_TAG:-latest}
+    <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+      UDM_SBI_ADDR: 172.23.0.12
+      UDM_SBI_PORT: "7777"
+    command: ["-c", "/etc/nextgcore/ausf.yaml"]
+    volumes:
+      - ./configs/5gc/ausf.yaml:/etc/nextgcore/ausf.yaml:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.11
+    depends_on:
+      nrf:
+        condition: service_healthy
+      udm:
+        condition: service_healthy
+
+  udm:
+    image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/udm:${NEXTGCORE_TAG:-latest}
+    <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+      UDR_SBI_ADDR: 172.23.0.20
+      UDR_SBI_PORT: "7777"
+    command: ["-c", "/etc/nextgcore/udm.yaml"]
+    volumes:
+      - ./configs/5gc/udm.yaml:/etc/nextgcore/udm.yaml:ro
+      - ./configs/5gc/hnet:/etc/nextgcore/hnet:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.12
+    depends_on:
+      nrf:
+        condition: service_healthy
+
+  udr:
+    image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/udr:${NEXTGCORE_TAG:-latest}
+    <<: [*common, *nf-healthcheck]
+    command: ["-c", "/etc/nextgcore/udr.yaml"]
+    volumes:
+      - ./configs/5gc/udr.yaml:/etc/nextgcore/udr.yaml:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.20
+    depends_on:
+      nrf:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+
+  pcf:
+    image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/pcf:${NEXTGCORE_TAG:-latest}
+    <<: [*common, *nf-healthcheck]
+    command: ["-c", "/etc/nextgcore/pcf.yaml"]
+    volumes:
+      - ./configs/5gc/pcf.yaml:/etc/nextgcore/pcf.yaml:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.13
+    depends_on:
+      nrf:
+        condition: service_healthy
+      # #1457: pcfd opens its subscriber store at startup and refuses to start
+      # without it.
+      mongodb:
+        condition: service_healthy
+
+  nssf:
+    image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/nssf:${NEXTGCORE_TAG:-latest}
+    <<: [*common, *nf-healthcheck]
+    command: ["-c", "/etc/nextgcore/nssf.yaml"]
+    volumes:
+      - ./configs/5gc/nssf.yaml:/etc/nextgcore/nssf.yaml:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.14
+    depends_on:
+      nrf:
+        condition: service_healthy
+
+  bsf:
+    image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/bsf:${NEXTGCORE_TAG:-latest}
+    <<: [*common, *nf-healthcheck]
+    command: ["-c", "/etc/nextgcore/bsf.yaml"]
+    volumes:
+      - ./configs/5gc/bsf.yaml:/etc/nextgcore/bsf.yaml:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.15
+    depends_on:
+      nrf:
+        condition: service_healthy
+
+  amf:
+    image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/amf:${NEXTGCORE_TAG:-latest}
+    <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+      RUST_LOG: info
+      NEXTGCORE_AMF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-000000000af0
+      AMF_SBI_ADDR: 172.23.0.5
+      AMF_SBI_PORT: "7777"
+      SMF_SBI_ADDR: 172.23.0.4
+      SMF_SBI_PORT: "7777"
+      AUSF_SBI_ADDR: 172.23.0.11
+      AUSF_SBI_PORT: "7777"
+      UDM_SBI_ADDR: 172.23.0.12
+      UDM_SBI_PORT: "7777"
+      PCF_SBI_ADDR: 172.23.0.13
+      PCF_SBI_PORT: "7777"
+    # Every container interface, inside the private network only: no publish.
+    command: ["-c", "/etc/nextgcore/amf.yaml", "--ngap-addr", "0.0.0.0:38412"]
+    volumes:
+      - ./configs/5gc/amf.yaml:/etc/nextgcore/amf.yaml:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.5
+    depends_on:
+      nrf:
+        condition: service_healthy
+      ausf:
+        condition: service_healthy
+      udm:
+        condition: service_healthy
+      pcf:
+        condition: service_healthy
+      nssf:
+        condition: service_healthy
+
+  smf:
+    image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/smf:${NEXTGCORE_TAG:-latest}
+    stop_grace_period: 45s
+    <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+      UPF_PFCP_ADDR: 172.23.0.7
+      UPF_PFCP_PORT: "8805"
+      SMF_PFCP_ADDR: 172.23.0.4
+      SMF_SHUTDOWN_BUDGET_SECS: "43"
+      UDM_SBI_ADDR: 172.23.0.12
+      UDM_SBI_PORT: "7777"
+    command: ["-c", "/etc/nextgcore/smf.yaml"]
+    volumes:
+      - ./configs/5gc/smf.yaml:/etc/nextgcore/smf.yaml:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.4
+    depends_on:
+      nrf:
+        condition: service_healthy
+      pcf:
+        condition: service_healthy
+      amf:
+        condition: service_healthy
+
+  upf:
+    image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/upf:${NEXTGCORE_TAG:-latest}
+    <<: *common
+    privileged: true
+    user: root
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.ip_forward=1
+    environment:
+      <<: *common-env
+      RUST_LOG: info
+      # #1455: no source NAT toward fl-dn (the AF must see the UE's address), and
+      # upf_session_{ul,dl}_bytes_total{seid,ue_ipv4} on /metrics.
+      UPF_NAT_EXCLUDE: 10.46.0.0/24
+      UPF_SESSION_METRICS: seid-ue-ip
+    command: ["-c", "/etc/nextgcore/upf.yaml", "--pfcp-addr", "172.23.0.7", "--gtpu-addr", "172.23.0.7", "--tun-ip", "10.45.0.1", "--tun-prefix", "16", "--pfcp-allowed-peers", "172.23.0.4"]
+    volumes:
+      - ./configs/5gc/upf.yaml:/etc/nextgcore/upf.yaml:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.7
+      fl-dn:
+        ipv4_address: 10.46.0.2
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    depends_on:
+      smf:
+        condition: service_healthy
+
+  nef:
+    image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/nef:${NEXTGCORE_TAG:-latest}
+    <<: *common
+    environment:
+      <<: *common-env
+      D445A_MODE: ${D445A_MODE:-t8-exclusion}
+      NEXTGCORE_SBI_ADVERTISE: 172.23.0.31
+      NEF_METRICS_PORT: "9090"
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        sed "s/@MODE@/$$D445A_MODE/" /etc/nextgcore/nef.yaml.in >/tmp/nef.yaml &&
+        exec nf-binary -c /tmp/nef.yaml --sbi-addr 0.0.0.0 --sbi-port 7777
+        --nrf-uri http://172.23.0.10:7777 --udm-uri http://172.23.0.12:7777
+        --bsf-uri http://172.23.0.15:7777
+    volumes:
+      - ./configs/demo-d445a/nef.yaml:/etc/nextgcore/nef.yaml.in:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.31
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    depends_on:
+      nrf:
+        condition: service_healthy
+      udm:
+        condition: service_healthy
+      bsf:
+        condition: service_healthy
+
+  # The FL application server (AF). Its FL listener is on fl-dn, its T8 listener
+  # on core. It publishes its CCA JWK into d445a_cca, which the NRF trusts. Root
+  # only to add the return route; nr-fl-server runs as nobody (setpriv).
+  fl-af:
+    image: ${NEXTGSIM_IMAGE_PREFIX:-nextgsim}-ue:${NEXTGSIM_TAG:-latest}
+    <<: *common
+    user: root
+    cap_drop: [ALL]
+    cap_add:
+      - NET_ADMIN
+      - CHOWN
+      - SETUID
+      - SETGID
+      # setpriv --bounding-set=-all needs it, or it silently keeps the set.
+      - SETPCAP
+    environment:
+      RUST_LOG: info
+      D445A_MODE: ${D445A_MODE:-t8-exclusion}
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        ip route replace 10.45.0.0/16 via 10.46.0.2 &&
+        sed "s/@MODE@/$$D445A_MODE/" /etc/nextgsim/af.yaml.in >/tmp/af.yaml &&
+        mkdir -p /var/lib/d445a/cca && chown -R 65534:65534 /var/lib/d445a &&
+        exec setpriv --reuid=65534 --regid=65534 --clear-groups --inh-caps=-all
+        --bounding-set=-all --no-new-privs nr-fl-server -c /tmp/af.yaml
+    volumes:
+      - ./configs/demo-d445a/af.yaml:/etc/nextgsim/af.yaml.in:ro
+      - d445a_cca:/var/lib/d445a/cca
+    networks:
+      core:
+        ipv4_address: 172.23.0.60
+      fl-dn:
+        ipv4_address: 10.46.0.10
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    depends_on:
+      nef:
+        condition: service_healthy
+      upf:
+        condition: service_healthy
+
+  # nextgsim config/gnb.yaml (172.23.0.100).
+  gnb:
+    image: ${NEXTGSIM_IMAGE_PREFIX:-nextgsim}-gnb:${NEXTGSIM_TAG:-latest}
+    <<: *common
+    environment:
+      RUST_LOG: info
+    command: ["-c", "/etc/nextgsim/gnb.yaml"]
+    volumes:
+      - ${NEXTGSIM_DIR:-../../../nextgsim}/config:/etc/nextgsim:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.100
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      amf:
+        condition: service_healthy
+      upf:
+        condition: service_healthy
+
+  ue1: &ue
+    image: ${NEXTGSIM_IMAGE_PREFIX:-nextgsim}-ue:${NEXTGSIM_TAG:-latest}
+    <<: *common
+    environment: &ue-env
+      RUST_LOG: info,nr_ue=warn,nextgsim_ue::rrc=warn
+      D445A_MODE: ${D445A_MODE:-t8-exclusion}
+      FL_MEMBER: "1"
+    entrypoint: ["sh", "/etc/d445a/ue-entry.sh"]
+    command: []
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - ${NEXTGSIM_DIR:-../../../nextgsim}/config:/etc/nextgsim:ro
+      - ./configs/demo-d445a/ue-entry.sh:/etc/d445a/ue-entry.sh:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.101
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      gnb:
+        condition: service_healthy
+      fl-af:
+        condition: service_healthy
+
+  ue2:
+    <<: *ue
+    environment:
+      <<: *ue-env
+      FL_MEMBER: "2"
+    networks:
+      core:
+        ipv4_address: 172.23.0.102
+
+  ue3:
+    <<: *ue
+    environment:
+      <<: *ue-env
+      FL_MEMBER: "3"
+    networks:
+      core:
+        ipv4_address: 172.23.0.103
+
+  ue4:
+    <<: *ue
+    profiles: [poisoned]
+    environment:
+      <<: *ue-env
+      FL_MEMBER: "4"
+    networks:
+      core:
+        ipv4_address: 172.23.0.104
+
+  ue5:
+    <<: *ue
+    profiles: [poisoned]
+    environment:
+      <<: *ue-env
+      FL_MEMBER: "5"
+    networks:
+      core:
+        ipv4_address: 172.23.0.105
+
+networks:
+  core:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.23.0.0/24
+          gateway: 172.23.0.1
+  # The FL data network (N6): the UPF and the AF only. No route off the host.
+  fl-dn:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.46.0.0/24
+          gateway: 10.46.0.1
+
+volumes:
+  mongodb_data:
+  d445a_cca:

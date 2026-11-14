@@ -1,0 +1,25 @@
+# The AF (nr-fl-server) of the D445A compose stack (nextgsim#480). @MODE@ is
+# substituted at container start.
+#   listen      the fl-dn address: UEs reach it through the UPF, without NAT;
+#   t8_listen   the core (SBI) network, where nefd posts T8 notifications; never fl-dn.
+listen: 10.46.0.10:7480
+t8_listen: 172.23.0.60:7481
+t8_notify_base: http://172.23.0.60:7481
+nef:
+  api_root: http://172.23.0.31:7777
+  scs_as_id: d445a-fl-af
+  oauth2:
+    nrf: http://172.23.0.10:7777
+    nf_instance_id: 6b1d7e3c-0000-4000-8000-00000000480a
+    cca_key_file: /var/lib/d445a/af.key
+    public_jwk_dir: /var/lib/d445a/cca
+    register: true
+seed: 480
+holds:
+  - {before_round: 4, until: member-excluded, timeout_s: 240}
+  - {before_round: 7, until: members-full, timeout_s: 300}
+demo:
+  enabled: true
+  d445a-fl-t8:
+    enabled: true
+    mode: @MODE@
