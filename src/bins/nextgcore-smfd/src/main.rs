@@ -51,6 +51,7 @@ mod n2_transfer; // #417: the N2 SM transfers, on the generated NGAP codec
 mod n4_build;
 mod n4_handler;
 mod n4_identity; // #797: the PFCP Node ID and CP F-SEID address
+mod n6_delay; // #1502: N6 delay measurement, provisioned over N4 association (TS 29.244 §5.33.8)
 mod pfcp_path;
 mod pfcp_sm;
 mod policy;
@@ -133,6 +134,7 @@ fn render_metrics() -> String {
     });
     session_metrics::render(&mut out);
     out.push_str(&render_smf_families());
+    n6_delay::render(&mut out);
     out
 }
 
@@ -658,6 +660,8 @@ struct SmfSection {
     mtu: Option<u16>,
     /// #619: PCC rules this PGW-C activates locally as dedicated EPS bearers.
     pcc_rules: Option<Vec<eps_bearer::LocalPccRule>>,
+    /// #1502: N6 delay measurement provisioned at the UPFs (TS 29.244 §5.33.8.2).
+    n6_delay_measurement: Option<n6_delay::N6DelayYaml>,
 }
 
 /// Root YAML document
@@ -688,6 +692,8 @@ struct SmfConfig {
     gtpc_port: u16,
     /// #619: `smf.pcc_rules`, the local PCC rules the S5/S8 role activates.
     pcc_rules: Vec<eps_bearer::LocalPccRule>,
+    /// #1502: `smf.n6_delay_measurement`, validated. `None` asks no UPF to measure.
+    n6_delay: Option<n6_delay::N6DelayConfig>,
 }
 
 impl Default for SmfConfig {
@@ -706,6 +712,7 @@ impl Default for SmfConfig {
             gtpc_addr: None,
             gtpc_port: 2123,
             pcc_rules: Vec::new(),
+            n6_delay: None,
         }
     }
 }
@@ -774,6 +781,11 @@ fn load_config(path: &str) -> anyhow::Result<SmfConfig> {
         }
         config.mtu = smf.mtu;
         config.pcc_rules = smf.pcc_rules.unwrap_or_default();
+        // #1502: an invalid block fails startup rather than leaving the measurement
+        // silently unconfigured.
+        if let Some(n6) = smf.n6_delay_measurement {
+            config.n6_delay = Some(n6.validate().map_err(|e| anyhow::anyhow!(e))?);
+        }
 
         // S5/S8 bind address (#52). Only the first entry is bound; a second is named
         // in a warning rather than silently ignored, matching how `sbi.server` and
@@ -891,6 +903,8 @@ async fn main() -> Result<()> {
         );
     }
     let _ = EPCO_CONFIG.set((config.dns_servers.clone(), config.mtu));
+    // #1502: before the association loop can associate a UPF.
+    n6_delay::set_config(config.n6_delay.take());
 
     // Seed NRF URI into SBI context for NF registration (parsed once in load_config).
     if let Some(ref uri) = config.nrf_uri {
