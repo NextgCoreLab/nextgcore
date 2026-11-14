@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nextg-demo-toggles
+data:
+  key: d445a-fl-t8
+  # nefd (UE ID retrieval, the T8 delivery line, /metrics), every UE (the FL
+  # client; only UE 005 poisons, and only in poisoned-ue) and the AF.
+  targets: nef.yaml ue.yaml af.yaml

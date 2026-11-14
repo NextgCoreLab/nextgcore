@@ -194,6 +194,10 @@
     {
       "path": "src/bins/nextgcore-webui",
       "reason": "no image is defined for the Rust WebUI (Dockerfile.nf's `-c nf.yaml` CMD does not fit it); the published nextgcore-webui image is the Node.js UI in docker/webui"
+    },
+    {
+      "path": "deploy/eks/overlays/demo-d445a-fl-t8/Dockerfile.ue-d445a",
+      "reason": "demo image for devtest1 only, never published: the D445A UE/AF image (nextgsim#480) built and pushed by that overlay's build-images.sh"
     }
   ]
 }

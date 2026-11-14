@@ -1,7 +1,7 @@
 //! #668: NF status subscriptions at the NRF (TS 29.510 §5.2.2.5, §5.2.2.6).
 //!
-//! The AMF caches the SMF, AUSF, UDM, PCF, NSSF, NSACF and UCMF profiles it
-//! discovers. Before #668 nothing told it when one of them went away or moved:
+//! The AMF caches the SMF, AUSF, UDM, PCF, NSSF, NSACF, UCMF, LMF and NWDAF
+//! profiles it discovers ([`CACHED_PEER_NF_TYPES`]). Before #668 nothing told it when one of them went away or moved:
 //! a deregistered or changed peer was noticed only when a request to it failed
 //! (#664 made that failure recoverable). This module subscribes, once per cached
 //! NF type, to `NF_DEREGISTERED` and `NF_PROFILE_CHANGED`, keeps every
@@ -790,8 +790,9 @@ mod tests {
             );
         }
         // The AMF itself is never a peer it discovers, and these are types
-        // `amf_nrf_discover` still drops. The LMF is NOT among them since #938.
-        for t in ["AMF", "UDR", "NEF", "CHF", "BSF", "SCP", "NWDAF"] {
+        // `amf_nrf_discover` still drops. The LMF is NOT among them since #938,
+        // nor the NWDAF since #1504.
+        for t in ["AMF", "UDR", "NEF", "CHF", "BSF", "SCP"] {
             assert!(
                 crate::sbi_path::cached_peer_nf_type(t).is_none(),
                 "{t} is cached but not subscribed to"

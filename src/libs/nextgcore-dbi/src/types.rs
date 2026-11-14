@@ -509,6 +509,41 @@ pub fn nextgcore_id_get_value(supi: &str) -> Option<String> {
     }
 }
 
+/// TS 29.571 `{ueId}` type prefix for a Network Access Identifier (`nai-<value>`).
+pub const NEXTGCORE_NAI_STRING: &str = "nai";
+
+/// The `{ueId}` type prefixes the subscriber store can be queried by.
+///
+/// Each one names a field of the subscriber document: `imsi` and `nai` for a SUPI,
+/// `msisdn` and `extid` for a GPSI (TS 29.571 `Supi`/`Gpsi`). The prefix becomes
+/// the field name of the lookup, so only these are accepted.
+pub const NEXTGCORE_UE_ID_TYPES: [&str; 4] = [
+    NEXTGCORE_IMSI_STRING,
+    NEXTGCORE_MSISDN_STRING,
+    NEXTGCORE_EXTID_STRING,
+    NEXTGCORE_NAI_STRING,
+];
+
+/// Split a `{type}-{value}` UE identifier into the subscriber-document field it
+/// selects and the value to match.
+///
+/// Every subscriber lookup and provisioning path resolves its identifier here.
+/// The type must be one of [`NEXTGCORE_UE_ID_TYPES`], matched exactly; any other
+/// prefix (empty, unknown, or not a plain field name) is
+/// [`DbiError::UnsupportedUeIdType`]. The value is only ever used as a string
+/// value of the lookup, never as a field name.
+pub fn nextgcore_ue_id_key(id: &str) -> Result<(&'static str, String), crate::mongoc::DbiError> {
+    let Some((ty, value)) = id.split_once('-') else {
+        return Err(crate::mongoc::DbiError::InvalidSupi(id.to_string()));
+    };
+    let field = NEXTGCORE_UE_ID_TYPES
+        .iter()
+        .copied()
+        .find(|known| *known == ty)
+        .ok_or_else(|| crate::mongoc::DbiError::UnsupportedUeIdType(id.to_string()))?;
+    Ok((field, value.to_string()))
+}
+
 /// Convert a hex string to bytes, lenient: non-hex pairs are DROPPED and the
 /// result is truncated to `buf`.
 ///
@@ -598,6 +633,48 @@ mod tests {
             nextgcore_id_get_value(supi2),
             Some("user@example.com".to_string())
         );
+    }
+
+    #[test]
+    fn each_supported_ue_id_type_is_accepted() {
+        for (id, field, value) in [
+            ("imsi-001010000000001", "imsi", "001010000000001"),
+            ("msisdn-491721074801", "msisdn", "491721074801"),
+            ("extid-ue013@fl.nextg", "extid", "ue013@fl.nextg"),
+            ("nai-user@example.com", "nai", "user@example.com"),
+            // Only the first '-' separates the type; the value keeps the rest.
+            ("nai-a-b", "nai", "a-b"),
+        ] {
+            let (f, v) = nextgcore_ue_id_key(id).expect(id);
+            assert_eq!((f, v.as_str()), (field, value), "{id}");
+        }
+    }
+
+    #[test]
+    fn unknown_ue_id_type_is_rejected() {
+        for id in [
+            "$x-1",
+            "a.b-1",
+            "-001010000000001",
+            "gci-1",
+            "gli-1",
+            "IMSI-001010000000001",
+            "imsi -1",
+            "foo-1",
+        ] {
+            assert!(
+                matches!(
+                    nextgcore_ue_id_key(id),
+                    Err(crate::mongoc::DbiError::UnsupportedUeIdType(_))
+                ),
+                "{id} must be rejected"
+            );
+        }
+        // No separator at all is a malformed identifier.
+        assert!(matches!(
+            nextgcore_ue_id_key("imsi001010000000001"),
+            Err(crate::mongoc::DbiError::InvalidSupi(_))
+        ));
     }
 
     #[test]

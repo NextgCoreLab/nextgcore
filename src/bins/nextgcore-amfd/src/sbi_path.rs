@@ -607,8 +607,9 @@ pub async fn amf_nrf_register(sbi_addr: &str, sbi_port: u16) -> Result<String, S
 /// discovery cache, which is exactly the set this AMF subscribes to at the NRF
 /// for NF status changes (#668, TS 29.510 §5.2.2.5). The NRF itself is cached
 /// too but is not a subscription target: it is not discovered through itself.
-pub const CACHED_PEER_NF_TYPES: [&str; 8] =
-    ["AUSF", "UDM", "SMF", "PCF", "NSSF", "NSACF", "UCMF", "LMF"];
+pub const CACHED_PEER_NF_TYPES: [&str; 9] = [
+    "AUSF", "UDM", "SMF", "PCF", "NSSF", "NSACF", "UCMF", "LMF", "NWDAF",
+];
 
 /// The cache type of a discovered profile's `nfType`, or `None` for a type
 /// [`amf_nrf_discover`] drops.
@@ -635,6 +636,13 @@ pub(crate) fn cached_peer_nf_type(nf_type_str: &str) -> Option<nextgcore_sbi::ty
         // or failed outright where that is unset, in a deployment whose NRF
         // does list an LMF (TS 23.273 §5.1, TS 29.510 §6.1.6.2.2 `lmfInfo`).
         "LMF" => nextgcore_sbi::types::NfType::Lmf,
+        // Paging analytics (#1504): the NWDAF. `nwdaf_mobility::
+        // resolve_nwdaf_endpoint` asks discovery for `target-nf-type=NWDAF`
+        // and then reads the cache, so without this arm every discovered NWDAF
+        // profile was dropped here and `paging.strategy: nwdaf-mobility` failed
+        // open on every page, in a deployment whose NRF does list an NWDAF
+        // (TS 23.501 §6.3.13: consumers discover the NWDAF through the NRF).
+        "NWDAF" => nextgcore_sbi::types::NfType::Nwdaf,
         _ => return None,
     })
 }

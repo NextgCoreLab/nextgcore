@@ -71,10 +71,7 @@ impl std::fmt::Debug for NextgcoreDbiAuthInfo {
 /// * `Ok(NextgcoreDbiAuthInfo)` with authentication data
 /// * `Err(DbiError)` on failure
 pub fn nextgcore_dbi_auth_info(supi: &str) -> DbiResult<NextgcoreDbiAuthInfo> {
-    let supi_type =
-        nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
-    let supi_id =
-        nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let (supi_type, supi_id) = nextgcore_ue_id_key(supi)?;
 
     #[cfg(any(test, feature = "test-helpers"))]
     if crate::test_store::active() {
@@ -82,7 +79,7 @@ pub fn nextgcore_dbi_auth_info(supi: &str) -> DbiResult<NextgcoreDbiAuthInfo> {
     }
 
     let collection = get_subscriber_collection()?;
-    let query = doc! { &supi_type: &supi_id };
+    let query = doc! { supi_type: &supi_id };
 
     let document = collection
         .find_one(query, None)?
@@ -222,10 +219,7 @@ pub(crate) fn parse_auth_info(security: &Document, supi: &str) -> NextgcoreDbiAu
 /// * `supi` - Subscriber Permanent Identifier
 /// * `sqn` - New sequence number
 pub fn nextgcore_dbi_update_sqn(supi: &str, sqn: u64) -> DbiResult<()> {
-    let supi_type =
-        nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
-    let supi_id =
-        nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let (supi_type, supi_id) = nextgcore_ue_id_key(supi)?;
 
     #[cfg(any(test, feature = "test-helpers"))]
     if crate::test_store::active() {
@@ -233,7 +227,7 @@ pub fn nextgcore_dbi_update_sqn(supi: &str, sqn: u64) -> DbiResult<()> {
     }
 
     let collection = get_subscriber_collection()?;
-    let query = doc! { &supi_type: &supi_id };
+    let query = doc! { supi_type: &supi_id };
     let update = doc! {
         "$set": {
             format!("{}.{}", NEXTGCORE_SECURITY_STRING, NEXTGCORE_SQN_STRING): sqn as i64
@@ -249,10 +243,7 @@ pub fn nextgcore_dbi_update_sqn(supi: &str, sqn: u64) -> DbiResult<()> {
 /// # Arguments
 /// * `supi` - Subscriber Permanent Identifier
 pub fn nextgcore_dbi_increment_sqn(supi: &str) -> DbiResult<()> {
-    let supi_type =
-        nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
-    let supi_id =
-        nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let (supi_type, supi_id) = nextgcore_ue_id_key(supi)?;
 
     #[cfg(any(test, feature = "test-helpers"))]
     if crate::test_store::active() {
@@ -260,7 +251,7 @@ pub fn nextgcore_dbi_increment_sqn(supi: &str) -> DbiResult<()> {
     }
 
     let collection = get_subscriber_collection()?;
-    let query = doc! { &supi_type: &supi_id };
+    let query = doc! { supi_type: &supi_id };
 
     // Increment by 32
     let update_inc = doc! {
@@ -289,15 +280,12 @@ pub fn nextgcore_dbi_increment_sqn(supi: &str) -> DbiResult<()> {
 /// * `supi` - Subscriber Permanent Identifier
 /// * `imeisv` - IMEISV string
 pub fn nextgcore_dbi_update_imeisv(supi: &str, imeisv: &str) -> DbiResult<()> {
-    let supi_type =
-        nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
-    let supi_id =
-        nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let (supi_type, supi_id) = nextgcore_ue_id_key(supi)?;
 
     log::debug!("SUPI type: {supi_type}, SUPI id: {supi_id}, imeisv: {imeisv}");
 
     let collection = get_subscriber_collection()?;
-    let query = doc! { &supi_type: &supi_id };
+    let query = doc! { supi_type: &supi_id };
     let update = doc! {
         "$set": {
             NEXTGCORE_IMEISV_STRING: imeisv
@@ -364,10 +352,7 @@ pub fn nextgcore_dbi_provision_auth_info(
     supi: &str,
     p: &NextgcoreDbiAuthProvision,
 ) -> DbiResult<bool> {
-    let supi_type =
-        nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
-    let supi_id =
-        nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let (supi_type, supi_id) = nextgcore_ue_id_key(supi)?;
 
     #[cfg(any(test, feature = "test-helpers"))]
     if crate::test_store::active() {
@@ -375,7 +360,7 @@ pub fn nextgcore_dbi_provision_auth_info(
     }
 
     let collection = get_subscriber_collection()?;
-    let query = doc! { &supi_type: &supi_id };
+    let query = doc! { supi_type: &supi_id };
 
     let mut set = doc! {
         format!("{}.{}", NEXTGCORE_SECURITY_STRING, NEXTGCORE_K_STRING): &p.k_hex,
@@ -452,17 +437,14 @@ pub fn nextgcore_dbi_update_mme(
     mme_realm: &str,
     purge_flag: bool,
 ) -> DbiResult<()> {
-    let supi_type =
-        nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
-    let supi_id =
-        nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let (supi_type, supi_id) = nextgcore_ue_id_key(supi)?;
 
     log::debug!(
         "SUPI type: {supi_type}, SUPI id: {supi_id}, mme_host: {mme_host}, mme_realm: {mme_realm}"
     );
 
     let collection = get_subscriber_collection()?;
-    let query = doc! { &supi_type: &supi_id };
+    let query = doc! { supi_type: &supi_id };
 
     // Get current timestamp
     let timestamp = std::time::SystemTime::now()
@@ -488,10 +470,7 @@ pub fn nextgcore_dbi_update_mme(
 /// # Arguments
 /// * `supi` - Subscriber Permanent Identifier
 pub fn nextgcore_dbi_subscription_data(supi: &str) -> DbiResult<NextgcoreSubscriptionData> {
-    let supi_type =
-        nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
-    let supi_id =
-        nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let (supi_type, supi_id) = nextgcore_ue_id_key(supi)?;
 
     // #87: the identity mirror answers only when a test has provisioned one, so
     // enabling the store for the authentication tests leaves every other
@@ -502,7 +481,7 @@ pub fn nextgcore_dbi_subscription_data(supi: &str) -> DbiResult<NextgcoreSubscri
     }
 
     let collection = get_subscriber_collection()?;
-    let query = doc! { &supi_type: &supi_id };
+    let query = doc! { supi_type: &supi_id };
 
     let document = collection
         .find_one(query, None)?
@@ -946,13 +925,10 @@ pub fn nextgcore_dbi_subscription_data_5g(supi: &str) -> DbiResult<NextgcoreSubs
 /// * `Ok(NextgcoreSubscriptionData)` with policy-related subscription data
 /// * `Err(DbiError)` on failure
 pub fn nextgcore_dbi_policy_subscription(supi: &str) -> DbiResult<NextgcoreSubscriptionData> {
-    let supi_type =
-        nextgcore_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
-    let supi_id =
-        nextgcore_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let (supi_type, supi_id) = nextgcore_ue_id_key(supi)?;
 
     let collection = get_subscriber_collection()?;
-    let query = doc! { &supi_type: &supi_id };
+    let query = doc! { supi_type: &supi_id };
 
     let document = collection
         .find_one(query, None)?
@@ -991,6 +967,103 @@ pub fn nextgcore_dbi_policy_subscription(supi: &str) -> DbiResult<NextgcoreSubsc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const UNSUPPORTED_UE_IDS: [&str; 4] = ["$x-1", "a.b-1", "-001010000000001", "foo-1"];
+
+    fn is_unsupported<T>(r: DbiResult<T>) -> bool {
+        matches!(r, Err(DbiError::UnsupportedUeIdType(_)))
+    }
+
+    /// Every subscriber lookup and provisioning entry point resolves its
+    /// identifier through `nextgcore_ue_id_key`, so an unsupported type prefix is
+    /// refused before any store is consulted, whether or not one is configured.
+    #[test]
+    fn lookup_and_provisioning_reject_unsupported_ue_id_type() {
+        let provision = NextgcoreDbiAuthProvision {
+            k_hex: "465b5ce8b199b49faa5f0a2ee238a6bc".into(),
+            opc_hex: None,
+            op_hex: None,
+            amf_hex: "8000".into(),
+            sqn: 0,
+            auth_method: "5G_AKA".into(),
+            algorithm_id: None,
+            topc_hex: None,
+            top_hex: None,
+        };
+        for id in UNSUPPORTED_UE_IDS {
+            assert!(
+                is_unsupported(nextgcore_dbi_auth_info(id)),
+                "auth_info {id}"
+            );
+            assert!(
+                is_unsupported(nextgcore_dbi_update_sqn(id, 1)),
+                "update_sqn {id}"
+            );
+            assert!(
+                is_unsupported(nextgcore_dbi_increment_sqn(id)),
+                "increment_sqn {id}"
+            );
+            assert!(
+                is_unsupported(nextgcore_dbi_update_imeisv(id, "0")),
+                "update_imeisv {id}"
+            );
+            assert!(
+                is_unsupported(nextgcore_dbi_provision_auth_info(id, &provision)),
+                "provision_auth_info {id}"
+            );
+            assert!(
+                is_unsupported(nextgcore_dbi_update_mme(id, "h", "r", false)),
+                "update_mme {id}"
+            );
+            assert!(
+                is_unsupported(nextgcore_dbi_subscription_data(id)),
+                "subscription_data {id}"
+            );
+            assert!(
+                is_unsupported(nextgcore_dbi_subscription_data_5g(id)),
+                "subscription_data_5g {id}"
+            );
+            assert!(
+                is_unsupported(nextgcore_dbi_policy_subscription(id)),
+                "policy_subscription {id}"
+            );
+            assert!(
+                is_unsupported(crate::session::nextgcore_dbi_session_data(
+                    id, None, "internet"
+                )),
+                "session_data {id}"
+            );
+            assert!(
+                is_unsupported(crate::ims::nextgcore_dbi_ims_data(id)),
+                "ims_data {id}"
+            );
+        }
+    }
+
+    /// The supported types reach the store (or report its absence); they are
+    /// never refused as unsupported.
+    #[test]
+    fn supported_ue_id_types_reach_the_lookup() {
+        for id in [
+            "imsi-999990000000901",
+            "msisdn-999990000901",
+            "extid-nobody901@example.org",
+            "nai-nobody901@example.org",
+        ] {
+            assert!(
+                !is_unsupported(nextgcore_dbi_auth_info(id)),
+                "auth_info {id}"
+            );
+            assert!(
+                !is_unsupported(nextgcore_dbi_subscription_data(id)),
+                "subscription_data {id}"
+            );
+            assert!(
+                !is_unsupported(nextgcore_dbi_policy_subscription(id)),
+                "policy_subscription {id}"
+            );
+        }
+    }
 
     /// **nextgsim#480**: the subscriber document's `extid` is read as the
     /// subscriber's External Identifiers, as one string or an array, so udrd can

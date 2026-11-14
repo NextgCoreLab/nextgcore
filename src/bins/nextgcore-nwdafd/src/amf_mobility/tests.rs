@@ -599,3 +599,81 @@ async fn a_lost_amf_subscription_is_renewed_and_then_replaced() {
     amf.stop().await.expect("stop");
     nrf.stop().await.expect("stop");
 }
+
+/// **#1504, the D440C chain end to end.** amfd's real `query_prediction`, with no
+/// test override and no `NWDAF_SBI_ADDR`, discovers this NWDAF through a stand-in
+/// NRF answering with this NWDAF's real `build_nf_profile`, and sends its
+/// UE_MOBILITY query to this NWDAF's real AnalyticsInfo handler. The answer is
+/// the predicted cell, not amfd's "no NWDAF (NRF discovery found none ...)" (its
+/// `cached_peer_nf_type` dropped NWDAF profiles) nor this NWDAF's
+/// `400 BOTH_STAT_PRED_NOT_ALLOWED` (amfd's `startTs` was its whole-second now).
+#[tokio::test]
+async fn amfd_discovers_this_nwdaf_and_gets_a_ue_mobility_prediction() {
+    let _serving = ServingOnThisThread::new();
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    std::env::remove_var("NWDAF_SBI_ADDR");
+    let supi = "imsi-999700000001504";
+
+    // History A→B, A→B, now at A: the prediction is B.
+    let ctx = fresh_ctx("1504");
+    let base = unix_now() - 600;
+    for (i, cell) in ["010", "020", "010", "020", "010"].iter().enumerate() {
+        let r = notify(
+            &ctx,
+            callback_token(),
+            &amf_notification(
+                supi,
+                &format!("000000{cell}"),
+                "000001",
+                &rfc3339(base + 10 * i as u64),
+            ),
+        );
+        assert_eq!(r.status, 204);
+    }
+    let answering = Arc::clone(&ctx);
+    let (nwdaf, nwdaf_port) = serve(move |req: SbiRequest| {
+        let ctx = Arc::clone(&answering);
+        async move { handle_analytics_info_query_with_ctx(&ctx, &req).await }
+    })
+    .await;
+
+    let profile = crate::build_nf_profile(
+        "15040000-0000-4000-8000-000000001504",
+        "127.0.0.1",
+        nwdaf_port,
+        &crate::spec_allowed_nf_types(),
+    );
+    let (nrf, nrf_port) = serve(move |req: SbiRequest| {
+        let profile = profile.clone();
+        async move {
+            let p = &req.http.params;
+            let asks_for_nwdaf = req.header.uri.starts_with("/nnrf-disc/v1/nf-instances")
+                && p.get("target-nf-type").map(String::as_str) == Some("NWDAF")
+                && p.get("requester-nf-type").map(String::as_str) == Some("AMF")
+                && p.get("service-names").map(String::as_str) == Some("nnwdaf-analyticsinfo");
+            if asks_for_nwdaf {
+                SbiResponse::with_status(200)
+                    .with_json_body(&json!({ "validityPeriod": 3600, "nfInstances": [profile] }))
+                    .expect("json")
+            } else {
+                SbiResponse::with_status(404)
+            }
+        }
+    })
+    .await;
+    let sbi = nextgcore_sbi::context::global_context();
+    sbi.set_nrf_uri(format!("http://127.0.0.1:{nrf_port}"))
+        .await;
+    sbi.clear_nf_instances().await;
+
+    let predicted = nextgcore_amfd::nwdaf_mobility::query_prediction(supi)
+        .await
+        .expect("this NWDAF is discovered and accepts the query's period")
+        .expect("a predicted cell");
+    assert_eq!(predicted.nci, 0x20, "the next cell after A is B");
+    assert_eq!(predicted.confidence, Some(100));
+
+    for s in [nwdaf, nrf] {
+        s.stop().await.expect("stop");
+    }
+}

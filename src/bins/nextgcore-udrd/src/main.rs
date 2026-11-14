@@ -832,6 +832,14 @@ async fn handle_identity_data(ue_id: &str, method: &str, request: &SbiRequest) -
     }
     let _ = request;
     log::info!("[{ue_id}] GET identity-data");
+    // GCI/GLI are valid VarUeId forms the subscriber DB does not hold: 404, as on
+    // the other subscription-data resources (udrd-06).
+    if ue_id.starts_with("gci-") || ue_id.starts_with("gli-") {
+        return send_not_found(
+            &format!("VarUeId form not in subscriber DB: {ue_id}"),
+            Some("NOT_FOUND"),
+        );
+    }
     match nextgcore_dbi::subscription::nextgcore_dbi_subscription_data_async(ue_id.to_string())
         .await
     {
@@ -852,9 +860,28 @@ async fn handle_identity_data(ue_id: &str, method: &str, request: &SbiRequest) -
             SbiResponse::with_status(200).with_body(doc.to_string(), "application/json")
         }
         Err(e) => {
+            if let Some(resp) = ue_id_rejection(&e) {
+                return resp;
+            }
             log::debug!("[{ue_id}] identity-data lookup failed: {e:?}");
             send_not_found("Subscriber not found", Some("DATA_NOT_FOUND"))
         }
+    }
+}
+
+/// The 400 for a `{ueId}` the subscriber store cannot be queried by, `None` for
+/// any other lookup failure.
+///
+/// The type prefix is checked once, in `nextgcore_dbi::nextgcore_ue_id_key`; this
+/// only maps that request error to the consumer's fault rather than a 404 or 5xx.
+fn ue_id_rejection(e: &nextgcore_dbi::DbiError) -> Option<SbiResponse> {
+    match e {
+        nextgcore_dbi::DbiError::UnsupportedUeIdType(_)
+        | nextgcore_dbi::DbiError::InvalidSupi(_) => Some(send_bad_request(
+            "Unsupported ueId type",
+            Some("MANDATORY_IE_INCORRECT"),
+        )),
+        _ => None,
     }
 }
 
@@ -1065,6 +1092,9 @@ async fn handle_auth_data(
                         .with_body(response_json.to_string(), "application/json")
                 }
                 Err(e) => {
+                    if let Some(resp) = ue_id_rejection(&e) {
+                        return resp;
+                    }
                     log::error!("[{supi}] DB auth_info query failed: {e:?}");
                     send_not_found("Subscriber not found", Some("NOT_FOUND"))
                 }
@@ -1165,6 +1195,9 @@ async fn handle_auth_data(
                     Some("SYSTEM_FAILURE"),
                 ),
                 Err(e) => {
+                    if let Some(resp) = ue_id_rejection(&e) {
+                        return resp;
+                    }
                     log::error!("[{supi}] DB provision failed: {e:?}");
                     send_error(
                         500,
@@ -1287,6 +1320,9 @@ async fn handle_auth_data(
                         );
                     }
                     Err(e) => {
+                        if let Some(resp) = ue_id_rejection(&e) {
+                            return resp;
+                        }
                         log::error!("[{supi}] DB update_sqn failed: {e:?}");
                         return send_error(
                             500,
@@ -2243,6 +2279,9 @@ async fn handle_provisioned_data(
         {
             Ok(data) => data,
             Err(e) => {
+                if let Some(resp) = ue_id_rejection(&e) {
+                    return resp;
+                }
                 log::error!("[{supi}] DB subscription_data query failed: {e:?}");
                 return send_not_found("Subscriber not found", Some("NOT_FOUND"));
             }
@@ -2522,7 +2561,12 @@ async fn handle_policy_ue_data(parts: &[&str], method: &str, request: &SbiReques
                             Ok(data) => Some(serde_json::json!({
                                 "smPolicySnssaiData": build_sm_policy_data(&data)
                             })),
-                            Err(_) => None,
+                            Err(e) => {
+                                if let Some(resp) = ue_id_rejection(&e) {
+                                    return resp;
+                                }
+                                None
+                            }
                         }
                     }
                 };
@@ -2583,7 +2627,10 @@ async fn handle_policy_ue_data(parts: &[&str], method: &str, request: &SbiReques
                         SbiResponse::with_status(200)
                             .with_body(response.to_string(), "application/json")
                     }
-                    Err(_) => {
+                    Err(e) => {
+                        if let Some(resp) = ue_id_rejection(&e) {
+                            return resp;
+                        }
                         // Return empty UePolicySet as default (TS 29.519)
                         SbiResponse::with_status(200)
                             .with_body("{}".to_string(), "application/json")
@@ -6486,6 +6533,67 @@ udr:
                 .await
                 .expect("GET unknown identity-data");
             assert_eq!(resp.status, 404, "{id}");
+        }
+        udr.stop().await.expect("stop");
+    }
+
+    /// A `{ueId}` whose type prefix is not one the subscriber store is keyed by is
+    /// a 400 on every resource that looks the UE up, while each supported type
+    /// still resolves.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_ue_id_type_is_rejected() {
+        let (udr, client) = start_udr().await;
+        let _dbi = DbiTestStore::enable().await;
+        let supi = "imsi-001019900004901";
+        let ext = "ue4901@fl.nextg";
+        nextgcore_dbi::test_store::provision_subscriber_with_external_ids(
+            supi,
+            &["491721074901"],
+            &[ext],
+        );
+
+        // Each supported type passes validation and resolves the subscriber;
+        // `nai-` is supported but this one is not provisioned.
+        for id in [
+            supi.to_string(),
+            "msisdn-491721074901".to_string(),
+            format!("extid-{ext}"),
+        ] {
+            let resp = client
+                .get(&format!("/nudr-dr/v2/subscription-data/{id}/identity-data"))
+                .await
+                .expect("GET identity-data");
+            assert_eq!(resp.status, 200, "{id}: {:?}", resp.http.content);
+        }
+        let resp = client
+            .get("/nudr-dr/v2/subscription-data/nai-nobody@fl.nextg/identity-data")
+            .await
+            .expect("GET identity-data");
+        assert_eq!(resp.status, 404, "nai-: {:?}", resp.http.content);
+
+        for id in ["$x-1", "a.b-1", "-001010000000001", "foo-1"] {
+            for path in [
+                format!("/nudr-dr/v2/subscription-data/{id}/identity-data"),
+                format!("/nudr-dr/v2/policy-data/ues/{id}/sm-data"),
+                format!("/nudr-dr/v2/policy-data/ues/{id}/ue-policy-set"),
+            ] {
+                let resp = client.get(&path).await.expect("GET");
+                assert_eq!(resp.status, 400, "{path}: {:?}", resp.http.content);
+                assert_eq!(json_of(&resp)["cause"], "MANDATORY_IE_INCORRECT", "{path}");
+            }
+            let resp = client
+                .put_json(
+                    &format!(
+                        "/nudr-dr/v2/subscription-data/{id}/authentication-data/authentication-subscription"
+                    ),
+                    &json!({
+                        "authenticationMethod": "5G_AKA",
+                        "encPermanentKey": "465b5ce8b199b49faa5f0a2ee238a6bc"
+                    }),
+                )
+                .await
+                .expect("PUT");
+            assert_eq!(resp.status, 400, "PUT {id}: {:?}", resp.http.content);
         }
         udr.stop().await.expect("stop");
     }

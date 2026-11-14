@@ -1,0 +1,34 @@
+# D445A core configs (nextgsim#480). A ConfigMap value is one string, so the
+# file is replaced whole: keep it in step with k8s/manifests/configmap.yaml.
+#
+#   nrf.yaml  trusts the CCA public keys in /etc/nextgcore/cca-trusted
+#             (nrf-cca.yaml), where scenario.sh publishes the AF's JWK, so the
+#             AF gets NRF tokens as an nfType AF consumer (nnef-ueid,
+#             nnef-eventexposure).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nextgcore-configs
+  namespace: nextg-system
+data:
+  nrf.yaml: |
+    logger:
+      file:
+        path: /var/log/nextgcore/nrf.log
+      level: info
+    global:
+      max:
+        ue: 1024
+        peer: 64
+    nrf:
+      serving:
+        - plmn_id:
+            mcc: 999
+            mnc: 70
+      sbi:
+        server:
+          - address: 0.0.0.0
+            advertise: nrf.nextg-system.svc.cluster.local
+            port: 7777
+        oauth2:
+          cca_trusted_keys_dir: /etc/nextgcore/cca-trusted

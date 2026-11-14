@@ -1,0 +1,55 @@
+# Demo d445a-fl-t8 (nextgsim#480): network-assisted federated learning over real
+# PDU sessions, with NEF T8 member exclusion. Over the demo-OFF base. Run with
+#   flock /tmp/eks-nextg-demo.lock k8s/demo-check.sh d445a-fl-t8 t8-exclusion
+#   flock /tmp/eks-nextg-demo.lock k8s/demo-check.sh d445a-fl-t8 poisoned-ue
+# and the extra arms of scenario.sh (D445A_ARM=...; its header lists them), or all
+# of them, built and pushed first, with run-arms.sh.
+#
+#   nef.yaml            nefd (built with --features demo-d445a-fl-t8), its
+#                       ConfigMap nef-config (a toggle target) and Service.
+#   af.yaml             the AF's config (a toggle target) and the upf-pod
+#                       sidecar (not privileged) that builds the fl-dn DN and
+#                       runs nr-fl-server as nobody.
+#   patches/upf-af.yaml the sidecar, plus upfd's UPF_NAT_EXCLUDE=10.46.0.0/24
+#                       and UPF_SESSION_METRICS=seid-ue-ip (#1455).
+#   subscribers.yaml    imsi-...001-005 with extid ueNNN@fl.nextg (#1490).
+#   ue-fl.yaml          fl-config.sh: each UE's fl: block (member, clients).
+#   ue-members.yaml     UEs 2-5, replicas 0 until scenario.sh scales them.
+#   patches/ue-*.yaml   the base UE as member 1, at info.
+#   core-configs.yaml, nrf-cca*.yaml   the NRF trusts the AF's CCA key.
+#
+# Images (build-images.sh): every core NF at demo-d445a-fl-t8-<nextgcore sha>
+# (the 6G profile's features, nefd with demo-d445a-fl-t8), and gnb/ue at
+# demo-d445a-fl-t8-<nextgsim sha>; the ue image carries nr-ue with
+# demo-d445a-fl-t8, nr-cli, nr-fl-server and their revert-hooks builds.
+#
+# ClusterIP only: nefd's Service is the one addition. The AF publishes nothing;
+# it is reachable from UEs through the UPF and from nefd through the upf pod's
+# DNAT (af.yaml).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: nextg-demo
+resources:
+  - ../demo
+  - toggles.yaml
+  - nef.yaml
+  - af.yaml
+  - subscribers.yaml
+  - ue-fl.yaml
+  - ue-members.yaml
+  - nrf-cca.yaml
+patches:
+  - path: core-configs.yaml
+  - path: nrf-cca-mount.yaml
+  - path: patches/ue-log-level.yaml
+    target:
+      kind: Deployment
+      name: ue
+  - path: patches/upf-af.yaml
+    target:
+      kind: Deployment
+      name: upf
+  - path: patches/ue-fl-config.yaml
+    target:
+      kind: Deployment
+      name: ue
