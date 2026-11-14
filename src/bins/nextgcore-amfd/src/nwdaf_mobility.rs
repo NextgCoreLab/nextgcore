@@ -12,8 +12,9 @@
 //!    (`namf_handler::initiate_paging_for_idle_ue`), it marks the context
 //!    `nwdaf_wait_until = now + HINT_TIMEOUT` and calls [`spawn_hint`].
 //! 2. [`spawn_hint`] runs off every NGAP and SBI-server task, with bounded
-//!    concurrency. It resolves an NWDAF, sends `Nnwdaf_AnalyticsInfo_Request` for
-//!    UE_MOBILITY over a future window (a prediction, TS 29.520 §4.3.2.2.2), and
+//!    concurrency. It resolves an NWDAF (the cache, then the NRF), sends
+//!    `Nnwdaf_AnalyticsInfo_Request` for UE_MOBILITY over a period from the
+//!    present time (only `endTs`: a prediction, TS 29.520 §4.3.2.2.2), and
 //!    posts the answer with `AmfContext::paging_set_nwdaf_hint`. Discovery and
 //!    request together are bounded by [`HINT_TIMEOUT`].
 //! 3. The paging pump holds only that context's first PAGING until the answer or
@@ -41,8 +42,9 @@ use crate::context::{PlmnId, PredictedCell};
 /// How long the first PAGING waits for the NWDAF, discovery included.
 pub const HINT_TIMEOUT: Duration = Duration::from_millis(300);
 
-/// The analytics target period asked for: a prediction from now for this long,
-/// which covers T3513's whole retransmission ladder (5 × 5 s by default).
+/// The analytics target period asked for: a prediction from the present time
+/// for this long, which covers T3513's whole retransmission ladder (5 × 5 s by
+/// default). See [`request_path`] for why only its end is sent.
 pub const PREDICTION_WINDOW: Duration = Duration::from_secs(30);
 
 /// At most this many NWDAF queries in flight. Past that a page fails open at once
@@ -201,16 +203,21 @@ pub fn gnb_id_of_nci(nci: u64, gnb_id_len: u8) -> Option<u32> {
 
 /// The request path of `Nnwdaf_AnalyticsInfo_Request` for `supi`'s UE mobility
 /// prediction (TS 29.520 §4.3.2.2.2): `event-id=UE_MOBILITY`, `tgt-ue` naming the
-/// SUPI, and `ana-req` a window starting `now`, which makes it a prediction.
+/// SUPI, and `ana-req` an analytics target period from the present time to
+/// `now + PREDICTION_WINDOW`, which makes it a prediction.
+///
+/// `ana-req` carries `endTs` only (#1504). An absent `startTs` means the present
+/// time at the NWDAF (TS 29.520 table 5.1.6.2.3-1, `EventReportingRequirement`),
+/// so the period cannot start in the NWDAF's past. A `startTs` of this AMF's
+/// `now` could: it is written in whole seconds and is already past when the
+/// request arrives, and with `endTs` in the future that is a request for
+/// statistics and prediction together, which the NWDAF "shall reject" with
+/// `400 BOTH_STAT_PRED_NOT_ALLOWED` (§4.3.2.2.2, `29520-k00.txt:5889-5893`).
 pub fn request_path(supi: &str, now: std::time::SystemTime) -> String {
     use crate::namf_server::system_time_to_rfc3339 as rfc3339;
     use nextgcore_sbi::uri_encode::encode_query_value as enc;
     let tgt_ue = json!({ "supis": [supi] }).to_string();
-    let ana_req = json!({
-        "startTs": rfc3339(now),
-        "endTs": rfc3339(now + PREDICTION_WINDOW),
-    })
-    .to_string();
+    let ana_req = json!({ "endTs": rfc3339(now + PREDICTION_WINDOW) }).to_string();
     format!(
         "/nnwdaf-analyticsinfo/v1/analytics?event-id=UE_MOBILITY&tgt-ue={}&ana-req={}",
         enc(&tgt_ue),
@@ -499,8 +506,38 @@ mod tests {
         let tgt: Value = serde_json::from_str(&params["tgt-ue"]).expect("json");
         assert_eq!(tgt, json!({ "supis": ["imsi-001010000000001"] }));
         let ana: Value = serde_json::from_str(&params["ana-req"]).expect("json");
-        assert_eq!(ana["startTs"], "2026-11-12T10:00:00Z");
-        assert_eq!(ana["endTs"], "2026-11-12T10:00:30Z");
+        assert_eq!(ana, json!({ "endTs": "2026-11-12T10:00:30Z" }));
+    }
+
+    /// #1504, TS 29.520 §4.3.2.2.2 (`29520-k00.txt:5889-5893`): the period may
+    /// not start in the NWDAF's past and end in its future. `request_path` is
+    /// built at a sub-second `now` and reaches the NWDAF later still; whatever
+    /// the NWDAF's clock reads within the window, the period it is asked for
+    /// starts there (no `startTs`, so "the present time") and ends in its future.
+    #[test]
+    fn the_window_never_starts_in_the_nwdafs_past() {
+        // 2026-11-12T10:00:00.700Z: `startTs = now` would have read 10:00:00Z.
+        let now = std::time::UNIX_EPOCH + Duration::from_millis(1_794_477_600_700);
+        let path = request_path("imsi-001010000000001", now);
+        let ana = path
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("ana-req="))
+            .map(percent_decode)
+            .expect("ana-req");
+        let ana: Value = serde_json::from_str(&ana).expect("json");
+        let end = ana["endTs"].as_str().expect("endTs");
+        for arrival_ms in [0u64, 1, 300, 999, 5_000] {
+            let nwdaf_now = now + Duration::from_millis(arrival_ms);
+            let start = match ana.get("startTs").and_then(Value::as_str) {
+                Some(s) => crate::namf_server::rfc3339_to_system_time(s).expect("startTs"),
+                None => nwdaf_now,
+            };
+            let end = crate::namf_server::rfc3339_to_system_time(end).expect("endTs");
+            assert!(
+                start >= nwdaf_now && end > nwdaf_now,
+                "a prediction at NWDAF time +{arrival_ms} ms: {ana}"
+            );
+        }
     }
 
     fn percent_decode(s: &str) -> String {
