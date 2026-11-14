@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nextg-demo-toggles
+data:
+  key: d440c-nwdaf-paging
+  # amfd picks the paging strategy from the mode; each gNB logs the PAGING's
+  # Assistance Data for Paging. nwdafd is not a target: it serves UE_MOBILITY
+  # from its own base knob (nwdaf.yaml), not from a demo block.
+  targets: amf.yaml gnb.yaml gnb-b.yaml gnb-c.yaml

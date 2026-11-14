@@ -1,0 +1,145 @@
+# gNB A's and the UE's configs for demo d440c-nwdaf-paging (nextgsim#464), over
+# the base nextgsim-configs entries: nextgsim's config/demo-nwdaf-paging/
+# gnb-a.yaml and ue-lap.yaml, with Service names where the compose has
+# addresses and no demo block (toggles.yaml adds gNB A's). test-scenario.sh
+# checks that nothing else differs from the committed nextgsim files.
+#
+# The route is deployed PARKED: start_after_secs 86400 instead of the committed
+# 60, so the deploy's UE stays at its start, in A, through the base e2e (a
+# handover mid-ping would fail its 0% loss for a reason that is not the demo).
+# scenario.sh writes the committed 60 back into this ConfigMap just before it
+# restarts the UE, and test-scenario.sh checks that start_after_secs is the only
+# difference from nextgsim's file and that the value restored is nextgsim's.
+#
+# The restarted UE registers on A and, 60 s after start-up, rides seed 464's
+# sim_route at 2.5 m/s (times from start-up):
+#   60-209 s   three laps A -> B -> C -> A, CM-CONNECTED: nine N2 handovers,
+#              each a HANDOVER NOTIFY at amfd and a LOCATION_REPORT to nwdafd;
+#   209-256 s  the dwell, out behind A to (-21, -10) at 233 s and back: no
+#              neighbour within the A3 margin of A. scenario.sh releases the UE
+#              to CM-IDLE at the far point;
+#   256-276 s  idle, to (81, 11), 22 m from B: idle reselection A -> B.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nextgsim-configs
+  namespace: nextg-demo
+data:
+  gnb.yaml: |
+    nci: 0x000000010
+    gnb_id_length: 32
+    plmn:
+      mcc: 999
+      mnc: 70
+      long_mnc: false
+    tac: 1
+    nssai:
+      - sst: 1
+        sd: null
+    amf_configs:
+      - address: amf.nextg-system.svc.cluster.local
+        port: 38412
+    sctp_backend: userspace
+    link_ip: 0.0.0.0
+    ngap_ip: 0.0.0.0
+    gtp_ip: 0.0.0.0
+    ignore_stream_ids: false
+    upf_addr: upf.nextg-system.svc.cluster.local
+    upf_port: 2152
+    si_broadcast_period_ms: 80
+    reselection:
+      broadcast: true
+      q_hyst_db: 4
+      t_reselection_s: 1
+      cell_reselection_priority: 4
+      s_intra_search_p: 31
+      thresh_serving_low_p: 4
+      intra_freq_neighbours: []
+      inter_freq_carriers: []
+    accept_raw_nas_on_dcch: false
+    rlc_am_psis: []
+    energy_saving_enabled: false
+    she_enabled: false
+    nwdaf_enabled: false
+    nkef_enabled: false
+    isac_enabled: false
+    agent_enabled: false
+    as_security_enabled: false
+    sim_position: { x: 0, y: 0, z: 0 }
+    handover_neighbours:
+      - nci: 0x000000020
+        tac: 1
+      - nci: 0x000000030
+        tac: 1
+  ue.yaml: |
+    supi:
+      supi_type: Imsi
+      value: "999700000000001"
+    protection_scheme: 0
+    home_network_public_key_id: 0
+    home_network_public_key: []
+    routing_indicator: "0000"
+    hplmn:
+      mcc: 999
+      mnc: 70
+      long_mnc: false
+    key: [0x46, 0x5B, 0x5C, 0xE8, 0xB1, 0x99, 0xB4, 0x9F, 0xAA, 0x5F, 0x0A, 0x2E, 0xE2, 0x38, 0xA6, 0xBC]
+    op: [0xE8, 0xED, 0x28, 0x9D, 0xEB, 0xA9, 0x52, 0xE4, 0x28, 0x3B, 0x54, 0xE8, 0x8E, 0x6D, 0x83, 0x4D]
+    op_type: Opc
+    amf: [0x80, 0x00]
+    imei: "356938035643803"
+    imei_sv: null
+    supported_algs:
+      nia1: true
+      nia2: true
+      nia3: true
+      nea1: true
+      nea2: true
+      nea3: true
+    pqc:
+      enabled: false
+    gnb_search_list:
+      - "gnb.nextg-system.svc.cluster.local"
+      - "gnb-b.nextg-system.svc.cluster.local"
+      - "gnb-c.nextg-system.svc.cluster.local"
+    sim_position: { x: 30, y: 17, z: 0 }
+    sim_route:
+      waypoints:
+        - { x: 71, y: 14, z: 0 }   # lap 1, B
+        - { x: 50, y: 54, z: 0 }   # lap 1, C
+        - { x: 27, y: 19, z: 0 }   # lap 1, A
+        - { x: 69, y: 14, z: 0 }   # lap 2, B
+        - { x: 48, y: 49, z: 0 }   # lap 2, C
+        - { x: 29, y: 17, z: 0 }   # lap 2, A
+        - { x: 71, y: 20, z: 0 }   # lap 3, B
+        - { x: 51, y: 55, z: 0 }   # lap 3, C
+        - { x: 31, y: 18, z: 0 }   # lap 3, A
+        - { x: -21, y: -10, z: 0 } # dwell: out behind A (the release)
+        - { x: 32, y: 16, z: 0 }   # dwell: back to A
+        - { x: 81, y: 11, z: 0 }   # idle: to B
+      speed_mps: 2.5
+      start_after_secs: 86400   # parked; scenario.sh restores 60
+    sessions:
+      - type: Ipv4
+        s_nssai:
+          sst: 1
+          sd: null
+        apn: "internet"
+        is_emergency: false
+    configured_nssai:
+      slices:
+        - sst: 1
+          sd: null
+    tun_name: "uesimtun"
+    redcap: false
+    racs_store_assigned_id: true
+    require_broadcast_sib1: false
+    rlc_am_psis: []
+    conditional_handover: false
+    eutra_b1_threshold_dbm: -110
+    she_enabled: false
+    ai_ml_enabled: false
+    isac_enabled: false
+    federated_learning_enabled: false
+    semantic_comm_enabled: false
+    as_security_enabled: false

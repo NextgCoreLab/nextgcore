@@ -11,7 +11,12 @@
 #                                        teardown=ok, artefacts mode 600
 #                                        and sim=/core_image=/sim_image= taken
 #                                        from SIM_SHA and the deployed pods
-#   4. the same run with scrubbing disabled -> VERDICT: FAIL naming the leak
+#   4. <key> off on a demo overlay   -> the demo-off assertions (PASS with no
+#                                        banner), DEMO_MODE=off and DEMO_VARIANT
+#                                        reach scenario.sh, artefacts under
+#                                        <key>/off+<variant>/, variant= recorded;
+#                                        off off with a DEMO_VARIANT -> exit 2
+#   5. the same run with scrubbing disabled -> VERDICT: FAIL naming the leak
 # Needs bash, python3 and coreutils only. Exit 0 when all hold.
 # shellcheck disable=SC2016,SC2317  # check() evals its single-quoted conditions
 set -uo pipefail
@@ -76,6 +81,24 @@ check "scrubbed run: VERDICT: PASS, teardown=ok" 'grep -q "VERDICT: PASS" "${L}/
 check "scrubbed run: no token or JWT in any artefact" \
   '! grep -rqE "Bearer [A-Za-z0-9]{8,}|eyJ[A-Za-z0-9_-]+\." "${L}/"'
 check "scrubbed run: artefacts mode 600" '[[ $(stat -c %a "${L}/deploy.log") == 600 ]]'
+
+mkdir -p "${T}/deploy/eks/overlays/demo-k1"
+: > "${T}/deploy/eks/overlays/demo-k1/kustomization.yaml"
+cat > "${T}/deploy/eks/overlays/demo-k1/scenario.sh" <<'EOF'
+#!/bin/bash
+echo "scenario mode=${DEMO_MODE} variant=${DEMO_VARIANT}" > "${OUT}/scenario-env.txt"
+EOF
+chmod +x "${T}/deploy/eks/overlays/demo-k1/scenario.sh"
+YES=true DEMO_VARIANT=fault-x run "${T}/k8s/demo-check.sh" k1 off >/dev/null 2>&1; rc=$?
+L="${T}/out/k1/off+fault-x/latest"
+check "<key> off: exit 0 under the demo-off assertions" '[[ ${rc} == 0 ]] && grep -q "VERDICT: PASS" "${L}/verdict.txt"'
+check "<key> off: DEMO_MODE=off and DEMO_VARIANT reach the scenario" \
+  'grep -qx "scenario mode=off variant=fault-x" "${L}/scenario-env.txt"'
+check "<key> off: variant= recorded" 'grep -q "^key=k1 mode=off variant=fault-x " "${L}/verdict.txt"'
+YES=true DEMO_VARIANT=x run "${T}/k8s/demo-check.sh" off off >/dev/null 2>&1; rc=$?
+check "off off refuses a DEMO_VARIANT: exit 2" '[[ ${rc} == 2 ]]'
+YES=true DEMO_VARIANT='Bad/x' run "${T}/k8s/demo-check.sh" k1 off >/dev/null 2>&1; rc=$?
+check "a malformed DEMO_VARIANT: exit 2" '[[ ${rc} == 2 ]]'
 
 sed -i 's|  scrub <"${f}" >"${f}.scrub" \&\& mv "${f}.scrub" "${f}"|  :|' "${T}/k8s/demo-check.sh"
 YES=true run "${T}/k8s/demo-check.sh" off off >/dev/null 2>&1; rc=$?

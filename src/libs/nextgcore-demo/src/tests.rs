@@ -295,3 +295,15 @@ fn install_logs_the_banner_once_and_feeds_the_metric_and_the_log_prefix() {
         "one WARN banner at install, then the prefixed demo line"
     );
 }
+
+/// `off` names the demo-off arm (`k8s/demo-check.sh <key> off`), so no demo may
+/// register it as a mode (nextgsim#464).
+#[test]
+#[should_panic(expected = "reserved for the demo-off arm")]
+fn a_mode_named_off_is_a_programming_error() {
+    DemoRegistry::new(&[DemoSpec {
+        key: "d1-x",
+        modes: &["on", "off"],
+        requires: &[],
+    }]);
+}
