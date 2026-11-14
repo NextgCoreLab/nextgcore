@@ -231,8 +231,10 @@ if [[ -z "${DEMO_KEY}" || "${DEMO_MODE}" == off ]]; then
 else
   grep -q "DEMO MODE ACTIVE:.*\b${DEMO_KEY}=${DEMO_MODE}\b" "${OUT}/log-chain.txt" \
     || FAILS+=("no DEMO MODE ACTIVE banner for ${DEMO_KEY}=${DEMO_MODE}")
-  cat "${OUT}"/metrics/*.prom 2>/dev/null \
-    | grep -qF "nextg_demo_enabled{demo=\"${DEMO_KEY}\",mode=\"${DEMO_MODE}\"} 1" \
+  # grep reads the files itself: `cat | grep -q` under pipefail fails when
+  # grep's early exit SIGPIPEs cat (a false FAIL on devtest1, 20261114T192632Z).
+  grep -qhF "nextg_demo_enabled{demo=\"${DEMO_KEY}\",mode=\"${DEMO_MODE}\"} 1" \
+      "${OUT}"/metrics/*.prom 2>/dev/null \
     || FAILS+=("no nextg_demo_enabled{demo=${DEMO_KEY},mode=${DEMO_MODE}} series")
 fi
 
