@@ -2,8 +2,8 @@
 //! against a stand-in UPF socket.
 
 use super::*;
-use crate::pfcp_path::stand_in::client_with_silent_peer;
-use crate::pfcp_path::{encode_wire_message, find_ie, parse_wire_header, try_associate};
+use crate::pfcp_path::stand_in::{client_with_silent_peer, client_with_silent_peer_timed};
+use crate::pfcp_path::{associate_and_provision, encode_wire_message, find_ie, parse_wire_header};
 use nextgcore_pfcp::message::{AssociationSetupResponse, PfcpMessage};
 use nextgcore_pfcp::qos_monitoring::{
     N6DelayMeasurementFailureInformation, N6DelayMeasurementInformation,
@@ -193,18 +193,21 @@ fn an_invalid_block_is_refused_1502() {
     }
 }
 
-/// A Setup Response advertising `features`, then (if asked) an accepted Update
-/// Response, from a stand-in UPF on `upf`. Returns every request it received.
+/// A Setup Response advertising `features`, then an accepted Update Response when
+/// `answer_update`, from a stand-in UPF on `upf`. Returns every request it received
+/// until it has heard nothing for `quiet_ms`.
 fn answer_setup_and_update(
     upf: UdpSocket,
     features: UpFunctionFeatures,
+    answer_update: bool,
+    quiet_ms: u64,
 ) -> tokio::task::JoinHandle<Vec<(u8, Vec<u8>)>> {
     tokio::spawn(async move {
         let mut seen = Vec::new();
         let mut buf = vec![0u8; 4096];
         // The association, and the Update if one follows within the window.
         while let Ok(Ok((len, from))) = tokio::time::timeout(
-            std::time::Duration::from_millis(300),
+            std::time::Duration::from_millis(quiet_ms),
             upf.recv_from(&mut buf),
         )
         .await
@@ -226,7 +229,7 @@ fn answer_setup_and_update(
                     )
                     .to_vec()
                 }
-                pfcp_message_type::ASSOCIATION_UPDATE_REQUEST => {
+                pfcp_message_type::ASSOCIATION_UPDATE_REQUEST if answer_update => {
                     let mut b = BytesMut::new();
                     AssociationUpdateResponse {
                         node_id: NodeId::new_ipv4([127, 0, 0, 4]),
@@ -262,8 +265,9 @@ fn un6dm() -> UpFunctionFeatures {
 /// the UPF received, in order.
 async fn associate_with(features: UpFunctionFeatures) -> Vec<(u8, Vec<u8>)> {
     let (client, upf) = client_with_silent_peer().await;
-    let answering = answer_setup_and_update(upf, features);
-    try_associate(&client).await.expect("associated");
+    let answering = answer_setup_and_update(upf, features, true, 300);
+    let provisioning = associate_and_provision(&client).await.expect("associated");
+    provisioning.await.unwrap();
     assert!(client.is_associated().await);
     answering.await.unwrap()
 }
@@ -272,8 +276,8 @@ async fn associate_with(features: UpFunctionFeatures) -> Vec<(u8, Vec<u8>)> {
 /// the SMF's next request, an Association Update Request carrying the configured IE
 /// 355 instances, exactly as the shared codec decodes them, and this SMF's Node ID.
 ///
-/// REVERT-VERIFIED: without the `provision` call in `try_associate`, the UPF sees
-/// only the Setup.
+/// REVERT-VERIFIED: without the `provision` task in `associate_and_provision`, the
+/// UPF sees only the Setup.
 #[tokio::test]
 async fn a_un6dm_upf_gets_an_association_update_with_the_configured_ie355_1502() {
     let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
@@ -412,6 +416,7 @@ async fn an_n6dr_node_report_is_stored_and_exported_1502() {
     let _n4 = crate::pfcp_path::N4_TEST_LOCK.lock().await;
     let _n6 = N6_TEST_LOCK.lock().await;
     reset_for_test();
+    set_config(Some(yaml(DEMO_BLOCK).unwrap()));
     let (client, upf) = client_with_silent_peer().await;
     client.set_assoc_state_for_test(true, None, None).await;
     let key = client.recovery_time_stamp_key();
@@ -527,6 +532,7 @@ async fn association_loss_forgets_the_upfs_n6_results_1502() {
     let _n4 = crate::pfcp_path::N4_TEST_LOCK.lock().await;
     let _n6 = N6_TEST_LOCK.lock().await;
     reset_for_test();
+    set_config(Some(yaml(DEMO_BLOCK).unwrap()));
     let (client, upf) = client_with_silent_peer().await;
     client.set_assoc_state_for_test(true, None, None).await;
     client.seed_peer_recovery_time_stamp(100).await;
@@ -615,4 +621,209 @@ fn the_config_loader_reads_the_block_and_refuses_an_invalid_one_1502() {
         "an invalid block fails startup"
     );
     assert_eq!(absent.unwrap(), None);
+}
+
+/// #1502 review M1: a UPF that advertises UN6DM but never answers the Association
+/// Update stays associated. The Update is retransmitted under T1/N1 and its
+/// exhaustion is reported as `Failed`, never run as the node-level abnormal action.
+/// It runs off the association loop, so `associate_and_provision` returns at once.
+///
+/// REVERT-VERIFIED: with `optional_request` marking down on exhaustion, the
+/// association is down afterwards; with the provisioning awaited inline, the call
+/// takes the full T1 x (N1 + 1).
+#[tokio::test]
+async fn an_unanswered_association_update_leaves_the_association_up_1502() {
+    let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _n4 = crate::pfcp_path::N4_TEST_LOCK.lock().await;
+    let _n6 = N6_TEST_LOCK.lock().await;
+    reset_for_test();
+    set_config(Some(yaml(DEMO_BLOCK).unwrap()));
+    let t1 = std::time::Duration::from_millis(400);
+    let (client, upf) = client_with_silent_peer_timed(t1, 1).await;
+    let answering = answer_setup_and_update(upf, un6dm(), false, 1500);
+
+    let started = std::time::Instant::now();
+    let provisioning = associate_and_provision(&client).await.expect("associated");
+    let returned_after = started.elapsed();
+    let outcome = provisioning.await.unwrap();
+    let associated = client.is_associated().await;
+    let seen = answering.await.unwrap();
+    reset_for_test();
+
+    assert!(
+        returned_after < t1,
+        "the association returns before the Update's T1: {returned_after:?}"
+    );
+    assert_eq!(outcome, Provisioned::Failed);
+    assert!(
+        associated,
+        "an ignored optional Update does not mark the association down"
+    );
+    let types: Vec<u8> = seen.iter().map(|(t, _)| *t).collect();
+    assert_eq!(
+        types,
+        vec![
+            pfcp_message_type::ASSOCIATION_SETUP_REQUEST,
+            pfcp_message_type::ASSOCIATION_UPDATE_REQUEST,
+            pfcp_message_type::ASSOCIATION_UPDATE_REQUEST
+        ],
+        "sent, then retransmitted once (N1 = 1)"
+    );
+}
+
+/// #1502 review M2: a heartbeat loss (N1 exhaustion, no teardown) drops the UPF's
+/// N6 results and failure counts, so `/metrics` never shows a dead UPF's delay.
+///
+/// REVERT-VERIFIED: without the `forget_upf` call in `publish_associated`, the value
+/// and the failure count survive the loss.
+#[tokio::test]
+async fn a_heartbeat_loss_forgets_the_upfs_n6_results_1502() {
+    let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _n4 = crate::pfcp_path::N4_TEST_LOCK.lock().await;
+    let _n6 = N6_TEST_LOCK.lock().await;
+    reset_for_test();
+    set_config(Some(yaml(DEMO_BLOCK).unwrap()));
+    let (client, upf) =
+        client_with_silent_peer_timed(std::time::Duration::from_millis(50), 1).await;
+    client.set_assoc_state_for_test(true, None, None).await;
+    let key = client.recovery_time_stamp_key();
+    let reported = deliver(
+        &client,
+        &upf,
+        &node_report(
+            1,
+            0x40,
+            &[
+                report_ie([10, 60, 0, 11], Some((9, 8, 11)), None),
+                report_ie([10, 60, 0, 12], None, Some(2)),
+            ],
+        ),
+    )
+    .await;
+    let before = store_sizes_for_test();
+
+    let heartbeat = client.heartbeat_once().await;
+    let associated = client.is_associated().await;
+    let after = store_sizes_for_test();
+    let metrics = crate::render_metrics();
+    reset_for_test();
+
+    assert_eq!(reported, (Some(1), None));
+    assert_eq!(before, (1, 1), "one value, one failure count");
+    assert!(heartbeat.is_err(), "the silent peer exhausts the heartbeat");
+    assert!(!associated);
+    assert_eq!(after, (0, 0), "both go with the association");
+    assert!(!metrics.contains(&format!("upf=\"{key}\"")), "{metrics}");
+}
+
+/// #1502 review M3: a report naming an endpoint this SMF did not provision is
+/// accepted (TS 29.244 §6.2.9.3; no §8.2.1 cause fits a well-formed unrequested
+/// report) but neither stored nor exported, only counted, so a UPF naming many
+/// endpoints cannot grow the store or the series.
+///
+/// REVERT-VERIFIED: without the configured-endpoint check in `on_reports`, all 201
+/// endpoints are stored and exported.
+#[tokio::test]
+async fn reports_for_unprovisioned_endpoints_are_ignored_and_counted_1502() {
+    let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _n4 = crate::pfcp_path::N4_TEST_LOCK.lock().await;
+    let _n6 = N6_TEST_LOCK.lock().await;
+    reset_for_test();
+    set_config(Some(yaml(DEMO_BLOCK).unwrap()));
+    let (client, upf) = client_with_silent_peer().await;
+    client.set_assoc_state_for_test(true, None, None).await;
+    let mut ies: Vec<Vec<u8>> = (0..200u8)
+        .map(|i| report_ie([10, 99, 0, i], Some((1, 1, 1)), None))
+        .collect();
+    ies.push(report_ie([10, 60, 0, 11], Some((9, 8, 11)), None));
+    let answer = deliver(&client, &upf, &node_report(1, 0x40, &ies)).await;
+    let sizes = store_sizes_for_test();
+    let metrics = crate::render_metrics();
+    reset_for_test();
+
+    assert_eq!(answer, (Some(1), None));
+    assert_eq!(sizes, (1, 0), "only the provisioned endpoint");
+    let series = metrics
+        .lines()
+        .filter(|l| l.starts_with("smf_n6_delay_ms{"))
+        .count();
+    assert_eq!(series, 3, "avg/min/max of 10.60.0.11 only");
+    assert!(!metrics.contains("10.99.0."));
+    assert!(metrics.contains("smf_n6_delay_reports_ignored_total 200"));
+}
+
+/// #1502 review M3: without the block, a valid N6DR report is still answered, but
+/// nothing is stored and `/metrics` carries no N6 family at all.
+///
+/// REVERT-VERIFIED: with `render` keyed on the store again, and reports stored
+/// without a block, the families appear.
+#[tokio::test]
+async fn without_the_block_nothing_is_stored_or_exported_1502() {
+    let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _n4 = crate::pfcp_path::N4_TEST_LOCK.lock().await;
+    let _n6 = N6_TEST_LOCK.lock().await;
+    reset_for_test();
+    let (client, upf) = client_with_silent_peer().await;
+    client.set_assoc_state_for_test(true, None, None).await;
+    let answer = deliver(
+        &client,
+        &upf,
+        &node_report(
+            1,
+            0x40,
+            &[
+                report_ie([10, 60, 0, 11], Some((9, 8, 11)), None),
+                report_ie([10, 60, 0, 12], None, Some(1)),
+            ],
+        ),
+    )
+    .await;
+    let sizes = store_sizes_for_test();
+    let metrics = crate::render_metrics();
+    reset_for_test();
+
+    assert_eq!(answer, (Some(1), None));
+    assert_eq!(sizes, (0, 0));
+    assert!(!metrics.contains("smf_n6_"), "{metrics}");
+}
+
+/// #1502 review MINORs, TS 29.244 §7.6.7 and §7.6.8:
+/// - an IE 356 whose endpoint carries neither V4 nor V6 → 69, Offending IE 356;
+/// - an IE 356 whose member's Length runs past the IE 356 → 68 (Invalid length);
+/// - an IE 356, last in the message, whose Length runs past the message → 68.
+///
+/// REVERT-VERIFIED: with `members_fit` not checked and the overrun IE skipped, the
+/// two length cases answer 69 and 67.
+#[tokio::test]
+async fn length_and_address_errors_in_ie356_get_their_causes_1502() {
+    let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _n4 = crate::pfcp_path::N4_TEST_LOCK.lock().await;
+    let _n6 = N6_TEST_LOCK.lock().await;
+    reset_for_test();
+    set_config(Some(yaml(DEMO_BLOCK).unwrap()));
+    let (client, upf) = client_with_silent_peer().await;
+    client.set_assoc_state_for_test(true, None, None).await;
+    let good = report_ie([10, 60, 0, 11], Some((9, 8, 11)), None);
+    // The IE 358 member starts right after the IE 356 header: flags octet 5.
+    let mut no_family = good.clone();
+    assert_eq!(&no_family[4..6], &[0x01, 0x66]);
+    no_family[8] = 0x00;
+    // The first member's Length grows by one, past the end of the IE 356 value.
+    let mut member_overrun = good.clone();
+    member_overrun[7] += 1;
+    // The IE 356 header claims 16 octets more than the message holds.
+    let mut ie_overrun = good.clone();
+    let l = u16::from_be_bytes([ie_overrun[2], ie_overrun[3]]) + 16;
+    ie_overrun[2..4].copy_from_slice(&l.to_be_bytes());
+
+    let a = deliver(&client, &upf, &node_report(1, 0x40, &[no_family])).await;
+    let b = deliver(&client, &upf, &node_report(2, 0x40, &[member_overrun])).await;
+    let c = deliver(&client, &upf, &node_report(3, 0x40, &[ie_overrun])).await;
+    let sizes = store_sizes_for_test();
+    reset_for_test();
+
+    assert_eq!(a, (Some(69), Some(IE_356)));
+    assert_eq!(b, (Some(68), Some(IE_356)));
+    assert_eq!(c, (Some(68), Some(IE_356)));
+    assert_eq!(sizes, (0, 0));
 }

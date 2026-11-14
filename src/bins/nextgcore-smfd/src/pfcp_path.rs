@@ -435,6 +435,15 @@ impl std::fmt::Display for PfcpRequestError {
 
 impl std::error::Error for PfcpRequestError {}
 
+/// What N1 exhaustion of a request does (#1502 review M1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Exhaustion {
+    /// The abnormal action: the peer is gone, mark the association down.
+    MarkDown,
+    /// Only report the timeout (an optional request, [`PfcpClient::optional_request`]).
+    Report,
+}
+
 // ============================================================================
 // Association state
 // ============================================================================
@@ -1095,13 +1104,22 @@ pub async fn run_association_loop<S: Fn() -> bool>(
 /// pod comes back at a new address, and the previous one will never answer.
 /// Before #658 the endpoint was fixed at startup, so the SMF retried a dead IP
 /// forever and rejected every PDU session with #26.
-pub async fn try_associate(client: &PfcpClient) -> Result<(), PfcpRequestError> {
+pub async fn try_associate(client: &Arc<PfcpClient>) -> Result<(), PfcpRequestError> {
+    associate_and_provision(client).await.map(drop)
+}
+
+/// [`try_associate`], returning the N6 delay provisioning it started (#1502).
+///
+/// Every (re)association re-provisions N6 delay measurement. It runs in its own task
+/// (#1502 review M1): a UPF that ignores the Association Update must not hold the
+/// serial association loop for T1 x (N1 + 1), and its silence never fails the
+/// association ([`PfcpClient::optional_request`]).
+pub(crate) async fn associate_and_provision(
+    client: &Arc<PfcpClient>,
+) -> Result<tokio::task::JoinHandle<crate::n6_delay::Provisioned>, PfcpRequestError> {
     client.reresolve_peer().await;
     client.associate().await?;
-    // #1502: every (re)association re-provisions N6 delay measurement, before this
-    // client's loop turn ends; never fails the association.
-    crate::n6_delay::provision(client).await;
-    Ok(())
+    Ok(tokio::spawn(crate::n6_delay::provision(client.clone())))
 }
 
 impl PfcpClient {
@@ -1133,6 +1151,12 @@ impl PfcpClient {
     fn publish_associated(&self, assoc: &AssociationState) {
         self.associated_gauge
             .store(assoc.associated, Ordering::Relaxed);
+        // #1502 review M2: every way the association goes down (teardown, a request's
+        // N1 exhaustion, a heartbeat loss) passes here, so this UPF's N6 delay results
+        // never outlive it on /metrics.
+        if !assoc.associated {
+            crate::n6_delay::forget_upf(&self.recovery_time_stamp_key());
+        }
     }
 
     /// Whether the N4 association is up, readable from a synchronous context
@@ -1149,6 +1173,14 @@ impl PfcpClient {
     /// not resolve yet — and [`Self::reresolve_peer`] refreshes it.
     pub fn with_peer_hostname(mut self, host: impl Into<String>, port: u16) -> Self {
         self.peer_host = Some((host.into(), port));
+        self
+    }
+
+    /// Test-only: shorten the Heartbeat's T1/N1 so a silent peer is lost fast.
+    #[cfg(test)]
+    pub(crate) fn with_heartbeat_timer_for_test(mut self, t1: Duration, n1: u32) -> Self {
+        self.timers.pfcp_no_heartbeat.duration = t1;
+        self.timers.pfcp_no_heartbeat.max_count = n1;
         self
     }
 
@@ -1384,6 +1416,21 @@ impl PfcpClient {
         self.request_on(msg_type, seid, body).await.0
     }
 
+    /// A node-level request whose loss says nothing about the association (#1502
+    /// review M1): sent and retransmitted under T1/N1 like [`Self::request`], but
+    /// N1 exhaustion is only reported to the caller. The Association Update that
+    /// provisions an optional feature is one: a UPF that ignores it is still
+    /// associated, and marking it down would refuse every new session and flap.
+    pub async fn optional_request(
+        &self,
+        msg_type: u8,
+        body: &[u8],
+    ) -> Result<(u8, Vec<u8>), PfcpRequestError> {
+        let mut sent_on = self.assoc.read().await.generation;
+        self.request_sent_on(msg_type, None, body, &mut sent_on, Exhaustion::Report)
+            .await
+    }
+
     /// [`Self::request`], and the association generation the request was last sent on
     /// (#966 follow-up 2): read as each (re)transmission leaves, so an association set
     /// up between the caller's decision and the send is the one the answer is about.
@@ -1395,7 +1442,7 @@ impl PfcpClient {
     ) -> (Result<(u8, Vec<u8>), PfcpRequestError>, u64) {
         let mut sent_on = self.assoc.read().await.generation;
         let result = self
-            .request_sent_on(msg_type, seid, body, &mut sent_on)
+            .request_sent_on(msg_type, seid, body, &mut sent_on, Exhaustion::MarkDown)
             .await;
         (result, sent_on)
     }
@@ -1406,6 +1453,7 @@ impl PfcpClient {
         seid: Option<u64>,
         body: &[u8],
         sent_on: &mut u64,
+        exhaustion: Exhaustion,
     ) -> Result<(u8, Vec<u8>), PfcpRequestError> {
         let seq = crate::PFCP_SEQ.fetch_add(1, Ordering::Relaxed) & 0x00FF_FFFF;
         let pkt = encode_wire_message(msg_type, seid, seq, body);
@@ -1464,7 +1512,9 @@ impl PfcpClient {
         // Exhaustion abnormal action: a node-level silence means the peer is
         // gone — drop the association so new sessions are refused until the
         // association is re-established.
-        if matches!(result, Err(PfcpRequestError::Timeout { .. })) {
+        if exhaustion == Exhaustion::MarkDown
+            && matches!(result, Err(PfcpRequestError::Timeout { .. }))
+        {
             let mut assoc = self.assoc.write().await;
             if assoc.associated {
                 log::error!("Marking PFCP association with {peer} as DOWN");
@@ -1868,8 +1918,6 @@ impl PfcpClient {
         // are alive; releasing them sent every UE in the pool a #39 and orphaned
         // their sessions on the healthy UPFs.
         let scope = self.session_scope();
-        // #1502: this UPF's N6 delay results go with the association.
-        crate::n6_delay::forget_upf(&self.recovery_time_stamp_key());
         // #687: the EPC PDN connections on this PGW-U, which have no SM context. First,
         // so no fan-out deadline can cut them (#941 review M1).
         let epc_released =
@@ -2837,6 +2885,33 @@ pub(crate) mod stand_in {
     /// clients the same way.
     pub(crate) async fn client_with_silent_peer() -> (Arc<PfcpClient>, UdpSocket) {
         client_with_silent_peer_as(&default_identity()).await
+    }
+
+    /// [`client_with_silent_peer`] whose node-level requests (association and
+    /// heartbeat) use T1 `t1` and N1 `n1` (#1502 review M1/M2: an unanswered
+    /// request in milliseconds).
+    pub(crate) async fn client_with_silent_peer_timed(
+        t1: Duration,
+        n1: u32,
+    ) -> (Arc<PfcpClient>, UdpSocket) {
+        let peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_sock.local_addr().unwrap();
+        let local = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let identity = default_identity();
+        let client = Arc::new(
+            PfcpClient::new(Arc::new(local), peer_addr, identity.f_seid_ipv4)
+                .with_node_id(identity.node_id)
+                .with_association_timer_for_test(t1, n1)
+                .with_heartbeat_timer_for_test(t1, n1),
+        );
+        let c = client.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            while let Ok((len, from)) = c.socket.recv_from(&mut buf).await {
+                c.on_datagram(&buf[..len], from).await;
+            }
+        });
+        (client, peer_sock)
     }
 
     /// The N4 identity every stand-in client signals unless a test chooses one.

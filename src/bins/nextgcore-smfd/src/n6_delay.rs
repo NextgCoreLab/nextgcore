@@ -276,7 +276,8 @@ static CONFIG: RwLock<Option<Arc<N6DelayConfig>>> = RwLock::new(None);
 /// The latest result per (UPF key, endpoint).
 static RESULTS: Mutex<BTreeMap<(String, IpAddr), Measured>> = Mutex::new(BTreeMap::new());
 
-/// Failure reports per (UPF key, endpoint) since startup.
+/// Failure reports per (UPF key, endpoint) during the UPF's current association.
+/// Keys are bounded like [`RESULTS`]: configured endpoints of associated UPFs.
 static FAILURES: Mutex<BTreeMap<(String, IpAddr), u64>> = Mutex::new(BTreeMap::new());
 
 /// Serialises the tests that touch [`CONFIG`], [`RESULTS`] or [`FAILURES`]. Taken after
@@ -299,6 +300,21 @@ pub fn set_config(config: Option<N6DelayConfig>) {
         );
     }
     *CONFIG.write().unwrap_or_else(|e| e.into_inner()) = config.map(Arc::new);
+}
+
+/// Reports ignored because they name an endpoint this SMF did not provision, or
+/// arrive with no block configured (#1502 review M3).
+static IGNORED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl N6DelayConfig {
+    /// Every endpoint the instances provision.
+    pub fn endpoints(&self) -> std::collections::BTreeSet<IpAddr> {
+        self.instances
+            .iter()
+            .flat_map(|i| i.measurement_endpoint_addresses.iter())
+            .filter_map(endpoint_ip)
+            .collect()
+    }
 }
 
 fn config() -> Option<Arc<N6DelayConfig>> {
@@ -341,10 +357,12 @@ pub enum Provisioned {
 }
 
 /// Ask a newly associated UPF to measure N6 delay (§5.33.8.2), if configured and the
-/// UPF advertised UN6DM. Called after every successful Association Setup. A failure
-/// is logged and never fails the association: N6 delay measurement is optional, and
-/// the sessions do not depend on it.
-pub async fn provision(client: &PfcpClient) -> Provisioned {
+/// UPF advertised UN6DM. Started in its own task after every successful Association
+/// Setup. A refusal or a timeout is logged and never fails the association: N6 delay
+/// measurement is optional, and the sessions do not depend on it. The request is an
+/// [`PfcpClient::optional_request`], so N1 exhaustion does not mark the association
+/// down (#1502 review M1).
+pub async fn provision(client: Arc<PfcpClient>) -> Provisioned {
     let Some(config) = config() else {
         return Provisioned::NotConfigured;
     };
@@ -362,7 +380,7 @@ pub async fn provision(client: &PfcpClient) -> Provisioned {
     }
     let body = update_request_body(client.node_id(), &config);
     let answer = client
-        .request(pfcp_message_type::ASSOCIATION_UPDATE_REQUEST, None, &body)
+        .optional_request(pfcp_message_type::ASSOCIATION_UPDATE_REQUEST, &body)
         .await;
     match answer {
         Ok((pfcp_message_type::ASSOCIATION_UPDATE_RESPONSE, resp)) => {
@@ -431,11 +449,26 @@ fn endpoint_ip(a: &MeasurementEndpointAddress) -> Option<IpAddr> {
 }
 
 /// Store the N6 Delay Measurement Reports of one Node Report from the UPF `upf_key`.
+///
+/// #1502 review M3: only for an endpoint this SMF provisioned, and nothing at all
+/// without the block. TS 29.244 §6.2.9.3 has the CP function accept the Node Report
+/// and "process the information being reported as appropriate"; §8.2.1 has no cause
+/// for an unrequested report, and every IE in it is well formed, so the message is
+/// still answered "Request accepted". The stray report is ignored and counted
+/// (`smf_n6_delay_reports_ignored_total`), which keeps the store and the `/metrics`
+/// series bounded by the configuration however many endpoints a UPF (or a datagram
+/// from its address) names.
 pub fn on_reports(upf_key: &str, reports: &[N6DelayMeasurementReport]) {
+    let configured = config().map(|c| c.endpoints()).unwrap_or_default();
     for r in reports {
         let Some(ip) = endpoint_ip(&r.measurement_endpoint_address) else {
             continue;
         };
+        if !configured.contains(&ip) {
+            IGNORED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            log::debug!("UPF {upf_key}: N6 delay report for {ip}, not provisioned: ignored");
+            continue;
+        }
         let key = (upf_key.to_string(), ip);
         if let Some(info) = r.information {
             let m = Measured {
@@ -476,49 +509,97 @@ pub fn on_reports(upf_key: &str, reports: &[N6DelayMeasurementReport]) {
     }
 }
 
-/// Forget the results of the UPF `upf_key` (its association is gone).
+/// Forget the results and failure counts of the UPF `upf_key` (its association is
+/// gone, however it went: #1502 review M2).
 pub fn forget_upf(upf_key: &str) {
     RESULTS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|(upf, _), _| upf != upf_key);
+    FAILURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(upf, _), _| upf != upf_key);
+}
+
+/// Whether every member IE header of a grouped IE value fits the value exactly.
+fn members_fit(mut v: &[u8]) -> bool {
+    while !v.is_empty() {
+        if v.len() < 4 {
+            return false;
+        }
+        let l = usize::from(u16::from_be_bytes([v[2], v[3]]));
+        if v.len() < 4 + l {
+            return false;
+        }
+        v = &v[4 + l..];
+    }
+    true
+}
+
+/// The causes [`parse_reports`] answers with (TS 29.244 §8.2.1).
+pub struct ReportCauses {
+    /// 67, §7.6.6: N6DR set and no IE 356.
+    pub conditional_missing: u8,
+    /// 68, §7.6.7: an IE 356, or a member inside it, whose Length field runs past
+    /// what contains it.
+    pub invalid_length: u8,
+    /// 69, §7.6.8: an IE 356 that does not decode (a missing mandatory member, a
+    /// leaf too short for its type, an endpoint with neither V4 nor V6), or with both
+    /// or neither of a measurement and a failure (Table 7.4.5.1.8-1 NOTE).
+    pub incorrect: u8,
 }
 
 /// Decode the N6 Delay Measurement Report IEs (type 356) of a Node Report body.
-/// `Err((cause, 356))` when there is none, or when one does not decode or carries
-/// neither a measurement nor a failure (Table 7.4.5.1.8-1 NOTE: exactly one).
+/// `Err((cause, 356))`, each naming IE 356 as the offending IE: see [`ReportCauses`].
 pub fn parse_reports(
-    ies: &[(u16, &[u8])],
-    conditional_missing: u8,
-    incorrect: u8,
+    body: &[u8],
+    causes: &ReportCauses,
 ) -> Result<Vec<N6DelayMeasurementReport>, (u8, u16)> {
     const IE: u16 = IeType::N6DelayMeasurementReport as u16;
     let mut out = Vec::new();
-    for (t, v) in ies {
-        if *t != IE {
+    let mut rest = body;
+    while rest.len() >= 4 {
+        let t = u16::from_be_bytes([rest[0], rest[1]]);
+        let l = usize::from(u16::from_be_bytes([rest[2], rest[3]]));
+        let Some(v) = rest.get(4..4 + l) else {
+            // §7.6.7: the Length runs past the message; detectable for this, the last
+            // IE. Only an IE 356 is ours to name.
+            if t == IE {
+                return Err((causes.invalid_length, IE));
+            }
+            break;
+        };
+        rest = &rest[4 + l..];
+        if t != IE {
             continue;
         }
-        let r = N6DelayMeasurementReport::decode_value(v).map_err(|_| (incorrect, IE))?;
-        if r.information.is_some() == r.failure_information.is_some() {
-            return Err((incorrect, IE));
+        if !members_fit(v) {
+            return Err((causes.invalid_length, IE));
+        }
+        let r = N6DelayMeasurementReport::decode_value(v).map_err(|_| (causes.incorrect, IE))?;
+        if endpoint_ip(&r.measurement_endpoint_address).is_none()
+            || r.information.is_some() == r.failure_information.is_some()
+        {
+            return Err((causes.incorrect, IE));
         }
         out.push(r);
     }
     if out.is_empty() {
-        return Err((conditional_missing, IE));
+        return Err((causes.conditional_missing, IE));
     }
     Ok(out)
 }
 
 /// Append the N6 delay families to `/metrics`. Nothing at all unless the block is
-/// configured or a UPF reported, so an unconfigured SMF's metrics are unchanged.
+/// configured, so an unconfigured SMF's metrics are unchanged.
 pub fn render(out: &mut String) {
     use std::fmt::Write as _;
-    let results = RESULTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let failures = FAILURES.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    if config().is_none() && results.is_empty() && failures.is_empty() {
+    if config().is_none() {
         return;
     }
+    let results = RESULTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let failures = FAILURES.lock().unwrap_or_else(|e| e.into_inner()).clone();
     nextgcore_metrics::nf::write_header(
         out,
         "smf_n6_delay_ms",
@@ -551,6 +632,13 @@ pub fn render(out: &mut String) {
             "smf_n6_delay_failures_total{{upf=\"{upf}\",endpoint=\"{ip}\"}} {n}"
         );
     }
+    nextgcore_metrics::nf::write_metric(
+        out,
+        "smf_n6_delay_reports_ignored_total",
+        "counter",
+        "N6 delay reports ignored because they name an endpoint this SMF did not provision",
+        IGNORED.load(std::sync::atomic::Ordering::Relaxed),
+    );
 }
 
 /// Test only: clear the configuration and every result.
@@ -559,6 +647,16 @@ pub(crate) fn reset_for_test() {
     set_config(None);
     RESULTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     FAILURES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    IGNORED.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Test only: the number of stored results and failure entries.
+#[cfg(test)]
+pub(crate) fn store_sizes_for_test() -> (usize, usize) {
+    (
+        RESULTS.lock().unwrap_or_else(|e| e.into_inner()).len(),
+        FAILURES.lock().unwrap_or_else(|e| e.into_inner()).len(),
+    )
 }
 
 /// Test only: the stored result for (UPF key, endpoint).

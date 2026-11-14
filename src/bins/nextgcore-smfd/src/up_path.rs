@@ -82,6 +82,7 @@ pub mod cause {
     pub const REQUEST_ACCEPTED: u8 = 1;
     pub const MANDATORY_IE_MISSING: u8 = 66;
     pub const CONDITIONAL_IE_MISSING: u8 = 67;
+    pub const INVALID_LENGTH: u8 = 68;
     pub const MANDATORY_IE_INCORRECT: u8 = 69;
     pub const NO_ESTABLISHED_PFCP_ASSOCIATION: u8 = 72;
 }
@@ -402,9 +403,12 @@ pub fn parse_node_report(body: &[u8]) -> Result<NodeReport, (u8, u16)> {
             Vec::new()
         } else {
             crate::n6_delay::parse_reports(
-                &ies(body),
-                cause::CONDITIONAL_IE_MISSING,
-                cause::MANDATORY_IE_INCORRECT,
+                body,
+                &crate::n6_delay::ReportCauses {
+                    conditional_missing: cause::CONDITIONAL_IE_MISSING,
+                    invalid_length: cause::INVALID_LENGTH,
+                    incorrect: cause::MANDATORY_IE_INCORRECT,
+                },
             )?
         },
     })
