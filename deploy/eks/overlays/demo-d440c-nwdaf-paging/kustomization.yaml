@@ -10,7 +10,9 @@
 #   gnb-b.yaml    gNB B (NCI 0x020, gNB ID 2) and
 #   gnb-c.yaml    gNB C (NCI 0x030, gNB ID 3), same TAC as the base gNB, which
 #                 is gNB A (NCI 0x010, gNB ID 1);
-#   sim-lap.yaml  gNB A's config and the UE's seeded commuter lap.
+#   sim-lap.yaml  gNB A's config and the UE's seeded commuter lap;
+#   ue-log-level.yaml  the UE at RUST_LOG=info, so kubelet does not rotate its
+#                 log away during the route.
 #
 # The configs are nextgsim's config/demo-nwdaf-paging/ (gnb-a/b/c.yaml,
 # ue-lap.yaml) with the compose addresses replaced by Service names and their
@@ -30,3 +32,7 @@ resources:
   - gnb-c.yaml
 patches:
   - path: sim-lap.yaml
+  - path: ue-log-level.yaml
+    target:
+      kind: Deployment
+      name: ue

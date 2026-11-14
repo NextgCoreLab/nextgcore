@@ -212,7 +212,11 @@ wait_for 30 grep_log "${UE_POD}" ue 'Received RRC Release from cell' || die "the
 # --- 4. idle reselection, route end, the producer's answer ---------------------------
 python3 -c "import time; time.sleep(max(0.0, ${END_AT} + 3 - time.time()))"
 grep_log "${UE_POD}" ue 'Cell reselection: id=' || say "no Cell reselection line yet (analyze.py decides)"
-NOW="$(date -u +%FT%TZ)"; LATER="$(date -u -d '+30 seconds' +%FT%TZ)"
+# The window starts 2 s ahead: nwdafd answers a startTs at or before its own
+# clock (RFC 3339 whole seconds here) with an endTs after it as statistics plus
+# prediction, 400 BOTH_STAT_PRED_NOT_ALLOWED (TS 29.520 §4.3.2.2.2; devtest1
+# 20261114T192632Z). A window wholly in the future is a prediction.
+NOW="$(date -u -d '+2 seconds' +%FT%TZ)"; LATER="$(date -u -d '+32 seconds' +%FT%TZ)"
 Q="$(python3 -c '
 import json, sys, urllib.parse as u
 q = lambda v: u.quote(json.dumps(v, separators=(",", ":")), safe="")
