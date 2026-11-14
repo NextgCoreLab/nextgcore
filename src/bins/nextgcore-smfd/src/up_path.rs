@@ -61,6 +61,8 @@ mod node_report_type {
     pub const UPFR: u8 = 0x01;
     pub const UPRR: u8 = 0x02;
     pub const PURR: u8 = 0x10;
+    /// N6 Delay Measurement Report (bit 7, #1502).
+    pub const N6DR: u8 = 0x40;
 }
 
 /// IE types of the Node Report Request (TS 29.244 Table 7.4.5.1.1-1, §8.1.2).
@@ -365,6 +367,8 @@ pub struct NodeReport {
     /// Peer GTP-U entities that restarted (TS 23.007 §20.3.4A); the UP function has
     /// already set the FARs toward them to BUFF and NOCP.
     pub restarted: Vec<IpAddr>,
+    /// N6 Delay Measurement Reports (TS 29.244 §5.33.8.3, #1502).
+    pub n6: Vec<nextgcore_pfcp::qos_monitoring::N6DelayMeasurementReport>,
 }
 
 /// Decode a Node Report Request body (TS 29.244 §7.4.5.1). `Err((cause, offending
@@ -392,6 +396,17 @@ pub fn parse_node_report(body: &[u8]) -> Result<NodeReport, (u8, u16)> {
         failed: peers(ie::USER_PLANE_PATH_FAILURE_REPORT, node_report_type::UPFR)?,
         recovered: peers(ie::USER_PLANE_PATH_RECOVERY_REPORT, node_report_type::UPRR)?,
         restarted: peers(ie::PEER_UP_RESTART_REPORT, node_report_type::PURR)?,
+        // #1502, Table 7.4.5.1.1-1: the N6 Delay Measurement Report IEs are
+        // conditional on N6DR, one per endpoint.
+        n6: if report_type & node_report_type::N6DR == 0 {
+            Vec::new()
+        } else {
+            crate::n6_delay::parse_reports(
+                &ies(body),
+                cause::CONDITIONAL_IE_MISSING,
+                cause::MANDATORY_IE_INCORRECT,
+            )?
+        },
     })
 }
 
@@ -551,6 +566,9 @@ const PATH_FANOUT: usize = 16;
 /// Called on the N4 receive task after the response went out: the state changes
 /// here are synchronous, the per-session work runs in tracked tasks.
 pub fn on_node_report(upf_key: &str, scope: SessionScope, report: NodeReport) {
+    if !report.n6.is_empty() {
+        crate::n6_delay::on_reports(upf_key, &report.n6);
+    }
     let hold = hold_duration();
     let mut newly_failed = Vec::new();
     let mut durable_changed = false;
@@ -997,8 +1015,7 @@ mod tests {
             SessionScope::default(),
             NodeReport {
                 failed: vec![ip],
-                recovered: Vec::new(),
-                restarted: Vec::new(),
+                ..Default::default()
             },
         );
         crate::set_shutting_down_for_test(false);
@@ -1015,9 +1032,8 @@ mod tests {
             upf_key,
             SessionScope::default(),
             NodeReport {
-                failed: Vec::new(),
                 recovered: vec![ip],
-                restarted: Vec::new(),
+                ..Default::default()
             },
         );
 

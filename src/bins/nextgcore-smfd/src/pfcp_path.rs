@@ -1097,7 +1097,11 @@ pub async fn run_association_loop<S: Fn() -> bool>(
 /// forever and rejected every PDU session with #26.
 pub async fn try_associate(client: &PfcpClient) -> Result<(), PfcpRequestError> {
     client.reresolve_peer().await;
-    client.associate().await
+    client.associate().await?;
+    // #1502: every (re)association re-provisions N6 delay measurement, before this
+    // client's loop turn ends; never fails the association.
+    crate::n6_delay::provision(client).await;
+    Ok(())
 }
 
 impl PfcpClient {
@@ -1864,6 +1868,8 @@ impl PfcpClient {
         // are alive; releasing them sent every UE in the pool a #39 and orphaned
         // their sessions on the healthy UPFs.
         let scope = self.session_scope();
+        // #1502: this UPF's N6 delay results go with the association.
+        crate::n6_delay::forget_upf(&self.recovery_time_stamp_key());
         // #687: the EPC PDN connections on this PGW-U, which have no SM context. First,
         // so no fan-out deadline can cut them (#941 review M1).
         let epc_released =
