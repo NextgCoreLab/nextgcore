@@ -34,7 +34,7 @@
 #   OUT_ROOT           artefact root (default /tmp/eks-val/demos)
 #   ENABLE_DATAPLANE   default true (the e2e needs the data-plane UPF)
 #   EPHEMERAL_STORAGE  default true (devtest1 has no EBS CSI StorageClass)
-#   CORE_IMAGE_TAG / SIM_IMAGE_TAG / IMAGE_TAG   passed to deploy-eks.sh
+#   CORE_IMAGE_TAG / SIM_IMAGE_TAG / UE_IMAGE_TAG / IMAGE_TAG   passed to deploy-eks.sh
 #   DEMO_VARIANT       optional [a-z0-9-]+: a scenario arm that is not a mode
 #                      (for example a fault injected by the scenario). Passed to
 #                      scenario.sh, recorded in verdict.txt, and the artefacts go
@@ -42,7 +42,8 @@
 #   SIM_SHA            the nextgsim commit the gnb/ue images were built from,
 #                      recorded as sim= in verdict.txt (default: unrecorded).
 #                      The images' own references are recorded as core_image=
-#                      and sim_image=, read from the deployed pods.
+#                      and sim_image= (the gnb), plus ue_image= when it differs,
+#                      read from the deployed pods.
 #
 # Private by default: nothing here publishes a port or opens a port-forward.
 # Metrics are read with `kubectl exec` inside each pod; the artefacts hold no
@@ -244,6 +245,9 @@ image_of() { awk -F'\t' -v d="$1" 'index($1, d "-") == 1 { split($2, i, " "); pr
   # so the deployed image references are the record, plus SIM_SHA if passed.
   echo "core=$(git -C "${CORE_DIR}" rev-parse --short=12 HEAD) sim=${SIM_SHA:-unrecorded}"
   echo "core_image=$(image_of amf) sim_image=$(image_of gnb)"
+  ue_image="$(image_of ue)"
+  [[ -z "${ue_image}" || "${ue_image}" == "$(image_of gnb | sed 's#/gnb:#/ue:#')" ]] \
+    || echo "ue_image=${ue_image}"
   echo "deploy=${DEPLOY_OK} e2e_rc=${E2E_RC} scenario_rc=${SCEN_RC} scrapes=${scrapes}"
   echo "demo_banner_lines=${banner_hits} demo_prefix_lines=${prefix_hits} nextg_demo_enabled_series=${metric_hits}"
   if [[ ${#FAILS[@]} -eq 0 ]]; then echo "VERDICT: PASS"; else printf 'FAIL: %s\n' "${FAILS[@]}"; echo "VERDICT: FAIL"; fi
