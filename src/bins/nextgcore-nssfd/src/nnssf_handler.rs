@@ -321,9 +321,21 @@ pub struct RegistrationSelection {
 
 /// Authorize the registration-scenario NSSAIs (TS 29.531 §5.2.3.2.3).
 ///
-/// - allowed = requested NSSAIs restricted to the subscription and to the
-///   S-NSSAIs available in the UE's TA; when the AMF sends no requestedNssai
-///   the default subscribed S-NSSAIs are used.
+/// - allowed = requested NSSAIs restricted to the subscribed S-NSSAIs the AMF
+///   supplied and to the S-NSSAIs available in the UE's TA
+///   (TS 23.501 §5.15.5.2.1 (B)). A requested S-NSSAI counts as subscribed under
+///   either its own value or the HPLMN value the consumer's `mappingOfNssai`
+///   gives for it, because `subscribedNssai` carries the subscribed HPLMN NSSAI
+///   in the inbound-roaming case and serving-PLMN values otherwise
+///   (TS 29.531 Table 6.1.6.2.10-1).
+/// - the default-marked subscribed S-NSSAIs are considered both when no
+///   requestedNssai was sent and when none of the requested ones is permitted or
+///   available in the TA — the two cases the same clause names. Only an explicit
+///   `defaultIndication` marks one (TS 23.501 §5.15.3: the subscription "shall
+///   include at least one default S-NSSAI").
+/// - an empty `info.subscribed` permits nothing: every requested S-NSSAI is then
+///   rejected in the PLMN and `sel.allowed` comes back empty, which the HTTP
+///   layer answers 403 SNSSAI_NOT_SUPPORTED (TS 29.531 §5.2.2.2.2 step 2b).
 /// - configured = subscribed S-NSSAIs applicable in the serving PLMN, i.e.
 ///   restricted by the CONFIGURED PLMN S-NSSAI set when one exists (#346), never
 ///   by what individual AMFs happen to have reported as available.
@@ -341,51 +353,113 @@ pub fn nssf_nsselection_handle_registration(
 
     let subscribed: Vec<SNssai> = info.subscribed.iter().map(|(s, _)| s.clone()).collect();
 
-    // Candidate set: requested NSSAIs, or the default subscribed ones when
-    // the UE/AMF did not request anything specific.
-    let candidates: Vec<SNssai> = if !info.requested.is_empty() {
-        info.requested.clone()
-    } else {
-        let defaults: Vec<SNssai> = info
-            .subscribed
-            .iter()
-            .filter(|(_, def)| *def)
-            .map(|(s, _)| s.clone())
-            .collect();
-        if defaults.is_empty() {
-            subscribed.clone()
-        } else {
-            defaults
-        }
-    };
-
-    // Subscription check (only meaningful when the AMF supplied the
-    // subscription; otherwise authorize against availability only).
-    let mut allowed: Vec<SNssai> = Vec::new();
-    for c in &candidates {
-        if subscribed.is_empty() || subscribed.contains(c) {
-            if !allowed.contains(c) {
-                allowed.push(c.clone());
-            }
-        } else if !sel.rejected_in_plmn.contains(c) {
-            sel.rejected_in_plmn.push(c.clone());
-        }
-    }
-
-    // TA availability check (TS 29.531: rejectedNssaiInTa)
-    if let Some(ref supported) = snapshot.supported_for_tai {
-        let (in_ta, out_of_ta): (Vec<SNssai>, Vec<SNssai>) =
-            allowed.into_iter().partition(|s| supported.contains(s));
-        allowed = in_ta;
-        sel.rejected_in_ta = out_of_ta;
-    }
-
     let mapped = |s: &SNssai| -> Option<SNssai> {
         info.mapping_of_nssai
             .iter()
             .find(|(serving, _)| serving == s)
             .map(|(_, home)| home.clone())
     };
+
+    // Subscription check (TS 23.501 §5.15.5.2.1 (B)): "verifies which S-NSSAI(s)
+    // in the Requested NSSAI are permitted based on comparing the Subscribed
+    // S-NSSAIs WITH THE S-NSSAIs IN THE MAPPING OF REQUESTED NSSAI TO HPLMN
+    // S-NSSAIs".
+    //
+    // The mapping half matters for inbound roaming, where `subscribedNssai`
+    // carries HPLMN values (TS 29.531 Table 6.1.6.2.10-1) while `requestedNssai`
+    // carries serving-PLMN ones: comparing the raw serving value against an HPLMN
+    // subscription rejects every slice a roamer asks for.
+    //
+    // Either spelling of the same slice is accepted: the value as requested, or
+    // the HPLMN value the consumer's own `mappingOfNssai` gives for it. The
+    // clause states the disjunction itself, in (A) and (B) alike: the Allowed
+    // NSSAI is determined from "the list of S-NSSAI(s) in the Requested NSSAI
+    // permitted based on the Subscribed S-NSSAIs AND/OR the list of S-NSSAI(s)
+    // for the Serving PLMN which are mapped to the HPLMN S-NSSAI(s) provided in
+    // the mapping of Requested NSSAI permitted based on the Subscribed S-NSSAIs".
+    // And a mapping being present does not say which spelling the subscription
+    // uses: `mappingOfNssai` may also be present during EPS-to-5GS and intra-5GS
+    // handover, where `subscribedNssai` may carry serving-PLMN values.
+    //
+    // The one widening this admits, stated so it is not mistaken for an
+    // oversight: when the subscription is in HPLMN values, a requested
+    // serving-PLMN S-NSSAI that HAPPENS TO EQUAL a subscribed HPLMN value is
+    // permitted on that coincidence, even if the request's own `mappingOfNssai`
+    // maps it to a home value that is not subscribed. It is bounded by the
+    // request itself -- the consumer supplies both the mapping and the
+    // subscription, so the result never reaches past the subscription it was
+    // checked against -- and nothing in the request tells the NSSF which spelling
+    // `subscribedNssai` uses, so neither reading can be refused on the request's
+    // own evidence.
+    let is_subscribed = |s: &SNssai| -> bool {
+        subscribed.contains(s) || mapped(s).is_some_and(|home| subscribed.contains(&home))
+    };
+
+    // The default-marked Subscribed S-NSSAIs. Only an explicit
+    // `defaultIndication: true` marks one. TS 23.501 §5.15.3: "The subscription
+    // information shall include at least one default S-NSSAI" (and again for
+    // what the UDM sends the AMF). A `subscribedNssai` with no default marked is
+    // therefore not a conformant subscription, and reading the gap as "every
+    // subscribed S-NSSAI is a default" would hand a consumer that never sends
+    // `defaultIndication` the whole subscription as its default set.
+    let default_marked: Vec<SNssai> = info
+        .subscribed
+        .iter()
+        .filter(|(_, def)| *def)
+        .map(|(s, _)| s.clone())
+        .collect();
+
+    // One pass of the two authorization filters over a candidate set:
+    // (allowed, rejected in the PLMN = not subscribed, rejected in the TA).
+    let permit = |candidates: &[SNssai]| -> (Vec<SNssai>, Vec<SNssai>, Vec<SNssai>) {
+        let mut allowed: Vec<SNssai> = Vec::new();
+        let mut rejected_in_plmn: Vec<SNssai> = Vec::new();
+        for c in candidates {
+            if is_subscribed(c) {
+                if !allowed.contains(c) {
+                    allowed.push(c.clone());
+                }
+            } else if !rejected_in_plmn.contains(c) {
+                rejected_in_plmn.push(c.clone());
+            }
+        }
+        // TA availability check (TS 29.531: rejectedNssaiInTa)
+        let mut rejected_in_ta: Vec<SNssai> = Vec::new();
+        if let Some(ref supported) = snapshot.supported_for_tai {
+            let (in_ta, out_of_ta): (Vec<SNssai>, Vec<SNssai>) =
+                allowed.into_iter().partition(|s| supported.contains(s));
+            allowed = in_ta;
+            rejected_in_ta = out_of_ta;
+        }
+        (allowed, rejected_in_plmn, rejected_in_ta)
+    };
+
+    // Candidate set: the Requested NSSAI, or the default-marked Subscribed
+    // S-NSSAIs when the consumer requested nothing.
+    let requested_something = !info.requested.is_empty();
+    let candidates: Vec<SNssai> = if requested_something {
+        info.requested.clone()
+    } else {
+        default_marked.clone()
+    };
+
+    let (mut allowed, rejected_in_plmn, rejected_in_ta) = permit(&candidates);
+    sel.rejected_in_plmn = rejected_in_plmn;
+    sel.rejected_in_ta = rejected_in_ta;
+
+    // The rest of the same sentence of §5.15.5.2.1 (B): the default-marked
+    // S-NSSAIs are considered "in the case that no Requested NSSAI was provided
+    // OR NO S-NSSAI FROM THE REQUESTED NSSAI ARE PERMITTED i.e. are not present
+    // in the Subscribed S-NSSAIs or not available e.g. at the current UE's
+    // Tracking Area". Only the first case was implemented, so a Requested NSSAI
+    // that was wholly unsubscribed or wholly unavailable here produced a response
+    // with no Allowed NSSAI at all -- which §5.2.2.2.2 step 2a does not allow a
+    // 200 to be. The requested S-NSSAIs stay in the rejected lists either way:
+    // the consumer asked about those, and the fallback does not un-reject them.
+    if allowed.is_empty() && requested_something && !default_marked.is_empty() {
+        let (fallback, _, _) = permit(&default_marked);
+        allowed = fallback;
+    }
 
     // Attach NSI information where an NSI is configured for the slice
     for s in &allowed {
@@ -412,12 +486,7 @@ pub fn nssf_nsselection_handle_registration(
     // (TS 24.501 Annex C.1), so that consequence outlives the report that caused
     // it. It is also what made a passing nssfd suite order-dependent: a sibling
     // test's availability document decided this member.
-    let configured_src: Vec<SNssai> = if subscribed.is_empty() {
-        allowed.clone()
-    } else {
-        subscribed.clone()
-    };
-    for s in &configured_src {
+    for s in &subscribed {
         let applicable_in_plmn = match &snapshot.plmn_snssai_restriction {
             Some(configured) => configured.contains(s),
             None => true,
@@ -532,54 +601,6 @@ pub fn query_nrf_slice_availability(
         nrf_id: nrf_uri.to_string(),
         available: nf_count > 0,
     }
-}
-
-/// Validate a requested S-NSSAI against subscription data and NRF availability (TS 29.531)
-///
-/// Returns true if the UE is subscribed to the slice AND the network can serve it.
-pub fn validate_slice_selection(s_nssai: &SNssai, supi: Option<&str>, nrf_uri: &str) -> bool {
-    // Step 1: Check subscription if SUPI available
-    if let Some(supi) = supi {
-        match nextgcore_dbi::nextgcore_dbi_subscription_data(supi) {
-            Ok(sub_data) => {
-                let subscribed = sub_data.slice.iter().any(|s| {
-                    s.s_nssai.sst == s_nssai.sst && {
-                        let sd_val = s.s_nssai.sd.v;
-                        if sd_val == 0xFFFFFF {
-                            s_nssai.sd.is_none()
-                        } else {
-                            s_nssai.sd == Some(sd_val)
-                        }
-                    }
-                });
-                if !subscribed {
-                    log::info!(
-                        "[{}] S-NSSAI[SST:{} SD:{:?}] not in subscription",
-                        supi,
-                        s_nssai.sst,
-                        s_nssai.sd
-                    );
-                    return false;
-                }
-            }
-            Err(e) => {
-                log::debug!("Subscription check skipped for {supi}: {e}");
-            }
-        }
-    }
-
-    // Step 2: Check NRF availability
-    let availability = query_nrf_slice_availability(nrf_uri, s_nssai, "SMF");
-    if !availability.available {
-        log::warn!(
-            "S-NSSAI[SST:{} SD:{:?}] has no available NF instances in NRF",
-            s_nssai.sst,
-            s_nssai.sd
-        );
-        return false;
-    }
-
-    true
 }
 
 #[cfg(test)]
@@ -755,6 +776,124 @@ mod tests {
         // configured = full subscription (no availability data)
         assert_eq!(sel.configured.len(), 2);
         assert!(sel.candidate_amf_list.is_empty());
+    }
+
+    /// Inbound roaming: `subscribedNssai` carries HPLMN values and
+    /// `requestedNssai` serving-PLMN ones, so the comparison runs through the
+    /// `mappingOfNssai` the consumer supplied (TS 23.501 §5.15.5.2.1 (B),
+    /// TS 29.531 Table 6.1.6.2.10-1). Without it every roamer's slice is
+    /// rejected in the PLMN.
+    #[test]
+    fn a_requested_snssai_is_compared_through_its_mapping_to_the_hplmn() {
+        let home = SNssai::new(1, Some(0x0a0a0a));
+        let serving = SNssai::new(2, None);
+        let info = RegistrationSliceInfo {
+            subscribed: vec![(home.clone(), true)],
+            requested: vec![serving.clone()],
+            mapping_of_nssai: vec![(serving.clone(), home.clone())],
+            ..Default::default()
+        };
+        let sel = nssf_nsselection_handle_registration(
+            "amf-roam",
+            &info,
+            &RegistrationContextSnapshot::default(),
+        );
+        assert_eq!(sel.allowed.len(), 1, "{:?}", sel.allowed);
+        // The Allowed NSSAI carries the SERVING value, with the HPLMN one mapped.
+        assert_eq!(sel.allowed[0].0, serving);
+        assert_eq!(sel.allowed[0].2, Some(home));
+        assert!(
+            sel.rejected_in_plmn.is_empty(),
+            "a mapped-and-subscribed S-NSSAI must not be rejected: {:?}",
+            sel.rejected_in_plmn
+        );
+
+        // An unmapped request is compared raw, and an S-NSSAI the subscription
+        // does not carry under EITHER spelling is rejected. No default-marked
+        // entry here, so the fallback has nothing to offer.
+        let info = RegistrationSliceInfo {
+            subscribed: vec![(SNssai::new(1, Some(0x0a0a0a)), false)],
+            requested: vec![SNssai::new(5, None)],
+            ..Default::default()
+        };
+        let sel = nssf_nsselection_handle_registration(
+            "amf-roam-2",
+            &info,
+            &RegistrationContextSnapshot::default(),
+        );
+        assert!(sel.allowed.is_empty());
+        assert_eq!(sel.rejected_in_plmn, vec![SNssai::new(5, None)]);
+    }
+
+    /// "It considers the S-NSSAI(s) marked as default in the Subscribed
+    /// S-NSSAIs in the case that no Requested NSSAI was provided or no S-NSSAI
+    /// from the Requested NSSAI are permitted" (TS 23.501 §5.15.5.2.1 (B)) --
+    /// the second case too, whether the requested set was unsubscribed or
+    /// unavailable in the TA. The requested S-NSSAIs stay rejected.
+    #[test]
+    fn default_marked_subscribed_snssais_are_considered_when_nothing_requested_is_permitted() {
+        // Unavailable in the TA: sst 3 is subscribed but not available here.
+        let info = reg_info(vec![(1, true), (3, false)], vec![3]);
+        let snap = RegistrationContextSnapshot {
+            supported_for_tai: Some(vec![SNssai::new(1, None)]),
+            ..Default::default()
+        };
+        let sel = nssf_nsselection_handle_registration("amf-f1", &info, &snap);
+        assert_eq!(sel.allowed.len(), 1, "{:?}", sel.allowed);
+        assert_eq!(sel.allowed[0].0, SNssai::new(1, None));
+        assert_eq!(sel.rejected_in_ta, vec![SNssai::new(3, None)]);
+
+        // Not subscribed at all: sst 9.
+        let info = reg_info(vec![(1, true), (2, false)], vec![9]);
+        let sel = nssf_nsselection_handle_registration(
+            "amf-f2",
+            &info,
+            &RegistrationContextSnapshot::default(),
+        );
+        assert_eq!(sel.allowed.len(), 1, "{:?}", sel.allowed);
+        assert_eq!(sel.allowed[0].0, SNssai::new(1, None));
+        assert_eq!(sel.rejected_in_plmn, vec![SNssai::new(9, None)]);
+
+        // No default-marked entry: nothing to fall back to, so nothing is
+        // allowed -- `defaultIndication` is optional and its absence is not a
+        // claim that every subscribed S-NSSAI is a default.
+        let info = reg_info(vec![(1, false), (2, false)], vec![9]);
+        let sel = nssf_nsselection_handle_registration(
+            "amf-f3",
+            &info,
+            &RegistrationContextSnapshot::default(),
+        );
+        assert!(sel.allowed.is_empty(), "{:?}", sel.allowed);
+        // And with no requestedNssai either: still nothing, not the whole
+        // subscription.
+        let info = reg_info(vec![(1, false), (2, false)], vec![]);
+        let sel = nssf_nsselection_handle_registration(
+            "amf-f4",
+            &info,
+            &RegistrationContextSnapshot::default(),
+        );
+        assert!(sel.allowed.is_empty(), "{:?}", sel.allowed);
+        // The Configured NSSAI is unaffected: it comes from the subscription.
+        assert_eq!(sel.configured.len(), 2);
+    }
+
+    /// With no Subscribed S-NSSAI nothing is permitted: every requested
+    /// S-NSSAI is rejected in the PLMN and none is allowed or configured. The
+    /// HTTP layer turns this into 403 SNSSAI_NOT_SUPPORTED (§5.2.2.2.2 step 2b).
+    #[test]
+    fn selection_with_no_subscribed_snssai_permits_no_requested_snssai() {
+        let info = reg_info(vec![], vec![1, 2]);
+        let sel = nssf_nsselection_handle_registration(
+            "amf-1",
+            &info,
+            &RegistrationContextSnapshot::default(),
+        );
+        assert!(sel.allowed.is_empty(), "{:?}", sel.allowed);
+        assert!(sel.configured.is_empty(), "{:?}", sel.configured);
+        assert_eq!(
+            sel.rejected_in_plmn,
+            vec![SNssai::new(1, None), SNssai::new(2, None)]
+        );
     }
 
     #[test]
