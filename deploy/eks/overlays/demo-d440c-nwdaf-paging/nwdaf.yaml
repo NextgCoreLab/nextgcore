@@ -68,7 +68,7 @@ spec:
       initContainers:
         - name: wait-nrf
           image: busybox:1.36
-          command: ['sh', '-c', 'until nc -z nrf.nextg-system.svc.cluster.local 7777; do echo waiting for nrf; sleep 2; done']
+          command: ['sh', '-c', 'until nc -z -w 2 nrf.nextg-system.svc.cluster.local 7777; do echo waiting for nrf; sleep 2; done']
       containers:
         - name: nwdaf
           image: nextgcore-rust/nwdaf:latest
