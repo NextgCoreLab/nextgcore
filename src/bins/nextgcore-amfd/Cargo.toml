@@ -92,6 +92,8 @@ nextgcore-asn1c = { workspace = true }
 proptest.workspace = true
 p256 = { workspace = true, features = ["ecdsa"] }
 base64.workspace = true
+# #1504: tests/nwdaf_discovery.rs reads `ana-req` DateTimes as nwdafd does.
+chrono = "0.4"
 
 [lints]
 workspace = true

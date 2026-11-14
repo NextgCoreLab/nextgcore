@@ -24458,6 +24458,11 @@ mod tests {
                     if delay_only_for.is_none_or(|supi| tgt_ue.contains(supi)) {
                         tokio::time::sleep(delay).await;
                     }
+                    // #1504: nwdafd's rule, TS 29.520 §4.3.2.2.2: a period that
+                    // starts in the past and ends in the future is refused.
+                    if straddles_now(&param("ana-req")) {
+                        return SResp::with_status(400);
+                    }
                     match body {
                         Some(b) => SResp::with_status(200)
                             .with_json_body(&b)
@@ -24468,6 +24473,23 @@ mod tests {
             })
             .await;
         (server, addr.port(), seen)
+    }
+
+    /// Whether `ana-req` asks for a period from the stand-in's past into its
+    /// future (TS 29.520 §4.3.2.2.2, `400 BOTH_STAT_PRED_NOT_ALLOWED`). An absent
+    /// `startTs` is the present time, as nwdafd's `parse_analytics_target_period`
+    /// reads it.
+    fn straddles_now(ana_req: &str) -> bool {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(ana_req) else {
+            return false;
+        };
+        let at = |k: &str| {
+            v.get(k)
+                .and_then(|t| t.as_str())
+                .and_then(crate::namf_server::rfc3339_to_system_time)
+        };
+        let now = std::time::SystemTime::now();
+        matches!((at("startTs"), at("endTs")), (Some(s), Some(e)) if s < now && e > now)
     }
 
     /// nwdafd's prediction body (`amf_mobility::ue_mobility_infos`) naming `nci`.
@@ -24587,8 +24609,8 @@ mod tests {
             "{uris:?}"
         );
         assert!(
-            uris[0].contains(r#"ana-req={"startTs":"#) && uris[0].contains(r#""endTs":"#),
-            "a future window, so a prediction: {uris:?}"
+            uris[0].contains(r#"ana-req={"endTs":"#),
+            "a period from the present time, so a prediction (#1504: no startTs): {uris:?}"
         );
         assert!(
             crate::nwdaf_mobility::outcome_count(crate::nwdaf_mobility::HintOutcome::Predicted)
@@ -24774,8 +24796,13 @@ mod tests {
             ("refused", down.port(), Some(1)),
             ("outside the area", outside_port, None),
         ];
+        use crate::nwdaf_mobility::{outcome_count, HintOutcome};
         for (i, (arm, port, last_gnb)) in arms.into_iter().enumerate() {
             let _ep = NwdafEndpointOverride::set(port);
+            let (no_prediction, error) = (
+                outcome_count(HintOutcome::NoPrediction),
+                outcome_count(HintOutcome::Error),
+            );
             let ue = 464_021u64 + i as u64;
             insert_nwdaf_ue(
                 &ngap,
@@ -24786,6 +24813,19 @@ mod tests {
             );
             queue_paging(&ngap, ue);
             assert!(nwdaf_answer_applied(ue).await, "{arm}: released");
+            // #1504: the D440C revert arm's 204 is `no_prediction`, a refused
+            // connection is `error`.
+            match arm {
+                "204" => assert!(
+                    outcome_count(HintOutcome::NoPrediction) > no_prediction,
+                    "{arm}: counted as no_prediction"
+                ),
+                "refused" => assert!(
+                    outcome_count(HintOutcome::Error) > error,
+                    "{arm}: counted as error"
+                ),
+                _ => {}
+            }
             take_sent_ngap(&mut ngap);
             ngap.process_paging_with(Duration::from_secs(3600)).await;
             assert_eq!(

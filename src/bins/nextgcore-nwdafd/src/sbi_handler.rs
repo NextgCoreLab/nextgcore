@@ -2380,6 +2380,43 @@ mod tests {
             .is_none());
     }
 
+    /// #1504: the query amfd's `paging.strategy: nwdaf-mobility` sends
+    /// (`nwdaf_mobility::request_path`, the production builder) is a prediction
+    /// this NWDAF accepts. amfd builds it at its own sub-second "now", which is
+    /// already past when the request arrives; its period must still not start in
+    /// this NWDAF's past and end in its future (TS 29.520 §4.3.2.2.2,
+    /// `29520-k00.txt:5889-5893`, `400 BOTH_STAT_PRED_NOT_ALLOWED`).
+    #[tokio::test]
+    async fn amfds_ue_mobility_query_is_a_prediction_not_both_stat_and_pred() {
+        let built_at = std::time::SystemTime::now() - std::time::Duration::from_millis(500);
+        let req = SbiRequest::get(nextgcore_amfd::nwdaf_mobility::request_path(
+            "imsi-999700000001504",
+            built_at,
+        ));
+        let params = request_query_params(&req);
+        let now = chrono::Utc::now();
+        let period = parse_analytics_target_period(params.get("ana-req"), now)
+            .expect("not 400 BOTH_STAT_PRED_NOT_ALLOWED")
+            .expect("a target period");
+        assert!(!period.is_statistics(now), "a prediction: {period:?}");
+        assert!(
+            period.start >= now,
+            "it starts at the present time: {period:?}"
+        );
+
+        // Through the real handler: a default build serves no UE_MOBILITY, so the
+        // answer is 204, never the 400 a straddling period draws.
+        let mut ctx = NwdafContext::new("nwdaf-1504-window".to_string());
+        ctx.init(8);
+        let ctx = Arc::new(RwLock::new(ctx));
+        let resp = handle_analytics_info_query_with_ctx(&ctx, &req).await;
+        assert_eq!(
+            resp.status, 204,
+            "the window is accepted: {:?}",
+            resp.http.content
+        );
+    }
+
     /// `tgt-ue` is a JSON `TargetUeInformation` per the yaml, so a bare
     /// identifier string, or an object that identifies no target, fails closed.
     #[tokio::test]
