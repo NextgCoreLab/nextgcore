@@ -16,7 +16,7 @@ static SELECTION_REFUSALS: CounterFamily = CounterFamily::new(
     "nssf_selection_refusals_total",
     "Nnssf_NSSelection_Get requests refused, by reason: every 403 \
      SNSSAI_NOT_SUPPORTED (TS 29.531 step 2b of each scenario) and every 400 for a \
-     missing or incorrect subscribedNssai, sNssaiForMapping or supi. Generic \
+     missing or incorrect subscribedNssai, requestedNssai, sNssaiForMapping or supi. Generic \
      request errors are counted only in nssf_selections_total",
     &["reason"],
 );
