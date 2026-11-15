@@ -332,6 +332,22 @@ static HELD: Mutex<Option<(String, String)>> = Mutex::new(None);
 /// Set once shutdown starts: the subscriber creates nothing after it.
 static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Wakes the subscriber out of a backoff or check-interval sleep at shutdown.
+static WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// The running subscriber task, so shutdown can wait for an in-flight
+/// Subscribe to settle (#1523 re-review r3) instead of dropping it with the
+/// runtime.
+static SUBSCRIBER: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
+
+/// Sleep `d`, or less if shutdown wakes the subscriber.
+async fn nap(d: Duration) {
+    tokio::select! {
+        _ = tokio::time::sleep(d) => {}
+        _ = WAKE.notified() => {}
+    }
+}
+
 /// Subscribe failures, by reason. `refused` (401/403) is the stuck state of an
 /// SMF that enforces OAuth2: this EES sends no access token (nextgcore#1529).
 pub static SUBSCRIBE_FAILURES: nextgcore_metrics::nf::CounterFamily =
@@ -376,6 +392,9 @@ pub(crate) fn clear_for_test() {
     SUBSCRIBED.store(false, std::sync::atomic::Ordering::SeqCst);
     SHUTTING_DOWN.store(false, std::sync::atomic::Ordering::SeqCst);
     *HELD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    if let Some(h) = SUBSCRIBER.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        h.abort();
+    }
 }
 
 /// Test only: the subscription held at the SMF.
@@ -947,7 +966,7 @@ pub async fn run_subscriber(
                                  ({why}); retrying in {backoff:?}"
                             );
                         }
-                        tokio::time::sleep(backoff).await;
+                        nap(backoff).await;
                         backoff = (backoff * 2).min(Duration::from_secs(30));
                         continue;
                     }
@@ -980,7 +999,7 @@ pub async fn run_subscriber(
                 }
             }
         }
-        tokio::time::sleep(interval).await;
+        nap(interval).await;
     }
 }
 
@@ -989,9 +1008,41 @@ pub async fn run_subscriber(
 /// one afterwards. A crash (SIGKILL) leaves the subscription at the SMF: smfd
 /// implements no `expiry` (TS 29.508 `NsmfEventExposure.expiry`), so it stays
 /// until smfd restarts. Returns the DELETE's status, if one was sent.
+///
+/// Then it waits, within the same `timeout`, for the subscriber started by
+/// [`start_subscriber`] to finish: a Subscribe still in flight either fails, or
+/// its 201 is DELETEd by the subscriber itself. Past the bound the task is
+/// aborted (one subscription may then be left, as with a crash).
 pub async fn release_subscription(timeout: Duration) -> Option<u16> {
+    let deadline = tokio::time::Instant::now() + timeout;
     SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
-    delete_held(timeout).await
+    WAKE.notify_one();
+    let status = delete_held(timeout).await;
+    let handle = SUBSCRIBER.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(mut h) = handle {
+        if tokio::time::timeout_at(deadline, &mut h).await.is_err() {
+            nextgcore_demo::demo_log!(
+                warn,
+                DEMO_KEY,
+                "QOS_MON subscriber did not settle within {timeout:?} of shutdown: aborted \
+                 (a Subscribe still in flight may leave one subscription at the SMF)"
+            );
+            h.abort();
+        }
+    }
+    status
+}
+
+/// Spawn [`run_subscriber`] and keep its handle for [`release_subscription`].
+pub fn start_subscriber(smf_uri: String, notif_uri: String, rep_period_s: u32, interval: Duration) {
+    let h = tokio::spawn(run_subscriber(smf_uri, notif_uri, rep_period_s, interval));
+    if let Some(old) = SUBSCRIBER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(h)
+    {
+        old.abort();
+    }
 }
 
 /// DELETE the held subscription, if any (whoever takes `HELD` first sends it).
@@ -1054,12 +1105,7 @@ pub fn spawn_subscriber(tls: bool, host: &str, port: u16) {
         return;
     };
     let uri = notif_uri(tls, host, port, &plan.token);
-    tokio::spawn(run_subscriber(
-        smf_uri,
-        uri,
-        plan.config.rep_period_s,
-        CHECK_INTERVAL,
-    ));
+    start_subscriber(smf_uri, uri, plan.config.rep_period_s, CHECK_INTERVAL);
 }
 
 // ============================================================================

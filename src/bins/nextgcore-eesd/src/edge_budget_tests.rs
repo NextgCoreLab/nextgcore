@@ -700,3 +700,97 @@ fn a_subscription_gone_at_the_smf_is_no_longer_held_471() {
     });
     clear_for_test();
 }
+
+/// #1523 re-review r3, the shutdown path main takes: SIGTERM while the Subscribe
+/// to a slow SMF is in flight. `release_subscription` waits (within its bound)
+/// for the subscriber started by `start_subscriber`, so by the time it returns
+/// the late 201 has been DELETEd: nothing is left for a dropped runtime to cancel.
+/// (main itself is not driven: it needs a process and a signal; it calls exactly
+/// this before stopping the SBI server.)
+#[test]
+fn shutdown_waits_for_an_in_flight_subscribe_471() {
+    let _l = lock_for_test();
+    clear_for_test();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (server, port, log) = stand_in_smf_with(201, Duration::from_millis(400), 200).await;
+        start_subscriber(
+            format!("http://127.0.0.1:{port}"),
+            "http://127.0.0.1:1/d443a-edge-budget/qos-mon/t".into(),
+            2,
+            Duration::from_secs(30),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !log.lock().unwrap().iter().any(|(m, _)| m == "POST") && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let started = Instant::now();
+        release_subscription(Duration::from_secs(2)).await;
+        // Checked as soon as release returns: no polling after it.
+        let l = log.lock().unwrap().clone();
+        assert!(
+            l.contains(&(
+                "DELETE".to_string(),
+                "/nsmf-event-exposure/v1/subscriptions/s471".to_string()
+            )),
+            "the late 201 is deleted before shutdown proceeds: {l:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "within the bound"
+        );
+        assert!(SUBSCRIBER.lock().unwrap().is_none());
+        server.stop().await.ok();
+    });
+    clear_for_test();
+}
+
+/// Idle (between checks, a 30 s interval) the subscriber is woken at shutdown,
+/// so release returns at once rather than after the bound.
+#[test]
+fn shutdown_wakes_an_idle_subscriber_471() {
+    let _l = lock_for_test();
+    clear_for_test();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (server, port, log) = stand_in_smf(201).await;
+        start_subscriber(
+            format!("http://127.0.0.1:{port}"),
+            "http://127.0.0.1:1/d443a-edge-budget/qos-mon/t".into(),
+            2,
+            Duration::from_secs(30),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while held_for_test().is_none() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let started = Instant::now();
+        assert_eq!(
+            release_subscription(Duration::from_secs(2)).await,
+            Some(204)
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            started.elapsed()
+        );
+        server.stop().await.ok();
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|(m, _)| m == "POST")
+                .count(),
+            1
+        );
+    });
+    clear_for_test();
+}
