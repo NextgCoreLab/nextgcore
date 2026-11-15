@@ -229,13 +229,13 @@ data:
         client:
           nrf:
             - uri: {{ include "nextgcore.nrfUri" . }}
-      # Whether the subscribed Session-AMBR the SMF reports (subsSessAmbr) caps
-      # the Session-AMBR the PCF authorises, on the SM policy create, the
-      # UpdateNotify and the SE_AMBR_CH update alike (#1402). subscribed (the
-      # default): per direction min(policy, subscribed). none: the policy value.
-      # Any other value fails start-up.
-      # policy:
-      #   session_ambr_cap: subscribed
+      # #1402: values.yaml pcf.policy.sessionAmbrCap (subscribed | none).
+      {{- $cap := .Values.pcf.policy.sessionAmbrCap | default "subscribed" }}
+      {{- if not (has $cap (list "subscribed" "none")) }}
+      {{- fail (printf "pcf.policy.sessionAmbrCap must be subscribed or none, got %q" $cap) }}
+      {{- end }}
+      policy:
+        session_ambr_cap: {{ $cap }}
 
   nssf.yaml: |
     logger:

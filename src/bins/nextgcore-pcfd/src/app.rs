@@ -350,10 +350,13 @@ pub async fn run() -> Result<()> {
         crate::session_ambr_cap::from_config_root(&demo_config_root(&args.config)?)
             .map_err(|e| anyhow::anyhow!("configuration file {}: {e}", args.config))?;
     crate::session_ambr_cap::set(session_ambr_cap);
+    // #1402 review M1: logged from the global the paths read, not from the parsed
+    // local, so the line proves the value is IN FORCE (the start-up test reads it).
+    let in_force = crate::session_ambr_cap::get();
     log::info!(
         "pcf.policy.session_ambr_cap = {}: the authorised Session-AMBR is {}",
-        session_ambr_cap.as_str(),
-        match session_ambr_cap {
+        in_force.as_str(),
+        match in_force {
             crate::session_ambr_cap::SessionAmbrCap::Subscribed => {
                 "capped per direction by the subscribed Session-AMBR the SMF reports"
             }
@@ -11741,6 +11744,155 @@ mod tests {
             }
         }
     }
+    /// #1402 review m1: a Create whose store read misses authorises the built-in
+    /// 100/100 Mbps default -- capped by the reported `subsSessAmbr` under
+    /// `subscribed`, as is under `none`.
+    ///
+    /// REVERT-VERIFIED: with the default built and answered uncapped, the
+    /// `subscribed` pass answers 100/100.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guards held across .await to serialize the process-global PCF context and cap setting
+    async fn create_on_a_store_miss_caps_the_built_in_default_per_the_setting_1402() {
+        use crate::session_ambr_cap::SessionAmbrCap;
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        for (n, (cap, ul, dl)) in [
+            (SessionAmbrCap::Subscribed, "5 Mbps", "7 Mbps"),
+            (SessionAmbrCap::None, "100 Mbps", "100 Mbps"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let _cap = crate::test_support::session_ambr_cap(cap);
+            // Never seeded: the store read misses and the default is authorised.
+            let supi = format!("imsi-0010100000143{n:02}");
+            let mut create = full_create_body(&supi, (n + 1) as u8);
+            let obj = create.as_object_mut().unwrap();
+            obj.insert(
+                "ipv4Address".to_string(),
+                serde_json::json!(format!("10.45.143.{}", n + 1)),
+            );
+            obj.insert(
+                "subsSessAmbr".to_string(),
+                serde_json::json!({ "uplink": "5 Mbps", "downlink": "7 Mbps" }),
+            );
+            let resp = pcf_sbi_request_handler(make_request(
+                "POST",
+                "/npcf-smpolicycontrol/v1/sm-policies",
+                Some(create),
+            ))
+            .await;
+            assert_eq!(resp.status, 201);
+            let created: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            remove_ue_1402(&supi);
+            assert_eq!(
+                sess_rule_1383(&created),
+                (9, ul.to_string(), dl.to_string()),
+                "store-miss create, {cap:?}"
+            );
+        }
+    }
+
+    /// #1402 review m2: a `subsSessAmbr` direction of 0 bps is no subscribed bound
+    /// for that direction, on every path: the Create, the UpdateNotify (and GET), and
+    /// SE_AMBR_CH with a reported and with a stored value. The other direction is
+    /// still capped.
+    ///
+    /// REVERT-VERIFIED: with `session_ambr_cap::apply` taking `min` with a zero,
+    /// every assertion below answers a 0 bps direction.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guards held across .await to serialize the process-global PCF context and cap setting
+    async fn a_zero_subscribed_direction_is_no_bound_on_any_path_1402() {
+        use crate::session_ambr_cap::SessionAmbrCap;
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let _cap = crate::test_support::session_ambr_cap(SessionAmbrCap::Subscribed);
+        let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
+        let rule = |ul: &str, dl: &str| (SEEDED_5QI_1383 as i64, ul.to_string(), dl.to_string());
+
+        // Create, then UpdateNotify and GET: uplink 0 is no bound, downlink capped.
+        let (supi, psi, ipv4) = ("imsi-001010000014401", 1, "10.45.144.1");
+        let created = create_1402(
+            supi,
+            psi,
+            ipv4,
+            peers.smf_port,
+            Some(serde_json::json!({ "uplink": "0 bps", "downlink": "7 Mbps" })),
+        )
+        .await;
+        assert_eq!(
+            sess_rule_1383(&created),
+            rule("11 Mbps", "7 Mbps"),
+            "create"
+        );
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
+            Some(serde_json::json!({ "ueIpv4": ipv4 })),
+        ))
+        .await;
+        assert_eq!(resp.status, 204);
+        let got = await_notifications(&peers, 1).await;
+        let path = format!("/nsmf-callback/v1/sm-policy-notify/{psi}/update");
+        let notify = got
+            .iter()
+            .find(|(p, _)| *p == path)
+            .unwrap_or_else(|| panic!("a notify on {path}: {got:?}"));
+        assert_eq!(
+            sess_rule_1383(&notify.1["smPolicyDecision"]),
+            rule("11 Mbps", "7 Mbps"),
+            "update-notify"
+        );
+        let pol = sm_policy_id_of(ipv4);
+        let get = pcf_sbi_request_handler(make_request(
+            "GET",
+            &format!("/npcf-smpolicycontrol/v1/sm-policies/{pol}"),
+            None,
+        ))
+        .await;
+        let body: serde_json::Value =
+            serde_json::from_str(get.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            sess_rule_1383(&body["policy"]),
+            rule("11 Mbps", "7 Mbps"),
+            "GET"
+        );
+
+        // SE_AMBR_CH, reported then stored: downlink 0 is no bound, uplink capped.
+        let reported = Some(serde_json::json!({ "uplink": "5 Mbps", "downlink": "0 bps" }));
+        assert_eq!(
+            report_se_ambr_ch(&pol, reported).await,
+            Some(("5 Mbps".to_string(), "22 Mbps".to_string())),
+            "SE_AMBR_CH, reported"
+        );
+        assert_eq!(
+            report_se_ambr_ch(&pol, None).await,
+            Some(("5 Mbps".to_string(), "22 Mbps".to_string())),
+            "SE_AMBR_CH, stored"
+        );
+        remove_ue_1402(supi);
+
+        // 0/0 is no bound at all.
+        let supi = "imsi-001010000014402";
+        let created = create_1402(
+            supi,
+            2,
+            "10.45.144.2",
+            peers.smf_port,
+            Some(serde_json::json!({ "uplink": "0 bps", "downlink": "0 bps" })),
+        )
+        .await;
+        remove_ue_1402(supi);
+        assert_eq!(sess_rule_1383(&created), seeded_rule_1383(), "0/0 create");
+
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
+    }
 }
 
 #[cfg(test)]
@@ -11915,6 +12067,18 @@ mod tests_am_policy_changes {
 /// shipped config of this daemon must parse with its typed structs.
 #[cfg(test)]
 mod shipped_config_tests {
+    /// #1402: every shipped config states a `pcf.policy.session_ambr_cap` pcfd
+    /// accepts, and it is the default `subscribed`.
+    fn assert_cap_ok(what: &str, text: &str) {
+        let root: serde_yaml::Value =
+            serde_yaml::from_str(text).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(
+            crate::session_ambr_cap::from_config_root(&root),
+            Ok(crate::session_ambr_cap::SessionAmbrCap::Subscribed),
+            "{what}"
+        );
+    }
+
     #[test]
     fn the_shipped_configs_parse() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
@@ -11922,6 +12086,7 @@ mod shipped_config_tests {
             let rel = "docker/rust/configs/5gc/pcf.yaml";
             let text = std::fs::read_to_string(root.join(rel)).unwrap();
             serde_yaml::from_str::<super::PcfYaml>(&text).unwrap_or_else(|e| panic!("{rel}: {e}"));
+            assert_cap_ok(rel, &text);
         }
         let cm: serde_yaml::Value = serde_yaml::from_str(
             &std::fs::read_to_string(root.join("k8s/manifests/configmap.yaml")).unwrap(),
@@ -11931,10 +12096,16 @@ mod shipped_config_tests {
             .as_str()
             .expect("the ConfigMap's pcf.yaml");
         serde_yaml::from_str::<super::PcfYaml>(text).expect("k8s pcf.yaml");
+        assert_cap_ok("k8s pcf.yaml", text);
         // #1312 (#1317 review): and as the Helm chart renders it (CI installs helm
         // and sets NEXTGCORE_HELM_REQUIRED, so this is never skipped there).
         if let Some(text) = nextgcore_core::helm_render::helm_rendered_config(&root, "pcf.yaml") {
             serde_yaml::from_str::<super::PcfYaml>(&text).expect("Helm pcf.yaml");
+            assert_cap_ok("Helm pcf.yaml", &text);
+            assert!(
+                text.contains("session_ambr_cap: subscribed"),
+                "the Helm chart renders values.yaml pcf.policy.sessionAmbrCap: {text}"
+            );
         }
     }
 }

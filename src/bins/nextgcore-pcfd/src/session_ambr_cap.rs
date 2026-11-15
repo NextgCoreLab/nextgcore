@@ -120,23 +120,44 @@ pub fn from_config_root(root: &serde_yaml::Value) -> Result<SessionAmbrCap, Stri
 /// `sd` with its Session-AMBR capped by `subscribed` per the setting in force.
 ///
 /// Under `subscribed`, each direction is `min(policy, subscribed)`, independently:
-/// a subscription that lowers only the uplink leaves the downlink alone. A
-/// direction whose subscribed value does not parse is left at the policy value
-/// rather than read as zero, which would police the subscriber to a standstill
-/// (`parse_subs_sess_ambr` already refuses such a value whole, so this is a
-/// second line). No subscribed value, or the setting `none`: `sd` unchanged.
+/// a subscription that lowers only the uplink leaves the downlink alone. No
+/// subscribed value, or the setting `none`: `sd` unchanged.
+///
+/// A direction that is NOT a bound is left at the policy value:
+/// - one whose subscribed value does not parse (`parse_subs_sess_ambr` already
+///   refuses such a value whole, so this is a second line);
+/// - one whose subscribed value is zero (`"0 bps"`, or a fraction that rounds to
+///   it). TS 29.571 §5.5.4.2 makes both `Ambr` directions mandatory, so a source
+///   with no value for one has nothing to put there but a zero, and TS 29.512
+///   §4.2.2.5 NOTE 1 has the SMF report the UDM-subscribed or DN-AAA-authorised
+///   Session-AMBR, which a 0 bps direction cannot be: it would police the
+///   subscriber to a standstill. Same reading as #1460 gives a 0/0 subscribed
+///   UE-AMBR: no data, not a zero limit.
 pub fn apply(sd: &SessionData, subscribed: Option<&Ambr>) -> SessionData {
     let mut out = sd.clone();
     if get() == SessionAmbrCap::None {
         return out;
     }
-    if let Some(subs) = subscribed {
-        if let Some(ul) = parse_bitrate(&subs.uplink) {
-            out.ambr_uplink = out.ambr_uplink.min(ul);
-        }
-        if let Some(dl) = parse_bitrate(&subs.downlink) {
-            out.ambr_downlink = out.ambr_downlink.min(dl);
-        }
+    let Some(subs) = subscribed else {
+        return out;
+    };
+    match parse_bitrate(&subs.uplink) {
+        Some(0) => log::warn!(
+            "subsSessAmbr uplink is 0 bps ({:?}): not a subscribed bound, the policy \
+             uplink stands",
+            subs.uplink
+        ),
+        Some(ul) => out.ambr_uplink = out.ambr_uplink.min(ul),
+        None => {}
+    }
+    match parse_bitrate(&subs.downlink) {
+        Some(0) => log::warn!(
+            "subsSessAmbr downlink is 0 bps ({:?}): not a subscribed bound, the policy \
+             downlink stands",
+            subs.downlink
+        ),
+        Some(dl) => out.ambr_downlink = out.ambr_downlink.min(dl),
+        None => {}
     }
     out
 }
@@ -243,6 +264,16 @@ mod tests {
             sd(11_000_000, 7_000_000),
             "an unparseable direction is no bound, not a zero"
         );
+        assert_eq!(
+            apply(&p, Some(&ambr("0 bps", "7 Mbps"))),
+            sd(11_000_000, 7_000_000),
+            "a zero direction is no bound, not a zero limit"
+        );
+        assert_eq!(
+            apply(&p, Some(&ambr("5 Mbps", "0 Kbps"))),
+            sd(5_000_000, 22_000_000)
+        );
+        assert_eq!(apply(&p, Some(&ambr("0 bps", "0 bps"))), p, "0/0: no bound");
         drop(cap);
 
         let _cap = crate::test_support::session_ambr_cap(SessionAmbrCap::None);
