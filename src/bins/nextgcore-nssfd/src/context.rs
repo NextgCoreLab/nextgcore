@@ -127,9 +127,9 @@ pub struct NssfNsi {
     pub nrf_id: String,
     pub nsi_id: String,
     pub s_nssai: SNssai,
-    pub roaming_indication: RoamingIndication,
-    pub tai_presence: bool,
-    pub tai: Option<Tai>,
+    // #1500: no per-UE state here (TAI, roaming indication). An NSI is shared
+    // by every UE that selects its S-NSSAI; request values belong to the
+    // request.
 }
 
 impl NssfNsi {
@@ -141,15 +141,7 @@ impl NssfNsi {
             // pool index. Use a UUID so identifiers are not guessable/sequential.
             nsi_id: uuid::Uuid::new_v4().to_string(),
             s_nssai: SNssai::new(sst, sd),
-            roaming_indication: RoamingIndication::default(),
-            tai_presence: false,
-            tai: None,
         }
-    }
-
-    pub fn set_tai(&mut self, tai: Tai) {
-        self.tai_presence = true;
-        self.tai = Some(tai);
     }
 }
 
