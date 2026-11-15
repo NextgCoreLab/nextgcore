@@ -38,7 +38,7 @@ hss:
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `db_uri` (top level) | string | none | MongoDB URI of the subscriber store, used when `--db-uri` is not given. Connection is retried 5 times, 2 s apart, then startup fails. |
+| `db_uri` (top level) | string | none | MongoDB URI of the subscriber store, used when `--db-uri` is not given. Connection is retried 5 times, 2 s apart, then startup fails (about 13 s). When the URI sets no `serverSelectionTimeoutMS` / `connectTimeoutMS`, nextgcore-dbi sets each to 1000 ms instead of the driver's 30 s (#1462), so each attempt, and each runtime read against a store that has gone away, fails within about 1 s; a value the URI sets is kept. |
 | `hss.diameter.identity` | string | `hss.epc.mnc001.mcc001.3gppnetwork.org` | Origin-Host. |
 | `hss.diameter.realm` | string | `epc.mnc001.mcc001.3gppnetwork.org` | Origin-Realm (TS 23.003 §19.2 format). |
 | `hss.diameter.addr` / `.port` | string / u16 | `0.0.0.0` / `3868` | S6a listen address and port. |
