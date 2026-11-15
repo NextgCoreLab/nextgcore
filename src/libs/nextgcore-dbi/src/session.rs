@@ -47,7 +47,7 @@ pub fn nextgcore_dbi_session_data(
 
 /// The slice/DNN match over one subscriber document, shared by the MongoDB path and
 /// the test mirror so the two cannot diverge.
-fn session_data_from_document(
+pub(crate) fn session_data_from_document(
     document: &Document,
     supi_id: &str,
     s_nssai: Option<&NextgcoreSNssai>,

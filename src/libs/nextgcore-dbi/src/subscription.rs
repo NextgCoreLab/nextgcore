@@ -793,12 +793,30 @@ pub(crate) fn parse_subscribed_slices(document: &Document, data: &mut NextgcoreS
 /// (TS 23.003 clause 28.4.2, `NEXTGCORE_S_NSSAI_NO_SD_VALUE`). An `sd` that is not a
 /// hex string reads the same way. The subscription read and the session-data read
 /// both go through here, so they agree on the same stored slice.
+///
+/// A present `sd` that does not parse is logged at WARN, once per read of the
+/// slice: the slice then lists as SST-only, which is a different S-NSSAI from the
+/// one the operator meant. The SUPI is not logged.
 pub(crate) fn parse_slice_sd(slice_doc: &Document) -> NextgcoreUint24 {
-    slice_doc
-        .get_str(NEXTGCORE_SD_STRING)
-        .ok()
-        .and_then(NextgcoreUint24::from_hex_string)
-        .unwrap_or(NextgcoreUint24::new(NEXTGCORE_S_NSSAI_NO_SD_VALUE))
+    let no_sd = NextgcoreUint24::new(NEXTGCORE_S_NSSAI_NO_SD_VALUE);
+    match slice_doc.get(NEXTGCORE_SD_STRING) {
+        None => no_sd,
+        Some(Bson::String(sd)) => NextgcoreUint24::from_hex_string(sd).unwrap_or_else(|| {
+            log::warn!(
+                "subscriber slice (sst {:?}): sd {sd:?} is not a hex string; read as no SD",
+                slice_doc.get_i32(NEXTGCORE_SST_STRING).ok()
+            );
+            no_sd
+        }),
+        Some(other) => {
+            log::warn!(
+                "subscriber slice (sst {:?}): sd is a {:?}, not a string; read as no SD",
+                slice_doc.get_i32(NEXTGCORE_SST_STRING).ok(),
+                other.element_type()
+            );
+            no_sd
+        }
+    }
 }
 
 /// Parse slice data from BSON document
@@ -1223,21 +1241,47 @@ mod tests {
         assert_eq!(typed.s_nssai, NextgcoreSNssai::new(1, None));
     }
 
-    /// The session-data read and the subscription read take the SD from the same helper
-    /// (#1514), so for every stored shape they agree.
+    /// The session-data read and the subscription read agree on the SD of every stored
+    /// shape (#1514). The session read never returns the SD; it uses it to match a
+    /// requested S-NSSAI, where a slice with no SD matches any SD and one with an SD
+    /// matches only that SD. So for each stored shape, the SD the subscription read
+    /// returns predicts which requested SDs the session read matches.
     #[test]
     fn the_subscription_read_and_the_session_read_agree_on_the_sd() {
-        for slice in [
+        let session = doc! { NEXTGCORE_NAME_STRING: "internet" };
+        let shapes = [
             doc! { NEXTGCORE_SST_STRING: 1 },
             doc! { NEXTGCORE_SST_STRING: 1, NEXTGCORE_SD_STRING: "000000" },
+            doc! { NEXTGCORE_SST_STRING: 1, NEXTGCORE_SD_STRING: "000001" },
             doc! { NEXTGCORE_SST_STRING: 1, NEXTGCORE_SD_STRING: "ffffff" },
             doc! { NEXTGCORE_SST_STRING: 1, NEXTGCORE_SD_STRING: "x" },
-        ] {
-            assert_eq!(
-                parse_slice_data(&slice).expect("sst is set").s_nssai.sd,
-                parse_slice_sd(&slice),
-                "{slice:?}"
+            doc! { NEXTGCORE_SST_STRING: 1, NEXTGCORE_SD_STRING: 7 },
+        ];
+        for shape in shapes {
+            let subscribed = parse_slice_data(&shape).expect("sst is set").s_nssai;
+            let mut slice = shape.clone();
+            slice.insert(
+                NEXTGCORE_SESSION_STRING,
+                vec![Bson::Document(session.clone())],
             );
+            let document = doc! { NEXTGCORE_SLICE_STRING: [Bson::Document(slice)] };
+            for requested_sd in [0x000000, 0x000001, 0x0a0b0c] {
+                let requested = NextgcoreSNssai::new(1, Some(requested_sd));
+                let session_matches = crate::session::session_data_from_document(
+                    &document,
+                    "999990000001514",
+                    Some(&requested),
+                    "internet",
+                )
+                .is_ok();
+                let predicted = !subscribed.has_sd() || subscribed.sd.v == requested_sd;
+                assert_eq!(
+                    session_matches, predicted,
+                    "stored {shape:?}, requested SD {requested_sd:06x}: the subscription read \
+                     says SD {:06x}",
+                    subscribed.sd.v
+                );
+            }
         }
     }
 
