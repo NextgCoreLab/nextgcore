@@ -771,6 +771,21 @@ fn parse_qos(doc: &Document) -> NextgcoreQos {
     qos
 }
 
+/// The SD of a subscriber `slice` document (#1514).
+///
+/// `sd` is optional (TS 29.571 Table 5.4.4.2-1); an absent one means no SD is
+/// associated with the SST, which this crate carries as the reserved value FFFFFF
+/// (TS 23.003 clause 28.4.2, `NEXTGCORE_S_NSSAI_NO_SD_VALUE`). An `sd` that is not a
+/// hex string reads the same way. The subscription read and the session-data read
+/// both go through here, so they agree on the same stored slice.
+pub(crate) fn parse_slice_sd(slice_doc: &Document) -> NextgcoreUint24 {
+    slice_doc
+        .get_str(NEXTGCORE_SD_STRING)
+        .ok()
+        .and_then(NextgcoreUint24::from_hex_string)
+        .unwrap_or(NextgcoreUint24::new(NEXTGCORE_S_NSSAI_NO_SD_VALUE))
+}
+
 /// Parse slice data from BSON document
 fn parse_slice_data(doc: &Document) -> Option<NextgcoreSliceData> {
     let mut slice_data = NextgcoreSliceData::default();
@@ -779,12 +794,9 @@ fn parse_slice_data(doc: &Document) -> Option<NextgcoreSliceData> {
     let sst = doc.get_i32(NEXTGCORE_SST_STRING).ok()?;
     slice_data.s_nssai.sst = sst as u8;
 
-    // SD is optional
-    if let Ok(sd_str) = doc.get_str(NEXTGCORE_SD_STRING) {
-        if let Some(sd) = NextgcoreUint24::from_hex_string(sd_str) {
-            slice_data.s_nssai.sd = sd;
-        }
-    }
+    // SD is optional (#1514). `NextgcoreSliceData::default()` leaves the SD at 0, which
+    // `has_sd()` reads as a real SD of 000000, so the slice has to be told it has none.
+    slice_data.s_nssai.sd = parse_slice_sd(doc);
 
     // Default indicator
     if let Ok(di) = doc.get_bool(NEXTGCORE_DEFAULT_INDICATOR_STRING) {
@@ -1167,6 +1179,63 @@ mod tests {
             NEXTGCORE_DEFAULT_INDICATOR_STRING, NEXTGCORE_DEFAULT_DNN_INDICATOR_STRING,
             "and the two constants must stay distinct"
         );
+    }
+
+    /// **#1514**: a subscriber slice stored without an `sd` reads back as "no SD"
+    /// (FFFFFF, TS 23.003 clause 28.4.2), not as SD 000000, so consumers render
+    /// `{sst: 1}` and not `{sst: 1, sd: "000000"}`. A stored SD of 000000 is a real SD
+    /// and keeps it; an unparseable `sd` reads as "no SD", as the session-data read does.
+    #[test]
+    fn a_slice_stored_without_an_sd_reads_back_as_no_sd() {
+        let no_sd = parse_slice_data(&doc! { NEXTGCORE_SST_STRING: 1 }).expect("sst is set");
+        assert_eq!(no_sd.s_nssai.sst, 1);
+        assert_eq!(no_sd.s_nssai.sd.v, NEXTGCORE_S_NSSAI_NO_SD_VALUE);
+        assert!(!no_sd.s_nssai.has_sd());
+        assert_eq!(no_sd.s_nssai, NextgcoreSNssai::new(1, None));
+
+        let zero_sd =
+            parse_slice_data(&doc! { NEXTGCORE_SST_STRING: 1, NEXTGCORE_SD_STRING: "000000" })
+                .expect("sst is set");
+        assert!(zero_sd.s_nssai.has_sd());
+        assert_eq!(zero_sd.s_nssai, NextgcoreSNssai::new(1, Some(0)));
+
+        let with_sd =
+            parse_slice_data(&doc! { NEXTGCORE_SST_STRING: 2, NEXTGCORE_SD_STRING: "0A0b0C" })
+                .expect("sst is set");
+        assert_eq!(with_sd.s_nssai, NextgcoreSNssai::new(2, Some(0x0a0b0c)));
+
+        for bad in ["", "zz", "not-hex"] {
+            let bad_sd =
+                parse_slice_data(&doc! { NEXTGCORE_SST_STRING: 1, NEXTGCORE_SD_STRING: bad })
+                    .expect("sst is set");
+            assert_eq!(
+                bad_sd.s_nssai,
+                NextgcoreSNssai::new(1, None),
+                "an unparseable sd {bad:?} must read as no SD"
+            );
+        }
+        // A non-string `sd` is not an SD either.
+        let typed = parse_slice_data(&doc! { NEXTGCORE_SST_STRING: 1, NEXTGCORE_SD_STRING: 7 })
+            .expect("sst is set");
+        assert_eq!(typed.s_nssai, NextgcoreSNssai::new(1, None));
+    }
+
+    /// The session-data read and the subscription read take the SD from the same helper
+    /// (#1514), so for every stored shape they agree.
+    #[test]
+    fn the_subscription_read_and_the_session_read_agree_on_the_sd() {
+        for slice in [
+            doc! { NEXTGCORE_SST_STRING: 1 },
+            doc! { NEXTGCORE_SST_STRING: 1, NEXTGCORE_SD_STRING: "000000" },
+            doc! { NEXTGCORE_SST_STRING: 1, NEXTGCORE_SD_STRING: "ffffff" },
+            doc! { NEXTGCORE_SST_STRING: 1, NEXTGCORE_SD_STRING: "x" },
+        ] {
+            assert_eq!(
+                parse_slice_data(&slice).expect("sst is set").s_nssai.sd,
+                parse_slice_sd(&slice),
+                "{slice:?}"
+            );
+        }
     }
 
     // 3GPP TS 35.208 Test Set 1, mirroring the constants in
