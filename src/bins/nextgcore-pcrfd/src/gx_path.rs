@@ -1067,6 +1067,17 @@ pub fn handle_ccr(
         }
     };
 
+    // The authorized policy for this session, re-derived from the subscription on
+    // every request rather than replayed from the initial answer (#57). An
+    // administrative change between the initial CCR and an update is therefore
+    // visible in the update's answer. Read before the context lock is taken
+    // (#1459): the store read is a network round trip, and holding the lock across
+    // it would make every context writer wait on the store.
+    let authorized = build_subscriber_session_data(
+        info.imsi.as_deref().unwrap_or(""),
+        info.apn.as_deref().unwrap_or(""),
+    );
+
     let ctx = pcrf_self();
     let context = match ctx.read() {
         Ok(c) => c,
@@ -1081,14 +1092,6 @@ pub fn handle_ccr(
     };
 
     let mut abort_targets = Vec::new();
-    // The authorized policy for this session, re-derived from the subscription on
-    // every request rather than replayed from the initial answer (#57). An
-    // administrative change between the initial CCR and an update is therefore
-    // visible in the update's answer.
-    let authorized = build_subscriber_session_data(
-        info.imsi.as_deref().unwrap_or(""),
-        info.apn.as_deref().unwrap_or(""),
-    );
 
     let result = match info.cc_request_type {
         cc_request_type::INITIAL_REQUEST => {
@@ -1656,6 +1659,24 @@ pub fn build_subscriber_session_data(imsi: &str, apn: &str) -> GxSessionData {
     }
 }
 
+/// Run a subscriber-store read so it does not hold a tokio worker (#1459).
+///
+/// nextgcore-dbi reads through `mongodb::sync`, which blocks the calling thread for
+/// the whole round trip, up to the server-selection timeout when the store is down.
+/// The CCR handler runs on the Diameter runtime's workers, so an inline read would
+/// stall every other peer connection, watchdog and CCR on that worker. On the
+/// multi-thread runtime the listener runs on, `block_in_place` hands the worker's
+/// other tasks to another thread for the duration. A current-thread runtime cannot,
+/// and runs the read inline; with no runtime there is nothing to protect.
+fn off_runtime<T>(read: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(read)
+        }
+        _ => read(),
+    }
+}
+
 /// Subscriber policy from the DB: QoS profile + AMBR for the APN
 struct SubscriberPolicy {
     qos: nextgcore_dbi::types::NextgcoreQos,
@@ -1668,7 +1689,13 @@ struct SubscriberPolicy {
 fn lookup_subscriber_policy(imsi: &str, apn: &str) -> Option<SubscriberPolicy> {
     use nextgcore_dbi::nextgcore_dbi_subscription_data;
     let supi = format!("imsi-{imsi}");
-    let subscription_data = nextgcore_dbi_subscription_data(&supi).ok()?;
+    let subscription_data = match off_runtime(|| nextgcore_dbi_subscription_data(&supi)) {
+        Ok(data) => data,
+        Err(e) => {
+            log::debug!("[{supi}] no subscriber policy from the store ({e}); local default");
+            return None;
+        }
+    };
 
     // Find the session matching the APN
     for slice in &subscription_data.slice {
@@ -2530,6 +2557,53 @@ mod tests {
         assert_eq!(rules[0].qos_index, 2); // Video -> QCI 2
         assert_eq!(rules[1].qos_index, 5); // Application -> QCI 5
         assert_eq!(rules[1].gbr_downlink, 0); // Non-GBR for QCI 5
+    }
+
+    /// #1459: a store read in a CCR handler must not hold its runtime worker. One
+    /// worker: a handler task runs a 600 ms blocking read through `off_runtime`
+    /// while a ticker task on the same runtime must keep ticking. The read runs
+    /// inside a task, as `handle_ccr` does, so it really occupies the worker.
+    #[test]
+    fn a_store_read_does_not_hold_the_runtime_worker() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let ticks = Arc::new(AtomicU32::new(0));
+        let during = rt.block_on({
+            let ticks = ticks.clone();
+            async move {
+                tokio::spawn(async move {
+                    let ticker = {
+                        let ticks = ticks.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                ticks.fetch_add(1, Ordering::SeqCst);
+                            }
+                        })
+                    };
+                    // Let the ticker get going on the one worker.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let before = ticks.load(Ordering::SeqCst);
+                    off_runtime(|| std::thread::sleep(Duration::from_millis(600)));
+                    let during = ticks.load(Ordering::SeqCst) - before;
+                    ticker.abort();
+                    during
+                })
+                .await
+                .unwrap()
+            }
+        });
+        assert!(
+            during >= 5,
+            "the ticker ran {during} times in 600 ms while a store read was in flight: \
+             the read held the worker"
+        );
     }
 
     #[test]
