@@ -39,6 +39,7 @@
 //! - [`overload`] - OCI/LCI overload & load control parse/emit + reaction
 //! - [`error`] - Error types
 
+pub mod callback_auth; // callback routes authenticated by their own token, not a bearer (#1421)
 pub mod cca_x5c; // The CCA's x5c chain and its NF-Instance-ID binding (issue #393)
 pub mod constants;
 pub mod context;

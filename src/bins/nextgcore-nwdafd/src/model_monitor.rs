@@ -836,6 +836,12 @@ pub fn spawn_upkeep(m: &'static Monitor, ctx: std::sync::Arc<RwLock<NwdafContext
     });
 }
 
+/// Whether `token` is `m`'s notificationUri token on an MTLF: the check both
+/// the handler and the server's OAuth2 callback exemption (#1421) apply.
+pub fn holds_callback_token(m: Option<&Monitor>, token: &str) -> bool {
+    m.is_some_and(|m| m.role.serves_mtlf() && token_matches(&m.token, token))
+}
+
 /// `POST /nnwdaf-callback/v1/mlmodel-monitor-notify/{token}`: an AnLF's
 /// `MLModelMonitorNotify` (§4.7.2.6.2). The whole body is checked before any
 /// entry is recorded. Each `mlModelAcc` of the registration's model feeds that
@@ -844,7 +850,7 @@ pub fn spawn_upkeep(m: &'static Monitor, ctx: std::sync::Arc<RwLock<NwdafContext
 /// that is not a live registration, 404 (the AnLF then drops the subscription
 /// and registers again); a body that is not a notification 400.
 pub fn handle_notify(m: Option<&Monitor>, token: &str, request: &SbiRequest) -> SbiResponse {
-    let Some(m) = m.filter(|m| m.role.serves_mtlf() && token_matches(&m.token, token)) else {
+    let Some(m) = m.filter(|_| holds_callback_token(m, token)) else {
         return send_not_found("no such callback", None);
     };
     let Some(body) = body_json(request) else {

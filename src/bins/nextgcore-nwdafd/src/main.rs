@@ -204,6 +204,50 @@ fn oauth2_required(config_path: &str) -> bool {
     })
 }
 
+/// The Nnwdaf callback routes admitted without an OAuth2 bearer when the listener
+/// requires one (#1421): a notification carries no access token (TS 33.501
+/// §13.4.1, TS 29.500 §6.7.3), and each of these is authenticated by the
+/// unguessable token this NWDAF minted into the callback URI instead. The server
+/// admits one only when the same check its route applies finds the token held
+/// now; any other request still needs a bearer. Feature-gated routes are listed
+/// only in the builds that serve them.
+fn oauth2_callback_exemptions() -> Vec<nextgcore_sbi::server::OAuth2CallbackExemption> {
+    use nextgcore_sbi::server::OAuth2CallbackExemption;
+    let route = |segment: &str| format!("/nnwdaf-callback/v1/{segment}/{{token}}");
+    #[allow(unused_mut)]
+    let mut list = vec![OAuth2CallbackExemption::new(
+        "POST",
+        route(nrf_collector::CALLBACK_SEGMENT),
+        |cb| nrf_collector::holds_callback_token(cb.token),
+    )];
+    #[cfg(feature = "amf-mobility")]
+    list.push(OAuth2CallbackExemption::new(
+        "POST",
+        route(amf_mobility::CALLBACK_SEGMENT),
+        |cb| amf_mobility::holds_callback_token(cb.token),
+    ));
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    list.push(OAuth2CallbackExemption::new(
+        "POST",
+        route(ran_congestion::CALLBACK_SEGMENT),
+        |cb| ran_congestion::holds_callback_token(cb.token),
+    ));
+    #[cfg(feature = "demo-d441e-model-retrain")]
+    {
+        list.push(OAuth2CallbackExemption::new(
+            "POST",
+            route(model_monitor::CALLBACK_SEGMENT),
+            |cb| model_monitor::holds_callback_token(model_monitor::monitor(), cb.token),
+        ));
+        list.push(OAuth2CallbackExemption::new(
+            "POST",
+            route(model_retrain::CALLBACK_SEGMENT),
+            |cb| model_retrain::holds_callback_token(model_retrain::anlf(), cb.token),
+        ));
+    }
+    list
+}
+
 /// Apply OAuth2 producer enforcement to `cfg` and install the outbound OAuth2
 /// client (Wave-6 H8). The server verifies incoming Bearer tokens against the
 /// NRF JWKS and requires `aud` to include NfType::Nwdaf; with no NRF URI it
@@ -483,6 +527,10 @@ async fn main() -> Result<()> {
     if oauth2_required(&args.config) {
         sbi_server_config = apply_oauth2_enforcement(sbi_server_config, &args.nrf_uri);
     }
+    // #1421: the callbacks this NWDAF subscribed for, admitted on their own token
+    // when the listener requires OAuth2 (a notification carries no bearer).
+    sbi_server_config =
+        sbi_server_config.with_oauth2_callback_exemptions(oauth2_callback_exemptions());
 
     let sbi_server = SbiServer::new(sbi_server_config);
 
@@ -530,12 +578,15 @@ async fn main() -> Result<()> {
         if let Ok(guard) = ctx.read() {
             guard.set_nrf_collector_config(NrfCollectorConfig {
                 nrf_uri: args.nrf_uri.clone(),
+                // #1421: the tokenised callback, so an OAuth2-required
+                // listener can admit the NRF's bearer-less notification.
                 callback_uri: format!(
-                    "http://{}/nnwdaf-nfstatus-notify/v1/notify",
+                    "http://{}{}",
                     nextgcore_sbi::uri_encode::uri_authority(
                         sbi.advertise.as_deref().unwrap_or("127.0.0.1"),
                         sbi_port
-                    )
+                    ),
+                    nrf_collector::callback_path()
                 ),
             });
         }
@@ -626,7 +677,11 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
 
-    log::debug!("NWDAF SBI: {method} {uri}");
+    // #1421: callback paths carry a token; the log shows it redacted (#940).
+    log::debug!(
+        "NWDAF SBI: {method} {}",
+        nextgcore_sbi::log_redact::redact_callback_tokens(uri)
+    );
 
     let path = uri.split('?').next().unwrap_or(uri);
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
@@ -687,9 +742,24 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             _ => send_method_not_allowed(method, "subscriptions/{id}"),
         },
 
+        // #1421: the same callback on the tokenised nfStatusNotificationUri this
+        // NWDAF now subscribes with; a token it did not hand out is 404.
+        ["nnwdaf-callback", "v1", segment, token]
+            if *segment == nrf_collector::CALLBACK_SEGMENT =>
+        {
+            match method {
+                "POST" if nrf_collector::holds_callback_token(token) => {
+                    nrf_collector::handle_nf_status_notify(&request).await
+                }
+                "POST" => send_not_found("no such NF status subscription callback", None),
+                _ => send_method_not_allowed(method, "nf-status-notify/{token}"),
+            }
+        }
+
         // G2-1: Nnrf_NFManagement NFStatusNotify callback (TS 29.510
         // §5.2.2.6) — the NRF POSTs NotificationData here; NFProfile.load
-        // becomes the NF_LOAD analytics data.
+        // becomes the NF_LOAD analytics data. The token-less URI subscriptions
+        // made before #1421 named; bearer-protected on an OAuth2 listener.
         ["nnwdaf-nfstatus-notify", "v1", "notify"] => match method {
             "POST" => nrf_collector::handle_nf_status_notify(&request).await,
             _ => send_method_not_allowed(method, "notify"),
@@ -2319,5 +2389,199 @@ mod allowed_nf_types_1412_tests {
                 "discovery of NWDAF by requester-nf-type={requester}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod callback_oauth2_1421_tests {
+    //! #1421: the real router behind an OAuth2-required listener that registers
+    //! [`super::oauth2_callback_exemptions`] the way `main` does. A notification
+    //! carries no bearer (TS 33.501 §13.4.1); each callback this NWDAF subscribed
+    //! for is admitted on its own token, and nothing else is.
+    use super::*;
+    use nextgcore_nrfd::sbi_path::{nrf_nnrf_nfm_send_nf_status_notify_async, NotifySendResult};
+    use nextgcore_nrfd::{NfProfile, NotificationEventType, SubscriptionData};
+    use nextgcore_sbi::client::SbiClient;
+    use serde_json::json;
+
+    async fn oauth2_listener() -> (SbiServer, u16) {
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let mut cfg = NextgcoreSbiServerConfig::new(addr)
+            .with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Nwdaf)
+            .with_oauth2_callback_exemptions(oauth2_callback_exemptions());
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(json!({"keys": []}));
+        let server = SbiServer::on_listener(cfg, listener);
+        server
+            .start(nwdaf_sbi_request_handler)
+            .await
+            .expect("server start");
+        (server, addr.port())
+    }
+
+    async fn status(client: &SbiClient, req: SbiRequest) -> u16 {
+        tokio::time::timeout(Duration::from_secs(5), client.send_request(req))
+            .await
+            .expect("bounded")
+            .expect("response")
+            .status
+    }
+
+    fn subscription(uri: String) -> SubscriptionData {
+        SubscriptionData {
+            id: "nwdaf-1421-sub".to_string(),
+            req_nf_type: Some("NWDAF".to_string()),
+            req_nf_instance_id: None,
+            notification_uri: uri,
+            subscr_cond: None,
+            validity_duration: 3600,
+            req_notif_events: None,
+            notif_condition: None,
+        }
+    }
+
+    fn last_load(id: &str) -> Option<u8> {
+        let ctx = nwdaf_self();
+        let guard = ctx.read().expect("ctx");
+        let engine = guard.lock_engine();
+        engine.nf_meta(id).and_then(|m| m.last_load)
+    }
+
+    /// The NRF's NFStatusNotify, sent by nrfd's real notify pipeline (no bearer),
+    /// is admitted on the tokenised callback URI this NWDAF subscribes with and
+    /// ingested. On a forged token, or on the token-less URI, it is refused 401
+    /// and ingests nothing; so is a service request without a bearer.
+    #[tokio::test]
+    async fn the_nrf_status_notify_is_admitted_on_its_token_only() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        let (server, port) = oauth2_listener().await;
+        let base = format!("http://127.0.0.1:{port}");
+        let id = "nwdaf-1421-amf";
+        let profile = NfProfile::from_json(&json!({
+            "nfInstanceId": id, "nfType": "AMF", "nfStatus": "REGISTERED", "load": 55,
+        }))
+        .expect("profile");
+        let notify = |uri: String| {
+            let profile = profile.clone();
+            async move {
+                nrf_nnrf_nfm_send_nf_status_notify_async(
+                    &subscription(uri),
+                    NotificationEventType::NfRegistered,
+                    &profile,
+                    "http://nrf.test:7777",
+                )
+                .await
+            }
+        };
+        let token = nrf_collector::callback_token();
+        assert!(nrf_collector::callback_path().ends_with(&format!("/nf-status-notify/{token}")));
+
+        let forged = uuid::Uuid::new_v4().simple().to_string();
+        for uri in [
+            format!("{base}/nnwdaf-callback/v1/nf-status-notify/{forged}"),
+            format!("{base}/nnwdaf-nfstatus-notify/v1/notify"),
+            format!("{base}/nnwdaf-callback/v1/nf-status-notify/{token}/"),
+        ] {
+            match notify(uri.clone()).await {
+                NotifySendResult::Failed(why) => assert_eq!(why, "HTTP 401", "{uri}"),
+                other => panic!("{uri}: {other:?}"),
+            }
+        }
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        let analytics = "/nnwdaf-analyticsinfo/v1/analytics?event-id=NF_LOAD";
+        assert_eq!(status(&client, SbiRequest::get(analytics)).await, 401);
+        assert_eq!(last_load(id), None, "a refused notification was ingested");
+
+        let ok = notify(format!("{base}{}", nrf_collector::callback_path())).await;
+        assert!(matches!(ok, NotifySendResult::Success), "{ok:?}");
+        assert_eq!(
+            last_load(id),
+            Some(55),
+            "the admitted notification is ingested"
+        );
+        server.stop().await.expect("stop");
+    }
+
+    /// The tokenised NFStatusNotify route checks its token itself too, so a
+    /// forged one is 404 even where no listener enforces OAuth2.
+    #[tokio::test]
+    async fn the_tokenised_route_refuses_a_forged_token_itself() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        let body =
+            json!({ "event": "NF_DEREGISTERED", "nfInstanceUri": "http://nrf/x/nwdaf-1421-r" });
+        let req = |token: &str| {
+            SbiRequest::post(format!("/nnwdaf-callback/v1/nf-status-notify/{token}"))
+                .with_body(body.to_string(), "application/json")
+        };
+        let forged = uuid::Uuid::new_v4().simple().to_string();
+        assert_eq!(nwdaf_sbi_request_handler(req(&forged)).await.status, 404);
+        let held = nrf_collector::callback_token();
+        assert_eq!(nwdaf_sbi_request_handler(req(held)).await.status, 204);
+    }
+
+    /// Every registered exemption refuses a token this NWDAF does not hold, so a
+    /// forged notification on any callback route is 401 before the router.
+    #[tokio::test]
+    async fn every_callback_route_refuses_a_forged_token() {
+        let exemptions = oauth2_callback_exemptions();
+        assert!(!exemptions.is_empty());
+        let (server, port) = oauth2_listener().await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        let forged = uuid::Uuid::new_v4().simple().to_string();
+        for e in &exemptions {
+            let path = e
+                .route()
+                .trim_start_matches("POST ")
+                .replace("{token}", &forged);
+            assert!(e.match_path("POST", &path).is_some(), "{path}");
+            let req = SbiRequest::post(&path).with_body("{}".to_string(), "application/json");
+            assert_eq!(status(&client, req).await, 401, "{path}");
+        }
+        server.stop().await.expect("stop");
+    }
+
+    /// nextgsim#466: the AMF's token-less LOCATION_REPORT notify reaches the
+    /// handler on this NWDAF's callback token, and is refused 401 on any other.
+    #[cfg(feature = "amf-mobility")]
+    #[tokio::test]
+    async fn the_amf_location_notify_is_admitted_on_its_token_only() {
+        let _serving = amf_mobility::ServingOnThisThread::new();
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        let (server, port) = oauth2_listener().await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        let body =
+            json!({ "notifyCorrelationId": amf_mobility::NOTIFY_CORRELATION_ID, "reportList": [] });
+        let post = |token: &str| {
+            SbiRequest::post(format!(
+                "/nnwdaf-callback/v1/{}/{token}",
+                amf_mobility::CALLBACK_SEGMENT
+            ))
+            .with_body(body.to_string(), "application/json")
+        };
+        let token = amf_mobility::callback_token();
+        assert_eq!(status(&client, post(&"0".repeat(32))).await, 401);
+        assert_eq!(status(&client, post(token)).await, 204);
+        server.stop().await.expect("stop");
+    }
+
+    /// nextgsim#465: the AMF's token-less UES_IN_AREA_REPORT notify, likewise.
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    #[tokio::test]
+    async fn the_amf_ues_in_area_notify_is_admitted_on_its_token_only() {
+        let _serving = ran_congestion::ServingOnThisThread::new();
+        let (server, port) = oauth2_listener().await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        let body = json!({ "notifyCorrelationId": "nwdaf-udc-x", "reportList": [] });
+        let post = |token: &str| {
+            SbiRequest::post(format!(
+                "/nnwdaf-callback/v1/{}/{token}",
+                ran_congestion::CALLBACK_SEGMENT
+            ))
+            .with_body(body.to_string(), "application/json")
+        };
+        let token = ran_congestion::callback_token();
+        assert_eq!(status(&client, post(&"0".repeat(32))).await, 401);
+        assert_eq!(status(&client, post(token)).await, 204);
+        server.stop().await.expect("stop");
     }
 }

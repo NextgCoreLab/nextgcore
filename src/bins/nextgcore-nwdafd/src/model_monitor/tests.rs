@@ -1173,3 +1173,19 @@ async fn a_new_registration_has_a_fresh_latch() {
     drop_reports(&r2);
     assert!(m.retrain_requested(model), "requested again");
 }
+
+/// #1421: the server's OAuth2 callback exemption and the handler share
+/// `holds_callback_token`; it admits an MTLF's own notificationUri token only.
+#[test]
+fn only_an_mtlfs_own_token_is_held() {
+    let mtlf = Monitor::new("retrain", Role::Mtlf, "http://m", "m", "http://n");
+    let anlf = Monitor::new("retrain", Role::Anlf, "http://a", "a", "http://n");
+    assert!(holds_callback_token(Some(&mtlf), &mtlf.token));
+    assert!(!holds_callback_token(Some(&mtlf), "nope"));
+    assert!(!holds_callback_token(Some(&mtlf), &anlf.token));
+    assert!(
+        !holds_callback_token(Some(&anlf), &anlf.token),
+        "an AnLF serves no notify"
+    );
+    assert!(!holds_callback_token(None, &mtlf.token));
+}

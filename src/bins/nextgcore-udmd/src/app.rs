@@ -581,6 +581,10 @@ pub async fn run() -> Result<()> {
         nextgcore_sbi::types::NfType::Udm,
         &nrf_uri,
     )?;
+    // #1421: the callbacks this UDM subscribed for, admitted on their own token
+    // when the listener requires OAuth2 (a notification carries no bearer).
+    sbi_server_config =
+        sbi_server_config.with_oauth2_callback_exemptions(oauth2_callback_exemptions());
     let sbi_server = SbiServer::new(sbi_server_config);
 
     sbi_server
@@ -727,14 +731,41 @@ pub(crate) const NUDM_SERVICE_NAMES: [&str; 10] = [
 fn unmatched(allowed: Option<&[&str]>, method: &str, uri: &str) -> SbiResponse {
     match allowed {
         Some(methods) => {
-            log::debug!("UDM: {method} not allowed for {uri} (allow: {methods:?})");
+            log::debug!(
+                "UDM: {method} not allowed for {} (allow: {methods:?})",
+                nextgcore_sbi::log_redact::redact_callback_tokens(uri)
+            );
             nextgcore_sbi::server::send_method_not_allowed_with_allow(method, uri, methods)
         }
         None => {
-            log::warn!("UDM: no resource at {uri}");
+            log::warn!(
+                "UDM: no resource at {}",
+                nextgcore_sbi::log_redact::redact_callback_tokens(uri)
+            );
             nextgcore_sbi::server::send_resource_uri_not_found(uri)
         }
     }
+}
+
+/// The Nudm callback routes admitted without an OAuth2 bearer when the listener
+/// requires one (#1421): a notification carries no access token (TS 33.501
+/// §13.4.1, TS 29.500 §6.7.3). The AMF's Namf_EventExposure subscription-change
+/// notification (#1440) is authenticated by the change token this UDM minted into
+/// its `subsChangeNotifyUri` instead; the server admits it only when that token
+/// is the named leg's current one. Any other request still needs a bearer.
+pub fn oauth2_callback_exemptions() -> Vec<nextgcore_sbi::server::OAuth2CallbackExemption> {
+    vec![nextgcore_sbi::server::OAuth2CallbackExemption::new(
+        "POST",
+        format!(
+            "/nudm-callback/v1/{{var}}/{}/{{token}}",
+            crate::ee_amf::SUBS_CHANGE_SEGMENT
+        ),
+        |cb| {
+            cb.vars
+                .first()
+                .is_some_and(|id| crate::ee_amf::token_matches(id, cb.token))
+        },
+    )]
 }
 
 /// Route an inbound SBI request to the UDM service handlers.
@@ -742,7 +773,11 @@ async fn udm_sbi_route(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
 
-    log::debug!("UDM SBI request: {method} {uri}");
+    // #1421: a callback path carries a token; the log shows it redacted (#940).
+    log::debug!(
+        "UDM SBI request: {method} {}",
+        nextgcore_sbi::log_redact::redact_callback_tokens(uri)
+    );
 
     // Parse the URI path
     let path = uri.split('?').next().unwrap_or(uri);

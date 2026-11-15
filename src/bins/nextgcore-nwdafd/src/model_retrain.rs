@@ -592,6 +592,12 @@ pub fn model_urls(body: &Value) -> Result<Vec<String>, String> {
     Ok(urls)
 }
 
+/// Whether `token` is `anlf`'s notifUri token: the check both the handler and
+/// the server's OAuth2 callback exemption (#1421) apply.
+pub fn holds_callback_token(anlf: Option<&Anlf>, token: &str) -> bool {
+    anlf.is_some_and(|a| token_matches(&a.token, token))
+}
+
 /// `POST /nnwdaf-callback/v1/mtlf-model-notify/{token}`: store the
 /// notification and answer 204 (TS 29.520 §4.5.2.4.2), then fetch and verify
 /// in the background. No client running, or a token this process did not hand
@@ -602,7 +608,7 @@ pub fn handle_model_notify(
     token: &str,
     request: &SbiRequest,
 ) -> SbiResponse {
-    let Some(anlf) = anlf.filter(|a| token_matches(&a.token, token)) else {
+    let Some(anlf) = anlf.filter(|_| holds_callback_token(anlf, token)) else {
         return nextgcore_sbi::server::send_not_found("no such callback", None);
     };
     let body = request

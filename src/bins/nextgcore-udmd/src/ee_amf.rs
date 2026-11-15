@@ -123,8 +123,9 @@ fn find_subscription(id: &str) -> Option<UdmEeSubscription> {
     guard.ee_subscription_find_by_id(id)
 }
 
-/// Whether `token` is the change token of `id`'s stored leg.
-fn token_matches(id: &str, token: &str) -> bool {
+/// Whether `token` is the change token of `id`'s stored leg: the check both
+/// the handler and the server's OAuth2 callback exemption (#1421) apply.
+pub(crate) fn token_matches(id: &str, token: &str) -> bool {
     find_subscription(id)
         .and_then(|s| s.amf_leg)
         .is_some_and(|l| tokens_equal(&l.change_token, token))
@@ -1511,6 +1512,110 @@ mod tests {
         let resp = crate::app::udm_sbi_request_handler(change("tok-4440", &dup)).await;
         assert_eq!(resp.status, 204);
         assert_eq!(leg_of(&id).map(|l| l.subscription_uri), Some(new));
+        clear(supi);
+    }
+
+    /// **#1421.** Behind an OAuth2-required listener, the AMF's token-less
+    /// subscription-change notification reaches the handler on the leg's change
+    /// token and moves the leg. A forged or missing token, and a service request
+    /// without a bearer, are refused 401 before the router and move nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn an_oauth2_listener_admits_the_subscription_change_on_its_token_only() {
+        let supi = "imsi-001010000014210";
+        let _guard = setup(supi);
+        let mut sub = UdmEeSubscription::for_ue(
+            supi,
+            "http://nef.example.org/notify",
+            json!({
+                "callbackReference": "http://nef.example.org/notify",
+                "monitoringConfigurations": loc(),
+            })
+            .to_string(),
+        );
+        let (old_port, new_port) = (
+            nextgcore_sbi::test_support::down_port(),
+            nextgcore_sbi::test_support::down_port(),
+        );
+        let old = format!(
+            "http://127.0.0.1:{}/namf-evts/v1/subscriptions/sub-old",
+            old_port.addr().port()
+        );
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        sub.amf_leg = Some(AmfEeLeg {
+            subscription_uri: old.clone(),
+            change_token: token.clone(),
+            amf_instance_id: Some("amf-old".to_string()),
+            notify_uri: "http://nef.example.org/notify".to_string(),
+            events: vec!["LOSS_OF_CONNECTIVITY".to_string()],
+        });
+        let id = sub.id.clone();
+        {
+            let ctx = udm_self();
+            ctx.read().expect("context").ee_subscription_insert(sub);
+        }
+
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let mut cfg = nextgcore_sbi::server::SbiServerConfig::new(addr)
+            .with_oauth2_callback_exemptions(crate::app::oauth2_callback_exemptions());
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(json!({"keys": []}));
+        let server = nextgcore_sbi::server::SbiServer::on_listener(cfg, listener);
+        server
+            .start(crate::app::udm_sbi_request_handler)
+            .await
+            .expect("server start");
+        let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", addr.port());
+        let new = format!(
+            "http://127.0.0.1:{}/namf-evts/v1/subscriptions/sub-new",
+            new_port.addr().port()
+        );
+        let body = json!({
+            "subsChangeNotifyCorrelationId": id,
+            "reportList": [{
+                "type": "SUBSCRIPTION_ID_CHANGE",
+                "state": { "active": true },
+                "timeStamp": "2026-11-15T00:00:00Z",
+                "subscriptionId": new,
+            }],
+        })
+        .to_string();
+        let send = |req: SbiRequest| {
+            let client = &client;
+            async move {
+                tokio::time::timeout(std::time::Duration::from_secs(5), client.send_request(req))
+                    .await
+                    .expect("bounded")
+                    .expect("response")
+                    .status
+            }
+        };
+        let post =
+            |path: String| SbiRequest::post(path).with_body(body.clone(), "application/json");
+
+        let forged = uuid::Uuid::new_v4().simple().to_string();
+        assert_eq!(send(post(subs_change_path(&id, &forged))).await, 401);
+        assert_eq!(
+            send(post(format!(
+                "/nudm-callback/v1/{id}/{SUBS_CHANGE_SEGMENT}"
+            )))
+            .await,
+            401
+        );
+        assert_eq!(send(post(subs_change_path("ee-other", &token))).await, 401);
+        assert_eq!(
+            send(SbiRequest::get(format!("/nudm-sdm/v2/{supi}/am-data"))).await,
+            401
+        );
+        assert_eq!(leg_of(&id).map(|l| l.subscription_uri), Some(old));
+
+        assert_eq!(send(post(subs_change_path(&id, &token))).await, 204);
+        assert_eq!(
+            leg_of(&id).map(|l| l.subscription_uri),
+            Some(new),
+            "the admitted notification moves the leg"
+        );
+        server.stop().await.expect("stop");
         clear(supi);
     }
 

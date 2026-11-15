@@ -550,6 +550,16 @@ fn describe(loc: &Value) -> String {
     )
 }
 
+/// Whether `token` is this process's subscription callback token while
+/// UE_MOBILITY is served: the check both the handler and the server's OAuth2
+/// callback exemption (#1421) apply.
+pub fn holds_callback_token(token: &str) -> bool {
+    serving()
+        && CALLBACK_TOKEN
+            .get()
+            .is_some_and(|t| token_matches(t, token))
+}
+
 /// `POST /nnwdaf-callback/v1/amf-location-notify/{token}`: Namf_EventExposure
 /// Notify from the AMF this NWDAF subscribed to.
 ///
@@ -562,11 +572,7 @@ pub fn handle_location_notify(
     token: &str,
     request: &SbiRequest,
 ) -> SbiResponse {
-    if !serving()
-        || !CALLBACK_TOKEN
-            .get()
-            .is_some_and(|t| token_matches(t, token))
-    {
+    if !holds_callback_token(token) {
         REFUSED.fetch_add(1, Ordering::Relaxed);
         log::warn!(
             "ue-mobility: location notify on a subscription this NWDAF does not hold; refused"
