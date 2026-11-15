@@ -109,6 +109,10 @@ pub struct Settings {
     pub poll_ms: u64,
     pub prediction_horizon_secs: u64,
     pub dry_run: bool,
+    /// How the controller's restore retries until the SMF confirms it (#1453). Not
+    /// configurable: [`crate::sbi_path::RestoreRetry::DEFAULT`], so the controller
+    /// and the boot restore behave alike. Tests shorten it.
+    pub restore_retry: crate::sbi_path::RestoreRetry,
 }
 
 impl Settings {
@@ -156,6 +160,7 @@ impl Settings {
             poll_ms: y.poll_ms.unwrap_or(1000).max(100),
             prediction_horizon_secs: y.prediction_horizon_secs.unwrap_or(5).max(1),
             dry_run: y.dry_run.unwrap_or(false),
+            restore_retry: crate::sbi_path::RestoreRetry::DEFAULT,
         };
         if s.floor_kbps == 0 {
             return Err("pcf.congestion_loop.floor_kbps must be positive".into());
@@ -458,9 +463,15 @@ fn observed(obs: Option<Observation>) -> String {
     }
 }
 
-/// Carry out `action`: write or clear the cap, then notify the SMF. Returns the
-/// cap installed (throttle) for the log.
-pub fn execute(s: &Settings, action: &Action, obs: Option<Observation>) {
+/// Carry out `action`: write or clear the cap, then notify the SMF.
+///
+/// A restore returns its task ([`crate::sbi_path::restore_demo_cap`]), which ends
+/// with the confirmed outcome; the controller does not wait for it.
+pub fn execute(
+    s: &Settings,
+    action: &Action,
+    obs: Option<Observation>,
+) -> Option<tokio::task::JoinHandle<crate::sbi_path::RestoreOutcome>> {
     let ctx = crate::context::pcf_self();
     match action {
         Action::Throttle {
@@ -478,7 +489,7 @@ pub fn execute(s: &Settings, action: &Action, obs: Option<Observation>) {
                     DEMO_KEY,
                     "congestion-loop: no session data for {supi}; not throttled"
                 );
-                return;
+                return None;
             };
             let cap = Cap {
                 uplink_bps: s.cap_for(sd.ambr_uplink),
@@ -498,7 +509,7 @@ pub fn execute(s: &Settings, action: &Action, obs: Option<Observation>) {
                 if s.dry_run { " dry-run" } else { "" }
             );
             if s.dry_run {
-                return;
+                return None;
             }
             ambr_override::set(sm_policy_id, DEMO_KEY, cap);
             persist_cap(
@@ -507,9 +518,11 @@ pub fn execute(s: &Settings, action: &Action, obs: Option<Observation>) {
                     writer: DEMO_KEY.to_string(),
                     uplink_bps: cap.uplink_bps,
                     downlink_bps: cap.downlink_bps,
+                    generation: crate::context::next_demo_cap_generation(),
                 }),
             );
             crate::sbi_path::pcf_sbi_send_smpolicycontrol_update_notify(*sess_id);
+            None
         }
         Action::Restore {
             sess_id,
@@ -526,24 +539,32 @@ pub fn execute(s: &Settings, action: &Action, obs: Option<Observation>) {
                 if s.dry_run { " dry-run" } else { "" }
             );
             if s.dry_run {
-                return;
+                return None;
             }
+            // #1453: the in-memory cap goes now, so the decision sent is the
+            // subscribed one. The RECORD stays until the SMF confirms that decision:
+            // `restore_demo_cap` clears it on a 2xx (or a 404) and keeps it, for the
+            // next start-up, if the SMF never answers. It used to be cleared here,
+            // before a fire-and-forget notify, so an SMF down for the whole retry
+            // chain left UE-B capped with nothing in pcfd that knew it.
             if ambr_override::clear(sm_policy_id, DEMO_KEY) {
-                persist_cap(*sess_id, None);
-                crate::sbi_path::pcf_sbi_send_smpolicycontrol_update_notify(*sess_id);
+                let retry = s.restore_retry;
+                let sess_id = *sess_id;
+                return Some(tokio::spawn(async move {
+                    crate::sbi_path::restore_demo_cap(sess_id, retry).await
+                }));
             }
+            None
         }
     }
 }
 
 /// Record on the session (and so in the durable state) the cap the SMF is about
 /// to hold, so a pcfd restart can undo it ([`crate::sbi_path::pcf_restore_demo_capped_sessions`]).
+/// In place (#1453), so it cannot interleave with a restore clearing the record.
 fn persist_cap(sess_id: u64, cap: Option<crate::context::DemoAmbrCap>) {
     if let Ok(ctx) = crate::context::pcf_self().read() {
-        if let Some(mut sess) = ctx.sess_find_by_id(sess_id) {
-            sess.demo_ambr_cap = cap;
-            ctx.sess_update(&sess);
-        }
+        ctx.sess_modify(sess_id, |sess| sess.demo_ambr_cap = cap);
     }
 }
 
@@ -631,7 +652,8 @@ async fn run(s: Settings, prediction: bool) {
             Ok(actions) => {
                 last_hold = None;
                 for a in &actions {
-                    execute(&s, a, obs);
+                    // A restore's task reports its own outcome; not awaited here.
+                    let _ = execute(&s, a, obs);
                 }
             }
             Err(hold) => {

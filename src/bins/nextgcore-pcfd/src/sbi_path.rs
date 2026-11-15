@@ -1015,7 +1015,7 @@ pub fn pcf_sbi_send_smpolicycontrol_delete_notify(sess_id: u64, app_session_id: 
 ///
 /// Returns `(notified, unnotifiable)`.
 /// How [`restore_demo_cap`] retries an undelivered restore.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RestoreRetry {
     /// Rounds of delivery, each one a full [`send_notification_post`].
     pub rounds: u32,
@@ -1105,17 +1105,36 @@ pub async fn restore_demo_cap(sess_id: u64, retry: RestoreRetry) -> RestoreOutco
                 continue;
             }
         };
-        // Confirmed: clear the record, unless a demo wrote a new one meanwhile.
+        // #1453: a demo capped the session again while this restore was in flight.
+        // Its notify may have reached the SMF BEFORE this one, which the SMF then
+        // applied last, leaving it at the subscribed rate while pcfd holds a cap.
+        // The decision in force (the cap) is sent again, after this one, so the
+        // SMF ends where pcfd is. The new record is the new throttle's, and stays.
+        #[cfg(feature = "demo-d441a-congestion-loop")]
+        if outcome == RestoreOutcome::Delivered
+            && crate::ambr_override::get(&sess.sm_policy_id).is_some()
+        {
+            log::warn!(
+                "[sm_policy_id={}] demo cap restore delivered while the session was capped \
+                 again; re-sending the capped decision so the SMF ends at it (nextgsim#465)",
+                sess.sm_policy_id
+            );
+            pcf_sbi_send_smpolicycontrol_update_notify(sess_id);
+            return RestoreOutcome::Superseded;
+        }
+        // Confirmed: clear the record, unless a demo wrote a new one meanwhile. The
+        // generation tells a new throttle with the same cap from the one undone
+        // (#1453), and the compare-and-clear is one in-place change, so a throttle's
+        // write cannot land between the compare and the clear.
         if let Ok(ctx) = crate::context::pcf_self().read() {
-            if let Some(mut stored) = ctx.sess_find_by_id(sess_id) {
+            ctx.sess_modify(sess_id, |stored| {
                 if stored.demo_ambr_cap.as_ref() == Some(&recorded) {
                     stored.demo_ambr_cap = None;
                 }
                 if outcome == RestoreOutcome::Delivered {
                     stored.authorised_session_data = Some(sd);
                 }
-                ctx.sess_update(&stored);
-            }
+            });
         }
         log::warn!(
             "[sm_policy_id={}] demo cap {recorded:?} undone: the SMF {} (nextgsim#465)",
