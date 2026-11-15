@@ -167,6 +167,12 @@ impl Mongo {
             .insert_one(document, None)
             .expect("provision the subscriber");
     }
+
+    /// Take the store away under a running pcrfd.
+    fn kill(&self) {
+        let out = docker(&["kill", &self.id]);
+        assert!(out.status.success(), "docker kill the store");
+    }
 }
 
 fn free_port() -> u16 {
@@ -216,9 +222,25 @@ fn subscriber(imsi: &str) -> nextgcore_dbi::mongodb::bson::Document {
 }
 
 fn build_ccr_i(session_id: &str, imsi: &str) -> DiameterMessage {
+    build_ccr(session_id, imsi, 1, 0, &[])
+}
+
+/// CC-Request-Type values (RFC 4006 §8.3).
+const UPDATE_REQUEST: i32 = 2;
+const TERMINATION_REQUEST: i32 = 3;
+/// Event-Trigger RAT_CHANGE (TS 29.212 §5.3.7).
+const RAT_CHANGE: i32 = 2;
+
+fn build_ccr(
+    session_id: &str,
+    imsi: &str,
+    cc_request_type: i32,
+    cc_request_number: u32,
+    triggers: &[i32],
+) -> DiameterMessage {
     let mut ccr = DiameterMessage::new_request(gx_cmd::CREDIT_CONTROL, GX_APPLICATION_ID);
-    ccr.header.hop_by_hop_id = 0x1459;
-    ccr.header.end_to_end_id = 0x14590;
+    ccr.header.hop_by_hop_id = 0x1459_0000 + cc_request_number;
+    ccr.header.end_to_end_id = 0x1459_1000 + cc_request_number;
     for avp in [
         Avp::mandatory(
             avp_code::SESSION_ID,
@@ -240,9 +262,14 @@ fn build_ccr_i(session_id: &str, imsi: &str) -> DiameterMessage {
             avp_code::DESTINATION_REALM,
             AvpData::DiameterIdentity(REALM.to_string()),
         ),
-        // INITIAL_REQUEST, number 0.
-        Avp::mandatory(gx_avp::CC_REQUEST_TYPE, AvpData::Enumerated(1)),
-        Avp::mandatory(gx_avp::CC_REQUEST_NUMBER, AvpData::Unsigned32(0)),
+        Avp::mandatory(
+            gx_avp::CC_REQUEST_TYPE,
+            AvpData::Enumerated(cc_request_type),
+        ),
+        Avp::mandatory(
+            gx_avp::CC_REQUEST_NUMBER,
+            AvpData::Unsigned32(cc_request_number),
+        ),
         Avp::mandatory(
             avp_code::SUBSCRIPTION_ID,
             AvpData::Grouped(vec![
@@ -265,7 +292,141 @@ fn build_ccr_i(session_id: &str, imsi: &str) -> DiameterMessage {
     ] {
         ccr.add_avp(avp);
     }
+    for trigger in triggers {
+        ccr.add_avp(Avp::vendor_mandatory(
+            gx_avp::EVENT_TRIGGER,
+            NEXTGCORE_3GPP_VENDOR_ID,
+            AvpData::Enumerated(*trigger),
+        ));
+    }
     ccr
+}
+
+/// The session-level APN-AMBR (UL, DL) a CCA provisions, `None` when it carries no
+/// session QoS-Information.
+fn apn_ambr(cca: &DiameterMessage) -> Option<(Option<u32>, Option<u32>)> {
+    let qos = cca
+        .find_vendor_avp(gx_avp::QOS_INFORMATION, NEXTGCORE_3GPP_VENDOR_ID)?
+        .parse_grouped()
+        .unwrap();
+    let ambr = |code| find_avp(&qos, code).and_then(|a| a.as_u32());
+    Some((
+        ambr(gx_avp::APN_AGGREGATE_MAX_BITRATE_UL),
+        ambr(gx_avp::APN_AGGREGATE_MAX_BITRATE_DL),
+    ))
+}
+
+/// The Experimental-Result-Code of an answer, if it carries one.
+fn experimental_result(cca: &DiameterMessage) -> Option<u32> {
+    let exp = cca
+        .find_avp(avp_code::EXPERIMENTAL_RESULT)?
+        .parse_grouped()
+        .unwrap();
+    assert_eq!(
+        find_avp(&exp, avp_code::VENDOR_ID).and_then(|a| a.as_u32()),
+        Some(NEXTGCORE_3GPP_VENDOR_ID),
+        "a 3GPP experimental result"
+    );
+    find_avp(&exp, avp_code::EXPERIMENTAL_RESULT_CODE).and_then(|a| a.as_u32())
+}
+
+/// Send `ccr` and answer (the CCA, how long it took).
+async fn exchange(peer: &mut DiameterPeer, ccr: &DiameterMessage) -> (DiameterMessage, Duration) {
+    let started = Instant::now();
+    peer.send_message(ccr).await.expect("send CCR");
+    let cca = tokio::time::timeout(Duration::from_secs(40), next_message(peer))
+        .await
+        .expect("a CCA within 40 s");
+    (cca, started.elapsed())
+}
+
+/// #1539 review: the store dies under a running pcrfd, with the shipped URI shape
+/// (no timeout options; nextgcore-dbi bounds selection at 1 s, #1462).
+///
+/// - A live session's CCR-U(RAT_CHANGE) is answered 2001 with **no** QoS
+///   provisioning, so the PCEF keeps enforcing the subscriber's real policy,
+///   instead of being re-authorized onto the local default.
+/// - A new CCR-I is rejected with DIAMETER_ERROR_INITIAL_PARAMETERS (5140), per
+///   TS 29.212 §4.5.1, instead of being established on the default.
+/// - Each is answered in about one server selection, inside a PCEF's Tx timer.
+/// - A CCR-T does not need the store and is answered promptly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_store_outage_neither_downgrades_live_sessions_nor_invents_new_ones() {
+    let Some(mongo) = Mongo::start() else {
+        return;
+    };
+    let imsi = "001010000014591";
+    mongo.provision(subscriber(imsi));
+    let dir = Scratch::new("outage");
+    let port = free_port();
+    let _pcrfd = Killed(
+        pcrfd_command(&dir, &mongo.uri(), port)
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn pcrfd"),
+    );
+    let mut pcef = connect_pcef(port).await;
+    let sid = "pgw-1459;2;outage";
+
+    // Store up: the session is established, and a RAT change re-authorizes it,
+    // both from the subscription.
+    let (cca, _) = exchange(&mut pcef, &build_ccr_i(sid, imsi)).await;
+    assert_eq!(cca.result_code(), Some(2001));
+    assert_eq!(apn_ambr(&cca), Some((Some(7_000_000), Some(13_000_000))));
+    let (cca, _) = exchange(
+        &mut pcef,
+        &build_ccr(sid, imsi, UPDATE_REQUEST, 1, &[RAT_CHANGE]),
+    )
+    .await;
+    assert_eq!(cca.result_code(), Some(2001));
+    assert_eq!(
+        apn_ambr(&cca),
+        Some((Some(7_000_000), Some(13_000_000))),
+        "with the store up, a RAT change re-authorizes from the subscription"
+    );
+
+    mongo.kill();
+
+    let (cca, took) = exchange(
+        &mut pcef,
+        &build_ccr(sid, imsi, UPDATE_REQUEST, 2, &[RAT_CHANGE]),
+    )
+    .await;
+    assert_eq!(cca.result_code(), Some(2001), "the live session is kept");
+    assert_eq!(
+        apn_ambr(&cca),
+        None,
+        "no re-authorization during the outage: the PCEF keeps 7/13 Mbps, not the default"
+    );
+    assert!(
+        cca.find_vendor_avp(gx_avp::DEFAULT_EPS_BEARER_QOS, NEXTGCORE_3GPP_VENDOR_ID)
+            .is_none(),
+        "no default-bearer QoS either"
+    );
+    eprintln!("outage CCA-U answered in {took:?}");
+    assert!(took < Duration::from_secs(3), "CCA-U took {took:?}");
+
+    let (cca, took) = exchange(&mut pcef, &build_ccr_i("pgw-1459;3;outage", imsi)).await;
+    assert_eq!(
+        cca.result_code(),
+        None,
+        "an Experimental-Result, not a Result-Code"
+    );
+    assert_eq!(experimental_result(&cca), Some(5140));
+    assert_eq!(apn_ambr(&cca), None, "and no invented policy");
+    eprintln!("outage CCA-I answered in {took:?}");
+    assert!(took < Duration::from_secs(3), "CCA-I took {took:?}");
+
+    let (cca, took) = exchange(
+        &mut pcef,
+        &build_ccr(sid, imsi, TERMINATION_REQUEST, 3, &[]),
+    )
+    .await;
+    assert_eq!(cca.result_code(), Some(2001));
+    assert!(
+        took < Duration::from_millis(500),
+        "CCA-T took {took:?}: it read the store"
+    );
 }
 
 /// Connect to pcrfd as a PCEF and complete CER/CEA, waiting on the listener

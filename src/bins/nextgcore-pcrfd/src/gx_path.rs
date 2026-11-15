@@ -1001,6 +1001,47 @@ pub fn build_cca_error(
     cca
 }
 
+/// Gx Experimental-Result-Code values (TS 29.212 clause 5.5), carried in an
+/// Experimental-Result AVP with Vendor-Id 10415 (RFC 6733 §7.7).
+pub mod gx_experimental_result {
+    /// The bearer, session or subscriber information the PCRF needs for rule
+    /// selection is incomplete, erroneous or not available (TS 29.212 §5.5).
+    pub const DIAMETER_ERROR_INITIAL_PARAMETERS: u32 =
+        nextgcore_diameter::gx::exp_result::ERROR_INITIAL_PARAMETERS;
+}
+
+/// Build a CCA carrying a 3GPP Experimental-Result instead of a Result-Code
+/// (RFC 6733 §7.7: the answer carries one or the other). Not a protocol error,
+/// so the E-bit stays clear.
+pub fn build_cca_experimental_error(
+    ccr: &DiameterMessage,
+    local: &LocalIdentity,
+    experimental_result_code: u32,
+) -> DiameterMessage {
+    let mut cca = DiameterMessage::new_answer(ccr);
+    let cc_request_type = ccr
+        .find_avp(gx_avp::CC_REQUEST_TYPE)
+        .and_then(|a| a.as_u32());
+    let cc_request_number = ccr
+        .find_avp(gx_avp::CC_REQUEST_NUMBER)
+        .and_then(|a| a.as_u32());
+    add_cca_base_avps(&mut cca, ccr, local, cc_request_type, cc_request_number);
+    cca.add_avp(Avp::mandatory(
+        avp_code::EXPERIMENTAL_RESULT,
+        AvpData::Grouped(vec![
+            Avp::mandatory(
+                avp_code::VENDOR_ID,
+                AvpData::Unsigned32(NEXTGCORE_3GPP_VENDOR_ID),
+            ),
+            Avp::mandatory(
+                avp_code::EXPERIMENTAL_RESULT_CODE,
+                AvpData::Unsigned32(experimental_result_code),
+            ),
+        ]),
+    ));
+    cca
+}
+
 /// Build an answer for an unsupported command (Result-Code 3001) or
 /// unsupported application (Result-Code 3007).
 pub fn build_unsupported_answer(
@@ -1072,11 +1113,40 @@ pub fn handle_ccr(
     // administrative change between the initial CCR and an update is therefore
     // visible in the update's answer. Read before the context lock is taken
     // (#1459): the store read is a network round trip, and holding the lock across
-    // it would make every context writer wait on the store.
-    let authorized = build_subscriber_session_data(
-        info.imsi.as_deref().unwrap_or(""),
-        info.apn.as_deref().unwrap_or(""),
-    );
+    // it would make every context writer wait on the store. A termination
+    // provisions nothing, so it does not read the store at all.
+    let authorized = if info.cc_request_type == cc_request_type::TERMINATION_REQUEST {
+        None
+    } else {
+        match build_subscriber_session_data(
+            info.imsi.as_deref().unwrap_or(""),
+            info.apn.as_deref().unwrap_or(""),
+        ) {
+            Ok(data) => Some(data),
+            // TS 29.212 §4.5.1: without the subscriber information the PCRF cannot
+            // provision a decision, and rejects the request with
+            // DIAMETER_ERROR_INITIAL_PARAMETERS; the PCEF then rejects the IP-CAN
+            // session establishment. Answering the local default instead would
+            // establish the session on a policy invented for a subscriber whose
+            // real one could not be read (#1539 review).
+            Err(StoreUnavailable) if info.cc_request_type == cc_request_type::INITIAL_REQUEST => {
+                pcrf_diam_stats().gx.inc_rx_ccr_error();
+                return (
+                    build_cca_experimental_error(
+                        msg,
+                        local,
+                        gx_experimental_result::DIAMETER_ERROR_INITIAL_PARAMETERS,
+                    ),
+                    Vec::new(),
+                );
+            }
+            // A CCR-U during an outage: the session keeps the policy the PCEF
+            // already enforces. Its reports are still applied below; only the
+            // re-authorization is withheld, because re-deriving it from the
+            // default would move a live session onto a policy nobody chose.
+            Err(StoreUnavailable) => None,
+        }
+    };
 
     let ctx = pcrf_self();
     let context = match ctx.read() {
@@ -1097,10 +1167,9 @@ pub fn handle_ccr(
         cc_request_type::INITIAL_REQUEST => {
             context.gx_session_add(&info.session_id);
             let installed: Vec<String> = authorized
-                .pcc_rules
-                .iter()
-                .map(|r| r.name.clone())
-                .collect();
+                .as_ref()
+                .map(|a| a.pcc_rules.iter().map(|r| r.name.clone()).collect())
+                .unwrap_or_default();
             context.gx_session_update(&info.session_id, |session| {
                 session.set_peer_host(&info.origin_host);
                 if let Some(ref imsi) = info.imsi {
@@ -1141,7 +1210,11 @@ pub fn handle_ccr(
                 // unconditional re-provisioning.
                 apply_update_triggers(&context, &info);
                 abort_targets.extend(apply_rule_reports(&context, &info));
-                Ok(GxProvisionDecision::for_update(&info, &authorized))
+                Ok(match &authorized {
+                    Some(authorized) => GxProvisionDecision::for_update(&info, authorized),
+                    // The store is down: provision nothing (#1539 review).
+                    None => GxProvisionDecision::none(),
+                })
             }
         }
         cc_request_type::TERMINATION_REQUEST => {
@@ -1185,7 +1258,7 @@ pub fn handle_ccr(
             let session_data = if decision.is_empty() {
                 None
             } else {
-                Some(authorized)
+                authorized
             };
             pcrf_diam_stats().gx.inc_tx_cca();
             (
@@ -1574,10 +1647,18 @@ mod default_profile {
 /// Build GxSessionData with charging rules for a subscriber/APN pair.
 ///
 /// Looks up the subscriber's policy profile (QoS index, ARP, AMBR) from the
-/// subscription DB. If the DB is not available (e.g. unit-test
-/// environments), falls back to a permissive default profile.
-pub fn build_subscriber_session_data(imsi: &str, apn: &str) -> GxSessionData {
-    let policy = lookup_subscriber_policy(imsi, apn);
+/// subscription DB. A subscriber or APN the store holds nothing for, or no store
+/// configured at all, gets the default profile ("internal policies", TS 29.212
+/// §4.5.5.7). A store that cannot be read is `Err(StoreUnavailable)`: the PCRF then
+/// has no basis for a decision and must not invent one (#1539 review).
+pub fn build_subscriber_session_data(
+    imsi: &str,
+    apn: &str,
+) -> Result<GxSessionData, StoreUnavailable> {
+    let policy = match lookup_subscriber_policy(imsi, apn)? {
+        SubscriberLookup::Provisioned(p) => Some(p),
+        SubscriberLookup::NotProvisioned => None,
+    };
 
     let (qci, arp_prio, arp_cap, arp_vuln, ambr_dl, ambr_ul) = match &policy {
         Some(p) => (
@@ -1642,7 +1723,7 @@ pub fn build_subscriber_session_data(imsi: &str, apn: &str) -> GxSessionData {
         ],
     };
 
-    GxSessionData {
+    Ok(GxSessionData {
         ambr_downlink: ambr_dl,
         ambr_uplink: ambr_ul,
         qos_index: qci,
@@ -1656,7 +1737,7 @@ pub fn build_subscriber_session_data(imsi: &str, apn: &str) -> GxSessionData {
             event_trigger::UE_IP_ADDRESS_ALLOCATE,
             event_trigger::UE_IP_ADDRESS_RELEASE,
         ],
-    }
+    })
 }
 
 /// Run a subscriber-store read so it does not hold a tokio worker (#1459).
@@ -1683,17 +1764,83 @@ struct SubscriberPolicy {
     ambr: nextgcore_dbi::types::NextgcoreAmbr,
 }
 
+/// The subscriber store could not be read (#1539 review): an outage, not an
+/// unprovisioned subscriber. The PCRF then has no basis for a policy decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreUnavailable;
+
+/// What the store says about a subscriber's policy for an APN.
+enum SubscriberLookup {
+    /// The subscriber's provisioned QoS and AMBR for the APN.
+    Provisioned(SubscriberPolicy),
+    /// The store answered, and holds no policy for this subscriber and APN (or no
+    /// store is configured at all): the documented local default applies.
+    NotProvisioned,
+}
+
+/// Whether a store read error means "the store holds nothing for this subscriber"
+/// (the local default applies) or "the store could not be read" (#1539 review).
+///
+/// `NotInitialized` is only ever seen when no store is configured: startup refuses
+/// to run with a configured store it could not open, and dbi stays initialised
+/// after a successful open. A lookup error (`SubscriberNotFound`) or a key the
+/// store cannot be asked for (`InvalidSupi`, `UnsupportedUeIdType`) is an answer
+/// about the subscriber. Everything else (a driver error such as a server
+/// selection timeout, a decode failure) is the store failing.
+fn store_error_is_outage(e: &nextgcore_dbi::mongoc::DbiError) -> bool {
+    use nextgcore_dbi::mongoc::DbiError;
+    !matches!(
+        e,
+        DbiError::NotInitialized
+            | DbiError::NoDbUri
+            | DbiError::SubscriberNotFound(_)
+            | DbiError::InvalidSupi(_)
+            | DbiError::UnsupportedUeIdType(_)
+            | DbiError::FieldNotFound(_)
+            | DbiError::SessionNotFound
+    )
+}
+
+/// The minimum gap between two "store unavailable" WARN lines, so an outage under
+/// load logs a line every few seconds with a count, not one per CCR.
+const STORE_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Log a store read failure at WARN, at most once per [`STORE_WARN_INTERVAL`],
+/// with the number of failures folded into it. No subscriber identity is logged.
+fn warn_store_unavailable(e: &nextgcore_dbi::mongoc::DbiError) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+    static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
+    let now = std::time::Instant::now();
+    if last.is_some_and(|t| now.duration_since(t) < STORE_WARN_INTERVAL) {
+        SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    *last = Some(now);
+    let suppressed = SUPPRESSED.swap(0, Ordering::Relaxed);
+    log::warn!(
+        "Subscriber store unavailable ({e}): CCR-I answered DIAMETER_ERROR_INITIAL_PARAMETERS \
+         (5140), CCR-U keeps the session's current policy ({suppressed} more such failures \
+         since the last report)"
+    );
+}
+
 /// Query the DB for a subscriber's session policy (QoS, ARP, AMBR) for the
-/// given APN. Returns None if the DB is not reachable or the subscriber
-/// has no matching session entry.
-fn lookup_subscriber_policy(imsi: &str, apn: &str) -> Option<SubscriberPolicy> {
+/// given APN.
+fn lookup_subscriber_policy(imsi: &str, apn: &str) -> Result<SubscriberLookup, StoreUnavailable> {
     use nextgcore_dbi::nextgcore_dbi_subscription_data;
     let supi = format!("imsi-{imsi}");
     let subscription_data = match off_runtime(|| nextgcore_dbi_subscription_data(&supi)) {
         Ok(data) => data,
+        Err(e) if store_error_is_outage(&e) => {
+            warn_store_unavailable(&e);
+            return Err(StoreUnavailable);
+        }
         Err(e) => {
-            log::debug!("[{supi}] no subscriber policy from the store ({e}); local default");
-            return None;
+            log::debug!("[{supi}] no subscriber policy in the store ({e}); local default");
+            return Ok(SubscriberLookup::NotProvisioned);
         }
     };
 
@@ -1706,21 +1853,21 @@ fn lookup_subscriber_policy(imsi: &str, apn: &str) -> Option<SubscriberPolicy> {
                 } else {
                     subscription_data.ambr
                 };
-                return Some(SubscriberPolicy {
+                return Ok(SubscriberLookup::Provisioned(SubscriberPolicy {
                     qos: session.qos,
                     ambr,
-                });
+                }));
             }
         }
     }
     // Fall back to UE-level AMBR if present
     if subscription_data.ambr.downlink > 0 || subscription_data.ambr.uplink > 0 {
-        return Some(SubscriberPolicy {
+        return Ok(SubscriberLookup::Provisioned(SubscriberPolicy {
             qos: nextgcore_dbi::types::NextgcoreQos::default(),
             ambr: subscription_data.ambr,
-        });
+        }));
     }
-    None
+    Ok(SubscriberLookup::NotProvisioned)
 }
 
 // ============================================================================
@@ -2609,7 +2756,10 @@ mod tests {
     #[test]
     fn test_build_subscriber_session_data_fallback() {
         // No DB in unit tests -> default profile with one catch-all rule
-        let data = build_subscriber_session_data("001010123456789", "internet");
+        // No store configured in unit tests: NotInitialized is "nothing provisioned",
+        // so the default applies rather than the outage path.
+        let data = build_subscriber_session_data("001010123456789", "internet")
+            .expect("no store configured is not an outage");
         assert!(data.ambr_downlink > 0);
         assert!(data.ambr_uplink > 0);
         assert!(data.qos_index > 0);
@@ -2617,6 +2767,72 @@ mod tests {
         assert_eq!(data.pcc_rules.len(), 1);
         assert!(!data.event_triggers.is_empty());
         assert_eq!(data.pcc_rules[0].name, "pcrf-internet-default");
+    }
+
+    /// #1539 review: which store errors are an outage (no decision possible) and
+    /// which are an answer about the subscriber (the default applies).
+    #[test]
+    fn store_errors_split_into_outage_and_not_provisioned() {
+        use nextgcore_dbi::mongoc::DbiError;
+        for e in [
+            DbiError::NotInitialized,
+            DbiError::SubscriberNotFound("imsi-1".into()),
+            DbiError::InvalidSupi("x".into()),
+            DbiError::UnsupportedUeIdType("x".into()),
+        ] {
+            assert!(!store_error_is_outage(&e), "{e:?} is about the subscriber");
+        }
+        for e in [
+            DbiError::Retry,
+            DbiError::ParseError("decode".into()),
+            DbiError::MongoDb(nextgcore_dbi::mongodb::error::Error::custom(
+                "selection timed out",
+            )),
+        ] {
+            assert!(store_error_is_outage(&e), "{e:?} is the store failing");
+        }
+    }
+
+    /// TS 29.212 §4.5.1 / §5.5: the outage answer to a CCR-I is an
+    /// Experimental-Result (Vendor-Id 10415, code 5140) and no Result-Code, with the
+    /// E-bit clear and the CC-Request type/number echoed.
+    #[test]
+    fn the_initial_parameters_answer_carries_experimental_result_5140() {
+        let ccr = roundtrip(&build_test_ccr("sid-5140", 1, 0));
+        let cca = build_cca_experimental_error(
+            &ccr,
+            &local(),
+            gx_experimental_result::DIAMETER_ERROR_INITIAL_PARAMETERS,
+        );
+        assert!(cca.header.is_answer());
+        assert!(!cca.header.is_error());
+        assert_eq!(cca.result_code(), None);
+        let exp = cca
+            .find_avp(avp_code::EXPERIMENTAL_RESULT)
+            .expect("Experimental-Result")
+            .parse_grouped()
+            .unwrap();
+        assert_eq!(
+            find_avp(&exp, avp_code::VENDOR_ID).and_then(|a| a.as_u32()),
+            Some(NEXTGCORE_3GPP_VENDOR_ID)
+        );
+        assert_eq!(
+            find_avp(&exp, avp_code::EXPERIMENTAL_RESULT_CODE).and_then(|a| a.as_u32()),
+            Some(5140)
+        );
+        assert_eq!(
+            cca.find_avp(gx_avp::CC_REQUEST_TYPE)
+                .and_then(|a| a.as_u32()),
+            Some(1)
+        );
+        assert_eq!(cca.session_id(), Some("sid-5140"));
+    }
+
+    /// The current-thread branch of `off_runtime` (#1539 review NIT): on a
+    /// current-thread runtime `block_in_place` panics, so the read must run inline.
+    #[tokio::test(flavor = "current_thread")]
+    async fn off_runtime_runs_inline_on_a_current_thread_runtime() {
+        assert_eq!(off_runtime(|| 1459), 1459);
     }
 
     #[test]
