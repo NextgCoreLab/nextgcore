@@ -99,6 +99,11 @@ SIM_TAG="${SIM_IMAGE_TAG:-${SIM_TAG}}"
 # The ue image alone, when it is built from a different nextgsim commit than the
 # gnb (a UE-only fix under an unchanged gNB). Default: the gnb/ue tag.
 UE_TAG="${UE_IMAGE_TAG:-${SIM_TAG}}"
+if [[ "${UE_IMAGE_TAG:-}" == "latest" ]]; then
+  warn "UE_IMAGE_TAG=latest is MUTABLE: the kubectl apply below cannot detect a"
+  warn "new ue image, so the ue pod keeps the old one and the rollout wait passes"
+  warn "trivially against a stale pod. Prefer a SHA tag."
+fi
 
 # --- preflight -------------------------------------------------------------
 
