@@ -2,8 +2,8 @@
 //! bearer (#1421).
 //!
 //! TS 33.501 §13.4.1: "The OAuth 2.0 framework does not apply to the
-//! notification operation"; TS 29.500 §6.7.3: for the notify operation "OAuth
-//! 2.0 access token is not used". A conformant notification sender therefore
+//! notification operation"; TS 29.500 §6.10.7 NOTE: "access token is not used
+//! in notification / callback". A conformant notification sender therefore
 //! sends no bearer, and a listener with `require_oauth2` answered 401 to every
 //! notification its own NF subscribed for.
 //!
@@ -290,7 +290,11 @@ mod tests {
                 "{ok}"
             );
         }
-        for bad in [".", "..", "a%2Fb", "%2e%2e", "a b", "a+b", "a;b", "a\\b"] {
+        // "" too: amfd's router drops empty segments, so an empty {var} would
+        // be routed with the segments after it shifted by one.
+        for bad in [
+            "", ".", "..", "a%2Fb", "%2e%2e", "a b", "a+b", "a;b", "a\\b",
+        ] {
             let path = format!("/nx-callback/v1/{bad}/n/{GOOD}");
             assert!(any.match_path("POST", &path).is_none(), "{path}");
         }

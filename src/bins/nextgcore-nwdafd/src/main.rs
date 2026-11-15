@@ -206,12 +206,40 @@ fn oauth2_required(config_path: &str) -> bool {
 
 /// The Nnwdaf callback routes admitted without an OAuth2 bearer when the listener
 /// requires one (#1421): a notification carries no access token (TS 33.501
-/// §13.4.1, TS 29.500 §6.7.3), and each of these is authenticated by the
+/// §13.4.1, TS 29.500 §6.10.7 NOTE), and each of these is authenticated by the
 /// unguessable token this NWDAF minted into the callback URI instead. The server
 /// admits one only when the same check its route applies finds the token held
 /// now; any other request still needs a bearer. Feature-gated routes are listed
 /// only in the builds that serve them.
 fn oauth2_callback_exemptions() -> Vec<nextgcore_sbi::server::OAuth2CallbackExemption> {
+    oauth2_callback_exemptions_from(CallbackSources::PROCESS)
+}
+
+/// Where the D441E callback checks find the state that holds their tokens: the
+/// process-wide monitor and AnLF in production, test instances in a test (a
+/// process-wide one cannot be installed in a test binary without leaking into
+/// every other test).
+#[derive(Clone, Copy)]
+struct CallbackSources {
+    #[cfg(feature = "demo-d441e-model-retrain")]
+    monitor: fn() -> Option<&'static model_monitor::Monitor>,
+    #[cfg(feature = "demo-d441e-model-retrain")]
+    anlf: fn() -> Option<&'static model_retrain::Anlf>,
+}
+
+impl CallbackSources {
+    const PROCESS: Self = Self {
+        #[cfg(feature = "demo-d441e-model-retrain")]
+        monitor: model_monitor::monitor,
+        #[cfg(feature = "demo-d441e-model-retrain")]
+        anlf: model_retrain::anlf,
+    };
+}
+
+#[cfg_attr(not(feature = "demo-d441e-model-retrain"), allow(unused_variables))]
+fn oauth2_callback_exemptions_from(
+    sources: CallbackSources,
+) -> Vec<nextgcore_sbi::server::OAuth2CallbackExemption> {
     use nextgcore_sbi::server::OAuth2CallbackExemption;
     let route = |segment: &str| format!("/nnwdaf-callback/v1/{segment}/{{token}}");
     #[allow(unused_mut)]
@@ -234,18 +262,27 @@ fn oauth2_callback_exemptions() -> Vec<nextgcore_sbi::server::OAuth2CallbackExem
     ));
     #[cfg(feature = "demo-d441e-model-retrain")]
     {
+        let monitor = sources.monitor;
         list.push(OAuth2CallbackExemption::new(
             "POST",
             route(model_monitor::CALLBACK_SEGMENT),
-            |cb| model_monitor::holds_callback_token(model_monitor::monitor(), cb.token),
+            move |cb| model_monitor::holds_callback_token(monitor(), cb.token),
         ));
+        let anlf = sources.anlf;
         list.push(OAuth2CallbackExemption::new(
             "POST",
             route(model_retrain::CALLBACK_SEGMENT),
-            |cb| model_retrain::holds_callback_token(model_retrain::anlf(), cb.token),
+            move |cb| model_retrain::holds_callback_token(anlf(), cb.token),
         ));
     }
     list
+}
+
+/// The NWDAF SBI server for `cfg`, with [`oauth2_callback_exemptions`]
+/// registered (#1421). `main` builds its server here, so a test can see what
+/// it registers.
+fn sbi_server(cfg: NextgcoreSbiServerConfig) -> SbiServer {
+    SbiServer::new(cfg.with_oauth2_callback_exemptions(oauth2_callback_exemptions()))
 }
 
 /// Apply OAuth2 producer enforcement to `cfg` and install the outbound OAuth2
@@ -527,12 +564,9 @@ async fn main() -> Result<()> {
     if oauth2_required(&args.config) {
         sbi_server_config = apply_oauth2_enforcement(sbi_server_config, &args.nrf_uri);
     }
-    // #1421: the callbacks this NWDAF subscribed for, admitted on their own token
-    // when the listener requires OAuth2 (a notification carries no bearer).
-    sbi_server_config =
-        sbi_server_config.with_oauth2_callback_exemptions(oauth2_callback_exemptions());
-
-    let sbi_server = SbiServer::new(sbi_server_config);
+    // #1421: the callbacks this NWDAF subscribed for are admitted on their own
+    // token when the listener requires OAuth2 (a notification carries no bearer).
+    let sbi_server = sbi_server(sbi_server_config);
 
     log::info!("Starting NWDAF SBI server on {addr}");
     sbi_server
@@ -2405,18 +2439,140 @@ mod callback_oauth2_1421_tests {
     use serde_json::json;
 
     async fn oauth2_listener() -> (SbiServer, u16) {
+        oauth2_listener_with(oauth2_callback_exemptions(), nwdaf_sbi_request_handler).await
+    }
+
+    async fn oauth2_listener_with<H: nextgcore_sbi::server::SbiRequestHandler>(
+        exemptions: Vec<nextgcore_sbi::server::OAuth2CallbackExemption>,
+        handler: H,
+    ) -> (SbiServer, u16) {
         let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let mut cfg = NextgcoreSbiServerConfig::new(addr)
             .with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Nwdaf)
-            .with_oauth2_callback_exemptions(oauth2_callback_exemptions());
+            .with_oauth2_callback_exemptions(exemptions);
         cfg.require_oauth2 = true;
         cfg.oauth2_jwks = Some(json!({"keys": []}));
         let server = SbiServer::on_listener(cfg, listener);
-        server
-            .start(nwdaf_sbi_request_handler)
-            .await
-            .expect("server start");
+        server.start(handler).await.expect("server start");
         (server, addr.port())
+    }
+
+    /// The server `main` builds registers every callback this build serves.
+    #[test]
+    fn the_nwdaf_server_registers_its_callback_exemptions() {
+        let server = sbi_server(NextgcoreSbiServerConfig::new(SocketAddr::from((
+            [127, 0, 0, 1],
+            0,
+        ))));
+        let routes: Vec<String> = server
+            .config()
+            .oauth2_callback_exemptions
+            .iter()
+            .map(|e| e.route())
+            .collect();
+        #[allow(unused_mut)]
+        let mut want = vec!["POST /nnwdaf-callback/v1/nf-status-notify/{token}"];
+        #[cfg(feature = "amf-mobility")]
+        want.push("POST /nnwdaf-callback/v1/amf-location-notify/{token}");
+        #[cfg(feature = "demo-d441a-congestion-loop")]
+        want.push("POST /nnwdaf-callback/v1/amf-ues-in-area-notify/{token}");
+        #[cfg(feature = "demo-d441e-model-retrain")]
+        {
+            want.push("POST /nnwdaf-callback/v1/mlmodel-monitor-notify/{token}");
+            want.push("POST /nnwdaf-callback/v1/mtlf-model-notify/{token}");
+        }
+        assert_eq!(routes, want);
+    }
+
+    #[cfg(feature = "demo-d441e-model-retrain")]
+    static TEST_MONITOR: std::sync::OnceLock<model_monitor::Monitor> = std::sync::OnceLock::new();
+    #[cfg(feature = "demo-d441e-model-retrain")]
+    static TEST_ANLF: std::sync::OnceLock<model_retrain::Anlf> = std::sync::OnceLock::new();
+
+    /// nextgsim#468 (the case #1421's comment reproduced): an AnLF's
+    /// MLModelProvision notify and an MTLF's MLModelMonitor notify, token-less,
+    /// reach the real handlers on the held notifUri / notificationUri token over
+    /// an OAuth2-required listener, and a forged token is 401. The exemptions'
+    /// state is injected (`CallbackSources`), the same instances the handlers get.
+    #[cfg(feature = "demo-d441e-model-retrain")]
+    #[tokio::test]
+    async fn the_d441e_notifies_are_admitted_on_their_tokens_only() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        fn monitor() -> Option<&'static model_monitor::Monitor> {
+            Some(TEST_MONITOR.get_or_init(|| {
+                model_monitor::Monitor::new(
+                    "retrain",
+                    role::Role::Mtlf,
+                    "http://m",
+                    "m",
+                    "http://n",
+                )
+            }))
+        }
+        fn anlf() -> Option<&'static model_retrain::Anlf> {
+            Some(TEST_ANLF.get_or_init(model_retrain::Anlf::new))
+        }
+        let sources = CallbackSources { monitor, anlf };
+        let (server, port) = oauth2_listener_with(
+            oauth2_callback_exemptions_from(sources),
+            move |req: SbiRequest| async move {
+                let parts: Vec<String> = req.header.uri.split('/').map(str::to_owned).collect();
+                let (segment, token) = (parts[3].as_str(), parts[4].as_str());
+                if segment == model_retrain::CALLBACK_SEGMENT {
+                    model_retrain::handle_model_notify(anlf(), nwdaf_self(), token, &req)
+                } else {
+                    model_monitor::handle_notify(monitor(), token, &req)
+                }
+            },
+        )
+        .await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        let post = |segment: &str, token: &str, body: serde_json::Value| {
+            SbiRequest::post(format!("/nnwdaf-callback/v1/{segment}/{token}"))
+                .with_body(body.to_string(), "application/json")
+        };
+        let forged = uuid::Uuid::new_v4().simple().to_string();
+        let prov = json!([{ "subscriptionId": "s-1421", "eventNotifs": [] }]);
+        let accu = json!({ "notifCorrId": "corr-1421", "modelAccuInfos": [] });
+
+        let (seg_p, tok_p) = (
+            model_retrain::CALLBACK_SEGMENT,
+            model_retrain::test_token(anlf()),
+        );
+        let (seg_m, tok_m) = (
+            model_monitor::CALLBACK_SEGMENT,
+            model_monitor::test_token(monitor()),
+        );
+        assert_eq!(
+            status(&client, post(seg_p, &forged, prov.clone())).await,
+            401
+        );
+        assert_eq!(
+            status(&client, post(seg_m, &forged, accu.clone())).await,
+            401
+        );
+
+        // MLModelProvision notify with no model to fetch: 204 from the handler.
+        assert_eq!(status(&client, post(seg_p, &tok_p, prov)).await, 204);
+        // MLModelMonitor notify: past the token check, the handler looks the
+        // registration up (none here), so its own 404 answers, not the gate.
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.send_request(post(seg_m, &tok_m, accu)),
+        )
+        .await
+        .expect("bounded")
+        .expect("response");
+        assert_eq!(resp.status, 404);
+        assert!(
+            resp.http
+                .content
+                .as_deref()
+                .is_some_and(|b| b.contains("no MLModelMonitor registration corr-1421")),
+            "{:?}",
+            resp.http.content
+        );
+        server.stop().await.expect("stop");
     }
 
     async fn status(client: &SbiClient, req: SbiRequest) -> u16 {

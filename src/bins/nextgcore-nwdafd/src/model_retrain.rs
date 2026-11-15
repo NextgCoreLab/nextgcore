@@ -592,6 +592,12 @@ pub fn model_urls(body: &Value) -> Result<Vec<String>, String> {
     Ok(urls)
 }
 
+/// #1421 tests: the callback token `anlf` hands out.
+#[cfg(test)]
+pub(crate) fn test_token(x: Option<&Anlf>) -> String {
+    x.map(|x| x.token.clone()).unwrap_or_default()
+}
+
 /// Whether `token` is `anlf`'s notifUri token: the check both the handler and
 /// the server's OAuth2 callback exemption (#1421) apply.
 pub fn holds_callback_token(anlf: Option<&Anlf>, token: &str) -> bool {

@@ -85,7 +85,7 @@ pub struct SbiServerConfig {
     pub oauth2_expected_audience: Option<String>,
     /// #1421: callback routes this NF serves that are admitted WITHOUT a bearer
     /// token when `require_oauth2` is enabled, because the notification
-    /// operation does not use OAuth 2.0 (TS 33.501 §13.4.1, TS 29.500 §6.7.3).
+    /// operation does not use OAuth 2.0 (TS 33.501 §13.4.1, TS 29.500 §6.10.7 NOTE).
     /// Each one is an exact route shape plus the NF's check of the
     /// per-subscription token in its path (see [`crate::callback_auth`]); a
     /// request that is not one of them, or whose token the NF does not hold,
@@ -499,7 +499,7 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
             // obtain verification keys is ours (503).
             // #1421: a notification to a callback route this NF registered, whose
             // path carries a callback token the NF holds, is not an OAuth 2.0
-            // protected access (TS 33.501 §13.4.1, TS 29.500 §6.7.3): it is
+            // protected access (TS 33.501 §13.4.1, TS 29.500 §6.10.7 NOTE): it is
             // authenticated by that token, and the bearer is not consulted.
             let oauth = oauth.filter(|verifier| {
                 let exempt = crate::callback_auth::admits_without_bearer(

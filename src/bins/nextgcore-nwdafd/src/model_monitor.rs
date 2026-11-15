@@ -836,6 +836,12 @@ pub fn spawn_upkeep(m: &'static Monitor, ctx: std::sync::Arc<RwLock<NwdafContext
     });
 }
 
+/// #1421 tests: the callback token `monitor` hands out.
+#[cfg(test)]
+pub(crate) fn test_token(x: Option<&Monitor>) -> String {
+    x.map(|x| x.token.clone()).unwrap_or_default()
+}
+
 /// Whether `token` is `m`'s notificationUri token on an MTLF: the check both
 /// the handler and the server's OAuth2 callback exemption (#1421) apply.
 pub fn holds_callback_token(m: Option<&Monitor>, token: &str) -> bool {

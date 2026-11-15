@@ -1619,6 +1619,25 @@ mod tests {
         clear(supi);
     }
 
+    /// **#1421.** The server the composition root builds registers the
+    /// subscription-change callback exemption.
+    #[test]
+    fn the_udm_server_registers_its_callback_exemptions() {
+        let server = crate::app::sbi_server(nextgcore_sbi::server::SbiServerConfig::new(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        ));
+        let routes: Vec<String> = server
+            .config()
+            .oauth2_callback_exemptions
+            .iter()
+            .map(|e| e.route())
+            .collect();
+        assert_eq!(
+            routes,
+            ["POST /nudm-callback/v1/{var}/ee-amf-subs-change/{token}"]
+        );
+    }
+
     /// **#1449 review 10.** Forged subscription-change calls (unknown ids, and a
     /// real id with a wrong token) are refused without creating a lock entry, so
     /// wire input cannot grow the lock map.

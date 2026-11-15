@@ -581,11 +581,9 @@ pub async fn run() -> Result<()> {
         nextgcore_sbi::types::NfType::Udm,
         &nrf_uri,
     )?;
-    // #1421: the callbacks this UDM subscribed for, admitted on their own token
-    // when the listener requires OAuth2 (a notification carries no bearer).
-    sbi_server_config =
-        sbi_server_config.with_oauth2_callback_exemptions(oauth2_callback_exemptions());
-    let sbi_server = SbiServer::new(sbi_server_config);
+    // #1421: the callbacks this UDM subscribed for are admitted on their own
+    // token when the listener requires OAuth2 (a notification carries no bearer).
+    let sbi_server = sbi_server(sbi_server_config);
 
     sbi_server
         .start(udm_sbi_request_handler)
@@ -749,7 +747,7 @@ fn unmatched(allowed: Option<&[&str]>, method: &str, uri: &str) -> SbiResponse {
 
 /// The Nudm callback routes admitted without an OAuth2 bearer when the listener
 /// requires one (#1421): a notification carries no access token (TS 33.501
-/// §13.4.1, TS 29.500 §6.7.3). The AMF's Namf_EventExposure subscription-change
+/// §13.4.1, TS 29.500 §6.10.7 NOTE). The AMF's Namf_EventExposure subscription-change
 /// notification (#1440) is authenticated by the change token this UDM minted into
 /// its `subsChangeNotifyUri` instead; the server admits it only when that token
 /// is the named leg's current one. Any other request still needs a bearer.
@@ -766,6 +764,13 @@ pub fn oauth2_callback_exemptions() -> Vec<nextgcore_sbi::server::OAuth2Callback
                 .is_some_and(|id| crate::ee_amf::token_matches(id, cb.token))
         },
     )]
+}
+
+/// The UDM SBI server for `cfg`, with [`oauth2_callback_exemptions`] registered
+/// (#1421). The composition root builds its server here, so a test can see what
+/// it registers.
+pub fn sbi_server(cfg: NextgcoreSbiServerConfig) -> SbiServer {
+    SbiServer::new(cfg.with_oauth2_callback_exemptions(oauth2_callback_exemptions()))
 }
 
 /// Route an inbound SBI request to the UDM service handlers.
