@@ -1,0 +1,539 @@
+# D443A compose stack (nextgsim#471): eesd picks the edge server on a
+# UPF-measured communication + compute budget. The 5GC (smfd with N6 delay
+# measurement and QOS_MON, upfd with UN6DM and QFQM), eesd, three EAS sidecars
+# (nr-she-eas: EDGE-3 registration, STAMP Session-Reflector, job listener) on
+# their own data network dn, one gNB with QMP, one UE with the EEC client.
+#
+# STANDALONE, NOT AN OVERLAY (the docker-compose.demo-n2ho.yml rule): the base
+# file publishes host ports, and compose merges `ports:` lists. This file
+# publishes nothing, and both networks are `internal` (no route off the host).
+# It shares the base stack's 172.23.0.0/24, so the two cannot run at once.
+#
+#   network  subnet          who
+#   core     172.23.0.0/24   the 5GC, eesd .31, gNB .100, UE .101
+#   dn       10.60.0.0/24    the UPF's N6 leg .2, eas-local .11, eas-regional .12, eas-cloud .13
+#
+# The UE's EEC and job sockets ride its PDU session (uesimtun0) to the UPF. Jobs
+# go onto dn WITHOUT source NAT (UPF_NAT_EXCLUDE=10.60.0.0/24), so EAS-EXEC logs
+# the UE's 10.45.0.0/16 address; the EASes route 10.45.0.0/16 back through the
+# UPF. The EEC's calls to eesd and the NRF are NATed by the UPF onto core.
+# smfd provisions N6 delay measurement toward 10.60.0.11-13:8620 (STAMP), and
+# eesd subscribes to QOS_MON at smfd; the notify carries no token (TS 33.501
+# §13.4.1) and is admitted on its path token (#1525).
+#
+# STAND-IN, labelled: eesd's entrypoint registers a profile with the custom
+# nfType "EES" at the NRF (the EES is not an NRF NF type, TS 29.510; the NRF
+# grants eees-* scopes only with such a producer, #1391).
+#
+# The acts (netem needs NET_ADMIN in these containers, and sch_netem on the host):
+#   Act 2  docker compose -f docker-compose.demo-d443a.yml exec eas-local tc qdisc add dev eth0 root netem delay 16ms
+#   Act 3  docker compose -f docker-compose.demo-d443a.yml exec gnb-netem sh -c 'tc qdisc add dev eth0 root handle 1: prio &&
+#            tc qdisc add dev eth0 parent 1:3 handle 30: netem delay 20ms &&
+#            tc filter add dev eth0 parent 1:0 protocol ip prio 1 u32 match ip dport 2152 0xffff flowid 1:3'
+#   load   docker compose -f docker-compose.demo-d443a.yml kill -s USR1 eas-local   (EAS_LOCAL_ARGS="--load 5")
+#   jobs   docker compose -f docker-compose.demo-d443a.yml exec ue sh -c 'nr-cli $(nr-cli --dump | head -1) -e "she-offload job count=10"'
+#
+# Mode: D443A_MODE=measured-budget (default) or static. EAS_LOCAL_ARGS adds
+# eas-local's flags ("--load 5", the revert arm "--load 5 --no-kpi-patch").
+# Every demo: block is in this file's configs (configs/demo-d443a/), none in the
+# shared ones.
+#
+# Images: the core NFs with the 6G profile's features, eesd and smfd with
+# --features demo-d443a-edge-budget, the default nr-gnb, and the demo UE image
+# (nr-ue with demo-d443a-edge-budget, nr-cli, nr-she-eas, iproute2;
+# deploy/eks/overlays/demo-d443a-edge-budget/Dockerfile.ue-d443a).
+# NEXTGCORE_TAG / NEXTGSIM_TAG pick the tags (default latest), NEXTGSIM_DIR the
+# nextgsim checkout.
+#
+# Usage:
+#   docker compose -f docker-compose.demo-d443a.yml up -d
+#   docker compose -f docker-compose.demo-d443a.yml logs -f ees eas-local ue
+#   docker compose -f docker-compose.demo-d443a.yml down -v
+
+name: nextg-demo-d443a
+
+x-common: &common
+  restart: on-failure:5
+  environment: &common-env
+    RUST_LOG: info
+    RUST_BACKTRACE: 1
+    # The local development profile, as in docker-compose.yml: cleartext h2c SBI.
+    NEXTGCORE_SBI_PROFILE: "dev"
+    TLS_ENABLED: "false"
+    SBI_SCHEME: "http"
+
+x-nf-healthcheck: &nf-healthcheck
+  healthcheck:
+    test: ["CMD-SHELL", "kill -0 1"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 5s
+
+services:
+  mongodb:
+    image: mongo:6.0
+    <<: *common
+    environment:
+      MONGO_INITDB_DATABASE: nextgcore
+    volumes:
+      - mongodb_data:/data/db
+      - ../../docs/assets/webui/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.2
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  nrf:
+    image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/nrf:${NEXTGCORE_TAG:-latest}
+    <<: [*common, *nf-healthcheck]
+    command: ["-c", "/etc/nextgcore/nrf.yaml", "--sbi-addr", "0.0.0.0"]
+    volumes:
+      - ./configs/demo-d443a/nrf.yaml:/etc/nextgcore/nrf.yaml:ro
+      - d443a_cca:/etc/nextgcore/cca-trusted:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.10
+    depends_on:
+      mongodb:
+        condition: service_healthy
+
+  ausf:
+    image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/ausf:${NEXTGCORE_TAG:-latest}
+    <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+      UDM_SBI_ADDR: 172.23.0.12
+      UDM_SBI_PORT: "7777"
+    command: ["-c", "/etc/nextgcore/ausf.yaml"]
+    volumes:
+      - ./configs/5gc/ausf.yaml:/etc/nextgcore/ausf.yaml:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.11
+    depends_on:
+      nrf:
+        condition: service_healthy
+      udm:
+        condition: service_healthy
+
+  udm:
+    image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/udm:${NEXTGCORE_TAG:-latest}
+    <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+      UDR_SBI_ADDR: 172.23.0.20
+      UDR_SBI_PORT: "7777"
+    command: ["-c", "/etc/nextgcore/udm.yaml"]
+    volumes:
+      - ./configs/5gc/udm.yaml:/etc/nextgcore/udm.yaml:ro
+      - ./configs/5gc/hnet:/etc/nextgcore/hnet:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.12
+    depends_on:
+      nrf:
+        condition: service_healthy
+
+  udr:
+    image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/udr:${NEXTGCORE_TAG:-latest}
+    <<: [*common, *nf-healthcheck]
+    command: ["-c", "/etc/nextgcore/udr.yaml"]
+    volumes:
+      - ./configs/5gc/udr.yaml:/etc/nextgcore/udr.yaml:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.20
+    depends_on:
+      nrf:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+
+  pcf:
+    image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/pcf:${NEXTGCORE_TAG:-latest}
+    <<: [*common, *nf-healthcheck]
+    command: ["-c", "/etc/nextgcore/pcf.yaml"]
+    volumes:
+      - ./configs/5gc/pcf.yaml:/etc/nextgcore/pcf.yaml:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.13
+    depends_on:
+      nrf:
+        condition: service_healthy
+      # #1457: pcfd opens its subscriber store at startup and refuses to start
+      # without it.
+      mongodb:
+        condition: service_healthy
+
+  nssf:
+    image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/nssf:${NEXTGCORE_TAG:-latest}
+    <<: [*common, *nf-healthcheck]
+    command: ["-c", "/etc/nextgcore/nssf.yaml"]
+    volumes:
+      - ./configs/5gc/nssf.yaml:/etc/nextgcore/nssf.yaml:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.14
+    depends_on:
+      nrf:
+        condition: service_healthy
+
+  bsf:
+    image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/bsf:${NEXTGCORE_TAG:-latest}
+    <<: [*common, *nf-healthcheck]
+    command: ["-c", "/etc/nextgcore/bsf.yaml"]
+    volumes:
+      - ./configs/5gc/bsf.yaml:/etc/nextgcore/bsf.yaml:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.15
+    depends_on:
+      nrf:
+        condition: service_healthy
+
+  amf:
+    image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/amf:${NEXTGCORE_TAG:-latest}
+    <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+      RUST_LOG: info
+      NEXTGCORE_AMF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-000000000af0
+      AMF_SBI_ADDR: 172.23.0.5
+      AMF_SBI_PORT: "7777"
+      SMF_SBI_ADDR: 172.23.0.4
+      SMF_SBI_PORT: "7777"
+      AUSF_SBI_ADDR: 172.23.0.11
+      AUSF_SBI_PORT: "7777"
+      UDM_SBI_ADDR: 172.23.0.12
+      UDM_SBI_PORT: "7777"
+      PCF_SBI_ADDR: 172.23.0.13
+      PCF_SBI_PORT: "7777"
+    # Every container interface, inside the private network only: no publish.
+    command: ["-c", "/etc/nextgcore/amf.yaml", "--ngap-addr", "0.0.0.0:38412"]
+    volumes:
+      - ./configs/5gc/amf.yaml:/etc/nextgcore/amf.yaml:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.5
+    depends_on:
+      nrf:
+        condition: service_healthy
+      ausf:
+        condition: service_healthy
+      udm:
+        condition: service_healthy
+      pcf:
+        condition: service_healthy
+      nssf:
+        condition: service_healthy
+
+  smf:
+    image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/smf:${NEXTGCORE_TAG:-latest}
+    stop_grace_period: 45s
+    <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+      UPF_PFCP_ADDR: 172.23.0.7
+      UPF_PFCP_PORT: "8805"
+      SMF_PFCP_ADDR: 172.23.0.4
+      SMF_SHUTDOWN_BUDGET_SECS: "43"
+      UDM_SBI_ADDR: 172.23.0.12
+      UDM_SBI_PORT: "7777"
+      SMF_METRICS_PORT: "9090"
+      D443A_MODE: ${D443A_MODE:-measured-budget}
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        sed "s/@MODE@/$$D443A_MODE/" /etc/nextgcore/smf.yaml.in >/tmp/smf.yaml &&
+        exec nf-binary -c /tmp/smf.yaml
+    volumes:
+      - ./configs/demo-d443a/smf.yaml.in:/etc/nextgcore/smf.yaml.in:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.4
+    depends_on:
+      nrf:
+        condition: service_healthy
+      pcf:
+        condition: service_healthy
+      amf:
+        condition: service_healthy
+
+  upf:
+    image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/upf:${NEXTGCORE_TAG:-latest}
+    <<: *common
+    privileged: true
+    user: root
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.ip_forward=1
+    environment:
+      <<: *common-env
+      RUST_LOG: info
+      # #1455: no source NAT toward dn (the EAS sees the UE's address); UN6DM
+      # (STAMP toward the endpoints smfd provisions) and QFQM (QMP with the gNB).
+      UPF_NAT_EXCLUDE: 10.60.0.0/24
+      UPF_N6_DELAY_MEASUREMENT: "true"
+      UPF_QOS_FLOW_MONITORING: "true"
+    command: ["-c", "/etc/nextgcore/upf.yaml", "--pfcp-addr", "172.23.0.7", "--gtpu-addr", "172.23.0.7", "--tun-ip", "10.45.0.1", "--tun-prefix", "16", "--pfcp-allowed-peers", "172.23.0.4"]
+    volumes:
+      - ./configs/5gc/upf.yaml:/etc/nextgcore/upf.yaml:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.7
+      dn:
+        ipv4_address: 10.60.0.2
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    depends_on:
+      smf:
+        condition: service_healthy
+
+  ees:
+    image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/ees:${NEXTGCORE_TAG:-latest}
+    <<: *common
+    environment:
+      <<: *common-env
+      D443A_MODE: ${D443A_MODE:-measured-budget}
+      EES_METRICS_PORT: "9090"
+      NEXTGCORE_METRICS_BIND: "172.23.0.31"
+    entrypoint: ["sh", "/etc/d443a/ees-entry.sh"]
+    command: []
+    volumes:
+      - ./configs/demo-d443a/ees.yaml.in:/etc/nextgcore/ees.yaml.in:ro
+      - ./configs/demo-d443a/ees-entry.sh:/etc/d443a/ees-entry.sh:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.31
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    depends_on:
+      nrf:
+        condition: service_healthy
+      smf:
+        condition: service_healthy
+
+  eas-local:
+    image: ${NEXTGSIM_IMAGE_PREFIX:-nextgsim}-ue:${NEXTGSIM_TAG:-latest}
+    <<: *common
+    user: root
+    cap_drop: [ALL]
+    # NET_ADMIN: the route back to the UEs, and netem (the emulated distance).
+    # CHOWN, SETUID, SETGID, SETPCAP: setpriv's drop to nobody; nr-she-eas runs
+    # with no capabilities. Its listeners bind 10.60.0.11:8620 and :9471 (>= 1024).
+    cap_add: [NET_ADMIN, CHOWN, SETUID, SETGID, SETPCAP]
+    environment:
+      RUST_LOG: info
+      D443A_MODE: ${D443A_MODE:-measured-budget}
+      EAS_ID: eas-local
+      EAS_IP: 10.60.0.11
+      EAS_MR: "10"
+      EAS_AVL: "50"
+      EAS_NF_ID: 6b1d7e3c-0000-4000-8000-0000000471a1
+      EAS_ARGS: ${EAS_LOCAL_ARGS:-}
+    entrypoint: ["sh", "/etc/d443a/eas-entry.sh"]
+    command: []
+    volumes:
+      - ./configs/demo-d443a/eas-entry.sh:/etc/d443a/eas-entry.sh:ro
+      - ./configs/demo-d443a/eas.yaml.in:/etc/d443a/eas.yaml.in:ro
+      - d443a_cca:/var/lib/d443a/cca
+    networks:
+      dn:
+        ipv4_address: 10.60.0.11
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    depends_on:
+      ees:
+        condition: service_healthy
+      upf:
+        condition: service_healthy
+
+  eas-regional:
+    image: ${NEXTGSIM_IMAGE_PREFIX:-nextgsim}-ue:${NEXTGSIM_TAG:-latest}
+    <<: *common
+    user: root
+    cap_drop: [ALL]
+    # NET_ADMIN: the route back to the UEs, and netem (the emulated distance).
+    # CHOWN, SETUID, SETGID, SETPCAP: setpriv's drop to nobody; nr-she-eas runs
+    # with no capabilities. Its listeners bind 10.60.0.12:8620 and :9471 (>= 1024).
+    cap_add: [NET_ADMIN, CHOWN, SETUID, SETGID, SETPCAP]
+    environment:
+      RUST_LOG: info
+      D443A_MODE: ${D443A_MODE:-measured-budget}
+      EAS_ID: eas-regional
+      EAS_IP: 10.60.0.12
+      EAS_MR: "14"
+      EAS_AVL: "50"
+      EAS_NF_ID: 6b1d7e3c-0000-4000-8000-0000000471a2
+      EAS_ARGS: ""
+    entrypoint: ["sh", "/etc/d443a/eas-entry.sh"]
+    command: []
+    volumes:
+      - ./configs/demo-d443a/eas-entry.sh:/etc/d443a/eas-entry.sh:ro
+      - ./configs/demo-d443a/eas.yaml.in:/etc/d443a/eas.yaml.in:ro
+      - d443a_cca:/var/lib/d443a/cca
+    networks:
+      dn:
+        ipv4_address: 10.60.0.12
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    depends_on:
+      ees:
+        condition: service_healthy
+      upf:
+        condition: service_healthy
+
+  eas-cloud:
+    image: ${NEXTGSIM_IMAGE_PREFIX:-nextgsim}-ue:${NEXTGSIM_TAG:-latest}
+    <<: *common
+    user: root
+    cap_drop: [ALL]
+    # NET_ADMIN: the route back to the UEs, and netem (the emulated distance).
+    # CHOWN, SETUID, SETGID, SETPCAP: setpriv's drop to nobody; nr-she-eas runs
+    # with no capabilities. Its listeners bind 10.60.0.13:8620 and :9471 (>= 1024).
+    cap_add: [NET_ADMIN, CHOWN, SETUID, SETGID, SETPCAP]
+    environment:
+      RUST_LOG: info
+      D443A_MODE: ${D443A_MODE:-measured-budget}
+      EAS_ID: eas-cloud
+      EAS_IP: 10.60.0.13
+      EAS_MR: "40"
+      EAS_AVL: "200"
+      EAS_NF_ID: 6b1d7e3c-0000-4000-8000-0000000471a3
+      EAS_ARGS: ""
+    entrypoint: ["sh", "/etc/d443a/eas-entry.sh"]
+    command: []
+    volumes:
+      - ./configs/demo-d443a/eas-entry.sh:/etc/d443a/eas-entry.sh:ro
+      - ./configs/demo-d443a/eas.yaml.in:/etc/d443a/eas.yaml.in:ro
+      - d443a_cca:/var/lib/d443a/cca
+    networks:
+      dn:
+        ipv4_address: 10.60.0.13
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    depends_on:
+      ees:
+        condition: service_healthy
+      upf:
+        condition: service_healthy
+
+  gnb:
+    image: ${NEXTGSIM_IMAGE_PREFIX:-nextgsim}-gnb:${NEXTGSIM_TAG:-latest}
+    <<: *common
+    environment:
+      RUST_LOG: info
+    command: ["-c", "/etc/d443a/gnb.yaml"]
+    volumes:
+      - ./configs/demo-d443a/gnb.yaml:/etc/d443a/gnb.yaml:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.100
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      amf:
+        condition: service_healthy
+      upf:
+        condition: service_healthy
+
+  # Act 3's netem on the gNB's GTP-U egress: shares the gnb container's network
+  # namespace, NET_ADMIN only, runs nothing until `tc` is exec'd in it.
+  gnb-netem:
+    image: ${NEXTGSIM_IMAGE_PREFIX:-nextgsim}-ue:${NEXTGSIM_TAG:-latest}
+    restart: on-failure:5
+    network_mode: service:gnb
+    user: root
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN]
+    entrypoint: ["sh", "-c", "trap 'exit 0' TERM; while :; do sleep 3600 & wait $$!; done"]
+    depends_on:
+      gnb:
+        condition: service_healthy
+
+  ue:
+    image: ${NEXTGSIM_IMAGE_PREFIX:-nextgsim}-ue:${NEXTGSIM_TAG:-latest}
+    <<: *common
+    environment:
+      RUST_LOG: info,nr_ue=warn,nextgsim_ue::rrc=warn
+      D443A_MODE: ${D443A_MODE:-measured-budget}
+    entrypoint: ["sh", "/etc/d443a/ue-entry.sh"]
+    command: []
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - ${NEXTGSIM_DIR:-../../../nextgsim}/config:/etc/nextgsim:ro
+      - ./configs/demo-d443a/ue-entry.sh:/etc/d443a/ue-entry.sh:ro
+      - d443a_cca:/var/lib/d443a/cca
+    networks:
+      core:
+        ipv4_address: 172.23.0.101
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      gnb:
+        condition: service_healthy
+      eas-local:
+        condition: service_healthy
+
+networks:
+  core:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.23.0.0/24
+          gateway: 172.23.0.1
+  # The FL data network (N6): the UPF and the AF only. No route off the host.
+  dn:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.60.0.0/24
+          gateway: 10.60.0.1
+
+volumes:
+  mongodb_data:
+  d443a_cca:

@@ -183,6 +183,19 @@ d443a_main() {
     return $(( FAILS > 0 ))
   fi
 
+  # --- 4b. netem preflight: fail loudly without NET_ADMIN or sch_netem --------------
+  local pre
+  pre="$("${K[@]}" exec deploy/upf -c she-eas -- sh -c \
+    'ip netns exec eas-cloud tc qdisc add dev lo root netem delay 0ms && ip netns exec eas-cloud tc qdisc del dev lo root && echo netem-ok' 2>&1)"
+  if [[ "${pre}" != *netem-ok* ]]; then
+    bad "netem preflight: no NET_ADMIN or no sch_netem on the node (${pre//$'\n'/ }); Acts 2 and 3 cannot run"
+    echo "netem=unavailable" >>"${S}/meta.txt"
+  else
+    echo "netem=ok" >>"${S}/meta.txt"
+  fi
+  pre="$("${K[@]}" exec deploy/gnb -c netem -- sh -c 'tc qdisc show dev eth0 && echo tc-ok' 2>&1)"
+  [[ "${pre}" == *tc-ok* ]] || bad "the gnb netem sidecar cannot run tc: ${pre//$'\n'/ }"
+
   # --- 5. measurements in place ------------------------------------------------------
   # smfd provisions N6 delay measurement at association (smf_n6_delay_ms per EAS),
   # and the QOS_MON SRR on the UE's session once eesd subscribed: eesd logs a

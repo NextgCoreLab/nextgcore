@@ -1,0 +1,22 @@
+# One EAS sidecar of the D443A compose stack (nextgsim#471); eas-entry.sh fills
+# @EAS@ @IP@ @MR@ @AVL@ @ID@ @MODE@. Listeners on the dn address only.
+eas_id: "@EAS@"
+address: "@IP@"
+stamp_port: 8620
+job_port: 9471
+max_resp_time_ms: @MR@
+avl_comp: @AVL@
+check_interval_s: 2
+ees:
+  api_root: "http://172.23.0.31:7777"
+  oauth2:
+    nrf: "http://172.23.0.10:7777"
+    nf_instance_id: "@ID@"
+    cca_key_file: "/var/lib/d443a/keys/@EAS@.key"
+    public_jwk_dir: "/var/lib/d443a/cca"
+    register: true
+demo:
+  enabled: true
+  d443a-edge-budget:
+    enabled: true
+    mode: @MODE@
