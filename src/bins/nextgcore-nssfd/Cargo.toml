@@ -32,6 +32,9 @@ proptest.workspace = true
 p256 = { workspace = true, features = ["ecdsa"] }
 base64.workspace = true
 sha2.workspace = true
+# #1501: the dbi in-memory subscriber store, so the subscription-confirmed
+# selection path can be driven to its 200 without MongoDB.
+nextgcore-dbi = { workspace = true, features = ["test-helpers"] }
 
 [lints]
 workspace = true

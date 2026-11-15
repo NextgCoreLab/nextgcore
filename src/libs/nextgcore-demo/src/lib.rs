@@ -98,7 +98,8 @@ impl DemoRegistry {
     /// A registry of `specs`.
     ///
     /// # Panics
-    /// On a malformed key or mode, a duplicate key, an empty mode list, or a
+    /// On a malformed key or mode, a mode named `off` (reserved for the demo-off
+    /// arm), a duplicate key, an empty mode list, or a
     /// `requires` naming an unregistered key. These are programming errors in the
     /// binary's own table, not configuration errors.
     pub fn new(specs: &[DemoSpec]) -> Self {
@@ -113,6 +114,13 @@ impl DemoRegistry {
                     "demo {:?} mode {:?} is not [a-z0-9-]+",
                     s.key,
                     m
+                );
+                // `off` is reserved: `k8s/demo-check.sh <key> off` runs a demo's
+                // overlay with no demo block at all (nextgsim#464).
+                assert!(
+                    *m != "off",
+                    "demo {:?} registers mode \"off\", which is reserved for the demo-off arm",
+                    s.key
                 );
             }
         }

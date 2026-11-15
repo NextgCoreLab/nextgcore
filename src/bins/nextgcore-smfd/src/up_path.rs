@@ -569,10 +569,10 @@ const PATH_FANOUT: usize = 16;
 /// Act on a Node Report from the UPF `upf_key`, whose sessions are `scope` (#994).
 /// Called on the N4 receive task after the response went out: the state changes
 /// here are synchronous, the per-session work runs in tracked tasks.
+///
+/// The N6 Delay Measurement Reports (`report.n6`) are not handled here: the N4 engine
+/// stores them under the association guard (#1505), and passes the rest on.
 pub fn on_node_report(upf_key: &str, scope: SessionScope, report: NodeReport) {
-    if !report.n6.is_empty() {
-        crate::n6_delay::on_reports(upf_key, &report.n6);
-    }
     let hold = hold_duration();
     let mut newly_failed = Vec::new();
     let mut durable_changed = false;

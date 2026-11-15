@@ -353,9 +353,11 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// How many times startup tries to reach MongoDB before giving up. Each attempt
-/// already waits for the driver's server-selection timeout, so a store that
-/// starts a little after the HSS (as in docker compose) is still found.
+/// How many times startup tries to reach MongoDB before giving up, 2 s apart, so
+/// a store that starts a little after the HSS (as in docker compose) is still
+/// found. Each attempt waits for the store client's server selection, which
+/// nextgcore-dbi bounds at 1 s unless the URI sets its own (#1462): an unreachable
+/// store fails startup in about 13 s, before a k8s liveness probe would.
 const STORE_CONNECT_ATTEMPTS: u32 = 5;
 
 /// The subscriber-store URI: `--db-uri` wins over the config file's top-level

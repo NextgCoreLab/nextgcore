@@ -31,6 +31,8 @@ use std::sync::Arc;
 
 mod binding;
 mod context;
+#[cfg(feature = "demo-d443a-edge-budget")]
+mod demo_d443a; // nextgsim#471: N6 delays on QOS_MON (demo d443a-edge-budget)
 mod easdf; // #114: EASDF selection + DNS-context lifecycle (TS 23.501 §5.6.7)
 mod eps_bearer; // #619: PGW-C dedicated EPS bearer activation over S5/S8 (TS 23.401 §5.4.1)
 mod eps_iwk; // #117: 5GS↔EPS interworking, EBI assignment over Namf_Communication
@@ -830,6 +832,38 @@ fn epco_config() -> (&'static [std::net::Ipv4Addr], Option<u16>) {
     }
 }
 
+/// The demos this build can run: `d443a-edge-budget` under its feature, none
+/// otherwise.
+fn demo_registry() -> nextgcore_demo::DemoRegistry {
+    #[cfg(feature = "demo-d443a-edge-budget")]
+    return nextgcore_demo::DemoRegistry::new(&[demo_d443a::DEMO_SPEC]);
+    #[cfg(not(feature = "demo-d443a-edge-budget"))]
+    nextgcore_demo::DemoRegistry::default()
+}
+
+/// The config file's root, for the `demo:` block. A missing file is no block, as
+/// for the rest of the config (`load_config`).
+fn config_root(config_path: &str) -> anyhow::Result<serde_yaml::Value> {
+    match std::fs::read_to_string(config_path) {
+        Ok(content) => serde_yaml::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("SMF config '{config_path}' does not parse: {e}")),
+        // A file that cannot be read is no block, exactly as `load_config` falls
+        // back to the defaults on any read error (it has already warned), so
+        // with the demo off nothing here fails where smfd did not fail before.
+        Err(_) => Ok(serde_yaml::Value::Null),
+    }
+}
+
+/// Validate and install the `demo:` block, once per process.
+fn init_demos(config_path: &str) -> anyhow::Result<()> {
+    let root = config_root(config_path)?;
+    nextgcore_demo::init_from_root(&root, &demo_registry())
+        .map_err(|e| anyhow::anyhow!("{e} ({e:?})"))?;
+    #[cfg(feature = "demo-d443a-edge-budget")]
+    demo_d443a::install(nextgcore_demo::active_mode(demo_d443a::DEMO_KEY));
+    Ok(())
+}
+
 /// The value after the first of `flags` in `args` (`-c x`, `--config x`), or
 /// `None`. smfd reads its few flags by hand rather than through clap.
 fn smf_flag_value(args: impl Iterator<Item = String>, flags: &[&str]) -> Option<String> {
@@ -905,6 +939,10 @@ async fn main() -> Result<()> {
     let _ = EPCO_CONFIG.set((config.dns_servers.clone(), config.mtu));
     // #1502: before the association loop can associate a UPF.
     n6_delay::set_config(config.n6_delay.take());
+    // nextgsim#458: the demo: block, checked against the demos this build was
+    // compiled with, so an unknown key or mode, or a demo whose cargo feature is
+    // not built, fails start-up. With no demo active nothing changes.
+    init_demos(&config_path)?;
 
     // Seed NRF URI into SBI context for NF registration (parsed once in load_config).
     if let Some(ref uri) = config.nrf_uri {
@@ -6824,8 +6862,9 @@ fn take_sm_policy_id(sm_context_ref: &str) -> Option<String> {
 ///
 /// The body is an empty SmPolicyDeleteData. Every attribute is optional, and the
 /// ones that would describe this release (`ranNasRelCauses`, §4.2.5.4) belong to
-/// the RAN-NAS-Cause feature, which this SMF does not negotiate (it creates the
-/// association with `suppFeat` "0"); sending them unnegotiated is not allowed.
+/// the RAN-NAS-Cause feature, which this SMF does not negotiate (its `suppFeat`
+/// offers only PCSCF-Restoration-Enhancement); sending them unnegotiated is not
+/// allowed.
 async fn delete_sm_policy(pol_id: &str) {
     for attempt in 1..=SM_POLICY_DELETE_ATTEMPTS {
         let result = match policy::resolve_pcf_endpoint().await {
@@ -10578,6 +10617,18 @@ async fn handle_sm_policy_notify(sm_context_ref: &str, request: &SbiRequest) -> 
 
     // The decision may be nested (smPolicyDecision) or top-level
     let decision_json = body.get("smPolicyDecision").unwrap_or(&body);
+
+    // #1398, TS 29.512 §4.2.3.18: "pcscfRestIndication" true asks for P-CSCF
+    // restoration. Acknowledged, then the restoration runs off the request path.
+    if decision_json
+        .get("pcscfRestIndication")
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
+        restore_pcscf(sm_context_ref, &binding);
+        return SbiResponse::with_status(204);
+    }
+
     let pol_id = binding.sm_policy_id.clone().unwrap_or_default();
     // #1387: a delta over what the session ENFORCES (TS 29.512 §4.2.6.1), not a
     // replacement built from the config default -- see `merge_sm_policy_decision`.
@@ -10670,6 +10721,64 @@ async fn handle_sm_policy_notify(sm_context_ref: &str, request: &SbiRequest) -> 
     signal_policy_change(sm_context_ref, &binding);
 
     SbiResponse::with_status(204)
+}
+
+/// P-CSCF restoration for one PDU session, on the PCF's `pcscfRestIndication`
+/// (#1398, TS 29.512 §4.2.3.18; TS 23.501 §5.16.3.9 defers to TS 23.380).
+///
+/// TS 23.380 gives the SMF two ways. The first is a PDU Session Modification that
+/// hands the UE a new P-CSCF list. TS 24.501 §6.3.2.2 (24501-k00 s06-s08 l.4952-4958)
+/// allows that only when the UE asked for a P-CSCF address and the SMF gave it
+/// some at establishment. This SMF puts no P-CSCF address in the ePCO
+/// (`gsm_build::build_epco`: DNS and MTU only), so that never holds. That leaves
+/// the second way: release the session with 5GSM cause #39 "reactivation
+/// requested". The UE then establishes the session again and finds a P-CSCF again.
+/// That is the same release #667 sends after a UPF restart:
+/// - the SM Policy Association is terminated;
+/// - the N4 session is deleted;
+/// - the PDU SESSION RELEASE COMMAND #39 goes with the N2 Release Command, under
+///   T3592.
+///
+/// Answered before the release runs, so the PCF's notify is not held behind the
+/// PFCP and N1N2 round trips. Taking the policy id is the once-only guard: a retried
+/// notify (TS 29.500 §6.10) finds it gone and starts no second release. Returns
+/// whether this call started the release.
+fn restore_pcscf(sm_context_ref: &str, binding: &context::PolicyBinding) -> bool {
+    let Some(pol_id) = take_sm_policy_id(sm_context_ref) else {
+        log::info!(
+            "P-CSCF restoration for ref={sm_context_ref}: already released, or no SM policy \
+             association; nothing more to do"
+        );
+        return false;
+    };
+    log::warn!(
+        "P-CSCF restoration for ref={sm_context_ref} (SUPI {}, PSI {}): releasing the PDU \
+         session with #39 reactivation requested (TS 23.380; no P-CSCF list to update)",
+        binding.supi,
+        binding.psi
+    );
+    spawn_sm_policy_delete(pol_id);
+    let reference = sm_context_ref.to_string();
+    let (amf_uri, supi, psi) = (
+        binding.sm_context_status_uri.clone(),
+        binding.supi.clone(),
+        binding.psi,
+    );
+    tokio::spawn(async move {
+        if let Some(seid) = lookup_upf_seid(&reference) {
+            if let Err(e) = pfcp_session_delete(smf_n4_seid_for(&reference), seid).await {
+                log::warn!("PFCP Session Deletion failed for ref={reference}: {e}");
+            }
+        }
+        match amf_uri {
+            Some(amf_uri) => release_for_reactivation(&reference, &amf_uri, &supi, psi).await,
+            None => {
+                log::warn!("P-CSCF restoration: ref={reference} has no AMF callback to tell");
+                complete_sm_context_release(&reference);
+            }
+        }
+    });
+    true
 }
 
 /// `POST /nsmf-callback/v1/sdm-notify/{smContextRef}` — `Nudm_SDM_Notification`
@@ -25633,6 +25742,86 @@ mod tests {
         }
     }
 
+    /// #1398, TS 29.512 §4.2.3.18, through the real SBI router and an AMF stand-in:
+    /// a notify with `pcscfRestIndication: true` is acknowledged 204, then:
+    /// - the SM Policy Association is terminated;
+    /// - the session is released toward the UE with 5GSM #39 "reactivation
+    ///   requested" plus the N2 Release Command, under T3592.
+    ///
+    /// This SMF gives the UE no P-CSCF list it could update, so TS 23.380 leaves it
+    /// the release. A retried copy of the notify starts no second release.
+    ///
+    /// REVERT-VERIFIED: without the `pcscfRestIndication` arm the notify is applied
+    /// as an ordinary (empty) policy change. No N1N2 transfer arrives, and the
+    /// association keeps its policy id.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pcscf_restoration_indication_releases_the_session_for_reactivation_1398() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (amf, amf_port, posts) = n1n2_recording_amf_1385(false).await;
+        let supi = "imsi-001010000001398";
+        let psi = 13;
+        let sm_context_ref = seed_pcf_authorised(supi, psi, "pol-1398");
+        set_amf_1385(&sm_context_ref, amf_port);
+
+        let restore = || {
+            smf_sbi_request_handler(policy_notify_1387(
+                &sm_context_ref,
+                serde_json::json!({ "pcscfRestIndication": true }),
+            ))
+        };
+        assert_eq!(restore().await.status, 204, "the SMF acknowledges the PCF");
+        let got = await_n1n2_1385(&posts, 1).await;
+        assert_eq!(got.len(), 1, "one N1N2MessageTransfer, got {got:?}");
+        let (path, body, n1_cmd, n2) = &got[0];
+        assert_eq!(
+            path,
+            &format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages")
+        );
+        assert_eq!(
+            n1_cmd[..5],
+            [
+                0x2E,
+                psi,
+                0,
+                crate::gsm_build::message_type::PDU_SESSION_RELEASE_COMMAND,
+                policy::gsm_cause::REACTIVATION_REQUESTED
+            ],
+            "5GSM, the PSI, PTI 0 (network-initiated), RELEASE COMMAND, cause #39"
+        );
+        assert_eq!(
+            body["n2InfoContainer"]["smInfo"]["n2InfoContent"]["ngapIeType"],
+            "PDU_RES_REL_CMD"
+        );
+        assert!(
+            !n2.is_empty(),
+            "the N2 Release Command transfer rides along"
+        );
+        assert_eq!(
+            lookup_policy_binding(&sm_context_ref).and_then(|b| b.sm_policy_id),
+            None,
+            "the SM Policy Association is terminated"
+        );
+
+        // A retried copy (TS 29.500 §6.10): acknowledged, and no second release,
+        // because the first took the policy id that starting one needs.
+        assert_eq!(restore().await.status, 204);
+        let binding = lookup_policy_binding(&sm_context_ref).expect("binding");
+        assert!(
+            !restore_pcscf(&sm_context_ref, &binding),
+            "a second restoration starts nothing"
+        );
+
+        assert!(
+            cancel_gsm_timer_for_test(&sm_context_ref),
+            "T3592 guards the release"
+        );
+        amf.stop().await.ok();
+    }
+
     /// The N2 transfer's (Session-AMBR DL/UL, the default flow's (QFI, 5QI, ARP PL)).
     fn decode_modify_transfer_1385(n2: &[u8]) -> ((u64, u64), Vec<(u8, u16, u8)>) {
         use nextgcore_ngap::transfer::{
@@ -26726,6 +26915,152 @@ mod tests {
         cancel_gsm_timer_for_test(&reference);
         forget_seeded_session(&reference);
         event_exposure::clear_for_test();
+        consumer.stop().await.ok();
+        amf.stop().await.ok();
+    }
+
+    /// nextgsim#471 (demo d443a-edge-budget): with the demo on, the QOS_MON notify
+    /// of a session report also carries the session's PSA UPF's N6 delays in the
+    /// vendor-specific member; with it off, the same report's notify is the #1390
+    /// body. Through `handle_pfcp_session_report`, the real report path.
+    #[cfg(feature = "demo-d443a-edge-budget")]
+    // The event-store lock is held across awaits, as the other event tests do.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_qos_mon_notify_carries_the_psa_upf_s_n6_delays_with_the_demo_on_471() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _q = qos_mon::TEST_LOCK.lock().await;
+        let _n6 = n6_delay::N6_TEST_LOCK.lock().await;
+        let _d = demo_d443a::TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _e = event_exposure::lock_store();
+        event_exposure::clear_for_test();
+        qos_mon::clear_for_test();
+        n6_delay::reset_for_test();
+        let supi = "imsi-001010000004710";
+        let (upf, reference, amf, _posts) = qos_mon_session_1390(supi, 5, true).await;
+        let upf_key = upf.client.recovery_time_stamp_key();
+        // #1523 review o3: the session's own UPF, and no UPF for an unknown
+        // session even though a default client exists to fall back to.
+        // A real establishment records the session's UPF (`record_session_upf`
+        // after the Session Establishment Response); the seeded session does not.
+        assert_eq!(demo_d443a::psa_upf_key(smf_n4_seid_for(&reference)), None);
+        pfcp_path::record_session_upf(smf_n4_seid_for(&reference), &upf.client);
+        assert_eq!(
+            demo_d443a::psa_upf_key(smf_n4_seid_for(&reference)).as_deref(),
+            Some(upf_key.as_str())
+        );
+        assert!(pfcp_path::client_for_session(0x0471_dead_beef).is_some());
+        assert_eq!(demo_d443a::psa_upf_key(0x0471_dead_beef), None);
+        n6_delay::insert_for_test(
+            &upf_key,
+            "10.60.0.11".parse().unwrap(),
+            n6_delay::Measured {
+                average_ms: 18,
+                minimum_ms: Some(17),
+                maximum_ms: Some(19),
+            },
+        );
+        // Another UPF's result: not this session's PSA, so not exposed.
+        n6_delay::insert_for_test(
+            "other-upf-471:8805",
+            "10.60.0.12".parse().unwrap(),
+            n6_delay::Measured {
+                average_ms: 3,
+                minimum_ms: None,
+                maximum_ms: None,
+            },
+        );
+        let notified = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let sink = notified.clone();
+        let (consumer, caddr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let sink = sink.clone();
+                async move {
+                    if let Some(v) = req
+                        .http
+                        .content
+                        .as_deref()
+                        .and_then(|c| serde_json::from_str(c).ok())
+                    {
+                        sink.lock().unwrap().push(v);
+                    }
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await;
+        let sub = qos_mon_subscription_1390(
+            supi,
+            &["QOS_MON"],
+            &format!(
+                "http://127.0.0.1:{}/d443a-edge-budget/qos-mon/t",
+                caddr.port()
+            ),
+        );
+        qos_mon::subscribed(&sub).await;
+        let srr_id = qos_mon::srr_ids(&reference)[0];
+        cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
+        let body = qos_mon::tests::sesr_body(
+            srr_id,
+            nextgcore_pfcp::qos_monitoring::QosMonitoringMeasurement {
+                downlink_packet_delay: Some(3),
+                uplink_packet_delay: Some(4),
+                round_trip_packet_delay: Some(6),
+                ..Default::default()
+            },
+        );
+        let seid = smf_n4_seid_for(&reference);
+        let mut pkt = vec![0x21, 56];
+        pkt.extend_from_slice(&((body.len() + 12) as u16).to_be_bytes());
+        pkt.extend_from_slice(&seid.to_be_bytes());
+        pkt.extend_from_slice(&[0, 0x47, 0x10, 0]);
+        pkt.extend_from_slice(&body);
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let report = |n: usize| {
+            let notified = notified.clone();
+            async move {
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                while notified.lock().unwrap().len() < n && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        };
+
+        demo_d443a::set_active_for_test(true);
+        handle_pfcp_session_report(&sock, &pkt, upf.client.peer()).await;
+        report(1).await;
+        demo_d443a::set_active_for_test(false);
+        handle_pfcp_session_report(&sock, &pkt, upf.client.peer()).await;
+        report(2).await;
+
+        let got = notified.lock().unwrap().clone();
+        assert_eq!(got.len(), 2, "two QOS_MON notifies: {got:?}");
+        let on = &got[0]["eventNotifs"][0];
+        assert_eq!(on["rtDelays"], serde_json::json!([6]));
+        assert_eq!(
+            on["vendorSpecific-032473"],
+            serde_json::json!({ "n6Delays": [
+                { "endpoint": "10.60.0.11", "avgMs": 18, "minMs": 17, "maxMs": 19 },
+            ]})
+        );
+        // Off: the same report's notify is the #1390 body, with no member.
+        let mut on_without = got[0].clone();
+        on_without["eventNotifs"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("vendorSpecific-032473");
+        on_without["eventNotifs"][0]["timeStamp"] = got[1]["eventNotifs"][0]["timeStamp"].clone();
+        assert_eq!(got[1], on_without);
+        assert!(got[1]["eventNotifs"][0]
+            .get("vendorSpecific-032473")
+            .is_none());
+
+        qos_mon::forget(&reference);
+        qos_mon::quiesce_for_test().await;
+        cancel_gsm_timer_for_test(&reference);
+        forget_seeded_session(&reference);
+        event_exposure::clear_for_test();
+        n6_delay::reset_for_test();
         consumer.stop().await.ok();
         amf.stop().await.ok();
     }
@@ -28582,5 +28917,58 @@ mod tests_peer_host_kind_1324 {
                 Some((dialled_host(host), 7793))
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod demo_block_tests_471 {
+    //! nextgsim#458 / #471: smfd reads the `demo:` block in every build. These
+    //! only exercise refusals, which fail before anything is installed (the
+    //! installed state is write-once per process).
+
+    fn config_file(body: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("smf-demo-471-{}.yaml", uuid::Uuid::new_v4()));
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[cfg(not(feature = "demo-d443a-edge-budget"))]
+    #[test]
+    fn a_default_build_refuses_the_d443a_block_471() {
+        let p = config_file(
+            "demo:\n  enabled: true\n  d443a-edge-budget:\n    enabled: true\n    mode: measured-budget\n",
+        );
+        let err = super::init_demos(p.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        std::fs::remove_file(&p).ok();
+        assert!(err.contains("UnknownKey"), "{err}");
+        assert!(err.contains("d443a-edge-budget"), "{err}");
+    }
+
+    /// #1523 review NIT: an unreadable config (a directory here; EACCES alike) is
+    /// no demo block, as `load_config` falls back on any read error.
+    #[test]
+    fn an_unreadable_config_is_no_demo_block_471() {
+        let dir = std::env::temp_dir();
+        assert_eq!(
+            super::config_root(dir.to_str().unwrap()).unwrap(),
+            serde_yaml::Value::Null
+        );
+    }
+
+    #[cfg(feature = "demo-d443a-edge-budget")]
+    #[test]
+    fn an_unknown_mode_fails_startup_471() {
+        let p = config_file(
+            "demo:\n  enabled: true\n  d443a-edge-budget:\n    enabled: true\n    mode: bogus\n",
+        );
+        let err = super::init_demos(p.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        std::fs::remove_file(&p).ok();
+        assert!(err.contains("UnknownMode"), "{err}");
+        assert!(err.contains("demo: \"d443a-edge-budget\""), "{err}");
+        assert!(err.contains("mode: \"bogus\""), "{err}");
     }
 }

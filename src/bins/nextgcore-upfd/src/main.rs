@@ -1528,11 +1528,9 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                     set.extend(own);
                 }
 
-                let qer_writes: Vec<&crate::n4_build::ParsedCreateQer> =
-                    created_qers.iter().chain(updated_qers.iter()).collect();
-                if !qer_writes.is_empty() {
+                if !created_qers.is_empty() || !updated_qers.is_empty() {
                     let mut dp_qers = session.qers.write().unwrap();
-                    for q in &qer_writes {
+                    for q in &created_qers {
                         let mut qer = DataPlaneQer::new(q.qer_id);
                         // Reflective QoS / paging policy the SMF asked for.
                         // Parsed since #81; previously decoded nowhere, so a
@@ -1546,15 +1544,34 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                         if let Some(qfi_val) = q.qfi {
                             qer.set_qfi(qfi_val);
                         }
-                        if qer.is_xr {
-                            log::info!(
-                                "Updated XR QER {} (5QI={:?}, DSCP={}, GBR UL/DL={}/{} kbps) for SEID={upf_seid:#x}",
-                                qer.qer_id, qer.qfi, qer.dscp, qer.ul_gbr, qer.dl_gbr
-                            );
-                        }
                         dp_qers.insert(q.qer_id, qer);
                     }
-                    log::info!("Installed {} QERs for SEID={upf_seid:#x}", qer_writes.len());
+                    // #1478, TS 29.244 Table 7.5.4.5-1: an Update QER changes only the
+                    // IEs it carries. It used to rebuild the QER from them, so one
+                    // without MBR lifted the rate cap and one without Gate Status
+                    // opened closed gates.
+                    for u in &updated_qers {
+                        dp_qers
+                            .entry(u.qer_id)
+                            .or_insert_with(|| DataPlaneQer::new(u.qer_id))
+                            .apply_update(u);
+                    }
+                    for qer in created_qers
+                        .iter()
+                        .map(|q| q.qer_id)
+                        .chain(updated_qers.iter().map(|u| u.qer_id))
+                        .filter_map(|id| dp_qers.get(&id))
+                        .filter(|q| q.is_xr)
+                    {
+                        log::info!(
+                            "Updated XR QER {} (5QI={:?}, DSCP={}, GBR UL/DL={}/{} kbps) for SEID={upf_seid:#x}",
+                            qer.qer_id, qer.qfi, qer.dscp, qer.ul_gbr, qer.dl_gbr
+                        );
+                    }
+                    log::info!(
+                        "Installed {} QERs for SEID={upf_seid:#x}",
+                        created_qers.len() + updated_qers.len()
+                    );
                 }
 
                 if !updated_bars.is_empty() {

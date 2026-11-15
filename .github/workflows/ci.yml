@@ -298,6 +298,8 @@ jobs:
         nextgcore-nefd:demo-d445a-fl-t8
         nextgcore-nsacfd:sla-observe
         nextgcore-smfd:compute-aware-upf
+        nextgcore-smfd:demo-d443a-edge-budget
+        nextgcore-eesd:demo-d443a-edge-budget
         nextgcore-upfd:compute-aware-upf
         nextgcore-udmd:nes
     steps:

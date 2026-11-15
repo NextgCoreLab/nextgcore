@@ -617,3 +617,14 @@ fn metrics_render_with_no_client() {
         "{out}"
     );
 }
+
+/// #1421: the server's OAuth2 callback exemption and the handler share
+/// `holds_callback_token`; it admits the AnLF's own notifUri token only.
+#[test]
+fn only_the_anlfs_own_token_is_held() {
+    let anlf = Anlf::new();
+    assert!(holds_callback_token(Some(&anlf), &anlf.token));
+    assert!(!holds_callback_token(Some(&anlf), "nope"));
+    assert!(!holds_callback_token(Some(&anlf), &Anlf::new().token));
+    assert!(!holds_callback_token(None, &anlf.token));
+}

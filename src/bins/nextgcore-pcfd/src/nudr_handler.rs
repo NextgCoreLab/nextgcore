@@ -65,38 +65,46 @@ pub struct SubscriptionData {
     pub ambr_downlink: u64,
 }
 
-/// Public API for querying subscription data (used by AM policy handler)
-pub fn query_subscription_data_pub(supi: &str) -> Option<SubscriptionData> {
-    query_subscription_data(supi)
-}
-
-/// Query subscription data from database via nextgcore-dbi
-/// In C: nextgcore_dbi_subscription_data()
-fn query_subscription_data(supi: &str) -> Option<SubscriptionData> {
+/// Read a subscriber's UE-AMBR from the subscriber store via nextgcore-dbi,
+/// REPORTING a failure as `Err` rather than answering a default (#1460).
+///
+/// `Err` when there is no UE-AMBR to authorise: no store configured, an unknown or
+/// invalid SUPI, the store down, or a subscriber document with no `ambr` (dbi reads
+/// that as 0/0, and a 0 bps UE-AMBR in both directions is not a subscription, it is
+/// the absence of one), or with only one direction of it. The AM policy then carries no `ueAmbr` (TS 29.507 §4.2.2.2
+/// item c: the PCF answers the UE-AMBR it authorises; there is nothing to
+/// authorise), and the AMF keeps the one it has. Before #1460 every failure here
+/// answered 1 Gbps in both directions, a UE-AMBR no subscription carried.
+pub fn pcf_read_subscription_data(supi: &str) -> Result<SubscriptionData, String> {
     log::debug!("Querying subscription data for SUPI: {supi}");
 
-    match off_runtime(|| nextgcore_dbi::nextgcore_dbi_subscription_data(supi)) {
-        Ok(sub_data) => {
-            log::debug!(
-                "[{}] Subscription data: AMBR up={}, down={}",
-                supi,
-                sub_data.ambr.uplink,
-                sub_data.ambr.downlink
-            );
-            Some(SubscriptionData {
-                ambr_uplink: sub_data.ambr.uplink,
-                ambr_downlink: sub_data.ambr.downlink,
-            })
-        }
-        Err(e) => {
-            log::warn!("[{supi}] Failed to query subscription data from DB: {e}, using defaults");
-            // Fallback to default values when DB is unavailable
-            Some(SubscriptionData {
-                ambr_uplink: 1000000000,   // 1 Gbps
-                ambr_downlink: 1000000000, // 1 Gbps
-            })
-        }
+    let sub_data = off_runtime(|| nextgcore_dbi::nextgcore_dbi_subscription_data(supi))
+        .map_err(|e| format!("reading the subscriber failed: {e}"))?;
+    if sub_data.ambr.uplink == 0 && sub_data.ambr.downlink == 0 {
+        return Err("the subscriber carries no ambr".to_string());
     }
+    // #1526 review: half an ambr is no UE-AMBR either. TS 29.571 Table 5.5.4.2-1
+    // (29571-k00 l.8341-8349) makes both `uplink` and `downlink` of an Ambr
+    // mandatory, so the only way to send one is to invent "0 bps" for the missing
+    // direction, which is the #1460 defect for one direction. dbi reads an absent
+    // direction as 0.
+    if sub_data.ambr.uplink == 0 || sub_data.ambr.downlink == 0 {
+        return Err(format!(
+            "the subscriber's ambr has only one direction (uplink {} bps, downlink {} bps); \
+             an Ambr needs both (TS 29.571 Table 5.5.4.2-1)",
+            sub_data.ambr.uplink, sub_data.ambr.downlink
+        ));
+    }
+    log::debug!(
+        "[{}] Subscription data: AMBR up={}, down={}",
+        supi,
+        sub_data.ambr.uplink,
+        sub_data.ambr.downlink
+    );
+    Ok(SubscriptionData {
+        ambr_uplink: sub_data.ambr.uplink,
+        ambr_downlink: sub_data.ambr.downlink,
+    })
 }
 
 /// Read a subscriber's session data from the database via nextgcore-dbi, REPORTING
@@ -257,13 +265,12 @@ mod tests {
         assert!(data.pcc_rules.is_empty());
     }
 
+    /// #1460: with no subscriber store the read is a failure, not 1 Gbps.
     #[test]
-    fn test_query_subscription_data() {
-        let data = query_subscription_data("imsi-001010000000001");
-        assert!(data.is_some());
-        let data = data.unwrap();
-        assert!(data.ambr_uplink > 0);
-        assert!(data.ambr_downlink > 0);
+    fn a_subscription_read_with_no_store_is_an_error_not_a_default() {
+        let err = pcf_read_subscription_data("imsi-001010000021460")
+            .expect_err("no store is open in a unit test");
+        assert!(err.starts_with("reading the subscriber failed"), "{err}");
     }
 
     #[test]
