@@ -24774,7 +24774,9 @@ mod tests {
     /// - an NWDAF with no UE mobility data (204: the default nwdafd, and the demo's
     ///   revert arm);
     /// - an unreachable NWDAF;
-    /// - for a UE with no known cell, a prediction naming a gNB outside the area.
+    /// - for a UE with no known cell, a prediction naming a gNB outside the area;
+    /// - statistics (no `confidence`) naming a cell in the area (#1508: the answer
+    ///   to a period the NWDAF's clock reads as past).
     #[tokio::test]
     async fn no_usable_prediction_pages_the_area_on_the_first_attempt() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
@@ -24791,10 +24793,19 @@ mod tests {
             None,
         )
         .await;
+        // #1508: statistics (no `confidence`) naming gNB 2's cell, as nwdafd answers
+        // a period already past at its clock.
+        let mut statistics = nwdafd_predicts(&nwdaf_cell_of(2));
+        statistics["ueMobs"][0]["locInfos"][0]
+            .as_object_mut()
+            .expect("locInfo")
+            .remove("confidence");
+        let (_stats, stats_port, _) = nwdaf_standin(Some(statistics), Duration::ZERO, None).await;
         let arms = [
             ("204", no_data_port, Some(1)),
             ("refused", down.port(), Some(1)),
             ("outside the area", outside_port, None),
+            ("statistics", stats_port, Some(1)),
         ];
         use crate::nwdaf_mobility::{outcome_count, HintOutcome};
         for (i, (arm, port, last_gnb)) in arms.into_iter().enumerate() {
@@ -24816,7 +24827,7 @@ mod tests {
             // #1504: the D440C revert arm's 204 is `no_prediction`, a refused
             // connection is `error`.
             match arm {
-                "204" => assert!(
+                "204" | "statistics" => assert!(
                     outcome_count(HintOutcome::NoPrediction) > no_prediction,
                     "{arm}: counted as no_prediction"
                 ),
