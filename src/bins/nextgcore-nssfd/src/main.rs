@@ -1132,6 +1132,20 @@ fn parse_registration_slice_info(v: &serde_json::Value) -> nnssf_handler::Regist
     info
 }
 
+/// Whether a `requestedNssai` member was sent (not absent, not `null`) without a
+/// single valid S-NSSAI in it: not an array, an empty array, or one whose every
+/// entry fails to parse (see the gate in [`handle_ns_selection_registration`]).
+fn requested_nssai_is_incorrect(
+    info_json: &serde_json::Value,
+    info: &nnssf_handler::RegistrationSliceInfo,
+) -> bool {
+    match info_json.get("requestedNssai") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Array(_)) => info.requested.is_empty(),
+        Some(_) => true,
+    }
+}
+
 /// Which scenario a `SliceInfoForRegistration`-shaped request belongs to.
 ///
 /// The two share the selection algorithm and both have a step 2b (TS 29.531
@@ -1154,13 +1168,14 @@ enum NsSelectionScenario {
 /// The family's scope, which its help text states: EVERY 403
 /// SNSSAI_NOT_SUPPORTED this resource answers (each scenario's step 2b), and
 /// every 400 for a missing or incorrect slice-selection IE -- `subscribedNssai`,
-/// `sNssaiForMapping`, `supi`. Generic request errors (a missing `nf-type` /
+/// `requestedNssai`, `sNssaiForMapping`, `supi`. Generic request errors (a missing `nf-type` /
 /// `nf-id`, unparseable JSON, no `slice-info-request-for-*` at all) are not
 /// refusals of a selection and are counted only in `nssf_selections_total`.
 /// Bounded cardinality: these constants are the only label values.
 mod refusal {
     pub const SUBSCRIBED_NSSAI_MISSING: &str = "subscribed_nssai_missing";
     pub const SUBSCRIBED_NSSAI_INCORRECT: &str = "subscribed_nssai_incorrect";
+    pub const REQUESTED_NSSAI_INCORRECT: &str = "requested_nssai_incorrect";
     pub const SNSSAI_FOR_MAPPING_MISSING: &str = "snssai_for_mapping_missing";
     pub const SUPI_INCORRECT: &str = "supi_incorrect";
     pub const NO_PERMITTED_SNSSAI: &str = "no_permitted_snssai";
@@ -1235,6 +1250,27 @@ fn handle_ns_selection_registration(
     // An explicit JSON `null` is the member being absent, as it is for any
     // optional or conditional member, so it neither counts as a malformed IE nor
     // shadows a well-formed mapping request.
+    // #1515: `requestedNssai` is O, `array(Snssai)` with minItems 1 (TS 29.531
+    // Tables 6.1.6.2.10-1 / 6.1.6.2.13-1). A present IE with no valid S-NSSAI
+    // in it is not "no Requested NSSAI": answering it as absent would run the
+    // default-marked path of TS 23.501 §5.15.5.2.1 for a UE that did send one,
+    // and give UE-CU the §5.2.2.2.4 NOTE exemption it is not entitled to. A
+    // schema-noncompliant IE is a 400 "even when the failed IEs are defined as
+    // optional" (TS 29.500 §5.2.7.2), cause OPTIONAL_IE_INCORRECT. Checked
+    // here, before either scenario reads the parsed list, so "a Requested NSSAI
+    // was sent" means one thing everywhere: a valid S-NSSAI in it. `null` is
+    // the member being absent. Individually invalid entries next to a valid one
+    // are dropped, as for `subscribedNssai`: that only narrows what is asked.
+    if requested_nssai_is_incorrect(info_json, &info) {
+        return refused(
+            400,
+            "Bad Request",
+            refusal::REQUESTED_NSSAI_INCORRECT,
+            "requestedNssai must be a non-empty array of Snssai with at least one valid entry",
+            "OPTIONAL_IE_INCORRECT",
+        );
+    }
+
     let subscribed_ie = info_json.get("subscribedNssai").filter(|v| !v.is_null());
     let mapping_requested = info_json.get("requestMapping").and_then(|v| v.as_bool()) == Some(true);
     match subscribed_ie {
@@ -1559,11 +1595,12 @@ fn handle_ns_selection_ue_cu(
     info_json: &serde_json::Value,
     tai: Option<&context::Tai>,
 ) -> SbiResponse {
-    let has_requested_nssai = info_json
-        .get("requestedNssai")
-        .and_then(|v| v.as_array())
-        .map(|a| !a.is_empty())
-        .unwrap_or(false);
+    // The same definition the registration algorithm's step-2b gate uses: a
+    // valid S-NSSAI in it. A present IE without one is refused 400 by that
+    // algorithm (#1515), and the refusal is returned below either way.
+    let has_requested_nssai = !parse_registration_slice_info(info_json)
+        .requested
+        .is_empty();
 
     // Reuse the registration algorithm; strip allowedNssaiList when
     // requestedNssai was absent (UE-CU-specific rule per §5.2.2.2.4).
@@ -6114,6 +6151,103 @@ mod tests_allowed_nssai_derivation {
         );
         assert_eq!(ssts(&body["rejectedNssaiInTa"], None), vec![3], "{body}");
         assert_eq!(ssts(&body["rejectedNssaiInPlmn"], None), vec![9], "{body}");
+    }
+
+    /// #1515: every shape of `requestedNssai`, in both scenarios. Sent without a
+    /// single valid S-NSSAI it is 400 OPTIONAL_IE_INCORRECT (TS 29.500 §5.2.7.2),
+    /// never the answer to "no Requested NSSAI" -- for registration the
+    /// default-marked S-NSSAI, for UE-CU the Configured-NSSAI-only 200. Absent
+    /// and `null` are the no-Requested-NSSAI answers; a valid entry, with or
+    /// without invalid neighbours, is selected from.
+    #[test]
+    fn requested_nssai_without_a_valid_snssai_is_optional_ie_incorrect() {
+        let _guard = context::nssf_test_guard(512);
+        with_nssf_context(|c| c.set_plmn_supported_snssais(None)).expect("context available");
+        let subscribed = json!([
+            {"subscribedSnssai": {"sst": 1}, "defaultIndication": true},
+            {"subscribedSnssai": {"sst": 2}, "defaultIndication": false}
+        ]);
+        let with_requested = |requested: Option<serde_json::Value>| {
+            let mut info = json!({"subscribedNssai": subscribed.clone()});
+            if let Some(r) = requested {
+                info["requestedNssai"] = r;
+            }
+            info
+        };
+        let allowed = |body: &serde_json::Value| {
+            ssts(
+                &body["allowedNssaiList"][0]["allowedSnssaiList"],
+                Some("allowedSnssai"),
+            )
+        };
+
+        let incorrect = [
+            json!([]),
+            json!("1"),
+            json!({"sst": 2}),
+            json!(false),
+            json!(2),
+            json!([{"bogus": 2}]),
+            json!([{"sst": "2"}]),
+            json!([{"sst": 2, "sd": "zz"}]),
+            json!([null, {"sd": "000001"}]),
+        ];
+        for requested in incorrect {
+            let info = with_requested(Some(requested));
+            for resp in [
+                handle_ns_selection_registration(
+                    "amf-1515",
+                    &info,
+                    None,
+                    NsSelectionScenario::Registration,
+                ),
+                handle_ns_selection_ue_cu("amf-1515", &info, None),
+            ] {
+                let body = body_of(&resp);
+                assert_eq!(resp.status, 400, "{info} -> {body}");
+                assert_eq!(body["cause"], "OPTIONAL_IE_INCORRECT", "{info} -> {body}");
+                assert!(body.get("allowedNssaiList").is_none(), "{body}");
+                assert!(body.get("configuredNssai").is_none(), "{body}");
+            }
+        }
+
+        // Absent and null: no Requested NSSAI. Registration gets the
+        // default-marked S-NSSAI; UE-CU its Configured NSSAI without an Allowed.
+        for requested in [None, Some(serde_json::Value::Null)] {
+            let info = with_requested(requested);
+            let reg = handle_ns_selection_registration(
+                "amf-1515",
+                &info,
+                None,
+                NsSelectionScenario::Registration,
+            );
+            let body = body_of(&reg);
+            assert_eq!(reg.status, 200, "{info} -> {body}");
+            assert_eq!(allowed(&body), vec![1], "{info} -> {body}");
+            let cu = handle_ns_selection_ue_cu("amf-1515", &info, None);
+            let body = body_of(&cu);
+            assert_eq!(cu.status, 200, "{info} -> {body}");
+            assert!(body.get("allowedNssaiList").is_none(), "{info} -> {body}");
+            assert!(body.get("configuredNssai").is_some(), "{info} -> {body}");
+        }
+
+        // A valid entry, alone or beside invalid ones: selected from, in both.
+        for requested in [json!([{"sst": 2}]), json!([{"bogus": 1}, {"sst": 2}])] {
+            let info = with_requested(Some(requested));
+            for resp in [
+                handle_ns_selection_registration(
+                    "amf-1515",
+                    &info,
+                    None,
+                    NsSelectionScenario::Registration,
+                ),
+                handle_ns_selection_ue_cu("amf-1515", &info, None),
+            ] {
+                let body = body_of(&resp);
+                assert_eq!(resp.status, 200, "{info} -> {body}");
+                assert_eq!(allowed(&body), vec![2], "{info} -> {body}");
+            }
+        }
     }
 
     /// The initial / mobility registration shape (and every UE-CU shape) without
