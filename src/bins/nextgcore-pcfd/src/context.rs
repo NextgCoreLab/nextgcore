@@ -602,6 +602,31 @@ pub struct DemoAmbrCap {
     pub writer: String,
     pub uplink_bps: u64,
     pub downlink_bps: u64,
+    /// Which write this is ([`next_demo_cap_generation`]), so a restore that
+    /// clears "the record it undid" cannot clear a newer throttle with the same
+    /// cap values (#1453). 0 in a snapshot written before #1453.
+    #[serde(default)]
+    pub generation: u64,
+}
+
+/// The last [`DemoAmbrCap::generation`] handed out.
+static DEMO_CAP_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A [`DemoAmbrCap::generation`] no earlier write has had: strictly increasing in
+/// this process, and seeded from the wall clock (microseconds), so a record a
+/// previous process persisted, which a boot restore is undoing, never shares one
+/// with a throttle this process writes.
+pub fn next_demo_cap_generation() -> u64 {
+    use std::sync::atomic::Ordering;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0);
+    let next = |g: u64| g.max(now.saturating_sub(1)) + 1;
+    let prev = DEMO_CAP_GENERATION
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |g| Some(next(g)))
+        .unwrap_or_else(|g| g);
+    next(prev)
 }
 
 impl PcfSess {
@@ -2751,6 +2776,24 @@ impl PcfContext {
         ipv6prefix_hash
             .get(ipv6prefix_string)
             .and_then(|&id| sess_list.get(&id).cloned())
+    }
+
+    /// Change one stored session in place under the session-list lock, and persist.
+    /// `None` when there is no such session.
+    ///
+    /// #1453: for a read-modify-write that must not interleave with another writer
+    /// of the same field, which a `sess_find_by_id` + [`sess_update`](Self::sess_update)
+    /// pair can (each copies the whole session). `f` must not change the indexed
+    /// members (`ipv4addr`, `ipv6prefix`, `sm_policy_id`): it bypasses their hashes.
+    pub fn sess_modify<T>(&self, id: u64, f: impl FnOnce(&mut PcfSess) -> T) -> Option<T> {
+        let out = {
+            let mut sess_list = write_through_poison(&self.sess_list);
+            sess_list.get_mut(&id).map(f)
+        };
+        if out.is_some() {
+            self.persist();
+        }
+        out
     }
 
     pub fn sess_update(&self, sess: &PcfSess) -> bool {

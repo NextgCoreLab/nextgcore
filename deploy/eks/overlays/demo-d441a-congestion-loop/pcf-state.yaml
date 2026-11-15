@@ -2,8 +2,11 @@
 #
 # A throttle's cap is recorded with the session; a restarted pcfd that restores
 # its durable state re-notifies the subscribed Session-AMBR for every capped
-# session and clears the record only once the SMF confirms it. This points the
-# state file at the pod's existing `logs` emptyDir.
+# session and clears the record only once the SMF confirms it. The controller's
+# own restore does the same (#1453). An unconfirmed restore is retried for about
+# 35 minutes (40 rounds, 2 s doubling to 60 s); after that the record is kept and
+# waits for the next pcfd start-up, which tries again. This points the state file
+# at the pod's existing `logs` emptyDir.
 #
 # PRECONDITION: an emptyDir survives a CONTAINER restart, not a pod re-creation
 # (devtest1 has no usable StorageClass, DECISIONS 2026-10-27). After a pod is

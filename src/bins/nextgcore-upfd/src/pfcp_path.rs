@@ -426,7 +426,7 @@ pub enum PfcpSessionEvent {
         /// Updated FAR rules
         updated_fars: Vec<ParsedCreateFar>,
         /// Updated QERs
-        updated_qers: Vec<ParsedCreateQer>,
+        updated_qers: Vec<crate::n4_build::ParsedUpdateQer>,
         /// Updated URRs. Re-threshold in place: the volume already measured against
         /// the rule must survive (see `DataPlaneUrr::set_reporting`).
         updated_urrs: Vec<ParsedCreateUrr>,
@@ -2141,6 +2141,51 @@ impl PfcpServer {
             }
         };
 
+        // #1478: the Create QERs are parsed before anything is allocated. A malformed
+        // one (an MBR or GBR shorter than its two 5-octet fields, TS 29.244 §8.2.8,
+        // §8.2.9) rejects the establishment with "Mandatory IE incorrect" (§7.6.8). It
+        // used to be dropped with a warning, so the session ran without that QER's
+        // gates and rate caps.
+        let mut parsed_qers = Vec::new();
+        for qer_ie in ParsedIe::find_all_ies(&ies, pfcp_ie::CREATE_QER) {
+            match parse_create_qer(&qer_ie.value) {
+                Ok(qer) => {
+                    log::debug!(
+                        "QER {}: ul_gate={}, dl_gate={}, ul_mbr={} kbps, dl_mbr={} kbps, qfi={:?}",
+                        qer.qer_id,
+                        qer.ul_gate,
+                        qer.dl_gate,
+                        qer.ul_mbr,
+                        qer.dl_mbr,
+                        qer.qfi
+                    );
+                    parsed_qers.push(qer);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Session Establishment from {src_addr}: malformed Create QER ({e}) — \
+                         rejecting"
+                    );
+                    let resp_payload = build_failure_response(
+                        PfcpCause::MandatoryIeIncorrect,
+                        Some(pfcp_ie::CREATE_QER),
+                    );
+                    let response = self.build_response(
+                        pfcp_type::SESSION_ESTABLISHMENT_RESPONSE,
+                        smf_seid,
+                        header.sequence_number,
+                        &resp_payload,
+                        true,
+                    );
+                    self.socket
+                        .send_to(&response, src_addr)
+                        .await
+                        .map_err(|e| format!("Send error: {e}"))?;
+                    return Ok(());
+                }
+            }
+        }
+
         // Allocate UPF SEID
         let upf_seid = self.alloc_seid();
         log::debug!("Allocated UPF SEID: {upf_seid:#x}");
@@ -2285,28 +2330,6 @@ impl PfcpServer {
         {
             dl_teid = teid;
             gnb_addr = addr;
-        }
-
-        // Parse Create QERs
-        let mut parsed_qers = Vec::new();
-        for qer_ie in ParsedIe::find_all_ies(&ies, pfcp_ie::CREATE_QER) {
-            match parse_create_qer(&qer_ie.value) {
-                Ok(qer) => {
-                    log::debug!(
-                        "QER {}: ul_gate={}, dl_gate={}, ul_mbr={}, dl_mbr={}, qfi={:?}",
-                        qer.qer_id,
-                        qer.ul_gate,
-                        qer.dl_gate,
-                        qer.ul_mbr,
-                        qer.dl_mbr,
-                        qer.qfi
-                    );
-                    parsed_qers.push(qer);
-                }
-                Err(e) => {
-                    log::warn!("Failed to parse QER: {e}");
-                }
-            }
         }
 
         // Parse Create URRs
@@ -2630,7 +2653,13 @@ impl PfcpServer {
         let mod_fars = parse_rule_list(&ies, pfcp_ie::UPDATE_FAR, parse_create_far, &mut failure);
         let created_qers =
             parse_rule_list(&ies, pfcp_ie::CREATE_QER, parse_create_qer, &mut failure);
-        let mod_qers = parse_rule_list(&ies, pfcp_ie::UPDATE_QER, parse_create_qer, &mut failure);
+        // #1478: an Update QER keeps which IEs it carries (Table 7.5.4.5-1).
+        let mod_qers = parse_rule_list(
+            &ies,
+            pfcp_ie::UPDATE_QER,
+            crate::n4_build::parse_update_qer,
+            &mut failure,
+        );
         let created_urrs = parse_rule_list(
             &ies,
             pfcp_ie::CREATE_URR,
@@ -5486,6 +5515,268 @@ mod tests {
             dp.stats.drops(DropReason::QerGate),
             "every drop is qer_gate: {}",
             dp.stats.summary()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // #1478: an Update QER changes only the IEs it carries (Table 7.5.4.5-1).
+    // ------------------------------------------------------------------
+
+    /// A QER body of QER ID `id` with the given IEs, each left out when `None`:
+    /// Gate Status octet (§8.2.7), the MBR and GBR as raw values (§8.2.8, §8.2.9: two
+    /// 5-octet kbit/s fields), QFI.
+    fn qer_body_1478(
+        id: u32,
+        gate: Option<u8>,
+        mbr: Option<&[u8]>,
+        gbr: Option<&[u8]>,
+        qfi: Option<u8>,
+    ) -> Vec<u8> {
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_u32(pfcp_ie::QER_ID, id);
+        if let Some(g) = gate {
+            b.add_u8(25, g);
+        }
+        if let Some(m) = mbr {
+            b.add_tlv(26, m);
+        }
+        if let Some(g) = gbr {
+            b.add_tlv(27, g);
+        }
+        if let Some(q) = qfi {
+            b.add_u8(pfcp_ie::QFI, q);
+        }
+        b.build()
+    }
+
+    /// An MBR or GBR value: UL then DL, 5 octets each, kbit/s.
+    fn rates_1478(ul_kbps: u64, dl_kbps: u64) -> Vec<u8> {
+        let mut v = ul_kbps.to_be_bytes()[3..8].to_vec();
+        v.extend_from_slice(&dl_kbps.to_be_bytes()[3..8]);
+        v
+    }
+
+    /// Establish, through the real N4 handler, the #1475 session (UL PDR 1 on TEID
+    /// 0x1234, FAR 1 FORW) with QER 1 = `qer`, apply it to `dp` and return the
+    /// Establishment Response.
+    async fn establish_with_qer_1478(
+        smf: &UdpSocket,
+        addr: SocketAddr,
+        rx: &mut mpsc::Receiver<PfcpSessionEvent>,
+        dp: &crate::data_plane::DataPlane,
+        qer: &[u8],
+    ) -> Vec<u8> {
+        let assoc = build_association_setup_request_payload(Some(1));
+        let _ = exchange(smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        let mut pdi = crate::n4_build::PfcpMessageBuilder::new();
+        pdi.add_u8(pfcp_ie::SOURCE_INTERFACE, 0);
+        pdi.add_f_teid(&crate::n4_build::FTeid {
+            teid: 0x1234,
+            ipv4: Some(Ipv4Addr::new(127, 0, 0, 4)),
+            ipv6: None,
+            choose: false,
+            choose_id: None,
+        });
+        pdi.add_ue_ip_address(
+            &crate::n4_build::UeIpAddress {
+                ipv4: Some(Ipv4Addr::new(10, 45, 0, 42)),
+                ipv6: None,
+                ipv6_prefix_len: 0,
+            },
+            false,
+        );
+        let mut pdr = crate::n4_build::PfcpMessageBuilder::new();
+        pdr.add_pdr_id(1);
+        pdr.add_u32(pfcp_ie::PRECEDENCE, 100);
+        pdr.add_tlv(pfcp_ie::PDI, &pdi.build());
+        pdr.add_u32(pfcp_ie::FAR_ID, 1);
+        pdr.add_u32(pfcp_ie::QER_ID, 1);
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        b.add_f_seid(&crate::n4_build::FSeid {
+            seid: 0x1478,
+            ipv4: Some(Ipv4Addr::new(127, 0, 0, 9)),
+            ipv6: None,
+        });
+        b.add_tlv(pfcp_ie::CREATE_PDR, &pdr.build());
+        b.add_tlv(pfcp_ie::CREATE_FAR, &far_body(1, 0x02));
+        b.add_tlv(pfcp_ie::CREATE_QER, qer);
+        let resp = exchange(smf, addr, &encode_pfcp(50, Some(0), 2, &b.build())).await;
+        if response_cause(&resp) == PfcpCause::RequestAccepted as u8 {
+            apply_next(rx, dp).await;
+        }
+        resp
+    }
+
+    /// Send a Session Modification carrying `update_qer` as its only IE; apply the
+    /// event when it is accepted. Returns the response.
+    async fn update_qer_1478(
+        smf: &UdpSocket,
+        addr: SocketAddr,
+        rx: &mut mpsc::Receiver<PfcpSessionEvent>,
+        dp: &crate::data_plane::DataPlane,
+        update_qer: &[u8],
+    ) -> Vec<u8> {
+        let upf_seid = dp.sessions.find_by_ul_teid(0x1234).expect("held").upf_seid;
+        let mut m = crate::n4_build::PfcpMessageBuilder::new();
+        m.add_tlv(pfcp_ie::UPDATE_QER, update_qer);
+        let resp = exchange(smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &m.build())).await;
+        if response_cause(&resp) == PfcpCause::RequestAccepted as u8 {
+            apply_next(rx, dp).await;
+        }
+        resp
+    }
+
+    fn offending_ie_1478(resp: &[u8]) -> Option<u16> {
+        let (_, body) = ParsedPfcpHeader::parse(resp).unwrap();
+        let ies = ParsedIe::parse_all(body);
+        ParsedIe::find_ie(&ies, pfcp_ie::OFFENDING_IE)
+            .map(|ie| u16::from_be_bytes([ie.value[0], ie.value[1]]))
+    }
+
+    /// **#1478.** A third-party SMF's Update QER that changes only the QFI keeps the
+    /// 64 kbps UL MBR: traffic above it is still dropped as qer_gate. upfd used to
+    /// rebuild the QER from the Update's IEs, so the cap was lifted and nothing was
+    /// dropped. The fixed-volume, deadline-paced offer is the #1487 rule.
+    #[tokio::test]
+    async fn an_update_qer_without_an_mbr_keeps_the_rate_cap_1478() {
+        let ms = std::time::Duration::from_millis;
+        let (_server, smf, addr, mut rx) = spawn_test_server().await;
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        let tun = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("/dev/null stands in for the TUN");
+        let create = qer_body_1478(
+            1,
+            Some(0x00),
+            Some(&rates_1478(64, 1_000_000)),
+            None,
+            Some(9),
+        );
+        let resp = establish_with_qer_1478(&smf, addr, &mut rx, &dp, &create).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+
+        // The Update carries the QER ID and a new QFI only.
+        let update = qer_body_1478(1, None, None, None, Some(5));
+        let resp = update_qer_1478(&smf, addr, &mut rx, &dp, &update).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        let session = dp.sessions.find_by_ul_teid(0x1234).unwrap();
+        {
+            let qers = session.qers.read().unwrap();
+            assert_eq!(qers[&1].qfi, Some(5), "the QFI it carried is applied");
+            assert_eq!((qers[&1].ul_mbr, qers[&1].dl_mbr), (64, 1_000_000));
+            assert!(qers[&1].ul_gate_open && qers[&1].dl_gate_open);
+        }
+
+        // 200 x 500 B on a 5 ms schedule (800 kbps): above 64 kbps, so it drops.
+        let sent = 200u64;
+        let (drops, secs) =
+            offer_ul_1475(&dp, &tun, 500, sent as u32, Pace1475::Deadline(ms(5))).await;
+        let offered_bps = (sent * 500 * 8) as f64 / secs;
+        assert!(
+            offered_bps > 2.0 * 64_000.0,
+            "the offer ran at only {offered_bps:.0} bit/s"
+        );
+        assert!(drops > 0, "the 64 kbps cap must still drop ({sent} sent)");
+        let passed_bytes = ((sent - drops) * 500) as f64;
+        let ceiling = 1500.0 + 8000.0 * secs + 500.0;
+        assert!(
+            passed_bytes <= ceiling,
+            "passed {passed_bytes} B in {secs:.3} s: above 64 kbps (ceiling {ceiling:.0} B)"
+        );
+    }
+
+    /// **#1478.** An Update QER that changes only the MBR leaves a CLOSED uplink gate
+    /// closed: every UL packet is still dropped. upfd used to rebuild the QER, so the
+    /// absent Gate Status opened both gates.
+    #[tokio::test]
+    async fn an_update_qer_without_gate_status_keeps_a_closed_gate_1478() {
+        use crate::data_plane::DropReason;
+        let (_server, smf, addr, mut rx) = spawn_test_server().await;
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        let tun = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("/dev/null stands in for the TUN");
+        // Gate Status 0x04: UL CLOSED (bits 3-4 = 1), DL OPEN (§8.2.7).
+        let create = qer_body_1478(1, Some(0x04), None, None, Some(9));
+        let resp = establish_with_qer_1478(&smf, addr, &mut rx, &dp, &create).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+
+        let update = qer_body_1478(1, None, Some(&rates_1478(1_000_000, 1_000_000)), None, None);
+        let resp = update_qer_1478(&smf, addr, &mut rx, &dp, &update).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        let session = dp.sessions.find_by_ul_teid(0x1234).unwrap();
+        {
+            let qers = session.qers.read().unwrap();
+            assert_eq!(qers[&1].ul_mbr, 1_000_000, "the MBR it carried is applied");
+            assert!(!qers[&1].ul_gate_open, "the UL gate stays closed");
+            assert!(qers[&1].dl_gate_open);
+            assert_eq!(qers[&1].qfi, Some(9), "the QFI is kept");
+        }
+
+        // 10 x 500 B is far inside the 1 Gbps burst: only the gate can drop them.
+        let (drops, _) = offer_ul_1475(&dp, &tun, 500, 10, Pace1475::Flat).await;
+        assert_eq!(drops, 10, "a closed UL gate drops every UL packet");
+        assert_eq!(dp.stats.drops(DropReason::QerGate), 10);
+    }
+
+    /// **#1478.** An MBR or GBR IE shorter than its two 5-octet fields is malformed:
+    /// an Update QER carrying one is refused with "Mandatory IE incorrect" naming the
+    /// Update QER (§7.6.8), and the QER keeps its cap. It used to be ignored, which
+    /// in an Update QER also lifted the cap.
+    #[tokio::test]
+    async fn a_short_mbr_or_gbr_in_an_update_qer_is_refused_1478() {
+        let (_server, smf, addr, mut rx) = spawn_test_server().await;
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        let create = qer_body_1478(1, Some(0x00), Some(&rates_1478(64, 64)), None, Some(9));
+        let resp = establish_with_qer_1478(&smf, addr, &mut rx, &dp, &create).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+
+        let short = rates_1478(1_000_000, 1_000_000)[..9].to_vec();
+        for update in [
+            qer_body_1478(1, Some(0x00), Some(&short), None, None),
+            qer_body_1478(1, Some(0x00), None, Some(&short), None),
+            qer_body_1478(1, Some(0x00), Some(&[]), None, None),
+        ] {
+            let resp = update_qer_1478(&smf, addr, &mut rx, &dp, &update).await;
+            assert_eq!(response_cause(&resp), PfcpCause::MandatoryIeIncorrect as u8);
+            assert_eq!(offending_ie_1478(&resp), Some(pfcp_ie::UPDATE_QER));
+        }
+        let session = dp.sessions.find_by_ul_teid(0x1234).unwrap();
+        let qers = session.qers.read().unwrap();
+        assert_eq!(
+            (qers[&1].ul_mbr, qers[&1].dl_mbr),
+            (64, 64),
+            "the cap stands"
+        );
+    }
+
+    /// **#1478.** A Create QER with a short MBR rejects the Session Establishment with
+    /// "Mandatory IE incorrect" naming the Create QER (§7.6.8); no session is held.
+    /// It used to be ignored, so the QER was installed without its cap.
+    #[tokio::test]
+    async fn a_short_mbr_in_a_create_qer_rejects_the_establishment_1478() {
+        let (server, smf, addr, mut rx) = spawn_test_server().await;
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        let short = rates_1478(64, 64)[..5].to_vec();
+        let create = qer_body_1478(1, Some(0x00), Some(&short), None, Some(9));
+        let resp = establish_with_qer_1478(&smf, addr, &mut rx, &dp, &create).await;
+        assert_eq!(resp[1], pfcp_type::SESSION_ESTABLISHMENT_RESPONSE);
+        assert_eq!(response_cause(&resp), PfcpCause::MandatoryIeIncorrect as u8);
+        assert_eq!(offending_ie_1478(&resp), Some(pfcp_ie::CREATE_QER));
+        assert!(
+            server.sessions.read().await.is_empty(),
+            "no session is held"
         );
     }
 

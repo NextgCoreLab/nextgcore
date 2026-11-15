@@ -1378,7 +1378,9 @@ pub async fn run() -> Result<()> {
     // overload threshold. Before this, an AMF at capacity answered 503 with no way
     // for a consumer to know to back off (§6.4.3.2).
     sbi_server_config = sbi_server_config.with_self_overload_reporting();
-    let sbi_server = nextgcore_sbi::server::SbiServer::new(sbi_server_config);
+    // #1421: the callbacks this AMF subscribed for are admitted on their own
+    // token when the listener requires OAuth2 (a notification carries no bearer).
+    let sbi_server = namf_server::sbi_server(sbi_server_config);
     sbi_server
         .start(namf_server::namf_request_handler)
         .await
