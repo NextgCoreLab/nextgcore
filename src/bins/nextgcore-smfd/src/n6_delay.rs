@@ -522,6 +522,19 @@ pub fn forget_upf(upf_key: &str) {
         .retain(|(upf, _), _| upf != upf_key);
 }
 
+/// The current results of the UPF `upf_key`, by endpoint (sorted): what the
+/// nextgsim#471 demo exposes to a QOS_MON consumer. Empty when none is held.
+#[cfg_attr(not(feature = "demo-d443a-edge-budget"), allow(dead_code))]
+pub fn latest_for(upf_key: &str) -> Vec<(IpAddr, Measured)> {
+    RESULTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|((upf, _), _)| upf == upf_key)
+        .map(|((_, ip), m)| (*ip, *m))
+        .collect()
+}
+
 /// Whether every member IE header of a grouped IE value fits the value exactly.
 fn members_fit(mut v: &[u8]) -> bool {
     while !v.is_empty() {
@@ -648,6 +661,15 @@ pub(crate) fn reset_for_test() {
     RESULTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     FAILURES.lock().unwrap_or_else(|e| e.into_inner()).clear();
     IGNORED.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Test only: store a result as a report would.
+#[cfg(test)]
+pub(crate) fn insert_for_test(upf_key: &str, ip: IpAddr, m: Measured) {
+    RESULTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((upf_key.to_string(), ip), m);
 }
 
 /// Test only: the number of stored results and failure entries.

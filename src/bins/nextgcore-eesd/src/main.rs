@@ -113,6 +113,8 @@ mod capabilities;
 mod context;
 mod ecs_registration;
 mod ecs_role; // #107: the ECS role (EDGE-4 provisioning, EDGE-6 registration, discovery)
+#[cfg(feature = "demo-d443a-edge-budget")]
+mod edge_budget; // nextgsim#471: demo d443a-edge-budget (QOS_MON consumer, budget ranking)
 mod eec;
 mod notifier;
 mod relocation;
@@ -261,6 +263,25 @@ fn setup_signal_handlers(shutdown: Arc<AtomicBool>) {
     .expect("value expected");
 }
 
+/// The demos this build can run: `d443a-edge-budget` under its feature, none
+/// otherwise.
+fn demo_registry() -> nextgcore_demo::DemoRegistry {
+    #[cfg(feature = "demo-d443a-edge-budget")]
+    return nextgcore_demo::DemoRegistry::new(&[edge_budget::DEMO_SPEC]);
+    #[cfg(not(feature = "demo-d443a-edge-budget"))]
+    nextgcore_demo::DemoRegistry::default()
+}
+
+/// The config file's root, for the `demo:` block. A missing file is no block.
+fn config_root(config_path: &str) -> Result<serde_yaml::Value> {
+    match std::fs::read_to_string(config_path) {
+        Ok(content) => serde_yaml::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("config file '{config_path}' does not parse: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(serde_yaml::Value::Null),
+        Err(e) => anyhow::bail!("cannot read the config file '{config_path}': {e}"),
+    }
+}
+
 /// Load the OAuth2 verification JWKS from `path` into the process-global store.
 fn load_oauth2_jwks(path: &str) {
     match std::fs::read_to_string(path) {
@@ -345,6 +366,29 @@ async fn main() -> Result<()> {
         );
     }
 
+    // nextgsim#458: the demo: block, checked against the demos this build was
+    // compiled with, so an unknown key or mode, or a demo whose cargo feature is
+    // not built, fails start-up. With no demo active nothing below changes.
+    let config_root = config_root(&args.config)?;
+    nextgcore_demo::init_from_root(&config_root, &demo_registry())
+        .map_err(|e| anyhow::anyhow!("{e} ({e:?})"))?;
+    // nextgsim#471: `ees.edge_budget` is validated whenever the feature is built,
+    // so a typo fails start-up even with the demo off; it is used only with it on.
+    #[cfg(feature = "demo-d443a-edge-budget")]
+    {
+        let budget_config =
+            edge_budget::config_from_root(&config_root).map_err(|e| anyhow::anyhow!("{e}"))?;
+        edge_budget::install(
+            nextgcore_demo::active_mode(edge_budget::DEMO_KEY)
+                .and_then(edge_budget::Mode::parse)
+                .map(|mode| edge_budget::Plan {
+                    mode,
+                    config: budget_config,
+                    token: edge_budget::mint_token(),
+                }),
+        );
+    }
+
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(shutdown.clone());
 
@@ -373,6 +417,28 @@ async fn main() -> Result<()> {
         .start(ees_sbi_request_handler)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
+
+    // nextgsim#471: the demo's /metrics and its QOS_MON subscription, only with
+    // the demo on. The subscription's notifUri uses the advertised host.
+    #[cfg(feature = "demo-d443a-edge-budget")]
+    let _metrics = if edge_budget::serving() {
+        match sbi.registration_host() {
+            Ok(host) => edge_budget::spawn_subscriber(args.tls, host, sbi_port),
+            Err(why) => nextgcore_demo::demo_log!(
+                error,
+                edge_budget::DEMO_KEY,
+                "{why} (no QOS_MON subscription: the SMF needs a notifUri it can reach)"
+            ),
+        }
+        nextgcore_metrics::nf::serve_nf_metrics(
+            "EES",
+            "EES_METRICS_PORT",
+            Arc::new(edge_budget::render_metrics),
+        )
+        .await
+    } else {
+        None
+    };
 
     // eesd-01: self-register toward the ECS (EDGE-6), not the NRF.
     // #107: resolve the ECS-role switch before anything can be served, so no
@@ -818,6 +884,19 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // Checked LAST and only after every eees-* arm, so an ECS route can never
         // shadow an EES one; `route` returns None with the role off, which leaves
         // the 404 below in charge exactly as before.
+        // nextgsim#471: the demo's QOS_MON notification route, only with the demo
+        // on. Behind the per-operation OAuth2 gate like every route here; the
+        // path token is checked in addition. No NF-local exemption: a token-less
+        // notify (TS 33.501 §13.4.1) is admitted only once the route is
+        // registered through the shared callback exemption (nextgcore#1421).
+        #[cfg(feature = "demo-d443a-edge-budget")]
+        [edge_budget::ROUTE_ROOT, edge_budget::ROUTE_QOS_MON, token] if edge_budget::serving() => {
+            if let Some(resp) = auth::require_oauth2(&request, edge_budget::SCOPE) {
+                return resp;
+            }
+            edge_budget::on_notify(token, &request)
+                .unwrap_or_else(|| send_not_found(&format!("Resource not found: {path}"), None))
+        }
         _ => match ecs_role::route(parts.as_slice(), &request) {
             Some(resp) => resp,
             None => send_not_found(&format!("Resource not found: {path}"), None),
@@ -1097,7 +1176,7 @@ async fn handle_eas_discover(request: &SbiRequest) -> SbiResponse {
         .map(|c| {
             c.eas_discover_filter(req.eas_discovery_filter.as_ref())
                 .into_iter()
-                .map(|eas| types::DiscoveredEas { eas })
+                .map(types::DiscoveredEas::of)
                 .collect()
         })
         .unwrap_or_default();
@@ -1351,11 +1430,20 @@ fn apply_ac_profile_matching(
     // EAS", and answering with a selection anyway would override the EEC's choice
     // to do its own discovery.
     if reg.eas_sel_req_ind == Some(true) && !outcome.selected.is_empty() {
+        // nextgsim#471: with the demo on, the selection is its local policy
+        // (budget ranking and deadline); a 404 when no EAS is within it.
+        #[cfg(feature = "demo-d443a-edge-budget")]
+        if let Some(choice) = edge_budget::select(reg, outcome.selected.clone()) {
+            reg.discovered_eas = Some(choice.map_err(|detail| {
+                Box::new(send_not_found(&detail, Some(cause::RESOURCE_NOT_FOUND)))
+            })?);
+            return Ok(());
+        }
         reg.discovered_eas = Some(
             outcome
                 .selected
                 .into_iter()
-                .map(|eas| types::DiscoveredEas { eas })
+                .map(types::DiscoveredEas::of)
                 .collect(),
         );
     }
@@ -2496,7 +2584,7 @@ fn emit_acrevents_target_info(req: &AcrDetermReq, state: &AcrState) {
             .ok()
             .and_then(|c| c.eas_discover(Some(tid), None).into_iter().next());
         profile.map(|eas| TargetInfo {
-            trget_eas_info: Some(types::DiscoveredEas { eas }),
+            trget_eas_info: Some(types::DiscoveredEas::of(eas)),
             trget_ees_info: None,
         })
     });
@@ -2937,6 +3025,10 @@ async fn handle_acr_param_send(request: &SbiRequest) -> SbiResponse {
     }
     SbiResponse::with_status(204)
 }
+
+#[cfg(test)]
+#[path = "edge_budget_router_tests.rs"]
+mod edge_budget_router_tests;
 
 #[cfg(test)]
 mod tests {
