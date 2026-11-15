@@ -472,19 +472,13 @@ pub fn nextgcore_dbi_update_mme(
 pub fn nextgcore_dbi_subscription_data(supi: &str) -> DbiResult<NextgcoreSubscriptionData> {
     let (supi_type, supi_id) = nextgcore_ue_id_key(supi)?;
 
-    // #87: the identity mirror answers only when a test has provisioned one, so
-    // enabling the store for the authentication tests leaves every other
-    // handler's view of the subscriber DB unchanged.
-    // #1526 review: a subscriber DOCUMENT a test provisioned answers too, parsed by
-    // the same code as a Mongo document, so a test can seed the real `ambr` shape.
+    // #87: the mirror answers only when a test has provisioned identities or
+    // subscriber documents, so enabling the store for the authentication tests
+    // leaves every other handler's view of the subscriber DB unchanged. #1526: the
+    // identity and the document are one subscriber, merged as Mongo's single
+    // document would be (`test_store::subscription_data`).
     #[cfg(any(test, feature = "test-helpers"))]
-    if crate::test_store::documents_active() {
-        if let Ok(document) = crate::test_store::subscriber_document(supi) {
-            return Ok(parse_subscription_document(&document));
-        }
-    }
-    #[cfg(any(test, feature = "test-helpers"))]
-    if crate::test_store::identities_active() {
+    if crate::test_store::identities_active() || crate::test_store::documents_active() {
         return crate::test_store::subscription_data(supi);
     }
 
@@ -500,7 +494,7 @@ pub fn nextgcore_dbi_subscription_data(supi: &str) -> DbiResult<NextgcoreSubscri
 
 /// The [`NextgcoreSubscriptionData`] of one `subscribers` document, shared by the
 /// Mongo read and the test mirror's document store.
-fn parse_subscription_document(document: &Document) -> NextgcoreSubscriptionData {
+pub(crate) fn parse_subscription_document(document: &Document) -> NextgcoreSubscriptionData {
     let mut subscription_data = NextgcoreSubscriptionData::new();
 
     // Parse IMSI
@@ -568,7 +562,7 @@ fn parse_subscription_document(document: &Document) -> NextgcoreSubscriptionData
     }
 
     // Parse slice array
-    parse_subscribed_slices(&document, &mut subscription_data);
+    parse_subscribed_slices(document, &mut subscription_data);
 
     // Parse MME host
     if let Ok(mme_host) = document.get_str(NEXTGCORE_MME_HOST_STRING) {

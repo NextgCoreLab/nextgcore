@@ -183,10 +183,6 @@ pub fn stored_sqn(supi: &str) -> Option<u64> {
 /// as its `imsi-`. That reverse direction is what makes the UDR's
 /// `identity-data` resource able to answer GPSI-to-SUPI at all.
 pub(crate) fn subscription_data(id: &str) -> DbiResult<crate::types::NextgcoreSubscriptionData> {
-    let guard = IDENTITIES.lock().unwrap();
-    let map = guard
-        .as_ref()
-        .ok_or_else(|| DbiError::SubscriberNotFound(id.to_string()))?;
     let value = crate::types::nextgcore_id_get_value(id)
         .ok_or_else(|| DbiError::InvalidSupi(id.to_string()))?;
     // `{extid: <value>}` reads only the `extid` field in Mongo, so an `extid-`
@@ -194,34 +190,52 @@ pub(crate) fn subscription_data(id: &str) -> DbiResult<crate::types::NextgcoreSu
     // them).
     let by_extid = crate::types::nextgcore_id_get_type(id).as_deref()
         == Some(crate::types::NEXTGCORE_EXTID_STRING);
-    let hit = map
-        .iter()
-        .find(|(supi, ids)| {
-            if by_extid {
-                ids.external_ids.iter().any(|e| e == &value)
-            } else {
-                crate::types::nextgcore_id_get_value(supi).as_deref() == Some(value.as_str())
-                    || ids.msisdns.iter().any(|m| m == &value)
-            }
-        })
-        .map(|(supi, ids)| (supi.clone(), ids.clone()))
-        .ok_or_else(|| DbiError::SubscriberNotFound(id.to_string()))?;
-    drop(guard); // never hold IDENTITIES while taking DOCUMENTS
+    let identity = IDENTITIES.lock().unwrap().as_ref().and_then(|map| {
+        map.iter()
+            .find(|(supi, ids)| {
+                if by_extid {
+                    ids.external_ids.iter().any(|e| e == &value)
+                } else {
+                    crate::types::nextgcore_id_get_value(supi).as_deref() == Some(value.as_str())
+                        || ids.msisdns.iter().any(|m| m == &value)
+                }
+            })
+            .map(|(supi, ids)| (supi.clone(), ids.clone()))
+    }); // IDENTITIES is released here: never held while taking DOCUMENTS
 
-    let mut data = crate::types::NextgcoreSubscriptionData::new();
-    data.imsi = crate::types::nextgcore_id_get_value(&hit.0);
-    for bcd in &hit.1.msisdns {
-        let mut msisdn = crate::types::NextgcoreMsisdn::default();
-        msisdn.bcd = bcd.clone();
-        data.msisdn.push(msisdn);
+    // One subscriber, one Mongo document: the provisioned document (#1383, #1501,
+    // #1526) is parsed by the Mongo parser, so it supplies every field it carries
+    // (`ambr`, `slice`, ...), and the identity, when provisioned, answers the
+    // identity fields on top of it. Neither hides the other.
+    let supi = identity
+        .as_ref()
+        .map(|(supi, _)| supi.clone())
+        .unwrap_or_else(|| id.to_string());
+    let document = if by_extid && identity.is_none() {
+        None
+    } else {
+        subscriber_document(&supi).ok()
+    };
+    if identity.is_none() && document.is_none() {
+        return Err(DbiError::SubscriberNotFound(id.to_string()));
     }
-    data.num_of_msisdn = data.msisdn.len();
-    data.external_ids = hit.1.external_ids;
-    // Subscribed S-NSSAIs (#1501): Mongo reads `slice` off the same subscriber
-    // document, so the mirror reads it off the provisioned document, through the
-    // same parser. A subscriber with no document has no slices.
-    if let Ok(document) = subscriber_document(&hit.0) {
-        crate::subscription::parse_subscribed_slices(&document, &mut data);
+    let mut data = document
+        .as_ref()
+        .map(crate::subscription::parse_subscription_document)
+        .unwrap_or_else(crate::types::NextgcoreSubscriptionData::new);
+    if let Some((supi, ids)) = identity {
+        data.imsi = crate::types::nextgcore_id_get_value(&supi);
+        data.msisdn = ids
+            .msisdns
+            .iter()
+            .map(|bcd| {
+                let mut msisdn = crate::types::NextgcoreMsisdn::default();
+                msisdn.bcd = bcd.clone();
+                msisdn
+            })
+            .collect();
+        data.num_of_msisdn = data.msisdn.len();
+        data.external_ids = ids.external_ids;
     }
     Ok(data)
 }
