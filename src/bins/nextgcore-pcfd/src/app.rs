@@ -343,6 +343,26 @@ pub async fn run() -> Result<()> {
         return Err(nextgcore_core::signal::kill_unsupported().into());
     }
 
+    // #1402: `pcf.policy.session_ambr_cap`, in force before anything authorises a
+    // Session-AMBR -- the boot restoration below re-evaluates restored sessions. An
+    // unknown value fails start-up rather than leaving the default in force.
+    let session_ambr_cap =
+        crate::session_ambr_cap::from_config_root(&demo_config_root(&args.config)?)
+            .map_err(|e| anyhow::anyhow!("configuration file {}: {e}", args.config))?;
+    crate::session_ambr_cap::set(session_ambr_cap);
+    log::info!(
+        "pcf.policy.session_ambr_cap = {}: the authorised Session-AMBR is {}",
+        session_ambr_cap.as_str(),
+        match session_ambr_cap {
+            crate::session_ambr_cap::SessionAmbrCap::Subscribed => {
+                "capped per direction by the subscribed Session-AMBR the SMF reports"
+            }
+            crate::session_ambr_cap::SessionAmbrCap::None => {
+                "the policy value, not capped by the subscribed Session-AMBR"
+            }
+        }
+    );
+
     // Set up signal handlers
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(shutdown.clone())?;
@@ -2997,27 +3017,32 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
             // Build policy decision from subscription data (TS 29.512).
             // When the DB has no policy data for this DNN/slice, the
             // config-default session data is used (documented fallback).
-            let decision = match session_data {
-                Some(ref sd) => build_sm_policy_decision(&sess.sm_policy_id, sd),
+            //
+            // #1402: the Session-AMBR is capped by the reported `subsSessAmbr` per
+            // `pcf.policy.session_ambr_cap`, as the UpdateNotify and SE_AMBR_CH are,
+            // the config default included.
+            let policy_data_for_decision = match session_data {
+                Some(ref sd) => sd.clone(),
                 None => {
                     log::warn!(
                         "No subscription policy data for dnn={dnn} sst={sst} — \
                          using config-default session data (5QI=9, AMBR 100/100 Mbps)"
                     );
-                    build_sm_policy_decision(
-                        &sess.sm_policy_id,
-                        &nudr_handler::SessionData {
-                            qos_index: 9,
-                            arp_priority_level: 8,
-                            arp_preempt_cap: false,
-                            arp_preempt_vuln: true,
-                            ambr_uplink: 100_000_000,
-                            ambr_downlink: 100_000_000,
-                            pcc_rules: vec![],
-                        },
-                    )
+                    nudr_handler::SessionData {
+                        qos_index: 9,
+                        arp_priority_level: 8,
+                        arp_preempt_cap: false,
+                        arp_preempt_vuln: true,
+                        ambr_uplink: 100_000_000,
+                        ambr_downlink: 100_000_000,
+                        pcc_rules: vec![],
+                    }
                 }
             };
+            let decision = build_sm_policy_decision(
+                &sess.sm_policy_id,
+                &sbi_path::decision_session_data(&sess, &policy_data_for_decision),
+            );
 
             // Map the TS 29.519 SmPolicyDnnData online/offline flags into the
             // ChargingData decisions when the UDR provided them.
@@ -3122,10 +3147,11 @@ pub async fn handle_sm_policy_get(sm_policy_id: &str) -> SbiResponse {
                     Some("SYSTEM_FAILURE"),
                 );
             };
-            // nextgsim#465: the decision in force carries any active override cap.
+            // #1402: the decision in force carries the subscribed cap per
+            // `pcf.policy.session_ambr_cap`; nextgsim#465: and any active override cap.
             let decision = build_sm_policy_decision(
                 &sess.sm_policy_id,
-                &sbi_path::effective_session_data(&sess.sm_policy_id, &session_data),
+                &sbi_path::decision_session_data(&sess, &session_data),
             );
             let mut context_data = serde_json::Map::new();
             context_data.insert("supi".to_string(), serde_json::json!(supi));
@@ -3316,7 +3342,8 @@ fn take_terminated_app_session(app_session_id: &str) -> bool {
 ///
 /// Before this, an operator editing a subscriber's policy data reached a **live**
 /// session through no path at all: the SMF sees the UDM's subscription notification and
-/// correctly defers to the PCF (TS 23.503 §6.1.3.2, #293), and the PCF never learned.
+/// correctly defers to the PCF (TS 23.501 §5.7.2.7, TS 29.512 §4.2.2.5, #293), and the
+/// PCF never learned.
 /// The edit took effect when the UE re-established.
 ///
 /// **Selection is by SUPI; evaluation is per session, scoped to its own S-NSSAI and
@@ -3942,11 +3969,14 @@ pub async fn handle_sm_policy_update_notify(
             // 2. It ignored the reported `subsSessAmbr` entirely, so even a reported
             //    change could not change the authorised value.
             //
-            // TS 23.503 §6.1.3.2 makes this PCF the authority and the subscribed value
-            // one of its INPUTS: the authorised AMBR shall not exceed the subscribed
-            // one. So the reported value BOUNDS the PCF's own policy rather than
-            // replacing it — `min` per direction, independently, because a subscription
-            // that lowers only the uplink must not touch the downlink.
+            // TS 29.512 §4.2.2.5 / §4.2.4.4 make this PCF the authority: it authorises
+            // the Session-AMBR "based on the operator's policy", and the subscribed
+            // value is one of its INPUTS, not a replacement for its own. Whether that
+            // input caps the policy value is operator policy (#1402):
+            // `pcf.policy.session_ambr_cap`, `subscribed` by default (`min` per
+            // direction, independently, because a subscription that lowers only the
+            // uplink must not touch the downlink), the same setting the create and
+            // the UpdateNotify apply.
             let sess_rules = if triggers.iter().any(|t| t == "SE_AMBR_CH") {
                 let dnn = sess.dnn.as_deref().unwrap_or("internet");
                 // The real SUPI. Resolved through the session's parent UE-SM, which is
@@ -3999,29 +4029,20 @@ pub async fn handle_sm_policy_update_notify(
                     // PCF had authorised lower. The cost: with the DB down, a raised
                     // subscription cannot raise the AMBR past the stored value until
                     // the DB answers again.
-                    let bound_bps = bound
-                        .as_ref()
-                        .map(|a| (parse_bitrate(&a.uplink), parse_bitrate(&a.downlink)));
-                    // `min` where a bound was reported, the PCF's own value where it was
-                    // not. An absent direction is NOT treated as an unlimited one: "the
-                    // SMF did not tell us the uplink" is no evidence about the uplink.
-                    let (mut auth_ul, mut auth_dl) = (sd.ambr_uplink, sd.ambr_downlink);
-                    if let Some((ul, dl)) = bound_bps {
-                        if let Some(ul) = ul {
-                            auth_ul = auth_ul.min(ul);
-                        }
-                        if let Some(dl) = dl {
-                            auth_dl = auth_dl.min(dl);
-                        }
-                    }
+                    // #1402: the one helper every path caps through, with the bound
+                    // this update just reported (or the stored one).
+                    let capped_by_subs = crate::session_ambr_cap::apply(&sd, bound.as_ref());
+                    let (auth_ul, auth_dl) =
+                        (capped_by_subs.ambr_uplink, capped_by_subs.ambr_downlink);
                     log::info!(
                         "SE_AMBR_CH for {supi} (smPolicyId={sm_policy_id}, dnn={dnn}): \
-                         policy {}/{} bps bounded by subscribed {:?} -> authorised \
-                         {auth_ul}/{auth_dl} bps (TS 23.503 §6.1.3.2: the authorised \
-                         session-AMBR shall not exceed the subscribed one)",
+                         policy {}/{} bps, subscribed {:?}, pcf.policy.session_ambr_cap={} \
+                         -> authorised {auth_ul}/{auth_dl} bps (TS 29.512 §4.2.2.5: \
+                         authorised per operator policy)",
                         sd.ambr_uplink,
                         sd.ambr_downlink,
                         bound.as_ref().map(|a| (&a.uplink, &a.downlink)),
+                        crate::session_ambr_cap::get().as_str(),
                     );
                     // What the SMF will hold, so a later re-evaluation whose read fails
                     // falls back to it rather than to the pre-bound value.
@@ -5507,8 +5528,9 @@ mod tests {
     }
 
     /// #310 criterion: the authorised session-AMBR is BOUNDED BY the reported
-    /// subscribed one (TS 23.503 §6.1.3.2 — the authorised AMBR shall not exceed the
-    /// subscribed one), rather than either ignoring it (pre-#310) or echoing it.
+    /// subscribed one under the default `pcf.policy.session_ambr_cap: subscribed`
+    /// (#1402; TS 29.512 §4.2.2.5 leaves the cap to operator policy), rather than
+    /// either ignoring it (pre-#310) or echoing it.
     ///
     /// Positive assertion on the answered `authSessAmbr` strings, which are reachable
     /// only by running the arm: a rejected or unrouted request answers no `sessRules`
@@ -5526,6 +5548,10 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         pcf_context_init(64, 64);
+        // #1402: these assertions are the default setting's.
+        let _cap = crate::test_support::session_ambr_cap(
+            crate::session_ambr_cap::SessionAmbrCap::default(),
+        );
 
         // Subscription BELOW the PCF's policy (100/100 Mbps): the subscription wins,
         // because the authorised value may not exceed it.
@@ -5596,6 +5622,10 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         pcf_context_init(64, 64);
+        // #1402: these assertions are the default setting's.
+        let _cap = crate::test_support::session_ambr_cap(
+            crate::session_ambr_cap::SessionAmbrCap::default(),
+        );
 
         let pol = create_with_subs_ambr(
             "imsi-001010000000315",
@@ -5709,6 +5739,10 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         pcf_context_init(64, 64);
+        // #1402: these assertions are the default setting's.
+        let _cap = crate::test_support::session_ambr_cap(
+            crate::session_ambr_cap::SessionAmbrCap::default(),
+        );
         let supi = "imsi-001010000061383";
         seed_subscriber_1383(supi);
         let pol = create_with_subs_ambr(supi, 19, None).await;
@@ -11301,6 +11335,254 @@ mod tests {
         assert_eq!(crate::ambr_override::get(&pol), None);
         peers.udr.stop().await.ok();
         peers.smf.stop().await.ok();
+    }
+    // ---- #1402: one `pcf.policy.session_ambr_cap`, applied on every path ----
+
+    /// (case, subsSessAmbr uplink, downlink, authorised under `subscribed`). The
+    /// policy value is the seeded subscriber's 11/22 Mbps ([`seed_subscriber_1383`]);
+    /// under `none` every case authorises 11/22.
+    const CASES_1402: [(&str, &str, &str, (&str, &str)); 4] = [
+        (
+            "subscribed above policy",
+            "50 Mbps",
+            "50 Mbps",
+            ("11 Mbps", "22 Mbps"),
+        ),
+        (
+            "subscribed below policy",
+            "5 Mbps",
+            "7 Mbps",
+            ("5 Mbps", "7 Mbps"),
+        ),
+        (
+            "subscribed equal to policy",
+            "11 Mbps",
+            "22 Mbps",
+            ("11 Mbps", "22 Mbps"),
+        ),
+        (
+            "only the uplink above",
+            "50 Mbps",
+            "7 Mbps",
+            ("11 Mbps", "7 Mbps"),
+        ),
+    ];
+
+    /// The Session-AMBR `cap` authorises for case `i` of [`CASES_1402`].
+    fn expected_1402(
+        cap: crate::session_ambr_cap::SessionAmbrCap,
+        i: usize,
+    ) -> (i64, String, String) {
+        let (ul, dl) = match cap {
+            crate::session_ambr_cap::SessionAmbrCap::Subscribed => CASES_1402[i].3,
+            crate::session_ambr_cap::SessionAmbrCap::None => (SEEDED_UL_1383, SEEDED_DL_1383),
+        };
+        (SEEDED_5QI_1383 as i64, ul.to_string(), dl.to_string())
+    }
+
+    fn subs_1402(i: usize) -> serde_json::Value {
+        serde_json::json!({ "uplink": CASES_1402[i].1, "downlink": CASES_1402[i].2 })
+    }
+
+    /// Remove `supi`'s UE-SM and its sessions: the PCF context is process-global and
+    /// capped at 64 sessions, so a test that leaves its sessions behind starves the
+    /// tests that run after it.
+    fn remove_ue_1402(supi: &str) {
+        let ctx = pcf_self();
+        let context = ctx.read().expect("context");
+        let ue = context.ue_sm_find_by_supi(supi).expect("ue_sm");
+        context.ue_sm_remove(ue.id);
+    }
+
+    /// SM policy create through the real router for a seeded subscriber, with
+    /// `subsSessAmbr` when given and its notificationUri on `smf_port`; answers the
+    /// 201 body.
+    async fn create_1402(
+        supi: &str,
+        psi: u8,
+        ipv4: &str,
+        smf_port: u16,
+        subs: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        seed_subscriber_1383(supi);
+        let mut create = full_create_body(supi, psi);
+        let obj = create.as_object_mut().unwrap();
+        obj.insert("ipv4Address".to_string(), serde_json::json!(ipv4));
+        obj.insert(
+            "notificationUri".to_string(),
+            serde_json::json!(format!(
+                "http://127.0.0.1:{smf_port}/nsmf-callback/v1/sm-policy-notify/{psi}"
+            )),
+        );
+        if let Some(subs) = subs {
+            obj.insert("subsSessAmbr".to_string(), subs);
+        }
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(create),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "SM policy create for {supi}");
+        serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap()
+    }
+
+    /// #1402, path 1 of 3 (Create): the 201's `authSessAmbr` is capped by the reported
+    /// `subsSessAmbr` per the setting, and the default is `subscribed`.
+    ///
+    /// REVERT-VERIFIED: with the create building from the uncapped session data, the
+    /// `subscribed` "below" case answers 11/22; with the default flipped to `none`,
+    /// the default pass answers 11/22.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guards held across .await to serialize the process-global PCF context and cap setting
+    async fn create_caps_the_session_ambr_per_the_setting_1402() {
+        use crate::session_ambr_cap::SessionAmbrCap;
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        for (pass, (cap, expect_as)) in [
+            (SessionAmbrCap::Subscribed, SessionAmbrCap::Subscribed),
+            (SessionAmbrCap::None, SessionAmbrCap::None),
+            // The default, asserted as `subscribed` whatever `default()` says.
+            (SessionAmbrCap::default(), SessionAmbrCap::Subscribed),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let _cap = crate::test_support::session_ambr_cap(cap);
+            for i in 0..CASES_1402.len() {
+                let n = pass * 10 + i;
+                let supi = format!("imsi-0010100000140{n:02}");
+                let created = create_1402(
+                    &supi,
+                    (n + 1) as u8,
+                    &format!("10.45.140.{}", n + 1),
+                    9,
+                    Some(subs_1402(i)),
+                )
+                .await;
+                remove_ue_1402(&supi);
+                assert_eq!(
+                    sess_rule_1383(&created),
+                    expected_1402(expect_as, i),
+                    "create, {cap:?} (pass {pass}), {}",
+                    CASES_1402[i].0
+                );
+            }
+        }
+    }
+
+    /// #1402, path 2 of 3 (UpdateNotify, here the one a P-CSCF restoration sends):
+    /// the notified `authSessAmbr` is capped by the session's `subsSessAmbr` per the
+    /// setting -- and the GET answers the same decision.
+    ///
+    /// REVERT-VERIFIED: with `build_sm_policy_notification` building from the
+    /// uncapped session data, the `subscribed` "below" case notifies 11/22.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guards held across .await to serialize the process-global PCF context and cap setting
+    async fn update_notify_caps_the_session_ambr_per_the_setting_1402() {
+        use crate::session_ambr_cap::SessionAmbrCap;
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
+        let mut notified = 0;
+        for (pass, cap) in [SessionAmbrCap::Subscribed, SessionAmbrCap::None]
+            .into_iter()
+            .enumerate()
+        {
+            let _cap = crate::test_support::session_ambr_cap(cap);
+            for i in 0..CASES_1402.len() {
+                let n = pass * 10 + i;
+                let (psi, ipv4) = ((n + 1) as u8, format!("10.45.141.{}", n + 1));
+                let supi = format!("imsi-0010100000141{n:02}");
+                create_1402(&supi, psi, &ipv4, peers.smf_port, Some(subs_1402(i))).await;
+                let resp = pcf_sbi_request_handler(make_request(
+                    "POST",
+                    "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
+                    Some(serde_json::json!({ "ueIpv4": ipv4 })),
+                ))
+                .await;
+                assert_eq!(resp.status, 204);
+                notified += 1;
+                let got = await_notifications(&peers, notified).await;
+                let path = format!("/nsmf-callback/v1/sm-policy-notify/{psi}/update");
+                let notify = got
+                    .iter()
+                    .find(|(p, _)| *p == path)
+                    .unwrap_or_else(|| panic!("a notify on {path}: {got:?}"));
+                assert_eq!(
+                    sess_rule_1383(&notify.1["smPolicyDecision"]),
+                    expected_1402(cap, i),
+                    "update-notify, {cap:?}, {}",
+                    CASES_1402[i].0
+                );
+
+                let pol = sm_policy_id_of(&ipv4);
+                let get = pcf_sbi_request_handler(make_request(
+                    "GET",
+                    &format!("/npcf-smpolicycontrol/v1/sm-policies/{pol}"),
+                    None,
+                ))
+                .await;
+                assert_eq!(get.status, 200);
+                let body: serde_json::Value =
+                    serde_json::from_str(get.http.content.as_deref().unwrap()).unwrap();
+                assert_eq!(
+                    sess_rule_1383(&body["policy"]),
+                    expected_1402(cap, i),
+                    "GET, {cap:?}, {}",
+                    CASES_1402[i].0
+                );
+                remove_ue_1402(&supi);
+            }
+        }
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
+    }
+
+    /// #1402, path 3 of 3 (`SE_AMBR_CH`): the update's `authSessAmbr` is capped by the
+    /// `subsSessAmbr` it reports per the setting. The create carries no
+    /// `subsSessAmbr`, so only the update's cap is under test.
+    ///
+    /// REVERT-VERIFIED: with the arm answering the uncapped session data, the
+    /// `subscribed` "below" case answers 11/22.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guards held across .await to serialize the process-global PCF context and cap setting
+    async fn se_ambr_ch_caps_the_session_ambr_per_the_setting_1402() {
+        use crate::session_ambr_cap::SessionAmbrCap;
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        for (pass, cap) in [SessionAmbrCap::Subscribed, SessionAmbrCap::None]
+            .into_iter()
+            .enumerate()
+        {
+            let _cap = crate::test_support::session_ambr_cap(cap);
+            for i in 0..CASES_1402.len() {
+                let n = pass * 10 + i;
+                let ipv4 = format!("10.45.142.{}", n + 1);
+                let supi = format!("imsi-0010100000142{n:02}");
+                let created = create_1402(&supi, (n + 1) as u8, &ipv4, 9, None).await;
+                assert_eq!(
+                    sess_rule_1383(&created),
+                    seeded_rule_1383(),
+                    "no subsSessAmbr at create: the policy value"
+                );
+                let pol = sm_policy_id_of(&ipv4);
+                let (_, ul, dl) = expected_1402(cap, i);
+                assert_eq!(
+                    report_se_ambr_ch(&pol, Some(subs_1402(i))).await,
+                    Some((ul, dl)),
+                    "SE_AMBR_CH, {cap:?}, {}",
+                    CASES_1402[i].0
+                );
+                remove_ue_1402(&supi);
+            }
+        }
     }
 }
 
