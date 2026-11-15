@@ -21,7 +21,7 @@
 //!   test fails; with a 30 s discovery bound, the hung-NRF test fails; with a 204
 //!   renewal read as "unlimited", the 204 test fails; without the stop check between
 //!   discovery and POST, the SIGTERM-during-discovery test fails.
-//! - #1497: with `spawn_pcfd_on` taking no new port when pcfd loses its SBI bind,
+//! - #1497: with `spawn_pcfd_with` taking no new port when pcfd loses its SBI bind,
 //!   the taken-port test fails ("pcfd exited at startup"); with no wait for the
 //!   listener at all (the spawn as it was), it fails after 30 s with "the
 //!   subscription within 30s", the failure #1497 reported.
@@ -320,16 +320,32 @@ const SPAWN_ATTEMPTS: usize = 5;
 
 /// Spawn pcfd and return once its SBI listener is bound.
 async fn spawn_pcfd(name: &str, nrf: &Nrf, audit_secs: Option<u64>) -> (Killed, Scratch) {
-    spawn_pcfd_on(
-        name,
-        nrf,
-        audit_secs,
-        nextgcore_sbi::test_support::free_port(),
-    )
-    .await
+    spawn_pcfd_with(name, nrf, audit_secs, Spawn::default()).await
 }
 
-/// [`spawn_pcfd`], trying `sbi_port` first.
+/// How [`spawn_pcfd_with`] starts pcfd; the defaults are what every test but the
+/// harness's own wants.
+struct Spawn {
+    /// The SBI port tried first (then fresh ones after a lost bind).
+    first_port: u16,
+    /// `pcf.sbi.server[0].address`.
+    address: &'static str,
+    /// A pause between seeing whether pcfd exited and reading its log, to widen
+    /// the window #1520's review found (the harness's own tests only).
+    pause_after_exit_check: Duration,
+}
+
+impl Default for Spawn {
+    fn default() -> Self {
+        Spawn {
+            first_port: nextgcore_sbi::test_support::free_port(),
+            address: "127.0.0.1",
+            pause_after_exit_check: Duration::ZERO,
+        }
+    }
+}
+
+/// [`spawn_pcfd`], started as `how` says.
 ///
 /// #1497: `free_port()` probes a port and releases it, and only this process's own
 /// `free_port()` and `bound_listener()` calls are kept off it. Anything else can take
@@ -338,23 +354,30 @@ async fn spawn_pcfd(name: &str, nrf: &Nrf, audit_secs: Option<u64>) -> (Killed, 
 /// exits, and the test waited 30 s for a subscription from a process that was gone.
 /// So wait for the listener: on a lost bind, spawn again on another port; on any
 /// other exit, fail now with pcfd's stderr.
-async fn spawn_pcfd_on(
+///
+/// #1520 review: whether pcfd exited is asked BEFORE its log is read, and an exit
+/// is classified from that later read. Read first, a pcfd that printed the bind
+/// error and exited in between was classified from a log without the error line,
+/// so a lost bind failed the test instead of being retried. Once the process has
+/// exited, its stderr is complete.
+async fn spawn_pcfd_with(
     name: &str,
     nrf: &Nrf,
     audit_secs: Option<u64>,
-    mut sbi_port: u16,
+    how: Spawn,
 ) -> (Killed, Scratch) {
     let dir =
         Scratch(std::env::temp_dir().join(format!("pcfd-1458-{name}-{}", std::process::id())));
     std::fs::create_dir_all(&dir.0).unwrap();
     let config = dir.0.join("pcf.yaml");
+    let mut sbi_port = how.first_port;
     for _ in 0..SPAWN_ATTEMPTS {
         std::fs::write(
             &config,
             format!(
-                "pcf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n        port: {sbi_port}\n    \
+                "pcf:\n  sbi:\n    server:\n      - address: {}\n        port: {sbi_port}\n    \
                  client:\n      nrf:\n        - uri: http://127.0.0.1:{}\n",
-                nrf.port
+                how.address, nrf.port
             ),
         )
         .unwrap();
@@ -377,17 +400,20 @@ async fn spawn_pcfd_on(
         let mut child = Killed(cmd.spawn().expect("spawn pcfd"));
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let log = std::fs::read_to_string(dir.log()).unwrap_or_default();
-            if log.contains(SBI_LISTENING) {
-                return (child, dir);
+            let exited = child.0.try_wait().unwrap();
+            if !how.pause_after_exit_check.is_zero() {
+                tokio::time::sleep(how.pause_after_exit_check).await;
             }
-            if let Some(status) = child.0.try_wait().unwrap() {
-                if log.contains("Failed to start SBI server") && log.contains("in use") {
+            let log = std::fs::read_to_string(dir.log()).unwrap_or_default();
+            match exited {
+                None if log.contains(SBI_LISTENING) => return (child, dir),
+                None => {}
+                Some(_) if log.contains("Failed to start SBI server") && log.contains("in use") => {
                     // Lost the port: drop the dead child and try another.
                     sbi_port = nextgcore_sbi::test_support::free_port();
                     break;
                 }
-                panic!("pcfd exited at startup ({status})");
+                Some(status) => panic!("pcfd exited at startup ({status})"),
             }
             assert!(Instant::now() < deadline, "pcfd listens within 30 s");
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -698,17 +724,27 @@ async fn a_sigterm_during_discovery_creates_no_subscription() {
     udr.server.stop().await.ok();
 }
 
-/// #1497, the flake's mechanism made deterministic. The first SBI port is held by
-/// another socket, as a sibling pcfd's outbound connection held it on a loaded
-/// runner: pcfd fails to bind it and exits at startup. The spawn sees that exit,
-/// moves to another port, and the subscription is made.
+/// #1497: the bind loss made deterministic. The first SBI port is held by another
+/// socket, here a listener; in the flake it was a sibling pcfd's outbound
+/// connection. Either gives EADDRINUSE, so pcfd exits at startup. This proves the
+/// harness's answer, not the cause: the spawn sees that exit, moves to another
+/// port, and the subscription is made.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pcfd_that_loses_its_sbi_port_is_spawned_on_another() {
     let nrf = Nrf::start().await;
     let udr = Udr::start(None).await;
     nrf.register_only(udr.port);
     let taken = nextgcore_sbi::test_support::bound_listener();
-    let (_pcfd, dir) = spawn_pcfd_on("taken", &nrf, None, taken.port()).await;
+    let (_pcfd, dir) = spawn_pcfd_with(
+        "taken",
+        &nrf,
+        None,
+        Spawn {
+            first_port: taken.port(),
+            ..Spawn::default()
+        },
+    )
+    .await;
     let log = std::fs::read_to_string(dir.log()).unwrap();
     let listening = log
         .lines()
@@ -726,4 +762,51 @@ async fn a_pcfd_that_loses_its_sbi_port_is_spawned_on_another() {
     .await;
     drop(taken);
     udr.server.stop().await.ok();
+}
+
+/// #1520 review: a lost bind is still retried when pcfd prints the bind error and
+/// exits after the harness last looked at its log. Here the harness pauses 300 ms
+/// between asking whether pcfd exited and reading the log, so that exit always
+/// falls in the window.
+///
+/// REVERT-VERIFIED: with the log read before `try_wait` again, this fails with
+/// "pcfd exited at startup (exit status: 1)" while the dumped stderr shows the bind
+/// error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_bind_seen_late_is_still_retried() {
+    let nrf = Nrf::start().await;
+    let taken = nextgcore_sbi::test_support::bound_listener();
+    let (_pcfd, dir) = spawn_pcfd_with(
+        "taken-late",
+        &nrf,
+        None,
+        Spawn {
+            first_port: taken.port(),
+            pause_after_exit_check: Duration::from_millis(300),
+            ..Spawn::default()
+        },
+    )
+    .await;
+    let log = std::fs::read_to_string(dir.log()).unwrap();
+    assert!(log.contains(SBI_LISTENING), "the respawn listens: {log}");
+    drop(taken);
+}
+
+/// #1520 review: a startup failure that is not a lost bind fails at once, as the
+/// failure it is, rather than being respawned until "lost its SBI port 5 times".
+/// The SBI address does not parse, so pcfd exits before it binds anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[should_panic(expected = "pcfd exited at startup")]
+async fn a_startup_failure_that_is_not_a_lost_bind_fails_at_once() {
+    let nrf = Nrf::start().await;
+    let _ = spawn_pcfd_with(
+        "badaddr",
+        &nrf,
+        None,
+        Spawn {
+            address: "not-an-address",
+            ..Spawn::default()
+        },
+    )
+    .await;
 }
