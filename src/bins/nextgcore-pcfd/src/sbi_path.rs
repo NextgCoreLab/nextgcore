@@ -914,6 +914,38 @@ pub fn pcf_sbi_send_smpolicycontrol_update_notify(sess_id: u64) -> bool {
     spawn_notification(uri, "/update", body, "SM policy update")
 }
 
+/// The `SmPolicyNotification` for a P-CSCF restoration (#1398, TS 29.512
+/// §4.2.3.18): `smPolicyDecision.pcscfRestIndication` set to true and nothing else.
+/// A notify's decision is a delta over the one the SMF holds (§4.2.6.1), and the
+/// restoration changes no policy, so no rule is re-sent with it.
+pub(crate) fn build_pcscf_restoration_notification(
+    sess: &crate::context::PcfSess,
+) -> serde_json::Value {
+    serde_json::json!({
+        "resourceUri": pcf_resource_uri(&format!("/npcf-smpolicycontrol/v1/sm-policies/{}", sess.sm_policy_id)),
+        "smPolicyDecision": { "pcscfRestIndication": true },
+    })
+}
+
+/// Ask the SMF to restore the P-CSCF for a session: POST `{notificationUri}/update`
+/// with [`build_pcscf_restoration_notification`] (#1398, TS 29.512 §4.2.3.18).
+pub fn pcf_sbi_send_pcscf_restoration_notify(sess_id: u64) -> bool {
+    let sess = crate::context::pcf_self()
+        .read()
+        .ok()
+        .and_then(|ctx| ctx.sess_find_by_id(sess_id));
+    let Some(sess) = sess else {
+        log::warn!("[sess_id={sess_id}] P-CSCF restoration notify: session not found");
+        return false;
+    };
+    let Some(uri) = sess.notification_uri.clone() else {
+        log::warn!("[sess_id={sess_id}] P-CSCF restoration notify: no notification URI stored");
+        return false;
+    };
+    let body = build_pcscf_restoration_notification(&sess);
+    spawn_notification(uri, "/update", body, "P-CSCF restoration")
+}
+
 /// Send an SM policy control update notify to the SMF carrying the AF-derived
 /// PCC rules stored on the session (TS 29.514 PolicyAuthorization → TS 29.512
 /// §4.2.3.2). Unlike `pcf_sbi_send_smpolicycontrol_update_notify` (which

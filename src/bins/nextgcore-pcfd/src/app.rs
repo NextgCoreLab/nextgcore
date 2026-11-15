@@ -1055,7 +1055,12 @@ pub async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 const PCF_AM_POLICY_SUPPORTED_FEATURES: u64 = 0x0;
 /// SM (TS 29.512 §5.8): conservative optional-feature set the decision builder
 /// actually exercises. Intersected with the SMF-requested value.
-const PCF_SM_POLICY_SUPPORTED_FEATURES: u64 = 0x3;
+/// #1398: plus PCSCF-Restoration-Enhancement (feature 9), which
+/// [`handle_pcscf_restoration`] signals with `pcscfRestIndication`.
+const PCF_SM_POLICY_SUPPORTED_FEATURES: u64 = 0x3 | SM_FEATURE_PCSCF_RESTORATION_ENHANCEMENT;
+/// TS 29.512 Table 5.8-1 feature 9, PCSCF-Restoration-Enhancement: bit 8, since
+/// feature 1 is the least significant bit (TS 29.571 §5.2.2 SupportedFeatures).
+pub(crate) const SM_FEATURE_PCSCF_RESTORATION_ENHANCEMENT: u64 = 1 << 8;
 /// PolicyAuthorization (TS 29.514): no optional features negotiated → "0".
 const PCF_PA_SUPPORTED_FEATURES: u64 = 0x0;
 /// UEPolicyControl (TS 29.525 §5.8): no optional features negotiated -> "0".
@@ -1067,12 +1072,18 @@ const PCF_UE_POLICY_SUPPORTED_FEATURES: u64 = 0x0;
 /// negotiates to "0" (no optional features) — never an error, so a consumer
 /// that omits `suppFeat` still gets a conformant, working feature set.
 fn negotiate_features(consumer_hex: Option<&str>, supported: u64) -> String {
+    format!("{:x}", negotiated_feature_bits(consumer_hex, supported))
+}
+
+/// [`negotiate_features`] as the bitmask, for a session that keeps what it
+/// negotiated (#1398).
+fn negotiated_feature_bits(consumer_hex: Option<&str>, supported: u64) -> u64 {
     let consumer = consumer_hex
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .and_then(|s| u64::from_str_radix(s, 16).ok())
         .unwrap_or(0);
-    format!("{:x}", consumer & supported)
+    consumer & supported
 }
 
 // AM Policy Control handlers
@@ -2916,6 +2927,14 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
             // with no callers (deleted by #655), so on the live path it was
             // neither written nor read.
             sess.subscribed_sess_ambr = subs_sess_ambr.clone();
+            // #1398: what this association negotiated, so a later PCF-initiated
+            // notify uses only the features the SMF said it supports (TS 29.512
+            // §4.2.3.18 needs PCSCF-Restoration-Enhancement on both ends). The same
+            // value the 201 answers in `suppFeat`.
+            sess.smpolicycontrol_features = negotiated_feature_bits(
+                policy_data.get("suppFeat").and_then(|v| v.as_str()),
+                PCF_SM_POLICY_SUPPORTED_FEATURES,
+            );
             if let Ok(context) = ctx.read() {
                 context.sess_update(&sess);
             }
@@ -4620,10 +4639,10 @@ pub async fn handle_events_subscription_delete(app_session_id: &str) -> SbiRespo
 ///
 /// `PcscfRestorationRequestData` is a `oneOf` over `ueIpv4` / `ueIpv6`, so the
 /// UE whose IMS session must be restored is identified the same way an app
-/// session is. The PCF resolves that session and pushes an SM policy update to
-/// its SMF, which is the mechanism it has for telling the SMF the policy for
-/// that session has changed (TS 23.380 §5.4: the network re-establishes the IMS
-/// PDU session). It answers `204`, as the spec defines no response body.
+/// session is. The PCF resolves that session and asks its SMF to restore it:
+/// an UpdateNotify carrying `pcscfRestIndication: true` when the association
+/// negotiated PCSCF-Restoration-Enhancement (TS 29.512 §4.2.3.18, #1398). It
+/// answers `204`, as the spec defines no response body.
 ///
 /// A UE address that resolves nothing is a `404`: the caller asked the PCF to
 /// restore a session it does not know about, and a `204` would report a
@@ -4668,11 +4687,29 @@ pub async fn handle_pcscf_restoration(request: &SbiRequest) -> SbiResponse {
             Some("SESSION_NOT_FOUND"),
         );
     };
-    log::info!(
-        "P-CSCF restoration: notifying SMF for sess_id={} ({address:?})",
-        sess.id
-    );
-    pcf_sbi_send_smpolicycontrol_update_notify(sess.id);
+    // #1398, TS 29.512 §4.2.3.18: with PCSCF-Restoration-Enhancement negotiated on
+    // the association, the notify carries `pcscfRestIndication: true`, which is what
+    // asks the SMF to restore (TS 23.380). Before #1398 it was the generic re-derived
+    // decision, which the SMF applies as an ordinary policy change, so nothing was
+    // restored.
+    if sess.smpolicycontrol_features & SM_FEATURE_PCSCF_RESTORATION_ENHANCEMENT != 0 {
+        log::info!(
+            "P-CSCF restoration: pcscfRestIndication to the SMF for sess_id={} ({address:?})",
+            sess.id
+        );
+        sbi_path::pcf_sbi_send_pcscf_restoration_notify(sess.id);
+    } else {
+        // §4.2.3.18 applies only when both ends support the feature; this SMF did
+        // not negotiate it, so it has no way to be asked. The session's policy is
+        // re-sent as before, and the gap is logged rather than hidden.
+        log::warn!(
+            "P-CSCF restoration for sess_id={} ({address:?}): the SMF did not negotiate \
+             PCSCF-Restoration-Enhancement (TS 29.512 §5.8 feature 9), so no \
+             pcscfRestIndication can be sent; re-sending the session's policy only",
+            sess.id
+        );
+        pcf_sbi_send_smpolicycontrol_update_notify(sess.id);
+    }
     SbiResponse::with_status(204)
 }
 
@@ -10373,6 +10410,72 @@ mod tests {
             Vec::<String>::new(),
             "no session-data read may be made for an empty SUPI"
         );
+    }
+
+    /// #1398, TS 29.512 §4.2.3.18: an association that negotiated
+    /// PCSCF-Restoration-Enhancement (feature 9, "100") gets a restoration notify
+    /// whose decision is `pcscfRestIndication: true`, and only that.
+    ///
+    /// REVERT-VERIFIED: with `handle_pcscf_restoration` sending the generic notify
+    /// again, the decision is the re-derived sessRules/pccRules/... with no
+    /// `pcscfRestIndication`; with the negotiated features not stored on the session,
+    /// the same; with feature 9 not in `PCF_SM_POLICY_SUPPORTED_FEATURES`, the create
+    /// answers `suppFeat` "0".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn pcscf_restoration_sends_pcscf_rest_indication_when_negotiated_1398() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
+        let (supi, psi, ipv4) = ("imsi-001010000001398", 11, "10.45.13.98");
+        let mut create = full_create_body(supi, psi);
+        let obj = create.as_object_mut().unwrap();
+        obj.insert("ipv4Address".to_string(), serde_json::json!(ipv4));
+        obj.insert("suppFeat".to_string(), serde_json::json!("100"));
+        obj.insert(
+            "notificationUri".to_string(),
+            serde_json::json!(format!(
+                "http://127.0.0.1:{}/nsmf-callback/v1/sm-policy-notify/{psi}",
+                peers.smf_port
+            )),
+        );
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(create),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let created: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(created["suppFeat"], "100", "feature 9 is negotiated");
+        let pol = sm_policy_id_of(ipv4);
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
+            Some(serde_json::json!({ "ueIpv4": ipv4 })),
+        ))
+        .await;
+        assert_eq!(resp.status, 204);
+        let got = await_notifications(&peers, 1).await;
+        assert_eq!(got.len(), 1, "one notify to the SMF: {got:?}");
+        assert_eq!(
+            got[0].0,
+            format!("/nsmf-callback/v1/sm-policy-notify/{psi}/update")
+        );
+        assert_eq!(
+            got[0].1,
+            serde_json::json!({
+                "resourceUri": format!("/npcf-smpolicycontrol/v1/sm-policies/{pol}"),
+                "smPolicyDecision": { "pcscfRestIndication": true },
+            }),
+            "the restoration request, and no re-sent policy"
+        );
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
     }
 
     /// #1383 path 2 of 3, policy-data re-authorisation (TS 29.519 policy-data change ->
