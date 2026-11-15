@@ -378,6 +378,12 @@ pub(crate) fn clear_for_test() {
     *HELD.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
+/// Test only: the subscription held at the SMF.
+#[cfg(test)]
+pub(crate) fn held_for_test() -> Option<(String, String)> {
+    HELD.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// Test only: the latest report.
 #[cfg(test)]
 pub(crate) fn latest_for_test() -> Option<Sample> {
@@ -773,8 +779,16 @@ pub fn select(
             d.src.as_str()
         )));
     }
+    // An AC profile the base matcher already listed (e.g. EAS_NOT_AVAILABLE)
+    // keeps that, more specific, reason and is not listed twice (#1523 review r2).
+    let already: Vec<String> = reg
+        .unfulfilled()
+        .into_iter()
+        .filter_map(|u| u.ac_id.clone())
+        .collect();
     let unfulfilled: Vec<String> = profs
         .iter()
+        .filter(|p| !already.contains(&p.ac_id))
         .filter(|p| {
             p.eass.as_ref().is_some_and(|e| {
                 !e.is_empty() && !e.iter().any(|x| selected.contains(&x.eas_id.as_str()))
@@ -786,7 +800,8 @@ pub fn select(
         nextgcore_demo::demo_log!(
             info,
             DEMO_KEY,
-            "EES-SEL AC profile(s) [{}] have no EAS within the deadline: unfulfilled              (REQ_UNFULFILLED)",
+            "EES-SEL AC profile(s) [{}] have no EAS within the deadline: unfulfilled \
+             (REQ_UNFULFILLED)",
             unfulfilled.join(",")
         );
     }
@@ -897,6 +912,12 @@ pub async fn run_subscriber(
                         SUBSCRIBED.store(true, std::sync::atomic::Ordering::SeqCst);
                         *HELD.lock().unwrap_or_else(|e| e.into_inner()) =
                             Some((smf_uri.clone(), loc.clone()));
+                        // #1523 review r2: shutdown started while the POST was in
+                        // flight, so `release_subscription` found nothing to delete.
+                        if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+                            delete_held(Duration::from_secs(2)).await;
+                            return;
+                        }
                         location = Some(loc);
                         backoff = Duration::from_secs(1);
                     }
@@ -970,6 +991,11 @@ pub async fn run_subscriber(
 /// until smfd restarts. Returns the DELETE's status, if one was sent.
 pub async fn release_subscription(timeout: Duration) -> Option<u16> {
     SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+    delete_held(timeout).await
+}
+
+/// DELETE the held subscription, if any (whoever takes `HELD` first sends it).
+async fn delete_held(timeout: Duration) -> Option<u16> {
     let (smf_uri, loc) = HELD.lock().unwrap_or_else(|e| e.into_inner()).take()?;
     SUBSCRIBED.store(false, std::sync::atomic::Ordering::SeqCst);
     let client = client(&smf_uri)?;

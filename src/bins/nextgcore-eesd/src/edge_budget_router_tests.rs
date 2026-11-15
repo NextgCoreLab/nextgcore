@@ -398,6 +398,26 @@ fn an_ac_profile_with_no_eas_within_the_deadline_is_unfulfilled_471() {
         "{v}"
     );
     assert!(!unful.contains("ac-fast"), "{v}");
+    // An AC profile the base matcher already marked unfulfilled (its EAS is not
+    // registered: EAS_NOT_AVAILABLE) keeps that one reason: listed once, in the
+    // singular form, and not again as REQ_UNFULFILLED (#1523 review r2).
+    let (status, v) = register(serde_json::json!([
+        { "acId": "ac-fast", "eass": [{ "easId": "eas-local-471" }] },
+        { "acId": "ac-missing", "eass": [{ "easId": "eas-not-registered-471" }] },
+    ]));
+    assert_eq!(status, 201, "{v}");
+    let all =
+        serde_json::to_string(&(v.get("unfulfillAcProfs"), v.get("unfulfilledAcProfs"))).unwrap();
+    assert_eq!(all.matches("ac-missing").count(), 1, "{v}");
+    assert!(
+        all.contains("EAS_NOT_AVAILABLE") && !all.contains("REQ_UNFULFILLED"),
+        "{v}"
+    );
+    assert!(
+        v.get("unfulfillAcProfs").is_none(),
+        "one entry: the singular form ({v})"
+    );
+    assert_eq!(v["unfulfilledAcProfs"]["acId"], "ac-missing", "{v}");
     let (status, _) = register(serde_json::json!([
         { "acId": "ac-slow", "eass": [{ "easId": "eas-cloud-471" }] },
     ]));

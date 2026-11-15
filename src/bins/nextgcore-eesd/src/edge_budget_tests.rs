@@ -485,21 +485,43 @@ async fn stand_in_smf(
     u16,
     Arc<Mutex<Vec<(String, String)>>>,
 ) {
+    stand_in_smf_with(post_status, Duration::ZERO, 200).await
+}
+
+/// [`stand_in_smf`] whose first POST answers after `post_delay`, and whose GET
+/// answers `get_status`; POSTs after the first answer 503.
+async fn stand_in_smf_with(
+    post_status: u16,
+    post_delay: Duration,
+    get_status: u16,
+) -> (
+    nextgcore_sbi::server::SbiServer,
+    u16,
+    Arc<Mutex<Vec<(String, String)>>>,
+) {
     let log = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
     let sink = log.clone();
     let (server, addr) =
         nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
             let sink = sink.clone();
             async move {
-                sink.lock()
-                    .unwrap()
-                    .push((req.header.method.clone(), req.header.uri.clone()));
+                let posts = {
+                    let mut l = sink.lock().unwrap();
+                    l.push((req.header.method.clone(), req.header.uri.clone()));
+                    l.iter().filter(|(m, _)| m == "POST").count()
+                };
                 match req.header.method.as_str() {
-                    "POST" if post_status == 201 => SbiResponse::with_status(201)
-                        .with_header("Location", "/nsmf-event-exposure/v1/subscriptions/s471"),
+                    "POST" if posts > 1 && (!post_delay.is_zero() || get_status == 404) => {
+                        SbiResponse::with_status(503)
+                    }
+                    "POST" if post_status == 201 => {
+                        tokio::time::sleep(post_delay).await;
+                        SbiResponse::with_status(201)
+                            .with_header("Location", "/nsmf-event-exposure/v1/subscriptions/s471")
+                    }
                     "POST" => SbiResponse::with_status(post_status),
                     "DELETE" => SbiResponse::with_status(204),
-                    _ => SbiResponse::with_status(200),
+                    _ => SbiResponse::with_status(get_status),
                 }
             }
         })
@@ -586,5 +608,95 @@ fn a_refused_subscribe_is_counted_471() {
     assert!(SUBSCRIBE_FAILURES.get(&["refused"]) > before);
     assert!(render_metrics()
         .contains("eees_d443a_qos_mon_subscribe_failures_total{reason=\"refused\"}"));
+    clear_for_test();
+}
+
+/// #1523 review r2: shutdown while the Subscribe is in flight. `release` finds
+/// nothing held; the 201 that lands afterwards is deleted at once and the
+/// subscriber stops.
+#[test]
+fn a_subscribe_answered_after_shutdown_is_deleted_at_once_471() {
+    let _l = lock_for_test();
+    clear_for_test();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (server, port, log) = stand_in_smf_with(201, Duration::from_millis(400), 200).await;
+        let task = tokio::spawn(run_subscriber(
+            format!("http://127.0.0.1:{port}"),
+            "http://127.0.0.1:1/d443a-edge-budget/qos-mon/t".into(),
+            2,
+            Duration::from_millis(50),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !log.lock().unwrap().iter().any(|(m, _)| m == "POST") && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            release_subscription(Duration::from_secs(1)).await,
+            None,
+            "nothing held yet"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !task.is_finished() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(task.is_finished(), "the subscriber stops");
+        server.stop().await.ok();
+        let l = log.lock().unwrap().clone();
+        assert!(
+            l.contains(&(
+                "DELETE".to_string(),
+                "/nsmf-event-exposure/v1/subscriptions/s471".to_string()
+            )),
+            "{l:?}"
+        );
+        assert!(held_for_test().is_none());
+    });
+    clear_for_test();
+}
+
+/// #1523 review r2: a subscription the SMF reports gone is no longer held, so
+/// shutdown does not DELETE it.
+#[test]
+fn a_subscription_gone_at_the_smf_is_no_longer_held_471() {
+    let _l = lock_for_test();
+    clear_for_test();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (server, port, log) = stand_in_smf_with(201, Duration::ZERO, 404).await;
+        let task = tokio::spawn(run_subscriber(
+            format!("http://127.0.0.1:{port}"),
+            "http://127.0.0.1:1/d443a-edge-budget/qos-mon/t".into(),
+            2,
+            Duration::from_millis(50),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, _)| m == "POST")
+            .count()
+            < 2
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // GET 404 seen, the re-create refused (503): nothing is held.
+        assert!(log.lock().unwrap().iter().any(|(m, _)| m == "GET"));
+        assert!(held_for_test().is_none(), "a gone subscription is not held");
+        assert_eq!(release_subscription(Duration::from_secs(1)).await, None);
+        task.abort();
+        server.stop().await.ok();
+        assert!(!log.lock().unwrap().iter().any(|(m, _)| m == "DELETE"));
+    });
     clear_for_test();
 }
