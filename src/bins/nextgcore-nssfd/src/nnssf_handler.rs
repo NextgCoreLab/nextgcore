@@ -106,17 +106,11 @@ pub fn nssf_nnssf_nsselection_handle_get_from_amf_or_vnssf(
         }
     };
 
-    // Update NSI with roaming indication and TAI
+    // #1500: a Get is a read (TS 29.501 §4.2.2 c): GET is not used for non-safe
+    // operations). The NSI entry is shared by every UE selecting this S-NSSAI,
+    // so the request's TAI and roaming indication are per-request inputs, read
+    // from `param` where needed, and never written into it.
     drop(context);
-    let ctx = nssf_self();
-    if let Ok(context) = ctx.read() {
-        let mut updated_nsi = nsi.clone();
-        updated_nsi.roaming_indication = param.slice_info_for_pdu_session.roaming_indication;
-        if let Some(ref tai) = param.tai {
-            updated_nsi.set_tai(tai.clone());
-        }
-        context.nsi_update(&updated_nsi);
-    }
 
     // Check if this is a roaming scenario requiring H-NSSF query
     if let (Some(ref home_plmn_id), Some(ref home_snssai)) =
@@ -718,6 +712,61 @@ mod tests {
                 assert!(!nsi_info.nrf_id.is_empty());
             }
             _ => panic!("Expected success"),
+        }
+    }
+
+    /// #1500: a Get is a read (TS 29.501 §4.2.2 c)). Two UEs in different
+    /// TAs, one roaming, select the same S-NSSAI; the shared NSI entry is
+    /// byte-for-byte what it was before either request, and both are answered
+    /// from it.
+    #[test]
+    fn ns_selection_gets_from_different_tais_leave_the_shared_nsi_unchanged() {
+        let _guard = setup_context();
+        let snssai = SNssai::new(1, Some(0x001500));
+        let nsi_id = nssf_self()
+            .read()
+            .unwrap()
+            .nsi_add("http://nrf-1500.example.com", snssai.sst, snssai.sd)
+            .expect("NSI installed")
+            .id;
+        let snapshot = || {
+            let nsi = nssf_self().read().unwrap().nsi_find_by_id(nsi_id);
+            format!("{nsi:?}")
+        };
+        let before = snapshot();
+
+        let request = |mcc: &str, tac: u32, roaming: RoamingIndication| NsSelectionParam {
+            nf_id: Some("amf-1500".to_string()),
+            nf_type: Some("AMF".to_string()),
+            slice_info_for_pdu_session: SliceInfoForPduSession {
+                presence: true,
+                snssai: Some(snssai.clone()),
+                roaming_indication: roaming,
+            },
+            tai: Some(Tai {
+                plmn_id: PlmnId::new(mcc, "01"),
+                tac,
+            }),
+            ..Default::default()
+        };
+        let expected_nsi = nssf_self()
+            .read()
+            .unwrap()
+            .nsi_find_by_id(nsi_id)
+            .expect("NSI present");
+        for param in [
+            request("001", 0x000001, RoamingIndication::NonRoaming),
+            request("999", 0x00abcd, RoamingIndication::LocalBreakout),
+        ] {
+            match nssf_nnssf_nsselection_handle_get_from_amf_or_vnssf(1, &param) {
+                NsSelectionResult::Success(info) => {
+                    let got = info.nsi_information.expect("nsiInformation");
+                    assert_eq!(got.nrf_id, expected_nsi.nrf_id);
+                    assert_eq!(got.nsi_id, expected_nsi.nsi_id);
+                }
+                _ => panic!("expected a 200 from the configured NSI"),
+            }
+            assert_eq!(snapshot(), before, "the Get wrote into the shared NSI");
         }
     }
 

@@ -966,6 +966,54 @@ mod tests {
             .with_body(body.to_string(), "application/json")
     }
 
+    /// #1421: behind an OAuth2-required listener, the NRF's token-less
+    /// NFStatusNotify on a token this AMF holds reaches the handler and acts; on
+    /// a token it does not hold it is refused 401 and acts on nothing, as is a
+    /// service request without a bearer.
+    #[tokio::test]
+    async fn an_oauth2_listener_admits_the_nrf_status_notify_on_a_held_token_only() {
+        let _cache = crate::sbi_path::nf_cache_test_lock().lock().await;
+        let token = register_token("SMF");
+        let ctx = global_context();
+        ctx.add_nf_instance(cached("smf-1421-gone", 41421)).await;
+        ctx.add_nf_instance(cached("smf-1421-third", 41422)).await;
+        let (server, port) = crate::namf_server::oauth2_callback_listener_for_tests().await;
+        let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", port);
+        let body = json!({ "event": "NF_DEREGISTERED", "nfInstanceUri": uri("smf-1421-gone") });
+        let send = |req: SbiRequest| {
+            let client = &client;
+            async move {
+                tokio::time::timeout(std::time::Duration::from_secs(5), client.send_request(req))
+                    .await
+                    .expect("bounded")
+                    .expect("response")
+                    .status
+            }
+        };
+
+        let forged = uuid::Uuid::new_v4().simple().to_string();
+        assert_eq!(send(notify_on(&forged, body.clone())).await, 401);
+        assert_eq!(
+            send(SbiRequest::post(NOTIFY_PATH).with_body(body.to_string(), "application/json"))
+                .await,
+            401
+        );
+        assert_eq!(
+            send(SbiRequest::get("/namf-comm/v1/subscriptions")).await,
+            401
+        );
+        assert!(
+            ctx.get_nf_instance("smf-1421-gone").await.is_some(),
+            "a refused notification acted"
+        );
+
+        assert_eq!(send(notify_on(&token, body)).await, 204);
+        assert!(ctx.get_nf_instance("smf-1421-gone").await.is_none());
+        unregister_token(&token);
+        ctx.remove_nf_instance("smf-1421-third").await;
+        server.stop().await.expect("stop");
+    }
+
     /// Through the router: a deregistration drops exactly the named
     /// instance, and the endpoint in the body's `nfProfile` is not taken.
     #[tokio::test]

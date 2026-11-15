@@ -280,6 +280,15 @@ itself be restarting).
   same sessions and is not notified here; that is `Npcf_SMPolicyControl_Delete`
   on the release path, which this does not drive.
 
+## P-CSCF restoration (#1398)
+
+The SMF offers `suppFeat` `"100"` on the SM policy create: PCSCF-Restoration-Enhancement, TS 29.512 Table 5.8-1 feature 9, and no other optional feature. When the PCF's UpdateNotify carries `smPolicyDecision.pcscfRestIndication: true` (TS 29.512 §4.2.3.18), the SMF answers 204 and then releases the PDU session for reactivation. The release is the same one a UPF restart triggers:
+- the SM policy association is terminated;
+- the N4 session is deleted;
+- the PDU SESSION RELEASE COMMAND with 5GSM cause #39 "reactivation requested" goes out with the N2 Release Command, under T3592.
+
+The UE then re-establishes the session and selects a P-CSCF again. TS 23.380 also allows a PDU Session Modification that hands the UE a new P-CSCF list. TS 24.501 §6.3.2.2 limits that to a UE the SMF gave P-CSCF addresses at establishment, and this SMF puts none in the ePCO, so the release is the only option open to it. A retried copy of the notify starts no second release.
+
 ## Parsed-but-inert YAML sections
 
 The example file follows an Open5GS-style layout, but the typed deserializer reads only `smf.sbi`, `smf.gtpc`, `smf.dns` and `smf.mtu` (unknown keys are silently dropped). The following sections in the shipped example currently have **no effect** on `nextgcore-smfd`:

@@ -1082,6 +1082,10 @@ fn pdu_session_type_name(t: u8) -> &'static str {
     }
 }
 
+/// The Npcf_SMPolicyControl features this SMF supports (TS 29.512 §5.8, TS 29.571
+/// §5.2.2 SupportedFeatures): feature 9, PCSCF-Restoration-Enhancement (#1398).
+pub const SMF_SM_POLICY_SUPPORTED_FEATURES: &str = "100";
+
 /// Npcf_SMPolicyControl_Create (POST /npcf-smpolicycontrol/v1/sm-policies)
 pub async fn sm_policy_create(
     pcf: &PcfEndpoint,
@@ -1101,7 +1105,9 @@ pub async fn sm_policy_create(
         "ipv4Address": format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]),
         "sliceInfo": slice_info,
         "servingNetwork": { "mcc": "001", "mnc": "01" },
-        "suppFeat": "0",
+        // #1398: PCSCF-Restoration-Enhancement (TS 29.512 Table 5.8-1 feature 9,
+        // bit 8), acted on in `handle_sm_policy_notify`. Nothing else.
+        "suppFeat": SMF_SM_POLICY_SUPPORTED_FEATURES,
     });
     // #310: the subscribed session-AMBR, so the PCF can bound its authorisation by
     // the subscription (TS 23.503 §6.1.3.2). Absent when the UDM leg is off or the
@@ -3008,6 +3014,9 @@ mod tests {
                  session-AMBR), and body was {body}"
             );
             assert_eq!(body["subsSessAmbr"]["downlink"], "80 Mbps");
+            // #1398: the SMF offers PCSCF-Restoration-Enhancement (feature 9), so a
+            // PCF can ask it to restore a P-CSCF (TS 29.512 §4.2.3.18).
+            assert_eq!(body["suppFeat"], "100", "body was {body}");
 
             // Only one direction stated: nothing is reported, because `Ambr` cannot
             // express half a pair and a defaulted zero would bound the subscriber to

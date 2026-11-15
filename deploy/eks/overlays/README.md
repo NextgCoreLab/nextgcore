@@ -25,7 +25,16 @@ includes `k8s/`. kustomize rejects an overlay under `k8s/` that reaches `k8s/`:
 ```bash
 k8s/demo-check.sh off off           # the demo-off control (this directory's demo/)
 k8s/demo-check.sh <key> <mode>      # deploy/eks/overlays/demo-<key>, mode <mode>
+k8s/demo-check.sh <key> off         # demo-<key>'s topology and scenario, no demo: block
+DEMO_VARIANT=<arm> k8s/demo-check.sh <key> <mode>   # a scenario arm that is not a mode
 ```
+
+`<key> off` is a demo's own demo-off arm: the post-render drops the toggles
+and refuses a `demo:` block anywhere, and demo-check makes the demo-off
+assertions (no banner, no `[demo:` line, no `nextg_demo_enabled`). No demo can
+register a mode named `off`: `nextgcore-demo` and `nextgsim-demo` refuse it. `DEMO_VARIANT` reaches `scenario.sh` (for
+example a fault it injects), is recorded in `verdict.txt`, and the artefacts
+go to `<key>/<mode>+<variant>/`.
 
 `k8s/demo-check.sh` does the whole run:
 
@@ -97,6 +106,6 @@ It then drops the toggles ConfigMap. So one overlay serves every mode.
   hostNetwork or Ingress fails it.
 - **No new runtime endpoint on a nextgcore NF.** Modes switch by config plus
   restart, which is a new `demo-check.sh` run.
-- **`scenario.sh` contract.** It gets `NAMESPACE`, `DEMO_KEY`, `DEMO_MODE` and
-  `OUT` in its environment, and `KUBECONFIG` points at the run's cluster. Exit 0
+- **`scenario.sh` contract.** It gets `NAMESPACE`, `DEMO_KEY`, `DEMO_MODE`,
+  `DEMO_VARIANT` (empty unless set) and `OUT` in its environment, and `KUBECONFIG` points at the run's cluster. Exit 0
   means the demo's assertions held. Write anything it captures under `$OUT`.
