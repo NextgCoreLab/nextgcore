@@ -475,6 +475,14 @@ pub fn nextgcore_dbi_subscription_data(supi: &str) -> DbiResult<NextgcoreSubscri
     // #87: the identity mirror answers only when a test has provisioned one, so
     // enabling the store for the authentication tests leaves every other
     // handler's view of the subscriber DB unchanged.
+    // #1526 review: a subscriber DOCUMENT a test provisioned answers too, parsed by
+    // the same code as a Mongo document, so a test can seed the real `ambr` shape.
+    #[cfg(any(test, feature = "test-helpers"))]
+    if crate::test_store::documents_active() {
+        if let Ok(document) = crate::test_store::subscriber_document(supi) {
+            return Ok(parse_subscription_document(&document));
+        }
+    }
     #[cfg(any(test, feature = "test-helpers"))]
     if crate::test_store::identities_active() {
         return crate::test_store::subscription_data(supi);
@@ -487,6 +495,12 @@ pub fn nextgcore_dbi_subscription_data(supi: &str) -> DbiResult<NextgcoreSubscri
         .find_one(query, None)?
         .ok_or_else(|| DbiError::SubscriberNotFound(supi.to_string()))?;
 
+    Ok(parse_subscription_document(&document))
+}
+
+/// The [`NextgcoreSubscriptionData`] of one `subscribers` document, shared by the
+/// Mongo read and the test mirror's document store.
+fn parse_subscription_document(document: &Document) -> NextgcoreSubscriptionData {
     let mut subscription_data = NextgcoreSubscriptionData::new();
 
     // Parse IMSI
@@ -512,7 +526,7 @@ pub fn nextgcore_dbi_subscription_data(supi: &str) -> DbiResult<NextgcoreSubscri
     }
 
     // Parse the External Identifier(s) (nextgsim#480): a string or an array.
-    subscription_data.external_ids = parse_external_ids(&document);
+    subscription_data.external_ids = parse_external_ids(document);
 
     // Parse access restriction data
     if let Ok(ard) = document.get_i32(NEXTGCORE_ACCESS_RESTRICTION_DATA_STRING) {
@@ -583,7 +597,7 @@ pub fn nextgcore_dbi_subscription_data(supi: &str) -> DbiResult<NextgcoreSubscri
         subscription_data.purge_flag = purge_flag;
     }
 
-    Ok(subscription_data)
+    subscription_data
 }
 
 // ============================================================================

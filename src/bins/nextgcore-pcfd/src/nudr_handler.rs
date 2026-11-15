@@ -71,7 +71,7 @@ pub struct SubscriptionData {
 /// `Err` when there is no UE-AMBR to authorise: no store configured, an unknown or
 /// invalid SUPI, the store down, or a subscriber document with no `ambr` (dbi reads
 /// that as 0/0, and a 0 bps UE-AMBR in both directions is not a subscription, it is
-/// the absence of one). The AM policy then carries no `ueAmbr` (TS 29.507 §4.2.2.2
+/// the absence of one), or with only one direction of it. The AM policy then carries no `ueAmbr` (TS 29.507 §4.2.2.2
 /// item c: the PCF answers the UE-AMBR it authorises; there is nothing to
 /// authorise), and the AMF keeps the one it has. Before #1460 every failure here
 /// answered 1 Gbps in both directions, a UE-AMBR no subscription carried.
@@ -82,6 +82,18 @@ pub fn pcf_read_subscription_data(supi: &str) -> Result<SubscriptionData, String
         .map_err(|e| format!("reading the subscriber failed: {e}"))?;
     if sub_data.ambr.uplink == 0 && sub_data.ambr.downlink == 0 {
         return Err("the subscriber carries no ambr".to_string());
+    }
+    // #1526 review: half an ambr is no UE-AMBR either. TS 29.571 Table 5.5.4.2-1
+    // (29571-k00 l.8341-8349) makes both `uplink` and `downlink` of an Ambr
+    // mandatory, so the only way to send one is to invent "0 bps" for the missing
+    // direction, which is the #1460 defect for one direction. dbi reads an absent
+    // direction as 0.
+    if sub_data.ambr.uplink == 0 || sub_data.ambr.downlink == 0 {
+        return Err(format!(
+            "the subscriber's ambr has only one direction (uplink {} bps, downlink {} bps); \
+             an Ambr needs both (TS 29.571 Table 5.5.4.2-1)",
+            sub_data.ambr.uplink, sub_data.ambr.downlink
+        ));
     }
     log::debug!(
         "[{}] Subscription data: AMBR up={}, down={}",

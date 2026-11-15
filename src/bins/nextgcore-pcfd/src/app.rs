@@ -7552,6 +7552,73 @@ mod tests {
         }
     }
 
+    /// #1526 review: the success path. The UDR's am-data has no `subscribedUeAmbr`,
+    /// and the subscriber store provisions the subscriber's `ambr` (30/60 Mbps): that
+    /// is the UE-AMBR there is, and both the create and the GET carry it.
+    ///
+    /// REVERT-VERIFIED: with `pcf_read_subscription_data` always answering `Err`,
+    /// this fails (no `ueAmbr`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI / PCF context
+    async fn am_policy_carries_the_stores_ue_ambr_1460() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let supi = "imsi-001010000031460";
+        nextgcore_dbi::test_store::provision_subscriber_document(
+            supi,
+            nextgcore_dbi::mongodb::bson::doc! {
+                "imsi": supi.trim_start_matches("imsi-"),
+                "ambr": { "uplink": { "value": 30, "unit": 2 },
+                          "downlink": { "value": 60, "unit": 2 } },
+            },
+        );
+        let (created, got) = am_create_without_udr_ue_ambr_1460(supi).await;
+        for body in [&created, &got] {
+            assert_eq!(
+                body["ueAmbr"],
+                serde_json::json!({ "uplink": "30 Mbps", "downlink": "60 Mbps" }),
+                "the store's UE-AMBR: {body}"
+            );
+            assert_eq!(body["rfsp"], 5, "{body}");
+        }
+    }
+
+    /// #1526 review: a store `ambr` with one direction missing is not a UE-AMBR
+    /// (TS 29.571 Table 5.5.4.2-1: both members are mandatory), so the policy
+    /// carries none, rather than "0 bps" for the missing direction.
+    ///
+    /// REVERT-VERIFIED: without the one-direction check, the create answers
+    /// `ueAmbr` with downlink "0 bps".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI / PCF context
+    async fn am_policy_for_half_a_stored_ambr_carries_none_1460() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let supi = "imsi-001010000041460";
+        nextgcore_dbi::test_store::provision_subscriber_document(
+            supi,
+            nextgcore_dbi::mongodb::bson::doc! {
+                "imsi": supi.trim_start_matches("imsi-"),
+                "ambr": { "uplink": { "value": 30, "unit": 2 } },
+            },
+        );
+        let (created, got) = am_create_without_udr_ue_ambr_1460(supi).await;
+        for body in [&created, &got] {
+            assert_eq!(body["rfsp"], 5, "{body}");
+            assert!(body.get("ueAmbr").is_none(), "no half UE-AMBR: {body}");
+        }
+        assert!(
+            crate::nudr_handler::pcf_read_subscription_data(supi)
+                .unwrap_err()
+                .contains("only one direction"),
+            "it was the half ambr that decided"
+        );
+    }
+
     /// #1460: a subscriber the store knows, with no `ambr` in its document (dbi
     /// reads 0/0), has no UE-AMBR either: the policy carries none, not "0 bps".
     ///
