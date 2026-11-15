@@ -610,6 +610,94 @@ fn note_refusal(what: std::fmt::Arguments<'_>) {
 /// #1389 part 2: N6 Delay Measurement Report IEs per Node Report Request.
 pub const N6_REPORTS_PER_NODE_REPORT: usize = 16;
 
+/// What the CP function of the current association has been told about the N3/N9
+/// user-plane paths (#1513).
+///
+/// TS 29.244 §6.2.9.2: only a PFCP Node Report Response "with the cause success"
+/// means the information was delivered. A path report is sent once per transition, so
+/// one the CP function refused (cause 72 "No established PFCP Association", §8.2.1,
+/// from an SMF that has marked this UPF down) or never answered (N1) would otherwise
+/// be lost. The current path state is re-reported instead: T1 after such a refusal,
+/// and at once after every re-association that retains the sessions.
+///
+/// Bound: at most [`PFCP_N1_MAX_RETRANSMIT`] re-report rounds follow each live path
+/// report (one sent for a transition) and each retained re-association. Rounds are
+/// counted, not refusals, so a CP function that accepts one report of a round and
+/// refuses another cannot keep the rounds going (#1531 review).
+#[derive(Debug, Default)]
+struct PathReportLedger {
+    /// Peers named in a failure report to this CP function and not since named in a
+    /// recovery report it accepted: the CP function may hold them as failed.
+    told_failed: std::collections::HashSet<IpAddr>,
+    /// The sequence number of the latest path report naming each peer, so a late
+    /// acceptance of an older report does not undo a newer one.
+    latest: HashMap<IpAddr, u32>,
+    /// Path reports awaiting their response: sequence number -> (failure, peers).
+    in_flight: HashMap<u32, (bool, Vec<IpAddr>)>,
+    /// When the current path state is next re-reported.
+    resend_at: Option<std::time::Instant>,
+    /// Re-report rounds run since the last live path report or retained Setup.
+    resends: u32,
+}
+
+impl PathReportLedger {
+    /// A path report with sequence number `seq` was sent: a live one (`resend`
+    /// false) for a transition, or one of a re-report round.
+    fn sent(&mut self, seq: u32, failure: bool, peers: &[IpAddr], resend: bool) {
+        if !resend {
+            self.resends = 0;
+        }
+        for ip in peers {
+            self.latest.insert(*ip, seq);
+            if failure {
+                self.told_failed.insert(*ip);
+            }
+        }
+        self.in_flight.insert(seq, (failure, peers.to_vec()));
+    }
+
+    /// The response to `seq` arrived with `accepted` (cause success), or the request
+    /// was abandoned after N1 (`accepted` false). Whether `seq` was a path report.
+    fn answered(&mut self, seq: u32, accepted: bool) -> bool {
+        let Some((failure, peers)) = self.in_flight.remove(&seq) else {
+            return false;
+        };
+        if accepted {
+            if !failure {
+                for ip in peers {
+                    if self.latest.get(&ip) == Some(&seq) {
+                        self.latest.remove(&ip);
+                        self.told_failed.remove(&ip);
+                    }
+                }
+            }
+        } else if self.resend_at.is_some() {
+            // A re-report is already scheduled; it carries the whole state.
+        } else if self.resends < PFCP_N1_MAX_RETRANSMIT {
+            self.resend_at = Some(std::time::Instant::now() + PFCP_T1_DURATION);
+        } else {
+            log::warn!(
+                "user-plane path state still not delivered after {} re-report rounds; it \
+                 is re-reported after the next transition or retained re-association",
+                self.resends
+            );
+        }
+        true
+    }
+
+    /// Start a re-report round if one is due: whether one starts.
+    fn start_round(&mut self, now: std::time::Instant) -> bool {
+        match self.resend_at {
+            Some(at) if at <= now => {
+                self.resend_at = None;
+                self.resends += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Async PFCP server for handling SMF requests
 pub struct PfcpServer {
     socket: Arc<UdpSocket>,
@@ -662,6 +750,17 @@ pub struct PfcpServer {
     /// for T1/N1 retransmission (TS 29.244 §7.2.2.3). Currently used for
     /// Session Report Requests (Downlink Data / Error Indication Reports).
     pending_reports: tokio::sync::Mutex<HashMap<u32, PendingReport>>,
+    /// #1513: what the CP function has been told about the user-plane paths.
+    path_ledger: std::sync::Mutex<PathReportLedger>,
+    /// #1531 review M-1: held while a path report is numbered and sent, and while a
+    /// re-report round reads the path table and sends. Path reports therefore leave
+    /// in the order their state was read, so a transition the round did not see is
+    /// reported after it, never before.
+    path_send: tokio::sync::Mutex<()>,
+    /// Test hook: a re-report round signals the first and waits for the second
+    /// after it has read the path table.
+    #[cfg(test)]
+    resend_hold: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     /// Setups from unlisted addresses waiting for a re-resolution (#1112).
     admission: std::sync::Mutex<PendingAdmission>,
     /// Set while a held Setup is judged again, so it is answered, not held twice.
@@ -998,6 +1097,10 @@ impl PfcpServer {
             un6dm: AtomicBool::new(false),
             qfqm: AtomicBool::new(false),
             pending_reports: tokio::sync::Mutex::new(HashMap::new()),
+            path_ledger: std::sync::Mutex::new(PathReportLedger::default()),
+            path_send: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            resend_hold: std::sync::Mutex::new(None),
             heartbeat: tokio::sync::Mutex::new(HeartbeatState::default()),
             allowed_peers: std::sync::RwLock::new(PeerAllowlist::default()),
             admission: std::sync::Mutex::new(PendingAdmission::default()),
@@ -1146,6 +1249,8 @@ impl PfcpServer {
         }
         self.clear_path_qos_control();
         self.clear_n6_delay_control();
+        // #1513: the CP function's sessions are gone, and with them what it was told.
+        *self.path_ledger.lock().unwrap() = PathReportLedger::default();
         self.delete_association_sessions(peer, reason).await;
     }
 
@@ -1273,6 +1378,8 @@ impl PfcpServer {
             // 100ms recv timeout gives this a sub-second polling cadence,
             // well under the multi-second T1 window.
             self.retransmit_pending_reports().await;
+            // #1513: re-report the user-plane path state the CP function refused.
+            self.resend_path_state_if_due().await;
             // #1112: Setups held for a re-resolution of the allowed CP names.
             self.rejudge_held_setups().await;
         }
@@ -1401,17 +1508,42 @@ impl PfcpServer {
                     .await?;
             }
             pfcp_type::NODE_REPORT_RESPONSE => {
-                // #935: the CP function acknowledged a path Node Report; stop T1/N1.
+                // #935: the CP function answered a Node Report; stop T1/N1.
                 let removed = self
                     .pending_reports
                     .lock()
                     .await
                     .remove(&header.sequence_number)
                     .is_some();
-                log::debug!(
-                    "Node Report Response (seq={}, tracked={removed})",
-                    header.sequence_number
-                );
+                // #1513, TS 29.244 §6.2.9.2: only the cause "success" delivers the
+                // report. A refused path report is re-reported (see PathReportLedger).
+                let ies = ParsedIe::parse_all(payload);
+                let cause = ParsedIe::find_ie(&ies, pfcp_ie::CAUSE)
+                    .and_then(|ie| ie.value.first().copied())
+                    .unwrap_or(0);
+                let accepted = cause == PfcpCause::RequestAccepted as u8;
+                let path_report = removed
+                    && self
+                        .path_ledger
+                        .lock()
+                        .unwrap()
+                        .answered(header.sequence_number, accepted);
+                if accepted {
+                    log::debug!(
+                        "Node Report accepted (seq={}, tracked={removed})",
+                        header.sequence_number
+                    );
+                } else {
+                    log::warn!(
+                        "Node Report refused: cause={cause} (seq={}){}",
+                        header.sequence_number,
+                        if path_report {
+                            "; the user-plane path state is re-reported"
+                        } else {
+                            ""
+                        }
+                    );
+                }
                 return Ok(());
             }
             pfcp_type::SESSION_REPORT_RESPONSE => {
@@ -1722,6 +1854,20 @@ impl PfcpServer {
                 recovery_time_stamp: rts,
             });
             self.publish_associated(&association);
+        }
+
+        // #1513: a CP function that keeps its sessions is told the current path state
+        // once this response is out (the run loop sends it): a report it refused while
+        // it considered this UPF down, or one it never received, is not lost. Without
+        // retention its sessions are gone, and with them what it was told.
+        {
+            let mut ledger = self.path_ledger.lock().unwrap();
+            if sessions_retained {
+                ledger.resends = 0;
+                ledger.resend_at = Some(std::time::Instant::now());
+            } else {
+                *ledger = PathReportLedger::default();
+            }
         }
 
         // #1389: a new association replaces the GTP-U path QoS monitoring with
@@ -3556,8 +3702,61 @@ impl PfcpServer {
             .collect()
     }
 
-    /// Send a Session Report Request carrying a Downlink Data Report
-    /// (TS 29.244 7.5.8.2) when the first DL packet is buffered under a
+    /// #1513: when a re-report is due, tell the CP function the current user-plane
+    /// path state, from the data plane's path table: every failed path, and every
+    /// path it may hold as failed that has answered since. Nothing is sent when there
+    /// is nothing to tell.
+    async fn resend_path_state_if_due(&self) {
+        if !self
+            .path_ledger
+            .lock()
+            .unwrap()
+            .start_round(std::time::Instant::now())
+        {
+            return;
+        }
+        let Some(dp) = self.data_plane.read().unwrap().clone() else {
+            return;
+        };
+        // The table is read under `path_send` (#1531 review M-1). A transition after
+        // the read is reported live, which waits for this round's sends, so the
+        // newer state always reaches the CP function last.
+        let _sending = self.path_send.lock().await;
+        let states = dp.path_table.read().unwrap().path_states();
+        #[cfg(test)]
+        {
+            let hold = self.resend_hold.lock().unwrap().clone();
+            if let Some((reached, proceed)) = hold {
+                reached.notify_one();
+                proceed.notified().await;
+            }
+        }
+        let mut failed: Vec<IpAddr> = states
+            .iter()
+            .filter(|(_, failed)| **failed)
+            .map(|(ip, _)| *ip)
+            .collect();
+        let mut recovered: Vec<IpAddr> = {
+            let ledger = self.path_ledger.lock().unwrap();
+            ledger
+                .told_failed
+                .iter()
+                .filter(|ip| states.get(ip) == Some(&false))
+                .copied()
+                .collect()
+        };
+        failed.sort();
+        recovered.sort();
+        for (failure, peers) in [(true, failed), (false, recovered)] {
+            if peers.is_empty() {
+                continue;
+            }
+            if let Err(e) = self.send_path_report(failure, &peers, true).await {
+                log::warn!("User-plane path state for {peers:?} was NOT re-reported: {e}");
+            }
+        }
+    }
+
     /// Report N3/N9 user-plane path FAILURE or RECOVERY for `peers` to the CP
     /// function in a PFCP Node Report Request (#935, TS 29.244 §7.4.5.1), tracked for
     /// T1/N1 retransmission like a Session Report Request until its Node Report
@@ -3566,6 +3765,18 @@ impl PfcpServer {
         &self,
         failure: bool,
         peers: &[std::net::IpAddr],
+    ) -> Result<(), String> {
+        let _sending = self.path_send.lock().await;
+        self.send_path_report(failure, peers, false).await
+    }
+
+    /// [`Self::send_node_report`] with `path_send` held; `resend` for a report of a
+    /// re-report round.
+    async fn send_path_report(
+        &self,
+        failure: bool,
+        peers: &[std::net::IpAddr],
+        resend: bool,
     ) -> Result<(), String> {
         if peers.is_empty() {
             return Err("no peers to report".to_string());
@@ -3577,6 +3788,11 @@ impl PfcpServer {
             crate::n4_build::build_node_report_request(&self.local_node_id, failure, peers);
         let seq = self.alloc_seq();
         let message = self.build_response(pfcp_type::NODE_REPORT_REQUEST, 0, seq, &payload, false);
+        // #1513: recorded before it is sent, so its response always finds it.
+        self.path_ledger
+            .lock()
+            .unwrap()
+            .sent(seq, failure, peers, resend);
         self.pending_reports.lock().await.insert(
             seq,
             PendingReport {
@@ -3590,6 +3806,7 @@ impl PfcpServer {
         );
         if let Err(e) = self.socket.send_to(&message, peer).await {
             self.pending_reports.lock().await.remove(&seq);
+            self.path_ledger.lock().unwrap().answered(seq, false);
             return Err(format!("Failed to send Node Report Request: {e}"));
         }
         log::info!(
@@ -3599,6 +3816,8 @@ impl PfcpServer {
         Ok(())
     }
 
+    /// Send a Session Report Request carrying a Downlink Data Report
+    /// (TS 29.244 7.5.8.2) when the first DL packet is buffered under a
     /// BUFF+NOCP FAR.
     pub async fn send_downlink_data_report(
         &self,
@@ -4072,6 +4291,8 @@ impl PfcpServer {
             }
         }
         for (seq, upf_seid, usage) in gave_up {
+            // #1513: an abandoned path report was not delivered either.
+            self.path_ledger.lock().unwrap().answered(seq, false);
             log::error!(
                 "Session Report Request (seq={seq}, SEID=0x{upf_seid:x}) abandoned after {} retransmissions (N1) — peer unresponsive",
                 PFCP_N1_MAX_RETRANSMIT
@@ -4139,6 +4360,36 @@ impl PfcpServer {
 
 #[cfg(test)]
 impl PfcpServer {
+    /// Test hook (#1513): make a scheduled path state re-report due now (avoids
+    /// waiting the real T1). Returns whether one was scheduled.
+    fn test_path_resend_now(&self) -> bool {
+        let mut ledger = self.path_ledger.lock().unwrap();
+        let scheduled = ledger.resend_at.is_some();
+        if scheduled {
+            ledger.resend_at = Some(std::time::Instant::now());
+        }
+        scheduled
+    }
+
+    /// Test hook (#1513): path reports awaiting their response.
+    fn test_path_in_flight(&self) -> usize {
+        self.path_ledger.lock().unwrap().in_flight.len()
+    }
+
+    /// Test hook (#1513): the peers the CP function may hold as failed.
+    fn test_told_failed(&self) -> Vec<IpAddr> {
+        let mut v: Vec<IpAddr> = self
+            .path_ledger
+            .lock()
+            .unwrap()
+            .told_failed
+            .iter()
+            .copied()
+            .collect();
+        v.sort();
+        v
+    }
+
     /// Test hook: insert a session so UPF-initiated reports can resolve the
     /// CP function (SMF) address.
     async fn test_insert_session(&self, info: PfcpSessionInfo) {
@@ -8404,6 +8655,635 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first_report(&smf_b).await, (FIRST_CP_SEID, 1));
+    }
+
+    /// #1513: drive the N3 path to `gnb` in the data plane's path table to FAILED.
+    fn fail_path(dp: &crate::data_plane::DataPlane, gnb: SocketAddr) {
+        let mut pt = dp.path_table.write().unwrap();
+        pt.sync_peers(&std::collections::HashSet::from([gnb]));
+        pt.miss_threshold = 1;
+        pt.tick();
+        let (_, failed) = pt.tick();
+        assert_eq!(failed, vec![gnb]);
+    }
+
+    /// #1513: the failed path to `gnb` answers an Echo Request: it RECOVERED.
+    fn recover_path(dp: &crate::data_plane::DataPlane, gnb: SocketAddr) {
+        let mut pt = dp.path_table.write().unwrap();
+        let seq = pt.tick().0[0].1;
+        assert_eq!(
+            pt.on_echo_response(gnb, Some(seq)),
+            crate::data_plane::EchoResponse::Answered { recovered: true }
+        );
+    }
+
+    /// #1513: the next datagram `smf` receives, which must be a path Node Report:
+    /// (sequence number, failure, the Remote GTP-U Peers it names).
+    async fn next_path_report(smf: &UdpSocket) -> (u32, bool, Vec<IpAddr>) {
+        let mut buf = vec![0u8; 2048];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), smf.recv_from(&mut buf))
+                .await
+                .expect("a path Node Report arrives")
+                .expect("recv");
+        assert_eq!(buf[1], pfcp_type::NODE_REPORT_REQUEST);
+        let (hdr, body) = ParsedPfcpHeader::parse(&buf[..len]).unwrap();
+        let ies = ParsedIe::parse_all(body);
+        let nrt = ParsedIe::find_ie(&ies, crate::n4_build::pfcp_ie::NODE_REPORT_TYPE).unwrap();
+        let failure = match nrt.value[0] {
+            0x01 => true,
+            0x02 => false,
+            other => panic!("not a path report: Node Report Type {other:#x}"),
+        };
+        let ie = if failure {
+            crate::n4_build::pfcp_ie::USER_PLANE_PATH_FAILURE_REPORT
+        } else {
+            crate::n4_build::pfcp_ie::USER_PLANE_PATH_RECOVERY_REPORT
+        };
+        let report = ParsedIe::find_ie(&ies, ie).expect("the path report IE");
+        let peers = ParsedIe::parse_all(&report.value)
+            .iter()
+            .filter(|p| p.ie_type == crate::n4_build::pfcp_ie::REMOTE_GTP_U_PEER)
+            .map(|p| {
+                assert_eq!(p.value[0], 0x02, "V4");
+                IpAddr::V4(Ipv4Addr::new(
+                    p.value[1], p.value[2], p.value[3], p.value[4],
+                ))
+            })
+            .collect();
+        (hdr.sequence_number, failure, peers)
+    }
+
+    /// #1513: answer the Node Report `seq` with `cause`.
+    async fn answer_node_report(smf: &UdpSocket, upf: SocketAddr, seq: u32, cause: u8) {
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(SMF_NODE));
+        b.add_u8(pfcp_ie::CAUSE, cause);
+        smf.send_to(
+            &encode_pfcp(pfcp_type::NODE_REPORT_RESPONSE, None, seq, &b.build()),
+            upf,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// #1513: wait until the server has scheduled a path state re-report, and make it
+    /// due now.
+    async fn resend_now(server: &PfcpServer) {
+        for _ in 0..200 {
+            if server.test_path_resend_now() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("no path state re-report was scheduled");
+    }
+
+    /// #1513: wait until every path report sent has had its response processed.
+    async fn settled(server: &PfcpServer) {
+        for _ in 0..200 {
+            if server.test_path_in_flight() == 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("path reports still in flight");
+    }
+
+    /// A model of the SMF's path handling as smfd implements it (#994, #1505): a
+    /// report from a UPF it has marked down is refused with cause 72 and changes
+    /// nothing; otherwise failed peers are held and recovered ones forgotten.
+    #[derive(Default)]
+    struct SmfPaths {
+        associated: bool,
+        failed: std::collections::HashSet<IpAddr>,
+        /// Refuse this many more reports with 72 even when associated: smfd marks the
+        /// association up only after it handled the Setup Response, so the first
+        /// re-report after a re-association can race into a 72.
+        refuse: u32,
+        /// Refuse every recovery report (a third-party SMF's policy).
+        refuse_recoveries: bool,
+    }
+
+    impl SmfPaths {
+        fn on_report(&mut self, failure: bool, peers: &[IpAddr]) -> u8 {
+            if !self.associated || self.refuse > 0 {
+                self.refuse = self.refuse.saturating_sub(1);
+                return PfcpCause::NoEstablishedPfcpAssociation as u8;
+            }
+            if !failure && self.refuse_recoveries {
+                return PfcpCause::RequestRejected as u8;
+            }
+            for ip in peers {
+                if failure {
+                    self.failed.insert(*ip);
+                } else {
+                    self.failed.remove(ip);
+                }
+            }
+            PfcpCause::RequestAccepted as u8
+        }
+
+        /// The SMF's next path report and its answer.
+        async fn serve(&mut self, smf: &UdpSocket, upf: SocketAddr) -> (bool, Vec<IpAddr>, u8) {
+            let (seq, failure, peers) = next_path_report(smf).await;
+            let cause = self.on_report(failure, &peers);
+            answer_node_report(smf, upf, seq, cause).await;
+            (failure, peers, cause)
+        }
+    }
+
+    /// #1513, the issue's scenario (TS 29.244 §6.2.9.2: only a "success" response
+    /// delivers a Node Report). A path recovery refused with cause 72 by an SMF that
+    /// marked this UPF down was dropped as delivered, so the SMF still held the path
+    /// failed after re-associating and released the sessions on the healthy gNB when
+    /// its hold expired. Now the refusal is not delivery: the recovery is re-reported,
+    /// and once the SMF re-associates and keeps the sessions it learns the path is up.
+    #[tokio::test]
+    async fn a_path_recovery_refused_while_marked_down_reaches_the_smf_after_reassociation() {
+        let (server, smf, upf, _rx) = spawn_test_server().await;
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        server.set_data_plane(dp.clone());
+        let gnb: SocketAddr = "10.1.1.1:2152".parse().unwrap();
+        let mut smf_paths = SmfPaths {
+            associated: true,
+            ..Default::default()
+        };
+        associate(&smf, upf, SMF_NODE, 100, None).await;
+        let x = establish(&server, &smf, upf, FIRST_CP_SEID).await;
+
+        // 1. The gNB path fails; the SMF accepts the failure report (and holds it).
+        fail_path(&dp, gnb);
+        server.send_node_report(true, &[gnb.ip()]).await.unwrap();
+        assert_eq!(
+            smf_paths.serve(&smf, upf).await,
+            (true, vec![gnb.ip()], PfcpCause::RequestAccepted as u8)
+        );
+        settled(&server).await;
+        assert_eq!(
+            server.test_told_failed(),
+            vec![gnb.ip()],
+            "an accepted failure stands"
+        );
+
+        // 2. A one-way heartbeat loss marks the UPF down on the SMF.
+        smf_paths.associated = false;
+
+        // 3. The path recovers; the SMF refuses the recovery report with cause 72.
+        recover_path(&dp, gnb);
+        server.send_node_report(false, &[gnb.ip()]).await.unwrap();
+        assert_eq!(
+            smf_paths.serve(&smf, upf).await,
+            (
+                false,
+                vec![gnb.ip()],
+                PfcpCause::NoEstablishedPfcpAssociation as u8
+            )
+        );
+        settled(&server).await;
+        // Not delivered: re-reported after T1, refused again while still marked down.
+        resend_now(&server).await;
+        assert_eq!(
+            smf_paths.serve(&smf, upf).await,
+            (
+                false,
+                vec![gnb.ip()],
+                PfcpCause::NoEstablishedPfcpAssociation as u8
+            )
+        );
+        assert_eq!(server.test_told_failed(), vec![gnb.ip()]);
+
+        // 4. The SMF re-associates and the UPF retains the sessions; the UPF re-reports
+        //    the current path state, and the SMF accepts the recovery.
+        smf_paths.associated = true;
+        let resp = associate(&smf, upf, SMF_NODE, 100, Some(&[])).await;
+        assert!(psrei(&resp), "the sessions are retained");
+        assert_eq!(
+            smf_paths.serve(&smf, upf).await,
+            (false, vec![gnb.ip()], PfcpCause::RequestAccepted as u8)
+        );
+
+        // 5. The hold expires: the SMF holds no failed path, so it releases nothing,
+        //    and the UPF still holds the session.
+        assert!(smf_paths.failed.is_empty(), "{:?}", smf_paths.failed);
+        for _ in 0..200 {
+            if server.test_told_failed().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(server.test_told_failed().is_empty());
+        assert_eq!(
+            held(&server).await,
+            vec![(x, FIRST_CP_SEID, smf.local_addr().unwrap())]
+        );
+    }
+
+    /// #1513: "a failure report sent in the same window is lost the same way". A path
+    /// failure refused with cause 72 is re-reported once the SMF re-associates and
+    /// keeps the sessions, so its hold is armed then.
+    #[tokio::test]
+    async fn a_path_failure_refused_while_marked_down_reaches_the_smf_after_reassociation() {
+        let (server, smf, upf, _rx) = spawn_test_server().await;
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        server.set_data_plane(dp.clone());
+        let gnb: SocketAddr = "10.1.1.2:2152".parse().unwrap();
+        let mut smf_paths = SmfPaths::default();
+        associate(&smf, upf, SMF_NODE, 100, None).await;
+        establish(&server, &smf, upf, FIRST_CP_SEID).await;
+
+        fail_path(&dp, gnb);
+        server.send_node_report(true, &[gnb.ip()]).await.unwrap();
+        assert_eq!(
+            smf_paths.serve(&smf, upf).await.2,
+            PfcpCause::NoEstablishedPfcpAssociation as u8
+        );
+
+        smf_paths.associated = true;
+        assert!(psrei(&associate(&smf, upf, SMF_NODE, 100, Some(&[])).await));
+        assert_eq!(
+            smf_paths.serve(&smf, upf).await,
+            (true, vec![gnb.ip()], PfcpCause::RequestAccepted as u8)
+        );
+        assert_eq!(
+            smf_paths.failed,
+            std::collections::HashSet::from([gnb.ip()])
+        );
+    }
+
+    /// #1513: a refused re-report is retried after T1, at most N1 times in a row; then
+    /// the state waits for the next re-association. A path report abandoned after N1
+    /// unanswered transmissions is not delivered either, and is re-reported.
+    #[tokio::test]
+    async fn path_state_re_reports_are_bounded_and_follow_an_abandoned_report() {
+        let (server, smf, upf, _rx) = spawn_test_server().await;
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        server.set_data_plane(dp.clone());
+        let gnb: SocketAddr = "10.1.1.3:2152".parse().unwrap();
+        associate(&smf, upf, SMF_NODE, 100, None).await;
+
+        // Abandoned after N1: the original and N1 retransmissions go unanswered.
+        fail_path(&dp, gnb);
+        server.send_node_report(true, &[gnb.ip()]).await.unwrap();
+        for _ in 0..=PFCP_N1_MAX_RETRANSMIT {
+            let (_, failure, _) = next_path_report(&smf).await;
+            assert!(failure);
+            server.test_expire_pending_t1().await;
+            server.retransmit_pending_reports().await;
+        }
+        assert_eq!(server.pending_report_count().await, 0, "abandoned");
+
+        // Re-reported; each refusal schedules one more, N1 in all.
+        for _ in 0..PFCP_N1_MAX_RETRANSMIT {
+            resend_now(&server).await;
+            let (seq, failure, peers) = next_path_report(&smf).await;
+            assert_eq!((failure, peers), (true, vec![gnb.ip()]));
+            answer_node_report(
+                &smf,
+                upf,
+                seq,
+                PfcpCause::NoEstablishedPfcpAssociation as u8,
+            )
+            .await;
+            for _ in 0..200 {
+                if server.test_path_in_flight() == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(server.test_path_in_flight(), 0, "the refusal is processed");
+        }
+        assert!(
+            !server.test_path_resend_now(),
+            "after N1 refused re-reports, the state waits for a re-association"
+        );
+    }
+
+    /// #1513: an Association Setup that does not retain the sessions starts afresh:
+    /// what the previous CP function was told is forgotten and nothing is re-reported.
+    #[tokio::test]
+    async fn a_reassociation_without_retention_forgets_the_path_reports() {
+        let (server, smf, upf, _rx) = spawn_test_server().await;
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        server.set_data_plane(dp.clone());
+        let gnb: SocketAddr = "10.1.1.4:2152".parse().unwrap();
+        associate(&smf, upf, SMF_NODE, 100, None).await;
+        fail_path(&dp, gnb);
+        server.send_node_report(true, &[gnb.ip()]).await.unwrap();
+        let (seq, _, _) = next_path_report(&smf).await;
+        answer_node_report(
+            &smf,
+            upf,
+            seq,
+            PfcpCause::NoEstablishedPfcpAssociation as u8,
+        )
+        .await;
+        resend_now(&server).await;
+        let _ = next_path_report(&smf).await;
+        assert_eq!(server.test_told_failed(), vec![gnb.ip()]);
+
+        assert!(!psrei(&associate(&smf, upf, SMF_NODE, 200, None).await));
+        assert!(server.test_told_failed().is_empty());
+        assert!(!server.test_path_resend_now(), "nothing is re-reported");
+    }
+
+    /// A data plane attached to `server`, for the #1513 tests.
+    fn attach_dp_1513(server: &PfcpServer) -> Arc<crate::data_plane::DataPlane> {
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        server.set_data_plane(dp.clone());
+        dp
+    }
+
+    fn set_path(dp: &crate::data_plane::DataPlane, gnb: SocketAddr, failed: bool) {
+        dp.path_table
+            .write()
+            .unwrap()
+            .set_path_state_for_test(gnb, failed);
+    }
+
+    /// #1531 review M-1: a transition that happens after a re-report round read the
+    /// path table is reported AFTER the round, so the SMF ends with the newer state.
+    /// The round reads gNB A as FAILED and is held there; A then recovers and its live
+    /// recovery report is sent concurrently. Without the ordering the live recovery
+    /// went first and the stale failure after it: the SMF held A failed while it was
+    /// up, and its hold would release A's sessions with #39.
+    #[tokio::test]
+    async fn a_transition_after_a_re_report_read_the_table_is_reported_after_it() {
+        let (server, smf, upf, _rx) = spawn_test_server().await;
+        let dp = attach_dp_1513(&server);
+        let a: SocketAddr = "10.1.2.1:2152".parse().unwrap();
+        let mut smf_paths = SmfPaths::default();
+        associate(&smf, upf, SMF_NODE, 100, None).await;
+        establish(&server, &smf, upf, FIRST_CP_SEID).await;
+
+        // A fails while the SMF has the UPF marked down: refused.
+        set_path(&dp, a, true);
+        server.send_node_report(true, &[a.ip()]).await.unwrap();
+        assert_eq!(
+            smf_paths.serve(&smf, upf).await.2,
+            PfcpCause::NoEstablishedPfcpAssociation as u8
+        );
+        settled(&server).await;
+
+        // The retained re-association starts a round; hold it after its table read.
+        let (reached, proceed) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        *server.resend_hold.lock().unwrap() = Some((reached.clone(), proceed.clone()));
+        smf_paths.associated = true;
+        assert!(psrei(&associate(&smf, upf, SMF_NODE, 100, Some(&[])).await));
+        tokio::time::timeout(std::time::Duration::from_secs(2), reached.notified())
+            .await
+            .expect("the round read the path table");
+        *server.resend_hold.lock().unwrap() = None;
+
+        // A recovers now, after the read: its live recovery report is sent.
+        set_path(&dp, a, false);
+        let live = {
+            let server = server.clone();
+            tokio::spawn(async move { server.send_node_report(false, &[a.ip()]).await })
+        };
+        // Give the live report every chance to overtake (it must not).
+        let mut peek = [0u8; 16];
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            smf.peek_from(&mut peek),
+        )
+        .await;
+        proceed.notify_one();
+
+        // The SMF sees the round's (stale) failure first, then the newer recovery.
+        assert_eq!(
+            smf_paths.serve(&smf, upf).await,
+            (true, vec![a.ip()], PfcpCause::RequestAccepted as u8),
+            "the round's report goes first"
+        );
+        assert_eq!(
+            smf_paths.serve(&smf, upf).await,
+            (false, vec![a.ip()], PfcpCause::RequestAccepted as u8),
+            "the newer transition goes last"
+        );
+        live.await.unwrap().unwrap();
+        settled(&server).await;
+        assert!(smf_paths.failed.is_empty(), "the SMF ends with A up");
+        assert!(server.test_told_failed().is_empty());
+    }
+
+    /// #1531 review M-2: a retained Setup restarts the re-report rounds. The
+    /// refusals while the SMF had the UPF marked down used up every round; the first
+    /// re-report after the re-association is refused with 72 too (smfd marks the
+    /// association up only after the Setup Response), and it is still retried.
+    #[tokio::test]
+    async fn a_retained_setup_restarts_the_re_report_rounds() {
+        let (server, smf, upf, _rx) = spawn_test_server().await;
+        let dp = attach_dp_1513(&server);
+        let a: SocketAddr = "10.1.2.2:2152".parse().unwrap();
+        let mut smf_paths = SmfPaths::default();
+        associate(&smf, upf, SMF_NODE, 100, None).await;
+        establish(&server, &smf, upf, FIRST_CP_SEID).await;
+
+        set_path(&dp, a, true);
+        server.send_node_report(true, &[a.ip()]).await.unwrap();
+        smf_paths.serve(&smf, upf).await;
+        settled(&server).await;
+        for _ in 0..PFCP_N1_MAX_RETRANSMIT {
+            resend_now(&server).await;
+            assert_eq!(
+                smf_paths.serve(&smf, upf).await.2,
+                PfcpCause::NoEstablishedPfcpAssociation as u8
+            );
+            settled(&server).await;
+        }
+        assert!(!server.test_path_resend_now(), "every round is used up");
+
+        smf_paths.associated = true;
+        smf_paths.refuse = 1;
+        assert!(psrei(&associate(&smf, upf, SMF_NODE, 100, Some(&[])).await));
+        assert_eq!(
+            smf_paths.serve(&smf, upf).await,
+            (
+                true,
+                vec![a.ip()],
+                PfcpCause::NoEstablishedPfcpAssociation as u8
+            ),
+            "the first re-report races into a 72"
+        );
+        resend_now(&server).await;
+        assert_eq!(
+            smf_paths.serve(&smf, upf).await,
+            (true, vec![a.ip()], PfcpCause::RequestAccepted as u8),
+            "and is retried"
+        );
+        assert_eq!(smf_paths.failed, std::collections::HashSet::from([a.ip()]));
+    }
+
+    /// #1531 review MINOR 2: the rounds are counted, not the refusals. A CP function
+    /// that accepts every failure but refuses a recovery gets PFCP_N1_MAX_RETRANSMIT
+    /// rounds and no more, although one report of every round is accepted. Before,
+    /// each accepted failure reset the count and a round followed every T1 forever.
+    #[tokio::test]
+    async fn re_report_rounds_stay_bounded_when_one_report_of_each_round_is_accepted() {
+        let (server, smf, upf, _rx) = spawn_test_server().await;
+        let dp = attach_dp_1513(&server);
+        let a: SocketAddr = "10.1.2.3:2152".parse().unwrap();
+        let b: SocketAddr = "10.1.2.4:2152".parse().unwrap();
+        let mut smf_paths = SmfPaths {
+            associated: true,
+            refuse_recoveries: true,
+            ..Default::default()
+        };
+        associate(&smf, upf, SMF_NODE, 100, None).await;
+
+        set_path(&dp, a, true);
+        server.send_node_report(true, &[a.ip()]).await.unwrap();
+        smf_paths.serve(&smf, upf).await;
+        set_path(&dp, a, false);
+        set_path(&dp, b, true);
+        server.send_node_report(false, &[a.ip()]).await.unwrap();
+        assert_eq!(
+            smf_paths.serve(&smf, upf).await.2,
+            PfcpCause::RequestRejected as u8
+        );
+        settled(&server).await;
+
+        for _ in 0..PFCP_N1_MAX_RETRANSMIT {
+            resend_now(&server).await;
+            assert_eq!(
+                smf_paths.serve(&smf, upf).await,
+                (true, vec![b.ip()], PfcpCause::RequestAccepted as u8)
+            );
+            assert_eq!(
+                smf_paths.serve(&smf, upf).await,
+                (false, vec![a.ip()], PfcpCause::RequestRejected as u8)
+            );
+            settled(&server).await;
+        }
+        assert!(
+            !server.test_path_resend_now(),
+            "no round after PFCP_N1_MAX_RETRANSMIT rounds"
+        );
+    }
+
+    /// #1531 review MINOR 3: a re-report says "recovered" only of a path known to be
+    /// up. A path the SMF may hold failed whose state is unknown (no longer tracked:
+    /// its sessions went) is not reported recovered; one that answered is.
+    #[tokio::test]
+    async fn a_re_report_recovers_only_paths_known_to_be_up() {
+        let (server, smf, upf, _rx) = spawn_test_server().await;
+        let dp = attach_dp_1513(&server);
+        let a: SocketAddr = "10.1.2.5:2152".parse().unwrap();
+        let b: SocketAddr = "10.1.2.6:2152".parse().unwrap();
+        let mut smf_paths = SmfPaths {
+            associated: true,
+            ..Default::default()
+        };
+        associate(&smf, upf, SMF_NODE, 100, None).await;
+        establish(&server, &smf, upf, FIRST_CP_SEID).await;
+        set_path(&dp, a, true);
+        set_path(&dp, b, true);
+        server
+            .send_node_report(true, &[a.ip(), b.ip()])
+            .await
+            .unwrap();
+        smf_paths.serve(&smf, upf).await;
+        settled(&server).await;
+
+        // A is no longer tracked (unknown); B answered (up).
+        dp.path_table.write().unwrap().remove_peer(&a);
+        set_path(&dp, b, false);
+        assert!(psrei(&associate(&smf, upf, SMF_NODE, 100, Some(&[])).await));
+        assert_eq!(
+            smf_paths.serve(&smf, upf).await,
+            (false, vec![b.ip()], PfcpCause::RequestAccepted as u8),
+            "only B is reported recovered"
+        );
+        settled(&server).await;
+        assert_eq!(
+            server.test_told_failed(),
+            vec![a.ip()],
+            "A may still be failed"
+        );
+    }
+
+    /// #1531 review MINOR 3: a path report that cannot be sent is not delivered: it
+    /// schedules a re-report, and nothing stays in flight.
+    #[tokio::test]
+    async fn a_path_report_that_cannot_be_sent_schedules_a_re_report() {
+        let (server, smf, upf, _rx) = spawn_test_server().await;
+        associate(&smf, upf, SMF_NODE, 100, None).await;
+        // An IPv6 destination from the IPv4 socket: the send fails.
+        server.association.write().await.as_mut().unwrap().peer_addr =
+            "[::1]:8805".parse().unwrap();
+        assert!(server
+            .send_node_report(true, &["10.1.2.7".parse().unwrap()])
+            .await
+            .is_err());
+        assert_eq!(server.test_path_in_flight(), 0);
+        assert!(server.test_path_resend_now(), "a re-report is scheduled");
+    }
+
+    /// #1531 review MINOR 3: a heartbeat teardown deletes the sessions, and with them
+    /// what the CP function was told: nothing stays to re-report.
+    #[tokio::test]
+    async fn a_heartbeat_teardown_clears_the_path_reports() {
+        let (server, smf, upf, _rx) = spawn_test_server().await;
+        associate(&smf, upf, SMF_NODE, 100, None).await;
+        let ip: IpAddr = "10.1.2.8".parse().unwrap();
+        server.send_node_report(true, &[ip]).await.unwrap();
+        let (seq, _, _) = next_path_report(&smf).await;
+        answer_node_report(
+            &smf,
+            upf,
+            seq,
+            PfcpCause::NoEstablishedPfcpAssociation as u8,
+        )
+        .await;
+        resend_now(&server).await;
+        assert_eq!(server.test_told_failed(), vec![ip]);
+
+        for _ in 0..HEARTBEAT_MAX_MISSES {
+            server.send_heartbeat_request().await.expect("sent");
+            server.close_heartbeat_round().await;
+        }
+        assert!(!server.is_associated().await, "torn down");
+        assert!(server.test_told_failed().is_empty());
+        assert!(!server.test_path_resend_now(), "nothing is re-reported");
+        assert_eq!(server.test_path_in_flight(), 0);
+    }
+
+    /// #1513: the ledger. A late acceptance of an older recovery does not clear a
+    /// newer failure of the same peer; an accepted recovery that is the peer's latest
+    /// report does. A response that is not to a path report is not one.
+    #[test]
+    fn the_path_report_ledger_applies_only_the_latest_report_per_peer() {
+        let ip: IpAddr = "10.1.1.5".parse().unwrap();
+        let mut l = PathReportLedger::default();
+        l.sent(1, true, &[ip], false);
+        assert!(l.answered(1, true));
+        assert!(l.told_failed.contains(&ip), "an accepted failure stands");
+        l.sent(2, false, &[ip], false);
+        l.sent(3, true, &[ip], false);
+        assert!(l.answered(2, true), "the recovery was a path report");
+        assert!(l.told_failed.contains(&ip), "the newer failure stands");
+        l.sent(4, false, &[ip], false);
+        assert!(l.answered(4, true));
+        assert!(
+            !l.told_failed.contains(&ip),
+            "the latest recovery was accepted"
+        );
+        assert!(!l.answered(99, true), "not a path report");
+        assert!(!l.answered(4, true), "answered once");
     }
 
     /// #718: a retention request naming CP PFCP entities keeps only those
