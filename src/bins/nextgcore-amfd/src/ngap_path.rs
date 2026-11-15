@@ -817,6 +817,11 @@ pub struct UeNasContext {
     /// #686 PR 2: a 5G-GUTI of this AMF's GUAMI is owed after the Service Accept, whatever
     /// `AMF_GUTI_REALLOCATION` says (TS 23.501 §5.21.2.3).
     guti_reallocation_owed: bool,
+    /// #1424: the location (TAI, NR CGI, serving association) the last LOCATION_REPORT
+    /// evaluation saw, the baseline the next one's `locationFilterList` is matched
+    /// against ([`NgapServer::report_location_change`]). `None` until the first:
+    /// a location the AMF had no earlier one for is a change in every dimension.
+    location_evaluated: Option<(crate::context::Tai5gs, crate::context::NrCgi, u64)>,
 }
 
 /// Manual `Debug` (no-auth-material-in-logs): the authentication material in
@@ -1005,6 +1010,21 @@ impl UeNasContext {
             taken_over: false,
             peers_stale: false,
             guti_reallocation_owed: false,
+            location_evaluated: None,
+        }
+    }
+
+    /// #1424: before an existing context's location is overwritten, keep where it was
+    /// as the LOCATION_REPORT baseline if none has been reported yet (a context
+    /// seeded or restored without a report). Its stored location was learned, so a
+    /// move away from it is measured from it, not from nothing.
+    fn seed_location_baseline(&mut self) {
+        if self.location_evaluated.is_none() {
+            self.location_evaluated = Some((
+                self.amf_ue.nr_tai.clone(),
+                self.amf_ue.nr_cgi.clone(),
+                self.association_id,
+            ));
         }
     }
 
@@ -3585,7 +3605,7 @@ impl NgapServer {
         //
         // 1. `handle_service_request_nas` reads the UE back out of the store to build the
         //    Service Accept and to fire its events. A write placed after dispatch would
-        //    leave `fire_location_report` reading the OLD TAI — the same defect, relocated.
+        //    leave `report_location_change` reading the OLD TAI — the same defect, relocated.
         // 2. The legacy raw-5GSM branch (`epd == 0x2E`) and the MAC-failure branch both
         //    return early. Each is still an Uplink NAS Transport carrying a mandatory,
         //    already-validated location, and a UE whose PDU session signalling arrives
@@ -3608,6 +3628,7 @@ impl NgapServer {
             let Some(location) = &ul_nas.user_location_info else {
                 return;
             };
+            state.seed_location_baseline();
             apply_user_location(&mut state.amf_ue, location);
             log::debug!(
                 "UE {} location refreshed from the Uplink NAS Transport (tac={}, nci=0x{:x})",
@@ -6965,6 +6986,14 @@ impl NgapServer {
             self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
                 s.registration_accept_sent = true;
             });
+            // #1424: a mobility or periodic registration update is where the AMF
+            // becomes aware of where an idle UE went (TS 29.518 Table 6.2.6.3.3-1,
+            // `29518-k00.txt:23958-23966`). LOCATION_REPORT goes to the subscriptions
+            // whose `locationFilterList` covers what changed since the last report.
+            // So a mobility update into a new TA reaches a filter-less subscriber,
+            // and a periodic update from the same cell reaches none. Before, the
+            // update path reported nothing.
+            self.report_location_change(amf_ue_ngap_id);
             let _ = self.create_ue_policy_association(amf_ue_ngap_id).await;
             return Ok(());
         }
@@ -7133,9 +7162,12 @@ impl NgapServer {
         if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
             crate::namf_server::fire_access_type_report(&state.amf_ue, "3GPP_ACCESS");
             crate::namf_server::fire_registration_state_report(&state.amf_ue, true);
-            crate::namf_server::fire_location_report(&state.amf_ue);
             crate::namf_server::fire_presence_in_aoi_report(&state.amf_ue);
         }
+        // #1424: LOCATION_REPORT only to the subscriptions whose `locationFilterList`
+        // covers what changed since the last report (a periodic registration from the
+        // same cell reports nothing to a TA subscriber); a new context reports all.
+        self.report_location_change(amf_ue_ngap_id);
         crate::namf_server::fire_ues_in_area_report();
         let _ = self.create_ue_policy_association(amf_ue_ngap_id).await;
         Ok(())
@@ -7394,6 +7426,7 @@ impl NgapServer {
              (integrity verified, TS 24.501 §4.4.6)"
         );
         self.ue_auth_state.remove(old_id);
+        state.seed_location_baseline();
         state.ran_ue_ngap_id = initial_ue.ran_ue_ngap_id;
         // #648: the AmfUe's own id is the key its sessions and store entry live under;
         // it moves with them, or a SUPI lookup returns the old id and misses both.
@@ -7548,6 +7581,7 @@ impl NgapServer {
 
         // The UE is back: its record moves to the new NGAP IDs and leaves CM-IDLE.
         self.ue_auth_state.remove(old_id);
+        state.seed_location_baseline();
         state.ran_ue_ngap_id = ran_ue_ngap_id;
         // #648: the AmfUe's own id is the key its sessions and store entry live under;
         // it moves with them. Left behind, every SUPI-addressed Namf request after this
@@ -7894,9 +7928,11 @@ impl NgapServer {
         if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
             crate::namf_server::fire_connectivity_state_report(&state.amf_ue, true);
             crate::namf_server::fire_reachability_report(&state.amf_ue, true);
-            crate::namf_server::fire_location_report(&state.amf_ue);
             crate::namf_server::fire_presence_in_aoi_report(&state.amf_ue);
         }
+        // #1424: LOCATION_REPORT diffed against the last reported location, through the
+        // subscriptions' `locationFilterList`.
+        self.report_location_change(amf_ue_ngap_id);
         crate::namf_server::fire_ues_in_area_report();
         Ok(())
     }
@@ -8389,9 +8425,11 @@ impl NgapServer {
         if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
             crate::namf_server::fire_connectivity_state_report(&state.amf_ue, true);
             crate::namf_server::fire_reachability_report(&state.amf_ue, true);
-            crate::namf_server::fire_location_report(&state.amf_ue);
             crate::namf_server::fire_presence_in_aoi_report(&state.amf_ue);
         }
+        // #1424: LOCATION_REPORT diffed against the last reported location, through the
+        // subscriptions' `locationFilterList`.
+        self.report_location_change(amf_ue_ngap_id);
         // A UE returning from CM-IDLE may have moved into or out of a counted area while
         // the AMF could not see it, so the per-area totals can change even though the
         // served population did not. Takes no UE argument: the type is any-UE by
@@ -11508,6 +11546,51 @@ impl NgapServer {
                 }
                 Ok(())
             }
+        }
+    }
+
+    /// #1424: fire LOCATION_REPORT for where UE `amf_ue_ngap_id` is now, only to the
+    /// subscriptions whose `locationFilterList` covers a dimension that changed since
+    /// the last evaluation, and make the current location the next baseline.
+    ///
+    /// TS 29.518 Table 6.2.6.3.3-1 (`29518-k00.txt:23958-23966`): the "Updated
+    /// Location ... when AMF becomes aware of a location change of the UE"; Table
+    /// 6.2.6.2.3-1 (`:21398-21404`): with no `locationFilterList` "the change of
+    /// the TA used by the UE should be reported". Every site that reports a UE's
+    /// location goes through here, so they share one baseline:
+    /// - Registration Accept;
+    /// - Service Request, from CM-IDLE and over NAS;
+    /// - Handover Notify;
+    /// - Path Switch.
+    ///
+    /// A Service Request from the cell the UE registered in then reports nothing to a
+    /// TA-filtered subscriber. With no baseline (a new UE context), every dimension
+    /// counts as changed: the AMF has just become aware of the UE's location.
+    fn report_location_change(&mut self, amf_ue_ngap_id: u64) {
+        let mut evaluated = None;
+        self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
+            let now = (
+                state.amf_ue.nr_tai.clone(),
+                state.amf_ue.nr_cgi.clone(),
+                state.association_id,
+            );
+            let change = match &state.location_evaluated {
+                None => crate::context::LocationChange {
+                    tai: true,
+                    cell: true,
+                    ran_node: true,
+                },
+                Some((tai, cgi, assoc)) => crate::context::LocationChange {
+                    tai: *tai != now.0,
+                    cell: *cgi != now.1,
+                    ran_node: *assoc != now.2,
+                },
+            };
+            state.location_evaluated = Some(now);
+            evaluated = Some((state.amf_ue.clone(), change));
+        });
+        if let Some((amf_ue, change)) = evaluated {
+            crate::namf_server::fire_location_change_report(&amf_ue, change);
         }
     }
 
@@ -15984,18 +16067,10 @@ impl NgapServer {
             .map(|s| (s.association_id, s.ran_ue_ngap_id))
             .filter(|pair| *pair != (association_id, notify.ran_ue_ngap_id));
 
-        // nextgsim#466: where the UE was, so the LOCATION_REPORT below goes only to
-        // the subscriptions whose `locationFilterList` covers what changed.
-        let located_before = self.ue_auth_state.get(notify.amf_ue_ngap_id).map(|s| {
-            (
-                s.amf_ue.nr_tai.clone(),
-                s.amf_ue.nr_cgi.clone(),
-                s.association_id,
-            )
-        });
         let updated = self.ue_auth_state.with_mut(notify.amf_ue_ngap_id, |state| {
             // Move the serving association/RAN-UE-NGAP-ID and location to the
             // target now that the UE has arrived (TS 23.502 Section 4.9.1.3).
+            state.seed_location_baseline();
             state.association_id = association_id;
             state.ran_ue_ngap_id = notify.ran_ue_ngap_id;
             // #738 review: the UE has ARRIVED on the target, so it is CM-CONNECTED
@@ -16077,19 +16152,13 @@ impl NgapServer {
         // the AMF has become aware of, and re-reporting the source cell would be wrong.
         // And only to the subscriptions whose `locationFilterList` covers a dimension
         // that changed (Table 6.2.6.2.3-1: absent means TA changes only), so an
-        // intra-TA handover does not reach a filter-less subscriber. Same snapshot as
-        // the presence report, read after the location write.
+        // intra-TA handover does not reach a filter-less subscriber. #1424: what
+        // changed is measured from the location last reported, the baseline every
+        // LOCATION_REPORT site shares ([`Self::report_location_change`]).
+        if notify.user_location_info.is_some() {
+            self.report_location_change(notify.amf_ue_ngap_id);
+        }
         if let Some(state) = self.ue_auth_state.get(notify.amf_ue_ngap_id) {
-            if let (Some(_), Some((tai, cgi, assoc))) =
-                (&notify.user_location_info, &located_before)
-            {
-                let change = crate::context::LocationChange {
-                    tai: *tai != state.amf_ue.nr_tai,
-                    cell: *cgi != state.amf_ue.nr_cgi,
-                    ran_node: *assoc != state.association_id,
-                };
-                crate::namf_server::fire_location_change_report(&state.amf_ue, change);
-            }
             crate::namf_server::fire_presence_in_aoi_report(&state.amf_ue);
         }
         // A relocation can move a UE into or out of a counted area, so the per-area
@@ -17857,17 +17926,10 @@ impl NgapServer {
                 // target (#406: `UserLocationInformation` is mandatory here, TS 38.413
                 // §9.2.3.8, and an Xn handover produces no HandoverNotify, so this is the
                 // AMF's only notice that the UE relocated). `with_mut`, so it persists.
-                // nextgsim#466: where the UE was, for the LOCATION_REPORT filter below.
-                let located_before = self.ue_auth_state.get(amf_ue_ngap_id).map(|s| {
-                    (
-                        s.amf_ue.nr_tai.clone(),
-                        s.amf_ue.nr_cgi.clone(),
-                        s.association_id,
-                    )
-                });
                 self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
                     let committed = state.amf_ue.advance_next_hop();
                     debug_assert_eq!(committed, (ncc, nh), "the previewed NH is the one sent");
+                    state.seed_location_baseline();
                     state.ran_ue_ngap_id = req.ran_ue_ngap_id;
                     state.association_id = association_id;
                     if let Some(uli) = &req.user_location_info {
@@ -17881,18 +17943,10 @@ impl NgapServer {
                 // the UE"*, `29518-k00.txt:23958-23966`). Read after the `with_mut`, so it reports
                 // the TARGET cell; only for an Acknowledge, because a Failure leaves the
                 // UE where it was; and only to subscriptions whose `locationFilterList`
-                // covers what changed (absent = TA only).
-                if let (Some(_), Some((tai, cgi, assoc)), Some(state)) = (
-                    &req.user_location_info,
-                    &located_before,
-                    self.ue_auth_state.get(amf_ue_ngap_id),
-                ) {
-                    let change = crate::context::LocationChange {
-                        tai: *tai != state.amf_ue.nr_tai,
-                        cell: *cgi != state.amf_ue.nr_cgi,
-                        ran_node: *assoc != state.association_id,
-                    };
-                    crate::namf_server::fire_location_change_report(&state.amf_ue, change);
+                // covers what changed (absent = TA only), measured from the location
+                // last reported (#1424, [`Self::report_location_change`]).
+                if req.user_location_info.is_some() {
+                    self.report_location_change(amf_ue_ngap_id);
                 }
                 // #570: the UE Radio Capability ID, when the UE has one (TS 38.413 §9.2.3.9).
                 let bytes = crate::racs::add_capability_ies(bytes, racs_id.as_deref(), None);
@@ -36092,6 +36146,203 @@ mod tests {
             "the TARGET's TAI and cell from the PATH SWITCH REQUEST, not the source's"
         );
         sink.stop().await.expect("sink stop");
+    }
+
+    /// **#1424**, TS 29.518 Table 6.2.6.2.3-1 (`29518-k00.txt:21398-21404`): the
+    /// LOCATION_REPORT a Service Request from CM-IDLE fires goes only to the
+    /// subscriptions whose `locationFilterList` covers what changed since the last
+    /// report. The UE went idle in cell 0x5_1100 of TAC 0x74 and comes back from cell
+    /// 0x5_1200 of the same TA, so a `[CELL_ID]` subscriber is told and a filter-less
+    /// one (TA changes only) is not.
+    ///
+    /// The CELL_ID report is the positive control. Both deliveries are spawned by the
+    /// same fire, so once it has arrived a filter-less one would have too. A second
+    /// Service Request from the same cell then tells neither: the first report is
+    /// the new baseline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_service_request_reports_location_only_through_the_filters_1424() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        // The Initial Context Setup carrying the Service Accept needs a served GUAMI.
+        // `served_guami` is process-global, so this holds CONTEXT_GUARD, and it is put
+        // back at the end.
+        let saved_guamis = crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .served_guami
+            .clone();
+        serve_only_local_guami();
+        // Capturing, so the Initial Context Setup's send succeeds and the reports
+        // after it fire.
+        let mut ngap = capturing_ngap_server().await;
+        let (old_id, new_id) = (14_240_101u64, 14_240_102u64);
+        let supi = "imsi-001010000142401";
+        let mut stored = idle_registered_ue(old_id);
+        stored.amf_ue.supi = Some(supi.to_string());
+        stored.amf_ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        stored.amf_ue.nr_tai.tac = 0x74;
+        stored.amf_ue.nr_cgi.plmn_id = PlmnId::new("001", "01");
+        stored.amf_ue.nr_cgi.cell_id = 0x0005_1100;
+        // The Initial Context Setup's Allowed NSSAI is SIZE(1..8).
+        stored.amf_ue.allowed_nssai = vec![crate::context::SNssai { sst: 1, sd: None }];
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_publish(&stored.amf_ue, 51, 1);
+        }
+        ngap.ue_auth_state.insert(old_id, stored);
+        let (plain, mut plain_rx) = location_report_sink(supi, "1424-sr-plain").await;
+        let (cell, mut cell_rx) =
+            location_report_sink_filtered(supi, "1424-sr-cell", Some(&["CELL_ID"])).await;
+
+        // `service_request_initial_ue` comes from TAC 0x74, cell 0x5_1200.
+        ngap.forced_amf_ue_ngap_id = Some(new_id);
+        let pdu = service_request_initial_ue(protected_service_request([0; 4], old_id as u32));
+        let _ = ngap.handle_initial_ue_message(1, &pdu).await;
+        assert!(ngap.ue_auth_state.get(new_id).is_some(), "the UE is back");
+
+        let (got, tac, nci) = next_location_report(&mut cell_rx).await;
+        assert_eq!(got, supi);
+        assert_eq!((tac.as_str(), nci.as_str()), ("0074", "000051200"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), plain_rx.recv())
+                .await
+                .is_err(),
+            "an intra-TA Service Request does not reach a TA-only subscriber"
+        );
+
+        // Idle again, and back from the same cell: nothing changed since that report.
+        ngap.ue_auth_state.with_mut(new_id, |s| s.cm_idle = true);
+        let newer_id = 14_240_103u64;
+        ngap.forced_amf_ue_ngap_id = Some(newer_id);
+        let pdu = service_request_initial_ue(protected_service_request([0; 4], old_id as u32));
+        let _ = ngap.handle_initial_ue_message(1, &pdu).await;
+        assert!(
+            ngap.ue_auth_state.get(newer_id).is_some(),
+            "the UE is back again"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), cell_rx.recv())
+                .await
+                .is_err(),
+            "the same cell is no change for a CELL_ID subscriber"
+        );
+        assert!(plain_rx.try_recv().is_err());
+        ngap.ue_auth_state.remove(newer_id);
+        plain.stop().await.expect("sink stop");
+        cell.stop().await.expect("sink stop");
+        let ctx = crate::context::amf_self();
+        let mut ctx = ctx.write().expect("ctx lock");
+        ctx.num_of_served_guami = saved_guamis.len();
+        ctx.served_guami = saved_guamis;
+    }
+
+    /// **#1424**: a registration update's Registration Accept reports the UE's
+    /// location through the `locationFilterList`. A periodic registration update
+    /// from CM-IDLE (protected, TS 24.501 §4.4.6), from another cell of the TA the UE
+    /// went idle in, reaches a `[CELL_ID]` subscriber (the positive control) and not
+    /// a filter-less one. Before, the update path reported no location at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_registration_reports_location_only_through_the_filters_1424() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = capturing_ngap_server().await;
+        let (old_id, new_id) = (14_240_301u64, 14_240_302u64);
+        let tmsi = 0x1424_0301u32;
+        let mut stored = idle_ue_with_security(old_id, tmsi);
+        let supi = stored.amf_ue.supi.clone().expect("supi");
+        stored.amf_ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        stored.amf_ue.nr_tai.tac = 0x74;
+        stored.amf_ue.nr_cgi.plmn_id = PlmnId::new("001", "01");
+        stored.amf_ue.nr_cgi.cell_id = 0x0005_1100;
+        let rr =
+            guti_registration_request(crate::gmm_build::registration_type::PERIODIC_UPDATING, tmsi);
+        let nas = protected_initial_registration(&stored.amf_ue, &rr, &rr, 5);
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_publish(&stored.amf_ue, 51, 1);
+        }
+        ngap.ue_auth_state.insert(old_id, stored);
+        let (plain, mut plain_rx) = location_report_sink(&supi, "1424-rr-plain").await;
+        let (cell, mut cell_rx) =
+            location_report_sink_filtered(&supi, "1424-rr-cell", Some(&["CELL_ID"])).await;
+
+        // From TAC 0x74, cell 0x5_1200.
+        ngap.forced_amf_ue_ngap_id = Some(new_id);
+        let _ = ngap
+            .handle_initial_ue_message(1, &service_request_initial_ue(nas))
+            .await;
+        assert!(ngap.ue_auth_state.get(new_id).is_some(), "the UE resumed");
+
+        let (got, tac, nci) = next_location_report(&mut cell_rx).await;
+        assert_eq!(got, supi);
+        assert_eq!((tac.as_str(), nci.as_str()), ("0074", "000051200"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), plain_rx.recv())
+                .await
+                .is_err(),
+            "an intra-TA registration does not reach a TA-only subscriber"
+        );
+        ngap.ue_auth_state.remove(new_id);
+        plain.stop().await.expect("sink stop");
+        cell.stop().await.expect("sink stop");
+    }
+
+    /// **#1424**: [`NgapServer::report_location_change`] measures each dimension from
+    /// the last report. With no baseline (a UE the AMF has just learned the location
+    /// of), every dimension counts as changed. A TA change reaches the filter-less
+    /// subscriber, and a new serving association reaches a `[RAN_NODE]` one only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_location_baseline_is_the_last_report_1424() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        let mut ngap = test_ngap_server().await;
+        let ue = 14_240_201u64;
+        let supi = "imsi-001010000142402";
+        let mut state = UeNasContext::new(ue, 7, 1, false);
+        state.amf_ue.supi = Some(supi.to_string());
+        state.amf_ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        state.amf_ue.nr_tai.tac = 0x0A;
+        state.amf_ue.nr_cgi.plmn_id = PlmnId::new("001", "01");
+        state.amf_ue.nr_cgi.cell_id = 0x0000_0A01;
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_publish(&state.amf_ue, 7, 1);
+        }
+        ngap.ue_auth_state.insert(ue, state);
+        let (plain, mut plain_rx) = location_report_sink(supi, "1424-b-plain").await;
+        let (ran, mut ran_rx) =
+            location_report_sink_filtered(supi, "1424-b-ran", Some(&["RAN_NODE"])).await;
+
+        // No baseline: the first evaluation is a report to both.
+        ngap.report_location_change(ue);
+        assert_eq!(next_location_report(&mut plain_rx).await.1, "000A");
+        assert_eq!(next_location_report(&mut ran_rx).await.1, "000A");
+
+        // A new TA on the same association: the TA subscriber only.
+        ngap.ue_auth_state
+            .with_mut(ue, |s| s.amf_ue.nr_tai.tac = 0x0B);
+        ngap.report_location_change(ue);
+        assert_eq!(next_location_report(&mut plain_rx).await.1, "000B");
+
+        // Same TA, another association: the RAN_NODE subscriber only.
+        ngap.ue_auth_state.with_mut(ue, |s| s.association_id = 2);
+        ngap.report_location_change(ue);
+        assert_eq!(next_location_report(&mut ran_rx).await.1, "000B");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), plain_rx.recv())
+                .await
+                .is_err(),
+            "neither the RAN node change nor anything earlier reached the TA subscriber twice"
+        );
+        assert!(
+            ran_rx.try_recv().is_err(),
+            "the TA change did not reach RAN_NODE"
+        );
+        ngap.ue_auth_state.remove(ue);
+        plain.stop().await.expect("sink stop");
+        ran.stop().await.expect("sink stop");
     }
 
     /// An ERROR INDICATION's `(amf id, ran id, radio-network cause)`; `None` otherwise.
