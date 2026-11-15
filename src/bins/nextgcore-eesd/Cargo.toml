@@ -10,6 +10,15 @@ description = "NextGCore EES (Edge Enabler Server, TS 23.558)"
 name = "nextgcore-eesd"
 path = "src/main.rs"
 
+[features]
+## nextgsim#471 (demo d443a-edge-budget): the EES ranks the EASes of an EEC
+## registration on a UPF-measured budget (QOS_MON rtDelays + 2 x the N6 delay
+## smfd exposes + a compute stand-in) against a local-policy deadline, or on the
+## advertised maxRespTime (mode static); subscribes to QOS_MON at the SMF and
+## serves the notification route and /metrics. Active only with the demo: block
+## on as well. Off by default.
+demo-d443a-edge-budget = []
+
 [dependencies]
 nextgcore-core = { workspace = true }
 nextgcore-sbi = { workspace = true }
@@ -27,6 +36,12 @@ ctrlc.workspace = true
 # #106: SHA-256 for the EDGE UE identifier (eees-ueidentifier). Needed so the
 # identifier is stable, per-EAS and opaque; a UUID would satisfy none of those.
 sha2.workspace = true
+# The demo: config block (nextgsim#458). Read by every build, so a demo block
+# naming a demo this build was not compiled with fails start-up.
+nextgcore-demo = { workspace = true }
+serde_yaml.workspace = true
+# nextgsim#471: the demo's callback path token, 16 bytes from the OS RNG.
+rand.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

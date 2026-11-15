@@ -414,6 +414,25 @@ pub struct EasDiscoveryResp {
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveredEas {
     pub eas: EasProfile,
+    /// A TS 29.500 §6.6.3 vendor-specific member, written only by the
+    /// nextgsim#471 demo (`achievableLatency`, `budgetSrc`); absent otherwise,
+    /// so the body is what it was.
+    #[serde(
+        rename = "vendorSpecific-032473",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub vendor_specific: Option<serde_json::Value>,
+}
+
+impl DiscoveredEas {
+    /// The `DiscoveredEas` of `eas`, with no vendor-specific member.
+    pub fn of(eas: EasProfile) -> Self {
+        Self {
+            eas,
+            vendor_specific: None,
+        }
+    }
 }
 
 /// TS 24.558 `EASDiscEventIDs` value: an EAS became available (a fresh

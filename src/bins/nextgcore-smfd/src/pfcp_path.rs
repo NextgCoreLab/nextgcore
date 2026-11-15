@@ -860,6 +860,14 @@ pub fn client_for_session(smf_n4_seid: u64) -> Option<Arc<PfcpClient>> {
     recorded_client(smf_n4_seid).or_else(global_client)
 }
 
+/// The PFCP client RECORDED for an existing session, with no fallback to the
+/// default client: for a caller that must not attribute another UPF's data to
+/// the session (nextgsim#471, #1523 review o3).
+#[cfg_attr(not(feature = "demo-d443a-edge-budget"), allow(dead_code))]
+pub fn recorded_client_for_session(smf_n4_seid: u64) -> Option<Arc<PfcpClient>> {
+    recorded_client(smf_n4_seid)
+}
+
 /// Pick the UPF for a NEW session (issue #20; UPF load is a TS 23.501
 /// §6.3.3 selection input).
 ///

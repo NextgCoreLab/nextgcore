@@ -31,6 +31,8 @@ use std::sync::Arc;
 
 mod binding;
 mod context;
+#[cfg(feature = "demo-d443a-edge-budget")]
+mod demo_d443a; // nextgsim#471: N6 delays on QOS_MON (demo d443a-edge-budget)
 mod easdf; // #114: EASDF selection + DNS-context lifecycle (TS 23.501 §5.6.7)
 mod eps_bearer; // #619: PGW-C dedicated EPS bearer activation over S5/S8 (TS 23.401 §5.4.1)
 mod eps_iwk; // #117: 5GS↔EPS interworking, EBI assignment over Namf_Communication
@@ -830,6 +832,38 @@ fn epco_config() -> (&'static [std::net::Ipv4Addr], Option<u16>) {
     }
 }
 
+/// The demos this build can run: `d443a-edge-budget` under its feature, none
+/// otherwise.
+fn demo_registry() -> nextgcore_demo::DemoRegistry {
+    #[cfg(feature = "demo-d443a-edge-budget")]
+    return nextgcore_demo::DemoRegistry::new(&[demo_d443a::DEMO_SPEC]);
+    #[cfg(not(feature = "demo-d443a-edge-budget"))]
+    nextgcore_demo::DemoRegistry::default()
+}
+
+/// The config file's root, for the `demo:` block. A missing file is no block, as
+/// for the rest of the config (`load_config`).
+fn config_root(config_path: &str) -> anyhow::Result<serde_yaml::Value> {
+    match std::fs::read_to_string(config_path) {
+        Ok(content) => serde_yaml::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("SMF config '{config_path}' does not parse: {e}")),
+        // A file that cannot be read is no block, exactly as `load_config` falls
+        // back to the defaults on any read error (it has already warned), so
+        // with the demo off nothing here fails where smfd did not fail before.
+        Err(_) => Ok(serde_yaml::Value::Null),
+    }
+}
+
+/// Validate and install the `demo:` block, once per process.
+fn init_demos(config_path: &str) -> anyhow::Result<()> {
+    let root = config_root(config_path)?;
+    nextgcore_demo::init_from_root(&root, &demo_registry())
+        .map_err(|e| anyhow::anyhow!("{e} ({e:?})"))?;
+    #[cfg(feature = "demo-d443a-edge-budget")]
+    demo_d443a::install(nextgcore_demo::active_mode(demo_d443a::DEMO_KEY));
+    Ok(())
+}
+
 /// The value after the first of `flags` in `args` (`-c x`, `--config x`), or
 /// `None`. smfd reads its few flags by hand rather than through clap.
 fn smf_flag_value(args: impl Iterator<Item = String>, flags: &[&str]) -> Option<String> {
@@ -905,6 +939,10 @@ async fn main() -> Result<()> {
     let _ = EPCO_CONFIG.set((config.dns_servers.clone(), config.mtu));
     // #1502: before the association loop can associate a UPF.
     n6_delay::set_config(config.n6_delay.take());
+    // nextgsim#458: the demo: block, checked against the demos this build was
+    // compiled with, so an unknown key or mode, or a demo whose cargo feature is
+    // not built, fails start-up. With no demo active nothing changes.
+    init_demos(&config_path)?;
 
     // Seed NRF URI into SBI context for NF registration (parsed once in load_config).
     if let Some(ref uri) = config.nrf_uri {
@@ -26881,6 +26919,152 @@ mod tests {
         amf.stop().await.ok();
     }
 
+    /// nextgsim#471 (demo d443a-edge-budget): with the demo on, the QOS_MON notify
+    /// of a session report also carries the session's PSA UPF's N6 delays in the
+    /// vendor-specific member; with it off, the same report's notify is the #1390
+    /// body. Through `handle_pfcp_session_report`, the real report path.
+    #[cfg(feature = "demo-d443a-edge-budget")]
+    // The event-store lock is held across awaits, as the other event tests do.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_qos_mon_notify_carries_the_psa_upf_s_n6_delays_with_the_demo_on_471() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _q = qos_mon::TEST_LOCK.lock().await;
+        let _n6 = n6_delay::N6_TEST_LOCK.lock().await;
+        let _d = demo_d443a::TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _e = event_exposure::lock_store();
+        event_exposure::clear_for_test();
+        qos_mon::clear_for_test();
+        n6_delay::reset_for_test();
+        let supi = "imsi-001010000004710";
+        let (upf, reference, amf, _posts) = qos_mon_session_1390(supi, 5, true).await;
+        let upf_key = upf.client.recovery_time_stamp_key();
+        // #1523 review o3: the session's own UPF, and no UPF for an unknown
+        // session even though a default client exists to fall back to.
+        // A real establishment records the session's UPF (`record_session_upf`
+        // after the Session Establishment Response); the seeded session does not.
+        assert_eq!(demo_d443a::psa_upf_key(smf_n4_seid_for(&reference)), None);
+        pfcp_path::record_session_upf(smf_n4_seid_for(&reference), &upf.client);
+        assert_eq!(
+            demo_d443a::psa_upf_key(smf_n4_seid_for(&reference)).as_deref(),
+            Some(upf_key.as_str())
+        );
+        assert!(pfcp_path::client_for_session(0x0471_dead_beef).is_some());
+        assert_eq!(demo_d443a::psa_upf_key(0x0471_dead_beef), None);
+        n6_delay::insert_for_test(
+            &upf_key,
+            "10.60.0.11".parse().unwrap(),
+            n6_delay::Measured {
+                average_ms: 18,
+                minimum_ms: Some(17),
+                maximum_ms: Some(19),
+            },
+        );
+        // Another UPF's result: not this session's PSA, so not exposed.
+        n6_delay::insert_for_test(
+            "other-upf-471:8805",
+            "10.60.0.12".parse().unwrap(),
+            n6_delay::Measured {
+                average_ms: 3,
+                minimum_ms: None,
+                maximum_ms: None,
+            },
+        );
+        let notified = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let sink = notified.clone();
+        let (consumer, caddr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let sink = sink.clone();
+                async move {
+                    if let Some(v) = req
+                        .http
+                        .content
+                        .as_deref()
+                        .and_then(|c| serde_json::from_str(c).ok())
+                    {
+                        sink.lock().unwrap().push(v);
+                    }
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await;
+        let sub = qos_mon_subscription_1390(
+            supi,
+            &["QOS_MON"],
+            &format!(
+                "http://127.0.0.1:{}/d443a-edge-budget/qos-mon/t",
+                caddr.port()
+            ),
+        );
+        qos_mon::subscribed(&sub).await;
+        let srr_id = qos_mon::srr_ids(&reference)[0];
+        cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
+        let body = qos_mon::tests::sesr_body(
+            srr_id,
+            nextgcore_pfcp::qos_monitoring::QosMonitoringMeasurement {
+                downlink_packet_delay: Some(3),
+                uplink_packet_delay: Some(4),
+                round_trip_packet_delay: Some(6),
+                ..Default::default()
+            },
+        );
+        let seid = smf_n4_seid_for(&reference);
+        let mut pkt = vec![0x21, 56];
+        pkt.extend_from_slice(&((body.len() + 12) as u16).to_be_bytes());
+        pkt.extend_from_slice(&seid.to_be_bytes());
+        pkt.extend_from_slice(&[0, 0x47, 0x10, 0]);
+        pkt.extend_from_slice(&body);
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let report = |n: usize| {
+            let notified = notified.clone();
+            async move {
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                while notified.lock().unwrap().len() < n && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        };
+
+        demo_d443a::set_active_for_test(true);
+        handle_pfcp_session_report(&sock, &pkt, upf.client.peer()).await;
+        report(1).await;
+        demo_d443a::set_active_for_test(false);
+        handle_pfcp_session_report(&sock, &pkt, upf.client.peer()).await;
+        report(2).await;
+
+        let got = notified.lock().unwrap().clone();
+        assert_eq!(got.len(), 2, "two QOS_MON notifies: {got:?}");
+        let on = &got[0]["eventNotifs"][0];
+        assert_eq!(on["rtDelays"], serde_json::json!([6]));
+        assert_eq!(
+            on["vendorSpecific-032473"],
+            serde_json::json!({ "n6Delays": [
+                { "endpoint": "10.60.0.11", "avgMs": 18, "minMs": 17, "maxMs": 19 },
+            ]})
+        );
+        // Off: the same report's notify is the #1390 body, with no member.
+        let mut on_without = got[0].clone();
+        on_without["eventNotifs"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("vendorSpecific-032473");
+        on_without["eventNotifs"][0]["timeStamp"] = got[1]["eventNotifs"][0]["timeStamp"].clone();
+        assert_eq!(got[1], on_without);
+        assert!(got[1]["eventNotifs"][0]
+            .get("vendorSpecific-032473")
+            .is_none());
+
+        qos_mon::forget(&reference);
+        qos_mon::quiesce_for_test().await;
+        cancel_gsm_timer_for_test(&reference);
+        forget_seeded_session(&reference);
+        event_exposure::clear_for_test();
+        n6_delay::reset_for_test();
+        consumer.stop().await.ok();
+        amf.stop().await.ok();
+    }
+
     /// A released session forgets its monitoring: its SRRs went with the N4 session,
     /// so a later Setup Request Transfer for the reference must not carry id 181.
     // The event-store lock is held across awaits, as the other event tests do
@@ -28733,5 +28917,58 @@ mod tests_peer_host_kind_1324 {
                 Some((dialled_host(host), 7793))
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod demo_block_tests_471 {
+    //! nextgsim#458 / #471: smfd reads the `demo:` block in every build. These
+    //! only exercise refusals, which fail before anything is installed (the
+    //! installed state is write-once per process).
+
+    fn config_file(body: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("smf-demo-471-{}.yaml", uuid::Uuid::new_v4()));
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[cfg(not(feature = "demo-d443a-edge-budget"))]
+    #[test]
+    fn a_default_build_refuses_the_d443a_block_471() {
+        let p = config_file(
+            "demo:\n  enabled: true\n  d443a-edge-budget:\n    enabled: true\n    mode: measured-budget\n",
+        );
+        let err = super::init_demos(p.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        std::fs::remove_file(&p).ok();
+        assert!(err.contains("UnknownKey"), "{err}");
+        assert!(err.contains("d443a-edge-budget"), "{err}");
+    }
+
+    /// #1523 review NIT: an unreadable config (a directory here; EACCES alike) is
+    /// no demo block, as `load_config` falls back on any read error.
+    #[test]
+    fn an_unreadable_config_is_no_demo_block_471() {
+        let dir = std::env::temp_dir();
+        assert_eq!(
+            super::config_root(dir.to_str().unwrap()).unwrap(),
+            serde_yaml::Value::Null
+        );
+    }
+
+    #[cfg(feature = "demo-d443a-edge-budget")]
+    #[test]
+    fn an_unknown_mode_fails_startup_471() {
+        let p = config_file(
+            "demo:\n  enabled: true\n  d443a-edge-budget:\n    enabled: true\n    mode: bogus\n",
+        );
+        let err = super::init_demos(p.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        std::fs::remove_file(&p).ok();
+        assert!(err.contains("UnknownMode"), "{err}");
+        assert!(err.contains("demo: \"d443a-edge-budget\""), "{err}");
+        assert!(err.contains("mode: \"bogus\""), "{err}");
     }
 }
