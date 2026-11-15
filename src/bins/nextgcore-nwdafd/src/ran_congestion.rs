@@ -755,6 +755,16 @@ fn report_tai(report: &Value) -> Option<TaiKey> {
     Some(TaiKey { mcc, mnc, tac })
 }
 
+/// Whether `token` is this process's UES_IN_AREA callback token while the loop
+/// is served: the check both the handler and the server's OAuth2 callback
+/// exemption (#1421) apply.
+pub fn holds_callback_token(token: &str) -> bool {
+    serving()
+        && CALLBACK_TOKEN
+            .get()
+            .is_some_and(|t| nextgcore_sbi::callback_auth::token_eq(t, token))
+}
+
 /// `POST /nnwdaf-callback/v1/amf-ues-in-area-notify/{token}`. A token this
 /// process did not hand out, or a process not serving: 404, nothing kept.
 pub fn handle_ues_in_area_notify(
@@ -762,14 +772,7 @@ pub fn handle_ues_in_area_notify(
     token: &str,
     request: &SbiRequest,
 ) -> SbiResponse {
-    let genuine = CALLBACK_TOKEN.get().is_some_and(|t| {
-        t.len() == token.len()
-            && t.bytes()
-                .zip(token.bytes())
-                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                == 0
-    });
-    if !serving() || !genuine {
+    if !holds_callback_token(token) {
         return nextgcore_sbi::server::send_not_found(
             "no such AMF event subscription callback",
             Some("RESOURCE_URI_STRUCTURE_NOT_FOUND"),
