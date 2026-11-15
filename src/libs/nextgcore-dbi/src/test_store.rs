@@ -77,6 +77,40 @@ pub fn provision_subscriber_document(supi: &str, document: mongodb::bson::Docume
         .insert(supi.to_string(), document);
 }
 
+/// Provision a subscriber's Subscribed S-NSSAIs (#1501): `(sst, sd)` with `sd`
+/// as Mongo stores it, six hex digits. Writes the `slice` array of the
+/// subscriber's document (replacing any earlier one, other keys kept) and makes
+/// sure the subscriber exists in the identity mirror (its GPSIs kept), so
+/// `nextgcore_dbi_subscription_data` lists exactly these slices. The slices go
+/// through the Mongo parser, so an `sd` of `None` reads back as that parser
+/// reads an SD-less slice (see #1514).
+pub fn provision_subscriber_slices(supi: &str, slices: &[(u8, Option<&str>)]) {
+    enable();
+    IDENTITIES
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .entry(supi.to_string())
+        .or_default();
+    let slice: Vec<mongodb::bson::Bson> = slices
+        .iter()
+        .map(|(sst, sd)| {
+            let mut entry = mongodb::bson::doc! { "sst": i32::from(*sst) };
+            if let Some(sd) = sd {
+                entry.insert("sd", *sd);
+            }
+            mongodb::bson::Bson::Document(entry)
+        })
+        .collect();
+    DOCUMENTS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .entry(supi.to_string())
+        .or_default()
+        .insert("slice", slice);
+}
+
 /// Whether any subscriber document has been provisioned.
 pub(crate) fn documents_active() -> bool {
     DOCUMENTS.lock().unwrap().is_some()
@@ -172,6 +206,7 @@ pub(crate) fn subscription_data(id: &str) -> DbiResult<crate::types::NextgcoreSu
         })
         .map(|(supi, ids)| (supi.clone(), ids.clone()))
         .ok_or_else(|| DbiError::SubscriberNotFound(id.to_string()))?;
+    drop(guard); // never hold IDENTITIES while taking DOCUMENTS
 
     let mut data = crate::types::NextgcoreSubscriptionData::new();
     data.imsi = crate::types::nextgcore_id_get_value(&hit.0);
@@ -182,6 +217,12 @@ pub(crate) fn subscription_data(id: &str) -> DbiResult<crate::types::NextgcoreSu
     }
     data.num_of_msisdn = data.msisdn.len();
     data.external_ids = hit.1.external_ids;
+    // Subscribed S-NSSAIs (#1501): Mongo reads `slice` off the same subscriber
+    // document, so the mirror reads it off the provisioned document, through the
+    // same parser. A subscriber with no document has no slices.
+    if let Ok(document) = subscriber_document(&hit.0) {
+        crate::subscription::parse_subscribed_slices(&document, &mut data);
+    }
     Ok(data)
 }
 
@@ -333,6 +374,35 @@ mod tests {
         assert!(!created, "existing subscriber must be updated, not created");
         assert_eq!(super::stored_sqn(supi), Some(0x40));
     }
+    /// #1501: provisioned Subscribed S-NSSAIs come back from the subscription read,
+    /// through the Mongo parser (SD hex included), for the SUPI and for its GPSI;
+    /// a subscriber provisioned without slices lists none.
+    #[test]
+    fn provisioned_subscribed_snssais_answer_the_subscription_read() {
+        use crate::subscription::nextgcore_dbi_subscription_data;
+
+        let supi = "imsi-999990000001501";
+        super::provision_subscriber(supi, &["999991501"]);
+        super::provision_subscriber_slices(supi, &[(1, Some("010203")), (2, Some("0a0b0c"))]);
+        for id in [supi, "msisdn-999991501"] {
+            let data = nextgcore_dbi_subscription_data(id).expect("provisioned subscriber");
+            let got: Vec<(u8, u32)> = data
+                .slice
+                .iter()
+                .map(|s| (s.s_nssai.sst, s.s_nssai.sd.v))
+                .collect();
+            assert_eq!(got, vec![(1, 0x010203), (2, 0x0a0b0c)], "{id}");
+            assert_eq!(data.num_of_slice, 2);
+            // The GPSI provisioned first is kept.
+            assert_eq!(data.msisdn.len(), 1, "{id}");
+        }
+
+        let bare = "imsi-999990000001502";
+        super::provision_subscriber(bare, &[]);
+        let data = nextgcore_dbi_subscription_data(bare).expect("provisioned subscriber");
+        assert!(data.slice.is_empty());
+    }
+
     /// #1383: the document mirror answers `nextgcore_dbi_session_data` through the
     /// REAL slice/DNN match and parser -- a provisioned 5QI and AMBR come back as the
     /// Mongo path would parse them, another DNN is `SessionNotFound`, an unknown
