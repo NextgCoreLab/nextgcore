@@ -1556,26 +1556,76 @@ fn parse_forwarding_parameters(data: &[u8]) -> Result<ParsedForwardingParameters
 
 /// Parse Create QER IE
 pub fn parse_create_qer(data: &[u8]) -> Result<ParsedCreateQer, &'static str> {
-    let ies = ParsedIe::parse_all(data);
-    let mut qer = ParsedCreateQer::default();
+    let u = parse_update_qer(data)?;
+    let (ul_gate, dl_gate) = u.gate.unwrap_or((0, 0));
+    let (ul_mbr, dl_mbr) = u.mbr.unwrap_or((0, 0));
+    let (ul_gbr, dl_gbr) = u.gbr.unwrap_or((0, 0));
+    Ok(ParsedCreateQer {
+        qer_id: u.qer_id,
+        ul_gate,
+        dl_gate,
+        ul_mbr,
+        dl_mbr,
+        ul_gbr,
+        dl_gbr,
+        qfi: u.qfi,
+        rqi: u.rqi.unwrap_or(false),
+        ppi: u.ppi,
+    })
+}
 
-    // QER ID (mandatory)
-    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::QER_ID) {
-        if ie.value.len() >= 4 {
-            qer.qer_id = u32::from_be_bytes([ie.value[0], ie.value[1], ie.value[2], ie.value[3]]);
-        }
-    } else {
-        return Err("QER ID missing");
+/// The IEs a Create or Update QER carries, each `None` when absent (#1478).
+///
+/// TS 29.244 Table 7.5.4.5-1: in an Update QER, Gate Status, MBR, GBR, QFI, RQI and
+/// PPI are each present only "if [it] needs to be modified", so an absent one keeps
+/// the value the QER has. Only [`parse_create_qer`] applies the defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParsedUpdateQer {
+    pub qer_id: u32,
+    /// (UL, DL) gate, 0 = OPEN, 1 = CLOSED (§8.2.7).
+    pub gate: Option<(u8, u8)>,
+    /// (UL, DL) MBR in kbit/s, as on the wire (§8.2.8).
+    pub mbr: Option<(u64, u64)>,
+    /// (UL, DL) GBR in kbit/s (§8.2.9).
+    pub gbr: Option<(u64, u64)>,
+    pub qfi: Option<u8>,
+    /// Reflective QoS Indicator (§8.2.88).
+    pub rqi: Option<bool>,
+    /// Paging Policy Indicator (§8.2.116).
+    pub ppi: Option<u8>,
+}
+
+/// The UL and DL bit rates of an MBR or GBR IE (TS 29.244 §8.2.8, §8.2.9): two
+/// 5-octet kbit/s fields. A shorter IE is malformed (#1478): before, it was ignored,
+/// which made the rate unlimited.
+fn parse_bitrates(value: &[u8], short: &'static str) -> Result<(u64, u64), &'static str> {
+    if value.len() < 10 {
+        return Err(short);
     }
+    let field = |o: &[u8]| o.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b));
+    Ok((field(&value[0..5]), field(&value[5..10])))
+}
 
-    // Gate Status (IE type 25)
+/// Parse a Create or Update QER IE body, keeping which IEs are present (#1478).
+/// A present IE too short for its fixed fields is an error, never a default.
+pub fn parse_update_qer(data: &[u8]) -> Result<ParsedUpdateQer, &'static str> {
+    let ies = ParsedIe::parse_all(data);
+    let mut qer = ParsedUpdateQer::default();
+
+    // QER ID (mandatory, §8.2.75: 4 octets).
+    let ie = ParsedIe::find_ie(&ies, pfcp_ie::QER_ID).ok_or("QER ID missing")?;
+    let id: [u8; 4] = ie
+        .value
+        .get(..4)
+        .and_then(|v| v.try_into().ok())
+        .ok_or("QER ID shorter than 4 octets")?;
+    qer.qer_id = u32::from_be_bytes(id);
+
+    // Gate Status (IE type 25). TS 29.244 §8.2.7 (Fig 8.2.7-1): octet 5 bits 1-2 =
+    // DL Gate, bits 3-4 = UL Gate (matches smfd's add_gate_status encode).
     if let Some(ie) = ParsedIe::find_ie(&ies, 25) {
-        if !ie.value.is_empty() {
-            // TS 29.244 §8.2.7 (Fig 8.2.7-1): octet 5 bits 1-2 = DL Gate,
-            // bits 3-4 = UL Gate (matches smfd's add_gate_status encode).
-            qer.dl_gate = ie.value[0] & 0x03; // bits 1-2
-            qer.ul_gate = (ie.value[0] >> 2) & 0x03; // bits 3-4
-        }
+        let v = *ie.value.first().ok_or("Gate Status is empty")?;
+        qer.gate = Some(((v >> 2) & 0x03, v & 0x03));
     }
 
     // MBR (IE type 26). TS 29.244 §8.2.8: the 5-octet UL/DL fields are
@@ -1583,62 +1633,18 @@ pub fn parse_create_qer(data: &[u8]) -> Result<ParsedCreateQer, &'static str> {
     // TokenBucket::from_mbr_kbps, the install logs) takes kbit/s. Scaling to
     // bit/s here policed every MBR 1000x too loosely (#1475).
     if let Some(ie) = ParsedIe::find_ie(&ies, 26) {
-        if ie.value.len() >= 10 {
-            qer.ul_mbr = u64::from_be_bytes([
-                0,
-                0,
-                0,
-                ie.value[0],
-                ie.value[1],
-                ie.value[2],
-                ie.value[3],
-                ie.value[4],
-            ]);
-            qer.dl_mbr = u64::from_be_bytes([
-                0,
-                0,
-                0,
-                ie.value[5],
-                ie.value[6],
-                ie.value[7],
-                ie.value[8],
-                ie.value[9],
-            ]);
-        }
+        qer.mbr = Some(parse_bitrates(&ie.value, "MBR shorter than 10 octets")?);
     }
 
     // GBR (IE type 27). TS 29.244 §8.2.9: kbit/s on the wire, kept in kbit/s
     // (DataPlaneQer::set_gbr takes kbit/s; #1475).
     if let Some(ie) = ParsedIe::find_ie(&ies, 27) {
-        if ie.value.len() >= 10 {
-            qer.ul_gbr = u64::from_be_bytes([
-                0,
-                0,
-                0,
-                ie.value[0],
-                ie.value[1],
-                ie.value[2],
-                ie.value[3],
-                ie.value[4],
-            ]);
-            qer.dl_gbr = u64::from_be_bytes([
-                0,
-                0,
-                0,
-                ie.value[5],
-                ie.value[6],
-                ie.value[7],
-                ie.value[8],
-                ie.value[9],
-            ]);
-        }
+        qer.gbr = Some(parse_bitrates(&ie.value, "GBR shorter than 10 octets")?);
     }
 
     // QFI
     if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::QFI) {
-        if !ie.value.is_empty() {
-            qer.qfi = Some(ie.value[0] & 0x3F);
-        }
+        qer.qfi = Some(ie.value.first().ok_or("QFI is empty")? & 0x3F);
     }
 
     // RQI (TS 29.244 §8.2.88, IE type 123): octet 5 bit 1, rest spare. Parsed so
@@ -1646,17 +1652,13 @@ pub fn parse_create_qer(data: &[u8]) -> Result<ParsedCreateQer, &'static str> {
     // QER asking for it was silently ignored and the downlink header always went
     // out with RQI clear.
     if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::RQI) {
-        if !ie.value.is_empty() {
-            qer.rqi = ie.value[0] & 0x01 != 0;
-        }
+        qer.rqi = Some(ie.value.first().ok_or("RQI is empty")? & 0x01 != 0);
     }
 
     // Paging Policy Indicator (TS 29.244 §8.2.116, IE type 158): octet 5 bits
     // 1-3 carry a value 0-7, the rest is spare.
     if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::PAGING_POLICY_INDICATOR) {
-        if !ie.value.is_empty() {
-            qer.ppi = Some(ie.value[0] & 0x07);
-        }
+        qer.ppi = Some(ie.value.first().ok_or("Paging Policy Indicator is empty")? & 0x07);
     }
 
     Ok(qer)
@@ -3293,6 +3295,65 @@ mod tests {
             (bare.ul_mbr, bare.dl_mbr, bare.ul_gbr, bare.dl_gbr),
             (0, 0, 0, 0)
         );
+    }
+
+    /// #1478, TS 29.244 Table 7.5.4.5-1: an Update QER says which IEs it carries, so
+    /// an absent one can keep its value; a present one too short for its fixed fields
+    /// (MBR, GBR: 10 octets; QER ID: 4; the one-octet IEs: 1) is an error.
+    #[test]
+    fn update_qer_keeps_which_ies_are_present_and_refuses_short_ones_1478() {
+        let id = ie(pfcp_ie::QER_ID, &7u32.to_be_bytes());
+        let bare = parse_update_qer(&id).expect("QER ID only parses");
+        assert_eq!(
+            bare,
+            ParsedUpdateQer {
+                qer_id: 7,
+                ..Default::default()
+            },
+            "nothing but the QER ID is present"
+        );
+
+        let mut full = id.clone();
+        full.extend_from_slice(&ie(25, &[0x06])); // UL CLOSED (1), DL gate value 2
+        full.extend_from_slice(&ie(26, &[0, 0, 0, 0, 0x40, 0, 0, 0, 0, 0x80]));
+        full.extend_from_slice(&ie(27, &[0, 0, 0, 0, 0x20, 0, 0, 0, 0, 0x10]));
+        full.extend_from_slice(&ie(pfcp_ie::QFI, &[0x45]));
+        full.extend_from_slice(&ie(123, &[0x00]));
+        full.extend_from_slice(&ie(158, &[0x03]));
+        assert_eq!(
+            parse_update_qer(&full).expect("parses"),
+            ParsedUpdateQer {
+                qer_id: 7,
+                gate: Some((1, 2)),
+                mbr: Some((64, 128)),
+                gbr: Some((32, 16)),
+                qfi: Some(5),
+                rqi: Some(false),
+                ppi: Some(3),
+            }
+        );
+
+        let with = |extra: Vec<u8>| {
+            let mut b = id.clone();
+            b.extend_from_slice(&extra);
+            b
+        };
+        for (body, what) in [
+            (with(ie(26, &[0; 9])), "MBR"),
+            (with(ie(27, &[0; 4])), "GBR"),
+            (with(ie(26, &[])), "empty MBR"),
+            (with(ie(25, &[])), "Gate Status"),
+            (with(ie(pfcp_ie::QFI, &[])), "QFI"),
+            (with(ie(123, &[])), "RQI"),
+            (with(ie(158, &[])), "PPI"),
+            (ie(pfcp_ie::QER_ID, &[0, 7]), "QER ID"),
+        ] {
+            assert!(
+                parse_update_qer(&body).is_err(),
+                "a short {what} is refused"
+            );
+            assert!(parse_create_qer(&body).is_err(), "and in a Create QER too");
+        }
     }
 
     /// #953 review: an Update URR changes DURAT only when it carries a Measurement
