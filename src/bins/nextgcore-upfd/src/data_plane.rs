@@ -151,6 +151,14 @@ impl GtpuPathTable {
         states
     }
 
+    /// Test hook (#1513): track `peer` and set its path FAILED, or up and answered.
+    #[cfg(test)]
+    pub fn set_path_state_for_test(&mut self, peer: SocketAddr, failed: bool) {
+        let state = self.peers.entry(peer).or_default();
+        state.path_failed = failed;
+        state.last_success = (!failed).then(std::time::Instant::now);
+    }
+
     /// Called on receiving an Echo Response from `peer` carrying sequence number `seq`.
     ///
     /// #887: only an ANSWER is accepted -- a response from a peer this table probes,
@@ -10448,8 +10456,7 @@ mod tests {
             "path delay {d} ms for a 40 ms round trip"
         );
     }
-    /// #1417 review m2: the §7.2 path table's sequence numbers stay below 0x8000,
-    /// the range the GTP-U path QoS probes use.
+
     /// #1513: the path states the PFCP layer re-reports. Failed when failed (on any
     /// port of the address), up only once answered, unknown otherwise.
     #[test]
@@ -10480,6 +10487,8 @@ mod tests {
         assert!(!states.contains_key(&c.ip()), "never answered: unknown");
     }
 
+    /// #1417 review m2: the §7.2 path table's sequence numbers stay below 0x8000,
+    /// the range the GTP-U path QoS probes use.
     #[test]
     fn path_table_sequence_numbers_stay_below_the_probe_range() {
         let peer: SocketAddr = "10.0.0.2:2152".parse().unwrap();
