@@ -20,6 +20,12 @@ path = "src/main.rs"
 ## Networking" has no frozen Stage-3 (non-normative research knob).
 ## Enable with: cargo build -p nextgcore-smfd --features compute-aware-upf
 compute-aware-upf = []
+## nextgsim#471 (demo d443a-edge-budget): QOS_MON notifications also carry the
+## N6 delays (#1502) of the session's PSA UPF, in the TS 29.500 §6.6.3
+## vendor-specific member `vendorSpecific-032473.n6Delays` (non-normative: TS
+## 29.508 has no N6 member). Active only with the demo: block on as well. Off
+## by default.
+demo-d443a-edge-budget = []
 
 [dependencies]
 nextgcore-core = { workspace = true }
@@ -36,6 +42,9 @@ nextgcore-sbi = { workspace = true }
 nextgcore-metrics = { workspace = true }
 nextgcore-diameter = { workspace = true }
 nextgcore-app = { workspace = true }
+# The demo: config block (nextgsim#458). Read by every build, so a demo block
+# naming a demo this build was not compiled with fails start-up.
+nextgcore-demo = { workspace = true }
 log.workspace = true
 env_logger.workspace = true
 tokio.workspace = true

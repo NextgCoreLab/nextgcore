@@ -860,6 +860,14 @@ pub fn client_for_session(smf_n4_seid: u64) -> Option<Arc<PfcpClient>> {
     recorded_client(smf_n4_seid).or_else(global_client)
 }
 
+/// The PFCP client RECORDED for an existing session, with no fallback to the
+/// default client: for a caller that must not attribute another UPF's data to
+/// the session (nextgsim#471, #1523 review o3).
+#[cfg_attr(not(feature = "demo-d443a-edge-budget"), allow(dead_code))]
+pub fn recorded_client_for_session(smf_n4_seid: u64) -> Option<Arc<PfcpClient>> {
+    recorded_client(smf_n4_seid)
+}
+
 /// Pick the UPF for a NEW session (issue #20; UPF load is a TS 23.501
 /// §6.3.3 selection input).
 ///
@@ -1718,12 +1726,40 @@ impl PfcpClient {
                 // Release above; anyone else has no association here (§8.2.1).
                 // Behind the #971 gate, which refuses a stranger's Node Report with
                 // the same cause 72; any address of this UPF (§5.8.1) is its own.
+                //
+                // #1505: and only over an established association. A configured UPF
+                // the SMF has marked down (a heartbeat loss, an N1 exhaustion, a
+                // teardown) passes the gate but has none: TS 29.244 §8.2.1 cause 72
+                // "shall be used" for any message other than Association Setup and
+                // Heartbeat "from a peer with which there is no established PFCP
+                // Association". The whole report is refused, whatever its types, and
+                // nothing in it is processed; its N6 delay reports are counted, never
+                // stored, so a UPF this SMF considers down shows no current delay.
+                //
+                // The association is read under its guard and the N6 results are
+                // stored before the guard is dropped: every down transition takes the
+                // write guard and forgets the UPF's results in `publish_associated`,
+                // so no store can land after that forget.
+                let key = self.recovery_time_stamp_key();
                 let ours = self.is_node_address(from);
-                let decoded = if ours {
-                    crate::up_path::parse_node_report(body)
-                } else {
+                let assoc = self.assoc.read().await;
+                let mut decoded = if !ours {
                     Err((crate::up_path::cause::NO_ESTABLISHED_PFCP_ASSOCIATION, 0))
+                } else if !assoc.associated {
+                    if let Ok(r) = crate::up_path::parse_node_report(body) {
+                        crate::n6_delay::note_not_associated(&key, r.n6.len());
+                    }
+                    Err((crate::up_path::cause::NO_ESTABLISHED_PFCP_ASSOCIATION, 0))
+                } else {
+                    crate::up_path::parse_node_report(body)
                 };
+                if let Ok(report) = &mut decoded {
+                    let n6 = std::mem::take(&mut report.n6);
+                    if !n6.is_empty() {
+                        crate::n6_delay::on_reports(&key, &n6);
+                    }
+                }
+                drop(assoc);
                 let (cause, offending) = match &decoded {
                     Ok(_) => (crate::up_path::cause::REQUEST_ACCEPTED, None),
                     Err((cause, 0)) => (*cause, None),
@@ -1744,11 +1780,7 @@ impl PfcpClient {
                 );
                 let _ = self.socket.send_to(&resp, from).await;
                 if let Ok(report) = decoded {
-                    crate::up_path::on_node_report(
-                        &self.recovery_time_stamp_key(),
-                        self.session_scope(),
-                        report,
-                    );
+                    crate::up_path::on_node_report(&key, self.session_scope(), report);
                 }
                 true
             }

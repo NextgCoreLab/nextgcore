@@ -77,6 +77,40 @@ pub fn provision_subscriber_document(supi: &str, document: mongodb::bson::Docume
         .insert(supi.to_string(), document);
 }
 
+/// Provision a subscriber's Subscribed S-NSSAIs (#1501): `(sst, sd)` with `sd`
+/// as Mongo stores it, six hex digits. Writes the `slice` array of the
+/// subscriber's document (replacing any earlier one, other keys kept) and makes
+/// sure the subscriber exists in the identity mirror (its GPSIs kept), so
+/// `nextgcore_dbi_subscription_data` lists exactly these slices. The slices go
+/// through the Mongo parser, so an `sd` of `None` reads back as that parser
+/// reads an SD-less slice (see #1514).
+pub fn provision_subscriber_slices(supi: &str, slices: &[(u8, Option<&str>)]) {
+    enable();
+    IDENTITIES
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .entry(supi.to_string())
+        .or_default();
+    let slice: Vec<mongodb::bson::Bson> = slices
+        .iter()
+        .map(|(sst, sd)| {
+            let mut entry = mongodb::bson::doc! { "sst": i32::from(*sst) };
+            if let Some(sd) = sd {
+                entry.insert("sd", *sd);
+            }
+            mongodb::bson::Bson::Document(entry)
+        })
+        .collect();
+    DOCUMENTS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .entry(supi.to_string())
+        .or_default()
+        .insert("slice", slice);
+}
+
 /// Whether any subscriber document has been provisioned.
 pub(crate) fn documents_active() -> bool {
     DOCUMENTS.lock().unwrap().is_some()
@@ -149,10 +183,6 @@ pub fn stored_sqn(supi: &str) -> Option<u64> {
 /// as its `imsi-`. That reverse direction is what makes the UDR's
 /// `identity-data` resource able to answer GPSI-to-SUPI at all.
 pub(crate) fn subscription_data(id: &str) -> DbiResult<crate::types::NextgcoreSubscriptionData> {
-    let guard = IDENTITIES.lock().unwrap();
-    let map = guard
-        .as_ref()
-        .ok_or_else(|| DbiError::SubscriberNotFound(id.to_string()))?;
     let value = crate::types::nextgcore_id_get_value(id)
         .ok_or_else(|| DbiError::InvalidSupi(id.to_string()))?;
     // `{extid: <value>}` reads only the `extid` field in Mongo, so an `extid-`
@@ -160,28 +190,53 @@ pub(crate) fn subscription_data(id: &str) -> DbiResult<crate::types::NextgcoreSu
     // them).
     let by_extid = crate::types::nextgcore_id_get_type(id).as_deref()
         == Some(crate::types::NEXTGCORE_EXTID_STRING);
-    let hit = map
-        .iter()
-        .find(|(supi, ids)| {
-            if by_extid {
-                ids.external_ids.iter().any(|e| e == &value)
-            } else {
-                crate::types::nextgcore_id_get_value(supi).as_deref() == Some(value.as_str())
-                    || ids.msisdns.iter().any(|m| m == &value)
-            }
-        })
-        .map(|(supi, ids)| (supi.clone(), ids.clone()))
-        .ok_or_else(|| DbiError::SubscriberNotFound(id.to_string()))?;
+    let identity = IDENTITIES.lock().unwrap().as_ref().and_then(|map| {
+        map.iter()
+            .find(|(supi, ids)| {
+                if by_extid {
+                    ids.external_ids.iter().any(|e| e == &value)
+                } else {
+                    crate::types::nextgcore_id_get_value(supi).as_deref() == Some(value.as_str())
+                        || ids.msisdns.iter().any(|m| m == &value)
+                }
+            })
+            .map(|(supi, ids)| (supi.clone(), ids.clone()))
+    }); // IDENTITIES is released here: never held while taking DOCUMENTS
 
-    let mut data = crate::types::NextgcoreSubscriptionData::new();
-    data.imsi = crate::types::nextgcore_id_get_value(&hit.0);
-    for bcd in &hit.1.msisdns {
-        let mut msisdn = crate::types::NextgcoreMsisdn::default();
-        msisdn.bcd = bcd.clone();
-        data.msisdn.push(msisdn);
+    // One subscriber, one Mongo document: the provisioned document (#1383, #1501,
+    // #1526) is parsed by the Mongo parser, so it supplies every field it carries
+    // (`ambr`, `slice`, ...), and the identity, when provisioned, answers the
+    // identity fields on top of it. Neither hides the other.
+    let supi = identity
+        .as_ref()
+        .map(|(supi, _)| supi.clone())
+        .unwrap_or_else(|| id.to_string());
+    let document = if by_extid && identity.is_none() {
+        None
+    } else {
+        subscriber_document(&supi).ok()
+    };
+    if identity.is_none() && document.is_none() {
+        return Err(DbiError::SubscriberNotFound(id.to_string()));
     }
-    data.num_of_msisdn = data.msisdn.len();
-    data.external_ids = hit.1.external_ids;
+    let mut data = document
+        .as_ref()
+        .map(crate::subscription::parse_subscription_document)
+        .unwrap_or_else(crate::types::NextgcoreSubscriptionData::new);
+    if let Some((supi, ids)) = identity {
+        data.imsi = crate::types::nextgcore_id_get_value(&supi);
+        data.msisdn = ids
+            .msisdns
+            .iter()
+            .map(|bcd| {
+                let mut msisdn = crate::types::NextgcoreMsisdn::default();
+                msisdn.bcd = bcd.clone();
+                msisdn
+            })
+            .collect();
+        data.num_of_msisdn = data.msisdn.len();
+        data.external_ids = ids.external_ids;
+    }
     Ok(data)
 }
 
@@ -333,6 +388,35 @@ mod tests {
         assert!(!created, "existing subscriber must be updated, not created");
         assert_eq!(super::stored_sqn(supi), Some(0x40));
     }
+    /// #1501: provisioned Subscribed S-NSSAIs come back from the subscription read,
+    /// through the Mongo parser (SD hex included), for the SUPI and for its GPSI;
+    /// a subscriber provisioned without slices lists none.
+    #[test]
+    fn provisioned_subscribed_snssais_answer_the_subscription_read() {
+        use crate::subscription::nextgcore_dbi_subscription_data;
+
+        let supi = "imsi-999990000001501";
+        super::provision_subscriber(supi, &["999991501"]);
+        super::provision_subscriber_slices(supi, &[(1, Some("010203")), (2, Some("0a0b0c"))]);
+        for id in [supi, "msisdn-999991501"] {
+            let data = nextgcore_dbi_subscription_data(id).expect("provisioned subscriber");
+            let got: Vec<(u8, u32)> = data
+                .slice
+                .iter()
+                .map(|s| (s.s_nssai.sst, s.s_nssai.sd.v))
+                .collect();
+            assert_eq!(got, vec![(1, 0x010203), (2, 0x0a0b0c)], "{id}");
+            assert_eq!(data.num_of_slice, 2);
+            // The GPSI provisioned first is kept.
+            assert_eq!(data.msisdn.len(), 1, "{id}");
+        }
+
+        let bare = "imsi-999990000001502";
+        super::provision_subscriber(bare, &[]);
+        let data = nextgcore_dbi_subscription_data(bare).expect("provisioned subscriber");
+        assert!(data.slice.is_empty());
+    }
+
     /// #1383: the document mirror answers `nextgcore_dbi_session_data` through the
     /// REAL slice/DNN match and parser -- a provisioned 5QI and AMBR come back as the
     /// Mongo path would parse them, another DNN is `SessionNotFound`, an unknown

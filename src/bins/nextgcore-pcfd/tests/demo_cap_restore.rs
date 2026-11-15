@@ -90,6 +90,7 @@ async fn a_restarted_pcfd_restores_a_demo_capped_session() {
             writer: "d441a-congestion-loop".into(),
             uplink_bps: 1_000_000,
             downlink_bps: 1_000_000,
+            generation: 1,
         });
         assert!(ctx.sess_update(&sess));
     }

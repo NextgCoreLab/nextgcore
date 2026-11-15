@@ -691,9 +691,7 @@ impl EesContext {
                 let notif = EasDiscoveryNotification {
                     sub_id: id.clone(),
                     event_type: EAS_AVAILABILITY_CHANGE.to_string(),
-                    discovered_eas: vec![DiscoveredEas {
-                        eas: changed.clone(),
-                    }],
+                    discovered_eas: vec![DiscoveredEas::of(changed.clone())],
                 };
                 if let Ok(body) = serde_json::to_value(&notif) {
                     // #105: `notificationDestination` is OPTIONAL, so a subscription may carry

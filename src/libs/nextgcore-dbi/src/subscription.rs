@@ -472,11 +472,13 @@ pub fn nextgcore_dbi_update_mme(
 pub fn nextgcore_dbi_subscription_data(supi: &str) -> DbiResult<NextgcoreSubscriptionData> {
     let (supi_type, supi_id) = nextgcore_ue_id_key(supi)?;
 
-    // #87: the identity mirror answers only when a test has provisioned one, so
-    // enabling the store for the authentication tests leaves every other
-    // handler's view of the subscriber DB unchanged.
+    // #87: the mirror answers only when a test has provisioned identities or
+    // subscriber documents, so enabling the store for the authentication tests
+    // leaves every other handler's view of the subscriber DB unchanged. #1526: the
+    // identity and the document are one subscriber, merged as Mongo's single
+    // document would be (`test_store::subscription_data`).
     #[cfg(any(test, feature = "test-helpers"))]
-    if crate::test_store::identities_active() {
+    if crate::test_store::identities_active() || crate::test_store::documents_active() {
         return crate::test_store::subscription_data(supi);
     }
 
@@ -487,6 +489,12 @@ pub fn nextgcore_dbi_subscription_data(supi: &str) -> DbiResult<NextgcoreSubscri
         .find_one(query, None)?
         .ok_or_else(|| DbiError::SubscriberNotFound(supi.to_string()))?;
 
+    Ok(parse_subscription_document(&document))
+}
+
+/// The [`NextgcoreSubscriptionData`] of one `subscribers` document, shared by the
+/// Mongo read and the test mirror's document store.
+pub(crate) fn parse_subscription_document(document: &Document) -> NextgcoreSubscriptionData {
     let mut subscription_data = NextgcoreSubscriptionData::new();
 
     // Parse IMSI
@@ -512,7 +520,7 @@ pub fn nextgcore_dbi_subscription_data(supi: &str) -> DbiResult<NextgcoreSubscri
     }
 
     // Parse the External Identifier(s) (nextgsim#480): a string or an array.
-    subscription_data.external_ids = parse_external_ids(&document);
+    subscription_data.external_ids = parse_external_ids(document);
 
     // Parse access restriction data
     if let Ok(ard) = document.get_i32(NEXTGCORE_ACCESS_RESTRICTION_DATA_STRING) {
@@ -554,19 +562,7 @@ pub fn nextgcore_dbi_subscription_data(supi: &str) -> DbiResult<NextgcoreSubscri
     }
 
     // Parse slice array
-    if let Ok(slice_array) = document.get_array(NEXTGCORE_SLICE_STRING) {
-        for slice_val in slice_array {
-            if subscription_data.num_of_slice >= NEXTGCORE_MAX_NUM_OF_SLICE {
-                break;
-            }
-            if let Bson::Document(slice_doc) = slice_val {
-                if let Some(slice_data) = parse_slice_data(slice_doc) {
-                    subscription_data.slice.push(slice_data);
-                    subscription_data.num_of_slice += 1;
-                }
-            }
-        }
-    }
+    parse_subscribed_slices(document, &mut subscription_data);
 
     // Parse MME host
     if let Ok(mme_host) = document.get_str(NEXTGCORE_MME_HOST_STRING) {
@@ -583,7 +579,7 @@ pub fn nextgcore_dbi_subscription_data(supi: &str) -> DbiResult<NextgcoreSubscri
         subscription_data.purge_flag = purge_flag;
     }
 
-    Ok(subscription_data)
+    subscription_data
 }
 
 // ============================================================================
@@ -771,6 +767,25 @@ fn parse_qos(doc: &Document) -> NextgcoreQos {
     qos
 }
 
+/// Parse a subscriber document's `slice` array into `data.slice` (at most
+/// `NEXTGCORE_MAX_NUM_OF_SLICE`; entries without an `sst` are skipped). Shared by
+/// the MongoDB reads and the test store's mirror, so both parse one shape.
+pub(crate) fn parse_subscribed_slices(document: &Document, data: &mut NextgcoreSubscriptionData) {
+    if let Ok(slice_array) = document.get_array(NEXTGCORE_SLICE_STRING) {
+        for slice_val in slice_array {
+            if data.num_of_slice >= NEXTGCORE_MAX_NUM_OF_SLICE {
+                break;
+            }
+            if let Bson::Document(slice_doc) = slice_val {
+                if let Some(slice_data) = parse_slice_data(slice_doc) {
+                    data.slice.push(slice_data);
+                    data.num_of_slice += 1;
+                }
+            }
+        }
+    }
+}
+
 /// Parse slice data from BSON document
 fn parse_slice_data(doc: &Document) -> Option<NextgcoreSliceData> {
     let mut slice_data = NextgcoreSliceData::default();
@@ -947,19 +962,7 @@ pub fn nextgcore_dbi_policy_subscription(supi: &str) -> DbiResult<NextgcoreSubsc
     }
 
     // Parse slice data for policy rules
-    if let Ok(slice_array) = document.get_array(NEXTGCORE_SLICE_STRING) {
-        for slice_val in slice_array {
-            if subscription_data.num_of_slice >= NEXTGCORE_MAX_NUM_OF_SLICE {
-                break;
-            }
-            if let Bson::Document(slice_doc) = slice_val {
-                if let Some(slice_data) = parse_slice_data(slice_doc) {
-                    subscription_data.slice.push(slice_data);
-                    subscription_data.num_of_slice += 1;
-                }
-            }
-        }
-    }
+    parse_subscribed_slices(&document, &mut subscription_data);
 
     Ok(subscription_data)
 }
