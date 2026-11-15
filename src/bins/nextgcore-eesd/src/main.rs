@@ -96,6 +96,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use nextgcore_sbi::callback_auth::OAuth2CallbackExemption;
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
 use nextgcore_sbi::server::{
     send_bad_request, send_error, send_method_not_allowed, send_not_found, SbiServer,
@@ -416,6 +417,10 @@ async fn main() -> Result<()> {
         sbi_server_config = sbi_server_config.with_tls(key, cert);
     }
 
+    // #1525: the callback routes admitted without a bearer, registered with the
+    // shared mechanism (#1519) on the server AND consulted by eesd's per-route
+    // gate (`auth::require_oauth2`), which is the one eesd actually runs.
+    let sbi_server_config = install_callback_exemptions(sbi_server_config);
     let sbi_server = SbiServer::new(sbi_server_config);
 
     log::info!("Starting EES SBI server on {addr}");
@@ -500,6 +505,44 @@ fn request_log_uri(uri: &str) -> std::borrow::Cow<'_, str> {
     } else {
         std::borrow::Cow::Borrowed(uri)
     }
+}
+
+/// The callback routes this EES serves that a notification reaches without a
+/// bearer (TS 33.501 §13.4.1: OAuth 2.0 does not apply to the notification
+/// operation; TS 29.500 §6.10.7 NOTE), each authenticated by its own callback
+/// token instead (#1525, over #1519's shared `OAuth2CallbackExemption`).
+///
+/// Only demo d443a-edge-budget's QOS_MON notify route today, and only while the
+/// demo serves it (feature built AND demo on): with the demo off the route does
+/// not exist and the list is empty, so every route needs a bearer. Its check is
+/// `edge_budget::token_is_current`, so a wrong, stale or missing path token is
+/// still held to the bearer.
+fn oauth2_callback_exemptions() -> Vec<OAuth2CallbackExemption> {
+    #[cfg(feature = "demo-d443a-edge-budget")]
+    if edge_budget::serving() {
+        return vec![OAuth2CallbackExemption::new(
+            "POST",
+            format!(
+                "/{}/{}/{{token}}",
+                edge_budget::ROUTE_ROOT,
+                edge_budget::ROUTE_QOS_MON
+            ),
+            |cb| edge_budget::token_is_current(cb.token),
+        )];
+    }
+    Vec::new()
+}
+
+/// Register [`oauth2_callback_exemptions`] where they take effect: on the
+/// server config (the shared gate, #1519) and in eesd's per-route gate (#1525).
+/// After `edge_budget::install`, so the demo's route is listed only when served.
+fn install_callback_exemptions(cfg: NextgcoreSbiServerConfig) -> NextgcoreSbiServerConfig {
+    let exemptions = oauth2_callback_exemptions();
+    for route in exemptions.iter().map(OAuth2CallbackExemption::route) {
+        log::info!("OAuth2 callback exemption (TS 33.501 §13.4.1): {route}");
+    }
+    auth::set_callback_exemptions(exemptions.clone());
+    cfg.with_oauth2_callback_exemptions(exemptions)
 }
 
 /// EES SBI request handler.
@@ -906,10 +949,10 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // shadow an EES one; `route` returns None with the role off, which leaves
         // the 404 below in charge exactly as before.
         // nextgsim#471: the demo's QOS_MON notification route, only with the demo
-        // on. Behind the per-operation OAuth2 gate like every route here; the
-        // path token is checked in addition. No NF-local exemption: a token-less
-        // notify (TS 33.501 §13.4.1) is admitted only once the route is
-        // registered through the shared callback exemption (nextgcore#1421).
+        // on. Through the per-operation OAuth2 gate like every route here, which
+        // admits a token-less notify (TS 33.501 §13.4.1) only through the
+        // route's registered callback exemption, i.e. on the current path token
+        // (#1525); the path token is checked again below in any case.
         #[cfg(feature = "demo-d443a-edge-budget")]
         [edge_budget::ROUTE_ROOT, edge_budget::ROUTE_QOS_MON, token] if edge_budget::serving() => {
             if let Some(resp) = auth::require_oauth2(&request, edge_budget::SCOPE) {
