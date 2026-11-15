@@ -408,8 +408,8 @@ async fn deliver(client: &PfcpClient, upf: &UdpSocket, pkt: &[u8]) -> (Option<u8
 /// report drops that endpoint's value and is counted.
 ///
 /// REVERT-VERIFIED: without the N6DR arm in `parse_node_report` (or the
-/// `on_reports` call in `on_node_report`), nothing is stored and the metric is
-/// absent.
+/// `on_reports` call in the Node Report arm of `on_datagram`), nothing is stored and
+/// the metric is absent.
 #[tokio::test]
 async fn an_n6dr_node_report_is_stored_and_exported_1502() {
     let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
@@ -716,6 +716,190 @@ async fn a_heartbeat_loss_forgets_the_upfs_n6_results_1502() {
     assert!(!metrics.contains(&format!("upf=\"{key}\"")), "{metrics}");
 }
 
+/// Answer the next Association Setup Request the stand-in UPF on `upf` receives,
+/// accepted, advertising F-TEID allocation only (no UN6DM, so no Update follows).
+async fn answer_one_setup(upf: &UdpSocket) {
+    let mut buf = vec![0u8; 4096];
+    let (len, from) =
+        tokio::time::timeout(std::time::Duration::from_secs(2), upf.recv_from(&mut buf))
+            .await
+            .expect("an Association Setup Request")
+            .unwrap();
+    let h = parse_wire_header(&buf[..len]).unwrap();
+    assert_eq!(h.msg_type, pfcp_message_type::ASSOCIATION_SETUP_REQUEST);
+    let mut resp = AssociationSetupResponse::new(
+        NodeId::new_ipv4([127, 0, 0, 4]),
+        PfcpCause::RequestAccepted,
+        0x1505,
+    );
+    resp.up_function_features = Some(UpFunctionFeatures {
+        ftup: true,
+        ..Default::default()
+    });
+    let reply = nextgcore_pfcp::message::build_message(
+        &PfcpMessage::AssociationSetupResponse(resp),
+        h.sequence_number,
+        None,
+    );
+    upf.send_to(&reply, from).await.unwrap();
+}
+
+/// #1505, TS 29.244 §8.2.1 cause 72: after a heartbeat loss marks the UPF down, a
+/// well-formed N6DR Node Report from it is refused with "No established PFCP
+/// Association" (no Offending IE), nothing is stored or exported for it, and it is
+/// counted under `reason="not_associated"`. Once the UPF is associated again, its next
+/// report is accepted and stored.
+///
+/// REVERT-VERIFIED: without the association check in the Node Report arm of
+/// `on_datagram`, the report is accepted (cause 1) and stored, and the counter stays
+/// 0; without the `note_not_associated` call, the counter stays 0.
+#[tokio::test]
+async fn a_report_from_a_upf_marked_down_is_refused_and_not_stored_1505() {
+    let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _n4 = crate::pfcp_path::N4_TEST_LOCK.lock().await;
+    let _n6 = N6_TEST_LOCK.lock().await;
+    reset_for_test();
+    set_config(Some(yaml(DEMO_BLOCK).unwrap()));
+    let (client, upf) =
+        client_with_silent_peer_timed(std::time::Duration::from_millis(50), 1).await;
+    client.set_assoc_state_for_test(true, None, None).await;
+    let local: IpAddr = "10.60.0.11".parse().unwrap();
+    let report = |seq| {
+        node_report(
+            seq,
+            0x40,
+            &[report_ie([10, 60, 0, 11], Some((9, 8, 11)), None)],
+        )
+    };
+
+    // Heartbeat loss: the silent peer exhausts T1 x (N1 + 1) and the UPF is down.
+    let heartbeat = client.heartbeat_once().await;
+    let down = !client.is_associated().await;
+    // The unanswered Heartbeat Requests (the first and its retransmission).
+    let mut buf = vec![0u8; 2048];
+    let mut heartbeats = 0;
+    while let Ok(Ok((len, _))) = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        upf.recv_from(&mut buf),
+    )
+    .await
+    {
+        assert_eq!(
+            parse_wire_header(&buf[..len]).unwrap().msg_type,
+            pfcp_message_type::HEARTBEAT_REQUEST
+        );
+        heartbeats += 1;
+    }
+    let key_down = client.recovery_time_stamp_key();
+    let while_down = deliver(&client, &upf, &report(1)).await;
+    let stored_while_down = store_sizes_for_test();
+    let metrics_down = crate::render_metrics();
+
+    // Re-association, through the real Association Setup.
+    let c = client.clone();
+    let associating = tokio::spawn(async move { associate_and_provision(&c).await.map(drop) });
+    answer_one_setup(&upf).await;
+    let reassociated = associating.await.unwrap();
+    let up = client.is_associated().await;
+    let key_up = client.recovery_time_stamp_key();
+    let after = deliver(&client, &upf, &report(2)).await;
+    let stored_after = result_for_test(&key_up, local);
+    let metrics_up = crate::render_metrics();
+    reset_for_test();
+
+    assert!(heartbeat.is_err(), "the silent peer exhausts the heartbeat");
+    assert!(down, "the heartbeat loss marks the UPF down");
+    assert_eq!(heartbeats, 2, "T1 x (N1 + 1)");
+    assert_eq!(
+        while_down,
+        (Some(72), None),
+        "No established PFCP Association"
+    );
+    assert_eq!(stored_while_down, (0, 0), "nothing stored while down");
+    assert!(
+        !metrics_down.contains(&format!("upf=\"{key_down}\"")),
+        "{metrics_down}"
+    );
+    assert!(
+        metrics_down.contains("smf_n6_delay_reports_ignored_total{reason=\"not_associated\"} 1"),
+        "{metrics_down}"
+    );
+    assert!(
+        metrics_down.contains("smf_n6_delay_reports_ignored_total{reason=\"unprovisioned\"} 0"),
+        "{metrics_down}"
+    );
+
+    assert!(reassociated.is_ok(), "{reassociated:?}");
+    assert!(up, "associated again");
+    assert_eq!(after, (Some(1), None), "accepted again");
+    assert_eq!(stored_after.map(|m| m.average_ms), Some(9), "stored again");
+    assert!(
+        metrics_up.contains(&format!(
+            "smf_n6_delay_ms{{upf=\"{key_up}\",endpoint=\"10.60.0.11\",stat=\"avg\"}} 9"
+        )),
+        "{metrics_up}"
+    );
+    assert!(
+        metrics_up.contains("smf_n6_delay_reports_ignored_total{reason=\"not_associated\"} 1"),
+        "a counter, not a gauge: {metrics_up}"
+    );
+}
+
+/// #1505, TS 29.244 §8.2.1 cause 72 applies to the Node Report whatever its type: a
+/// User Plane Path Failure Report from a configured UPF that is not associated is
+/// refused and the path is not recorded failed; once associated, the same report is
+/// accepted and recorded.
+///
+/// REVERT-VERIFIED: without the association check in the Node Report arm of
+/// `on_datagram`, the first report is accepted and the path recorded failed.
+#[tokio::test]
+async fn a_path_failure_report_without_an_association_is_refused_1505() {
+    let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+    let _n4 = crate::pfcp_path::N4_TEST_LOCK.lock().await;
+    let _n6 = N6_TEST_LOCK.lock().await;
+    reset_for_test();
+    let (client, upf) = client_with_silent_peer().await;
+    let key = client.recovery_time_stamp_key();
+    let peer: IpAddr = "10.15.5.1".parse().unwrap();
+    // UPFR (0x01): IE 102 carrying one Remote GTP-U Peer (IE 103, V4).
+    let upfr = |seq| {
+        node_report(
+            seq,
+            0x01,
+            &[vec![0, 102, 0, 9, 0, 103, 0, 5, 0x02, 10, 15, 5, 1]],
+        )
+    };
+
+    let down = deliver(&client, &upf, &upfr(1)).await;
+    let failed_while_down = crate::up_path::is_failed(&key, peer);
+    client.set_assoc_state_for_test(true, None, None).await;
+    let up = deliver(&client, &upf, &upfr(2)).await;
+    let failed_while_up = crate::up_path::is_failed(&key, peer);
+    // Clean up: the path recovers (UPRR, 0x02, IE 187).
+    let recovered = deliver(
+        &client,
+        &upf,
+        &node_report(
+            3,
+            0x02,
+            &[vec![0, 187, 0, 9, 0, 103, 0, 5, 0x02, 10, 15, 5, 1]],
+        ),
+    )
+    .await;
+    let failed_after = crate::up_path::is_failed(&key, peer);
+    reset_for_test();
+
+    assert_eq!(down, (Some(72), None), "No established PFCP Association");
+    assert!(
+        !failed_while_down,
+        "nothing processed without an association"
+    );
+    assert_eq!(up, (Some(1), None));
+    assert!(failed_while_up);
+    assert_eq!(recovered, (Some(1), None));
+    assert!(!failed_after);
+}
+
 /// #1502 review M3: a report naming an endpoint this SMF did not provision is
 /// accepted (TS 29.244 §6.2.9.3; no §8.2.1 cause fits a well-formed unrequested
 /// report) but neither stored nor exported, only counted, so a UPF naming many
@@ -749,7 +933,8 @@ async fn reports_for_unprovisioned_endpoints_are_ignored_and_counted_1502() {
         .count();
     assert_eq!(series, 3, "avg/min/max of 10.60.0.11 only");
     assert!(!metrics.contains("10.99.0."));
-    assert!(metrics.contains("smf_n6_delay_reports_ignored_total 200"));
+    assert!(metrics.contains("smf_n6_delay_reports_ignored_total{reason=\"unprovisioned\"} 200"));
+    assert!(metrics.contains("smf_n6_delay_reports_ignored_total{reason=\"not_associated\"} 0"));
 }
 
 /// #1502 review M3: without the block, a valid N6DR report is still answered, but
