@@ -6453,6 +6453,134 @@ mod tests_allowed_nssai_derivation {
         with_nssf_context(|c| c.nsi_remove_all());
     }
 
+    /// #1501: a `supi` whose subscription lists the requested S-NSSAI is
+    /// confirmed, and the selection is answered 200 with the configured NSI's
+    /// NRF in `nsiInformation` (§5.2.2.2.3 step 2a) and the S-NSSAI in
+    /// `allowedNssaiList`. A different SD in the same SST is not confirmed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
+    async fn pdu_session_selection_with_a_confirmed_subscription_is_answered() {
+        let _guard = context::nssf_test_guard(512);
+        let supi = "imsi-001011501000001";
+        nextgcore_dbi::test_store::provision_subscriber_slices(supi, &[(9, Some("000901"))]);
+        with_nssf_context(|c| {
+            c.nsi_add("http://nrf-slice-9:7777", 9, Some(0x000901));
+            c.nsi_add("http://nrf-slice-9b:7777", 9, Some(0x000902));
+        })
+        .expect("context available");
+
+        let si = json!({"sNssai": {"sst": 9, "sd": "000901"}, "roamingIndication": "NON_ROAMING"});
+        let resp = handle_ns_selection_pdu_session(
+            "amf-1501",
+            "AMF",
+            &si,
+            None,
+            Some(supi.to_string()),
+            None,
+        )
+        .await;
+        let body = body_of(&resp);
+        assert_eq!(resp.status, 200, "{body}");
+        assert_eq!(
+            body["nsiInformation"]["nrfId"], "http://nrf-slice-9:7777",
+            "{body}"
+        );
+        assert_eq!(
+            body["allowedNssaiList"][0]["allowedSnssaiList"][0]["allowedSnssai"],
+            json!({"sst": 9, "sd": "000901"}),
+            "{body}"
+        );
+
+        // Same SST, an SD the subscription does not list, NSI configured.
+        let other =
+            json!({"sNssai": {"sst": 9, "sd": "000902"}, "roamingIndication": "NON_ROAMING"});
+        let resp = handle_ns_selection_pdu_session(
+            "amf-1501",
+            "AMF",
+            &other,
+            None,
+            Some(supi.to_string()),
+            None,
+        )
+        .await;
+        let body = body_of(&resp);
+        assert_eq!(resp.status, 403, "{body}");
+        assert_eq!(body["cause"], "SNSSAI_NOT_SUPPORTED", "{body}");
+
+        with_nssf_context(|c| c.nsi_remove_all());
+    }
+
+    /// #1501: home-routed, the subscription lists HPLMN S-NSSAIs, so it is
+    /// `homeSnssai` that is compared, not the serving `sNssai`. The two values
+    /// differ here: a subscription listing only the home value is confirmed
+    /// (200 with the home network's NRF), one listing only the serving value is
+    /// not (403).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
+    async fn a_home_routed_request_is_confirmed_against_the_home_snssai() {
+        let _guard = context::nssf_test_guard(512);
+        let home_supi = "imsi-001011501000002";
+        let serving_supi = "imsi-001011501000003";
+        nextgcore_dbi::test_store::provision_subscriber_slices(home_supi, &[(7, Some("070707"))]);
+        nextgcore_dbi::test_store::provision_subscriber_slices(
+            serving_supi,
+            &[(6, Some("060606"))],
+        );
+        let home_plmn = context::PlmnId::new("001", "01");
+        let home_snssai = context::SNssai::new(7, Some(0x070707));
+        with_nssf_context(|c| {
+            c.nsi_add("http://nrf-serving-6:7777", 6, Some(0x060606));
+            // A cached H-NSSF answer, so the confirmed request is answered from
+            // it rather than by a query to the home network.
+            let mut home = c.home_add(&home_plmn, &home_snssai).expect("home added");
+            home.nrf_id = Some("http://nrf-home-7:7777".to_string());
+            home.nsi_id = Some("nsi-home-7".to_string());
+            assert!(c.home_update(&home));
+        })
+        .expect("context available");
+
+        let si = json!({
+            "sNssai": {"sst": 6, "sd": "060606"},
+            "homeSnssai": {"sst": 7, "sd": "070707"},
+            "homePlmnId": {"mcc": "001", "mnc": "01"},
+            "roamingIndication": ROAMING_HOME_ROUTED
+        });
+        let resp = handle_ns_selection_pdu_session(
+            "vnssf-1501",
+            "NSSF",
+            &si,
+            None,
+            Some(home_supi.to_string()),
+            None,
+        )
+        .await;
+        let body = body_of(&resp);
+        assert_eq!(resp.status, 200, "{body}");
+        assert_eq!(
+            body["nsiInformation"]["nrfId"], "http://nrf-home-7:7777",
+            "{body}"
+        );
+        assert_eq!(body["nsiInformation"]["nsiId"], "nsi-home-7", "{body}");
+
+        let resp = handle_ns_selection_pdu_session(
+            "vnssf-1501",
+            "NSSF",
+            &si,
+            None,
+            Some(serving_supi.to_string()),
+            None,
+        )
+        .await;
+        let body = body_of(&resp);
+        assert_eq!(resp.status, 403, "{body}");
+        assert_eq!(body["cause"], "SNSSAI_NOT_SUPPORTED", "{body}");
+
+        with_nssf_context(|c| {
+            c.nsi_remove_all();
+            c.home_remove_all();
+        });
+    }
+
     /// An S-NSSAI nobody reports as available in the consumer's TAI is refused,
     /// including when the availability data covers other TAIs only -- the
     /// unknown-TAI case, where the per-TAI list comes back empty. The
