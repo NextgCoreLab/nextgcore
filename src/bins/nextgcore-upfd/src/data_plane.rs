@@ -1093,6 +1093,33 @@ impl DataPlaneQer {
         };
     }
 
+    /// Apply an Update QER (#1478, TS 29.244 Table 7.5.4.5-1): each IE it carries
+    /// replaces that value; an absent IE leaves it as it is. A rate that is not
+    /// changed keeps its token bucket.
+    pub fn apply_update(&mut self, u: &crate::n4_build::ParsedUpdateQer) {
+        if let Some((ul, dl)) = u.gate {
+            self.ul_gate_open = ul == 0;
+            self.dl_gate_open = dl == 0;
+        }
+        if let Some((ul, dl)) = u.mbr {
+            self.set_mbr(ul, dl);
+        }
+        if let Some((ul, dl)) = u.gbr {
+            self.set_gbr(ul, dl);
+        }
+        if let Some(rqi) = u.rqi {
+            self.rqi = rqi;
+        }
+        if u.ppi.is_some() {
+            self.ppi = u.ppi;
+        }
+        // The XR flag and DSCP follow the QFI and the GBR (set_qfi), so they are
+        // recomputed when either changes.
+        if let Some(qfi) = u.qfi.or(self.qfi) {
+            self.set_qfi(qfi);
+        }
+    }
+
     /// Rate-gate a packet against this QER (TS 29.244 5.4.1 QoS enforcement).
     ///
     /// A packet within the GBR token bucket is always allowed (the guaranteed
@@ -6468,6 +6495,54 @@ mod tests {
         assert!(qer.check_rate(1000, true));
         // GBR bucket nearly empty; MBR also consumed — large packet dropped
         assert!(!qer.check_rate(5000, true));
+    }
+
+    /// #1478 (TS 29.244 Table 7.5.4.5-1): `apply_update` changes only what the Update
+    /// QER carries. RQI, PPI, the gates and the rates survive an Update without
+    /// them; a new GBR re-derives the XR flag from the kept QFI.
+    #[test]
+    fn an_update_qer_keeps_every_value_it_does_not_carry_1478() {
+        let mut qer = DataPlaneQer::new(1);
+        qer.ul_gate_open = false;
+        qer.rqi = true;
+        qer.ppi = Some(4);
+        qer.set_mbr(64, 128);
+        qer.set_qfi(9);
+        assert!(!qer.is_xr);
+
+        qer.apply_update(&crate::n4_build::ParsedUpdateQer {
+            qer_id: 1,
+            gbr: Some((32, 32)),
+            ..Default::default()
+        });
+        assert!(!qer.ul_gate_open && qer.dl_gate_open, "gates kept");
+        assert!(qer.rqi, "RQI kept");
+        assert_eq!(qer.ppi, Some(4), "PPI kept");
+        assert_eq!((qer.ul_mbr, qer.dl_mbr), (64, 128), "MBR kept");
+        assert_eq!(
+            (qer.ul_gbr, qer.qfi),
+            (32, Some(9)),
+            "GBR applied, QFI kept"
+        );
+        assert!(qer.is_xr, "a GBR flow is XR (set_qfi re-derived it)");
+        // The kept MBR still polices: its bucket holds at most 1500 B (the burst
+        // floor), so a 1501 B packet never fits, however long the runner takes.
+        assert!(
+            !qer.check_rate(1501, true),
+            "the 64 kbps cap stands (unlimited would pass it)"
+        );
+
+        qer.apply_update(&crate::n4_build::ParsedUpdateQer {
+            qer_id: 1,
+            gate: Some((0, 1)),
+            rqi: Some(false),
+            ..Default::default()
+        });
+        assert!(
+            qer.ul_gate_open && !qer.dl_gate_open,
+            "gates it carries applied"
+        );
+        assert!(!qer.rqi);
     }
 
     #[test]
