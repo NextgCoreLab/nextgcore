@@ -41,6 +41,8 @@ pub mod nudr_handler;
 pub mod pcf_sm;
 pub mod policy_data_sub; // #1458: the UDR policy-data subscription maintainer
 pub mod sbi_path;
+/// #1402: the operator setting `pcf.policy.session_ambr_cap`.
+pub mod session_ambr_cap;
 pub mod sm_policy_build;
 pub mod timer;
 pub mod ue_policy; // Rel-16: URSP rule provisioning (TS 23.503)
@@ -124,6 +126,37 @@ pub mod test_support {
         UePolicyDeliveryEnv {
             previous,
             _guard: guard,
+        }
+    }
+
+    /// `pcf.policy.session_ambr_cap` pinned to `cap` for as long as the returned
+    /// guard lives (#1402). Holds [`crate::session_ambr_cap::SESSION_AMBR_CAP_LOCK`],
+    /// so no other test can change the setting underneath the holder, and restores
+    /// the previous value on drop. Every test that sets the setting, or whose
+    /// assertions depend on it, takes one of these. Taken AFTER `CONTEXT_GUARD` by
+    /// tests that hold both.
+    pub fn session_ambr_cap(cap: crate::session_ambr_cap::SessionAmbrCap) -> SessionAmbrCapGuard {
+        let guard = crate::session_ambr_cap::SESSION_AMBR_CAP_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = crate::session_ambr_cap::get();
+        crate::session_ambr_cap::set(cap);
+        SessionAmbrCapGuard {
+            previous,
+            _guard: guard,
+        }
+    }
+
+    /// Guard returned by [`session_ambr_cap`].
+    pub struct SessionAmbrCapGuard {
+        previous: crate::session_ambr_cap::SessionAmbrCap,
+        // Declared last so it drops after `Drop::drop` has restored the setting.
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for SessionAmbrCapGuard {
+        fn drop(&mut self) {
+            crate::session_ambr_cap::set(self.previous);
         }
     }
 

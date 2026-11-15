@@ -801,10 +801,12 @@ fn build_sm_policy_notification(
         );
         return None;
     };
-    // nextgsim#465: the decision carries min(subscribed, active demo caps); the
-    // returned session data stays the subscription-derived one, so a later
-    // fallback re-evaluation re-applies whatever cap is then in force.
-    let effective = effective_session_data(&sess.sm_policy_id, &sd);
+    // #1402: the decision's Session-AMBR is capped by the session's subscribed one
+    // per `pcf.policy.session_ambr_cap`, exactly as the create's and SE_AMBR_CH's
+    // are; nextgsim#465: then by any active demo cap. The returned session data
+    // stays the subscription-derived one, so a later fallback re-evaluation
+    // re-applies whatever caps are then in force.
+    let effective = decision_session_data(sess, &sd);
     let parts = crate::sm_policy_build::build_sm_policy_decision(&sess.sm_policy_id, &effective);
     let mut chg_decs = parts.chg_decs;
     // #299: overlay the UDR's SmPolicyDnnData charging flags, exactly as the
@@ -823,6 +825,21 @@ fn build_sm_policy_notification(
         },
     });
     Some((body, sd))
+}
+
+/// The session data the decision for `sess` is built from (#1402): `sd` with its
+/// Session-AMBR capped by the session's subscribed Session-AMBR per
+/// `pcf.policy.session_ambr_cap` ([`crate::session_ambr_cap::apply`]), then lowered
+/// to any active override cap ([`effective_session_data`]). The create, the
+/// UpdateNotify and the GET build from it, so they answer the same Session-AMBR;
+/// the `SE_AMBR_CH` arm applies the same two steps around the bound it was just
+/// told.
+pub(crate) fn decision_session_data(
+    sess: &crate::context::PcfSess,
+    sd: &crate::nudr_handler::SessionData,
+) -> crate::nudr_handler::SessionData {
+    let capped = crate::session_ambr_cap::apply(sd, sess.subscribed_sess_ambr.as_ref());
+    effective_session_data(&sess.sm_policy_id, &capped)
 }
 
 /// The session data a decision for `sm_policy_id` is built from: `sd` with its
