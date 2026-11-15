@@ -303,8 +303,25 @@ pub fn set_config(config: Option<N6DelayConfig>) {
 }
 
 /// Reports ignored because they name an endpoint this SMF did not provision, or
-/// arrive with no block configured (#1502 review M3).
+/// arrive with no block configured (#1502 review M3). Exported as
+/// `smf_n6_delay_reports_ignored_total{reason="unprovisioned"}`.
 static IGNORED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Reports that arrived in a Node Report from a UPF with no established PFCP
+/// association (#1505): refused with cause 72 and not stored. Exported as
+/// `smf_n6_delay_reports_ignored_total{reason="not_associated"}`, so the family has
+/// exactly two series whatever the senders.
+static NOT_ASSOCIATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Count `n` N6 Delay Measurement Reports received from a UPF that is not associated
+/// (#1505). They are not stored: a UPF this SMF considers down has no current delay.
+pub fn note_not_associated(upf_key: &str, n: usize) {
+    if n == 0 {
+        return;
+    }
+    NOT_ASSOCIATED.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+    log::debug!("UPF {upf_key}: {n} N6 delay report(s) while not associated: not stored");
+}
 
 impl N6DelayConfig {
     /// Every endpoint the instances provision.
@@ -645,13 +662,23 @@ pub fn render(out: &mut String) {
             "smf_n6_delay_failures_total{{upf=\"{upf}\",endpoint=\"{ip}\"}} {n}"
         );
     }
-    nextgcore_metrics::nf::write_metric(
+    nextgcore_metrics::nf::write_header(
         out,
         "smf_n6_delay_reports_ignored_total",
         "counter",
-        "N6 delay reports ignored because they name an endpoint this SMF did not provision",
-        IGNORED.load(std::sync::atomic::Ordering::Relaxed),
+        "N6 delay reports not stored: naming an endpoint this SMF did not provision, or \
+         from a UPF with no established PFCP association",
     );
+    for (reason, n) in [
+        ("unprovisioned", &IGNORED),
+        ("not_associated", &NOT_ASSOCIATED),
+    ] {
+        let _ = writeln!(
+            out,
+            "smf_n6_delay_reports_ignored_total{{reason=\"{reason}\"}} {}",
+            n.load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
 }
 
 /// Test only: clear the configuration and every result.
@@ -661,6 +688,7 @@ pub(crate) fn reset_for_test() {
     RESULTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     FAILURES.lock().unwrap_or_else(|e| e.into_inner()).clear();
     IGNORED.store(0, std::sync::atomic::Ordering::Relaxed);
+    NOT_ASSOCIATED.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Test only: store a result as a report would.

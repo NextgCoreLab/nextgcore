@@ -37,6 +37,62 @@ const NOTIFY_CONNECT_TIMEOUT_SECS: u64 = 2;
 const NOTIFY_REQUEST_TIMEOUT_SECS: u64 = 3;
 
 // ============================================================================
+// OAuth2 callback exemptions (#1421)
+// ============================================================================
+
+/// The Namf_Callback routes admitted without an OAuth2 bearer when the listener
+/// requires one: a notification carries no access token (TS 33.501 §13.4.1,
+/// TS 29.500 §6.10.7 NOTE). The one route here is authenticated by the
+/// per-subscription token this AMF minted into its NRF subscription's callback
+/// URI instead. The server admits it only when the check below finds the token
+/// held now; any other path, or a stale or forged token, still needs a bearer.
+///
+/// `dereg-notify/{token}` is NOT here (#1522): its token travels in the UECM
+/// registration's `deregCallbackUri`, which any Nudm_UECM Get consumer can read,
+/// so it does not show that the sender is the UDM. It stays bearer-protected,
+/// like the routes that carry no token (`ucmf-notify`, `sm-context-status`,
+/// `ue-policy-notify`, `am-policy-notify`, #1518).
+pub fn oauth2_callback_exemptions() -> Vec<nextgcore_sbi::server::OAuth2CallbackExemption> {
+    use nextgcore_sbi::server::OAuth2CallbackExemption;
+    vec![
+        // NFStatusNotify (#940): the token names one of this AMF's NRF subscriptions.
+        OAuth2CallbackExemption::new(
+            "POST",
+            format!("{}/{{token}}", crate::nrf_subscription::NOTIFY_PATH),
+            |cb| crate::nrf_subscription::token_nf_type(cb.token).is_some(),
+        ),
+    ]
+}
+
+/// The Namf SBI server for `cfg`, with this AMF's [`oauth2_callback_exemptions`]
+/// registered (#1421). The composition root builds its server here, so a test
+/// can see what it registers.
+pub fn sbi_server(cfg: nextgcore_sbi::server::SbiServerConfig) -> nextgcore_sbi::server::SbiServer {
+    nextgcore_sbi::server::SbiServer::new(
+        cfg.with_oauth2_callback_exemptions(oauth2_callback_exemptions()),
+    )
+}
+
+/// #1421 tests: this AMF's real router behind an OAuth2-required listener that
+/// registers [`oauth2_callback_exemptions`] the way `lib.rs` does, with an empty
+/// JWKS so that no bearer could verify. Returns the server and its port.
+#[cfg(test)]
+pub(crate) async fn oauth2_callback_listener_for_tests() -> (nextgcore_sbi::server::SbiServer, u16)
+{
+    let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let mut cfg = nextgcore_sbi::server::SbiServerConfig::new(addr)
+        .with_oauth2_callback_exemptions(oauth2_callback_exemptions());
+    cfg.require_oauth2 = true;
+    cfg.oauth2_jwks = Some(serde_json::json!({"keys": []}));
+    let server = nextgcore_sbi::server::SbiServer::on_listener(cfg, listener);
+    server
+        .start(namf_request_handler)
+        .await
+        .expect("server start");
+    (server, addr.port())
+}
+
+// ============================================================================
 // Request router
 // ============================================================================
 
@@ -632,7 +688,13 @@ fn handle_dereg_notify_callback(
     let Some(ue) = find_ue_by_context_id(supi) else {
         return context_not_found(supi);
     };
-    if ue.uecm_dereg_token.as_deref().is_none() || ue.uecm_dereg_token.as_deref() != token {
+    // Constant-time: on a listener without OAuth2 this is the only check.
+    let current = ue
+        .uecm_dereg_token
+        .as_deref()
+        .zip(token)
+        .is_some_and(|(held, got)| nextgcore_sbi::callback_auth::token_eq(held, got));
+    if !current {
         // The UE's CURRENT token is never logged: with it, anyone who reads the
         // log and reaches the SBI could forge a notification that acts.
         log::info!(
@@ -8981,6 +9043,69 @@ mod tests {
         );
         assert!(!queued[0].reregistration_required);
         assert_eq!(queued[0].gmm_cause, None);
+    }
+
+    /// #1421 / #1522: dereg-notify is NOT exempt from bearer auth (its token is
+    /// readable by any Nudm_UECM Get consumer). An OAuth2-required listener answers
+    /// a token-less DeregistrationNotification 401 even on the UE's current
+    /// token, and nothing is torn down; the same request straight to the router
+    /// (no OAuth2 listener) is acted on, so the token was the right one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_oauth2_listener_keeps_the_dereg_notify_on_bearer_auth() {
+        let _serial = dereg_queue_test_lock().lock().await;
+        let supi = "imsi-001010000071421";
+        let ue = setup_ue(supi, true, true);
+        let (server, port) = oauth2_callback_listener_for_tests().await;
+        let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", port);
+        let body = json!({ "deregReason": "UE_INITIAL_REGISTRATION", "accessType": "3GPP_ACCESS" });
+        let req = |path: String| SbiRequest::post(path).with_json_body(&body).expect("json");
+        let current = format!("/namf-callback/v1/{supi}/dereg-notify/tok-{supi}");
+
+        for path in [
+            current.clone(),
+            format!("/namf-callback/v1/{supi}/dereg-notify/tok-stale"),
+            format!("/namf-callback/v1/{supi}/dereg-notify"),
+            "/namf-comm/v1/subscriptions".to_string(),
+            "/namf-callback/v1/ucmf-notify".to_string(),
+        ] {
+            let status = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.send_request(req(path.clone())),
+            )
+            .await
+            .expect("bounded")
+            .expect("response")
+            .status;
+            assert_eq!(status, 401, "{path}");
+        }
+        assert!(
+            drain_network_deregs_for(ue.id).is_empty(),
+            "a refused request acted"
+        );
+        server.stop().await.expect("stop");
+
+        let resp = namf_request_handler(req(current)).await;
+        assert_eq!(
+            resp.status, 204,
+            "control: the token is the UE's current one"
+        );
+        assert_eq!(drain_network_deregs_for(ue.id).len(), 1);
+    }
+
+    /// #1421: the server the composition root builds registers exactly the
+    /// NFStatusNotify callback exemption, and not dereg-notify (#1522).
+    #[test]
+    fn the_namf_server_registers_its_callback_exemptions() {
+        let cfg =
+            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+        let server = sbi_server(cfg);
+        let routes: Vec<String> = server
+            .config()
+            .oauth2_callback_exemptions
+            .iter()
+            .map(|e| e.route())
+            .collect();
+        assert_eq!(routes, ["POST /namf-callback/v1/nf-status-notify/{token}"]);
     }
 
     /// #753: after an AMF restart the UE registers again (new UECM registration,

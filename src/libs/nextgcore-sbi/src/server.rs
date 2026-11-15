@@ -21,6 +21,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio_rustls::TlsAcceptor;
 
+pub use crate::callback_auth::OAuth2CallbackExemption;
 use crate::error::{SbiError, SbiResult};
 use crate::message::{SbiHttpMessage, SbiRequest, SbiResponse};
 use crate::overload::OverloadReporter;
@@ -82,6 +83,15 @@ pub struct SbiServerConfig {
     /// check, preserving prior behaviour. Only consulted when
     /// `require_oauth2` is enabled.
     pub oauth2_expected_audience: Option<String>,
+    /// #1421: callback routes this NF serves that are admitted WITHOUT a bearer
+    /// token when `require_oauth2` is enabled, because the notification
+    /// operation does not use OAuth 2.0 (TS 33.501 §13.4.1, TS 29.500 §6.10.7 NOTE).
+    /// Each one is an exact route shape plus the NF's check of the
+    /// per-subscription token in its path (see [`crate::callback_auth`]); a
+    /// request that is not one of them, or whose token the NF does not hold,
+    /// still needs a valid bearer. Empty by default: every route requires a
+    /// token. Not consulted when `require_oauth2` is off.
+    pub oauth2_callback_exemptions: Vec<OAuth2CallbackExemption>,
     /// Maximum request body size, in bytes, accepted before the body is
     /// buffered. Oversize requests are rejected with 413 (ProblemDetails)
     /// without allocating the full body. Defaults to
@@ -134,6 +144,7 @@ impl Default for SbiServerConfig {
             oauth2_jwks: None,
             oauth2_jwks_uri: None,
             oauth2_expected_audience: None,
+            oauth2_callback_exemptions: Vec::new(),
             max_request_body_size: DEFAULT_MAX_REQUEST_BODY_SIZE,
             max_concurrent_streams: Some(DEFAULT_MAX_CONCURRENT_STREAMS),
             max_frame_size: Some(DEFAULT_MAX_FRAME_SIZE),
@@ -194,6 +205,23 @@ impl SbiServerConfig {
     /// Set the expected OAuth2 `aud` claim from an [`NfType`] (T1.2).
     pub fn with_expected_audience_nf_type(mut self, nf_type: NfType) -> Self {
         self.oauth2_expected_audience = Some(nf_type.to_str().to_string());
+        self
+    }
+
+    /// Admit `exemption`'s callback route without a bearer token when its path
+    /// carries a callback token the NF holds (#1421). Only consulted when
+    /// `require_oauth2` is enabled.
+    pub fn with_oauth2_callback_exemption(mut self, exemption: OAuth2CallbackExemption) -> Self {
+        self.oauth2_callback_exemptions.push(exemption);
+        self
+    }
+
+    /// [`Self::with_oauth2_callback_exemption`] for each of `exemptions`.
+    pub fn with_oauth2_callback_exemptions(
+        mut self,
+        exemptions: impl IntoIterator<Item = OAuth2CallbackExemption>,
+    ) -> Self {
+        self.oauth2_callback_exemptions.extend(exemptions);
         self
     }
 
@@ -286,6 +314,8 @@ struct OAuthVerifier {
     /// Expected audience (the NF's own type/instanceId); `None` skips the
     /// audience check, preserving prior behaviour.
     expected_audience: Option<String>,
+    /// #1421: callback routes admitted on their own callback token instead.
+    callback_exemptions: Vec<OAuth2CallbackExemption>,
 }
 
 impl OAuthVerifier {
@@ -309,6 +339,7 @@ impl OAuthVerifier {
         Some(Self {
             keys,
             expected_audience: config.oauth2_expected_audience.clone(),
+            callback_exemptions: config.oauth2_callback_exemptions.clone(),
         })
     }
 
@@ -466,6 +497,27 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
             // configured key material before dispatching to the NF handler.
             // An invalid token is the caller's fault (401); not being able to
             // obtain verification keys is ours (503).
+            // #1421: a notification to a callback route this NF registered, whose
+            // path carries a callback token the NF holds, is not an OAuth 2.0
+            // protected access (TS 33.501 §13.4.1, TS 29.500 §6.10.7 NOTE): it is
+            // authenticated by that token, and the bearer is not consulted.
+            let oauth = oauth.filter(|verifier| {
+                let exempt = crate::callback_auth::admits_without_bearer(
+                    &verifier.callback_exemptions,
+                    &sbi_request.header.method,
+                    &sbi_request.header.uri,
+                );
+                if exempt {
+                    log::debug!(
+                        "cid={} {} {}: callback admitted on its callback token, no bearer \
+                         required",
+                        sbi_request.correlation_id,
+                        sbi_request.header.method,
+                        crate::log_redact::redact_callback_tokens(&sbi_request.header.uri)
+                    );
+                }
+                !exempt
+            });
             if let Some(verifier) = &oauth {
                 // get_header() is case-insensitive, covering both hyper's
                 // lowercased HTTP/2 names and in-process constructed requests.
@@ -1884,6 +1936,7 @@ mod tests {
         let unconfigured = OAuthVerifier {
             keys: OAuthKeySource::Unconfigured,
             expected_audience: None,
+            callback_exemptions: Vec::new(),
         };
         let err = unconfigured
             .authorize(Some("Bearer a.b.c"), None)
@@ -1896,6 +1949,7 @@ mod tests {
         let static_v = OAuthVerifier {
             keys: OAuthKeySource::Static(serde_json::json!({"keys": []})),
             expected_audience: None,
+            callback_exemptions: Vec::new(),
         };
         let err = static_v.authorize(None, None).await.unwrap_err();
         assert!(matches!(err, SbiError::AuthorizationFailed(_)));
@@ -1906,6 +1960,7 @@ mod tests {
                 "http://127.0.0.1:1/nnrf-oauth2/v1/jwks",
             )),
             expected_audience: None,
+            callback_exemptions: Vec::new(),
         };
         let err = remote
             .authorize(Some("Bearer a.b.c"), None)
@@ -2440,6 +2495,7 @@ mod tests {
         let verifier = OAuthVerifier {
             keys: OAuthKeySource::Static(jwks.clone()),
             expected_audience: Some("UDM".into()),
+            callback_exemptions: Vec::new(),
         };
         let header = format!("Bearer {token}");
         assert!(verifier.authorize(Some(&header), None).await.is_ok());
@@ -2449,6 +2505,7 @@ mod tests {
         let wrong = OAuthVerifier {
             keys: OAuthKeySource::Static(jwks.clone()),
             expected_audience: Some("AMF".into()),
+            callback_exemptions: Vec::new(),
         };
         let err = wrong.authorize(Some(&header), None).await.unwrap_err();
         assert!(matches!(err, SbiError::AuthorizationFailed(_)));
@@ -2457,6 +2514,7 @@ mod tests {
         let none = OAuthVerifier {
             keys: OAuthKeySource::Static(jwks),
             expected_audience: None,
+            callback_exemptions: Vec::new(),
         };
         assert!(none.authorize(Some(&header), None).await.is_ok());
     }
@@ -2468,6 +2526,7 @@ mod tests {
         let verifier = OAuthVerifier {
             keys: OAuthKeySource::Static(jwks),
             expected_audience: None,
+            callback_exemptions: Vec::new(),
         };
         let header = format!("Bearer {token}");
 
@@ -3171,5 +3230,195 @@ mod accept_path_tests {
             .await
             .expect("stop() is not held up by the accept pause")
             .expect("stop");
+    }
+}
+
+/// #1421: callback routes an NF registers are admitted without a bearer token
+/// when their path carries a callback token the NF holds; nothing else is.
+#[cfg(test)]
+mod oauth2_callback_exemption_tests {
+    use super::{OAuth2CallbackExemption, SbiServer, SbiServerConfig};
+    use crate::message::{SbiRequest, SbiResponse};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    const GOOD: &str = "0123456789abcdef0123456789abcdef";
+    const CALLBACK: &str = "/nx-callback/v1/ue-1/thing-notify";
+
+    /// Paths the handler saw, in order.
+    type Seen = Arc<Mutex<Vec<String>>>;
+
+    async fn start(jwks: Option<serde_json::Value>) -> (SbiServer, std::net::SocketAddr, Seen) {
+        let seen: Seen = Arc::default();
+        let sink = Arc::clone(&seen);
+        let (listener, addr) = crate::test_support::bound_listener().into_parts();
+        let mut cfg = SbiServerConfig::new(addr).with_oauth2_callback_exemption(
+            OAuth2CallbackExemption::new(
+                "POST",
+                "/nx-callback/v1/{var}/thing-notify/{token}",
+                |cb| cb.vars == ["ue-1"] && cb.token == GOOD,
+            ),
+        );
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = jwks;
+        let server = SbiServer::on_listener(cfg, listener);
+        server
+            .start(move |req: SbiRequest| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    assert!(req.oauth2_subject.is_none(), "no bearer was verified");
+                    sink.lock().unwrap().push(req.header.uri.clone());
+                    SbiResponse::no_content()
+                }
+            })
+            .await
+            .expect("server starts");
+        (server, addr, seen)
+    }
+
+    /// One request with `method` and the raw `path_and_query`, no bearer; the
+    /// status and the `WWW-Authenticate` value.
+    async fn send(
+        addr: std::net::SocketAddr,
+        method: &str,
+        path_and_query: &str,
+    ) -> (u16, Option<String>) {
+        let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let (client, conn) = h2::client::handshake(tcp).await.expect("h2 handshake");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let mut client = client.ready().await.expect("ready");
+        let req = hyper::Request::builder()
+            .method(method)
+            .uri(format!("http://{addr}{path_and_query}"))
+            .header("content-type", "application/json")
+            .body(())
+            .expect("request");
+        let (answer, mut body) = client.send_request(req, false).expect("send");
+        body.send_data(bytes::Bytes::from_static(b"{}"), true)
+            .expect("data");
+        let answer = tokio::time::timeout(Duration::from_secs(5), answer)
+            .await
+            .expect("answered")
+            .expect("response");
+        let www = answer
+            .headers()
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        (answer.status().as_u16(), www)
+    }
+
+    fn empty_jwks() -> Option<serde_json::Value> {
+        Some(serde_json::json!({"keys": []}))
+    }
+
+    #[tokio::test]
+    async fn a_token_less_callback_carrying_a_held_token_reaches_the_handler() {
+        let (server, addr, seen) = start(empty_jwks()).await;
+        let path = format!("{CALLBACK}/{GOOD}");
+        assert_eq!(send(addr, "POST", &path).await.0, 204);
+        // The query is not part of the route: the handler sees the same path.
+        assert_eq!(send(addr, "POST", &format!("{path}?x=1")).await.0, 204);
+        assert_eq!(*seen.lock().unwrap(), vec![path.clone(), path]);
+        server.stop().await.expect("stop");
+    }
+
+    /// Every request shape that is not the registered route with a held token
+    /// is answered 401 Bearer, and none reaches the handler.
+    #[tokio::test]
+    async fn every_other_request_shape_still_needs_a_bearer() {
+        let (server, addr, seen) = start(empty_jwks()).await;
+        let wrong = "f".repeat(32);
+        let posts = [
+            // A service route.
+            "/nx-svc/v1/ue-contexts/ue-1".to_string(),
+            // The callback with a wrong, missing or empty token.
+            format!("{CALLBACK}/{wrong}"),
+            CALLBACK.to_string(),
+            format!("{CALLBACK}/"),
+            // Another UE's callback carrying this UE's token.
+            format!("/nx-callback/v1/ue-2/thing-notify/{GOOD}"),
+            // Variant spellings of the right route.
+            format!("{CALLBACK}/{GOOD}/"),
+            format!("/{CALLBACK}/{GOOD}"),
+            format!("/nx-callback//v1/ue-1/thing-notify/{GOOD}"),
+            format!("{CALLBACK}/{GOOD}/extra"),
+            format!("{CALLBACK}/{GOOD}/../../../../nx-svc/v1/ue-contexts/ue-1"),
+            format!("/nx-callback/v1/../thing-notify/{GOOD}"),
+            format!("/nx-callback/v1/./thing-notify/{GOOD}"),
+            format!("/nx%2Dcallback/v1/ue-1/thing-notify/{GOOD}"),
+            format!("/nx-callback/v1/ue%2D1/thing-notify/{GOOD}"),
+            format!("{CALLBACK}%2F{GOOD}"),
+            format!("{CALLBACK}/{GOOD}%2F..%2F..%2Fnx-svc"),
+            format!("/NX-CALLBACK/v1/ue-1/thing-notify/{GOOD}"),
+        ];
+        for path in &posts {
+            let (status, www) = send(addr, "POST", path).await;
+            assert_eq!(status, 401, "POST {path}");
+            assert!(
+                www.as_deref().is_some_and(|w| w.starts_with("Bearer")),
+                "POST {path}: {www:?}"
+            );
+        }
+        let good = format!("{CALLBACK}/{GOOD}");
+        for method in ["GET", "PUT", "PATCH", "DELETE"] {
+            assert_eq!(send(addr, method, &good).await.0, 401, "{method} {good}");
+        }
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+
+        // Control: the same server admits the registered route.
+        assert_eq!(send(addr, "POST", &good).await.0, 204);
+        assert_eq!(*seen.lock().unwrap(), vec![good]);
+        server.stop().await.expect("stop");
+    }
+
+    /// With no verification keys the server fails closed on service routes
+    /// (503); a callback needs no keys, so its token alone admits it.
+    #[tokio::test]
+    async fn a_callback_needs_no_verification_keys() {
+        let (server, addr, seen) = start(None).await;
+        assert_eq!(
+            send(addr, "POST", "/nx-svc/v1/ue-contexts/ue-1").await.0,
+            503
+        );
+        assert_eq!(
+            send(addr, "POST", &format!("{CALLBACK}/{}", "f".repeat(32)))
+                .await
+                .0,
+            503
+        );
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(
+            send(addr, "POST", &format!("{CALLBACK}/{GOOD}")).await.0,
+            204
+        );
+        server.stop().await.expect("stop");
+    }
+
+    /// The exemption list is opt-in: a server that registers none answers the
+    /// same token-less callback 401.
+    #[tokio::test]
+    async fn without_a_registered_exemption_a_callback_needs_a_bearer() {
+        let (listener, addr) = crate::test_support::bound_listener().into_parts();
+        let mut cfg = SbiServerConfig::new(addr);
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = empty_jwks();
+        assert!(cfg.oauth2_callback_exemptions.is_empty());
+        let server = SbiServer::on_listener(cfg, listener);
+        server
+            .start(|_req: SbiRequest| async { SbiResponse::no_content() })
+            .await
+            .expect("server starts");
+        assert_eq!(
+            send(addr, "POST", &format!("{CALLBACK}/{GOOD}")).await.0,
+            401
+        );
+        server.stop().await.expect("stop");
     }
 }

@@ -6862,8 +6862,9 @@ fn take_sm_policy_id(sm_context_ref: &str) -> Option<String> {
 ///
 /// The body is an empty SmPolicyDeleteData. Every attribute is optional, and the
 /// ones that would describe this release (`ranNasRelCauses`, §4.2.5.4) belong to
-/// the RAN-NAS-Cause feature, which this SMF does not negotiate (it creates the
-/// association with `suppFeat` "0"); sending them unnegotiated is not allowed.
+/// the RAN-NAS-Cause feature, which this SMF does not negotiate (its `suppFeat`
+/// offers only PCSCF-Restoration-Enhancement); sending them unnegotiated is not
+/// allowed.
 async fn delete_sm_policy(pol_id: &str) {
     for attempt in 1..=SM_POLICY_DELETE_ATTEMPTS {
         let result = match policy::resolve_pcf_endpoint().await {
@@ -10616,6 +10617,18 @@ async fn handle_sm_policy_notify(sm_context_ref: &str, request: &SbiRequest) -> 
 
     // The decision may be nested (smPolicyDecision) or top-level
     let decision_json = body.get("smPolicyDecision").unwrap_or(&body);
+
+    // #1398, TS 29.512 §4.2.3.18: "pcscfRestIndication" true asks for P-CSCF
+    // restoration. Acknowledged, then the restoration runs off the request path.
+    if decision_json
+        .get("pcscfRestIndication")
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
+        restore_pcscf(sm_context_ref, &binding);
+        return SbiResponse::with_status(204);
+    }
+
     let pol_id = binding.sm_policy_id.clone().unwrap_or_default();
     // #1387: a delta over what the session ENFORCES (TS 29.512 §4.2.6.1), not a
     // replacement built from the config default -- see `merge_sm_policy_decision`.
@@ -10708,6 +10721,64 @@ async fn handle_sm_policy_notify(sm_context_ref: &str, request: &SbiRequest) -> 
     signal_policy_change(sm_context_ref, &binding);
 
     SbiResponse::with_status(204)
+}
+
+/// P-CSCF restoration for one PDU session, on the PCF's `pcscfRestIndication`
+/// (#1398, TS 29.512 §4.2.3.18; TS 23.501 §5.16.3.9 defers to TS 23.380).
+///
+/// TS 23.380 gives the SMF two ways. The first is a PDU Session Modification that
+/// hands the UE a new P-CSCF list. TS 24.501 §6.3.2.2 (24501-k00 s06-s08 l.4952-4958)
+/// allows that only when the UE asked for a P-CSCF address and the SMF gave it
+/// some at establishment. This SMF puts no P-CSCF address in the ePCO
+/// (`gsm_build::build_epco`: DNS and MTU only), so that never holds. That leaves
+/// the second way: release the session with 5GSM cause #39 "reactivation
+/// requested". The UE then establishes the session again and finds a P-CSCF again.
+/// That is the same release #667 sends after a UPF restart:
+/// - the SM Policy Association is terminated;
+/// - the N4 session is deleted;
+/// - the PDU SESSION RELEASE COMMAND #39 goes with the N2 Release Command, under
+///   T3592.
+///
+/// Answered before the release runs, so the PCF's notify is not held behind the
+/// PFCP and N1N2 round trips. Taking the policy id is the once-only guard: a retried
+/// notify (TS 29.500 §6.10) finds it gone and starts no second release. Returns
+/// whether this call started the release.
+fn restore_pcscf(sm_context_ref: &str, binding: &context::PolicyBinding) -> bool {
+    let Some(pol_id) = take_sm_policy_id(sm_context_ref) else {
+        log::info!(
+            "P-CSCF restoration for ref={sm_context_ref}: already released, or no SM policy \
+             association; nothing more to do"
+        );
+        return false;
+    };
+    log::warn!(
+        "P-CSCF restoration for ref={sm_context_ref} (SUPI {}, PSI {}): releasing the PDU \
+         session with #39 reactivation requested (TS 23.380; no P-CSCF list to update)",
+        binding.supi,
+        binding.psi
+    );
+    spawn_sm_policy_delete(pol_id);
+    let reference = sm_context_ref.to_string();
+    let (amf_uri, supi, psi) = (
+        binding.sm_context_status_uri.clone(),
+        binding.supi.clone(),
+        binding.psi,
+    );
+    tokio::spawn(async move {
+        if let Some(seid) = lookup_upf_seid(&reference) {
+            if let Err(e) = pfcp_session_delete(smf_n4_seid_for(&reference), seid).await {
+                log::warn!("PFCP Session Deletion failed for ref={reference}: {e}");
+            }
+        }
+        match amf_uri {
+            Some(amf_uri) => release_for_reactivation(&reference, &amf_uri, &supi, psi).await,
+            None => {
+                log::warn!("P-CSCF restoration: ref={reference} has no AMF callback to tell");
+                complete_sm_context_release(&reference);
+            }
+        }
+    });
+    true
 }
 
 /// `POST /nsmf-callback/v1/sdm-notify/{smContextRef}` — `Nudm_SDM_Notification`
@@ -25669,6 +25740,86 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #1398, TS 29.512 §4.2.3.18, through the real SBI router and an AMF stand-in:
+    /// a notify with `pcscfRestIndication: true` is acknowledged 204, then:
+    /// - the SM Policy Association is terminated;
+    /// - the session is released toward the UE with 5GSM #39 "reactivation
+    ///   requested" plus the N2 Release Command, under T3592.
+    ///
+    /// This SMF gives the UE no P-CSCF list it could update, so TS 23.380 leaves it
+    /// the release. A retried copy of the notify starts no second release.
+    ///
+    /// REVERT-VERIFIED: without the `pcscfRestIndication` arm the notify is applied
+    /// as an ordinary (empty) policy change. No N1N2 transfer arrives, and the
+    /// association keeps its policy id.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pcscf_restoration_indication_releases_the_session_for_reactivation_1398() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (amf, amf_port, posts) = n1n2_recording_amf_1385(false).await;
+        let supi = "imsi-001010000001398";
+        let psi = 13;
+        let sm_context_ref = seed_pcf_authorised(supi, psi, "pol-1398");
+        set_amf_1385(&sm_context_ref, amf_port);
+
+        let restore = || {
+            smf_sbi_request_handler(policy_notify_1387(
+                &sm_context_ref,
+                serde_json::json!({ "pcscfRestIndication": true }),
+            ))
+        };
+        assert_eq!(restore().await.status, 204, "the SMF acknowledges the PCF");
+        let got = await_n1n2_1385(&posts, 1).await;
+        assert_eq!(got.len(), 1, "one N1N2MessageTransfer, got {got:?}");
+        let (path, body, n1_cmd, n2) = &got[0];
+        assert_eq!(
+            path,
+            &format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages")
+        );
+        assert_eq!(
+            n1_cmd[..5],
+            [
+                0x2E,
+                psi,
+                0,
+                crate::gsm_build::message_type::PDU_SESSION_RELEASE_COMMAND,
+                policy::gsm_cause::REACTIVATION_REQUESTED
+            ],
+            "5GSM, the PSI, PTI 0 (network-initiated), RELEASE COMMAND, cause #39"
+        );
+        assert_eq!(
+            body["n2InfoContainer"]["smInfo"]["n2InfoContent"]["ngapIeType"],
+            "PDU_RES_REL_CMD"
+        );
+        assert!(
+            !n2.is_empty(),
+            "the N2 Release Command transfer rides along"
+        );
+        assert_eq!(
+            lookup_policy_binding(&sm_context_ref).and_then(|b| b.sm_policy_id),
+            None,
+            "the SM Policy Association is terminated"
+        );
+
+        // A retried copy (TS 29.500 §6.10): acknowledged, and no second release,
+        // because the first took the policy id that starting one needs.
+        assert_eq!(restore().await.status, 204);
+        let binding = lookup_policy_binding(&sm_context_ref).expect("binding");
+        assert!(
+            !restore_pcscf(&sm_context_ref, &binding),
+            "a second restoration starts nothing"
+        );
+
+        assert!(
+            cancel_gsm_timer_for_test(&sm_context_ref),
+            "T3592 guards the release"
+        );
+        amf.stop().await.ok();
     }
 
     /// The N2 transfer's (Session-AMBR DL/UL, the default flow's (QFI, 5QI, ARP PL)).

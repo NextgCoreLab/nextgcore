@@ -1,0 +1,26 @@
+# The UE's log level in this overlay (nextgsim#464), as #1472 does for d444a.
+# The base ue.yaml runs nextgsim_ue at debug, and nextgsim_ue::rrc logs every
+# MIB and SIB of all three gNBs at debug (about 36 kB/s here). Once nr-ue's
+# A3 reports stopped capping out (nextgsim#541) the restarted UE lives through
+# the whole route, kubelet rotated its log at 10 MiB within about 4.5 minutes,
+# and `kubectl logs` then returned only the last file: the UE's
+# `PDU Session 1 is now ACTIVE` and `Simulated motion started` lines were gone
+# (devtest1, 20261114T192632Z). At info the UE logs about 5 kB/s.
+#
+# Unlike d441a/d444a, nextgsim_ue::rrc stays at info: scenario.sh and analyze.py
+# assert its `Received RRC Release from cell`, `Cell reselection: id=` and
+# `Paged by cell` lines (info!), beside nr_ue's `is now ACTIVE`, rls's
+# `Simulated motion started` and nas's Service Request / Service Accept, all at
+# info.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ue
+spec:
+  template:
+    spec:
+      containers:
+        - name: ue
+          env:
+            - name: RUST_LOG
+              value: info

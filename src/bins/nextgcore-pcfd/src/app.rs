@@ -1055,7 +1055,12 @@ pub async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 const PCF_AM_POLICY_SUPPORTED_FEATURES: u64 = 0x0;
 /// SM (TS 29.512 §5.8): conservative optional-feature set the decision builder
 /// actually exercises. Intersected with the SMF-requested value.
-const PCF_SM_POLICY_SUPPORTED_FEATURES: u64 = 0x3;
+/// #1398: plus PCSCF-Restoration-Enhancement (feature 9), which
+/// [`handle_pcscf_restoration`] signals with `pcscfRestIndication`.
+const PCF_SM_POLICY_SUPPORTED_FEATURES: u64 = 0x3 | SM_FEATURE_PCSCF_RESTORATION_ENHANCEMENT;
+/// TS 29.512 Table 5.8-1 feature 9, PCSCF-Restoration-Enhancement: bit 8, since
+/// feature 1 is the least significant bit (TS 29.571 §5.2.2 SupportedFeatures).
+pub(crate) const SM_FEATURE_PCSCF_RESTORATION_ENHANCEMENT: u64 = 1 << 8;
 /// PolicyAuthorization (TS 29.514): no optional features negotiated → "0".
 const PCF_PA_SUPPORTED_FEATURES: u64 = 0x0;
 /// UEPolicyControl (TS 29.525 §5.8): no optional features negotiated -> "0".
@@ -1067,12 +1072,18 @@ const PCF_UE_POLICY_SUPPORTED_FEATURES: u64 = 0x0;
 /// negotiates to "0" (no optional features) — never an error, so a consumer
 /// that omits `suppFeat` still gets a conformant, working feature set.
 fn negotiate_features(consumer_hex: Option<&str>, supported: u64) -> String {
+    format!("{:x}", negotiated_feature_bits(consumer_hex, supported))
+}
+
+/// [`negotiate_features`] as the bitmask, for a session that keeps what it
+/// negotiated (#1398).
+fn negotiated_feature_bits(consumer_hex: Option<&str>, supported: u64) -> u64 {
     let consumer = consumer_hex
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .and_then(|s| u64::from_str_radix(s, 16).ok())
         .unwrap_or(0);
-    format!("{:x}", consumer & supported)
+    consumer & supported
 }
 
 // AM Policy Control handlers
@@ -2916,6 +2927,14 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
             // with no callers (deleted by #655), so on the live path it was
             // neither written nor read.
             sess.subscribed_sess_ambr = subs_sess_ambr.clone();
+            // #1398: what this association negotiated, so a later PCF-initiated
+            // notify uses only the features the SMF said it supports (TS 29.512
+            // §4.2.3.18 needs PCSCF-Restoration-Enhancement on both ends). The same
+            // value the 201 answers in `suppFeat`.
+            sess.smpolicycontrol_features = negotiated_feature_bits(
+                policy_data.get("suppFeat").and_then(|v| v.as_str()),
+                PCF_SM_POLICY_SUPPORTED_FEATURES,
+            );
             if let Ok(context) = ctx.read() {
                 context.sess_update(&sess);
             }
@@ -4620,10 +4639,10 @@ pub async fn handle_events_subscription_delete(app_session_id: &str) -> SbiRespo
 ///
 /// `PcscfRestorationRequestData` is a `oneOf` over `ueIpv4` / `ueIpv6`, so the
 /// UE whose IMS session must be restored is identified the same way an app
-/// session is. The PCF resolves that session and pushes an SM policy update to
-/// its SMF, which is the mechanism it has for telling the SMF the policy for
-/// that session has changed (TS 23.380 §5.4: the network re-establishes the IMS
-/// PDU session). It answers `204`, as the spec defines no response body.
+/// session is. The PCF resolves that session and asks its SMF to restore it:
+/// an UpdateNotify carrying `pcscfRestIndication: true` when the association
+/// negotiated PCSCF-Restoration-Enhancement (TS 29.512 §4.2.3.18, #1398). It
+/// answers `204`, as the spec defines no response body.
 ///
 /// A UE address that resolves nothing is a `404`: the caller asked the PCF to
 /// restore a session it does not know about, and a `204` would report a
@@ -4668,11 +4687,29 @@ pub async fn handle_pcscf_restoration(request: &SbiRequest) -> SbiResponse {
             Some("SESSION_NOT_FOUND"),
         );
     };
-    log::info!(
-        "P-CSCF restoration: notifying SMF for sess_id={} ({address:?})",
-        sess.id
-    );
-    pcf_sbi_send_smpolicycontrol_update_notify(sess.id);
+    // #1398, TS 29.512 §4.2.3.18: with PCSCF-Restoration-Enhancement negotiated on
+    // the association, the notify carries `pcscfRestIndication: true`, which is what
+    // asks the SMF to restore (TS 23.380). Before #1398 it was the generic re-derived
+    // decision, which the SMF applies as an ordinary policy change, so nothing was
+    // restored.
+    if sess.smpolicycontrol_features & SM_FEATURE_PCSCF_RESTORATION_ENHANCEMENT != 0 {
+        log::info!(
+            "P-CSCF restoration: pcscfRestIndication to the SMF for sess_id={} ({address:?})",
+            sess.id
+        );
+        sbi_path::pcf_sbi_send_pcscf_restoration_notify(sess.id);
+    } else {
+        // §4.2.3.18 applies only when both ends support the feature; this SMF did
+        // not negotiate it, so it has no way to be asked. The session's policy is
+        // re-sent as before, and the gap is logged rather than hidden.
+        log::warn!(
+            "P-CSCF restoration for sess_id={} ({address:?}): the SMF did not negotiate \
+             PCSCF-Restoration-Enhancement (TS 29.512 §5.8 feature 9), so no \
+             pcscfRestIndication can be sent; re-sending the session's policy only",
+            sess.id
+        );
+        pcf_sbi_send_smpolicycontrol_update_notify(sess.id);
+    }
     SbiResponse::with_status(204)
 }
 
@@ -10375,6 +10412,72 @@ mod tests {
         );
     }
 
+    /// #1398, TS 29.512 §4.2.3.18: an association that negotiated
+    /// PCSCF-Restoration-Enhancement (feature 9, "100") gets a restoration notify
+    /// whose decision is `pcscfRestIndication: true`, and only that.
+    ///
+    /// REVERT-VERIFIED: with `handle_pcscf_restoration` sending the generic notify
+    /// again, the decision is the re-derived sessRules/pccRules/... with no
+    /// `pcscfRestIndication`; with the negotiated features not stored on the session,
+    /// the same; with feature 9 not in `PCF_SM_POLICY_SUPPORTED_FEATURES`, the create
+    /// answers `suppFeat` "0".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn pcscf_restoration_sends_pcscf_rest_indication_when_negotiated_1398() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
+        let (supi, psi, ipv4) = ("imsi-001010000001398", 11, "10.45.13.98");
+        let mut create = full_create_body(supi, psi);
+        let obj = create.as_object_mut().unwrap();
+        obj.insert("ipv4Address".to_string(), serde_json::json!(ipv4));
+        obj.insert("suppFeat".to_string(), serde_json::json!("100"));
+        obj.insert(
+            "notificationUri".to_string(),
+            serde_json::json!(format!(
+                "http://127.0.0.1:{}/nsmf-callback/v1/sm-policy-notify/{psi}",
+                peers.smf_port
+            )),
+        );
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(create),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let created: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(created["suppFeat"], "100", "feature 9 is negotiated");
+        let pol = sm_policy_id_of(ipv4);
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
+            Some(serde_json::json!({ "ueIpv4": ipv4 })),
+        ))
+        .await;
+        assert_eq!(resp.status, 204);
+        let got = await_notifications(&peers, 1).await;
+        assert_eq!(got.len(), 1, "one notify to the SMF: {got:?}");
+        assert_eq!(
+            got[0].0,
+            format!("/nsmf-callback/v1/sm-policy-notify/{psi}/update")
+        );
+        assert_eq!(
+            got[0].1,
+            serde_json::json!({
+                "resourceUri": format!("/npcf-smpolicycontrol/v1/sm-policies/{pol}"),
+                "smPolicyDecision": { "pcscfRestIndication": true },
+            }),
+            "the restoration request, and no re-sent policy"
+        );
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
+    }
+
     /// #1383 path 2 of 3, policy-data re-authorisation (TS 29.519 policy-data change ->
     /// TS 29.512 §4.2.3.2): the notify carries the subscriber's Session-AMBR and 5QI
     /// alongside the #299 `chgDecs` overlay, which until now was the only member checked.
@@ -10777,7 +10880,8 @@ mod tests {
             }
         }
         assert!(matches!(&restores[..], [Action::Restore { supi, .. }] if supi == ue_b));
-        crate::congestion_loop::execute(&s, &restores[0], obs(10));
+        let restore = crate::congestion_loop::execute(&s, &restores[0], obs(10))
+            .expect("a restore runs as its own task (#1453)");
         let got = await_notifications(&peers, 1).await;
         assert_eq!(got[0].0, "/nsmf-callback/v1/sm-policy-notify/2/update");
         assert_eq!(
@@ -10793,12 +10897,286 @@ mod tests {
         );
         assert_eq!(crate::ambr_override::get(&pol_b), None);
         assert_eq!(
+            restore.await.unwrap(),
+            sbi_path::RestoreOutcome::Delivered,
+            "the SMF confirmed the restore"
+        );
+        assert_eq!(
             sess(&pol_b).demo_ambr_cap,
             None,
             "restored: no cap recorded"
         );
         peers.udr.stop().await.ok();
         peers.smf.stop().await.ok();
+    }
+
+    /// #1453 a: the controller's own restore keeps the record until the SMF confirms
+    /// it. With the SMF unreachable for every round the in-memory cap is gone (the
+    /// decision sent is the subscribed one) but the record stays, so the next start-up
+    /// undoes the cap the SMF may still hold. Once delivered, it is cleared.
+    ///
+    /// REVERT-VERIFIED: with `Action::Restore` clearing the record and sending the
+    /// fire-and-forget notify again (the pre-#1453 order), the "keeps the record"
+    /// assertion fails.
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context
+    async fn a_controller_restore_keeps_the_record_until_the_smf_confirms_1453() {
+        use crate::congestion_loop::{Action, Observation};
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
+        let ue_b = "imsi-001010000014531";
+        seed_subscriber_1383(ue_b);
+        let pol = create_for_1383(ue_b, 4, "10.45.14.53", peers.smf_port).await;
+        let s = settings_1453();
+        let sess = || {
+            pcf_self()
+                .read()
+                .unwrap()
+                .sess_find_by_sm_policy_id(&pol)
+                .unwrap()
+        };
+        let obs = Some(Observation {
+            cong_level: 99,
+            confidence: None,
+        });
+        peers.notified.lock().unwrap().clear();
+        let throttle = Action::Throttle {
+            sess_id: sess().id,
+            sm_policy_id: pol.clone(),
+            supi: ue_b.into(),
+        };
+        assert!(crate::congestion_loop::execute(&s, &throttle, obs).is_none());
+        await_notifications(&peers, 1).await;
+        let recorded = sess().demo_ambr_cap.expect("the throttle is recorded");
+
+        // The SMF is unreachable for the whole restore.
+        let held = nextgcore_sbi::test_support::down_port();
+        let live_uri = sess().notification_uri.clone();
+        let mut down = sess();
+        down.notification_uri = Some(format!(
+            "http://127.0.0.1:{}/nsmf-callback/v1/sm-policy-notify/4",
+            held.port()
+        ));
+        pcf_self().read().unwrap().sess_update(&down);
+        let restore = Action::Restore {
+            sess_id: sess().id,
+            sm_policy_id: pol.clone(),
+            supi: ue_b.into(),
+            why: "test",
+        };
+        let task = crate::congestion_loop::execute(&s, &restore, obs).expect("a restore task");
+        assert_eq!(task.await.unwrap(), sbi_path::RestoreOutcome::Failed);
+        assert_eq!(
+            crate::ambr_override::get(&pol),
+            None,
+            "the in-memory cap is gone"
+        );
+        assert_eq!(
+            sess().demo_ambr_cap,
+            Some(recorded),
+            "an unconfirmed controller restore keeps the record"
+        );
+        drop(held);
+
+        // The SMF is back: the next restore (a start-up's) is delivered and clears it.
+        let mut up = sess();
+        up.notification_uri = live_uri;
+        pcf_self().read().unwrap().sess_update(&up);
+        peers.notified.lock().unwrap().clear();
+        assert_eq!(
+            sbi_path::restore_demo_cap(up.id, s.restore_retry).await,
+            sbi_path::RestoreOutcome::Delivered
+        );
+        assert_eq!(sess().demo_ambr_cap, None);
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
+    }
+
+    /// #1453 b: a restore that a re-throttle crosses. The stub SMF, on receiving the
+    /// restore, caps the session again with the SAME values before it answers. That
+    /// is a throttle whose notify the SMF had already applied, so the restore lands
+    /// last and leaves the SMF at the subscribed rate. The restore must:
+    /// - keep the new record (a different generation, though the cap values match);
+    /// - re-send the capped decision, so the SMF ends at the cap pcfd holds.
+    ///
+    /// REVERT-VERIFIED: without the re-check after delivery, the outcome is
+    /// `Delivered` and the SMF's last decision is the subscribed 11/22 Mbps.
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context
+    async fn a_restore_crossed_by_a_rethrottle_ends_at_the_cap_1453() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        restore_crossed_1453(true, "imsi-001010000014532", 5, "10.45.14.54").await;
+    }
+
+    /// #1453 b, the record half on its own: while a restore is in flight the
+    /// session is throttled and then restored again by the controller, so a NEWER
+    /// record (same cap values) waits for that second restore's confirmation, with
+    /// no in-memory cap. The first restore's confirmation must not clear it: only
+    /// the restore that undid a record clears it.
+    ///
+    /// REVERT-VERIFIED: with the generation left out of the record comparison, the
+    /// newer record is cleared.
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context
+    async fn a_restore_does_not_clear_a_newer_record_with_the_same_cap_1453() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        restore_crossed_1453(false, "imsi-001010000014533", 6, "10.45.14.55").await;
+    }
+
+    /// The #1453 b scenario. When the restore reaches the stub SMF, a newer record
+    /// with the same cap values is written; with `rethrottled` the in-memory cap is
+    /// set too (a throttle), without it not (a throttle already restored again,
+    /// awaiting confirmation).
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    async fn restore_crossed_1453(rethrottled: bool, ue_b: &str, psi: u8, ipv4: &str) {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        pcf_context_init(64, 64);
+        let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
+        seed_subscriber_1383(ue_b);
+        let pol = create_for_1383(ue_b, psi, ipv4, peers.smf_port).await;
+        let id = pcf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_sm_policy_id(&pol)
+            .unwrap()
+            .id;
+        let record = |generation| crate::context::DemoAmbrCap {
+            writer: crate::congestion_loop::DEMO_KEY.to_string(),
+            uplink_bps: 1_000_000,
+            downlink_bps: 1_000_000,
+            generation,
+        };
+        // A boot restore's input: a record from the previous process, no in-memory cap.
+        let old = record(crate::context::next_demo_cap_generation());
+        let new = record(crate::context::next_demo_cap_generation());
+        pcf_self()
+            .read()
+            .unwrap()
+            .sess_modify(id, |sess| sess.demo_ambr_cap = Some(old.clone()));
+
+        // The SMF that re-throttles on the restore's arrival.
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let smf = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        let (sink, pol_c, new_c) = (seen.clone(), pol.clone(), new.clone());
+        smf.start(move |req: SbiRequest| {
+            let (sink, pol, new) = (sink.clone(), pol_c.clone(), new_c.clone());
+            async move {
+                let body: serde_json::Value =
+                    serde_json::from_str(req.http.content.as_deref().unwrap_or("null"))
+                        .unwrap_or_default();
+                let first = {
+                    let mut seen = sink.lock().unwrap();
+                    seen.push(body);
+                    seen.len() == 1
+                };
+                if first && rethrottled {
+                    crate::ambr_override::set(
+                        &pol,
+                        crate::congestion_loop::DEMO_KEY,
+                        crate::ambr_override::Cap {
+                            uplink_bps: new.uplink_bps,
+                            downlink_bps: new.downlink_bps,
+                        },
+                    );
+                }
+                if first {
+                    pcf_self()
+                        .read()
+                        .unwrap()
+                        .sess_modify(id, |sess| sess.demo_ambr_cap = Some(new));
+                }
+                SbiResponse::with_status(204)
+            }
+        })
+        .await
+        .expect("stub SMF starts");
+        pcf_self().read().unwrap().sess_modify(id, |sess| {
+            sess.notification_uri = Some(format!(
+                "http://127.0.0.1:{}/nsmf-callback/v1/sm-policy-notify/{psi}",
+                addr.port()
+            ))
+        });
+
+        let outcome = sbi_path::restore_demo_cap(id, settings_1453().restore_retry).await;
+        assert_eq!(
+            pcf_self()
+                .read()
+                .unwrap()
+                .sess_find_by_id(id)
+                .unwrap()
+                .demo_ambr_cap,
+            Some(new),
+            "the newer record stays, though its cap values match the undone one"
+        );
+        if !rethrottled {
+            assert_eq!(outcome, sbi_path::RestoreOutcome::Delivered);
+            let _apps = pcf_self().read().unwrap().sess_remove_with_apps(id);
+            smf.stop().await.ok();
+            peers.udr.stop().await.ok();
+            peers.smf.stop().await.ok();
+            return;
+        }
+        assert_eq!(
+            outcome,
+            sbi_path::RestoreOutcome::Superseded,
+            "the session was capped again during the restore"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while seen.lock().unwrap().len() < 2 {
+            assert!(tokio::time::Instant::now() < deadline, "a second notify");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            sess_rule_1383(&seen[0]["smPolicyDecision"]),
+            seeded_rule_1383(),
+            "the restore carried the subscribed 11/22 Mbps"
+        );
+        let (_, ul, dl) = sess_rule_1383(&seen[seen.len() - 1]["smPolicyDecision"]);
+        assert_eq!(
+            (ul.as_str(), dl.as_str()),
+            ("1 Mbps", "1 Mbps"),
+            "the SMF's last decision is the cap pcfd holds"
+        );
+        // Leave no capped session behind for a later test's start-up scan.
+        crate::ambr_override::forget(&pol);
+        let _apps = pcf_self().read().unwrap().sess_remove_with_apps(id);
+        smf.stop().await.ok();
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
+    }
+
+    /// The congestion-loop settings the #1453 tests run with: one cell, and a quick
+    /// restore retry (2 rounds, 10 ms apart).
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    fn settings_1453() -> crate::congestion_loop::Settings {
+        let mut s =
+            crate::congestion_loop::Settings::from_yaml(&crate::congestion_loop::LoopYaml {
+                cells: Some(vec![crate::congestion_loop::CellYaml {
+                    mcc: "001".into(),
+                    mnc: "01".into(),
+                    nr_cell_id: "000000010".into(),
+                }]),
+                ..crate::congestion_loop::LoopYaml::default()
+            })
+            .unwrap();
+        s.restore_retry = sbi_path::RestoreRetry {
+            rounds: 2,
+            first: Duration::from_millis(10),
+            max: Duration::from_millis(10),
+        };
+        s
     }
 
     /// nextgsim#465 review MAJOR 1: a throttle does not outlive pcfd. A session

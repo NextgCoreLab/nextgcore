@@ -27,6 +27,37 @@ use nextgcore_sbi::server::send_bad_request;
 use serde_json::Value;
 use std::sync::{Arc, RwLock};
 
+/// #1421: the NRF's notification carries no OAuth2 bearer (TS 33.501 §13.4.1),
+/// so the `nfStatusNotificationUri` this NWDAF subscribes with ends in an
+/// unguessable per-process token, `/nnwdaf-callback/v1/nf-status-notify/{token}`
+/// (the #940 pattern; `nf-status-notify` is in
+/// `nextgcore_sbi::log_redact::CALLBACK_TOKEN_SEGMENTS`, so logs never show it).
+/// An OAuth2-required listener admits a notification on it by that token.
+pub const CALLBACK_SEGMENT: &str = "nf-status-notify";
+
+static CALLBACK_TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// This process's NFStatusNotify callback token: a UUID v4 (122 random bits).
+pub fn callback_token() -> &'static str {
+    CALLBACK_TOKEN.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
+}
+
+/// The callback path the NFStatusSubscribe names.
+pub fn callback_path() -> String {
+    format!(
+        "/nnwdaf-callback/v1/{CALLBACK_SEGMENT}/{}",
+        callback_token()
+    )
+}
+
+/// Whether `token` is the one [`callback_path`] carries: the check both the
+/// route and the server's OAuth2 callback exemption (#1421) apply.
+pub fn holds_callback_token(token: &str) -> bool {
+    CALLBACK_TOKEN
+        .get()
+        .is_some_and(|t| nextgcore_sbi::callback_auth::token_eq(t, token))
+}
+
 /// Renew the NRF subscription when it expires within this margin (seconds).
 /// Two default dispatcher ticks (2 × 30 s) plus slack.
 const RENEW_MARGIN_SECS: u64 = 120;

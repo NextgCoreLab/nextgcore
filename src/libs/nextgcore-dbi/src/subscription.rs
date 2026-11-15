@@ -554,19 +554,7 @@ pub fn nextgcore_dbi_subscription_data(supi: &str) -> DbiResult<NextgcoreSubscri
     }
 
     // Parse slice array
-    if let Ok(slice_array) = document.get_array(NEXTGCORE_SLICE_STRING) {
-        for slice_val in slice_array {
-            if subscription_data.num_of_slice >= NEXTGCORE_MAX_NUM_OF_SLICE {
-                break;
-            }
-            if let Bson::Document(slice_doc) = slice_val {
-                if let Some(slice_data) = parse_slice_data(slice_doc) {
-                    subscription_data.slice.push(slice_data);
-                    subscription_data.num_of_slice += 1;
-                }
-            }
-        }
-    }
+    parse_subscribed_slices(&document, &mut subscription_data);
 
     // Parse MME host
     if let Ok(mme_host) = document.get_str(NEXTGCORE_MME_HOST_STRING) {
@@ -771,6 +759,25 @@ fn parse_qos(doc: &Document) -> NextgcoreQos {
     qos
 }
 
+/// Parse a subscriber document's `slice` array into `data.slice` (at most
+/// `NEXTGCORE_MAX_NUM_OF_SLICE`; entries without an `sst` are skipped). Shared by
+/// the MongoDB reads and the test store's mirror, so both parse one shape.
+pub(crate) fn parse_subscribed_slices(document: &Document, data: &mut NextgcoreSubscriptionData) {
+    if let Ok(slice_array) = document.get_array(NEXTGCORE_SLICE_STRING) {
+        for slice_val in slice_array {
+            if data.num_of_slice >= NEXTGCORE_MAX_NUM_OF_SLICE {
+                break;
+            }
+            if let Bson::Document(slice_doc) = slice_val {
+                if let Some(slice_data) = parse_slice_data(slice_doc) {
+                    data.slice.push(slice_data);
+                    data.num_of_slice += 1;
+                }
+            }
+        }
+    }
+}
+
 /// Parse slice data from BSON document
 fn parse_slice_data(doc: &Document) -> Option<NextgcoreSliceData> {
     let mut slice_data = NextgcoreSliceData::default();
@@ -947,19 +954,7 @@ pub fn nextgcore_dbi_policy_subscription(supi: &str) -> DbiResult<NextgcoreSubsc
     }
 
     // Parse slice data for policy rules
-    if let Ok(slice_array) = document.get_array(NEXTGCORE_SLICE_STRING) {
-        for slice_val in slice_array {
-            if subscription_data.num_of_slice >= NEXTGCORE_MAX_NUM_OF_SLICE {
-                break;
-            }
-            if let Bson::Document(slice_doc) = slice_val {
-                if let Some(slice_data) = parse_slice_data(slice_doc) {
-                    subscription_data.slice.push(slice_data);
-                    subscription_data.num_of_slice += 1;
-                }
-            }
-        }
-    }
+    parse_subscribed_slices(&document, &mut subscription_data);
 
     Ok(subscription_data)
 }
