@@ -17894,6 +17894,22 @@ impl NgapServer {
                     };
                     crate::namf_server::fire_location_change_report(&state.amf_ue, change);
                 }
+                // #1420: PRESENCE_IN_AOI_REPORT and UES_IN_AREA_REPORT, as
+                // `handle_handover_notify` fires them after the same write. An Xn
+                // handover produces no HandoverNotify, so without these a UE that
+                // crosses an Area of Interest boundary by Xn handover never reports
+                // the transition. TS 29.518 §6.2 PRESENCE_IN_AOI_REPORT: *"notification
+                // when a specified UE enters or leaves the specified area"*
+                // (`29518-k00.txt:23968-23978`). The emitter applies the §5.3.1 change
+                // rule (`:4893-4895`), so an Xn handover within one area stays silent.
+                // Only for an Acknowledge carrying the target's location: a Failure
+                // leaves the UE where it was.
+                if req.user_location_info.is_some() {
+                    if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
+                        crate::namf_server::fire_presence_in_aoi_report(&state.amf_ue);
+                    }
+                    crate::namf_server::fire_ues_in_area_report();
+                }
                 // #570: the UE Radio Capability ID, when the UE has one (TS 38.413 §9.2.3.9).
                 let bytes = crate::racs::add_capability_ies(bytes, racs_id.as_deref(), None);
                 self.send_to_association(association_id, &bytes).await?;
@@ -36091,6 +36107,179 @@ mod tests {
             ("0E0F10", "000077777"),
             "the TARGET's TAI and cell from the PATH SWITCH REQUEST, not the source's"
         );
+        sink.stop().await.expect("sink stop");
+    }
+
+    /// **#1420**, TS 29.518 §6.2 (`29518-k00.txt:23968-23978`): an Xn handover, whose
+    /// only N2 trace is the PATH SWITCH REQUEST, out of a subscribed Area of
+    /// Interest reports the transition: a `PRESENCE_IN_AOI_REPORT` with `OUT_OF_AREA`.
+    /// It also re-counts `UES_IN_AREA_REPORT`, here 1 UE in the target's TA. Driven
+    /// through `handle_path_switch_request` with a real APER PDU and observed at
+    /// real subscribers, as `a_handover_out_of_the_subscribed_area_reports_the_transition`
+    /// does for the N2 handover. The IN_AREA baseline is consumed first, so what
+    /// follows is the transition.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_path_switch_out_of_the_subscribed_area_reports_the_transition_1420() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let amf_ue_ngap_id = 7_142_001u64;
+        let supi = "imsi-001010000142001";
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 76, 1, false);
+        ue_ctx.registered = true;
+        ue_ctx.amf_ue.supi = Some(supi.to_string());
+        ue_ctx.amf_ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        ue_ctx.amf_ue.nr_tai.tac = 0x001420;
+        ue_ctx.amf_ue.nr_cgi.plmn_id = PlmnId::new("001", "01");
+        ue_ctx.amf_ue.nr_cgi.cell_id = 0x0001_4201;
+        let ue_snapshot = ue_ctx.amf_ue.clone();
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_publish(&ue_snapshot, 76, 1);
+        }
+
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let (tx, mut rx) = mpsc::channel::<String>(64);
+        let sink = nextgcore_sbi::SbiServer::on_listener(
+            nextgcore_sbi::SbiServerConfig::new(format!("127.0.0.1:{port}").parse().expect("addr")),
+            listener,
+        );
+        sink.start(move |req: nextgcore_sbi::SbiRequest| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(req.http.content.clone().unwrap_or_default()).await;
+                nextgcore_sbi::SbiResponse::no_content()
+            }
+        })
+        .await
+        .expect("sink start");
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let tai =
+            |tac: &str| serde_json::json!({ "plmnId": {"mcc": "001", "mnc": "01"}, "tac": tac });
+        for (body, what) in [
+            (
+                serde_json::json!({
+                    "eventList": [{
+                        "type": "PRESENCE_IN_AOI_REPORT",
+                        "areaList": [{ "presenceInfo": {
+                            "praId": "142001",
+                            "trackingAreaList": [tai("001420")],
+                        }}],
+                    }],
+                    "eventNotifyUri": format!("http://127.0.0.1:{port}/notify/1420-aoi"),
+                    "notifyCorrelationId": "corr-1420-aoi",
+                    "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                    "supi": supi,
+                }),
+                "presence",
+            ),
+            (
+                serde_json::json!({
+                    "eventList": [{
+                        "type": "UES_IN_AREA_REPORT",
+                        "areaList": [{ "presenceInfo": {
+                            "praId": "142002",
+                            "trackingAreaList": [tai("14200A")],
+                        }}],
+                    }],
+                    "eventNotifyUri": format!("http://127.0.0.1:{port}/notify/1420-count"),
+                    "notifyCorrelationId": "corr-1420-count",
+                    "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                    "anyUE": true,
+                }),
+                "count",
+            ),
+        ] {
+            let resp = crate::namf_server::namf_request_handler(
+                nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
+                    .with_json_body(&serde_json::json!({ "subscription": body }))
+                    .expect("json"),
+            )
+            .await;
+            assert_eq!(resp.status, 201, "the {what} subscription is created");
+        }
+
+        // A report for `corr`, skipping the others (other tests' any-UE fires).
+        async fn next_for(rx: &mut mpsc::Receiver<String>, corr: &str) -> serde_json::Value {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                let body = tokio::time::timeout(left, rx.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("a report for {corr}"))
+                    .expect("channel closed");
+                let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+                if v["notifyCorrelationId"].as_str() == Some(corr) {
+                    return v;
+                }
+            }
+        }
+        crate::namf_server::fire_presence_in_aoi_report(&ue_snapshot);
+        let baseline = next_for(&mut rx, "corr-1420-aoi").await;
+        assert_eq!(
+            baseline["reportList"][0]["areaList"][0]["presenceInfo"]["presenceState"], "IN_AREA",
+            "the UE starts inside the subscribed area"
+        );
+
+        // The Xn handover: target TAC 0x14200A, outside the presence area.
+        let pdu = nextgcore_ngap::builder::build_path_switch_request(
+            &nextgcore_ngap::types::PathSwitchRequest {
+                ran_ue_ngap_id: 88,
+                source_amf_ue_ngap_id: amf_ue_ngap_id,
+                user_location_info: test_user_location(0x14200A, 0x0014_200A),
+                ue_security_capabilities: nextgcore_ngap::types::UeSecurityCapabilities {
+                    nr_encryption_algorithms: 0x8000,
+                    nr_integrity_algorithms: 0x8000,
+                    eutra_encryption_algorithms: 0,
+                    eutra_integrity_algorithms: 0,
+                },
+                pdu_session_list: vec![nextgcore_ngap::types::PduSessionResourceSwitchItem {
+                    pdu_session_id: 1,
+                    transfer: vec![0x00],
+                }],
+                failed_list: None,
+            },
+        )
+        .expect("encode a PathSwitchRequest");
+        let (_smf, smf_port, _calls) = handler_tests::path_switch_smf().await;
+        ngap.sm_context_refs
+            .insert((amf_ue_ngap_id, 1), "ps1420-1".to_string());
+        ngap.sm_context_smfs
+            .insert((amf_ue_ngap_id, 1), ("127.0.0.1".to_string(), smf_port));
+        ngap.sent_ngap = Some(Vec::new());
+        let _ = ngap.handle_path_switch_request(2, &pdu).await;
+        drive_sbi(&mut ngap).await;
+        let sent = take_sent_ngap(&mut ngap);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].1[0], 0x20, "a PATH SWITCH REQUEST ACKNOWLEDGE");
+
+        let v = next_for(&mut rx, "corr-1420-aoi").await;
+        let report = &v["reportList"][0];
+        assert_eq!(report["type"], "PRESENCE_IN_AOI_REPORT", "{v}");
+        assert_eq!(report["supi"], supi);
+        assert_eq!(
+            report["areaList"][0]["presenceInfo"]["presenceState"], "OUT_OF_AREA",
+            "the Xn handover left the area: {report}"
+        );
+        assert_eq!(report["areaList"][0]["presenceInfo"]["praId"], "142001");
+        // The count names this UE's new TA. Another test's any-UE fire can deliver
+        // too, so wait for the count of 1 the path switch produces.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let v = tokio::time::timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                next_for(&mut rx, "corr-1420-count"),
+            )
+            .await
+            .expect("a UES_IN_AREA_REPORT counting the UE in the target's TA");
+            if v["reportList"][0]["numberOfUes"] == 1 {
+                break;
+            }
+        }
+        ngap.ue_auth_state.remove(amf_ue_ngap_id);
         sink.stop().await.expect("sink stop");
     }
 
