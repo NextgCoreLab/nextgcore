@@ -17,6 +17,7 @@
 #                                                #   StatefulSet (data loss, see below)
 #   DRY_RUN=true ./deploy-eks.sh                 # render + validate, apply nothing
 #   CORE_IMAGE_TAG=<t> SIM_IMAGE_TAG=<t> ./deploy-eks.sh  # deploy already-pushed tags
+#   UE_IMAGE_TAG=<t> ./deploy-eks.sh   # the ue image only, at its own tag (default: the gnb/ue tag)
 #   VERIFY_WAIT=90 ./deploy-eks.sh               # how long not-Ready replacements are
 #                                                #   re-checked before failing (#1353)
 #   PROFILE=epc ./deploy-eks.sh                  # another profile (default 5g)
@@ -95,6 +96,14 @@ fi
 # where IMAGE_TAG (one tag for both groups) cannot name them.
 CORE_TAG="${CORE_IMAGE_TAG:-${CORE_TAG}}"
 SIM_TAG="${SIM_IMAGE_TAG:-${SIM_TAG}}"
+# The ue image alone, when it is built from a different nextgsim commit than the
+# gnb (a UE-only fix under an unchanged gNB). Default: the gnb/ue tag.
+UE_TAG="${UE_IMAGE_TAG:-${SIM_TAG}}"
+if [[ "${UE_IMAGE_TAG:-}" == "latest" ]]; then
+  warn "UE_IMAGE_TAG=latest is MUTABLE: the kubectl apply below cannot detect a"
+  warn "new ue image, so the ue pod keeps the old one and the rollout wait passes"
+  warn "trivially against a stale pod. Prefer a SHA tag."
+fi
 
 # --- preflight -------------------------------------------------------------
 
@@ -151,7 +160,7 @@ if [[ "${DRY_RUN}" != "true" ]]; then
   namespace      : ${NAMESPACE}
   registry       : ${REGISTRY}/${REPO_PREFIX}
   core NF tag    : ${CORE_TAG}
-  gnb/ue tag     : ${SIM_TAG}
+  gnb/ue tag     : ${SIM_TAG}$([[ "${UE_TAG}" != "${SIM_TAG}" ]] && echo " (ue: ${UE_TAG})")
   data plane     : ${ENABLE_DATAPLANE}${DATAPLANE_NOTE}
   mongo storage  : $([[ "${EPHEMERAL_STORAGE}" == "true" ]] && echo "emptyDir (EPHEMERAL - data lost on restart)" || echo "gp3 PVC")${STORAGE_NOTE}
   AMF UE store   : ${AMF_UE_CONTEXT_STORE}
@@ -446,9 +455,9 @@ fi
 # EKS - without this every pod ends in ErrImagePull.
 log "rewriting image references to ${REGISTRY}/${REPO_PREFIX}..."
 python3 - "${RENDERED}" "${REGISTRY}" "${REPO_PREFIX}" "${CORE_TAG}" "${SIM_TAG}" \
-  "$(nextg_profile_sim_names)" <<'PY'
+  "$(nextg_profile_sim_names)" "${UE_TAG}" <<'PY'
 import re, sys
-path, registry, prefix, core_tag, sim_tag, sim_names = sys.argv[1:7]
+path, registry, prefix, core_tag, sim_tag, sim_names, ue_tag = sys.argv[1:8]
 # Simulator image names come from the profile (PROFILE_SIM_IMAGES).
 sim_alt = '|'.join(re.escape(n) for n in sim_names.split())
 src = open(path).read()
@@ -457,7 +466,8 @@ src = open(path).read()
 src, n1 = re.subn(r'nextgcore-rust/([a-z0-9]+):latest',
                   rf'{registry}/{prefix}/\1:{core_tag}', src)
 src, n2 = re.subn(rf'\bnextgsim-({sim_alt}):latest',
-                  rf'{registry}/{prefix}/\1:{sim_tag}', src)
+                  lambda m: f'{registry}/{prefix}/{m.group(1)}:'
+                            f'{ue_tag if m.group(1) == "ue" else sim_tag}', src)
 # imagePullPolicy IfNotPresent is right for Kind (images side-loaded). On EKS an
 # immutable SHA tag makes the choice moot for correctness -- a changed tag is a
 # changed spec, so the pod is recreated and pulled regardless -- but Always is
@@ -465,8 +475,8 @@ src, n2 = re.subn(rf'\bnextgsim-({sim_alt}):latest',
 src, n3 = re.subn(r'imagePullPolicy: IfNotPresent',
                   'imagePullPolicy: Always', src)
 open(path, 'w').write(src)
-print(f'  {n1} core NF images @ {core_tag}, {n2} simulator images @ {sim_tag}, '
-      f'{n3} pull policies')
+print(f'  {n1} core NF images @ {core_tag}, {n2} simulator images @ {sim_tag}'
+      + (f' (ue @ {ue_tag})' if ue_tag != sim_tag else '') + f', {n3} pull policies')
 # A Kind-local image name left anywhere means a rewrite pattern missed, which on
 # EKS is an ErrImagePull. Match on the SOURCE names rather than on a ':latest'
 # suffix: IMAGE_TAG=latest is a supported (if discouraged) override, so a
