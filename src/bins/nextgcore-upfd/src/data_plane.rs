@@ -134,6 +134,23 @@ impl GtpuPathTable {
         }
     }
 
+    /// The known state of each tracked path, by peer address (#1513): `true` when it
+    /// is FAILED, `false` when it is up and has answered an Echo Request. A peer not
+    /// yet answered and not failed has no known state and is left out. When several
+    /// paths share an address, a failed one makes the address failed: path reports
+    /// name addresses (TS 29.244 §8.2.70).
+    pub fn path_states(&self) -> HashMap<std::net::IpAddr, bool> {
+        let mut states: HashMap<std::net::IpAddr, bool> = HashMap::new();
+        for (peer, state) in &self.peers {
+            if state.path_failed {
+                states.insert(peer.ip(), true);
+            } else if state.last_success.is_some() {
+                states.entry(peer.ip()).or_insert(false);
+            }
+        }
+        states
+    }
+
     /// Called on receiving an Echo Response from `peer` carrying sequence number `seq`.
     ///
     /// #887: only an ANSWER is accepted -- a response from a peer this table probes,
@@ -10433,6 +10450,36 @@ mod tests {
     }
     /// #1417 review m2: the §7.2 path table's sequence numbers stay below 0x8000,
     /// the range the GTP-U path QoS probes use.
+    /// #1513: the path states the PFCP layer re-reports. Failed when failed (on any
+    /// port of the address), up only once answered, unknown otherwise.
+    #[test]
+    fn path_states_name_failed_and_answered_paths_only() {
+        let mut pt = GtpuPathTable::default();
+        let a: SocketAddr = "10.0.0.1:2152".parse().unwrap();
+        let a2: SocketAddr = "10.0.0.1:2153".parse().unwrap();
+        let b: SocketAddr = "10.0.0.2:2152".parse().unwrap();
+        let c: SocketAddr = "10.0.0.3:2152".parse().unwrap();
+        pt.sync_peers(&HashSet::from([a, a2, b, c]));
+        pt.miss_threshold = 1;
+        let sent = pt.tick().0;
+        for (peer, seq) in sent {
+            if peer == b || peer == a2 {
+                pt.on_echo_response(peer, Some(seq));
+            }
+        }
+        // a misses and fails; a2 and b answered; c has neither missed nor answered.
+        pt.peers.get_mut(&c).unwrap().pending_seq = None;
+        pt.tick();
+        let states = pt.path_states();
+        assert_eq!(
+            states.get(&a.ip()),
+            Some(&true),
+            "a failed port fails the address"
+        );
+        assert_eq!(states.get(&b.ip()), Some(&false));
+        assert!(!states.contains_key(&c.ip()), "never answered: unknown");
+    }
+
     #[test]
     fn path_table_sequence_numbers_stay_below_the_probe_range() {
         let peer: SocketAddr = "10.0.0.2:2152".parse().unwrap();
