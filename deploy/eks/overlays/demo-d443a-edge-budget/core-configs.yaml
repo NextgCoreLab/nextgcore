@@ -1,0 +1,92 @@
+# D443A core configs (nextgsim#471). A ConfigMap value is one string, so each
+# file is replaced whole: keep it in step with k8s/manifests/configmap.yaml.
+#
+#   nrf.yaml  trusts the CCA public keys in /etc/nextgcore/cca-trusted
+#             (nrf-cca.yaml), where scenario.sh publishes the JWKs of the EAS
+#             sidecars and the UE's EEC, so they get NRF tokens as nfType AF
+#             consumers (eees-easregistration, eees-eecregistration).
+#   smf.yaml  the base smf.yaml plus smf.n6_delay_measurement (#1502): the three
+#             EAS addresses on the dn bridge (eas.yaml), STAMP Session-Reflector
+#             port 8620 (>= 1024, so the sidecar needs no capability to bind it;
+#             provisioned to upfd in the N6 Delay Measurement Control Information),
+#             immediate + periodic every 2 s. Normative and config-only (no demo
+#             gate): with the demo off smfd still provisions it and exports
+#             smf_n6_delay_ms, and its QOS_MON notifies carry no n6Delays.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nextgcore-configs
+  namespace: nextg-system
+data:
+  nrf.yaml: |
+    logger:
+      file:
+        path: /var/log/nextgcore/nrf.log
+      level: info
+    global:
+      max:
+        ue: 1024
+        peer: 64
+    nrf:
+      serving:
+        - plmn_id:
+            mcc: 999
+            mnc: 70
+      sbi:
+        server:
+          - address: 0.0.0.0
+            advertise: nrf.nextg-system.svc.cluster.local
+            port: 7777
+        oauth2:
+          cca_trusted_keys_dir: /etc/nextgcore/cca-trusted
+  smf.yaml: |
+    logger:
+      file:
+        path: /var/log/nextgcore/smf.log
+      level: info
+    global:
+      max:
+        ue: 1024
+        peer: 64
+    smf:
+      sbi:
+        server:
+          - address: 0.0.0.0
+            port: 7777
+        client:
+          nrf:
+            - uri: http://nrf.nextg-system.svc.cluster.local:7777
+      pfcp:
+        server:
+          - address: 0.0.0.0
+            port: 8805
+        client:
+          upf:
+            - address: upf.nextg-system.svc.cluster.local
+      gtpc:
+        server:
+          - address: 0.0.0.0
+      gtpu:
+        server:
+          - address: 0.0.0.0
+      session:
+        - subnet: 10.45.0.0/16
+          gateway: 10.45.0.1
+        - subnet: 2001:db8:cafe::/48
+          gateway: 2001:db8:cafe::1
+      dns:
+        - 8.8.8.8
+        - 8.8.4.4
+        - 2001:4860:4860::8888
+        - 2001:4860:4860::8844
+      mtu: 1400
+      n6_delay_measurement:
+        endpoints:
+          - address: 10.60.0.11
+            port: 8620
+          - address: 10.60.0.12
+            port: 8620
+          - address: 10.60.0.13
+            port: 8620
+        reporting: [immediate, periodic]
+        period: 2

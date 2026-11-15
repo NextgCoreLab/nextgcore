@@ -1,0 +1,61 @@
+# Demo d443a-edge-budget (nextgsim#471): eesd picks the EAS on a UPF-measured
+# communication + compute budget. Over the demo-OFF base. Run with
+#   flock /tmp/eks-nextg-demo.lock k8s/demo-check.sh d443a-edge-budget measured-budget
+#   flock /tmp/eks-nextg-demo.lock k8s/demo-check.sh d443a-edge-budget static
+#   flock /tmp/eks-nextg-demo.lock k8s/demo-check.sh d443a-edge-budget off
+# and the extra arms of scenario.sh (D443A_ARM=...; its header lists them), or all
+# of them, built and pushed first, with run-arms.sh.
+#
+#   ees.yaml             eesd (--features demo-d443a-edge-budget), its ConfigMap
+#                        ees-config (a toggle target), Service and the labelled
+#                        stand-in EES profile at the NRF (see the file).
+#   eas.yaml             the three EAS sidecars' configs (eas.yaml is a toggle
+#                        target) and the upf-pod sidecar that builds the dn DN
+#                        (three network namespaces behind a bridge) and runs
+#                        nr-she-eas in each as nobody.
+#   patches/upf-eas.yaml the sidecar, plus upfd's UPF_NAT_EXCLUDE=10.60.0.0/24,
+#                        UPF_N6_DELAY_MEASUREMENT and UPF_QOS_FLOW_MONITORING.
+#   patches/gnb-netem.yaml  a NET_ADMIN-only sidecar in the gnb pod for Act 3's
+#                        netem on the gNB's N3 (GTP-U) egress.
+#   ue-eec.yaml, patches/ue-eec.yaml  the UE's eec: block (IP literals resolved
+#                        at pod start: the client is bound to uesimtun0).
+#   core-configs.yaml    nrf.yaml (CCA trust) and smf.yaml with the N6 delay
+#                        measurement block (#1502) for the three EAS endpoints,
+#                        STAMP on 8620.
+#   sim-configs.yaml     gnb.yaml with qos_monitoring (QMP, #509).
+#   nrf-cca*.yaml        the NRF's CCA trusted-key directory.
+#
+# Images (build-images.sh): every core NF at demo-d443a-edge-budget-<nextgcore
+# sha> (the 6G profile's features; eesd and smfd with demo-d443a-edge-budget),
+# gnb/ue at demo-d443a-edge-budget-<nextgsim sha>; the ue image carries nr-ue
+# with demo-d443a-edge-budget, nr-cli and nr-she-eas.
+#
+# ClusterIP only: the ees Service is the one addition. The EASes publish
+# nothing: they are reachable from UEs through the UPF only (dn is a bridge
+# inside the upf pod).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: nextg-demo
+resources:
+  - ../demo
+  - toggles.yaml
+  - ees.yaml
+  - eas.yaml
+  - ue-eec.yaml
+  - nrf-cca.yaml
+patches:
+  - path: core-configs.yaml
+  - path: sim-configs.yaml
+  - path: nrf-cca-mount.yaml
+  - path: patches/upf-eas.yaml
+    target:
+      kind: Deployment
+      name: upf
+  - path: patches/gnb-netem.yaml
+    target:
+      kind: Deployment
+      name: gnb
+  - path: patches/ue-eec.yaml
+    target:
+      kind: Deployment
+      name: ue

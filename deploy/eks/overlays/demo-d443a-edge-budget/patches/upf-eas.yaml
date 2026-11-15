@@ -1,0 +1,89 @@
+# The EAS sidecars and dn in the upf pod (nextgsim#471; eas.yaml says why).
+# Appended (JSON patch `/-`) so the UPF stays containers[0], which deploy-eks.sh's
+# data-plane swap and demo-check.sh's /metrics scrape address by index.
+#
+# The UPF itself gets three settings, all off by default:
+#   UPF_NAT_EXCLUDE=10.60.0.0/24   no source NAT toward dn (#1455), so the EAS
+#                                  sees the UE's 10.45.0.0/16 address;
+#   UPF_N6_DELAY_MEASUREMENT=true  UN6DM: STAMP Session-Sender toward the
+#                                  endpoints smfd provisions (#1389);
+#   UPF_QOS_FLOW_MONITORING=true   QFQM: per QoS flow QMP with the gNB (#1451).
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: UPF_NAT_EXCLUDE
+    value: 10.60.0.0/24
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: UPF_N6_DELAY_MEASUREMENT
+    value: "true"
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: UPF_QOS_FLOW_MONITORING
+    value: "true"
+# No service-account token in the pod: nothing in it calls the API server.
+- op: add
+  path: /spec/template/spec/automountServiceAccountToken
+  value: false
+- op: add
+  path: /spec/template/spec/containers/-
+  value:
+    name: she-eas
+    # The demo UE image (build-images.sh): nr-she-eas, iproute2 (ip, tc),
+    # iptables, setpriv. deploy-eks.sh rewrites the name.
+    image: nextgsim-ue:latest
+    imagePullPolicy: IfNotPresent
+    command:
+      - sh
+      - -c
+      - printf '%s\n' "${D443A_SIDECAR_SH}" >/tmp/d443a-sidecar.sh && exec sh /tmp/d443a-sidecar.sh
+    env:
+      - name: D443A_SIDECAR_SH
+        valueFrom:
+          configMapKeyRef:
+            name: d443a-eas
+            key: sidecar.sh
+      - name: D443A_EAS_YAML
+        valueFrom:
+          configMapKeyRef:
+            name: d443a-eas
+            key: eas.yaml
+      - name: D443A_EASES
+        valueFrom:
+          configMapKeyRef:
+            name: d443a-eas
+            key: eases
+      - name: RUST_LOG
+        value: info
+    # Not privileged: every capability dropped, then only what the sidecar's root
+    # shell uses:
+    #   NET_ADMIN  the bridge, veths, addresses, routes, iptables, tc (netem);
+    #   SYS_ADMIN  `ip netns add` / `ip netns exec`;
+    #   CHOWN      handing each EAS's key to nobody;
+    #   SETUID, SETGID, SETPCAP  setpriv's drop to nobody and of the bounding set.
+    # nr-she-eas itself runs as nobody with no capabilities, an empty bounding
+    # set and no_new_privs; its listeners bind 8620 and 9471 (>= 1024).
+    securityContext:
+      privileged: false
+      allowPrivilegeEscalation: false
+      runAsUser: 0
+      seccompProfile:
+        type: RuntimeDefault
+      capabilities:
+        drop: [ALL]
+        add:
+          - NET_ADMIN
+          - SYS_ADMIN
+          - CHOWN
+          - SETUID
+          - SETGID
+          - SETPCAP
+    resources:
+      requests:
+        cpu: 100m
+        memory: 64Mi
+      limits:
+        cpu: 1000m
+        memory: 256Mi

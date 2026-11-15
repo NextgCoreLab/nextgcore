@@ -1,0 +1,58 @@
+# The UE's eec: block of demo d443a-edge-budget (nextgsim#471): the EEC client
+# (TS 24.558 Eees_EECRegistration with easSelReqInd) and the AC's job, every
+# socket bound to the PDU session's TUN (uesimtun0), so the EEC reaches eesd and
+# the NRF through the UPF, and the job reaches the EAS on dn.
+#
+# A bound client takes IP literals only (a name would be resolved by the host's
+# resolver, outside the TUN; nextgsim#555 review m3). So this initContainer
+# resolves the ees and nrf Services' ClusterIPs ONCE, at pod start, on the pod
+# network, and writes them into the block (labelled: config-time resolution).
+# The demo: block is already in ue.yaml (ue.yaml is a toggle target); with the
+# demo off (no block) the eec: block is ignored by the UE.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: d443a-ue-eec
+  labels:
+    app.kubernetes.io/part-of: nextgsim
+data:
+  eec-config.sh: |
+    set -eu
+    src="$1"; f=/etc/nextgsim/ue.yaml
+    [ "$src" = "$f" ] || cp "$src" "$f"
+    if grep -qE '^(she_enabled|eec):' "$f"; then
+      echo "[d443a-eec-config] FATAL: $f already sets she_enabled/eec" >&2
+      exit 1
+    fi
+    ip_of() {   # the first IPv4 of a Service name
+      n=0
+      while [ "$n" -lt 60 ]; do
+        a="$(nslookup "$1" 2>/dev/null | sed -n 's/^Address[^:]*: *\([0-9.]*\)$/\1/p' | tail -1)"
+        [ -n "$a" ] && { echo "$a"; return 0; }
+        n=$((n+1)); sleep 2
+      done
+      echo "[d443a-eec-config] FATAL: cannot resolve $1" >&2; return 1
+    }
+    ees="$(ip_of "ees.${NAMESPACE}.svc.cluster.local")"
+    nrf="$(ip_of "nrf.${NAMESPACE}.svc.cluster.local")"
+    prefix="$(sed -nE 's/^tun_name:[[:space:]]*"?([^"[:space:]]+)"?.*/\1/p' "$f")"
+    cat >>"$f" <<YAML
+
+    she_enabled: true
+    eec:
+      ees: "http://${ees}:7777"
+      device: ${EEC_DEVICE:-${prefix:-uesimtun}0}
+      eec_id: eec-d443a-ue1
+      ac_id: ac-d443a
+      eass: [eas-local, eas-regional, eas-cloud]
+      req_comp: 100
+      deadline_ms: 15
+      job_port: 9471
+      job_timeout_ms: 1000
+      oauth2:
+        nrf: "http://${nrf}:7777"
+        nf_instance_id: 6b1d7e3c-0000-4000-8000-0000000471ec
+        cca_key_file: /tmp/d443a-cca/eec.key
+        register: true
+    YAML
+    grep -nE '^(she_enabled|eec:|demo:)' -A3 "$f"

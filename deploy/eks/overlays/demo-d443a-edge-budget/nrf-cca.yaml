@@ -1,0 +1,11 @@
+# The NRF's CCA trusted-key directory (nextgsim#471). Empty at deploy:
+# scenario.sh generates the CCA keys of the three EAS sidecars and the UE's EEC
+# outside the artefacts, and puts only the public JWKs here;
+# the kubelet syncs them into the mounted directory, and the NRF re-reads it on
+# an unknown issuer (#187). No private key is in git.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: d443a-cca-trusted
+  namespace: nextg-system
+data: {}

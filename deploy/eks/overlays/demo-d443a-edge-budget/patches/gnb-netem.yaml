@@ -1,0 +1,29 @@
+# Act 3 of demo d443a-edge-budget (nextgsim#471): netem +20 ms on the gNB's N3
+# (GTP-U, UDP 2152) egress, so the per QoS flow delay upfd measures with the
+# gNB's QMP answers (and so rtDelays in QOS_MON) rises. A sidecar sharing the gnb
+# pod's network namespace, with NET_ADMIN only (operator-approved for the
+# temporary nextg-demo pods; no node or cluster change). It runs nothing until
+# scenario.sh execs `tc` in it. Appended (`/-`), so the gNB stays containers[0].
+- op: add
+  path: /spec/template/spec/containers/-
+  value:
+    name: netem
+    image: nextgsim-ue:latest
+    imagePullPolicy: IfNotPresent
+    command: ["sh", "-c", "trap 'exit 0' TERM; while :; do sleep 3600 & wait $!; done"]
+    securityContext:
+      privileged: false
+      allowPrivilegeEscalation: false
+      runAsUser: 0
+      seccompProfile:
+        type: RuntimeDefault
+      capabilities:
+        drop: [ALL]
+        add: [NET_ADMIN]
+    resources:
+      requests:
+        cpu: 10m
+        memory: 16Mi
+      limits:
+        cpu: 100m
+        memory: 64Mi

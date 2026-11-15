@@ -1,0 +1,181 @@
+# eesd for demo d443a-edge-budget (nextgsim#471): the EES the EAS sidecars
+# register at (EDGE-3) and the UE's EEC registers at (EDGE-1), built with
+# --features demo-d443a-edge-budget. ClusterIP Service only.
+#
+# - ees.yaml (a toggle target: the demo: block is merged in at render time)
+#   holds ees.edge_budget: the QOS_MON consumer subscribes at smfd for any UE,
+#   PERIODIC every 2 s, deadline 15 ms (EES local policy). The EAS N6 endpoints
+#   are their registered endPt addresses (10.60.0.11-13), which smfd measures.
+# - JWKS: eesd verifies every eees-* token against the NRF's JWKS. The NRF
+#   generates its signing key at start, so scenario.sh fetches
+#   /nnrf-oauth2/v1/jwks once the NRF is up, stores it in the ConfigMap
+#   d443a-ees-jwks and only then scales eesd from 0 to 1 (a missing ConfigMap
+#   keeps the pod Pending: never a JWKS-less eesd that refuses everything).
+# - The QOS_MON notify carries no token (TS 33.501 §13.4.1); eesd admits it on
+#   its path token through the registered OAuth2 callback exemption (#1525).
+#
+# STAND-IN, labelled: the EES is not an NRF-registered NF (TS 29.510 NFType has
+# no EES; TS 23.558 §6.2 has EASes find the EES by pre-configuration or CAPIF),
+# and the NRF (#1391) grants an eees-* scope only if a producer of the target
+# type offering it is registered. The nrf-standin sidecar therefore registers a
+# profile with the custom nfType "EES" and the two eees-* services at the NRF,
+# and re-registers it every 30 s (heartBeatTimer 60), so the NRF can issue the
+# EAS and EEC tokens. nrfd is not relaxed, and eesd is not made an NRF client.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ees-config
+  labels:
+    app.kubernetes.io/part-of: nextgcore
+data:
+  ees.yaml: |
+    logger:
+      level: info
+    ees:
+      sbi:
+        server:
+          - address: 0.0.0.0
+            port: 7777
+      edge_budget:
+        smf_uri: http://smf.nextg-system.svc.cluster.local:7777
+        deadline_ms: 15
+        rep_period_s: 2
+  nrf-standin.sh: |
+    # The labelled stand-in EES profile at the NRF (see ees.yaml's header).
+    set -u
+    id=6b1d7e3c-0000-4000-8000-00000000471e
+    svc() { printf '{"serviceInstanceId":"%s","serviceName":"%s","versions":[{"apiVersionInUri":"v1","apiFullVersion":"1.0.0"}],"scheme":"http","nfServiceStatus":"REGISTERED"}' "$1" "$1"; }
+    body="{\"nfInstanceId\":\"${id}\",\"nfType\":\"EES\",\"nfStatus\":\"REGISTERED\",\"heartBeatTimer\":60,\"ipv4Addresses\":[\"${POD_IP}\"],\"nfServices\":[$(svc eees-easregistration),$(svc eees-eecregistration)]}"
+    while :; do
+      code="$(curl -s --http2-prior-knowledge --max-time 5 -o /dev/null -w '%{http_code}' -X PUT \
+        -H 'Content-Type: application/json' -d "${body}" \
+        "http://nrf.nextg-system.svc.cluster.local:7777/nnrf-nfm/v1/nf-instances/${id}")"
+      echo "$(date -u +%FT%TZ) [d443a nrf-standin] stand-in EES profile ${id} (nfType EES, eees-easregistration, eees-eecregistration) PUT -> ${code}"
+      sleep 30
+    done
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ees
+  labels:
+    app.kubernetes.io/name: ees
+    app.kubernetes.io/part-of: nextgcore
+spec:
+  selector:
+    app.kubernetes.io/name: ees
+  ports:
+    - name: sbi
+      port: 7777
+      targetPort: 7777
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ees
+  labels:
+    app.kubernetes.io/name: ees
+    app.kubernetes.io/part-of: nextgcore
+spec:
+  # scenario.sh scales it to 1 once d443a-ees-jwks holds the NRF's JWKS.
+  replicas: 0
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ees
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ees
+        app.kubernetes.io/part-of: nextgcore
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: ees
+          image: nextgcore-rust/ees:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "-c"
+            - "/etc/nextgcore/ees.yaml"
+            - "--sbi-addr"
+            - "0.0.0.0"
+            - "--sbi-port"
+            - "7777"
+            - "--oauth2-jwks-file"
+            - "/etc/nextgcore/jwks/jwks.json"
+          ports:
+            - containerPort: 7777
+              name: sbi
+            - containerPort: 9090
+              name: metrics
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: EES_METRICS_PORT
+              value: "9090"
+            # In-cluster only (ClusterIP); demo-check.sh scrapes it with kubectl exec.
+            - name: NEXTGCORE_METRICS_BIND
+              value: "0.0.0.0"
+            # The notifUri smfd calls back: the pod IP, never a wildcard.
+            - name: NEXTGCORE_SBI_ADVERTISE
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 300m
+              memory: 128Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nextgcore/ees.yaml
+              subPath: ees.yaml
+              readOnly: true
+            - name: jwks
+              mountPath: /etc/nextgcore/jwks
+              readOnly: true
+          readinessProbe:
+            tcpSocket:
+              port: 7777
+            initialDelaySeconds: 3
+            periodSeconds: 5
+        - name: nrf-standin
+          image: nextgcore-rust/ees:latest
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "/d443a/nrf-standin.sh"]
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          securityContext:
+            runAsUser: 65534
+            runAsGroup: 65534
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 32Mi
+          volumeMounts:
+            - name: config
+              mountPath: /d443a/nrf-standin.sh
+              subPath: nrf-standin.sh
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: ees-config
+        - name: jwks
+          configMap:
+            name: d443a-ees-jwks
