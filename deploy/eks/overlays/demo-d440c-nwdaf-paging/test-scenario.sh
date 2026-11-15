@@ -118,6 +118,37 @@ else
   nok "release/route times: far=${far} end=${end} dwell=${dwell_in}..${dwell_out} scenario-uses-waypoint-10=${scen}"
 fi
 
+# --- 2b. the check's own UE_MOBILITY query (nextgcore#1507's shape) ------------------
+# scenario.sh's mobility_query, run as it is: ana-req must carry endTs only. A
+# startTs from the builder host can land in nwdafd's past (one run cleared it
+# by 56 ms) and turn the corroboration GET into 400 BOTH_STAT_PRED_NOT_ALLOWED.
+eval "$(sed -n '/^mobility_query()/,/^}/p' "${HERE}/scenario.sh")"
+if ! declare -F mobility_query >/dev/null; then
+  nok "scenario.sh has no mobility_query()"
+else
+  q="$(mobility_query imsi-999700000000001 2026-11-15T10:00:30Z)"
+  if why="$(python3 - "${q}" <<'PY'
+import json, sys, urllib.parse as u
+p = dict(u.parse_qsl(sys.argv[1], strict_parsing=True))
+want = {"event-id": "UE_MOBILITY", "tgt-ue": {"supis": ["imsi-999700000000001"]},
+        "ana-req": {"endTs": "2026-11-15T10:00:30Z"}}
+got = {"event-id": p.get("event-id"), "tgt-ue": json.loads(p.get("tgt-ue", "null")),
+       "ana-req": json.loads(p.get("ana-req", "null"))}
+if set(p) != set(want) or got != want:
+    print("query %s, want %s" % (got, want))
+    sys.exit(1)
+PY
+)"; then
+    ok "the check's UE_MOBILITY GET sends ana-req endTs only (no startTs)"
+  else
+    nok "the check's UE_MOBILITY query: ${why}"
+  fi
+  # shellcheck disable=SC2016  # the pattern is scenario.sh's literal text
+  uses="$(grep -c '^Q="$(mobility_query "${SUPI}" ' "${HERE}/scenario.sh")"
+  if [[ "${uses}" == 1 ]]; then ok "scenario.sh's GET is built by mobility_query"
+  else nok "scenario.sh's GET does not use mobility_query (${uses})"; fi
+fi
+
 # --- 3. analyze.py on the arm fixtures ---------------------------------------------------
 # case <expect pass|fail> <fixture arm> <mode> <variant> <why: grep -F in the output> [drop] [from to]
 n=0

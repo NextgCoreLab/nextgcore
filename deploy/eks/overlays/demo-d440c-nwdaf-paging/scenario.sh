@@ -66,14 +66,28 @@ pod_of() {
 logs_of() { "${K[@]}" logs "$1" -c "$2" --timestamps 2>/dev/null; }
 # Through a file, never `logs | grep -q`: under pipefail grep's early exit
 # SIGPIPEs kubectl and turns a match into a failure (a UE log is ~35k lines).
+# One fixed scratch file under the run's artefacts, so an interrupted poll
+# leaves nothing behind outside them.
 grep_log() {
-  local f
-  f="$(mktemp)"
+  local f="${S}/.grep_log.tmp"
   logs_of "$1" "$2" >"${f}"
   grep -qE -- "$3" "${f}"
   local rc=$?
   rm -f "${f}"
   return "${rc}"
+}
+# The check's own UE_MOBILITY query string, shaped as amfd asks since
+# nextgcore#1507: ana-req carries endTs only. An absent startTs is the present
+# time at the NWDAF (TS 29.520 §4.3.2.2.2; nwdafd sbi_handler.rs `(None,
+# Some(e)) if e > now => (now, e)`), so the period is a prediction whatever
+# this host's clock or the exec latency. A startTs from this host could land
+# in nwdafd's past: one run cleared a +2 s start by 56 ms, and a miss is
+# 400 BOTH_STAT_PRED_NOT_ALLOWED.
+mobility_query() {   # <supi> <endTs, RFC 3339>
+  python3 -c '
+import json, sys, urllib.parse as u
+q = lambda v: u.quote(json.dumps(v, separators=(",", ":")), safe="")
+print("event-id=UE_MOBILITY&tgt-ue=%s&ana-req=%s" % (q({"supis": [sys.argv[1]]}), q({"endTs": sys.argv[2]})))' "$1" "$2"
 }
 UE_POD=""
 CAPTURED=false
@@ -212,20 +226,14 @@ wait_for 30 grep_log "${UE_POD}" ue 'Received RRC Release from cell' || die "the
 # --- 4. idle reselection, route end, the producer's answer ---------------------------
 python3 -c "import time; time.sleep(max(0.0, ${END_AT} + 3 - time.time()))"
 grep_log "${UE_POD}" ue 'Cell reselection: id=' || say "no Cell reselection line yet (analyze.py decides)"
-# The window starts 2 s ahead: nwdafd answers a startTs at or before its own
-# clock (RFC 3339 whole seconds here) with an endTs after it as statistics plus
-# prediction, 400 BOTH_STAT_PRED_NOT_ALLOWED (TS 29.520 §4.3.2.2.2; devtest1
-# 20261114T192632Z). A window wholly in the future is a prediction.
-NOW="$(date -u -d '+2 seconds' +%FT%TZ)"; LATER="$(date -u -d '+32 seconds' +%FT%TZ)"
-Q="$(python3 -c '
-import json, sys, urllib.parse as u
-q = lambda v: u.quote(json.dumps(v, separators=(",", ":")), safe="")
-print("event-id=UE_MOBILITY&tgt-ue=%s&ana-req=%s" % (q({"supis": [sys.argv[1]]}), q({"startTs": sys.argv[2], "endTs": sys.argv[3]})))' \
-  "${SUPI}" "${NOW}" "${LATER}")"
+# The window: nwdafd's present time to 30 s from now (mobility_query).
+LATER="$(date -u -d '+30 seconds' +%FT%TZ)"
+Q="$(mobility_query "${SUPI}" "${LATER}")"
+echo "${Q}" >"${S}/ue-mobility.query"
 "${K[@]}" exec deploy/nwdaf -c nwdaf -- sh -c \
   "curl -s --http2-prior-knowledge --max-time 10 -o /tmp/body -w '%{http_code}\n' 'http://127.0.0.1:7777/nnwdaf-analyticsinfo/v1/analytics?${Q}'; cat /tmp/body 2>/dev/null" \
   >"${S}/ue-mobility.http" 2>&1
-say "UE_MOBILITY GET (prediction window ${NOW}..${LATER}): $(head -1 "${S}/ue-mobility.http")"
+say "UE_MOBILITY GET (prediction window nwdafd-now..${LATER}, query in ue-mobility.query): $(head -1 "${S}/ue-mobility.http")"
 
 # --- 5. nwdaf-down --------------------------------------------------------------------
 if [[ "${VARIANT}" == nwdaf-down ]]; then
