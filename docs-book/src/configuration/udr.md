@@ -61,7 +61,7 @@ These are the fields actually read by the daemon. The serde structs are `UdrYaml
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `db_uri` | string | env `DB_URI`, else `mongodb://172.23.0.2/nextgcore` | MongoDB connection URI for the subscriber database (auth subscriptions, provisioned-data). Precedence: YAML `db_uri` → `DB_URI` env var → hardcoded Docker default. Credentials are masked in logs. If MongoDB init fails the daemon warns and continues with hardcoded defaults. |
+| `db_uri` | string | env `DB_URI`, else `mongodb://172.23.0.2/nextgcore` | MongoDB connection URI for the subscriber database (auth subscriptions, provisioned-data). Precedence: YAML `db_uri` → `DB_URI` env var → hardcoded Docker default. Credentials are masked in logs. If MongoDB init fails the daemon warns and continues with hardcoded defaults. When the URI sets no `serverSelectionTimeoutMS` / `connectTimeoutMS`, nextgcore-dbi sets each to 1000 ms instead of the driver's 30 s (#1462): the startup attempt, and every Nudr read against a store that has gone away, fails within about 1 s rather than holding the request for 30 s. A value the URI sets is kept. |
 | `udr.sbi.server[]` | list | absent → CLI values used | Only the **first** entry is read; extra entries are ignored. |
 | `udr.sbi.server[0].address` | string | absent → `127.0.0.1` (#1308) | SBI bind address, after `--sbi-addr` (#1312). |
 | `udr.sbi.server[0].advertise` | string | absent → the bind address, unless it is a wildcard | The host registered in the NRF NFProfile and put in callback URIs (#1312). After `--sbi-advertise` and `NEXTGCORE_SBI_ADVERTISE`. A wildcard is never advertised: with a wildcard bind and nothing set here, the NF does not register with the NRF and logs why. |

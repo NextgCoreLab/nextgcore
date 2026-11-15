@@ -322,6 +322,7 @@ mod tests {
                         svc_area: None,
                         svc_kpi: None,
                     },
+                    vendor_specific: None,
                 }),
                 trget_ees_info: None,
             }),

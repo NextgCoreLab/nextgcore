@@ -9,7 +9,28 @@ use mongodb::{
     sync::{Client, Collection, Database},
 };
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 use thiserror::Error;
+
+/// The server-selection and connect timeout every store client gets when its URI
+/// sets none (#1462). The driver's default is 30 s and no shipped `db_uri` sets
+/// either option, so with the store down each startup attempt and each runtime read
+/// waited 30 s: hssd took about 158 s to refuse to start (past a k8s liveness probe)
+/// and every udrd Nudr read held its request far past any consumer's budget. With
+/// 1 s, an unreachable store fails within about 1 s, the value pcfd has used since
+/// #1457. An operator who wants longer (a replica set that takes a while to elect a
+/// primary) sets `serverSelectionTimeoutMS` / `connectTimeoutMS` in the URI, which
+/// always wins.
+pub const STORE_DEFAULT_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// Bound `options`' server selection and connect at [`STORE_DEFAULT_TIMEOUT`], for
+/// each one the URI did not set itself (#1462).
+pub fn bound_store_timeouts(options: &mut ClientOptions) {
+    options
+        .server_selection_timeout
+        .get_or_insert(STORE_DEFAULT_TIMEOUT);
+    options.connect_timeout.get_or_insert(STORE_DEFAULT_TIMEOUT);
+}
 
 /// Database interface error types
 #[derive(Error, Debug)]
@@ -102,7 +123,8 @@ pub fn nextgcore_mongoc_init(db_uri: &str) -> DbiResult<()> {
     dbi_guard.mongoc.masked_db_uri = Some(masked_db_uri(db_uri));
 
     // Parse client options (sync version)
-    let client_options = ClientOptions::parse(db_uri)?;
+    let mut client_options = ClientOptions::parse(db_uri)?;
+    bound_store_timeouts(&mut client_options);
 
     // Get database name from URI or use default
     let db_name = client_options
@@ -263,6 +285,75 @@ pub fn reset_for_tests() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1462: every shipped URI shape (docker, k8s/Helm/EKS, EPC) sets neither
+    /// timeout, and gets both bounded at 1 s instead of the driver's 30 s.
+    #[test]
+    fn a_uri_with_no_timeouts_gets_the_store_default() {
+        for uri in [
+            "mongodb://172.23.0.2/nextgcore",
+            "mongodb://mongodb.nextg-system.svc.cluster.local:27017/nextgcore",
+            "mongodb://mongodb:27017/nextgcore",
+            "mongodb://u:p@h1,h2/nextgcore?replicaSet=rs0",
+        ] {
+            let mut options = ClientOptions::parse(uri).expect(uri);
+            bound_store_timeouts(&mut options);
+            assert_eq!(
+                options.server_selection_timeout,
+                Some(Duration::from_millis(1000)),
+                "{uri}"
+            );
+            assert_eq!(
+                options.connect_timeout,
+                Some(Duration::from_millis(1000)),
+                "{uri}"
+            );
+        }
+    }
+
+    /// The init path applies the bound (#1462): a shipped-shape URI naming a port
+    /// nothing listens on answers `Retry` in about 1 s, not after 30 s. The store stays
+    /// uninitialised, so no other test's view of the global changes.
+    #[test]
+    fn an_unreachable_store_answers_retry_within_the_bound() {
+        let started = std::time::Instant::now();
+        let result = nextgcore_dbi_init("mongodb://127.0.0.1:1/nextgcore");
+        let took = started.elapsed();
+        assert!(matches!(result, Err(DbiError::Retry)), "{result:?}");
+        assert!(
+            took < Duration::from_secs(5),
+            "took {took:?}: the 30 s driver default"
+        );
+        assert!(
+            took >= Duration::from_millis(900),
+            "took {took:?}: it did wait for selection"
+        );
+    }
+
+    /// An operator's own value wins, in any case spelling, and each option is
+    /// defaulted independently of the other.
+    #[test]
+    fn a_uri_that_sets_a_timeout_keeps_it() {
+        let mut options = ClientOptions::parse(
+            "mongodb://h/nextgcore?serverselectiontimeoutms=5000&connectTimeoutMS=3000",
+        )
+        .unwrap();
+        bound_store_timeouts(&mut options);
+        assert_eq!(
+            options.server_selection_timeout,
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(options.connect_timeout, Some(Duration::from_secs(3)));
+
+        let mut options =
+            ClientOptions::parse("mongodb://h/nextgcore?serverSelectionTimeoutMS=4000").unwrap();
+        bound_store_timeouts(&mut options);
+        assert_eq!(
+            options.server_selection_timeout,
+            Some(Duration::from_secs(4))
+        );
+        assert_eq!(options.connect_timeout, Some(Duration::from_millis(1000)));
+    }
 
     #[test]
     fn test_masked_db_uri() {
