@@ -40,6 +40,8 @@ sha2.workspace = true
 # naming a demo this build was not compiled with fails start-up.
 nextgcore-demo = { workspace = true }
 serde_yaml.workspace = true
+# nextgsim#471: the demo's callback path token, 16 bytes from the OS RNG.
+rand.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

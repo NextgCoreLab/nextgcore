@@ -82,6 +82,13 @@ pub fn active() -> bool {
     ACTIVE.load(Ordering::SeqCst)
 }
 
+/// The key of the UPF recorded for the session `smf_seid`, or `None` when none is
+/// recorded: never the default client's, so another UPF's N6 delays are never
+/// attributed to the session (#1523 review o3).
+pub fn psa_upf_key(smf_seid: u64) -> Option<String> {
+    crate::pfcp_path::recorded_client_for_session(smf_seid).map(|c| c.recovery_time_stamp_key())
+}
+
 /// The `n6Delays` array for the UPF `upf_key`: one entry per endpoint with a
 /// current result, sorted by endpoint. Empty when the SMF holds none.
 pub fn n6_delays(upf_key: &str) -> Vec<Value> {

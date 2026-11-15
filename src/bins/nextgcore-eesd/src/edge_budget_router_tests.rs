@@ -237,9 +237,15 @@ fn the_selection_follows_the_qos_mon_budget_through_the_router_471() {
     // the route's scope: refused by the gate even with the right path token, and
     // the budget does not move back.
     assert_eq!(notify_as(None, token, 6, 2), 401);
-    assert_ne!(
+    // Bearer before path token (#1523 review m1): with no bearer, a wrong path
+    // token is the same 401, so the route is no token-validity oracle.
+    assert_eq!(
+        notify_as(None, "fedcba9876543210fedcba9876543211", 6, 2),
+        401
+    );
+    assert_eq!(
         notify_as(Some(bearer(&sk, "eees-easdiscovery")), token, 6, 2),
-        204
+        403
     );
     assert_eq!(eec_register(&sk).1, ["eas-regional-471"]);
 
@@ -308,4 +314,95 @@ fn the_demo_block_is_checked_against_this_build_471() {
         #[cfg(not(feature = "demo-d443a-edge-budget"))]
         let _ = parsed;
     }
+}
+
+/// #1523 review m2: the debug request log never shows the callback token; other
+/// URIs are logged as they were.
+#[test]
+fn the_request_log_redacts_the_callback_token_471() {
+    let tok = "fedcba9876543210fedcba9876543210";
+    let uri = format!("/d443a-edge-budget/qos-mon/{tok}");
+    let line = request_log_uri(&uri);
+    assert!(!line.contains(tok), "{line}");
+    assert_eq!(line, "/d443a-edge-budget/qos-mon/<redacted>");
+    assert_eq!(
+        request_log_uri("/eees-easregistration/v1/registrations/abc"),
+        "/eees-easregistration/v1/registrations/abc"
+    );
+}
+
+/// TS 24.558 §5.2.2.2: with two AC profiles of which only one has an EAS within
+/// the deadline, the registration succeeds (step 3 ii), `24558-k00.txt:1263-1270`)
+/// with the other listed in `unfulfillAcProfs` as REQ_UNFULFILLED; with neither,
+/// it is refused 404 (step 1, `:1239-1243`).
+#[cfg(feature = "demo-d443a-edge-budget")]
+#[test]
+fn an_ac_profile_with_no_eas_within_the_deadline_is_unfulfilled_471() {
+    let _g = auth::GLOBAL_STATE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _d = edge_budget::lock_for_test();
+    ees_context_init(512);
+    let sk = signing_key();
+    auth::set_auth_jwks(jwks_for(&sk));
+    edge_budget::clear_for_test();
+    let regs = register_eases(&sk);
+    edge_budget::install(Some(edge_budget::Plan {
+        mode: edge_budget::Mode::Static,
+        config: edge_budget::Config::default(),
+        token: "fedcba9876543210fedcba9876543210".into(),
+    }));
+    let register = |profs: serde_json::Value| {
+        let body =
+            serde_json::json!({ "eecId": "eec-471-multi", "easSelReqInd": true, "acProfs": profs });
+        let r = block_on(ees_sbi_request_handler(
+            SbiRequest::post("/eees-eecregistration/v1/registrations")
+                .with_header("Authorization", bearer(&sk, "eees-eecregistration"))
+                .with_json_body(&body)
+                .unwrap(),
+        ));
+        if let Some(loc) = r.http.get_header("location") {
+            let id = loc.rsplit('/').next().unwrap().to_string();
+            if let Ok(c) = ees_self().read() {
+                c.eec_deregister(&id);
+            }
+        }
+        let v: serde_json::Value = r
+            .http
+            .content
+            .as_deref()
+            .and_then(|c| serde_json::from_str(c).ok())
+            .unwrap_or_default();
+        (r.status, v)
+    };
+    // ac-fast names eas-local (10 ms advertised), ac-slow eas-cloud (40 ms).
+    let (status, v) = register(serde_json::json!([
+        { "acId": "ac-fast", "eass": [{ "easId": "eas-local-471" }] },
+        { "acId": "ac-slow", "eass": [{ "easId": "eas-cloud-471" }] },
+    ]));
+    assert_eq!(status, 201, "{v}");
+    let ids: Vec<&str> = v["discoveredEas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["eas"]["easId"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["eas-local-471"]);
+    let unful = v
+        .get("unfulfillAcProfs")
+        .or_else(|| v.get("unfulfilledAcProfs"))
+        .cloned();
+    let unful = serde_json::to_string(&unful).unwrap();
+    assert!(
+        unful.contains("ac-slow") && unful.contains("REQ_UNFULFILLED"),
+        "{v}"
+    );
+    assert!(!unful.contains("ac-fast"), "{v}");
+    let (status, _) = register(serde_json::json!([
+        { "acId": "ac-slow", "eass": [{ "easId": "eas-cloud-471" }] },
+    ]));
+    assert_eq!(status, 404);
+    edge_budget::install(None);
+    deregister(&sk, &regs);
+    auth::clear_auth_jwks();
 }

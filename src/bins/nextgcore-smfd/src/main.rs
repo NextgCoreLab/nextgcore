@@ -847,8 +847,10 @@ fn config_root(config_path: &str) -> anyhow::Result<serde_yaml::Value> {
     match std::fs::read_to_string(config_path) {
         Ok(content) => serde_yaml::from_str(&content)
             .map_err(|e| anyhow::anyhow!("SMF config '{config_path}' does not parse: {e}")),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(serde_yaml::Value::Null),
-        Err(e) => anyhow::bail!("cannot read the SMF config '{config_path}': {e}"),
+        // A file that cannot be read is no block, exactly as `load_config` falls
+        // back to the defaults on any read error (it has already warned), so
+        // with the demo off nothing here fails where smfd did not fail before.
+        Err(_) => Ok(serde_yaml::Value::Null),
     }
 }
 
@@ -26787,6 +26789,18 @@ mod tests {
         let supi = "imsi-001010000004710";
         let (upf, reference, amf, _posts) = qos_mon_session_1390(supi, 5, true).await;
         let upf_key = upf.client.recovery_time_stamp_key();
+        // #1523 review o3: the session's own UPF, and no UPF for an unknown
+        // session even though a default client exists to fall back to.
+        // A real establishment records the session's UPF (`record_session_upf`
+        // after the Session Establishment Response); the seeded session does not.
+        assert_eq!(demo_d443a::psa_upf_key(smf_n4_seid_for(&reference)), None);
+        pfcp_path::record_session_upf(smf_n4_seid_for(&reference), &upf.client);
+        assert_eq!(
+            demo_d443a::psa_upf_key(smf_n4_seid_for(&reference)).as_deref(),
+            Some(upf_key.as_str())
+        );
+        assert!(pfcp_path::client_for_session(0x0471_dead_beef).is_some());
+        assert_eq!(demo_d443a::psa_upf_key(0x0471_dead_beef), None);
         n6_delay::insert_for_test(
             &upf_key,
             "10.60.0.11".parse().unwrap(),
@@ -28779,6 +28793,17 @@ mod demo_block_tests_471 {
         std::fs::remove_file(&p).ok();
         assert!(err.contains("UnknownKey"), "{err}");
         assert!(err.contains("d443a-edge-budget"), "{err}");
+    }
+
+    /// #1523 review NIT: an unreadable config (a directory here; EACCES alike) is
+    /// no demo block, as `load_config` falls back on any read error.
+    #[test]
+    fn an_unreadable_config_is_no_demo_block_471() {
+        let dir = std::env::temp_dir();
+        assert_eq!(
+            super::config_root(dir.to_str().unwrap()).unwrap(),
+            serde_yaml::Value::Null
+        );
     }
 
     #[cfg(feature = "demo-d443a-edge-budget")]

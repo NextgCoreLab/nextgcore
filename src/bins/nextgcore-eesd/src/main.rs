@@ -384,8 +384,14 @@ async fn main() -> Result<()> {
                 .map(|mode| edge_budget::Plan {
                     mode,
                     config: budget_config,
-                    token: edge_budget::mint_token(),
-                }),
+                    token: String::new(),
+                })
+                .map(|mut plan| {
+                    plan.token = edge_budget::mint_token()?;
+                    Ok::<_, String>(plan)
+                })
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
         );
     }
 
@@ -470,6 +476,11 @@ async fn main() -> Result<()> {
     }
 
     log::info!("Shutting down...");
+    // nextgsim#471 (#1523 review M1): give the SMF its QOS_MON subscription back.
+    #[cfg(feature = "demo-d443a-edge-budget")]
+    if edge_budget::serving() {
+        edge_budget::release_subscription(Duration::from_secs(2)).await;
+    }
     sbi_server
         .stop()
         .await
@@ -479,6 +490,16 @@ async fn main() -> Result<()> {
     log::info!("EES shutdown complete");
 
     Ok(())
+}
+
+/// The request URI as the debug log shows it: the demo's QOS_MON callback token
+/// (nextgsim#471) redacted, every other URI as it was.
+fn request_log_uri(uri: &str) -> std::borrow::Cow<'_, str> {
+    if uri.starts_with("/d443a-edge-budget/") {
+        std::borrow::Cow::Owned(nextgcore_sbi::log_redact::redact_last_segment(uri))
+    } else {
+        std::borrow::Cow::Borrowed(uri)
+    }
 }
 
 /// EES SBI request handler.
@@ -491,7 +512,7 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
 
-    log::debug!("EES SBI: {method} {uri}");
+    log::debug!("EES SBI: {method} {}", request_log_uri(uri));
 
     let path = uri.split('?').next().unwrap_or(uri);
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
@@ -1434,9 +1455,18 @@ fn apply_ac_profile_matching(
         // (budget ranking and deadline); a 404 when no EAS is within it.
         #[cfg(feature = "demo-d443a-edge-budget")]
         if let Some(choice) = edge_budget::select(reg, outcome.selected.clone()) {
-            reg.discovered_eas = Some(choice.map_err(|detail| {
+            let sel = choice.map_err(|detail| {
                 Box::new(send_not_found(&detail, Some(cause::RESOURCE_NOT_FOUND)))
-            })?);
+            })?;
+            if !sel.unfulfilled.is_empty() {
+                let mut list: Vec<eec::UnfulfilledAcProfile> =
+                    reg.unfulfilled().into_iter().cloned().collect();
+                list.extend(sel.unfulfilled.iter().map(|ac| {
+                    eec::UnfulfilledAcProfile::new(ac, eec::unfulfill_reason::REQ_UNFULFILLED)
+                }));
+                reg.set_unfulfilled(list);
+            }
+            reg.discovered_eas = Some(sel.discovered);
             return Ok(());
         }
         reg.discovered_eas = Some(

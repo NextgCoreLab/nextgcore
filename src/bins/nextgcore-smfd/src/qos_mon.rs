@@ -942,8 +942,7 @@ pub async fn on_session_report(smf_seid: u64, payload: &[u8]) {
         #[cfg(feature = "demo-d443a-edge-budget")]
         let body = {
             let mut body = body;
-            let upf_key =
-                crate::pfcp_path::client_for_session(smf_seid).map(|c| c.recovery_time_stamp_key());
+            let upf_key = crate::demo_d443a::psa_upf_key(smf_seid);
             crate::demo_d443a::extend(&mut body, upf_key.as_deref(), &r);
             body
         };

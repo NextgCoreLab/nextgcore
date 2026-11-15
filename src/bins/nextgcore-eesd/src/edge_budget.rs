@@ -10,7 +10,7 @@
 //! - The notification route `/d443a-edge-budget/qos-mon/<token>` on the
 //!   existing SBI listener, **behind eesd's per-operation OAuth2 gate** like
 //!   every other eesd route (scope [`SCOPE`], the route's apiName), and, in
-//!   addition, the unguessable path token (128 bits from a v4 UUID, minted at
+//!   addition, the unguessable path token (128 bits from the OS RNG, minted at
 //!   startup): a wrong or missing token is a 404, the notification is dropped
 //!   and counted, and nothing it carried is used.
 //!
@@ -314,10 +314,32 @@ pub fn serving() -> bool {
     plan().is_some()
 }
 
-/// A fresh notification path token: 32 hex digits (122 random bits).
-pub fn mint_token() -> String {
-    uuid::Uuid::new_v4().simple().to_string()
+/// A fresh notification path token: 16 bytes from the OS RNG, as 32 hex digits
+/// (128 random bits). An RNG failure fails start-up.
+pub fn mint_token() -> Result<String, String> {
+    use rand::TryRngCore as _;
+    let mut b = [0u8; 16];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut b)
+        .map_err(|e| format!("cannot draw the QOS_MON callback token from the OS RNG: {e}"))?;
+    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
 }
+
+/// The subscription this process holds at the SMF, `(smf_uri, Location)`, so
+/// that shutdown can delete it (#1523 review M1).
+static HELD: Mutex<Option<(String, String)>> = Mutex::new(None);
+
+/// Set once shutdown starts: the subscriber creates nothing after it.
+static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Subscribe failures, by reason. `refused` (401/403) is the stuck state of an
+/// SMF that enforces OAuth2: this EES sends no access token (nextgcore#1529).
+pub static SUBSCRIBE_FAILURES: nextgcore_metrics::nf::CounterFamily =
+    nextgcore_metrics::nf::CounterFamily::new(
+        "eees_d443a_qos_mon_subscribe_failures_total",
+        "QOS_MON Subscribe attempts at the SMF that failed, by reason (nextgsim#471 demo)",
+        &["reason"],
+    );
 
 /// Install the start-up decision. `None` is the demo off: nothing here runs.
 pub fn install(plan: Option<Plan>) {
@@ -352,6 +374,8 @@ fn mode_str(m: Mode) -> &'static str {
 pub(crate) fn clear_for_test() {
     *LATEST.lock().unwrap_or_else(|e| e.into_inner()) = None;
     SUBSCRIBED.store(false, std::sync::atomic::Ordering::SeqCst);
+    SHUTTING_DOWN.store(false, std::sync::atomic::Ordering::SeqCst);
+    *HELD.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// Test only: the latest report.
@@ -438,10 +462,15 @@ pub fn on_notify(token: &str, request: &SbiRequest) -> Option<SbiResponse> {
         }
         if let Some(sample) = sample_of(e) {
             nextgcore_demo::demo_log!(
+                debug,
+                DEMO_KEY,
+                "QOS_MON report for supi={}",
+                sample.supi.as_deref().unwrap_or("?")
+            );
+            nextgcore_demo::demo_log!(
                 info,
                 DEMO_KEY,
-                "QOS_MON supi={} rt={} ms n6=[{}]",
-                sample.supi.as_deref().unwrap_or("?"),
+                "QOS_MON rt={} ms n6=[{}]",
                 sample.rt_ms,
                 sample
                     .n6_ms
@@ -661,14 +690,30 @@ pub fn candidates(profs: &[AcProfile], matched: Vec<EasProfile>) -> Vec<Candidat
         .collect()
 }
 
+/// What the demo selected for one EEC registration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Selection {
+    /// The kept EASes, by budget.
+    pub discovered: Vec<DiscoveredEas>,
+    /// The AC profiles (acId) none of whose EASes is within the deadline: the
+    /// caller lists them in `unfulfillAcProfs` with REQ_UNFULFILLED (TS 24.558
+    /// §5.2.2.2 step 3 ii), `24558-k00.txt:1263-1270`).
+    pub unfulfilled: Vec<String>,
+}
+
 /// The demo's selection for an EEC registration that asked for one
 /// (`easSelReqInd`), from the EASes the AC profiles matched. `None` when the
-/// demo is off (the caller selects as before). `Some(Err(detail))` is "no EAS
-/// within the deadline": the caller answers 404 with `detail`.
+/// demo is off (the caller selects as before).
+///
+/// Per AC profile, as TS 24.558 §5.2.2.2 decides it: a profile none of whose
+/// EASes is within the deadline is unfulfilled and reported in the successful
+/// response (step 3 ii), `24558-k00.txt:1263-1270`); only when no EAS of any
+/// profile is within it is the request refused, `Some(Err(detail))`, which the
+/// caller answers 404 (step 1, `:1239-1243`).
 pub fn select(
     reg: &EecRegistration,
     matched: Vec<EasProfile>,
-) -> Option<Result<Vec<DiscoveredEas>, String>> {
+) -> Option<Result<Selection, String>> {
     let plan = plan()?;
     let profs = reg.ac_profs.clone().unwrap_or_default();
     let cands = candidates(&profs, matched);
@@ -697,14 +742,16 @@ pub fn select(
         .collect();
     let n3 = sample
         .as_ref()
-        .map(|s| {
-            format!(
-                " n3_rt={} supi={}",
-                s.rt_ms,
-                s.supi.as_deref().unwrap_or("?")
-            )
-        })
+        .map(|s| format!(" n3_rt={}", s.rt_ms))
         .unwrap_or_default();
+    if let Some(s) = &sample {
+        nextgcore_demo::demo_log!(
+            debug,
+            DEMO_KEY,
+            "EES-SEL n3 from the report for supi={}",
+            s.supi.as_deref().unwrap_or("?")
+        );
+    }
     let result = if selected.is_empty() { "404" } else { "201" };
     nextgcore_demo::demo_log!(
         info,
@@ -726,7 +773,24 @@ pub fn select(
             d.src.as_str()
         )));
     }
-    Some(Ok(d
+    let unfulfilled: Vec<String> = profs
+        .iter()
+        .filter(|p| {
+            p.eass.as_ref().is_some_and(|e| {
+                !e.is_empty() && !e.iter().any(|x| selected.contains(&x.eas_id.as_str()))
+            })
+        })
+        .map(|p| p.ac_id.clone())
+        .collect();
+    if !unfulfilled.is_empty() {
+        nextgcore_demo::demo_log!(
+            info,
+            DEMO_KEY,
+            "EES-SEL AC profile(s) [{}] have no EAS within the deadline: unfulfilled              (REQ_UNFULFILLED)",
+            unfulfilled.join(",")
+        );
+    }
+    let discovered = d
         .selected
         .iter()
         .map(|i| {
@@ -739,7 +803,11 @@ pub fn select(
                 })),
             }
         })
-        .collect()))
+        .collect();
+    Some(Ok(Selection {
+        discovered,
+        unfulfilled,
+    }))
 }
 
 // ============================================================================
@@ -804,6 +872,9 @@ pub async fn run_subscriber(
     let mut location: Option<String> = None;
     let mut backoff = Duration::from_secs(1);
     loop {
+        if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         match &location {
             None => {
                 let req = SbiRequest::post("/nsmf-event-exposure/v1/subscriptions").with_body(
@@ -824,20 +895,37 @@ pub async fn run_subscriber(
                              QoSMonitoring) at {smf_uri}: 201 {loc}"
                         );
                         SUBSCRIBED.store(true, std::sync::atomic::Ordering::SeqCst);
+                        *HELD.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some((smf_uri.clone(), loc.clone()));
                         location = Some(loc);
                         backoff = Duration::from_secs(1);
                     }
                     other => {
-                        let why = match other {
-                            Ok(r) => format!("status {}", r.status),
-                            Err(e) => format!("{e}"),
+                        let (reason, why) = match other {
+                            Ok(r) if r.status == 401 || r.status == 403 => {
+                                ("refused", format!("status {}", r.status))
+                            }
+                            Ok(r) => ("rejected", format!("status {}", r.status)),
+                            Err(e) => ("unreachable", format!("{e}")),
                         };
-                        nextgcore_demo::demo_log!(
-                            warn,
-                            DEMO_KEY,
-                            "Nsmf_EventExposure_Subscribe QOS_MON at {smf_uri} failed ({why}); \
-                             retrying in {backoff:?}"
-                        );
+                        SUBSCRIBE_FAILURES.inc(&[reason]);
+                        if reason == "refused" {
+                            nextgcore_demo::demo_log!(
+                                warn,
+                                DEMO_KEY,
+                                "Nsmf_EventExposure_Subscribe QOS_MON REFUSED by the SMF at \
+                                 {smf_uri} ({why}): this EES sends no OAuth2 access token \
+                                 (nextgcore#1529), so measured-budget ranks on the advertisement \
+                                 (src=static-fallback); retrying in {backoff:?}"
+                            );
+                        } else {
+                            nextgcore_demo::demo_log!(
+                                warn,
+                                DEMO_KEY,
+                                "Nsmf_EventExposure_Subscribe QOS_MON at {smf_uri} failed \
+                                 ({why}); retrying in {backoff:?}"
+                            );
+                        }
                         tokio::time::sleep(backoff).await;
                         backoff = (backoff * 2).min(Duration::from_secs(30));
                         continue;
@@ -861,6 +949,7 @@ pub async fn run_subscriber(
                              re-creating it"
                         );
                         SUBSCRIBED.store(false, std::sync::atomic::Ordering::SeqCst);
+                        *HELD.lock().unwrap_or_else(|e| e.into_inner()) = None;
                         location = None;
                         continue;
                     }
@@ -872,6 +961,42 @@ pub async fn run_subscriber(
         }
         tokio::time::sleep(interval).await;
     }
+}
+
+/// Delete the subscription this process holds at the SMF (graceful shutdown,
+/// #1523 review M1), within `timeout`; best effort. The subscriber creates no new
+/// one afterwards. A crash (SIGKILL) leaves the subscription at the SMF: smfd
+/// implements no `expiry` (TS 29.508 `NsmfEventExposure.expiry`), so it stays
+/// until smfd restarts. Returns the DELETE's status, if one was sent.
+pub async fn release_subscription(timeout: Duration) -> Option<u16> {
+    SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (smf_uri, loc) = HELD.lock().unwrap_or_else(|e| e.into_inner()).take()?;
+    SUBSCRIBED.store(false, std::sync::atomic::Ordering::SeqCst);
+    let client = client(&smf_uri)?;
+    let status = match tokio::time::timeout(
+        timeout,
+        client.send_request(SbiRequest::delete(loc.clone())),
+    )
+    .await
+    {
+        Ok(Ok(r)) => Some(r.status),
+        Ok(Err(e)) => {
+            nextgcore_demo::demo_log!(warn, DEMO_KEY, "QOS_MON unsubscribe {loc}: {e}");
+            None
+        }
+        Err(_) => {
+            nextgcore_demo::demo_log!(warn, DEMO_KEY, "QOS_MON unsubscribe {loc}: timed out");
+            None
+        }
+    };
+    if let Some(st) = status {
+        nextgcore_demo::demo_log!(
+            info,
+            DEMO_KEY,
+            "Nsmf_EventExposure_Unsubscribe QOS_MON at {smf_uri}: {st} {loc}"
+        );
+    }
+    status
 }
 
 /// The path of a `Location` value (absolute or already a path).
@@ -921,6 +1046,7 @@ pub fn render_metrics() -> String {
     nextgcore_demo::render_installed_metrics(&mut out);
     SELECTIONS.render(&mut out);
     NOTIFICATIONS.render(&mut out);
+    SUBSCRIBE_FAILURES.render(&mut out);
     nextgcore_metrics::nf::write_metric(
         &mut out,
         "eees_d443a_qos_mon_subscribed",

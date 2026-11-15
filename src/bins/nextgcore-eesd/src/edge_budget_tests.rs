@@ -333,6 +333,27 @@ fn only_the_path_token_s_notifications_are_used_471() {
     let r = notify("0123456789abcdef0123456789abcdef", "not json").unwrap();
     assert_eq!(r.status, 400);
 
+    // Only POST, and only QOS_MON entries (#1523 review o1).
+    clear_for_test();
+    let get = SbiRequest::get(format!(
+        "/{ROUTE_ROOT}/{ROUTE_QOS_MON}/0123456789abcdef0123456789abcdef"
+    ))
+    .with_body(qos_mon_body(6, 2), "application/json");
+    assert_eq!(
+        on_notify("0123456789abcdef0123456789abcdef", &get)
+            .unwrap()
+            .status,
+        405
+    );
+    assert!(latest_for_test().is_none(), "a GET is not a notification");
+    let other_event = qos_mon_body(6, 2).replace("\"QOS_MON\"", "\"PDU_SES_EST\"");
+    let r = notify("0123456789abcdef0123456789abcdef", &other_event).unwrap();
+    assert_eq!(r.status, 204);
+    assert!(
+        latest_for_test().is_none(),
+        "a PDU_SES_EST entry carries no budget"
+    );
+
     install(None);
     clear_for_test();
 }
@@ -355,8 +376,10 @@ fn the_subscription_asks_for_qos_mon_any_ue_periodic_with_qos_monitoring_471() {
         notif_uri(true, "ees.nextg", 7814, "t"),
         "https://ees.nextg:7814/d443a-edge-budget/qos-mon/t"
     );
-    assert_eq!(mint_token().len(), 32);
-    assert_ne!(mint_token(), mint_token());
+    let t = mint_token().unwrap();
+    assert_eq!(t.len(), 32);
+    assert!(t.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert_ne!(t, mint_token().unwrap());
     assert_eq!(path_of("http://smf:7777/a/b"), "/a/b");
     assert_eq!(path_of("/a/b"), "/a/b");
 }
@@ -450,5 +473,118 @@ fn a_stale_report_is_not_used_471() {
     s.at = Instant::now() - Duration::from_secs(4);
     set_latest_for_test(Some(s));
     assert!(current_sample(&cfg).is_none(), "4 s > 3 x 1 s");
+    clear_for_test();
+}
+
+/// A stand-in SMF answering POST with 201 + Location (or with `post_status`),
+/// recording every request. `(server, port, log)`.
+async fn stand_in_smf(
+    post_status: u16,
+) -> (
+    nextgcore_sbi::server::SbiServer,
+    u16,
+    Arc<Mutex<Vec<(String, String)>>>,
+) {
+    let log = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+    let sink = log.clone();
+    let (server, addr) =
+        nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+            let sink = sink.clone();
+            async move {
+                sink.lock()
+                    .unwrap()
+                    .push((req.header.method.clone(), req.header.uri.clone()));
+                match req.header.method.as_str() {
+                    "POST" if post_status == 201 => SbiResponse::with_status(201)
+                        .with_header("Location", "/nsmf-event-exposure/v1/subscriptions/s471"),
+                    "POST" => SbiResponse::with_status(post_status),
+                    "DELETE" => SbiResponse::with_status(204),
+                    _ => SbiResponse::with_status(200),
+                }
+            }
+        })
+        .await;
+    (server, addr.port(), log)
+}
+
+/// #1523 review M1: on shutdown the held subscription is DELETEd at the SMF, and
+/// the subscriber creates no other one afterwards.
+#[test]
+fn shutdown_deletes_the_held_subscription_471() {
+    let _l = lock_for_test();
+    clear_for_test();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (server, port, log) = stand_in_smf(201).await;
+        let task = tokio::spawn(run_subscriber(
+            format!("http://127.0.0.1:{port}"),
+            "http://127.0.0.1:1/d443a-edge-budget/qos-mon/t".into(),
+            2,
+            Duration::from_millis(50),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !log.lock().unwrap().iter().any(|(m, _)| m == "POST") && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            release_subscription(Duration::from_secs(2)).await,
+            Some(204)
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !task.is_finished() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(task.is_finished(), "the subscriber stops after shutdown");
+        server.stop().await.ok();
+        let l = log.lock().unwrap().clone();
+        assert!(
+            l.contains(&(
+                "DELETE".to_string(),
+                "/nsmf-event-exposure/v1/subscriptions/s471".to_string()
+            )),
+            "{l:?}"
+        );
+        assert_eq!(l.iter().filter(|(m, _)| m == "POST").count(), 1, "{l:?}");
+        // Nothing held any more: a second release sends nothing.
+        assert_eq!(release_subscription(Duration::from_secs(1)).await, None);
+    });
+    clear_for_test();
+}
+
+/// #1523 review o2: an SMF that refuses the Subscribe (401: no access token,
+/// nextgcore#1529) is counted as `refused`, not left to look like "no data".
+#[test]
+fn a_refused_subscribe_is_counted_471() {
+    let _l = lock_for_test();
+    clear_for_test();
+    let before = SUBSCRIBE_FAILURES.get(&["refused"]);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (server, port, _log) = stand_in_smf(401).await;
+        let task = tokio::spawn(run_subscriber(
+            format!("http://127.0.0.1:{port}"),
+            "http://127.0.0.1:1/d443a-edge-budget/qos-mon/t".into(),
+            2,
+            Duration::from_millis(50),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while SUBSCRIBE_FAILURES.get(&["refused"]) == before && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        task.abort();
+        server.stop().await.ok();
+    });
+    assert!(SUBSCRIBE_FAILURES.get(&["refused"]) > before);
+    assert!(render_metrics()
+        .contains("eees_d443a_qos_mon_subscribe_failures_total{reason=\"refused\"}"));
     clear_for_test();
 }
