@@ -2536,7 +2536,17 @@ mod tests {
         reservation: nextgcore_sbi::test_support::BoundListener,
         config: ScpProxyConfig,
     ) -> nextgcore_sbi::server::SbiServer {
+        start_scp_with_proxy(reservation, config).await.0
+    }
+
+    /// [`start_scp`], also handing back the proxy so a test can reach its
+    /// per-producer state (the circuit breakers, #1392).
+    async fn start_scp_with_proxy(
+        reservation: nextgcore_sbi::test_support::BoundListener,
+        config: ScpProxyConfig,
+    ) -> (nextgcore_sbi::server::SbiServer, Arc<ScpProxy>) {
         let proxy = Arc::new(ScpProxy::new(config));
+        let handle = proxy.clone();
         let (listener, addr) = reservation.into_parts();
         let server = nextgcore_sbi::server::SbiServer::on_listener(
             nextgcore_sbi::server::SbiServerConfig::new(addr),
@@ -2549,7 +2559,7 @@ mod tests {
             })
             .await
             .expect("scp start");
-        server
+        (server, handle)
     }
 
     fn fast_client(port: u16) -> SbiClient {
@@ -6238,6 +6248,11 @@ mod tests {
     /// scpd-#102: repeated producer 5xx trips the per-endpoint circuit breaker;
     /// once Open the SCP sheds load with a 503 without contacting the producer,
     /// and after the open timeout admits a single half-open probe.
+    ///
+    /// #1392: no wall-clock window. The open timeout is an hour, so the shed
+    /// request cannot arrive after it however loaded the host is, and the test
+    /// ends the window itself (`expire_open_window`) instead of sleeping past a
+    /// 200 ms timeout that a slow third request could also outlive.
     #[tokio::test]
     async fn test_circuit_breaker_opens_sheds_load_then_probes() {
         let producer_listener = reserve_port();
@@ -6247,15 +6262,21 @@ mod tests {
         let hits = Arc::new(AtomicU64::new(0));
 
         let producer = start_counting_500_producer(producer_listener, hits.clone()).await;
-        let scp = start_scp(
+        let (scp, proxy) = start_scp_with_proxy(
             scp_listener,
             ScpProxyConfig {
                 circuit_failure_threshold: 2,
-                circuit_open_timeout: Duration::from_millis(200),
+                circuit_open_timeout: Duration::from_secs(3600),
                 ..Default::default()
             },
         )
         .await;
+        use crate::circuit_breaker::CircuitState;
+        let key = ApiRoot::parse(&format!("http://127.0.0.1:{producer_port}"))
+            .expect("producer apiRoot")
+            .authority_key();
+        let breaker = || proxy.circuit_breaker_for(&key);
+        let breaker_state = || breaker().lock().unwrap_or_else(|p| p.into_inner()).state;
 
         let client = fast_client(scp_port);
         let make = || {
@@ -6269,6 +6290,7 @@ mod tests {
         assert_eq!(client.send_request(make()).await.unwrap().status, 500);
         assert_eq!(client.send_request(make()).await.unwrap().status, 500);
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(breaker_state(), CircuitState::Open);
 
         // Circuit now Open: the next request is shed with 503, producer untouched.
         let shed = client.send_request(make()).await.unwrap();
@@ -6286,9 +6308,18 @@ mod tests {
             Some("SCP-scp.5gc.local")
         );
 
-        // After the open timeout, one probe is admitted (HalfOpen) and reaches
+        assert_eq!(
+            breaker_state(),
+            CircuitState::Open,
+            "shedding keeps it Open"
+        );
+
+        // Once the open window ends, one probe is admitted (HalfOpen) and reaches
         // the producer.
-        tokio::time::sleep(Duration::from_millis(260)).await;
+        breaker()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .expire_open_window();
         let probe = client.send_request(make()).await.unwrap();
         assert_eq!(
             probe.status, 500,
@@ -6298,6 +6329,11 @@ mod tests {
             hits.load(Ordering::SeqCst),
             3,
             "the half-open probe reached the producer"
+        );
+        assert_eq!(
+            breaker_state(),
+            CircuitState::Open,
+            "the failed probe reopens the circuit"
         );
 
         scp.stop().await.expect("scp stop");

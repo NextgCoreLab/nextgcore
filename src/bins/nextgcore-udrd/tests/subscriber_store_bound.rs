@@ -159,6 +159,24 @@ async fn get_auth(sbi: &SbiClient, supi: &str) -> (u16, String) {
     )
 }
 
+/// GET the authentication subscription; answers (status, ProblemDetails cause).
+async fn get_auth_cause(sbi: &SbiClient, supi: &str) -> (u16, String) {
+    let resp = sbi
+        .get(&format!(
+            "/nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-subscription"
+        ))
+        .await
+        .unwrap_or_else(|e| {
+            panic!("no Nudr answer (the client gives up after its own 30 s): {e:?}")
+        });
+    let body: serde_json::Value =
+        serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap_or_default();
+    (
+        resp.status,
+        body["cause"].as_str().unwrap_or("").to_string(),
+    )
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_store_that_goes_down_answers_a_read_in_time() {
     let Some(mongo) = Mongo::start() else {
@@ -207,12 +225,21 @@ async fn a_store_that_goes_down_answers_a_read_in_time() {
         (200, K),
         "the store is live and was read"
     );
+    // #1534: a subscriber the live store does not hold is the one 404, with the
+    // TS 29.504 cause for it.
+    let (status, cause) = get_auth_cause(&sbi, "imsi-001010000091462").await;
+    assert_eq!((status, cause.as_str()), (404, "USER_NOT_FOUND"));
 
     mongo.kill();
     let started = Instant::now();
-    let (status, _) = get_auth(&sbi, &supi).await;
+    let (status, cause) = get_auth_cause(&sbi, &supi).await;
     let took = started.elapsed();
-    assert_ne!(status, 200, "the store really was down");
+    // #1534: an outage, not an unknown user (TS 29.500 Table 5.2.7.2-1).
+    assert_eq!(
+        (status, cause.as_str()),
+        (500, "SYSTEM_FAILURE"),
+        "the store really was down, and that is a system failure"
+    );
     assert!(
         took < Duration::from_secs(3),
         "answered in {took:?}: past the 3 s an SBI consumer here waits"
