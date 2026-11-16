@@ -5471,6 +5471,132 @@ mod tests {
         server.close();
     }
 
+    /// #1538, TS 23.401 §4.7.3 (only a GBR bearer has an MBR and a GBR), TS 29.274
+    /// §8.15/§8.16 (zero for non-GBR): a local PCC rule with a non-GBR QCI and a
+    /// configured MBR/GBR activates a bearer with no MBR or GBR, in the Create Bearer
+    /// Request, in the store and on the PGW-U (a Create QER with no MBR IE). A Bearer
+    /// Resource Command on it (QCI 8 -> 9) with a non-zero MBR in its Flow QoS is
+    /// signalled and stored with none, and its Update QER carries none: there is no
+    /// cap on the PGW-U that an absent MBR would leave in place (TS 29.244 Table
+    /// 7.5.4.5-1, upfd since #1535).
+    ///
+    /// REVERT-VERIFIED: without `drop_non_gbr_rates` in `activate`, the Create Bearer
+    /// Request carries MBR 128/128 kbit/s and the Create QER an MBR IE; without it in
+    /// `modify_on_command`, the Update Bearer Request carries MBR 256/256.
+    #[tokio::test]
+    async fn a_non_gbr_bearer_carries_no_mbr_from_activation_to_modification_1538() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let mut rule = voice_rule();
+        rule.name = "bulk".into();
+        rule.qci = 8;
+        let (server, sgw, _port, sess, pgw_c_teid) = pdn_with_local_rules(0x78, vec![rule]).await;
+        // The PFCP MBR IE header (type 26, length 10), TS 29.244 §8.2.8.
+        const MBR_IE: [u8; 4] = [0x00, 0x1a, 0x00, 0x0a];
+        let rates = |q: &nextgcore_gtp::v2::Gtp2BearerQosIe| {
+            (q.qci, q.mbr_ul, q.mbr_dl, q.gbr_ul, q.gbr_dl)
+        };
+
+        // ---- activation ----
+        let (cbr, _) = recv_type(&sgw, gtp2_message_type::CREATE_BEARER_REQUEST).await;
+        let cbr_qos = cbr
+            .bearer_context(0)
+            .unwrap()
+            .expect("a Bearer Context")
+            .bearer_qos()
+            .unwrap()
+            .expect("the Bearer QoS");
+        sgw.send_to(
+            &s5c_create_bearer_response(cbr.header.sequence_number, pgw_c_teid, 6, 16, None),
+            server.local_addr(),
+        )
+        .await
+        .expect("send");
+        let activated = stored_bearer(sess.id, 6).await.expect("EBI 6 active");
+        assert!(upf_until(&upf, |m| sent(m, &far_id_ie(0x81))).await);
+        let activation_bodies = upf.modification_bodies();
+        upf.clear_seen();
+
+        // ---- a Bearer Resource Command: QCI 8 -> 9, Flow QoS MBR 256/256 kbit/s ----
+        const SEQ: u32 = 0x8078;
+        let tad = crate::eps_tft::encode(crate::eps_tft::op::NO_TFT_OPERATION, &[]).unwrap();
+        let brc = s5c_bearer_resource_command(
+            SEQ,
+            pgw_c_teid,
+            6,
+            0x15,
+            &tad,
+            Some((9, [256, 256, 0, 0])),
+        );
+        sgw.send_to(&brc, server.local_addr()).await.expect("send");
+        let (ubr, _) = recv_type(&sgw, gtp2_message_type::UPDATE_BEARER_REQUEST).await;
+        let ubr_qos = ubr
+            .bearer_context(0)
+            .unwrap()
+            .expect("a Bearer Context")
+            .bearer_qos()
+            .unwrap()
+            .expect("the Bearer QoS: it changed");
+        sgw.send_to(
+            &s5c_bearer_answer(
+                gtp2_message_type::UPDATE_BEARER_RESPONSE,
+                SEQ,
+                pgw_c_teid,
+                6,
+                16,
+            ),
+            server.local_addr(),
+        )
+        .await
+        .expect("send");
+        assert!(
+            upf_until(&upf, |m| sent(m, &[0x00, 0x0e])).await,
+            "an Update QER"
+        );
+        let modification_bodies = upf.modification_bodies();
+        let modified = stored_bearer(sess.id, 6).await.expect("EBI 6");
+        assert_eq!(server.outstanding().await, 0);
+        server.close();
+
+        assert_eq!(rates(&cbr_qos), (8, 0, 0, 0, 0), "non-GBR: no MBR, no GBR");
+        let q = &activated.qos;
+        assert_eq!(
+            (
+                q.index,
+                q.mbr_uplink,
+                q.mbr_downlink,
+                q.gbr_uplink,
+                q.gbr_downlink
+            ),
+            (8, 0, 0, 0, 0)
+        );
+        assert!(
+            sent(&activation_bodies, &[0x00, 0x07]),
+            "a Create QER: {activation_bodies:02x?}"
+        );
+        assert!(
+            !sent(&activation_bodies, &MBR_IE),
+            "and no MBR on it: {activation_bodies:02x?}"
+        );
+        assert_eq!(rates(&ubr_qos), (9, 0, 0, 0, 0), "the QCI change, no MBR");
+        let q = &modified.qos;
+        assert_eq!(
+            (
+                q.index,
+                q.mbr_uplink,
+                q.mbr_downlink,
+                q.gbr_uplink,
+                q.gbr_downlink
+            ),
+            (9, 0, 0, 0, 0)
+        );
+        assert!(
+            !sent(&modification_bodies, &MBR_IE),
+            "the Update QER has no MBR to leave in place: {modification_bodies:02x?}"
+        );
+    }
+
     /// #619 follow-up 2: a Bearer Resource Command for a dedicated bearer whose
     /// Command-triggered procedure is still running is refused at once with a Bearer
     /// Resource Failure Indication, cause #101 "Collision with network initiated

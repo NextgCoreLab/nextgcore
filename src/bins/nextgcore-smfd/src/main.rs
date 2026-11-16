@@ -782,7 +782,8 @@ fn load_config(path: &str) -> anyhow::Result<SmfConfig> {
             }
         }
         config.mtu = smf.mtu;
-        config.pcc_rules = smf.pcc_rules.unwrap_or_default();
+        // #1538: a non-GBR rule's MBR/GBR is dropped here, with one WARN per rule.
+        config.pcc_rules = eps_bearer::checked_pcc_rules(smf.pcc_rules.unwrap_or_default());
         // #1502: an invalid block fails startup rather than leaving the measurement
         // silently unconfigured.
         if let Some(n6) = smf.n6_delay_measurement {
