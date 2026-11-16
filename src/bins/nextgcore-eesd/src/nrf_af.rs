@@ -49,6 +49,30 @@ pub fn af_profile(nf_instance_id: &str, host: &str) -> serde_json::Value {
     )
 }
 
+/// The AF's `nfInstanceId` for this process's shared instance id `shared` (the
+/// eesId). TS 29.571 `NfInstanceId` is `format: uuid`, but `--ees-id` may be any
+/// string (`ees1.example.com`). A hyphenated UUID is used as it is (lower-cased),
+/// so one id names
+/// the EES at the ECS and the NRF; anything else maps to a stable name-based UUID
+/// (RFC 9562 version 8, the first 16 octets of SHA-256 over a fixed prefix and the
+/// eesId), so a restart with the same `--ees-id` registers, and is trusted by a
+/// CCA trust store, under the same id.
+pub fn af_instance_id(shared: &str) -> String {
+    if let Ok(u) = uuid::Uuid::try_parse(shared) {
+        if u.hyphenated().to_string() == shared.to_ascii_lowercase() {
+            return u.hyphenated().to_string();
+        }
+    }
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(format!("nextgcore-ees-af:{shared}").as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    uuid::Builder::from_custom_bytes(bytes)
+        .into_uuid()
+        .hyphenated()
+        .to_string()
+}
+
 /// One NFRegister (PUT) of [`af_profile`] at `nrf_uri`.
 async fn register_once(nrf_uri: &str, nf_instance_id: &str, host: &str) -> Result<(), String> {
     let (nrf_host, nrf_port) = crate::ecs_registration::parse_host_port(nrf_uri)
@@ -84,7 +108,14 @@ async fn register_once(nrf_uri: &str, nf_instance_id: &str, host: &str) -> Resul
 /// before the registration lands is refused by the NRF and retried by the
 /// caller, which is the same state as an NRF that is down.
 pub async fn start(nrf_uri: &str, host: &str) {
-    let nf_instance_id = nextgcore_sbi::nf_instance_id::nf_instance_id(NfType::Af).to_string();
+    let shared = nextgcore_sbi::nf_instance_id::nf_instance_id(NfType::Af);
+    let nf_instance_id = af_instance_id(shared);
+    if nf_instance_id != shared {
+        log::info!(
+            "AF nfInstanceId {nf_instance_id}: derived from the eesId {shared:?}, which is not \
+             a UUID (TS 29.571 NfInstanceId); provision the CCA trust store under this id"
+        );
+    }
     let ctx = nextgcore_sbi::context::global_context();
     ctx.set_nrf_uri(nrf_uri).await;
     let _ = OAUTH2_CLIENT.set(Arc::new(OAuth2Client::new(
@@ -108,6 +139,31 @@ pub async fn start(nrf_uri: &str, host: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A UUID eesId is the AF id as it is; any other eesId (`--ees-id
+    /// ees1.example.com`) maps to a stable, canonical UUID, never to itself.
+    #[test]
+    fn the_af_instance_id_is_always_a_uuid() {
+        let id = "6b1d7e3c-1529-4000-8000-000000000001";
+        assert_eq!(af_instance_id(id), id);
+        assert_eq!(af_instance_id(&id.to_ascii_uppercase()), id);
+        for other in [
+            "ees1.example.com",
+            "ees-1",
+            "6b1d7e3c152940008000000000000001",
+            "",
+        ] {
+            let derived = af_instance_id(other);
+            let u = uuid::Uuid::try_parse(&derived).expect("a UUID");
+            assert_eq!(u.hyphenated().to_string(), derived, "canonical form");
+            assert_ne!(derived, other);
+            assert_eq!(af_instance_id(other), derived, "stable");
+        }
+        assert_ne!(
+            af_instance_id("ees1.example.com"),
+            af_instance_id("ees2.example.com")
+        );
+    }
 
     /// The profile nrfd needs to issue this EES a token: an AF instance, the
     /// three mandatory attributes, no services.

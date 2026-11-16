@@ -145,6 +145,21 @@ jobs:
         # features; about 20 s.
         run: cd src && cargo test --workspace --bin nextgcore-smfd -- --test-threads=1
 
+      - name: cargo test eesd OAuth2 e2e (real nrfd + smfd + eesd)
+        # #1529: eesd's Nsmf_EventExposure Subscribe with an NRF-issued token
+        # against an smfd that enforces OAuth2. The test is behind eesd's
+        # demo-d443a-edge-budget feature (the Subscribe exists only there), so
+        # `cargo test --workspace` compiles it out. `--workspace` keeps the feature
+        # unification of the build above (only eesd is rebuilt); the two sibling
+        # binaries are built explicitly, and the test FAILS rather than skips when
+        # one is missing with CI set.
+        run: |
+          set -eu
+          cd src
+          cargo build --workspace --bin nextgcore-nrfd --bin nextgcore-smfd
+          cargo test --workspace --features nextgcore-eesd/demo-d443a-edge-budget \
+            --test oauth2_smf_subscribe
+
       - name: cargo test (non-default features)
         # Feature-gated paths are invisible to the default build, so a gated
         # module rots uncompiled -- the reason this project normally prefers a
@@ -330,6 +345,9 @@ jobs:
         run: |
           set -eu
           cd src
+          # #1529: eesd's OAuth2 e2e test runs the real nrfd and smfd binaries
+          # (it fails, not skips, under CI when they are missing).
+          cargo build --bin nextgcore-nrfd --bin nextgcore-smfd
           for entry in $RESEARCH_FEATURES; do
             echo "::group::cargo test -p ${entry%%:*} --features ${entry#*:}"
             cargo test -p "${entry%%:*}" --features "${entry#*:}"

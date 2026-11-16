@@ -7,12 +7,15 @@
 //!   default policy), and presents the token for scope `nsmf-event-exposure`;
 //!   smfd answers 201, so the subscription is held and the refused counter stays
 //!   at 0.
+//! - With `--nrf-uri` but no client authentication, nrfd issues no token: the
+//!   Subscribe is not sent bare, it counts as `no-token`, nothing is held.
 //! - Without it, the same Subscribe carries no token and smfd refuses it: the
 //!   refused counter rises and nothing is held.
 //!
 //! nrfd and smfd are siblings of this crate's binary in the target directory.
-//! `cargo test --workspace` builds them; a `-p nextgcore-eesd` run that did not
-//! skips with a message saying so.
+//! The CI steps that run this test (feature `demo-d443a-edge-budget`) build
+//! them first; outside CI a run without them skips with a message, and in CI
+//! (`CI` set) it fails.
 #![cfg(feature = "demo-d443a-edge-budget")]
 
 use std::net::SocketAddr;
@@ -87,10 +90,21 @@ async fn smfd(bin: &Path, tag: &str, nrf: u16) -> NfProcess {
         .await
 }
 
-/// eesd with the demo on, subscribing at `smf`; with `nrf`, as an AF of it.
-async fn eesd(tag: &str, smf: u16, nrf: Option<(u16, &Path)>) -> (NfProcess, SocketAddr) {
+/// How eesd reaches the NRF.
+enum Arm<'a> {
+    /// `--nrf-uri` at this nrfd, a CCA key whose public half is published into
+    /// the nrfd's trust directory, and a non-UUID `--ees-id` (the AF id is then
+    /// derived from it).
+    Token(u16, &'a Path),
+    /// `--nrf-uri` but no CCA key: nrfd's default policy refuses the token.
+    NoCca(u16),
+    /// No `--nrf-uri`.
+    Bare,
+}
+
+/// eesd with the demo on, subscribing at `smf`, reaching the NRF per `arm`.
+async fn eesd(tag: &str, smf: u16, arm: Arm<'_>) -> (NfProcess, SocketAddr) {
     let mut metrics = 0;
-    let nrf = nrf.map(|(p, trust)| (p, trust.to_path_buf()));
     let nf = NfSpawn::new(EESD, &format!("{tag}-eesd"))
         .ready_when_logged("EES metrics endpoint on http://")
         .spawn_async(|cmd, port, dir| {
@@ -109,14 +123,37 @@ async fn eesd(tag: &str, smf: u16, nrf: Option<(u16, &Path)>) -> (NfProcess, Soc
             cmd.arg("-c")
                 .arg(&config)
                 .env("EES_METRICS_PORT", metrics.to_string());
-            if let Some((nrf, trust)) = &nrf {
-                cmd.args(["--nrf-uri", &format!("http://127.0.0.1:{nrf}")])
-                    .env("NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE", dir.join("cca.key"))
-                    .env("NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR", trust);
+            match &arm {
+                Arm::Token(nrf, trust) => {
+                    cmd.args(["--nrf-uri", &format!("http://127.0.0.1:{nrf}")])
+                        .args(["--ees-id", "ees1529.example.com"])
+                        .env("NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE", dir.join("cca.key"))
+                        .env("NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR", trust);
+                }
+                Arm::NoCca(nrf) => {
+                    cmd.args(["--nrf-uri", &format!("http://127.0.0.1:{nrf}")]);
+                }
+                Arm::Bare => {}
             }
         })
         .await;
     (nf, SocketAddr::from(([127, 0, 0, 1], metrics)))
+}
+
+/// Wait until smfd has registered at nrfd: until then nrfd has no producer to
+/// grant `nsmf-event-exposure` for and answers a token request `invalid_scope`.
+/// Read from smfd's log, since an SMF without a UPF registers UNDISCOVERABLE and
+/// no discovery returns it.
+async fn smf_registered(smf: &NfProcess) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !smf.log().contains("SMF registered with NRF") {
+        assert!(
+            Instant::now() < deadline,
+            "smfd never registered at nrfd\n--- smfd log ---\n{}",
+            smf.log()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// The value of the unlabelled sample `name`, or of `name{labels}`, if present.
@@ -149,38 +186,73 @@ async fn scrape_until(addr: SocketAddr, nf: &NfProcess, done: impl Fn(&str) -> b
 
 const SUBSCRIBED: &str = "eees_d443a_qos_mon_subscribed";
 const REFUSED: &str = "eees_d443a_qos_mon_subscribe_failures_total{reason=\"refused\"}";
+const NO_TOKEN: &str = "eees_d443a_qos_mon_subscribe_failures_total{reason=\"no-token\"}";
+
+/// Removes the CCA trust directory however the test ends.
+struct TempDir(PathBuf);
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_subscribe_carries_an_nrf_token_the_oauth2_smf_accepts() {
     let (Some(nrfd_bin), Some(smfd_bin)) = (sibling("nextgcore-nrfd"), sibling("nextgcore-smfd"))
     else {
+        // #1581 review: in CI a missing sibling is a broken job, not a pass. The
+        // CI steps that run this test build nrfd and smfd first.
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "nextgcore-nrfd / nextgcore-smfd are not built next to nextgcore-eesd ({EESD}); \
+             build them first (`cargo build --bin nextgcore-nrfd --bin nextgcore-smfd`)"
+        );
         eprintln!(
             "SKIPPED: nextgcore-nrfd / nextgcore-smfd are not built next to nextgcore-eesd \
              (`cargo test --workspace` builds them)"
         );
         return;
     };
-    let trust = std::env::temp_dir().join(format!("eesd-1529-trust-{}", std::process::id()));
-    std::fs::create_dir_all(&trust).unwrap();
+    let trust =
+        TempDir(std::env::temp_dir().join(format!("eesd-1529-trust-{}", std::process::id())));
+    std::fs::create_dir_all(&trust.0).unwrap();
+    let trust = &trust.0;
 
-    let nrf = nrfd(&nrfd_bin, "eesd-1529-token", &trust).await;
+    let nrf = nrfd(&nrfd_bin, "eesd-1529-token", trust).await;
     let smf = smfd(&smfd_bin, "eesd-1529-token", nrf.port()).await;
+    smf_registered(&smf).await;
 
-    // Token arm: held, never refused.
-    let (ees, metrics) = eesd("eesd-1529-token", smf.port(), Some((nrf.port(), &trust))).await;
+    // Token arm: held, never refused. The eesId is not a UUID, so the AF
+    // registers (and its CCA key is trusted) under the UUID derived from it.
+    let (ees, metrics) = eesd("eesd-1529-token", smf.port(), Arm::Token(nrf.port(), trust)).await;
     let body = scrape_until(metrics, &ees, |b| sample(b, SUBSCRIBED) == Some(1.0)).await;
     assert_eq!(sample(&body, REFUSED).unwrap_or(0.0), 0.0, "{body}");
+    assert_eq!(sample(&body, NO_TOKEN).unwrap_or(0.0), 0.0, "{body}");
+    let log = ees.log();
+    assert!(log.contains("registered at the NRF as AF"), "{log}");
     assert!(
-        ees.log().contains("registered at the NRF as AF"),
-        "{}",
-        ees.log()
+        log.contains("derived from the eesId \"ees1529.example.com\""),
+        "{log}"
     );
     drop(ees);
 
+    // An NRF that issues no token (no client authentication): nothing is sent
+    // bare, the failure is counted as no-token, nothing is held.
+    let (no_cca, metrics) = eesd("eesd-1529-nocca", smf.port(), Arm::NoCca(nrf.port())).await;
+    let body = scrape_until(metrics, &no_cca, |b| {
+        sample(b, NO_TOKEN).unwrap_or(0.0) >= 1.0
+    })
+    .await;
+    assert_eq!(sample(&body, SUBSCRIBED), Some(0.0), "{body}");
+    assert_eq!(
+        sample(&body, REFUSED).unwrap_or(0.0),
+        0.0,
+        "never sent bare: {body}"
+    );
+    drop(no_cca);
+
     // No token source: the same SMF refuses, nothing is held.
-    let (bare, metrics) = eesd("eesd-1529-bare", smf.port(), None).await;
+    let (bare, metrics) = eesd("eesd-1529-bare", smf.port(), Arm::Bare).await;
     let body = scrape_until(metrics, &bare, |b| sample(b, REFUSED).unwrap_or(0.0) >= 1.0).await;
     assert_eq!(sample(&body, SUBSCRIBED), Some(0.0), "{body}");
-
-    let _ = std::fs::remove_dir_all(&trust);
 }
