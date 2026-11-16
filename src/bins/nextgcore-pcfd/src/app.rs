@@ -4498,37 +4498,80 @@ fn validate_asc_req_data(asc: &AscReqData) -> Result<UeAddress, Box<SbiResponse>
     }
 }
 
-/// Resolve the PDU session an AF request is about.
+/// Resolve the PDU session an AF request is about (TS 29.514 §4.2.2.2).
+///
+/// #1583: through [`bind_one_session`], with every binding attribute the request
+/// carries: the UE address, `ipDomain` (NOTE 4), `sliceInfo` (NOTE 5), `dnn` and
+/// `supi`. "All attributes must match, if provided" (NOTE 7). A private IPv4 two
+/// sessions share is bound only when the other attributes tell them apart; it
+/// used to bind to whichever session the one-slot IPv4 index held. `gpsi` is not
+/// a session attribute this PCF holds, so it is not compared.
 ///
 /// `ueMac` is validated as a UE-address form but cannot resolve anything here:
-/// binding by MAC needs a session attribute this PCF never receives — nothing in
-/// the tree sends a MAC on the SM policy create — so it fails the binding rather
-/// than being bound to a guess. TS 29.514 §4.2.2.2's answer for "cannot
-/// associate with an existing PDU session" is exactly what the caller then
-/// returns.
-fn bind_ue_address(address: &UeAddress) -> Option<PcfSess> {
-    let ctx = pcf_self();
-    let context = ctx.read().ok()?;
-    match address {
-        UeAddress::Ipv4(ip) => context.sess_find_by_ipv4addr(ip),
-        UeAddress::Ipv6(ip) => context.sess_find_by_ipv6_ue_addr(ip),
+/// binding by MAC needs a session attribute this PCF never receives, so it fails
+/// the binding rather than being bound to a guess.
+///
+/// `Err` is the binding failure, answered by [`pdu_session_not_available`], or a
+/// 400 for a malformed `sliceInfo`.
+fn bind_af_session(
+    address: &UeAddress,
+    req_root: &serde_json::Value,
+) -> Result<PcfSess, Box<SbiResponse>> {
+    let text = |key: &str| {
+        req_root
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    let Ok(slice) = parse_binding_snssai(req_root.get("sliceInfo")) else {
+        return Err(Box::new(send_bad_request(
+            "AppSessionContextReqData.sliceInfo is not an Snssai",
+            Some("MANDATORY_IE_INCORRECT"),
+        )));
+    };
+    let binding = match address {
+        UeAddress::Ipv4(ip) => ip
+            .parse::<std::net::Ipv4Addr>()
+            .ok()
+            .map(|ip| BindingAddress::V4(u32::from(ip))),
+        UeAddress::Ipv6(ip) => ip
+            .parse::<std::net::Ipv6Addr>()
+            .ok()
+            .map(|ip| BindingAddress::V6(ip.octets())),
         UeAddress::Mac(mac) => {
             log::warn!("AF request bound by ueMac={mac}: no MAC-keyed session exists in this PCF");
             None
         }
-    }
+    };
+    let Some(binding) = binding else {
+        return Err(Box::new(pdu_session_not_available(&format!(
+            "no PDU session can be bound to {address:?}"
+        ))));
+    };
+    bind_one_session(&BindingKeys {
+        address: binding,
+        ip_domain: text("ipDomain"),
+        slice,
+        supi: text("supi"),
+        dnn: text("dnn"),
+    })
+    .map_err(|why| Box::new(pdu_session_not_available(&why)))
 }
 
-/// `403 PDU_SESSION_NOT_AVAILABLE` — TS 29.514 §4.2.2.2's answer when the PCF
-/// cannot associate an AF request with an existing PDU session.
-fn pdu_session_not_available(address: &UeAddress) -> SbiResponse {
-    SbiResponse::with_status(403)
-        .with_json_body(&serde_json::json!({
-            "status": 403,
-            "cause": "PDU_SESSION_NOT_AVAILABLE",
-            "detail": format!("No PDU session bound to {address:?}"),
-        }))
-        .unwrap_or_else(|_| SbiResponse::with_status(403))
+/// `500 PDU_SESSION_NOT_AVAILABLE`: TS 29.514 §4.2.2.2, "If the PCF fails in
+/// executing session binding, the PCF shall reject the
+/// Npcf_PolicyAuthorization_Create service operation with an HTTP "500 Internal
+/// Server Error" ... "cause" attribute set to "PDU_SESSION_NOT_AVAILABLE"" (also
+/// Table 5.7.3-1). #1583: it was a 403.
+fn pdu_session_not_available(detail: &str) -> SbiResponse {
+    log::warn!("App session create refused: {detail}");
+    nextgcore_sbi::server::send_error(
+        500,
+        "Internal Server Error",
+        detail,
+        Some("PDU_SESSION_NOT_AVAILABLE"),
+    )
 }
 
 /// Whether AscRespData is conditionally required in the response (TS 29.514
@@ -4621,13 +4664,13 @@ pub async fn handle_app_session_create(request: &SbiRequest) -> SbiResponse {
     // Bind the AF session to the PCC session via the UE address so AF-triggered
     // PCC rule changes can be pushed to the SMF. TS 29.514 §4.2.2.2: when the
     // PCF cannot associate the request with an existing PDU session it REFUSES
-    // with 403 PDU_SESSION_NOT_AVAILABLE. Before #88 it minted a UUID, stored
+    // with PDU_SESSION_NOT_AVAILABLE (500, #1583). Before #88 it minted a UUID, stored
     // nothing and answered 201, so the AF believed authorisation had succeeded
     // while no PCC rule existed and the appSessionId it was given was not
     // addressable.
-    let Some(bound_sess) = bind_ue_address(&address) else {
-        log::warn!("App session create refused: no PDU session bound to {address:?}");
-        return pdu_session_not_available(&address);
+    let bound_sess = match bind_af_session(&address, req_root) {
+        Ok(sess) => sess,
+        Err(resp) => return *resp,
     };
 
     let ctx = pcf_self();
@@ -4880,20 +4923,130 @@ fn pcscf_restoration_session_not_available(detail: &str) -> SbiResponse {
     )
 }
 
-/// #1527: the one PDU session a `PcscfRestorationRequestData` identifies (TS 29.514
-/// §4.2.2.27, Table 5.6.2.36-1).
+/// #1583: a TS 29.571 `Snssai` from JSON: `Ok(None)` when absent, `Err` when it is
+/// not one (sst 0..255; sd, when present, exactly six hex digits).
+fn parse_binding_snssai(v: Option<&serde_json::Value>) -> Result<Option<SNssai>, ()> {
+    let Some(v) = v else {
+        return Ok(None);
+    };
+    let sst = v.get("sst").and_then(|x| x.as_u64()).filter(|x| *x <= 255);
+    let sd = match v.get("sd") {
+        None => Some(None),
+        Some(sd) => sd
+            .as_str()
+            // Exactly six hex digits: `from_str_radix` alone also takes a leading '+'.
+            .filter(|sd| sd.len() == 6 && sd.chars().all(|c| c.is_ascii_hexdigit()))
+            .and_then(|sd| u32::from_str_radix(sd, 16).ok())
+            .map(Some),
+    };
+    match (sst, sd) {
+        (Some(sst), Some(sd)) => Ok(Some(SNssai { sst: sst as u8, sd })),
+        _ => Err(()),
+    }
+}
+
+/// #1583: the UE address a session binding is keyed by.
+#[derive(Debug, Clone, Copy)]
+enum BindingAddress {
+    V4(u32),
+    V6([u8; 16]),
+    /// None given (P-CSCF restoration by `supi` + `dnn`).
+    None,
+}
+
+/// #1583: what a request offers to identify a PDU session with (TS 29.514
+/// §4.2.2.2 for an AF session, §4.2.2.27 for a P-CSCF restoration).
+struct BindingKeys<'a> {
+    address: BindingAddress,
+    ip_domain: Option<&'a str>,
+    slice: Option<SNssai>,
+    supi: Option<&'a str>,
+    dnn: Option<&'a str>,
+}
+
+/// #1583 (shared with #1527): the sessions `keys` match. TS 29.514 §4.2.2.2 NOTE
+/// 7 (via TS 29.513): "in order to have a successful session binding, all
+/// attributes must match, if provided".
 ///
-/// - `ueIpv4` / `ueIpv6` (only one, NOTE 1) selects the sessions holding that
-///   address; an IPv6 address matches the session prefix that contains it.
+/// - The address selects the sessions holding that IPv4, or whose IPv6 prefix
+///   contains the IPv6 address. One scan of the session list: the IPv4 index has
+///   one slot per address, so it cannot answer for a private IPv4 two sessions
+///   share.
+/// - `sliceInfo`, `supi` and `dnn` must match (DNN as received, NOTE 2 of Table
+///   5.6.2.36-1, against the DNN or full DNN, ignoring ASCII case, TS 23.003
+///   §9.1). Filtered inside the scan, so only matching sessions are cloned.
 /// - `ipDomain` narrows an IPv4 match to the sessions the SMF reported in that
-///   IPv4 address domain (TS 29.512 NOTE 11). A session for which the SMF reported
-///   no domain still matches when none reported this one, so a P-CSCF that sends
-///   it to an SMF that does not is not refused.
-/// - `sliceInfo` narrows by S-NSSAI.
+///   domain (TS 29.512 NOTE 11); when none reported it, to the sessions with no
+///   reported domain, so an SMF that never sends `ipDomain` is not refused.
+///
+/// `Err` names why nothing can match (a SUPI with no SM association here).
+fn binding_candidates(keys: &BindingKeys) -> Result<Vec<PcfSess>, String> {
+    let ctx = pcf_self();
+    let Ok(context) = ctx.read() else {
+        return Err("the PCF context is unavailable".to_string());
+    };
+    let ue_sm_id = match keys.supi {
+        Some(supi) => match context.ue_sm_find_by_supi(supi) {
+            Some(ue_sm) => Some(ue_sm.id),
+            None => return Err(format!("no SM policy association for supi {supi}")),
+        },
+        None => None,
+    };
+    let mut candidates = context.sess_find_all(|sess| {
+        let address_matches = match keys.address {
+            BindingAddress::V4(ip) => sess.ipv4addr_string.is_some() && sess.ipv4addr == ip,
+            BindingAddress::V6(ip) => sess.ipv6prefix.is_some_and(|(len, prefix)| {
+                crate::context::ipv6_prefix_contains(&prefix, len, &ip)
+            }),
+            BindingAddress::None => true,
+        };
+        address_matches
+            && keys.slice.as_ref().is_none_or(|s| sess.s_nssai == *s)
+            && ue_sm_id.is_none_or(|id| sess.pcf_ue_sm_id == id)
+            && keys.dnn.is_none_or(|dnn| {
+                [&sess.dnn, &sess.full_dnn]
+                    .into_iter()
+                    .flatten()
+                    .any(|d| d.eq_ignore_ascii_case(dnn))
+            })
+    });
+    drop(context);
+    if let (BindingAddress::V4(_), Some(domain)) = (keys.address, keys.ip_domain) {
+        if candidates
+            .iter()
+            .any(|s| s.ip_domain.as_deref() == Some(domain))
+        {
+            candidates.retain(|s| s.ip_domain.as_deref() == Some(domain));
+        } else {
+            candidates.retain(|s| s.ip_domain.is_none());
+        }
+    }
+    Ok(candidates)
+}
+
+/// #1583: exactly one session for `keys`, else why not (none, or several).
+fn bind_one_session(keys: &BindingKeys) -> Result<PcfSess, String> {
+    let mut candidates = binding_candidates(keys)?;
+    let asked = format!(
+        "address={:?} ipDomain={:?} sliceInfo={:?} supi={:?} dnn={:?}",
+        keys.address, keys.ip_domain, keys.slice, keys.supi, keys.dnn
+    );
+    match candidates.len() {
+        1 => Ok(candidates.remove(0)),
+        0 => Err(format!("no PDU session matches {asked}")),
+        n => Err(format!(
+            "{n} PDU sessions match {asked}; the request does not identify one"
+        )),
+    }
+}
+
+/// #1527: the one PDU session a `PcscfRestorationRequestData` identifies (TS 29.514
+/// §4.2.2.27, Table 5.6.2.36-1), through [`bind_one_session`].
+///
+/// - `ueIpv4` / `ueIpv6` (only one, NOTE 1); `ipDomain` / `sliceInfo` narrow it.
 /// - Without an IP address, `supi` and `dnn` (both required) identify the
 ///   session. With one, they must agree with it: a contradicting `supi` or `dnn`
-///   identifies no session. The DNN is compared as received (NOTE 2), against
-///   the session's DNN or full DNN, ignoring ASCII case (TS 23.003 §9.1).
+///   identifies no session.
 ///
 /// No session, or more than one, is a failure to identify it: `Err` holds the
 /// `500 PDU_SESSION_NOT_AVAILABLE`, or a `400` for a request that names nothing.
@@ -4908,38 +5061,12 @@ fn identify_pcscf_restoration_session(
     };
     let (ipv4, ipv6) = (text("ueIpv4"), text("ueIpv6"));
     let (ip_domain, supi, dnn) = (text("ipDomain"), text("supi"), text("dnn"));
-    let slice = match body.get("sliceInfo") {
-        None => None,
-        Some(v) => {
-            let sst = v.get("sst").and_then(|x| x.as_u64()).filter(|x| *x <= 255);
-            // TS 29.571 Snssai.sd: 6 hex digits.
-            let sd = match v.get("sd") {
-                None => Some(None),
-                Some(sd) => sd
-                    .as_str()
-                    // Exactly six hex digits: `from_str_radix` alone also takes a
-                    // leading '+'.
-                    .filter(|sd| sd.len() == 6 && sd.chars().all(|c| c.is_ascii_hexdigit()))
-                    .and_then(|sd| u32::from_str_radix(sd, 16).ok())
-                    .map(Some),
-            };
-            match (sst, sd) {
-                (Some(sst), Some(sd)) => Some(SNssai { sst: sst as u8, sd }),
-                _ => {
-                    return Err(Box::new(send_bad_request(
-                        "PcscfRestorationRequestData.sliceInfo is not an Snssai",
-                        Some("MANDATORY_IE_INCORRECT"),
-                    )))
-                }
-            }
-        }
+    let Ok(slice) = parse_binding_snssai(body.get("sliceInfo")) else {
+        return Err(Box::new(send_bad_request(
+            "PcscfRestorationRequestData.sliceInfo is not an Snssai",
+            Some("MANDATORY_IE_INCORRECT"),
+        )));
     };
-
-    enum Address {
-        V4(u32),
-        V6([u8; 16]),
-        None,
-    }
     let address = match (ipv4, ipv6) {
         (Some(_), Some(_)) => {
             return Err(Box::new(send_bad_request(
@@ -4948,7 +5075,7 @@ fn identify_pcscf_restoration_session(
             )))
         }
         (Some(ip), None) => match ip.parse::<std::net::Ipv4Addr>() {
-            Ok(ip) => Address::V4(u32::from(ip)),
+            Ok(ip) => BindingAddress::V4(u32::from(ip)),
             Err(_) => {
                 return Err(Box::new(send_bad_request(
                     &format!("ueIpv4 {ip:?} is not an Ipv4Addr"),
@@ -4957,7 +5084,7 @@ fn identify_pcscf_restoration_session(
             }
         },
         (None, Some(ip)) => match ip.parse::<std::net::Ipv6Addr>() {
-            Ok(ip) => Address::V6(ip.octets()),
+            Ok(ip) => BindingAddress::V6(ip.octets()),
             Err(_) => {
                 return Err(Box::new(send_bad_request(
                     &format!("ueIpv6 {ip:?} is not an Ipv6Addr"),
@@ -4965,7 +5092,7 @@ fn identify_pcscf_restoration_session(
                 )))
             }
         },
-        (None, None) if supi.is_some() && dnn.is_some() => Address::None,
+        (None, None) if supi.is_some() && dnn.is_some() => BindingAddress::None,
         (None, None) => {
             return Err(Box::new(send_bad_request(
                 "PcscfRestorationRequestData requires ueIpv4 or ueIpv6, or supi and dnn",
@@ -4973,73 +5100,14 @@ fn identify_pcscf_restoration_session(
             )))
         }
     };
-
-    let ctx = pcf_self();
-    let Ok(context) = ctx.read() else {
-        return Err(Box::new(pcscf_restoration_session_not_available(
-            "the PCF context is unavailable",
-        )));
-    };
-    // A SUPI with no SM policy association here identifies no session.
-    let ue_sm_id = match supi {
-        Some(supi) => match context.ue_sm_find_by_supi(supi) {
-            Some(ue_sm) => Some(ue_sm.id),
-            None => {
-                return Err(Box::new(pcscf_restoration_session_not_available(&format!(
-                    "no SM policy association for supi {supi}"
-                ))))
-            }
-        },
-        None => None,
-    };
-    // Every member the request carries must hold for the session it applies to
-    // (§4.2.2.27: "the PCF shall identify the PDU session for which the HTTP POST
-    // request applies"): a `supi` or `dnn` that contradicts the session holding
-    // the address (an address reused by another UE) identifies none, rather than
-    // restoring the wrong UE. Filtered inside the scan, so only matching sessions
-    // are cloned.
-    let mut candidates = context.sess_find_all(|sess| {
-        let address_matches = match address {
-            Address::V4(ip) => sess.ipv4addr_string.is_some() && sess.ipv4addr == ip,
-            Address::V6(ip) => sess.ipv6prefix.is_some_and(|(len, prefix)| {
-                crate::context::ipv6_prefix_contains(&prefix, len, &ip)
-            }),
-            Address::None => true,
-        };
-        address_matches
-            && slice.as_ref().is_none_or(|s| sess.s_nssai == *s)
-            && ue_sm_id.is_none_or(|id| sess.pcf_ue_sm_id == id)
-            && dnn.is_none_or(|dnn| {
-                [&sess.dnn, &sess.full_dnn]
-                    .into_iter()
-                    .flatten()
-                    .any(|d| d.eq_ignore_ascii_case(dnn))
-            })
-    });
-    drop(context);
-    if let (Address::V4(_), Some(domain)) = (&address, ip_domain) {
-        if candidates
-            .iter()
-            .any(|s| s.ip_domain.as_deref() == Some(domain))
-        {
-            candidates.retain(|s| s.ip_domain.as_deref() == Some(domain));
-        } else {
-            candidates.retain(|s| s.ip_domain.is_none());
-        }
-    }
-    let asked = format!(
-        "ueIpv4={ipv4:?} ueIpv6={ipv6:?} ipDomain={ip_domain:?} sliceInfo={slice:?} \
-         supi={supi:?} dnn={dnn:?}"
-    );
-    match candidates.len() {
-        1 => Ok(candidates.remove(0)),
-        0 => Err(Box::new(pcscf_restoration_session_not_available(&format!(
-            "no PDU session matches {asked}"
-        )))),
-        n => Err(Box::new(pcscf_restoration_session_not_available(&format!(
-            "{n} PDU sessions match {asked}; the request does not identify one"
-        )))),
-    }
+    bind_one_session(&BindingKeys {
+        address,
+        ip_domain,
+        slice,
+        supi,
+        dnn,
+    })
+    .map_err(|why| Box::new(pcscf_restoration_session_not_available(&why)))
 }
 
 /// `POST /app-sessions/pcscf-restoration` — TS 29.514 §4.2.5 `PcscfRestoration`.
@@ -6540,7 +6608,18 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         pcf_context_init(64, 64);
-        provision_session_with_ipv4("imsi-001010000000251", 13, "10.45.0.251").await;
+        // #1583: the session is the emergency (DNN "sos") one the AF names: all
+        // binding attributes must match (TS 29.514 §4.2.2.2 NOTE 7).
+        let mut create = full_create_body("imsi-001010000000251", 13);
+        create["ipv4Address"] = serde_json::json!("10.45.0.251");
+        create["dnn"] = serde_json::json!("sos");
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(create),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "the emergency PDU session");
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
             "/npcf-policyauthorization/v1/app-sessions",
@@ -8924,7 +9003,7 @@ mod tests {
     /// `201` with a fabricated, unaddressable appSessionId.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
-    async fn create_with_unbindable_address_is_403_and_stores_nothing() {
+    async fn create_with_unbindable_address_is_500_and_stores_nothing() {
         // Serialised with every test that touches the process-global PCF context or,
         // through the handlers, the process-global NRF URI / SBI client cache (#529).
         let _guard = crate::test_support::CONTEXT_GUARD
@@ -8943,7 +9022,7 @@ mod tests {
                 Some(af_create_body("http://127.0.0.1:9/af-notif/88", address)),
             ))
             .await;
-            assert_eq!(resp.status, 403, "{address:?} must be refused");
+            assert_eq!(resp.status, 500, "{address:?} must be refused"); // #1583: TS 29.514 §4.2.2.2
             assert_eq!(
                 problem_cause_of(&resp).as_deref(),
                 Some("PDU_SESSION_NOT_AVAILABLE"),
@@ -9318,7 +9397,7 @@ mod tests {
         ))
         .await;
         assert_eq!(
-            resp.status, 403,
+            resp.status, 500,
             "an address outside the prefix must not bind"
         );
     }
@@ -9911,6 +9990,139 @@ mod tests {
             .cloned()
             .unwrap_or_default();
         loc.rsplit('/').next().unwrap().to_string()
+    }
+
+    /// #1583: an AF app-session create naming `ueIpv4` plus `extra`; answers (status,
+    /// the bound session's smPolicyId when created, ProblemDetails cause).
+    async fn af_bind_1583(ip: &str, extra: serde_json::Value) -> (u16, Option<String>, String) {
+        let mut body = af_create_body("http://127.0.0.1:9/af-notif/1583", ("ueIpv4", ip));
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions",
+            Some(body),
+        ))
+        .await;
+        let cause = problem_cause_of(&resp).unwrap_or_default();
+        let bound = resp
+            .http
+            .headers
+            .get("location")
+            .and_then(|l| l.rsplit('/').next())
+            .and_then(|id| pcf_self().read().ok()?.app_find_by_app_session_id(id))
+            .and_then(|app| pcf_self().read().ok()?.sess_find_by_id(app.sess_id))
+            .map(|sess| sess.sm_policy_id);
+        (resp.status, bound, cause)
+    }
+
+    /// #1583: TS 29.514 §4.2.2.2 NOTE 4/5/7 and TS 29.512 NOTE 11. Two sessions share
+    /// a private IPv4 in two address domains and two slices. `ipDomain` or
+    /// `sliceInfo` binds the AF session to the right one; the bare address, or an
+    /// attribute that matches neither, is a failed binding: 500
+    /// PDU_SESSION_NOT_AVAILABLE, not a binding to whichever session the IPv4 index
+    /// held. A `supi` or `dnn` that contradicts the session is refused too.
+    ///
+    /// REVERT-VERIFIED: with the create bound through the one-slot IPv4 index again
+    /// (`sess_find_by_ipv4addr`), the bare-address request binds (201) and the dom-a
+    /// request binds to the dom-b session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn af_binding_uses_ip_domain_and_slice_for_a_shared_private_ipv4_1583() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let ip = "10.158.3.1";
+        let a = sm_create_1527(
+            "imsi-001010000015831",
+            1,
+            9,
+            serde_json::json!({ "ipv4Address": ip, "ipDomain": "dom-a", "sliceInfo": { "sst": 1 } }),
+        )
+        .await;
+        let b = sm_create_1527(
+            "imsi-001010000015832",
+            1,
+            9,
+            serde_json::json!({ "ipv4Address": ip, "ipDomain": "dom-b", "sliceInfo": { "sst": 2 } }),
+        )
+        .await;
+        let not_available = (500, None, "PDU_SESSION_NOT_AVAILABLE".to_string());
+
+        let (status, bound, _) = af_bind_1583(ip, serde_json::json!({ "ipDomain": "dom-a" })).await;
+        assert_eq!((status, bound), (201, Some(a.clone())));
+        let (status, bound, _) = af_bind_1583(ip, serde_json::json!({ "ipDomain": "dom-b" })).await;
+        assert_eq!((status, bound), (201, Some(b.clone())));
+        let (status, bound, _) =
+            af_bind_1583(ip, serde_json::json!({ "sliceInfo": { "sst": 2 } })).await;
+        assert_eq!((status, bound), (201, Some(b)));
+        let (status, bound, _) = af_bind_1583(
+            ip,
+            serde_json::json!({ "supi": "imsi-001010000015831", "dnn": "internet" }),
+        )
+        .await;
+        assert_eq!(
+            (status, bound),
+            (201, Some(a)),
+            "supi + dnn tell them apart"
+        );
+
+        assert_eq!(
+            af_bind_1583(ip, serde_json::json!({})).await,
+            not_available,
+            "ambiguous"
+        );
+        assert_eq!(
+            af_bind_1583(ip, serde_json::json!({ "ipDomain": "dom-c" })).await,
+            not_available,
+            "no session in that domain, none without one"
+        );
+        assert_eq!(
+            af_bind_1583(
+                ip,
+                serde_json::json!({ "ipDomain": "dom-a", "sliceInfo": { "sst": 2 } })
+            )
+            .await,
+            not_available,
+            "all attributes must match (NOTE 7)"
+        );
+        assert_eq!(
+            af_bind_1583(ip, serde_json::json!({ "ipDomain": "dom-a", "dnn": "ims" })).await,
+            not_available,
+            "a contradicting dnn"
+        );
+        let (status, _, _) =
+            af_bind_1583(ip, serde_json::json!({ "sliceInfo": { "sst": 300 } })).await;
+        assert_eq!(status, 400, "a malformed sliceInfo");
+    }
+
+    /// #1583: an AF binding by a unique private IPv4 for which the SMF reported no
+    /// domain still binds when the AF supplies an `ipDomain` (an SMF that does not
+    /// send it), and a unique address with no other attribute binds as before.
+    ///
+    /// REVERT-VERIFIED: without the no-domain fallback in `binding_candidates`, the
+    /// ipDomain request answers 500.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn af_binding_keeps_working_without_a_reported_domain_1583() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let ip = "10.158.4.1";
+        let only = sm_create_1527(
+            "imsi-001010000025831",
+            1,
+            9,
+            serde_json::json!({ "ipv4Address": ip }),
+        )
+        .await;
+        let (status, bound, _) = af_bind_1583(ip, serde_json::json!({})).await;
+        assert_eq!((status, bound), (201, Some(only.clone())));
+        let (status, bound, _) = af_bind_1583(ip, serde_json::json!({ "ipDomain": "dom-x" })).await;
+        assert_eq!((status, bound), (201, Some(only)));
     }
 
     /// #1527: what `handle_pcscf_restoration` identifies for `body`: `Ok(smPolicyId)`,
