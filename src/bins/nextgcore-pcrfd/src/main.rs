@@ -230,6 +230,33 @@ fn main() -> Result<()> {
         log::debug!("Configuration file not found: {}", args.config);
     }
 
+    // Open the subscriber store (#1459). The Gx policy for each IP-CAN session --
+    // QCI, ARP and APN-AMBR -- is read from the subscription (TS 29.212 clauses
+    // 4.4.1, 4.5.5.7 and 4.5.5.9: from the SPR, else from local policy). Until this
+    // call nothing opened it: `--db-uri` and the YAML `db_uri` were parsed and then
+    // ignored, so every lookup failed "Database not initialized" and every CCA-I
+    // carried the local default. Opened before the Diameter listener, so no CCR is
+    // answered from the default while the store is still being reached.
+    match resolve_db_uri(args.db_uri.as_deref(), &args.config) {
+        Some(db_uri) => {
+            let stopping = || shutdown.load(Ordering::SeqCst) || SHUTDOWN.load(Ordering::SeqCst);
+            if !open_subscriber_store(
+                &db_uri,
+                STORE_CONNECT_ATTEMPTS,
+                STORE_CONNECT_BACKOFF,
+                stopping,
+            )? {
+                log::info!("Shutdown requested while opening the subscriber store");
+                pcrf_context_final();
+                return Ok(());
+            }
+        }
+        None => log::warn!(
+            "No subscriber store configured (--db-uri / db_uri): every Gx session gets the \
+             local default policy (QCI 9, APN-AMBR UL 50 / DL 100 Mbps)"
+        ),
+    }
+
     // Initialize PCRF state machine
     let mut pcrf_sm = PcrfSmContext::new();
     pcrf_sm.init(false);
@@ -379,6 +406,89 @@ fn setup_signal_handlers(shutdown: Arc<AtomicBool>) -> Result<()> {
     Ok(())
 }
 
+/// How many times startup tries to reach the subscriber store before giving up
+/// (#1459), so a store that comes up a little after the PCRF (docker compose, a pod
+/// restart) is still found. The same count and backoff as hssd (#478) and pcfd
+/// (#1457). Each attempt waits for one server selection, which nextgcore-dbi
+/// bounds unless the URI sets `serverSelectionTimeoutMS` itself.
+const STORE_CONNECT_ATTEMPTS: u32 = 5;
+
+/// The pause between two store connection attempts.
+const STORE_CONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The subscriber-store URI (#1459): `--db-uri` wins over the config file's
+/// top-level `db_uri` (the key the shipped `docker/rust/configs/epc/pcrf.yaml`
+/// sets), the same CLI-over-YAML precedence as hssd and pcfd. `None` when neither
+/// names one, or when the config is absent; a config that does not parse has
+/// already failed startup in `pcrf_context_parse_config`.
+fn resolve_db_uri(cli: Option<&str>, config_path: &str) -> Option<String> {
+    if let Some(uri) = cli.map(str::trim).filter(|u| !u.is_empty()) {
+        return Some(uri.to_string());
+    }
+    #[derive(serde::Deserialize)]
+    struct TopLevel {
+        db_uri: Option<String>,
+    }
+    let content = std::fs::read_to_string(config_path).ok()?;
+    serde_yaml::from_str::<TopLevel>(&content)
+        .ok()?
+        .db_uri
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+}
+
+/// Open nextgcore-dbi's subscriber collection (#1459), retrying only the "server
+/// not reachable yet" failure. A malformed URI fails on the first attempt and an
+/// unreachable store after `attempts`: either way startup stops, so the PCRF never
+/// answers a CCR with a policy it had to invent for a subscriber it could not read.
+/// `Ok(false)` when `stopping` turned true during the wait (a SIGTERM), so the
+/// caller exits cleanly rather than being killed at the end of its grace period.
+fn open_subscriber_store(
+    db_uri: &str,
+    attempts: u32,
+    backoff: std::time::Duration,
+    stopping: impl Fn() -> bool,
+) -> Result<bool> {
+    let mut attempt = 1;
+    loop {
+        match nextgcore_dbi::nextgcore_dbi_init(db_uri) {
+            Ok(()) => {
+                log::info!("Subscriber store opened");
+                return Ok(true);
+            }
+            Err(nextgcore_dbi::mongoc::DbiError::Retry) if attempt < attempts => {
+                log::warn!(
+                    "Subscriber store not reachable (attempt {attempt}/{attempts}); retrying"
+                );
+                attempt += 1;
+                let until = std::time::Instant::now() + backoff;
+                while std::time::Instant::now() < until {
+                    if stopping() {
+                        return Ok(false);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                if stopping() {
+                    return Ok(false);
+                }
+            }
+            Err(e) => {
+                // `Retry` displays as "Retry needed", which reads as advice rather
+                // than as the reason startup stopped.
+                let why = match e {
+                    nextgcore_dbi::mongoc::DbiError::Retry => {
+                        "the server did not answer".to_string()
+                    }
+                    other => other.to_string(),
+                };
+                return Err(anyhow::anyhow!(
+                    "cannot open the subscriber store after {attempt} attempt(s): {why}"
+                ));
+            }
+        }
+    }
+}
+
 /// Main event loop
 fn run_event_loop(pcrf_sm: &mut PcrfSmContext, shutdown: Arc<AtomicBool>) -> Result<()> {
     log::debug!("Entering main event loop");
@@ -418,6 +528,101 @@ fn cleanup(pcrf_sm: &mut PcrfSmContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A config file in its own scratch directory, removed on drop.
+    struct ScratchConfig(std::path::PathBuf);
+    impl ScratchConfig {
+        fn new(name: &str, body: &str) -> ScratchConfig {
+            let dir =
+                std::env::temp_dir().join(format!("pcrfd-1459-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("pcrf.yaml"), body).unwrap();
+            ScratchConfig(dir)
+        }
+        fn path(&self) -> String {
+            self.0.join("pcrf.yaml").to_string_lossy().into_owned()
+        }
+    }
+    impl Drop for ScratchConfig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0.join("pcrf.yaml"));
+            let _ = std::fs::remove_dir(&self.0);
+        }
+    }
+
+    /// #1459: the shipped pcrf.yaml's top-level `db_uri` is what pcrfd opens, and
+    /// `--db-uri` wins over it.
+    #[test]
+    fn the_store_uri_comes_from_the_cli_then_the_config() {
+        let cfg = ScratchConfig::new(
+            "uri",
+            "db_uri: mongodb://mongodb:27017/nextgcore\npcrf: {}\n",
+        );
+        assert_eq!(
+            resolve_db_uri(None, &cfg.path()).as_deref(),
+            Some("mongodb://mongodb:27017/nextgcore")
+        );
+        assert_eq!(
+            resolve_db_uri(Some("mongodb://from-cli:27017/x"), &cfg.path()).as_deref(),
+            Some("mongodb://from-cli:27017/x")
+        );
+        // An empty flag is unset, not an override.
+        assert_eq!(
+            resolve_db_uri(Some("  "), &cfg.path()).as_deref(),
+            Some("mongodb://mongodb:27017/nextgcore")
+        );
+        let none = ScratchConfig::new("none", "pcrf: {}\n");
+        assert_eq!(resolve_db_uri(None, &none.path()), None);
+        assert_eq!(resolve_db_uri(None, "/nonexistent/pcrf.yaml"), None);
+    }
+
+    /// A malformed URI is a configuration error: refused on the first attempt.
+    #[test]
+    fn a_malformed_store_uri_fails_without_retrying() {
+        let started = std::time::Instant::now();
+        let err = open_subscriber_store(
+            "not-a-mongodb-uri",
+            5,
+            std::time::Duration::from_secs(5),
+            || false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("after 1 attempt(s)"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// An unreachable store is retried, then startup fails.
+    #[test]
+    fn an_unreachable_store_is_retried_then_fatal() {
+        let err = open_subscriber_store(
+            "mongodb://127.0.0.1:1/nextgcore?serverSelectionTimeoutMS=100&connectTimeoutMS=100",
+            2,
+            std::time::Duration::from_millis(10),
+            || false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "cannot open the subscriber store after 2 attempt(s): the server did not answer"
+        );
+    }
+
+    /// A shutdown requested during the backoff ends the retry cleanly.
+    #[test]
+    fn a_shutdown_during_the_retry_stops_it() {
+        let started = std::time::Instant::now();
+        let opened = open_subscriber_store(
+            "mongodb://127.0.0.1:1/nextgcore?serverSelectionTimeoutMS=100&connectTimeoutMS=100",
+            5,
+            std::time::Duration::from_secs(30),
+            || true,
+        )
+        .expect("a requested shutdown is not an error");
+        assert!(!opened);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
 
     #[test]
     fn test_args_default() {

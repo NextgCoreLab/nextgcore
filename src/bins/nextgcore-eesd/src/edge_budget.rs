@@ -8,19 +8,20 @@
 //!   (`supportedFeatures` "10", feature 5). It checks the subscription every
 //!   [`CHECK_INTERVAL`] and re-creates it on a 404 (an SMF restart loses it).
 //! - The notification route `/d443a-edge-budget/qos-mon/<token>` on the
-//!   existing SBI listener, **behind eesd's per-operation OAuth2 gate** like
-//!   every other eesd route (scope [`SCOPE`], the route's apiName), and, in
-//!   addition, the unguessable path token (128 bits from the OS RNG, minted at
-//!   startup): a wrong or missing token is a 404, the notification is dropped
-//!   and counted, and nothing it carried is used.
+//!   existing SBI listener, authenticated by its unguessable path token (128
+//!   bits from the OS RNG, minted at startup): a wrong or missing token is a
+//!   404, the notification is dropped and counted, and nothing it carried is
+//!   used.
 //!
 //!   TS 33.501 §13.4.1 (*"The OAuth 2.0 framework does not apply to the
 //!   notification operation"*) and TS 29.500 §6.7.3 mean smfd's notify carries
-//!   no token, so until the route is registered through the shared callback
-//!   exemption (nextgcore#1421, PR #1519) a token-less notify gets 401. That is
-//!   deliberate: no NF-local exemption is shipped here. The follow-up registers
-//!   `POST /d443a-edge-budget/qos-mon/{token}` with [`token_is_current`] as the
-//!   check.
+//!   no token. The route is registered through the shared callback exemption
+//!   (#1519's `OAuth2CallbackExemption`, `POST /d443a-edge-budget/qos-mon/{token}`
+//!   with [`token_is_current`] as the check), which eesd's per-route gate
+//!   consults (#1525): a token-less notify on the current token is admitted;
+//!   with any other path token it is held to the bearer (401, so the route is no
+//!   token-validity oracle). A notify that does carry a bearer needs scope
+//!   [`SCOPE`].
 //! - The selection policy (TS 24.558 §5.2.2.2 step 1 iii) B), *"based on EES
 //!   local policies"*): with `easSelReqInd`, the EASes that matched the AC
 //!   profiles are ranked on a budget and filtered by the deadline
@@ -364,8 +365,8 @@ pub fn install(plan: Option<Plan>) {
             warn,
             DEMO_KEY,
             "edge-budget: on (mode={}, deadline={} ms local policy, QOS_MON from {}, \
-             N6 endpoints {:?}); the QOS_MON callback is behind the OAuth2 gate and its \
-             path token (no callback exemption until nextgcore#1421)",
+             N6 endpoints {:?}); the QOS_MON callback is authenticated by its path \
+             token (OAuth2 callback exemption, TS 33.501 §13.4.1)",
             mode_str(p.mode),
             p.config.deadline_ms,
             p.config
@@ -425,8 +426,8 @@ fn same_token(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Whether `token` is the notification path token of this process: the check a
-/// callback exemption (nextgcore#1421) will call. Constant-time.
+/// Whether `token` is the notification path token of this process: the check
+/// of the route's OAuth2 callback exemption (#1525). Constant-time.
 pub fn token_is_current(token: &str) -> bool {
     plan().is_some_and(|p| same_token(token, &p.token))
 }

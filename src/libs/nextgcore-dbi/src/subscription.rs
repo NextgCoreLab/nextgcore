@@ -786,6 +786,39 @@ pub(crate) fn parse_subscribed_slices(document: &Document, data: &mut NextgcoreS
     }
 }
 
+/// The SD of a subscriber `slice` document (#1514).
+///
+/// `sd` is optional (TS 29.571 Table 5.4.4.2-1); an absent one means no SD is
+/// associated with the SST, which this crate carries as the reserved value FFFFFF
+/// (TS 23.003 clause 28.4.2, `NEXTGCORE_S_NSSAI_NO_SD_VALUE`). An `sd` that is not a
+/// hex string reads the same way. The subscription read and the session-data read
+/// both go through here, so they agree on the same stored slice.
+///
+/// A present `sd` that does not parse is logged at WARN, once per read of the
+/// slice: the slice then lists as SST-only, which is a different S-NSSAI from the
+/// one the operator meant. The SUPI is not logged.
+pub(crate) fn parse_slice_sd(slice_doc: &Document) -> NextgcoreUint24 {
+    let no_sd = NextgcoreUint24::new(NEXTGCORE_S_NSSAI_NO_SD_VALUE);
+    match slice_doc.get(NEXTGCORE_SD_STRING) {
+        None => no_sd,
+        Some(Bson::String(sd)) => NextgcoreUint24::from_hex_string(sd).unwrap_or_else(|| {
+            log::warn!(
+                "subscriber slice (sst {:?}): sd {sd:?} is not a hex string; read as no SD",
+                slice_doc.get_i32(NEXTGCORE_SST_STRING).ok()
+            );
+            no_sd
+        }),
+        Some(other) => {
+            log::warn!(
+                "subscriber slice (sst {:?}): sd is a {:?}, not a string; read as no SD",
+                slice_doc.get_i32(NEXTGCORE_SST_STRING).ok(),
+                other.element_type()
+            );
+            no_sd
+        }
+    }
+}
+
 /// Parse slice data from BSON document
 fn parse_slice_data(doc: &Document) -> Option<NextgcoreSliceData> {
     let mut slice_data = NextgcoreSliceData::default();
@@ -794,12 +827,9 @@ fn parse_slice_data(doc: &Document) -> Option<NextgcoreSliceData> {
     let sst = doc.get_i32(NEXTGCORE_SST_STRING).ok()?;
     slice_data.s_nssai.sst = sst as u8;
 
-    // SD is optional
-    if let Ok(sd_str) = doc.get_str(NEXTGCORE_SD_STRING) {
-        if let Some(sd) = NextgcoreUint24::from_hex_string(sd_str) {
-            slice_data.s_nssai.sd = sd;
-        }
-    }
+    // SD is optional (#1514). `NextgcoreSliceData::default()` leaves the SD at 0, which
+    // `has_sd()` reads as a real SD of 000000, so the slice has to be told it has none.
+    slice_data.s_nssai.sd = parse_slice_sd(doc);
 
     // Default indicator
     if let Ok(di) = doc.get_bool(NEXTGCORE_DEFAULT_INDICATOR_STRING) {
@@ -1170,6 +1200,89 @@ mod tests {
             NEXTGCORE_DEFAULT_INDICATOR_STRING, NEXTGCORE_DEFAULT_DNN_INDICATOR_STRING,
             "and the two constants must stay distinct"
         );
+    }
+
+    /// **#1514**: a subscriber slice stored without an `sd` reads back as "no SD"
+    /// (FFFFFF, TS 23.003 clause 28.4.2), not as SD 000000, so consumers render
+    /// `{sst: 1}` and not `{sst: 1, sd: "000000"}`. A stored SD of 000000 is a real SD
+    /// and keeps it; an unparseable `sd` reads as "no SD", as the session-data read does.
+    #[test]
+    fn a_slice_stored_without_an_sd_reads_back_as_no_sd() {
+        let no_sd = parse_slice_data(&doc! { NEXTGCORE_SST_STRING: 1 }).expect("sst is set");
+        assert_eq!(no_sd.s_nssai.sst, 1);
+        assert_eq!(no_sd.s_nssai.sd.v, NEXTGCORE_S_NSSAI_NO_SD_VALUE);
+        assert!(!no_sd.s_nssai.has_sd());
+        assert_eq!(no_sd.s_nssai, NextgcoreSNssai::new(1, None));
+
+        let zero_sd =
+            parse_slice_data(&doc! { NEXTGCORE_SST_STRING: 1, NEXTGCORE_SD_STRING: "000000" })
+                .expect("sst is set");
+        assert!(zero_sd.s_nssai.has_sd());
+        assert_eq!(zero_sd.s_nssai, NextgcoreSNssai::new(1, Some(0)));
+
+        let with_sd =
+            parse_slice_data(&doc! { NEXTGCORE_SST_STRING: 2, NEXTGCORE_SD_STRING: "0A0b0C" })
+                .expect("sst is set");
+        assert_eq!(with_sd.s_nssai, NextgcoreSNssai::new(2, Some(0x0a0b0c)));
+
+        for bad in ["", "zz", "not-hex"] {
+            let bad_sd =
+                parse_slice_data(&doc! { NEXTGCORE_SST_STRING: 1, NEXTGCORE_SD_STRING: bad })
+                    .expect("sst is set");
+            assert_eq!(
+                bad_sd.s_nssai,
+                NextgcoreSNssai::new(1, None),
+                "an unparseable sd {bad:?} must read as no SD"
+            );
+        }
+        // A non-string `sd` is not an SD either.
+        let typed = parse_slice_data(&doc! { NEXTGCORE_SST_STRING: 1, NEXTGCORE_SD_STRING: 7 })
+            .expect("sst is set");
+        assert_eq!(typed.s_nssai, NextgcoreSNssai::new(1, None));
+    }
+
+    /// The session-data read and the subscription read agree on the SD of every stored
+    /// shape (#1514). The session read never returns the SD; it uses it to match a
+    /// requested S-NSSAI, where a slice with no SD matches any SD and one with an SD
+    /// matches only that SD. So for each stored shape, the SD the subscription read
+    /// returns predicts which requested SDs the session read matches.
+    #[test]
+    fn the_subscription_read_and_the_session_read_agree_on_the_sd() {
+        let session = doc! { NEXTGCORE_NAME_STRING: "internet" };
+        let shapes = [
+            doc! { NEXTGCORE_SST_STRING: 1 },
+            doc! { NEXTGCORE_SST_STRING: 1, NEXTGCORE_SD_STRING: "000000" },
+            doc! { NEXTGCORE_SST_STRING: 1, NEXTGCORE_SD_STRING: "000001" },
+            doc! { NEXTGCORE_SST_STRING: 1, NEXTGCORE_SD_STRING: "ffffff" },
+            doc! { NEXTGCORE_SST_STRING: 1, NEXTGCORE_SD_STRING: "x" },
+            doc! { NEXTGCORE_SST_STRING: 1, NEXTGCORE_SD_STRING: 7 },
+        ];
+        for shape in shapes {
+            let subscribed = parse_slice_data(&shape).expect("sst is set").s_nssai;
+            let mut slice = shape.clone();
+            slice.insert(
+                NEXTGCORE_SESSION_STRING,
+                vec![Bson::Document(session.clone())],
+            );
+            let document = doc! { NEXTGCORE_SLICE_STRING: [Bson::Document(slice)] };
+            for requested_sd in [0x000000, 0x000001, 0x0a0b0c] {
+                let requested = NextgcoreSNssai::new(1, Some(requested_sd));
+                let session_matches = crate::session::session_data_from_document(
+                    &document,
+                    "999990000001514",
+                    Some(&requested),
+                    "internet",
+                )
+                .is_ok();
+                let predicted = !subscribed.has_sd() || subscribed.sd.v == requested_sd;
+                assert_eq!(
+                    session_matches, predicted,
+                    "stored {shape:?}, requested SD {requested_sd:06x}: the subscription read \
+                     says SD {:06x}",
+                    subscribed.sd.v
+                );
+            }
+        }
     }
 
     // 3GPP TS 35.208 Test Set 1, mirroring the constants in

@@ -9,8 +9,9 @@
 //! policy-data change, a P-CSCF restoration, an SMF `SE_AMBR_CH` report): since
 //! #1383 each of those re-reads the UDR, which would otherwise silently undo it.
 //!
-//! TS 23.503 §6.1.3.2 bounds the authorised Session-AMBR by the subscribed one;
-//! a cap can only lower it, never raise it, so the layer cannot violate that.
+//! A cap can only lower the authorised Session-AMBR, never raise it, so the layer
+//! cannot lift a session past the subscribed cap `pcf.policy.session_ambr_cap`
+//! applies before it (#1402).
 //!
 //! Compiled only with `demo-d441a-congestion-loop`; without it the call sites in
 //! `sbi_path` and `app` use the session data unchanged.
