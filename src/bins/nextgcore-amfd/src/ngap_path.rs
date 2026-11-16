@@ -10497,7 +10497,8 @@ impl NgapServer {
                     // §5.4.5.2.5 a)7): with no routing context the AMF "may" send the
                     // message back as not forwarded; it is dropped, as for 0xCC/0xD4.
                     log::info!(
-                        "{what} (0x{other:02x}) for UE {amf_ue_ngap_id} PSI {psi}: no SM                          context; not forwarded"
+                        "{what} (0x{other:02x}) for UE {amf_ue_ngap_id} PSI {psi}: no SM \
+                         context; not forwarded"
                     );
                     return Ok(());
                 };
@@ -35477,6 +35478,26 @@ mod tests {
             .expect("handled");
         settle_offloaded_sbi(&mut ngap).await;
         assert_eq!(seen.lock().expect("seen").len(), 4, "nothing for PSI 6");
+
+        // The UE goes CM-IDLE before the SMF's answer is applied. The report still
+        // reaches the SMF, but its REMOTE UE REPORT RESPONSE is not sent on the
+        // released NG connection.
+        take_sent_ngap(&mut ngap);
+        ngap.handle_5gsm_message(1, ue, 71, &report, None)
+            .await
+            .expect("handled");
+        ngap.ue_auth_state.with_mut(ue, |s| s.cm_idle = true);
+        settle_offloaded_sbi(&mut ngap).await;
+        assert_eq!(
+            seen.lock().expect("seen").len(),
+            5,
+            "the report reached the SMF"
+        );
+        assert!(
+            take_sent_ngap(&mut ngap).is_empty(),
+            "nothing goes to a CM-IDLE UE"
+        );
+        ngap.ue_auth_state.remove(ue);
     }
 
     /// **#738.** After an N2 handover the SOURCE gNB's UE Context Release Complete ends
