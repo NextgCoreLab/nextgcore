@@ -52,7 +52,7 @@ LOAD_LOCAL_ONLY = re.compile(r'\[eas-local\] .*' + P + r'LOAD eas=eas-local avlC
                              r'--no-kpi-patch: the EES is NOT told')
 QOSMON = re.compile(P + r'QOS_MON rt=(\d+) ms n6=\[([^\]]*)\]')
 SUBSCRIBED = re.compile(P + r'Nsmf_EventExposure_Subscribe QOS_MON .* 201 ')
-N6_ACCEPTED = re.compile(r'accepted N6 Delay Measurement Control Information x3 ')
+N6_ACCEPTED = re.compile(r'accepted N6 Delay Measurement Control Information x\d+ \(Association Update')
 N6_METRIC = re.compile(r'^smf_n6_delay_ms\{[^}]*endpoint="([0-9.]+)"[^}]*stat="avg"\} (\d+)', re.M)
 MERGE_PATCHED = re.compile(r'EAS registration merge-patched')
 STANDIN = re.compile(r'\[d443a nrf-standin\] stand-in EES profile \S+ \(nfType EES, '
@@ -145,8 +145,8 @@ def c_standin(d):
 
 def c_n6_provisioned(d):
     if not grep(N6_ACCEPTED, lines(d, acts_of(d)[-1], 'smf.log')):
-        return False, 'smfd logged no accepted N6 Delay Measurement Control Information x3'
-    return True, 'upfd accepted the three N6 controls (Association Update)'
+        return False, 'smfd logged no accepted N6 Delay Measurement Control Information'
+    return True, 'upfd accepted the N6 delay measurement control (Association Update)'
 
 
 def c_n6_measured(d):
@@ -455,8 +455,10 @@ def fixture(arm):
         'nrf-standin.log': [f'{TS} 2026-11-15T10:00:00Z [d443a nrf-standin] stand-in EES profile '
                             f'6b1d7e3c-0000-4000-8000-00000000471e (nfType EES, eees-easregistration, '
                             f'eees-eecregistration) PUT -> 201'],
-        'smf.log': [f'{TS} INFO UPF 10.0.0.5:8805 accepted N6 Delay Measurement Control Information x3 '
-                    f'(Association Update, TS 29.244 §5.33.8.2)'],
+        # The real smfd line (EKS run 20261116T002400Z): one instance, three endpoints.
+        'smf.log': ['2026-11-16T00:24:51.996274977Z [2026-11-16T00:24:51.996Z INFO  nextgcore_smfd::n6_delay] '
+                    'UPF 10.10.1.73:8805 accepted N6 Delay Measurement Control Information x1 '
+                    '(Association Update, TS 29.244 §5.33.8.2)'],
         'eas.log': list(regs),
         'ue.log': [],
     }
@@ -534,8 +536,9 @@ def gates_fixture():
 
 def off_fixture():
     return {'off': {
-        'smf.log': [f'{TS} INFO UPF 10.0.0.5:8805 accepted N6 Delay Measurement Control Information x3 '
-                    f'(Association Update, TS 29.244 §5.33.8.2)'],
+        'smf.log': ['2026-11-16T00:24:51.996274977Z [2026-11-16T00:24:51.996Z INFO  nextgcore_smfd::n6_delay] '
+                    'UPF 10.10.1.73:8805 accepted N6 Delay Measurement Control Information x1 '
+                    '(Association Update, TS 29.244 §5.33.8.2)'],
         'ees.log': [f'{TS} INFO EEC Register'], 'ue.log': [f'{TS} INFO UE up'],
         'eas.log': [f'{TS} [d443a-sidecar] dn ready']},
         '_files': {'off-cli.txt': 'ERROR: unknown command: she-offload\n',

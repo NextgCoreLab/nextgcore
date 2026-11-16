@@ -46,12 +46,15 @@ data:
     stamp_port: 8620
     job_port: 9471
     check_interval_s: 2
-  # eas_id address max_resp_time_ms avl_comp nf_instance_id (the plan's and
-  # #1523's fixtures: local 10 ms / 50, regional 14 / 50, cloud 40 / 200).
+  # eas_id address max_resp_time_ms avl_comp nf_instance_id distance_ms (the
+  # plan's and #1523's fixtures: local 10 ms / 50, regional 14 / 50, cloud 40 /
+  # 200). distance_ms is the EMULATED distance, netem on the EAS's egress toward
+  # the UPF: one way only, so upfd's STAMP one-way N6 delay is half of it
+  # (local 2, regional 3, cloud 20 ms, the plan's Act 1 values).
   eases: |
-    eas-local 10.60.0.11 10 50 6b1d7e3c-0000-4000-8000-0000000471a1
-    eas-regional 10.60.0.12 14 50 6b1d7e3c-0000-4000-8000-0000000471a2
-    eas-cloud 10.60.0.13 40 200 6b1d7e3c-0000-4000-8000-0000000471a3
+    eas-local 10.60.0.11 10 50 6b1d7e3c-0000-4000-8000-0000000471a1 4
+    eas-regional 10.60.0.12 14 50 6b1d7e3c-0000-4000-8000-0000000471a2 6
+    eas-cloud 10.60.0.13 40 200 6b1d7e3c-0000-4000-8000-0000000471a3 40
   sidecar.sh: |
     set -eu
     D=/tmp/d443a
@@ -68,7 +71,7 @@ data:
     ip link add eas-br type bridge
     ip addr add 10.60.0.1/24 dev eas-br
     ip link set eas-br up
-    while read -r id ip mr av nf; do
+    while read -r id ip mr av nf dist; do
       [ -n "$id" ] || continue
       ns="${id}"
       ip netns add "$ns"
@@ -78,7 +81,9 @@ data:
       ip -n "$ns" link set lo up
       ip -n "$ns" link set eth0 up
       ip -n "$ns" route add default via 10.60.0.1
-      say "$id: namespace $ns, $ip/24 via eas-br"
+      # The emulated distance (labelled): scenario.sh changes it for Act 2.
+      ip netns exec "$ns" tc qdisc add dev eth0 root netem delay "${dist}ms"
+      say "$id: namespace $ns, $ip/24 via eas-br, netem ${dist} ms toward the UPF"
     done <<EASES
     ${D443A_EASES}
     EASES
@@ -88,7 +93,7 @@ data:
     touch "$D/ready"
     say "dn ready; waiting for $D/start"
     while [ ! -e "$D/start" ]; do sleep 1; done
-    while read -r id ip mr av nf; do
+    while read -r id ip mr av nf dist; do
       [ -n "$id" ] || continue
       key="$D/cca/$id.key"
       [ -s "$key" ] || { say "FATAL: no CCA key for $id"; exit 1; }

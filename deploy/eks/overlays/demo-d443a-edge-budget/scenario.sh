@@ -100,12 +100,10 @@ d443a_main() {
       "[ \$(kubectl -n ${NAMESPACE} logs deploy/ue -c ue 2>/dev/null | grep -c '\[demo:d443a-edge-budget\] JOB job=') -ge $(( before + n )) ]" \
       || bad "the UE did not finish ${n} job(s)"
   }
-  netem_eas() {  # add|del eas-local's one-way +16 ms
-    if [[ "$1" == add ]]; then
-      "${K[@]}" exec deploy/upf -c she-eas -- ip netns exec eas-local tc qdisc add dev eth0 root netem delay 16ms
-    else
-      "${K[@]}" exec deploy/upf -c she-eas -- ip netns exec eas-local tc qdisc del dev eth0 root
-    fi
+  netem_eas() {  # add|del: eas-local 16 ms further away (its emulated distance 4 -> 20 ms)
+    local d=4
+    [[ "$1" == add ]] && d=20
+    "${K[@]}" exec deploy/upf -c she-eas -- ip netns exec eas-local tc qdisc change dev eth0 root netem delay "${d}ms"
   }
   netem_gnb() {  # add|del +20 ms on the gNB's GTP-U (UDP 2152) egress only
     if [[ "$1" == add ]]; then
@@ -265,7 +263,7 @@ d443a_main() {
 d443a_off() {
   # The demo-off arm on the overlay's topology: no demo: block anywhere.
   local K=(kubectl -n "${NAMESPACE}") S="${OUT}/scenario"
-  wait_for 120 has_in smf smf 'accepted N6 Delay Measurement Control Information x3' \
+  wait_for 120 has_in smf smf 'accepted N6 Delay Measurement Control Information x[0-9]+' \
     || bad "smfd did not provision N6 delay measurement (config-only, #1502)"
   # The UE has no demo, so she-offload is the unknown command it was.
   "${K[@]}" rollout status deploy/ue --timeout=300s >/dev/null || bad "ue rollout"

@@ -62,7 +62,8 @@
     #   NET_ADMIN  the bridge, veths, addresses, routes, iptables, tc (netem);
     #   SYS_ADMIN  `ip netns add` / `ip netns exec`;
     #   CHOWN      handing each EAS's key to nobody;
-    #   SETUID, SETGID, SETPCAP  setpriv's drop to nobody and of the bounding set.
+    #   SETUID, SETGID, SETPCAP  setpriv's drop to nobody and of the bounding set;
+    #   KILL       the load act's SIGUSR1 to eas-local (a nobody process).
     # nr-she-eas itself runs as nobody with no capabilities, an empty bounding
     # set and no_new_privs; its listeners bind 8620 and 9471 (>= 1024).
     securityContext:
@@ -80,6 +81,7 @@
           - SETUID
           - SETGID
           - SETPCAP
+          - KILL
     resources:
       requests:
         cpu: 100m
