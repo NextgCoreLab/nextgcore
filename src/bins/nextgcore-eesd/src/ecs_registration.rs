@@ -156,18 +156,31 @@ fn rfc3339_utc(secs: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
 }
 
+/// The `EESProfile.endPt` the EES registers: its EDGE-1 API root as a `uri`
+/// (#1540). TS 29.558 `EndPoint` has no port member
+/// (`TS29558_Eees_EASRegistration.yaml:506-530`) and is `oneOf` uri / fqdn /
+/// ipv4Addrs / ipv6Addrs, and the EEC needs the port to connect to the EES
+/// (`EESProfile.endPt`, `29558-j70.txt:19999-20005`), so the one form that
+/// carries it is used, alone.
+pub fn ees_end_point(tls: bool, sbi_addr: &str, sbi_port: u16) -> EndPoint {
+    let scheme = if tls { "https" } else { "http" };
+    EndPoint {
+        uri: Some(format!(
+            "{scheme}://{}",
+            nextgcore_sbi::uri_encode::uri_authority(sbi_addr, sbi_port)
+        )),
+        ..Default::default()
+    }
+}
+
 /// Build the `EESRegistration` body the EES POSTs to the ECS.
 ///
 /// `easIds` and `expTime` are derived from live state, not left `None` (#107).
-pub fn build_ees_registration(ees_id: &str, sbi_addr: &str, sbi_port: u16) -> EesRegistration {
+pub fn build_ees_registration(ees_id: &str, end_pt: &EndPoint) -> EesRegistration {
     EesRegistration {
         ees_prof: EesProfile {
             ees_id: ees_id.to_string(),
-            end_pt: EndPoint {
-                ipv4_addrs: Some(vec![sbi_addr.to_string()]),
-                port: Some(sbi_port as u32),
-                ..Default::default()
-            },
+            end_pt: end_pt.clone(),
             prov_id: None,
             eas_ids: current_eas_ids(),
         },
@@ -202,6 +215,7 @@ pub(crate) fn parse_host_port(uri: &str) -> Option<(String, u16)> {
 pub async fn start_ecs_registration(
     ecs_uri: Option<&str>,
     ees_id: &str,
+    tls: bool,
     sbi_addr: &str,
     sbi_port: u16,
 ) {
@@ -214,14 +228,14 @@ pub async fn start_ecs_registration(
         return;
     };
 
-    match register_with_backoff(ecs_uri, ees_id, sbi_addr, sbi_port).await {
+    let end_pt = ees_end_point(tls, sbi_addr, sbi_port);
+    match register_with_backoff(ecs_uri, ees_id, &end_pt).await {
         Some(registration_id) => {
             log::info!("EES registered with ECS at {ecs_uri} (registrationId={registration_id})");
             spawn_refresh(
                 ecs_uri.to_string(),
                 ees_id.to_string(),
-                sbi_addr.to_string(),
-                sbi_port,
+                end_pt,
                 registration_id,
             );
         }
@@ -259,14 +273,9 @@ pub fn backoff_for_attempt(attempt: u32) -> Duration {
 /// The body is rebuilt on every attempt rather than captured once: `easIds` comes
 /// from the live EAS pool, and an EAS that registered while the ECS was unreachable
 /// must appear in the registration that finally lands.
-async fn register_with_backoff(
-    ecs_uri: &str,
-    ees_id: &str,
-    sbi_addr: &str,
-    sbi_port: u16,
-) -> Option<String> {
+async fn register_with_backoff(ecs_uri: &str, ees_id: &str, end_pt: &EndPoint) -> Option<String> {
     for attempt in 1..=MAX_REGISTRATION_ATTEMPTS {
-        let registration = build_ees_registration(ees_id, sbi_addr, sbi_port);
+        let registration = build_ees_registration(ees_id, end_pt);
         match register_once(ecs_uri, &registration).await {
             Ok(Some(id)) => return Some(id),
             Ok(None) => {
@@ -334,18 +343,12 @@ fn extract_registration_id(response: &nextgcore_sbi::message::SbiResponse) -> Op
 
 /// Spawn a periodic refresh task that PUTs the registration to keep it alive, and
 /// **re-creates it when the ECS no longer has it** (#107).
-fn spawn_refresh(
-    ecs_uri: String,
-    ees_id: String,
-    sbi_addr: String,
-    sbi_port: u16,
-    registration_id: String,
-) {
+fn spawn_refresh(ecs_uri: String, ees_id: String, end_pt: EndPoint, registration_id: String) {
     tokio::spawn(async move {
         let mut registration_id = registration_id;
         loop {
             tokio::time::sleep(REFRESH_INTERVAL).await;
-            match refresh_once(&ecs_uri, &ees_id, &sbi_addr, sbi_port, &registration_id).await {
+            match refresh_once(&ecs_uri, &ees_id, &end_pt, &registration_id).await {
                 RefreshOutcome::Refreshed => {
                     log::debug!("ECS registration refreshed (registrationId={registration_id})")
                 }
@@ -395,15 +398,14 @@ pub enum RefreshOutcome {
 pub async fn refresh_once(
     ecs_uri: &str,
     ees_id: &str,
-    sbi_addr: &str,
-    sbi_port: u16,
+    end_pt: &EndPoint,
     registration_id: &str,
 ) -> RefreshOutcome {
     let Some((host, port)) = parse_host_port(ecs_uri) else {
         log::error!("ECS URI '{ecs_uri}' stopped parsing; abandoning the refresh loop");
         return RefreshOutcome::Fatal;
     };
-    let registration = build_ees_registration(ees_id, sbi_addr, sbi_port);
+    let registration = build_ees_registration(ees_id, end_pt);
     let path = ecs_registration_resource_path(registration_id);
     let client = global_context().get_client(&host, port).await;
     match client.put_json(&path, &registration).await {
@@ -436,23 +438,40 @@ pub async fn refresh_once(
 mod tests {
     use super::*;
 
+    /// The endPt the tests register: what `main` builds for 10.0.0.5:7814.
+    fn ep() -> EndPoint {
+        ees_end_point(false, "10.0.0.5", 7814)
+    }
+
     /// eesd-01: the ECS registration request is built with the correct
     /// `eecs-eesregistration` path and a camelCase `EESRegistration` body.
     #[test]
     fn test_build_ees_registration_shape() {
-        let reg = build_ees_registration("ees1.example.com", "10.0.0.5", 7814);
+        let reg = build_ees_registration("ees1.example.com", &ep());
         assert_eq!(reg.ees_prof.ees_id, "ees1.example.com");
-        assert_eq!(reg.ees_prof.end_pt.port, Some(7814));
+        let json = serde_json::to_value(&reg).unwrap();
+        assert_eq!(json["eesProf"]["eesId"], "ees1.example.com");
+        // #1540: TS 29.558 EndPoint is oneOf uri / fqdn / ipv4Addrs / ipv6Addrs
+        // and has no port; the port the EEC needs travels in the uri, alone.
         assert_eq!(
-            reg.ees_prof.end_pt.ipv4_addrs.as_deref(),
-            Some(["10.0.0.5".to_string()].as_slice())
+            json["eesProf"]["endPt"],
+            serde_json::json!({ "uri": "http://10.0.0.5:7814" })
         );
+    }
 
-        let json = serde_json::to_string(&reg).unwrap();
-        assert!(json.contains("\"eesProf\""));
-        assert!(json.contains("\"eesId\":\"ees1.example.com\""));
-        assert!(json.contains("\"endPt\""));
-        assert!(json.contains("\"ipv4Addrs\""));
+    /// #1540: the registered endPt is the EES's API root in every listener shape.
+    #[test]
+    fn the_ees_end_point_is_a_uri_with_the_port() {
+        assert_eq!(
+            ees_end_point(true, "ees.example.com", 443).uri.as_deref(),
+            Some("https://ees.example.com:443")
+        );
+        assert_eq!(
+            ees_end_point(false, "fd00::5", 7814).uri.as_deref(),
+            Some("http://[fd00::5]:7814")
+        );
+        let ep = ees_end_point(false, "10.0.0.5", 7814);
+        assert!(ep.fqdn.is_none() && ep.ipv4_addrs.is_none() && ep.ipv6_addrs.is_none());
     }
 
     #[test]
@@ -469,7 +488,7 @@ mod tests {
 
     #[test]
     fn test_ees_registration_roundtrip() {
-        let reg = build_ees_registration("ees1.example.com", "10.0.0.5", 7814);
+        let reg = build_ees_registration("ees1.example.com", &ep());
         let json = serde_json::to_string(&reg).unwrap();
         let back: EesRegistration = serde_json::from_str(&json).unwrap();
         assert_eq!(back, reg);
@@ -567,7 +586,7 @@ mod tests {
     #[tokio::test]
     async fn the_initial_post_retries_with_increasing_delay() {
         let ecs = spawn_stub_ecs(2, 204).await;
-        let id = register_with_backoff(&ecs.uri, "ees1.example.com", "10.0.0.5", 7814).await;
+        let id = register_with_backoff(&ecs.uri, "ees1.example.com", &ep()).await;
         let seen = ecs.seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
         ecs.server.stop().await.expect("stop stub ECS");
 
@@ -600,8 +619,7 @@ mod tests {
     #[tokio::test]
     async fn a_404_refresh_re_registers_and_adopts_the_new_id() {
         let ecs = spawn_stub_ecs(0, 404).await;
-        let outcome =
-            refresh_once(&ecs.uri, "ees1.example.com", "10.0.0.5", 7814, "stale-id").await;
+        let outcome = refresh_once(&ecs.uri, "ees1.example.com", &ep(), "stale-id").await;
         let seen = ecs.seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
         ecs.server.stop().await.expect("stop stub ECS");
 
@@ -630,7 +648,7 @@ mod tests {
     #[tokio::test]
     async fn an_accepted_refresh_does_not_re_register() {
         let ecs = spawn_stub_ecs(0, 204).await;
-        let outcome = refresh_once(&ecs.uri, "ees1.example.com", "10.0.0.5", 7814, "live-id").await;
+        let outcome = refresh_once(&ecs.uri, "ees1.example.com", &ep(), "live-id").await;
         let seen = ecs.seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
         ecs.server.stop().await.expect("stop stub ECS");
 
@@ -658,7 +676,7 @@ mod tests {
         crate::context::ees_context_init(64);
 
         // Before any EAS registers, easIds is absent -- there is nothing to state.
-        let empty = build_ees_registration("ees1.example.com", "10.0.0.5", 7814);
+        let empty = build_ees_registration("ees1.example.com", &ep());
         assert!(
             empty.ees_prof.eas_ids.is_none(),
             "an EES serving no EAS states none"
@@ -678,7 +696,6 @@ mod tests {
                         eas_id: "eas-107.example.com".to_string(),
                         end_pt: EndPoint {
                             ipv4_addrs: Some(vec!["10.0.0.20".to_string()]),
-                            port: Some(8080),
                             ..Default::default()
                         },
                         prov_id: None,
@@ -694,7 +711,7 @@ mod tests {
                 })
                 .expect("EAS registers");
         }
-        let with_eas = build_ees_registration("ees1.example.com", "10.0.0.5", 7814);
+        let with_eas = build_ees_registration("ees1.example.com", &ep());
         assert!(
             with_eas
                 .ees_prof
@@ -707,7 +724,7 @@ mod tests {
 
         // And on the wire, from the refresh path rather than only from the builder.
         let ecs = spawn_stub_ecs(0, 204).await;
-        refresh_once(&ecs.uri, "ees1.example.com", "10.0.0.5", 7814, "live-id").await;
+        refresh_once(&ecs.uri, "ees1.example.com", &ep(), "live-id").await;
         let seen = ecs.seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
         ecs.server.stop().await.expect("stop stub ECS");
         let put = seen
