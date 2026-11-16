@@ -409,6 +409,21 @@ async fn main() -> Result<()> {
             .to_string();
 
     nwdaf_context_init(nf_instance_id.clone(), args.max_subscriptions);
+    // #1428: bound the per-SUPI UE mobility history (least recently reported
+    // evicted). A malformed value fails start-up.
+    #[cfg(feature = "amf-mobility")]
+    {
+        let max_ues =
+            amf_mobility::max_ues_from_root(&config_root).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let ctx = nwdaf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        guard.lock_engine().set_max_tracked_ues(max_ues);
+        if amf_mobility_plan.serves() {
+            log::info!(
+                "ue-mobility: history bounded at {max_ues} UEs (nwdaf.amf_mobility.max_ues)"
+            );
+        }
+    }
 
     // Issue #1412: who the NRF lets discover this NWDAF and get a token for it.
     // A malformed configured list fails startup rather than registering one.
@@ -932,14 +947,16 @@ fn build_nf_profile(
         advertise_analytics_info_event(&mut nwdaf_info, AnalyticsId::UserDataCongestion);
     }
 
-    let can_provision = nwdaf_self()
-        .read()
-        .map(|ctx| ctx.can_provision_model())
-        .unwrap_or(false)
-        // nextgsim#468: an AnLF-only NWDAF contains no MTLF.
-        && role::current().serves_mtlf();
+    // nextgsim#468: an AnLF-only NWDAF contains no MTLF. The role is decided
+    // first, so an AnLF is not told its model has no exportable form (#1493).
+    let ml_provision = MlProvision::decide(role::current().serves_mtlf(), || {
+        nwdaf_self()
+            .read()
+            .map(|ctx| ctx.can_provision_model())
+            .unwrap_or(false)
+    });
     #[allow(unused_mut)]
-    let mut services = nwdaf_services(nf_instance_id, sbi_addr, sbi_port, can_provision);
+    let mut services = nwdaf_services(nf_instance_id, sbi_addr, sbi_port, ml_provision);
     // nextgsim#468: Nnwdaf_MLModelMonitor, only while the demo is on.
     #[cfg(feature = "demo-d441e-model-retrain")]
     if model_monitor::monitor().is_some() {
@@ -1154,18 +1171,67 @@ fn render_prometheus() -> String {
     out
 }
 
+/// Whether this NWDAF offers `nnwdaf-mlmodelprovision`, and if not, why.
+///
+/// TS 29.520 §4.5.1.2 (`29520-k00.txt:6722-6724`): the service "is part of the
+/// Nnwdaf service-based interface exhibited by the [NWDAF] containing Model
+/// Training Logical Function (MTLF)". So an AnLF-only role never offers it, which
+/// is configuration, not a fault. An MTLF whose active predictor cannot be
+/// exported (issue #109) could serve no model artefact, which is a fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MlProvision {
+    /// An MTLF with an exportable predictor: the service is advertised.
+    Offered,
+    /// The role contains no MTLF (`nwdaf.role: anlf`, nextgsim#468).
+    NoMtlf,
+    /// An MTLF whose active predictor has no exportable form (issue #109).
+    NotExportable,
+}
+
+impl MlProvision {
+    /// The role decides first: `exportable` is not consulted for an AnLF.
+    fn decide(serves_mtlf: bool, exportable: impl FnOnce() -> bool) -> Self {
+        if !serves_mtlf {
+            Self::NoMtlf
+        } else if exportable() {
+            Self::Offered
+        } else {
+            Self::NotExportable
+        }
+    }
+
+    /// The log line for a withheld service, with its level: info for a role
+    /// without an MTLF, warn for an MTLF that cannot export its model (#1493).
+    fn withheld_log(self) -> Option<(log::Level, &'static str)> {
+        match self {
+            Self::Offered => None,
+            Self::NoMtlf => Some((
+                log::Level::Info,
+                "role anlf: this NWDAF contains no MTLF, so nnwdaf-mlmodelprovision is not \
+                 offered (TS 29.520 §4.5.1.2)",
+            )),
+            Self::NotExportable => Some((
+                log::Level::Warn,
+                "not advertising nnwdaf-mlmodelprovision: the active prediction model has no \
+                 exportable form, so no model artefact could be served (issue #109)",
+            )),
+        }
+    }
+}
+
 /// The `nfServices[]` this NWDAF advertises.
 ///
-/// `can_provision` gates `nnwdaf-mlmodelprovision` (issue #109): the MTLF role is
-/// only claimed when the active predictor can actually be exported. Taken as a
-/// parameter rather than read from the global context so both branches are
-/// testable without mutating process-wide state — swapping the global predictor
-/// in a test raced the artefact-download test in the same binary.
+/// `ml_provision` gates `nnwdaf-mlmodelprovision` (issue #109, #1493): the MTLF
+/// role is only claimed by an MTLF whose active predictor can actually be
+/// exported. Taken as a parameter rather than read from the global context so
+/// every branch is testable without mutating process-wide state — swapping the
+/// global predictor in a test raced the artefact-download test in the same
+/// binary.
 fn nwdaf_services(
     nf_instance_id: &str,
     sbi_addr: &str,
     sbi_port: u16,
-    can_provision: bool,
+    ml_provision: MlProvision,
 ) -> Vec<serde_json::Value> {
     let mut services = vec![
         serde_json::json!({
@@ -1185,7 +1251,7 @@ fn nwdaf_services(
             "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
         }),
     ];
-    if can_provision {
+    if ml_provision == MlProvision::Offered {
         services.push(serde_json::json!({
             "serviceInstanceId": format!("{}-nnwdaf-mlmodelprovision", nf_instance_id),
             "serviceName": "nnwdaf-mlmodelprovision",
@@ -1201,11 +1267,8 @@ fn nwdaf_services(
             // ModelProvisionExt (TS 29.520 Table 5.4.8-1).
             "supportedFeatures": ml_service::MLMODELPROVISION_SUPPORTED_FEATURES
         }));
-    } else {
-        log::warn!(
-            "not advertising nnwdaf-mlmodelprovision: the active prediction model has no \
-             exportable form, so no model artefact could be served (issue #109)"
-        );
+    } else if let Some((level, line)) = ml_provision.withheld_log() {
+        log::log!(level, "{line}");
     }
     services
 }
@@ -1758,7 +1821,12 @@ mod tests {
     #[test]
     fn test_profile_advertises_mlmodelprovision_only_when_exportable() {
         let names = |can_provision: bool| -> Vec<String> {
-            nwdaf_services("nwdaf-test", "10.0.0.5", 7777, can_provision)
+            let ml = if can_provision {
+                MlProvision::Offered
+            } else {
+                MlProvision::NotExportable
+            };
+            nwdaf_services("nwdaf-test", "10.0.0.5", 7777, ml)
                 .iter()
                 .filter_map(|s| s["serviceName"].as_str().map(String::from))
                 .collect()
@@ -1779,6 +1847,43 @@ mod tests {
         assert_eq!(without.len() + 1, with.len());
         assert!(without.iter().any(|n| n == "nnwdaf-eventssubscription"));
         assert!(without.iter().any(|n| n == "nnwdaf-analyticsinfo"));
+    }
+
+    /// #1493: an AnLF-only role withholds nnwdaf-mlmodelprovision because it
+    /// contains no MTLF, and says so at info, without consulting the model. Only
+    /// an MTLF whose model cannot be exported is warned about.
+    #[test]
+    fn an_anlf_withholds_mlmodelprovision_for_its_role_not_its_model() {
+        let anlf = MlProvision::decide(false, || panic!("an AnLF's model is not consulted"));
+        assert_eq!(anlf, MlProvision::NoMtlf);
+        let (level, line) = anlf.withheld_log().expect("withheld");
+        assert_eq!(level, log::Level::Info);
+        assert!(line.starts_with("role anlf: "), "{line}");
+        assert!(!line.contains("exportable"), "{line}");
+
+        let broken = MlProvision::decide(true, || false);
+        assert_eq!(broken, MlProvision::NotExportable);
+        let (level, line) = broken.withheld_log().expect("withheld");
+        assert_eq!(level, log::Level::Warn);
+        assert!(line.contains("no exportable form"), "{line}");
+
+        assert_eq!(MlProvision::decide(true, || true), MlProvision::Offered);
+        assert_eq!(MlProvision::Offered.withheld_log(), None);
+
+        // Both withheld reasons advertise the same services: only the log differs.
+        let names = |ml| -> Vec<String> {
+            nwdaf_services("nwdaf-test", "10.0.0.5", 7777, ml)
+                .iter()
+                .filter_map(|s| s["serviceName"].as_str().map(String::from))
+                .collect()
+        };
+        assert_eq!(
+            names(MlProvision::NoMtlf),
+            names(MlProvision::NotExportable)
+        );
+        assert!(!names(MlProvision::NoMtlf)
+            .iter()
+            .any(|n| n == "nnwdaf-mlmodelprovision"));
     }
 
     /// The default build's predictor IS exportable, so a freshly initialised
@@ -2359,8 +2464,12 @@ mod allowed_nf_types_1412_tests {
     #[test]
     fn nrfd_authorizes_mlmodelprovision_only_for_nwdaf_and_lmf() {
         let mut doc = profile_json("nwdaf-1412-mlmp", &spec_allowed_nf_types());
-        doc["nfServices"] =
-            serde_json::Value::Array(nwdaf_services("nwdaf-1412-mlmp", "127.0.0.1", 7815, true));
+        doc["nfServices"] = serde_json::Value::Array(nwdaf_services(
+            "nwdaf-1412-mlmp",
+            "127.0.0.1",
+            7815,
+            MlProvision::Offered,
+        ));
         let producer = NfProfile::from_json(&doc).expect("nrfd accepts the profile");
         for consumer in ["NWDAF", "LMF"] {
             assert_eq!(

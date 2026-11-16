@@ -53,6 +53,10 @@ pub mod gsm_cause {
     /// #68 Not supported SSC mode (TS 24.501 §9.11.4.2). Paired with the Allowed
     /// SSC mode IE so the UE knows what to request instead.
     pub const NOT_SUPPORTED_SSC_MODE: u8 = 68;
+    /// #81 Invalid PTI value (TS 24.501 §9.11.4.2, §7.3.1 b)).
+    pub const INVALID_PTI_VALUE: u8 = 81;
+    /// #97 Message type non-existent or not implemented (TS 24.501 §9.11.4.2, §7.4).
+    pub const MESSAGE_TYPE_NON_EXISTENT_OR_NOT_IMPLEMENTED: u8 = 97;
 }
 
 /// PDU session type values (TS 24.501 §9.11.4.11)
@@ -212,8 +216,9 @@ impl PolicyDecision {
     /// member silently mean 0.
     ///
     /// Applied to the config-default arm only. With a PCF configured its decision
-    /// is authoritative (TS 23.503 §6.1.3.2 has the PCF take the subscribed values
-    /// as input and answer with authorised ones), so overlaying the subscription on
+    /// is authoritative (TS 29.512 §4.2.2.5 / §4.2.2.6 have the PCF take the
+    /// subscribed values as input and answer with authorised ones), so overlaying the
+    /// subscription on
     /// top of a PCF answer would override the authorisation with its own input.
     pub fn apply_subscribed_baseline(&mut self, sub: &crate::udm::SubscribedSmData) {
         if let Some(ul) = sub.sess_ambr_ul_bps {
@@ -1109,8 +1114,8 @@ pub async fn sm_policy_create(
         // bit 8), acted on in `handle_sm_policy_notify`. Nothing else.
         "suppFeat": SMF_SM_POLICY_SUPPORTED_FEATURES,
     });
-    // #310: the subscribed session-AMBR, so the PCF can bound its authorisation by
-    // the subscription (TS 23.503 §6.1.3.2). Absent when the UDM leg is off or the
+    // #310: the subscribed session-AMBR, the input the PCF authorises the
+    // Session-AMBR from (TS 29.512 §4.2.2.5). Absent when the UDM leg is off or the
     // subscription states no AMBR, in which case the PCF bounds by nothing — the
     // pre-#310 behaviour, now the documented fallback rather than the only case.
     if let Some(ambr) = ctx.subs_sess_ambr.and_then(subs_sess_ambr_json) {
@@ -2047,6 +2052,28 @@ pub fn build_network_modification_command(
 }
 
 /// Build a PDU Session Release Command (TS 24.501 §8.3.13).
+/// 5GSM STATUS (TS 24.501 §8.3.16): header and the mandatory 5GSM cause.
+pub fn build_gsm_status(psi: u8, pti: u8, cause_5gsm: u8) -> Vec<u8> {
+    vec![
+        0x2E,
+        psi,
+        pti,
+        crate::gsm_build::message_type::GSM_STATUS,
+        cause_5gsm,
+    ]
+}
+
+/// REMOTE UE REPORT RESPONSE (TS 24.501 §8.3.20, Table 8.3.20.1): header only; the
+/// optional EAP message IE (§6.6.2.3) is absent, as no DN EAP exchange runs.
+pub fn build_remote_ue_report_response(psi: u8, pti: u8) -> Vec<u8> {
+    vec![
+        0x2E,
+        psi,
+        pti,
+        crate::gsm_build::message_type::REMOTE_UE_REPORT_RESPONSE,
+    ]
+}
+
 pub fn build_release_command(psi: u8, pti: u8, cause_5gsm: u8) -> Vec<u8> {
     vec![
         0x2E,

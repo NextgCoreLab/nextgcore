@@ -27,7 +27,9 @@
 //! Every failure pages the registration area from the first attempt, as the
 //! default strategy does. That covers no SUPI, a full concurrency bound, no
 //! NWDAF, a timeout, a non-200 answer (an NWDAF without UE mobility data answers
-//! 204), a body naming no NR cell, and a predicted cell no gNB in the area owns.
+//! 204), a body naming no NR cell, statistics instead of a prediction (no
+//! `confidence`, [`parse_ue_mobility`]), and a predicted cell no gNB in the area
+//! owns.
 //! The cost of an NWDAF that is down is at most [`HINT_TIMEOUT`] on the first
 //! attempt, against T3513's 5 s.
 
@@ -74,7 +76,8 @@ pub fn in_flight_for_test() -> Arc<Semaphore> {
 pub enum HintOutcome {
     /// A predicted NR cell reached the page before its first PAGING.
     Predicted,
-    /// The NWDAF answered with no usable cell (204, or no NR cell in the body).
+    /// The NWDAF answered with no usable cell (204, no NR cell in the body, or
+    /// statistics rather than a prediction: no `confidence`).
     NoPrediction,
     /// No NWDAF, a refused connection, a non-200, or a malformed body.
     Error,
@@ -226,8 +229,18 @@ pub fn request_path(supi: &str, now: std::time::SystemTime) -> String {
 }
 
 /// The predicted cell in a TS 29.520 `AnalyticsData` body: across `ueMobs[]`, the
-/// `locInfos[]` entry with the highest `confidence` (an absent one counts as 0)
-/// whose `loc.nrLocation.ncgi` is a TS 29.571 NCGI. `None` when there is none.
+/// `locInfos[]` entry with the highest `confidence` whose `loc.nrLocation.ncgi`
+/// is a TS 29.571 NCGI. `None` when there is none.
+///
+/// An entry without `confidence` is not a prediction and is skipped (#1508).
+/// `LocationInfo.confidence` "Shall be present if the analytics result is a
+/// prediction" (TS 29.520 Table 5.1.6.2.11-1, `29520-k00.txt:13480-13486`), and
+/// nwdafd's statistics carry none. An NWDAF answers statistics, the cells the UE
+/// was seen in, when it reads the requested period as past: [`request_path`]
+/// sends only `endTs = now + PREDICTION_WINDOW`, so an AMF clock that runs that
+/// far behind the NWDAF's asks for a period that has already ended there. Paging
+/// such a cell as predicted would hold the page for a past location; the page
+/// goes to the registration area instead, as for any answer with no prediction.
 pub fn parse_ue_mobility(body: &Value) -> Option<PredictedCell> {
     let mut best: Option<PredictedCell> = None;
     for mob in body.get("ueMobs")?.as_array()? {
@@ -243,18 +256,21 @@ pub fn parse_ue_mobility(body: &Value) -> Option<PredictedCell> {
             else {
                 continue;
             };
-            let confidence = info
+            let Some(confidence) = info
                 .get("confidence")
                 .and_then(Value::as_u64)
-                .map(|c| c.min(100) as u8);
+                .map(|c| c.min(100) as u8)
+            else {
+                continue;
+            };
             let better = best
                 .as_ref()
-                .is_none_or(|b| confidence.unwrap_or(0) > b.confidence.unwrap_or(0));
+                .is_none_or(|b| confidence > b.confidence.unwrap_or(0));
             if better {
                 best = Some(PredictedCell {
                     plmn_id: ncgi.plmn_id,
                     nci: ncgi.cell_id,
-                    confidence,
+                    confidence: Some(confidence),
                 });
             }
         }
@@ -301,7 +317,8 @@ pub async fn resolve_nwdaf_endpoint() -> Option<(String, u16)> {
 }
 
 /// Ask the NWDAF for `supi`'s UE mobility prediction. `Ok(None)` is an answer
-/// with no prediction (204, or a body naming no NR cell); `Err` is a failure.
+/// with no prediction (204, a body naming no NR cell, or statistics); `Err` is a
+/// failure.
 pub async fn query_prediction(supi: &str) -> Result<Option<PredictedCell>, String> {
     let (host, port) = resolve_nwdaf_endpoint()
         .await
@@ -474,6 +491,46 @@ mod tests {
             ]}
         ]});
         assert_eq!(parse_ue_mobility(&body).map(|p| p.nci), Some(0x8005));
+    }
+
+    /// The body nwdafd's `amf_mobility::ue_mobility_infos` builds for statistics:
+    /// every cell the UE was seen in, and no `confidence` (TS 29.520 Table
+    /// 5.1.6.2.11-1: present only for a prediction).
+    fn nwdafd_statistics(nr_cell_ids: &[&str]) -> Value {
+        let loc_infos: Vec<Value> = nr_cell_ids
+            .iter()
+            .map(|id| {
+                json!({ "loc": { "nrLocation": {
+                    "tai": { "plmnId": { "mcc": "001", "mnc": "01" }, "tac": "000001" },
+                    "ncgi": { "plmnId": { "mcc": "001", "mnc": "01" }, "nrCellId": id }
+                }}})
+            })
+            .collect();
+        json!({
+            "ueMobs": [{ "ts": "2026-11-12T09:59:00Z", "duration": 50, "locInfos": loc_infos }],
+            "timeStampGen": "2026-11-12T10:00:00Z"
+        })
+    }
+
+    /// #1508: an AMF clock 30 s or more behind the NWDAF's turns the period into
+    /// a past one there, and the NWDAF answers statistics. Those are where the UE
+    /// was, not a prediction, and name no predicted cell.
+    #[test]
+    fn statistics_are_not_a_prediction() {
+        assert_eq!(parse_ue_mobility(&nwdafd_statistics(&["000008005"])), None);
+        assert_eq!(
+            parse_ue_mobility(&nwdafd_statistics(&["000004001", "000008005"])),
+            None
+        );
+        // A prediction entry beside a statistics one is still read, and a
+        // statistics entry never outranks it.
+        let mut body = nwdafd_prediction("000004001", 0);
+        body["ueMobs"]
+            .as_array_mut()
+            .expect("ueMobs")
+            .push(nwdafd_statistics(&["000008005"])["ueMobs"][0].clone());
+        let p = parse_ue_mobility(&body).expect("the prediction entry");
+        assert_eq!((p.nci, p.confidence), (0x4001, Some(0)));
     }
 
     #[test]

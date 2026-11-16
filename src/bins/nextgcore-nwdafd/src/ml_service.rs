@@ -581,6 +581,39 @@ pub fn parse_ml_model_prov_subsc(body: &Value) -> Result<ParsedMlProvSubsc, Stri
     })
 }
 
+/// The ML events this MTLF provisions a model for (#1452): the events its one
+/// exported predictor, the NF_LOAD series forecaster, actually serves.
+pub const PROVISIONED_ML_EVENTS: [AnalyticsId; 1] = [AnalyticsId::NfLoad];
+
+/// Whether this MTLF provisions a model for `event`.
+pub fn provisions_ml_event(event: AnalyticsId) -> bool {
+    PROVISIONED_ML_EVENTS.contains(&event)
+}
+
+/// Keep only the provisioned events of `parsed` (and their accuracy
+/// thresholds), and return a TS 29.520 `FailureEventInfoForMLModel` for each
+/// event dropped (#1452).
+///
+/// `NwdafMLModelProvSubsc.failEventReports`
+/// (`TS29520_Nnwdaf_MLModelProvision.yaml:260-266`) "shall contain the event(s)
+/// that the subscription is not successful including the failure reason(s)",
+/// and `UNAVAILABLE_ML_MODEL` (l.619-633) "Indicates the requested ML model for
+/// the event is unavailable". Empty when every event is provisioned; the caller
+/// answers 500 `UNAVAILABLE_ML_MODEL_FOR_ALLEVENTS` when none is left.
+pub fn retain_provisioned_events(parsed: &mut ParsedMlProvSubsc) -> Vec<Value> {
+    let failed: Vec<Value> = parsed
+        .ml_events
+        .iter()
+        .filter(|e| !provisions_ml_event(**e))
+        .map(|e| json!({ "event": e.as_str(), "failureCode": "UNAVAILABLE_ML_MODEL" }))
+        .collect();
+    parsed.ml_events.retain(|e| provisions_ml_event(*e));
+    parsed
+        .accuracy_thresholds
+        .retain(|t| provisions_ml_event(t.event));
+    failed
+}
+
 /// Echo a stored [`MlProvSubscription`] back as a TS 29.520
 /// `NwdafMLModelProvSubsc` JSON object (the 201/200 response representation).
 pub fn ml_prov_subsc_json(sub: &MlProvSubscription) -> Value {
@@ -620,8 +653,9 @@ pub fn ml_prov_subsc_json(sub: &MlProvSubscription) -> Value {
 // SCOPE NOTE (issue #109): this NWDAF is a linear-regression analytics engine.
 // What it provisions is the predictor it actually runs, exported as an ONNX
 // `LinearRegressor` whose output equals this NWDAF's own prediction (see
-// `crate::onnx_export`). There is one predictor, so every subscribed event is
-// notified the same model (nextgcore #1452).
+// `crate::onnx_export`). There is one predictor, the NF_LOAD forecaster, so only
+// NF_LOAD is provisioned; any other subscribed event is reported in
+// `failEventReports` with UNAVAILABLE_ML_MODEL and never notified (#1452).
 
 /// Build the `Nnwdaf_MLModelProvision` notification callback body for a
 /// subscription and the model version it is notified of.
@@ -642,10 +676,14 @@ pub fn build_ml_model_prov_notif_body(
     sub: &MlProvSubscription,
     base_uri: &str,
     model: &crate::model_store::ModelVersion,
-) -> Value {
+) -> Option<Value> {
+    // #1452: only the events the exported predictor serves. A subscription
+    // restored from an older build's snapshot may still list others; one that
+    // lists none is notified nothing (`eventNotifs` has minItems 1).
     let event_notifs: Vec<Value> = sub
         .ml_events
         .iter()
+        .filter(|ev| provisions_ml_event(**ev))
         .map(|ev| {
             let mut notif = Map::new();
             notif.insert("event".to_string(), json!(ev.as_str()));
@@ -662,13 +700,16 @@ pub fn build_ml_model_prov_notif_body(
             Value::Object(notif)
         })
         .collect();
+    if event_notifs.is_empty() {
+        return None;
+    }
 
-    json!([
+    Some(json!([
         {
             "subscriptionId": sub.subscription_id,
             "eventNotifs": event_notifs,
         }
-    ])
+    ]))
 }
 
 #[cfg(test)]
@@ -881,7 +922,8 @@ mod tests {
             vec![AnalyticsId::NfLoad],
         );
         let model = v1();
-        let body = build_ml_model_prov_notif_body(&sub, "http://10.0.0.5:7777", &model);
+        let body = build_ml_model_prov_notif_body(&sub, "http://10.0.0.5:7777", &model)
+            .expect("NF_LOAD is provisioned");
 
         let arr = body.as_array().expect("callback body is an array");
         assert_eq!(arr.len(), 1, "minItems 1 array of NwdafMLModelProvNotif");
@@ -968,6 +1010,40 @@ mod tests {
         .is_err());
     }
 
+    /// #1452: a Notify carries only the events the exported predictor serves.
+    /// A subscription restored from an older snapshot that lists UE_MOBILITY is
+    /// notified NF_LOAD only, and one that lists no provisioned event is not
+    /// notified at all.
+    #[test]
+    fn only_provisioned_events_are_notified() {
+        let model = v1();
+        let sub = MlProvSubscription::new(
+            "s-1452".into(),
+            "http://a/cb".into(),
+            None,
+            vec![AnalyticsId::UeMobility, AnalyticsId::NfLoad],
+        );
+        let body = build_ml_model_prov_notif_body(&sub, "http://m", &model).expect("NF_LOAD");
+        let events: Vec<&str> = body[0]["eventNotifs"]
+            .as_array()
+            .expect("eventNotifs")
+            .iter()
+            .filter_map(|n| n["event"].as_str())
+            .collect();
+        assert_eq!(events, ["NF_LOAD"]);
+
+        let none = MlProvSubscription::new(
+            "s-1452-none".into(),
+            "http://a/cb".into(),
+            None,
+            vec![AnalyticsId::UeMobility],
+        );
+        assert_eq!(
+            build_ml_model_prov_notif_body(&none, "http://m", &model),
+            None
+        );
+    }
+
     /// `modelUniqueId` appears exactly when ModelProvisionExt was negotiated.
     #[test]
     fn model_unique_id_follows_the_negotiation() {
@@ -978,10 +1054,10 @@ mod tests {
             None,
             vec![AnalyticsId::NfLoad],
         );
-        let body = build_ml_model_prov_notif_body(&sub, "http://m", &model);
+        let body = build_ml_model_prov_notif_body(&sub, "http://m", &model).expect("NF_LOAD");
         assert!(body[0]["eventNotifs"][0].get("modelUniqueId").is_none());
         sub.supp_feats = Some("8".into());
-        let body = build_ml_model_prov_notif_body(&sub, "http://m", &model);
+        let body = build_ml_model_prov_notif_body(&sub, "http://m", &model).expect("NF_LOAD");
         let id = body[0]["eventNotifs"][0]["modelUniqueId"].as_u64().unwrap();
         assert_eq!(id, model.unique_id());
         assert_eq!(format!("{id:012x}"), model.sha256[..12]);
