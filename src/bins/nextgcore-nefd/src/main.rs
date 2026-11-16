@@ -1876,6 +1876,26 @@ fn report_monitoring_type(
     }
 }
 
+/// The T8 `lossOfConnectReason` (TS 29.122 §5.3.2.3.2, an integer) for a
+/// TS 29.518 §6.2.6.3.12 `LossOfConnectivityReason`, as TS 29.522 §4.4.2 mandates
+/// for 5GS: 6 if the UE is deregistered, 7 if the maximum detection timer
+/// expired, 8 if the UE is purged. Values 0-5 are the pre-5G TS 29.336 §8.4.58
+/// MME/SGSN codes and are not applicable here (issue #1444).
+///
+/// `None` for anything else, `UNAVAILABLE_PERIOD` included: its code 9 is only
+/// for an AF that negotiated `Loss_of_connectivity_notification_5G`, which this
+/// NEF does not offer (it carries no `unavailPerDur` either). Forwarding the
+/// TS 29.518 string used to put a string in an integer member, which a strict
+/// AF rejects along with the whole notification.
+fn t8_loss_of_connect_reason(reason: &serde_json::Value) -> Option<u8> {
+    match reason.as_str()? {
+        "DEREGISTERED" => Some(6),
+        "MAX_DETECTION_TIME_EXPIRED" => Some(7),
+        "PURGED" => Some(8),
+        _ => None,
+    }
+}
+
 /// Build the TS 29.122 §5.3 MonitoringNotification forwarded to the AF's
 /// notificationDestination from a producer notification body (AMF
 /// `AmfEventNotification.reportList` or UDM Nudm_EE `reportList`).
@@ -1891,9 +1911,10 @@ fn report_monitoring_type(
 /// body, so an AF watching for `LOSS_OF_CONNECTIVITY` was told "loss of
 /// connectivity" when the UE re-registered.
 ///
-/// `lossOfConnectReason` is carried through for a `LOSS_OF_CONNECTIVITY` report:
-/// top level in an AMF report, inside `report` (TS 29.503 `LossConnectivityReport`)
-/// in a UDM one.
+/// `lossOfConnectReason` is carried through for a `LOSS_OF_CONNECTIVITY` report,
+/// read top level in an AMF report and inside `report` (TS 29.503
+/// `LossConnectivityReport`) in a UDM one, and sent as its TS 29.522 §4.4.2
+/// integer code ([`t8_loss_of_connect_reason`]).
 ///
 /// # The SUPI never crosses this boundary (issue #110)
 ///
@@ -1967,11 +1988,21 @@ fn build_monitoring_notification(
             out["reachabilityType"] = serde_json::json!(reachability_type);
         }
         if monitoring_type == "LOSS_OF_CONNECTIVITY" {
-            if let Some(reason) = report
+            let reported_reason = report
                 .get("lossOfConnectReason")
-                .or_else(|| report.pointer("/report/lossOfConnectReason"))
-            {
-                out["lossOfConnectReason"] = reason.clone();
+                .or_else(|| report.pointer("/report/lossOfConnectReason"));
+            if let Some(reason) = reported_reason {
+                match t8_loss_of_connect_reason(reason) {
+                    Some(code) => out["lossOfConnectReason"] = serde_json::json!(code),
+                    // "shall be included if available" (TS 29.122 §5.3.2.3.2): a
+                    // reason with no T8 code is not available, and the report is
+                    // still the loss of connectivity it is.
+                    None => log::debug!(
+                        "subscription {}: lossOfConnectReason {reason} has no TS 29.522 \
+                         §4.4.2 code; omitted",
+                        sub.id
+                    ),
+                }
             }
         }
         // `report["supi"]` is deliberately NOT read. The producer sends the
@@ -3403,7 +3434,9 @@ mod tests {
         let reports = notification["monitoringEventReports"].as_array().unwrap();
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0]["monitoringType"], "LOSS_OF_CONNECTIVITY");
-        assert_eq!(reports[0]["lossOfConnectReason"], "DEREGISTERED");
+        // TS 29.122 lossOfConnectReason is an integer; DEREGISTERED is 6
+        // (TS 29.522 §4.4.2), never the TS 29.518 string (#1444).
+        assert_eq!(reports[0]["lossOfConnectReason"], 6);
         assert_eq!(reports[0]["msisdn"], "491700000003");
 
         // An AMF body mixing types keeps only the matching report, with the AMF's
@@ -3425,11 +3458,53 @@ mod tests {
             "the reachability report is dropped: {notification}"
         );
         assert_eq!(reports[0]["monitoringType"], "LOSS_OF_CONNECTIVITY");
-        assert_eq!(
-            reports[0]["lossOfConnectReason"],
-            "MAX_DETECTION_TIME_EXPIRED"
-        );
+        assert_eq!(reports[0]["lossOfConnectReason"], 7);
         assert!(reports[0].get("reachabilityType").is_none());
+    }
+
+    /// **Issue #1444**: every TS 29.518 LossOfConnectivityReason, from an AMF
+    /// report and a UDM one, reaches the AF as its TS 29.522 §4.4.2 integer.
+    /// A reason with no code (UNAVAILABLE_PERIOD without the _5G feature, an
+    /// unknown string, a non-string) is omitted, and the report still goes out.
+    #[test]
+    fn loss_of_connect_reason_is_the_ts_29522_integer() {
+        let sub = NefMonitoringSubscription::new(
+            "af1444",
+            "LOSS_OF_CONNECTIVITY",
+            "http://af.example.com/cb",
+            "{}",
+        );
+        let cases = [
+            (serde_json::json!("DEREGISTERED"), Some(6)),
+            (serde_json::json!("MAX_DETECTION_TIME_EXPIRED"), Some(7)),
+            (serde_json::json!("PURGED"), Some(8)),
+            (serde_json::json!("UNAVAILABLE_PERIOD"), None),
+            (serde_json::json!("SOMETHING_NEW"), None),
+            (serde_json::json!(6), None),
+        ];
+        for (reason, want) in cases {
+            let amf = serde_json::json!({"reportList": [{"type": "LOSS_OF_CONNECTIVITY",
+                "state": {"active": true}, "lossOfConnectReason": reason}]});
+            let udm = serde_json::json!({"reportList": [{"referenceId": "1",
+                "eventType": "LOSS_OF_CONNECTIVITY", "timeStamp": "2026-11-16T00:00:00Z",
+                "report": {"lossOfConnectReason": reason}}]});
+            for body in [amf, udm] {
+                let notification = build_monitoring_notification(&sub, &body)
+                    .unwrap_or_else(|| panic!("a LoC report is forwarded: {body}"));
+                let report = &notification["monitoringEventReports"][0];
+                assert_eq!(report["monitoringType"], "LOSS_OF_CONNECTIVITY");
+                match want {
+                    Some(code) => {
+                        assert!(report["lossOfConnectReason"].is_u64(), "{report}");
+                        assert_eq!(report["lossOfConnectReason"], code, "{body}");
+                    }
+                    None => assert!(
+                        report.get("lossOfConnectReason").is_none(),
+                        "{reason} has no T8 code: {report}"
+                    ),
+                }
+            }
+        }
     }
 
     /// **Issue #1439, the reverse direction.** UDM reachability event types map to
@@ -3645,7 +3720,7 @@ mod tests {
                 let reports = delivered[0]["monitoringEventReports"].as_array().unwrap();
                 assert_eq!(reports.len(), 1);
                 assert_eq!(reports[0]["monitoringType"], "LOSS_OF_CONNECTIVITY");
-                assert_eq!(reports[0]["lossOfConnectReason"], "DEREGISTERED");
+                assert_eq!(reports[0]["lossOfConnectReason"], 6, "TS 29.522 §4.4.2");
                 assert_eq!(reports[0]["msisdn"], "491700001439");
                 assert_eq!(
                     delivered[0]["subscription"],

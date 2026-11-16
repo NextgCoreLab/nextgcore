@@ -715,7 +715,7 @@ def _fixture(d, af=None, nef=None, udm=None, amf=None, extra=None):
          for n in (1, 2, 3)]
     A += [(10, f'{P}round=1 arm=1 rule=fedavg participants=3 selected=ue1,ue2,ue3 excluded=-'),
           (20, f'{P}hold before round=4 until=member-excluded (timeout 240 s)'),
-          (31, f'{P}member_selection excluded={gpsi(3)} member=ue3 reason=nef_event lossOfConnectReason=DEREGISTERED subscription={loc(3)}'),
+          (31, f'{P}member_selection excluded={gpsi(3)} member=ue3 reason=nef_event lossOfConnectReason=6 subscription={loc(3)}'),
           (32, f'{P}round=4 arm=1 rule=fedavg participants=2 selected=ue1,ue2 excluded={gpsi(3)}(ue3)'),
           (33, f'{P}round=4 done arm=1 rule=fedavg updates=2 from=ue1,ue2 dur_ms=12 mse=0.5'),
           (40, f'{P}member_selection readmitted={gpsi(3)} member=ue3 peer=10.45.0.4:45000 t8=subscribed {loc(9)}')]
@@ -730,7 +730,7 @@ def _fixture(d, af=None, nef=None, udm=None, amf=None, extra=None):
                              f'http://amf:7777/namf-evts/v1/subscriptions/asub{n}'))
     M = [(29, 'Deregistration Accept sent to UE 3'),
          (30, 'Event notification delivered: sub=asub3, status=204')]
-    N = [(31, f'{P}T8 delivery sub=nsub3 monitoringType=LOSS_OF_CONNECTIVITY lossOfConnectReason=DEREGISTERED status=204 to http://x/[redacted]')]
+    N = [(31, f'{P}T8 delivery sub=nsub3 monitoringType=LOSS_OF_CONNECTIVITY lossOfConnectReason=6 status=204 to http://x/[redacted]')]
     for name, rows in (('af.log', af if af is not None else A), ('udm.log', udm if udm is not None else U),
                        ('amf.log', amf if amf is not None else M), ('nef.log', nef if nef is not None else N)):
         with open(os.path.join(d, name), 'w') as f:
@@ -871,9 +871,9 @@ def self_test():
         ('the amfd delivery names an unknown subscription', edit('amf.log', 'sub=asub3', 'sub=other')),
         ('no nefd T8 delivery', without('nef.log', 'T8 delivery')),
         ('nefd delivered another subscription', edit('nef.log', 'sub=nsub3', 'sub=nsub1')),
-        ('nefd delivered no reason', edit('nef.log', 'lossOfConnectReason=DEREGISTERED', 'lossOfConnectReason=-')),
+        ('nefd delivered no reason', edit('nef.log', 'lossOfConnectReason=6', 'lossOfConnectReason=-')),
         ('no AF exclusion', without('af.log', 'member_selection excluded=')),
-        ('the exclusion carries no reason', edit('af.log', 'reason=nef_event lossOfConnectReason=DEREGISTERED', 'reason=nef_event lossOfConnectReason=-')),
+        ('the exclusion carries no reason', edit('af.log', 'reason=nef_event lossOfConnectReason=6', 'reason=nef_event lossOfConnectReason=-')),
         ('round 4 at participants=3', edit('af.log', 'round=4 arm=1 rule=fedavg participants=2', 'round=4 arm=1 rule=fedavg participants=3')),
         ('round 4 too slow', edit('af.log', 'dur_ms=12 ', 'dur_ms=9000 ')),
         ('ue3 resolved to another GPSI', edit('af.log', f'member=ue3 gpsi={gpsi(3)}', f'member=ue3 gpsi={gpsi(4)}')),
