@@ -1230,6 +1230,31 @@ fn gate_am_ue_ambr(
     }
 }
 
+/// #1580: `policy` without the request-conditioned members the consumer did not
+/// send: TS 29.507 §4.2.2.2 / §4.2.3.2 items a and b answer `servAreaRes` and
+/// `rfsp` only "if the PCF received" that attribute in the request. The stored
+/// policy keeps them, because a PCF-initiated PolicyUpdate (§4.2.3.3.2) is not
+/// request-conditioned and diffs against it.
+fn am_answer_policy(
+    policy: Option<&serde_json::Value>,
+    serv_area_res: bool,
+    rfsp: bool,
+) -> Option<serde_json::Value> {
+    let mut answered = policy.cloned()?;
+    if let Some(members) = answered.as_object_mut() {
+        if !serv_area_res {
+            members.remove("servAreaRes");
+        }
+        if !rfsp {
+            members.remove("rfsp");
+        }
+        if members.is_empty() {
+            return None;
+        }
+    }
+    Some(answered)
+}
+
 /// The `RequestTrigger`s a consumer asked this association to watch, plus the
 /// ones the PCF adds because the subscription disagrees with the request.
 ///
@@ -1381,6 +1406,8 @@ pub async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
             let mut updated = ue_am.clone();
             updated.am_policy_control_features = features;
             updated.ue_ambr_requested = policy_data.get("ueAmbr").is_some();
+            updated.serv_area_res_requested = policy_data.get("servAreaRes").is_some();
+            updated.rfsp_requested = policy_data.get("rfsp").is_some();
             gate_am_ue_ambr(am_ue_ambr_authorised(&updated), &mut policy, &mut triggers);
             let am_policy = if policy.is_empty() {
                 None
@@ -1411,7 +1438,12 @@ pub async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
                 &ue_am.association_id,
                 supi,
                 &triggers,
-                am_policy.as_ref(),
+                am_answer_policy(
+                    am_policy.as_ref(),
+                    updated.serv_area_res_requested,
+                    updated.rfsp_requested,
+                )
+                .as_ref(),
                 &format!("{features:x}"),
             );
 
@@ -1446,7 +1478,13 @@ pub async fn handle_am_policy_get(pol_asso_id: &str) -> SbiResponse {
                 &ue_am.association_id,
                 &ue_am.supi,
                 &ue_am.triggers,
-                ue_am.am_policy.as_ref(),
+                // #1580: as the create answered it.
+                am_answer_policy(
+                    ue_am.am_policy.as_ref(),
+                    ue_am.serv_area_res_requested,
+                    ue_am.rfsp_requested,
+                )
+                .as_ref(),
                 // #1524: the value negotiated at create, which the association
                 // keeps; it used to be re-negotiated from nothing, so "0".
                 &format!("{:x}", ue_am.am_policy_control_features),
@@ -1570,6 +1608,11 @@ pub async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
     // authorised one from then on.
     let update_has_ue_ambr = update_data.get("ueAmbr").is_some();
     updated.ue_ambr_requested |= update_has_ue_ambr;
+    // #1580: as `servAreaRes` / `rfsp` the AMF reports changed (items 3 and 4).
+    let update_has_serv_area_res = update_data.get("servAreaRes").is_some();
+    let update_has_rfsp = update_data.get("rfsp").is_some();
+    updated.serv_area_res_requested |= update_has_serv_area_res;
+    updated.rfsp_requested |= update_has_rfsp;
 
     // Re-evaluate the provisioned policy: an update is the point at which the
     // subscription is consulted again, which is what makes servAreaRes / rfsp /
@@ -1621,7 +1664,12 @@ pub async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
     // The 200 response schema is PolicyUpdate, not PolicyAssociation: it carries
     // resourceUri and the changed policy. #1524: `ueAmbr` only when this request
     // carried one (TS 29.507 §4.2.3.2 item c).
-    let mut answered = updated.am_policy.clone();
+    // #1580: `servAreaRes` / `rfsp` likewise (items a and b).
+    let mut answered = am_answer_policy(
+        updated.am_policy.as_ref(),
+        update_has_serv_area_res,
+        update_has_rfsp,
+    );
     if !update_has_ue_ambr {
         if let Some(policy) = answered.as_mut().and_then(|p| p.as_object_mut()) {
             policy.remove("ueAmbr");
@@ -7925,6 +7973,9 @@ mod tests {
                 // #1524: UE-AMBR_Authorization, and the AMF's UE-AMBR, so the
                 // policy carries the authorised one.
                 "suppFeat": "4",
+                // #1580: the AMF's UDM values, so the answer carries the authorised ones.
+                "rfsp": 1,
+                "servAreaRes": { "restrictionType": "ALLOWED_AREAS", "areas": [] },
                 "ueAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" },
                 "triggers": ["LOC_CH"]
             })),
@@ -7958,6 +8009,113 @@ mod tests {
         assert_eq!(got["ueAmbr"]["uplink"], "1 Gbps");
         assert_eq!(got["triggers"], serde_json::json!(["LOC_CH"]));
 
+        udr.stop().await.ok();
+    }
+
+    /// #1580: TS 29.507 §4.2.2.2 / §4.2.3.2 items a and b. The create, the GET and
+    /// the Update answer `servAreaRes` / `rfsp` only when the AMF sent that attribute
+    /// (on the create, or for the Update in that request), with the PCF's authorised
+    /// value (the UDR's, not the AMF's).
+    ///
+    /// REVERT-VERIFIED: with `am_answer_policy` returning the policy whole, the
+    /// create without either member answers both; with the update answer filtered
+    /// by the association's flags instead of the request's, the second update
+    /// answers `servAreaRes`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI / PCF context
+    async fn am_policy_answers_serv_area_res_and_rfsp_only_when_requested_1580() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let sar = serde_json::json!({
+            "restrictionType": "ALLOWED_AREAS",
+            "areas": [{ "tacs": ["000001"] }]
+        });
+        let udr = start_mock_nrf_udr_am_data(serde_json::json!({
+            "rfspIndex": 7,
+            "serviceAreaRestriction": sar
+        }))
+        .await;
+        let create = |supi: &str, extra: serde_json::Value| {
+            let mut body = serde_json::json!({
+                "supi": supi,
+                "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/1580",
+                "suppFeat": "0",
+            });
+            for (k, v) in extra.as_object().unwrap() {
+                body[k] = v.clone();
+            }
+            make_request("POST", "/npcf-am-policy-control/v1/policies", Some(body))
+        };
+        let json = |resp: SbiResponse| {
+            serde_json::from_str::<serde_json::Value>(resp.http.content.as_deref().unwrap())
+                .unwrap()
+        };
+        let get = |id: String| async move {
+            json(
+                pcf_sbi_request_handler(make_request(
+                    "GET",
+                    &format!("/npcf-am-policy-control/v1/policies/{id}"),
+                    None,
+                ))
+                .await,
+            )
+        };
+
+        // Neither sent (amfd's create): neither answered, on the create or the GET.
+        let created = json(
+            pcf_sbi_request_handler(create("imsi-001010000015801", serde_json::json!({}))).await,
+        );
+        let id = created["polAssoId"].as_str().unwrap().to_string();
+        for body in [&created, &get(id.clone()).await] {
+            assert!(body.get("servAreaRes").is_none(), "{body}");
+            assert!(body.get("rfsp").is_none(), "{body}");
+        }
+
+        // Only rfsp sent: the authorised (UDR) RFSP, and no servAreaRes.
+        let created = json(
+            pcf_sbi_request_handler(create(
+                "imsi-001010000025801",
+                serde_json::json!({ "rfsp": 2 }),
+            ))
+            .await,
+        );
+        let id = created["polAssoId"].as_str().unwrap().to_string();
+        for body in [&created, &get(id.clone()).await] {
+            assert_eq!(body["rfsp"], 7, "{body}");
+            assert!(body.get("servAreaRes").is_none(), "{body}");
+        }
+
+        // An Update carrying servAreaRes is answered with it; one carrying neither
+        // answers neither; the GET from then on carries both.
+        let update = |body: serde_json::Value| {
+            let id = id.clone();
+            async move {
+                json(
+                    pcf_sbi_request_handler(make_request(
+                        "POST",
+                        &format!("/npcf-am-policy-control/v1/policies/{id}/update"),
+                        Some(body),
+                    ))
+                    .await,
+                )
+            }
+        };
+        let answered = update(serde_json::json!({ "servAreaRes": sar })).await;
+        assert_eq!(answered["servAreaRes"], sar, "{answered}");
+        assert!(
+            answered.get("rfsp").is_none(),
+            "not in this request: {answered}"
+        );
+        let answered = update(serde_json::json!({ "triggers": ["LOC_CH"] })).await;
+        assert!(answered.get("servAreaRes").is_none(), "{answered}");
+        assert!(answered.get("rfsp").is_none(), "{answered}");
+        let got = get(id).await;
+        assert_eq!(
+            (got["rfsp"].clone(), got["servAreaRes"].clone()),
+            (serde_json::json!(7), sar)
+        );
         udr.stop().await.ok();
     }
 
@@ -8018,6 +8176,8 @@ mod tests {
                 // #1524: UE-AMBR_Authorization negotiated, so the #1460 rules for
                 // the authorised UE-AMBR are what decides.
                 "suppFeat": "4",
+                // #1580: the AMF's UDM RFSP, so the answer carries the authorised one.
+                "rfsp": 1,
                 "ueAmbr": { "uplink": "500 Mbps", "downlink": "500 Mbps" },
                 "triggers": ["LOC_CH"]
             })),
@@ -8174,7 +8334,9 @@ mod tests {
             "supi": supi,
             "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/1524",
             "suppFeat": supp_feat,
-            "triggers": ["LOC_CH", "UE_AMBR_CH"]
+            "triggers": ["LOC_CH", "UE_AMBR_CH"],
+            // #1580: the AMF's UDM RFSP, so the answer carries the authorised one.
+            "rfsp": 1
         });
         if amf_ue_ambr {
             req["ueAmbr"] = serde_json::json!({ "uplink": "500 Mbps", "downlink": "500 Mbps" });
@@ -8350,7 +8512,8 @@ mod tests {
             ids.push(created["polAssoId"].as_str().unwrap().to_string());
         }
         let (negotiated, unnegotiated) = (ids[0].clone(), ids[1].clone());
-        let with_ue_ambr = serde_json::json!({ "ueAmbr": ue_ambr, "triggers": ["UE_AMBR_CH"] });
+        let with_ue_ambr =
+            serde_json::json!({ "ueAmbr": ue_ambr, "triggers": ["UE_AMBR_CH"], "rfsp": 1 });
 
         let answered = update(negotiated.clone(), with_ue_ambr.clone()).await;
         assert_eq!(answered["ueAmbr"], ue_ambr, "authorised: {answered}");
@@ -8358,7 +8521,7 @@ mod tests {
         assert_eq!(get(negotiated.clone()).await["ueAmbr"], ue_ambr);
         let answered = update(
             negotiated.clone(),
-            serde_json::json!({ "triggers": ["LOC_CH"] }),
+            serde_json::json!({ "triggers": ["LOC_CH"], "rfsp": 1 }),
         )
         .await;
         assert!(
