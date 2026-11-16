@@ -566,6 +566,8 @@ pub struct AmfContext {
     pub t3512_value: u64,
     /// Which (R)AN nodes a CM-IDLE UE is paged on (`amf.paging.strategy`, #1442).
     /// TS 23.501 §5.4.3.1 leaves the paging strategy to local configuration.
+    /// Tests that set it, or queue a page, hold
+    /// `test_support::PAGING_STRATEGY_LOCK` (#1588).
     pub paging_strategy: PagingStrategy,
 
     // ID generators

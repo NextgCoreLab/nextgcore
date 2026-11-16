@@ -24791,7 +24791,8 @@ mod tests {
     async fn nwdaf_mobility_pages_the_predicted_gnb_then_widens_to_the_area() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
-        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::NwdafMobility);
+        let _strategy =
+            PagingStrategyGuard::set(crate::context::PagingStrategy::NwdafMobility).await;
         let (_nwdaf, port, seen) = nwdaf_standin(
             Some(nwdafd_predicts(&nwdaf_cell_of(2))),
             Duration::ZERO,
@@ -24859,7 +24860,8 @@ mod tests {
     async fn a_stationary_ue_is_paged_at_its_own_gnb_on_the_first_attempt() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
-        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::NwdafMobility);
+        let _strategy =
+            PagingStrategyGuard::set(crate::context::PagingStrategy::NwdafMobility).await;
         let mut ngap = capturing_ngap_server().await;
         let base = 4_680u64;
         nwdaf_grid(&ngap, base).await;
@@ -24904,7 +24906,8 @@ mod tests {
     async fn a_slow_nwdaf_delays_no_other_page_and_its_own_only_until_the_deadline() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
-        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::NwdafMobility);
+        let _strategy =
+            PagingStrategyGuard::set(crate::context::PagingStrategy::NwdafMobility).await;
         let (_nwdaf, port, seen) = nwdaf_standin(
             Some(nwdafd_predicts(&nwdaf_cell_of(2))),
             Duration::from_secs(5),
@@ -24995,7 +24998,8 @@ mod tests {
     async fn no_usable_prediction_pages_the_area_on_the_first_attempt() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
-        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::NwdafMobility);
+        let _strategy =
+            PagingStrategyGuard::set(crate::context::PagingStrategy::NwdafMobility).await;
         let mut ngap = capturing_ngap_server().await;
         let base = 4_660u64;
         nwdaf_grid(&ngap, base).await;
@@ -25068,7 +25072,8 @@ mod tests {
     async fn a_full_query_cap_releases_the_page_at_once() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
-        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::NwdafMobility);
+        let _strategy =
+            PagingStrategyGuard::set(crate::context::PagingStrategy::NwdafMobility).await;
         let (_nwdaf, port, seen) = nwdaf_standin(
             Some(nwdafd_predicts(&nwdaf_cell_of(2))),
             Duration::ZERO,
@@ -25124,7 +25129,7 @@ mod tests {
     async fn the_default_strategy_makes_no_nwdaf_request() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
-        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::default());
+        let _strategy = PagingStrategyGuard::set(crate::context::PagingStrategy::default()).await;
         let (_nwdaf, port, seen) = nwdaf_standin(
             Some(nwdafd_predicts(&nwdaf_cell_of(2))),
             Duration::ZERO,
@@ -25228,7 +25233,7 @@ mod tests {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let _strategy =
-            PagingStrategyOverride::set(crate::context::PagingStrategy::RecommendedFirst);
+            PagingStrategyGuard::set(crate::context::PagingStrategy::RecommendedFirst).await;
         let mut ngap = capturing_ngap_server().await;
         let base = 14_640u64;
         reco_grid(&ngap, base).await;
@@ -25281,7 +25286,7 @@ mod tests {
 
         {
             let _strategy =
-                PagingStrategyOverride::set(crate::context::PagingStrategy::NwdafMobility);
+                PagingStrategyGuard::set(crate::context::PagingStrategy::NwdafMobility).await;
             let (_hit, hit_port, _) = nwdaf_standin(
                 Some(nwdafd_predicts(&nwdaf_cell_of(2))),
                 Duration::ZERO,
@@ -25331,7 +25336,7 @@ mod tests {
             }
         }
 
-        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::default());
+        let _strategy = PagingStrategyGuard::set(crate::context::PagingStrategy::default()).await;
         let ue = 464_211u64;
         insert_nwdaf_ue(&ngap, ue, base + 1, Some("imsi-001010000464211"), Some(1));
         queue_paging(&ngap, ue);
@@ -25462,7 +25467,8 @@ mod tests {
     async fn demo_nwdaf_mobility_sends_the_predicted_cells_on_the_first_attempt() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
-        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::NwdafMobility);
+        let _strategy =
+            PagingStrategyGuard::set(crate::context::PagingStrategy::NwdafMobility).await;
         let (_nwdaf, port, _) = nwdaf_standin(
             Some(nwdafd_predicts(&nwdaf_cell_of(2))),
             Duration::ZERO,
@@ -25549,7 +25555,8 @@ mod tests {
     async fn demo_line_names_a_last_known_only_first_attempt() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
-        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::NwdafMobility);
+        let _strategy =
+            PagingStrategyGuard::set(crate::context::PagingStrategy::NwdafMobility).await;
         let _mode =
             crate::demo_d440c::ModeOnThisThread::set(crate::demo_d440c::MODE_NWDAF_MOBILITY);
         let (_nwdaf, port, _) = nwdaf_standin(
@@ -25673,7 +25680,7 @@ mod tests {
             crate::context::PagingStrategy::NwdafMobility,
             Some(crate::demo_d440c::MODE_REGISTRATION_AREA),
         );
-        let _strategy = PagingStrategyOverride::set(forced);
+        let _strategy = PagingStrategyGuard::set(forced).await;
         let _mode =
             crate::demo_d440c::ModeOnThisThread::set(crate::demo_d440c::MODE_REGISTRATION_AREA);
         let mut ngap = capturing_ngap_server().await;
@@ -25702,21 +25709,26 @@ mod tests {
     const RECO_TAC: u32 = 0x1442;
 
     /// Sets `amf.paging.strategy` on the process-global context for one test and
-    /// puts the default back on drop, even on a panic. Hold `CONTEXT_GUARD` for as
-    /// long as it lives: the strategy is a field of that global.
-    struct PagingStrategyOverride;
+    /// puts the default back on drop, even on a panic. Holds
+    /// `test_support::PAGING_STRATEGY_LOCK` for as long as it lives (#1588): every
+    /// page any test queues reads the strategy, so a test that queues one under the
+    /// default must not run inside this one's window.
+    struct PagingStrategyGuard {
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+    }
 
-    impl PagingStrategyOverride {
-        fn set(strategy: crate::context::PagingStrategy) -> Self {
+    impl PagingStrategyGuard {
+        async fn set(strategy: crate::context::PagingStrategy) -> Self {
+            let lock = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
             crate::context::amf_self()
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
                 .paging_strategy = strategy;
-            Self
+            Self { _lock: lock }
         }
     }
 
-    impl Drop for PagingStrategyOverride {
+    impl Drop for PagingStrategyGuard {
         fn drop(&mut self) {
             crate::context::amf_self()
                 .write()
@@ -25912,7 +25924,7 @@ mod tests {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let _strategy =
-            PagingStrategyOverride::set(crate::context::PagingStrategy::RecommendedFirst);
+            PagingStrategyGuard::set(crate::context::PagingStrategy::RecommendedFirst).await;
         let mut ngap = capturing_ngap_server().await;
         let base = 14_420u64;
         reco_grid(&ngap, base).await;
@@ -25965,7 +25977,7 @@ mod tests {
     async fn the_default_strategy_ignores_the_recommendation_and_pages_the_area() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
-        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::default());
+        let _strategy = PagingStrategyGuard::set(crate::context::PagingStrategy::default()).await;
         let mut ngap = capturing_ngap_server().await;
         let base = 14_430u64;
         reco_grid(&ngap, base).await;
@@ -26134,7 +26146,7 @@ mod tests {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let _strategy =
-            PagingStrategyOverride::set(crate::context::PagingStrategy::RecommendedFirst);
+            PagingStrategyGuard::set(crate::context::PagingStrategy::RecommendedFirst).await;
         let (base, ue) = (14_460u64, 1_442_005u64);
         let mut ngap = connected_ue_with_a_stored_recommendation(base, ue, 65).await;
         ngap.handle_ng_reset(
@@ -26154,7 +26166,7 @@ mod tests {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let _strategy =
-            PagingStrategyOverride::set(crate::context::PagingStrategy::RecommendedFirst);
+            PagingStrategyGuard::set(crate::context::PagingStrategy::RecommendedFirst).await;
         let (base, ue) = (14_470u64, 1_442_006u64);
         let mut ngap = connected_ue_with_a_stored_recommendation(base, ue, 66).await;
         ngap.reset_ue_associations_of(base + 1, "SCTP association lost (test)")
@@ -26171,7 +26183,7 @@ mod tests {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let _strategy =
-            PagingStrategyOverride::set(crate::context::PagingStrategy::RecommendedFirst);
+            PagingStrategyGuard::set(crate::context::PagingStrategy::RecommendedFirst).await;
         let (base, ue) = (14_480u64, 1_442_007u64);
         let mut ngap = connected_ue_with_a_stored_recommendation(base, ue, 67).await;
         let failure = nextgcore_ngap::builder::build_initial_context_setup_failure(
@@ -26204,7 +26216,7 @@ mod tests {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let _strategy =
-            PagingStrategyOverride::set(crate::context::PagingStrategy::RecommendedFirst);
+            PagingStrategyGuard::set(crate::context::PagingStrategy::RecommendedFirst).await;
         let mut ngap = capturing_ngap_server().await;
         let base = 14_450u64;
         reco_grid(&ngap, base).await;
