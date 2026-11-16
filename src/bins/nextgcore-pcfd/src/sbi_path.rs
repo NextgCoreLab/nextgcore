@@ -1919,7 +1919,10 @@ async fn bounded_udr_read<F>(fut: F) -> Result<Option<serde_json::Value>, UdrErr
 where
     F: std::future::Future<Output = Result<Option<serde_json::Value>, UdrError>>,
 {
-    match tokio::time::timeout(UDR_CREATE_READ_TIMEOUT, fut).await {
+    // #1607 review: boxed, so the read's state machine lives on the heap. Inline,
+    // it roughly doubled the SM create future (20 -> 36 KB) and the router's, and
+    // the pcfd suite overflowed a test thread's stack.
+    match tokio::time::timeout(UDR_CREATE_READ_TIMEOUT, Box::pin(fut)).await {
         Ok(Err(UdrError::Status(s))) if s >= 500 => Err(UdrError::Status(s)),
         Ok(Err(e)) => {
             log::warn!("nudr-dr read failed without a UDR answer ({e}); local default");

@@ -8238,6 +8238,8 @@ mod tests {
                 "supi": "imsi-001010000025971",
                 "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/1597",
                 "suppFeat": "0",
+                // #1580: the AMF's UDM RFSP, so the answer carries the authorised one.
+                "rfsp": 1,
             })),
         ))
         .await;
@@ -8251,7 +8253,7 @@ mod tests {
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
             &format!("/npcf-am-policy-control/v1/policies/{id}/update"),
-            Some(serde_json::json!({ "triggers": ["LOC_CH"] })),
+            Some(serde_json::json!({ "triggers": ["LOC_CH"], "rfsp": 1 })),
         ))
         .await;
         assert_eq!(resp.status, 200);
