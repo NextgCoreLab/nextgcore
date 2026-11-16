@@ -167,6 +167,27 @@ pub fn knob_from_root(root: &serde_yaml::Value) -> Result<bool, String> {
     }
 }
 
+/// `nwdaf.amf_mobility.max_ues` from the config root (#1428): how many SUPIs'
+/// mobility histories are held, the least recently reported evicted past it.
+/// Absent means [`DEFAULT_MAX_TRACKED_UES`](crate::analytics::DEFAULT_MAX_TRACKED_UES);
+/// a present value that is not a positive integer fails start-up.
+pub fn max_ues_from_root(root: &serde_yaml::Value) -> Result<usize, String> {
+    let value = root
+        .get("nwdaf")
+        .and_then(|n| n.get("amf_mobility"))
+        .and_then(|s| s.get("max_ues"));
+    match value {
+        None | Some(serde_yaml::Value::Null) => Ok(crate::analytics::DEFAULT_MAX_TRACKED_UES),
+        Some(v) => v
+            .as_u64()
+            .filter(|n| *n >= 1)
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| {
+                format!("nwdaf.amf_mobility.max_ues must be a positive integer, got {v:?}")
+            }),
+    }
+}
+
 /// Record the plan for this process. Call once, before the NRF registration, so
 /// the profile advertises UE_MOBILITY exactly when it is served.
 pub fn install(plan: Plan) {
@@ -750,6 +771,92 @@ pub fn render_metrics(out: &mut String) {
         "nwdaf_ue_mobility_location_reports_total{{result=\"refused\"}} {}",
         REFUSED.load(Ordering::Relaxed)
     );
+    // #1428: the bounded history. Lock order: context read → engine mutex.
+    if let Ok(guard) = crate::context::nwdaf_self().read() {
+        render_history_metrics(out, &guard.lock_engine());
+    }
+}
+
+/// The #1428 history families for `engine`.
+fn render_history_metrics(out: &mut String, engine: &AnalyticsEngine) {
+    nextgcore_metrics::nf::write_metric(
+        out,
+        "nwdaf_ue_mobility_tracked_ues",
+        "gauge",
+        "SUPIs whose UE mobility history is held (bounded by nwdaf.amf_mobility.max_ues)",
+        engine.tracked_ue_count(),
+    );
+    nextgcore_metrics::nf::write_metric(
+        out,
+        "nwdaf_ue_mobility_max_tracked_ues",
+        "gauge",
+        "The nwdaf.amf_mobility.max_ues bound on tracked SUPIs",
+        engine.max_tracked_ues(),
+    );
+    nextgcore_metrics::nf::write_metric(
+        out,
+        "nwdaf_ue_mobility_tracked_cells",
+        "gauge",
+        "Cells whose reported UserLocation is held for UE_MOBILITY answers",
+        engine.tracked_cell_count(),
+    );
+    nextgcore_metrics::nf::write_metric(
+        out,
+        "nwdaf_ue_mobility_evicted_ues_total",
+        "counter",
+        "SUPIs evicted, least recently reported first, at the nwdaf.amf_mobility.max_ues bound",
+        engine.evicted_ue_count(),
+    );
+}
+
+/// #1428: the `max_ues` knob and the history metrics. Kept out of `tests.rs`,
+/// which another open change edits.
+#[cfg(test)]
+mod bound_tests {
+    use super::*;
+
+    fn root(yaml: &str) -> serde_yaml::Value {
+        serde_yaml::from_str(yaml).expect("yaml")
+    }
+
+    #[test]
+    fn max_ues_defaults_and_rejects_a_non_positive_value() {
+        assert_eq!(
+            max_ues_from_root(&root("nwdaf: {}")),
+            Ok(crate::analytics::DEFAULT_MAX_TRACKED_UES)
+        );
+        assert_eq!(
+            max_ues_from_root(&root("nwdaf: {amf_mobility: {enabled: true}}")),
+            Ok(crate::analytics::DEFAULT_MAX_TRACKED_UES)
+        );
+        assert_eq!(
+            max_ues_from_root(&root("nwdaf: {amf_mobility: {max_ues: 250}}")),
+            Ok(250)
+        );
+        for bad in ["0", "-1", "lots", "1.5"] {
+            let yaml = format!("nwdaf: {{amf_mobility: {{max_ues: {bad}}}}}");
+            assert!(max_ues_from_root(&root(&yaml)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_history_metrics_report_the_bound() {
+        let mut engine = AnalyticsEngine::new();
+        engine.set_max_tracked_ues(2);
+        for supi in ["imsi-1", "imsi-2", "imsi-3"] {
+            engine.ingest_ue_location(supi, 1, json!({}), 0);
+        }
+        let mut out = String::new();
+        render_history_metrics(&mut out, &engine);
+        for line in [
+            "nwdaf_ue_mobility_tracked_ues 2",
+            "nwdaf_ue_mobility_max_tracked_ues 2",
+            "nwdaf_ue_mobility_tracked_cells 1",
+            "nwdaf_ue_mobility_evicted_ues_total 1",
+        ] {
+            assert!(out.lines().any(|l| l == line), "{line} in:\n{out}");
+        }
+    }
 }
 
 #[cfg(test)]

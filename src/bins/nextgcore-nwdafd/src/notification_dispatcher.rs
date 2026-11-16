@@ -717,7 +717,12 @@ pub(crate) async fn dispatch_ml_prov_notifications_as(
     };
 
     for sub in &pending {
-        let body = crate::ml_service::build_ml_model_prov_notif_body(sub, &base_uri, &model);
+        let Some(body) = crate::ml_service::build_ml_model_prov_notif_body(sub, &base_uri, &model)
+        else {
+            // #1452: a restored subscription for events this MTLF provisions no
+            // model for; there is nothing to notify.
+            continue;
+        };
 
         let (host, port, path) = match parse_notify_uri(&sub.notif_uri) {
             Some(t) => t,
@@ -744,6 +749,24 @@ pub(crate) async fn dispatch_ml_prov_notifications_as(
                     guard.mark_ml_prov_notified(&sub.subscription_id, &model.sha256);
                 }
             }
+            Ok(resp) if notify_says_subscription_gone(&resp) => {
+                // #1474: a restarted AnLF serves a new callback token, so its old
+                // subscription's notifUri answers 404 for ever. Retrying it every
+                // tick, and keeping one more persisted record per restart, is
+                // what TS 29.500 §6.2.3 says not to do.
+                let removed = ctx
+                    .read()
+                    .ok()
+                    .and_then(|guard| guard.remove_ml_prov_subscription(&sub.subscription_id));
+                if removed.is_some() {
+                    log::info!(
+                        "MLModelProvision: subscription {} removed: its notifUri answered {} \
+                         (the consumer no longer holds it, TS 29.500 §6.2.3)",
+                        sub.subscription_id,
+                        resp.status
+                    );
+                }
+            }
             Ok(resp) => log::warn!(
                 "dispatch: ML-prov notify non-success status={} sub={}",
                 resp.status,
@@ -755,6 +778,32 @@ pub(crate) async fn dispatch_ml_prov_notifications_as(
                 nextgcore_sbi::log_redact::redact_last_segment(&sub.notif_uri)
             ),
         }
+    }
+}
+
+/// Whether a Notify answer tells the producer that the consumer no longer holds
+/// the subscription, so it is terminated rather than retried (#1474).
+///
+/// TS 29.500 §6.2.3 (`29500-j70.txt:5942-5962`): a producer "should consider that
+/// the subscription is no longer valid and terminate the subscription" on
+/// `400 RESOURCE_CONTEXT_NOT_FOUND` or `404 SUBSCRIPTION_NOT_FOUND`, and "should
+/// not keep on sending notification requests ... and may consider that the
+/// subscription is no longer valid" on a `404` without, or with another,
+/// application error. Every 404 is therefore terminal: the target resource, the
+/// callback, does not exist (§5.2.7.2, `29500-j70.txt:4596-4597`). Transport
+/// errors, 5xx and every other 4xx are retried.
+fn notify_says_subscription_gone(resp: &nextgcore_sbi::message::SbiResponse) -> bool {
+    match resp.status {
+        404 => true,
+        400 => resp
+            .http
+            .content
+            .as_deref()
+            .and_then(|c| serde_json::from_str::<Value>(c).ok())
+            .is_some_and(|b| {
+                b.get("cause").and_then(|c| c.as_str()) == Some("RESOURCE_CONTEXT_NOT_FOUND")
+            }),
+        _ => false,
     }
 }
 
@@ -883,7 +932,8 @@ mod tests {
             .current_model_version()
             .expect("the default predictor is exportable");
         let ml_body =
-            crate::ml_service::build_ml_model_prov_notif_body(&ml_sub, "http://x", &model);
+            crate::ml_service::build_ml_model_prov_notif_body(&ml_sub, "http://x", &model)
+                .expect("NF_LOAD is provisioned");
 
         assert!(events_body.is_array(), "EventsSubscription notify");
         assert!(ml_body.is_array(), "MLModelProvision notify");
@@ -1842,6 +1892,102 @@ mod ml_prov_version_tests {
         dispatch_ml_prov_notifications_as(ctx.clone(), crate::role::Role::Mtlf).await;
         assert_eq!(seen.lock().unwrap().len(), 1);
         server.stop().await.expect("stop");
+    }
+
+    /// A consumer that answers every Notify with `status` and `body`, counting
+    /// the POSTs it receives.
+    async fn consumer_answering(
+        status: u16,
+        body: Option<Value>,
+    ) -> (nextgcore_sbi::SbiServer, u16, Arc<Mutex<usize>>) {
+        let posts = Arc::new(Mutex::new(0usize));
+        let count = posts.clone();
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = nextgcore_sbi::SbiServer::on_listener(
+            nextgcore_sbi::SbiServerConfig::new(addr),
+            listener,
+        );
+        server
+            .start(move |_req: SbiRequest| {
+                let count = count.clone();
+                let body = body.clone();
+                async move {
+                    *count.lock().unwrap() += 1;
+                    let resp = SbiResponse::with_status(status);
+                    match body {
+                        Some(b) => resp.with_json_body(&b).expect("json"),
+                        None => resp,
+                    }
+                }
+            })
+            .await
+            .expect("consumer starts");
+        (server, addr.port(), posts)
+    }
+
+    /// #1474: a notifUri that answers 404 (a restarted AnLF's old token) or
+    /// 400 RESOURCE_CONTEXT_NOT_FOUND ends the subscription after one Notify,
+    /// TS 29.500 §6.2.3. The next tick sends nothing to it.
+    #[tokio::test]
+    async fn a_notify_answered_404_removes_the_ml_provision_subscription() {
+        for (status, body) in [
+            (404, None),
+            (
+                404,
+                Some(json!({ "status": 404, "cause": "SUBSCRIPTION_NOT_FOUND" })),
+            ),
+            (
+                400,
+                Some(json!({ "status": 400, "cause": "RESOURCE_CONTEXT_NOT_FOUND" })),
+            ),
+        ] {
+            let (server, port, posts) = consumer_answering(status, body.clone()).await;
+            let ctx = mtlf(port, "mlsub-1474-gone");
+            assert_eq!(ctx.read().unwrap().ml_prov_subscription_count(), 1);
+
+            dispatch_ml_prov_notifications(ctx.clone()).await;
+            assert_eq!(*posts.lock().unwrap(), 1, "{status} {body:?}: one Notify");
+            {
+                let guard = ctx.read().unwrap();
+                assert!(
+                    guard.get_ml_prov_subscription("mlsub-1474-gone").is_none(),
+                    "{status} {body:?}: the subscription is gone"
+                );
+                assert_eq!(guard.ml_prov_subscription_count(), 0);
+            }
+
+            dispatch_ml_prov_notifications(ctx.clone()).await;
+            assert_eq!(*posts.lock().unwrap(), 1, "{status} {body:?}: no retry");
+            server.stop().await.expect("stop");
+        }
+    }
+
+    /// #1474: a 5xx or any other 4xx is not "gone": the subscription stays
+    /// pending and the next tick notifies it again.
+    #[tokio::test]
+    async fn a_notify_answered_500_or_another_400_is_retried() {
+        for (status, body) in [
+            (500, None),
+            (503, None),
+            (
+                400,
+                Some(json!({ "status": 400, "cause": "MANDATORY_IE_MISSING" })),
+            ),
+        ] {
+            let (server, port, posts) = consumer_answering(status, body.clone()).await;
+            let ctx = mtlf(port, "mlsub-1474-kept");
+            dispatch_ml_prov_notifications(ctx.clone()).await;
+            dispatch_ml_prov_notifications(ctx.clone()).await;
+            assert_eq!(*posts.lock().unwrap(), 2, "{status} {body:?}: retried");
+            {
+                let guard = ctx.read().unwrap();
+                let active = guard.current_model_version().unwrap();
+                let pending = guard.get_pending_ml_prov_subscriptions(&active.sha256);
+                assert_eq!(pending.len(), 1, "{status} {body:?}: still pending");
+                assert_eq!(pending[0].subscription_id, "mlsub-1474-kept");
+            }
+            server.stop().await.expect("stop");
+        }
     }
 
     /// A failed delivery leaves the subscription pending for the next tick.
