@@ -1723,9 +1723,13 @@ pub fn handle_ml_prov_subscription_create_with_ctx(
         Err((detail, cause)) => return send_bad_request(detail, Some(cause)),
     };
 
-    let parsed = match crate::ml_service::parse_ml_model_prov_subsc(&data) {
+    let mut parsed = match crate::ml_service::parse_ml_model_prov_subsc(&data) {
         Ok(p) => p,
         Err(detail) => return send_bad_request(&detail, Some("MANDATORY_IE_MISSING")),
+    };
+    let failed = match ml_prov_retain_provisioned(&mut parsed) {
+        Ok(f) => f,
+        Err(resp) => return *resp,
     };
 
     let subscription_id = format!("mlsub-{}", uuid::Uuid::new_v4());
@@ -1738,7 +1742,7 @@ pub fn handle_ml_prov_subscription_create_with_ctx(
                 "Location",
                 format!("/nnwdaf-mlmodelprovision/v1/subscriptions/{sub_id}"),
             )
-            .with_json_body(&crate::ml_service::ml_prov_subsc_json(&sub))
+            .with_json_body(&ml_prov_representation(&sub, failed))
             .unwrap_or_else(|_| SbiResponse::with_status(201)),
         None => send_bad_request(
             "Failed to create ML-provision subscription",
@@ -1761,9 +1765,13 @@ pub async fn handle_ml_prov_subscription_update(
         Err((detail, cause)) => return send_bad_request(detail, Some(cause)),
     };
 
-    let parsed = match crate::ml_service::parse_ml_model_prov_subsc(&data) {
+    let mut parsed = match crate::ml_service::parse_ml_model_prov_subsc(&data) {
         Ok(p) => p,
         Err(detail) => return send_bad_request(&detail, Some("MANDATORY_IE_MISSING")),
+    };
+    let failed = match ml_prov_retain_provisioned(&mut parsed) {
+        Ok(f) => f,
+        Err(resp) => return *resp,
     };
 
     let mut sub = MlProvSubscription::from_parsed(subscription_id.to_string(), parsed);
@@ -1778,7 +1786,7 @@ pub async fn handle_ml_prov_subscription_update(
 
     if updated {
         SbiResponse::with_status(200)
-            .with_json_body(&crate::ml_service::ml_prov_subsc_json(&sub))
+            .with_json_body(&ml_prov_representation(&sub, failed))
             .unwrap_or_else(|_| SbiResponse::with_status(200))
     } else {
         send_not_found(
@@ -1786,6 +1794,51 @@ pub async fn handle_ml_prov_subscription_update(
             Some("SUBSCRIPTION_NOT_FOUND"),
         )
     }
+}
+
+/// Keep the events this MTLF provisions a model for, and return the
+/// `failEventReports` for the others (#1452), or the error answer when none is
+/// left.
+///
+/// TS 29.520 §4.5.2.2.2 (`29520-k00.txt:6916-6933`, Subscribe) and §4.5.2.2.3
+/// (l.6985-7003, Update): when not all events are accepted the NWDAF answers
+/// 201/200 with `failEventReports`; "If there is no associated ML model
+/// available for all the listed "mLEvent" attribute[s] ... the NWDAF which
+/// contains MTLF shall send a "500 Internal Server Error" ... "cause" attribute
+/// set to "UNAVAILABLE_ML_MODEL_FOR_ALLEVENTS"", and then no subscription is
+/// created or changed.
+fn ml_prov_retain_provisioned(
+    parsed: &mut crate::ml_service::ParsedMlProvSubsc,
+) -> Result<Vec<serde_json::Value>, Box<SbiResponse>> {
+    let failed = crate::ml_service::retain_provisioned_events(parsed);
+    if parsed.ml_events.is_empty() {
+        log::info!(
+            "ML Model Provision: no ML model for any requested event ({} failed) → 500 \
+             UNAVAILABLE_ML_MODEL_FOR_ALLEVENTS",
+            failed.len()
+        );
+        return Err(Box::new(send_error(
+            500,
+            "Internal Server Error",
+            "this NWDAF provisions an ML model for none of the requested mLEvents",
+            Some("UNAVAILABLE_ML_MODEL_FOR_ALLEVENTS"),
+        )));
+    }
+    Ok(failed)
+}
+
+/// The 201/200 `NwdafMLModelProvSubsc` representation: the stored subscription,
+/// plus `failEventReports` when an event was not accepted (minItems 1, so
+/// absent otherwise).
+fn ml_prov_representation(
+    sub: &MlProvSubscription,
+    failed: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    let mut body = crate::ml_service::ml_prov_subsc_json(sub);
+    if !failed.is_empty() {
+        body["failEventReports"] = serde_json::Value::Array(failed);
+    }
+    body
 }
 
 /// Handle `DELETE /nnwdaf-mlmodelprovision/v1/subscriptions/{id}`.
@@ -3486,6 +3539,112 @@ mod tests {
 
     // ── nwafd-05: Nnwdaf_MLModelProvision Subscribe/Notify ────────────────────
 
+    /// A private context and an `NwdafMLModelProvSubsc` POST for `events`.
+    fn ml_prov_ctx_and_post(events: &[&str]) -> (NwdafContext, SbiRequest) {
+        let mut ctx = NwdafContext::new("nwdaf-1452".to_string());
+        ctx.init(16);
+        let subscs: Vec<Value> = events
+            .iter()
+            .map(|e| json!({ "mLEvent": e, "mLEventFilter": {} }))
+            .collect();
+        let req = SbiRequest::post("/nnwdaf-mlmodelprovision/v1/subscriptions")
+            .with_json_body(&json!({
+                "notifUri": "http://anlf.example.org/ml-cb-1452",
+                "mLEventSubscs": subscs,
+            }))
+            .expect("valid JSON body");
+        (ctx, req)
+    }
+
+    /// #1452: an event this MTLF provisions no model for is reported in
+    /// `failEventReports` with UNAVAILABLE_ML_MODEL (201, TS 29.520
+    /// §4.5.2.2.2), and only NF_LOAD is subscribed.
+    #[test]
+    fn an_unprovisioned_ml_event_is_a_fail_event_report() {
+        let (ctx, req) = ml_prov_ctx_and_post(&["NF_LOAD", "UE_MOBILITY", "QOS_SUSTAINABILITY"]);
+        let resp = handle_ml_prov_subscription_create_with_ctx(&ctx, &req);
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        let body = body_json(&resp);
+        assert_eq!(
+            body["failEventReports"],
+            json!([
+                { "event": "UE_MOBILITY", "failureCode": "UNAVAILABLE_ML_MODEL" },
+                { "event": "QOS_SUSTAINABILITY", "failureCode": "UNAVAILABLE_ML_MODEL" },
+            ])
+        );
+        assert_eq!(body["mLEventSubscs"], json!([{ "mLEvent": "NF_LOAD" }]));
+        let id = body["subscriptionId"].as_str().expect("subscriptionId");
+        let stored = ctx.get_ml_prov_subscription(id).expect("stored");
+        assert_eq!(stored.ml_events, vec![AnalyticsId::NfLoad]);
+
+        // Every event provisioned: no failEventReports (minItems 1).
+        let (ctx, req) = ml_prov_ctx_and_post(&["NF_LOAD"]);
+        let resp = handle_ml_prov_subscription_create_with_ctx(&ctx, &req);
+        assert_eq!(resp.status, 201);
+        assert!(body_json(&resp).get("failEventReports").is_none());
+    }
+
+    /// #1452: when no requested event has a model, the MTLF "shall send a 500
+    /// ... UNAVAILABLE_ML_MODEL_FOR_ALLEVENTS" (`29520-k00.txt:6928-6933`) and
+    /// creates no subscription.
+    #[test]
+    fn no_provisioned_ml_event_is_500_unavailable_for_all_events() {
+        let (ctx, req) = ml_prov_ctx_and_post(&["UE_MOBILITY", "QOS_SUSTAINABILITY"]);
+        let resp = handle_ml_prov_subscription_create_with_ctx(&ctx, &req);
+        assert_eq!(resp.status, 500);
+        assert_eq!(
+            body_json(&resp)["cause"].as_str(),
+            Some("UNAVAILABLE_ML_MODEL_FOR_ALLEVENTS")
+        );
+        assert_eq!(ctx.ml_prov_subscription_count(), 0);
+    }
+
+    /// #1452: an Update follows the same rule (§4.5.2.2.3,
+    /// `29520-k00.txt:6985-7003`): 200 with failEventReports for a mixed list,
+    /// 500 for none, and a 500 leaves the subscription as it was.
+    #[tokio::test]
+    async fn an_ml_prov_update_reports_unprovisioned_events() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        let post = |events: Value| {
+            SbiRequest::post("/nnwdaf-mlmodelprovision/v1/subscriptions")
+                .with_json_body(&json!({
+                    "notifUri": "http://anlf.example.org/ml-cb-1452-put",
+                    "mLEventSubscs": events,
+                }))
+                .expect("valid JSON body")
+        };
+        let created =
+            handle_ml_prov_subscription_create(&post(json!([{ "mLEvent": "NF_LOAD" }]))).await;
+        assert_eq!(created.status, 201);
+        let id = body_json(&created)["subscriptionId"]
+            .as_str()
+            .expect("subscriptionId")
+            .to_string();
+
+        let mixed = post(json!([{ "mLEvent": "UE_MOBILITY" }, { "mLEvent": "NF_LOAD" }]));
+        let resp = handle_ml_prov_subscription_update(&id, &mixed).await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            body_json(&resp)["failEventReports"],
+            json!([{ "event": "UE_MOBILITY", "failureCode": "UNAVAILABLE_ML_MODEL" }])
+        );
+
+        let none = post(json!([{ "mLEvent": "UE_MOBILITY" }]));
+        let resp = handle_ml_prov_subscription_update(&id, &none).await;
+        assert_eq!(resp.status, 500);
+        assert_eq!(
+            body_json(&resp)["cause"].as_str(),
+            Some("UNAVAILABLE_ML_MODEL_FOR_ALLEVENTS")
+        );
+        let stored = nwdaf_self()
+            .read()
+            .unwrap()
+            .get_ml_prov_subscription(&id)
+            .expect("still there");
+        assert_eq!(stored.ml_events, vec![AnalyticsId::NfLoad]);
+        assert_eq!(handle_ml_prov_subscription_delete(&id).await.status, 204);
+    }
+
     /// POST a conformant `NwdafMLModelProvSubsc` → 201, a Location pointing at
     /// the `/subscriptions/{id}` resource (never `/models`), and a body echoing
     /// the `NwdafMLModelProvSubsc` representation.
@@ -3575,7 +3734,7 @@ mod tests {
         ))
         .with_json_body(&json!({
             "notifUri": "http://anlf.example.org/ml-cb2",
-            "mLEventSubscs": [ { "mLEvent": "UE_MOBILITY" } ]
+            "mLEventSubscs": [ { "mLEvent": "NF_LOAD" } ]
         }))
         .expect("valid JSON body");
         let put_resp = handle_ml_prov_subscription_update(&sub_id, &put).await;

@@ -717,7 +717,12 @@ pub(crate) async fn dispatch_ml_prov_notifications_as(
     };
 
     for sub in &pending {
-        let body = crate::ml_service::build_ml_model_prov_notif_body(sub, &base_uri, &model);
+        let Some(body) = crate::ml_service::build_ml_model_prov_notif_body(sub, &base_uri, &model)
+        else {
+            // #1452: a restored subscription for events this MTLF provisions no
+            // model for; there is nothing to notify.
+            continue;
+        };
 
         let (host, port, path) = match parse_notify_uri(&sub.notif_uri) {
             Some(t) => t,
@@ -927,7 +932,8 @@ mod tests {
             .current_model_version()
             .expect("the default predictor is exportable");
         let ml_body =
-            crate::ml_service::build_ml_model_prov_notif_body(&ml_sub, "http://x", &model);
+            crate::ml_service::build_ml_model_prov_notif_body(&ml_sub, "http://x", &model)
+                .expect("NF_LOAD is provisioned");
 
         assert!(events_body.is_array(), "EventsSubscription notify");
         assert!(ml_body.is_array(), "MLModelProvision notify");
