@@ -47,7 +47,7 @@ pub fn nextgcore_dbi_session_data(
 
 /// The slice/DNN match over one subscriber document, shared by the MongoDB path and
 /// the test mirror so the two cannot diverge.
-fn session_data_from_document(
+pub(crate) fn session_data_from_document(
     document: &Document,
     supi_id: &str,
     s_nssai: Option<&NextgcoreSNssai>,
@@ -69,13 +69,8 @@ fn session_data_from_document(
                 }
             };
 
-            // Parse SD
-            let sd = if let Ok(sd_str) = slice_doc.get_str(NEXTGCORE_SD_STRING) {
-                NextgcoreUint24::from_hex_string(sd_str)
-                    .unwrap_or(NextgcoreUint24::new(NEXTGCORE_S_NSSAI_NO_SD_VALUE))
-            } else {
-                NextgcoreUint24::new(NEXTGCORE_S_NSSAI_NO_SD_VALUE)
-            };
+            // Parse SD: absent or unparseable is "no SD", as in the subscription read.
+            let sd = crate::subscription::parse_slice_sd(slice_doc);
 
             // Check S-NSSAI match
             if let Some(req_snssai) = s_nssai {

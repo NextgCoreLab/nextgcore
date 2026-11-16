@@ -31,6 +31,8 @@ use std::sync::Arc;
 
 mod binding;
 mod context;
+#[cfg(feature = "demo-d443a-edge-budget")]
+mod demo_d443a; // nextgsim#471: N6 delays on QOS_MON (demo d443a-edge-budget)
 mod easdf; // #114: EASDF selection + DNS-context lifecycle (TS 23.501 §5.6.7)
 mod eps_bearer; // #619: PGW-C dedicated EPS bearer activation over S5/S8 (TS 23.401 §5.4.1)
 mod eps_iwk; // #117: 5GS↔EPS interworking, EBI assignment over Namf_Communication
@@ -830,6 +832,38 @@ fn epco_config() -> (&'static [std::net::Ipv4Addr], Option<u16>) {
     }
 }
 
+/// The demos this build can run: `d443a-edge-budget` under its feature, none
+/// otherwise.
+fn demo_registry() -> nextgcore_demo::DemoRegistry {
+    #[cfg(feature = "demo-d443a-edge-budget")]
+    return nextgcore_demo::DemoRegistry::new(&[demo_d443a::DEMO_SPEC]);
+    #[cfg(not(feature = "demo-d443a-edge-budget"))]
+    nextgcore_demo::DemoRegistry::default()
+}
+
+/// The config file's root, for the `demo:` block. A missing file is no block, as
+/// for the rest of the config (`load_config`).
+fn config_root(config_path: &str) -> anyhow::Result<serde_yaml::Value> {
+    match std::fs::read_to_string(config_path) {
+        Ok(content) => serde_yaml::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("SMF config '{config_path}' does not parse: {e}")),
+        // A file that cannot be read is no block, exactly as `load_config` falls
+        // back to the defaults on any read error (it has already warned), so
+        // with the demo off nothing here fails where smfd did not fail before.
+        Err(_) => Ok(serde_yaml::Value::Null),
+    }
+}
+
+/// Validate and install the `demo:` block, once per process.
+fn init_demos(config_path: &str) -> anyhow::Result<()> {
+    let root = config_root(config_path)?;
+    nextgcore_demo::init_from_root(&root, &demo_registry())
+        .map_err(|e| anyhow::anyhow!("{e} ({e:?})"))?;
+    #[cfg(feature = "demo-d443a-edge-budget")]
+    demo_d443a::install(nextgcore_demo::active_mode(demo_d443a::DEMO_KEY));
+    Ok(())
+}
+
 /// The value after the first of `flags` in `args` (`-c x`, `--config x`), or
 /// `None`. smfd reads its few flags by hand rather than through clap.
 fn smf_flag_value(args: impl Iterator<Item = String>, flags: &[&str]) -> Option<String> {
@@ -905,6 +939,10 @@ async fn main() -> Result<()> {
     let _ = EPCO_CONFIG.set((config.dns_servers.clone(), config.mtu));
     // #1502: before the association loop can associate a UPF.
     n6_delay::set_config(config.n6_delay.take());
+    // nextgsim#458: the demo: block, checked against the demos this build was
+    // compiled with, so an unknown key or mode, or a demo whose cargo feature is
+    // not built, fails start-up. With no demo active nothing changes.
+    init_demos(&config_path)?;
 
     // Seed NRF URI into SBI context for NF registration (parsed once in load_config).
     if let Some(ref uri) = config.nrf_uri {
@@ -6663,6 +6701,22 @@ fn arm_gsm_timer_with_n2(
     }
 }
 
+/// Whether `timer_id` is the 5GSM timer armed for `sm_context_ref` (#1471).
+fn gsm_timer_armed(sm_context_ref: &str, timer_id: timer::SmfTimerId) -> bool {
+    gsm_procedure_timers()
+        .lock()
+        .map(|t| {
+            t.get(sm_context_ref)
+                .is_some_and(|e| e.timer_id == timer_id)
+        })
+        .unwrap_or(false)
+}
+
+/// PTI values (TS 24.007 §11.2.3.1a, TS 24.501 §9.6): 0 is "no procedure
+/// transaction identity assigned", 255 is reserved.
+const PTI_UNASSIGNED: u8 = 0;
+const PTI_RESERVED: u8 = 0xFF;
+
 /// Stop the armed timer for `sm_context_ref` when it matches `timer_id`.
 ///
 /// Returns whether a matching timer was actually stopped, which is what lets a
@@ -9121,6 +9175,13 @@ enum N1SmIntent {
     ReleaseComplete,
     /// 5GSM STATUS (§6.5): the UE reports an error condition.
     Status { cause: Option<u8> },
+    /// PDU SESSION AUTHENTICATION COMPLETE (§6.3.1) or SERVICE-LEVEL
+    /// AUTHENTICATION COMPLETE (§6.4.3): the answer to a command this SMF never
+    /// sends, as it runs neither procedure (#1471).
+    AuthenticationComplete { psi: u8, pti: u8, message_type: u8 },
+    /// REMOTE UE REPORT (§6.6.2): a 5G ProSe UE-to-network relay UE reports its
+    /// remote UEs (#1471).
+    RemoteUeReport { psi: u8, pti: u8 },
     /// A 5GSM message this SMF does not act on at this point in the session.
     Unhandled { message_type: u8 },
 }
@@ -9154,6 +9215,18 @@ fn classify_n1_sm_message(n1: &[u8]) -> Option<N1SmIntent> {
         }
         gsm_build::message_type::PDU_SESSION_RELEASE_COMPLETE => N1SmIntent::ReleaseComplete,
         gsm_build::message_type::GSM_STATUS => N1SmIntent::Status { cause },
+        message_type @ (gsm_build::message_type::PDU_SESSION_AUTHENTICATION_COMPLETE
+        | gsm_build::message_type::SERVICE_LEVEL_AUTHENTICATION_COMPLETE) => {
+            N1SmIntent::AuthenticationComplete {
+                psi: hdr.psi,
+                pti: hdr.pti,
+                message_type,
+            }
+        }
+        gsm_build::message_type::REMOTE_UE_REPORT => N1SmIntent::RemoteUeReport {
+            psi: hdr.psi,
+            pti: hdr.pti,
+        },
         other => N1SmIntent::Unhandled {
             message_type: other,
         },
@@ -9277,6 +9350,69 @@ async fn handle_n1_sm_message(sm_context_ref: &str, n1: &[u8]) -> SbiResponse {
         N1SmIntent::Status { cause } => {
             log::warn!("5GSM STATUS from UE for ref={sm_context_ref}: cause={cause:?}");
             SbiResponse::with_status(204)
+        }
+
+        // #1471. This SMF sends no PDU SESSION AUTHENTICATION COMMAND and no
+        // SERVICE-LEVEL AUTHENTICATION COMMAND, so it implements neither COMPLETE.
+        // - TS 24.501 §7.3.1 d): a reserved PTI is ignored.
+        // - §7.3.1 b): an assigned PTI is answered 5GSM STATUS #81 "invalid PTI
+        //   value".
+        // - §7.4 otherwise: a message type "not implemented by the receiver" is
+        //   ignored, "except that it should return a status message ... with cause
+        //   #97".
+        N1SmIntent::AuthenticationComplete {
+            psi,
+            pti,
+            message_type,
+        } => {
+            if pti == PTI_RESERVED {
+                log::warn!(
+                    "ref={sm_context_ref}: 5GSM {message_type:#04x} with the reserved PTI \
+                     ignored (TS 24.501 §7.3.1 d))"
+                );
+                return SbiResponse::with_status(204);
+            }
+            let cause = if pti == PTI_UNASSIGNED {
+                policy::gsm_cause::MESSAGE_TYPE_NON_EXISTENT_OR_NOT_IMPLEMENTED
+            } else {
+                policy::gsm_cause::INVALID_PTI_VALUE
+            };
+            log::warn!(
+                "ref={sm_context_ref}: 5GSM {message_type:#04x} (PTI={pti}) for an \
+                 authentication this SMF never started; answering 5GSM STATUS #{cause}"
+            );
+            let status = policy::build_gsm_status(psi, pti, cause);
+            sbi_response_with_n1(200, serde_json::json!({}), &status)
+        }
+
+        // #1471, TS 24.501 §6.6.2.3: "Upon receipt of the REMOTE UE REPORT message,
+        // the SMF shall send a REMOTE UE REPORT RESPONSE message to the UE. The SMF
+        // shall include the PTI from the REMOTE UE REPORT message." It carries no EAP
+        // message, as no DN EAP exchange runs. §6.6.2.5 a): during a
+        // network-requested release of the session (T3592 armed) the report is
+        // aborted, and the release proceeds.
+        N1SmIntent::RemoteUeReport { psi, pti } => {
+            if pti == PTI_RESERVED {
+                log::warn!(
+                    "ref={sm_context_ref}: REMOTE UE REPORT with the reserved PTI ignored \
+                     (TS 24.501 §7.3.1 d))"
+                );
+                return SbiResponse::with_status(204);
+            }
+            if gsm_timer_armed(sm_context_ref, timer::SmfTimerId::T3592) {
+                log::info!(
+                    "ref={sm_context_ref}: REMOTE UE REPORT (PTI={pti}) during the \
+                     network-requested release; the report is aborted (TS 24.501 \
+                     §6.6.2.5 a))"
+                );
+                return SbiResponse::with_status(204);
+            }
+            log::info!(
+                "ref={sm_context_ref}: REMOTE UE REPORT (PSI={psi}, PTI={pti}); answering \
+                 REMOTE UE REPORT RESPONSE"
+            );
+            let response = policy::build_remote_ue_report_response(psi, pti);
+            sbi_response_with_n1(200, serde_json::json!({}), &response)
         }
 
         N1SmIntent::Unhandled { message_type } => {
@@ -21566,6 +21702,123 @@ mod tests {
         );
     }
 
+    /// The N1 SM the SMF answered with, if any.
+    fn answered_n1(resp: &SbiResponse) -> Option<Vec<u8>> {
+        resp.http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n1SmMsg"))
+            .map(|p| p.data.to_vec())
+    }
+
+    /// **#1471.** This SMF runs no secondary or service-level authentication, so a
+    /// PDU SESSION AUTHENTICATION COMPLETE (0xC6) or a SERVICE-LEVEL
+    /// AUTHENTICATION COMPLETE (0xD9) answers a command it never sent.
+    /// - TS 24.501 §7.4: with no PTI it is a message type not implemented,
+    ///   answered with 5GSM STATUS #97.
+    /// - §7.3.1 b): with an assigned PTI, 5GSM STATUS #81.
+    /// - §7.3.1 d): with the reserved PTI, ignored.
+    ///
+    /// The STATUS carries the message's PSI and PTI.
+    #[tokio::test]
+    async fn an_authentication_complete_is_answered_with_5gsm_status_1471() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let reference = "n1471-auth";
+        seed_binding(reference, 6);
+        for mt in [
+            gsm_build::message_type::PDU_SESSION_AUTHENTICATION_COMPLETE,
+            gsm_build::message_type::SERVICE_LEVEL_AUTHENTICATION_COMPLETE,
+        ] {
+            // EAP message IE (LV-E), as the UE sends it.
+            let eap = [0x00, 0x04, 0x02, 0x01, 0x00, 0x04];
+            for (pti, cause) in [
+                (
+                    0u8,
+                    policy::gsm_cause::MESSAGE_TYPE_NON_EXISTENT_OR_NOT_IMPLEMENTED,
+                ),
+                (9, policy::gsm_cause::INVALID_PTI_VALUE),
+            ] {
+                let resp = handle_n1_sm_message(reference, &n1(6, pti, mt, &eap)).await;
+                assert_eq!(resp.status, 200, "{mt:#04x} PTI {pti}");
+                assert_eq!(
+                    answered_n1(&resp),
+                    Some(vec![
+                        0x2E,
+                        6,
+                        pti,
+                        gsm_build::message_type::GSM_STATUS,
+                        cause
+                    ]),
+                    "{mt:#04x} PTI {pti}: 5GSM STATUS #{cause}"
+                );
+            }
+            let resp = handle_n1_sm_message(reference, &n1(6, 0xFF, mt, &eap)).await;
+            assert_eq!(resp.status, 204, "{mt:#04x}: the reserved PTI is ignored");
+            assert_eq!(answered_n1(&resp), None);
+        }
+    }
+
+    /// **#1471**, TS 24.501 §6.6.2.3: a REMOTE UE REPORT (0xDA) is answered with a
+    /// REMOTE UE REPORT RESPONSE (0xDB) carrying its PSI and PTI.
+    /// - §6.6.2.5 a): while the network releases the session (T3592 armed), the
+    ///   report is aborted, gets no response, and leaves the release running.
+    /// - §7.3.1 d): a reserved PTI is ignored.
+    #[tokio::test]
+    async fn a_remote_ue_report_is_answered_with_its_response_1471() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let reference = "n1471-remote";
+        seed_binding(reference, 4);
+        // Remote UE context connected IE (0x76, TLV-E), one remote UE.
+        let report = n1(
+            4,
+            0x21,
+            gsm_build::message_type::REMOTE_UE_REPORT,
+            &[0x76, 0x00, 0x03, 0x01, 0x01, 0x00],
+        );
+        let resp = handle_n1_sm_message(reference, &report).await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            answered_n1(&resp),
+            Some(vec![
+                0x2E,
+                4,
+                0x21,
+                gsm_build::message_type::REMOTE_UE_REPORT_RESPONSE
+            ])
+        );
+
+        let resp = handle_n1_sm_message(
+            reference,
+            &n1(4, 0xFF, gsm_build::message_type::REMOTE_UE_REPORT, &[]),
+        )
+        .await;
+        assert_eq!((resp.status, answered_n1(&resp)), (204, None));
+
+        let release_cmd =
+            policy::build_release_command(4, 0, policy::gsm_cause::REGULAR_DEACTIVATION);
+        arm_gsm_timer(
+            reference,
+            timer::SmfTimerId::T3592,
+            &release_cmd,
+            "imsi-001010000000001",
+            4,
+            None,
+        );
+        let resp = handle_n1_sm_message(reference, &report).await;
+        assert_eq!(
+            (resp.status, answered_n1(&resp)),
+            (204, None),
+            "aborted during the network-requested release"
+        );
+        assert!(
+            gsm_timer_armed(reference, timer::SmfTimerId::T3592),
+            "the release proceeds"
+        );
+        cancel_gsm_timer(reference, timer::SmfTimerId::T3592);
+    }
+
     #[tokio::test]
     async fn n1_message_for_an_unknown_context_is_404_and_a_malformed_one_403() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
@@ -26881,6 +27134,152 @@ mod tests {
         amf.stop().await.ok();
     }
 
+    /// nextgsim#471 (demo d443a-edge-budget): with the demo on, the QOS_MON notify
+    /// of a session report also carries the session's PSA UPF's N6 delays in the
+    /// vendor-specific member; with it off, the same report's notify is the #1390
+    /// body. Through `handle_pfcp_session_report`, the real report path.
+    #[cfg(feature = "demo-d443a-edge-budget")]
+    // The event-store lock is held across awaits, as the other event tests do.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_qos_mon_notify_carries_the_psa_upf_s_n6_delays_with_the_demo_on_471() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _q = qos_mon::TEST_LOCK.lock().await;
+        let _n6 = n6_delay::N6_TEST_LOCK.lock().await;
+        let _d = demo_d443a::TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _e = event_exposure::lock_store();
+        event_exposure::clear_for_test();
+        qos_mon::clear_for_test();
+        n6_delay::reset_for_test();
+        let supi = "imsi-001010000004710";
+        let (upf, reference, amf, _posts) = qos_mon_session_1390(supi, 5, true).await;
+        let upf_key = upf.client.recovery_time_stamp_key();
+        // #1523 review o3: the session's own UPF, and no UPF for an unknown
+        // session even though a default client exists to fall back to.
+        // A real establishment records the session's UPF (`record_session_upf`
+        // after the Session Establishment Response); the seeded session does not.
+        assert_eq!(demo_d443a::psa_upf_key(smf_n4_seid_for(&reference)), None);
+        pfcp_path::record_session_upf(smf_n4_seid_for(&reference), &upf.client);
+        assert_eq!(
+            demo_d443a::psa_upf_key(smf_n4_seid_for(&reference)).as_deref(),
+            Some(upf_key.as_str())
+        );
+        assert!(pfcp_path::client_for_session(0x0471_dead_beef).is_some());
+        assert_eq!(demo_d443a::psa_upf_key(0x0471_dead_beef), None);
+        n6_delay::insert_for_test(
+            &upf_key,
+            "10.60.0.11".parse().unwrap(),
+            n6_delay::Measured {
+                average_ms: 18,
+                minimum_ms: Some(17),
+                maximum_ms: Some(19),
+            },
+        );
+        // Another UPF's result: not this session's PSA, so not exposed.
+        n6_delay::insert_for_test(
+            "other-upf-471:8805",
+            "10.60.0.12".parse().unwrap(),
+            n6_delay::Measured {
+                average_ms: 3,
+                minimum_ms: None,
+                maximum_ms: None,
+            },
+        );
+        let notified = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let sink = notified.clone();
+        let (consumer, caddr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let sink = sink.clone();
+                async move {
+                    if let Some(v) = req
+                        .http
+                        .content
+                        .as_deref()
+                        .and_then(|c| serde_json::from_str(c).ok())
+                    {
+                        sink.lock().unwrap().push(v);
+                    }
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await;
+        let sub = qos_mon_subscription_1390(
+            supi,
+            &["QOS_MON"],
+            &format!(
+                "http://127.0.0.1:{}/d443a-edge-budget/qos-mon/t",
+                caddr.port()
+            ),
+        );
+        qos_mon::subscribed(&sub).await;
+        let srr_id = qos_mon::srr_ids(&reference)[0];
+        cancel_gsm_timer(&reference, timer::SmfTimerId::T3591);
+        let body = qos_mon::tests::sesr_body(
+            srr_id,
+            nextgcore_pfcp::qos_monitoring::QosMonitoringMeasurement {
+                downlink_packet_delay: Some(3),
+                uplink_packet_delay: Some(4),
+                round_trip_packet_delay: Some(6),
+                ..Default::default()
+            },
+        );
+        let seid = smf_n4_seid_for(&reference);
+        let mut pkt = vec![0x21, 56];
+        pkt.extend_from_slice(&((body.len() + 12) as u16).to_be_bytes());
+        pkt.extend_from_slice(&seid.to_be_bytes());
+        pkt.extend_from_slice(&[0, 0x47, 0x10, 0]);
+        pkt.extend_from_slice(&body);
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let report = |n: usize| {
+            let notified = notified.clone();
+            async move {
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                while notified.lock().unwrap().len() < n && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        };
+
+        demo_d443a::set_active_for_test(true);
+        handle_pfcp_session_report(&sock, &pkt, upf.client.peer()).await;
+        report(1).await;
+        demo_d443a::set_active_for_test(false);
+        handle_pfcp_session_report(&sock, &pkt, upf.client.peer()).await;
+        report(2).await;
+
+        let got = notified.lock().unwrap().clone();
+        assert_eq!(got.len(), 2, "two QOS_MON notifies: {got:?}");
+        let on = &got[0]["eventNotifs"][0];
+        assert_eq!(on["rtDelays"], serde_json::json!([6]));
+        assert_eq!(
+            on["vendorSpecific-032473"],
+            serde_json::json!({ "n6Delays": [
+                { "endpoint": "10.60.0.11", "avgMs": 18, "minMs": 17, "maxMs": 19 },
+            ]})
+        );
+        // Off: the same report's notify is the #1390 body, with no member.
+        let mut on_without = got[0].clone();
+        on_without["eventNotifs"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("vendorSpecific-032473");
+        on_without["eventNotifs"][0]["timeStamp"] = got[1]["eventNotifs"][0]["timeStamp"].clone();
+        assert_eq!(got[1], on_without);
+        assert!(got[1]["eventNotifs"][0]
+            .get("vendorSpecific-032473")
+            .is_none());
+
+        qos_mon::forget(&reference);
+        qos_mon::quiesce_for_test().await;
+        cancel_gsm_timer_for_test(&reference);
+        forget_seeded_session(&reference);
+        event_exposure::clear_for_test();
+        n6_delay::reset_for_test();
+        consumer.stop().await.ok();
+        amf.stop().await.ok();
+    }
+
     /// A released session forgets its monitoring: its SRRs went with the N4 session,
     /// so a later Setup Request Transfer for the reference must not carry id 181.
     // The event-store lock is held across awaits, as the other event tests do
@@ -28733,5 +29132,58 @@ mod tests_peer_host_kind_1324 {
                 Some((dialled_host(host), 7793))
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod demo_block_tests_471 {
+    //! nextgsim#458 / #471: smfd reads the `demo:` block in every build. These
+    //! only exercise refusals, which fail before anything is installed (the
+    //! installed state is write-once per process).
+
+    fn config_file(body: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("smf-demo-471-{}.yaml", uuid::Uuid::new_v4()));
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[cfg(not(feature = "demo-d443a-edge-budget"))]
+    #[test]
+    fn a_default_build_refuses_the_d443a_block_471() {
+        let p = config_file(
+            "demo:\n  enabled: true\n  d443a-edge-budget:\n    enabled: true\n    mode: measured-budget\n",
+        );
+        let err = super::init_demos(p.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        std::fs::remove_file(&p).ok();
+        assert!(err.contains("UnknownKey"), "{err}");
+        assert!(err.contains("d443a-edge-budget"), "{err}");
+    }
+
+    /// #1523 review NIT: an unreadable config (a directory here; EACCES alike) is
+    /// no demo block, as `load_config` falls back on any read error.
+    #[test]
+    fn an_unreadable_config_is_no_demo_block_471() {
+        let dir = std::env::temp_dir();
+        assert_eq!(
+            super::config_root(dir.to_str().unwrap()).unwrap(),
+            serde_yaml::Value::Null
+        );
+    }
+
+    #[cfg(feature = "demo-d443a-edge-budget")]
+    #[test]
+    fn an_unknown_mode_fails_startup_471() {
+        let p = config_file(
+            "demo:\n  enabled: true\n  d443a-edge-budget:\n    enabled: true\n    mode: bogus\n",
+        );
+        let err = super::init_demos(p.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        std::fs::remove_file(&p).ok();
+        assert!(err.contains("UnknownMode"), "{err}");
+        assert!(err.contains("demo: \"d443a-edge-budget\""), "{err}");
+        assert!(err.contains("mode: \"bogus\""), "{err}");
     }
 }

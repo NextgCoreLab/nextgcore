@@ -96,6 +96,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use nextgcore_sbi::callback_auth::OAuth2CallbackExemption;
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
 use nextgcore_sbi::server::{
     send_bad_request, send_error, send_method_not_allowed, send_not_found, SbiServer,
@@ -113,6 +114,8 @@ mod capabilities;
 mod context;
 mod ecs_registration;
 mod ecs_role; // #107: the ECS role (EDGE-4 provisioning, EDGE-6 registration, discovery)
+#[cfg(feature = "demo-d443a-edge-budget")]
+mod edge_budget; // nextgsim#471: demo d443a-edge-budget (QOS_MON consumer, budget ranking)
 mod eec;
 mod notifier;
 mod relocation;
@@ -261,6 +264,25 @@ fn setup_signal_handlers(shutdown: Arc<AtomicBool>) {
     .expect("value expected");
 }
 
+/// The demos this build can run: `d443a-edge-budget` under its feature, none
+/// otherwise.
+fn demo_registry() -> nextgcore_demo::DemoRegistry {
+    #[cfg(feature = "demo-d443a-edge-budget")]
+    return nextgcore_demo::DemoRegistry::new(&[edge_budget::DEMO_SPEC]);
+    #[cfg(not(feature = "demo-d443a-edge-budget"))]
+    nextgcore_demo::DemoRegistry::default()
+}
+
+/// The config file's root, for the `demo:` block. A missing file is no block.
+fn config_root(config_path: &str) -> Result<serde_yaml::Value> {
+    match std::fs::read_to_string(config_path) {
+        Ok(content) => serde_yaml::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("config file '{config_path}' does not parse: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(serde_yaml::Value::Null),
+        Err(e) => anyhow::bail!("cannot read the config file '{config_path}': {e}"),
+    }
+}
+
 /// Load the OAuth2 verification JWKS from `path` into the process-global store.
 fn load_oauth2_jwks(path: &str) {
     match std::fs::read_to_string(path) {
@@ -345,6 +367,35 @@ async fn main() -> Result<()> {
         );
     }
 
+    // nextgsim#458: the demo: block, checked against the demos this build was
+    // compiled with, so an unknown key or mode, or a demo whose cargo feature is
+    // not built, fails start-up. With no demo active nothing below changes.
+    let config_root = config_root(&args.config)?;
+    nextgcore_demo::init_from_root(&config_root, &demo_registry())
+        .map_err(|e| anyhow::anyhow!("{e} ({e:?})"))?;
+    // nextgsim#471: `ees.edge_budget` is validated whenever the feature is built,
+    // so a typo fails start-up even with the demo off; it is used only with it on.
+    #[cfg(feature = "demo-d443a-edge-budget")]
+    {
+        let budget_config =
+            edge_budget::config_from_root(&config_root).map_err(|e| anyhow::anyhow!("{e}"))?;
+        edge_budget::install(
+            nextgcore_demo::active_mode(edge_budget::DEMO_KEY)
+                .and_then(edge_budget::Mode::parse)
+                .map(|mode| edge_budget::Plan {
+                    mode,
+                    config: budget_config,
+                    token: String::new(),
+                })
+                .map(|mut plan| {
+                    plan.token = edge_budget::mint_token()?;
+                    Ok::<_, String>(plan)
+                })
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        );
+    }
+
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(shutdown.clone());
 
@@ -366,6 +417,10 @@ async fn main() -> Result<()> {
         sbi_server_config = sbi_server_config.with_tls(key, cert);
     }
 
+    // #1525: the callback routes admitted without a bearer, registered with the
+    // shared mechanism (#1519) on the server AND consulted by eesd's per-route
+    // gate (`auth::require_oauth2`), which is the one eesd actually runs.
+    let sbi_server_config = install_callback_exemptions(sbi_server_config);
     let sbi_server = SbiServer::new(sbi_server_config);
 
     log::info!("Starting EES SBI server on {addr}");
@@ -373,6 +428,28 @@ async fn main() -> Result<()> {
         .start(ees_sbi_request_handler)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
+
+    // nextgsim#471: the demo's /metrics and its QOS_MON subscription, only with
+    // the demo on. The subscription's notifUri uses the advertised host.
+    #[cfg(feature = "demo-d443a-edge-budget")]
+    let _metrics = if edge_budget::serving() {
+        match sbi.registration_host() {
+            Ok(host) => edge_budget::spawn_subscriber(args.tls, host, sbi_port),
+            Err(why) => nextgcore_demo::demo_log!(
+                error,
+                edge_budget::DEMO_KEY,
+                "{why} (no QOS_MON subscription: the SMF needs a notifUri it can reach)"
+            ),
+        }
+        nextgcore_metrics::nf::serve_nf_metrics(
+            "EES",
+            "EES_METRICS_PORT",
+            Arc::new(edge_budget::render_metrics),
+        )
+        .await
+    } else {
+        None
+    };
 
     // eesd-01: self-register toward the ECS (EDGE-6), not the NRF.
     // #107: resolve the ECS-role switch before anything can be served, so no
@@ -404,6 +481,11 @@ async fn main() -> Result<()> {
     }
 
     log::info!("Shutting down...");
+    // nextgsim#471 (#1523 review M1): give the SMF its QOS_MON subscription back.
+    #[cfg(feature = "demo-d443a-edge-budget")]
+    if edge_budget::serving() {
+        edge_budget::release_subscription(Duration::from_secs(2)).await;
+    }
     sbi_server
         .stop()
         .await
@@ -413,6 +495,54 @@ async fn main() -> Result<()> {
     log::info!("EES shutdown complete");
 
     Ok(())
+}
+
+/// The request URI as the debug log shows it: the demo's QOS_MON callback token
+/// (nextgsim#471) redacted, every other URI as it was.
+fn request_log_uri(uri: &str) -> std::borrow::Cow<'_, str> {
+    if uri.starts_with("/d443a-edge-budget/") {
+        std::borrow::Cow::Owned(nextgcore_sbi::log_redact::redact_last_segment(uri))
+    } else {
+        std::borrow::Cow::Borrowed(uri)
+    }
+}
+
+/// The callback routes this EES serves that a notification reaches without a
+/// bearer (TS 33.501 §13.4.1: OAuth 2.0 does not apply to the notification
+/// operation; TS 29.500 §6.10.7 NOTE), each authenticated by its own callback
+/// token instead (#1525, over #1519's shared `OAuth2CallbackExemption`).
+///
+/// Only demo d443a-edge-budget's QOS_MON notify route today, and only while the
+/// demo serves it (feature built AND demo on): with the demo off the route does
+/// not exist and the list is empty, so every route needs a bearer. Its check is
+/// `edge_budget::token_is_current`, so a wrong, stale or missing path token is
+/// still held to the bearer.
+fn oauth2_callback_exemptions() -> Vec<OAuth2CallbackExemption> {
+    #[cfg(feature = "demo-d443a-edge-budget")]
+    if edge_budget::serving() {
+        return vec![OAuth2CallbackExemption::new(
+            "POST",
+            format!(
+                "/{}/{}/{{token}}",
+                edge_budget::ROUTE_ROOT,
+                edge_budget::ROUTE_QOS_MON
+            ),
+            |cb| edge_budget::token_is_current(cb.token),
+        )];
+    }
+    Vec::new()
+}
+
+/// Register [`oauth2_callback_exemptions`] where they take effect: on the
+/// server config (the shared gate, #1519) and in eesd's per-route gate (#1525).
+/// After `edge_budget::install`, so the demo's route is listed only when served.
+fn install_callback_exemptions(cfg: NextgcoreSbiServerConfig) -> NextgcoreSbiServerConfig {
+    let exemptions = oauth2_callback_exemptions();
+    for route in exemptions.iter().map(OAuth2CallbackExemption::route) {
+        log::info!("OAuth2 callback exemption (TS 33.501 §13.4.1): {route}");
+    }
+    auth::set_callback_exemptions(exemptions.clone());
+    cfg.with_oauth2_callback_exemptions(exemptions)
 }
 
 /// EES SBI request handler.
@@ -425,7 +555,7 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
 
-    log::debug!("EES SBI: {method} {uri}");
+    log::debug!("EES SBI: {method} {}", request_log_uri(uri));
 
     let path = uri.split('?').next().unwrap_or(uri);
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
@@ -818,6 +948,19 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // Checked LAST and only after every eees-* arm, so an ECS route can never
         // shadow an EES one; `route` returns None with the role off, which leaves
         // the 404 below in charge exactly as before.
+        // nextgsim#471: the demo's QOS_MON notification route, only with the demo
+        // on. Through the per-operation OAuth2 gate like every route here, which
+        // admits a token-less notify (TS 33.501 §13.4.1) only through the
+        // route's registered callback exemption, i.e. on the current path token
+        // (#1525); the path token is checked again below in any case.
+        #[cfg(feature = "demo-d443a-edge-budget")]
+        [edge_budget::ROUTE_ROOT, edge_budget::ROUTE_QOS_MON, token] if edge_budget::serving() => {
+            if let Some(resp) = auth::require_oauth2(&request, edge_budget::SCOPE) {
+                return resp;
+            }
+            edge_budget::on_notify(token, &request)
+                .unwrap_or_else(|| send_not_found(&format!("Resource not found: {path}"), None))
+        }
         _ => match ecs_role::route(parts.as_slice(), &request) {
             Some(resp) => resp,
             None => send_not_found(&format!("Resource not found: {path}"), None),
@@ -1097,7 +1240,7 @@ async fn handle_eas_discover(request: &SbiRequest) -> SbiResponse {
         .map(|c| {
             c.eas_discover_filter(req.eas_discovery_filter.as_ref())
                 .into_iter()
-                .map(|eas| types::DiscoveredEas { eas })
+                .map(types::DiscoveredEas::of)
                 .collect()
         })
         .unwrap_or_default();
@@ -1351,11 +1494,29 @@ fn apply_ac_profile_matching(
     // EAS", and answering with a selection anyway would override the EEC's choice
     // to do its own discovery.
     if reg.eas_sel_req_ind == Some(true) && !outcome.selected.is_empty() {
+        // nextgsim#471: with the demo on, the selection is its local policy
+        // (budget ranking and deadline); a 404 when no EAS is within it.
+        #[cfg(feature = "demo-d443a-edge-budget")]
+        if let Some(choice) = edge_budget::select(reg, outcome.selected.clone()) {
+            let sel = choice.map_err(|detail| {
+                Box::new(send_not_found(&detail, Some(cause::RESOURCE_NOT_FOUND)))
+            })?;
+            if !sel.unfulfilled.is_empty() {
+                let mut list: Vec<eec::UnfulfilledAcProfile> =
+                    reg.unfulfilled().into_iter().cloned().collect();
+                list.extend(sel.unfulfilled.iter().map(|ac| {
+                    eec::UnfulfilledAcProfile::new(ac, eec::unfulfill_reason::REQ_UNFULFILLED)
+                }));
+                reg.set_unfulfilled(list);
+            }
+            reg.discovered_eas = Some(sel.discovered);
+            return Ok(());
+        }
         reg.discovered_eas = Some(
             outcome
                 .selected
                 .into_iter()
-                .map(|eas| types::DiscoveredEas { eas })
+                .map(types::DiscoveredEas::of)
                 .collect(),
         );
     }
@@ -2496,7 +2657,7 @@ fn emit_acrevents_target_info(req: &AcrDetermReq, state: &AcrState) {
             .ok()
             .and_then(|c| c.eas_discover(Some(tid), None).into_iter().next());
         profile.map(|eas| TargetInfo {
-            trget_eas_info: Some(types::DiscoveredEas { eas }),
+            trget_eas_info: Some(types::DiscoveredEas::of(eas)),
             trget_ees_info: None,
         })
     });
@@ -2937,6 +3098,10 @@ async fn handle_acr_param_send(request: &SbiRequest) -> SbiResponse {
     }
     SbiResponse::with_status(204)
 }
+
+#[cfg(test)]
+#[path = "edge_budget_router_tests.rs"]
+mod edge_budget_router_tests;
 
 #[cfg(test)]
 mod tests {

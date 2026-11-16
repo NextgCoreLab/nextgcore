@@ -937,6 +937,15 @@ pub async fn on_session_report(smf_seid: u64, payload: &[u8]) {
             );
             continue;
         };
+        // nextgsim#471: the demo adds the PSA UPF's N6 delays (a vendor-specific
+        // member); with the demo off the body is what it was.
+        #[cfg(feature = "demo-d443a-edge-budget")]
+        let body = {
+            let mut body = body;
+            let upf_key = crate::demo_d443a::psa_upf_key(smf_seid);
+            crate::demo_d443a::extend(&mut body, upf_key.as_deref(), &r);
+            body
+        };
         event_exposure::deliver(&sub, &body, event_exposure::event::QOS_MON, &b.supi, b.psi).await;
     }
 }

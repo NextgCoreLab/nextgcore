@@ -106,6 +106,13 @@ data:
         client:
           nrf:
             - uri: http://nrf.nextg-system.svc.cluster.local:7777
+      # Whether the subscribed Session-AMBR the SMF reports (subsSessAmbr) caps
+      # the Session-AMBR the PCF authorises, on the SM policy create, the
+      # UpdateNotify and the SE_AMBR_CH update alike (#1402). subscribed (the
+      # default): per direction min(policy, subscribed). none: the policy value.
+      # Any other value fails start-up.
+      # policy:
+      #   session_ambr_cap: subscribed
 
   nssf.yaml: |
     logger:

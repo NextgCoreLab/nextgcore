@@ -172,6 +172,7 @@ Cargo features: `kernel-sctp` (enables `--sctp-backend kernel`; the Docker build
     - the connection is refused, or there is no answer within 300 ms;
     - the answer is not 200 (204: no data);
     - the body names no NR cell;
+    - the body is statistics, not a prediction: no `locInfos` entry carries a `confidence`, which TS 29.520 Table 5.1.6.2.11-1 requires of a prediction (#1508). The NWDAF answers statistics when its clock reads the requested period as already past, that is when the AMF's clock runs 30 s or more behind the NWDAF's. Keep the two within a few seconds (NTP); a skewed pair counts every page as `no_prediction`;
     - neither the predicted cell nor the last known one is owned by a connected gNB in the area;
     - the answer arrives after the first PAGING. A late answer is not used for that page.
   - **RAN sharing.** A cell whose NCGI carries a broadcast PLMN other than the Global gNB ID's PLMN matches no gNB, so it falls back as above.

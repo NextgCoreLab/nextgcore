@@ -299,6 +299,13 @@ pcf:
   metrics:
     enabled: true
     port: 9090
+  # Rendered as pcf.policy.session_ambr_cap in pcf.yaml (#1402): whether the
+  # subscribed Session-AMBR the SMF reports caps the authorised Session-AMBR on
+  # the SM policy create, the UpdateNotify and the SE_AMBR_CH update alike.
+  # subscribed: per direction min(policy, subscribed). none: the policy value.
+  # Any other value fails the render (and pcfd start-up).
+  policy:
+    sessionAmbrCap: subscribed
 
 # NSSF - Network Slice Selection Function
 nssf:
