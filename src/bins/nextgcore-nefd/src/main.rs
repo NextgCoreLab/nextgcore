@@ -1828,7 +1828,10 @@ async fn southbound_unsubscribe(producer_uri: Option<String>, southbound: Southb
 /// `mismatched_type`: the report names an event of a different MonitoringType than
 /// the subscription it arrived on. `unrecognised_type`: the report names no event
 /// type this NEF maps onto a TS 29.122 MonitoringType, or none at all (both
-/// `AmfEventReport.type` and `MonitoringReport.eventType` are mandatory). nefd
+/// `AmfEventReport.type` and `MonitoringReport.eventType` are mandatory).
+/// `not_reachable`: an AMF reachability report whose state is not REACHABLE
+/// (UNREACHABLE, REGULATORY_ONLY or absent), which is no UE_REACHABILITY event
+/// (issue #1443). nefd
 /// serves `/metrics` only in a `demo-d445a-fl-t8` build with that demo on
 /// (nextgsim#480); otherwise this is read in-process (tests). Every drop is also
 /// logged.
@@ -1860,8 +1863,10 @@ fn report_monitoring_type(
     match reported {
         "LOCATION_REPORT" | "LOCATION_REPORTING" => Some(("LOCATION_REPORTING", None)),
         "REACHABILITY_REPORT" => {
-            // AMF `reachability`: REACHABLE / UNREACHABLE / REGULATION_ONLY. Only
-            // REACHABLE means reachable for data.
+            // AMF `reachability` (TS 29.518 UeReachability): REACHABLE,
+            // UNREACHABLE or REGULATORY_ONLY. Only REACHABLE is reachable for
+            // downlink data; the other two come back with no reachability type
+            // and are not forwarded (#1443).
             let data = report.get("reachability").and_then(|v| v.as_str()) == Some("REACHABLE");
             Some(("UE_REACHABILITY", data.then_some("DATA")))
         }
@@ -1977,6 +1982,25 @@ fn build_monitoring_notification(
                  ({monitoring_type}) not forwarded",
                 sub.id,
                 sub.monitoring_type
+            );
+            continue;
+        }
+        // TS 29.122 UE_REACHABILITY is "notified when the UE becomes reachable"
+        // (§5.3.2.4.3) and its report "shall" carry reachabilityType
+        // (§5.3.2.3.2). An AMF report of UNREACHABLE or REGULATORY_ONLY (reachable
+        // only for regulatory prioritised service, TS 29.518 §6.2.6.3.7) is
+        // neither, so it is dropped: forwarding it used to tell the AF the UE was
+        // reachable, with no reachabilityType (#1443).
+        if monitoring_type == "UE_REACHABILITY" && reachability_type.is_none() {
+            DROPPED_PRODUCER_REPORTS.inc(&["not_reachable"]);
+            log::info!(
+                "subscription {}: producer report of type {reported} (reachability {}) \
+                 is not a UE becoming reachable; not forwarded",
+                sub.id,
+                report
+                    .get("reachability")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<none>")
             );
             continue;
         }
@@ -3535,6 +3559,157 @@ mod tests {
         assert_eq!(build_monitoring_notification(&sub, &loc), None);
     }
 
+    /// **Issue #1443**: an AMF REACHABILITY_REPORT is forwarded as T8
+    /// UE_REACHABILITY only when the UE is REACHABLE, with reachabilityType DATA.
+    /// UNREACHABLE, REGULATORY_ONLY and a report with no state are dropped and
+    /// counted, never sent to the AF without a reachabilityType.
+    #[test]
+    fn only_a_reachable_amf_report_is_ue_reachability() {
+        let sub = NefMonitoringSubscription::new(
+            "af1443",
+            "UE_REACHABILITY",
+            "http://af.example.com/cb",
+            "{}",
+        );
+        let amf = |reachability: Option<&str>| {
+            let mut report = serde_json::json!({"type": "REACHABILITY_REPORT",
+                "state": {"active": true}, "supi": "imsi-001010000001443"});
+            if let Some(r) = reachability {
+                report["reachability"] = serde_json::json!(r);
+            }
+            serde_json::json!({"notifyCorrelationId": "c1443", "reportList": [report]})
+        };
+        for state in [Some("UNREACHABLE"), Some("REGULATORY_ONLY"), None] {
+            let before = DROPPED_PRODUCER_REPORTS.get(&["not_reachable"]);
+            assert_eq!(
+                build_monitoring_notification(&sub, &amf(state)),
+                None,
+                "{state:?} is not the UE becoming reachable"
+            );
+            // Process-global counter shared with other tests: at-least delta.
+            assert!(
+                DROPPED_PRODUCER_REPORTS.get(&["not_reachable"]) > before,
+                "{state:?} is counted"
+            );
+        }
+        let notification = build_monitoring_notification(&sub, &amf(Some("REACHABLE")))
+            .expect("a REACHABLE report is forwarded");
+        let reports = notification["monitoringEventReports"].as_array().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0]["monitoringType"], "UE_REACHABILITY");
+        assert_eq!(reports[0]["reachabilityType"], "DATA");
+
+        // In one body, only the reachable report survives.
+        let mixed = serde_json::json!({"reportList": [
+            {"type": "REACHABILITY_REPORT", "state": {"active": true}, "reachability": "UNREACHABLE"},
+            {"type": "REACHABILITY_REPORT", "state": {"active": true}, "reachability": "REACHABLE"},
+            {"type": "REACHABILITY_REPORT", "state": {"active": true}, "reachability": "REGULATORY_ONLY"},
+        ]});
+        let notification =
+            build_monitoring_notification(&sub, &mixed).expect("the reachable one is forwarded");
+        let reports = notification["monitoringEventReports"].as_array().unwrap();
+        assert_eq!(reports.len(), 1, "{notification}");
+        assert_eq!(reports[0]["reachabilityType"], "DATA");
+    }
+
+    /// **Issue #1443, over the wire**: the AMF's UNREACHABLE and REGULATORY_ONLY
+    /// reachability notifications are answered 204 and forward nothing; the
+    /// REACHABLE one that follows is the AF stub's first and only delivery, as
+    /// UE_REACHABILITY with reachabilityType DATA. A dropped body never spawns a
+    /// forward, so no fixed sleep is needed to show the drops sent nothing.
+    #[test]
+    fn amf_unreachable_notifications_never_reach_the_af() {
+        let _guard = lock_globals();
+        reset_context();
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                nextgcore_sbi::security::set_sbi_profile_override(
+                    nextgcore_sbi::security::SbiProfile::Dev,
+                );
+                let seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
+                let sink = Arc::clone(&seen);
+                let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+                let af = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+                af.start(move |req: SbiRequest| {
+                    let sink = Arc::clone(&sink);
+                    async move {
+                        if let Some(v) = req
+                            .http
+                            .content
+                            .as_deref()
+                            .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+                        {
+                            sink.lock().expect("sink").push(v);
+                        }
+                        SbiResponse::with_status(204)
+                    }
+                })
+                .await
+                .expect("AF stub starts");
+                for _ in 0..200 {
+                    if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+
+                let mut sub = NefMonitoringSubscription::new(
+                    "af-1443",
+                    "UE_REACHABILITY",
+                    format!("http://127.0.0.1:{}/t8/cb", addr.port()),
+                    "{}",
+                )
+                .with_af_target(Some(AfTarget::Msisdn("491700001443".to_string())));
+                sub.id = "sub-1443".to_string();
+                nef_self()
+                    .read()
+                    .expect("ctx")
+                    .subscription_insert(sub)
+                    .expect("insert");
+
+                let post = |reachability: &str| {
+                    SbiRequest::post("/nnef-eventexposure/v1/notify/sub-1443")
+                        .with_json_body(&serde_json::json!({
+                            "notifyCorrelationId": "sub-1443",
+                            "reportList": [{
+                                "type": "REACHABILITY_REPORT",
+                                "state": {"active": true},
+                                "timeStamp": "2026-11-16T00:00:00Z",
+                                "supi": "imsi-001010000001443",
+                                "reachability": reachability,
+                            }]
+                        }))
+                        .expect("serialize")
+                };
+                for state in ["UNREACHABLE", "REGULATORY_ONLY"] {
+                    let response = handle_producer_notification("sub-1443", &post(state)).await;
+                    assert_eq!(response.status, 204, "{state}");
+                }
+                let response = handle_producer_notification("sub-1443", &post("REACHABLE")).await;
+                assert_eq!(response.status, 204);
+
+                let mut delivered = Vec::new();
+                for _ in 0..500 {
+                    delivered = seen.lock().expect("sink").clone();
+                    if !delivered.is_empty() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert_eq!(delivered.len(), 1, "exactly one delivery: {delivered:?}");
+                let reports = delivered[0]["monitoringEventReports"].as_array().unwrap();
+                assert_eq!(reports.len(), 1);
+                assert_eq!(reports[0]["monitoringType"], "UE_REACHABILITY");
+                assert_eq!(reports[0]["reachabilityType"], "DATA");
+                assert_eq!(reports[0]["msisdn"], "491700001443");
+                drop(af);
+            });
+    }
+
     /// **nextgsim#480**: a T8 request naming the UE by `externalId` (what UE ID
     /// retrieval hands the AF) is resolved through the UDM's
     /// id-translation-result keyed by the `extid-` GPSI, and the southbound
@@ -3898,7 +4073,8 @@ mod tests {
             serde_json::json!({"reportList": [{"type": "REACHABILITY_REPORT",
                 "supi": "imsi-001010000000001", "reachability": "REACHABLE"}]}),
             serde_json::json!({"reportList": [{"type": "REACHABILITY_REPORT",
-                "supi": "imsi-001010000000001", "location": {"nrLocation": {}}}]}),
+                "supi": "imsi-001010000000001", "reachability": "REACHABLE",
+                "location": {"nrLocation": {}}}]}),
             serde_json::json!({"reportList": [{"eventType": "UE_REACHABILITY_FOR_DATA",
                 "report": {"supi": "imsi-001010000000001"}}]}),
         ];
