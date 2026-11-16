@@ -173,36 +173,20 @@ pub async fn bsf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String>
     Ok(())
 }
 
-/// Close SBI server and deregister from NRF
+/// Close the SBI context.
 /// Port of bsf_sbi_close
-pub fn bsf_sbi_close() {
+///
+/// #1482: this no longer sends NFDeregister. It sent a DELETE from a spawned
+/// task that the process could exit before running, and it duplicated the
+/// awaited, bounded `nextgcore_sbi::heartbeat::deregister_self()` that
+/// `lib.rs` already calls before it stops the listener. What is left is awaited.
+pub async fn bsf_sbi_close() {
     if !SBI_SERVER_RUNNING.load(Ordering::SeqCst) {
         return;
     }
 
     log::info!("Closing BSF SBI server");
-
-    // Attempt async deregistration (only if tokio runtime is available)
-    let sbi_ctx = global_context();
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(async move {
-            if let (Some(nrf_uri), Some(self_instance)) = (
-                sbi_ctx.get_nrf_uri().await,
-                sbi_ctx.get_self_instance().await,
-            ) {
-                if let Ok((host, port)) = parse_uri_host_port(&nrf_uri) {
-                    let client = sbi_ctx.get_client(&host, port).await;
-                    let path = format!("/nnrf-nfm/v1/nf-instances/{}", self_instance.id);
-                    if let Err(e) = client.delete(&path).await {
-                        log::warn!("Failed to deregister BSF from NRF: {e}");
-                    } else {
-                        log::info!("BSF deregistered from NRF");
-                    }
-                }
-            }
-            sbi_ctx.clear_clients().await;
-        });
-    }
+    global_context().clear_clients().await;
 
     SBI_SERVER_RUNNING.store(false, Ordering::SeqCst);
 
@@ -261,7 +245,7 @@ mod tests {
         let result = bsf_sbi_open(None).await;
         assert!(result.is_err());
 
-        bsf_sbi_close();
+        bsf_sbi_close().await;
         assert!(!bsf_sbi_is_running());
     }
 

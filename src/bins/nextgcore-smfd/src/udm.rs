@@ -23,8 +23,10 @@
 //!
 //! # The subscription is a baseline, and the PCF still outranks it
 //!
-//! TS 23.503 §6.1.3.2: the PCF authorises the session-AMBR and default QoS, using
-//! the subscribed values as input. So the precedence here is
+//! TS 29.512 §4.2.2.5 / §4.2.2.6: the SMF provides the subscribed Session-AMBR and
+//! default QoS, and the PCF authorises them "based on the operator's policy"; TS
+//! 23.501 §5.7.2.7: the SMF changes the subscribed Session-AMBR "based on
+//! interaction with the PCF". So the precedence here is
 //! `PCF` then `subscription` then `config default`, and the subscription is
 //! consulted only to build the input the PCF's decision replaces — or, with no PCF
 //! configured, to be the answer.

@@ -21,27 +21,20 @@
 //!   test fails; with a 30 s discovery bound, the hung-NRF test fails; with a 204
 //!   renewal read as "unlimited", the 204 test fails; without the stop check between
 //!   discovery and POST, the SIGTERM-during-discovery test fails.
-//! - #1497: with `spawn_pcfd_with` taking no new port when pcfd loses its SBI bind,
-//!   the taken-port test fails ("pcfd exited at startup"); with no wait for the
-//!   listener at all (the spawn as it was), it fails after 30 s with "the
-//!   subscription within 30s", the failure #1497 reported.
+//! - #1497: with no wait for the listener at all (the spawn as it was), a lost
+//!   bind failed after 30 s with "the subscription within 30s". The spawn is now
+//!   the shared `nextgcore_sbi::test_support::NfSpawn` (#1521), whose lost-bind
+//!   tests, moved from here, are in `tests/nf_spawn.rs`.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::test_support::{NfProcess, NfSpawn};
 use nextgcore_sbi::SbiServer;
-
-struct Killed(Child);
-impl Drop for Killed {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
 
 /// Serve `handler` on a loopback listener. The handler answers a response and how
 /// long to hold it before sending (zero for most).
@@ -289,137 +282,40 @@ fn udr_profile(port: u16) -> serde_json::Value {
     })
 }
 
-/// A per-test scratch directory, removed on drop. It holds the config and pcfd's
-/// stderr, which is printed when the test fails, so a pcfd that exited or never got
-/// as far as subscribing leaves its reason in the test output (#1497).
-struct Scratch(std::path::PathBuf);
-impl Scratch {
-    fn log(&self) -> std::path::PathBuf {
-        self.0.join("pcfd.log")
-    }
-}
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            eprintln!(
-                "--- pcfd stderr ---\n{}",
-                std::fs::read_to_string(self.log()).unwrap_or_default()
-            );
-        }
-        let _ = std::fs::remove_file(self.0.join("pcf.yaml"));
-        let _ = std::fs::remove_file(self.log());
-        let _ = std::fs::remove_dir(&self.0);
-    }
-}
-
 /// What pcfd logs once its SBI listener is bound (`app::run`).
 const SBI_LISTENING: &str = "SBI HTTP/2 server listening on";
 
-/// The most SBI ports one spawn tries before giving up.
-const SPAWN_ATTEMPTS: usize = 5;
-
 /// Spawn pcfd and return once its SBI listener is bound.
-async fn spawn_pcfd(name: &str, nrf: &Nrf, audit_secs: Option<u64>) -> (Killed, Scratch) {
-    spawn_pcfd_with(name, nrf, audit_secs, Spawn::default()).await
-}
-
-/// How [`spawn_pcfd_with`] starts pcfd; the defaults are what every test but the
-/// harness's own wants.
-struct Spawn {
-    /// The SBI port tried first (then fresh ones after a lost bind).
-    first_port: u16,
-    /// `pcf.sbi.server[0].address`.
-    address: &'static str,
-    /// A pause between seeing whether pcfd exited and reading its log, to widen
-    /// the window #1520's review found (the harness's own tests only).
-    pause_after_exit_check: Duration,
-}
-
-impl Default for Spawn {
-    fn default() -> Self {
-        Spawn {
-            first_port: nextgcore_sbi::test_support::free_port(),
-            address: "127.0.0.1",
-            pause_after_exit_check: Duration::ZERO,
-        }
-    }
-}
-
-/// [`spawn_pcfd`], started as `how` says.
 ///
-/// #1497: `free_port()` probes a port and releases it, and only this process's own
-/// `free_port()` and `bound_listener()` calls are kept off it. Anything else can take
-/// it before pcfd binds: a sibling test's pcfd connecting out to its stub NRF or UDR
-/// is handed an ephemeral source port from the same range. pcfd then fails to bind,
-/// exits, and the test waited 30 s for a subscription from a process that was gone.
-/// So wait for the listener: on a lost bind, spawn again on another port; on any
-/// other exit, fail now with pcfd's stderr.
-///
-/// #1520 review: whether pcfd exited is asked BEFORE its log is read, and an exit
-/// is classified from that later read. Read first, a pcfd that printed the bind
-/// error and exited in between was classified from a log without the error line,
-/// so a lost bind failed the test instead of being retried. Once the process has
-/// exited, its stderr is complete.
-async fn spawn_pcfd_with(
-    name: &str,
-    nrf: &Nrf,
-    audit_secs: Option<u64>,
-    how: Spawn,
-) -> (Killed, Scratch) {
-    let dir =
-        Scratch(std::env::temp_dir().join(format!("pcfd-1458-{name}-{}", std::process::id())));
-    std::fs::create_dir_all(&dir.0).unwrap();
-    let config = dir.0.join("pcf.yaml");
-    let mut sbi_port = how.first_port;
-    for _ in 0..SPAWN_ATTEMPTS {
-        std::fs::write(
-            &config,
-            format!(
-                "pcf:\n  sbi:\n    server:\n      - address: {}\n        port: {sbi_port}\n    \
-                 client:\n      nrf:\n        - uri: http://127.0.0.1:{}\n",
-                how.address, nrf.port
-            ),
-        )
-        .unwrap();
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_nextgcore-pcfd"));
-        cmd.arg("-c")
-            .arg(&config)
-            .env("NEXTGCORE_SBI_PROFILE", "dev")
-            .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
-            .env(
-                "PCF_METRICS_PORT",
-                nextgcore_sbi::test_support::free_port().to_string(),
+/// #1497 / #1521: the shared `NfSpawn` waits for the listener, respawns on fresh
+/// ports when pcfd loses a bind (a sibling process's outbound connection can
+/// take a probed port before pcfd binds it), and fails at once with pcfd's
+/// stderr on any other exit. Its own tests are in `tests/nf_spawn.rs`.
+async fn spawn_pcfd(name: &str, nrf: &Nrf, audit_secs: Option<u64>) -> NfProcess {
+    let nrf_port = nrf.port;
+    NfSpawn::new(env!("CARGO_BIN_EXE_nextgcore-pcfd"), &format!("pcfd-1458-{name}"))
+        .ready_when_logged(SBI_LISTENING)
+        .spawn_async(|cmd, sbi_port, dir| {
+            let config = dir.join("pcf.yaml");
+            std::fs::write(
+                &config,
+                format!(
+                    "pcf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n        port: {sbi_port}\n    \
+                     client:\n      nrf:\n        - uri: http://127.0.0.1:{nrf_port}\n"
+                ),
             )
-            // The readiness line is logged at info; a CI-wide RUST_LOG must not hide it.
-            .env("RUST_LOG", "info")
-            .stdout(Stdio::null())
-            .stderr(std::fs::File::create(dir.log()).unwrap());
-        if let Some(secs) = audit_secs {
-            cmd.env("PCF_POLICY_DATA_AUDIT_SECS", secs.to_string());
-        }
-        let mut child = Killed(cmd.spawn().expect("spawn pcfd"));
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let exited = child.0.try_wait().unwrap();
-            if !how.pause_after_exit_check.is_zero() {
-                tokio::time::sleep(how.pause_after_exit_check).await;
+            .unwrap();
+            cmd.arg("-c")
+                .arg(&config)
+                .env("NEXTGCORE_SBI_PROFILE", "dev")
+                .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
+                // An ephemeral metrics port: /metrics is not under test here.
+                .env("PCF_METRICS_PORT", "0");
+            if let Some(secs) = audit_secs {
+                cmd.env("PCF_POLICY_DATA_AUDIT_SECS", secs.to_string());
             }
-            let log = std::fs::read_to_string(dir.log()).unwrap_or_default();
-            match exited {
-                None if log.contains(SBI_LISTENING) => return (child, dir),
-                None => {}
-                Some(_) if log.contains("Failed to start SBI server") && log.contains("in use") => {
-                    // Lost the port: drop the dead child and try another.
-                    sbi_port = nextgcore_sbi::test_support::free_port();
-                    break;
-                }
-                Some(status) => panic!("pcfd exited at startup ({status})"),
-            }
-            assert!(Instant::now() < deadline, "pcfd listens within 30 s");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-    panic!("pcfd lost its SBI port {SPAWN_ATTEMPTS} times running");
+        })
+        .await
 }
 
 /// Wait on a condition, not a timer.
@@ -459,7 +355,7 @@ async fn exits_within(child: &mut Child, within: Duration) -> std::process::Exit
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_udr_that_registers_after_the_pcf_looked_is_subscribed_to() {
     let nrf = Nrf::start().await;
-    let (_pcfd, _dir) = spawn_pcfd("late", &nrf, None).await;
+    let _pcfd = spawn_pcfd("late", &nrf, None).await;
     eventually(
         Duration::from_secs(30),
         "the PCF looks for a UDR before any is registered",
@@ -485,7 +381,7 @@ async fn a_udr_that_lost_the_subscription_gets_it_again() {
     let nrf = Nrf::start().await;
     let udr = Udr::start(None).await;
     nrf.register_only(udr.port);
-    let (_pcfd, _dir) = spawn_pcfd("lost", &nrf, Some(1)).await;
+    let _pcfd = spawn_pcfd("lost", &nrf, Some(1)).await;
     eventually(Duration::from_secs(30), "the first subscription", || {
         udr.with(|s| s.posts) == 1
     })
@@ -517,7 +413,7 @@ async fn a_replacement_udr_gets_the_subscription() {
     let nrf = Nrf::start().await;
     let first = Udr::start(None).await;
     nrf.register_only(first.port);
-    let (_pcfd, _dir) = spawn_pcfd("replaced", &nrf, Some(1)).await;
+    let _pcfd = spawn_pcfd("replaced", &nrf, Some(1)).await;
     eventually(
         Duration::from_secs(30),
         "the first UDR's subscription",
@@ -558,7 +454,7 @@ async fn a_confirmed_expiry_is_renewed_before_it_lapses() {
     let nrf = Nrf::start().await;
     let udr = Udr::start(Some(4)).await;
     nrf.register_only(udr.port);
-    let (_pcfd, _dir) = spawn_pcfd("expiry", &nrf, None).await;
+    let _pcfd = spawn_pcfd("expiry", &nrf, None).await;
     eventually(Duration::from_secs(30), "the subscription", || {
         udr.with(|s| s.posts) == 1
     })
@@ -592,13 +488,13 @@ async fn a_sigterm_deletes_the_subscription() {
     let nrf = Nrf::start().await;
     let udr = Udr::start(None).await;
     nrf.register_only(udr.port);
-    let (mut pcfd, _dir) = spawn_pcfd("delete", &nrf, None).await;
+    let mut pcfd = spawn_pcfd("delete", &nrf, None).await;
     eventually(Duration::from_secs(30), "the subscription", || {
         udr.with(|s| s.posts) == 1
     })
     .await;
-    sigterm(&pcfd.0);
-    let status = exits_within(&mut pcfd.0, Duration::from_secs(10)).await;
+    sigterm(pcfd.child());
+    let status = exits_within(pcfd.child(), Duration::from_secs(10)).await;
     assert!(status.success(), "{status:?}");
     assert_eq!(
         udr.with(|s| s.deletes),
@@ -614,14 +510,14 @@ async fn a_sigterm_deletes_the_subscription() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sigterm_while_no_udr_is_registered_exits_promptly() {
     let nrf = Nrf::start().await;
-    let (mut pcfd, _dir) = spawn_pcfd("nosub", &nrf, None).await;
+    let mut pcfd = spawn_pcfd("nosub", &nrf, None).await;
     // Several misses, so the backoff has grown past the stop poll.
     eventually(Duration::from_secs(30), "repeated UDR discoveries", || {
         nrf.udr_discoveries() >= 3
     })
     .await;
-    sigterm(&pcfd.0);
-    let status = exits_within(&mut pcfd.0, Duration::from_secs(3)).await;
+    sigterm(pcfd.child());
+    let status = exits_within(pcfd.child(), Duration::from_secs(3)).await;
     assert!(status.success(), "{status:?}");
 }
 
@@ -634,7 +530,7 @@ async fn a_reordered_discovery_result_keeps_the_subscription() {
     let a = Udr::start(None).await;
     let b = Udr::start(None).await;
     nrf.register_rotating(&[a.port, b.port]);
-    let (_pcfd, _dir) = spawn_pcfd("rotating", &nrf, Some(1)).await;
+    let _pcfd = spawn_pcfd("rotating", &nrf, Some(1)).await;
     let posts = || a.with(|s| s.posts) + b.with(|s| s.posts);
     eventually(Duration::from_secs(30), "the subscription", || posts() == 1).await;
     let seen = nrf.udr_discoveries();
@@ -656,7 +552,7 @@ async fn a_204_renewal_keeps_the_confirmed_lifetime() {
     let udr = Udr::start(Some(4)).await;
     udr.with(|s| s.put_204 = true);
     nrf.register_only(udr.port);
-    let (_pcfd, _dir) = spawn_pcfd("put204", &nrf, None).await;
+    let _pcfd = spawn_pcfd("put204", &nrf, None).await;
     eventually(Duration::from_secs(30), "the subscription", || {
         udr.with(|s| s.posts) == 1
     })
@@ -684,7 +580,7 @@ async fn a_hung_nrf_does_not_delay_a_due_renewal() {
     let nrf = Nrf::start().await;
     let udr = Udr::start(Some(8)).await;
     nrf.register_only(udr.port);
-    let (_pcfd, _dir) = spawn_pcfd("hungnrf", &nrf, Some(1)).await;
+    let _pcfd = spawn_pcfd("hungnrf", &nrf, Some(1)).await;
     eventually(Duration::from_secs(30), "the subscription", || {
         udr.with(|s| s.posts) == 1
     })
@@ -708,13 +604,13 @@ async fn a_sigterm_during_discovery_creates_no_subscription() {
     let udr = Udr::start(None).await;
     nrf.register_only(udr.port);
     nrf.hold_discovery(Duration::from_secs(2));
-    let (mut pcfd, _dir) = spawn_pcfd("stopdisc", &nrf, None).await;
+    let mut pcfd = spawn_pcfd("stopdisc", &nrf, None).await;
     eventually(Duration::from_secs(30), "the first UDR discovery", || {
         nrf.udr_discoveries() >= 1
     })
     .await;
-    sigterm(&pcfd.0);
-    let status = exits_within(&mut pcfd.0, Duration::from_secs(8)).await;
+    sigterm(pcfd.child());
+    let status = exits_within(pcfd.child(), Duration::from_secs(8)).await;
     assert!(status.success(), "{status:?}");
     assert_eq!(
         udr.with(|s| s.posts),
@@ -722,91 +618,4 @@ async fn a_sigterm_during_discovery_creates_no_subscription() {
         "no subscribe once shutdown was requested"
     );
     udr.server.stop().await.ok();
-}
-
-/// #1497: the bind loss made deterministic. The first SBI port is held by another
-/// socket, here a listener; in the flake it was a sibling pcfd's outbound
-/// connection. Either gives EADDRINUSE, so pcfd exits at startup. This proves the
-/// harness's answer, not the cause: the spawn sees that exit, moves to another
-/// port, and the subscription is made.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_pcfd_that_loses_its_sbi_port_is_spawned_on_another() {
-    let nrf = Nrf::start().await;
-    let udr = Udr::start(None).await;
-    nrf.register_only(udr.port);
-    let taken = nextgcore_sbi::test_support::bound_listener();
-    let (_pcfd, dir) = spawn_pcfd_with(
-        "taken",
-        &nrf,
-        None,
-        Spawn {
-            first_port: taken.port(),
-            ..Spawn::default()
-        },
-    )
-    .await;
-    let log = std::fs::read_to_string(dir.log()).unwrap();
-    let listening = log
-        .lines()
-        .find_map(|l| l.split(SBI_LISTENING).nth(1))
-        .expect("the listening line")
-        .trim()
-        .to_string();
-    assert!(
-        listening.starts_with("127.0.0.1:") && listening != format!("127.0.0.1:{}", taken.port()),
-        "listening on another port than the taken one: {listening}"
-    );
-    eventually(Duration::from_secs(10), "the subscription", || {
-        udr.with(|s| s.posts) == 1
-    })
-    .await;
-    drop(taken);
-    udr.server.stop().await.ok();
-}
-
-/// #1520 review: a lost bind is still retried when pcfd prints the bind error and
-/// exits after the harness last looked at its log. Here the harness pauses 300 ms
-/// between asking whether pcfd exited and reading the log, so that exit always
-/// falls in the window.
-///
-/// REVERT-VERIFIED: with the log read before `try_wait` again, this fails with
-/// "pcfd exited at startup (exit status: 1)" while the dumped stderr shows the bind
-/// error.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_lost_bind_seen_late_is_still_retried() {
-    let nrf = Nrf::start().await;
-    let taken = nextgcore_sbi::test_support::bound_listener();
-    let (_pcfd, dir) = spawn_pcfd_with(
-        "taken-late",
-        &nrf,
-        None,
-        Spawn {
-            first_port: taken.port(),
-            pause_after_exit_check: Duration::from_millis(300),
-            ..Spawn::default()
-        },
-    )
-    .await;
-    let log = std::fs::read_to_string(dir.log()).unwrap();
-    assert!(log.contains(SBI_LISTENING), "the respawn listens: {log}");
-    drop(taken);
-}
-
-/// #1520 review: a startup failure that is not a lost bind fails at once, as the
-/// failure it is, rather than being respawned until "lost its SBI port 5 times".
-/// The SBI address does not parse, so pcfd exits before it binds anything.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[should_panic(expected = "pcfd exited at startup")]
-async fn a_startup_failure_that_is_not_a_lost_bind_fails_at_once() {
-    let nrf = Nrf::start().await;
-    let _ = spawn_pcfd_with(
-        "badaddr",
-        &nrf,
-        None,
-        Spawn {
-            address: "not-an-address",
-            ..Spawn::default()
-        },
-    )
-    .await;
 }

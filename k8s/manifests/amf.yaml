@@ -47,13 +47,13 @@ spec:
       initContainers:
         - name: wait-nrf
           image: busybox:1.36
-          command: ['sh', '-c', 'until nc -z nrf.nextg-system.svc.cluster.local 7777; do echo waiting for nrf; sleep 2; done']
+          command: ['sh', '-c', 'until nc -z -w 2 nrf.nextg-system.svc.cluster.local 7777; do echo waiting for nrf; sleep 2; done']
         - name: wait-ausf
           image: busybox:1.36
-          command: ['sh', '-c', 'until nc -z ausf.nextg-system.svc.cluster.local 7777; do echo waiting for ausf; sleep 2; done']
+          command: ['sh', '-c', 'until nc -z -w 2 ausf.nextg-system.svc.cluster.local 7777; do echo waiting for ausf; sleep 2; done']
         - name: wait-udm
           image: busybox:1.36
-          command: ['sh', '-c', 'until nc -z udm.nextg-system.svc.cluster.local 7777; do echo waiting for udm; sleep 2; done']
+          command: ['sh', '-c', 'until nc -z -w 2 udm.nextg-system.svc.cluster.local 7777; do echo waiting for udm; sleep 2; done']
       containers:
         - name: amf
           image: nextgcore-rust/amf:latest

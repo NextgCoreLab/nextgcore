@@ -453,6 +453,14 @@ jobs:
             echo "committed git conflict markers (above); resolve them (#1098)"
             exit 1
           fi
+      - name: Every netcat port probe has a connect timeout
+        working-directory: nextgcore
+        run: |
+          # #1506: a port probe with no connect timeout blocks ~130 s on one
+          # dropped SYN. The self-test first: a pattern that silently stopped
+          # matching (or matched a bounded probe) would pass every scan.
+          deploy/check_nc_timeout.sh --self-test
+          deploy/check_nc_timeout.sh
       - name: Checkout nextgsim
         uses: actions/checkout@v4
         with:

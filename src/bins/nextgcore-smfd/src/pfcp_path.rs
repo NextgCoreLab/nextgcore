@@ -1398,6 +1398,16 @@ impl PfcpClient {
         self.publish_associated(&assoc);
     }
 
+    /// A client toward `peer` with an established association, for a test that
+    /// delivers a Session Report as that UPF's: one from a UPF that is not associated
+    /// is refused with cause 72 (#1509, TS 29.244 §5.8.3).
+    #[cfg(test)]
+    pub(crate) async fn associated_for_test(socket: Arc<UdpSocket>, peer: SocketAddr) -> Arc<Self> {
+        let client = Arc::new(Self::new(socket, peer, [127, 0, 0, 1]));
+        client.set_assoc_state_for_test(true, None, None).await;
+        client
+    }
+
     /// T1/N1 parameters for a given request type.
     fn retransmit_params(&self, msg_type: u8) -> (Duration, u32) {
         let cfg = match msg_type {

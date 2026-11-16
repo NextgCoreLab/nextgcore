@@ -111,7 +111,8 @@ amf.sbi.server[0].address (#1311), so the env var is set instead.
 
 {{/*
 initContainer that blocks until the NRF SBI port accepts a connection. Every NF
-registers with the NRF at startup, and a failed registration is not retried.
+registers with the NRF at startup. A failed registration is retried with backoff
+(#1482), so this wait only keeps the first attempt from being one that fails.
 */}}
 {{- define "nextgcore.waitForNrf" -}}
 - name: wait-nrf
@@ -120,7 +121,7 @@ registers with the NRF at startup, and a failed registration is not retried.
     - sh
     - -c
     - |
-      until nc -z {{ include "nextgcore.nrfHost" . }} {{ .Values.global.sbi.port }}; do
+      until nc -z -w 2 {{ include "nextgcore.nrfHost" . }} {{ .Values.global.sbi.port }}; do
         echo "waiting for nrf"
         sleep 2
       done
@@ -136,7 +137,7 @@ initContainer that blocks until MongoDB accepts a connection.
     - sh
     - -c
     - |
-      until nc -z {{ .Release.Name }}-mongodb.{{ .Release.Namespace }}.svc.cluster.local 27017; do
+      until nc -z -w 2 {{ .Release.Name }}-mongodb.{{ .Release.Namespace }}.svc.cluster.local 27017; do
         echo "waiting for mongodb"
         sleep 2
       done

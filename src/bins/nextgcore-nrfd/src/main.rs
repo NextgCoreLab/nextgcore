@@ -4966,6 +4966,183 @@ mod tests {
         outcome.expect("deregister test timed out");
     }
 
+    /// #1574 review M1: an NFRegister retry whose PUT is at the NRF when shutdown
+    /// begins, and lands after it, is deregistered BY `deregister_self`, before it
+    /// returns. Left to the retry task, that DELETE was cancelled when the process
+    /// exited, and the profile stayed discoverable at the NRF.
+    ///
+    /// Against the real NRF registry: the retry's second attempt PUTs a real
+    /// profile, but only once `deregister_self` is already running.
+    ///
+    /// REVERT-VERIFIED: with `deregister_self` not waiting for the in-flight
+    /// attempt (the #1574 head), it returns `false` at once and the profile is
+    /// still registered; with its DELETE replaced by a no-op, the profile is
+    /// still registered.
+    /// Without the attempt's `notify_waiters()` wake-up, it returns only when
+    /// the 5 s bound runs out, and the "woken by it" assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // a std guard held to serialise globals, by design
+    async fn a_registration_landing_during_shutdown_is_deleted_before_deregister_self_returns() {
+        use nextgcore_sbi::heartbeat as hb;
+        use serde_json::json;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        let _registration_guard = hb::lock_registration_state_for_test();
+        hb::clear_registration_abandoned();
+        hb::clear_registered_nf_instance_id();
+
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), listener);
+        server
+            .start(nrf_sbi_request_handler)
+            .await
+            .expect("SBI server starts");
+        nextgcore_sbi::context::global_context()
+            .set_nrf_uri(format!("http://127.0.0.1:{}", addr.port()))
+            .await;
+        // Distinct ID and NF type: nf_manager() is process-global.
+        let nf_id = "5e9b1c0a-1574-4f6a-8888-0123456789ab";
+        let port = addr.port();
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let gates = std::sync::Arc::new(std::sync::Mutex::new(Some((started_tx, release_rx))));
+        let attempts = std::sync::Arc::new(AtomicU32::new(0));
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+
+        let body = async {
+            let (a, g, r) = (attempts.clone(), gates.clone(), ran.clone());
+            let out = hb::register_or_retry(
+                "TEST",
+                hb::RegisterRetryPolicy {
+                    initial: Duration::from_millis(10),
+                    max: Duration::from_millis(10),
+                    jitter_percent: 0,
+                },
+                move || {
+                    let n = a.fetch_add(1, Ordering::SeqCst) + 1;
+                    let gate = if n == 2 {
+                        g.lock().unwrap().take()
+                    } else {
+                        None
+                    };
+                    async move {
+                        let Some((started, release)) = gate else {
+                            return Err("NRF unreachable".to_string());
+                        };
+                        // In flight: hold the PUT until shutdown has begun.
+                        let _ = started.send(());
+                        let _ = release.await;
+                        let client =
+                            nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", port);
+                        let profile = json!({
+                            "nfInstanceId": nf_id,
+                            "nfType": "NWDAF",
+                            "nfStatus": "REGISTERED",
+                            "heartBeatTimer": 10,
+                            "ipv4Addresses": ["10.15.7.4"]
+                        });
+                        let resp = client
+                            .put_json(&format!("/nnrf-nfm/v1/nf-instances/{nf_id}"), &profile)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        assert_eq!(resp.status, 201);
+                        Ok(Some(nf_id.to_string()))
+                    }
+                },
+                move |_| r.store(true, Ordering::SeqCst),
+            )
+            .await;
+            assert_eq!(out, hb::Registration::Retrying);
+            started_rx.await.expect("the second attempt is in flight");
+
+            let dereg = tokio::spawn(hb::deregister_self());
+            nextgcore_sbi::test_support::poll_until(
+                Duration::from_secs(5),
+                Duration::from_millis(5),
+                || async { hb::registration_abandoned().then_some(()) },
+            )
+            .await
+            .expect("shutdown has begun");
+            // The NRF now accepts the registration that was in flight.
+            let released = std::time::Instant::now();
+            release_tx.send(()).expect("release the PUT");
+
+            assert!(
+                dereg.await.expect("deregister_self"),
+                "the late registration produced a DELETE"
+            );
+            // Woken by the landing attempt, not by the 5 s bound running out.
+            let took = released.elapsed();
+            assert!(
+                took < Duration::from_secs(2),
+                "deregister_self returned {took:?} after the landing, not woken by it"
+            );
+            assert!(
+                nf_manager().get(nf_id).is_none(),
+                "the late registration is gone by the time deregister_self returns"
+            );
+            assert!(
+                !ran.load(Ordering::SeqCst),
+                "and no heartbeat was started for it"
+            );
+        };
+        let outcome = tokio::time::timeout(Duration::from_secs(30), body).await;
+
+        hb::set_heartbeat_paused(false);
+        hb::clear_registered_nf_instance_id();
+        hb::clear_registration_abandoned();
+        server.stop().await.expect("server stops");
+        outcome.expect("late-registration test timed out");
+    }
+
+    /// #1574 review m1: `deregister_self` gives up on an NRF that never answers
+    /// within `DEREGISTER_TIMEOUT` (5 s), well inside Kubernetes' default 30 s
+    /// termination grace, and still reports that a DELETE was attempted.
+    ///
+    /// REVERT-VERIFIED: with `DEREGISTER_TIMEOUT` at 3600 s, the client's own
+    /// 30 s request timeout ends the wait instead, and the bound assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // a std guard held to serialise globals, by design
+    async fn deregister_self_gives_up_on_a_silent_nrf_within_its_bound() {
+        use nextgcore_sbi::heartbeat as hb;
+        let _registration_guard = hb::lock_registration_state_for_test();
+        hb::clear_registration_abandoned();
+
+        // An NRF that accepts the connection and never answers.
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let silent = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), listener);
+        silent
+            .start(|_req: SbiRequest| async {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                SbiResponse::with_status(204)
+            })
+            .await
+            .expect("silent NRF starts");
+        nextgcore_sbi::context::global_context()
+            .set_nrf_uri(format!("http://127.0.0.1:{}", addr.port()))
+            .await;
+        hb::set_registered_nf_instance_id("5e9b1c0a-1574-4f6a-8888-00000000dead");
+
+        let started = std::time::Instant::now();
+        let issued = tokio::time::timeout(Duration::from_secs(60), hb::deregister_self())
+            .await
+            .expect("deregister_self returns");
+        let took = started.elapsed();
+
+        hb::set_heartbeat_paused(false);
+        hb::clear_registered_nf_instance_id();
+        hb::clear_registration_abandoned();
+        let _ = tokio::time::timeout(Duration::from_secs(2), silent.stop()).await;
+
+        assert!(issued, "a recorded ID produces a DELETE attempt");
+        assert!(
+            took >= hb::DEREGISTER_TIMEOUT - Duration::from_millis(100)
+                && took < hb::DEREGISTER_TIMEOUT + Duration::from_secs(3),
+            "gave up after {took:?}, not within the {:?} bound",
+            hb::DEREGISTER_TIMEOUT
+        );
+    }
+
     /// #1334: the NRF's `/metrics`, scraped over HTTP, serves every NRF series the
     /// shipped rules and dashboards use, and the counters follow real Nnrf traffic
     /// through the production handler: a registration, a heartbeat, a discovery that

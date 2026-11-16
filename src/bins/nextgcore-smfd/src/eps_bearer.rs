@@ -139,6 +139,11 @@ pub struct LocalFlow {
 ///         - direction: uplink
 ///           description: permit out 17 from any to assigned 5004
 /// ```
+///
+/// `mbr` and `gbr` apply to a GBR QCI only (TS 23.401 §4.7.3). For a standardized
+/// non-GBR QCI (5-9, 69, 70, 79, 80) they are ignored, with a WARN at startup (#1538,
+/// [`checked_pcc_rules`]). Every other QCI keeps them: an operator-specific QCI
+/// (128-254) has the resource type the operator pre-configures (TS 23.203 §6.1.7.1).
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct LocalPccRule {
     pub name: String,
@@ -552,6 +557,10 @@ pub async fn activate(
     mut req: DedicatedBearerRequest,
 ) -> Result<SmfBearer, ActivationError> {
     use ActivationError::{Failed, NotSent};
+
+    // #1538: a non-GBR bearer is created with no MBR or GBR, toward the SGW-C and on
+    // the PGW-U alike.
+    drop_non_gbr_rates(&mut req.qos, "dedicated bearer activation");
 
     let handle = context::smf_self();
     // Everything read from the store is read here, and the guard dropped before any await.
@@ -1298,6 +1307,77 @@ fn is_gbr_qci(qci: u8) -> bool {
     matches!(qci, 1..=4 | 65..=67 | 71..=76 | 82..=85)
 }
 
+/// Whether a QCI is a STANDARDIZED non-GBR one (TS 23.203 Table 6.1.7-A; the EPS
+/// QCIs share TS 23.501 Table 5.7.4-1's values): 5-9, 69, 70, 79, 80. Not the
+/// complement of [`is_gbr_qci`]: an operator-specific QCI (128-254, TS 23.203
+/// §6.1.7.1) or an unassigned one is neither, its resource type unknown here, so
+/// nothing is taken from it (#1567 review).
+fn is_non_gbr_qci(qci: u8) -> bool {
+    matches!(qci, 5..=9 | 69 | 70 | 79 | 80)
+}
+
+/// #1538: a non-GBR EPS bearer carries no MBR and no GBR. TS 23.401 §4.7.3: only
+/// "each GBR bearer is additionally associated with" a GBR and an MBR; TS 29.274 §8.15
+/// and §8.16: "For non-GBR bearers, both the UL/DL MBR and GBR should be set to zero".
+/// Rates given for a standardized non-GBR QCI ([`is_non_gbr_qci`]: a configured
+/// `smf.pcc_rules` entry, a Bearer Resource Command's Flow QoS) are dropped, with a
+/// WARN naming `what`; any other QCI's rates are left as given.
+///
+/// Why it matters past conformance: an MBR installed on a non-GBR bearer's PGW-U QER
+/// could never be taken off again. A later modification stores MBR 0 and omits the
+/// MBR IE from the Update QER, and TS 29.244 Table 7.5.4.5-1 makes an absent MBR
+/// "unchanged" (upfd keeps the old cap since #1535): store and PGW-U disagreed.
+/// With no MBR ever attached, there is none to remove. Returns whether rates were
+/// dropped.
+pub(crate) fn drop_non_gbr_rates(qos: &mut context::Qos, what: &str) -> bool {
+    if !is_non_gbr_qci(qos.index) {
+        return false;
+    }
+    let rates = (
+        qos.mbr_uplink,
+        qos.mbr_downlink,
+        qos.gbr_uplink,
+        qos.gbr_downlink,
+    );
+    if rates == (0, 0, 0, 0) {
+        return false;
+    }
+    log::warn!(
+        "{what}: QCI {} is non-GBR, which has no MBR or GBR (TS 23.401 §4.7.3); MBR UL/DL \
+         {}/{} and GBR UL/DL {}/{} bit/s are ignored",
+        qos.index,
+        rates.0,
+        rates.1,
+        rates.2,
+        rates.3
+    );
+    qos.mbr_uplink = 0;
+    qos.mbr_downlink = 0;
+    qos.gbr_uplink = 0;
+    qos.gbr_downlink = 0;
+    true
+}
+
+/// The configured `smf.pcc_rules`, with the rates of each non-GBR rule dropped and
+/// warned about once, at startup (#1538, see [`drop_non_gbr_rates`]).
+pub fn checked_pcc_rules(mut rules: Vec<LocalPccRule>) -> Vec<LocalPccRule> {
+    for rule in &mut rules {
+        let mut qos = context::Qos {
+            index: rule.qci,
+            mbr_uplink: rule.mbr.uplink,
+            mbr_downlink: rule.mbr.downlink,
+            gbr_uplink: rule.gbr.uplink,
+            gbr_downlink: rule.gbr.downlink,
+            ..Default::default()
+        };
+        if drop_non_gbr_rates(&mut qos, &format!("smf.pcc_rules '{}'", rule.name)) {
+            rule.mbr = BitRates::default();
+            rule.gbr = BitRates::default();
+        }
+    }
+    rules
+}
+
 /// Why a Bearer Resource Command on an existing bearer was not carried out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandError {
@@ -1712,7 +1792,7 @@ pub async fn modify_on_command(
     };
 
     // The QoS the UE asked for, with the bearer's ARP (Flow QoS carries none).
-    let new_qos = cmd.flow_qos.as_ref().map(|f| context::Qos {
+    let mut new_qos = cmd.flow_qos.as_ref().map(|f| context::Qos {
         index: f.qci,
         mbr_uplink: crate::gtp_build::gtp2_kbps_to_bps(f.ul_mbr),
         mbr_downlink: crate::gtp_build::gtp2_kbps_to_bps(f.dl_mbr),
@@ -1732,6 +1812,11 @@ pub async fn modify_on_command(
                 ),
             ));
         }
+    }
+    // #1538: a non-GBR bearer's Flow QoS carries no MBR or GBR (TS 29.274 §8.16), so
+    // none is stored, signalled or put on the PGW-U QER.
+    if let Some(q) = new_qos.as_mut() {
+        drop_non_gbr_rates(q, &format!("Bearer Resource Command on EBI {ebi}"));
     }
     let qos_changed = new_qos.as_ref().is_some_and(|q| {
         (
@@ -1920,6 +2005,79 @@ pub async fn modify_on_command(
 mod tests {
     use super::*;
     use crate::eps_tft::{op, Tft};
+
+    /// #1538: at config load, a non-GBR `smf.pcc_rules` entry loses its MBR and GBR
+    /// (TS 23.401 §4.7.3); a GBR one keeps them.
+    #[test]
+    fn a_non_gbr_pcc_rule_has_no_mbr_or_gbr_after_load() {
+        let rules: Vec<LocalPccRule> = serde_yaml::from_str(
+            r#"
+- name: bulk
+  qci: 8
+  mbr: { uplink: 128000, downlink: 256000 }
+  gbr: { uplink: 64000, downlink: 64000 }
+  flows: [ { direction: downlink, description: "permit out 17 from any to assigned" } ]
+- name: voice
+  qci: 1
+  mbr: { uplink: 128000, downlink: 128000 }
+  gbr: { uplink: 64000, downlink: 64000 }
+  flows: [ { direction: downlink, description: "permit out 17 from any to assigned" } ]
+- name: vip-video
+  qci: 130
+  mbr: { uplink: 2000000, downlink: 4000000 }
+  gbr: { uplink: 1000000, downlink: 2000000 }
+  flows: [ { direction: downlink, description: "permit out 17 from any to assigned" } ]
+"#,
+        )
+        .expect("rules");
+        let checked = checked_pcc_rules(rules);
+        let rates = |r: &LocalPccRule| (r.qci, r.mbr, r.gbr);
+        let none = BitRates::default();
+        assert_eq!(rates(&checked[0]), (8, none, none), "non-GBR: dropped");
+        assert_eq!(
+            rates(&checked[1]),
+            (
+                1,
+                BitRates {
+                    uplink: 128_000,
+                    downlink: 128_000
+                },
+                BitRates {
+                    uplink: 64_000,
+                    downlink: 64_000
+                }
+            ),
+            "GBR: kept"
+        );
+        // #1567 review: an operator-specific QCI is not known to be non-GBR.
+        assert_eq!(
+            rates(&checked[2]),
+            (
+                130,
+                BitRates {
+                    uplink: 2_000_000,
+                    downlink: 4_000_000
+                },
+                BitRates {
+                    uplink: 1_000_000,
+                    downlink: 2_000_000
+                }
+            ),
+            "operator-specific QCI 130: kept"
+        );
+    }
+
+    /// #1567 review: only the standardized non-GBR QCIs are non-GBR here; GBR,
+    /// operator-specific and unassigned QCIs are not.
+    #[test]
+    fn only_standardized_non_gbr_qcis_lose_their_rates() {
+        for qci in [5u8, 6, 7, 8, 9, 69, 70, 79, 80] {
+            assert!(is_non_gbr_qci(qci), "{qci}");
+        }
+        for qci in [1u8, 4, 65, 67, 71, 76, 82, 85, 128, 130, 254, 0, 100] {
+            assert!(!is_non_gbr_qci(qci), "{qci}");
+        }
+    }
 
     /// #1293: precedences unique across the PDN connection, relative order kept.
     #[test]

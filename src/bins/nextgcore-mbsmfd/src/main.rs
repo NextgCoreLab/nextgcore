@@ -270,23 +270,39 @@ async fn main() -> Result<()> {
     // Register with NRF
     let sbi_ctx = global_context();
     sbi_ctx.set_nrf_uri(&args.nrf_uri).await;
-    if let Err(e) = match sbi.registration_host() {
-        Ok(host) => register_with_nrf(host, sbi_port, &nf_instance_id).await,
-        Err(why) => Err(why),
-    } {
-        log::warn!("NRF registration failed (will operate without NRF): {e}");
-    } else {
-        // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
-        // (active MBS sessions, saturated at 100; TS 29.510 §5.2.2.3.2).
-        // Honest session-count proxy — no fabricated CPU numbers.
-        nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(
-            nf_instance_id.clone(),
-            5,
-            || {
-                let load = mbsmf_self().read().map(|c| c.session_count()).unwrap_or(0);
-                load.min(100) as u8
-            },
-        );
+    // #1482: a failed attempt is retried in the background, and the heartbeat
+    // starts after the one that succeeds.
+    match sbi.registration_host() {
+        Ok(host) => {
+            let (host, id) = (host.to_string(), nf_instance_id.clone());
+            nextgcore_sbi::heartbeat::register_or_retry(
+                "MB-SMF",
+                Default::default(),
+                move || {
+                    let (host, id) = (host.clone(), id.clone());
+                    async move {
+                        register_with_nrf(&host, sbi_port, &id)
+                            .await
+                            .map(|()| Some(id))
+                    }
+                },
+                |nf_instance_id| {
+                    // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
+                    // (active MBS sessions, saturated at 100; TS 29.510 §5.2.2.3.2).
+                    // Honest session-count proxy — no fabricated CPU numbers.
+                    nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(
+                        nf_instance_id,
+                        5,
+                        || {
+                            let load = mbsmf_self().read().map(|c| c.session_count()).unwrap_or(0);
+                            load.min(100) as u8
+                        },
+                    );
+                },
+            )
+            .await;
+        }
+        Err(e) => log::warn!("NRF registration not attempted (will operate without NRF): {e}"),
     }
 
     log::info!("NextGCore MB-SMF ready (instance: {nf_instance_id})");

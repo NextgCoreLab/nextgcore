@@ -658,6 +658,309 @@ pub async fn reregister_self(nf_instance_id: &str) -> Result<u16, String> {
     }
 }
 
+// ─── Initial NFRegister retry (#1482) ───────────────────────────────────────
+//
+// TS 29.510 §5.2.2.2.1: NFRegister is what makes the NRF mark an NF "available
+// to be discovered by other NFs". §5.2.2.2.2 step 2b lists the failures (400,
+// 500, 3xx) and says nothing about what the NF does next, so the retry policy
+// is this implementation's. Before #1482 every registering daemon made ONE
+// attempt and, on a transport error or a non-2xx, logged "will operate without
+// NRF" and ran undiscoverable for its whole life. An NRF restarting, or an NRF
+// Service with no ready endpoint during a rollout, was enough to cause that.
+// pcfd was worse: it read a failure as success and started a heartbeat with no
+// recorded profile, so even the #434 404 path could not re-register it.
+//
+// Every daemon now registers through [`register_or_retry`]. The first attempt
+// is awaited inline, so the happy-path startup order is unchanged. A failure
+// moves the attempts to a background task with bounded exponential backoff,
+// and the daemon's `on_registered` (heartbeat worker, and anything else that
+// must follow a registration) runs exactly once, after the attempt that
+// succeeded. So `set_registered_profile` always holds what the NRF holds, and
+// the heartbeat never runs for a profile the NRF never accepted.
+
+/// Backoff for the initial NFRegister retry (#1482).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegisterRetryPolicy {
+    /// The wait before the second attempt. Each later wait doubles it.
+    pub initial: Duration,
+    /// The cap on any one wait. Attempts continue at this period until one
+    /// succeeds or the NF deregisters for shutdown.
+    pub max: Duration,
+    /// Each wait is spread uniformly by up to this many percent either way, so
+    /// replicas that failed together do not retry in lockstep (#1574 review).
+    /// 0 for none.
+    pub jitter_percent: u8,
+}
+
+impl Default for RegisterRetryPolicy {
+    /// 1 s, 2 s, 4 s, ... capped at 30 s. An NRF that is back within a
+    /// rollout's few seconds is reached within a second or two of its return.
+    /// A long outage costs one attempt (and one warning) per 30 s.
+    fn default() -> Self {
+        RegisterRetryPolicy {
+            initial: Duration::from_secs(1),
+            max: Duration::from_secs(30),
+            jitter_percent: 20,
+        }
+    }
+}
+
+impl RegisterRetryPolicy {
+    /// The wait after failed attempt `n` (1-based).
+    pub fn delay_after(&self, attempt: u32) -> Duration {
+        let factor = 1u32
+            .checked_shl(attempt.saturating_sub(1))
+            .unwrap_or(u32::MAX);
+        self.initial.saturating_mul(factor).min(self.max)
+    }
+
+    /// `delay` spread by up to [`RegisterRetryPolicy::jitter_percent`] either way.
+    pub fn jittered(&self, delay: Duration) -> Duration {
+        if self.jitter_percent == 0 {
+            return delay;
+        }
+        let span = f64::from(self.jitter_percent.min(100)) / 100.0;
+        let factor = 1.0 + span * (2.0 * rand::random::<f64>() - 1.0);
+        delay.mul_f64(factor.max(0.0))
+    }
+}
+
+/// Whether an NFRegister error is the NRF REJECTING the profile (a 3xx or 4xx,
+/// TS 29.510 §5.2.2.2.2 step 2b: 400 for an encoding or shared-data error, 3xx
+/// for a redirect) rather than the NRF being down. Retrying the same PUT will
+/// not fix that, so it is logged as an error and retried only at the cap.
+/// 408 and 429 are load, not rejection. The register functions report a
+/// status as "... status NNN ...".
+fn is_rejection(error: &str) -> bool {
+    error
+        .match_indices("status ")
+        .filter_map(|(i, m)| error.get(i + m.len()..i + m.len() + 3))
+        .filter_map(|code| code.parse::<u16>().ok())
+        .any(|code| (300..500).contains(&code) && code != 408 && code != 429)
+}
+
+/// What [`register_or_retry`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Registration {
+    /// The first attempt succeeded under this NF instance ID. `on_registered`
+    /// has already run.
+    Registered(String),
+    /// No NRF is configured. Nothing was sent, nothing is retried, and
+    /// `on_registered` does not run.
+    NotConfigured,
+    /// The first attempt failed. A background task keeps trying and runs
+    /// `on_registered` after the first attempt that succeeds.
+    Retrying,
+}
+
+/// The background NFRegister retry's state, shared with [`deregister_self`].
+///
+/// One `Mutex` so each check and the step it guards are one step against
+/// shutdown. With separate flags a retry could see "not abandoned", lose the CPU
+/// to `deregister_self` (which finds no recorded ID and sends nothing), and
+/// register a profile nothing will ever delete.
+#[derive(Debug)]
+struct RetryState {
+    /// [`deregister_self`] has run: no new attempt starts.
+    abandoned: bool,
+    /// An attempt's PUT is at the NRF now.
+    in_flight: bool,
+    /// [`deregister_self`] is waiting for that attempt (bounded), and will
+    /// DELETE what it lands with: the attempt hands the ID over in `landed`.
+    waiter: bool,
+    /// The ID an attempt registered under after shutdown began.
+    landed: Option<String>,
+}
+
+static RETRY_STATE: std::sync::Mutex<RetryState> = std::sync::Mutex::new(RetryState {
+    abandoned: false,
+    in_flight: false,
+    waiter: false,
+    landed: None,
+});
+
+fn retry_state() -> std::sync::MutexGuard<'static, RetryState> {
+    RETRY_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Signalled each time an attempt finishes, for a waiting [`deregister_self`].
+fn attempt_done() -> &'static tokio::sync::Notify {
+    static DONE: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+    DONE.get_or_init(tokio::sync::Notify::new)
+}
+
+/// Whether [`deregister_self`] has stopped any pending NFRegister retry.
+pub fn registration_abandoned() -> bool {
+    retry_state().abandoned
+}
+
+/// Reset the retry state [`deregister_self`] sets.
+///
+/// **Only for use in tests**, under [`lock_registration_state_for_test`]. Not
+/// `cfg(test)`-gated, for the reason [`clear_registered_nf_instance_id`] gives.
+pub fn clear_registration_abandoned() {
+    let mut st = retry_state();
+    st.abandoned = false;
+    st.in_flight = false;
+    st.waiter = false;
+    st.landed = None;
+}
+
+/// NFRegister (TS 29.510 §5.2.2.2.2) with a bounded-backoff retry (#1482).
+///
+/// `register` makes one attempt. It returns:
+/// - `Ok(Some(id))` on a 200/201, with the profile already recorded by
+///   [`set_registered_profile`];
+/// - `Ok(None)` when no NRF is configured;
+/// - `Err` on a transport error or any other status.
+///
+/// The first attempt is awaited here. On success `on_registered(id)` runs before
+/// this returns. On failure the attempts continue on a spawned task, waiting
+/// [`RegisterRetryPolicy::delay_after`] between them, and `on_registered` runs
+/// on that task after the first success. It runs at most once. The task stops
+/// when an attempt reports `Ok(None)` (the NRF URI was removed), or when
+/// [`deregister_self`] has run. An attempt in flight when `deregister_self`
+/// runs is waited for (bounded), and what it registered is DELETEd by
+/// `deregister_self` itself, before the process can exit (#1574 review).
+///
+/// A rejection (3xx/4xx but 408/429, see [`is_rejection`]) is logged as an
+/// error and retried only at the cap: the same PUT will not fix it.
+///
+/// `nf` names the daemon in the log lines (e.g. `"PCF"`).
+pub async fn register_or_retry<R, Fut, S>(
+    nf: &'static str,
+    policy: RegisterRetryPolicy,
+    mut register: R,
+    on_registered: S,
+) -> Registration
+where
+    R: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<Option<String>, String>> + Send + 'static,
+    S: FnOnce(String) + Send + 'static,
+{
+    let first = match register().await {
+        Ok(Some(id)) => {
+            on_registered(id.clone());
+            return Registration::Registered(id);
+        }
+        Ok(None) => return Registration::NotConfigured,
+        Err(e) => e,
+    };
+    let delay = if is_rejection(&first) {
+        log::error!(
+            "{nf}: the NRF rejected NFRegister (attempt 1): {first}. Retrying the same \
+             profile will not fix this; check the NFProfile and the NRF. Retrying every {:?} \
+             (the NF is not discoverable until it registers, TS 29.510 §5.2.2.2.1)",
+            policy.max
+        );
+        policy.max
+    } else {
+        let delay = policy.delay_after(1);
+        log::warn!(
+            "{nf}: NFRegister failed (attempt 1): {first}; retrying in ~{delay:?} \
+             (the NF is not discoverable until it registers, TS 29.510 §5.2.2.2.1)"
+        );
+        delay
+    };
+    tokio::spawn(async move {
+        let mut attempt: u32 = 1;
+        let mut delay = delay;
+        let mut rejected = is_rejection(&first);
+        loop {
+            tokio::time::sleep(policy.jittered(delay)).await;
+            {
+                let mut st = retry_state();
+                if st.abandoned {
+                    log::info!("{nf}: shutting down; NFRegister retry stopped");
+                    return;
+                }
+                st.in_flight = true;
+            }
+            attempt = attempt.saturating_add(1);
+            let result = register().await;
+            match result {
+                Ok(Some(id)) => {
+                    // None: registered; Some(true): handed to the waiting
+                    // deregister_self; Some(false): nobody waits, DELETE here.
+                    let late = {
+                        let mut st = retry_state();
+                        st.in_flight = false;
+                        if !st.abandoned {
+                            on_registered(id.clone());
+                            None
+                        } else if st.waiter {
+                            st.landed = Some(id.clone());
+                            Some(true)
+                        } else {
+                            Some(false)
+                        }
+                    };
+                    attempt_done().notify_waiters();
+                    match late {
+                        None => {
+                            log::info!(
+                                "{nf}: registered with the NRF on attempt {attempt} (id={id})"
+                            )
+                        }
+                        Some(true) => log::info!(
+                            "{nf}: registered during shutdown; NFDeregister of {id} follows"
+                        ),
+                        Some(false) => {
+                            log::info!("{nf}: registered during shutdown; deregistering {id}");
+                            if let Err(e) = deregister_nf(&id).await {
+                                log::warn!("{nf}: NFDeregister of {id} failed: {e}");
+                            }
+                        }
+                    }
+                    return;
+                }
+                Ok(None) => {
+                    retry_state().in_flight = false;
+                    attempt_done().notify_waiters();
+                    log::info!("{nf}: no NRF configured any more; NFRegister retry stopped");
+                    return;
+                }
+                Err(e) => {
+                    retry_state().in_flight = false;
+                    attempt_done().notify_waiters();
+                    if is_rejection(&e) {
+                        delay = policy.max;
+                        if !rejected {
+                            rejected = true;
+                            log::error!(
+                                "{nf}: the NRF rejected NFRegister (attempt {attempt}): {e}. \
+                                 Retrying the same profile will not fix this; check the \
+                                 NFProfile and the NRF. Retrying every {delay:?}"
+                            );
+                            continue;
+                        }
+                    } else {
+                        delay = policy.delay_after(attempt);
+                    }
+                    log::warn!(
+                        "{nf}: NFRegister failed (attempt {attempt}): {e}; retrying in ~{delay:?}"
+                    );
+                }
+            }
+        }
+    });
+    Registration::Retrying
+}
+
+/// `Some(id)` unless `id` is empty: the convention the `Result<String, String>`
+/// registration functions use for "no NRF configured".
+pub fn registered_id(id: String) -> Option<String> {
+    (!id.is_empty()).then_some(id)
+}
+
+/// The most [`deregister_self`] waits for an in-flight NFRegister retry to land,
+/// and then, separately, for the NRF's answer to the DELETE: at most 10 s in
+/// all. Before this, the client's own 5 s connect plus 30 s request timeouts
+/// applied, which is longer than Kubernetes' default 30 s termination grace.
+pub const DEREGISTER_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// `DELETE /nnrf-nfm/v1/nf-instances/{nfInstanceId}` — NFDeregister,
 /// TS 29.510 §5.2.2.2.3.
 ///
@@ -709,14 +1012,39 @@ pub async fn deregister_nf(nf_instance_id: &str) -> Result<(), String> {
 /// would be worse than the stale profile this is trying to avoid. Returns
 /// whether a DELETE was actually issued so a test can assert it.
 pub async fn deregister_self() -> bool {
-    let Some(nf_instance_id) = registered_nf_instance_id() else {
+    // #1482: stop any pending NFRegister retry FIRST, and read the recorded ID
+    // under the same guard, so a retry cannot register between the two.
+    let (registered, in_flight) = {
+        let mut st = retry_state();
+        st.abandoned = true;
+        if st.in_flight {
+            st.waiter = true;
+        }
+        (registered_nf_instance_id(), st.in_flight)
+    };
+    // #1574 review: an attempt whose PUT is at the NRF now may still register.
+    // Wait for it (bounded), and DELETE what it lands with HERE: a DELETE left
+    // to the retry task would be cancelled when the process exits.
+    let landed = if in_flight {
+        wait_for_in_flight_attempt().await
+    } else {
+        None
+    };
+    let Some(nf_instance_id) = registered.or(landed) else {
         log::debug!("No registered NF instance ID: skipping NRF deregistration");
         return false;
     };
 
     set_heartbeat_paused(true);
 
-    match deregister_nf(&nf_instance_id).await {
+    // #1482: bounded, so an unreachable NRF cannot hold the process past its
+    // termination grace.
+    let result =
+        match tokio::time::timeout(DEREGISTER_TIMEOUT, deregister_nf(&nf_instance_id)).await {
+            Ok(r) => r,
+            Err(_) => Err(format!("no answer within {DEREGISTER_TIMEOUT:?}")),
+        };
+    match result {
         Ok(()) => {
             log::info!("Deregistered NF instance {nf_instance_id} from the NRF");
             true
@@ -727,6 +1055,41 @@ pub async fn deregister_self() -> bool {
             // backstop this is merely trying to pre-empt.
             log::warn!("NRF deregistration for {nf_instance_id} failed: {e}");
             true
+        }
+    }
+}
+
+/// Wait, bounded by [`DEREGISTER_TIMEOUT`], for the NFRegister attempt in flight
+/// to finish, and take the ID it registered under during shutdown, if any.
+async fn wait_for_in_flight_attempt() -> Option<String> {
+    let deadline = tokio::time::Instant::now() + DEREGISTER_TIMEOUT;
+    loop {
+        // Register interest BEFORE looking, so a notify between the look and
+        // the await is not lost.
+        let notified = attempt_done().notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        {
+            let mut st = retry_state();
+            if !st.in_flight {
+                st.waiter = false;
+                return st.landed.take();
+            }
+        }
+        if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            // Give up waiting. From here an attempt that lands DELETEs its own
+            // registration (best effort: the process may exit first). One that
+            // landed in between left its ID here.
+            let mut st = retry_state();
+            st.waiter = false;
+            let landed = st.landed.take();
+            if landed.is_none() {
+                log::warn!(
+                    "an NFRegister attempt was still in flight after {DEREGISTER_TIMEOUT:?}; \
+                     if it lands, it deregisters itself"
+                );
+            }
+            return landed;
         }
     }
 }
@@ -1450,5 +1813,371 @@ mod tests {
 
         let patch = build_status_patch(0, crate::context::NfStatus::Registered);
         assert_eq!(patch.as_array().unwrap()[1]["value"], json!(0));
+    }
+
+    // ─── #1482: initial NFRegister retry ────────────────────────────────────
+
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+
+    /// The default backoff with no jitter, so paused-time tests see exact waits.
+    fn no_jitter() -> RegisterRetryPolicy {
+        RegisterRetryPolicy {
+            jitter_percent: 0,
+            ..RegisterRetryPolicy::default()
+        }
+    }
+
+    #[test]
+    fn jitter_stays_within_its_percent() {
+        let p = RegisterRetryPolicy::default();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let d = p.jittered(Duration::from_secs(10));
+            assert!(
+                d >= Duration::from_secs(8) && d <= Duration::from_secs(12),
+                "{d:?}"
+            );
+            seen.insert(d.as_millis());
+        }
+        // It really spreads: a jitter that returned the delay unchanged (or a
+        // constant) would leave one value.
+        assert!(seen.len() > 100, "only {} distinct delays", seen.len());
+        assert_eq!(
+            no_jitter().jittered(Duration::from_secs(10)),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn a_3xx_or_4xx_is_a_rejection_but_load_and_transport_are_not() {
+        assert!(is_rejection("NRF registration returned status 400"));
+        assert!(is_rejection(
+            "NRF registration returned status 307: Some(..)"
+        ));
+        assert!(is_rejection("NRF returned status 403"));
+        assert!(!is_rejection("NRF registration returned status 503"));
+        assert!(!is_rejection("NRF registration returned status 429"));
+        assert!(!is_rejection("NRF registration returned status 408"));
+        assert!(!is_rejection("NRF registration failed: connection refused"));
+    }
+
+    /// #1574 review m4: the NRF rejecting the profile (a 400) is retried only at
+    /// the 30 s cap, not on the 1, 2, 4 s ramp: the same PUT will not fix it.
+    ///
+    /// REVERT-VERIFIED: with the rejection branch removed (the normal ramp), 6
+    /// attempts are made in the 61 s, not 3.
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::await_holding_lock)] // the registration-state test lock; one runtime thread
+    async fn a_rejected_registration_is_retried_only_at_the_cap() {
+        let _g = lock_registration_state_for_test();
+        clear_registration_abandoned();
+        let attempts = Arc::new(AtomicU32::new(0));
+        let a = attempts.clone();
+        let out = register_or_retry(
+            "TEST",
+            no_jitter(),
+            move || {
+                a.fetch_add(1, AtomicOrdering::SeqCst);
+                std::future::ready(Err("NRF registration returned status 400".to_string()))
+            },
+            |_| {},
+        )
+        .await;
+        assert_eq!(out, Registration::Retrying);
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        assert_eq!(
+            attempts.load(AtomicOrdering::SeqCst),
+            3,
+            "attempts at 0, 30 and 60 s"
+        );
+        // Stop the task before the lock is released.
+        retry_state().abandoned = true;
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        clear_registration_abandoned();
+    }
+
+    /// #1574 review m2: an attempt that finds the NRF URI gone (`Ok(None)`)
+    /// stops the retry, without running `on_registered`.
+    ///
+    /// REVERT-VERIFIED: with `Ok(None)` treated like an error (retry), attempts
+    /// keep climbing past 2.
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::await_holding_lock)] // the registration-state test lock; one runtime thread
+    async fn a_retry_that_finds_no_nrf_configured_stops() {
+        let _g = lock_registration_state_for_test();
+        clear_registration_abandoned();
+        let attempts = Arc::new(AtomicU32::new(0));
+        let a = attempts.clone();
+        let ran = Arc::new(Mutex::new(false));
+        let r = ran.clone();
+        let out = register_or_retry(
+            "TEST",
+            no_jitter(),
+            move || {
+                let n = a.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                std::future::ready(if n == 1 {
+                    Err("NRF unreachable".to_string())
+                } else {
+                    Ok(None)
+                })
+            },
+            move |_| *r.lock().unwrap() = true,
+        )
+        .await;
+        assert_eq!(out, Registration::Retrying);
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 2);
+        assert!(!*ran.lock().unwrap());
+    }
+
+    /// A `register` closure that fails `failures` times, then returns `Ok(Some(id))`.
+    /// Counts its calls in `attempts`.
+    fn failing_then_ok(
+        failures: u32,
+        id: &'static str,
+        attempts: Arc<AtomicU32>,
+    ) -> impl FnMut() -> std::future::Ready<Result<Option<String>, String>> + Send + 'static {
+        move || {
+            let n = attempts.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            std::future::ready(if n <= failures {
+                Err(format!("NRF unreachable (attempt {n})"))
+            } else {
+                Ok(Some(id.to_string()))
+            })
+        }
+    }
+
+    #[test]
+    fn register_retry_backoff_doubles_from_initial_and_caps_at_max() {
+        let p = RegisterRetryPolicy::default();
+        let secs: Vec<u64> = (1..=8).map(|n| p.delay_after(n).as_secs()).collect();
+        assert_eq!(secs, vec![1, 2, 4, 8, 16, 30, 30, 30]);
+        // No overflow however long the outage lasts.
+        assert_eq!(p.delay_after(u32::MAX), Duration::from_secs(30));
+        assert_eq!(p.delay_after(0), Duration::from_secs(1));
+    }
+
+    /// The happy path keeps today's ordering: one attempt, awaited, and the
+    /// daemon's follow-up (the heartbeat) has run by the time this returns.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_registration_that_succeeds_runs_on_registered_before_returning() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let ran = Arc::new(Mutex::new(None::<String>));
+        let r = ran.clone();
+        let out = register_or_retry(
+            "TEST",
+            no_jitter(),
+            failing_then_ok(0, "id-1482-ok", attempts.clone()),
+            move |id| *r.lock().unwrap() = Some(id),
+        )
+        .await;
+        assert_eq!(out, Registration::Registered("id-1482-ok".into()));
+        assert_eq!(ran.lock().unwrap().as_deref(), Some("id-1482-ok"));
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    /// No NRF configured: nothing is retried and nothing follows.
+    #[tokio::test(start_paused = true)]
+    async fn no_nrf_configured_is_not_retried() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let a = attempts.clone();
+        let ran = Arc::new(Mutex::new(false));
+        let r = ran.clone();
+        let out = register_or_retry(
+            "TEST",
+            no_jitter(),
+            move || {
+                a.fetch_add(1, AtomicOrdering::SeqCst);
+                std::future::ready(Ok(None))
+            },
+            move |_| *r.lock().unwrap() = true,
+        )
+        .await;
+        assert_eq!(out, Registration::NotConfigured);
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 1);
+        assert!(!*ran.lock().unwrap());
+    }
+
+    /// The #1482 defect: a failed first NFRegister was never retried. Now the
+    /// attempts continue at 1 s, 2 s, 4 s, and `on_registered` runs once, after
+    /// the attempt that succeeded and not before.
+    ///
+    /// REVERT-VERIFIED: with `register_or_retry` returning after the failed
+    /// first attempt (no spawned retry), this fails at "registered after the
+    /// fourth attempt" with 1 attempt and nothing run.
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::await_holding_lock)] // the registration-state test lock; one runtime thread
+    async fn a_failed_first_registration_is_retried_with_backoff_until_it_succeeds() {
+        let _g = lock_registration_state_for_test();
+        clear_registration_abandoned();
+        let attempts = Arc::new(AtomicU32::new(0));
+        let (tx, rx) = tokio::sync::oneshot::channel::<(String, u32)>();
+        let a = attempts.clone();
+        let start = tokio::time::Instant::now();
+        let out = register_or_retry(
+            "TEST",
+            no_jitter(),
+            failing_then_ok(3, "id-1482-retry", attempts.clone()),
+            move |id| {
+                let _ = tx.send((id, a.load(AtomicOrdering::SeqCst)));
+            },
+        )
+        .await;
+        assert_eq!(out, Registration::Retrying);
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 1);
+
+        let (id, attempts_when_run) = tokio::time::timeout(Duration::from_secs(60), rx)
+            .await
+            .expect("registered after the fourth attempt")
+            .expect("on_registered ran");
+        assert_eq!(id, "id-1482-retry");
+        assert_eq!(attempts_when_run, 4, "on_registered follows the success");
+        // 1 s + 2 s + 4 s of backoff before attempts 2, 3 and 4.
+        assert_eq!(start.elapsed(), Duration::from_secs(7));
+        // And nothing more after the success.
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 4);
+    }
+
+    /// Shutdown (`deregister_self`) stops a retry that has not registered yet:
+    /// a profile registered after the NF deregistered would stay at the NRF
+    /// until its heartbeat expired.
+    ///
+    /// REVERT-VERIFIED: without the `registration_abandoned()` check before
+    /// each attempt, this fails with attempts still climbing after shutdown.
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::await_holding_lock)] // see SELF_REPORTER_TEST_LOCK's rationale
+    async fn deregister_self_stops_a_pending_registration_retry() {
+        let _g = lock_registration_state_for_test();
+        // The recorded instance ID is also written by the tests that spawn a
+        // heartbeat worker, under this lock. Held so `deregister_self` below
+        // finds no ID and neither pauses the heartbeat nor sends a DELETE.
+        let _r = crate::overload::lock_self_reporter();
+        clear_registration_abandoned();
+        clear_registered_nf_instance_id();
+        let attempts = Arc::new(AtomicU32::new(0));
+        let ran = Arc::new(Mutex::new(false));
+        let r = ran.clone();
+        let out = register_or_retry(
+            "TEST",
+            no_jitter(),
+            failing_then_ok(u32::MAX, "never", attempts.clone()),
+            move |_| *r.lock().unwrap() = true,
+        )
+        .await;
+        assert_eq!(out, Registration::Retrying);
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        let before = attempts.load(AtomicOrdering::SeqCst);
+        assert_eq!(before, 3, "premise: attempts at 0, 1 s and 3 s");
+
+        // Nothing recorded, so no DELETE is sent; the retry still stops.
+        assert!(!deregister_self().await);
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), before);
+        assert!(!*ran.lock().unwrap());
+        clear_registration_abandoned();
+    }
+
+    /// An attempt in flight when shutdown begins, that then succeeds, must not
+    /// start the heartbeat (`deregister_self` has already looked for an ID).
+    ///
+    /// REVERT-VERIFIED: running `on_registered` without the abandoned check
+    /// fails at "on_registered did not run".
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::await_holding_lock)] // the registration-state test lock; one runtime thread
+    async fn a_registration_that_lands_during_shutdown_does_not_start_the_heartbeat() {
+        let _g = lock_registration_state_for_test();
+        clear_registration_abandoned();
+        let attempts = Arc::new(AtomicU32::new(0));
+        let a = attempts.clone();
+        let ran = Arc::new(Mutex::new(false));
+        let r = ran.clone();
+        let out = register_or_retry(
+            "TEST",
+            no_jitter(),
+            move || {
+                let n = a.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                async move {
+                    if n == 1 {
+                        return Err("NRF unreachable".to_string());
+                    }
+                    // Shutdown begins while this attempt is at the NRF.
+                    retry_state().abandoned = true;
+                    Ok(Some("id-1482-late".to_string()))
+                }
+            },
+            move |_| *r.lock().unwrap() = true,
+        )
+        .await;
+        assert_eq!(out, Registration::Retrying);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(
+            attempts.load(AtomicOrdering::SeqCst),
+            2,
+            "premise: it was retried"
+        );
+        assert!(!*ran.lock().unwrap(), "on_registered did not run");
+        clear_registration_abandoned();
+    }
+
+    /// #1482 source guard: every daemon that starts the heartbeat worker
+    /// registers through [`register_or_retry`], so none of them is back to one
+    /// attempt and "will operate without NRF". nrfd is excluded: it IS the NRF,
+    /// and its only heartbeat call is in a test.
+    #[test]
+    fn every_heartbeating_daemon_registers_through_register_or_retry() {
+        fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    rust_sources(&p, out);
+                } else if p.extension().is_some_and(|e| e == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        fn calls(text: &str, needle: &str) -> bool {
+            text.lines()
+                .any(|l| l.contains(needle) && !l.trim_start().starts_with("//"))
+        }
+        let bins = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("crate is at <root>/libs/nextgcore-sbi")
+            .join("bins");
+        let mut heartbeating = Vec::new();
+        let mut one_shot = Vec::new();
+        for entry in std::fs::read_dir(&bins).expect("read bins/").flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == "nextgcore-nrfd" {
+                continue;
+            }
+            let mut files = Vec::new();
+            rust_sources(&entry.path().join("src"), &mut files);
+            let text: String = files
+                .iter()
+                .map(|f| std::fs::read_to_string(f).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if calls(&text, "spawn_heartbeat_worker") {
+                heartbeating.push(name.clone());
+                if !calls(&text, "register_or_retry(") {
+                    one_shot.push(name);
+                }
+            }
+        }
+        one_shot.sort();
+        assert!(
+            heartbeating.len() >= 18,
+            "expected the 18 registering daemons, found {}: {heartbeating:?}",
+            heartbeating.len()
+        );
+        assert!(
+            one_shot.is_empty(),
+            "these daemons start the heartbeat but do not register through \
+             register_or_retry, so a failed first NFRegister is never retried (#1482): \
+             {one_shot:?}"
+        );
     }
 }

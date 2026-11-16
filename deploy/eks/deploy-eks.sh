@@ -395,7 +395,7 @@ for d in yaml.safe_load_all(open(sys.argv[1])):
                 'name': 'wait-mongodb',
                 'image': 'busybox:1.36',
                 'command': ['sh', '-c',
-                            f'until nc -z mongodb.{ns}.svc.cluster.local 27017; do '
+                            f'until nc -z -w 2 mongodb.{ns}.svc.cluster.local 27017; do '
                             'echo waiting for mongodb; sleep 2; done'],
             })
         pod['initContainers'] = inits

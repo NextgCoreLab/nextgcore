@@ -782,7 +782,8 @@ fn load_config(path: &str) -> anyhow::Result<SmfConfig> {
             }
         }
         config.mtu = smf.mtu;
-        config.pcc_rules = smf.pcc_rules.unwrap_or_default();
+        // #1538: a non-GBR rule's MBR/GBR is dropped here, with one WARN per rule.
+        config.pcc_rules = eps_bearer::checked_pcc_rules(smf.pcc_rules.unwrap_or_default());
         // #1502: an invalid block fails startup rather than leaving the measurement
         // silently unconfigured.
         if let Some(n6) = smf.n6_delay_measurement {
@@ -1149,27 +1150,43 @@ async fn main() -> Result<()> {
 
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
 
-    // Register with NRF (if configured)
-    match match sbi.registration_host() {
-        Ok(host) => smf_nrf_register(host, sbi.port).await,
-        Err(why) => Err(why),
-    } {
-        Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
-            // #79: the UDM must record the SAME instance id the NRF knows, or its
-            // serving-SMF record points at an instance nothing else can resolve.
-            udm::set_instance_id(&nf_instance_id);
-            // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
-            // (PDU sessions vs configured capacity; TS 29.510 §5.2.2.3.2).
-            nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(nf_instance_id, 5, || {
-                let ctx = smf_self();
-                let load = ctx.read().map(|c| c.get_load()).unwrap_or(0);
-                load.clamp(0, 100) as u8
-            });
+    // Register with NRF (if configured). #1482: a failed attempt is retried in
+    // the background, and the heartbeat starts after the one that succeeds.
+    match sbi.registration_host() {
+        Ok(host) => {
+            let (host, port) = (host.to_string(), sbi.port);
+            nextgcore_sbi::heartbeat::register_or_retry(
+                "SMF",
+                Default::default(),
+                move || {
+                    let host = host.clone();
+                    async move {
+                        smf_nrf_register(&host, port)
+                            .await
+                            .map(nextgcore_sbi::heartbeat::registered_id)
+                    }
+                },
+                |nf_instance_id| {
+                    // #79: the UDM must record the SAME instance id the NRF knows, or
+                    // its serving-SMF record points at an instance nothing else can
+                    // resolve.
+                    udm::set_instance_id(&nf_instance_id);
+                    // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
+                    // (PDU sessions vs configured capacity; TS 29.510 §5.2.2.3.2).
+                    nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(
+                        nf_instance_id,
+                        5,
+                        || {
+                            let ctx = smf_self();
+                            let load = ctx.read().map(|c| c.get_load()).unwrap_or(0);
+                            load.clamp(0, 100) as u8
+                        },
+                    );
+                },
+            )
+            .await;
         }
-        Ok(_) => {}
-        Err(e) => {
-            log::warn!("NRF registration failed (will operate without NRF): {e}");
-        }
+        Err(e) => log::warn!("NRF registration not attempted (will operate without NRF): {e}"),
     }
 
     log::info!("NextGCore SMF ready");
@@ -1520,6 +1537,43 @@ async fn handle_pfcp_session_report_from(
             Some(0),
             seq,
             &[0, 19, 0, 1, 65],
+        );
+        let _ = sock.send_to(&resp, peer).await;
+        return;
+    }
+
+    // #1509, TS 29.244 §5.8.3: "When a PFCP Association is not established with a UP
+    // function, the CP function shall reject any incoming PFCP Session related
+    // messages from that UP function, with a cause indicating that no PFCP
+    // association exists with the peer entity" (§8.2.1 cause 72). A configured UPF
+    // the SMF has marked down (heartbeat loss, N1 exhaustion, teardown) passes the
+    // #971 gate and still owns its retained sessions, so ownership alone is not
+    // enough: nothing in the report is processed, no usage, no Downlink Data Report,
+    // no Error Indication. The owner is the client that passed the ownership check
+    // above (the admitted one, or the session's recorded or default client).
+    // SEID 0 in the answer, as the #971 refusal of a stranger's report: §7.2.2.4.2
+    // lets a rejecting node answer without looking up the peer's SEID, with any
+    // cause but "Session context not found".
+    let associated = match pfcp_path::client_for_session(seid) {
+        Some(owner) => owner.is_associated().await,
+        None => false,
+    };
+    if !associated {
+        log::warn!(
+            "PFCP Session Report Request from {peer} for SEID 0x{seid:016x} refused: \
+             no established PFCP association with this UPF (cause 72)"
+        );
+        let resp = pfcp_path::encode_wire_message(
+            pfcp_path::pfcp_message_type::SESSION_REPORT_RESPONSE,
+            Some(0),
+            seq,
+            &[
+                0,
+                19,
+                0,
+                1,
+                pfcp_path::pfcp_cause::NO_ESTABLISHED_PFCP_ASSOCIATION,
+            ],
         );
         let _ = sock.send_to(&resp, peer).await;
         return;
@@ -4720,7 +4774,8 @@ async fn handle_sm_context_create_inner(request: &SbiRequest) -> SbiResponse {
             // #79: the subscribed values, when the UDM supplied any, are the
             // baseline here -- the config default is what they fall back TO, not
             // the other way round. With a PCF present its decision wins outright
-            // (TS 23.503 §6.1.3.2), which is why this applies only on this arm.
+            // (TS 29.512 §4.2.2.5 / §4.2.2.6), which is why this applies only on
+            // this arm.
             let mut decision = policy::PolicyDecision::config_default_for_dnn(&dnn);
             if let Some(ref sub) = subscribed {
                 decision.apply_subscribed_baseline(sub);
@@ -6271,9 +6326,16 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             );
 
             // Re-authorize via PCF (trigger RES_MO_RE, TS 29.512 §4.2.4)
+            //
+            // #1399: the answer is a delta (TS 29.512 §4.2.6.1), merged onto what the
+            // session enforces when it is applied: under the policy-apply lock, taken
+            // only after the PCF has answered (as the SE_AMBR_CH arm, #1387 review
+            // m1), and onto the binding read under it, so an UpdateNotify applied
+            // while the update was in flight is the base, not overwritten.
+            let mut _applying = None;
             let (qfi, ambr_ul, ambr_dl) = match binding.as_ref() {
                 Some(b) => {
-                    let mut authorized = (b.qfi, b.ambr_ul_bps, b.ambr_dl_bps);
+                    let mut answer = None;
                     if let Some(ref pol_id) = b.sm_policy_id {
                         match policy::resolve_pcf_endpoint().await {
                             Some(pcf) => {
@@ -6290,10 +6352,7 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                                 )
                                 .await
                                 {
-                                    Ok(dec) => {
-                                        authorized =
-                                            (b.qfi, dec.sess_ambr_ul_bps, dec.sess_ambr_dl_bps);
-                                    }
+                                    Ok(json) => answer = Some(json),
                                     Err(policy::PolicyError::Rejected { status, detail }) => {
                                         // Abnormal path: PCF rejects the
                                         // modification → 403 + 5GSM cause 29
@@ -6319,7 +6378,24 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                             None => log::warn!("PCF unresolved — keeping current QoS"),
                         }
                     }
-                    authorized
+                    // #1565 review: on every arm, the answer, a PCF failure or no
+                    // PCF, so a "keep current QoS" outcome keeps what the session
+                    // enforces NOW, not the binding read before the await (which an
+                    // UpdateNotify applied meanwhile has replaced).
+                    _applying =
+                        Some(SmContextLock::acquire(policy_apply_locks(), sm_context_ref).await);
+                    let enforced =
+                        lookup_policy_binding(sm_context_ref).unwrap_or_else(|| b.clone());
+                    match answer {
+                        Some(json) => {
+                            let dec = policy::merge_sm_policy_decision(
+                                enforced_policy_decision(&enforced),
+                                &json,
+                            );
+                            (enforced.qfi, dec.sess_ambr_ul_bps, dec.sess_ambr_dl_bps)
+                        }
+                        None => (enforced.qfi, enforced.ambr_ul_bps, enforced.ambr_dl_bps),
+                    }
                 }
                 None => {
                     log::warn!(
@@ -6581,25 +6657,53 @@ struct GsmProcedureTimer {
     /// The AMF callback authority to reach (from `smContextStatusUri`).
     amf_uri: Option<String>,
     /// #1409: the N2 SM information the first N1N2MessageTransfer carried with the
-    /// command (a network-requested modification, TS 23.502 §4.3.3.2 step 3b). A
-    /// retransmission resends it with the command, so a lost first transfer still
-    /// reaches the NG-RAN. `None` for an N1-only procedure.
+    /// command (a network-requested modification, TS 23.502 §4.3.3.2 step 3b; #1430,
+    /// a release, §4.3.4.2 steps 3a/3b). A retransmission resends it with the
+    /// command, so a lost first transfer still reaches the NG-RAN. `None` for an
+    /// N1-only procedure.
     n2: Option<GsmN2>,
     attempts: u32,
     deadline: std::time::Instant,
 }
 
-/// The N2 part of a 5GSM command's transfer (#1409): the
-/// PDUSessionResourceModifyRequestTransfer bytes, sent again verbatim, and the
-/// 5QI and ARP given to the AMF for paging (TS 29.518 §6.1.6.2.18).
+/// The N2 part of a 5GSM command's transfer (#1409): the N2 SM information bytes,
+/// sent again verbatim, the NGAP IE type they are (#1430), and the 5QI and ARP given
+/// to the AMF for paging (TS 29.518 §6.1.6.2.18).
 #[derive(Debug, Clone)]
 struct GsmN2 {
     transfer: Vec<u8>,
+    /// What `transfer` is, and so the `ngapIeType` its retransmission carries.
+    kind: GsmN2Kind,
     paged: Option<(u16, n2_transfer::Arp)>,
     /// A QoS Monitoring Request (#1390): its retransmissions go through the
     /// session's `qos_mon` RAN-leg owner, so none can overtake a later request
     /// (#1390 review round 4).
     qos_monitoring: bool,
+}
+
+/// The N2 SM information a 5GSM command went out with (TS 29.518 §6.1.6.3.x
+/// `NgapIeType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GsmN2Kind {
+    /// PDUSessionResourceModifyRequestTransfer, `PDU_RES_MOD_REQ`, with a PDU
+    /// SESSION MODIFICATION COMMAND (T3591).
+    ModifyRequest,
+    /// PDUSessionResourceReleaseCommandTransfer, `PDU_RES_REL_CMD`, with a PDU
+    /// SESSION RELEASE COMMAND (T3592, #1430).
+    ReleaseCommand,
+}
+
+impl GsmN2 {
+    /// The N2 Resource Release request a PDU SESSION RELEASE COMMAND went out with
+    /// (TS 23.502 §4.3.4.2 steps 3a/3b, #1430).
+    fn release(transfer: Vec<u8>) -> Self {
+        Self {
+            transfer,
+            kind: GsmN2Kind::ReleaseCommand,
+            paged: None,
+            qos_monitoring: false,
+        }
+    }
 }
 
 /// Armed 5GSM procedure timers, keyed by SM context reference.
@@ -6700,6 +6804,22 @@ fn arm_gsm_timer_with_n2(
         );
     }
 }
+
+/// Whether `timer_id` is the 5GSM timer armed for `sm_context_ref` (#1471).
+fn gsm_timer_armed(sm_context_ref: &str, timer_id: timer::SmfTimerId) -> bool {
+    gsm_procedure_timers()
+        .lock()
+        .map(|t| {
+            t.get(sm_context_ref)
+                .is_some_and(|e| e.timer_id == timer_id)
+        })
+        .unwrap_or(false)
+}
+
+/// PTI values (TS 24.007 §11.2.3.1a, TS 24.501 §9.6): 0 is "no procedure
+/// transaction identity assigned", 255 is reserved.
+const PTI_UNASSIGNED: u8 = 0;
+const PTI_RESERVED: u8 = 0xFF;
 
 /// Stop the armed timer for `sm_context_ref` when it matches `timer_id`.
 ///
@@ -7997,13 +8117,16 @@ pub(crate) async fn release_for_reactivation(
             ctx.sess_update(&sess);
         }
     }
-    arm_gsm_timer(
+    // #1430: armed with the N2 it goes out with, so a T3592 retransmission carries
+    // the same PDU_RES_REL_CMD (TS 23.502 §4.3.4.2 step 3b).
+    arm_gsm_timer_with_n2(
         sm_context_ref,
         timer::SmfTimerId::T3592,
         &n1_cmd,
         supi,
         psi,
         Some(amf_uri),
+        Some(GsmN2::release(n2.clone())),
     );
     send_n1_n2_release_transfer(amf_uri, supi, psi, &n1_cmd, &n2).await;
 }
@@ -8107,7 +8230,19 @@ async fn run_gsm_timer_tick() {
                     // #1409, TS 23.502 §4.3.3.2 step 3b: a command that went out with
                     // N2 SM information goes out with it again. Resent N1-only, a lost
                     // first transfer left the NG-RAN on the old Session-AMBR and QoS.
+                    // #1430, §4.3.4.2 step 3b: and a release command that went out
+                    // with the N2 Resource Release request goes out with it again.
                     match (&entry.n2, entry.amf_uri.as_deref()) {
+                        (Some(n2), Some(amf_uri)) if n2.kind == GsmN2Kind::ReleaseCommand => {
+                            send_n1_n2_release_transfer(
+                                amf_uri,
+                                &entry.supi,
+                                entry.psi,
+                                &entry.command,
+                                &n2.transfer,
+                            )
+                            .await;
+                        }
                         (Some(n2), Some(amf_uri)) => {
                             send_n1_n2_modify_transfer(
                                 amf_uri,
@@ -9159,6 +9294,13 @@ enum N1SmIntent {
     ReleaseComplete,
     /// 5GSM STATUS (§6.5): the UE reports an error condition.
     Status { cause: Option<u8> },
+    /// PDU SESSION AUTHENTICATION COMPLETE (§6.3.1) or SERVICE-LEVEL
+    /// AUTHENTICATION COMPLETE (§6.4.3): the answer to a command this SMF never
+    /// sends, as it runs neither procedure (#1471).
+    AuthenticationComplete { psi: u8, pti: u8, message_type: u8 },
+    /// REMOTE UE REPORT (§6.6.2): a 5G ProSe UE-to-network relay UE reports its
+    /// remote UEs (#1471).
+    RemoteUeReport { psi: u8, pti: u8 },
     /// A 5GSM message this SMF does not act on at this point in the session.
     Unhandled { message_type: u8 },
 }
@@ -9192,6 +9334,18 @@ fn classify_n1_sm_message(n1: &[u8]) -> Option<N1SmIntent> {
         }
         gsm_build::message_type::PDU_SESSION_RELEASE_COMPLETE => N1SmIntent::ReleaseComplete,
         gsm_build::message_type::GSM_STATUS => N1SmIntent::Status { cause },
+        message_type @ (gsm_build::message_type::PDU_SESSION_AUTHENTICATION_COMPLETE
+        | gsm_build::message_type::SERVICE_LEVEL_AUTHENTICATION_COMPLETE) => {
+            N1SmIntent::AuthenticationComplete {
+                psi: hdr.psi,
+                pti: hdr.pti,
+                message_type,
+            }
+        }
+        gsm_build::message_type::REMOTE_UE_REPORT => N1SmIntent::RemoteUeReport {
+            psi: hdr.psi,
+            pti: hdr.pti,
+        },
         other => N1SmIntent::Unhandled {
             message_type: other,
         },
@@ -9244,14 +9398,17 @@ async fn handle_n1_sm_message(sm_context_ref: &str, n1: &[u8]) -> SbiResponse {
             // session (cause 65), and that reconciliation completes the whole release;
             // a T3592 for a context that is gone would only retransmit and abandon
             // nothing.
+            // #1430: the N2 Resource Release request goes out with the command
+            // (TS 23.502 §4.3.4.2 step 3a), so a T3592 retransmission carries it too.
             if lookup_policy_binding(sm_context_ref).is_some() {
-                arm_gsm_timer(
+                arm_gsm_timer_with_n2(
                     sm_context_ref,
                     timer::SmfTimerId::T3592,
                     &n1_cmd,
                     &binding.supi,
                     psi,
                     amf_uri.as_deref(),
+                    Some(GsmN2::release(n2_cmd.clone())),
                 );
             }
             sbi_response_with_n1_n2(
@@ -9315,6 +9472,69 @@ async fn handle_n1_sm_message(sm_context_ref: &str, n1: &[u8]) -> SbiResponse {
         N1SmIntent::Status { cause } => {
             log::warn!("5GSM STATUS from UE for ref={sm_context_ref}: cause={cause:?}");
             SbiResponse::with_status(204)
+        }
+
+        // #1471. This SMF sends no PDU SESSION AUTHENTICATION COMMAND and no
+        // SERVICE-LEVEL AUTHENTICATION COMMAND, so it implements neither COMPLETE.
+        // - TS 24.501 §7.3.1 d): a reserved PTI is ignored.
+        // - §7.3.1 b): an assigned PTI is answered 5GSM STATUS #81 "invalid PTI
+        //   value".
+        // - §7.4 otherwise: a message type "not implemented by the receiver" is
+        //   ignored, "except that it should return a status message ... with cause
+        //   #97".
+        N1SmIntent::AuthenticationComplete {
+            psi,
+            pti,
+            message_type,
+        } => {
+            if pti == PTI_RESERVED {
+                log::warn!(
+                    "ref={sm_context_ref}: 5GSM {message_type:#04x} with the reserved PTI \
+                     ignored (TS 24.501 §7.3.1 d))"
+                );
+                return SbiResponse::with_status(204);
+            }
+            let cause = if pti == PTI_UNASSIGNED {
+                policy::gsm_cause::MESSAGE_TYPE_NON_EXISTENT_OR_NOT_IMPLEMENTED
+            } else {
+                policy::gsm_cause::INVALID_PTI_VALUE
+            };
+            log::warn!(
+                "ref={sm_context_ref}: 5GSM {message_type:#04x} (PTI={pti}) for an \
+                 authentication this SMF never started; answering 5GSM STATUS #{cause}"
+            );
+            let status = policy::build_gsm_status(psi, pti, cause);
+            sbi_response_with_n1(200, serde_json::json!({}), &status)
+        }
+
+        // #1471, TS 24.501 §6.6.2.3: "Upon receipt of the REMOTE UE REPORT message,
+        // the SMF shall send a REMOTE UE REPORT RESPONSE message to the UE. The SMF
+        // shall include the PTI from the REMOTE UE REPORT message." It carries no EAP
+        // message, as no DN EAP exchange runs. §6.6.2.5 a): during a
+        // network-requested release of the session (T3592 armed) the report is
+        // aborted, and the release proceeds.
+        N1SmIntent::RemoteUeReport { psi, pti } => {
+            if pti == PTI_RESERVED {
+                log::warn!(
+                    "ref={sm_context_ref}: REMOTE UE REPORT with the reserved PTI ignored \
+                     (TS 24.501 §7.3.1 d))"
+                );
+                return SbiResponse::with_status(204);
+            }
+            if gsm_timer_armed(sm_context_ref, timer::SmfTimerId::T3592) {
+                log::info!(
+                    "ref={sm_context_ref}: REMOTE UE REPORT (PTI={pti}) during the \
+                     network-requested release; the report is aborted (TS 24.501 \
+                     §6.6.2.5 a))"
+                );
+                return SbiResponse::with_status(204);
+            }
+            log::info!(
+                "ref={sm_context_ref}: REMOTE UE REPORT (PSI={psi}, PTI={pti}); answering \
+                 REMOTE UE REPORT RESPONSE"
+            );
+            let response = policy::build_remote_ue_report_response(psi, pti);
+            sbi_response_with_n1(200, serde_json::json!({}), &response)
         }
 
         N1SmIntent::Unhandled { message_type } => {
@@ -10229,6 +10449,7 @@ pub(crate) async fn signal_qos_monitoring(
         Some(&amf_uri),
         Some(GsmN2 {
             transfer: n2.clone(),
+            kind: GsmN2Kind::ModifyRequest,
             paged,
             qos_monitoring: true,
         }),
@@ -10472,6 +10693,7 @@ fn signal_policy_change(sm_context_ref: &str, before: &context::PolicyBinding) {
         Some(&amf_uri),
         Some(GsmN2 {
             transfer: n2.clone(),
+            kind: GsmN2Kind::ModifyRequest,
             paged,
             qos_monitoring: false,
         }),
@@ -10590,6 +10812,19 @@ async fn send_n1_n2_modify_transfer(
     }
 }
 
+/// The session-rule decision `binding` enforces, onto which a PCF delta (an
+/// UpdateNotify, #1387, or an Update response, #1399; TS 29.512 §4.2.6.1) is merged.
+fn enforced_policy_decision(binding: &context::PolicyBinding) -> policy::PolicyDecision {
+    policy::PolicyDecision {
+        sm_policy_id: binding.sm_policy_id.clone().unwrap_or_default(),
+        sess_ambr_ul_bps: binding.ambr_ul_bps,
+        sess_ambr_dl_bps: binding.ambr_dl_bps,
+        def_five_qi: binding.five_qi,
+        arp_priority_level: binding.arp_priority_level,
+        ..policy::PolicyDecision::config_default()
+    }
+}
+
 /// Handle SM Policy Update Notification (from PCF, TS 29.512 §4.2.3.2):
 /// the SmPolicyNotification carries an SmPolicyDecision whose authorized
 /// session AMBR / default QoS is applied to the session's N4 QER.
@@ -10629,18 +10864,9 @@ async fn handle_sm_policy_notify(sm_context_ref: &str, request: &SbiRequest) -> 
         return SbiResponse::with_status(204);
     }
 
-    let pol_id = binding.sm_policy_id.clone().unwrap_or_default();
     // #1387: a delta over what the session ENFORCES (TS 29.512 §4.2.6.1), not a
     // replacement built from the config default -- see `merge_sm_policy_decision`.
-    let current = policy::PolicyDecision {
-        sm_policy_id: pol_id,
-        sess_ambr_ul_bps: binding.ambr_ul_bps,
-        sess_ambr_dl_bps: binding.ambr_dl_bps,
-        def_five_qi: binding.five_qi,
-        arp_priority_level: binding.arp_priority_level,
-        ..policy::PolicyDecision::config_default()
-    };
-    let dec = policy::merge_sm_policy_decision(current, decision_json);
+    let dec = policy::merge_sm_policy_decision(enforced_policy_decision(&binding), decision_json);
 
     log::info!(
         "Applying PCF-updated policy to ref={sm_context_ref}: AMBR UL/DL={}/{} bps, 5QI={}",
@@ -10800,9 +11026,9 @@ fn restore_pcscf(sm_context_ref: &str, binding: &context::PolicyBinding) -> bool
 /// The notification's role is to say *when*, and for which resource.
 ///
 /// **With a PCF configured this SMF does not apply the change itself — it REPORTS it
-/// to the PCF** (#310, TS 29.512 §4.2.4, `SE_AMBR_CH`). TS 23.503 §6.1.3.2 makes the
-/// PCF the authority on session-AMBR and default QoS, and the subscribed value is one
-/// of its INPUTS, so applying a subscription-driven override behind its back would
+/// to the PCF** (#310, TS 29.512 §4.2.4.4, `SE_AMBR_CH`). TS 29.512 §4.2.2.5 /
+/// §4.2.3.5 make the PCF the authority on session-AMBR and default QoS, and the
+/// subscribed value is one of its INPUTS, so applying a subscription-driven override behind its back would
 /// leave the SMF enforcing something the PCF never authorised. But the PCF cannot
 /// learn of the change on its own: `SmPolicyDnnData`, the UDR's policy-data resource,
 /// carries no session-AMBR (TS 29.519 §5.6.2), and `SmPolicyContextData.subsSessAmbr`
@@ -10900,6 +11126,7 @@ async fn handle_sdm_notification(sm_context_ref: &str, request: &SbiRequest) -> 
     // raised above what the PCF authorised is reported (its input changed, and the PCF
     // may now authorise more) and the PCF is free to answer with the same decision.
     // That judgement is the PCF's to make, which is the whole point of reporting.
+    let mut answer = None;
     if let Some(sm_policy_id) = binding.sm_policy_id.clone() {
         let Some(pcf) = policy::resolve_pcf_endpoint().await else {
             // A session with an sm_policy_id and no resolvable PCF: the PCF this
@@ -10917,13 +11144,13 @@ async fn handle_sdm_notification(sm_context_ref: &str, request: &SbiRequest) -> 
         log::info!(
             "[{}] SM data changed for PCF-authorised ref={sm_context_ref}: reporting \
              SE_AMBR_CH to the PCF (smPolicyId={sm_policy_id}) with subsSessAmbr \
-             UL/DL {:?}/{:?} bps — TS 23.503 §6.1.3.2 makes the PCF the authority and \
-             the subscribed value one of ITS inputs (TS 29.512 §4.2.4)",
+             UL/DL {:?}/{:?} bps — TS 29.512 §4.2.2.5 makes the PCF the authority and \
+             the subscribed value one of ITS inputs (TS 29.512 §4.2.4.4)",
             binding.supi,
             subscribed.sess_ambr_ul_bps,
             subscribed.sess_ambr_dl_bps
         );
-        decision = match policy::sm_policy_update(
+        answer = match policy::sm_policy_update(
             &pcf,
             &sm_policy_id,
             &["SE_AMBR_CH"],
@@ -10932,7 +11159,7 @@ async fn handle_sdm_notification(sm_context_ref: &str, request: &SbiRequest) -> 
         )
         .await
         {
-            Ok(authorised) => authorised,
+            Ok(json) => Some(json),
             Err(e) => {
                 // 204, not 5xx: the notification WAS understood, and a retry would
                 // re-drive a leg whose failure the UDM cannot see. Nothing was
@@ -10949,17 +11176,6 @@ async fn handle_sdm_notification(sm_context_ref: &str, request: &SbiRequest) -> 
                 return SbiResponse::with_status(204);
             }
         };
-        log::info!(
-            "[{}] PCF re-authorised ref={sm_context_ref}: AMBR UL/DL {}/{} -> {}/{} bps, \
-             5QI {} -> {}",
-            binding.supi,
-            binding.ambr_ul_bps,
-            binding.ambr_dl_bps,
-            decision.sess_ambr_ul_bps,
-            decision.sess_ambr_dl_bps,
-            binding.five_qi,
-            decision.def_five_qi
-        );
     } else {
         log::info!(
             "[{}] applying changed SM data to ref={sm_context_ref}: AMBR UL/DL {}/{} -> \
@@ -10979,6 +11195,26 @@ async fn handle_sdm_notification(sm_context_ref: &str, request: &SbiRequest) -> 
     // a PCF that notifies this session while answering the SE_AMBR_CH update would
     // otherwise wait on a lock held across its own answer.
     let _applying = SmContextLock::acquire(policy_apply_locks(), sm_context_ref).await;
+
+    // #1399: the PCF's answer is a delta (TS 29.512 §4.2.6.1): what it omits keeps the
+    // value the session enforces, read under the lock, so an UpdateNotify applied while
+    // the update was in flight is the base. Before, it was parsed from the config
+    // default, and an answer with no `sessRules` reset the Session-AMBR and 5QI.
+    if let Some(json) = answer {
+        let enforced = lookup_policy_binding(sm_context_ref).unwrap_or_else(|| binding.clone());
+        decision = policy::merge_sm_policy_decision(enforced_policy_decision(&enforced), &json);
+        log::info!(
+            "[{}] PCF re-authorised ref={sm_context_ref}: AMBR UL/DL {}/{} -> {}/{} bps, \
+             5QI {} -> {}",
+            binding.supi,
+            enforced.ambr_ul_bps,
+            enforced.ambr_dl_bps,
+            decision.sess_ambr_ul_bps,
+            decision.sess_ambr_dl_bps,
+            enforced.five_qi,
+            decision.def_five_qi
+        );
+    }
 
     // The N4 QER, through the SAME function the PCF-update path uses: a second way to
     // change a live session's QoS is a second thing to keep correct, and #293 asks
@@ -12405,6 +12641,9 @@ mod tests {
             upf_b.local_addr().unwrap(),
             [127, 0, 0, 1],
         ));
+        // #1509: an associated UPF; a report from one that is not is cause 72.
+        a.set_assoc_state_for_test(true, None, None).await;
+        b.set_assoc_state_for_test(true, None, None).await;
         pfcp_path::set_global_pool(vec![a.clone(), b.clone()]);
         let listener = spawn_pfcp_listener(sock, vec![a.clone(), b.clone()]);
         let reference = "9740104";
@@ -12464,6 +12703,9 @@ mod tests {
             upf_b.local_addr().unwrap(),
             [127, 0, 0, 1],
         ));
+        // #1509: an associated UPF; a report from one that is not is cause 72.
+        a.set_assoc_state_for_test(true, None, None).await;
+        b.set_assoc_state_for_test(true, None, None).await;
         pfcp_path::set_global_pool(vec![a.clone(), b.clone()]);
         let listener = spawn_pfcp_listener(sock, vec![a.clone(), b.clone()]);
         // Restored: in the session table, its UPF known only by identity.
@@ -12635,6 +12877,9 @@ mod tests {
             upf_b.local_addr().unwrap(),
             [127, 0, 0, 1],
         ));
+        // #1509: an associated UPF; a report from one that is not is cause 72.
+        a.set_assoc_state_for_test(true, None, None).await;
+        b.set_assoc_state_for_test(true, None, None).await;
         pfcp_path::set_global_pool(vec![a.clone(), b.clone()]);
         let listener = spawn_pfcp_listener(sock, vec![a.clone(), b.clone()]);
         // Restored: in the session table, with no recorded UPF.
@@ -12700,6 +12945,8 @@ mod tests {
             [127, 0, 0, 1],
         ));
         a.set_node_addresses_for_test(vec!["127.0.0.4".parse().unwrap()]);
+        // #1509: an associated UPF; a report from one that is not is cause 72.
+        a.set_assoc_state_for_test(true, None, None).await;
         pfcp_path::set_global_pool(vec![a.clone()]);
         let listener = spawn_pfcp_listener(sock, vec![a.clone()]);
         let reference = "9740103";
@@ -12728,6 +12975,123 @@ mod tests {
         pfcp_path::clear_global_upf_for_test();
 
         assert_eq!(pfcp_cause_of(&answer.expect("answered")), Some(1));
+    }
+
+    /// #1509, TS 29.244 §5.8.3 / §8.2.1 cause 72: a heartbeat loss marks the UPF down
+    /// and keeps its sessions; a Session Report from it for one of them is refused with
+    /// "No established PFCP Association", SEID 0, and nothing in it is processed (its
+    /// TSC Management Information is not recorded). Once the UPF is associated again,
+    /// the same report is accepted and recorded.
+    ///
+    /// REVERT-VERIFIED: without the association check in
+    /// `handle_pfcp_session_report_from`, the report while down is accepted (cause 1)
+    /// and its TSC report recorded.
+    #[tokio::test]
+    async fn a_session_report_from_a_upf_marked_down_is_refused_1509() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        pfcp_path::clear_tsc_reports_for_test();
+        smf_context_init(64, 256, 512);
+        let (client, upf) = pfcp_path::stand_in::client_with_silent_peer_timed(
+            std::time::Duration::from_millis(50),
+            1,
+        )
+        .await;
+        client.set_assoc_state_for_test(true, None, None).await;
+        pfcp_path::set_global_pool(vec![client.clone()]);
+        let upf_addr = upf.local_addr().unwrap();
+        let smf_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let reference = "15090001";
+        smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .write()
+            .unwrap()
+            .insert(reference.to_string(), 0x1509);
+        let seid = crate::context::derive_cp_n4_seid(reference);
+        // Report Type TMIR plus one TSC Management Information IE (201).
+        let report = |seq: u32| {
+            let mut tsc = bytes::BytesMut::new();
+            nextgcore_pfcp::types::TscManagementInformation::port(vec![0x15, 0x09], 7)
+                .encode(&mut tsc);
+            let mut body = vec![0, 39, 0, 1, 0x10, 0, 201];
+            body.extend_from_slice(&(tsc.len() as u16).to_be_bytes());
+            body.extend_from_slice(&tsc);
+            pfcp_path::encode_wire_message(
+                pfcp_path::pfcp_message_type::SESSION_REPORT_REQUEST,
+                Some(seid),
+                seq,
+                &body,
+            )
+        };
+        // The next Session Report Response the UPF receives, past its Heartbeat
+        // Requests.
+        let response = || async {
+            let mut buf = vec![0u8; 2048];
+            loop {
+                let (n, _) = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    upf.recv_from(&mut buf),
+                )
+                .await
+                .expect("a Session Report Response")
+                .unwrap();
+                let h = pfcp_path::parse_wire_header(&buf[..n]).unwrap();
+                if h.msg_type == pfcp_path::pfcp_message_type::SESSION_REPORT_RESPONSE {
+                    return (h, buf[..n].to_vec());
+                }
+            }
+        };
+
+        // Heartbeat loss: the silent peer exhausts T1 x (N1 + 1) and the UPF is down.
+        let heartbeat = client.heartbeat_once().await;
+        let down = !client.is_associated().await;
+        let retained = pfcp_path::holds_session_seid(seid);
+        handle_pfcp_session_report_from(&smf_sock, &report(0x1509), upf_addr, Some(&client)).await;
+        let (h_down, while_down) = response().await;
+        let recorded_while_down = pfcp_path::tsc_reports_for(seid);
+
+        // Associated again: the same report is the UPF's to make.
+        client.set_assoc_state_for_test(true, None, None).await;
+        handle_pfcp_session_report_from(&smf_sock, &report(0x150a), upf_addr, Some(&client)).await;
+        let (h_up, after) = response().await;
+        let recorded_after = pfcp_path::tsc_reports_for(seid);
+
+        smf_self()
+            .read()
+            .unwrap()
+            .pfcp_sessions
+            .write()
+            .unwrap()
+            .remove(reference);
+        pfcp_path::clear_global_upf_for_test();
+        pfcp_path::clear_tsc_reports_for_test();
+
+        assert!(heartbeat.is_err(), "the silent peer exhausts the heartbeat");
+        assert!(down, "the heartbeat loss marks the UPF down");
+        assert!(retained, "and the SMF keeps the UPF's session");
+        assert_eq!(
+            pfcp_cause_of(&while_down),
+            Some(72),
+            "No established PFCP Association"
+        );
+        assert_eq!(h_down.sequence_number, 0x1509);
+        assert!(h_down.seid_present);
+        assert_eq!(h_down.seid, 0, "SEID 0 in the refusal");
+        assert!(
+            recorded_while_down.is_none(),
+            "nothing in the refused report is processed: {recorded_while_down:?}"
+        );
+        assert_eq!(pfcp_cause_of(&after), Some(1), "accepted once associated");
+        assert_eq!(h_up.sequence_number, 0x150a);
+        let recorded = recorded_after.expect("the accepted report is processed");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].nw_tt_port_number, Some(7));
+        assert_eq!(
+            recorded[0].port_management_container.as_deref(),
+            Some(&[0x15, 0x09][..])
+        );
     }
 
     /// #971: a UPF reports only on its own sessions. A report for a session recorded
@@ -14278,11 +14642,9 @@ mod tests {
             .unwrap()
             .insert(reference.to_string(), 0x0BAD_F00D);
         let seid = crate::context::derive_cp_n4_seid(reference);
-        pfcp_path::set_global_pool(vec![std::sync::Arc::new(pfcp_path::PfcpClient::new(
-            sock.clone(),
-            peer_addr,
-            [127, 0, 0, 1],
-        ))]);
+        pfcp_path::set_global_pool(vec![
+            pfcp_path::PfcpClient::associated_for_test(sock.clone(), peer_addr).await,
+        ]);
 
         // Body: Report Type with TMIR (bit 5 => 0x10) plus one IE 201 carrying a
         // PMIC and its NW-TT port. Hand-built, so the test does not depend on the
@@ -16422,7 +16784,7 @@ mod tests {
     /// default 5QI to a LIVE session, read back off the session and the binding.
     ///
     /// Also the PCF-precedence half (criterion 5): the same notification against a
-    /// session a PCF authorised changes nothing, because TS 23.503 §6.1.3.2 makes the
+    /// session a PCF authorised changes nothing, because TS 29.512 §4.2.2.5 makes the
     /// PCF the authority and the subscription is one of its inputs.
     #[tokio::test]
     async fn a_sdm_notification_applies_the_changed_ambr_to_a_live_session() {
@@ -16503,7 +16865,7 @@ mod tests {
         // ---- PCF precedence (#293 criterion 5, as #310 left it) ----
         //
         // A PCF-authorised session is STILL not re-derived from the subscription — the
-        // PCF is the authority (TS 23.503 §6.1.3.2). What #310 changed is that the
+        // PCF is the authority (TS 29.512 §4.2.2.5). What #310 changed is that the
         // change is now REPORTED to the PCF instead of dropped; the SMF applies the
         // PCF's answer, never the subscription. Here the PCF is unreachable (port 1),
         // so there is no answer and the session keeps what the PCF last authorised —
@@ -16531,7 +16893,7 @@ mod tests {
             (after.ambr_ul_bps, after.ambr_dl_bps, after.five_qi),
             (before.ambr_ul_bps, before.ambr_dl_bps, before.five_qi),
             "a PCF-authorised session must not be re-derived from the subscription: \
-             TS 23.503 §6.1.3.2 makes the PCF the authority, and the subscription is \
+             TS 29.512 §4.2.2.5 makes the PCF the authority, and the subscription is \
              one of ITS inputs. With the PCF unreachable the session keeps the QoS the \
              PCF last authorised (40/80 Mbps would be the SUBSCRIBED value leaking in)"
         );
@@ -20832,6 +21194,32 @@ mod tests {
         nextgcore_sbi::server::SbiServer,
         std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
     ) {
+        spawn_recording_pcf_with(answer.map(|(ul, dl)| {
+            serde_json::json!({
+                "sessRules": {
+                    "SessRule-310": {
+                        "sessRuleId": "SessRule-310",
+                        "authSessAmbr": {
+                            "uplink": policy::format_bitrate(ul),
+                            "downlink": policy::format_bitrate(dl),
+                        },
+                        "authDefQos": { "5qi": 6, "arp": { "priorityLevel": 8 } },
+                    }
+                },
+                "pccRules": {}, "qosDecs": {}, "chgDecs": {}, "traffContDecs": {},
+            })
+        }))
+        .await
+    }
+
+    /// [`spawn_recording_pcf`] answering every `/update` with the `SmPolicyDecision`
+    /// `answer` as it stands, or with a status (#1399).
+    async fn spawn_recording_pcf_with(
+        answer: Result<serde_json::Value, u16>,
+    ) -> (
+        nextgcore_sbi::server::SbiServer,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+    ) {
         use nextgcore_sbi::message::SbiResponse;
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
 
@@ -20846,6 +21234,7 @@ mod tests {
         );
         pcf.start(move |req: SbiRequest| {
             let sink = sink.clone();
+            let answer = answer.clone();
             async move {
                 let body: serde_json::Value = req
                     .http
@@ -20858,20 +21247,8 @@ mod tests {
                     .push((req.header.uri.clone(), body));
                 match answer {
                     Err(status) => SbiResponse::with_status(status),
-                    Ok((ul, dl)) => SbiResponse::with_status(200)
-                        .with_json_body(&serde_json::json!({
-                            "sessRules": {
-                                "SessRule-310": {
-                                    "sessRuleId": "SessRule-310",
-                                    "authSessAmbr": {
-                                        "uplink": policy::format_bitrate(ul),
-                                        "downlink": policy::format_bitrate(dl),
-                                    },
-                                    "authDefQos": { "5qi": 6, "arp": { "priorityLevel": 8 } },
-                                }
-                            },
-                            "pccRules": {}, "qosDecs": {}, "chgDecs": {}, "traffContDecs": {},
-                        }))
+                    Ok(decision) => SbiResponse::with_status(200)
+                        .with_json_body(&decision)
                         .unwrap_or_else(|_| SbiResponse::with_status(200)),
                 }
             }
@@ -21062,6 +21439,428 @@ mod tests {
         std::env::remove_var("UDM_SBI_PORT");
         pcf_srv.stop().await.expect("stop");
         udm_srv.stop().await.expect("stop");
+    }
+
+    /// The PCF-authorised values a #1399 session enforces before its update: 30/70
+    /// Mbps, 5QI 7, all different from the config default (100/100, 5QI 9) and from
+    /// the subscription the UDM reports (40/80, 5QI 6).
+    fn seed_authorised_1399(supi: &str, psi: u8, sm_policy_id: &str) -> String {
+        let sm_context_ref = seed_pcf_authorised(supi, psi, sm_policy_id);
+        if let Ok(ctx) = smf_self().read() {
+            if let Ok(mut bindings) = ctx.policy_bindings.write() {
+                if let Some(b) = bindings.get_mut(&sm_context_ref) {
+                    b.ambr_ul_bps = 30_000_000;
+                    b.ambr_dl_bps = 70_000_000;
+                    b.five_qi = 7;
+                }
+            }
+        }
+        sm_context_ref
+    }
+
+    /// #1399, TS 29.512 §4.2.6.1 (the Update answer "shall contain a description of
+    /// the changes"), the SE_AMBR_CH leg: a PCF answer with no `sessRules` leaves the
+    /// Session-AMBR and the 5QI the session enforces; one with only a changed
+    /// `authSessAmbr` changes the AMBR and keeps the 5QI.
+    ///
+    /// REVERT-VERIFIED: with the answer parsed from the config default again
+    /// (`parse_sm_policy_decision`), the first answer resets the binding to 100/100,
+    /// 5QI 9, and the second keeps 5QI 9.
+    #[tokio::test]
+    async fn an_se_ambr_ch_answer_is_a_delta_over_what_the_session_enforces_1399() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (udm_srv, _seen) = spawn_recording_udm(sm_data_with("40 Mbps", "80 Mbps", 6)).await;
+        udm::set_for_test(true);
+        smf_context_init(64, 256, 512);
+        let enforced = |r: &str| {
+            let b = lookup_policy_binding(r).expect("binding");
+            let s = smf_self()
+                .read()
+                .expect("context")
+                .sess_find_by_sm_context_ref(r)
+                .expect("session");
+            (
+                b.ambr_ul_bps,
+                b.ambr_dl_bps,
+                b.five_qi,
+                s.session_ambr.uplink,
+                s.session_ambr.downlink,
+            )
+        };
+
+        // ---- the PCF changed nothing session-level ----
+        let (pcf_srv, pcf_seen) =
+            spawn_recording_pcf_with(Ok(serde_json::json!({ "pccRules": {} }))).await;
+        let supi = "imsi-001010000001399";
+        let unchanged = seed_authorised_1399(supi, 22, "pol-1399");
+        assert_eq!(
+            smf_sbi_request_handler(sdm_notify(&unchanged, supi))
+                .await
+                .status,
+            204
+        );
+        let reported = pcf_seen.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let after_empty = enforced(&unchanged);
+        pcf_srv.stop().await.expect("stop");
+
+        // ---- the PCF changed only the Session-AMBR ----
+        let (pcf_srv, _) = spawn_recording_pcf_with(Ok(serde_json::json!({
+            "sessRules": { "SessRule-1399": {
+                "authSessAmbr": { "uplink": "50 Mbps", "downlink": "90 Mbps" },
+            }}
+        })))
+        .await;
+        let supi2 = "imsi-001010000001398";
+        let changed = seed_authorised_1399(supi2, 23, "pol-1398");
+        assert_eq!(
+            smf_sbi_request_handler(sdm_notify(&changed, supi2))
+                .await
+                .status,
+            204
+        );
+        let after_ambr = enforced(&changed);
+
+        std::env::remove_var("PCF_URI");
+        udm::set_for_test(false);
+        std::env::remove_var("UDM_SBI_ADDR");
+        std::env::remove_var("UDM_SBI_PORT");
+        pcf_srv.stop().await.expect("stop");
+        udm_srv.stop().await.expect("stop");
+
+        assert_eq!(reported, 1, "the change was reported");
+        assert_eq!(
+            after_empty,
+            (30_000_000, 70_000_000, 7, 30_000_000, 70_000_000),
+            "an answer with no sessRules keeps the authorised AMBR and 5QI"
+        );
+        assert_eq!(
+            after_ambr,
+            (50_000_000, 90_000_000, 7, 50_000_000, 90_000_000),
+            "a changed authSessAmbr is applied; the 5QI it omits is kept"
+        );
+    }
+
+    /// The Session-AMBR (DL, UL) in bps a PDU SESSION MODIFICATION COMMAND carries in
+    /// its IE 0x2A (TS 24.501 §9.11.4.14), for the units these tests use (Mbps).
+    fn command_ambr_1399(n1: &[u8]) -> (u64, u64) {
+        assert_eq!(
+            n1[3],
+            gsm_build::message_type::PDU_SESSION_MODIFICATION_COMMAND
+        );
+        assert_eq!(&n1[4..6], &[0x2A, 6], "the Session-AMBR IE: {n1:?}");
+        assert_eq!((n1[6], n1[9]), (0x06, 0x06), "in Mbps: {n1:?}");
+        let mbps = |hi: u8, lo: u8| u64::from(u16::from_be_bytes([hi, lo])) * 1_000_000;
+        (mbps(n1[7], n1[8]), mbps(n1[10], n1[11]))
+    }
+
+    /// #1399, the UE-requested modification leg (RES_MO_RE, TS 29.512 §4.2.4.17): a
+    /// PCF answer with no `sessRules` authorises the Session-AMBR the session already
+    /// enforces, so the MODIFICATION COMMAND carries 70/30 Mbps, not the config
+    /// default; one with a changed `authSessAmbr` carries the new value.
+    ///
+    /// REVERT-VERIFIED: with the answer parsed from the config default again, the
+    /// command carries 100/100.
+    #[tokio::test]
+    async fn a_res_mo_re_answer_is_a_delta_over_what_the_session_enforces_1399() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let modify = |r: &str, psi: u8| {
+            SbiRequest::post(format!("/nsmf-pdusession/v1/sm-contexts/{r}/modify"))
+                .with_body(
+                    serde_json::json!({
+                        "n2SmInfoType": "PDU_RES_MOD_REQ",
+                        "n1SmMsg": { "contentId": "n1SmMsg" },
+                    })
+                    .to_string(),
+                    "application/json",
+                )
+                .with_part(nextgcore_sbi::message::SbiPart::with_content(
+                    "n1SmMsg",
+                    nextgcore_sbi::constants::content_type::APPLICATION_5GNAS,
+                    bytes::Bytes::from(n1(
+                        psi,
+                        5,
+                        gsm_build::message_type::PDU_SESSION_MODIFICATION_REQUEST,
+                        &[],
+                    )),
+                ))
+        };
+        let command = |resp: &SbiResponse| {
+            resp.http
+                .parts
+                .iter()
+                .find(|p| p.content_id.as_deref() == Some("n1SmMsg"))
+                .map(|p| p.data.to_vec())
+                .expect("the MODIFICATION COMMAND")
+        };
+
+        // ---- the PCF changed nothing session-level ----
+        let (pcf_srv, pcf_seen) =
+            spawn_recording_pcf_with(Ok(serde_json::json!({ "pccRules": {} }))).await;
+        let unchanged = seed_authorised_1399("imsi-001010000001397", 24, "pol-1397");
+        let resp = handle_sm_context_update(&unchanged, &modify(&unchanged, 24)).await;
+        let status_empty = resp.status;
+        let ambr_empty = command_ambr_1399(&command(&resp));
+        let reported = pcf_seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        pcf_srv.stop().await.expect("stop");
+
+        // ---- the PCF changed the Session-AMBR ----
+        let (pcf_srv, _) = spawn_recording_pcf_with(Ok(serde_json::json!({
+            "sessRules": { "SessRule-1399": {
+                "authSessAmbr": { "uplink": "50 Mbps", "downlink": "90 Mbps" },
+            }}
+        })))
+        .await;
+        let changed = seed_authorised_1399("imsi-001010000001396", 25, "pol-1396");
+        let resp = handle_sm_context_update(&changed, &modify(&changed, 25)).await;
+        let status_changed = resp.status;
+        let ambr_changed = command_ambr_1399(&command(&resp));
+
+        std::env::remove_var("PCF_URI");
+        pcf_srv.stop().await.expect("stop");
+
+        assert_eq!(status_empty, 200);
+        assert_eq!(reported.len(), 1, "{reported:?}");
+        assert_eq!(
+            reported[0].1["repPolicyCtrlReqTriggers"],
+            serde_json::json!(["RES_MO_RE"])
+        );
+        assert_eq!(
+            ambr_empty,
+            (70_000_000, 30_000_000),
+            "an answer with no sessRules authorises what the session enforces"
+        );
+        assert_eq!(status_changed, 200);
+        assert_eq!(
+            ambr_changed,
+            (90_000_000, 50_000_000),
+            "a changed authSessAmbr"
+        );
+    }
+
+    /// A PCF stand-in that parks every `/update` until `gate` is notified, signalling
+    /// `seen` when it has one, then answers `answer`, or, when `None`, a 200 whose body
+    /// is not an SmPolicyDecision (a transport-class failure for the SMF). Points
+    /// `PCF_URI` at itself; the caller removes it (#1565 review).
+    async fn spawn_gated_pcf_1399(
+        answer: Option<serde_json::Value>,
+    ) -> (
+        nextgcore_sbi::server::SbiServer,
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        use nextgcore_sbi::message::SbiResponse;
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let seen = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let pcf = SbiServer::on_listener(
+            SbiServerConfig::new(std::net::SocketAddr::from(([127, 0, 0, 1], addr.port()))),
+            listener,
+        );
+        let (g, s) = (gate.clone(), seen.clone());
+        pcf.start(move |_req: SbiRequest| {
+            let (gate, seen, answer) = (g.clone(), s.clone(), answer.clone());
+            async move {
+                seen.notify_one();
+                gate.notified().await;
+                match answer {
+                    Some(decision) => SbiResponse::with_status(200)
+                        .with_json_body(&decision)
+                        .unwrap_or_else(|_| SbiResponse::with_status(200)),
+                    None => SbiResponse::with_status(200).with_body("not json", "text/plain"),
+                }
+            }
+        })
+        .await
+        .expect("pcf start");
+        std::env::set_var("PCF_URI", format!("http://127.0.0.1:{}", addr.port()));
+        (pcf, gate, seen)
+    }
+
+    /// The PCF's own UpdateNotify, raising the Session-AMBR to UL/DL 60/65 Mbps.
+    fn notify_60_65_1399(sm_context_ref: &str) -> SbiRequest {
+        SbiRequest::post(format!(
+            "/nsmf-callback/v1/sm-policy-notify/{sm_context_ref}"
+        ))
+        .with_body(
+            serde_json::json!({ "smPolicyDecision": { "sessRules": { "S": {
+                    "authSessAmbr": { "uplink": "60 Mbps", "downlink": "65 Mbps" } } } } })
+            .to_string(),
+            "application/json",
+        )
+    }
+
+    /// A UE-requested modification (PDU_RES_MOD_REQ with a PDU SESSION MODIFICATION
+    /// REQUEST) for `sm_context_ref`, PSI `psi`.
+    fn ue_modification_1399(sm_context_ref: &str, psi: u8) -> SbiRequest {
+        SbiRequest::post(format!(
+            "/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/modify"
+        ))
+        .with_body(
+            serde_json::json!({
+                "n2SmInfoType": "PDU_RES_MOD_REQ",
+                "n1SmMsg": { "contentId": "n1SmMsg" },
+            })
+            .to_string(),
+            "application/json",
+        )
+        .with_part(nextgcore_sbi::message::SbiPart::with_content(
+            "n1SmMsg",
+            nextgcore_sbi::constants::content_type::APPLICATION_5GNAS,
+            bytes::Bytes::from(n1(
+                psi,
+                5,
+                gsm_build::message_type::PDU_SESSION_MODIFICATION_REQUEST,
+                &[],
+            )),
+        ))
+    }
+
+    /// The RES_MO_RE leg with an UpdateNotify applied while its Update is in flight:
+    /// the MODIFICATION COMMAND's Session-AMBR (DL, UL) once the PCF answers `answer`
+    /// (`None`: an unusable answer, "keeping current QoS").
+    async fn res_mo_re_racing_a_notify_1399(
+        answer: Option<serde_json::Value>,
+        supi: &str,
+        psi: u8,
+    ) -> (u16, (u64, u64), u64, u64) {
+        let (pcf, gate, seen) = spawn_gated_pcf_1399(answer).await;
+        let r = seed_authorised_1399(supi, psi, "pol-1565");
+        let req = ue_modification_1399(&r, psi);
+        let r2 = r.clone();
+        let update = tokio::spawn(async move { handle_sm_context_update(&r2, &req).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), seen.notified())
+            .await
+            .expect("the PCF got the update");
+        let notified = handle_sm_policy_notify(&r, &notify_60_65_1399(&r))
+            .await
+            .status;
+        gate.notify_one();
+        let resp = update.await.expect("joined");
+        std::env::remove_var("PCF_URI");
+        pcf.stop().await.ok();
+        assert_eq!(notified, 204);
+        let n1c = resp
+            .http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n1SmMsg"))
+            .map(|p| p.data.to_vec())
+            .expect("the MODIFICATION COMMAND");
+        let b = lookup_policy_binding(&r).expect("binding");
+        (
+            resp.status,
+            command_ambr_1399(&n1c),
+            b.ambr_ul_bps,
+            b.ambr_dl_bps,
+        )
+    }
+
+    /// #1565 review MAJOR, the RES_MO_RE leg (adapted from the reviewer's probe): an
+    /// UpdateNotify the PCF sends while it holds the RES_MO_RE Update (60/65 Mbps) is
+    /// the base the answer (no `sessRules`) is merged onto, not undone by the binding
+    /// read before the Update (30/70).
+    ///
+    /// REVERT-VERIFIED: with the merge base the pre-await binding (`b.clone()` for the
+    /// re-read under the lock), the command carries 70/30.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn res_mo_re_merges_onto_a_notify_applied_in_flight_1399() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let got = res_mo_re_racing_a_notify_1399(
+            Some(serde_json::json!({ "pccRules": {} })),
+            "imsi-001010000001395",
+            26,
+        )
+        .await;
+        assert_eq!(
+            got,
+            (200, (65_000_000, 60_000_000), 60_000_000, 65_000_000),
+            "the notify's AMBR is the base, in the command and the binding"
+        );
+    }
+
+    /// #1565 review MINOR 1: the same race when the Update fails (an answer that is not
+    /// an SmPolicyDecision, "keeping current QoS"): the session keeps what it enforces
+    /// at that point, the notify's 60/65, not the binding read before the Update.
+    ///
+    /// REVERT-VERIFIED: with the pre-await binding on the no-answer arm, the command
+    /// and the binding carry 30/70.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_res_mo_re_update_keeps_a_notify_applied_in_flight_1399() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let got = res_mo_re_racing_a_notify_1399(None, "imsi-001010000001394", 27).await;
+        assert_eq!(
+            got,
+            (200, (65_000_000, 60_000_000), 60_000_000, 65_000_000),
+            "the current QoS is what the notify left, not the pre-await binding"
+        );
+    }
+
+    /// #1565 review MAJOR, the SE_AMBR_CH leg: an UpdateNotify (60/65) applied while
+    /// the PCF holds the SE_AMBR_CH Update is the base its answer (no `sessRules`) is
+    /// merged onto: binding and session end at 60/65, 5QI 7, not the 30/70 read before
+    /// the report.
+    ///
+    /// REVERT-VERIFIED: with the merge base the pre-await binding (`binding.clone()`
+    /// for the re-read under the lock), they end at 30/70.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn se_ambr_ch_merges_onto_a_notify_applied_in_flight_1399() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (udm_srv, _seen) = spawn_recording_udm(sm_data_with("40 Mbps", "80 Mbps", 6)).await;
+        udm::set_for_test(true);
+        smf_context_init(64, 256, 512);
+        let (pcf, gate, seen) =
+            spawn_gated_pcf_1399(Some(serde_json::json!({ "pccRules": {} }))).await;
+        let supi = "imsi-001010000001393";
+        let r = seed_authorised_1399(supi, 28, "pol-1393");
+        let sdm = sdm_notify(&r, supi);
+        let reported = tokio::spawn(async move { smf_sbi_request_handler(sdm).await.status });
+        tokio::time::timeout(std::time::Duration::from_secs(5), seen.notified())
+            .await
+            .expect("the PCF got the SE_AMBR_CH update");
+        let notified = handle_sm_policy_notify(&r, &notify_60_65_1399(&r))
+            .await
+            .status;
+        gate.notify_one();
+        let status = reported.await.expect("joined");
+        let b = lookup_policy_binding(&r).expect("binding");
+        let s = smf_self()
+            .read()
+            .expect("context")
+            .sess_find_by_sm_context_ref(&r)
+            .expect("session");
+        std::env::remove_var("PCF_URI");
+        udm::set_for_test(false);
+        std::env::remove_var("UDM_SBI_ADDR");
+        std::env::remove_var("UDM_SBI_PORT");
+        pcf.stop().await.ok();
+        udm_srv.stop().await.ok();
+
+        assert_eq!((notified, status), (204, 204));
+        assert_eq!(
+            (
+                b.ambr_ul_bps,
+                b.ambr_dl_bps,
+                b.five_qi,
+                s.session_ambr.uplink,
+                s.session_ambr.downlink
+            ),
+            (60_000_000, 65_000_000, 7, 60_000_000, 65_000_000),
+            "the notify's AMBR is the base, on the binding and the session"
+        );
     }
 
     /// #310 Decision 3: a PCF that REJECTS the `SE_AMBR_CH` report leaves the session
@@ -21602,6 +22401,123 @@ mod tests {
             "MODIFICATION COMPLETE must stop T3591, or the SMF retransmits a \
              command the UE already answered"
         );
+    }
+
+    /// The N1 SM the SMF answered with, if any.
+    fn answered_n1(resp: &SbiResponse) -> Option<Vec<u8>> {
+        resp.http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n1SmMsg"))
+            .map(|p| p.data.to_vec())
+    }
+
+    /// **#1471.** This SMF runs no secondary or service-level authentication, so a
+    /// PDU SESSION AUTHENTICATION COMPLETE (0xC6) or a SERVICE-LEVEL
+    /// AUTHENTICATION COMPLETE (0xD9) answers a command it never sent.
+    /// - TS 24.501 §7.4: with no PTI it is a message type not implemented,
+    ///   answered with 5GSM STATUS #97.
+    /// - §7.3.1 b): with an assigned PTI, 5GSM STATUS #81.
+    /// - §7.3.1 d): with the reserved PTI, ignored.
+    ///
+    /// The STATUS carries the message's PSI and PTI.
+    #[tokio::test]
+    async fn an_authentication_complete_is_answered_with_5gsm_status_1471() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let reference = "n1471-auth";
+        seed_binding(reference, 6);
+        for mt in [
+            gsm_build::message_type::PDU_SESSION_AUTHENTICATION_COMPLETE,
+            gsm_build::message_type::SERVICE_LEVEL_AUTHENTICATION_COMPLETE,
+        ] {
+            // EAP message IE (LV-E), as the UE sends it.
+            let eap = [0x00, 0x04, 0x02, 0x01, 0x00, 0x04];
+            for (pti, cause) in [
+                (
+                    0u8,
+                    policy::gsm_cause::MESSAGE_TYPE_NON_EXISTENT_OR_NOT_IMPLEMENTED,
+                ),
+                (9, policy::gsm_cause::INVALID_PTI_VALUE),
+            ] {
+                let resp = handle_n1_sm_message(reference, &n1(6, pti, mt, &eap)).await;
+                assert_eq!(resp.status, 200, "{mt:#04x} PTI {pti}");
+                assert_eq!(
+                    answered_n1(&resp),
+                    Some(vec![
+                        0x2E,
+                        6,
+                        pti,
+                        gsm_build::message_type::GSM_STATUS,
+                        cause
+                    ]),
+                    "{mt:#04x} PTI {pti}: 5GSM STATUS #{cause}"
+                );
+            }
+            let resp = handle_n1_sm_message(reference, &n1(6, 0xFF, mt, &eap)).await;
+            assert_eq!(resp.status, 204, "{mt:#04x}: the reserved PTI is ignored");
+            assert_eq!(answered_n1(&resp), None);
+        }
+    }
+
+    /// **#1471**, TS 24.501 §6.6.2.3: a REMOTE UE REPORT (0xDA) is answered with a
+    /// REMOTE UE REPORT RESPONSE (0xDB) carrying its PSI and PTI.
+    /// - §6.6.2.5 a): while the network releases the session (T3592 armed), the
+    ///   report is aborted, gets no response, and leaves the release running.
+    /// - §7.3.1 d): a reserved PTI is ignored.
+    #[tokio::test]
+    async fn a_remote_ue_report_is_answered_with_its_response_1471() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let reference = "n1471-remote";
+        seed_binding(reference, 4);
+        // Remote UE context connected IE (0x76, TLV-E), one remote UE.
+        let report = n1(
+            4,
+            0x21,
+            gsm_build::message_type::REMOTE_UE_REPORT,
+            &[0x76, 0x00, 0x03, 0x01, 0x01, 0x00],
+        );
+        let resp = handle_n1_sm_message(reference, &report).await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            answered_n1(&resp),
+            Some(vec![
+                0x2E,
+                4,
+                0x21,
+                gsm_build::message_type::REMOTE_UE_REPORT_RESPONSE
+            ])
+        );
+
+        let resp = handle_n1_sm_message(
+            reference,
+            &n1(4, 0xFF, gsm_build::message_type::REMOTE_UE_REPORT, &[]),
+        )
+        .await;
+        assert_eq!((resp.status, answered_n1(&resp)), (204, None));
+
+        let release_cmd =
+            policy::build_release_command(4, 0, policy::gsm_cause::REGULAR_DEACTIVATION);
+        arm_gsm_timer(
+            reference,
+            timer::SmfTimerId::T3592,
+            &release_cmd,
+            "imsi-001010000000001",
+            4,
+            None,
+        );
+        let resp = handle_n1_sm_message(reference, &report).await;
+        assert_eq!(
+            (resp.status, answered_n1(&resp)),
+            (204, None),
+            "aborted during the network-requested release"
+        );
+        assert!(
+            gsm_timer_armed(reference, timer::SmfTimerId::T3592),
+            "the release proceeds"
+        );
+        cancel_gsm_timer(reference, timer::SmfTimerId::T3592);
     }
 
     #[tokio::test]
@@ -24705,11 +25621,9 @@ mod tests {
         // #974: a report is accepted only from the UPF serving the session.
         let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
         let smf_sock = std::sync::Arc::new(smf_sock);
-        pfcp_path::set_global_pool(vec![std::sync::Arc::new(pfcp_path::PfcpClient::new(
-            smf_sock.clone(),
-            upf_addr,
-            [127, 0, 0, 1],
-        ))]);
+        pfcp_path::set_global_pool(vec![
+            pfcp_path::PfcpClient::associated_for_test(smf_sock.clone(), upf_addr).await,
+        ]);
         // The buffered packet is on the dedicated flow.
         handle_pfcp_session_report(&smf_sock, &dldr_report_packet(seid, 7), upf_addr).await;
         pfcp_path::clear_global_upf_for_test();
@@ -24916,11 +25830,9 @@ mod tests {
             std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let upf_addr = upf.local_addr().unwrap();
         let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
-        pfcp_path::set_global_pool(vec![std::sync::Arc::new(pfcp_path::PfcpClient::new(
-            smf_sock.clone(),
-            upf_addr,
-            [127, 0, 0, 1],
-        ))]);
+        pfcp_path::set_global_pool(vec![
+            pfcp_path::PfcpClient::associated_for_test(smf_sock.clone(), upf_addr).await,
+        ]);
         let seid = context::derive_cp_n4_seid(REF);
         handle_pfcp_session_report(&smf_sock, &dldr_report_packet(seid, 1), upf_addr).await;
         pfcp_path::clear_global_upf_for_test();
@@ -25378,8 +26290,24 @@ mod tests {
             .await
             .expect("smf socket");
         let upf_addr = upf.local_addr().expect("upf addr");
+        // #1509: the session's own, associated UPF, so the report is ACCEPTED and the
+        // DLDR branch runs. Before, no pool was installed and the report was refused
+        // (cause 65) before the branch: "not paged" held for the wrong reason.
+        let smf_sock = std::sync::Arc::new(smf_sock);
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        pfcp_path::set_global_pool(vec![
+            pfcp_path::PfcpClient::associated_for_test(smf_sock.clone(), upf_addr).await,
+        ]);
         handle_pfcp_session_report(&smf_sock, &dldr_report_packet(seid, 1), upf_addr).await;
+        pfcp_path::clear_global_upf_for_test();
+        let mut buf = vec![0u8; 512];
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(2), upf.recv(&mut buf))
+            .await
+            .expect("a Session Report Response")
+            .map(|n| buf[..n].to_vec())
+            .unwrap();
 
+        assert_eq!(pfcp_cause_of(&answer), Some(1), "the report is accepted");
         assert!(
             seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
             "an active user-plane connection must not be paged"
@@ -26123,6 +27051,168 @@ mod tests {
         amf.stop().await.ok();
         listener.abort();
         upf_task.abort();
+    }
+
+    /// Expire `sm_context_ref`'s armed 5GSM timer now and run one tick (#1430).
+    async fn expire_gsm_timer_now_1430(sm_context_ref: &str, timer_id: timer::SmfTimerId) {
+        if let Ok(mut timers) = gsm_procedure_timers().lock() {
+            let t = timers.get_mut(sm_context_ref).expect("a 5GSM timer armed");
+            assert_eq!(t.timer_id, timer_id);
+            t.deadline = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        }
+        run_gsm_timer_tick().await;
+    }
+
+    /// An SM context with a binding addressed to the AMF stand-in on `amf_port`, and
+    /// no N4 session or SM policy, so a release has no UPF or PCF leg (#1430).
+    fn seed_release_session_1430(supi: &str, psi: u8, amf_port: u16) -> String {
+        let reference = {
+            let ctx = smf_self();
+            let context = ctx.read().expect("context");
+            register_sm_context(&context, supi, psi)
+                .expect("register")
+                .0
+        };
+        seed_binding(&reference, psi);
+        if let Ok(ctx) = smf_self().read() {
+            if let Ok(mut bindings) = ctx.policy_bindings.write() {
+                if let Some(b) = bindings.get_mut(&reference) {
+                    b.supi = supi.to_string();
+                }
+            }
+        }
+        set_amf_1385(&reference, amf_port);
+        reference
+    }
+
+    /// #1430, TS 23.502 §4.3.4.2 steps 3a/3b, TS 24.501 §6.3.3.3: a T3592
+    /// retransmission of a PDU SESSION RELEASE COMMAND that went out with the N2
+    /// Resource Release request carries the same N1 and the same
+    /// PDUSessionResourceReleaseCommandTransfer (`PDU_RES_REL_CMD`), so a lost first
+    /// transfer still releases the NG-RAN resources:
+    /// - network-initiated (the UPF-restart reactivation release, step 3b);
+    /// - UE-requested (the UpdateSMContext answer carried the N2, step 3a).
+    ///
+    /// A release that went out N1-only (the NG-RAN already released, step 3a: no N2)
+    /// is retransmitted N1-only.
+    ///
+    /// REVERT-VERIFIED: with the tick's release arm removed (or the release sites
+    /// arming T3592 with no N2), both N2 retransmissions go out N1-only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn t3592_resends_the_n2_release_command_1430() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (amf, amf_port, posts) = n1n2_recording_amf_1385(false).await;
+        let amf_uri = format!("http://127.0.0.1:{amf_port}");
+        let expected_n2 = n2_transfer::release_command_transfer().expect("release transfer");
+        assert!(!expected_n2.is_empty());
+
+        // ---- network-initiated: N1 + N2 in the first transfer and the retransmission ----
+        let supi = "imsi-001010000001430";
+        let net = seed_release_session_1430(supi, 14, amf_port);
+        release_for_reactivation(&net, &amf_uri, supi, 14).await;
+        let got = await_n1n2_1385(&posts, 1).await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        let (_, first_body, first_n1, first_n2) = got[0].clone();
+        assert_eq!(first_n2, expected_n2);
+        assert_eq!(
+            first_body["n2InfoContainer"]["smInfo"]["n2InfoContent"]["ngapIeType"],
+            "PDU_RES_REL_CMD"
+        );
+        expire_gsm_timer_now_1430(&net, timer::SmfTimerId::T3592).await;
+        let got = await_n1n2_1385(&posts, 2).await;
+        assert_eq!(got.len(), 2, "the T3592 retransmission, got {got:?}");
+        let (path, body, n1_again, n2_again) = &got[1];
+        assert_eq!(
+            path,
+            &format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages")
+        );
+        assert_eq!(n1_again, &first_n1, "the same command, verbatim");
+        assert_eq!(
+            n2_again, &expected_n2,
+            "the retransmission carries the same PDUSessionResourceReleaseCommandTransfer"
+        );
+        assert_eq!(
+            body["n2InfoContainer"]["smInfo"]["n2InfoContent"]["ngapIeType"],
+            "PDU_RES_REL_CMD"
+        );
+        assert_eq!(body["n2InfoContainer"]["smInfo"]["pduSessionId"], 14);
+        assert!(cancel_gsm_timer_for_test(&net));
+
+        // ---- UE-requested: the answer carried N1 + N2; so does the retransmission ----
+        let supi_ue = "imsi-001010000001431";
+        let ue = seed_release_session_1430(supi_ue, 15, amf_port);
+        let resp = handle_n1_sm_message(
+            &ue,
+            &n1(
+                15,
+                3,
+                gsm_build::message_type::PDU_SESSION_RELEASE_REQUEST,
+                &[],
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        let part = |id: &str| {
+            resp.http
+                .parts
+                .iter()
+                .find(|p| p.content_id.as_deref() == Some(id))
+                .map(|p| p.data.to_vec())
+        };
+        let answered_n1 = part("n1SmMsg").expect("the RELEASE COMMAND");
+        assert_eq!(part("n2SmInfo"), Some(expected_n2.clone()));
+        expire_gsm_timer_now_1430(&ue, timer::SmfTimerId::T3592).await;
+        let got = await_n1n2_1385(&posts, 3).await;
+        assert_eq!(got.len(), 3, "the T3592 retransmission, got {got:?}");
+        let (path, body, n1_again, n2_again) = &got[2];
+        assert_eq!(
+            path,
+            &format!("/namf-comm/v1/ue-contexts/{supi_ue}/n1-n2-messages")
+        );
+        assert_eq!(
+            n1_again, &answered_n1,
+            "the command the UE was answered with"
+        );
+        assert_eq!(n2_again, &expected_n2, "and the N2 it went out with");
+        assert_eq!(
+            body["n2InfoContainer"]["smInfo"]["n2InfoContent"]["ngapIeType"],
+            "PDU_RES_REL_CMD"
+        );
+        assert!(cancel_gsm_timer_for_test(&ue));
+
+        // ---- the NG-RAN already released: N1-only, and so is the retransmission ----
+        let supi_an = "imsi-001010000001432";
+        let an = seed_release_session_1430(supi_an, 16, amf_port);
+        let resp = ran_released_session(&an, None).await;
+        assert_eq!(resp.status, 200);
+        assert!(
+            !resp
+                .http
+                .parts
+                .iter()
+                .any(|p| p.content_id.as_deref() == Some("n2SmInfo")),
+            "no N2 in the answer"
+        );
+        expire_gsm_timer_now_1430(&an, timer::SmfTimerId::T3592).await;
+        let got = await_n1n2_1385(&posts, 4).await;
+        assert_eq!(got.len(), 4, "the T3592 retransmission, got {got:?}");
+        let (path, body, n1_again, n2_again) = &got[3];
+        assert_eq!(
+            path,
+            &format!("/namf-comm/v1/ue-contexts/{supi_an}/n1-n2-messages")
+        );
+        assert_eq!(
+            n1_again[3],
+            gsm_build::message_type::PDU_SESSION_RELEASE_COMMAND
+        );
+        assert!(n2_again.is_empty(), "N1-only: no N2 part");
+        assert!(body["n2InfoContainer"].is_null(), "{body}");
+        assert!(cancel_gsm_timer_for_test(&an));
+
+        amf.stop().await.ok();
     }
 
     /// #1385 review B1: the 5QI change is a "Create new QoS flow description" -- also

@@ -263,7 +263,9 @@ async fn main() -> Result<()> {
     let sbi_ctx = nextgcore_sbi::context::global_context();
     sbi_ctx.set_nrf_uri(&args.nrf_uri).await;
     // #1322: the advertised host, never a wildcard.
-    if let Err(e) = match nrf_registration_host(
+    // #1482: a failed attempt is retried in the background, and the heartbeat
+    // starts after the one that succeeds.
+    match nrf_registration_host(
         &args.sbi_addr,
         args.sbi_port,
         args.sbi_advertise.as_deref(),
@@ -271,21 +273,35 @@ async fn main() -> Result<()> {
             .ok()
             .as_deref(),
     ) {
-        Ok(host) => register_with_nrf(sbi_ctx, &host, args.sbi_port, &nf_instance_id).await,
-        Err(why) => Err(why),
-    } {
-        log::warn!("NRF registration failed (will operate without NRF): {e}");
-    } else {
-        // PATCH a real NFProfile "/load" gauge each heartbeat: stored
-        // time-sync configurations, saturated at 100 (TS 29.510 §5.2.2.3.2).
-        nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(
-            nf_instance_id.clone(),
-            5,
-            || {
-                let load = tsctsf_self().read().map(|c| c.config_count()).unwrap_or(0);
-                load.min(100) as u8
-            },
-        );
+        Ok(host) => {
+            let (port, id) = (args.sbi_port, nf_instance_id.clone());
+            nextgcore_sbi::heartbeat::register_or_retry(
+                "TSCTSF",
+                Default::default(),
+                move || {
+                    let (ctx, host, id) = (sbi_ctx.clone(), host.clone(), id.clone());
+                    async move {
+                        register_with_nrf(ctx, &host, port, &id)
+                            .await
+                            .map(|()| Some(id))
+                    }
+                },
+                |nf_instance_id| {
+                    // PATCH a real NFProfile "/load" gauge each heartbeat: stored
+                    // time-sync configurations, saturated at 100 (TS 29.510 §5.2.2.3.2).
+                    nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(
+                        nf_instance_id,
+                        5,
+                        || {
+                            let load = tsctsf_self().read().map(|c| c.config_count()).unwrap_or(0);
+                            load.min(100) as u8
+                        },
+                    );
+                },
+            )
+            .await;
+        }
+        Err(e) => log::warn!("NRF registration not attempted (will operate without NRF): {e}"),
     }
 
     log::info!("NextGCore TSCTSF ready (instance: {nf_instance_id})");
