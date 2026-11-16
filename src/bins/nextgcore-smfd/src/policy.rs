@@ -2014,7 +2014,23 @@ pub fn build_network_modification_command(
     qfi: u8,
     flow: Option<ModifiedFlowQos>,
 ) -> Vec<u8> {
-    let mut msg = build_modification_command(psi, 0, ambr_dl_bps, ambr_ul_bps);
+    build_modification_command_for_flow(psi, 0, ambr_dl_bps, ambr_ul_bps, qfi, flow)
+}
+
+/// [`build_network_modification_command`] with the PTI `pti`. The command answering a
+/// UE-requested modification (TS 24.501 §6.4.2.3) echoes the request's PTI: §6.3.2.2
+/// sets "No procedure transaction identity assigned" only for a modification "not
+/// triggered by a UE-requested PDU session modification procedure". It carries the
+/// default flow's description when the PCF's answer changed its 5QI (#1573).
+pub fn build_modification_command_for_flow(
+    psi: u8,
+    pti: u8,
+    ambr_dl_bps: u64,
+    ambr_ul_bps: u64,
+    qfi: u8,
+    flow: Option<ModifiedFlowQos>,
+) -> Vec<u8> {
+    let mut msg = build_modification_command(psi, pti, ambr_dl_bps, ambr_ul_bps);
     if let Some(flow) = flow {
         use crate::gsm_build::{
             encode_bitrate, encode_qos_flow_descriptions, qos_flow_description_code,
