@@ -156,6 +156,13 @@ pub struct PcfUeAm {
     /// §4.2.2.2 item c, §4.2.3.2 item c).
     #[serde(default)]
     pub ue_ambr_requested: bool,
+    /// #1580: the AMF sent `servAreaRes` / `rfsp` on this association (create or
+    /// update). TS 29.507 §4.2.2.2 items a/b and §4.2.3.2 items a/b answer them
+    /// only "if the PCF received" them in the request.
+    #[serde(default)]
+    pub serv_area_res_requested: bool,
+    #[serde(default)]
+    pub rfsp_requested: bool,
 }
 
 /// UE Route Selection Policy rule (TS 24.526)
@@ -238,6 +245,8 @@ impl PcfUeAm {
             am_policy: None,
             alt_notif_uris: Vec::new(),
             ue_ambr_requested: false,
+            serv_area_res_requested: false,
+            rfsp_requested: false,
         }
     }
 
