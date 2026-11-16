@@ -812,7 +812,8 @@ fn build_sm_policy_notification(
 
 /// The session data the decision for `sess` is built from (#1402): `sd` with its
 /// Session-AMBR capped by the session's subscribed Session-AMBR per
-/// `pcf.policy.session_ambr_cap` ([`crate::session_ambr_cap::apply`]), then lowered
+/// `pcf.policy.session_ambr_cap` ([`crate::session_ambr_cap::apply`]), then bounded by
+/// the VPLMN's QoS constraints ([`crate::vplmn_qos::apply`], #1541), then lowered
 /// to any active override cap ([`effective_session_data`]). The create, the
 /// UpdateNotify and the GET build from it, so they answer the same Session-AMBR;
 /// the `SE_AMBR_CH` arm applies the same two steps around the bound it was just
@@ -822,6 +823,9 @@ pub(crate) fn decision_session_data(
     sd: &crate::nudr_handler::SessionData,
 ) -> crate::nudr_handler::SessionData {
     let capped = crate::session_ambr_cap::apply(sd, sess.subscribed_sess_ambr.as_ref());
+    // #1541: the VPLMN's constraints (home-routed roaming), whatever the
+    // operator cap above says (TS 29.512 §4.2.2.5, TS 23.503 §6.1.3.6).
+    let capped = crate::vplmn_qos::apply(&capped, sess.vplmn_qos.as_ref());
     effective_session_data(&sess.sm_policy_id, &capped)
 }
 
