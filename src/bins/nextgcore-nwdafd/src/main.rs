@@ -2411,8 +2411,12 @@ mod allowed_nf_types_1412_tests {
     #[test]
     fn nrfd_authorizes_eventssubscription_for_cef_and_upf_only_there() {
         let mut doc = profile_json("nwdaf-1415", &spec_allowed_nf_types());
-        doc["nfServices"] =
-            serde_json::Value::Array(nwdaf_services("nwdaf-1415", "127.0.0.1", 7815, true));
+        doc["nfServices"] = serde_json::Value::Array(nwdaf_services(
+            "nwdaf-1415",
+            "127.0.0.1",
+            7815,
+            MlProvision::Offered,
+        ));
         let service_list = |name: &str| -> Vec<String> {
             doc["nfServices"]
                 .as_array()
