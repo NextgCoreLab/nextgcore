@@ -224,7 +224,7 @@ async fn start_pcfd(dir: &Scratch, db_uri: &str, one_worker: bool) -> Pcfd {
     .ready_when_logged("PCF metrics endpoint on http://")
     .within(Duration::from_secs(60))
     .spawn_async(|cmd, sbi_port, scratch| {
-        metrics_port = nextgcore_sbi::test_support::free_port();
+        metrics_port = nextgcore_sbi::test_support::spawn_port();
         pcfd_args(cmd, scratch, db_uri, sbi_port, metrics_port);
         if one_worker {
             cmd.env("TOKIO_WORKER_THREADS", "1");

@@ -106,7 +106,7 @@ fn running(tag: &str, pcf_extra: &str, demo: &str) -> (NfProcess, u16) {
         .ready_when_logged("SBI HTTP/2 server listening on")
         .ready_when_logged("PCF metrics endpoint on http://")
         .spawn(|cmd, sbi_port, dir| {
-            metrics_port = free_port();
+            metrics_port = nextgcore_sbi::test_support::spawn_port();
             let config = dir.join("pcf.yaml");
             std::fs::write(
                 &config,

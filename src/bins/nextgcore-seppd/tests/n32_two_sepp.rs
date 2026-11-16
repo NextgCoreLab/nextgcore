@@ -78,7 +78,7 @@ impl ChildSepp {
             .ready_when_accepting(std::net::Ipv4Addr::LOCALHOST.into())
             .within(STARTUP_TIMEOUT)
             .spawn_async(|cmd, n32_port, _| {
-                let sbi_port = free_port();
+                let sbi_port = nextgcore_sbi::test_support::spawn_port();
                 cmd.args([
                     "-c",
                     "/nonexistent/sepp.yaml",

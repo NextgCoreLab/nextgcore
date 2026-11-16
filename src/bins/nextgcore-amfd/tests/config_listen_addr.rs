@@ -32,7 +32,10 @@ fn amfd_args(cmd: &mut Command, config: &std::path::Path, extra: &[String]) {
         .env_remove("AMF_SBI_PORT")
         .env_remove("NEXTGCORE_SBI_ADVERTISE")
         .env("NEXTGCORE_SBI_PROFILE", "dev")
-        .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1");
+        .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
+        // #1575 review: not the fixed 9090 default, which anything on the host
+        // may hold; the metrics endpoint is not under test here.
+        .env("AMF_METRICS_PORT", "0");
 }
 
 fn wait(what: impl Fn() -> bool, within: Duration) -> bool {

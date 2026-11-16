@@ -13,19 +13,22 @@
 //!   taken-late and taken-metrics tests fail;
 //! - with stderr read before `try_wait` (the pause between them), the taken-late test fails
 //!   ("exited at startup" while the printed stderr shows the bind error);
+//! - with `Run::next_attempt` leaking the old attempt (`std::mem::forget`)
+//!   instead of dropping it, the taken-SBI and taken-metrics tests fail at
+//!   "is still running";
 //! - with an exit that is not a lost bind no longer failing at once, the
 //!   bad-address test fails its `should_panic` (it panics "not ready within"
 //!   30 s later instead).
 
 use std::time::Duration;
 
-use nextgcore_sbi::test_support::{bound_listener, free_port, NfProcess, NfSpawn};
+use nextgcore_sbi::test_support::{bound_listener, claim_port, spawn_port, NfProcess, NfSpawn};
 
 const SBI_LISTENING: &str = "SBI HTTP/2 server listening on";
 const METRICS_ON: &str = "PCF metrics endpoint on http://";
 
 /// pcfd with no NRF, its SBI listener on the spawn's port and its metrics port
-/// from `metrics_port` (called once per spawn).
+/// from `metrics_port` (called once per spawn, inside `configure`).
 fn pcfd(spawn: NfSpawn, address: &'static str, mut metrics_port: impl FnMut() -> u16) -> NfProcess {
     spawn.spawn(move |cmd, sbi_port, dir| {
         let config = dir.join("pcf.yaml");
@@ -42,6 +45,21 @@ fn pcfd(spawn: NfSpawn, address: &'static str, mut metrics_port: impl FnMut() ->
             .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
             .env("PCF_METRICS_PORT", metrics_port().to_string());
     })
+}
+
+/// Each replaced spawn was killed and reaped before its replacement started:
+/// no process, and no zombie, is left with its PID.
+fn assert_replaced_and_gone(nf: &NfProcess) {
+    assert!(
+        !nf.replaced_pids().is_empty(),
+        "premise: the first spawn lost its bind and was replaced"
+    );
+    for pid in nf.replaced_pids() {
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "the replaced spawn {pid} is still running (or unreaped)"
+        );
+    }
 }
 
 fn listening_on(nf: &NfProcess) -> String {
@@ -63,10 +81,11 @@ fn an_nf_that_loses_its_sbi_port_is_spawned_on_another() {
             .ready_when_logged(SBI_LISTENING)
             .first_port(taken.port()),
         "127.0.0.1",
-        free_port,
+        spawn_port,
     );
     assert_ne!(nf.port(), taken.port());
     assert_eq!(listening_on(&nf), format!("127.0.0.1:{}", nf.port()));
+    assert_replaced_and_gone(&nf);
     drop(taken);
 }
 
@@ -82,7 +101,7 @@ fn a_lost_bind_seen_late_is_still_retried() {
             .first_port(taken.port())
             .pause_after_exit_check(Duration::from_millis(300)),
         "127.0.0.1",
-        free_port,
+        spawn_port,
     );
     assert_eq!(listening_on(&nf), format!("127.0.0.1:{}", nf.port()));
     drop(taken);
@@ -104,7 +123,8 @@ fn a_non_fatal_lost_bind_is_respawned_too() {
         .ready_when_logged(SBI_LISTENING)
         .ready_when_logged(METRICS_ON),
         "127.0.0.1",
-        move || first.take().unwrap_or_else(free_port),
+        // The held port is claimed for this spawn: it is "our" metrics port.
+        move || first.take().map_or_else(spawn_port, claim_port),
     );
     let log = nf.log();
     assert!(
@@ -115,7 +135,31 @@ fn a_non_fatal_lost_bind_is_respawned_too() {
         !log.contains(&format!("127.0.0.1:{}", taken.port())),
         "not on the held port: {log}"
     );
+    // pcfd ran on after losing the metrics bind, so this is the case where a
+    // leaked first spawn would still be alive.
+    assert_replaced_and_gone(&nf);
     drop(taken);
+}
+
+/// #1575 review: an in-use port the spawn did NOT choose (here a metrics port
+/// held by something outside the test, standing in for the fixed 9090
+/// default) is reported at once, naming the port. Respawning on a new SBI port
+/// would only hit it again, five times over.
+///
+/// REVERT-VERIFIED: with every in-use line read as the spawn's own, this fails
+/// its `should_panic` with "lost its listening port on all 5 spawns".
+#[test]
+#[should_panic(expected = "a port this spawn did not choose is in use")]
+fn an_in_use_port_the_spawn_did_not_choose_fails_at_once() {
+    let held = bound_listener();
+    let port = held.port();
+    let _ = pcfd(
+        NfSpawn::new(env!("CARGO_BIN_EXE_nextgcore-pcfd"), "nfspawn-foreign")
+            .ready_when_logged(SBI_LISTENING)
+            .ready_when_logged(METRICS_ON),
+        "127.0.0.1",
+        move || port,
+    );
 }
 
 /// #1520 review: a startup failure that is not a lost bind fails at once, as the
@@ -128,6 +172,6 @@ fn a_startup_failure_that_is_not_a_lost_bind_fails_at_once() {
         NfSpawn::new(env!("CARGO_BIN_EXE_nextgcore-pcfd"), "nfspawn-badaddr")
             .ready_when_logged(SBI_LISTENING),
         "not-an-address",
-        free_port,
+        spawn_port,
     );
 }

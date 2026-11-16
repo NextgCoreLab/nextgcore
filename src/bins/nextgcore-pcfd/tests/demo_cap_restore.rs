@@ -107,10 +107,8 @@ async fn a_restarted_pcfd_restores_a_demo_capped_session() {
                 .arg(&state)
                 .env("NEXTGCORE_SBI_PROFILE", "dev")
                 .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
-                .env(
-                    "PCF_METRICS_PORT",
-                    nextgcore_sbi::test_support::free_port().to_string(),
-                );
+                // An ephemeral metrics port: /metrics is not under test here.
+                .env("PCF_METRICS_PORT", "0");
         })
         .await;
 

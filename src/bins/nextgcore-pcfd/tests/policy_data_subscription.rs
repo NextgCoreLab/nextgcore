@@ -309,10 +309,8 @@ async fn spawn_pcfd(name: &str, nrf: &Nrf, audit_secs: Option<u64>) -> NfProcess
                 .arg(&config)
                 .env("NEXTGCORE_SBI_PROFILE", "dev")
                 .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
-                .env(
-                    "PCF_METRICS_PORT",
-                    nextgcore_sbi::test_support::free_port().to_string(),
-                );
+                // An ephemeral metrics port: /metrics is not under test here.
+                .env("PCF_METRICS_PORT", "0");
             if let Some(secs) = audit_secs {
                 cmd.env("PCF_POLICY_DATA_AUDIT_SECS", secs.to_string());
             }

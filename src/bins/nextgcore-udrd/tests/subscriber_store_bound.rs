@@ -191,7 +191,10 @@ async fn a_store_that_goes_down_answers_a_read_in_time() {
                 .env("NEXTGCORE_SBI_PROFILE", "dev")
                 .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
                 .env_remove("NEXTGCORE_SBI_ADVERTISE")
-                .env_remove("DB_URI");
+                .env_remove("DB_URI")
+                // #1575 review: not the fixed 9090 default, which anything on the
+                // host may hold; /metrics is not under test here.
+                .env("UDR_METRICS_PORT", "0");
         })
         .await;
     let port = udrd.port();

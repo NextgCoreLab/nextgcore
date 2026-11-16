@@ -27,7 +27,11 @@ use serde_json::Value;
 /// which a test host does not have.
 fn child_env(cmd: &mut std::process::Command) {
     cmd.env("NEXTGCORE_SBI_PROFILE", "dev")
-        .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1");
+        .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
+        // #1575 review: an ephemeral metrics port, not the fixed default that
+        // anything else on the host may hold. Neither endpoint is under test.
+        .env("NRF_METRICS_PORT", "0")
+        .env("UCMF_METRICS_ADDR", "127.0.0.1:0");
 }
 
 fn nrfd_bin() -> Option<PathBuf> {

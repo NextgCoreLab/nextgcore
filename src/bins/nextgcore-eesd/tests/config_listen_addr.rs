@@ -30,7 +30,10 @@ fn start(
             .arg(&config)
             .args(extra(port))
             .env("NEXTGCORE_SBI_PROFILE", "dev")
-            .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1");
+            .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
+            // #1575 review: not the fixed 9090 default, which anything on the host
+            // may hold; the metrics endpoint is not under test here.
+            .env("EES_METRICS_PORT", "0");
     })
 }
 

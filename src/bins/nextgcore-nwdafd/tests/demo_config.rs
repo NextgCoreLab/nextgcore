@@ -62,7 +62,7 @@ fn running(template: &str) -> (NfProcess, u16) {
     let spawn = spawn.ready_when_logged("NWDAF metrics endpoint on http://");
     let mut metrics_port = 0;
     let nf = spawn.spawn(|cmd, sbi_port, dir| {
-        metrics_port = free_port();
+        metrics_port = nextgcore_sbi::test_support::spawn_port();
         let config = dir.join("nwdaf.yaml");
         std::fs::write(&config, template.replace(SBI_PORT, &sbi_port.to_string())).unwrap();
         nwdafd_args(cmd, &config, metrics_port);

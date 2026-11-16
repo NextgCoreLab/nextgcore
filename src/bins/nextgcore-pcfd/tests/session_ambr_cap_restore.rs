@@ -58,10 +58,8 @@ async fn restored_ambr(
             .arg(&state)
             .env("NEXTGCORE_SBI_PROFILE", "dev")
             .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
-            .env(
-                "PCF_METRICS_PORT",
-                nextgcore_sbi::test_support::free_port().to_string(),
-            );
+            // An ephemeral metrics port: /metrics is not under test here.
+            .env("PCF_METRICS_PORT", "0");
     })
     .await;
     let deadline = Instant::now() + Duration::from_secs(30);
