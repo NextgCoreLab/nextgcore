@@ -1465,6 +1465,115 @@ mod mtls_oauth2_e2e {
         server.stop().await.ok();
     }
 
+    /// #1522: one token-less callback, POSTed over TLS to an OAuth2-required
+    /// listener that registers a [`OAuth2CallbackExemption::for_verified_peer`]
+    /// route admitting only peer `udm-1522` with token `GOOD`. `mtls` decides
+    /// whether the listener verifies client certificates. The client presents the
+    /// PKI's client leaf, whose URI SAN is `client_uri`. Returns the status.
+    async fn verified_peer_callback_status(
+        tag: &str,
+        client_uri: &str,
+        mtls: bool,
+        token: &str,
+    ) -> u16 {
+        use crate::server::OAuth2CallbackExemption;
+        const GOOD: &str = "0123456789abcdef0123456789abcdef";
+        let pki = pki_with_uri_san(tag, client_uri);
+        let signing = crate::oauth::generate_es256_key();
+        let (listener, addr) = crate::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let policy = SbiSecurityPolicy {
+            mtls_required: mtls,
+            tls_paths: TlsPaths {
+                cert: pki.server_cert.clone(),
+                key: pki.server_key.clone(),
+                ca_cert: pki.ca.clone(),
+                client_cert: Some(pki.client_cert.clone()),
+                client_key: Some(pki.client_key.clone()),
+            },
+            ..SbiSecurityPolicy::production()
+        };
+        let mut cfg = SbiServerConfig::new(addr).with_oauth2_callback_exemption(
+            OAuth2CallbackExemption::for_verified_peer(
+                "POST",
+                "/nx-callback/v1/{var}/dereg-notify/{token}",
+                |cb, peer| async move {
+                    cb.vars == ["imsi-001010000015220"] && cb.token == GOOD && peer == "udm-1522"
+                },
+            ),
+        );
+        cfg.oauth2_jwks = Some(jwks(signing.verifying_key()));
+        let cfg = apply_sbi_security_policy(
+            cfg,
+            SbiProfile::Production,
+            &policy,
+            NfType::Amf,
+            "http://unused",
+        )
+        .expect("production profile applies");
+        assert!(cfg.require_oauth2, "the listener requires OAuth2");
+        let server = SbiServer::on_listener(cfg, listener);
+        server
+            .start(|req: SbiRequest| async move {
+                assert!(req.oauth2_subject.is_none(), "no bearer was verified");
+                SbiResponse::no_content()
+            })
+            .await
+            .expect("server starts");
+        let mut client_cfg = SbiClientConfig::new("localhost", port).with_https();
+        client_cfg.ca_cert = Some(pki.ca.clone());
+        client_cfg.client_cert = Some(pki.client_cert.clone());
+        client_cfg.client_key = Some(pki.client_key.clone());
+        let req = SbiRequest::post(format!(
+            "/nx-callback/v1/imsi-001010000015220/dereg-notify/{token}"
+        ))
+        .with_body("{}", "application/json");
+        let resp = SbiClient::new(client_cfg)
+            .send_request(req)
+            .await
+            .expect("the TLS request completes");
+        server.stop().await.ok();
+        resp.status
+    }
+
+    /// #1522: a verified-peer callback exemption admits a token-less notification
+    /// only from the named peer's VERIFIED mutual-TLS certificate with the current
+    /// token. Another peer, a stale token, or a TLS listener that verifies no client
+    /// certificate (no peer identity) is held to the bearer: 401.
+    ///
+    /// REVERT-VERIFIED: with the server passing no peer identity to the exemption
+    /// (`None` instead of `peer_cert_nf_instance_id`), the first case is 401 too.
+    #[tokio::test]
+    async fn a_verified_peer_callback_is_admitted_only_from_that_peer_1522() {
+        const GOOD: &str = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            verified_peer_callback_status("vp-udm", "urn:uuid:udm-1522", true, GOOD).await,
+            204,
+            "the verified UDM with the current token needs no bearer"
+        );
+        assert_eq!(
+            verified_peer_callback_status("vp-other", "urn:uuid:amf-1522", true, GOOD).await,
+            401,
+            "another verified peer needs a bearer"
+        );
+        assert_eq!(
+            verified_peer_callback_status(
+                "vp-stale",
+                "urn:uuid:udm-1522",
+                true,
+                "ffffffffffffffffffffffffffffffff"
+            )
+            .await,
+            401,
+            "a stale token from the UDM needs a bearer"
+        );
+        assert_eq!(
+            verified_peer_callback_status("vp-tls", "urn:uuid:udm-1522", false, GOOD).await,
+            401,
+            "without client-certificate verification there is no peer identity"
+        );
+    }
+
     /// Issue #63 criterion 1: the client CERTIFICATE is genuinely required, not
     /// merely accepted when offered.
     ///

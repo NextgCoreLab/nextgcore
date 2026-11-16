@@ -501,12 +501,22 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
             // path carries a callback token the NF holds, is not an OAuth 2.0
             // protected access (TS 33.501 §13.4.1, TS 29.500 §6.10.7 NOTE): it is
             // authenticated by that token, and the bearer is not consulted.
-            let oauth = oauth.filter(|verifier| {
-                let exempt = crate::callback_auth::admits_without_bearer(
-                    &verifier.callback_exemptions,
-                    &sbi_request.header.method,
-                    &sbi_request.header.uri,
-                );
+            // #1522: an exemption may also require the connection's verified
+            // mutual-TLS peer identity (`peer_cert_nf_instance_id`, set only from a
+            // client certificate rustls verified).
+            let exempt = match &oauth {
+                Some(verifier) => {
+                    crate::callback_auth::admits_without_bearer_from(
+                        &verifier.callback_exemptions,
+                        &sbi_request.header.method,
+                        &sbi_request.header.uri,
+                        sbi_request.peer_cert_nf_instance_id.as_deref(),
+                    )
+                    .await
+                }
+                None => false,
+            };
+            let oauth = oauth.filter(|_| {
                 if exempt {
                     log::debug!(
                         "cid={} {} {}: callback admitted on its callback token, no bearer \

@@ -28,6 +28,13 @@
 //!
 //! The query string is not part of the match: the server matches on the path
 //! alone and the NF routers route on the path alone.
+//!
+//! #1522: a token that does not by itself show who sent the request (the UECM
+//! `deregCallbackUri`'s, which any Nudm_UECM Get consumer can read) is registered
+//! with [`OAuth2CallbackExemption::for_verified_peer`]. Its check also sees the NF
+//! Instance ID of the connection's VERIFIED mutual-TLS client certificate (TS
+//! 33.501 §13.1, TS 33.310), and a request without one (plaintext, server-only
+//! TLS, HTTP/3) is never admitted by it.
 
 use std::fmt;
 use std::sync::Arc;
@@ -44,6 +51,35 @@ pub struct CallbackPath<'a> {
 /// The NF's verdict on a callback token: `true` only for a token it holds now.
 pub type CallbackTokenCheck = Arc<dyn Fn(&CallbackPath<'_>) -> bool + Send + Sync>;
 
+/// A matched callback path, owned, for a [`PeerCallbackCheck`] that may await.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedCallbackPath {
+    /// The `{var}` segments, in path order.
+    pub vars: Vec<String>,
+    /// The `{token}` segment.
+    pub token: String,
+}
+
+/// The NF's verdict on a callback token AND the verified mutual-TLS peer that sent
+/// it (#1522): the matched path and the peer certificate's NF Instance ID.
+pub type PeerCallbackCheck = Arc<
+    dyn Fn(
+            OwnedCallbackPath,
+            String,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// What decides a matched path.
+#[derive(Clone)]
+enum Check {
+    /// The token alone (#1421).
+    Token(CallbackTokenCheck),
+    /// The token and a verified mutual-TLS peer identity (#1522).
+    VerifiedPeer(PeerCallbackCheck),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Segment {
     Literal(String),
@@ -58,7 +94,7 @@ pub struct OAuth2CallbackExemption {
     method: String,
     pattern: String,
     segments: Vec<Segment>,
-    check: CallbackTokenCheck,
+    check: Check,
 }
 
 impl fmt::Debug for OAuth2CallbackExemption {
@@ -111,7 +147,27 @@ impl OAuth2CallbackExemption {
         pattern: impl Into<String>,
         check: impl Fn(&CallbackPath<'_>) -> bool + Send + Sync + 'static,
     ) -> Self {
-        let pattern = pattern.into();
+        Self::with_check(method, pattern.into(), Check::Token(Arc::new(check)))
+    }
+
+    /// A callback route `method pattern` admitted without a bearer only on a
+    /// connection whose client presented a VERIFIED mutual-TLS certificate, and only
+    /// when `check` accepts the path's token together with that certificate's NF
+    /// Instance ID (#1522). For a token that does not by itself show who sent the
+    /// request. A request without a verified peer identity is held to the bearer.
+    ///
+    /// # Panics
+    /// As [`Self::new`].
+    pub fn for_verified_peer<F, Fut>(method: &str, pattern: impl Into<String>, check: F) -> Self
+    where
+        F: Fn(OwnedCallbackPath, String) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = bool> + Send + 'static,
+    {
+        let check: PeerCallbackCheck = Arc::new(move |cb, peer| Box::pin(check(cb, peer)));
+        Self::with_check(method, pattern.into(), Check::VerifiedPeer(check))
+    }
+
+    fn with_check(method: &str, pattern: String, check: Check) -> Self {
         assert!(
             !method.is_empty() && method.bytes().all(|b| b.is_ascii_uppercase()),
             "callback exemption {pattern:?}: method {method:?} is not an HTTP method"
@@ -141,7 +197,7 @@ impl OAuth2CallbackExemption {
             method: method.to_string(),
             pattern,
             segments,
-            check: Arc::new(check),
+            check,
         }
     }
 
@@ -180,9 +236,33 @@ impl OAuth2CallbackExemption {
     }
 
     /// Whether `method path` is this route AND carries a token the NF holds.
+    ///
+    /// A [`Self::for_verified_peer`] route is never admitted here, where no peer
+    /// identity is known: see [`Self::admits_from`].
     pub fn admits(&self, method: &str, path: &str) -> bool {
-        self.match_path(method, path)
-            .is_some_and(|cb| (self.check)(&cb))
+        match &self.check {
+            Check::Token(check) => self.match_path(method, path).is_some_and(|cb| check(&cb)),
+            Check::VerifiedPeer(_) => false,
+        }
+    }
+
+    /// [`Self::admits`] for a request whose connection's verified mutual-TLS client
+    /// certificate named `peer` (its NF Instance ID), or `None` when it presented
+    /// none (#1522).
+    pub async fn admits_from(&self, method: &str, path: &str, peer: Option<&str>) -> bool {
+        match &self.check {
+            Check::Token(_) => self.admits(method, path),
+            Check::VerifiedPeer(check) => {
+                let (Some(cb), Some(peer)) = (self.match_path(method, path), peer) else {
+                    return false;
+                };
+                let owned = OwnedCallbackPath {
+                    vars: cb.vars.iter().map(|v| v.to_string()).collect(),
+                    token: cb.token.to_string(),
+                };
+                check(owned, peer.to_string()).await
+            }
+        }
     }
 }
 
@@ -203,6 +283,22 @@ pub fn admits_without_bearer(
     path: &str,
 ) -> bool {
     exemptions.iter().any(|e| e.admits(method, path))
+}
+
+/// [`admits_without_bearer`] for a request whose connection's verified mutual-TLS
+/// client certificate named `peer` (#1522). The server's admission check.
+pub async fn admits_without_bearer_from(
+    exemptions: &[OAuth2CallbackExemption],
+    method: &str,
+    path: &str,
+    peer: Option<&str>,
+) -> bool {
+    for e in exemptions {
+        if e.admits_from(method, path, peer).await {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -312,6 +408,41 @@ mod tests {
             .match_path("POST", &format!("/nx-callback/v1/notify/{GOOD}"))
             .is_some());
         assert!(!deny.admits("POST", &format!("/nx-callback/v1/notify/{GOOD}")));
+    }
+
+    /// #1522: a verified-peer route is decided only with a peer identity. The sync
+    /// `admits` (no identity known) never admits it, nor `admits_from` with none;
+    /// with one, its check sees the path's parts and the peer.
+    #[tokio::test]
+    async fn a_verified_peer_route_needs_a_peer_identity_1522() {
+        let e = OAuth2CallbackExemption::for_verified_peer(
+            "POST",
+            "/nx-callback/v1/{var}/dereg-notify/{token}",
+            |cb, peer| async move { cb.vars == ["ue-1"] && cb.token == GOOD && peer == "udm-1" },
+        );
+        let path = format!("/nx-callback/v1/ue-1/dereg-notify/{GOOD}");
+        assert!(!e.admits("POST", &path), "no identity: not admitted");
+        assert!(!e.admits_from("POST", &path, None).await);
+        assert!(e.admits_from("POST", &path, Some("udm-1")).await);
+        assert!(!e.admits_from("POST", &path, Some("amf-1")).await);
+        assert!(
+            !e.admits_from(
+                "POST",
+                "/nx-callback/v1/ue-1/dereg-notify/x%2Fy",
+                Some("udm-1")
+            )
+            .await,
+            "the route shape is still matched strictly"
+        );
+        assert!(!admits_without_bearer(
+            std::slice::from_ref(&e),
+            "POST",
+            &path
+        ));
+        assert!(
+            admits_without_bearer_from(std::slice::from_ref(&e), "POST", &path, Some("udm-1"))
+                .await
+        );
     }
 
     #[test]
