@@ -167,7 +167,14 @@ pub struct AnalyticsEngine {
     ue_cells: HashMap<String, Vec<(u64, u64)>>, // (cell_id, timestamp)
     /// The TS 29.571 `UserLocation` last reported for each cell id, so a
     /// UE_MOBILITY answer can name the cell the way the AMF did (nextgsim#466).
+    /// Kept only while some tracked UE's history names the cell (#1428).
     cell_locations: HashMap<u64, serde_json::Value>,
+    /// How many samples across all tracked histories name each cell, so a
+    /// cell's location is dropped with its last sample (#1428).
+    cell_refs: HashMap<u64, usize>,
+    /// The bound on `ue_cells` and its least-recently-reported eviction
+    /// (#1428).
+    ue_bound: UeBound,
     /// Anomaly scores per SUPI
     anomaly_scores: HashMap<String, Vec<AbnormalBehaviourRecord>>,
     /// Active prediction model for NF_LOAD (issue #26): defaults to the OLS
@@ -176,6 +183,59 @@ pub struct AnalyticsEngine {
 }
 
 pub(crate) const MAX_SAMPLES: usize = 100;
+
+/// The default bound on the SUPIs whose mobility history is held (#1428),
+/// `nwdaf.amf_mobility.max_ues`. At [`MAX_SAMPLES`] 16-byte samples each,
+/// about 16 MB of history at the bound.
+pub const DEFAULT_MAX_TRACKED_UES: usize = 10_000;
+
+/// The bound on the per-SUPI mobility history (#1428): at most `max` SUPIs; when
+/// a report for a new SUPI would exceed it, the SUPI reported least recently is
+/// evicted with its history. Recency is the order of reports, not their
+/// timestamps, so a report carrying an old `timestamp` cannot keep a UE alive.
+#[derive(Debug)]
+struct UeBound {
+    max: usize,
+    /// The next recency stamp.
+    next: u64,
+    /// Each tracked SUPI's latest stamp.
+    stamp: HashMap<String, u64>,
+    /// Stamp → SUPI, oldest first.
+    order: std::collections::BTreeMap<u64, String>,
+    /// SUPIs evicted since start, for `/metrics`.
+    evicted: u64,
+}
+
+impl Default for UeBound {
+    fn default() -> Self {
+        Self {
+            max: DEFAULT_MAX_TRACKED_UES,
+            next: 0,
+            stamp: HashMap::new(),
+            order: std::collections::BTreeMap::new(),
+            evicted: 0,
+        }
+    }
+}
+
+impl UeBound {
+    /// Mark `supi` as reported now.
+    fn touch(&mut self, supi: &str) {
+        let stamp = self.next;
+        self.next += 1;
+        if let Some(old) = self.stamp.insert(supi.to_string(), stamp) {
+            self.order.remove(&old);
+        }
+        self.order.insert(stamp, supi.to_string());
+    }
+
+    /// The SUPI reported least recently, removed from the bound's books.
+    fn pop_oldest(&mut self) -> Option<String> {
+        let (_, supi) = self.order.pop_first()?;
+        self.stamp.remove(&supi);
+        Some(supi)
+    }
+}
 
 impl AnalyticsEngine {
     pub fn new() -> Self {
@@ -349,13 +409,77 @@ impl AnalyticsEngine {
         })
     }
 
-    /// Records a UE cell update for mobility analytics
+    /// Records a UE cell update for mobility analytics.
+    ///
+    /// #1428: at most [`max_tracked_ues`](Self::max_tracked_ues) SUPIs are held.
+    /// A report for a new SUPI beyond that evicts the SUPI reported least
+    /// recently, with its history, so an `anyUE` LOCATION_REPORT subscription
+    /// cannot grow this map for the life of the process.
     pub fn ingest_ue_cell(&mut self, supi: &str, cell_id: u64, timestamp: u64) {
-        let buf = self.ue_cells.entry(supi.into()).or_default();
-        if buf.len() >= MAX_SAMPLES {
-            buf.remove(0);
+        if !self.ue_cells.contains_key(supi) {
+            while self.ue_cells.len() >= self.ue_bound.max {
+                let Some(oldest) = self.ue_bound.pop_oldest() else {
+                    break;
+                };
+                if let Some(history) = self.ue_cells.remove(&oldest) {
+                    for (cell, _) in history {
+                        self.release_cell(cell);
+                    }
+                    self.ue_bound.evicted += 1;
+                }
+            }
         }
+        self.ue_bound.touch(supi);
+        let buf = self.ue_cells.entry(supi.into()).or_default();
+        let dropped = if buf.len() >= MAX_SAMPLES {
+            Some(buf.remove(0).0)
+        } else {
+            None
+        };
         buf.push((cell_id, timestamp));
+        *self.cell_refs.entry(cell_id).or_default() += 1;
+        if let Some(cell) = dropped {
+            self.release_cell(cell);
+        }
+    }
+
+    /// One sample naming `cell` is gone; forget the cell's location with its
+    /// last sample (#1428).
+    fn release_cell(&mut self, cell: u64) {
+        if let Some(n) = self.cell_refs.get_mut(&cell) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.cell_refs.remove(&cell);
+                self.cell_locations.remove(&cell);
+            }
+        }
+    }
+
+    /// Bound the SUPIs whose mobility history is held (#1428,
+    /// `nwdaf.amf_mobility.max_ues`; at least 1). Lowering it evicts at the next
+    /// report for a new SUPI.
+    pub fn set_max_tracked_ues(&mut self, max: usize) {
+        self.ue_bound.max = max.max(1);
+    }
+
+    /// The bound set by [`set_max_tracked_ues`](Self::set_max_tracked_ues).
+    pub fn max_tracked_ues(&self) -> usize {
+        self.ue_bound.max
+    }
+
+    /// The SUPIs whose mobility history is held now.
+    pub fn tracked_ue_count(&self) -> usize {
+        self.ue_cells.len()
+    }
+
+    /// The cells whose `UserLocation` is held now.
+    pub fn tracked_cell_count(&self) -> usize {
+        self.cell_locations.len()
+    }
+
+    /// SUPIs evicted by the bound since start.
+    pub fn evicted_ue_count(&self) -> u64 {
+        self.ue_bound.evicted
     }
 
     /// Records a UE location reported by the AMF (nextgsim#466): the cell goes
@@ -561,6 +685,65 @@ mod tests {
         assert_eq!(pred.current_cell, 2); // last cell is 2
                                           // From cell 2, most transitions go to cell 1
         assert_eq!(pred.predicted_next_cell, Some(1));
+    }
+
+    /// #1428: past the bound, the SUPI reported least recently is evicted with
+    /// its history; the newest, and a UE reported again since, are still held.
+    #[test]
+    fn the_least_recently_reported_ue_is_evicted_past_the_bound() {
+        let mut engine = AnalyticsEngine::new();
+        assert_eq!(engine.max_tracked_ues(), DEFAULT_MAX_TRACKED_UES);
+        engine.set_max_tracked_ues(3);
+        let loc = |c: u64| serde_json::json!({ "nrLocation": { "ncgi": { "nrCellId": c } } });
+        engine.ingest_ue_location("imsi-1", 10, loc(10), 1);
+        engine.ingest_ue_location("imsi-2", 20, loc(20), 2);
+        engine.ingest_ue_location("imsi-3", 30, loc(30), 3);
+        // imsi-1 reports again, so imsi-2 is now the least recent. Its report
+        // carries an older timestamp: recency is report order, not timestamps.
+        engine.ingest_ue_location("imsi-1", 11, loc(11), 0);
+        engine.ingest_ue_location("imsi-4", 40, loc(40), 4);
+
+        assert_eq!(engine.tracked_ue_count(), 3);
+        assert_eq!(engine.evicted_ue_count(), 1);
+        assert!(engine.ue_cell_history("imsi-2").is_none(), "evicted");
+        assert_eq!(engine.ue_cell_history("imsi-4"), Some(&[(40, 4)][..]));
+        assert_eq!(
+            engine.ue_cell_history("imsi-1"),
+            Some(&[(10, 1), (11, 0)][..])
+        );
+        assert!(engine.ue_cell_history("imsi-3").is_some());
+        // imsi-2's only cell went with it; the others are still named.
+        assert!(engine.cell_location(20).is_none());
+        assert_eq!(engine.cell_location(40), Some(&loc(40)));
+        assert_eq!(engine.tracked_cell_count(), 4);
+
+        // A UE already held never evicts another.
+        for t in 5..10 {
+            engine.ingest_ue_cell("imsi-4", 40, t);
+        }
+        assert_eq!(engine.evicted_ue_count(), 1);
+    }
+
+    /// #1428: a cell's location is dropped with the last sample that names it,
+    /// including a sample rolled out of a full per-SUPI history.
+    #[test]
+    fn a_cell_location_goes_with_its_last_sample() {
+        let mut engine = AnalyticsEngine::new();
+        let loc = serde_json::json!({ "nrLocation": { "ncgi": { "nrCellId": "7" } } });
+        engine.ingest_ue_location("imsi-a", 7, loc.clone(), 0);
+        engine.ingest_ue_location("imsi-b", 7, loc.clone(), 0);
+        for t in 1..=MAX_SAMPLES as u64 {
+            engine.ingest_ue_cell("imsi-a", 8, t);
+        }
+        assert_eq!(engine.cell_location(7), Some(&loc), "imsi-b still names 7");
+        for t in 1..=MAX_SAMPLES as u64 {
+            engine.ingest_ue_cell("imsi-b", 8, t);
+        }
+        assert!(engine.cell_location(7).is_none(), "no history names 7");
+        assert_eq!(
+            engine.ue_cell_history("imsi-a").map(<[_]>::len),
+            Some(MAX_SAMPLES)
+        );
     }
 
     #[test]
