@@ -221,6 +221,29 @@ struct TargetUeInfo {
 }
 
 impl TargetUeInfo {
+    /// The shape of this `tgt-ue` for a log line, e.g. `supis=1`: which members
+    /// are present and how many entries each holds, never the identifiers
+    /// themselves (#1494).
+    fn log_summary(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.any_ue {
+            parts.push("anyUe".to_string());
+        }
+        for (name, n) in [
+            ("supis", self.supis.len()),
+            ("gpsis", self.gpsis.len()),
+            ("intGroupIds", self.int_group_ids.len()),
+        ] {
+            if n > 0 {
+                parts.push(format!("{name}={n}"));
+            }
+        }
+        if self.ue_ip_addrs {
+            parts.push("ueIpAddrs".to_string());
+        }
+        parts.join(" ")
+    }
+
     /// Whether this restricts the request to an identified set of UEs, as
     /// opposed to `anyUe`.
     fn names_specific_ues(&self) -> bool {
@@ -469,10 +492,115 @@ pub async fn handle_analytics_info_query_with_ctx(
     ctx: &Arc<RwLock<NwdafContext>>,
     request: &SbiRequest,
 ) -> SbiResponse {
-    log::info!("Analytics Info Query: {}", request.header.uri);
-
     let params = request_query_params(request);
+    let response = analytics_info_answer(ctx, &params).await;
+    log::info!("{}", analytics_info_log_line(&params, &response));
+    response
+}
 
+/// The one log line of a Nnwdaf_AnalyticsInfo answer (#1494): the `event-id`,
+/// the shape of `tgt-ue`, the status, and what the answer carries.
+///
+/// The live SBI server strips the query from `header.uri`, so logging the URI
+/// named no event, and a UE_MOBILITY query from amfd could not be told from
+/// pcfd's NF_LOAD polls. This line is built from the parsed query and the
+/// response instead.
+///
+/// No subscriber identifier is logged: `tgt-ue` is summarised as counts
+/// (`supis=1`), never its SUPIs, GPSIs or group ids. The answer is described by
+/// its cells (`nrCellId`/`eutraCellId`), a ProblemDetails `cause`, or the
+/// length of its analytics member, none of which identifies a UE.
+fn analytics_info_log_line(params: &HashMap<String, String>, response: &SbiResponse) -> String {
+    let event = params
+        .get("event-id")
+        .map(String::as_str)
+        .filter(|t| !t.is_empty())
+        .map_or_else(|| "<no event-id>".to_string(), loggable_token);
+    let tgt_ue = match parse_target_ue(params.get("tgt-ue")) {
+        Ok(None) => String::new(),
+        Ok(Some(t)) => format!(" (tgt-ue {})", t.log_summary()),
+        Err(_) => " (tgt-ue malformed)".to_string(),
+    };
+    let body: Option<serde_json::Value> = response
+        .http
+        .content
+        .as_deref()
+        .and_then(|c| serde_json::from_str(c).ok());
+    let detail = match (&body, response.status) {
+        (Some(b), 200) => analytics_data_summary(b),
+        (Some(b), _) => b
+            .get("cause")
+            .and_then(|c| c.as_str())
+            .map(|c| format!(" {}", loggable_token(c)))
+            .unwrap_or_default(),
+        (None, _) => String::new(),
+    };
+    format!("AnalyticsInfo {event}{tgt_ue}: {}{detail}", response.status)
+}
+
+/// A query token (`event-id`, a `cause`) as it may be logged: kept when it is an
+/// enumeration-shaped token, otherwise replaced, so a client cannot inject
+/// line breaks or an unbounded string into the log.
+fn loggable_token(token: &str) -> String {
+    if !token.is_empty()
+        && token.len() <= 64
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        token.to_string()
+    } else {
+        "<invalid token>".to_string()
+    }
+}
+
+/// `, 1 UE, predicted 000000020` for a `ueMobs` answer, `, nfLoadLevelInfos: 3`
+/// for any other `AnalyticsData` member.
+fn analytics_data_summary(body: &serde_json::Value) -> String {
+    let Some(obj) = body.as_object() else {
+        return String::new();
+    };
+    if let Some(mobs) = obj.get("ueMobs").and_then(|m| m.as_array()) {
+        let loc_infos = || {
+            mobs.iter()
+                .filter_map(|m| m.get("locInfos").and_then(|l| l.as_array()))
+                .flatten()
+        };
+        let mut cells: Vec<&str> = Vec::new();
+        for info in loc_infos() {
+            let Some(loc) = info.get("loc") else { continue };
+            let cell = loc
+                .pointer("/nrLocation/ncgi/nrCellId")
+                .or_else(|| loc.pointer("/eutraLocation/ecgi/eutraCellId"))
+                .and_then(|c| c.as_str());
+            if let Some(cell) = cell {
+                if !cells.contains(&cell) {
+                    cells.push(cell);
+                }
+            }
+        }
+        // A prediction's locInfos carry `confidence`; statistics' never do
+        // (TS 29.520 Table 5.1.6.2.11-1, `amf_mobility::ue_mobility_infos`).
+        let kind = if loc_infos().any(|i| i.get("confidence").is_some()) {
+            "predicted"
+        } else {
+            "observed"
+        };
+        let ues = if mobs.len() == 1 { "UE" } else { "UEs" };
+        let cells: Vec<String> = cells.into_iter().map(loggable_token).collect();
+        return format!(", {} {ues}, {kind} {}", mobs.len(), cells.join(" "));
+    }
+    obj.iter()
+        .find_map(|(k, v)| v.as_array().map(|a| format!(", {k}: {}", a.len())))
+        .unwrap_or_default()
+}
+
+/// The Nnwdaf_AnalyticsInfo answer for `params`; see
+/// [`handle_analytics_info_query_with_ctx`].
+async fn analytics_info_answer(
+    ctx: &Arc<RwLock<NwdafContext>>,
+    params: &HashMap<String, String>,
+) -> SbiResponse {
     let event_token = match params.get("event-id") {
         Some(t) if !t.is_empty() => t.as_str(),
         _ => {
@@ -2414,6 +2542,118 @@ mod tests {
             resp.status, 204,
             "the window is accepted: {:?}",
             resp.http.content
+        );
+    }
+
+    /// #1494: the AnalyticsInfo log line names the event and the status of
+    /// each answer, so an NF_LOAD poll and a UE_MOBILITY query differ in the
+    /// log. Driven through the real handler on the live request shape: the query
+    /// in `http.params`, `header.uri` the path only.
+    #[tokio::test]
+    async fn the_analytics_info_log_line_names_the_event_and_the_status() {
+        let ctx = ctx_with_loads("AMF", "amf-1494-log", &[40, 50]);
+        let live = |pairs: &[(&str, String)]| {
+            let mut req = SbiRequest::get("/nnwdaf-analyticsinfo/v1/analytics");
+            for (k, v) in pairs {
+                req.http.params.insert((*k).to_string(), v.clone());
+            }
+            req
+        };
+
+        let req = live(&[("event-id", "NF_LOAD".to_string())]);
+        let resp = handle_analytics_info_query_with_ctx(&ctx, &req).await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            analytics_info_log_line(&request_query_params(&req), &resp),
+            "AnalyticsInfo NF_LOAD: 200, nfLoadLevelInfos: 1"
+        );
+
+        // A default build serves no UE_MOBILITY; the line still names the event,
+        // and the SUPI is summarised, not printed.
+        let supi = "imsi-999700000001494";
+        let req = live(&[
+            ("event-id", "UE_MOBILITY".to_string()),
+            ("tgt-ue", json!({ "supis": [supi] }).to_string()),
+        ]);
+        let resp = handle_analytics_info_query_with_ctx(&ctx, &req).await;
+        let line = analytics_info_log_line(&request_query_params(&req), &resp);
+        assert_eq!(
+            line,
+            format!(
+                "AnalyticsInfo UE_MOBILITY (tgt-ue supis=1): {}",
+                resp.status
+            )
+        );
+        assert!(!line.contains(supi), "{line}");
+
+        // An error answer carries its ProblemDetails cause.
+        let req = live(&[("event-id", "NOT_AN_EVENT".to_string())]);
+        let resp = handle_analytics_info_query_with_ctx(&ctx, &req).await;
+        assert_eq!(
+            analytics_info_log_line(&request_query_params(&req), &resp),
+            "AnalyticsInfo NOT_AN_EVENT: 400 INVALID_ANALYTICS_TYPE"
+        );
+        let req = live(&[]);
+        let resp = handle_analytics_info_query_with_ctx(&ctx, &req).await;
+        assert_eq!(
+            analytics_info_log_line(&request_query_params(&req), &resp),
+            "AnalyticsInfo <no event-id>: 400 MANDATORY_QUERY_PARAM_INCORRECT"
+        );
+    }
+
+    /// #1494: a UE_MOBILITY 200 is logged with its UE count and the cells it
+    /// names, prediction or statistics, and never with a SUPI or a token a client
+    /// could use to forge a line.
+    #[test]
+    fn a_ue_mobility_answer_is_logged_with_its_cells_and_no_supi() {
+        let supi = "imsi-999700000001494";
+        let params: HashMap<String, String> = [
+            ("event-id".to_string(), "UE_MOBILITY".to_string()),
+            (
+                "tgt-ue".to_string(),
+                json!({ "supis": [supi], "intGroupIds": ["g-1"] }).to_string(),
+            ),
+        ]
+        .into();
+        let loc = |cell: &str| json!({ "nrLocation": { "ncgi": { "nrCellId": cell } } });
+        let answer = |mobs: Value| {
+            SbiResponse::with_status(200)
+                .with_json_body(&json!({ "ueMobs": mobs, "start": "x", "expiry": "y" }))
+                .expect("json")
+        };
+
+        let predicted = answer(json!([{
+            "ts": "t", "duration": 60,
+            "locInfos": [{ "loc": loc("000000020"), "confidence": 75 }],
+        }]));
+        let line = analytics_info_log_line(&params, &predicted);
+        assert_eq!(
+            line,
+            "AnalyticsInfo UE_MOBILITY (tgt-ue supis=1 intGroupIds=1): 200, 1 UE, \
+             predicted 000000020"
+        );
+        assert!(!line.contains(supi) && !line.contains("g-1"), "{line}");
+
+        let observed = answer(json!([
+            { "locInfos": [{ "loc": loc("000000010") }, { "loc": loc("000000020") }] },
+            { "locInfos": [{ "loc": loc("000000020") }] },
+        ]));
+        assert!(
+            analytics_info_log_line(&params, &observed)
+                .ends_with(": 200, 2 UEs, observed 000000010 000000020"),
+            "{}",
+            analytics_info_log_line(&params, &observed)
+        );
+
+        // A client-chosen token never reaches the log verbatim.
+        let forged: HashMap<String, String> = [(
+            "event-id".to_string(),
+            "X\nAnalyticsInfo NF_LOAD: 200".to_string(),
+        )]
+        .into();
+        assert_eq!(
+            analytics_info_log_line(&forged, &SbiResponse::with_status(400)),
+            "AnalyticsInfo <invalid token>: 400"
         );
     }
 
