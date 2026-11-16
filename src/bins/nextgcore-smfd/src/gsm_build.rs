@@ -34,6 +34,9 @@ pub mod message_type {
     pub const PDU_SESSION_RELEASE_COMMAND: u8 = 0xd3;
     pub const PDU_SESSION_RELEASE_COMPLETE: u8 = 0xd4;
     pub const GSM_STATUS: u8 = 0xd6;
+    pub const SERVICE_LEVEL_AUTHENTICATION_COMPLETE: u8 = 0xd9;
+    pub const REMOTE_UE_REPORT: u8 = 0xda;
+    pub const REMOTE_UE_REPORT_RESPONSE: u8 = 0xdb;
 }
 
 /// QoS rule operation codes

@@ -1777,20 +1777,25 @@ pub async fn call_smf_update_sm_context_n1_only(
     sm_context_ref: &str,
     n1_sm_msg: &[u8],
 ) -> SbiResult<()> {
-    call_smf_update_sm_context_n1_at(smf_host, smf_port, sm_context_ref, n1_sm_msg, None).await
+    call_smf_update_sm_context_n1_at(smf_host, smf_port, sm_context_ref, n1_sm_msg, None)
+        .await
+        .map(|_| ())
 }
 
 /// [`call_smf_update_sm_context_n1_only`] with the UE's User Location Information as
 /// `ueLocation` (TS 29.502 SmContextUpdateData), when the AMF has it: TS 23.502
 /// §4.3.3.2 step 11 forwards the N1 SM container "and User Location Information
 /// received from the AN" (#1465).
+///
+/// Returns the `n1SmMsg` the SMF answered with, empty when it sent none (#1471: a
+/// 5GSM STATUS or a REMOTE UE REPORT RESPONSE for the UE).
 pub async fn call_smf_update_sm_context_n1_at(
     smf_host: &str,
     smf_port: u16,
     sm_context_ref: &str,
     n1_sm_msg: &[u8],
     ue_location: Option<serde_json::Value>,
-) -> SbiResult<()> {
+) -> SbiResult<Vec<u8>> {
     let client = crate::attach_oauth2(
         SbiClient::for_peer(smf_host, smf_port),
         nextgcore_sbi::types::NfType::Smf,
@@ -1817,11 +1822,19 @@ pub async fn call_smf_update_sm_context_n1_at(
             response.status
         )));
     }
+    let response_body: serde_json::Value = response
+        .http
+        .content
+        .as_deref()
+        .and_then(|c| serde_json::from_str(c).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let n1_answer = extract_binary_ref(&response, &response_body, "n1SmMsg").unwrap_or_default();
     log::info!(
-        "SMF SM Context Updated (N1 only): ref={sm_context_ref}, status {}",
-        response.status
+        "SMF SM Context Updated (N1 only): ref={sm_context_ref}, status {}, n1_len={}",
+        response.status,
+        n1_answer.len()
     );
-    Ok(())
+    Ok(n1_answer)
 }
 
 /// Sends POST /nsmf-pdusession/v1/sm-contexts/{ref}/modify with N1 SM info
