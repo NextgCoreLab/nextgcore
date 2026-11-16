@@ -350,7 +350,9 @@ async fn nap(d: Duration) {
 }
 
 /// Subscribe failures, by reason. `refused` (401/403) is the stuck state of an
-/// SMF that enforces OAuth2: this EES sends no access token (nextgcore#1529).
+/// SMF that enforces OAuth2 when this EES has no token source (no `--nrf-uri`,
+/// #1529) or presents one the SMF does not accept; `no-token` is an NRF that did
+/// not issue one, so nothing was sent.
 pub static SUBSCRIBE_FAILURES: nextgcore_metrics::nf::CounterFamily =
     nextgcore_metrics::nf::CounterFamily::new(
         "eees_d443a_qos_mon_subscribe_failures_total",
@@ -874,15 +876,24 @@ pub fn notif_uri(tls: bool, host: &str, port: u16, token: &str) -> String {
     format!("{scheme}://{host}:{port}/{ROUTE_ROOT}/{ROUTE_QOS_MON}/{token}")
 }
 
+/// The client for the SMF. With an NRF (`--nrf-uri`, #1529) it attaches an
+/// NRF-issued access token for scope `nsmf-event-exposure` (derived from the
+/// request path) to every request, the Subscribe, the check and the DELETE alike
+/// (TS 33.501 §13.4.1.1.2, TS 29.500 §6.7.3); a token it cannot obtain fails the
+/// request rather than sending it bare. Without an NRF, no token.
 fn client(smf_uri: &str) -> Option<SbiClient> {
     let (scheme, host, port) = parse_uri(smf_uri)?;
-    Some(SbiClient::new(
+    let client = SbiClient::new(
         SbiClientConfig::new(host, port)
             .with_scheme(scheme)
             .with_connect_timeout(Duration::from_secs(2))
             .with_request_timeout(Duration::from_secs(3))
             .with_pool_size(1),
-    ))
+    );
+    Some(match crate::nrf_af::oauth2_client() {
+        Some(oauth2) => client.with_oauth2(oauth2, nextgcore_sbi::types::NfType::Smf),
+        None => client,
+    })
 }
 
 /// What the subscription check found.
@@ -947,6 +958,9 @@ pub async fn run_subscriber(
                                 ("refused", format!("status {}", r.status))
                             }
                             Ok(r) => ("rejected", format!("status {}", r.status)),
+                            Err(e @ nextgcore_sbi::SbiError::AuthenticationFailed(_)) => {
+                                ("no-token", format!("{e}"))
+                            }
                             Err(e) => ("unreachable", format!("{e}")),
                         };
                         SUBSCRIBE_FAILURES.inc(&[reason]);
@@ -955,9 +969,14 @@ pub async fn run_subscriber(
                                 warn,
                                 DEMO_KEY,
                                 "Nsmf_EventExposure_Subscribe QOS_MON REFUSED by the SMF at \
-                                 {smf_uri} ({why}): this EES sends no OAuth2 access token \
-                                 (nextgcore#1529), so measured-budget ranks on the advertisement \
-                                 (src=static-fallback); retrying in {backoff:?}"
+                                 {smf_uri} ({why}): {}, so measured-budget ranks on the \
+                                 advertisement (src=static-fallback); retrying in {backoff:?}",
+                                if crate::nrf_af::oauth2_client().is_some() {
+                                    "the SMF did not accept this EES's NRF-issued access token"
+                                } else {
+                                    "this EES has no NRF (--nrf-uri), so it sends no OAuth2 \
+                                     access token (TS 33.501 §13.4.1)"
+                                }
                             );
                         } else {
                             nextgcore_demo::demo_log!(

@@ -25,7 +25,7 @@ ees:
     uri: http://172.23.0.10:7777
 ```
 
-The docker deployment does its real configuration on the command line: `command: ["--sbi-addr", "172.23.0.31", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]`. Note that `--nrf-uri` is a flag the current `Args` struct no longer defines — the `--ecs-uri` doc comment states it "Replaces the former `--nrf-uri`" (eesd-01 removed NRF self-registration) — so the shipped compose command line is stale: clap rejects an unknown argument, so `eesd` started with that command line exits with a usage error instead of serving.
+The docker deployment does its real configuration on the command line: `command: ["--sbi-addr", "172.23.0.31", "--sbi-port", "7777"]`. It passes no `--nrf-uri`, so that EES has no NRF and sends no access token to 5GC NFs (see `--nrf-uri` below, #1529).
 
 ## YAML parameters
 
@@ -37,7 +37,7 @@ Since the YAML file is never parsed, **every** field in the shipped example is d
 
 - **`logger.level` is read.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691).
 - **`ees.sbi.server[0]` is read (#1312).** The SBI bind is `--sbi-addr`/`--sbi-port`, else `address`/`port` here, else `127.0.0.1` and the default port. The advertised host is `--sbi-advertise`, else `NEXTGCORE_SBI_ADVERTISE`, else `advertise` here, else the bind address when it is not a wildcard; it is used in the `EESRegistration` endpoint sent to the ECS (the EES has no NRF registration); with a wildcard bind and nothing to advertise, the ECS registration is skipped and the reason logged. A wildcard is never advertised: with a wildcard bind and nothing set to advertise, the NF does not register and logs why. A config that does not parse fails startup (#1313).
-- **`ees.nrf.uri` is inert and doubly stale.** The EES does not register with the NRF at all (eesd-01); the ECS apiRoot is `--ecs-uri`, a CLI flag only.
+- **`ees.nrf.uri` is inert.** The NRF is `--nrf-uri`, a CLI flag only (#1529); the ECS apiRoot is `--ecs-uri`, likewise.
 
 The file exists for visual consistency with the other NF configs and to satisfy the compose volume mount.
 
@@ -59,6 +59,7 @@ From the clap `Args` struct in `src/bins/nextgcore-eesd/src/main.rs`:
 | `--tls-key` | path | `/etc/nextgcore/tls/server.key` (when `--tls`) | TLS private key file. |
 | `--max-eas` | usize | `512` | Capacity cap, applied **per resource family** (see behavior notes). |
 | `--ecs-uri` | string | unset | ECS apiRoot for EES self-registration over EDGE-6 (TS 29.558 §9.1 per code comment). When unset, the registration request is built and logged but skipped. |
+| `--nrf-uri` | string | unset | NRF apiRoot (#1529). When set, the EES registers at the NRF as an **AF** NF instance (TS 23.558 §6.2: the EES acts as an AF toward the 5GC; TS 29.510 has no `EES` NF type), heartbeats and deregisters it, and presents an NRF-issued OAuth2 access token (TS 33.501 §13.4.1, client credentials grant with the shared CCA: `NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE`, public half under `NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR`) on its requests to 5GC NFs: today demo d443a's `Nsmf_EventExposure` Subscribe, check and DELETE (scope `nsmf-event-exposure`). A token the NRF does not issue fails the request (`reason="no-token"`) rather than sending it bare. When unset, no NRF registration and no token: an SMF enforcing OAuth2 refuses the Subscribe (`reason="refused"`). |
 | `--ees-id` | string | fresh `ees-<UUIDv4>` per start | EES identifier advertised to the ECS (`eesId`), and the `ees-id` this EES presents when it pulls an EEC context from a source EES (see EEC context relocation below). |
 | `--oauth2-jwks-file` | path | unset | JSON JWKS used to verify OAuth2 access tokens (CAPIF/NRF issuer). When unset, **every protected operation fails closed with 401** (authorization is mandatory, TS 29.558 §6 per code comment). |
 | `--callback-max-attempts` | u32 | `3` | Max delivery attempts per notification callback, including the first (clamped to ≥ 1); exhausting the budget drops the notification. |
