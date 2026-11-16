@@ -1993,9 +1993,21 @@ impl NgapServer {
     /// report (#981), so the next poll applies the answer within the caller's tick
     /// rather than up to `SCTP_RECV_TIMEOUT` later.
     async fn receive_n2_or_sbi_report(&mut self) -> Result<nextgcore_sctp::RecvOutcome> {
+        self.receive_n2_or_sbi_report_within(SCTP_RECV_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::receive_n2_or_sbi_report`] with the wait bounded by `timeout`. The
+    /// #981 wake tests (#1566) wait far longer than [`SCTP_RECV_TIMEOUT`], so a turn
+    /// ends `Timeout` only when no report came at all, however slowly a loaded
+    /// machine serves their stand-in SMF.
+    async fn receive_n2_or_sbi_report_within(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<nextgcore_sctp::RecvOutcome> {
         let outcome = self
             .transport
-            .recv_or_wake(SCTP_RECV_TIMEOUT, self.sbi_offload.report_arrived())
+            .recv_or_wake(timeout, self.sbi_offload.report_arrived())
             .await
             .map_err(|e| anyhow::anyhow!("SCTP receive error: {e}"))?;
         if outcome == nextgcore_sctp::RecvOutcome::Data {
