@@ -409,6 +409,21 @@ async fn main() -> Result<()> {
             .to_string();
 
     nwdaf_context_init(nf_instance_id.clone(), args.max_subscriptions);
+    // #1428: bound the per-SUPI UE mobility history (least recently reported
+    // evicted). A malformed value fails start-up.
+    #[cfg(feature = "amf-mobility")]
+    {
+        let max_ues =
+            amf_mobility::max_ues_from_root(&config_root).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let ctx = nwdaf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        guard.lock_engine().set_max_tracked_ues(max_ues);
+        if amf_mobility_plan.serves() {
+            log::info!(
+                "ue-mobility: history bounded at {max_ues} UEs (nwdaf.amf_mobility.max_ues)"
+            );
+        }
+    }
 
     // Issue #1412: who the NRF lets discover this NWDAF and get a token for it.
     // A malformed configured list fails startup rather than registering one.
