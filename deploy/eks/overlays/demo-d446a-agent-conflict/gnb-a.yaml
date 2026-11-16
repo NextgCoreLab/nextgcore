@@ -96,7 +96,7 @@ spec:
         - -c
         - "set -eu\necho \"[wait-amf] waiting for AMF NGAP endpoint...\"\ni=0\nuntil nslookup amf.nextg-system.svc.cluster.local >/dev/null 2>&1; do\n  i=$((i+1))\n  [ \"$i\" -ge 60 ] && { echo \"[wait-amf]\
           \ FATAL: AMF DNS never resolved\"; exit 1; }\n  sleep 2\ndone\necho \"[wait-amf] AMF DNS resolves.\"\n# NGAP is userspace SCTP over UDP, so a TCP connect check would\n# always fail. Probe the\
-          \ AMF SBI port instead, which is TCP and\n# comes up in the same process.\ni=0\nuntil nc -z amf.nextg-system.svc.cluster.local 7777; do\n  i=$((i+1))\n  [ \"$i\" -ge 60 ] && { echo \"[wait-amf]\
+          \ AMF SBI port instead, which is TCP and\n# comes up in the same process.\ni=0\nuntil nc -z -w 2 amf.nextg-system.svc.cluster.local 7777; do\n  i=$((i+1))\n  [ \"$i\" -ge 60 ] && { echo \"[wait-amf]\
           \ FATAL: AMF SBI never accepted\"; exit 1; }\n  echo \"[wait-amf] waiting for AMF SBI... ($i/60)\"\n  sleep 2\ndone\necho \"[wait-amf] AMF ready.\"\n"
         image: busybox:1.36
         name: wait-amf

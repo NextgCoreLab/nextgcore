@@ -1011,19 +1011,35 @@ fn build_nf_profile(
 }
 
 /// The NF service consumers of Nnwdaf_AnalyticsInfo, TS 29.520 §4.3.1.3.2
-/// (29520-k00): PCF, NSSF, AMF, SMF, NEF, AF, LMF, OAM, NWDAF, DCCF, ADRF, UDM,
-/// NRF and SCP, in the clause's order. OAM is left out because it is not a
-/// TS 29.510 `NFType` (TS29510_Nnrf_NFManagement.yaml), so no NF profile, token
-/// request or discovery query can name it.
-///
-/// The default NF-level `allowedNfTypes` (issue #1412). The old list, AMF, SMF,
-/// PCF, NEF and SCP, made the NRF hide this NWDAF from, and refuse an
-/// `nnwdaf-*` token to, every other consumer the clause names: a trusted AF
-/// (TS 23.288 §6.1), an NSSF, an LMF or a UDM got `nfInstances: []` and
-/// `unauthorized_client`.
-const SPEC_ALLOWED_NF_TYPES: &[&str] = &[
+/// (`29520-k00.txt:4708-4995`): PCF, NSSF, AMF, SMF, NEF, AF, LMF, OAM, NWDAF,
+/// DCCF, ADRF, UDM, NRF and SCP, in the clause's order. OAM is left out because
+/// it is not a TS 29.510 `NFType` (TS29510_Nnrf_NFManagement.yaml), so no NF
+/// profile, token request or discovery query can name it. Set as that service's
+/// `NFService.allowedNfTypes` (#1415).
+const ANALYTICSINFO_ALLOWED_NF_TYPES: &[&str] = &[
     "PCF", "NSSF", "AMF", "SMF", "NEF", "AF", "LMF", "NWDAF", "DCCF", "ADRF", "UDM", "NRF", "SCP",
 ];
+
+/// The NF service consumers of Nnwdaf_EventsSubscription, TS 29.520 §4.2.1.3.2
+/// (`29520-k00.txt:2501-2820`): the AnalyticsInfo consumers plus the CEF
+/// (l.2771) and the UPF (l.2816), in the clause's order, OAM again left out.
+/// Set as that service's `NFService.allowedNfTypes` (#1415).
+const EVENTSSUBSCRIPTION_ALLOWED_NF_TYPES: &[&str] = &[
+    "PCF", "NSSF", "AMF", "SMF", "NEF", "AF", "CEF", "LMF", "NWDAF", "DCCF", "ADRF", "UDM", "NRF",
+    "SCP", "UPF",
+];
+
+/// The default NF-level `allowedNfTypes` (issue #1412, #1415): the union of the
+/// per-service lists ([`EVENTSSUBSCRIPTION_ALLOWED_NF_TYPES`] is a superset of
+/// the other two). nrfd authorizes a service only when the profile AND the
+/// service allow the consumer, so the NF level must admit every service's
+/// consumers, and each service narrows it to its own clause.
+///
+/// The pre-#1412 list, AMF, SMF, PCF, NEF and SCP, made the NRF hide this NWDAF
+/// from, and refuse an `nnwdaf-*` token to, every other consumer the clauses
+/// name: a trusted AF (TS 23.288 §6.1), an NSSF, an LMF or a UDM got
+/// `nfInstances: []` and `unauthorized_client`.
+const SPEC_ALLOWED_NF_TYPES: &[&str] = EVENTSSUBSCRIPTION_ALLOWED_NF_TYPES;
 
 /// The NF service consumers of Nnwdaf_MLModelProvision, TS 29.520 §4.5.1.3.2:
 /// the NWDAF (containing an AnLF or MTLF) and the LMF. Set as that service's
@@ -1073,7 +1089,7 @@ fn allowed_nf_types_from_config(config_path: &str) -> Result<Vec<String>, String
     if items.is_empty() {
         return Err(format!(
             "{key} is empty; list the NF types allowed to consume this NWDAF, or omit the key \
-             for the TS 29.520 §4.3.1.3.2 default {SPEC_ALLOWED_NF_TYPES:?}"
+             for the TS 29.520 default {SPEC_ALLOWED_NF_TYPES:?}"
         ));
     }
     let mut types: Vec<String> = Vec::with_capacity(items.len());
@@ -1259,7 +1275,9 @@ fn nwdaf_services(
             "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
             "scheme": "http",
             "nfServiceStatus": "REGISTERED",
-            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
+            // TS 29.520 §4.2.1.3.2 (#1415): the CEF and the UPF too.
+            "allowedNfTypes": EVENTSSUBSCRIPTION_ALLOWED_NF_TYPES
         }),
         serde_json::json!({
             "serviceInstanceId": format!("{}-nnwdaf-analyticsinfo", nf_instance_id),
@@ -1267,7 +1285,9 @@ fn nwdaf_services(
             "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
             "scheme": "http",
             "nfServiceStatus": "REGISTERED",
-            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
+            // TS 29.520 §4.3.1.3.2 (#1415): the NF-level union is wider.
+            "allowedNfTypes": ANALYTICSINFO_ALLOWED_NF_TYPES
         }),
     ];
     if ml_provision == MlProvision::Offered {
@@ -2371,8 +2391,10 @@ mod allowed_nf_types_1412_tests {
         out
     }
 
+    /// #1415: the NF-level default is the union of the services' consumer
+    /// lists, §4.2.1.3.2 being the widest (§4.3.1.3.2 plus CEF and UPF).
     #[test]
-    fn the_default_profile_lists_the_ts29520_4_3_1_3_2_consumers() {
+    fn the_default_profile_lists_the_union_of_the_service_consumers() {
         let profile = profile_json("nwdaf-1412-default", &spec_allowed_nf_types());
         let listed: Vec<&str> = profile["allowedNfTypes"]
             .as_array()
@@ -2383,12 +2405,90 @@ mod allowed_nf_types_1412_tests {
         assert_eq!(
             listed,
             [
-                "PCF", "NSSF", "AMF", "SMF", "NEF", "AF", "LMF", "NWDAF", "DCCF", "ADRF", "UDM",
-                "NRF", "SCP"
+                "PCF", "NSSF", "AMF", "SMF", "NEF", "AF", "CEF", "LMF", "NWDAF", "DCCF", "ADRF",
+                "UDM", "NRF", "SCP", "UPF"
             ],
-            "TS 29.520 §4.3.1.3.2, in the clause's order, without OAM (not an NFType)"
+            "TS 29.520 §4.2.1.3.2, in the clause's order, without OAM (not an NFType)"
         );
         assert!(!listed.contains(&"OAM"));
+        let mut union: Vec<&str> = ANALYTICSINFO_ALLOWED_NF_TYPES
+            .iter()
+            .chain(EVENTSSUBSCRIPTION_ALLOWED_NF_TYPES)
+            .chain(MLMODELPROVISION_ALLOWED_NF_TYPES)
+            .copied()
+            .collect();
+        union.sort_unstable();
+        union.dedup();
+        let mut sorted = listed.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, union, "the NF level is exactly the services' union");
+    }
+
+    /// #1415: each service registers its own clause's list, and the real
+    /// nrfd's `authorizes_service` (profile AND service) grants the CEF and the
+    /// UPF EventsSubscription but not AnalyticsInfo.
+    #[test]
+    fn nrfd_authorizes_eventssubscription_for_cef_and_upf_only_there() {
+        let mut doc = profile_json("nwdaf-1415", &spec_allowed_nf_types());
+        doc["nfServices"] = serde_json::Value::Array(nwdaf_services(
+            "nwdaf-1415",
+            "127.0.0.1",
+            7815,
+            MlProvision::Offered,
+        ));
+        let service_list = |name: &str| -> Vec<String> {
+            doc["nfServices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["serviceName"] == name)
+                .and_then(|s| s["allowedNfTypes"].as_array())
+                .unwrap_or_else(|| panic!("{name} carries allowedNfTypes"))
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(
+            service_list("nnwdaf-eventssubscription"),
+            EVENTSSUBSCRIPTION_ALLOWED_NF_TYPES
+        );
+        assert_eq!(
+            service_list("nnwdaf-analyticsinfo"),
+            ANALYTICSINFO_ALLOWED_NF_TYPES
+        );
+
+        let producer = NfProfile::from_json(&doc).expect("nrfd accepts the profile");
+        for consumer in ["CEF", "UPF"] {
+            assert_eq!(
+                producer.authorizes_service(consumer, "nnwdaf-eventssubscription"),
+                (true, true),
+                "{consumer} is a §4.2.1.3.2 consumer"
+            );
+            assert_eq!(
+                producer.authorizes_service(consumer, "nnwdaf-analyticsinfo"),
+                (true, false),
+                "{consumer} is not a §4.3.1.3.2 consumer"
+            );
+            assert_eq!(
+                producer.authorizes_service(consumer, "nnwdaf-mlmodelprovision"),
+                (true, false),
+                "{consumer} is not a §4.5.1.3.2 consumer"
+            );
+        }
+        for consumer in ANALYTICSINFO_ALLOWED_NF_TYPES {
+            for service in ["nnwdaf-eventssubscription", "nnwdaf-analyticsinfo"] {
+                assert_eq!(
+                    producer.authorizes_service(consumer, service),
+                    (true, true),
+                    "{consumer} keeps {service}"
+                );
+            }
+        }
+        assert_eq!(
+            producer.authorizes_service("CHF", "nnwdaf-eventssubscription"),
+            (true, false),
+            "a type no clause lists stays barred"
+        );
     }
 
     #[test]

@@ -38,6 +38,7 @@ nextgcore-dbi = { path = "../../libs/nextgcore-dbi" }
 nextgcore-app = { path = "../../libs/nextgcore-app" }
 
 [dev-dependencies]
+nextgcore-sbi = { workspace = true }
 proptest.workspace = true
 
 [lints]

@@ -2877,6 +2877,8 @@ fn empty_any_ue_aoi_report(sub: &EventSubscription) -> Value {
 /// Accepted and logged, never refused: it is an optional IE on a conformant
 /// subscription.
 pub fn fire_ues_in_area_report() {
+    #[cfg(test)]
+    UES_IN_AREA_FIRES_ON_THIS_THREAD.with(|n| n.set(n.get() + 1));
     let ctx = amf_self();
     let subs = {
         let Ok(guard) = ctx.read() else {
@@ -2957,6 +2959,23 @@ pub fn fire_ues_in_area_report() {
             }
         });
     }
+}
+
+// Test-only attribution for [`fire_ues_in_area_report`] (#1420 review): how many
+// times it ran on this thread. The report is any-UE, so a report at a subscriber
+// cannot show which handler fired it. A test on a current-thread runtime reads this
+// before and after its own handler call. Per thread, so no lock is needed and no
+// other test's fire is counted.
+#[cfg(test)]
+thread_local! {
+    static UES_IN_AREA_FIRES_ON_THIS_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: [`fire_ues_in_area_report`] calls on this thread so far.
+#[cfg(test)]
+pub(crate) fn ues_in_area_fires_on_this_thread() -> u64 {
+    UES_IN_AREA_FIRES_ON_THIS_THREAD.with(std::cell::Cell::get)
 }
 
 /// Fire a `SUBSCRIPTION_ID_CHANGE` or `SUBSCRIPTION_ID_ADDITION` to a

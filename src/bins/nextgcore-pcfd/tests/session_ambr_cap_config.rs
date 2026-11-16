@@ -1,6 +1,13 @@
 //! #1402: `pcf.policy.session_ambr_cap` at pcfd start-up, through the real binary.
 //! An unknown value fails start-up naming the setting; a known one is logged as in
 //! force.
+//!
+//! #1521: these spawn pcfd on probed ports without waiting for a listener, and
+//! cannot lose to the #1497 bind race. Everything they assert is in stderr
+//! BEFORE pcfd binds anything: `app::run` logs the setting in force, and fails
+//! on an unknown one, before the boot restoration and long before the SBI and
+//! metrics listeners start. A port lost afterwards ends the run after the
+//! asserted lines are out.
 
 use std::io::{BufRead, BufReader, Read};
 use std::net::TcpListener;

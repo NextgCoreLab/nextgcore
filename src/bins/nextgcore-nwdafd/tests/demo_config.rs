@@ -4,9 +4,10 @@
 //! switch and an absent block leave the process unchanged.
 
 use std::io::Read;
-use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+use nextgcore_sbi::test_support::{free_port, NfProcess, NfSpawn};
 
 struct Killed(Child);
 impl Drop for Killed {
@@ -16,55 +17,77 @@ impl Drop for Killed {
     }
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// The SBI port's place in a config template; [`running`] and [`run_to_exit`]
+/// fill it in.
+const SBI_PORT: &str = "__SBI_PORT__";
+
+/// A config template: `nwdaf.sbi` on [`SBI_PORT`], then `demo`.
+fn config(_tag: &str, demo: &str) -> String {
+    format!(
+        "nwdaf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n        port: {SBI_PORT}\n{demo}"
+    )
 }
 
-fn config(tag: &str, demo: &str) -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "nwdafd-demo-{tag}-{}-{}.yaml",
-        std::process::id(),
-        free_port()
-    ));
-    std::fs::write(
-        &path,
-        format!(
-            "nwdaf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n        port: {}\n{demo}",
-            free_port()
-        ),
-    )
-    .unwrap();
-    path
+fn nwdafd_args(cmd: &mut Command, config: &std::path::Path, metrics_port: u16) {
+    cmd.arg("-c")
+        .arg(config)
+        // No NRF: registration and the AMF subscription fail and retry, which
+        // is all this test needs.
+        .args(["--nrf-uri", "http://127.0.0.1:1"])
+        .env("NEXTGCORE_SBI_PROFILE", "dev")
+        .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
+        .env("RUST_LOG", "info")
+        .env("NWDAF_METRICS_PORT", metrics_port.to_string());
 }
 
-fn spawn(config: &std::path::Path, metrics_port: u16) -> Killed {
-    Killed(
-        Command::new(env!("CARGO_BIN_EXE_nextgcore-nwdafd"))
-            .arg("-c")
-            .arg(config)
-            // No NRF: registration and the AMF subscription fail and retry, which
-            // is all this test needs.
-            .args(["--nrf-uri", "http://127.0.0.1:1"])
-            .env("NEXTGCORE_SBI_PROFILE", "dev")
-            .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
-            .env("RUST_LOG", "info")
-            .env("NWDAF_METRICS_PORT", metrics_port.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn nwdafd"),
+/// Start nwdafd on `template` and wait until its SBI port accepts (and, in a
+/// build that serves `/metrics`, its metrics endpoint is up). Returns the
+/// process and its metrics port; the SBI port is `nf.port()`.
+///
+/// #1521: through the shared `NfSpawn`, which respawns on fresh ports when
+/// nwdafd loses a probed one to another process (the #1497 race). The SBI bind
+/// is fatal; the metrics bind is not, and a lost one used to surface as
+/// "/metrics" timing out. The start-up-failure tests use [`run_to_exit`]:
+/// nwdafd validates its `demo:` block and `nwdaf.role` before it binds
+/// anything, so they lose no bind.
+fn running(template: &str) -> (NfProcess, u16) {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let spawn = NfSpawn::new(
+        env!("CARGO_BIN_EXE_nextgcore-nwdafd"),
+        &format!("nwdafd-demo-{n}"),
     )
+    .ready_when_accepting(std::net::Ipv4Addr::LOCALHOST.into());
+    #[cfg(any(feature = "amf-mobility", feature = "demo-d441e-model-retrain"))]
+    let spawn = spawn.ready_when_logged("NWDAF metrics endpoint on http://");
+    let mut metrics_port = 0;
+    let nf = spawn.spawn(|cmd, sbi_port, dir| {
+        metrics_port = nextgcore_sbi::test_support::spawn_port();
+        let config = dir.join("nwdaf.yaml");
+        std::fs::write(&config, template.replace(SBI_PORT, &sbi_port.to_string())).unwrap();
+        nwdafd_args(cmd, &config, metrics_port);
+    });
+    (nf, metrics_port)
 }
 
 /// Run to exit (start-up failure), returning (success, stderr).
-fn run_to_exit(config: &std::path::Path) -> (bool, String) {
-    let mut child = spawn(config, free_port());
+fn run_to_exit(template: &str) -> (bool, String) {
+    let path = std::env::temp_dir().join(format!(
+        "nwdafd-demo-exit-{}-{}.yaml",
+        std::process::id(),
+        free_port()
+    ));
+    std::fs::write(&path, template.replace(SBI_PORT, &free_port().to_string())).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nextgcore-nwdafd"));
+    nwdafd_args(&mut cmd, &path, free_port());
+    let mut child = Killed(
+        cmd.stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn nwdafd"),
+    );
     let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
+    let out = loop {
         if let Some(status) = child.0.try_wait().unwrap() {
             let mut err = String::new();
             child
@@ -74,11 +97,13 @@ fn run_to_exit(config: &std::path::Path) -> (bool, String) {
                 .unwrap()
                 .read_to_string(&mut err)
                 .unwrap();
-            return (status.success(), err);
+            break (status.success(), err);
         }
         assert!(Instant::now() < deadline, "nwdafd did not exit");
         std::thread::sleep(Duration::from_millis(50));
-    }
+    };
+    let _ = std::fs::remove_file(&path);
+    out
 }
 
 #[cfg(any(feature = "amf-mobility", feature = "demo-d441e-model-retrain"))]
@@ -145,23 +170,14 @@ fn mode_on_logs_the_banner_and_exports_the_metric() {
         "on",
         "demo:\n  enabled: true\n  d441c-amf-mobility:\n    enabled: true\n    mode: on\n",
     );
-    let port = free_port();
-    let mut child = spawn(&cfg, port);
+    let (child, port) = running(&cfg);
     let body = scrape(port, Duration::from_secs(20)).expect("/metrics");
     assert!(
         body.contains(r#"nextg_demo_enabled{demo="d441c-amf-mobility",mode="on"} 1"#),
         "{body}"
     );
     assert!(body.contains("nwdaf_ue_mobility_serving 1"), "{body}");
-    let _ = child.0.kill();
-    let mut err = String::new();
-    child
-        .0
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut err)
-        .unwrap();
+    let err = child.log();
     assert!(
         err.contains("DEMO MODE ACTIVE: d441c-amf-mobility=on"),
         "{err}"
@@ -185,23 +201,14 @@ fn the_kill_switch_and_an_absent_block_are_demo_off() {
         ("absent", ""),
     ] {
         let cfg = config(tag, demo);
-        let port = free_port();
-        let mut child = spawn(&cfg, port);
+        let (child, port) = running(&cfg);
         let body = scrape(port, Duration::from_secs(20)).expect("/metrics");
         assert!(!body.contains("nextg_demo_enabled"), "{tag}: {body}");
         assert!(
             body.contains("nwdaf_ue_mobility_serving 0"),
             "{tag}: {body}"
         );
-        let _ = child.0.kill();
-        let mut err = String::new();
-        child
-            .0
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut err)
-            .unwrap();
+        let err = child.log();
         assert!(!err.contains("DEMO MODE ACTIVE"), "{tag}: {err}");
         assert!(!err.contains("[demo:"), "{tag}: {err}");
     }
@@ -243,18 +250,7 @@ fn d441a_mode_bogus_fails_startup_with_unknown_mode() {
 #[cfg(feature = "demo-d441a-congestion-loop")]
 #[test]
 fn d441a_modes_and_demo_off_shapes() {
-    let read_err = |child: &mut Killed| {
-        let _ = child.0.kill();
-        let mut err = String::new();
-        child
-            .0
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut err)
-            .unwrap();
-        err
-    };
+    let read_err = |child: &NfProcess| child.log();
     for mode in ["statistics", "prediction", "no-loop"] {
         let cfg = config(
             &format!("d441a-{mode}"),
@@ -262,8 +258,7 @@ fn d441a_modes_and_demo_off_shapes() {
                 "demo:\n  enabled: true\n  d441a-congestion-loop:\n    enabled: true\n    mode: {mode}\n"
             ),
         );
-        let port = free_port();
-        let mut child = spawn(&cfg, port);
+        let (child, port) = running(&cfg);
         let body = scrape(port, Duration::from_secs(20)).expect("/metrics");
         assert!(
             body.contains(&format!(
@@ -272,7 +267,7 @@ fn d441a_modes_and_demo_off_shapes() {
             "{body}"
         );
         assert!(body.contains("nwdaf_udc_serving 1"), "{body}");
-        let err = read_err(&mut child);
+        let err = read_err(&child);
         assert!(
             err.contains(&format!("DEMO MODE ACTIVE: d441a-congestion-loop={mode}")),
             "{err}"
@@ -293,12 +288,11 @@ fn d441a_modes_and_demo_off_shapes() {
         ),
     ] {
         let cfg = config(tag, demo);
-        let port = free_port();
-        let mut child = spawn(&cfg, port);
+        let (child, port) = running(&cfg);
         let body = scrape(port, Duration::from_secs(20)).expect("/metrics");
         assert!(!body.contains("nextg_demo_enabled"), "{tag}: {body}");
         assert!(body.contains("nwdaf_udc_serving 0"), "{tag}: {body}");
-        let err = read_err(&mut child);
+        let err = read_err(&child);
         assert!(!err.contains("DEMO MODE ACTIVE"), "{tag}: {err}");
         assert!(!err.contains("[demo:"), "{tag}: {err}");
     }
@@ -310,19 +304,9 @@ fn d441a_modes_and_demo_off_shapes() {
 /// start-up, in every build.
 #[test]
 fn an_unknown_nwdaf_role_fails_startup() {
-    let path = std::env::temp_dir().join(format!(
-        "nwdafd-role-bogus-{}-{}.yaml",
-        std::process::id(),
-        free_port()
-    ));
-    std::fs::write(
-        &path,
-        format!(
-            "nwdaf:\n  role: bogus\n  sbi:\n    server:\n      - address: 127.0.0.1\n        port: {}\n",
-            free_port()
-        ),
-    )
-    .unwrap();
+    let path = format!(
+        "nwdaf:\n  role: bogus\n  sbi:\n    server:\n      - address: 127.0.0.1\n        port: {SBI_PORT}\n"
+    );
     let (ok, err) = run_to_exit(&path);
     assert!(!ok, "start-up must fail");
     assert!(err.contains("nwdaf.role must be one of"), "{err}");
@@ -337,19 +321,11 @@ fn an_anlf_role_serves_no_mlmodelprovision() {
         .build()
         .unwrap();
     for (role, expected) in [("anlf", 404u16), ("both", 201)] {
-        let sbi_port = free_port();
-        let path = std::env::temp_dir().join(format!(
-            "nwdafd-role-{role}-{}-{sbi_port}.yaml",
-            std::process::id()
-        ));
-        std::fs::write(
-            &path,
-            format!(
-                "nwdaf:\n  role: {role}\n  sbi:\n    server:\n      - address: 127.0.0.1\n        port: {sbi_port}\n"
-            ),
-        )
-        .unwrap();
-        let mut child = spawn(&path, free_port());
+        let path = format!(
+            "nwdaf:\n  role: {role}\n  sbi:\n    server:\n      - address: 127.0.0.1\n        port: {SBI_PORT}\n"
+        );
+        let (child, _) = running(&path);
+        let sbi_port = child.port();
         let status = rt.block_on(async {
             let client = nextgcore_sbi::SbiClient::new(nextgcore_sbi::SbiClientConfig::new(
                 "127.0.0.1",
@@ -374,7 +350,7 @@ fn an_anlf_role_serves_no_mlmodelprovision() {
             }
         });
         assert_eq!(status, expected, "role {role}");
-        let _ = child.0.kill();
+        drop(child);
     }
 }
 
@@ -414,25 +390,9 @@ fn d441e_mode_bogus_fails_startup_with_unknown_mode() {
 #[test]
 fn d441e_modes_and_demo_off_shapes() {
     let anlf = "nwdaf:\n  role: anlf\n  anlf:\n    mtlf_uri: http://127.0.0.1:1\n";
-    let read_err = |child: &mut Killed| {
-        let _ = child.0.kill();
-        let mut err = String::new();
-        child
-            .0
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut err)
-            .unwrap();
-        err
-    };
-    let cfg_with = |tag: &str, demo: &str| {
-        let path = config(tag, demo);
-        let text = std::fs::read_to_string(&path).unwrap();
-        // config() writes `nwdaf:\n  sbi: ...`; put role and anlf under it.
-        std::fs::write(&path, text.replacen("nwdaf:\n", anlf, 1)).unwrap();
-        path
-    };
+    let read_err = |child: &NfProcess| child.log();
+    // config() writes `nwdaf:\n  sbi: ...`; put role and anlf under it.
+    let cfg_with = |tag: &str, demo: &str| config(tag, demo).replacen("nwdaf:\n", anlf, 1);
     for mode in ["retrain", "no-retrain"] {
         let cfg = cfg_with(
             &format!("d441e-{mode}"),
@@ -440,8 +400,7 @@ fn d441e_modes_and_demo_off_shapes() {
                 "demo:\n  enabled: true\n  d441e-model-retrain:\n    enabled: true\n    mode: {mode}\n"
             ),
         );
-        let port = free_port();
-        let mut child = spawn(&cfg, port);
+        let (child, port) = running(&cfg);
         let body = scrape(port, Duration::from_secs(20)).expect("/metrics");
         assert!(
             body.contains(&format!(
@@ -450,7 +409,7 @@ fn d441e_modes_and_demo_off_shapes() {
             "{body}"
         );
         assert!(body.contains("nwdaf_anlf_client_active 1"), "{body}");
-        let err = read_err(&mut child);
+        let err = read_err(&child);
         assert!(
             err.contains(&format!("DEMO MODE ACTIVE: d441e-model-retrain={mode}")),
             "{err}"
@@ -471,12 +430,11 @@ fn d441e_modes_and_demo_off_shapes() {
         ),
     ] {
         let cfg = cfg_with(tag, demo);
-        let port = free_port();
-        let mut child = spawn(&cfg, port);
+        let (child, port) = running(&cfg);
         let body = scrape(port, Duration::from_secs(20)).expect("/metrics");
         assert!(!body.contains("nextg_demo_enabled"), "{tag}: {body}");
         assert!(body.contains("nwdaf_anlf_client_active 0"), "{tag}: {body}");
-        let err = read_err(&mut child);
+        let err = read_err(&child);
         assert!(!err.contains("DEMO MODE ACTIVE"), "{tag}: {err}");
         assert!(!err.contains("[demo:"), "{tag}: {err}");
     }
@@ -507,19 +465,11 @@ fn mlmodelmonitor_routes_follow_the_demo_block() {
         arms.push(("mm-on", on, 400));
     }
     for (tag, demo, expected) in arms {
-        let sbi_port = free_port();
-        let path = std::env::temp_dir().join(format!(
-            "nwdafd-{tag}-{}-{sbi_port}.yaml",
-            std::process::id()
-        ));
-        std::fs::write(
-            &path,
-            format!(
-                "nwdaf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n        port: {sbi_port}\n{demo}"
-            ),
-        )
-        .unwrap();
-        let mut child = spawn(&path, free_port());
+        let path = format!(
+            "nwdaf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n        port: {SBI_PORT}\n{demo}"
+        );
+        let (child, _) = running(&path);
+        let sbi_port = child.port();
         let status = rt.block_on(async {
             let client = nextgcore_sbi::SbiClient::new(nextgcore_sbi::SbiClientConfig::new(
                 "127.0.0.1",
@@ -543,7 +493,7 @@ fn mlmodelmonitor_routes_follow_the_demo_block() {
             }
         });
         assert_eq!(status, expected, "{tag}");
-        let _ = child.0.kill();
+        drop(child);
     }
 }
 
@@ -565,19 +515,11 @@ fn the_seeded_series_follows_its_block() {
         ("series-on", "", 200u16),
         ("series-off", "  retrain_series:\n    enabled: false\n", 204),
     ] {
-        let sbi_port = free_port();
-        let path = std::env::temp_dir().join(format!(
-            "nwdafd-{tag}-{}-{sbi_port}.yaml",
-            std::process::id()
-        ));
-        std::fs::write(
-            &path,
-            format!(
-                "nwdaf:\n  role: mtlf\n{series}  sbi:\n    server:\n      - address: 127.0.0.1\n        port: {sbi_port}\n{on}"
-            ),
-        )
-        .unwrap();
-        let mut child = spawn(&path, free_port());
+        let path = format!(
+            "nwdaf:\n  role: mtlf\n{series}  sbi:\n    server:\n      - address: 127.0.0.1\n        port: {SBI_PORT}\n{on}"
+        );
+        let (child, _) = running(&path);
+        let sbi_port = child.port();
         let status = rt.block_on(async {
             let client = nextgcore_sbi::SbiClient::new(nextgcore_sbi::SbiClientConfig::new(
                 "127.0.0.1",
@@ -599,15 +541,7 @@ fn the_seeded_series_follows_its_block() {
                 }
             }
         });
-        let _ = child.0.kill();
-        let mut err = String::new();
-        child
-            .0
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut err)
-            .unwrap();
+        let err = child.log();
         assert_eq!(status, expected, "{tag}: {err}");
         assert_eq!(
             err.contains("[demo:d441e-model-retrain] seeded series nf=d441e000-0468-4000-8000-000000000468 seed=468"),
@@ -615,17 +549,11 @@ fn the_seeded_series_follows_its_block() {
             "{tag}: {err}"
         );
     }
-    let cfg = config("series-bad", on);
-    let text = std::fs::read_to_string(&cfg).unwrap();
-    std::fs::write(
-        &cfg,
-        text.replacen(
-            "nwdaf:\n",
-            "nwdaf:\n  retrain_series:\n    step_secs: 0\n",
-            1,
-        ),
-    )
-    .unwrap();
+    let cfg = config("series-bad", on).replacen(
+        "nwdaf:\n",
+        "nwdaf:\n  retrain_series:\n    step_secs: 0\n",
+        1,
+    );
     let (ok, err) = run_to_exit(&cfg);
     assert!(!ok, "a malformed retrain_series fails start-up");
     assert!(err.contains("nwdaf.retrain_series.step_secs"), "{err}");
