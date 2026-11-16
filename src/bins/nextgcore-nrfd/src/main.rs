@@ -2718,6 +2718,17 @@ async fn handle_nf_discover(request: &SbiRequest) -> SbiResponse {
         Ok(v) => v,
         Err(e) => return send_bad_request(&e, Some("INVALID_QUERY_PARAM")),
     };
+    // #1570: an array of MlAnalyticsInfo objects, minItems 1.
+    let ml_analytics_info_list = match json_array_param("ml-analytics-info-list") {
+        Ok(v) if v.iter().all(|i| i.is_object()) => v,
+        Ok(_) => {
+            return send_bad_request(
+                "ml-analytics-info-list must be a JSON array of MlAnalyticsInfo objects",
+                Some("INVALID_QUERY_PARAM"),
+            )
+        }
+        Err(e) => return send_bad_request(&e, Some("INVALID_QUERY_PARAM")),
+    };
 
     // nrfd-10: clamp the requested page size to the NRF default/maximum, and
     // page over the full match set in the handler (so discover_profiles still
@@ -2763,6 +2774,7 @@ async fn handle_nf_discover(request: &SbiRequest) -> SbiResponse {
                     .collect()
             })
             .unwrap_or_default(),
+        ml_analytics_info_list,
     };
 
     let all_matches = discover_profiles(&query);
@@ -4164,6 +4176,108 @@ mod tests {
         NrfPolicy {
             require_client_auth: false,
             ..NrfPolicy::default()
+        }
+    }
+
+    /// #1570: `ml-analytics-info-list` reaches the filter through the real
+    /// SearchNFInstances handler (TS 29.510 Table 6.2.3.2.3.1-1): an NWDAF whose
+    /// `nwdafInfo.mlAnalyticsList` supports an item is returned, one with no
+    /// list or a list for other events is not, and a malformed list is a 400.
+    #[tokio::test]
+    async fn discovery_filters_on_ml_analytics_info_list_1570() {
+        let pid = std::process::id();
+        let mtlf = format!("6b1d7e3c-1570-4000-8000-{pid:012x}");
+        let anlf = format!("6b1d7e3c-1570-4000-8001-{pid:012x}");
+        let other = format!("6b1d7e3c-1570-4000-8002-{pid:012x}");
+        let profile = |id: &str, info: serde_json::Value| {
+            nextgcore_nrfd::NfProfile::from_json(&serde_json::json!({
+                "nfInstanceId": id,
+                "nfType": "NWDAF",
+                "nfStatus": "REGISTERED",
+                "ipv4Addresses": ["127.0.0.1"],
+                "nwdafInfo": info,
+            }))
+            .expect("valid profile")
+        };
+        nf_manager()
+            .register(profile(
+                &mtlf,
+                serde_json::json!({
+                    "nwdafEvents": ["NF_LOAD"],
+                    "mlAnalyticsList": [{ "mlAnalyticsIds": ["NF_LOAD"] }],
+                }),
+            ))
+            .expect("register MTLF");
+        nf_manager()
+            .register(profile(
+                &anlf,
+                serde_json::json!({ "nwdafEvents": ["NF_LOAD"] }),
+            ))
+            .expect("register AnLF");
+        nf_manager()
+            .register(profile(
+                &other,
+                serde_json::json!({
+                    "mlAnalyticsList": [{ "mlAnalyticsIds": ["UE_MOBILITY"] }],
+                }),
+            ))
+            .expect("register other MTLF");
+
+        let discover = |list: &str| {
+            let mut req = SbiRequest::get("/nnrf-disc/v1/nf-instances");
+            req.http.set_param("target-nf-type", "NWDAF");
+            req.http.set_param("requester-nf-type", "NWDAF");
+            req.http.set_param("ml-analytics-info-list", list);
+            req
+        };
+        let ids = |resp: SbiResponse| -> Vec<String> {
+            assert_eq!(resp.status, 200);
+            let body: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            body["nfInstances"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|p| p["nfInstanceId"].as_str().map(String::from))
+                .collect()
+        };
+
+        let nf_load =
+            ids(handle_nf_discover(&discover(r#"[{"mlAnalyticsIds":["NF_LOAD"]}]"#)).await);
+        let ue_mob =
+            ids(handle_nf_discover(&discover(r#"[{"mlAnalyticsIds":["UE_MOBILITY"]}]"#)).await);
+        let either = ids(handle_nf_discover(&discover(
+            r#"[{"mlAnalyticsIds":["SLICE_LOAD_LEVEL"]},{"mlAnalyticsIds":["NF_LOAD"]}]"#,
+        ))
+        .await);
+        let bad = handle_nf_discover(&discover(r#"["NF_LOAD"]"#)).await;
+        let not_json = handle_nf_discover(&discover("NF_LOAD")).await;
+        for id in [&mtlf, &anlf, &other] {
+            let _ = nf_manager().deregister(id);
+        }
+
+        assert!(
+            nf_load.contains(&mtlf),
+            "the NF_LOAD MTLF is returned: {nf_load:?}"
+        );
+        assert!(!nf_load.contains(&anlf), "no mlAnalyticsList, not returned");
+        assert!(
+            !nf_load.contains(&other),
+            "a UE_MOBILITY-only list, not returned"
+        );
+        assert!(
+            ue_mob.contains(&other) && !ue_mob.contains(&mtlf),
+            "{ue_mob:?}"
+        );
+        assert!(
+            either.contains(&mtlf),
+            "one item supported is enough: {either:?}"
+        );
+        for resp in [bad, not_json] {
+            assert_eq!(resp.status, 400);
+            let problem: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(problem["cause"], "INVALID_QUERY_PARAM");
         }
     }
 
