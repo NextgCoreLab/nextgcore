@@ -30,13 +30,12 @@ set -uo pipefail
 
 D443A_EAS_IDS=(6b1d7e3c-0000-4000-8000-0000000471a1 6b1d7e3c-0000-4000-8000-0000000471a2
   6b1d7e3c-0000-4000-8000-0000000471a3)
-D443A_EAS_NAMES=(eas-local eas-regional eas-cloud)
 D443A_EEC_ID=6b1d7e3c-0000-4000-8000-0000000471ec
 
 d443a_main() {
   : "${NAMESPACE:?}" "${DEMO_MODE:?}" "${OUT:?}"
   local K=(kubectl -n "${NAMESPACE}" --request-timeout=120s)
-  local S="${OUT}/scenario" HERE ARM FAILS=0 keys i
+  local S="${OUT}/scenario" HERE ARM FAILS=0 keys
   HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   mkdir -p "${S}"
   case "${DEMO_MODE}" in
@@ -116,20 +115,27 @@ d443a_main() {
   say "arm=${ARM} mode=${DEMO_MODE}"
   printf 'arm=%s\nmode=%s\ndeadline_ms=15\n' "${ARM}" "${DEMO_MODE}" >"${S}/meta.txt"
 
-  # --- 1. CCA keys, trusted at the NRF -------------------------------------------
-  # Generated here, outside $OUT; only public JWKs go to the cluster's trust store
-  # and each private key straight into the container that uses it.
+  # --- 1. the EEC's CCA key ------------------------------------------------------
+  # Generated here, outside $OUT; its public JWK goes to the NRF's trust store
+  # (step 3, with the EASes' own) and the private key straight into the UE. Each
+  # EAS creates its own key in its pod (eas.yaml): only its JWK leaves it.
   keys="$(mktemp -d -t d443a-keys-XXXXXX)"
   # shellcheck disable=SC2064  # expand now: the directory is this run's
   trap "rm -rf '${keys}'" EXIT
-  python3 "${HERE}/cca.py" keygen "${keys}" "${D443A_EAS_IDS[@]}" "${D443A_EEC_ID}" >/dev/null \
-    || bad "CCA key generation"
-  local -a jwks=()
-  for f in "${keys}"/*.jwk; do jwks+=(--from-file="$(basename "${f}")=${f}"); done
-  "${K[@]}" create configmap d443a-cca-trusted ${jwks[@]+"${jwks[@]}"} --dry-run=client -o yaml \
-    | "${K[@]}" apply -f - >/dev/null || bad "trusted-key ConfigMap"
-  wait_for 180 "${K[@]}" exec deploy/nrf -c nrf -- test -s "/etc/nextgcore/cca-trusted/${D443A_EEC_ID}.jwk" \
-    || bad "the NRF does not see the JWKs within 180 s"
+  python3 "${HERE}/cca.py" keygen "${keys}" "${D443A_EEC_ID}" >/dev/null || bad "CCA key generation"
+
+  # --- 1b. per-arm records: the sidecars' capability sets, sch_netem ---------------
+  wait_for 240 "${K[@]}" exec deploy/upf -c she-eas -- test -e /tmp/d443a/ready \
+    || bad "the she-eas sidecar never got ready"
+  "${K[@]}" get deploy/upf deploy/gnb -o json >"${S}/pod-specs.json" 2>/dev/null || bad "pod specs"
+  # Whether sch_netem was loaded on the node BEFORE this pod's first tc (the
+  # sidecar's baseline netem, at start): the sidecar logs /proc/modules first. A
+  # NET_ADMIN tc can make the kernel autoload the module; the operator accepts
+  # that on devtest1 (2026-11-16), recorded per run.
+  "${K[@]}" logs deploy/upf -c she-eas 2>/dev/null | grep -E 'sch_netem before the first tc: ' | head -1 \
+    >"${S}/sch_netem.txt" || true
+  echo "sch_netem_before_first_tc=$(sed -nE 's/.*sch_netem before the first tc: ([a-z]+).*/\1/p' "${S}/sch_netem.txt")" \
+    >>"${S}/meta.txt"
 
   # --- 2. eesd, with the NRF's JWKS -----------------------------------------------
   local jw
@@ -151,20 +157,28 @@ d443a_main() {
   wait_for 60 has_in ees nrf-standin 'PUT -> 20[01]' || bad "the stand-in EES profile was not registered"
 
   # --- 3. the EAS sidecars ----------------------------------------------------------
-  wait_for 240 "${K[@]}" exec deploy/upf -c she-eas -- test -e /tmp/d443a/ready \
-    || bad "the she-eas sidecar never got ready"
-  for i in 0 1 2; do
-    "${K[@]}" exec -i deploy/upf -c she-eas -- sh -c "umask 077; cat >/tmp/d443a/cca/${D443A_EAS_NAMES[i]}.key" \
-      <"${keys}/${D443A_EAS_IDS[i]}.key" || bad "${D443A_EAS_NAMES[i]} key handover"
-  done
   local local_args="--load 5"
   [[ "${ARM}" == no-kpi-patch ]] && local_args="--load 5 --no-kpi-patch"
   printf 'eas-local: %s\neas-regional:\neas-cloud:\n' "${local_args}" \
     | "${K[@]}" exec -i deploy/upf -c she-eas -- sh -c 'cat >/tmp/d443a/start.tmp && mv /tmp/d443a/start.tmp /tmp/d443a/start' \
     || bad "EAS start"
   say "EASes started (eas-local: ${local_args})"
-  wait_for 120 has_in upf she-eas '\[demo:d443a-edge-budget\] EAS-REG eas=[a-z-]+ registrationId=' 3 \
-    || bad "the three EASes did not register at eesd within 120 s"
+  # Each EAS's own public JWK, then all four trusted at the NRF (the EASes retry
+  # their token requests until it trusts them).
+  local id
+  for id in "${D443A_EAS_IDS[@]}"; do
+    wait_for 60 "${K[@]}" exec deploy/upf -c she-eas -- test -s "/tmp/d443a-jwk/${id}.jwk" \
+      || bad "no public JWK from EAS ${id}"
+    "${K[@]}" exec deploy/upf -c she-eas -- cat "/tmp/d443a-jwk/${id}.jwk" >"${keys}/${id}.jwk" 2>/dev/null
+  done
+  local -a jwks=()
+  for f in "${keys}"/*.jwk; do jwks+=(--from-file="$(basename "${f}")=${f}"); done
+  "${K[@]}" create configmap d443a-cca-trusted ${jwks[@]+"${jwks[@]}"} --dry-run=client -o yaml \
+    | "${K[@]}" apply -f - >/dev/null || bad "trusted-key ConfigMap"
+  wait_for 180 "${K[@]}" exec deploy/nrf -c nrf -- test -s "/etc/nextgcore/cca-trusted/${D443A_EAS_IDS[0]}.jwk" \
+    || bad "the NRF does not see the JWKs within 180 s"
+  wait_for 240 has_in upf she-eas '\[demo:d443a-edge-budget\] EAS-REG eas=[a-z-]+ registrationId=' 3 \
+    || bad "the three EASes did not register at eesd within 240 s"
 
   # --- 4. the UE: PDU session, EEC key --------------------------------------------
   "${K[@]}" rollout status deploy/ue --timeout=300s >/dev/null || bad "ue rollout"
@@ -180,17 +194,8 @@ d443a_main() {
   fi
 
   # --- 4b. netem preflight: fail loudly without NET_ADMIN or sch_netem --------------
-  # Whether sch_netem was loaded on the node BEFORE this pod's first tc: the
-  # sidecar logs /proc/modules before its baseline netem (the first tc of the
-  # run). A NET_ADMIN tc can make the kernel autoload the module, which would
-  # outlive teardown, so the artefacts say which it was.
   local pre
-  pre="$(count_in upf she-eas 'sch_netem before the first tc: ')"
-  "${K[@]}" logs deploy/upf -c she-eas 2>/dev/null | grep -E 'sch_netem before the first tc: ' | head -1 \
-    >"${S}/sch_netem.txt" || true
-  echo "sch_netem_before_first_tc=$(sed -nE 's/.*sch_netem before the first tc: ([a-z]+).*/\1/p' "${S}/sch_netem.txt")" \
-    >>"${S}/meta.txt"
-  [[ "${pre}" -ge 1 ]] || bad "the sidecar did not record sch_netem before its first tc"
+  [[ -s "${S}/sch_netem.txt" ]] || bad "the sidecar did not record sch_netem before its first tc"
   pre="$("${K[@]}" exec deploy/upf -c she-eas -- sh -c \
     'ip netns exec eas-cloud tc qdisc add dev lo root netem delay 0ms && ip netns exec eas-cloud tc qdisc del dev lo root && echo netem-ok' 2>&1)"
   if [[ "${pre}" != *netem-ok* ]]; then
@@ -254,7 +259,10 @@ d443a_main() {
   fi
 
   # --- 9. the load act: eas-local loses compute (avlComp 50 -> 5) --------------------
-  "${K[@]}" exec deploy/upf -c she-eas -- sh -c 'kill -USR1 "$(cat /tmp/d443a/eas-local.pid)"' || bad "SIGUSR1"
+  # As nobody, like eas-local itself: the sidecar has no CAP_KILL.
+  "${K[@]}" exec deploy/upf -c she-eas -- sh -c \
+    'p="$(cat /tmp/d443a/eas-local.pid)"; setpriv --reuid=65534 --regid=65534 --clear-groups --no-new-privs sh -c "kill -USR1 $p"' \
+    || bad "SIGUSR1"
   wait_for 30 has_in upf she-eas '\[eas-local\] .*LOAD eas=eas-local' || bad "eas-local did not apply the load"
   sleep 3
   jobs_act 3

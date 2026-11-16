@@ -12,7 +12,7 @@ ees:
   oauth2:
     nrf: "http://172.23.0.10:7777"
     nf_instance_id: "@ID@"
-    cca_key_file: "/var/lib/d443a/keys/@EAS@.key"
+    cca_key_file: "/tmp/@EAS@.cca.key"
     public_jwk_dir: "/var/lib/d443a/cca"
     register: true
 demo:

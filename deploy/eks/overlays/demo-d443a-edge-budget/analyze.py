@@ -299,6 +299,56 @@ def c_revert_pre(d):
     return ok, ('the EES kept eas-local on the stale KPI and the UE missed: ' + why) if ok else why
 
 
+# Every arm: the capability sets the operator approved (2026-11-16), from the
+# deployed pod spec, and the per-run sch_netem record.
+SHE_EAS_CAPS = {'NET_ADMIN', 'SYS_ADMIN', 'SETUID', 'SETGID'}
+GNB_NETEM_CAPS = {'NET_ADMIN'}
+
+
+def container_sc(d, deploy, name):
+    import json
+    try:
+        doc = json.loads(read(d, 'pod-specs.json') or '{}')
+    except ValueError:
+        return None
+    items = doc.get('items', [doc]) if isinstance(doc, dict) else []
+    for it in items:
+        if it.get('metadata', {}).get('name') != deploy:
+            continue
+        for c in it.get('spec', {}).get('template', {}).get('spec', {}).get('containers', []):
+            if c.get('name') == name:
+                return c.get('securityContext') or {}
+    return None
+
+
+def caps_ok(sc, want):
+    if sc is None:
+        return 'not in the pod spec'
+    caps = sc.get('capabilities') or {}
+    if set(caps.get('add') or []) != want:
+        return f'adds {sorted(caps.get("add") or [])}, want exactly {sorted(want)}'
+    if caps.get('drop') != ['ALL']:
+        return f'drops {caps.get("drop")}, want [ALL]'
+    if sc.get('privileged') is not False or sc.get('allowPrivilegeEscalation') is not False:
+        return 'privileged or allows privilege escalation'
+    return None
+
+
+def c_caps(d):
+    for deploy, name, want in (('upf', 'she-eas', SHE_EAS_CAPS), ('gnb', 'netem', GNB_NETEM_CAPS)):
+        why = caps_ok(container_sc(d, deploy, name), want)
+        if why:
+            return False, f'{deploy}/{name}: {why}'
+    return True, 'she-eas: exactly NET_ADMIN SYS_ADMIN SETUID SETGID; gnb netem: exactly NET_ADMIN'
+
+
+def c_netem_recorded(d):
+    v = meta(d).get('sch_netem_before_first_tc', '')
+    if v not in ('loaded', 'absent'):
+        return False, f'sch_netem before the first tc not recorded ({v!r})'
+    return True, f'sch_netem before the first tc: {v}'
+
+
 # gates
 GATES = {
     'nr-she-eas bogus': (BOGUS, r'rc=1\b'),
@@ -357,14 +407,14 @@ def c_off(d):
 
 
 ARMS = {
-    'main': [c_acts_ordered, c_registrations, c_standin, c_n6_provisioned, c_n6_measured,
+    'main': [c_caps, c_netem_recorded, c_acts_ordered, c_registrations, c_standin, c_n6_provisioned, c_n6_measured,
              c_qos_mon, c_act1, c_accuracy, c_act2, c_act3, c_load],
-    'static': [c_acts_ordered, c_registrations, c_standin, c_n6_provisioned, c_n6_measured,
+    'static': [c_caps, c_netem_recorded, c_acts_ordered, c_registrations, c_standin, c_n6_provisioned, c_n6_measured,
                c_act1_static, c_act2_static, c_act3_static, c_load_static],
-    'no-kpi-patch': [c_acts_ordered, c_registrations, c_n6_measured, c_qos_mon, c_act1,
+    'no-kpi-patch': [c_caps, c_netem_recorded, c_acts_ordered, c_registrations, c_n6_measured, c_qos_mon, c_act1,
                      c_revert_pre, c_load],
-    'gates': [c_gates_startup, c_gates_runtime],
-    'off': [c_off],
+    'gates': [c_caps, c_netem_recorded, c_gates_startup, c_gates_runtime],
+    'off': [c_caps, c_netem_recorded, c_off],
 }
 # A revert arm holds when its target FAILS and every other check passes.
 REVERT_TARGET = {'no-kpi-patch': 'c_load'}
@@ -549,10 +599,23 @@ def off_fixture():
         '_meta': 'arm=off\nmode=off\n'}
 
 
+def pod_specs(she=SHE_EAS_CAPS, gnb=GNB_NETEM_CAPS, drop=('ALL',), privileged=False):
+    import json
+
+    def dep(name, cname, add):
+        return {'metadata': {'name': name}, 'spec': {'template': {'spec': {'containers': [
+            {'name': name}, {'name': cname, 'securityContext': {
+                'privileged': privileged, 'allowPrivilegeEscalation': False, 'runAsUser': 0,
+                'capabilities': {'drop': list(drop), 'add': sorted(add)}}}]}}}}
+    return json.dumps({'kind': 'List', 'items': [dep('upf', 'she-eas', she), dep('gnb', 'netem', gnb)]})
+
+
 def write(fx, root):
     for act, comps in fx.items():
         if act == '_meta':
             open(os.path.join(root, 'meta.txt'), 'w').write(comps)
+            continue
+        if act == '_no_netem_record':
             continue
         if act == '_files':
             for name, text in comps.items():
@@ -563,6 +626,12 @@ def write(fx, root):
             text = ''.join(ls) if comp.endswith('.prom') else '\n'.join(ls) + ('\n' if ls else '')
             open(os.path.join(root, act, comp), 'w').write(text)
     open(os.path.join(root, 'ue-ip.txt'), 'w').write(UE_IP + '\n')
+    if not os.path.exists(os.path.join(root, 'pod-specs.json')):
+        open(os.path.join(root, 'pod-specs.json'), 'w').write(pod_specs())
+    mp = os.path.join(root, 'meta.txt')
+    m = open(mp).read() if os.path.exists(mp) else ''
+    if 'sch_netem_before_first_tc=' not in m and '_no_netem_record' not in fx:
+        open(mp, 'a').write('sch_netem_before_first_tc=loaded\n')
 
 
 def edit(fx, act, comp, fn):
@@ -645,7 +714,30 @@ def drop_nth(rx, n=0):
     return f
 
 
+def common_negatives(fx):
+    return {
+        'c_caps': [
+            with_files(fx, **{'pod-specs.json': pod_specs(she=SHE_EAS_CAPS | {'CHOWN'})}),
+            with_files(fx, **{'pod-specs.json': pod_specs(she=SHE_EAS_CAPS | {'KILL'})}),
+            with_files(fx, **{'pod-specs.json': pod_specs(she=SHE_EAS_CAPS - {'SYS_ADMIN'})}),
+            with_files(fx, **{'pod-specs.json': pod_specs(gnb={'NET_ADMIN', 'SYS_ADMIN'})}),
+            with_files(fx, **{'pod-specs.json': pod_specs(drop=())}),
+            with_files(fx, **{'pod-specs.json': pod_specs(privileged=True)}),
+            with_files(fx, **{'pod-specs.json': '{"kind": "List", "items": []}'}),
+        ],
+        'c_netem_recorded': [dict(fx, _no_netem_record=True)],
+    }
+
+
 def negatives(arm):
+    n = negatives_of(arm)
+    base = {'gates': gates_fixture(), 'off': off_fixture()}.get(arm) or fixture(arm)
+    names = {c.__name__ for c in ARMS[arm]}
+    n.update({k: v for k, v in common_negatives(base).items() if k in names})
+    return n
+
+
+def negatives_of(arm):
     """{check name: [negative-control fixtures]} for `arm`: one control per
     condition the check asserts, each breaking that condition alone (the
     forced-true sweep in self_test proves no other check catches it)."""

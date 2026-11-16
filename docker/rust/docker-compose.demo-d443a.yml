@@ -351,9 +351,10 @@ services:
     user: root
     cap_drop: [ALL]
     # NET_ADMIN: the route back to the UEs, and netem (the emulated distance).
-    # CHOWN, SETUID, SETGID, SETPCAP: setpriv's drop to nobody; nr-she-eas runs
-    # with no capabilities. Its listeners bind 10.60.0.11:8620 and :9471 (>= 1024).
-    cap_add: [NET_ADMIN, CHOWN, SETUID, SETGID, SETPCAP]
+    # SETUID, SETGID: setpriv's drop to nobody; nr-she-eas runs with no
+    # capabilities. Its listeners bind 10.60.0.11:8620 and :9471 (>= 1024). (No netns
+    # here, so no SYS_ADMIN; no CHOWN, no SETPCAP, as on EKS.)
+    cap_add: [NET_ADMIN, SETUID, SETGID]
     environment:
       RUST_LOG: info
       D443A_MODE: ${D443A_MODE:-measured-budget}
@@ -391,9 +392,10 @@ services:
     user: root
     cap_drop: [ALL]
     # NET_ADMIN: the route back to the UEs, and netem (the emulated distance).
-    # CHOWN, SETUID, SETGID, SETPCAP: setpriv's drop to nobody; nr-she-eas runs
-    # with no capabilities. Its listeners bind 10.60.0.12:8620 and :9471 (>= 1024).
-    cap_add: [NET_ADMIN, CHOWN, SETUID, SETGID, SETPCAP]
+    # SETUID, SETGID: setpriv's drop to nobody; nr-she-eas runs with no
+    # capabilities. Its listeners bind 10.60.0.12:8620 and :9471 (>= 1024). (No netns
+    # here, so no SYS_ADMIN; no CHOWN, no SETPCAP, as on EKS.)
+    cap_add: [NET_ADMIN, SETUID, SETGID]
     environment:
       RUST_LOG: info
       D443A_MODE: ${D443A_MODE:-measured-budget}
@@ -431,9 +433,10 @@ services:
     user: root
     cap_drop: [ALL]
     # NET_ADMIN: the route back to the UEs, and netem (the emulated distance).
-    # CHOWN, SETUID, SETGID, SETPCAP: setpriv's drop to nobody; nr-she-eas runs
-    # with no capabilities. Its listeners bind 10.60.0.13:8620 and :9471 (>= 1024).
-    cap_add: [NET_ADMIN, CHOWN, SETUID, SETGID, SETPCAP]
+    # SETUID, SETGID: setpriv's drop to nobody; nr-she-eas runs with no
+    # capabilities. Its listeners bind 10.60.0.13:8620 and :9471 (>= 1024). (No netns
+    # here, so no SYS_ADMIN; no CHOWN, no SETPCAP, as on EKS.)
+    cap_add: [NET_ADMIN, SETUID, SETGID]
     environment:
       RUST_LOG: info
       D443A_MODE: ${D443A_MODE:-measured-budget}

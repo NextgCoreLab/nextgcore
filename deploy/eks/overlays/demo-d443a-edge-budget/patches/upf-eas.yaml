@@ -61,15 +61,16 @@
       # ip netns exec and setpriv).
       - name: NO_COLOR
         value: "1"
-    # Not privileged: every capability dropped, then only what the sidecar's root
-    # shell uses:
+    # Not privileged: every capability dropped, then exactly the four the
+    # operator approved (2026-11-16) for the sidecar's root shell:
     #   NET_ADMIN  the bridge, veths, addresses, routes, iptables, tc (netem);
-    #   SYS_ADMIN  `ip netns add` / `ip netns exec`;
-    #   CHOWN      handing each EAS's key to nobody;
-    #   SETUID, SETGID, SETPCAP  setpriv's drop to nobody and of the bounding set;
-    #   KILL       the load act's SIGUSR1 to eas-local (a nobody process).
-    # nr-she-eas itself runs as nobody with no capabilities, an empty bounding
-    # set and no_new_privs; its listeners bind 8620 and 9471 (>= 1024).
+    #   SYS_ADMIN  `ip netns add` / `ip netns exec` (one namespace per EAS);
+    #   SETUID, SETGID  setpriv's drop to nobody.
+    # No CHOWN (each EAS creates its own key as nobody), no KILL (the load act's
+    # SIGUSR1 is sent as nobody), no SETPCAP (no bounding-set drop: with
+    # no_new_privs and a non-root uid nothing can be regained). nr-she-eas runs as
+    # nobody with no capabilities and no_new_privs; its listeners bind 8620 and
+    # 9471 (>= 1024). analyze.py asserts this set from the deployed pod spec.
     securityContext:
       privileged: false
       allowPrivilegeEscalation: false
@@ -81,11 +82,8 @@
         add:
           - NET_ADMIN
           - SYS_ADMIN
-          - CHOWN
           - SETUID
           - SETGID
-          - SETPCAP
-          - KILL
     resources:
       requests:
         cpu: 100m
