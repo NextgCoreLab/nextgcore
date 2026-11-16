@@ -2,9 +2,11 @@
 //! (`amf.ngap.server`, `amf.sbi.server`) when neither the command line nor the
 //! environment names one; `--ngap-addr` overrides the YAML.
 
-use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{SocketAddr, UdpSocket};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+use nextgcore_sbi::test_support::NfSpawn;
 
 struct Killed(Child);
 impl Drop for Killed {
@@ -12,14 +14,6 @@ impl Drop for Killed {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
-}
-
-fn free_tcp(ip: &str) -> u16 {
-    TcpListener::bind((ip, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 fn free_udp(ip: &str) -> u16 {
@@ -30,22 +24,15 @@ fn free_udp(ip: &str) -> u16 {
         .port()
 }
 
-fn start(config: &std::path::Path, extra: &[&str]) -> Killed {
-    Killed(
-        Command::new(env!("CARGO_BIN_EXE_nextgcore-amfd"))
-            .arg("-c")
-            .arg(config)
-            .args(extra)
-            .env_remove("AMF_SBI_ADDR")
-            .env_remove("AMF_SBI_PORT")
-            .env_remove("NEXTGCORE_SBI_ADVERTISE")
-            .env("NEXTGCORE_SBI_PROFILE", "dev")
-            .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn amfd"),
-    )
+fn amfd_args(cmd: &mut Command, config: &std::path::Path, extra: &[String]) {
+    cmd.arg("-c")
+        .arg(config)
+        .args(extra)
+        .env_remove("AMF_SBI_ADDR")
+        .env_remove("AMF_SBI_PORT")
+        .env_remove("NEXTGCORE_SBI_ADVERTISE")
+        .env("NEXTGCORE_SBI_PROFILE", "dev")
+        .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1");
 }
 
 fn wait(what: impl Fn() -> bool, within: Duration) -> bool {
@@ -69,33 +56,44 @@ fn amfd_binds_its_yaml_ngap_and_sbi_addresses_unless_overridden() {
     let dir = std::env::temp_dir().join(format!("amfd-1311-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     // 127.0.0.2: loopback, but not the 127.0.0.1 default.
-    let ngap = free_udp("127.0.0.2");
-    let sbi = free_tcp("127.0.0.2");
     let config = dir.join("amf.yaml");
-    std::fs::write(
-        &config,
-        format!(
-            "amf:\n  sbi:\n    server:\n      - address: 127.0.0.2\n        port: {sbi}\n  \
-             ngap:\n    server:\n      - address: 127.0.0.2\n        port: {ngap}\n"
-        ),
-    )
-    .unwrap();
+    // #1521: both amfd runs go through the shared `NfSpawn`, which waits until
+    // the address under test is bound and respawns on fresh ports if amfd loses
+    // a probed one to another process (the #1497 race; a sibling's UDP socket or
+    // outbound connection can be handed the number first). Each spawn draws its
+    // NGAP port inside `configure`, so a respawn gets a new one too.
+    let ngap = std::cell::Cell::new(0);
+    let yaml_amfd = NfSpawn::new(env!("CARGO_BIN_EXE_nextgcore-amfd"), "amfd-1311-yaml")
+        .ready_when_accepting("127.0.0.2".parse().unwrap())
+        .spawn(|cmd, sbi, _| {
+            ngap.set(free_udp("127.0.0.2"));
+            std::fs::write(
+                &config,
+                format!(
+                    "amf:\n  sbi:\n    server:\n      - address: 127.0.0.2\n        port: {sbi}\n  \
+                     ngap:\n    server:\n      - address: 127.0.0.2\n        port: {}\n",
+                    ngap.get()
+                ),
+            )
+            .unwrap();
+            amfd_args(cmd, &config, &[]);
+        });
     {
-        let _amfd = start(&config, &[]);
-        let sbi_addr: SocketAddr = format!("127.0.0.2:{sbi}").parse().unwrap();
-        assert!(
-            wait(
-                || TcpStream::connect_timeout(&sbi_addr, Duration::from_millis(100)).is_ok(),
-                Duration::from_secs(20)
-            ),
-            "amf.sbi.server is bound"
-        );
-        let ngap_addr: SocketAddr = format!("127.0.0.2:{ngap}").parse().unwrap();
+        let _amfd = yaml_amfd;
+        // The spawn was ready only once amf.sbi.server accepted.
+        let ngap_addr: SocketAddr = format!("127.0.0.2:{}", ngap.get()).parse().unwrap();
         assert!(udp_taken(ngap_addr), "amf.ngap.server is bound");
     }
-    let cli = free_udp("127.0.0.1");
-    let cli_addr: SocketAddr = format!("127.0.0.1:{cli}").parse().unwrap();
-    let _amfd = start(&config, &["--ngap-addr", &cli_addr.to_string()]);
+    let cli_amfd = NfSpawn::new(env!("CARGO_BIN_EXE_nextgcore-amfd"), "amfd-1311-cli")
+        .ready_when_udp_bound("127.0.0.1".parse().unwrap())
+        .spawn(|cmd, cli, _| {
+            amfd_args(
+                cmd,
+                &config,
+                &["--ngap-addr".into(), format!("127.0.0.1:{cli}")],
+            );
+        });
+    let cli_addr: SocketAddr = format!("127.0.0.1:{}", cli_amfd.port()).parse().unwrap();
     assert!(
         wait(|| udp_taken(cli_addr), Duration::from_secs(20)),
         "--ngap-addr wins"

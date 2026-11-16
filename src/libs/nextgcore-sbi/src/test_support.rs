@@ -13,6 +13,9 @@ use std::time::Duration;
 
 use crate::server::{SbiServer, SbiServerConfig};
 
+mod nf_process;
+pub use nf_process::{free_port_on, NfProcess, NfSpawn, ADDR_IN_USE};
+
 /// Every port this module has handed out in this process, by either route.
 ///
 /// One set for both [`free_port`] and [`bound_listener`]: a bare-port caller and

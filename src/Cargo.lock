@@ -3106,6 +3106,7 @@ dependencies = [
  "nextgcore-dbi",
  "nextgcore-diameter",
  "nextgcore-metrics",
+ "nextgcore-sbi",
  "proptest",
  "serde",
  "serde_json",

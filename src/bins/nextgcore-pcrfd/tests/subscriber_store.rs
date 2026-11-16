@@ -20,7 +20,7 @@
 //! retry.
 
 use std::io::Read;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -39,14 +39,6 @@ const PID_LABEL: &str = "nextgcore-test-pcrfd-1459-pid";
 const REALM: &str = "epc.mnc001.mcc001.3gppnetwork.org";
 const PCEF_HOST: &str = "pgw-1459.epc.mnc001.mcc001.3gppnetwork.org";
 
-struct Killed(Child);
-impl Drop for Killed {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 /// A per-test scratch directory, removed on drop.
 struct Scratch(std::path::PathBuf);
 impl Scratch {
@@ -54,6 +46,13 @@ impl Scratch {
         let dir = std::env::temp_dir().join(format!("pcrfd-1459-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         Scratch(dir)
+    }
+
+    fn name(&self) -> String {
+        self.0
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
     }
 }
 impl Drop for Scratch {
@@ -175,25 +174,43 @@ impl Mongo {
     }
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+use nextgcore_sbi::test_support::{free_port, NfProcess, NfSpawn};
+
+/// Start pcrfd on `db_uri` and wait for its Diameter listener.
+///
+/// #1521: through the shared `NfSpawn`. pcrfd's Diameter bind is not fatal: on a
+/// lost port it logs the error and runs on without a listener, so the probed
+/// port taken by another process (the #1497 race) surfaced as the PCEF never
+/// connecting. `NfSpawn` sees "Address already in use" and respawns on a fresh
+/// port. The startup-failure tests below spawn directly: pcrfd opens its store
+/// before the Diameter listener, so an unreachable store exits before any bind.
+async fn start_pcrfd(dir: &Scratch, db_uri: &str) -> NfProcess {
+    NfSpawn::new(
+        env!("CARGO_BIN_EXE_nextgcore-pcrfd"),
+        &format!("pcrfd-1459-{}", dir.name()),
+    )
+    .ready_when_logged("Diameter listener active on")
+    .spawn_async(|cmd, diameter_port, _| {
+        pcrfd_args(cmd, dir, db_uri, diameter_port);
+    })
+    .await
 }
 
 fn pcrfd_command(dir: &Scratch, db_uri: &str, diameter_port: u16) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nextgcore-pcrfd"));
+    pcrfd_args(&mut cmd, dir, db_uri, diameter_port);
+    cmd.stdout(Stdio::null());
+    cmd
+}
+
+fn pcrfd_args(cmd: &mut Command, dir: &Scratch, db_uri: &str, diameter_port: u16) {
     let config = dir.0.join("pcrf.yaml");
     std::fs::write(&config, format!("db_uri: {db_uri}\n")).unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nextgcore-pcrfd"));
     cmd.arg("-c")
         .arg(&config)
         .arg("--diameter-addr")
         .arg(format!("127.0.0.1:{diameter_port}"))
-        .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
-        .stdout(Stdio::null());
-    cmd
+        .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1");
 }
 
 /// A subscriber whose APN "internet" differs from the local default in every
@@ -358,14 +375,8 @@ async fn a_store_outage_neither_downgrades_live_sessions_nor_invents_new_ones() 
     let imsi = "001010000014591";
     mongo.provision(subscriber(imsi));
     let dir = Scratch::new("outage");
-    let port = free_port();
-    let _pcrfd = Killed(
-        pcrfd_command(&dir, &mongo.uri(), port)
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn pcrfd"),
-    );
-    let mut pcef = connect_pcef(port).await;
+    let pcrfd = start_pcrfd(&dir, &mongo.uri()).await;
+    let mut pcef = connect_pcef(pcrfd.port()).await;
     let sid = "pgw-1459;2;outage";
 
     // Store up: the session is established, and a RAT change re-authorizes it,
@@ -475,14 +486,8 @@ async fn pcrfd_answers_a_ccr_i_with_the_provisioned_policy() {
     let imsi = "001010000001459";
     mongo.provision(subscriber(imsi));
     let dir = Scratch::new("store");
-    let port = free_port();
-    let _pcrfd = Killed(
-        pcrfd_command(&dir, &mongo.uri(), port)
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn pcrfd"),
-    );
-    let mut pcef = connect_pcef(port).await;
+    let pcrfd = start_pcrfd(&dir, &mongo.uri()).await;
+    let mut pcef = connect_pcef(pcrfd.port()).await;
     pcef.send_message(&build_ccr_i("pgw-1459;1;1459", imsi))
         .await
         .expect("send CCR-I");

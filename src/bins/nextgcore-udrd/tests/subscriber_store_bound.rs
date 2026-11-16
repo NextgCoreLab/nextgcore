@@ -17,25 +17,18 @@
 //! `nextgcore_mongoc_init`, `a_store_that_goes_down_answers_a_read_in_time` waits
 //! about 30 s for its read, and the test client gives up on it with no answer.
 
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use nextgcore_dbi::mongodb::bson::doc;
 use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
+use nextgcore_sbi::test_support::NfSpawn;
 
 const DOCKER_REQUIRED_ENV: &str = "NEXTGCORE_DOCKER_REQUIRED";
 const PID_LABEL: &str = "nextgcore-test-udrd-1462-pid";
 
 /// A K no default could produce, so a 200 carrying it came from the store.
 const K: &str = "14621462146214621462146214621462";
-
-struct Killed(Child);
-impl Drop for Killed {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
 
 fn docker(args: &[&str]) -> std::process::Output {
     Command::new("docker").args(args).output().expect("docker")
@@ -177,39 +170,31 @@ async fn a_store_that_goes_down_answers_a_read_in_time() {
         "security": { "k": K, "opc": "e8ed289deba952e4283b54e88e6183ca", "amf": "8000", "sqn": 64_i64 },
     });
 
-    let dir = std::env::temp_dir().join(format!("udrd-1462-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let config = dir.join("udr.yaml");
-    let port = nextgcore_sbi::test_support::free_port();
-    std::fs::write(
-        &config,
-        format!(
-            "db_uri: {}\nudr:\n  sbi:\n    server:\n      - address: 127.0.0.1\n        port: {port}\n",
-            mongo.uri()
-        ),
-    )
-    .unwrap();
-    let _udrd = Killed(
-        Command::new(env!("CARGO_BIN_EXE_nextgcore-udrd"))
-            .arg("-c")
-            .arg(&config)
-            .env("NEXTGCORE_SBI_PROFILE", "dev")
-            .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
-            .env_remove("NEXTGCORE_SBI_ADVERTISE")
-            .env_remove("DB_URI")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn udrd"),
-    );
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while tokio::net::TcpStream::connect(("127.0.0.1", port))
-        .await
-        .is_err()
-    {
-        assert!(Instant::now() < deadline, "udrd never served the SBI");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    // #1521: through the shared `NfSpawn`, which waits for the SBI listener and
+    // respawns on a fresh port if udrd loses its probed one to another process
+    // (the #1497 race; udrd's SBI bind is fatal).
+    let db_uri = mongo.uri();
+    let udrd = NfSpawn::new(env!("CARGO_BIN_EXE_nextgcore-udrd"), "udrd-1462")
+        .ready_when_logged("SBI HTTP/2 server listening on")
+        .within(Duration::from_secs(60))
+        .spawn_async(|cmd, port, dir| {
+            let config = dir.join("udr.yaml");
+            std::fs::write(
+                &config,
+                format!(
+                    "db_uri: {db_uri}\nudr:\n  sbi:\n    server:\n      - address: 127.0.0.1\n        port: {port}\n"
+                ),
+            )
+            .unwrap();
+            cmd.arg("-c")
+                .arg(&config)
+                .env("NEXTGCORE_SBI_PROFILE", "dev")
+                .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
+                .env_remove("NEXTGCORE_SBI_ADVERTISE")
+                .env_remove("DB_URI");
+        })
+        .await;
+    let port = udrd.port();
     let sbi = SbiClient::new(SbiClientConfig::new("127.0.0.1", port));
     let supi = format!("imsi-{imsi}");
 
@@ -224,8 +209,6 @@ async fn a_store_that_goes_down_answers_a_read_in_time() {
     let started = Instant::now();
     let (status, _) = get_auth(&sbi, &supi).await;
     let took = started.elapsed();
-    let _ = std::fs::remove_file(&config);
-    let _ = std::fs::remove_dir(&dir);
     assert_ne!(status, 200, "the store really was down");
     assert!(
         took < Duration::from_secs(3),

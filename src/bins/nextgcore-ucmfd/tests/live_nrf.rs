@@ -13,45 +13,21 @@
 //! than failing on something unrelated to the UCMF.
 
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
 use nextgcore_sbi::message::SbiRequest;
+use nextgcore_sbi::test_support::NfSpawn;
 use serde_json::Value;
 
-/// Kills the child process when dropped, so a failed assertion never leaks a server.
-struct Proc(Child);
-
-impl Drop for Proc {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// Each child logs to a file in the system temp dir, named in the failure output.
-fn log_file(name: &str) -> (PathBuf, Stdio) {
-    let path = std::env::temp_dir().join(format!("ucmf-live-{}-{name}.log", std::process::id()));
-    let f = std::fs::File::create(&path).expect("log file");
-    (path, Stdio::from(f))
-}
-
-fn spawn(bin: &PathBuf, args: &[&str], log: Stdio) -> Proc {
-    Proc(
-        Command::new(bin)
-            .args(args)
-            .env("RUST_LOG", "info")
-            // Plain-HTTP SBI on loopback: the `dev` profile (issue #63). The default
-            // `production` profile dials peers over mTLS with this NF's client
-            // certificate, which a test host does not have.
-            .env("NEXTGCORE_SBI_PROFILE", "dev")
-            .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
-            .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .unwrap_or_else(|e| panic!("spawning {}: {e}", bin.display())),
-    )
+/// The env every child gets.
+///
+/// Plain-HTTP SBI on loopback: the `dev` profile (issue #63). The default
+/// `production` profile dials peers over mTLS with this NF's client certificate,
+/// which a test host does not have.
+fn child_env(cmd: &mut std::process::Command) {
+    cmd.env("NEXTGCORE_SBI_PROFILE", "dev")
+        .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1");
 }
 
 fn nrfd_bin() -> Option<PathBuf> {
@@ -96,54 +72,31 @@ async fn ucmfd_registers_with_a_live_nrfd_and_serves_a_transcoded_resolve() {
         return;
     };
     let ucmfd = PathBuf::from(env!("CARGO_BIN_EXE_nextgcore-ucmfd"));
-    let nrf_port = nextgcore_sbi::test_support::free_port();
-    let ucmf_port = nextgcore_sbi::test_support::free_port();
-    let (nrf_port_s, ucmf_port_s) = (nrf_port.to_string(), ucmf_port.to_string());
-    let nrf_uri = format!("http://127.0.0.1:{nrf_port}");
+    // #1521: both children through the shared `NfSpawn`, which waits for each
+    // SBI listener and respawns on a fresh port if a child loses its probed one
+    // to another process (the #1497 race). nrfd is up before the UCMF starts, so
+    // the UCMF's first registration attempt has an NRF to reach.
+    let nrfd = NfSpawn::new(&nrfd, "ucmf-live-nrfd")
+        .ready_when_logged("server listening on")
+        .spawn_async(|cmd, port, _| {
+            child_env(cmd);
+            cmd.args(["-c", "/nonexistent/nrf.yaml", "--sbi-addr", "127.0.0.1"])
+                .args(["--sbi-port", &port.to_string()]);
+        })
+        .await;
+    let nrf_uri = format!("http://127.0.0.1:{}", nrfd.port());
+    let nrf = SbiClient::new(SbiClientConfig::new("127.0.0.1", nrfd.port()));
 
-    let (nrf_log, nrf_out) = log_file("nrfd");
-    let (ucmf_log, ucmf_out) = log_file("ucmfd");
-    eprintln!("logs: {} {}", nrf_log.display(), ucmf_log.display());
-    let _nrf = spawn(
-        &nrfd,
-        &[
-            "-c",
-            "/nonexistent/nrf.yaml",
-            "--sbi-addr",
-            "127.0.0.1",
-            "--sbi-port",
-            &nrf_port_s,
-        ],
-        nrf_out,
-    );
-    // Give the NRF its listener before the UCMF's one registration attempt.
-    let nrf = SbiClient::new(SbiClientConfig::new("127.0.0.1", nrf_port));
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while nrf
-        .send_request(SbiRequest::get("/nnrf-nfm/v1/nf-instances"))
-        .await
-        .is_err()
-    {
-        assert!(Instant::now() < deadline, "nrfd never started listening");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    let _ucmf = spawn(
-        &ucmfd,
-        &[
-            "-c",
-            "/nonexistent/ucmf.yaml",
-            "--sbi-addr",
-            "127.0.0.1",
-            "--sbi-port",
-            &ucmf_port_s,
-            "--nrf-uri",
-            &nrf_uri,
-            "--mode",
-            "B",
-        ],
-        ucmf_out,
-    );
+    let ucmf_proc = NfSpawn::new(&ucmfd, "ucmf-live-ucmfd")
+        .ready_when_logged("SBI server listening on")
+        .spawn_async(|cmd, port, _| {
+            child_env(cmd);
+            cmd.args(["-c", "/nonexistent/ucmf.yaml", "--sbi-addr", "127.0.0.1"])
+                .args(["--sbi-port", &port.to_string()])
+                .args(["--nrf-uri", &nrf_uri, "--mode", "B"]);
+        })
+        .await;
+    let ucmf_port = ucmf_proc.port();
 
     let profiles = discover_ucmf(&nrf, Instant::now() + Duration::from_secs(20)).await;
     let profile = &profiles[0];

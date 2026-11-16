@@ -7,21 +7,13 @@
 //! REVERT-VERIFIED: removing the `pcf_restore_demo_capped_sessions()` call from
 //! `app::run` times the wait for the notify out.
 
-use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use nextgcore_pcfd::context::{pcf_context_init, pcf_self, DemoAmbrCap, SNssai, SessCreateRequest};
 use nextgcore_pcfd::nudr_handler::SessionData;
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
-
-struct Killed(Child);
-impl Drop for Killed {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
+use nextgcore_sbi::test_support::NfSpawn;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restarted_pcfd_restores_a_demo_capped_session() {
@@ -96,32 +88,31 @@ async fn a_restarted_pcfd_restores_a_demo_capped_session() {
     }
     assert!(state.exists(), "the snapshot was written");
 
-    let sbi_port = nextgcore_sbi::test_support::free_port();
-    let config = dir.join("pcf.yaml");
-    std::fs::write(
-        &config,
-        format!(
-            "pcf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n        port: {sbi_port}\n"
-        ),
-    )
-    .unwrap();
-    let _pcfd = Killed(
-        Command::new(env!("CARGO_BIN_EXE_nextgcore-pcfd"))
-            .arg("-c")
-            .arg(&config)
-            .arg("--state-file")
-            .arg(&state)
-            .env("NEXTGCORE_SBI_PROFILE", "dev")
-            .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
-            .env(
-                "PCF_METRICS_PORT",
-                nextgcore_sbi::test_support::free_port().to_string(),
+    // #1521: wait for the SBI listener, and respawn on fresh ports if pcfd loses
+    // a probed one to another process (the #1497 race).
+    let _pcfd = NfSpawn::new(env!("CARGO_BIN_EXE_nextgcore-pcfd"), "pcfd-465-restore")
+        .ready_when_logged("SBI HTTP/2 server listening on")
+        .spawn_async(|cmd, sbi_port, scratch| {
+            let config = scratch.join("pcf.yaml");
+            std::fs::write(
+                &config,
+                format!(
+                    "pcf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n        port: {sbi_port}\n"
+                ),
             )
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn pcfd"),
-    );
+            .unwrap();
+            cmd.arg("-c")
+                .arg(&config)
+                .arg("--state-file")
+                .arg(&state)
+                .env("NEXTGCORE_SBI_PROFILE", "dev")
+                .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
+                .env(
+                    "PCF_METRICS_PORT",
+                    nextgcore_sbi::test_support::free_port().to_string(),
+                );
+        })
+        .await;
 
     let deadline = Instant::now() + Duration::from_secs(30);
     let notify = loop {
