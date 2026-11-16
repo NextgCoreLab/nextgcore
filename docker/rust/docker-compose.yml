@@ -463,8 +463,8 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
-    # No --nrf-uri: eesd registers with an ECS over EDGE-6 (--ecs-uri), not with
-    # the NRF, and an unknown flag makes clap exit before the daemon starts (#694).
+    # No --nrf-uri: eesd registers with an ECS over EDGE-6 (--ecs-uri). --nrf-uri
+    # (#1529) would register it at the NRF as an AF, for 5GC access tokens.
     command: ["--sbi-addr", "172.23.0.31", "--sbi-port", "7777"]
     volumes:
       - ./configs/5gc/ees.yaml:/etc/nextgcore/ees.yaml:ro

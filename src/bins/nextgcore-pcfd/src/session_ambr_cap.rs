@@ -17,9 +17,8 @@
 //!
 //! The home-routed-roaming bound (TS 29.512 §4.2.2.5, §4.2.3.5, §4.2.4.4; TS 23.503
 //! §6.1.3.6: the H-PCF ensures the authorised value does not exceed the VPLMN's) is
-//! not this setting: it would apply whatever the setting says. pcfd does not
-//! implement it today; it negotiates no VPLMN-QoS-Control (TS 29.512 Table 5.8-1
-//! feature 49), so no SMF sends it a `vplmnQos` to bound by.
+//! not this setting: it applies whatever the setting says. It is
+//! [`crate::vplmn_qos`] (#1541, VPLMN-QoS-Control, TS 29.512 Table 5.8-1 feature 49).
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;

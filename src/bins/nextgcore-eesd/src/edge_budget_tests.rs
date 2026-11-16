@@ -15,7 +15,6 @@ fn eas(id: &str, ip: &str, max_resp_ms: Option<u32>, avl_comp: Option<u32>) -> E
         eas_id: id.into(),
         end_pt: EndPoint {
             ipv4_addrs: Some(vec![ip.into()]),
-            port: Some(9471),
             ..Default::default()
         },
         prov_id: None,

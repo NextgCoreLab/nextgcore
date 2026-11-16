@@ -791,7 +791,8 @@ pub(crate) fn parse_subscribed_slices(document: &Document, data: &mut NextgcoreS
 /// `sd` is optional (TS 29.571 Table 5.4.4.2-1); an absent one means no SD is
 /// associated with the SST, which this crate carries as the reserved value FFFFFF
 /// (TS 23.003 clause 28.4.2, `NEXTGCORE_S_NSSAI_NO_SD_VALUE`). An `sd` that is not a
-/// hex string reads the same way. The subscription read and the session-data read
+/// SD string (exactly 6 hex digits, TS 29.571 pattern `^[A-Fa-f0-9]{6}$`, #1547)
+/// reads the same way. The subscription read and the session-data read
 /// both go through here, so they agree on the same stored slice.
 ///
 /// A present `sd` that does not parse is logged at WARN, once per read of the
@@ -803,7 +804,8 @@ pub(crate) fn parse_slice_sd(slice_doc: &Document) -> NextgcoreUint24 {
         None => no_sd,
         Some(Bson::String(sd)) => NextgcoreUint24::from_hex_string(sd).unwrap_or_else(|| {
             log::warn!(
-                "subscriber slice (sst {:?}): sd {sd:?} is not a hex string; read as no SD",
+                "subscriber slice (sst {:?}): sd {sd:?} is not 6 hex digits (TS 29.571 \
+                 Snssai.sd); read as no SD",
                 slice_doc.get_i32(NEXTGCORE_SST_STRING).ok()
             );
             no_sd
@@ -1225,7 +1227,11 @@ mod tests {
                 .expect("sst is set");
         assert_eq!(with_sd.s_nssai, NextgcoreSNssai::new(2, Some(0x0a0b0c)));
 
-        for bad in ["", "zz", "not-hex"] {
+        // #1547: not exactly 6 hex digits, so not an SD, even where u32 parsing
+        // would take it ("0100001" would have been SD 100001, a different slice).
+        for bad in [
+            "", "zz", "not-hex", "1", "+1", "+00001", "00001", "0100001", " 00001", "00001 ",
+        ] {
             let bad_sd =
                 parse_slice_data(&doc! { NEXTGCORE_SST_STRING: 1, NEXTGCORE_SD_STRING: bad })
                     .expect("sst is set");
@@ -1255,6 +1261,8 @@ mod tests {
             doc! { NEXTGCORE_SST_STRING: 1, NEXTGCORE_SD_STRING: "000001" },
             doc! { NEXTGCORE_SST_STRING: 1, NEXTGCORE_SD_STRING: "ffffff" },
             doc! { NEXTGCORE_SST_STRING: 1, NEXTGCORE_SD_STRING: "x" },
+            doc! { NEXTGCORE_SST_STRING: 1, NEXTGCORE_SD_STRING: "1" },
+            doc! { NEXTGCORE_SST_STRING: 1, NEXTGCORE_SD_STRING: "0000001" },
             doc! { NEXTGCORE_SST_STRING: 1, NEXTGCORE_SD_STRING: 7 },
         ];
         for shape in shapes {

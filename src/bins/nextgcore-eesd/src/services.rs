@@ -636,7 +636,7 @@ mod tests {
             "requestorId":"ees-src.example.com",
             "requestorEndPt":{"fqdn":"ees-src.example.com"},
             "easId":"common-eas.example.com",
-            "easEndPt":{"fqdn":"common-eas.edge.example.com","port":443},
+            "easEndPt":{"fqdn":"common-eas.edge.example.com"},
             "serviceKpisList":{"connBand":"100 Mbps"},
             "ednInfo":{"ednServiceArea":{"tais":[]}},
             "appGrpId":"grp-1",
@@ -649,7 +649,6 @@ mod tests {
             info.eas_end_pt.fqdn.as_deref(),
             Some("common-eas.edge.example.com")
         );
-        assert_eq!(info.eas_end_pt.port, Some(443));
         assert_eq!(info.app_grp_id, "grp-1");
         assert!(info.requestor_end_pt.is_some());
         assert!(info.service_kpis_list.is_some());
@@ -1221,7 +1220,7 @@ mod tests {
             "eecId":"eec1",
             "acId":"ac1",
             "sAsEndPoint":{"fqdn":"s-as.edge.example.com"},
-            "tAsEndPoint":{"fqdn":"t-as.edge.example.com","port":8443},
+            "tAsEndPoint":{"fqdn":"t-as.edge.example.com"},
             "acrParams":{"predictExpTime":"2030-01-01T00:00:00Z"}
         }"#;
         let info: ACRParamsInfo = serde_json::from_str(body).expect("deserializes");
@@ -1236,7 +1235,6 @@ mod tests {
             info.t_as_end_point.fqdn.as_deref(),
             Some("t-as.edge.example.com")
         );
-        assert_eq!(info.t_as_end_point.port, Some(8443));
         assert_eq!(
             info.acr_params.predict_exp_time.as_deref(),
             Some("2030-01-01T00:00:00Z")

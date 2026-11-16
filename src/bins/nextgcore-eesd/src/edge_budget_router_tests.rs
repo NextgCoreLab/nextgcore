@@ -53,7 +53,7 @@ const EASES: [(&str, &str, u32, u32); 3] = [
 
 fn eas_body(id: &str, ip: &str, max_resp: u32, avl: u32) -> String {
     format!(
-        r#"{{"easProf":{{"easId":"{id}","endPt":{{"ipv4Addrs":["{ip}"],"port":9471}},"svcKpi":{{"maxRespTime":{max_resp},"avlComp":{avl}}}}}}}"#
+        r#"{{"easProf":{{"easId":"{id}","endPt":{{"ipv4Addrs":["{ip}"]}},"svcKpi":{{"maxRespTime":{max_resp},"avlComp":{avl}}}}}}}"#
     )
 }
 

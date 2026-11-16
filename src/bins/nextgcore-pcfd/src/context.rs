@@ -150,6 +150,12 @@ pub struct PcfUeAm {
     /// (TS 29.500 §6.10).
     #[serde(default)]
     pub alt_notif_uris: Vec<String>,
+    /// #1524: the AMF sent a `ueAmbr` on this association (create or update).
+    /// With UE-AMBR_Authorization negotiated in `am_policy_control_features`,
+    /// that is what makes the policy carry an authorised UE-AMBR (TS 29.507
+    /// §4.2.2.2 item c, §4.2.3.2 item c).
+    #[serde(default)]
+    pub ue_ambr_requested: bool,
 }
 
 /// UE Route Selection Policy rule (TS 24.526)
@@ -231,6 +237,7 @@ impl PcfUeAm {
             triggers: Vec::new(),
             am_policy: None,
             alt_notif_uris: Vec::new(),
+            ue_ambr_requested: false,
         }
     }
 
@@ -593,6 +600,12 @@ pub struct PcfSess {
     /// writes it. `#[serde(default)]` for older snapshots.
     #[serde(default)]
     pub demo_ambr_cap: Option<DemoAmbrCap>,
+    /// #1541: the QoS constraints of the VPLMN in home-routed roaming
+    /// (`vplmnQos`, TS 29.512 VPLMN-QoS-Control), last reported by the SMF;
+    /// `None` when none apply. Only held when the feature was negotiated.
+    /// `#[serde(default)]` for older snapshots.
+    #[serde(default)]
+    pub vplmn_qos: Option<crate::vplmn_qos::VplmnQosBound>,
 }
 
 /// The cap a demo installed on a session ([`PcfSess::demo_ambr_cap`]).
@@ -662,6 +675,7 @@ impl PcfSess {
             origination_ms: None,
             authorised_session_data: None,
             demo_ambr_cap: None,
+            vplmn_qos: None,
         }
     }
 
