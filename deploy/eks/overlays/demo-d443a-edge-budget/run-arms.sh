@@ -35,8 +35,8 @@ ARMS=("$@")
 CORE_NFS=(nrf amf smf upf ausf udm udr pcf nssf bsf ees)
 set -e
 if [[ -n "${CORE_IMAGE_TAG:-}" && -n "${SIM_IMAGE_TAG:-}" ]]; then
-  [[ "${CORE_IMAGE_TAG}" == "${KEY}-$(git -C "${CORE_SRC}" rev-parse --short=12 HEAD)" \
-     && "${SIM_IMAGE_TAG}" == "${KEY}-$(git -C "${SIM_SRC}" rev-parse --short=12 HEAD)" ]] \
+  [[ "${CORE_IMAGE_TAG}" == "demo-${KEY}-$(git -C "${CORE_SRC}" rev-parse --short=12 HEAD)" \
+     && "${SIM_IMAGE_TAG}" == "demo-${KEY}-$(git -C "${SIM_SRC}" rev-parse --short=12 HEAD)" ]] \
     || { echo "run-arms: the given tags do not name CORE_SRC/SIM_SRC at HEAD" >&2; exit 1; }
   for r in "${CORE_NFS[@]}"; do
     aws ecr describe-images --repository-name "nextg/${r}" --image-ids imageTag="${CORE_IMAGE_TAG}" >/dev/null \
