@@ -1684,6 +1684,18 @@ pub struct SmContextUpdateResponse {
     pub n2_sm_info_type: Option<String>,
 }
 
+/// A UE-requested modification the SMF did not answer with a 2xx (#1590).
+#[derive(Debug)]
+pub struct SmContextUpdateRefusal {
+    /// Why: the SMF unreachable, or its status.
+    pub reason: String,
+    /// The N1 SM information of the SMF's SmContextUpdateError (TS 29.502 §5.2.2.3.1
+    /// step 2b, Table 6.1.6.2.36-1 `n1SmMsg`): its PDU SESSION MODIFICATION REJECT,
+    /// with its own 5GSM cause, for the AMF to forward to the UE. `None` when the
+    /// SMF gave none.
+    pub n1_sm_msg: Option<Vec<u8>>,
+}
+
 /// Call SMF to update SM context with N1 SM info (UE-initiated modification)
 ///
 /// Call the SMF with an N2 SM transfer and return what it answers (#70).
@@ -1844,7 +1856,7 @@ pub async fn call_smf_update_sm_context_with_n1(
     smf_port: u16,
     sm_context_ref: &str,
     n1_sm_msg: &[u8],
-) -> SbiResult<SmContextUpdateResponse> {
+) -> Result<SmContextUpdateResponse, SmContextUpdateRefusal> {
     log::info!(
         "Calling SMF SM Context Update (N1): ref={}, n1_len={}",
         sm_context_ref,
@@ -1875,13 +1887,27 @@ pub async fn call_smf_update_sm_context_with_n1(
     let response = client
         .send_request(request)
         .await
-        .map_err(|e| SbiError::RequestFailed(format!("SMF update failed: {e}")))?;
+        .map_err(|e| SmContextUpdateRefusal {
+            reason: format!("SMF update failed: {e}"),
+            n1_sm_msg: None,
+        })?;
 
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "SMF update returned status {}",
-            response.status
-        )));
+        // #1590, TS 29.502 §5.2.2.3.1 step 2b: a 4xx/5xx SmContextUpdateError carries
+        // "N1 SM information, if the SMF needs and can return a response to the UE".
+        // TS 24.501 §6.4.2.4.1: that is the SMF's PDU SESSION MODIFICATION REJECT,
+        // whose 5GSM cause is the SMF's to set. It goes to the UE as it is.
+        let root: serde_json::Value = response
+            .http
+            .content
+            .as_deref()
+            .and_then(|c| serde_json::from_str(c).ok())
+            .unwrap_or_default();
+        let n1_sm_msg = extract_binary_ref(&response, &root, "n1SmMsg").filter(|n1| !n1.is_empty());
+        return Err(SmContextUpdateRefusal {
+            reason: format!("SMF update returned status {}", response.status),
+            n1_sm_msg,
+        });
     }
 
     let response_body: serde_json::Value = match &response.http.content {

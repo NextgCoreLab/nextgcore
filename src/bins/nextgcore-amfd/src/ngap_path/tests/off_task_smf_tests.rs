@@ -160,6 +160,94 @@ async fn a_failed_modification_is_answered_with_a_modification_reject_1546() {
     server.forget_ue(ue);
 }
 
+/// A stand-in SMF that refuses every UpdateSMContext with `status`, carrying `n1` as
+/// its SmContextUpdateError's `n1SmMsg` part when given (TS 29.502 §5.2.2.3.1 step
+/// 2b, Table 6.1.6.2.36-1).
+async fn refusing_smf(status: u16, n1: Option<Vec<u8>>) -> (nextgcore_sbi::server::SbiServer, u16) {
+    use nextgcore_sbi::message::{SbiPart, SbiRequest as SReq, SbiResponse as SResp};
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let server = nextgcore_sbi::server::SbiServer::on_listener(
+        nextgcore_sbi::server::SbiServerConfig::new(addr),
+        listener,
+    );
+    server
+        .start(move |_req: SReq| {
+            let n1 = n1.clone();
+            async move {
+                let mut body = serde_json::json!({
+                    "error": { "status": status, "cause": "SUBSCRIPTION_DENIED" },
+                });
+                let Some(n1) = n1 else {
+                    return SResp::with_status(status)
+                        .with_body(body.to_string(), "application/json");
+                };
+                body["n1SmMsg"] = serde_json::json!({ "contentId": "n1SmMsg" });
+                SResp::with_status(status)
+                    .with_body(body.to_string(), "application/json")
+                    .with_part(SbiPart::with_content(
+                        "n1SmMsg",
+                        nextgcore_sbi::constants::content_type::APPLICATION_5GNAS,
+                        bytes::Bytes::from(n1),
+                    ))
+            }
+        })
+        .await
+        .expect("stand-in SMF starts");
+    (server, addr.port())
+}
+
+/// The one DL NAS TRANSPORT a UE-requested modification of `ue` (PSI 5, PTI 7) at
+/// an SMF on `port` is answered with.
+async fn modification_answer(ue: u64, ran: u32, sm_ref: &str, port: u16) -> Vec<u8> {
+    let mut server = capturing_ngap_server().await;
+    secured_registered_ue(&mut server, ue, ran);
+    hold_session(&mut server, ue, 5, sm_ref, port);
+    server
+        .handle_5gsm_message(ASSOC, ue, ran, &[0x2E, 0x05, 0x07, 0xC9], None)
+        .await
+        .expect("handled");
+    let sent = apply_until(&mut server, |s| !concerns(s, ue).is_empty()).await;
+    let [Sent::DownlinkNas { nas_pdu, .. }] = concerns(&sent, ue)[..] else {
+        panic!("one DL NAS TRANSPORT to the UE: {sent:?}");
+    };
+    let nas_pdu = nas_pdu.clone();
+    server.forget_ue(ue);
+    nas_pdu
+}
+
+/// #1590, TS 29.502 §5.2.2.3.1 step 2b / TS 24.501 §6.4.2.4.1: an SMF that refuses a
+/// UE-requested modification with its own PDU SESSION MODIFICATION REJECT (#29 here,
+/// as smfd answers a PCF refusal) has that reject relayed to the UE, not the AMF's
+/// own #26. A refusal with no N1 still gets the AMF's #26.
+///
+/// REVERT-VERIFIED: with the SMF's `n1SmMsg` dropped on a non-2xx again, the UE gets
+/// `CA 1A` (#26) instead of `CA 1D`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_smf_modification_reject_is_relayed_to_the_ue_1590() {
+    let smf_reject = vec![0x2E, 0x05, 0x07, 0xCA, 0x1D];
+    let (relaying, port) = refusing_smf(403, Some(smf_reject.clone())).await;
+    let nas = modification_answer(15_900_101, 159, "mod-1590-n1", port).await;
+    assert!(
+        nas.windows(smf_reject.len()).any(|w| w == smf_reject),
+        "the DL NAS TRANSPORT carries the SMF's MODIFICATION REJECT #29: {nas:02x?}"
+    );
+    assert!(
+        !nas.windows(5).any(|w| w == [0x2E, 0x05, 0x07, 0xCA, 0x1A]),
+        "and not the AMF's #26: {nas:02x?}"
+    );
+    relaying.stop().await.expect("stop");
+
+    let (bare, port) = refusing_smf(403, None).await;
+    let nas = modification_answer(15_900_102, 160, "mod-1590-bare", port).await;
+    let own = [0x2E, 0x05, 0x07, 0xCA, 0x1A];
+    assert!(
+        nas.windows(own.len()).any(|w| w == own),
+        "a refusal with no N1 gets the AMF's own #26: {nas:02x?}"
+    );
+    bare.stop().await.expect("stop");
+}
+
 /// TS 23.502 §4.2.3.2, CM-CONNECTED: a Service Request re-activating a session at a
 /// blackholed SMF does not hold the NGAP task, and another UE's Service Request is
 /// served meanwhile. The Service Accept waits for the ACTIVATING's answer, since it
