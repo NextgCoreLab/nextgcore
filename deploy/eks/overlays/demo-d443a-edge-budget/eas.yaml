@@ -56,8 +56,14 @@ data:
     set -eu
     D=/tmp/d443a
     mkdir -p "$D/cca"
-    chmod 0711 "$D"; chmod 0700 "$D/cca"
+    # Traversable, not listable, by nobody: each key is handed to nobody alone.
+    chmod 0711 "$D" "$D/cca"
     say() { echo "$(date -u +%FT%TZ) [d443a-sidecar] $*"; }
+    # A restarted container finds the pod's network namespace as it left it.
+    if ip link show eas-br >/dev/null 2>&1; then
+      say "FATAL: dn already exists (this container restarted); the pod must be recreated"
+      exec sleep infinity
+    fi
     # dn: a bridge in the UPF's namespace, one namespace per EAS.
     ip link add eas-br type bridge
     ip addr add 10.60.0.1/24 dev eas-br
@@ -97,8 +103,13 @@ data:
       # shellcheck disable=SC2086  # $args is the start file's flag list
       ( sh -c "echo \$\$ >$D/$id.pid; exec ip netns exec $id setpriv --reuid=65534 --regid=65534 \
           --clear-groups --inh-caps=-all --bounding-set=-all --no-new-privs \
-          nr-she-eas -c $cfg $args" 2>&1 | sed -u "s/^/[$id] /" ) &
+          nr-she-eas -c $cfg $args" 2>&1 | sed -u "s/^/[$id] /"
+        say "$id: nr-she-eas exited" ) &
     done <<EASES
     ${D443A_EASES}
     EASES
+    # An EAS that exits is logged, never a container restart (which would find
+    # dn already built): the scenario's checks see it gone.
     wait
+    say "every nr-she-eas has exited; idling"
+    exec sleep infinity

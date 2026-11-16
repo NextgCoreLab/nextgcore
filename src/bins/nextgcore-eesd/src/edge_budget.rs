@@ -14,14 +14,15 @@
 //!   used.
 //!
 //!   TS 33.501 §13.4.1 (*"The OAuth 2.0 framework does not apply to the
-//!   notification operation"*) and TS 29.500 §6.7.3 mean smfd's notify carries
+//!   notification operation"*) and TS 29.500 §6.10.7 NOTE mean smfd's notify carries
 //!   no token. The route is registered through the shared callback exemption
 //!   (#1519's `OAuth2CallbackExemption`, `POST /d443a-edge-budget/qos-mon/{token}`
 //!   with [`token_is_current`] as the check), which eesd's per-route gate
 //!   consults (#1525): a token-less notify on the current token is admitted;
 //!   with any other path token it is held to the bearer (401, so the route is no
-//!   token-validity oracle). A notify that does carry a bearer needs scope
-//!   [`SCOPE`].
+//!   token-validity oracle). On the current path token a bearer, if any, is not
+//!   consulted (as at #1519's server gate); with any other path token the
+//!   bearer must carry scope [`SCOPE`] (and the wrong token is then a 404).
 //! - The selection policy (TS 24.558 §5.2.2.2 step 1 iii) B), *"based on EES
 //!   local policies"*): with `easSelReqInd`, the EASes that matched the AC
 //!   profiles are ranked on a budget and filtered by the deadline
