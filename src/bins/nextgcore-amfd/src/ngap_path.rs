@@ -1430,6 +1430,15 @@ pub(crate) enum SmfAnswer {
         ran_ue_ngap_id: u32,
         result: Result<Vec<u8>, String>,
     },
+    /// #1471: the SMF's answer to a relayed UE 5GSM message (5GSM STATUS, an
+    /// authentication complete, a REMOTE UE REPORT, ...): the N1 SM to send to the
+    /// UE, empty for none, or why the relay failed.
+    N1Relayed {
+        amf_ue_ngap_id: u64,
+        psi: u8,
+        what: &'static str,
+        result: Result<Vec<u8>, String>,
+    },
     /// One session's answer for the [`SmfJoin`] `join`.
     JoinPart {
         join: u64,
@@ -10462,14 +10471,114 @@ impl NgapServer {
                     ),
                 }
             }
-            0xD6 => {
-                log::info!("5GSM STATUS from UE: PSI={psi}");
-            }
+            // #1471: every other 5GSM message from the UE goes to the SMF of its
+            // session. TS 24.501 §5.4.5.2.3 a)1)i): with a PDU session routing context
+            // for the PDU session ID and no initial/existing Request type, "the AMF
+            // shall send the 5GSM message, and the PDU session ID IE towards the SMF"
+            // (24501-k00_2_Main-Body_s05_s0504.txt:11844-11849), whatever its type: the
+            // AMF does not interpret 5GSM. The SMF acts on it or answers per §7.3/§7.4,
+            // and an N1 SM it answers with goes back to the UE. Those include 5GSM STATUS (0xD6,
+            // §6.5.3), PDU SESSION AUTHENTICATION COMPLETE (0xC6, §6.3.1),
+            // SERVICE-LEVEL AUTHENTICATION COMPLETE (0xD9, §6.4.3) and REMOTE UE
+            // REPORT (0xDA, §6.6.2, answered with a REMOTE UE REPORT RESPONSE). Before,
+            // 0xD6 was only logged and the rest fell to "Unhandled".
             other => {
-                log::warn!("Unhandled 5GSM message type 0x{other:02x}");
+                let what = match other {
+                    0xD6 => "5GSM STATUS",
+                    0xC6 => "PDU SESSION AUTHENTICATION COMPLETE",
+                    0xD9 => "SERVICE-LEVEL AUTHENTICATION COMPLETE",
+                    0xDA => "REMOTE UE REPORT",
+                    _ => "5GSM message",
+                };
+                log::info!("{what} (0x{other:02x}) from UE: PSI={psi}, PTI={pti}");
+                let Some(sm_context_ref) =
+                    self.sm_context_refs.get(&(amf_ue_ngap_id, psi)).cloned()
+                else {
+                    // §5.4.5.2.5 a)7): with no routing context the AMF "may" send the
+                    // message back as not forwarded; it is dropped, as for 0xCC/0xD4.
+                    log::info!(
+                        "{what} (0x{other:02x}) for UE {amf_ue_ngap_id} PSI {psi}: no SM                          context; not forwarded"
+                    );
+                    return Ok(());
+                };
+                let n1 = sm_pdu.to_vec();
+                // The User Location Information, as the 0xCC/0xCD relay sends it.
+                let ue_location = build_sm_context_identity(
+                    self.ue_auth_state.get(amf_ue_ngap_id).as_ref(),
+                    None,
+                )
+                .ue_location;
+                self.sbi_offload
+                    .spawn_keyed((amf_ue_ngap_id, psi), move || async move {
+                        let (host, port) = smf_or_selected(owner).await;
+                        let result = crate::sbi_path::call_smf_update_sm_context_n1_at(
+                            &host,
+                            port,
+                            &sm_context_ref,
+                            &n1,
+                            ue_location,
+                        )
+                        .await
+                        .map_err(|e| e.to_string());
+                        Some(crate::sbi_offload::SbiOutcome::Smf(SmfAnswer::N1Relayed {
+                            amf_ue_ngap_id,
+                            psi,
+                            what,
+                            result,
+                        }))
+                    });
             }
         }
         Ok(())
+    }
+
+    /// #1471: the SMF's answer to a UE 5GSM message relayed by the catch-all arm of
+    /// [`Self::handle_5gsm_message`]. An N1 SM in it (a 5GSM STATUS, a REMOTE UE
+    /// REPORT RESPONSE) goes to the UE in a DL NAS TRANSPORT on its current NG
+    /// connection, while it is CM-CONNECTED.
+    async fn apply_n1_relayed(
+        &mut self,
+        amf_ue_ngap_id: u64,
+        psi: u8,
+        what: &str,
+        result: Result<Vec<u8>, String>,
+    ) -> Result<()> {
+        let n1 = match result {
+            Ok(n1) if n1.is_empty() => {
+                log::info!("{what} for UE {amf_ue_ngap_id} PSI {psi}: relayed to the SMF");
+                return Ok(());
+            }
+            Ok(n1) => n1,
+            Err(e) => {
+                log::warn!("{what} for UE {amf_ue_ngap_id} PSI {psi}: SMF update failed: {e}");
+                return Ok(());
+            }
+        };
+        let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) else {
+            log::info!(
+                "{what} for UE {amf_ue_ngap_id} PSI {psi}: the UE is gone; the SMF's \
+                 {}-byte N1 SM is not delivered",
+                n1.len()
+            );
+            return Ok(());
+        };
+        if state.is_cm_idle() {
+            log::warn!(
+                "{what} for UE {amf_ue_ngap_id} PSI {psi}: the UE went CM-IDLE meanwhile; \
+                 the SMF's {}-byte N1 SM is not delivered",
+                n1.len()
+            );
+            return Ok(());
+        }
+        log::info!(
+            "{what} for UE {amf_ue_ngap_id} PSI {psi}: relaying the SMF's {}-byte N1 SM \
+             (message type 0x{:02x}) to the UE",
+            n1.len(),
+            n1.get(3).copied().unwrap_or_default()
+        );
+        let (association_id, ran_ue_ngap_id) = (state.association_id, state.ran_ue_ngap_id);
+        self.send_n1_sm_to_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, psi, &n1)
+            .await
     }
 
     /// The SMF answered a UE-requested PDU Session Modification (#922): TS 23.502
@@ -11531,6 +11640,15 @@ impl NgapServer {
                     result,
                 )
                 .await
+            }
+            SmfAnswer::N1Relayed {
+                amf_ue_ngap_id,
+                psi,
+                what,
+                result,
+            } => {
+                self.apply_n1_relayed(amf_ue_ngap_id, psi, what, result)
+                    .await
             }
             SmfAnswer::JoinPart { join, psi, answer } => {
                 let Some(j) = self.smf_joins.get_mut(&join) else {
@@ -35207,6 +35325,145 @@ mod tests {
                 "70"
             );
         }
+    }
+
+    /// A stand-in SMF as smfd answers the UE 5GSM messages #1471 relays: a REMOTE UE
+    /// REPORT with `200` and its REMOTE UE REPORT RESPONSE (TS 24.501 §6.6.2.3), an
+    /// authentication COMPLETE with `200` and 5GSM STATUS #97 (§7.4), a 5GSM STATUS
+    /// with `204`. Records `(uri, json body, n1SmMsg part)`. Keep the server alive.
+    #[allow(clippy::type_complexity)]
+    async fn answering_smf_1471() -> (
+        nextgcore_sbi::server::SbiServer,
+        u16,
+        Arc<std::sync::Mutex<Vec<(String, String, Vec<u8>)>>>,
+    ) {
+        use nextgcore_sbi::constants::content_type;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let seen: Arc<std::sync::Mutex<Vec<(String, String, Vec<u8>)>>> = Arc::default();
+        let sink = Arc::clone(&seen);
+        let (server, addr) = nextgcore_sbi::test_support::sbi_server_on_free_port(
+            move |req: nextgcore_sbi::SbiRequest| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    let n1 = req
+                        .http
+                        .parts
+                        .iter()
+                        .find(|p| p.content_id.as_deref() == Some("n1SmMsg"))
+                        .map(|p| p.data.to_vec())
+                        .unwrap_or_default();
+                    sink.lock().expect("sink").push((
+                        req.header.uri.clone(),
+                        req.http.content.clone().unwrap_or_default(),
+                        n1.clone(),
+                    ));
+                    let answer = match n1.get(3) {
+                        Some(0xDA) => Some(vec![0x2E, n1[1], n1[2], 0xDB]),
+                        Some(0xC6 | 0xD9) => Some(vec![0x2E, n1[1], n1[2], 0xD6, 97]),
+                        _ => None,
+                    };
+                    match answer {
+                        Some(a) => nextgcore_sbi::SbiResponse::with_status(200)
+                            .with_body(
+                                r#"{"n1SmMsg":{"contentId":"n1SmMsg"}}"#.to_string(),
+                                content_type::APPLICATION_JSON,
+                            )
+                            .with_part(nextgcore_sbi::message::SbiPart::with_content(
+                                "n1SmMsg",
+                                content_type::APPLICATION_5GNAS,
+                                bytes::Bytes::from(a),
+                            )),
+                        None => nextgcore_sbi::SbiResponse::no_content(),
+                    }
+                }
+            },
+        )
+        .await;
+        (server, addr.port(), seen)
+    }
+
+    /// **#1471**, TS 24.501 §5.4.5.2.3 a)1)i): the UE's other 5GSM messages reach the
+    /// SMF holding the session, byte for byte, with the User Location Information.
+    /// Those are 5GSM STATUS (0xD6), PDU SESSION AUTHENTICATION COMPLETE (0xC6),
+    /// SERVICE-LEVEL AUTHENTICATION COMPLETE (0xD9) and REMOTE UE REPORT (0xDA), and
+    /// an N1 SM the SMF answers with goes to the UE in a DL NAS TRANSPORT. Before,
+    /// 0xD6 was only logged and the rest were "Unhandled": none reached the SMF, and
+    /// a relay UE's T3586 ran out on every report.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_ue_s_other_5gsm_messages_reach_the_smf_and_its_answer_the_ue_1471() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (_smf, port, seen) = answering_smf_1471().await;
+        let mut ngap = capturing_ngap_server().await;
+        let ue = 7_147_101u64;
+        let mut state = UeNasContext::new(ue, 71, 1, false);
+        state.amf_ue.nr_tai.plmn_id = PlmnId::new("999", "70");
+        state.amf_ue.nr_tai.tac = 0x1471;
+        state.amf_ue.nr_cgi.plmn_id = PlmnId::new("999", "70");
+        state.amf_ue.nr_cgi.cell_id = 0x0_0001_4711;
+        ngap.ue_auth_state.insert(ue, state);
+        ngap.sm_context_refs
+            .insert((ue, 5), "smctx-1471".to_string());
+        ngap.sm_context_smfs
+            .insert((ue, 5), ("127.0.0.1".to_string(), port));
+
+        let status = vec![0x2E, 5, 0, 0xD6, 0x2F];
+        let auth = vec![0x2E, 5, 0, 0xC6, 0x00, 0x04, 0x02, 0x01, 0x00, 0x04];
+        let sl_auth = vec![0x2E, 5, 0, 0xD9, 0x00, 0x04, 0x02, 0x01, 0x00, 0x04];
+        let report = vec![0x2E, 5, 0x21, 0xDA, 0x76, 0x00, 0x03, 0x01, 0x01, 0x00];
+        let cases: [(&[u8], Option<Vec<u8>>); 4] = [
+            (&status, None),
+            (&auth, Some(vec![0x2E, 5, 0, 0xD6, 97])),
+            (&sl_auth, Some(vec![0x2E, 5, 0, 0xD6, 97])),
+            (&report, Some(vec![0x2E, 5, 0x21, 0xDB])),
+        ];
+        for (i, (msg, answer)) in cases.iter().enumerate() {
+            take_sent_ngap(&mut ngap);
+            ngap.handle_5gsm_message(1, ue, 71, msg, None)
+                .await
+                .expect("handled");
+            settle_offloaded_sbi(&mut ngap).await;
+            let got = seen.lock().expect("seen").clone();
+            assert_eq!(
+                got.len(),
+                i + 1,
+                "0x{:02x}: one UpdateSMContext: {got:?}",
+                msg[3]
+            );
+            let (uri, body, n1) = &got[i];
+            assert_eq!(uri, "/nsmf-pdusession/v1/sm-contexts/smctx-1471/modify");
+            assert_eq!(n1.as_slice(), *msg, "the N1 SM container, byte for byte");
+            let json: serde_json::Value = serde_json::from_str(body).expect("JSON body");
+            assert_eq!(json["n1SmMsg"]["contentId"], "n1SmMsg", "{body}");
+            assert_eq!(
+                json["ueLocation"]["nrLocation"]["tai"]["tac"], "001471",
+                "with the User Location Information: {body}"
+            );
+            let sent = take_sent_ngap(&mut ngap);
+            match answer {
+                Some(a) => {
+                    assert_eq!(
+                        sent.len(),
+                        1,
+                        "0x{:02x}: the SMF's answer goes to the UE",
+                        msg[3]
+                    );
+                    assert_eq!(sent[0].0, 1, "on the UE's association");
+                    assert!(
+                        sent[0].1.windows(a.len()).any(|w| w == a.as_slice()),
+                        "0x{:02x}: the DL NAS TRANSPORT carries the SMF's N1 SM {a:02x?}",
+                        msg[3]
+                    );
+                }
+                None => assert!(sent.is_empty(), "0x{:02x}: nothing to send", msg[3]),
+            }
+        }
+
+        // No SM context for PSI 6: not forwarded.
+        ngap.handle_5gsm_message(1, ue, 71, &[0x2E, 6, 0x22, 0xDA], None)
+            .await
+            .expect("handled");
+        settle_offloaded_sbi(&mut ngap).await;
+        assert_eq!(seen.lock().expect("seen").len(), 4, "nothing for PSI 6");
     }
 
     /// **#738.** After an N2 handover the SOURCE gNB's UE Context Release Complete ends
