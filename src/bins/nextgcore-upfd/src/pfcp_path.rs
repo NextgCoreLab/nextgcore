@@ -878,7 +878,8 @@ fn parse_rule_id_u16(body: &[u8], id_ie_type: u16) -> Option<u16> {
 }
 
 /// Parse every IE of one type with the establishment path's parser, noting a
-/// malformed body as an Offending IE rather than dropping it silently (#306).
+/// malformed body as an Offending IE rather than dropping it silently (#306;
+/// Session Establishment too since #1532).
 fn parse_rule_list<T>(
     ies: &[ParsedIe],
     ie_type: u16,
@@ -2186,6 +2187,39 @@ impl PfcpServer {
             }
         }
 
+        // #1532: the Create PDRs, FARs and URRs too, before anything is allocated. A
+        // Create PDR, FAR or URR its parser refuses (no PDR/FAR/URR ID, or a
+        // malformed F-TEID, UE IP Address or Outer Header Creation inside it) is a
+        // mandatory or verifiable conditional IE with a semantically invalid value,
+        // so the request is discarded and answered "Mandatory IE incorrect" with the
+        // offending grouped IE (TS 29.244 §7.6.8), as Session Modification already
+        // does (`parse_rule_list`). These used to be logged and skipped, so the
+        // session ran without that rule: a PDR that never matched, a missing FAR, a
+        // URR that never reported.
+        let mut malformed: Option<N4Failure> = None;
+        let create_pdrs =
+            parse_rule_list(&ies, pfcp_ie::CREATE_PDR, parse_create_pdr, &mut malformed);
+        let create_fars =
+            parse_rule_list(&ies, pfcp_ie::CREATE_FAR, parse_create_far, &mut malformed);
+        let create_urrs =
+            parse_rule_list(&ies, pfcp_ie::CREATE_URR, parse_create_urr, &mut malformed);
+        if let Some(failure) = malformed {
+            log::warn!("Session Establishment from {src_addr}: {failure:?} — rejecting");
+            let resp_payload = failure.response_body();
+            let response = self.build_response(
+                pfcp_type::SESSION_ESTABLISHMENT_RESPONSE,
+                smf_seid,
+                header.sequence_number,
+                &resp_payload,
+                true,
+            );
+            self.socket
+                .send_to(&response, src_addr)
+                .await
+                .map_err(|e| format!("Send error: {e}"))?;
+            return Ok(());
+        }
+
         // Allocate UPF SEID
         let upf_seid = self.alloc_seid();
         log::debug!("Allocated UPF SEID: {upf_seid:#x}");
@@ -2196,92 +2230,85 @@ impl PfcpServer {
         let mut created_pdrs = Vec::new();
         let mut parsed_pdrs = Vec::new();
 
-        for pdr_ie in ParsedIe::find_all_ies(&ies, pfcp_ie::CREATE_PDR) {
-            match parse_create_pdr(&pdr_ie.value) {
-                Ok(pdr) => {
-                    log::debug!(
-                        "PDR {}: src_if={}, precedence={}, far_id={:?}, qer_id={:?}, urr_ids={:?}",
-                        pdr.pdr_id,
-                        pdr.pdi.source_interface,
-                        pdr.precedence,
-                        pdr.far_id,
-                        pdr.qer_id,
-                        pdr.urr_ids,
-                    );
+        for pdr in create_pdrs {
+            log::debug!(
+                "PDR {}: src_if={}, precedence={}, far_id={:?}, qer_id={:?}, urr_ids={:?}",
+                pdr.pdr_id,
+                pdr.pdi.source_interface,
+                pdr.precedence,
+                pdr.far_id,
+                pdr.qer_id,
+                pdr.urr_ids,
+            );
 
-                    // Check if this PDR needs a local F-TEID (uplink PDR).
-                    //
-                    // The SMF asks the UPF to allocate the N3 uplink F-TEID in
-                    // one of two ways (TS 29.244 8.2.3 / 7.5.3.2):
-                    //   * CH (CHOOSE) flag set — the canonical "UP function
-                    //     shall assign the F-TEID" request, with TEID/address
-                    //     omitted on the wire; or
-                    //   * a PDI F-TEID with TEID == 0 (no concrete tunnel to
-                    //     bind to). Our SMF signals allocation this way.
-                    // In either case the UPF allocates a fresh non-zero TEID +
-                    // its N3 GTP-U address and returns it in the Created PDR so
-                    // uplink GTP-U traffic matches.
-                    let local_f_teid = if let Some(ref fteid) = pdr.pdi.local_f_teid {
-                        if fteid.ch || fteid.teid == 0 {
-                            let Some((ipv4, ipv6)) = self.local_f_teid_addrs(fteid) else {
-                                // #985 review: an IPv6-only F-TEID this UPF cannot
-                                // assign refuses the establishment (§7.5.3.1).
-                                // #1154: the Failed Rule ID, not an Offending IE.
-                                let resp_payload = crate::n4_build::build_rule_failure_response(
-                                    crate::n4_build::FailedRule::Pdr(pdr.pdr_id),
-                                );
-                                let response = self.build_response(
-                                    pfcp_type::SESSION_ESTABLISHMENT_RESPONSE,
-                                    smf_seid,
-                                    header.sequence_number,
-                                    &resp_payload,
-                                    true,
-                                );
-                                self.socket
-                                    .send_to(&response, src_addr)
-                                    .await
-                                    .map_err(|e| format!("Send error: {e}"))?;
-                                return Ok(());
-                            };
-                            ul_teid = self.alloc_teid();
-                            log::debug!(
-                                "Allocated uplink F-TEID: teid={ul_teid:#x} (ch={})",
-                                fteid.ch
-                            );
-                            Some(FTeid {
-                                teid: ul_teid,
-                                ipv4,
-                                ipv6,
-                                choose: false,
-                                choose_id: None,
-                            })
-                        } else {
-                            ul_teid = fteid.teid;
-                            None
-                        }
-                    } else {
-                        None
+            // Check if this PDR needs a local F-TEID (uplink PDR).
+            //
+            // The SMF asks the UPF to allocate the N3 uplink F-TEID in
+            // one of two ways (TS 29.244 8.2.3 / 7.5.3.2):
+            //   * CH (CHOOSE) flag set — the canonical "UP function
+            //     shall assign the F-TEID" request, with TEID/address
+            //     omitted on the wire; or
+            //   * a PDI F-TEID with TEID == 0 (no concrete tunnel to
+            //     bind to). Our SMF signals allocation this way.
+            // In either case the UPF allocates a fresh non-zero TEID +
+            // its N3 GTP-U address and returns it in the Created PDR so
+            // uplink GTP-U traffic matches.
+            let local_f_teid = if let Some(ref fteid) = pdr.pdi.local_f_teid {
+                if fteid.ch || fteid.teid == 0 {
+                    let Some((ipv4, ipv6)) = self.local_f_teid_addrs(fteid) else {
+                        // #985 review: an IPv6-only F-TEID this UPF cannot
+                        // assign refuses the establishment (§7.5.3.1).
+                        // #1154: the Failed Rule ID, not an Offending IE.
+                        let resp_payload = crate::n4_build::build_rule_failure_response(
+                            crate::n4_build::FailedRule::Pdr(pdr.pdr_id),
+                        );
+                        let response = self.build_response(
+                            pfcp_type::SESSION_ESTABLISHMENT_RESPONSE,
+                            smf_seid,
+                            header.sequence_number,
+                            &resp_payload,
+                            true,
+                        );
+                        self.socket
+                            .send_to(&response, src_addr)
+                            .await
+                            .map_err(|e| format!("Send error: {e}"))?;
+                        return Ok(());
                     };
-
-                    // Extract UE IP address
-                    if let Some(ref ue_ip) = pdr.pdi.ue_ip_address {
-                        if let Some(addr) = ue_ip.ipv4 {
-                            ue_ipv4 = Some(addr);
-                            log::debug!("UE IPv4: {addr}");
-                        }
-                    }
-
-                    created_pdrs.push(CreatedPdr {
-                        pdr_id: pdr.pdr_id,
-                        local_f_teid,
-                        ue_ip_address: None,
-                    });
-                    parsed_pdrs.push(pdr);
+                    ul_teid = self.alloc_teid();
+                    log::debug!(
+                        "Allocated uplink F-TEID: teid={ul_teid:#x} (ch={})",
+                        fteid.ch
+                    );
+                    Some(FTeid {
+                        teid: ul_teid,
+                        ipv4,
+                        ipv6,
+                        choose: false,
+                        choose_id: None,
+                    })
+                } else {
+                    ul_teid = fteid.teid;
+                    None
                 }
-                Err(e) => {
-                    log::warn!("Failed to parse PDR: {e}");
+            } else {
+                None
+            };
+
+            // Extract UE IP address
+            if let Some(ref ue_ip) = pdr.pdi.ue_ip_address {
+                if let Some(addr) = ue_ip.ipv4 {
+                    ue_ipv4 = Some(addr);
+                    log::debug!("UE IPv4: {addr}");
                 }
             }
+
+            created_pdrs.push(CreatedPdr {
+                pdr_id: pdr.pdr_id,
+                local_f_teid,
+                ue_ip_address: None,
+            });
+            parsed_pdrs.push(pdr);
         }
 
         // Parse Create FARs
@@ -2289,24 +2316,17 @@ impl PfcpServer {
         let mut gnb_addr: Option<Ipv4Addr> = None;
         let mut parsed_fars = Vec::new();
 
-        for far_ie in ParsedIe::find_all_ies(&ies, pfcp_ie::CREATE_FAR) {
-            match parse_create_far(&far_ie.value) {
-                Ok(far) => {
-                    log::debug!("FAR {}: apply_action={:#x}", far.far_id, far.apply_action);
+        for far in create_fars {
+            log::debug!("FAR {}: apply_action={:#x}", far.far_id, far.apply_action);
 
-                    if let Some(ref fp) = far.forwarding_parameters {
-                        if let Some(ref ohc) = fp.outer_header_creation {
-                            dl_teid = ohc.teid;
-                            gnb_addr = ohc.ipv4;
-                            log::debug!("Downlink: TEID={dl_teid:#x}, gNB={gnb_addr:?}");
-                        }
-                    }
-                    parsed_fars.push(far);
-                }
-                Err(e) => {
-                    log::warn!("Failed to parse FAR: {e}");
+            if let Some(ref fp) = far.forwarding_parameters {
+                if let Some(ref ohc) = fp.outer_header_creation {
+                    dl_teid = ohc.teid;
+                    gnb_addr = ohc.ipv4;
+                    log::debug!("Downlink: TEID={dl_teid:#x}, gNB={gnb_addr:?}");
                 }
             }
+            parsed_fars.push(far);
         }
 
         // #619 (#1170 review): the session's downlink tunnel is the one its catch-all
@@ -2334,21 +2354,14 @@ impl PfcpServer {
 
         // Parse Create URRs
         let mut parsed_urrs = Vec::new();
-        for urr_ie in ParsedIe::find_all_ies(&ies, pfcp_ie::CREATE_URR) {
-            match parse_create_urr(&urr_ie.value) {
-                Ok(urr) => {
-                    log::debug!(
-                        "URR {}: vol_thresh={:?}, time_thresh={:?}",
-                        urr.urr_id,
-                        urr.volume_threshold_total,
-                        urr.time_threshold_secs
-                    );
-                    parsed_urrs.push(urr);
-                }
-                Err(e) => {
-                    log::warn!("Failed to parse URR: {e}");
-                }
-            }
+        for urr in create_urrs {
+            log::debug!(
+                "URR {}: vol_thresh={:?}, time_thresh={:?}",
+                urr.urr_id,
+                urr.volume_threshold_total,
+                urr.time_threshold_secs
+            );
+            parsed_urrs.push(urr);
         }
 
         // Parse Create BARs
@@ -5778,6 +5791,132 @@ mod tests {
             server.sessions.read().await.is_empty(),
             "no session is held"
         );
+    }
+
+    /// A grouped IE body holding only `ies`, each `(type, value)`.
+    fn grouped_1532(ies: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        for (t, v) in ies {
+            b.add_tlv(*t, v);
+        }
+        b.build()
+    }
+
+    /// An association, then a Session Establishment of PDR 1 (QER 1, URR 1),
+    /// FAR 1 FORW, QER 1 and URR 1, plus `extra` IEs. Returns the response.
+    async fn establish_1532(
+        smf: &UdpSocket,
+        addr: SocketAddr,
+        seq: u32,
+        extra: &[(u16, Vec<u8>)],
+    ) -> Vec<u8> {
+        let assoc = build_association_setup_request_payload(Some(1));
+        let _ = exchange(smf, addr, &encode_pfcp(5, None, seq, &assoc)).await;
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        b.add_f_seid(&crate::n4_build::FSeid {
+            seid: 0x1532,
+            ipv4: Some(Ipv4Addr::new(127, 0, 0, 9)),
+            ipv6: None,
+        });
+        b.add_tlv(pfcp_ie::CREATE_PDR, &pdr_body(1, 100, 1, 1, 1));
+        b.add_tlv(pfcp_ie::CREATE_FAR, &far_body(1, 0x02));
+        b.add_tlv(pfcp_ie::CREATE_QER, &qer_body(1, 9));
+        b.add_tlv(
+            pfcp_ie::CREATE_URR,
+            &urr_body(1, Some(1_000_000), None, None),
+        );
+        for (t, v) in extra {
+            b.add_tlv(*t, v);
+        }
+        exchange(smf, addr, &encode_pfcp(50, Some(0), seq + 1, &b.build())).await
+    }
+
+    /// **#1532.** A Create PDR, FAR or URR that its parser refuses rejects the
+    /// Session Establishment with "Mandatory IE incorrect" naming the grouped IE
+    /// (TS 29.244 §7.6.8); no session is held and nothing reaches the data plane.
+    /// Each used to be dropped with a warning and the session accepted without it.
+    /// The same request without the malformed IE is accepted.
+    #[tokio::test]
+    async fn a_malformed_create_pdr_far_or_urr_rejects_the_establishment_1532() {
+        let pdi_short_fteid =
+            grouped_1532(&[(pfcp_ie::SOURCE_INTERFACE, &[0]), (pfcp_ie::F_TEID, &[])]);
+        let pdi_short_ue_ip = grouped_1532(&[
+            (pfcp_ie::SOURCE_INTERFACE, &[1]),
+            (pfcp_ie::UE_IP_ADDRESS, &[]),
+        ]);
+        let fp_short_ohc = grouped_1532(&[
+            (pfcp_ie::DESTINATION_INTERFACE, &[0]),
+            (pfcp_ie::OUTER_HEADER_CREATION, &[0x01, 0x00]),
+        ]);
+        let cases: Vec<(&str, u16, Vec<u8>)> = vec![
+            (
+                "PDR without a PDR ID",
+                pfcp_ie::CREATE_PDR,
+                grouped_1532(&[(pfcp_ie::PRECEDENCE, &200u32.to_be_bytes())]),
+            ),
+            (
+                "PDR with an empty F-TEID",
+                pfcp_ie::CREATE_PDR,
+                grouped_1532(&[
+                    (pfcp_ie::PDR_ID, &2u16.to_be_bytes()),
+                    (pfcp_ie::PRECEDENCE, &200u32.to_be_bytes()),
+                    (pfcp_ie::PDI, &pdi_short_fteid),
+                    (pfcp_ie::FAR_ID, &1u32.to_be_bytes()),
+                ]),
+            ),
+            (
+                "PDR with an empty UE IP Address",
+                pfcp_ie::CREATE_PDR,
+                grouped_1532(&[
+                    (pfcp_ie::PDR_ID, &2u16.to_be_bytes()),
+                    (pfcp_ie::PRECEDENCE, &200u32.to_be_bytes()),
+                    (pfcp_ie::PDI, &pdi_short_ue_ip),
+                    (pfcp_ie::FAR_ID, &1u32.to_be_bytes()),
+                ]),
+            ),
+            (
+                "FAR without a FAR ID",
+                pfcp_ie::CREATE_FAR,
+                grouped_1532(&[(pfcp_ie::APPLY_ACTION, &[0x02, 0x00])]),
+            ),
+            (
+                "FAR with a short Outer Header Creation",
+                pfcp_ie::CREATE_FAR,
+                grouped_1532(&[
+                    (pfcp_ie::FAR_ID, &2u32.to_be_bytes()),
+                    (pfcp_ie::APPLY_ACTION, &[0x02, 0x00]),
+                    (pfcp_ie::FORWARDING_PARAMETERS, &fp_short_ohc),
+                ]),
+            ),
+            (
+                "URR without a URR ID",
+                pfcp_ie::CREATE_URR,
+                grouped_1532(&[(pfcp_ie::MEASUREMENT_METHOD, &[0x02])]),
+            ),
+        ];
+        for (seq, (what, ie_type, body)) in (0u32..).step_by(10).zip(cases) {
+            let (server, smf, addr, mut rx) = spawn_test_server().await;
+            let resp = establish_1532(&smf, addr, seq + 1, &[(ie_type, body)]).await;
+            assert_eq!(resp[1], pfcp_type::SESSION_ESTABLISHMENT_RESPONSE, "{what}");
+            assert_eq!(
+                response_cause(&resp),
+                PfcpCause::MandatoryIeIncorrect as u8,
+                "{what}"
+            );
+            assert_eq!(offending_ie_1478(&resp), Some(ie_type), "{what}");
+            assert!(
+                server.sessions.read().await.is_empty(),
+                "{what}: no session"
+            );
+            assert!(rx.try_recv().is_err(), "{what}: nothing installed");
+        }
+
+        // Control: the same establishment without the malformed IE is accepted.
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        let resp = establish_1532(&smf, addr, 1, &[]).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(server.sessions.read().await.len(), 1);
     }
 
     fn usage_reports_in(resp: &[u8]) -> Vec<(u32, u64)> {
