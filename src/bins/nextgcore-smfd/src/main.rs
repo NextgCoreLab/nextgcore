@@ -4720,7 +4720,8 @@ async fn handle_sm_context_create_inner(request: &SbiRequest) -> SbiResponse {
             // #79: the subscribed values, when the UDM supplied any, are the
             // baseline here -- the config default is what they fall back TO, not
             // the other way round. With a PCF present its decision wins outright
-            // (TS 23.503 §6.1.3.2), which is why this applies only on this arm.
+            // (TS 29.512 §4.2.2.5 / §4.2.2.6), which is why this applies only on
+            // this arm.
             let mut decision = policy::PolicyDecision::config_default_for_dnn(&dnn);
             if let Some(ref sub) = subscribed {
                 decision.apply_subscribed_baseline(sub);
@@ -10800,9 +10801,9 @@ fn restore_pcscf(sm_context_ref: &str, binding: &context::PolicyBinding) -> bool
 /// The notification's role is to say *when*, and for which resource.
 ///
 /// **With a PCF configured this SMF does not apply the change itself — it REPORTS it
-/// to the PCF** (#310, TS 29.512 §4.2.4, `SE_AMBR_CH`). TS 23.503 §6.1.3.2 makes the
-/// PCF the authority on session-AMBR and default QoS, and the subscribed value is one
-/// of its INPUTS, so applying a subscription-driven override behind its back would
+/// to the PCF** (#310, TS 29.512 §4.2.4.4, `SE_AMBR_CH`). TS 29.512 §4.2.2.5 /
+/// §4.2.3.5 make the PCF the authority on session-AMBR and default QoS, and the
+/// subscribed value is one of its INPUTS, so applying a subscription-driven override behind its back would
 /// leave the SMF enforcing something the PCF never authorised. But the PCF cannot
 /// learn of the change on its own: `SmPolicyDnnData`, the UDR's policy-data resource,
 /// carries no session-AMBR (TS 29.519 §5.6.2), and `SmPolicyContextData.subsSessAmbr`
@@ -10917,8 +10918,8 @@ async fn handle_sdm_notification(sm_context_ref: &str, request: &SbiRequest) -> 
         log::info!(
             "[{}] SM data changed for PCF-authorised ref={sm_context_ref}: reporting \
              SE_AMBR_CH to the PCF (smPolicyId={sm_policy_id}) with subsSessAmbr \
-             UL/DL {:?}/{:?} bps — TS 23.503 §6.1.3.2 makes the PCF the authority and \
-             the subscribed value one of ITS inputs (TS 29.512 §4.2.4)",
+             UL/DL {:?}/{:?} bps — TS 29.512 §4.2.2.5 makes the PCF the authority and \
+             the subscribed value one of ITS inputs (TS 29.512 §4.2.4.4)",
             binding.supi,
             subscribed.sess_ambr_ul_bps,
             subscribed.sess_ambr_dl_bps
@@ -16422,7 +16423,7 @@ mod tests {
     /// default 5QI to a LIVE session, read back off the session and the binding.
     ///
     /// Also the PCF-precedence half (criterion 5): the same notification against a
-    /// session a PCF authorised changes nothing, because TS 23.503 §6.1.3.2 makes the
+    /// session a PCF authorised changes nothing, because TS 29.512 §4.2.2.5 makes the
     /// PCF the authority and the subscription is one of its inputs.
     #[tokio::test]
     async fn a_sdm_notification_applies_the_changed_ambr_to_a_live_session() {
@@ -16503,7 +16504,7 @@ mod tests {
         // ---- PCF precedence (#293 criterion 5, as #310 left it) ----
         //
         // A PCF-authorised session is STILL not re-derived from the subscription — the
-        // PCF is the authority (TS 23.503 §6.1.3.2). What #310 changed is that the
+        // PCF is the authority (TS 29.512 §4.2.2.5). What #310 changed is that the
         // change is now REPORTED to the PCF instead of dropped; the SMF applies the
         // PCF's answer, never the subscription. Here the PCF is unreachable (port 1),
         // so there is no answer and the session keeps what the PCF last authorised —
@@ -16531,7 +16532,7 @@ mod tests {
             (after.ambr_ul_bps, after.ambr_dl_bps, after.five_qi),
             (before.ambr_ul_bps, before.ambr_dl_bps, before.five_qi),
             "a PCF-authorised session must not be re-derived from the subscription: \
-             TS 23.503 §6.1.3.2 makes the PCF the authority, and the subscription is \
+             TS 29.512 §4.2.2.5 makes the PCF the authority, and the subscription is \
              one of ITS inputs. With the PCF unreachable the session keeps the QoS the \
              PCF last authorised (40/80 Mbps would be the SUBSCRIBED value leaking in)"
         );
