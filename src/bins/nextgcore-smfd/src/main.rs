@@ -6348,7 +6348,11 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             // m1), and onto the binding read under it, so an UpdateNotify applied
             // while the update was in flight is the base, not overwritten.
             let mut _applying = None;
-            let (qfi, ambr_ul, ambr_dl) = match binding.as_ref() {
+            // #1573: the merged decision as a whole (Session-AMBR, default 5QI, ARP),
+            // with the binding it is merged onto. TS 29.512 §4.2.2.5 / §4.2.2.6: "the
+            // SMF shall apply" the authorised Session-AMBR and default QoS "towards the
+            // access network, the UE and the UPF".
+            let (decision, enforced) = match binding.as_ref() {
                 Some(b) => {
                     let mut answer = None;
                     if let Some(ref pol_id) = b.sm_policy_id {
@@ -6401,25 +6405,26 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                         Some(SmContextLock::acquire(policy_apply_locks(), sm_context_ref).await);
                     let enforced =
                         lookup_policy_binding(sm_context_ref).unwrap_or_else(|| b.clone());
-                    match answer {
-                        Some(json) => {
-                            let dec = policy::merge_sm_policy_decision(
-                                enforced_policy_decision(&enforced),
-                                &json,
-                            );
-                            (enforced.qfi, dec.sess_ambr_ul_bps, dec.sess_ambr_dl_bps)
-                        }
-                        None => (enforced.qfi, enforced.ambr_ul_bps, enforced.ambr_dl_bps),
-                    }
+                    let decision = match answer {
+                        Some(json) => policy::merge_sm_policy_decision(
+                            enforced_policy_decision(&enforced),
+                            &json,
+                        ),
+                        None => enforced_policy_decision(&enforced),
+                    };
+                    (decision, Some(enforced))
                 }
                 None => {
                     log::warn!(
                         "No policy binding for ref={sm_context_ref} — applying config-default QoS"
                     );
-                    let d = policy::PolicyDecision::config_default();
-                    (d.default_qfi(), d.sess_ambr_ul_bps, d.sess_ambr_dl_bps)
+                    (policy::PolicyDecision::config_default(), None)
                 }
             };
+            let qfi = enforced
+                .as_ref()
+                .map_or_else(|| decision.default_qfi(), |b| b.qfi);
+            let (ambr_ul, ambr_dl) = (decision.sess_ambr_ul_bps, decision.sess_ambr_dl_bps);
 
             // Apply the authorized QoS to the N4 session QER
             if let Some(seid) = lookup_upf_seid(sm_context_ref) {
@@ -6439,30 +6444,73 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                         "the UPF did not apply the modification",
                     );
                 }
-                // Persist the new authorized AMBR in the binding
+            } else {
+                log::warn!("No PFCP session found for modification: ref={sm_context_ref}");
+            }
+
+            // #1573: the merged decision is persisted whole, as the UpdateNotify path
+            // does: the Session-AMBR, the default 5QI and its ARP in the binding (a
+            // re-activation rebuilds the setup transfer from it), and the Session-AMBR
+            // on the session too (the Retrieve and the EPS interworking encoders read
+            // it). Before, only the binding's AMBR was written, and only with an N4
+            // session.
+            if enforced.is_some() {
                 if let Ok(ctx) = smf_self().read() {
                     if let Ok(mut bindings) = ctx.policy_bindings.write() {
                         if let Some(b) = bindings.get_mut(sm_context_ref) {
                             b.ambr_ul_bps = ambr_ul;
                             b.ambr_dl_bps = ambr_dl;
+                            b.five_qi = decision.def_five_qi;
+                            b.arp_priority_level = decision.arp_priority_level;
                         }
+                    }
+                    if let Some(mut sess) = ctx.sess_find_by_sm_context_ref(sm_context_ref) {
+                        sess.session_ambr = context::SessionAmbr {
+                            uplink: ambr_ul,
+                            downlink: ambr_dl,
+                        };
+                        ctx.sess_update(&sess);
                     }
                     // Issue #191: durable too, not just in memory.
                     ctx.persist();
                 }
-            } else {
-                log::warn!("No PFCP session found for modification: ref={sm_context_ref}");
             }
 
-            // N1: PDU Session Modification Command (PTI echoed, authorized AMBR)
-            let n1_mod_cmd = policy::build_modification_command(psi, pti, ambr_dl, ambr_ul);
-
-            // N2 SM Info: real-APER PDUSessionResourceModifyRequestTransfer
-            // (TS 38.413 clause 9.3.4.3) carrying the re-authorized Session-AMBR
-            // and the QoS flow to modify; the gNB decodes it with its strict
-            // APER decoder -- a hand-rolled blob is rejected (smfd#2).
-            let n2_sm_info = match build_modify_request_transfer(qfi, ambr_dl, ambr_ul) {
-                Ok(bytes) => bytes,
+            // N1: PDU Session Modification Command (PTI echoed, authorized AMBR); N2:
+            // real-APER PDUSessionResourceModifyRequestTransfer (TS 38.413 clause
+            // 9.3.4.3) carrying the re-authorized Session-AMBR and the QoS flow to
+            // modify; the gNB decodes it with its strict APER decoder -- a hand-rolled
+            // blob is rejected (smfd#2). #1573: a changed default 5QI or ARP goes in
+            // both legs, as the PCF-notify path sends it ([`default_flow_modification_legs`]):
+            // the 5QI as the flow's QoS flow description in N1, both in N2's QoS Flow
+            // Level QoS Parameters.
+            let after = enforced
+                .as_ref()
+                .and_then(|_| lookup_policy_binding(sm_context_ref));
+            let qos_changed = enforced
+                .as_ref()
+                .zip(after.as_ref())
+                .filter(|(before, after)| {
+                    (before.five_qi, before.arp_priority_level)
+                        != (after.five_qi, after.arp_priority_level)
+                });
+            let legs = match qos_changed {
+                Some((before, after)) => default_flow_modification_legs(
+                    sm_context_ref,
+                    after,
+                    pti,
+                    before.five_qi != after.five_qi,
+                )
+                .map(|legs| (legs.n1, legs.n2)),
+                None => build_modify_request_transfer(qfi, ambr_dl, ambr_ul).map(|n2| {
+                    (
+                        policy::build_modification_command(psi, pti, ambr_dl, ambr_ul),
+                        n2,
+                    )
+                }),
+            };
+            let (n1_mod_cmd, n2_sm_info) = match legs {
+                Ok(legs) => legs,
                 Err(e) => {
                     log::error!("Failed to encode PDUSessionResourceModifyRequestTransfer: {e:?}");
                     return eps_to_5gs::sm_context_error(
@@ -10621,6 +10669,93 @@ pub(crate) enum QosMonitoringSignal {
     NotSent,
 }
 
+/// The N1 and N2 of a PDU Session Modification for the default flow as `after`
+/// authorises it (#1385, #1573): built by [`default_flow_modification_legs`].
+struct DefaultFlowLegs {
+    /// PDU SESSION MODIFICATION COMMAND: the Session-AMBR and, when the 5QI changed
+    /// and the flow can be described, its QoS flow description.
+    n1: Vec<u8>,
+    /// PDUSessionResourceModifyRequestTransfer with the Session-AMBR and the default
+    /// flow's QoS Flow Level QoS Parameters (5QI, ARP).
+    n2: Vec<u8>,
+    /// The default flow's 5QI and ARP, for the AMF's paging policy.
+    paged: Option<(u16, n2_transfer::Arp)>,
+    /// A GBR default 5QI whose bit rates are unknown: the flow is in neither leg, so
+    /// only the Session-AMBR is signalled.
+    flow_left_out: bool,
+}
+
+/// Build [`DefaultFlowLegs`] for the default flow of `sm_context_ref` as `after`
+/// holds it, with PTI `pti` (0 for a network-requested modification, the request's
+/// for a UE-requested one). `five_qi_changed` puts the flow's description in N1.
+/// Shared by the PCF/UDM notification path ([`signal_policy_change`]) and the
+/// UE-requested modification's RES_MO_RE leg, so both carry the same decision.
+fn default_flow_modification_legs(
+    sm_context_ref: &str,
+    after: &context::PolicyBinding,
+    pti: u8,
+    mut five_qi_changed: bool,
+) -> Result<DefaultFlowLegs, n2_transfer::TransferError> {
+    let mut flows: Vec<_> = session_setup_flows(sm_context_ref, after)
+        .into_iter()
+        .filter(|f| f.qfi == after.qfi)
+        .collect();
+    // #1385 review B1: a GBR default 5QI needs its four bit rates, on N1 (TS 24.501
+    // §6.3.2.4 a) case 8: a GBR description lacking one is rejected) and on N2 (TS
+    // 38.413 §9.3.1.12: GBR QoS Flow Information "shall be present" for a GBR flow).
+    // They come from the session's bearer for the default QFI. Without them neither
+    // leg can describe the flow validly, so the flow is left out of both and only the
+    // Session-AMBR is signalled.
+    let gbr_5qi = context::QosCharacteristics::from_5qi(after.five_qi).is_some_and(|c| c.is_gbr());
+    let gbr = gbr_5qi
+        .then(|| default_flow_bit_rates(sm_context_ref, after.qfi))
+        .flatten();
+    let mut flow_left_out = false;
+    if gbr_5qi {
+        match gbr {
+            Some(rates) => {
+                for f in &mut flows {
+                    f.gbr = Some(rates);
+                }
+            }
+            None => {
+                log::error!(
+                    "ref={sm_context_ref}: default 5QI {} is a GBR 5QI but no GFBR/MFBR is \
+                     known for QFI {}; the flow cannot be described, so only the \
+                     Session-AMBR is signalled",
+                    after.five_qi,
+                    after.qfi
+                );
+                flows.clear();
+                five_qi_changed = false;
+                flow_left_out = true;
+            }
+        }
+    }
+    let n1 = policy::build_modification_command_for_flow(
+        after.psi,
+        pti,
+        after.ambr_dl_bps,
+        after.ambr_ul_bps,
+        after.qfi,
+        five_qi_changed.then_some(policy::ModifiedFlowQos {
+            five_qi: after.five_qi,
+            gbr: gbr.map(|g| (g.gfbr_ul, g.gfbr_dl, g.mfbr_ul, g.mfbr_dl)),
+        }),
+    );
+    let paged = flows.first().map(|f| (f.five_qi, f.arp));
+    let n2 = n2_transfer::modify_request_transfer_with_qos(
+        (after.ambr_dl_bps, after.ambr_ul_bps),
+        &flows,
+    )?;
+    Ok(DefaultFlowLegs {
+        n1,
+        n2,
+        paged,
+        flow_left_out,
+    })
+}
+
 /// Tell the UE and the NG-RAN about a policy change the session now enforces (#1385,
 /// TS 23.502 §4.3.3.2 step 3b): one Namf_Communication_N1N2MessageTransfer carrying
 /// - N1: PDU SESSION MODIFICATION COMMAND, PTI 0 (TS 24.501 §6.3.2.2), the new
@@ -10646,7 +10781,7 @@ fn signal_policy_change(sm_context_ref: &str, before: &context::PolicyBinding) {
     };
     let ambr_changed =
         (after.ambr_ul_bps, after.ambr_dl_bps) != (before.ambr_ul_bps, before.ambr_dl_bps);
-    let mut five_qi_changed = after.five_qi != before.five_qi;
+    let five_qi_changed = after.five_qi != before.five_qi;
     // #1409: the ARP is not UE-facing (TS 24.501 §9.11.4.12 has no ARP parameter), but
     // the NG-RAN holds it in the flow's QoS profile (TS 38.413 §9.3.1.12), so an
     // ARP-only change is signalled too. Step 3b carries an N1 SM container in every
@@ -10694,60 +10829,8 @@ fn signal_policy_change(sm_context_ref: &str, before: &context::PolicyBinding) {
         );
         return;
     };
-    let mut flows: Vec<_> = session_setup_flows(sm_context_ref, &after)
-        .into_iter()
-        .filter(|f| f.qfi == after.qfi)
-        .collect();
-    // #1385 review B1: a GBR default 5QI needs its four bit rates, on N1 (TS 24.501
-    // §6.3.2.4 a) case 8: a GBR description lacking one is rejected) and on N2 (TS
-    // 38.413 §9.3.1.12: GBR QoS Flow Information "shall be present" for a GBR flow).
-    // They come from the session's bearer for the default QFI. Without them neither
-    // leg can describe the flow validly, so the flow is left out of both and only the
-    // Session-AMBR is signalled.
-    let gbr_5qi = context::QosCharacteristics::from_5qi(after.five_qi).is_some_and(|c| c.is_gbr());
-    let gbr = gbr_5qi
-        .then(|| default_flow_bit_rates(sm_context_ref, after.qfi))
-        .flatten();
-    if gbr_5qi {
-        match gbr {
-            Some(rates) => {
-                for f in &mut flows {
-                    f.gbr = Some(rates);
-                }
-            }
-            None => {
-                log::error!(
-                    "ref={sm_context_ref}: default 5QI {} is a GBR 5QI but no GFBR/MFBR is \
-                     known for QFI {}; the flow cannot be described, so only the \
-                     Session-AMBR is signalled",
-                    after.five_qi,
-                    after.qfi
-                );
-                flows.clear();
-                five_qi_changed = false;
-                // Without the flow there is no ARP to carry either.
-                if !ambr_changed {
-                    return;
-                }
-            }
-        }
-    }
-    let n1 = policy::build_network_modification_command(
-        after.psi,
-        after.ambr_dl_bps,
-        after.ambr_ul_bps,
-        after.qfi,
-        five_qi_changed.then_some(policy::ModifiedFlowQos {
-            five_qi: after.five_qi,
-            gbr: gbr.map(|g| (g.gfbr_ul, g.gfbr_dl, g.mfbr_ul, g.mfbr_dl)),
-        }),
-    );
-    let paged = flows.first().map(|f| (f.five_qi, f.arp));
-    let n2 = match n2_transfer::modify_request_transfer_with_qos(
-        (after.ambr_dl_bps, after.ambr_ul_bps),
-        &flows,
-    ) {
-        Ok(bytes) => bytes,
+    let legs = match default_flow_modification_legs(sm_context_ref, &after, 0, five_qi_changed) {
+        Ok(legs) => legs,
         Err(e) => {
             log::error!(
                 "ref={sm_context_ref}: PDUSessionResourceModifyRequestTransfer did not \
@@ -10756,6 +10839,11 @@ fn signal_policy_change(sm_context_ref: &str, before: &context::PolicyBinding) {
             return;
         }
     };
+    // Without the flow there is no 5QI or ARP to carry either.
+    if legs.flow_left_out && !ambr_changed {
+        return;
+    }
+    let DefaultFlowLegs { n1, n2, paged, .. } = legs;
     log::info!(
         "ref={sm_context_ref}: network-requested PDU Session Modification (AMBR UL/DL \
          {}/{} -> {}/{} bps, 5QI {} -> {}, ARP PL {} -> {})",
@@ -21832,6 +21920,97 @@ mod tests {
             ambr_changed,
             (90_000_000, 50_000_000),
             "a changed authSessAmbr"
+        );
+    }
+
+    /// #1573, TS 29.512 §4.2.2.5 / §4.2.2.6 ("Upon reception of the authorized
+    /// Session-AMBR / default QoS ... the SMF shall apply the corresponding
+    /// procedures towards the access network, the UE and the UPF"), the RES_MO_RE leg
+    /// (§4.2.4.17): a PCF answer whose `authDefQos` changes the default 5QI (7 -> 8)
+    /// and ARP (priority level 8 -> 3), with a new `authSessAmbr`, reaches:
+    /// - the binding (5QI, ARP, AMBR), and `SmfSess.session_ambr` matches it;
+    /// - N1: the MODIFICATION COMMAND echoes the PTI, carries the AMBR and the default
+    ///   flow's QoS flow description with 5QI 8 (IEI 0x79);
+    /// - N2: the Modify Request Transfer's QoS flow has 5QI 8, ARP 3.
+    ///
+    /// REVERT-VERIFIED: with the leg back on the AMBR alone, the binding keeps 5QI 7
+    /// and ARP 8, `session_ambr` keeps the establishment's value, N1 has no 0x79 and
+    /// N2 no QoS Flow Level QoS Parameters.
+    #[tokio::test]
+    async fn a_res_mo_re_answer_applies_its_default_qos_and_session_ambr_1573() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (pcf_srv, _seen) = spawn_recording_pcf_with(Ok(serde_json::json!({
+            "sessRules": { "SessRule-1573": {
+                "authSessAmbr": { "uplink": "50 Mbps", "downlink": "90 Mbps" },
+                "authDefQos": { "5qi": 8, "arp": { "priorityLevel": 3 } },
+            }}
+        })))
+        .await;
+        let psi = 27;
+        let reference = seed_authorised_1399("imsi-001010000001573", psi, "pol-1573");
+        let before = lookup_policy_binding(&reference).expect("binding");
+        assert_eq!((before.five_qi, before.arp_priority_level), (7, 8));
+        let resp =
+            handle_sm_context_update(&reference, &ue_modification_1399(&reference, psi)).await;
+        std::env::remove_var("PCF_URI");
+        pcf_srv.stop().await.expect("stop");
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        let part = |id: &str| {
+            resp.http
+                .parts
+                .iter()
+                .find(|p| p.content_id.as_deref() == Some(id))
+                .map(|p| p.data.to_vec())
+                .unwrap_or_else(|| panic!("the {id} part"))
+        };
+        let (n1, n2) = (part("n1SmMsg"), part("n2SmInfo"));
+
+        let after = lookup_policy_binding(&reference).expect("binding");
+        let sess = smf_self()
+            .read()
+            .expect("context")
+            .sess_find_by_sm_context_ref(&reference)
+            .expect("session");
+        assert_eq!(
+            (after.five_qi, after.arp_priority_level),
+            (8, 3),
+            "the binding holds the authorised default QoS"
+        );
+        assert_eq!(
+            (after.ambr_ul_bps, after.ambr_dl_bps),
+            (50_000_000, 90_000_000)
+        );
+        assert_eq!(
+            (sess.session_ambr.uplink, sess.session_ambr.downlink),
+            (after.ambr_ul_bps, after.ambr_dl_bps),
+            "SmfSess.session_ambr is in step with the binding"
+        );
+        assert_eq!(n1[2], 5, "the request's PTI is echoed");
+        assert_eq!(command_ambr_1399(&n1), (90_000_000, 50_000_000));
+        assert_eq!(
+            n1.get(12),
+            Some(&0x79),
+            "the QoS flow description: {n1:02x?}"
+        );
+        let expected_n1 = policy::build_modification_command_for_flow(
+            psi,
+            5,
+            90_000_000,
+            50_000_000,
+            after.qfi,
+            Some(policy::ModifiedFlowQos {
+                five_qi: 8,
+                gbr: None,
+            }),
+        );
+        assert_eq!(n1, expected_n1, "the default flow is described with 5QI 8");
+        assert_eq!(
+            decode_modify_transfer_1385(&n2),
+            ((90_000_000, 50_000_000), vec![(after.qfi, 8, 3)]),
+            "N2 carries the new 5QI and ARP"
         );
     }
 
