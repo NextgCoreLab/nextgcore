@@ -393,6 +393,10 @@ struct SbiService<H: SbiRequestHandler> {
     /// extracted once per connection alongside the exporter secret and threaded
     /// into every request multiplexed on it.
     peer_cert_nf_instance_id: Option<String>,
+    /// #1522: the NF types in the same verified certificate's RFC 9310 NFTypes
+    /// extension (TS 33.310 §6.1.3c.2), empty when it has none. Server-internal:
+    /// only the callback-exemption decision reads it.
+    peer_cert_nf_types: Vec<String>,
     /// This NF's `(NfType, id)` identity for the `Server` response header
     /// (sbi-02). `None` emits no `Server` header.
     server_identity: Option<(NfType, String)>,
@@ -408,6 +412,7 @@ impl<H: SbiRequestHandler> Clone for SbiService<H> {
             max_request_body_size: self.max_request_body_size,
             tls_exporter_secret: self.tls_exporter_secret.clone(),
             peer_cert_nf_instance_id: self.peer_cert_nf_instance_id.clone(),
+            peer_cert_nf_types: self.peer_cert_nf_types.clone(),
             server_identity: self.server_identity.clone(),
             overload_reporter: self.overload_reporter.clone(),
         }
@@ -425,6 +430,7 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
         let max_body = self.max_request_body_size;
         let tls_exporter_secret = self.tls_exporter_secret.clone();
         let peer_cert_nf_instance_id = self.peer_cert_nf_instance_id.clone();
+        let peer_cert_nf_types = self.peer_cert_nf_types.clone();
         let server_identity = self.server_identity.clone();
         let overload_reporter = self.overload_reporter.clone();
         let path = req.uri().path().to_string();
@@ -502,15 +508,21 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
             // protected access (TS 33.501 §13.4.1, TS 29.500 §6.10.7 NOTE): it is
             // authenticated by that token, and the bearer is not consulted.
             // #1522: an exemption may also require the connection's verified
-            // mutual-TLS peer identity (`peer_cert_nf_instance_id`, set only from a
-            // client certificate rustls verified).
+            // mutual-TLS peer: its NF Instance ID and RFC 9310 NF types, both read
+            // only from a client certificate rustls verified.
             let exempt = match &oauth {
                 Some(verifier) => {
+                    let peer = sbi_request.peer_cert_nf_instance_id.as_ref().map(|id| {
+                        crate::callback_auth::VerifiedPeer {
+                            nf_instance_id: id.clone(),
+                            nf_types: peer_cert_nf_types.clone(),
+                        }
+                    });
                     crate::callback_auth::admits_without_bearer_from(
                         &verifier.callback_exemptions,
                         &sbi_request.header.method,
                         &sbi_request.header.uri,
-                        sbi_request.peer_cert_nf_instance_id.as_deref(),
+                        peer.as_ref(),
                     )
                     .await
                 }
@@ -1342,12 +1354,27 @@ impl SbiServer {
                                                             )
                                                         })
                                                 };
+                                                // #1522: the RFC 9310 NF types of the
+                                                // same verified leaf.
+                                                let peer_cert_nf_types = {
+                                                    let (_, server_conn) = tls_stream.get_ref();
+                                                    server_conn
+                                                        .peer_certificates()
+                                                        .and_then(|chain| chain.first())
+                                                        .map(|leaf| {
+                                                            crate::peer_cert::nf_types_from_der(
+                                                                leaf.as_ref(),
+                                                            )
+                                                        })
+                                                        .unwrap_or_default()
+                                                };
                                                 let service = SbiService {
                                                     handler: handler_ref,
                                                     oauth: oauth_ref,
                                                     max_request_body_size,
                                                     tls_exporter_secret,
                                                     peer_cert_nf_instance_id,
+                                                    peer_cert_nf_types,
                                                     server_identity: server_identity_ref,
                                                     overload_reporter:
                                                         overload_reporter_ref,
@@ -1381,6 +1408,7 @@ impl SbiServer {
                                         // exporter secret and no peer certificate.
                                         tls_exporter_secret: None,
                                         peer_cert_nf_instance_id: None,
+                                        peer_cert_nf_types: Vec::new(),
                                         server_identity: server_identity_ref,
                                         overload_reporter: overload_reporter_ref,
                                     };

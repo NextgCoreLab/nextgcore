@@ -31,10 +31,10 @@
 //!
 //! #1522: a token that does not by itself show who sent the request (the UECM
 //! `deregCallbackUri`'s, which any Nudm_UECM Get consumer can read) is registered
-//! with [`OAuth2CallbackExemption::for_verified_peer`]. Its check also sees the NF
-//! Instance ID of the connection's VERIFIED mutual-TLS client certificate (TS
-//! 33.501 §13.1, TS 33.310), and a request without one (plaintext, server-only
-//! TLS, HTTP/3) is never admitted by it.
+//! with [`OAuth2CallbackExemption::for_verified_peer`]. Its check also sees the
+//! connection's VERIFIED mutual-TLS client ([`VerifiedPeer`]: the certificate's NF
+//! Instance ID and RFC 9310 NF types, TS 33.501 §13.1.0, TS 33.310 §6.1.3c), and a
+//! request without one (plaintext, server-only TLS, HTTP/3) is never admitted by it.
 
 use std::fmt;
 use std::sync::Arc;
@@ -60,12 +60,34 @@ pub struct OwnedCallbackPath {
     pub token: String,
 }
 
+/// The verified mutual-TLS client of a connection (#1522), read only from a
+/// certificate rustls verified: its URI SAN's NF Instance ID (TS 33.310) and the
+/// NF types of its RFC 9310 NFTypes extension (TS 33.310 §6.1.3c.2), empty when
+/// the certificate has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedPeer {
+    /// NF Instance ID from the URI SubjectAltName.
+    pub nf_instance_id: String,
+    /// NF types from the NFTypes extension; empty when absent.
+    pub nf_types: Vec<String>,
+}
+
+impl VerifiedPeer {
+    /// Whether the certificate's NFTypes extension names `nf_type` (an NFType
+    /// value of TS 29.510, such as `UDM`). Case-insensitive.
+    pub fn has_nf_type(&self, nf_type: &str) -> bool {
+        self.nf_types
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(nf_type))
+    }
+}
+
 /// The NF's verdict on a callback token AND the verified mutual-TLS peer that sent
-/// it (#1522): the matched path and the peer certificate's NF Instance ID.
+/// it (#1522): the matched path and the peer.
 pub type PeerCallbackCheck = Arc<
     dyn Fn(
             OwnedCallbackPath,
-            String,
+            VerifiedPeer,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
         + Send
         + Sync,
@@ -160,7 +182,7 @@ impl OAuth2CallbackExemption {
     /// As [`Self::new`].
     pub fn for_verified_peer<F, Fut>(method: &str, pattern: impl Into<String>, check: F) -> Self
     where
-        F: Fn(OwnedCallbackPath, String) -> Fut + Send + Sync + 'static,
+        F: Fn(OwnedCallbackPath, VerifiedPeer) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = bool> + Send + 'static,
     {
         let check: PeerCallbackCheck = Arc::new(move |cb, peer| Box::pin(check(cb, peer)));
@@ -247,9 +269,8 @@ impl OAuth2CallbackExemption {
     }
 
     /// [`Self::admits`] for a request whose connection's verified mutual-TLS client
-    /// certificate named `peer` (its NF Instance ID), or `None` when it presented
-    /// none (#1522).
-    pub async fn admits_from(&self, method: &str, path: &str, peer: Option<&str>) -> bool {
+    /// is `peer`, or `None` when it presented no certificate (#1522).
+    pub async fn admits_from(&self, method: &str, path: &str, peer: Option<&VerifiedPeer>) -> bool {
         match &self.check {
             Check::Token(_) => self.admits(method, path),
             Check::VerifiedPeer(check) => {
@@ -260,7 +281,7 @@ impl OAuth2CallbackExemption {
                     vars: cb.vars.iter().map(|v| v.to_string()).collect(),
                     token: cb.token.to_string(),
                 };
-                check(owned, peer.to_string()).await
+                check(owned, peer.clone()).await
             }
         }
     }
@@ -291,7 +312,7 @@ pub async fn admits_without_bearer_from(
     exemptions: &[OAuth2CallbackExemption],
     method: &str,
     path: &str,
-    peer: Option<&str>,
+    peer: Option<&VerifiedPeer>,
 ) -> bool {
     for e in exemptions {
         if e.admits_from(method, path, peer).await {
@@ -418,18 +439,36 @@ mod tests {
         let e = OAuth2CallbackExemption::for_verified_peer(
             "POST",
             "/nx-callback/v1/{var}/dereg-notify/{token}",
-            |cb, peer| async move { cb.vars == ["ue-1"] && cb.token == GOOD && peer == "udm-1" },
+            |cb, peer| async move {
+                cb.vars == ["ue-1"]
+                    && cb.token == GOOD
+                    && peer.nf_instance_id == "udm-1"
+                    && peer.has_nf_type("udm")
+            },
         );
+        let peer = |id: &str, types: &[&str]| VerifiedPeer {
+            nf_instance_id: id.to_string(),
+            nf_types: types.iter().map(|t| t.to_string()).collect(),
+        };
+        let udm = peer("udm-1", &["UDM"]);
         let path = format!("/nx-callback/v1/ue-1/dereg-notify/{GOOD}");
         assert!(!e.admits("POST", &path), "no identity: not admitted");
         assert!(!e.admits_from("POST", &path, None).await);
-        assert!(e.admits_from("POST", &path, Some("udm-1")).await);
-        assert!(!e.admits_from("POST", &path, Some("amf-1")).await);
+        assert!(e.admits_from("POST", &path, Some(&udm)).await);
+        assert!(
+            !e.admits_from("POST", &path, Some(&peer("amf-1", &["AMF"])))
+                .await
+        );
+        assert!(
+            !e.admits_from("POST", &path, Some(&peer("udm-1", &[])))
+                .await,
+            "the check sees the certificate's NF types"
+        );
         assert!(
             !e.admits_from(
                 "POST",
                 "/nx-callback/v1/ue-1/dereg-notify/x%2Fy",
-                Some("udm-1")
+                Some(&udm)
             )
             .await,
             "the route shape is still matched strictly"
@@ -440,8 +479,7 @@ mod tests {
             &path
         ));
         assert!(
-            admits_without_bearer_from(std::slice::from_ref(&e), "POST", &path, Some("udm-1"))
-                .await
+            admits_without_bearer_from(std::slice::from_ref(&e), "POST", &path, Some(&udm)).await
         );
     }
 

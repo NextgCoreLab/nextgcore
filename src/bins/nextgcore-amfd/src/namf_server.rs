@@ -80,24 +80,44 @@ pub fn oauth2_callback_exemptions() -> Vec<nextgcore_sbi::server::OAuth2Callback
 /// Whether a token-less dereg-notify for `supi` naming `token` may skip the bearer
 /// (#1522): TS 33.501 §13.4.1 and TS 29.500 §6.10.7 NOTE have a notification carry
 /// no access token, so a conformant UDM sends none. The sender is authenticated
-/// instead by the NDS/IP TLS of TS 33.501 §13.1: `peer` is the NF Instance ID of the
-/// connection's client certificate, which rustls verified against the SBI CA
-/// (`peer_cert_nf_instance_id`). Admitted only when both hold:
-/// - `peer` is a UDM in this AMF's NRF discovery cache (unexpired). A peer the AMF
-///   has not discovered as a UDM (another NF type, an SCP relaying, an expired
-///   entry) is not admitted, and the bearer is required as before;
+/// instead by the NDS/IP TLS of TS 33.501 §13.1: `peer` is the connection's client
+/// certificate, which rustls verified against the SBI CA. TS 33.501 §13.1.0: "The
+/// identities in the end entity certificates shall be used for authentication and
+/// policy checks". Admitted only when all hold:
+/// - the certificate's RFC 9310 NFTypes extension names UDM (TS 33.310 §6.1.3c.2:
+///   "nfTypes shall contain NF type for the Network Function instance"). The NF
+///   type is taken from the certificate, not from the NRF: nrfd does not bind an
+///   NFRegister to the registrant, so an NRF profile alone does not show it. A
+///   certificate without the extension stays on bearer auth;
+/// - `peer`'s NF Instance ID is a UDM in this AMF's NRF discovery cache, unexpired.
+///   A peer the AMF has not discovered as a UDM (another NF type, an SCP relaying,
+///   an expired entry) is not admitted;
 /// - `token` is the UE's CURRENT UECM registration token, compared in constant
 ///   time, so a stale or forged token is not admitted either.
-pub(crate) async fn dereg_notify_from_the_udm(supi: &str, token: &str, peer: &str) -> bool {
+pub(crate) async fn dereg_notify_from_the_udm(
+    supi: &str,
+    token: &str,
+    peer: &nextgcore_sbi::callback_auth::VerifiedPeer,
+) -> bool {
+    if !peer.has_nf_type("UDM") {
+        log::debug!(
+            "[{supi}] dereg-notify without a bearer from TLS peer {} whose certificate \
+             names no UDM NF type ({:?}): the bearer is required",
+            peer.nf_instance_id,
+            peer.nf_types
+        );
+        return false;
+    }
     let is_udm = nextgcore_sbi::context::global_context()
         .find_nf_instances_by_type(nextgcore_sbi::types::NfType::Udm)
         .await
         .iter()
-        .any(|udm| udm.id.eq_ignore_ascii_case(peer));
+        .any(|udm| udm.id.eq_ignore_ascii_case(&peer.nf_instance_id));
     if !is_udm {
-        log::info!(
-            "[{supi}] dereg-notify without a bearer from TLS peer {peer}, which this AMF \
-             does not know as a UDM: the bearer is required"
+        log::debug!(
+            "[{supi}] dereg-notify without a bearer from TLS peer {}, which this AMF does \
+             not know as a UDM: the bearer is required",
+            peer.nf_instance_id
         );
         return false;
     }
@@ -9176,25 +9196,34 @@ mod tests {
     }
 
     /// #1522: the dereg-notify exemption's check admits a token-less notification
-    /// only from a verified TLS peer this AMF discovered as a UDM, with the UE's
-    /// current UECM token. A peer cached as another NF type, an unknown peer, a
-    /// stale token, or an unknown UE is not admitted (the bearer stays required).
-    /// The peer ID is matched case-insensitively (a UUID's hex case).
+    /// only from a verified TLS peer whose certificate's NFTypes extension names UDM
+    /// and which this AMF discovered (unexpired) as a UDM, with the UE's current UECM
+    /// token. Refused: NFTypes=AMF or no NFTypes for the UDM's own identity, a peer
+    /// cached as another NF type, an unknown peer, an expired UDM entry, a stale
+    /// token, an unknown UE. The peer ID is matched case-insensitively.
     ///
-    /// REVERT-VERIFIED: with the UDM lookup dropped (`is_udm` always true), the
-    /// AMF-typed and unknown peers are admitted.
+    /// REVERT-VERIFIED: without the NFTypes check, the NFTypes=AMF and untyped
+    /// certificates are admitted; with the UDM lookup dropped, the AMF-typed and
+    /// unknown peers are admitted; with the expiry filter dropped, the expired
+    /// entry is admitted.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_dereg_notify_exemption_admits_only_the_udm_with_the_current_token_1522() {
+        use nextgcore_sbi::callback_auth::VerifiedPeer;
         let _cache = crate::sbi_path::nf_cache_test_lock().lock().await;
         let _serial = dereg_queue_test_lock().lock().await;
         let supi = "imsi-001010000015221";
         let _ue = setup_ue(supi, true, true);
         let token = format!("tok-{supi}");
         let sbi = nextgcore_sbi::context::global_context();
-        let (udm, amf) = (
+        let (udm, amf, stale_udm) = (
             "4e3c1522-0000-4000-8000-00000000ud01",
             "4e3c1522-0000-4000-8000-0000000am001",
+            "4e3c1522-0000-4000-8000-00000000ud02",
         );
+        let peer = |id: &str, types: &[&str]| VerifiedPeer {
+            nf_instance_id: id.to_string(),
+            nf_types: types.iter().map(|t| t.to_string()).collect(),
+        };
         sbi.add_nf_instance(nextgcore_sbi::context::NfInstance::new(
             udm,
             nextgcore_sbi::types::NfType::Udm,
@@ -9205,43 +9234,73 @@ mod tests {
             nextgcore_sbi::types::NfType::Amf,
         ))
         .await;
+        // A UDM entry whose NRF validity has run out (zero: expired at once).
+        sbi.add_nf_instance_with_validity(
+            nextgcore_sbi::context::NfInstance::new(stale_udm, nextgcore_sbi::types::NfType::Udm),
+            std::time::Duration::ZERO,
+        )
+        .await;
 
-        let admitted = dereg_notify_from_the_udm(supi, &token, udm).await;
-        let upper = dereg_notify_from_the_udm(supi, &token, &udm.to_ascii_uppercase()).await;
-        let other_type = dereg_notify_from_the_udm(supi, &token, amf).await;
-        let unknown = dereg_notify_from_the_udm(supi, &token, "not-discovered").await;
-        let stale = dereg_notify_from_the_udm(supi, "tok-stale", udm).await;
-        let no_ue = dereg_notify_from_the_udm("imsi-001010000015229", &token, udm).await;
+        let check = |p: VerifiedPeer, t: String| async move {
+            dereg_notify_from_the_udm(supi, &t, &p).await
+        };
+        let admitted = check(peer(udm, &["UDM"]), token.clone()).await;
+        let upper = check(peer(&udm.to_ascii_uppercase(), &["udm"]), token.clone()).await;
+        let typed_amf = check(peer(udm, &["AMF"]), token.clone()).await;
+        let untyped = check(peer(udm, &[]), token.clone()).await;
+        let other_type = check(peer(amf, &["UDM"]), token.clone()).await;
+        let unknown = check(peer("not-discovered", &["UDM"]), token.clone()).await;
+        let expired = check(peer(stale_udm, &["UDM"]), token.clone()).await;
+        let stale = check(peer(udm, &["UDM"]), "tok-stale".to_string()).await;
+        let no_ue =
+            dereg_notify_from_the_udm("imsi-001010000015229", &token, &peer(udm, &["UDM"])).await;
         // The route the server matches, end to end through the registered exemption.
         let route = format!("/namf-callback/v1/{supi}/dereg-notify/{token}");
-        let via_route = nextgcore_sbi::callback_auth::admits_without_bearer_from(
-            &oauth2_callback_exemptions(),
-            "POST",
-            &route,
-            Some(udm),
-        )
-        .await;
-        let via_route_no_peer = nextgcore_sbi::callback_auth::admits_without_bearer_from(
-            &oauth2_callback_exemptions(),
-            "POST",
-            &route,
-            None,
-        )
-        .await;
+        let via_route = |p: Option<VerifiedPeer>| {
+            let route = route.clone();
+            async move {
+                nextgcore_sbi::callback_auth::admits_without_bearer_from(
+                    &oauth2_callback_exemptions(),
+                    "POST",
+                    &route,
+                    p.as_ref(),
+                )
+                .await
+            }
+        };
+        let route_udm = via_route(Some(peer(udm, &["UDM"]))).await;
+        let route_amf = via_route(Some(peer(amf, &["AMF"]))).await;
+        let route_untyped = via_route(Some(peer(udm, &[]))).await;
+        let route_none = via_route(None).await;
         sbi.remove_nf_instance(udm).await;
         sbi.remove_nf_instance(amf).await;
+        sbi.remove_nf_instance(stale_udm).await;
 
-        assert!(admitted, "the discovered UDM with the current token");
-        assert!(upper, "the same UDM, its ID in upper case");
-        assert!(!other_type, "a verified peer that is an AMF");
+        assert!(
+            admitted,
+            "the discovered UDM, NFTypes=UDM, with the current token"
+        );
+        assert!(upper, "the same UDM, its ID and NF type in another case");
+        assert!(
+            !typed_amf,
+            "the UDM's identity in a certificate with NFTypes=AMF"
+        );
+        assert!(
+            !untyped,
+            "the UDM's identity in a certificate without NFTypes"
+        );
+        assert!(!other_type, "a peer the NRF cache holds as an AMF");
         assert!(!unknown, "a verified peer this AMF never discovered");
+        assert!(!expired, "a UDM whose cache entry has expired");
         assert!(!stale, "a stale token from the UDM");
         assert!(!no_ue, "a SUPI this AMF does not hold");
         assert!(
-            via_route,
+            route_udm,
             "the registered exemption admits the UDM's request"
         );
-        assert!(!via_route_no_peer, "and nothing without a verified peer");
+        assert!(!route_amf, "and not a verified AMF's");
+        assert!(!route_untyped, "nor the UDM's identity without NFTypes");
+        assert!(!route_none, "nor anything without a verified peer");
     }
 
     /// #753: after an AMF restart the UE registers again (new UECM registration,

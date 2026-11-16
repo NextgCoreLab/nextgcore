@@ -1034,14 +1034,24 @@ mod mtls_oauth2_e2e {
     /// [`pki`] with a URI SubjectAltName on the CLIENT leaf, so the server can
     /// recover an NF Instance ID from it (issue #186, TS 33.310).
     fn pki_with_uri_san(tag: &str, client_uri: &str) -> Pki {
-        pki_inner(tag, Some(client_uri))
+        pki_inner(tag, Some(client_uri), None)
+    }
+
+    /// [`pki_with_uri_san`] whose client leaf also carries an RFC 9310 NFTypes
+    /// extension naming `nf_types` (#1522, TS 33.310 §6.1.3c.2), or none.
+    fn pki_with_uri_san_and_nf_types(
+        tag: &str,
+        client_uri: &str,
+        nf_types: Option<&[&str]>,
+    ) -> Pki {
+        pki_inner(tag, Some(client_uri), nf_types)
     }
 
     fn pki(tag: &str) -> Pki {
-        pki_inner(tag, None)
+        pki_inner(tag, None, None)
     }
 
-    fn pki_inner(tag: &str, client_uri: Option<&str>) -> Pki {
+    fn pki_inner(tag: &str, client_uri: Option<&str>, client_nf_types: Option<&[&str]>) -> Pki {
         use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
 
         let dir = std::env::temp_dir().join(format!("sbi-e2e-{}-{tag}", std::process::id()));
@@ -1055,7 +1065,7 @@ mod mtls_oauth2_e2e {
         let ca_key = KeyPair::generate().expect("ca key");
         let ca_cert = ca_params.self_signed(&ca_key).expect("self-signed ca");
 
-        let leaf = |name: &str, uri: Option<&str>| -> (String, String) {
+        let leaf = |name: &str, uri: Option<&str>, nf_types: Option<&[&str]>| -> (String, String) {
             let mut params =
                 CertificateParams::new(vec!["localhost".to_string()]).expect("leaf params");
             params.distinguished_name.push(DnType::CommonName, name);
@@ -1064,14 +1074,23 @@ mod mtls_oauth2_e2e {
                     .subject_alt_names
                     .push(rcgen::SanType::URI(u.try_into().expect("ia5 uri")));
             }
+            if let Some(types) = nf_types {
+                params
+                    .custom_extensions
+                    .push(rcgen::CustomExtension::from_oid_content(
+                        &[1, 3, 6, 1, 5, 5, 7, 1, 34],
+                        crate::peer_cert::tests::nf_types_der(types),
+                    ));
+            }
             let key = KeyPair::generate().expect("leaf key");
             let cert = params
                 .signed_by(&key, &ca_cert, &ca_key)
                 .expect("ca-signed leaf");
             (cert.pem(), key.serialize_pem())
         };
-        let (server_cert_pem, server_key_pem) = leaf("nextgcore-test-producer", None);
-        let (client_cert_pem, client_key_pem) = leaf("nextgcore-test-consumer", client_uri);
+        let (server_cert_pem, server_key_pem) = leaf("nextgcore-test-producer", None, None);
+        let (client_cert_pem, client_key_pem) =
+            leaf("nextgcore-test-consumer", client_uri, client_nf_types);
 
         let write = |name: &str, contents: &str| -> String {
             let p = dir.join(name);
@@ -1473,12 +1492,13 @@ mod mtls_oauth2_e2e {
     async fn verified_peer_callback_status(
         tag: &str,
         client_uri: &str,
+        nf_types: Option<&[&str]>,
         mtls: bool,
         token: &str,
     ) -> u16 {
         use crate::server::OAuth2CallbackExemption;
         const GOOD: &str = "0123456789abcdef0123456789abcdef";
-        let pki = pki_with_uri_san(tag, client_uri);
+        let pki = pki_with_uri_san_and_nf_types(tag, client_uri, nf_types);
         let signing = crate::oauth::generate_es256_key();
         let (listener, addr) = crate::test_support::bound_listener().into_parts();
         let port = addr.port();
@@ -1498,7 +1518,10 @@ mod mtls_oauth2_e2e {
                 "POST",
                 "/nx-callback/v1/{var}/dereg-notify/{token}",
                 |cb, peer| async move {
-                    cb.vars == ["imsi-001010000015220"] && cb.token == GOOD && peer == "udm-1522"
+                    cb.vars == ["imsi-001010000015220"]
+                        && cb.token == GOOD
+                        && peer.nf_instance_id == "udm-1522"
+                        && peer.has_nf_type("UDM")
                 },
             ),
         );
@@ -1537,29 +1560,44 @@ mod mtls_oauth2_e2e {
     }
 
     /// #1522: a verified-peer callback exemption admits a token-less notification
-    /// only from the named peer's VERIFIED mutual-TLS certificate with the current
-    /// token. Another peer, a stale token, or a TLS listener that verifies no client
-    /// certificate (no peer identity) is held to the bearer: 401.
+    /// only from the named peer's VERIFIED mutual-TLS certificate whose RFC 9310
+    /// NFTypes extension (TS 33.310 §6.1.3c.2) names UDM, with the current token.
+    /// The same identity with NFTypes=AMF or with no NFTypes extension, another
+    /// peer, a stale token, or a TLS listener that verifies no client certificate is
+    /// held to the bearer: 401.
     ///
-    /// REVERT-VERIFIED: with the server passing no peer identity to the exemption
-    /// (`None` instead of `peer_cert_nf_instance_id`), the first case is 401 too.
+    /// REVERT-VERIFIED: with the server passing no NF types from the certificate,
+    /// the NFTypes=UDM case is 401; with no peer at all, the same.
     #[tokio::test]
     async fn a_verified_peer_callback_is_admitted_only_from_that_peer_1522() {
         const GOOD: &str = "0123456789abcdef0123456789abcdef";
+        const UDM: Option<&[&str]> = Some(&["UDM"]);
+        let udm_san = "urn:uuid:udm-1522";
         assert_eq!(
-            verified_peer_callback_status("vp-udm", "urn:uuid:udm-1522", true, GOOD).await,
+            verified_peer_callback_status("vp-udm", udm_san, UDM, true, GOOD).await,
             204,
-            "the verified UDM with the current token needs no bearer"
+            "the verified UDM (NFTypes=UDM) with the current token needs no bearer"
         );
         assert_eq!(
-            verified_peer_callback_status("vp-other", "urn:uuid:amf-1522", true, GOOD).await,
+            verified_peer_callback_status("vp-amf-type", udm_san, Some(&["AMF"]), true, GOOD).await,
+            401,
+            "the UDM's identity with NFTypes=AMF needs a bearer"
+        );
+        assert_eq!(
+            verified_peer_callback_status("vp-no-type", udm_san, None, true, GOOD).await,
+            401,
+            "a certificate without the NFTypes extension needs a bearer"
+        );
+        assert_eq!(
+            verified_peer_callback_status("vp-other", "urn:uuid:amf-1522", UDM, true, GOOD).await,
             401,
             "another verified peer needs a bearer"
         );
         assert_eq!(
             verified_peer_callback_status(
                 "vp-stale",
-                "urn:uuid:udm-1522",
+                udm_san,
+                UDM,
                 true,
                 "ffffffffffffffffffffffffffffffff"
             )
@@ -1568,7 +1606,7 @@ mod mtls_oauth2_e2e {
             "a stale token from the UDM needs a bearer"
         );
         assert_eq!(
-            verified_peer_callback_status("vp-tls", "urn:uuid:udm-1522", false, GOOD).await,
+            verified_peer_callback_status("vp-tls", udm_san, UDM, false, GOOD).await,
             401,
             "without client-certificate verification there is no peer identity"
         );
