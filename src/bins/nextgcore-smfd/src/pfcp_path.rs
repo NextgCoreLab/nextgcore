@@ -2366,6 +2366,42 @@ pub fn holds_session_seid(seid: u64) -> bool {
     five_g || ctx.sess_find_by_seid(seid).is_some()
 }
 
+/// The UP function's SEID for the PFCP session whose SMF-side SEID is `seid`
+/// (#1559): the SEID the UPF gave in its UP F-SEID at establishment, which TS 29.244
+/// §7.2.2.4.1 has the SMF put in the header of every message it sends the UPF for
+/// that session, a Session Report Response included. `None` for a SEID this SMF
+/// does not hold.
+///
+/// Resolved as [`holds_session_seid`] resolves the session: a 5G session's
+/// reference by its inherited (`cp_n4_seids`) or derived SEID, then its
+/// `pfcp_sessions` entry; else the EPC PDN connection's own `upf_n4_seid`. One map
+/// guard at a time, as every writer takes them.
+pub fn upf_seid_for_session(seid: u64) -> Option<u64> {
+    let global = smf_self();
+    let ctx = global.read().ok()?;
+    let inherited = ctx
+        .cp_n4_seids
+        .read()
+        .map(|m| m.clone())
+        .unwrap_or_default();
+    let five_g = ctx.pfcp_sessions.read().ok().and_then(|m| {
+        m.iter()
+            .find(|(r, _)| {
+                inherited
+                    .get(*r)
+                    .copied()
+                    .unwrap_or_else(|| crate::context::derive_cp_n4_seid(r))
+                    == seid
+            })
+            .map(|(_, upf_seid)| *upf_seid)
+    });
+    five_g.or_else(|| {
+        ctx.sess_find_by_seid(seid)
+            .map(|s| s.upf_n4_seid)
+            .filter(|upf_seid| *upf_seid != 0)
+    })
+}
+
 fn held_session_seids() -> Vec<u64> {
     let global = smf_self();
     let Ok(ctx) = global.read() else {

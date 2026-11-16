@@ -1542,6 +1542,18 @@ async fn handle_pfcp_session_report_from(
         return;
     }
 
+    // #1559, TS 29.244 §7.2.2.4.1: from here on the session is this UPF's, and every
+    // answer carries the SEID the UPF gave for it (its UP F-SEID), not the SMF's own
+    // one the request was addressed to. §7.2.2.4.2 leaves 0 for an unknown session
+    // (the cause 65 answer above) and for a peer SEID that is not available.
+    let upf_seid = pfcp_path::upf_seid_for_session(seid).unwrap_or_else(|| {
+        log::warn!(
+            "Session Report Request for SEID 0x{seid:016x}: no UP F-SEID recorded for the \
+             session; the response carries SEID 0 (TS 29.244 §7.2.2.4.2)"
+        );
+        0
+    });
+
     // #1509, TS 29.244 §5.8.3: "When a PFCP Association is not established with a UP
     // function, the CP function shall reject any incoming PFCP Session related
     // messages from that UP function, with a cause indicating that no PFCP
@@ -1551,9 +1563,9 @@ async fn handle_pfcp_session_report_from(
     // enough: nothing in the report is processed, no usage, no Downlink Data Report,
     // no Error Indication. The owner is the client that passed the ownership check
     // above (the admitted one, or the session's recorded or default client).
-    // SEID 0 in the answer, as the #971 refusal of a stranger's report: §7.2.2.4.2
-    // lets a rejecting node answer without looking up the peer's SEID, with any
-    // cause but "Session context not found".
+    // #1559 (review of #1561): the session and its UP SEID are known, so the answer
+    // carries that SEID. §7.2.2.4.2 allows 0 only for an unknown session (cause 65)
+    // or, as an option, a §7.6 protocol-error reject; this is neither.
     let associated = match pfcp_path::client_for_session(seid) {
         Some(owner) => owner.is_associated().await,
         None => false,
@@ -1565,7 +1577,7 @@ async fn handle_pfcp_session_report_from(
         );
         let resp = pfcp_path::encode_wire_message(
             pfcp_path::pfcp_message_type::SESSION_REPORT_RESPONSE,
-            Some(0),
+            Some(upf_seid),
             seq,
             &[
                 0,
@@ -1592,7 +1604,7 @@ async fn handle_pfcp_session_report_from(
         body.add_u16(n4_build::pfcp_ie::OFFENDING_IE, 39);
         let resp = pfcp_path::encode_wire_message(
             pfcp_path::pfcp_message_type::SESSION_REPORT_RESPONSE,
-            Some(seid),
+            Some(upf_seid),
             seq,
             &body.build(),
         );
@@ -1779,7 +1791,7 @@ async fn handle_pfcp_session_report_from(
     body.add_cause_raw(1); // Request Accepted
     let resp = pfcp_path::encode_wire_message(
         pfcp_path::pfcp_message_type::SESSION_REPORT_RESPONSE,
-        Some(seid),
+        Some(upf_seid),
         seq,
         &body.build(),
     );
@@ -1787,7 +1799,10 @@ async fn handle_pfcp_session_report_from(
     if let Err(e) = sock.send_to(&resp, peer).await {
         log::warn!("Failed to send PFCP Session Report Response to {peer}: {e}");
     } else {
-        log::info!("PFCP Session Report Response sent: SEID=0x{seid:016x}, seq={seq}, peer={peer}");
+        log::info!(
+            "PFCP Session Report Response sent: SEID=0x{upf_seid:016x} (the UPF's, for SMF \
+             SEID 0x{seid:016x}), seq={seq}, peer={peer}"
+        );
     }
 }
 
@@ -12979,7 +12994,8 @@ mod tests {
 
     /// #1509, TS 29.244 §5.8.3 / §8.2.1 cause 72: a heartbeat loss marks the UPF down
     /// and keeps its sessions; a Session Report from it for one of them is refused with
-    /// "No established PFCP Association", SEID 0, and nothing in it is processed (its
+    /// "No established PFCP Association", the UPF's SEID (#1559, §7.2.2.4.1: the
+    /// session is known, so 0 is not allowed), and nothing in it is processed (its
     /// TSC Management Information is not recorded). Once the UPF is associated again,
     /// the same report is accepted and recorded.
     ///
@@ -13078,19 +13094,127 @@ mod tests {
         );
         assert_eq!(h_down.sequence_number, 0x1509);
         assert!(h_down.seid_present);
-        assert_eq!(h_down.seid, 0, "SEID 0 in the refusal");
+        assert_eq!(
+            h_down.seid, 0x1509,
+            "#1559: the refusal carries the UPF's SEID for the known session, not 0"
+        );
         assert!(
             recorded_while_down.is_none(),
             "nothing in the refused report is processed: {recorded_while_down:?}"
         );
         assert_eq!(pfcp_cause_of(&after), Some(1), "accepted once associated");
         assert_eq!(h_up.sequence_number, 0x150a);
+        assert_eq!(
+            h_up.seid, 0x1509,
+            "#1559: the UPF's SEID, not the SMF's {seid:#x}"
+        );
         let recorded = recorded_after.expect("the accepted report is processed");
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].nw_tt_port_number, Some(7));
         assert_eq!(
             recorded[0].port_management_container.as_deref(),
             Some(&[0x15, 0x09][..])
+        );
+    }
+
+    /// #1559, TS 29.244 §7.2.2.4.1 (`29244-k00.txt:14142-14149`): the SEID in a PFCP
+    /// header is the one "provided by the corresponding receiving entity". A Session
+    /// Report Response goes to the UPF, so it carries the UP F-SEID's SEID the UPF
+    /// gave at establishment, not the SMF's own SEID the request was addressed to.
+    /// Both answers to a known session's report: accepted (cause 1) and missing its
+    /// Report Type (cause 66, §7.2.2.4.2: the node "should look up the remote peer's
+    /// SEID"). The session's SMF SEID is an inherited one (#475, `cp_n4_seids`), so
+    /// the lookup follows the same resolution as the ownership check.
+    ///
+    /// REVERT-VERIFIED: with `Some(seid)` back in both encoders, both headers carry
+    /// the SMF's SEID 0x1559_0001.
+    #[tokio::test]
+    async fn a_session_report_response_carries_the_upfs_seid_1559() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let (client, upf) = pfcp_path::stand_in::client_with_silent_peer_timed(
+            std::time::Duration::from_millis(50),
+            1,
+        )
+        .await;
+        client.set_assoc_state_for_test(true, None, None).await;
+        pfcp_path::set_global_pool(vec![client.clone()]);
+        let upf_addr = upf.local_addr().unwrap();
+        let smf_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let reference = "15590001";
+        let (smf_seid, upf_seid) = (0x1559_0001u64, 0x00AB_1559u64);
+        {
+            let global = smf_self();
+            let ctx = global.read().unwrap();
+            ctx.cp_n4_seids
+                .write()
+                .unwrap()
+                .insert(reference.to_string(), smf_seid);
+            ctx.pfcp_sessions
+                .write()
+                .unwrap()
+                .insert(reference.to_string(), upf_seid);
+        }
+        let report = |seq: u32, body: &[u8]| {
+            pfcp_path::encode_wire_message(
+                pfcp_path::pfcp_message_type::SESSION_REPORT_REQUEST,
+                Some(smf_seid),
+                seq,
+                body,
+            )
+        };
+        let response = || async {
+            let mut buf = vec![0u8; 2048];
+            loop {
+                let (n, _) = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    upf.recv_from(&mut buf),
+                )
+                .await
+                .expect("a Session Report Response")
+                .unwrap();
+                let h = pfcp_path::parse_wire_header(&buf[..n]).unwrap();
+                if h.msg_type == pfcp_path::pfcp_message_type::SESSION_REPORT_RESPONSE {
+                    return (h, buf[..n].to_vec());
+                }
+            }
+        };
+
+        // A Report Type with no report bit set: accepted, and nothing to act on.
+        handle_pfcp_session_report_from(
+            &smf_sock,
+            &report(0x1559, &[0, 39, 0, 1, 0x00]),
+            upf_addr,
+            Some(&client),
+        )
+        .await;
+        let (h_accepted, accepted) = response().await;
+        // No Report Type at all.
+        handle_pfcp_session_report_from(&smf_sock, &report(0x155a, &[]), upf_addr, Some(&client))
+            .await;
+        let (h_missing, missing) = response().await;
+
+        {
+            let global = smf_self();
+            let ctx = global.read().unwrap();
+            ctx.pfcp_sessions.write().unwrap().remove(reference);
+            ctx.cp_n4_seids.write().unwrap().remove(reference);
+        }
+        pfcp_path::clear_global_upf_for_test();
+
+        assert_eq!(pfcp_cause_of(&accepted), Some(1));
+        assert_eq!(h_accepted.sequence_number, 0x1559);
+        assert!(h_accepted.seid_present);
+        assert_eq!(
+            h_accepted.seid, upf_seid,
+            "the accepted answer carries the UPF's SEID, not the SMF's {smf_seid:#x}"
+        );
+        assert_eq!(pfcp_cause_of(&missing), Some(66), "Mandatory IE missing");
+        assert_eq!(h_missing.sequence_number, 0x155a);
+        assert_eq!(
+            h_missing.seid, upf_seid,
+            "the cause-66 answer carries the UPF's SEID too"
         );
     }
 
