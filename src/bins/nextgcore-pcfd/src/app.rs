@@ -1146,9 +1146,29 @@ fn negotiated_feature_bits(consumer_hex: Option<&str>, supported: u64) -> u64 {
 /// only, which is all it holds. `rfsp` is range-checked (1..=256) because a value
 /// outside it is not an `RfspIndex` and forwarding it would push the rejection
 /// onto the AMF.
-async fn provision_am_policy(supi: &str) -> serde_json::Map<String, serde_json::Value> {
-    let am_data = sbi_path::pcf_udr_am_subscription_data(supi).await;
-    am_policy_from(supi, am_data.as_ref())
+///
+/// #1597: `Err` when the UDR answered a 5xx (TS 29.504 SYSTEM_FAILURE, #1534).
+/// That is not "nothing provisioned": deciding from it would authorise an AM
+/// policy without the subscriber's restrictions.
+async fn provision_am_policy(
+    supi: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, sbi_path::UdrError> {
+    let am_data = sbi_path::pcf_udr_am_subscription_data(supi).await?;
+    Ok(am_policy_from(supi, am_data.as_ref()))
+}
+
+/// #1597: the answer to a policy create whose UDR read failed: `500
+/// SYSTEM_FAILURE` (TS 29.500 Table 5.2.7.2-1, "generic error condition in the
+/// NF"). The PCF has no basis for a decision, and authorising the local default
+/// would drop the subscriber's provisioned policy.
+fn udr_read_failed(what: &str, supi: &str, e: &sbi_path::UdrError) -> SbiResponse {
+    log::error!("[{supi}] {what}: the UDR read failed ({e}); the create is refused");
+    nextgcore_sbi::server::send_error(
+        500,
+        "Internal Server Error",
+        &format!("{what}: the subscription data could not be read from the UDR"),
+        Some("SYSTEM_FAILURE"),
+    )
 }
 
 /// [`provision_am_policy`] from an AM subscription data document already read
@@ -1387,6 +1407,13 @@ pub async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
         return send_bad_request("suppFeat is required", Some("MANDATORY_IE_MISSING"));
     };
 
+    // Provision the access-and-mobility policy before the association exists, so a
+    // failed UDR read (#1597) refuses the create without leaving one behind.
+    let mut policy = match provision_am_policy(supi).await {
+        Ok(policy) => policy,
+        Err(e) => return udr_read_failed("AM policy create", supi, &e),
+    };
+
     // Add UE AM to context
     let ctx = pcf_self();
     let ue_am = if let Ok(context) = ctx.read() {
@@ -1397,9 +1424,8 @@ pub async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
 
     match ue_am {
         Some(ue_am) => {
-            // Provision the access-and-mobility policy and the triggers before
-            // storing, so the association carries them from the moment it exists.
-            let mut policy = provision_am_policy(supi).await;
+            // The triggers before storing, so the association carries them and the
+            // policy from the moment it exists.
             let mut triggers = am_policy_triggers(&policy_data, &policy);
             let features =
                 negotiated_feature_bits(Some(supp_feat), PCF_AM_POLICY_SUPPORTED_FEATURES);
@@ -1617,17 +1643,35 @@ pub async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
     // Re-evaluate the provisioned policy: an update is the point at which the
     // subscription is consulted again, which is what makes servAreaRes / rfsp /
     // ueAmbr able to change after the association is created.
-    let mut policy = provision_am_policy(&updated.supi).await;
+    // #1597: a failed UDR read keeps the policy the association holds rather than
+    // re-deciding from an outage, which would drop provisioned restrictions.
     let authorised = am_ue_ambr_authorised(&updated);
-    gate_am_ue_ambr(authorised, &mut policy, &mut updated.triggers);
-    let am_policy = if policy.is_empty() {
-        None
-    } else {
-        Some(serde_json::Value::Object(policy))
-    };
-    if am_policy != updated.am_policy {
-        updated.am_policy = am_policy.clone();
-        changed.push("policy");
+    match provision_am_policy(&updated.supi).await {
+        Ok(mut policy) => {
+            gate_am_ue_ambr(authorised, &mut policy, &mut updated.triggers);
+            let am_policy = if policy.is_empty() {
+                None
+            } else {
+                Some(serde_json::Value::Object(policy))
+            };
+            if am_policy != updated.am_policy {
+                updated.am_policy = am_policy.clone();
+                changed.push("policy");
+            }
+        }
+        Err(e) => {
+            gate_am_ue_ambr(
+                authorised,
+                &mut serde_json::Map::new(),
+                &mut updated.triggers,
+            );
+            log::warn!(
+                "[{}] AM policy update: the UDR read failed ({e}); association {} keeps \
+                 its policy",
+                updated.supi,
+                pol_asso_id
+            );
+        }
     }
 
     if let Ok(context) = ctx.read() {
@@ -1833,7 +1877,19 @@ fn spawn_ue_policy_delivery(pol_asso_id: &str, supi: &str, data: &serde_json::Va
         // UePolicySet (TS 29.519 §5.4), bounded so a stuck UDR cannot block
         // delivery; fall back to the static default set on absence / timeout /
         // malformed doc (fail-closed — never a half-parsed provisioned set).
-        let udr_doc = sbi_path::pcf_udr_ue_policy_set(&supi).await;
+        // #1597: a failed UDR read delivers nothing, rather than the static
+        // default in place of what the operator provisioned; the UE keeps the
+        // policy it has.
+        let udr_doc = match sbi_path::pcf_udr_ue_policy_set(&supi).await {
+            Ok(doc) => doc,
+            Err(e) => {
+                log::warn!(
+                    "[{supi}] UE policy delivery for {id}: the UDR read failed ({e}); \
+                     nothing is delivered"
+                );
+                return;
+            }
+        };
         let rules = ue_policy::resolve_ursp_rules(udr_doc.as_ref());
         // E3: provision the resolved rules into the per-SUPI UE-policy context
         // (the mapping target; E6 reads it to correlate the COMPLETE/REJECT).
@@ -3134,11 +3190,6 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
                 }
             }
 
-            // Register the PCF↔PDU-session binding with the BSF so an AF can
-            // discover the serving PCF (TS 23.503 §6.1.1.2, TS 29.521). Best
-            // effort: no-op when no BSF/NRF is reachable.
-            sbi_path::pcf_sess_register_bsf_binding(sess.id);
-
             // Query real session data from UDR/database
             let s_nssai = SNssai { sst, sd };
             let session_data = pcf_get_session_data(supi, None, &s_nssai, dnn);
@@ -3148,7 +3199,25 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
             // the local subscription/config data as the documented fallback. The QoS/ARP/
             // AMBR/PCC decision is not re-derived from this resource (SmPolicyDnnData does
             // not carry them); only the spec-defined online/offline charging flags are.
-            let udr_dnn_data = sbi_path::pcf_udr_sm_policy_dnn_data(supi, sst, sd, dnn).await;
+            let udr_dnn_data = match sbi_path::pcf_udr_sm_policy_dnn_data(supi, sst, sd, dnn).await
+            {
+                Ok(doc) => doc,
+                Err(e) => {
+                    // #1597: an outage is not "nothing provisioned". The session was
+                    // added above; it is removed (before any BSF binding exists, which
+                    // is why the registration follows this read) so the refused
+                    // create leaves no state behind, as the UAV reject does.
+                    if let Ok(context) = ctx.read() {
+                        context.sess_remove(sess.id);
+                    }
+                    return udr_read_failed("SM policy create", supi, &e);
+                }
+            };
+
+            // Register the PCF↔PDU-session binding with the BSF so an AF can
+            // discover the serving PCF (TS 23.503 §6.1.1.2, TS 29.521). Best
+            // effort: no-op when no BSF/NRF is reachable.
+            sbi_path::pcf_sess_register_bsf_binding(sess.id);
             if udr_dnn_data.is_some() {
                 log::info!(
                     "UDR SmPolicyData retrieved over Nudr_DataRepository for SUPI {supi} dnn={dnn}"
@@ -8022,6 +8091,281 @@ mod tests {
 
         peers.udr.stop().await.ok();
         peers.smf.stop().await.ok();
+    }
+
+    /// #1597: a mock NRF + UDR. Every nudr-dr read answers `status` when it is not
+    /// 0; with 0, am-data answers `am_data` and the other reads 404.
+    async fn start_mock_udr_1597(
+        status: std::sync::Arc<std::sync::atomic::AtomicU16>,
+        am_data: serde_json::Value,
+    ) -> nextgcore_sbi::server::SbiServer {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        use std::sync::atomic::Ordering;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        server
+            .start(move |req: SbiRequest| {
+                let status = status.clone();
+                let am_data = am_data.clone();
+                async move {
+                    let path = req.header.uri.split('?').next().unwrap_or("").to_string();
+                    if path == "/nnrf-disc/v1/nf-instances" {
+                        return SbiResponse::with_status(200)
+                            .with_json_body(&serde_json::json!({
+                                "nfInstances": [{
+                                    "nfInstanceId": "udr-1597",
+                                    "nfType": "UDR",
+                                    "ipv4Addresses": ["127.0.0.1"],
+                                    "nfServices": [{
+                                        "serviceName": "nudr-dr",
+                                        "scheme": "http",
+                                        "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": port }]
+                                    }]
+                                }]
+                            }))
+                            .unwrap_or_else(|_| SbiResponse::with_status(500));
+                    }
+                    if path.starts_with("/nudr-dr/") {
+                        let s = status.load(Ordering::SeqCst);
+                        if s != 0 {
+                            return nextgcore_sbi::server::send_error(
+                                s,
+                                "Internal Server Error",
+                                "Subscriber store unavailable",
+                                Some("SYSTEM_FAILURE"),
+                            );
+                        }
+                        if path.ends_with("/provisioned-data/am-data") {
+                            return SbiResponse::with_status(200)
+                                .with_json_body(&am_data)
+                                .unwrap_or_else(|_| SbiResponse::with_status(500));
+                        }
+                    }
+                    SbiResponse::with_status(404)
+                }
+            })
+            .await
+            .expect("mock NRF/UDR starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        crate::test_support::point_nrf_at(format!("http://127.0.0.1:{port}")).await;
+        server
+    }
+
+    fn problem_cause_1597(resp: &SbiResponse) -> String {
+        resp.http
+            .content
+            .as_deref()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+            .and_then(|v| v["cause"].as_str().map(str::to_string))
+            .unwrap_or_default()
+    }
+
+    /// #1597: an AM policy create whose UDR answers 500 (TS 29.504 SYSTEM_FAILURE,
+    /// #1534) is refused 500 SYSTEM_FAILURE and leaves no association; a 404 is
+    /// "nothing provisioned" and the create succeeds.
+    ///
+    /// REVERT-VERIFIED: with `bounded_udr_read` mapping a 5xx to `Ok(None)` again,
+    /// the 500 create answers 201 with no restrictions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn am_policy_create_refuses_a_udr_outage_1597() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(500));
+        let udr = start_mock_udr_1597(status.clone(), serde_json::json!({ "rfspIndex": 5 })).await;
+        let create = |supi: &str| {
+            make_request(
+                "POST",
+                "/npcf-am-policy-control/v1/policies",
+                Some(serde_json::json!({
+                    "supi": supi,
+                    "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/1597",
+                    "suppFeat": "0",
+                })),
+            )
+        };
+        let supi = "imsi-001010000015971";
+        let resp = pcf_sbi_request_handler(create(supi)).await;
+        assert_eq!(resp.status, 500, "{:?}", resp.http.content);
+        assert_eq!(problem_cause_1597(&resp), "SYSTEM_FAILURE");
+        assert!(
+            pcf_self()
+                .read()
+                .unwrap()
+                .ue_am_find_by_supi(supi)
+                .is_none(),
+            "a refused create leaves no association"
+        );
+
+        status.store(404, std::sync::atomic::Ordering::SeqCst);
+        let resp = pcf_sbi_request_handler(create("imsi-001010000015972")).await;
+        assert_eq!(
+            resp.status, 201,
+            "404 is not provisioned: {:?}",
+            resp.http.content
+        );
+        udr.stop().await.ok();
+    }
+
+    /// #1597: an AM policy update during a UDR outage keeps the policy the
+    /// association holds (here the provisioned RFSP) rather than re-deciding from
+    /// the failed read.
+    ///
+    /// REVERT-VERIFIED: with the update's `Err` arm deciding from no data, the
+    /// answer and the GET lose `rfsp`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn am_policy_update_keeps_the_policy_during_a_udr_outage_1597() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let udr = start_mock_udr_1597(status.clone(), serde_json::json!({ "rfspIndex": 5 })).await;
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-am-policy-control/v1/policies",
+            Some(serde_json::json!({
+                "supi": "imsi-001010000025971",
+                "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/1597",
+                "suppFeat": "0",
+                // #1580: the AMF's UDM RFSP, so the answer carries the authorised one.
+                "rfsp": 1,
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let created: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(created["rfsp"], 5, "{created}");
+        let id = created["polAssoId"].as_str().unwrap().to_string();
+
+        status.store(500, std::sync::atomic::Ordering::SeqCst);
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            &format!("/npcf-am-policy-control/v1/policies/{id}/update"),
+            Some(serde_json::json!({ "triggers": ["LOC_CH"], "rfsp": 1 })),
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+        let answered: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(answered["rfsp"], 5, "kept through the outage: {answered}");
+        let resp = pcf_sbi_request_handler(make_request(
+            "GET",
+            &format!("/npcf-am-policy-control/v1/policies/{id}"),
+            None,
+        ))
+        .await;
+        let got: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(got["rfsp"], 5, "{got}");
+        udr.stop().await.ok();
+    }
+
+    /// #1597: an SM policy create whose UDR sm-data read answers 500 is refused 500
+    /// SYSTEM_FAILURE and leaves no session; a 404 is "nothing provisioned" (local
+    /// default charging) and the create succeeds.
+    ///
+    /// REVERT-VERIFIED: with the create's `Err` arm falling back to no data, the
+    /// 500 create answers 201; without the `sess_remove`, a session is left behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn sm_policy_create_refuses_a_udr_outage_1597() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(503));
+        let udr = start_mock_udr_1597(status.clone(), serde_json::json!({})).await;
+        let supi = "imsi-001010000035971";
+        let mut body = full_create_body(supi, 5);
+        body["ipv4Address"] = serde_json::json!("10.159.7.1");
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(body.clone()),
+        ))
+        .await;
+        assert_eq!(resp.status, 500, "{:?}", resp.http.content);
+        assert_eq!(problem_cause_1597(&resp), "SYSTEM_FAILURE");
+        assert!(
+            pcf_self()
+                .read()
+                .unwrap()
+                .sess_find_by_ipv4addr("10.159.7.1")
+                .is_none(),
+            "a refused create leaves no session"
+        );
+
+        status.store(404, std::sync::atomic::Ordering::SeqCst);
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(body),
+        ))
+        .await;
+        assert_eq!(
+            resp.status, 201,
+            "404 is not provisioned: {:?}",
+            resp.http.content
+        );
+        udr.stop().await.ok();
+    }
+
+    /// #1597: a UE policy delivery whose UDR ue-policy-set read answers 500 delivers
+    /// nothing, rather than the static default in place of the operator's URSP.
+    ///
+    /// REVERT-VERIFIED: without the early return, the outage line is never logged
+    /// (the default set is provisioned instead).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn ue_policy_delivery_sends_nothing_during_a_udr_outage_1597() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _delivery = crate::test_support::ue_policy_delivery(true);
+        pcf_context_init(64, 64);
+        nextgcore_core::test_log::init();
+        let supi = "imsi-001010000045971";
+        let watch = nextgcore_core::test_log::watch(format!("[{supi}] UE policy delivery for"));
+        let status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(500));
+        let udr = start_mock_udr_1597(status, serde_json::json!({})).await;
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-ue-policy-control/v1/policies",
+            Some(serde_json::json!({
+                "notificationUri": "http://127.0.0.1:9/namf-callback/v1/ue-policy/1597",
+                "supi": supi,
+                "suppFeat": "0",
+                "servingPlmn": { "mcc": "001", "mnc": "01" }
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while watch.records().is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let records = watch.records();
+        assert!(
+            records.iter().any(|r| r.contains("nothing is delivered")),
+            "the outage stops the delivery: {records:?}"
+        );
+        assert!(
+            ue_policy::context_ursp_for(supi).is_empty(),
+            "no rule set was provisioned for the UE"
+        );
+        udr.stop().await.ok();
     }
 
     /// AM policy Create and GET both carry the negotiated `suppFeat` and the
