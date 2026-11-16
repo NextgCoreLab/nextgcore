@@ -7014,7 +7014,19 @@ impl NgapServer {
             // So a mobility update into a new TA reaches a filter-less subscriber,
             // and a periodic update from the same cell reaches none. Before, the
             // update path reported nothing.
+            //
+            // #1549: PRESENCE_IN_AOI_REPORT and UES_IN_AREA_REPORT too, as the Service
+            // Request from CM-IDLE fires them. A UE that moved while CM-IDLE out of its
+            // registration area comes back with a mobility registration update, so this
+            // is where the AMF learns it crossed an area boundary (TS 29.518 §5.3.1,
+            // "notification when a specified UE enters or leaves the specified area",
+            // `29518-k00.txt:23968-23978`). The emitter applies the §5.3.1 change rule,
+            // so a periodic update inside the area sends nothing.
+            if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
+                crate::namf_server::fire_presence_in_aoi_report(&state.amf_ue);
+            }
             self.report_location_change(amf_ue_ngap_id);
+            crate::namf_server::fire_ues_in_area_report();
             let _ = self.create_ue_policy_association(amf_ue_ngap_id).await;
             return Ok(());
         }
@@ -36794,6 +36806,160 @@ mod tests {
         ngap.ue_auth_state.remove(new_id);
         plain.stop().await.expect("sink stop");
         cell.stop().await.expect("sink stop");
+    }
+
+    /// **#1549**, TS 29.518 §5.3.1 / §6.2 (`29518-k00.txt:23968-23978`): a UE that
+    /// moved while CM-IDLE out of a subscribed Area of Interest comes back with a
+    /// protected mobility registration update, and its Registration Accept reports
+    /// the transition: `PRESENCE_IN_AOI_REPORT` with `OUT_OF_AREA`, after the
+    /// `IN_AREA` baseline is consumed. `UES_IN_AREA_REPORT` is re-counted once by the
+    /// handler (attributed by `ues_in_area_fires_on_this_thread` on this
+    /// current-thread runtime), and the delivered count names the UE in its new TA.
+    ///
+    /// REVERT-VERIFIED: without the two fires on the update path, the presence
+    /// transition never arrives and the handler counts no UES_IN_AREA fire.
+    #[tokio::test]
+    async fn a_mobility_update_out_of_the_subscribed_area_reports_the_transition_1549() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = capturing_ngap_server().await;
+        let (old_id, new_id) = (15_490_101u64, 15_490_102u64);
+        let tmsi = 0x1549_0101u32;
+        let mut stored = idle_ue_with_security(old_id, tmsi);
+        let supi = stored.amf_ue.supi.clone().expect("supi");
+        // Idle INSIDE the area the subscription names (TAC 0x1549). The update comes
+        // from TAC 0x15_4902, outside it, which no other test uses (so the any-UE count
+        // there is this UE's).
+        stored.amf_ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        stored.amf_ue.nr_tai.tac = 0x1549;
+        stored.amf_ue.nr_cgi.plmn_id = PlmnId::new("001", "01");
+        stored.amf_ue.nr_cgi.cell_id = 0x0001_5491;
+        let ue_snapshot = stored.amf_ue.clone();
+        let rr =
+            guti_registration_request(crate::gmm_build::registration_type::MOBILITY_UPDATING, tmsi);
+        let nas = protected_initial_registration(&stored.amf_ue, &rr, &rr, 5);
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_publish(&stored.amf_ue, 51, 1);
+        }
+        ngap.ue_auth_state.insert(old_id, stored);
+
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (aoi_sink, aoi_port, mut aoi_rx) = notify_sink().await;
+        let (count_sink, count_port, mut count_rx) = notify_sink().await;
+        let tai =
+            |tac: &str| serde_json::json!({ "plmnId": {"mcc": "001", "mnc": "01"}, "tac": tac });
+        for (body, what) in [
+            (
+                serde_json::json!({
+                    "eventList": [{
+                        "type": "PRESENCE_IN_AOI_REPORT",
+                        "areaList": [{ "presenceInfo": {
+                            "praId": "154901",
+                            "trackingAreaList": [tai("001549")],
+                        }}],
+                    }],
+                    "eventNotifyUri": format!("http://127.0.0.1:{aoi_port}/notify/1549-aoi"),
+                    "notifyCorrelationId": "corr-1549-aoi",
+                    "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                    "supi": supi,
+                }),
+                "presence",
+            ),
+            (
+                serde_json::json!({
+                    "eventList": [{
+                        "type": "UES_IN_AREA_REPORT",
+                        "areaList": [{ "presenceInfo": {
+                            "praId": "154902",
+                            "trackingAreaList": [tai("154902")],
+                        }}],
+                    }],
+                    "eventNotifyUri": format!("http://127.0.0.1:{count_port}/notify/1549-count"),
+                    "notifyCorrelationId": "corr-1549-count",
+                    "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                    "anyUE": true,
+                }),
+                "count",
+            ),
+        ] {
+            let resp = crate::namf_server::namf_request_handler(
+                nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
+                    .with_json_body(&serde_json::json!({ "subscription": body }))
+                    .expect("json"),
+            )
+            .await;
+            assert_eq!(resp.status, 201, "the {what} subscription is created");
+        }
+        async fn next(rx: &mut mpsc::Receiver<String>, what: &str) -> serde_json::Value {
+            let body = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("a {what} report"))
+                .expect("channel closed");
+            serde_json::from_str(&body).expect("JSON")
+        }
+
+        crate::namf_server::fire_presence_in_aoi_report(&ue_snapshot);
+        let baseline = next(&mut aoi_rx, "baseline presence").await;
+        assert_eq!(
+            baseline["reportList"][0]["areaList"][0]["presenceInfo"]["presenceState"], "IN_AREA",
+            "the UE went idle inside the subscribed area"
+        );
+
+        let fires_before = crate::namf_server::ues_in_area_fires_on_this_thread();
+        ngap.forced_amf_ue_ngap_id = Some(new_id);
+        let initial_ue = nextgcore_ngap::builder::build_initial_ue_message(
+            &nextgcore_ngap::types::InitialUeMessage {
+                ran_ue_ngap_id: 512,
+                nas_pdu: nas,
+                user_location_info: test_user_location(0x15_4902, 0x0015_4902),
+                rrc_establishment_cause: nextgcore_ngap::types::RrcEstablishmentCause::MoSignalling,
+                ue_context_request: None,
+                allowed_nssai: Vec::new(),
+            },
+        )
+        .expect("encode an InitialUEMessage");
+        let _ = ngap.handle_initial_ue_message(1, &initial_ue).await;
+        assert!(
+            ngap.ue_auth_state
+                .get(new_id)
+                .is_some_and(|s| s.registration_accept_sent),
+            "the mobility update was accepted"
+        );
+        assert_eq!(
+            crate::namf_server::ues_in_area_fires_on_this_thread() - fires_before,
+            1,
+            "the update's Accept re-counts UES_IN_AREA, once"
+        );
+
+        let v = next(&mut aoi_rx, "presence transition").await;
+        let report = &v["reportList"][0];
+        assert_eq!(report["type"], "PRESENCE_IN_AOI_REPORT", "{v}");
+        assert_eq!(report["supi"], supi.as_str());
+        assert_eq!(v["notifyCorrelationId"], "corr-1549-aoi");
+        assert_eq!(
+            report["areaList"][0]["presenceInfo"]["presenceState"], "OUT_OF_AREA",
+            "the UE left the area while idle: {report}"
+        );
+        assert_eq!(report["areaList"][0]["presenceInfo"]["praId"], "154901");
+        // Another test's any-UE fire may deliver an earlier count; wait for a 1.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let v = tokio::time::timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                next(&mut count_rx, "UES_IN_AREA"),
+            )
+            .await
+            .expect("a UES_IN_AREA_REPORT counting the UE in its new TA");
+            assert_eq!(v["notifyCorrelationId"], "corr-1549-count");
+            if v["reportList"][0]["numberOfUes"] == 1 {
+                break;
+            }
+        }
+        ngap.ue_auth_state.remove(new_id);
+        aoi_sink.stop().await.expect("sink stop");
+        count_sink.stop().await.expect("sink stop");
     }
 
     /// **#1424**: [`NgapServer::report_location_change`] measures each dimension from
