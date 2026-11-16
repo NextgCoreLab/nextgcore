@@ -16,8 +16,9 @@
 //! 5. Capability mismatch -> negotiation failure (HTTP 400,
 //!    NEGOTIATION_NOT_ALLOWED)
 
-use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+
+use nextgcore_sbi::test_support::{NfProcess, NfSpawn};
 
 use nextgcore_seppd::context::{sepp_self, SecurityCapability};
 use nextgcore_seppd::jose::{b64url_decode, b64url_encode};
@@ -51,88 +52,69 @@ fn free_port() -> u16 {
 }
 
 /// A peer SEPP running as a real child process; killed on drop.
+///
+/// #1521: spawned through the shared `NfSpawn`, which waits until the N32 port
+/// accepts and respawns on fresh ports if the child loses either probed port to
+/// another process (the #1497 race: a sibling's outbound connection can be
+/// handed a probed port before the child binds it). Both binds are fatal for
+/// seppd, so a lost one used to surface as "did not open its N32 port in time".
 struct ChildSepp {
-    child: Child,
-    n32_port: u16,
+    nf: NfProcess,
 }
 
 impl ChildSepp {
-    fn spawn(sender: &str, prins: bool) -> Self {
-        Self::spawn_inner(sender, prins, None)
+    async fn spawn(sender: &str, prins: bool) -> Self {
+        Self::spawn_inner(sender, prins, None).await
     }
 
     /// Spawn a peer SEPP that itself initiates the N32-c handshake
     /// towards `peer` ("fqdn=apiroot") at startup.
-    fn spawn_with_peer(sender: &str, prins: bool, peer: &str) -> Self {
-        Self::spawn_inner(sender, prins, Some(peer))
+    async fn spawn_with_peer(sender: &str, prins: bool, peer: &str) -> Self {
+        Self::spawn_inner(sender, prins, Some(peer)).await
     }
 
-    fn spawn_inner(sender: &str, prins: bool, peer: Option<&str>) -> Self {
-        let n32_port = free_port();
-        let sbi_port = free_port();
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_nextgcore-seppd"));
-        cmd.args([
-            "-c",
-            "/nonexistent/sepp.yaml",
-            "-e",
-            "warn",
-            "--sbi-addr",
-            "127.0.0.1",
-            "--sbi-port",
-            &sbi_port.to_string(),
-            "--n32-addr",
-            "127.0.0.1",
-            "--n32-port",
-            &n32_port.to_string(),
-            "--sender",
-            sender,
-            "--serving-plmn",
-            "999:70",
-        ]);
-        if prins {
-            cmd.arg("--prins");
-        }
-        // sepp-10: these peer SEPPs run over plaintext HTTP (no N32-c TLS), so
-        // permit the deterministic no-TLS N32-f key-derivation fallback. In
-        // production this is off and exchange-params requires the TLS exporter.
-        cmd.arg("--allow-insecure-no-tls");
-        if let Some(peer) = peer {
-            cmd.args(["--peer-sepp", peer]);
-        }
-        let child = cmd
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn nextgcore-seppd");
-        Self { child, n32_port }
+    async fn spawn_inner(sender: &str, prins: bool, peer: Option<&str>) -> Self {
+        let nf = NfSpawn::new(env!("CARGO_BIN_EXE_nextgcore-seppd"), sender)
+            .ready_when_accepting(std::net::Ipv4Addr::LOCALHOST.into())
+            .within(STARTUP_TIMEOUT)
+            .spawn_async(|cmd, n32_port, _| {
+                let sbi_port = nextgcore_sbi::test_support::spawn_port();
+                cmd.args([
+                    "-c",
+                    "/nonexistent/sepp.yaml",
+                    "-e",
+                    "warn",
+                    "--sbi-addr",
+                    "127.0.0.1",
+                    "--sbi-port",
+                    &sbi_port.to_string(),
+                    "--n32-addr",
+                    "127.0.0.1",
+                    "--n32-port",
+                    &n32_port.to_string(),
+                    "--sender",
+                    sender,
+                    "--serving-plmn",
+                    "999:70",
+                ]);
+                if prins {
+                    cmd.arg("--prins");
+                }
+                // sepp-10: these peer SEPPs run over plaintext HTTP (no N32-c TLS),
+                // so permit the deterministic no-TLS N32-f key-derivation fallback.
+                // In production this is off and exchange-params requires the TLS
+                // exporter.
+                cmd.arg("--allow-insecure-no-tls");
+                if let Some(peer) = peer {
+                    cmd.args(["--peer-sepp", peer]);
+                }
+            })
+            .await;
+        Self { nf }
     }
 
     fn api_root(&self) -> String {
-        format!("http://127.0.0.1:{}", self.n32_port)
-    }
-
-    async fn wait_ready(&self) {
-        let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
-        loop {
-            if tokio::net::TcpStream::connect(("127.0.0.1", self.n32_port))
-                .await
-                .is_ok()
-            {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "peer SEPP did not open its N32 port in time"
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
-}
-
-impl Drop for ChildSepp {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        format!("http://127.0.0.1:{}", self.nf.port())
     }
 }
 
@@ -184,17 +166,28 @@ async fn two_sepp_n32_handshake_and_forwarding() {
         // SEPP-A: in-process listener (receives n32f-error reports)
         // ------------------------------------------------------------------
         configure_local_sepp(false, true); // PRINS-only for phase 1
-        let a_port = free_port();
-        let a_server = start_n32_listener("127.0.0.1", a_port, None)
-            .await
-            .expect("start SEPP-A N32 listener");
+                                           // #1521: a probed port can be taken by another process before the bind
+                                           // (#1497); in-process, a lost bind is an Err, so draw another port.
+        let (a_port, a_server) = {
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                let port = free_port();
+                match start_n32_listener("127.0.0.1", port, None).await {
+                    Ok(server) => break (port, server),
+                    Err(e) if attempt < 5 => {
+                        eprintln!("SEPP-A N32 listener on {port} not started ({e}); another port");
+                    }
+                    Err(e) => panic!("start SEPP-A N32 listener: {e}"),
+                }
+            }
+        };
         let a_root = format!("http://127.0.0.1:{a_port}");
 
         // ------------------------------------------------------------------
         // Phase 1: PRINS handshake against B1 (capability + exchange-params)
         // ------------------------------------------------------------------
-        let b1 = ChildSepp::spawn("sepp-b1.example.com", true);
-        b1.wait_ready().await;
+        let b1 = ChildSepp::spawn("sepp-b1.example.com", true).await;
 
         let outcome =
             initiate_n32c_handshake("sepp-b1.example.com", &b1.api_root(), Some(&a_root), None)
@@ -313,8 +306,7 @@ async fn two_sepp_n32_handshake_and_forwarding() {
         // Phase 4: TLS preferred when both sides support it + TLS forward
         // ------------------------------------------------------------------
         configure_local_sepp(true, true); // we offer TLS + PRINS
-        let b2 = ChildSepp::spawn("sepp-b2.example.com", false); // TLS only
-        b2.wait_ready().await;
+        let b2 = ChildSepp::spawn("sepp-b2.example.com", false).await; // TLS only
 
         let outcome2 =
             initiate_n32c_handshake("sepp-b2.example.com", &b2.api_root(), Some(&a_root), None)
@@ -388,8 +380,8 @@ async fn two_sepp_n32_handshake_and_forwarding() {
             "sepp-b3.example.com",
             true,
             &format!("sepp-a.example.com={a_root}"),
-        );
-        b3.wait_ready().await;
+        )
+        .await;
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         let node_b3 = loop {

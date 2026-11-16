@@ -4,7 +4,6 @@
 //! and exports `nextg_demo_enabled`; the demo-off shapes leave pcfd unchanged.
 
 use std::io::Read;
-use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -16,13 +15,7 @@ impl Drop for Killed {
     }
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+use nextgcore_sbi::test_support::{free_port, NfProcess, NfSpawn};
 
 #[allow(dead_code)]
 const LOOP_BLOCK: &str = "  congestion_loop:\n    cells:\n      - {mcc: '999', mnc: '70', nr_cell_id: '000000010'}\n    best_effort_supis: [imsi-999700000000002]\n";
@@ -98,18 +91,37 @@ fn scrape(port: u16, within: Duration) -> Option<String> {
     None
 }
 
+/// Start pcfd with this `demo:` shape and wait until its metrics endpoint is
+/// up. Returns the process and its metrics port.
+///
+/// #1521: through the shared `NfSpawn`, which respawns on fresh ports when pcfd
+/// loses a probed one to another process (the #1497 race). pcfd's metrics bind
+/// is not fatal, so a lost one used to surface as "/metrics" timing out. The
+/// start-up-failure tests use `run_to_exit` directly: pcfd validates its
+/// `demo:` and `pcf` blocks before it binds anything, so they lose no bind.
 #[allow(dead_code)]
-fn stderr_of(child: &mut Killed) -> String {
-    let _ = child.0.kill();
-    let mut err = String::new();
-    child
-        .0
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut err)
-        .unwrap();
-    err
+fn running(tag: &str, pcf_extra: &str, demo: &str) -> (NfProcess, u16) {
+    let mut metrics_port = 0;
+    let nf = NfSpawn::new(env!("CARGO_BIN_EXE_nextgcore-pcfd"), &format!("pcfd-demo-{tag}"))
+        .ready_when_logged("SBI HTTP/2 server listening on")
+        .ready_when_logged("PCF metrics endpoint on http://")
+        .spawn(|cmd, sbi_port, dir| {
+            metrics_port = nextgcore_sbi::test_support::spawn_port();
+            let config = dir.join("pcf.yaml");
+            std::fs::write(
+                &config,
+                format!(
+                    "pcf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n        port: {sbi_port}\n{pcf_extra}{demo}"
+                ),
+            )
+            .unwrap();
+            cmd.arg("-c")
+                .arg(&config)
+                .env("NEXTGCORE_SBI_PROFILE", "dev")
+                .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
+                .env("PCF_METRICS_PORT", metrics_port.to_string());
+        });
+    (nf, metrics_port)
 }
 
 #[test]
@@ -175,15 +187,13 @@ fn an_active_demo_without_its_block_fails_startup() {
 #[test]
 fn each_mode_logs_the_banner_and_exports_the_metric() {
     for mode in ["statistics", "prediction", "no-loop"] {
-        let cfg = config(
+        let (nf, port) = running(
             &format!("on-{mode}"),
             LOOP_BLOCK,
             &format!(
                 "demo:\n  enabled: true\n  d441a-congestion-loop:\n    enabled: true\n    mode: {mode}\n"
             ),
         );
-        let port = free_port();
-        let mut child = spawn(&cfg, port);
         let body = scrape(port, Duration::from_secs(20)).expect("/metrics");
         assert!(
             body.contains(&format!(
@@ -191,7 +201,7 @@ fn each_mode_logs_the_banner_and_exports_the_metric() {
             )),
             "{body}"
         );
-        let err = stderr_of(&mut child);
+        let err = nf.log();
         assert!(
             err.contains(&format!("DEMO MODE ACTIVE: d441a-congestion-loop={mode}")),
             "{err}"
@@ -219,12 +229,10 @@ fn the_demo_off_shapes_run_no_controller() {
             "demo:\n  enabled: false\n  d441a-congestion-loop:\n    enabled: true\n    mode: statistics\n",
         ),
     ] {
-        let cfg = config(tag, LOOP_BLOCK, demo);
-        let port = free_port();
-        let mut child = spawn(&cfg, port);
+        let (nf, port) = running(tag, LOOP_BLOCK, demo);
         let body = scrape(port, Duration::from_secs(20)).expect("/metrics");
         assert!(!body.contains("nextg_demo_enabled"), "{tag}: {body}");
-        let err = stderr_of(&mut child);
+        let err = nf.log();
         assert!(!err.contains("DEMO MODE ACTIVE"), "{tag}: {err}");
         assert!(!err.contains("[demo:"), "{tag}: {err}");
         assert!(!err.contains("congestion-loop"), "{tag}: {err}");

@@ -27,23 +27,16 @@
 //!   `a_slow_store_read_does_not_stall_the_runtime` waits out the read for `/metrics`.
 
 use std::io::Read;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use nextgcore_dbi::mongodb::bson::doc;
 use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
+use nextgcore_sbi::test_support::{NfProcess, NfSpawn};
 
 const DOCKER_REQUIRED_ENV: &str = "NEXTGCORE_DOCKER_REQUIRED";
 /// The docker label carrying the owning test process id.
 const PID_LABEL: &str = "nextgcore-test-pcfd-1457-pid";
-
-struct Killed(Child);
-impl Drop for Killed {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
 
 /// A per-test scratch directory, removed on drop.
 struct Scratch(std::path::PathBuf);
@@ -52,6 +45,13 @@ impl Scratch {
         let dir = std::env::temp_dir().join(format!("pcfd-1457-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         Scratch(dir)
+    }
+
+    fn name(&self) -> String {
+        self.0
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
     }
 }
 impl Drop for Scratch {
@@ -202,40 +202,61 @@ fn subscriber(imsi: &str) -> nextgcore_dbi::mongodb::bson::Document {
 }
 
 struct Pcfd {
-    _child: Killed,
+    _nf: NfProcess,
     sbi: SbiClient,
     metrics_port: u16,
 }
 
 /// Start pcfd on `db_uri` (one runtime worker when `one_worker`, so a blocked
-/// worker is the whole runtime) and wait for its SBI listener.
+/// worker is the whole runtime) and wait for its SBI and metrics listeners.
+///
+/// #1521: through the shared `NfSpawn`, which waits for both listeners and
+/// respawns on fresh ports when pcfd loses a probed one to another process (the
+/// #1497 race). The metrics bind is not fatal for pcfd, so without the wait a
+/// lost one surfaced as a scrape timing out.
 async fn start_pcfd(dir: &Scratch, db_uri: &str, one_worker: bool) -> Pcfd {
-    let sbi_port = nextgcore_sbi::test_support::free_port();
-    let metrics_port = nextgcore_sbi::test_support::free_port();
-    let mut cmd = pcfd_command(dir, db_uri, sbi_port, metrics_port);
-    if one_worker {
-        cmd.env("TOKIO_WORKER_THREADS", "1");
-    }
-    let child = Killed(cmd.stderr(Stdio::null()).spawn().expect("spawn pcfd"));
-    let pcfd = Pcfd {
-        _child: child,
-        sbi: SbiClient::new(SbiClientConfig::new("127.0.0.1", sbi_port)),
+    let mut metrics_port = 0;
+    let nf = NfSpawn::new(
+        env!("CARGO_BIN_EXE_nextgcore-pcfd"),
+        &format!("pcfd-1457-{}", dir.name()),
+    )
+    .ready_when_logged("SBI HTTP/2 server listening on")
+    .ready_when_logged("PCF metrics endpoint on http://")
+    .within(Duration::from_secs(60))
+    .spawn_async(|cmd, sbi_port, scratch| {
+        metrics_port = nextgcore_sbi::test_support::spawn_port();
+        pcfd_args(cmd, scratch, db_uri, sbi_port, metrics_port);
+        if one_worker {
+            cmd.env("TOKIO_WORKER_THREADS", "1");
+        }
+    })
+    .await;
+    Pcfd {
+        sbi: SbiClient::new(SbiClientConfig::new("127.0.0.1", nf.port())),
         metrics_port,
-    };
-    // Waits on the listener, not a timer: a refused connection is pcfd still starting.
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while tokio::net::TcpStream::connect(("127.0.0.1", sbi_port))
-        .await
-        .is_err()
-    {
-        assert!(Instant::now() < deadline, "pcfd never served the SBI");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        _nf: nf,
     }
-    pcfd
 }
 
+/// The two startup tests below spawn pcfd directly, without [`NfSpawn`]: their
+/// store is unreachable, and pcfd opens its store (`app::run`) BEFORE it binds
+/// any listener, so neither probed port is ever bound and there is no bind to
+/// lose.
 fn pcfd_command(dir: &Scratch, db_uri: &str, sbi_port: u16, metrics_port: u16) -> Command {
-    let config = dir.0.join("pcf.yaml");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nextgcore-pcfd"));
+    pcfd_args(&mut cmd, &dir.0, db_uri, sbi_port, metrics_port);
+    cmd.stdout(Stdio::null());
+    cmd
+}
+
+fn pcfd_args(
+    cmd: &mut Command,
+    dir: &std::path::Path,
+    db_uri: &str,
+    sbi_port: u16,
+    metrics_port: u16,
+) {
+    let config = dir.join("pcf.yaml");
     std::fs::write(
         &config,
         format!(
@@ -244,14 +265,11 @@ fn pcfd_command(dir: &Scratch, db_uri: &str, sbi_port: u16, metrics_port: u16) -
         ),
     )
     .unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nextgcore-pcfd"));
     cmd.arg("-c")
         .arg(&config)
         .env("NEXTGCORE_SBI_PROFILE", "dev")
         .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
-        .env("PCF_METRICS_PORT", metrics_port.to_string())
-        .stdout(Stdio::null());
-    cmd
+        .env("PCF_METRICS_PORT", metrics_port.to_string());
 }
 
 fn create_body(supi: &str, psi: u8, ipv4: &str) -> serde_json::Value {
@@ -411,7 +429,7 @@ async fn a_slow_store_read_does_not_stall_the_runtime() {
 /// lands well before a k8s liveness probe (about 75 s) would kill the pod.
 #[test]
 fn pcfd_refuses_to_start_when_its_store_is_unreachable() {
-    let down = nextgcore_sbi::test_support::free_port();
+    let down = nextgcore_sbi::test_support::refused_port();
     let dir = Scratch::new("down-startup");
     let mut child = pcfd_command(
         &dir,
@@ -456,7 +474,7 @@ fn pcfd_refuses_to_start_when_its_store_is_unreachable() {
 /// cleanly, rather than at the end of a supervisor's grace period.
 #[test]
 fn a_sigterm_during_the_store_retry_exits_promptly() {
-    let down = nextgcore_sbi::test_support::free_port();
+    let down = nextgcore_sbi::test_support::refused_port();
     let dir = Scratch::new("sigterm");
     let mut child = pcfd_command(
         &dir,

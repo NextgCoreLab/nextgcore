@@ -12,7 +12,6 @@
 //! REVERT-VERIFIED: with `session_ambr_cap::set(..)` deleted from `run()`, the
 //! `none` run notifies 5/7.
 
-use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,14 +20,7 @@ use nextgcore_pcfd::context::{
 };
 use nextgcore_pcfd::nudr_handler::SessionData;
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
-
-struct Killed(Child);
-impl Drop for Killed {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
+use nextgcore_sbi::test_support::NfSpawn;
 
 type Seen = Arc<Mutex<Vec<(String, serde_json::Value)>>>;
 
@@ -44,32 +36,32 @@ async fn restored_ambr(
     seen.lock().unwrap().clear();
     let state = dir.join(format!("pcf-state-{tag}.json"));
     std::fs::copy(snapshot, &state).expect("copy the snapshot");
-    let config = dir.join(format!("pcf-{tag}.yaml"));
-    std::fs::write(
-        &config,
-        format!(
-            "pcf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n        port: {}\n{policy}",
-            nextgcore_sbi::test_support::free_port()
-        ),
+    // #1521: wait for the SBI listener, and respawn on fresh ports if pcfd loses
+    // a probed one to another process (the #1497 race).
+    let _pcfd = NfSpawn::new(
+        env!("CARGO_BIN_EXE_nextgcore-pcfd"),
+        &format!("pcfd-1402-restore-{tag}"),
     )
-    .unwrap();
-    let _pcfd = Killed(
-        Command::new(env!("CARGO_BIN_EXE_nextgcore-pcfd"))
-            .arg("-c")
+    .ready_when_logged("SBI HTTP/2 server listening on")
+    .spawn_async(|cmd, sbi_port, scratch| {
+        let config = scratch.join("pcf.yaml");
+        std::fs::write(
+            &config,
+            format!(
+                "pcf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n        port: {sbi_port}\n{policy}"
+            ),
+        )
+        .unwrap();
+        cmd.arg("-c")
             .arg(&config)
             .arg("--state-file")
             .arg(&state)
             .env("NEXTGCORE_SBI_PROFILE", "dev")
             .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
-            .env(
-                "PCF_METRICS_PORT",
-                nextgcore_sbi::test_support::free_port().to_string(),
-            )
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn pcfd"),
-    );
+            // An ephemeral metrics port: /metrics is not under test here.
+            .env("PCF_METRICS_PORT", "0");
+    })
+    .await;
     let deadline = Instant::now() + Duration::from_secs(30);
     let notify = loop {
         if let Some(n) = seen

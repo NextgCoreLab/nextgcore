@@ -1,42 +1,43 @@
 //! #1311: nrfd binds the SBI address of its YAML config (`nrf.sbi.server`) when
 //! the command line names none, and `--sbi-addr` overrides it.
 
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
+use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
-struct Killed(Child);
-impl Drop for Killed {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
+use nextgcore_sbi::test_support::{NfProcess, NfSpawn};
 
-fn free_port(ip: &str) -> u16 {
-    TcpListener::bind((ip, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-fn start(config: &std::path::Path, extra: &[&str]) -> Killed {
-    let dir = config.parent().unwrap();
-    Killed(
-        Command::new(env!("CARGO_BIN_EXE_nextgcore-nrfd"))
-            .arg("-c")
-            .arg(config)
-            .args(extra)
+/// Spawn nrfd and wait until `ip:port` accepts, `port` being the one this spawn
+/// hands it. `config(port)` writes its YAML and `extra(port)` gives its extra
+/// arguments, once per spawn.
+///
+/// #1521: through the shared `NfSpawn`, which respawns on a fresh port when
+/// nrfd loses a probed one to another process (the #1497 race: a sibling's
+/// outbound connection can be handed it as a source port before nrfd binds).
+fn start(
+    ip: &str,
+    config: impl Fn(u16) -> std::path::PathBuf,
+    extra: impl Fn(u16) -> Vec<String>,
+) -> NfProcess {
+    NfSpawn::new(
+        env!("CARGO_BIN_EXE_nextgcore-nrfd"),
+        &format!("nrfd-listen-{ip}"),
+    )
+    .ready_when_accepting(ip.parse().unwrap())
+    .within(Duration::from_secs(40))
+    .spawn(|cmd, port, _| {
+        let config = config(port);
+        let dir = config.parent().unwrap();
+        cmd.arg("-c")
+            .arg(&config)
+            .args(extra(port))
             .arg("--signing-key-file")
             .arg(dir.join("key.pem"))
             .env("NEXTGCORE_SBI_PROFILE", "dev")
             .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn nrfd"),
-    )
+            // #1575 review: not the fixed 9090 default, which anything on the host
+            // may hold; the metrics endpoint is not under test here.
+            .env("NRF_METRICS_PORT", "0");
+    })
 }
 
 fn listening(addr: SocketAddr, within: Duration) -> bool {
@@ -56,15 +57,24 @@ fn nrfd_binds_its_yaml_sbi_address_unless_the_command_line_overrides() {
     std::fs::create_dir_all(&dir).unwrap();
     // 127.0.0.2: on loopback, but not the 127.0.0.1 default, so only the YAML
     // can have put the listener there.
-    let port = free_port("127.0.0.2");
     let config = dir.join("nrf.yaml");
-    std::fs::write(
-        &config,
-        format!("nrf:\n  sbi:\n    server:\n      - address: 127.0.0.2\n        port: {port}\n"),
-    )
-    .unwrap();
+    let yaml_nf = start(
+        "127.0.0.2",
+        |port| {
+            std::fs::write(
+                &config,
+                format!(
+                    "nrf:\n  sbi:\n    server:\n      - address: 127.0.0.2\n        port: {port}\n"
+                ),
+            )
+            .unwrap();
+            config.clone()
+        },
+        |_| Vec::new(),
+    );
+    let port = yaml_nf.port();
     {
-        let _nrfd = start(&config, &[]);
+        let _nrfd = yaml_nf;
         let yaml: SocketAddr = format!("127.0.0.2:{port}").parse().unwrap();
         assert!(
             listening(yaml, Duration::from_secs(20)),
@@ -76,16 +86,20 @@ fn nrfd_binds_its_yaml_sbi_address_unless_the_command_line_overrides() {
             "not the default"
         );
     }
-    let cli_port = free_port("127.0.0.1");
-    let _nrfd = start(
-        &config,
-        &[
-            "--sbi-addr",
-            "127.0.0.1",
-            "--sbi-port",
-            &cli_port.to_string(),
-        ],
+    let cli_nf = start(
+        "127.0.0.1",
+        |_| config.clone(),
+        |port| {
+            vec![
+                "--sbi-addr".to_string(),
+                "127.0.0.1".to_string(),
+                "--sbi-port".to_string(),
+                port.to_string(),
+            ]
+        },
     );
+    let cli_port = cli_nf.port();
+    let _nrfd = cli_nf;
     let cli: SocketAddr = format!("127.0.0.1:{cli_port}").parse().unwrap();
     assert!(
         listening(cli, Duration::from_secs(20)),
