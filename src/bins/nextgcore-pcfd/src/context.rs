@@ -600,6 +600,12 @@ pub struct PcfSess {
     /// writes it. `#[serde(default)]` for older snapshots.
     #[serde(default)]
     pub demo_ambr_cap: Option<DemoAmbrCap>,
+    /// #1541: the QoS constraints of the VPLMN in home-routed roaming
+    /// (`vplmnQos`, TS 29.512 VPLMN-QoS-Control), last reported by the SMF;
+    /// `None` when none apply. Only held when the feature was negotiated.
+    /// `#[serde(default)]` for older snapshots.
+    #[serde(default)]
+    pub vplmn_qos: Option<crate::vplmn_qos::VplmnQosBound>,
 }
 
 /// The cap a demo installed on a session ([`PcfSess::demo_ambr_cap`]).
@@ -669,6 +675,7 @@ impl PcfSess {
             origination_ms: None,
             authorised_session_data: None,
             demo_ambr_cap: None,
+            vplmn_qos: None,
         }
     }
 
