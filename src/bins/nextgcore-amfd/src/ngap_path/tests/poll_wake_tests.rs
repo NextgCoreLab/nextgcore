@@ -9,20 +9,25 @@
 //! The tests drive `poll()`'s receive step and its SBI-outcome step, not the whole
 //! `poll()`: the rest of it drains process-global queues (5GS→EPS answers, network
 //! deregistrations, ...) that sibling tests fill and wait on.
+//!
+//! #1566: the receive step is bounded by [`WAKE_WAIT`], not [`SCTP_RECV_TIMEOUT`].
+//! What #981 promises is that a report ends the wait; how fast the stand-in SMF
+//! answers is the machine's business. With the 100 ms bound, a loaded suite that
+//! took longer than that to serve the two PREPARINGs over HTTP/2 ended a turn in
+//! `Timeout` although the wake worked. With [`WAKE_WAIT`], `Timeout` means no
+//! report came for 5 s, which without the wake is every turn and with it none.
 
 use super::*;
 
-/// One `poll()` turn as far as off-task SBI work goes: apply what is in, then wait
-/// for N2 or an SBI report. Returns how the receive step ended.
-async fn sbi_turn(server: &mut NgapServer) -> nextgcore_sctp::RecvOutcome {
-    server.process_sbi_outcomes().await;
-    server.receive_n2_or_sbi_report().await.expect("receive")
-}
+/// How long a test turn's receive waits for N2 or an SBI report (#1566): far past
+/// any answer time of a loopback stand-in, however loaded the machine.
+const WAKE_WAIT: Duration = Duration::from_secs(5);
 
 /// A keyed exchange that finishes while `poll()` waits on a quiet socket ends the
 /// wait (`Woken`) instead of the full receive timeout.
 ///
-/// REVERT-VERIFIED: without the wake, the receive ends in `Timeout` after 100 ms.
+/// REVERT-VERIFIED: without the wake, the receive ends in `Timeout` after
+/// [`WAKE_WAIT`].
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_finished_exchange_ends_the_polls_receive_wait() {
     let mut server = test_ngap_server().await;
@@ -32,11 +37,14 @@ async fn a_finished_exchange_ends_the_polls_receive_wait() {
             tokio::time::sleep(Duration::from_millis(10)).await;
             None
         });
-    let woke = server.receive_n2_or_sbi_report().await.expect("receive");
+    let woke = server
+        .receive_n2_or_sbi_report_within(WAKE_WAIT)
+        .await
+        .expect("receive");
     assert_eq!(
         woke,
         nextgcore_sctp::RecvOutcome::Woken,
-        "the finished exchange must end the receive wait, not the {SCTP_RECV_TIMEOUT:?} timeout"
+        "the finished exchange must end the receive wait, not the {WAKE_WAIT:?} timeout"
     );
     assert!(
         !server.sbi_offload.key_busy((7_981_001, 5)),
@@ -50,7 +58,7 @@ async fn a_finished_exchange_ends_the_polls_receive_wait() {
 /// timeout on the way.
 ///
 /// REVERT-VERIFIED: without the wake, the first turn after the HANDOVER REQUIRED
-/// waits the full 100 ms (`Timeout`) before the answer is applied.
+/// waits the full [`WAKE_WAIT`] (`Timeout`) before the answer is applied.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_handover_request_follows_the_smf_answers_without_a_poll_timeout() {
     let (_smf, smf_port, _seen) = handover_smf().await;
@@ -74,18 +82,24 @@ async fn a_handover_request_follows_the_smf_answers_without_a_poll_timeout() {
         .handle_handover_required(source, &handover_required_pdu(ue, ran, gnb_t, &[1, 2]))
         .await
         .expect("handled");
+    // Each turn as `poll()` takes it: apply what is in, then wait. The HANDOVER
+    // REQUEST goes out from an apply; only a wait before it may not time out.
     let mut sent = Vec::new();
     for _ in 0..50 {
-        let woke = sbi_turn(&mut server).await;
+        server.process_sbi_outcomes().await;
         sent.extend(take_sent_ngap(&mut server));
         if !sent.is_empty() {
             break;
         }
+        let woke = server
+            .receive_n2_or_sbi_report_within(WAKE_WAIT)
+            .await
+            .expect("receive");
         assert_ne!(
             woke,
             nextgcore_sctp::RecvOutcome::Timeout,
-            "a poll waited out its {SCTP_RECV_TIMEOUT:?} receive timeout while the SMF \
-             answers were in"
+            "a poll waited out its {WAKE_WAIT:?} receive timeout: the SMF answers did \
+             not end the wait"
         );
     }
     assert_eq!(sent.len(), 1, "{sent:?}");
