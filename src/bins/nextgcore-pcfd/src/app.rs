@@ -10098,12 +10098,13 @@ mod tests {
         assert_eq!(status, 400, "a malformed sliceInfo");
     }
 
-    /// #1583: an AF binding by a unique private IPv4 for which the SMF reported no
-    /// domain still binds when the AF supplies an `ipDomain` (an SMF that does not
-    /// send it), and a unique address with no other attribute binds as before.
+    /// #1583: a unique address with no other attribute binds as before. With an
+    /// `ipDomain` no session reported, the AF binds to the session for which the SMF
+    /// reported no domain (an SMF that does not send it), not to one in another
+    /// domain sharing the address.
     ///
     /// REVERT-VERIFIED: without the no-domain fallback in `binding_candidates`, the
-    /// ipDomain request answers 500.
+    /// dom-x request matches both sessions and answers 500.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn af_binding_keeps_working_without_a_reported_domain_1583() {
@@ -10121,6 +10122,14 @@ mod tests {
         .await;
         let (status, bound, _) = af_bind_1583(ip, serde_json::json!({})).await;
         assert_eq!((status, bound), (201, Some(only.clone())));
+        // A second session on the address, in a reported domain.
+        sm_create_1527(
+            "imsi-001010000025832",
+            1,
+            9,
+            serde_json::json!({ "ipv4Address": ip, "ipDomain": "dom-a" }),
+        )
+        .await;
         let (status, bound, _) = af_bind_1583(ip, serde_json::json!({ "ipDomain": "dom-x" })).await;
         assert_eq!((status, bound), (201, Some(only)));
     }
