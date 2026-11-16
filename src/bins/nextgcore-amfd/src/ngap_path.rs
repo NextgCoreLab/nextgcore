@@ -36429,15 +36429,43 @@ mod tests {
         sink.stop().await.expect("sink stop");
     }
 
-    /// **#1420**, TS 29.518 §6.2 (`29518-k00.txt:23968-23978`): an Xn handover, whose
-    /// only N2 trace is the PATH SWITCH REQUEST, out of a subscribed Area of
-    /// Interest reports the transition: a `PRESENCE_IN_AOI_REPORT` with `OUT_OF_AREA`.
-    /// It also re-counts `UES_IN_AREA_REPORT`, here 1 UE in the target's TA. Driven
-    /// through `handle_path_switch_request` with a real APER PDU and observed at
-    /// real subscribers, as `a_handover_out_of_the_subscribed_area_reports_the_transition`
-    /// does for the N2 handover. The IN_AREA baseline is consumed first, so what
-    /// follows is the transition.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// A subscriber over real HTTP/2 forwarding every notify body (#1420).
+    async fn notify_sink() -> (nextgcore_sbi::SbiServer, u16, mpsc::Receiver<String>) {
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let (tx, rx) = mpsc::channel::<String>(64);
+        let sink = nextgcore_sbi::SbiServer::on_listener(
+            nextgcore_sbi::SbiServerConfig::new(format!("127.0.0.1:{port}").parse().expect("addr")),
+            listener,
+        );
+        sink.start(move |req: nextgcore_sbi::SbiRequest| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(req.http.content.clone().unwrap_or_default()).await;
+                nextgcore_sbi::SbiResponse::no_content()
+            }
+        })
+        .await
+        .expect("sink start");
+        (sink, port, rx)
+    }
+
+    /// **#1420**, TS 29.518 §6.2 (`29518-k00.txt:23968-23978`): an Xn handover out of
+    /// a subscribed Area of Interest reports the transition. Its only N2 trace is
+    /// the PATH SWITCH REQUEST. The checks:
+    /// - A `PRESENCE_IN_AOI_REPORT` with `OUT_OF_AREA` arrives, after the IN_AREA
+    ///   baseline is consumed.
+    /// - `UES_IN_AREA_REPORT` is re-counted: 1 UE in the target's TA.
+    ///
+    /// The test drives `handle_path_switch_request` with a real APER PDU, observed
+    /// at real subscribers, one sink per subscription.
+    ///
+    /// The count report is any-UE, so another test's fire can deliver one too, and
+    /// it would count this UE once the path switch has moved it. Attribution is
+    /// therefore by `namf_server::ues_in_area_fires_on_this_thread`: on this
+    /// current-thread runtime, the fire is counted only if this handler call made
+    /// it.
+    #[tokio::test]
     async fn a_path_switch_out_of_the_subscribed_area_reports_the_transition_1420() {
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
@@ -36459,23 +36487,9 @@ mod tests {
             guard.amf_ue_publish(&ue_snapshot, 76, 1);
         }
 
-        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
-        let port = addr.port();
-        let (tx, mut rx) = mpsc::channel::<String>(64);
-        let sink = nextgcore_sbi::SbiServer::on_listener(
-            nextgcore_sbi::SbiServerConfig::new(format!("127.0.0.1:{port}").parse().expect("addr")),
-            listener,
-        );
-        sink.start(move |req: nextgcore_sbi::SbiRequest| {
-            let tx = tx.clone();
-            async move {
-                let _ = tx.send(req.http.content.clone().unwrap_or_default()).await;
-                nextgcore_sbi::SbiResponse::no_content()
-            }
-        })
-        .await
-        .expect("sink start");
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (aoi_sink, aoi_port, mut aoi_rx) = notify_sink().await;
+        let (count_sink, count_port, mut count_rx) = notify_sink().await;
         let tai =
             |tac: &str| serde_json::json!({ "plmnId": {"mcc": "001", "mnc": "01"}, "tac": tac });
         for (body, what) in [
@@ -36488,7 +36502,7 @@ mod tests {
                             "trackingAreaList": [tai("001420")],
                         }}],
                     }],
-                    "eventNotifyUri": format!("http://127.0.0.1:{port}/notify/1420-aoi"),
+                    "eventNotifyUri": format!("http://127.0.0.1:{aoi_port}/notify/1420-aoi"),
                     "notifyCorrelationId": "corr-1420-aoi",
                     "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
                     "supi": supi,
@@ -36504,7 +36518,7 @@ mod tests {
                             "trackingAreaList": [tai("14200A")],
                         }}],
                     }],
-                    "eventNotifyUri": format!("http://127.0.0.1:{port}/notify/1420-count"),
+                    "eventNotifyUri": format!("http://127.0.0.1:{count_port}/notify/1420-count"),
                     "notifyCorrelationId": "corr-1420-count",
                     "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
                     "anyUE": true,
@@ -36520,24 +36534,16 @@ mod tests {
             .await;
             assert_eq!(resp.status, 201, "the {what} subscription is created");
         }
-
-        // A report for `corr`, skipping the others (other tests' any-UE fires).
-        async fn next_for(rx: &mut mpsc::Receiver<String>, corr: &str) -> serde_json::Value {
-            let deadline = Instant::now() + Duration::from_secs(3);
-            loop {
-                let left = deadline.saturating_duration_since(Instant::now());
-                let body = tokio::time::timeout(left, rx.recv())
-                    .await
-                    .unwrap_or_else(|_| panic!("a report for {corr}"))
-                    .expect("channel closed");
-                let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
-                if v["notifyCorrelationId"].as_str() == Some(corr) {
-                    return v;
-                }
-            }
+        async fn next(rx: &mut mpsc::Receiver<String>, what: &str) -> serde_json::Value {
+            let body = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("a {what} report"))
+                .expect("channel closed");
+            serde_json::from_str(&body).expect("JSON")
         }
+
         crate::namf_server::fire_presence_in_aoi_report(&ue_snapshot);
-        let baseline = next_for(&mut rx, "corr-1420-aoi").await;
+        let baseline = next(&mut aoi_rx, "baseline presence").await;
         assert_eq!(
             baseline["reportList"][0]["areaList"][0]["presenceInfo"]["presenceState"], "IN_AREA",
             "the UE starts inside the subscribed area"
@@ -36569,37 +36575,47 @@ mod tests {
         ngap.sm_context_smfs
             .insert((amf_ue_ngap_id, 1), ("127.0.0.1".to_string(), smf_port));
         ngap.sent_ngap = Some(Vec::new());
+        let fires_before = crate::namf_server::ues_in_area_fires_on_this_thread();
         let _ = ngap.handle_path_switch_request(2, &pdu).await;
         drive_sbi(&mut ngap).await;
         let sent = take_sent_ngap(&mut ngap);
         assert_eq!(sent.len(), 1, "{sent:?}");
         assert_eq!(sent[0].1[0], 0x20, "a PATH SWITCH REQUEST ACKNOWLEDGE");
+        assert_eq!(
+            crate::namf_server::ues_in_area_fires_on_this_thread() - fires_before,
+            1,
+            "the path switch itself re-counts UES_IN_AREA, once"
+        );
 
-        let v = next_for(&mut rx, "corr-1420-aoi").await;
+        let v = next(&mut aoi_rx, "presence transition").await;
         let report = &v["reportList"][0];
         assert_eq!(report["type"], "PRESENCE_IN_AOI_REPORT", "{v}");
         assert_eq!(report["supi"], supi);
+        assert_eq!(v["notifyCorrelationId"], "corr-1420-aoi");
         assert_eq!(
             report["areaList"][0]["presenceInfo"]["presenceState"], "OUT_OF_AREA",
             "the Xn handover left the area: {report}"
         );
         assert_eq!(report["areaList"][0]["presenceInfo"]["praId"], "142001");
-        // The count names this UE's new TA. Another test's any-UE fire can deliver
-        // too, so wait for the count of 1 the path switch produces.
+        // The delivered count names this UE in its new TA. Another test's any-UE
+        // fire may deliver an earlier report, with count 0 or 1, so wait for a 1.
+        // The attribution above is what makes it this handler's.
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let v = tokio::time::timeout(
                 deadline.saturating_duration_since(Instant::now()),
-                next_for(&mut rx, "corr-1420-count"),
+                next(&mut count_rx, "UES_IN_AREA"),
             )
             .await
             .expect("a UES_IN_AREA_REPORT counting the UE in the target's TA");
+            assert_eq!(v["notifyCorrelationId"], "corr-1420-count");
             if v["reportList"][0]["numberOfUes"] == 1 {
                 break;
             }
         }
         ngap.ue_auth_state.remove(amf_ue_ngap_id);
-        sink.stop().await.expect("sink stop");
+        aoi_sink.stop().await.expect("sink stop");
+        count_sink.stop().await.expect("sink stop");
     }
 
     /// **#1424**, TS 29.518 Table 6.2.6.2.3-1 (`29518-k00.txt:21398-21404`): the
