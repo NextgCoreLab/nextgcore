@@ -600,6 +600,112 @@ async fn a_lost_amf_subscription_is_renewed_and_then_replaced() {
     nrf.stop().await.expect("stop");
 }
 
+/// Holds the process-global state [`amfd_discovers_this_nwdaf_and_gets_a_ue_mobility_prediction`]
+/// changes, and puts it back on drop (#1508): `NWDAF_SBI_ADDR`/`NWDAF_SBI_PORT`
+/// (amfd's fallback NWDAF), and the global SBI context's NRF URI and discovery
+/// cache. Serialised on amfd's `sbi_path::nf_cache_test_lock`, the one lock
+/// declared beside the code that empties that cache; every test that empties it
+/// or relies on its entries holds it. The cache is emptied on entry, so amfd's
+/// lookup goes to the stand-in NRF, and on exit, so the NWDAF this test cached is
+/// gone.
+struct SbiGlobalsGuard {
+    env: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    nrf_uri: Option<String>,
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl SbiGlobalsGuard {
+    const ENV: [&'static str; 2] = ["NWDAF_SBI_ADDR", "NWDAF_SBI_PORT"];
+
+    async fn acquire() -> Self {
+        let lock = nextgcore_amfd::sbi_path::nf_cache_test_lock().lock().await;
+        let env = Self::ENV
+            .iter()
+            .map(|k| (*k, std::env::var_os(k)))
+            .collect();
+        for k in Self::ENV {
+            std::env::remove_var(k);
+        }
+        let sbi = nextgcore_sbi::context::global_context();
+        let nrf_uri = sbi.get_nrf_uri().await;
+        sbi.clear_nf_instances().await;
+        Self {
+            env,
+            nrf_uri,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for SbiGlobalsGuard {
+    fn drop(&mut self) {
+        for (k, v) in &self.env {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        // The context's locks are tokio locks and `drop` cannot await: restore
+        // them from a helper thread's own runtime, before the lock is released.
+        let nrf_uri = self.nrf_uri.take();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("runtime");
+                rt.block_on(async {
+                    let sbi = nextgcore_sbi::context::global_context();
+                    match nrf_uri {
+                        Some(uri) => sbi.set_nrf_uri(uri).await,
+                        None => sbi.clear_nrf_uri().await,
+                    }
+                    sbi.clear_nf_instances().await;
+                });
+            });
+        });
+    }
+}
+
+/// **#1508.** [`SbiGlobalsGuard`] puts the env, the NRF URI and the discovery
+/// cache back as it found them.
+#[tokio::test]
+async fn the_sbi_globals_guard_restores_what_it_changed() {
+    let sbi = nextgcore_sbi::context::global_context();
+    let (addr, uri) = {
+        let _outer = nextgcore_amfd::sbi_path::nf_cache_test_lock().lock().await;
+        let addr = std::env::var_os("NWDAF_SBI_ADDR");
+        let uri = sbi.get_nrf_uri().await;
+        std::env::set_var("NWDAF_SBI_ADDR", "nwdaf.1508.invalid");
+        sbi.set_nrf_uri("http://nrf.1508.invalid:7777").await;
+        (addr, uri)
+    };
+    {
+        let _g = SbiGlobalsGuard::acquire().await;
+        assert_eq!(std::env::var_os("NWDAF_SBI_ADDR"), None, "removed inside");
+        std::env::set_var("NWDAF_SBI_ADDR", "changed.inside");
+        sbi.set_nrf_uri("http://nrf.inside:1").await;
+    }
+    let _outer = nextgcore_amfd::sbi_path::nf_cache_test_lock().lock().await;
+    assert_eq!(
+        std::env::var("NWDAF_SBI_ADDR").as_deref(),
+        Ok("nwdaf.1508.invalid"),
+        "the env var is back"
+    );
+    assert_eq!(
+        sbi.get_nrf_uri().await.as_deref(),
+        Some("http://nrf.1508.invalid:7777"),
+        "the NRF URI is back"
+    );
+    match addr {
+        Some(v) => std::env::set_var("NWDAF_SBI_ADDR", v),
+        None => std::env::remove_var("NWDAF_SBI_ADDR"),
+    }
+    match uri {
+        Some(u) => sbi.set_nrf_uri(u).await,
+        None => sbi.clear_nrf_uri().await,
+    }
+}
+
 /// **#1504, the D440C chain end to end.** amfd's real `query_prediction`, with no
 /// test override and no `NWDAF_SBI_ADDR`, discovers this NWDAF through a stand-in
 /// NRF answering with this NWDAF's real `build_nf_profile`, and sends its
@@ -611,7 +717,7 @@ async fn a_lost_amf_subscription_is_renewed_and_then_replaced() {
 async fn amfd_discovers_this_nwdaf_and_gets_a_ue_mobility_prediction() {
     let _serving = ServingOnThisThread::new();
     nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-    std::env::remove_var("NWDAF_SBI_ADDR");
+    let _globals = SbiGlobalsGuard::acquire().await;
     let supi = "imsi-999700000001504";
 
     // History A→B, A→B, now at A: the prediction is B.
@@ -661,10 +767,9 @@ async fn amfd_discovers_this_nwdaf_and_gets_a_ue_mobility_prediction() {
         }
     })
     .await;
-    let sbi = nextgcore_sbi::context::global_context();
-    sbi.set_nrf_uri(format!("http://127.0.0.1:{nrf_port}"))
+    nextgcore_sbi::context::global_context()
+        .set_nrf_uri(format!("http://127.0.0.1:{nrf_port}"))
         .await;
-    sbi.clear_nf_instances().await;
 
     let predicted = nextgcore_amfd::nwdaf_mobility::query_prediction(supi)
         .await
