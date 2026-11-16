@@ -1110,13 +1110,25 @@ fn negotiate_features(consumer_hex: Option<&str>, supported: u64) -> String {
 
 /// [`negotiate_features`] as the bitmask, for a session that keeps what it
 /// negotiated (#1398).
+///
+/// #1596: TS 29.571 §5.2.2 `SupportedFeatures` is a hex string of any length,
+/// features 1-4 in the LAST character, and TS 29.512 defines SM features past 64.
+/// Every producer mask here fits in 64 bits, so the intersection is decided by
+/// the last 16 characters alone; the characters before them only name features
+/// this PCF does not support. The whole string must still be hex (the OpenAPI
+/// pattern `^[A-Fa-f0-9]*$`), else nothing is negotiated. Before, the string was
+/// parsed as one u64, so a consumer setting any feature above 64 negotiated
+/// nothing at all.
 fn negotiated_feature_bits(consumer_hex: Option<&str>, supported: u64) -> u64 {
-    let consumer = consumer_hex
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .and_then(|s| u64::from_str_radix(s, 16).ok())
-        .unwrap_or(0);
-    consumer & supported
+    let Some(hex) = consumer_hex.map(str::trim).filter(|s| !s.is_empty()) else {
+        return 0;
+    };
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return 0;
+    }
+    // ASCII only (checked above), so a byte index is a char boundary.
+    let low = &hex[hex.len().saturating_sub(16)..];
+    u64::from_str_radix(low, 16).unwrap_or(0) & supported
 }
 
 // AM Policy Control handlers
@@ -6582,6 +6594,27 @@ mod tests {
         assert_eq!(negotiate_features(Some(""), 0x3), "0");
         assert_eq!(negotiate_features(Some("ffff"), 0x3), "3");
         assert_eq!(negotiate_features(Some("not-hex"), 0x3), "0");
+        // #1596: a SupportedFeatures longer than 64 bits (TS 29.571 §5.2.2; TS
+        // 29.512 defines SM features up to 124) negotiates its low bits; a
+        // non-hex character anywhere (including a leading '+', which
+        // from_str_radix takes) negotiates nothing.
+        assert_eq!(
+            negotiate_features(Some("10000000000000000000000000000103"), 0x103),
+            "103"
+        );
+        assert_eq!(
+            negotiate_features(
+                Some("ffffffffffffffffffffffffffffffff"),
+                PCF_SM_POLICY_SUPPORTED_FEATURES
+            ),
+            format!("{PCF_SM_POLICY_SUPPORTED_FEATURES:x}")
+        );
+        assert_eq!(
+            negotiate_features(Some("1000000000000000000000000000000g"), 0x3),
+            "0"
+        );
+        assert_eq!(negotiate_features(Some("+3"), 0x3), "0");
+        assert_eq!(negotiate_features(Some("0003"), 0x3), "3");
         // Empty-string consumer (the matched AMF sends suppFeat="") → "0".
         assert_eq!(
             negotiate_features(Some(""), PCF_AM_POLICY_SUPPORTED_FEATURES),
@@ -6678,6 +6711,47 @@ mod tests {
             format!("{:x}", 0xffff_ffff_u64 & PCF_SM_POLICY_SUPPORTED_FEATURES)
         );
         assert_ne!(body["suppFeat"], "ffffffff");
+    }
+
+    /// #1596: an SMF whose suppFeat sets a feature above 64 (here feature 128 and the
+    /// ones this PCF supports, 32 hex digits) negotiates the supported ones, and the
+    /// association keeps them (PCSCF-Restoration-Enhancement, feature 9).
+    ///
+    /// REVERT-VERIFIED: with suppFeat parsed as one u64 again, the create answers
+    /// suppFeat "0".
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn sm_policy_create_negotiates_a_suppfeat_longer_than_64_bits_1596() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let mut body = full_create_body("imsi-001010000015961", 12);
+        let supp_feat = format!("8000000000000000{PCF_SM_POLICY_SUPPORTED_FEATURES:016x}");
+        assert_eq!(supp_feat.len(), 32);
+        body["suppFeat"] = serde_json::json!(supp_feat);
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(body),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        let got: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            got["suppFeat"],
+            format!("{PCF_SM_POLICY_SUPPORTED_FEATURES:x}")
+        );
+        let sess = pcf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_ipv4addr("10.45.0.77")
+            .expect("session");
+        assert_eq!(
+            sess.smpolicycontrol_features,
+            PCF_SM_POLICY_SUPPORTED_FEATURES
+        );
     }
 
     /// pcfd-06: the SessionRule conveys the default QoS inline via `authDefQos`
