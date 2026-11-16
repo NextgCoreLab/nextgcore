@@ -1174,13 +1174,22 @@ pub async fn sm_policy_create(
 /// Reporting the trigger without the value would tell the PCF that the datum it
 /// cannot read changed, and nothing more — which is why the pre-#310 arm on the PCF
 /// side re-derived it from the DB and answered with the value it already held.
+///
+/// #1399: returns the answer's `SmPolicyDecision` as it stands, not a decision. TS
+/// 29.512 §4.2.6.1: for the Update service operation it "shall contain a description
+/// of the changes to the policy decision(s) with respect to the last provided policy
+/// decision(s)", so it is a delta, and the caller applies it with
+/// [`merge_sm_policy_decision`] onto what the session enforces at the time it applies
+/// it. Before, it was parsed by [`parse_sm_policy_decision`] from the config default,
+/// so an answer with no `sessRules` (the PCF changed nothing session-level) reset the
+/// Session-AMBR and the default 5QI to the config defaults.
 pub async fn sm_policy_update(
     pcf: &PcfEndpoint,
     sm_policy_id: &str,
     triggers: &[&str],
     ue_init_res_req: Option<serde_json::Value>,
     subs_sess_ambr: Option<&crate::udm::SubscribedSmData>,
-) -> Result<PolicyDecision, PolicyError> {
+) -> Result<serde_json::Value, PolicyError> {
     let mut body = serde_json::json!({
         "repPolicyCtrlReqTriggers": triggers,
     });
@@ -1208,7 +1217,7 @@ pub async fn sm_policy_update(
         .as_deref()
         .and_then(|c| serde_json::from_str(c).ok())
         .ok_or_else(|| PolicyError::Transport("empty/invalid SmPolicyDecision body".into()))?;
-    Ok(parse_sm_policy_decision(sm_policy_id, &json))
+    Ok(json)
 }
 
 /// Npcf_SMPolicyControl_Delete
@@ -1249,9 +1258,10 @@ pub async fn sm_policy_delete(pcf: &PcfEndpoint, sm_policy_id: &str) -> Result<(
 /// Parse an SmPolicyDecision JSON body into a [`PolicyDecision`].
 ///
 /// For a decision that is the session's FIRST (the create response, TS 29.512
-/// §4.2.2.2) and for an update response, so an attribute it omits takes the config
-/// default. A PCF-initiated UpdateNotify is a delta over what the session already
-/// enforces and goes through [`merge_sm_policy_decision`] instead (#1387).
+/// §4.2.2.2, "a full description of all policy decision(s)", §4.2.6.1), so an
+/// attribute it omits takes the config default. A PCF-initiated UpdateNotify (#1387)
+/// and an Update response (#1399) are deltas over what the session already enforces
+/// and go through [`merge_sm_policy_decision`] instead.
 pub fn parse_sm_policy_decision(sm_policy_id: &str, json: &serde_json::Value) -> PolicyDecision {
     let mut dec = PolicyDecision {
         sm_policy_id: sm_policy_id.to_string(),
@@ -1261,10 +1271,12 @@ pub fn parse_sm_policy_decision(sm_policy_id: &str, json: &serde_json::Value) ->
     dec
 }
 
-/// Apply a PCF-initiated `SmPolicyDecision` (TS 29.512 §4.2.3.2 UpdateNotify) to the
-/// decision the session `current`ly enforces, as the delta it is (#1387).
+/// Apply a PCF-initiated `SmPolicyDecision` (TS 29.512 §4.2.3.2 UpdateNotify), or the
+/// one in an Npcf_SMPolicyControl_Update response (§4.2.4, #1399), to the decision the
+/// session `current`ly enforces, as the delta it is (#1387).
 ///
-/// TS 29.512 §4.2.6.1: an UpdateNotify carries only what changed. A map attribute
+/// TS 29.512 §4.2.6.1: an UpdateNotify, and an Update response, carry only what
+/// changed. A map attribute
 /// (`sessRules`, `pccRules`, ...) carries only the entries added, modified or deleted,
 /// an unmodified entry "no entry needs to be provided", and "attributes that are not
 /// added, modified or deleted do not need to be provided" (bullet 6). §4.2.6.3.1: in
@@ -2839,9 +2851,10 @@ mod tests {
             assert_eq!(dec.def_five_qi, 8);
 
             // Update
-            let dec = sm_policy_update(&pcf, "stub-pol-1", &["RES_MO_RE"], None, None)
+            let answer = sm_policy_update(&pcf, "stub-pol-1", &["RES_MO_RE"], None, None)
                 .await
                 .expect("update");
+            let dec = merge_sm_policy_decision(dec, &answer);
             assert_eq!(dec.sess_ambr_ul_bps, 20_000_000);
 
             // Delete
