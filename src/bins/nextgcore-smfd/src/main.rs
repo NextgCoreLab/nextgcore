@@ -6271,9 +6271,16 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             );
 
             // Re-authorize via PCF (trigger RES_MO_RE, TS 29.512 §4.2.4)
+            //
+            // #1399: the answer is a delta (TS 29.512 §4.2.6.1), merged onto what the
+            // session enforces when it is applied: under the policy-apply lock, taken
+            // only after the PCF has answered (as the SE_AMBR_CH arm, #1387 review
+            // m1), and onto the binding read under it, so an UpdateNotify applied
+            // while the update was in flight is the base, not overwritten.
+            let mut _applying = None;
             let (qfi, ambr_ul, ambr_dl) = match binding.as_ref() {
                 Some(b) => {
-                    let mut authorized = (b.qfi, b.ambr_ul_bps, b.ambr_dl_bps);
+                    let mut answer = None;
                     if let Some(ref pol_id) = b.sm_policy_id {
                         match policy::resolve_pcf_endpoint().await {
                             Some(pcf) => {
@@ -6290,10 +6297,7 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                                 )
                                 .await
                                 {
-                                    Ok(dec) => {
-                                        authorized =
-                                            (b.qfi, dec.sess_ambr_ul_bps, dec.sess_ambr_dl_bps);
-                                    }
+                                    Ok(json) => answer = Some(json),
                                     Err(policy::PolicyError::Rejected { status, detail }) => {
                                         // Abnormal path: PCF rejects the
                                         // modification → 403 + 5GSM cause 29
@@ -6319,7 +6323,21 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                             None => log::warn!("PCF unresolved — keeping current QoS"),
                         }
                     }
-                    authorized
+                    match answer {
+                        Some(json) => {
+                            _applying = Some(
+                                SmContextLock::acquire(policy_apply_locks(), sm_context_ref).await,
+                            );
+                            let enforced =
+                                lookup_policy_binding(sm_context_ref).unwrap_or_else(|| b.clone());
+                            let dec = policy::merge_sm_policy_decision(
+                                enforced_policy_decision(&enforced),
+                                &json,
+                            );
+                            (enforced.qfi, dec.sess_ambr_ul_bps, dec.sess_ambr_dl_bps)
+                        }
+                        None => (b.qfi, b.ambr_ul_bps, b.ambr_dl_bps),
+                    }
                 }
                 None => {
                     log::warn!(
@@ -10590,6 +10608,19 @@ async fn send_n1_n2_modify_transfer(
     }
 }
 
+/// The session-rule decision `binding` enforces, onto which a PCF delta (an
+/// UpdateNotify, #1387, or an Update response, #1399; TS 29.512 §4.2.6.1) is merged.
+fn enforced_policy_decision(binding: &context::PolicyBinding) -> policy::PolicyDecision {
+    policy::PolicyDecision {
+        sm_policy_id: binding.sm_policy_id.clone().unwrap_or_default(),
+        sess_ambr_ul_bps: binding.ambr_ul_bps,
+        sess_ambr_dl_bps: binding.ambr_dl_bps,
+        def_five_qi: binding.five_qi,
+        arp_priority_level: binding.arp_priority_level,
+        ..policy::PolicyDecision::config_default()
+    }
+}
+
 /// Handle SM Policy Update Notification (from PCF, TS 29.512 §4.2.3.2):
 /// the SmPolicyNotification carries an SmPolicyDecision whose authorized
 /// session AMBR / default QoS is applied to the session's N4 QER.
@@ -10629,18 +10660,9 @@ async fn handle_sm_policy_notify(sm_context_ref: &str, request: &SbiRequest) -> 
         return SbiResponse::with_status(204);
     }
 
-    let pol_id = binding.sm_policy_id.clone().unwrap_or_default();
     // #1387: a delta over what the session ENFORCES (TS 29.512 §4.2.6.1), not a
     // replacement built from the config default -- see `merge_sm_policy_decision`.
-    let current = policy::PolicyDecision {
-        sm_policy_id: pol_id,
-        sess_ambr_ul_bps: binding.ambr_ul_bps,
-        sess_ambr_dl_bps: binding.ambr_dl_bps,
-        def_five_qi: binding.five_qi,
-        arp_priority_level: binding.arp_priority_level,
-        ..policy::PolicyDecision::config_default()
-    };
-    let dec = policy::merge_sm_policy_decision(current, decision_json);
+    let dec = policy::merge_sm_policy_decision(enforced_policy_decision(&binding), decision_json);
 
     log::info!(
         "Applying PCF-updated policy to ref={sm_context_ref}: AMBR UL/DL={}/{} bps, 5QI={}",
@@ -10900,6 +10922,7 @@ async fn handle_sdm_notification(sm_context_ref: &str, request: &SbiRequest) -> 
     // raised above what the PCF authorised is reported (its input changed, and the PCF
     // may now authorise more) and the PCF is free to answer with the same decision.
     // That judgement is the PCF's to make, which is the whole point of reporting.
+    let mut answer = None;
     if let Some(sm_policy_id) = binding.sm_policy_id.clone() {
         let Some(pcf) = policy::resolve_pcf_endpoint().await else {
             // A session with an sm_policy_id and no resolvable PCF: the PCF this
@@ -10923,7 +10946,7 @@ async fn handle_sdm_notification(sm_context_ref: &str, request: &SbiRequest) -> 
             subscribed.sess_ambr_ul_bps,
             subscribed.sess_ambr_dl_bps
         );
-        decision = match policy::sm_policy_update(
+        answer = match policy::sm_policy_update(
             &pcf,
             &sm_policy_id,
             &["SE_AMBR_CH"],
@@ -10932,7 +10955,7 @@ async fn handle_sdm_notification(sm_context_ref: &str, request: &SbiRequest) -> 
         )
         .await
         {
-            Ok(authorised) => authorised,
+            Ok(json) => Some(json),
             Err(e) => {
                 // 204, not 5xx: the notification WAS understood, and a retry would
                 // re-drive a leg whose failure the UDM cannot see. Nothing was
@@ -10949,17 +10972,6 @@ async fn handle_sdm_notification(sm_context_ref: &str, request: &SbiRequest) -> 
                 return SbiResponse::with_status(204);
             }
         };
-        log::info!(
-            "[{}] PCF re-authorised ref={sm_context_ref}: AMBR UL/DL {}/{} -> {}/{} bps, \
-             5QI {} -> {}",
-            binding.supi,
-            binding.ambr_ul_bps,
-            binding.ambr_dl_bps,
-            decision.sess_ambr_ul_bps,
-            decision.sess_ambr_dl_bps,
-            binding.five_qi,
-            decision.def_five_qi
-        );
     } else {
         log::info!(
             "[{}] applying changed SM data to ref={sm_context_ref}: AMBR UL/DL {}/{} -> \
@@ -10979,6 +10991,26 @@ async fn handle_sdm_notification(sm_context_ref: &str, request: &SbiRequest) -> 
     // a PCF that notifies this session while answering the SE_AMBR_CH update would
     // otherwise wait on a lock held across its own answer.
     let _applying = SmContextLock::acquire(policy_apply_locks(), sm_context_ref).await;
+
+    // #1399: the PCF's answer is a delta (TS 29.512 §4.2.6.1): what it omits keeps the
+    // value the session enforces, read under the lock, so an UpdateNotify applied while
+    // the update was in flight is the base. Before, it was parsed from the config
+    // default, and an answer with no `sessRules` reset the Session-AMBR and 5QI.
+    if let Some(json) = answer {
+        let enforced = lookup_policy_binding(sm_context_ref).unwrap_or_else(|| binding.clone());
+        decision = policy::merge_sm_policy_decision(enforced_policy_decision(&enforced), &json);
+        log::info!(
+            "[{}] PCF re-authorised ref={sm_context_ref}: AMBR UL/DL {}/{} -> {}/{} bps, \
+             5QI {} -> {}",
+            binding.supi,
+            enforced.ambr_ul_bps,
+            enforced.ambr_dl_bps,
+            decision.sess_ambr_ul_bps,
+            decision.sess_ambr_dl_bps,
+            enforced.five_qi,
+            decision.def_five_qi
+        );
+    }
 
     // The N4 QER, through the SAME function the PCF-update path uses: a second way to
     // change a live session's QoS is a second thing to keep correct, and #293 asks
@@ -20832,6 +20864,32 @@ mod tests {
         nextgcore_sbi::server::SbiServer,
         std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
     ) {
+        spawn_recording_pcf_with(answer.map(|(ul, dl)| {
+            serde_json::json!({
+                "sessRules": {
+                    "SessRule-310": {
+                        "sessRuleId": "SessRule-310",
+                        "authSessAmbr": {
+                            "uplink": policy::format_bitrate(ul),
+                            "downlink": policy::format_bitrate(dl),
+                        },
+                        "authDefQos": { "5qi": 6, "arp": { "priorityLevel": 8 } },
+                    }
+                },
+                "pccRules": {}, "qosDecs": {}, "chgDecs": {}, "traffContDecs": {},
+            })
+        }))
+        .await
+    }
+
+    /// [`spawn_recording_pcf`] answering every `/update` with the `SmPolicyDecision`
+    /// `answer` as it stands, or with a status (#1399).
+    async fn spawn_recording_pcf_with(
+        answer: Result<serde_json::Value, u16>,
+    ) -> (
+        nextgcore_sbi::server::SbiServer,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+    ) {
         use nextgcore_sbi::message::SbiResponse;
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
 
@@ -20846,6 +20904,7 @@ mod tests {
         );
         pcf.start(move |req: SbiRequest| {
             let sink = sink.clone();
+            let answer = answer.clone();
             async move {
                 let body: serde_json::Value = req
                     .http
@@ -20858,20 +20917,8 @@ mod tests {
                     .push((req.header.uri.clone(), body));
                 match answer {
                     Err(status) => SbiResponse::with_status(status),
-                    Ok((ul, dl)) => SbiResponse::with_status(200)
-                        .with_json_body(&serde_json::json!({
-                            "sessRules": {
-                                "SessRule-310": {
-                                    "sessRuleId": "SessRule-310",
-                                    "authSessAmbr": {
-                                        "uplink": policy::format_bitrate(ul),
-                                        "downlink": policy::format_bitrate(dl),
-                                    },
-                                    "authDefQos": { "5qi": 6, "arp": { "priorityLevel": 8 } },
-                                }
-                            },
-                            "pccRules": {}, "qosDecs": {}, "chgDecs": {}, "traffContDecs": {},
-                        }))
+                    Ok(decision) => SbiResponse::with_status(200)
+                        .with_json_body(&decision)
                         .unwrap_or_else(|_| SbiResponse::with_status(200)),
                 }
             }
@@ -21062,6 +21109,207 @@ mod tests {
         std::env::remove_var("UDM_SBI_PORT");
         pcf_srv.stop().await.expect("stop");
         udm_srv.stop().await.expect("stop");
+    }
+
+    /// The PCF-authorised values a #1399 session enforces before its update: 30/70
+    /// Mbps, 5QI 7, all different from the config default (100/100, 5QI 9) and from
+    /// the subscription the UDM reports (40/80, 5QI 6).
+    fn seed_authorised_1399(supi: &str, psi: u8, sm_policy_id: &str) -> String {
+        let sm_context_ref = seed_pcf_authorised(supi, psi, sm_policy_id);
+        if let Ok(ctx) = smf_self().read() {
+            if let Ok(mut bindings) = ctx.policy_bindings.write() {
+                if let Some(b) = bindings.get_mut(&sm_context_ref) {
+                    b.ambr_ul_bps = 30_000_000;
+                    b.ambr_dl_bps = 70_000_000;
+                    b.five_qi = 7;
+                }
+            }
+        }
+        sm_context_ref
+    }
+
+    /// #1399, TS 29.512 §4.2.6.1 (the Update answer "shall contain a description of
+    /// the changes"), the SE_AMBR_CH leg: a PCF answer with no `sessRules` leaves the
+    /// Session-AMBR and the 5QI the session enforces; one with only a changed
+    /// `authSessAmbr` changes the AMBR and keeps the 5QI.
+    ///
+    /// REVERT-VERIFIED: with the answer parsed from the config default again
+    /// (`parse_sm_policy_decision`), the first answer resets the binding to 100/100,
+    /// 5QI 9, and the second keeps 5QI 9.
+    #[tokio::test]
+    async fn an_se_ambr_ch_answer_is_a_delta_over_what_the_session_enforces_1399() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (udm_srv, _seen) = spawn_recording_udm(sm_data_with("40 Mbps", "80 Mbps", 6)).await;
+        udm::set_for_test(true);
+        smf_context_init(64, 256, 512);
+        let enforced = |r: &str| {
+            let b = lookup_policy_binding(r).expect("binding");
+            let s = smf_self()
+                .read()
+                .expect("context")
+                .sess_find_by_sm_context_ref(r)
+                .expect("session");
+            (
+                b.ambr_ul_bps,
+                b.ambr_dl_bps,
+                b.five_qi,
+                s.session_ambr.uplink,
+                s.session_ambr.downlink,
+            )
+        };
+
+        // ---- the PCF changed nothing session-level ----
+        let (pcf_srv, pcf_seen) =
+            spawn_recording_pcf_with(Ok(serde_json::json!({ "pccRules": {} }))).await;
+        let supi = "imsi-001010000001399";
+        let unchanged = seed_authorised_1399(supi, 22, "pol-1399");
+        assert_eq!(
+            smf_sbi_request_handler(sdm_notify(&unchanged, supi))
+                .await
+                .status,
+            204
+        );
+        let reported = pcf_seen.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let after_empty = enforced(&unchanged);
+        pcf_srv.stop().await.expect("stop");
+
+        // ---- the PCF changed only the Session-AMBR ----
+        let (pcf_srv, _) = spawn_recording_pcf_with(Ok(serde_json::json!({
+            "sessRules": { "SessRule-1399": {
+                "authSessAmbr": { "uplink": "50 Mbps", "downlink": "90 Mbps" },
+            }}
+        })))
+        .await;
+        let supi2 = "imsi-001010000001398";
+        let changed = seed_authorised_1399(supi2, 23, "pol-1398");
+        assert_eq!(
+            smf_sbi_request_handler(sdm_notify(&changed, supi2))
+                .await
+                .status,
+            204
+        );
+        let after_ambr = enforced(&changed);
+
+        std::env::remove_var("PCF_URI");
+        udm::set_for_test(false);
+        std::env::remove_var("UDM_SBI_ADDR");
+        std::env::remove_var("UDM_SBI_PORT");
+        pcf_srv.stop().await.expect("stop");
+        udm_srv.stop().await.expect("stop");
+
+        assert_eq!(reported, 1, "the change was reported");
+        assert_eq!(
+            after_empty,
+            (30_000_000, 70_000_000, 7, 30_000_000, 70_000_000),
+            "an answer with no sessRules keeps the authorised AMBR and 5QI"
+        );
+        assert_eq!(
+            after_ambr,
+            (50_000_000, 90_000_000, 7, 50_000_000, 90_000_000),
+            "a changed authSessAmbr is applied; the 5QI it omits is kept"
+        );
+    }
+
+    /// The Session-AMBR (DL, UL) in bps a PDU SESSION MODIFICATION COMMAND carries in
+    /// its IE 0x2A (TS 24.501 §9.11.4.14), for the units these tests use (Mbps).
+    fn command_ambr_1399(n1: &[u8]) -> (u64, u64) {
+        assert_eq!(
+            n1[3],
+            gsm_build::message_type::PDU_SESSION_MODIFICATION_COMMAND
+        );
+        assert_eq!(&n1[4..6], &[0x2A, 6], "the Session-AMBR IE: {n1:?}");
+        assert_eq!((n1[6], n1[9]), (0x06, 0x06), "in Mbps: {n1:?}");
+        let mbps = |hi: u8, lo: u8| u64::from(u16::from_be_bytes([hi, lo])) * 1_000_000;
+        (mbps(n1[7], n1[8]), mbps(n1[10], n1[11]))
+    }
+
+    /// #1399, the UE-requested modification leg (RES_MO_RE, TS 29.512 §4.2.4.17): a
+    /// PCF answer with no `sessRules` authorises the Session-AMBR the session already
+    /// enforces, so the MODIFICATION COMMAND carries 70/30 Mbps, not the config
+    /// default; one with a changed `authSessAmbr` carries the new value.
+    ///
+    /// REVERT-VERIFIED: with the answer parsed from the config default again, the
+    /// command carries 100/100.
+    #[tokio::test]
+    async fn a_res_mo_re_answer_is_a_delta_over_what_the_session_enforces_1399() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let modify = |r: &str, psi: u8| {
+            SbiRequest::post(format!("/nsmf-pdusession/v1/sm-contexts/{r}/modify"))
+                .with_body(
+                    serde_json::json!({
+                        "n2SmInfoType": "PDU_RES_MOD_REQ",
+                        "n1SmMsg": { "contentId": "n1SmMsg" },
+                    })
+                    .to_string(),
+                    "application/json",
+                )
+                .with_part(nextgcore_sbi::message::SbiPart::with_content(
+                    "n1SmMsg",
+                    nextgcore_sbi::constants::content_type::APPLICATION_5GNAS,
+                    bytes::Bytes::from(n1(
+                        psi,
+                        5,
+                        gsm_build::message_type::PDU_SESSION_MODIFICATION_REQUEST,
+                        &[],
+                    )),
+                ))
+        };
+        let command = |resp: &SbiResponse| {
+            resp.http
+                .parts
+                .iter()
+                .find(|p| p.content_id.as_deref() == Some("n1SmMsg"))
+                .map(|p| p.data.to_vec())
+                .expect("the MODIFICATION COMMAND")
+        };
+
+        // ---- the PCF changed nothing session-level ----
+        let (pcf_srv, pcf_seen) =
+            spawn_recording_pcf_with(Ok(serde_json::json!({ "pccRules": {} }))).await;
+        let unchanged = seed_authorised_1399("imsi-001010000001397", 24, "pol-1397");
+        let resp = handle_sm_context_update(&unchanged, &modify(&unchanged, 24)).await;
+        let status_empty = resp.status;
+        let ambr_empty = command_ambr_1399(&command(&resp));
+        let reported = pcf_seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        pcf_srv.stop().await.expect("stop");
+
+        // ---- the PCF changed the Session-AMBR ----
+        let (pcf_srv, _) = spawn_recording_pcf_with(Ok(serde_json::json!({
+            "sessRules": { "SessRule-1399": {
+                "authSessAmbr": { "uplink": "50 Mbps", "downlink": "90 Mbps" },
+            }}
+        })))
+        .await;
+        let changed = seed_authorised_1399("imsi-001010000001396", 25, "pol-1396");
+        let resp = handle_sm_context_update(&changed, &modify(&changed, 25)).await;
+        let status_changed = resp.status;
+        let ambr_changed = command_ambr_1399(&command(&resp));
+
+        std::env::remove_var("PCF_URI");
+        pcf_srv.stop().await.expect("stop");
+
+        assert_eq!(status_empty, 200);
+        assert_eq!(reported.len(), 1, "{reported:?}");
+        assert_eq!(
+            reported[0].1["repPolicyCtrlReqTriggers"],
+            serde_json::json!(["RES_MO_RE"])
+        );
+        assert_eq!(
+            ambr_empty,
+            (70_000_000, 30_000_000),
+            "an answer with no sessRules authorises what the session enforces"
+        );
+        assert_eq!(status_changed, 200);
+        assert_eq!(
+            ambr_changed,
+            (90_000_000, 50_000_000),
+            "a changed authSessAmbr"
+        );
     }
 
     /// #310 Decision 3: a PCF that REJECTS the `SE_AMBR_CH` report leaves the session
