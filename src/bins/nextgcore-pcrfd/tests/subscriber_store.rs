@@ -167,6 +167,29 @@ impl Mongo {
             .expect("provision the subscriber");
     }
 
+    /// #1553: bring a killed store back, empty, on the same loopback port, so the
+    /// URI pcrfd holds reaches it again.
+    fn restart(&mut self) {
+        let label = format!("{PID_LABEL}={}", std::process::id());
+        let publish = format!("127.0.0.1:{}:27017", self.port);
+        let out = docker(&[
+            "run",
+            "-d",
+            "--rm",
+            "--label",
+            &label,
+            "-p",
+            &publish,
+            "mongo:6.0",
+        ]);
+        assert!(
+            out.status.success(),
+            "docker run mongo:6.0 on {publish}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        self.id = String::from_utf8(out.stdout).unwrap().trim().to_string();
+    }
+
     /// Take the store away under a running pcrfd.
     fn kill(&self) {
         let out = docker(&["kill", &self.id]);
@@ -438,6 +461,80 @@ async fn a_store_outage_neither_downgrades_live_sessions_nor_invents_new_ones() 
         took < Duration::from_millis(500),
         "CCA-T took {took:?}: it read the store"
     );
+}
+
+/// #1553: during a store outage, CCRs on ONE PCEF connection (handled in order)
+/// no longer each wait a server selection: after the first finds the store down,
+/// the rest fail fast for `STORE_DOWN_LATCH` (3 s), so a burst drains in about one
+/// selection rather than one per CCR. A store that comes back is read again once
+/// the latch expires.
+///
+/// REVERT-VERIFIED: with the latch check removed from `lookup_subscriber_policy`,
+/// the burst of 6 CCR-Is takes about 6 s and the burst assertion fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_burst_during_an_outage_costs_one_store_wait_1553() {
+    let Some(mut mongo) = Mongo::start() else {
+        return;
+    };
+    let imsi = "001010000015531";
+    mongo.provision(subscriber(imsi));
+    let dir = Scratch::new("latch");
+    let pcrfd = start_pcrfd(&dir, &mongo.uri()).await;
+    let mut pcef = connect_pcef(pcrfd.port()).await;
+
+    let (cca, _) = exchange(&mut pcef, &build_ccr_i("pgw-1553;0;latch", imsi)).await;
+    assert_eq!(cca.result_code(), Some(2001), "the store is up");
+
+    mongo.kill();
+    const BURST: u32 = 6;
+    let started = Instant::now();
+    for n in 1..=BURST {
+        let (cca, _) = exchange(
+            &mut pcef,
+            &build_ccr_i(&format!("pgw-1553;{n};latch"), imsi),
+        )
+        .await;
+        assert_eq!(
+            experimental_result(&cca),
+            Some(5140),
+            "CCR-I {n} during the outage"
+        );
+    }
+    let burst = started.elapsed();
+    eprintln!("{BURST} outage CCR-Is answered in {burst:?}");
+    assert!(
+        burst < Duration::from_millis(2_500),
+        "{BURST} CCR-Is on one connection took {burst:?}: each waited a server selection"
+    );
+
+    // The store comes back: once the latch expires a CCR-I reads it again and is
+    // established from the subscription.
+    mongo.restart();
+    mongo.provision(subscriber(imsi));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut n = 100;
+    loop {
+        n += 1;
+        let (cca, _) = exchange(
+            &mut pcef,
+            &build_ccr_i(&format!("pgw-1553;{n};latch"), imsi),
+        )
+        .await;
+        if cca.result_code() == Some(2001) {
+            assert_eq!(
+                apn_ambr(&cca),
+                Some((Some(7_000_000), Some(13_000_000))),
+                "recovered: the provisioned policy"
+            );
+            break;
+        }
+        assert_eq!(experimental_result(&cca), Some(5140));
+        assert!(
+            Instant::now() < deadline,
+            "pcrfd never read the restored store"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 /// Connect to pcrfd as a PCEF and complete CER/CEA, waiting on the listener
