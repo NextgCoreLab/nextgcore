@@ -579,25 +579,41 @@ async fn main() -> Result<()> {
     // (registration failure is non-fatal, mirroring nwdafd).
     let sbi_ctx = nextgcore_sbi::context::global_context();
     sbi_ctx.set_nrf_uri(&args.nrf_uri).await;
-    if let Err(e) = match sbi.registration_host() {
-        Ok(host) => register_with_nrf(sbi_ctx, host, sbi.port, &nf_instance_id).await,
-        Err(why) => Err(why),
-    } {
-        log::warn!("NRF registration failed (will operate without NRF): {e}");
-    } else {
-        // PATCH a real NFProfile "/load" gauge to NRF each heartbeat: active
-        // monitoring subscriptions, saturated at 100 (TS 29.510 §5.2.2.3.2).
-        nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(
-            nf_instance_id.clone(),
-            5,
-            || {
-                let load = nef_self()
-                    .read()
-                    .map(|c| c.subscription_count())
-                    .unwrap_or(0);
-                load.min(100) as u8
-            },
-        );
+    // #1482: a failed attempt is retried in the background, and the heartbeat
+    // starts after the one that succeeds.
+    match sbi.registration_host() {
+        Ok(host) => {
+            let (host, port, id) = (host.to_string(), sbi.port, nf_instance_id.clone());
+            nextgcore_sbi::heartbeat::register_or_retry(
+                "NEF",
+                Default::default(),
+                move || {
+                    let (ctx, host, id) = (sbi_ctx.clone(), host.clone(), id.clone());
+                    async move {
+                        register_with_nrf(ctx, &host, port, &id)
+                            .await
+                            .map(|()| Some(id))
+                    }
+                },
+                |nf_instance_id| {
+                    // PATCH a real NFProfile "/load" gauge to NRF each heartbeat: active
+                    // monitoring subscriptions, saturated at 100 (TS 29.510 §5.2.2.3.2).
+                    nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(
+                        nf_instance_id,
+                        5,
+                        || {
+                            let load = nef_self()
+                                .read()
+                                .map(|c| c.subscription_count())
+                                .unwrap_or(0);
+                            load.min(100) as u8
+                        },
+                    );
+                },
+            )
+            .await;
+        }
+        Err(e) => log::warn!("NRF registration not attempted (will operate without NRF): {e}"),
     }
 
     log::info!("NextGCore NEF ready (instance: {nf_instance_id})");

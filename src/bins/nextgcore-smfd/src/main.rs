@@ -1149,27 +1149,43 @@ async fn main() -> Result<()> {
 
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
 
-    // Register with NRF (if configured)
-    match match sbi.registration_host() {
-        Ok(host) => smf_nrf_register(host, sbi.port).await,
-        Err(why) => Err(why),
-    } {
-        Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
-            // #79: the UDM must record the SAME instance id the NRF knows, or its
-            // serving-SMF record points at an instance nothing else can resolve.
-            udm::set_instance_id(&nf_instance_id);
-            // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
-            // (PDU sessions vs configured capacity; TS 29.510 §5.2.2.3.2).
-            nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(nf_instance_id, 5, || {
-                let ctx = smf_self();
-                let load = ctx.read().map(|c| c.get_load()).unwrap_or(0);
-                load.clamp(0, 100) as u8
-            });
+    // Register with NRF (if configured). #1482: a failed attempt is retried in
+    // the background, and the heartbeat starts after the one that succeeds.
+    match sbi.registration_host() {
+        Ok(host) => {
+            let (host, port) = (host.to_string(), sbi.port);
+            nextgcore_sbi::heartbeat::register_or_retry(
+                "SMF",
+                Default::default(),
+                move || {
+                    let host = host.clone();
+                    async move {
+                        smf_nrf_register(&host, port)
+                            .await
+                            .map(nextgcore_sbi::heartbeat::registered_id)
+                    }
+                },
+                |nf_instance_id| {
+                    // #79: the UDM must record the SAME instance id the NRF knows, or
+                    // its serving-SMF record points at an instance nothing else can
+                    // resolve.
+                    udm::set_instance_id(&nf_instance_id);
+                    // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
+                    // (PDU sessions vs configured capacity; TS 29.510 §5.2.2.3.2).
+                    nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(
+                        nf_instance_id,
+                        5,
+                        || {
+                            let ctx = smf_self();
+                            let load = ctx.read().map(|c| c.get_load()).unwrap_or(0);
+                            load.clamp(0, 100) as u8
+                        },
+                    );
+                },
+            )
+            .await;
         }
-        Ok(_) => {}
-        Err(e) => {
-            log::warn!("NRF registration failed (will operate without NRF): {e}");
-        }
+        Err(e) => log::warn!("NRF registration not attempted (will operate without NRF): {e}"),
     }
 
     log::info!("NextGCore SMF ready");

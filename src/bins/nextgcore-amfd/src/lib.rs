@@ -1397,12 +1397,28 @@ pub async fn run() -> Result<()> {
     )
     .await;
 
-    // Register with NRF (if configured)
-    let mut amf_nf_instance_id = String::new();
+    // Register with NRF (if configured). #1482: a failed first attempt is retried
+    // in the background; the heartbeat and the #668 status-subscription
+    // maintainer start after the attempt that succeeds.
     let (advertised_host, advertised_port) = sbi_path::advertised_sbi_host_port();
-    match sbi_path::amf_nrf_register(&advertised_host, advertised_port).await {
-        Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
-            amf_nf_instance_id = nf_instance_id.clone();
+    let registration = nextgcore_sbi::heartbeat::register_or_retry(
+        "AMF",
+        Default::default(),
+        move || {
+            let host = advertised_host.clone();
+            async move {
+                sbi_path::amf_nrf_register(&host, advertised_port)
+                    .await
+                    .map(nextgcore_sbi::heartbeat::registered_id)
+            }
+        },
+        |nf_instance_id| {
+            // #668: subscribe at the NRF to status changes of every NF type the
+            // discovery cache holds, and keep the subscriptions renewed, so a
+            // deregistered or moved peer is dropped from the cache when the NRF
+            // says so instead of on the first failed request. Its own task: a
+            // slow or blackholed NRF delays nothing else.
+            let _ = nrf_subscription::spawn_maintainer(nf_instance_id.clone());
             // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
             // (registered UEs vs configured capacity; TS 29.510 §5.2.2.3.2).
             nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(nf_instance_id, 5, || {
@@ -1410,19 +1426,19 @@ pub async fn run() -> Result<()> {
                 let load = ctx.read().map(|c| c.get_ue_load()).unwrap_or(0);
                 load.clamp(0, 100) as u8
             });
+        },
+    )
+    .await;
+    // The UCMF subscription below names this AMF by the id it registers (or is
+    // still retrying) under; amf_nrf_register derives the same pinned id.
+    let amf_nf_instance_id = match registration {
+        nextgcore_sbi::heartbeat::Registration::Registered(id) => id,
+        nextgcore_sbi::heartbeat::Registration::Retrying => {
+            nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf)
+                .to_string()
         }
-        Ok(_) => {}
-        Err(e) => {
-            log::warn!("NRF registration failed (will operate without NRF): {e}");
-        }
-    }
-
-    // #668: subscribe at the NRF to status changes of every NF type the
-    // discovery cache holds, and keep the subscriptions renewed, so a
-    // deregistered or moved peer is dropped from the cache when the NRF says
-    // so instead of on the first failed request. Its own task: a slow or
-    // blackholed NRF delays nothing else.
-    let _nrf_status_maintainer = nrf_subscription::spawn_maintainer(amf_nf_instance_id.clone());
+        nextgcore_sbi::heartbeat::Registration::NotConfigured => String::new(),
+    };
 
     // #664: a request that cannot reach a cached peer re-discovers through this
     // and is resent once, instead of failing the UE's procedure.

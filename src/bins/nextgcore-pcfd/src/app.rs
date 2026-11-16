@@ -669,11 +669,18 @@ pub async fn run() -> Result<()> {
     // Register with NRF and start heartbeat worker. ONE registration, through the
     // single profile builder in sbi_path, so the advertised service set cannot
     // drift from the one the router actually serves.
+    //
+    // #1482: a failed attempt (transport error or non-2xx) is retried in the
+    // background, and the heartbeat starts after the one that succeeds, so it
+    // always has the recorded profile a 404 re-registration needs.
     if let Err(why) = sbi.registration_host() {
         log::error!("{why}");
     } else if !nf_instance_id.is_empty() {
-        match sbi_path::pcf_register_with_nrf().await {
-            Ok(Some(registered_id)) => {
+        nextgcore_sbi::heartbeat::register_or_retry(
+            "PCF",
+            Default::default(),
+            sbi_path::pcf_register_with_nrf,
+            |registered_id| {
                 // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
                 // (policy sessions vs configured capacity; TS 29.510 §5.2.2.3.2).
                 nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(
@@ -685,12 +692,9 @@ pub async fn run() -> Result<()> {
                         load.clamp(0, 100) as u8
                     },
                 );
-            }
-            Ok(None) => {}
-            Err(e) => {
-                log::warn!("NRF registration failed (will operate without NRF): {e}");
-            }
-        }
+            },
+        )
+        .await;
     }
 
     // #299: subscribe to the UDR for policy-data changes, AFTER the SBI server is
@@ -765,7 +769,7 @@ pub async fn run() -> Result<()> {
     log::info!("SBI HTTP/2 server stopped");
 
     // Close legacy SBI server
-    pcf_sbi_close();
+    pcf_sbi_close().await;
     log::info!("SBI server closed");
 
     // Cleanup state machine
@@ -10267,7 +10271,7 @@ mod tests {
             tls_key: None,
             nrf_uri: Some(format!("http://127.0.0.1:{port}")),
         };
-        crate::sbi_path::pcf_sbi_close();
+        crate::sbi_path::pcf_sbi_close().await;
         crate::sbi_path::pcf_sbi_open(Some(sbi_config))
             .await
             .expect("pcf_sbi_open");
@@ -10331,7 +10335,7 @@ mod tests {
         assert!(allowed.contains(&"AF") && allowed.contains(&"NEF"));
 
         nrf.stop().await.expect("stop mock NRF");
-        crate::sbi_path::pcf_sbi_close();
+        crate::sbi_path::pcf_sbi_close().await;
     }
 
     /// A genuine access-type change on the FIRST update after create is

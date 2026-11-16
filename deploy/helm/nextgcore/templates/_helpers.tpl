@@ -111,7 +111,8 @@ amf.sbi.server[0].address (#1311), so the env var is set instead.
 
 {{/*
 initContainer that blocks until the NRF SBI port accepts a connection. Every NF
-registers with the NRF at startup, and a failed registration is not retried.
+registers with the NRF at startup. A failed registration is retried with backoff
+(#1482), so this wait only keeps the first attempt from being one that fails.
 */}}
 {{- define "nextgcore.waitForNrf" -}}
 - name: wait-nrf
