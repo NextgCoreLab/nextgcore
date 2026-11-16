@@ -92,7 +92,8 @@ data:
       [ -n "$id" ] || continue
       key="$D/cca/$id.key"
       [ -s "$key" ] || { say "FATAL: no CCA key for $id"; exit 1; }
-      chown 65534:65534 "$key"; chmod 0400 "$key"
+      # chmod before chown: once nobody owns it, root (no CAP_FOWNER) cannot.
+      chmod 0400 "$key"; chown 65534:65534 "$key"
       cfg="$D/$id.yaml"
       { printf '%s\n' "${D443A_EAS_YAML}" | sed -e "s/@ID@/$nf/" -e "s/@EAS@/$id/"
         printf 'eas_id: %s\naddress: %s\nmax_resp_time_ms: %s\navl_comp: %s\n' "$id" "$ip" "$mr" "$av"
