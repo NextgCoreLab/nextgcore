@@ -6619,25 +6619,53 @@ struct GsmProcedureTimer {
     /// The AMF callback authority to reach (from `smContextStatusUri`).
     amf_uri: Option<String>,
     /// #1409: the N2 SM information the first N1N2MessageTransfer carried with the
-    /// command (a network-requested modification, TS 23.502 §4.3.3.2 step 3b). A
-    /// retransmission resends it with the command, so a lost first transfer still
-    /// reaches the NG-RAN. `None` for an N1-only procedure.
+    /// command (a network-requested modification, TS 23.502 §4.3.3.2 step 3b; #1430,
+    /// a release, §4.3.4.2 steps 3a/3b). A retransmission resends it with the
+    /// command, so a lost first transfer still reaches the NG-RAN. `None` for an
+    /// N1-only procedure.
     n2: Option<GsmN2>,
     attempts: u32,
     deadline: std::time::Instant,
 }
 
-/// The N2 part of a 5GSM command's transfer (#1409): the
-/// PDUSessionResourceModifyRequestTransfer bytes, sent again verbatim, and the
-/// 5QI and ARP given to the AMF for paging (TS 29.518 §6.1.6.2.18).
+/// The N2 part of a 5GSM command's transfer (#1409): the N2 SM information bytes,
+/// sent again verbatim, the NGAP IE type they are (#1430), and the 5QI and ARP given
+/// to the AMF for paging (TS 29.518 §6.1.6.2.18).
 #[derive(Debug, Clone)]
 struct GsmN2 {
     transfer: Vec<u8>,
+    /// What `transfer` is, and so the `ngapIeType` its retransmission carries.
+    kind: GsmN2Kind,
     paged: Option<(u16, n2_transfer::Arp)>,
     /// A QoS Monitoring Request (#1390): its retransmissions go through the
     /// session's `qos_mon` RAN-leg owner, so none can overtake a later request
     /// (#1390 review round 4).
     qos_monitoring: bool,
+}
+
+/// The N2 SM information a 5GSM command went out with (TS 29.518 §6.1.6.3.x
+/// `NgapIeType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GsmN2Kind {
+    /// PDUSessionResourceModifyRequestTransfer, `PDU_RES_MOD_REQ`, with a PDU
+    /// SESSION MODIFICATION COMMAND (T3591).
+    ModifyRequest,
+    /// PDUSessionResourceReleaseCommandTransfer, `PDU_RES_REL_CMD`, with a PDU
+    /// SESSION RELEASE COMMAND (T3592, #1430).
+    ReleaseCommand,
+}
+
+impl GsmN2 {
+    /// The N2 Resource Release request a PDU SESSION RELEASE COMMAND went out with
+    /// (TS 23.502 §4.3.4.2 steps 3a/3b, #1430).
+    fn release(transfer: Vec<u8>) -> Self {
+        Self {
+            transfer,
+            kind: GsmN2Kind::ReleaseCommand,
+            paged: None,
+            qos_monitoring: false,
+        }
+    }
 }
 
 /// Armed 5GSM procedure timers, keyed by SM context reference.
@@ -8051,13 +8079,16 @@ pub(crate) async fn release_for_reactivation(
             ctx.sess_update(&sess);
         }
     }
-    arm_gsm_timer(
+    // #1430: armed with the N2 it goes out with, so a T3592 retransmission carries
+    // the same PDU_RES_REL_CMD (TS 23.502 §4.3.4.2 step 3b).
+    arm_gsm_timer_with_n2(
         sm_context_ref,
         timer::SmfTimerId::T3592,
         &n1_cmd,
         supi,
         psi,
         Some(amf_uri),
+        Some(GsmN2::release(n2.clone())),
     );
     send_n1_n2_release_transfer(amf_uri, supi, psi, &n1_cmd, &n2).await;
 }
@@ -8161,7 +8192,19 @@ async fn run_gsm_timer_tick() {
                     // #1409, TS 23.502 §4.3.3.2 step 3b: a command that went out with
                     // N2 SM information goes out with it again. Resent N1-only, a lost
                     // first transfer left the NG-RAN on the old Session-AMBR and QoS.
+                    // #1430, §4.3.4.2 step 3b: and a release command that went out
+                    // with the N2 Resource Release request goes out with it again.
                     match (&entry.n2, entry.amf_uri.as_deref()) {
+                        (Some(n2), Some(amf_uri)) if n2.kind == GsmN2Kind::ReleaseCommand => {
+                            send_n1_n2_release_transfer(
+                                amf_uri,
+                                &entry.supi,
+                                entry.psi,
+                                &entry.command,
+                                &n2.transfer,
+                            )
+                            .await;
+                        }
                         (Some(n2), Some(amf_uri)) => {
                             send_n1_n2_modify_transfer(
                                 amf_uri,
@@ -9317,14 +9360,17 @@ async fn handle_n1_sm_message(sm_context_ref: &str, n1: &[u8]) -> SbiResponse {
             // session (cause 65), and that reconciliation completes the whole release;
             // a T3592 for a context that is gone would only retransmit and abandon
             // nothing.
+            // #1430: the N2 Resource Release request goes out with the command
+            // (TS 23.502 §4.3.4.2 step 3a), so a T3592 retransmission carries it too.
             if lookup_policy_binding(sm_context_ref).is_some() {
-                arm_gsm_timer(
+                arm_gsm_timer_with_n2(
                     sm_context_ref,
                     timer::SmfTimerId::T3592,
                     &n1_cmd,
                     &binding.supi,
                     psi,
                     amf_uri.as_deref(),
+                    Some(GsmN2::release(n2_cmd.clone())),
                 );
             }
             sbi_response_with_n1_n2(
@@ -10365,6 +10411,7 @@ pub(crate) async fn signal_qos_monitoring(
         Some(&amf_uri),
         Some(GsmN2 {
             transfer: n2.clone(),
+            kind: GsmN2Kind::ModifyRequest,
             paged,
             qos_monitoring: true,
         }),
@@ -10608,6 +10655,7 @@ fn signal_policy_change(sm_context_ref: &str, before: &context::PolicyBinding) {
         Some(&amf_uri),
         Some(GsmN2 {
             transfer: n2.clone(),
+            kind: GsmN2Kind::ModifyRequest,
             paged,
             qos_monitoring: false,
         }),
@@ -26514,6 +26562,168 @@ mod tests {
         amf.stop().await.ok();
         listener.abort();
         upf_task.abort();
+    }
+
+    /// Expire `sm_context_ref`'s armed 5GSM timer now and run one tick (#1430).
+    async fn expire_gsm_timer_now_1430(sm_context_ref: &str, timer_id: timer::SmfTimerId) {
+        if let Ok(mut timers) = gsm_procedure_timers().lock() {
+            let t = timers.get_mut(sm_context_ref).expect("a 5GSM timer armed");
+            assert_eq!(t.timer_id, timer_id);
+            t.deadline = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        }
+        run_gsm_timer_tick().await;
+    }
+
+    /// An SM context with a binding addressed to the AMF stand-in on `amf_port`, and
+    /// no N4 session or SM policy, so a release has no UPF or PCF leg (#1430).
+    fn seed_release_session_1430(supi: &str, psi: u8, amf_port: u16) -> String {
+        let reference = {
+            let ctx = smf_self();
+            let context = ctx.read().expect("context");
+            register_sm_context(&context, supi, psi)
+                .expect("register")
+                .0
+        };
+        seed_binding(&reference, psi);
+        if let Ok(ctx) = smf_self().read() {
+            if let Ok(mut bindings) = ctx.policy_bindings.write() {
+                if let Some(b) = bindings.get_mut(&reference) {
+                    b.supi = supi.to_string();
+                }
+            }
+        }
+        set_amf_1385(&reference, amf_port);
+        reference
+    }
+
+    /// #1430, TS 23.502 §4.3.4.2 steps 3a/3b, TS 24.501 §6.3.3.3: a T3592
+    /// retransmission of a PDU SESSION RELEASE COMMAND that went out with the N2
+    /// Resource Release request carries the same N1 and the same
+    /// PDUSessionResourceReleaseCommandTransfer (`PDU_RES_REL_CMD`), so a lost first
+    /// transfer still releases the NG-RAN resources:
+    /// - network-initiated (the UPF-restart reactivation release, step 3b);
+    /// - UE-requested (the UpdateSMContext answer carried the N2, step 3a).
+    ///
+    /// A release that went out N1-only (the NG-RAN already released, step 3a: no N2)
+    /// is retransmitted N1-only.
+    ///
+    /// REVERT-VERIFIED: with the tick's release arm removed (or the release sites
+    /// arming T3592 with no N2), both N2 retransmissions go out N1-only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn t3592_resends_the_n2_release_command_1430() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (amf, amf_port, posts) = n1n2_recording_amf_1385(false).await;
+        let amf_uri = format!("http://127.0.0.1:{amf_port}");
+        let expected_n2 = n2_transfer::release_command_transfer().expect("release transfer");
+        assert!(!expected_n2.is_empty());
+
+        // ---- network-initiated: N1 + N2 in the first transfer and the retransmission ----
+        let supi = "imsi-001010000001430";
+        let net = seed_release_session_1430(supi, 14, amf_port);
+        release_for_reactivation(&net, &amf_uri, supi, 14).await;
+        let got = await_n1n2_1385(&posts, 1).await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        let (_, first_body, first_n1, first_n2) = got[0].clone();
+        assert_eq!(first_n2, expected_n2);
+        assert_eq!(
+            first_body["n2InfoContainer"]["smInfo"]["n2InfoContent"]["ngapIeType"],
+            "PDU_RES_REL_CMD"
+        );
+        expire_gsm_timer_now_1430(&net, timer::SmfTimerId::T3592).await;
+        let got = await_n1n2_1385(&posts, 2).await;
+        assert_eq!(got.len(), 2, "the T3592 retransmission, got {got:?}");
+        let (path, body, n1_again, n2_again) = &got[1];
+        assert_eq!(
+            path,
+            &format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages")
+        );
+        assert_eq!(n1_again, &first_n1, "the same command, verbatim");
+        assert_eq!(
+            n2_again, &expected_n2,
+            "the retransmission carries the same PDUSessionResourceReleaseCommandTransfer"
+        );
+        assert_eq!(
+            body["n2InfoContainer"]["smInfo"]["n2InfoContent"]["ngapIeType"],
+            "PDU_RES_REL_CMD"
+        );
+        assert_eq!(body["n2InfoContainer"]["smInfo"]["pduSessionId"], 14);
+        assert!(cancel_gsm_timer_for_test(&net));
+
+        // ---- UE-requested: the answer carried N1 + N2; so does the retransmission ----
+        let supi_ue = "imsi-001010000001431";
+        let ue = seed_release_session_1430(supi_ue, 15, amf_port);
+        let resp = handle_n1_sm_message(
+            &ue,
+            &n1(
+                15,
+                3,
+                gsm_build::message_type::PDU_SESSION_RELEASE_REQUEST,
+                &[],
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        let part = |id: &str| {
+            resp.http
+                .parts
+                .iter()
+                .find(|p| p.content_id.as_deref() == Some(id))
+                .map(|p| p.data.to_vec())
+        };
+        let answered_n1 = part("n1SmMsg").expect("the RELEASE COMMAND");
+        assert_eq!(part("n2SmInfo"), Some(expected_n2.clone()));
+        expire_gsm_timer_now_1430(&ue, timer::SmfTimerId::T3592).await;
+        let got = await_n1n2_1385(&posts, 3).await;
+        assert_eq!(got.len(), 3, "the T3592 retransmission, got {got:?}");
+        let (path, body, n1_again, n2_again) = &got[2];
+        assert_eq!(
+            path,
+            &format!("/namf-comm/v1/ue-contexts/{supi_ue}/n1-n2-messages")
+        );
+        assert_eq!(
+            n1_again, &answered_n1,
+            "the command the UE was answered with"
+        );
+        assert_eq!(n2_again, &expected_n2, "and the N2 it went out with");
+        assert_eq!(
+            body["n2InfoContainer"]["smInfo"]["n2InfoContent"]["ngapIeType"],
+            "PDU_RES_REL_CMD"
+        );
+        assert!(cancel_gsm_timer_for_test(&ue));
+
+        // ---- the NG-RAN already released: N1-only, and so is the retransmission ----
+        let supi_an = "imsi-001010000001432";
+        let an = seed_release_session_1430(supi_an, 16, amf_port);
+        let resp = ran_released_session(&an, None).await;
+        assert_eq!(resp.status, 200);
+        assert!(
+            !resp
+                .http
+                .parts
+                .iter()
+                .any(|p| p.content_id.as_deref() == Some("n2SmInfo")),
+            "no N2 in the answer"
+        );
+        expire_gsm_timer_now_1430(&an, timer::SmfTimerId::T3592).await;
+        let got = await_n1n2_1385(&posts, 4).await;
+        assert_eq!(got.len(), 4, "the T3592 retransmission, got {got:?}");
+        let (path, body, n1_again, n2_again) = &got[3];
+        assert_eq!(
+            path,
+            &format!("/namf-comm/v1/ue-contexts/{supi_an}/n1-n2-messages")
+        );
+        assert_eq!(
+            n1_again[3],
+            gsm_build::message_type::PDU_SESSION_RELEASE_COMMAND
+        );
+        assert!(n2_again.is_empty(), "N1-only: no N2 part");
+        assert!(body["n2InfoContainer"].is_null(), "{body}");
+        assert!(cancel_gsm_timer_for_test(&an));
+
+        amf.stop().await.ok();
     }
 
     /// #1385 review B1: the 5QI change is a "Create new QoS flow description" -- also
