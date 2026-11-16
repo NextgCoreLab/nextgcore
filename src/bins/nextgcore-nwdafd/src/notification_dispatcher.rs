@@ -635,6 +635,25 @@ pub async fn dispatch_notifications(ctx: Arc<RwLock<NwdafContext>>) {
                     guard.update_subscription_last_notification(&sub.subscription_id);
                 }
             }
+            Ok(resp) if notify_says_subscription_gone(&resp) => {
+                // #1571: the consumer no longer holds the subscription (its
+                // notificationUri answers 404, or 400 RESOURCE_CONTEXT_NOT_FOUND).
+                // TS 29.500 §6.2.3: terminate it rather than keep notifying until
+                // it expires. The removal is persisted, so a restart does not
+                // resurrect it.
+                let removed = ctx
+                    .read()
+                    .ok()
+                    .and_then(|guard| guard.remove_subscription(&sub.subscription_id));
+                if removed.is_some() {
+                    log::info!(
+                        "dispatch: subscription {} removed: its notificationUri answered {} \
+                         (the consumer no longer holds it, TS 29.500 §6.2.3)",
+                        sub.subscription_id,
+                        resp.status
+                    );
+                }
+            }
             Ok(resp) => {
                 log::warn!(
                     "dispatch: notify POST returned non-success status={} sub={}",
@@ -782,7 +801,8 @@ pub(crate) async fn dispatch_ml_prov_notifications_as(
 }
 
 /// Whether a Notify answer tells the producer that the consumer no longer holds
-/// the subscription, so it is terminated rather than retried (#1474).
+/// the subscription, so it is terminated rather than retried (#1474, and #1571
+/// for Nnwdaf_EventsSubscription).
 ///
 /// TS 29.500 §6.2.3 (`29500-j70.txt:5942-5962`): a producer "should consider that
 /// the subscription is no longer valid and terminate the subscription" on
@@ -2004,5 +2024,143 @@ mod ml_prov_version_tests {
                 .len(),
             1
         );
+    }
+
+    /// An events subscription whose notificationUri is the test consumer, due
+    /// now, with NF_LOAD data to report. With `state`, the context persists to
+    /// that file.
+    fn events_ctx(
+        port: u16,
+        sub_id: &str,
+        state: Option<&std::path::Path>,
+    ) -> Arc<RwLock<NwdafContext>> {
+        let mut ctx = NwdafContext::new("nwdaf-1571".to_string());
+        ctx.init(16);
+        if let Some(path) = state {
+            ctx.set_state_file(path.to_path_buf()).expect("state file");
+        }
+        let mut sub = crate::context::AnalyticsSubscription::new(
+            sub_id.to_string(),
+            AnalyticsId::NfLoad,
+            format!("http://127.0.0.1:{port}/consumer/notify"),
+            u64::MAX,
+        );
+        sub.notification_correlation_id = "corr-1571".to_string();
+        // Due on every tick: no wait between the two dispatches below.
+        sub.repetition_period_secs = Some(0);
+        ctx.add_subscription(sub).expect("subscription added");
+        {
+            let mut engine = ctx.lock_engine();
+            for load in [30.0, 32.0] {
+                engine.ingest_nf_load(crate::analytics::NfLoadSample::now(
+                    "AMF",
+                    "amf-1571",
+                    load / 100.0,
+                    0.0,
+                    0,
+                ));
+            }
+        }
+        Arc::new(RwLock::new(ctx))
+    }
+
+    /// #1571: an Nnwdaf_EventsSubscription Notify answered 404 (with or without
+    /// a ProblemDetails) or 400 RESOURCE_CONTEXT_NOT_FOUND ends the subscription
+    /// after one Notify (TS 29.500 §6.2.3), the removal reaches the state file,
+    /// and the next tick sends nothing to it.
+    #[tokio::test]
+    async fn an_events_notify_answered_404_removes_the_subscription() {
+        for (i, (status, body)) in [
+            (404, None),
+            (
+                404,
+                Some(json!({ "status": 404, "cause": "SUBSCRIPTION_NOT_FOUND" })),
+            ),
+            (
+                400,
+                Some(json!({ "status": 400, "cause": "RESOURCE_CONTEXT_NOT_FOUND" })),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let path = std::env::temp_dir().join(format!(
+                "nextgcore-nwdaf-1571-{}-{i}-{nanos}.json",
+                std::process::id()
+            ));
+            let (server, port, posts) = consumer_answering(status, body.clone()).await;
+            let ctx = events_ctx(port, "sub-1571-gone", Some(&path));
+
+            dispatch_notifications(ctx.clone()).await;
+            assert_eq!(*posts.lock().unwrap(), 1, "{status} {body:?}: one Notify");
+            assert!(
+                ctx.read()
+                    .unwrap()
+                    .get_subscription("sub-1571-gone")
+                    .is_none(),
+                "{status} {body:?}: the subscription is gone"
+            );
+
+            dispatch_notifications(ctx.clone()).await;
+            assert_eq!(*posts.lock().unwrap(), 1, "{status} {body:?}: no retry");
+            server.stop().await.expect("stop");
+
+            let mut restarted = NwdafContext::new("nwdaf-1571".to_string());
+            restarted.init(16);
+            restarted.set_state_file(path.clone()).expect("restore");
+            assert!(
+                restarted.get_subscription("sub-1571-gone").is_none(),
+                "{status} {body:?}: a restart does not resurrect it"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    /// #1571: a 5xx or any other 4xx (429, 403, another 400) is not "gone": the
+    /// events subscription stays and the next tick notifies it again.
+    #[tokio::test]
+    async fn an_events_notify_answered_5xx_or_another_4xx_is_retried() {
+        for (status, body) in [
+            (500, None),
+            (503, None),
+            (429, None),
+            (403, None),
+            (
+                400,
+                Some(json!({ "status": 400, "cause": "MANDATORY_IE_MISSING" })),
+            ),
+        ] {
+            let (server, port, posts) = consumer_answering(status, body.clone()).await;
+            let ctx = events_ctx(port, "sub-1571-kept", None);
+            dispatch_notifications(ctx.clone()).await;
+            dispatch_notifications(ctx.clone()).await;
+            assert_eq!(*posts.lock().unwrap(), 2, "{status} {body:?}: retried");
+            assert!(
+                ctx.read()
+                    .unwrap()
+                    .get_subscription("sub-1571-kept")
+                    .is_some(),
+                "{status} {body:?}: the subscription is kept"
+            );
+            server.stop().await.expect("stop");
+        }
+    }
+
+    /// #1571: a transport error (nothing listening) keeps the events
+    /// subscription.
+    #[tokio::test]
+    async fn an_events_notify_transport_error_keeps_the_subscription() {
+        let down = nextgcore_sbi::test_support::down_port();
+        let ctx = events_ctx(down.addr().port(), "sub-1571-down", None);
+        dispatch_notifications(ctx.clone()).await;
+        assert!(ctx
+            .read()
+            .unwrap()
+            .get_subscription("sub-1571-down")
+            .is_some());
     }
 }
