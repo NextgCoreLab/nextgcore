@@ -6472,6 +6472,9 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             log::info!(
                 "SM Context Update ({n2_sm_info_type}) acknowledged for ref={sm_context_ref}"
             );
+            if n2_sm_info_type == "PDU_RES_REL_RSP" {
+                drop_release_n2_from_t3592(sm_context_ref);
+            }
             SbiResponse::with_status(200)
                 .with_body(serde_json::json!({}).to_string(), "application/json")
         }
@@ -6814,6 +6817,52 @@ fn gsm_timer_armed(sm_context_ref: &str, timer_id: timer::SmfTimerId) -> bool {
                 .is_some_and(|e| e.timer_id == timer_id)
         })
         .unwrap_or(false)
+}
+
+/// #1563 review: the NG-RAN acknowledged the N2 Resource Release (`PDU_RES_REL_RSP`)
+/// of the release T3592 guards. The UP connection is no longer active, so a later
+/// retransmission of the PDU SESSION RELEASE COMMAND goes N1-only (TS 23.502
+/// §4.3.4.2: "If the User Plane connection of the PDU Session is not activated, the
+/// message sent by the SMF to the AMF shall not include N2 SM Resource Release
+/// request"), not paging a CM-IDLE UE to release resources the NG-RAN has freed.
+/// Returns whether an N2 was dropped.
+fn drop_release_n2_from_t3592(sm_context_ref: &str) -> bool {
+    let Ok(mut timers) = gsm_procedure_timers().lock() else {
+        return false;
+    };
+    match timers.get_mut(sm_context_ref) {
+        Some(entry)
+            if entry.timer_id == timer::SmfTimerId::T3592
+                && entry
+                    .n2
+                    .as_ref()
+                    .is_some_and(|n2| n2.kind == GsmN2Kind::ReleaseCommand) =>
+        {
+            entry.n2 = None;
+            log::info!(
+                "ref={sm_context_ref}: the NG-RAN released the session's resources; a T3592 \
+                 retransmission of the release command goes N1-only"
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Whether the User Plane connection of `sm_context_ref` is active, for the N2 rule
+/// of a PDU Session Release (TS 23.502 §4.3.4.2 steps 3a/3b, `23502-k20.txt:14016-
+/// 14020`): N2 SM Resource Release request only for an activated one (#1563).
+/// ACTIVATING counts as active: the NG-RAN may already hold the resources the
+/// activation set up. A context with no session record (one restored after a
+/// restart, whose UP state is not persisted) also counts as active: the SMF cannot
+/// tell the UP connection is down, and a release missing its N2 would leave the
+/// NG-RAN's resources allocated.
+fn up_connection_active(sm_context_ref: &str) -> bool {
+    smf_self()
+        .read()
+        .ok()
+        .and_then(|ctx| ctx.sess_find_by_sm_context_ref(sm_context_ref))
+        .is_none_or(|sess| sess.up_cnx_state != context::UpCnxState::Deactivated)
 }
 
 /// PTI values (TS 24.007 §11.2.3.1a, TS 24.501 §9.6): 0 is "no procedure
@@ -8110,7 +8159,9 @@ pub(crate) async fn release_for_reactivation(
         0, // network-initiated: no procedure transaction (TS 24.501 §6.3.3.2)
         policy::gsm_cause::REACTIVATION_REQUESTED,
     );
-    let n2 = build_release_command_transfer();
+    // #1563, TS 23.502 §4.3.4.2 step 3b: the N2 SM Resource Release request only for
+    // a UP connection that is activated. Read before it is marked deactivated below.
+    let n2 = up_connection_active(sm_context_ref).then(build_release_command_transfer);
     if let Ok(ctx) = smf_self().read() {
         if let Some(mut sess) = ctx.sess_find_by_sm_context_ref(sm_context_ref) {
             sess.up_cnx_state = context::UpCnxState::Deactivated;
@@ -8118,7 +8169,8 @@ pub(crate) async fn release_for_reactivation(
         }
     }
     // #1430: armed with the N2 it goes out with, so a T3592 retransmission carries
-    // the same PDU_RES_REL_CMD (TS 23.502 §4.3.4.2 step 3b).
+    // the same PDU_RES_REL_CMD (TS 23.502 §4.3.4.2 step 3b), or none when the first
+    // transfer had none (#1563).
     arm_gsm_timer_with_n2(
         sm_context_ref,
         timer::SmfTimerId::T3592,
@@ -8126,9 +8178,18 @@ pub(crate) async fn release_for_reactivation(
         supi,
         psi,
         Some(amf_uri),
-        Some(GsmN2::release(n2.clone())),
+        n2.clone().map(GsmN2::release),
     );
-    send_n1_n2_release_transfer(amf_uri, supi, psi, &n1_cmd, &n2).await;
+    match n2 {
+        Some(n2) => send_n1_n2_release_transfer(amf_uri, supi, psi, &n1_cmd, &n2).await,
+        None => {
+            log::info!(
+                "ref={sm_context_ref}: the UP connection is not active; the release \
+                 command goes without N2 (TS 23.502 §4.3.4.2 step 3b)"
+            );
+            send_n1_n2_message_transfer(Some(amf_uri), supi, psi, &n1_cmd, sm_context_ref).await;
+        }
+    }
 }
 
 /// N1N2MessageTransfer carrying an N1 5GSM message AND an N2 PDU Session Resource
@@ -9386,6 +9447,10 @@ async fn handle_n1_sm_message(sm_context_ref: &str, n1: &[u8]) -> SbiResponse {
             // UPF forwarding state and the IP are released before the command is
             // acknowledged. The context itself lives until RELEASE COMPLETE so
             // T3592 has something to key on.
+            // #1563, TS 23.502 §4.3.4.2 step 3a: whether the N2 SM Resource Release
+            // request goes with the command is the UP connection's state at the
+            // release, read before anything here changes it.
+            let up_active = up_connection_active(sm_context_ref);
             release_user_plane(sm_context_ref).await;
 
             let n1_cmd = policy::build_release_command(
@@ -9393,13 +9458,14 @@ async fn handle_n1_sm_message(sm_context_ref: &str, n1: &[u8]) -> SbiResponse {
                 pti,
                 cause.unwrap_or(policy::gsm_cause::REQUEST_REJECTED_UNSPECIFIED),
             );
-            let n2_cmd = build_release_command_transfer();
+            let n2_cmd = up_active.then(build_release_command_transfer);
             // #912 review n3: the user-plane release can find the UPF holds no such
             // session (cause 65), and that reconciliation completes the whole release;
             // a T3592 for a context that is gone would only retransmit and abandon
             // nothing.
             // #1430: the N2 Resource Release request goes out with the command
-            // (TS 23.502 §4.3.4.2 step 3a), so a T3592 retransmission carries it too.
+            // (TS 23.502 §4.3.4.2 step 3a), so a T3592 retransmission carries it too;
+            // and neither carries one for a UP connection that is not active (#1563).
             if lookup_policy_binding(sm_context_ref).is_some() {
                 arm_gsm_timer_with_n2(
                     sm_context_ref,
@@ -9408,15 +9474,18 @@ async fn handle_n1_sm_message(sm_context_ref: &str, n1: &[u8]) -> SbiResponse {
                     &binding.supi,
                     psi,
                     amf_uri.as_deref(),
-                    Some(GsmN2::release(n2_cmd.clone())),
+                    n2_cmd.clone().map(GsmN2::release),
                 );
             }
-            sbi_response_with_n1_n2(
-                200,
-                serde_json::json!({ "n2SmInfoType": "PDU_RES_REL_CMD" }),
-                &n1_cmd,
-                &n2_cmd,
-            )
+            match n2_cmd {
+                Some(n2_cmd) => sbi_response_with_n1_n2(
+                    200,
+                    serde_json::json!({ "n2SmInfoType": "PDU_RES_REL_CMD" }),
+                    &n1_cmd,
+                    &n2_cmd,
+                ),
+                None => sbi_response_with_n1(200, serde_json::json!({}), &n1_cmd),
+            }
         }
 
         N1SmIntent::ModificationRequested { psi, pti } => {
@@ -26694,6 +26763,8 @@ mod tests {
         let psi = 13;
         let sm_context_ref = seed_pcf_authorised(supi, psi, "pol-1398");
         set_amf_1385(&sm_context_ref, amf_port);
+        // #1563: a session whose UP connection is active, so the release carries N2.
+        mark_up_cnx_state(&sm_context_ref, context::UpCnxState::Activated);
 
         let restore = || {
             smf_sbi_request_handler(policy_notify_1387(
@@ -27082,6 +27153,8 @@ mod tests {
             }
         }
         set_amf_1385(&reference, amf_port);
+        // #1563: a session whose UP connection is active, so its release carries N2.
+        mark_up_cnx_state(&reference, context::UpCnxState::Activated);
         reference
     }
 
@@ -27211,6 +27284,154 @@ mod tests {
         assert!(n2_again.is_empty(), "N1-only: no N2 part");
         assert!(body["n2InfoContainer"].is_null(), "{body}");
         assert!(cancel_gsm_timer_for_test(&an));
+
+        amf.stop().await.ok();
+    }
+
+    /// #1563, TS 23.502 §4.3.4.2 (`23502-k20.txt:14016-14020`): "If the User Plane
+    /// connection of the PDU Session is not activated, the message sent by the SMF to
+    /// the AMF shall not include N2 SM Resource Release request". A session whose UP
+    /// connection is DEACTIVATED (the UE went CM-IDLE) is released N1-only on both
+    /// paths, and so is its T3592 retransmission:
+    /// - network-initiated (the UPF-restart reactivation release, step 3b): no
+    ///   `n2InfoContainer` in the N1N2MessageTransfer;
+    /// - UE-requested (step 3a): no `n2SmInfo` part and no `n2SmInfoType` in the
+    ///   UpdateSMContext answer.
+    ///
+    /// REVERT-VERIFIED: with the N2 built unconditionally again, every transfer and
+    /// the answer carry the PDU_RES_REL_CMD.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_release_of_a_deactivated_up_connection_carries_no_n2_1563() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (amf, amf_port, posts) = n1n2_recording_amf_1385(false).await;
+        let amf_uri = format!("http://127.0.0.1:{amf_port}");
+
+        // ---- network-initiated: N1-only, and so is the retransmission ----
+        let supi = "imsi-001010000001563";
+        let net = seed_release_session_1430(supi, 14, amf_port);
+        mark_up_cnx_state(&net, context::UpCnxState::Deactivated);
+        release_for_reactivation(&net, &amf_uri, supi, 14).await;
+        let got = await_n1n2_1385(&posts, 1).await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        let (_, body, first_n1, n2) = &got[0];
+        assert_eq!(
+            first_n1[3],
+            gsm_build::message_type::PDU_SESSION_RELEASE_COMMAND
+        );
+        assert!(n2.is_empty(), "no N2 part");
+        assert!(body["n2InfoContainer"].is_null(), "{body}");
+        expire_gsm_timer_now_1430(&net, timer::SmfTimerId::T3592).await;
+        let got = await_n1n2_1385(&posts, 2).await;
+        assert_eq!(got.len(), 2, "the T3592 retransmission, got {got:?}");
+        let (_, body, n1_again, n2_again) = &got[1];
+        assert_eq!(n1_again, first_n1, "the same command, verbatim");
+        assert!(n2_again.is_empty(), "the retransmission is N1-only too");
+        assert!(body["n2InfoContainer"].is_null(), "{body}");
+        assert!(cancel_gsm_timer_for_test(&net));
+
+        // ---- UE-requested: the answer is N1-only, and so is the retransmission ----
+        let supi_ue = "imsi-001010000001564";
+        let ue = seed_release_session_1430(supi_ue, 15, amf_port);
+        mark_up_cnx_state(&ue, context::UpCnxState::Deactivated);
+        let resp = handle_n1_sm_message(
+            &ue,
+            &n1(
+                15,
+                3,
+                gsm_build::message_type::PDU_SESSION_RELEASE_REQUEST,
+                &[],
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        let part = |id: &str| {
+            resp.http
+                .parts
+                .iter()
+                .find(|p| p.content_id.as_deref() == Some(id))
+                .map(|p| p.data.to_vec())
+        };
+        let answered_n1 = part("n1SmMsg").expect("the RELEASE COMMAND");
+        assert_eq!(
+            answered_n1[3],
+            gsm_build::message_type::PDU_SESSION_RELEASE_COMMAND
+        );
+        assert_eq!(part("n2SmInfo"), None, "no N2 in the answer");
+        let answer: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).expect("JSON");
+        assert!(answer["n2SmInfoType"].is_null(), "{answer}");
+        expire_gsm_timer_now_1430(&ue, timer::SmfTimerId::T3592).await;
+        let got = await_n1n2_1385(&posts, 3).await;
+        assert_eq!(got.len(), 3, "the T3592 retransmission, got {got:?}");
+        let (_, body, n1_again, n2_again) = &got[2];
+        assert_eq!(n1_again, &answered_n1);
+        assert!(n2_again.is_empty(), "the retransmission is N1-only too");
+        assert!(body["n2InfoContainer"].is_null(), "{body}");
+        assert!(cancel_gsm_timer_for_test(&ue));
+
+        amf.stop().await.ok();
+    }
+
+    /// #1563 (review of #1564): once the NG-RAN has acknowledged the N2 Resource
+    /// Release (`PDU_RES_REL_RSP`), the UP connection is no longer active, so a later
+    /// T3592 retransmission of the release command is N1-only (TS 23.502 §4.3.4.2),
+    /// not a PDU_RES_REL_CMD that pages a CM-IDLE UE for resources the NG-RAN freed.
+    /// Before the acknowledgement the retransmission keeps its N2 (#1430).
+    ///
+    /// REVERT-VERIFIED: without the drop in the `PDU_RES_REL_RSP` arm, the
+    /// retransmission after the acknowledgement still carries the PDU_RES_REL_CMD.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn t3592_drops_the_n2_once_the_ran_released_1563() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (amf, amf_port, posts) = n1n2_recording_amf_1385(false).await;
+        let amf_uri = format!("http://127.0.0.1:{amf_port}");
+        let expected_n2 = n2_transfer::release_command_transfer().expect("release transfer");
+
+        let supi = "imsi-001010000001565";
+        let net = seed_release_session_1430(supi, 14, amf_port);
+        release_for_reactivation(&net, &amf_uri, supi, 14).await;
+        let got = await_n1n2_1385(&posts, 1).await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(
+            got[0].3, expected_n2,
+            "the active session's release carries N2"
+        );
+        let first_n1 = got[0].2.clone();
+        // A retransmission before the NG-RAN answered keeps the N2.
+        expire_gsm_timer_now_1430(&net, timer::SmfTimerId::T3592).await;
+        let got = await_n1n2_1385(&posts, 2).await;
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[1].3, expected_n2, "not yet acknowledged: N2 again");
+
+        let rel_rsp = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode([0x00])
+        };
+        let req = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts/x/modify").with_body(
+            serde_json::json!({
+                "n2SmInfoType": "PDU_RES_REL_RSP",
+                "n2SmInfo": rel_rsp,
+            })
+            .to_string(),
+            "application/json",
+        );
+        let resp = handle_sm_context_update(&net, &req).await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+
+        expire_gsm_timer_now_1430(&net, timer::SmfTimerId::T3592).await;
+        let got = await_n1n2_1385(&posts, 3).await;
+        assert_eq!(got.len(), 3, "the T3592 retransmission, got {got:?}");
+        let (_, body, n1_again, n2_again) = &got[2];
+        assert_eq!(n1_again, &first_n1, "the same command, verbatim");
+        assert!(n2_again.is_empty(), "N1-only after the NG-RAN released");
+        assert!(body["n2InfoContainer"].is_null(), "{body}");
+        assert!(cancel_gsm_timer_for_test(&net));
 
         amf.stop().await.ok();
     }
