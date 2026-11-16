@@ -67,6 +67,10 @@ data:
       say "FATAL: dn already exists (this container restarted); the pod must be recreated"
       exec sleep infinity
     fi
+    # Whether the node had sch_netem loaded before this pod's first tc (a
+    # NET_ADMIN tc can make the kernel autoload it, which outlives the pod).
+    if grep -q '^sch_netem ' /proc/modules; then nm=loaded; else nm=absent; fi
+    say "sch_netem before the first tc: $nm ($(grep -c . /proc/modules) modules listed)"
     # dn: a bridge in the UPF's namespace, one namespace per EAS.
     ip link add eas-br type bridge
     ip addr add 10.60.0.1/24 dev eas-br

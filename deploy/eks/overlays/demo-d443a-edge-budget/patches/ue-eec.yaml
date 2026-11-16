@@ -16,6 +16,11 @@
         mountPath: /d443a
         readOnly: true
 - op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: NO_COLOR
+    value: "1"
+- op: add
   path: /spec/template/spec/volumes/-
   value:
     name: d443a-ue-eec

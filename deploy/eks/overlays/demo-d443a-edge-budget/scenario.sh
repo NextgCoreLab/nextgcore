@@ -32,11 +32,10 @@ D443A_EAS_IDS=(6b1d7e3c-0000-4000-8000-0000000471a1 6b1d7e3c-0000-4000-8000-0000
   6b1d7e3c-0000-4000-8000-0000000471a3)
 D443A_EAS_NAMES=(eas-local eas-regional eas-cloud)
 D443A_EEC_ID=6b1d7e3c-0000-4000-8000-0000000471ec
-D443A_KEY=d443a-edge-budget
 
 d443a_main() {
   : "${NAMESPACE:?}" "${DEMO_MODE:?}" "${OUT:?}"
-  local K=(kubectl -n "${NAMESPACE}")
+  local K=(kubectl -n "${NAMESPACE}" --request-timeout=120s)
   local S="${OUT}/scenario" HERE ARM FAILS=0 keys i
   HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   mkdir -p "${S}"
@@ -181,7 +180,17 @@ d443a_main() {
   fi
 
   # --- 4b. netem preflight: fail loudly without NET_ADMIN or sch_netem --------------
+  # Whether sch_netem was loaded on the node BEFORE this pod's first tc: the
+  # sidecar logs /proc/modules before its baseline netem (the first tc of the
+  # run). A NET_ADMIN tc can make the kernel autoload the module, which would
+  # outlive teardown, so the artefacts say which it was.
   local pre
+  pre="$(count_in upf she-eas 'sch_netem before the first tc: ')"
+  "${K[@]}" logs deploy/upf -c she-eas 2>/dev/null | grep -E 'sch_netem before the first tc: ' | head -1 \
+    >"${S}/sch_netem.txt" || true
+  echo "sch_netem_before_first_tc=$(sed -nE 's/.*sch_netem before the first tc: ([a-z]+).*/\1/p' "${S}/sch_netem.txt")" \
+    >>"${S}/meta.txt"
+  [[ "${pre}" -ge 1 ]] || bad "the sidecar did not record sch_netem before its first tc"
   pre="$("${K[@]}" exec deploy/upf -c she-eas -- sh -c \
     'ip netns exec eas-cloud tc qdisc add dev lo root netem delay 0ms && ip netns exec eas-cloud tc qdisc del dev lo root && echo netem-ok' 2>&1)"
   if [[ "${pre}" != *netem-ok* ]]; then
@@ -198,7 +207,7 @@ d443a_main() {
   # and the QOS_MON SRR on the UE's session once eesd subscribed: eesd logs a
   # QOS_MON rt= line per report. If the session predates the subscription and no
   # report arrives, the UE pod is power-cycled once (recorded in meta.txt).
-  wait_for 120 bash -c "$(declare -f n6_avg scrape); K=(kubectl -n ${NAMESPACE}); [ -n \"\$(n6_avg 10.60.0.11)\" ] && [ -n \"\$(n6_avg 10.60.0.12)\" ] && [ -n \"\$(n6_avg 10.60.0.13)\" ]" \
+  wait_for 120 bash -c "$(declare -f n6_avg scrape); K=(kubectl -n ${NAMESPACE} --request-timeout=60s); [ -n \"\$(n6_avg 10.60.0.11)\" ] && [ -n \"\$(n6_avg 10.60.0.12)\" ] && [ -n \"\$(n6_avg 10.60.0.13)\" ]" \
     || bad "smfd has no N6 delay result for every EAS within 120 s"
   if ! wait_for 60 has_in ees ees '\[demo:d443a-edge-budget\] QOS_MON rt='; then
     echo "ue_power_cycled=true" >>"${S}/meta.txt"
@@ -224,23 +233,23 @@ d443a_main() {
   if [[ "${ARM}" != no-kpi-patch ]]; then
     # --- 7. Act 2: eas-local moves away (+16 ms one way on its N6 path) -------------
     netem_eas add || bad "netem on eas-local"
-    wait_for 60 bash -c "$(declare -f n6_avg scrape); K=(kubectl -n ${NAMESPACE}); v=\$(n6_avg 10.60.0.11); [ -n \"\$v\" ] && [ \"\$v\" -ge 8 ]" \
+    wait_for 60 bash -c "$(declare -f n6_avg scrape); K=(kubectl -n ${NAMESPACE} --request-timeout=60s); v=\$(n6_avg 10.60.0.11); [ -n \"\$v\" ] && [ \"\$v\" -ge 8 ]" \
       || bad "smf_n6_delay_ms for eas-local did not reach 8 ms within 60 s"
     sleep 4   # one more QOS_MON period, so eesd's sample carries it
     jobs_act 3
     snapshot act2
     netem_eas del || bad "netem off eas-local"
-    wait_for 60 bash -c "$(declare -f n6_avg scrape); K=(kubectl -n ${NAMESPACE}); v=\$(n6_avg 10.60.0.11); [ -n \"\$v\" ] && [ \"\$v\" -lt 8 ]" \
+    wait_for 60 bash -c "$(declare -f n6_avg scrape); K=(kubectl -n ${NAMESPACE} --request-timeout=60s); v=\$(n6_avg 10.60.0.11); [ -n \"\$v\" ] && [ \"\$v\" -lt 8 ]" \
       || bad "eas-local's N6 delay did not come back under 8 ms"
 
     # --- 8. Act 3: the UE's own path is slow (+20 ms on the gNB's N3 egress) --------
     netem_gnb add || bad "netem on the gNB"
-    wait_for 60 bash -c "$(declare -f last_rt logs_of); K=(kubectl -n ${NAMESPACE}); v=\$(last_rt); [ -n \"\$v\" ] && [ \"\$v\" -ge $(( ${rt0:-0} + 15 )) ]" \
+    wait_for 60 bash -c "$(declare -f last_rt logs_of); K=(kubectl -n ${NAMESPACE} --request-timeout=60s); v=\$(last_rt); [ -n \"\$v\" ] && [ \"\$v\" -ge $(( ${rt0:-0} + 15 )) ]" \
       || bad "QOS_MON rtDelays did not rise by 15 ms within 60 s"
     jobs_act 2
     snapshot act3
     netem_gnb del || bad "netem off the gNB"
-    wait_for 60 bash -c "$(declare -f last_rt logs_of); K=(kubectl -n ${NAMESPACE}); v=\$(last_rt); [ -n \"\$v\" ] && [ \"\$v\" -lt $(( ${rt0:-0} + 10 )) ]" \
+    wait_for 60 bash -c "$(declare -f last_rt logs_of); K=(kubectl -n ${NAMESPACE} --request-timeout=60s); v=\$(last_rt); [ -n \"\$v\" ] && [ \"\$v\" -lt $(( ${rt0:-0} + 10 )) ]" \
       || bad "rtDelays did not come back"
   fi
 
@@ -259,9 +268,21 @@ d443a_main() {
   (( FAILS == 0 && rc == 0 ))
 }
 
+# One gate result: the full output goes to <S>/gates-out/<name>-<case>.txt, and
+# the gate line in <g> keeps only the lines a check reads (the demo error, rc=,
+# the show line), whatever precedes them: eesd's and smfd's OpenTelemetry
+# preamble pushed the error past a fixed cut once (run 20261116T010236Z).
+# test-scenario.sh feeds that run's real eesd output through it.
+d443a_gate() {   # S g name case output
+  mkdir -p "$1/gates-out"
+  printf '%s\n' "$5" >"$1/gates-out/$3-$4.txt"
+  printf '%s %s: %s\n' "$3" "$4" \
+    "$(grep -E 'unknown mode|rc=|demo=|mode=|Error' <<<"$5" | tr '\n' ' ' | head -c 1200)" >>"$2"
+}
+
 d443a_off() {
   # The demo-off arm on the overlay's topology: no demo: block anywhere.
-  local K=(kubectl -n "${NAMESPACE}") S="${OUT}/scenario"
+  local K=(kubectl -n "${NAMESPACE}" --request-timeout=120s) S="${OUT}/scenario"
   wait_for 120 has_in smf smf 'accepted N6 Delay Measurement Control Information x[0-9]+' \
     || bad "smfd did not provision N6 delay measurement (config-only, #1502)"
   # The UE has no demo, so she-offload is the unknown command it was.
@@ -279,16 +300,9 @@ d443a_off() {
 
 d443a_gates() {
   # mode: bogus at startup, every binary of the demo; and the runtime switch.
-  local K=(kubectl -n "${NAMESPACE}") S="${OUT}/scenario" g="${OUT}/scenario/gates.txt"
+  local K=(kubectl -n "${NAMESPACE}" --request-timeout=120s) S="${OUT}/scenario" g="${OUT}/scenario/gates.txt"
   : >"${g}"
-  # The full output goes to gates/<name>.txt; the gate line keeps the lines a
-  # check reads (the demo error, rc=, the show line), whatever precedes them.
-  gate() {
-    mkdir -p "${S}/gates-out"
-    printf '%s\n' "$3" >"${S}/gates-out/$1-$2.txt"
-    printf '%s %s: %s\n' "$1" "$2" \
-      "$(grep -E 'unknown mode|rc=|demo=|mode=|Error' <<<"$3" | tr '\n' ' ' | head -c 1200)" >>"${g}"
-  }
+  gate() { d443a_gate "${S}" "${g}" "$@"; }
   local r
   r="$("${K[@]}" exec deploy/upf -c she-eas -- sh -c \
     'sed "s/mode: measured-budget/mode: bogus/" /tmp/d443a/eas-local.yaml >/tmp/d443a/bogus.yaml && nr-she-eas -c /tmp/d443a/bogus.yaml; echo "rc=$?"' 2>&1)"

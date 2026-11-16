@@ -27,8 +27,6 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CORE_DIR="$(cd "${HERE}/../../../.." && pwd)"
 KEY=d443a-edge-budget
 : "${CORE_SRC:?}" "${SIM_SRC:?}"
-T="${TARGET_DIR:-$(mktemp -d -t tgt-d443a-XXXXXX)}"
-echo "run-arms: target dir ${T} (cargo clean it afterwards)"
 ARMS=("$@")
 [[ ${#ARMS[@]} -gt 0 ]] || ARMS=(off:off main:measured-budget static:static
   no-kpi-patch:measured-budget gates:measured-budget)
@@ -49,6 +47,9 @@ if [[ -n "${CORE_IMAGE_TAG:-}" && -n "${SIM_IMAGE_TAG:-}" ]]; then
   SKIP_BUILD=true
 fi
 if [[ "${SKIP_BUILD:-}" != true ]]; then
+# A target dir of this run unless given, made only when something is built.
+T="${TARGET_DIR:-$(mktemp -d -t tgt-d443a-XXXXXX)}"
+echo "run-arms: target dir ${T} (cargo clean it afterwards)"
 CORE_HEAD="$(git -C "${CORE_SRC}" rev-parse HEAD)"; SIM_HEAD="$(git -C "${SIM_SRC}" rev-parse HEAD)"
 for d in "${CORE_SRC}" "${SIM_SRC}"; do
   [[ -z "$(git -C "${d}" status --porcelain)" ]] || { echo "run-arms: ${d} is not clean" >&2; exit 1; }

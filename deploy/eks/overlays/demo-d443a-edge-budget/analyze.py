@@ -348,8 +348,8 @@ def c_off(d):
     if '+n6Delays' in read(d, 'off', 'smf.log'):
         return False, 'smfd added n6Delays with the demo off'
     cli = read(d, 'off-cli.txt')
-    if 'JOB' in cli or '[demo:' in cli or not cli.strip():
-        return False, f'she-offload answered with the demo off: {cli[:200]}'
+    if 'Unknown command: she-offload' not in cli or 'JOB' in cli or '[demo:' in cli:
+        return False, f'she-offload is not the unknown command it was: {cli[:200]}'
     eas = read(d, 'off-eas.txt')
     if 'runs only with demo d443a-edge-budget enabled' not in eas or 'rc=1' not in eas:
         return False, f'nr-she-eas started without the demo: {eas[:200]}'
@@ -369,8 +369,10 @@ ARMS = {
 # A revert arm holds when its target FAILS and every other check passes.
 REVERT_TARGET = {'no-kpi-patch': 'c_load'}
 # Checks reported but not part of the verdict: the plan states them as targets on
-# real paths, not guarantees (c_accuracy: the emulated distance and the stated
-# RAN delay make the prediction a lower bound).
+# real paths, not guarantees. c_accuracy: the anchor proves the loop, not the
+# estimation. On EKS the prediction came out ABOVE the measured rtt (Act 1
+# predicted 11, measured 9-10; run 20261116T003320Z): rtDelays includes the
+# gNB's stated 1 + 1 ms RAN delay, which the simulated radio never incurs.
 ADVISORY = {'c_accuracy'}
 
 
@@ -518,35 +520,32 @@ def fixture(arm):
 
 
 def gates_fixture():
-    g = '\n'.join([
-        'nr-she-eas bogus: nr-she-eas: /tmp/d443a/bogus.yaml: demo config: unknown mode "bogus" '
-        'for demo "d443a-edge-budget" (known modes ["measured-budget", "static"]) rc=1',
-        'eesd bogus: Error: demo config: unknown mode "bogus" for demo "d443a-edge-budget" '
-        '(known modes ["measured-budget", "static"]) (UnknownMode { .. }) rc=1',
-        'smfd bogus: Error: demo config: unknown mode "bogus" for demo "d443a-edge-budget" rc=1',
-        'nr-ue bogus: Error: Invalid demo block in /tmp/bogus.yaml Caused by: demo config: unknown '
-        'mode "bogus" for demo "d443a-edge-budget" rc=1',
-        'nr-cli set-bogus: ERROR: demo config: unknown mode "bogus" for demo "d443a-edge-budget" '
-        'rc=0 d443a-edge-budget mode=measured-budget',
-        'nr-cli set-static: previous mode measured-budget d443a-edge-budget mode=static',
-    ]) + '\n'
-    # The real nextgsim-demo audit format (nextgsim-demo/src/lib.rs, `set_mode`).
-    ue = [f'{TS} 2026-11-16T01:07:16.9Z  WARN nextgsim_demo: [demo:{KEY}] audit: rejected set '
-          f'mode="bogus" from nr-cli: demo config: unknown mode "bogus" for demo "{KEY}" (known modes '
-          f'["measured-budget", "static"]); mode unchanged (measured-budget)']
+    """The real gates capture of run 20261116T011728Z (ANSI stripped): its
+    gates.txt, kept beside this file, and the UE's audit lines."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    g = open(os.path.join(here, 'fixture-gates-20261116T011728Z.txt')).read()
+    ue = ['2026-11-16T01:24:06.858634695Z 2026-11-16T01:24:06.858596Z  WARN nextgsim_demo: '
+          '[demo:d443a-edge-budget] audit: rejected set mode="bogus" from nr-cli: demo config: '
+          'unknown mode "bogus" for demo "d443a-edge-budget" (known modes ["measured-budget", '
+          '"static"]); mode unchanged (measured-budget)',
+          '2026-11-16T01:24:09.080948021Z 2026-11-16T01:24:09.080896Z  WARN nextgsim_demo: '
+          '[demo:d443a-edge-budget] audit: mode measured-budget -> static from nr-cli; applies '
+          'to the next decision']
     return {'gates': {'ue.log': ue}, '_files': {'gates.txt': g}, '_meta': 'arm=gates\n'}
 
 
 def off_fixture():
+    """The off arm, from run 20261116T011013Z's real lines."""
     return {'off': {
-        'smf.log': ['2026-11-16T00:24:51.996274977Z [2026-11-16T00:24:51.996Z INFO  nextgcore_smfd::n6_delay] '
-                    'UPF 10.10.1.73:8805 accepted N6 Delay Measurement Control Information x1 '
+        'smf.log': ['2026-11-16T01:11:02.789343434Z [2026-11-16T01:11:02.789Z INFO  nextgcore_smfd::n6_delay] '
+                    'UPF 10.10.5.190:8805 accepted N6 Delay Measurement Control Information x1 '
                     '(Association Update, TS 29.244 §5.33.8.2)'],
         'ees.log': [f'{TS} INFO EEC Register'], 'ue.log': [f'{TS} INFO UE up'],
         'eas.log': [f'{TS} [d443a-sidecar] dn ready']},
-        '_files': {'off-cli.txt': 'ERROR: unknown command: she-offload\n',
-                   'off-eas.txt': 'nr-she-eas: /tmp/d443a/off.yaml: nr-she-eas runs only with demo '
-                                  'd443a-edge-budget enabled (demo.enabled and demo.d443a-edge-budget.enabled)\nrc=1\n'},
+        '_files': {'off-cli.txt': 'ERROR: Unknown command: she-offload\ncommand terminated with exit code 1\n',
+                   'off-eas.txt': '2026-11-16T01:14:06.486914Z ERROR nr_she_eas: nr-she-eas: /tmp/d443a/off.yaml: '
+                                  'nr-she-eas runs only with demo d443a-edge-budget enabled (demo.enabled and '
+                                  'demo.d443a-edge-budget.enabled)\nrc=1\n'},
         '_meta': 'arm=off\nmode=off\n'}
 
 
@@ -601,54 +600,208 @@ def sub(rx, rep):
     return lambda ls: [re.sub(rx, rep, x) for x in ls]
 
 
+def with_files(fx, **files):
+    import copy
+    out = copy.deepcopy(fx)
+    out['_files'] = dict(out.get('_files', {}), **files)
+    return out
+
+
+def drop_act(fx, act):
+    import copy
+    out = copy.deepcopy(fx)
+    out.pop(act, None)
+    return out
+
+
+def append(line):
+    return lambda ls: ls + [line]
+
+
+def nth(rx, rep, n=0):
+    """Substitute in the n-th line matching rx only."""
+    def f(ls):
+        out, k = [], 0
+        for x in ls:
+            if re.search(rx, x):
+                if k == n:
+                    x = re.sub(rx, rep, x)
+                k += 1
+            out.append(x)
+        return out
+    return f
+
+
+def drop_nth(rx, n=0):
+    def f(ls):
+        out, k = [], 0
+        for x in ls:
+            if re.search(rx, x):
+                k += 1
+                if k - 1 == n:
+                    continue
+            out.append(x)
+        return out
+    return f
+
+
 def negatives(arm):
-    """{check name: negative-control fixture} for `arm`: each breaks exactly the
-    one thing that check asserts."""
+    """{check name: [negative-control fixtures]} for `arm`: one control per
+    condition the check asserts, each breaking that condition alone (the
+    forced-true sweep in self_test proves no other check catches it)."""
     if arm == 'gates':
         g = gates_fixture()
-        bad_eesd = dict(g, _files={'gates.txt': g['_files']['gates.txt'].replace(
-            'eesd bogus: Error: demo config: unknown mode "bogus"', 'eesd bogus: started rc=124')})
-        bad_cli = dict(g, _files={'gates.txt': g['_files']['gates.txt'].replace(
-            'rc=0 d443a-edge-budget mode=measured-budget', 'rc=0 d443a-edge-budget mode=bogus')})
-        return {'c_gates_startup': bad_eesd, 'c_gates_runtime': bad_cli}
+        txt = g['_files']['gates.txt']
+
+        def gate_sub(old, new):
+            assert old in txt, old
+            return with_files(g, **{'gates.txt': txt.replace(old, new)})
+        return {
+            'c_gates_startup': [
+                # Each binary on its own: its refusal gone, or its rc not 1.
+                gate_sub('nr-she-eas: /tmp/d443a/bogus.yaml: demo config: unknown mode "bogus"',
+                         'nr-she-eas: /tmp/d443a/bogus.yaml: started'),
+                gate_sub('eesd bogus: Error: demo config: unknown mode "bogus"', 'eesd bogus: started'),
+                gate_sub('smfd bogus: Error: demo config: unknown mode "bogus"', 'smfd bogus: started'),
+                gate_sub('UE failed: Invalid demo block in /tmp/bogus.yaml: demo config: unknown mode "bogus"',
+                         'UE started'),
+                # Killed by the timeout, not refused.
+                with_files(g, **{'gates.txt': re.sub(r'(eesd bogus: .*?) rc=1', r'\1 rc=124', txt, count=1)}),
+            ],
+            'c_gates_runtime': [
+                # The refused set changed the mode anyway.
+                gate_sub('rc=1 demo=d443a-edge-budget active=true mode=measured-budget',
+                         'rc=1 demo=d443a-edge-budget active=true mode=bogus'),
+                # set mode=static was not accepted.
+                with_files(g, **{'gates.txt': re.sub(r'nr-cli set-static: .*\n',
+                                                     'nr-cli set-static: ERROR: refused\n', txt)}),
+                # The refused set is not audited.
+                edit_only(g, 'gates', 'ue.log', drop(r'audit: rejected')),
+            ],
+        }
     if arm == 'off':
         o = off_fixture()
-        bad = edit(o, 'off', 'ees.log', lambda ls: ls + [f'{TS} INFO [demo:{KEY}] EES-SEL x'])
-        return {'c_off': bad}
+        demo_line = f'{TS} INFO [demo:{KEY}] EES-SEL x'
+        return {'c_off': [
+            edit_only(o, 'off', 'smf.log', drop(r'accepted N6')),
+            edit_only(o, 'off', 'ees.log', append(demo_line)),
+            edit_only(o, 'off', 'ue.log', append(f'{TS} WARN DEMO MODE ACTIVE: {KEY}=static')),
+            edit_only(o, 'off', 'smf.log', append(f'{TS} INFO QOS_MON ref=1 +n6Delays upf=u [x]')),
+            with_files(o, **{'off-cli.txt': 'Error from server (NotFound): pods "ue" not found\n'}),
+            with_files(o, **{'off-eas.txt': 'rc=1\n'}),
+            with_files(o, **{'off-eas.txt': o['_files']['off-eas.txt'].replace('rc=1', 'rc=0')}),
+        ]}
     fx = fixture(arm)
+    sel_rx = r'EES-SEL ac='
+    upf_ip = '10.45.255.254'
     n = {
-        # A restart: the warm capture of nrf-standin.log is longer than the next.
-        'c_acts_ordered': edit_only(fx, 'warm', 'nrf-standin.log', lambda ls: ls + ls),
-        'c_registrations': edit(fx, 'warm', 'eas.log', drop(r'EAS-REG eas=eas-cloud')),
-        'c_standin': edit(fx, 'warm', 'nrf-standin.log', sub(r'PUT -> 201', 'PUT -> 401')),
-        'c_n6_provisioned': edit(fx, 'warm', 'smf.log', drop(r'accepted N6')),
-        'c_n6_measured': edit_only(fx, 'warm', 'smf.prom', lambda ls: [ls[0].replace('10.60.0.13', '10.60.0.99')]),
-        'c_qos_mon': edit(fx, 'warm', 'ees.log', sub(r',10\.60\.0\.13=20ms', '')),
-        'c_act1': edit(fx, 'act1', 'ue.log', sub(r'JOB job=5 eas=eas-local', 'JOB job=5 eas=eas-regional')),
-        'c_accuracy': edit(fx, 'act1', 'ue.log', sub(r'rtt=11 ', 'rtt=40 ')),
-        'c_act2': edit_only(fx, 'act2', 'smf.prom', lambda ls: [ls[0].replace('"10.60.0.11",stat="avg"} 18',
-                                                                            '"10.60.0.11",stat="avg"} 7')]),
-        'c_act3': edit(fx, 'act3', 'ue.log', sub(r'reason=ees-404', 'reason=ees-401')),
-        'c_load': edit(fx, 'load', 'eas.log', drop(r'EAS-KPI-PATCH')),
-        'c_act1_static': edit(fx, 'act1', 'ees.log', sub(r'src=static', 'src=static-fallback')),
-        'c_act2_static': edit(fx, 'act2', 'ue.log', sub(r'rtt=38 (.*)result=deadline-miss', r'rtt=12 \1result=ok')),
-        'c_act3_static': edit(fx, 'act3', 'ees.log', sub(r'selected=\[eas-local', 'selected=[eas-regional')),
-        'c_load_static': edit(fx, 'load', 'eas.log', drop(r'EAS-KPI-PATCH')),
-        'c_revert_pre': edit(fx, 'load', 'eas.log', drop(r'--no-kpi-patch')),
+        'c_acts_ordered': [
+            # A restart: the warm capture of nrf-standin.log is longer than the next.
+            edit_only(fx, 'warm', 'nrf-standin.log', lambda ls: ls + ls),
+            # (An act not captured at all also fails every check of that act, so
+            # it has no single-check control; the shrink above is this check's.)
+        ],
+        'c_registrations': [
+            edit(fx, 'warm', 'eas.log', drop(r'EAS-REG eas=eas-cloud')),
+            edit(fx, 'warm', 'eas.log', sub(r'endPt=10\.60\.0\.11', 'endPt=10.60.0.99')),
+        ],
+        'c_standin': [edit(fx, 'warm', 'nrf-standin.log', sub(r'PUT -> 201', 'PUT -> 401'))],
+        'c_n6_provisioned': [edit(fx, 'warm', 'smf.log', drop(r'accepted N6'))],
+        'c_n6_measured': [edit_only(fx, 'warm', 'smf.prom',
+                                    lambda ls: [ls[0].replace('10.60.0.13', '10.60.0.99')])],
+        'c_qos_mon': [
+            edit(fx, 'warm', 'ees.log', drop(r'Nsmf_EventExposure_Subscribe')),
+            edit(fx, 'warm', 'ees.log', sub(r',10\.60\.0\.13=20ms', '')),
+        ],
+        # selection_act through c_act1 (and its static twin): one control per condition.
+        'c_act1': [
+            # Fewer jobs than asked for (job + selection + execution lines all gone).
+            edit(edit(edit(fx, 'act1', 'ue.log', drop(r'JOB job=(?:[3-9]|10) ')),
+                      'act1', 'ees.log', lambda ls: [x for x in ls if 'EES-SEL' not in x]
+                      + [x for x in ls if 'EES-SEL' in x][:2]),
+                 'act1', 'eas.log', drop(r'EAS-EXEC job=(?:[3-9]|10) ')),
+            # One job on-device (with its own selection line).
+            edit(edit(fx, 'act1', 'ue.log', append(f'{TS} INFO [demo:{KEY}] JOB job=99 on-device '
+                                                   f'fallback reason=ees-404 mode=measured-budget')),
+                 'act1', 'ees.log', append(sel_line(MEASURED, ['eas-local', 'eas-cloud']))),
+            # A selection line too few.
+            edit(fx, 'act1', 'ees.log', drop_nth(sel_rx, 3)),
+            # One selection from another budget source.
+            edit(fx, 'act1', 'ees.log', nth(r'src=upf-n3\+upf-n6', 'src=static-fallback', 4)),
+            # One selection not 201 (still naming eas-local).
+            edit(fx, 'act1', 'ees.log', nth(r'result=201', 'result=207', 4)),
+            # One job run elsewhere than the EES's first choice (and executed there).
+            edit(edit(fx, 'act1', 'ue.log', sub(r'JOB job=5 eas=eas-local', 'JOB job=5 eas=eas-regional')),
+                 'act1', 'eas.log', sub(r'\[eas-local\] (.*)EAS-EXEC job=5 src=(\S+) eas=eas-local',
+                                        r'[eas-regional] \1EAS-EXEC job=5 src=\2 eas=eas-regional')),
+            # One execution not from the UE's address (NATed).
+            edit(fx, 'act1', 'eas.log', sub(r'EAS-EXEC job=6 src=\S+', f'EAS-EXEC job=6 src={upf_ip}')),
+            # One job late.
+            edit(fx, 'act1', 'ue.log', sub(r'(JOB job=7 .*)result=ok', r'\1result=deadline-miss')),
+            # One selection (and its job, run there) not on the expected EAS.
+            edit(edit(edit(fx, 'act1', 'ees.log', nth(r'selected=\[eas-local', 'selected=[eas-regional', 7)),
+                      'act1', 'ue.log', sub(r'JOB job=8 eas=eas-local', 'JOB job=8 eas=eas-regional')),
+                 'act1', 'eas.log', sub(r'\[eas-local\] (.*)EAS-EXEC job=8 src=(\S+) eas=eas-local',
+                                        r'[eas-regional] \1EAS-EXEC job=8 src=\2 eas=eas-regional')),
+        ],
+        'c_accuracy': [edit(fx, 'act1', 'ue.log', sub(r'rtt=11 ', 'rtt=40 '))],
+        'c_act2': [
+            # The live N6 control: eas-local's N6 average under 8 ms.
+            edit_only(fx, 'act2', 'smf.prom', lambda ls: [ls[0].replace('"10.60.0.11",stat="avg"} 18',
+                                                                        '"10.60.0.11",stat="avg"} 7')]),
+            # Byte-identical, part 1: eas-local re-registered.
+            edit(fx, 'act2', 'eas.log', append(
+                f'{TS} [eas-local] {TS} INFO [demo:{KEY}] EAS-REG eas=eas-local registrationId=r2 '
+                f'endPt=10.60.0.11 maxRespTime=10 ms avlComp=50')),
+            # Part 2: eas-local merge-patched its KPI.
+            edit(fx, 'act2', 'eas.log', append(
+                f'{TS} [eas-local] {TS} INFO [demo:{KEY}] EAS-KPI-PATCH eas=eas-local svcKpi.avlComp=50 (200)')),
+            # Part 3: eesd merge-patched a registration.
+            edit(fx, 'act2', 'ees.log', append(
+                f'{TS} INFO EAS registration merge-patched: registrationId=r-eas-local')),
+            # The selection did not move.
+            edit(edit(fx, 'act2', 'ees.log', sub(r'selected=\[eas-regional', 'selected=[eas-local')),
+                 'act2', 'ue.log', sub(r'eas=eas-regional', 'eas=eas-local')),
+        ] if arm == 'main' else [],
+        'c_act3': [
+            # rtDelays did not rise (rt 6 throughout).
+            edit(fx, 'act3', 'ees.log', sub(r'QOS_MON rt=26', 'QOS_MON rt=6')),
+            # An on-device job for another reason.
+            edit(fx, 'act3', 'ue.log', nth(r'reason=ees-404', 'reason=ees-401', 1)),
+            # A job ran on an EAS.
+            edit(edit(fx, 'act3', 'ue.log', append(job_line(98, 'eas-local', 11, 12, MEASURED, 'ok',
+                                                            'measured-budget'))),
+                 'act3', 'ees.log', append(sel_line(MEASURED, [], '404', 26))),
+            # A selection was 201, not 404.
+            edit(fx, 'act3', 'ees.log', nth(r'result=404', 'result=201', 1)),
+            # A selection from another budget source.
+            edit(fx, 'act3', 'ees.log', nth(r'src=upf-n3\+upf-n6', 'src=static-fallback', 0)),
+        ] if arm == 'main' else [],
+        'c_load': [
+            edit(fx, 'load', 'eas.log', drop(r'EAS-KPI-PATCH')),
+            edit(fx, 'load', 'eas.log', sub(r'svcKpi\.avlComp=5 \(200\)', 'svcKpi.avlComp=5 (500)')),
+            edit(edit(fx, 'load', 'ees.log', sub(r'selected=\[eas-regional', 'selected=[eas-local')),
+                 'load', 'ue.log', sub(r'eas=eas-regional', 'eas=eas-local')),
+        ] if arm == 'main' else [],
+        'c_act1_static': [edit(fx, 'act1', 'ees.log', sub(r'src=static', 'src=static-fallback'))],
+        'c_act2_static': [edit(fx, 'act2', 'ue.log', sub(r'rtt=38 (.*)result=deadline-miss', r'rtt=12 \1result=ok'))],
+        'c_act3_static': [edit(fx, 'act3', 'ees.log', sub(r'selected=\[eas-local', 'selected=[eas-regional'))],
+        'c_load_static': [
+            edit(fx, 'load', 'eas.log', drop(r'EAS-KPI-PATCH')),
+            edit(fx, 'load', 'ue.log', sub(r'(JOB job=1[6-8] .*)result=deadline-miss', r'\1result=ok')),
+        ],
+        'c_revert_pre': [
+            edit(fx, 'load', 'eas.log', drop(r'--no-kpi-patch')),
+            edit(fx, 'load', 'eas.log', append(
+                f'{TS} [eas-local] {TS} INFO [demo:{KEY}] EAS-KPI-PATCH eas=eas-local svcKpi.avlComp=5 (200)')),
+            edit(fx, 'load', 'ue.log', sub(r'(JOB job=1[1-3] .*)result=deadline-miss', r'\1result=ok')),
+        ],
     }
-    if arm == 'main':
-        # The act-2 registration rule on its own.
-        n['c_act2'] = edit(fx, 'act2', 'eas.log', lambda ls: ls + [
-            f'{TS} [eas-local] {TS} INFO [demo:{KEY}] EAS-REG eas=eas-local registrationId=r2 '
-            f'endPt=10.60.0.11 maxRespTime=10 ms avlComp=50'])
-    if arm == 'no-kpi-patch':
-        # The revert target has no single-check negative: c_load passing needs the
-        # selection to move, which is c_revert_pre's precondition failing. Its
-        # controls are: it FAILS on this arm's complete fixture and PASSES on
-        # main's (self_test asserts both).
-        n.pop('c_load', None)
     names = {c.__name__ for c in ARMS[arm]}
-    return {k: v for k, v in n.items() if k in names}
+    out = {k: v for k, v in n.items() if k in names and v}
+    # The revert target's controls are the other way round (self_test).
+    out.pop(REVERT_TARGET.get(arm), None)
+    return out
 
 
 def self_test():
@@ -677,22 +830,23 @@ def self_test():
             if name not in negs:
                 fails.append(f'{arm}: {name} has no negative control')
                 continue
-            with tempfile.TemporaryDirectory() as d:
-                write(negs[name], d)
+            for i, neg in enumerate(negs[name]):
+              with tempfile.TemporaryDirectory() as d:
+                write(neg, d)
                 ok, _ = c(d)
                 if ok:
-                    fails.append(f'{arm}: {name} does not react to its negative control')
+                    fails.append(f'{arm}: {name} does not react to its negative control #{i}')
                 if name in ADVISORY:
                     continue
                 holds, _ = verdict(arm, d)
                 if holds:
-                    fails.append(f'{arm}: the verdict holds on {name}\'s negative control')
+                    fails.append(f'{arm}: the verdict holds on {name}\'s negative control #{i}')
                 # Forced-true sweep: with the check forced to PASS, the verdict
                 # now holds, so this check (alone) is what catches the control.
                 forced, _ = verdict(arm, d, forced=name)
                 if not forced:
-                    fails.append(f'{arm}: {name} forced true still fails the verdict: '
-                                 f'its negative control also breaks another check')
+                    fails.append(f'{arm}: {name} forced true still fails the verdict on control #{i}: '
+                                 f'it also breaks another check')
     for f in fails:
         print('not ok -', f)
     print('ok' if not fails else f'{len(fails)} failure(s)')

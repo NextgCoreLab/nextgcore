@@ -57,6 +57,10 @@
             key: eases
       - name: RUST_LOG
         value: info
+      # Plain log lines (tracing-subscriber honours NO_COLOR; it survives
+      # ip netns exec and setpriv).
+      - name: NO_COLOR
+        value: "1"
     # Not privileged: every capability dropped, then only what the sidecar's root
     # shell uses:
     #   NET_ADMIN  the bridge, veths, addresses, routes, iptables, tc (netem);

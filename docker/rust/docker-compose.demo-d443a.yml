@@ -1,3 +1,8 @@
+# NOT YET RUN: this file has not been brought up end to end (the validation
+# host has no docker compose); EKS (deploy/eks/overlays/demo-d443a-edge-budget)
+# is the only validated path. A manual run capturing the success signal is the
+# gate before anything claims compose support.
+#
 # D443A compose stack (nextgsim#471): eesd picks the edge server on a
 # UPF-measured communication + compute budget. The 5GC (smfd with N6 delay
 # measurement and QOS_MON, upfd with UN6DM and QFQM), eesd, three EAS sidecars
@@ -26,7 +31,7 @@
 # grants eees-* scopes only with such a producer, #1391).
 #
 # The acts (netem needs NET_ADMIN in these containers, and sch_netem on the host):
-#   Act 2  docker compose -f docker-compose.demo-d443a.yml exec eas-local tc qdisc add dev eth0 root netem delay 16ms
+#   Act 2  docker compose -f docker-compose.demo-d443a.yml exec eas-local tc qdisc change dev eth0 root netem delay 20ms   (its distance 4 -> 20 ms)
 #   Act 3  docker compose -f docker-compose.demo-d443a.yml exec gnb-netem sh -c 'tc qdisc add dev eth0 root handle 1: prio &&
 #            tc qdisc add dev eth0 parent 1:3 handle 30: netem delay 20ms &&
 #            tc filter add dev eth0 parent 1:0 protocol ip prio 1 u32 match ip dport 2152 0xffff flowid 1:3'
@@ -286,7 +291,15 @@ services:
       UPF_NAT_EXCLUDE: 10.60.0.0/24
       UPF_N6_DELAY_MEASUREMENT: "true"
       UPF_QOS_FLOW_MONITORING: "true"
-    command: ["-c", "/etc/nextgcore/upf.yaml", "--pfcp-addr", "172.23.0.7", "--gtpu-addr", "172.23.0.7", "--tun-ip", "10.45.0.1", "--tun-prefix", "16", "--pfcp-allowed-peers", "172.23.0.4"]
+    # The EASes' own calls (eesd, the NRF) cross from dn to core through the UPF,
+    # masqueraded to its core address; UE traffic into dn keeps its source
+    # (UPF_NAT_EXCLUDE). Nothing is published: both networks stay internal.
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        iptables -t nat -A POSTROUTING -s 10.60.0.0/24 -d 172.23.0.0/24 -j MASQUERADE &&
+        exec nf-binary -c /etc/nextgcore/upf.yaml --pfcp-addr 172.23.0.7 --gtpu-addr 172.23.0.7
+        --tun-ip 10.45.0.1 --tun-prefix 16 --pfcp-allowed-peers 172.23.0.4
     volumes:
       - ./configs/5gc/upf.yaml:/etc/nextgcore/upf.yaml:ro
     networks:
@@ -345,6 +358,7 @@ services:
       RUST_LOG: info
       D443A_MODE: ${D443A_MODE:-measured-budget}
       EAS_ID: eas-local
+      EAS_DIST_MS: "4"
       EAS_IP: 10.60.0.11
       EAS_MR: "10"
       EAS_AVL: "50"
@@ -384,6 +398,7 @@ services:
       RUST_LOG: info
       D443A_MODE: ${D443A_MODE:-measured-budget}
       EAS_ID: eas-regional
+      EAS_DIST_MS: "6"
       EAS_IP: 10.60.0.12
       EAS_MR: "14"
       EAS_AVL: "50"
@@ -423,6 +438,7 @@ services:
       RUST_LOG: info
       D443A_MODE: ${D443A_MODE:-measured-budget}
       EAS_ID: eas-cloud
+      EAS_DIST_MS: "40"
       EAS_IP: 10.60.0.13
       EAS_MR: "40"
       EAS_AVL: "200"
@@ -525,7 +541,7 @@ networks:
       config:
         - subnet: 172.23.0.0/24
           gateway: 172.23.0.1
-  # The FL data network (N6): the UPF and the AF only. No route off the host.
+  # The EAS data network (N6): the UPF and the three EASes only. No route off the host.
   dn:
     driver: bridge
     internal: true
