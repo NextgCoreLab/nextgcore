@@ -95,7 +95,7 @@ d443a_main() {
     before="$(count_in ue ue '\[demo:d443a-edge-budget\] JOB job=')"
     ue_cli "she-offload job count=${n} interval-ms=1000" >>"${S}/cli.txt"
     wait_for $(( 30 + 3 * n )) sh -c \
-      "[ \$(kubectl -n ${NAMESPACE} logs deploy/ue -c ue 2>/dev/null | grep -c '\[demo:d443a-edge-budget\] JOB job=') -ge $(( before + n )) ]" \
+      "[ \$(kubectl -n ${NAMESPACE} --request-timeout=60s logs deploy/ue -c ue 2>/dev/null | grep -c '\[demo:d443a-edge-budget\] JOB job=') -ge $(( before + n )) ]" \
       || bad "the UE did not finish ${n} job(s)"
   }
   netem_eas() {  # add|del: eas-local 16 ms further away (its emulated distance 4 -> 20 ms)
@@ -182,7 +182,7 @@ d443a_main() {
 
   # --- 4. the UE: PDU session, EEC key --------------------------------------------
   "${K[@]}" rollout status deploy/ue --timeout=300s >/dev/null || bad "ue rollout"
-  wait_for 240 sh -c "[ -n \"\$(kubectl -n ${NAMESPACE} exec deploy/ue -c ue -- ip -4 -o addr show uesimtun0 2>/dev/null)\" ]" \
+  wait_for 240 sh -c "[ -n \"\$(kubectl -n ${NAMESPACE} --request-timeout=60s exec deploy/ue -c ue -- ip -4 -o addr show uesimtun0 2>/dev/null)\" ]" \
     || bad "the UE has no PDU session (uesimtun0) within 240 s"
   "${K[@]}" exec deploy/ue -c ue -- sh -c "ip -4 -o addr show uesimtun0 | awk '{print \$4}' | cut -d/ -f1" \
     >"${S}/ue-ip.txt" 2>/dev/null
@@ -219,7 +219,7 @@ d443a_main() {
     "${K[@]}" delete pod -l app.kubernetes.io/name=ue --wait=false >/dev/null
     sleep 5
     "${K[@]}" rollout status deploy/ue --timeout=300s >/dev/null || bad "ue rollout after the power cycle"
-    wait_for 240 sh -c "[ -n \"\$(kubectl -n ${NAMESPACE} exec deploy/ue -c ue -- ip -4 -o addr show uesimtun0 2>/dev/null)\" ]" \
+    wait_for 240 sh -c "[ -n \"\$(kubectl -n ${NAMESPACE} --request-timeout=60s exec deploy/ue -c ue -- ip -4 -o addr show uesimtun0 2>/dev/null)\" ]" \
       || bad "no PDU session after the power cycle"
     "${K[@]}" exec -i deploy/ue -c ue -- sh -c 'mkdir -p /tmp/d443a-cca && umask 077 && cat >/tmp/d443a-cca/eec.key' \
       <"${keys}/${D443A_EEC_ID}.key" || bad "EEC key handover after the power cycle"
