@@ -1453,6 +1453,57 @@ mod mtls_oauth2_e2e {
         server.stop().await.ok();
     }
 
+    /// #1611: the RFC 9310 NF types of the verified client certificate reach the
+    /// handler on the request, beside the NF Instance ID, so the NRF can bind an
+    /// NFRegister's nfType to them (TS 33.310 §6.1.3c.3). Without an NFTypes
+    /// extension the list is empty.
+    ///
+    /// REVERT-VERIFIED: with `convert_request` not given the NF types, the first
+    /// case sees an empty list.
+    #[tokio::test]
+    async fn direct_mtls_surfaces_the_peer_nf_types_1611() {
+        for (tag, types, expected) in [
+            (
+                "nftypes-1611",
+                Some(&["AMF", "SMF"][..]),
+                vec!["AMF", "SMF"],
+            ),
+            ("no-nftypes-1611", None, vec![]),
+        ] {
+            let pki = pki_with_uri_san_and_nf_types(tag, "urn:uuid:consumer-1611", types);
+            let (listener, addr) = crate::test_support::bound_listener().into_parts();
+            let port = addr.port();
+            let mut cfg = SbiServerConfig::new(addr).with_tls(&pki.server_key, &pki.server_cert);
+            cfg.verify_client = true;
+            cfg.verify_client_cacert = Some(pki.ca.clone());
+            let server = SbiServer::on_listener(cfg, listener);
+            server
+                .start(|req: SbiRequest| async move {
+                    SbiResponse::with_status(200)
+                        .with_json_body(&serde_json::json!({
+                            "peer": req.peer_cert_nf_instance_id,
+                            "types": req.peer_cert_nf_types,
+                        }))
+                        .expect("body")
+                })
+                .await
+                .expect("producer starts");
+            let mut client_cfg = SbiClientConfig::new("localhost", port).with_https();
+            client_cfg.ca_cert = Some(pki.ca.clone());
+            client_cfg.client_cert = Some(pki.client_cert.clone());
+            client_cfg.client_key = Some(pki.client_key.clone());
+            let resp = SbiClient::new(client_cfg)
+                .send_request(SbiRequest::get("/ntest/v1/x"))
+                .await
+                .expect("mTLS request completes");
+            server.stop().await.ok();
+            let body: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).expect("json");
+            assert_eq!(body["peer"], "consumer-1611", "{tag}");
+            assert_eq!(body["types"], serde_json::json!(expected), "{tag}");
+        }
+    }
+
     /// Issue #186: a plaintext connection carries no peer certificate, so the
     /// identity is `None` rather than anything a caller could act on.
     #[tokio::test]
