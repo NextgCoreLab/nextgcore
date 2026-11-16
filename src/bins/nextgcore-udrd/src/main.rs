@@ -875,13 +875,56 @@ async fn handle_identity_data(ue_id: &str, method: &str, request: &SbiRequest) -
             }
             SbiResponse::with_status(200).with_body(doc.to_string(), "application/json")
         }
-        Err(e) => {
-            if let Some(resp) = ue_id_rejection(&e) {
-                return resp;
-            }
-            log::debug!("[{ue_id}] identity-data lookup failed: {e:?}");
-            send_not_found("Subscriber not found", Some("DATA_NOT_FOUND"))
+        Err(e) => store_read_failure(ue_id, "identity-data", &e),
+    }
+}
+
+/// #1534: whether a subscriber-store error is the store failing (unreachable,
+/// never opened, a driver or decode error) rather than an answer about the
+/// subscriber or the request.
+fn store_error_is_outage(e: &nextgcore_dbi::DbiError) -> bool {
+    use nextgcore_dbi::DbiError;
+    !matches!(
+        e,
+        DbiError::SubscriberNotFound(_)
+            | DbiError::FieldNotFound(_)
+            | DbiError::SessionNotFound
+            | DbiError::InvalidSupi(_)
+            | DbiError::UnsupportedUeIdType(_)
+    )
+}
+
+/// #1534: `500 SYSTEM_FAILURE` (TS 29.500 Table 5.2.7.2-1) for a store outage. A
+/// 404 would tell the consumer the user does not exist (TS 29.504 Table
+/// 6.1.7.3-1 `USER_NOT_FOUND`), and a UDM / AUSF would reject the UE rather than
+/// retry.
+fn store_outage(ue_id: &str, what: &str, e: &nextgcore_dbi::DbiError) -> SbiResponse {
+    log::error!("[{ue_id}] {what}: the subscriber store failed: {e}");
+    send_error(
+        500,
+        "Internal Server Error",
+        "Subscriber store unavailable",
+        Some("SYSTEM_FAILURE"),
+    )
+}
+
+/// #1534: the answer for a failed subscriber-store read: the 400 of
+/// [`ue_id_rejection`], `500 SYSTEM_FAILURE` for an outage ([`store_outage`]),
+/// `404 USER_NOT_FOUND` for an unknown subscriber (TS 29.504 Table 6.1.7.3-1),
+/// and `404 DATA_NOT_FOUND` for data the subscriber's record lacks.
+fn store_read_failure(ue_id: &str, what: &str, e: &nextgcore_dbi::DbiError) -> SbiResponse {
+    if let Some(resp) = ue_id_rejection(e) {
+        return resp;
+    }
+    if store_error_is_outage(e) {
+        return store_outage(ue_id, what, e);
+    }
+    log::debug!("[{ue_id}] {what}: {e}");
+    match e {
+        nextgcore_dbi::DbiError::SubscriberNotFound(_) => {
+            send_not_found("Subscriber not found", Some("USER_NOT_FOUND"))
         }
+        _ => send_not_found("Subscriber data not found", Some("DATA_NOT_FOUND")),
     }
 }
 
@@ -1107,13 +1150,7 @@ async fn handle_auth_data(
                     SbiResponse::with_status(200)
                         .with_body(response_json.to_string(), "application/json")
                 }
-                Err(e) => {
-                    if let Some(resp) = ue_id_rejection(&e) {
-                        return resp;
-                    }
-                    log::error!("[{supi}] DB auth_info query failed: {e:?}");
-                    send_not_found("Subscriber not found", Some("NOT_FOUND"))
-                }
+                Err(e) => store_read_failure(supi, "authentication-subscription", &e),
             }
         }
         ("authentication-subscription", "PUT") => {
@@ -2294,13 +2331,7 @@ async fn handle_provisioned_data(
             .await
         {
             Ok(data) => data,
-            Err(e) => {
-                if let Some(resp) = ue_id_rejection(&e) {
-                    return resp;
-                }
-                log::error!("[{supi}] DB subscription_data query failed: {e:?}");
-                return send_not_found("Subscriber not found", Some("NOT_FOUND"));
-            }
+            Err(e) => return store_read_failure(supi, "provisioned-data", &e),
         };
 
     let response = match dataset {
@@ -2577,12 +2608,7 @@ async fn handle_policy_ue_data(parts: &[&str], method: &str, request: &SbiReques
                             Ok(data) => Some(serde_json::json!({
                                 "smPolicySnssaiData": build_sm_policy_data(&data)
                             })),
-                            Err(e) => {
-                                if let Some(resp) = ue_id_rejection(&e) {
-                                    return resp;
-                                }
-                                None
-                            }
+                            Err(e) => return store_read_failure(supi, "sm-data", &e),
                         }
                     }
                 };
@@ -2646,6 +2672,9 @@ async fn handle_policy_ue_data(parts: &[&str], method: &str, request: &SbiReques
                     Err(e) => {
                         if let Some(resp) = ue_id_rejection(&e) {
                             return resp;
+                        }
+                        if store_error_is_outage(&e) {
+                            return store_outage(supi, "ue-policy-set", &e);
                         }
                         // Return empty UePolicySet as default (TS 29.519)
                         SbiResponse::with_status(200)
@@ -5173,14 +5202,17 @@ udr:
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
         assert_eq!(problem["cause"], "MANDATORY_IE_INCORRECT");
 
-        // Valid PLMN routes through (404 without a subscriber DB, not 400).
+        // Valid PLMN routes through to the store, not a 400. #1534: no store is
+        // open in this test process (the backend lock is held without the test
+        // store), which is a system failure, not an unknown user.
         let resp = client
             .get(&format!(
                 "/nudr-dr/v2/subscription-data/{supi}/00101/provisioned-data/am-data"
             ))
             .await
             .expect("GET good plmn");
-        assert_eq!(resp.status, 404);
+        assert_eq!(resp.status, 500);
+        assert_eq!(json_of(&resp)["cause"], "SYSTEM_FAILURE");
 
         udr.stop().await.expect("udr stops");
     }
@@ -6823,6 +6855,13 @@ udr:
     async fn test_http_unprovisioned_policy_documents_keep_200_empty() {
         let (udr, client, _listener, _cb, _rx) = start_udr_and_listener().await;
         let supi = "imsi-001019900008706";
+        // #1534: a store that answers, and holds no such subscriber
+        // (SubscriberNotFound). Without one the reads are a store outage (500).
+        let _dbi = DbiTestStore::enable().await;
+        nextgcore_dbi::test_store::provision_subscriber_document(
+            "imsi-001019900018706",
+            nextgcore_dbi::mongodb::bson::doc! { "imsi": "001019900018706" },
+        );
         for resource in ["am-data", "ue-policy-set"] {
             let resp = client
                 .get(&format!("/nudr-dr/v2/policy-data/ues/{supi}/{resource}"))
@@ -6842,6 +6881,7 @@ udr:
             resp.status, 404,
             "sm-data has a derived default, so absence means no subscriber"
         );
+        assert_eq!(json_of(&resp)["cause"], "USER_NOT_FOUND");
         udr.stop().await.expect("stop");
     }
 
@@ -7424,5 +7464,52 @@ mod tests_nf_profile_host_kind_1324 {
                 nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
             assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
         }
+    }
+}
+
+/// #1534: how each subscriber-store error is answered.
+#[cfg(test)]
+mod tests_store_read_failure_1534 {
+    use super::store_read_failure;
+    use nextgcore_dbi::DbiError;
+
+    fn answer(e: DbiError) -> (u16, String) {
+        let resp = store_read_failure("imsi-001010000001534", "test", &e);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap();
+        (
+            resp.status,
+            body["cause"].as_str().unwrap_or("").to_string(),
+        )
+    }
+
+    /// REVERT-VERIFIED: with `store_error_is_outage` always false, the outage
+    /// errors answer 404.
+    #[test]
+    fn an_outage_is_500_an_unknown_user_404_and_a_bad_ue_id_400() {
+        for e in [
+            DbiError::NotInitialized,
+            DbiError::Retry,
+            DbiError::NoDbUri,
+            DbiError::ParseError("decode".into()),
+            DbiError::MongoDb(nextgcore_dbi::mongodb::error::Error::custom(
+                "server selection timeout",
+            )),
+        ] {
+            let label = format!("{e:?}");
+            assert_eq!(answer(e), (500, "SYSTEM_FAILURE".into()), "{label}");
+        }
+        assert_eq!(
+            answer(DbiError::SubscriberNotFound("imsi-1".into())),
+            (404, "USER_NOT_FOUND".into())
+        );
+        assert_eq!(
+            answer(DbiError::FieldNotFound("security".into())),
+            (404, "DATA_NOT_FOUND".into())
+        );
+        assert_eq!(
+            answer(DbiError::UnsupportedUeIdType("gci".into())),
+            (400, "MANDATORY_IE_INCORRECT".into())
+        );
     }
 }
