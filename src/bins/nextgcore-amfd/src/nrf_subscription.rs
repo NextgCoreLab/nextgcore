@@ -1,12 +1,13 @@
 //! #668: NF status subscriptions at the NRF (TS 29.510 §5.2.2.5, §5.2.2.6).
 //!
 //! The AMF caches the SMF, AUSF, UDM, PCF, NSSF, NSACF, UCMF, LMF and NWDAF
-//! profiles it discovers ([`CACHED_PEER_NF_TYPES`]). Before #668 nothing told it when one of them went away or moved:
-//! a deregistered or changed peer was noticed only when a request to it failed
-//! (#664 made that failure recoverable). This module subscribes, once per cached
-//! NF type, to `NF_DEREGISTERED` and `NF_PROFILE_CHANGED`, keeps every
-//! subscription alive by renewing it before its `validityTime`, and handles the
-//! NRF's `NotificationData` callback.
+//! profiles it discovers ([`CACHED_PEER_NF_TYPES`]). Before #668 nothing told
+//! it when one of them went away or moved: a deregistered or changed peer was
+//! noticed only when a request to it failed (#664 made that failure
+//! recoverable). This module subscribes, once per cached NF type, to
+//! `NF_DEREGISTERED` and `NF_PROFILE_CHANGED`, keeps every subscription alive
+//! by renewing it before its `validityTime`, and handles the NRF's
+//! `NotificationData` callback.
 //!
 //! # The callback only evicts
 //!

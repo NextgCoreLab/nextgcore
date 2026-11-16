@@ -191,8 +191,9 @@ fn the_selection_follows_the_qos_mon_budget_through_the_router_471() {
         config: edge_budget::Config::default(),
         token: token.into(),
     };
-    // The route is behind the OAuth2 gate (no NF-local callback exemption until
-    // nextgcore#1421): a bearer with the route's scope, then the path token.
+    // The route goes through the OAuth2 gate, which admits a token-less notify
+    // only through its registered callback exemption (#1525); here with a
+    // bearer of the route's scope, then the path token.
     let notify_as = |auth: Option<String>, tok: &str, rt: u32, n6_local: u32| {
         let mut req = SbiRequest::post(format!("/d443a-edge-budget/qos-mon/{tok}")).with_body(
             edge_budget::tests::qos_mon_body(rt, n6_local),
@@ -207,6 +208,7 @@ fn the_selection_follows_the_qos_mon_budget_through_the_router_471() {
         notify_as(Some(bearer(&sk, edge_budget::SCOPE)), tok, rt, n6_local)
     };
     edge_budget::install(Some(plan(edge_budget::Mode::MeasuredBudget)));
+    auth::set_callback_exemptions(oauth2_callback_exemptions());
 
     // No report yet: measured-budget ranks on the advertisement, labelled.
     let (status, ids, vendor) = eec_register(&sk);
@@ -233,19 +235,15 @@ fn the_selection_follows_the_qos_mon_budget_through_the_router_471() {
     // The EAS's registration is what it was: only the measurement moved.
     assert_eq!(eas_get(&sk, &regs[0]), local_before);
 
-    // No bearer (what a TS 33.501 §13.4.1 notify carries), or a bearer without
-    // the route's scope: refused by the gate even with the right path token, and
-    // the budget does not move back.
-    assert_eq!(notify_as(None, token, 6, 2), 401);
-    // Bearer before path token (#1523 review m1): with no bearer, a wrong path
-    // token is the same 401, so the route is no token-validity oracle.
+    // No bearer (what a TS 33.501 §13.4.1 notify carries) on the current path
+    // token: admitted by the route's callback exemption (#1525).
+    assert_eq!(notify_as(None, token, 6, 18), 204);
+    // With no bearer, a wrong path token is not exempt: 401, the same answer as
+    // any unauthenticated request, so the route is no token-validity oracle
+    // (#1523 review m1), and the budget does not move back.
     assert_eq!(
         notify_as(None, "fedcba9876543210fedcba9876543211", 6, 2),
         401
-    );
-    assert_eq!(
-        notify_as(Some(bearer(&sk, "eees-easdiscovery")), token, 6, 2),
-        403
     );
     assert_eq!(eec_register(&sk).1, ["eas-regional-471"]);
 
@@ -270,8 +268,10 @@ fn the_selection_follows_the_qos_mon_budget_through_the_router_471() {
         serde_json::json!({ "achievableLatency": 10, "budgetSrc": "static" })
     );
 
-    // Off again: the base behaviour, the route gone.
+    // Off again: the base behaviour, the route gone, nothing exempt.
     edge_budget::install(None);
+    assert!(oauth2_callback_exemptions().is_empty());
+    auth::set_callback_exemptions(oauth2_callback_exemptions());
     assert_base_behaviour(&sk);
 
     edge_budget::clear_for_test();
@@ -425,4 +425,146 @@ fn an_ac_profile_with_no_eas_within_the_deadline_is_unfulfilled_471() {
     edge_budget::install(None);
     deregister(&sk, &regs);
     auth::clear_auth_jwks();
+}
+
+/// #1525 through the router, with OAuth2 enforced (a JWKS configured): the
+/// D443A notify route's callback exemption admits a token-less notify on the
+/// current path token, and nothing else.
+#[cfg(feature = "demo-d443a-edge-budget")]
+#[test]
+fn the_qos_mon_notify_is_admitted_without_a_bearer_only_on_its_current_token_1525() {
+    let _g = auth::GLOBAL_STATE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _d = edge_budget::lock_for_test();
+    ees_context_init(512);
+    let sk = signing_key();
+    auth::set_auth_jwks(jwks_for(&sk));
+    edge_budget::clear_for_test();
+    let token = "0a1b2c3d4e5f60718293a4b5c6d7e8f9";
+    edge_budget::install(Some(edge_budget::Plan {
+        mode: edge_budget::Mode::MeasuredBudget,
+        config: edge_budget::Config::default(),
+        token: token.into(),
+    }));
+    // What the composition root registers, on the server config and in the
+    // per-route gate: exactly the one route.
+    auth::set_callback_exemptions(Vec::new());
+    let cfg = install_callback_exemptions(NextgcoreSbiServerConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+    ));
+    assert_eq!(
+        cfg.oauth2_callback_exemptions
+            .iter()
+            .map(OAuth2CallbackExemption::route)
+            .collect::<Vec<_>>(),
+        ["POST /d443a-edge-budget/qos-mon/{token}"]
+    );
+    assert_eq!(
+        auth::callback_exemption_routes(),
+        ["POST /d443a-edge-budget/qos-mon/{token}"]
+    );
+    let body = edge_budget::tests::qos_mon_body(6, 2);
+    let send = |method: &str, uri: &str| {
+        let req = match method {
+            "POST" => SbiRequest::post(uri.to_string()),
+            "PUT" => SbiRequest::put(uri.to_string()),
+            "GET" => SbiRequest::get(uri.to_string()),
+            _ => SbiRequest::delete(uri.to_string()),
+        }
+        .with_body(body.clone(), "application/json");
+        block_on(ees_sbi_request_handler(req))
+    };
+    let route = format!("/d443a-edge-budget/qos-mon/{token}");
+
+    // Admitted: no bearer, the current token; the report is used.
+    assert!(edge_budget::latest_for_test().is_none());
+    assert_eq!(send("POST", &route).status, 204);
+    assert_eq!(edge_budget::latest_for_test().map(|s| s.rt_ms), Some(6));
+    edge_budget::clear_for_test();
+    // As at #1519's server gate, an exempt request's bearer is not consulted:
+    // one without the route's scope is admitted on the current token too.
+    let mut with_bearer =
+        SbiRequest::post(route.clone()).with_body(body.clone(), "application/json");
+    with_bearer = with_bearer.with_header("Authorization", bearer(&sk, "eees-easdiscovery"));
+    assert_eq!(block_on(ees_sbi_request_handler(with_bearer)).status, 204);
+    edge_budget::clear_for_test();
+
+    // A forged or stale token, no bearer: 401, nothing used.
+    let forged = "/d443a-edge-budget/qos-mon/0a1b2c3d4e5f60718293a4b5c6d7e8f8";
+    assert_eq!(send("POST", forged).status, 401);
+    // Another method on the exact route: not exempt.
+    for m in ["PUT", "GET", "DELETE"] {
+        assert_eq!(send(m, &route).status, 401, "{m}");
+    }
+    // A token-less service request is still refused.
+    assert_eq!(
+        send("POST", "/eees-eecregistration/v1/registrations").status,
+        401
+    );
+    assert_eq!(
+        send("GET", "/eees-easregistration/v1/registrations").status,
+        401
+    );
+    // A leading `//` routes to the arm (the router trims leading slashes) but
+    // is not the exempt shape: 401.
+    assert_eq!(send("POST", &format!("/{route}")).status, 401);
+    // Spellings the router does not route here: never 204, and at the gate
+    // itself every one of them needs a bearer.
+    let variants = [
+        format!("{route}/"),
+        format!("{route}/extra"),
+        route.replace("d443a-edge-budget", "d443a%2Dedge-budget"),
+        route.replace("qos-mon", "qos%2Dmon"),
+        format!("{route}?x=1"),
+        format!("/d443a-edge-budget/qos-mon/{token}%00"),
+        "/D443A-EDGE-BUDGET/qos-mon/".to_string() + token,
+    ];
+    for v in &variants {
+        assert_ne!(send("POST", v).status, 204, "{v}");
+        let gate = auth::require_oauth2(&SbiRequest::post(v.clone()), edge_budget::SCOPE);
+        assert_eq!(gate.map(|r| r.status), Some(401), "{v}");
+    }
+    assert!(
+        edge_budget::latest_for_test().is_none(),
+        "no refused request was used"
+    );
+
+    // Demo off: the route does not exist and nothing is exempt.
+    edge_budget::install(None);
+    assert!(oauth2_callback_exemptions().is_empty());
+    auth::set_callback_exemptions(oauth2_callback_exemptions());
+    assert_eq!(send("POST", &route).status, 404);
+    let gate = auth::require_oauth2(&SbiRequest::post(route.clone()), edge_budget::SCOPE);
+    assert_eq!(gate.map(|r| r.status), Some(401));
+    // Even a stale list left installed admits nothing with the demo off: the
+    // check is the live token.
+    edge_budget::install(Some(edge_budget::Plan {
+        mode: edge_budget::Mode::MeasuredBudget,
+        config: edge_budget::Config::default(),
+        token: token.into(),
+    }));
+    auth::set_callback_exemptions(oauth2_callback_exemptions());
+    edge_budget::install(None);
+    let gate = auth::require_oauth2(&SbiRequest::post(route.clone()), edge_budget::SCOPE);
+    assert_eq!(gate.map(|r| r.status), Some(401));
+
+    auth::set_callback_exemptions(Vec::new());
+    edge_budget::clear_for_test();
+    auth::clear_auth_jwks();
+}
+
+/// #1525, default build: no demo route, so nothing is exempt.
+#[cfg(not(feature = "demo-d443a-edge-budget"))]
+#[test]
+fn a_default_build_registers_no_callback_exemption_1525() {
+    let _g = auth::GLOBAL_STATE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    assert!(oauth2_callback_exemptions().is_empty());
+    let cfg = install_callback_exemptions(NextgcoreSbiServerConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+    ));
+    assert!(cfg.oauth2_callback_exemptions.is_empty());
+    assert!(auth::callback_exemption_routes().is_empty());
 }

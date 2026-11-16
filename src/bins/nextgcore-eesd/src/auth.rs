@@ -18,6 +18,7 @@
 use std::sync::OnceLock;
 use std::sync::RwLock;
 
+use nextgcore_sbi::callback_auth::{admits_without_bearer, OAuth2CallbackExemption};
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
 use nextgcore_sbi::oauth::authorize_bearer;
 use nextgcore_sbi::server::{send_forbidden, send_unauthorized};
@@ -84,6 +85,55 @@ pub fn clear_auth_jwks() {
     }
 }
 
+/// The callback routes this EES serves that are admitted without a bearer
+/// (#1525): a notification carries no access token (TS 33.501 §13.4.1, TS
+/// 29.500 §6.10.7 NOTE) and is authenticated by the callback token in its path.
+/// The same list is registered on the SBI server (#1519's
+/// `with_oauth2_callback_exemptions`); because eesd gates the bearer per route
+/// (eesd-08), [`require_oauth2`] consults it too. Empty unless a route that
+/// needs one is served (today only demo d443a-edge-budget's QOS_MON notify), so
+/// by default every route requires a bearer, as before.
+static CALLBACK_EXEMPTIONS: RwLock<Vec<OAuth2CallbackExemption>> = RwLock::new(Vec::new());
+
+/// Install the callback exemptions [`require_oauth2`] consults (start-up, and
+/// tests).
+pub fn set_callback_exemptions(exemptions: Vec<OAuth2CallbackExemption>) {
+    *CALLBACK_EXEMPTIONS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = exemptions;
+}
+
+/// The installed callback exemptions, as `METHOD /pattern` (tests, logs).
+pub fn callback_exemption_routes() -> Vec<String> {
+    CALLBACK_EXEMPTIONS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .map(OAuth2CallbackExemption::route)
+        .collect()
+}
+
+/// Whether `req` is a registered callback route carrying a callback token the
+/// EES holds: then no bearer is required. The shared matcher
+/// (`callback_auth::admits_without_bearer`) is strict: exact method, the raw
+/// path segment for segment (no trailing `/`, no extra segment, no
+/// percent-encoded variant), and the route's own token check.
+fn callback_admitted(req: &SbiRequest) -> bool {
+    let exemptions = CALLBACK_EXEMPTIONS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let admitted = admits_without_bearer(&exemptions, &req.header.method, &req.header.uri);
+    if admitted {
+        log::debug!(
+            "{} {}: callback admitted on its callback token, no bearer required (#1525)",
+            req.header.method,
+            // An exempt route's token is its last segment, by construction.
+            nextgcore_sbi::log_redact::redact_last_segment(&req.header.uri)
+        );
+    }
+    admitted
+}
+
 /// Serializes tests that mutate any process-global in this crate.
 ///
 /// An ALIAS for `context::PROCESS_STATE_TEST_LOCK` as of #107, not a second static.
@@ -100,7 +150,14 @@ pub(crate) use crate::context::PROCESS_STATE_TEST_LOCK as GLOBAL_STATE_TEST_LOCK
 /// `Some(response)` carrying the RFC 7807 error to return:
 /// * 401 — missing/malformed/invalid/expired bearer token, or no JWKS configured.
 /// * 403 — valid token whose `scope` does not include `expected_scope`.
+///
+/// A registered callback route with a callback token the EES holds is admitted
+/// without a bearer (#1525, [`set_callback_exemptions`]); every other request,
+/// including that route with a wrong, stale or missing token, needs a bearer.
 pub fn require_oauth2(req: &SbiRequest, expected_scope: &str) -> Option<SbiResponse> {
+    if callback_admitted(req) {
+        return None;
+    }
     // Clone the configured JWKS out of the lock so verification happens without
     // holding the guard.
     let jwks = auth_jwks().read().ok().and_then(|g| g.clone());
