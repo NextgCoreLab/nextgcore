@@ -128,6 +128,38 @@ async fn a_modification_to_a_blackholed_smf_does_not_hold_the_ngap_task() {
     server.forget_ue(live.0);
 }
 
+/// #1546, TS 24.501 §6.4.2.4.1: a UE-requested PDU Session Modification (0xC9)
+/// whose SMF update fails is answered PDU SESSION MODIFICATION REJECT (§8.3.8,
+/// message type 0xCA, Table 9.7.2) with 5GSM cause #26, echoing the PSI and PTI.
+/// Before, it went out as 0xCC (PDU SESSION MODIFICATION COMPLETE), a UE-to-network
+/// message the UE answers with 5GSM STATUS #97 (§7.4).
+///
+/// REVERT-VERIFIED: with the message type back at 0xCC, the reject is not found.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_modification_is_answered_with_a_modification_reject_1546() {
+    let down = nextgcore_sbi::test_support::down_port();
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (15_460_101u64, 146u32);
+    secured_registered_ue(&mut server, ue, ran);
+    hold_session(&mut server, ue, 5, "mod-1546", down.port());
+    let request = [0x2E, 0x05, 0x07, 0xC9];
+
+    server
+        .handle_5gsm_message(ASSOC, ue, ran, &request, None)
+        .await
+        .expect("handled");
+    let sent = apply_until(&mut server, |s| !concerns(s, ue).is_empty()).await;
+    let [Sent::DownlinkNas { nas_pdu, .. }] = concerns(&sent, ue)[..] else {
+        panic!("one DL NAS TRANSPORT to the UE: {sent:?}");
+    };
+    let reject = [0x2E, 0x05, 0x07, 0xCA, 0x1A];
+    assert!(
+        nas_pdu.windows(reject.len()).any(|w| w == reject),
+        "the DL NAS Transport carries PDU SESSION MODIFICATION REJECT #26: {nas_pdu:02x?}"
+    );
+    server.forget_ue(ue);
+}
+
 /// TS 23.502 §4.2.3.2, CM-CONNECTED: a Service Request re-activating a session at a
 /// blackholed SMF does not hold the NGAP task, and another UE's Service Request is
 /// served meanwhile. The Service Accept waits for the ACTIVATING's answer, since it

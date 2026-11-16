@@ -10639,8 +10639,12 @@ impl NgapServer {
             }
             Err(e) => {
                 log::warn!("SMF modification failed ({e}), sending reject");
-                // PDU SESSION MODIFICATION REJECT, cause #26
-                let reject = vec![0x2E, psi, pti, 0xCC, 0x1A];
+                // #1546: PDU SESSION MODIFICATION REJECT (TS 24.501 §8.3.8, message type
+                // 0xCA, Table 9.7.2) with 5GSM cause #26 "insufficient resources"
+                // (§6.4.2.4.1). Before, the type was 0xCC, PDU SESSION MODIFICATION
+                // COMPLETE: a UE-to-network message the UE answers with 5GSM STATUS
+                // #97 (§7.4), leaving its procedure running until T3581 expires.
+                let reject = vec![0x2E, psi, pti, 0xCA, 0x1A];
                 self.send_n1_sm_to_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, psi, &reject)
                     .await?;
             }
