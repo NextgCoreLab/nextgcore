@@ -483,12 +483,29 @@ async fn main() -> Result<()> {
     }
 
     global_context().set_nrf_uri(&settings.nrf_uri).await;
-    match match sbi.registration_host() {
-        Ok(host) => register_with_nrf(host, sbi.port, scheme, &nf_instance_id).await,
-        Err(why) => Err(why),
-    } {
-        Ok(()) => nextgcore_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id.clone(), 5),
-        Err(e) => log::warn!("NRF registration failed (will operate without NRF): {e}"),
+    // #1482: a failed attempt is retried in the background, and the heartbeat
+    // starts after the one that succeeds.
+    match sbi.registration_host() {
+        Ok(host) => {
+            let (host, port, id) = (host.to_string(), sbi.port, nf_instance_id.clone());
+            nextgcore_sbi::heartbeat::register_or_retry(
+                "UCMF",
+                Default::default(),
+                move || {
+                    let (host, id) = (host.clone(), id.clone());
+                    async move {
+                        register_with_nrf(&host, port, scheme, &id)
+                            .await
+                            .map(|()| Some(id))
+                    }
+                },
+                |nf_instance_id| {
+                    nextgcore_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5)
+                },
+            )
+            .await;
+        }
+        Err(e) => log::warn!("NRF registration not attempted (will operate without NRF): {e}"),
     }
     for note in startup_notes {
         dispatch(note);

@@ -240,20 +240,17 @@ async fn register_with_nrf(nrf_uri: &str, nf_instance: &NfInstance) -> Result<()
                 nextgcore_sbi::heartbeat::set_registered_profile(&body);
                 Ok(())
             } else {
-                let msg = format!(
+                // #1482: a failure, not a success. This returned Ok(()), so the
+                // caller started a heartbeat for a profile the NRF never held,
+                // with nothing recorded for a 404 to re-register, and never
+                // tried again. The caller now retries (register_or_retry).
+                Err(format!(
                     "NRF registration returned status {}: {:?}",
                     status, response.http.content
-                );
-                log::warn!("{msg}");
-                // Non-fatal: PCF can operate without NRF
-                Ok(())
+                ))
             }
         }
-        Err(e) => {
-            log::warn!("NRF registration failed (PCF will operate standalone): {e}");
-            // Non-fatal: PCF can operate without NRF
-            Ok(())
-        }
+        Err(e) => Err(format!("NRF registration failed: {e}")),
     }
 }
 
@@ -374,37 +371,23 @@ pub async fn pcf_register_with_nrf() -> Result<Option<String>, String> {
     Ok(Some(nf_instance.id))
 }
 
-/// Close SBI server and deregister from NRF
+/// Close the SBI context.
 /// Port of pcf_sbi_close() from sbi-path.c
-pub fn pcf_sbi_close() {
+///
+/// #1482: this no longer sends NFDeregister. It sent a DELETE from a spawned
+/// task that the process could exit before running, and it duplicated the
+/// awaited, bounded `nextgcore_sbi::heartbeat::deregister_self()` that
+/// `app::run` already calls before it stops the listener. Now that every
+/// successful registration records its instance ID (the heartbeat starts only
+/// after one), that call covers every registered PCF. What is left is awaited.
+pub async fn pcf_sbi_close() {
     if !SBI_SERVER_RUNNING.load(Ordering::SeqCst) {
         log::warn!("SBI server not running");
         return;
     }
 
     log::info!("Closing PCF SBI server");
-
-    // Attempt async deregistration (only if tokio runtime is available)
-    let sbi_ctx = global_context();
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(async move {
-            if let (Some(nrf_uri), Some(self_instance)) = (
-                sbi_ctx.get_nrf_uri().await,
-                sbi_ctx.get_self_instance().await,
-            ) {
-                if let Ok((host, port)) = parse_uri_host_port(&nrf_uri) {
-                    let client = sbi_ctx.get_client(&host, port).await;
-                    let path = format!("/nnrf-nfm/v1/nf-instances/{}", self_instance.id);
-                    if let Err(e) = client.delete(&path).await {
-                        log::warn!("Failed to deregister PCF from NRF: {e}");
-                    } else {
-                        log::info!("PCF deregistered from NRF");
-                    }
-                }
-            }
-            sbi_ctx.clear_clients().await;
-        });
-    }
+    global_context().clear_clients().await;
 
     SBI_SERVER_RUNNING.store(false, Ordering::SeqCst);
 
@@ -3041,7 +3024,7 @@ mod tests {
         let result = pcf_sbi_open(None).await;
         assert!(result.is_err());
 
-        pcf_sbi_close();
+        pcf_sbi_close().await;
         assert!(!pcf_sbi_is_running());
 
         // Open with custom config
@@ -3057,7 +3040,7 @@ mod tests {
         let result = pcf_sbi_open(Some(config)).await;
         assert!(result.is_ok());
 
-        pcf_sbi_close();
+        pcf_sbi_close().await;
     }
 
     /// #1479: the self instance and the NRF URI are readable the moment

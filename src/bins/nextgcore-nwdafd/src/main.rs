@@ -594,29 +594,48 @@ async fn main() -> Result<()> {
     // reaching for the global_context() singleton.
     let sbi_ctx = global_context();
     sbi_ctx.set_nrf_uri(&args.nrf_uri).await;
-    if let Err(e) = match sbi.registration_host() {
+    // #1482: a failed attempt is retried in the background, and the heartbeat
+    // starts after the one that succeeds.
+    match sbi.registration_host() {
         Ok(host) => {
-            register_with_nrf(sbi_ctx, host, sbi_port, &nf_instance_id, &allowed_nf_types).await
+            let (host, id, allowed) = (
+                host.to_string(),
+                nf_instance_id.clone(),
+                allowed_nf_types.clone(),
+            );
+            nextgcore_sbi::heartbeat::register_or_retry(
+                "NWDAF",
+                Default::default(),
+                move || {
+                    let (ctx, host, id, allowed) =
+                        (sbi_ctx.clone(), host.clone(), id.clone(), allowed.clone());
+                    async move {
+                        register_with_nrf(ctx, &host, sbi_port, &id, &allowed)
+                            .await
+                            .map(|()| Some(id))
+                    }
+                },
+                |nf_instance_id| {
+                    // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
+                    // (active analytics subscriptions, saturated at 100;
+                    // TS 29.510 §5.2.2.3.2). Honest subscription-count proxy — no
+                    // fabricated CPU numbers.
+                    nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(
+                        nf_instance_id,
+                        5,
+                        || {
+                            let load = nwdaf_self()
+                                .read()
+                                .map(|c| c.subscription_count())
+                                .unwrap_or(0);
+                            load.min(100) as u8
+                        },
+                    );
+                },
+            )
+            .await;
         }
-        Err(why) => Err(why),
-    } {
-        log::warn!("NRF registration failed (will operate without NRF): {e}");
-    } else {
-        // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
-        // (active analytics subscriptions, saturated at 100;
-        // TS 29.510 §5.2.2.3.2). Honest subscription-count proxy — no
-        // fabricated CPU numbers.
-        nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(
-            nf_instance_id.clone(),
-            5,
-            || {
-                let load = nwdaf_self()
-                    .read()
-                    .map(|c| c.subscription_count())
-                    .unwrap_or(0);
-                load.min(100) as u8
-            },
-        );
+        Err(e) => log::warn!("NRF registration not attempted (will operate without NRF): {e}"),
     }
 
     // G2-1: arm the NRF NF_LOAD collector and attempt the initial

@@ -387,21 +387,32 @@ async fn main() -> Result<()> {
                 .to_string();
         let sbi_ctx = nextgcore_sbi::context::global_context();
         sbi_ctx.set_nrf_uri(&args.nrf_uri).await;
-        match register_upf_with_nrf(&nf_instance_id, &args.pfcp_addr, &args.gtpu_addr).await {
-            Ok(()) => {
+        // #1482: a failed attempt is retried in the background (never blocking
+        // the data plane), and the heartbeat starts after the one that succeeds.
+        let (pfcp, gtpu) = (args.pfcp_addr.clone(), args.gtpu_addr.clone());
+        nextgcore_sbi::heartbeat::register_or_retry(
+            "UPF",
+            Default::default(),
+            move || {
+                let (id, pfcp, gtpu) = (nf_instance_id.clone(), pfcp.clone(), gtpu.clone());
+                async move {
+                    register_upf_with_nrf(&id, &pfcp, &gtpu)
+                        .await
+                        .map(|()| Some(id))
+                }
+            },
+            |nf_instance_id| {
                 // G2-2: PATCH a real NFProfile "/load" gauge to NRF each
                 // heartbeat — PFCP-session occupancy, recomputed each tick.
+                log::info!("UPF NRF heartbeat started (instance: {nf_instance_id})");
                 nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(
-                    nf_instance_id.clone(),
+                    nf_instance_id,
                     5,
                     || upf_self().get_load(),
                 );
-                log::info!("UPF NRF heartbeat started (instance: {nf_instance_id})");
-            }
-            Err(e) => {
-                log::warn!("NRF registration failed (UPF will operate without NRF): {e}");
-            }
-        }
+            },
+        )
+        .await;
     } else {
         log::debug!("No NRF URI configured (--nrf-uri empty); UPF runs data-plane-only");
     }

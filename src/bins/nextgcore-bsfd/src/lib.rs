@@ -351,22 +351,38 @@ pub async fn run() -> Result<()> {
     .await;
 
     // Register with NRF and start heartbeat worker
-    match match sbi.registration_host() {
-        Ok(host) => register_with_nrf(host, sbi.port, args.tls).await,
-        Err(e) => Err(e),
-    } {
-        Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
-            // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
-            // (BSF bindings vs configured capacity; TS 29.510 §5.2.2.3.2).
-            nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(nf_instance_id, 5, || {
-                let load = crate::context::get_sess_load();
-                load.clamp(0, 100) as u8
-            });
+    // #1482: a failed attempt is retried in the background, and the heartbeat
+    // starts after the one that succeeds.
+    match sbi.registration_host() {
+        Ok(host) => {
+            let (host, port, tls) = (host.to_string(), sbi.port, args.tls);
+            nextgcore_sbi::heartbeat::register_or_retry(
+                "BSF",
+                Default::default(),
+                move || {
+                    let host = host.clone();
+                    async move {
+                        register_with_nrf(&host, port, tls)
+                            .await
+                            .map(nextgcore_sbi::heartbeat::registered_id)
+                    }
+                },
+                |nf_instance_id| {
+                    // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
+                    // (BSF bindings vs configured capacity; TS 29.510 §5.2.2.3.2).
+                    nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(
+                        nf_instance_id,
+                        5,
+                        || {
+                            let load = crate::context::get_sess_load();
+                            load.clamp(0, 100) as u8
+                        },
+                    );
+                },
+            )
+            .await;
         }
-        Ok(_) => {}
-        Err(e) => {
-            log::warn!("NRF registration failed (will operate without NRF): {e}");
-        }
+        Err(e) => log::warn!("NRF registration not attempted (will operate without NRF): {e}"),
     }
 
     log::info!("NextGCore BSF ready");
@@ -391,7 +407,7 @@ pub async fn run() -> Result<()> {
     log::info!("SBI HTTP/2 server stopped");
 
     // Close legacy SBI server
-    bsf_sbi_close();
+    bsf_sbi_close().await;
     log::info!("SBI server closed");
 
     // Cleanup state machine
