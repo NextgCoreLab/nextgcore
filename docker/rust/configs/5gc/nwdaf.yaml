@@ -9,11 +9,14 @@ nwdaf:
         advertise: 172.23.0.30
         port: 7777
     # NRF NFProfile (#1412): the NF types the NRF lets discover this NWDAF and
-    # get an nnwdaf-* access token. Omit it for the TS 29.520 §4.3.1.3.2
-    # consumer list: PCF, NSSF, AMF, SMF, NEF, AF, LMF, NWDAF, DCCF, ADRF, UDM,
-    # NRF, SCP. A present list must be non-empty NFType tokens, or startup fails.
+    # get an nnwdaf-* access token. Omit it for the union of the TS 29.520
+    # consumer lists (#1415): PCF, NSSF, AMF, SMF, NEF, AF, CEF, LMF, NWDAF,
+    # DCCF, ADRF, UDM, NRF, SCP, UPF. Each service still registers its own
+    # clause's list (AnalyticsInfo §4.3.1.3.2 has no CEF/UPF; MLModelProvision
+    # §4.5.1.3.2 is NWDAF, LMF), and the NRF requires both levels to allow a
+    # consumer. A present list must be non-empty NFType tokens, or startup fails.
     # nrf_profile:
-    #   allowed_nf_types: [PCF, NSSF, AMF, SMF, NEF, AF, LMF, NWDAF, DCCF, ADRF, UDM, NRF, SCP]
+    #   allowed_nf_types: [PCF, NSSF, AMF, SMF, NEF, AF, CEF, LMF, NWDAF, DCCF, ADRF, UDM, NRF, SCP, UPF]
   nrf:
     uri: http://172.23.0.10:7777
   analytics:
