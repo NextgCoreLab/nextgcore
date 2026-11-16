@@ -453,6 +453,22 @@ jobs:
             echo "committed git conflict markers (above); resolve them (#1098)"
             exit 1
           fi
+      - name: Every nc -z wait probe has a connect timeout
+        working-directory: nextgcore
+        run: |
+          # #1506: `until nc -z host port` with no -w blocks for the kernel's
+          # SYN-retransmit timeout (~130 s) when one SYN is dropped, so the
+          # pod starts after deploy-eks.sh's readiness window. Every probe in
+          # the manifests, Helm chart, overlays and scripts sets `-w SEC`.
+          # git grep exits 0 on a match, 1 on none (the pass case) and >1 on
+          # an error, which must fail rather than read as "no match".
+          rc=0
+          git grep -nIP 'nc\s+-z(?!\s+-w\s*[0-9])' -- ':!*.rs' ':!.github/workflows/ci.yml' || rc=$?
+          case "$rc" in
+            1) ;;
+            0) echo "nc -z probe without a connect timeout (above); use 'nc -z -w 2' (#1506)"; exit 1 ;;
+            *) echo "git grep failed (rc=$rc)"; exit 1 ;;
+          esac
       - name: Checkout nextgsim
         uses: actions/checkout@v4
         with:

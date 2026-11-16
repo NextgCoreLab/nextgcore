@@ -45,7 +45,7 @@ spec:
               # always fail. Probe the AMF SBI port instead, which is TCP and
               # comes up in the same process.
               i=0
-              until nc -z amf.nextg-system.svc.cluster.local 7777; do
+              until nc -z -w 2 amf.nextg-system.svc.cluster.local 7777; do
                 i=$((i+1))
                 [ "$i" -ge 60 ] && { echo "[wait-amf] FATAL: AMF SBI never accepted"; exit 1; }
                 echo "[wait-amf] waiting for AMF SBI... ($i/60)"

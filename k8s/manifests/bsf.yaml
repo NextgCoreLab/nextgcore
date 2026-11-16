@@ -77,10 +77,10 @@ spec:
               mountPath: /etc/nextgcore-resolved
         - name: wait-nrf
           image: busybox:1.36
-          command: ['sh', '-c', 'until nc -z nrf.nextg-system.svc.cluster.local 7777; do echo waiting for nrf; sleep 2; done']
+          command: ['sh', '-c', 'until nc -z -w 2 nrf.nextg-system.svc.cluster.local 7777; do echo waiting for nrf; sleep 2; done']
         - name: wait-mongodb
           image: busybox:1.36
-          command: ['sh', '-c', 'until nc -z mongodb.nextg-system.svc.cluster.local 27017; do echo waiting for mongodb; sleep 2; done']
+          command: ['sh', '-c', 'until nc -z -w 2 mongodb.nextg-system.svc.cluster.local 27017; do echo waiting for mongodb; sleep 2; done']
       containers:
         - name: bsf
           image: nextgcore-rust/bsf:latest
