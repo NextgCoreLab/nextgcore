@@ -1076,10 +1076,13 @@ pub async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 /// `intersection(consumer, producer)`; advertising only genuinely-supported bits
 /// keeps a strict peer from depending on an unimplemented feature.
 ///
-/// AM (TS 29.507 §5.8): no optional features are negotiated, so the result is
-/// always "0" — the spec NOTE requires `suppFeat` present and set to 0 when
-/// negotiation is not needed.
-const PCF_AM_POLICY_SUPPORTED_FEATURES: u64 = 0x0;
+/// AM (TS 29.507 §5.8): #1524, UE-AMBR_Authorization (feature 3) only. A
+/// consumer that negotiates nothing gets "0", which the spec NOTE requires
+/// present when negotiation is not needed.
+const PCF_AM_POLICY_SUPPORTED_FEATURES: u64 = AM_FEATURE_UE_AMBR_AUTHORIZATION;
+/// TS 29.507 Table 5.8-1 feature 3, UE-AMBR_Authorization: bit 2, since feature 1
+/// is the least significant bit (TS 29.571 §5.2.2 SupportedFeatures).
+const AM_FEATURE_UE_AMBR_AUTHORIZATION: u64 = 1 << 2;
 /// SM (TS 29.512 §5.8): conservative optional-feature set the decision builder
 /// actually exercises. Intersected with the SMF-requested value.
 /// #1398: plus PCSCF-Restoration-Enhancement (feature 9), which
@@ -1187,6 +1190,29 @@ fn am_policy_from(
         }
     }
     policy
+}
+
+/// #1524: whether an AM policy association carries an authorised UE-AMBR. TS
+/// 29.507 §4.2.2.2 item c and §4.2.3.2 item c include `ueAmbr` only "if the
+/// feature UE-AMBR_Authorization is supported and the PCF received the `ueAmbr`
+/// attribute in the request"; §4.2.3.3.2 and Table 5.6.2.2-1 gate it on the
+/// feature, and §4.2.3.2 NOTE 2 gates `UE_AMBR_CH` on it.
+fn am_ue_ambr_authorised(ue_am: &PcfUeAm) -> bool {
+    ue_am.am_policy_control_features & AM_FEATURE_UE_AMBR_AUTHORIZATION != 0
+        && ue_am.ue_ambr_requested
+}
+
+/// #1524: drop `ueAmbr` and `UE_AMBR_CH` from an association's policy and
+/// triggers unless it authorises a UE-AMBR ([`am_ue_ambr_authorised`]).
+fn gate_am_ue_ambr(
+    authorised: bool,
+    policy: &mut serde_json::Map<String, serde_json::Value>,
+    triggers: &mut Vec<String>,
+) {
+    if !authorised {
+        policy.remove("ueAmbr");
+        triggers.retain(|t| t != "UE_AMBR_CH");
+    }
 }
 
 /// The `RequestTrigger`s a consumer asked this association to watch, plus the
@@ -1333,8 +1359,14 @@ pub async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
         Some(ue_am) => {
             // Provision the access-and-mobility policy and the triggers before
             // storing, so the association carries them from the moment it exists.
-            let policy = provision_am_policy(supi).await;
-            let triggers = am_policy_triggers(&policy_data, &policy);
+            let mut policy = provision_am_policy(supi).await;
+            let mut triggers = am_policy_triggers(&policy_data, &policy);
+            let features =
+                negotiated_feature_bits(Some(supp_feat), PCF_AM_POLICY_SUPPORTED_FEATURES);
+            let mut updated = ue_am.clone();
+            updated.am_policy_control_features = features;
+            updated.ue_ambr_requested = policy_data.get("ueAmbr").is_some();
+            gate_am_ue_ambr(am_ue_ambr_authorised(&updated), &mut policy, &mut triggers);
             let am_policy = if policy.is_empty() {
                 None
             } else {
@@ -1345,7 +1377,6 @@ pub async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
             // Persist the notification URI so later AM policy update notifies
             // (pcf_sbi_send_am_policy_control_notify) can reach the AMF.
             {
-                let mut updated = ue_am.clone();
                 updated.notification_uri = Some(notification_uri.to_string());
                 updated.alt_notif_uris = alt_notif_uris;
                 updated.triggers = triggers.clone();
@@ -1366,7 +1397,7 @@ pub async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
                 supi,
                 &triggers,
                 am_policy.as_ref(),
-                &negotiate_features(Some(supp_feat), PCF_AM_POLICY_SUPPORTED_FEATURES),
+                &format!("{features:x}"),
             );
 
             SbiResponse::with_status(201)
@@ -1401,10 +1432,9 @@ pub async fn handle_am_policy_get(pol_asso_id: &str) -> SbiResponse {
                 &ue_am.supi,
                 &ue_am.triggers,
                 ue_am.am_policy.as_ref(),
-                // The association's negotiated value is fixed at create; the
-                // producer set is a constant, so re-negotiating the stored
-                // consumer features would give the same answer.
-                &negotiate_features(None, PCF_AM_POLICY_SUPPORTED_FEATURES),
+                // #1524: the value negotiated at create, which the association
+                // keeps; it used to be re-negotiated from nothing, so "0".
+                &format!("{:x}", ue_am.am_policy_control_features),
             ))
             .unwrap_or_else(|_| SbiResponse::with_status(200)),
         None => send_not_found(
@@ -1520,10 +1550,18 @@ pub async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
         }
     }
 
+    // #1524: an AMF that reports a subscribed UE-AMBR change sends `ueAmbr`
+    // (TS 29.507 §4.2.3.2 item 14), which asks this association for an
+    // authorised one from then on.
+    let update_has_ue_ambr = update_data.get("ueAmbr").is_some();
+    updated.ue_ambr_requested |= update_has_ue_ambr;
+
     // Re-evaluate the provisioned policy: an update is the point at which the
     // subscription is consulted again, which is what makes servAreaRes / rfsp /
     // ueAmbr able to change after the association is created.
-    let policy = provision_am_policy(&updated.supi).await;
+    let mut policy = provision_am_policy(&updated.supi).await;
+    let authorised = am_ue_ambr_authorised(&updated);
+    gate_am_ue_ambr(authorised, &mut policy, &mut updated.triggers);
     let am_policy = if policy.is_empty() {
         None
     } else {
@@ -1566,12 +1604,19 @@ pub async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
     }
 
     // The 200 response schema is PolicyUpdate, not PolicyAssociation: it carries
-    // resourceUri and the changed policy.
+    // resourceUri and the changed policy. #1524: `ueAmbr` only when this request
+    // carried one (TS 29.507 §4.2.3.2 item c).
+    let mut answered = updated.am_policy.clone();
+    if !update_has_ue_ambr {
+        if let Some(policy) = answered.as_mut().and_then(|p| p.as_object_mut()) {
+            policy.remove("ueAmbr");
+        }
+    }
     SbiResponse::with_status(200)
         .with_json_body(&sbi_path::build_am_policy_update(
             &updated.association_id,
             &updated.triggers,
-            updated.am_policy.as_ref(),
+            answered.as_ref(),
         ))
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
@@ -3527,12 +3572,13 @@ async fn reauthorise_sm_sessions(
 const UDR_REREAD_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The AM policy members a PCF-initiated PolicyUpdate carries when they change
-/// (TS 29.507 §4.2.3.3.2): the Service Area Restriction and the RFSP index.
+/// (TS 29.507 §4.2.3.3.2): the Service Area Restriction, the RFSP index and the
+/// UE-AMBR.
 ///
-/// `ueAmbr` is not among them: §4.2.3.3.2 includes it only "if the
-/// UE-AMBR_Authorization feature is supported", and this PCF negotiates no AM
-/// feature (`PCF_AM_POLICY_SUPPORTED_FEATURES` is 0).
-const AM_UPDATE_NOTIFY_MEMBERS: [&str; 2] = ["servAreaRes", "rfsp"];
+/// §4.2.3.3.2 includes `ueAmbr` only "if the UE-AMBR_Authorization feature is
+/// supported": #1524, [`reevaluate_am_policy`] drops it from both policies it
+/// compares unless the association authorises one ([`gate_am_ue_ambr`]).
+const AM_UPDATE_NOTIFY_MEMBERS: [&str; 3] = ["servAreaRes", "rfsp", "ueAmbr"];
 
 /// The members of a re-evaluated AM policy that a PCF-initiated PolicyUpdate must
 /// carry (#1261): each [`AM_UPDATE_NOTIFY_MEMBERS`] member that was added or whose
@@ -3601,8 +3647,15 @@ async fn reevaluate_am_policy(udr: &sbi_path::DiscoveredEndpoint, ue_am: PcfUeAm
             return false;
         }
     };
-    let policy = am_policy_from(&supi, am_data.as_ref());
-    let (changes, removed) = am_policy_changes(ue_am.am_policy.as_ref(), &policy);
+    let mut policy = am_policy_from(&supi, am_data.as_ref());
+    let authorised = am_ue_ambr_authorised(&ue_am);
+    gate_am_ue_ambr(authorised, &mut policy, &mut Vec::new());
+    let mut stored = ue_am.am_policy.clone();
+    if let Some(stored) = stored.as_mut().and_then(|p| p.as_object_mut()) {
+        // A policy stored before #1524 can hold an unauthorised `ueAmbr`.
+        gate_am_ue_ambr(authorised, stored, &mut Vec::new());
+    }
+    let (changes, removed) = am_policy_changes(stored.as_ref(), &policy);
     if !removed.is_empty() {
         log::warn!(
             "[{supi}] AM policy re-evaluation: {removed:?} no longer provisioned. PolicyUpdate \
@@ -7496,7 +7549,10 @@ mod tests {
             Some(serde_json::json!({
                 "supi": "imsi-001010000000890",
                 "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/89",
-                "suppFeat": "0",
+                // #1524: UE-AMBR_Authorization, and the AMF's UE-AMBR, so the
+                // policy carries the authorised one.
+                "suppFeat": "4",
+                "ueAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" },
                 "triggers": ["LOC_CH"]
             })),
         ))
@@ -7509,7 +7565,7 @@ mod tests {
         assert_eq!(body["rfsp"], 7, "rfsp provisioned from UDR am-data: {body}");
         assert_eq!(body["servAreaRes"]["restrictionType"], "ALLOWED_AREAS");
         assert_eq!(body["ueAmbr"]["uplink"], "1 Gbps");
-        assert_eq!(body["suppFeat"], "0");
+        assert_eq!(body["suppFeat"], "4");
         assert_eq!(body["triggers"], serde_json::json!(["LOC_CH"]));
 
         // The GET representation must agree with the create one -- it used to
@@ -7523,7 +7579,7 @@ mod tests {
         assert_eq!(resp.status, 200);
         let got: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        assert_eq!(got["suppFeat"], "0", "suppFeat is mandatory on GET: {got}");
+        assert_eq!(got["suppFeat"], "4", "suppFeat is mandatory on GET: {got}");
         assert_eq!(got["rfsp"], 7);
         assert_eq!(got["servAreaRes"]["restrictionType"], "ALLOWED_AREAS");
         assert_eq!(got["ueAmbr"]["uplink"], "1 Gbps");
@@ -7586,7 +7642,9 @@ mod tests {
             Some(serde_json::json!({
                 "supi": supi,
                 "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/1460",
-                "suppFeat": "0",
+                // #1524: UE-AMBR_Authorization negotiated, so the #1460 rules for
+                // the authorised UE-AMBR are what decides.
+                "suppFeat": "4",
                 "ueAmbr": { "uplink": "500 Mbps", "downlink": "500 Mbps" },
                 "triggers": ["LOC_CH"]
             })),
@@ -7723,6 +7781,372 @@ mod tests {
                 .as_deref(),
             Some("the subscriber carries no ambr"),
         );
+    }
+
+    /// #1524: create an AM policy for `supi` against UDR am-data provisioning a
+    /// 1/2 Gbps `subscribedUeAmbr`, with the given `suppFeat` and, when
+    /// `amf_ue_ambr`, the AMF's own (different) `ueAmbr`; the consumer also asks
+    /// for `UE_AMBR_CH`. Answers the create body and the GET body.
+    async fn am_create_1524(
+        supi: &str,
+        supp_feat: &str,
+        amf_ue_ambr: bool,
+    ) -> (serde_json::Value, serde_json::Value) {
+        let udr = start_mock_nrf_udr_am_data(serde_json::json!({
+            "subscribedUeAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" },
+            "rfspIndex": 5
+        }))
+        .await;
+        let mut req = serde_json::json!({
+            "supi": supi,
+            "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/1524",
+            "suppFeat": supp_feat,
+            "triggers": ["LOC_CH", "UE_AMBR_CH"]
+        });
+        if amf_ue_ambr {
+            req["ueAmbr"] = serde_json::json!({ "uplink": "500 Mbps", "downlink": "500 Mbps" });
+        }
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-am-policy-control/v1/policies",
+            Some(req),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "create: {:?}", resp.http.content);
+        let created: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let pol_id = created["polAssoId"].as_str().unwrap().to_string();
+        let resp = pcf_sbi_request_handler(make_request(
+            "GET",
+            &format!("/npcf-am-policy-control/v1/policies/{pol_id}"),
+            None,
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+        let got: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        udr.stop().await.ok();
+        (created, got)
+    }
+
+    /// #1524: UE-AMBR_Authorization negotiated and the AMF sent `ueAmbr`: the create
+    /// and the GET carry the authorised (subscribed) UE-AMBR, `UE_AMBR_CH`, and the
+    /// negotiated `suppFeat` "4" (TS 29.507 §4.2.2.2 item c, Table 5.8-1 feature 3).
+    ///
+    /// REVERT-VERIFIED: with `PCF_AM_POLICY_SUPPORTED_FEATURES` back at 0, suppFeat
+    /// is "0" and `ueAmbr` / `UE_AMBR_CH` are absent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI / PCF context
+    async fn am_policy_with_ue_ambr_authorization_carries_the_authorised_ue_ambr_1524() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let (created, got) = am_create_1524("imsi-001010000001524", "4", true).await;
+        for body in [&created, &got] {
+            assert_eq!(body["suppFeat"], "4", "{body}");
+            assert_eq!(
+                body["ueAmbr"],
+                serde_json::json!({ "uplink": "1 Gbps", "downlink": "2 Gbps" }),
+                "the authorised UE-AMBR: {body}"
+            );
+            assert_eq!(
+                body["triggers"],
+                serde_json::json!(["LOC_CH", "UE_AMBR_CH"]),
+                "{body}"
+            );
+        }
+    }
+
+    /// #1524: UE-AMBR_Authorization not negotiated (the AMF's "0" and "", which is
+    /// what amfd sends, and a value without bit 3): no `ueAmbr`, no `UE_AMBR_CH`,
+    /// even with the AMF's `ueAmbr` in the request and `UE_AMBR_CH` asked for
+    /// (§4.2.2.2 item c, §4.2.3.2 NOTE 2). The rest of the policy is unchanged.
+    ///
+    /// REVERT-VERIFIED: without `gate_am_ue_ambr` in the create, `ueAmbr` 1/2 Gbps
+    /// and `UE_AMBR_CH` are back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI / PCF context
+    async fn am_policy_without_ue_ambr_authorization_carries_no_ue_ambr_1524() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        for (i, supp_feat) in ["0", "", "3"].into_iter().enumerate() {
+            let supi = format!("imsi-00101000001152{i}");
+            let (created, got) = am_create_1524(&supi, supp_feat, true).await;
+            for body in [&created, &got] {
+                assert_eq!(body["suppFeat"], "0", "{supp_feat:?}: {body}");
+                assert_eq!(
+                    body["rfsp"], 5,
+                    "{supp_feat:?}: the policy is provisioned: {body}"
+                );
+                assert_eq!(
+                    body["triggers"],
+                    serde_json::json!(["LOC_CH"]),
+                    "{supp_feat:?}: no UE_AMBR_CH: {body}"
+                );
+                assert!(body.get("ueAmbr").is_none(), "{supp_feat:?}: {body}");
+            }
+        }
+    }
+
+    /// #1524: UE-AMBR_Authorization negotiated but no `ueAmbr` in the request: the
+    /// PCF "received" none, so it answers none and no `UE_AMBR_CH` (item c).
+    ///
+    /// REVERT-VERIFIED: with `am_ue_ambr_authorised` ignoring `ue_ambr_requested`,
+    /// `ueAmbr` 1/2 Gbps is answered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI / PCF context
+    async fn am_policy_with_the_feature_but_no_requested_ue_ambr_carries_none_1524() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let (created, got) = am_create_1524("imsi-001010000021524", "4", false).await;
+        for body in [&created, &got] {
+            assert_eq!(body["suppFeat"], "4", "{body}");
+            assert_eq!(body["rfsp"], 5, "{body}");
+            assert_eq!(body["triggers"], serde_json::json!(["LOC_CH"]), "{body}");
+            assert!(body.get("ueAmbr").is_none(), "{body}");
+        }
+    }
+
+    /// #1524: the AMF's Update. With the feature negotiated, an update carrying
+    /// `ueAmbr` (a subscribed UE-AMBR change, TS 29.507 §4.2.3.2 item 14) is
+    /// answered with the authorised one (item c), and the GET carries it from then
+    /// on; an update without `ueAmbr` is answered without it. Without the feature,
+    /// an update with `ueAmbr` is answered without it.
+    ///
+    /// REVERT-VERIFIED: without `gate_am_ue_ambr` in the update, the unnegotiated
+    /// association answers `ueAmbr`; without the `update_has_ue_ambr` filter, the
+    /// update without `ueAmbr` answers it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI / PCF context
+    async fn am_policy_update_answers_ue_ambr_only_when_authorised_and_requested_1524() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let udr = start_mock_nrf_udr_am_data(serde_json::json!({
+            "subscribedUeAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" },
+            "rfspIndex": 5
+        }))
+        .await;
+        let ue_ambr = serde_json::json!({ "uplink": "1 Gbps", "downlink": "2 Gbps" });
+        let update = |pol_id: String, body: serde_json::Value| async move {
+            let resp = pcf_sbi_request_handler(make_request(
+                "POST",
+                &format!("/npcf-am-policy-control/v1/policies/{pol_id}/update"),
+                Some(body),
+            ))
+            .await;
+            assert_eq!(resp.status, 200, "update: {:?}", resp.http.content);
+            serde_json::from_str::<serde_json::Value>(resp.http.content.as_deref().unwrap())
+                .unwrap()
+        };
+        let get = |pol_id: String| async move {
+            let resp = pcf_sbi_request_handler(make_request(
+                "GET",
+                &format!("/npcf-am-policy-control/v1/policies/{pol_id}"),
+                None,
+            ))
+            .await;
+            serde_json::from_str::<serde_json::Value>(resp.http.content.as_deref().unwrap())
+                .unwrap()
+        };
+        let mut ids = Vec::new();
+        for (supi, supp_feat) in [("imsi-001010000031524", "4"), ("imsi-001010000041524", "0")] {
+            let resp = pcf_sbi_request_handler(make_request(
+                "POST",
+                "/npcf-am-policy-control/v1/policies",
+                Some(serde_json::json!({
+                    "supi": supi,
+                    "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/1524",
+                    "suppFeat": supp_feat,
+                })),
+            ))
+            .await;
+            assert_eq!(resp.status, 201);
+            let created: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            assert!(
+                created.get("ueAmbr").is_none(),
+                "none requested yet: {created}"
+            );
+            ids.push(created["polAssoId"].as_str().unwrap().to_string());
+        }
+        let (negotiated, unnegotiated) = (ids[0].clone(), ids[1].clone());
+        let with_ue_ambr = serde_json::json!({ "ueAmbr": ue_ambr, "triggers": ["UE_AMBR_CH"] });
+
+        let answered = update(negotiated.clone(), with_ue_ambr.clone()).await;
+        assert_eq!(answered["ueAmbr"], ue_ambr, "authorised: {answered}");
+        assert_eq!(answered["rfsp"], 5, "{answered}");
+        assert_eq!(get(negotiated.clone()).await["ueAmbr"], ue_ambr);
+        let answered = update(
+            negotiated.clone(),
+            serde_json::json!({ "triggers": ["LOC_CH"] }),
+        )
+        .await;
+        assert!(
+            answered.get("ueAmbr").is_none(),
+            "none received: {answered}"
+        );
+        assert_eq!(answered["rfsp"], 5, "{answered}");
+
+        let answered = update(unnegotiated.clone(), with_ue_ambr).await;
+        assert!(answered.get("ueAmbr").is_none(), "unnegotiated: {answered}");
+        assert!(
+            answered.get("triggers").is_none(),
+            "no UE_AMBR_CH: {answered}"
+        );
+        assert_eq!(answered["rfsp"], 5, "{answered}");
+        assert!(get(unnegotiated).await.get("ueAmbr").is_none());
+
+        udr.stop().await.ok();
+    }
+
+    /// #1524: a mock NRF + UDR whose am-data the test changes, and which records
+    /// every `.../update` POST it receives (the AMF's UpdateNotify callback).
+    async fn start_mock_am_peer_1524(
+        am_data: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
+    ) -> (
+        nextgcore_sbi::server::SbiServer,
+        u16,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+    ) {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        let notified = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = notified.clone();
+        server
+            .start(move |req: SbiRequest| {
+                let am_data = am_data.clone();
+                let seen = seen.clone();
+                async move {
+                    let path = req.header.uri.split('?').next().unwrap_or("").to_string();
+                    if path == "/nnrf-disc/v1/nf-instances" {
+                        return SbiResponse::with_status(200)
+                            .with_json_body(&serde_json::json!({
+                                "nfInstances": [{
+                                    "nfInstanceId": "udr-1524",
+                                    "nfType": "UDR",
+                                    "ipv4Addresses": ["127.0.0.1"],
+                                    "nfServices": [{
+                                        "serviceName": "nudr-dr",
+                                        "scheme": "http",
+                                        "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": port }]
+                                    }]
+                                }]
+                            }))
+                            .unwrap_or_else(|_| SbiResponse::with_status(500));
+                    }
+                    if path.ends_with("/provisioned-data/am-data") {
+                        let body = am_data.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        return SbiResponse::with_status(200)
+                            .with_json_body(&body)
+                            .unwrap_or_else(|_| SbiResponse::with_status(500));
+                    }
+                    if path.ends_with("/update") {
+                        let body = req
+                            .http
+                            .content
+                            .as_deref()
+                            .and_then(|c| serde_json::from_str(c).ok())
+                            .unwrap_or(serde_json::Value::Null);
+                        seen.lock().unwrap_or_else(|e| e.into_inner()).push((path, body));
+                        return SbiResponse::with_status(204);
+                    }
+                    SbiResponse::with_status(404)
+                }
+            })
+            .await
+            .expect("mock NRF/UDR/AMF starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        crate::test_support::point_nrf_at(format!("http://127.0.0.1:{port}")).await;
+        (server, port, notified)
+    }
+
+    /// #1524: a PCF-initiated UpdateNotify carries a changed `ueAmbr` for an
+    /// association with UE-AMBR_Authorization negotiated and a requested UE-AMBR,
+    /// and not for one without the feature (TS 29.507 §4.2.3.3.2, §4.2.4.2).
+    ///
+    /// REVERT-VERIFIED: with `AM_UPDATE_NOTIFY_MEMBERS` back to the two members,
+    /// the negotiated association's notification has no `ueAmbr`; without the
+    /// `gate_am_ue_ambr` in `reevaluate_am_policy`, the unnegotiated one has it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI / PCF context
+    async fn am_update_notify_carries_ue_ambr_only_when_authorised_1524() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let am_data = |rfsp: u64, ul: &str, dl: &str| {
+            serde_json::json!({
+                "subscribedUeAmbr": { "uplink": ul, "downlink": dl },
+                "rfspIndex": rfsp
+            })
+        };
+        let data = std::sync::Arc::new(std::sync::Mutex::new(am_data(5, "1 Gbps", "2 Gbps")));
+        let (peer, port, notified) = start_mock_am_peer_1524(data.clone()).await;
+        let cases = [("imsi-001010000051524", "4"), ("imsi-001010000061524", "0")];
+        for (supi, supp_feat) in cases {
+            let resp = pcf_sbi_request_handler(make_request(
+                "POST",
+                "/npcf-am-policy-control/v1/policies",
+                Some(serde_json::json!({
+                    "supi": supi,
+                    "notificationUri": format!("http://127.0.0.1:{port}/namf-callback/v1/{supi}/am"),
+                    "suppFeat": supp_feat,
+                    "ueAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" },
+                })),
+            ))
+            .await;
+            assert_eq!(resp.status, 201);
+        }
+        *data.lock().unwrap_or_else(|e| e.into_inner()) = am_data(7, "3 Gbps", "4 Gbps");
+        for (supi, _) in cases {
+            let resp = pcf_sbi_request_handler(make_request(
+                "POST",
+                sbi_path::POLICY_DATA_NOTIFY_PATH,
+                Some(serde_json::json!({ "ueId": supi })),
+            ))
+            .await;
+            assert_eq!(resp.status, 204);
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let got = loop {
+            let got = notified.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if got.len() >= 2 || tokio::time::Instant::now() >= deadline {
+                break got;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let body_for = |supi: &str| {
+            got.iter()
+                .find(|(path, _)| path.contains(supi))
+                .map(|(_, body)| body.clone())
+                .unwrap_or_else(|| panic!("no UpdateNotify for {supi}: {got:?}"))
+        };
+        let negotiated = body_for(cases[0].0);
+        assert_eq!(negotiated["rfsp"], 7, "{negotiated}");
+        assert_eq!(
+            negotiated["ueAmbr"],
+            serde_json::json!({ "uplink": "3 Gbps", "downlink": "4 Gbps" }),
+            "the changed authorised UE-AMBR: {negotiated}"
+        );
+        let unnegotiated = body_for(cases[1].0);
+        assert_eq!(unnegotiated["rfsp"], 7, "{unnegotiated}");
+        assert!(unnegotiated.get("ueAmbr").is_none(), "{unnegotiated}");
+        peer.stop().await.ok();
     }
 
     /// AM policy Update applies the request and answers a `PolicyUpdate` carrying
@@ -12051,11 +12475,14 @@ mod tests_am_policy_changes {
         // Unchanged: nothing.
         let (c, r) = am_policy_changes(Some(&old), &map(old.clone()));
         assert!(c.is_empty() && r.is_empty());
-        // RFSP changed, SAR not, UE-AMBR changed (not carried without
-        // UE-AMBR_Authorization, §4.2.3.3.2).
+        // RFSP changed, SAR not, UE-AMBR changed (#1524: carried; the caller
+        // has already dropped it from both unless UE-AMBR_Authorization applies).
         let new = json!({"rfsp": 7, "servAreaRes": sar, "ueAmbr": {"uplink": "2 Mbps"}});
         let (c, r) = am_policy_changes(Some(&old), &map(new));
-        assert_eq!(serde_json::Value::Object(c), json!({"rfsp": 7}));
+        assert_eq!(
+            serde_json::Value::Object(c),
+            json!({"rfsp": 7, "ueAmbr": {"uplink": "2 Mbps"}})
+        );
         assert!(r.is_empty());
         // Added, from no stored policy at all: the complete value (bullet 4).
         let (c, _) = am_policy_changes(None, &map(json!({"servAreaRes": sar})));
@@ -12063,7 +12490,7 @@ mod tests_am_policy_changes {
         // Removed: not encodable (not nullable), so reported and not carried.
         let (c, r) = am_policy_changes(Some(&old), &map(json!({"servAreaRes": sar})));
         assert!(c.is_empty());
-        assert_eq!(r, vec!["rfsp"]);
+        assert_eq!(r, vec!["rfsp", "ueAmbr"]);
     }
 }
 

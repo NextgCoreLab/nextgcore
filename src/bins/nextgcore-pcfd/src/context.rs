@@ -150,6 +150,12 @@ pub struct PcfUeAm {
     /// (TS 29.500 §6.10).
     #[serde(default)]
     pub alt_notif_uris: Vec<String>,
+    /// #1524: the AMF sent a `ueAmbr` on this association (create or update).
+    /// With UE-AMBR_Authorization negotiated in `am_policy_control_features`,
+    /// that is what makes the policy carry an authorised UE-AMBR (TS 29.507
+    /// §4.2.2.2 item c, §4.2.3.2 item c).
+    #[serde(default)]
+    pub ue_ambr_requested: bool,
 }
 
 /// UE Route Selection Policy rule (TS 24.526)
@@ -231,6 +237,7 @@ impl PcfUeAm {
             triggers: Vec::new(),
             am_policy: None,
             alt_notif_uris: Vec::new(),
+            ue_ambr_requested: false,
         }
     }
 

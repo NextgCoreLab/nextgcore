@@ -418,7 +418,7 @@ mod tests {
         serde_json::json!({
             "eesProf": {
                 "eesId": ees_id,
-                "endPt": { "ipv4Addrs": ["10.0.0.9"], "port": 7814 },
+                "endPt": { "uri": "http://10.0.0.9:7814" },
                 "easIds": eas_ids,
             },
             "expTime": "2026-12-31T23:59:59Z",
@@ -615,7 +615,8 @@ mod tests {
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0]["eesId"], "ees1.example.com");
         assert_eq!(
-            configs[0]["endPt"]["port"], 7814,
+            configs[0]["endPt"],
+            serde_json::json!({ "uri": "http://10.0.0.9:7814" }),
             "the EEC needs the endpoint, not just the name"
         );
     }
@@ -756,8 +757,7 @@ mod tests {
         assert_eq!(
             stored[0].registration.ees_prof.end_pt,
             EndPoint {
-                ipv4_addrs: Some(vec!["10.0.0.9".to_string()]),
-                port: Some(7814),
+                uri: Some("http://10.0.0.9:7814".to_string()),
                 ..Default::default()
             }
         );

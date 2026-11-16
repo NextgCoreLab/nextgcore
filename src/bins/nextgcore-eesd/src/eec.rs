@@ -369,7 +369,7 @@ mod tests {
             "eecSvcContSupp": ["SERVICE_CONTINUITY_SCENARIO_1"],
             "eecCntxId": "cntx-77",
             "srcEesId": "http://s-ees.example.com:8080",
-            "endPt": {"fqdn": "eec1.example.com", "port": 9000},
+            "endPt": {"fqdn": "eec1.example.com"},
             "easSelReqInd": true,
             "discoveredEas": [{"eas": {"easId": "eas1", "endPt": {"fqdn": "eas1.example.com"}}}],
             "ueMobilityReq": true,

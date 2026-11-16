@@ -66,6 +66,10 @@ pub struct EasProfile {
 
 /// Common `EndPoint` type (TS 29.558). One of `uri`/`fqdn`/`ipv4Addrs`/
 /// `ipv6Addrs` must be present.
+///
+/// The schema (`TS29558_Eees_EASRegistration.yaml:506-530`) has exactly these
+/// four members, and no port (#1540): a non-default port travels in `uri`. A
+/// received `port` member is not an `EndPoint` attribute and is ignored.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct EndPoint {
@@ -77,8 +81,6 @@ pub struct EndPoint {
     pub ipv4_addrs: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ipv6_addrs: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub port: Option<u32>,
 }
 
 impl EndPoint {
@@ -816,6 +818,34 @@ mod tests {
         // Round-trips back to an equal value.
         let back: EasRegistration = serde_json::from_str(&json).unwrap();
         assert_eq!(back, reg);
+    }
+
+    /// #1540: `EndPoint` serialises only the four TS 29.558 members
+    /// (`TS29558_Eees_EASRegistration.yaml:506-530`). A non-conformant sender's
+    /// `port` is not an attribute: it is dropped, and the rest still parses.
+    #[test]
+    fn an_endpoint_has_no_port_member() {
+        let ep: EndPoint =
+            serde_json::from_str(r#"{"ipv4Addrs":["10.0.0.9"],"port":7814}"#).expect("parses");
+        assert_eq!(
+            serde_json::to_value(&ep).unwrap(),
+            serde_json::json!({ "ipv4Addrs": ["10.0.0.9"] })
+        );
+        let full = EndPoint {
+            uri: Some("http://10.0.0.9:7814".into()),
+            fqdn: Some("eas.edge".into()),
+            ipv4_addrs: Some(vec!["10.0.0.9".into()]),
+            ipv6_addrs: Some(vec!["fd00::9".into()]),
+        };
+        let mut keys: Vec<String> = serde_json::to_value(&full)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        assert_eq!(keys, ["fqdn", "ipv4Addrs", "ipv6Addrs", "uri"]);
     }
 
     #[test]
