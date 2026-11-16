@@ -177,7 +177,6 @@ d443a_main() {
     <"${keys}/${D443A_EEC_ID}.key" || bad "EEC key handover"
   if [[ "${ARM}" == gates ]]; then
     d443a_gates
-    snapshot gates
     return $(( FAILS > 0 ))
   fi
 
@@ -282,7 +281,14 @@ d443a_gates() {
   # mode: bogus at startup, every binary of the demo; and the runtime switch.
   local K=(kubectl -n "${NAMESPACE}") S="${OUT}/scenario" g="${OUT}/scenario/gates.txt"
   : >"${g}"
-  gate() { printf '%s %s: %s\n' "$1" "$2" "$(tr '\n' ' ' <<<"$3" | head -c 400)" >>"${g}"; }
+  # The full output goes to gates/<name>.txt; the gate line keeps the lines a
+  # check reads (the demo error, rc=, the show line), whatever precedes them.
+  gate() {
+    mkdir -p "${S}/gates-out"
+    printf '%s\n' "$3" >"${S}/gates-out/$1-$2.txt"
+    printf '%s %s: %s\n' "$1" "$2" \
+      "$(grep -E 'unknown mode|rc=|demo=|mode=|Error' <<<"$3" | tr '\n' ' ' | head -c 1200)" >>"${g}"
+  }
   local r
   r="$("${K[@]}" exec deploy/upf -c she-eas -- sh -c \
     'sed "s/mode: measured-budget/mode: bogus/" /tmp/d443a/eas-local.yaml >/tmp/d443a/bogus.yaml && nr-she-eas -c /tmp/d443a/bogus.yaml; echo "rc=$?"' 2>&1)"
@@ -300,6 +306,8 @@ d443a_gates() {
   gate nr-cli set-bogus "${r}"
   r="$(ue_cli "demo d443a-edge-budget set mode=static"; ue_cli "demo d443a-edge-budget show"; ue_cli "demo d443a-edge-budget set mode=measured-budget")"
   gate nr-cli set-static "${r}"
+  # Captured BEFORE the analysis: the audit line is in the UE's log.
+  snapshot gates
   python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/analyze.py" gates "${S}" | tee "${S}/analyze.txt"
   local rc=${PIPESTATUS[0]}
   (( rc == 0 )) || FAILS=$((FAILS+1))

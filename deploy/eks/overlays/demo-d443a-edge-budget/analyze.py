@@ -530,7 +530,10 @@ def gates_fixture():
         'rc=0 d443a-edge-budget mode=measured-budget',
         'nr-cli set-static: previous mode measured-budget d443a-edge-budget mode=static',
     ]) + '\n'
-    ue = [f'{TS} WARN [demo:{KEY}] audit: nr-cli set mode=bogus refused: unknown mode']
+    # The real nextgsim-demo audit format (nextgsim-demo/src/lib.rs, `set_mode`).
+    ue = [f'{TS} 2026-11-16T01:07:16.9Z  WARN nextgsim_demo: [demo:{KEY}] audit: rejected set '
+          f'mode="bogus" from nr-cli: demo config: unknown mode "bogus" for demo "{KEY}" (known modes '
+          f'["measured-budget", "static"]); mode unchanged (measured-budget)']
     return {'gates': {'ue.log': ue}, '_files': {'gates.txt': g}, '_meta': 'arm=gates\n'}
 
 
