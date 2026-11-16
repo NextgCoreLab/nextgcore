@@ -1831,6 +1831,9 @@ pub struct DiscoveryQuery {
     /// group-id-list — matched against the profile's NF `groupId`
     /// (style: form, explode: false => comma-separated).
     pub group_id_list: Vec<String>,
+    /// ml-analytics-info-list (JSON array of MlAnalyticsInfo, TS 29.510
+    /// Table 6.2.3.2.3.1-1): the NWDAF must support at least one item (#1570).
+    pub ml_analytics_info_list: Vec<serde_json::Value>,
 }
 
 /// Two S-NSSAIs match when sst is equal and sd is equal (an absent sd only
@@ -1838,6 +1841,95 @@ pub struct DiscoveryQuery {
 fn snssai_matches(a: &serde_json::Value, b: &serde_json::Value) -> bool {
     a.get("sst").and_then(|v| v.as_u64()) == b.get("sst").and_then(|v| v.as_u64())
         && a.get("sd").and_then(|v| v.as_str()) == b.get("sd").and_then(|v| v.as_str())
+}
+
+/// Two TS 29.571 `Tai`s match when plmnId, tac (hex, case-insensitive) and nid
+/// are equal (an absent nid only matches an absent nid).
+fn tai_matches(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    let tac = |t: &serde_json::Value| {
+        t.get("tac")
+            .and_then(|v| v.as_str())
+            .map(str::to_ascii_lowercase)
+    };
+    let nid = |t: &serde_json::Value| {
+        t.get("nid")
+            .and_then(|v| v.as_str())
+            .map(str::to_ascii_lowercase)
+    };
+    matches!((a.get("plmnId"), b.get("plmnId")), (Some(pa), Some(pb)) if plmn_matches(pa, pb))
+        && tac(a).is_some()
+        && tac(a) == tac(b)
+        && nid(a) == nid(b)
+}
+
+/// Whether one profile `MlAnalyticsInfo` (`have`) supports one queried
+/// `MlAnalyticsInfo` (`want`), TS 29.510 Table 6.2.3.2.3.1-1
+/// `ml-analytics-info-list` (`29510-k00.txt:20689-20800`): every attribute of
+/// `want` must be matched by `have`; an array attribute matches when `have`
+/// contains at least one of its elements.
+///
+/// Absent from `have`, `mlAnalyticsIds`, `snssaiList` and `trackingAreaList`
+/// mean "any" (Table 6.1.6.2.84-1: "the NWDAF can serve any mlAnalyticsId", "can
+/// apply to any snssai", "to any TAIs"), so they match. Every other attribute
+/// absent from `have` means the capability is not offered (an absent
+/// `mlModelInterInfo` means "the ML models are not allowed to be retrieved by
+/// any NWDAF vendors", an absent `flCapabilityType` "can not support any type"),
+/// so it does not, except `vflClientAggrCap`, whose default is `false`.
+fn ml_analytics_info_supported(have: &serde_json::Value, want: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    fn any_common(have: &Value, want: &Value, eq: fn(&Value, &Value) -> bool) -> bool {
+        match (have.as_array(), want.as_array()) {
+            (Some(h), Some(w)) => w.iter().any(|x| h.iter().any(|y| eq(y, x))),
+            _ => false,
+        }
+    }
+    fn json_eq(a: &Value, b: &Value) -> bool {
+        a == b
+    }
+    let Some(want) = want.as_object() else {
+        return false;
+    };
+    want.iter().all(|(key, w)| {
+        let h = have.get(key);
+        match key.as_str() {
+            "mlAnalyticsIds" => h.is_none_or(|h| any_common(h, w, json_eq)),
+            "snssaiList" => h.is_none_or(|h| any_common(h, w, snssai_matches)),
+            "trackingAreaList" => h.is_none_or(|h| any_common(h, w, tai_matches)),
+            "mlModelInterInfo" | "vflInterInfo" => h.is_some_and(|h| {
+                // MlModelInterInfo: { vendorList: array(VendorId) }.
+                w.as_object().is_some_and(|wo| {
+                    wo.iter().all(|(k, wv)| {
+                        h.get(k).is_some_and(|hv| match wv {
+                            Value::Array(_) => any_common(hv, wv, json_eq),
+                            _ => hv == wv,
+                        })
+                    })
+                })
+            }),
+            "vflClientAggrCap" => h.unwrap_or(&Value::Bool(false)) == w,
+            _ => h.is_some_and(|h| match w {
+                Value::Array(_) => any_common(h, w, json_eq),
+                _ => h == w,
+            }),
+        }
+    })
+}
+
+/// Whether a profile supports at least one queried `MlAnalyticsInfo` (#1570).
+/// A profile without `nwdafInfo.mlAnalyticsList` claims no ML analytics
+/// capability, so it supports none: unlike `taiList` or `servingNfTypeList`,
+/// TS 29.510 gives its absence no "any" meaning.
+fn ml_analytics_list_matches(doc: &serde_json::Value, wanted: &[serde_json::Value]) -> bool {
+    let Some(have) = doc
+        .get("nwdafInfo")
+        .and_then(|i| i.get("mlAnalyticsList"))
+        .and_then(|l| l.as_array())
+    else {
+        return false;
+    };
+    wanted
+        .iter()
+        .any(|w| have.iter().any(|h| ml_analytics_info_supported(h, w)))
 }
 
 fn plmn_matches(a: &serde_json::Value, b: &serde_json::Value) -> bool {
@@ -2098,6 +2190,13 @@ fn profile_matches(doc: &serde_json::Value, status: &str, query: &DiscoveryQuery
         }
     }
 
+    // ml-analytics-info-list (#1570): an NWDAF supporting at least one item.
+    if !query.ml_analytics_info_list.is_empty()
+        && !ml_analytics_list_matches(doc, &query.ml_analytics_info_list)
+    {
+        return false;
+    }
+
     // Identity selection (supi / gpsi / routing-indicator / group-id-list):
     // route the subscriber to the UDM/UDR/AUSF instance that actually serves it
     // (TS 29.510 §5.3.2.2.2). Only these three NF types carry the identity
@@ -2160,6 +2259,65 @@ pub fn discover_profiles(query: &DiscoveryQuery) -> Vec<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1570: TS 29.510 Table 6.2.3.2.3.1-1 `ml-analytics-info-list`, the
+    /// clause's own example (`29510-k00.txt:20715-20800`).
+    #[test]
+    fn ml_analytics_info_matching_follows_the_clause_example() {
+        let have = serde_json::json!({
+            "nwdafInfo": { "mlAnalyticsList": [{
+                "mlAnalyticsIds": ["SLICE_LOAD_LEVEL", "NETWORK_PERFORMANCE"],
+                "snssaiList": [{ "sst": 1 }, { "sst": 2 }],
+                "trackingAreaList": [{ "plmnId": { "mcc": "090", "mnc": "880" }, "tac": "cb34" }],
+                "mlModelInterInfo": { "vendorList": ["034523", "109296"] }
+            }]}
+        });
+        let m = |q: serde_json::Value| ml_analytics_list_matches(&have, q.as_array().unwrap());
+        // 1) the first item matches, so the instance is returned.
+        assert!(m(serde_json::json!([
+            { "mlAnalyticsIds": ["SLICE_LOAD_LEVEL"] },
+            { "snssaiList": [{ "sst": 3 }] }
+        ])));
+        // 2) one item whose vendor does not match: not returned.
+        assert!(!m(serde_json::json!([{
+            "mlAnalyticsIds": ["NETWORK_PERFORMANCE"],
+            "mlModelInterInfo": { "vendorList": ["002145"] }
+        }])));
+        assert!(m(serde_json::json!([{
+            "mlAnalyticsIds": ["NETWORK_PERFORMANCE"],
+            "mlModelInterInfo": { "vendorList": ["002145", "109296"] }
+        }])));
+        // Every attribute of one item must match the same profile item.
+        assert!(!m(serde_json::json!([{
+            "mlAnalyticsIds": ["SLICE_LOAD_LEVEL"],
+            "snssaiList": [{ "sst": 3 }]
+        }])));
+        assert!(m(serde_json::json!([{
+            "trackingAreaList": [{ "plmnId": { "mcc": "090", "mnc": "880" }, "tac": "CB34" }]
+        }])));
+        assert!(!m(serde_json::json!([{
+            "trackingAreaList": [{ "plmnId": { "mcc": "090", "mnc": "880" }, "tac": "cb35" }]
+        }])));
+        // An attribute the profile item does not offer is not supported.
+        assert!(!m(serde_json::json!([{ "flCapabilityType": "FL_SERVER" }])));
+        assert!(m(serde_json::json!([{ "vflClientAggrCap": false }])));
+        assert!(!m(serde_json::json!([{ "vflClientAggrCap": true }])));
+        // An item with no mlAnalyticsIds, snssaiList or trackingAreaList serves any.
+        let any = serde_json::json!({ "nwdafInfo": { "mlAnalyticsList": [{}] } });
+        assert!(ml_analytics_list_matches(
+            &any,
+            &[serde_json::json!({
+                "mlAnalyticsIds": ["NF_LOAD"],
+                "snssaiList": [{ "sst": 1, "sd": "000001" }]
+            })]
+        ));
+        // No mlAnalyticsList at all claims nothing.
+        let none = serde_json::json!({ "nwdafInfo": { "nwdafEvents": ["NF_LOAD"] } });
+        assert!(!ml_analytics_list_matches(
+            &none,
+            &[serde_json::json!({ "mlAnalyticsIds": ["NF_LOAD"] })]
+        ));
+    }
 
     #[test]
     fn test_nf_instance_manager_new() {

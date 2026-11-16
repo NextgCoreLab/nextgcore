@@ -46,6 +46,7 @@ pub mod session_ambr_cap;
 pub mod sm_policy_build;
 pub mod timer;
 pub mod ue_policy; // Rel-16: URSP rule provisioning (TS 23.503)
+pub mod vplmn_qos; // #1541: VPLMN-QoS-Control (TS 29.512 feature 49)
 
 // Re-export the WSB-1/H2 strict-peer surface (PcfBinding body builder and
 // the PCF self identity it reads) and the shared SM policy decision builder.

@@ -1087,7 +1087,10 @@ const AM_FEATURE_UE_AMBR_AUTHORIZATION: u64 = 1 << 2;
 /// actually exercises. Intersected with the SMF-requested value.
 /// #1398: plus PCSCF-Restoration-Enhancement (feature 9), which
 /// [`handle_pcscf_restoration`] signals with `pcscfRestIndication`.
-const PCF_SM_POLICY_SUPPORTED_FEATURES: u64 = 0x3 | SM_FEATURE_PCSCF_RESTORATION_ENHANCEMENT;
+/// #1541: plus VPLMN-QoS-Control (feature 49), which bounds the decision by the
+/// SMF's `vplmnQos` ([`crate::vplmn_qos`]).
+const PCF_SM_POLICY_SUPPORTED_FEATURES: u64 =
+    0x3 | SM_FEATURE_PCSCF_RESTORATION_ENHANCEMENT | crate::vplmn_qos::SM_FEATURE_VPLMN_QOS_CONTROL;
 /// TS 29.512 Table 5.8-1 feature 9, PCSCF-Restoration-Enhancement: bit 8, since
 /// feature 1 is the least significant bit (TS 29.571 §5.2.2 SupportedFeatures).
 pub(crate) const SM_FEATURE_PCSCF_RESTORATION_ENHANCEMENT: u64 = 1 << 8;
@@ -2908,6 +2911,24 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
     // a later `SE_AMBR_CH` update that reports only the trigger still has the
     // subscribed bound to authorise against.
     let subs_sess_ambr = parse_subs_sess_ambr(policy_data.get("subsSessAmbr"));
+    // #1541: TS 29.512 §4.2.2.2, the QoS the VPLMN supports, when VPLMN-QoS-Control
+    // is negotiated. Refused when malformed: a bound this PCF cannot read is one it
+    // cannot honour, and authorising past it is what the clause forbids.
+    let vplmn_qos = match policy_data.get("vplmnQos") {
+        Some(v)
+            if negotiated_feature_bits(
+                policy_data.get("suppFeat").and_then(|v| v.as_str()),
+                PCF_SM_POLICY_SUPPORTED_FEATURES,
+            ) & crate::vplmn_qos::SM_FEATURE_VPLMN_QOS_CONTROL
+                != 0 =>
+        {
+            match crate::vplmn_qos::parse(v) {
+                Ok(bound) => Some(bound),
+                Err(why) => return send_bad_request(&why, Some("MANDATORY_IE_INCORRECT")),
+            }
+        }
+        _ => None,
+    };
 
     // TS 29.512 §4.2.7 / §5.2.3.2: the SMF forwards the AMF's origination
     // timestamp. A value that is present but unreadable is refused rather than
@@ -3019,6 +3040,7 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
                 policy_data.get("suppFeat").and_then(|v| v.as_str()),
                 PCF_SM_POLICY_SUPPORTED_FEATURES,
             );
+            sess.vplmn_qos = vplmn_qos.clone();
             if let Ok(context) = ctx.read() {
                 context.sess_update(&sess);
             }
@@ -4065,6 +4087,40 @@ pub async fn handle_sm_policy_update_notify(
             // direction, independently, because a subscription that lowers only the
             // uplink must not touch the downlink), the same setting the create and
             // the UpdateNotify apply.
+            // #1541: TS 29.512 §4.2.4.4 / §4.2.4.5, VPLMN_QOS_CH with the new
+            // `vplmnQos`, or `vplmnQosNotApp: true` when the constraints no longer
+            // apply. Stored before the arms below so each authorises against it.
+            let vplmn_reported =
+                sess.smpolicycontrol_features & crate::vplmn_qos::SM_FEATURE_VPLMN_QOS_CONTROL != 0
+                    && triggers.iter().any(|t| t == "VPLMN_QOS_CH");
+            let sess = if vplmn_reported {
+                let fresh =
+                    if update_data.get("vplmnQosNotApp").and_then(|v| v.as_bool()) == Some(true) {
+                        None
+                    } else {
+                        match update_data.get("vplmnQos").map(crate::vplmn_qos::parse) {
+                            Some(Ok(bound)) => Some(bound),
+                            Some(Err(why)) => {
+                                return send_bad_request(&why, Some("MANDATORY_IE_INCORRECT"))
+                            }
+                            // The trigger without either member: nothing to apply.
+                            None => sess.vplmn_qos.clone(),
+                        }
+                    };
+                log::info!(
+                    "VPLMN_QOS_CH for smPolicyId={sm_policy_id}: VPLMN QoS constraints \
+                     {fresh:?}"
+                );
+                if let Ok(context) = ctx.read() {
+                    context.sess_modify(sess.id, |s| s.vplmn_qos = fresh.clone());
+                }
+                let mut latest = sess.clone();
+                latest.vplmn_qos = fresh;
+                latest
+            } else {
+                sess
+            };
+
             let sess_rules = if triggers.iter().any(|t| t == "SE_AMBR_CH") {
                 let dnn = sess.dnn.as_deref().unwrap_or("internet");
                 // The real SUPI. Resolved through the session's parent UE-SM, which is
@@ -4119,7 +4175,10 @@ pub async fn handle_sm_policy_update_notify(
                     // the DB answers again.
                     // #1402: the one helper every path caps through, with the bound
                     // this update just reported (or the stored one).
-                    let capped_by_subs = crate::session_ambr_cap::apply(&sd, bound.as_ref());
+                    let subs_only = crate::session_ambr_cap::apply(&sd, bound.as_ref());
+                    // #1541: and never past the VPLMN's Session-AMBR (§4.2.4.4).
+                    let capped_by_subs =
+                        crate::vplmn_qos::apply(&subs_only, sess.vplmn_qos.as_ref());
                     let (auth_ul, auth_dl) =
                         (capped_by_subs.ambr_uplink, capped_by_subs.ambr_downlink);
                     log::info!(
@@ -4136,9 +4195,12 @@ pub async fn handle_sm_policy_update_notify(
                     // falls back to it rather than to the pre-bound value.
                     if let Ok(context) = ctx.read() {
                         if let Some(mut stored) = context.sess_find_by_sm_policy_id(sm_policy_id) {
+                            // #1541: without the VPLMN bound, which every build
+                            // re-applies from `vplmn_qos`, so lifting it later
+                            // (vplmnQosNotApp) is not undone by this fallback.
                             stored.authorised_session_data = Some(nudr_handler::SessionData {
-                                ambr_uplink: auth_ul,
-                                ambr_downlink: auth_dl,
+                                ambr_uplink: subs_only.ambr_uplink,
+                                ambr_downlink: subs_only.ambr_downlink,
                                 ..sd.clone()
                             });
                             context.sess_update(&stored);
@@ -4150,20 +4212,25 @@ pub async fn handle_sm_policy_update_notify(
                     let bounded = nudr_handler::SessionData {
                         ambr_uplink: auth_ul,
                         ambr_downlink: auth_dl,
-                        ..sd.clone()
+                        // #1541: with the VPLMN-bounded default QoS.
+                        ..capped_by_subs.clone()
                     };
                     let capped = sbi_path::effective_session_data(&sess.sm_policy_id, &bounded);
                     let (auth_ul, auth_dl) = (capped.ambr_uplink, capped.ambr_downlink);
                     let sess_rule_id = format!("SessRule-{}", sess.sm_policy_id);
-                    serde_json::json!({
-                        &sess_rule_id: {
-                            "sessRuleId": sess_rule_id,
-                            "authSessAmbr": {
-                                "uplink": format_bitrate(auth_ul),
-                                "downlink": format_bitrate(auth_dl),
-                            },
-                        }
-                    })
+                    let mut rule = serde_json::json!({
+                        "sessRuleId": sess_rule_id,
+                        "authSessAmbr": {
+                            "uplink": format_bitrate(auth_ul),
+                            "downlink": format_bitrate(auth_dl),
+                        },
+                    });
+                    if vplmn_reported {
+                        // #1541: a VPLMN_QOS_CH in the same update also re-derives
+                        // the default QoS (§4.2.4.5).
+                        rule["authDefQos"] = auth_def_qos_json(&capped);
+                    }
+                    serde_json::json!({ &sess_rule_id: rule })
                 } else {
                     // Neither readable nor stored: no session rule, and the SMF keeps
                     // the AMBR it has (TS 29.512 §4.2.6.1: no entry, no change).
@@ -4174,6 +4241,11 @@ pub async fn handle_sm_policy_update_notify(
                     );
                     serde_json::json!({})
                 }
+            } else if vplmn_reported {
+                // #1541: TS 29.512 §4.2.4.4 / §4.2.4.5: the authorised Session-AMBR and
+                // default QoS, re-derived within the VPLMN's new constraints (or
+                // without them), in the response.
+                vplmn_qos_ch_sess_rules(&sess)
             } else {
                 serde_json::json!({})
             };
@@ -4195,6 +4267,56 @@ pub async fn handle_sm_policy_update_notify(
             Some("POLICY_NOT_FOUND"),
         ),
     }
+}
+
+/// #1541: `authDefQos` (TS 29.512 `AuthorizedDefaultQos`) for `sd`, as the create
+/// builds it.
+fn auth_def_qos_json(sd: &nudr_handler::SessionData) -> serde_json::Value {
+    serde_json::json!({
+        "5qi": sd.qos_index,
+        "arp": crate::sm_policy_build::arp_json(
+            sd.arp_priority_level,
+            sd.arp_preempt_cap,
+            sd.arp_preempt_vuln,
+        ),
+    })
+}
+
+/// #1541: the session rule a VPLMN_QOS_CH update is answered with: the
+/// Session-AMBR and default QoS re-derived through `decision_session_data`
+/// (operator cap, the VPLMN bound now stored on `sess`, override), from the
+/// session data a re-evaluation reads. `{}` (no change, §4.2.6.1) when the
+/// session's SUPI or session data cannot be had.
+fn vplmn_qos_ch_sess_rules(sess: &PcfSess) -> serde_json::Value {
+    let supi = pcf_self()
+        .read()
+        .ok()
+        .and_then(|context| context.ue_sm_find_by_id(sess.pcf_ue_sm_id))
+        .map(|ue| ue.supi)
+        .unwrap_or_default();
+    if supi.is_empty() {
+        log::warn!(
+            "VPLMN_QOS_CH for smPolicyId={}: the session's SUPI cannot be resolved; no \
+             session rule is authorised",
+            sess.sm_policy_id
+        );
+        return serde_json::json!({});
+    }
+    let Some(sd) = sbi_path::session_data_for_reevaluation(sess, &supi, "VPLMN_QOS_CH") else {
+        return serde_json::json!({});
+    };
+    let auth = sbi_path::decision_session_data(sess, &sd);
+    let sess_rule_id = format!("SessRule-{}", sess.sm_policy_id);
+    serde_json::json!({
+        &sess_rule_id: {
+            "sessRuleId": sess_rule_id,
+            "authSessAmbr": {
+                "uplink": format_bitrate(auth.ambr_uplink),
+                "downlink": format_bitrate(auth.ambr_downlink),
+            },
+            "authDefQos": auth_def_qos_json(&auth),
+        }
+    })
 }
 
 // Policy Authorization handlers
@@ -6553,7 +6675,7 @@ mod tests {
         // Negotiated = ffffffff & PCF_SM_POLICY_SUPPORTED_FEATURES, not the echo.
         assert_eq!(
             body["suppFeat"],
-            format!("{:x}", PCF_SM_POLICY_SUPPORTED_FEATURES)
+            format!("{:x}", 0xffff_ffff_u64 & PCF_SM_POLICY_SUPPORTED_FEATURES)
         );
         assert_ne!(body["suppFeat"], "ffffffff");
     }
@@ -11542,6 +11664,225 @@ mod tests {
                 }],
             },
         );
+    }
+
+    /// #1541: the one session rule of a decision, as (5QI, ARP, uplink, downlink).
+    fn sess_rule_1541(rules: &serde_json::Value) -> (i64, serde_json::Value, String, String) {
+        let rules = rules
+            .as_object()
+            .unwrap_or_else(|| panic!("sessRules present: {rules}"));
+        assert_eq!(rules.len(), 1, "one session rule: {rules:?}");
+        let rule = rules.values().next().unwrap();
+        (
+            rule["authDefQos"]["5qi"].as_i64().unwrap_or(-1),
+            rule["authDefQos"]["arp"].clone(),
+            rule["authSessAmbr"]["uplink"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+            rule["authSessAmbr"]["downlink"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+        )
+    }
+
+    /// #1541: TS 29.512 Table 5.8-1 feature 49 (VPLMN-QoS-Control) as a suppFeat.
+    const VPLMN_QOS_FEAT_1541: &str = "1000000000000";
+
+    /// #1541: a VPLMN that supports less than the subscription (seeded 5QI 7, ARP
+    /// level 2, 11/22 Mbps).
+    fn vplmn_qos_1541() -> serde_json::Value {
+        serde_json::json!({
+            "sessionAmbr": { "uplink": "5 Mbps", "downlink": "50 Mbps" },
+            "5qi": 8,
+            "arp": { "priorityLevel": 9, "preemptCap": "NOT_PREEMPT", "preemptVuln": "PREEMPTABLE" }
+        })
+    }
+
+    /// #1541: an SM policy create for a seeded subscriber with `suppFeat` and, if
+    /// given, `vplmnQos`; answers (status, body, smPolicyId).
+    async fn sm_create_1541(
+        supi: &str,
+        supp_feat: &str,
+        vplmn_qos: Option<serde_json::Value>,
+    ) -> (u16, serde_json::Value, String) {
+        seed_subscriber_1383(supi);
+        let mut create = full_create_body(supi, 5);
+        let obj = create.as_object_mut().unwrap();
+        obj.insert("suppFeat".into(), serde_json::json!(supp_feat));
+        obj.remove("ipv4Address");
+        if let Some(v) = vplmn_qos {
+            obj.insert("vplmnQos".into(), v);
+        }
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(create),
+        ))
+        .await;
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap_or_default();
+        let id = resp
+            .http
+            .headers
+            .get("location")
+            .and_then(|l| l.rsplit('/').next())
+            .unwrap_or("")
+            .to_string();
+        (resp.status, body, id)
+    }
+
+    fn arp_1541(level: i64, cap: &str, vuln: &str) -> serde_json::Value {
+        serde_json::json!({ "priorityLevel": level, "preemptCap": cap, "preemptVuln": vuln })
+    }
+
+    /// #1541: TS 29.512 §4.2.2.5 / TS 23.503 §6.1.3.6. With VPLMN-QoS-Control
+    /// negotiated, the create and the GET authorise no more than the VPLMN supports:
+    /// Session-AMBR per direction, a default 5QI it supports, an ARP no more
+    /// privileged than its own. Not negotiated, `vplmnQos` is not this association's
+    /// and the subscription is authorised. A malformed `vplmnQos` is refused only
+    /// when negotiated.
+    ///
+    /// REVERT-VERIFIED: without `vplmn_qos::apply` in `decision_session_data`, the
+    /// negotiated create answers 11/22 Mbps and 5QI 7; with the feature bit not
+    /// advertised, the same.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn sm_policy_create_is_bounded_by_the_vplmn_qos_1541() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _cap = crate::test_support::session_ambr_cap(
+            crate::session_ambr_cap::SessionAmbrCap::Subscribed,
+        );
+        pcf_context_init(64, 64);
+        let (status, body, id) = sm_create_1541(
+            "imsi-001010000015411",
+            VPLMN_QOS_FEAT_1541,
+            Some(vplmn_qos_1541()),
+        )
+        .await;
+        assert_eq!(status, 201, "{body}");
+        assert_eq!(body["suppFeat"], VPLMN_QOS_FEAT_1541, "{body}");
+        let bounded = (
+            8,
+            arp_1541(9, "NOT_PREEMPT", "PREEMPTABLE"),
+            "5 Mbps".to_string(),
+            "22 Mbps".to_string(),
+        );
+        assert_eq!(sess_rule_1541(&body["sessRules"]), bounded, "{body}");
+        let resp = pcf_sbi_request_handler(make_request(
+            "GET",
+            &format!("/npcf-smpolicycontrol/v1/sm-policies/{id}"),
+            None,
+        ))
+        .await;
+        let got: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            sess_rule_1541(&got["policy"]["sessRules"]),
+            bounded,
+            "GET: {got}"
+        );
+
+        let (status, body, _) =
+            sm_create_1541("imsi-001010000015412", "0", Some(vplmn_qos_1541())).await;
+        assert_eq!(status, 201, "{body}");
+        let (five_qi, _, ul, dl) = sess_rule_1541(&body["sessRules"]);
+        assert_eq!(
+            (five_qi, ul.as_str(), dl.as_str()),
+            (7, "11 Mbps", "22 Mbps"),
+            "not negotiated: the subscription: {body}"
+        );
+
+        let bad = serde_json::json!({ "sessionAmbr": { "uplink": "fast" } });
+        let (status, _, _) = sm_create_1541(
+            "imsi-001010000015413",
+            VPLMN_QOS_FEAT_1541,
+            Some(bad.clone()),
+        )
+        .await;
+        assert_eq!(status, 400, "a bound it cannot read is refused");
+        let (status, _, _) = sm_create_1541("imsi-001010000015414", "0", Some(bad)).await;
+        assert_eq!(status, 201, "not negotiated: ignored");
+    }
+
+    /// #1541: TS 29.512 §4.2.4.4 / §4.2.4.5. A VPLMN_QOS_CH update with a new
+    /// `vplmnQos` is answered with the Session-AMBR and default QoS bound by it;
+    /// `vplmnQosNotApp` lifts the bound; an SE_AMBR_CH still respects the stored one.
+    ///
+    /// REVERT-VERIFIED: without the `vplmn_reported` arm, the VPLMN_QOS_CH updates
+    /// answer no session rule; without the `vplmn_qos::apply` in the SE_AMBR_CH arm,
+    /// the last update answers 100/100 Mbps.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn sm_policy_update_applies_a_changed_vplmn_qos_1541() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _cap =
+            crate::test_support::session_ambr_cap(crate::session_ambr_cap::SessionAmbrCap::None);
+        pcf_context_init(64, 64);
+        let (status, body, id) =
+            sm_create_1541("imsi-001010000025411", VPLMN_QOS_FEAT_1541, None).await;
+        assert_eq!(status, 201, "{body}");
+        let (five_qi, _, ul, dl) = sess_rule_1541(&body["sessRules"]);
+        assert_eq!(
+            (five_qi, ul.as_str(), dl.as_str()),
+            (7, "11 Mbps", "22 Mbps")
+        );
+
+        let update = |body: serde_json::Value| {
+            let id = id.clone();
+            async move {
+                let resp = pcf_sbi_request_handler(make_request(
+                    "POST",
+                    &format!("/npcf-smpolicycontrol/v1/sm-policies/{id}/update"),
+                    Some(body),
+                ))
+                .await;
+                assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+                serde_json::from_str::<serde_json::Value>(resp.http.content.as_deref().unwrap())
+                    .unwrap()
+            }
+        };
+        let got = update(serde_json::json!({
+            "repPolicyCtrlReqTriggers": ["VPLMN_QOS_CH"],
+            "vplmnQos": { "sessionAmbr": { "uplink": "1 Mbps", "downlink": "2 Mbps" }, "5qi": 7 }
+        }))
+        .await;
+        let (five_qi, _, ul, dl) = sess_rule_1541(&got["sessRules"]);
+        assert_eq!(
+            (five_qi, ul.as_str(), dl.as_str()),
+            (7, "1 Mbps", "2 Mbps"),
+            "{got}"
+        );
+
+        let got = update(serde_json::json!({
+            "repPolicyCtrlReqTriggers": ["VPLMN_QOS_CH"],
+            "vplmnQosNotApp": true
+        }))
+        .await;
+        let (five_qi, _, ul, dl) = sess_rule_1541(&got["sessRules"]);
+        assert_eq!(
+            (five_qi, ul.as_str(), dl.as_str()),
+            (7, "11 Mbps", "22 Mbps"),
+            "{got}"
+        );
+
+        update(serde_json::json!({
+            "repPolicyCtrlReqTriggers": ["VPLMN_QOS_CH"],
+            "vplmnQos": { "sessionAmbr": { "uplink": "3 Mbps", "downlink": "4 Mbps" } }
+        }))
+        .await;
+        let got = update(serde_json::json!({
+            "repPolicyCtrlReqTriggers": ["SE_AMBR_CH"],
+            "subsSessAmbr": { "uplink": "100 Mbps", "downlink": "100 Mbps" }
+        }))
+        .await;
+        let (_, _, ul, dl) = sess_rule_1541(&got["sessRules"]);
+        assert_eq!((ul.as_str(), dl.as_str()), ("3 Mbps", "4 Mbps"), "{got}");
     }
 
     /// SM policy create for `supi` through the real router, its notificationUri on the

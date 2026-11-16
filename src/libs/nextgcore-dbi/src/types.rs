@@ -156,8 +156,17 @@ impl NextgcoreUint24 {
         }
     }
 
-    /// Parse SD from hex string (e.g., "000001")
+    /// Parse an SD from its TS 29.571 string form (e.g. `"000001"`).
+    ///
+    /// `Snssai.sd` is a 3-octet string with pattern `^[A-Fa-f0-9]{6}$`
+    /// (TS 29.571 Table 5.4.4.2-1, `29571-k00.txt:4388-4441`), so anything else is
+    /// `None` (#1547). `u32::from_str_radix` alone also took `"1"` (SD 000001),
+    /// `"+1"`, and a 7-digit `"0100001"` (SD 100001 after the 24-bit mask, a
+    /// different slice).
     pub fn from_hex_string(s: &str) -> Option<Self> {
+        if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
         u32::from_str_radix(s, 16).ok().map(NextgcoreUint24::new)
     }
 }
