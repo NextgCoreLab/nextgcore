@@ -5597,6 +5597,119 @@ mod tests {
         );
     }
 
+    /// #1567 review: an operator-specific QCI (130, TS 23.203 §6.1.7.1: its resource
+    /// type is the operator's) keeps its MBR and GBR, at activation and through a
+    /// Bearer Resource Command: the Create Bearer Request carries 128/128 and 64/64
+    /// kbit/s and the Create QER an MBR IE; the Command's 256/256 and 128/96 reach the
+    /// Update Bearer Request, the store and the Update QER's MBR.
+    ///
+    /// REVERT-VERIFIED: with the drop keyed on `!is_gbr_qci` again, the Command's rates
+    /// are dropped too, so it changes nothing and no Update Bearer Request (type 97)
+    /// arrives; the config-load test fails on the QCI 130 rule's zeroed rates.
+    #[tokio::test]
+    async fn an_operator_specific_qci_keeps_its_rates_1567() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        let mut rule = voice_rule();
+        rule.name = "vip-video".into();
+        rule.qci = 130;
+        let (server, sgw, _port, sess, pgw_c_teid) = pdn_with_local_rules(0x79, vec![rule]).await;
+        const MBR_IE: [u8; 4] = [0x00, 0x1a, 0x00, 0x0a];
+        let rates = |q: &nextgcore_gtp::v2::Gtp2BearerQosIe| {
+            (q.qci, q.mbr_ul, q.mbr_dl, q.gbr_ul, q.gbr_dl)
+        };
+
+        let (cbr, _) = recv_type(&sgw, gtp2_message_type::CREATE_BEARER_REQUEST).await;
+        let cbr_qos = cbr
+            .bearer_context(0)
+            .unwrap()
+            .expect("a Bearer Context")
+            .bearer_qos()
+            .unwrap()
+            .expect("the Bearer QoS");
+        sgw.send_to(
+            &s5c_create_bearer_response(cbr.header.sequence_number, pgw_c_teid, 6, 16, None),
+            server.local_addr(),
+        )
+        .await
+        .expect("send");
+        stored_bearer(sess.id, 6).await.expect("EBI 6 active");
+        assert!(upf_until(&upf, |m| sent(m, &far_id_ie(0x81))).await);
+        let activation_bodies = upf.modification_bodies();
+        upf.clear_seen();
+
+        const SEQ: u32 = 0x8079;
+        let tad = crate::eps_tft::encode(crate::eps_tft::op::NO_TFT_OPERATION, &[]).unwrap();
+        let brc = s5c_bearer_resource_command(
+            SEQ,
+            pgw_c_teid,
+            6,
+            0x16,
+            &tad,
+            Some((130, [256, 256, 128, 96])),
+        );
+        sgw.send_to(&brc, server.local_addr()).await.expect("send");
+        let (ubr, _) = recv_type(&sgw, gtp2_message_type::UPDATE_BEARER_REQUEST).await;
+        let ubr_qos = ubr
+            .bearer_context(0)
+            .unwrap()
+            .expect("a Bearer Context")
+            .bearer_qos()
+            .unwrap()
+            .expect("the Bearer QoS: it changed");
+        sgw.send_to(
+            &s5c_bearer_answer(
+                gtp2_message_type::UPDATE_BEARER_RESPONSE,
+                SEQ,
+                pgw_c_teid,
+                6,
+                16,
+            ),
+            server.local_addr(),
+        )
+        .await
+        .expect("send");
+        assert!(
+            upf_until(&upf, |m| sent(m, &[0x00, 0x0e])).await,
+            "an Update QER"
+        );
+        let modification_bodies = upf.modification_bodies();
+        let modified = stored_bearer(sess.id, 6).await.expect("EBI 6");
+        assert_eq!(server.outstanding().await, 0);
+        server.close();
+
+        assert_eq!(
+            rates(&cbr_qos),
+            (130, 128, 128, 64, 64),
+            "kept at activation"
+        );
+        assert!(
+            sent(&activation_bodies, &MBR_IE),
+            "the Create QER has its MBR: {activation_bodies:02x?}"
+        );
+        assert_eq!(
+            rates(&ubr_qos),
+            (130, 256, 256, 128, 96),
+            "kept on the Command"
+        );
+        let q = &modified.qos;
+        assert_eq!(
+            (
+                q.index,
+                q.mbr_uplink,
+                q.mbr_downlink,
+                q.gbr_uplink,
+                q.gbr_downlink
+            ),
+            (130, 256_000, 256_000, 128_000, 96_000)
+        );
+        assert!(
+            sent(&modification_bodies, &MBR_IE),
+            "the Update QER carries the new MBR: {modification_bodies:02x?}"
+        );
+    }
+
     /// #619 follow-up 2: a Bearer Resource Command for a dedicated bearer whose
     /// Command-triggered procedure is still running is refused at once with a Bearer
     /// Resource Failure Indication, cause #101 "Collision with network initiated
