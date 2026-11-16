@@ -877,17 +877,81 @@ fn parse_rule_id_u16(body: &[u8], id_ie_type: u16) -> Option<u16> {
     Some(u16::from_be_bytes([ie.value[0], ie.value[1]]))
 }
 
+/// The rule-ID IE a rule-bearing grouped IE embeds as Mandatory (TS 29.244
+/// Tables 7.5.2.2-1 to 7.5.2.5-1 and 7.5.2.9-1 for Create, 7.5.4.2-1 to 7.5.4.5-1
+/// and 7.5.4.20-1 for Update, 7.5.4.6-1 to 7.5.4.10-1 and 7.5.4.19-1 for Remove
+/// and Query URR), or `None` for an IE that is not a rule (#1598).
+fn embedded_rule_id_ie(grouped: u16) -> Option<u16> {
+    match grouped {
+        pfcp_ie::CREATE_PDR | pfcp_ie::UPDATE_PDR | pfcp_ie::REMOVE_PDR => Some(pfcp_ie::PDR_ID),
+        pfcp_ie::CREATE_FAR | pfcp_ie::UPDATE_FAR | pfcp_ie::REMOVE_FAR => Some(pfcp_ie::FAR_ID),
+        pfcp_ie::CREATE_URR | pfcp_ie::UPDATE_URR | pfcp_ie::REMOVE_URR | pfcp_ie::QUERY_URR => {
+            Some(pfcp_ie::URR_ID)
+        }
+        pfcp_ie::CREATE_QER | pfcp_ie::UPDATE_QER | pfcp_ie::REMOVE_QER => Some(pfcp_ie::QER_ID),
+        pfcp_ie::CREATE_SRR | pfcp_ie::UPDATE_SRR | pfcp_ie::REMOVE_SRR => Some(pfcp_ie::SRR_ID),
+        _ => None,
+    }
+}
+
+/// The type of the rule-ID IE `body` (a `grouped` IE's value) lacks, if it lacks
+/// it (#1598).
+fn missing_rule_id(grouped: u16, body: &[u8]) -> Option<u16> {
+    let id = embedded_rule_id_ie(grouped)?;
+    ParsedIe::find_ie(&ParsedIe::parse_all(body), id)
+        .is_none()
+        .then_some(id)
+}
+
+/// The Cause for a rule-bearing grouped IE whose rule ID is absent (#1598).
+///
+/// The rule ID is Mandatory inside every Create, Update and Remove rule IE, and
+/// TS 29.244 §7.2.2.4.1 (29244-k00.txt:14248-14274) sets how the receiver views
+/// it: Mandatory inside a Mandatory grouped IE, Conditional inside a Conditional
+/// one. Session Establishment carries Create PDR and Create FAR as M and Create
+/// URR and Create QER as C (Table 7.5.2.1-1); every rule IE of a Session
+/// Modification is C (Table 7.5.4.1-1). §7.6.6 then answers a missing Mandatory
+/// IE "Mandatory IE missing" (66) and a missing Conditional one "Conditional IE
+/// missing" (67), each with the missing IE's own type as the Offending IE. Cause
+/// 69 (§7.6.8) is for an ID that is present but wrong, not absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleIdPresence {
+    /// The grouped IE is Mandatory in this message: a missing ID is cause 66.
+    Mandatory,
+    /// The grouped IE is Conditional in this message: a missing ID is cause 67.
+    Conditional,
+}
+
+impl RuleIdPresence {
+    fn missing_cause(self) -> PfcpCause {
+        match self {
+            Self::Mandatory => PfcpCause::MandatoryIeMissing,
+            Self::Conditional => PfcpCause::ConditionalIeMissing,
+        }
+    }
+}
+
 /// Parse every IE of one type with the establishment path's parser, noting a
 /// malformed body as an Offending IE rather than dropping it silently (#306;
 /// Session Establishment too since #1532).
+///
+/// A body without its rule ID is noted as that ID missing, with the cause
+/// `presence` gives (#1598); any other refusal is "Mandatory IE incorrect" with
+/// the grouped IE as the Offending IE (§7.6.8).
 fn parse_rule_list<T>(
     ies: &[ParsedIe],
     ie_type: u16,
+    presence: RuleIdPresence,
     parse: impl Fn(&[u8]) -> Result<T, &'static str>,
     failure: &mut Option<N4Failure>,
 ) -> Vec<T> {
     let mut out = Vec::new();
     for ie in ParsedIe::find_all_ies(ies, ie_type) {
+        if let Some(id) = missing_rule_id(ie_type, &ie.value) {
+            log::warn!("rule IE {ie_type} carries no rule ID (IE {id})");
+            note_first_failure(failure, presence.missing_cause(), id);
+            continue;
+        }
         match parse(&ie.value) {
             Ok(rule) => out.push(rule),
             Err(e) => {
@@ -2167,10 +2231,19 @@ impl PfcpServer {
                         "Session Establishment from {src_addr}: malformed Create QER ({e}) — \
                          rejecting"
                     );
-                    let resp_payload = build_failure_response(
-                        PfcpCause::MandatoryIeIncorrect,
-                        Some(pfcp_ie::CREATE_QER),
-                    );
+                    // #1598: a Create QER without its QER ID is "Conditional IE
+                    // missing" with the QER ID's type (Create QER is C at
+                    // establishment, Table 7.5.2.1-1, §7.2.2.4.1, §7.6.6); any other
+                    // refusal stays "Mandatory IE incorrect" with the Create QER.
+                    let resp_payload = match missing_rule_id(pfcp_ie::CREATE_QER, &qer_ie.value) {
+                        Some(id) => {
+                            build_failure_response(PfcpCause::ConditionalIeMissing, Some(id))
+                        }
+                        None => build_failure_response(
+                            PfcpCause::MandatoryIeIncorrect,
+                            Some(pfcp_ie::CREATE_QER),
+                        ),
+                    };
                     let response = self.build_response(
                         pfcp_type::SESSION_ESTABLISHMENT_RESPONSE,
                         smf_seid,
@@ -2188,21 +2261,38 @@ impl PfcpServer {
         }
 
         // #1532: the Create PDRs, FARs and URRs too, before anything is allocated. A
-        // Create PDR, FAR or URR its parser refuses (no PDR/FAR/URR ID, or a
-        // malformed F-TEID, UE IP Address or Outer Header Creation inside it) is a
-        // mandatory or verifiable conditional IE with a semantically invalid value,
-        // so the request is discarded and answered "Mandatory IE incorrect" with the
-        // offending grouped IE (TS 29.244 §7.6.8), as Session Modification already
-        // does (`parse_rule_list`). These used to be logged and skipped, so the
-        // session ran without that rule: a PDR that never matched, a missing FAR, a
-        // URR that never reported.
+        // Create PDR, FAR or URR its parser refuses (a malformed F-TEID, UE IP
+        // Address or Outer Header Creation inside it) is a mandatory or verifiable
+        // conditional IE with a semantically invalid value, so the request is
+        // discarded and answered "Mandatory IE incorrect" with the offending grouped
+        // IE (TS 29.244 §7.6.8), as Session Modification already does
+        // (`parse_rule_list`). #1598: one with no PDR/FAR/URR ID is instead a missing
+        // IE, cause 66 for the Mandatory Create PDR and FAR and 67 for the
+        // Conditional Create URR (`RuleIdPresence`). These used to be logged and
+        // skipped, so the session ran without that rule: a PDR that never matched,
+        // a missing FAR, a URR that never reported.
         let mut malformed: Option<N4Failure> = None;
-        let create_pdrs =
-            parse_rule_list(&ies, pfcp_ie::CREATE_PDR, parse_create_pdr, &mut malformed);
-        let create_fars =
-            parse_rule_list(&ies, pfcp_ie::CREATE_FAR, parse_create_far, &mut malformed);
-        let create_urrs =
-            parse_rule_list(&ies, pfcp_ie::CREATE_URR, parse_create_urr, &mut malformed);
+        let create_pdrs = parse_rule_list(
+            &ies,
+            pfcp_ie::CREATE_PDR,
+            RuleIdPresence::Mandatory,
+            parse_create_pdr,
+            &mut malformed,
+        );
+        let create_fars = parse_rule_list(
+            &ies,
+            pfcp_ie::CREATE_FAR,
+            RuleIdPresence::Mandatory,
+            parse_create_far,
+            &mut malformed,
+        );
+        let create_urrs = parse_rule_list(
+            &ies,
+            pfcp_ie::CREATE_URR,
+            RuleIdPresence::Conditional,
+            parse_create_urr,
+            &mut malformed,
+        );
         if let Some(failure) = malformed {
             log::warn!("Session Establishment from {src_addr}: {failure:?} — rejecting");
             let resp_payload = failure.response_body();
@@ -2550,40 +2640,35 @@ impl PfcpServer {
 
         // A Remove IE whose rule-id sub-IE is missing or short is malformed, and is
         // reported rather than skipped: silently dropping it is the defect #306 is
-        // about, one level down.
-        for (ie_type, parsed, total) in [
-            (
-                pfcp_ie::REMOVE_PDR,
-                removed_pdr_ids.len(),
-                ParsedIe::find_all_ies(&ies, pfcp_ie::REMOVE_PDR).len(),
-            ),
-            (
-                pfcp_ie::REMOVE_FAR,
-                removed_far_ids.len(),
-                ParsedIe::find_all_ies(&ies, pfcp_ie::REMOVE_FAR).len(),
-            ),
-            (
-                pfcp_ie::REMOVE_QER,
-                removed_qer_ids.len(),
-                ParsedIe::find_all_ies(&ies, pfcp_ie::REMOVE_QER).len(),
-            ),
-            (
-                pfcp_ie::REMOVE_URR,
-                removed_urr_ids.len(),
-                ParsedIe::find_all_ies(&ies, pfcp_ie::REMOVE_URR).len(),
-            ),
-            (
-                pfcp_ie::QUERY_URR,
-                queried_urr_ids.len(),
-                ParsedIe::find_all_ies(&ies, pfcp_ie::QUERY_URR).len(),
-            ),
+        // about, one level down. #1598: a missing ID is "Conditional IE missing"
+        // with the ID's own type (every Remove and Query IE is C in a Session
+        // Modification, §7.2.2.4.1, §7.6.6); a present but short one is "Mandatory
+        // IE incorrect" with the grouped IE (§7.6.8), as a short Create QER ID is.
+        for ie_type in [
+            pfcp_ie::REMOVE_PDR,
+            pfcp_ie::REMOVE_FAR,
+            pfcp_ie::REMOVE_QER,
+            pfcp_ie::REMOVE_URR,
+            pfcp_ie::QUERY_URR,
         ] {
-            if parsed < total {
-                log::warn!(
-                    "{} of {total} Remove IE {ie_type} carried no rule id",
-                    total - parsed
-                );
-                note_first_failure(&mut failure, PfcpCause::MandatoryIeMissing, ie_type);
+            for ie in ParsedIe::find_all_ies(&ies, ie_type) {
+                let id_ok = if ie_type == pfcp_ie::REMOVE_PDR {
+                    parse_rule_id_u16(&ie.value, pfcp_ie::PDR_ID).is_some()
+                } else {
+                    embedded_rule_id_ie(ie_type)
+                        .and_then(|id| parse_rule_id_u32(&ie.value, id))
+                        .is_some()
+                };
+                if id_ok {
+                    continue;
+                }
+                if let Some(id) = missing_rule_id(ie_type, &ie.value) {
+                    log::warn!("Remove/Query IE {ie_type} carries no rule ID (IE {id})");
+                    note_first_failure(&mut failure, PfcpCause::ConditionalIeMissing, id);
+                } else {
+                    log::warn!("Remove/Query IE {ie_type} carries a short rule ID");
+                    note_first_failure(&mut failure, PfcpCause::MandatoryIeIncorrect, ie_type);
+                }
             }
         }
 
@@ -2594,6 +2679,7 @@ impl PfcpServer {
         let mut created_pdrs = parse_rule_list(
             &ies,
             pfcp_ie::CREATE_PDR,
+            RuleIdPresence::Conditional,
             crate::n4_build::parse_create_pdr,
             &mut failure,
         );
@@ -2658,30 +2744,50 @@ impl PfcpServer {
         let updated_pdrs = parse_rule_list(
             &ies,
             pfcp_ie::UPDATE_PDR,
+            RuleIdPresence::Conditional,
             crate::n4_build::parse_create_pdr,
             &mut failure,
         );
-        let created_fars =
-            parse_rule_list(&ies, pfcp_ie::CREATE_FAR, parse_create_far, &mut failure);
-        let mod_fars = parse_rule_list(&ies, pfcp_ie::UPDATE_FAR, parse_create_far, &mut failure);
-        let created_qers =
-            parse_rule_list(&ies, pfcp_ie::CREATE_QER, parse_create_qer, &mut failure);
+        let created_fars = parse_rule_list(
+            &ies,
+            pfcp_ie::CREATE_FAR,
+            RuleIdPresence::Conditional,
+            parse_create_far,
+            &mut failure,
+        );
+        let mod_fars = parse_rule_list(
+            &ies,
+            pfcp_ie::UPDATE_FAR,
+            RuleIdPresence::Conditional,
+            parse_create_far,
+            &mut failure,
+        );
+        let created_qers = parse_rule_list(
+            &ies,
+            pfcp_ie::CREATE_QER,
+            RuleIdPresence::Conditional,
+            parse_create_qer,
+            &mut failure,
+        );
         // #1478: an Update QER keeps which IEs it carries (Table 7.5.4.5-1).
         let mod_qers = parse_rule_list(
             &ies,
             pfcp_ie::UPDATE_QER,
+            RuleIdPresence::Conditional,
             crate::n4_build::parse_update_qer,
             &mut failure,
         );
         let created_urrs = parse_rule_list(
             &ies,
             pfcp_ie::CREATE_URR,
+            RuleIdPresence::Conditional,
             crate::n4_build::parse_create_urr,
             &mut failure,
         );
         let mod_urrs = parse_rule_list(
             &ies,
             pfcp_ie::UPDATE_URR,
+            RuleIdPresence::Conditional,
             crate::n4_build::parse_create_urr,
             &mut failure,
         );
@@ -2694,25 +2800,37 @@ impl PfcpServer {
                 .iter()
                 .filter_map(|ie| crate::n4_build::parse_remove_srr(&ie.value))
                 .collect();
-            if removed.len() < removes.len() {
-                log::warn!("a Remove SRR carried no SRR ID");
-                note_first_failure(
-                    &mut failure,
-                    PfcpCause::MandatoryIeMissing,
-                    pfcp_ie::REMOVE_SRR,
-                );
+            // #1598: as for the other Remove IEs, a missing SRR ID is cause 67
+            // with the SRR ID's type, an empty one 69 with the Remove SRR.
+            for ie in &removes {
+                if crate::n4_build::parse_remove_srr(&ie.value).is_some() {
+                    continue;
+                }
+                log::warn!("a Remove SRR carried no usable SRR ID");
+                match missing_rule_id(pfcp_ie::REMOVE_SRR, &ie.value) {
+                    Some(id) => {
+                        note_first_failure(&mut failure, PfcpCause::ConditionalIeMissing, id)
+                    }
+                    None => note_first_failure(
+                        &mut failure,
+                        PfcpCause::MandatoryIeIncorrect,
+                        pfcp_ie::REMOVE_SRR,
+                    ),
+                }
             }
             (
                 removed,
                 parse_rule_list(
                     &ies,
                     pfcp_ie::CREATE_SRR,
+                    RuleIdPresence::Conditional,
                     crate::n4_build::parse_srr,
                     &mut failure,
                 ),
                 parse_rule_list(
                     &ies,
                     pfcp_ie::UPDATE_SRR,
+                    RuleIdPresence::Conditional,
                     crate::n4_build::parse_srr,
                     &mut failure,
                 ),
@@ -5849,11 +5967,17 @@ mod tests {
             (pfcp_ie::DESTINATION_INTERFACE, &[0]),
             (pfcp_ie::OUTER_HEADER_CREATION, &[0x01, 0x00]),
         ]);
-        let cases: Vec<(&str, u16, Vec<u8>)> = vec![
+        // #1598: a missing rule ID is cause 66 (Create PDR, Create FAR: M at
+        // establishment) or 67 (Create URR: C) with the ID's type; a malformed
+        // value stays 69 with the grouped IE.
+        let incorrect = PfcpCause::MandatoryIeIncorrect;
+        let cases: Vec<(&str, u16, Vec<u8>, PfcpCause, u16)> = vec![
             (
                 "PDR without a PDR ID",
                 pfcp_ie::CREATE_PDR,
                 grouped_1532(&[(pfcp_ie::PRECEDENCE, &200u32.to_be_bytes())]),
+                PfcpCause::MandatoryIeMissing,
+                pfcp_ie::PDR_ID,
             ),
             (
                 "PDR with an empty F-TEID",
@@ -5864,6 +5988,8 @@ mod tests {
                     (pfcp_ie::PDI, &pdi_short_fteid),
                     (pfcp_ie::FAR_ID, &1u32.to_be_bytes()),
                 ]),
+                incorrect,
+                pfcp_ie::CREATE_PDR,
             ),
             (
                 "PDR with an empty UE IP Address",
@@ -5874,11 +6000,15 @@ mod tests {
                     (pfcp_ie::PDI, &pdi_short_ue_ip),
                     (pfcp_ie::FAR_ID, &1u32.to_be_bytes()),
                 ]),
+                incorrect,
+                pfcp_ie::CREATE_PDR,
             ),
             (
                 "FAR without a FAR ID",
                 pfcp_ie::CREATE_FAR,
                 grouped_1532(&[(pfcp_ie::APPLY_ACTION, &[0x02, 0x00])]),
+                PfcpCause::MandatoryIeMissing,
+                pfcp_ie::FAR_ID,
             ),
             (
                 "FAR with a short Outer Header Creation",
@@ -5888,23 +6018,23 @@ mod tests {
                     (pfcp_ie::APPLY_ACTION, &[0x02, 0x00]),
                     (pfcp_ie::FORWARDING_PARAMETERS, &fp_short_ohc),
                 ]),
+                incorrect,
+                pfcp_ie::CREATE_FAR,
             ),
             (
                 "URR without a URR ID",
                 pfcp_ie::CREATE_URR,
                 grouped_1532(&[(pfcp_ie::MEASUREMENT_METHOD, &[0x02])]),
+                PfcpCause::ConditionalIeMissing,
+                pfcp_ie::URR_ID,
             ),
         ];
-        for (seq, (what, ie_type, body)) in (0u32..).step_by(10).zip(cases) {
+        for (seq, (what, ie_type, body, cause, offending)) in (0u32..).step_by(10).zip(cases) {
             let (server, smf, addr, mut rx) = spawn_test_server().await;
             let resp = establish_1532(&smf, addr, seq + 1, &[(ie_type, body)]).await;
             assert_eq!(resp[1], pfcp_type::SESSION_ESTABLISHMENT_RESPONSE, "{what}");
-            assert_eq!(
-                response_cause(&resp),
-                PfcpCause::MandatoryIeIncorrect as u8,
-                "{what}"
-            );
-            assert_eq!(offending_ie_1478(&resp), Some(ie_type), "{what}");
+            assert_eq!(response_cause(&resp), cause as u8, "{what}");
+            assert_eq!(offending_ie_1478(&resp), Some(offending), "{what}");
             assert!(
                 server.sessions.read().await.is_empty(),
                 "{what}: no session"
@@ -6778,14 +6908,248 @@ mod tests {
         bad.add_u32(pfcp_ie::TIME_THRESHOLD, 10);
         b.add_tlv(pfcp_ie::CREATE_URR, &bad.build());
         let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
-        assert_eq!(response_cause(&resp), PfcpCause::MandatoryIeIncorrect as u8);
+        // #1598: a missing URR ID in a Session Modification's (Conditional) Create
+        // URR is "Conditional IE missing" naming the URR ID, not cause 69.
+        assert_eq!(response_cause(&resp), PfcpCause::ConditionalIeMissing as u8);
         let (_, body) = ParsedPfcpHeader::parse(&resp).unwrap();
         let ies = ParsedIe::parse_all(body);
         let off = ParsedIe::find_ie(&ies, pfcp_ie::OFFENDING_IE).unwrap();
         assert_eq!(
             u16::from_be_bytes([off.value[0], off.value[1]]),
-            pfcp_ie::CREATE_URR
+            pfcp_ie::URR_ID
         );
+    }
+
+    /// `body` with every IE of `ie_type` removed: a rule IE without its rule ID.
+    fn without_ie_1598(body: &[u8], ie_type: u16) -> Vec<u8> {
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        for ie in ParsedIe::parse_all(body) {
+            if ie.ie_type != ie_type {
+                b.add_tlv(ie.ie_type, &ie.value);
+            }
+        }
+        b.build()
+    }
+
+    /// (Cause, Offending IE) of a response.
+    fn cause_and_offending_1598(resp: &[u8]) -> (u8, Option<u16>) {
+        let (_, body) = ParsedPfcpHeader::parse(resp).unwrap();
+        let ies = ParsedIe::parse_all(body);
+        (
+            response_cause(resp),
+            ParsedIe::find_ie(&ies, pfcp_ie::OFFENDING_IE)
+                .map(|ie| u16::from_be_bytes([ie.value[0], ie.value[1]])),
+        )
+    }
+
+    /// **#1598, Session Modification.** Every rule IE of a Session Modification
+    /// Request is Conditional (TS 29.244 Table 7.5.4.1-1), so a rule ID missing
+    /// from a Create, Update, Remove or Query IE is viewed as a missing
+    /// Conditional IE (§7.2.2.4.1, 29244-k00.txt:14248-14274) and answered cause
+    /// 67 with the rule ID's own type as the Offending IE (§7.6.6). It used to be
+    /// 69 (Create, Update) or 66 with the grouped IE (Remove, Query).
+    #[tokio::test]
+    async fn a_modification_rule_without_its_id_is_conditional_ie_missing_1598() {
+        let (_server, smf, addr, _rx, _dp, upf_seid) = established_session().await;
+        let cases: Vec<(u16, Vec<u8>, u16)> = vec![
+            (
+                pfcp_ie::CREATE_PDR,
+                pdr_body(7, 50, 1, 1, 1),
+                pfcp_ie::PDR_ID,
+            ),
+            (
+                pfcp_ie::UPDATE_PDR,
+                pdr_body(1, 50, 1, 1, 1),
+                pfcp_ie::PDR_ID,
+            ),
+            (pfcp_ie::CREATE_FAR, far_body(7, 0x02), pfcp_ie::FAR_ID),
+            (pfcp_ie::UPDATE_FAR, far_body(1, 0x02), pfcp_ie::FAR_ID),
+            (
+                pfcp_ie::CREATE_URR,
+                urr_body(7, None, Some(10), None),
+                pfcp_ie::URR_ID,
+            ),
+            (
+                pfcp_ie::UPDATE_URR,
+                urr_body(1, None, Some(10), None),
+                pfcp_ie::URR_ID,
+            ),
+            (pfcp_ie::CREATE_QER, qer_body(7, 9), pfcp_ie::QER_ID),
+            (pfcp_ie::UPDATE_QER, qer_body(1, 9), pfcp_ie::QER_ID),
+            (pfcp_ie::REMOVE_PDR, remove_body_u16(1), pfcp_ie::PDR_ID),
+            (
+                pfcp_ie::REMOVE_FAR,
+                remove_body_u32(pfcp_ie::FAR_ID, 1),
+                pfcp_ie::FAR_ID,
+            ),
+            (
+                pfcp_ie::REMOVE_URR,
+                remove_body_u32(pfcp_ie::URR_ID, 1),
+                pfcp_ie::URR_ID,
+            ),
+            (
+                pfcp_ie::REMOVE_QER,
+                remove_body_u32(pfcp_ie::QER_ID, 1),
+                pfcp_ie::QER_ID,
+            ),
+            (
+                pfcp_ie::QUERY_URR,
+                remove_body_u32(pfcp_ie::URR_ID, 1),
+                pfcp_ie::URR_ID,
+            ),
+        ];
+        for (seq, (grouped, valid, id)) in (10u32..).zip(cases) {
+            let mut b = crate::n4_build::PfcpMessageBuilder::new();
+            b.add_tlv(grouped, &without_ie_1598(&valid, id));
+            let resp = exchange(
+                &smf,
+                addr,
+                &encode_pfcp(52, Some(upf_seid), seq, &b.build()),
+            )
+            .await;
+            assert_eq!(
+                cause_and_offending_1598(&resp),
+                (PfcpCause::ConditionalIeMissing as u8, Some(id)),
+                "IE {grouped} without IE {id}"
+            );
+        }
+    }
+
+    /// **#1598**: a Remove IE whose rule ID is present but too short is a
+    /// semantically incorrect value, cause 69 with the Remove IE (§7.6.8), the
+    /// same answer a short Create QER ID gets. Only an absent ID is cause 67.
+    #[tokio::test]
+    async fn a_short_remove_rule_id_is_mandatory_ie_incorrect_1598() {
+        let (_server, smf, addr, _rx, _dp, upf_seid) = established_session().await;
+        for (seq, (grouped, id, short)) in (10u32..).zip([
+            (pfcp_ie::REMOVE_PDR, pfcp_ie::PDR_ID, vec![0u8]),
+            (pfcp_ie::REMOVE_FAR, pfcp_ie::FAR_ID, vec![0u8, 1]),
+            (pfcp_ie::REMOVE_URR, pfcp_ie::URR_ID, vec![0u8, 0, 1]),
+            (pfcp_ie::REMOVE_QER, pfcp_ie::QER_ID, vec![1u8]),
+            (pfcp_ie::QUERY_URR, pfcp_ie::URR_ID, vec![]),
+        ]) {
+            let mut body = crate::n4_build::PfcpMessageBuilder::new();
+            body.add_tlv(id, &short);
+            let mut b = crate::n4_build::PfcpMessageBuilder::new();
+            b.add_tlv(grouped, &body.build());
+            let resp = exchange(
+                &smf,
+                addr,
+                &encode_pfcp(52, Some(upf_seid), seq, &b.build()),
+            )
+            .await;
+            assert_eq!(
+                cause_and_offending_1598(&resp),
+                (PfcpCause::MandatoryIeIncorrect as u8, Some(grouped)),
+                "IE {grouped} with a {}-octet IE {id}",
+                short.len()
+            );
+        }
+    }
+
+    /// A Session Establishment Request of PDR 1 (UL, TEID 0x1234), FAR 1 and
+    /// `extra` rule IEs, with `pdr` and `far` as the Create PDR and FAR bodies,
+    /// through the real handler (#1598). Returns the response.
+    async fn establish_1598(
+        smf: &UdpSocket,
+        addr: SocketAddr,
+        seid: u64,
+        pdr: &[u8],
+        far: &[u8],
+        extra: &[(u16, Vec<u8>)],
+    ) -> Vec<u8> {
+        let assoc = build_association_setup_request_payload(Some(1));
+        let _ = exchange(smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        b.add_f_seid(&crate::n4_build::FSeid {
+            seid,
+            ipv4: Some(Ipv4Addr::new(127, 0, 0, 9)),
+            ipv6: None,
+        });
+        b.add_tlv(pfcp_ie::CREATE_PDR, pdr);
+        b.add_tlv(pfcp_ie::CREATE_FAR, far);
+        for (ie_type, body) in extra {
+            b.add_tlv(*ie_type, body);
+        }
+        exchange(smf, addr, &encode_pfcp(50, Some(0), 2, &b.build())).await
+    }
+
+    /// **#1598, Session Establishment.** Create PDR and Create FAR are Mandatory
+    /// in a Session Establishment Request and Create URR and Create QER
+    /// Conditional (Table 7.5.2.1-1), so a missing PDR ID or FAR ID is cause 66
+    /// and a missing URR ID or QER ID cause 67, each with the ID's own type as
+    /// the Offending IE (§7.2.2.4.1, §7.6.6). No session is created.
+    #[tokio::test]
+    async fn an_establishment_rule_without_its_id_is_66_or_67_1598() {
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        let pdr = pdr_body(1, 100, 1, 1, 1);
+        let far = far_body(1, 0x02);
+        let qer = qer_body(1, 9);
+        let urr = urr_body(1, None, Some(10), None);
+        let full = || {
+            vec![
+                (pfcp_ie::CREATE_QER, qer.clone()),
+                (pfcp_ie::CREATE_URR, urr.clone()),
+            ]
+        };
+        let strip = |extra: Vec<(u16, Vec<u8>)>, grouped: u16, id: u16| {
+            extra
+                .into_iter()
+                .map(|(t, b)| {
+                    if t == grouped {
+                        (t, without_ie_1598(&b, id))
+                    } else {
+                        (t, b)
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let cases = [
+            (
+                without_ie_1598(&pdr, pfcp_ie::PDR_ID),
+                far.clone(),
+                full(),
+                PfcpCause::MandatoryIeMissing,
+                pfcp_ie::PDR_ID,
+            ),
+            (
+                pdr.clone(),
+                without_ie_1598(&far, pfcp_ie::FAR_ID),
+                full(),
+                PfcpCause::MandatoryIeMissing,
+                pfcp_ie::FAR_ID,
+            ),
+            (
+                pdr.clone(),
+                far.clone(),
+                strip(full(), pfcp_ie::CREATE_URR, pfcp_ie::URR_ID),
+                PfcpCause::ConditionalIeMissing,
+                pfcp_ie::URR_ID,
+            ),
+            (
+                pdr.clone(),
+                far.clone(),
+                strip(full(), pfcp_ie::CREATE_QER, pfcp_ie::QER_ID),
+                PfcpCause::ConditionalIeMissing,
+                pfcp_ie::QER_ID,
+            ),
+        ];
+        for (seid, (pdr, far, extra, cause, id)) in (0x1598_0000u64..).zip(cases) {
+            let resp = establish_1598(&smf, addr, seid, &pdr, &far, &extra).await;
+            assert_eq!(
+                cause_and_offending_1598(&resp),
+                (cause as u8, Some(id)),
+                "missing IE {id}"
+            );
+            assert!(
+                server.sessions.read().await.is_empty(),
+                "a rejected establishment creates no session (missing IE {id})"
+            );
+        }
+        // The same message with every ID present is accepted.
+        let resp = establish_1598(&smf, addr, 0x1598_ffff, &pdr, &far, &full()).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
     }
 
     /// The Usage Report Trigger octets carried by each Usage Report in a Session
@@ -7506,6 +7870,7 @@ mod tests {
         let updated_urrs = super::parse_rule_list(
             &ies,
             pfcp_ie::UPDATE_URR,
+            RuleIdPresence::Conditional,
             crate::n4_build::parse_create_urr,
             &mut failure,
         );
@@ -10253,11 +10618,13 @@ mod tests {
             !dp.with_qos_flow_monitor(|m| m.is_active()),
             "a refused modification applies nothing"
         );
-        // A Create SRR with no SRR ID is malformed, not accepted.
+        // A Create SRR with no SRR ID is refused, not accepted: "Conditional IE
+        // missing" naming the SRR ID (#1598, Create SRR is C in a modification).
         let mut no_id = srr_body(1, &[5]);
         no_id.drain(..5);
         let resp = modify(&smf, addr, upf_seid, 4, &[(pfcp_ie::CREATE_SRR, no_id)]).await;
-        assert_eq!(response_cause(&resp), PfcpCause::MandatoryIeIncorrect as u8);
+        assert_eq!(response_cause(&resp), PfcpCause::ConditionalIeMissing as u8);
+        assert_eq!(offending_ie_1478(&resp), Some(pfcp_ie::SRR_ID));
         assert!(!dp.with_qos_flow_monitor(|m| m.is_active()));
     }
 
