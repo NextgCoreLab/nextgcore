@@ -16,20 +16,12 @@
 //!   at "a second NFRegister, a 201 and then a heartbeat".
 
 use std::net::SocketAddr;
-use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+use nextgcore_sbi::test_support::{spawn_port, NfProcess, NfSpawn};
 use nextgcore_sbi::SbiServer;
-
-struct Killed(Child);
-impl Drop for Killed {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
 
 /// What the stub NRF saw, in order: `("PUT", status answered)` or `("PATCH", 204)`.
 type Seen = Arc<Mutex<Vec<(&'static str, u16)>>>;
@@ -80,80 +72,28 @@ async fn nrf_on(
     (server, seen)
 }
 
-/// A per-test scratch directory, removed on drop; pcfd's stderr is printed when
-/// the test fails.
-struct Scratch(std::path::PathBuf);
-impl Scratch {
-    fn log(&self) -> std::path::PathBuf {
-        self.0.join("pcfd.log")
-    }
-}
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            eprintln!(
-                "--- pcfd stderr ---\n{}",
-                std::fs::read_to_string(self.log()).unwrap_or_default()
-            );
-        }
-        let _ = std::fs::remove_file(self.0.join("pcf.yaml"));
-        let _ = std::fs::remove_file(self.log());
-        let _ = std::fs::remove_dir(&self.0);
-    }
-}
-
-/// Spawn pcfd against the NRF on `nrf_port` and return once its SBI listener is
-/// bound. On a lost SBI bind (#1497) it respawns on a fresh port; on any other
-/// exit it fails with pcfd's stderr.
-async fn spawn_pcfd(name: &str, nrf_port: u16) -> (Killed, Scratch) {
-    let dir =
-        Scratch(std::env::temp_dir().join(format!("pcfd-1482-{name}-{}", std::process::id())));
-    std::fs::create_dir_all(&dir.0).unwrap();
-    let config = dir.0.join("pcf.yaml");
-    for _ in 0..5 {
-        let sbi_port = nextgcore_sbi::test_support::free_port();
-        std::fs::write(
-            &config,
-            format!(
-                "pcf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n        port: {sbi_port}\n    \
-                 client:\n      nrf:\n        - uri: http://127.0.0.1:{nrf_port}\n"
-            ),
-        )
-        .unwrap();
-        let mut child = Killed(
-            Command::new(env!("CARGO_BIN_EXE_nextgcore-pcfd"))
-                .arg("-c")
+/// Spawn pcfd against the NRF on `nrf_port` through the shared `NfSpawn` (#1521):
+/// ready once its SBI listener is up, respawned on fresh ports after a lost bind.
+async fn spawn_pcfd(name: &str, nrf_port: u16) -> NfProcess {
+    NfSpawn::new(env!("CARGO_BIN_EXE_nextgcore-pcfd"), &format!("pcfd-1482-{name}"))
+        .ready_when_logged("SBI HTTP/2 server listening on")
+        .spawn_async(|cmd, sbi_port, dir| {
+            let config = dir.join("pcf.yaml");
+            std::fs::write(
+                &config,
+                format!(
+                    "pcf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n        port: {sbi_port}\n    \
+                     client:\n      nrf:\n        - uri: http://127.0.0.1:{nrf_port}\n"
+                ),
+            )
+            .unwrap();
+            cmd.arg("-c")
                 .arg(&config)
                 .env("NEXTGCORE_SBI_PROFILE", "dev")
                 .env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
-                .env(
-                    "PCF_METRICS_PORT",
-                    nextgcore_sbi::test_support::free_port().to_string(),
-                )
-                .env("RUST_LOG", "info")
-                .stdout(Stdio::null())
-                .stderr(std::fs::File::create(dir.log()).unwrap())
-                .spawn()
-                .expect("spawn pcfd"),
-        );
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            // Exit status first, then the log: once exited, stderr is complete.
-            let exited = child.0.try_wait().unwrap();
-            let log = std::fs::read_to_string(dir.log()).unwrap_or_default();
-            match exited {
-                None if log.contains("SBI HTTP/2 server listening on") => return (child, dir),
-                None => {}
-                Some(_) if log.contains("Failed to start SBI server") && log.contains("in use") => {
-                    break;
-                }
-                Some(status) => panic!("pcfd exited at startup ({status})"),
-            }
-            assert!(Instant::now() < deadline, "pcfd listens within 30 s");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-    panic!("pcfd lost its SBI bind 5 times");
+                .env("PCF_METRICS_PORT", spawn_port().to_string());
+        })
+        .await
 }
 
 /// Wait until `seen` holds a successful PUT followed by a PATCH, then check that
@@ -190,7 +130,7 @@ async fn assert_registered_then_heartbeat(seen: &Seen, min_puts: usize) {
 async fn a_non_2xx_nfregister_is_retried_and_the_heartbeat_follows_the_success() {
     let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
     let (_nrf, seen) = nrf_on(listener, addr, 2).await;
-    let (_pcfd, _dir) = spawn_pcfd("non2xx", addr.port()).await;
+    let _pcfd = spawn_pcfd("non2xx", addr.port()).await;
     assert_registered_then_heartbeat(&seen, 3).await;
 }
 
@@ -200,13 +140,10 @@ async fn a_non_2xx_nfregister_is_retried_and_the_heartbeat_follows_the_success()
 async fn an_nfregister_to_an_nrf_that_is_down_is_retried_once_it_is_up() {
     let down = nextgcore_sbi::test_support::down_port();
     let addr = down.addr();
-    let (_pcfd, dir) = spawn_pcfd("down", addr.port()).await;
+    let pcfd = spawn_pcfd("down", addr.port()).await;
     // Premise: the first attempt has failed before the NRF comes up.
     let deadline = Instant::now() + Duration::from_secs(30);
-    while !std::fs::read_to_string(dir.log())
-        .unwrap_or_default()
-        .contains("NFRegister failed (attempt 1)")
-    {
+    while !pcfd.log().contains("NFRegister failed (attempt 1)") {
         assert!(Instant::now() < deadline, "the first NFRegister fails");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

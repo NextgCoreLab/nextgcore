@@ -1830,13 +1830,18 @@ mod tests {
     #[test]
     fn jitter_stays_within_its_percent() {
         let p = RegisterRetryPolicy::default();
+        let mut seen = std::collections::HashSet::new();
         for _ in 0..1000 {
             let d = p.jittered(Duration::from_secs(10));
             assert!(
                 d >= Duration::from_secs(8) && d <= Duration::from_secs(12),
                 "{d:?}"
             );
+            seen.insert(d.as_millis());
         }
+        // It really spreads: a jitter that returned the delay unchanged (or a
+        // constant) would leave one value.
+        assert!(seen.len() > 100, "only {} distinct delays", seen.len());
         assert_eq!(
             no_jitter().jittered(Duration::from_secs(10)),
             Duration::from_secs(10)

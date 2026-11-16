@@ -4978,6 +4978,8 @@ mod tests {
     /// attempt (the #1574 head), it returns `false` at once and the profile is
     /// still registered; with its DELETE replaced by a no-op, the profile is
     /// still registered.
+    /// Without the attempt's `notify_waiters()` wake-up, it returns only when
+    /// the 5 s bound runs out, and the "woken by it" assertion fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // a std guard held to serialise globals, by design
     async fn a_registration_landing_during_shutdown_is_deleted_before_deregister_self_returns() {
@@ -5062,11 +5064,18 @@ mod tests {
             .await
             .expect("shutdown has begun");
             // The NRF now accepts the registration that was in flight.
+            let released = std::time::Instant::now();
             release_tx.send(()).expect("release the PUT");
 
             assert!(
                 dereg.await.expect("deregister_self"),
                 "the late registration produced a DELETE"
+            );
+            // Woken by the landing attempt, not by the 5 s bound running out.
+            let took = released.elapsed();
+            assert!(
+                took < Duration::from_secs(2),
+                "deregister_self returned {took:?} after the landing, not woken by it"
             );
             assert!(
                 nf_manager().get(nf_id).is_none(),
