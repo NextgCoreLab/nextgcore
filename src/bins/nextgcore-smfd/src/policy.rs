@@ -2038,7 +2038,6 @@ pub fn build_network_modification_command(
     msg
 }
 
-/// Build a PDU Session Release Command (TS 24.501 §8.3.13).
 /// 5GSM STATUS (TS 24.501 §8.3.16): header and the mandatory 5GSM cause.
 pub fn build_gsm_status(psi: u8, pti: u8, cause_5gsm: u8) -> Vec<u8> {
     vec![
@@ -2061,6 +2060,7 @@ pub fn build_remote_ue_report_response(psi: u8, pti: u8) -> Vec<u8> {
     ]
 }
 
+/// Build a PDU Session Release Command (TS 24.501 §8.3.13).
 pub fn build_release_command(psi: u8, pti: u8, cause_5gsm: u8) -> Vec<u8> {
     vec![
         0x2E,
