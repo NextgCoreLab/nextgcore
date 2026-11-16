@@ -2934,6 +2934,13 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
             if let Some(ref ip) = ipv4_address {
                 sess.set_ipv4addr(ip);
             }
+            // #1527: TS 29.512 SmPolicyContextData.ipDomain (NOTE 11), what tells
+            // sessions sharing a private IPv4 apart in a P-CSCF restoration.
+            sess.ip_domain = policy_data
+                .get("ipDomain")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             if let Some(ref prefix) = ipv6_address_prefix {
                 if !sess.set_ipv6prefix(prefix) {
                     log::warn!("SM policy create: unparseable ipv6AddressPrefix {prefix}");
@@ -3784,8 +3791,24 @@ pub async fn handle_sm_policy_update_notify(
                 new_ipv4.is_some_and(|ip| sess.ipv4addr_string.as_deref() != Some(ip));
             let ipv6_changed =
                 new_ipv6.is_some_and(|p| sess.ipv6prefix_string.as_deref() != Some(p));
+            // #1527: SmPolicyUpdateContextData.ipDomain (TS 29.512 §4.2.4.1).
+            let new_domain = update_data
+                .get("ipDomain")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .filter(|d| sess.ip_domain.as_deref() != Some(*d));
+            if let Some(domain) = new_domain {
+                if let Ok(context) = ctx.read() {
+                    context.sess_modify(sess.id, |s| s.ip_domain = Some(domain.to_string()));
+                }
+            }
             if ipv4_changed || ipv6_changed {
-                let mut latest = sess.clone();
+                let mut latest = match ctx.read() {
+                    Ok(context) => context
+                        .sess_find_by_id(sess.id)
+                        .unwrap_or_else(|| sess.clone()),
+                    Err(_) => sess.clone(),
+                };
                 if let Some(ip) = new_ipv4.filter(|_| ipv4_changed) {
                     latest.set_ipv4addr(ip);
                 }
@@ -4668,18 +4691,185 @@ pub async fn handle_events_subscription_delete(app_session_id: &str) -> SbiRespo
     }
 }
 
+/// #1527: `500 PDU_SESSION_NOT_AVAILABLE`, TS 29.514 §4.2.2.27: "If the PCF fails
+/// in identifying the PDU session, the PCF shall reject the "P-CSCF restoration"
+/// custom operation with an HTTP "500 Internal Server Error" ... "cause" attribute
+/// set to "PDU_SESSION_NOT_AVAILABLE"".
+fn pcscf_restoration_session_not_available(detail: &str) -> SbiResponse {
+    log::warn!("P-CSCF restoration: {detail}");
+    nextgcore_sbi::server::send_error(
+        500,
+        "Internal Server Error",
+        detail,
+        Some("PDU_SESSION_NOT_AVAILABLE"),
+    )
+}
+
+/// #1527: the one PDU session a `PcscfRestorationRequestData` identifies (TS 29.514
+/// §4.2.2.27, Table 5.6.2.36-1).
+///
+/// - `ueIpv4` / `ueIpv6` (only one, NOTE 1) selects the sessions holding that
+///   address; an IPv6 address matches the session prefix that contains it.
+/// - `ipDomain` narrows an IPv4 match to the sessions the SMF reported in that
+///   IPv4 address domain (TS 29.512 NOTE 11). A session for which the SMF reported
+///   no domain still matches when none reported this one, so a P-CSCF that sends
+///   it to an SMF that does not is not refused.
+/// - `sliceInfo` narrows by S-NSSAI.
+/// - Without an IP address, `supi` and `dnn` (both required) identify the
+///   session; with one, they only break a tie. The DNN is compared as received
+///   (NOTE 2), against the session's DNN or full DNN, ignoring ASCII case
+///   (TS 23.003 §9.1).
+///
+/// No session, or more than one, is a failure to identify it: `Err` holds the
+/// `500 PDU_SESSION_NOT_AVAILABLE`, or a `400` for a request that names nothing.
+fn identify_pcscf_restoration_session(
+    body: &serde_json::Value,
+) -> Result<PcfSess, Box<SbiResponse>> {
+    let text = |key: &str| {
+        body.get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    let (ipv4, ipv6) = (text("ueIpv4"), text("ueIpv6"));
+    let (ip_domain, supi, dnn) = (text("ipDomain"), text("supi"), text("dnn"));
+    let slice = match body.get("sliceInfo") {
+        None => None,
+        Some(v) => {
+            let sst = v.get("sst").and_then(|x| x.as_u64()).filter(|x| *x <= 255);
+            // TS 29.571 Snssai.sd: 6 hex digits.
+            let sd = match v.get("sd") {
+                None => Some(None),
+                Some(sd) => sd
+                    .as_str()
+                    .filter(|sd| sd.len() == 6)
+                    .and_then(|sd| u32::from_str_radix(sd, 16).ok())
+                    .map(Some),
+            };
+            match (sst, sd) {
+                (Some(sst), Some(sd)) => Some(SNssai { sst: sst as u8, sd }),
+                _ => {
+                    return Err(Box::new(send_bad_request(
+                        "PcscfRestorationRequestData.sliceInfo is not an Snssai",
+                        Some("MANDATORY_IE_INCORRECT"),
+                    )))
+                }
+            }
+        }
+    };
+
+    enum Address {
+        V4(u32),
+        V6([u8; 16]),
+        None,
+    }
+    let address = match (ipv4, ipv6) {
+        (Some(_), Some(_)) => {
+            return Err(Box::new(send_bad_request(
+                "PcscfRestorationRequestData carries both ueIpv4 and ueIpv6 (NOTE 1)",
+                Some("MANDATORY_IE_INCORRECT"),
+            )))
+        }
+        (Some(ip), None) => match ip.parse::<std::net::Ipv4Addr>() {
+            Ok(ip) => Address::V4(u32::from(ip)),
+            Err(_) => {
+                return Err(Box::new(send_bad_request(
+                    &format!("ueIpv4 {ip:?} is not an Ipv4Addr"),
+                    Some("MANDATORY_IE_INCORRECT"),
+                )))
+            }
+        },
+        (None, Some(ip)) => match ip.parse::<std::net::Ipv6Addr>() {
+            Ok(ip) => Address::V6(ip.octets()),
+            Err(_) => {
+                return Err(Box::new(send_bad_request(
+                    &format!("ueIpv6 {ip:?} is not an Ipv6Addr"),
+                    Some("MANDATORY_IE_INCORRECT"),
+                )))
+            }
+        },
+        (None, None) if supi.is_some() && dnn.is_some() => Address::None,
+        (None, None) => {
+            return Err(Box::new(send_bad_request(
+                "PcscfRestorationRequestData requires ueIpv4 or ueIpv6, or supi and dnn",
+                Some("MANDATORY_IE_MISSING"),
+            )))
+        }
+    };
+
+    let ctx = pcf_self();
+    let Ok(context) = ctx.read() else {
+        return Err(Box::new(pcscf_restoration_session_not_available(
+            "the PCF context is unavailable",
+        )));
+    };
+    // `None`: the request names no SUPI; `Some(None)`: a SUPI with no SM policy
+    // association here, which matches no session.
+    let ue_sm_id = supi.map(|supi| context.ue_sm_find_by_supi(supi).map(|ue_sm| ue_sm.id));
+    let mut candidates = context.sess_find_all(|sess| {
+        let address_matches = match address {
+            Address::V4(ip) => sess.ipv4addr_string.is_some() && sess.ipv4addr == ip,
+            Address::V6(ip) => sess.ipv6prefix.is_some_and(|(len, prefix)| {
+                crate::context::ipv6_prefix_contains(&prefix, len, &ip)
+            }),
+            Address::None => true,
+        };
+        address_matches && slice.as_ref().is_none_or(|s| sess.s_nssai == *s)
+    });
+    drop(context);
+    if let (Address::V4(_), Some(domain)) = (&address, ip_domain) {
+        if candidates
+            .iter()
+            .any(|s| s.ip_domain.as_deref() == Some(domain))
+        {
+            candidates.retain(|s| s.ip_domain.as_deref() == Some(domain));
+        } else {
+            candidates.retain(|s| s.ip_domain.is_none());
+        }
+    }
+    // `supi` + `dnn` identify the session when no IP address is given; with one,
+    // they only break a tie between sessions sharing it.
+    if matches!(address, Address::None) || candidates.len() > 1 {
+        if let Some(ue_sm_id) = ue_sm_id {
+            candidates.retain(|s| Some(s.pcf_ue_sm_id) == ue_sm_id);
+        }
+        if let Some(dnn) = dnn {
+            candidates.retain(|s| {
+                [&s.dnn, &s.full_dnn]
+                    .into_iter()
+                    .flatten()
+                    .any(|d| d.eq_ignore_ascii_case(dnn))
+            });
+        }
+    }
+    let asked = format!(
+        "ueIpv4={ipv4:?} ueIpv6={ipv6:?} ipDomain={ip_domain:?} sliceInfo={slice:?} \
+         supi={supi:?} dnn={dnn:?}"
+    );
+    match candidates.len() {
+        1 => Ok(candidates.remove(0)),
+        0 => Err(Box::new(pcscf_restoration_session_not_available(&format!(
+            "no PDU session matches {asked}"
+        )))),
+        n => Err(Box::new(pcscf_restoration_session_not_available(&format!(
+            "{n} PDU sessions match {asked}; the request does not identify one"
+        )))),
+    }
+}
+
 /// `POST /app-sessions/pcscf-restoration` — TS 29.514 §4.2.5 `PcscfRestoration`.
 ///
-/// `PcscfRestorationRequestData` is a `oneOf` over `ueIpv4` / `ueIpv6`, so the
-/// UE whose IMS session must be restored is identified the same way an app
-/// session is. The PCF resolves that session and asks its SMF to restore it:
-/// an UpdateNotify carrying `pcscfRestIndication: true` when the association
-/// negotiated PCSCF-Restoration-Enhancement (TS 29.512 §4.2.3.18, #1398). It
-/// answers `204`, as the spec defines no response body.
+/// #1527: the PDU session is identified as TS 29.514 §4.2.2.27 says the P-CSCF
+/// names it ([`identify_pcscf_restoration_session`]): by `ueIpv4`/`ueIpv6`,
+/// narrowed by `ipDomain` / `sliceInfo` for a non-unique (private) IPv4, or by
+/// `supi` + `dnn` when no usable IP is given. The PCF then asks its SMF to
+/// restore it: an UpdateNotify carrying `pcscfRestIndication: true` when the
+/// association negotiated PCSCF-Restoration-Enhancement (TS 29.512 §4.2.3.18,
+/// #1398). It answers `204`, as the spec defines no response body.
 ///
-/// A UE address that resolves nothing is a `404`: the caller asked the PCF to
-/// restore a session it does not know about, and a `204` would report a
-/// restoration that did not happen.
+/// A request that identifies no single session is a `500` with cause
+/// `PDU_SESSION_NOT_AVAILABLE` (§4.2.2.27, Table 5.7.3-1); it was a `404
+/// SESSION_NOT_FOUND`.
 pub async fn handle_pcscf_restoration(request: &SbiRequest) -> SbiResponse {
     log::info!("P-CSCF Restoration");
     let Some(content) = request.http.content.as_deref() else {
@@ -4689,37 +4879,14 @@ pub async fn handle_pcscf_restoration(request: &SbiRequest) -> SbiResponse {
         Ok(v) => v,
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
-    let ipv4 = body
-        .get("ueIpv4")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty());
-    let ipv6 = body
-        .get("ueIpv6")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty());
-    let address = match (ipv4, ipv6) {
-        (Some(ip), None) => UeAddress::Ipv4(ip.to_string()),
-        (None, Some(ip)) => UeAddress::Ipv6(ip.to_string()),
-        (None, None) => {
-            return send_bad_request(
-                "PcscfRestorationRequestData requires exactly one of ueIpv4 or ueIpv6",
-                Some("MANDATORY_IE_MISSING"),
-            )
-        }
-        (Some(_), Some(_)) => {
-            return send_bad_request(
-                "PcscfRestorationRequestData carries both ueIpv4 and ueIpv6 (oneOf)",
-                Some("MANDATORY_IE_INCORRECT"),
-            )
-        }
+    let sess = match identify_pcscf_restoration_session(&body) {
+        Ok(sess) => sess,
+        Err(resp) => return *resp,
     };
-    let Some(sess) = bind_ue_address(&address) else {
-        log::warn!("P-CSCF restoration for an unknown UE address {address:?}");
-        return send_not_found(
-            &format!("No PDU session bound to {address:?}"),
-            Some("SESSION_NOT_FOUND"),
-        );
-    };
+    let address = format!(
+        "ipv4={:?} ipv6={:?} dnn={:?}",
+        sess.ipv4addr_string, sess.ipv6prefix_string, sess.dnn
+    );
     // #1398, TS 29.512 §4.2.3.18: with PCSCF-Restoration-Enhancement negotiated on
     // the association, the notify carries `pcscfRestIndication: true`, which is what
     // asks the SMF to restore (TS 23.380). Before #1398 it was the generic re-derived
@@ -4727,7 +4894,7 @@ pub async fn handle_pcscf_restoration(request: &SbiRequest) -> SbiResponse {
     // restored.
     if sess.smpolicycontrol_features & SM_FEATURE_PCSCF_RESTORATION_ENHANCEMENT != 0 {
         log::info!(
-            "P-CSCF restoration: pcscfRestIndication to the SMF for sess_id={} ({address:?})",
+            "P-CSCF restoration: pcscfRestIndication to the SMF for sess_id={} ({address})",
             sess.id
         );
         sbi_path::pcf_sbi_send_pcscf_restoration_notify(sess.id);
@@ -4736,7 +4903,7 @@ pub async fn handle_pcscf_restoration(request: &SbiRequest) -> SbiResponse {
         // not negotiate it, so it has no way to be asked. The session's policy is
         // re-sent as before, and the gap is logged rather than hidden.
         log::warn!(
-            "P-CSCF restoration for sess_id={} ({address:?}): the SMF did not negotiate \
+            "P-CSCF restoration for sess_id={} ({address}): the SMF did not negotiate \
              PCSCF-Restoration-Enhancement (TS 29.512 §5.8 feature 9), so no \
              pcscfRestIndication can be sent; re-sending the session's policy only",
             sess.id
@@ -9120,15 +9287,18 @@ mod tests {
         .await;
         assert_eq!(resp.status, 400);
 
-        // An unknown UE address is a 404, not a 204 reporting a restoration that
-        // did not happen.
+        // An unknown UE address is not a 204 reporting a restoration that did not
+        // happen: #1527, a 500 PDU_SESSION_NOT_AVAILABLE (TS 29.514 §4.2.2.27).
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
             "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
             Some(serde_json::json!({"ueIpv4": "10.99.99.99"})),
         ))
         .await;
-        assert_eq!(resp.status, 404);
+        assert_eq!(resp.status, 500);
+        let problem: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(problem["cause"], "PDU_SESSION_NOT_AVAILABLE", "{problem}");
 
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
@@ -9146,6 +9316,308 @@ mod tests {
         assert!(
             !resp.http.headers.contains_key("location"),
             "pcscf-restoration must not mint an app session"
+        );
+    }
+
+    /// #1527: an SM policy create through the router, with the given members merged
+    /// over [`full_create_body`]; answers the `smPolicyId`. The notification URI
+    /// points at the stub SMF on `smf_port`, path suffix `psi`.
+    async fn sm_create_1527(
+        supi: &str,
+        psi: u8,
+        smf_port: u16,
+        extra: serde_json::Value,
+    ) -> String {
+        let mut create = full_create_body(supi, psi);
+        let obj = create.as_object_mut().unwrap();
+        obj.insert(
+            "notificationUri".to_string(),
+            serde_json::json!(format!(
+                "http://127.0.0.1:{smf_port}/nsmf-callback/v1/sm-policy-notify/{psi}"
+            )),
+        );
+        for (k, v) in extra.as_object().unwrap() {
+            obj.insert(k.clone(), v.clone());
+        }
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(create),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "SM policy create for {supi}/{psi}");
+        let loc = resp
+            .http
+            .headers
+            .get("location")
+            .cloned()
+            .unwrap_or_default();
+        loc.rsplit('/').next().unwrap().to_string()
+    }
+
+    /// #1527: what `handle_pcscf_restoration` identifies for `body`: `Ok(smPolicyId)`,
+    /// or `Err((status, cause))`.
+    fn pcscf_identify_1527(body: serde_json::Value) -> Result<String, (u16, String)> {
+        identify_pcscf_restoration_session(&body)
+            .map(|sess| sess.sm_policy_id)
+            .map_err(|resp| {
+                let cause = resp
+                    .http
+                    .content
+                    .as_deref()
+                    .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+                    .and_then(|v| v["cause"].as_str().map(str::to_string))
+                    .unwrap_or_default();
+                (resp.status, cause)
+            })
+    }
+
+    fn not_available_1527() -> Result<String, (u16, String)> {
+        Err((500, "PDU_SESSION_NOT_AVAILABLE".to_string()))
+    }
+
+    /// #1527: TS 29.514 §4.2.2.27. Two UEs hold the same private IPv4 in two IPv4
+    /// address domains (reported by the SMF as `ipDomain`, TS 29.512 NOTE 11) and on
+    /// two slices. `ipDomain` or `sliceInfo` picks one; the bare address identifies
+    /// neither and is a 500 PDU_SESSION_NOT_AVAILABLE; `supi` + `dnn` break the tie.
+    ///
+    /// REVERT-VERIFIED: without the `ipDomain` narrowing, the ipDomain requests
+    /// answer 500 (two sessions); without `sliceInfo` narrowing, so do the sliceInfo
+    /// ones; with the first match returned again, the bare address answers a session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn pcscf_restoration_narrows_a_shared_private_ipv4_1527() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let ip = "10.152.7.1";
+        let a = sm_create_1527(
+            "imsi-001010000015271",
+            1,
+            9,
+            serde_json::json!({ "ipv4Address": ip, "ipDomain": "dom-a", "sliceInfo": { "sst": 1 } }),
+        )
+        .await;
+        let b = sm_create_1527(
+            "imsi-001010000015272",
+            2,
+            9,
+            serde_json::json!({
+                "ipv4Address": ip, "ipDomain": "dom-b",
+                "sliceInfo": { "sst": 2, "sd": "000001" }
+            }),
+        )
+        .await;
+        assert_ne!(a, b);
+
+        let ok = |id: &String| Ok::<String, (u16, String)>(id.clone());
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({ "ueIpv4": ip, "ipDomain": "dom-b" })),
+            ok(&b)
+        );
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({ "ueIpv4": ip, "ipDomain": "dom-a" })),
+            ok(&a)
+        );
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({
+                "ueIpv4": ip, "sliceInfo": { "sst": 2, "sd": "000001" }
+            })),
+            ok(&b)
+        );
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({ "ueIpv4": ip, "sliceInfo": { "sst": 1 } })),
+            ok(&a)
+        );
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({
+                "ueIpv4": ip, "supi": "imsi-001010000015272", "dnn": "internet"
+            })),
+            ok(&b),
+            "supi + dnn break the tie"
+        );
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({ "ueIpv4": ip })),
+            not_available_1527(),
+            "two sessions hold it: not identified"
+        );
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({ "ueIpv4": ip, "ipDomain": "dom-c" })),
+            not_available_1527(),
+            "no session in that domain, and none without a domain"
+        );
+        assert_eq!(
+            pcscf_identify_1527(
+                serde_json::json!({ "ueIpv4": ip, "sliceInfo": { "sst": 1, "sd": "zz" } })
+            )
+            .map_err(|e| e.0),
+            Err(400),
+            "a malformed sliceInfo is a 400"
+        );
+
+        // Through the router: 500 with the ProblemDetails cause, and a 204 for the
+        // narrowed request.
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
+            Some(serde_json::json!({ "ueIpv4": ip })),
+        ))
+        .await;
+        assert_eq!(resp.status, 500);
+        let problem: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(problem["cause"], "PDU_SESSION_NOT_AVAILABLE", "{problem}");
+        assert_eq!(problem["status"], 500, "{problem}");
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
+            Some(serde_json::json!({ "ueIpv4": ip, "ipDomain": "dom-a" })),
+        ))
+        .await;
+        assert_eq!(resp.status, 204, "{:?}", resp.http.content);
+    }
+
+    /// #1527: with no IP address, `supi` + `dnn` identify the PDU session (TS 29.514
+    /// §4.2.2.27 second bullet), and the SMF of THAT session is the one asked to
+    /// restore; a SUPI + DNN that match nothing, or two sessions, are a 500
+    /// PDU_SESSION_NOT_AVAILABLE, and `sliceInfo` narrows the two. A body with
+    /// neither an address nor both of `supi` / `dnn` stays a 400.
+    ///
+    /// REVERT-VERIFIED: with supi + dnn refused as before (400 MANDATORY_IE_MISSING),
+    /// the first assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn pcscf_restoration_identifies_by_supi_and_dnn_1527() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
+        let supi = "imsi-001010000025271";
+        let ims = sm_create_1527(
+            supi,
+            5,
+            peers.smf_port,
+            serde_json::json!({ "dnn": "ims", "ipv4Address": "10.152.8.5" }),
+        )
+        .await;
+        let internet_1 = sm_create_1527(
+            supi,
+            6,
+            peers.smf_port,
+            serde_json::json!({ "ipv4Address": "10.152.8.6" }),
+        )
+        .await;
+        let internet_2 = sm_create_1527(
+            supi,
+            7,
+            peers.smf_port,
+            serde_json::json!({ "ipv4Address": "10.152.8.7", "sliceInfo": { "sst": 3 } }),
+        )
+        .await;
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
+            Some(serde_json::json!({ "supi": supi, "dnn": "IMS" })),
+        ))
+        .await;
+        assert_eq!(resp.status, 204, "{:?}", resp.http.content);
+        let got = await_notifications(&peers, 1).await;
+        assert_eq!(
+            got.first().map(|n| n.0.as_str()),
+            Some("/nsmf-callback/v1/sm-policy-notify/5/update"),
+            "the IMS session's SMF is asked: {got:?}"
+        );
+        assert_eq!(
+            got[0].1["resourceUri"],
+            serde_json::json!(format!("/npcf-smpolicycontrol/v1/sm-policies/{ims}"))
+        );
+
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({ "supi": supi, "dnn": "internet" })),
+            not_available_1527(),
+            "two internet sessions: not identified"
+        );
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({
+                "supi": supi, "dnn": "internet", "sliceInfo": { "sst": 3 }
+            })),
+            Ok(internet_2)
+        );
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({
+                "supi": supi, "dnn": "internet", "sliceInfo": { "sst": 1 }
+            })),
+            Ok(internet_1)
+        );
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({ "supi": supi, "dnn": "corp" })),
+            not_available_1527()
+        );
+        assert_eq!(
+            pcscf_identify_1527(
+                serde_json::json!({ "supi": "imsi-001010000025279", "dnn": "ims" })
+            ),
+            not_available_1527(),
+            "an unknown SUPI"
+        );
+        for body in [
+            serde_json::json!({ "supi": supi }),
+            serde_json::json!({ "dnn": "ims" }),
+        ] {
+            assert_eq!(
+                pcscf_identify_1527(body.clone()),
+                Err((400, "MANDATORY_IE_MISSING".to_string())),
+                "{body}"
+            );
+        }
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
+    }
+
+    /// #1527: an `ipDomain` the SMF reports on an SM policy update (TS 29.512
+    /// SmPolicyUpdateContextData) is the one a later P-CSCF restoration narrows by.
+    ///
+    /// REVERT-VERIFIED: without the update storing `ipDomain`, the restoration for
+    /// "dom-new" answers 500.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn pcscf_restoration_uses_an_updated_ip_domain_1527() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let ip = "10.152.9.1";
+        let a = sm_create_1527(
+            "imsi-001010000035271",
+            1,
+            9,
+            serde_json::json!({ "ipv4Address": ip, "ipDomain": "dom-old" }),
+        )
+        .await;
+        let _b = sm_create_1527(
+            "imsi-001010000035272",
+            1,
+            9,
+            serde_json::json!({ "ipv4Address": ip, "ipDomain": "dom-other" }),
+        )
+        .await;
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            &format!("/npcf-smpolicycontrol/v1/sm-policies/{a}/update"),
+            Some(serde_json::json!({ "ipDomain": "dom-new" })),
+        ))
+        .await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({ "ueIpv4": ip, "ipDomain": "dom-new" })),
+            Ok(a)
+        );
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({ "ueIpv4": ip, "ipDomain": "dom-old" })),
+            not_available_1527()
         );
     }
 
