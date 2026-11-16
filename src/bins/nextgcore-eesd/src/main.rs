@@ -462,6 +462,7 @@ async fn main() -> Result<()> {
             ecs_registration::start_ecs_registration(
                 args.ecs_uri.as_deref(),
                 &ees_id,
+                args.tls,
                 host,
                 sbi_port,
             )
@@ -3188,7 +3189,7 @@ mod tests {
         let body = serde_json::json!({
             "eesProf": {
                 "eesId": "ees-router.example.com",
-                "endPt": { "ipv4Addrs": ["10.0.0.9"], "port": 7814 },
+                "endPt": { "uri": "http://10.0.0.9:7814" },
                 "easIds": ["eas-router"],
             },
         });
