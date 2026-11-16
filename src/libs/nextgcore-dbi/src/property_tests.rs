@@ -229,6 +229,17 @@ mod unit_tests {
 
         let u3 = NextgcoreUint24::from_hex_string("invalid");
         assert!(u3.is_none());
+
+        // #1547: exactly 6 hex digits (TS 29.571 `^[A-Fa-f0-9]{6}$`), either case.
+        assert_eq!(
+            NextgcoreUint24::from_hex_string("0a0B0c").map(|u| u.v),
+            Some(0x0a0b0c)
+        );
+        for bad in [
+            "", "1", "+1", "+00001", "-00001", "00001", "0100001", "0x0001", " 00001",
+        ] {
+            assert_eq!(NextgcoreUint24::from_hex_string(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
