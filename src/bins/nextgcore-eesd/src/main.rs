@@ -118,6 +118,7 @@ mod ecs_role; // #107: the ECS role (EDGE-4 provisioning, EDGE-6 registration, d
 mod edge_budget; // nextgsim#471: demo d443a-edge-budget (QOS_MON consumer, budget ranking)
 mod eec;
 mod notifier;
+mod nrf_af; // #1529: the EES as an AF at the NRF, for 5GC access tokens
 mod relocation;
 mod services;
 mod types;
@@ -222,9 +223,17 @@ struct Args {
 
     /// ECS apiRoot for EES self-registration over EDGE-6 (TS 29.558 §9.1).
     /// When unset, the registration request is built and logged but skipped
-    /// (no live ECS peer in this stack). Replaces the former `--nrf-uri`.
+    /// (no live ECS peer in this stack).
     #[arg(long)]
     ecs_uri: Option<String>,
+
+    /// NRF apiRoot (#1529). When set, the EES registers at the NRF as an AF
+    /// (TS 23.558 §6.2: the EES acts as an AF toward the 5GC) and presents an
+    /// NRF-issued OAuth2 access token (TS 33.501 §13.4.1) on its requests to 5GC
+    /// NFs, today the demo's Nsmf_EventExposure Subscribe. Unset: no NRF, and
+    /// those requests carry no token.
+    #[arg(long)]
+    nrf_uri: Option<String>,
 
     /// EES identifier advertised to the ECS (eesId). Defaults to a fresh UUID.
     #[arg(long)]
@@ -429,6 +438,15 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
+    // #1529: with an NRF, register as an AF and install the token client, before
+    // the demo's subscriber below sends its first request to the SMF.
+    if let Some(nrf_uri) = args.nrf_uri.as_deref() {
+        match sbi.registration_host() {
+            Ok(host) => nrf_af::start(nrf_uri, host).await,
+            Err(why) => log::error!("{why} (NRF registration skipped: no 5GC access tokens)"),
+        }
+    }
+
     // nextgsim#471: the demo's /metrics and its QOS_MON subscription, only with
     // the demo on. The subscription's notifUri uses the advertised host.
     #[cfg(feature = "demo-d443a-edge-budget")]
@@ -486,6 +504,8 @@ async fn main() -> Result<()> {
     if edge_budget::serving() {
         edge_budget::release_subscription(Duration::from_secs(2)).await;
     }
+    // #1529: after the SMF DELETE above, which needed the token.
+    nextgcore_sbi::heartbeat::deregister_self().await;
     sbi_server
         .stop()
         .await
