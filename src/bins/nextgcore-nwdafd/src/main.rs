@@ -950,6 +950,32 @@ fn build_nf_profile(
     sbi_port: u16,
     allowed_nf_types: &[String],
 ) -> serde_json::Value {
+    // nextgsim#468: an AnLF-only NWDAF contains no MTLF. The role is decided
+    // first, so an AnLF is not told its model has no exportable form (#1493).
+    let ml_provision = MlProvision::decide(role::current().serves_mtlf(), || {
+        nwdaf_self()
+            .read()
+            .map(|ctx| ctx.can_provision_model())
+            .unwrap_or(false)
+    });
+    build_nf_profile_for(
+        nf_instance_id,
+        sbi_addr,
+        sbi_port,
+        allowed_nf_types,
+        ml_provision,
+    )
+}
+
+/// [`build_nf_profile`] for a given [`MlProvision`] outcome, so each outcome is
+/// testable without mutating the process-wide role or predictor.
+fn build_nf_profile_for(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+    allowed_nf_types: &[String],
+    ml_provision: MlProvision,
+) -> serde_json::Value {
     #[allow(unused_mut)]
     let mut nwdaf_info = nwdaf_info(SUPPORTED_EVENTS);
     // nextgsim#466: UE_MOBILITY is advertised for Nnwdaf_AnalyticsInfo
@@ -966,14 +992,12 @@ fn build_nf_profile(
         advertise_analytics_info_event(&mut nwdaf_info, AnalyticsId::UserDataCongestion);
     }
 
-    // nextgsim#468: an AnLF-only NWDAF contains no MTLF. The role is decided
-    // first, so an AnLF is not told its model has no exportable form (#1493).
-    let ml_provision = MlProvision::decide(role::current().serves_mtlf(), || {
-        nwdaf_self()
-            .read()
-            .map(|ctx| ctx.can_provision_model())
-            .unwrap_or(false)
-    });
+    // #1570: an MTLF that offers Nnwdaf_MLModelProvision states which
+    // Analytics IDs it provisions a model for.
+    if let (Some(list), Some(info)) = (ml_analytics_list(ml_provision), nwdaf_info.as_object_mut())
+    {
+        info.insert("mlAnalyticsList".to_string(), list);
+    }
     #[allow(unused_mut)]
     let mut services = nwdaf_services(nf_instance_id, sbi_addr, sbi_port, ml_provision);
     // nextgsim#468: Nnwdaf_MLModelMonitor, only while the demo is on.
@@ -1142,6 +1166,32 @@ fn nwdaf_info(events: &[AnalyticsId]) -> serde_json::Value {
         info.insert("nwdafEvents".to_string(), serde_json::json!(nwdaf_events));
     }
     serde_json::Value::Object(info)
+}
+
+/// TS 29.510 `NwdafInfo.mlAnalyticsList` (Table 6.1.6.2.45-1, "ML Analytics
+/// Filter information supported by Network Data Analytics Services, e.g. the
+/// Nnwdaf_MLModelProvision service"), for an NWDAF whose MTLF offers that
+/// service (#1570), else `None`.
+///
+/// One `MlAnalyticsInfo` (Table 6.1.6.2.84-1) whose `mlAnalyticsIds` are
+/// [`ml_service::PROVISIONED_ML_EVENTS`], the same list that filters a
+/// subscription's events (#1452), so the profile cannot claim an event a
+/// Subscribe would answer UNAVAILABLE_ML_MODEL. No `snssaiList` or
+/// `trackingAreaList`: this NWDAF is configured with no S-NSSAI or TAI scope,
+/// and their absence means "any". No `mlModelInterInfo`: no FL
+/// interoperability is offered.
+fn ml_analytics_list(ml_provision: MlProvision) -> Option<serde_json::Value> {
+    if ml_provision != MlProvision::Offered {
+        return None;
+    }
+    let ids: Vec<&'static str> = ml_service::PROVISIONED_ML_EVENTS
+        .iter()
+        .map(|e| e.as_str())
+        .collect();
+    if ids.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!([{ "mlAnalyticsIds": ids }]))
 }
 
 /// Add `event` to `nwdafInfo.eventIds` (nextgsim#466).
@@ -2617,6 +2667,66 @@ mod allowed_nf_types_1412_tests {
     fn an_unparseable_config_fails_instead_of_defaulting() {
         let err = from_config("badyaml", "nwdaf: [unclosed\n").expect_err("invalid YAML");
         assert!(err.contains("not valid YAML"), "{err}");
+    }
+
+    /// #1570: only an MTLF offering Nnwdaf_MLModelProvision advertises
+    /// `nwdafInfo.mlAnalyticsList`, built from the events it provisions, and
+    /// nrfd's `ml-analytics-info-list` discovery returns it for NF_LOAD and for
+    /// nothing else; an AnLF or a non-exportable MTLF is never returned.
+    #[test]
+    fn nrfd_ml_analytics_discovery_finds_only_the_offering_mtlf() {
+        let pid = std::process::id();
+        let cases = [
+            (
+                MlProvision::Offered,
+                format!("6b1d7e3c-1570-4100-8000-{pid:012x}"),
+            ),
+            (
+                MlProvision::NoMtlf,
+                format!("6b1d7e3c-1570-4100-8001-{pid:012x}"),
+            ),
+            (
+                MlProvision::NotExportable,
+                format!("6b1d7e3c-1570-4100-8002-{pid:012x}"),
+            ),
+        ];
+        for (ml, id) in &cases {
+            let doc = build_nf_profile_for(id, "127.0.0.1", 7815, &spec_allowed_nf_types(), *ml);
+            let list = doc["nwdafInfo"].get("mlAnalyticsList");
+            if *ml == MlProvision::Offered {
+                let want: Vec<&str> = ml_service::PROVISIONED_ML_EVENTS
+                    .iter()
+                    .map(|e| e.as_str())
+                    .collect();
+                assert_eq!(list, Some(&serde_json::json!([{ "mlAnalyticsIds": want }])));
+                assert_eq!(want, ["NF_LOAD"]);
+            } else {
+                assert_eq!(list, None, "{ml:?} claims no ML analytics");
+            }
+            nf_manager()
+                .register(NfProfile::from_json(&doc).expect("nrfd accepts the profile"))
+                .expect("register at nrfd");
+        }
+        let found = |event: &str| -> Vec<String> {
+            discover_profiles(&DiscoveryQuery {
+                target_nf_type: "NWDAF".to_string(),
+                requester_nf_type: "NWDAF".to_string(),
+                service_names: vec!["nnwdaf-mlmodelprovision".to_string()],
+                ml_analytics_info_list: vec![serde_json::json!({ "mlAnalyticsIds": [event] })],
+                ..Default::default()
+            })
+            .iter()
+            .filter_map(|p| p["nfInstanceId"].as_str().map(String::from))
+            .collect()
+        };
+        let nf_load = found("NF_LOAD");
+        let ue_mobility = found("UE_MOBILITY");
+        for (_, id) in &cases {
+            let _ = nf_manager().deregister(id);
+        }
+        assert!(nf_load.contains(&cases[0].1), "{nf_load:?}");
+        assert!(!nf_load.contains(&cases[1].1) && !nf_load.contains(&cases[2].1));
+        assert!(!ue_mobility.contains(&cases[0].1), "{ue_mobility:?}");
     }
 
     /// The discovery path: nrfd's SearchNFInstances filter (TS 29.510 §6.2)
