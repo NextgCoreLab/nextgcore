@@ -1147,9 +1147,10 @@ fn negotiated_feature_bits(consumer_hex: Option<&str>, supported: u64) -> u64 {
 /// outside it is not an `RfspIndex` and forwarding it would push the rejection
 /// onto the AMF.
 ///
-/// #1597: `Err` when the UDR answered a 5xx (TS 29.504 SYSTEM_FAILURE, #1534).
-/// That is not "nothing provisioned": deciding from it would authorise an AM
-/// policy without the subscriber's restrictions.
+/// #1597: `Err` when the UDR answered a 5xx (TS 29.504 SYSTEM_FAILURE, #1534),
+/// and (#1613) when a discovered UDR gave no answer. That is not "nothing
+/// provisioned": deciding from it would authorise an AM policy without the
+/// subscriber's restrictions.
 async fn provision_am_policy(
     supi: &str,
 ) -> Result<serde_json::Map<String, serde_json::Value>, sbi_path::UdrError> {
@@ -8366,6 +8367,175 @@ mod tests {
             "no rule set was provisioned for the UE"
         );
         udr.stop().await.ok();
+    }
+
+    /// #1613: a mock NRF whose discovery lists one UDR at `127.0.0.1:{udr_port}`,
+    /// or none when `udr_port` is 0. The UDR itself is whatever the test put on
+    /// that port: nothing (refused), a listener that never answers, or a server.
+    async fn start_mock_nrf_1613(
+        udr_port: std::sync::Arc<std::sync::atomic::AtomicU16>,
+    ) -> nextgcore_sbi::server::SbiServer {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        use std::sync::atomic::Ordering;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        server
+            .start(move |req: SbiRequest| {
+                let udr_port = udr_port.load(Ordering::SeqCst);
+                async move {
+                    let path = req.header.uri.split('?').next().unwrap_or("").to_string();
+                    if path != "/nnrf-disc/v1/nf-instances" {
+                        return SbiResponse::with_status(404);
+                    }
+                    let instances = if udr_port == 0 {
+                        serde_json::json!([])
+                    } else {
+                        serde_json::json!([{
+                            "nfInstanceId": "udr-1613",
+                            "nfType": "UDR",
+                            "ipv4Addresses": ["127.0.0.1"],
+                            "nfServices": [{
+                                "serviceName": "nudr-dr",
+                                "scheme": "http",
+                                "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": udr_port }]
+                            }]
+                        }])
+                    };
+                    SbiResponse::with_status(200)
+                        .with_json_body(&serde_json::json!({ "nfInstances": instances }))
+                        .unwrap_or_else(|_| SbiResponse::with_status(500))
+                }
+            })
+            .await
+            .expect("mock NRF starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        crate::test_support::point_nrf_at(format!("http://127.0.0.1:{}", addr.port())).await;
+        server
+    }
+
+    /// #1613: a UDR the NRF lists but that gives no answer is an outage, like a
+    /// 5xx (#1597): an AM policy create is refused 500 SYSTEM_FAILURE (TS 29.500
+    /// Table 5.2.7.2-1) and leaves no association, whether the UDR refuses the
+    /// connection or accepts it and never answers (the read's 3 s bound expires).
+    /// "No UDR deployed" (the NRF lists none) and an NRF that does not answer keep
+    /// the local default, as before.
+    ///
+    /// REVERT-VERIFIED: with `bounded_udr_read` mapping a no-answer read to
+    /// `Ok(None)` again, both no-answer creates answer 201 with no restrictions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn am_policy_create_refuses_a_udr_that_does_not_answer_1613() {
+        use std::sync::atomic::Ordering;
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let create = |supi: &str| {
+            make_request(
+                "POST",
+                "/npcf-am-policy-control/v1/policies",
+                Some(serde_json::json!({
+                    "supi": supi,
+                    "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/1613",
+                    "suppFeat": "0",
+                })),
+            )
+        };
+        let association = |supi: &str| pcf_self().read().unwrap().ue_am_find_by_supi(supi);
+        let refused = nextgcore_sbi::test_support::down_port();
+        let udr_port = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(refused.port()));
+        let nrf = start_mock_nrf_1613(udr_port.clone()).await;
+
+        // A listed UDR that refuses the connection.
+        let supi = "imsi-001010000016131";
+        let resp = pcf_sbi_request_handler(create(supi)).await;
+        assert_eq!(resp.status, 500, "{:?}", resp.http.content);
+        assert_eq!(problem_cause_1597(&resp), "SYSTEM_FAILURE");
+        assert!(
+            association(supi).is_none(),
+            "a refused create leaves no association"
+        );
+
+        // A listed UDR that accepts the connection and never answers.
+        let silent = nextgcore_sbi::test_support::down_port();
+        udr_port.store(silent.port(), Ordering::SeqCst);
+        let _silent = silent.listen();
+        let supi = "imsi-001010000016132";
+        let started = std::time::Instant::now();
+        let resp = pcf_sbi_request_handler(create(supi)).await;
+        assert_eq!(resp.status, 500, "{:?}", resp.http.content);
+        assert_eq!(problem_cause_1597(&resp), "SYSTEM_FAILURE");
+        assert!(
+            association(supi).is_none(),
+            "a refused create leaves no association"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the read is bounded: {:?}",
+            started.elapsed()
+        );
+
+        // No UDR deployed: the NRF lists none, the local default applies.
+        udr_port.store(0, Ordering::SeqCst);
+        let supi = "imsi-001010000016133";
+        let resp = pcf_sbi_request_handler(create(supi)).await;
+        assert_eq!(resp.status, 201, "no UDR deployed: {:?}", resp.http.content);
+        assert!(association(supi).is_some());
+        nrf.stop().await.ok();
+
+        // An NRF that does not answer says nothing about a UDR: local default too.
+        let no_nrf = nextgcore_sbi::test_support::down_port();
+        crate::test_support::point_nrf_at(format!("http://127.0.0.1:{}", no_nrf.port())).await;
+        let supi = "imsi-001010000016134";
+        let resp = pcf_sbi_request_handler(create(supi)).await;
+        assert_eq!(resp.status, 201, "NRF down: {:?}", resp.http.content);
+        crate::test_support::point_nrf_at(String::new()).await;
+        drop(refused);
+    }
+
+    /// #1613: an SM policy create whose listed UDR refuses the connection is
+    /// refused 500 SYSTEM_FAILURE and leaves no session, as for a 5xx (#1597).
+    ///
+    /// REVERT-VERIFIED: with a no-answer read mapped to `Ok(None)` again, the
+    /// create answers 201 with the local default.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn sm_policy_create_refuses_a_udr_that_does_not_answer_1613() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let refused = nextgcore_sbi::test_support::down_port();
+        let udr_port = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(refused.port()));
+        let nrf = start_mock_nrf_1613(udr_port).await;
+        let supi = "imsi-001010000016135";
+        let mut body = full_create_body(supi, 5);
+        body["ipv4Address"] = serde_json::json!("10.161.3.1");
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(body),
+        ))
+        .await;
+        assert_eq!(resp.status, 500, "{:?}", resp.http.content);
+        assert_eq!(problem_cause_1597(&resp), "SYSTEM_FAILURE");
+        assert!(
+            pcf_self()
+                .read()
+                .unwrap()
+                .sess_find_by_ipv4addr("10.161.3.1")
+                .is_none(),
+            "a refused create leaves no session"
+        );
+        nrf.stop().await.ok();
+        crate::test_support::point_nrf_at(String::new()).await;
+        drop(refused);
     }
 
     /// AM policy Create and GET both carry the negotiated `suppFeat` and the
