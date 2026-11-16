@@ -216,8 +216,9 @@ impl PolicyDecision {
     /// member silently mean 0.
     ///
     /// Applied to the config-default arm only. With a PCF configured its decision
-    /// is authoritative (TS 23.503 §6.1.3.2 has the PCF take the subscribed values
-    /// as input and answer with authorised ones), so overlaying the subscription on
+    /// is authoritative (TS 29.512 §4.2.2.5 / §4.2.2.6 have the PCF take the
+    /// subscribed values as input and answer with authorised ones), so overlaying the
+    /// subscription on
     /// top of a PCF answer would override the authorisation with its own input.
     pub fn apply_subscribed_baseline(&mut self, sub: &crate::udm::SubscribedSmData) {
         if let Some(ul) = sub.sess_ambr_ul_bps {
@@ -1113,8 +1114,8 @@ pub async fn sm_policy_create(
         // bit 8), acted on in `handle_sm_policy_notify`. Nothing else.
         "suppFeat": SMF_SM_POLICY_SUPPORTED_FEATURES,
     });
-    // #310: the subscribed session-AMBR, so the PCF can bound its authorisation by
-    // the subscription (TS 23.503 §6.1.3.2). Absent when the UDM leg is off or the
+    // #310: the subscribed session-AMBR, the input the PCF authorises the
+    // Session-AMBR from (TS 29.512 §4.2.2.5). Absent when the UDM leg is off or the
     // subscription states no AMBR, in which case the PCF bounds by nothing — the
     // pre-#310 behaviour, now the documented fallback rather than the only case.
     if let Some(ambr) = ctx.subs_sess_ambr.and_then(subs_sess_ambr_json) {
