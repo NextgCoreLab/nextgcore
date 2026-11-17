@@ -56,9 +56,6 @@ static EASDF_CONFIG: RwLock<Option<EasdfConfig>> = RwLock::new(None);
 pub struct EasdfConfig {
     /// NRF root, e.g. `http://127.0.0.1:7777`.
     pub nrf_uri: String,
-    /// Where the EASDF should send DNS-message reports for sessions this SMF
-    /// creates. Supplied as the context's notification URI.
-    pub report_uri: String,
     /// FQDN patterns this deployment treats as edge-served, one DNS
     /// handling rule per pattern. Supplied by the operator alongside the switch
     /// (`--easdf-edge-fqdn`), because there is no other source of truth for it in
@@ -130,11 +127,15 @@ fn should_create(cfg: Option<&EasdfConfig>) -> bool {
 /// The created context carries a DNS message-handling rule per edge FQDN pattern
 /// this DNN is configured for, each asking for a report so this SMF learns the
 /// resolved EAS address and can drive UL-CL / PSA re-selection.
+///
+/// `notification_uri` is the session's own report URI (#1518):
+/// `{ref}/easdf-dns-report/{token}`, with a token minted for it.
 pub async fn create_dns_context(
     supi: &str,
     pdu_session_id: u8,
     dnn: &str,
     ue_ipv4: std::net::Ipv4Addr,
+    notification_uri: &str,
 ) -> Option<String> {
     let cfg = config()?;
     if !should_create(Some(&cfg)) {
@@ -156,7 +157,7 @@ pub async fn create_dns_context(
         // UDP/53 carries no context id, so the source address is the sole
         // correlator between a datagram and a session.
         "ueIpv4Address": ue_ipv4.to_string(),
-        "notificationUri": cfg.report_uri,
+        "notificationUri": notification_uri,
         // One rule per configured edge pattern. `reportInd` is what makes the
         // EASDF tell this SMF what it resolved -- without it the context would be
         // installed and the SMF would still learn nothing.
@@ -358,7 +359,6 @@ pub(crate) mod tests {
         assert!(
             !should_create(Some(&EasdfConfig {
                 nrf_uri: "http://nrf".into(),
-                report_uri: "http://smf/cb".into(),
                 edge_fqdn_patterns: Vec::new(),
             })),
             "enabled with no edge pattern must not create an inert context"
@@ -366,7 +366,6 @@ pub(crate) mod tests {
         assert!(
             should_create(Some(&EasdfConfig {
                 nrf_uri: "http://nrf".into(),
-                report_uri: "http://smf/cb".into(),
                 edge_fqdn_patterns: vec!["*.edge.example.com".into()],
             })),
             "a named pattern is what makes a context worth creating"
@@ -385,7 +384,8 @@ pub(crate) mod tests {
                 "imsi-1",
                 5,
                 "internet",
-                std::net::Ipv4Addr::new(10, 45, 0, 2)
+                std::net::Ipv4Addr::new(10, 45, 0, 2),
+                "http://127.0.0.1:9/nsmf-callback/v1/1/easdf-dns-report/0123456789abcdef"
             )
             .await,
             None
@@ -479,7 +479,6 @@ pub(crate) mod tests {
 
         set_for_test(Some(EasdfConfig {
             nrf_uri: format!("http://127.0.0.1:{nrf_port}"),
-            report_uri: "http://127.0.0.1:9/nsmf-pdusession/v1/easdf-dns-reports".to_string(),
             edge_fqdn_patterns: vec!["*.edge.example.com".to_string()],
         }));
         (nrf, easdf, seen)
@@ -503,6 +502,7 @@ pub(crate) mod tests {
             5,
             "internet",
             std::net::Ipv4Addr::new(10, 45, 0, 2),
+            "http://127.0.0.1:9/nsmf-callback/v1/1/easdf-dns-report/0123456789abcdef",
         )
         .await
         .expect("a context id");
