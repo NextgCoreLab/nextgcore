@@ -63,7 +63,7 @@ A path to a freeDiameter-style `.conf`. It is loaded with `nextgcore_diameter::f
 - `Identity`, `Realm`, the **first** `ListenOn` and `Port` set the identity, realm, listen host and listen port. `SecPort` is stored like `port_tls` and is just as inert.
 - `ConnectPeer` is parsed and dropped, because the PCRF never dials out: it only accepts inbound connections. The flags (`No_IPv6`, `No_TCP`, `NoRelay`, ...) are also parsed and not applied.
 - Any other directive is logged at info as "directives not interpreted".
-- A directive from the list above whose value does not parse (`Port = "abc"`, `Port = 70000`, `ListenOn = ""`) sets nothing. Each one is logged at WARN as `'<Directive> = <value>' does not parse`, and the next source applies: the YAML, a flag, or the default. An earlier valid occurrence of the same directive stands.
+- A directive from the list above whose value does not parse (`Port = "abc"`, `Port = 70000`, `Port = 0`, `ListenOn = ""`, or a ConnectPeer whose identity or `ConnectTo` is empty) sets nothing. Each one is logged at WARN as `'<Directive> = <value>' does not parse`, and the next source applies: the YAML, a flag, or the default. An earlier valid occurrence of the same directive stands.
 - A file that cannot be read is a **warning**, not a startup failure, and the daemon continues without it.
 
 The path is recorded in the context for diagnosis. The `--diameter-config` flag does not feed this loader and is never read.

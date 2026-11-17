@@ -168,8 +168,14 @@ impl FreeDiameterConf {
             "no_sctp" => self.flags.no_sctp = true,
             "prefer_tcp" => self.flags.prefer_tcp = true,
             "norelay" => self.flags.no_relay = true,
-            "connectpeer" => match value.and_then(|v| parse_connect_peer(v, &mut self.malformed)) {
-                Some(peer) => self.peers.push(peer),
+            // parse_connect_peer records its own malformed parts, the identity
+            // included, so only a ConnectPeer with no value at all is noted here.
+            "connectpeer" => match value {
+                Some(v) => {
+                    if let Some(peer) = parse_connect_peer(v, &mut self.malformed) {
+                        self.peers.push(peer);
+                    }
+                }
                 None => malformed(self),
             },
             other if !other.is_empty() => {
@@ -251,43 +257,60 @@ fn unquote(value: &str) -> Option<String> {
     (!unquoted.is_empty()).then(|| unquoted.to_string())
 }
 
+/// A port 1-65535. Port 0 is not one a peer can connect to (#1536 review), so it
+/// does not parse either.
 fn parse_port(value: &str) -> Option<u16> {
-    unquote(value)?.parse().ok()
+    unquote(value)?.parse().ok().filter(|p| *p != 0)
 }
 
 /// Parse `"peer.identity" { ConnectTo = "addr"; No_TLS; }`.
 ///
-/// A `Port` inside the block that does not parse is noted in `malformed`.
+/// An identity, `ConnectTo` or `Port` that does not parse is noted in `malformed`
+/// (#1536 review). A peer with a bad identity is not returned, but its block is
+/// still read, so its other bad entries are noted too.
 fn parse_connect_peer(value: &str, malformed: &mut Vec<String>) -> Option<FreeDiameterPeer> {
     let (identity_part, block) = match value.find('{') {
         Some(idx) => (&value[..idx], value[idx + 1..].trim_end_matches(['}', ' '])),
         None => (value, ""),
     };
 
-    let identity = unquote(identity_part)?;
+    let identity = unquote(identity_part);
+    if identity.is_none() {
+        malformed.push(format!("ConnectPeer = {}", identity_part.trim()));
+    }
+    // The peer as written: `"name"` when the identity parsed, else the raw text.
+    let label = match &identity {
+        Some(id) => format!("\"{id}\""),
+        None => identity_part.trim().to_string(),
+    };
     let mut peer = FreeDiameterPeer {
-        identity,
+        identity: identity.clone().unwrap_or_default(),
         ..Default::default()
     };
 
     for inner in block.split(';') {
         let (keyword, inner_value) = split_statement(inner);
+        let mut bad = || {
+            malformed.push(format!(
+                "ConnectPeer {label} {keyword} = {}",
+                inner_value.unwrap_or_default()
+            ))
+        };
         match keyword.to_ascii_lowercase().as_str() {
-            "connectto" => peer.connect_to = inner_value.and_then(unquote),
+            "connectto" => match inner_value.and_then(unquote) {
+                Some(addr) => peer.connect_to = Some(addr),
+                None => bad(),
+            },
             "port" => match inner_value.and_then(parse_port) {
                 Some(p) => peer.port = Some(p),
-                None => malformed.push(format!(
-                    "ConnectPeer \"{}\" Port = {}",
-                    peer.identity,
-                    inner_value.unwrap_or_default()
-                )),
+                None => bad(),
             },
             "no_tls" => peer.no_tls = true,
             _ => {}
         }
     }
 
-    Some(peer)
+    identity.map(|_| peer)
 }
 
 // ============================================================================
@@ -312,6 +335,9 @@ SecPort = 70000;
 ListenOn = "";
 Realm = "localdomain";
 ConnectPeer = "smf.localdomain" { ConnectTo = "172.24.0.4"; Port = x; };
+ConnectPeer = "hss.localdomain" { ConnectTo = ""; Port = 0; };
+ConnectPeer = "" { ConnectTo = ""; };
+Port = 0;
 "#,
         );
         assert_eq!(
@@ -321,6 +347,11 @@ ConnectPeer = "smf.localdomain" { ConnectTo = "172.24.0.4"; Port = x; };
                 "SecPort = 70000".to_string(),
                 "ListenOn = \"\"".to_string(),
                 "ConnectPeer \"smf.localdomain\" Port = x".to_string(),
+                "ConnectPeer \"hss.localdomain\" ConnectTo = \"\"".to_string(),
+                "ConnectPeer \"hss.localdomain\" Port = 0".to_string(),
+                "ConnectPeer = \"\"".to_string(),
+                "ConnectPeer \"\" ConnectTo = \"\"".to_string(),
+                "Port = 0".to_string(),
             ]
         );
         assert_eq!(conf.port, Some(3868), "the earlier valid Port stands");
@@ -328,8 +359,18 @@ ConnectPeer = "smf.localdomain" { ConnectTo = "172.24.0.4"; Port = x; };
         assert!(conf.listen_on.is_empty());
         assert_eq!(conf.identity.as_deref(), Some("pcrf.localdomain"));
         assert_eq!(conf.realm.as_deref(), Some("localdomain"));
-        assert_eq!(conf.peers.len(), 1);
+        assert_eq!(conf.peers.len(), 2, "the peer with no identity is not kept");
         assert_eq!(conf.peers[0].port, None);
+        assert_eq!(conf.peers[1].identity, "hss.localdomain");
+        assert_eq!(
+            conf.peers[1].connect_to, None,
+            "a bad ConnectTo sets nothing"
+        );
+        assert_eq!(
+            conf.port,
+            Some(3868),
+            "Port = 0 does not replace a valid Port"
+        );
         assert!(conf.ignored.is_empty());
     }
 
