@@ -803,6 +803,11 @@ pub struct UeNasContext {
     /// that comes in on a new gNB before its old connection is released has
     /// changed no CM state, and neither has a later message on the same connection.
     left_cm_idle: bool,
+    /// #1700: the UE arrived by an EPS->5GS handover (TS 23.502 §4.11.1.2.2) and
+    /// its step-12 mobility registration has not been accepted yet. Set with
+    /// `registered` at the HandoverNotify; taken by the first Registration Accept,
+    /// which reports the registration and access type this AMF now serves.
+    arrived_from_eps: bool,
     /// UDM SDM subscription ID (from Nudm_SDM_Subscribe)
     sdm_subscription_id: Option<String>,
     /// PCF AM policy association ID (from Npcf_AMPolicyControl_Create)
@@ -1071,6 +1076,7 @@ impl UeNasContext {
             release_after_registration: false,
             cm_idle: false,
             left_cm_idle: false,
+            arrived_from_eps: false,
             restored: false,
             taken_over: false,
             peers_stale: false,
@@ -7053,7 +7059,9 @@ impl NgapServer {
         // is for the *initial* context only (TS 23.502 §4.2.2.2.2 step 16);
         // re-issuing it on a periodic update would needlessly re-establish AS
         // security. `registered` is false during initial registration (set only
-        // after Registration Complete), so this branch is taken solely on update.
+        // after Registration Complete), so this branch is taken solely on update,
+        // and on the step-12 mobility update of a UE that arrived by an EPS->5GS
+        // handover (#1700).
         if update {
             let tmsi = state.amf_ue.next_guti.tmsi;
             let sessions = reconciled.map(|r| r.activated).unwrap_or_default();
@@ -7152,10 +7160,25 @@ impl NgapServer {
                 }
             }
             // #91: AFTER the Accept is on the wire, never before.
-            self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
-                s.registration_accept_sent = true;
-                s.left_cm_idle = false;
-            });
+            let arrived_from_eps = self
+                .ue_auth_state
+                .with_mut(amf_ue_ngap_id, |s| {
+                    s.registration_accept_sent = true;
+                    s.left_cm_idle = false;
+                    std::mem::take(&mut s.arrived_from_eps)
+                })
+                .unwrap_or(false);
+            // #1700: the first Accept to a UE that arrived from the EPS is where this
+            // AMF starts serving its registration over 3GPP access, as an initial
+            // registration's Accept is (TS 29.518 §6.2, `29518-k00.txt:24000-24008`):
+            // ACCESS_TYPE_REPORT and REGISTRATION_STATE_REPORT, once. The handover
+            // already reported CONNECTED and REACHABLE (#1645).
+            if arrived_from_eps {
+                if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
+                    crate::namf_server::fire_access_type_report(&state.amf_ue, "3GPP_ACCESS");
+                    crate::namf_server::fire_registration_state_report(&state.amf_ue, true);
+                }
+            }
             // #1424: a mobility or periodic registration update is where the AMF
             // becomes aware of where an idle UE went (TS 29.518 Table 6.2.6.3.3-1,
             // `29518-k00.txt:23958-23966`). LOCATION_REPORT goes to the subscriptions
@@ -14147,56 +14170,65 @@ impl NgapServer {
         }
     }
 
-    /// Start mobile-reachable supervision for a registered UE whose N1 connection was
-    /// just released (TS 24.501 §5.3.7).
+    /// A registered UE's N1 connection was just released: report CM-IDLE, and start
+    /// its mobile-reachable supervision (TS 24.501 §5.3.7) when the timer is
+    /// configured.
+    ///
+    /// #1701: the CM-IDLE report does not depend on the timer. TS 29.518 §6.2
+    /// (`29518-k00.txt:24011-24017`) reports "updated connection management state of
+    /// a UE ... when AMF becomes aware of a connection management state change", and
+    /// a disabled timer (`AMF_MOBILE_REACHABLE_SECS=0`) changes nothing about the
+    /// release. Before #1701 the report fired only once the timer was armed, so with
+    /// the timer off a subscriber never heard IDLE.
     async fn start_reachability_supervision(&mut self, amf_ue_ngap_id: u64) {
-        let Some(config) = self.timer_configs.get(AmfTimerId::MobileReachable).cloned() else {
-            return;
+        let timer = match self.timer_configs.get(AmfTimerId::MobileReachable) {
+            Some(config) if config.enabled => Some(config.duration),
+            Some(_) => {
+                log::debug!("Mobile reachable timer disabled by configuration; not supervising");
+                None
+            }
+            None => None,
         };
-        if !config.enabled {
-            log::debug!("Mobile reachable timer disabled by configuration; not supervising");
-            return;
-        }
-        let targets = [amf_ue_ngap_id];
-        let deadline = Instant::now() + config.duration;
-        for amf_ue_ngap_id in targets {
-            // Await-free, so the arming happens under one lock acquisition: a
-            // get-then-write-back would leave a window in which a release lands and
-            // the timer is re-armed on a UE that no longer exists.
-            let armed = self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
-                if !state.registered {
-                    // An unregistered UE has no context worth supervising; the
-                    // release already disposed of it.
-                    return false;
-                }
+        let deadline = timer.map(|d| Instant::now() + d);
+        // Await-free, so the arming happens under one lock acquisition: a
+        // get-then-write-back would leave a window in which a release lands and the
+        // timer is re-armed on a UE that no longer exists.
+        let registered = self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
+            if !state.registered {
+                // An unregistered UE has no context worth supervising or reporting;
+                // the release already disposed of it.
+                return false;
+            }
+            if let Some(deadline) = deadline {
                 state.reachability = Some(Reachability {
                     phase: ReachabilityPhase::MobileReachable,
                     deadline,
                 });
                 state.mobile_reachable_expired = false;
-                true
-            });
-            if armed == Some(true) {
-                log::info!(
-                    "Mobile reachable timer started for UE {amf_ue_ngap_id} ({:?}) after N1 \
-                     release (TS 24.501 §5.3.7)",
-                    config.duration
-                );
-                // #74 criterion 5: CONNECTIVITY_STATE_REPORT for the
-                // CM-CONNECTED -> CM-IDLE half. The N1 signalling connection is gone,
-                // which is the "connection management state change" of TS 29.518 §6.2;
-                // its counterpart (IDLE -> CONNECTED on a Service Request) fires from
-                // `gmm_handler::handle_service_request`. Read from the record rather
-                // than reconstructed, so the report carries the UE's real identities.
-                // #1645 (the R5 #1624 round-3 MINOR): through the per-subscription
-                // change gate, so a connection that ends before its CONNECTED was
-                // reported (a release racing the Service Request's SMF answers) tells a
-                // subscriber that last heard IDLE nothing: never IDLE with no CONNECTED
-                // before it.
-                if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
-                    crate::namf_server::fire_connectivity_state_report(&state.amf_ue, false);
-                }
             }
+            true
+        });
+        if registered != Some(true) {
+            return;
+        }
+        if let Some(duration) = timer {
+            log::info!(
+                "Mobile reachable timer started for UE {amf_ue_ngap_id} ({duration:?}) after N1 \
+                 release (TS 24.501 §5.3.7)"
+            );
+        }
+        // #74 criterion 5: CONNECTIVITY_STATE_REPORT for the CM-CONNECTED -> CM-IDLE
+        // half. The N1 signalling connection is gone, which is the "connection
+        // management state change" of TS 29.518 §6.2; its counterpart (IDLE ->
+        // CONNECTED on a Service Request) fires from
+        // `gmm_handler::handle_service_request`. Read from the record rather than
+        // reconstructed, so the report carries the UE's real identities.
+        // #1645 (the R5 #1624 round-3 MINOR): through the per-subscription change
+        // gate, so a connection that ends before its CONNECTED was reported (a release
+        // racing the Service Request's SMF answers) tells a subscriber that last heard
+        // IDLE nothing: never IDLE with no CONNECTED before it.
+        if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
+            crate::namf_server::fire_connectivity_state_report(&state.amf_ue, false);
         }
     }
 
@@ -18136,9 +18168,21 @@ impl NgapServer {
         // §4.11.1.2.2 step 14) must not be answered with an Initial Context Setup
         // to a gNB that already holds one (#759), and a new PDU session's setup is
         // only sent once this is true.
+        //
+        // #1700: and record the UE as registered. Its registration moved here from
+        // the EPS with its context (single-registration interworking with N26, TS
+        // 23.502 §4.11.1.2.2), and the step-12 registration is a "mobility
+        // registration update" (§4.11.1.3.3 step 2; TS 24.501 §5.5.1.3.2 e)) on this
+        // established connection. Left unregistered, its Accept took the
+        // initial-registration branch: a second INITIAL CONTEXT SETUP REQUEST to a
+        // gNB that already holds the UE context (TS 38.413 §8.3.1 has no such case),
+        // a KgNB and NH chain re-derived over the {NCC, NH} the handover set up
+        // (TS 33.501 §8.4.2), and a second REACHABLE.
         self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
             s.initial_context_setup_request_sent = true;
             s.initial_context_setup_response_received = true;
+            s.registered = true;
+            s.arrived_from_eps = true;
         });
         // #945: TS 23.502 §4.11.1.2.2.3 step 5, the Forward Relocation Complete
         // Notification, comes BEFORE step 7, Nsmf_PDUSession_UpdateSMContext (Handover
@@ -43339,6 +43383,122 @@ mod tests {
         }
     }
 
+    /// **#1701**, TS 29.518 §6.2 (`29518-k00.txt:24011-24017`): with the mobile
+    /// reachable timer disabled by configuration (`AMF_MOBILE_REACHABLE_SECS=0`), a UE
+    /// Context Release Complete for a connected, registered UE still reports CM-IDLE,
+    /// exactly once, to a CONNECTIVITY_STATE_REPORT subscriber. A duplicate Complete
+    /// reports nothing more, and no supervision is armed. An unregistered UE is
+    /// neither supervised nor reported.
+    ///
+    /// REVERT-VERIFIED: with the report inside the timer-armed branch again (main),
+    /// no IDLE report arrives; without the `registered` check, the unregistered UE
+    /// reports IDLE.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_idle_report_does_not_need_the_mobile_reachable_timer_1701() {
+        // #1588: the release path reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        ngap.timer_configs.mobile_reachable.enabled = false;
+        let (assoc, id, ran) = (17_010u64, 17_010_001u64, 1_701u32);
+        let supi = "imsi-001010000017010";
+        let mut ue = UeNasContext::new(id, ran, assoc, false);
+        ue.registered = true;
+        ue.amf_ue.security_context_available = true;
+        ue.amf_ue.supi = Some(supi.to_string());
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_publish(&ue.amf_ue, ran, assoc);
+        }
+        ngap.ue_auth_state.insert(id, ue);
+
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (sink, port, mut rx) = notify_sink().await;
+        let resp = crate::namf_server::namf_request_handler(
+            nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&serde_json::json!({ "subscription": {
+                    "eventList": [{ "type": "CONNECTIVITY_STATE_REPORT" }],
+                    "eventNotifyUri": format!("http://127.0.0.1:{port}/notify/1701"),
+                    "notifyCorrelationId": "corr-1701",
+                    "nfId": "3fa85f64-5717-4562-b3fc-2c963f661701",
+                    "supi": supi,
+                }}))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let subscription = crate::namf_server::EventSubscriptionGuard::of(&resp);
+
+        let deliveries = crate::namf_server::connectivity_deliveries_on_this_thread();
+        ngap.handle_ue_context_release_complete(assoc, &release_complete_pdu(id, Some(ran)))
+            .await
+            .expect("handled");
+        let state = ngap.ue_auth_state.get(id).expect("the UE stays registered");
+        assert!(state.is_cm_idle(), "the release took the UE to CM-IDLE");
+        assert!(
+            state.reachability.is_none(),
+            "the timer is off: nothing armed"
+        );
+        assert_eq!(
+            crate::namf_server::connectivity_deliveries_on_this_thread() - deliveries,
+            1,
+            "one IDLE delivery"
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let idle = loop {
+            let body = tokio::time::timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                rx.recv(),
+            )
+            .await
+            .expect("a CONNECTIVITY_STATE_REPORT after the release")
+            .expect("channel closed");
+            let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+            let report = &v["reportList"][0];
+            if report["type"] == "CONNECTIVITY_STATE_REPORT"
+                && report["cmInfoList"][0]["cmState"] == "IDLE"
+            {
+                break v;
+            }
+        };
+        assert_eq!(idle["reportList"][0]["supi"], supi, "{idle}");
+
+        // A duplicate Complete: the UE is already idle, nothing more is reported.
+        let deliveries = crate::namf_server::connectivity_deliveries_on_this_thread();
+        ngap.handle_ue_context_release_complete(assoc, &release_complete_pdu(id, Some(ran)))
+            .await
+            .expect("handled");
+        assert_eq!(
+            crate::namf_server::connectivity_deliveries_on_this_thread(),
+            deliveries,
+            "no second IDLE"
+        );
+        // A UE that is not registered (mid-registration) is neither supervised nor
+        // reported, timer or not.
+        ngap.ue_auth_state.with_mut(id, |s| {
+            s.registered = false;
+            s.cm_idle = false;
+        });
+        ngap.timer_configs.mobile_reachable.enabled = true;
+        let calls = crate::namf_server::idle_reports_on_this_thread();
+        ngap.start_reachability_supervision(id).await;
+        assert_eq!(
+            crate::namf_server::idle_reports_on_this_thread(),
+            calls,
+            "an unregistered UE reports no IDLE"
+        );
+        assert!(ngap.ue_auth_state.get(id).unwrap().reachability.is_none());
+        let amf_ue_id = ngap.ue_auth_state.remove(id).expect("the UE").amf_ue.id;
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_unpublish(amf_ue_id);
+        }
+        drop(subscription);
+        sink.stop().await.expect("sink stop");
+    }
+
     /// **#923.** The gNB asks for a UE's release; the AMF's UE Context Release
     /// Command is answered by a Release Complete the AMF cannot use (undecodable,
     /// or a not-comprehended IE marked reject, TS 38.413 §10.3.4.2). It is the only
@@ -45330,7 +45490,6 @@ mod eps_to_5gs_tests {
             1,
             "and REACHABLE to the DL-traffic subscriber"
         );
-        drop(dl_traffic);
         assert_eq!(completion.sessions_relayed, 1);
         assert_eq!(
             completion.source_context, None,
@@ -45358,6 +45517,78 @@ mod eps_to_5gs_tests {
                 && arrived.initial_context_setup_response_received,
             "the handed-over UE has an established UE context at the target"
         );
+        // #1700: and it is registered, its registration moved from the EPS.
+        assert!(arrived.registered, "the arrival is a registered UE");
+        let (kgnb, nh, nhcc) = (arrived.amf_ue.kgnb, arrived.amf_ue.nh, arrived.amf_ue.nhcc);
+
+        // #1700, TS 23.502 §4.11.1.2.2.3 step 12 / §4.11.1.3.3: the UE's mobility
+        // registration update on this connection, accepted once identification,
+        // authentication and the Security Mode procedure are done (the state
+        // `complete_registration` leaves: an Allowed NSSAI and a new 5G-GUTI). The
+        // Accept goes in a DOWNLINK NAS TRANSPORT, with no second INITIAL CONTEXT
+        // SETUP REQUEST to the gNB that holds the UE context; the {NCC, NH} the
+        // handover set up is kept; no second REACHABLE; and the registration and
+        // access type are reported once.
+        ngap.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
+            s.amf_ue.registration_type = crate::gmm_build::registration_type::MOBILITY_UPDATING;
+            s.amf_ue.allowed_nssai = vec![crate::context::SNssai {
+                sst: 1,
+                sd: Some(1),
+            }];
+            s.amf_ue.generate_new_guti();
+        });
+        ngap.sent_ngap = Some(Vec::new());
+        let reach_before = crate::namf_server::reachability_reports_on_this_thread();
+        let registered_before = crate::namf_server::registration_state_reports_on_this_thread();
+        ngap.send_registration_accept(ASSOC, amf_ue_ngap_id, 77)
+            .await
+            .expect("accepted");
+        let procedures: Vec<u8> = std::mem::take(ngap.sent_ngap.as_mut().expect("capturing"))
+            .into_iter()
+            .filter(|(assoc, _, _)| *assoc == ASSOC)
+            .filter_map(|(_, _, pdu)| match nextgcore_ngap_gen::decode(&pdu).ok()? {
+                nextgcore_ngap_gen::NGAP_PDU::InitiatingMessage(m) => Some(m.procedure_code.0),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !procedures.contains(&14),
+            "no second Initial Context Setup to the target gNB: {procedures:?}"
+        );
+        assert!(
+            procedures.contains(&4),
+            "the Accept goes in a DOWNLINK NAS TRANSPORT: {procedures:?}"
+        );
+        let accepted = ngap.ue_auth_state.get(amf_ue_ngap_id).unwrap();
+        assert!(accepted.registration_accept_sent);
+        assert_eq!(
+            (
+                accepted.amf_ue.kgnb,
+                accepted.amf_ue.nh,
+                accepted.amf_ue.nhcc
+            ),
+            (kgnb, nh, nhcc),
+            "the handover's AS key chain is not re-derived"
+        );
+        assert_eq!(
+            crate::namf_server::reachability_reports_on_this_thread() - reach_before,
+            0,
+            "no second REACHABLE to the DL-traffic subscriber"
+        );
+        assert_eq!(
+            crate::namf_server::registration_state_reports_on_this_thread() - registered_before,
+            1,
+            "REGISTERED is reported at the first Accept"
+        );
+        ngap.send_registration_accept(ASSOC, amf_ue_ngap_id, 77)
+            .await
+            .expect("accepted");
+        assert_eq!(
+            crate::namf_server::registration_state_reports_on_this_thread() - registered_before,
+            1,
+            "and only once"
+        );
+        drop(dl_traffic);
 
         crate::sbi_path::set_pgw_discovery_nrf_for_test(None);
         ngap.ue_auth_state.remove(amf_ue_ngap_id);
