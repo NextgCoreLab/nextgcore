@@ -7776,14 +7776,15 @@ impl NgapServer {
         // an uplink-data session (§4.2.3.2 step 4, upCnxState ACTIVATING), so the
         // ICS carries it and the buffered downlink is delivered.
         // #1643 review: not for an N1-only page (the SMF's answer to the UE's own
-        // release or modification). A session the UE's PDU session status releases
-        // needs no check here: the release below forgets it before any activation
-        // runs, which `a_page_for_a_session_the_ue_releases_activates_nothing_1643`
-        // pins.
+        // release or modification), and not for a session the UE's PDU session
+        // status releases. The activation resolves from the `held` snapshot taken
+        // before the release below, so without this check a released session is
+        // ACTIVATING'd at the default SMF.
         if let Some(p) = paging.as_ref().filter(|p| !p.pending_n1_only) {
             if let (Some(psi), false) = (p.pdu_session_id, p.pending_n2_release) {
                 if !already.contains(&psi)
                     && !plan.activate.contains(&psi)
+                    && !plan.release.contains(&psi)
                     && held.iter().any(|(h, _, _)| *h == psi)
                 {
                     plan.activate.push(psi);
@@ -11087,7 +11088,8 @@ impl NgapServer {
     /// it and delivers the SMF's N1 after the Service Request, through the N1N2
     /// transfer paging path, N1 only: no N2, and no user plane re-activated for the
     /// session (`pending_n1_only`). If the page fails, the N1 is dropped with it, and
-    /// the SMF's T3591/T3592 (or the UE's T3581/T3582) recovers. With nothing to deliver (no N1 of the SMF's for this session),
+    /// the SMF's T3591/T3592 (or the UE's T3581/T3582) recovers. With nothing to
+    /// deliver (no N1 of the SMF's for this session),
     /// nothing is paged.
     fn page_for_smf_answer(
         &mut self,

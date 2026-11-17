@@ -825,14 +825,19 @@ async fn release_then_idle_answer(
 /// #1643 round 3: an ordinary page (not N1-only) for a session with no setup
 /// transfer, answered by a Service Request whose PDU session status shows that
 /// session inactive. A session the plan releases is not re-activated by the #540
-/// rule: the release goes to the SMF, and no ACTIVATING. R5's round-3 MAJOR 2 asked
-/// to pin or drop the `!plan.release` check. It was redundant, because the release
-/// forgets the session before any activation runs, so it is dropped, and this test
-/// pins the outcome.
+/// rule: the release goes to the SMF, and no ACTIVATING. The activation would go to
+/// the default SMF (the release drops the session's SMF), so the stand-in is also
+/// the environment's SMF.
+///
+/// REVERT-VERIFIED: without the `!plan.release.contains(&psi)` check, the stand-in
+/// sees the release and then an ACTIVATING for PSI 5.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_page_for_a_session_the_ue_releases_activates_nothing_1643() {
     let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
-    // Paging reads the strategy (#1588).
+    let (_smf, port, calls) = release_answering_smf().await;
+    // An activation that loses the session's SMF goes to the environment's SMF.
+    let _env = super::SmfEnvGuard::acquire(port).await;
+    // Paging reads the strategy (#1588). Taken last.
     let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     let saved_guamis = crate::context::amf_self()
         .read()
@@ -841,7 +846,6 @@ async fn a_page_for_a_session_the_ue_releases_activates_nothing_1643() {
         .clone();
     serve_only_local_guami();
     crate::context::amf_context_init(64, 1024, 4096);
-    let (_smf, port, calls) = release_answering_smf().await;
     let mut server = capturing_ngap_server().await;
     let (old_id, new_id) = (16_430_241u64, 16_430_242u64);
     let mut ue = idle_registered_ue(old_id);
