@@ -6307,6 +6307,12 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                     log::warn!("DL FAR deactivation after AN failure failed: {e}");
                 }
             }
+            // #1606, TS 29.502 §5.2.2.3.2.2 step 3: the SMF shall "consider that the
+            // activation of the User Plane connection has failed and set the
+            // upCnxState attribute to DEACTIVATED", the state step 4 answers. Without
+            // it a failed activation stayed ACTIVATING: its release carried an N2 for
+            // resources the gNB never set up, and buffered downlink data never paged.
+            mark_up_cnx_state(sm_context_ref, context::UpCnxState::Deactivated);
             let response_body = serde_json::json!({ "upCnxState": "DEACTIVATED" });
             SbiResponse::with_status(200).with_body(response_body.to_string(), "application/json")
         }
@@ -6582,7 +6588,16 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                 // with no N2 at all, so the AMF had nothing to put in the ICS.
                 // #1230: a restored context whose uplink endpoint is unknown gets one.
                 recover_upf_ul_endpoint(sm_context_ref).await;
-                return activation_response(sm_context_ref);
+                let resp = activation_response(sm_context_ref);
+                // #1606, TS 29.502 §5.2.2.3.2.2 step 2a: "the SMF shall set the
+                // upCnxState attribute to ACTIVATING" when it can proceed. The gNB may
+                // hold the session's resources from here on, so a release before its
+                // PDU_RES_SETUP_RSP carries N2 (`up_connection_active`, #1563). A
+                // refused activation (step 2b) leaves the state as it was.
+                if resp.status == 200 {
+                    mark_up_cnx_state(sm_context_ref, context::UpCnxState::Activating);
+                }
+                return resp;
             }
             // Default: treat as activation confirmation
             let response_body = serde_json::json!({ "upCnxState": "ACTIVATED" });
@@ -27735,6 +27750,167 @@ mod tests {
         assert!(n2_again.is_empty(), "N1-only after the NG-RAN released");
         assert!(body["n2InfoContainer"].is_null(), "{body}");
         assert!(cancel_gsm_timer_for_test(&net));
+
+        amf.stop().await.ok();
+    }
+
+    /// The UP connection state `sm_context_ref`'s session records (#1606).
+    fn up_state_1606(sm_context_ref: &str) -> context::UpCnxState {
+        smf_self()
+            .read()
+            .expect("context")
+            .sess_find_by_sm_context_ref(sm_context_ref)
+            .expect("session")
+            .up_cnx_state
+    }
+
+    /// The AMF's `upCnxState`-only or N2 SM Context Update `body` to `sm_context_ref`
+    /// through the /modify dispatcher (#1606).
+    async fn update_1606(sm_context_ref: &str, body: serde_json::Value) -> SbiResponse {
+        let req = SbiRequest::post(format!(
+            "/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/modify"
+        ))
+        .with_body(body.to_string(), "application/json");
+        handle_sm_context_update(sm_context_ref, &req).await
+    }
+
+    /// A released-to-idle session (UP connection DEACTIVATED) that the AMF is
+    /// re-activating: its uplink endpoint is recorded, and the AMF's
+    /// `upCnxState: ACTIVATING` has been answered 200 (#1606).
+    async fn activating_session_1606(supi: &str, psi: u8, amf_port: u16) -> String {
+        let r = seed_release_session_1430(supi, psi, amf_port);
+        smf_self()
+            .read()
+            .expect("context")
+            .upf_ul_endpoints
+            .write()
+            .expect("w")
+            .insert(r.clone(), (0x0016_0600 + u32::from(psi), [10, 45, 0, 9]));
+        mark_up_cnx_state(&r, context::UpCnxState::Deactivated);
+        let resp = update_1606(&r, serde_json::json!({ "upCnxState": "ACTIVATING" })).await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        r
+    }
+
+    /// #1606, TS 29.502 §5.2.2.3.2.2 step 2a: answering `upCnxState: ACTIVATING`,
+    /// "the SMF shall set the upCnxState attribute to ACTIVATING". A release that
+    /// lands before the gNB's PDU_RES_SETUP_RSP therefore carries the N2 SM
+    /// Resource Release request (TS 23.502 §4.3.4.2, `up_connection_active`), on
+    /// both release paths:
+    /// - UE-requested (step 3a): the UpdateSMContext answer has the `n2SmInfo`
+    ///   part and `n2SmInfoType: PDU_RES_REL_CMD`;
+    /// - network-initiated (step 3b): the N1N2MessageTransfer has it.
+    ///
+    /// A refused activation (no recorded uplink endpoint, step 2b) stays
+    /// DEACTIVATED.
+    ///
+    /// REVERT-VERIFIED: without the ACTIVATING mark the state stays DEACTIVATED
+    /// and both releases go out N1-only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_release_during_up_activation_carries_n2_1606() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (amf, amf_port, posts) = n1n2_recording_amf_1385(false).await;
+        let amf_uri = format!("http://127.0.0.1:{amf_port}");
+        let expected_n2 = n2_transfer::release_command_transfer().expect("release transfer");
+
+        // ---- UE-requested release in the activation window ----
+        let ue = activating_session_1606("imsi-001010000001606", 14, amf_port).await;
+        assert_eq!(up_state_1606(&ue), context::UpCnxState::Activating);
+        let resp = handle_n1_sm_message(
+            &ue,
+            &n1(
+                14,
+                3,
+                gsm_build::message_type::PDU_SESSION_RELEASE_REQUEST,
+                &[],
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        let n2 = resp
+            .http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n2SmInfo"))
+            .map(|p| p.data.to_vec());
+        assert_eq!(n2, Some(expected_n2.clone()), "the answer carries the N2");
+        let answer: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).expect("JSON");
+        assert_eq!(answer["n2SmInfoType"], "PDU_RES_REL_CMD", "{answer}");
+        assert!(cancel_gsm_timer_for_test(&ue));
+
+        // ---- network-initiated release in the activation window ----
+        let supi = "imsi-001010000001607";
+        let net = activating_session_1606(supi, 15, amf_port).await;
+        assert_eq!(up_state_1606(&net), context::UpCnxState::Activating);
+        release_for_reactivation(&net, &amf_uri, supi, 15).await;
+        let got = await_n1n2_1385(&posts, 1).await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].3, expected_n2, "the transfer carries the N2");
+        assert_eq!(
+            got[0].1["n2InfoContainer"]["smInfo"]["n2InfoContent"]["ngapIeType"],
+            "PDU_RES_REL_CMD"
+        );
+        assert!(cancel_gsm_timer_for_test(&net));
+
+        // ---- a refused activation leaves the UP connection DEACTIVATED ----
+        let none = seed_release_session_1430("imsi-001010000001608", 16, amf_port);
+        mark_up_cnx_state(&none, context::UpCnxState::Deactivated);
+        let resp = update_1606(&none, serde_json::json!({ "upCnxState": "ACTIVATING" })).await;
+        assert_eq!(resp.status, 500, "no uplink endpoint recorded");
+        assert_eq!(up_state_1606(&none), context::UpCnxState::Deactivated);
+
+        amf.stop().await.ok();
+    }
+
+    /// #1606, TS 29.502 §5.2.2.3.2.2 step 3: on the gNB's PDU_RES_SETUP_FAIL the SMF
+    /// shall "consider that the activation of the User Plane connection has failed
+    /// and set the upCnxState attribute to DEACTIVATED". The session's later
+    /// release is then N1-only (TS 23.502 §4.3.4.2), not an N2 for resources the
+    /// gNB never set up.
+    ///
+    /// REVERT-VERIFIED: without the DEACTIVATED mark in the failure arm the state
+    /// stays ACTIVATING and the release carries the PDU_RES_REL_CMD.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_up_activation_is_deactivated_1606() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (amf, amf_port, posts) = n1n2_recording_amf_1385(false).await;
+        let amf_uri = format!("http://127.0.0.1:{amf_port}");
+
+        let supi = "imsi-001010000001609";
+        let r = activating_session_1606(supi, 14, amf_port).await;
+        assert_eq!(up_state_1606(&r), context::UpCnxState::Activating);
+        let fail = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode([0x00])
+        };
+        let resp = update_1606(
+            &r,
+            serde_json::json!({ "n2SmInfoType": "PDU_RES_SETUP_FAIL", "n2SmInfo": fail }),
+        )
+        .await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        let answer: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).expect("JSON");
+        assert_eq!(answer["upCnxState"], "DEACTIVATED", "{answer}");
+        assert_eq!(up_state_1606(&r), context::UpCnxState::Deactivated);
+
+        release_for_reactivation(&r, &amf_uri, supi, 14).await;
+        let got = await_n1n2_1385(&posts, 1).await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(
+            got[0].2[3],
+            gsm_build::message_type::PDU_SESSION_RELEASE_COMMAND
+        );
+        assert!(got[0].3.is_empty(), "N1-only: no N2 part");
+        assert!(got[0].1["n2InfoContainer"].is_null(), "{}", got[0].1);
+        assert!(cancel_gsm_timer_for_test(&r));
 
         amf.stop().await.ok();
     }
