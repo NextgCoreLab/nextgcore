@@ -8,6 +8,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use nextgcore_nrfd::nnrf_handler::{canonical_nf_instance_id, same_nf_instance_id};
 use nextgcore_nrfd::{
     apply_json_patch, discover_profiles, json_merge_patch, nf_manager, nrf_context_final,
     nrf_context_init, nrf_nnrf_nfm_send_nf_profile_changed_notify_all_async,
@@ -419,7 +420,10 @@ impl NrfPolicy {
                 for entry in keys {
                     match nextgcore_sbi::oauth::parse_es256_jwk(&entry.jwk) {
                         Ok(key) => {
-                            p.cca_trusted_keys.insert(entry.nf_instance_id.clone(), key);
+                            // Keyed as the registry keys an NF (#1633), so a
+                            // UUID configured in either case is found.
+                            p.cca_trusted_keys
+                                .insert(canonical_nf_instance_id(&entry.nf_instance_id), key);
                         }
                         // A malformed key is dropped (not fatal): the issuer
                         // then has no trusted key and its CCA is rejected at
@@ -547,8 +551,9 @@ impl NrfPolicy {
             };
             match nextgcore_sbi::oauth::parse_es256_jwk(&jwk) {
                 Ok(key) => {
+                    // Keyed canonically, as the inline keys are (#1633).
                     self.cca_trusted_keys
-                        .insert(nf_instance_id.to_string(), key);
+                        .insert(canonical_nf_instance_id(nf_instance_id), key);
                     loaded += 1;
                 }
                 Err(e) => log::warn!(
@@ -720,20 +725,30 @@ fn nrf_self_profile_for(uri: &str) -> serde_json::Value {
         Some((h, p)) => (h, p.parse::<u16>().unwrap_or(7777)),
         None => (host_port, 7777),
     };
+    let services: Vec<serde_json::Value> = ["nnrf-nfm", "nnrf-disc", "nnrf-oauth2"]
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "serviceInstanceId": name,
+                "serviceName": name,
+                "versions": [{ "apiVersionInUri": "v1", "apiFullVersion": "1.0.0" }],
+                "scheme": scheme,
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{ "ipv4Address": host, "port": port, "transport": "TCP" }],
+            })
+        })
+        .collect();
     nextgcore_sbi::nf_addressing::classify_profile_host(
         serde_json::json!({
             "nfInstanceId": nrf_instance_id(),
             "nfType": NfType::Nrf.to_str(),
             "nfStatus": "REGISTERED",
             "ipv4Addresses": [host],
-            "nfServices": [{
-                "serviceInstanceId": "nnrf-oauth2",
-                "serviceName": "nnrf-oauth2",
-                "versions": [{ "apiVersionInUri": "v1", "apiFullVersion": "1.0.0" }],
-                "scheme": scheme,
-                "nfServiceStatus": "REGISTERED",
-                "ipEndPoints": [{ "ipv4Address": host, "port": port, "transport": "TCP" }],
-            }],
+            // #1644 review B1: the NRF's own APIs, so the token endpoint can grant
+            // the `nnrf-nfm` / `nnrf-disc` scope that the nrfd-06 gate requires
+            // (TS 29.510 §5.2.2.2.3 b: an NRF profile lists nnrf-disc, nnrf-nfm and
+            // optionally nnrf-oauth2).
+            "nfServices": services,
         }),
         host,
     )
@@ -749,7 +764,27 @@ fn nrf_self_profile_for(uri: &str) -> serde_json::Value {
 /// Idempotent: `NfInstanceManager::register` inserts by instance ID, and the ID
 /// is stable across restarts once pinned, so a restart overwrites its own entry
 /// rather than accumulating one per start.
+/// Whether the NRF puts itself in its own registry at startup (#187, #1644 review
+/// m4): when it requests tokens from itself (`require_oauth2`), and when its own
+/// nnrf-nfm / nnrf-disc are gated (`require_server`), because a token for them is
+/// minted only when a registered NRF offers the service.
+fn registers_itself(require_oauth2: bool, require_server: bool) -> bool {
+    require_oauth2 || require_server
+}
+
+/// The one lock for tests that add or remove the NRF's own entry in the
+/// process-global registry (#1644 review M1), declared beside the function that
+/// writes it: a test deregistering the entry raced one that needs it.
+#[cfg(test)]
+fn self_entry_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 fn register_self_with_own_registry() {
+    // #1644 review M2: whatever armed one before (a restored registry), the NRF's
+    // own entry has no no-heartbeat timer.
+    disarm_heartbeat_timer(nrf_instance_id());
     let doc = nrf_self_profile();
     match NfProfile::from_json(&doc) {
         Ok(profile) => match nf_manager().register(profile) {
@@ -972,7 +1007,17 @@ fn negotiate_heartbeat(proposed: Option<u32>, default: u32, min: u32, max: u32) 
 
 /// Arm (or re-arm) the no-heartbeat expiry timer for an NF instance,
 /// cancelling any previously armed timer for the same instance.
+///
+/// Never for the NRF's own entry (#1644 review M2): the NRF does not heartbeat
+/// itself, so a timer on it (from `rearm_restored_timers` after a restart with
+/// persistence, or a PUT naming it) would suspend and then deregister it, after
+/// which its token endpoint grants no nnrf-* scope and the nrfd-06 gate refuses
+/// everyone.
 fn arm_heartbeat_timer(nf_instance_id: &str, expiry: Duration) {
+    if nf_instance_id.eq_ignore_ascii_case(nrf_instance_id()) {
+        disarm_heartbeat_timer(nf_instance_id);
+        return;
+    }
     let timer_mgr = timer_manager();
     let new_id = timer_mgr.start_timer(
         nextgcore_nrfd::NrfTimerId::NfInstanceNoHeartbeat,
@@ -1138,6 +1183,7 @@ async fn main() -> Result<()> {
              (token + jwks endpoints stay exempt)"
         );
     }
+    let self_registers = registers_itself(require_oauth2, policy.require_oauth2_server);
     if policy.require_client_auth {
         log::info!(
             "nrfd-05: token-endpoint client authentication required (signature-verified CCA \
@@ -1232,6 +1278,11 @@ async fn main() -> Result<()> {
              calls (issuer/self: {})",
             nrf_self_uri()
         );
+    } else if self_registers {
+        // #1644 review B1: a token for nnrf-nfm / nnrf-disc is minted only when a
+        // registered NRF offers the service, so the NRF must be in its own registry
+        // whenever the gate requires one.
+        register_self_with_own_registry();
     }
 
     // Build SBI server configuration (legacy, for context)
@@ -1362,6 +1413,20 @@ fn enforce_oauth2_on_request(
 /// is the `sub` of an NRF-issued token whose signature verified (the consumer's
 /// NF Instance ID, TS 29.510 §6.3.5.2.4 `AccessTokenClaims`); `Ok(None)` means no
 /// token was required here.
+///
+/// #1634: a verified signature is not enough. The token must also be FOR this
+/// API on this NRF (TS 33.501 §13.4.1.1, TS 29.500 §6.7.3):
+/// - `scope` must contain the invoked service name (`nnrf-nfm` / `nnrf-disc`):
+///   TS 29.500 §6.7.3 makes the service-name scope part of every access scope,
+///   and TS 29.510 Table 6.1.8-1 defines `nnrf-nfm` for the Nnrf_NFManagement API.
+///   Otherwise 403, `WWW-Authenticate: Bearer error="insufficient_scope"`.
+/// - `aud` must name this NRF: its NF type `NRF` or its NF Instance ID (TS 29.510
+///   §6.3.5.2.4). A token minted for another producer is a claims mismatch: 403
+///   `ACCESS_TOKEN_CLAIM_MISMATCH`, `error="invalid_token"`.
+///
+/// Before, a token issued for any service of any producer (say an
+/// nsmf-pdusession token a peer obtained legitimately) was accepted here, and,
+/// since #1611, its `sub` then stood for the caller's identity.
 fn oauth2_gate(
     path: &str,
     auth_header: Option<&str>,
@@ -1371,15 +1436,99 @@ fn oauth2_gate(
     if !require || !oauth2_protected_path(path) {
         return Ok(None);
     }
-    match nextgcore_sbi::oauth::authorize_bearer(auth_header, jwks) {
-        Ok(claims) => Ok(Some(claims.sub)),
-        Err(e) => Err(Box::new(send_error(
-            401,
-            "Unauthorized",
-            &format!("OAuth2 access token required: {e}"),
-            Some("UNAUTHORIZED"),
-        ))),
+    let service = path
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    let realm = format!("{}/{service}/v1", nrf_self_uri());
+    let challenge = |error: Option<&str>, scope: Option<&str>| {
+        let mut c = format!("Bearer realm=\"{realm}\"");
+        if let Some(e) = error {
+            c.push_str(&format!(", error=\"{e}\""));
+        }
+        if let Some(s) = scope {
+            c.push_str(&format!(", scope=\"{s}\""));
+        }
+        c
+    };
+    let refuse = |status: u16, title: &str, detail: String, cause: Option<&str>, www: String| {
+        Box::new(send_error(status, title, &detail, cause).with_header("WWW-Authenticate", www))
+    };
+    // TS 29.500 §6.7.3: a claims mismatch MAY carry ACCESS_TOKEN_CLAIM_MISMATCH with
+    // `invalidParams` naming the claim (#1644 review m1).
+    let claim_mismatch = |claim: &str, detail: String| {
+        let body = serde_json::json!({
+            "title": "Forbidden",
+            "status": 403,
+            "detail": detail,
+            "cause": "ACCESS_TOKEN_CLAIM_MISMATCH",
+            "invalidParams": [{ "param": claim }],
+        });
+        Box::new(
+            SbiResponse::with_status(403)
+                .with_body(body.to_string(), "application/problem+json")
+                .with_header("WWW-Authenticate", challenge(Some("invalid_token"), None)),
+        )
+    };
+    let claims = match nextgcore_sbi::oauth::authorize_bearer(auth_header, jwks) {
+        Ok(claims) => claims,
+        Err(e) => {
+            // TS 29.500 §6.7.3: no `error` when the request carried no token; and
+            // RFC 6750 §3.1: a request with another authentication scheme carries
+            // no Bearer token either (#1644 review m2).
+            let presented = auth_header.is_some_and(|h| {
+                h.trim()
+                    .get(..7)
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("bearer "))
+            });
+            return Err(refuse(
+                401,
+                "Unauthorized",
+                format!("OAuth2 access token required: {e}"),
+                Some("UNAUTHORIZED"),
+                challenge(presented.then_some("invalid_token"), None),
+            ));
+        }
+    };
+    // The issuer must be this NRF (TS 29.510 §6.3.5.2.4 `iss`: the NRF's NF Instance
+    // ID). The signature already ties the token to this NRF's key; this keeps the
+    // gate right if the JWKS ever holds another NRF's key.
+    if !claims.iss.eq_ignore_ascii_case(nrf_instance_id()) {
+        return Err(claim_mismatch(
+            "iss",
+            format!(
+                "the access token was not issued by this NRF ({:?})",
+                claims.iss
+            ),
+        ));
     }
+    let for_this_nrf = |aud: &str| aud == "NRF" || aud.eq_ignore_ascii_case(nrf_instance_id());
+    let aud_ok = match &claims.aud {
+        serde_json::Value::String(a) => for_this_nrf(a),
+        serde_json::Value::Array(items) => {
+            items.iter().filter_map(|v| v.as_str()).any(for_this_nrf)
+        }
+        _ => false,
+    };
+    if !aud_ok {
+        return Err(claim_mismatch(
+            "aud",
+            format!("the access token's audience {} is not this NRF", claims.aud),
+        ));
+    }
+    if nextgcore_sbi::oauth::check_token_scope(&claims.scope, service).is_err() {
+        return Err(refuse(
+            403,
+            "Forbidden",
+            format!("the access token's scope does not include {service}"),
+            // RFC 6750 `insufficient_scope` is in the challenge; TS 29.500 defines no
+            // ProblemDetails cause for it (#1644 review m1).
+            None,
+            challenge(Some("insufficient_scope"), Some(service)),
+        ));
+    }
+    Ok(Some(claims.sub))
 }
 
 /// SBI request handler for NRF
@@ -3164,7 +3313,7 @@ fn verify_cca_binding(
     // `sub` (and, per TS 29.510 §6.7.5, the assertion is self-issued so `iss`
     // equals `sub`) must be the NF Instance ID asserted in the token request.
     let sub = payload.get("sub").and_then(|v| v.as_str()).unwrap_or("");
-    if sub != expected_nf_instance_id {
+    if !same_nf_instance_id(sub, expected_nf_instance_id) {
         return Err((
             "invalid_client",
             format!(
@@ -3173,7 +3322,7 @@ fn verify_cca_binding(
         ));
     }
     if let Some(iss) = payload.get("iss").and_then(|v| v.as_str()) {
-        if iss != expected_nf_instance_id {
+        if !same_nf_instance_id(iss, expected_nf_instance_id) {
             return Err((
                 "invalid_client",
                 format!("CCA issuer {iss:?} does not match request nfInstanceId"),
@@ -3348,7 +3497,7 @@ fn resolve_cca_verifying_key(
             // §13.3.8.3's final bullet, the reason this issue exists. Both ids are
             // named: a mismatch is an operator-visible misissuance or an attempted
             // impersonation, and "they differ" without saying how is undiagnosable.
-            if verified.nf_instance_id != nf_instance_id {
+            if !same_nf_instance_id(&verified.nf_instance_id, nf_instance_id) {
                 return Err((
                     "invalid_client",
                     format!(
@@ -3378,9 +3527,20 @@ fn resolve_cca_verifying_key(
         CcaCertReference::Absent => {
             // No certificate reference: the pre-#393 trust-store path (issue #187).
             // Fail-closed, unchanged — an issuer with no trusted key is refused.
-            match policy.cca_trusted_keys.get(nf_instance_id) {
+            match policy
+                .cca_trusted_keys
+                .get(&canonical_nf_instance_id(nf_instance_id))
+            {
                 Some(k) => Ok(*k),
-                None => match policy.lookup_cca_trusted_key_on_disk(nf_instance_id) {
+                // The file as the request spells the ID, then in the registry's
+                // spelling (#1633).
+                None => match policy
+                    .lookup_cca_trusted_key_on_disk(nf_instance_id)
+                    .or_else(|| {
+                        policy.lookup_cca_trusted_key_on_disk(&canonical_nf_instance_id(
+                            nf_instance_id,
+                        ))
+                    }) {
                     Some(k) => Ok(k),
                     None => Err((
                         "invalid_client",
@@ -3608,13 +3768,15 @@ impl RegistrantIdentity {
     }
 
     /// The `{nfInstanceID}` the request targets must be every verified identity
-    /// of the caller. UUIDs compare case-insensitively (TS 29.510 §5.2.2.2.2).
+    /// of the caller, compared as the registry keys them: a UUID
+    /// case-insensitively (TS 29.510 §5.2.2.2.2), any other ID exactly, so a
+    /// certificate for `nf-a` cannot manage a distinct `NF-A` entry (#1633).
     /// `Some` is the refusal to send.
     fn bind_instance(&self, operation: &str, nf_instance_id: &str) -> Option<SbiResponse> {
         let (source, id) = self
             .instance_ids
             .iter()
-            .find(|(_, id)| !id.eq_ignore_ascii_case(nf_instance_id.trim()))?;
+            .find(|(_, id)| !same_nf_instance_id(id, nf_instance_id.trim()))?;
         // debug, not warn: a peer can send these at will (#1620 review m7); the
         // refusal is counted by the NRF's per-operation outcome metrics.
         log::debug!(
@@ -3673,7 +3835,7 @@ fn verify_transport_binding(
     cert_nf_instance_id: &str,
     expected_nf_instance_id: &str,
 ) -> Result<(), (&'static str, String)> {
-    if cert_nf_instance_id != expected_nf_instance_id {
+    if !same_nf_instance_id(cert_nf_instance_id, expected_nf_instance_id) {
         return Err((
             "invalid_client",
             format!(
@@ -3736,7 +3898,9 @@ fn authenticate_token_client(
 
     if let Some(cert_id) = extract_transport_client_nf_instance_id(request, policy) {
         verify_transport_binding(&cert_id, nf_instance_id)?;
-        auth.identity = Some(cert_id);
+        // The registry's spelling (#1633): the token subject is then the same
+        // whatever case the certificate and the request used.
+        auth.identity = Some(canonical_nf_instance_id(&cert_id));
         auth.via_transport = true;
     }
 
@@ -3755,7 +3919,7 @@ fn authenticate_token_client(
             // certificate identity was also present both bind to the same
             // nfInstanceId, so this does not overwrite it with anything different.
             auth.identity
-                .get_or_insert_with(|| nf_instance_id.to_string());
+                .get_or_insert_with(|| canonical_nf_instance_id(nf_instance_id));
         }
     }
 
@@ -7210,7 +7374,9 @@ mod tests {
         // A producer for the NRF to ask about, so authorization has a target.
         let (_c, producer_id, _ct, ptype) = register_pair("nrfd187self");
 
-        // The NRF registers itself, exactly as startup does.
+        // The NRF registers itself, exactly as startup does. Its entry is shared with
+        // every other test of this process (#1644 review M1).
+        let _self_entry = self_entry_test_lock().lock().await;
         register_self_with_own_registry();
         let self_id = nrf_instance_id().to_string();
         assert!(
@@ -7584,6 +7750,188 @@ mod tests {
         verify_cca_binding(&parsed.cca, "amf-1", now).expect("binding holds after the round trip");
         verify_cca_signature(&parsed.cca, key.verifying_key())
             .expect("signature holds after the round trip");
+    }
+
+    /// **#1633 review m1.** Every identity check of the token endpoint compares
+    /// NF Instance IDs as the registry keys them: a UUID case-insensitively (TS
+    /// 29.510 §5.2.2.2.2), any other ID exactly. Over the real handler, for each
+    /// proof:
+    /// - mTLS (`verify_transport_binding`): a certificate naming the UUID in
+    ///   upper case authenticates the lower-case request;
+    /// - a trust-store CCA (`verify_cca_binding` sub/iss, the key lookup): an
+    ///   upper-case `sub`/`iss` authenticates the lower-case request, and an
+    ///   upper-case request finds the key of the lower-case NF;
+    /// - an x5c CCA (`resolve_cca_verifying_key`): a leaf naming the UUID in
+    ///   upper case binds the lower-case assertion.
+    ///
+    /// Each token's `sub` is the canonical (lower-case) ID. A non-UUID ID that
+    /// differs only in case is refused, `invalid_client`, by every proof.
+    #[tokio::test]
+    async fn token_endpoint_identity_checks_fold_only_uuid_case_1633() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        use serde_json::json;
+
+        let (consumer_id, producer_id, ctype, ptype) = register_pair("nrfd1633m1");
+        let lower = "1633c0de-0000-4000-8000-0000000000a1";
+        let upper = lower.to_ascii_uppercase();
+        let legacy = "nrfd1633m1-legacy";
+        let legacy_upper = legacy.to_ascii_uppercase();
+        for id in [lower, legacy] {
+            nf_manager()
+                .register(
+                    NfProfile::from_json(&json!({
+                        "nfInstanceId": id, "nfType": ctype, "nfStatus": "REGISTERED",
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let sub_of = |resp: &SbiResponse| -> String {
+            assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+            let token = error_of(resp)["access_token"]
+                .as_str()
+                .expect("access_token")
+                .to_string();
+            let claims: serde_json::Value = serde_json::from_slice(
+                &URL_SAFE_NO_PAD
+                    .decode(token.split('.').nth(1).expect("payload"))
+                    .expect("base64url"),
+            )
+            .expect("claims");
+            claims["sub"].as_str().expect("sub").to_string()
+        };
+        let refused = |resp: &SbiResponse, what: &str| {
+            assert_eq!(resp.status, 400, "{what}: {:?}", resp.http.content);
+            assert_eq!(error_of(resp)["error"], "invalid_client", "{what}");
+        };
+        let req = |id: &str, cca: Option<&str>, xfcc: Option<&str>| {
+            auth_token_req(id, &ctype, &ptype, cca, xfcc)
+        };
+
+        // mTLS, through a declared terminator.
+        let fwd = NrfPolicy {
+            trust_forwarded_client_cert: true,
+            ..NrfPolicy::default()
+        };
+        let resp = handle_access_token_request_with_policy(
+            &req(lower, None, Some(&format!("Hash=ab;URI=urn:uuid:{upper}"))),
+            &fwd,
+        )
+        .await;
+        assert_eq!(sub_of(&resp), lower, "mTLS, upper-case certificate");
+        let resp = handle_access_token_request_with_policy(
+            &req(
+                legacy,
+                None,
+                Some(&format!("Hash=ab;URI=urn:uuid:{legacy_upper}")),
+            ),
+            &fwd,
+        )
+        .await;
+        refused(&resp, "mTLS, non-UUID differing in case");
+
+        // A CCA verified against the trust store.
+        let key = nextgcore_sbi::oauth::generate_es256_key();
+        let trusted: std::collections::HashMap<_, _> = [lower, legacy]
+            .into_iter()
+            .map(|id| (id.to_string(), *key.verifying_key()))
+            .collect();
+        let store = NrfPolicy {
+            cca_trusted_keys: trusted,
+            ..NrfPolicy::default()
+        };
+        let cca = nextgcore_sbi::oauth::mint_cca(&key, &upper, "NRF", now, 60, &[]);
+        let resp =
+            handle_access_token_request_with_policy(&req(lower, Some(&cca), None), &store).await;
+        assert_eq!(sub_of(&resp), lower, "trust store, upper-case sub/iss");
+        let cca = nextgcore_sbi::oauth::mint_cca(&key, &upper, "NRF", now, 60, &[]);
+        let resp =
+            handle_access_token_request_with_policy(&req(&upper, Some(&cca), None), &store).await;
+        assert_eq!(sub_of(&resp), lower, "trust store, upper-case request");
+        let cca = nextgcore_sbi::oauth::mint_cca(&key, &legacy_upper, "NRF", now, 60, &[]);
+        let resp =
+            handle_access_token_request_with_policy(&req(legacy, Some(&cca), None), &store).await;
+        refused(&resp, "trust store, non-UUID sub differing in case");
+
+        // A CCA carrying its x5c certificate.
+        let (ca_der, ca, ca_key) = cca_test_ca();
+        let anchored = NrfPolicy {
+            cca_trust_anchors: vec![ca_der],
+            ..NrfPolicy::default()
+        };
+        let leaf = cca_test_leaf(&key, &upper, &ca, &ca_key);
+        let cca = nextgcore_sbi::oauth::mint_cca(&key, lower, "NRF", now, 60, &[leaf]);
+        let resp =
+            handle_access_token_request_with_policy(&req(lower, Some(&cca), None), &anchored).await;
+        assert_eq!(sub_of(&resp), lower, "x5c, upper-case certificate");
+        let leaf = cca_test_leaf(&key, &legacy_upper, &ca, &ca_key);
+        let cca = nextgcore_sbi::oauth::mint_cca(&key, legacy, "NRF", now, 60, &[leaf]);
+        let resp =
+            handle_access_token_request_with_policy(&req(legacy, Some(&cca), None), &anchored)
+                .await;
+        refused(&resp, "x5c, non-UUID certificate differing in case");
+
+        for id in [lower, legacy, &consumer_id, &producer_id] {
+            nf_manager().deregister(id).ok();
+        }
+    }
+
+    /// **#1633 review m1.** A key in `cca_trusted_keys_dir` is keyed by the
+    /// canonical ID when the directory is loaded, and a key published after
+    /// start is also looked up under the canonical file name, so a UUID in
+    /// either case finds it.
+    #[test]
+    fn directory_trusted_cca_keys_are_found_in_either_uuid_case_1633() {
+        let now = 1_700_000_000u64;
+        let dir = std::env::temp_dir().join(format!("nrfd1633-jwks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let key = nextgcore_sbi::oauth::generate_es256_key();
+        let loaded = "1633e0e0-0000-4000-8000-0000000000d4";
+        nextgcore_sbi::oauth::publish_cca_public_jwk(&key, &loaded.to_ascii_uppercase(), &dir)
+            .expect("publish");
+        let yaml: NrfYaml = serde_yaml::from_str(&format!(
+            "nrf:\n  sbi:\n    oauth2:\n      cca_trusted_keys_dir: {}\n",
+            dir.display()
+        ))
+        .expect("parse yaml");
+        let policy = NrfPolicy::from_yaml(&yaml);
+        assert!(
+            policy.cca_trusted_keys.contains_key(loaded),
+            "{:?}",
+            policy.cca_trusted_keys.keys().collect::<Vec<_>>()
+        );
+
+        let late = "1633e0e0-0000-4000-8000-0000000000e5";
+        let late_upper = late.to_ascii_uppercase();
+        nextgcore_sbi::oauth::publish_cca_public_jwk(&key, late, &dir).expect("publish");
+        let cca = nextgcore_sbi::oauth::mint_cca(&key, &late_upper, "NRF", now, 60, &[]);
+        let found = resolve_cca_verifying_key(&policy, &cca, &late_upper, now);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(found.ok(), Some(*key.verifying_key()));
+    }
+
+    /// **#1633 review m1.** A configured CCA trusted key is stored under the
+    /// canonical ID, so a UUID written in upper case in the config is found.
+    #[test]
+    fn a_trusted_cca_key_is_keyed_canonically_1633() {
+        let yaml_str = "nrf:\n  sbi:\n    oauth2:\n      cca_verify_signature: true\n      \
+             cca_trusted_keys:\n        - nfInstanceId: 1633C0DE-0000-4000-8000-0000000000B2\n          \
+             jwk:\n            kty: EC\n            crv: P-256\n            \
+             x: f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\n            \
+             y: x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\n        \
+             - nfInstanceId: NF-1633\n          jwk:\n            kty: EC\n            \
+             crv: P-256\n            x: f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\n            \
+             y: x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\n";
+        let yaml: NrfYaml = serde_yaml::from_str(yaml_str).expect("parse yaml");
+        let policy = NrfPolicy::from_yaml(&yaml);
+        let mut keys: Vec<_> = policy.cca_trusted_keys.keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["1633c0de-0000-4000-8000-0000000000b2", "NF-1633"]);
     }
 
     /// Issue #64 gap 2: `authenticate_token_client` returns an identity ONLY for
@@ -8152,8 +8500,35 @@ mod tests {
     // nrfd-06: per-path server-side OAuth2 enforcement (TS 33.501 §13.4.1)
     // -----------------------------------------------------------------
 
-    /// Mint an NRF-signed ES256 access token (as the token endpoint does).
+    /// Mint an NRF-signed ES256 access token (as the token endpoint does), with
+    /// scope `nnrf-nfm nnrf-disc` (#1634).
     fn mint_nrf_token(sub: &str, aud: &str, exp_offset: i64) -> String {
+        mint_nrf_token_with(
+            sub,
+            &serde_json::json!(aud),
+            "nnrf-nfm nnrf-disc",
+            exp_offset,
+        )
+    }
+
+    /// [`mint_nrf_token`] with any `aud` and `scope`.
+    fn mint_nrf_token_with(
+        sub: &str,
+        aud: &serde_json::Value,
+        scope: &str,
+        exp_offset: i64,
+    ) -> String {
+        mint_nrf_token_from(nrf_instance_id(), sub, aud, scope, exp_offset)
+    }
+
+    /// [`mint_nrf_token_with`] under any `iss`, still signed with this NRF's key.
+    fn mint_nrf_token_from(
+        iss: &str,
+        sub: &str,
+        aud: &serde_json::Value,
+        scope: &str,
+        exp_offset: i64,
+    ) -> String {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
         use p256::ecdsa::{signature::Signer, Signature};
@@ -8163,7 +8538,7 @@ mod tests {
             .as_secs() as i64;
         let header = format!(r#"{{"alg":"ES256","typ":"JWT","kid":"{NRF_KID}"}}"#);
         let claims = serde_json::json!({
-            "iss": nrf_instance_id(), "sub": sub, "aud": aud, "scope": "x",
+            "iss": iss, "sub": sub, "aud": aud, "scope": scope,
             "exp": (now + exp_offset) as u64, "iat": now as u64,
         });
         let h = URL_SAFE_NO_PAD.encode(header.as_bytes());
@@ -8200,6 +8575,239 @@ mod tests {
             "not required: nothing verified, nothing recorded"
         );
         assert!(oauth2_gate("/nnrf-nfm/v1/nf-instances/x", None, true, &jwks).is_err());
+    }
+
+    /// #1634: the gate accepts only a token for this API on this NRF.
+    /// - Accepted: scope naming the invoked service, aud `NRF` or this NRF's instance
+    ///   ID (also inside an array, and in another case).
+    /// - 403 insufficient_scope (with the required scope in the challenge): another
+    ///   service's scope, or `nnrf-disc` only on nnrf-nfm, or a scope that merely
+    ///   starts with the service name.
+    /// - 403 ACCESS_TOKEN_CLAIM_MISMATCH / invalid_token: aud of another NF type or
+    ///   instance.
+    /// - 401: no token (challenge without `error`), a forged token (`invalid_token`).
+    ///
+    /// REVERT-VERIFIED: without the scope check the foreign-scope tokens pass; without
+    /// the audience check the foreign-audience tokens pass.
+    #[test]
+    fn the_oauth2_gate_requires_this_api_s_scope_and_this_nrf_as_audience_1634() {
+        use serde_json::json;
+        let jwks = nrf_jwks_json();
+        let nfm = "/nnrf-nfm/v1/nf-instances/x";
+        let gate = |path: &str, token: Option<String>| {
+            let auth = token.map(|t| format!("Bearer {t}"));
+            oauth2_gate(path, auth.as_deref(), true, &jwks)
+        };
+        let tok = |aud: serde_json::Value, scope: &str| {
+            Some(mint_nrf_token_with("nf-1634", &aud, scope, 3600))
+        };
+        let www = |r: &SbiResponse| {
+            r.http
+                .get_header("WWW-Authenticate")
+                .cloned()
+                .unwrap_or_default()
+        };
+        let cause = |r: &SbiResponse| {
+            serde_json::from_str::<serde_json::Value>(r.http.content.as_deref().unwrap_or("{}"))
+                .unwrap_or_default()["cause"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        for (aud, scope) in [
+            (json!("NRF"), "nnrf-nfm"),
+            (json!(nrf_instance_id()), "nnrf-disc nnrf-nfm"),
+            (
+                json!(["AMF", nrf_instance_id().to_ascii_uppercase()]),
+                "nnrf-nfm",
+            ),
+        ] {
+            assert_eq!(
+                gate(nfm, tok(aud.clone(), scope)).ok().flatten().as_deref(),
+                Some("nf-1634"),
+                "{aud} {scope}"
+            );
+        }
+        assert!(gate("/nnrf-disc/v1/nf-instances", tok(json!("NRF"), "nnrf-disc")).is_ok());
+
+        for (path, scope) in [
+            (nfm, "nsmf-pdusession"),
+            (nfm, "nnrf-disc"),
+            (nfm, "nnrf-nfmx"),
+            (nfm, ""),
+            ("/nnrf-disc/v1/nf-instances", "nnrf-nfm"),
+        ] {
+            let r = *gate(path, tok(json!("NRF"), scope)).expect_err(scope);
+            assert_eq!(r.status, 403, "{path} {scope:?}");
+            assert_eq!(cause(&r), "", "TS 29.500 defines no cause for it");
+            assert!(
+                www(&r).contains("error=\"insufficient_scope\""),
+                "{}",
+                www(&r)
+            );
+            let service = path.split('/').nth(1).unwrap();
+            assert!(
+                www(&r).contains(&format!("scope=\"{service}\"")),
+                "{}",
+                www(&r)
+            );
+        }
+
+        for aud in [json!("SMF"), json!(["smf-instance-1"]), json!(42)] {
+            let r = *gate(nfm, tok(aud.clone(), "nnrf-nfm")).expect_err("aud");
+            assert_eq!(r.status, 403, "{aud}");
+            assert_eq!(cause(&r), "ACCESS_TOKEN_CLAIM_MISMATCH");
+            assert!(www(&r).contains("error=\"invalid_token\""));
+            let body: serde_json::Value =
+                serde_json::from_str(r.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(body["invalidParams"][0]["param"], "aud");
+        }
+
+        // #1644 review: a token another issuer minted (were its key ever trusted).
+        let foreign =
+            mint_nrf_token_from("another-nrf", "nf-1634", &json!("NRF"), "nnrf-nfm", 3600);
+        let r = *gate(nfm, Some(foreign)).expect_err("iss");
+        assert_eq!(r.status, 403);
+        assert_eq!(cause(&r), "ACCESS_TOKEN_CLAIM_MISMATCH");
+        let body: serde_json::Value =
+            serde_json::from_str(r.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["invalidParams"][0]["param"], "iss");
+
+        // RFC 6750 §3.1: another scheme is no Bearer token, so no `error`.
+        let r = *oauth2_gate(nfm, Some("Basic dXNlcjpwdw=="), true, &jwks).expect_err("basic");
+        assert_eq!(r.status, 401);
+        assert!(!www(&r).contains("error="), "{}", www(&r));
+
+        let r = *gate(nfm, None).expect_err("no token");
+        assert_eq!(r.status, 401);
+        assert!(www(&r).starts_with("Bearer realm=") && !www(&r).contains("error="));
+        let r = *gate(nfm, Some("e30.e30.AAAA".to_string())).expect_err("forged");
+        assert_eq!(r.status, 401);
+        assert!(www(&r).contains("error=\"invalid_token\""));
+    }
+
+    /// #1644 review B1: a token the NRF's own token endpoint issues for its APIs
+    /// passes the gate. Both forms the endpoint mints: `targetNfType: NRF` (aud
+    /// "NRF") and `targetNfInstanceId` = this NRF (aud [its instance ID]), for
+    /// nnrf-disc and nnrf-nfm.
+    ///
+    /// REVERT-VERIFIED: with only nnrf-oauth2 in the NRF's self profile, the token
+    /// endpoint answers invalid_scope.
+    #[tokio::test]
+    async fn a_token_the_nrf_issues_for_its_own_apis_passes_the_gate_1644() {
+        use serde_json::json;
+        let consumer = "1644c0c0-0000-4000-8000-0000000000a1";
+        nf_manager()
+            .register(
+                NfProfile::from_json(&json!({
+                    "nfInstanceId": consumer, "nfType": "AMF", "nfStatus": "REGISTERED",
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let _self_entry = self_entry_test_lock().lock().await;
+        register_self_with_own_registry();
+        let jwks = nrf_jwks_json();
+        let policy = policy_without_client_auth();
+        for (target, scope, path) in [
+            (
+                json!({"targetNfType": "NRF"}),
+                "nnrf-disc",
+                "/nnrf-disc/v1/nf-instances",
+            ),
+            (
+                json!({"targetNfType": "NRF"}),
+                "nnrf-nfm",
+                "/nnrf-nfm/v1/nf-instances/x",
+            ),
+            (
+                json!({"targetNfInstanceId": nrf_instance_id()}),
+                "nnrf-disc",
+                "/nnrf-disc/v1/nf-instances",
+            ),
+            (
+                json!({"targetNfInstanceId": nrf_instance_id()}),
+                "nnrf-nfm",
+                "/nnrf-nfm/v1/nf-instances/x",
+            ),
+        ] {
+            let mut body = json!({
+                "grant_type": "client_credentials", "nfInstanceId": consumer,
+                "nfType": "AMF", "scope": scope,
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(target.as_object().unwrap().clone());
+            let mut req = SbiRequest::post("/nnrf-oauth2/v1/access-token");
+            req.http.set_content(body.to_string());
+            let resp = handle_access_token_request_with_policy(&req, &policy).await;
+            assert_eq!(
+                resp.status, 200,
+                "{target} {scope}: {:?}",
+                resp.http.content
+            );
+            let token: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            let auth = format!("Bearer {}", token["access_token"].as_str().unwrap());
+            assert_eq!(
+                oauth2_gate(path, Some(&auth), true, &jwks)
+                    .map_err(|r| r.http.content.clone())
+                    .unwrap()
+                    .as_deref(),
+                Some(consumer),
+                "{target} {scope}"
+            );
+        }
+        nf_manager().deregister(consumer).ok();
+    }
+
+    /// #1644 review M2: with persistence on, a restart restores the NRF's own entry
+    /// and re-arms every restored profile's no-heartbeat timer. The NRF's own entry
+    /// must get none, in either order of restore and self-registration, so it stays
+    /// REGISTERED past the heartbeat window and its token endpoint keeps issuing.
+    ///
+    /// REVERT-VERIFIED: without the guard in `arm_heartbeat_timer` (and the disarm in
+    /// `register_self_with_own_registry`), a timer is armed for the entry.
+    #[tokio::test]
+    async fn the_nrf_s_own_entry_never_gets_a_heartbeat_timer_1644() {
+        let _self_entry = self_entry_test_lock().lock().await;
+        let armed = || {
+            HEARTBEAT_TIMERS
+                .lock()
+                .expect("timers")
+                .contains_key(nrf_instance_id())
+        };
+        register_self_with_own_registry();
+        rearm_restored_timers();
+        assert!(!armed(), "restore after self-registration");
+        register_self_with_own_registry();
+        assert!(!armed(), "self-registration after restore");
+        arm_heartbeat_timer(nrf_instance_id(), Duration::from_secs(1));
+        assert!(!armed(), "nor through any other caller");
+        assert_eq!(
+            nf_manager()
+                .get(nrf_instance_id())
+                .expect("the entry stays")
+                .nf_status,
+            "REGISTERED"
+        );
+    }
+
+    /// #1644 review m4: the NRF registers itself whenever either its own token
+    /// requests or its gated APIs need it, and only then.
+    #[test]
+    fn the_nrf_registers_itself_when_its_tokens_need_it_1644() {
+        assert!(
+            registers_itself(true, false),
+            "it requests tokens from itself"
+        );
+        assert!(
+            registers_itself(false, true),
+            "its APIs require tokens it must issue"
+        );
+        assert!(registers_itself(true, true));
+        assert!(!registers_itself(false, false), "nothing needs the entry");
     }
 
     #[test]
@@ -9497,7 +10105,7 @@ mod registrant_binding_tests_1611 {
             let upper = own.to_ascii_uppercase();
             let resp = put(&client, &upper, "CUSTOM_T1611A").await;
             assert_eq!(resp.status, 201, "{:?}", resp.http.content);
-            // The registry keys instances as written; drop the upper-case one.
+            // One entry, under the canonical ID (#1633); drop it.
             let _ = nf_manager().deregister(&upper);
             let resp = put(&client, own, "CUSTOM_T1611A").await;
             assert_eq!(resp.status, 201, "{:?}", resp.http.content);
@@ -9566,6 +10174,57 @@ mod registrant_binding_tests_1611 {
             .await
             .expect("bounded");
         let _ = nf_manager().deregister(other);
+        server.stop().await.ok();
+    }
+
+    /// **#1633 review m2.** The registrant binding compares as the registry
+    /// keys: a UUID case-insensitively, any other ID exactly. Over real mutual
+    /// TLS, a certificate for `nrfd1633-m2` cannot register `NRFD1633-M2`, a
+    /// distinct registry entry (400 INVALID_CLIENT, nothing stored), but
+    /// registers its own ID; a certificate naming a UUID in upper case manages
+    /// the lower-case instance.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_registrant_binding_folds_only_uuid_case_1633() {
+        let own = "nrfd1633-m2";
+        let other = own.to_ascii_uppercase();
+        let (server, client) = mtls_nrf("m2-1633", Some(&format!("urn:uuid:{own}")), None).await;
+        let run = async {
+            let resp = put(&client, &other, "CUSTOM_T1633M2").await;
+            assert_eq!(resp.status, 400, "{:?}", resp.http.content);
+            assert_eq!(cause(&resp), "INVALID_CLIENT");
+            assert!(stored_type(&other).is_none(), "nothing stored for {other}");
+            let resp = put(&client, own, "CUSTOM_T1633M2").await;
+            assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+            let resp = client
+                .delete(&format!("/nnrf-nfm/v1/nf-instances/{other}"))
+                .await
+                .expect("DELETE completes");
+            assert_eq!(resp.status, 400, "{:?}", resp.http.content);
+            assert_eq!(stored_type(own).as_deref(), Some("CUSTOM_T1633M2"));
+        };
+        tokio::time::timeout(Duration::from_secs(30), run)
+            .await
+            .expect("bounded");
+        let _ = nf_manager().deregister(own);
+        server.stop().await.ok();
+
+        let lower = "1633d0d0-0000-4000-8000-0000000000c3";
+        let upper = lower.to_ascii_uppercase();
+        let (server, client) =
+            mtls_nrf("m2-1633-uuid", Some(&format!("urn:uuid:{upper}")), None).await;
+        let run = async {
+            let resp = put(&client, lower, "CUSTOM_T1633M2").await;
+            assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+            let resp = client
+                .delete(&format!("/nnrf-nfm/v1/nf-instances/{lower}"))
+                .await
+                .expect("DELETE completes");
+            assert_eq!(resp.status, 204, "{:?}", resp.http.content);
+        };
+        tokio::time::timeout(Duration::from_secs(30), run)
+            .await
+            .expect("bounded");
+        let _ = nf_manager().deregister(lower);
         server.stop().await.ok();
     }
 
@@ -9661,7 +10320,7 @@ mod registrant_binding_tests_1611 {
 
         // A verified token subject.
         let token = RegistrantIdentity::of(&request_with(None, &[], None, Some("nf-a")), &plain);
-        assert!(token.bind_instance("NFRegister", "NF-A").is_none());
+        assert!(token.bind_instance("NFRegister", "nf-a").is_none());
         assert_eq!(
             token
                 .bind_instance("NFRegister", "nf-b")

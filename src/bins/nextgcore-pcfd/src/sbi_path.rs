@@ -2039,7 +2039,7 @@ pub fn forget_udr() {
 }
 
 /// What the NRF says of a remembered UDR instance it no longer lists (#1621
-/// review round 2, m-2), from an NFProfile retrieval (TS 29.510 §5.2.2.5, `GET
+/// review round 2, m-2), from an NFProfile retrieval (TS 29.510 §5.2.2.9, `GET
 /// /nnrf-nfm/v1/nf-instances/{nfInstanceId}`).
 #[derive(Debug, PartialEq, Eq)]
 enum UdrProfile {
@@ -2062,7 +2062,7 @@ async fn udr_profile(nrf_uri: &str, nf_instance_id: &str) -> UdrProfile {
         percent_encode(nf_instance_id)
     );
     match client.get(&path).await {
-        Ok(resp) if resp.status == 404 => UdrProfile::Deregistered,
+        Ok(resp) if resp.status == 404 => profile_not_found(resp.http.content.as_deref()),
         Ok(resp) if resp.status == 200 => resp
             .http
             .content
@@ -2080,14 +2080,47 @@ async fn udr_profile(nrf_uri: &str, nf_instance_id: &str) -> UdrProfile {
     }
 }
 
+/// What a 404 to an NFProfile retrieval says (#1653).
+///
+/// TS 29.500 §5.2.7.2 answers a target resource that does not exist 404, and
+/// §5.2.7.1 has a 4xx carry a ProblemDetails; TS 29.510 §5.2.2.9 names no cause
+/// of its own for an NF instance the NRF does not hold (nrfd sends one). Two
+/// 404s do not say that, so the remembered UDR is kept rather than evicted on
+/// them:
+/// - one with no ProblemDetails: Table 5.2.7.2-1 NOTE 5 allows that bare form
+///   for an error in the URI before its first variable part, i.e. a path that
+///   did not reach the NF instance resource at all (a wrong apiRoot, an SCP
+///   route);
+/// - cause `RESOURCE_URI_STRUCTURE_NOT_FOUND` (Table 5.2.7.2-1): a path segment
+///   was not understood, again not "no such instance".
+///
+/// Evicting a live UDR on either would decide every create from the local
+/// default while the subscriber's policy is still provisioned.
+fn profile_not_found(body: Option<&str>) -> UdrProfile {
+    let problem = body
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+        .filter(serde_json::Value::is_object);
+    let Some(problem) = problem else {
+        return UdrProfile::Unknown(
+            "NFProfile retrieval returned 404 without ProblemDetails".into(),
+        );
+    };
+    match problem.get("cause").and_then(|c| c.as_str()) {
+        Some(cause @ "RESOURCE_URI_STRUCTURE_NOT_FOUND") => {
+            UdrProfile::Unknown(format!("NFProfile retrieval returned 404 {cause}"))
+        }
+        _ => UdrProfile::Deregistered,
+    }
+}
+
 /// The UDR a create-path read goes to (#1621 review M1).
 ///
 /// - No NRF configured: `Ok(None)`, no UDR deployed.
 /// - The NRF lists one: that one, remembered for the SearchResult's
 ///   `validityPeriod` (TS 29.510 Table 6.2.6.2.2-1), at most a day.
 /// - The NRF lists none, and a UDR is remembered (#1621 review round 2, m-2): its
-///   NFProfile is retrieved (TS 29.510 §5.2.2.5). 404: it deregistered, so it is
-///   forgotten and the local default applies (`Ok(None)`). `nfStatus` SUSPENDED
+///   NFProfile is retrieved (TS 29.510 §5.2.2.9). A 404 with a ProblemDetails
+///   ([`profile_not_found`], #1653): it deregistered, so it is forgotten and the local default applies (`Ok(None)`). `nfStatus` SUSPENDED
 ///   (it missed its heartbeats, §5.2.2.3.2) or UNDISCOVERABLE: an outage, `Err`.
 ///   Any other status, or no usable answer: the remembered UDR is read.
 /// - The NRF fails or does not answer within [`UDR_DISCOVERY_TIMEOUT`]: the
