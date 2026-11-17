@@ -7,6 +7,7 @@
 
 use nextgcore_sbi::callback_auth::CallbackToken;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::data_mgmt::{DataManagementSubsc, SubscriptionScope};
@@ -51,6 +52,9 @@ pub struct ProducerSubscription {
     /// notification presenting it is fanned out, and only to this subscription's
     /// consumers.
     pub notify_token: CallbackToken,
+    /// Which claim created this entry (#1747 review): a late record or abandon of an
+    /// earlier claim of the same scope never acts on it.
+    pub claim_seq: u64,
     /// Consumer subscription ids currently relying on it. The producer
     /// subscription is removed when this empties — refcounting, so one
     /// consumer's unsubscribe cannot cut off another's data.
@@ -290,6 +294,9 @@ pub enum ProducerClaim {
     NeedsCreate {
         /// The token for the subscription's `notificationURI`.
         notify_token: CallbackToken,
+        /// This claim, for [`dccf_context_record_producer_sub`] and
+        /// [`dccf_context_abandon_producer_sub`].
+        claim_seq: u64,
     },
     /// No producer subscription covers this scope and the consumer named no
     /// producer, so none can be created without guessing one.
@@ -322,6 +329,7 @@ pub fn dccf_context_claim_producer_sub(
                 return ProducerClaim::NoProducer;
             };
             let notify_token = CallbackToken::mint();
+            let claim_seq = CLAIM_SEQ.fetch_add(1, Ordering::Relaxed);
             c.producer_subs.insert(
                 key,
                 ProducerSubscription {
@@ -329,22 +337,31 @@ pub fn dccf_context_claim_producer_sub(
                     producer_id: producer_id.to_string(),
                     resource_uri: None,
                     notify_token: notify_token.clone(),
+                    claim_seq,
                     consumers: HashSet::from([consumer_id.to_string()]),
                 },
             );
-            ProducerClaim::NeedsCreate { notify_token }
+            ProducerClaim::NeedsCreate {
+                notify_token,
+                claim_seq,
+            }
         }
     }
 }
 
-/// Record that the producer created the subscription claimed for `scope`. `false`
-/// when its every consumer left while the create was in flight: the caller then
-/// deletes it at the producer.
-pub fn dccf_context_record_producer_sub(scope: &SubscriptionScope, resource_uri: String) -> bool {
+/// Record that the producer created the subscription claim `claim_seq` made for
+/// `scope`. `false` when that claim is no longer held (its every consumer left
+/// while the create was in flight, or a later claim of the scope replaced it): the
+/// caller then deletes it at the producer.
+pub fn dccf_context_record_producer_sub(
+    scope: &SubscriptionScope,
+    claim_seq: u64,
+    resource_uri: String,
+) -> bool {
     let key = scope_key(scope);
     let mut c = ctx().lock().unwrap();
     match c.producer_subs.get_mut(&key) {
-        Some(entry) => {
+        Some(entry) if entry.claim_seq == claim_seq && entry.resource_uri.is_none() => {
             log::info!(
                 "[DCCF] created producer subscription on {} for scope {key}",
                 entry.producer_id
@@ -352,17 +369,42 @@ pub fn dccf_context_record_producer_sub(scope: &SubscriptionScope, resource_uri:
             entry.resource_uri = Some(resource_uri);
             true
         }
-        None => false,
+        _ => false,
     }
 }
 
-/// The create of the subscription claimed for `scope` failed: forget it, its token
-/// with it. Its consumers keep their own subscriptions; a later consumer claim
-/// tries again.
-pub fn dccf_context_abandon_producer_sub(scope: &SubscriptionScope) {
+/// The create of claim `claim_seq` for `scope` failed or was cancelled: forget the
+/// entry, its token with it, if it is still that claim's and still in flight. Its
+/// consumers keep their own subscriptions, but no producer data comes for them
+/// until a later consumer's claim of the scope creates one (a Limit). Returns the
+/// consumer ids that relied on it.
+pub fn dccf_context_abandon_producer_sub(scope: &SubscriptionScope, claim_seq: u64) -> Vec<String> {
     let key = scope_key(scope);
-    ctx().lock().unwrap().producer_subs.remove(&key);
+    let mut c = ctx().lock().unwrap();
+    let ours = c
+        .producer_subs
+        .get(&key)
+        .is_some_and(|e| e.claim_seq == claim_seq && e.resource_uri.is_none());
+    if !ours {
+        return Vec::new();
+    }
+    c.producer_subs
+        .remove(&key)
+        .map(|e| e.consumers.into_iter().collect())
+        .unwrap_or_default()
 }
+
+/// Whether a producer subscription, created or in flight, covers `scope`.
+pub fn dccf_context_holds_producer_sub(scope: &SubscriptionScope) -> bool {
+    ctx()
+        .lock()
+        .unwrap()
+        .producer_subs
+        .contains_key(&scope_key(scope))
+}
+
+/// Claim sequence numbers (#1747 review).
+static CLAIM_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// The consumer subscriptions a producer notification presented on `token` is
 /// for (#1518): those of the producer subscription holding it, created or in

@@ -42,7 +42,6 @@
 //! coordination step is skipped, with a log line saying so.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
 
 use nextgcore_sbi::client::SbiClient;
 
@@ -72,7 +71,8 @@ pub fn producer_notify_uri(own_api_root: &str, token: &CallbackToken) -> String 
 }
 
 /// The NRF to resolve producers through, and this DCCF's own apiRoot.
-static COORDINATION_CONFIG: OnceLock<CoordinationConfig> = OnceLock::new();
+static COORDINATION_CONFIG: std::sync::RwLock<Option<CoordinationConfig>> =
+    std::sync::RwLock::new(None);
 
 /// What the coordination path needs to reach the NRF and to be called back.
 #[derive(Debug, Clone)]
@@ -87,7 +87,9 @@ pub struct CoordinationConfig {
 
 /// Enable coordination with the given config (called once at startup).
 pub fn enable_coordination(config: CoordinationConfig) {
-    let _ = COORDINATION_CONFIG.set(config);
+    *COORDINATION_CONFIG
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = Some(config);
     COORDINATION_ENABLED.store(true, Ordering::SeqCst);
     log::info!("[DCCF] producer-subscription coordination ENABLED (TS 23.288 §5A.2)");
 }
@@ -102,9 +104,10 @@ pub fn coordination_enabled() -> bool {
 pub fn set_coordination_for_test(config: Option<CoordinationConfig>) {
     match config {
         Some(c) => {
-            // `OnceLock` cannot be re-set, so tests share one config; the NRF and
-            // notify URI are per-run values passed by the caller.
-            let _ = COORDINATION_CONFIG.set(c);
+            // Replaced per test: each runs its own loopback NRF.
+            *COORDINATION_CONFIG
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = Some(c);
             COORDINATION_ENABLED.store(true, Ordering::SeqCst);
         }
         None => COORDINATION_ENABLED.store(false, Ordering::SeqCst),
@@ -112,9 +115,14 @@ pub fn set_coordination_for_test(config: Option<CoordinationConfig>) {
 }
 
 /// The current coordination config, when enabled.
-fn config() -> Option<&'static CoordinationConfig> {
+fn config() -> Option<CoordinationConfig> {
     coordination_enabled()
-        .then(|| COORDINATION_CONFIG.get())
+        .then(|| {
+            COORDINATION_CONFIG
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        })
         .flatten()
 }
 
@@ -149,24 +157,33 @@ pub async fn ensure_producer_subscription(
     // before any producer signalling. A claim that needs a create holds the
     // subscription in flight, so a concurrent consumer of the same scope reuses it.
     let target = sub.target_nf_id.as_deref();
-    let notify_token = match dccf_context_claim_producer_sub(consumer_id, scope, target) {
-        ProducerClaim::Reused { producer_id } => {
-            return CoordinationOutcome::Reused { producer_id }
-        }
-        ProducerClaim::NoProducer => {
-            log::info!(
-                "[DCCF] consumer subscription {consumer_id} names no targetNfId; skipping \
+    let (notify_token, claim_seq) =
+        match dccf_context_claim_producer_sub(consumer_id, scope, target) {
+            ProducerClaim::Reused { producer_id } => {
+                return CoordinationOutcome::Reused { producer_id }
+            }
+            ProducerClaim::NoProducer => {
+                log::info!(
+                    "[DCCF] consumer subscription {consumer_id} names no targetNfId; skipping \
                  producer coordination (an event-to-producer mapping is deliberately not guessed)"
-            );
-            return CoordinationOutcome::NoProducerNamed;
-        }
-        ProducerClaim::NeedsCreate { notify_token } => notify_token,
-    };
+                );
+                return CoordinationOutcome::NoProducerNamed;
+            }
+            ProducerClaim::NeedsCreate {
+                notify_token,
+                claim_seq,
+            } => (notify_token, claim_seq),
+        };
     let target = target.unwrap_or_default();
-    let failed = |detail: String| {
-        dccf_context_abandon_producer_sub(scope);
-        CoordinationOutcome::Failed(detail)
+    // From here every exit, an await cancelled included (the consumer's subscribe
+    // request this runs in is dropped when its client goes away), records or
+    // abandons this claim.
+    let claim = InFlightClaim {
+        scope: scope.clone(),
+        claim_seq,
+        armed: true,
     };
+    let failed = CoordinationOutcome::Failed;
 
     let profile = match fetch_nf_profile(&cfg.nrf_uri, target).await {
         Ok(p) => p,
@@ -202,10 +219,7 @@ pub async fn ensure_producer_subscription(
 
     match post_producer_subscription(&api_root, &service_name, &producer_body).await {
         Ok(resource_uri) => {
-            if !dccf_context_record_producer_sub(scope, resource_uri.clone()) {
-                // Every consumer left while the create was in flight.
-                delete_producer_subscription(&resource_uri).await;
-            }
+            claim.committed(resource_uri);
             CoordinationOutcome::Created {
                 producer_id: target.to_string(),
             }
@@ -213,6 +227,51 @@ pub async fn ensure_producer_subscription(
         Err(e) => {
             log::warn!("[DCCF] creating a producer subscription on {target} failed: {e}");
             failed(e)
+        }
+    }
+}
+
+/// A producer-subscription claim held in flight (#1747 review). Dropped without
+/// [`InFlightClaim::committed`] (the create failed, or the future running it was
+/// cancelled) it abandons the claim, so the scope can be claimed again rather than
+/// being reused forever by consumers no producer subscription serves.
+struct InFlightClaim {
+    scope: SubscriptionScope,
+    claim_seq: u64,
+    /// Cleared once committed: drop then leaves the entry alone.
+    armed: bool,
+}
+
+impl InFlightClaim {
+    /// The producer created it at `resource_uri`: record it. When the claim went
+    /// while the create was in flight (every consumer left, or the scope was
+    /// claimed anew), delete it at the producer instead, on its own task so that
+    /// cancelling this future cannot leak it.
+    fn committed(mut self, resource_uri: String) {
+        self.armed = false;
+        if !dccf_context_record_producer_sub(&self.scope, self.claim_seq, resource_uri.clone()) {
+            log::info!(
+                "[DCCF] producer subscription {resource_uri} created for a claim no longer \
+                 held; deleting it"
+            );
+            tokio::spawn(async move { delete_producer_subscription(&resource_uri).await });
+        }
+    }
+}
+
+impl Drop for InFlightClaim {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let left = dccf_context_abandon_producer_sub(&self.scope, self.claim_seq);
+        if !left.is_empty() {
+            log::warn!(
+                "[DCCF] producer subscription for {} consumer(s) {left:?} not created; no \
+                 producer data reaches them until a later subscription of the same scope \
+                 creates one",
+                left.len()
+            );
         }
     }
 }

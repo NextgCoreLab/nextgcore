@@ -803,8 +803,9 @@ async fn handle_dm_notify(token: &str, req: &SbiRequest) -> SbiResponse {
         let client = SbiClient::for_peer(&host, port);
         tokio::spawn(async move {
             match client.post_json(&path_owned, &notif).await {
-                // The consumer no longer has the subscription (TS 29.500 §5.2.7.2:
-                // 404 on a notification ends it), so neither does this DCCF.
+                // The consumer no longer has the subscription (TS 29.500 §6.2.3: a
+                // 404 to a notification should end it, SUBSCRIPTION_NOT_FOUND, and
+                // may for any other 404), so neither does this DCCF.
                 Ok(resp) if resp.status == 404 => {
                     log::info!("[DCCF] consumer of {sub_id} answered 404; subscription removed");
                     remove_consumer_subscription(&sub_id).await;
@@ -1051,7 +1052,7 @@ mod data_management_tests {
     fn claim_producer_token(sub_id: &str, producer: &str) -> String {
         let scope = dccf_context_get_subscription(sub_id).expect("stored").scope;
         match context::dccf_context_claim_producer_sub(sub_id, &scope, Some(producer)) {
-            context::ProducerClaim::NeedsCreate { notify_token } => {
+            context::ProducerClaim::NeedsCreate { notify_token, .. } => {
                 notify_token.as_str().to_string()
             }
             other => panic!("expected a fresh claim, got {other:?}"),
@@ -1884,23 +1885,42 @@ mod data_management_tests {
         clear_subscriptions();
     }
 
-    /// #1518: a producer subscription is held from the claim, so its token is
-    /// admitted before the 201 arrives. A consumer that leaves mid-create has the
-    /// producer subscription deleted when the create lands (record answers
-    /// `false`), and a failed create forgets the claim and its token.
-    #[test]
-    fn an_in_flight_producer_subscription_is_held_and_released_1518() {
-        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        init();
-        clear_subscriptions();
+    /// A fresh claim for consumer `sub_id`'s scope on `producer`: its token and seq.
+    fn claim(sub_id: &str, producer: &str) -> (String, u64) {
+        let scope = dccf_context_get_subscription(sub_id).expect("stored").scope;
+        match context::dccf_context_claim_producer_sub(sub_id, &scope, Some(producer)) {
+            context::ProducerClaim::NeedsCreate {
+                notify_token,
+                claim_seq,
+            } => (notify_token.as_str().to_string(), claim_seq),
+            other => panic!("expected a fresh claim, got {other:?}"),
+        }
+    }
 
+    /// A consumer subscription to NF_LOAD with no producer signalling: its id and
+    /// scope.
+    fn consumer() -> (String, data_mgmt::SubscriptionScope) {
         let resp = post(
             "/ndccf-datamanagement/v1/subscriptions",
             &subscribe_body("corr-1", "http://consumer/cb", "NF_LOAD"),
         );
         let id = created_id(&resp);
         let scope = dccf_context_get_subscription(&id).unwrap().scope;
-        let token = claim_producer_token(&id, "amf-1");
+        (id, scope)
+    }
+
+    /// #1518: a producer subscription is held from the claim, so its token is
+    /// admitted before the 201 arrives; a concurrent claim reuses it; a failed
+    /// create forgets it and its token; a create that lands after every consumer
+    /// left is not recorded (the caller deletes it).
+    #[test]
+    fn an_in_flight_producer_subscription_is_held_and_released_1518() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        init();
+        clear_subscriptions();
+
+        let (id, scope) = consumer();
+        let (token, seq) = claim(&id, "amf-1");
         assert_eq!(
             context::dccf_context_producer_for_token(&token).as_deref(),
             Some("amf-1"),
@@ -1919,12 +1939,16 @@ mod data_management_tests {
             context::ProducerClaim::NoProducer
         ));
 
-        // A failed create forgets it.
-        context::dccf_context_abandon_producer_sub(&scope);
+        // A failed create forgets it, and names who relied on it.
+        let mut left = context::dccf_context_abandon_producer_sub(&scope, seq);
+        left.sort();
+        let mut want = vec![id.clone(), "other".to_string()];
+        want.sort();
+        assert_eq!(left, want);
         assert!(context::dccf_context_producer_for_token(&token).is_none());
 
         // Every consumer leaves while the create is in flight.
-        let token = claim_producer_token(&id, "amf-1");
+        let (token, seq) = claim(&id, "amf-1");
         let orphaned = dccf_context_release_producer_sub(&id).expect("last consumer");
         assert!(
             orphaned.resource_uri.is_none(),
@@ -1932,9 +1956,372 @@ mod data_management_tests {
         );
         assert!(!context::dccf_context_record_producer_sub(
             &scope,
+            seq,
             "http://producer/sub/1".to_string()
         ));
         assert!(context::dccf_context_producer_for_token(&token).is_none());
+        clear_subscriptions();
+    }
+
+    /// #1747 review (R7 probe): an old claim's late abandon does not remove a newer
+    /// claim of the same scope.
+    ///
+    /// REVERT-VERIFIED: with abandon keyed on the scope alone, B's claim is removed.
+    #[test]
+    fn r7_stale_abandon_hits_newer_claim() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        init();
+        clear_subscriptions();
+        let (id, scope) = consumer();
+        let (_, a) = claim(&id, "amf-1");
+        dccf_context_release_producer_sub(&id).expect("A released");
+        let (token_b, b) = claim(&id, "amf-1");
+        assert_ne!(a, b);
+        assert!(context::dccf_context_abandon_producer_sub(&scope, a).is_empty());
+        assert!(
+            context::dccf_context_producer_for_token(&token_b).is_some(),
+            "B's in-flight claim stays"
+        );
+        assert!(context::dccf_context_record_producer_sub(
+            &scope,
+            b,
+            "http://producer/sub/b".to_string()
+        ));
+        clear_subscriptions();
+    }
+
+    /// #1747 review (R7 probe): an old claim's late 201 does not bind to a newer
+    /// claim of the same scope; it is refused, so its creator deletes it.
+    ///
+    /// REVERT-VERIFIED: with record keyed on the scope alone, X's 201 is recorded on
+    /// Y's entry.
+    #[test]
+    fn r7_stale_record_binds_newer_claim() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        init();
+        clear_subscriptions();
+        let (id, scope) = consumer();
+        let (_, x) = claim(&id, "amf-1");
+        dccf_context_release_producer_sub(&id).expect("X released");
+        let (_, y) = claim(&id, "amf-1");
+        assert!(!context::dccf_context_record_producer_sub(
+            &scope,
+            x,
+            "http://producer/sub/x".to_string()
+        ));
+        let held = dccf_context_release_producer_sub(&id).expect("Y held");
+        assert_eq!(held.claim_seq, y);
+        assert!(held.resource_uri.is_none(), "X's resource is not Y's");
+        clear_subscriptions();
+    }
+
+    /// A loopback server answering with `handler`, recording each request's method
+    /// and path.
+    async fn stub<F, Fut>(handler: F) -> (SbiServer, u16, Arc<StdMutex<Vec<(String, String)>>>)
+    where
+        F: Fn(SbiRequest) -> Fut + Send + Sync + Clone + 'static,
+        Fut: std::future::Future<Output = SbiResponse> + Send + 'static,
+    {
+        let seen: Arc<StdMutex<Vec<(String, String)>>> = Arc::default();
+        let sink = seen.clone();
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let server = SbiServer::on_listener(
+            SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+            listener,
+        );
+        server
+            .start(move |req: SbiRequest| {
+                let (sink, handler) = (sink.clone(), handler.clone());
+                async move {
+                    sink.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((req.header.method.clone(), req.header.uri.clone()));
+                    handler(req).await
+                }
+            })
+            .await
+            .expect("stub start");
+        (server, port, seen)
+    }
+
+    /// An NRF answering every NF profile retrieval with an event-exposure service
+    /// on `producer_port`.
+    async fn nrf_for(producer_port: u16) -> (SbiServer, u16) {
+        let (nrf, port, _) = stub(move |_req| async move {
+            SbiResponse::ok()
+                .with_json_body(&serde_json::json!({
+                    "nfInstanceId": "amf-1",
+                    "nfType": "AMF",
+                    "nfStatus": "REGISTERED",
+                    "nfServices": [{
+                        "serviceInstanceId": "amf-evts-1",
+                        "serviceName": "namf-evts",
+                        "scheme": "http",
+                        "ipEndPoints": [{"ipv4Address": "127.0.0.1", "port": producer_port}]
+                    }]
+                }))
+                .unwrap_or_else(|_| SbiResponse::ok())
+        })
+        .await;
+        (nrf, port)
+    }
+
+    fn coordinate_via(nrf_port: u16) {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        coordination::set_coordination_for_test(Some(coordination::CoordinationConfig {
+            nrf_uri: format!("http://127.0.0.1:{nrf_port}"),
+            own_api_root: "http://dccf".to_string(),
+        }));
+    }
+
+    /// A consumer subscription naming producer amf-1, so coordination claims.
+    fn targeted_body(corr: &str) -> String {
+        serde_json::json!({
+            "notifCorrId": corr,
+            "notificURI": "http://consumer/cb",
+            "targetNfId": "amf-1",
+            "anaSub": {"eventSubscriptions": [{"event": "UE_MOBILITY"}]}
+        })
+        .to_string()
+    }
+
+    fn targeted_scope() -> data_mgmt::SubscriptionScope {
+        let sub: data_mgmt::DataManagementSubsc =
+            serde_json::from_str(&targeted_body("c")).expect("body");
+        data_mgmt::SubscriptionScope::from_subsc(&sub)
+    }
+
+    /// #1747 review (R7 probe, MAJOR): a consumer subscribe cancelled while its
+    /// producer create is in flight (its client went away) abandons the claim, so
+    /// the next consumer of the scope creates a producer subscription instead of
+    /// reusing one that is never made.
+    ///
+    /// REVERT-VERIFIED: with `InFlightClaim`'s drop not abandoning, the next claim is
+    /// `Reused` onto the wedged entry.
+    #[test]
+    fn r7_cancelled_create_wedges_scope() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        init();
+        clear_subscriptions();
+        futures_lite_block_on(async {
+            // An NRF that accepts the connection and never answers.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let nrf_port = listener.local_addr().unwrap().port();
+            let hold = tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((sock, _)) = listener.accept().await {
+                    held.push(sock);
+                }
+            });
+            coordinate_via(nrf_port);
+            let task = tokio::spawn(dccf_request_handler(
+                SbiRequest::post("/ndccf-datamanagement/v1/subscriptions")
+                    .with_body(targeted_body("corr-1"), "application/json"),
+            ));
+            let scope = targeted_scope();
+            for _ in 0..100 {
+                if context::dccf_context_holds_producer_sub(&scope) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                context::dccf_context_holds_producer_sub(&scope),
+                "in flight"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert!(
+                !context::dccf_context_holds_producer_sub(&scope),
+                "abandoned on cancel"
+            );
+            assert!(matches!(
+                context::dccf_context_claim_producer_sub("next", &scope, Some("amf-1")),
+                context::ProducerClaim::NeedsCreate { .. }
+            ));
+            dccf_context_release_producer_sub("next");
+            coordination::set_coordination_for_test(None);
+            hold.abort();
+        });
+        clear_subscriptions();
+    }
+
+    /// #1747 review MINOR: coordination abandons its claim on every failed path:
+    /// discovery fails, the producer advertises no event exposure, and the producer
+    /// refuses the create.
+    ///
+    /// REVERT-VERIFIED: with the guard never abandoning, the claim survives each.
+    #[test]
+    fn a_failed_create_is_abandoned_on_every_path_1747() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        init();
+        clear_subscriptions();
+        futures_lite_block_on(async {
+            let scope = targeted_scope();
+            let (refusing, refusing_port, refused) = stub(|_req| async move {
+                nextgcore_sbi::server::send_error(500, "Internal", "no", None)
+            })
+            .await;
+            let (nrf_ok, nrf_ok_port) = nrf_for(refusing_port).await;
+            let (nrf_404, nrf_404_port, _) =
+                stub(|_req| async move { send_not_found("no such NF", None) }).await;
+            let (nrf_bare, nrf_bare_port, _) = stub(|_req| async move {
+                SbiResponse::ok()
+                    .with_json_body(&serde_json::json!({
+                        "nfInstanceId": "amf-1", "nfType": "AMF",
+                        "nfServices": [{"serviceName": "namf-comm"}]
+                    }))
+                    .unwrap_or_else(|_| SbiResponse::ok())
+            })
+            .await;
+            for (nrf_port, why) in [
+                (nrf_404_port, "discovery fails"),
+                (nrf_bare_port, "no event-exposure service"),
+                (nrf_ok_port, "the producer refuses"),
+            ] {
+                coordinate_via(nrf_port);
+                let resp = dccf_request_handler(
+                    SbiRequest::post("/ndccf-datamanagement/v1/subscriptions")
+                        .with_body(targeted_body("corr-1"), "application/json"),
+                )
+                .await;
+                assert_eq!(resp.status, 201, "{why}: the consumer still subscribes");
+                assert!(
+                    !context::dccf_context_holds_producer_sub(&scope),
+                    "{why}: the claim is abandoned"
+                );
+            }
+            assert!(
+                refused
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .any(|(m, _)| m == "POST"),
+                "the producer was asked"
+            );
+            coordination::set_coordination_for_test(None);
+            for s in [refusing, nrf_ok, nrf_404, nrf_bare] {
+                s.stop().await.ok();
+            }
+        });
+        clear_subscriptions();
+    }
+
+    /// #1747 review MINOR: a producer create that lands after every consumer of its
+    /// claim left is deleted at the producer, not recorded.
+    ///
+    /// REVERT-VERIFIED: without the delete when record answers `false`, the
+    /// producer sees no DELETE.
+    #[test]
+    fn a_create_landing_after_its_consumers_left_is_deleted_1747() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        init();
+        clear_subscriptions();
+        futures_lite_block_on(async {
+            let location: Arc<StdMutex<String>> = Arc::default();
+            let loc = location.clone();
+            let (producer, producer_port, seen) = stub(move |req: SbiRequest| {
+                let loc = loc.clone();
+                async move {
+                    if req.header.method == "POST" {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        let l = loc.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        return SbiResponse::created().with_header("Location", l);
+                    }
+                    SbiResponse::no_content()
+                }
+            })
+            .await;
+            *location.lock().unwrap() =
+                format!("http://127.0.0.1:{producer_port}/namf-evts/v1/subscriptions/late");
+            let (nrf, nrf_port) = nrf_for(producer_port).await;
+            coordinate_via(nrf_port);
+            let scope = targeted_scope();
+            let task = tokio::spawn(dccf_request_handler(
+                SbiRequest::post("/ndccf-datamanagement/v1/subscriptions")
+                    .with_body(targeted_body("corr-1"), "application/json"),
+            ));
+            for _ in 0..100 {
+                if context::dccf_context_holds_producer_sub(&scope) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // The consumer unsubscribes while the create is in flight.
+            let id = context::dccf_context_subscription_ids()[0].clone();
+            assert!(remove_consumer_subscription(&id).await);
+            assert_eq!(task.await.expect("joined").status, 201);
+            let mut deleted = false;
+            for _ in 0..100 {
+                deleted = seen
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .any(|(m, p)| m == "DELETE" && p.ends_with("/subscriptions/late"));
+                if deleted {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                deleted,
+                "the orphaned create is deleted: {:?}",
+                seen.lock().unwrap()
+            );
+            assert!(!context::dccf_context_holds_producer_sub(&scope));
+            coordination::set_coordination_for_test(None);
+            producer.stop().await.ok();
+            nrf.stop().await.ok();
+        });
+        clear_subscriptions();
+    }
+
+    /// #1747 review MINOR: a consumer that answers a fan-out with 404 no longer has
+    /// the subscription (TS 29.500 §6.2.3), so the DCCF removes it.
+    ///
+    /// REVERT-VERIFIED: without the 404 removal, the subscription stays.
+    #[test]
+    fn a_consumer_answering_404_loses_its_subscription_1747() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        init();
+        clear_subscriptions();
+        futures_lite_block_on(async {
+            let (gone, port, seen) =
+                stub(|_req| async move { send_not_found("no such subscription", None) }).await;
+            let resp = dccf_request_handler(
+                SbiRequest::post("/ndccf-datamanagement/v1/subscriptions").with_body(
+                    subscribe_body("corr-A", &format!("http://127.0.0.1:{port}/cb"), "NF_LOAD"),
+                    "application/json",
+                ),
+            )
+            .await;
+            let id = created_id(&resp);
+            let token = claim_producer_token(&id, "amf-1");
+            let resp = dccf_request_handler(SbiRequest::post(notify_path(&token)).with_body(
+                serde_json::json!({"eventNotifications": [{"event": "NF_LOAD"}]}).to_string(),
+                "application/json",
+            ))
+            .await;
+            assert_eq!(resp.status, 204);
+            for _ in 0..100 {
+                if dccf_context_get_subscription(&id).is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(!seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+            assert!(
+                dccf_context_get_subscription(&id).is_none(),
+                "removed on the consumer's 404"
+            );
+            assert!(
+                context::dccf_context_producer_for_token(&token).is_none(),
+                "and its producer claim released"
+            );
+            gone.stop().await.ok();
+        });
         clear_subscriptions();
     }
 }
