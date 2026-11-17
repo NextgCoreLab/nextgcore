@@ -6038,25 +6038,20 @@ fn begin_network_paging_toward(
     Ok(token)
 }
 
+/// Whether `sm_context_ref`'s paging in progress is the one whose failure token is
+/// `token` (#1705 review m1).
+fn paging_holds_token(
+    sm_context_ref: &str,
+    token: &nextgcore_sbi::callback_auth::CallbackToken,
+) -> bool {
+    lookup_policy_binding(sm_context_ref)
+        .and_then(|b| b.network_paging)
+        .is_some_and(|p| p.failure_token.matches(token.as_str()))
+}
+
 /// The (host, port) an AMF URI addresses, which is what tells one AMF from another.
 fn amf_authority(uri: &str) -> Option<(String, u16)> {
     policy::split_host_port(uri)
-}
-
-/// What a re-invocation of `sm_context_ref`'s paging toward a new AMF needs (#1705):
-/// the SUPI, the PDU session ID and the QFI of the paging in progress. `None` when no
-/// paging is in progress, or the one in progress already went to `new_amf_uri`'s AMF.
-fn paging_to_move(sm_context_ref: &str, new_amf_uri: &str) -> Option<(String, u8, Option<u8>)> {
-    if !network_paging_pending(sm_context_ref) {
-        return None;
-    }
-    let binding = lookup_policy_binding(sm_context_ref)?;
-    let paging = binding.network_paging.as_ref()?;
-    let new = amf_authority(new_amf_uri)?;
-    if paging.amf_uri.as_deref().and_then(amf_authority) == Some(new) {
-        return None;
-    }
-    Some((binding.supi.clone(), binding.psi, paging.qfi))
 }
 
 /// TS 23.502 §4.2.3.3 step 3a (#1705): "If the SMF, while waiting for the User Plane
@@ -6066,12 +6061,25 @@ fn paging_to_move(sm_context_ref: &str, new_amf_uri: &str) -> Option<(String, u8
 /// progress is replaced, with a new failure token, so the old AMF's failure
 /// notification for it changes nothing, and the guard starts again.
 ///
-/// `Ok` with the new token; `Err` when no paging is in progress, or the one in
-/// progress already went to that AMF (two messages from it re-page once).
+/// `Ok` with what the re-invoked transfer needs: the new token, the SUPI, the PDU
+/// session ID and the QFI of the paging in progress. `Err` when no paging is in
+/// progress, or the one in progress already went to that AMF (two messages from it
+/// re-page once). Called on the handler, before the transfer is spawned (review
+/// M1), so the decision and the record's move to the new AMF are one step under the
+/// bindings guard, ahead of anything else the same request does.
+#[allow(clippy::type_complexity)]
 fn begin_repaging_toward(
     sm_context_ref: &str,
     amf_uri: &str,
-) -> Result<nextgcore_sbi::callback_auth::CallbackToken, ()> {
+) -> Result<
+    (
+        nextgcore_sbi::callback_auth::CallbackToken,
+        String,
+        u8,
+        Option<u8>,
+    ),
+    (),
+> {
     let ctx = smf_self();
     let ctx = ctx.read().map_err(|_| ())?;
     let state = ctx
@@ -6091,7 +6099,8 @@ fn begin_repaging_toward(
     paging.failure_token = token.clone();
     paging.started = std::time::Instant::now();
     paging.amf_uri = Some(amf_uri.to_string());
-    Ok(token)
+    let qfi = paging.qfi;
+    Ok((token, binding.supi.clone(), binding.psi, qfi))
 }
 
 /// What the AMF answered a paging transfer (#1631), for [`settle_network_paging`].
@@ -6877,8 +6886,14 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
         // ACTIVATING: the UE answered, through the new AMF, and the paging ends with
         // it. Off the handler, so the new AMF's request is answered without waiting on
         // a transfer back to that AMF.
+        //
+        // Before the rest of the request is validated (review m2), as
+        // `record_serving_amf` above is: the clause's trigger is that the SMF
+        // "receives a message from a new AMF", and the AMF it names is the one now
+        // serving the UE whether or not this particular request is then answered
+        // 400 or 403.
         if req_body["upCnxState"].as_str() != Some("ACTIVATING") {
-            if let Some((supi, psi, qfi)) = paging_to_move(sm_context_ref, status_uri) {
+            if let Ok((token, supi, psi, qfi)) = begin_repaging_toward(sm_context_ref, status_uri) {
                 let (status_uri, sm_context_ref) =
                     (status_uri.to_string(), sm_context_ref.to_string());
                 tokio::spawn(async move {
@@ -6888,7 +6903,7 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                         psi,
                         qfi,
                         &sm_context_ref,
-                        PagingStart::NewAmf,
+                        PagingStart::NewAmf(token),
                     )
                     .await;
                 });
@@ -9523,13 +9538,13 @@ fn paging_n1n2_body(
 }
 
 /// Why a paging transfer is sent (#1705).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PagingStart {
     /// A Downlink Data Report: a new paging, or one at a higher priority (#1631).
     Report,
     /// A message from a new AMF while a paging is in progress: the transfer is
-    /// re-invoked there (TS 23.502 §4.2.3.3 step 3a).
-    NewAmf,
+    /// re-invoked there (TS 23.502 §4.2.3.3 step 3a), under the failure token
+    /// [`begin_repaging_toward`] already recorded.
+    NewAmf(nextgcore_sbi::callback_auth::CallbackToken),
 }
 
 /// Ask the AMF to page an idle UE for buffered downlink data (#78,
@@ -9560,6 +9575,11 @@ async fn send_n1_n2_paging_request(
 
     let path = format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages");
     let Some((mut body, transfer)) = paging_n1n2_body(psi, qfi, sm_context_ref) else {
+        // A re-invocation's paging was already moved to this AMF: with no transfer to
+        // send, it ends, so a later report pages afresh.
+        if let PagingStart::NewAmf(token) = &start {
+            settle_network_paging(sm_context_ref, token, PagingAnswer::Refused);
+        }
         return;
     };
     // #1631, TS 23.502 §4.2.3.3 step 3a: the re-paging rule, and the
@@ -9569,6 +9589,7 @@ async fn send_n1_n2_paging_request(
         .pointer("/arp/priorityLevel")
         .and_then(|v| v.as_u64())
         .and_then(|v| u8::try_from(v).ok());
+    let new_amf = matches!(start, PagingStart::NewAmf(_));
     let begun = match start {
         PagingStart::Report => {
             begin_network_paging_toward(sm_context_ref, arp_priority_level, qfi, Some(amf_uri))
@@ -9581,12 +9602,12 @@ async fn send_n1_n2_paging_request(
                     );
                 })
         }
-        PagingStart::NewAmf => begin_repaging_toward(sm_context_ref, amf_uri),
+        PagingStart::NewAmf(token) => Ok(token),
     };
     let Ok(token) = begun else {
         return;
     };
-    if start == PagingStart::NewAmf {
+    if new_amf {
         log::info!(
             "Paging of ref={sm_context_ref} in progress when a new AMF ({host}:{port}) took \
              the UE: re-invoking the N1N2MessageTransfer there (TS 23.502 §4.2.3.3 step 3a)"
@@ -9627,6 +9648,7 @@ async fn send_n1_n2_paging_request(
                             request,
                             sm_context_ref.clone(),
                             wait,
+                            Some(token.clone()),
                         )
                         .await;
                         let answer = match end {
@@ -9704,7 +9726,7 @@ async fn send_n1n2_honouring_paging_conflict(
         .send_request(request.clone())
         .await?;
     if let Some(wait) = n1n2_paging_conflict_retry_after(&resp) {
-        let retry = retry_n1n2_after_paging_conflict(config, request, sm_context_ref, wait);
+        let retry = retry_n1n2_after_paging_conflict(config, request, sm_context_ref, wait, None);
         match retries {
             PagingRetries::Spawned => {
                 tokio::spawn(retry);
@@ -9755,6 +9777,9 @@ enum N1n2RetryEnd {
     Exhausted,
     /// A resend failed in transport.
     Failed,
+    /// The paging the transfer was for is no longer the one in progress: it ended, or
+    /// was re-invoked toward a new AMF under a new token (#1705 review m1).
+    Superseded,
 }
 
 /// Resend a transfer the AMF refused with 409 `HIGHER_PRIORITY_REQUEST_ONGOING`
@@ -9762,11 +9787,17 @@ enum N1n2RetryEnd {
 /// number of times. Each resend first checks that the session `sm_context_ref`
 /// still exists: a released session's transfer is moot, and resending it would
 /// page the UE for nothing (#1079 review m1).
+///
+/// A paging transfer (`paging` its failure token) is resent only while that paging
+/// is still the one in progress (#1705 review m1). Once it ended, or was re-invoked
+/// toward a new AMF under a new token, a resend would have the old AMF page the UE
+/// for a transfer nothing waits on.
 async fn retry_n1n2_after_paging_conflict(
     config: nextgcore_sbi::client::SbiClientConfig,
     request: nextgcore_sbi::message::SbiRequest,
     sm_context_ref: String,
     first_wait: std::time::Duration,
+    paging: Option<nextgcore_sbi::callback_auth::CallbackToken>,
 ) -> N1n2RetryEnd {
     let client = namf_client(config);
     let mut wait = first_wait;
@@ -9794,6 +9825,15 @@ async fn retry_n1n2_after_paging_conflict(
                  released meanwhile"
             );
             return N1n2RetryEnd::SessionGone;
+        }
+        if let Some(token) = &paging {
+            if !paging_holds_token(&sm_context_ref, token) {
+                log::info!(
+                    "N1N2MessageTransfer (paging) for ref={sm_context_ref} not resent: its \
+                     paging ended or was re-invoked toward another AMF meanwhile"
+                );
+                return N1n2RetryEnd::Superseded;
+            }
         }
         match client.send_request(request.clone()).await {
             Ok(resp) => match n1n2_paging_conflict_retry_after(&resp) {
@@ -17073,6 +17113,7 @@ mod tests {
             request,
             sm_ref.clone(),
             std::time::Duration::from_secs(1),
+            None,
         ));
         drop_session_for_retry(&sm_ref);
         let end = tokio::time::timeout(std::time::Duration::from_secs(3), retry)
@@ -17103,6 +17144,7 @@ mod tests {
                 request.clone(),
                 sm_ref.clone(),
                 std::time::Duration::from_secs(N1N2_RETRY_AFTER_MAX_S + 1),
+                None,
             ),
         )
         .await
@@ -17121,6 +17163,7 @@ mod tests {
             request,
             sm_ref.clone(),
             std::time::Duration::from_secs(2),
+            None,
         )
         .await;
         assert!(started.elapsed() >= std::time::Duration::from_secs(2));
@@ -17562,6 +17605,7 @@ mod tests {
                     request,
                     sm_ref.clone(),
                     std::time::Duration::ZERO,
+                    None,
                 )
                 .await;
                 assert_eq!(end, N1n2RetryEnd::Sent(200));
@@ -28805,6 +28849,184 @@ mod tests {
         assert_eq!(up_state_1631(&reference), context::UpCnxState::Activating);
         assert_eq!(notify_failure_1631(&reference, &second, failure).await, 204);
         assert_eq!(up_state_1631(&reference), context::UpCnxState::Deactivated);
+
+        drop_session_for_retry(&reference);
+        amf_a.stop().await.expect("stop");
+        amf_b.stop().await.expect("stop");
+    }
+
+    /// **#1705 review (m3)**: two messages from the new AMF back to back, the second
+    /// handled before the first one's transfer has been sent, still re-page once. The
+    /// decision is `begin_repaging_toward`'s, under the bindings guard, and it has
+    /// already moved the paging to B when the second message arrives.
+    ///
+    /// REVERT-VERIFIED: without the AMF comparison in `begin_repaging_toward`, B
+    /// receives two transfers ("B is paged once").
+    #[tokio::test]
+    async fn two_messages_from_the_new_amf_at_once_re_page_once_1705() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let (amf_a, port_a, seen_a) = scripted_amf_1631(vec![attempting_1631()]).await;
+        let (amf_b, port_b, seen_b) = scripted_amf_1631(vec![attempting_1631()]).await;
+        let supi = "imsi-001010000017053";
+        let (reference, seid) = seed_paged_session_1631(supi, 5, port_a);
+        report_dl_data_1631(seid, 7).await;
+        assert_eq!(
+            seen_a.lock().unwrap().len(),
+            1,
+            "the report pages through A"
+        );
+
+        let body = serde_json::json!({
+            "servingNfId": "00000000-0000-4000-8000-000000001705",
+            "smContextStatusUri": format!(
+                "http://127.0.0.1:{port_b}/namf-callback/v1/{supi}/sm-context-status/5"
+            ),
+            "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "021705" },
+            "servingNetwork": { "mcc": "001", "mnc": "01" },
+        });
+        // On this single-threaded runtime the first message's spawned transfer has not
+        // run when the second is handled.
+        let first =
+            handle_sm_context_update(&reference, &ho_update(&reference, body.clone(), None)).await;
+        assert!(seen_b.lock().unwrap().is_empty(), "not sent yet");
+        let second = handle_sm_context_update(&reference, &ho_update(&reference, body, None)).await;
+        assert_eq!((first.status, second.status), (204, 204));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while seen_b.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(seen_b.lock().unwrap().len(), 1, "B is paged once");
+
+        drop_session_for_retry(&reference);
+        amf_a.stop().await.expect("stop");
+        amf_b.stop().await.expect("stop");
+    }
+
+    /// **#1705 review (m1)**: AMF A answered the paging transfer with a 409
+    /// HIGHER_PRIORITY_REQUEST_ONGOING, so the SMF waits out its `retryAfter` to resend
+    /// it. Meanwhile the UE moved to AMF B, and the paging was re-invoked there. The
+    /// resend to A is dropped: that transfer is no longer the paging in progress, and A
+    /// would page the UE for nothing.
+    ///
+    /// REVERT-VERIFIED: without the `paging_holds_token` check in
+    /// `retry_n1n2_after_paging_conflict`, A receives the resend ("nothing resent to A").
+    #[tokio::test]
+    async fn a_conflict_retry_toward_the_old_amf_stops_after_a_re_page_1705() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let (amf_a, port_a, seen_a) = scripted_amf_1631(vec![(
+            409,
+            serde_json::json!({
+                "error": { "status": 409, "cause": "HIGHER_PRIORITY_REQUEST_ONGOING" },
+                "errInfo": { "retryAfter": 1 },
+            }),
+        )])
+        .await;
+        let (amf_b, port_b, seen_b) = scripted_amf_1631(vec![attempting_1631()]).await;
+        let supi = "imsi-001010000017054";
+        let (reference, seid) = seed_paged_session_1631(supi, 5, port_a);
+        report_dl_data_1631(seid, 7).await;
+        assert_eq!(seen_a.lock().unwrap().len(), 1, "A refused the transfer");
+        assert!(network_paging_pending(&reference), "the resend is awaited");
+
+        let body = serde_json::json!({
+            "servingNfId": "00000000-0000-4000-8000-000000001705",
+            "smContextStatusUri": format!(
+                "http://127.0.0.1:{port_b}/namf-callback/v1/{supi}/sm-context-status/5"
+            ),
+            "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "021705" },
+            "servingNetwork": { "mcc": "001", "mnc": "01" },
+        });
+        let resp = handle_sm_context_update(&reference, &ho_update(&reference, body, None)).await;
+        assert_eq!(resp.status, 204);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while seen_b.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(seen_b.lock().unwrap().len(), 1, "re-paged through B");
+        // Past A's retryAfter of 1 s.
+        tokio::time::sleep(std::time::Duration::from_millis(1_600)).await;
+        assert_eq!(seen_a.lock().unwrap().len(), 1, "nothing resent to A");
+        assert!(
+            network_paging_pending(&reference),
+            "B's paging is in progress"
+        );
+
+        drop_session_for_retry(&reference);
+        amf_a.stop().await.expect("stop");
+        amf_b.stop().await.expect("stop");
+    }
+
+    /// **#1705 review (M1)**: the new AMF's first Update is usually the UE's own answer
+    /// to the paging. It registered or sent a Service Request there, so the Update
+    /// carries `servingNfId` and `smContextStatusUri` together with `upCnxState`
+    /// ACTIVATING. That activates the user plane and ends the paging. It does not
+    /// re-invoke the transfer toward that AMF, which would page a UE that is already
+    /// connecting, and could have the new AMF deliver a second PDU SESSION RESOURCE
+    /// SETUP to the NG-RAN.
+    ///
+    /// REVERT-VERIFIED: without the ACTIVATING exclusion in `handle_sm_context_update`,
+    /// B receives a paging transfer ("B is not paged"). Before the review the re-page
+    /// was decided on the spawned task, which on this runtime always ran after the
+    /// ACTIVATING had ended the paging, so the revert bit nothing; it is decided on
+    /// the handler now.
+    #[tokio::test]
+    async fn the_new_amf_s_activation_ends_the_paging_without_a_re_page_1705() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let (amf_a, port_a, seen_a) = scripted_amf_1631(vec![attempting_1631()]).await;
+        let (amf_b, port_b, seen_b) = scripted_amf_1631(vec![attempting_1631()]).await;
+        let supi = "imsi-001010000017052";
+        let (reference, seid) = seed_paged_session_1631(supi, 5, port_a);
+
+        report_dl_data_1631(seid, 7).await;
+        let to_a = seen_a.lock().unwrap().clone();
+        assert_eq!(to_a.len(), 1, "the report pages through AMF A");
+        let token = failure_token_1631(&to_a[0], &reference);
+        assert!(network_paging_pending(&reference), "paging through A");
+
+        let body = serde_json::json!({
+            "servingNfId": "00000000-0000-4000-8000-000000001705",
+            "smContextStatusUri": format!(
+                "http://127.0.0.1:{port_b}/namf-callback/v1/{supi}/sm-context-status/5"
+            ),
+            "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "021705" },
+            "servingNetwork": { "mcc": "001", "mnc": "01" },
+            "upCnxState": "ACTIVATING",
+        });
+        let resp = handle_sm_context_update(&reference, &ho_update(&reference, body, None)).await;
+        assert_eq!(resp.status, 200, "the user plane is activated");
+        let (root, n2) = ho_answer(&resp);
+        assert_eq!(
+            root["n2SmInfoType"], "PDU_RES_SETUP_REQ",
+            "with the Setup Request Transfer: {root}"
+        );
+        assert!(n2.is_some(), "the n2SmInfo part");
+        assert!(!network_paging_pending(&reference), "the paging ended");
+        assert_eq!(up_state_1631(&reference), context::UpCnxState::Activating);
+
+        // The spawned re-page, had there been one, reaches B well within this.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(seen_b.lock().unwrap().is_empty(), "B is not paged");
+        assert_eq!(seen_a.lock().unwrap().len(), 1, "nor A again");
+        let failure = serde_json::json!({
+            "cause": "UE_NOT_RESPONDING",
+            "n1n2MsgDataUri": "http://amf/namf-comm/v1/ue-contexts/x/n1-n2-messages/1",
+        });
+        assert_eq!(
+            notify_failure_1631(&reference, &token, failure).await,
+            404,
+            "A's transfer is no longer held"
+        );
+        assert_eq!(up_state_1631(&reference), context::UpCnxState::Activating);
 
         drop_session_for_retry(&reference);
         amf_a.stop().await.expect("stop");
