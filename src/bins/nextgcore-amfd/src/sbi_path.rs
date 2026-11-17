@@ -560,8 +560,7 @@ pub async fn amf_nrf_register(sbi_addr: &str, sbi_port: u16) -> Result<String, S
 
     log::info!("Registering AMF with NRF at {nrf_uri}");
 
-    let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
-    let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
+    let client = capped_nrf_client(&nrf_uri, MAX_NRF_RESPONSE_BODY).ok_or("Invalid NRF URI")?;
 
     let nf_instance_id =
         nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf)
@@ -678,18 +677,16 @@ async fn amf_nrf_discover_qualified_at(
 ) -> Result<(), String> {
     let sbi_ctx = global_context();
 
-    let client = match nrf_uri {
-        // #1617: an NRF named here rather than in the context is still an NRF:
-        // the NRF client TLS for an https URI or the production profile.
-        Some(uri) => std::sync::Arc::new(SbiClient::for_nrf_uri(&uri).ok_or("Invalid NRF URI")?),
-        None => {
-            let Some(uri) = sbi_ctx.get_nrf_uri().await else {
-                return Ok(());
-            };
-            let (nrf_host, nrf_port) = parse_host_port(&uri).ok_or("Invalid NRF URI")?;
-            sbi_ctx.get_client(&nrf_host, nrf_port).await
-        }
+    // #1617: an NRF named here, or the context's, is dialled with the NRF client
+    // TLS; #1674: its answer is capped like every NRF answer.
+    let nrf_uri = match nrf_uri {
+        Some(uri) => uri,
+        None => match sbi_ctx.get_nrf_uri().await {
+            Some(uri) => uri,
+            None => return Ok(()),
+        },
     };
+    let client = capped_nrf_client(&nrf_uri, MAX_NRF_RESPONSE_BODY).ok_or("Invalid NRF URI")?;
 
     let mut path = format!(
         "/nnrf-disc/v1/nf-instances?target-nf-type={target_nf_type}&requester-nf-type=AMF&service-names={service_name}"
@@ -1685,16 +1682,95 @@ pub async fn call_smf_activate_up_connection(
 /// while it is being read, before it is buffered whole.
 pub const MAX_SMF_RESPONSE_BODY: usize = 256 * 1024;
 
+/// The largest answer the AMF reads from a peer AMF (#1674). A UEContextTransfer
+/// answer (TS 29.518 §6.1.6.2.25 `UeContextTransferRspData`) is the biggest: the
+/// JSON `UeContext` (security context, MM contexts, every PDU session, event
+/// subscriptions, policy associations) plus binary parts for the UE's REGISTRATION
+/// REQUEST (a NAS message, at most 65 535 octets) and its UE radio capability (an
+/// NGAP IE the AMF receives in an NGAP message of at most `MAX_NGAP_MSG_SIZE`).
+/// 1 MiB leaves several times that for the JSON.
+pub const MAX_AMF_RESPONSE_BODY: usize = 1024 * 1024;
+
+/// The largest UDM answer the AMF reads (#1674). The biggest is the SDM
+/// `AccessAndMobilitySubscriptionData` (TS 29.503 §6.1.6.2.4): S-NSSAIs (at most
+/// 16 configured), RAT and core-network restrictions, and service-area and
+/// forbidden-area lists of TAs, all bounded small. UECM and SDM-subscription
+/// answers echo a request-sized body.
+pub const MAX_UDM_RESPONSE_BODY: usize = 256 * 1024;
+
+/// The largest PCF answer the AMF reads (#1674). An AM or UE policy association
+/// (TS 29.507 §5.6.2.2 `PolicyAssociation`, TS 29.525 §5.6.2.2) is small apart from
+/// its presence reporting areas, each a list of TAs, NCGIs, ECGIs or RAN nodes.
+/// At about 60 octets per NCGI, 1 MiB admits more than 15 000 cells.
+pub const MAX_PCF_RESPONSE_BODY: usize = 1024 * 1024;
+
+/// The largest NRF answer the AMF reads (#1674). A discovery `SearchResult`
+/// (TS 29.510 §6.2.6.2.2) with no `limit` lists every matching NF profile, each a
+/// few KiB with its services. 4 MiB admits about a thousand of them.
+pub const MAX_NRF_RESPONSE_BODY: usize = 4 * 1024 * 1024;
+
+/// The largest UCMF answer the AMF reads (#1674). A `DicEntryData` (TS 29.675
+/// §6.1.6.2.2) carries a UE radio capability as a binary part, which can be larger
+/// than the NGAP-delivered one the AMF itself assigns from; 1 MiB.
+pub const MAX_UCMF_RESPONSE_BODY: usize = 1024 * 1024;
+
+/// The largest NWDAF answer the AMF reads (#1674). A UE mobility `AnalyticsData`
+/// (TS 29.520 §5.1.6.2.2) is a list of time slots, each with a list of locations
+/// and ratios; 1 MiB.
+pub const MAX_NWDAF_RESPONSE_BODY: usize = 1024 * 1024;
+
+/// The largest answer the AMF reads from every other peer (#1674): AUSF, LMF,
+/// NSACF, and the consumers it notifies. Each answer is a small JSON object: a 5G
+/// AKA vector or an EAP packet (at most 1 500 octets in NAS, TS 24.501 §9.11.2.2),
+/// a location estimate, an admission result per S-NSSAI, or a 204 to a
+/// notification.
+pub const MAX_SMALL_RESPONSE_BODY: usize = 64 * 1024;
+
+/// The response-body cap for answers from a peer of type `nf` (#1674).
+pub(crate) fn max_response_body_for(nf: nextgcore_sbi::types::NfType) -> usize {
+    use nextgcore_sbi::types::NfType;
+    match nf {
+        NfType::Smf => MAX_SMF_RESPONSE_BODY,
+        NfType::Amf => MAX_AMF_RESPONSE_BODY,
+        NfType::Udm => MAX_UDM_RESPONSE_BODY,
+        NfType::Pcf => MAX_PCF_RESPONSE_BODY,
+        NfType::Nrf => MAX_NRF_RESPONSE_BODY,
+        NfType::Ucmf => MAX_UCMF_RESPONSE_BODY,
+        NfType::Nwdaf => MAX_NWDAF_RESPONSE_BODY,
+        _ => MAX_SMALL_RESPONSE_BODY,
+    }
+}
+
+/// A client for `host:port` with the peer SBI profile and response bodies capped
+/// at `max_response_body` (#1636, #1674). No OAuth2: for the NRF itself and for
+/// callers that attach their own.
+pub(crate) fn capped_client(host: &str, port: u16, max_response_body: usize) -> SbiClient {
+    SbiClient::new(
+        nextgcore_sbi::security::sbi_peer_client_config(host, port)
+            .with_max_response_body(max_response_body),
+    )
+}
+
+/// A client for this AMF's NRF at `nrf_uri`: the NRF client TLS (https + this
+/// AMF's certificate for an https NRF URI or the production profile, #1617),
+/// with response bodies capped at `max_response_body` (#1674). `None` for an
+/// unparseable URI.
+pub(crate) fn capped_nrf_client(nrf_uri: &str, max_response_body: usize) -> Option<SbiClient> {
+    nextgcore_sbi::nrf_tls::nrf_client_config_for_uri(nrf_uri)
+        .map(|config| SbiClient::new(config.with_max_response_body(max_response_body)))
+}
+
+/// A client for a peer NF of type `nf` (#1674): the peer SBI profile, OAuth2 scoped
+/// to `nf` when configured, and response bodies capped at
+/// [`max_response_body_for`]`(nf)`. A larger body is refused while it is read.
+pub(crate) fn peer_client(nf: nextgcore_sbi::types::NfType, host: &str, port: u16) -> SbiClient {
+    crate::attach_oauth2(capped_client(host, port, max_response_body_for(nf)), nf)
+}
+
 /// An SMF client: the peer's SBI profile, OAuth2 when configured, and response
 /// bodies capped at [`MAX_SMF_RESPONSE_BODY`] (#1636).
 fn smf_client(smf_host: &str, smf_port: u16) -> SbiClient {
-    crate::attach_oauth2(
-        SbiClient::new(
-            nextgcore_sbi::security::sbi_peer_client_config(smf_host, smf_port)
-                .with_max_response_body(MAX_SMF_RESPONSE_BODY),
-        ),
-        nextgcore_sbi::types::NfType::Smf,
-    )
+    peer_client(nextgcore_sbi::types::NfType::Smf, smf_host, smf_port)
 }
 
 /// SM Context Update response from SMF (with optional N1/N2 info)
@@ -2152,10 +2228,7 @@ pub async fn call_ausf_authenticate_with_resync(
         resync.is_some()
     );
 
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(ausf_host, ausf_port),
-        nextgcore_sbi::types::NfType::Ausf,
-    );
+    let client = peer_client(nextgcore_sbi::types::NfType::Ausf, ausf_host, ausf_port);
 
     let mut body = serde_json::json!({
         "supiOrSuci": suci,
@@ -2239,10 +2312,7 @@ pub async fn call_ausf_5g_aka_confirm(
     // RES* is authentication material: never logged, not even a prefix.
     log::info!("Calling AUSF 5G-AKA confirmation: ctx_id={auth_ctx_id}");
 
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(ausf_host, ausf_port),
-        nextgcore_sbi::types::NfType::Ausf,
-    );
+    let client = peer_client(nextgcore_sbi::types::NfType::Ausf, ausf_host, ausf_port);
 
     let body = serde_json::json!({
         "resStar": hex::encode(res_star)
@@ -2484,8 +2554,7 @@ async fn peer_amf_from_nrf(
 ) -> Option<(String, u16)> {
     let sbi_ctx = global_context();
     let nrf_uri = sbi_ctx.get_nrf_uri().await?;
-    let (nrf_host, nrf_port) = parse_host_port(&nrf_uri)?;
-    let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
+    let client = capped_nrf_client(&nrf_uri, MAX_NRF_RESPONSE_BODY)?;
 
     // `guami` is a JSON-valued query parameter (`content: application/json` in
     // TS 29.510), so it is percent-encoded rather than interpolated raw — `{`, `"`
@@ -2642,10 +2711,7 @@ pub async fn call_amf_ue_context_transfer(
          (reason={reason}, accessType={access_type})"
     );
 
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(peer_host, peer_port),
-        nextgcore_sbi::types::NfType::Amf,
-    );
+    let client = peer_client(nextgcore_sbi::types::NfType::Amf, peer_host, peer_port);
 
     let mut body = serde_json::json!({
         "reason": reason,
@@ -2759,10 +2825,7 @@ pub async fn call_amf_registration_status_update(
          {ue_context_id} (transferStatus={status})"
     );
 
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(peer_host, peer_port),
-        nextgcore_sbi::types::NfType::Amf,
-    );
+    let client = peer_client(nextgcore_sbi::types::NfType::Amf, peer_host, peer_port);
 
     let response = client
         .post_json(
@@ -3205,10 +3268,7 @@ pub async fn call_lmf_determine_location(
         input["correlationID"] = corr.clone();
     }
 
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(&lmf_host, lmf_port),
-        nextgcore_sbi::types::NfType::Lmf,
-    );
+    let client = peer_client(nextgcore_sbi::types::NfType::Lmf, &lmf_host, lmf_port);
     let response = client
         .post_json("/nlmf-loc/v1/determine-location", &input)
         .await
@@ -3313,10 +3373,7 @@ pub async fn call_lmf_cancel_location(
     }
     log::debug!("Cancelling LDR [{ldr_reference}] for [{supi}] at LMF {lmf_host}:{lmf_port}");
 
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(lmf_host, lmf_port),
-        nextgcore_sbi::types::NfType::Lmf,
-    );
+    let client = peer_client(nextgcore_sbi::types::NfType::Lmf, lmf_host, lmf_port);
     let response = client
         .post_json("/nlmf-loc/v1/cancel-location", &body)
         .await
@@ -3414,7 +3471,7 @@ pub async fn notify_amf_status_change(status_change: &str) {
             continue;
         };
         let client = crate::attach_oauth2(
-            SbiClient::for_peer(&host, port),
+            capped_client(&host, port, MAX_SMALL_RESPONSE_BODY),
             nextgcore_sbi::types::NfType::Nrf,
         );
         match tokio::time::timeout(
@@ -3706,10 +3763,7 @@ pub async fn call_udm_uecm_registration(
     guami_plmn_mnc: &str,
     amf_id_hex: &str,
 ) -> SbiResult<()> {
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(udm_host, udm_port),
-        nextgcore_sbi::types::NfType::Udm,
-    );
+    let client = peer_client(nextgcore_sbi::types::NfType::Udm, udm_host, udm_port);
 
     let body = serde_json::json!({
         "amfInstanceId": amf_instance_id,
@@ -3802,10 +3856,7 @@ pub async fn call_udm_sdm_get_am_data(
     udm_port: u16,
     supi: &str,
 ) -> SbiResult<AmDataResponse> {
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(udm_host, udm_port),
-        nextgcore_sbi::types::NfType::Udm,
-    );
+    let client = peer_client(nextgcore_sbi::types::NfType::Udm, udm_host, udm_port);
     let path = format!("/nudm-sdm/v2/{supi}/am-data");
     let response = client
         .get(&path)
@@ -3899,10 +3950,7 @@ pub async fn call_udm_sdm_subscribe(
     supi: &str,
     amf_instance_id: &str,
 ) -> SbiResult<String> {
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(udm_host, udm_port),
-        nextgcore_sbi::types::NfType::Udm,
-    );
+    let client = peer_client(nextgcore_sbi::types::NfType::Udm, udm_host, udm_port);
 
     let body = serde_json::json!({
         "nfInstanceId": amf_instance_id,
@@ -3953,10 +4001,7 @@ pub async fn call_pcf_am_policy_create(
     // #1518: the token for the association's `notificationUri`.
     notify_token: &str,
 ) -> SbiResult<String> {
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(pcf_host, pcf_port),
-        nextgcore_sbi::types::NfType::Pcf,
-    );
+    let client = peer_client(nextgcore_sbi::types::NfType::Pcf, pcf_host, pcf_port);
 
     let body = serde_json::json!({
         "notificationUri": am_policy_notification_uri(supi, Some(notify_token)),
@@ -4036,10 +4081,7 @@ pub async fn call_pcf_ue_policy_create(
     // #1518: the token for the association's `notificationUri`.
     notify_token: &str,
 ) -> SbiResult<String> {
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(pcf_host, pcf_port),
-        nextgcore_sbi::types::NfType::Pcf,
-    );
+    let client = peer_client(nextgcore_sbi::types::NfType::Pcf, pcf_host, pcf_port);
 
     let mut body = serde_json::json!({
         // #92: ABSOLUTE and scheme-derived (was a relative path the PCF could not POST
@@ -4113,10 +4155,7 @@ pub async fn call_pcf_ue_policy_delete(
     pcf_port: u16,
     pol_asso_id: &str,
 ) -> SbiResult<()> {
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(pcf_host, pcf_port),
-        nextgcore_sbi::types::NfType::Pcf,
-    );
+    let client = peer_client(nextgcore_sbi::types::NfType::Pcf, pcf_host, pcf_port);
 
     let response = client
         .delete(&format!(
@@ -4174,10 +4213,7 @@ pub async fn call_pcf_am_policy_update_serving_amf(
     notification_uri: &str,
     guami: &serde_json::Value,
 ) -> SbiResult<()> {
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(pcf_host, pcf_port),
-        nextgcore_sbi::types::NfType::Pcf,
-    );
+    let client = peer_client(nextgcore_sbi::types::NfType::Pcf, pcf_host, pcf_port);
     let body = serde_json::json!({ "notificationUri": notification_uri, "guami": guami });
     let response = client
         .post_json(
@@ -4207,10 +4243,7 @@ pub async fn call_pcf_ue_policy_update_serving_amf(
     guami: &serde_json::Value,
     serving_nf_id: &str,
 ) -> SbiResult<()> {
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(pcf_host, pcf_port),
-        nextgcore_sbi::types::NfType::Pcf,
-    );
+    let client = peer_client(nextgcore_sbi::types::NfType::Pcf, pcf_host, pcf_port);
     let body = serde_json::json!({
         "notificationUri": notification_uri,
         "guami": guami,
@@ -4239,10 +4272,7 @@ pub async fn call_udm_sdm_unsubscribe(
     supi: &str,
     subscription_id: &str,
 ) -> SbiResult<()> {
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(udm_host, udm_port),
-        nextgcore_sbi::types::NfType::Udm,
-    );
+    let client = peer_client(nextgcore_sbi::types::NfType::Udm, udm_host, udm_port);
     let response = client
         .delete(&format!(
             "/nudm-sdm/v2/{supi}/sdm-subscriptions/{subscription_id}"
@@ -4267,10 +4297,7 @@ pub async fn call_pcf_am_policy_delete(
     pcf_port: u16,
     pol_asso_id: &str,
 ) -> SbiResult<()> {
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(pcf_host, pcf_port),
-        nextgcore_sbi::types::NfType::Pcf,
-    );
+    let client = peer_client(nextgcore_sbi::types::NfType::Pcf, pcf_host, pcf_port);
 
     let response = client
         .delete(&format!(
@@ -4319,10 +4346,7 @@ pub async fn call_nsacf_ue_admission(
     access_type: &str,
     update_flag: bool,
 ) -> SbiResult<NsacfUeAdmissionResult> {
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(nsacf_host, nsacf_port),
-        nextgcore_sbi::types::NfType::Nsacf,
-    );
+    let client = peer_client(nextgcore_sbi::types::NfType::Nsacf, nsacf_host, nsacf_port);
 
     let mut snssai = serde_json::json!({ "sst": snssai_sst });
     if let Some(sd) = snssai_sd {
@@ -4392,10 +4416,7 @@ pub async fn call_udm_uecm_deregistration(
     udm_port: u16,
     supi: &str,
 ) -> SbiResult<()> {
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(udm_host, udm_port),
-        nextgcore_sbi::types::NfType::Udm,
-    );
+    let client = peer_client(nextgcore_sbi::types::NfType::Udm, udm_host, udm_port);
 
     let body = serde_json::json!({ "purgeFlag": true });
     let path = format!("/nudm-uecm/v1/{supi}/registrations/amf-3gpp-access");
@@ -4557,7 +4578,7 @@ pub async fn discover_smf_by_pgw(
     };
     // #1617: the NRF client TLS (https + this NF's certificate) for an https
     // NRF URI or the production profile.
-    let client = SbiClient::for_nrf_uri(&nrf_uri)
+    let client = capped_nrf_client(&nrf_uri, MAX_NRF_RESPONSE_BODY)
         .ok_or_else(|| format!("NRF URI {nrf_uri:?} is unusable"))?;
 
     let query = match (pgw_fqdn, pgw_ipv4) {
@@ -7288,5 +7309,364 @@ mod tests_peer_host_kind_1324 {
                 Some((dialled_host(host), 7792))
             );
         }
+    }
+}
+
+/// #1674: every peer client caps its answer bodies at the size its largest
+/// legitimate answer needs.
+#[cfg(test)]
+mod body_cap_tests {
+    use super::*;
+    use nextgcore_sbi::types::NfType;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// A JSON object `base` padded with a `pad` member to exactly `len` octets.
+    fn padded(base: &serde_json::Value, len: usize) -> String {
+        let mut s = base.to_string();
+        assert_eq!(s.pop(), Some('}'), "an object");
+        let sep = if s.len() > 1 { "," } else { "" };
+        let frame = s.len() + sep.len() + "\"pad\":\"\"}".len();
+        assert!(len >= frame, "{len} leaves room for the frame");
+        format!("{s}{sep}\"pad\":\"{}\"}}", "x".repeat(len - frame))
+    }
+
+    /// A stand-in peer answering every request with `status` and `base` padded to
+    /// the length last stored in `len`.
+    async fn padded_peer(
+        status: u16,
+        base: serde_json::Value,
+    ) -> (nextgcore_sbi::server::SbiServer, u16, Arc<AtomicUsize>) {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let len = Arc::new(AtomicUsize::new(0));
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        let (l, b) = (len.clone(), base);
+        server
+            .start(move |_req: SbiRequest| {
+                let body = padded(&b, l.load(Ordering::SeqCst));
+                async move { SbiResponse::with_status(status).with_body(body, "application/json") }
+            })
+            .await
+            .expect("stand-in peer starts");
+        (server, addr.port(), len)
+    }
+
+    fn over_the_cap<T>(r: &Result<T, String>) -> bool {
+        r.as_ref().err().is_some_and(|e| e.contains("byte limit"))
+    }
+
+    /// Runs `call` with an answer of exactly `cap` octets, which must not be refused
+    /// for its size, then with `cap + 1`, which must be.
+    async fn assert_capped_at<T, F, Fut>(what: &str, len: &AtomicUsize, cap: usize, call: F)
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<T, String>>,
+    {
+        len.store(cap, Ordering::SeqCst);
+        let at = call().await;
+        assert!(!over_the_cap(&at), "{what}: a {cap}-octet answer is read");
+        len.store(cap + 1, Ordering::SeqCst);
+        let over = call().await;
+        assert!(
+            over_the_cap(&over),
+            "{what}: a {}-octet answer is refused",
+            cap + 1
+        );
+    }
+
+    fn s<T>(r: SbiResult<T>) -> Result<T, String> {
+        r.map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn each_peer_type_has_the_cap_its_largest_answer_needs() {
+        assert_eq!(max_response_body_for(NfType::Smf), 256 * 1024);
+        assert_eq!(max_response_body_for(NfType::Amf), 1024 * 1024);
+        assert_eq!(max_response_body_for(NfType::Udm), 256 * 1024);
+        assert_eq!(max_response_body_for(NfType::Pcf), 1024 * 1024);
+        assert_eq!(max_response_body_for(NfType::Nrf), 4 * 1024 * 1024);
+        assert_eq!(max_response_body_for(NfType::Ucmf), 1024 * 1024);
+        assert_eq!(max_response_body_for(NfType::Nwdaf), 1024 * 1024);
+        for small in [NfType::Ausf, NfType::Lmf, NfType::Nsacf, NfType::Nssf] {
+            assert_eq!(max_response_body_for(small), 64 * 1024, "{small:?}");
+        }
+        // The SMF's cap still admits the largest N1 a payload container carries.
+        const { assert!(MAX_SMF_RESPONSE_BODY > crate::gmm_build::MAX_PAYLOAD_CONTAINER_LEN * 2) };
+    }
+
+    /// No client in the crate is built uncapped: every one comes from `peer_client` or
+    /// `capped_client`, or from `notify_client`, which caps itself. Tests may still
+    /// dial their loopback stand-ins with `with_host_port("127.0.0.1", ..)`.
+    #[test]
+    fn no_peer_client_is_built_without_a_body_cap() {
+        fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("src readable").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        sources(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        assert!(files.len() > 30, "the crate's sources were found");
+        // Spelled in pieces so this test does not find itself.
+        let uncapped = [
+            concat!("SbiClient::", "for_peer("),
+            concat!(".get_", "client("),
+        ];
+        let unpinned = concat!("with_host_", "port(");
+        for file in &files {
+            let src = std::fs::read_to_string(file).expect("readable");
+            for (n, line) in src.lines().enumerate() {
+                for banned in uncapped {
+                    assert!(
+                        !line.contains(banned),
+                        "{}:{}: `{banned}` builds a client with no response-body cap",
+                        file.display(),
+                        n + 1
+                    );
+                }
+                if let Some(at) = line.find(unpinned) {
+                    assert!(
+                        line[at + unpinned.len()..].starts_with("\"127.0.0.1\""),
+                        "{}:{}: an uncapped client to a non-loopback peer",
+                        file.display(),
+                        n + 1
+                    );
+                }
+            }
+        }
+        let src = include_str!("namf_server.rs");
+        let notify = &src[src.find("fn notify_client(").expect("notify_client")..];
+        let notify = &notify[..notify.find("\n}\n").expect("its end")];
+        assert!(
+            notify.contains("with_max_response_body(crate::sbi_path::MAX_SMALL_RESPONSE_BODY)"),
+            "notify_client caps its answers"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_client_refuses_a_body_over_its_peer_types_cap() {
+        let (server, port, len) = padded_peer(200, serde_json::json!({})).await;
+        for nf in [NfType::Ausf, NfType::Udm, NfType::Amf, NfType::Nrf] {
+            let cap = max_response_body_for(nf);
+            assert_capped_at(&format!("{nf:?}"), &len, cap, || async {
+                peer_client(nf, "127.0.0.1", port)
+                    .get("/x")
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .await;
+        }
+        server.stop().await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn the_ausf_answers_are_capped() {
+        let (server, port, len) = padded_peer(
+            201,
+            serde_json::json!({ "5gAuthData": {
+                "rand": "00".repeat(16), "autn": "00".repeat(16), "hxresStar": "00".repeat(16)
+            }, "authResult": "AUTHENTICATION_SUCCESS", "kseaf": "00".repeat(32) }),
+        )
+        .await;
+        assert_capped_at("authenticate", &len, MAX_SMALL_RESPONSE_BODY, || async {
+            s(call_ausf_authenticate_with_resync(
+                "127.0.0.1",
+                port,
+                "suci-0-001-01-0-0-0-1",
+                "5G:mnc001.mcc001.3gppnetwork.org",
+                None,
+            )
+            .await)
+        })
+        .await;
+        assert_capped_at(
+            "5G AKA confirmation",
+            &len,
+            MAX_SMALL_RESPONSE_BODY,
+            || async { s(call_ausf_5g_aka_confirm("127.0.0.1", port, "ctx-1674", &[0; 16]).await) },
+        )
+        .await;
+        server.stop().await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn the_peer_amf_answers_are_capped() {
+        let (server, port, len) = padded_peer(200, serde_json::json!({ "ueContext": {} })).await;
+        let guti = crate::context::Guti5gs::default();
+        assert_capped_at("UEContextTransfer", &len, MAX_AMF_RESPONSE_BODY, || async {
+            s(call_amf_ue_context_transfer(
+                "127.0.0.1",
+                port,
+                &guti,
+                "INIT_REG",
+                "3GPP_ACCESS",
+                None,
+            )
+            .await)
+        })
+        .await;
+        assert_capped_at(
+            "RegistrationStatusUpdate",
+            &len,
+            MAX_AMF_RESPONSE_BODY,
+            || async {
+                s(call_amf_registration_status_update("127.0.0.1", port, &guti, true).await)
+            },
+        )
+        .await;
+        server.stop().await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn the_udm_answers_are_capped() {
+        let (server, port, len) =
+            padded_peer(201, serde_json::json!({ "subscriptionId": "s" })).await;
+        let cap = MAX_UDM_RESPONSE_BODY;
+        assert_capped_at("UECM registration", &len, cap, || async {
+            s(call_udm_uecm_registration(
+                "127.0.0.1",
+                port,
+                "imsi-1674",
+                "amf",
+                "t",
+                "001",
+                "01",
+                "020040",
+            )
+            .await)
+        })
+        .await;
+        assert_capped_at("SDM am-data", &len, cap, || async {
+            s(call_udm_sdm_get_am_data("127.0.0.1", port, "imsi-1674")
+                .await
+                .map(|_| ()))
+        })
+        .await;
+        assert_capped_at("SDM subscribe", &len, cap, || async {
+            s(call_udm_sdm_subscribe("127.0.0.1", port, "imsi-1674", "amf").await)
+        })
+        .await;
+        assert_capped_at("SDM unsubscribe", &len, cap, || async {
+            s(call_udm_sdm_unsubscribe("127.0.0.1", port, "imsi-1674", "s").await)
+        })
+        .await;
+        assert_capped_at("UECM deregistration", &len, cap, || async {
+            s(call_udm_uecm_deregistration("127.0.0.1", port, "imsi-1674").await)
+        })
+        .await;
+        server.stop().await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn the_pcf_answers_are_capped() {
+        let (server, port, len) = padded_peer(201, serde_json::json!({})).await;
+        let cap = MAX_PCF_RESPONSE_BODY;
+        let guami = serde_json::json!({});
+        assert_capped_at("AM policy create", &len, cap, || async {
+            s(call_pcf_am_policy_create("127.0.0.1", port, "imsi-1674", "001", "01", "t").await)
+        })
+        .await;
+        assert_capped_at("UE policy create", &len, cap, || async {
+            s(call_pcf_ue_policy_create(
+                "127.0.0.1",
+                port,
+                "imsi-1674",
+                "001",
+                "01",
+                "001",
+                "01",
+                "020040",
+                None,
+                "t",
+            )
+            .await)
+        })
+        .await;
+        assert_capped_at("UE policy delete", &len, cap, || async {
+            s(call_pcf_ue_policy_delete("127.0.0.1", port, "p").await)
+        })
+        .await;
+        assert_capped_at("AM policy update", &len, cap, || async {
+            s(
+                call_pcf_am_policy_update_serving_amf("127.0.0.1", port, "p", "http://a/n", &guami)
+                    .await,
+            )
+        })
+        .await;
+        assert_capped_at("UE policy update", &len, cap, || async {
+            s(call_pcf_ue_policy_update_serving_amf(
+                "127.0.0.1",
+                port,
+                "p",
+                "http://a/n",
+                &guami,
+                "amf",
+            )
+            .await)
+        })
+        .await;
+        assert_capped_at("AM policy delete", &len, cap, || async {
+            s(call_pcf_am_policy_delete("127.0.0.1", port, "p").await)
+        })
+        .await;
+        server.stop().await.expect("stop");
+    }
+
+    /// The NSACF degrades open on a failed exchange, so a refused body admits where
+    /// the padded partial-failure answer, read whole, would not.
+    #[tokio::test]
+    async fn the_nsacf_answer_is_capped() {
+        let (server, port, len) = padded_peer(
+            200,
+            serde_json::json!({ "acuFailureList": { "imsi-1674": [{ "reason": "EXCEED_MAX_UE_NUM" }] } }),
+        )
+        .await;
+        let admit = || async {
+            call_nsacf_ue_admission(
+                "127.0.0.1",
+                port,
+                "amf",
+                "imsi-1674",
+                1,
+                None,
+                "3GPP_ACCESS",
+                true,
+            )
+            .await
+            .expect("an answer")
+            .admitted
+        };
+        len.store(MAX_SMALL_RESPONSE_BODY, Ordering::SeqCst);
+        assert!(!admit().await, "read whole: the failure list refuses");
+        len.store(MAX_SMALL_RESPONSE_BODY + 1, Ordering::SeqCst);
+        assert!(admit().await, "refused for its size: degrade-open admits");
+        server.stop().await.expect("stop");
+    }
+
+    /// The NRF discovery by PGW-C, at a stand-in NRF through the module's own
+    /// override (CONTEXT_GUARD held, as its setters must).
+    #[tokio::test]
+    async fn the_nrf_discovery_answer_is_capped() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        let (server, port, len) = padded_peer(200, serde_json::json!({ "nfInstances": [] })).await;
+        set_pgw_discovery_nrf_for_test(Some(format!("http://127.0.0.1:{port}")));
+        assert_capped_at("SMF discovery", &len, MAX_NRF_RESPONSE_BODY, || async {
+            discover_smf_by_pgw(Some("pgw.1674.example"), None).await
+        })
+        .await;
+        set_pgw_discovery_nrf_for_test(None);
+        server.stop().await.expect("stop");
     }
 }

@@ -169,7 +169,7 @@ pub async fn create_dns_context(
             .collect::<Vec<_>>(),
     });
 
-    let client = SbiClient::with_host_port(&host, port);
+    let client = easdf_client(&host, port);
     match client
         .post_json("/neasdf-dnscontext/v1/dns-contexts", &body)
         .await
@@ -228,6 +228,22 @@ pub async fn create_dns_context(
     }
 }
 
+/// #1648: a client for a Neasdf_DNSContext service operation (TS 29.556 §5.2.2) at
+/// `host:port`. It honours the SBI security profile (`https` with this SMF's client
+/// certificate under `production`; before #1648 this was a cleartext
+/// `with_host_port` client in every profile), and carries an NRF-issued token when
+/// OAuth2 enforcement is on (TS 33.501 §13.4.1.1.2, TS 29.500 §6.7.3).
+///
+/// With enforcement on it is the per-peer cached tokened client (review M1);
+/// off, a fresh client per call, as before.
+fn easdf_client(host: &str, port: u16) -> std::sync::Arc<SbiClient> {
+    crate::tokened_peer_client(
+        nextgcore_sbi::security::sbi_peer_client_config(host, port),
+        nextgcore_sbi::types::NfType::Easdf,
+    )
+    .unwrap_or_else(|| std::sync::Arc::new(SbiClient::for_peer(host, port)))
+}
+
 /// Delete a session's DNS context at release (#114).
 ///
 /// Best-effort: a failure leaves an orphaned context on the EASDF, which its own
@@ -239,7 +255,7 @@ pub async fn delete_dns_context(supi: &str, ctx_id: &str) {
         log::warn!("[{supi}] cannot delete EASDF DNS context {ctx_id}: no EASDF discoverable");
         return;
     };
-    let client = SbiClient::with_host_port(&host, port);
+    let client = easdf_client(&host, port);
     let path = format!("/neasdf-dnscontext/v1/dns-contexts/{ctx_id}");
     match client.delete(&path).await {
         Ok(resp) => log::info!(
@@ -393,9 +409,11 @@ pub(crate) mod tests {
         use nextgcore_sbi::message::SbiResponse;
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
         use std::net::SocketAddr;
-        // A plaintext NRF: the dev profile, or #1617's NRF client dials https.
-        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
 
+        // #1648: the EASDF and NRF clients honour the SBI profile, and these are
+        // loopback plaintext peers (a dev deployment). Set and left set, as every
+        // other loopback-plaintext test in this crate does.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let seen: SeenRequests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
         // EASDF: 201 + Location + dnsContextId on create, 204 on delete.

@@ -31,6 +31,13 @@ static DISCOVERY_FAILURE: AtomicU64 = AtomicU64::new(0);
 static DISCOVERY_EMPTY: AtomicU64 = AtomicU64::new(0);
 static TOKENS_GRANTED: AtomicU64 = AtomicU64::new(0);
 static TOKENS_DENIED: AtomicU64 = AtomicU64::new(0);
+static CCA_KEY_CONFLICTS: AtomicU64 = AtomicU64::new(0);
+
+/// Count one NF whose CCA trusted keys conflict (#1633): two case-variant entries
+/// with different keys, so its CCA is refused. Called once per NF.
+pub fn observe_cca_key_conflict() {
+    CCA_KEY_CONFLICTS.fetch_add(1, Ordering::Relaxed);
+}
 
 /// What an NRF request was, for the outcome counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,6 +219,13 @@ pub fn render_nrf_families(
         out,
         "nrf_access_tokens_total{{result=\"denied\"}} {}",
         get(&TOKENS_DENIED)
+    );
+    write_metric(
+        out,
+        "nrf_cca_trusted_key_conflicts_total",
+        "counter",
+        "NFs whose CCA trusted keys conflict (differently cased IDs, different keys), so their CCA is refused",
+        get(&CCA_KEY_CONFLICTS),
     );
 }
 
