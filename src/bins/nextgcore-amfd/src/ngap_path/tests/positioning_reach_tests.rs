@@ -123,6 +123,8 @@ async fn a_connected_ue_is_reachable_for_namf_mt() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cm_idle_ues_positioning_transfer_pages_it_and_waits() {
     let _q = crate::test_support::POSITIONING_DL_LOCK.lock().await;
+    // #1588: this page reads the paging strategy.
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran, supi) = (7_108_703u64, 89, "imsi-001010010870003");
     idle_ue(&mut server, ue, ran, supi);

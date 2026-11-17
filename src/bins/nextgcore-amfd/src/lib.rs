@@ -95,6 +95,33 @@ pub mod test_support {
     /// [`CONNECTED_DOWNLINK_LOCK`].
     pub static POSITIONING_DL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    /// Serialises tests that set the process-global paging strategy
+    /// (`AmfContext::paging_strategy`, read by every page the AMF queues) with tests
+    /// that queue a page under the default (#1588). Under `nwdaf-mobility` a page
+    /// queued by another test waits for an NWDAF query, counts into the
+    /// process-global hint outcomes, and takes an in-flight permit; under
+    /// `recommended-first` it is paged on stored cells. `CONTEXT_GUARD` does not
+    /// cover it: the downlink tests that page hold their own queue locks instead.
+    /// Take it last, after any other lock, and take no other lock while holding it,
+    /// so a holder never waits on another. Sync tests take it with
+    /// `blocking_lock()`.
+    pub static PAGING_STRATEGY_LOCK: Mutex<()> = Mutex::const_new(());
+
+    /// Test-only enforcement of [`PAGING_STRATEGY_LOCK`] (#1588 review): every reader
+    /// of the paging strategy calls this, and it panics when nobody holds the lock.
+    /// A test that reads the strategy without the lock then fails deterministically
+    /// whenever it runs alone, and in most parallel runs too.
+    #[cfg(test)]
+    #[track_caller]
+    pub(crate) fn assert_paging_strategy_lock_held() {
+        if PAGING_STRATEGY_LOCK.try_lock().is_ok() {
+            panic!(
+                "the paging strategy was read with PAGING_STRATEGY_LOCK free: take it in \
+                 this test (#1588)"
+            );
+        }
+    }
+
     /// Serialises tests that set the AUSF endpoint environment variables
     /// (`AUSF_SBI_ADDR` / `AUSF_SBI_PORT`), for the same reason as
     /// [`SMF_ENV_LOCK`].
@@ -1684,6 +1711,7 @@ mod tests {
     async fn the_config_loader_applies_the_paging_strategy() {
         use std::io::Write;
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         context::amf_context_init(64, 1024, 4096);
         let strategy = || {
             context::amf_self()
