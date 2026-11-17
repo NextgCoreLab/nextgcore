@@ -3076,6 +3076,12 @@ pub(crate) struct EventSubscriptionGuard(String);
 
 #[cfg(test)]
 impl EventSubscriptionGuard {
+    /// The subscription `id`, for a test that subscribed through the handler
+    /// function rather than over HTTP (#1640).
+    pub(crate) fn id(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
     /// The subscription a `201 Created` from `/namf-evts/v1/subscriptions` names.
     ///
     /// # Panics
@@ -12145,6 +12151,8 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status, 201);
+        // #1640: an any-UE subscription, removed when the test ends.
+        let _subscription = EventSubscriptionGuard::of(&resp);
         let body = body_json(&resp);
         let report = &body["reportList"][0];
         assert_eq!(
