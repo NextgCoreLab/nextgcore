@@ -32,10 +32,23 @@
 //! request is bounded at 3 s: the UDR ones by `client_for`, the NRF discovery by
 //! [`DISCOVERY_TIMEOUT`]. Startup does not wait for it, it checks the shutdown flags
 //! at least every [`STOP_POLL`], and it starts no POST once shutdown is requested.
+//!
+//! # The notification URI's token (#1518)
+//!
+//! Each subscription gets its own [`CallbackToken`], minted by [`subscribe_once`]
+//! and carried in its `notificationUri`
+//! (`{apiRoot}/npcf-callback/v1/policy-data-change-notify/{token}`). A renewal PUTs
+//! the same URI, so the token lives as long as the subscription; a new subscription
+//! (after a loss, an expiry or a UDR switch) gets a new one. The router acts on a
+//! notification only when [`admits_notification`] accepts its token: the held
+//! subscription's, or the one being created, whose POST may be answered after the
+//! UDR's first notification is sent. Neither survives the subscription, so a
+//! previous subscription the UDR still holds (a failed DELETE) notifies into a 404.
 
 use std::sync::Mutex;
 use std::time::Duration;
 
+use nextgcore_sbi::callback_auth::CallbackToken;
 use nextgcore_sbi::datetime::{now_epoch_secs, rfc3339_to_epoch};
 use nextgcore_sbi::types::NfType;
 
@@ -68,7 +81,7 @@ pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 const RENEW_LEAD_MAX_SECS: u64 = 60;
 
 /// A subscription the UDR has confirmed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Subscription {
     /// The UDR the subscription was created at. Renewal, audit and DELETE go here,
     /// never to whichever UDR discovery happens to return at that moment.
@@ -81,6 +94,8 @@ pub struct Subscription {
     pub expiry: Option<u64>,
     /// When it was confirmed or last renewed (epoch seconds).
     pub granted_at: u64,
+    /// The token in its `notificationUri` (#1518), kept across renewals.
+    pub notify_token: CallbackToken,
 }
 
 /// The subscription currently held, for shutdown and for tests.
@@ -91,8 +106,53 @@ pub fn current() -> Option<Subscription> {
     CURRENT.lock().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
+/// The token of the subscription [`subscribe_once`] is creating (#1518): set before
+/// its POST, cleared when the attempt ends. The UDR may notify before it answers the
+/// POST, and that notification must not be lost.
+static CREATING: Mutex<Option<CallbackToken>> = Mutex::new(None);
+
+fn set_creating(token: Option<CallbackToken>) {
+    *CREATING.lock().unwrap_or_else(|p| p.into_inner()) = token;
+}
+
+/// Record `sub` as the held subscription. Its creation, if it was being created,
+/// is over: its token is now admitted as the held one's.
 fn set_current(sub: Option<Subscription>) {
     *CURRENT.lock().unwrap_or_else(|p| p.into_inner()) = sub;
+    set_creating(None);
+}
+
+/// Whether `presented` is the token of the subscription this PCF holds or is
+/// creating (#1518). Every policy-data notification is checked here, whatever
+/// admitted the request.
+pub fn admits_notification(presented: &str) -> bool {
+    let held = CURRENT
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .is_some_and(|sub| sub.notify_token.matches(presented));
+    held || CREATING
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .is_some_and(|token| token.matches(presented))
+}
+
+/// The notification path of a token admitted for the life of a test process, for
+/// the tests that drive the router in process (`test_support::policy_data_notify_path`).
+/// No in-process test creates, holds or drops a subscription (the maintainer is
+/// tested on the real binary, in `tests/policy_data_subscription.rs`), so nothing
+/// replaces it. Never called by the daemon: it is not reachable from the wire, and
+/// a running pcfd's maintainer clears it with its first subscription.
+#[doc(hidden)]
+pub fn test_notify_path() -> String {
+    let mut creating = CREATING.lock().unwrap_or_else(|p| p.into_inner());
+    let token = creating.get_or_insert_with(CallbackToken::mint);
+    format!(
+        "{}/{}",
+        crate::sbi_path::POLICY_DATA_NOTIFY_PATH,
+        token.as_str()
+    )
 }
 
 /// The pause between two audits: [`AUDIT_ENV`] when it parses to at least 1 s,
@@ -144,7 +204,8 @@ pub enum Attempt {
 /// arrives during a slow discovery never creates a subscription at the UDR that the
 /// PCF would then have no time to record and delete.
 pub async fn subscribe_once(stopping: &impl Fn() -> bool) -> Attempt {
-    let Some(notification_uri) = policy_data_notify_uri() else {
+    let notify_token = CallbackToken::mint();
+    let Some(notification_uri) = policy_data_notify_uri(&notify_token) else {
         return Attempt::NotYet("no advertised SBI address for the notification URI");
     };
     // #1621 review M1: `pcf_discover_udrs` also remembers the UDR, with its NF
@@ -161,14 +222,19 @@ pub async fn subscribe_once(stopping: &impl Fn() -> bool) -> Attempt {
         return Attempt::NotYet("shutting down");
     }
     let body = policy_data_subscription_body(&notification_uri);
+    set_creating(Some(notify_token.clone()));
     let resp = match client_for(&udr, NfType::Udr)
         .post_json("/nudr-dr/v2/policy-data/subs-to-notify", &body)
         .await
     {
         Ok(resp) => resp,
-        Err(e) => return Attempt::Failed(format!("POST subs-to-notify failed: {e}")),
+        Err(e) => {
+            set_creating(None);
+            return Attempt::Failed(format!("POST subs-to-notify failed: {e}"));
+        }
     };
     if resp.status != 201 {
+        set_creating(None);
         return Attempt::Failed(format!("the UDR answered {} to the subscribe", resp.status));
     }
     let resource = resp
@@ -181,7 +247,7 @@ pub async fn subscribe_once(stopping: &impl Fn() -> bool) -> Attempt {
     log::info!(
         "Subscribed to UDR policy-data changes; notifications arrive at {} (subscription {}, \
          expiry {})",
-        nextgcore_sbi::log_redact::redact_last_segment(&notification_uri),
+        nextgcore_sbi::log_redact::redact_callback_tokens(&notification_uri),
         resource.as_deref().unwrap_or("<no Location>"),
         expiry.map_or("none".to_string(), |e| e.to_string()),
     );
@@ -190,6 +256,7 @@ pub async fn subscribe_once(stopping: &impl Fn() -> bool) -> Attempt {
         resource,
         expiry,
         granted_at: now_epoch_secs(),
+        notify_token,
     })
 }
 
@@ -209,7 +276,9 @@ pub async fn renew(sub: &Subscription) -> Check {
     let Some(resource) = sub.resource.as_deref() else {
         return Check::Held(sub.expiry);
     };
-    let Some(notification_uri) = policy_data_notify_uri() else {
+    // The same URI, token included: the subscription the UDR renews is the one
+    // whose notifications this PCF admits.
+    let Some(notification_uri) = policy_data_notify_uri(&sub.notify_token) else {
         return Check::Unknown("no advertised SBI address".into());
     };
     let body = policy_data_subscription_body(&notification_uri);

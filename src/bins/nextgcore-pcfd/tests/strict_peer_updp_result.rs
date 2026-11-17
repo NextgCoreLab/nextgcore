@@ -45,7 +45,11 @@ fn seed_pending_association(pti: u8) -> String {
 /// UE-policy uplink message: amfd's REAL multipart builder (class "UPDP"),
 /// targeting pcfd's callback path for `pol_asso_id`.
 fn amfd_notify_request(pol_asso_id: &str, n1_payload: &[u8]) -> nextgcore_sbi::message::SbiRequest {
-    let path = format!("/npcf-ue-policy-control/v1/notify/{pol_asso_id}/n1-message-notify");
+    let path = nextgcore_pcfd::sbi_path::ue_policy_callback_path(
+        pol_asso_id,
+        nextgcore_pcfd::ue_policy::UePolicyCallback::N1MessageNotify,
+    )
+    .expect("the association's tokened callback path");
     build_n1_message_notify_request(
         &path,
         Some("n1n2sub-test"),

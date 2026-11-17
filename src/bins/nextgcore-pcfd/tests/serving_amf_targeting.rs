@@ -336,7 +336,7 @@ async fn subscribe_targets_the_same_serving_amf_as_delivery() {
         let sub = nextgcore_pcfd::sbi_path::pcf_subscribe_ue_policy_notify(
             &assoc.pol_asso_id,
             supi,
-            "http://127.0.0.1:9/npcf-ue-policy-control/v1/notify/x/n1-message-notify",
+            "http://127.0.0.1:9/npcf-ue-policy-control/v1/notify/x/n1-message-notify/t",
         )
         .await
         .expect("subscribe reaches an AMF");
