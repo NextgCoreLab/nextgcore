@@ -6916,7 +6916,9 @@ impl NgapServer {
             let tmsi = state.amf_ue.next_guti.tmsi;
             let sessions = reconciled.map(|r| r.activated).unwrap_or_default();
             let reactivated = sessions.len();
-            if !state.initial_context_setup_request_sent {
+            // #1593: a new NG connection is the UE's CM-IDLE -> CM-CONNECTED.
+            let from_cm_idle = !state.initial_context_setup_request_sent;
+            if from_cm_idle {
                 // A new NG connection: the UE came back from CM-IDLE (#609 resume),
                 // so the gNB holds no UE context and no AS security for it. The
                 // Accept rides an Initial Context Setup together with any session
@@ -7022,7 +7024,19 @@ impl NgapServer {
             // "notification when a specified UE enters or leaves the specified area",
             // `29518-k00.txt:23968-23978`). The emitter applies the §5.3.1 change rule,
             // so a periodic update inside the area sends nothing.
+            //
+            // #1593: an update from CM-IDLE is a connection management state change
+            // too, as the Service Request from CM-IDLE is: CONNECTIVITY_STATE_REPORT
+            // (TS 29.518 §6.2, "report for updated connection management state of a
+            // UE", `29518-k00.txt:24011-24017`) and REACHABILITY_REPORT. Before,
+            // a subscriber saw CM-IDLE at the release and nothing when the UE came
+            // back this way. A connected UE's update changes no CM state, so it fires
+            // neither.
             if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
+                if from_cm_idle {
+                    crate::namf_server::fire_connectivity_state_report(&state.amf_ue, true);
+                    crate::namf_server::fire_reachability_report(&state.amf_ue, true);
+                }
                 crate::namf_server::fire_presence_in_aoi_report(&state.amf_ue);
             }
             self.report_location_change(amf_ue_ngap_id);
@@ -36960,6 +36974,96 @@ mod tests {
         ngap.ue_auth_state.remove(new_id);
         aoi_sink.stop().await.expect("sink stop");
         count_sink.stop().await.expect("sink stop");
+    }
+
+    /// **#1593**, TS 29.518 §6.2 (`29518-k00.txt:24011-24017`): a protected periodic
+    /// registration update from CM-IDLE brings the UE to CM-CONNECTED on a new NG
+    /// connection, so a `CONNECTIVITY_STATE_REPORT` subscriber gets `CONNECTED` and a
+    /// `REACHABILITY_REPORT` subscriber gets `REACHABLE`, as after a Service Request
+    /// from CM-IDLE.
+    ///
+    /// REVERT-VERIFIED: without the two fires on the update-from-CM-IDLE branch, no
+    /// report arrives within 3 s.
+    #[tokio::test]
+    async fn a_registration_update_from_cm_idle_reports_connected_and_reachable_1593() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = capturing_ngap_server().await;
+        let (old_id, new_id) = (15_939_301u64, 15_939_302u64);
+        let tmsi = 0x1593_9301u32;
+        let mut stored = idle_ue_with_security(old_id, tmsi);
+        let supi = stored.amf_ue.supi.clone().expect("supi");
+        stored.amf_ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        stored.amf_ue.nr_tai.tac = 0x74;
+        stored.amf_ue.nr_cgi.plmn_id = PlmnId::new("001", "01");
+        stored.amf_ue.nr_cgi.cell_id = 0x0005_1100;
+        let rr =
+            guti_registration_request(crate::gmm_build::registration_type::PERIODIC_UPDATING, tmsi);
+        let nas = protected_initial_registration(&stored.amf_ue, &rr, &rr, 5);
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_publish(&stored.amf_ue, 51, 1);
+        }
+        ngap.ue_auth_state.insert(old_id, stored);
+
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let mut sinks = Vec::new();
+        let mut rxs = Vec::new();
+        for event in ["CONNECTIVITY_STATE_REPORT", "REACHABILITY_REPORT"] {
+            let (sink, port, rx) = notify_sink().await;
+            let body = serde_json::json!({
+                "eventList": [{ "type": event }],
+                "eventNotifyUri": format!("http://127.0.0.1:{port}/notify/1593"),
+                "notifyCorrelationId": format!("corr-1593-{event}"),
+                "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                "supi": supi,
+            });
+            let resp = crate::namf_server::namf_request_handler(
+                nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
+                    .with_json_body(&serde_json::json!({ "subscription": body }))
+                    .expect("json"),
+            )
+            .await;
+            assert_eq!(resp.status, 201, "the {event} subscription is created");
+            sinks.push(sink);
+            rxs.push(rx);
+        }
+
+        ngap.forced_amf_ue_ngap_id = Some(new_id);
+        let _ = ngap
+            .handle_initial_ue_message(1, &service_request_initial_ue(nas))
+            .await;
+        assert!(
+            ngap.ue_auth_state
+                .get(new_id)
+                .is_some_and(|s| s.registration_accept_sent),
+            "the periodic update was accepted"
+        );
+
+        for (rx, (event, key, want)) in rxs.iter_mut().zip([
+            ("CONNECTIVITY_STATE_REPORT", "cmInfoList", "CONNECTED"),
+            ("REACHABILITY_REPORT", "reachability", "REACHABLE"),
+        ]) {
+            let body = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("a {event} after the update from CM-IDLE"))
+                .expect("channel closed");
+            let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+            let report = &v["reportList"][0];
+            assert_eq!(report["type"], event, "{v}");
+            assert_eq!(report["supi"], supi.as_str());
+            let got = if key == "cmInfoList" {
+                &report["cmInfoList"][0]["cmState"]
+            } else {
+                &report["reachability"]
+            };
+            assert_eq!(got, want, "{v}");
+        }
+        ngap.ue_auth_state.remove(new_id);
+        for sink in sinks {
+            sink.stop().await.expect("sink stop");
+        }
     }
 
     /// **#1424**: [`NgapServer::report_location_change`] measures each dimension from
