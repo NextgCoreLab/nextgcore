@@ -231,6 +231,14 @@ NFTypes are the identity it binds NFRegister / NFUpdate / NFDeregister to.
   `nf_instance_id`). `certs/check-nf-identities.py` (CI) fails a compose file
   whose pins, volumes or `NEXTGCORE_NRF_TLS_*` disagree with the table, and
   any service other than `sbi-tls` that mounts `certs/` or `sbi_pki`.
+- **What has run.** The base stack's NRF registration over TLS is checked by
+  CI (Docker E2E, `Every NF registers at the NRF over TLS with its
+  certificate`), and nextgsim's `demo-n2ho` job runs the n2ho stack. The
+  `docker-compose.demo-d443a.yml` and `docker-compose.demo-d445a.yml` stacks
+  are **config-only and unverified at runtime**: no CI job brings them up.
+  Their TLS configuration is checked statically (`check-nf-identities.py`),
+  but no run has registered their NFs at the NRF over TLS. The OAuth2 overlay
+  over TLS is in the same position until the deferred end-of-wave E2E pass.
 
 #### Rel-17/18 Feature Knobs
 
