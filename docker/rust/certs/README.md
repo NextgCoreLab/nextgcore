@@ -84,6 +84,9 @@ it through a bind mount: the deployment must give the key to the container's
 user (for example a copy owned by that user, or a Kubernetes Secret with
 `defaultMode`/`fsGroup`), rather than widening the file mode.
 
+Certificates (`*.crt`, `ca.crt`) are public and written `0644`, so any
+container user can read them through a bind mount.
+
 ## Re-running
 
 Re-running keeps the CA and every NF certificate that already carries the

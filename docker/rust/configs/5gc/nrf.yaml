@@ -21,9 +21,10 @@ nrf:
       - address: 0.0.0.0
         advertise: 172.23.0.10
         port: 7777
-        # TLS configuration (G36: SBI TLS by default)
-        # Enable with: TLS_ENABLED=true SBI_SCHEME=https docker compose up -d
-        # Generate certs first: ./certs/generate-dev-certs.sh
+        # TLS on the NRF's one SBI listener (#1617): read by nrfd. With it on,
+        # the NRF requests a client certificate (optional; a presented one must
+        # chain to `ca`). NEXTGCORE_NRF_SERVER_TLS=true also turns it on.
+        # Generate certs first: docker/rust/certs/generate-dev-certs.sh
         tls:
           enabled: false
           cert: /etc/nextgcore/certs/nrf.crt

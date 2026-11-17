@@ -597,7 +597,7 @@ pub async fn deregister_serving_smf(supi: &str, pdu_session_id: u8) -> bool {
 /// sent by an SMF that serves no notification handler creates a resource that
 /// notifies into a `404` — strictly worse than not subscribing, because the UDM then
 /// retries against us. The handler
-/// (`nsmf-callback/v1/sdm-notify/{smContextRef}`) is therefore part of this same
+/// (`nsmf-callback/v1/{smContextRef}/sdm-notify/{token}`, #1518) is therefore part of this same
 /// change, and `callback_uri` is the caller's proof that it has one.
 pub async fn subscribe_sm_data(
     supi: &str,

@@ -2313,6 +2313,39 @@ impl AmfContext {
         None
     }
 
+    /// #1650: take every paging context of a UE that is being deregistered or
+    /// forgotten: the one keyed by `amf_ue_ngap_id`, and any that a REGISTRATION
+    /// REQUEST on this UE's connection answered (`answered_by`, #1102), which stays
+    /// keyed by the idle record's ID while the UE registers on its new connection.
+    pub fn paging_take_for_ue(&self, amf_ue_ngap_id: u64) -> Vec<PagingContext> {
+        let Ok(mut paging_map) = self.paging_map.write() else {
+            return Vec::new();
+        };
+        let ids: Vec<u64> = paging_map
+            .iter()
+            .filter(|(id, c)| **id == amf_ue_ngap_id || c.answered_by == Some(amf_ue_ngap_id))
+            .map(|(id, _)| *id)
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| paging_map.remove(&id))
+            .collect()
+    }
+
+    /// #1650: take the queued connected-UE transfers of these UEs.
+    pub fn connected_downlink_remove_for(
+        &self,
+        amf_ue_ngap_ids: &[u64],
+    ) -> Vec<PendingConnectedDownlink> {
+        let Ok(mut q) = self.connected_downlink_queue.write() else {
+            return Vec::new();
+        };
+        let (taken, kept) = std::mem::take(&mut *q)
+            .into_iter()
+            .partition(|item| amf_ue_ngap_ids.contains(&item.amf_ue_ngap_id));
+        *q = kept;
+        taken
+    }
+
     /// Get paging context for a UE
     pub fn paging_find(&self, amf_ue_ngap_id: u64) -> Option<PagingContext> {
         if let Ok(paging_map) = self.paging_map.read() {
@@ -5462,6 +5495,14 @@ impl Default for AmfSess {
 /// Global AMF context (thread-safe singleton)
 static GLOBAL_AMF_CONTEXT: std::sync::OnceLock<Arc<RwLock<AmfContext>>> =
     std::sync::OnceLock::new();
+
+/// Serialises the tests that add pages to the process-global `AmfContext::paging_map` or
+/// pump it (`NgapServer::process_paging*` takes EVERY due page): one test's pump would
+/// otherwise send, retransmit or abandon a sibling's page (#1689 review). Declared beside
+/// the global it guards. Taken after CONTEXT_GUARD and the queue locks, before
+/// `PAGING_STRATEGY_LOCK`.
+#[cfg(test)]
+pub(crate) static PAGING_MAP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Serialises the tests that run `NgapServer::process_reachability_timers` (#600 wave,
 /// red main on fbedaf4).

@@ -1,0 +1,41 @@
+# nextgsim k8s/configmap.yaml's gnb.yaml, plus per QoS flow QoS monitoring
+# (QMP, TS 38.415 §5.5.2; nextgsim#509) for demo d443a-edge-budget
+# (nextgsim#471). A ConfigMap value is one string, so the whole file is
+# replaced: keep the first part in step with nextgsim's k8s/configmap.yaml.
+#
+# qos_monitoring is not a demo knob: the gNB answers a QMP only for a QoS flow
+# the SMF asked it to monitor (NGAP QoS Monitoring Request), so with the demo off
+# nothing changes on N3. ran_{dl,ul}_delay_ms are STATED values (the simulator
+# measures no radio delay): the RAN part of rtDelays is what the gNB says.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nextgsim-configs
+  namespace: nextg-system
+data:
+  gnb.yaml: |
+    # gNB Configuration for Kubernetes deployment
+    nci: 0x000000010
+    gnb_id_length: 32
+    plmn:
+      mcc: 999
+      mnc: 70
+      long_mnc: false
+    tac: 1
+    nssai:
+      - sst: 1
+        sd: null
+    amf_configs:
+      - address: amf.nextg-system.svc.cluster.local
+        port: 38412
+    link_ip: 0.0.0.0
+    ngap_ip: 0.0.0.0
+    gtp_ip: 0.0.0.0
+    ignore_stream_ids: false
+    upf_addr: upf.nextg-system.svc.cluster.local
+    upf_port: 2152
+    qos_monitoring:
+      enabled: true
+      dummy_response_after_ms: 0
+      ran_dl_delay_ms: 1
+      ran_ul_delay_ms: 1

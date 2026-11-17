@@ -117,6 +117,32 @@ pub fn nf_types_from_der(der: &[u8]) -> Vec<String> {
     types
 }
 
+/// The DNS-ID SubjectAltNames of a DER-encoded certificate, in order (#1617:
+/// the name an NRF verifies its own certificate as when it dials itself).
+/// Empty when the certificate cannot be parsed or names no DNS-ID.
+pub fn dns_names_from_der(der: &[u8]) -> Vec<String> {
+    let Ok(cert) = Certificate::from_der(der) else {
+        return Vec::new();
+    };
+    let Some(extensions) = cert.tbs_certificate.extensions.as_ref() else {
+        return Vec::new();
+    };
+    let Some(san) = extensions
+        .iter()
+        .find(|e| e.extn_id == SubjectAltName::OID)
+        .and_then(|e| SubjectAltName::from_der(e.extn_value.as_bytes()).ok())
+    else {
+        return Vec::new();
+    };
+    san.0
+        .iter()
+        .filter_map(|name| match name {
+            GeneralName::DnsName(dns) => Some(dns.as_str().to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Strip a case-insensitive `urn:uuid:` prefix and trim, rejecting an empty
 /// result. Split out so the normalisation is testable without building a
 /// certificate.
@@ -163,6 +189,28 @@ pub(crate) mod tests {
         let mut der = vec![0x30, body.len() as u8];
         der.extend(body);
         der
+    }
+
+    /// #1617: DNS-IDs in order, other SAN kinds skipped, junk is none.
+    #[test]
+    fn dns_names_are_the_dns_ids_in_order_1617() {
+        use rcgen::{CertificateParams, KeyPair, SanType};
+        let mut params = CertificateParams::new(Vec::new()).expect("params");
+        params.subject_alt_names = vec![
+            SanType::URI(
+                "urn:uuid:6b1d7e3c-0000-4000-8000-0000000000f0"
+                    .try_into()
+                    .unwrap(),
+            ),
+            SanType::DnsName("nrf".try_into().unwrap()),
+            SanType::IpAddress(std::net::IpAddr::from([172, 23, 0, 10])),
+            SanType::DnsName("nextgcore-nrf".try_into().unwrap()),
+        ];
+        let key = KeyPair::generate().expect("key");
+        let der = params.self_signed(&key).expect("cert").der().to_vec();
+        assert_eq!(dns_names_from_der(&der), vec!["nrf", "nextgcore-nrf"]);
+        assert!(dns_names_from_der(&cert_with_uri_san("urn:uuid:x")).is_empty());
+        assert!(dns_names_from_der(b"not a certificate").is_empty());
     }
 
     fn cert_with_nf_types(content: Option<Vec<u8>>) -> Vec<u8> {

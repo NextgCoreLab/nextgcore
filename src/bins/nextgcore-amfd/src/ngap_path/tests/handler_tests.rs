@@ -5005,20 +5005,22 @@ async fn a_page_answered_by_an_update_without_session_ies_still_sets_its_session
     forget_update_test(&mut server, old_id, new_id);
 }
 
-/// **#1102 (#1105 review m1): an answered page no update Accept takes.** A paged
-/// CM-IDLE UE answers with a verified INITIAL registration, which is not an update
-/// and takes no page. The page is marked answered by the new connection, so it is
-/// not sent again, but it stays in the paging map. There it runs out on T3513's
-/// schedule and is abandoned, and its requester is told UE_NOT_RESPONDING as
-/// before. It is not silently dropped. The expiry of an answered page is pinned in
-/// `context::tests::an_answered_page_is_not_sent_but_still_expires`.
+/// **#1102 (#1105 review m1), updated by #1650: an answered page no update Accept
+/// takes.** A paged CM-IDLE UE answers with a verified INITIAL registration, which is
+/// not an update and takes no page. The page is marked answered by the new connection
+/// (so it is not sent again), and the initial registration supersedes the old one
+/// (#774), whose sessions are released. #1650: that is the old registration's local
+/// deregistration, so its page stops at once and its requester is told
+/// (FAILURE_CAUSE_UNSPECIFIED) instead of waiting out T3513 for UE_NOT_RESPONDING.
+/// It is still not silently dropped.
 ///
 /// REVERT-VERIFIED: removing the page when the registration answers it (the first
-/// cut of this fix) fails the "still in the map" assert.
+/// cut of #1102) sends no notification, and the count below is 0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
-async fn a_page_answered_by_an_initial_registration_is_kept_for_abandonment() {
+async fn a_page_answered_by_an_initial_registration_is_stopped_and_notified() {
     let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    let _pages = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeFixtureGuami::install();
     let (_smf, port, _calls) = activating_smf().await;
@@ -5038,17 +5040,21 @@ async fn a_page_answered_by_an_initial_registration_is_kept_for_abandonment() {
     let pdu = super::service_request_initial_ue(super::protected_initial_registration(
         &ue_keys, &cleartext, &cleartext, 5,
     ));
+    let notified = crate::namf_server::failure_notifications_on_this_thread();
     let _ = server.handle_initial_ue_message(ASSOC, &pdu).await;
 
-    let kept = crate::context::amf_self()
-        .read()
-        .unwrap()
-        .paging_find(old_id)
-        .expect("the answered page is still in the map");
-    assert_eq!(kept.answered_by, Some(new_id));
     assert!(
-        kept.failure_notify_uri.is_some(),
-        "its requester can still be told"
+        crate::context::amf_self()
+            .read()
+            .unwrap()
+            .paging_find(old_id)
+            .is_none(),
+        "the superseded registration's page is stopped"
+    );
+    assert_eq!(
+        crate::namf_server::failure_notifications_on_this_thread() - notified,
+        1,
+        "and its requester told, once"
     );
     forget_update_test(&mut server, old_id, new_id);
 }

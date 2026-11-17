@@ -318,6 +318,43 @@ pub fn token_eq(a: &str, b: &str) -> bool {
             == 0
 }
 
+/// A callback-URI token an NF minted for one subscription or association (#1518): a
+/// v4 UUID in simple form, 122 random bits. Persisted as its plain string
+/// (`serde(transparent)`), but its `Debug` output is redacted, so a state struct
+/// holding one can still derive `Debug` without printing the secret. There is no
+/// `Display` and no `PartialEq`: a URI takes it through [`CallbackToken::as_str`],
+/// and a presented token is compared through [`CallbackToken::matches`], in
+/// constant time.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct CallbackToken(String);
+
+impl CallbackToken {
+    /// A fresh token.
+    pub fn mint() -> Self {
+        Self(uuid::Uuid::new_v4().simple().to_string())
+    }
+
+    /// The token, for the callback URI it is minted into.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether `presented` is this token ([`token_eq`]). An empty token, which
+    /// only a damaged record could hold, matches nothing.
+    pub fn matches(&self, presented: &str) -> bool {
+        !self.0.is_empty() && token_eq(&self.0, presented)
+    }
+}
+
+impl fmt::Debug for CallbackToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CallbackToken(")?;
+        f.write_str(crate::log_redact::REDACTED)?;
+        f.write_str(")")
+    }
+}
+
 /// Whether any of `exemptions` admits `method path` without a bearer.
 pub fn admits_without_bearer(
     exemptions: &[OAuth2CallbackExemption],
@@ -608,5 +645,27 @@ mod tests {
     #[should_panic(expected = "not an HTTP method")]
     fn a_lowercase_method_is_refused() {
         OAuth2CallbackExemption::new("post", "/nx-callback/v1/nf-status-notify/{token}", |_| true);
+    }
+
+    /// #1518: a minted token goes into URIs and persists as its plain string, is
+    /// compared only through `matches`, and never shows in `Debug` output.
+    #[test]
+    fn a_callback_token_persists_plainly_and_debugs_redacted_1518() {
+        let token = CallbackToken::mint();
+        assert_eq!(token.as_str().len(), 32);
+        assert_ne!(token.as_str(), CallbackToken::mint().as_str());
+        assert!(token.matches(token.as_str()));
+        assert!(!token.matches(&token.as_str()[..31]));
+        assert!(!token.matches(""));
+        let json = serde_json::to_string(&token).expect("ser");
+        assert_eq!(json, format!("\"{}\"", token.as_str()));
+        let back: CallbackToken = serde_json::from_str(&json).expect("de");
+        assert!(back.matches(token.as_str()));
+        let shown = format!("{token:?} {:?}", Some(token.clone()));
+        assert!(!shown.contains(token.as_str()), "{shown}");
+        assert!(shown.contains(crate::log_redact::REDACTED), "{shown}");
+        // A damaged record's empty token names nothing.
+        let empty: CallbackToken = serde_json::from_str("\"\"").expect("de");
+        assert!(!empty.matches(""));
     }
 }

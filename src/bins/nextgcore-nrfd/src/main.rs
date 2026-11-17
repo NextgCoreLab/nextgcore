@@ -168,6 +168,259 @@ struct SbiServerYaml {
     address: Option<String>,
     advertise: Option<String>,
     port: Option<u16>,
+    /// `nrf.sbi.server[0].tls` (#1617 step b): TLS on the one SBI listener.
+    tls: Option<SbiServerTlsYaml>,
+}
+
+/// `nrf.sbi.server[0].tls`, the shape the shipped `nrf.yaml` files already
+/// carry. Every key is optional; see [`resolve_server_tls`].
+#[derive(Debug, Default, Deserialize)]
+struct SbiServerTlsYaml {
+    enabled: Option<bool>,
+    cert: Option<String>,
+    key: Option<String>,
+    /// The CA a client certificate must chain to.
+    ca: Option<String>,
+    /// `optional` (default) or `required`.
+    client_auth: Option<String>,
+    /// `"1.2"` or absent: rustls negotiates TLS 1.2 or 1.3 (TS 33.501 §13.1.0,
+    /// TS 33.210). Any other value is a startup error rather than ignored.
+    min_version: Option<String>,
+}
+
+/// Whether the NRF's listener demands a client certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientAuth {
+    /// Request one; admit a client that presents none (#1617 step 2 decision).
+    /// A presented certificate must still verify against the CA.
+    Optional,
+    /// Refuse the handshake of a client without a valid certificate (`--mtls`).
+    Required,
+}
+
+/// The TLS the NRF serves its single SBI listener with (#1617 step b).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NrfServerTls {
+    cert: String,
+    key: String,
+    ca: String,
+    client_auth: ClientAuth,
+}
+
+/// Turns TLS on the NRF's listener on (`true`) or off (`false`).
+const NRF_SERVER_TLS_ENV: &str = "NEXTGCORE_NRF_SERVER_TLS";
+/// The NRF's server certificate (PEM).
+const NRF_SERVER_TLS_CERT_ENV: &str = "NEXTGCORE_NRF_SERVER_TLS_CERT";
+/// The private key of [`NRF_SERVER_TLS_CERT_ENV`].
+const NRF_SERVER_TLS_KEY_ENV: &str = "NEXTGCORE_NRF_SERVER_TLS_KEY";
+/// The CA a client certificate must chain to.
+const NRF_SERVER_TLS_CA_ENV: &str = "NEXTGCORE_NRF_SERVER_TLS_CA";
+/// `optional` or `required`.
+const NRF_SERVER_TLS_CLIENT_AUTH_ENV: &str = "NEXTGCORE_NRF_SERVER_TLS_CLIENT_AUTH";
+
+const DEFAULT_SERVER_CERT: &str = "/etc/nextgcore/tls/server.crt";
+const DEFAULT_SERVER_KEY: &str = "/etc/nextgcore/tls/server.key";
+const DEFAULT_CLIENT_CA: &str = "/etc/nextgcore/tls/ca.crt";
+
+/// The TLS command-line flags.
+#[derive(Debug, Default, Clone)]
+struct TlsFlags {
+    tls: bool,
+    cert: Option<String>,
+    key: Option<String>,
+    mtls: bool,
+    ca: Option<String>,
+}
+
+/// #1617 step b: the NRF listener's TLS, from the command line, else the
+/// environment, else `nrf.sbi.server[0].tls`, else the defaults. `None` serves
+/// cleartext h2c, as before.
+///
+/// With TLS on, the listener always requests a client certificate and verifies
+/// a presented one against the CA: the NRF binds NFRegister / NFUpdate /
+/// NFDeregister to it (TS 33.310 §6.1.3c.3, TS 33.501 §13.1.0). It requires one
+/// only with `--mtls` or `client_auth: required`, so discovery, the token
+/// endpoint and probes without a certificate still complete the handshake on
+/// the one port.
+///
+/// A value that does not parse, and `--mtls` without TLS, are errors: neither
+/// may silently serve weaker than the operator asked.
+fn resolve_server_tls(
+    flags: &TlsFlags,
+    env: impl Fn(&str) -> Option<String>,
+    yaml: Option<&SbiServerTlsYaml>,
+) -> anyhow::Result<Option<NrfServerTls>> {
+    let env = |var: &str| {
+        env(var)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let env_enabled = match env(NRF_SERVER_TLS_ENV) {
+        None => None,
+        Some(v) => Some(match v.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => anyhow::bail!("{NRF_SERVER_TLS_ENV}={v:?} is not a boolean (true / false)"),
+        }),
+    };
+    let enabled = flags.tls
+        || env_enabled
+            .or_else(|| yaml.and_then(|y| y.enabled))
+            .unwrap_or(false);
+    if !enabled {
+        if flags.mtls {
+            anyhow::bail!("--mtls needs TLS on the SBI listener (--tls, {NRF_SERVER_TLS_ENV}=true or nrf.sbi.server[0].tls.enabled)");
+        }
+        return Ok(None);
+    }
+    if let Some(v) = yaml.and_then(|y| y.min_version.as_deref()) {
+        if v.trim() != "1.2" {
+            anyhow::bail!(
+                "nrf.sbi.server[0].tls.min_version {v:?} is not supported: the listener \
+                 negotiates TLS 1.2 or 1.3; set \"1.2\" or remove the key"
+            );
+        }
+    }
+    let pick = |flag: &Option<String>, var: &str, yaml_value: Option<&String>, default: &str| {
+        flag.clone()
+            .or_else(|| env(var))
+            .or_else(|| yaml_value.cloned())
+            .unwrap_or_else(|| default.to_string())
+    };
+    let client_auth = if flags.mtls {
+        ClientAuth::Required
+    } else {
+        match env(NRF_SERVER_TLS_CLIENT_AUTH_ENV)
+            .or_else(|| yaml.and_then(|y| y.client_auth.clone()))
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            None | Some("optional") => ClientAuth::Optional,
+            Some("required") => ClientAuth::Required,
+            Some(other) => anyhow::bail!(
+                "TLS client_auth {other:?} is not one of optional, required \
+                 ({NRF_SERVER_TLS_CLIENT_AUTH_ENV} / nrf.sbi.server[0].tls.client_auth)"
+            ),
+        }
+    };
+    Ok(Some(NrfServerTls {
+        cert: pick(
+            &flags.cert,
+            NRF_SERVER_TLS_CERT_ENV,
+            yaml.and_then(|y| y.cert.as_ref()),
+            DEFAULT_SERVER_CERT,
+        ),
+        key: pick(
+            &flags.key,
+            NRF_SERVER_TLS_KEY_ENV,
+            yaml.and_then(|y| y.key.as_ref()),
+            DEFAULT_SERVER_KEY,
+        ),
+        ca: pick(
+            &flags.ca,
+            NRF_SERVER_TLS_CA_ENV,
+            yaml.and_then(|y| y.ca.as_ref()),
+            DEFAULT_CLIENT_CA,
+        ),
+        client_auth,
+    }))
+}
+
+impl NrfServerTls {
+    /// Every file must exist at startup, named, rather than as a handshake error.
+    fn check_files(&self) -> anyhow::Result<()> {
+        for (label, path) in [
+            ("certificate", &self.cert),
+            ("private key", &self.key),
+            ("client CA certificate", &self.ca),
+        ] {
+            if !std::path::Path::new(path).is_file() {
+                anyhow::bail!("NRF SBI TLS: the {label} {path} does not exist");
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply to the listener's configuration.
+    fn apply(&self, config: NextgcoreSbiServerConfig) -> NextgcoreSbiServerConfig {
+        let mut config = config.with_tls(&self.key, &self.cert);
+        config.verify_client = true;
+        config.verify_client_cacert = Some(self.ca.clone());
+        config.verify_client_optional = self.client_auth == ClientAuth::Optional;
+        config
+    }
+
+    /// The NRF client TLS the NRF uses to dial ITSELF (its OAuth2 client for its
+    /// own outbound notifications, `OAuth2Client::new(nrf_self_uri())`).
+    ///
+    /// Explicit `NEXTGCORE_NRF_TLS_*` / `NEXTGCORE_SBI_TLS_*` settings win; what
+    /// they leave unset comes from the NRF's own listener: its CA as the trust
+    /// anchor, the first DNS-ID of its own certificate as the server name (the
+    /// self URI's host is an address its certificate need not name), and its own
+    /// certificate as the client certificate, but only when that certificate's
+    /// URN names `own_id`. A certificate naming another instance would be
+    /// refused by the token endpoint's binding check, so none is presented then.
+    fn self_client_tls(
+        &self,
+        env: impl Fn(&str) -> Option<String>,
+        own_id: &str,
+    ) -> nextgcore_sbi::nrf_tls::NrfClientTls {
+        use nextgcore_sbi::nrf_tls::{
+            NrfClientTls, NRF_TLS_CA_ENV, NRF_TLS_CLIENT_CERT_ENV, NRF_TLS_CLIENT_KEY_ENV,
+            NRF_TLS_SERVER_NAME_ENV,
+        };
+        use nextgcore_sbi::security::TlsPaths;
+        let env = |var: &str| {
+            env(var)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let leaf = nextgcore_sbi::tls::load_certs(&self.cert)
+            .ok()
+            .and_then(|chain| chain.into_iter().next());
+        let names_own_id = leaf
+            .as_ref()
+            .and_then(|der| nextgcore_sbi::peer_cert::nf_instance_id_from_der(der.as_ref()))
+            .is_some_and(|id| id.eq_ignore_ascii_case(own_id.trim()));
+        let dns = leaf.as_ref().and_then(|der| {
+            nextgcore_sbi::peer_cert::dns_names_from_der(der.as_ref())
+                .into_iter()
+                .next()
+        });
+        let pair_configured = [
+            NRF_TLS_CLIENT_CERT_ENV,
+            NRF_TLS_CLIENT_KEY_ENV,
+            TlsPaths::CLIENT_CERT_ENV,
+            TlsPaths::CLIENT_KEY_ENV,
+        ]
+        .iter()
+        .any(|v| env(v).is_some());
+        let ca_configured = env(NRF_TLS_CA_ENV).is_some() || env(TlsPaths::CA_ENV).is_some();
+        if !pair_configured && !names_own_id {
+            log::warn!(
+                "the NRF's certificate {} does not name its NF instance {own_id} \
+                 (urn:uuid URI SAN), so the NRF presents no client certificate to its own \
+                 token endpoint",
+                self.cert
+            );
+        }
+        NrfClientTls::resolve(
+            |var| {
+                env(var).or_else(|| match var {
+                    v if v == NRF_TLS_CA_ENV && !ca_configured => Some(self.ca.clone()),
+                    v if v == NRF_TLS_SERVER_NAME_ENV => dns.clone(),
+                    v if v == NRF_TLS_CLIENT_CERT_ENV && !pair_configured && names_own_id => {
+                        Some(self.cert.clone())
+                    }
+                    v if v == NRF_TLS_CLIENT_KEY_ENV && !pair_configured && names_own_id => {
+                        Some(self.key.clone())
+                    }
+                    _ => None,
+                })
+            },
+            |path| std::path::Path::new(path).is_file(),
+        )
+    }
 }
 
 /// The config file, parsed (#1313 review). `None` when there is no file; a file
@@ -298,6 +551,11 @@ struct NrfPolicy {
     /// proof of mTLS identity. Default OFF — without a TLS terminator that
     /// overwrites the header, any client can set it.
     trust_forwarded_client_cert: bool,
+    /// #1617: refuse NFRegister / NFUpdate / NFDeregister from a caller with no
+    /// verified certificate identity ([`RegistrantIdentity::require_certificate`]).
+    /// OFF until the shipped deployments present certificates (#1617 step f
+    /// turns it on by default); until then such a request is only counted.
+    require_registrant_identity: bool,
     /// I1 (TS 33.501 §13.3.8.3): cryptographically verify the CCA ES256 JWS
     /// signature (not just the claim binding). Default ON (issue #64 gap 2).
     cca_verify_signature: bool,
@@ -358,6 +616,7 @@ impl Default for NrfPolicy {
             // The forwarded-cert header is only as trustworthy as the terminator
             // that sets it, and nothing here guarantees one exists.
             trust_forwarded_client_cert: false,
+            require_registrant_identity: false,
             cca_trusted_keys: std::collections::HashMap::new(),
             cca_conflicted: std::collections::HashSet::new(),
             cca_trusted_keys_dir: None,
@@ -954,23 +1213,28 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_TOKEN_EXPIRES_IN_SECS)]
     token_expires_in: u64,
 
-    /// Enable TLS
+    /// Serve the SBI listener over TLS. Without it, NEXTGCORE_NRF_SERVER_TLS,
+    /// else `nrf.sbi.server[0].tls.enabled`. With TLS the listener requests a
+    /// client certificate and verifies a presented one (#1617).
     #[arg(long)]
     tls: bool,
 
-    /// TLS certificate path
+    /// TLS certificate path (else NEXTGCORE_NRF_SERVER_TLS_CERT, else
+    /// `nrf.sbi.server[0].tls.cert`, else /etc/nextgcore/tls/server.crt).
     #[arg(long)]
     tls_cert: Option<String>,
 
-    /// TLS key path
+    /// TLS key path (else NEXTGCORE_NRF_SERVER_TLS_KEY, else
+    /// `nrf.sbi.server[0].tls.key`, else /etc/nextgcore/tls/server.key).
     #[arg(long)]
     tls_key: Option<String>,
 
-    /// Enable mTLS (require client certificates)
+    /// REQUIRE a client certificate (default: requested, optional). Needs TLS.
     #[arg(long)]
     mtls: bool,
 
-    /// CA certificate for client verification (mTLS)
+    /// CA a client certificate must chain to (else NEXTGCORE_NRF_SERVER_TLS_CA,
+    /// else `nrf.sbi.server[0].tls.ca`, else /etc/nextgcore/tls/ca.crt).
     #[arg(long)]
     tls_ca_cert: Option<String>,
 
@@ -1136,8 +1400,43 @@ async fn main() -> Result<()> {
         nrf_token_expires_in()
     );
 
+    // #1617 step b: TLS on the one SBI listener, from the command line, the
+    // environment or nrf.sbi.server[0].tls. Resolved and checked before anything
+    // listens, so a bad setting or a missing file fails startup by name.
+    let server_tls = resolve_server_tls(
+        &TlsFlags {
+            tls: args.tls,
+            cert: args.tls_cert.clone(),
+            key: args.tls_key.clone(),
+            mtls: args.mtls,
+            ca: args.tls_ca_cert.clone(),
+        },
+        |var| std::env::var(var).ok(),
+        config_yaml
+            .as_ref()
+            .and_then(|y| y.nrf.as_ref())
+            .and_then(|n| n.sbi.as_ref())
+            .and_then(|s| s.server.as_ref())
+            .and_then(|v| v.first())
+            .and_then(|s| s.tls.as_ref()),
+    )?;
+    if let Some(tls) = &server_tls {
+        tls.check_files()?;
+    } else if nextgcore_sbi::security::SbiProfile::resolve().is_production() {
+        log::warn!(
+            "the NRF serves cleartext h2c, but the SBI profile is production: every NF on \
+             that profile dials its NRF over https and cannot reach this one. Enable TLS \
+             (nrf.sbi.server[0].tls.enabled, {NRF_SERVER_TLS_ENV}=true or --tls), or set \
+             NEXTGCORE_SBI_PROFILE=dev for a cleartext development core."
+        );
+    }
+
     // Store the NRF's own SBI URI so notification handlers can use it
-    let scheme = if args.tls { "https" } else { "http" };
+    let scheme = if server_tls.is_some() {
+        "https"
+    } else {
+        "http"
+    };
     let self_uri = format!(
         "{}://{}",
         scheme,
@@ -1277,6 +1576,21 @@ async fn main() -> Result<()> {
         }
         register_self_with_own_registry();
 
+        // #1617 step b: under TLS the NRF's token client dials its own listener
+        // with the NRF client TLS (#1690). Fill what the NEXTGCORE_NRF_TLS_*
+        // settings leave unset from the listener's own CA, name and certificate,
+        // so the self URI's address need not be a name the certificate carries.
+        if let Some(tls) = &server_tls {
+            let own = tls.self_client_tls(|var| std::env::var(var).ok(), nrf_instance_id());
+            log::info!(
+                "NRF self client TLS: CA={} client certificate={} server name={}",
+                own.ca_cert,
+                own.client_cert.as_deref().unwrap_or("NONE"),
+                own.server_name.as_deref().unwrap_or("(the self URI host)"),
+            );
+            nextgcore_sbi::nrf_tls::set_nrf_client_tls_override(Some(own));
+        }
+
         let oauth2 = Arc::new(OAuth2Client::new(
             nrf_self_uri().to_string(),
             nrf_instance_id().to_string(),
@@ -1299,9 +1613,9 @@ async fn main() -> Result<()> {
     let sbi_config = SbiServerConfig {
         addr: listen.host.clone(),
         port: listen.port,
-        tls_enabled: args.tls,
-        tls_cert: args.tls_cert.clone(),
-        tls_key: args.tls_key.clone(),
+        tls_enabled: server_tls.is_some(),
+        tls_cert: server_tls.as_ref().map(|t| t.cert.clone()),
+        tls_key: server_tls.as_ref().map(|t| t.key.clone()),
     };
 
     // Open legacy SBI server (for context initialization)
@@ -1319,28 +1633,20 @@ async fn main() -> Result<()> {
     );
     let mut sbi_server_config = NextgcoreSbiServerConfig::new(sbi_addr);
 
-    // Wire TLS/mTLS configuration from CLI args into the nextgcore-sbi server
-    if args.tls {
-        let cert = args
-            .tls_cert
-            .as_deref()
-            .unwrap_or("/etc/nextgcore/tls/server.crt");
-        let key = args
-            .tls_key
-            .as_deref()
-            .unwrap_or("/etc/nextgcore/tls/server.key");
-        sbi_server_config = sbi_server_config.with_tls(key, cert);
-        log::info!("TLS enabled: cert={cert}, key={key}");
-
-        if args.mtls {
-            let ca = args
-                .tls_ca_cert
-                .as_deref()
-                .unwrap_or("/etc/nextgcore/tls/ca.crt");
-            sbi_server_config.verify_client = true;
-            sbi_server_config.verify_client_cacert = Some(ca.to_string());
-            log::info!("mTLS enabled: client CA={ca}");
-        }
+    // #1617 step b: one listener; with TLS it requests a client certificate and
+    // verifies a presented one (required only with --mtls / client_auth: required).
+    if let Some(tls) = &server_tls {
+        sbi_server_config = tls.apply(sbi_server_config);
+        log::info!(
+            "TLS enabled: cert={}, key={}, client CA={}, client certificate {}",
+            tls.cert,
+            tls.key,
+            tls.ca,
+            match tls.client_auth {
+                ClientAuth::Optional => "requested (optional; a presented one must verify)",
+                ClientAuth::Required => "REQUIRED",
+            }
+        );
     }
 
     let sbi_server = SbiServer::new(sbi_server_config);
@@ -1350,7 +1656,11 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
-    let scheme = if args.tls { "HTTPS" } else { "HTTP" };
+    let scheme = if server_tls.is_some() {
+        "HTTPS"
+    } else {
+        "HTTP"
+    };
     log::info!("SBI HTTP/2 {scheme} server listening on {sbi_addr}");
 
     // #1334: the Prometheus endpoint, on NEXTGCORE_METRICS_BIND (loopback by default,
@@ -1705,6 +2015,13 @@ async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiRe
 
     // #1611: a verified caller registers only its own NF instance.
     let registrant = RegistrantIdentity::of(request, nrf_policy());
+    if let Some(refused) = registrant.require_certificate(
+        "NFRegister",
+        nf_instance_id,
+        nrf_policy().require_registrant_identity,
+    ) {
+        return refused;
+    }
     if let Some(refused) = registrant.bind_instance("NFRegister", nf_instance_id) {
         return refused;
     }
@@ -1865,6 +2182,13 @@ async fn handle_nf_deregister(nf_instance_id: &str, request: &SbiRequest) -> Sbi
     // #1611: a verified caller deregisters only its own NF instance, and (for a
     // certificate that names NF types) only one of a type it names.
     let registrant = RegistrantIdentity::of(request, nrf_policy());
+    if let Some(refused) = registrant.require_certificate(
+        "NFDeregister",
+        nf_instance_id,
+        nrf_policy().require_registrant_identity,
+    ) {
+        return refused;
+    }
     if let Some(refused) = registrant.bind_instance("NFDeregister", nf_instance_id) {
         return refused;
     }
@@ -2028,6 +2352,13 @@ async fn handle_nf_update(nf_instance_id: &str, request: &SbiRequest) -> SbiResp
     // #1611: a verified caller updates only its own NF instance, checked before
     // the lookup so another NF's existence is not disclosed.
     let registrant = RegistrantIdentity::of(request, nrf_policy());
+    if let Some(refused) = registrant.require_certificate(
+        "NFUpdate",
+        nf_instance_id,
+        nrf_policy().require_registrant_identity,
+    ) {
+        return refused;
+    }
     if let Some(refused) = registrant.bind_instance("NFUpdate", nf_instance_id) {
         return refused;
     }
@@ -3834,6 +4165,46 @@ impl RegistrantIdentity {
             instance_ids,
             nf_types,
         }
+    }
+
+    /// The verified certificate identity of the caller: the URN of a client
+    /// certificate this process verified, or of one a declared trusted
+    /// terminator forwarded. An access-token subject is not one: the operator
+    /// decision on #1617 makes NF management need a certificate identity
+    /// (TS 33.310 §6.1.3c.3, TS 33.501 §13.1.0), and a first NFRegister cannot
+    /// carry a token at all.
+    fn certificate_identity(&self) -> Option<&str> {
+        self.instance_ids
+            .iter()
+            .find(|(source, _)| source.ends_with("client certificate"))
+            .map(|(_, id)| id.as_str())
+    }
+
+    /// #1617: the enforcement point every NF-management operation passes first.
+    /// A caller with no verified certificate identity is counted, and refused
+    /// `400 INVALID_CLIENT` (TS 29.510 Table 6.1.7.3-1) when `enforce` is on.
+    /// `Some` is the refusal to send.
+    fn require_certificate(
+        &self,
+        operation: &str,
+        nf_instance_id: &str,
+        enforce: bool,
+    ) -> Option<SbiResponse> {
+        if self.certificate_identity().is_some() {
+            return None;
+        }
+        nextgcore_nrfd::metrics::observe_unverified_nf_management();
+        log::debug!(
+            "{operation} for NF instance {nf_instance_id}: the caller has no verified \
+             certificate identity{}",
+            if enforce { "; refused" } else { "" }
+        );
+        enforce.then(|| {
+            invalid_client(&format!(
+                "{operation}: the requester has no verified client certificate identity \
+                 (urn:uuid URI SAN, TS 33.310 §6.1.3c.3)"
+            ))
+        })
     }
 
     /// The `{nfInstanceID}` the request targets must be every verified identity
@@ -10707,6 +11078,492 @@ mod registrant_binding_tests_1611 {
             RegistrantIdentity::of(&request_with(Some("nf-e"), &[], None, Some("nf-f")), &plain);
         assert!(both.bind_instance("NFRegister", "nf-e").is_some());
         assert!(both.bind_instance("NFRegister", "nf-f").is_some());
+    }
+}
+
+/// #1617 step b: the NRF's listener TLS from the command line, the environment
+/// and `nrf.sbi.server[0].tls`; optional client authentication on the one
+/// listener; the NF-management enforcement point; and the NRF's self client.
+#[cfg(test)]
+mod server_tls_tests_1617 {
+    use super::*;
+    use nextgcore_sbi::client::SbiClient;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    const NRF_ID: &str = "6b1d7e3c-0000-4000-8000-0000000000f0";
+    const AMF_ID: &str = "6b1d7e3c-0000-4000-8000-000000000af0";
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k| map.get(k).cloned()
+    }
+
+    fn yaml_tls(text: &str) -> SbiServerTlsYaml {
+        let y: NrfYaml = serde_yaml::from_str(text).expect("yaml");
+        y.nrf
+            .and_then(|n| n.sbi)
+            .and_then(|s| s.server)
+            .and_then(|v| v.into_iter().next())
+            .and_then(|s| s.tls)
+            .expect("nrf.sbi.server[0].tls")
+    }
+
+    const SHIPPED_SHAPE: &str = "nrf:\n  sbi:\n    server:\n      - address: 0.0.0.0\n        port: 7777\n        tls:\n          enabled: true\n          cert: /y/nrf.crt\n          key: /y/nrf.key\n          ca: /y/ca.crt\n          min_version: \"1.2\"\n";
+
+    /// Off unless asked for, from any source; the shipped `tls:` shape parses.
+    #[test]
+    fn tls_is_off_by_default_and_on_from_any_source_1617() {
+        let none = TlsFlags::default();
+        assert_eq!(resolve_server_tls(&none, env(&[]), None).unwrap(), None);
+        let off = yaml_tls("nrf:\n  sbi:\n    server:\n      - tls:\n          enabled: false\n");
+        assert_eq!(
+            resolve_server_tls(&none, env(&[]), Some(&off)).unwrap(),
+            None
+        );
+
+        let on = yaml_tls(SHIPPED_SHAPE);
+        let tls = resolve_server_tls(&none, env(&[]), Some(&on))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            tls,
+            NrfServerTls {
+                cert: "/y/nrf.crt".into(),
+                key: "/y/nrf.key".into(),
+                ca: "/y/ca.crt".into(),
+                client_auth: ClientAuth::Optional,
+            }
+        );
+
+        let by_env = resolve_server_tls(&none, env(&[(NRF_SERVER_TLS_ENV, "true")]), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                by_env.cert.as_str(),
+                by_env.key.as_str(),
+                by_env.ca.as_str()
+            ),
+            (DEFAULT_SERVER_CERT, DEFAULT_SERVER_KEY, DEFAULT_CLIENT_CA)
+        );
+        assert_eq!(by_env.client_auth, ClientAuth::Optional);
+        // The environment turns a YAML `enabled: true` off, and the flag wins.
+        assert_eq!(
+            resolve_server_tls(&none, env(&[(NRF_SERVER_TLS_ENV, "false")]), Some(&on)).unwrap(),
+            None
+        );
+        let flag = TlsFlags {
+            tls: true,
+            ..TlsFlags::default()
+        };
+        assert!(
+            resolve_server_tls(&flag, env(&[(NRF_SERVER_TLS_ENV, "false")]), None)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// The command line beats the environment, which beats the YAML, path by path.
+    #[test]
+    fn each_path_comes_from_the_most_specific_source_1617() {
+        let on = yaml_tls(SHIPPED_SHAPE);
+        let flags = TlsFlags {
+            cert: Some("/c/nrf.crt".into()),
+            ..TlsFlags::default()
+        };
+        let tls = resolve_server_tls(
+            &flags,
+            env(&[
+                (NRF_SERVER_TLS_CERT_ENV, "/e/nrf.crt"),
+                (NRF_SERVER_TLS_KEY_ENV, "/e/nrf.key"),
+                (NRF_SERVER_TLS_CA_ENV, " "),
+            ]),
+            Some(&on),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(tls.cert, "/c/nrf.crt");
+        assert_eq!(tls.key, "/e/nrf.key");
+        // An empty variable is unset.
+        assert_eq!(tls.ca, "/y/ca.crt");
+    }
+
+    /// Client authentication is requested and optional by default, required only
+    /// when asked; a bad value, a bad boolean, an unsupported minimum version and
+    /// `--mtls` without TLS fail rather than serving weaker than asked.
+    #[test]
+    fn client_auth_is_optional_unless_required_and_bad_values_fail_1617() {
+        let on = yaml_tls(SHIPPED_SHAPE);
+        let none = TlsFlags::default();
+        let auth = |e: &[(&str, &str)], y: &SbiServerTlsYaml, f: &TlsFlags| {
+            resolve_server_tls(f, env(e), Some(y)).map(|t| t.unwrap().client_auth)
+        };
+        assert_eq!(auth(&[], &on, &none).unwrap(), ClientAuth::Optional);
+        let mtls = TlsFlags {
+            mtls: true,
+            ..TlsFlags::default()
+        };
+        assert_eq!(auth(&[], &on, &mtls).unwrap(), ClientAuth::Required);
+        // --mtls is the stricter choice: an environment `optional` does not undo it.
+        assert_eq!(
+            auth(&[(NRF_SERVER_TLS_CLIENT_AUTH_ENV, "optional")], &on, &mtls).unwrap(),
+            ClientAuth::Required
+        );
+        assert_eq!(
+            auth(&[(NRF_SERVER_TLS_CLIENT_AUTH_ENV, "Required")], &on, &none).unwrap(),
+            ClientAuth::Required
+        );
+        let required = yaml_tls(
+            "nrf:\n  sbi:\n    server:\n      - tls:\n          enabled: true\n          client_auth: required\n",
+        );
+        assert_eq!(auth(&[], &required, &none).unwrap(), ClientAuth::Required);
+        assert!(auth(&[(NRF_SERVER_TLS_CLIENT_AUTH_ENV, "none")], &on, &none).is_err());
+
+        assert!(resolve_server_tls(&none, env(&[(NRF_SERVER_TLS_ENV, "maybe")]), None).is_err());
+        let v13 = yaml_tls(
+            "nrf:\n  sbi:\n    server:\n      - tls:\n          enabled: true\n          min_version: \"1.0\"\n",
+        );
+        assert!(resolve_server_tls(&none, env(&[]), Some(&v13)).is_err());
+        let err = resolve_server_tls(&mtls, env(&[]), None).unwrap_err();
+        assert!(err.to_string().contains("--mtls"), "{err}");
+    }
+
+    /// The enforcement point: only a (direct or trusted-forwarded) certificate
+    /// identity passes. Without one the request is counted, and refused
+    /// `400 INVALID_CLIENT` only when enforcement is on (step f).
+    #[test]
+    fn nf_management_needs_a_certificate_identity_to_pass_the_hook_1617() {
+        let plain = NrfPolicy::default();
+        let trusting = NrfPolicy {
+            trust_forwarded_client_cert: true,
+            ..NrfPolicy::default()
+        };
+        let req = |peer: Option<&str>, xfcc: Option<&str>, sub: Option<&str>| {
+            let mut r = SbiRequest::put("/nnrf-nfm/v1/nf-instances/x");
+            r.peer_cert_nf_instance_id = peer.map(str::to_string);
+            if let Some(x) = xfcc {
+                r.http.set_header(XFCC_HEADER, x.to_string());
+            }
+            r.oauth2_subject = sub.map(str::to_string);
+            r
+        };
+        let none = RegistrantIdentity::of(&req(None, None, None), &plain);
+        let token_only = RegistrantIdentity::of(&req(None, None, Some("nf-a")), &plain);
+        let direct = RegistrantIdentity::of(&req(Some("nf-a"), None, None), &plain);
+        let forwarded =
+            RegistrantIdentity::of(&req(None, Some("By=x;URI=urn:uuid:nf-a"), None), &trusting);
+        let untrusted_forward =
+            RegistrantIdentity::of(&req(None, Some("By=x;URI=urn:uuid:nf-a"), None), &plain);
+
+        let before = nextgcore_nrfd::metrics::unverified_nf_management_total();
+        for (who, id) in [
+            ("none", &none),
+            ("token", &token_only),
+            ("xfcc", &untrusted_forward),
+        ] {
+            assert_eq!(id.certificate_identity(), None, "{who}");
+            assert!(
+                id.require_certificate("NFRegister", "nf-a", false)
+                    .is_none(),
+                "{who}"
+            );
+            let refused = id
+                .require_certificate("NFRegister", "nf-a", true)
+                .unwrap_or_else(|| panic!("{who}: refused when enforced"));
+            assert_eq!(refused.status, 400);
+            assert!(refused
+                .http
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("INVALID_CLIENT"));
+        }
+        assert!(
+            nextgcore_nrfd::metrics::unverified_nf_management_total() >= before + 6,
+            "every unverified request is counted"
+        );
+        for (who, id) in [("direct", &direct), ("forwarded", &forwarded)] {
+            assert_eq!(id.certificate_identity(), Some("nf-a"), "{who}");
+            assert!(
+                id.require_certificate("NFRegister", "nf-a", true).is_none(),
+                "{who}"
+            );
+        }
+    }
+
+    /// Every shipped NRF config still parses, and still serves h2c: this step
+    /// adds the switch, the deployments turn it on (#1617 step d).
+    #[test]
+    fn every_shipped_nrf_config_parses_and_keeps_tls_off_1617() {
+        let dir = repo_root().join("docker/rust/configs");
+        let mut checked = 0;
+        for sub in std::fs::read_dir(&dir).unwrap() {
+            let sub = sub.unwrap().path();
+            if !sub.is_dir() {
+                continue;
+            }
+            for f in std::fs::read_dir(&sub).unwrap() {
+                let f = f.unwrap().path();
+                let name = f.file_name().unwrap().to_string_lossy().into_owned();
+                if !(name.starts_with("nrf") && name.ends_with(".yaml")) {
+                    continue;
+                }
+                let yaml = load_config(f.to_str().unwrap())
+                    .unwrap_or_else(|e| panic!("{}: {e}", f.display()))
+                    .unwrap();
+                let tls = yaml
+                    .nrf
+                    .as_ref()
+                    .and_then(|n| n.sbi.as_ref())
+                    .and_then(|s| s.server.as_ref())
+                    .and_then(|v| v.first())
+                    .and_then(|s| s.tls.as_ref());
+                assert_eq!(
+                    resolve_server_tls(&TlsFlags::default(), env(&[]), tls).unwrap(),
+                    None,
+                    "{}",
+                    f.display()
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 4, "found {checked} NRF configs");
+    }
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .canonicalize()
+            .expect("repo root")
+    }
+
+    /// The shipped generator's PKI (the NRF row pins [`NRF_ID`]).
+    struct DevPki(PathBuf);
+
+    impl DevPki {
+        fn generate(tag: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("nrfd-1617b-pki-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let out = std::process::Command::new("bash")
+                .arg(repo_root().join("docker/rust/certs/generate-dev-certs.sh"))
+                .arg("--out")
+                .arg(&dir)
+                .output()
+                .expect("run generate-dev-certs.sh (needs bash and openssl)");
+            assert!(
+                out.status.success(),
+                "generate-dev-certs.sh failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            DevPki(dir)
+        }
+
+        fn file(&self, name: &str) -> String {
+            self.0.join(name).display().to_string()
+        }
+
+        fn nrf_tls(&self) -> NrfServerTls {
+            NrfServerTls {
+                cert: self.file("nrf.crt"),
+                key: self.file("nrf.key"),
+                ca: self.file("ca.crt"),
+                client_auth: ClientAuth::Optional,
+            }
+        }
+    }
+
+    impl Drop for DevPki {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The self client: the listener's CA, its own certificate's DNS-ID `nrf`,
+    /// and its own certificate as the client certificate only when that names
+    /// the NRF's instance. Explicit NRF client settings win.
+    #[test]
+    fn the_nrf_dials_itself_with_its_own_ca_name_and_certificate_1617() {
+        let pki = DevPki::generate("self");
+        let tls = pki.nrf_tls();
+        tls.check_files().expect("the generated files");
+
+        let own = tls.self_client_tls(env(&[]), NRF_ID);
+        assert_eq!(own.ca_cert, pki.file("ca.crt"));
+        assert_eq!(own.server_name.as_deref(), Some("nrf"));
+        assert_eq!(
+            own.client_cert.as_deref(),
+            Some(pki.file("nrf.crt").as_str())
+        );
+        assert_eq!(
+            own.client_key.as_deref(),
+            Some(pki.file("nrf.key").as_str())
+        );
+        assert_eq!(own.error, None);
+        // The UUID compares case-insensitively (TS 29.510 §5.2.2.2.2).
+        let upper = tls.self_client_tls(env(&[]), &NRF_ID.to_ascii_uppercase());
+        assert_eq!(upper.client_cert, own.client_cert);
+
+        // A certificate that names another instance is not presented.
+        let other = tls.self_client_tls(env(&[]), AMF_ID);
+        assert_eq!(other.client_cert, None);
+        assert_eq!(other.client_key, None);
+        assert_eq!(other.server_name.as_deref(), Some("nrf"));
+
+        use nextgcore_sbi::nrf_tls::{
+            NRF_TLS_CA_ENV, NRF_TLS_CLIENT_CERT_ENV, NRF_TLS_CLIENT_KEY_ENV,
+            NRF_TLS_SERVER_NAME_ENV,
+        };
+        let explicit = tls.self_client_tls(
+            env(&[
+                (NRF_TLS_CA_ENV, "/x/ca.crt"),
+                (NRF_TLS_CLIENT_CERT_ENV, "/x/c.crt"),
+                (NRF_TLS_CLIENT_KEY_ENV, "/x/c.key"),
+                (NRF_TLS_SERVER_NAME_ENV, "nrf.example"),
+            ]),
+            NRF_ID,
+        );
+        assert_eq!(explicit.ca_cert, "/x/ca.crt");
+        assert_eq!(explicit.client_cert.as_deref(), Some("/x/c.crt"));
+        assert_eq!(explicit.client_key.as_deref(), Some("/x/c.key"));
+        assert_eq!(explicit.server_name.as_deref(), Some("nrf.example"));
+        // Half an explicit pair stays an error, not a silent fallback to ours.
+        let half = tls.self_client_tls(env(&[(NRF_TLS_CLIENT_CERT_ENV, "/x/c.crt")]), NRF_ID);
+        assert!(half.error.is_some());
+
+        let missing = NrfServerTls {
+            ca: pki.file("missing-ca.crt"),
+            ..pki.nrf_tls()
+        };
+        let err = missing.check_files().unwrap_err();
+        assert!(err.to_string().contains("missing-ca.crt"), "{err}");
+    }
+
+    /// Over the real handler behind `NrfServerTls::apply` (optional client auth):
+    /// - a client with no certificate completes the handshake: discovery is 200
+    ///   and, until step f, its NFRegister is still 201 but counted unverified;
+    /// - a client whose certificate does not chain to the CA is refused at the
+    ///   handshake;
+    /// - the NRF's self client (`self_client_tls`, dialling `127.0.0.1`) is
+    ///   verified as `nrf`, registers the NRF's own instance with its certificate
+    ///   and obtains an access token from its own token endpoint, the transport
+    ///   `OAuth2Client::new(nrf_self_uri())` uses.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_tls_listener_serves_callers_with_and_without_certificates_1617() {
+        let _g = nextgcore_sbi::nrf_tls::NRF_CLIENT_TLS_TEST_LOCK
+            .lock()
+            .await;
+        let pki = DevPki::generate("listener");
+        let foreign = DevPki::generate("foreign");
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let cfg = pki.nrf_tls().apply(NextgcoreSbiServerConfig::new(addr));
+        assert!(cfg.verify_client && cfg.verify_client_optional);
+        let server = SbiServer::on_listener(cfg, listener);
+        server.start(nrf_sbi_request_handler).await.expect("starts");
+        let uri = format!("https://127.0.0.1:{}", addr.port());
+        let client_with = |cert: Option<(String, String)>| {
+            let mut c = nextgcore_sbi::client::SbiClientConfig::new("127.0.0.1", addr.port())
+                .with_https()
+                .with_tls_server_name("nrf");
+            c.ca_cert = Some(pki.file("ca.crt"));
+            if let Some((crt, key)) = cert {
+                c.client_cert = Some(crt);
+                c.client_key = Some(key);
+            }
+            SbiClient::new(c)
+        };
+        let anon_id = "1617b000-0000-4000-8000-0000000000a1";
+        let run = async {
+            let anon = client_with(None);
+            let r = anon
+                .get("/nnrf-disc/v1/nf-instances?target-nf-type=AMF&requester-nf-type=SMF")
+                .await
+                .expect("no certificate: the handshake completes");
+            assert_eq!(r.status, 200);
+            let before = nextgcore_nrfd::metrics::unverified_nf_management_total();
+            let r = anon
+                .put_json(
+                    &format!("/nnrf-nfm/v1/nf-instances/{anon_id}"),
+                    &json!({"nfInstanceId": anon_id, "nfType": "CUSTOM_T1617B",
+                            "nfStatus": "REGISTERED", "heartBeatTimer": 10}),
+                )
+                .await
+                .expect("PUT completes");
+            assert_eq!(
+                r.status, 201,
+                "not refused before step f: {:?}",
+                r.http.content
+            );
+            let after_put = nextgcore_nrfd::metrics::unverified_nf_management_total();
+            assert!(after_put > before, "NFRegister counted");
+            let req = SbiRequest::patch(format!("/nnrf-nfm/v1/nf-instances/{anon_id}")).with_body(
+                json!([{"op": "replace", "path": "/nfStatus", "value": "REGISTERED"}]).to_string(),
+                "application/json-patch+json",
+            );
+            let r = anon.send_request(req).await.expect("PATCH completes");
+            assert_eq!(r.status, 200, "{:?}", r.http.content);
+            let after_patch = nextgcore_nrfd::metrics::unverified_nf_management_total();
+            assert!(after_patch > after_put, "NFUpdate counted");
+            let r = anon
+                .delete(&format!("/nnrf-nfm/v1/nf-instances/{anon_id}"))
+                .await
+                .expect("DELETE completes");
+            assert_eq!(r.status, 204, "{:?}", r.http.content);
+            assert!(
+                nextgcore_nrfd::metrics::unverified_nf_management_total() > after_patch,
+                "NFDeregister counted"
+            );
+
+            let forged = client_with(Some((foreign.file("amf.crt"), foreign.file("amf.key"))));
+            let err = forged
+                .get("/nnrf-disc/v1/nf-instances?target-nf-type=AMF&requester-nf-type=SMF")
+                .await
+                .expect_err("a certificate of another CA is refused");
+            assert!(
+                !matches!(err, nextgcore_sbi::error::SbiError::HttpError { .. }),
+                "refused at the handshake, not by a handler: {err:?}"
+            );
+
+            // The NRF's self client.
+            nextgcore_sbi::nrf_tls::set_nrf_client_tls_override(Some(
+                pki.nrf_tls().self_client_tls(env(&[]), NRF_ID),
+            ));
+            let own = SbiClient::for_nrf_uri(&uri).expect("self URI");
+            let r = own
+                .put_json(
+                    &format!("/nnrf-nfm/v1/nf-instances/{NRF_ID}"),
+                    &nrf_self_profile_for(&uri)
+                        .as_object()
+                        .cloned()
+                        .map(|mut p| {
+                            p.insert("nfInstanceId".into(), json!(NRF_ID));
+                            serde_json::Value::Object(p)
+                        })
+                        .unwrap(),
+                )
+                .await
+                .expect("the self client reaches the NRF over TLS");
+            assert!(
+                r.status == 201 || r.status == 200,
+                "the NRF registers itself with its certificate: {} {:?}",
+                r.status,
+                r.http.content
+            );
+            let oauth = nextgcore_sbi::oauth::OAuth2Client::new(&uri, NRF_ID, NfType::Nrf);
+            let token = oauth.get_token(NfType::Nrf, "nnrf-disc").await;
+            nf_manager().deregister(NRF_ID).ok();
+            let token = token.expect("the self token client is granted over TLS");
+            assert!(!token.is_empty());
+        };
+        let outcome = tokio::time::timeout(Duration::from_secs(60), run).await;
+        nextgcore_sbi::nrf_tls::set_nrf_client_tls_override(None);
+        server.stop().await.ok();
+        outcome.expect("finishes");
     }
 }
 

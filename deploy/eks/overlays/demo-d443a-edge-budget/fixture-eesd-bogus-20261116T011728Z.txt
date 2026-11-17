@@ -1,0 +1,13 @@
+Initializing OpenTelemetry for service 'nextgcore-eesd' (endpoint: http://jaeger:4317)
+Initializing OpenTelemetry traces
+Initializing OpenTelemetry metrics
+Initializing OpenTelemetry logs
+[2026-11-16T01:24:03.652Z INFO  nextgcore_eesd] NextGCore EES v0.1.0
+[2026-11-16T01:24:03.652Z INFO  nextgcore_eesd] Edge Enabler Server (3GPP TS 23.558)
+[2026-11-16T01:24:03.652Z INFO  nextgcore_eesd::context] EES context initialized with max 512 EAS registrations
+[2026-11-16T01:24:03.652Z INFO  nextgcore_eesd::notifier] EES notifier: real callback sender active (max_attempts=3, base_backoff=1s, honor_retry_after=true)
+[2026-11-16T01:24:03.652Z INFO  nextgcore_sbi::nf_instance_id] nfInstanceId 7bbf74f2-f7af-4e11-ab57-32ab0d279331 generated for NF type EES (set NEXTGCORE_NF_INSTANCE_ID or NEXTGCORE_EES_INSTANCE_ID to pin it; a CCA trust store keyed by nfInstanceId needs a pinned value to be provisioned in advance)
+[2026-11-16T01:24:03.652Z WARN  nextgcore_eesd] OAuth2 verification keys not configured: all EES operations will be rejected with 401 (per-operation OAuth2 is mandatory, TS 29.558 §6)
+Shutting down OpenTelemetry
+Error: demo config: unknown mode "bogus" for demo "d443a-edge-budget" (known modes ["measured-budget", "static"]) (UnknownMode { demo: "d443a-edge-budget", mode: "bogus", known: ["measured-budget", "static"] })
+rc=1
