@@ -1574,6 +1574,9 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                 // through one loop.
                 let far_writes: Vec<&crate::n4_build::ParsedCreateFar> =
                     created_fars.iter().chain(updated_fars.iter()).collect();
+                // #1631: the FAR this modification set to BUFF|NOCP, for the backlog
+                // report below.
+                let mut rearmed_far: Option<u32> = None;
                 if !far_writes.is_empty() {
                     let mut dp_fars = session.fars.write().unwrap();
                     for f in &far_writes {
@@ -1586,6 +1589,7 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                         let buff_nocp = data_plane::FAR_ACTION_BUFF | data_plane::FAR_ACTION_NOCP;
                         if f.apply_action & buff_nocp == buff_nocp {
                             session.rearm_dl_notification();
+                            rearmed_far.get_or_insert(f.far_id);
                         }
                         dp_fars.insert(f.far_id, data_plane_far_from_parsed(f));
                     }
@@ -1674,6 +1678,17 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                         log::info!(
                             "DROBU: discarded {dropped} buffered DL packets for SEID={upf_seid:#x}"
                         );
+                    }
+                }
+
+                // #1631 (#1635 review m3): the instruction to buffer and notify makes
+                // the packets already buffered the episode's first (TS 29.244
+                // §5.2.3.1), so they are reported now, once, rather than when a later
+                // packet arrives, which may be never. After DROBU, so a discarded
+                // buffer is not reported.
+                if let Some(far_id) = rearmed_far {
+                    if session.claim_dl_backlog_report() {
+                        data_plane.report_dl_backlog(&session, far_id);
                     }
                 }
             }
@@ -2108,16 +2123,150 @@ mod tests {
             )),
         )
         .await;
+        // #1631: a new episode, whose first packets are the three already buffered;
+        // they take its one report at the modification
+        // (`a_buff_nocp_modification_reports_the_packets_already_buffered_1631`).
         assert!(
-            first(4),
-            "BUFF|NOCP: a new episode, this packet is a first one"
+            !first(4),
+            "BUFF|NOCP: a new episode, already reported for the buffered packets"
         );
-        assert!(!first(5), "and only one");
         assert_eq!(
             session.dl_buffer.lock().unwrap().len(),
-            5,
+            4,
             "the packets buffered before stay buffered"
         );
+        // With nothing buffered, the next packet is the episode's first.
+        session.drain_dl_buffer();
+        handle_pfcp_session_event(
+            &dp,
+            modify(far(
+                data_plane::FAR_ACTION_BUFF | data_plane::FAR_ACTION_NOCP
+            )),
+        )
+        .await;
+        assert!(
+            first(5),
+            "BUFF|NOCP: a new episode, this packet is a first one"
+        );
+        assert!(!first(6), "and only one");
+    }
+
+    /// #1631 (#1635 review m3): a Session Modification that sets a FAR to BUFF|NOCP
+    /// while packets are already buffered reports them at once, in one Downlink Data
+    /// Report naming the FAR's core PDR. The packets are the episode's first, so the
+    /// next packet does not report again. With an empty buffer, or with the buffer
+    /// discarded by the same modification (DROBU), nothing is reported until a packet
+    /// arrives.
+    ///
+    /// REVERT-VERIFIED: without the backlog report, no report follows the
+    /// modification; with the claim not taking the episode, the next packet reports a
+    /// second time; with the report before DROBU, the discarded buffer is reported.
+    #[tokio::test]
+    async fn a_buff_nocp_modification_reports_the_packets_already_buffered_1631() {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        let seid = 0x1631;
+        let far = |apply_action: u16| crate::n4_build::ParsedCreateFar {
+            far_id: 2,
+            apply_action,
+            ..Default::default()
+        };
+        let core_pdr = crate::n4_build::ParsedCreatePdr {
+            pdr_id: 9,
+            precedence: 100,
+            pdi: crate::n4_build::ParsedPdi {
+                source_interface: data_plane::SRC_INTF_CORE,
+                ..Default::default()
+            },
+            far_id: Some(2),
+            ..Default::default()
+        };
+        handle_pfcp_session_event(
+            &dp,
+            PfcpSessionEvent::SessionEstablished {
+                upf_seid: seid,
+                smf_seid: 0x1631_0000,
+                ue_ipv4: Some(Ipv4Addr::new(10, 45, 16, 31)),
+                ul_teid: 0x1631,
+                dl_teid: 0,
+                gnb_addr: None,
+                pdrs: vec![core_pdr],
+                fars: vec![far(data_plane::FAR_ACTION_BUFF)],
+                qers: Vec::new(),
+                urrs: Vec::new(),
+                bars: Vec::new(),
+            },
+        )
+        .await;
+        let (tx, mut reports) = tokio::sync::mpsc::channel(16);
+        dp.set_report_channel(tx);
+        let session = dp.sessions.find_by_seid(seid).expect("installed");
+        let modify = |drop_buffered: bool| PfcpSessionEvent::SessionModified {
+            upf_seid: seid,
+            dl_teid: None,
+            gnb_addr: None,
+            removed_pdr_ids: Vec::new(),
+            removed_far_ids: Vec::new(),
+            removed_qer_ids: Vec::new(),
+            removed_urr_ids: Vec::new(),
+            created_pdrs: Vec::new(),
+            created_fars: Vec::new(),
+            created_qers: Vec::new(),
+            created_urrs: Vec::new(),
+            updated_pdrs: Vec::new(),
+            updated_fars: vec![far(
+                data_plane::FAR_ACTION_BUFF | data_plane::FAR_ACTION_NOCP
+            )],
+            updated_qers: Vec::new(),
+            updated_urrs: Vec::new(),
+            updated_bars: Vec::new(),
+            send_end_marker: false,
+            drop_buffered,
+            old_dl_tunnel: None,
+        };
+        let mut drain = || {
+            let mut out = Vec::new();
+            while let Ok(event) = reports.try_recv() {
+                out.push(event);
+            }
+            out
+        };
+
+        // Buffered under the create's BUFF (no NOCP): nothing was reported.
+        session.buffer_dl_packet(vec![1], None);
+        session.buffer_dl_packet(vec![2], None);
+        handle_pfcp_session_event(&dp, modify(false)).await;
+        let got = drain();
+        assert_eq!(got.len(), 1, "one report for the backlog: {got:?}");
+        assert!(
+            matches!(
+                got[0],
+                data_plane::UpfReportEvent::DownlinkDataReport {
+                    upf_seid: 0x1631,
+                    smf_seid: 0x1631_0000,
+                    pdr_id: 9,
+                    ..
+                }
+            ),
+            "{got:?}"
+        );
+        assert!(
+            !session.buffer_dl_packet(vec![3], None).1,
+            "the backlog took the episode's report"
+        );
+
+        // The buffer discarded by the same modification: nothing to report.
+        handle_pfcp_session_event(&dp, modify(true)).await;
+        assert!(drain().is_empty(), "a discarded buffer is not reported");
+        assert!(
+            session.buffer_dl_packet(vec![4], None).1,
+            "the episode's report is still owed to the next packet"
+        );
+
+        // An empty buffer: the next packet reports, as before.
+        session.drain_dl_buffer();
+        handle_pfcp_session_event(&dp, modify(false)).await;
+        assert!(drain().is_empty(), "nothing buffered, nothing reported");
+        assert!(session.buffer_dl_packet(vec![5], None).1);
     }
 
     /// #953 review (minor): an Update URR that CARRIES a Measurement Method changes

@@ -2094,6 +2094,7 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
         reported_presence: std::collections::HashMap::new(),
         reachability_filter,
         reported_reachability: std::collections::HashMap::new(),
+        reported_connectivity: std::collections::HashMap::new(),
         reporting_threshold,
         location_filters,
     };
@@ -2103,6 +2104,23 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
     // #1641: the first REACHABILITY_REPORT, recorded in the subscription before it is
     // stored, so no fire point can see it without its first state (review m1).
     let mut sub = sub;
+    // #1645 review: an immediate CONNECTIVITY_STATE_REPORT is a report, recorded as the
+    // state this subscription last heard, so the change gate knows it.
+    if let Some(state) = report_list
+        .iter()
+        .find(|r| r["type"] == "CONNECTIVITY_STATE_REPORT")
+        .and_then(|r| r.pointer("/cmInfoList/0/cmState"))
+        .and_then(Value::as_str)
+    {
+        if let Some(key) = supi
+            .as_deref()
+            .and_then(find_ue_by_context_id)
+            .as_ref()
+            .and_then(|ue| reachability_key(ue).map(str::to_string))
+        {
+            sub.reported_connectivity.insert(key, state.to_string());
+        }
+    }
     let first_reach = first_reachability_report(
         &mut sub,
         immediate_types.iter().any(|t| t == "REACHABILITY_REPORT"),
@@ -2884,17 +2902,66 @@ pub fn fire_connectivity_state_report(ue: &AmfUe, connected: bool) {
     #[cfg(test)]
     if connected {
         CONNECTED_REPORTS_ON_THIS_THREAD.with(|c| c.set(c.get() + 1));
+    } else {
+        IDLE_REPORTS_ON_THIS_THREAD.with(|c| c.set(c.get() + 1));
     }
-    fire_ue_event(
-        ue,
-        "CONNECTIVITY_STATE_REPORT",
-        json!({
-            "cmInfoList": [{
-                "cmState": if connected { "CONNECTED" } else { "IDLE" },
-                "accessType": "3GPP_ACCESS",
-            }]
-        }),
-    );
+    let state = if connected { "CONNECTED" } else { "IDLE" };
+    let extra = json!({ "cmInfoList": [{ "cmState": state, "accessType": "3GPP_ACCESS" }] });
+    // #1645 review (MINOR c): each subscription hears an *updated* CM state only
+    // (TS 29.518 §6.2), gated per subscription and UE on the state last reported to it,
+    // its immediate report included. So a connection that ends before its CONNECTED was
+    // reported (a release racing the Service Request's SMF answers) reports no IDLE to a
+    // subscriber that last heard IDLE, and IDLE to one whose immediate report said
+    // CONNECTED.
+    let Some(key) = reachability_key(ue).map(str::to_string) else {
+        fire_ue_event(ue, "CONNECTIVITY_STATE_REPORT", extra);
+        return;
+    };
+    let ctx = amf_self();
+    // Matched under one read, then gated and delivered with it released: the gate
+    // takes the subscription store's own lock, never the context lock again.
+    let subs = {
+        let Ok(guard) = ctx.read() else {
+            return;
+        };
+        guard.event_subscriptions_remove_expired();
+        guard.event_subscriptions_matching_ue(
+            "CONNECTIVITY_STATE_REPORT",
+            ue.supi.as_deref(),
+            ue.gpsi.as_deref(),
+            ue.pei.as_deref(),
+        )
+    };
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let mut report = build_event_report("CONNECTIVITY_STATE_REPORT", ue.supi.as_deref(), extra);
+    if let Some(gpsi) = ue.gpsi.as_deref() {
+        report["gpsi"] = json!(gpsi);
+    }
+    if let Some(pei) = ue.pei.as_deref() {
+        report["pei"] = json!(pei);
+    }
+    for sub in subs {
+        let changed = match ctx.read() {
+            Ok(guard) => {
+                guard.event_subscription_record_connectivity(&sub.subscription_id, &key, state)
+            }
+            Err(_) => true,
+        };
+        if !changed {
+            continue;
+        }
+        #[cfg(test)]
+        CONNECTIVITY_DELIVERIES_ON_THIS_THREAD.with(|c| c.set(c.get() + 1));
+        let report = report.clone();
+        let sub_id = sub.subscription_id.clone();
+        handle.spawn(async move {
+            if let Err(e) = deliver_event_notification(sub, report).await {
+                log::warn!("Event notification delivery failed (sub={sub_id}): {e}");
+            }
+        });
+    }
 }
 
 /// Fire an ACCESS_TYPE_REPORT for the access the UE is reachable over,
@@ -3539,6 +3606,34 @@ pub(crate) fn reachability_reports_on_this_thread() -> u64 {
     REACHABILITY_REPORTS_ON_THIS_THREAD.with(std::cell::Cell::get)
 }
 
+// Test-only (#1645 review): CONNECTIVITY_STATE_REPORT notifications that passed the
+// per-subscription change gate on this thread.
+#[cfg(test)]
+thread_local! {
+    static CONNECTIVITY_DELIVERIES_ON_THIS_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: CONNECTIVITY_STATE_REPORT notifications delivered on this thread so far.
+#[cfg(test)]
+pub(crate) fn connectivity_deliveries_on_this_thread() -> u64 {
+    CONNECTIVITY_DELIVERIES_ON_THIS_THREAD.with(std::cell::Cell::get)
+}
+
+// Test-only (#1645): IDLE [`fire_connectivity_state_report`] calls on this thread,
+// as CONNECTED_REPORTS_ON_THIS_THREAD counts CONNECTED ones.
+#[cfg(test)]
+thread_local! {
+    static IDLE_REPORTS_ON_THIS_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: IDLE [`fire_connectivity_state_report`] calls on this thread so far.
+#[cfg(test)]
+pub(crate) fn idle_reports_on_this_thread() -> u64 {
+    IDLE_REPORTS_ON_THIS_THREAD.with(std::cell::Cell::get)
+}
+
 /// Test-only: CONNECTED [`fire_connectivity_state_report`] calls on this thread so
 /// far.
 #[cfg(test)]
@@ -3847,6 +3942,7 @@ fn take_over_transferred_event_subscriptions(
                     }
                 }),
             reported_reachability: std::collections::HashMap::new(),
+            reported_connectivity: std::collections::HashMap::new(),
             reporting_threshold: entry.get("eventList").and_then(Value::as_array).and_then(
                 |events| {
                     events
@@ -8216,6 +8312,7 @@ mod tests {
             reported_presence: std::collections::HashMap::new(),
             reachability_filter: None,
             reported_reachability: std::collections::HashMap::new(),
+            reported_connectivity: std::collections::HashMap::new(),
             reporting_threshold: None,
             location_filters: Vec::new(),
         };
@@ -15590,6 +15687,7 @@ mod tests {
             reported_presence: std::collections::HashMap::new(),
             reachability_filter: None,
             reported_reachability: std::collections::HashMap::new(),
+            reported_connectivity: std::collections::HashMap::new(),
             reporting_threshold: None,
             location_filters: Vec::new(),
         };
