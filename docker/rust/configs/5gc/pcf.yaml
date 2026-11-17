@@ -26,8 +26,14 @@ pcf:
   # UpdateNotify and the SE_AMBR_CH update alike (#1402). subscribed (the
   # default): per direction min(policy, subscribed). none: the policy value.
   # Any other value fails start-up.
-  # policy:
   #   session_ambr_cap: subscribed
+  # Whether a policy create is refused (500 SYSTEM_FAILURE) when the NRF does
+  # not answer the UDR discovery and no UDR is known: none discovered since
+  # start-up, none remembered, and no NRF answer saying none is deployed (#1639).
+  # true: refused (fail closed, production). false: the local default policy
+  # (fail open, dev/sim/compose). Not a boolean: start-up fails.
+  policy:
+    udr_required: false
   # TLS configuration (G36: SBI TLS)
   # Enable: TLS_ENABLED=true SBI_SCHEME=https docker compose up -d
   tls:

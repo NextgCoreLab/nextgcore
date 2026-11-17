@@ -68,6 +68,11 @@ data:
         client:
           nrf:
             - uri: http://nrf.nextg-system.svc.cluster.local:7777
+      # #1639: as the k8s/manifests pcf.yaml this replaces (the EKS profiles'
+      # base): a policy create is refused when the NRF does not answer and no
+      # UDR is known.
+      policy:
+        udr_required: true
       congestion_loop:
         cells:
           - {mcc: '999', mnc: '70', nr_cell_id: '000000010'}
