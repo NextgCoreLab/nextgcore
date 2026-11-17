@@ -34,7 +34,7 @@ Unlike most NextGCore NFs, `nextgcore-dccfd` defines **no `#[derive(Deserialize)
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `dccf.sbi.oauth2.require` | bool | `false` | SBI OAuth2 bearer-token enforcement (Wave-6 H8; TS 33.501 §13.4.1 and TS 29.510 §5.4.2 per code comments). When enabled, incoming requests must carry an NRF-issued token whose audience includes `DCCF`, verified against the NRF JWKS; with no NRF URI configured the server fails closed (503, per code comment). A missing, unreadable, or unparseable YAML file yields `false`. The environment variable `NEXTGCORE_SBI_OAUTH2_REQUIRE` is checked *first* and, when set to any value, decides the outcome in both directions (see Behavior notes). |
+| `dccf.sbi.oauth2.require` | bool | `false` | SBI OAuth2 bearer-token enforcement (Wave-6 H8; TS 33.501 §13.4.1 and TS 29.510 §5.4.2 per code comments). When enabled, incoming requests must carry an NRF-issued token whose audience includes `DCCF`, verified against the NRF JWKS; with no NRF URI configured the server fails closed (503, per code comment). A missing, unreadable, or unparseable YAML file yields `false`. The environment variable `NEXTGCORE_SBI_OAUTH2_REQUIRE` is checked *first* and, when set to any value, decides the outcome in both directions (see Behavior notes). The outbound token client is also installed, with the knob off, under the `production` SBI profile (#1665; see [Configuration Overview](./overview.md)). |
 
 That is the complete list — no other YAML field influences the daemon.
 

@@ -1089,8 +1089,16 @@ impl UeNasContext {
     /// as the LOCATION_REPORT baseline if none has been reported yet (a context
     /// seeded or restored without a report). Its stored location was learned, so a
     /// move away from it is measured from it, not from nothing.
+    ///
+    /// #1716: only for a REGISTERED context. A context still in its initial
+    /// registration (authentication, security mode) has a location no report has
+    /// told anyone about, so its Registration Accept is where the AMF first becomes
+    /// aware of the UE's location and reports every dimension (TS 29.518 §5.3.2.4,
+    /// Table 6.2.6.3.3-1). Seeding it from the Uplink NAS Transports of that
+    /// registration made the Accept see no change, and a subscriber with no
+    /// `locationFilterList` was never told where the UE registered.
     fn seed_location_baseline(&mut self) {
-        if self.location_evaluated.is_none() {
+        if self.registered && self.location_evaluated.is_none() {
             self.location_evaluated = Some((
                 self.amf_ue.nr_tai.clone(),
                 self.amf_ue.nr_cgi.clone(),
@@ -2060,6 +2068,11 @@ impl NgapServer {
             let dropped = self.sweep_orphaned_session_state();
             if dropped > 0 {
                 log::info!("Dropped {dropped} orphaned per-session entries (#756)");
+            }
+            // #1692: the 5G-TMSI registry's release point.
+            let released = self.sweep_tmsi_registry(Instant::now());
+            if released > 0 {
+                log::debug!("Released {released} 5G-TMSI(s) no UE has held for the grace (#1692)");
             }
         }
 
@@ -14642,6 +14655,24 @@ impl NgapServer {
         if let Some(sess) = guard.sess_find_by_psi(amf_ue_ngap_id, psi) {
             guard.sess_remove(sess.id);
         }
+    }
+
+    /// The 5G-TMSIs the live UE records hold, as `current_guti` or `next_guti`
+    /// (#1692).
+    fn live_tmsis(&self) -> std::collections::HashSet<u32> {
+        self.ue_auth_state
+            .snapshot()
+            .iter()
+            .flat_map(|(_, s)| [s.amf_ue.current_guti.tmsi, s.amf_ue.next_guti.tmsi])
+            .filter(|t| *t != 0)
+            .collect()
+    }
+
+    /// #1692: refresh the 5G-TMSI registry from the live records and release what
+    /// none has held for [`crate::context::TMSI_RELEASE_GRACE`]
+    /// ([`crate::context::tmsi_registry_sweep`]). Returns how many were released.
+    fn sweep_tmsi_registry(&self, now: Instant) -> usize {
+        crate::context::tmsi_registry_sweep(&self.live_tmsis(), now)
     }
 
     /// Backstop sweep for per-session state whose end this task never sees (#756).
@@ -37859,6 +37890,91 @@ mod tests {
         cell.stop().await.expect("sink stop");
     }
 
+    /// **#1716**, TS 29.518 §5.3.2.4 / Table 6.2.6.3.3-1: an initial registration's
+    /// Registration Accept reports the UE's location to a LOCATION_REPORT subscriber
+    /// with no `locationFilterList`, after the registration's own Uplink NAS
+    /// Transports (authentication, security mode) carried that same location. Those
+    /// messages arrive before the Accept on every real registration, which is how the
+    /// Docker E2E lost its LOCATION_REPORT while REGISTRATION_STATE_REPORT and
+    /// ACCESS_TYPE_REPORT still arrived.
+    ///
+    /// REVERT-VERIFIED: with `seed_location_baseline` seeding an unregistered context
+    /// again (main since #1424), the Uplink NAS Transport makes the Accept see no
+    /// change and no LOCATION_REPORT arrives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_initial_registration_reports_location_after_its_uplink_nas_1716() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        // The Initial Context Setup carrying the Accept needs a served GUAMI.
+        let _guamis = serve_only_local_guami();
+        let mut ngap = capturing_ngap_server().await;
+        let (id, ran) = (17_160_001u64, 1_716u32);
+        let supi = "imsi-001010000171601";
+        let (tac, cell) = (0x17_1601u32, 0x0017_1601u64);
+        // The secured, not yet registered record of a UE mid initial registration, at
+        // the location its Initial UE Message carried.
+        let mut ue = UeNasContext::new(id, ran, 1, false);
+        ue.amf_ue.supi = Some(supi.to_string());
+        ue.amf_ue.security_context_available = true;
+        ue.amf_ue.registration_type = crate::gmm_build::registration_type::INITIAL;
+        ue.amf_ue.allowed_nssai = vec![crate::context::SNssai { sst: 1, sd: None }];
+        ue.amf_ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        ue.amf_ue.nr_tai.tac = tac;
+        ue.amf_ue.nr_cgi.plmn_id = PlmnId::new("001", "01");
+        ue.amf_ue.nr_cgi.cell_id = cell;
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_publish(&ue.amf_ue, ran, 1);
+        }
+        let amf_ue_id = ue.amf_ue.id;
+        ngap.ue_auth_state.insert(id, ue);
+        let (plain, mut plain_rx) = location_report_sink(supi, "1716-plain").await;
+
+        // An Uplink NAS Transport of the registration, from the same cell.
+        let ul_pdu = nextgcore_ngap::builder::build_uplink_nas_transport(
+            &nextgcore_ngap::types::UplinkNasTransport {
+                amf_ue_ngap_id: id,
+                ran_ue_ngap_id: ran,
+                nas_pdu: vec![
+                    0x7E,
+                    security_header::PLAIN_NAS_MESSAGE,
+                    message_type::CONFIGURATION_UPDATE_COMPLETE,
+                ],
+                user_location_info: test_user_location(tac, cell),
+            },
+        )
+        .expect("encode an Uplink NAS Transport");
+        ngap.handle_uplink_nas_transport(1, &ul_pdu)
+            .await
+            .expect("handled");
+
+        ngap.send_registration_accept(1, id, ran)
+            .await
+            .expect("accepted");
+        assert!(
+            ngap.ue_auth_state
+                .get(id)
+                .is_some_and(|s| s.registration_accept_sent),
+            "the Accept went out"
+        );
+        let (got, got_tac, got_cell) = next_location_report(&mut plain_rx).await;
+        assert_eq!(got, supi);
+        assert_eq!(
+            (got_tac.as_str(), got_cell.as_str()),
+            ("171601", "000171601"),
+            "the location the UE registered from"
+        );
+
+        ngap.ue_auth_state.remove(id);
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_unpublish(amf_ue_id);
+        }
+        plain.stop().await.expect("sink stop");
+    }
+
     /// **#1549**, TS 29.518 §5.3.1 / §6.2 (`29518-k00.txt:23968-23978`): a UE that
     /// moved while CM-IDLE out of a subscribed Area of Interest comes back with a
     /// protected mobility registration update, and its Registration Accept reports
@@ -43071,6 +43187,109 @@ mod tests {
                 ngap.ue_auth_state.remove(id);
             }
         }
+    }
+
+    /// **#1723 review M1**, TS 24.501 §5.5.1.2.8 / §5.4.4.6: a record whose new
+    /// 5G-GUTI was allocated but never acknowledged (T3550 or T3555 exhausted) keeps
+    /// it in `next_guti`, and the UE may hold and present it. Its 5G-TMSI stays held
+    /// for as long as the record holds it, past any number of graces, and is never
+    /// drawn again.
+    ///
+    /// REVERT-VERIFIED: with `live_tmsis` collecting `current_guti` only, the
+    /// pending value is released two graces in and the forced draw returns it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pending_next_guti_stays_held_for_as_long_as_its_record_holds_it_1692() {
+        let _registry = crate::context::TMSI_REGISTRY_TEST_LOCK.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let ngap = test_ngap_server().await;
+        let (id, current) = (16_920_101u64, 0x1692_0401u32);
+        let mut ue = UeNasContext::new(id, 1, 1, false);
+        ue.registered = true;
+        ue.amf_ue.current_guti.tmsi = current;
+        ngap.ue_auth_state.insert(id, ue);
+        let t0 = Instant::now();
+        let pending = ngap
+            .ue_auth_state
+            .with_mut(id, |s| {
+                s.amf_ue.generate_new_guti();
+                s.amf_ue.next_guti.tmsi
+            })
+            .expect("the record");
+        ngap.sweep_tmsi_registry(t0);
+
+        let grace = crate::context::TMSI_RELEASE_GRACE;
+        for k in 1..=3u32 {
+            ngap.sweep_tmsi_registry(t0 + grace * k + Duration::from_secs(1));
+        }
+        assert!(
+            crate::context::tmsi_registry_holds(pending),
+            "an unacknowledged next_guti is held while its record holds it"
+        );
+        assert!(crate::context::tmsi_registry_holds(current));
+        let mut draws = [pending, current, 0x1692_0402].into_iter();
+        assert_eq!(
+            crate::context::allocate_unique_tmsi_from(
+                || draws.next().expect("a draw"),
+                t0 + grace * 3
+            ),
+            0x1692_0402,
+            "the pending value is redrawn"
+        );
+        ngap.ue_auth_state.remove(id);
+    }
+
+    /// **#1692**, TS 23.003 §2.10.1: the NGAP task's registry sweep holds every
+    /// 5G-TMSI a live record holds (here one that was never allocated by this
+    /// process, as after a takeover), so an allocation cannot hand it out;
+    /// `generate_new_guti` under `ue_auth_state.with_mut` (the store's write lock)
+    /// allocates through the registry without re-entering the store; and once the
+    /// record is gone its values are released one grace later.
+    ///
+    /// REVERT-VERIFIED: with `live_tmsis` returning nothing, the live record's value
+    /// is drawn again; with `generate_new_guti` back on `generate_random_tmsi`, the
+    /// new `next_guti` is not held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_registry_sweep_holds_every_live_5g_tmsi_1692() {
+        let _registry = crate::context::TMSI_REGISTRY_TEST_LOCK.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let ngap = test_ngap_server().await;
+        let (id, live) = (16_920_001u64, 0x1692_0301u32);
+        let mut ue = UeNasContext::new(id, 1, 1, false);
+        ue.registered = true;
+        ue.amf_ue.current_guti.tmsi = live;
+        ngap.ue_auth_state.insert(id, ue);
+
+        let t0 = Instant::now();
+        ngap.sweep_tmsi_registry(t0);
+        assert!(crate::context::tmsi_registry_holds(live));
+        let mut draws = [live, 0x1692_0302].into_iter();
+        assert_eq!(
+            crate::context::allocate_unique_tmsi_from(|| draws.next().expect("a draw"), t0),
+            0x1692_0302
+        );
+
+        let next = ngap
+            .ue_auth_state
+            .with_mut(id, |s| {
+                s.amf_ue.generate_new_guti();
+                s.amf_ue.next_guti.tmsi
+            })
+            .expect("the record");
+        assert_ne!(next, live);
+        assert!(
+            crate::context::tmsi_registry_holds(next),
+            "allocated under the store's lock, through the registry"
+        );
+
+        // The UE is gone: both values are released one grace after the last sweep
+        // that saw them, not before.
+        ngap.ue_auth_state.remove(id);
+        let grace = crate::context::TMSI_RELEASE_GRACE;
+        ngap.sweep_tmsi_registry(t0 + grace);
+        assert!(crate::context::tmsi_registry_holds(live));
+        ngap.sweep_tmsi_registry(t0 + grace + Duration::from_secs(1));
+        assert!(!crate::context::tmsi_registry_holds(live));
+        assert!(!crate::context::tmsi_registry_holds(next));
     }
 
     /// **#1701**, TS 29.518 §6.2 (`29518-k00.txt:24011-24017`): with the mobile

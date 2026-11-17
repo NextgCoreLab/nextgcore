@@ -141,6 +141,8 @@ From the clap `Args` struct in `src/bins/nextgcore-tsctsf/src/main.rs`:
 - **OAuth2** producer enforcement mirrors dccfd: enable with
   `NEXTGCORE_SBI_OAUTH2_REQUIRE=1` or `tsctsf.sbi.oauth2.require: true`; tokens are
   verified against the NRF JWKS with audience `TSCTSF`.
+  The outbound token client is installed under the knob or the `production` SBI
+  profile (#1665).
 - **Environment variables:** `NEXTGCORE_SBI_OAUTH2_REQUIRE`, `TSCTSF_ACTUATION`,
   `PCF_URI` and `OTEL_EXPORTER_OTLP_ENDPOINT` (default `http://jaeger:4317`).
 
