@@ -36556,6 +36556,8 @@ mod tests {
         let (count_sink, count_port, mut count_rx) = notify_sink().await;
         let tai =
             |tac: &str| serde_json::json!({ "plmnId": {"mcc": "001", "mnc": "01"}, "tac": tac });
+        // #1614: the any-UE count subscription outlives the test unless removed.
+        let mut subscriptions = Vec::new();
         for (body, what) in [
             (
                 serde_json::json!({
@@ -36597,6 +36599,7 @@ mod tests {
             )
             .await;
             assert_eq!(resp.status, 201, "the {what} subscription is created");
+            subscriptions.push(crate::namf_server::EventSubscriptionGuard::of(&resp));
         }
         async fn next(rx: &mut mpsc::Receiver<String>, what: &str) -> serde_json::Value {
             let body = tokio::time::timeout(Duration::from_secs(3), rx.recv())
@@ -36678,6 +36681,7 @@ mod tests {
             }
         }
         ngap.ue_auth_state.remove(amf_ue_ngap_id);
+        drop(subscriptions);
         aoi_sink.stop().await.expect("sink stop");
         count_sink.stop().await.expect("sink stop");
     }
@@ -36865,6 +36869,8 @@ mod tests {
         let (count_sink, count_port, mut count_rx) = notify_sink().await;
         let tai =
             |tac: &str| serde_json::json!({ "plmnId": {"mcc": "001", "mnc": "01"}, "tac": tac });
+        // #1614: the any-UE count subscription outlives the test unless removed.
+        let mut subscriptions = Vec::new();
         for (body, what) in [
             (
                 serde_json::json!({
@@ -36906,6 +36912,7 @@ mod tests {
             )
             .await;
             assert_eq!(resp.status, 201, "the {what} subscription is created");
+            subscriptions.push(crate::namf_server::EventSubscriptionGuard::of(&resp));
         }
         async fn next(rx: &mut mpsc::Receiver<String>, what: &str) -> serde_json::Value {
             let body = tokio::time::timeout(Duration::from_secs(3), rx.recv())
@@ -36973,6 +36980,7 @@ mod tests {
             }
         }
         ngap.ue_auth_state.remove(new_id);
+        drop(subscriptions);
         aoi_sink.stop().await.expect("sink stop");
         count_sink.stop().await.expect("sink stop");
     }

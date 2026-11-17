@@ -3040,6 +3040,51 @@ pub(crate) fn ues_in_area_fires_on_this_thread() -> u64 {
     UES_IN_AREA_FIRES_ON_THIS_THREAD.with(std::cell::Cell::get)
 }
 
+/// Test-only: removes one event subscription from the process-global store when
+/// dropped, even on a panic (#1614).
+///
+/// Hold one for every `anyUE` subscription a test creates with a sink it owns. Such
+/// a subscription is notified on EVERY UE's event in every later test
+/// ([`fire_ues_in_area_report`]), long after its sink has stopped. Once the OS hands
+/// the sink's port to another test's `bind(:0)` stand-in, that stand-in receives
+/// the notification. A path-switch stand-in SMF recorded one as an extra
+/// `("", "")` call.
+#[cfg(test)]
+#[must_use = "the subscription is removed when this is dropped"]
+pub(crate) struct EventSubscriptionGuard(String);
+
+#[cfg(test)]
+impl EventSubscriptionGuard {
+    /// The subscription a `201 Created` from `/namf-evts/v1/subscriptions` names.
+    ///
+    /// # Panics
+    ///
+    /// If the response carries no `subscriptionId`.
+    pub(crate) fn of(created: &SbiResponse) -> Self {
+        let body: Value = created
+            .http
+            .content
+            .as_deref()
+            .and_then(|c| serde_json::from_str(c).ok())
+            .unwrap_or_default();
+        Self(
+            body["subscriptionId"]
+                .as_str()
+                .expect("a created subscription names its subscriptionId")
+                .to_string(),
+        )
+    }
+}
+
+#[cfg(test)]
+impl Drop for EventSubscriptionGuard {
+    fn drop(&mut self) {
+        let ctx = amf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        guard.event_subscription_remove(&self.0);
+    }
+}
+
 /// Fire a `SUBSCRIPTION_ID_CHANGE` or `SUBSCRIPTION_ID_ADDITION` to a
 /// subscription's `subsChangeNotifyUri` (#397).
 ///
@@ -11980,6 +12025,8 @@ mod tests {
             "an unhonoured OBGAD reportingThreshold must not turn a conformant \
              subscription into a 400"
         );
+        // #1614: an any-UE subscription outlives the test unless removed.
+        let subscription = EventSubscriptionGuard::of(&resp);
 
         fire_ues_in_area_report();
         // #867: the capture server listens on a port other tests' subscriptions may
@@ -12021,6 +12068,7 @@ mod tests {
              UE` means"
         );
 
+        drop(subscription);
         server.stop().await.expect("server stop");
     }
 
