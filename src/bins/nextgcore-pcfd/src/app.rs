@@ -1076,15 +1076,21 @@ pub async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 /// `intersection(consumer, producer)`; advertising only genuinely-supported bits
 /// keeps a strict peer from depending on an unimplemented feature.
 ///
-/// AM (TS 29.507 §5.8): no optional features are negotiated, so the result is
-/// always "0" — the spec NOTE requires `suppFeat` present and set to 0 when
-/// negotiation is not needed.
-const PCF_AM_POLICY_SUPPORTED_FEATURES: u64 = 0x0;
+/// AM (TS 29.507 §5.8): #1524, UE-AMBR_Authorization (feature 3) only. A
+/// consumer that negotiates nothing gets "0", which the spec NOTE requires
+/// present when negotiation is not needed.
+const PCF_AM_POLICY_SUPPORTED_FEATURES: u64 = AM_FEATURE_UE_AMBR_AUTHORIZATION;
+/// TS 29.507 Table 5.8-1 feature 3, UE-AMBR_Authorization: bit 2, since feature 1
+/// is the least significant bit (TS 29.571 §5.2.2 SupportedFeatures).
+const AM_FEATURE_UE_AMBR_AUTHORIZATION: u64 = 1 << 2;
 /// SM (TS 29.512 §5.8): conservative optional-feature set the decision builder
 /// actually exercises. Intersected with the SMF-requested value.
 /// #1398: plus PCSCF-Restoration-Enhancement (feature 9), which
 /// [`handle_pcscf_restoration`] signals with `pcscfRestIndication`.
-const PCF_SM_POLICY_SUPPORTED_FEATURES: u64 = 0x3 | SM_FEATURE_PCSCF_RESTORATION_ENHANCEMENT;
+/// #1541: plus VPLMN-QoS-Control (feature 49), which bounds the decision by the
+/// SMF's `vplmnQos` ([`crate::vplmn_qos`]).
+const PCF_SM_POLICY_SUPPORTED_FEATURES: u64 =
+    0x3 | SM_FEATURE_PCSCF_RESTORATION_ENHANCEMENT | crate::vplmn_qos::SM_FEATURE_VPLMN_QOS_CONTROL;
 /// TS 29.512 Table 5.8-1 feature 9, PCSCF-Restoration-Enhancement: bit 8, since
 /// feature 1 is the least significant bit (TS 29.571 §5.2.2 SupportedFeatures).
 pub(crate) const SM_FEATURE_PCSCF_RESTORATION_ENHANCEMENT: u64 = 1 << 8;
@@ -1104,13 +1110,25 @@ fn negotiate_features(consumer_hex: Option<&str>, supported: u64) -> String {
 
 /// [`negotiate_features`] as the bitmask, for a session that keeps what it
 /// negotiated (#1398).
+///
+/// #1596: TS 29.571 §5.2.2 `SupportedFeatures` is a hex string of any length,
+/// features 1-4 in the LAST character, and TS 29.512 defines SM features past 64.
+/// Every producer mask here fits in 64 bits, so the intersection is decided by
+/// the last 16 characters alone; the characters before them only name features
+/// this PCF does not support. The whole string must still be hex (the OpenAPI
+/// pattern `^[A-Fa-f0-9]*$`), else nothing is negotiated. Before, the string was
+/// parsed as one u64, so a consumer setting any feature above 64 negotiated
+/// nothing at all.
 fn negotiated_feature_bits(consumer_hex: Option<&str>, supported: u64) -> u64 {
-    let consumer = consumer_hex
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .and_then(|s| u64::from_str_radix(s, 16).ok())
-        .unwrap_or(0);
-    consumer & supported
+    let Some(hex) = consumer_hex.map(str::trim).filter(|s| !s.is_empty()) else {
+        return 0;
+    };
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return 0;
+    }
+    // ASCII only (checked above), so a byte index is a char boundary.
+    let low = &hex[hex.len().saturating_sub(16)..];
+    u64::from_str_radix(low, 16).unwrap_or(0) & supported
 }
 
 // AM Policy Control handlers
@@ -1128,9 +1146,29 @@ fn negotiated_feature_bits(consumer_hex: Option<&str>, supported: u64) -> u64 {
 /// only, which is all it holds. `rfsp` is range-checked (1..=256) because a value
 /// outside it is not an `RfspIndex` and forwarding it would push the rejection
 /// onto the AMF.
-async fn provision_am_policy(supi: &str) -> serde_json::Map<String, serde_json::Value> {
-    let am_data = sbi_path::pcf_udr_am_subscription_data(supi).await;
-    am_policy_from(supi, am_data.as_ref())
+///
+/// #1597: `Err` when the UDR answered a 5xx (TS 29.504 SYSTEM_FAILURE, #1534).
+/// That is not "nothing provisioned": deciding from it would authorise an AM
+/// policy without the subscriber's restrictions.
+async fn provision_am_policy(
+    supi: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, sbi_path::UdrError> {
+    let am_data = sbi_path::pcf_udr_am_subscription_data(supi).await?;
+    Ok(am_policy_from(supi, am_data.as_ref()))
+}
+
+/// #1597: the answer to a policy create whose UDR read failed: `500
+/// SYSTEM_FAILURE` (TS 29.500 Table 5.2.7.2-1, "generic error condition in the
+/// NF"). The PCF has no basis for a decision, and authorising the local default
+/// would drop the subscriber's provisioned policy.
+fn udr_read_failed(what: &str, supi: &str, e: &sbi_path::UdrError) -> SbiResponse {
+    log::error!("[{supi}] {what}: the UDR read failed ({e}); the create is refused");
+    nextgcore_sbi::server::send_error(
+        500,
+        "Internal Server Error",
+        &format!("{what}: the subscription data could not be read from the UDR"),
+        Some("SYSTEM_FAILURE"),
+    )
 }
 
 /// [`provision_am_policy`] from an AM subscription data document already read
@@ -1187,6 +1225,54 @@ fn am_policy_from(
         }
     }
     policy
+}
+
+/// #1524: whether an AM policy association carries an authorised UE-AMBR. TS
+/// 29.507 §4.2.2.2 item c and §4.2.3.2 item c include `ueAmbr` only "if the
+/// feature UE-AMBR_Authorization is supported and the PCF received the `ueAmbr`
+/// attribute in the request"; §4.2.3.3.2 and Table 5.6.2.2-1 gate it on the
+/// feature, and §4.2.3.2 NOTE 2 gates `UE_AMBR_CH` on it.
+fn am_ue_ambr_authorised(ue_am: &PcfUeAm) -> bool {
+    ue_am.am_policy_control_features & AM_FEATURE_UE_AMBR_AUTHORIZATION != 0
+        && ue_am.ue_ambr_requested
+}
+
+/// #1524: drop `ueAmbr` and `UE_AMBR_CH` from an association's policy and
+/// triggers unless it authorises a UE-AMBR ([`am_ue_ambr_authorised`]).
+fn gate_am_ue_ambr(
+    authorised: bool,
+    policy: &mut serde_json::Map<String, serde_json::Value>,
+    triggers: &mut Vec<String>,
+) {
+    if !authorised {
+        policy.remove("ueAmbr");
+        triggers.retain(|t| t != "UE_AMBR_CH");
+    }
+}
+
+/// #1580: `policy` without the request-conditioned members the consumer did not
+/// send: TS 29.507 §4.2.2.2 / §4.2.3.2 items a and b answer `servAreaRes` and
+/// `rfsp` only "if the PCF received" that attribute in the request. The stored
+/// policy keeps them, because a PCF-initiated PolicyUpdate (§4.2.3.3.2) is not
+/// request-conditioned and diffs against it.
+fn am_answer_policy(
+    policy: Option<&serde_json::Value>,
+    serv_area_res: bool,
+    rfsp: bool,
+) -> Option<serde_json::Value> {
+    let mut answered = policy.cloned()?;
+    if let Some(members) = answered.as_object_mut() {
+        if !serv_area_res {
+            members.remove("servAreaRes");
+        }
+        if !rfsp {
+            members.remove("rfsp");
+        }
+        if members.is_empty() {
+            return None;
+        }
+    }
+    Some(answered)
 }
 
 /// The `RequestTrigger`s a consumer asked this association to watch, plus the
@@ -1321,6 +1407,13 @@ pub async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
         return send_bad_request("suppFeat is required", Some("MANDATORY_IE_MISSING"));
     };
 
+    // Provision the access-and-mobility policy before the association exists, so a
+    // failed UDR read (#1597) refuses the create without leaving one behind.
+    let mut policy = match provision_am_policy(supi).await {
+        Ok(policy) => policy,
+        Err(e) => return udr_read_failed("AM policy create", supi, &e),
+    };
+
     // Add UE AM to context
     let ctx = pcf_self();
     let ue_am = if let Ok(context) = ctx.read() {
@@ -1331,10 +1424,17 @@ pub async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
 
     match ue_am {
         Some(ue_am) => {
-            // Provision the access-and-mobility policy and the triggers before
-            // storing, so the association carries them from the moment it exists.
-            let policy = provision_am_policy(supi).await;
-            let triggers = am_policy_triggers(&policy_data, &policy);
+            // The triggers before storing, so the association carries them and the
+            // policy from the moment it exists.
+            let mut triggers = am_policy_triggers(&policy_data, &policy);
+            let features =
+                negotiated_feature_bits(Some(supp_feat), PCF_AM_POLICY_SUPPORTED_FEATURES);
+            let mut updated = ue_am.clone();
+            updated.am_policy_control_features = features;
+            updated.ue_ambr_requested = policy_data.get("ueAmbr").is_some();
+            updated.serv_area_res_requested = policy_data.get("servAreaRes").is_some();
+            updated.rfsp_requested = policy_data.get("rfsp").is_some();
+            gate_am_ue_ambr(am_ue_ambr_authorised(&updated), &mut policy, &mut triggers);
             let am_policy = if policy.is_empty() {
                 None
             } else {
@@ -1345,7 +1445,6 @@ pub async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
             // Persist the notification URI so later AM policy update notifies
             // (pcf_sbi_send_am_policy_control_notify) can reach the AMF.
             {
-                let mut updated = ue_am.clone();
                 updated.notification_uri = Some(notification_uri.to_string());
                 updated.alt_notif_uris = alt_notif_uris;
                 updated.triggers = triggers.clone();
@@ -1365,8 +1464,13 @@ pub async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
                 &ue_am.association_id,
                 supi,
                 &triggers,
-                am_policy.as_ref(),
-                &negotiate_features(Some(supp_feat), PCF_AM_POLICY_SUPPORTED_FEATURES),
+                am_answer_policy(
+                    am_policy.as_ref(),
+                    updated.serv_area_res_requested,
+                    updated.rfsp_requested,
+                )
+                .as_ref(),
+                &format!("{features:x}"),
             );
 
             SbiResponse::with_status(201)
@@ -1400,11 +1504,16 @@ pub async fn handle_am_policy_get(pol_asso_id: &str) -> SbiResponse {
                 &ue_am.association_id,
                 &ue_am.supi,
                 &ue_am.triggers,
-                ue_am.am_policy.as_ref(),
-                // The association's negotiated value is fixed at create; the
-                // producer set is a constant, so re-negotiating the stored
-                // consumer features would give the same answer.
-                &negotiate_features(None, PCF_AM_POLICY_SUPPORTED_FEATURES),
+                // #1580: as the create answered it.
+                am_answer_policy(
+                    ue_am.am_policy.as_ref(),
+                    ue_am.serv_area_res_requested,
+                    ue_am.rfsp_requested,
+                )
+                .as_ref(),
+                // #1524: the value negotiated at create, which the association
+                // keeps; it used to be re-negotiated from nothing, so "0".
+                &format!("{:x}", ue_am.am_policy_control_features),
             ))
             .unwrap_or_else(|_| SbiResponse::with_status(200)),
         None => send_not_found(
@@ -1520,18 +1629,49 @@ pub async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
         }
     }
 
+    // #1524: an AMF that reports a subscribed UE-AMBR change sends `ueAmbr`
+    // (TS 29.507 §4.2.3.2 item 14), which asks this association for an
+    // authorised one from then on.
+    let update_has_ue_ambr = update_data.get("ueAmbr").is_some();
+    updated.ue_ambr_requested |= update_has_ue_ambr;
+    // #1580: as `servAreaRes` / `rfsp` the AMF reports changed (items 3 and 4).
+    let update_has_serv_area_res = update_data.get("servAreaRes").is_some();
+    let update_has_rfsp = update_data.get("rfsp").is_some();
+    updated.serv_area_res_requested |= update_has_serv_area_res;
+    updated.rfsp_requested |= update_has_rfsp;
+
     // Re-evaluate the provisioned policy: an update is the point at which the
     // subscription is consulted again, which is what makes servAreaRes / rfsp /
     // ueAmbr able to change after the association is created.
-    let policy = provision_am_policy(&updated.supi).await;
-    let am_policy = if policy.is_empty() {
-        None
-    } else {
-        Some(serde_json::Value::Object(policy))
-    };
-    if am_policy != updated.am_policy {
-        updated.am_policy = am_policy.clone();
-        changed.push("policy");
+    // #1597: a failed UDR read keeps the policy the association holds rather than
+    // re-deciding from an outage, which would drop provisioned restrictions.
+    let authorised = am_ue_ambr_authorised(&updated);
+    match provision_am_policy(&updated.supi).await {
+        Ok(mut policy) => {
+            gate_am_ue_ambr(authorised, &mut policy, &mut updated.triggers);
+            let am_policy = if policy.is_empty() {
+                None
+            } else {
+                Some(serde_json::Value::Object(policy))
+            };
+            if am_policy != updated.am_policy {
+                updated.am_policy = am_policy.clone();
+                changed.push("policy");
+            }
+        }
+        Err(e) => {
+            gate_am_ue_ambr(
+                authorised,
+                &mut serde_json::Map::new(),
+                &mut updated.triggers,
+            );
+            log::warn!(
+                "[{}] AM policy update: the UDR read failed ({e}); association {} keeps \
+                 its policy",
+                updated.supi,
+                pol_asso_id
+            );
+        }
     }
 
     if let Ok(context) = ctx.read() {
@@ -1566,12 +1706,24 @@ pub async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
     }
 
     // The 200 response schema is PolicyUpdate, not PolicyAssociation: it carries
-    // resourceUri and the changed policy.
+    // resourceUri and the changed policy. #1524: `ueAmbr` only when this request
+    // carried one (TS 29.507 §4.2.3.2 item c).
+    // #1580: `servAreaRes` / `rfsp` likewise (items a and b).
+    let mut answered = am_answer_policy(
+        updated.am_policy.as_ref(),
+        update_has_serv_area_res,
+        update_has_rfsp,
+    );
+    if !update_has_ue_ambr {
+        if let Some(policy) = answered.as_mut().and_then(|p| p.as_object_mut()) {
+            policy.remove("ueAmbr");
+        }
+    }
     SbiResponse::with_status(200)
         .with_json_body(&sbi_path::build_am_policy_update(
             &updated.association_id,
             &updated.triggers,
-            updated.am_policy.as_ref(),
+            answered.as_ref(),
         ))
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
@@ -1725,7 +1877,19 @@ fn spawn_ue_policy_delivery(pol_asso_id: &str, supi: &str, data: &serde_json::Va
         // UePolicySet (TS 29.519 §5.4), bounded so a stuck UDR cannot block
         // delivery; fall back to the static default set on absence / timeout /
         // malformed doc (fail-closed — never a half-parsed provisioned set).
-        let udr_doc = sbi_path::pcf_udr_ue_policy_set(&supi).await;
+        // #1597: a failed UDR read delivers nothing, rather than the static
+        // default in place of what the operator provisioned; the UE keeps the
+        // policy it has.
+        let udr_doc = match sbi_path::pcf_udr_ue_policy_set(&supi).await {
+            Ok(doc) => doc,
+            Err(e) => {
+                log::warn!(
+                    "[{supi}] UE policy delivery for {id}: the UDR read failed ({e}); \
+                     nothing is delivered"
+                );
+                return;
+            }
+        };
         let rules = ue_policy::resolve_ursp_rules(udr_doc.as_ref());
         // E3: provision the resolved rules into the per-SUPI UE-policy context
         // (the mapping target; E6 reads it to correlate the COMPLETE/REJECT).
@@ -2863,6 +3027,24 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
     // a later `SE_AMBR_CH` update that reports only the trigger still has the
     // subscribed bound to authorise against.
     let subs_sess_ambr = parse_subs_sess_ambr(policy_data.get("subsSessAmbr"));
+    // #1541: TS 29.512 §4.2.2.2, the QoS the VPLMN supports, when VPLMN-QoS-Control
+    // is negotiated. Refused when malformed: a bound this PCF cannot read is one it
+    // cannot honour, and authorising past it is what the clause forbids.
+    let vplmn_qos = match policy_data.get("vplmnQos") {
+        Some(v)
+            if negotiated_feature_bits(
+                policy_data.get("suppFeat").and_then(|v| v.as_str()),
+                PCF_SM_POLICY_SUPPORTED_FEATURES,
+            ) & crate::vplmn_qos::SM_FEATURE_VPLMN_QOS_CONTROL
+                != 0 =>
+        {
+            match crate::vplmn_qos::parse(v) {
+                Ok(bound) => Some(bound),
+                Err(why) => return send_bad_request(&why, Some("MANDATORY_IE_INCORRECT")),
+            }
+        }
+        _ => None,
+    };
 
     // TS 29.512 §4.2.7 / §5.2.3.2: the SMF forwards the AMF's origination
     // timestamp. A value that is present but unreadable is refused rather than
@@ -2934,6 +3116,13 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
             if let Some(ref ip) = ipv4_address {
                 sess.set_ipv4addr(ip);
             }
+            // #1527: TS 29.512 SmPolicyContextData.ipDomain (NOTE 11), what tells
+            // sessions sharing a private IPv4 apart in a P-CSCF restoration.
+            sess.ip_domain = policy_data
+                .get("ipDomain")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             if let Some(ref prefix) = ipv6_address_prefix {
                 if !sess.set_ipv6prefix(prefix) {
                     log::warn!("SM policy create: unparseable ipv6AddressPrefix {prefix}");
@@ -2967,6 +3156,7 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
                 policy_data.get("suppFeat").and_then(|v| v.as_str()),
                 PCF_SM_POLICY_SUPPORTED_FEATURES,
             );
+            sess.vplmn_qos = vplmn_qos.clone();
             if let Ok(context) = ctx.read() {
                 context.sess_update(&sess);
             }
@@ -3000,11 +3190,6 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
                 }
             }
 
-            // Register the PCF↔PDU-session binding with the BSF so an AF can
-            // discover the serving PCF (TS 23.503 §6.1.1.2, TS 29.521). Best
-            // effort: no-op when no BSF/NRF is reachable.
-            sbi_path::pcf_sess_register_bsf_binding(sess.id);
-
             // Query real session data from UDR/database
             let s_nssai = SNssai { sst, sd };
             let session_data = pcf_get_session_data(supi, None, &s_nssai, dnn);
@@ -3014,7 +3199,25 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
             // the local subscription/config data as the documented fallback. The QoS/ARP/
             // AMBR/PCC decision is not re-derived from this resource (SmPolicyDnnData does
             // not carry them); only the spec-defined online/offline charging flags are.
-            let udr_dnn_data = sbi_path::pcf_udr_sm_policy_dnn_data(supi, sst, sd, dnn).await;
+            let udr_dnn_data = match sbi_path::pcf_udr_sm_policy_dnn_data(supi, sst, sd, dnn).await
+            {
+                Ok(doc) => doc,
+                Err(e) => {
+                    // #1597: an outage is not "nothing provisioned". The session was
+                    // added above; it is removed (before any BSF binding exists, which
+                    // is why the registration follows this read) so the refused
+                    // create leaves no state behind, as the UAV reject does.
+                    if let Ok(context) = ctx.read() {
+                        context.sess_remove(sess.id);
+                    }
+                    return udr_read_failed("SM policy create", supi, &e);
+                }
+            };
+
+            // Register the PCF↔PDU-session binding with the BSF so an AF can
+            // discover the serving PCF (TS 23.503 §6.1.1.2, TS 29.521). Best
+            // effort: no-op when no BSF/NRF is reachable.
+            sbi_path::pcf_sess_register_bsf_binding(sess.id);
             if udr_dnn_data.is_some() {
                 log::info!(
                     "UDR SmPolicyData retrieved over Nudr_DataRepository for SUPI {supi} dnn={dnn}"
@@ -3527,12 +3730,13 @@ async fn reauthorise_sm_sessions(
 const UDR_REREAD_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The AM policy members a PCF-initiated PolicyUpdate carries when they change
-/// (TS 29.507 §4.2.3.3.2): the Service Area Restriction and the RFSP index.
+/// (TS 29.507 §4.2.3.3.2): the Service Area Restriction, the RFSP index and the
+/// UE-AMBR.
 ///
-/// `ueAmbr` is not among them: §4.2.3.3.2 includes it only "if the
-/// UE-AMBR_Authorization feature is supported", and this PCF negotiates no AM
-/// feature (`PCF_AM_POLICY_SUPPORTED_FEATURES` is 0).
-const AM_UPDATE_NOTIFY_MEMBERS: [&str; 2] = ["servAreaRes", "rfsp"];
+/// §4.2.3.3.2 includes `ueAmbr` only "if the UE-AMBR_Authorization feature is
+/// supported": #1524, [`reevaluate_am_policy`] drops it from both policies it
+/// compares unless the association authorises one ([`gate_am_ue_ambr`]).
+const AM_UPDATE_NOTIFY_MEMBERS: [&str; 3] = ["servAreaRes", "rfsp", "ueAmbr"];
 
 /// The members of a re-evaluated AM policy that a PCF-initiated PolicyUpdate must
 /// carry (#1261): each [`AM_UPDATE_NOTIFY_MEMBERS`] member that was added or whose
@@ -3601,8 +3805,15 @@ async fn reevaluate_am_policy(udr: &sbi_path::DiscoveredEndpoint, ue_am: PcfUeAm
             return false;
         }
     };
-    let policy = am_policy_from(&supi, am_data.as_ref());
-    let (changes, removed) = am_policy_changes(ue_am.am_policy.as_ref(), &policy);
+    let mut policy = am_policy_from(&supi, am_data.as_ref());
+    let authorised = am_ue_ambr_authorised(&ue_am);
+    gate_am_ue_ambr(authorised, &mut policy, &mut Vec::new());
+    let mut stored = ue_am.am_policy.clone();
+    if let Some(stored) = stored.as_mut().and_then(|p| p.as_object_mut()) {
+        // A policy stored before #1524 can hold an unauthorised `ueAmbr`.
+        gate_am_ue_ambr(authorised, stored, &mut Vec::new());
+    }
+    let (changes, removed) = am_policy_changes(stored.as_ref(), &policy);
     if !removed.is_empty() {
         log::warn!(
             "[{supi}] AM policy re-evaluation: {removed:?} no longer provisioned. PolicyUpdate \
@@ -3784,8 +3995,24 @@ pub async fn handle_sm_policy_update_notify(
                 new_ipv4.is_some_and(|ip| sess.ipv4addr_string.as_deref() != Some(ip));
             let ipv6_changed =
                 new_ipv6.is_some_and(|p| sess.ipv6prefix_string.as_deref() != Some(p));
+            // #1527: SmPolicyUpdateContextData.ipDomain (TS 29.512 §4.2.4.1).
+            let new_domain = update_data
+                .get("ipDomain")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .filter(|d| sess.ip_domain.as_deref() != Some(*d));
+            if let Some(domain) = new_domain {
+                if let Ok(context) = ctx.read() {
+                    context.sess_modify(sess.id, |s| s.ip_domain = Some(domain.to_string()));
+                }
+            }
             if ipv4_changed || ipv6_changed {
-                let mut latest = sess.clone();
+                let mut latest = match ctx.read() {
+                    Ok(context) => context
+                        .sess_find_by_id(sess.id)
+                        .unwrap_or_else(|| sess.clone()),
+                    Err(_) => sess.clone(),
+                };
                 if let Some(ip) = new_ipv4.filter(|_| ipv4_changed) {
                     latest.set_ipv4addr(ip);
                 }
@@ -3989,6 +4216,40 @@ pub async fn handle_sm_policy_update_notify(
             // direction, independently, because a subscription that lowers only the
             // uplink must not touch the downlink), the same setting the create and
             // the UpdateNotify apply.
+            // #1541: TS 29.512 §4.2.4.4 / §4.2.4.5, VPLMN_QOS_CH with the new
+            // `vplmnQos`, or `vplmnQosNotApp: true` when the constraints no longer
+            // apply. Stored before the arms below so each authorises against it.
+            let vplmn_reported =
+                sess.smpolicycontrol_features & crate::vplmn_qos::SM_FEATURE_VPLMN_QOS_CONTROL != 0
+                    && triggers.iter().any(|t| t == "VPLMN_QOS_CH");
+            let sess = if vplmn_reported {
+                let fresh =
+                    if update_data.get("vplmnQosNotApp").and_then(|v| v.as_bool()) == Some(true) {
+                        None
+                    } else {
+                        match update_data.get("vplmnQos").map(crate::vplmn_qos::parse) {
+                            Some(Ok(bound)) => Some(bound),
+                            Some(Err(why)) => {
+                                return send_bad_request(&why, Some("MANDATORY_IE_INCORRECT"))
+                            }
+                            // The trigger without either member: nothing to apply.
+                            None => sess.vplmn_qos.clone(),
+                        }
+                    };
+                log::info!(
+                    "VPLMN_QOS_CH for smPolicyId={sm_policy_id}: VPLMN QoS constraints \
+                     {fresh:?}"
+                );
+                if let Ok(context) = ctx.read() {
+                    context.sess_modify(sess.id, |s| s.vplmn_qos = fresh.clone());
+                }
+                let mut latest = sess.clone();
+                latest.vplmn_qos = fresh;
+                latest
+            } else {
+                sess
+            };
+
             let sess_rules = if triggers.iter().any(|t| t == "SE_AMBR_CH") {
                 let dnn = sess.dnn.as_deref().unwrap_or("internet");
                 // The real SUPI. Resolved through the session's parent UE-SM, which is
@@ -4043,7 +4304,10 @@ pub async fn handle_sm_policy_update_notify(
                     // the DB answers again.
                     // #1402: the one helper every path caps through, with the bound
                     // this update just reported (or the stored one).
-                    let capped_by_subs = crate::session_ambr_cap::apply(&sd, bound.as_ref());
+                    let subs_only = crate::session_ambr_cap::apply(&sd, bound.as_ref());
+                    // #1541: and never past the VPLMN's Session-AMBR (§4.2.4.4).
+                    let capped_by_subs =
+                        crate::vplmn_qos::apply(&subs_only, sess.vplmn_qos.as_ref());
                     let (auth_ul, auth_dl) =
                         (capped_by_subs.ambr_uplink, capped_by_subs.ambr_downlink);
                     log::info!(
@@ -4060,9 +4324,12 @@ pub async fn handle_sm_policy_update_notify(
                     // falls back to it rather than to the pre-bound value.
                     if let Ok(context) = ctx.read() {
                         if let Some(mut stored) = context.sess_find_by_sm_policy_id(sm_policy_id) {
+                            // #1541: without the VPLMN bound, which every build
+                            // re-applies from `vplmn_qos`, so lifting it later
+                            // (vplmnQosNotApp) is not undone by this fallback.
                             stored.authorised_session_data = Some(nudr_handler::SessionData {
-                                ambr_uplink: auth_ul,
-                                ambr_downlink: auth_dl,
+                                ambr_uplink: subs_only.ambr_uplink,
+                                ambr_downlink: subs_only.ambr_downlink,
                                 ..sd.clone()
                             });
                             context.sess_update(&stored);
@@ -4074,20 +4341,25 @@ pub async fn handle_sm_policy_update_notify(
                     let bounded = nudr_handler::SessionData {
                         ambr_uplink: auth_ul,
                         ambr_downlink: auth_dl,
-                        ..sd.clone()
+                        // #1541: with the VPLMN-bounded default QoS.
+                        ..capped_by_subs.clone()
                     };
                     let capped = sbi_path::effective_session_data(&sess.sm_policy_id, &bounded);
                     let (auth_ul, auth_dl) = (capped.ambr_uplink, capped.ambr_downlink);
                     let sess_rule_id = format!("SessRule-{}", sess.sm_policy_id);
-                    serde_json::json!({
-                        &sess_rule_id: {
-                            "sessRuleId": sess_rule_id,
-                            "authSessAmbr": {
-                                "uplink": format_bitrate(auth_ul),
-                                "downlink": format_bitrate(auth_dl),
-                            },
-                        }
-                    })
+                    let mut rule = serde_json::json!({
+                        "sessRuleId": sess_rule_id,
+                        "authSessAmbr": {
+                            "uplink": format_bitrate(auth_ul),
+                            "downlink": format_bitrate(auth_dl),
+                        },
+                    });
+                    if vplmn_reported {
+                        // #1541: a VPLMN_QOS_CH in the same update also re-derives
+                        // the default QoS (§4.2.4.5).
+                        rule["authDefQos"] = auth_def_qos_json(&capped);
+                    }
+                    serde_json::json!({ &sess_rule_id: rule })
                 } else {
                     // Neither readable nor stored: no session rule, and the SMF keeps
                     // the AMBR it has (TS 29.512 §4.2.6.1: no entry, no change).
@@ -4098,6 +4370,11 @@ pub async fn handle_sm_policy_update_notify(
                     );
                     serde_json::json!({})
                 }
+            } else if vplmn_reported {
+                // #1541: TS 29.512 §4.2.4.4 / §4.2.4.5: the authorised Session-AMBR and
+                // default QoS, re-derived within the VPLMN's new constraints (or
+                // without them), in the response.
+                vplmn_qos_ch_sess_rules(&sess)
             } else {
                 serde_json::json!({})
             };
@@ -4119,6 +4396,56 @@ pub async fn handle_sm_policy_update_notify(
             Some("POLICY_NOT_FOUND"),
         ),
     }
+}
+
+/// #1541: `authDefQos` (TS 29.512 `AuthorizedDefaultQos`) for `sd`, as the create
+/// builds it.
+fn auth_def_qos_json(sd: &nudr_handler::SessionData) -> serde_json::Value {
+    serde_json::json!({
+        "5qi": sd.qos_index,
+        "arp": crate::sm_policy_build::arp_json(
+            sd.arp_priority_level,
+            sd.arp_preempt_cap,
+            sd.arp_preempt_vuln,
+        ),
+    })
+}
+
+/// #1541: the session rule a VPLMN_QOS_CH update is answered with: the
+/// Session-AMBR and default QoS re-derived through `decision_session_data`
+/// (operator cap, the VPLMN bound now stored on `sess`, override), from the
+/// session data a re-evaluation reads. `{}` (no change, §4.2.6.1) when the
+/// session's SUPI or session data cannot be had.
+fn vplmn_qos_ch_sess_rules(sess: &PcfSess) -> serde_json::Value {
+    let supi = pcf_self()
+        .read()
+        .ok()
+        .and_then(|context| context.ue_sm_find_by_id(sess.pcf_ue_sm_id))
+        .map(|ue| ue.supi)
+        .unwrap_or_default();
+    if supi.is_empty() {
+        log::warn!(
+            "VPLMN_QOS_CH for smPolicyId={}: the session's SUPI cannot be resolved; no \
+             session rule is authorised",
+            sess.sm_policy_id
+        );
+        return serde_json::json!({});
+    }
+    let Some(sd) = sbi_path::session_data_for_reevaluation(sess, &supi, "VPLMN_QOS_CH") else {
+        return serde_json::json!({});
+    };
+    let auth = sbi_path::decision_session_data(sess, &sd);
+    let sess_rule_id = format!("SessRule-{}", sess.sm_policy_id);
+    serde_json::json!({
+        &sess_rule_id: {
+            "sessRuleId": sess_rule_id,
+            "authSessAmbr": {
+                "uplink": format_bitrate(auth.ambr_uplink),
+                "downlink": format_bitrate(auth.ambr_downlink),
+            },
+            "authDefQos": auth_def_qos_json(&auth),
+        }
+    })
 }
 
 // Policy Authorization handlers
@@ -4300,37 +4627,80 @@ fn validate_asc_req_data(asc: &AscReqData) -> Result<UeAddress, Box<SbiResponse>
     }
 }
 
-/// Resolve the PDU session an AF request is about.
+/// Resolve the PDU session an AF request is about (TS 29.514 §4.2.2.2).
+///
+/// #1583: through [`bind_one_session`], with every binding attribute the request
+/// carries: the UE address, `ipDomain` (NOTE 4), `sliceInfo` (NOTE 5), `dnn` and
+/// `supi`. "All attributes must match, if provided" (NOTE 7). A private IPv4 two
+/// sessions share is bound only when the other attributes tell them apart; it
+/// used to bind to whichever session the one-slot IPv4 index held. `gpsi` is not
+/// a session attribute this PCF holds, so it is not compared.
 ///
 /// `ueMac` is validated as a UE-address form but cannot resolve anything here:
-/// binding by MAC needs a session attribute this PCF never receives — nothing in
-/// the tree sends a MAC on the SM policy create — so it fails the binding rather
-/// than being bound to a guess. TS 29.514 §4.2.2.2's answer for "cannot
-/// associate with an existing PDU session" is exactly what the caller then
-/// returns.
-fn bind_ue_address(address: &UeAddress) -> Option<PcfSess> {
-    let ctx = pcf_self();
-    let context = ctx.read().ok()?;
-    match address {
-        UeAddress::Ipv4(ip) => context.sess_find_by_ipv4addr(ip),
-        UeAddress::Ipv6(ip) => context.sess_find_by_ipv6_ue_addr(ip),
+/// binding by MAC needs a session attribute this PCF never receives, so it fails
+/// the binding rather than being bound to a guess.
+///
+/// `Err` is the binding failure, answered by [`pdu_session_not_available`], or a
+/// 400 for a malformed `sliceInfo`.
+fn bind_af_session(
+    address: &UeAddress,
+    req_root: &serde_json::Value,
+) -> Result<PcfSess, Box<SbiResponse>> {
+    let text = |key: &str| {
+        req_root
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    let Ok(slice) = parse_binding_snssai(req_root.get("sliceInfo")) else {
+        return Err(Box::new(send_bad_request(
+            "AppSessionContextReqData.sliceInfo is not an Snssai",
+            Some("MANDATORY_IE_INCORRECT"),
+        )));
+    };
+    let binding = match address {
+        UeAddress::Ipv4(ip) => ip
+            .parse::<std::net::Ipv4Addr>()
+            .ok()
+            .map(|ip| BindingAddress::V4(u32::from(ip))),
+        UeAddress::Ipv6(ip) => ip
+            .parse::<std::net::Ipv6Addr>()
+            .ok()
+            .map(|ip| BindingAddress::V6(ip.octets())),
         UeAddress::Mac(mac) => {
             log::warn!("AF request bound by ueMac={mac}: no MAC-keyed session exists in this PCF");
             None
         }
-    }
+    };
+    let Some(binding) = binding else {
+        return Err(Box::new(pdu_session_not_available(&format!(
+            "no PDU session can be bound to {address:?}"
+        ))));
+    };
+    bind_one_session(&BindingKeys {
+        address: binding,
+        ip_domain: text("ipDomain"),
+        slice,
+        supi: text("supi"),
+        dnn: text("dnn"),
+    })
+    .map_err(|why| Box::new(pdu_session_not_available(&why)))
 }
 
-/// `403 PDU_SESSION_NOT_AVAILABLE` — TS 29.514 §4.2.2.2's answer when the PCF
-/// cannot associate an AF request with an existing PDU session.
-fn pdu_session_not_available(address: &UeAddress) -> SbiResponse {
-    SbiResponse::with_status(403)
-        .with_json_body(&serde_json::json!({
-            "status": 403,
-            "cause": "PDU_SESSION_NOT_AVAILABLE",
-            "detail": format!("No PDU session bound to {address:?}"),
-        }))
-        .unwrap_or_else(|_| SbiResponse::with_status(403))
+/// `500 PDU_SESSION_NOT_AVAILABLE`: TS 29.514 §4.2.2.2, "If the PCF fails in
+/// executing session binding, the PCF shall reject the
+/// Npcf_PolicyAuthorization_Create service operation with an HTTP "500 Internal
+/// Server Error" ... "cause" attribute set to "PDU_SESSION_NOT_AVAILABLE"" (also
+/// Table 5.7.3-1). #1583: it was a 403.
+fn pdu_session_not_available(detail: &str) -> SbiResponse {
+    log::warn!("App session create refused: {detail}");
+    nextgcore_sbi::server::send_error(
+        500,
+        "Internal Server Error",
+        detail,
+        Some("PDU_SESSION_NOT_AVAILABLE"),
+    )
 }
 
 /// Whether AscRespData is conditionally required in the response (TS 29.514
@@ -4423,13 +4793,13 @@ pub async fn handle_app_session_create(request: &SbiRequest) -> SbiResponse {
     // Bind the AF session to the PCC session via the UE address so AF-triggered
     // PCC rule changes can be pushed to the SMF. TS 29.514 §4.2.2.2: when the
     // PCF cannot associate the request with an existing PDU session it REFUSES
-    // with 403 PDU_SESSION_NOT_AVAILABLE. Before #88 it minted a UUID, stored
+    // with PDU_SESSION_NOT_AVAILABLE (500, #1583). Before #88 it minted a UUID, stored
     // nothing and answered 201, so the AF believed authorisation had succeeded
     // while no PCC rule existed and the appSessionId it was given was not
     // addressable.
-    let Some(bound_sess) = bind_ue_address(&address) else {
-        log::warn!("App session create refused: no PDU session bound to {address:?}");
-        return pdu_session_not_available(&address);
+    let bound_sess = match bind_af_session(&address, req_root) {
+        Ok(sess) => sess,
+        Err(resp) => return *resp,
     };
 
     let ctx = pcf_self();
@@ -4668,18 +5038,220 @@ pub async fn handle_events_subscription_delete(app_session_id: &str) -> SbiRespo
     }
 }
 
+/// #1527: `500 PDU_SESSION_NOT_AVAILABLE`, TS 29.514 §4.2.2.27: "If the PCF fails
+/// in identifying the PDU session, the PCF shall reject the "P-CSCF restoration"
+/// custom operation with an HTTP "500 Internal Server Error" ... "cause" attribute
+/// set to "PDU_SESSION_NOT_AVAILABLE"".
+fn pcscf_restoration_session_not_available(detail: &str) -> SbiResponse {
+    log::warn!("P-CSCF restoration: {detail}");
+    nextgcore_sbi::server::send_error(
+        500,
+        "Internal Server Error",
+        detail,
+        Some("PDU_SESSION_NOT_AVAILABLE"),
+    )
+}
+
+/// #1583: a TS 29.571 `Snssai` from JSON: `Ok(None)` when absent, `Err` when it is
+/// not one (sst 0..255; sd, when present, exactly six hex digits).
+fn parse_binding_snssai(v: Option<&serde_json::Value>) -> Result<Option<SNssai>, ()> {
+    let Some(v) = v else {
+        return Ok(None);
+    };
+    let sst = v.get("sst").and_then(|x| x.as_u64()).filter(|x| *x <= 255);
+    let sd = match v.get("sd") {
+        None => Some(None),
+        Some(sd) => sd
+            .as_str()
+            // Exactly six hex digits: `from_str_radix` alone also takes a leading '+'.
+            .filter(|sd| sd.len() == 6 && sd.chars().all(|c| c.is_ascii_hexdigit()))
+            .and_then(|sd| u32::from_str_radix(sd, 16).ok())
+            .map(Some),
+    };
+    match (sst, sd) {
+        (Some(sst), Some(sd)) => Ok(Some(SNssai { sst: sst as u8, sd })),
+        _ => Err(()),
+    }
+}
+
+/// #1583: the UE address a session binding is keyed by.
+#[derive(Debug, Clone, Copy)]
+enum BindingAddress {
+    V4(u32),
+    V6([u8; 16]),
+    /// None given (P-CSCF restoration by `supi` + `dnn`).
+    None,
+}
+
+/// #1583: what a request offers to identify a PDU session with (TS 29.514
+/// §4.2.2.2 for an AF session, §4.2.2.27 for a P-CSCF restoration).
+struct BindingKeys<'a> {
+    address: BindingAddress,
+    ip_domain: Option<&'a str>,
+    slice: Option<SNssai>,
+    supi: Option<&'a str>,
+    dnn: Option<&'a str>,
+}
+
+/// #1583 (shared with #1527): the sessions `keys` match. TS 29.514 §4.2.2.2 NOTE
+/// 7 (via TS 29.513): "in order to have a successful session binding, all
+/// attributes must match, if provided".
+///
+/// - The address selects the sessions holding that IPv4, or whose IPv6 prefix
+///   contains the IPv6 address. One scan of the session list: the IPv4 index has
+///   one slot per address, so it cannot answer for a private IPv4 two sessions
+///   share.
+/// - `sliceInfo`, `supi` and `dnn` must match (DNN as received, NOTE 2 of Table
+///   5.6.2.36-1, against the DNN or full DNN, ignoring ASCII case, TS 23.003
+///   §9.1). Filtered inside the scan, so only matching sessions are cloned.
+/// - `ipDomain` narrows an IPv4 match to the sessions the SMF reported in that
+///   domain (TS 29.512 NOTE 11); when none reported it, to the sessions with no
+///   reported domain, so an SMF that never sends `ipDomain` is not refused.
+///
+/// `Err` names why nothing can match (a SUPI with no SM association here).
+fn binding_candidates(keys: &BindingKeys) -> Result<Vec<PcfSess>, String> {
+    let ctx = pcf_self();
+    let Ok(context) = ctx.read() else {
+        return Err("the PCF context is unavailable".to_string());
+    };
+    let ue_sm_id = match keys.supi {
+        Some(supi) => match context.ue_sm_find_by_supi(supi) {
+            Some(ue_sm) => Some(ue_sm.id),
+            None => return Err(format!("no SM policy association for supi {supi}")),
+        },
+        None => None,
+    };
+    let mut candidates = context.sess_find_all(|sess| {
+        let address_matches = match keys.address {
+            BindingAddress::V4(ip) => sess.ipv4addr_string.is_some() && sess.ipv4addr == ip,
+            BindingAddress::V6(ip) => sess.ipv6prefix.is_some_and(|(len, prefix)| {
+                crate::context::ipv6_prefix_contains(&prefix, len, &ip)
+            }),
+            BindingAddress::None => true,
+        };
+        address_matches
+            && keys.slice.as_ref().is_none_or(|s| sess.s_nssai == *s)
+            && ue_sm_id.is_none_or(|id| sess.pcf_ue_sm_id == id)
+            && keys.dnn.is_none_or(|dnn| {
+                [&sess.dnn, &sess.full_dnn]
+                    .into_iter()
+                    .flatten()
+                    .any(|d| d.eq_ignore_ascii_case(dnn))
+            })
+    });
+    drop(context);
+    if let (BindingAddress::V4(_), Some(domain)) = (keys.address, keys.ip_domain) {
+        if candidates
+            .iter()
+            .any(|s| s.ip_domain.as_deref() == Some(domain))
+        {
+            candidates.retain(|s| s.ip_domain.as_deref() == Some(domain));
+        } else {
+            candidates.retain(|s| s.ip_domain.is_none());
+        }
+    }
+    Ok(candidates)
+}
+
+/// #1583: exactly one session for `keys`, else why not (none, or several).
+fn bind_one_session(keys: &BindingKeys) -> Result<PcfSess, String> {
+    let mut candidates = binding_candidates(keys)?;
+    let asked = format!(
+        "address={:?} ipDomain={:?} sliceInfo={:?} supi={:?} dnn={:?}",
+        keys.address, keys.ip_domain, keys.slice, keys.supi, keys.dnn
+    );
+    match candidates.len() {
+        1 => Ok(candidates.remove(0)),
+        0 => Err(format!("no PDU session matches {asked}")),
+        n => Err(format!(
+            "{n} PDU sessions match {asked}; the request does not identify one"
+        )),
+    }
+}
+
+/// #1527: the one PDU session a `PcscfRestorationRequestData` identifies (TS 29.514
+/// §4.2.2.27, Table 5.6.2.36-1), through [`bind_one_session`].
+///
+/// - `ueIpv4` / `ueIpv6` (only one, NOTE 1); `ipDomain` / `sliceInfo` narrow it.
+/// - Without an IP address, `supi` and `dnn` (both required) identify the
+///   session. With one, they must agree with it: a contradicting `supi` or `dnn`
+///   identifies no session.
+///
+/// No session, or more than one, is a failure to identify it: `Err` holds the
+/// `500 PDU_SESSION_NOT_AVAILABLE`, or a `400` for a request that names nothing.
+fn identify_pcscf_restoration_session(
+    body: &serde_json::Value,
+) -> Result<PcfSess, Box<SbiResponse>> {
+    let text = |key: &str| {
+        body.get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    let (ipv4, ipv6) = (text("ueIpv4"), text("ueIpv6"));
+    let (ip_domain, supi, dnn) = (text("ipDomain"), text("supi"), text("dnn"));
+    let Ok(slice) = parse_binding_snssai(body.get("sliceInfo")) else {
+        return Err(Box::new(send_bad_request(
+            "PcscfRestorationRequestData.sliceInfo is not an Snssai",
+            Some("MANDATORY_IE_INCORRECT"),
+        )));
+    };
+    let address = match (ipv4, ipv6) {
+        (Some(_), Some(_)) => {
+            return Err(Box::new(send_bad_request(
+                "PcscfRestorationRequestData carries both ueIpv4 and ueIpv6 (NOTE 1)",
+                Some("MANDATORY_IE_INCORRECT"),
+            )))
+        }
+        (Some(ip), None) => match ip.parse::<std::net::Ipv4Addr>() {
+            Ok(ip) => BindingAddress::V4(u32::from(ip)),
+            Err(_) => {
+                return Err(Box::new(send_bad_request(
+                    &format!("ueIpv4 {ip:?} is not an Ipv4Addr"),
+                    Some("MANDATORY_IE_INCORRECT"),
+                )))
+            }
+        },
+        (None, Some(ip)) => match ip.parse::<std::net::Ipv6Addr>() {
+            Ok(ip) => BindingAddress::V6(ip.octets()),
+            Err(_) => {
+                return Err(Box::new(send_bad_request(
+                    &format!("ueIpv6 {ip:?} is not an Ipv6Addr"),
+                    Some("MANDATORY_IE_INCORRECT"),
+                )))
+            }
+        },
+        (None, None) if supi.is_some() && dnn.is_some() => BindingAddress::None,
+        (None, None) => {
+            return Err(Box::new(send_bad_request(
+                "PcscfRestorationRequestData requires ueIpv4 or ueIpv6, or supi and dnn",
+                Some("MANDATORY_IE_MISSING"),
+            )))
+        }
+    };
+    bind_one_session(&BindingKeys {
+        address,
+        ip_domain,
+        slice,
+        supi,
+        dnn,
+    })
+    .map_err(|why| Box::new(pcscf_restoration_session_not_available(&why)))
+}
+
 /// `POST /app-sessions/pcscf-restoration` — TS 29.514 §4.2.5 `PcscfRestoration`.
 ///
-/// `PcscfRestorationRequestData` is a `oneOf` over `ueIpv4` / `ueIpv6`, so the
-/// UE whose IMS session must be restored is identified the same way an app
-/// session is. The PCF resolves that session and asks its SMF to restore it:
-/// an UpdateNotify carrying `pcscfRestIndication: true` when the association
-/// negotiated PCSCF-Restoration-Enhancement (TS 29.512 §4.2.3.18, #1398). It
-/// answers `204`, as the spec defines no response body.
+/// #1527: the PDU session is identified as TS 29.514 §4.2.2.27 says the P-CSCF
+/// names it ([`identify_pcscf_restoration_session`]): by `ueIpv4`/`ueIpv6`,
+/// narrowed by `ipDomain` / `sliceInfo` for a non-unique (private) IPv4, or by
+/// `supi` + `dnn` when no usable IP is given. The PCF then asks its SMF to
+/// restore it: an UpdateNotify carrying `pcscfRestIndication: true` when the
+/// association negotiated PCSCF-Restoration-Enhancement (TS 29.512 §4.2.3.18,
+/// #1398). It answers `204`, as the spec defines no response body.
 ///
-/// A UE address that resolves nothing is a `404`: the caller asked the PCF to
-/// restore a session it does not know about, and a `204` would report a
-/// restoration that did not happen.
+/// A request that identifies no single session is a `500` with cause
+/// `PDU_SESSION_NOT_AVAILABLE` (§4.2.2.27, Table 5.7.3-1); it was a `404
+/// SESSION_NOT_FOUND`.
 pub async fn handle_pcscf_restoration(request: &SbiRequest) -> SbiResponse {
     log::info!("P-CSCF Restoration");
     let Some(content) = request.http.content.as_deref() else {
@@ -4689,37 +5261,14 @@ pub async fn handle_pcscf_restoration(request: &SbiRequest) -> SbiResponse {
         Ok(v) => v,
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
-    let ipv4 = body
-        .get("ueIpv4")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty());
-    let ipv6 = body
-        .get("ueIpv6")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty());
-    let address = match (ipv4, ipv6) {
-        (Some(ip), None) => UeAddress::Ipv4(ip.to_string()),
-        (None, Some(ip)) => UeAddress::Ipv6(ip.to_string()),
-        (None, None) => {
-            return send_bad_request(
-                "PcscfRestorationRequestData requires exactly one of ueIpv4 or ueIpv6",
-                Some("MANDATORY_IE_MISSING"),
-            )
-        }
-        (Some(_), Some(_)) => {
-            return send_bad_request(
-                "PcscfRestorationRequestData carries both ueIpv4 and ueIpv6 (oneOf)",
-                Some("MANDATORY_IE_INCORRECT"),
-            )
-        }
+    let sess = match identify_pcscf_restoration_session(&body) {
+        Ok(sess) => sess,
+        Err(resp) => return *resp,
     };
-    let Some(sess) = bind_ue_address(&address) else {
-        log::warn!("P-CSCF restoration for an unknown UE address {address:?}");
-        return send_not_found(
-            &format!("No PDU session bound to {address:?}"),
-            Some("SESSION_NOT_FOUND"),
-        );
-    };
+    let address = format!(
+        "ipv4={:?} ipv6={:?} dnn={:?}",
+        sess.ipv4addr_string, sess.ipv6prefix_string, sess.dnn
+    );
     // #1398, TS 29.512 §4.2.3.18: with PCSCF-Restoration-Enhancement negotiated on
     // the association, the notify carries `pcscfRestIndication: true`, which is what
     // asks the SMF to restore (TS 23.380). Before #1398 it was the generic re-derived
@@ -4727,7 +5276,7 @@ pub async fn handle_pcscf_restoration(request: &SbiRequest) -> SbiResponse {
     // restored.
     if sess.smpolicycontrol_features & SM_FEATURE_PCSCF_RESTORATION_ENHANCEMENT != 0 {
         log::info!(
-            "P-CSCF restoration: pcscfRestIndication to the SMF for sess_id={} ({address:?})",
+            "P-CSCF restoration: pcscfRestIndication to the SMF for sess_id={} ({address})",
             sess.id
         );
         sbi_path::pcf_sbi_send_pcscf_restoration_notify(sess.id);
@@ -4736,7 +5285,7 @@ pub async fn handle_pcscf_restoration(request: &SbiRequest) -> SbiResponse {
         // not negotiate it, so it has no way to be asked. The session's policy is
         // re-sent as before, and the gap is logged rather than hidden.
         log::warn!(
-            "P-CSCF restoration for sess_id={} ({address:?}): the SMF did not negotiate \
+            "P-CSCF restoration for sess_id={} ({address}): the SMF did not negotiate \
              PCSCF-Restoration-Enhancement (TS 29.512 §5.8 feature 9), so no \
              pcscfRestIndication can be sent; re-sending the session's policy only",
             sess.id
@@ -6188,7 +6737,18 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         pcf_context_init(64, 64);
-        provision_session_with_ipv4("imsi-001010000000251", 13, "10.45.0.251").await;
+        // #1583: the session is the emergency (DNN "sos") one the AF names: all
+        // binding attributes must match (TS 29.514 §4.2.2.2 NOTE 7).
+        let mut create = full_create_body("imsi-001010000000251", 13);
+        create["ipv4Address"] = serde_json::json!("10.45.0.251");
+        create["dnn"] = serde_json::json!("sos");
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(create),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "the emergency PDU session");
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
             "/npcf-policyauthorization/v1/app-sessions",
@@ -6230,6 +6790,27 @@ mod tests {
         assert_eq!(negotiate_features(Some(""), 0x3), "0");
         assert_eq!(negotiate_features(Some("ffff"), 0x3), "3");
         assert_eq!(negotiate_features(Some("not-hex"), 0x3), "0");
+        // #1596: a SupportedFeatures longer than 64 bits (TS 29.571 §5.2.2; TS
+        // 29.512 defines SM features up to 124) negotiates its low bits; a
+        // non-hex character anywhere (including a leading '+', which
+        // from_str_radix takes) negotiates nothing.
+        assert_eq!(
+            negotiate_features(Some("10000000000000000000000000000103"), 0x103),
+            "103"
+        );
+        assert_eq!(
+            negotiate_features(
+                Some("ffffffffffffffffffffffffffffffff"),
+                PCF_SM_POLICY_SUPPORTED_FEATURES
+            ),
+            format!("{PCF_SM_POLICY_SUPPORTED_FEATURES:x}")
+        );
+        assert_eq!(
+            negotiate_features(Some("1000000000000000000000000000000g"), 0x3),
+            "0"
+        );
+        assert_eq!(negotiate_features(Some("+3"), 0x3), "0");
+        assert_eq!(negotiate_features(Some("0003"), 0x3), "3");
         // Empty-string consumer (the matched AMF sends suppFeat="") → "0".
         assert_eq!(
             negotiate_features(Some(""), PCF_AM_POLICY_SUPPORTED_FEATURES),
@@ -6323,9 +6904,50 @@ mod tests {
         // Negotiated = ffffffff & PCF_SM_POLICY_SUPPORTED_FEATURES, not the echo.
         assert_eq!(
             body["suppFeat"],
-            format!("{:x}", PCF_SM_POLICY_SUPPORTED_FEATURES)
+            format!("{:x}", 0xffff_ffff_u64 & PCF_SM_POLICY_SUPPORTED_FEATURES)
         );
         assert_ne!(body["suppFeat"], "ffffffff");
+    }
+
+    /// #1596: an SMF whose suppFeat sets a feature above 64 (here feature 128 and the
+    /// ones this PCF supports, 32 hex digits) negotiates the supported ones, and the
+    /// association keeps them (PCSCF-Restoration-Enhancement, feature 9).
+    ///
+    /// REVERT-VERIFIED: with suppFeat parsed as one u64 again, the create answers
+    /// suppFeat "0".
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn sm_policy_create_negotiates_a_suppfeat_longer_than_64_bits_1596() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let mut body = full_create_body("imsi-001010000015961", 12);
+        let supp_feat = format!("8000000000000000{PCF_SM_POLICY_SUPPORTED_FEATURES:016x}");
+        assert_eq!(supp_feat.len(), 32);
+        body["suppFeat"] = serde_json::json!(supp_feat);
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(body),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        let got: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            got["suppFeat"],
+            format!("{PCF_SM_POLICY_SUPPORTED_FEATURES:x}")
+        );
+        let sess = pcf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_ipv4addr("10.45.0.77")
+            .expect("session");
+        assert_eq!(
+            sess.smpolicycontrol_features,
+            PCF_SM_POLICY_SUPPORTED_FEATURES
+        );
     }
 
     /// pcfd-06: the SessionRule conveys the default QoS inline via `authDefQos`
@@ -7471,6 +8093,281 @@ mod tests {
         peers.smf.stop().await.ok();
     }
 
+    /// #1597: a mock NRF + UDR. Every nudr-dr read answers `status` when it is not
+    /// 0; with 0, am-data answers `am_data` and the other reads 404.
+    async fn start_mock_udr_1597(
+        status: std::sync::Arc<std::sync::atomic::AtomicU16>,
+        am_data: serde_json::Value,
+    ) -> nextgcore_sbi::server::SbiServer {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        use std::sync::atomic::Ordering;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        server
+            .start(move |req: SbiRequest| {
+                let status = status.clone();
+                let am_data = am_data.clone();
+                async move {
+                    let path = req.header.uri.split('?').next().unwrap_or("").to_string();
+                    if path == "/nnrf-disc/v1/nf-instances" {
+                        return SbiResponse::with_status(200)
+                            .with_json_body(&serde_json::json!({
+                                "nfInstances": [{
+                                    "nfInstanceId": "udr-1597",
+                                    "nfType": "UDR",
+                                    "ipv4Addresses": ["127.0.0.1"],
+                                    "nfServices": [{
+                                        "serviceName": "nudr-dr",
+                                        "scheme": "http",
+                                        "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": port }]
+                                    }]
+                                }]
+                            }))
+                            .unwrap_or_else(|_| SbiResponse::with_status(500));
+                    }
+                    if path.starts_with("/nudr-dr/") {
+                        let s = status.load(Ordering::SeqCst);
+                        if s != 0 {
+                            return nextgcore_sbi::server::send_error(
+                                s,
+                                "Internal Server Error",
+                                "Subscriber store unavailable",
+                                Some("SYSTEM_FAILURE"),
+                            );
+                        }
+                        if path.ends_with("/provisioned-data/am-data") {
+                            return SbiResponse::with_status(200)
+                                .with_json_body(&am_data)
+                                .unwrap_or_else(|_| SbiResponse::with_status(500));
+                        }
+                    }
+                    SbiResponse::with_status(404)
+                }
+            })
+            .await
+            .expect("mock NRF/UDR starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        crate::test_support::point_nrf_at(format!("http://127.0.0.1:{port}")).await;
+        server
+    }
+
+    fn problem_cause_1597(resp: &SbiResponse) -> String {
+        resp.http
+            .content
+            .as_deref()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+            .and_then(|v| v["cause"].as_str().map(str::to_string))
+            .unwrap_or_default()
+    }
+
+    /// #1597: an AM policy create whose UDR answers 500 (TS 29.504 SYSTEM_FAILURE,
+    /// #1534) is refused 500 SYSTEM_FAILURE and leaves no association; a 404 is
+    /// "nothing provisioned" and the create succeeds.
+    ///
+    /// REVERT-VERIFIED: with `bounded_udr_read` mapping a 5xx to `Ok(None)` again,
+    /// the 500 create answers 201 with no restrictions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn am_policy_create_refuses_a_udr_outage_1597() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(500));
+        let udr = start_mock_udr_1597(status.clone(), serde_json::json!({ "rfspIndex": 5 })).await;
+        let create = |supi: &str| {
+            make_request(
+                "POST",
+                "/npcf-am-policy-control/v1/policies",
+                Some(serde_json::json!({
+                    "supi": supi,
+                    "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/1597",
+                    "suppFeat": "0",
+                })),
+            )
+        };
+        let supi = "imsi-001010000015971";
+        let resp = pcf_sbi_request_handler(create(supi)).await;
+        assert_eq!(resp.status, 500, "{:?}", resp.http.content);
+        assert_eq!(problem_cause_1597(&resp), "SYSTEM_FAILURE");
+        assert!(
+            pcf_self()
+                .read()
+                .unwrap()
+                .ue_am_find_by_supi(supi)
+                .is_none(),
+            "a refused create leaves no association"
+        );
+
+        status.store(404, std::sync::atomic::Ordering::SeqCst);
+        let resp = pcf_sbi_request_handler(create("imsi-001010000015972")).await;
+        assert_eq!(
+            resp.status, 201,
+            "404 is not provisioned: {:?}",
+            resp.http.content
+        );
+        udr.stop().await.ok();
+    }
+
+    /// #1597: an AM policy update during a UDR outage keeps the policy the
+    /// association holds (here the provisioned RFSP) rather than re-deciding from
+    /// the failed read.
+    ///
+    /// REVERT-VERIFIED: with the update's `Err` arm deciding from no data, the
+    /// answer and the GET lose `rfsp`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn am_policy_update_keeps_the_policy_during_a_udr_outage_1597() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let udr = start_mock_udr_1597(status.clone(), serde_json::json!({ "rfspIndex": 5 })).await;
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-am-policy-control/v1/policies",
+            Some(serde_json::json!({
+                "supi": "imsi-001010000025971",
+                "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/1597",
+                "suppFeat": "0",
+                // #1580: the AMF's UDM RFSP, so the answer carries the authorised one.
+                "rfsp": 1,
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let created: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(created["rfsp"], 5, "{created}");
+        let id = created["polAssoId"].as_str().unwrap().to_string();
+
+        status.store(500, std::sync::atomic::Ordering::SeqCst);
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            &format!("/npcf-am-policy-control/v1/policies/{id}/update"),
+            Some(serde_json::json!({ "triggers": ["LOC_CH"], "rfsp": 1 })),
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+        let answered: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(answered["rfsp"], 5, "kept through the outage: {answered}");
+        let resp = pcf_sbi_request_handler(make_request(
+            "GET",
+            &format!("/npcf-am-policy-control/v1/policies/{id}"),
+            None,
+        ))
+        .await;
+        let got: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(got["rfsp"], 5, "{got}");
+        udr.stop().await.ok();
+    }
+
+    /// #1597: an SM policy create whose UDR sm-data read answers 500 is refused 500
+    /// SYSTEM_FAILURE and leaves no session; a 404 is "nothing provisioned" (local
+    /// default charging) and the create succeeds.
+    ///
+    /// REVERT-VERIFIED: with the create's `Err` arm falling back to no data, the
+    /// 500 create answers 201; without the `sess_remove`, a session is left behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn sm_policy_create_refuses_a_udr_outage_1597() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(503));
+        let udr = start_mock_udr_1597(status.clone(), serde_json::json!({})).await;
+        let supi = "imsi-001010000035971";
+        let mut body = full_create_body(supi, 5);
+        body["ipv4Address"] = serde_json::json!("10.159.7.1");
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(body.clone()),
+        ))
+        .await;
+        assert_eq!(resp.status, 500, "{:?}", resp.http.content);
+        assert_eq!(problem_cause_1597(&resp), "SYSTEM_FAILURE");
+        assert!(
+            pcf_self()
+                .read()
+                .unwrap()
+                .sess_find_by_ipv4addr("10.159.7.1")
+                .is_none(),
+            "a refused create leaves no session"
+        );
+
+        status.store(404, std::sync::atomic::Ordering::SeqCst);
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(body),
+        ))
+        .await;
+        assert_eq!(
+            resp.status, 201,
+            "404 is not provisioned: {:?}",
+            resp.http.content
+        );
+        udr.stop().await.ok();
+    }
+
+    /// #1597: a UE policy delivery whose UDR ue-policy-set read answers 500 delivers
+    /// nothing, rather than the static default in place of the operator's URSP.
+    ///
+    /// REVERT-VERIFIED: without the early return, the outage line is never logged
+    /// (the default set is provisioned instead).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn ue_policy_delivery_sends_nothing_during_a_udr_outage_1597() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _delivery = crate::test_support::ue_policy_delivery(true);
+        pcf_context_init(64, 64);
+        nextgcore_core::test_log::init();
+        let supi = "imsi-001010000045971";
+        let watch = nextgcore_core::test_log::watch(format!("[{supi}] UE policy delivery for"));
+        let status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(500));
+        let udr = start_mock_udr_1597(status, serde_json::json!({})).await;
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-ue-policy-control/v1/policies",
+            Some(serde_json::json!({
+                "notificationUri": "http://127.0.0.1:9/namf-callback/v1/ue-policy/1597",
+                "supi": supi,
+                "suppFeat": "0",
+                "servingPlmn": { "mcc": "001", "mnc": "01" }
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while watch.records().is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let records = watch.records();
+        assert!(
+            records.iter().any(|r| r.contains("nothing is delivered")),
+            "the outage stops the delivery: {records:?}"
+        );
+        assert!(
+            ue_policy::context_ursp_for(supi).is_empty(),
+            "no rule set was provisioned for the UE"
+        );
+        udr.stop().await.ok();
+    }
+
     /// AM policy Create and GET both carry the negotiated `suppFeat` and the
     /// policy provisioned from UDR am-data, and NEVER an explicit null.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7496,7 +8393,13 @@ mod tests {
             Some(serde_json::json!({
                 "supi": "imsi-001010000000890",
                 "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/89",
-                "suppFeat": "0",
+                // #1524: UE-AMBR_Authorization, and the AMF's UE-AMBR, so the
+                // policy carries the authorised one.
+                "suppFeat": "4",
+                // #1580: the AMF's UDM values, so the answer carries the authorised ones.
+                "rfsp": 1,
+                "servAreaRes": { "restrictionType": "ALLOWED_AREAS", "areas": [] },
+                "ueAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" },
                 "triggers": ["LOC_CH"]
             })),
         ))
@@ -7509,7 +8412,7 @@ mod tests {
         assert_eq!(body["rfsp"], 7, "rfsp provisioned from UDR am-data: {body}");
         assert_eq!(body["servAreaRes"]["restrictionType"], "ALLOWED_AREAS");
         assert_eq!(body["ueAmbr"]["uplink"], "1 Gbps");
-        assert_eq!(body["suppFeat"], "0");
+        assert_eq!(body["suppFeat"], "4");
         assert_eq!(body["triggers"], serde_json::json!(["LOC_CH"]));
 
         // The GET representation must agree with the create one -- it used to
@@ -7523,12 +8426,119 @@ mod tests {
         assert_eq!(resp.status, 200);
         let got: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-        assert_eq!(got["suppFeat"], "0", "suppFeat is mandatory on GET: {got}");
+        assert_eq!(got["suppFeat"], "4", "suppFeat is mandatory on GET: {got}");
         assert_eq!(got["rfsp"], 7);
         assert_eq!(got["servAreaRes"]["restrictionType"], "ALLOWED_AREAS");
         assert_eq!(got["ueAmbr"]["uplink"], "1 Gbps");
         assert_eq!(got["triggers"], serde_json::json!(["LOC_CH"]));
 
+        udr.stop().await.ok();
+    }
+
+    /// #1580: TS 29.507 §4.2.2.2 / §4.2.3.2 items a and b. The create, the GET and
+    /// the Update answer `servAreaRes` / `rfsp` only when the AMF sent that attribute
+    /// (on the create, or for the Update in that request), with the PCF's authorised
+    /// value (the UDR's, not the AMF's).
+    ///
+    /// REVERT-VERIFIED: with `am_answer_policy` returning the policy whole, the
+    /// create without either member answers both; with the update answer filtered
+    /// by the association's flags instead of the request's, the second update
+    /// answers `servAreaRes`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI / PCF context
+    async fn am_policy_answers_serv_area_res_and_rfsp_only_when_requested_1580() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let sar = serde_json::json!({
+            "restrictionType": "ALLOWED_AREAS",
+            "areas": [{ "tacs": ["000001"] }]
+        });
+        let udr = start_mock_nrf_udr_am_data(serde_json::json!({
+            "rfspIndex": 7,
+            "serviceAreaRestriction": sar
+        }))
+        .await;
+        let create = |supi: &str, extra: serde_json::Value| {
+            let mut body = serde_json::json!({
+                "supi": supi,
+                "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/1580",
+                "suppFeat": "0",
+            });
+            for (k, v) in extra.as_object().unwrap() {
+                body[k] = v.clone();
+            }
+            make_request("POST", "/npcf-am-policy-control/v1/policies", Some(body))
+        };
+        let json = |resp: SbiResponse| {
+            serde_json::from_str::<serde_json::Value>(resp.http.content.as_deref().unwrap())
+                .unwrap()
+        };
+        let get = |id: String| async move {
+            json(
+                pcf_sbi_request_handler(make_request(
+                    "GET",
+                    &format!("/npcf-am-policy-control/v1/policies/{id}"),
+                    None,
+                ))
+                .await,
+            )
+        };
+
+        // Neither sent (amfd's create): neither answered, on the create or the GET.
+        let created = json(
+            pcf_sbi_request_handler(create("imsi-001010000015801", serde_json::json!({}))).await,
+        );
+        let id = created["polAssoId"].as_str().unwrap().to_string();
+        for body in [&created, &get(id.clone()).await] {
+            assert!(body.get("servAreaRes").is_none(), "{body}");
+            assert!(body.get("rfsp").is_none(), "{body}");
+        }
+
+        // Only rfsp sent: the authorised (UDR) RFSP, and no servAreaRes.
+        let created = json(
+            pcf_sbi_request_handler(create(
+                "imsi-001010000025801",
+                serde_json::json!({ "rfsp": 2 }),
+            ))
+            .await,
+        );
+        let id = created["polAssoId"].as_str().unwrap().to_string();
+        for body in [&created, &get(id.clone()).await] {
+            assert_eq!(body["rfsp"], 7, "{body}");
+            assert!(body.get("servAreaRes").is_none(), "{body}");
+        }
+
+        // An Update carrying servAreaRes is answered with it; one carrying neither
+        // answers neither; the GET from then on carries both.
+        let update = |body: serde_json::Value| {
+            let id = id.clone();
+            async move {
+                json(
+                    pcf_sbi_request_handler(make_request(
+                        "POST",
+                        &format!("/npcf-am-policy-control/v1/policies/{id}/update"),
+                        Some(body),
+                    ))
+                    .await,
+                )
+            }
+        };
+        let answered = update(serde_json::json!({ "servAreaRes": sar })).await;
+        assert_eq!(answered["servAreaRes"], sar, "{answered}");
+        assert!(
+            answered.get("rfsp").is_none(),
+            "not in this request: {answered}"
+        );
+        let answered = update(serde_json::json!({ "triggers": ["LOC_CH"] })).await;
+        assert!(answered.get("servAreaRes").is_none(), "{answered}");
+        assert!(answered.get("rfsp").is_none(), "{answered}");
+        let got = get(id).await;
+        assert_eq!(
+            (got["rfsp"].clone(), got["servAreaRes"].clone()),
+            (serde_json::json!(7), sar)
+        );
         udr.stop().await.ok();
     }
 
@@ -7586,7 +8596,11 @@ mod tests {
             Some(serde_json::json!({
                 "supi": supi,
                 "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/1460",
-                "suppFeat": "0",
+                // #1524: UE-AMBR_Authorization negotiated, so the #1460 rules for
+                // the authorised UE-AMBR are what decides.
+                "suppFeat": "4",
+                // #1580: the AMF's UDM RFSP, so the answer carries the authorised one.
+                "rfsp": 1,
                 "ueAmbr": { "uplink": "500 Mbps", "downlink": "500 Mbps" },
                 "triggers": ["LOC_CH"]
             })),
@@ -7723,6 +8737,375 @@ mod tests {
                 .as_deref(),
             Some("the subscriber carries no ambr"),
         );
+    }
+
+    /// #1524: create an AM policy for `supi` against UDR am-data provisioning a
+    /// 1/2 Gbps `subscribedUeAmbr`, with the given `suppFeat` and, when
+    /// `amf_ue_ambr`, the AMF's own (different) `ueAmbr`; the consumer also asks
+    /// for `UE_AMBR_CH`. Answers the create body and the GET body.
+    async fn am_create_1524(
+        supi: &str,
+        supp_feat: &str,
+        amf_ue_ambr: bool,
+    ) -> (serde_json::Value, serde_json::Value) {
+        let udr = start_mock_nrf_udr_am_data(serde_json::json!({
+            "subscribedUeAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" },
+            "rfspIndex": 5
+        }))
+        .await;
+        let mut req = serde_json::json!({
+            "supi": supi,
+            "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/1524",
+            "suppFeat": supp_feat,
+            "triggers": ["LOC_CH", "UE_AMBR_CH"],
+            // #1580: the AMF's UDM RFSP, so the answer carries the authorised one.
+            "rfsp": 1
+        });
+        if amf_ue_ambr {
+            req["ueAmbr"] = serde_json::json!({ "uplink": "500 Mbps", "downlink": "500 Mbps" });
+        }
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-am-policy-control/v1/policies",
+            Some(req),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "create: {:?}", resp.http.content);
+        let created: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let pol_id = created["polAssoId"].as_str().unwrap().to_string();
+        let resp = pcf_sbi_request_handler(make_request(
+            "GET",
+            &format!("/npcf-am-policy-control/v1/policies/{pol_id}"),
+            None,
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+        let got: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        udr.stop().await.ok();
+        (created, got)
+    }
+
+    /// #1524: UE-AMBR_Authorization negotiated and the AMF sent `ueAmbr`: the create
+    /// and the GET carry the authorised (subscribed) UE-AMBR, `UE_AMBR_CH`, and the
+    /// negotiated `suppFeat` "4" (TS 29.507 §4.2.2.2 item c, Table 5.8-1 feature 3).
+    ///
+    /// REVERT-VERIFIED: with `PCF_AM_POLICY_SUPPORTED_FEATURES` back at 0, suppFeat
+    /// is "0" and `ueAmbr` / `UE_AMBR_CH` are absent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI / PCF context
+    async fn am_policy_with_ue_ambr_authorization_carries_the_authorised_ue_ambr_1524() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let (created, got) = am_create_1524("imsi-001010000001524", "4", true).await;
+        for body in [&created, &got] {
+            assert_eq!(body["suppFeat"], "4", "{body}");
+            assert_eq!(
+                body["ueAmbr"],
+                serde_json::json!({ "uplink": "1 Gbps", "downlink": "2 Gbps" }),
+                "the authorised UE-AMBR: {body}"
+            );
+            assert_eq!(
+                body["triggers"],
+                serde_json::json!(["LOC_CH", "UE_AMBR_CH"]),
+                "{body}"
+            );
+        }
+    }
+
+    /// #1524: UE-AMBR_Authorization not negotiated (the AMF's "0" and "", which is
+    /// what amfd sends, and a value without bit 3): no `ueAmbr`, no `UE_AMBR_CH`,
+    /// even with the AMF's `ueAmbr` in the request and `UE_AMBR_CH` asked for
+    /// (§4.2.2.2 item c, §4.2.3.2 NOTE 2). The rest of the policy is unchanged.
+    ///
+    /// REVERT-VERIFIED: without `gate_am_ue_ambr` in the create, `ueAmbr` 1/2 Gbps
+    /// and `UE_AMBR_CH` are back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI / PCF context
+    async fn am_policy_without_ue_ambr_authorization_carries_no_ue_ambr_1524() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        for (i, supp_feat) in ["0", "", "3"].into_iter().enumerate() {
+            let supi = format!("imsi-00101000001152{i}");
+            let (created, got) = am_create_1524(&supi, supp_feat, true).await;
+            for body in [&created, &got] {
+                assert_eq!(body["suppFeat"], "0", "{supp_feat:?}: {body}");
+                assert_eq!(
+                    body["rfsp"], 5,
+                    "{supp_feat:?}: the policy is provisioned: {body}"
+                );
+                assert_eq!(
+                    body["triggers"],
+                    serde_json::json!(["LOC_CH"]),
+                    "{supp_feat:?}: no UE_AMBR_CH: {body}"
+                );
+                assert!(body.get("ueAmbr").is_none(), "{supp_feat:?}: {body}");
+            }
+        }
+    }
+
+    /// #1524: UE-AMBR_Authorization negotiated but no `ueAmbr` in the request: the
+    /// PCF "received" none, so it answers none and no `UE_AMBR_CH` (item c).
+    ///
+    /// REVERT-VERIFIED: with `am_ue_ambr_authorised` ignoring `ue_ambr_requested`,
+    /// `ueAmbr` 1/2 Gbps is answered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI / PCF context
+    async fn am_policy_with_the_feature_but_no_requested_ue_ambr_carries_none_1524() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let (created, got) = am_create_1524("imsi-001010000021524", "4", false).await;
+        for body in [&created, &got] {
+            assert_eq!(body["suppFeat"], "4", "{body}");
+            assert_eq!(body["rfsp"], 5, "{body}");
+            assert_eq!(body["triggers"], serde_json::json!(["LOC_CH"]), "{body}");
+            assert!(body.get("ueAmbr").is_none(), "{body}");
+        }
+    }
+
+    /// #1524: the AMF's Update. With the feature negotiated, an update carrying
+    /// `ueAmbr` (a subscribed UE-AMBR change, TS 29.507 §4.2.3.2 item 14) is
+    /// answered with the authorised one (item c), and the GET carries it from then
+    /// on; an update without `ueAmbr` is answered without it. Without the feature,
+    /// an update with `ueAmbr` is answered without it.
+    ///
+    /// REVERT-VERIFIED: without `gate_am_ue_ambr` in the update, the unnegotiated
+    /// association answers `ueAmbr`; without the `update_has_ue_ambr` filter, the
+    /// update without `ueAmbr` answers it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI / PCF context
+    async fn am_policy_update_answers_ue_ambr_only_when_authorised_and_requested_1524() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let udr = start_mock_nrf_udr_am_data(serde_json::json!({
+            "subscribedUeAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" },
+            "rfspIndex": 5
+        }))
+        .await;
+        let ue_ambr = serde_json::json!({ "uplink": "1 Gbps", "downlink": "2 Gbps" });
+        let update = |pol_id: String, body: serde_json::Value| async move {
+            let resp = pcf_sbi_request_handler(make_request(
+                "POST",
+                &format!("/npcf-am-policy-control/v1/policies/{pol_id}/update"),
+                Some(body),
+            ))
+            .await;
+            assert_eq!(resp.status, 200, "update: {:?}", resp.http.content);
+            serde_json::from_str::<serde_json::Value>(resp.http.content.as_deref().unwrap())
+                .unwrap()
+        };
+        let get = |pol_id: String| async move {
+            let resp = pcf_sbi_request_handler(make_request(
+                "GET",
+                &format!("/npcf-am-policy-control/v1/policies/{pol_id}"),
+                None,
+            ))
+            .await;
+            serde_json::from_str::<serde_json::Value>(resp.http.content.as_deref().unwrap())
+                .unwrap()
+        };
+        let mut ids = Vec::new();
+        for (supi, supp_feat) in [("imsi-001010000031524", "4"), ("imsi-001010000041524", "0")] {
+            let resp = pcf_sbi_request_handler(make_request(
+                "POST",
+                "/npcf-am-policy-control/v1/policies",
+                Some(serde_json::json!({
+                    "supi": supi,
+                    "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/1524",
+                    "suppFeat": supp_feat,
+                })),
+            ))
+            .await;
+            assert_eq!(resp.status, 201);
+            let created: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            assert!(
+                created.get("ueAmbr").is_none(),
+                "none requested yet: {created}"
+            );
+            ids.push(created["polAssoId"].as_str().unwrap().to_string());
+        }
+        let (negotiated, unnegotiated) = (ids[0].clone(), ids[1].clone());
+        let with_ue_ambr =
+            serde_json::json!({ "ueAmbr": ue_ambr, "triggers": ["UE_AMBR_CH"], "rfsp": 1 });
+
+        let answered = update(negotiated.clone(), with_ue_ambr.clone()).await;
+        assert_eq!(answered["ueAmbr"], ue_ambr, "authorised: {answered}");
+        assert_eq!(answered["rfsp"], 5, "{answered}");
+        assert_eq!(get(negotiated.clone()).await["ueAmbr"], ue_ambr);
+        let answered = update(
+            negotiated.clone(),
+            serde_json::json!({ "triggers": ["LOC_CH"], "rfsp": 1 }),
+        )
+        .await;
+        assert!(
+            answered.get("ueAmbr").is_none(),
+            "none received: {answered}"
+        );
+        assert_eq!(answered["rfsp"], 5, "{answered}");
+
+        let answered = update(unnegotiated.clone(), with_ue_ambr).await;
+        assert!(answered.get("ueAmbr").is_none(), "unnegotiated: {answered}");
+        assert!(
+            answered.get("triggers").is_none(),
+            "no UE_AMBR_CH: {answered}"
+        );
+        assert_eq!(answered["rfsp"], 5, "{answered}");
+        assert!(get(unnegotiated).await.get("ueAmbr").is_none());
+
+        udr.stop().await.ok();
+    }
+
+    /// #1524: a mock NRF + UDR whose am-data the test changes, and which records
+    /// every `.../update` POST it receives (the AMF's UpdateNotify callback).
+    async fn start_mock_am_peer_1524(
+        am_data: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
+    ) -> (
+        nextgcore_sbi::server::SbiServer,
+        u16,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+    ) {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        let notified = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = notified.clone();
+        server
+            .start(move |req: SbiRequest| {
+                let am_data = am_data.clone();
+                let seen = seen.clone();
+                async move {
+                    let path = req.header.uri.split('?').next().unwrap_or("").to_string();
+                    if path == "/nnrf-disc/v1/nf-instances" {
+                        return SbiResponse::with_status(200)
+                            .with_json_body(&serde_json::json!({
+                                "nfInstances": [{
+                                    "nfInstanceId": "udr-1524",
+                                    "nfType": "UDR",
+                                    "ipv4Addresses": ["127.0.0.1"],
+                                    "nfServices": [{
+                                        "serviceName": "nudr-dr",
+                                        "scheme": "http",
+                                        "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": port }]
+                                    }]
+                                }]
+                            }))
+                            .unwrap_or_else(|_| SbiResponse::with_status(500));
+                    }
+                    if path.ends_with("/provisioned-data/am-data") {
+                        let body = am_data.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        return SbiResponse::with_status(200)
+                            .with_json_body(&body)
+                            .unwrap_or_else(|_| SbiResponse::with_status(500));
+                    }
+                    if path.ends_with("/update") {
+                        let body = req
+                            .http
+                            .content
+                            .as_deref()
+                            .and_then(|c| serde_json::from_str(c).ok())
+                            .unwrap_or(serde_json::Value::Null);
+                        seen.lock().unwrap_or_else(|e| e.into_inner()).push((path, body));
+                        return SbiResponse::with_status(204);
+                    }
+                    SbiResponse::with_status(404)
+                }
+            })
+            .await
+            .expect("mock NRF/UDR/AMF starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        crate::test_support::point_nrf_at(format!("http://127.0.0.1:{port}")).await;
+        (server, port, notified)
+    }
+
+    /// #1524: a PCF-initiated UpdateNotify carries a changed `ueAmbr` for an
+    /// association with UE-AMBR_Authorization negotiated and a requested UE-AMBR,
+    /// and not for one without the feature (TS 29.507 §4.2.3.3.2, §4.2.4.2).
+    ///
+    /// REVERT-VERIFIED: with `AM_UPDATE_NOTIFY_MEMBERS` back to the two members,
+    /// the negotiated association's notification has no `ueAmbr`; without the
+    /// `gate_am_ue_ambr` in `reevaluate_am_policy`, the unnegotiated one has it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI / PCF context
+    async fn am_update_notify_carries_ue_ambr_only_when_authorised_1524() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let am_data = |rfsp: u64, ul: &str, dl: &str| {
+            serde_json::json!({
+                "subscribedUeAmbr": { "uplink": ul, "downlink": dl },
+                "rfspIndex": rfsp
+            })
+        };
+        let data = std::sync::Arc::new(std::sync::Mutex::new(am_data(5, "1 Gbps", "2 Gbps")));
+        let (peer, port, notified) = start_mock_am_peer_1524(data.clone()).await;
+        let cases = [("imsi-001010000051524", "4"), ("imsi-001010000061524", "0")];
+        for (supi, supp_feat) in cases {
+            let resp = pcf_sbi_request_handler(make_request(
+                "POST",
+                "/npcf-am-policy-control/v1/policies",
+                Some(serde_json::json!({
+                    "supi": supi,
+                    "notificationUri": format!("http://127.0.0.1:{port}/namf-callback/v1/{supi}/am"),
+                    "suppFeat": supp_feat,
+                    "ueAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" },
+                })),
+            ))
+            .await;
+            assert_eq!(resp.status, 201);
+        }
+        *data.lock().unwrap_or_else(|e| e.into_inner()) = am_data(7, "3 Gbps", "4 Gbps");
+        for (supi, _) in cases {
+            let resp = pcf_sbi_request_handler(make_request(
+                "POST",
+                sbi_path::POLICY_DATA_NOTIFY_PATH,
+                Some(serde_json::json!({ "ueId": supi })),
+            ))
+            .await;
+            assert_eq!(resp.status, 204);
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let got = loop {
+            let got = notified.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if got.len() >= 2 || tokio::time::Instant::now() >= deadline {
+                break got;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let body_for = |supi: &str| {
+            got.iter()
+                .find(|(path, _)| path.contains(supi))
+                .map(|(_, body)| body.clone())
+                .unwrap_or_else(|| panic!("no UpdateNotify for {supi}: {got:?}"))
+        };
+        let negotiated = body_for(cases[0].0);
+        assert_eq!(negotiated["rfsp"], 7, "{negotiated}");
+        assert_eq!(
+            negotiated["ueAmbr"],
+            serde_json::json!({ "uplink": "3 Gbps", "downlink": "4 Gbps" }),
+            "the changed authorised UE-AMBR: {negotiated}"
+        );
+        let unnegotiated = body_for(cases[1].0);
+        assert_eq!(unnegotiated["rfsp"], 7, "{unnegotiated}");
+        assert!(unnegotiated.get("ueAmbr").is_none(), "{unnegotiated}");
+        peer.stop().await.ok();
     }
 
     /// AM policy Update applies the request and answers a `PolicyUpdate` carrying
@@ -8201,7 +9584,7 @@ mod tests {
     /// `201` with a fabricated, unaddressable appSessionId.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
-    async fn create_with_unbindable_address_is_403_and_stores_nothing() {
+    async fn create_with_unbindable_address_is_500_and_stores_nothing() {
         // Serialised with every test that touches the process-global PCF context or,
         // through the handlers, the process-global NRF URI / SBI client cache (#529).
         let _guard = crate::test_support::CONTEXT_GUARD
@@ -8220,7 +9603,7 @@ mod tests {
                 Some(af_create_body("http://127.0.0.1:9/af-notif/88", address)),
             ))
             .await;
-            assert_eq!(resp.status, 403, "{address:?} must be refused");
+            assert_eq!(resp.status, 500, "{address:?} must be refused"); // #1583: TS 29.514 §4.2.2.2
             assert_eq!(
                 problem_cause_of(&resp).as_deref(),
                 Some("PDU_SESSION_NOT_AVAILABLE"),
@@ -8595,7 +9978,7 @@ mod tests {
         ))
         .await;
         assert_eq!(
-            resp.status, 403,
+            resp.status, 500,
             "an address outside the prefix must not bind"
         );
     }
@@ -9120,20 +10503,25 @@ mod tests {
         .await;
         assert_eq!(resp.status, 400);
 
-        // An unknown UE address is a 404, not a 204 reporting a restoration that
-        // did not happen.
+        // An unknown UE address is not a 204 reporting a restoration that did not
+        // happen: #1527, a 500 PDU_SESSION_NOT_AVAILABLE (TS 29.514 §4.2.2.27).
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
             "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
             Some(serde_json::json!({"ueIpv4": "10.99.99.99"})),
         ))
         .await;
-        assert_eq!(resp.status, 404);
+        assert_eq!(resp.status, 500);
+        let problem: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(problem["cause"], "PDU_SESSION_NOT_AVAILABLE", "{problem}");
 
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
             "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
-            Some(serde_json::json!({"ueIpv4": "10.45.0.184", "dnn": "ims"})),
+            // #1527 review: the session's own DNN; a contradicting one identifies
+            // no session (pcscf_restoration_refuses_a_contradicting_supi_or_dnn_1527).
+            Some(serde_json::json!({"ueIpv4": "10.45.0.184", "dnn": "internet"})),
         ))
         .await;
         assert_eq!(
@@ -9146,6 +10534,622 @@ mod tests {
         assert!(
             !resp.http.headers.contains_key("location"),
             "pcscf-restoration must not mint an app session"
+        );
+    }
+
+    /// #1527: an SM policy create through the router, with the given members merged
+    /// over [`full_create_body`]; answers the `smPolicyId`. The notification URI
+    /// points at the stub SMF on `smf_port`, path suffix `psi`.
+    async fn sm_create_1527(
+        supi: &str,
+        psi: u8,
+        smf_port: u16,
+        extra: serde_json::Value,
+    ) -> String {
+        let mut create = full_create_body(supi, psi);
+        let obj = create.as_object_mut().unwrap();
+        obj.insert(
+            "notificationUri".to_string(),
+            serde_json::json!(format!(
+                "http://127.0.0.1:{smf_port}/nsmf-callback/v1/sm-policy-notify/{psi}"
+            )),
+        );
+        for (k, v) in extra.as_object().unwrap() {
+            obj.insert(k.clone(), v.clone());
+        }
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(create),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "SM policy create for {supi}/{psi}");
+        let loc = resp
+            .http
+            .headers
+            .get("location")
+            .cloned()
+            .unwrap_or_default();
+        loc.rsplit('/').next().unwrap().to_string()
+    }
+
+    /// #1583: an AF app-session create naming `ueIpv4` plus `extra`; answers (status,
+    /// the bound session's smPolicyId when created, ProblemDetails cause).
+    async fn af_bind_1583(ip: &str, extra: serde_json::Value) -> (u16, Option<String>, String) {
+        let mut body = af_create_body("http://127.0.0.1:9/af-notif/1583", ("ueIpv4", ip));
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions",
+            Some(body),
+        ))
+        .await;
+        let cause = problem_cause_of(&resp).unwrap_or_default();
+        let bound = resp
+            .http
+            .headers
+            .get("location")
+            .and_then(|l| l.rsplit('/').next())
+            .and_then(|id| pcf_self().read().ok()?.app_find_by_app_session_id(id))
+            .and_then(|app| pcf_self().read().ok()?.sess_find_by_id(app.sess_id))
+            .map(|sess| sess.sm_policy_id);
+        (resp.status, bound, cause)
+    }
+
+    /// #1583: TS 29.514 §4.2.2.2 NOTE 4/5/7 and TS 29.512 NOTE 11. Two sessions share
+    /// a private IPv4 in two address domains and two slices. `ipDomain` or
+    /// `sliceInfo` binds the AF session to the right one; the bare address, or an
+    /// attribute that matches neither, is a failed binding: 500
+    /// PDU_SESSION_NOT_AVAILABLE, not a binding to whichever session the IPv4 index
+    /// held. A `supi` or `dnn` that contradicts the session is refused too.
+    ///
+    /// REVERT-VERIFIED: with the create bound through the one-slot IPv4 index again
+    /// (`sess_find_by_ipv4addr`), the bare-address request binds (201) and the dom-a
+    /// request binds to the dom-b session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn af_binding_uses_ip_domain_and_slice_for_a_shared_private_ipv4_1583() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let ip = "10.158.3.1";
+        let a = sm_create_1527(
+            "imsi-001010000015831",
+            1,
+            9,
+            serde_json::json!({ "ipv4Address": ip, "ipDomain": "dom-a", "sliceInfo": { "sst": 1 } }),
+        )
+        .await;
+        let b = sm_create_1527(
+            "imsi-001010000015832",
+            1,
+            9,
+            serde_json::json!({ "ipv4Address": ip, "ipDomain": "dom-b", "sliceInfo": { "sst": 2 } }),
+        )
+        .await;
+        let not_available = (500, None, "PDU_SESSION_NOT_AVAILABLE".to_string());
+
+        let (status, bound, _) = af_bind_1583(ip, serde_json::json!({ "ipDomain": "dom-a" })).await;
+        assert_eq!((status, bound), (201, Some(a.clone())));
+        let (status, bound, _) = af_bind_1583(ip, serde_json::json!({ "ipDomain": "dom-b" })).await;
+        assert_eq!((status, bound), (201, Some(b.clone())));
+        let (status, bound, _) =
+            af_bind_1583(ip, serde_json::json!({ "sliceInfo": { "sst": 2 } })).await;
+        assert_eq!((status, bound), (201, Some(b)));
+        let (status, bound, _) = af_bind_1583(
+            ip,
+            serde_json::json!({ "supi": "imsi-001010000015831", "dnn": "internet" }),
+        )
+        .await;
+        assert_eq!(
+            (status, bound),
+            (201, Some(a)),
+            "supi + dnn tell them apart"
+        );
+
+        assert_eq!(
+            af_bind_1583(ip, serde_json::json!({})).await,
+            not_available,
+            "ambiguous"
+        );
+        assert_eq!(
+            af_bind_1583(ip, serde_json::json!({ "ipDomain": "dom-c" })).await,
+            not_available,
+            "no session in that domain, none without one"
+        );
+        assert_eq!(
+            af_bind_1583(
+                ip,
+                serde_json::json!({ "ipDomain": "dom-a", "sliceInfo": { "sst": 2 } })
+            )
+            .await,
+            not_available,
+            "all attributes must match (NOTE 7)"
+        );
+        assert_eq!(
+            af_bind_1583(ip, serde_json::json!({ "ipDomain": "dom-a", "dnn": "ims" })).await,
+            not_available,
+            "a contradicting dnn"
+        );
+        let (status, _, _) =
+            af_bind_1583(ip, serde_json::json!({ "sliceInfo": { "sst": 300 } })).await;
+        assert_eq!(status, 400, "a malformed sliceInfo");
+    }
+
+    /// #1583: a unique address with no other attribute binds as before. With an
+    /// `ipDomain` no session reported, the AF binds to the session for which the SMF
+    /// reported no domain (an SMF that does not send it), not to one in another
+    /// domain sharing the address.
+    ///
+    /// REVERT-VERIFIED: without the no-domain fallback in `binding_candidates`, the
+    /// dom-x request matches both sessions and answers 500.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn af_binding_keeps_working_without_a_reported_domain_1583() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let ip = "10.158.4.1";
+        let only = sm_create_1527(
+            "imsi-001010000025831",
+            1,
+            9,
+            serde_json::json!({ "ipv4Address": ip }),
+        )
+        .await;
+        let (status, bound, _) = af_bind_1583(ip, serde_json::json!({})).await;
+        assert_eq!((status, bound), (201, Some(only.clone())));
+        // A second session on the address, in a reported domain.
+        sm_create_1527(
+            "imsi-001010000025832",
+            1,
+            9,
+            serde_json::json!({ "ipv4Address": ip, "ipDomain": "dom-a" }),
+        )
+        .await;
+        let (status, bound, _) = af_bind_1583(ip, serde_json::json!({ "ipDomain": "dom-x" })).await;
+        assert_eq!((status, bound), (201, Some(only)));
+    }
+
+    /// #1527: what `handle_pcscf_restoration` identifies for `body`: `Ok(smPolicyId)`,
+    /// or `Err((status, cause))`.
+    fn pcscf_identify_1527(body: serde_json::Value) -> Result<String, (u16, String)> {
+        identify_pcscf_restoration_session(&body)
+            .map(|sess| sess.sm_policy_id)
+            .map_err(|resp| {
+                let cause = resp
+                    .http
+                    .content
+                    .as_deref()
+                    .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+                    .and_then(|v| v["cause"].as_str().map(str::to_string))
+                    .unwrap_or_default();
+                (resp.status, cause)
+            })
+    }
+
+    fn not_available_1527() -> Result<String, (u16, String)> {
+        Err((500, "PDU_SESSION_NOT_AVAILABLE".to_string()))
+    }
+
+    /// #1527: TS 29.514 §4.2.2.27. Two UEs hold the same private IPv4 in two IPv4
+    /// address domains (reported by the SMF as `ipDomain`, TS 29.512 NOTE 11) and on
+    /// two slices. `ipDomain` or `sliceInfo` picks one; the bare address identifies
+    /// neither and is a 500 PDU_SESSION_NOT_AVAILABLE; `supi` + `dnn` break the tie.
+    ///
+    /// REVERT-VERIFIED: without the `ipDomain` narrowing, the ipDomain requests
+    /// answer 500 (two sessions); without `sliceInfo` narrowing, so do the sliceInfo
+    /// ones; with the first match returned again, the bare address answers a session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn pcscf_restoration_narrows_a_shared_private_ipv4_1527() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let ip = "10.152.7.1";
+        let a = sm_create_1527(
+            "imsi-001010000015271",
+            1,
+            9,
+            serde_json::json!({ "ipv4Address": ip, "ipDomain": "dom-a", "sliceInfo": { "sst": 1 } }),
+        )
+        .await;
+        let b = sm_create_1527(
+            "imsi-001010000015272",
+            2,
+            9,
+            serde_json::json!({
+                "ipv4Address": ip, "ipDomain": "dom-b",
+                "sliceInfo": { "sst": 2, "sd": "000001" }
+            }),
+        )
+        .await;
+        assert_ne!(a, b);
+
+        let ok = |id: &String| Ok::<String, (u16, String)>(id.clone());
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({ "ueIpv4": ip, "ipDomain": "dom-b" })),
+            ok(&b)
+        );
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({ "ueIpv4": ip, "ipDomain": "dom-a" })),
+            ok(&a)
+        );
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({
+                "ueIpv4": ip, "sliceInfo": { "sst": 2, "sd": "000001" }
+            })),
+            ok(&b)
+        );
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({ "ueIpv4": ip, "sliceInfo": { "sst": 1 } })),
+            ok(&a)
+        );
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({
+                "ueIpv4": ip, "supi": "imsi-001010000015272", "dnn": "internet"
+            })),
+            ok(&b),
+            "supi + dnn break the tie"
+        );
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({ "ueIpv4": ip })),
+            not_available_1527(),
+            "two sessions hold it: not identified"
+        );
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({ "ueIpv4": ip, "ipDomain": "dom-c" })),
+            not_available_1527(),
+            "no session in that domain, and none without a domain"
+        );
+        assert_eq!(
+            pcscf_identify_1527(
+                serde_json::json!({ "ueIpv4": ip, "sliceInfo": { "sst": 1, "sd": "zz" } })
+            )
+            .map_err(|e| e.0),
+            Err(400),
+            "a malformed sliceInfo is a 400"
+        );
+        assert_eq!(
+            pcscf_identify_1527(
+                serde_json::json!({ "ueIpv4": ip, "sliceInfo": { "sst": 2, "sd": "+00001" } })
+            )
+            .map_err(|e| e.0),
+            Err(400),
+            "#1527 review: a leading '+' is not six hex digits"
+        );
+
+        // Through the router: 500 with the ProblemDetails cause, and a 204 for the
+        // narrowed request.
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
+            Some(serde_json::json!({ "ueIpv4": ip })),
+        ))
+        .await;
+        assert_eq!(resp.status, 500);
+        let problem: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(problem["cause"], "PDU_SESSION_NOT_AVAILABLE", "{problem}");
+        assert_eq!(problem["status"], 500, "{problem}");
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
+            Some(serde_json::json!({ "ueIpv4": ip, "ipDomain": "dom-a" })),
+        ))
+        .await;
+        assert_eq!(resp.status, 204, "{:?}", resp.http.content);
+    }
+
+    /// #1527: with no IP address, `supi` + `dnn` identify the PDU session (TS 29.514
+    /// §4.2.2.27 second bullet), and the SMF of THAT session is the one asked to
+    /// restore; a SUPI + DNN that match nothing, or two sessions, are a 500
+    /// PDU_SESSION_NOT_AVAILABLE, and `sliceInfo` narrows the two. A body with
+    /// neither an address nor both of `supi` / `dnn` stays a 400.
+    ///
+    /// REVERT-VERIFIED: with supi + dnn refused as before (400 MANDATORY_IE_MISSING),
+    /// the first assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn pcscf_restoration_identifies_by_supi_and_dnn_1527() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
+        let supi = "imsi-001010000025271";
+        let ims = sm_create_1527(
+            supi,
+            5,
+            peers.smf_port,
+            serde_json::json!({ "dnn": "ims", "ipv4Address": "10.152.8.5" }),
+        )
+        .await;
+        let internet_1 = sm_create_1527(
+            supi,
+            6,
+            peers.smf_port,
+            serde_json::json!({ "ipv4Address": "10.152.8.6" }),
+        )
+        .await;
+        let internet_2 = sm_create_1527(
+            supi,
+            7,
+            peers.smf_port,
+            serde_json::json!({ "ipv4Address": "10.152.8.7", "sliceInfo": { "sst": 3 } }),
+        )
+        .await;
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
+            Some(serde_json::json!({ "supi": supi, "dnn": "IMS" })),
+        ))
+        .await;
+        assert_eq!(resp.status, 204, "{:?}", resp.http.content);
+        let got = await_notifications(&peers, 1).await;
+        assert_eq!(
+            got.first().map(|n| n.0.as_str()),
+            Some("/nsmf-callback/v1/sm-policy-notify/5/update"),
+            "the IMS session's SMF is asked: {got:?}"
+        );
+        assert_eq!(
+            got[0].1["resourceUri"],
+            serde_json::json!(format!("/npcf-smpolicycontrol/v1/sm-policies/{ims}"))
+        );
+
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({ "supi": supi, "dnn": "internet" })),
+            not_available_1527(),
+            "two internet sessions: not identified"
+        );
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({
+                "supi": supi, "dnn": "internet", "sliceInfo": { "sst": 3 }
+            })),
+            Ok(internet_2)
+        );
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({
+                "supi": supi, "dnn": "internet", "sliceInfo": { "sst": 1 }
+            })),
+            Ok(internet_1)
+        );
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({ "supi": supi, "dnn": "corp" })),
+            not_available_1527()
+        );
+        assert_eq!(
+            pcscf_identify_1527(
+                serde_json::json!({ "supi": "imsi-001010000025279", "dnn": "ims" })
+            ),
+            not_available_1527(),
+            "an unknown SUPI"
+        );
+        for body in [
+            serde_json::json!({ "supi": supi }),
+            serde_json::json!({ "dnn": "ims" }),
+        ] {
+            assert_eq!(
+                pcscf_identify_1527(body.clone()),
+                Err((400, "MANDATORY_IE_MISSING".to_string())),
+                "{body}"
+            );
+        }
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
+    }
+
+    /// #1527 review: the IPv6 path. `ueIpv6` is a full address and identifies the
+    /// session whose `ipv6AddressPrefix` contains it, for an IPv6-only and a
+    /// dual-stack session; the SMF of that session is the one asked to restore. An
+    /// address outside every prefix is a 500 PDU_SESSION_NOT_AVAILABLE.
+    ///
+    /// REVERT-VERIFIED: with the `Address::V6` arm never matching, the first
+    /// assertion fails (500).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn pcscf_restoration_identifies_an_ipv6_session_by_prefix_1527() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
+        let v6_only = sm_create_1527(
+            "imsi-001010000045271",
+            8,
+            peers.smf_port,
+            serde_json::json!({
+                "pduSessionType": "IPV6",
+                "ipv6AddressPrefix": "2001:db8:1::/64",
+            }),
+        )
+        .await;
+        // `full_create_body` carries ipv4Address 10.45.0.77 as well: dual stack.
+        let dual = sm_create_1527(
+            "imsi-001010000045272",
+            9,
+            peers.smf_port,
+            serde_json::json!({
+                "pduSessionType": "IPV4V6",
+                "ipv4Address": "10.152.10.9",
+                "ipv6AddressPrefix": "2001:db8:2::/64",
+            }),
+        )
+        .await;
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions/pcscf-restoration",
+            Some(serde_json::json!({ "ueIpv6": "2001:db8:1::5" })),
+        ))
+        .await;
+        assert_eq!(resp.status, 204, "{:?}", resp.http.content);
+        let got = await_notifications(&peers, 1).await;
+        assert_eq!(
+            got.first().map(|n| n.0.as_str()),
+            Some("/nsmf-callback/v1/sm-policy-notify/8/update"),
+            "the IPv6 session's SMF is asked: {got:?}"
+        );
+        assert_eq!(
+            got[0].1["resourceUri"],
+            serde_json::json!(format!("/npcf-smpolicycontrol/v1/sm-policies/{v6_only}"))
+        );
+
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({ "ueIpv6": "2001:db8:2::9" })),
+            Ok(dual.clone()),
+            "a dual-stack session named by its IPv6"
+        );
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({ "ueIpv4": "10.152.10.9" })),
+            Ok(dual),
+            "and by its IPv4"
+        );
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({ "ueIpv6": "2001:db8:3::1" })),
+            not_available_1527(),
+            "outside every prefix"
+        );
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({ "ueIpv6": "not-an-address" })).map_err(|e| e.0),
+            Err(400)
+        );
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
+    }
+
+    /// #1527 review: an `ipDomain` no session reported falls back to the session
+    /// for which the SMF reported no domain (an SMF that does not send ipDomain),
+    /// not to the one in another domain.
+    ///
+    /// REVERT-VERIFIED: without the `retain(ip_domain.is_none())` fallback, the
+    /// request matches both sessions and answers 500.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn pcscf_restoration_falls_back_to_the_session_with_no_domain_1527() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let ip = "10.152.11.1";
+        let _in_dom_a = sm_create_1527(
+            "imsi-001010000055271",
+            1,
+            9,
+            serde_json::json!({ "ipv4Address": ip, "ipDomain": "dom-a" }),
+        )
+        .await;
+        let no_domain = sm_create_1527(
+            "imsi-001010000055272",
+            1,
+            9,
+            serde_json::json!({ "ipv4Address": ip }),
+        )
+        .await;
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({ "ueIpv4": ip, "ipDomain": "dom-z" })),
+            Ok(no_domain)
+        );
+    }
+
+    /// #1527 review: a `supi` or `dnn` that contradicts the one session holding the
+    /// address (an address since reused by another UE) identifies no session: a 500
+    /// PDU_SESSION_NOT_AVAILABLE, not a restoration of the other UE (§4.2.2.27: the
+    /// PCF identifies the PDU session "for which the HTTP POST request applies").
+    ///
+    /// REVERT-VERIFIED: with supi / dnn applied only to break a tie (the first
+    /// draft), both contradicting requests identify the other UE's session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn pcscf_restoration_refuses_a_contradicting_supi_or_dnn_1527() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let ip = "10.152.12.1";
+        let holder = sm_create_1527(
+            "imsi-001010000065271",
+            1,
+            9,
+            serde_json::json!({ "ipv4Address": ip }),
+        )
+        .await;
+        // Another UE this PCF knows, on another address.
+        let other = "imsi-001010000065272";
+        sm_create_1527(
+            other,
+            1,
+            9,
+            serde_json::json!({ "ipv4Address": "10.152.12.2" }),
+        )
+        .await;
+
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({ "ueIpv4": ip, "supi": other })),
+            not_available_1527(),
+            "the address holder is another UE"
+        );
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({ "ueIpv4": ip, "dnn": "ims" })),
+            not_available_1527(),
+            "the address holder's session is not the IMS one"
+        );
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({
+                "ueIpv4": ip, "supi": "imsi-001010000065271", "dnn": "internet"
+            })),
+            Ok(holder),
+            "a consistent supi + dnn still identifies it"
+        );
+    }
+
+    /// #1527: an `ipDomain` the SMF reports on an SM policy update (TS 29.512
+    /// SmPolicyUpdateContextData) is the one a later P-CSCF restoration narrows by.
+    ///
+    /// REVERT-VERIFIED: without the update storing `ipDomain`, the restoration for
+    /// "dom-new" answers 500.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn pcscf_restoration_uses_an_updated_ip_domain_1527() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let ip = "10.152.9.1";
+        let a = sm_create_1527(
+            "imsi-001010000035271",
+            1,
+            9,
+            serde_json::json!({ "ipv4Address": ip, "ipDomain": "dom-old" }),
+        )
+        .await;
+        let _b = sm_create_1527(
+            "imsi-001010000035272",
+            1,
+            9,
+            serde_json::json!({ "ipv4Address": ip, "ipDomain": "dom-other" }),
+        )
+        .await;
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            &format!("/npcf-smpolicycontrol/v1/sm-policies/{a}/update"),
+            Some(serde_json::json!({ "ipDomain": "dom-new" })),
+        ))
+        .await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({ "ueIpv4": ip, "ipDomain": "dom-new" })),
+            Ok(a)
+        );
+        assert_eq!(
+            pcscf_identify_1527(serde_json::json!({ "ueIpv4": ip, "ipDomain": "dom-old" })),
+            not_available_1527()
         );
     }
 
@@ -10462,6 +12466,225 @@ mod tests {
                 }],
             },
         );
+    }
+
+    /// #1541: the one session rule of a decision, as (5QI, ARP, uplink, downlink).
+    fn sess_rule_1541(rules: &serde_json::Value) -> (i64, serde_json::Value, String, String) {
+        let rules = rules
+            .as_object()
+            .unwrap_or_else(|| panic!("sessRules present: {rules}"));
+        assert_eq!(rules.len(), 1, "one session rule: {rules:?}");
+        let rule = rules.values().next().unwrap();
+        (
+            rule["authDefQos"]["5qi"].as_i64().unwrap_or(-1),
+            rule["authDefQos"]["arp"].clone(),
+            rule["authSessAmbr"]["uplink"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+            rule["authSessAmbr"]["downlink"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+        )
+    }
+
+    /// #1541: TS 29.512 Table 5.8-1 feature 49 (VPLMN-QoS-Control) as a suppFeat.
+    const VPLMN_QOS_FEAT_1541: &str = "1000000000000";
+
+    /// #1541: a VPLMN that supports less than the subscription (seeded 5QI 7, ARP
+    /// level 2, 11/22 Mbps).
+    fn vplmn_qos_1541() -> serde_json::Value {
+        serde_json::json!({
+            "sessionAmbr": { "uplink": "5 Mbps", "downlink": "50 Mbps" },
+            "5qi": 8,
+            "arp": { "priorityLevel": 9, "preemptCap": "NOT_PREEMPT", "preemptVuln": "PREEMPTABLE" }
+        })
+    }
+
+    /// #1541: an SM policy create for a seeded subscriber with `suppFeat` and, if
+    /// given, `vplmnQos`; answers (status, body, smPolicyId).
+    async fn sm_create_1541(
+        supi: &str,
+        supp_feat: &str,
+        vplmn_qos: Option<serde_json::Value>,
+    ) -> (u16, serde_json::Value, String) {
+        seed_subscriber_1383(supi);
+        let mut create = full_create_body(supi, 5);
+        let obj = create.as_object_mut().unwrap();
+        obj.insert("suppFeat".into(), serde_json::json!(supp_feat));
+        obj.remove("ipv4Address");
+        if let Some(v) = vplmn_qos {
+            obj.insert("vplmnQos".into(), v);
+        }
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(create),
+        ))
+        .await;
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap_or_default();
+        let id = resp
+            .http
+            .headers
+            .get("location")
+            .and_then(|l| l.rsplit('/').next())
+            .unwrap_or("")
+            .to_string();
+        (resp.status, body, id)
+    }
+
+    fn arp_1541(level: i64, cap: &str, vuln: &str) -> serde_json::Value {
+        serde_json::json!({ "priorityLevel": level, "preemptCap": cap, "preemptVuln": vuln })
+    }
+
+    /// #1541: TS 29.512 §4.2.2.5 / TS 23.503 §6.1.3.6. With VPLMN-QoS-Control
+    /// negotiated, the create and the GET authorise no more than the VPLMN supports:
+    /// Session-AMBR per direction, a default 5QI it supports, an ARP no more
+    /// privileged than its own. Not negotiated, `vplmnQos` is not this association's
+    /// and the subscription is authorised. A malformed `vplmnQos` is refused only
+    /// when negotiated.
+    ///
+    /// REVERT-VERIFIED: without `vplmn_qos::apply` in `decision_session_data`, the
+    /// negotiated create answers 11/22 Mbps and 5QI 7; with the feature bit not
+    /// advertised, the same.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn sm_policy_create_is_bounded_by_the_vplmn_qos_1541() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _cap = crate::test_support::session_ambr_cap(
+            crate::session_ambr_cap::SessionAmbrCap::Subscribed,
+        );
+        pcf_context_init(64, 64);
+        let (status, body, id) = sm_create_1541(
+            "imsi-001010000015411",
+            VPLMN_QOS_FEAT_1541,
+            Some(vplmn_qos_1541()),
+        )
+        .await;
+        assert_eq!(status, 201, "{body}");
+        assert_eq!(body["suppFeat"], VPLMN_QOS_FEAT_1541, "{body}");
+        let bounded = (
+            8,
+            arp_1541(9, "NOT_PREEMPT", "PREEMPTABLE"),
+            "5 Mbps".to_string(),
+            "22 Mbps".to_string(),
+        );
+        assert_eq!(sess_rule_1541(&body["sessRules"]), bounded, "{body}");
+        let resp = pcf_sbi_request_handler(make_request(
+            "GET",
+            &format!("/npcf-smpolicycontrol/v1/sm-policies/{id}"),
+            None,
+        ))
+        .await;
+        let got: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            sess_rule_1541(&got["policy"]["sessRules"]),
+            bounded,
+            "GET: {got}"
+        );
+
+        let (status, body, _) =
+            sm_create_1541("imsi-001010000015412", "0", Some(vplmn_qos_1541())).await;
+        assert_eq!(status, 201, "{body}");
+        let (five_qi, _, ul, dl) = sess_rule_1541(&body["sessRules"]);
+        assert_eq!(
+            (five_qi, ul.as_str(), dl.as_str()),
+            (7, "11 Mbps", "22 Mbps"),
+            "not negotiated: the subscription: {body}"
+        );
+
+        let bad = serde_json::json!({ "sessionAmbr": { "uplink": "fast" } });
+        let (status, _, _) = sm_create_1541(
+            "imsi-001010000015413",
+            VPLMN_QOS_FEAT_1541,
+            Some(bad.clone()),
+        )
+        .await;
+        assert_eq!(status, 400, "a bound it cannot read is refused");
+        let (status, _, _) = sm_create_1541("imsi-001010000015414", "0", Some(bad)).await;
+        assert_eq!(status, 201, "not negotiated: ignored");
+    }
+
+    /// #1541: TS 29.512 §4.2.4.4 / §4.2.4.5. A VPLMN_QOS_CH update with a new
+    /// `vplmnQos` is answered with the Session-AMBR and default QoS bound by it;
+    /// `vplmnQosNotApp` lifts the bound; an SE_AMBR_CH still respects the stored one.
+    ///
+    /// REVERT-VERIFIED: without the `vplmn_reported` arm, the VPLMN_QOS_CH updates
+    /// answer no session rule; without the `vplmn_qos::apply` in the SE_AMBR_CH arm,
+    /// the last update answers 100/100 Mbps.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn sm_policy_update_applies_a_changed_vplmn_qos_1541() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _cap =
+            crate::test_support::session_ambr_cap(crate::session_ambr_cap::SessionAmbrCap::None);
+        pcf_context_init(64, 64);
+        let (status, body, id) =
+            sm_create_1541("imsi-001010000025411", VPLMN_QOS_FEAT_1541, None).await;
+        assert_eq!(status, 201, "{body}");
+        let (five_qi, _, ul, dl) = sess_rule_1541(&body["sessRules"]);
+        assert_eq!(
+            (five_qi, ul.as_str(), dl.as_str()),
+            (7, "11 Mbps", "22 Mbps")
+        );
+
+        let update = |body: serde_json::Value| {
+            let id = id.clone();
+            async move {
+                let resp = pcf_sbi_request_handler(make_request(
+                    "POST",
+                    &format!("/npcf-smpolicycontrol/v1/sm-policies/{id}/update"),
+                    Some(body),
+                ))
+                .await;
+                assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+                serde_json::from_str::<serde_json::Value>(resp.http.content.as_deref().unwrap())
+                    .unwrap()
+            }
+        };
+        let got = update(serde_json::json!({
+            "repPolicyCtrlReqTriggers": ["VPLMN_QOS_CH"],
+            "vplmnQos": { "sessionAmbr": { "uplink": "1 Mbps", "downlink": "2 Mbps" }, "5qi": 7 }
+        }))
+        .await;
+        let (five_qi, _, ul, dl) = sess_rule_1541(&got["sessRules"]);
+        assert_eq!(
+            (five_qi, ul.as_str(), dl.as_str()),
+            (7, "1 Mbps", "2 Mbps"),
+            "{got}"
+        );
+
+        let got = update(serde_json::json!({
+            "repPolicyCtrlReqTriggers": ["VPLMN_QOS_CH"],
+            "vplmnQosNotApp": true
+        }))
+        .await;
+        let (five_qi, _, ul, dl) = sess_rule_1541(&got["sessRules"]);
+        assert_eq!(
+            (five_qi, ul.as_str(), dl.as_str()),
+            (7, "11 Mbps", "22 Mbps"),
+            "{got}"
+        );
+
+        update(serde_json::json!({
+            "repPolicyCtrlReqTriggers": ["VPLMN_QOS_CH"],
+            "vplmnQos": { "sessionAmbr": { "uplink": "3 Mbps", "downlink": "4 Mbps" } }
+        }))
+        .await;
+        let got = update(serde_json::json!({
+            "repPolicyCtrlReqTriggers": ["SE_AMBR_CH"],
+            "subsSessAmbr": { "uplink": "100 Mbps", "downlink": "100 Mbps" }
+        }))
+        .await;
+        let (_, _, ul, dl) = sess_rule_1541(&got["sessRules"]);
+        assert_eq!((ul.as_str(), dl.as_str()), ("3 Mbps", "4 Mbps"), "{got}");
     }
 
     /// SM policy create for `supi` through the real router, its notificationUri on the
@@ -12051,11 +14274,14 @@ mod tests_am_policy_changes {
         // Unchanged: nothing.
         let (c, r) = am_policy_changes(Some(&old), &map(old.clone()));
         assert!(c.is_empty() && r.is_empty());
-        // RFSP changed, SAR not, UE-AMBR changed (not carried without
-        // UE-AMBR_Authorization, §4.2.3.3.2).
+        // RFSP changed, SAR not, UE-AMBR changed (#1524: carried; the caller
+        // has already dropped it from both unless UE-AMBR_Authorization applies).
         let new = json!({"rfsp": 7, "servAreaRes": sar, "ueAmbr": {"uplink": "2 Mbps"}});
         let (c, r) = am_policy_changes(Some(&old), &map(new));
-        assert_eq!(serde_json::Value::Object(c), json!({"rfsp": 7}));
+        assert_eq!(
+            serde_json::Value::Object(c),
+            json!({"rfsp": 7, "ueAmbr": {"uplink": "2 Mbps"}})
+        );
         assert!(r.is_empty());
         // Added, from no stored policy at all: the complete value (bullet 4).
         let (c, _) = am_policy_changes(None, &map(json!({"servAreaRes": sar})));
@@ -12063,7 +14289,7 @@ mod tests_am_policy_changes {
         // Removed: not encodable (not nullable), so reported and not carried.
         let (c, r) = am_policy_changes(Some(&old), &map(json!({"servAreaRes": sar})));
         assert!(c.is_empty());
-        assert_eq!(r, vec!["rfsp"]);
+        assert_eq!(r, vec!["rfsp", "ueAmbr"]);
     }
 }
 

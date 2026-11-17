@@ -150,6 +150,19 @@ pub struct PcfUeAm {
     /// (TS 29.500 §6.10).
     #[serde(default)]
     pub alt_notif_uris: Vec<String>,
+    /// #1524: the AMF sent a `ueAmbr` on this association (create or update).
+    /// With UE-AMBR_Authorization negotiated in `am_policy_control_features`,
+    /// that is what makes the policy carry an authorised UE-AMBR (TS 29.507
+    /// §4.2.2.2 item c, §4.2.3.2 item c).
+    #[serde(default)]
+    pub ue_ambr_requested: bool,
+    /// #1580: the AMF sent `servAreaRes` / `rfsp` on this association (create or
+    /// update). TS 29.507 §4.2.2.2 items a/b and §4.2.3.2 items a/b answer them
+    /// only "if the PCF received" them in the request.
+    #[serde(default)]
+    pub serv_area_res_requested: bool,
+    #[serde(default)]
+    pub rfsp_requested: bool,
 }
 
 /// UE Route Selection Policy rule (TS 24.526)
@@ -231,6 +244,9 @@ impl PcfUeAm {
             triggers: Vec::new(),
             am_policy: None,
             alt_notif_uris: Vec::new(),
+            ue_ambr_requested: false,
+            serv_area_res_requested: false,
+            rfsp_requested: false,
         }
     }
 
@@ -593,6 +609,19 @@ pub struct PcfSess {
     /// writes it. `#[serde(default)]` for older snapshots.
     #[serde(default)]
     pub demo_ambr_cap: Option<DemoAmbrCap>,
+    /// #1527: the IPv4 address domain the SMF reported for this session's UE IPv4
+    /// address (TS 29.512 `SmPolicyContextData.ipDomain` / `SmPolicyUpdateContextData.ipDomain`,
+    /// NOTE 11): what tells two sessions holding the same private IPv4 apart when a
+    /// P-CSCF restoration names one (TS 29.514 §4.2.2.27). `#[serde(default)]` for
+    /// older snapshots.
+    #[serde(default)]
+    pub ip_domain: Option<String>,
+    /// #1541: the QoS constraints of the VPLMN in home-routed roaming
+    /// (`vplmnQos`, TS 29.512 VPLMN-QoS-Control), last reported by the SMF;
+    /// `None` when none apply. Only held when the feature was negotiated.
+    /// `#[serde(default)]` for older snapshots.
+    #[serde(default)]
+    pub vplmn_qos: Option<crate::vplmn_qos::VplmnQosBound>,
 }
 
 /// The cap a demo installed on a session ([`PcfSess::demo_ambr_cap`]).
@@ -662,6 +691,8 @@ impl PcfSess {
             origination_ms: None,
             authorised_session_data: None,
             demo_ambr_cap: None,
+            ip_domain: None,
+            vplmn_qos: None,
         }
     }
 
@@ -1236,7 +1267,7 @@ impl PcfApp {
 /// that is not a multiple of 8 is honoured rather than rounded — rounding up
 /// would reject a legitimate address, and rounding down would bind an AF request
 /// to a neighbouring UE's session.
-fn ipv6_prefix_contains(prefix: &[u8; 16], len: u8, addr: &[u8; 16]) -> bool {
+pub(crate) fn ipv6_prefix_contains(prefix: &[u8; 16], len: u8, addr: &[u8; 16]) -> bool {
     let len = len.min(128) as usize;
     let full_bytes = len / 8;
     if prefix[..full_bytes] != addr[..full_bytes] {
@@ -2705,6 +2736,15 @@ impl PcfContext {
         let mut all: Vec<PcfSess> = sess_list.values().cloned().collect();
         all.sort_by_key(|s| s.id);
         all
+    }
+
+    /// #1527: every session `pred` accepts, under one read of the session list (a
+    /// scan, bounded by `max_num_of_sess`), ordered by id.
+    pub fn sess_find_all(&self, pred: impl Fn(&PcfSess) -> bool) -> Vec<PcfSess> {
+        let sess_list = read_through_poison(&self.sess_list);
+        let mut found: Vec<PcfSess> = sess_list.values().filter(|s| pred(s)).cloned().collect();
+        found.sort_by_key(|s| s.id);
+        found
     }
 
     pub fn sess_find_by_id(&self, id: u64) -> Option<PcfSess> {

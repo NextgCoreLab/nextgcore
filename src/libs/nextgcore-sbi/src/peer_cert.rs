@@ -61,6 +61,45 @@ pub fn nf_instance_id_from_der(der: &[u8]) -> Option<String> {
     })
 }
 
+/// The RFC 9310 NFTypes certificate extension, `id-pe-nftype`
+/// (1.3.6.1.5.5.7.1.34). TS 33.310 §6.1.3c.2: "nfTypes shall contain NF type for
+/// the Network Function instance formatted according to RFC 9310".
+pub const NF_TYPES_OID: x509_cert::der::oid::ObjectIdentifier =
+    x509_cert::der::oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.1.34");
+
+/// The NF types a DER-encoded certificate's RFC 9310 NFTypes extension names
+/// (#1522): `NFTypes ::= SEQUENCE SIZE (1..MAX) OF NFType`, `NFType ::= IA5String
+/// (SIZE (1..32))`.
+///
+/// Empty when the certificate cannot be parsed, carries no NFTypes extension, or
+/// carries one that does not decode as RFC 9310 defines it (an empty sequence, an
+/// entry that is not a 1-32 character IA5String). Every one of those means "this
+/// certificate asserts no NF type", never "any type". Like
+/// [`nf_instance_id_from_der`] this does no verification: it reads a certificate
+/// the TLS layer has already verified.
+pub fn nf_types_from_der(der: &[u8]) -> Vec<String> {
+    let Ok(cert) = Certificate::from_der(der) else {
+        return Vec::new();
+    };
+    let Some(ext) = cert
+        .tbs_certificate
+        .extensions
+        .as_ref()
+        .and_then(|exts| exts.iter().find(|e| e.extn_id == NF_TYPES_OID))
+    else {
+        return Vec::new();
+    };
+    let Ok(types) = Vec::<x509_cert::der::asn1::Ia5String>::from_der(ext.extn_value.as_bytes())
+    else {
+        return Vec::new();
+    };
+    let types: Vec<String> = types.iter().map(|t| t.as_str().to_string()).collect();
+    if types.is_empty() || types.iter().any(|t| t.is_empty() || t.len() > 32) {
+        return Vec::new();
+    }
+    types
+}
+
 /// Strip a case-insensitive `urn:uuid:` prefix and trim, rejecting an empty
 /// result. Split out so the normalisation is testable without building a
 /// certificate.
@@ -81,7 +120,7 @@ fn normalize_uri_san(uri: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Generate a certificate carrying `uri` as a URI SubjectAltName, and return
@@ -94,6 +133,62 @@ mod tests {
         params.subject_alt_names = vec![SanType::URI(uri.try_into().expect("ia5 uri"))];
         let key = KeyPair::generate().expect("key");
         params.self_signed(&key).expect("cert").der().to_vec()
+    }
+
+    /// An RFC 9310 NFTypes extension's DER: SEQUENCE OF IA5String.
+    pub(crate) fn nf_types_der(types: &[&str]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for t in types {
+            body.push(0x16);
+            body.push(t.len() as u8);
+            body.extend_from_slice(t.as_bytes());
+        }
+        let mut der = vec![0x30, body.len() as u8];
+        der.extend(body);
+        der
+    }
+
+    fn cert_with_nf_types(content: Option<Vec<u8>>) -> Vec<u8> {
+        use rcgen::{CertificateParams, CustomExtension, KeyPair};
+        let mut params = CertificateParams::new(Vec::new()).expect("params");
+        if let Some(content) = content {
+            params
+                .custom_extensions
+                .push(CustomExtension::from_oid_content(
+                    &[1, 3, 6, 1, 5, 5, 7, 1, 34],
+                    content,
+                ));
+        }
+        let key = KeyPair::generate().expect("key");
+        params.self_signed(&key).expect("cert").der().to_vec()
+    }
+
+    /// #1522, RFC 9310 / TS 33.310 §6.1.3c.2: the NF types a certificate's NFTypes
+    /// extension names; nothing for a certificate without one, or with one that
+    /// does not decode as RFC 9310 defines it.
+    #[test]
+    fn reads_the_rfc_9310_nf_types_extension_1522() {
+        assert_eq!(
+            nf_types_from_der(&cert_with_nf_types(Some(nf_types_der(&["UDM"])))),
+            ["UDM"]
+        );
+        assert_eq!(
+            nf_types_from_der(&cert_with_nf_types(Some(nf_types_der(&["AMF", "SMF"])))),
+            ["AMF", "SMF"]
+        );
+        assert!(nf_types_from_der(&cert_with_nf_types(None)).is_empty());
+        assert!(
+            nf_types_from_der(&cert_with_nf_types(Some(vec![0x30, 0x00]))).is_empty(),
+            "an empty sequence (SIZE (1..MAX))"
+        );
+        assert!(
+            nf_types_from_der(&cert_with_nf_types(Some(vec![
+                0x04, 0x03, b'U', b'D', b'M'
+            ])))
+            .is_empty(),
+            "an OCTET STRING, not a SEQUENCE OF IA5String"
+        );
+        assert!(nf_types_from_der(b"not a certificate").is_empty());
     }
 
     /// **Issue #186.** The NF Instance ID is recovered from a real certificate's

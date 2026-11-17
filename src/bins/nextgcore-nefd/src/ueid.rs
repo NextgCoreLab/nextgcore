@@ -923,7 +923,7 @@ mod tests {
             "subscription": "/3gpp-monitoring-event/v1/fl-af/subscriptions/sub-480-on",
             "monitoringEventReports": [{
                 "monitoringType": "LOSS_OF_CONNECTIVITY",
-                "lossOfConnectReason": "DEREGISTERED",
+                "lossOfConnectReason": 6,
                 "externalId": EXT
             }]
         });
@@ -952,7 +952,7 @@ mod tests {
         assert!(
             on[0].contains(
                 "[demo:d445a-fl-t8] T8 delivery sub=sub-480-on \
-                 monitoringType=LOSS_OF_CONNECTIVITY lossOfConnectReason=DEREGISTERED status=204"
+                 monitoringType=LOSS_OF_CONNECTIVITY lossOfConnectReason=6 status=204"
             ),
             "{on:?}"
         );

@@ -1542,6 +1542,18 @@ async fn handle_pfcp_session_report_from(
         return;
     }
 
+    // #1559, TS 29.244 §7.2.2.4.1: from here on the session is this UPF's, and every
+    // answer carries the SEID the UPF gave for it (its UP F-SEID), not the SMF's own
+    // one the request was addressed to. §7.2.2.4.2 leaves 0 for an unknown session
+    // (the cause 65 answer above) and for a peer SEID that is not available.
+    let upf_seid = pfcp_path::upf_seid_for_session(seid).unwrap_or_else(|| {
+        log::warn!(
+            "Session Report Request for SEID 0x{seid:016x}: no UP F-SEID recorded for the \
+             session; the response carries SEID 0 (TS 29.244 §7.2.2.4.2)"
+        );
+        0
+    });
+
     // #1509, TS 29.244 §5.8.3: "When a PFCP Association is not established with a UP
     // function, the CP function shall reject any incoming PFCP Session related
     // messages from that UP function, with a cause indicating that no PFCP
@@ -1551,9 +1563,9 @@ async fn handle_pfcp_session_report_from(
     // enough: nothing in the report is processed, no usage, no Downlink Data Report,
     // no Error Indication. The owner is the client that passed the ownership check
     // above (the admitted one, or the session's recorded or default client).
-    // SEID 0 in the answer, as the #971 refusal of a stranger's report: §7.2.2.4.2
-    // lets a rejecting node answer without looking up the peer's SEID, with any
-    // cause but "Session context not found".
+    // #1559 (review of #1561): the session and its UP SEID are known, so the answer
+    // carries that SEID. §7.2.2.4.2 allows 0 only for an unknown session (cause 65)
+    // or, as an option, a §7.6 protocol-error reject; this is neither.
     let associated = match pfcp_path::client_for_session(seid) {
         Some(owner) => owner.is_associated().await,
         None => false,
@@ -1565,7 +1577,7 @@ async fn handle_pfcp_session_report_from(
         );
         let resp = pfcp_path::encode_wire_message(
             pfcp_path::pfcp_message_type::SESSION_REPORT_RESPONSE,
-            Some(0),
+            Some(upf_seid),
             seq,
             &[
                 0,
@@ -1592,7 +1604,7 @@ async fn handle_pfcp_session_report_from(
         body.add_u16(n4_build::pfcp_ie::OFFENDING_IE, 39);
         let resp = pfcp_path::encode_wire_message(
             pfcp_path::pfcp_message_type::SESSION_REPORT_RESPONSE,
-            Some(seid),
+            Some(upf_seid),
             seq,
             &body.build(),
         );
@@ -1779,7 +1791,7 @@ async fn handle_pfcp_session_report_from(
     body.add_cause_raw(1); // Request Accepted
     let resp = pfcp_path::encode_wire_message(
         pfcp_path::pfcp_message_type::SESSION_REPORT_RESPONSE,
-        Some(seid),
+        Some(upf_seid),
         seq,
         &body.build(),
     );
@@ -1787,7 +1799,10 @@ async fn handle_pfcp_session_report_from(
     if let Err(e) = sock.send_to(&resp, peer).await {
         log::warn!("Failed to send PFCP Session Report Response to {peer}: {e}");
     } else {
-        log::info!("PFCP Session Report Response sent: SEID=0x{seid:016x}, seq={seq}, peer={peer}");
+        log::info!(
+            "PFCP Session Report Response sent: SEID=0x{upf_seid:016x} (the UPF's, for SMF \
+             SEID 0x{seid:016x}), seq={seq}, peer={peer}"
+        );
     }
 }
 
@@ -6333,7 +6348,11 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             // m1), and onto the binding read under it, so an UpdateNotify applied
             // while the update was in flight is the base, not overwritten.
             let mut _applying = None;
-            let (qfi, ambr_ul, ambr_dl) = match binding.as_ref() {
+            // #1573: the merged decision as a whole (Session-AMBR, default 5QI, ARP),
+            // with the binding it is merged onto. TS 29.512 §4.2.2.5 / §4.2.2.6: "the
+            // SMF shall apply" the authorised Session-AMBR and default QoS "towards the
+            // access network, the UE and the UPF".
+            let (decision, enforced) = match binding.as_ref() {
                 Some(b) => {
                     let mut answer = None;
                     if let Some(ref pol_id) = b.sm_policy_id {
@@ -6386,25 +6405,26 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                         Some(SmContextLock::acquire(policy_apply_locks(), sm_context_ref).await);
                     let enforced =
                         lookup_policy_binding(sm_context_ref).unwrap_or_else(|| b.clone());
-                    match answer {
-                        Some(json) => {
-                            let dec = policy::merge_sm_policy_decision(
-                                enforced_policy_decision(&enforced),
-                                &json,
-                            );
-                            (enforced.qfi, dec.sess_ambr_ul_bps, dec.sess_ambr_dl_bps)
-                        }
-                        None => (enforced.qfi, enforced.ambr_ul_bps, enforced.ambr_dl_bps),
-                    }
+                    let decision = match answer {
+                        Some(json) => policy::merge_sm_policy_decision(
+                            enforced_policy_decision(&enforced),
+                            &json,
+                        ),
+                        None => enforced_policy_decision(&enforced),
+                    };
+                    (decision, Some(enforced))
                 }
                 None => {
                     log::warn!(
                         "No policy binding for ref={sm_context_ref} — applying config-default QoS"
                     );
-                    let d = policy::PolicyDecision::config_default();
-                    (d.default_qfi(), d.sess_ambr_ul_bps, d.sess_ambr_dl_bps)
+                    (policy::PolicyDecision::config_default(), None)
                 }
             };
+            let qfi = enforced
+                .as_ref()
+                .map_or_else(|| decision.default_qfi(), |b| b.qfi);
+            let (ambr_ul, ambr_dl) = (decision.sess_ambr_ul_bps, decision.sess_ambr_dl_bps);
 
             // Apply the authorized QoS to the N4 session QER
             if let Some(seid) = lookup_upf_seid(sm_context_ref) {
@@ -6424,30 +6444,73 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                         "the UPF did not apply the modification",
                     );
                 }
-                // Persist the new authorized AMBR in the binding
+            } else {
+                log::warn!("No PFCP session found for modification: ref={sm_context_ref}");
+            }
+
+            // #1573: the merged decision is persisted whole, as the UpdateNotify path
+            // does: the Session-AMBR, the default 5QI and its ARP in the binding (a
+            // re-activation rebuilds the setup transfer from it), and the Session-AMBR
+            // on the session too (the Retrieve and the EPS interworking encoders read
+            // it). Before, only the binding's AMBR was written, and only with an N4
+            // session.
+            if enforced.is_some() {
                 if let Ok(ctx) = smf_self().read() {
                     if let Ok(mut bindings) = ctx.policy_bindings.write() {
                         if let Some(b) = bindings.get_mut(sm_context_ref) {
                             b.ambr_ul_bps = ambr_ul;
                             b.ambr_dl_bps = ambr_dl;
+                            b.five_qi = decision.def_five_qi;
+                            b.arp_priority_level = decision.arp_priority_level;
                         }
+                    }
+                    if let Some(mut sess) = ctx.sess_find_by_sm_context_ref(sm_context_ref) {
+                        sess.session_ambr = context::SessionAmbr {
+                            uplink: ambr_ul,
+                            downlink: ambr_dl,
+                        };
+                        ctx.sess_update(&sess);
                     }
                     // Issue #191: durable too, not just in memory.
                     ctx.persist();
                 }
-            } else {
-                log::warn!("No PFCP session found for modification: ref={sm_context_ref}");
             }
 
-            // N1: PDU Session Modification Command (PTI echoed, authorized AMBR)
-            let n1_mod_cmd = policy::build_modification_command(psi, pti, ambr_dl, ambr_ul);
-
-            // N2 SM Info: real-APER PDUSessionResourceModifyRequestTransfer
-            // (TS 38.413 clause 9.3.4.3) carrying the re-authorized Session-AMBR
-            // and the QoS flow to modify; the gNB decodes it with its strict
-            // APER decoder -- a hand-rolled blob is rejected (smfd#2).
-            let n2_sm_info = match build_modify_request_transfer(qfi, ambr_dl, ambr_ul) {
-                Ok(bytes) => bytes,
+            // N1: PDU Session Modification Command (PTI echoed, authorized AMBR); N2:
+            // real-APER PDUSessionResourceModifyRequestTransfer (TS 38.413 clause
+            // 9.3.4.3) carrying the re-authorized Session-AMBR and the QoS flow to
+            // modify; the gNB decodes it with its strict APER decoder -- a hand-rolled
+            // blob is rejected (smfd#2). #1573: a changed default 5QI or ARP goes in
+            // both legs, as the PCF-notify path sends it ([`default_flow_modification_legs`]):
+            // the 5QI as the flow's QoS flow description in N1, both in N2's QoS Flow
+            // Level QoS Parameters.
+            let after = enforced
+                .as_ref()
+                .and_then(|_| lookup_policy_binding(sm_context_ref));
+            let qos_changed = enforced
+                .as_ref()
+                .zip(after.as_ref())
+                .filter(|(before, after)| {
+                    (before.five_qi, before.arp_priority_level)
+                        != (after.five_qi, after.arp_priority_level)
+                });
+            let legs = match qos_changed {
+                Some((before, after)) => default_flow_modification_legs(
+                    sm_context_ref,
+                    after,
+                    pti,
+                    before.five_qi != after.five_qi,
+                )
+                .map(|legs| (legs.n1, legs.n2)),
+                None => build_modify_request_transfer(qfi, ambr_dl, ambr_ul).map(|n2| {
+                    (
+                        policy::build_modification_command(psi, pti, ambr_dl, ambr_ul),
+                        n2,
+                    )
+                }),
+            };
+            let (n1_mod_cmd, n2_sm_info) = match legs {
+                Ok(legs) => legs,
                 Err(e) => {
                     log::error!("Failed to encode PDUSessionResourceModifyRequestTransfer: {e:?}");
                     return eps_to_5gs::sm_context_error(
@@ -6472,6 +6535,9 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             log::info!(
                 "SM Context Update ({n2_sm_info_type}) acknowledged for ref={sm_context_ref}"
             );
+            if n2_sm_info_type == "PDU_RES_REL_RSP" {
+                drop_release_n2_from_t3592(sm_context_ref);
+            }
             SbiResponse::with_status(200)
                 .with_body(serde_json::json!({}).to_string(), "application/json")
         }
@@ -6814,6 +6880,52 @@ fn gsm_timer_armed(sm_context_ref: &str, timer_id: timer::SmfTimerId) -> bool {
                 .is_some_and(|e| e.timer_id == timer_id)
         })
         .unwrap_or(false)
+}
+
+/// #1563 review: the NG-RAN acknowledged the N2 Resource Release (`PDU_RES_REL_RSP`)
+/// of the release T3592 guards. The UP connection is no longer active, so a later
+/// retransmission of the PDU SESSION RELEASE COMMAND goes N1-only (TS 23.502
+/// §4.3.4.2: "If the User Plane connection of the PDU Session is not activated, the
+/// message sent by the SMF to the AMF shall not include N2 SM Resource Release
+/// request"), not paging a CM-IDLE UE to release resources the NG-RAN has freed.
+/// Returns whether an N2 was dropped.
+fn drop_release_n2_from_t3592(sm_context_ref: &str) -> bool {
+    let Ok(mut timers) = gsm_procedure_timers().lock() else {
+        return false;
+    };
+    match timers.get_mut(sm_context_ref) {
+        Some(entry)
+            if entry.timer_id == timer::SmfTimerId::T3592
+                && entry
+                    .n2
+                    .as_ref()
+                    .is_some_and(|n2| n2.kind == GsmN2Kind::ReleaseCommand) =>
+        {
+            entry.n2 = None;
+            log::info!(
+                "ref={sm_context_ref}: the NG-RAN released the session's resources; a T3592 \
+                 retransmission of the release command goes N1-only"
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Whether the User Plane connection of `sm_context_ref` is active, for the N2 rule
+/// of a PDU Session Release (TS 23.502 §4.3.4.2 steps 3a/3b, `23502-k20.txt:14016-
+/// 14020`): N2 SM Resource Release request only for an activated one (#1563).
+/// ACTIVATING counts as active: the NG-RAN may already hold the resources the
+/// activation set up. A context with no session record (one restored after a
+/// restart, whose UP state is not persisted) also counts as active: the SMF cannot
+/// tell the UP connection is down, and a release missing its N2 would leave the
+/// NG-RAN's resources allocated.
+fn up_connection_active(sm_context_ref: &str) -> bool {
+    smf_self()
+        .read()
+        .ok()
+        .and_then(|ctx| ctx.sess_find_by_sm_context_ref(sm_context_ref))
+        .is_none_or(|sess| sess.up_cnx_state != context::UpCnxState::Deactivated)
 }
 
 /// PTI values (TS 24.007 §11.2.3.1a, TS 24.501 §9.6): 0 is "no procedure
@@ -8110,7 +8222,9 @@ pub(crate) async fn release_for_reactivation(
         0, // network-initiated: no procedure transaction (TS 24.501 §6.3.3.2)
         policy::gsm_cause::REACTIVATION_REQUESTED,
     );
-    let n2 = build_release_command_transfer();
+    // #1563, TS 23.502 §4.3.4.2 step 3b: the N2 SM Resource Release request only for
+    // a UP connection that is activated. Read before it is marked deactivated below.
+    let n2 = up_connection_active(sm_context_ref).then(build_release_command_transfer);
     if let Ok(ctx) = smf_self().read() {
         if let Some(mut sess) = ctx.sess_find_by_sm_context_ref(sm_context_ref) {
             sess.up_cnx_state = context::UpCnxState::Deactivated;
@@ -8118,7 +8232,8 @@ pub(crate) async fn release_for_reactivation(
         }
     }
     // #1430: armed with the N2 it goes out with, so a T3592 retransmission carries
-    // the same PDU_RES_REL_CMD (TS 23.502 §4.3.4.2 step 3b).
+    // the same PDU_RES_REL_CMD (TS 23.502 §4.3.4.2 step 3b), or none when the first
+    // transfer had none (#1563).
     arm_gsm_timer_with_n2(
         sm_context_ref,
         timer::SmfTimerId::T3592,
@@ -8126,9 +8241,18 @@ pub(crate) async fn release_for_reactivation(
         supi,
         psi,
         Some(amf_uri),
-        Some(GsmN2::release(n2.clone())),
+        n2.clone().map(GsmN2::release),
     );
-    send_n1_n2_release_transfer(amf_uri, supi, psi, &n1_cmd, &n2).await;
+    match n2 {
+        Some(n2) => send_n1_n2_release_transfer(amf_uri, supi, psi, &n1_cmd, &n2).await,
+        None => {
+            log::info!(
+                "ref={sm_context_ref}: the UP connection is not active; the release \
+                 command goes without N2 (TS 23.502 §4.3.4.2 step 3b)"
+            );
+            send_n1_n2_message_transfer(Some(amf_uri), supi, psi, &n1_cmd, sm_context_ref).await;
+        }
+    }
 }
 
 /// N1N2MessageTransfer carrying an N1 5GSM message AND an N2 PDU Session Resource
@@ -9386,6 +9510,10 @@ async fn handle_n1_sm_message(sm_context_ref: &str, n1: &[u8]) -> SbiResponse {
             // UPF forwarding state and the IP are released before the command is
             // acknowledged. The context itself lives until RELEASE COMPLETE so
             // T3592 has something to key on.
+            // #1563, TS 23.502 §4.3.4.2 step 3a: whether the N2 SM Resource Release
+            // request goes with the command is the UP connection's state at the
+            // release, read before anything here changes it.
+            let up_active = up_connection_active(sm_context_ref);
             release_user_plane(sm_context_ref).await;
 
             let n1_cmd = policy::build_release_command(
@@ -9393,13 +9521,14 @@ async fn handle_n1_sm_message(sm_context_ref: &str, n1: &[u8]) -> SbiResponse {
                 pti,
                 cause.unwrap_or(policy::gsm_cause::REQUEST_REJECTED_UNSPECIFIED),
             );
-            let n2_cmd = build_release_command_transfer();
+            let n2_cmd = up_active.then(build_release_command_transfer);
             // #912 review n3: the user-plane release can find the UPF holds no such
             // session (cause 65), and that reconciliation completes the whole release;
             // a T3592 for a context that is gone would only retransmit and abandon
             // nothing.
             // #1430: the N2 Resource Release request goes out with the command
-            // (TS 23.502 §4.3.4.2 step 3a), so a T3592 retransmission carries it too.
+            // (TS 23.502 §4.3.4.2 step 3a), so a T3592 retransmission carries it too;
+            // and neither carries one for a UP connection that is not active (#1563).
             if lookup_policy_binding(sm_context_ref).is_some() {
                 arm_gsm_timer_with_n2(
                     sm_context_ref,
@@ -9408,15 +9537,18 @@ async fn handle_n1_sm_message(sm_context_ref: &str, n1: &[u8]) -> SbiResponse {
                     &binding.supi,
                     psi,
                     amf_uri.as_deref(),
-                    Some(GsmN2::release(n2_cmd.clone())),
+                    n2_cmd.clone().map(GsmN2::release),
                 );
             }
-            sbi_response_with_n1_n2(
-                200,
-                serde_json::json!({ "n2SmInfoType": "PDU_RES_REL_CMD" }),
-                &n1_cmd,
-                &n2_cmd,
-            )
+            match n2_cmd {
+                Some(n2_cmd) => sbi_response_with_n1_n2(
+                    200,
+                    serde_json::json!({ "n2SmInfoType": "PDU_RES_REL_CMD" }),
+                    &n1_cmd,
+                    &n2_cmd,
+                ),
+                None => sbi_response_with_n1(200, serde_json::json!({}), &n1_cmd),
+            }
         }
 
         N1SmIntent::ModificationRequested { psi, pti } => {
@@ -10537,6 +10669,93 @@ pub(crate) enum QosMonitoringSignal {
     NotSent,
 }
 
+/// The N1 and N2 of a PDU Session Modification for the default flow as `after`
+/// authorises it (#1385, #1573): built by [`default_flow_modification_legs`].
+struct DefaultFlowLegs {
+    /// PDU SESSION MODIFICATION COMMAND: the Session-AMBR and, when the 5QI changed
+    /// and the flow can be described, its QoS flow description.
+    n1: Vec<u8>,
+    /// PDUSessionResourceModifyRequestTransfer with the Session-AMBR and the default
+    /// flow's QoS Flow Level QoS Parameters (5QI, ARP).
+    n2: Vec<u8>,
+    /// The default flow's 5QI and ARP, for the AMF's paging policy.
+    paged: Option<(u16, n2_transfer::Arp)>,
+    /// A GBR default 5QI whose bit rates are unknown: the flow is in neither leg, so
+    /// only the Session-AMBR is signalled.
+    flow_left_out: bool,
+}
+
+/// Build [`DefaultFlowLegs`] for the default flow of `sm_context_ref` as `after`
+/// holds it, with PTI `pti` (0 for a network-requested modification, the request's
+/// for a UE-requested one). `five_qi_changed` puts the flow's description in N1.
+/// Shared by the PCF/UDM notification path ([`signal_policy_change`]) and the
+/// UE-requested modification's RES_MO_RE leg, so both carry the same decision.
+fn default_flow_modification_legs(
+    sm_context_ref: &str,
+    after: &context::PolicyBinding,
+    pti: u8,
+    mut five_qi_changed: bool,
+) -> Result<DefaultFlowLegs, n2_transfer::TransferError> {
+    let mut flows: Vec<_> = session_setup_flows(sm_context_ref, after)
+        .into_iter()
+        .filter(|f| f.qfi == after.qfi)
+        .collect();
+    // #1385 review B1: a GBR default 5QI needs its four bit rates, on N1 (TS 24.501
+    // §6.3.2.4 a) case 8: a GBR description lacking one is rejected) and on N2 (TS
+    // 38.413 §9.3.1.12: GBR QoS Flow Information "shall be present" for a GBR flow).
+    // They come from the session's bearer for the default QFI. Without them neither
+    // leg can describe the flow validly, so the flow is left out of both and only the
+    // Session-AMBR is signalled.
+    let gbr_5qi = context::QosCharacteristics::from_5qi(after.five_qi).is_some_and(|c| c.is_gbr());
+    let gbr = gbr_5qi
+        .then(|| default_flow_bit_rates(sm_context_ref, after.qfi))
+        .flatten();
+    let mut flow_left_out = false;
+    if gbr_5qi {
+        match gbr {
+            Some(rates) => {
+                for f in &mut flows {
+                    f.gbr = Some(rates);
+                }
+            }
+            None => {
+                log::error!(
+                    "ref={sm_context_ref}: default 5QI {} is a GBR 5QI but no GFBR/MFBR is \
+                     known for QFI {}; the flow cannot be described, so only the \
+                     Session-AMBR is signalled",
+                    after.five_qi,
+                    after.qfi
+                );
+                flows.clear();
+                five_qi_changed = false;
+                flow_left_out = true;
+            }
+        }
+    }
+    let n1 = policy::build_modification_command_for_flow(
+        after.psi,
+        pti,
+        after.ambr_dl_bps,
+        after.ambr_ul_bps,
+        after.qfi,
+        five_qi_changed.then_some(policy::ModifiedFlowQos {
+            five_qi: after.five_qi,
+            gbr: gbr.map(|g| (g.gfbr_ul, g.gfbr_dl, g.mfbr_ul, g.mfbr_dl)),
+        }),
+    );
+    let paged = flows.first().map(|f| (f.five_qi, f.arp));
+    let n2 = n2_transfer::modify_request_transfer_with_qos(
+        (after.ambr_dl_bps, after.ambr_ul_bps),
+        &flows,
+    )?;
+    Ok(DefaultFlowLegs {
+        n1,
+        n2,
+        paged,
+        flow_left_out,
+    })
+}
+
 /// Tell the UE and the NG-RAN about a policy change the session now enforces (#1385,
 /// TS 23.502 §4.3.3.2 step 3b): one Namf_Communication_N1N2MessageTransfer carrying
 /// - N1: PDU SESSION MODIFICATION COMMAND, PTI 0 (TS 24.501 §6.3.2.2), the new
@@ -10562,7 +10781,7 @@ fn signal_policy_change(sm_context_ref: &str, before: &context::PolicyBinding) {
     };
     let ambr_changed =
         (after.ambr_ul_bps, after.ambr_dl_bps) != (before.ambr_ul_bps, before.ambr_dl_bps);
-    let mut five_qi_changed = after.five_qi != before.five_qi;
+    let five_qi_changed = after.five_qi != before.five_qi;
     // #1409: the ARP is not UE-facing (TS 24.501 §9.11.4.12 has no ARP parameter), but
     // the NG-RAN holds it in the flow's QoS profile (TS 38.413 §9.3.1.12), so an
     // ARP-only change is signalled too. Step 3b carries an N1 SM container in every
@@ -10610,60 +10829,8 @@ fn signal_policy_change(sm_context_ref: &str, before: &context::PolicyBinding) {
         );
         return;
     };
-    let mut flows: Vec<_> = session_setup_flows(sm_context_ref, &after)
-        .into_iter()
-        .filter(|f| f.qfi == after.qfi)
-        .collect();
-    // #1385 review B1: a GBR default 5QI needs its four bit rates, on N1 (TS 24.501
-    // §6.3.2.4 a) case 8: a GBR description lacking one is rejected) and on N2 (TS
-    // 38.413 §9.3.1.12: GBR QoS Flow Information "shall be present" for a GBR flow).
-    // They come from the session's bearer for the default QFI. Without them neither
-    // leg can describe the flow validly, so the flow is left out of both and only the
-    // Session-AMBR is signalled.
-    let gbr_5qi = context::QosCharacteristics::from_5qi(after.five_qi).is_some_and(|c| c.is_gbr());
-    let gbr = gbr_5qi
-        .then(|| default_flow_bit_rates(sm_context_ref, after.qfi))
-        .flatten();
-    if gbr_5qi {
-        match gbr {
-            Some(rates) => {
-                for f in &mut flows {
-                    f.gbr = Some(rates);
-                }
-            }
-            None => {
-                log::error!(
-                    "ref={sm_context_ref}: default 5QI {} is a GBR 5QI but no GFBR/MFBR is \
-                     known for QFI {}; the flow cannot be described, so only the \
-                     Session-AMBR is signalled",
-                    after.five_qi,
-                    after.qfi
-                );
-                flows.clear();
-                five_qi_changed = false;
-                // Without the flow there is no ARP to carry either.
-                if !ambr_changed {
-                    return;
-                }
-            }
-        }
-    }
-    let n1 = policy::build_network_modification_command(
-        after.psi,
-        after.ambr_dl_bps,
-        after.ambr_ul_bps,
-        after.qfi,
-        five_qi_changed.then_some(policy::ModifiedFlowQos {
-            five_qi: after.five_qi,
-            gbr: gbr.map(|g| (g.gfbr_ul, g.gfbr_dl, g.mfbr_ul, g.mfbr_dl)),
-        }),
-    );
-    let paged = flows.first().map(|f| (f.five_qi, f.arp));
-    let n2 = match n2_transfer::modify_request_transfer_with_qos(
-        (after.ambr_dl_bps, after.ambr_ul_bps),
-        &flows,
-    ) {
-        Ok(bytes) => bytes,
+    let legs = match default_flow_modification_legs(sm_context_ref, &after, 0, five_qi_changed) {
+        Ok(legs) => legs,
         Err(e) => {
             log::error!(
                 "ref={sm_context_ref}: PDUSessionResourceModifyRequestTransfer did not \
@@ -10672,6 +10839,11 @@ fn signal_policy_change(sm_context_ref: &str, before: &context::PolicyBinding) {
             return;
         }
     };
+    // Without the flow there is no 5QI or ARP to carry either.
+    if legs.flow_left_out && !ambr_changed {
+        return;
+    }
+    let DefaultFlowLegs { n1, n2, paged, .. } = legs;
     log::info!(
         "ref={sm_context_ref}: network-requested PDU Session Modification (AMBR UL/DL \
          {}/{} -> {}/{} bps, 5QI {} -> {}, ARP PL {} -> {})",
@@ -12979,7 +13151,8 @@ mod tests {
 
     /// #1509, TS 29.244 §5.8.3 / §8.2.1 cause 72: a heartbeat loss marks the UPF down
     /// and keeps its sessions; a Session Report from it for one of them is refused with
-    /// "No established PFCP Association", SEID 0, and nothing in it is processed (its
+    /// "No established PFCP Association", the UPF's SEID (#1559, §7.2.2.4.1: the
+    /// session is known, so 0 is not allowed), and nothing in it is processed (its
     /// TSC Management Information is not recorded). Once the UPF is associated again,
     /// the same report is accepted and recorded.
     ///
@@ -13078,19 +13251,127 @@ mod tests {
         );
         assert_eq!(h_down.sequence_number, 0x1509);
         assert!(h_down.seid_present);
-        assert_eq!(h_down.seid, 0, "SEID 0 in the refusal");
+        assert_eq!(
+            h_down.seid, 0x1509,
+            "#1559: the refusal carries the UPF's SEID for the known session, not 0"
+        );
         assert!(
             recorded_while_down.is_none(),
             "nothing in the refused report is processed: {recorded_while_down:?}"
         );
         assert_eq!(pfcp_cause_of(&after), Some(1), "accepted once associated");
         assert_eq!(h_up.sequence_number, 0x150a);
+        assert_eq!(
+            h_up.seid, 0x1509,
+            "#1559: the UPF's SEID, not the SMF's {seid:#x}"
+        );
         let recorded = recorded_after.expect("the accepted report is processed");
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].nw_tt_port_number, Some(7));
         assert_eq!(
             recorded[0].port_management_container.as_deref(),
             Some(&[0x15, 0x09][..])
+        );
+    }
+
+    /// #1559, TS 29.244 §7.2.2.4.1 (`29244-k00.txt:14142-14149`): the SEID in a PFCP
+    /// header is the one "provided by the corresponding receiving entity". A Session
+    /// Report Response goes to the UPF, so it carries the UP F-SEID's SEID the UPF
+    /// gave at establishment, not the SMF's own SEID the request was addressed to.
+    /// Both answers to a known session's report: accepted (cause 1) and missing its
+    /// Report Type (cause 66, §7.2.2.4.2: the node "should look up the remote peer's
+    /// SEID"). The session's SMF SEID is an inherited one (#475, `cp_n4_seids`), so
+    /// the lookup follows the same resolution as the ownership check.
+    ///
+    /// REVERT-VERIFIED: with `Some(seid)` back in both encoders, both headers carry
+    /// the SMF's SEID 0x1559_0001.
+    #[tokio::test]
+    async fn a_session_report_response_carries_the_upfs_seid_1559() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let (client, upf) = pfcp_path::stand_in::client_with_silent_peer_timed(
+            std::time::Duration::from_millis(50),
+            1,
+        )
+        .await;
+        client.set_assoc_state_for_test(true, None, None).await;
+        pfcp_path::set_global_pool(vec![client.clone()]);
+        let upf_addr = upf.local_addr().unwrap();
+        let smf_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let reference = "15590001";
+        let (smf_seid, upf_seid) = (0x1559_0001u64, 0x00AB_1559u64);
+        {
+            let global = smf_self();
+            let ctx = global.read().unwrap();
+            ctx.cp_n4_seids
+                .write()
+                .unwrap()
+                .insert(reference.to_string(), smf_seid);
+            ctx.pfcp_sessions
+                .write()
+                .unwrap()
+                .insert(reference.to_string(), upf_seid);
+        }
+        let report = |seq: u32, body: &[u8]| {
+            pfcp_path::encode_wire_message(
+                pfcp_path::pfcp_message_type::SESSION_REPORT_REQUEST,
+                Some(smf_seid),
+                seq,
+                body,
+            )
+        };
+        let response = || async {
+            let mut buf = vec![0u8; 2048];
+            loop {
+                let (n, _) = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    upf.recv_from(&mut buf),
+                )
+                .await
+                .expect("a Session Report Response")
+                .unwrap();
+                let h = pfcp_path::parse_wire_header(&buf[..n]).unwrap();
+                if h.msg_type == pfcp_path::pfcp_message_type::SESSION_REPORT_RESPONSE {
+                    return (h, buf[..n].to_vec());
+                }
+            }
+        };
+
+        // A Report Type with no report bit set: accepted, and nothing to act on.
+        handle_pfcp_session_report_from(
+            &smf_sock,
+            &report(0x1559, &[0, 39, 0, 1, 0x00]),
+            upf_addr,
+            Some(&client),
+        )
+        .await;
+        let (h_accepted, accepted) = response().await;
+        // No Report Type at all.
+        handle_pfcp_session_report_from(&smf_sock, &report(0x155a, &[]), upf_addr, Some(&client))
+            .await;
+        let (h_missing, missing) = response().await;
+
+        {
+            let global = smf_self();
+            let ctx = global.read().unwrap();
+            ctx.pfcp_sessions.write().unwrap().remove(reference);
+            ctx.cp_n4_seids.write().unwrap().remove(reference);
+        }
+        pfcp_path::clear_global_upf_for_test();
+
+        assert_eq!(pfcp_cause_of(&accepted), Some(1));
+        assert_eq!(h_accepted.sequence_number, 0x1559);
+        assert!(h_accepted.seid_present);
+        assert_eq!(
+            h_accepted.seid, upf_seid,
+            "the accepted answer carries the UPF's SEID, not the SMF's {smf_seid:#x}"
+        );
+        assert_eq!(pfcp_cause_of(&missing), Some(66), "Mandatory IE missing");
+        assert_eq!(h_missing.sequence_number, 0x155a);
+        assert_eq!(
+            h_missing.seid, upf_seid,
+            "the cause-66 answer carries the UPF's SEID too"
         );
     }
 
@@ -21642,6 +21923,97 @@ mod tests {
         );
     }
 
+    /// #1573, TS 29.512 §4.2.2.5 / §4.2.2.6 ("Upon reception of the authorized
+    /// Session-AMBR / default QoS ... the SMF shall apply the corresponding
+    /// procedures towards the access network, the UE and the UPF"), the RES_MO_RE leg
+    /// (§4.2.4.17): a PCF answer whose `authDefQos` changes the default 5QI (7 -> 8)
+    /// and ARP (priority level 8 -> 3), with a new `authSessAmbr`, reaches:
+    /// - the binding (5QI, ARP, AMBR), and `SmfSess.session_ambr` matches it;
+    /// - N1: the MODIFICATION COMMAND echoes the PTI, carries the AMBR and the default
+    ///   flow's QoS flow description with 5QI 8 (IEI 0x79);
+    /// - N2: the Modify Request Transfer's QoS flow has 5QI 8, ARP 3.
+    ///
+    /// REVERT-VERIFIED: with the leg back on the AMBR alone, the binding keeps 5QI 7
+    /// and ARP 8, `session_ambr` keeps the establishment's value, N1 has no 0x79 and
+    /// N2 no QoS Flow Level QoS Parameters.
+    #[tokio::test]
+    async fn a_res_mo_re_answer_applies_its_default_qos_and_session_ambr_1573() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (pcf_srv, _seen) = spawn_recording_pcf_with(Ok(serde_json::json!({
+            "sessRules": { "SessRule-1573": {
+                "authSessAmbr": { "uplink": "50 Mbps", "downlink": "90 Mbps" },
+                "authDefQos": { "5qi": 8, "arp": { "priorityLevel": 3 } },
+            }}
+        })))
+        .await;
+        let psi = 27;
+        let reference = seed_authorised_1399("imsi-001010000001573", psi, "pol-1573");
+        let before = lookup_policy_binding(&reference).expect("binding");
+        assert_eq!((before.five_qi, before.arp_priority_level), (7, 8));
+        let resp =
+            handle_sm_context_update(&reference, &ue_modification_1399(&reference, psi)).await;
+        std::env::remove_var("PCF_URI");
+        pcf_srv.stop().await.expect("stop");
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        let part = |id: &str| {
+            resp.http
+                .parts
+                .iter()
+                .find(|p| p.content_id.as_deref() == Some(id))
+                .map(|p| p.data.to_vec())
+                .unwrap_or_else(|| panic!("the {id} part"))
+        };
+        let (n1, n2) = (part("n1SmMsg"), part("n2SmInfo"));
+
+        let after = lookup_policy_binding(&reference).expect("binding");
+        let sess = smf_self()
+            .read()
+            .expect("context")
+            .sess_find_by_sm_context_ref(&reference)
+            .expect("session");
+        assert_eq!(
+            (after.five_qi, after.arp_priority_level),
+            (8, 3),
+            "the binding holds the authorised default QoS"
+        );
+        assert_eq!(
+            (after.ambr_ul_bps, after.ambr_dl_bps),
+            (50_000_000, 90_000_000)
+        );
+        assert_eq!(
+            (sess.session_ambr.uplink, sess.session_ambr.downlink),
+            (after.ambr_ul_bps, after.ambr_dl_bps),
+            "SmfSess.session_ambr is in step with the binding"
+        );
+        assert_eq!(n1[2], 5, "the request's PTI is echoed");
+        assert_eq!(command_ambr_1399(&n1), (90_000_000, 50_000_000));
+        assert_eq!(
+            n1.get(12),
+            Some(&0x79),
+            "the QoS flow description: {n1:02x?}"
+        );
+        let expected_n1 = policy::build_modification_command_for_flow(
+            psi,
+            5,
+            90_000_000,
+            50_000_000,
+            after.qfi,
+            Some(policy::ModifiedFlowQos {
+                five_qi: 8,
+                gbr: None,
+            }),
+        );
+        assert_eq!(n1, expected_n1, "the default flow is described with 5QI 8");
+        assert_eq!(
+            decode_modify_transfer_1385(&n2),
+            ((90_000_000, 50_000_000), vec![(after.qfi, 8, 3)]),
+            "N2 carries the new 5QI and ARP"
+        );
+    }
+
     /// A PCF stand-in that parks every `/update` until `gate` is notified, signalling
     /// `seen` when it has one, then answers `answer`, or, when `None`, a 200 whose body
     /// is not an SmPolicyDecision (a transport-class failure for the SMF). Points
@@ -26694,6 +27066,8 @@ mod tests {
         let psi = 13;
         let sm_context_ref = seed_pcf_authorised(supi, psi, "pol-1398");
         set_amf_1385(&sm_context_ref, amf_port);
+        // #1563: a session whose UP connection is active, so the release carries N2.
+        mark_up_cnx_state(&sm_context_ref, context::UpCnxState::Activated);
 
         let restore = || {
             smf_sbi_request_handler(policy_notify_1387(
@@ -27082,6 +27456,8 @@ mod tests {
             }
         }
         set_amf_1385(&reference, amf_port);
+        // #1563: a session whose UP connection is active, so its release carries N2.
+        mark_up_cnx_state(&reference, context::UpCnxState::Activated);
         reference
     }
 
@@ -27211,6 +27587,154 @@ mod tests {
         assert!(n2_again.is_empty(), "N1-only: no N2 part");
         assert!(body["n2InfoContainer"].is_null(), "{body}");
         assert!(cancel_gsm_timer_for_test(&an));
+
+        amf.stop().await.ok();
+    }
+
+    /// #1563, TS 23.502 §4.3.4.2 (`23502-k20.txt:14016-14020`): "If the User Plane
+    /// connection of the PDU Session is not activated, the message sent by the SMF to
+    /// the AMF shall not include N2 SM Resource Release request". A session whose UP
+    /// connection is DEACTIVATED (the UE went CM-IDLE) is released N1-only on both
+    /// paths, and so is its T3592 retransmission:
+    /// - network-initiated (the UPF-restart reactivation release, step 3b): no
+    ///   `n2InfoContainer` in the N1N2MessageTransfer;
+    /// - UE-requested (step 3a): no `n2SmInfo` part and no `n2SmInfoType` in the
+    ///   UpdateSMContext answer.
+    ///
+    /// REVERT-VERIFIED: with the N2 built unconditionally again, every transfer and
+    /// the answer carry the PDU_RES_REL_CMD.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_release_of_a_deactivated_up_connection_carries_no_n2_1563() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (amf, amf_port, posts) = n1n2_recording_amf_1385(false).await;
+        let amf_uri = format!("http://127.0.0.1:{amf_port}");
+
+        // ---- network-initiated: N1-only, and so is the retransmission ----
+        let supi = "imsi-001010000001563";
+        let net = seed_release_session_1430(supi, 14, amf_port);
+        mark_up_cnx_state(&net, context::UpCnxState::Deactivated);
+        release_for_reactivation(&net, &amf_uri, supi, 14).await;
+        let got = await_n1n2_1385(&posts, 1).await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        let (_, body, first_n1, n2) = &got[0];
+        assert_eq!(
+            first_n1[3],
+            gsm_build::message_type::PDU_SESSION_RELEASE_COMMAND
+        );
+        assert!(n2.is_empty(), "no N2 part");
+        assert!(body["n2InfoContainer"].is_null(), "{body}");
+        expire_gsm_timer_now_1430(&net, timer::SmfTimerId::T3592).await;
+        let got = await_n1n2_1385(&posts, 2).await;
+        assert_eq!(got.len(), 2, "the T3592 retransmission, got {got:?}");
+        let (_, body, n1_again, n2_again) = &got[1];
+        assert_eq!(n1_again, first_n1, "the same command, verbatim");
+        assert!(n2_again.is_empty(), "the retransmission is N1-only too");
+        assert!(body["n2InfoContainer"].is_null(), "{body}");
+        assert!(cancel_gsm_timer_for_test(&net));
+
+        // ---- UE-requested: the answer is N1-only, and so is the retransmission ----
+        let supi_ue = "imsi-001010000001564";
+        let ue = seed_release_session_1430(supi_ue, 15, amf_port);
+        mark_up_cnx_state(&ue, context::UpCnxState::Deactivated);
+        let resp = handle_n1_sm_message(
+            &ue,
+            &n1(
+                15,
+                3,
+                gsm_build::message_type::PDU_SESSION_RELEASE_REQUEST,
+                &[],
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        let part = |id: &str| {
+            resp.http
+                .parts
+                .iter()
+                .find(|p| p.content_id.as_deref() == Some(id))
+                .map(|p| p.data.to_vec())
+        };
+        let answered_n1 = part("n1SmMsg").expect("the RELEASE COMMAND");
+        assert_eq!(
+            answered_n1[3],
+            gsm_build::message_type::PDU_SESSION_RELEASE_COMMAND
+        );
+        assert_eq!(part("n2SmInfo"), None, "no N2 in the answer");
+        let answer: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).expect("JSON");
+        assert!(answer["n2SmInfoType"].is_null(), "{answer}");
+        expire_gsm_timer_now_1430(&ue, timer::SmfTimerId::T3592).await;
+        let got = await_n1n2_1385(&posts, 3).await;
+        assert_eq!(got.len(), 3, "the T3592 retransmission, got {got:?}");
+        let (_, body, n1_again, n2_again) = &got[2];
+        assert_eq!(n1_again, &answered_n1);
+        assert!(n2_again.is_empty(), "the retransmission is N1-only too");
+        assert!(body["n2InfoContainer"].is_null(), "{body}");
+        assert!(cancel_gsm_timer_for_test(&ue));
+
+        amf.stop().await.ok();
+    }
+
+    /// #1563 (review of #1564): once the NG-RAN has acknowledged the N2 Resource
+    /// Release (`PDU_RES_REL_RSP`), the UP connection is no longer active, so a later
+    /// T3592 retransmission of the release command is N1-only (TS 23.502 §4.3.4.2),
+    /// not a PDU_RES_REL_CMD that pages a CM-IDLE UE for resources the NG-RAN freed.
+    /// Before the acknowledgement the retransmission keeps its N2 (#1430).
+    ///
+    /// REVERT-VERIFIED: without the drop in the `PDU_RES_REL_RSP` arm, the
+    /// retransmission after the acknowledgement still carries the PDU_RES_REL_CMD.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn t3592_drops_the_n2_once_the_ran_released_1563() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (amf, amf_port, posts) = n1n2_recording_amf_1385(false).await;
+        let amf_uri = format!("http://127.0.0.1:{amf_port}");
+        let expected_n2 = n2_transfer::release_command_transfer().expect("release transfer");
+
+        let supi = "imsi-001010000001565";
+        let net = seed_release_session_1430(supi, 14, amf_port);
+        release_for_reactivation(&net, &amf_uri, supi, 14).await;
+        let got = await_n1n2_1385(&posts, 1).await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(
+            got[0].3, expected_n2,
+            "the active session's release carries N2"
+        );
+        let first_n1 = got[0].2.clone();
+        // A retransmission before the NG-RAN answered keeps the N2.
+        expire_gsm_timer_now_1430(&net, timer::SmfTimerId::T3592).await;
+        let got = await_n1n2_1385(&posts, 2).await;
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[1].3, expected_n2, "not yet acknowledged: N2 again");
+
+        let rel_rsp = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode([0x00])
+        };
+        let req = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts/x/modify").with_body(
+            serde_json::json!({
+                "n2SmInfoType": "PDU_RES_REL_RSP",
+                "n2SmInfo": rel_rsp,
+            })
+            .to_string(),
+            "application/json",
+        );
+        let resp = handle_sm_context_update(&net, &req).await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+
+        expire_gsm_timer_now_1430(&net, timer::SmfTimerId::T3592).await;
+        let got = await_n1n2_1385(&posts, 3).await;
+        assert_eq!(got.len(), 3, "the T3592 retransmission, got {got:?}");
+        let (_, body, n1_again, n2_again) = &got[2];
+        assert_eq!(n1_again, &first_n1, "the same command, verbatim");
+        assert!(n2_again.is_empty(), "N1-only after the NG-RAN released");
+        assert!(body["n2InfoContainer"].is_null(), "{body}");
+        assert!(cancel_gsm_timer_for_test(&net));
 
         amf.stop().await.ok();
     }

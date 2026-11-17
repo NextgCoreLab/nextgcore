@@ -1805,9 +1805,55 @@ fn store_error_is_outage(e: &nextgcore_dbi::mongoc::DbiError) -> bool {
 /// load logs a line every few seconds with a count, not one per CCR.
 const STORE_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// #1553: how long a store read that failed as an outage makes the reads after it
+/// fail fast, before one is let through to probe the store again.
+///
+/// CCRs on one PCEF connection are handled in order, and an outage read waits the
+/// whole server selection (about 1 s, #1462): without the latch a burst of N CCRs
+/// on one connection took about N seconds to drain. With it, an outage costs one
+/// bounded wait per latch period, and a store that comes back is read again at
+/// most this long after.
+pub(crate) const STORE_DOWN_LATCH: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// #1553: "the subscriber store was found down at most [`STORE_DOWN_LATCH`] ago".
+pub(crate) struct StoreDownLatch {
+    until: std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+impl StoreDownLatch {
+    pub(crate) const fn new() -> Self {
+        Self {
+            until: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Whether a read at `now` should fail fast instead of asking the store.
+    pub(crate) fn is_down(&self, now: std::time::Instant) -> bool {
+        self.until
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some_and(|until| now < until)
+    }
+
+    /// A read at `now` found the store down.
+    pub(crate) fn trip(&self, now: std::time::Instant) {
+        *self.until.lock().unwrap_or_else(|p| p.into_inner()) = Some(now + STORE_DOWN_LATCH);
+    }
+
+    /// A read answered: the store is up.
+    pub(crate) fn clear(&self) {
+        *self.until.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+}
+
+/// The process's latch over the one subscriber store pcrfd reads. Only the real
+/// store path trips it (no unit test reads a store that fails as an outage); the
+/// latch's own tests use their own [`StoreDownLatch`].
+static STORE_DOWN: StoreDownLatch = StoreDownLatch::new();
+
 /// Log a store read failure at WARN, at most once per [`STORE_WARN_INTERVAL`],
 /// with the number of failures folded into it. No subscriber identity is logged.
-fn warn_store_unavailable(e: &nextgcore_dbi::mongoc::DbiError) {
+fn warn_store_unavailable(e: &dyn std::fmt::Display) {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
     static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
@@ -1832,7 +1878,17 @@ fn warn_store_unavailable(e: &nextgcore_dbi::mongoc::DbiError) {
 fn lookup_subscriber_policy(imsi: &str, apn: &str) -> Result<SubscriberLookup, StoreUnavailable> {
     use nextgcore_dbi::nextgcore_dbi_subscription_data;
     let supi = format!("imsi-{imsi}");
-    let subscription_data = match off_runtime(|| nextgcore_dbi_subscription_data(&supi)) {
+    // #1553: a store found down within the last STORE_DOWN_LATCH is not asked again.
+    if STORE_DOWN.is_down(std::time::Instant::now()) {
+        warn_store_unavailable(&"found down within the last few seconds, not asked again");
+        return Err(StoreUnavailable);
+    }
+    let read = off_runtime(|| nextgcore_dbi_subscription_data(&supi));
+    match &read {
+        Err(e) if store_error_is_outage(e) => STORE_DOWN.trip(std::time::Instant::now()),
+        _ => STORE_DOWN.clear(),
+    }
+    let subscription_data = match read {
         Ok(data) => data,
         Err(e) if store_error_is_outage(&e) => {
             warn_store_unavailable(&e);
@@ -2767,6 +2823,27 @@ mod tests {
         assert_eq!(data.pcc_rules.len(), 1);
         assert!(!data.event_triggers.is_empty());
         assert_eq!(data.pcc_rules[0].name, "pcrf-internet-default");
+    }
+
+    /// #1553: the latch fails reads fast for STORE_DOWN_LATCH after a trip, then
+    /// lets one through; a read that answered clears it.
+    ///
+    /// REVERT-VERIFIED: with `is_down` always false, the first assertion fails.
+    #[test]
+    fn the_store_down_latch_holds_for_its_period_then_probes() {
+        let latch = StoreDownLatch::new();
+        let t0 = std::time::Instant::now();
+        assert!(!latch.is_down(t0), "untripped");
+        latch.trip(t0);
+        assert!(latch.is_down(t0));
+        assert!(latch.is_down(t0 + STORE_DOWN_LATCH - std::time::Duration::from_millis(1)));
+        assert!(
+            !latch.is_down(t0 + STORE_DOWN_LATCH),
+            "expired: the next read probes the store"
+        );
+        latch.trip(t0);
+        latch.clear();
+        assert!(!latch.is_down(t0), "a read that answered clears it");
     }
 
     /// #1539 review: which store errors are an outage (no decision possible) and

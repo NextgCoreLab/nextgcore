@@ -812,7 +812,8 @@ fn build_sm_policy_notification(
 
 /// The session data the decision for `sess` is built from (#1402): `sd` with its
 /// Session-AMBR capped by the session's subscribed Session-AMBR per
-/// `pcf.policy.session_ambr_cap` ([`crate::session_ambr_cap::apply`]), then lowered
+/// `pcf.policy.session_ambr_cap` ([`crate::session_ambr_cap::apply`]), then bounded by
+/// the VPLMN's QoS constraints ([`crate::vplmn_qos::apply`], #1541), then lowered
 /// to any active override cap ([`effective_session_data`]). The create, the
 /// UpdateNotify and the GET build from it, so they answer the same Session-AMBR;
 /// the `SE_AMBR_CH` arm applies the same two steps around the bound it was just
@@ -822,6 +823,9 @@ pub(crate) fn decision_session_data(
     sd: &crate::nudr_handler::SessionData,
 ) -> crate::nudr_handler::SessionData {
     let capped = crate::session_ambr_cap::apply(sd, sess.subscribed_sess_ambr.as_ref());
+    // #1541: the VPLMN's constraints (home-routed roaming), whatever the
+    // operator cap above says (TS 29.512 §4.2.2.5, TS 23.503 §6.1.3.6).
+    let capped = crate::vplmn_qos::apply(&capped, sess.vplmn_qos.as_ref());
     effective_session_data(&sess.sm_policy_id, &capped)
 }
 
@@ -1868,6 +1872,70 @@ pub(crate) fn uri_path_only(uri: &str) -> String {
     }
 }
 
+/// #1597: why a Nudr_DataRepository read failed. Display is the message the
+/// callers log; [`UdrError::Status`] keeps the status the UDR answered, so a 5xx
+/// (TS 29.504 SYSTEM_FAILURE, #1534) is told apart from a request that never got
+/// an answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UdrError {
+    /// The UDR answered this status (not 200, not 404).
+    Status(u16),
+    /// No answer, or an answer that could not be read.
+    Other(String),
+}
+
+impl std::fmt::Display for UdrError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UdrError::Status(s) => write!(f, "nudr-dr GET returned status {s}"),
+            UdrError::Other(e) => f.write_str(e),
+        }
+    }
+}
+
+impl From<String> for UdrError {
+    fn from(e: String) -> Self {
+        UdrError::Other(e)
+    }
+}
+
+impl From<&str> for UdrError {
+    fn from(e: &str) -> Self {
+        UdrError::Other(e.to_string())
+    }
+}
+
+/// #1597: the bound every live-path create read gets, so a stuck UDR cannot hold
+/// the consumer's request.
+const UDR_CREATE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// #1597: a bounded create-path read. `Err` only when the UDR answered a 5xx (TS
+/// 29.504 / TS 29.500 SYSTEM_FAILURE, #1534): the UDR says it cannot serve the
+/// data, which is an outage, and deciding from it would authorise the unrestricted
+/// default. `Ok(None)` when nothing is provisioned (404) or no UDR is
+/// discoverable, and, as before #1597, when the read got no answer or the bound
+/// expired: those keep the documented local-default fallback (logged).
+async fn bounded_udr_read<F>(fut: F) -> Result<Option<serde_json::Value>, UdrError>
+where
+    F: std::future::Future<Output = Result<Option<serde_json::Value>, UdrError>>,
+{
+    // #1607 review: boxed, so the read's state machine lives on the heap. Inline,
+    // it roughly doubled the SM create future (20 -> 36 KB) and the router's, and
+    // the pcfd suite overflowed a test thread's stack.
+    match tokio::time::timeout(UDR_CREATE_READ_TIMEOUT, Box::pin(fut)).await {
+        Ok(Err(UdrError::Status(s))) if s >= 500 => Err(UdrError::Status(s)),
+        Ok(Err(e)) => {
+            log::warn!("nudr-dr read failed without a UDR answer ({e}); local default");
+            Ok(None)
+        }
+        Ok(Ok(doc)) => Ok(doc),
+        Err(_) => {
+            log::warn!("nudr-dr read timed out after {UDR_CREATE_READ_TIMEOUT:?}; local default");
+            Ok(None)
+        }
+    }
+}
+
 /// Discover a UDR and GET the SM PolicyData for `(supi, snssai, dnn)`
 /// (TS 29.519 nudr-dr: `GET /nudr-dr/v2/policy-data/ues/{ueId}/sm-data`).
 /// Returns the decoded body on 200, `Ok(None)` on 404 or when no UDR is
@@ -1877,7 +1945,7 @@ pub async fn pcf_udr_get_sm_policy_data(
     snssai_sst: u8,
     snssai_sd: Option<u32>,
     dnn: &str,
-) -> Result<Option<serde_json::Value>, String> {
+) -> Result<Option<serde_json::Value>, UdrError> {
     let Some(ep) = pcf_discover_endpoint("UDR", "nudr-dr").await? else {
         return Ok(None);
     };
@@ -1907,7 +1975,7 @@ pub async fn pcf_udr_get_sm_policy_data(
             log::warn!("nudr-dr returned 404 for SUPI {supi}; using config defaults");
             Ok(None)
         }
-        other => Err(format!("nudr-dr GET returned status {other}")),
+        other => Err(UdrError::Status(other)),
     }
 }
 
@@ -1927,7 +1995,7 @@ pub async fn pcf_udr_sm_policy_dnn_data_from(
     sst: u8,
     sd: Option<u32>,
     dnn: &str,
-) -> Result<Option<serde_json::Value>, String> {
+) -> Result<Option<serde_json::Value>, UdrError> {
     let client = client_for(ep, NfType::Udr);
     let snssai = match sd {
         Some(sd) => format!("{{\"sst\":{sst},\"sd\":\"{sd:06x}\"}}"),
@@ -1951,7 +2019,7 @@ pub async fn pcf_udr_sm_policy_dnn_data_from(
             Ok(extract_sm_policy_dnn_data(&json, dnn))
         }
         404 => Ok(None),
-        other => Err(format!("nudr-dr GET returned status {other}")),
+        other => Err(UdrError::Status(other)),
     }
 }
 
@@ -1973,19 +2041,17 @@ pub fn extract_sm_policy_dnn_data(
 }
 
 /// Live-path bounded Nudr_DataRepository GET of the UE's SM PolicyData (TS 29.519),
-/// returning the SmPolicyDnnData object for `dnn` when provisioned. `None` on
-/// 404 / unreachable / timeout — caller then falls back to local defaults.
+/// returning the SmPolicyDnnData object for `dnn` when provisioned. `Ok(None)`
+/// when nothing is provisioned or no UDR answers (the caller falls back to local
+/// defaults); #1597: `Err` when the UDR answered a 5xx ([`bounded_udr_read`]).
 pub async fn pcf_udr_sm_policy_dnn_data(
     supi: &str,
     sst: u8,
     sd: Option<u32>,
     dnn: &str,
-) -> Option<serde_json::Value> {
-    let fut = pcf_udr_get_sm_policy_data(supi, sst, sd, dnn);
-    match tokio::time::timeout(std::time::Duration::from_secs(3), fut).await {
-        Ok(Ok(Some(v))) => extract_sm_policy_dnn_data(&v, dnn),
-        _ => None,
-    }
+) -> Result<Option<serde_json::Value>, UdrError> {
+    let doc = bounded_udr_read(pcf_udr_get_sm_policy_data(supi, sst, sd, dnn)).await?;
+    Ok(doc.and_then(|v| extract_sm_policy_dnn_data(&v, dnn)))
 }
 
 /// Discover a UDR and GET the UE PolicySet for `supi`
@@ -1994,7 +2060,7 @@ pub async fn pcf_udr_sm_policy_dnn_data(
 /// / udrd `handle_policy_data`). Returns the decoded UePolicySet body on 200,
 /// `Ok(None)` on 404 or when no UDR is reachable — the caller (E3 rule source)
 /// then falls back to the static default rule set, fail-closed.
-pub async fn pcf_udr_get_ue_policy_set(supi: &str) -> Result<Option<serde_json::Value>, String> {
+pub async fn pcf_udr_get_ue_policy_set(supi: &str) -> Result<Option<serde_json::Value>, UdrError> {
     let Some(ep) = pcf_discover_endpoint("UDR", "nudr-dr").await? else {
         return Ok(None);
     };
@@ -2007,7 +2073,7 @@ pub async fn pcf_udr_get_ue_policy_set(supi: &str) -> Result<Option<serde_json::
 pub async fn pcf_udr_get_ue_policy_set_from(
     ep: &DiscoveredEndpoint,
     supi: &str,
-) -> Result<Option<serde_json::Value>, String> {
+) -> Result<Option<serde_json::Value>, UdrError> {
     let client = client_for(ep, NfType::Udr);
     let path = format!(
         "/nudr-dr/v2/policy-data/ues/{}/ue-policy-set",
@@ -2028,20 +2094,16 @@ pub async fn pcf_udr_get_ue_policy_set_from(
             log::warn!("nudr-dr returned 404 for ue-policy-set SUPI {supi}; using static defaults");
             Ok(None)
         }
-        other => Err(format!("nudr-dr ue-policy-set GET returned status {other}")),
+        other => Err(UdrError::Status(other)),
     }
 }
 
 /// Live-path bounded Nudr_DataRepository GET of the UE's provisioned UePolicySet
-/// (TS 29.519 §5.4), returning the doc when provisioned. `None` on
-/// 404 / unreachable / timeout — the E3 rule source then falls back to the
-/// static default set (fail-closed against a stuck UDR blocking delivery).
-pub async fn pcf_udr_ue_policy_set(supi: &str) -> Option<serde_json::Value> {
-    let fut = pcf_udr_get_ue_policy_set(supi);
-    match tokio::time::timeout(std::time::Duration::from_secs(3), fut).await {
-        Ok(Ok(Some(v))) => Some(v),
-        _ => None,
-    }
+/// (TS 29.519 §5.4), returning the doc when provisioned. `Ok(None)` when nothing
+/// is provisioned or no UDR answers (the E3 rule source then uses the static
+/// default set); #1597: `Err` when the UDR answered a 5xx.
+pub async fn pcf_udr_ue_policy_set(supi: &str) -> Result<Option<serde_json::Value>, UdrError> {
+    bounded_udr_read(pcf_udr_get_ue_policy_set(supi)).await
 }
 
 /// Discover a UDR and GET the UE's AM subscription data
@@ -2054,7 +2116,7 @@ pub async fn pcf_udr_ue_policy_set(supi: &str) -> Option<serde_json::Value> {
 /// rather than emitting nulls (#89).
 pub async fn pcf_udr_get_am_subscription_data(
     supi: &str,
-) -> Result<Option<serde_json::Value>, String> {
+) -> Result<Option<serde_json::Value>, UdrError> {
     let Some(ep) = pcf_discover_endpoint("UDR", "nudr-dr").await? else {
         return Ok(None);
     };
@@ -2066,7 +2128,7 @@ pub async fn pcf_udr_get_am_subscription_data(
 pub async fn pcf_udr_get_am_subscription_data_from(
     ep: &DiscoveredEndpoint,
     supi: &str,
-) -> Result<Option<serde_json::Value>, String> {
+) -> Result<Option<serde_json::Value>, UdrError> {
     let client = client_for(ep, NfType::Udr);
     let path = format!(
         "/nudr-dr/v2/subscription-data/{}/provisioned-data/am-data",
@@ -2087,18 +2149,17 @@ pub async fn pcf_udr_get_am_subscription_data_from(
             log::warn!("nudr-dr returned 404 for am-data SUPI {supi}");
             Ok(None)
         }
-        other => Err(format!("nudr-dr am-data GET returned status {other}")),
+        other => Err(UdrError::Status(other)),
     }
 }
 
-/// Bounded live-path AM subscription-data read. `None` on 404 / unreachable /
-/// timeout, so a stuck UDR cannot hold up an AM policy association.
-pub async fn pcf_udr_am_subscription_data(supi: &str) -> Option<serde_json::Value> {
-    let fut = pcf_udr_get_am_subscription_data(supi);
-    match tokio::time::timeout(std::time::Duration::from_secs(3), fut).await {
-        Ok(Ok(Some(v))) => Some(v),
-        _ => None,
-    }
+/// Bounded live-path AM subscription-data read. `Ok(None)` when nothing is
+/// provisioned or no UDR answers; #1597: `Err` when the UDR answered a 5xx, so
+/// the caller does not provision from an outage.
+pub async fn pcf_udr_am_subscription_data(
+    supi: &str,
+) -> Result<Option<serde_json::Value>, UdrError> {
+    bounded_udr_read(pcf_udr_get_am_subscription_data(supi)).await
 }
 
 /// Register a PCF binding with a discovered BSF

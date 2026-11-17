@@ -259,7 +259,13 @@ async fn a_policy_data_change_is_pushed_to_the_amf_and_the_ue() {
     .await;
     assert_eq!(am.status, 201);
     let am: serde_json::Value = serde_json::from_str(am.http.content.as_deref().unwrap()).unwrap();
-    assert_eq!(am["rfsp"], 3, "created with the provisioned RFSP");
+    // #1580: amfd's create carries no `rfsp`, so the answer carries none (TS 29.507
+    // §4.2.2.2 item b); the association still holds the provisioned 3, which the
+    // PCF-initiated UpdateNotify below diffs against (§4.2.3.3.2).
+    assert!(
+        am.get("rfsp").is_none(),
+        "no rfsp the AMF did not send: {am}"
+    );
     let am_id = am["polAssoId"].as_str().unwrap().to_string();
 
     let ue = pcf_sbi_request_handler(post(

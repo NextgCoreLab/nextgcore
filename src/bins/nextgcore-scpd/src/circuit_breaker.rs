@@ -101,12 +101,19 @@ impl CircuitBreaker {
     /// HalfOpen (admitting a single probe) once `open_timeout` has elapsed, so
     /// it takes `&mut self`.
     pub fn allow_request(&mut self) -> bool {
+        self.allow_request_at(Instant::now())
+    }
+
+    /// [`allow_request`](Self::allow_request) as of `now`. The clock is a
+    /// parameter so a test can step past the open timeout exactly instead of
+    /// racing a wall-clock window (#1392).
+    pub(crate) fn allow_request_at(&mut self, now: Instant) -> bool {
         match self.state {
             CircuitState::Closed => true,
             CircuitState::HalfOpen => true,
             CircuitState::Open => {
                 if let Some(opened) = self.opened_at {
-                    if opened.elapsed() >= self.open_timeout {
+                    if now.saturating_duration_since(opened) >= self.open_timeout {
                         self.state = CircuitState::HalfOpen;
                         self.half_open_success = 0;
                         return true;
@@ -119,12 +126,23 @@ impl CircuitBreaker {
 }
 
 #[cfg(test)]
+impl CircuitBreaker {
+    /// End the current open window now, as if `open_timeout` had elapsed: the
+    /// next [`allow_request`](Self::allow_request) admits the half-open probe.
+    /// For tests that drive the breaker through the proxy, where the clock
+    /// cannot be passed in; it touches only this breaker (#1392).
+    pub(crate) fn expire_open_window(&mut self) {
+        self.open_timeout = Duration::ZERO;
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn opens_after_threshold_failures() {
-        let mut cb = CircuitBreaker::new(3, Duration::from_millis(100));
+        let mut cb = CircuitBreaker::new(3, Duration::from_secs(30));
         assert_eq!(cb.state, CircuitState::Closed);
         assert!(cb.allow_request());
 
@@ -134,17 +152,28 @@ mod tests {
         cb.record_failure();
         assert_eq!(cb.state, CircuitState::Open);
         assert!(!cb.allow_request(), "Open rejects before the timeout");
+        let opened = cb.opened_at.expect("an open circuit has an open time");
+        assert!(
+            !cb.allow_request_at(opened + Duration::from_secs(30) - Duration::from_millis(1)),
+            "still Open one millisecond before the timeout"
+        );
+        assert_eq!(cb.state, CircuitState::Open);
+        assert!(
+            cb.allow_request_at(opened + Duration::from_secs(30)),
+            "the probe is admitted exactly at the timeout"
+        );
+        assert_eq!(cb.state, CircuitState::HalfOpen);
     }
 
     #[test]
     fn recovers_through_half_open() {
-        let mut cb = CircuitBreaker::new(1, Duration::from_millis(1));
+        let mut cb = CircuitBreaker::new(1, Duration::from_secs(30));
         cb.record_failure();
         assert_eq!(cb.state, CircuitState::Open);
 
-        std::thread::sleep(Duration::from_millis(5));
+        let opened = cb.opened_at.expect("open time");
         assert!(
-            cb.allow_request(),
+            cb.allow_request_at(opened + Duration::from_secs(30)),
             "the timeout elapsed: a probe is admitted"
         );
         assert_eq!(cb.state, CircuitState::HalfOpen);
@@ -157,13 +186,34 @@ mod tests {
 
     #[test]
     fn half_open_probe_failure_reopens() {
-        let mut cb = CircuitBreaker::new(1, Duration::from_millis(1));
+        let mut cb = CircuitBreaker::new(1, Duration::from_secs(30));
         cb.record_failure();
-        std::thread::sleep(Duration::from_millis(5));
-        assert!(cb.allow_request());
+        let opened = cb.opened_at.expect("open time");
+        assert!(cb.allow_request_at(opened + Duration::from_secs(30)));
         assert_eq!(cb.state, CircuitState::HalfOpen);
         cb.record_failure();
         assert_eq!(cb.state, CircuitState::Open, "a failed probe reopens");
+        let reopened = cb.opened_at.expect("reopen time");
+        assert!(
+            reopened >= opened,
+            "the open window restarts at the failed probe"
+        );
+        assert!(
+            !cb.allow_request_at(reopened + Duration::from_secs(29)),
+            "a whole new timeout before the next probe"
+        );
+    }
+
+    /// `expire_open_window` ends the current window: the next request is the
+    /// probe, without waiting on the clock.
+    #[test]
+    fn expire_open_window_admits_the_probe() {
+        let mut cb = CircuitBreaker::new(1, Duration::from_secs(3600));
+        cb.record_failure();
+        assert!(!cb.allow_request());
+        cb.expire_open_window();
+        assert!(cb.allow_request());
+        assert_eq!(cb.state, CircuitState::HalfOpen);
     }
 
     #[test]
