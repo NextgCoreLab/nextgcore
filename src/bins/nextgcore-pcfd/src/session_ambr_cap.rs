@@ -96,11 +96,13 @@ pub fn from_config_root(root: &serde_yaml::Value) -> Result<SessionAmbrCap, Stri
     };
     for key in map.keys() {
         match key.as_str() {
-            // #1621 review B1: read by `crate::emergency_dnn`.
-            Some("session_ambr_cap") | Some("emergency_dnns") => {}
+            // #1621 review B1: read by `crate::emergency_dnn`; #1639: by
+            // `crate::udr_required`.
+            Some("session_ambr_cap") | Some("emergency_dnns") | Some("udr_required") => {}
             other => {
                 return Err(format!(
-                    "pcf.policy: unknown key {other:?} (known: session_ambr_cap, emergency_dnns)"
+                    "pcf.policy: unknown key {other:?} (known: session_ambr_cap, \
+                     emergency_dnns, udr_required)"
                 ))
             }
         }

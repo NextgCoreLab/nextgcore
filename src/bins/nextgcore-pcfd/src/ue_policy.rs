@@ -1003,6 +1003,17 @@ pub fn ue_policy_set_triggers(pol_asso_id: &str, triggers: Vec<String>) {
 /// AMF takes over), and the next delivery hands the new AMF the new ones. The
 /// connectivity token is kept: its subscription moves to the new AMF in
 /// `UeContext.eventSubscriptionList`. Answers whether the AMF changed.
+///
+/// The AMF changed when a member that was recorded is re-sent with another value,
+/// or when the update names the AMF only by the member that was never recorded
+/// (#1717 review): nothing then shows it is the same AMF, so it is treated as
+/// another one. An update that re-sends a recorded member unchanged identifies the
+/// same AMF, whatever else it adds.
+///
+/// A delivery result still in flight from the previous AMF then answers 404 and is
+/// lost to the N1 notify route. That AMF no longer serves the UE; the result can
+/// still reach the PCF as the update's `uePolDelResult`, and an unconfirmed
+/// delivery falls to T3501 as before.
 pub fn ue_policy_set_serving_amf(
     pol_asso_id: &str,
     guami: Option<AmfGuami>,
@@ -1014,13 +1025,25 @@ pub fn ue_policy_set_serving_amf(
     let Some(a) = m.get_mut(pol_asso_id) else {
         return false;
     };
-    let mut changed = false;
+    fn differs<T: PartialEq>(old: &Option<T>, new: &Option<T>) -> bool {
+        matches!((old, new), (Some(o), Some(n)) if o != n)
+    }
+    fn unconfirmed<T, U>(
+        old: &Option<T>,
+        new: &Option<T>,
+        old_other: &Option<U>,
+        new_other: &Option<U>,
+    ) -> bool {
+        old.is_none() && new.is_some() && old_other.is_some() && new_other.is_none()
+    }
+    let changed = differs(&a.guami, &guami)
+        || differs(&a.serving_nf_id, &serving_nf_id)
+        || unconfirmed(&a.guami, &guami, &a.serving_nf_id, &serving_nf_id)
+        || unconfirmed(&a.serving_nf_id, &serving_nf_id, &a.guami, &guami);
     if let Some(g) = guami {
-        changed |= a.guami.as_ref().is_some_and(|old| *old != g);
         a.guami = Some(g);
     }
     if let Some(id) = serving_nf_id {
-        changed |= a.serving_nf_id.as_ref().is_some_and(|old| *old != id);
         a.serving_nf_id = Some(id);
     }
     if changed {

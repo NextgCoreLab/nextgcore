@@ -4050,21 +4050,28 @@ fn find_binary_part(request: &SbiRequest, content_id: &str) -> Option<Vec<u8>> {
         .map(|p| p.data.to_vec())
 }
 
-/// 504 N1N2MessageTransferError with cause UE_NOT_REACHABLE
-/// (TS 29.518 Table 6.1.7.3-1) + asynchronous failure notification when
-/// the consumer supplied n1n2FailureTxfNotifURI.
-fn ue_not_reachable_error(ue_context_id: &str, failure_uri: Option<&str>) -> SbiResponse {
-    if let Some(uri) = failure_uri {
-        send_n1n2_failure_notification(
-            uri.to_string(),
-            "UE_NOT_REACHABLE",
-            format!("/namf-comm/v1/ue-contexts/{ue_context_id}/n1-n2-messages"),
-        );
-    }
+/// 504 N1N2MessageTransferError with cause UE_NOT_REACHABLE (TS 29.518
+/// Table 6.1.3.5.3.1-3, Table 6.1.7.3-1): the UE is not reachable for paging.
+fn ue_not_reachable_error() -> SbiResponse {
+    n1n2_transfer_error_504("UE_NOT_REACHABLE", "UE is not reachable")
+}
+
+/// A 504 N1N2MessageTransferError (TS 29.518 Table 6.1.3.5.3.1-3) whose
+/// ProblemDetails `cause` is `cause`: UE_NOT_REACHABLE or UE_NOT_RESPONDING, the
+/// two application errors of Table 6.1.7.3-1 for a 504 (§5.2.2.3.1, 5xx cases).
+///
+/// #1704: the answer IS the failure. No N1N2MsgTxfrFailureNotification goes to
+/// `n1n2FailureTxfNotifURI`: §5.2.2.3.2 sends one for an earlier transfer the AMF
+/// accepted and then failed to deliver (paging failed, the UE rejected the page),
+/// naming the request resource its response returned, and a refused request
+/// created none. Its `cause` is an N1N2MessageTransferCause (Table 6.1.6.2.30-1,
+/// values per Table 6.1.5.6.3.1-1), and UE_NOT_REACHABLE is not one: before #1704
+/// that notification carried it.
+fn n1n2_transfer_error_504(cause: &str, detail: &str) -> SbiResponse {
     let problem = ProblemDetails::with_status(504)
         .with_title("Gateway Timeout")
-        .with_detail("UE is not reachable")
-        .with_cause("UE_NOT_REACHABLE");
+        .with_detail(detail)
+        .with_cause(cause);
     let body = json!({ "error": problem });
     match SbiResponse::with_status(504).with_json_body(&body) {
         Ok(resp) => resp.with_header("content-type", "application/problem+json"),
@@ -4687,7 +4694,7 @@ fn try_positioning_relay(
     let failure_uri = body.get("n1n2FailureTxfNotifURI").and_then(Value::as_str);
     let connected = ue_ng_connected(ue);
     if !connected && !ue_pageable(ue) {
-        return Some(ue_not_reachable_error(ue_context_id, failure_uri));
+        return Some(ue_not_reachable_error());
     }
 
     // Fallback correlation record (TS 29.518 N1N2MessageTransferReqData
@@ -4868,7 +4875,7 @@ fn try_ue_policy_relay(
         // the 5G-S-TMSI and registration area); a UE with no such record cannot
         // be paged and stays UE_NOT_REACHABLE.
         if !ue_pageable(ue) {
-            return Some(ue_not_reachable_error(ue_context_id, failure_uri));
+            return Some(ue_not_reachable_error());
         }
         // #749: paging is ongoing for another transfer; overwriting its context
         // would lose that one, so this one is refused for the PCF to retry.
@@ -5073,7 +5080,7 @@ pub fn handle_n1_n2_message_transfer_request(
                 Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
             }
         } else {
-            ue_not_reachable_error(ue_context_id, failure_uri.as_deref())
+            ue_not_reachable_error()
         };
     };
 
@@ -5145,12 +5152,23 @@ pub fn handle_n1_n2_message_transfer_request(
                     Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
                 }
             }
+            // #1704, TS 29.518 §5.2.2.3.1 2a and Case A a): a skipped N1 (skipInd,
+            // CM-IDLE) or N2 (outside the area of validity) is a "200 OK" whose
+            // N1N2MessageTransferRspData carries that cause, not a failure.
             N1N2MessageTransferCause::N1MsgNotTransferred
-            | N1N2MessageTransferCause::N2MsgNotTransferred
-            | N1N2MessageTransferCause::UeNotResponding
-            | N1N2MessageTransferCause::UeNotReachable => {
-                ue_not_reachable_error(ue_context_id, failure_uri.as_deref())
+            | N1N2MessageTransferCause::N2MsgNotTransferred => {
+                let body = json!({ "cause": rsp.cause.as_str() });
+                match SbiResponse::ok().with_json_body(&body) {
+                    Ok(resp) => resp,
+                    Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
+                }
             }
+            // §5.2.2.3.1 5xx cases: 504 with the application error in the
+            // ProblemDetails (Table 6.1.7.3-1).
+            N1N2MessageTransferCause::UeNotResponding => {
+                n1n2_transfer_error_504("UE_NOT_RESPONDING", "UE is not responding")
+            }
+            N1N2MessageTransferCause::UeNotReachable => ue_not_reachable_error(),
             N1N2MessageTransferCause::TemporaryRejectRegistrationOngoing
             | N1N2MessageTransferCause::TemporaryRejectHandoverOngoing => {
                 // 409 Conflict per TS 29.518 §5.2.2.3.1
@@ -8812,8 +8830,7 @@ mod tests {
         ue.supi = Some(supi.to_string());
         ue.ran_ue_id = NEXTGCORE_INVALID_POOL_ID;
 
-        let (server, port, mut rx) = start_capture_server().await;
-        let failure_uri = format!("http://127.0.0.1:{port}/pcf-n1n2-failure");
+        let failure_uri = "http://127.0.0.1:9/pcf-n1n2-failure";
 
         let body = json!({
             "n1MessageContainer": {
@@ -8822,6 +8839,7 @@ mod tests {
             },
             "n1n2FailureTxfNotifURI": failure_uri,
         });
+        let notified_before = failure_notifications_on_this_thread();
         let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
             .with_json_body(&body)
             .expect("json")
@@ -8835,21 +8853,17 @@ mod tests {
         assert_eq!(resp.status, 504, "CM-IDLE UPDP must be 504, never 200");
         let err = body_json(&resp);
         assert_eq!(err["error"]["cause"].as_str(), Some("UE_NOT_REACHABLE"));
-
-        // n1n2FailureTxfNotifURI is honored (TS 29.518 §6.1.6.2.8).
-        let (uri, posted) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
-            .await
-            .expect("failure notification not delivered within 3s")
-            .expect("capture channel closed");
-        assert_eq!(uri, "/pcf-n1n2-failure");
-        let posted: Value = serde_json::from_str(&posted).expect("failure body JSON");
-        assert_eq!(posted["cause"].as_str(), Some("UE_NOT_REACHABLE"));
+        // #1704: the 504 is the failure; no N1N2MsgTxfrFailureNotification for a
+        // transfer that was never accepted (TS 29.518 §5.2.2.3.2).
+        assert_eq!(
+            failure_notifications_on_this_thread(),
+            notified_before,
+            "no failure notification for a refused transfer"
+        );
 
         // Nothing was enqueued for this UE (fail-closed).
         let leaked = drain_downlinks_for(ue.id).len();
         assert_eq!(leaked, 0, "no downlink may be enqueued for an idle UE");
-
-        server.stop().await.expect("server stop");
     }
 
     /// Wave-6 E5: a UPDP transfer whose contentId has no matching binary part
@@ -9406,26 +9420,25 @@ mod tests {
         assert_eq!(problem_cause(&resp), "CONTEXT_NOT_FOUND");
     }
 
+    /// #1704, TS 29.518 §5.2.2.3.1 Case A a): a release whose N1 the SMF lets the
+    /// AMF skip (`skipInd`) for a CM-IDLE UE is answered "200 OK" with the
+    /// N1N2MessageTransferRspData cause N1_MSG_NOT_TRANSFERRED. Before, it was a
+    /// 504 UE_NOT_REACHABLE, and a failure notification with that cause, which is
+    /// not an N1N2MessageTransferCause (Table 6.1.5.6.3.1-1), went to the
+    /// n1n2FailureTxfNotifURI.
+    ///
+    /// REVERT-VERIFIED: with N1MsgNotTransferred mapped to the 504 again, this
+    /// answers 504.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_n1n2_failure_callback_http_delivery() {
-        // This test drives production code against a loopback PLAINTEXT peer, i.e.
-        // it describes a dev-profile deployment (issue #63). Declared explicitly
-        // rather than inherited from the environment.
-        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-        // Idle UE + PDU_RES_REL_CMD + skipInd: N1 message is not transferred,
-        // the response is 504 UE_NOT_REACHABLE and the failure notification
-        // is POSTed to n1n2FailureTxfNotifURI.
+    async fn a_skipped_n1_for_an_idle_ue_is_200_n1_msg_not_transferred_1704() {
         let supi = "imsi-001010000060023";
         let ue = setup_ue(supi, false, false);
         setup_sess(&ue, 8);
 
-        let (server, port, mut rx) = start_capture_server().await;
-        let failure_uri = format!("http://127.0.0.1:{port}/smf-n1n2-failure");
-
         let body = json!({
             "pduSessionId": 8,
             "skipInd": true,
-            "n1n2FailureTxfNotifURI": failure_uri,
+            "n1n2FailureTxfNotifURI": "http://127.0.0.1:9/smf-n1n2-failure",
             "n2InfoContainer": {
                 "n2InformationClass": "SM",
                 "smInfo": {
@@ -9437,25 +9450,62 @@ mod tests {
                 },
             },
         });
+        let notified_before = failure_notifications_on_this_thread();
         let resp = namf_request_handler(n1n2_request(supi, &body, false)).await;
-        assert_eq!(resp.status, 504);
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        assert_eq!(
+            body_json(&resp)["cause"].as_str(),
+            Some("N1_MSG_NOT_TRANSFERRED")
+        );
+        assert_eq!(
+            failure_notifications_on_this_thread(),
+            notified_before,
+            "a skipped N1 is no delivery failure"
+        );
+    }
+
+    /// #1704: a pure N1 transfer to a UE with no NG connection is answered 504 with
+    /// the application error UE_NOT_REACHABLE in the N1N2MessageTransferError's
+    /// ProblemDetails (TS 29.518 Table 6.1.3.5.3.1-3, Table 6.1.7.3-1), and no
+    /// N1N2MsgTxfrFailureNotification: §5.2.2.3.2 sends one for an accepted
+    /// transfer the AMF then failed to deliver, and this one was refused.
+    ///
+    /// REVERT-VERIFIED: with the notification sent from the 504 again, the
+    /// counter moves by one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_504_carries_ue_not_reachable_in_problem_details_only_1704() {
+        let supi = "imsi-001010000060024";
+        let _ue = setup_ue(supi, false, false);
+        let body = json!({
+            "n1n2FailureTxfNotifURI": "http://127.0.0.1:9/smf-n1n2-failure",
+            "n1MessageContainer": {
+                "n1MessageClass": "SM",
+                "n1MessageContent": { "contentId": "5gnas-sm" },
+            },
+        });
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
+            .with_json_body(&body)
+            .expect("json")
+            .with_part(SbiPart::with_content(
+                "5gnas-sm",
+                "application/vnd.3gpp.5gnas",
+                bytes::Bytes::from_static(&[0x2e, 0x01, 0x01, 0xc1]),
+            ));
+        let notified_before = failure_notifications_on_this_thread();
+        let resp = namf_request_handler(req).await;
+        assert_eq!(resp.status, 504, "{:?}", resp.http.content);
         let err = body_json(&resp);
+        assert_eq!(err["error"]["status"].as_u64(), Some(504));
         assert_eq!(err["error"]["cause"].as_str(), Some("UE_NOT_REACHABLE"));
-
-        let (uri, posted) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
-            .await
-            .expect("failure notification not delivered within 3s")
-            .expect("capture channel closed");
-        assert_eq!(uri, "/smf-n1n2-failure");
-        let posted: Value = serde_json::from_str(&posted).expect("failure body JSON");
-        // Both mandatory attributes of N1N2MsgTxfrFailureNotification
-        assert_eq!(posted["cause"].as_str(), Some("UE_NOT_REACHABLE"));
-        assert!(posted["n1n2MsgDataUri"]
-            .as_str()
-            .expect("n1n2MsgDataUri")
-            .contains(supi));
-
-        server.stop().await.expect("server stop");
+        assert!(
+            err.get("cause").is_none(),
+            "not an N1N2MessageTransferRspData cause: {err}"
+        );
+        assert_eq!(
+            failure_notifications_on_this_thread(),
+            notified_before,
+            "no failure notification for a refused transfer"
+        );
     }
 
     // ------------------------------------------------------------------

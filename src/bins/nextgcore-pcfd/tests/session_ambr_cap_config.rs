@@ -219,3 +219,80 @@ fn a_known_session_ambr_cap_is_logged_in_force() {
         drop(child);
     }
 }
+
+/// #1639: `pcf.policy.udr_required` that is not a YAML boolean fails start-up,
+/// naming the setting; a boolean (or none) is logged in force.
+///
+/// REVERT-VERIFIED: with `udr_required::from_config_root` mapping a non-boolean
+/// to the default, pcfd starts on `yes`; with `udr_required::set(..)` deleted from
+/// `run()`, `true` is logged as `false`.
+#[test]
+fn pcf_policy_udr_required_at_startup_1639() {
+    let cfg = config("udrreq-bad", "  policy:\n    udr_required: yes\n");
+    let mut child = spawn(&cfg);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "pcfd did not exit");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut err = String::new();
+    child
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
+    assert!(!status.success(), "start-up must fail: {err}");
+    assert!(
+        err.contains("pcf.policy.udr_required") && err.contains("yes"),
+        "the failure names the setting and the value: {err}"
+    );
+
+    for (value, expect) in [
+        ("true", "pcf.policy.udr_required = true"),
+        ("false", "pcf.policy.udr_required = false"),
+        ("", "pcf.policy.udr_required = false"),
+    ] {
+        let policy = if value.is_empty() {
+            String::new()
+        } else {
+            format!("  policy:\n    udr_required: {value}\n")
+        };
+        let tag = format!("udrreq-{}", if value.is_empty() { "absent" } else { value });
+        let cfg = config(&tag, &policy);
+        let mut child = spawn(&cfg);
+        let stderr = child.0.stderr.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut seen = Vec::new();
+        let found = loop {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(line) => {
+                    let hit = line.contains(expect);
+                    seen.push(line);
+                    if hit {
+                        break true;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break false,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+        };
+        assert!(found, "{value:?}: expected {expect:?} in {seen:#?}");
+        drop(child);
+    }
+}
