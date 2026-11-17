@@ -2378,7 +2378,9 @@ fn handle_event_subscription_delete(subscription_id: &str) -> SbiResponse {
 fn notify_client(host: &str, port: u16) -> SbiClient {
     let config = nextgcore_sbi::security::sbi_peer_client_config(host, port)
         .with_connect_timeout(std::time::Duration::from_secs(NOTIFY_CONNECT_TIMEOUT_SECS))
-        .with_request_timeout(std::time::Duration::from_secs(NOTIFY_REQUEST_TIMEOUT_SECS));
+        .with_request_timeout(std::time::Duration::from_secs(NOTIFY_REQUEST_TIMEOUT_SECS))
+        // #1674: a notification is answered with a 204 or a ProblemDetails.
+        .with_max_response_body(crate::sbi_path::MAX_SMALL_RESPONSE_BODY);
     SbiClient::new(config)
 }
 
@@ -4528,6 +4530,40 @@ pub fn handle_n1_n2_message_transfer_request(
     if n1_container.is_none() && n2_container.is_none() {
         // At least one of N1/N2 content must be present
         return mandatory_ie_missing("n1MessageContainer or n2InfoContainer");
+    }
+
+    // #1674 (the #1670 review): an N1 longer than a payload container can carry
+    // (TS 24.501 §9.11.3.39, 65 535 octets) can never reach the UE. It is refused
+    // here, before any relay or the 200, with 413 "Content Too Large" (TS 29.500
+    // §5.2.7.2: content larger than the NF is able to process), so the requester
+    // learns of it rather than retransmitting into silence.
+    if let Some(len) = n1_container
+        .and_then(|c| c.pointer("/n1MessageContent/contentId"))
+        .and_then(Value::as_str)
+        .and_then(|cid| {
+            request
+                .http
+                .parts
+                .iter()
+                .find(|p| p.content_id.as_deref() == Some(cid))
+                .map(|p| p.data.len())
+        })
+        .filter(|&len| len > crate::gmm_build::MAX_PAYLOAD_CONTAINER_LEN)
+    {
+        log::warn!(
+            "[{ue_context_id}] N1N2MessageTransfer refused: an N1 of {len} bytes is longer \
+             than a payload container can carry"
+        );
+        return send_error(
+            413,
+            "Content Too Large",
+            &format!(
+                "n1MessageContent of {len} octets exceeds the {}-octet payload container \
+                 (TS 24.501 9.11.3.39)",
+                crate::gmm_build::MAX_PAYLOAD_CONTAINER_LEN
+            ),
+            None,
+        );
     }
 
     // LCS positioning relay (TS 23.273): an LMF push of NRPPa (→gNB, N2) and/or
@@ -8038,6 +8074,97 @@ mod tests {
             body_json(&resp)["cause"].as_str(),
             Some("N1_N2_TRANSFER_INITIATED")
         );
+    }
+
+    /// #1674 (the #1670 review), TS 24.501 §9.11.3.39 / TS 29.500 §5.2.7.2: an
+    /// N1N2MessageTransfer whose N1 is longer than a payload container can carry is
+    /// refused with 413 before the 200, on the SM path and on the relays alike. One
+    /// of exactly 65 535 octets is accepted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_n1_over_a_payload_container_is_refused_before_the_200_1674() {
+        let supi = "imsi-001010000167401";
+        let ue = setup_ue(supi, true, true);
+        setup_sess(&ue, 5);
+        let sm = |len: usize| {
+            let mut n1 = vec![0x2e, 0x05, 0x01, 0xcb];
+            n1.resize(len, 0);
+            SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
+                .with_json_body(&n1n2_body(5, true, false, None))
+                .expect("json")
+                .with_part(SbiPart::with_content(
+                    "ngap-sm",
+                    "application/vnd.3gpp.ngap",
+                    bytes::Bytes::from_static(&[0x00, 0x1d, 0x00, 0x03]),
+                ))
+                .with_part(SbiPart::with_content(
+                    "5gnas-sm",
+                    "application/vnd.3gpp.5gnas",
+                    bytes::Bytes::from(n1),
+                ))
+        };
+        let max = crate::gmm_build::MAX_PAYLOAD_CONTAINER_LEN;
+        let resp = namf_request_handler(sm(max)).await;
+        assert_eq!(resp.status, 200, "65 535 octets fit");
+        let resp = namf_request_handler(sm(max + 1)).await;
+        assert_eq!(resp.status, 413, "65 536 do not");
+        assert_eq!(body_json(&resp)["status"].as_u64(), Some(413));
+
+        let lpp = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
+            .with_json_body(&json!({
+                "n1MessageContainer": {
+                    "n1MessageClass": "LPP",
+                    "n1MessageContent": { "contentId": "lpp-pdu" }
+                }
+            }))
+            .expect("json")
+            .with_part(SbiPart::with_content(
+                "lpp-pdu",
+                "application/vnd.3gpp.lpp",
+                bytes::Bytes::from(vec![0x90; max + 1]),
+            ));
+        let resp = namf_request_handler(lpp).await;
+        assert_eq!(
+            resp.status, 413,
+            "an over-long LPP is refused before the relay too"
+        );
+    }
+
+    /// #1674: a notification's answer is capped at `MAX_SMALL_RESPONSE_BODY`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_notification_answer_over_the_cap_is_refused_1674() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        server
+            .start(|req: SbiRequest| async move {
+                let len: usize = req
+                    .header
+                    .uri
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap_or(0);
+                SbiResponse::with_status(200).with_body("x".repeat(len), "text/plain")
+            })
+            .await
+            .expect("stand-in consumer starts");
+        let cap = crate::sbi_path::MAX_SMALL_RESPONSE_BODY;
+        let client = notify_client("127.0.0.1", addr.port());
+        let at = client.get(&format!("/n/{cap}")).await;
+        assert!(at.is_ok(), "a {cap}-octet answer is read: {:?}", at.err());
+        let over = client.get(&format!("/n/{}", cap + 1)).await;
+        assert!(
+            over.as_ref()
+                .err()
+                .is_some_and(|e| e.to_string().contains("byte limit")),
+            "a larger one is refused: {:?}",
+            over.map(|r| r.status)
+        );
+        server.stop().await.expect("stop");
     }
 
     /// LCS: an LMF push of LPP (n1MessageClass "LPP", no PDU session) to a

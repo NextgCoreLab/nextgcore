@@ -858,9 +858,10 @@ async fn ucmf_client() -> Result<nextgcore_sbi::client::SbiClient, String> {
     let (host, port) = resolve_ucmf_endpoint().await.ok_or_else(|| {
         "no UCMF endpoint (NRF discovery found none, UCMF_SBI_ADDR unset)".to_string()
     })?;
-    Ok(crate::attach_oauth2(
-        nextgcore_sbi::client::SbiClient::for_peer(&host, port),
+    Ok(crate::sbi_path::peer_client(
         nextgcore_sbi::types::NfType::Ucmf,
+        &host,
+        port,
     ))
 }
 
