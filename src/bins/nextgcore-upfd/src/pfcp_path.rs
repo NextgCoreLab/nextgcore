@@ -3034,211 +3034,230 @@ impl PfcpServer {
                 .collect();
             if let Some(session) = sessions.get_mut(&upf_seid) {
                 let old_tunnel = session.gnb_addr.map(|addr| (session.dl_teid, addr));
-                for id in &removed_far_ids {
-                    session.rules.own_tunnel_far_ids.remove(id);
-                }
-                for f in &created_fars {
-                    if own_tunnel_fars.contains(&f.far_id) {
-                        session.rules.own_tunnel_far_ids.insert(f.far_id);
-                    } else {
-                        // A re-created id that is now an ordinary FAR.
-                        session.rules.own_tunnel_far_ids.remove(&f.far_id);
-                    }
-                }
-                for &(far_id, teid, ipv4) in created_tunnels.iter().chain(
-                    updated_tunnels
-                        .iter()
-                        .filter(|(id, ..)| !session.rules.own_tunnel_far_ids.contains(id)),
-                ) {
-                    updated_dl_teid = Some(teid);
-                    updated_gnb_addr = ipv4;
-                    log::debug!("Updated downlink: FAR {far_id}, TEID={teid:#x}, gNB={ipv4:?}");
-                }
-                if let Some(teid) = updated_dl_teid {
-                    session.dl_teid = teid;
-                }
-                if let Some(addr) = updated_gnb_addr {
-                    session.gnb_addr = Some(addr);
-                }
-
-                // Removing a rule the session does not hold is IDEMPOTENT SUCCESS,
-                // deliberately: the CP function asked for the rule to be gone and it
-                // is gone, so answering §7.5.5's rule-failure cause would fail a
-                // modification that achieved exactly what was requested. Logged at
-                // debug so it is visible without being an error.
-                for id in &removed_pdr_ids {
-                    if !session.rules.pdr_ids.remove(id) {
-                        log::debug!("Remove PDR {id}: not held by SEID {upf_seid:#x}, idempotent");
-                    }
-                }
-                for id in &removed_far_ids {
-                    if !session.rules.far_ids.remove(id) {
-                        log::debug!("Remove FAR {id}: not held by SEID {upf_seid:#x}, idempotent");
-                    }
-                }
-                for id in &removed_qer_ids {
-                    if !session.rules.qer_ids.remove(id) {
-                        log::debug!("Remove QER {id}: not held by SEID {upf_seid:#x}, idempotent");
-                    }
-                }
-                for id in &removed_urr_ids {
-                    if !session.rules.urr_ids.remove(id) {
-                        log::debug!("Remove URR {id}: not held by SEID {upf_seid:#x}, idempotent");
-                    }
-                }
-
-                for p in &created_pdrs {
-                    session.rules.pdr_ids.insert(p.pdr_id);
-                }
-                for f in &created_fars {
-                    session.rules.far_ids.insert(f.far_id);
-                }
-                for q in &created_qers {
-                    session.rules.qer_ids.insert(q.qer_id);
-                }
-                for u in &created_urrs {
-                    session.rules.urr_ids.insert(u.urr_id);
-                }
-                for id in &removed_srr_ids {
-                    if !session.rules.srr_ids.remove(id) {
-                        log::debug!("Remove SRR {id}: not held by SEID {upf_seid:#x}, idempotent");
-                    }
-                }
-                for r in &created_srrs {
-                    session.rules.srr_ids.insert(r.srr_id);
-                }
-                for r in &mod_srrs {
-                    if !session.rules.srr_ids.contains(&r.srr_id) {
+                // #1682 review M1: a collision is known before anything is written, so
+                // a colliding modification writes NOTHING here: no rule IDs removed or
+                // created, no `dl_teid`/`gnb_addr` moved, no TSC applied. TS 29.244
+                // §6.3.3 (29244-k00.txt:13687-13693): a rejected request leaves the
+                // PFCP session context "as if the PFCP Session Modification Request
+                // had not been received". The data plane is left alone below too.
+                if !key_collisions.is_empty() {
+                    for pdr_id in &key_collisions {
                         log::warn!(
-                            "Update SRR {}: no such rule on SEID {upf_seid:#x}",
-                            r.srr_id
+                            "Update PDR {pdr_id} on SEID {upf_seid:#x}: its F-TEID or UE IP \
+                             address is another session's; refused, nothing applied"
                         );
                         note_first_rule_failure(
                             &mut failure,
-                            crate::n4_build::FailedRule::Srr(r.srr_id),
+                            crate::n4_build::FailedRule::Pdr(*pdr_id),
                         );
                     }
-                }
-
-                // Updating a rule the session does NOT hold is a different case from
-                // removing one: the new threshold, gate or forwarding action has
-                // nowhere to land, so the CP function's intent is not satisfied and
-                // §7.5.5's Rule creation/modification Failure is the truthful answer.
-                // Ignoring it is precisely the "accepted a modification it did not
-                // apply" defect this issue is about.
-                for p in &updated_pdrs {
-                    if !session.rules.pdr_ids.contains(&p.pdr_id) {
-                        log::warn!(
-                            "Update PDR {}: no such rule on SEID {upf_seid:#x}",
-                            p.pdr_id
-                        );
-                        note_first_rule_failure(
-                            &mut failure,
-                            crate::n4_build::FailedRule::Pdr(p.pdr_id),
-                        );
+                } else {
+                    for id in &removed_far_ids {
+                        session.rules.own_tunnel_far_ids.remove(id);
                     }
-                }
-                for f in &mod_fars {
-                    if !session.rules.far_ids.contains(&f.far_id) {
-                        log::warn!(
-                            "Update FAR {}: no such rule on SEID {upf_seid:#x}",
-                            f.far_id
-                        );
-                        note_first_rule_failure(
-                            &mut failure,
-                            crate::n4_build::FailedRule::Far(f.far_id),
-                        );
+                    for f in &created_fars {
+                        if own_tunnel_fars.contains(&f.far_id) {
+                            session.rules.own_tunnel_far_ids.insert(f.far_id);
+                        } else {
+                            // A re-created id that is now an ordinary FAR.
+                            session.rules.own_tunnel_far_ids.remove(&f.far_id);
+                        }
                     }
-                }
-                for q in &mod_qers {
-                    if !session.rules.qer_ids.contains(&q.qer_id) {
-                        log::warn!(
-                            "Update QER {}: no such rule on SEID {upf_seid:#x}",
-                            q.qer_id
-                        );
-                        note_first_rule_failure(
-                            &mut failure,
-                            crate::n4_build::FailedRule::Qer(q.qer_id),
-                        );
-                    }
-                }
-                for u in &mod_urrs {
-                    if !session.rules.urr_ids.contains(&u.urr_id) {
-                        log::warn!(
-                            "Update URR {}: no such rule on SEID {upf_seid:#x}",
-                            u.urr_id
-                        );
-                        note_first_rule_failure(
-                            &mut failure,
-                            crate::n4_build::FailedRule::Urr(u.urr_id),
-                        );
-                    }
-                }
-
-                for pdr_id in &key_collisions {
-                    log::warn!(
-                        "Update PDR {pdr_id} on SEID {upf_seid:#x}: its F-TEID or UE IP \
-                         address is another session's; refused"
-                    );
-                    note_first_rule_failure(
-                        &mut failure,
-                        crate::n4_build::FailedRule::Pdr(*pdr_id),
-                    );
-                }
-                // #1682: which F-TEID each PDR detects on, and the session's UE IP
-                // address, in §7.5.4's order (remove, create, update). Committed only
-                // for a modification that is accepted: a rejected one applies nothing
-                // (below), so recording its keys would refuse a later session the TEID
-                // or address this one never took.
-                if failure.is_none() {
-                    let teids = &mut session.rules.pdr_teids;
-                    for id in &removed_pdr_ids {
-                        teids.remove(id);
-                    }
-                    let pdis = created_pdrs.iter().map(|p| (p.pdr_id, &p.pdi)).chain(
-                        updated_pdrs
+                    for &(far_id, teid, ipv4) in created_tunnels.iter().chain(
+                        updated_tunnels
                             .iter()
-                            .filter_map(|u| Some((u.pdr_id, u.pdi.as_ref()?))),
-                    );
-                    for (pdr_id, pdi) in pdis {
-                        match pdi.local_f_teid.as_ref().filter(|f| !f.ch && f.teid != 0) {
-                            Some(f) => teids.insert(pdr_id, f.teid),
-                            None => teids.remove(&pdr_id),
-                        };
+                            .filter(|(id, ..)| !session.rules.own_tunnel_far_ids.contains(id)),
+                    ) {
+                        updated_dl_teid = Some(teid);
+                        updated_gnb_addr = ipv4;
+                        log::debug!("Updated downlink: FAR {far_id}, TEID={teid:#x}, gNB={ipv4:?}");
                     }
-                    for u in &updated_pdrs {
-                        if let Some(ip) = u.pdi.as_ref().and_then(update_pdr_ue_ipv4) {
-                            session.ue_ipv4 = Some(ip);
-                        }
+                    if let Some(teid) = updated_dl_teid {
+                        session.dl_teid = teid;
                     }
-                }
+                    if let Some(addr) = updated_gnb_addr {
+                        session.gnb_addr = Some(addr);
+                    }
 
-                // #321: apply the TSC containers in the SAME critical section as the
-                // rule bookkeeping, so the response's echo (IE 200) describes state
-                // that is already committed rather than state a concurrent
-                // modification could still change.
-                if !tsc_ies.is_empty() {
-                    let bridge = session.tsn_bridge.get_or_insert_with(|| {
-                        // The bridge ID is the UPF's own 5GS User Plane Node ID. The
-                        // SEID is used as its basis so it is stable per session and
-                        // distinct across sessions; a real deployment reads it from
-                        // configuration (TS 29.244 §5.26.2 says these identities "may
-                        // be pre-configured in the UPF based on deployment"), which is
-                        // a recorded ceiling rather than something to invent here.
-                        crate::context::TsnBridge::new(upf_seid.to_be_bytes())
-                    });
-                    let mut applied = 0usize;
-                    for tsc in &tsc_ies {
-                        if bridge.apply_tsc_management_information(tsc) {
-                            applied += 1;
+                    // Removing a rule the session does not hold is IDEMPOTENT SUCCESS,
+                    // deliberately: the CP function asked for the rule to be gone and it
+                    // is gone, so answering §7.5.5's rule-failure cause would fail a
+                    // modification that achieved exactly what was requested. Logged at
+                    // debug so it is visible without being an error.
+                    for id in &removed_pdr_ids {
+                        if !session.rules.pdr_ids.remove(id) {
+                            log::debug!(
+                                "Remove PDR {id}: not held by SEID {upf_seid:#x}, idempotent"
+                            );
                         }
                     }
-                    log::info!(
-                        "TSC management information applied to SEID {upf_seid:#x}: \
+                    for id in &removed_far_ids {
+                        if !session.rules.far_ids.remove(id) {
+                            log::debug!(
+                                "Remove FAR {id}: not held by SEID {upf_seid:#x}, idempotent"
+                            );
+                        }
+                    }
+                    for id in &removed_qer_ids {
+                        if !session.rules.qer_ids.remove(id) {
+                            log::debug!(
+                                "Remove QER {id}: not held by SEID {upf_seid:#x}, idempotent"
+                            );
+                        }
+                    }
+                    for id in &removed_urr_ids {
+                        if !session.rules.urr_ids.remove(id) {
+                            log::debug!(
+                                "Remove URR {id}: not held by SEID {upf_seid:#x}, idempotent"
+                            );
+                        }
+                    }
+
+                    for p in &created_pdrs {
+                        session.rules.pdr_ids.insert(p.pdr_id);
+                    }
+                    for f in &created_fars {
+                        session.rules.far_ids.insert(f.far_id);
+                    }
+                    for q in &created_qers {
+                        session.rules.qer_ids.insert(q.qer_id);
+                    }
+                    for u in &created_urrs {
+                        session.rules.urr_ids.insert(u.urr_id);
+                    }
+                    for id in &removed_srr_ids {
+                        if !session.rules.srr_ids.remove(id) {
+                            log::debug!(
+                                "Remove SRR {id}: not held by SEID {upf_seid:#x}, idempotent"
+                            );
+                        }
+                    }
+                    for r in &created_srrs {
+                        session.rules.srr_ids.insert(r.srr_id);
+                    }
+                    for r in &mod_srrs {
+                        if !session.rules.srr_ids.contains(&r.srr_id) {
+                            log::warn!(
+                                "Update SRR {}: no such rule on SEID {upf_seid:#x}",
+                                r.srr_id
+                            );
+                            note_first_rule_failure(
+                                &mut failure,
+                                crate::n4_build::FailedRule::Srr(r.srr_id),
+                            );
+                        }
+                    }
+
+                    // Updating a rule the session does NOT hold is a different case from
+                    // removing one: the new threshold, gate or forwarding action has
+                    // nowhere to land, so the CP function's intent is not satisfied and
+                    // §7.5.5's Rule creation/modification Failure is the truthful answer.
+                    // Ignoring it is precisely the "accepted a modification it did not
+                    // apply" defect this issue is about.
+                    for p in &updated_pdrs {
+                        if !session.rules.pdr_ids.contains(&p.pdr_id) {
+                            log::warn!(
+                                "Update PDR {}: no such rule on SEID {upf_seid:#x}",
+                                p.pdr_id
+                            );
+                            note_first_rule_failure(
+                                &mut failure,
+                                crate::n4_build::FailedRule::Pdr(p.pdr_id),
+                            );
+                        }
+                    }
+                    for f in &mod_fars {
+                        if !session.rules.far_ids.contains(&f.far_id) {
+                            log::warn!(
+                                "Update FAR {}: no such rule on SEID {upf_seid:#x}",
+                                f.far_id
+                            );
+                            note_first_rule_failure(
+                                &mut failure,
+                                crate::n4_build::FailedRule::Far(f.far_id),
+                            );
+                        }
+                    }
+                    for q in &mod_qers {
+                        if !session.rules.qer_ids.contains(&q.qer_id) {
+                            log::warn!(
+                                "Update QER {}: no such rule on SEID {upf_seid:#x}",
+                                q.qer_id
+                            );
+                            note_first_rule_failure(
+                                &mut failure,
+                                crate::n4_build::FailedRule::Qer(q.qer_id),
+                            );
+                        }
+                    }
+                    for u in &mod_urrs {
+                        if !session.rules.urr_ids.contains(&u.urr_id) {
+                            log::warn!(
+                                "Update URR {}: no such rule on SEID {upf_seid:#x}",
+                                u.urr_id
+                            );
+                            note_first_rule_failure(
+                                &mut failure,
+                                crate::n4_build::FailedRule::Urr(u.urr_id),
+                            );
+                        }
+                    }
+
+                    // #1682: which F-TEID each PDR detects on, and the session's UE IP
+                    // address, in §7.5.4's order (remove, create, update). Committed only
+                    // for a modification that is accepted: a rejected one applies nothing
+                    // (below), so recording its keys would refuse a later session the TEID
+                    // or address this one never took.
+                    if failure.is_none() {
+                        let teids = &mut session.rules.pdr_teids;
+                        for id in &removed_pdr_ids {
+                            teids.remove(id);
+                        }
+                        let pdis = created_pdrs.iter().map(|p| (p.pdr_id, &p.pdi)).chain(
+                            updated_pdrs
+                                .iter()
+                                .filter_map(|u| Some((u.pdr_id, u.pdi.as_ref()?))),
+                        );
+                        for (pdr_id, pdi) in pdis {
+                            match pdi.local_f_teid.as_ref().filter(|f| !f.ch && f.teid != 0) {
+                                Some(f) => teids.insert(pdr_id, f.teid),
+                                None => teids.remove(&pdr_id),
+                            };
+                        }
+                        for u in &updated_pdrs {
+                            if let Some(ip) = u.pdi.as_ref().and_then(update_pdr_ue_ipv4) {
+                                session.ue_ipv4 = Some(ip);
+                            }
+                        }
+                    }
+
+                    // #321: apply the TSC containers in the SAME critical section as the
+                    // rule bookkeeping, so the response's echo (IE 200) describes state
+                    // that is already committed rather than state a concurrent
+                    // modification could still change.
+                    if !tsc_ies.is_empty() {
+                        let bridge = session.tsn_bridge.get_or_insert_with(|| {
+                            // The bridge ID is the UPF's own 5GS User Plane Node ID. The
+                            // SEID is used as its basis so it is stable per session and
+                            // distinct across sessions; a real deployment reads it from
+                            // configuration (TS 29.244 §5.26.2 says these identities "may
+                            // be pre-configured in the UPF based on deployment"), which is
+                            // a recorded ceiling rather than something to invent here.
+                            crate::context::TsnBridge::new(upf_seid.to_be_bytes())
+                        });
+                        let mut applied = 0usize;
+                        for tsc in &tsc_ies {
+                            if bridge.apply_tsc_management_information(tsc) {
+                                applied += 1;
+                            }
+                        }
+                        log::info!(
+                            "TSC management information applied to SEID {upf_seid:#x}: \
                          {applied}/{} IE(s), bridge now holds {} port(s)",
-                        tsc_ies.len(),
-                        bridge.port_count()
-                    );
+                            tsc_ies.len(),
+                            bridge.port_count()
+                        );
+                    }
                 }
 
                 Some((
@@ -8286,6 +8305,102 @@ mod tests {
         )
         .await;
         assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+    }
+
+    /// **#1682 review M1.** A colliding Update PDR refuses the WHOLE modification
+    /// at the PFCP layer too (TS 29.244 §6.3.3): the Remove PDR 2, Create PDR 3,
+    /// Remove FAR 2 and Update FAR 1 tunnel sent with it change none of B's rule
+    /// IDs or its downlink tunnel, matching the data plane, which is untouched. So
+    /// B's next Update PDR 2 is accepted, as the data plane still holds PDR 2.
+    ///
+    /// REVERT-VERIFIED: with the bookkeeping written before the collision is
+    /// noted (as at 10b7a6ff), PDR 2 is gone from `rules.pdr_ids` while the data
+    /// plane still holds it, and the follow-up Update PDR 2 is refused.
+    #[tokio::test]
+    async fn a_colliding_update_pdr_applies_nothing_at_the_pfcp_layer_1682() {
+        let (server, smf, addr, mut rx) = spawn_test_server().await;
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        let assoc = build_association_setup_request_payload(Some(1));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        let (ue_a, ue_b) = (Ipv4Addr::new(10, 45, 0, 42), Ipv4Addr::new(10, 45, 0, 43));
+        let _a = establish_1682(&smf, addr, &mut rx, &dp, 0xA, 0x1234, ue_a).await;
+        let b = establish_1682(&smf, addr, &mut rx, &dp, 0xB, 0x2345, ue_b).await;
+        let before = {
+            let s = server.sessions.read().await;
+            let r = &s[&b].rules;
+            (
+                r.pdr_ids.clone(),
+                r.far_ids.clone(),
+                s[&b].dl_teid,
+                s[&b].gnb_addr,
+            )
+        };
+
+        let mut upd = crate::n4_build::PfcpMessageBuilder::new();
+        upd.add_pdr_id(1);
+        upd.add_tlv(
+            pfcp_ie::PDI,
+            &pdi_1682(0, Some(f_teid_1682(0x1234)), Some(ue_b)),
+        );
+        let mut pdr3 = crate::n4_build::PfcpMessageBuilder::new();
+        pdr3.add_pdr_id(3);
+        pdr3.add_u32(pfcp_ie::PRECEDENCE, 300);
+        pdr3.add_tlv(pfcp_ie::PDI, &pdi_1682(1, None, Some(ue_b)));
+        pdr3.add_u32(pfcp_ie::FAR_ID, 1);
+        let mut m = crate::n4_build::PfcpMessageBuilder::new();
+        m.add_tlv(pfcp_ie::REMOVE_PDR, &remove_body_u16(2));
+        m.add_tlv(pfcp_ie::REMOVE_FAR, &remove_body_u32(pfcp_ie::FAR_ID, 2));
+        m.add_tlv(pfcp_ie::CREATE_PDR, &pdr3.build());
+        m.add_tlv(
+            pfcp_ie::UPDATE_FAR,
+            &forwarding_far(1, Some((0x7777, [127, 0, 0, 77])), true),
+        );
+        m.add_tlv(pfcp_ie::UPDATE_PDR, &upd.build());
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(b), 10, &m.build())).await;
+        assert_eq!(
+            (response_cause(&resp), failed_rule_id(&resp)),
+            (
+                PfcpCause::RuleCreationModificationFailure as u8,
+                Some(vec![0x00, 0x00, 0x01])
+            ),
+            "refused, naming the colliding PDR 1"
+        );
+        assert!(rx.try_recv().is_err(), "nothing reaches the data plane");
+
+        let after = {
+            let s = server.sessions.read().await;
+            let r = &s[&b].rules;
+            (
+                r.pdr_ids.clone(),
+                r.far_ids.clone(),
+                s[&b].dl_teid,
+                s[&b].gnb_addr,
+            )
+        };
+        assert_eq!(
+            after, before,
+            "B's PFCP rule IDs and downlink tunnel unchanged"
+        );
+        assert!(
+            after.0.contains(&2) && !after.0.contains(&3),
+            "PDR 2 still held and PDR 3 not created: {:?}",
+            after.0
+        );
+
+        // The two layers agree, so B can still manage PDR 2.
+        let mut upd2 = crate::n4_build::PfcpMessageBuilder::new();
+        upd2.add_pdr_id(2);
+        upd2.add_u32(pfcp_ie::PRECEDENCE, 210);
+        let mut m = crate::n4_build::PfcpMessageBuilder::new();
+        m.add_tlv(pfcp_ie::UPDATE_PDR, &upd2.build());
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(b), 11, &m.build())).await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::RequestAccepted as u8,
+            "Update PDR 2 after the refused modification"
+        );
     }
 
     /// **#1682.** The keys follow the move, in both layers: after session A moves
