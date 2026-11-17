@@ -14129,56 +14129,65 @@ impl NgapServer {
         }
     }
 
-    /// Start mobile-reachable supervision for a registered UE whose N1 connection was
-    /// just released (TS 24.501 §5.3.7).
+    /// A registered UE's N1 connection was just released: report CM-IDLE, and start
+    /// its mobile-reachable supervision (TS 24.501 §5.3.7) when the timer is
+    /// configured.
+    ///
+    /// #1701: the CM-IDLE report does not depend on the timer. TS 29.518 §6.2
+    /// (`29518-k00.txt:24011-24017`) reports "updated connection management state of
+    /// a UE ... when AMF becomes aware of a connection management state change", and
+    /// a disabled timer (`AMF_MOBILE_REACHABLE_SECS=0`) changes nothing about the
+    /// release. Before #1701 the report fired only once the timer was armed, so with
+    /// the timer off a subscriber never heard IDLE.
     async fn start_reachability_supervision(&mut self, amf_ue_ngap_id: u64) {
-        let Some(config) = self.timer_configs.get(AmfTimerId::MobileReachable).cloned() else {
-            return;
+        let timer = match self.timer_configs.get(AmfTimerId::MobileReachable) {
+            Some(config) if config.enabled => Some(config.duration),
+            Some(_) => {
+                log::debug!("Mobile reachable timer disabled by configuration; not supervising");
+                None
+            }
+            None => None,
         };
-        if !config.enabled {
-            log::debug!("Mobile reachable timer disabled by configuration; not supervising");
-            return;
-        }
-        let targets = [amf_ue_ngap_id];
-        let deadline = Instant::now() + config.duration;
-        for amf_ue_ngap_id in targets {
-            // Await-free, so the arming happens under one lock acquisition: a
-            // get-then-write-back would leave a window in which a release lands and
-            // the timer is re-armed on a UE that no longer exists.
-            let armed = self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
-                if !state.registered {
-                    // An unregistered UE has no context worth supervising; the
-                    // release already disposed of it.
-                    return false;
-                }
+        let deadline = timer.map(|d| Instant::now() + d);
+        // Await-free, so the arming happens under one lock acquisition: a
+        // get-then-write-back would leave a window in which a release lands and the
+        // timer is re-armed on a UE that no longer exists.
+        let registered = self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
+            if !state.registered {
+                // An unregistered UE has no context worth supervising or reporting;
+                // the release already disposed of it.
+                return false;
+            }
+            if let Some(deadline) = deadline {
                 state.reachability = Some(Reachability {
                     phase: ReachabilityPhase::MobileReachable,
                     deadline,
                 });
                 state.mobile_reachable_expired = false;
-                true
-            });
-            if armed == Some(true) {
-                log::info!(
-                    "Mobile reachable timer started for UE {amf_ue_ngap_id} ({:?}) after N1 \
-                     release (TS 24.501 §5.3.7)",
-                    config.duration
-                );
-                // #74 criterion 5: CONNECTIVITY_STATE_REPORT for the
-                // CM-CONNECTED -> CM-IDLE half. The N1 signalling connection is gone,
-                // which is the "connection management state change" of TS 29.518 §6.2;
-                // its counterpart (IDLE -> CONNECTED on a Service Request) fires from
-                // `gmm_handler::handle_service_request`. Read from the record rather
-                // than reconstructed, so the report carries the UE's real identities.
-                // #1645 (the R5 #1624 round-3 MINOR): through the per-subscription
-                // change gate, so a connection that ends before its CONNECTED was
-                // reported (a release racing the Service Request's SMF answers) tells a
-                // subscriber that last heard IDLE nothing: never IDLE with no CONNECTED
-                // before it.
-                if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
-                    crate::namf_server::fire_connectivity_state_report(&state.amf_ue, false);
-                }
             }
+            true
+        });
+        if registered != Some(true) {
+            return;
+        }
+        if let Some(duration) = timer {
+            log::info!(
+                "Mobile reachable timer started for UE {amf_ue_ngap_id} ({duration:?}) after N1 \
+                 release (TS 24.501 §5.3.7)"
+            );
+        }
+        // #74 criterion 5: CONNECTIVITY_STATE_REPORT for the CM-CONNECTED -> CM-IDLE
+        // half. The N1 signalling connection is gone, which is the "connection
+        // management state change" of TS 29.518 §6.2; its counterpart (IDLE ->
+        // CONNECTED on a Service Request) fires from
+        // `gmm_handler::handle_service_request`. Read from the record rather than
+        // reconstructed, so the report carries the UE's real identities.
+        // #1645 (the R5 #1624 round-3 MINOR): through the per-subscription change
+        // gate, so a connection that ends before its CONNECTED was reported (a release
+        // racing the Service Request's SMF answers) tells a subscriber that last heard
+        // IDLE nothing: never IDLE with no CONNECTED before it.
+        if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
+            crate::namf_server::fire_connectivity_state_report(&state.amf_ue, false);
         }
     }
 
@@ -43027,6 +43036,122 @@ mod tests {
                 ngap.ue_auth_state.remove(id);
             }
         }
+    }
+
+    /// **#1701**, TS 29.518 §6.2 (`29518-k00.txt:24011-24017`): with the mobile
+    /// reachable timer disabled by configuration (`AMF_MOBILE_REACHABLE_SECS=0`), a UE
+    /// Context Release Complete for a connected, registered UE still reports CM-IDLE,
+    /// exactly once, to a CONNECTIVITY_STATE_REPORT subscriber. A duplicate Complete
+    /// reports nothing more, and no supervision is armed. An unregistered UE is
+    /// neither supervised nor reported.
+    ///
+    /// REVERT-VERIFIED: with the report inside the timer-armed branch again (main),
+    /// no IDLE report arrives; without the `registered` check, the unregistered UE
+    /// reports IDLE.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_idle_report_does_not_need_the_mobile_reachable_timer_1701() {
+        // #1588: the release path reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        ngap.timer_configs.mobile_reachable.enabled = false;
+        let (assoc, id, ran) = (17_010u64, 17_010_001u64, 1_701u32);
+        let supi = "imsi-001010000017010";
+        let mut ue = UeNasContext::new(id, ran, assoc, false);
+        ue.registered = true;
+        ue.amf_ue.security_context_available = true;
+        ue.amf_ue.supi = Some(supi.to_string());
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_publish(&ue.amf_ue, ran, assoc);
+        }
+        ngap.ue_auth_state.insert(id, ue);
+
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (sink, port, mut rx) = notify_sink().await;
+        let resp = crate::namf_server::namf_request_handler(
+            nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&serde_json::json!({ "subscription": {
+                    "eventList": [{ "type": "CONNECTIVITY_STATE_REPORT" }],
+                    "eventNotifyUri": format!("http://127.0.0.1:{port}/notify/1701"),
+                    "notifyCorrelationId": "corr-1701",
+                    "nfId": "3fa85f64-5717-4562-b3fc-2c963f661701",
+                    "supi": supi,
+                }}))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let subscription = crate::namf_server::EventSubscriptionGuard::of(&resp);
+
+        let deliveries = crate::namf_server::connectivity_deliveries_on_this_thread();
+        ngap.handle_ue_context_release_complete(assoc, &release_complete_pdu(id, Some(ran)))
+            .await
+            .expect("handled");
+        let state = ngap.ue_auth_state.get(id).expect("the UE stays registered");
+        assert!(state.is_cm_idle(), "the release took the UE to CM-IDLE");
+        assert!(
+            state.reachability.is_none(),
+            "the timer is off: nothing armed"
+        );
+        assert_eq!(
+            crate::namf_server::connectivity_deliveries_on_this_thread() - deliveries,
+            1,
+            "one IDLE delivery"
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let idle = loop {
+            let body = tokio::time::timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                rx.recv(),
+            )
+            .await
+            .expect("a CONNECTIVITY_STATE_REPORT after the release")
+            .expect("channel closed");
+            let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+            let report = &v["reportList"][0];
+            if report["type"] == "CONNECTIVITY_STATE_REPORT"
+                && report["cmInfoList"][0]["cmState"] == "IDLE"
+            {
+                break v;
+            }
+        };
+        assert_eq!(idle["reportList"][0]["supi"], supi, "{idle}");
+
+        // A duplicate Complete: the UE is already idle, nothing more is reported.
+        let deliveries = crate::namf_server::connectivity_deliveries_on_this_thread();
+        ngap.handle_ue_context_release_complete(assoc, &release_complete_pdu(id, Some(ran)))
+            .await
+            .expect("handled");
+        assert_eq!(
+            crate::namf_server::connectivity_deliveries_on_this_thread(),
+            deliveries,
+            "no second IDLE"
+        );
+        // A UE that is not registered (mid-registration) is neither supervised nor
+        // reported, timer or not.
+        ngap.ue_auth_state.with_mut(id, |s| {
+            s.registered = false;
+            s.cm_idle = false;
+        });
+        ngap.timer_configs.mobile_reachable.enabled = true;
+        let calls = crate::namf_server::idle_reports_on_this_thread();
+        ngap.start_reachability_supervision(id).await;
+        assert_eq!(
+            crate::namf_server::idle_reports_on_this_thread(),
+            calls,
+            "an unregistered UE reports no IDLE"
+        );
+        assert!(ngap.ue_auth_state.get(id).unwrap().reachability.is_none());
+        let amf_ue_id = ngap.ue_auth_state.remove(id).expect("the UE").amf_ue.id;
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_unpublish(amf_ue_id);
+        }
+        drop(subscription);
+        sink.stop().await.expect("sink stop");
     }
 
     /// **#923.** The gNB asks for a UE's release; the AMF's UE Context Release
