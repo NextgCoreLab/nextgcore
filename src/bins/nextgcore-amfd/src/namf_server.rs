@@ -2662,6 +2662,8 @@ fn parse_location_filters(event: &Value) -> Vec<String> {
 
 /// Fire a REGISTRATION_STATE_REPORT (REGISTERED / DEREGISTERED)
 pub fn fire_registration_state_report(ue: &AmfUe, registered: bool) {
+    #[cfg(test)]
+    REGISTRATION_STATE_REPORTS_ON_THIS_THREAD.with(|c| c.set(c.get() + 1));
     fire_ue_event(
         ue,
         "REGISTRATION_STATE_REPORT",
@@ -3598,6 +3600,19 @@ pub(crate) fn failure_notifications_on_this_thread() -> u64 {
 thread_local! {
     static REACHABILITY_REPORTS_ON_THIS_THREAD: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
+}
+
+// Test-only (#1700): REGISTRATION_STATE_REPORT fires on this thread.
+#[cfg(test)]
+thread_local! {
+    static REGISTRATION_STATE_REPORTS_ON_THIS_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: [`fire_registration_state_report`] calls on this thread so far.
+#[cfg(test)]
+pub(crate) fn registration_state_reports_on_this_thread() -> u64 {
+    REGISTRATION_STATE_REPORTS_ON_THIS_THREAD.with(std::cell::Cell::get)
 }
 
 /// Test-only: REACHABILITY_REPORT notifications spawned on this thread so far.
