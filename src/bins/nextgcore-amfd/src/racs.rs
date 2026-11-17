@@ -993,11 +993,28 @@ pub async fn ucmf_assign(tac: &str, capability: &[u8]) -> Result<Vec<u8>, String
     Ok(id)
 }
 
-/// The callback the UCMF notifies (TS 29.673 §5.2.2.4). Routed by `namf_server`.
+/// The token in this AMF's `ucmfNotificationUri` (#1518): one per process, since
+/// the AMF subscribes once at start-up and the subscription is not persisted.
+static UCMF_NOTIFY_TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn ucmf_notify_token() -> &'static str {
+    UCMF_NOTIFY_TOKEN.get_or_init(crate::sbi_path::new_callback_token)
+}
+
+/// Whether `token` is this AMF's `ucmfNotificationUri` token (#1518), compared in
+/// constant time.
+pub fn holds_ucmf_notify_token(token: &str) -> bool {
+    nextgcore_sbi::callback_auth::token_eq(ucmf_notify_token(), token)
+}
+
+/// The callback the UCMF notifies (TS 29.673 §5.2.2.4), ending in
+/// [`UCMF_NOTIFY_TOKEN`] (#1518). Routed by `namf_server` at
+/// `POST /namf-callback/v1/ucmf-notify/{token}`.
 pub fn notification_uri() -> String {
     format!(
-        "{}/namf-callback/v1/ucmf-notify",
-        crate::sbi_path::advertised_sbi_base()
+        "{}/namf-callback/v1/ucmf-notify/{}",
+        crate::sbi_path::advertised_sbi_base(),
+        ucmf_notify_token()
     )
 }
 

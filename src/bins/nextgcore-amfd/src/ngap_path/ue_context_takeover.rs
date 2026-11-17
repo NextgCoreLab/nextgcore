@@ -410,7 +410,11 @@ impl NgapServer {
         let pcf = self.pcf_for_takeover();
         if let Some(pol_asso_id) = state.policy_association_id.clone() {
             let (uri, guami, pcf) = (
-                crate::sbi_path::am_policy_notification_uri(&supi),
+                // #1518: the association's token, restored with it.
+                crate::sbi_path::am_policy_notification_uri(
+                    &supi,
+                    state.amf_ue.policy_association.notify_token.as_deref(),
+                ),
                 guami.clone(),
                 pcf.clone(),
             );
@@ -436,7 +440,10 @@ impl NgapServer {
             });
         }
         if let Some(pol_asso_id) = state.ue_policy_association_id.clone() {
-            let uri = crate::sbi_path::ue_policy_notification_uri(&supi);
+            let uri = crate::sbi_path::ue_policy_notification_uri(
+                &supi,
+                state.amf_ue.ue_policy_association.notify_token.as_deref(),
+            );
             self.sbi_offload.spawn(async move {
                 let (host, port) = takeover_pcf(pcf).await;
                 if let Err(e) = crate::sbi_path::retry_peer_update("UE policy update", || {
@@ -519,7 +526,11 @@ impl NgapServer {
         for (psi, sm_ref, host, port) in self.ue_sm_contexts(amf_ue_ngap_id) {
             let serving = serde_json::json!({
                 "servingNfId": instance,
-                "smContextStatusUri": crate::sbi_path::sm_context_status_uri(&supi, psi),
+                "smContextStatusUri": crate::sbi_path::sm_context_status_uri(
+                    &supi,
+                    psi,
+                    state.amf_ue.sm_context_status_token.as_deref(),
+                ),
                 "guami": {
                     "plmnId": { "mcc": guami_mcc, "mnc": guami_mnc },
                     "amfId": amf_id_hex,

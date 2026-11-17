@@ -182,6 +182,10 @@ pub struct StoredUeContext {
     pub assigned_ebis: Vec<AssignedEbi>,
     /// The token of the UE's current UECM registration's `deregCallbackUri` (#753).
     pub uecm_dereg_token: Option<String>,
+    /// The token of the UE's `smContextStatusUri`s (#1518). Absent in a record
+    /// written before #1518.
+    #[serde(default)]
+    pub sm_context_status_token: Option<String>,
     pub sdm_subscription_id: Option<String>,
     pub policy_association: PolicyAssociation,
     pub ue_policy_association: PolicyAssociation,
@@ -729,6 +733,7 @@ impl NgapServer {
             ue_radio_capability_id_known_to_ue: ue.ue_radio_capability_id_known_to_ue,
             assigned_ebis: ue.assigned_ebis.clone(),
             uecm_dereg_token: ue.uecm_dereg_token.clone(),
+            sm_context_status_token: ue.sm_context_status_token.clone(),
             sdm_subscription_id: state.sdm_subscription_id.clone(),
             policy_association: ue.policy_association.clone(),
             ue_policy_association: ue.ue_policy_association.clone(),
@@ -1082,6 +1087,7 @@ fn restored_ue(amf_ue_ngap_id: u64, rec: &StoredUeContext) -> Option<UeNasContex
     ue.ue_radio_capability_id_known_to_ue = rec.ue_radio_capability_id_known_to_ue;
     ue.assigned_ebis = rec.assigned_ebis.clone();
     ue.uecm_dereg_token = rec.uecm_dereg_token.clone();
+    ue.sm_context_status_token = rec.sm_context_status_token.clone();
     ue.policy_association = rec.policy_association.clone();
     ue.ue_policy_association = rec.ue_policy_association.clone();
     state.suci = rec.suci.clone();

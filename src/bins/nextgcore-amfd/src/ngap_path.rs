@@ -6189,18 +6189,29 @@ impl NgapServer {
         )
         .await
         .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
+        // #1518: the callback tokens of this UE context. The smContextStatusUri
+        // token is minted once and kept, so the URIs the SMFs hold for the UE's
+        // sessions stay valid across its re-registrations; an AM policy
+        // association gets its own token for its notificationUri.
+        state
+            .amf_ue
+            .sm_context_status_token
+            .get_or_insert_with(crate::sbi_path::new_callback_token);
+        let am_policy_token = crate::sbi_path::new_callback_token();
         match crate::sbi_path::call_pcf_am_policy_create(
             &pcf_host,
             pcf_port,
             &supi,
             &serving_mcc,
             &serving_mnc,
+            &am_policy_token,
         )
         .await
         {
             Ok(assoc) => {
                 state.policy_association_id = Some(assoc.clone());
                 state.amf_ue.policy_association.id = Some(assoc);
+                state.amf_ue.policy_association.notify_token = Some(am_policy_token);
             }
             Err(e) => {
                 log::error!("[{supi}] Npcf_AMPolicyControl_Create failed: {e}");
@@ -7286,6 +7297,8 @@ impl NgapServer {
         .await
         .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
 
+        // #1518: the association's own notificationUri token.
+        let ue_policy_token = crate::sbi_path::new_callback_token();
         match crate::sbi_path::call_pcf_ue_policy_create(
             &pcf_host,
             pcf_port,
@@ -7296,6 +7309,7 @@ impl NgapServer {
             &guami_mnc,
             &amf_id_hex,
             ue_policy_container.as_deref(),
+            &ue_policy_token,
         )
         .await
         {
@@ -7312,6 +7326,7 @@ impl NgapServer {
                 self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
                     state.ue_policy_association_id = Some(assoc.clone());
                     state.amf_ue.ue_policy_association.id = Some(assoc);
+                    state.amf_ue.ue_policy_association.notify_token = Some(ue_policy_token);
                 });
             }
             Err(e) => log::warn!(
@@ -20518,6 +20533,7 @@ fn build_sm_context_identity(
         });
     crate::sbi_path::SmContextIdentity {
         supi: state.and_then(|s| s.amf_ue.supi.clone()),
+        sm_context_status_token: state.and_then(|s| s.amf_ue.sm_context_status_token.clone()),
         pei: state.and_then(|s| s.amf_ue.pei.clone()),
         guami,
         serving_plmn,

@@ -51,12 +51,77 @@ const NOTIFY_REQUEST_TIMEOUT_SECS: u64 = 3;
 /// verified mutual-TLS identity (#1522, [`dereg_notify_from_the_udm`]). The token
 /// travels in the UECM registration's `deregCallbackUri`, which any Nudm_UECM Get
 /// consumer can read, so it does not by itself show that the sender is the UDM.
-/// Without a verified UDM client certificate it stays bearer-protected, like the
-/// routes that carry no token (`ucmf-notify`, `sm-context-status`,
-/// `ue-policy-notify`, `am-policy-notify`, #1518).
+/// Without a verified UDM client certificate it stays bearer-protected.
+///
+/// #1518: the other notification URIs this AMF hands out end in a token it minted
+/// for them, followed by the operation the PCF appends:
+/// - `ucmf-notify/{token}` and `am-policy-notify/{token}/{update,terminate}` are
+///   admitted on the token alone: only the UCMF and the PCF of the association are
+///   given them, and neither serves them back (ucmfd has no GET of a subscription,
+///   and the AM policy GET does not echo the request);
+/// - `ue-policy-notify/{token}[/{update,terminate}]` and
+///   `{psi}/sm-context-status/{token}` are, like `dereg-notify`, readable by other
+///   consumers (the UE policy association GET returns the request, TS 29.525
+///   `PolicyAssociation.request`; the SMF's SM context retrieval returns
+///   `smContextStatusUri`). They are admitted only together with the verified
+///   mutual-TLS certificate of a PCF, resp. an SMF (RFC 9310 NFTypes, TS 33.310
+///   §6.1.3c.3), as [`dereg_notify_from_the_udm`] is.
+///
+/// The token-less URIs of associations and sessions made before #1518 stay
+/// bearer-protected.
 pub fn oauth2_callback_exemptions() -> Vec<nextgcore_sbi::server::OAuth2CallbackExemption> {
     use nextgcore_sbi::server::OAuth2CallbackExemption;
+    let am_policy = |op: &str| {
+        OAuth2CallbackExemption::new(
+            "POST",
+            format!("/namf-callback/v1/{{var}}/am-policy-notify/{{token}}/{op}"),
+            |cb| match cb.vars.as_slice() {
+                [supi] => {
+                    holds_callback_token(supi, cb.token, |ue| &ue.policy_association.notify_token)
+                }
+                _ => false,
+            },
+        )
+    };
+    let ue_policy = |suffix: &str| {
+        OAuth2CallbackExemption::for_verified_peer(
+            "POST",
+            format!("/namf-callback/v1/{{var}}/ue-policy-notify/{{token}}{suffix}"),
+            |cb, peer| async move {
+                let [supi] = cb.vars.as_slice() else {
+                    return false;
+                };
+                peer.has_nf_type("PCF")
+                    && holds_callback_token(supi, &cb.token, |ue| {
+                        &ue.ue_policy_association.notify_token
+                    })
+            },
+        )
+    };
     vec![
+        // Nucmf_UECapabilityManagement Notify (TS 29.673 §5.2.2.4), #1518.
+        OAuth2CallbackExemption::new("POST", "/namf-callback/v1/ucmf-notify/{token}", |cb| {
+            crate::racs::holds_ucmf_notify_token(cb.token)
+        }),
+        // Npcf_AMPolicyControl_UpdateNotify (TS 29.507 §4.2.4), #1518.
+        am_policy("update"),
+        am_policy("terminate"),
+        // Npcf_UEPolicyControl_UpdateNotify (TS 29.525 §4.2.4), #1518.
+        ue_policy(""),
+        ue_policy("/update"),
+        ue_policy("/terminate"),
+        // Nsmf_PDUSession SmContextStatusNotify (TS 29.502 §5.2.2.6), #1518.
+        OAuth2CallbackExemption::for_verified_peer(
+            "POST",
+            "/namf-callback/v1/{var}/{var}/sm-context-status/{token}",
+            |cb, peer| async move {
+                let [supi, _psi] = cb.vars.as_slice() else {
+                    return false;
+                };
+                peer.has_nf_type("SMF")
+                    && holds_callback_token(supi, &cb.token, |ue| &ue.sm_context_status_token)
+            },
+        ),
         // NFStatusNotify (#940): the token names one of this AMF's NRF subscriptions.
         OAuth2CallbackExemption::new(
             "POST",
@@ -367,10 +432,11 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
         //   POST /namf-callback/v1/{supi}/dereg-notify
         // --------------------------------------------------------------
         // Namf_Callback: Nucmf_UECapabilityManagement Notify (#570, TS 29.673
-        // §5.2.2.4), POSTed to the ucmfNotificationUri the AMF subscribed with.
-        //   POST /namf-callback/v1/ucmf-notify
-        "namf-callback" if parts.len() == 3 && parts[2] == "ucmf-notify" && method == "POST" => {
-            handle_ucmf_notify_callback(&request)
+        // §5.2.2.4), POSTed to the ucmfNotificationUri the AMF subscribed with,
+        // which ends in this AMF's token (#1518).
+        //   POST /namf-callback/v1/ucmf-notify/{token}
+        "namf-callback" if parts.len() == 4 && parts[2] == "ucmf-notify" && method == "POST" => {
+            handle_ucmf_notify_callback(parts[3], &request)
         }
         // Namf_Callback: Nnrf_NFManagement NFStatusNotify (#668, TS 29.510
         // §5.2.2.6), POSTed to the nfStatusNotificationUri of the AMF's
@@ -395,11 +461,18 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
         // Namf_Callback: Nsmf_PDUSession SmContextStatusNotification (#540,
         // TS 29.502 §5.2.2.6), POSTed to the smContextStatusUri the AMF gave at
         // CreateSMContext. A RELEASED status drops the AMF's session record.
-        //   POST /namf-callback/v1/{supi}/sm-context-status/{psi}
+        //   POST /namf-callback/v1/{supi}/{psi}/sm-context-status/{token}  (#1518)
+        //   POST /namf-callback/v1/{supi}/sm-context-status/{psi}          (URIs given
+        //                                                                 before #1518)
+        "namf-callback"
+            if parts.len() == 6 && parts[4] == "sm-context-status" && method == "POST" =>
+        {
+            handle_sm_context_status_callback(parts[2], parts[3], Some(parts[5]), &request)
+        }
         "namf-callback"
             if parts.len() == 5 && parts[3] == "sm-context-status" && method == "POST" =>
         {
-            handle_sm_context_status_callback(parts[2], parts[4], &request)
+            handle_sm_context_status_callback(parts[2], parts[4], None, &request)
         }
 
         // --------------------------------------------------------------
@@ -411,15 +484,24 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
         // (`sbi_path::ue_policy_notification_uri`). Before #92 this path was
         // unrouted and fell to the 404 arm below, so the PCF's notification had
         // nowhere to land even once the PCF started sending it.
-        //   POST /namf-callback/v1/{supi}/ue-policy-notify/{update|terminate}
-        //   POST /namf-callback/v1/{supi}/ue-policy-notify
+        //   POST /namf-callback/v1/{supi}/ue-policy-notify/{token}[/{update|terminate}]
+        //   POST /namf-callback/v1/{supi}/ue-policy-notify[/{update|terminate}]
+        // The second, token-less shape is the URI of an association created before
+        // #1518. A token is never "update" or "terminate" (it is 32 hex digits).
         // --------------------------------------------------------------
         "namf-callback"
             if method == "POST"
-                && (4..=5).contains(&parts.len())
+                && (4..=6).contains(&parts.len())
                 && parts[3] == "ue-policy-notify" =>
         {
-            handle_ue_policy_notify_callback(parts[2], parts.get(4).copied(), &request)
+            let (token, operation) = match parts.get(4..).unwrap_or_default() {
+                [] => (None, None),
+                [op @ ("update" | "terminate")] => (None, Some(*op)),
+                [token] => (Some(*token), None),
+                [token, op] => (Some(*token), Some(*op)),
+                _ => (None, None),
+            };
+            handle_ue_policy_notify_callback(parts[2], token, operation, &request)
         }
 
         // --------------------------------------------------------------
@@ -427,12 +509,19 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
         // The PCF POSTs a PolicyUpdate to `{notificationUri}/update` (§4.2.4.2) or a
         // TerminationNotification to `{notificationUri}/terminate` (§4.2.4.3), where
         // `notificationUri` is `sbi_path::am_policy_notification_uri`.
-        //   POST /namf-callback/v1/{supi}/am-policy-notify/{update|terminate}
+        //   POST /namf-callback/v1/{supi}/am-policy-notify/{token}/{update|terminate}
+        //   POST /namf-callback/v1/{supi}/am-policy-notify/{update|terminate}  (before
+        //                                                                    #1518)
         // --------------------------------------------------------------
+        "namf-callback"
+            if method == "POST" && parts.len() == 6 && parts[3] == "am-policy-notify" =>
+        {
+            handle_am_policy_notify_callback(parts[2], Some(parts[4]), parts[5], &request)
+        }
         "namf-callback"
             if method == "POST" && parts.len() == 5 && parts[3] == "am-policy-notify" =>
         {
-            handle_am_policy_notify_callback(parts[2], parts[4], &request)
+            handle_am_policy_notify_callback(parts[2], None, parts[4], &request)
         }
 
         // --------------------------------------------------------------
@@ -648,7 +737,12 @@ fn parse_dereg_reason(s: &str) -> Option<DeregistrationReason> {
 /// Deleted and out-of-version IDs are retired, so they leave NGAP and the UEs holding
 /// them get the deletion indication at their next registration or UE configuration
 /// update (TS 24.501 §5.4.4.1 f).
-fn handle_ucmf_notify_callback(request: &SbiRequest) -> SbiResponse {
+fn handle_ucmf_notify_callback(token: &str, request: &SbiRequest) -> SbiResponse {
+    // #1518: only to the URI this AMF subscribed with.
+    if !crate::racs::holds_ucmf_notify_token(token) {
+        log::warn!("UCMF notification on a callback token this AMF does not hold; refused");
+        return SbiResponse::with_status(404);
+    }
     let Some(body) = parse_json_body(request) else {
         return malformed_body();
     };
@@ -817,7 +911,21 @@ fn handle_dereg_notify_callback(
 /// SmContextStatusNotification (TS 29.502 §6.1.6.2.6) for PDU session `psi` of
 /// `supi` (#540): acknowledged with 204; a `RELEASED` resource status removes
 /// the AMF's record of the session.
-fn handle_sm_context_status_callback(supi: &str, psi: &str, request: &SbiRequest) -> SbiResponse {
+///
+/// #1518: on the tokened URI, the token must be the UE's `sm_context_status_token`;
+/// otherwise 404 and nothing changes. The token-less URI of a session created
+/// before #1518 is served as before.
+fn handle_sm_context_status_callback(
+    supi: &str,
+    psi: &str,
+    token: Option<&str>,
+    request: &SbiRequest,
+) -> SbiResponse {
+    if let Some(token) = token {
+        if !holds_callback_token(supi, token, |ue| &ue.sm_context_status_token) {
+            return unknown_callback_token(supi, "SM context status");
+        }
+    }
     let state = parse_json_body(request)
         .and_then(|b| {
             b.pointer("/statusInfo/resourceStatus")
@@ -845,9 +953,19 @@ fn handle_sm_context_status_callback(supi: &str, psi: &str, request: &SbiRequest
 /// way, and TS 29.500 §6.10 makes a 4xx the one status that stops the retry loop.
 fn handle_ue_policy_notify_callback(
     supi: &str,
+    token: Option<&str>,
     operation: Option<&str>,
     request: &SbiRequest,
 ) -> SbiResponse {
+    // #1518: a tokened URI must carry the token of the UE's current association.
+    // A UE this AMF no longer holds keeps the 204 below (nothing is acted on).
+    if let Some(token) = token {
+        if find_ue_by_context_id(supi).is_some()
+            && !holds_callback_token(supi, token, |ue| &ue.ue_policy_association.notify_token)
+        {
+            return unknown_callback_token(supi, "UE policy");
+        }
+    }
     let resource_uri = parse_json_body(request)
         .and_then(|b| {
             b.get("resourceUri")
@@ -904,6 +1022,33 @@ fn handle_ue_policy_notify_callback(
     SbiResponse::no_content()
 }
 
+/// #1518: whether `token` is the callback token `field` of the UE `supi` holds now,
+/// compared in constant time. `false` for a UE this AMF does not hold and for a UE
+/// whose field is `None`.
+fn holds_callback_token(
+    supi: &str,
+    token: &str,
+    field: impl Fn(&AmfUe) -> &Option<String>,
+) -> bool {
+    find_ue_by_context_id(supi).is_some_and(|ue| {
+        field(&ue)
+            .as_deref()
+            .is_some_and(|held| nextgcore_sbi::callback_auth::token_eq(held, token))
+    })
+}
+
+/// #1518: 404 for a notification to a callback URI whose token this AMF does not
+/// hold for the UE. It names no resource of this AMF.
+fn unknown_callback_token(supi: &str, what: &str) -> SbiResponse {
+    log::warn!("[{supi}] {what} notification on a callback token the UE does not hold; refused");
+    send_error(
+        404,
+        "Not Found",
+        "no callback resource with that token",
+        Some("RESOURCE_URI_STRUCTURE_NOT_FOUND"),
+    )
+}
+
 /// Which of the PCF's per-UE policy associations (#1247).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PolicyKind {
@@ -928,6 +1073,7 @@ enum PolicyKind {
 /// operation, which is no resource of this API.
 fn handle_am_policy_notify_callback(
     supi: &str,
+    token: Option<&str>,
     operation: &str,
     request: &SbiRequest,
 ) -> SbiResponse {
@@ -941,6 +1087,12 @@ fn handle_am_policy_notify_callback(
     }
     if find_ue_by_context_id(supi).is_none() {
         return context_not_found(supi);
+    }
+    // #1518: a tokened URI must carry the token of the UE's current association.
+    if let Some(token) = token {
+        if !holds_callback_token(supi, token, |ue| &ue.policy_association.notify_token) {
+            return unknown_callback_token(supi, "AM policy");
+        }
     }
     let body = parse_json_body(request).unwrap_or_default();
     if operation == "update" {
@@ -7263,6 +7415,10 @@ mod tests {
         ue.nr_cgi.cell_id = 0x12345;
         // #753: the token of this UE's (stand-in) UECM registration.
         ue.uecm_dereg_token = Some(format!("tok-{supi}"));
+        // #1518: and of its smContextStatusUri / policy notificationUris.
+        ue.sm_context_status_token = Some(format!("smst-{supi}"));
+        ue.policy_association.notify_token = Some(format!("amp-{supi}"));
+        ue.ue_policy_association.notify_token = Some(format!("uep-{supi}"));
         if connected {
             guard.amf_ue_associate_ran_ue(ue.id, ran_ue.id);
             ue.ran_ue_id = ran_ue.id;
@@ -9189,10 +9345,247 @@ mod tests {
         assert_eq!(
             routes,
             [
+                "POST /namf-callback/v1/ucmf-notify/{token}",
+                "POST /namf-callback/v1/{var}/am-policy-notify/{token}/update",
+                "POST /namf-callback/v1/{var}/am-policy-notify/{token}/terminate",
+                "POST /namf-callback/v1/{var}/ue-policy-notify/{token}",
+                "POST /namf-callback/v1/{var}/ue-policy-notify/{token}/update",
+                "POST /namf-callback/v1/{var}/ue-policy-notify/{token}/terminate",
+                "POST /namf-callback/v1/{var}/{var}/sm-context-status/{token}",
                 "POST /namf-callback/v1/nf-status-notify/{token}",
                 "POST /namf-callback/v1/{var}/dereg-notify/{token}"
             ]
         );
+    }
+
+    /// #1518: on an OAuth2-required listener (whose empty JWKS verifies no bearer),
+    /// a token-less notification to `ucmf-notify/{token}` or
+    /// `am-policy-notify/{token}/{op}` is admitted on the token this AMF minted for
+    /// it. A forged or another UE's token, the token-less URIs of before #1518, a
+    /// service request, and the verified-peer routes (`ue-policy-notify`,
+    /// `sm-context-status`) without a verified certificate are all 401.
+    ///
+    /// REVERT-VERIFIED: with the four token routes dropped from
+    /// `oauth2_callback_exemptions`, the admitted cases are 401.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_oauth2_listener_admits_the_callbacks_on_their_tokens_1518() {
+        let _serial = dereg_queue_test_lock().lock().await;
+        let supi = "imsi-001010000015181";
+        let other = "imsi-001010000015182";
+        let _ue = setup_ue(supi, true, true);
+        let _other = setup_ue(other, true, true);
+        let ucmf = crate::racs::notification_uri();
+        let ucmf_path = &ucmf[ucmf.find("/namf-callback").expect("path")..];
+        let (server, port) = oauth2_callback_listener_for_tests().await;
+        let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", port);
+        let client = &client;
+        let post = |path: String, body: serde_json::Value| async move {
+            let req = SbiRequest::post(path.clone())
+                .with_json_body(&body)
+                .expect("json");
+            let status = tokio::time::timeout(Duration::from_secs(5), client.send_request(req))
+                .await
+                .expect("bounded")
+                .expect("response")
+                .status;
+            (path, status)
+        };
+        let ucmf_body = json!({"eventType": "DICTIONARY_ENTRY_CHANGED"});
+        let update = json!({});
+        let admitted = [
+            post(ucmf_path.to_string(), ucmf_body.clone()).await,
+            post(
+                format!("/namf-callback/v1/{supi}/am-policy-notify/amp-{supi}/update"),
+                update.clone(),
+            )
+            .await,
+        ];
+        let refused = [
+            post(
+                "/namf-callback/v1/ucmf-notify/0123456789abcdef0123456789abcdef".to_string(),
+                ucmf_body.clone(),
+            )
+            .await,
+            post("/namf-callback/v1/ucmf-notify".to_string(), ucmf_body).await,
+            post(
+                format!("/namf-callback/v1/{supi}/am-policy-notify/amp-{other}/update"),
+                update.clone(),
+            )
+            .await,
+            post(
+                format!("/namf-callback/v1/{supi}/am-policy-notify/update"),
+                update.clone(),
+            )
+            .await,
+            post(
+                format!("/namf-callback/v1/{supi}/am-policy-notify/amp-{supi}/delete"),
+                update.clone(),
+            )
+            .await,
+            post(
+                format!("/namf-callback/v1/{supi}/ue-policy-notify/uep-{supi}/update"),
+                update.clone(),
+            )
+            .await,
+            post(
+                format!("/namf-callback/v1/{supi}/5/sm-context-status/smst-{supi}"),
+                json!({"statusInfo": {"resourceStatus": "RELEASED"}}),
+            )
+            .await,
+            post(
+                format!("/namf-callback/v1/{supi}/sm-context-status/5"),
+                json!({"statusInfo": {"resourceStatus": "RELEASED"}}),
+            )
+            .await,
+            post("/namf-comm/v1/subscriptions".to_string(), update).await,
+        ];
+        server.stop().await.expect("stop");
+        for (path, status) in admitted {
+            assert_eq!(status, 204, "{path}");
+        }
+        for (path, status) in refused {
+            assert_eq!(status, 401, "{path}");
+        }
+    }
+
+    /// #1518: the verified-peer callback routes admit only a verified certificate of
+    /// the notifying NF type with the UE's current token: `ue-policy-notify` a PCF's,
+    /// `sm-context-status` an SMF's. Another NF type, a certificate without NFTypes,
+    /// no certificate, or a wrong token is held to the bearer.
+    ///
+    /// REVERT-VERIFIED: without the NF-type checks, the AMF-typed and untyped
+    /// certificates are admitted; with the token check dropped, the forged token is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_peer_callback_routes_admit_only_the_notifying_nf_type_1518() {
+        use nextgcore_sbi::callback_auth::VerifiedPeer;
+        let _serial = dereg_queue_test_lock().lock().await;
+        let supi = "imsi-001010000015183";
+        let _ue = setup_ue(supi, true, true);
+        let peer = |types: &[&str]| {
+            Some(VerifiedPeer {
+                nf_instance_id: "4e3c1518-0000-4000-8000-000000000001".to_string(),
+                nf_types: types.iter().map(|t| t.to_string()).collect(),
+            })
+        };
+        let admits = |path: String, p: Option<VerifiedPeer>| async move {
+            nextgcore_sbi::callback_auth::admits_without_bearer_from(
+                &oauth2_callback_exemptions(),
+                "POST",
+                &path,
+                p.as_ref(),
+            )
+            .await
+        };
+        let uep =
+            |suffix: &str| format!("/namf-callback/v1/{supi}/ue-policy-notify/uep-{supi}{suffix}");
+        let sms = |token: &str| format!("/namf-callback/v1/{supi}/5/sm-context-status/{token}");
+        for suffix in ["", "/update", "/terminate"] {
+            assert!(admits(uep(suffix), peer(&["PCF"])).await, "PCF {suffix}");
+            assert!(!admits(uep(suffix), peer(&["AMF"])).await, "AMF {suffix}");
+            assert!(!admits(uep(suffix), peer(&[])).await, "untyped {suffix}");
+            assert!(!admits(uep(suffix), None).await, "no peer {suffix}");
+        }
+        assert!(
+            !admits(
+                format!("/namf-callback/v1/{supi}/ue-policy-notify/uep-forged/update"),
+                peer(&["PCF"])
+            )
+            .await
+        );
+        let good = format!("smst-{supi}");
+        assert!(admits(sms(&good), peer(&["SMF"])).await);
+        assert!(!admits(sms(&good), peer(&["PCF"])).await);
+        assert!(!admits(sms(&good), peer(&[])).await);
+        assert!(!admits(sms(&good), None).await);
+        assert!(!admits(sms("smst-forged"), peer(&["SMF"])).await);
+    }
+
+    /// #1518: whatever admitted it (a bearer, or a token-less listener), a
+    /// notification to a tokened callback URI is acted on only with the UE's
+    /// current token: otherwise 404 and nothing changes. The token-less URIs of
+    /// before #1518 are served as they were.
+    ///
+    /// REVERT-VERIFIED: with the handlers' token checks removed, the forged-token
+    /// cases answer 204 and the session record is dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_callback_handlers_act_only_on_the_current_token_1518() {
+        let _serial = dereg_queue_test_lock().lock().await;
+        let supi = "imsi-001010000015184";
+        let ue = setup_ue(supi, true, true);
+        let sess = setup_sess(&ue, 5);
+        let post = |path: String, body: serde_json::Value| async move {
+            namf_request_handler(SbiRequest::post(path).with_json_body(&body).expect("json")).await
+        };
+        let released = json!({"statusInfo": {"resourceStatus": "RELEASED"}});
+        let sess_held = || {
+            amf_self()
+                .read()
+                .expect("ctx")
+                .sess_find_by_psi(ue.id, 5)
+                .is_some()
+        };
+
+        for (path, body) in [
+            (
+                "/namf-callback/v1/ucmf-notify/0123456789abcdef0123456789abcdef".to_string(),
+                json!({"eventType": "DICTIONARY_ENTRY_CHANGED"}),
+            ),
+            (
+                format!("/namf-callback/v1/{supi}/am-policy-notify/amp-forged/update"),
+                json!({}),
+            ),
+            (
+                format!("/namf-callback/v1/{supi}/ue-policy-notify/uep-forged/update"),
+                json!({}),
+            ),
+            (
+                format!("/namf-callback/v1/{supi}/5/sm-context-status/smst-forged"),
+                released.clone(),
+            ),
+        ] {
+            assert_eq!(post(path.clone(), body).await.status, 404, "{path}");
+        }
+        assert!(sess_held(), "a forged token released nothing");
+
+        let ucmf = crate::racs::notification_uri();
+        let ucmf_path = ucmf[ucmf.find("/namf-callback").expect("path")..].to_string();
+        for (path, body) in [
+            (ucmf_path, json!({"eventType": "DICTIONARY_ENTRY_CHANGED"})),
+            (
+                format!("/namf-callback/v1/{supi}/am-policy-notify/amp-{supi}/update"),
+                json!({}),
+            ),
+            (
+                format!("/namf-callback/v1/{supi}/ue-policy-notify/uep-{supi}/update"),
+                json!({}),
+            ),
+            (
+                format!("/namf-callback/v1/{supi}/ue-policy-notify/uep-{supi}"),
+                json!({}),
+            ),
+            // The token-less URIs of before #1518.
+            (
+                format!("/namf-callback/v1/{supi}/am-policy-notify/update"),
+                json!({}),
+            ),
+            (
+                format!("/namf-callback/v1/{supi}/ue-policy-notify/update"),
+                json!({}),
+            ),
+        ] {
+            assert_eq!(post(path.clone(), body).await.status, 204, "{path}");
+        }
+        assert_eq!(
+            post(
+                format!("/namf-callback/v1/{supi}/5/sm-context-status/smst-{supi}"),
+                released
+            )
+            .await
+            .status,
+            204
+        );
+        assert!(!sess_held(), "the current token released the session");
+        let _ = sess;
     }
 
     /// #1522: the dereg-notify exemption's check admits a token-less notification

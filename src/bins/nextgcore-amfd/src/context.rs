@@ -3593,6 +3593,11 @@ pub struct PolicyAssociation {
     pub resource_uri: Option<String>,
     /// ID
     pub id: Option<String>,
+    /// #1518: the per-association token in the `notificationUri` this AMF gave
+    /// the PCF, checked on every notification to that URI. `None` for an
+    /// association created before #1518, whose URI carries no token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_token: Option<String>,
 }
 
 /// 5G AKA confirmation
@@ -3691,6 +3696,11 @@ pub struct AmfUe {
     /// longer holds (one made before a restart, under a different
     /// `amfInstanceId`). Acting on it would tear down the UE's new registration.
     pub uecm_dereg_token: Option<String>,
+    /// #1518: the token in every `smContextStatusUri` this AMF gives an SMF for
+    /// this UE (TS 29.502 §5.2.2.2.1), minted once per UE context, so the URI of a
+    /// session survives the UE's re-registrations. `None` before it is minted: a
+    /// session created then gets the token-less URI of before #1518.
+    pub sm_context_status_token: Option<String>,
     /// NAS state
     pub nas: NasState,
     /// SUCI (Subscription Concealed Identifier)
@@ -3983,6 +3993,7 @@ impl std::fmt::Debug for AmfUe {
         let mut d = f.debug_struct("AmfUe");
         d.field("id", &self.id);
         d.field("uecm_dereg_token", &self.uecm_dereg_token);
+        d.field("sm_context_status_token", &self.sm_context_status_token);
         d.field("nas", &self.nas);
         d.field("suci", &self.suci);
         d.field("supi", &self.supi);
@@ -4553,6 +4564,7 @@ impl AmfUe {
         Self {
             id,
             uecm_dereg_token: None,
+            sm_context_status_token: None,
             nas: NasState::default(),
             suci: None,
             supi: None,
@@ -4694,8 +4706,7 @@ impl AmfUe {
 
     /// Clear PCF AM policy
     pub fn pcf_am_policy_clear(&mut self) {
-        self.policy_association.resource_uri = None;
-        self.policy_association.id = None;
+        self.policy_association = PolicyAssociation::default();
     }
 
     /// Check if a PCF UE Policy Association exists (Npcf_UEPolicyControl,
@@ -4706,8 +4717,7 @@ impl AmfUe {
 
     /// Clear the PCF UE Policy Association (Wave-6 E7)
     pub fn pcf_ue_policy_clear(&mut self) {
-        self.ue_policy_association.resource_uri = None;
-        self.ue_policy_association.id = None;
+        self.ue_policy_association = PolicyAssociation::default();
     }
 
     /// Check if 5G AKA confirmation exists
