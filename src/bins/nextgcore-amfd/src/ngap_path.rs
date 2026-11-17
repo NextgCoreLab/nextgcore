@@ -11538,6 +11538,23 @@ impl NgapServer {
         }
     }
 
+    /// #1518 (#1625 review round 4): the key a NEW PDU session's smContextStatusUri
+    /// token derives from. A UE context restored from before #1518 has none, so it is
+    /// minted here, at its first new session, and stored: every session established
+    /// from now on is tokened, and only its legacy sessions (no nonce) keep the
+    /// token-less URI.
+    pub(super) fn sm_context_status_key_for_new_session(
+        &mut self,
+        amf_ue_ngap_id: u64,
+    ) -> Option<String> {
+        self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
+            s.amf_ue
+                .sm_context_status_key
+                .get_or_insert_with(crate::sbi_path::new_callback_token)
+                .clone()
+        })
+    }
+
     /// Start one off-task re-selection attempt (#796): SMF selection (NRF discovery
     /// on a cache miss) and CreateSMContext, bounded by what is left of the window.
     fn spawn_establishment_attempt(
@@ -11553,6 +11570,7 @@ impl NgapServer {
             .first()
             .map_or((1, None), |n| (n.sst, n.sd));
         let redcap_indication = state.amf_ue.redcap_indication;
+        let status_key = self.sm_context_status_key_for_new_session(amf_ue_ngap_id);
         let identity = {
             let ctx = crate::context::amf_self();
             let guard = ctx.read().ok();
@@ -11560,6 +11578,7 @@ impl NgapServer {
                 // The establishment's own stamp, not a new one: a retry is the
                 // same request (#980 review).
                 origination_timestamp: Some(p.origination_timestamp.clone()),
+                sm_context_status_key: status_key,
                 sm_context_status_nonce: Some(p.status_nonce.clone()),
                 request_type: p
                     .request_type

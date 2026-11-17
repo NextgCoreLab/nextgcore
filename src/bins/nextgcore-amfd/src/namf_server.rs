@@ -916,8 +916,9 @@ fn handle_dereg_notify_callback(
 ///
 /// #1518: on the tokened URI, the token must be the session's
 /// ([`crate::sbi_path::sm_context_status_token`]); otherwise 404 and nothing
-/// changes. The token-less URI is served only for a UE context restored from
-/// before #1518 (no `sm_context_status_key`), whose sessions were given it.
+/// changes. The token-less URI is served only for a session given it: one of a UE
+/// context restored from before #1518 that has no nonce
+/// ([`serves_tokenless_session`]).
 fn handle_sm_context_status_callback(
     supi: &str,
     psi: &str,
@@ -926,7 +927,7 @@ fn handle_sm_context_status_callback(
 ) -> SbiResponse {
     let admitted = match token {
         Some(token) => holds_sm_context_status_token(supi, psi, token),
-        None => serves_tokenless(supi, |ue| &ue.sm_context_status_key),
+        None => serves_tokenless_session(supi, psi),
     };
     if !admitted {
         return unknown_callback_token(supi, "SM context status");
@@ -1082,6 +1083,22 @@ fn holds_sm_context_status_token(supi: &str, psi: &str, token: &str) -> bool {
 /// sender skip the token by dropping it from the path (#1625 review M1).
 fn serves_tokenless(supi: &str, field: impl Fn(&AmfUe) -> &Option<String>) -> bool {
     find_ue_by_context_id(supi).is_some_and(|ue| ue.pre_1518_callbacks && field(&ue).is_none())
+}
+
+/// #1518 (#1625 review round 4): the token-less `smContextStatusUri` is served per
+/// SESSION: only for a UE context restored from before #1518, and only for a
+/// session of it that was given the token-less URI (no nonce). A session the AMF
+/// established since, with a token, is never reached without it.
+fn serves_tokenless_session(supi: &str, psi: &str) -> bool {
+    let (Some(ue), Ok(psi)) = (find_ue_by_context_id(supi), psi.parse::<u8>()) else {
+        return false;
+    };
+    ue.pre_1518_callbacks
+        && amf_self()
+            .read()
+            .ok()
+            .and_then(|guard| guard.sess_find_by_psi(ue.id, psi))
+            .is_some_and(|sess| sess.sm_context_status_nonce.is_none())
 }
 
 /// #1518: 404 for a notification to a callback URI whose token this AMF does not
@@ -9755,7 +9772,12 @@ mod tests {
         // URI names it.
         let old = "imsi-001010000015185";
         let old_ue = setup_ue_with_tokens(old, true, true, false);
-        let _old_sess = setup_sess(&old_ue, 5);
+        // Its PSI 5 is a legacy session (given the token-less URI, so no nonce); its
+        // PSI 6 was established since, tokened (#1625 review round 4).
+        let mut legacy = setup_sess(&old_ue, 5);
+        legacy.sm_context_status_nonce = None;
+        amf_self().read().expect("ctx").sess_update(&legacy);
+        let _new_sess = setup_sess(&old_ue, 6);
         for (path, body, status) in [
             (
                 format!("/namf-callback/v1/{old}/am-policy-notify/update"),
@@ -9775,6 +9797,12 @@ mod tests {
             (
                 format!("/namf-callback/v1/{old}/am-policy-notify/amp-{old}/update"),
                 json!({}),
+                404,
+            ),
+            // The session established since is never reached without its token.
+            (
+                format!("/namf-callback/v1/{old}/sm-context-status/6"),
+                released.clone(),
                 404,
             ),
         ] {

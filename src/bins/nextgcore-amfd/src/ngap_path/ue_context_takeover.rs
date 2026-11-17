@@ -529,11 +529,14 @@ impl NgapServer {
             // the URI is tokened. A context restored from before #1518 has no key: its
             // sessions keep the token-less URI, which is served for it, until #1642
             // moves them over once the SMF has accepted the new URI.
+            let legacy_ue = state.amf_ue.pre_1518_callbacks;
             let nonce = state.amf_ue.sm_context_status_key.as_ref().and_then(|_| {
                 let ctx = crate::context::amf_self();
                 let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
                 let mut sess = guard.sess_find_by_psi(amf_ue_ngap_id, psi)?;
-                if sess.sm_context_status_nonce.is_none() {
+                // A legacy session of a pre-#1518 context keeps its token-less URI
+                // until #1642 moves it over (the token adopted on the SMF's 2xx).
+                if sess.sm_context_status_nonce.is_none() && !legacy_ue {
                     sess.sm_context_status_nonce = Some(crate::sbi_path::new_callback_token());
                     guard.sess_update(&sess);
                 }

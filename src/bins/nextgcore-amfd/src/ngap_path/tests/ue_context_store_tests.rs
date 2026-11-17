@@ -1108,6 +1108,11 @@ async fn a_pre_1518_record_restores_marked_and_keeps_its_marker_1518() {
             .expect("assoc")
             .remove("notify_token");
     }
+    for sess in obj["sessions"].as_array_mut().expect("sessions") {
+        sess.as_object_mut()
+            .expect("session")
+            .remove("status_nonce");
+    }
     let old: StoredUeContext = serde_json::from_value(doc).expect("the old encoding decodes");
     assert!(!old.callback_tokens && old.sm_context_status_key.is_none());
 
@@ -1115,7 +1120,7 @@ async fn a_pre_1518_record_restores_marked_and_keeps_its_marker_1518() {
     alone.put(&old).expect("put");
     let mut after = storing_server(&alone).await;
     open_with(&mut after, Arc::clone(&alone) as Arc<dyn UeContextBackend>).await;
-    let (_, restored) = after.ue_auth_state.find_by_supi(supi).expect("restored");
+    let (new_id, restored) = after.ue_auth_state.find_by_supi(supi).expect("restored");
     assert!(restored.amf_ue.pre_1518_callbacks, "restored marked");
     assert!(
         restored.amf_ue.sm_context_status_key.is_none(),
@@ -1131,6 +1136,90 @@ async fn a_pre_1518_record_restores_marked_and_keeps_its_marker_1518() {
         "the rewrite keeps the pre-#1518 marker"
     );
     assert!(rewritten.sm_context_status_key.is_none());
+
+    // #1625 review round 4: a NEW session of this legacy UE is tokened. Its key is
+    // minted at that first new session and stored, the CreateSMContext carries the
+    // tokened URI, and that session's token-less URI is refused; the legacy
+    // session's token-less URI is still served.
+    let key = after
+        .sm_context_status_key_for_new_session(new_id)
+        .expect("minted at the first new session");
+    let (_, now) = after.ue_auth_state.find_by_supi(supi).expect("held");
+    assert_eq!(
+        now.amf_ue.sm_context_status_key.as_deref(),
+        Some(key.as_str())
+    );
+    assert!(
+        now.amf_ue.pre_1518_callbacks,
+        "its legacy callbacks stay served"
+    );
+    assert_eq!(
+        after
+            .sm_context_status_key_for_new_session(new_id)
+            .as_deref(),
+        Some(key.as_str()),
+        "minted once"
+    );
+    let identity = crate::sbi_path::SmContextIdentity {
+        sm_context_status_nonce: Some("n-6".to_string()),
+        ..super::super::build_sm_context_identity(Some(&now), None)
+    };
+    let create = crate::sbi_path::build_create_sm_context_request_for_test(&identity);
+    let create: serde_json::Value = serde_json::from_str(
+        create
+            .http
+            .content
+            .as_deref()
+            .or_else(|| {
+                create
+                    .http
+                    .parts
+                    .first()
+                    .and_then(|p| std::str::from_utf8(&p.data).ok())
+            })
+            .unwrap_or("{}"),
+    )
+    .unwrap_or_default();
+    let token6 = crate::sbi_path::sm_context_status_token(&key, 5, "n-6");
+    assert_eq!(
+        create["smContextStatusUri"],
+        crate::sbi_path::sm_context_status_uri(supi, 5, Some(&token6)),
+        "the new session's URI is tokened"
+    );
+    {
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        let mut sess = guard.sess_add(new_id, 6).expect("PSI 6");
+        sess.sm_context_status_nonce = Some("n-6".to_string());
+        guard.sess_update(&sess);
+    }
+    let post = |path: String| async move {
+        crate::namf_server::namf_request_handler(
+            nextgcore_sbi::message::SbiRequest::post(path)
+                .with_json_body(&serde_json::json!({"statusInfo": {"resourceStatus": "ACTIVE"}}))
+                .expect("json"),
+        )
+        .await
+        .status
+    };
+    assert_eq!(
+        post(format!("/namf-callback/v1/{supi}/sm-context-status/6")).await,
+        404,
+        "the new session is not reached without its token"
+    );
+    assert_eq!(
+        post(format!("/namf-callback/v1/{supi}/sm-context-status/5")).await,
+        204,
+        "the legacy session's token-less URI is still served"
+    );
+    assert_eq!(
+        post(format!(
+            "/namf-callback/v1/{supi}/6/sm-context-status/{}",
+            crate::sbi_path::sm_context_status_token(&key, 6, "n-6")
+        ))
+        .await,
+        204
+    );
 
     // A record written since #1518 restores unmarked, with its key.
     let new = super::super::ue_context_store::restored_ue_for_tests(9, &written).expect("restores");
