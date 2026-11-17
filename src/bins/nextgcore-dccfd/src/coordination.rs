@@ -46,15 +46,32 @@ use std::sync::OnceLock;
 
 use nextgcore_sbi::client::SbiClient;
 
+use nextgcore_sbi::callback_auth::CallbackToken;
+
 use crate::context::{
-    dccf_context_claim_producer_sub, dccf_context_record_producer_sub, ProducerClaim,
+    dccf_context_abandon_producer_sub, dccf_context_claim_producer_sub,
+    dccf_context_record_producer_sub, ProducerClaim,
 };
 use crate::data_mgmt::{DataManagementSubsc, SubscriptionScope};
 
 /// Is coordination enabled for this process?
 static COORDINATION_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// The NRF to resolve producers through, and this DCCF's own notification URI.
+/// The path prefix of the `notificationURI` this DCCF hands a producer (#1518):
+/// `{apiRoot}{PRODUCER_NOTIFY_PREFIX}/{token}`. Its last segment is in
+/// `nextgcore_sbi::log_redact::CALLBACK_TOKEN_SEGMENTS`.
+pub const PRODUCER_NOTIFY_PREFIX: &str = "/ndccf-datamanagement/v1/notify/dccf-data-notify";
+
+/// The `notificationURI` for the producer subscription holding `token` (#1518).
+pub fn producer_notify_uri(own_api_root: &str, token: &CallbackToken) -> String {
+    format!(
+        "{}{PRODUCER_NOTIFY_PREFIX}/{}",
+        own_api_root.trim_end_matches('/'),
+        token.as_str()
+    )
+}
+
+/// The NRF to resolve producers through, and this DCCF's own apiRoot.
 static COORDINATION_CONFIG: OnceLock<CoordinationConfig> = OnceLock::new();
 
 /// What the coordination path needs to reach the NRF and to be called back.
@@ -62,9 +79,10 @@ static COORDINATION_CONFIG: OnceLock<CoordinationConfig> = OnceLock::new();
 pub struct CoordinationConfig {
     /// NRF root, e.g. `http://127.0.0.1:7777`.
     pub nrf_uri: String,
-    /// This DCCF's own notify URI, handed to producers as `notificationURI` so
+    /// This DCCF's own apiRoot, e.g. `http://10.0.0.9:7777`. Producers are handed
+    /// `notificationURI`s under it, each with its subscription's token (#1518), so
     /// their data arrives here rather than at the consumer.
-    pub own_notify_uri: String,
+    pub own_api_root: String,
 }
 
 /// Enable coordination with the given config (called once at startup).
@@ -128,32 +146,39 @@ pub async fn ensure_producer_subscription(
         return CoordinationOutcome::Disabled;
     };
     // Reuse first: this is the whole point of the DCCF, so it must be checked
-    // before any producer signalling.
-    if let ProducerClaim::Reused { producer_id } =
-        dccf_context_claim_producer_sub(consumer_id, scope)
-    {
-        return CoordinationOutcome::Reused { producer_id };
-    }
-
-    let Some(target) = sub.target_nf_id.as_deref() else {
-        log::info!(
-            "[DCCF] consumer subscription {consumer_id} names no targetNfId; skipping producer \
-             coordination (an event-to-producer mapping is deliberately not guessed)"
-        );
-        return CoordinationOutcome::NoProducerNamed;
+    // before any producer signalling. A claim that needs a create holds the
+    // subscription in flight, so a concurrent consumer of the same scope reuses it.
+    let target = sub.target_nf_id.as_deref();
+    let notify_token = match dccf_context_claim_producer_sub(consumer_id, scope, target) {
+        ProducerClaim::Reused { producer_id } => {
+            return CoordinationOutcome::Reused { producer_id }
+        }
+        ProducerClaim::NoProducer => {
+            log::info!(
+                "[DCCF] consumer subscription {consumer_id} names no targetNfId; skipping \
+                 producer coordination (an event-to-producer mapping is deliberately not guessed)"
+            );
+            return CoordinationOutcome::NoProducerNamed;
+        }
+        ProducerClaim::NeedsCreate { notify_token } => notify_token,
+    };
+    let target = target.unwrap_or_default();
+    let failed = |detail: String| {
+        dccf_context_abandon_producer_sub(scope);
+        CoordinationOutcome::Failed(detail)
     };
 
     let profile = match fetch_nf_profile(&cfg.nrf_uri, target).await {
         Ok(p) => p,
         Err(e) => {
             log::warn!("[DCCF] producer discovery for {target} failed: {e}");
-            return CoordinationOutcome::Failed(e);
+            return failed(e);
         }
     };
     let Some((api_root, service_name)) = event_exposure_endpoint(&profile) else {
         let detail = format!("NF {target} advertises no event-exposure service");
         log::warn!("[DCCF] {detail}");
-        return CoordinationOutcome::Failed(detail);
+        return failed(detail);
     };
 
     // Forward the CONSUMER'S own subscription body, with the callback rewritten
@@ -162,12 +187,12 @@ pub async fn ensure_producer_subscription(
     // its behalf, not inventing a subscription.
     let mut producer_body = match sub.ana_sub.clone().or_else(|| sub.data_sub.clone()) {
         Some(b) => b,
-        None => return CoordinationOutcome::Failed("no anaSub/dataSub to forward".to_string()),
+        None => return failed("no anaSub/dataSub to forward".to_string()),
     };
     if let Some(obj) = producer_body.as_object_mut() {
         obj.insert(
             "notificationURI".to_string(),
-            serde_json::Value::String(cfg.own_notify_uri.clone()),
+            serde_json::Value::String(producer_notify_uri(&cfg.own_api_root, &notify_token)),
         );
         obj.insert(
             "notifCorrId".to_string(),
@@ -177,19 +202,17 @@ pub async fn ensure_producer_subscription(
 
     match post_producer_subscription(&api_root, &service_name, &producer_body).await {
         Ok(resource_uri) => {
-            dccf_context_record_producer_sub(
-                consumer_id,
-                scope.clone(),
-                target.to_string(),
-                resource_uri,
-            );
+            if !dccf_context_record_producer_sub(scope, resource_uri.clone()) {
+                // Every consumer left while the create was in flight.
+                delete_producer_subscription(&resource_uri).await;
+            }
             CoordinationOutcome::Created {
                 producer_id: target.to_string(),
             }
         }
         Err(e) => {
             log::warn!("[DCCF] creating a producer subscription on {target} failed: {e}");
-            CoordinationOutcome::Failed(e)
+            failed(e)
         }
     }
 }

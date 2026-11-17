@@ -106,7 +106,10 @@ async fn dccf_request_handler(req: SbiRequest) -> SbiResponse {
     let uri = &req.header.uri;
     let path = uri.split('?').next().unwrap_or(uri);
 
-    log::debug!("DCCF SBI: {method} {path}");
+    log::debug!(
+        "DCCF SBI: {method} {}",
+        nextgcore_sbi::log_redact::redact_callback_tokens(path)
+    );
 
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
 
@@ -143,9 +146,13 @@ async fn dccf_request_handler(req: SbiRequest) -> SbiResponse {
             _ => send_method_not_allowed(method, "subscriptions/{id}"),
         },
 
-        // POST /ndccf-datamanagement/v1/notify — inbound data from producers
-        ["ndccf-datamanagement", "v1", "notify"] => match method {
-            "POST" => handle_dm_notify(&req).await,
+        // POST /ndccf-datamanagement/v1/notify/dccf-data-notify/{token} — inbound
+        // data from a producer, on the token of the producer subscription it is for
+        // (#1518). The token-less `/notify` of before is gone: producer
+        // subscriptions are held in memory only, so none made before a restart is
+        // honoured anyway.
+        ["ndccf-datamanagement", "v1", "notify", PRODUCER_NOTIFY_SEGMENT, token] => match method {
+            "POST" => handle_dm_notify(token, &req).await,
             _ => send_method_not_allowed(method, "notify"),
         },
 
@@ -310,7 +317,8 @@ async fn main() -> Result<()> {
     nextgcore_core::sockaddr::warn_if_loopback_listener("SBI", &bind_addr, "--sbi-addr");
     log::info!("DCCF SBI listening on {bind_addr}");
 
-    let mut sbi_config = SbiServerConfig::new(bind_addr);
+    let mut sbi_config = SbiServerConfig::new(bind_addr)
+        .with_oauth2_callback_exemptions(oauth2_callback_exemptions());
     if args.tls {
         if let (Some(cert), Some(key)) = (args.tls_cert, args.tls_key) {
             sbi_config = sbi_config.with_tls(key, cert);
@@ -658,17 +666,71 @@ async fn handle_dm_update(sub_id: &str, req: &SbiRequest) -> SbiResponse {
 /// producer subscription when it was the last consumer — refcounted, so one
 /// consumer unsubscribing cannot cut off another's data.
 async fn handle_dm_unsubscribe(sub_id: &str) -> SbiResponse {
-    if !dccf_context_remove_subscription(sub_id) {
+    if !remove_consumer_subscription(sub_id).await {
         return send_not_found("subscription not found", None);
     }
     log::info!("[DCCF] DataManagement subscription deleted sub_id={sub_id}");
-    if let Some(orphaned) = dccf_context_release_producer_sub(sub_id) {
-        coordination::delete_producer_subscription(&orphaned.resource_uri).await;
-    }
     SbiResponse::no_content()
 }
 
-/// `POST /ndccf-datamanagement/v1/notify` — inbound producer data (#112).
+/// Remove a consumer subscription and release its producer claim, deleting the
+/// producer subscription at the producer when it was the last consumer. `false`
+/// when there was no such subscription.
+async fn remove_consumer_subscription(sub_id: &str) -> bool {
+    if !dccf_context_remove_subscription(sub_id) {
+        return false;
+    }
+    if let Some(orphaned) = dccf_context_release_producer_sub(sub_id) {
+        // One still being created is deleted when its create completes.
+        if let Some(uri) = orphaned.resource_uri.as_deref() {
+            coordination::delete_producer_subscription(uri).await;
+        }
+    }
+    true
+}
+
+/// The producer notify callback, admitted without an OAuth2 bearer when the
+/// listener requires one (#1518): a notification carries no access token (TS
+/// 33.501 §13.4.1, TS 29.500 §6.10.7 NOTE). It needs the producer subscription's
+/// token AND a verified mutual-TLS peer that is the producer NF instance the
+/// subscription was created on: producer event-exposure subscriptions can be read
+/// back by other consumers of the producer (the #1522 rule). Without a verified
+/// certificate the route stays on the bearer.
+fn oauth2_callback_exemptions() -> Vec<nextgcore_sbi::server::OAuth2CallbackExemption> {
+    vec![
+        nextgcore_sbi::server::OAuth2CallbackExemption::for_verified_peer(
+            "POST",
+            format!("/ndccf-datamanagement/v1/notify/{PRODUCER_NOTIFY_SEGMENT}/{{token}}"),
+            |cb, peer| async move {
+                dccf_context_producer_for_token(&cb.token)
+                    .is_some_and(|producer| same_nf_instance(&producer, &peer.nf_instance_id))
+            },
+        ),
+    ]
+}
+
+/// Whether two NF instance ids name the same instance: UUIDs compare
+/// case-insensitively, with or without the `urn:uuid:` prefix a certificate's URI
+/// SAN carries.
+fn same_nf_instance(a: &str, b: &str) -> bool {
+    let norm = |s: &str| {
+        let s = s.trim();
+        s.strip_prefix("urn:uuid:")
+            .unwrap_or(s)
+            .to_ascii_lowercase()
+    };
+    !a.trim().is_empty() && norm(a) == norm(b)
+}
+
+/// The segment before the token in a producer `notificationURI` (#1518).
+const PRODUCER_NOTIFY_SEGMENT: &str = "dccf-data-notify";
+
+/// `POST /ndccf-datamanagement/v1/notify/dccf-data-notify/{token}` — inbound
+/// producer data (#112).
+///
+/// #1518: acted on only for the producer subscription holding `token`, whatever
+/// admitted the request, and fanned out only to that subscription's consumers.
+/// Any other token is 404, and nothing is sent.
 ///
 /// Two defects fixed: the fan-out is keyed on `(events, target)` instead of
 /// going to every subscriber with a callback URI, and each consumer receives a
@@ -677,7 +739,10 @@ async fn handle_dm_unsubscribe(sub_id: &str) -> SbiResponse {
 ///
 /// Because each consumer's body differs (its own correlation id), the
 /// notification is built per target rather than once and broadcast.
-async fn handle_dm_notify(req: &SbiRequest) -> SbiResponse {
+async fn handle_dm_notify(token: &str, req: &SbiRequest) -> SbiResponse {
+    if dccf_context_producer_for_token(token).is_none() {
+        return send_not_found("no producer subscription holds this callback", None);
+    }
     let raw = req.http.content.as_deref().unwrap_or("{}");
     let body: serde_json::Value = match serde_json::from_str(raw) {
         Ok(v) => v,
@@ -696,7 +761,9 @@ async fn handle_dm_notify(req: &SbiRequest) -> SbiResponse {
         raw.len()
     );
 
-    let targets = dccf_context_fanout_notify_scoped(&notif_scope);
+    let Some(targets) = dccf_context_fanout_for_token(token, &notif_scope) else {
+        return send_not_found("no producer subscription holds this callback", None);
+    };
     let timestamp = rfc3339_now();
     for (sub_id, notify_uri, notif_corr_id) in targets {
         let Some((host, port)) = parse_host_port(&notify_uri) else {
@@ -721,6 +788,12 @@ async fn handle_dm_notify(req: &SbiRequest) -> SbiResponse {
         let client = SbiClient::with_host_port(&host, port);
         tokio::spawn(async move {
             match client.post_json(&path_owned, &notif).await {
+                // The consumer no longer has the subscription (TS 29.500 §5.2.7.2:
+                // 404 on a notification ends it), so neither does this DCCF.
+                Ok(resp) if resp.status == 404 => {
+                    log::info!("[DCCF] consumer of {sub_id} answered 404; subscription removed");
+                    remove_consumer_subscription(&sub_id).await;
+                }
                 Ok(resp) => {
                     log::debug!("[DCCF] fanout POST {sub_id} -> status={}", resp.status)
                 }
@@ -947,6 +1020,34 @@ mod data_management_tests {
         .to_string()
     }
 
+    /// The sub id in a 201's `Location`.
+    fn created_id(resp: &SbiResponse) -> String {
+        resp.http
+            .get_header("location")
+            .expect("Location")
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Hold a producer subscription on `producer` for consumer `sub_id`'s scope,
+    /// as coordination does before its create (#1518), and return its token.
+    fn claim_producer_token(sub_id: &str, producer: &str) -> String {
+        let scope = dccf_context_get_subscription(sub_id).expect("stored").scope;
+        match context::dccf_context_claim_producer_sub(sub_id, &scope, Some(producer)) {
+            context::ProducerClaim::NeedsCreate { notify_token } => {
+                notify_token.as_str().to_string()
+            }
+            other => panic!("expected a fresh claim, got {other:?}"),
+        }
+    }
+
+    /// The producer notify path for `token` (#1518).
+    fn notify_path(token: &str) -> String {
+        format!("{}/{token}", coordination::PRODUCER_NOTIFY_PREFIX)
+    }
+
     fn post(path: &str, body: &str) -> SbiResponse {
         let req = SbiRequest::post(path).with_body(body.to_string(), "application/json");
         futures_lite_block_on(dccf_request_handler(req))
@@ -1080,10 +1181,12 @@ mod data_management_tests {
             )
             .await;
             assert_eq!(resp.status, 201);
+            let token = claim_producer_token(&created_id(&resp), "amf-1");
 
-            // A producer notification for the subscribed event.
+            // A producer notification for the subscribed event, on its
+            // subscription's token (#1518).
             let resp = dccf_request_handler(
-                SbiRequest::post("/ndccf-datamanagement/v1/notify").with_body(
+                SbiRequest::post(notify_path(&token)).with_body(
                     serde_json::json!({
                         "subscriptionId": "prod-1",
                         "eventNotifications": [{"event": "NF_LOAD"}]
@@ -1142,6 +1245,7 @@ mod data_management_tests {
             let (consumer_a, port_a, seen_a) = spawn_consumer().await;
             let (consumer_b, port_b, seen_b) = spawn_consumer().await;
 
+            let mut tokens = Vec::new();
             for (corr, port, event) in [
                 ("corr-A", port_a, "NF_LOAD"),
                 ("corr-B", port_b, "UE_MOBILITY"),
@@ -1154,15 +1258,14 @@ mod data_management_tests {
                 )
                 .await;
                 assert_eq!(resp.status, 201);
+                tokens.push(claim_producer_token(&created_id(&resp), "amf-1"));
             }
 
-            // A notification for NF_LOAD only.
-            dccf_request_handler(
-                SbiRequest::post("/ndccf-datamanagement/v1/notify").with_body(
-                    serde_json::json!({"eventNotifications": [{"event": "NF_LOAD"}]}).to_string(),
-                    "application/json",
-                ),
-            )
+            // A notification for NF_LOAD only, on A's producer subscription.
+            dccf_request_handler(SbiRequest::post(notify_path(&tokens[0])).with_body(
+                serde_json::json!({"eventNotifications": [{"event": "NF_LOAD"}]}).to_string(),
+                "application/json",
+            ))
             .await;
 
             for _ in 0..50 {
@@ -1359,6 +1462,8 @@ mod data_management_tests {
             // Producer: counts the subscriptions created on it.
             let created = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let counter = created.clone();
+            let bodies: Arc<StdMutex<Vec<serde_json::Value>>> = Arc::default();
+            let seen_bodies = bodies.clone();
             let (producer_listener, producer_addr) =
                 nextgcore_sbi::test_support::bound_listener().into_parts();
             let producer_port = producer_addr.port();
@@ -1369,9 +1474,21 @@ mod data_management_tests {
             producer
                 .start(move |req: SbiRequest| {
                     let counter = counter.clone();
+                    let seen_bodies = seen_bodies.clone();
                     async move {
                         if req.header.method == "POST" {
                             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if let Some(b) = req
+                                .http
+                                .content
+                                .as_deref()
+                                .and_then(|c| serde_json::from_str(c).ok())
+                            {
+                                seen_bodies
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .push(b);
+                            }
                             return SbiResponse::created()
                                 .with_header("Location", "http://producer/sub/1");
                         }
@@ -1412,7 +1529,7 @@ mod data_management_tests {
 
             coordination::set_coordination_for_test(Some(coordination::CoordinationConfig {
                 nrf_uri: format!("http://127.0.0.1:{nrf_port}"),
-                own_notify_uri: "http://dccf/ndccf-datamanagement/v1/notify".to_string(),
+                own_api_root: "http://dccf".to_string(),
             }));
 
             // Two consumers, same event and same target NF.
@@ -1443,6 +1560,28 @@ mod data_management_tests {
                 dccf_context_producer_sub_count(),
                 1,
                 "one producer subscription for the shared scope"
+            );
+
+            // #1518: the producer is handed a notificationURI carrying that
+            // subscription's token, which names the producer it was created on.
+            let uri = bodies.lock().unwrap_or_else(|e| e.into_inner())[0]["notificationURI"]
+                .as_str()
+                .expect("notificationURI")
+                .to_string();
+            let token = uri
+                .strip_prefix(&format!(
+                    "http://dccf{}/",
+                    coordination::PRODUCER_NOTIFY_PREFIX
+                ))
+                .unwrap_or_else(|| panic!("tokened notificationURI, got {uri}"));
+            assert!(token.len() >= 32 && !token.contains('/'), "{uri}");
+            assert_eq!(
+                context::dccf_context_producer_for_token(token).as_deref(),
+                Some("amf-1")
+            );
+            assert!(
+                !nextgcore_sbi::log_redact::redact_callback_tokens(&uri).contains(token),
+                "the token must never reach a log"
             );
 
             coordination::set_coordination_for_test(None);
@@ -1481,6 +1620,300 @@ mod data_management_tests {
             0,
             "coordination is off by default: no producer is dialled"
         );
+        clear_subscriptions();
+    }
+
+    /// Wait for a spawned fan-out to land, then give stragglers a fair chance so
+    /// an absence assertion is not checked too early.
+    async fn settle(seen: &StdMutex<Vec<serde_json::Value>>, want: usize) {
+        for _ in 0..50 {
+            if seen.lock().unwrap_or_else(|e| e.into_inner()).len() >= want {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    /// #1518: producer data is acted on only on the token of a producer
+    /// subscription this DCCF holds. Any other token, and the token-less
+    /// `/notify` of earlier builds, is 404 and nothing is fanned out.
+    ///
+    /// REVERT-VERIFIED: with any non-empty token taken as held (the lookups in
+    /// `context` no longer comparing it), this test and the other #1518 fan-out
+    /// and exemption tests fail.
+    #[test]
+    fn producer_data_is_acted_on_only_on_a_held_token_1518() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        init();
+        clear_subscriptions();
+
+        futures_lite_block_on(async {
+            let (consumer, port, seen) = spawn_consumer().await;
+            let resp = dccf_request_handler(
+                SbiRequest::post("/ndccf-datamanagement/v1/subscriptions").with_body(
+                    subscribe_body("corr-A", &format!("http://127.0.0.1:{port}/cb"), "NF_LOAD"),
+                    "application/json",
+                ),
+            )
+            .await;
+            assert_eq!(resp.status, 201);
+            let token = claim_producer_token(&created_id(&resp), "amf-1");
+            let notif =
+                serde_json::json!({"eventNotifications": [{"event": "NF_LOAD"}]}).to_string();
+            let send = |path: String| {
+                dccf_request_handler(
+                    SbiRequest::post(path).with_body(notif.clone(), "application/json"),
+                )
+            };
+
+            assert_eq!(
+                send(notify_path("0123456789abcdef0123456789abcdef"))
+                    .await
+                    .status,
+                404,
+                "a token no producer subscription holds"
+            );
+            assert_eq!(
+                send("/ndccf-datamanagement/v1/notify".to_string())
+                    .await
+                    .status,
+                404,
+                "the token-less route is gone"
+            );
+            settle(&seen, 1).await;
+            assert!(
+                seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+                "nothing may be fanned out on a refused notification"
+            );
+
+            assert_eq!(send(notify_path(&token)).await.status, 204);
+            settle(&seen, 1).await;
+            assert_eq!(seen.lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
+
+            // Once its last consumer leaves, the token is no longer held.
+            let id = context::dccf_context_subscription_ids()[0].clone();
+            assert!(remove_consumer_subscription(&id).await);
+            assert_eq!(send(notify_path(&token)).await.status, 404);
+
+            consumer.stop().await.expect("stop");
+        });
+        clear_subscriptions();
+    }
+
+    /// #1518: a notification on one producer subscription's token reaches only
+    /// that subscription's consumers, even when another consumer's scope matches
+    /// it too. Before, every consumer whose scope matched was sent it.
+    #[test]
+    fn a_token_fans_out_only_to_its_own_consumers_1518() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        init();
+        clear_subscriptions();
+
+        futures_lite_block_on(async {
+            let (consumer_a, port_a, seen_a) = spawn_consumer().await;
+            let (consumer_b, port_b, seen_b) = spawn_consumer().await;
+            let mut tokens = Vec::new();
+            for (corr, port, event) in [
+                ("corr-A", port_a, "NF_LOAD"),
+                ("corr-B", port_b, "UE_MOBILITY"),
+            ] {
+                let resp = post_async(&subscribe_body(
+                    corr,
+                    &format!("http://127.0.0.1:{port}/cb"),
+                    event,
+                ))
+                .await;
+                tokens.push(claim_producer_token(&created_id(&resp), "amf-1"));
+            }
+
+            // Both events, so B's scope matches as well as A's.
+            let resp = dccf_request_handler(
+                SbiRequest::post(notify_path(&tokens[0])).with_body(
+                    serde_json::json!({"eventNotifications": [
+                        {"event": "NF_LOAD"}, {"event": "UE_MOBILITY"}
+                    ]})
+                    .to_string(),
+                    "application/json",
+                ),
+            )
+            .await;
+            assert_eq!(resp.status, 204);
+            settle(&seen_a, 1).await;
+            assert_eq!(seen_a.lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
+            assert!(
+                seen_b.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+                "B's data comes on B's producer subscription, not A's"
+            );
+
+            consumer_a.stop().await.expect("stop");
+            consumer_b.stop().await.expect("stop");
+        });
+        clear_subscriptions();
+    }
+
+    async fn post_async(body: &str) -> SbiResponse {
+        let resp = dccf_request_handler(
+            SbiRequest::post("/ndccf-datamanagement/v1/subscriptions")
+                .with_body(body.to_string(), "application/json"),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        resp
+    }
+
+    /// #1518: on an OAuth2-required listener the producer notify route is admitted
+    /// without a bearer only on a held token AND a verified certificate of the
+    /// producer NF instance that subscription was created on. Producer
+    /// subscriptions can be read back by the producer's other consumers, so the
+    /// token alone is not enough.
+    ///
+    /// REVERT-VERIFIED: with the exemption admitting on a held token whatever the
+    /// certificate names, the other instance's certificate is admitted.
+    #[test]
+    fn the_notify_route_admits_only_the_subscriptions_producer_1518() {
+        use nextgcore_sbi::callback_auth::VerifiedPeer;
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        init();
+        clear_subscriptions();
+
+        let producer = "4e3c1518-0000-4000-8000-0000000000dc";
+        let resp = post(
+            "/ndccf-datamanagement/v1/subscriptions",
+            &subscribe_body("corr-1", "http://consumer/cb", "NF_LOAD"),
+        );
+        let token = claim_producer_token(&created_id(&resp), producer);
+        let exemptions = oauth2_callback_exemptions();
+        let admits = |path: String, id: Option<&str>| {
+            let peer = id.map(|id| VerifiedPeer {
+                nf_instance_id: id.to_string(),
+                nf_types: vec!["AMF".to_string()],
+            });
+            futures_lite_block_on(nextgcore_sbi::callback_auth::admits_without_bearer_from(
+                &exemptions,
+                "POST",
+                &path,
+                peer.as_ref(),
+            ))
+        };
+
+        assert!(admits(notify_path(&token), Some(producer)));
+        assert!(
+            admits(
+                notify_path(&token),
+                Some("urn:uuid:4E3C1518-0000-4000-8000-0000000000DC")
+            ),
+            "the certificate's urn:uuid: form, in any case"
+        );
+        assert!(!admits(
+            notify_path(&token),
+            Some("4e3c1518-0000-4000-8000-0000000000ee")
+        ));
+        assert!(!admits(notify_path(&token), Some("")));
+        assert!(!admits(notify_path(&token), None), "no certificate");
+        assert!(!admits(
+            notify_path("0123456789abcdef0123456789abcdef"),
+            Some(producer)
+        ));
+        assert!(!admits(
+            "/ndccf-datamanagement/v1/notify".to_string(),
+            Some(producer)
+        ));
+
+        // Real HTTP: an OAuth2-required listener with an empty JWKS and the
+        // exemption. Plaintext carries no certificate, so the held token is 401 as
+        // well as the forged one, the token-less route and a service request.
+        let got = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+                let mut cfg = SbiServerConfig::new(addr)
+                    .with_oauth2_callback_exemptions(oauth2_callback_exemptions());
+                cfg.require_oauth2 = true;
+                cfg.oauth2_jwks = Some(serde_json::json!({"keys": []}));
+                let server = SbiServer::on_listener(cfg, listener);
+                server.start(dccf_request_handler).await.expect("start");
+                let client = SbiClient::with_host_port("127.0.0.1", addr.port());
+                let mut got = Vec::new();
+                for path in [
+                    notify_path(&token),
+                    notify_path("0123456789abcdef0123456789abcdef"),
+                    "/ndccf-datamanagement/v1/notify".to_string(),
+                    "/ndccf-datamanagement/v1/subscriptions".to_string(),
+                ] {
+                    let req = SbiRequest::post(path.clone())
+                        .with_body("{}".to_string(), "application/json");
+                    let status =
+                        tokio::time::timeout(Duration::from_secs(5), client.send_request(req))
+                            .await
+                            .expect("bounded")
+                            .expect("response")
+                            .status;
+                    got.push((path, status));
+                }
+                server.stop().await.ok();
+                got
+            });
+        for (path, status) in got {
+            assert_eq!(status, 401, "{path}");
+        }
+        clear_subscriptions();
+    }
+
+    /// #1518: a producer subscription is held from the claim, so its token is
+    /// admitted before the 201 arrives. A consumer that leaves mid-create has the
+    /// producer subscription deleted when the create lands (record answers
+    /// `false`), and a failed create forgets the claim and its token.
+    #[test]
+    fn an_in_flight_producer_subscription_is_held_and_released_1518() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        init();
+        clear_subscriptions();
+
+        let resp = post(
+            "/ndccf-datamanagement/v1/subscriptions",
+            &subscribe_body("corr-1", "http://consumer/cb", "NF_LOAD"),
+        );
+        let id = created_id(&resp);
+        let scope = dccf_context_get_subscription(&id).unwrap().scope;
+        let token = claim_producer_token(&id, "amf-1");
+        assert_eq!(
+            context::dccf_context_producer_for_token(&token).as_deref(),
+            Some("amf-1"),
+            "in flight, already held"
+        );
+        assert!(matches!(
+            context::dccf_context_claim_producer_sub("other", &scope, Some("amf-1")),
+            context::ProducerClaim::Reused { .. }
+        ));
+        assert!(matches!(
+            context::dccf_context_claim_producer_sub(
+                "x",
+                &data_mgmt::SubscriptionScope::default(),
+                None
+            ),
+            context::ProducerClaim::NoProducer
+        ));
+
+        // A failed create forgets it.
+        context::dccf_context_abandon_producer_sub(&scope);
+        assert!(context::dccf_context_producer_for_token(&token).is_none());
+
+        // Every consumer leaves while the create is in flight.
+        let token = claim_producer_token(&id, "amf-1");
+        let orphaned = dccf_context_release_producer_sub(&id).expect("last consumer");
+        assert!(
+            orphaned.resource_uri.is_none(),
+            "deleted when its create lands"
+        );
+        assert!(!context::dccf_context_record_producer_sub(
+            &scope,
+            "http://producer/sub/1".to_string()
+        ));
+        assert!(context::dccf_context_producer_for_token(&token).is_none());
         clear_subscriptions();
     }
 }
