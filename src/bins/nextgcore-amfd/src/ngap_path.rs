@@ -29007,9 +29007,11 @@ mod tests {
     /// real binaries in the PR (this fixture has no gNB association to observe).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_ue_initial_registration_dereg_notify_deregisters_the_ue_locally() {
-        let _serial = crate::namf_server::dereg_queue_test_lock().lock().await;
         let (_nf, port, seen) = recording_nf().await;
+        // #1711: `SmfEnvGuard` (which takes `nf_cache_test_lock` first) before the
+        // dereg-queue lock, the one order every test takes them in.
         let _env = SmfEnvGuard::acquire(port).await;
+        let _serial = crate::namf_server::dereg_queue_test_lock().lock().await;
         std::env::set_var("PCF_SBI_ADDR", "127.0.0.1");
         std::env::set_var("PCF_SBI_PORT", port.to_string());
         crate::context::amf_context_init(64, 1024, 4096);

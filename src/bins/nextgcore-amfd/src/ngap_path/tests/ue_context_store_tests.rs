@@ -2166,9 +2166,11 @@ async fn a_registration_guti_of_another_region_is_not_looked_up() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_live_old_amf_forgets_a_taken_over_ue_without_releasing_it() {
     use super::super::ue_context_store::UeContextBackend as _;
-    let _serial = crate::namf_server::dereg_queue_test_lock().lock().await;
     let (_smf, port, seen) = fake_activating_smf().await;
+    // #1711: `SmfEnvGuard` (which takes `nf_cache_test_lock` first) before the
+    // dereg-queue lock, the one order every test takes them in.
     let _env = SmfEnvGuard::acquire(port).await;
+    let _serial = crate::namf_server::dereg_queue_test_lock().lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     const OLD: &str = "00000000-0000-4000-8000-0000000001d0";
     const PEER: &str = "00000000-0000-4000-8000-0000000001d1";
