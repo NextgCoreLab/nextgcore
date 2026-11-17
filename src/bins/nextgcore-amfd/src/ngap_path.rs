@@ -10937,14 +10937,22 @@ impl NgapServer {
         psi: u8,
         n1_sm: &[u8],
     ) -> Result<()> {
-        let plain = gmm_build::build_dl_nas_transport(
+        // #1636: an N1 SM over 65 535 octets cannot be framed (TS 24.501
+        // §9.11.3.39). It is refused, not truncated, and not sent bare either.
+        let Some(plain) = gmm_build::build_dl_nas_transport(
             Some(psi),
             payload_container_type::N1_SM_INFORMATION,
             n1_sm,
             None,
             None,
-        )
-        .unwrap_or_default();
+        ) else {
+            log::warn!(
+                "UE {amf_ue_ngap_id}: PSI {psi} N1 SM of {} bytes not sent: longer than a \
+                 payload container can carry",
+                n1_sm.len()
+            );
+            return Ok(());
+        };
 
         let pdu = match self.protect_nas(amf_ue_ngap_id, &plain) {
             Some(p) => p,
@@ -13336,6 +13344,12 @@ impl NgapServer {
     /// Protect a plain inner NAS message with the UE's security context
     /// (integrity protected + ciphered). Returns None without a context.
     fn protect_nas(&mut self, amf_ue_ngap_id: u64, plain: &[u8]) -> Option<Vec<u8>> {
+        // #1636: an empty plain message is a builder's refusal (an over-long
+        // payload container) passed on as `unwrap_or_default()`: nothing to send.
+        if plain.is_empty() {
+            log::warn!("UE {amf_ue_ngap_id}: no NAS message to protect; nothing is sent");
+            return None;
+        }
         // `with_mut`, NOT get-a-clone-and-mutate-it: `nas_5gs_security_encode`
         // INCREMENTS the downlink NAS COUNT, and that increment has to persist. A
         // mutation dropped with a clone would protect every downlink message with
@@ -21208,8 +21222,14 @@ pub(crate) struct ServiceRequestSessionIes {
 /// Whether an N1 SM the SMF answered is a 5GSM message (EPD 0x2E, TS 24.501 §9.2)
 /// for PDU session `psi`, so the AMF may relay it to the UE for that session (#1637,
 /// #1590 review). A mismatched or foreign N1 is not relayed.
+///
+/// #1636: an N1 longer than a payload container can carry (TS 24.501 §9.11.3.39) is
+/// not relayed either. The AMF answers with its own reject or #90 instead.
 fn smf_n1_for_session(n1: &[u8], psi: u8) -> bool {
-    n1.len() >= 4 && n1[0] == 0x2E && n1[1] == psi
+    n1.len() >= 4
+        && n1.len() <= gmm_build::MAX_PAYLOAD_CONTAINER_LEN
+        && n1[0] == 0x2E
+        && n1[1] == psi
 }
 
 /// The SMF an exchange for an existing session goes to (#669): the one holding its
@@ -25961,7 +25981,7 @@ mod tests {
         crate::context::amf_context_init(64, 1024, 4096);
         // The Initial Context Setup that carries the Service Accept needs a served
         // GUAMI; `served_guami` is process-global, so this holds CONTEXT_GUARD.
-        serve_only_local_guami();
+        let _guamis = serve_only_local_guami();
         nextgcore_core::test_log::init();
         for (i, demo_on) in [true, false].into_iter().enumerate() {
             let _mode = demo_on.then(|| {
@@ -37068,12 +37088,7 @@ mod tests {
         // The Initial Context Setup carrying the Service Accept needs a served GUAMI.
         // `served_guami` is process-global, so this holds CONTEXT_GUARD, and it is put
         // back at the end.
-        let saved_guamis = crate::context::amf_self()
-            .read()
-            .expect("ctx lock")
-            .served_guami
-            .clone();
-        serve_only_local_guami();
+        let _guamis = serve_only_local_guami();
         // Capturing, so the Initial Context Setup's send succeeds and the reports
         // after it fire.
         let mut ngap = capturing_ngap_server().await;
@@ -37133,10 +37148,6 @@ mod tests {
         ngap.ue_auth_state.remove(newer_id);
         plain.stop().await.expect("sink stop");
         cell.stop().await.expect("sink stop");
-        let ctx = crate::context::amf_self();
-        let mut ctx = ctx.write().expect("ctx lock");
-        ctx.num_of_served_guami = saved_guamis.len();
-        ctx.served_guami = saved_guamis;
     }
 
     /// **#1424**: a registration update's Registration Accept reports the UE's
@@ -37565,12 +37576,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let count = crate::namf_server::connected_reports_on_this_thread;
-        let saved_guamis = crate::context::amf_self()
-            .read()
-            .expect("ctx lock")
-            .served_guami
-            .clone();
-        serve_only_local_guami();
+        let _guamis = serve_only_local_guami();
         let mut ngap = capturing_ngap_server().await;
 
         // 1. Idle, back with a Service Request.
@@ -37624,10 +37630,6 @@ mod tests {
             "a connected Service Request: no CONNECTED"
         );
         ngap.ue_auth_state.remove(ue);
-        let ctx = crate::context::amf_self();
-        let mut ctx = ctx.write().expect("ctx lock");
-        ctx.num_of_served_guami = saved_guamis.len();
-        ctx.served_guami = saved_guamis;
     }
 
     /// **#1424**: [`NgapServer::report_location_change`] measures each dimension from
@@ -40448,12 +40450,28 @@ mod tests {
 
     /// Install `local_guami()` as the sole served GUAMI, so
     /// `registration_request_from_old_amf` has something real to compare against.
-    fn serve_only_local_guami() {
+    /// Serve only [`local_guami`] until the returned guard drops, which puts back
+    /// the GUAMIs served before, even on a panic (#1636, R5's #1624 review).
+    #[must_use = "the served GUAMIs are put back when this is dropped"]
+    fn serve_only_local_guami() -> ServedGuamiGuard {
         let ctx_arc = crate::context::amf_self();
         let mut ctx = ctx_arc.write().unwrap_or_else(|e| e.into_inner());
-        ctx.served_guami.clear();
+        let saved = std::mem::take(&mut ctx.served_guami);
         ctx.served_guami.push(local_guami());
         ctx.num_of_served_guami = 1;
+        ServedGuamiGuard(saved)
+    }
+
+    /// Restores the served GUAMIs [`serve_only_local_guami`] replaced.
+    struct ServedGuamiGuard(Vec<crate::context::Guami>);
+
+    impl Drop for ServedGuamiGuard {
+        fn drop(&mut self) {
+            let ctx_arc = crate::context::amf_self();
+            let mut ctx = ctx_arc.write().unwrap_or_else(|e| e.into_inner());
+            ctx.num_of_served_guami = self.0.len();
+            ctx.served_guami = std::mem::take(&mut self.0);
+        }
     }
 
     /// #352 criterion 4: a registration presenting a 5G-GUTI **this AMF issued**
@@ -40479,7 +40497,7 @@ mod tests {
         // with every other test that writes them, on the EXISTING guard.
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
-        serve_only_local_guami();
+        let _guamis = serve_only_local_guami();
 
         let mut ngap = test_ngap_server().await;
         // Distinct literal keys per #352 test: the store is process-global and
@@ -40593,7 +40611,7 @@ mod tests {
     async fn a_locally_issued_guti_with_no_held_context_still_requests_a_suci() {
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
-        serve_only_local_guami();
+        let _guamis = serve_only_local_guami();
 
         let mut ngap = test_ngap_server().await;
         // Distinct from every other #352 test, per the note on the test above.
@@ -40684,7 +40702,7 @@ mod tests {
 
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
-        serve_only_local_guami();
+        let _guamis = serve_only_local_guami();
 
         // Distinct from every other #352 test, per the note on the first one.
         let ngap_id = 7_352_030u64;
@@ -40899,7 +40917,7 @@ mod tests {
     async fn an_unreachable_old_amf_falls_back_to_identification_rather_than_rejecting() {
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
-        serve_only_local_guami();
+        let _guamis = serve_only_local_guami();
         // Neither an NRF nor a configured peer, so discovery must fail closed.
         // Removed rather than assumed absent: these tests share one process.
         std::env::remove_var("AMF_PEER_SBI_ADDR");
@@ -40976,7 +40994,7 @@ mod tests {
     async fn after_an_aborted_reallocation_the_ue_may_present_either_guti() {
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
-        serve_only_local_guami();
+        let _guamis = serve_only_local_guami();
 
         let mut ngap = test_ngap_server().await;
         // Distinct from every other #352 test, per the note on the first one.
