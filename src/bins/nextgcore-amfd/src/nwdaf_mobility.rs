@@ -328,10 +328,7 @@ pub async fn query_prediction(supi: &str) -> Result<Option<PredictedCell>, Strin
     let (host, port) = resolve_nwdaf_endpoint()
         .await
         .ok_or_else(|| "no NWDAF (NRF discovery found none, NWDAF_SBI_ADDR unset)".to_string())?;
-    let client = crate::attach_oauth2(
-        nextgcore_sbi::client::SbiClient::for_peer(&host, port),
-        nextgcore_sbi::types::NfType::Nwdaf,
-    );
+    let client = crate::sbi_path::peer_client(nextgcore_sbi::types::NfType::Nwdaf, &host, port);
     let response = client
         .get(&request_path(supi, std::time::SystemTime::now()))
         .await
