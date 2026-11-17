@@ -60,13 +60,19 @@ def run(workloads, pods, target='deployment/ue', limit=3):
 class CrashLoop(unittest.TestCase):
     def test_crash_loop_back_off_in_the_current_revision(self):
         self.assertEqual(run(CURRENT, [ue_pod('ue-new-a', 'new', waiting='CrashLoopBackOff',
-                                              restarts=2)]),
-                         [('ue-new-a', 'main', 'CrashLoopBackOff', 2)])
+                                              restarts=4)]),
+                         [('ue-new-a', 'main', 'CrashLoopBackOff', 4)])
+
+    def test_one_transient_crash_in_back_off_is_not(self):
+        # The kubelet enters CrashLoopBackOff after the first exit (#1671 review).
+        for restarts in (0, 1, 3):
+            self.assertEqual(run(CURRENT, [ue_pod('ue-new-a', 'new', waiting='CrashLoopBackOff',
+                                                  restarts=restarts)]), [], restarts)
 
     def test_an_init_container_crash_loop(self):
         self.assertEqual(run(CURRENT, [ue_pod('ue-new-a', 'new', waiting='CrashLoopBackOff',
-                                              init=True)]),
-                         [('ue-new-a', 'main', 'CrashLoopBackOff', 0)])
+                                              restarts=4, init=True)]),
+                         [('ue-new-a', 'main', 'CrashLoopBackOff', 4)])
 
     def test_restarts_over_the_limit_while_not_ready(self):
         self.assertEqual(run(CURRENT, [ue_pod('ue-new-a', 'new', restarts=4)]),
@@ -91,32 +97,33 @@ class CrashLoop(unittest.TestCase):
 
     def test_a_replicaset_of_another_deployment_is_not_the_current_one(self):
         workloads = [deployment(), replicaset('other', '2', owner='someone-else')]
-        self.assertEqual(run(workloads, [ue_pod('x', 'other', waiting='CrashLoopBackOff')]), [])
+        self.assertEqual(run(workloads, [ue_pod('x', 'other', waiting='CrashLoopBackOff',
+                                                 restarts=9)]), [])
 
     def test_a_terminating_pod_is_not(self):
         self.assertEqual(run(CURRENT, [ue_pod('ue-new-a', 'new', waiting='CrashLoopBackOff',
-                                              deleting=True)]), [])
+                                              restarts=9, deleting=True)]), [])
 
     def test_another_workloads_pod_is_not(self):
         other = pod('gnb-x', {'app.kubernetes.io/name': 'gnb', 'pod-template-hash': 'new'},
-                    waiting='CrashLoopBackOff')
+                    waiting='CrashLoopBackOff', restarts=9)
         self.assertEqual(run(CURRENT, [other]), [])
 
     def test_a_statefulset_current_revision(self):
         workloads = [statefulset()]
         pods = [pod('mongodb-0', {'app': 'mongodb', 'controller-revision-hash': 'mongodb-new'},
-                    waiting='CrashLoopBackOff'),
+                    waiting='CrashLoopBackOff', restarts=4),
                 pod('mongodb-1', {'app': 'mongodb', 'controller-revision-hash': 'mongodb-old'},
-                    waiting='CrashLoopBackOff')]
+                    waiting='CrashLoopBackOff', restarts=4)]
         self.assertEqual(run(workloads, pods, 'statefulset/mongodb'),
-                         [('mongodb-0', 'main', 'CrashLoopBackOff', 0)])
+                         [('mongodb-0', 'main', 'CrashLoopBackOff', 4)])
 
     def test_no_target_checks_every_workload(self):
-        pods = [ue_pod('ue-new-a', 'new', waiting='CrashLoopBackOff')]
-        self.assertEqual(run(CURRENT, pods, None), [('ue-new-a', 'main', 'CrashLoopBackOff', 0)])
+        pods = [ue_pod('ue-new-a', 'new', waiting='CrashLoopBackOff', restarts=4)]
+        self.assertEqual(run(CURRENT, pods, None), [('ue-new-a', 'main', 'CrashLoopBackOff', 4)])
 
     def test_an_unknown_target_finds_nothing(self):
-        pods = [ue_pod('ue-new-a', 'new', waiting='CrashLoopBackOff')]
+        pods = [ue_pod('ue-new-a', 'new', waiting='CrashLoopBackOff', restarts=9)]
         self.assertEqual(run(CURRENT, pods, 'deployment/gnb'), [])
 
 

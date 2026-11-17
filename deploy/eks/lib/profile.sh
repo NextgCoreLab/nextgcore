@@ -82,23 +82,38 @@ nextg_profile_sim_names() {
   echo "${out[*]}"
 }
 
-# nextg_rollout_wait KIND/NAME TIMEOUT_SECONDS (#1651)
+# nextg_rollout_wait KIND/NAME TIMEOUT_SECONDS [warn] (#1651)
 #   `kubectl rollout status KIND/NAME -n NAMESPACE --timeout=TIMEOUT_SECONDSs`,
 #   which only reports a crash-looping pod once its timeout expires. Every
-#   NEXTG_ROLLOUT_POLL seconds (default 5) lib/crashloop.py checks the pods of
-#   the workload's current revision; a container in CrashLoopBackOff, or not
-#   Ready after more than NEXTG_ROLLOUT_RESTART_LIMIT restarts (default 3), ends
-#   the wait at once with the container's last log lines. The deploy then fails
-#   through `die` when the caller defines one; otherwise this returns 3. Returns
-#   the rollout's own status when it ends first. A check that cannot list the
-#   cluster gives no verdict and the wait goes on.
+#   NEXTG_ROLLOUT_POLL seconds (a positive integer, default 5) lib/crashloop.py
+#   checks the pods of the workload's current revision. A container that is not
+#   Ready after more than NEXTG_ROLLOUT_RESTART_LIMIT restarts (default 3;
+#   CrashLoopBackOff included) ends the wait at once with the container's last
+#   log lines. The deploy then fails through `die` when the caller defines one,
+#   unless the third argument is `warn` (a non-critical workload such as
+#   monitoring); otherwise this returns 3. Returns the rollout's own status when
+#   it ends first. A check that cannot list the cluster gives no verdict and the
+#   wait goes on. An INT or TERM during the wait stops the background rollout
+#   wait too, then takes its usual effect: bash starts a background job with INT
+#   ignored, so without this it would outlive the deploy (and any lock it holds)
+#   until its own timeout.
 NEXTG_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 nextg_rollout_wait() {
-  local target="$1" timeout="$2" poll="${NEXTG_ROLLOUT_POLL:-5}"
-  local dir pid rc=0 ticks=0 found line pod container reason restarts
+  local target="$1" timeout="$2" mode="${3:-}" poll="${NEXTG_ROLLOUT_POLL:-5}"
+  local dir pid rc=0 ticks=0 found pod container reason restarts prev_int prev_term
+  if ! [[ "${poll}" =~ ^[1-9][0-9]*$ ]]; then
+    warn "NEXTG_ROLLOUT_POLL must be a positive number of seconds, not '${poll}'; using 5"
+    poll=5
+  fi
   dir="$(mktemp -d)"
   kubectl rollout status "${target}" -n "${NAMESPACE}" --timeout="${timeout}s" &
   pid=$!
+  prev_int="$(trap -p INT)"
+  prev_term="$(trap -p TERM)"
+  # On a signal: stop the background wait, restore the caller's traps, then
+  # deliver the signal again so it acts as it would have.
+  trap 'kill "${pid}" 2>/dev/null; wait "${pid}" 2>/dev/null; rm -rf "${dir}"; trap - INT TERM; eval "${prev_int}"; eval "${prev_term}"; kill -s INT "${BASHPID}"' INT
+  trap 'kill "${pid}" 2>/dev/null; wait "${pid}" 2>/dev/null; rm -rf "${dir}"; trap - INT TERM; eval "${prev_int}"; eval "${prev_term}"; kill -s TERM "${BASHPID}"' TERM
   while kill -0 "${pid}" 2>/dev/null; do
     sleep 0.2
     ticks=$((ticks + 1))
@@ -112,18 +127,20 @@ nextg_rollout_wait() {
     kill "${pid}" 2>/dev/null
     wait "${pid}" 2>/dev/null
     rm -rf "${dir}"
+    trap - INT TERM; eval "${prev_int}"; eval "${prev_term}"
     while read -r pod container reason restarts; do
       warn "${target}: pod ${pod} container ${container} is crash-looping (${reason}, ${restarts} restarts); its last log lines:"
       kubectl logs "${pod}" -c "${container}" -n "${NAMESPACE}" --previous --tail=20 2>/dev/null \
         || kubectl logs "${pod}" -c "${container}" -n "${NAMESPACE}" --tail=20 2>/dev/null \
         || true
     done <<<"${found}"
-    if declare -F die >/dev/null; then
+    if [[ "${mode}" != warn ]] && declare -F die >/dev/null; then
       die "${target} is crash-looping; not waiting out its ${timeout}s rollout timeout"
     fi
     return 3
   done
   wait "${pid}" || rc=$?
   rm -rf "${dir}"
+  trap - INT TERM; eval "${prev_int}"; eval "${prev_term}"
   return "${rc}"
 }

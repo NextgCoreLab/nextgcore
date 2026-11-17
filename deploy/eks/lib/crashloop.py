@@ -17,8 +17,11 @@ Only the pods of the workload's CURRENT revision count: during a rolling update
 the previous ReplicaSet's pods stay up until the new ones are Ready, and a deploy
 that fixes a crash loop must not be failed by the crash loop it is replacing.
 Terminating pods are skipped. A container (init or regular) is crash-looping when
-it waits in CrashLoopBackOff, or when it is not Ready and has restarted more than
-NEXTG_ROLLOUT_RESTART_LIMIT times (default 3).
+it is not Ready and has restarted more than NEXTG_ROLLOUT_RESTART_LIMIT times
+(default 3); it is reported as CrashLoopBackOff when it waits in that state. The
+kubelet enters CrashLoopBackOff after the first exit, so a single transient crash
+is not counted; with the kubelet's back-off a real loop passes the limit in about
+80 s.
 
 Prints one line per crash-looping container, `pod container reason restarts`,
 and exits 1 when there is any; 0 when there is none; 2 when the input does not
@@ -77,10 +80,13 @@ def crash_looping(pod, restart_limit):
     for cs in (status.get('initContainerStatuses') or []) + (status.get('containerStatuses') or []):
         waiting = (cs.get('state') or {}).get('waiting') or {}
         restarts = cs.get('restartCount') or 0
-        if waiting.get('reason') == 'CrashLoopBackOff':
-            out.append((cs.get('name', '?'), 'CrashLoopBackOff', restarts))
-        elif restarts > restart_limit and not cs.get('ready'):
-            out.append((cs.get('name', '?'), 'Restarting', restarts))
+        # The kubelet enters CrashLoopBackOff after the first exit, so the
+        # restart limit applies to it too: one transient crash is not a loop
+        # (#1671 review).
+        if restarts <= restart_limit or cs.get('ready'):
+            continue
+        reason = 'CrashLoopBackOff' if waiting.get('reason') == 'CrashLoopBackOff' else 'Restarting'
+        out.append((cs.get('name', '?'), reason, restarts))
     return out
 
 
