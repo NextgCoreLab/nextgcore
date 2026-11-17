@@ -43,7 +43,7 @@ pcrf:
 
 ## YAML parameters
 
-`main.rs` checks whether the `-c` file exists. A **missing** file is not an error: the daemon starts on the flags and built-in defaults (logged at debug). A file that **exists** is parsed by `pcrf_context_parse_config`. If it cannot be read or is not valid YAML, **startup fails** ("Failed to parse config ..."). A file with no `pcrf:` section, or a `pcrf:` section with no `diameter` block, is valid and keeps the defaults. The top-level `db_uri` is read separately by `resolve_db_uri` in `main.rs` (#1459), and `logger.level` by the shared `nf_log_level`.
+`main.rs` checks whether the `-c` file exists. A **missing** file is not an error: the daemon starts on the flags and built-in defaults (logged at debug). A file that **exists** is parsed by `pcrf_context_parse_config`. If it cannot be read or is not valid YAML, **startup fails** ("Failed to parse config ..."). A file with no `pcrf:` section is valid and keeps the defaults. So is a `pcrf:` section with neither a `diameter` block nor a `freeDiameter` key; with only `freeDiameter`, that file supplies what it states. The top-level `db_uri` is read separately by `resolve_db_uri` in `main.rs` (#1459), and `logger.level` by the shared `nf_log_level`.
 
 ### `pcrf.diameter`
 
@@ -63,6 +63,7 @@ A path to a freeDiameter-style `.conf`. It is loaded with `nextgcore_diameter::f
 - `Identity`, `Realm`, the **first** `ListenOn` and `Port` set the identity, realm, listen host and listen port. `SecPort` is stored like `port_tls` and is just as inert.
 - `ConnectPeer` is parsed and dropped, because the PCRF never dials out: it only accepts inbound connections. The flags (`No_IPv6`, `No_TCP`, `NoRelay`, ...) are also parsed and not applied.
 - Any other directive is logged at info as "directives not interpreted".
+- A directive from the list above whose value does not parse (`Port = "abc"`, `Port = 70000`, `ListenOn = ""`) sets nothing. Each one is logged at WARN as `'<Directive> = <value>' does not parse`, and the next source applies: the YAML, a flag, or the default. An earlier valid occurrence of the same directive stands.
 - A file that cannot be read is a **warning**, not a startup failure, and the daemon continues without it.
 
 The path is recorded in the context for diagnosis. The `--diameter-config` flag does not feed this loader and is never read.
