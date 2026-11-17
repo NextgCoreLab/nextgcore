@@ -37,10 +37,13 @@ const URN_UUID_PREFIX: &str = "urn:uuid:";
 /// `subjectAltName` extension, or carries one with no URI entry — every one of
 /// which means "this peer asserted no NF identity", not "trust it anyway".
 ///
-/// When several URI SANs are present the **first** is used, matching the
-/// convention already applied to the forwarded-certificate header (the leaf
-/// entry wins). A certificate with two URI SANs naming different NFs is
-/// malformed for this purpose; picking the first is at least deterministic.
+/// When several URI SANs are present, the first `urn:uuid:` one is used (#1611):
+/// TS 33.310 §6.1.3c.3 puts the NF Instance ID in a URI-ID "as an URN", and
+/// also lets the same certificate carry HTTPS URI-IDs for the NF's apiRoot, in
+/// any order. Without a `urn:uuid:` entry the **first** URI SAN is used, matching
+/// the convention already applied to the forwarded-certificate header. A
+/// certificate with two URNs naming different NFs is malformed for this
+/// purpose; picking the first is at least deterministic.
 ///
 /// The `urn:uuid:` prefix is stripped so the result compares directly against a
 /// `nfInstanceId`. Any other URI form is returned verbatim, because a deployment
@@ -55,14 +58,28 @@ pub fn nf_instance_id_from_der(der: &[u8]) -> Option<String> {
         .find(|e| e.extn_id == SubjectAltName::OID)?;
     let san = SubjectAltName::from_der(san_ext.extn_value.as_bytes()).ok()?;
 
-    san.0.iter().find_map(|name| match name {
-        GeneralName::UniformResourceIdentifier(uri) => normalize_uri_san(uri.as_str()),
-        _ => None,
-    })
+    let uris: Vec<&str> = san
+        .0
+        .iter()
+        .filter_map(|name| match name {
+            GeneralName::UniformResourceIdentifier(uri) => Some(uri.as_str()),
+            _ => None,
+        })
+        .collect();
+    let is_urn_uuid = |uri: &str| {
+        uri.trim()
+            .get(..URN_UUID_PREFIX.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(URN_UUID_PREFIX))
+    };
+    uris.iter()
+        .copied()
+        .filter(|uri| is_urn_uuid(uri))
+        .chain(uris.iter().copied())
+        .find_map(normalize_uri_san)
 }
 
 /// The RFC 9310 NFTypes certificate extension, `id-pe-nftype`
-/// (1.3.6.1.5.5.7.1.34). TS 33.310 §6.1.3c.2: "nfTypes shall contain NF type for
+/// (1.3.6.1.5.5.7.1.34). TS 33.310 §6.1.3c.3: "nfTypes shall contain NF type for
 /// the Network Function instance formatted according to RFC 9310".
 pub const NF_TYPES_OID: x509_cert::der::oid::ObjectIdentifier =
     x509_cert::der::oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.1.34");
@@ -189,6 +206,34 @@ pub(crate) mod tests {
             "an OCTET STRING, not a SEQUENCE OF IA5String"
         );
         assert!(nf_types_from_der(b"not a certificate").is_empty());
+    }
+
+    /// #1611, TS 33.310 §6.1.3c.3: a certificate that lists its apiRoot HTTPS
+    /// URI-ID before the NF Instance ID URN still yields the NF Instance ID.
+    #[test]
+    fn prefers_the_urn_uuid_san_over_an_earlier_https_uri_1611() {
+        use rcgen::{CertificateParams, KeyPair, SanType};
+        let mut params = CertificateParams::new(Vec::new()).expect("params");
+        params.subject_alt_names = vec![
+            SanType::URI("https://amf.example.org:443".try_into().expect("ia5")),
+            SanType::URI(
+                "URN:UUID:4947a69a-f61b-4bc1-b9da-47c9c5d14b64"
+                    .try_into()
+                    .expect("ia5"),
+            ),
+        ];
+        let key = KeyPair::generate().expect("key");
+        let der = params.self_signed(&key).expect("cert").der().to_vec();
+        assert_eq!(
+            nf_instance_id_from_der(&der).as_deref(),
+            Some("4947a69a-f61b-4bc1-b9da-47c9c5d14b64")
+        );
+        // Without a URN the first URI SAN is still the identity, as before.
+        let der = cert_with_uri_san("https://amf.example.org:443");
+        assert_eq!(
+            nf_instance_id_from_der(&der).as_deref(),
+            Some("https://amf.example.org:443")
+        );
     }
 
     /// **Issue #186.** The NF Instance ID is recovered from a real certificate's
