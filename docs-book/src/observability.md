@@ -124,6 +124,7 @@ Counted at the Nsmf_PDUSession_CreateSMContext answer (TS 29.502 §5.2.2.2), mod
 | `nrf_discovery_failure_total` | counter | | NFDiscover rejected (any other status) |
 | `nrf_discovery_empty_total` | counter | | SearchResults that matched no instance (routine for an optional NF type that is not deployed) |
 | `nrf_access_tokens_total` | counter | `result` (`granted`, `denied`) | access token requests |
+| `nrf_cca_trusted_key_conflicts_total` | counter | | NFs whose CCA trusted keys conflict (differently cased IDs, different keys), so their CCA is refused (#1633) |
 
 ### PCF families (`src/bins/nextgcore-pcfd/src/metrics.rs`, #1334)
 
