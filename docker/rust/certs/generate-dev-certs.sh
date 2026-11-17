@@ -10,7 +10,8 @@
 # registering (TS 33.501 §13.1.0, §5.9.2.2; nextgcore #1611, #1617):
 #   - subjectAltName URI-ID  urn:uuid:<nfInstanceId>   (from nf-identities.txt)
 #   - RFC 9310 NFTypes       <nfType>                  (from nf-identities.txt)
-#   - subjectAltName DNS-IDs and IPs of this NF only (and loopback)
+#   - subjectAltName DNS-IDs and IPs of this NF only (loopback only with
+#     --loopback, see below)
 #   - keyUsage               critical, digitalSignature
 #   - extendedKeyUsage       serverAuth, clientAuth (an NF is both)
 #   - subjectKeyIdentifier / authorityKeyIdentifier (RFC 5280 method 1)
@@ -21,6 +22,17 @@
 #   ./generate-dev-certs.sh --out DIR       # Generate into DIR
 #   ./generate-dev-certs.sh --clean [...]   # Remove existing certs first
 #   ./generate-dev-certs.sh --ids FILE      # Use another identity table
+#   ./generate-dev-certs.sh --loopback      # Also name localhost/127.0.0.1
+#
+# --loopback adds DNS:localhost and IP:127.0.0.1 to EVERY NF certificate, so
+# any NF's certificate then passes as the server for a peer addressed by
+# loopback. It is for a single dev host whose NFs dial each other on
+# 127.0.0.1, and it WARNs. Without it, a TLS client on the same host dials the
+# NF by its name (DNS:<nf>), or names it explicitly (NEXTGCORE_NRF_TLS_SERVER_NAME).
+#
+# Private keys are written 0600. The CA has pathLenConstraint 0, so it cannot
+# certify a sub-CA. A CA issued without it is re-issued, with every NF
+# certificate.
 #
 # Re-running keeps the CA and every NF certificate that already carries the
 # URN and NFTypes its table entry names. A certificate that does not (one
@@ -37,12 +49,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT_DIR="$SCRIPT_DIR"
 IDS_FILE="$SCRIPT_DIR/nf-identities.txt"
 CLEAN=0
+LOOPBACK=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --clean) CLEAN=1; shift ;;
         --out)   OUT_DIR="${2:?--out needs a directory}"; shift 2 ;;
         --ids)   IDS_FILE="${2:?--ids needs a file}"; shift 2 ;;
-        -h|--help) sed -n '2,31p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        --loopback) LOOPBACK=1; shift ;;
+        -h|--help) sed -n '2,43p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -52,6 +66,14 @@ command -v openssl >/dev/null || { echo "openssl not found" >&2; exit 1; }
 mkdir -p "$OUT_DIR"
 IDS_FILE="$(cd "$(dirname "$IDS_FILE")" && pwd)/$(basename "$IDS_FILE")"
 cd "$OUT_DIR"
+# Every private key this script writes is readable by its owner only.
+umask 077
+
+if [[ "$LOOPBACK" == 1 ]]; then
+    echo "WARN: --loopback: every NF certificate also names DNS:localhost and" \
+         "IP:127.0.0.1, so any NF's certificate passes as the server of a peer" \
+         "addressed by loopback. Single-host dev use only." >&2
+fi
 
 # ---- Config ----------------------------------------------------------------
 CA_DAYS=3650       # dev root CA
@@ -97,9 +119,19 @@ if [[ "$CLEAN" == 1 ]]; then
     rm -f ca.crt ca.key ca.srl ./*.crt ./*.key ./*.csr ./*.ext
 fi
 
-if [[ -f ca.crt && -f ca.key ]]; then
+# Whether ca.crt is a CA that cannot certify a sub-CA (pathlen:0).
+ca_is_current() {
+    [[ -f ca.crt && -f ca.key ]] || return 1
+    openssl x509 -in ca.crt -noout -text 2>/dev/null \
+        | grep -A1 "Basic Constraints" | grep -q "CA:TRUE, pathlen:0"
+}
+
+if ca_is_current; then
     echo "CA certificate already exists (use --clean to regenerate)"
 else
+    if [[ -f ca.crt ]]; then
+        echo "   ca.crt has no pathlen:0 (or no key): re-issuing the CA and every NF certificate"
+    fi
     echo "==> Generating CA key and self-signed certificate"
     # A config file rather than -addext, which OpenSSL 1.0.x lacks.
     cat > ca.ext <<EXTEOF
@@ -112,7 +144,7 @@ C = ${COUNTRY}
 O = ${HOME_DOMAIN}
 CN = NextGCore Dev CA
 [v3_ca]
-basicConstraints = critical, CA:TRUE
+basicConstraints = critical, CA:TRUE, pathlen:0
 keyUsage = critical, keyCertSign, cRLSign
 subjectKeyIdentifier = hash
 EXTEOF
@@ -137,7 +169,8 @@ nf_types_der_hex() {
 # The subjectAltName of <nf>.crt as `openssl x509 -text` prints it.
 expected_san() {
     local NF="$1" ip san
-    san="URI:urn:uuid:${NF_ID[$NF]}, DNS:${NF}, DNS:nextgcore-${NF}, DNS:localhost, IP Address:127.0.0.1"
+    san="URI:urn:uuid:${NF_ID[$NF]}, DNS:${NF}, DNS:nextgcore-${NF}"
+    if [[ "$LOOPBACK" == 1 ]]; then san+=", DNS:localhost, IP Address:127.0.0.1"; fi
     if [[ "${NF_IPS[$NF]}" != "-" ]]; then
         for ip in ${NF_IPS[$NF]//,/ }; do san+=", IP Address:${ip}"; done
     fi
@@ -166,7 +199,7 @@ generate_nf_cert() {
         return
     fi
     if [[ -f "${NF}.crt" ]]; then
-        echo "   ${NF}.crt lacks urn:uuid:${NF_ID[$NF]} / NFTypes ${NF_TYPE[$NF]}, or another CA issued it: re-issuing"
+        echo "   ${NF}.crt does not carry urn:uuid:${NF_ID[$NF]}, NFTypes ${NF_TYPE[$NF]} and exactly its SANs, or another CA issued it: re-issuing"
     fi
 
     {
@@ -185,12 +218,15 @@ nfType.1 = IA5STRING:${NF_TYPE[$NF]}
 URI.1 = urn:uuid:${NF_ID[$NF]}
 DNS.1 = ${NF}
 DNS.2 = nextgcore-${NF}
-DNS.3 = localhost
-IP.1 = 127.0.0.1
 EXTEOF
+        idx=1
+        if [[ "$LOOPBACK" == 1 ]]; then
+            echo "DNS.3 = localhost"
+            echo "IP.1 = 127.0.0.1"
+            idx=2
+        fi
         # Only this NF's own addresses: a certificate naming every NF's
         # address would let any NF pass as any other NF's server.
-        idx=2
         if [[ "${NF_IPS[$NF]}" != "-" ]]; then
             for ip in ${NF_IPS[$NF]//,/ }; do
                 echo "IP.${idx} = ${ip}"; idx=$((idx + 1))
@@ -223,6 +259,8 @@ for NF in "${NF_LIST[@]}"; do
 done
 
 rm -f ca.srl
+# Keys kept from an earlier run (before the 0600 umask) are tightened too.
+chmod 600 ./*.key
 
 echo ""
 echo "==> Certificate summary ($(pwd)):"
@@ -233,4 +271,4 @@ for NF in "${NF_LIST[@]}"; do
 done
 echo ""
 echo "    To verify an NRF that serves TLS:"
-echo "    openssl s_client -connect localhost:7777 -CAfile ca.crt -verify_return_error < /dev/null"
+echo "    openssl s_client -connect localhost:7777 -verify_hostname nrf -CAfile ca.crt -verify_return_error < /dev/null"

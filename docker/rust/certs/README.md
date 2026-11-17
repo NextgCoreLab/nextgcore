@@ -15,6 +15,9 @@ This directory holds the generator for the TLS certificates that secure the SBI
 # Or somewhere else
 ./generate-dev-certs.sh --out /tmp/nextgcore-certs
 
+# Single dev host whose NFs dial each other on loopback (WARNs, see below)
+./generate-dev-certs.sh --loopback
+
 # Inspect one
 openssl x509 -in amf.crt -noout -text
 ```
@@ -35,12 +38,16 @@ client and server certificate profile of TS 33.310 §6.1.3c.3:
 | Field | Value |
 |-------|-------|
 | Subject | `C=US, O=5gc.mnc070.mcc999.3gppnetwork.org, CN=<nf>` (override the home domain with `HOME_DOMAIN`) |
-| subjectAltName | `URI:urn:uuid:<nfInstanceId>`, `DNS:<nf>`, `DNS:nextgcore-<nf>`, `DNS:localhost`, `IP:127.0.0.1`, plus the NF's addresses from the table |
+| subjectAltName | `URI:urn:uuid:<nfInstanceId>`, `DNS:<nf>`, `DNS:nextgcore-<nf>`, plus the NF's addresses from the table (`DNS:localhost`, `IP:127.0.0.1` only with `--loopback`) |
 | NFTypes (RFC 9310, 1.3.6.1.5.5.7.1.34) | `<nfType>` |
 | keyUsage | critical, digitalSignature |
 | extendedKeyUsage | serverAuth, clientAuth (an NF is both) |
 | subjectKeyIdentifier / authorityKeyIdentifier | RFC 5280 method (1) |
 | Validity | 3 years (the CA: 10 years) |
+| cRLDistributionPoints | **absent** (see "Known deviations") |
+
+The CA is `basicConstraints = critical, CA:TRUE, pathlen:0`: it signs NF
+certificates and cannot certify a sub-CA.
 
 The URN and the NFTypes are what the NRF checks a registrant against:
 NFRegister, NFUpdate and NFDeregister must name the nfInstanceId and nfType of
@@ -55,11 +62,27 @@ random UUID at start that no certificate names.
 [`check-nf-identities.py`](check-nf-identities.py) (run in CI) fails when a
 compose file pins an ID other than the table's.
 
-Each certificate names only its own NF in its DNS and IP SANs (plus loopback),
-so one NF's certificate cannot pass as another NF's server identity.
+Each certificate names only its own NF in its DNS and IP SANs, so one NF's
+certificate cannot pass as another NF's server identity.
 
-The private keys keep the default file mode, so the non-root `nextgcore` user
-in the containers can read them through the bind mount.
+### Loopback
+
+By default no certificate names `localhost` or `127.0.0.1`. Every certificate
+naming them would let any NF's certificate pass as the server of any peer
+addressed by loopback, which is the impersonation the per-NF SANs remove.
+A client on the same host dials the NF by a name its certificate carries
+(`DNS:<nf>`), or, for the NRF, sets `NEXTGCORE_NRF_TLS_SERVER_NAME=nrf` to
+verify the NRF's certificate against that name while dialling `127.0.0.1`.
+`--loopback` restores the loopback SANs on every certificate for a single dev
+host, and prints a WARN. Switching it on or off re-issues the certificates.
+
+### Private keys
+
+Every `*.key` is written `0600` (and a key kept from an earlier run is
+tightened to `0600`). A container whose user is not the key's owner cannot read
+it through a bind mount: the deployment must give the key to the container's
+user (for example a copy owned by that user, or a Kubernetes Secret with
+`defaultMode`/`fsGroup`), rather than widening the file mode.
 
 ## Re-running
 
@@ -67,6 +90,13 @@ Re-running keeps the CA and every NF certificate that already carries the
 identity its table row names. A certificate that does not (one issued before
 #1617, or for a changed ID or type) is re-issued, and the script says so.
 `--clean` removes everything and starts over.
+
+## Known deviations from TS 33.310 Table 6.1.3c.3-1
+
+- **cRLDistributionPoints** is "Mandatory: TRUE" in the profile and is not
+  issued. This dev PKI has no CRL and revokes nothing, so a distribution point
+  would name a URL that serves nothing. Do not copy this profile as conformant:
+  an operator PKI must carry the extension.
 
 ## Production TLS
 

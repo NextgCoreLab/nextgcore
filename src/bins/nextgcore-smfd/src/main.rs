@@ -2038,10 +2038,10 @@ async fn smf_nrf_register(sbi_addr: &str, sbi_port: u16) -> std::result::Result<
     let sbi_ctx = global_context();
 
     // Prefer the URI seeded from YAML config; fall back to NRF_URI env var
-    let nrf_uri = match sbi_ctx.get_nrf_uri().await {
-        Some(uri) => uri,
+    let (nrf_uri, from_context) = match sbi_ctx.get_nrf_uri().await {
+        Some(uri) => (uri, true),
         None => match std::env::var("NRF_URI").ok() {
-            Some(uri) => uri,
+            Some(uri) => (uri, false),
             None => {
                 log::debug!("No NRF URI configured, skipping NRF registration");
                 return Ok(String::new());
@@ -2052,7 +2052,15 @@ async fn smf_nrf_register(sbi_addr: &str, sbi_port: u16) -> std::result::Result<
     log::info!("Registering SMF with NRF at {nrf_uri}");
 
     let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
-    let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
+    // #1617: get_client knows the context's NRF; an NRF_URI-only NRF is dialled
+    // with the same NRF client TLS directly.
+    let client = if from_context {
+        sbi_ctx.get_client(&nrf_host, nrf_port).await
+    } else {
+        std::sync::Arc::new(
+            nextgcore_sbi::client::SbiClient::for_nrf_uri(&nrf_uri).ok_or("Invalid NRF URI")?,
+        )
+    };
 
     let nf_instance_id =
         nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Smf)
@@ -2214,13 +2222,21 @@ pub(crate) async fn discover_udm_uecm_endpoint() -> Option<(String, u16)> {
 async fn discover_udm_service_endpoint(service: &str) -> Option<(String, u16)> {
     let sbi_ctx = global_context();
     let nrf_uri = match sbi_ctx.get_nrf_uri().await {
-        Some(uri) => Some(uri),
-        None => std::env::var("NRF_URI").ok(),
+        Some(uri) => Some((uri, true)),
+        None => std::env::var("NRF_URI").ok().map(|uri| (uri, false)),
     };
 
-    if let Some(nrf_uri) = nrf_uri {
+    if let Some((nrf_uri, from_context)) = nrf_uri {
         if let Some((nrf_host, nrf_port)) = parse_host_port(&nrf_uri) {
-            let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
+            // #1617: as in smf_nrf_register, an NRF_URI-only NRF still gets the
+            // NRF client TLS.
+            let client = match (
+                from_context,
+                nextgcore_sbi::client::SbiClient::for_nrf_uri(&nrf_uri),
+            ) {
+                (false, Some(c)) => std::sync::Arc::new(c),
+                _ => sbi_ctx.get_client(&nrf_host, nrf_port).await,
+            };
             let path = format!(
                 "/nnrf-disc/v1/nf-instances\
                  ?target-nf-type=UDM&requester-nf-type=SMF&service-names={service}"

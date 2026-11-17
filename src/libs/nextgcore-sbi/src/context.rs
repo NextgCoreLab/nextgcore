@@ -419,15 +419,34 @@ impl SbiContext {
         self_instance.clone()
     }
 
-    /// Set the NRF URI
+    /// Set the NRF URI.
+    ///
+    /// [`SbiContext::get_client`] dials this URI's authority with the NRF
+    /// client TLS (#1617), so a client cached for the old or the new NRF
+    /// authority is dropped: it was built for the other role.
     pub async fn set_nrf_uri(&self, uri: impl Into<String>) {
-        let mut nrf_uri = self.nrf_uri.write().await;
-        *nrf_uri = Some(uri.into());
+        let uri = uri.into();
+        crate::nrf_tls::log_nrf_client_tls(&uri);
+        let old = self.nrf_uri.write().await.replace(uri.clone());
+        self.forget_nrf_clients(old.iter().chain(std::iter::once(&uri)))
+            .await;
     }
 
     /// Forget the NRF URI (a test restoring the "no NRF configured" state).
     pub async fn clear_nrf_uri(&self) {
-        *self.nrf_uri.write().await = None;
+        let old = self.nrf_uri.write().await.take();
+        self.forget_nrf_clients(old.iter()).await;
+    }
+
+    async fn forget_nrf_clients(&self, uris: impl Iterator<Item = &String>) {
+        let uris: Vec<&String> = uris.collect();
+        let mut clients = self.clients.write().await;
+        clients.retain(|_, client| {
+            let c = client.config();
+            !uris
+                .iter()
+                .any(|u| crate::nrf_tls::is_nrf_authority(u, &c.host, c.port))
+        });
     }
 
     /// Get the NRF URI
@@ -612,7 +631,11 @@ impl SbiContext {
         self.healthy_first(found)
     }
 
-    /// Get or create a client for the given endpoint
+    /// Get or create a client for the given endpoint.
+    ///
+    /// The NRF's authority (from [`SbiContext::set_nrf_uri`]) gets the NRF
+    /// client TLS ([`crate::nrf_tls::nrf_client_config`], #1617); every other
+    /// peer the process-wide SBI profile (#63).
     pub async fn get_client(&self, host: &str, port: u16) -> Arc<SbiClient> {
         let key = format!("{host}:{port}");
 
@@ -628,7 +651,18 @@ impl SbiContext {
         // Issue #63: this cache hands out clients for dialling PEER NFs, so it
         // must honour the SBI security profile. Left cleartext it would silently
         // undo the outbound half for every NF that resolves peers through it.
-        let config = crate::security::sbi_peer_client_config(host, port);
+        let nrf_scheme = self.nrf_uri.read().await.as_deref().and_then(|uri| {
+            crate::nrf_tls::is_nrf_authority(uri, host, port)
+                .then(|| crate::nrf_tls::parse_nrf_uri(uri))
+                .flatten()
+                .map(|(scheme, _, _)| {
+                    crate::nrf_tls::nrf_scheme(scheme, crate::security::SbiProfile::resolve())
+                })
+        });
+        let config = match nrf_scheme {
+            Some(scheme) => crate::nrf_tls::nrf_client_config(scheme, host, port),
+            None => crate::security::sbi_peer_client_config(host, port),
+        };
         let client = Arc::new(SbiClient::new(config));
 
         let mut clients = self.clients.write().await;

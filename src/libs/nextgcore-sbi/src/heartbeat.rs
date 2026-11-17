@@ -388,22 +388,11 @@ pub fn init_heartbeat_manager() {
 // NF-side outbound heartbeat worker
 // ---------------------------------------------------------------------------
 
-/// Parse host and port from a URI string (e.g., "http://localhost:7777").
-fn parse_nrf_host_port(uri: &str) -> Option<(String, u16)> {
-    let without_scheme = uri
-        .strip_prefix("https://")
-        .or_else(|| uri.strip_prefix("http://"))
-        .unwrap_or(uri);
-    let (host_port, _path) = without_scheme
-        .split_once('/')
-        .unwrap_or((without_scheme, ""));
-    if let Some((host, port_str)) = host_port.rsplit_once(':') {
-        let port: u16 = port_str.parse().ok()?;
-        Some((host.to_string(), port))
-    } else {
-        let default_port = if uri.starts_with("https://") { 443 } else { 80 };
-        Some((host_port.to_string(), default_port))
-    }
+/// The client every NRF request in this module goes through: `https` with the
+/// NRF client TLS for an `https://` NRF URI or the production profile, so the
+/// NRF can bind the registration to this NF's certificate (#1617).
+fn nrf_client(nrf_uri: &str) -> Result<SbiClient, String> {
+    SbiClient::for_nrf_uri(nrf_uri).ok_or_else(|| format!("invalid NRF URI '{nrf_uri}'"))
 }
 
 /// Build the RFC 6902 JSON Patch body for an NRF heartbeat that also reports a
@@ -643,9 +632,7 @@ pub async fn reregister_self(nf_instance_id: &str) -> Result<u16, String> {
         .get_nrf_uri()
         .await
         .ok_or_else(|| "no NRF URI configured".to_string())?;
-    let (nrf_host, nrf_port) =
-        parse_nrf_host_port(&nrf_uri).ok_or_else(|| format!("invalid NRF URI '{nrf_uri}'"))?;
-    let client = SbiClient::with_host_port(&nrf_host, nrf_port);
+    let client = nrf_client(&nrf_uri)?;
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     match client.put_json(&path, &profile).await {
         Ok(resp) if resp.status == 200 || resp.status == 201 => {
@@ -973,9 +960,7 @@ pub async fn deregister_nf(nf_instance_id: &str) -> Result<(), String> {
         .get_nrf_uri()
         .await
         .ok_or_else(|| "no NRF URI configured".to_string())?;
-    let (nrf_host, nrf_port) =
-        parse_nrf_host_port(&nrf_uri).ok_or_else(|| format!("invalid NRF URI '{nrf_uri}'"))?;
-    let client = SbiClient::with_host_port(&nrf_host, nrf_port);
+    let client = nrf_client(&nrf_uri)?;
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     // #1334: deleting this process's own profile ends its registration.
     let own = registered_nf_instance_id().as_deref() == Some(nf_instance_id);
@@ -1107,9 +1092,7 @@ pub async fn patch_nf_status(
         .get_nrf_uri()
         .await
         .ok_or_else(|| "no NRF URI configured".to_string())?;
-    let (nrf_host, nrf_port) =
-        parse_nrf_host_port(&nrf_uri).ok_or_else(|| format!("invalid NRF URI '{nrf_uri}'"))?;
-    let client = SbiClient::with_host_port(&nrf_host, nrf_port);
+    let client = nrf_client(&nrf_uri)?;
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     let body = build_status_patch(load, status);
     let request = SbiRequest::patch(&path)
@@ -1256,15 +1239,13 @@ where
                 }
             };
 
-            let (nrf_host, nrf_port) = match parse_nrf_host_port(&nrf_uri) {
-                Some(hp) => hp,
-                None => {
-                    log::warn!("Heartbeat: could not parse NRF URI '{nrf_uri}'");
+            let client = match nrf_client(&nrf_uri) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::warn!("Heartbeat: {e}");
                     continue;
                 }
             };
-
-            let client = SbiClient::with_host_port(&nrf_host, nrf_port);
             let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
             let body = build_load_patch(load);
 

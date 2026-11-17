@@ -402,9 +402,10 @@ pub async fn subscribe_with_body_answer(
     nrf_uri: &str,
     body: &Value,
 ) -> Result<(AmfSubscription, Value), String> {
-    let (nrf_host, nrf_port, nrf_base) = crate::notification_dispatcher::parse_notify_uri(nrf_uri)
+    let (_, _, nrf_base) = crate::notification_dispatcher::parse_notify_uri(nrf_uri)
         .ok_or_else(|| format!("invalid NRF URI {nrf_uri:?}"))?;
-    let nrf = crate::notification_dispatcher::notify_client(&nrf_host, nrf_port);
+    let nrf = crate::notification_dispatcher::nrf_client(nrf_uri)
+        .ok_or_else(|| format!("invalid NRF URI {nrf_uri:?}"))?;
     let disc = format!(
         "{}/nnrf-disc/v1/nf-instances?target-nf-type=AMF&requester-nf-type=NWDAF\
          &service-names=namf-evts",

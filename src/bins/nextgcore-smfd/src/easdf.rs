@@ -256,8 +256,9 @@ pub async fn delete_dns_context(supi: &str, ctx_id: &str) {
 /// EASDF is registered, which is the normal state in a deployment that does not
 /// run one — logged at debug, not warn, for exactly that reason.
 async fn discover_easdf(nrf_uri: &str) -> Option<(String, u16)> {
-    let (nrf_host, nrf_port) = split_authority(nrf_uri)?;
-    let client = SbiClient::with_host_port(&nrf_host, nrf_port);
+    // #1617: the NRF is dialled with the NRF client TLS (https + this NF's
+    // certificate) whenever the URI is https or the profile is production.
+    let client = SbiClient::for_nrf_uri(nrf_uri)?;
     let mut request = SbiRequest::get("/nnrf-disc/v1/nf-instances");
     request.http.set_param("target-nf-type", "EASDF");
     request.http.set_param("requester-nf-type", "SMF");
@@ -297,39 +298,9 @@ fn dnscontext_endpoint(instance: &serde_json::Value) -> Option<(String, u16)> {
     Some((host, port))
 }
 
-/// Split `scheme://host:port` into `(host, port)`.
-fn split_authority(uri: &str) -> Option<(String, u16)> {
-    let (default_port, rest) = if let Some(r) = uri.strip_prefix("https://") {
-        (443u16, r)
-    } else if let Some(r) = uri.strip_prefix("http://") {
-        (80u16, r)
-    } else {
-        (80u16, uri)
-    };
-    let authority = rest.split('/').next().unwrap_or(rest);
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => (h.to_string(), p.parse().unwrap_or(default_port)),
-        None => (authority.to_string(), default_port),
-    };
-    (!host.is_empty()).then_some((host, port))
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-
-    #[test]
-    fn split_authority_handles_scheme_and_port() {
-        assert_eq!(
-            split_authority("http://10.0.0.1:7777"),
-            Some(("10.0.0.1".to_string(), 7777))
-        );
-        assert_eq!(
-            split_authority("http://nrf.example/nnrf-disc/v1"),
-            Some(("nrf.example".to_string(), 80))
-        );
-        assert_eq!(split_authority("http://"), None);
-    }
 
     /// The endpoint is chosen by SERVICE NAME, not by position — easdfd advertises
     /// two services, and `nfServices[0]` would dial whichever came first.
@@ -422,6 +393,8 @@ pub(crate) mod tests {
         use nextgcore_sbi::message::SbiResponse;
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
         use std::net::SocketAddr;
+        // A plaintext NRF: the dev profile, or #1617's NRF client dials https.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
 
         let seen: SeenRequests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 

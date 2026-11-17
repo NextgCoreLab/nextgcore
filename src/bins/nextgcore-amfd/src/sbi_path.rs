@@ -678,17 +678,18 @@ async fn amf_nrf_discover_qualified_at(
 ) -> Result<(), String> {
     let sbi_ctx = global_context();
 
-    let nrf_uri = match nrf_uri {
-        Some(uri) => Some(uri),
-        None => sbi_ctx.get_nrf_uri().await,
+    let client = match nrf_uri {
+        // #1617: an NRF named here rather than in the context is still an NRF:
+        // the NRF client TLS for an https URI or the production profile.
+        Some(uri) => std::sync::Arc::new(SbiClient::for_nrf_uri(&uri).ok_or("Invalid NRF URI")?),
+        None => {
+            let Some(uri) = sbi_ctx.get_nrf_uri().await else {
+                return Ok(());
+            };
+            let (nrf_host, nrf_port) = parse_host_port(&uri).ok_or("Invalid NRF URI")?;
+            sbi_ctx.get_client(&nrf_host, nrf_port).await
+        }
     };
-    let nrf_uri = match nrf_uri {
-        Some(uri) => uri,
-        None => return Ok(()),
-    };
-
-    let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
-    let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
 
     let mut path = format!(
         "/nnrf-disc/v1/nf-instances?target-nf-type={target_nf_type}&requester-nf-type=AMF&service-names={service_name}"
@@ -4554,8 +4555,10 @@ pub async fn discover_smf_by_pgw(
             .await
             .ok_or_else(|| "no NRF is configured, so no SMF+PGW-C can be resolved".to_string())?,
     };
-    let (nrf_host, nrf_port) =
-        parse_host_port(&nrf_uri).ok_or_else(|| format!("NRF URI {nrf_uri:?} is unusable"))?;
+    // #1617: the NRF client TLS (https + this NF's certificate) for an https
+    // NRF URI or the production profile.
+    let client = SbiClient::for_nrf_uri(&nrf_uri)
+        .ok_or_else(|| format!("NRF URI {nrf_uri:?} is unusable"))?;
 
     let query = match (pgw_fqdn, pgw_ipv4) {
         (Some(fqdn), _) => format!(
@@ -4582,7 +4585,6 @@ pub async fn discover_smf_by_pgw(
          &service-names={}&{query}",
         service_name::NSMF_PDUSESSION
     );
-    let client = SbiClient::for_peer(&nrf_host, nrf_port);
     let response = client
         .get(&path)
         .await

@@ -1667,8 +1667,8 @@ fn uri_is_https(uri: &str) -> bool {
 ///   the previous inline connect code: no TLS, no ALPN. The `tls` connector is
 ///   ignored for this scheme.
 /// * `https://` → a rustls TLS 1.2/1.3 handshake (ALPN `h2`) then HTTP/2, using
-///   the supplied `tls` connector or, when `None`, a default webpki-roots
-///   server-auth connector (secure by default).
+///   the supplied `tls` connector or, when `None`, the NRF client TLS
+///   ([`crate::nrf_tls`]): the NRF's CA and this NF's client certificate.
 ///
 /// `conn_label` names the spawned connection-driver error log so each call
 /// site preserves its original message text.
@@ -1687,12 +1687,22 @@ async fn http2_connect(
     .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
 
     if uri_is_https(uri) {
-        let connector = match tls {
-            Some(c) => c.clone(),
-            None => TlsConnector::from(Arc::new(crate::tls::build_client_config(None, false)?)),
+        // The token and key endpoints are the NRF's (it is the authorization
+        // server, TS 33.501 §13.4.1.1), so without an explicit connector they
+        // are dialled with the NRF client TLS: its CA, this NF's client
+        // certificate and its server name (#1617). Public roots no longer
+        // stand in for the NRF's CA.
+        let (connector, verify_as) = match tls {
+            Some(c) => (c.clone(), None),
+            None => {
+                let nrf = crate::nrf_tls::nrf_client_tls();
+                (nrf.connector()?, nrf.server_name)
+            }
         };
         let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(&addr);
-        let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        let server_name = verify_as.unwrap_or_else(|| host.to_string());
+        let server_name = rustls::pki_types::ServerName::try_from(server_name)
             .map_err(|e| SbiError::TlsError(format!("Invalid server name: {e}")))?;
         let tls_stream = tokio::time::timeout(
             Duration::from_secs(5),
@@ -1897,8 +1907,8 @@ impl JwksCache {
 }
 
 /// Fetch a JWKS document and validate its shape, using TLS for `https://`
-/// URIs and cleartext HTTP/2 for `http://`. `tls = None` uses a default
-/// webpki-roots connector for `https` (and is ignored for `http`).
+/// URIs and cleartext HTTP/2 for `http://`. `tls = None` uses the
+/// NRF client TLS ([`crate::nrf_tls`]) for `https` (and is ignored for `http`).
 pub async fn fetch_jwks_with(
     jwks_uri: &str,
     tls: Option<&TlsConnector>,
