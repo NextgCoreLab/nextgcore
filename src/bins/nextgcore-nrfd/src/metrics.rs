@@ -32,6 +32,18 @@ static DISCOVERY_EMPTY: AtomicU64 = AtomicU64::new(0);
 static TOKENS_GRANTED: AtomicU64 = AtomicU64::new(0);
 static TOKENS_DENIED: AtomicU64 = AtomicU64::new(0);
 static CCA_KEY_CONFLICTS: AtomicU64 = AtomicU64::new(0);
+static UNVERIFIED_NF_MANAGEMENT: AtomicU64 = AtomicU64::new(0);
+
+/// Count one NFRegister / NFUpdate / NFDeregister from a caller with no verified
+/// certificate identity (#1617): the requests NF-management enforcement refuses.
+pub fn observe_unverified_nf_management() {
+    UNVERIFIED_NF_MANAGEMENT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The [`observe_unverified_nf_management`] count so far.
+pub fn unverified_nf_management_total() -> u64 {
+    UNVERIFIED_NF_MANAGEMENT.load(Ordering::Relaxed)
+}
 
 /// Count one NF whose CCA trusted keys conflict (#1633): two case-variant entries
 /// with different keys, so its CCA is refused. Called once per NF.
@@ -226,6 +238,13 @@ pub fn render_nrf_families(
         "counter",
         "NFs whose CCA trusted keys conflict (differently cased IDs, different keys), so their CCA is refused",
         get(&CCA_KEY_CONFLICTS),
+    );
+    write_metric(
+        out,
+        "nrf_nf_management_unverified_total",
+        "counter",
+        "NFRegister/NFUpdate/NFDeregister requests from a caller with no verified client certificate identity",
+        get(&UNVERIFIED_NF_MANAGEMENT),
     );
 }
 

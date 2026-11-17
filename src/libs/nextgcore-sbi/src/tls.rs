@@ -265,18 +265,58 @@ pub fn build_server_config_mtls_with_pqc(
     client_ca_path: &str,
     pqc_config: &PqcTlsConfig,
 ) -> SbiResult<ServerConfig> {
+    build_server_config_client_auth_with_pqc(certs, key, client_ca_path, false, pqc_config)
+}
+
+/// Build a server-side TLS config that **requests** a client certificate but
+/// does not require one (#1617): a client that presents none still completes
+/// the handshake, and one that presents a certificate must chain to
+/// `client_ca_path` or the handshake fails. The handler then sees a verified
+/// peer identity or none, never an unverified one.
+pub fn build_server_config_optional_client_auth(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    client_ca_path: &str,
+) -> SbiResult<ServerConfig> {
+    build_server_config_client_auth_with_pqc(
+        certs,
+        key,
+        client_ca_path,
+        true,
+        &PqcTlsConfig::default(),
+    )
+}
+
+/// Build a server-side TLS config verifying client certificates against
+/// `client_ca_path`: required, or (`optional`) requested but not required.
+pub fn build_server_config_client_auth_with_pqc(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    client_ca_path: &str,
+    optional: bool,
+    pqc_config: &PqcTlsConfig,
+) -> SbiResult<ServerConfig> {
     let root_store = load_root_store(client_ca_path)?;
 
     // builder() would resolve the ambient process-default CryptoProvider,
     // which is ambiguous in this workspace (tokio-rustls enables aws-lc-rs
     // beside our ring pin) and panics at runtime — pass the provider
     // explicitly, same as every config builder in this module.
-    let client_verifier = WebPkiClientVerifier::builder_with_provider(
+    let builder = WebPkiClientVerifier::builder_with_provider(
         Arc::new(root_store),
         select_provider(pqc_config),
-    )
-    .build()
-    .map_err(|e| SbiError::TlsError(format!("Failed to build client verifier: {e}")))?;
+    );
+    // `allow_unauthenticated` only admits a client that sends NO certificate;
+    // a presented one is still verified against the roots (rustls
+    // WebPkiClientVerifier::verify_client_cert).
+    let builder = if optional {
+        builder.allow_unauthenticated()
+    } else {
+        builder
+    };
+    let client_verifier = builder
+        .build()
+        .map_err(|e| SbiError::TlsError(format!("Failed to build client verifier: {e}")))?;
 
     let config = ServerConfig::builder_with_provider(select_provider(pqc_config))
         .with_safe_default_protocol_versions()

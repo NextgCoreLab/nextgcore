@@ -84,6 +84,7 @@ Common sub-blocks seen in the Docker configs:
 | `NEXTGCORE_NRF_TLS_CA` | Trust anchor for the NRF's server certificate. Falls back to `NEXTGCORE_SBI_TLS_CA`, then `/etc/nextgcore/tls/ca.crt`; never to public roots | `nextgcore-sbi` `nrf_tls.rs` |
 | `NEXTGCORE_NRF_TLS_CLIENT_CERT` / `_CLIENT_KEY` | The certificate this NF presents to the NRF. Falls back to `NEXTGCORE_SBI_TLS_CLIENT_CERT` / `_KEY`, then `/etc/nextgcore/tls/client.{crt,key}` when both exist; with none, no certificate (no verified identity). Half a pair fails every NRF connection, logged at startup | `nextgcore-sbi` `nrf_tls.rs` |
 | `NEXTGCORE_NRF_TLS_SERVER_NAME` | Name the NRF's certificate is verified against when the NRF URI's host is not in it, e.g. `nrf` for `https://127.0.0.1:7777` (the dev PKI names no loopback address) | `nextgcore-sbi` `nrf_tls.rs` |
+| `NEXTGCORE_NRF_SERVER_TLS`, `_CERT`, `_KEY`, `_CA`, `_CLIENT_AUTH` | **nrfd only**: TLS on the NRF's one SBI listener (#1617), between its flags and `nrf.sbi.server[0].tls`. The listener requests a client certificate (`optional`, default) or requires one (`required`); a presented certificate must chain to `_CA`. See [NRF](nrf.md) | `nextgcore-nrfd` `main.rs` |
 | `TLS_ENABLED`, `SBI_SCHEME` | Set in `docker-compose.yml`, but **not read** by any NF; use `--tls`/`--tls-cert`/`--tls-key` or the SBI profile | compose file |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP collector (default `http://jaeger:4317`; no-op if absent) | `init.rs` |
 

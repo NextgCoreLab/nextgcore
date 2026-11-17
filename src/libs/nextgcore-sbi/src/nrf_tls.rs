@@ -278,19 +278,40 @@ pub fn log_nrf_client_tls(nrf_uri: &str) {
         return;
     }
     let tls = nrf_client_tls();
-    if let Some(e) = &tls.error {
-        log::error!("{e}: every request to the NRF at {host}:{port} will fail");
-        return;
+    let authority = crate::uri_encode::uri_authority(&host, port);
+    let server_name = tls.server_name.as_deref().unwrap_or(&host);
+    match nrf_client_tls_log_level(&tls) {
+        log::Level::Error => log::error!(
+            "{}: every request to the NRF at {authority} will fail",
+            tls.error.as_deref().unwrap_or("NRF client TLS is unusable")
+        ),
+        // #1690 review m3: the NRF binds NFRegister / NFUpdate / NFDeregister to
+        // the client certificate (TS 33.310 §6.1.3c.3), so dialling it without
+        // one is a misconfiguration an operator must see, not routine.
+        log::Level::Warn => log::warn!(
+            "NRF client TLS for {authority}: CA={} server name={server_name}, but NO client \
+             certificate: the NRF sees no verified identity for this NF and will refuse its \
+             registration. Set {NRF_TLS_CLIENT_CERT_ENV} / {NRF_TLS_CLIENT_KEY_ENV}.",
+            tls.ca_cert,
+        ),
+        _ => log::info!(
+            "NRF client TLS for {authority}: CA={} client certificate={} server name={server_name}",
+            tls.ca_cert,
+            tls.client_cert.as_deref().unwrap_or_default(),
+        ),
     }
-    log::info!(
-        "NRF client TLS for {}: CA={} client certificate={} server name={}",
-        crate::uri_encode::uri_authority(&host, port),
-        tls.ca_cert,
-        tls.client_cert
-            .as_deref()
-            .unwrap_or("NONE (no verified identity)"),
-        tls.server_name.as_deref().unwrap_or(&host),
-    );
+}
+
+/// The level [`log_nrf_client_tls`] reports `tls` at over https: an error for an
+/// unusable configuration, a warning without a client certificate, else info.
+pub fn nrf_client_tls_log_level(tls: &NrfClientTls) -> log::Level {
+    if tls.error.is_some() {
+        log::Level::Error
+    } else if tls.client_cert.is_none() {
+        log::Level::Warn
+    } else {
+        log::Level::Info
+    }
 }
 
 #[cfg(test)]
@@ -443,5 +464,24 @@ mod tests {
             nrf_scheme(UriScheme::Http, SbiProfile::Dev),
             UriScheme::Http
         );
+    }
+
+    /// #1690 review m3: an https NRF dialled without a client certificate is a
+    /// WARN (the NRF will refuse the registration), not routine INFO.
+    #[test]
+    fn no_client_certificate_toward_the_nrf_is_a_warning_1617() {
+        let full = resolve(
+            &[
+                (NRF_TLS_CLIENT_CERT_ENV, "/n/amf.crt"),
+                (NRF_TLS_CLIENT_KEY_ENV, "/n/amf.key"),
+            ],
+            &[],
+        );
+        assert_eq!(nrf_client_tls_log_level(&full), log::Level::Info);
+        let none = resolve(&[], &[]);
+        assert_eq!(none.client_cert, None);
+        assert_eq!(nrf_client_tls_log_level(&none), log::Level::Warn);
+        let half = resolve(&[(NRF_TLS_CLIENT_CERT_ENV, "/n/amf.crt")], &[]);
+        assert_eq!(nrf_client_tls_log_level(&half), log::Level::Error);
     }
 }

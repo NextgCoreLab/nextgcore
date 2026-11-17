@@ -591,6 +591,15 @@ impl SbiClient {
         // An IPv6 literal is bracketed, or `fd00::1:7777` is no socket address.
         let addr = crate::uri_encode::uri_authority(host, port);
 
+        // A TLS configuration that cannot be used fails before anything is
+        // dialled (#1690 review m5): no TCP connection is opened for a request
+        // that can never be sent.
+        if scheme == UriScheme::Https {
+            if let Some(e) = &self.config.tls_config_error {
+                return Err(SbiError::TlsError(e.clone()));
+            }
+        }
+
         // #664: a connect-phase timeout is a CONNECTION error, not
         // `SbiError::Timeout`. Nothing was sent, so the request may be resent
         // anywhere — the same reading `scpd`'s `is_provably_undelivered` and the

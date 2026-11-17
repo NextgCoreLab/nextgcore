@@ -261,6 +261,9 @@ done
 rm -f ca.srl
 # Keys kept from an earlier run (before the 0600 umask) are tightened too.
 chmod 600 ./*.key
+# Certificates are public material: the umask made them 0600 too, which a
+# container user other than their owner could not read (#1690 review m4).
+chmod 644 ./*.crt
 
 echo ""
 echo "==> Certificate summary ($(pwd)):"

@@ -1582,6 +1582,7 @@ impl OAuth2Client {
         let mut sender = http2_connect(
             &self.nrf_uri,
             self.tls.as_ref(),
+            Some(&self.nrf_uri),
             "OAuth2 HTTP/2 connection error",
         )
         .await?;
@@ -1672,12 +1673,45 @@ fn uri_is_https(uri: &str) -> bool {
 ///
 /// `conn_label` names the spawned connection-driver error log so each call
 /// site preserves its original message text.
+///
+/// `nrf_uri` is the NRF the endpoint belongs to: the NRF client TLS server name
+/// ([`crate::nrf_tls::NRF_TLS_SERVER_NAME_ENV`]) stands in for the dialled host
+/// only when `uri` names that NRF's authority (#1690 review m2), as
+/// [`crate::client::SbiClient`] scopes it to its configured host. Any other host
+/// is verified as itself.
 async fn http2_connect(
     uri: &str,
     tls: Option<&TlsConnector>,
+    nrf_uri: Option<&str>,
     conn_label: &'static str,
 ) -> SbiResult<hyper::client::conn::http2::SendRequest<http_body_util::Full<bytes::Bytes>>> {
     let addr = parse_uri_to_addr(uri)?;
+    let https = uri_is_https(uri);
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(&addr);
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    // The token and key endpoints are the NRF's (it is the authorization
+    // server, TS 33.501 §13.4.1.1), so without an explicit connector they are
+    // dialled with the NRF client TLS: its CA, this NF's client certificate and
+    // its server name (#1617). Public roots no longer stand in for the NRF's CA.
+    // Resolved before dialling (#1690 review m5): an unusable TLS configuration
+    // opens no connection.
+    let tls_setup = if https {
+        Some(match tls {
+            Some(c) => (c.clone(), None),
+            None => {
+                let nrf = crate::nrf_tls::nrf_client_tls();
+                let is_nrf = nrf_uri
+                    .zip(crate::nrf_tls::parse_nrf_uri(uri))
+                    .is_some_and(|(n, (_, h, p))| crate::nrf_tls::is_nrf_authority(n, &h, p));
+                (nrf.connector()?, nrf.server_name.filter(|_| is_nrf))
+            }
+        })
+    } else {
+        None
+    };
     let stream = tokio::time::timeout(
         Duration::from_secs(5),
         tokio::net::TcpStream::connect(&addr),
@@ -1686,22 +1720,8 @@ async fn http2_connect(
     .map_err(|_| SbiError::Timeout)?
     .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
 
-    if uri_is_https(uri) {
-        // The token and key endpoints are the NRF's (it is the authorization
-        // server, TS 33.501 §13.4.1.1), so without an explicit connector they
-        // are dialled with the NRF client TLS: its CA, this NF's client
-        // certificate and its server name (#1617). Public roots no longer
-        // stand in for the NRF's CA.
-        let (connector, verify_as) = match tls {
-            Some(c) => (c.clone(), None),
-            None => {
-                let nrf = crate::nrf_tls::nrf_client_tls();
-                (nrf.connector()?, nrf.server_name)
-            }
-        };
-        let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(&addr);
-        let host = host.trim_start_matches('[').trim_end_matches(']');
-        let server_name = verify_as.unwrap_or_else(|| host.to_string());
+    if let Some((connector, verify_as)) = tls_setup {
+        let server_name = verify_as.unwrap_or_else(|| host.clone());
         let server_name = rustls::pki_types::ServerName::try_from(server_name)
             .map_err(|e| SbiError::TlsError(format!("Invalid server name: {e}")))?;
         let tls_stream = tokio::time::timeout(
@@ -1772,6 +1792,10 @@ pub struct JwksCache {
     /// TLS connector for `https://` JWKS URIs; `None` keeps the cleartext
     /// `http://` path unchanged.
     tls: Option<TlsConnector>,
+    /// The NRF this cache was built for ([`JwksCache::for_nrf`]). `None` (an
+    /// explicit JWKS URI) compares the JWKS host with the process's configured
+    /// NRF URI instead, before applying the NRF client TLS server name.
+    nrf_uri: Option<String>,
 }
 
 impl JwksCache {
@@ -1807,6 +1831,7 @@ impl JwksCache {
             cached: RwLock::new(None),
             ttl: Self::DEFAULT_TTL,
             tls: None,
+            nrf_uri: None,
         }
     }
 
@@ -1825,7 +1850,9 @@ impl JwksCache {
     /// route, or [`JwksCache::NRF_JWKS_PATH`] (the [`for_nrf`](Self::for_nrf)
     /// default) for the bespoke one.
     pub fn for_nrf_with_path(nrf_uri: &str, path: &str) -> Self {
-        Self::new(format!("{}{}", nrf_uri.trim_end_matches('/'), path))
+        let mut cache = Self::new(format!("{}{}", nrf_uri.trim_end_matches('/'), path));
+        cache.nrf_uri = Some(nrf_uri.to_string());
+        cache
     }
 
     /// Override the cache TTL.
@@ -1866,7 +1893,11 @@ impl JwksCache {
 
     /// Force a re-fetch, replacing the cached document on success.
     pub async fn refresh(&self) -> SbiResult<serde_json::Value> {
-        let doc = fetch_jwks_with(&self.jwks_uri, self.tls.as_ref()).await?;
+        let nrf_uri = match &self.nrf_uri {
+            Some(uri) => Some(uri.clone()),
+            None => crate::context::global_context().get_nrf_uri().await,
+        };
+        let doc = fetch_jwks_from(&self.jwks_uri, self.tls.as_ref(), nrf_uri.as_deref()).await?;
         *self.cached.write().await = Some((doc.clone(), Instant::now()));
         Ok(doc)
     }
@@ -1913,7 +1944,18 @@ pub async fn fetch_jwks_with(
     jwks_uri: &str,
     tls: Option<&TlsConnector>,
 ) -> SbiResult<serde_json::Value> {
-    let mut sender = http2_connect(jwks_uri, tls, "JWKS HTTP/2 connection error").await?;
+    let nrf_uri = crate::context::global_context().get_nrf_uri().await;
+    fetch_jwks_from(jwks_uri, tls, nrf_uri.as_deref()).await
+}
+
+/// [`fetch_jwks_with`] where `nrf_uri` names the NRF whose client TLS server
+/// name may stand in for the JWKS host (only when the two authorities match).
+async fn fetch_jwks_from(
+    jwks_uri: &str,
+    tls: Option<&TlsConnector>,
+    nrf_uri: Option<&str>,
+) -> SbiResult<serde_json::Value> {
+    let mut sender = http2_connect(jwks_uri, tls, nrf_uri, "JWKS HTTP/2 connection error").await?;
 
     let http_request = hyper::Request::builder()
         .method(hyper::Method::GET)

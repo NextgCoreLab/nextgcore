@@ -38,6 +38,11 @@ struct DevPki(PathBuf);
 
 impl DevPki {
     fn generate() -> Self {
+        Self::generate_with(&[])
+    }
+
+    /// As [`DevPki::generate`], passing `extra` to the generator (`--loopback`).
+    fn generate_with(extra: &[&str]) -> Self {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let dir = tempfile::Builder::new()
             .prefix("nrf-client-tls-1617-")
@@ -56,6 +61,7 @@ impl DevPki {
             .arg(&dir)
             .arg("--ids")
             .arg(&ids)
+            .args(extra)
             .output()
             .expect("run generate-dev-certs.sh (needs bash and openssl)");
         assert!(
@@ -279,12 +285,13 @@ async fn the_token_and_key_transports_present_this_nfs_certificate_1617() {
         .refresh()
         .await
         .expect("JWKS for_nrf over mTLS");
-    // The listener-side cache is built from the configured JWKS URI.
+    // The listener-side cache is built from the configured JWKS URI; it is the
+    // NRF's because it names the NRF URI this NF configured (#1690 review m2).
     let uri = JwksCache::for_nrf(&nrf).jwks_uri().to_string();
-    JwksCache::new(uri.clone())
-        .refresh()
-        .await
-        .expect("JWKS from its URI over mTLS");
+    global_context().set_nrf_uri(nrf.clone()).await;
+    let fetched = JwksCache::new(uri.clone()).refresh().await;
+    global_context().clear_nrf_uri().await;
+    fetched.expect("JWKS from its URI over mTLS");
     let path = uri.split_once(&format!("{port}")).unwrap().1.to_string();
     let keyed: Vec<_> = seen
         .lock()
@@ -343,4 +350,272 @@ async fn the_nrf_is_verified_by_name_and_loopback_names_no_certificate_1617() {
         seen.lock().unwrap().is_empty(),
         "no request reached the NRF"
     );
+}
+
+/// A server over TLS with `cert` (`<name>.crt` / `.key`) that answers every
+/// request with `respond`, recording the verified client URN.
+async fn tls_server(
+    pki: &DevPki,
+    name: &str,
+    respond: impl Fn(&SbiRequest) -> SbiResponse + Send + Sync + 'static,
+) -> (nextgcore_sbi::server::SbiServer, u16, Seen) {
+    let seen: Seen = Arc::default();
+    let log = seen.clone();
+    let respond = Arc::new(respond);
+    let (key, cert) = (
+        pki.file(&format!("{name}.key")),
+        pki.file(&format!("{name}.crt")),
+    );
+    let (server, addr) = sbi_server_on_free_port_with(
+        move |addr| SbiServerConfig::new(addr).with_tls(key, cert),
+        move |req: SbiRequest| {
+            let log = log.clone();
+            let respond = respond.clone();
+            async move {
+                log.lock().unwrap().push((
+                    req.header.method.to_string(),
+                    req.header.uri.clone(),
+                    req.peer_cert_nf_instance_id.clone(),
+                ));
+                respond(&req)
+            }
+        },
+    )
+    .await;
+    (server, addr.port(), seen)
+}
+
+/// #1690 review m1: the NRF server name stands in for the configured host only.
+/// A redirect from the NRF (`127.0.0.1`, verified as `nrf`) to another host is
+/// verified as that host: here `localhost`, served with `amf.crt`, which names
+/// `localhost` (the generator's `--loopback`) but not `nrf`. Applying the NRF
+/// name to the redirect target fails its handshake.
+#[tokio::test]
+async fn a_redirect_away_from_the_nrf_is_verified_as_its_own_host_1617() {
+    let _g = NRF_CLIENT_TLS_TEST_LOCK.lock().await;
+    let pki = DevPki::generate_with(&["--loopback"]);
+    setup(&pki);
+    let (_other, other_port, other_seen) = tls_server(&pki, "amf", |_| {
+        SbiResponse::with_status(200).with_body("{}", "application/json")
+    })
+    .await;
+    let location = format!("https://localhost:{other_port}/nnrf-disc/v1/nf-instances");
+    let (_nrf, port, nrf_seen) = tls_server(&pki, "nrf", move |_| {
+        SbiResponse::with_status(307).with_header("location", location.clone())
+    })
+    .await;
+
+    let client = SbiClient::for_nrf_uri(&format!("https://127.0.0.1:{port}")).unwrap();
+    assert_eq!(client.config().tls_server_name.as_deref(), Some("nrf"));
+    let resp = client
+        .get("/nnrf-disc/v1/nf-instances")
+        .await
+        .expect("the redirect target verifies as localhost");
+    assert_eq!(resp.status, 200);
+    assert_eq!(nrf_seen.lock().unwrap().len(), 1, "the NRF answered 307");
+    assert_eq!(
+        other_seen.lock().unwrap().len(),
+        1,
+        "the redirect reached the other host"
+    );
+}
+
+/// #1690 review m2: the token / JWKS transport applies the NRF server name only
+/// to the NRF's own authority. A JWKS URI at another host (`localhost`, served
+/// with `amf.crt`) is verified as itself; one at the NRF authority is verified
+/// as `nrf`.
+#[tokio::test]
+async fn a_jwks_uri_off_the_nrf_is_verified_as_its_own_host_1617() {
+    let _g = NRF_CLIENT_TLS_TEST_LOCK.lock().await;
+    let pki = DevPki::generate_with(&["--loopback"]);
+    setup(&pki);
+    let keys = |_: &SbiRequest| {
+        SbiResponse::with_status(200).with_body(r#"{"keys":[]}"#, "application/json")
+    };
+    let (_other, other_port, other_seen) = tls_server(&pki, "amf", keys).await;
+    let (_nrf, nrf_port, nrf_seen) = tls_server(&pki, "nrf", keys).await;
+    global_context()
+        .set_nrf_uri(format!("https://127.0.0.1:{nrf_port}"))
+        .await;
+
+    let off_nrf = format!("https://localhost:{other_port}/nnrf-oauth2/v1/jwks");
+    let explicit = JwksCache::new(off_nrf.clone()).refresh().await;
+    let free = nextgcore_sbi::oauth::fetch_jwks(&off_nrf).await;
+    // The NRF's own key endpoint, by an explicit URI: matched to the context's
+    // NRF URI, so verified as `nrf`.
+    let at_nrf = JwksCache::new(format!("https://127.0.0.1:{nrf_port}/nnrf-oauth2/v1/jwks"))
+        .refresh()
+        .await;
+    global_context().clear_nrf_uri().await;
+
+    explicit.expect("an explicit JWKS URI off the NRF verifies as its host");
+    free.expect("fetch_jwks off the NRF verifies as its host");
+    at_nrf.expect("the NRF's JWKS URI verifies as nrf");
+    assert_eq!(other_seen.lock().unwrap().len(), 2);
+    assert_eq!(nrf_seen.lock().unwrap().len(), 1);
+}
+
+/// #1690 review m5: an unusable NRF client TLS configuration fails before any
+/// TCP connection. Dialled at a port that refuses connections, the error is the
+/// configuration's (a TLS error), not a connection error.
+#[tokio::test]
+async fn an_unusable_nrf_tls_configuration_fails_before_dialling_1617() {
+    let _g = NRF_CLIENT_TLS_TEST_LOCK.lock().await;
+    let pki = DevPki::generate();
+    set_sbi_profile_override(SbiProfile::Dev);
+    let mut half = pki.amf_tls(Some("nrf"));
+    half.client_key = None;
+    half.error = Some("half a pair 1617".into());
+    set_nrf_client_tls_override(Some(half));
+    let down = nextgcore_sbi::test_support::down_port();
+    let nrf = format!("https://127.0.0.1:{}", down.port());
+
+    let err = SbiClient::for_nrf_uri(&nrf)
+        .unwrap()
+        .get("/nnrf-disc/v1/nf-instances")
+        .await
+        .expect_err("half a pair");
+    assert!(
+        matches!(&err, nextgcore_sbi::error::SbiError::TlsError(m) if m.contains("half a pair 1617")),
+        "the client reports the configuration, not the refused connect: {err:?}"
+    );
+    let err = OAuth2Client::new(&nrf, AMF_ID, NfType::Amf)
+        .get_token(NfType::Smf, "nsmf-pdusession")
+        .await
+        .expect_err("half a pair");
+    assert!(
+        matches!(&err, nextgcore_sbi::error::SbiError::TlsError(m) if m.contains("half a pair 1617")),
+        "the token transport reports the configuration: {err:?}"
+    );
+    let err = JwksCache::for_nrf(&nrf)
+        .refresh()
+        .await
+        .expect_err("half a pair");
+    assert!(
+        matches!(&err, nextgcore_sbi::error::SbiError::TlsError(m) if m.contains("half a pair 1617")),
+        "the JWKS transport reports the configuration: {err:?}"
+    );
+}
+
+/// #1617 step b: a listener with OPTIONAL client authentication (the NRF's)
+/// admits a client that presents no certificate, binds the identity of one that
+/// presents a valid certificate, and refuses the handshake of one whose
+/// certificate does not chain to its CA. With client authentication required,
+/// a client without a certificate is refused.
+#[tokio::test]
+async fn optional_client_auth_admits_no_certificate_but_verifies_a_presented_one_1617() {
+    let _g = NRF_CLIENT_TLS_TEST_LOCK.lock().await;
+    let pki = DevPki::generate();
+    let foreign = DevPki::generate();
+    set_sbi_profile_override(SbiProfile::Dev);
+
+    let start = |optional: bool| {
+        let seen: Seen = Arc::default();
+        let log = seen.clone();
+        let (key, cert, ca) = (pki.file("nrf.key"), pki.file("nrf.crt"), pki.file("ca.crt"));
+        async move {
+            let (server, addr) = sbi_server_on_free_port_with(
+                move |addr| {
+                    let mut cfg = SbiServerConfig::new(addr).with_tls(key, cert);
+                    cfg.verify_client = true;
+                    cfg.verify_client_cacert = Some(ca);
+                    cfg.verify_client_optional = optional;
+                    cfg
+                },
+                move |req: SbiRequest| {
+                    let log = log.clone();
+                    async move {
+                        log.lock().unwrap().push((
+                            req.header.method.to_string(),
+                            req.header.uri.clone(),
+                            req.peer_cert_nf_instance_id.clone(),
+                        ));
+                        SbiResponse::with_status(200).with_body("{}", "application/json")
+                    }
+                },
+            )
+            .await;
+            (server, addr.port(), seen)
+        }
+    };
+    let get = |tls: NrfClientTls, port: u16| async move {
+        set_nrf_client_tls_override(Some(tls));
+        SbiClient::for_nrf_uri(&format!("https://127.0.0.1:{port}"))
+            .unwrap()
+            .get("/nnrf-disc/v1/nf-instances")
+            .await
+    };
+    let anonymous = |pki: &DevPki| {
+        let mut t = pki.amf_tls(Some("nrf"));
+        t.client_cert = None;
+        t.client_key = None;
+        t
+    };
+
+    let (_optional, port, seen) = start(true).await;
+    let resp = get(anonymous(&pki), port)
+        .await
+        .expect("no certificate: the handshake completes");
+    assert_eq!(resp.status, 200);
+    assert_eq!(seen.lock().unwrap().last().unwrap().2, None, "no identity");
+    let resp = get(pki.amf_tls(Some("nrf")), port)
+        .await
+        .expect("a valid certificate");
+    assert_eq!(resp.status, 200);
+    assert_eq!(
+        seen.lock().unwrap().last().unwrap().2.as_deref(),
+        Some(AMF_ID)
+    );
+    // The foreign AMF certificate, presented with a CA that trusts our NRF:
+    // the NRF must refuse it, not treat it as "no certificate".
+    let mut forged = pki.amf_tls(Some("nrf"));
+    forged.client_cert = Some(foreign.file("amf.crt"));
+    forged.client_key = Some(foreign.file("amf.key"));
+    let err = get(forged, port)
+        .await
+        .expect_err("a certificate from another CA is refused");
+    assert!(
+        err.to_string().contains("TLS") || err.to_string().contains("onnection"),
+        "{err}"
+    );
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        2,
+        "the forged client never reached the handler"
+    );
+
+    let (_required, port, seen) = start(false).await;
+    assert!(
+        get(anonymous(&pki), port).await.is_err(),
+        "client authentication required: no certificate, no handshake"
+    );
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+/// #1690 review m4: the generator writes every private key 0600 and every
+/// certificate (the CA's included) 0644, so a container user other than the
+/// owner can read the public material through a bind mount but no key.
+#[cfg(unix)]
+#[test]
+fn the_generator_writes_keys_0600_and_certificates_0644_1617() {
+    use std::os::unix::fs::PermissionsExt;
+    let pki = DevPki::generate();
+    let mut seen = (0, 0);
+    for entry in std::fs::read_dir(&pki.0).unwrap() {
+        let path = entry.unwrap().path();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("key") => {
+                assert_eq!(mode, 0o600, "{}", path.display());
+                seen.0 += 1;
+            }
+            Some("crt") => {
+                assert_eq!(mode, 0o644, "{}", path.display());
+                seen.1 += 1;
+            }
+            _ => {}
+        }
+    }
+    // ca, nrf, amf.
+    assert_eq!(seen, (3, 3));
 }
