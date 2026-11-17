@@ -1107,6 +1107,39 @@ fn data_plane_pdr_from_parsed(p: &crate::n4_build::ParsedCreatePdr) -> data_plan
     }
 }
 
+/// Merge an Update PDR into the PDR the data plane holds (#1673, TS 29.244
+/// §5.6.3 and Table 7.5.4.2-1): an IE the update does not carry keeps its value,
+/// a present one replaces it (a PDI whole, with its SDF filter and QFI), and a
+/// null-length FAR ID, URR ID, QER ID or Outer Header Removal removes it.
+fn apply_update_pdr(pdr: &mut data_plane::DataPlanePdr, u: &crate::n4_build::ParsedUpdatePdr) {
+    if let Some(precedence) = u.precedence {
+        pdr.precedence = precedence;
+    }
+    if let Some(pdi) = &u.pdi {
+        let parsed = crate::n4_build::ParsedCreatePdr {
+            pdi: pdi.clone(),
+            ..Default::default()
+        };
+        let fresh = data_plane_pdr_from_parsed(&parsed);
+        pdr.source_interface = fresh.source_interface;
+        pdr.sdf_rule = fresh.sdf_rule;
+        pdr.qfi = fresh.qfi;
+    }
+    if let Some(ohr) = u.outer_header_removal {
+        pdr.outer_header_removal = ohr;
+    }
+    if let Some(far_id) = u.far_id {
+        pdr.far_id = far_id;
+    }
+    if let Some(urr_ids) = &u.urr_ids {
+        pdr.urr_ids = urr_ids.clone();
+    }
+    if let Some(qer_ids) = &u.qer_ids {
+        // One QER per PDR in the data plane until #1672.
+        pdr.qer_id = qer_ids.first().copied();
+    }
+}
+
 /// A FAR as the data plane holds it, from a PFCP Create FAR or Update FAR (#918).
 ///
 /// The Outer Header Creation endpoint is the IPv4 address when the OHC carries one,
@@ -1501,11 +1534,22 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                         }
                     }
                 }
+                // #1673: an Update PDR changes only what it carries (TS 29.244
+                // §5.6.3). It used to replace the stored PDR with one built from
+                // the update alone, so a precedence-only update dropped the PDR's
+                // FAR, URRs, QER and PDI.
                 if !updated_pdrs.is_empty() {
                     let mut dp_pdrs = session.pdrs.write().unwrap();
-                    for p in &updated_pdrs {
-                        dp_pdrs.retain(|e| e.pdr_id != p.pdr_id);
-                        dp_pdrs.push(data_plane_pdr_from_parsed(p));
+                    for u in &updated_pdrs {
+                        match dp_pdrs.iter_mut().find(|e| e.pdr_id == u.pdr_id) {
+                            Some(stored) => apply_update_pdr(stored, u),
+                            // The PFCP layer already answered this one as a rule
+                            // failure (TS 29.244 §7.5.5); nothing to merge into.
+                            None => log::warn!(
+                                "Update PDR {}: the data plane holds no such PDR",
+                                u.pdr_id
+                            ),
+                        }
                     }
                     dp_pdrs.sort_by_key(|p| p.precedence);
                 }
@@ -1519,6 +1563,13 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                     for f in &far_writes {
                         if f.apply_action & FAR_ACTION_FORW != 0 {
                             any_far_forwards = true;
+                        }
+                        // #1629 review: BUFF with NOCP instructs the UP function to
+                        // notify the first downlink packet (TS 29.244 §5.2.3.1),
+                        // which starts a new buffering episode.
+                        let buff_nocp = data_plane::FAR_ACTION_BUFF | data_plane::FAR_ACTION_NOCP;
+                        if f.apply_action & buff_nocp == buff_nocp {
+                            session.rearm_dl_notification();
                         }
                         dp_fars.insert(f.far_id, data_plane_far_from_parsed(f));
                     }
@@ -1962,6 +2013,90 @@ mod tests {
             ohc(1),
             Some(IpAddr::V4(v4)),
             "Update FAR, dual OHC: IPv4 wins"
+        );
+    }
+
+    /// #1629 review: a Session Modification that sets a FAR to BUFF with NOCP
+    /// instructs the UP function to notify the first downlink packet (TS 29.244
+    /// §5.2.3.1), so it starts a new buffering episode: the next buffered packet
+    /// is a first one again, though a packet was buffered before. A BUFF without
+    /// NOCP, or a FORW with no flush yet, does not re-arm.
+    ///
+    /// REVERT-VERIFIED: without the re-arm in the FAR loop, the packet after the
+    /// BUFF|NOCP modification is not a first one.
+    #[tokio::test]
+    async fn a_buff_nocp_modification_starts_a_new_buffering_episode_1629() {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        let seid = 0x1629;
+        let far = |apply_action: u16| crate::n4_build::ParsedCreateFar {
+            far_id: 2,
+            apply_action,
+            ..Default::default()
+        };
+        handle_pfcp_session_event(
+            &dp,
+            PfcpSessionEvent::SessionEstablished {
+                upf_seid: seid,
+                smf_seid: 0x1629,
+                ue_ipv4: Some(Ipv4Addr::new(10, 45, 16, 29)),
+                ul_teid: 0x1629,
+                dl_teid: 0,
+                gnb_addr: None,
+                pdrs: Vec::new(),
+                fars: vec![far(data_plane::FAR_ACTION_BUFF)],
+                qers: Vec::new(),
+                urrs: Vec::new(),
+                bars: Vec::new(),
+            },
+        )
+        .await;
+        let session = dp.sessions.find_by_seid(seid).expect("installed");
+        let modify = |f| PfcpSessionEvent::SessionModified {
+            upf_seid: seid,
+            dl_teid: None,
+            gnb_addr: None,
+            removed_pdr_ids: Vec::new(),
+            removed_far_ids: Vec::new(),
+            removed_qer_ids: Vec::new(),
+            removed_urr_ids: Vec::new(),
+            created_pdrs: Vec::new(),
+            created_fars: Vec::new(),
+            created_qers: Vec::new(),
+            created_urrs: Vec::new(),
+            updated_pdrs: Vec::new(),
+            updated_fars: vec![f],
+            updated_qers: Vec::new(),
+            updated_urrs: Vec::new(),
+            updated_bars: Vec::new(),
+            send_end_marker: false,
+            drop_buffered: false,
+            old_dl_tunnel: None,
+        };
+        let first = |n: u8| session.buffer_dl_packet(vec![n], None).1;
+
+        assert!(first(1), "the create's BUFF FAR: the first packet");
+        assert!(!first(2), "the same episode");
+        handle_pfcp_session_event(&dp, modify(far(data_plane::FAR_ACTION_BUFF))).await;
+        assert!(
+            !first(3),
+            "BUFF without NOCP asks for no report: no new episode"
+        );
+        handle_pfcp_session_event(
+            &dp,
+            modify(far(
+                data_plane::FAR_ACTION_BUFF | data_plane::FAR_ACTION_NOCP
+            )),
+        )
+        .await;
+        assert!(
+            first(4),
+            "BUFF|NOCP: a new episode, this packet is a first one"
+        );
+        assert!(!first(5), "and only one");
+        assert_eq!(
+            session.dl_buffer.lock().unwrap().len(),
+            5,
+            "the packets buffered before stay buffered"
         );
     }
 

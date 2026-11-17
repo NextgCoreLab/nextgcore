@@ -147,7 +147,10 @@ pub async fn subscribe_once(stopping: &impl Fn() -> bool) -> Attempt {
     let Some(notification_uri) = policy_data_notify_uri() else {
         return Attempt::NotYet("no advertised SBI address for the notification URI");
     };
-    let udr = match pcf_discover_endpoints("UDR", "nudr-dr", DISCOVERY_TIMEOUT).await {
+    // #1621 review M1: `pcf_discover_udrs` also remembers the UDR, with its NF
+    // instance id and validityPeriod, for the create path's reads when the NRF
+    // later fails or stops listing it.
+    let udr = match crate::sbi_path::pcf_discover_udrs(DISCOVERY_TIMEOUT).await {
         Ok(found) => match found.into_iter().next() {
             Some(ep) => ep,
             None => return Attempt::NotYet("no UDR discoverable"),

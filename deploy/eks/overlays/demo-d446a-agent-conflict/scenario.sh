@@ -12,6 +12,10 @@
 #   energy-saving   gnb: ... Resolved ... winner energy-1 -> Agent switch-off: cell
 #                   16 off the air; amf: HandoverFailure ... gnb_id=1; gnb-a:
 #                   Handover Preparation Failure -> ActuationFailed (lb-1)
+# Both modes (nextgcore#1630): the UE pod's uplink-burst sidecar sent 5 pings,
+#                   and gnb-a: Uplink data (RLC) ... len=475 -> IntentSubmitted
+#                   (lb-1) TriggerHandover, with no incidental len=49 packet
+#                   (ue-uplink-burst.yaml; test-scenario.sh tests the check).
 # Also captured: gNB-B's `nr-cli agent-audit --json` and `demo metrics` (the gNB
 # has no /metrics listener), the latter as $OUT/metrics/gnb-b.prom, which
 # demo-check.sh reads with the NF scrapes. NR_CLI names the nr-cli binary to
@@ -49,7 +53,17 @@ in_order() {
         # assert_log_order does): an operand `RE=...` after the program is an awk
         # variable, so ENVIRON["RE"] would be empty and match every line.
         line="$(DEMO_RE="${re}" awk -v from="${from}" 'NR > from && $0 ~ ENVIRON["DEMO_RE"] { print NR; exit }' "${file}")"
-        if [[ -z "${line}" ]]; then fail "[${label}] step ${n}/$# missing: ${re}"; return; fi
+        if [[ -z "${line}" ]]; then
+            # grep -E knows GNU escapes (\b, \w, \<) that awk reads otherwise:
+            # name a pattern awk cannot match instead of calling the step missing.
+            if grep -qE -- "${re}" "${file}" \
+                && ! DEMO_RE="${re}" awk '$0 ~ ENVIRON["DEMO_RE"] { f = 1; exit } END { exit !f }' "${file}"; then
+                fail "[${label}] step ${n}/$#: ${re} matches under grep -E but not awk; use POSIX ERE only"
+            else
+                fail "[${label}] step ${n}/$# missing: ${re}"
+            fi
+            return
+        fi
         from="${line}"
     done
     echo "[${label}] chain of $# in order"
@@ -64,13 +78,48 @@ selftest_in_order() {
     in_order "${f}" selftest 'beta' 'alpha' >/dev/null
     local caught=$((fails - before))
     fails=${before}
-    in_order "${f}" selftest 'alpha' 'beta' >/dev/null
+    # A GNU escape awk cannot match (#1630) is named as such (in a subshell, so
+    # it does not count), and the POSIX boundary used below matches.
+    local gnu; gnu="$(in_order "${f}" selftest 'alpha\b')"
+    in_order "${f}" selftest 'alpha' 'two([^0-9]|$)' >/dev/null
     rm -f "${f}"
-    if (( caught != 2 || fails != before )); then
-        echo "DEMO CHECK FAILED: in_order self-test (caught ${caught}/2 bad chains)"; exit 1
+    if (( caught != 2 || fails != before )) || [[ "${gnu}" != *"but not awk"* ]]; then
+        echo "DEMO CHECK FAILED: in_order self-test (caught ${caught}/2 bad chains; GNU escape: ${gnu})"; exit 1
     fi
 }
 selftest_in_order
+
+# nextgcore#1630 (nextgsim#568): lb-1 counts only UEs whose bearer carried
+# user-plane data, so the UE pod's uplink-burst sidecar (ue-uplink-burst.yaml)
+# sends 5 pings with a 446-byte payload (gNB len=475) as its TUN comes up, and
+# ipv6-off removes the incidental IPv6 packet (len=49) runs used to depend on.
+# d446a_uplink_burst SIDECAR_LOG GNB_A_LOG: the sidecar sent its 5 pings, the
+# burst reached gNB-A before lb-1's intent, and no len=49 packet did.
+# POSIX ERE only: in_order matches with awk, where \b is a backspace.
+# Returns non-zero (and counts a failure) when any of them does not hold.
+d446a_uplink_burst() {
+    local before=${fails}
+    # Transmitted, from the sidecar's own log; that they ARRIVED is the gNB-A step below.
+    grep -qE '^5 packets transmitted' "$1" \
+        || fail "[ue] the uplink-burst sidecar did not send its 5 pings (see d446a/uplink-burst.log)"
+    in_order "$2" gnb-a 'Uplink data \(RLC\): ue_id=[0-9]+, drb_id=1, psi=1, len=475([^0-9]|$)' \
+        'audit #[0-9]+: IntentSubmitted \(lb-1\) TriggerHandover'
+    ! grep -qE 'Uplink data \(RLC\): .*len=49([^0-9]|$)' "$2" \
+        || fail "[gnb-a] an incidental len=49 uplink packet: IPv6 is not off in the UE pod"
+    (( fails == before ))
+}
+
+# d446a_ipv6_off UE_LOG: the ue container's wrapper (ue-uplink-burst.yaml)
+# logged that IPv6 is off before nr-ue started. The wrapper exits non-zero when
+# it cannot; this names the case where the wrapper did not run at all (#1630).
+d446a_ipv6_off() {
+    grep -qF '[ue] IPv6 off' "$1" && return 0
+    fail "[ue] no '[ue] IPv6 off' line in the ue log: IPv6 may be on in the UE pod (see d446a/ue.log)"
+    return 1
+}
+
+# Sourced by test-scenario.sh for the functions above; run, the checks below.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then return 0; fi
 
 lb_required='HandoverRequired \(amf_ue_ngap_id=[0-9]+, ran_ue_ngap_id=[0-9]+, type=Intra5gs\) source_gnb_id=2 cause=RadioNetwork\(ReduceLoadInServingCell\)'
 
@@ -86,6 +135,12 @@ for f in gnb-b gnb-a amf; do
     [[ -s "${OUT}/d446a/${f}.log" ]] || fail "[${f}] captured log is empty"
 done
 west="${OUT}/d446a/gnb-b.log" east="${OUT}/d446a/gnb-a.log" amf="${OUT}/d446a/amf.log"
+
+# Both modes (lb-1 fires in each): the uplink burst, then lb-1's intent (#1630).
+"${K[@]}" logs deploy/ue -c uplink-burst 2>/dev/null > "${OUT}/d446a/uplink-burst.log"
+d446a_uplink_burst "${OUT}/d446a/uplink-burst.log" "${east}" || true
+"${K[@]}" logs deploy/ue -c ue 2>/dev/null > "${OUT}/d446a/ue.log"
+d446a_ipv6_off "${OUT}/d446a/ue.log" || true
 
 case "${DEMO_MODE}" in
 load-balancing)

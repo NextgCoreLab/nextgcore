@@ -1268,10 +1268,12 @@ async fn releasing_smf() -> (
     use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
     let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
     let sink = Arc::clone(&seen);
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = listener.local_addr().expect("addr").port();
+    // #1646 review: a recording stand-in takes a port never issued before, so a
+    // stale callback from an earlier test cannot be counted as an SMF call (#1640).
+    let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let port = addr.port();
     let smf = nextgcore_sbi::server::SbiServer::on_listener(
-        nextgcore_sbi::server::SbiServerConfig::new(listener.local_addr().expect("addr")),
+        nextgcore_sbi::server::SbiServerConfig::new(addr),
         listener,
     );
     smf.start(move |req: SReq| {
@@ -2390,6 +2392,8 @@ async fn a_modify_request_missing_its_n1_or_transfer_is_refused() {
 /// and kept as a MODIFY in the paging context, not answered 200 and dropped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_modification_for_an_idle_ue_pages_it() {
+    // #1588: this page reads the paging strategy.
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     let (_smf, port, _calls) = activating_smf().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran, supi) = (7_757_005u64, 61, "imsi-001010007570005");
@@ -2425,6 +2429,8 @@ async fn a_modification_for_an_idle_ue_pages_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_transfer_queued_before_the_ue_went_idle_pages_it_instead_of_sending() {
     let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
+    // #1588: this page reads the paging strategy.
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     let (_smf, port, _calls) = activating_smf().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran, supi) = (7_757_006u64, 62, "imsi-001010007570006");
@@ -2989,7 +2995,10 @@ async fn a_deregistered_ue_leaves_no_session_state_behind() {
     assert!(!server.ue_auth_state.contains(ue));
 }
 
-/// The UE-requested PDU Session Release (0xD1) forgets that PSI and only that PSI.
+/// The UE-requested PDU Session Release (0xD1) of one PSI touches that PSI only, and
+/// its state lives until the SMF reports it RELEASED (#1637: the SMF runs the release,
+/// and the UE's RELEASE COMPLETE must still find the context). Then the sweep drops
+/// that PSI and keeps its sibling.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_released_pdu_session_is_forgotten_and_its_sibling_kept() {
     let (_smf, port, _calls) = activating_smf().await;
@@ -3005,12 +3014,26 @@ async fn a_released_pdu_session_is_forgotten_and_its_sibling_kept() {
         .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &release_request))
         .await
         .expect("handled");
+    assert_eq!(
+        session_state_of(&server, ue),
+        (2, 2, 2),
+        "nothing is forgotten before the SMF reports RELEASED"
+    );
+    // The SMF's RELEASED arrives on the SBI task: only sess_list loses PSI 1.
+    {
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap();
+        let s = guard.sess_find_by_psi(ue, 1).expect("held");
+        guard.sess_remove(s.id);
+    }
+    server.sweep_orphaned_session_state();
     assert_eq!(session_state_of(&server, ue), (1, 1, 1));
     assert!(
         server.sm_context_refs.contains_key(&(ue, 2)),
         "PSI 2 is untouched"
     );
     assert!(!server.sm_context_refs.contains_key(&(ue, 1)));
+    server.forget_ue(ue);
 }
 
 /// The orphan sweep drops refs whose session the SBI task removed (the SMF's
@@ -3371,6 +3394,8 @@ async fn the_plain_dispatch_service_request_arm_records_its_allocation() {
 /// it. It gets an Error Indication "Unknown local UE NGAP ID".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_released_connection_loses_its_contextless_allocation() {
+    // #1588: this test reads the paging strategy.
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     let mut server = capturing_ngap_server().await;
     let id = 7_758_021u64;
     server.forced_amf_ue_ngap_id = Some(id);
@@ -3967,10 +3992,10 @@ async fn a_first_create_sm_context_answered_off_the_task_sets_the_session_up() {
     server.forget_ue(ue);
 }
 
-/// #922: a UE-requested PDU Session Release does not wait for the SMF. The
-/// release command goes to the UE and the gNB at once, and the ReleaseSMContext
-/// reaches the SMF off the NGAP task. With an SMF that never answers, the
-/// handler still returns at once.
+/// #922: a UE-requested PDU Session Release does not wait for the SMF. With one
+/// session's SMF never answering, the handler still returns at once for both, and
+/// the answering SMF gets its session's request off the NGAP task. #1637: nothing goes
+/// to the UE or the gNB before the SMF answers (TS 23.502 §4.3.4.2 steps 1a-3).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_ue_requested_release_does_not_wait_for_the_smf() {
     let (_hang, hang_port) = hanging_smf();
@@ -3994,28 +4019,24 @@ async fn a_ue_requested_release_does_not_wait_for_the_smf() {
         "the handler did not wait for the SMF: {:?}",
         started.elapsed()
     );
-    let releases = sent_to(&mut server, ue)
-        .into_iter()
-        .filter(|s| matches!(s, Sent::ReleaseCommand { .. }))
-        .count();
-    assert_eq!(releases, 2, "both sessions released at the gNB at once");
-    // The answering SMF gets its release off the task.
+    assert!(
+        sent_to(&mut server, ue).is_empty(),
+        "nothing goes out before an SMF answers"
+    );
+    // The answering SMF gets its session's request off the task.
+    let reached =
+        || {
+            calls.lock().expect("calls").iter().any(|(u, b)| {
+                u.ends_with("/sm-contexts/rel-922-ok/modify") && b["n1SmMsg"].is_object()
+            })
+        };
     for _ in 0..200 {
-        if calls
-            .lock()
-            .expect("calls")
-            .iter()
-            .any(|(u, _)| u.ends_with("/sm-contexts/rel-922-ok/release"))
-        {
+        if reached() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(calls
-        .lock()
-        .expect("calls")
-        .iter()
-        .any(|(u, _)| u.ends_with("/sm-contexts/rel-922-ok/release")));
+    assert!(reached(), "the release request reached the answering SMF");
     server.forget_ue(ue);
 }
 
@@ -5222,6 +5243,8 @@ async fn an_update_from_cm_idle_whose_initial_context_setup_cannot_encode_still_
 #[allow(clippy::await_holding_lock)]
 async fn an_ics_failure_after_an_idle_update_keeps_the_ue_registered_and_idle() {
     let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    // #1588: this test reads the paging strategy.
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeFixtureGuami::install();
     let (_smf, port, calls) = activating_smf().await;
@@ -5813,6 +5836,8 @@ async fn an_update_that_reactivated_a_session_keeps_the_connection() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_second_downlink_data_transfer_while_paging_gets_409_with_retry_after() {
     let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
+    // #1588: this page reads the paging strategy.
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     let (_smf, port, _calls) = activating_smf().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran, supi) = (7_749_021u64, 65, "imsi-001010007490021");

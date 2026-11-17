@@ -535,6 +535,17 @@ pub struct SbiRequest {
     /// forwarded-certificate header, which is only as trustworthy as the
     /// terminator that set it.
     pub peer_cert_nf_instance_id: Option<String>,
+    /// NF types named by the RFC 9310 NFTypes extension of the same **verified**
+    /// client certificate (#1611, TS 33.310 §6.1.3c.3: "nfTypes shall contain NF
+    /// type for the Network Function instance").
+    ///
+    /// Empty whenever [`Self::peer_cert_nf_instance_id`] could not be trusted
+    /// (plaintext, TLS without client authentication, programmatic requests),
+    /// and also for a verified certificate that carries no NFTypes extension or
+    /// one that does not decode. Empty means "the certificate asserts no NF type",
+    /// never "any type". It may be non-empty when the certificate has NFTypes but
+    /// no URI SAN.
+    pub peer_cert_nf_types: Vec<String>,
     /// `sub` of the OAuth2 access token this process **verified** — the NF
     /// Instance ID of the service consumer (TS 33.501 §13.4.1.2, TS 29.510
     /// §5.4.2.2.2 `AccessTokenClaims.sub`).

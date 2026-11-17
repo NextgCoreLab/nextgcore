@@ -1320,26 +1320,36 @@ impl ParsedOuterHeaderCreation {
     }
 }
 
+/// The Unsigned32 at the start of `ie`'s value, or `short` when the value is
+/// under 4 octets (#1616).
+fn be_u32(ie: &ParsedIe, short: &'static str) -> Result<u32, &'static str> {
+    ie.value
+        .get(..4)
+        .and_then(|v| <[u8; 4]>::try_from(v).ok())
+        .map(u32::from_be_bytes)
+        .ok_or(short)
+}
+
 /// Parse Create PDR IE and extract relevant fields
 pub fn parse_create_pdr(data: &[u8]) -> Result<ParsedCreatePdr, &'static str> {
     let ies = ParsedIe::parse_all(data);
     let mut pdr = ParsedCreatePdr::default();
 
-    // PDR ID (mandatory)
-    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::PDR_ID) {
-        if ie.value.len() >= 2 {
-            pdr.pdr_id = u16::from_be_bytes([ie.value[0], ie.value[1]]);
-        }
-    } else {
-        return Err("PDR ID missing");
-    }
+    // PDR ID (mandatory, §8.2.36: 2 octets). A present but shorter ID is a
+    // semantically invalid value (§7.6.8), refused like a short QER ID; it used
+    // to install the rule as PDR 0 (#1605).
+    let ie = ParsedIe::find_ie(&ies, pfcp_ie::PDR_ID).ok_or("PDR ID missing")?;
+    let id: [u8; 2] = ie
+        .value
+        .get(..2)
+        .and_then(|v| v.try_into().ok())
+        .ok_or("PDR ID shorter than 2 octets")?;
+    pdr.pdr_id = u16::from_be_bytes(id);
 
-    // Precedence (mandatory)
+    // Precedence (mandatory, §8.2.11: Unsigned32). A shorter one is refused
+    // (§7.6.8), not read as precedence 0, the highest (#1616).
     if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::PRECEDENCE) {
-        if ie.value.len() >= 4 {
-            pdr.precedence =
-                u32::from_be_bytes([ie.value[0], ie.value[1], ie.value[2], ie.value[3]]);
-        }
+        pdr.precedence = be_u32(ie, "Precedence shorter than 4 octets")?;
     }
 
     // PDI (mandatory)
@@ -1354,41 +1364,112 @@ pub fn parse_create_pdr(data: &[u8]) -> Result<ParsedCreatePdr, &'static str> {
         }
     }
 
-    // FAR ID
+    // The rules the PDR references: FAR ID (§8.2.74), URR ID (§8.2.54) and
+    // QER ID (§8.2.75), each 4 octets. A shorter reference is refused (§7.6.8)
+    // rather than skipped, which installed the PDR with no FAR, or missing a URR
+    // or QER, and accepted the request (#1616).
     if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::FAR_ID) {
-        if ie.value.len() >= 4 {
-            pdr.far_id = Some(u32::from_be_bytes([
-                ie.value[0],
-                ie.value[1],
-                ie.value[2],
-                ie.value[3],
-            ]));
-        }
+        pdr.far_id = Some(be_u32(ie, "FAR ID shorter than 4 octets")?);
     }
-
-    // URR IDs
     for ie in ParsedIe::find_all_ies(&ies, pfcp_ie::URR_ID) {
-        if ie.value.len() >= 4 {
-            pdr.urr_ids.push(u32::from_be_bytes([
-                ie.value[0],
-                ie.value[1],
-                ie.value[2],
-                ie.value[3],
-            ]));
-        }
+        pdr.urr_ids
+            .push(be_u32(ie, "URR ID shorter than 4 octets")?);
+    }
+    // Only the first QER ID is kept, but every one present is checked.
+    for ie in ParsedIe::find_all_ies(&ies, pfcp_ie::QER_ID) {
+        let id = be_u32(ie, "QER ID shorter than 4 octets")?;
+        pdr.qer_id.get_or_insert(id);
     }
 
-    // QER ID
-    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::QER_ID) {
-        if ie.value.len() >= 4 {
-            pdr.qer_id = Some(u32::from_be_bytes([
-                ie.value[0],
-                ie.value[1],
-                ie.value[2],
-                ie.value[3],
-            ]));
+    Ok(pdr)
+}
+
+/// An Update PDR (TS 29.244 Table 7.5.4.2-1): the changes it carries to a stored
+/// PDR, and nothing else (#1673).
+///
+/// §5.6.3 (29244-k00.txt:6060-6095): an IE the update does not carry keeps its
+/// provisioned value, a present IE replaces it, and an IE "to be removed" is sent
+/// with a null length. For an IE that may occur several times, one null
+/// occurrence removes them all, and the URR ID and QER ID lists of an Update PDR
+/// are "the list of all the URR/QER IDs to be associated to the PDR". In every
+/// field below, `None` means "keep".
+#[derive(Debug, Clone, Default)]
+pub struct ParsedUpdatePdr {
+    pub pdr_id: u16,
+    pub precedence: Option<u32>,
+    /// Replaces the stored PDI whole (Table 7.5.4.2-1).
+    pub pdi: Option<ParsedPdi>,
+    /// `Some(None)`: removed (null length).
+    pub outer_header_removal: Option<Option<u8>>,
+    /// `Some(None)`: removed (null length).
+    pub far_id: Option<Option<u32>>,
+    /// The new list; empty when a null URR ID removed them all.
+    pub urr_ids: Option<Vec<u32>>,
+    /// The new list; empty when a null QER ID removed them all.
+    pub qer_ids: Option<Vec<u32>>,
+}
+
+/// The new list a repeatable rule-reference IE of an Update PDR gives, or
+/// `None` when the update carries none (#1673). A null occurrence contributes
+/// nothing (§5.6.3: it removes every provisioned one); a 1 to 3-octet value is
+/// refused (§7.6.8, #1616).
+fn update_id_list(
+    ies: &[ParsedIe],
+    ie_type: u16,
+    short: &'static str,
+) -> Result<Option<Vec<u32>>, &'static str> {
+    let found = ParsedIe::find_all_ies(ies, ie_type);
+    if found.is_empty() {
+        return Ok(None);
+    }
+    let mut ids = Vec::new();
+    for ie in found {
+        if !ie.value.is_empty() {
+            ids.push(be_u32(ie, short)?);
         }
     }
+    Ok(Some(ids))
+}
+
+/// Parse an Update PDR IE (#1673): see [`ParsedUpdatePdr`].
+pub fn parse_update_pdr(data: &[u8]) -> Result<ParsedUpdatePdr, &'static str> {
+    let ies = ParsedIe::parse_all(data);
+    let mut pdr = ParsedUpdatePdr::default();
+
+    // PDR ID (mandatory, §8.2.36). It names the rule, so it cannot be removed:
+    // a short one is refused (#1605).
+    let ie = ParsedIe::find_ie(&ies, pfcp_ie::PDR_ID).ok_or("PDR ID missing")?;
+    let id: [u8; 2] = ie
+        .value
+        .get(..2)
+        .and_then(|v| v.try_into().ok())
+        .ok_or("PDR ID shorter than 2 octets")?;
+    pdr.pdr_id = u16::from_be_bytes(id);
+
+    // Precedence and PDI have no "not set" state to remove to, so a null one is
+    // as invalid as a short one (§7.6.8).
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::PRECEDENCE) {
+        pdr.precedence = Some(be_u32(ie, "Precedence shorter than 4 octets")?);
+    }
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::PDI) {
+        if ie.value.is_empty() {
+            return Err("PDI is empty");
+        }
+        pdr.pdi = Some(parse_pdi(&ie.value)?);
+    }
+
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::OUTER_HEADER_REMOVAL) {
+        pdr.outer_header_removal = Some(ie.value.first().copied());
+    }
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::FAR_ID) {
+        pdr.far_id = Some(if ie.value.is_empty() {
+            None
+        } else {
+            Some(be_u32(ie, "FAR ID shorter than 4 octets")?)
+        });
+    }
+    pdr.urr_ids = update_id_list(&ies, pfcp_ie::URR_ID, "URR ID shorter than 4 octets")?;
+    pdr.qer_ids = update_id_list(&ies, pfcp_ie::QER_ID, "QER ID shorter than 4 octets")?;
 
     Ok(pdr)
 }
@@ -1475,14 +1556,15 @@ pub fn parse_create_far(data: &[u8]) -> Result<ParsedCreateFar, &'static str> {
     let ies = ParsedIe::parse_all(data);
     let mut far = ParsedCreateFar::default();
 
-    // FAR ID (mandatory)
-    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::FAR_ID) {
-        if ie.value.len() >= 4 {
-            far.far_id = u32::from_be_bytes([ie.value[0], ie.value[1], ie.value[2], ie.value[3]]);
-        }
-    } else {
-        return Err("FAR ID missing");
-    }
+    // FAR ID (mandatory, §8.2.74: 4 octets). A shorter one is refused, not read
+    // as FAR 0 (#1605, §7.6.8).
+    let ie = ParsedIe::find_ie(&ies, pfcp_ie::FAR_ID).ok_or("FAR ID missing")?;
+    let id: [u8; 4] = ie
+        .value
+        .get(..4)
+        .and_then(|v| v.try_into().ok())
+        .ok_or("FAR ID shorter than 4 octets")?;
+    far.far_id = u32::from_be_bytes(id);
 
     // Apply Action (mandatory; TS 29.244 §8.2.26). Octet 5 (DROP, FORW, BUFF, NOCP,
     // DUPL, ...) comes first, octet 6 (EDRT, BDPN, DDPN, ...) second; the library's
@@ -1691,14 +1773,15 @@ pub fn parse_create_urr(data: &[u8]) -> Result<ParsedCreateUrr, &'static str> {
     let ies = ParsedIe::parse_all(data);
     let mut urr = ParsedCreateUrr::default();
 
-    // URR ID (mandatory)
-    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::URR_ID) {
-        if ie.value.len() >= 4 {
-            urr.urr_id = u32::from_be_bytes([ie.value[0], ie.value[1], ie.value[2], ie.value[3]]);
-        }
-    } else {
-        return Err("URR ID missing");
-    }
+    // URR ID (mandatory, §8.2.54: 4 octets). A shorter one is refused, not read
+    // as URR 0 (#1605, §7.6.8).
+    let ie = ParsedIe::find_ie(&ies, pfcp_ie::URR_ID).ok_or("URR ID missing")?;
+    let id: [u8; 4] = ie
+        .value
+        .get(..4)
+        .and_then(|v| v.try_into().ok())
+        .ok_or("URR ID shorter than 4 octets")?;
+    urr.urr_id = u32::from_be_bytes(id);
 
     // Measurement Method (IE type 62)
     if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::MEASUREMENT_METHOD) {

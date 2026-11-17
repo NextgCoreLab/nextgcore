@@ -53,9 +53,12 @@ pub const PREDICTION_WINDOW: Duration = Duration::from_secs(30);
 /// rather than queueing behind a slow NWDAF.
 pub const MAX_IN_FLIGHT: usize = 64;
 
-/// The in-flight bound. Process-global; a test that takes its permits holds
-/// `test_support::CONTEXT_GUARD`, as every test that queues a page does, so no
-/// other test's query competes for them.
+/// The in-flight bound. Process-global; a test that takes its permits sets the
+/// `nwdaf-mobility` strategy, which holds `test_support::PAGING_STRATEGY_LOCK`.
+/// Every test that reads the strategy holds that lock too, which the readers enforce
+/// in test builds (#1588).
+/// So no other test's query competes for the permits or counts into
+/// [`outcome_count`].
 static IN_FLIGHT: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
 
 fn in_flight() -> Arc<Semaphore> {
@@ -65,7 +68,7 @@ fn in_flight() -> Arc<Semaphore> {
 }
 
 /// Test-only: the in-flight bound, so a test can fill it. Hold
-/// `test_support::CONTEXT_GUARD` while holding its permits.
+/// `test_support::PAGING_STRATEGY_LOCK` while holding its permits.
 #[doc(hidden)]
 pub fn in_flight_for_test() -> Arc<Semaphore> {
     in_flight()
@@ -127,6 +130,8 @@ pub fn outcome_count(outcome: HintOutcome) -> u64 {
 /// default `/metrics` is unchanged.
 pub fn render_metrics(out: &mut String) {
     use std::fmt::Write as _;
+    #[cfg(test)]
+    crate::test_support::assert_paging_strategy_lock_held();
     let strategy = crate::context::amf_self()
         .read()
         .map(|c| c.paging_strategy)
@@ -323,10 +328,7 @@ pub async fn query_prediction(supi: &str) -> Result<Option<PredictedCell>, Strin
     let (host, port) = resolve_nwdaf_endpoint()
         .await
         .ok_or_else(|| "no NWDAF (NRF discovery found none, NWDAF_SBI_ADDR unset)".to_string())?;
-    let client = crate::attach_oauth2(
-        nextgcore_sbi::client::SbiClient::for_peer(&host, port),
-        nextgcore_sbi::types::NfType::Nwdaf,
-    );
+    let client = crate::sbi_path::peer_client(nextgcore_sbi::types::NfType::Nwdaf, &host, port);
     let response = client
         .get(&request_path(supi, std::time::SystemTime::now()))
         .await

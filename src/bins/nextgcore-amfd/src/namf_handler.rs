@@ -554,6 +554,7 @@ pub fn connected_downlink_for(
         n1: req_data.n1_message.clone(),
         n2,
         failure_notify_uri: req_data.n1n2_failure_txf_notif_uri.clone(),
+        n1_only: false,
     })
 }
 
@@ -841,6 +842,8 @@ pub fn send_event_notification(
 
 /// The configured paging strategy (`amf.paging.strategy`).
 fn paging_strategy() -> crate::context::PagingStrategy {
+    #[cfg(test)]
+    crate::test_support::assert_paging_strategy_lock_held();
     let ctx = amf_self();
     let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
     guard.paging_strategy
@@ -855,6 +858,10 @@ pub(crate) enum PagedN2 {
     Release,
     /// A modify transfer: its own Modify Request after the ICS (#757).
     Modify,
+    /// #1643 review: no N2, and the page is N1-only (`pending_n1_only`): the SMF's
+    /// answer to the UE's own release or modification, the NAS message only (TS
+    /// 23.502 §4.3.4.2 step 4). The UE's answer re-activates no user plane for it.
+    N1Only,
 }
 
 /// Initiate paging for an idle UE when DL data arrives
@@ -896,6 +903,7 @@ pub(crate) fn initiate_paging_for_idle_ue(
         pending_n2,
         pending_n2_release: paged_n2 == PagedN2::Release,
         pending_n2_modify: paged_n2 == PagedN2::Modify,
+        pending_n1_only: paged_n2 == PagedN2::N1Only,
         pdu_session_id,
         // The registration area this AMF assigned: the single TAI the
         // Registration Accept's TAI list carries (`gmm_build`, list type 00).
@@ -1094,6 +1102,8 @@ mod tests {
     /// second silently replaced the first.
     #[test]
     fn a_second_transfer_while_paging_is_refused_and_keeps_the_first() {
+        // #1588 review: this page reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.blocking_lock();
         let mut ue = create_test_ue();
         ue.id = 7_749_001;
         let setup = |psi: u8| N1N2MessageTransferReqData {
@@ -1128,6 +1138,8 @@ mod tests {
     /// N1-only case fell through as N1_N2_TRANSFER_INITIATED and nothing was sent.
     #[test]
     fn an_n1_only_transfer_to_an_idle_ue_pages_and_keeps_the_n1() {
+        // #1588 review: this page reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.blocking_lock();
         let mut ue = create_test_ue();
         ue.id = 5_180_001;
         let mut sess = create_test_sess();
@@ -1164,6 +1176,8 @@ mod tests {
     /// answered N1_N2_TRANSFER_INITIATED and never sent.
     #[test]
     fn a_connected_ues_n1_and_release_are_delivered_now() {
+        // #1588 review: this page reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.blocking_lock();
         let mut ue = create_test_ue();
         ue.id = 6_660_001;
         let mut sess = create_test_sess();
@@ -1185,6 +1199,7 @@ mod tests {
                 n1: Some(release_cmd.clone()),
                 n2: crate::context::ConnectedN2::None,
                 failure_notify_uri: None,
+                n1_only: false,
             })
         );
 
@@ -1293,6 +1308,8 @@ mod tests {
         let result = handle_event_subscribe(&subscription, "http://nef.example.com/callback");
         assert!(result.is_ok());
         let sub_id = result.unwrap();
+        // #1640: a subscription for every UE, removed when the test ends.
+        let _subscription = crate::namf_server::EventSubscriptionGuard::id(sub_id.clone());
         assert!(sub_id.starts_with("sub-"));
     }
 
@@ -1382,6 +1399,8 @@ mod tests {
 
     #[test]
     fn test_n1n2_transfer_idle_ue_triggers_paging() {
+        // #1588 review: this page reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.blocking_lock();
         amf_context_init(64, 1024, 4096);
 
         let mut ue = AmfUe::default();

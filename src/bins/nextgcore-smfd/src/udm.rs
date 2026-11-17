@@ -227,6 +227,32 @@ pub fn parse_sm_data(
     }
 }
 
+/// #1648: the client for a Nudm service operation (UECM registration, SDM get and
+/// subscription) at `host:port`. With OAuth2 enforcement on it carries an
+/// NRF-issued token (TS 33.501 §13.4.1.1.2, TS 29.500 §6.7.3); these used the
+/// shared `global_context().get_client` cache, whose clients carry no token, so an
+/// OAuth2-required UDM answered every one of them 401.
+///
+/// Review M1: both arms reuse one client per UDM, and so its pooled connections.
+/// Off, it is the shared cache exactly as before; on, the per-peer cached tokened
+/// client.
+pub(crate) async fn udm_client(
+    host: &str,
+    port: u16,
+) -> std::sync::Arc<nextgcore_sbi::client::SbiClient> {
+    match crate::tokened_peer_client(
+        nextgcore_sbi::security::sbi_peer_client_config(host, port),
+        nextgcore_sbi::types::NfType::Udm,
+    ) {
+        Some(client) => client,
+        None => {
+            nextgcore_sbi::context::global_context()
+                .get_client(host, port)
+                .await
+        }
+    }
+}
+
 /// `Nudm_SDM_Get sm-data` for one DNN (TS 29.503 §5.2.2.2).
 ///
 /// Scoped with `?dnn=` only. `single-nssai` is deliberately omitted for the reason
@@ -244,9 +270,7 @@ pub async fn fetch_sm_data(
         return None;
     }
     let (host, port) = crate::discover_udm_sdm_endpoint().await?;
-    let client = nextgcore_sbi::context::global_context()
-        .get_client(&host, port)
-        .await;
+    let client = udm_client(&host, port).await;
     let path = format!("/nudm-sdm/v2/{supi}/sm-data?dnn={dnn}");
     let response = match client.get(&path).await {
         Ok(r) => r,
@@ -468,9 +492,7 @@ pub async fn register_as_serving_smf(
         body.to_string(),
         nextgcore_sbi::constants::content_type::APPLICATION_JSON,
     );
-    let client = nextgcore_sbi::context::global_context()
-        .get_client(&host, port)
-        .await;
+    let client = udm_client(&host, port).await;
     match client.send_request(request).await {
         // 201 (created) and 200/204 (replaced) are all success for a PUT upsert.
         Ok(resp) if resp.is_success() => {
@@ -525,9 +547,7 @@ pub async fn deregister_serving_smf(supi: &str, pdu_session_id: u8) -> bool {
         return false;
     };
     let path = format!("/nudm-uecm/v1/{supi}/registrations/smf-registrations/{pdu_session_id}");
-    let client = nextgcore_sbi::context::global_context()
-        .get_client(&host, port)
-        .await;
+    let client = udm_client(&host, port).await;
     match client
         .send_request(nextgcore_sbi::message::SbiRequest::delete(path))
         .await
@@ -610,9 +630,7 @@ pub async fn subscribe_sm_data(
         body.to_string(),
         nextgcore_sbi::constants::content_type::APPLICATION_JSON,
     );
-    let client = nextgcore_sbi::context::global_context()
-        .get_client(&host, port)
-        .await;
+    let client = udm_client(&host, port).await;
     let response = match client.send_request(request).await {
         Ok(resp) => resp,
         Err(e) => {
@@ -695,9 +713,7 @@ pub async fn unsubscribe_sm_data(supi: &str, subscription_id: &str) -> bool {
         return false;
     };
     let path = format!("/nudm-sdm/v2/{supi}/sdm-subscriptions/{subscription_id}");
-    let client = nextgcore_sbi::context::global_context()
-        .get_client(&host, port)
-        .await;
+    let client = udm_client(&host, port).await;
     match client
         .send_request(nextgcore_sbi::message::SbiRequest::delete(path))
         .await

@@ -1,22 +1,22 @@
-# SBI TLS Certificates — Development Setup
+# SBI TLS Certificates — Development PKI
 
-This directory holds TLS certificates for securing the SBI (Service Based Interface) between 5G Core NFs.
+This directory holds the generator for the TLS certificates that secure the SBI
+(Service Based Interface) between the 5G Core NFs of the shipped stacks.
 
-> **Warning**: These are **development-only** self-signed certificates. Do not use in production.
+> **Warning**: These are **development-only** certificates from a self-signed
+> CA. Do not use them in production.
 
 ## Quick Start
 
 ```bash
-# 1. Generate CA + per-NF certificates
+# Generate the CA and one certificate per NF into this directory
 ./generate-dev-certs.sh
 
-# 2. Start the stack with TLS enabled
-TLS_ENABLED=true SBI_SCHEME=https docker compose up -d
+# Or somewhere else
+./generate-dev-certs.sh --out /tmp/nextgcore-certs
 
-# 3. Verify NRF TLS endpoint
-openssl s_client -connect localhost:7777 \
-    -CAfile certs/ca.crt \
-    -verify_return_error < /dev/null
+# Inspect one
+openssl x509 -in amf.crt -noout -text
 ```
 
 ## What Gets Generated
@@ -25,34 +25,52 @@ openssl s_client -connect localhost:7777 \
 |------|---------|
 | `ca.crt` | Root CA certificate (trust anchor for all NFs) |
 | `ca.key` | Root CA private key (**never share**) |
-| `<nf>.crt` | Per-NF server certificate (signed by CA) |
+| `<nf>.crt` | Per-NF TLS client and server certificate, signed by the CA |
 | `<nf>.key` | Per-NF private key (**never share**) |
 
-NF certificates cover: nrf, ausf, udm, udr, pcf, nssf, bsf, amf, smf, upf, scp, sepp, lmf, mbsmf, nsacf, ee, pin, nwdaf, dccf
+The NFs, their NF types, NF instance IDs and addresses come from
+[`nf-identities.txt`](nf-identities.txt). Each NF certificate follows the NF TLS
+client and server certificate profile of TS 33.310 §6.1.3c.3:
 
-All certificates include SANs for `localhost`, Docker network IPs (172.23.0.x), and per-NF DNS names.
+| Field | Value |
+|-------|-------|
+| Subject | `C=US, O=5gc.mnc070.mcc999.3gppnetwork.org, CN=<nf>` (override the home domain with `HOME_DOMAIN`) |
+| subjectAltName | `URI:urn:uuid:<nfInstanceId>`, `DNS:<nf>`, `DNS:nextgcore-<nf>`, `DNS:localhost`, `IP:127.0.0.1`, plus the NF's addresses from the table |
+| NFTypes (RFC 9310, 1.3.6.1.5.5.7.1.34) | `<nfType>` |
+| keyUsage | critical, digitalSignature |
+| extendedKeyUsage | serverAuth, clientAuth (an NF is both) |
+| subjectKeyIdentifier / authorityKeyIdentifier | RFC 5280 method (1) |
+| Validity | 3 years (the CA: 10 years) |
 
-## Environment Variables
+The URN and the NFTypes are what the NRF checks a registrant against:
+NFRegister, NFUpdate and NFDeregister must name the nfInstanceId and nfType of
+the caller's verified client certificate, or they are refused
+`400 INVALID_CLIENT` (#1611). TS 33.310 §6.1.3c.3 NOTE 1a: without the URN, "the
+identity of the NF instance can not be securely validated".
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `TLS_ENABLED` | `false` | Set to `true` to pass `--tls` flag to NF binaries |
-| `SBI_SCHEME` | `http` | Set to `https` for TLS SBI URLs |
+So **an NF must register with the nfInstanceId its certificate names**. The
+compose stacks pin each NF's ID with `NEXTGCORE_<TYPE>_INSTANCE_ID` (see
+`src/libs/nextgcore-sbi/src/nf_instance_id.rs`); an unpinned NF generates a
+random UUID at start that no certificate names.
+[`check-nf-identities.py`](check-nf-identities.py) (run in CI) fails when a
+compose file pins an ID other than the table's.
 
-## Certificate Renewal
+Each certificate names only its own NF in its DNS and IP SANs (plus loopback),
+so one NF's certificate cannot pass as another NF's server identity.
 
-Certificates have a 10-year validity (development only).  To regenerate:
+The private keys keep the default file mode, so the non-root `nextgcore` user
+in the containers can read them through the bind mount.
 
-```bash
-./generate-dev-certs.sh --clean
-docker compose down && docker compose up -d
-```
+## Re-running
+
+Re-running keeps the CA and every NF certificate that already carries the
+identity its table row names. A certificate that does not (one issued before
+#1617, or for a changed ID or type) is re-issued, and the script says so.
+`--clean` removes everything and starts over.
 
 ## Production TLS
 
-For production deployments, replace self-signed certificates with:
-- Certificates from an internal PKI (e.g., cert-manager in K8s)
-- Certificates per 3GPP TS 33.310 (Network Domain Security)
-- TLS 1.3 with ECDSA P-256 or P-384 for SBI (TS 33.501 §13.2)
-
-See `../../deploy/helm/` for K8s TLS configuration using cert-manager.
+For production, issue the certificates from the operator's PKI (TS 33.310
+§6.1.3c: CMPv2 or ACME) with the same profile: in particular the
+`urn:uuid:<nfInstanceId>` URI SAN, the RFC 9310 NFTypes extension, and the
+nfInstanceId the NF actually registers.

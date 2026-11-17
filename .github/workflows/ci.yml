@@ -596,6 +596,23 @@ jobs:
           set -euo pipefail
           python3 deploy/check_no_demo_block.py --self-test
           python3 deploy/check_no_demo_block.py
+      - name: Dev PKI names the IDs the stacks register (nextgcore#1617)
+        # Each NF certificate carries urn:uuid:<nfInstanceId> and RFC 9310
+        # NFTypes (TS 33.310 §6.1.3c.3) from docker/rust/certs/nf-identities.txt;
+        # a compose pin that differs would leave that NF unable to register
+        # once the NRF binds registration to the certificate. Then generate
+        # the PKI twice: the second run must keep every certificate.
+        working-directory: nextgcore
+        run: |
+          set -euo pipefail
+          python3 docker/rust/certs/check-nf-identities.py --self-test
+          python3 docker/rust/certs/check-nf-identities.py
+          out="$(mktemp -d)"
+          bash docker/rust/certs/generate-dev-certs.sh --out "$out" >/dev/null
+          rows="$(grep -cvE '^\s*(#|$)' docker/rust/certs/nf-identities.txt)"
+          kept="$(bash docker/rust/certs/generate-dev-certs.sh --out "$out" | grep -c 'already current')"
+          test "$kept" = "$rows" || { echo "re-run re-issued $((rows - kept)) of $rows certificates"; exit 1; }
+          openssl x509 -in "$out/amf.crt" -noout -text | grep -q 'URI:urn:uuid:'
       - name: Demo profile toggles (nextgcore#1395)
         # The PROFILE=demo post-render that merges a demo overlay's toggles
         # into the NF configs: fail-closed rules, demo-off untouched.
@@ -606,6 +623,11 @@ jobs:
           # nextgsim#480: profile_rollout waits on every rendered Deployment
           # (d445a's nef, d441e's nwdaf-mtlf/-anlf), against a stub kubectl.
           deploy/eks/profiles/demo/test-rollout.sh
+          # #1651: a rollout wait fails at once on a crash-looping pod of the
+          # workload's current revision (fixture rules, then the wait itself
+          # against a stub kubectl, PROFILE=5g end to end).
+          (cd deploy/eks/lib && python3 -m unittest -v test_crashloop)
+          deploy/eks/lib/test-rollout-wait.sh
           # k8s/demo-check.sh against a fake cluster: the private kubeconfig is
           # removed on every exit path, every artefact is scrubbed, and a
           # surviving token fails the run.

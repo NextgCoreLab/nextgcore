@@ -1,0 +1,45 @@
+# NF identities of the shipped dev stacks (issue #1617).
+#
+# One line per NF: <cert name> <nfType> <nfInstanceId> <addresses>
+#
+# generate-dev-certs.sh issues <cert name>.crt with the TLS client/server
+# profile of TS 33.310 §6.1.3c.3: subjectAltName URI-ID urn:uuid:<nfInstanceId>
+# and the RFC 9310 NFTypes extension naming <nfType>. The NRF binds
+# NFRegister / NFUpdate / NFDeregister to both (#1611), so each value here
+# must be what that NF actually registers:
+#   - <nfInstanceId> is pinned in the stack by NEXTGCORE_<TYPE>_INSTANCE_ID
+#     (src/libs/nextgcore-sbi/src/nf_instance_id.rs). A generated UUID would
+#     not match any certificate.
+#   - <nfType> is the nfType the daemon puts in its NFProfile (TS 29.510
+#     §6.1.6.3.3 spelling as nextgcore emits it).
+# check-nf-identities.py fails CI when a compose file pins a different ID.
+#
+# <addresses> is a comma-separated list of the NF's IP addresses on the
+# stack's networks (docker-compose.yml), or - for none. They become IP SANs
+# next to DNS:<cert name>, DNS:nextgcore-<cert name> and loopback.
+#
+# nfInstanceId is a UUID version 4 (TS 29.571 §5.3.2): the 13th hex digit is
+# 4 and the 17th is 8.
+#
+# scp and sepp do not register with the NRF; their certificates still carry
+# a URN, which TS 33.310 §6.1.3c.4 / §6.1.3c.5.2 require of them too.
+nrf     NRF     6b1d7e3c-0000-4000-8000-0000000000f0  172.23.0.10
+ausf    AUSF    6b1d7e3c-0000-4000-8000-00000000a05f  172.23.0.11
+udm     UDM     6b1d7e3c-0000-4000-8000-000000000d10  172.23.0.12
+udr     UDR     6b1d7e3c-0000-4000-8000-000000000d00  172.23.0.20
+pcf     PCF     6b1d7e3c-0000-4000-8000-000000000cf0  172.23.0.13
+nssf    NSSF    6b1d7e3c-0000-4000-8000-0000000055f0  172.23.0.14
+bsf     BSF     6b1d7e3c-0000-4000-8000-000000000b0f  172.23.0.15
+amf     AMF     6b1d7e3c-0000-4000-8000-000000000af0  172.23.0.5
+smf     SMF     6b1d7e3c-0000-4000-8000-0000000005f0  172.23.0.4
+upf     UPF     6b1d7e3c-0000-4000-8000-0000000004f0  172.23.0.7
+nwdaf   NWDAF   6b1d7e3c-0000-4000-8000-00000000fdaf  172.23.0.30
+ees     AF      6b1d7e3c-0000-4000-8000-0000000000e5  172.23.0.31
+lmf     LMF     6b1d7e3c-0000-4000-8000-0000000001f0  172.23.0.32
+mbsmf   MBSMF   6b1d7e3c-0000-4000-8000-0000000b05f0  172.23.0.33
+nsacf   NSACF   6b1d7e3c-0000-4000-8000-00000005acf0  172.23.0.34
+ucmf    UCMF    6b1d7e3c-0000-4000-8000-00000000ac3f  172.23.0.39
+pin     AF      6b1d7e3c-0000-4000-8000-00000000014a  172.23.0.35
+dccf    DCCF    6b1d7e3c-0000-4000-8000-00000000dccf  172.23.0.36
+scp     SCP     6b1d7e3c-0000-4000-8000-000000005c90  172.23.0.37
+sepp    SEPP    6b1d7e3c-0000-4000-8000-00000005e990  172.23.0.38

@@ -240,7 +240,113 @@ static OAUTH2_CLIENT: std::sync::OnceLock<Option<Arc<nextgcore_sbi::oauth::OAuth
 /// The shared OAuth2 client, if SBI OAuth2 enforcement is enabled (Wave-6 H8
 /// Phase A). Outbound SBI clients attach a token via [`attach_oauth2`].
 fn oauth2_client() -> Option<Arc<nextgcore_sbi::oauth::OAuth2Client>> {
+    #[cfg(test)]
+    if let Ok(oauth2) = TEST_OAUTH2_CLIENT.try_with(Arc::clone) {
+        return Some(oauth2);
+    }
     OAUTH2_CLIENT.get().and_then(|opt| opt.clone())
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// #1648 tests: the OAuth2 client [`oauth2_client`] returns inside
+    /// `TEST_OAUTH2_CLIENT.scope(..)`, so a test can see what an outbound site
+    /// sends with enforcement on. Task-local, so the other tests in the process
+    /// keep the default (off) that `oauth2_consumer_disabled_by_default` pins.
+    pub(crate) static TEST_OAUTH2_CLIENT: Arc<nextgcore_sbi::oauth::OAuth2Client>;
+}
+
+/// #1648: a client for a Namf service operation at `config` (N1N2MessageTransfer,
+/// EBIAssignment). It carries an NRF-issued token when enforcement is on: these
+/// are service requests (TS 29.518 §5.2.2.3.1, §5.2.2.6), and the consumer
+/// presents its token on each (TS 33.501 §13.4.1.1.2, TS 29.500 §6.7.3). A
+/// notification to the AMF (SmContextStatusNotify) is not one and carries none.
+///
+/// A fresh client per call, never cached (#1669 review M2): the AMF's authority
+/// comes from the session's `smContextStatusUri`, which the consumer supplies, so
+/// a per-authority cache would grow, with its connections, by whatever authorities
+/// an AMF names. The UDM and EASDF are discovered peers and use
+/// [`tokened_peer_client`].
+pub(crate) fn namf_client(
+    config: nextgcore_sbi::client::SbiClientConfig,
+) -> nextgcore_sbi::client::SbiClient {
+    attach_oauth2(
+        nextgcore_sbi::client::SbiClient::new(config),
+        nextgcore_sbi::types::NfType::Amf,
+    )
+}
+
+/// What a [`tokened_peer_client`] is cached under: the target NF type, the peer
+/// (scheme, host, port), the timeouts, and the identity of the OAuth2 client it
+/// carries. That last one is fixed in production (one process-wide client); in
+/// tests it keeps a `TEST_OAUTH2_CLIENT` scope's clients apart from another test's.
+type TokenedPeerKey = (
+    nextgcore_sbi::types::NfType,
+    nextgcore_sbi::types::UriScheme,
+    String,
+    u16,
+    std::time::Duration,
+    std::time::Duration,
+    usize,
+);
+
+/// The cache behind [`tokened_peer_client`]. Bounded by the discovered peers
+/// (UDM, EASDF) this SMF talks to, one entry per producer authority and NF type,
+/// like `global_context().get_client`'s. Only discovered (NRF or configured)
+/// authorities may be passed in, never one a peer supplied (review M2).
+static TOKENED_PEER_CLIENTS: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<TokenedPeerKey, Arc<nextgcore_sbi::client::SbiClient>>,
+    >,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// The most clients [`TOKENED_PEER_CLIENTS`] holds (#1669 review M2). Past it,
+/// a client for a new peer is built uncached: it is used for its call and then
+/// dropped with its connections, so a long-running SMF that has seen many
+/// discovered peers (pod churn) still holds a bounded number of sockets.
+const TOKENED_PEER_CLIENTS_MAX: usize = 64;
+
+/// #1669 review M2: tests that depend on what [`TOKENED_PEER_CLIENTS`] holds take
+/// this lock (one lock per process-global, declared beside it).
+#[cfg(test)]
+pub(crate) static TOKENED_PEER_CLIENTS_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+/// #1648 review M1: the client for a service request to the `target` producer at
+/// `config`, carrying the NRF-issued token, or `None` when OAuth2 enforcement is
+/// off (the caller then keeps the client it used before #1648).
+///
+/// One client per peer, reused: its HTTP/2 connection (and, under `production`,
+/// its mTLS session) carries every request to that producer, as the shared
+/// `global_context().get_client` cache does for token-less clients. The token is
+/// still fetched and refreshed per request by the shared OAuth2 client's cache
+/// (`prepare_request`), so caching the SBI client does not pin a token.
+pub(crate) fn tokened_peer_client(
+    config: nextgcore_sbi::client::SbiClientConfig,
+    target: nextgcore_sbi::types::NfType,
+) -> Option<Arc<nextgcore_sbi::client::SbiClient>> {
+    let oauth2 = oauth2_client()?;
+    let key = (
+        target,
+        config.scheme,
+        config.host.clone(),
+        config.port,
+        config.connect_timeout,
+        config.request_timeout,
+        Arc::as_ptr(&oauth2) as usize,
+    );
+    let mut clients = TOKENED_PEER_CLIENTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(client) = clients.get(&key) {
+        return Some(Arc::clone(client));
+    }
+    let client =
+        Arc::new(nextgcore_sbi::client::SbiClient::new(config).with_oauth2(oauth2, target));
+    if clients.len() < TOKENED_PEER_CLIENTS_MAX {
+        clients.insert(key, Arc::clone(&client));
+    }
+    Some(client)
 }
 
 /// Attach the process-wide OAuth2 client (when enforcement is on) so the
@@ -2390,7 +2496,7 @@ async fn fetch_subscribed_default_dnn(
     let (host, port) = discover_udm_sdm_endpoint()
         .await
         .ok_or(DefaultDnnError::NoUdmEndpoint)?;
-    let client = global_context().get_client(&host, port).await;
+    let client = udm::udm_client(&host, port).await;
 
     let path = smf_select_data_path(supi, sst, sd);
     let response = client.get(&path).await.map_err(|e| {
@@ -4021,6 +4127,33 @@ fn sm_context_create_error(
         ))
 }
 
+/// A refused UE-requested PDU session modification (#1590): an SmContextUpdateError
+/// (TS 29.502 §5.2.2.3.1 step 2b, Table 6.1.6.2.36-1) whose `n1SmMsg` is the PDU
+/// SESSION MODIFICATION REJECT the AMF forwards to the UE (TS 24.501 §6.4.2.4.1),
+/// as a 5gnas binary part referenced by RefToBinaryData.
+fn sm_context_modification_reject(
+    status: u16,
+    cause: &str,
+    psi: u8,
+    pti: u8,
+    gsm_cause_5gsm: u8,
+) -> SbiResponse {
+    use nextgcore_sbi::constants::content_type;
+    use nextgcore_sbi::message::SbiPart;
+    let n1 = policy::build_modification_reject(psi, pti, gsm_cause_5gsm);
+    let body = serde_json::json!({
+        "error": { "status": status, "cause": cause },
+        "n1SmMsg": { "contentId": "n1SmMsg" },
+    });
+    SbiResponse::with_status(status)
+        .with_body(body.to_string(), content_type::APPLICATION_JSON)
+        .with_part(SbiPart::with_content(
+            "n1SmMsg",
+            content_type::APPLICATION_5GNAS,
+            bytes::Bytes::copy_from_slice(&n1),
+        ))
+}
+
 /// The SSC modes this SMF actually implements, as the Allowed SSC mode bitmap
 /// (bit 1 = mode 1, bit 2 = mode 2, bit 3 = mode 3 — TS 24.501 §9.11.4.16).
 ///
@@ -5119,7 +5252,12 @@ async fn handle_sm_context_create_inner(request: &SbiRequest) -> SbiResponse {
                         .and_then(|s| u32::from_str_radix(s, 16).ok()),
                 };
                 sess.set_ipv4_addr(std::net::Ipv4Addr::from(ue_ip_octets));
-                sess.up_cnx_state = context::UpCnxState::Activated;
+                // #1629, TS 29.502 §5.2.2.2 step 3 ("same as step 3 of figure
+                // 5.2.2.3.2.2-1"): the 201 answers upCnxState ACTIVATING with the
+                // PDUSessionResourceSetupRequestTransfer, so the session is ACTIVATING
+                // until the gNB's PDU_RES_SETUP_RSP (ACTIVATED) or PDU_RES_SETUP_FAIL
+                // (DEACTIVATED). Release and paging treat it as before (#1606).
+                sess.up_cnx_state = context::UpCnxState::Activating;
                 sess.sm_context_status_uri = sm_context_status_uri.clone();
                 sess.session_ambr = context::SessionAmbr {
                     uplink: decision.sess_ambr_ul_bps,
@@ -5377,6 +5515,16 @@ fn smf_n4_seid_for(sm_context_ref: &str) -> u64 {
             .and_then(|m| m.get(sm_context_ref).copied())
     });
     inherited.unwrap_or_else(|| context::derive_cp_n4_seid(sm_context_ref))
+}
+
+/// The user-plane connection state `sm_context_ref`'s session records, if it
+/// has a session (#1629).
+fn up_cnx_state_of(sm_context_ref: &str) -> Option<context::UpCnxState> {
+    smf_self()
+        .read()
+        .ok()?
+        .sess_find_by_sm_context_ref(sm_context_ref)
+        .map(|sess| sess.up_cnx_state)
 }
 
 /// Record a session's user-plane connection state (#540). The Downlink Data
@@ -6307,6 +6455,12 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                     log::warn!("DL FAR deactivation after AN failure failed: {e}");
                 }
             }
+            // #1606, TS 29.502 §5.2.2.3.2.2 step 3: the SMF shall "consider that the
+            // activation of the User Plane connection has failed and set the
+            // upCnxState attribute to DEACTIVATED", the state step 4 answers. Without
+            // it a failed activation stayed ACTIVATING: its release carried an N2 for
+            // resources the gNB never set up, and buffered downlink data never paged.
+            mark_up_cnx_state(sm_context_ref, context::UpCnxState::Deactivated);
             let response_body = serde_json::json!({ "upCnxState": "DEACTIVATED" });
             SbiResponse::with_status(200).with_body(response_body.to_string(), "application/json")
         }
@@ -6374,17 +6528,19 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                                     Ok(json) => answer = Some(json),
                                     Err(policy::PolicyError::Rejected { status, detail }) => {
                                         // Abnormal path: PCF rejects the
-                                        // modification → 403 + 5GSM cause 29
+                                        // modification → 403 + 5GSM cause 29, in a
+                                        // PDU SESSION MODIFICATION REJECT (#1590,
+                                        // TS 24.501 §6.4.2.4.1). Before, an
+                                        // ESTABLISHMENT REJECT (0xC3) answered it.
                                         log::error!(
                                             "PCF rejected SM policy update (status={status}): {detail}"
                                         );
-                                        return sm_context_create_error(
+                                        return sm_context_modification_reject(
                                             403,
                                             "SUBSCRIPTION_DENIED",
                                             psi,
                                             pti,
                                             policy::gsm_cause::USER_AUTHENTICATION_OR_AUTHORIZATION_FAILED,
-                                            policy::RejectTo::default(),
                                         );
                                     }
                                     Err(e) => {
@@ -6582,7 +6738,43 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                 // with no N2 at all, so the AMF had nothing to put in the ICS.
                 // #1230: a restored context whose uplink endpoint is unknown gets one.
                 recover_upf_ul_endpoint(sm_context_ref).await;
-                return activation_response(sm_context_ref);
+                let resp = activation_response(sm_context_ref);
+                // #1606, TS 29.502 §5.2.2.3.2.2 step 2a: "the SMF shall set the
+                // upCnxState attribute to ACTIVATING" when it can proceed. The gNB may
+                // hold the session's resources from here on, so a release before its
+                // PDU_RES_SETUP_RSP carries N2 (`up_connection_active`, #1563). A
+                // refused activation (step 2b) leaves the state as it was.
+                if resp.status == 200 {
+                    // #1629, TS 29.502 §5.2.2.3.2.2 step 2a: "If the SMF finds the PDU
+                    // session already activated ..., the SMF shall delete the N3 tunnel
+                    // information and update the UPF accordingly" (TS 23.502 §4.2.3.2
+                    // step 8a: "it deletes the AN Tunnel Info and initiates an N4
+                    // Session Modification procedure to remove Tunnel Info of AN in the
+                    // UPF"). The DL FAR toward the old AN tunnel buffers until the
+                    // gNB's PDU_RES_SETUP_RSP names the new one. A UPF that does not
+                    // apply it does not refuse the activation, unlike the DEACTIVATED
+                    // request, which answers 504: here a refusal would leave the UE
+                    // with no user plane, while the PDU_RES_SETUP_RSP rewrites the DL
+                    // FAR anyway, so the removal is best effort. Its BUFF|NOCP also
+                    // starts a new buffering episode at upfd (#1629 review), so a
+                    // DLDR the SMF does not page for while ACTIVATING does not use up
+                    // the report a later DEACTIVATED needs.
+                    if up_cnx_state_of(sm_context_ref) == Some(context::UpCnxState::Activated) {
+                        if let Some(upf_seid) = lookup_upf_seid(sm_context_ref) {
+                            if let Err(e) =
+                                pfcp_deactivate_dl_far(smf_n4_seid_for(sm_context_ref), upf_seid)
+                                    .await
+                            {
+                                log::warn!(
+                                    "UP activation for already-activated ref={sm_context_ref}: \
+                                     removing the old AN tunnel at the UPF failed: {e}"
+                                );
+                            }
+                        }
+                    }
+                    mark_up_cnx_state(sm_context_ref, context::UpCnxState::Activating);
+                }
+                return resp;
             }
             // Default: treat as activation confirmation
             let response_body = serde_json::json!({ "upCnxState": "ACTIVATED" });
@@ -8186,7 +8378,7 @@ async fn send_n2_release_transfer(amf_uri: &str, supi: &str, psi: u8, n2: &[u8])
             content_type::APPLICATION_NGAP,
             bytes::Bytes::copy_from_slice(n2),
         ));
-    let client = nextgcore_sbi::client::SbiClient::new(
+    let client = namf_client(
         nextgcore_sbi::security::sbi_peer_client_config(&host, port)
             .with_connect_timeout(std::time::Duration::from_secs(2))
             .with_request_timeout(std::time::Duration::from_secs(3)),
@@ -8295,7 +8487,7 @@ async fn send_n1_n2_release_transfer(amf_uri: &str, supi: &str, psi: u8, n1: &[u
             content_type::APPLICATION_NGAP,
             bytes::Bytes::copy_from_slice(n2),
         ));
-    let client = nextgcore_sbi::client::SbiClient::new(
+    let client = namf_client(
         nextgcore_sbi::security::sbi_peer_client_config(&host, port)
             .with_connect_timeout(std::time::Duration::from_secs(2))
             .with_request_timeout(std::time::Duration::from_secs(3)),
@@ -8772,7 +8964,7 @@ async fn send_n1n2_honouring_paging_conflict(
     sm_context_ref: String,
     retries: PagingRetries,
 ) -> nextgcore_sbi::SbiResult<nextgcore_sbi::message::SbiResponse> {
-    let resp = nextgcore_sbi::client::SbiClient::new(config.clone())
+    let resp = namf_client(config.clone())
         .send_request(request.clone())
         .await?;
     if let Some(wait) = n1n2_paging_conflict_retry_after(&resp) {
@@ -8840,7 +9032,7 @@ async fn retry_n1n2_after_paging_conflict(
     sm_context_ref: String,
     first_wait: std::time::Duration,
 ) -> N1n2RetryEnd {
-    let client = nextgcore_sbi::client::SbiClient::new(config);
+    let client = namf_client(config);
     let mut wait = first_wait;
     for attempt in 1..=N1N2_PAGING_CONFLICT_RETRIES {
         if wait > std::time::Duration::from_secs(N1N2_RETRY_AFTER_MAX_S) {
@@ -16107,6 +16299,645 @@ mod tests {
         drop_session_for_retry(&sm_ref);
     }
 
+    // ------------------------------------------------------------------
+    // #1648: outbound service requests carry the NRF-issued token
+    // ------------------------------------------------------------------
+
+    /// The `(method, path, Authorization)` of each request an OAuth2 stand-in saw.
+    type SeenAuth1648 = Arc<std::sync::Mutex<Vec<(String, String, Option<String>)>>>;
+
+    /// #1648: a stand-in NRF token endpoint. It mints an ES256 access token, signed
+    /// by `sk`, whose `aud` is the request's `targetNfType` and whose `scope` is the
+    /// request's `scope` (TS 29.510 §6.3.5.2.2 AccessTokenReq), so a producer that
+    /// verifies `aud` and `scope` (as nextgcore-sbi's does) accepts it. It answers
+    /// both the bespoke and the TS 29.510 standard token path.
+    async fn token_nrf_1648(sk: p256::ecdsa::SigningKey) -> (SbiServer, u16) {
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server =
+            SbiServer::on_listener(nextgcore_sbi::server::SbiServerConfig::new(addr), listener);
+        server
+            .start(move |req: SbiRequest| {
+                let sk = sk.clone();
+                async move {
+                    let path = req.header.uri.split('?').next().unwrap_or_default();
+                    if path != nextgcore_sbi::oauth::OAuth2Client::TOKEN_PATH_BESPOKE
+                        && path != nextgcore_sbi::oauth::OAuth2Client::TOKEN_PATH_STANDARD
+                    {
+                        return SbiResponse::with_status(404);
+                    }
+                    let form = req.http.content.clone().unwrap_or_default();
+                    let field = |name: &str| {
+                        form.split('&')
+                            .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+                            .unwrap_or_default()
+                            .replace("%20", " ")
+                            .replace('+', " ")
+                    };
+                    let token = super::oauth2_h8_tests::build_es256_token(
+                        &sk,
+                        "nrf-1648",
+                        &field("targetNfType"),
+                        &field("scope"),
+                    );
+                    SbiResponse::with_status(200)
+                        .with_json_body(&serde_json::json!({
+                            "access_token": token,
+                            "token_type": "Bearer",
+                            "expires_in": 3600,
+                        }))
+                        .unwrap()
+                }
+            })
+            .await
+            .expect("token NRF starts");
+        (server, addr.port())
+    }
+
+    /// #1648: a producer of NF type `nf_type` that, with `gated`, REQUIRES OAuth2
+    /// the way an OAuth2-required amfd/udmd/easdfd listens: nextgcore-sbi verifies
+    /// the bearer against the NRF's JWKS (`sk`'s public half) and checks that its
+    /// `aud` names `nf_type`, answering 401 before the handler runs otherwise.
+    ///
+    /// The handler records each request it serves with its Authorization header,
+    /// so on a gated producer a recorded request is one that PASSED the gate: a
+    /// test asserts that the request it expects is recorded, which a token-less or
+    /// wrong-audience send cannot satisfy. Ungated, it records what was sent, for
+    /// asserting that a notification carries no token.
+    async fn oauth2_producer_1648(
+        sk: &p256::ecdsa::SigningKey,
+        nf_type: nextgcore_sbi::types::NfType,
+        gated: bool,
+        respond: impl Fn(&SbiRequest) -> SbiResponse + Clone + Send + Sync + 'static,
+    ) -> (SbiServer, u16, SeenAuth1648) {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let seen: SeenAuth1648 = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let mut cfg = nextgcore_sbi::server::SbiServerConfig::new(addr);
+        if gated {
+            cfg = cfg.with_expected_audience_nf_type(nf_type);
+            cfg.require_oauth2 = true;
+            cfg.oauth2_jwks = Some(super::oauth2_h8_tests::jwks_for(sk, "nrf-1648"));
+        }
+        let server = SbiServer::on_listener(cfg, listener);
+        server
+            .start(move |req: SbiRequest| {
+                let sink = Arc::clone(&sink);
+                let respond = respond.clone();
+                async move {
+                    sink.lock().unwrap_or_else(|e| e.into_inner()).push((
+                        req.header.method.clone(),
+                        req.header
+                            .uri
+                            .split('?')
+                            .next()
+                            .unwrap_or_default()
+                            .to_string(),
+                        req.http.get_header("authorization").cloned(),
+                    ));
+                    respond(&req)
+                }
+            })
+            .await
+            .expect("producer starts");
+        (server, addr.port(), seen)
+    }
+
+    /// How many requests `seen` holds for `method` on a path containing `fragment`,
+    /// each with a bearer.
+    fn bearer_requests_1648(seen: &SeenAuth1648, method: &str, fragment: &str) -> usize {
+        seen.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(m, p, auth)| {
+                m == method
+                    && p.contains(fragment)
+                    && auth.as_deref().is_some_and(|a| a.starts_with("Bearer "))
+            })
+            .count()
+    }
+
+    /// The OAuth2 client the SMF installs under enforcement, pointed at `nrf_port`.
+    fn smf_oauth2_client_1648(nrf_port: u16) -> Arc<nextgcore_sbi::oauth::OAuth2Client> {
+        Arc::new(nextgcore_sbi::oauth::OAuth2Client::new(
+            format!("http://127.0.0.1:{nrf_port}"),
+            "smf-1648",
+            nextgcore_sbi::types::NfType::Smf,
+        ))
+    }
+
+    /// #1648 review M1: a loopback TCP proxy to `upstream` that counts the
+    /// connections it accepts, so a test can tell one reused connection from one
+    /// per request.
+    async fn counting_proxy_1648(upstream: u16) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("proxy binds");
+        let port = listener.local_addr().expect("addr").port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    if let Ok(mut outbound) =
+                        tokio::net::TcpStream::connect(("127.0.0.1", upstream)).await
+                    {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+            }
+        });
+        (port, accepted)
+    }
+
+    /// A stand-in UDM's answers for the Nudm calls the reuse tests make.
+    fn udm_answer_1648(req: &SbiRequest) -> SbiResponse {
+        let path = req.header.uri.split('?').next().unwrap_or_default();
+        if path.ends_with("/sm-data") {
+            SbiResponse::with_status(200)
+                .with_json_body(&serde_json::json!([]))
+                .unwrap()
+        } else {
+            SbiResponse::with_status(201)
+        }
+    }
+
+    /// How many calls the reuse tests make to one peer: twice the client's pool,
+    /// so a client per call opens this many connections while a reused client
+    /// opens at most [`pool_slots_1648`].
+    const REUSE_CALLS_1648: usize = 8;
+
+    /// The connection slots of one SBI client (its HTTP/2 pool, round-robin).
+    fn pool_slots_1648() -> usize {
+        nextgcore_sbi::security::sbi_peer_client_config("127.0.0.1", 1).pool_size
+    }
+
+    /// [`REUSE_CALLS_1648`] Nudm calls: sm-data reads, then a UECM registration.
+    async fn nudm_calls_1648(supi: &str) {
+        for _ in 1..REUSE_CALLS_1648 {
+            let _ = udm::fetch_sm_data(supi, "internet", 1, Some("010203")).await;
+        }
+        udm::register_as_serving_smf(
+            supi,
+            1,
+            "internet",
+            1,
+            Some("010203"),
+            Some(("001", "01")),
+            udm::EpsInterworkingInd::None,
+        )
+        .await;
+    }
+
+    /// #1648 review M1: with OAuth2 off, successive Nudm calls to one UDM share one
+    /// connection, as they did through the shared `get_client` cache before #1648.
+    #[tokio::test]
+    async fn nudm_calls_reuse_pooled_connections_without_oauth2_1648() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let sk = p256::ecdsa::SigningKey::from_slice(&[19u8; 32]).expect("key");
+        let (_udm, udm_port, seen) = oauth2_producer_1648(
+            &sk,
+            nextgcore_sbi::types::NfType::Udm,
+            false,
+            udm_answer_1648,
+        )
+        .await;
+        let (port, accepted) = counting_proxy_1648(udm_port).await;
+        std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("UDM_SBI_PORT", port.to_string());
+        udm::set_for_test(true);
+        nudm_calls_1648("imsi-001010016480004").await;
+        udm::set_for_test(false);
+        std::env::remove_var("UDM_SBI_ADDR");
+        std::env::remove_var("UDM_SBI_PORT");
+        assert_eq!(
+            seen.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            REUSE_CALLS_1648
+        );
+        let connections = accepted.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            connections <= pool_slots_1648(),
+            "{REUSE_CALLS_1648} Nudm calls opened {connections} connections, past the \
+             {} of one reused client",
+            pool_slots_1648()
+        );
+    }
+
+    /// #1648 review M1: with OAuth2 on, the tokened Nudm client is cached per peer,
+    /// so successive calls share its pooled connections (and, under `production`,
+    /// their mTLS sessions) while each still carries the token.
+    ///
+    /// Review M2: the Namf client is NOT cached, because its authority is the one
+    /// the AMF supplied in `smContextStatusUri`: after tokened Namf calls the cache
+    /// holds no AMF entry, and each call still passes the OAuth2 gate.
+    #[tokio::test]
+    async fn tokened_udm_calls_reuse_pooled_connections_and_namf_is_not_cached_1648() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _cache = TOKENED_PEER_CLIENTS_TEST_LOCK.lock().await;
+        let sk = p256::ecdsa::SigningKey::from_slice(&[20u8; 32]).expect("key");
+        let (_nrf, nrf_port) = token_nrf_1648(sk.clone()).await;
+        let (_udm, udm_port, udm_seen) = oauth2_producer_1648(
+            &sk,
+            nextgcore_sbi::types::NfType::Udm,
+            true,
+            udm_answer_1648,
+        )
+        .await;
+        let (_amf, amf_port, amf_seen) =
+            oauth2_producer_1648(&sk, nextgcore_sbi::types::NfType::Amf, true, |_| {
+                SbiResponse::with_status(200)
+            })
+            .await;
+        let (udm_proxy, udm_accepted) = counting_proxy_1648(udm_port).await;
+        // Two distinct authorities for the same AMF, as two sessions'
+        // `smContextStatusUri`s may name: neither may leave a cached client.
+        let (amf_proxy, _) = counting_proxy_1648(amf_port).await;
+        std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("UDM_SBI_PORT", udm_proxy.to_string());
+        udm::set_for_test(true);
+        let supi = "imsi-001010016480005";
+        let amf_uris = [
+            format!("http://127.0.0.1:{amf_port}"),
+            format!("http://127.0.0.1:{amf_proxy}"),
+        ];
+        TEST_OAUTH2_CLIENT
+            .scope(smf_oauth2_client_1648(nrf_port), async {
+                nudm_calls_1648(supi).await;
+                for amf_uri in &amf_uris {
+                    send_n2_release_transfer(amf_uri, supi, 1, &[0x00]).await;
+                    send_n1_n2_release_transfer(amf_uri, supi, 1, &[0x2e], &[0x00]).await;
+                }
+            })
+            .await;
+        udm::set_for_test(false);
+        std::env::remove_var("UDM_SBI_ADDR");
+        std::env::remove_var("UDM_SBI_PORT");
+        assert_eq!(
+            bearer_requests_1648(&udm_seen, "GET", "/sm-data"),
+            REUSE_CALLS_1648 - 1
+        );
+        assert_eq!(
+            bearer_requests_1648(&udm_seen, "PUT", "/smf-registrations/1"),
+            1
+        );
+        let connections = udm_accepted.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            connections <= pool_slots_1648(),
+            "{REUSE_CALLS_1648} tokened Nudm calls opened {connections} connections, past \
+             the {} of one reused client",
+            pool_slots_1648()
+        );
+        assert_eq!(
+            bearer_requests_1648(&amf_seen, "POST", "/n1-n2-messages"),
+            4,
+            "the Namf calls still carry the token"
+        );
+        assert!(
+            !TOKENED_PEER_CLIENTS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys()
+                .any(|key| key.0 == nextgcore_sbi::types::NfType::Amf),
+            "no Namf client is cached: its authority is peer-supplied"
+        );
+    }
+
+    /// #1669 review M2: the tokened-client cache stops growing at
+    /// [`TOKENED_PEER_CLIENTS_MAX`]. A client for one more peer is still returned,
+    /// tokened, but not cached; a cached peer is still served from the cache.
+    #[tokio::test]
+    async fn the_tokened_client_cache_is_capped_1648() {
+        let _cache = TOKENED_PEER_CLIENTS_TEST_LOCK.lock().await;
+        let oauth2 = smf_oauth2_client_1648(nextgcore_sbi::test_support::refused_port());
+        let mine = Arc::as_ptr(&oauth2) as usize;
+        let held = || {
+            TOKENED_PEER_CLIENTS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len()
+        };
+        TEST_OAUTH2_CLIENT
+            .scope(oauth2, async {
+                // Fill to the cap with distinct authorities (lazy clients: nothing
+                // is dialled).
+                let mut port = 20_000u16;
+                let first = tokened_peer_client(
+                    nextgcore_sbi::security::sbi_peer_client_config("127.0.0.1", port),
+                    nextgcore_sbi::types::NfType::Udm,
+                )
+                .expect("enforcement on");
+                while held() < TOKENED_PEER_CLIENTS_MAX {
+                    port += 1;
+                    let _ = tokened_peer_client(
+                        nextgcore_sbi::security::sbi_peer_client_config("127.0.0.1", port),
+                        nextgcore_sbi::types::NfType::Udm,
+                    );
+                }
+                let past = tokened_peer_client(
+                    nextgcore_sbi::security::sbi_peer_client_config("127.0.0.1", port + 1),
+                    nextgcore_sbi::types::NfType::Udm,
+                );
+                assert!(
+                    past.is_some(),
+                    "a peer past the cap still gets a tokened client"
+                );
+                assert_eq!(
+                    held(),
+                    TOKENED_PEER_CLIENTS_MAX,
+                    "the cache stops at its cap"
+                );
+                let again = tokened_peer_client(
+                    nextgcore_sbi::security::sbi_peer_client_config("127.0.0.1", 20_000),
+                    nextgcore_sbi::types::NfType::Udm,
+                )
+                .expect("enforcement on");
+                assert!(Arc::ptr_eq(&first, &again), "a cached peer is still reused");
+            })
+            .await;
+        TOKENED_PEER_CLIENTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|key, _| key.6 != mine);
+    }
+
+    /// #1648, found by the D443A `oauth2` arm: every Namf_Communication service
+    /// request this SMF sends (N1N2MessageTransfer on the UP deactivation, release,
+    /// paging-conflict and retry paths, and EBIAssignment) passes an OAuth2-required
+    /// AMF's gate. They are service operations (TS 29.518 §5.2.2.3.1, §5.2.2.6), so
+    /// the consumer presents its NRF-issued token (TS 33.501 §13.4.1.1.2, TS 29.500
+    /// §6.7.3). Before the fix each one got 401 and never reached the AMF.
+    ///
+    /// The SmContextStatusNotify to the same AMF is a notification and carries no
+    /// token (TS 33.501 §13.4.1, TS 29.500 §6.10.7 NOTE): it stays token-less.
+    #[tokio::test]
+    async fn namf_service_requests_pass_an_oauth2_required_amf_1648() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let sk = p256::ecdsa::SigningKey::from_slice(&[16u8; 32]).expect("key");
+        let (_nrf, nrf_port) = token_nrf_1648(sk.clone()).await;
+        let (_amf, port, seen) =
+            oauth2_producer_1648(&sk, nextgcore_sbi::types::NfType::Amf, true, |_| {
+                SbiResponse::with_status(200)
+            })
+            .await;
+        let (_plain_amf, plain_port, plain_seen) =
+            oauth2_producer_1648(&sk, nextgcore_sbi::types::NfType::Amf, false, |_| {
+                SbiResponse::with_status(204)
+            })
+            .await;
+        let amf_uri = format!("http://127.0.0.1:{port}");
+        let supi = "imsi-001010016480001";
+        let sm_ref = held_session_for_retry(supi, 1);
+
+        // The control: without enforcement the same transfer carries no token, and
+        // the OAuth2-required AMF refuses it before its handler.
+        send_n2_release_transfer(&amf_uri, supi, 1, &[0x00]).await;
+        assert_eq!(seen.lock().unwrap_or_else(|e| e.into_inner()).len(), 0);
+
+        eps_iwk::set_for_test(true);
+        TEST_OAUTH2_CLIENT
+            .scope(smf_oauth2_client_1648(nrf_port), async {
+                send_n2_release_transfer(&amf_uri, supi, 1, &[0x00]).await;
+                assert_eq!(
+                    bearer_requests_1648(&seen, "POST", "/n1-n2-messages"),
+                    1,
+                    "the UP deactivation transfer carries the token"
+                );
+                send_n1_n2_release_transfer(&amf_uri, supi, 1, &[0x2e], &[0x00]).await;
+                assert_eq!(
+                    bearer_requests_1648(&seen, "POST", "/n1-n2-messages"),
+                    2,
+                    "the release transfer carries the token"
+                );
+                let (config, request) = n1n2_request_to(port);
+                let resp = send_n1n2_honouring_paging_conflict(
+                    config.clone(),
+                    request.clone(),
+                    sm_ref.clone(),
+                    PagingRetries::Awaited(None),
+                )
+                .await
+                .expect("answered");
+                assert_eq!(resp.status, 200, "the AMF accepted the transfer");
+                assert_eq!(
+                    bearer_requests_1648(&seen, "POST", "/n1-n2-messages"),
+                    3,
+                    "the paging-conflict-aware transfer carries the token"
+                );
+                let end = retry_n1n2_after_paging_conflict(
+                    config,
+                    request,
+                    sm_ref.clone(),
+                    std::time::Duration::ZERO,
+                )
+                .await;
+                assert_eq!(end, N1n2RetryEnd::Sent(200));
+                assert_eq!(
+                    bearer_requests_1648(&seen, "POST", "/n1-n2-messages"),
+                    4,
+                    "the paging-conflict retry carries the token"
+                );
+                let _ = eps_iwk::request_ebi(Some(&amf_uri), supi, 1, 8).await;
+                assert_eq!(
+                    bearer_requests_1648(&seen, "POST", "/assign-ebi"),
+                    1,
+                    "the EBI assignment carries the token"
+                );
+                send_sm_context_status_notification(
+                    Some(&format!(
+                        "http://127.0.0.1:{plain_port}/namf-callback/v1/{supi}/1/sm-context-status"
+                    )),
+                    "RELEASED",
+                    None,
+                )
+                .await;
+            })
+            .await;
+        eps_iwk::set_for_test(false);
+        drop_session_for_retry(&sm_ref);
+
+        let notified = plain_seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(notified.len(), 1, "the status notification was sent");
+        assert_eq!(
+            notified[0].2, None,
+            "a notification carries no access token (TS 33.501 §13.4.1)"
+        );
+    }
+
+    /// #1648: every Nudm service request (SDM get of smf-select-data and sm-data,
+    /// UECM registration and its removal, SDM subscribe and unsubscribe) passes an
+    /// OAuth2-required UDM's gate. They used the shared `get_client` cache, whose
+    /// clients carry no token.
+    #[tokio::test]
+    async fn nudm_service_requests_pass_an_oauth2_required_udm_1648() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let sk = p256::ecdsa::SigningKey::from_slice(&[17u8; 32]).expect("key");
+        let (_nrf, nrf_port) = token_nrf_1648(sk.clone()).await;
+        let sm_data = sm_data_with("40 Mbps", "80 Mbps", 6);
+        let (_udm, port, seen) =
+            oauth2_producer_1648(&sk, nextgcore_sbi::types::NfType::Udm, true, move |req| {
+                let path = req.header.uri.split('?').next().unwrap_or_default();
+                if req.header.method == "DELETE" {
+                    SbiResponse::with_status(204)
+                } else if path.ends_with("/sdm-subscriptions") {
+                    SbiResponse::with_status(201)
+                        .with_header("Location", format!("{path}/sub-1648"))
+                        .with_json_body(&serde_json::json!({ "subscriptionId": "sub-1648" }))
+                        .unwrap()
+                } else if path.ends_with("/sm-data") {
+                    SbiResponse::with_status(200)
+                        .with_json_body(&sm_data)
+                        .unwrap()
+                } else if path.ends_with("/smf-select-data") {
+                    SbiResponse::with_status(200)
+                        .with_json_body(&serde_json::json!({}))
+                        .unwrap()
+                } else {
+                    SbiResponse::with_status(201)
+                }
+            })
+            .await;
+        std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("UDM_SBI_PORT", port.to_string());
+        udm::set_for_test(true);
+        let supi = "imsi-001010016480002";
+        TEST_OAUTH2_CLIENT
+            .scope(smf_oauth2_client_1648(nrf_port), async {
+                let _ = fetch_subscribed_default_dnn(supi, 1, Some("010203")).await;
+                assert_eq!(
+                    bearer_requests_1648(&seen, "GET", "/smf-select-data"),
+                    1,
+                    "Nudm_SDM_Get smf-select-data carries the token"
+                );
+                let _ = udm::fetch_sm_data(supi, "internet", 1, Some("010203")).await;
+                assert_eq!(
+                    bearer_requests_1648(&seen, "GET", "/sm-data"),
+                    1,
+                    "Nudm_SDM_Get sm-data carries the token"
+                );
+                udm::register_as_serving_smf(
+                    supi,
+                    1,
+                    "internet",
+                    1,
+                    Some("010203"),
+                    Some(("001", "01")),
+                    udm::EpsInterworkingInd::None,
+                )
+                .await;
+                assert_eq!(
+                    bearer_requests_1648(&seen, "PUT", "/smf-registrations/1"),
+                    1,
+                    "Nudm_UECM_Registration carries the token"
+                );
+                udm::deregister_serving_smf(supi, 1).await;
+                assert_eq!(
+                    bearer_requests_1648(&seen, "DELETE", "/smf-registrations/1"),
+                    1,
+                    "Nudm_UECM_Deregistration carries the token"
+                );
+                let id = udm::subscribe_sm_data(
+                    supi,
+                    "http://127.0.0.1:9/nsmf-callback/v1/sdm-notify/1",
+                    "internet",
+                    1,
+                    Some("010203"),
+                )
+                .await
+                .expect("subscribed past the gate");
+                assert_eq!(
+                    bearer_requests_1648(&seen, "POST", "/sdm-subscriptions"),
+                    1,
+                    "Nudm_SDM_Subscribe carries the token"
+                );
+                udm::unsubscribe_sm_data(supi, &id).await;
+                assert_eq!(
+                    bearer_requests_1648(&seen, "DELETE", "/sdm-subscriptions/sub-1648"),
+                    1,
+                    "Nudm_SDM_Unsubscribe carries the token"
+                );
+            })
+            .await;
+        udm::set_for_test(false);
+        std::env::remove_var("UDM_SBI_ADDR");
+        std::env::remove_var("UDM_SBI_PORT");
+    }
+
+    /// #1648: both Neasdf_DNSContext service requests (create and delete) pass an
+    /// OAuth2-required EASDF's gate (TS 29.556 §5.2.2). The EASDF client was a
+    /// cleartext `with_host_port` client with no token.
+    #[tokio::test]
+    async fn neasdf_service_requests_pass_an_oauth2_required_easdf_1648() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let sk = p256::ecdsa::SigningKey::from_slice(&[18u8; 32]).expect("key");
+        let (_nrf, nrf_port) = token_nrf_1648(sk.clone()).await;
+        let (_easdf, easdf_port, seen) =
+            oauth2_producer_1648(&sk, nextgcore_sbi::types::NfType::Easdf, true, |req| {
+                if req.header.method == "POST" {
+                    SbiResponse::with_status(201)
+                        .with_json_body(&serde_json::json!({ "dnsContextId": "ctx-1648" }))
+                        .unwrap()
+                } else {
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await;
+        // The discovery NRF (nnrf-disc is not OAuth2-gated by default).
+        let (_disc, disc_port, _) =
+            oauth2_producer_1648(&sk, nextgcore_sbi::types::NfType::Nrf, false, move |_| {
+                SbiResponse::with_status(200)
+                    .with_json_body(&serde_json::json!({
+                        "validityPeriod": 3600,
+                        "nfInstances": [{
+                            "nfInstanceId": "easdf-1648",
+                            "nfType": "EASDF",
+                            "nfStatus": "REGISTERED",
+                            "ipv4Addresses": ["127.0.0.1"],
+                            "nfServices": [{
+                                "serviceName": "neasdf-dnscontext",
+                                "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": easdf_port }]
+                            }]
+                        }]
+                    }))
+                    .unwrap()
+            })
+            .await;
+        easdf::set_for_test(Some(easdf::EasdfConfig {
+            nrf_uri: format!("http://127.0.0.1:{disc_port}"),
+            report_uri: "http://127.0.0.1:9/nsmf-pdusession/v1/easdf-dns-reports".to_string(),
+            edge_fqdn_patterns: vec!["*.edge.example.com".to_string()],
+        }));
+        let supi = "imsi-001010016480003";
+        TEST_OAUTH2_CLIENT
+            .scope(smf_oauth2_client_1648(nrf_port), async {
+                let id = easdf::create_dns_context(
+                    supi,
+                    5,
+                    "internet",
+                    std::net::Ipv4Addr::new(10, 45, 0, 2),
+                )
+                .await
+                .expect("created past the gate");
+                assert_eq!(
+                    bearer_requests_1648(&seen, "POST", "/neasdf-dnscontext/v1/dns-contexts"),
+                    1,
+                    "the DNS context create carries the token"
+                );
+                easdf::delete_dns_context(supi, &id).await;
+                assert_eq!(
+                    bearer_requests_1648(
+                        &seen,
+                        "DELETE",
+                        "/neasdf-dnscontext/v1/dns-contexts/ctx-1648"
+                    ),
+                    1,
+                    "the DNS context delete carries the token"
+                );
+            })
+            .await;
+        easdf::set_for_test(None);
+    }
+
     #[tokio::test]
     async fn fetch_subscribed_default_dnn_queries_the_udm_and_returns_the_flagged_dnn() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
@@ -22093,6 +22924,64 @@ mod tests {
         ))
     }
 
+    /// #1590, TS 24.501 §6.4.2.4.1 / §8.3.8: a UE-requested modification whose
+    /// RES_MO_RE update the PCF refuses is answered 403 with an SmContextUpdateError
+    /// (TS 29.502 §5.2.2.3.1 step 2b) carrying a PDU SESSION MODIFICATION REJECT
+    /// (0xCA) with cause #29, echoing the PSI and the UE's PTI.
+    ///
+    /// REVERT-VERIFIED: with `sm_context_create_error` back on this arm, the N1 is a
+    /// PDU SESSION ESTABLISHMENT REJECT (0xC3).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pcf_refused_ue_modification_is_a_modification_reject_1590() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let pcf = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        pcf.start(|_req: SbiRequest| async move {
+            SbiResponse::with_status(403).with_body(
+                r#"{"status":403,"cause":"POLICY_CONTEXT_DENIED"}"#,
+                "application/problem+json",
+            )
+        })
+        .await
+        .expect("pcf start");
+        std::env::set_var("PCF_URI", format!("http://127.0.0.1:{}", addr.port()));
+        let psi = 27;
+        let r = seed_authorised_1399("imsi-001010000015901", psi, "pol-1590");
+        let resp = handle_sm_context_update(&r, &ue_modification_1399(&r, psi)).await;
+        std::env::remove_var("PCF_URI");
+        pcf.stop().await.ok();
+
+        assert_eq!(resp.status, 403);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
+        assert_eq!(body["error"]["cause"], "SUBSCRIPTION_DENIED");
+        assert_eq!(body["n1SmMsg"]["contentId"], "n1SmMsg");
+        let n1 = resp
+            .http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n1SmMsg"))
+            .map(|p| p.data.to_vec())
+            .expect("the N1 part");
+        assert_eq!(
+            n1,
+            vec![
+                0x2E,
+                psi,
+                5,
+                0xCA,
+                policy::gsm_cause::USER_AUTHENTICATION_OR_AUTHORIZATION_FAILED
+            ],
+            "PDU SESSION MODIFICATION REJECT #29, PSI and PTI echoed"
+        );
+    }
+
     /// The RES_MO_RE leg with an UpdateNotify applied while its Update is in flight:
     /// the MODIFICATION COMMAND's Session-AMBR (DL, UL) once the PCF answers `answer`
     /// (`None`: an unusable answer, "keeping current QoS").
@@ -23306,7 +24195,7 @@ mod tests {
     /// #289 converted this test: the N4 leg now fails because the stand-in UPF's
     /// association is deliberately down, not because no UPF exists. The
     /// REGISTRATION half its old comment asked for is
-    /// `a_successful_create_registers_an_activated_session_and_its_binding` below.
+    /// `a_successful_create_registers_an_activating_session_and_its_binding` below.
     /// #980 review, end to end: the CreateSMContext handler sends the AMF's
     /// `3gpp-Sbi-Origination-Timestamp` on the SM policy create unchanged
     /// (TS 29.512 §4.2.2.2). The PCF's collision rule (§4.2.7) then sees the
@@ -23636,7 +24525,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_successful_create_registers_an_activated_session_and_its_binding() {
+    async fn a_successful_create_registers_an_activating_session_and_its_binding() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
@@ -23677,10 +24566,12 @@ mod tests {
             .expect("context")
             .sess_find_by_sm_context_ref(&sm_context_ref)
             .expect("the reference the AMF was handed must resolve to a session");
+        // #1629, TS 29.502 §5.2.2.2 step 3: ACTIVATING until the gNB's
+        // PDU_RES_SETUP_RSP, as the 201 says.
         assert_eq!(
             sess.up_cnx_state,
-            context::UpCnxState::Activated,
-            "upCnxState is ACTIVATED once the user plane exists"
+            context::UpCnxState::Activating,
+            "upCnxState is ACTIVATING until the gNB has set the session up"
         );
         assert_eq!(
             (sess.session_ambr.uplink, sess.session_ambr.downlink),
@@ -27739,6 +28630,487 @@ mod tests {
         amf.stop().await.ok();
     }
 
+    /// The UP connection state `sm_context_ref`'s session records (#1606).
+    fn up_state_1606(sm_context_ref: &str) -> context::UpCnxState {
+        smf_self()
+            .read()
+            .expect("context")
+            .sess_find_by_sm_context_ref(sm_context_ref)
+            .expect("session")
+            .up_cnx_state
+    }
+
+    /// The AMF's `upCnxState`-only or N2 SM Context Update `body` to `sm_context_ref`
+    /// through the /modify dispatcher (#1606).
+    async fn update_1606(sm_context_ref: &str, body: serde_json::Value) -> SbiResponse {
+        let req = SbiRequest::post(format!(
+            "/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/modify"
+        ))
+        .with_body(body.to_string(), "application/json");
+        handle_sm_context_update(sm_context_ref, &req).await
+    }
+
+    /// A released-to-idle session (UP connection DEACTIVATED) that the AMF is
+    /// re-activating: its uplink endpoint is recorded, and the AMF's
+    /// `upCnxState: ACTIVATING` has been answered 200 (#1606).
+    async fn activating_session_1606(supi: &str, psi: u8, amf_port: u16) -> String {
+        let r = seed_release_session_1430(supi, psi, amf_port);
+        smf_self()
+            .read()
+            .expect("context")
+            .upf_ul_endpoints
+            .write()
+            .expect("w")
+            .insert(r.clone(), (0x0016_0600 + u32::from(psi), [10, 45, 0, 9]));
+        mark_up_cnx_state(&r, context::UpCnxState::Deactivated);
+        let resp = update_1606(&r, serde_json::json!({ "upCnxState": "ACTIVATING" })).await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        r
+    }
+
+    /// #1606, TS 29.502 §5.2.2.3.2.2 step 2a: answering `upCnxState: ACTIVATING`,
+    /// "the SMF shall set the upCnxState attribute to ACTIVATING". A release that
+    /// lands before the gNB's PDU_RES_SETUP_RSP therefore carries the N2 SM
+    /// Resource Release request (TS 23.502 §4.3.4.2, `up_connection_active`), on
+    /// both release paths:
+    /// - UE-requested (step 3a): the UpdateSMContext answer has the `n2SmInfo`
+    ///   part and `n2SmInfoType: PDU_RES_REL_CMD`;
+    /// - network-initiated (step 3b): the N1N2MessageTransfer has it.
+    ///
+    /// A refused activation (no recorded uplink endpoint, step 2b) stays
+    /// DEACTIVATED.
+    ///
+    /// REVERT-VERIFIED: without the ACTIVATING mark the state stays DEACTIVATED
+    /// and both releases go out N1-only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_release_during_up_activation_carries_n2_1606() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (amf, amf_port, posts) = n1n2_recording_amf_1385(false).await;
+        let amf_uri = format!("http://127.0.0.1:{amf_port}");
+        let expected_n2 = n2_transfer::release_command_transfer().expect("release transfer");
+
+        // ---- UE-requested release in the activation window ----
+        let ue = activating_session_1606("imsi-001010000001606", 14, amf_port).await;
+        assert_eq!(up_state_1606(&ue), context::UpCnxState::Activating);
+        let resp = handle_n1_sm_message(
+            &ue,
+            &n1(
+                14,
+                3,
+                gsm_build::message_type::PDU_SESSION_RELEASE_REQUEST,
+                &[],
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        let n2 = resp
+            .http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n2SmInfo"))
+            .map(|p| p.data.to_vec());
+        assert_eq!(n2, Some(expected_n2.clone()), "the answer carries the N2");
+        let answer: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).expect("JSON");
+        assert_eq!(answer["n2SmInfoType"], "PDU_RES_REL_CMD", "{answer}");
+        assert!(cancel_gsm_timer_for_test(&ue));
+
+        // ---- network-initiated release in the activation window ----
+        let supi = "imsi-001010000001607";
+        let net = activating_session_1606(supi, 15, amf_port).await;
+        assert_eq!(up_state_1606(&net), context::UpCnxState::Activating);
+        release_for_reactivation(&net, &amf_uri, supi, 15).await;
+        let got = await_n1n2_1385(&posts, 1).await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].3, expected_n2, "the transfer carries the N2");
+        assert_eq!(
+            got[0].1["n2InfoContainer"]["smInfo"]["n2InfoContent"]["ngapIeType"],
+            "PDU_RES_REL_CMD"
+        );
+        assert!(cancel_gsm_timer_for_test(&net));
+
+        // ---- a refused activation leaves the UP connection DEACTIVATED ----
+        let none = seed_release_session_1430("imsi-001010000001608", 16, amf_port);
+        mark_up_cnx_state(&none, context::UpCnxState::Deactivated);
+        let resp = update_1606(&none, serde_json::json!({ "upCnxState": "ACTIVATING" })).await;
+        assert_eq!(resp.status, 500, "no uplink endpoint recorded");
+        assert_eq!(up_state_1606(&none), context::UpCnxState::Deactivated);
+
+        amf.stop().await.ok();
+    }
+
+    /// #1606, TS 29.502 §5.2.2.3.2.2 step 3: on the gNB's PDU_RES_SETUP_FAIL the SMF
+    /// shall "consider that the activation of the User Plane connection has failed
+    /// and set the upCnxState attribute to DEACTIVATED". The session's later
+    /// release is then N1-only (TS 23.502 §4.3.4.2), not an N2 for resources the
+    /// gNB never set up.
+    ///
+    /// REVERT-VERIFIED: without the DEACTIVATED mark in the failure arm the state
+    /// stays ACTIVATING and the release carries the PDU_RES_REL_CMD.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_up_activation_is_deactivated_1606() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (amf, amf_port, posts) = n1n2_recording_amf_1385(false).await;
+        let amf_uri = format!("http://127.0.0.1:{amf_port}");
+
+        let supi = "imsi-001010000001609";
+        let r = activating_session_1606(supi, 14, amf_port).await;
+        assert_eq!(up_state_1606(&r), context::UpCnxState::Activating);
+        let fail = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode([0x00])
+        };
+        let resp = update_1606(
+            &r,
+            serde_json::json!({ "n2SmInfoType": "PDU_RES_SETUP_FAIL", "n2SmInfo": fail }),
+        )
+        .await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        let answer: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).expect("JSON");
+        assert_eq!(answer["upCnxState"], "DEACTIVATED", "{answer}");
+        assert_eq!(up_state_1606(&r), context::UpCnxState::Deactivated);
+
+        release_for_reactivation(&r, &amf_uri, supi, 14).await;
+        let got = await_n1n2_1385(&posts, 1).await;
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(
+            got[0].2[3],
+            gsm_build::message_type::PDU_SESSION_RELEASE_COMMAND
+        );
+        assert!(got[0].3.is_empty(), "N1-only: no N2 part");
+        assert!(got[0].1["n2InfoContainer"].is_null(), "{}", got[0].1);
+        assert!(cancel_gsm_timer_for_test(&r));
+
+        amf.stop().await.ok();
+    }
+
+    /// #1629, TS 29.502 §5.2.2.2 step 3 (the same as §5.2.2.3.2.2 step 3): a create
+    /// answers 201 with upCnxState ACTIVATING and records ACTIVATING, until the gNB
+    /// answers. A PDU_RES_SETUP_FAIL then makes it DEACTIVATED (#1606).
+    ///
+    /// REVERT-VERIFIED: with the create recording ACTIVATED again, the first state
+    /// assertion fails.
+    #[tokio::test]
+    async fn a_created_session_is_activating_until_the_gnb_answers_1629() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let supi = "imsi-001010000001629";
+        let resp = handle_sm_context_create(&create_request(
+            supi,
+            9,
+            &n1(
+                9,
+                1,
+                gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+                &[0x91, 0x00],
+            ),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("JSON")).expect("json");
+        assert_eq!(body["upCnxState"], "ACTIVATING");
+        let r = body["smContextRef"]
+            .as_str()
+            .expect("smContextRef")
+            .to_string();
+        assert_eq!(up_state_1606(&r), context::UpCnxState::Activating);
+
+        let fail = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode([0x00])
+        };
+        let resp = update_1606(
+            &r,
+            serde_json::json!({ "n2SmInfoType": "PDU_RES_SETUP_FAIL", "n2SmInfo": fail }),
+        )
+        .await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        assert_eq!(up_state_1606(&r), context::UpCnxState::Deactivated);
+        let _ = release_sm_context_locally(&r);
+        side_effects_settled().await;
+    }
+
+    /// #1629, TS 29.502 §5.2.2.3.2.2 step 2a: an ACTIVATING for a session whose UP
+    /// connection is already ACTIVATED makes the SMF "delete the N3 tunnel
+    /// information and update the UPF accordingly" (TS 23.502 §4.2.3.2 step 8a): one
+    /// N4 Session Modification that deactivates the DL FAR (FAR 2), before the
+    /// answer. The session is then ACTIVATING. An ACTIVATING for a DEACTIVATED
+    /// session has no tunnel to remove and sends no modification.
+    ///
+    /// REVERT-VERIFIED: without the already-activated branch, no Session
+    /// Modification reaches the UPF.
+    #[tokio::test]
+    async fn a_late_activating_removes_the_old_an_tunnel_1629() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let (upf, seen, upf_task) = modification_recording_upf_1387().await;
+        let (_client, listener) = client_behind_the_real_listener(upf).await;
+        let r = seed_notified_session_1387("imsi-001010000001630", 22, 0x1629);
+        smf_self()
+            .read()
+            .expect("context")
+            .upf_ul_endpoints
+            .write()
+            .expect("w")
+            .insert(r.clone(), (0x0016_2900, [10, 45, 0, 9]));
+        let update_far_ids = |bodies: &[Vec<u8>]| -> Vec<u32> {
+            bodies
+                .iter()
+                .filter_map(|b| pfcp_path::find_ie(b, n4_build::pfcp_ie::UPDATE_FAR))
+                .filter_map(|far| pfcp_path::find_ie(far, n4_build::pfcp_ie::FAR_ID))
+                .filter_map(|id| {
+                    id.get(..4)
+                        .map(|v| u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
+                })
+                .collect()
+        };
+
+        // Already ACTIVATED: the old AN tunnel is removed first.
+        mark_up_cnx_state(&r, context::UpCnxState::Activated);
+        let resp = update_1606(&r, serde_json::json!({ "upCnxState": "ACTIVATING" })).await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        let answer: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("JSON")).expect("json");
+        assert_eq!(answer["upCnxState"], "ACTIVATING");
+        assert_eq!(
+            update_far_ids(&seen.lock().unwrap()),
+            vec![2],
+            "one Session Modification deactivating the DL FAR"
+        );
+        assert_eq!(up_state_1606(&r), context::UpCnxState::Activating);
+
+        // DEACTIVATED: nothing to remove.
+        seen.lock().unwrap().clear();
+        mark_up_cnx_state(&r, context::UpCnxState::Deactivated);
+        let resp = update_1606(&r, serde_json::json!({ "upCnxState": "ACTIVATING" })).await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        assert!(seen.lock().unwrap().is_empty(), "no Session Modification");
+        assert_eq!(up_state_1606(&r), context::UpCnxState::Activating);
+
+        listener.abort();
+        upf_task.abort();
+    }
+
+    /// A stub UPF that answers each Session Modification Request "Request rejected"
+    /// (cause 64) and counts them (#1629 review m2).
+    async fn rejecting_upf_1629() -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use pfcp_path::pfcp_message_type as t;
+        let upf = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = upf.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = seen.clone();
+        let task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            while let Ok((len, from)) = upf.recv_from(&mut buf).await {
+                let Some(h) = pfcp_path::parse_wire_header(&buf[..len]) else {
+                    continue;
+                };
+                if h.msg_type != t::SESSION_MODIFICATION_REQUEST {
+                    continue;
+                }
+                sink.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Cause (IE 19) 64, Request rejected.
+                let reply = pfcp_path::encode_wire_message(
+                    t::SESSION_MODIFICATION_RESPONSE,
+                    Some(h.seid),
+                    h.sequence_number,
+                    &[0x00, 0x13, 0x00, 0x01, 64],
+                );
+                let _ = upf.send_to(&reply, from).await;
+            }
+        });
+        (addr, seen, task)
+    }
+
+    /// The session's SMF N4 SEID, which a DLDR names (#1629 review).
+    fn smf_n4_seid_1629(sm_context_ref: &str) -> u64 {
+        smf_self()
+            .read()
+            .expect("context")
+            .sess_find_by_sm_context_ref(sm_context_ref)
+            .expect("session")
+            .smf_n4_seid
+    }
+
+    /// #1629 review M1 (R3): an ACTIVATED session gets a late ACTIVATING, whose
+    /// N4 sets the DL FAR to BUFF|NOCP. A downlink packet then raises a DLDR that
+    /// the SMF does not page for (the UP connection is ACTIVATING, TS 29.244
+    /// §7.5.8.2). The gNB answers PDU_RES_SETUP_FAIL, so the SMF marks DEACTIVATED
+    /// and sends BUFF|NOCP again. upfd starts a new buffering episode on that
+    /// instruction (TS 29.244 §5.2.3.1, `rearm_dl_notification`), so the next
+    /// downlink packet raises a DLDR again, and this one pages: the
+    /// N1N2MessageTransfer reaches the AMF.
+    ///
+    /// The upfd half (the re-arm) is `a_buff_nocp_modification_starts_a_new_
+    /// buffering_episode_1629`; this drives the SMF half through the real PFCP
+    /// listener and Session Report path.
+    ///
+    /// REVERT-VERIFIED: with the SETUP_FAIL arm not marking DEACTIVATED, the
+    /// second DLDR does not page.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_late_activation_pages_for_the_next_downlink_data_1629() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (amf, amf_port, posts) = n1n2_recording_amf_1385(false).await;
+        let (upf, seen, upf_task) = modification_recording_upf_1387().await;
+        let (_client, listener) = client_behind_the_real_listener(upf).await;
+        let supi = "imsi-001010000001632";
+        let r = seed_release_session_1430(supi, 23, amf_port);
+        if let Ok(ctx) = smf_self().read() {
+            ctx.upf_ul_endpoints
+                .write()
+                .expect("w")
+                .insert(r.clone(), (0x0016_3200, [10, 45, 0, 9]));
+            ctx.pfcp_sessions
+                .write()
+                .expect("w")
+                .insert(r.clone(), 0x1632);
+        }
+        let seid = smf_n4_seid_1629(&r);
+        let smf_sock =
+            std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+
+        // Late ACTIVATING: the old AN tunnel is removed (BUFF|NOCP on FAR 2).
+        let resp = update_1606(&r, serde_json::json!({ "upCnxState": "ACTIVATING" })).await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        assert_eq!(seen.lock().unwrap().len(), 1, "one Session Modification");
+
+        // A downlink packet before the gNB answers: no page while ACTIVATING.
+        handle_pfcp_session_report(&smf_sock, &dldr_report_packet(seid, 1), upf).await;
+        assert!(
+            posts.lock().unwrap().is_empty(),
+            "no paging while the UP connection is ACTIVATING"
+        );
+
+        // The gNB could not set the session up.
+        let fail = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode([0x00])
+        };
+        let resp = update_1606(
+            &r,
+            serde_json::json!({ "n2SmInfoType": "PDU_RES_SETUP_FAIL", "n2SmInfo": fail }),
+        )
+        .await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        assert_eq!(up_state_1606(&r), context::UpCnxState::Deactivated);
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "the failure re-sends BUFF|NOCP, which re-arms the UPF's report"
+        );
+
+        // The next downlink packet's DLDR pages the UE.
+        handle_pfcp_session_report(&smf_sock, &dldr_report_packet(seid, 1), upf).await;
+        let got = await_n1n2_1385(&posts, 1).await;
+        assert_eq!(got.len(), 1, "the paging N1N2MessageTransfer, got {got:?}");
+        assert_eq!(
+            got[0].0,
+            format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages")
+        );
+        assert_eq!(
+            got[0].1["n2InfoContainer"]["smInfo"]["n2InfoContent"]["ngapIeType"],
+            "PDU_RES_SETUP_REQ"
+        );
+
+        listener.abort();
+        upf_task.abort();
+        amf.stop().await.ok();
+    }
+
+    /// #1629 review m2: a late ACTIVATING whose N4 the UPF refuses is still
+    /// answered 200 ACTIVATING with the setup transfer. The removal of the old AN
+    /// tunnel is best effort here, unlike the DEACTIVATED request, which answers
+    /// 504 when the UPF refuses: an activation that fails at the UPF would leave
+    /// the UE with no user plane, while the PDU_RES_SETUP_RSP that follows
+    /// rewrites the DL FAR anyway (TS 23.502 §4.2.3.2 step 8a only removes the
+    /// stale tunnel).
+    ///
+    /// REVERT-VERIFIED: with a refused N4 answered as the DEACTIVATED arm answers
+    /// it (504), the status assertion fails.
+    #[tokio::test]
+    async fn a_late_activating_proceeds_when_the_upf_refuses_the_tunnel_removal_1629() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let (upf, seen, upf_task) = rejecting_upf_1629().await;
+        let (_client, listener) = client_behind_the_real_listener(upf).await;
+        let r = seed_notified_session_1387("imsi-001010000001633", 24, 0x1633);
+        smf_self()
+            .read()
+            .expect("context")
+            .upf_ul_endpoints
+            .write()
+            .expect("w")
+            .insert(r.clone(), (0x0016_3300, [10, 45, 0, 9]));
+        mark_up_cnx_state(&r, context::UpCnxState::Activated);
+        let resp = update_1606(&r, serde_json::json!({ "upCnxState": "ACTIVATING" })).await;
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the UPF was asked, and refused"
+        );
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        let answer: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("JSON")).expect("json");
+        assert_eq!(answer["upCnxState"], "ACTIVATING");
+        assert_eq!(answer["n2SmInfoType"], "PDU_RES_SETUP_REQ");
+        assert_eq!(up_state_1606(&r), context::UpCnxState::Activating);
+        listener.abort();
+        upf_task.abort();
+    }
+
+    /// #1629 (review of #1618): a PATH_SWITCH_SETUP_FAIL (the target NG-RAN could not
+    /// set up the session's resources at an Xn handover) is answered and recorded
+    /// DEACTIVATED (TS 29.502 §5.2.2.3.2.2 step 3, shared with PDU_RES_SETUP_FAIL).
+    ///
+    /// REVERT-VERIFIED: without the DEACTIVATED mark in the failure arm, the state
+    /// stays ACTIVATED.
+    #[tokio::test]
+    async fn a_path_switch_setup_failure_is_deactivated_1629() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let r = seed_release_session_1430("imsi-001010000001631", 14, 9);
+        assert_eq!(up_state_1606(&r), context::UpCnxState::Activated);
+        let fail = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode([0x00])
+        };
+        let resp = update_1606(
+            &r,
+            serde_json::json!({ "n2SmInfoType": "PATH_SWITCH_SETUP_FAIL", "n2SmInfo": fail }),
+        )
+        .await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        let answer: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("JSON")).expect("json");
+        assert_eq!(answer["upCnxState"], "DEACTIVATED", "{answer}");
+        assert_eq!(up_state_1606(&r), context::UpCnxState::Deactivated);
+    }
+
     /// #1385 review B1: the 5QI change is a "Create new QoS flow description" -- also
     /// for the usual session whose default QFI equals its 5QI, where the accept sent the
     /// UE NO description, so a "Modify existing" would be TS 24.501 §6.3.2.4 a) case 13
@@ -29696,7 +31068,7 @@ mod oauth2_h8_tests {
     use std::time::Duration;
 
     /// Mint an ES256 access token in the NRF's shape, signed by `sk`.
-    fn build_es256_token(
+    pub(super) fn build_es256_token(
         sk: &p256::ecdsa::SigningKey,
         kid: &str,
         aud: &str,
@@ -29724,7 +31096,7 @@ mod oauth2_h8_tests {
     }
 
     /// Public JWKS for the signing key `sk` under `kid`.
-    fn jwks_for(sk: &p256::ecdsa::SigningKey, kid: &str) -> serde_json::Value {
+    pub(super) fn jwks_for(sk: &p256::ecdsa::SigningKey, kid: &str) -> serde_json::Value {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
         let point = sk.verifying_key().to_encoded_point(false);
