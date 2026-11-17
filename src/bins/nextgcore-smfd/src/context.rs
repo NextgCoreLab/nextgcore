@@ -1768,11 +1768,20 @@ pub struct NetworkPaging {
     /// it carried none. A further Downlink Data Report pages again only for a higher
     /// priority, a lower level (TS 23.502 §4.2.3.3 step 3a).
     pub arp_priority_level: Option<u8>,
+    /// When the transfer was sent, for the SMF's guard on the paging (#1631 review):
+    /// the AMF supervises the paging (step 5), and a paging it never reports on
+    /// (an AMF restart, a lost notification) must not block re-paging for good.
+    pub started: std::time::Instant,
 }
 
 impl NetworkPaging {
     /// Whether a transfer at `arp_priority_level` is of a higher priority than this
     /// one (TS 23.501 §5.7.2.2: 1 is the highest). No ARP ranks below every ARP.
+    /// Whether the SMF's guard on this paging has run out at `now` (#1631 review).
+    pub fn expired(&self, guard: std::time::Duration, now: std::time::Instant) -> bool {
+        now.saturating_duration_since(self.started) >= guard
+    }
+
     pub fn is_outranked_by(&self, arp_priority_level: Option<u8>) -> bool {
         let rank = |level: Option<u8>| level.map_or(u16::MAX, u16::from);
         rank(arp_priority_level) < rank(self.arp_priority_level)

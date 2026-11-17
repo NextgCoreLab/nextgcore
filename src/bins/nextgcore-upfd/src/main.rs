@@ -1589,7 +1589,7 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                         let buff_nocp = data_plane::FAR_ACTION_BUFF | data_plane::FAR_ACTION_NOCP;
                         if f.apply_action & buff_nocp == buff_nocp {
                             session.rearm_dl_notification();
-                            rearmed_far = Some(f.far_id);
+                            rearmed_far.get_or_insert(f.far_id);
                         }
                         dp_fars.insert(f.far_id, data_plane_far_from_parsed(f));
                     }
