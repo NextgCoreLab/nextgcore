@@ -1,16 +1,39 @@
-# Act 3 of demo d443a-edge-budget (nextgsim#471): netem +20 ms on the gNB's N3
-# (GTP-U, UDP 2152) egress, so the per QoS flow delay upfd measures with the
-# gNB's QMP answers (and so rtDelays in QOS_MON) rises. A sidecar sharing the gnb
-# pod's network namespace, with NET_ADMIN only (operator-approved for the
-# temporary nextg-demo pods; no node or cluster change). It runs nothing until
-# scenario.sh execs `tc` in it. Appended (`/-`), so the gNB stays containers[0].
+# Act 3 of demo d443a-edge-budget (nextgsim#471): netem +20 ms on the gNB's
+# egress (a root netem qdisc on eth0: N3 GTP-U included, and N2 and the radio
+# link to the UE with it, which Act 3 does not depend on), so the per QoS flow
+# delay upfd measures with the gNB's QMP answers (and so rtDelays in QOS_MON)
+# rises. netem only: no prio qdisc and no u32 classifier.
+#
+# A sidecar sharing the gnb pod's network namespace, with NET_ADMIN only
+# (operator-approved for the temporary nextg-demo pods). The qdisc lives in the
+# pod's namespace and goes with it, but a NET_ADMIN tc can make the NODE's kernel
+# autoload sch_netem, which outlives the pod (operator-accepted, 2026-11-16). So
+# the sidecar first logs which of sch_netem, sch_prio and cls_u32 the node had
+# loaded, and its node name, before any tc; scenario.sh records that per run.
+# It then runs nothing until scenario.sh execs `tc` in it. Appended (`/-`), so
+# the gNB stays containers[0].
 - op: add
   path: /spec/template/spec/containers/-
   value:
     name: netem
     image: nextgsim-ue:latest
     imagePullPolicy: IfNotPresent
-    command: ["sh", "-c", "trap 'exit 0' TERM; while :; do sleep 3600 & wait $!; done"]
+    command:
+      - sh
+      - -c
+      - |
+        m=""
+        for mod in sch_netem sch_prio cls_u32; do
+          if grep -q "^$mod " /proc/modules; then m="$m $mod=loaded"; else m="$m $mod=absent"; fi
+        done
+        echo "$(date -u +%FT%TZ) [d443a-gnb-netem] node=${NODE_NAME:-unknown} modules before the first tc:$m"
+        trap 'exit 0' TERM
+        while :; do sleep 3600 & wait $!; done
+    env:
+      - name: NODE_NAME
+        valueFrom:
+          fieldRef:
+            fieldPath: spec.nodeName
     securityContext:
       privileged: false
       allowPrivilegeEscalation: false

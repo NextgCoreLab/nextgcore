@@ -7,8 +7,10 @@
 #   name those trees' HEADs and be in ECR), nothing is built or pushed.
 #
 # Arms (scenario.sh's header says what each does):
-#   off:off  main:measured-budget  static:static
-#   no-kpi-patch:measured-budget (revert)  gates:measured-budget (bogus mode)
+#   off:off  main:measured-budget  static:static  gates:measured-budget (bogus mode)
+#   oauth2:measured-budget  restart-flip:measured-budget
+#   revert: no-kpi-patch no-qos-mon wrong-callback-token no-upf-qos bind-eth0
+#           (each :measured-budget)
 #
 # Prerequisites: the ECR repos nextg/<nf> for every core NF, ees included, plus
 # nextg/gnb and nextg/ue (this script creates none); the tags
@@ -28,8 +30,10 @@ CORE_DIR="$(cd "${HERE}/../../../.." && pwd)"
 KEY=d443a-edge-budget
 : "${CORE_SRC:?}" "${SIM_SRC:?}"
 ARMS=("$@")
-[[ ${#ARMS[@]} -gt 0 ]] || ARMS=(off:off main:measured-budget static:static
-  no-kpi-patch:measured-budget gates:measured-budget)
+[[ ${#ARMS[@]} -gt 0 ]] || ARMS=(off:off main:measured-budget static:static gates:measured-budget
+  oauth2:measured-budget restart-flip:measured-budget no-kpi-patch:measured-budget
+  no-qos-mon:measured-budget wrong-callback-token:measured-budget no-upf-qos:measured-budget
+  bind-eth0:measured-budget)
 CORE_NFS=(nrf amf smf upf ausf udm udr pcf nssf bsf ees)
 set -e
 if [[ -n "${CORE_IMAGE_TAG:-}" && -n "${SIM_IMAGE_TAG:-}" ]]; then

@@ -57,6 +57,11 @@
             key: eases
       - name: RUST_LOG
         value: info
+      # The node, for the per-run module record (sidecar.sh).
+      - name: NODE_NAME
+        valueFrom:
+          fieldRef:
+            fieldPath: spec.nodeName
       # Plain log lines (tracing-subscriber honours NO_COLOR; it survives
       # ip netns exec and setpriv).
       - name: NO_COLOR
@@ -65,11 +70,12 @@
     # operator approved (2026-11-16) for the sidecar's root shell:
     #   NET_ADMIN  the bridge, veths, addresses, routes, iptables, tc (netem);
     #   SYS_ADMIN  `ip netns add` / `ip netns exec` (one namespace per EAS);
-    #   SETUID, SETGID  setpriv's drop to nobody.
-    # No CHOWN (each EAS creates its own key as nobody), no KILL (the load act's
-    # SIGUSR1 is sent as nobody), no SETPCAP (no bounding-set drop: with
-    # no_new_privs and a non-root uid nothing can be regained). nr-she-eas runs as
-    # nobody with no capabilities and no_new_privs; its listeners bind 8620 and
+    #   SETUID, SETGID  setpriv's drop to each EAS's own uid (65531-65533).
+    # No CHOWN (each EAS creates its own key directory as its own uid), no KILL
+    # (the load act's SIGUSR1 is sent as eas-local's uid), no SETPCAP (no
+    # bounding-set drop: with no_new_privs and a non-root uid nothing can be
+    # regained). Each nr-she-eas runs as its own uid with no capabilities and
+    # no_new_privs; its listeners bind 8620 and
     # 9471 (>= 1024). analyze.py asserts this set from the deployed pod spec.
     securityContext:
       privileged: false

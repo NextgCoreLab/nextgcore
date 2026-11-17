@@ -10,7 +10,8 @@
 #                                        |-- veth --> [eas-regional] 10.60.0.12
 #                                        `-- veth --> [eas-cloud]    10.60.0.13
 #
-# In each: nr-she-eas, as nobody with no capabilities (setpriv), with
+# In each: nr-she-eas, as a uid of its own (eas-local 65531, eas-regional
+# 65532, eas-cloud 65533) with no capabilities (setpriv), with
 #   - the STAMP Session-Reflector on <ip>:8620 (upfd's N6 probes; smfd
 #     provisions port 8620 in core-configs.yaml),
 #   - the job listener on <ip>:9471 (the UE's jobs, through the PDU session),
@@ -23,9 +24,8 @@
 # Distance (labelled, emulated): netem on an EAS's veth (its egress toward the
 # UPF) is the demo's "eas-local is far away"; scenario.sh adds and removes it.
 #
-# The sidecar (sidecar.sh) builds dn and waits: scenario.sh hands it each EAS's
-# start file
-# naming each EAS's extra flags (the load act's --load, the revert arm's
+# The sidecar (sidecar.sh) builds dn and waits: scenario.sh hands it the start
+# file naming each EAS's extra flags (the load act's --load, the revert arm's
 # --no-kpi-patch). eas.yaml is the common part of each EAS's config, and a
 # toggle target: the demo: block is merged in at render time.
 apiVersion: v1
@@ -41,47 +41,56 @@ data:
       oauth2:
         nrf: "http://nrf.nextg-system.svc.cluster.local:7777"
         nf_instance_id: "@ID@"
-        # Created by nr-she-eas itself, as nobody (0600, in the sticky /tmp):
-        # the private key never leaves the pod; scenario.sh reads only the
-        # public JWK it publishes into the NRF's trust ConfigMap.
-        cca_key_file: "/tmp/@EAS@.cca.key"
-        public_jwk_dir: "/tmp/d443a-jwk"
+        # Created by nr-she-eas itself, as its own uid, in a 0700 directory
+        # it made itself: no other EAS can read it, and the private key never
+        # leaves the pod. scenario.sh reads only the public JWK, from the
+        # EAS's own 0755 directory, into the NRF's trust ConfigMap.
+        cca_key_file: "/tmp/d443a-key-@EAS@/cca.key"
+        public_jwk_dir: "/tmp/d443a-jwk-@EAS@"
         register: true
     stamp_port: 8620
     job_port: 9471
     check_interval_s: 2
-  # eas_id address max_resp_time_ms avl_comp nf_instance_id distance_ms (the
+  # eas_id address max_resp_time_ms avl_comp nf_instance_id distance_ms uid (the
   # plan's and #1523's fixtures: local 10 ms / 50, regional 14 / 50, cloud 40 /
   # 200). distance_ms is the EMULATED distance, netem on the EAS's egress toward
   # the UPF: one way only, so upfd's STAMP one-way N6 delay is half of it
-  # (local 2, regional 3, cloud 20 ms, the plan's Act 1 values).
+  # (local 2, regional 3, cloud 20 ms, the plan's Act 1 values). uid: each EAS
+  # runs as its own uid, so none can read another's CCA private key or replace
+  # its public JWK.
   eases: |
-    eas-local 10.60.0.11 10 50 6b1d7e3c-0000-4000-8000-0000000471a1 4
-    eas-regional 10.60.0.12 14 50 6b1d7e3c-0000-4000-8000-0000000471a2 6
-    eas-cloud 10.60.0.13 40 200 6b1d7e3c-0000-4000-8000-0000000471a3 40
+    eas-local 10.60.0.11 10 50 6b1d7e3c-0000-4000-8000-0000000471a1 4 65531
+    eas-regional 10.60.0.12 14 50 6b1d7e3c-0000-4000-8000-0000000471a2 6 65532
+    eas-cloud 10.60.0.13 40 200 6b1d7e3c-0000-4000-8000-0000000471a3 40 65533
   sidecar.sh: |
     set -eu
-    D=/tmp/d443a
+    # Overridable only so test-scenario.sh can point them at a scratch directory.
+    D="${D443A_DIR:-/tmp/d443a}"; T="${D443A_TMP:-/tmp}"
     say() { echo "$(date -u +%FT%TZ) [d443a-sidecar] $*"; }
     # A restarted container finds the pod's network namespace as it left it.
     if ip link show eas-br >/dev/null 2>&1; then
       say "FATAL: dn already exists (this container restarted); the pod must be recreated"
       exec sleep infinity
     fi
-    mkdir -p "$D" /tmp/d443a-jwk
-    # $D: configs and pids, readable by nobody. /tmp/d443a-jwk: sticky and
-    # world-writable like /tmp, so each nobody EAS publishes its own public JWK
-    # there (no chown: the sidecar has no CHOWN).
-    chmod 0755 "$D"; chmod 1777 /tmp/d443a-jwk
-    # Whether the node had sch_netem loaded before this pod's first tc (a
-    # NET_ADMIN tc can make the kernel autoload it, which outlives the pod).
-    if grep -q '^sch_netem ' /proc/modules; then nm=loaded; else nm=absent; fi
-    say "sch_netem before the first tc: $nm ($(grep -c . /proc/modules) modules listed)"
+    mkdir -p "$D"
+    # $D: configs and pids, readable by every EAS uid. Each EAS makes its own
+    # key and JWK directories as itself (below): no chown, the sidecar has no
+    # CHOWN.
+    chmod 0755 "$D"
+    # The node's modules before this pod's first tc: a NET_ADMIN tc can make the
+    # kernel autoload a qdisc or classifier module, which outlives the pod. The
+    # demo uses netem only; prio and u32 are recorded so a run shows they were
+    # not loaded by it either.
+    m=""
+    for mod in sch_netem sch_prio cls_u32; do
+      if grep -q "^$mod " /proc/modules; then m="$m $mod=loaded"; else m="$m $mod=absent"; fi
+    done
+    say "node=${NODE_NAME:-unknown} modules before the first tc:$m ($(grep -c . /proc/modules) modules listed)"
     # dn: a bridge in the UPF's namespace, one namespace per EAS.
     ip link add eas-br type bridge
     ip addr add 10.60.0.1/24 dev eas-br
     ip link set eas-br up
-    while read -r id ip mr av nf dist; do
+    while read -r id ip mr av nf dist uid; do
       [ -n "$id" ] || continue
       ns="${id}"
       ip netns add "$ns"
@@ -103,7 +112,7 @@ data:
     touch "$D/ready"
     say "dn ready; waiting for $D/start"
     while [ ! -e "$D/start" ]; do sleep 1; done
-    while read -r id ip mr av nf dist; do
+    while read -r id ip mr av nf dist uid; do
       [ -n "$id" ] || continue
       cfg="$D/$id.yaml"
       { printf '%s\n' "${D443A_EAS_YAML}" | sed -e "s/@ID@/$nf/" -e "s/@EAS@/$id/"
@@ -112,10 +121,13 @@ data:
       chmod 0644 "$cfg"
       args="$(sed -n "s/^$id: *//p" "$D/start")"
       say "$id: starting nr-she-eas -c $cfg $args"
-      # shellcheck disable=SC2086  # $args is the start file's flag list
-      ( sh -c "echo \$\$ >$D/$id.pid; exec ip netns exec $id setpriv --reuid=65534 --regid=65534 \
+      # As its own uid: it makes its 0700 key directory and 0755 JWK directory
+      # itself, and refuses to start if either exists already (a name another
+      # uid took first would otherwise be used). $args is the start file's flag list.
+      ( sh -c "echo \$\$ >$D/$id.pid; exec ip netns exec $id setpriv --reuid=$uid --regid=$uid \
           --clear-groups --inh-caps=-all --no-new-privs \
-          nr-she-eas -c $cfg $args" 2>&1 | sed -u "s/^/[$id] /"
+          sh -c 'mkdir -m 0700 $T/d443a-key-$id && mkdir -m 0755 $T/d443a-jwk-$id && exec nr-she-eas -c $cfg $args'" \
+          2>&1 | sed -u "s/^/[$id] /"
         say "$id: nr-she-eas exited" ) &
     done <<EASES
     ${D443A_EASES}

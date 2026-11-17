@@ -48,11 +48,13 @@ exit 1
 STUB
 printf '#!/bin/sh\necho "sleep $*" >>"${STUB_LOG}"\n' >"${t}/bin/sleep"
 chmod +x "${t}/bin/ip" "${t}/bin/sleep"
-out="$(cd "${t}" && STUB_LOG="${t}/calls" PATH="${t}/bin:${PATH}" D443A_EASES='eas-local 10.60.0.11 10 50 x 4' \
-  sh "${t}/sidecar.sh" 2>&1 || true)"
+# D443A_DIR/D443A_TMP: a regressed guard writes into ${t}, never the host's /tmp.
+out="$(cd "${t}" && STUB_LOG="${t}/calls" PATH="${t}/bin:${PATH}" D443A_EASES='eas-local 10.60.0.11 10 50 x 4 65531' \
+  D443A_DIR="${t}/d443a" D443A_TMP="${t}" sh "${t}/sidecar.sh" 2>&1 || true)"
 grep -q 'FATAL: dn already exists' <<<"${out}" || { echo "not ok - no restart guard: ${out}"; exit 1; }
 ! grep -q '^ip link add' "${t}/calls" || { echo "not ok - the guard ran after dn was touched"; exit 1; }
 grep -q '^sleep infinity' "${t}/calls" || { echo "not ok - the guard does not idle"; exit 1; }
+[[ ! -e "${t}/d443a" ]] || { echo "not ok - the guard ran after the sidecar made its directory"; exit 1; }
 echo "ok - a restarted sidecar stops at the guard and idles"
 
 if python3 -c 'import cryptography' 2>/dev/null; then

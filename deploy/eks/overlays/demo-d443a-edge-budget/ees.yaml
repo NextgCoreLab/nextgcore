@@ -20,7 +20,8 @@
 # type offering it is registered. The nrf-standin sidecar therefore registers a
 # profile with the custom nfType "EES" and the two eees-* services at the NRF,
 # and re-registers it every 30 s (heartBeatTimer 60), so the NRF can issue the
-# EAS and EEC tokens. nrfd is not relaxed, and eesd is not made an NRF client.
+# EAS and EEC tokens. nrfd is not relaxed. Only the oauth2 arm makes eesd an NRF
+# client too (an AF, --nrf-uri, #1581), for its token toward an OAuth2 smfd.
 apiVersion: v1
 kind: ConfigMap
 metadata:
