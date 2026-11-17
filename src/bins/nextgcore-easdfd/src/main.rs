@@ -787,7 +787,7 @@ async fn send_dns_message_report(
         );
         return;
     };
-    let client = SbiClient::with_host_port(&host, port);
+    let client = SbiClient::for_peer(&host, port);
     match client.post_json(&path, &body).await {
         Ok(resp) => log::info!(
             "DNS message report for {fqdn} (context {ctx_id}) -> {notify_uri} status={}",
@@ -1592,6 +1592,9 @@ easdf:
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn a_reporting_rule_emits_a_dns_message_report() {
+        // #1666: the notification client follows the SBI profile, and this
+        // drives it at a loopback plaintext peer, i.e. a dev deployment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _g = lock_globals();
         reset_context(DnsMissBehavior::NxDomain);
 

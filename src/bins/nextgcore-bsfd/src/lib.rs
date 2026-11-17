@@ -1403,7 +1403,7 @@ fn spawn_bsf_notifications(
                 return;
             };
             let client = nextgcore_sbi::client::SbiClient::new(
-                nextgcore_sbi::client::SbiClientConfig::new(host, port)
+                nextgcore_sbi::security::sbi_peer_client_config(&host, port)
                     .with_connect_timeout(Duration::from_secs(2))
                     .with_request_timeout(Duration::from_secs(3)),
             );
@@ -5024,6 +5024,9 @@ mod tests {
     /// arrives at the consumer, rather than asserting the notifier was called.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn subscribe_register_deregister_delivers_notifications() {
+        // #1666: the notification client follows the SBI profile, and this
+        // drives it at a loopback plaintext peer, i.e. a dev deployment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (server, client) = start_bsf().await;
 
         // A stub consumer that records every BsfNotification. Handed back so the
@@ -5173,6 +5176,9 @@ mod tests {
     /// — and a test that only counted notifications would pass either way.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ue_binding_register_deregister_delivers_notifications() {
+        // #1666: the notification client follows the SBI profile, and this
+        // drives it at a loopback plaintext peer, i.e. a dev deployment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (server, client) = start_bsf().await;
 
         let recorded: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =

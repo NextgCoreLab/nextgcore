@@ -200,7 +200,7 @@ pub async fn delete_producer_subscription(resource_uri: &str) {
         log::warn!("[DCCF] cannot delete producer subscription: unparseable URI {resource_uri}");
         return;
     };
-    let client = SbiClient::with_host_port(&host, port);
+    let client = SbiClient::for_peer(&host, port);
     match client.delete(&path).await {
         Ok(resp) => log::info!(
             "[DCCF] deleted producer subscription {resource_uri} -> status={}",
@@ -281,7 +281,7 @@ async fn post_producer_subscription(
     let Some((host, port, _)) = split_uri(api_root) else {
         return Err(format!("unparseable producer apiRoot {api_root}"));
     };
-    let client = SbiClient::with_host_port(&host, port);
+    let client = SbiClient::for_peer(&host, port);
     let path = format!("/{service_name}/v1/subscriptions");
     let resp = client
         .post_json(&path, body)
