@@ -796,6 +796,10 @@ pub struct PendingConnectedDownlink {
     /// The consumer's n1n2FailureTxfNotifURI. The NGAP task needs it when the UE
     /// turns out to be CM-IDLE at delivery time and has to be paged instead.
     pub failure_notify_uri: Option<String>,
+    /// #1643 review: the N1 answers the UE's own release or modification. If the
+    /// UE turns out CM-IDLE, the page this item creates is N1-only
+    /// (`PagingContext::pending_n1_only`), so the UE's answer re-activates nothing.
+    pub n1_only: bool,
 }
 
 /// A network-initiated deregistration the Nudm_UECM DeregistrationNotification
@@ -2226,18 +2230,8 @@ impl AmfContext {
     // Paging Management (TS 23.502 4.2.3.3)
     // ========================================================================
 
-    /// Initiate paging for a UE in CM-IDLE state
     /// Set the payload container type a queued paging context's pending N1 is
     /// delivered in (#540). No-op when no paging is queued for the UE.
-    /// Mark the page queued for `amf_ue_ngap_id` as N1-only (#1643 review).
-    pub fn paging_set_n1_only(&self, amf_ue_ngap_id: u64) {
-        if let Ok(mut paging_map) = self.paging_map.write() {
-            if let Some(ctx) = paging_map.get_mut(&amf_ue_ngap_id) {
-                ctx.pending_n1_only = true;
-            }
-        }
-    }
-
     pub fn paging_set_n1_container_type(&self, amf_ue_ngap_id: u64, container_type: u8) {
         if let Ok(mut paging_map) = self.paging_map.write() {
             if let Some(ctx) = paging_map.get_mut(&amf_ue_ngap_id) {

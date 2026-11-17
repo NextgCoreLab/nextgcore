@@ -7753,13 +7753,14 @@ impl NgapServer {
         // an uplink-data session (§4.2.3.2 step 4, upCnxState ACTIVATING), so the
         // ICS carries it and the buffered downlink is delivered.
         // #1643 review: not for an N1-only page (the SMF's answer to the UE's own
-        // release or modification), and not for a session the UE's PDU session
-        // status is releasing.
+        // release or modification). A session the UE's PDU session status releases
+        // needs no check here: the release below forgets it before any activation
+        // runs, which `a_page_for_a_session_the_ue_releases_activates_nothing_1643`
+        // pins.
         if let Some(p) = paging.as_ref().filter(|p| !p.pending_n1_only) {
             if let (Some(psi), false) = (p.pdu_session_id, p.pending_n2_release) {
                 if !already.contains(&psi)
                     && !plan.activate.contains(&psi)
-                    && !plan.release.contains(&psi)
                     && held.iter().any(|(h, _, _)| *h == psi)
                 {
                     plan.activate.push(psi);
@@ -11061,8 +11062,8 @@ impl NgapServer {
     /// the UE CM-IDLE. TS 23.502 §4.3.4.2 step 4 / §4.3.3.2 and §4.2.3.3: the AMF pages
     /// it and delivers the SMF's N1 after the Service Request, through the N1N2
     /// transfer paging path, N1 only: no N2, and no user plane re-activated for the
-    /// session (`pending_n1_only`). If the page fails, the N1 is dropped with it and the SMF's T3591/T3592 (or the UE's T3581/T3582)
-    /// recovers. With nothing to deliver (no N1 of the SMF's for this session),
+    /// session (`pending_n1_only`). If the page fails, the N1 is dropped with it, and
+    /// the SMF's T3591/T3592 (or the UE's T3581/T3582) recovers. With nothing to deliver (no N1 of the SMF's for this session),
     /// nothing is paged.
     fn page_for_smf_answer(
         &mut self,
@@ -11088,32 +11089,20 @@ impl NgapServer {
         // #1643 review, TS 23.502 §4.3.4.2 step 4: the NAS message only. A CM-IDLE
         // UE has no AN resources, so the SMF's N2 (a release or modify transfer)
         // has nothing to act on and is not paged for.
-        if crate::namf_handler::paging_ongoing(amf_ue.id) {
-            // As for a queued N1N2 transfer (#749): delivered once the UE answers
-            // the ongoing page and is CM-CONNECTED.
-            let ctx = crate::context::amf_self();
-            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
-            guard.connected_downlink_add(crate::context::PendingConnectedDownlink {
+        // The queued-transfer path: behind an ongoing page it waits as a connected
+        // downlink, and its own page is N1-only, either way (the item carries the
+        // mark, so a re-page after a failed ongoing page keeps it).
+        self.page_for_queued_downlink(
+            amf_ue,
+            crate::context::PendingConnectedDownlink {
                 amf_ue_ngap_id: amf_ue.id,
                 pdu_session_id: psi,
                 n1: Some(n1),
                 n2: crate::context::ConnectedN2::None,
                 failure_notify_uri: None,
-            });
-            return Ok(());
-        }
-        crate::namf_handler::initiate_paging_for_idle_ue(
-            amf_ue,
-            None,
-            Some(n1),
-            None,
-            crate::namf_handler::PagedN2::Setup,
-            Some(psi),
-            None,
+                n1_only: true,
+            },
         );
-        let ctx = crate::context::amf_self();
-        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
-        guard.paging_set_n1_only(amf_ue.id);
         Ok(())
     }
 
@@ -11144,6 +11133,8 @@ impl NgapServer {
             return;
         }
         let (n2, paged) = match item.n2 {
+            // #1643 review: the SMF's answer to the UE's own procedure, N1 only.
+            _ if item.n1_only => (None, PagedN2::N1Only),
             ConnectedN2::None => (None, PagedN2::Setup),
             ConnectedN2::Release => (None, PagedN2::Release),
             ConnectedN2::Setup(t) => (t, PagedN2::Setup),

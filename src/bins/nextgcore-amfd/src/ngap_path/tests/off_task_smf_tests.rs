@@ -671,22 +671,58 @@ fn ics_psis(pdu: &[u8]) -> Option<Vec<u8>> {
     )
 }
 
-/// The UE's release answered while it went CM-IDLE, then the UE answers the page
-/// with a real Service Request from CM-IDLE (`pss`: its PDU session status IE, if
-/// any). Returns the SMF calls and the NGAP sent after the Service Request.
-async fn release_then_idle_service_request(
+/// How the paged UE comes back in [`release_then_idle_answer`].
+#[derive(Clone, Copy, PartialEq)]
+enum Answer {
+    /// A Service Request from CM-IDLE, with its PDU session status IE if given.
+    ServiceRequest(Option<[u8; 2]>),
+    /// A protected periodic registration update from CM-IDLE (TS 24.501 §4.4.6).
+    PeriodicUpdate,
+}
+
+/// Whether the process-global connected-downlink queue holds an item for `ue`
+/// (peeked by draining and re-adding; the caller holds CONNECTED_DOWNLINK_LOCK).
+fn connected_downlink_queued_for(ue: u64) -> bool {
+    let ctx = crate::context::amf_self();
+    let guard = ctx.read().unwrap();
+    let items = guard.connected_downlink_drain();
+    let found = items.iter().any(|i| i.amf_ue_ngap_id == ue);
+    for item in items {
+        guard.connected_downlink_add(item);
+    }
+    found
+}
+
+/// The UE's release is answered by the SMF while the UE went CM-IDLE; then the UE
+/// answers the page (`answer`). With `ongoing_page`, another page for the UE was
+/// already running: the SMF's N1 waits as a queued downlink, that page is exhausted,
+/// and the downlink pump pages for the queued N1 itself. Returns the SMF calls and
+/// the NGAP sent from the UE's answer on.
+async fn release_then_idle_answer(
     old_id: u64,
     new_id: u64,
     sm_ref: &str,
-    pss: Option<[u8; 2]>,
+    answer: Answer,
+    ongoing_page: bool,
 ) -> (Vec<ReleaseCall>, Vec<Vec<u8>>) {
     crate::context::amf_context_init(64, 1024, 4096);
     let (_smf, port, calls) = release_answering_smf().await;
     let mut server = capturing_ngap_server().await;
-    let mut ue = idle_registered_ue(old_id);
+    let tmsi = old_id as u32;
+    let mut ue = match answer {
+        Answer::ServiceRequest(_) => idle_registered_ue(old_id),
+        Answer::PeriodicUpdate => {
+            let mut ue = idle_ue_with_security(old_id, tmsi);
+            // NEA0, so the delivered N1 can be found in the DL NAS TRANSPORT's octets.
+            ue.amf_ue.selected_enc_algorithm = 0;
+            ue
+        }
+    };
     ue.cm_idle = false;
     ue.amf_ue.supi = Some(format!("imsi-00101000164{:05}", old_id % 100_000));
     ue.amf_ue.allowed_nssai = vec![crate::context::SNssai { sst: 1, sd: None }];
+    ue.amf_ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+    ue.amf_ue.nr_tai.tac = 0x74;
     {
         let ctx = crate::context::amf_self();
         let guard = ctx.read().expect("ctx lock");
@@ -695,12 +731,35 @@ async fn release_then_idle_service_request(
     server.ue_auth_state.insert(old_id, ue);
     hold_session(&mut server, old_id, 5, sm_ref, port);
     server.mark_up_active(old_id, 5);
+    server
+        .handle_5gsm_message(ASSOC, old_id, 51, &[0x2E, 0x05, 0x07, 0xD1], None)
+        .await
+        .expect("handled");
+    server.ue_auth_state.with_mut(old_id, |s| s.cm_idle = true);
+    if ongoing_page {
+        // Another transfer's page is already running for the UE.
+        let mut other = paged_ue(old_id, 4);
+        other.tmsi = tmsi;
+        crate::context::amf_self().read().unwrap().paging_add(other);
+        for _ in 0..300 {
+            server.process_sbi_outcomes().await;
+            if connected_downlink_queued_for(old_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            connected_downlink_queued_for(old_id),
+            "behind the ongoing page, the SMF's N1 waits queued"
+        );
+        // The ongoing page is exhausted (T3513); the pump pages for the queued N1.
+        crate::context::amf_self()
+            .read()
+            .unwrap()
+            .paging_remove(old_id);
+        server.process_connected_downlinks().await;
+    }
     let paged = {
-        server
-            .handle_5gsm_message(ASSOC, old_id, 51, &[0x2E, 0x05, 0x07, 0xD1], None)
-            .await
-            .expect("handled");
-        server.ue_auth_state.with_mut(old_id, |s| s.cm_idle = true);
         let mut found = None;
         for _ in 0..300 {
             server.process_sbi_outcomes().await;
@@ -723,14 +782,31 @@ async fn release_then_idle_service_request(
     take_sent_ngap(&mut server);
     let calls_before = calls.lock().expect("calls").len();
 
-    let mut nas = protected_service_request([0; 4], old_id as u32);
-    if let Some(bitmap) = pss {
-        nas.extend_from_slice(&[0x50, 0x02, bitmap[0], bitmap[1]]);
-    }
     server.forced_amf_ue_ngap_id = Some(new_id);
+    let nas = match answer {
+        Answer::ServiceRequest(pss) => {
+            let mut nas = protected_service_request([0; 4], tmsi);
+            if let Some(bitmap) = pss {
+                nas.extend_from_slice(&[0x50, 0x02, bitmap[0], bitmap[1]]);
+            }
+            nas
+        }
+        Answer::PeriodicUpdate => {
+            let state = server.ue_auth_state.get(old_id).expect("the UE");
+            let rr = guti_registration_request(
+                crate::gmm_build::registration_type::PERIODIC_UPDATING,
+                tmsi,
+            );
+            protected_initial_registration(&state.amf_ue, &rr, &rr, 5)
+        }
+    };
     let _ = server
         .handle_initial_ue_message(1, &service_request_initial_ue(nas))
         .await;
+    assert!(
+        server.ue_auth_state.get(new_id).is_some(),
+        "the UE answered the page"
+    );
     let mut sent = Vec::new();
     for _ in 0..50 {
         server.process_sbi_outcomes().await;
@@ -746,6 +822,74 @@ async fn release_then_idle_service_request(
     (after, sent)
 }
 
+/// #1643 round 3: an ordinary page (not N1-only) for a session with no setup
+/// transfer, answered by a Service Request whose PDU session status shows that
+/// session inactive. A session the plan releases is not re-activated by the #540
+/// rule: the release goes to the SMF, and no ACTIVATING. R5's round-3 MAJOR 2 asked
+/// to pin or drop the `!plan.release` check. It was redundant, because the release
+/// forgets the session before any activation runs, so it is dropped, and this test
+/// pins the outcome.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_page_for_a_session_the_ue_releases_activates_nothing_1643() {
+    let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+    // Paging reads the strategy (#1588).
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
+    let saved_guamis = crate::context::amf_self()
+        .read()
+        .expect("ctx lock")
+        .served_guami
+        .clone();
+    serve_only_local_guami();
+    crate::context::amf_context_init(64, 1024, 4096);
+    let (_smf, port, calls) = release_answering_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (old_id, new_id) = (16_430_241u64, 16_430_242u64);
+    let mut ue = idle_registered_ue(old_id);
+    ue.amf_ue.supi = Some(format!("imsi-00101000164{:05}", old_id % 100_000));
+    ue.amf_ue.allowed_nssai = vec![crate::context::SNssai { sst: 1, sd: None }];
+    {
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().expect("ctx lock");
+        guard.amf_ue_publish(&ue.amf_ue, 51, 1);
+    }
+    server.ue_auth_state.insert(old_id, ue);
+    hold_session(&mut server, old_id, 5, "rel-n2-1643-plan", port);
+    // smfd's Downlink Data Report page: names PSI 5, no transfer.
+    let mut page = paged_ue(old_id, 4);
+    page.pdu_session_id = Some(5);
+    crate::context::amf_self().read().unwrap().paging_add(page);
+
+    let mut nas = protected_service_request([0; 4], old_id as u32);
+    nas.extend_from_slice(&[0x50, 0x02, 0x00, 0x00]);
+    server.forced_amf_ue_ngap_id = Some(new_id);
+    let _ = server
+        .handle_initial_ue_message(1, &service_request_initial_ue(nas))
+        .await;
+    for _ in 0..50 {
+        server.process_sbi_outcomes().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let seen = calls.lock().expect("calls").clone();
+    assert!(
+        seen.iter()
+            .any(|(u, _, _)| u.ends_with("/sm-contexts/rel-n2-1643-plan/release")),
+        "the session the UE dropped is released at the SMF: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|(_, b, _)| b["upCnxState"] == "ACTIVATING"),
+        "and not re-activated: {seen:?}"
+    );
+    server.forget_ue(new_id);
+    crate::context::amf_self()
+        .read()
+        .unwrap()
+        .paging_remove(old_id);
+    let ctx = crate::context::amf_self();
+    let mut ctx = ctx.write().expect("ctx lock");
+    ctx.num_of_served_guami = saved_guamis.len();
+    ctx.served_guami = saved_guamis;
+}
+
 /// #1643 review round 2, TS 23.502 §4.3.4.2 step 4 (the NAS message only): a page for
 /// the SMF's answer to the UE's own release is N1-only. The real Service Request from
 /// CM-IDLE that answers it re-activates no user plane for that session (no
@@ -759,6 +903,8 @@ async fn release_then_idle_service_request(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_n1_only_page_reactivates_nothing_and_delivers_the_command_1643() {
     let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+    // The re-page case drains the process-global connected-downlink queue.
+    let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
     // Paging reads the strategy (#1588).
     let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     let saved_guamis = crate::context::amf_self()
@@ -776,8 +922,14 @@ async fn an_n1_only_page_reactivates_nothing_and_delivers_the_command_1643() {
     };
 
     // The Service Request reports no PDU session status.
-    let (calls, sent) =
-        release_then_idle_service_request(16_430_201, 16_430_202, "rel-n2-1643-sr", None).await;
+    let (calls, sent) = release_then_idle_answer(
+        16_430_201,
+        16_430_202,
+        "rel-n2-1643-sr",
+        Answer::ServiceRequest(None),
+        false,
+    )
+    .await;
     assert!(
         !calls
             .iter()
@@ -802,11 +954,12 @@ async fn an_n1_only_page_reactivates_nothing_and_delivers_the_command_1643() {
     );
 
     // Its PDU session status shows PSI 5 inactive (all bits clear).
-    let (calls, sent) = release_then_idle_service_request(
+    let (calls, sent) = release_then_idle_answer(
         16_430_211,
         16_430_212,
         "rel-n2-1643-pss",
-        Some([0x00, 0x00]),
+        Answer::ServiceRequest(Some([0x00, 0x00])),
+        false,
     )
     .await;
     assert!(
@@ -824,6 +977,47 @@ async fn an_n1_only_page_reactivates_nothing_and_delivers_the_command_1643() {
     assert!(
         !has_command(&sent),
         "no RELEASE COMMAND for a session the UE dropped"
+    );
+
+    // #1643 round 3: a periodic registration update from CM-IDLE answers the page.
+    let (calls, sent) = release_then_idle_answer(
+        16_430_221,
+        16_430_222,
+        "rel-n2-1643-rr",
+        Answer::PeriodicUpdate,
+        false,
+    )
+    .await;
+    assert!(
+        !calls
+            .iter()
+            .any(|(_, b, _)| b["upCnxState"] == "ACTIVATING"),
+        "the registration update re-activates nothing for it: {calls:?}"
+    );
+    assert!(
+        has_command(&sent),
+        "the update's page delivers the SMF's RELEASE COMMAND"
+    );
+
+    // #1643 round 3: the answer came behind another page, which was exhausted; the
+    // re-page for the queued N1 is N1-only too.
+    let (calls, sent) = release_then_idle_answer(
+        16_430_231,
+        16_430_232,
+        "rel-n2-1643-requeue",
+        Answer::ServiceRequest(None),
+        true,
+    )
+    .await;
+    assert!(
+        !calls
+            .iter()
+            .any(|(_, b, _)| b["upCnxState"] == "ACTIVATING"),
+        "the re-page re-activates nothing: {calls:?}"
+    );
+    assert!(
+        has_command(&sent),
+        "the re-page delivers the SMF's RELEASE COMMAND"
     );
 
     let ctx = crate::context::amf_self();
