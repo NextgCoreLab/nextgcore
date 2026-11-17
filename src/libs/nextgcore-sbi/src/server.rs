@@ -394,8 +394,9 @@ struct SbiService<H: SbiRequestHandler> {
     /// into every request multiplexed on it.
     peer_cert_nf_instance_id: Option<String>,
     /// #1522: the NF types in the same verified certificate's RFC 9310 NFTypes
-    /// extension (TS 33.310 §6.1.3c.2), empty when it has none. Server-internal:
-    /// only the callback-exemption decision reads it.
+    /// extension (TS 33.310 §6.1.3c.3), empty when it has none. Read by the
+    /// callback-exemption decision and (#1611) copied onto every request as
+    /// [`SbiRequest::peer_cert_nf_types`].
     peer_cert_nf_types: Vec<String>,
     /// This NF's `(NfType, id)` identity for the `Server` response header
     /// (sbi-02). `None` emits no `Server` header.
@@ -459,7 +460,12 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
                 match convert_request(req, max_body, tls_exporter_secret, peer_cert_nf_instance_id)
                     .await
                 {
-                    Ok(request) => request,
+                    Ok(mut request) => {
+                        // #1611: the verified leaf's RFC 9310 NF types travel with
+                        // the request (the NRF binds an NFRegister's nfType to them).
+                        request.peer_cert_nf_types = peer_cert_nf_types.clone();
+                        request
+                    }
                     Err(ConvertRequestError::BodyTooLarge) => {
                         let body = serde_json::json!({
                             "title": "Payload Too Large",
@@ -896,6 +902,8 @@ async fn convert_request(
         correlation_id,
         tls_exporter_secret,
         peer_cert_nf_instance_id,
+        // #1611: set by the caller from the same verified leaf.
+        peer_cert_nf_types: Vec::new(),
         // Set by the caller after the bearer token verifies; `convert_request`
         // runs before authorization, so it cannot know it here.
         oauth2_subject: None,
