@@ -6590,6 +6590,14 @@ impl NgapServer {
                 }
             }
         }
+        // #1728: a session whose user plane is already up on this connection (an EPS or
+        // N2 handover set it up) needs no activation: a second PDU SESSION RESOURCE
+        // SETUP would set up at the gNB what it already holds. It is not a failed
+        // re-activation either, so it is left out of `activate` here, after the plan,
+        // rather than passed as `already`, which would also keep a session the UE
+        // reports inactive from being released.
+        plan.activate
+            .retain(|psi| !self.up_active.contains(&(amf_ue_ngap_id, *psi)));
         for psi in &plan.release {
             if let Some(r) = held
                 .iter()
@@ -18197,6 +18205,16 @@ impl NgapServer {
             s.registered = true;
             s.arrived_from_eps = true;
         });
+        // #1728: the sessions still in flight are the ones the target gNB admitted and
+        // whose SMF took the target tunnel (the others were dropped at the
+        // Acknowledge, `drop_unmoved_eps_session`). Their user plane is up on this
+        // connection, set up by the HANDOVER REQUEST, as an N2 handover's are at its
+        // Handover Notify. Marked, so a registration update that flags one in its
+        // Uplink data status does not set it up a second time.
+        self.clear_up_active_for_ue(amf_ue_ngap_id);
+        for sess in &in_flight.sessions {
+            self.mark_up_active(amf_ue_ngap_id, sess.created.pdu_session_id);
+        }
         // #945: TS 23.502 §4.11.1.2.2.3 step 5, the Forward Relocation Complete
         // Notification, comes BEFORE step 7, Nsmf_PDUSession_UpdateSMContext (Handover
         // Complete). The MME needs it to release the source eNB and start its step-14
@@ -45514,6 +45532,12 @@ mod eps_to_5gs_tests {
         // SETUP REQUEST to the gNB that holds the UE context; the {NCC, NH} the
         // handover set up is kept; no second REACHABLE; and the registration and
         // access type are reported once.
+        //
+        // #1728: the request flags the handed-over PDU session 5 in its Uplink data
+        // status (TS 24.501 §5.5.1.3.2). Its user plane is already up at the target
+        // gNB, set up by the HANDOVER REQUEST, so it is not activated at the SMF and
+        // no PDU SESSION RESOURCE SETUP goes to the gNB: the Accept goes out at once,
+        // with no failed re-activation for it.
         ngap.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
             s.amf_ue.registration_type = crate::gmm_build::registration_type::MOBILITY_UPDATING;
             s.amf_ue.allowed_nssai = vec![crate::context::SNssai {
@@ -45521,7 +45545,15 @@ mod eps_to_5gs_tests {
                 sd: Some(1),
             }];
             s.amf_ue.generate_new_guti();
+            s.registration_session_ies = Some(ServiceRequestSessionIes {
+                uplink_data_status: Some(1 << 5),
+                pdu_session_status: Some(1 << 5),
+            });
         });
+        assert!(
+            ngap.up_active.contains(&(amf_ue_ngap_id, 5)),
+            "the handed-over session's user plane is up on this connection"
+        );
         ngap.sent_ngap = Some(Vec::new());
         let reach_before = crate::namf_server::reachability_reports_on_this_thread();
         let registered_before = crate::namf_server::registration_state_reports_on_this_thread();
@@ -45544,8 +45576,22 @@ mod eps_to_5gs_tests {
             procedures.contains(&4),
             "the Accept goes in a DOWNLINK NAS TRANSPORT: {procedures:?}"
         );
+        // #1728: procedure code 29 is PDU Session Resource Setup (TS 38.413 §9.4.7).
+        assert!(
+            !procedures.contains(&29),
+            "no PDU SESSION RESOURCE SETUP for the handed-over session: {procedures:?}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), smf_rx.recv())
+                .await
+                .is_err(),
+            "the handed-over session is not activated at its SMF"
+        );
         let accepted = ngap.ue_auth_state.get(amf_ue_ngap_id).unwrap();
-        assert!(accepted.registration_accept_sent);
+        assert!(
+            accepted.registration_accept_sent,
+            "the Accept went out at once, not after an activation"
+        );
         assert_eq!(
             (
                 accepted.amf_ue.kgnb,
