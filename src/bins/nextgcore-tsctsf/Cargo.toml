@@ -33,6 +33,7 @@ clap.workspace = true
 ctrlc.workspace = true
 
 [dev-dependencies]
+nextgcore-sbi = { workspace = true, features = ["test-support"] }
 proptest.workspace = true
 
 [lints]

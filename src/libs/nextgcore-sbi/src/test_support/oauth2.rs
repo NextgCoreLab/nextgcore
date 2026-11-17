@@ -7,6 +7,9 @@
 //! NF listener does. Both are here, so every NF's test uses the same producer gate
 //! (nextgcore-sbi's own `require_oauth2`, JWKS and audience check), not a copy.
 //!
+//! Test-only: compiled under `cfg(test)` or the `test-support` feature, which
+//! only dev-dependencies enable, so no production build ships a token minter.
+//!
 //! Both stand-ins listen on loopback in cleartext. A test that drives production
 //! code at them sets the `dev` SBI profile override and never resets it (see
 //! [`crate::security::set_sbi_profile_override`]).
@@ -110,8 +113,14 @@ pub async fn token_nrf(sk: p256::ecdsa::SigningKey) -> (SbiServer, u16) {
 }
 
 /// An OAuth2 client of NF type `consumer`, asking the stand-in NRF on `nrf_port`.
+///
+/// It touches no process-wide CCA state: no signing key, no `x5c` chain, and
+/// nothing published to the CCA public-JWK directory
+/// ([`OAuth2Client::isolated_for_test`]). `OAuth2Client::new` would resolve both
+/// from the process-wide override or environment, which a sibling test may have
+/// set, and could publish a key file. The stand-in NRF needs no assertion.
 pub fn oauth2_client_for(nrf_port: u16, consumer: NfType) -> Arc<OAuth2Client> {
-    Arc::new(OAuth2Client::new(
+    Arc::new(OAuth2Client::isolated_for_test(
         format!("http://127.0.0.1:{nrf_port}"),
         format!("{}-test", consumer.to_str().to_ascii_lowercase()),
         consumer,
@@ -184,6 +193,15 @@ pub fn bearer_requests(seen: &SeenRequests, method: &str, fragment: &str) -> usi
 mod tests {
     use super::*;
     use crate::client::SbiClient;
+
+    /// The fixture's client carries no CCA key or chain, whatever the
+    /// process-wide CCA state is: it never reads it (R8 review).
+    #[test]
+    fn the_fixture_client_carries_no_process_wide_cca_state() {
+        let client = oauth2_client_for(1, NfType::Udm);
+        assert!(!client.has_cca_signing_key());
+        assert!(!client.has_cca_cert_chain());
+    }
 
     /// The two stand-ins agree with each other and with the shared client: a client
     /// with the OAuth2 client attached gets through the gate, and one without is
