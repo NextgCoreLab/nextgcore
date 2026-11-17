@@ -725,20 +725,30 @@ fn nrf_self_profile_for(uri: &str) -> serde_json::Value {
         Some((h, p)) => (h, p.parse::<u16>().unwrap_or(7777)),
         None => (host_port, 7777),
     };
+    let services: Vec<serde_json::Value> = ["nnrf-nfm", "nnrf-disc", "nnrf-oauth2"]
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "serviceInstanceId": name,
+                "serviceName": name,
+                "versions": [{ "apiVersionInUri": "v1", "apiFullVersion": "1.0.0" }],
+                "scheme": scheme,
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{ "ipv4Address": host, "port": port, "transport": "TCP" }],
+            })
+        })
+        .collect();
     nextgcore_sbi::nf_addressing::classify_profile_host(
         serde_json::json!({
             "nfInstanceId": nrf_instance_id(),
             "nfType": NfType::Nrf.to_str(),
             "nfStatus": "REGISTERED",
             "ipv4Addresses": [host],
-            "nfServices": [{
-                "serviceInstanceId": "nnrf-oauth2",
-                "serviceName": "nnrf-oauth2",
-                "versions": [{ "apiVersionInUri": "v1", "apiFullVersion": "1.0.0" }],
-                "scheme": scheme,
-                "nfServiceStatus": "REGISTERED",
-                "ipEndPoints": [{ "ipv4Address": host, "port": port, "transport": "TCP" }],
-            }],
+            // #1644 review B1: the NRF's own APIs, so the token endpoint can grant
+            // the `nnrf-nfm` / `nnrf-disc` scope that the nrfd-06 gate requires
+            // (TS 29.510 §5.2.2.2.3 b: an NRF profile lists nnrf-disc, nnrf-nfm and
+            // optionally nnrf-oauth2).
+            "nfServices": services,
         }),
         host,
     )
@@ -754,7 +764,27 @@ fn nrf_self_profile_for(uri: &str) -> serde_json::Value {
 /// Idempotent: `NfInstanceManager::register` inserts by instance ID, and the ID
 /// is stable across restarts once pinned, so a restart overwrites its own entry
 /// rather than accumulating one per start.
+/// Whether the NRF puts itself in its own registry at startup (#187, #1644 review
+/// m4): when it requests tokens from itself (`require_oauth2`), and when its own
+/// nnrf-nfm / nnrf-disc are gated (`require_server`), because a token for them is
+/// minted only when a registered NRF offers the service.
+fn registers_itself(require_oauth2: bool, require_server: bool) -> bool {
+    require_oauth2 || require_server
+}
+
+/// The one lock for tests that add or remove the NRF's own entry in the
+/// process-global registry (#1644 review M1), declared beside the function that
+/// writes it: a test deregistering the entry raced one that needs it.
+#[cfg(test)]
+fn self_entry_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 fn register_self_with_own_registry() {
+    // #1644 review M2: whatever armed one before (a restored registry), the NRF's
+    // own entry has no no-heartbeat timer.
+    disarm_heartbeat_timer(nrf_instance_id());
     let doc = nrf_self_profile();
     match NfProfile::from_json(&doc) {
         Ok(profile) => match nf_manager().register(profile) {
@@ -977,7 +1007,17 @@ fn negotiate_heartbeat(proposed: Option<u32>, default: u32, min: u32, max: u32) 
 
 /// Arm (or re-arm) the no-heartbeat expiry timer for an NF instance,
 /// cancelling any previously armed timer for the same instance.
+///
+/// Never for the NRF's own entry (#1644 review M2): the NRF does not heartbeat
+/// itself, so a timer on it (from `rearm_restored_timers` after a restart with
+/// persistence, or a PUT naming it) would suspend and then deregister it, after
+/// which its token endpoint grants no nnrf-* scope and the nrfd-06 gate refuses
+/// everyone.
 fn arm_heartbeat_timer(nf_instance_id: &str, expiry: Duration) {
+    if nf_instance_id.eq_ignore_ascii_case(nrf_instance_id()) {
+        disarm_heartbeat_timer(nf_instance_id);
+        return;
+    }
     let timer_mgr = timer_manager();
     let new_id = timer_mgr.start_timer(
         nextgcore_nrfd::NrfTimerId::NfInstanceNoHeartbeat,
@@ -1143,6 +1183,7 @@ async fn main() -> Result<()> {
              (token + jwks endpoints stay exempt)"
         );
     }
+    let self_registers = registers_itself(require_oauth2, policy.require_oauth2_server);
     if policy.require_client_auth {
         log::info!(
             "nrfd-05: token-endpoint client authentication required (signature-verified CCA \
@@ -1237,6 +1278,11 @@ async fn main() -> Result<()> {
              calls (issuer/self: {})",
             nrf_self_uri()
         );
+    } else if self_registers {
+        // #1644 review B1: a token for nnrf-nfm / nnrf-disc is minted only when a
+        // registered NRF offers the service, so the NRF must be in its own registry
+        // whenever the gate requires one.
+        register_self_with_own_registry();
     }
 
     // Build SBI server configuration (legacy, for context)
@@ -1367,6 +1413,20 @@ fn enforce_oauth2_on_request(
 /// is the `sub` of an NRF-issued token whose signature verified (the consumer's
 /// NF Instance ID, TS 29.510 §6.3.5.2.4 `AccessTokenClaims`); `Ok(None)` means no
 /// token was required here.
+///
+/// #1634: a verified signature is not enough. The token must also be FOR this
+/// API on this NRF (TS 33.501 §13.4.1.1, TS 29.500 §6.7.3):
+/// - `scope` must contain the invoked service name (`nnrf-nfm` / `nnrf-disc`):
+///   TS 29.500 §6.7.3 makes the service-name scope part of every access scope,
+///   and TS 29.510 Table 6.1.8-1 defines `nnrf-nfm` for the Nnrf_NFManagement API.
+///   Otherwise 403, `WWW-Authenticate: Bearer error="insufficient_scope"`.
+/// - `aud` must name this NRF: its NF type `NRF` or its NF Instance ID (TS 29.510
+///   §6.3.5.2.4). A token minted for another producer is a claims mismatch: 403
+///   `ACCESS_TOKEN_CLAIM_MISMATCH`, `error="invalid_token"`.
+///
+/// Before, a token issued for any service of any producer (say an
+/// nsmf-pdusession token a peer obtained legitimately) was accepted here, and,
+/// since #1611, its `sub` then stood for the caller's identity.
 fn oauth2_gate(
     path: &str,
     auth_header: Option<&str>,
@@ -1376,15 +1436,99 @@ fn oauth2_gate(
     if !require || !oauth2_protected_path(path) {
         return Ok(None);
     }
-    match nextgcore_sbi::oauth::authorize_bearer(auth_header, jwks) {
-        Ok(claims) => Ok(Some(claims.sub)),
-        Err(e) => Err(Box::new(send_error(
-            401,
-            "Unauthorized",
-            &format!("OAuth2 access token required: {e}"),
-            Some("UNAUTHORIZED"),
-        ))),
+    let service = path
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    let realm = format!("{}/{service}/v1", nrf_self_uri());
+    let challenge = |error: Option<&str>, scope: Option<&str>| {
+        let mut c = format!("Bearer realm=\"{realm}\"");
+        if let Some(e) = error {
+            c.push_str(&format!(", error=\"{e}\""));
+        }
+        if let Some(s) = scope {
+            c.push_str(&format!(", scope=\"{s}\""));
+        }
+        c
+    };
+    let refuse = |status: u16, title: &str, detail: String, cause: Option<&str>, www: String| {
+        Box::new(send_error(status, title, &detail, cause).with_header("WWW-Authenticate", www))
+    };
+    // TS 29.500 §6.7.3: a claims mismatch MAY carry ACCESS_TOKEN_CLAIM_MISMATCH with
+    // `invalidParams` naming the claim (#1644 review m1).
+    let claim_mismatch = |claim: &str, detail: String| {
+        let body = serde_json::json!({
+            "title": "Forbidden",
+            "status": 403,
+            "detail": detail,
+            "cause": "ACCESS_TOKEN_CLAIM_MISMATCH",
+            "invalidParams": [{ "param": claim }],
+        });
+        Box::new(
+            SbiResponse::with_status(403)
+                .with_body(body.to_string(), "application/problem+json")
+                .with_header("WWW-Authenticate", challenge(Some("invalid_token"), None)),
+        )
+    };
+    let claims = match nextgcore_sbi::oauth::authorize_bearer(auth_header, jwks) {
+        Ok(claims) => claims,
+        Err(e) => {
+            // TS 29.500 §6.7.3: no `error` when the request carried no token; and
+            // RFC 6750 §3.1: a request with another authentication scheme carries
+            // no Bearer token either (#1644 review m2).
+            let presented = auth_header.is_some_and(|h| {
+                h.trim()
+                    .get(..7)
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("bearer "))
+            });
+            return Err(refuse(
+                401,
+                "Unauthorized",
+                format!("OAuth2 access token required: {e}"),
+                Some("UNAUTHORIZED"),
+                challenge(presented.then_some("invalid_token"), None),
+            ));
+        }
+    };
+    // The issuer must be this NRF (TS 29.510 §6.3.5.2.4 `iss`: the NRF's NF Instance
+    // ID). The signature already ties the token to this NRF's key; this keeps the
+    // gate right if the JWKS ever holds another NRF's key.
+    if !claims.iss.eq_ignore_ascii_case(nrf_instance_id()) {
+        return Err(claim_mismatch(
+            "iss",
+            format!(
+                "the access token was not issued by this NRF ({:?})",
+                claims.iss
+            ),
+        ));
     }
+    let for_this_nrf = |aud: &str| aud == "NRF" || aud.eq_ignore_ascii_case(nrf_instance_id());
+    let aud_ok = match &claims.aud {
+        serde_json::Value::String(a) => for_this_nrf(a),
+        serde_json::Value::Array(items) => {
+            items.iter().filter_map(|v| v.as_str()).any(for_this_nrf)
+        }
+        _ => false,
+    };
+    if !aud_ok {
+        return Err(claim_mismatch(
+            "aud",
+            format!("the access token's audience {} is not this NRF", claims.aud),
+        ));
+    }
+    if nextgcore_sbi::oauth::check_token_scope(&claims.scope, service).is_err() {
+        return Err(refuse(
+            403,
+            "Forbidden",
+            format!("the access token's scope does not include {service}"),
+            // RFC 6750 `insufficient_scope` is in the challenge; TS 29.500 defines no
+            // ProblemDetails cause for it (#1644 review m1).
+            None,
+            challenge(Some("insufficient_scope"), Some(service)),
+        ));
+    }
+    Ok(Some(claims.sub))
 }
 
 /// SBI request handler for NRF
@@ -7230,7 +7374,9 @@ mod tests {
         // A producer for the NRF to ask about, so authorization has a target.
         let (_c, producer_id, _ct, ptype) = register_pair("nrfd187self");
 
-        // The NRF registers itself, exactly as startup does.
+        // The NRF registers itself, exactly as startup does. Its entry is shared with
+        // every other test of this process (#1644 review M1).
+        let _self_entry = self_entry_test_lock().lock().await;
         register_self_with_own_registry();
         let self_id = nrf_instance_id().to_string();
         assert!(
@@ -8354,8 +8500,35 @@ mod tests {
     // nrfd-06: per-path server-side OAuth2 enforcement (TS 33.501 §13.4.1)
     // -----------------------------------------------------------------
 
-    /// Mint an NRF-signed ES256 access token (as the token endpoint does).
+    /// Mint an NRF-signed ES256 access token (as the token endpoint does), with
+    /// scope `nnrf-nfm nnrf-disc` (#1634).
     fn mint_nrf_token(sub: &str, aud: &str, exp_offset: i64) -> String {
+        mint_nrf_token_with(
+            sub,
+            &serde_json::json!(aud),
+            "nnrf-nfm nnrf-disc",
+            exp_offset,
+        )
+    }
+
+    /// [`mint_nrf_token`] with any `aud` and `scope`.
+    fn mint_nrf_token_with(
+        sub: &str,
+        aud: &serde_json::Value,
+        scope: &str,
+        exp_offset: i64,
+    ) -> String {
+        mint_nrf_token_from(nrf_instance_id(), sub, aud, scope, exp_offset)
+    }
+
+    /// [`mint_nrf_token_with`] under any `iss`, still signed with this NRF's key.
+    fn mint_nrf_token_from(
+        iss: &str,
+        sub: &str,
+        aud: &serde_json::Value,
+        scope: &str,
+        exp_offset: i64,
+    ) -> String {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
         use p256::ecdsa::{signature::Signer, Signature};
@@ -8365,7 +8538,7 @@ mod tests {
             .as_secs() as i64;
         let header = format!(r#"{{"alg":"ES256","typ":"JWT","kid":"{NRF_KID}"}}"#);
         let claims = serde_json::json!({
-            "iss": nrf_instance_id(), "sub": sub, "aud": aud, "scope": "x",
+            "iss": iss, "sub": sub, "aud": aud, "scope": scope,
             "exp": (now + exp_offset) as u64, "iat": now as u64,
         });
         let h = URL_SAFE_NO_PAD.encode(header.as_bytes());
@@ -8402,6 +8575,239 @@ mod tests {
             "not required: nothing verified, nothing recorded"
         );
         assert!(oauth2_gate("/nnrf-nfm/v1/nf-instances/x", None, true, &jwks).is_err());
+    }
+
+    /// #1634: the gate accepts only a token for this API on this NRF.
+    /// - Accepted: scope naming the invoked service, aud `NRF` or this NRF's instance
+    ///   ID (also inside an array, and in another case).
+    /// - 403 insufficient_scope (with the required scope in the challenge): another
+    ///   service's scope, or `nnrf-disc` only on nnrf-nfm, or a scope that merely
+    ///   starts with the service name.
+    /// - 403 ACCESS_TOKEN_CLAIM_MISMATCH / invalid_token: aud of another NF type or
+    ///   instance.
+    /// - 401: no token (challenge without `error`), a forged token (`invalid_token`).
+    ///
+    /// REVERT-VERIFIED: without the scope check the foreign-scope tokens pass; without
+    /// the audience check the foreign-audience tokens pass.
+    #[test]
+    fn the_oauth2_gate_requires_this_api_s_scope_and_this_nrf_as_audience_1634() {
+        use serde_json::json;
+        let jwks = nrf_jwks_json();
+        let nfm = "/nnrf-nfm/v1/nf-instances/x";
+        let gate = |path: &str, token: Option<String>| {
+            let auth = token.map(|t| format!("Bearer {t}"));
+            oauth2_gate(path, auth.as_deref(), true, &jwks)
+        };
+        let tok = |aud: serde_json::Value, scope: &str| {
+            Some(mint_nrf_token_with("nf-1634", &aud, scope, 3600))
+        };
+        let www = |r: &SbiResponse| {
+            r.http
+                .get_header("WWW-Authenticate")
+                .cloned()
+                .unwrap_or_default()
+        };
+        let cause = |r: &SbiResponse| {
+            serde_json::from_str::<serde_json::Value>(r.http.content.as_deref().unwrap_or("{}"))
+                .unwrap_or_default()["cause"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        for (aud, scope) in [
+            (json!("NRF"), "nnrf-nfm"),
+            (json!(nrf_instance_id()), "nnrf-disc nnrf-nfm"),
+            (
+                json!(["AMF", nrf_instance_id().to_ascii_uppercase()]),
+                "nnrf-nfm",
+            ),
+        ] {
+            assert_eq!(
+                gate(nfm, tok(aud.clone(), scope)).ok().flatten().as_deref(),
+                Some("nf-1634"),
+                "{aud} {scope}"
+            );
+        }
+        assert!(gate("/nnrf-disc/v1/nf-instances", tok(json!("NRF"), "nnrf-disc")).is_ok());
+
+        for (path, scope) in [
+            (nfm, "nsmf-pdusession"),
+            (nfm, "nnrf-disc"),
+            (nfm, "nnrf-nfmx"),
+            (nfm, ""),
+            ("/nnrf-disc/v1/nf-instances", "nnrf-nfm"),
+        ] {
+            let r = *gate(path, tok(json!("NRF"), scope)).expect_err(scope);
+            assert_eq!(r.status, 403, "{path} {scope:?}");
+            assert_eq!(cause(&r), "", "TS 29.500 defines no cause for it");
+            assert!(
+                www(&r).contains("error=\"insufficient_scope\""),
+                "{}",
+                www(&r)
+            );
+            let service = path.split('/').nth(1).unwrap();
+            assert!(
+                www(&r).contains(&format!("scope=\"{service}\"")),
+                "{}",
+                www(&r)
+            );
+        }
+
+        for aud in [json!("SMF"), json!(["smf-instance-1"]), json!(42)] {
+            let r = *gate(nfm, tok(aud.clone(), "nnrf-nfm")).expect_err("aud");
+            assert_eq!(r.status, 403, "{aud}");
+            assert_eq!(cause(&r), "ACCESS_TOKEN_CLAIM_MISMATCH");
+            assert!(www(&r).contains("error=\"invalid_token\""));
+            let body: serde_json::Value =
+                serde_json::from_str(r.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(body["invalidParams"][0]["param"], "aud");
+        }
+
+        // #1644 review: a token another issuer minted (were its key ever trusted).
+        let foreign =
+            mint_nrf_token_from("another-nrf", "nf-1634", &json!("NRF"), "nnrf-nfm", 3600);
+        let r = *gate(nfm, Some(foreign)).expect_err("iss");
+        assert_eq!(r.status, 403);
+        assert_eq!(cause(&r), "ACCESS_TOKEN_CLAIM_MISMATCH");
+        let body: serde_json::Value =
+            serde_json::from_str(r.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["invalidParams"][0]["param"], "iss");
+
+        // RFC 6750 §3.1: another scheme is no Bearer token, so no `error`.
+        let r = *oauth2_gate(nfm, Some("Basic dXNlcjpwdw=="), true, &jwks).expect_err("basic");
+        assert_eq!(r.status, 401);
+        assert!(!www(&r).contains("error="), "{}", www(&r));
+
+        let r = *gate(nfm, None).expect_err("no token");
+        assert_eq!(r.status, 401);
+        assert!(www(&r).starts_with("Bearer realm=") && !www(&r).contains("error="));
+        let r = *gate(nfm, Some("e30.e30.AAAA".to_string())).expect_err("forged");
+        assert_eq!(r.status, 401);
+        assert!(www(&r).contains("error=\"invalid_token\""));
+    }
+
+    /// #1644 review B1: a token the NRF's own token endpoint issues for its APIs
+    /// passes the gate. Both forms the endpoint mints: `targetNfType: NRF` (aud
+    /// "NRF") and `targetNfInstanceId` = this NRF (aud [its instance ID]), for
+    /// nnrf-disc and nnrf-nfm.
+    ///
+    /// REVERT-VERIFIED: with only nnrf-oauth2 in the NRF's self profile, the token
+    /// endpoint answers invalid_scope.
+    #[tokio::test]
+    async fn a_token_the_nrf_issues_for_its_own_apis_passes_the_gate_1644() {
+        use serde_json::json;
+        let consumer = "1644c0c0-0000-4000-8000-0000000000a1";
+        nf_manager()
+            .register(
+                NfProfile::from_json(&json!({
+                    "nfInstanceId": consumer, "nfType": "AMF", "nfStatus": "REGISTERED",
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let _self_entry = self_entry_test_lock().lock().await;
+        register_self_with_own_registry();
+        let jwks = nrf_jwks_json();
+        let policy = policy_without_client_auth();
+        for (target, scope, path) in [
+            (
+                json!({"targetNfType": "NRF"}),
+                "nnrf-disc",
+                "/nnrf-disc/v1/nf-instances",
+            ),
+            (
+                json!({"targetNfType": "NRF"}),
+                "nnrf-nfm",
+                "/nnrf-nfm/v1/nf-instances/x",
+            ),
+            (
+                json!({"targetNfInstanceId": nrf_instance_id()}),
+                "nnrf-disc",
+                "/nnrf-disc/v1/nf-instances",
+            ),
+            (
+                json!({"targetNfInstanceId": nrf_instance_id()}),
+                "nnrf-nfm",
+                "/nnrf-nfm/v1/nf-instances/x",
+            ),
+        ] {
+            let mut body = json!({
+                "grant_type": "client_credentials", "nfInstanceId": consumer,
+                "nfType": "AMF", "scope": scope,
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(target.as_object().unwrap().clone());
+            let mut req = SbiRequest::post("/nnrf-oauth2/v1/access-token");
+            req.http.set_content(body.to_string());
+            let resp = handle_access_token_request_with_policy(&req, &policy).await;
+            assert_eq!(
+                resp.status, 200,
+                "{target} {scope}: {:?}",
+                resp.http.content
+            );
+            let token: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            let auth = format!("Bearer {}", token["access_token"].as_str().unwrap());
+            assert_eq!(
+                oauth2_gate(path, Some(&auth), true, &jwks)
+                    .map_err(|r| r.http.content.clone())
+                    .unwrap()
+                    .as_deref(),
+                Some(consumer),
+                "{target} {scope}"
+            );
+        }
+        nf_manager().deregister(consumer).ok();
+    }
+
+    /// #1644 review M2: with persistence on, a restart restores the NRF's own entry
+    /// and re-arms every restored profile's no-heartbeat timer. The NRF's own entry
+    /// must get none, in either order of restore and self-registration, so it stays
+    /// REGISTERED past the heartbeat window and its token endpoint keeps issuing.
+    ///
+    /// REVERT-VERIFIED: without the guard in `arm_heartbeat_timer` (and the disarm in
+    /// `register_self_with_own_registry`), a timer is armed for the entry.
+    #[tokio::test]
+    async fn the_nrf_s_own_entry_never_gets_a_heartbeat_timer_1644() {
+        let _self_entry = self_entry_test_lock().lock().await;
+        let armed = || {
+            HEARTBEAT_TIMERS
+                .lock()
+                .expect("timers")
+                .contains_key(nrf_instance_id())
+        };
+        register_self_with_own_registry();
+        rearm_restored_timers();
+        assert!(!armed(), "restore after self-registration");
+        register_self_with_own_registry();
+        assert!(!armed(), "self-registration after restore");
+        arm_heartbeat_timer(nrf_instance_id(), Duration::from_secs(1));
+        assert!(!armed(), "nor through any other caller");
+        assert_eq!(
+            nf_manager()
+                .get(nrf_instance_id())
+                .expect("the entry stays")
+                .nf_status,
+            "REGISTERED"
+        );
+    }
+
+    /// #1644 review m4: the NRF registers itself whenever either its own token
+    /// requests or its gated APIs need it, and only then.
+    #[test]
+    fn the_nrf_registers_itself_when_its_tokens_need_it_1644() {
+        assert!(
+            registers_itself(true, false),
+            "it requests tokens from itself"
+        );
+        assert!(
+            registers_itself(false, true),
+            "its APIs require tokens it must issue"
+        );
+        assert!(registers_itself(true, true));
+        assert!(!registers_itself(false, false), "nothing needs the entry");
     }
 
     #[test]
