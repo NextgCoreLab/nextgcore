@@ -350,6 +350,15 @@ pub async fn run() -> Result<()> {
         crate::session_ambr_cap::from_config_root(&demo_config_root(&args.config)?)
             .map_err(|e| anyhow::anyhow!("configuration file {}: {e}", args.config))?;
     crate::session_ambr_cap::set(session_ambr_cap);
+    // #1621 review B1: `pcf.policy.emergency_dnns`, the Emergency DNs an SM policy
+    // create authorises without a UDR read (TS 29.512 §4.2.2.2).
+    let emergency_dnns = crate::emergency_dnn::from_config_root(&demo_config_root(&args.config)?)
+        .map_err(|e| anyhow::anyhow!("configuration file {}: {e}", args.config))?;
+    log::info!(
+        "pcf.policy.emergency_dnns = {emergency_dnns:?}: SM policy creates for these DNNs \
+         use local policy, without a UDR subscription check"
+    );
+    crate::emergency_dnn::set(emergency_dnns);
     // #1402 review M1: logged from the global the paths read, not from the parsed
     // local, so the line proves the value is IN FORCE (the start-up test reads it).
     let in_force = crate::session_ambr_cap::get();
@@ -3196,12 +3205,27 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
             let session_data = pcf_get_session_data(supi, None, &s_nssai, dnn);
 
             // Retrieve the SM PolicyData from UDR over Nudr_DataRepository (TS 29.519,
-            // TS 29.512 §4.2.2.2) on the live path. Bounded; on 404/unreachable we keep
-            // the local subscription/config data as the documented fallback. The QoS/ARP/
-            // AMBR/PCC decision is not re-derived from this resource (SmPolicyDnnData does
-            // not carry them); only the spec-defined online/offline charging flags are.
-            let udr_dnn_data = match sbi_path::pcf_udr_sm_policy_dnn_data(supi, sst, sd, dnn).await
-            {
+            // TS 29.512 §4.2.2.2) on the live path. Bounded; a 404 or no UDR deployed
+            // keeps the local subscription/config data as the documented fallback, and
+            // any other failure refuses the create (#1597, #1613). The QoS/ARP/AMBR/PCC
+            // decision is not re-derived from this resource (SmPolicyDnnData does not
+            // carry them); only the spec-defined online/offline charging flags are.
+            //
+            // #1621 review B1, TS 29.512 §4.2.2.2 (29512-k00.txt:3576-3583): for an
+            // Emergency DN of the configurable list "the PCF does not perform ...
+            // subscription check procedures with UDR; it uses instead the locally
+            // configured operator policies", so a UDR outage cannot refuse it.
+            let emergency = crate::emergency_dnn::is_emergency(dnn);
+            let udr_read = if emergency {
+                log::info!(
+                    "SM policy create for SUPI {supi} dnn={dnn}: an Emergency DN, no UDR \
+                     subscription check (TS 29.512 §4.2.2.2)"
+                );
+                Ok(None)
+            } else {
+                sbi_path::pcf_udr_sm_policy_dnn_data(supi, sst, sd, dnn).await
+            };
+            let udr_dnn_data = match udr_read {
                 Ok(doc) => doc,
                 Err(e) => {
                     // #1597: an outage is not "nothing provisioned". The session was
@@ -3223,10 +3247,10 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
                 log::info!(
                     "UDR SmPolicyData retrieved over Nudr_DataRepository for SUPI {supi} dnn={dnn}"
                 );
-            } else {
+            } else if !emergency {
                 log::warn!(
-                    "UDR SmPolicyData unavailable (404/unreachable) for SUPI {supi} dnn={dnn}; \
-                     using local defaults"
+                    "UDR SmPolicyData not provisioned (404, or no UDR deployed) for SUPI \
+                     {supi} dnn={dnn}; using local defaults"
                 );
             }
 
@@ -4713,8 +4737,8 @@ fn asc_resp_required(root: &serde_json::Value) -> bool {
         || root
             .get("dnn")
             .and_then(|v| v.as_str())
-            .map(|d| d.eq_ignore_ascii_case("sos") || d.eq_ignore_ascii_case("emergency"))
-            .unwrap_or(false)
+            // #1621 review B1: the configurable Emergency DN list.
+            .is_some_and(crate::emergency_dnn::is_emergency)
 }
 
 /// Merge newly-built AF PCC rules into a session, replacing any rule with the
@@ -8099,7 +8123,10 @@ mod tests {
     async fn start_mock_udr_1597(
         status: std::sync::Arc<std::sync::atomic::AtomicU16>,
         am_data: serde_json::Value,
-    ) -> nextgcore_sbi::server::SbiServer {
+    ) -> (
+        nextgcore_sbi::server::SbiServer,
+        crate::test_support::NrfUriGuard,
+    ) {
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
         use std::sync::atomic::Ordering;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -8155,8 +8182,9 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        crate::test_support::point_nrf_at(format!("http://127.0.0.1:{port}")).await;
-        server
+        // #1621 review m2: restored when the test ends, even on a panic.
+        let nrf = crate::test_support::scoped_nrf_at(format!("http://127.0.0.1:{port}")).await;
+        (server, nrf)
     }
 
     fn problem_cause_1597(resp: &SbiResponse) -> String {
@@ -8182,7 +8210,8 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         pcf_context_init(64, 64);
         let status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(500));
-        let udr = start_mock_udr_1597(status.clone(), serde_json::json!({ "rfspIndex": 5 })).await;
+        let (udr, _nrf) =
+            start_mock_udr_1597(status.clone(), serde_json::json!({ "rfspIndex": 5 })).await;
         let create = |supi: &str| {
             make_request(
                 "POST",
@@ -8231,7 +8260,8 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         pcf_context_init(64, 64);
         let status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
-        let udr = start_mock_udr_1597(status.clone(), serde_json::json!({ "rfspIndex": 5 })).await;
+        let (udr, _nrf) =
+            start_mock_udr_1597(status.clone(), serde_json::json!({ "rfspIndex": 5 })).await;
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
             "/npcf-am-policy-control/v1/policies",
@@ -8287,7 +8317,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         pcf_context_init(64, 64);
         let status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(503));
-        let udr = start_mock_udr_1597(status.clone(), serde_json::json!({})).await;
+        let (udr, _nrf) = start_mock_udr_1597(status.clone(), serde_json::json!({})).await;
         let supi = "imsi-001010000035971";
         let mut body = full_create_body(supi, 5);
         body["ipv4Address"] = serde_json::json!("10.159.7.1");
@@ -8340,7 +8370,7 @@ mod tests {
         let supi = "imsi-001010000045971";
         let watch = nextgcore_core::test_log::watch(format!("[{supi}] UE policy delivery for"));
         let status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(500));
-        let udr = start_mock_udr_1597(status, serde_json::json!({})).await;
+        let (udr, _nrf) = start_mock_udr_1597(status, serde_json::json!({})).await;
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
             "/npcf-ue-policy-control/v1/policies",
@@ -8371,10 +8401,15 @@ mod tests {
 
     /// #1613: a mock NRF whose discovery lists one UDR at `127.0.0.1:{udr_port}`,
     /// or none when `udr_port` is 0. The UDR itself is whatever the test put on
-    /// that port: nothing (refused), a listener that never answers, or a server.
+    /// that port: nothing (refused), a listener that never answers, or
+    /// [`start_udr_1621`]. The NRF URI is restored when the guard drops (#1621
+    /// review m2).
     async fn start_mock_nrf_1613(
         udr_port: std::sync::Arc<std::sync::atomic::AtomicU16>,
-    ) -> nextgcore_sbi::server::SbiServer {
+    ) -> (
+        nextgcore_sbi::server::SbiServer,
+        crate::test_support::NrfUriGuard,
+    ) {
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
         use std::sync::atomic::Ordering;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -8403,7 +8438,10 @@ mod tests {
                         }])
                     };
                     SbiResponse::with_status(200)
-                        .with_json_body(&serde_json::json!({ "nfInstances": instances }))
+                        .with_json_body(&serde_json::json!({
+                            "validityPeriod": 3600,
+                            "nfInstances": instances,
+                        }))
                         .unwrap_or_else(|_| SbiResponse::with_status(500))
                 }
             })
@@ -8415,16 +8453,79 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        crate::test_support::point_nrf_at(format!("http://127.0.0.1:{}", addr.port())).await;
+        let guard =
+            crate::test_support::scoped_nrf_at(format!("http://127.0.0.1:{}", addr.port())).await;
+        (server, guard)
+    }
+
+    /// What [`start_udr_1621`] answers every nudr-dr GET with.
+    const UDR_OK_1621: u16 = 0;
+    /// A 200 whose body is not JSON.
+    const UDR_GARBLED_1621: u16 = 1;
+    /// A 200 with no body.
+    const UDR_EMPTY_1621: u16 = 2;
+
+    /// #1621: a mock UDR (no NRF) whose every nudr-dr GET answers per `mode`:
+    /// [`UDR_OK_1621`] am-data `{ "rfspIndex": 5 }` (other reads 404),
+    /// [`UDR_GARBLED_1621`], [`UDR_EMPTY_1621`], or else that HTTP status.
+    async fn start_udr_1621(
+        mode: std::sync::Arc<std::sync::atomic::AtomicU16>,
+    ) -> (nextgcore_sbi::server::SbiServer, u16) {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        use std::sync::atomic::Ordering;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
         server
+            .start(move |req: SbiRequest| {
+                let mode = mode.load(Ordering::SeqCst);
+                async move {
+                    let path = req.header.uri.split('?').next().unwrap_or("").to_string();
+                    match mode {
+                        UDR_OK_1621 if path.ends_with("/provisioned-data/am-data") => {
+                            SbiResponse::with_status(200)
+                                .with_json_body(&serde_json::json!({ "rfspIndex": 5 }))
+                                .unwrap_or_else(|_| SbiResponse::with_status(500))
+                        }
+                        UDR_OK_1621 => SbiResponse::with_status(404),
+                        UDR_GARBLED_1621 => SbiResponse::with_status(200)
+                            .with_body("{not json".to_string(), "application/json"),
+                        UDR_EMPTY_1621 => SbiResponse::with_status(200),
+                        status => SbiResponse::with_status(status),
+                    }
+                }
+            })
+            .await
+            .expect("mock UDR starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (server, addr.port())
+    }
+
+    /// An AM policy create request for `supi` (#1613, #1621).
+    fn am_create_1613(supi: &str) -> SbiRequest {
+        make_request(
+            "POST",
+            "/npcf-am-policy-control/v1/policies",
+            Some(serde_json::json!({
+                "supi": supi,
+                "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/1613",
+                "suppFeat": "0",
+                "rfsp": 1,
+            })),
+        )
     }
 
     /// #1613: a UDR the NRF lists but that gives no answer is an outage, like a
     /// 5xx (#1597): an AM policy create is refused 500 SYSTEM_FAILURE (TS 29.500
     /// Table 5.2.7.2-1) and leaves no association, whether the UDR refuses the
     /// connection or accepts it and never answers (the read's 3 s bound expires).
-    /// "No UDR deployed" (the NRF lists none) and an NRF that does not answer keep
-    /// the local default, as before.
+    /// An NRF that lists no UDR, with none ever discovered, keeps the local
+    /// default.
     ///
     /// REVERT-VERIFIED: with `bounded_udr_read` mapping a no-answer read to
     /// `Ok(None)` again, both no-answer creates answer 201 with no restrictions.
@@ -8436,25 +8537,21 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         pcf_context_init(64, 64);
-        let create = |supi: &str| {
-            make_request(
-                "POST",
-                "/npcf-am-policy-control/v1/policies",
-                Some(serde_json::json!({
-                    "supi": supi,
-                    "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/1613",
-                    "suppFeat": "0",
-                })),
-            )
-        };
         let association = |supi: &str| pcf_self().read().unwrap().ue_am_find_by_supi(supi);
-        let refused = nextgcore_sbi::test_support::down_port();
-        let udr_port = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(refused.port()));
-        let nrf = start_mock_nrf_1613(udr_port.clone()).await;
+
+        // No UDR deployed: the NRF lists none, the local default applies.
+        let udr_port = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let (nrf, _nrf_uri) = start_mock_nrf_1613(udr_port.clone()).await;
+        let supi = "imsi-001010000016133";
+        let resp = pcf_sbi_request_handler(am_create_1613(supi)).await;
+        assert_eq!(resp.status, 201, "no UDR deployed: {:?}", resp.http.content);
+        assert!(association(supi).is_some());
 
         // A listed UDR that refuses the connection.
+        let refused = nextgcore_sbi::test_support::down_port();
+        udr_port.store(refused.port(), Ordering::SeqCst);
         let supi = "imsi-001010000016131";
-        let resp = pcf_sbi_request_handler(create(supi)).await;
+        let resp = pcf_sbi_request_handler(am_create_1613(supi)).await;
         assert_eq!(resp.status, 500, "{:?}", resp.http.content);
         assert_eq!(problem_cause_1597(&resp), "SYSTEM_FAILURE");
         assert!(
@@ -8468,7 +8565,7 @@ mod tests {
         let _silent = silent.listen();
         let supi = "imsi-001010000016132";
         let started = std::time::Instant::now();
-        let resp = pcf_sbi_request_handler(create(supi)).await;
+        let resp = pcf_sbi_request_handler(am_create_1613(supi)).await;
         assert_eq!(resp.status, 500, "{:?}", resp.http.content);
         assert_eq!(problem_cause_1597(&resp), "SYSTEM_FAILURE");
         assert!(
@@ -8480,61 +8577,170 @@ mod tests {
             "the read is bounded: {:?}",
             started.elapsed()
         );
-
-        // No UDR deployed: the NRF lists none, the local default applies.
-        udr_port.store(0, Ordering::SeqCst);
-        let supi = "imsi-001010000016133";
-        let resp = pcf_sbi_request_handler(create(supi)).await;
-        assert_eq!(resp.status, 201, "no UDR deployed: {:?}", resp.http.content);
-        assert!(association(supi).is_some());
         nrf.stop().await.ok();
-
-        // An NRF that does not answer says nothing about a UDR: local default too.
-        let no_nrf = nextgcore_sbi::test_support::down_port();
-        crate::test_support::point_nrf_at(format!("http://127.0.0.1:{}", no_nrf.port())).await;
-        let supi = "imsi-001010000016134";
-        let resp = pcf_sbi_request_handler(create(supi)).await;
-        assert_eq!(resp.status, 201, "NRF down: {:?}", resp.http.content);
-        crate::test_support::point_nrf_at(String::new()).await;
         drop(refused);
+    }
+
+    /// #1621 review M1: the UDR the PCF discovered is remembered for the NRF's
+    /// `validityPeriod` (TS 29.510 Table 6.2.6.2.2-1). When the NRF later lists no
+    /// UDR (a crashed UDR goes SUSPENDED and is no longer discoverable, TS 29.510
+    /// §5.2.2.3.2) or stops answering, the create reads the remembered UDR: an
+    /// outage there is refused 500, and a UDR still serving keeps authorising from
+    /// the subscription. Only a PCF that never discovered a UDR and finds the NRF
+    /// down keeps the local default (the `decision` case).
+    ///
+    /// REVERT-VERIFIED: without the remembered UDR, the creates after the NRF
+    /// stopped listing it answer 201 with the local default.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn a_create_reads_the_last_discovered_udr_when_the_nrf_cannot_name_one_1621() {
+        use std::sync::atomic::Ordering;
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let mode = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(UDR_OK_1621));
+        let (udr, port) = start_udr_1621(mode.clone()).await;
+        let udr_port = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(port));
+        let (nrf, _nrf_uri) = start_mock_nrf_1613(udr_port.clone()).await;
+        let rfsp = |resp: &SbiResponse| {
+            serde_json::from_str::<serde_json::Value>(resp.http.content.as_deref().unwrap_or("{}"))
+                .unwrap_or_default()["rfsp"]
+                .clone()
+        };
+
+        // 1. The NRF lists the UDR: the provisioned RFSP is authorised.
+        let resp = pcf_sbi_request_handler(am_create_1613("imsi-001010000016211")).await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        assert_eq!(rfsp(&resp), 5);
+
+        // 2. The NRF lists none (the UDR went SUSPENDED) and the UDR fails: refused.
+        udr_port.store(0, Ordering::SeqCst);
+        mode.store(500, Ordering::SeqCst);
+        let resp = pcf_sbi_request_handler(am_create_1613("imsi-001010000016212")).await;
+        assert_eq!(resp.status, 500, "{:?}", resp.http.content);
+        assert_eq!(problem_cause_1597(&resp), "SYSTEM_FAILURE");
+
+        // 3. The NRF lists none but the UDR still serves: authorised from it.
+        mode.store(UDR_OK_1621, Ordering::SeqCst);
+        let resp = pcf_sbi_request_handler(am_create_1613("imsi-001010000016213")).await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        assert_eq!(rfsp(&resp), 5, "read from the remembered UDR");
+
+        // 4. The NRF is down and the UDR fails: refused, not the default.
+        nrf.stop().await.ok();
+        mode.store(503, Ordering::SeqCst);
+        let resp = pcf_sbi_request_handler(am_create_1613("imsi-001010000016214")).await;
+        assert_eq!(
+            resp.status, 500,
+            "NRF down, UDR failing: {:?}",
+            resp.http.content
+        );
+
+        // 5. Never discovered a UDR, NRF down: the local default (the `decision`
+        //    case, #1621 review M1).
+        crate::sbi_path::forget_udr();
+        let resp = pcf_sbi_request_handler(am_create_1613("imsi-001010000016215")).await;
+        assert_eq!(resp.status, 201, "nothing known: {:?}", resp.http.content);
+        udr.stop().await.ok();
+    }
+
+    /// #1621 review M2: only a 404 means "nothing provisioned". Any other 4xx (a
+    /// 403 from a token scope misconfiguration, a 400), a 3xx, and a 200 whose
+    /// body is empty or not JSON refuse the create 500 SYSTEM_FAILURE, as a 5xx
+    /// does, instead of authorising the unrestricted default.
+    ///
+    /// REVERT-VERIFIED: with `bounded_udr_read` falling back on a non-5xx error
+    /// again, each of these creates answers 201.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn only_a_404_from_the_udr_means_nothing_provisioned_1621() {
+        use std::sync::atomic::Ordering;
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let mode = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(UDR_OK_1621));
+        let (udr, port) = start_udr_1621(mode.clone()).await;
+        let (nrf, _nrf_uri) =
+            start_mock_nrf_1613(std::sync::Arc::new(std::sync::atomic::AtomicU16::new(port))).await;
+        for (n, answer) in (0u32..).zip([403, 400, 307, UDR_GARBLED_1621, UDR_EMPTY_1621]) {
+            mode.store(answer, Ordering::SeqCst);
+            let supi = format!("imsi-00101000001622{n}");
+            let resp = pcf_sbi_request_handler(am_create_1613(&supi)).await;
+            assert_eq!(
+                resp.status, 500,
+                "UDR answer {answer}: {:?}",
+                resp.http.content
+            );
+            assert_eq!(
+                problem_cause_1597(&resp),
+                "SYSTEM_FAILURE",
+                "UDR answer {answer}"
+            );
+            assert!(
+                pcf_self()
+                    .read()
+                    .unwrap()
+                    .ue_am_find_by_supi(&supi)
+                    .is_none(),
+                "UDR answer {answer} leaves no association"
+            );
+        }
+        // The control: a 404 is "nothing provisioned".
+        mode.store(404, Ordering::SeqCst);
+        let resp = pcf_sbi_request_handler(am_create_1613("imsi-001010000016229")).await;
+        assert_eq!(
+            resp.status, 201,
+            "404 is not provisioned: {:?}",
+            resp.http.content
+        );
+        nrf.stop().await.ok();
+        udr.stop().await.ok();
     }
 
     /// #1613: an SM policy create whose listed UDR refuses the connection is
     /// refused 500 SYSTEM_FAILURE and leaves no session, as for a 5xx (#1597).
+    /// #1621 review B1: the same create for an Emergency DN (`sos`, the default
+    /// `pcf.policy.emergency_dnns`) does no UDR subscription check (TS 29.512
+    /// §4.2.2.2, 29512-k00.txt:3576-3583) and is authorised 201.
     ///
     /// REVERT-VERIFIED: with a no-answer read mapped to `Ok(None)` again, the
-    /// create answers 201 with the local default.
+    /// `internet` create answers 201; with the Emergency DN read from the UDR
+    /// again, the `sos` create answers 500.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn sm_policy_create_refuses_a_udr_that_does_not_answer_1613() {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _emergency = crate::test_support::emergency_dnns(crate::emergency_dnn::DEFAULT);
         pcf_context_init(64, 64);
         let refused = nextgcore_sbi::test_support::down_port();
         let udr_port = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(refused.port()));
-        let nrf = start_mock_nrf_1613(udr_port).await;
-        let supi = "imsi-001010000016135";
-        let mut body = full_create_body(supi, 5);
-        body["ipv4Address"] = serde_json::json!("10.161.3.1");
-        let resp = pcf_sbi_request_handler(make_request(
-            "POST",
-            "/npcf-smpolicycontrol/v1/sm-policies",
-            Some(body),
-        ))
-        .await;
+        let (nrf, _nrf_uri) = start_mock_nrf_1613(udr_port).await;
+        let create = |supi: &str, dnn: &str, ip: &str| {
+            let mut body = full_create_body(supi, 5);
+            body["dnn"] = serde_json::json!(dnn);
+            body["ipv4Address"] = serde_json::json!(ip);
+            make_request("POST", "/npcf-smpolicycontrol/v1/sm-policies", Some(body))
+        };
+        let session = |ip: &str| pcf_self().read().unwrap().sess_find_by_ipv4addr(ip);
+
+        let resp =
+            pcf_sbi_request_handler(create("imsi-001010000016135", "internet", "10.161.3.1")).await;
         assert_eq!(resp.status, 500, "{:?}", resp.http.content);
         assert_eq!(problem_cause_1597(&resp), "SYSTEM_FAILURE");
         assert!(
-            pcf_self()
-                .read()
-                .unwrap()
-                .sess_find_by_ipv4addr("10.161.3.1")
-                .is_none(),
+            session("10.161.3.1").is_none(),
             "a refused create leaves no session"
         );
+
+        let resp =
+            pcf_sbi_request_handler(create("imsi-001010000016136", "sos", "10.161.3.2")).await;
+        assert_eq!(resp.status, 201, "an Emergency DN: {:?}", resp.http.content);
+        assert!(session("10.161.3.2").is_some());
         nrf.stop().await.ok();
-        crate::test_support::point_nrf_at(String::new()).await;
         drop(refused);
     }
 

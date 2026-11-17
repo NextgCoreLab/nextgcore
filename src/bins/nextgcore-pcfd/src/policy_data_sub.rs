@@ -154,6 +154,11 @@ pub async fn subscribe_once(stopping: &impl Fn() -> bool) -> Attempt {
         },
         Err(e) => return Attempt::Failed(format!("UDR discovery failed: {e}")),
     };
+    // #1621 review M1: the create path reads this UDR when the NRF later fails or
+    // stops listing it (a crashed UDR goes SUSPENDED).
+    if let Some(nrf_uri) = nextgcore_sbi::context::global_context().get_nrf_uri().await {
+        crate::sbi_path::remember_udr(&nrf_uri, &udr, None);
+    }
     if stopping() {
         return Attempt::NotYet("shutting down");
     }
