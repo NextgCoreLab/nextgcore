@@ -7287,6 +7287,114 @@ mod tests {
         }
     }
 
+    /// Every way a Create/Update PDR body `body` can carry a too-short reference
+    /// (#1616): its Precedence, FAR ID, URR ID or QER ID (each 4 octets, TS
+    /// 29.244 §8.2.11, §8.2.74, §8.2.54, §8.2.75) cut to 0..3 octets, and a
+    /// second URR ID or QER ID that is short after a full first one.
+    fn short_pdr_references_1616(body: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
+        let mut out = Vec::new();
+        for short in short_ids_1605(4) {
+            for (name, ie) in [
+                ("Precedence", pfcp_ie::PRECEDENCE),
+                ("FAR ID", pfcp_ie::FAR_ID),
+                ("URR ID", pfcp_ie::URR_ID),
+                ("QER ID", pfcp_ie::QER_ID),
+            ] {
+                out.push((name, with_short_id_1605(body, ie, &short)));
+            }
+            for (name, ie) in [
+                ("second URR ID", pfcp_ie::URR_ID),
+                ("second QER ID", pfcp_ie::QER_ID),
+            ] {
+                let mut b = crate::n4_build::PfcpMessageBuilder::new();
+                b.add_tlv(ie, &short);
+                let mut v = body.to_vec();
+                v.extend_from_slice(&b.build());
+                out.push((name, v));
+            }
+        }
+        out
+    }
+
+    /// **#1616, Session Establishment.** A Create PDR whose Precedence, FAR ID,
+    /// URR ID or QER ID is shorter than 4 octets carries a semantically invalid
+    /// value: the request is refused with "Mandatory IE incorrect" and the
+    /// Create PDR as the Offending IE (TS 29.244 §7.6.8), and no session is
+    /// created. The short IE used to be skipped, so the PDR was installed with
+    /// no FAR, without the URR or QER, or at precedence 0, and accepted.
+    #[tokio::test]
+    async fn an_establishment_pdr_with_a_short_reference_is_mandatory_ie_incorrect_1616() {
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        let pdr = pdr_body(1, 100, 1, 1, 1);
+        let far = far_body(1, 0x02);
+        let urr = vec![(pfcp_ie::CREATE_URR, urr_body(1, None, Some(10), None))];
+        let cases = short_pdr_references_1616(&pdr);
+        assert_eq!(cases.len(), 24);
+        for (seid, (name, short_pdr)) in (0x1616_0000u64..).zip(cases) {
+            let resp = establish_1598(&smf, addr, seid, &short_pdr, &far, &urr).await;
+            assert_eq!(
+                cause_and_offending_1598(&resp),
+                (
+                    PfcpCause::MandatoryIeIncorrect as u8,
+                    Some(pfcp_ie::CREATE_PDR)
+                ),
+                "Create PDR with a short {name} (seid {seid:#x})"
+            );
+            assert!(
+                server.sessions.read().await.is_empty(),
+                "a rejected establishment creates no session (short {name})"
+            );
+        }
+        // The same message with full-length references is accepted.
+        let resp = establish_1598(&smf, addr, 0x1616_ffff, &pdr, &far, &urr).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+    }
+
+    /// **#1616, Session Modification.** A Create PDR or an Update PDR with a
+    /// too-short Precedence, FAR ID, URR ID or QER ID is refused with
+    /// "Mandatory IE incorrect" naming the grouped IE (TS 29.244 §7.6.8), and
+    /// the session's rules are unchanged. It used to be accepted, the Create
+    /// installing a PDR with no FAR (or at precedence 0) and the Update
+    /// rewriting PDR 1 the same way.
+    #[tokio::test]
+    async fn a_modification_pdr_with_a_short_reference_is_mandatory_ie_incorrect_1616() {
+        let (server, smf, addr, _rx, _dp, upf_seid) = established_session().await;
+        let mut cases: Vec<(u16, &'static str, Vec<u8>)> = Vec::new();
+        for (grouped, pdr_id) in [(pfcp_ie::CREATE_PDR, 7), (pfcp_ie::UPDATE_PDR, 1)] {
+            for (name, body) in short_pdr_references_1616(&pdr_body(pdr_id, 50, 1, 1, 1)) {
+                cases.push((grouped, name, body));
+            }
+        }
+        assert_eq!(cases.len(), 48);
+        for (seq, (grouped, name, body)) in (10u32..).zip(cases) {
+            let mut b = crate::n4_build::PfcpMessageBuilder::new();
+            b.add_tlv(grouped, &body);
+            let resp = exchange(
+                &smf,
+                addr,
+                &encode_pfcp(52, Some(upf_seid), seq, &b.build()),
+            )
+            .await;
+            assert_eq!(
+                cause_and_offending_1598(&resp),
+                (PfcpCause::MandatoryIeIncorrect as u8, Some(grouped)),
+                "IE {grouped} with a short {name} (seq {seq})"
+            );
+            let sessions = server.sessions.read().await;
+            let rules = &sessions.get(&upf_seid).expect("session kept").rules;
+            assert_eq!(
+                rules.pdr_ids.iter().copied().collect::<Vec<_>>(),
+                vec![1],
+                "the refused IE {grouped} (short {name}) added no PDR"
+            );
+        }
+        // The same Create PDR with full-length references is accepted.
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::CREATE_PDR, &pdr_body(7, 50, 1, 1, 1));
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 99, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+    }
+
     /// The Usage Report Trigger octets carried by each Usage Report in a Session
     /// Report Request (#80, TS 29.244 §8.2.19).
     ///
