@@ -37975,6 +37975,82 @@ mod tests {
         plain.stop().await.expect("sink stop");
     }
 
+    /// **#1734** (the #403 E2E stage): a LOCATION_REPORT subscriber that wants the
+    /// UE's current location asks with the immediateFlag and gets it in the subscribe
+    /// response, with no location change needed to trigger it. TS 29.518 §5.3.2.2.2
+    /// (`29518-k00.txt:5702-5705`): "the AMF shall include the current status of the
+    /// events subscribed, if available (e.g. last known location information is
+    /// included if the subscribed event is LOCATION_REPORT)"; Table 6.2.6.2.3-1
+    /// `immediateFlag` (`:21370`). A Service Request from the cell the UE registered in
+    /// is no location change (#1424), so this is how a subscriber created after the
+    /// registration learns where the UE is.
+    ///
+    /// REVERT-VERIFIED: without the `LOCATION_REPORT` arm of `build_immediate_reports`,
+    /// the response carries no report.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_immediate_location_subscription_gets_the_current_location_1734() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let supi = "imsi-001010000173401";
+        let mut ue = idle_registered_ue(17_160_201);
+        ue.amf_ue.supi = Some(supi.to_string());
+        ue.amf_ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        ue.amf_ue.nr_tai.tac = 0x17_1602;
+        ue.amf_ue.nr_cgi.plmn_id = PlmnId::new("001", "01");
+        ue.amf_ue.nr_cgi.cell_id = 0x0017_1602;
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_publish(&ue.amf_ue, 51, 1);
+        }
+        let subscribe = |supi: &str, tag: &str| {
+            crate::namf_server::namf_request_handler(
+                nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
+                    .with_json_body(&serde_json::json!({ "subscription": {
+                        "eventList": [{ "type": "LOCATION_REPORT", "immediateFlag": true }],
+                        "eventNotifyUri": format!("http://127.0.0.1:9/notify/{tag}"),
+                        "notifyCorrelationId": format!("corr-{tag}"),
+                        "nfId": "3fa85f64-5717-4562-b3fc-2c963f661734",
+                        "supi": supi,
+                    }}))
+                    .expect("json"),
+            )
+        };
+
+        let resp = subscribe(supi, "1734-immediate").await;
+        assert_eq!(resp.status, 201, "the subscription is created");
+        let _sub = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).expect("JSON");
+        let report = &v["reportList"][0];
+        assert_eq!(report["type"], "LOCATION_REPORT", "{v}");
+        assert_eq!(report["supi"], supi, "{v}");
+        let nr = &report["location"]["nrLocation"];
+        assert_eq!(nr["tai"]["plmnId"]["mcc"], "001", "{v}");
+        assert_eq!(nr["tai"]["plmnId"]["mnc"], "01", "{v}");
+        assert_eq!(nr["tai"]["tac"], "171602", "the UE's stored TAC; {v}");
+        assert_eq!(
+            nr["ncgi"]["nrCellId"], "000171602",
+            "the UE's stored cell; {v}"
+        );
+
+        // A subscription for a UE the AMF does not serve has no location to report.
+        let resp = subscribe("imsi-001019999173401", "1734-unknown").await;
+        assert_eq!(resp.status, 201, "the subscription is created");
+        let _unknown = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).expect("JSON");
+        assert!(
+            v["reportList"].as_array().is_none_or(|l| l.is_empty()),
+            "no report for an unknown UE: {v}"
+        );
+
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().expect("ctx lock");
+        guard.amf_ue_unpublish(ue.amf_ue.id);
+    }
+
     /// **#1549**, TS 29.518 §5.3.1 / §6.2 (`29518-k00.txt:23968-23978`): a UE that
     /// moved while CM-IDLE out of a subscribed Area of Interest comes back with a
     /// protected mobility registration update, and its Registration Accept reports
