@@ -3269,6 +3269,19 @@ thread_local! {
         const { std::cell::Cell::new(0) };
 }
 
+// Test-only (#1689 review): N1N2 failure notifications sent on this thread.
+#[cfg(test)]
+thread_local! {
+    static FAILURE_NOTIFICATIONS_ON_THIS_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: [`send_n1n2_failure_notification`] calls on this thread so far.
+#[cfg(test)]
+pub(crate) fn failure_notifications_on_this_thread() -> u64 {
+    FAILURE_NOTIFICATIONS_ON_THIS_THREAD.with(std::cell::Cell::get)
+}
+
 /// Test-only: CONNECTED [`fire_connectivity_state_report`] calls on this thread so
 /// far.
 #[cfg(test)]
@@ -3685,6 +3698,8 @@ fn ue_not_reachable_error(ue_context_id: &str, failure_uri: Option<&str>) -> Sbi
 /// (TS 29.518 §6.1.6.2.8: cause and n1n2MsgDataUri are both mandatory).
 /// Fire-and-forget on a background task with bounded timeouts.
 pub fn send_n1n2_failure_notification(notify_uri: String, cause: &str, n1n2_msg_data_uri: String) {
+    #[cfg(test)]
+    FAILURE_NOTIFICATIONS_ON_THIS_THREAD.with(|c| c.set(c.get() + 1));
     let cause = cause.to_string();
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         log::debug!("N1N2 failure notification skipped (no tokio runtime)");
