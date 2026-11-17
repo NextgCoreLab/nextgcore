@@ -13,6 +13,8 @@ LABEL org.opencontainers.image.title="NextGCore Core Runtime"
 LABEL org.opencontainers.image.description="Shared base image for all NextGCore network functions"
 
 # Install all runtime dependencies (shared across all NFs)
+# openssl: the compose stacks' one-shot `sbi-tls` service runs
+# certs/generate-dev-certs.sh in this image to issue the dev SBI PKI (#1617).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
@@ -21,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iptables \
     iputils-ping \
     curl \
+    openssl \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user

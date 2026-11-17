@@ -376,6 +376,8 @@ async fn pair_with(mode: &str, anlf_id: &'static str, budget: Duration) -> Pair 
     let anlf_listener = nextgcore_sbi::test_support::bound_listener();
     let anlf_port = anlf_listener.port();
     let anlf_srv = nwdaf_on(anlf_listener, anlf_slot.clone(), anlf_ctx.clone()).await;
+    // A plaintext stand-in NRF: the dev profile, or #1617's NRF client dials https.
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
     let (nrf_srv, nrf_port) = nrf(anlf_id, anlf_port).await;
     let mtlf_listener = nextgcore_sbi::test_support::bound_listener();
     let mtlf_port = mtlf_listener.port();
@@ -962,6 +964,8 @@ async fn a_deregister_during_the_subscribe_leaves_nothing() {
     let anlf_listener = nextgcore_sbi::test_support::bound_listener();
     let anlf_port = anlf_listener.port();
     let anlf_srv = nwdaf_on(anlf_listener, Arc::new(Mutex::new(anlf)), context(anlf_id)).await;
+    // A plaintext stand-in NRF: the dev profile, or #1617's NRF client dials https.
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
     // An NRF that answers discovery only when released.
     let asked = Arc::new(AtomicBool::new(false));
     let release = Arc::new(tokio::sync::Notify::new());

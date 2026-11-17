@@ -1004,7 +1004,11 @@ jobs:
           echo "=== Container status ==="
           docker compose ps
           echo "=== NRF health ==="
-          curl -sf http://172.23.0.10:7777/healthz || echo "NRF not responding"
+          # #1617: the NRF serves TLS (client_auth optional); probe it from its own
+          # container, which holds the CA (the runner does not: the PKI lives in
+          # the stack's volumes).
+          docker compose exec -T nrf curl -sf --cacert /etc/nextgcore/certs/ca.crt \
+            https://172.23.0.10:7777/healthz || echo "NRF not responding"
           echo "=== AMF health ==="
           curl -sf http://172.23.0.5:7777/healthz || echo "AMF not responding"
 
@@ -1034,6 +1038,47 @@ jobs:
             if $ok; then echo "$nf: /metrics up ($series)"; else echo "$nf: /metrics DOWN at $addr:9090"; failed=1; fi
           done
           exit $failed
+
+      # #1617 (step d): every NF reaches the NRF over TLS and presents its own
+      # certificate. POSITIVE half: each core NF type is REGISTERED at the NRF, which
+      # since this change serves only TLS, so the registration crossed the TLS
+      # listener. NEGATIVE half, which the positive cannot give: the NRF counts every
+      # NFRegister / NFUpdate (heartbeat) / NFDeregister whose caller presented no
+      # verified certificate identity (nrf_nf_management_unverified_total); it must
+      # stay 0, so no NF registered or heartbeated without its certificate. Read
+      # after the registrations, and again at the end of the bounded wait, so a
+      # heartbeat sent without a certificate is seen too.
+      - name: Every NF registers at the NRF over TLS with its certificate (#1617)
+        run: |
+          set -euo pipefail
+          want="AUSF UDM UDR PCF NSSF BSF AMF SMF"
+          m=""
+          for _ in $(seq 1 45); do
+            m="$(curl -sf --max-time 3 http://172.23.0.10:9090/metrics || true)"
+            missing=""
+            for t in $want; do
+              grep -Eq "^nrf_registered_nf_instances\{nf_type=\"$t\",nf_status=\"REGISTERED\"\} [1-9]" <<<"$m" \
+                || missing="$missing $t"
+            done
+            [ -z "$missing" ] && break
+            sleep 2
+          done
+          grep '^nrf_registered_nf_instances' <<<"$m" || true
+          if [ -n "$missing" ]; then
+            echo "::error::not REGISTERED at the NRF over TLS:$missing"
+            docker compose logs --tail=40 nrf; exit 1
+          fi
+          # Long enough for every NF to send heartbeats (NFUpdate PATCH) too.
+          sleep 15
+          m="$(curl -sf --max-time 3 http://172.23.0.10:9090/metrics)"
+          grep '^nrf_nf_management_unverified_total' <<<"$m" \
+            || { echo "::error::the NRF did not expose nrf_nf_management_unverified_total"; exit 1; }
+          n="$(awk '/^nrf_nf_management_unverified_total /{print $2}' <<<"$m")"
+          if [ "$n" != 0 ]; then
+            echo "::error::$n NF-management requests reached the NRF without a verified client certificate"
+            docker compose logs --tail=60 nrf; exit 1
+          fi
+          echo "all of $want REGISTERED over TLS; 0 unverified NF-management requests"
 
       # ====================================================================
       # Issue #397: the Namf_EventExposure DELIVERY assertion.
@@ -1859,8 +1904,10 @@ jobs:
           # POSITIVELY below. `tee` keeps it in the log for a human too, and the
           # pipefail guard means the probe's own exit code still gates the step.
           set -o pipefail
+          # #1617: the token endpoint is on the NRF's TLS listener; the probe's
+          # OAuth2 client uses the AMF's NEXTGCORE_NRF_TLS_* (CA, amf.crt pair).
           docker compose $C exec -T amf /tmp/cca_token_probe \
-            http://172.23.0.10:7777 \
+            https://172.23.0.10:7777 \
             /var/lib/nextgcore/cca/amf-cca.key \
             6b1d7e3c-0000-4000-8000-000000000af0 \
             AMF UDM nudm-sdm | tee /tmp/probe-amf.log
@@ -1903,8 +1950,13 @@ jobs:
           # authentication failure — still fails the step.
           docker cp binaries/cca_token_probe nextgcore-nrf:/tmp/cca_token_probe
           docker compose $C exec -T --user root nrf chmod 0755 /tmp/cca_token_probe
-          docker compose $C exec -T -e CCA_PROBE_AUTH_ONLY=1 nrf /tmp/cca_token_probe \
-            http://172.23.0.10:7777 \
+          # #1617: over the NRF's TLS listener, with the NRF's own pair (nrf.crt
+          # names its pinned nfInstanceId).
+          docker compose $C exec -T -e CCA_PROBE_AUTH_ONLY=1 \
+            -e NEXTGCORE_NRF_TLS_CLIENT_CERT=/etc/nextgcore/certs/nrf.crt \
+            -e NEXTGCORE_NRF_TLS_CLIENT_KEY=/etc/nextgcore/certs/nrf.key \
+            nrf /tmp/cca_token_probe \
+            https://172.23.0.10:7777 \
             /var/lib/nextgcore/cca/nrf-cca.key \
             6b1d7e3c-0000-4000-8000-0000000000f0 \
             NRF UDM nudm-sdm

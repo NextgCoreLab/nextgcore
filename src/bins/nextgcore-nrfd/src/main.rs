@@ -11301,10 +11301,11 @@ mod server_tls_tests_1617 {
         }
     }
 
-    /// Every shipped NRF config still parses, and still serves h2c: this step
-    /// adds the switch, the deployments turn it on (#1617 step d).
+    /// Every shipped compose NRF config parses and serves TLS with client auth
+    /// optional, from the stack's own certificate volume (#1617 step d: the
+    /// one listener, a certificate requested but not required).
     #[test]
-    fn every_shipped_nrf_config_parses_and_keeps_tls_off_1617() {
+    fn every_shipped_nrf_config_serves_tls_with_optional_client_auth_1617() {
         let dir = repo_root().join("docker/rust/configs");
         let mut checked = 0;
         for sub in std::fs::read_dir(&dir).unwrap() {
@@ -11330,14 +11331,19 @@ mod server_tls_tests_1617 {
                     .and_then(|s| s.tls.as_ref());
                 assert_eq!(
                     resolve_server_tls(&TlsFlags::default(), env(&[]), tls).unwrap(),
-                    None,
+                    Some(NrfServerTls {
+                        cert: "/etc/nextgcore/certs/nrf.crt".into(),
+                        key: "/etc/nextgcore/certs/nrf.key".into(),
+                        ca: "/etc/nextgcore/certs/ca.crt".into(),
+                        client_auth: ClientAuth::Optional,
+                    }),
                     "{}",
                     f.display()
                 );
                 checked += 1;
             }
         }
-        assert!(checked >= 4, "found {checked} NRF configs");
+        assert!(checked >= 5, "found {checked} NRF configs");
     }
 
     fn repo_root() -> PathBuf {

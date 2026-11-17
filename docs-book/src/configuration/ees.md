@@ -22,7 +22,7 @@ ees:
         advertise: 172.23.0.31
         port: 7777
   nrf:
-    uri: http://172.23.0.10:7777
+    uri: https://172.23.0.10:7777
 ```
 
 The docker deployment does its real configuration on the command line: `command: ["--sbi-addr", "172.23.0.31", "--sbi-port", "7777"]`. It passes no `--nrf-uri`, so that EES has no NRF and sends no access token to 5GC NFs (see `--nrf-uri` below, #1529).

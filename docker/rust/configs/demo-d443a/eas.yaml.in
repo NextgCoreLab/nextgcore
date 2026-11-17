@@ -10,7 +10,7 @@ check_interval_s: 2
 ees:
   api_root: "http://172.23.0.31:7777"
   oauth2:
-    nrf: "http://172.23.0.10:7777"
+    nrf: "https://172.23.0.10:7777"
     nf_instance_id: "@ID@"
     cca_key_file: "/tmp/@EAS@.cca.key"
     public_jwk_dir: "/var/lib/d443a/cca"

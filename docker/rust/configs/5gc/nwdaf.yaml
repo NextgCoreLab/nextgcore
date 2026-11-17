@@ -20,6 +20,6 @@ nwdaf:
     # nrf_profile:
     #   allowed_nf_types: [PCF, NSSF, AMF, SMF, NEF, AF, CEF, LMF, NWDAF, DCCF, ADRF, UDM, NRF, SCP, UPF]
   nrf:
-    uri: http://172.23.0.10:7777
+    uri: https://172.23.0.10:7777
   analytics:
     ml_model_dir: /var/lib/nextgcore/models
