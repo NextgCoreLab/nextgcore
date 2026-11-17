@@ -7,6 +7,31 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
+/// The registry key of an NF Instance ID (#1633): a UUID in lower case. TS 29.510
+/// §5.2.2.2.2: "if the NF Service Consumer sends a request where the UUIDs are
+/// formatted with upper-case hexadecimal letters, the NRF shall handle it as if
+/// the request had been formatted with lower-case characters". Anything that is
+/// not a UUID (TS 29.571 §5.3.2 makes the NF Instance ID one, but legacy and test
+/// identifiers exist) is kept as it is: its case is not known to be insignificant.
+pub fn canonical_nf_instance_id(id: &str) -> String {
+    let b = id.as_bytes();
+    let is_uuid = b.len() == 36
+        && b.iter().enumerate().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => *c == b'-',
+            _ => c.is_ascii_hexdigit(),
+        });
+    if is_uuid {
+        id.to_ascii_lowercase()
+    } else {
+        id.to_string()
+    }
+}
+
+/// Whether two NF Instance IDs name the same instance (#1633).
+pub fn same_nf_instance_id(a: &str, b: &str) -> bool {
+    canonical_nf_instance_id(a) == canonical_nf_instance_id(b)
+}
+
 /// NF Profile data structure
 #[derive(Debug, Clone, Default)]
 pub struct NfProfile {
@@ -152,8 +177,17 @@ impl NfProfile {
             })
             .unwrap_or_default();
 
+        // #1633: one registry key per NF instance, however the UUID is cased.
+        let nf_instance_id = canonical_nf_instance_id(&str_at("nfInstanceId").unwrap_or_default());
+        let mut attributes = doc.clone();
+        if let Some(obj) = attributes.as_object_mut() {
+            obj.insert(
+                "nfInstanceId".to_string(),
+                serde_json::Value::String(nf_instance_id.clone()),
+            );
+        }
         Ok(NfProfile {
-            nf_instance_id: str_at("nfInstanceId").unwrap_or_default(),
+            nf_instance_id,
             nf_type: str_at("nfType").unwrap_or_default(),
             nf_status: str_at("nfStatus").unwrap_or_default(),
             heartbeat_timer: doc
@@ -165,7 +199,7 @@ impl NfProfile {
             ipv6_addresses: str_vec("ipv6Addresses"),
             fqdn: str_at("fqdn"),
             nf_services,
-            attributes: doc.clone(),
+            attributes,
         })
     }
 
@@ -908,9 +942,18 @@ impl NfInstanceManager {
                 if let Some(status) = pd.get("nfStatus").and_then(|v| v.as_str()) {
                     profile.nf_status = status.to_string();
                 }
+                // #1633: `from_json` canonicalised the ID, so a mixed-case key
+                // persisted before #1633 lands on its canonical key, and two
+                // spellings of one instance become one entry (the later wins).
                 let id = profile.nf_instance_id.clone();
                 if id.is_empty() {
                     continue;
+                }
+                if self.profiles.read().is_ok_and(|p| p.contains_key(&id)) {
+                    log::warn!(
+                        "persisted NF registry held NF instance {id} under two spellings; \
+                         keeping one"
+                    );
                 }
                 // Re-create the per-instance FSM and store the profile without
                 // re-persisting (we are loading, not mutating).
@@ -939,12 +982,14 @@ impl NfInstanceManager {
 
     /// Find an NF instance by ID
     pub fn find_instance(&self, id: &str) -> Option<NfState> {
+        let id = canonical_nf_instance_id(id);
         let instances = self.instances.read().ok()?;
-        instances.get(id).map(|ctx| ctx.state())
+        instances.get(&id).map(|ctx| ctx.state())
     }
 
     /// Add a new NF instance
     pub fn add_instance(&self, id: String) -> bool {
+        let id = canonical_nf_instance_id(&id);
         if let Ok(mut instances) = self.instances.write() {
             if instances.contains_key(&id) {
                 return false;
@@ -960,6 +1005,8 @@ impl NfInstanceManager {
 
     /// Remove an NF instance
     pub fn remove_instance(&self, id: &str) -> bool {
+        let id = canonical_nf_instance_id(id);
+        let id = id.as_str();
         let removed = {
             if let Ok(mut instances) = self.instances.write() {
                 if let Some(mut ctx) = instances.remove(id) {
@@ -988,7 +1035,18 @@ impl NfInstanceManager {
     }
 
     /// Register an NF profile
-    pub fn register(&self, profile: NfProfile) -> Result<(), String> {
+    pub fn register(&self, mut profile: NfProfile) -> Result<(), String> {
+        // #1633: a profile built in code (not through `from_json`) is keyed the
+        // same way.
+        profile.nf_instance_id = canonical_nf_instance_id(&profile.nf_instance_id);
+        if let Some(obj) = profile.attributes.as_object_mut() {
+            if obj.contains_key("nfInstanceId") {
+                obj.insert(
+                    "nfInstanceId".to_string(),
+                    serde_json::Value::String(profile.nf_instance_id.clone()),
+                );
+            }
+        }
         let id = profile.nf_instance_id.clone();
 
         // Add instance FSM if new
@@ -1025,6 +1083,8 @@ impl NfInstanceManager {
     /// The NF is not deregistered yet - it will be auto-deregistered if no
     /// heartbeat is received within the grace period.
     pub fn suspend(&self, id: &str) -> bool {
+        let id = canonical_nf_instance_id(id);
+        let id = id.as_str();
         let changed = {
             if let Ok(mut profiles) = self.profiles.write() {
                 if let Some(profile) = profiles.get_mut(id) {
@@ -1052,6 +1112,8 @@ impl NfInstanceManager {
     ///
     /// Returns true only if the NF was SUSPENDED and is now REGISTERED again.
     pub fn reactivate(&self, id: &str) -> bool {
+        let id = canonical_nf_instance_id(id);
+        let id = id.as_str();
         let changed = {
             if let Ok(mut profiles) = self.profiles.write() {
                 if let Some(profile) = profiles.get_mut(id) {
@@ -1079,8 +1141,9 @@ impl NfInstanceManager {
 
     /// Check if an NF is suspended
     pub fn is_suspended(&self, id: &str) -> bool {
+        let id = canonical_nf_instance_id(id);
         if let Ok(profiles) = self.profiles.read() {
-            if let Some(profile) = profiles.get(id) {
+            if let Some(profile) = profiles.get(&id) {
                 return profile.nf_status == "SUSPENDED";
             }
         }
@@ -1089,8 +1152,9 @@ impl NfInstanceManager {
 
     /// Get an NF profile by ID
     pub fn get(&self, id: &str) -> Option<NfProfile> {
+        let id = canonical_nf_instance_id(id);
         let profiles = self.profiles.read().ok()?;
-        profiles.get(id).cloned()
+        profiles.get(&id).cloned()
     }
 
     /// List all NF profiles
@@ -1474,7 +1538,7 @@ pub fn nrf_nnrf_handle_nf_discover(
             if let Some(opts) = discovery_options {
                 // Filter by target NF instance ID
                 if let Some(ref target_id) = opts.target_nf_instance_id {
-                    if &profile.nf_instance_id != target_id {
+                    if !same_nf_instance_id(&profile.nf_instance_id, target_id) {
                         return false;
                     }
                 }
@@ -2108,7 +2172,11 @@ fn profile_matches(doc: &serde_json::Value, status: &str, query: &DiscoveryQuery
     }
 
     if let Some(ref target_id) = query.target_nf_instance_id {
-        if doc.get("nfInstanceId").and_then(|v| v.as_str()) != Some(target_id.as_str()) {
+        if !doc
+            .get("nfInstanceId")
+            .and_then(|v| v.as_str())
+            .is_some_and(|id| same_nf_instance_id(id, target_id))
+        {
             return false;
         }
     }
@@ -2258,6 +2326,51 @@ pub fn discover_profiles(query: &DiscoveryQuery) -> Vec<serde_json::Value> {
 
 #[cfg(test)]
 mod tests {
+    /// #1633: a UUID is canonical in lower case; anything else keeps its case.
+    #[test]
+    fn nf_instance_ids_are_canonicalised_only_when_they_are_uuids_1633() {
+        assert_eq!(
+            canonical_nf_instance_id("4947A69A-F61B-4BC1-B9DA-47C9C5D14B64"),
+            "4947a69a-f61b-4bc1-b9da-47c9c5d14b64"
+        );
+        assert_eq!(canonical_nf_instance_id("AMF-1"), "AMF-1");
+        assert_eq!(
+            canonical_nf_instance_id("4947A69A-F61B-4BC1-B9DA-47C9C5D14B6G"),
+            "4947A69A-F61B-4BC1-B9DA-47C9C5D14B6G",
+            "not hex"
+        );
+        assert!(same_nf_instance_id(
+            "4947a69a-f61b-4bc1-b9da-47c9c5d14b64",
+            "4947A69A-F61B-4bc1-B9DA-47C9C5D14B64"
+        ));
+        assert!(!same_nf_instance_id("amf-1", "AMF-1"));
+    }
+
+    /// #1633: a registry persisted before #1633 that holds one NF under two
+    /// spellings loads as one entry, under the canonical ID.
+    ///
+    /// REVERT-VERIFIED: without the canonicalisation in `from_json`, two entries load.
+    #[test]
+    fn a_persisted_mixed_case_registry_loads_as_one_entry_1633() {
+        let manager = NfInstanceManager::new();
+        let lower = "1633cccc-dddd-4eee-8fff-000011110002";
+        let doc = serde_json::json!({
+            "profiles": [
+                {"nfInstanceId": lower, "nfType": "CUSTOM_T1633B", "nfStatus": "REGISTERED"},
+                {"nfInstanceId": lower.to_ascii_uppercase(), "nfType": "CUSTOM_T1633B",
+                 "nfStatus": "SUSPENDED"},
+            ]
+        });
+        manager.restore_from(&doc);
+        assert_eq!(manager.list().len(), 1);
+        let p = manager
+            .get(&lower.to_ascii_uppercase())
+            .expect("by either spelling");
+        assert_eq!(p.nf_instance_id, lower);
+        assert_eq!(p.to_json()["nfInstanceId"], lower);
+        assert!(manager.find_instance(lower).is_some());
+    }
+
     use super::*;
 
     /// #1570: TS 29.510 Table 6.2.3.2.3.1-1 `ml-analytics-info-list`, the

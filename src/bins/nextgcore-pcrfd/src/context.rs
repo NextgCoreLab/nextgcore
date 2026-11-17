@@ -970,13 +970,13 @@ pub struct DiameterYaml {
     pub port_tls: Option<u16>,
 }
 
-/// The `pcrf:` section. Unknown keys are ignored: the shipped configs carry
-/// `freeDiameter:` and `metrics:` keys owned by other subsystems.
+/// The `pcrf:` section. Unknown keys are ignored without a warning.
 #[derive(Debug, Default, Deserialize)]
 pub struct PcrfSectionYaml {
     pub diameter: Option<DiameterYaml>,
-    /// Path to a freeDiameter-style config, recorded for diagnosis only; this
-    /// daemon does not parse that format.
+    /// Path to a freeDiameter-style config. [`pcrf_context_parse_config`] loads it
+    /// as the lower-precedence identity source: its Identity, Realm, first
+    /// ListenOn, Port and SecPort ([`apply_fd_conf`]).
     #[serde(rename = "freeDiameter")]
     pub free_diameter: Option<String>,
 }
@@ -1033,6 +1033,15 @@ pub fn pcrf_context_parse_config(config_path: &str) -> Result<(), String> {
     if let Some(path) = section.free_diameter {
         match nextgcore_diameter::fd_conf::FreeDiameterConf::load(&path) {
             Ok(conf) => {
+                // #1536 review: a recognised directive with a value that does not
+                // parse sets nothing, so the identity or listener falls back to
+                // the next source. Said, naming what was written, rather than
+                // silently. A warning, as an unreadable freeDiameter file is.
+                for statement in &conf.malformed {
+                    log::warn!(
+                        "{path}: '{statement}' does not parse; the directive is not applied"
+                    );
+                }
                 if !conf.ignored.is_empty() {
                     log::info!(
                         "{path}: directives not interpreted: {}",

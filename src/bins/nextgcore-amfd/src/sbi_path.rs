@@ -1154,6 +1154,13 @@ pub struct SmContextIdentity {
     /// priority establishment cause or subscription ([`priority_message_priority`]).
     /// `None` omits the header: the SMF then applies the default priority 24.
     pub message_priority: Option<u8>,
+    /// #1518: the UE's `sm_context_status_key`, from which the session's
+    /// `smContextStatusUri` token is derived ([`sm_context_status_token`]). `None`
+    /// sends the token-less URI.
+    pub sm_context_status_key: Option<String>,
+    /// #1518: the establishment's `sm_context_status_nonce` (one per new PDU
+    /// session). The token is sent only with both the key and the nonce.
+    pub sm_context_status_nonce: Option<String>,
 }
 
 /// #1222: the `RequestType` of SmContextCreateData (TS 29.502 §6.1.6.3.5) for the
@@ -1292,7 +1299,16 @@ fn build_create_sm_context_request(
         // URI"), because the SMF reaches Namf through this callback root.
         obj.insert(
             "smContextStatusUri".to_string(),
-            serde_json::json!(sm_context_status_uri(supi, pdu_session_id)),
+            serde_json::json!(sm_context_status_uri(
+                supi,
+                pdu_session_id,
+                identity
+                    .sm_context_status_key
+                    .as_deref()
+                    .zip(identity.sm_context_status_nonce.as_deref())
+                    .map(|(key, nonce)| sm_context_status_token(key, pdu_session_id, nonce))
+                    .as_deref()
+            )),
         );
     }
     if let Some(pei) = &identity.pei {
@@ -1674,6 +1690,7 @@ pub async fn call_smf_activate_up_connection(
 }
 
 /// SM Context Update response from SMF (with optional N1/N2 info)
+#[derive(Debug)]
 pub struct SmContextUpdateResponse {
     /// N1 SM message (NAS PDU Session Modification Command) - optional
     pub n1_sm_msg: Vec<u8>,
@@ -1862,12 +1879,6 @@ pub async fn call_smf_update_sm_context_with_n1(
         sm_context_ref,
         n1_sm_msg.len()
     );
-
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(smf_host, smf_port),
-        nextgcore_sbi::types::NfType::Smf,
-    );
-
     // UE-initiated modification: the UE's N1 container is carried as a
     // multipart/related 5gnas binary part referenced by RefToBinaryData
     // (smfd-02).
@@ -1875,7 +1886,47 @@ pub async fn call_smf_update_sm_context_with_n1(
         "n1SmMsg": { "contentId": "n1SmMsg" },
         "n2SmInfoType": "PDU_RES_MOD_REQ"
     });
+    update_sm_context_with_ue_n1(smf_host, smf_port, sm_context_ref, n1_sm_msg, body).await
+}
 
+/// Forward a UE's PDU SESSION RELEASE REQUEST to its SMF (#1637): an
+/// Nsmf_PDUSession_UpdateSMContext with the N1 SM container and the User Location
+/// Information (TS 23.502 §4.3.4.2 step 1a, `23502-k20.txt`; TS 29.502 §5.2.2.3.1).
+/// The SMF answers the PDU SESSION RELEASE COMMAND, and, when the user plane is
+/// active, the N2 PDU Session Resource Release Command Transfer (`PDU_RES_REL_CMD`,
+/// step 3a). A refusal carries its PDU SESSION RELEASE REJECT (TS 24.501 §6.4.3.4).
+pub async fn call_smf_update_sm_context_release_request(
+    smf_host: &str,
+    smf_port: u16,
+    sm_context_ref: &str,
+    n1_sm_msg: &[u8],
+    ue_location: Option<serde_json::Value>,
+) -> Result<SmContextUpdateResponse, SmContextUpdateRefusal> {
+    log::info!(
+        "Calling SMF SM Context Update (UE release request): ref={sm_context_ref}, n1_len={}",
+        n1_sm_msg.len()
+    );
+    let mut body = serde_json::json!({ "n1SmMsg": { "contentId": "n1SmMsg" } });
+    if let Some(loc) = ue_location {
+        body["ueLocation"] = loc;
+    }
+    update_sm_context_with_ue_n1(smf_host, smf_port, sm_context_ref, n1_sm_msg, body).await
+}
+
+/// POST `/sm-contexts/{ref}/modify` with `body` and the UE's `n1_sm_msg` as its
+/// `n1SmMsg` part. The answer's N1 and N2 SM information on a 2xx; on a 4xx/5xx,
+/// the SmContextUpdateError's N1, if any (#1590).
+async fn update_sm_context_with_ue_n1(
+    smf_host: &str,
+    smf_port: u16,
+    sm_context_ref: &str,
+    n1_sm_msg: &[u8],
+    body: serde_json::Value,
+) -> Result<SmContextUpdateResponse, SmContextUpdateRefusal> {
+    let client = crate::attach_oauth2(
+        SbiClient::for_peer(smf_host, smf_port),
+        nextgcore_sbi::types::NfType::Smf,
+    );
     let path = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/modify");
     let request = SbiRequest::post(&path)
         .with_body(body.to_string(), content_type::APPLICATION_JSON)
@@ -1892,31 +1943,26 @@ pub async fn call_smf_update_sm_context_with_n1(
             n1_sm_msg: None,
         })?;
 
+    let response_body: serde_json::Value = response
+        .http
+        .content
+        .as_deref()
+        .and_then(|c| serde_json::from_str(c).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+
     if !response.is_success() {
         // #1590, TS 29.502 §5.2.2.3.1 step 2b: a 4xx/5xx SmContextUpdateError carries
-        // "N1 SM information, if the SMF needs and can return a response to the UE".
-        // TS 24.501 §6.4.2.4.1: that is the SMF's PDU SESSION MODIFICATION REJECT,
-        // whose 5GSM cause is the SMF's to set. It goes to the UE as it is.
-        let root: serde_json::Value = response
-            .http
-            .content
-            .as_deref()
-            .and_then(|c| serde_json::from_str(c).ok())
-            .unwrap_or_default();
-        let n1_sm_msg = extract_binary_ref(&response, &root, "n1SmMsg").filter(|n1| !n1.is_empty());
+        // "N1 SM information, if the SMF needs and can return a response to the UE":
+        // its reject, whose 5GSM cause is the SMF's to set.
+        let n1_sm_msg =
+            extract_binary_ref(&response, &response_body, "n1SmMsg").filter(|n1| !n1.is_empty());
         return Err(SmContextUpdateRefusal {
             reason: format!("SMF update returned status {}", response.status),
             n1_sm_msg,
         });
     }
 
-    let response_body: serde_json::Value = match &response.http.content {
-        Some(content) => serde_json::from_str(content).unwrap_or(serde_json::json!({})),
-        None => serde_json::json!({}),
-    };
-
-    // N1 (PDU Session Modification Command) + N2 (QoS flow mod) from the SMF:
-    // multipart binary parts or legacy base64-in-JSON.
+    // The SMF's N1 and N2: multipart binary parts or legacy base64-in-JSON.
     let n1_sm_msg = extract_binary_ref(&response, &response_body, "n1SmMsg").unwrap_or_default();
     let n2_sm_info = extract_binary_ref(&response, &response_body, "n2SmInfo").unwrap_or_default();
 
@@ -3517,12 +3563,46 @@ pub fn advertised_sbi_scheme() -> &'static str {
 
 /// The absolute `smContextStatusUri` the AMF gives the SMF for PDU session
 /// `psi` of `supi` (#540, TS 29.502 §5.2.2.2.1). Routed by `namf_server` at
-/// `POST /namf-callback/v1/{supi}/sm-context-status/{psi}`.
-pub fn sm_context_status_uri(supi: &str, psi: u8) -> String {
-    format!(
-        "{}/namf-callback/v1/{supi}/sm-context-status/{psi}",
-        advertised_sbi_base()
-    )
+/// `POST /namf-callback/v1/{supi}/{psi}/sm-context-status/{token}`, `token` being
+/// [`sm_context_status_token`] of the session (#1518); without one, the token-less
+/// `POST /namf-callback/v1/{supi}/sm-context-status/{psi}` of before #1518.
+pub fn sm_context_status_uri(supi: &str, psi: u8, token: Option<&str>) -> String {
+    match token {
+        Some(token) => format!(
+            "{}/namf-callback/v1/{supi}/{psi}/sm-context-status/{token}",
+            advertised_sbi_base()
+        ),
+        None => format!(
+            "{}/namf-callback/v1/{supi}/sm-context-status/{psi}",
+            advertised_sbi_base()
+        ),
+    }
+}
+
+/// The `smContextStatusUri` token of the PDU session `psi` whose
+/// `sm_context_status_nonce` is `nonce`, for a UE whose `sm_context_status_key`
+/// is `key` (#1518): the first 128 bits of HMAC-SHA-256(`key`,
+/// "sm-context-status:" `psi` ":" `nonce`), as 32 hex digits.
+///
+/// One token per session: the SMF holding one session's URI cannot forge a
+/// notification about another (#1625 review m1), and a re-created PSI gets a new
+/// nonce, so the old session's token (an old SMF's, or a late retry) does not
+/// name the new one (round 2). The key never leaves the AMF.
+pub fn sm_context_status_token(key: &str, psi: u8, nonce: &str) -> String {
+    use hmac::Mac;
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key.as_bytes())
+        .expect("HMAC takes a key of any length");
+    mac.update(format!("sm-context-status:{psi}:{nonce}").as_bytes());
+    mac.finalize().into_bytes()[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// A fresh callback-URI token (#753, #1518): a v4 UUID in simple form, 122
+/// random bits.
+pub fn new_callback_token() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// The absolute Nudm_UECM `deregCallbackUri` the AMF registers for `supi`
@@ -3538,7 +3618,7 @@ pub fn dereg_callback_uri(supi: &str, token: &str) -> String {
 
 /// A fresh `deregCallbackUri` token for one Nudm_UECM registration (#753).
 pub fn new_dereg_callback_token() -> String {
-    uuid::Uuid::new_v4().simple().to_string()
+    new_callback_token()
 }
 
 /// This AMF's configured GUAMIs as a TS 29.571 `Guami` JSON array, for the
@@ -3607,11 +3687,18 @@ pub(crate) fn amf_id_hex(id: &crate::context::AmfId) -> String {
 /// §4.2.4 update/terminate notification leg could not have worked even once the PCF
 /// started sending it. It also named a path `namf_server` did not route, so the
 /// resource it advertised did not exist either.
-pub fn ue_policy_notification_uri(supi: &str) -> String {
-    format!(
+///
+/// #1518: with the association's `notify_token`, the URI ends in it
+/// (`.../ue-policy-notify/{token}`), and the PCF's `/update` / `/terminate` follow it.
+pub fn ue_policy_notification_uri(supi: &str, token: Option<&str>) -> String {
+    let base = format!(
         "{}/namf-callback/v1/{supi}/ue-policy-notify",
         advertised_sbi_base()
-    )
+    );
+    match token {
+        Some(token) => format!("{base}/{token}"),
+        None => base,
+    }
 }
 
 /// Nudm_UECM_Registration (amf3gpp-access):
@@ -3870,6 +3957,8 @@ pub async fn call_pcf_am_policy_create(
     supi: &str,
     serving_plmn_mcc: &str,
     serving_plmn_mnc: &str,
+    // #1518: the token for the association's `notificationUri`.
+    notify_token: &str,
 ) -> SbiResult<String> {
     let client = crate::attach_oauth2(
         SbiClient::for_peer(pcf_host, pcf_port),
@@ -3877,7 +3966,7 @@ pub async fn call_pcf_am_policy_create(
     );
 
     let body = serde_json::json!({
-        "notificationUri": am_policy_notification_uri(supi),
+        "notificationUri": am_policy_notification_uri(supi, Some(notify_token)),
         "supi": supi,
         "servingPlmn": { "mcc": serving_plmn_mcc, "mnc": serving_plmn_mnc },
         "suppFeat": ""
@@ -3951,6 +4040,8 @@ pub async fn call_pcf_ue_policy_create(
     // `ue_policy_container`: the UE policy container from the Registration Request's
     // Payload container (TS 24.501 §5.5.1.2.2), or `None` when the UE sent none (#91).
     ue_policy_container: Option<&[u8]>,
+    // #1518: the token for the association's `notificationUri`.
+    notify_token: &str,
 ) -> SbiResult<String> {
     let client = crate::attach_oauth2(
         SbiClient::for_peer(pcf_host, pcf_port),
@@ -3960,7 +4051,7 @@ pub async fn call_pcf_ue_policy_create(
     let mut body = serde_json::json!({
         // #92: ABSOLUTE and scheme-derived (was a relative path the PCF could not POST
         // to), from the same self-URI helper as `deregCallbackUri`.
-        "notificationUri": ue_policy_notification_uri(supi),
+        "notificationUri": ue_policy_notification_uri(supi, Some(notify_token)),
         "supi": supi,
         "suppFeat": "",
         "servingPlmn": { "mcc": serving_plmn_mcc, "mnc": serving_plmn_mnc },
@@ -4064,12 +4155,17 @@ pub fn sdm_callback_reference(supi: &str) -> String {
 }
 
 /// The absolute AM policy `notificationUri` for `supi` (TS 29.507 §5.6.2.3), as
-/// [`sdm_callback_reference`] (#1210).
-pub fn am_policy_notification_uri(supi: &str) -> String {
-    format!(
+/// [`sdm_callback_reference`] (#1210). #1518: ending in the association's
+/// `notify_token` when it has one, as [`ue_policy_notification_uri`].
+pub fn am_policy_notification_uri(supi: &str, token: Option<&str>) -> String {
+    let base = format!(
         "{}/namf-callback/v1/{supi}/am-policy-notify",
         advertised_sbi_base()
-    )
+    );
+    match token {
+        Some(token) => format!("{base}/{token}"),
+        None => base,
+    }
 }
 
 /// Npcf_AMPolicyControl_Update toward a new serving AMF (#1210): POST
@@ -5934,6 +6030,8 @@ mod tests {
 
     fn test_identity() -> SmContextIdentity {
         SmContextIdentity {
+            sm_context_status_key: None,
+            sm_context_status_nonce: None,
             supi: Some("imsi-262011234567890".to_string()),
             pei: Some("imeisv-1234567890123456".to_string()),
             guami: Some(serde_json::json!({
@@ -6454,7 +6552,11 @@ mod tests {
         // comparing a value to itself proves nothing about its shape.
         let supi = body["supi"].as_str().unwrap_or_default();
         let notification_uri = body["notificationUri"].as_str().unwrap_or_default();
-        if notification_uri != ue_policy_notification_uri(supi)
+        // #1518: followed by the association's token (32 hex digits).
+        let tokened = notification_uri
+            .strip_prefix(&format!("{}/", ue_policy_notification_uri(supi, None)))
+            .is_some_and(|t| t.len() == 32 && t.bytes().all(|b| b.is_ascii_hexdigit()));
+        if !tokened
             || !(notification_uri.starts_with("http://")
                 || notification_uri.starts_with("https://"))
         {
@@ -6463,8 +6565,8 @@ mod tests {
                     "status": 400,
                     "cause": "INVALID_NOTIFICATION_URI",
                     "detail": format!(
-                        "expected the absolute {}, got {notification_uri:?}",
-                        ue_policy_notification_uri(supi)
+                        "expected the absolute {}/{{token}}, got {notification_uri:?}",
+                        ue_policy_notification_uri(supi, None)
                     ),
                 })
                 .to_string(),
@@ -6631,6 +6733,7 @@ mod tests {
             "01",
             "020040",
             None,
+            "0123456789abcdef0123456789abcdef",
         )
         .await
         .expect("UE policy create against paired stub");
@@ -6664,6 +6767,7 @@ mod tests {
             "01",
             "020040",
             Some(&container),
+            "0123456789abcdef0123456789abcdef",
         )
         .await
         .expect("the stub 400s unless uePolReq is present and byte-exact");
@@ -6679,6 +6783,7 @@ mod tests {
             "01",
             "020040",
             None,
+            "0123456789abcdef0123456789abcdef",
         )
         .await
         .expect("the stub 400s if uePolReq appears when no container was passed");
@@ -6704,6 +6809,7 @@ mod tests {
             "01",
             "020040",
             None,
+            "0123456789abcdef0123456789abcdef",
         )
         .await;
         assert!(result.is_err(), "5xx from PCF must surface as Err");
@@ -6728,6 +6834,7 @@ mod tests {
             "01",
             "020040",
             None,
+            "0123456789abcdef0123456789abcdef",
         )
         .await;
         assert!(result.is_err(), "unreachable PCF must surface as Err");
@@ -7128,11 +7235,12 @@ mod tests_no_wildcard_uri_1322 {
         let authority = nextgcore_sbi::uri_encode::uri_authority(&host, port);
         let uris = [
             advertised_sbi_base(),
-            sm_context_status_uri("imsi-001010000000001", 5),
+            sm_context_status_uri("imsi-001010000000001", 5, Some("t")),
+            sm_context_status_uri("imsi-001010000000001", 5, None),
             dereg_callback_uri("imsi-001010000000001", "t"),
-            ue_policy_notification_uri("imsi-001010000000001"),
+            ue_policy_notification_uri("imsi-001010000000001", Some("t")),
             sdm_callback_reference("imsi-001010000000001"),
-            am_policy_notification_uri("imsi-001010000000001"),
+            am_policy_notification_uri("imsi-001010000000001", Some("t")),
             crate::racs::notification_uri(),
             crate::nrf_subscription::notification_uri(),
         ];

@@ -693,6 +693,13 @@ pub fn hss_context_parse_config(config_path: &str) -> Result<(), String> {
     if let Some(path) = section.free_diameter {
         match nextgcore_diameter::fd_conf::FreeDiameterConf::load(&path) {
             Ok(conf) => {
+                // #1536 review: a recognised directive whose value does not parse sets
+                // nothing; said, naming what was written, as pcrfd does.
+                for statement in &conf.malformed {
+                    log::warn!(
+                        "{path}: '{statement}' does not parse; the directive is not applied"
+                    );
+                }
                 if !conf.ignored.is_empty() {
                     log::info!(
                         "{path}: directives not interpreted: {}",
@@ -988,6 +995,49 @@ hss:
         let result = hss_context_parse_config(path.to_str().unwrap());
         std::fs::remove_file(&path).ok();
         assert!(result.is_err(), "a malformed config must not be accepted");
+    }
+
+    /// #1536 review: a freeDiameter directive whose value does not parse is
+    /// warned about, one WARN per entry naming the directive and its value, as
+    /// pcrfd does; the parse still succeeds.
+    ///
+    /// REVERT-VERIFIED: without the warning loop, no record names the directive.
+    #[test]
+    fn a_free_diameter_directive_that_does_not_parse_is_warned_about() {
+        nextgcore_core::test_log::init();
+        let dir = std::env::temp_dir().join(format!(
+            "nextgcore-hssd-fd-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("hss.conf");
+        std::fs::write(
+            &conf,
+            "Identity = \"hss.localdomain\";\nPort = 0;\n\
+             ConnectPeer = \"mme.localdomain\" { ConnectTo = \"\"; };\n",
+        )
+        .unwrap();
+        let yaml = dir.join("hss.yaml");
+        std::fs::write(
+            &yaml,
+            format!("hss:\n  freeDiameter: {}\n", conf.to_str().unwrap()),
+        )
+        .unwrap();
+        let watch = nextgcore_core::test_log::watch("does not parse");
+        let result = hss_context_parse_config(yaml.to_str().unwrap());
+        let records = watch.records();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(result.is_ok(), "{result:?}");
+        for statement in [
+            "'Port = 0'",
+            "'ConnectPeer \"mme.localdomain\" ConnectTo = \"\"'",
+        ] {
+            assert!(
+                records.iter().any(|r| r.contains(statement)),
+                "a WARN names {statement}: {records:?}"
+            );
+        }
     }
 
     /// An unreadable/missing path is an Err too. main() only calls this when the

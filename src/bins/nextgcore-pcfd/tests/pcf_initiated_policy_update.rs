@@ -138,6 +138,11 @@ async fn start_peer(udr: Arc<Udr>, log: Log) -> (nextgcore_sbi::server::SbiServe
     (server, addr.port())
 }
 
+/// The callback tokens of the seeded UE's AM and UE policy associations
+/// (nextgcore#1518).
+const AM_TOKEN: &str = "0123456789abcdef0123456789ab1261";
+const UE_TOKEN: &str = "fedcba9876543210fedcba98765a1261";
+
 /// Seed a CM-CONNECTED UE in amfd's process-global context, as
 /// `strict_peer_updp.rs` does.
 fn seed_amf_ue(supi: &str) {
@@ -149,6 +154,9 @@ fn seed_amf_ue(supi: &str) {
     let mut ue = guard.amf_ue_add(ran_ue.id).expect("amf_ue_add");
     ue.supi = Some(supi.to_string());
     ue.security_context_available = true;
+    // nextgcore#1518: amfd's notificationUris end in the association's token.
+    ue.policy_association.notify_token = Some(AM_TOKEN.to_string());
+    ue.ue_policy_association.notify_token = Some(UE_TOKEN.to_string());
     guard.amf_ue_associate_ran_ue(ue.id, ran_ue.id);
     ue.ran_ue_id = ran_ue.id;
     guard.amf_ue_update(&ue);
@@ -165,7 +173,7 @@ fn relayed(log: &Log, pred: impl Fn(&Relayed) -> bool) -> Vec<Relayed> {
 }
 
 fn is_am_update(r: &Relayed) -> bool {
-    r.path == format!("/namf-callback/v1/{SUPI}/am-policy-notify/update")
+    r.path == format!("/namf-callback/v1/{SUPI}/am-policy-notify/{AM_TOKEN}/update")
 }
 
 fn is_n1n2(r: &Relayed) -> bool {
@@ -251,7 +259,7 @@ async fn a_policy_data_change_is_pushed_to_the_amf_and_the_ue() {
     let am = pcf_sbi_request_handler(post(
         "/npcf-am-policy-control/v1/policies",
         serde_json::json!({
-            "notificationUri": format!("http://127.0.0.1:{port}/namf-callback/v1/{SUPI}/am-policy-notify"),
+            "notificationUri": format!("http://127.0.0.1:{port}/namf-callback/v1/{SUPI}/am-policy-notify/{AM_TOKEN}"),
             "supi": SUPI,
             "suppFeat": "",
         }),
@@ -271,7 +279,7 @@ async fn a_policy_data_change_is_pushed_to_the_amf_and_the_ue() {
     let ue = pcf_sbi_request_handler(post(
         "/npcf-ue-policy-control/v1/policies",
         serde_json::json!({
-            "notificationUri": format!("http://127.0.0.1:{port}/namf-callback/v1/{SUPI}/ue-policy-notify"),
+            "notificationUri": format!("http://127.0.0.1:{port}/namf-callback/v1/{SUPI}/ue-policy-notify/{UE_TOKEN}"),
             "supi": SUPI,
             "suppFeat": "",
             "servingPlmn": { "mcc": "001", "mnc": "01" },

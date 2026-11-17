@@ -834,6 +834,49 @@ pcrf:
         assert!(result.is_err());
     }
 
+    /// #1536 review: a freeDiameter directive pcrfd reads whose value does not
+    /// parse (`Port = "abc"`) is warned about, naming the directive and the value,
+    /// instead of being dropped silently; the file's valid directives still load
+    /// and start-up is not refused (an unreadable freeDiameter file only warns
+    /// too).
+    ///
+    /// REVERT-VERIFIED: without the warning loop in `pcrf_context_parse_config`,
+    /// no record names the directive.
+    #[test]
+    fn a_free_diameter_directive_that_does_not_parse_is_warned_about() {
+        nextgcore_core::test_log::init();
+        let dir = std::env::temp_dir().join(format!(
+            "nextgcore-pcrfd-fd-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("pcrf.conf");
+        std::fs::write(
+            &conf,
+            "Identity = \"pcrf.localdomain\";\nRealm = \"localdomain\";\nPort = \"abc\";\n",
+        )
+        .unwrap();
+        let yaml = dir.join("pcrf.yaml");
+        std::fs::write(
+            &yaml,
+            format!("pcrf:\n  freeDiameter: {}\n", conf.to_str().unwrap()),
+        )
+        .unwrap();
+        let watch = nextgcore_core::test_log::watch("does not parse");
+        let result = pcrf_context_parse_config(yaml.to_str().unwrap());
+        let records = watch.records();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            result.is_ok(),
+            "a bad freeDiameter value warns, not fails: {result:?}"
+        );
+        assert!(
+            records.iter().any(|r| r.contains("'Port = \"abc\"'")),
+            "the warning names the directive and its value: {records:?}"
+        );
+    }
+
     #[test]
     fn test_args_log_options() {
         let args = Args::parse_from(["nextgcore-pcrfd", "-l", "/var/log/pcrf.log", "-m"]);

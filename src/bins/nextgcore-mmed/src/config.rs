@@ -487,6 +487,11 @@ fn apply_fd_conf(ctx: &mut MmeContext, path: &str) {
         }
     };
 
+    // #1536 review: a recognised directive whose value does not parse sets
+    // nothing; said, naming what was written, as pcrfd does.
+    for statement in &conf.malformed {
+        log::warn!("{path}: '{statement}' does not parse; the directive is not applied");
+    }
     if !conf.ignored.is_empty() {
         log::info!(
             "{path}: directives not interpreted: {}",
@@ -981,6 +986,41 @@ mod tests {
                 std::net::SocketAddr::from(([172, 24, 0, 8], 3868))
             ))
         );
+    }
+
+    /// #1536 review: a freeDiameter directive whose value does not parse is
+    /// warned about, one WARN per entry naming the directive and its value. A bad
+    /// `ConnectTo` matters here: it leaves mmed with no S6a peer, which used to be
+    /// silent.
+    ///
+    /// REVERT-VERIFIED: without the warning loop, no record names the directive.
+    #[test]
+    fn test_a_free_diameter_directive_that_does_not_parse_is_warned_about() {
+        nextgcore_core::test_log::init();
+        let conf = write_temp(
+            "nextgcore-mmed-fd-bad.conf",
+            "Identity = \"mme.localdomain\";\nPort = \"abc\";\n\
+             ConnectPeer = \"hss.localdomain\" { ConnectTo = \"\"; };\n",
+        );
+        let path = write_temp(
+            "nextgcore-mmed-fd-bad.yaml",
+            &format!("mme:\n  freeDiameter: {}\n", conf.to_str().unwrap()),
+        );
+        let watch = nextgcore_core::test_log::watch("does not parse");
+        let mut ctx = MmeContext::new();
+        assert!(load_config(&mut ctx, path.to_str().unwrap()));
+        let records = watch.records();
+        for statement in [
+            "'Port = \"abc\"'",
+            "'ConnectPeer \"hss.localdomain\" ConnectTo = \"\"'",
+        ] {
+            assert!(
+                records.iter().any(|r| r.contains(statement)),
+                "a WARN names {statement}: {records:?}"
+            );
+        }
+        assert_eq!(ctx.diam_identity.as_deref(), Some("mme.localdomain"));
+        assert_eq!(ctx.hss_peer, None, "no S6a peer from a bad ConnectTo");
     }
 
     #[test]

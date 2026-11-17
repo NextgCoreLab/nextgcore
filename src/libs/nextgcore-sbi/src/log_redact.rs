@@ -12,7 +12,7 @@
 //! retained far more widely than the NF that holds the token.
 
 /// Path segments whose NEXT segment is a callback token.
-pub const CALLBACK_TOKEN_SEGMENTS: [&str; 7] = [
+pub const CALLBACK_TOKEN_SEGMENTS: [&str; 12] = [
     "nf-status-notify",
     "dereg-notify",
     "amf-location-notify",
@@ -23,6 +23,14 @@ pub const CALLBACK_TOKEN_SEGMENTS: [&str; 7] = [
     "mtlf-model-notify",
     // The MTLF's Nnwdaf_MLModelMonitor notificationUri (nextgsim#468).
     "mlmodel-monitor-notify",
+    // eesd's demo d443a QOS_MON notify route (#1519).
+    "qos-mon",
+    // amfd's ucmfNotificationUri, AM / UE policy notificationUris and
+    // smContextStatusUri (nextgcore#1518).
+    "ucmf-notify",
+    "am-policy-notify",
+    "ue-policy-notify",
+    "sm-context-status",
 ];
 
 /// What a redacted segment is replaced with.

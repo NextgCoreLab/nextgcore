@@ -1268,10 +1268,12 @@ async fn releasing_smf() -> (
     use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
     let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
     let sink = Arc::clone(&seen);
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = listener.local_addr().expect("addr").port();
+    // #1646 review: a recording stand-in takes a port never issued before, so a
+    // stale callback from an earlier test cannot be counted as an SMF call (#1640).
+    let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let port = addr.port();
     let smf = nextgcore_sbi::server::SbiServer::on_listener(
-        nextgcore_sbi::server::SbiServerConfig::new(listener.local_addr().expect("addr")),
+        nextgcore_sbi::server::SbiServerConfig::new(addr),
         listener,
     );
     smf.start(move |req: SReq| {
@@ -2993,7 +2995,10 @@ async fn a_deregistered_ue_leaves_no_session_state_behind() {
     assert!(!server.ue_auth_state.contains(ue));
 }
 
-/// The UE-requested PDU Session Release (0xD1) forgets that PSI and only that PSI.
+/// The UE-requested PDU Session Release (0xD1) of one PSI touches that PSI only, and
+/// its state lives until the SMF reports it RELEASED (#1637: the SMF runs the release,
+/// and the UE's RELEASE COMPLETE must still find the context). Then the sweep drops
+/// that PSI and keeps its sibling.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_released_pdu_session_is_forgotten_and_its_sibling_kept() {
     let (_smf, port, _calls) = activating_smf().await;
@@ -3009,12 +3014,26 @@ async fn a_released_pdu_session_is_forgotten_and_its_sibling_kept() {
         .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &release_request))
         .await
         .expect("handled");
+    assert_eq!(
+        session_state_of(&server, ue),
+        (2, 2, 2),
+        "nothing is forgotten before the SMF reports RELEASED"
+    );
+    // The SMF's RELEASED arrives on the SBI task: only sess_list loses PSI 1.
+    {
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap();
+        let s = guard.sess_find_by_psi(ue, 1).expect("held");
+        guard.sess_remove(s.id);
+    }
+    server.sweep_orphaned_session_state();
     assert_eq!(session_state_of(&server, ue), (1, 1, 1));
     assert!(
         server.sm_context_refs.contains_key(&(ue, 2)),
         "PSI 2 is untouched"
     );
     assert!(!server.sm_context_refs.contains_key(&(ue, 1)));
+    server.forget_ue(ue);
 }
 
 /// The orphan sweep drops refs whose session the SBI task removed (the SMF's
@@ -3973,10 +3992,10 @@ async fn a_first_create_sm_context_answered_off_the_task_sets_the_session_up() {
     server.forget_ue(ue);
 }
 
-/// #922: a UE-requested PDU Session Release does not wait for the SMF. The
-/// release command goes to the UE and the gNB at once, and the ReleaseSMContext
-/// reaches the SMF off the NGAP task. With an SMF that never answers, the
-/// handler still returns at once.
+/// #922: a UE-requested PDU Session Release does not wait for the SMF. With one
+/// session's SMF never answering, the handler still returns at once for both, and
+/// the answering SMF gets its session's request off the NGAP task. #1637: nothing goes
+/// to the UE or the gNB before the SMF answers (TS 23.502 §4.3.4.2 steps 1a-3).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_ue_requested_release_does_not_wait_for_the_smf() {
     let (_hang, hang_port) = hanging_smf();
@@ -4000,28 +4019,24 @@ async fn a_ue_requested_release_does_not_wait_for_the_smf() {
         "the handler did not wait for the SMF: {:?}",
         started.elapsed()
     );
-    let releases = sent_to(&mut server, ue)
-        .into_iter()
-        .filter(|s| matches!(s, Sent::ReleaseCommand { .. }))
-        .count();
-    assert_eq!(releases, 2, "both sessions released at the gNB at once");
-    // The answering SMF gets its release off the task.
+    assert!(
+        sent_to(&mut server, ue).is_empty(),
+        "nothing goes out before an SMF answers"
+    );
+    // The answering SMF gets its session's request off the task.
+    let reached =
+        || {
+            calls.lock().expect("calls").iter().any(|(u, b)| {
+                u.ends_with("/sm-contexts/rel-922-ok/modify") && b["n1SmMsg"].is_object()
+            })
+        };
     for _ in 0..200 {
-        if calls
-            .lock()
-            .expect("calls")
-            .iter()
-            .any(|(u, _)| u.ends_with("/sm-contexts/rel-922-ok/release"))
-        {
+        if reached() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(calls
-        .lock()
-        .expect("calls")
-        .iter()
-        .any(|(u, _)| u.ends_with("/sm-contexts/rel-922-ok/release")));
+    assert!(reached(), "the release request reached the answering SMF");
     server.forget_ue(ue);
 }
 

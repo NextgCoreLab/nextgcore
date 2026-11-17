@@ -796,6 +796,10 @@ pub struct PendingConnectedDownlink {
     /// The consumer's n1n2FailureTxfNotifURI. The NGAP task needs it when the UE
     /// turns out to be CM-IDLE at delivery time and has to be paged instead.
     pub failure_notify_uri: Option<String>,
+    /// #1643 review: the N1 answers the UE's own release or modification. If the
+    /// UE turns out CM-IDLE, the page this item creates is N1-only
+    /// (`PagingContext::pending_n1_only`), so the UE's answer re-activates nothing.
+    pub n1_only: bool,
 }
 
 /// A network-initiated deregistration the Nudm_UECM DeregistrationNotification
@@ -2226,7 +2230,6 @@ impl AmfContext {
     // Paging Management (TS 23.502 4.2.3.3)
     // ========================================================================
 
-    /// Initiate paging for a UE in CM-IDLE state
     /// Set the payload container type a queued paging context's pending N1 is
     /// delivered in (#540). No-op when no paging is queued for the UE.
     pub fn paging_set_n1_container_type(&self, amf_ue_ngap_id: u64, container_type: u8) {
@@ -3594,12 +3597,35 @@ pub struct GmmCapability {
 }
 
 /// Policy association
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PolicyAssociation {
     /// Resource URI
     pub resource_uri: Option<String>,
     /// ID
     pub id: Option<String>,
+    /// #1518: the per-association token in the `notificationUri` this AMF gave
+    /// the PCF, checked on every notification to that URI. `None` for an
+    /// association created before #1518, whose URI carries no token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_token: Option<String>,
+}
+
+/// Debug without the callback token (#1625 review): a `{:?}` in a log line must
+/// not hand out what authenticates a notification.
+impl std::fmt::Debug for PolicyAssociation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PolicyAssociation")
+            .field("resource_uri", &self.resource_uri)
+            .field("id", &self.id)
+            .field("notify_token", &redacted(&self.notify_token))
+            .finish()
+    }
+}
+
+/// `Some(secret)` printed as `Some("<redacted>")`, for the Debug impls of
+/// structures carrying callback tokens and keys (#1625 review).
+pub(crate) fn redacted(secret: &Option<String>) -> Option<&'static str> {
+    secret.as_ref().map(|_| "<redacted>")
 }
 
 /// 5G AKA confirmation
@@ -3698,6 +3724,21 @@ pub struct AmfUe {
     /// longer holds (one made before a restart, under a different
     /// `amfInstanceId`). Acting on it would tear down the UE's new registration.
     pub uecm_dereg_token: Option<String>,
+    /// #1518: the secret each PDU session's `smContextStatusUri` token is derived
+    /// from ([`crate::sbi_path::sm_context_status_token`]), one token per PSI, so the
+    /// SMF of one session cannot notify about another. Minted with the UE context
+    /// and kept for its life (persisted, restored on takeover), so a session's URI
+    /// survives the UE's re-registrations. `None` only for a context restored from a
+    /// record written before #1518 (`pre_1518_callbacks`): its sessions' URIs carry
+    /// no token, and it keeps handing out token-less URIs, served only for it.
+    pub sm_context_status_key: Option<String>,
+    /// #1518: this context was restored from a record written before #1518, whose
+    /// peers hold token-less callback URIs. Only then is a token-less URI served,
+    /// and only for a callback whose token is still `None`. Kept through every
+    /// rewrite of the record (`StoredUeContext.callback_tokens`). `false` for every
+    /// context created, transferred or adopted since. Moving such a context to
+    /// tokened URIs is #1642.
+    pub pre_1518_callbacks: bool,
     /// NAS state
     pub nas: NasState,
     /// SUCI (Subscription Concealed Identifier)
@@ -3989,7 +4030,12 @@ impl std::fmt::Debug for AmfUe {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut d = f.debug_struct("AmfUe");
         d.field("id", &self.id);
-        d.field("uecm_dereg_token", &self.uecm_dereg_token);
+        d.field("uecm_dereg_token", &redacted(&self.uecm_dereg_token));
+        d.field(
+            "sm_context_status_key",
+            &redacted(&self.sm_context_status_key),
+        );
+        d.field("pre_1518_callbacks", &self.pre_1518_callbacks);
         d.field("nas", &self.nas);
         d.field("suci", &self.suci);
         d.field("supi", &self.supi);
@@ -4560,6 +4606,8 @@ impl AmfUe {
         Self {
             id,
             uecm_dereg_token: None,
+            sm_context_status_key: Some(uuid::Uuid::new_v4().simple().to_string()),
+            pre_1518_callbacks: false,
             nas: NasState::default(),
             suci: None,
             supi: None,
@@ -4701,8 +4749,7 @@ impl AmfUe {
 
     /// Clear PCF AM policy
     pub fn pcf_am_policy_clear(&mut self) {
-        self.policy_association.resource_uri = None;
-        self.policy_association.id = None;
+        self.policy_association = PolicyAssociation::default();
     }
 
     /// Check if a PCF UE Policy Association exists (Npcf_UEPolicyControl,
@@ -4713,8 +4760,7 @@ impl AmfUe {
 
     /// Clear the PCF UE Policy Association (Wave-6 E7)
     pub fn pcf_ue_policy_clear(&mut self) {
-        self.ue_policy_association.resource_uri = None;
-        self.ue_policy_association.id = None;
+        self.ue_policy_association = PolicyAssociation::default();
     }
 
     /// Check if 5G AKA confirmation exists
@@ -5005,6 +5051,12 @@ pub struct PagingContext {
     /// a UE that has not moved since it went idle is still under the gNB it was
     /// last seen on.
     pub nwdaf_last_cell: Option<(PlmnId, u64)>,
+    /// #1643 review: the page carries only the SMF's N1 for `pdu_session_id`, an
+    /// answer to the UE's own release or modification request. TS 23.502 §4.3.4.2
+    /// step 4: the NAS message only. The UE's answer re-activates no user plane
+    /// for it (the #540 rule does not apply), and if the UE's PDU session status
+    /// shows the session gone, the N1 is not sent.
+    pub pending_n1_only: bool,
 }
 
 /// What one paging pump pass decided (TS 24.501 §5.6.2.2.1 / §5.6.2.2.2).
@@ -5035,6 +5087,7 @@ impl Default for PagingContext {
             pending_n2: None,
             pending_n2_release: false,
             pending_n2_modify: false,
+            pending_n1_only: false,
             pdu_session_id: None,
             tai_list: Vec::new(),
             last_sent: None,
@@ -5177,6 +5230,11 @@ pub struct AmfSess {
     pub lbo_roaming_allowed: bool,
     /// SM context in SMF flag (for gmm_build compatibility)
     pub sm_context_in_smf: bool,
+    /// #1518: the per-session nonce of this session's `smContextStatusUri` token
+    /// ([`crate::sbi_path::sm_context_status_token`]), new for every PDU session
+    /// established, so a re-created PSI does not inherit the old session's token.
+    /// `None` until the AMF hands this session a tokened URI.
+    pub sm_context_status_nonce: Option<String>,
 }
 
 impl AmfSess {
@@ -5211,6 +5269,7 @@ impl AmfSess {
             dnn: None,
             lbo_roaming_allowed: false,
             sm_context_in_smf: false,
+            sm_context_status_nonce: None,
         }
     }
 

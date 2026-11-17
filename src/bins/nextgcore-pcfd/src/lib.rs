@@ -19,6 +19,8 @@ pub mod app;
 #[cfg(feature = "demo-d441a-congestion-loop")]
 pub mod congestion_loop;
 pub mod context;
+/// #1621 review B1: the operator setting `pcf.policy.emergency_dnns`.
+pub mod emergency_dnn;
 pub mod event;
 /// Issue #24: intent-driven closed-loop policy controller (non-normative 6G
 /// research spike, off by default). Crate-internal like `intent_policy`; the
@@ -108,6 +110,71 @@ pub mod test_support {
         let ctx = nextgcore_sbi::context::global_context();
         ctx.clear_clients().await;
         ctx.set_nrf_uri(uri).await;
+    }
+
+    /// [`point_nrf_at`], undone when the returned guard drops, even when the test
+    /// panics (#1621 review m2): the NRF URI is cleared, the cached SBI clients
+    /// dropped and the remembered UDR forgotten
+    /// ([`crate::sbi_path::forget_udr`]). Without it a test that stopped its mock
+    /// left the next test discovering, or reading, a server that is gone (the #1607
+    /// leak). Take it with [`CONTEXT_GUARD`] held, and declare it after that guard
+    /// so it drops first.
+    pub async fn scoped_nrf_at(uri: impl Into<String>) -> NrfUriGuard {
+        point_nrf_at(uri).await;
+        NrfUriGuard(())
+    }
+
+    /// Guard returned by [`scoped_nrf_at`]; declared beside [`CONTEXT_GUARD`],
+    /// whose process-global NRF URI it restores.
+    #[must_use = "the NRF URI is restored when this guard drops"]
+    pub struct NrfUriGuard(());
+
+    impl Drop for NrfUriGuard {
+        fn drop(&mut self) {
+            crate::sbi_path::forget_udr();
+            // The NRF URI and the client cache sit behind tokio locks. Drop cannot
+            // await, and may run on a runtime worker, so a short-lived thread with
+            // its own runtime does the clearing and is joined before the drop ends.
+            let _ = std::thread::spawn(|| {
+                if let Ok(rt) = tokio::runtime::Builder::new_current_thread().build() {
+                    rt.block_on(async {
+                        let ctx = nextgcore_sbi::context::global_context();
+                        ctx.clear_nrf_uri().await;
+                        ctx.clear_clients().await;
+                    });
+                }
+            })
+            .join();
+        }
+    }
+
+    /// `pcf.policy.emergency_dnns` pinned to `dnns` for as long as the returned
+    /// guard lives (#1621 review B1). Holds
+    /// [`crate::emergency_dnn::EMERGENCY_DNNS_LOCK`] and restores the previous list
+    /// on drop. Taken AFTER `CONTEXT_GUARD` by tests that hold both.
+    pub fn emergency_dnns(dnns: &[&str]) -> EmergencyDnnsGuard {
+        let guard = crate::emergency_dnn::EMERGENCY_DNNS_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = crate::emergency_dnn::get();
+        crate::emergency_dnn::set(dnns.iter().map(|d| d.to_string()).collect());
+        EmergencyDnnsGuard {
+            previous,
+            _guard: guard,
+        }
+    }
+
+    /// Guard returned by [`emergency_dnns`].
+    pub struct EmergencyDnnsGuard {
+        previous: Vec<String>,
+        // Declared last so it drops after `Drop::drop` has restored the list.
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for EmergencyDnnsGuard {
+        fn drop(&mut self) {
+            crate::emergency_dnn::set(std::mem::take(&mut self.previous));
+        }
     }
 
     /// `PCF_UE_POLICY_DELIVERY` pinned to `enabled` for as long as the returned guard

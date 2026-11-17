@@ -651,7 +651,8 @@ pub fn nrf_nnrf_nfm_send_nf_status_notify_all(
 fn subscription_matches(subscription: &SubscriptionData, nf_instance: &NfProfile) -> bool {
     // Skip if the requester is the same as the NF instance
     if let Some(ref req_nf_instance_id) = subscription.req_nf_instance_id {
-        if req_nf_instance_id == &nf_instance.nf_instance_id {
+        if crate::nnrf_handler::same_nf_instance_id(req_nf_instance_id, &nf_instance.nf_instance_id)
+        {
             return false;
         }
     }
@@ -744,11 +745,16 @@ fn subscr_cond_matches(cond: &SubscrCond, nf: &NfProfile) -> bool {
         .unwrap_or(&serde_json::Value::Null);
 
     match cond.kind {
-        SubscrCondKind::NfInstanceId => cond.str_at("nfInstanceId") == Some(&nf.nf_instance_id),
+        SubscrCondKind::NfInstanceId => cond
+            .str_at("nfInstanceId")
+            .is_some_and(|id| crate::nnrf_handler::same_nf_instance_id(id, &nf.nf_instance_id)),
 
-        SubscrCondKind::NfInstanceIdList => cond
-            .str_list_at("nfInstanceIdList")
-            .is_some_and(|ids| ids.iter().any(|id| *id == nf.nf_instance_id)),
+        SubscrCondKind::NfInstanceIdList => {
+            cond.str_list_at("nfInstanceIdList").is_some_and(|ids| {
+                ids.iter()
+                    .any(|id| crate::nnrf_handler::same_nf_instance_id(id, &nf.nf_instance_id))
+            })
+        }
 
         SubscrCondKind::NfType => cond.str_at("nfType") == Some(&nf.nf_type),
 

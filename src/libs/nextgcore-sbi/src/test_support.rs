@@ -160,31 +160,55 @@ impl BoundListener {
     }
 }
 
+/// Bind with `bind` until it yields a port never issued in this process, and
+/// record it (#1640). A rejected socket stays bound until a fresh port is found,
+/// so the kernel cannot hand the same port straight back.
+///
+/// # Why a reissued port is refused
+///
+/// A port issued earlier may still be named by something in this process: a
+/// leaked event subscription, a callback URI, or an off-task request of a test
+/// whose stand-in has stopped. Once the kernel reissues that port to a new
+/// stand-in, those stale requests land there, in the wrong test (#1614, #1638:
+/// a UES_IN_AREA notify recorded as an SMF call, and as a LOCATION_REPORT).
+/// With every port issued once, a stale request always meets a closed port.
+fn issue_unique<S>(what: &str, mut bind: impl FnMut() -> (S, u16)) -> (S, u16) {
+    let mut rejected = Vec::new();
+    for _ in 0..256 {
+        let (socket, port) = bind();
+        if issued_ports().lock().expect("issued lock").insert(port) {
+            return (socket, port);
+        }
+        rejected.push(socket);
+    }
+    panic!("could not bind {what} on a port not yet issued in 256 attempts");
+}
+
 /// Reserve a loopback port by **keeping it bound**, closing the window
 /// [`free_port`] leaves open (#313).
 ///
 /// The returned listener is still bound when it reaches the caller, so no other
 /// process — not just no other thread — can take the port in between. The port
-/// is also recorded in [`free_port`]'s issued set, so the two helpers cannot
-/// hand out the same port to one process.
+/// is never one this process was issued before by this helper, [`down_port`] or
+/// [`free_port`] (#1640). A stale request to a stopped stand-in's port can
+/// therefore never reach this listener.
 ///
 /// # Panics
 ///
 /// If `127.0.0.1:0` cannot be bound, or its local address cannot be read.
 pub fn bound_listener() -> BoundListener {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind reserved listener");
-    let addr = listener.local_addr().expect("reserved listener addr");
-    // Share one issued set with free_port(), so a bare-port caller and a
-    // reserved-listener caller in the same process cannot be handed the same
-    // number either. No retry loop is needed here and having one would be
-    // wrong: the port is already held, so a duplicate would mean the OS reissued
-    // a port free_port() probed and released — recording it is what stops
-    // free_port() returning it a second time.
-    issued_ports()
-        .lock()
-        .expect("issued lock")
-        .insert(addr.port());
-    BoundListener { listener, addr }
+    let (listener, port) = issue_unique("a reserved listener", || {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind reserved listener");
+        let port = listener
+            .local_addr()
+            .expect("reserved listener addr")
+            .port();
+        (listener, port)
+    });
+    BoundListener {
+        listener,
+        addr: SocketAddr::from(([127, 0, 0, 1], port)),
+    }
 }
 
 /// A loopback port held **bound but not listening**: a peer that is down now and
@@ -232,22 +256,24 @@ impl DownPort {
 
 /// Hold a loopback port that refuses connections until [`DownPort::listen`].
 ///
-/// The port is recorded in [`free_port`]'s issued set, like [`bound_listener`]'s.
+/// Never a port this process was issued before, as for [`bound_listener`] (#1640).
 ///
 /// # Panics
 ///
 /// If a socket cannot be created or bound to `127.0.0.1:0`.
 pub fn down_port() -> DownPort {
-    let socket = tokio::net::TcpSocket::new_v4().expect("a TCP socket");
-    socket
-        .bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-        .expect("bind the held port");
-    let addr = socket.local_addr().expect("held port addr");
-    issued_ports()
-        .lock()
-        .expect("issued lock")
-        .insert(addr.port());
-    DownPort { socket, addr }
+    let (socket, port) = issue_unique("a held port", || {
+        let socket = tokio::net::TcpSocket::new_v4().expect("a TCP socket");
+        socket
+            .bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .expect("bind the held port");
+        let port = socket.local_addr().expect("held port addr").port();
+        (socket, port)
+    });
+    DownPort {
+        socket,
+        addr: SocketAddr::from(([127, 0, 0, 1], port)),
+    }
 }
 
 /// Build and start an [`SbiServer`] on a reserved loopback port, with no window
@@ -374,6 +400,45 @@ mod tests {
     use super::*;
     use std::collections::HashSet as Set;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// #1640: a port the kernel hands back after its first listener closed is
+    /// refused, and the caller gets a fresh one. The binder offers the freed port
+    /// first, as the kernel may.
+    ///
+    /// REVERT-VERIFIED: with `issue_unique` returning the first bind again, the
+    /// reissued port comes back.
+    #[test]
+    fn a_reissued_port_is_never_returned() {
+        let first = bound_listener();
+        let freed = first.port();
+        drop(first);
+        let mut offers = 0;
+        let (listener, port) = issue_unique("a test listener", || {
+            offers += 1;
+            let listener = if offers == 1 {
+                TcpListener::bind(("127.0.0.1", freed)).expect("rebind the freed port")
+            } else {
+                TcpListener::bind("127.0.0.1:0").expect("bind")
+            };
+            let port = listener.local_addr().expect("addr").port();
+            (listener, port)
+        });
+        assert!(offers >= 2, "the freed port was offered and refused");
+        assert_ne!(port, freed, "a reissued port is never returned");
+        assert_eq!(listener.local_addr().expect("addr").port(), port);
+
+        // And the public helpers never repeat a port among themselves.
+        let mut seen = Set::new();
+        let mut held = Vec::new();
+        for _ in 0..100 {
+            let l = bound_listener();
+            assert!(seen.insert(l.port()), "port {} issued twice", l.port());
+            drop(l);
+            let d = down_port();
+            assert!(seen.insert(d.port()), "port {} issued twice", d.port());
+            held.push(d);
+        }
+    }
 
     /// The core guarantee: no port is ever issued twice in one process.
     #[test]

@@ -71,6 +71,12 @@ pub struct FreeDiameterConf {
     pub peers: Vec<FreeDiameterPeer>,
     /// Directives this parser does not interpret, deduplicated by keyword
     pub ignored: BTreeSet<String>,
+    /// Recognised directives whose value does not parse (`Port = "abc"`,
+    /// `Port = 70000`, `ListenOn = ""`), each as `Keyword = value` in
+    /// declaration order (#1536 review). They set nothing, so an earlier valid
+    /// value of the same directive stands; a caller logs them rather than
+    /// letting a typo fall back to a default silently.
+    pub malformed: Vec<String>,
 }
 
 /// The valueless directives.
@@ -131,27 +137,47 @@ impl FreeDiameterConf {
     fn apply(&mut self, statement: &str) {
         let (keyword, value) = split_statement(statement);
 
+        let malformed = |this: &mut Self| {
+            this.malformed
+                .push(format!("{keyword} = {}", value.unwrap_or_default()));
+        };
         match keyword.to_ascii_lowercase().as_str() {
-            "identity" => self.identity = value.and_then(unquote),
-            "realm" => self.realm = value.and_then(unquote),
-            "listenon" => {
-                if let Some(address) = value.and_then(unquote) {
-                    self.listen_on.push(address);
-                }
-            }
-            "port" => self.port = value.and_then(parse_port),
-            "secport" => self.sec_port = value.and_then(parse_port),
+            "identity" => match value.and_then(unquote) {
+                Some(v) => self.identity = Some(v),
+                None => malformed(self),
+            },
+            "realm" => match value.and_then(unquote) {
+                Some(v) => self.realm = Some(v),
+                None => malformed(self),
+            },
+            "listenon" => match value.and_then(unquote) {
+                Some(address) => self.listen_on.push(address),
+                None => malformed(self),
+            },
+            "port" => match value.and_then(parse_port) {
+                Some(p) => self.port = Some(p),
+                None => malformed(self),
+            },
+            "secport" => match value.and_then(parse_port) {
+                Some(p) => self.sec_port = Some(p),
+                None => malformed(self),
+            },
             "no_ip" => self.flags.no_ip = true,
             "no_ipv6" => self.flags.no_ipv6 = true,
             "no_tcp" => self.flags.no_tcp = true,
             "no_sctp" => self.flags.no_sctp = true,
             "prefer_tcp" => self.flags.prefer_tcp = true,
             "norelay" => self.flags.no_relay = true,
-            "connectpeer" => {
-                if let Some(peer) = value.and_then(parse_connect_peer) {
-                    self.peers.push(peer);
+            // parse_connect_peer records its own malformed parts, the identity
+            // included, so only a ConnectPeer with no value at all is noted here.
+            "connectpeer" => match value {
+                Some(v) => {
+                    if let Some(peer) = parse_connect_peer(v, &mut self.malformed) {
+                        self.peers.push(peer);
+                    }
                 }
-            }
+                None => malformed(self),
+            },
             other if !other.is_empty() => {
                 self.ignored.insert(keyword.to_string());
             }
@@ -231,34 +257,60 @@ fn unquote(value: &str) -> Option<String> {
     (!unquoted.is_empty()).then(|| unquoted.to_string())
 }
 
+/// A port 1-65535. Port 0 is not one a peer can connect to (#1536 review), so it
+/// does not parse either.
 fn parse_port(value: &str) -> Option<u16> {
-    unquote(value)?.parse().ok()
+    unquote(value)?.parse().ok().filter(|p| *p != 0)
 }
 
 /// Parse `"peer.identity" { ConnectTo = "addr"; No_TLS; }`.
-fn parse_connect_peer(value: &str) -> Option<FreeDiameterPeer> {
+///
+/// An identity, `ConnectTo` or `Port` that does not parse is noted in `malformed`
+/// (#1536 review). A peer with a bad identity is not returned, but its block is
+/// still read, so its other bad entries are noted too.
+fn parse_connect_peer(value: &str, malformed: &mut Vec<String>) -> Option<FreeDiameterPeer> {
     let (identity_part, block) = match value.find('{') {
         Some(idx) => (&value[..idx], value[idx + 1..].trim_end_matches(['}', ' '])),
         None => (value, ""),
     };
 
-    let identity = unquote(identity_part)?;
+    let identity = unquote(identity_part);
+    if identity.is_none() {
+        malformed.push(format!("ConnectPeer = {}", identity_part.trim()));
+    }
+    // The peer as written: `"name"` when the identity parsed, else the raw text.
+    let label = match &identity {
+        Some(id) => format!("\"{id}\""),
+        None => identity_part.trim().to_string(),
+    };
     let mut peer = FreeDiameterPeer {
-        identity,
+        identity: identity.clone().unwrap_or_default(),
         ..Default::default()
     };
 
     for inner in block.split(';') {
         let (keyword, inner_value) = split_statement(inner);
+        let mut bad = || {
+            malformed.push(format!(
+                "ConnectPeer {label} {keyword} = {}",
+                inner_value.unwrap_or_default()
+            ))
+        };
         match keyword.to_ascii_lowercase().as_str() {
-            "connectto" => peer.connect_to = inner_value.and_then(unquote),
-            "port" => peer.port = inner_value.and_then(parse_port),
+            "connectto" => match inner_value.and_then(unquote) {
+                Some(addr) => peer.connect_to = Some(addr),
+                None => bad(),
+            },
+            "port" => match inner_value.and_then(parse_port) {
+                Some(p) => peer.port = Some(p),
+                None => bad(),
+            },
             "no_tls" => peer.no_tls = true,
             _ => {}
         }
     }
 
-    Some(peer)
+    identity.map(|_| peer)
 }
 
 // ============================================================================
@@ -268,6 +320,59 @@ fn parse_connect_peer(value: &str) -> Option<FreeDiameterPeer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1536 review: a recognised directive whose value does not parse is
+    /// recorded in `malformed`, sets nothing, and leaves an earlier valid value
+    /// in place; the valid directives around it still apply.
+    #[test]
+    fn a_recognised_directive_with_a_bad_value_is_recorded_as_malformed() {
+        let conf = FreeDiameterConf::parse(
+            r#"
+Identity = "pcrf.localdomain";
+Port = 3868;
+Port = "abc";
+SecPort = 70000;
+ListenOn = "";
+Realm = "localdomain";
+ConnectPeer = "smf.localdomain" { ConnectTo = "172.24.0.4"; Port = x; };
+ConnectPeer = "hss.localdomain" { ConnectTo = ""; Port = 0; };
+ConnectPeer = "" { ConnectTo = ""; };
+Port = 0;
+"#,
+        );
+        assert_eq!(
+            conf.malformed,
+            vec![
+                "Port = \"abc\"".to_string(),
+                "SecPort = 70000".to_string(),
+                "ListenOn = \"\"".to_string(),
+                "ConnectPeer \"smf.localdomain\" Port = x".to_string(),
+                "ConnectPeer \"hss.localdomain\" ConnectTo = \"\"".to_string(),
+                "ConnectPeer \"hss.localdomain\" Port = 0".to_string(),
+                "ConnectPeer = \"\"".to_string(),
+                "ConnectPeer \"\" ConnectTo = \"\"".to_string(),
+                "Port = 0".to_string(),
+            ]
+        );
+        assert_eq!(conf.port, Some(3868), "the earlier valid Port stands");
+        assert_eq!(conf.sec_port, None);
+        assert!(conf.listen_on.is_empty());
+        assert_eq!(conf.identity.as_deref(), Some("pcrf.localdomain"));
+        assert_eq!(conf.realm.as_deref(), Some("localdomain"));
+        assert_eq!(conf.peers.len(), 2, "the peer with no identity is not kept");
+        assert_eq!(conf.peers[0].port, None);
+        assert_eq!(conf.peers[1].identity, "hss.localdomain");
+        assert_eq!(
+            conf.peers[1].connect_to, None,
+            "a bad ConnectTo sets nothing"
+        );
+        assert_eq!(
+            conf.port,
+            Some(3868),
+            "Port = 0 does not replace a valid Port"
+        );
+        assert!(conf.ignored.is_empty());
+    }
 
     /// The MME file the Docker EPC ships, verbatim.
     const SHIPPED_MME_CONF: &str = r#"

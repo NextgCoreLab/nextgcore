@@ -622,6 +622,17 @@ fn service_request_s_tmsi(plain: &[u8]) -> Option<(u16, u8, u32)> {
     Some((amf_set_id, amf_pointer, tmsi))
 }
 
+/// #1518: record on the session of `psi` the nonce of the `smContextStatusUri`
+/// its SMF was given (`None`: a token-less URI).
+fn record_status_nonce(amf_ue_ngap_id: u64, psi: u8, nonce: Option<&str>) {
+    let ctx = crate::context::amf_self();
+    let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+    if let Some(mut sess) = guard.sess_find_by_psi(amf_ue_ngap_id, psi) {
+        sess.sm_context_status_nonce = nonce.map(str::to_string);
+        guard.sess_update(&sess);
+    }
+}
+
 /// Record PDU session `psi` of `amf_ue_ngap_id` in the AMF context's session
 /// store -- where the Namf N1N2MessageTransfer handler and the Service Request's
 /// re-activation find it (#540) -- unless it is already there. Returns whether the
@@ -1368,6 +1379,10 @@ struct PendingEstablishment {
     /// #1222: the UE's Request type for it (TS 24.501 §9.11.3.47), sent to the SMF as
     /// `requestType` on every attempt.
     request_type: Option<u8>,
+    /// #1518: the new session's `smContextStatusUri` token nonce, minted with the
+    /// establishment and the same on every attempt; recorded on the session once
+    /// the SMF created it.
+    status_nonce: String,
 }
 
 /// #774 review M1: the earlier registration's sessions are being released at
@@ -1428,6 +1443,20 @@ pub(crate) enum SmfAnswer {
         /// The N1 and the N2 SM information the SMF answered, or why it did not
         /// (with the N1 of its refusal, if any, #1590).
         result: Result<(Vec<u8>, Vec<u8>), crate::sbi_path::SmContextUpdateRefusal>,
+    },
+    /// #1637: the SMF's answer to a UE-requested PDU Session Release (0xD1, TS 23.502
+    /// §4.3.4.2 steps 1a-3): its PDU SESSION RELEASE COMMAND and, with an active user
+    /// plane, its N2 release transfer; or why it did not answer one.
+    ReleaseRequested {
+        amf_ue_ngap_id: u64,
+        psi: u8,
+        /// The UE's PDU SESSION RELEASE REQUEST, sent back with 5GMM #90 if the
+        /// SMF cannot be reached (TS 24.501 §5.4.5.3.1 case e)).
+        request: Vec<u8>,
+        result: Result<
+            crate::sbi_path::SmContextUpdateResponse,
+            crate::sbi_path::SmContextUpdateRefusal,
+        >,
     },
     /// #778: the ACTIVATING for a queued downlink setup of a CM-CONNECTED UE.
     DownlinkActivation(Box<DownlinkActivation>),
@@ -6201,18 +6230,22 @@ impl NgapServer {
         )
         .await
         .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
+        // #1518: the association's own token for its notificationUri.
+        let am_policy_token = crate::sbi_path::new_callback_token();
         match crate::sbi_path::call_pcf_am_policy_create(
             &pcf_host,
             pcf_port,
             &supi,
             &serving_mcc,
             &serving_mnc,
+            &am_policy_token,
         )
         .await
         {
             Ok(assoc) => {
                 state.policy_association_id = Some(assoc.clone());
                 state.amf_ue.policy_association.id = Some(assoc);
+                state.amf_ue.policy_association.notify_token = Some(am_policy_token);
             }
             Err(e) => {
                 log::error!("[{supi}] Npcf_AMPolicyControl_Create failed: {e}");
@@ -6448,7 +6481,7 @@ impl NgapServer {
         );
         // A page that named a session but brought no setup transfer (smfd's Downlink
         // Data Report paging) re-activates it, as the Service Request path does (#540).
-        if let Some(p) = page {
+        if let Some(p) = page.filter(|p| !p.pending_n1_only) {
             if let (Some(psi), false) = (p.pdu_session_id, p.pending_n2_release) {
                 if !already.contains(&psi)
                     && !plan.activate.contains(&psi)
@@ -7318,6 +7351,8 @@ impl NgapServer {
         .await
         .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
 
+        // #1518: the association's own notificationUri token.
+        let ue_policy_token = crate::sbi_path::new_callback_token();
         match crate::sbi_path::call_pcf_ue_policy_create(
             &pcf_host,
             pcf_port,
@@ -7328,6 +7363,7 @@ impl NgapServer {
             &guami_mnc,
             &amf_id_hex,
             ue_policy_container.as_deref(),
+            &ue_policy_token,
         )
         .await
         {
@@ -7344,6 +7380,7 @@ impl NgapServer {
                 self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
                     state.ue_policy_association_id = Some(assoc.clone());
                     state.amf_ue.ue_policy_association.id = Some(assoc);
+                    state.amf_ue.ue_policy_association.notify_token = Some(ue_policy_token);
                 });
             }
             Err(e) => log::warn!(
@@ -7738,10 +7775,16 @@ impl NgapServer {
         // paging names the session and the IE type only -- is re-activated like
         // an uplink-data session (§4.2.3.2 step 4, upCnxState ACTIVATING), so the
         // ICS carries it and the buffered downlink is delivered.
-        if let Some(p) = &paging {
+        // #1643 review: not for an N1-only page (the SMF's answer to the UE's own
+        // release or modification), and not for a session the UE's PDU session
+        // status releases. The activation resolves from the `held` snapshot taken
+        // before the release below, so without this check a released session is
+        // ACTIVATING'd at the default SMF.
+        if let Some(p) = paging.as_ref().filter(|p| !p.pending_n1_only) {
             if let (Some(psi), false) = (p.pdu_session_id, p.pending_n2_release) {
                 if !already.contains(&psi)
                     && !plan.activate.contains(&psi)
+                    && !plan.release.contains(&psi)
                     && held.iter().any(|(h, _, _)| *h == psi)
                 {
                     plan.activate.push(psi);
@@ -8025,6 +8068,22 @@ impl NgapServer {
         ran_ue_ngap_id: u32,
         paging: &crate::context::PagingContext,
     ) -> Result<()> {
+        // #1643 review: an N1-only page answers the UE's own release or modification
+        // of a session. If the UE's Service Request or registration already reported
+        // that session inactive, the session was released toward the SMF there
+        // (its SM context is gone), so the N1 is not sent: the UE would answer 5GSM
+        // STATUS #43.
+        if paging.pending_n1_only {
+            if let Some(psi) = paging.pdu_session_id {
+                if !self.sm_context_refs.contains_key(&(amf_ue_ngap_id, psi)) {
+                    log::info!(
+                        "UE {amf_ue_ngap_id}: paged N1 for PSI {psi} not sent: the UE's PDU \
+                         session status released the session"
+                    );
+                    return Ok(());
+                }
+            }
+        }
         if paging.pending_n2_modify {
             if let (Some(psi), Some(transfer)) = (paging.pdu_session_id, &paging.pending_n2) {
                 // #778 review m4: the modification applies to a user plane the
@@ -10349,6 +10408,7 @@ impl NgapServer {
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                     origination_timestamp: origination,
                     request_type: self.ul_request_types.get(&(amf_ue_ngap_id, psi)).copied(),
+                    status_nonce: crate::sbi_path::new_callback_token(),
                 };
                 self.spawn_establishment_attempt(amf_ue_ngap_id, &pending, &state);
                 self.pending_establishments
@@ -10443,70 +10503,62 @@ impl NgapServer {
                     ),
                 }
             }
-            // PDU Session Release Request
+            // PDU Session Release Request. #1637, TS 23.502 §4.3.4.2 step 1a and TS 24.501
+            // §6.4.3.3: the SMF is the 5GSM endpoint. The request goes to it in an
+            // UpdateSMContext, and it answers the PDU SESSION RELEASE COMMAND (with the
+            // UE's PTI and its own cause) and the N2 release (step 3a), which the AMF
+            // relays (`apply_release_request_answer`). The session is forgotten when
+            // the SMF reports it RELEASED, after the UE's RELEASE COMPLETE reaches it.
+            // Before, the AMF released the context itself and answered with its own
+            // RELEASE COMMAND #36, so the SMF never ran the procedure and the UE's
+            // RELEASE COMPLETE found no context to relay to.
             0xD1 => {
                 log::info!("PDU Session Release Request from UE: PSI={psi}, PTI={pti}");
                 // SMF-chosen ref, not the PSI -- see sm_context_refs.
                 let Some(sm_context_ref) =
                     self.sm_context_refs.get(&(amf_ue_ngap_id, psi)).cloned()
                 else {
-                    log::warn!(
-                        "PDU Session Release for UE {amf_ue_ngap_id} PSI {psi} with no stored \
-                         SM context ref: dropping (no session to release)"
-                    );
-                    return Ok(());
+                    // #1643 review, TS 24.501 §7.3.2 c) 2): a PDU session identity that
+                    // matches no existing PDU session is answered with a DL NAS
+                    // TRANSPORT carrying 5GMM #90 "payload was not forwarded".
+                    return self
+                        .answer_payload_not_forwarded(
+                            association_id,
+                            amf_ue_ngap_id,
+                            ran_ue_ngap_id,
+                            sm_pdu,
+                            "for a PDU session release: no such PDU session (TS 24.501 §7.3.2 c) 2))",
+                        )
+                        .await;
                 };
-
-                // #922: released at the SMF off the NGAP task. Durable, keyed on
-                // the session: it reaches the SMF before any later exchange for the
-                // PSI (a new establishment of it), and the UE leaving cannot drop it.
+                let n1 = sm_pdu.to_vec();
+                // The User Location Information, as the 0xCC/0xCD relay sends it.
+                let ue_location = build_sm_context_identity(
+                    self.ue_auth_state.get(amf_ue_ngap_id).as_ref(),
+                    None,
+                )
+                .ue_location;
+                // #922: off the NGAP task, keyed on the session.
                 self.sbi_offload
-                    .spawn_keyed_durable((amf_ue_ngap_id, psi), move || async move {
+                    .spawn_keyed((amf_ue_ngap_id, psi), move || async move {
                         let (host, port) = smf_or_selected(owner).await;
-                        match crate::sbi_path::call_smf_release_sm_context(
+                        let result = crate::sbi_path::call_smf_update_sm_context_release_request(
                             &host,
                             port,
                             &sm_context_ref,
+                            &n1,
+                            ue_location,
                         )
-                        .await
-                        {
-                            Ok(()) => log::info!("SMF SM Context Released: PSI={psi}"),
-                            Err(e) => log::warn!("SMF release failed: {e}"),
-                        }
-                        None
+                        .await;
+                        Some(crate::sbi_offload::SbiOutcome::Smf(
+                            SmfAnswer::ReleaseRequested {
+                                amf_ue_ngap_id,
+                                psi,
+                                request: n1,
+                                result,
+                            },
+                        ))
                     });
-                // #756: the session is over at the AMF too. Forgotten whatever the
-                // SMF answers: the UE is told the session is released below, so
-                // nothing will address it again, and keeping the ref would leak it.
-                self.forget_session(amf_ue_ngap_id, psi);
-
-                // PDU Session Release Command (cause #36 regular deactivation)
-                let release_cmd = vec![0x2E, psi, pti, 0xD3, 0x24];
-                self.send_n1_sm_to_ue(
-                    association_id,
-                    amf_ue_ngap_id,
-                    ran_ue_ngap_id,
-                    psi,
-                    &release_cmd,
-                )
-                .await?;
-
-                let release_ngap =
-                    match crate::ngap_asn1::build_pdu_session_resource_release_command_asn1(
-                        amf_ue_ngap_id,
-                        ran_ue_ngap_id,
-                        &[psi],
-                    ) {
-                        Some(bytes) => bytes,
-                        None => {
-                            log::error!("Failed to build PDU Session Resource Release Command");
-                            return Ok(());
-                        }
-                    };
-                self.send_to_association(association_id, &release_ngap)
-                    .await?;
-                self.clear_up_active(amf_ue_ngap_id, psi);
-                log::info!("PDU Session Resource Release Command sent to gNB: PSI={psi}");
             }
             // PDU Session Release Complete (TS 24.501 Table 9.7.1: 0xD4; 0xD6 is 5GSM
             // STATUS). #582: relayed to the SMF (TS 23.502 §4.3.4.2 step 10), which
@@ -10674,11 +10726,17 @@ impl NgapServer {
             return Ok(());
         };
         if state.is_cm_idle() {
-            log::warn!(
-                "PDU Session Modification answer for UE {amf_ue_ngap_id} PSI {psi}: the UE \
-                 went CM-IDLE meanwhile; nothing is sent (it retransmits on T3581)"
-            );
-            return Ok(());
+            // #1643 review: the SMF's N1 (and N2) are paged for, not dropped.
+            let held = match result {
+                Ok((n1, _)) if smf_n1_for_session(&n1, psi) => Some(n1),
+                Err(crate::sbi_path::SmContextUpdateRefusal {
+                    n1_sm_msg: Some(n1),
+                    ..
+                }) if smf_n1_for_session(&n1, psi) => Some(n1),
+                _ => None,
+            };
+            let amf_ue = state.amf_ue.clone();
+            return self.page_for_smf_answer(&amf_ue, psi, "PDU Session Modification", held);
         }
         let (association_id, ran_ue_ngap_id) = (state.association_id, state.ran_ue_ngap_id);
         match result {
@@ -10712,7 +10770,7 @@ impl NgapServer {
             Err(crate::sbi_path::SmContextUpdateRefusal {
                 reason,
                 n1_sm_msg: Some(n1),
-            }) => {
+            }) if smf_n1_for_session(&n1, psi) => {
                 // #1590, TS 29.502 §5.2.2.3.1 step 2b / TS 24.501 §6.4.2.4.1: the SMF
                 // refused with its own N1 SM answer (its PDU SESSION MODIFICATION
                 // REJECT and 5GSM cause), which the AMF forwards. Before, the AMF
@@ -10721,10 +10779,14 @@ impl NgapServer {
                 self.send_n1_sm_to_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, psi, &n1)
                     .await?;
             }
-            Err(crate::sbi_path::SmContextUpdateRefusal {
-                reason,
-                n1_sm_msg: None,
-            }) => {
+            Err(crate::sbi_path::SmContextUpdateRefusal { reason, n1_sm_msg }) => {
+                if let Some(n1) = n1_sm_msg {
+                    log::warn!(
+                        "SMF refused the modification ({reason}) with an N1 that is not a 5GSM \
+                         message for PSI {psi} ({} bytes); not relayed",
+                        n1.len()
+                    );
+                }
                 log::warn!("SMF modification failed ({reason}), sending reject");
                 // #1546: PDU SESSION MODIFICATION REJECT (TS 24.501 §8.3.8, message type
                 // 0xCA, Table 9.7.2) with 5GSM cause #26 "insufficient resources"
@@ -10734,6 +10796,131 @@ impl NgapServer {
                 let reject = vec![0x2E, psi, pti, 0xCA, 0x1A];
                 self.send_n1_sm_to_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, psi, &reject)
                     .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// #1637: apply the SMF's answer to a UE-requested PDU Session Release.
+    ///
+    /// - Accepted (TS 24.501 §6.4.3.3, TS 23.502 §4.3.4.2 step 3): the SMF's PDU
+    ///   SESSION RELEASE COMMAND goes to the UE. With the SMF's N2 release transfer
+    ///   (an active user plane) it rides a PDU SESSION RESOURCE RELEASE COMMAND as
+    ///   its NAS-PDU, with the transfer as received (TS 38.413 §9.2.1.3); without
+    ///   one, in a DL NAS TRANSPORT.
+    /// - Refused with an N1 (§6.4.3.4, PDU SESSION RELEASE REJECT): relayed.
+    /// - Not answered (no SMF reached, or a refusal with no N1 for this session): the
+    ///   request goes back to the UE with 5GMM #90 "payload was not forwarded"
+    ///   (§5.4.5.3.1 case e)). The UE then releases the session locally and reports
+    ///   its PDU session status in a registration update (§6.4.3.5 d)).
+    ///
+    /// The session is not forgotten here: its context lives until the SMF reports
+    /// it RELEASED.
+    async fn apply_release_request_answer(
+        &mut self,
+        amf_ue_ngap_id: u64,
+        psi: u8,
+        request: &[u8],
+        result: Result<
+            crate::sbi_path::SmContextUpdateResponse,
+            crate::sbi_path::SmContextUpdateRefusal,
+        >,
+    ) -> Result<()> {
+        let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) else {
+            log::info!(
+                "PDU Session Release answer for UE {amf_ue_ngap_id} PSI {psi}: the UE is gone"
+            );
+            return Ok(());
+        };
+        if state.is_cm_idle() {
+            // #1643 review, TS 23.502 §4.3.4.2 step 4: a UE that went CM-IDLE is paged
+            // for the SMF's RELEASE COMMAND (or REJECT), the NAS message only, which is
+            // delivered after its Service Request.
+            let held = match result {
+                Ok(answer) if smf_n1_for_session(&answer.n1_sm_msg, psi) => Some(answer.n1_sm_msg),
+                Err(crate::sbi_path::SmContextUpdateRefusal {
+                    n1_sm_msg: Some(n1),
+                    ..
+                }) if smf_n1_for_session(&n1, psi) => Some(n1),
+                _ => None,
+            };
+            let amf_ue = state.amf_ue.clone();
+            return self.page_for_smf_answer(&amf_ue, psi, "PDU Session Release", held);
+        }
+        let (association_id, ran_ue_ngap_id) = (state.association_id, state.ran_ue_ngap_id);
+        match result {
+            Ok(answer) if smf_n1_for_session(&answer.n1_sm_msg, psi) => {
+                let n1 = answer.n1_sm_msg;
+                if answer.n2_sm_info.is_empty() {
+                    self.send_n1_sm_to_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, psi, &n1)
+                        .await?;
+                    log::info!(
+                        "UE {amf_ue_ngap_id}: the SMF's PDU SESSION RELEASE COMMAND for PSI \
+                         {psi} sent (no user plane to release)"
+                    );
+                    return Ok(());
+                }
+                let plain = gmm_build::build_dl_nas_transport(
+                    Some(psi),
+                    payload_container_type::N1_SM_INFORMATION,
+                    &n1,
+                    None,
+                    None,
+                )
+                .unwrap_or_default();
+                let Some(nas_pdu) = self.protect_nas(amf_ue_ngap_id, &plain) else {
+                    log::warn!(
+                        "UE {amf_ue_ngap_id}: PDU SESSION RELEASE COMMAND for PSI {psi} not \
+                         sent: no NAS security context"
+                    );
+                    return Ok(());
+                };
+                let Some(cmd) =
+                    crate::ngap_asn1::build_pdu_session_resource_release_command_relayed(
+                        amf_ue_ngap_id,
+                        ran_ue_ngap_id,
+                        psi,
+                        &answer.n2_sm_info,
+                        Some(&nas_pdu),
+                    )
+                else {
+                    log::error!("UE {amf_ue_ngap_id}: release of PSI {psi} did not encode");
+                    return Ok(());
+                };
+                self.send_to_association(association_id, &cmd).await?;
+                self.clear_up_active(amf_ue_ngap_id, psi);
+                log::info!(
+                    "UE {amf_ue_ngap_id}: PDU Session Resource Release Command for PSI {psi} \
+                     sent with the SMF's RELEASE COMMAND"
+                );
+            }
+            Ok(answer) => {
+                log::warn!(
+                    "UE {amf_ue_ngap_id}: the SMF accepted the release of PSI {psi} without \
+                     a 5GSM answer for it ({} bytes); nothing is sent (the UE retransmits on \
+                     T3582)",
+                    answer.n1_sm_msg.len()
+                );
+            }
+            Err(crate::sbi_path::SmContextUpdateRefusal {
+                reason,
+                n1_sm_msg: Some(n1),
+            }) if smf_n1_for_session(&n1, psi) => {
+                log::warn!(
+                    "SMF refused the release of PSI {psi} ({reason}); relaying its N1 SM answer"
+                );
+                self.send_n1_sm_to_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, psi, &n1)
+                    .await?;
+            }
+            Err(crate::sbi_path::SmContextUpdateRefusal { reason, .. }) => {
+                self.answer_payload_not_forwarded(
+                    association_id,
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    request,
+                    &format!("for the PDU session release ({reason})"),
+                )
+                .await?;
             }
         }
         Ok(())
@@ -10896,6 +11083,55 @@ impl NgapServer {
         }
     }
 
+    /// #1643 review: the SMF's answer to a UE-requested modification or release found
+    /// the UE CM-IDLE. TS 23.502 §4.3.4.2 step 4 / §4.3.3.2 and §4.2.3.3: the AMF pages
+    /// it and delivers the SMF's N1 after the Service Request, through the N1N2
+    /// transfer paging path, N1 only: no N2, and no user plane re-activated for the
+    /// session (`pending_n1_only`). If the page fails, the N1 is dropped with it, and
+    /// the SMF's T3591/T3592 (or the UE's T3581/T3582) recovers. With nothing to
+    /// deliver (no N1 of the SMF's for this session),
+    /// nothing is paged.
+    fn page_for_smf_answer(
+        &mut self,
+        amf_ue: &AmfUe,
+        psi: u8,
+        what: &str,
+        held: Option<Vec<u8>>,
+    ) -> Result<()> {
+        let Some(n1) = held else {
+            log::warn!(
+                "{what} answer for UE {} PSI {psi}: the UE went CM-IDLE meanwhile and the \
+                 SMF gave no N1 for it; nothing is paged",
+                amf_ue.id
+            );
+            return Ok(());
+        };
+        log::info!(
+            "{what} answer for UE {} PSI {psi}: the UE went CM-IDLE meanwhile; paging it \
+             for the SMF's {}-byte N1",
+            amf_ue.id,
+            n1.len()
+        );
+        // #1643 review, TS 23.502 §4.3.4.2 step 4: the NAS message only. A CM-IDLE
+        // UE has no AN resources, so the SMF's N2 (a release or modify transfer)
+        // has nothing to act on and is not paged for.
+        // The queued-transfer path: behind an ongoing page it waits as a connected
+        // downlink, and its own page is N1-only, either way (the item carries the
+        // mark, so a re-page after a failed ongoing page keeps it).
+        self.page_for_queued_downlink(
+            amf_ue,
+            crate::context::PendingConnectedDownlink {
+                amf_ue_ngap_id: amf_ue.id,
+                pdu_session_id: psi,
+                n1: Some(n1),
+                n2: crate::context::ConnectedN2::None,
+                failure_notify_uri: None,
+                n1_only: true,
+            },
+        );
+        Ok(())
+    }
+
     /// Page a UE whose queued N1N2 transfer found it CM-IDLE (#757). The transfer
     /// is kept in the paging context and delivered after the Service Request, as if
     /// the SMF's request had arrived while the UE was idle.
@@ -10923,6 +11159,8 @@ impl NgapServer {
             return;
         }
         let (n2, paged) = match item.n2 {
+            // #1643 review: the SMF's answer to the UE's own procedure, N1 only.
+            _ if item.n1_only => (None, PagedN2::N1Only),
             ConnectedN2::None => (None, PagedN2::Setup),
             ConnectedN2::Release => (None, PagedN2::Release),
             ConnectedN2::Setup(t) => (t, PagedN2::Setup),
@@ -11212,6 +11450,7 @@ impl NgapServer {
         sd: Option<u32>,
         dnn: Option<&str>,
         sm_pdu: &[u8],
+        status_nonce: Option<&str>,
         resp: crate::sbi_path::SmContextCreateResponse,
     ) -> Result<()> {
         // #796: an establishment that was waiting for an SMF is done.
@@ -11248,6 +11487,10 @@ impl NgapServer {
         let forced_full = false;
         let recorded =
             !forced_full && record_amf_session(amf_ue_ngap_id, psi, &resp.sm_context_ref, sst, sd);
+        if recorded {
+            // #1518: the nonce of the smContextStatusUri this SMF was given.
+            record_status_nonce(amf_ue_ngap_id, psi, status_nonce);
+        }
         if !recorded {
             // #756 review m1: a session the AMF cannot record is one it could never
             // page, modify, re-activate or release, and its refs would be swept within
@@ -11407,7 +11650,7 @@ impl NgapServer {
         let key = (amf_ue_ngap_id, psi);
         // A UE retransmission of the same request keeps the original window, and
         // the original origination timestamp (#980 review).
-        let (first_failure, generation, origination_timestamp, request_type) =
+        let (first_failure, generation, origination_timestamp, request_type, status_nonce) =
             self.pending_establishments.get(&key).map_or_else(
                 || {
                     (
@@ -11415,6 +11658,7 @@ impl NgapServer {
                         ESTABLISHMENT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                         origination_timestamp.to_string(),
                         self.ul_request_types.get(&key).copied(),
+                        crate::sbi_path::new_callback_token(),
                     )
                 },
                 |p| {
@@ -11423,6 +11667,7 @@ impl NgapServer {
                         p.generation,
                         p.origination_timestamp.clone(),
                         p.request_type,
+                        p.status_nonce.clone(),
                     )
                 },
             );
@@ -11465,6 +11710,7 @@ impl NgapServer {
                 generation,
                 origination_timestamp,
                 request_type,
+                status_nonce,
             },
         );
         Ok(())
@@ -11483,8 +11729,8 @@ impl NgapServer {
     ) -> Result<()> {
         let psi = sm_pdu[1];
         log::warn!(
-            "UE {amf_ue_ngap_id}: PDU session establishment PSI={psi} not forwarded: no SMF \
-             reachable {why}; 5GMM #90 (TS 24.501 §5.4.5.3.1 e))"
+            "UE {amf_ue_ngap_id}: 5GSM message for PSI={psi} not forwarded: no SMF reachable \
+             {why}; 5GMM #90 (TS 24.501 §5.4.5.3.1 e))"
         );
         let plain = gmm_build::build_dl_nas_transport(
             Some(psi),
@@ -11569,6 +11815,23 @@ impl NgapServer {
         }
     }
 
+    /// #1518 (#1625 review round 4): the key a NEW PDU session's smContextStatusUri
+    /// token derives from. A UE context restored from before #1518 has none, so it is
+    /// minted here, at its first new session, and stored: every session established
+    /// from now on is tokened, and only its legacy sessions (no nonce) keep the
+    /// token-less URI.
+    pub(super) fn sm_context_status_key_for_new_session(
+        &mut self,
+        amf_ue_ngap_id: u64,
+    ) -> Option<String> {
+        self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
+            s.amf_ue
+                .sm_context_status_key
+                .get_or_insert_with(crate::sbi_path::new_callback_token)
+                .clone()
+        })
+    }
+
     /// Start one off-task re-selection attempt (#796): SMF selection (NRF discovery
     /// on a cache miss) and CreateSMContext, bounded by what is left of the window.
     fn spawn_establishment_attempt(
@@ -11584,6 +11847,7 @@ impl NgapServer {
             .first()
             .map_or((1, None), |n| (n.sst, n.sd));
         let redcap_indication = state.amf_ue.redcap_indication;
+        let status_key = self.sm_context_status_key_for_new_session(amf_ue_ngap_id);
         let identity = {
             let ctx = crate::context::amf_self();
             let guard = ctx.read().ok();
@@ -11591,6 +11855,8 @@ impl NgapServer {
                 // The establishment's own stamp, not a new one: a retry is the
                 // same request (#980 review).
                 origination_timestamp: Some(p.origination_timestamp.clone()),
+                sm_context_status_key: status_key,
+                sm_context_status_nonce: Some(p.status_nonce.clone()),
                 request_type: p
                     .request_type
                     .and_then(crate::sbi_path::request_type_for_smf),
@@ -11711,6 +11977,15 @@ impl NgapServer {
                 result,
             } => {
                 self.apply_modification_answer(amf_ue_ngap_id, psi, pti, result)
+                    .await
+            }
+            SmfAnswer::ReleaseRequested {
+                amf_ue_ngap_id,
+                psi,
+                request,
+                result,
+            } => {
+                self.apply_release_request_answer(amf_ue_ngap_id, psi, &request, result)
                     .await
             }
             SmfAnswer::DownlinkActivation(a) => {
@@ -12063,6 +12338,7 @@ impl NgapServer {
                     a.sd,
                     a.dnn.as_deref(),
                     &p.sm_pdu,
+                    Some(&p.status_nonce),
                     resp,
                 )
                 .await
@@ -20583,6 +20859,8 @@ fn build_sm_context_identity(
         });
     crate::sbi_path::SmContextIdentity {
         supi: state.and_then(|s| s.amf_ue.supi.clone()),
+        sm_context_status_key: state.and_then(|s| s.amf_ue.sm_context_status_key.clone()),
+        sm_context_status_nonce: None,
         pei: state.and_then(|s| s.amf_ue.pei.clone()),
         guami,
         serving_plmn,
@@ -20927,9 +21205,13 @@ pub(crate) struct ServiceRequestSessionIes {
     pub pdu_session_status: Option<u16>,
 }
 
-/// Read them from a decoded SERVICE REQUEST. A UE in CM-IDLE sends these
-/// non-cleartext IEs only inside the NAS message container (TS 24.501 §4.4.6), so
-/// the container's full message wins when it is present.
+/// Whether an N1 SM the SMF answered is a 5GSM message (EPD 0x2E, TS 24.501 §9.2)
+/// for PDU session `psi`, so the AMF may relay it to the UE for that session (#1637,
+/// #1590 review). A mismatched or foreign N1 is not relayed.
+fn smf_n1_for_session(n1: &[u8], psi: u8) -> bool {
+    n1.len() >= 4 && n1[0] == 0x2E && n1[1] == psi
+}
+
 /// The SMF an exchange for an existing session goes to (#669): the one holding its
 /// context, else the selected one. Resolving it can be an NRF lookup, so this runs
 /// inside the off-task exchange (#922), never on the NGAP task.
@@ -20944,6 +21226,9 @@ async fn smf_or_selected(owner: Option<(String, u16)>) -> (String, u16) {
     }
 }
 
+/// Read them from a decoded SERVICE REQUEST. A UE in CM-IDLE sends these
+/// non-cleartext IEs only inside the NAS message container (TS 24.501 §4.4.6), so
+/// the container's full message wins when it is present.
 pub(crate) fn service_request_session_ies(
     plain: &[u8],
     decipher_container: &dyn Fn(&mut Vec<u8>),
@@ -28491,6 +28776,9 @@ mod tests {
         ue.amf_ue.supi = Some(supi.to_string());
         ue.amf_ue.policy_association.id = Some("am-pol-1247".to_string());
         ue.amf_ue.ue_policy_association.id = Some("ue-pol-1247".to_string());
+        // #1518: the associations' notificationUri tokens.
+        ue.amf_ue.policy_association.notify_token = Some("amp-t".to_string());
+        ue.amf_ue.ue_policy_association.notify_token = Some("uep-t".to_string());
         ngap.ue_auth_state.insert(id, ue);
         let notify = |path: String, body: serde_json::Value| {
             crate::namf_server::namf_request_handler(
@@ -28502,7 +28790,7 @@ mod tests {
         let base = format!("/namf-callback/v1/{supi}");
 
         let update = notify(
-            format!("{base}/am-policy-notify/update"),
+            format!("{base}/am-policy-notify/amp-t/update"),
             serde_json::json!({ "resourceUri": "x/policies/am-pol-1247", "rfsp": 3 }),
         )
         .await;
@@ -28514,7 +28802,7 @@ mod tests {
         .await;
         assert_eq!(unknown.status, 404, "no such UE");
         let foreign = notify(
-            format!("{base}/am-policy-notify/terminate"),
+            format!("{base}/am-policy-notify/amp-t/terminate"),
             serde_json::json!({
                 "resourceUri": "http://pcf/npcf-am-policy-control/v1/policies/someone-else",
                 "cause": "UNSPECIFIED",
@@ -28527,7 +28815,7 @@ mod tests {
         );
         // The same for the UE policy: refused, and the UE's real association stays.
         let foreign_ue = notify(
-            format!("{base}/ue-policy-notify/terminate"),
+            format!("{base}/ue-policy-notify/uep-t/terminate"),
             serde_json::json!({
                 "resourceUri": "http://pcf/npcf-ue-policy-control/v1/policies/someone-else",
                 "cause": "UNSPECIFIED",
@@ -28536,7 +28824,7 @@ mod tests {
         .await;
         assert_eq!(foreign_ue.status, 404);
         let missing = notify(
-            format!("{base}/am-policy-notify/terminate"),
+            format!("{base}/am-policy-notify/amp-t/terminate"),
             serde_json::json!({ "cause": "UNSPECIFIED" }),
         )
         .await;
@@ -28552,12 +28840,12 @@ mod tests {
 
         for (op, path, kind) in [
             (
-                "am-policy-notify",
+                "am-policy-notify/amp-t",
                 "npcf-am-policy-control/v1/policies/am-pol-1247",
                 "AM",
             ),
             (
-                "ue-policy-notify",
+                "ue-policy-notify/uep-t",
                 "npcf-ue-policy-control/v1/policies/ue-pol-1247",
                 "UE",
             ),

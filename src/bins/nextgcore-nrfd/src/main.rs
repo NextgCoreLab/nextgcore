@@ -1538,6 +1538,10 @@ fn registration_notification_event(is_new: bool) -> NotificationEventType {
 
 /// Handle NF Register request
 async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1633: the registry key (TS 29.510 §5.2.2.2.2: upper-case UUIDs are handled as
+    // lower-case).
+    let nf_instance_id = nextgcore_nrfd::nnrf_handler::canonical_nf_instance_id(nf_instance_id);
+    let nf_instance_id = nf_instance_id.as_str();
     log::info!("NF Register: {nf_instance_id}");
 
     // #1611: a verified caller registers only its own NF instance.
@@ -1670,6 +1674,10 @@ async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiRe
 
 /// Handle NF Profile Retrieval request
 async fn handle_nf_profile_retrieval(nf_instance_id: &str) -> SbiResponse {
+    // #1633: the registry key (TS 29.510 §5.2.2.2.2: upper-case UUIDs are handled as
+    // lower-case).
+    let nf_instance_id = nextgcore_nrfd::nnrf_handler::canonical_nf_instance_id(nf_instance_id);
+    let nf_instance_id = nf_instance_id.as_str();
     log::debug!("NF Profile Retrieval: {nf_instance_id}");
 
     let manager = nf_manager();
@@ -1689,12 +1697,16 @@ async fn handle_nf_profile_retrieval(nf_instance_id: &str) -> SbiResponse {
 
 /// Handle NF Deregister request
 async fn handle_nf_deregister(nf_instance_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1633: the registry key (TS 29.510 §5.2.2.2.2: upper-case UUIDs are handled as
+    // lower-case).
+    let nf_instance_id = nextgcore_nrfd::nnrf_handler::canonical_nf_instance_id(nf_instance_id);
+    let nf_instance_id = nf_instance_id.as_str();
     log::info!("NF Deregister: {nf_instance_id}");
 
-    // #1611: a verified caller deregisters only its own NF instance.
-    if let Some(refused) =
-        RegistrantIdentity::of(request, nrf_policy()).bind_instance("NFDeregister", nf_instance_id)
-    {
+    // #1611: a verified caller deregisters only its own NF instance, and (for a
+    // certificate that names NF types) only one of a type it names.
+    let registrant = RegistrantIdentity::of(request, nrf_policy());
+    if let Some(refused) = registrant.bind_instance("NFDeregister", nf_instance_id) {
         return refused;
     }
 
@@ -1702,6 +1714,12 @@ async fn handle_nf_deregister(nf_instance_id: &str, request: &SbiRequest) -> Sbi
 
     // Fetch the profile before deregistering so we can notify subscribers
     let profile_for_notify = manager.get(nf_instance_id);
+    if let Some(refused) = profile_for_notify
+        .as_ref()
+        .and_then(|p| registrant.bind_nf_type("NFDeregister", nf_instance_id, &p.nf_type))
+    {
+        return refused;
+    }
 
     match manager.deregister(nf_instance_id) {
         Ok(_) => {
@@ -1842,6 +1860,10 @@ fn patch_requests_self_suspension(patch: &serde_json::Value, is_json_patch: bool
 }
 
 async fn handle_nf_update(nf_instance_id: &str, request: &SbiRequest) -> SbiResponse {
+    // #1633: the registry key (TS 29.510 §5.2.2.2.2: upper-case UUIDs are handled as
+    // lower-case).
+    let nf_instance_id = nextgcore_nrfd::nnrf_handler::canonical_nf_instance_id(nf_instance_id);
+    let nf_instance_id = nf_instance_id.as_str();
     log::info!("NF Update: {nf_instance_id}");
 
     // #1611: a verified caller updates only its own NF instance, checked before
@@ -3593,7 +3615,9 @@ impl RegistrantIdentity {
             .instance_ids
             .iter()
             .find(|(_, id)| !id.eq_ignore_ascii_case(nf_instance_id.trim()))?;
-        log::warn!(
+        // debug, not warn: a peer can send these at will (#1620 review m7); the
+        // refusal is counted by the NRF's per-operation outcome metrics.
+        log::debug!(
             "{operation} for NF instance {nf_instance_id} refused: the caller's {source} \
              identifies NF instance {id}"
         );
@@ -3619,7 +3643,7 @@ impl RegistrantIdentity {
         {
             return None;
         }
-        log::warn!(
+        log::debug!(
             "{operation} for NF instance {nf_instance_id} refused: nfType {nf_type} is not in \
              the caller's certificate NFTypes {:?}",
             self.nf_types
@@ -4058,7 +4082,12 @@ async fn handle_access_token_request_with_policy(
     let target_instance: Option<NfProfile> = if !target_nf_instance_id.is_empty() {
         let inst = all
             .iter()
-            .find(|p| p.nf_instance_id == target_nf_instance_id)
+            .find(|p| {
+                nextgcore_nrfd::nnrf_handler::same_nf_instance_id(
+                    &p.nf_instance_id,
+                    &target_nf_instance_id,
+                )
+            })
             .cloned();
         match inst {
             Some(ref p) => {
@@ -9468,6 +9497,8 @@ mod registrant_binding_tests_1611 {
             let upper = own.to_ascii_uppercase();
             let resp = put(&client, &upper, "CUSTOM_T1611A").await;
             assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+            // The registry keys instances as written; drop the upper-case one.
+            let _ = nf_manager().deregister(&upper);
             let resp = put(&client, own, "CUSTOM_T1611A").await;
             assert_eq!(resp.status, 201, "{:?}", resp.http.content);
 
@@ -9488,6 +9519,21 @@ mod registrant_binding_tests_1611 {
             assert_eq!(resp.status, 400, "{:?}", resp.http.content);
             assert_eq!(cause(&resp), "INVALID_CLIENT");
             assert_eq!(stored_type(own).as_deref(), Some("CUSTOM_T1611A"));
+
+            // Checked before the lookup: an instance nobody registered is 400, not
+            // 404, so the caller learns nothing about which instances exist.
+            let resp = patch(
+                &client,
+                other,
+                json!([{"op": "replace", "path": "/nfStatus", "value": "SUSPENDED"}]),
+            )
+            .await;
+            assert_eq!(resp.status, 400, "{:?}", resp.http.content);
+            let resp = client
+                .delete(&format!("/nnrf-nfm/v1/nf-instances/{other}"))
+                .await
+                .expect("DELETE completes");
+            assert_eq!(resp.status, 400, "{:?}", resp.http.content);
 
             // Another NF's existing instance: neither patched nor deregistered.
             let theirs = NfProfile::from_json(&profile(other, "CUSTOM_T1611B")).expect("profile");
@@ -9549,6 +9595,7 @@ mod registrant_binding_tests_1611 {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_certificate_without_a_uri_san_binds_only_the_type_1611() {
         let id = "1611e0e0-0000-4000-8000-00000000000e";
+        let other = "1611f0f0-0000-4000-8000-00000000000f";
         let (server, client) = mtls_nrf("no-uri", None, Some(&["CUSTOM_T1611E"])).await;
         let run = async {
             let resp = put(&client, id, "CUSTOM_T1611F").await;
@@ -9556,11 +9603,22 @@ mod registrant_binding_tests_1611 {
             assert_eq!(cause(&resp), "INVALID_CLIENT");
             let resp = put(&client, id, "CUSTOM_T1611E").await;
             assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+            // Nor may it deregister an instance of a type it does not name.
+            let theirs = NfProfile::from_json(&profile(other, "CUSTOM_T1611F")).expect("profile");
+            nf_manager().register(theirs).expect("stored");
+            let resp = client
+                .delete(&format!("/nnrf-nfm/v1/nf-instances/{other}"))
+                .await
+                .expect("DELETE completes");
+            assert_eq!(resp.status, 400, "{:?}", resp.http.content);
+            assert_eq!(cause(&resp), "INVALID_CLIENT");
+            assert_eq!(stored_type(other).as_deref(), Some("CUSTOM_T1611F"));
         };
         tokio::time::timeout(Duration::from_secs(30), run)
             .await
             .expect("bounded");
         let _ = nf_manager().deregister(id);
+        let _ = nf_manager().deregister(other);
         server.stop().await.ok();
     }
 
@@ -9840,5 +9898,115 @@ mod dev_pki_tests_1617 {
         let outcome = tokio::time::timeout(Duration::from_secs(60), run).await;
         server.stop().await.ok();
         outcome.expect("dev PKI registrations finish");
+    }
+}
+
+/// #1633: TS 29.510 §5.2.2.2.2: an NF Instance ID UUID in upper case is handled as
+/// if it were lower case. One NF, however its ID is cased, is one registry entry.
+#[cfg(test)]
+mod registry_uuid_case_tests_1633 {
+    use super::*;
+    use serde_json::json;
+
+    /// Over the real handler: the upper-case PUT replaces (200) the lower-case
+    /// registration instead of adding a second instance; GET, PATCH, discovery by
+    /// `target-nf-instance-id` and DELETE in the other case all reach the one entry,
+    /// and the stored profile carries the canonical (lower-case) ID.
+    ///
+    /// REVERT-VERIFIED: without the canonicalisation the upper-case PUT is a second
+    /// 201 and discovery returns the NF twice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_nf_is_one_entry_however_its_uuid_is_cased_1633() {
+        let lower = "1633aaaa-bbbb-4ccc-8ddd-eeeeffff0001";
+        let upper = lower.to_ascii_uppercase();
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), listener);
+        server.start(nrf_sbi_request_handler).await.expect("starts");
+        let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", addr.port());
+        let profile = |id: &str| {
+            json!({
+                "nfInstanceId": id,
+                "nfType": "CUSTOM_T1633",
+                "nfStatus": "REGISTERED",
+                "heartBeatTimer": 10,
+                "ipv4Addresses": ["10.16.33.1"]
+            })
+        };
+        let entries = || {
+            nf_manager()
+                .list()
+                .into_iter()
+                .filter(|p| p.nf_instance_id.eq_ignore_ascii_case(lower))
+                .count()
+        };
+        let run = async {
+            let r = client
+                .put_json(
+                    &format!("/nnrf-nfm/v1/nf-instances/{lower}"),
+                    &profile(lower),
+                )
+                .await
+                .expect("PUT");
+            assert_eq!(r.status, 201);
+            let r = client
+                .put_json(
+                    &format!("/nnrf-nfm/v1/nf-instances/{upper}"),
+                    &profile(&upper),
+                )
+                .await
+                .expect("PUT");
+            assert_eq!(r.status, 200, "a replacement of the same instance");
+            assert_eq!(entries(), 1);
+
+            let r = client
+                .get(&format!("/nnrf-nfm/v1/nf-instances/{upper}"))
+                .await
+                .expect("GET");
+            assert_eq!(r.status, 200);
+            let body: serde_json::Value =
+                serde_json::from_str(r.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(body["nfInstanceId"], lower, "stored under the canonical ID");
+
+            let patch = SbiRequest::patch(format!("/nnrf-nfm/v1/nf-instances/{upper}")).with_body(
+                json!([{"op": "replace", "path": "/ipv4Addresses", "value": ["10.16.33.2"]}])
+                    .to_string(),
+                "application/json-patch+json",
+            );
+            let r = client.send_request(patch).await.expect("PATCH");
+            assert_eq!(r.status, 200, "{:?}", r.http.content);
+            assert_eq!(
+                nf_manager().get(lower).expect("one").ipv4_addresses,
+                ["10.16.33.2"]
+            );
+            assert_eq!(entries(), 1);
+
+            let r = client
+                .get(&format!(
+                    "/nnrf-disc/v1/nf-instances?target-nf-type=CUSTOM_T1633&requester-nf-type=AMF\
+                     &target-nf-instance-id={upper}"
+                ))
+                .await
+                .expect("discover");
+            assert_eq!(r.status, 200, "{:?}", r.http.content);
+            let body: serde_json::Value =
+                serde_json::from_str(r.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                body["nfInstances"].as_array().map(Vec::len),
+                Some(1),
+                "{body}"
+            );
+
+            let r = client
+                .delete(&format!("/nnrf-nfm/v1/nf-instances/{upper}"))
+                .await
+                .expect("DELETE");
+            assert_eq!(r.status, 204);
+            assert_eq!(entries(), 0);
+        };
+        tokio::time::timeout(Duration::from_secs(30), run)
+            .await
+            .expect("bounded");
+        let _ = nf_manager().deregister(lower);
+        server.stop().await.ok();
     }
 }

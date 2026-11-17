@@ -44,7 +44,7 @@ use std::sync::Arc;
 pub struct CallbackPath<'a> {
     /// The `{var}` segments, in path order.
     pub vars: Vec<&'a str>,
-    /// The `{token}` segment (always the last one).
+    /// The `{token}` segment (followed by literal segments only, #1518).
     pub token: &'a str,
 }
 
@@ -157,8 +157,14 @@ impl OAuth2CallbackExemption {
     /// `check` accepts the token in its path.
     ///
     /// `pattern` is an absolute path of `/`-separated segments: lowercase
-    /// literals (`[a-z0-9-]+`), `{var}` placeholders, and exactly one `{token}`,
-    /// which must be the last segment. The first segment must be a literal.
+    /// literals (`[a-z0-9-]+`), `{var}` placeholders, and exactly one `{token}`.
+    /// The first segment must be a literal. The `{token}` is the last segment,
+    /// or is followed only by literals: a notifier that appends an operation to
+    /// the URI it was given (TS 29.507 / TS 29.512 / TS 29.525
+    /// `{notificationUri}/update`, `/terminate`) keeps the token in place (#1518).
+    /// The segment before `{token}` must be one of
+    /// [`crate::log_redact::CALLBACK_TOKEN_SEGMENTS`], so that every token a route
+    /// admits on is also redacted from the logs.
     ///
     /// # Panics
     /// On a malformed pattern or method: both are fixed at the NF's
@@ -210,10 +216,25 @@ impl OAuth2CallbackExemption {
             matches!(segments.first(), Some(Segment::Literal(_))),
             "callback exemption {pattern:?} must start with a literal segment"
         );
+        let token_at = segments.iter().position(|s| *s == Segment::Token);
         assert!(
             segments.iter().filter(|s| **s == Segment::Token).count() == 1
-                && segments.last() == Some(&Segment::Token),
-            "callback exemption {pattern:?} needs exactly one {{token}}, as its last segment"
+                && token_at.is_some_and(|at| {
+                    segments[at + 1..]
+                        .iter()
+                        .all(|s| matches!(s, Segment::Literal(_)))
+                }),
+            "callback exemption {pattern:?} needs exactly one {{token}}, followed by literal \
+             segments only"
+        );
+        assert!(
+            token_at.is_some_and(|at| matches!(
+                segments.get(at.wrapping_sub(1)),
+                Some(Segment::Literal(lit))
+                    if crate::log_redact::CALLBACK_TOKEN_SEGMENTS.contains(&lit.as_str())
+            )),
+            "callback exemption {pattern:?}: the segment before {{token}} must be listed in \
+             log_redact::CALLBACK_TOKEN_SEGMENTS"
         );
         Self {
             method: method.to_string(),
@@ -400,10 +421,14 @@ mod tests {
     /// byte.
     #[test]
     fn variable_and_token_segments_are_drawn_from_a_safe_charset() {
-        let any = OAuth2CallbackExemption::new("POST", "/nx-callback/v1/{var}/n/{token}", |_| true);
+        let any = OAuth2CallbackExemption::new(
+            "POST",
+            "/nx-callback/v1/{var}/dereg-notify/{token}",
+            |_| true,
+        );
         for ok in ["imsi-001010000000001", "nai-user@realm.example", "ee_1.2"] {
             assert!(
-                any.admits("POST", &format!("/nx-callback/v1/{ok}/n/{GOOD}")),
+                any.admits("POST", &format!("/nx-callback/v1/{ok}/dereg-notify/{GOOD}")),
                 "{ok}"
             );
         }
@@ -412,23 +437,26 @@ mod tests {
         for bad in [
             "", ".", "..", "a%2Fb", "%2e%2e", "a b", "a+b", "a;b", "a\\b",
         ] {
-            let path = format!("/nx-callback/v1/{bad}/n/{GOOD}");
+            let path = format!("/nx-callback/v1/{bad}/dereg-notify/{GOOD}");
             assert!(any.match_path("POST", &path).is_none(), "{path}");
         }
         for bad in ["a.b", "a@b", "a%41", "..", "a~b"] {
-            let path = format!("/nx-callback/v1/ue/n/{bad}");
+            let path = format!("/nx-callback/v1/ue/dereg-notify/{bad}");
             assert!(any.match_path("POST", &path).is_none(), "{path}");
         }
     }
 
     #[test]
     fn the_check_decides_even_for_a_well_formed_path() {
-        let deny =
-            OAuth2CallbackExemption::new("POST", "/nx-callback/v1/notify/{token}", |_| false);
+        let deny = OAuth2CallbackExemption::new(
+            "POST",
+            "/nx-callback/v1/nf-status-notify/{token}",
+            |_| false,
+        );
         assert!(deny
-            .match_path("POST", &format!("/nx-callback/v1/notify/{GOOD}"))
+            .match_path("POST", &format!("/nx-callback/v1/nf-status-notify/{GOOD}"))
             .is_some());
-        assert!(!deny.admits("POST", &format!("/nx-callback/v1/notify/{GOOD}")));
+        assert!(!deny.admits("POST", &format!("/nx-callback/v1/nf-status-notify/{GOOD}")));
     }
 
     /// #1522: a verified-peer route is decided only with a peer identity. The sync
@@ -520,8 +548,42 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "exactly one {token}")]
-    fn a_token_that_is_not_last_is_refused() {
-        OAuth2CallbackExemption::new("POST", "/nx-callback/v1/{token}/notify", |_| true);
+    fn a_token_followed_by_a_variable_is_refused() {
+        OAuth2CallbackExemption::new("POST", "/nx-callback/v1/dereg-notify/{token}/{var}", |_| {
+            true
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "CALLBACK_TOKEN_SEGMENTS")]
+    fn a_token_after_an_unredacted_segment_is_refused_1518() {
+        OAuth2CallbackExemption::new("POST", "/nx-callback/v1/notify/{token}", |_| true);
+    }
+
+    /// #1518: a notifier that appends `/update` or `/terminate` to the URI it was
+    /// given (TS 29.507 §4.2.4) keeps the token where it was, followed only by
+    /// the exact literal; no other suffix, and no missing one, is the route.
+    #[test]
+    fn literal_segments_after_the_token_are_matched_exactly_1518() {
+        let route = OAuth2CallbackExemption::new(
+            "POST",
+            "/nx-callback/v1/{var}/am-policy-notify/{token}/update",
+            |cb| cb.token == "t0k",
+        );
+        assert!(route.admits("POST", "/nx-callback/v1/imsi-1/am-policy-notify/t0k/update"));
+        let cb = route
+            .match_path("POST", "/nx-callback/v1/imsi-1/am-policy-notify/t0k/update")
+            .expect("matches");
+        assert_eq!((cb.vars, cb.token), (vec!["imsi-1"], "t0k"));
+        for path in [
+            "/nx-callback/v1/imsi-1/am-policy-notify/t0k",
+            "/nx-callback/v1/imsi-1/am-policy-notify/t0k/terminate",
+            "/nx-callback/v1/imsi-1/am-policy-notify/t0k/update/x",
+            "/nx-callback/v1/imsi-1/am-policy-notify/t0k/update/",
+            "/nx-callback/v1/imsi-1/am-policy-notify/bad/update",
+        ] {
+            assert!(!route.admits("POST", path), "{path}");
+        }
     }
 
     #[test]
@@ -545,6 +607,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "not an HTTP method")]
     fn a_lowercase_method_is_refused() {
-        OAuth2CallbackExemption::new("post", "/nx-callback/v1/{token}", |_| true);
+        OAuth2CallbackExemption::new("post", "/nx-callback/v1/nf-status-notify/{token}", |_| true);
     }
 }
