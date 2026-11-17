@@ -4704,7 +4704,7 @@ fn idle_mobility_update(ue_keys: &crate::context::AmfUe, tmsi: u32, extra: &[u8]
 }
 
 /// A page for `old_id`'s UE, identified by the fixture GUTI's 5G-S-TMSI with `tmsi`.
-fn page_for(old_id: u64, tmsi: u32, psi: u8) -> crate::context::PagingContext {
+pub(super) fn page_for(old_id: u64, tmsi: u32, psi: u8) -> crate::context::PagingContext {
     crate::context::PagingContext {
         amf_ue_ngap_id: old_id,
         tmsi,
@@ -5007,12 +5007,13 @@ async fn a_page_answered_by_an_update_without_session_ies_still_sets_its_session
 
 /// **#1102 (#1105 review m1), updated by #1650: an answered page no update Accept
 /// takes.** A paged CM-IDLE UE answers with a verified INITIAL registration, which is
-/// not an update and takes no page. The page is marked answered by the new connection
-/// (so it is not sent again), and the initial registration supersedes the old one
-/// (#774), whose sessions are released. #1650: that is the old registration's local
-/// deregistration, so its page stops at once and its requester is told
-/// (FAILURE_CAUSE_UNSPECIFIED) instead of waiting out T3513 for UE_NOT_RESPONDING.
-/// It is still not silently dropped.
+/// not an update and takes no page. The page is marked answered by the new connection,
+/// so it is not sent again. In this fixture the new registration goes no further
+/// (no AUSF answers it), and the UE's record is forgotten. #1650's `forget_ue` takes
+/// the page through `answered_by` and tells its requester (FAILURE_CAUSE_UNSPECIFIED)
+/// at once, rather than leaving it to T3513 and UE_NOT_RESPONDING. The successful
+/// registration's case is `a_successful_initial_registration_stops_the_answered_page_1698`
+/// (initial_registration_tests).
 ///
 /// REVERT-VERIFIED: removing the page when the registration answers it (the first
 /// cut of #1102) sends no notification, and the count below is 0.

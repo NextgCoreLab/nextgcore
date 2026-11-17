@@ -605,3 +605,68 @@ async fn the_new_establishments_reach_the_smf_after_the_earlier_releases() {
     assert!(server.supersede_barriers.is_empty());
     server.forget_ue(new);
 }
+
+/// **#1698**, TS 29.518 §5.2.2.3.2 / Table 6.1.6.3.6-1: a paged UE that answered with
+/// an initial registration from 5GMM-IDLE (#1102) moved its record to the new
+/// connection, and its page stayed keyed by the idle ID, marked answered by the new
+/// one. When 5G-AKA proves the UE genuine and its earlier sessions are superseded
+/// (#774), the page stops at once and its requester gets one
+/// FAILURE_CAUSE_UNSPECIFIED. Before, the page waited out T3513 and the requester
+/// was told UE_NOT_RESPONDING, although the UE had responded. The new registration
+/// goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_successful_initial_registration_stops_the_answered_page_1698() {
+    let (_smf, smf_port, _seen) = activating_smf().await;
+    let supi = "imsi-001010000169801";
+    let (_ausf, ausf_port) = confirming_ausf("AUTHENTICATION_SUCCESS", supi).await;
+    let _env = AusfEnvGuard::acquire(ausf_port).await;
+    let _pages = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
+    let mut server = capturing_ngap_server().await;
+    let (idle_id, new, tmsi) = (16_980_001u64, 16_980_002u64, 0x1698_0001u32);
+    authenticating_ue(
+        &mut server,
+        new,
+        43,
+        crate::gmm_build::registration_type::INITIAL,
+    );
+    // The session the record carried over from its idle ID, and the page for it,
+    // answered by this connection's REGISTRATION REQUEST.
+    hold_session(&mut server, new, 1, "1698-a1", smf_port);
+    let mut page = super::handler_tests::page_for(idle_id, tmsi, 1);
+    page.failure_notify_uri = Some("http://127.0.0.1:9/n1n2-fail-1698".to_string());
+    {
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().expect("ctx lock");
+        assert!(guard.paging_add(page));
+        assert!(guard
+            .paging_mark_answered_by_s_tmsi(0x155, 0x2A, tmsi, new)
+            .is_some());
+    }
+    let notified = crate::namf_server::failure_notifications_on_this_thread();
+
+    server
+        .handle_authentication_response_nas(ASSOC, new, 43, &authentication_response())
+        .await
+        .expect("authentication response handled");
+    server.sbi_offload.settle().await;
+
+    assert!(
+        server.ue_auth_state.get(new).is_some(),
+        "the new registration goes on"
+    );
+    assert!(
+        crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .paging_find(idle_id)
+            .is_none(),
+        "the answered page is stopped"
+    );
+    assert_eq!(
+        crate::namf_server::failure_notifications_on_this_thread() - notified,
+        1,
+        "and its requester told, once"
+    );
+    server.forget_ue(new);
+}
