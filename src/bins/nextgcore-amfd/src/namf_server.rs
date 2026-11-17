@@ -3055,17 +3055,17 @@ pub(crate) struct EventSubscriptionGuard(String);
 
 #[cfg(test)]
 impl EventSubscriptionGuard {
-    /// The subscription a `201 Created` from `/namf-evts/v1/subscriptions` names.
-    ///
-    /// # Panics
-    ///
-    /// If the response carries no `subscriptionId`.
     /// The subscription `id`, for a test that subscribed through the handler
     /// function rather than over HTTP (#1640).
     pub(crate) fn id(id: impl Into<String>) -> Self {
         Self(id.into())
     }
 
+    /// The subscription a `201 Created` from `/namf-evts/v1/subscriptions` names.
+    ///
+    /// # Panics
+    ///
+    /// If the response carries no `subscriptionId`.
     pub(crate) fn of(created: &SbiResponse) -> Self {
         let body: Value = created
             .http

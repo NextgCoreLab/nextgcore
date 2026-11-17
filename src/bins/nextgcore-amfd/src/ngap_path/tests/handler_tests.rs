@@ -1268,10 +1268,12 @@ async fn releasing_smf() -> (
     use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
     let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
     let sink = Arc::clone(&seen);
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = listener.local_addr().expect("addr").port();
+    // #1646 review: a recording stand-in takes a port never issued before, so a
+    // stale callback from an earlier test cannot be counted as an SMF call (#1640).
+    let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let port = addr.port();
     let smf = nextgcore_sbi::server::SbiServer::on_listener(
-        nextgcore_sbi::server::SbiServerConfig::new(listener.local_addr().expect("addr")),
+        nextgcore_sbi::server::SbiServerConfig::new(addr),
         listener,
     );
     smf.start(move |req: SReq| {
