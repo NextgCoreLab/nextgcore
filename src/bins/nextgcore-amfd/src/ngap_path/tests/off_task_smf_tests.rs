@@ -1081,6 +1081,133 @@ async fn an_over_long_smf_n1_gets_the_amfs_own_reject_1636() {
     smf.stop().await.expect("stop");
 }
 
+/// A stand-in SMF that accepts every UpdateSMContext (200) with `n1` as its
+/// `n1SmMsg` and an N2 SM transfer as its `n2SmInfo` (PDU_RES_MOD_REQ), both as
+/// binary parts (TS 29.502 §6.1.6.2.4).
+async fn accepting_smf(n1: Vec<u8>) -> (nextgcore_sbi::server::SbiServer, u16) {
+    use nextgcore_sbi::message::{SbiPart, SbiRequest as SReq, SbiResponse as SResp};
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let server = nextgcore_sbi::server::SbiServer::on_listener(
+        nextgcore_sbi::server::SbiServerConfig::new(addr),
+        listener,
+    );
+    server
+        .start(move |_req: SReq| {
+            let n1 = n1.clone();
+            async move {
+                let body = serde_json::json!({
+                    "n1SmMsg": { "contentId": "n1SmMsg" },
+                    "n2SmInfo": { "contentId": "n2SmInfo" },
+                    "n2SmInfoType": "PDU_RES_MOD_REQ",
+                });
+                SResp::with_status(200)
+                    .with_body(body.to_string(), "application/json")
+                    .with_part(SbiPart::with_content(
+                        "n1SmMsg",
+                        nextgcore_sbi::constants::content_type::APPLICATION_5GNAS,
+                        bytes::Bytes::from(n1),
+                    ))
+                    .with_part(SbiPart::with_content(
+                        "n2SmInfo",
+                        "application/vnd.3gpp.ngap",
+                        bytes::Bytes::from_static(&[0x00, 0x00, 0x00]),
+                    ))
+            }
+        })
+        .await
+        .expect("stand-in SMF starts");
+    (server, addr.port())
+}
+
+/// What a UE-requested modification of `ue` (PSI 5, PTI 7) at an SMF on `port`
+/// sends for that UE in the pass that sends anything: the number of PDUs, whether
+/// one is an N2 Modify Request, and the DL NAS TRANSPORTs' NAS PDUs.
+async fn modification_sends(
+    ue: u64,
+    ran: u32,
+    sm_ref: &str,
+    port: u16,
+) -> (usize, bool, Vec<Vec<u8>>) {
+    let mut server = capturing_ngap_server().await;
+    secured_registered_ue(&mut server, ue, ran);
+    hold_session(&mut server, ue, 5, sm_ref, port);
+    server
+        .handle_5gsm_message(ASSOC, ue, ran, &[0x2E, 0x05, 0x07, 0xC9], None)
+        .await
+        .expect("handled");
+    let sent = apply_until(&mut server, |s| !concerns(s, ue).is_empty()).await;
+    let mine = concerns(&sent, ue);
+    let modify = mine.iter().any(|s| matches!(s, Sent::ModifyRequest { .. }));
+    let nas = mine
+        .iter()
+        .filter_map(|s| match s {
+            Sent::DownlinkNas { nas_pdu, .. } => Some(nas_pdu.clone()),
+            _ => None,
+        })
+        .collect();
+    let out = (mine.len(), modify, nas);
+    server.forget_ue(ue);
+    out
+}
+
+/// #1674 (the #1670 review), TS 24.501 §9.11.3.39 / §6.4.2.4.1: an accepted
+/// modification whose N1 the AMF cannot relay (over-long, or for another session)
+/// sends no N2 Modify Request, so the gNB does not apply a QoS change the UE is
+/// never told of. The UE gets the AMF's own #26. A relayable N1 still goes with
+/// its N2 (the positive control).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_accepted_modification_with_an_unrelayable_n1_sends_no_n2_1674() {
+    let command = vec![0x2E, 0x05, 0x07, 0xCB, 0x00];
+    let (smf, port) = accepting_smf(command.clone()).await;
+    let (_, modify, nas) = modification_sends(16_740_101, 211, "mod-1674-ok", port).await;
+    assert!(modify, "a relayable command goes with its N2");
+    assert!(
+        nas.iter()
+            .any(|p| p.windows(command.len()).any(|w| w == command)),
+        "and the UE gets the SMF's command: {nas:02x?}"
+    );
+    smf.stop().await.expect("stop");
+
+    let mut long = command.clone();
+    long.resize(crate::gmm_build::MAX_PAYLOAD_CONTAINER_LEN + 1, 0);
+    let foreign = vec![0x2E, 0x06, 0x07, 0xCB, 0x00];
+    for (i, n1) in [long, foreign].into_iter().enumerate() {
+        let (smf, port) = accepting_smf(n1).await;
+        let ue = 16_740_110 + i as u64;
+        let (count, modify, nas) =
+            modification_sends(ue, 212 + i as u32, &format!("mod-1674-{i}"), port).await;
+        assert!(!modify, "case {i}: no N2 Modify Request");
+        let [nas_pdu] = &nas[..] else {
+            panic!("case {i}: one DL NAS TRANSPORT ({count} PDUs)");
+        };
+        assert_eq!(count, 1, "case {i}: and nothing else");
+        let own = [0x2E, 0x05, 0x07, 0xCA, 0x1A];
+        assert!(
+            nas_pdu.windows(own.len()).any(|w| w == own),
+            "case {i}: the AMF's own #26: {:02x?}",
+            &nas_pdu[..nas_pdu.len().min(32)]
+        );
+        smf.stop().await.expect("stop");
+    }
+}
+
+/// #1674 (the #1670 review, its mutation Q4): `protect_nas` refuses an empty plain
+/// message, which is a builder's refusal passed on as `unwrap_or_default()`, so
+/// nothing is sent for it. A real message is protected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn protect_nas_refuses_an_empty_plain_message_1674() {
+    let mut server = capturing_ngap_server().await;
+    let ue = 16_740_201;
+    secured_registered_ue(&mut server, ue, 221);
+    assert!(
+        server.protect_nas(ue, &[0x7E, 0x00, 0x68]).is_some(),
+        "a real message is protected"
+    );
+    assert_eq!(server.protect_nas(ue, &[]), None, "an empty one is not");
+    server.forget_ue(ue);
+}
+
 /// #1636: an SMF answer body larger than `MAX_SMF_RESPONSE_BODY` is refused while
 /// it is read. The UE-requested modification is then an SMF failure with no N1, and
 /// the UE gets the AMF's own #26.
@@ -2058,5 +2185,38 @@ async fn a_repeated_registration_request_during_the_join_follows_5_5_1_3_8_e() {
     assert_ne!(second, first, "the first join is gone, a new one waits");
     assert!(take_sent_ngap(&mut server).is_empty(), "no Accept yet");
     forget_amf_sessions(ue);
+    server.forget_ue(ue);
+}
+
+/// #1674 (the #1670 review): the N1N2 delivery backstop refuses an over-long N1 at
+/// the builder and says so, rather than reaching `protect_nas` with an empty
+/// message and logging a missing security context. Nothing is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_over_long_n1n2_delivery_is_refused_with_an_accurate_log_1674() {
+    nextgcore_core::test_log::init();
+    let mut server = capturing_ngap_server().await;
+    let ue = 16_740_301;
+    secured_registered_ue(&mut server, ue, 231);
+    let said = nextgcore_core::test_log::watch(format!(
+        "UE {ue}: N1 message for PSI Some(5) of 65536 bytes not sent: longer than a payload"
+    ));
+    let n1 = vec![0x2E; crate::gmm_build::MAX_PAYLOAD_CONTAINER_LEN + 1];
+    server
+        .deliver_n1_n2(
+            ASSOC,
+            ue,
+            231,
+            Some(5),
+            false,
+            Some(&n1),
+            payload_container_type::N1_SM_INFORMATION,
+        )
+        .await
+        .expect("delivered");
+    assert_eq!(said.records().len(), 1, "the refusal says why");
+    assert!(
+        take_sent_ngap(&mut server).is_empty(),
+        "and nothing is sent"
+    );
     server.forget_ue(ue);
 }

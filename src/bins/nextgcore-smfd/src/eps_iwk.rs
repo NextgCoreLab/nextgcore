@@ -222,7 +222,9 @@ async fn post_assign_ebi(
         body.to_string(),
         nextgcore_sbi::constants::content_type::APPLICATION_JSON,
     );
-    let client = nextgcore_sbi::client::SbiClient::new(
+    // #1648: EBIAssignment is a Namf_Communication service operation (TS 29.518
+    // §5.2.2.6), so it carries the token.
+    let client = crate::namf_client(
         nextgcore_sbi::security::sbi_peer_client_config(&host, port)
             .with_connect_timeout(std::time::Duration::from_secs(2))
             .with_request_timeout(std::time::Duration::from_secs(3)),

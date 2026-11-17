@@ -735,7 +735,7 @@ restart_if_resolved_before_ready() {
     if [[ "$(python3 "${SCRIPT_DIR}/lib/pinned_peers.py" "${PEER_A_JSON}" "${PEER_B_JSON}")" == restart ]]; then
       log "${dependent} resolved ${peer} before its current pod was Ready; restarting it to re-resolve"
       kubectl rollout restart "deployment/${dependent}" -n "${NAMESPACE}" >/dev/null
-      kubectl rollout status "deployment/${dependent}" -n "${NAMESPACE}" --timeout=300s \
+      nextg_rollout_wait "deployment/${dependent}" 300 \
         || warn "${dependent} not ready after the re-resolve restart"
       return 0
     fi

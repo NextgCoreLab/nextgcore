@@ -8181,8 +8181,18 @@ impl NgapServer {
             }
         }
         if let Some(n1) = n1 {
-            let plain = gmm_build::build_dl_nas_transport(psi, n1_container_type, n1, None, None)
-                .unwrap_or_default();
+            // #1674: the Namf handler refuses an over-long N1 with a 413 before it
+            // answers; this is the backstop, with a log that says why.
+            let Some(plain) =
+                gmm_build::build_dl_nas_transport(psi, n1_container_type, n1, None, None)
+            else {
+                log::warn!(
+                    "UE {amf_ue_ngap_id}: N1 message for PSI {psi:?} of {} bytes not sent: \
+                     longer than a payload container can carry",
+                    n1.len()
+                );
+                return Ok(());
+            };
             match self.protect_nas(amf_ue_ngap_id, &plain) {
                 Some(protected) => {
                     self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
@@ -10759,6 +10769,22 @@ impl NgapServer {
         }
         let (association_id, ran_ue_ngap_id) = (state.association_id, state.ran_ue_ngap_id);
         match result {
+            Ok((n1, _)) if !n1.is_empty() && !smf_n1_for_session(&n1, psi) => {
+                // #1674 (the #1670 review): an accepted modification whose N1 the AMF
+                // cannot relay, over-long (TS 24.501 §9.11.3.39) or not a 5GSM message
+                // for this session. The N2 Modify Request is not sent either, or the gNB
+                // would apply a QoS change the UE is never told of. The UE gets the
+                // AMF's own #26, which ends its procedure (TS 24.501 §6.4.2.4.1); the
+                // SMF's procedure ends at its own timer with no N2 answer.
+                log::warn!(
+                    "SMF accepted the modification of PSI {psi} with an N1 the AMF cannot \
+                     relay ({} bytes); the N2 is not sent and the UE gets #26",
+                    n1.len()
+                );
+                let reject = vec![0x2E, psi, pti, 0xCA, 0x1A];
+                self.send_n1_sm_to_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, psi, &reject)
+                    .await?;
+            }
             Ok((n1, n2)) => {
                 // PDU Session Modification Command to UE (from SMF N1 when provided)
                 let n1 = if n1.is_empty() {

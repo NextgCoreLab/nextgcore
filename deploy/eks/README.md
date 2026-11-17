@@ -271,6 +271,20 @@ running container's image is the one the manifests asked for, and fails
 with the bottom-up `rollout restart` command if any pod is stale. A
 rollout wait alone cannot detect this.
 
+A rollout wait fails fast on a crash loop (#1651). Every wait
+(`nextg_rollout_wait` in `lib/profile.sh`) checks the pods of the workload's
+current revision every `NEXTG_ROLLOUT_POLL` seconds (a positive integer,
+default 5). A container that is not Ready after more than
+`NEXTG_ROLLOUT_RESTART_LIMIT` restarts (default 3) fails the deploy at once
+with its last 20 log lines. That includes `CrashLoopBackOff`, which the kubelet
+enters after the first exit, so a single transient crash is not counted. A
+crash-looping prometheus, grafana or jaeger pod is reported but does not fail
+the deploy. An INT or TERM to the deploy also stops the background wait. Without this check the deploy only failed when
+every timeout had expired. The previous revision's pods are not counted, so a
+deploy that replaces a crash-looping build is not failed by it. The rules are
+in `lib/crashloop.py` (fixtures in `lib/test_crashloop.py`), and the wait has
+its own self-test in `lib/test-rollout-wait.sh`.
+
 To pin a release or redeploy an older build, set `IMAGE_TAG` on **both**
 scripts; `IMAGE_TAG=latest` still works but warns.
 

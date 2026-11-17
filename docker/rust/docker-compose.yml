@@ -81,6 +81,8 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
+      # Pinned to the URN of certs/nrf.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_NRF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-0000000000f0
       TLS_CERT: /etc/nextgcore/certs/nrf.crt
       TLS_KEY: /etc/nextgcore/certs/nrf.key
       TLS_CA: /etc/nextgcore/certs/ca.crt
@@ -107,6 +109,8 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
+      # Pinned to the URN of certs/ausf.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_AUSF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-00000000a05f
       UDM_SBI_ADDR: 172.23.0.12
       UDM_SBI_PORT: "7777"
       TLS_CERT: /etc/nextgcore/certs/ausf.crt
@@ -131,6 +135,8 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
+      # Pinned to the URN of certs/udm.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_UDM_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-000000000d10
       UDR_SBI_ADDR: 172.23.0.20
       UDR_SBI_PORT: "7777"
       TLS_CERT: /etc/nextgcore/certs/udm.crt
@@ -154,6 +160,8 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
+      # Pinned to the URN of certs/udr.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_UDR_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-000000000d00
       TLS_CERT: /etc/nextgcore/certs/udr.crt
       TLS_KEY: /etc/nextgcore/certs/udr.key
       TLS_CA: /etc/nextgcore/certs/ca.crt
@@ -190,6 +198,8 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
+      # Pinned to the URN of certs/pcf.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_PCF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-000000000cf0
       TLS_CERT: /etc/nextgcore/certs/pcf.crt
       TLS_KEY: /etc/nextgcore/certs/pcf.key
       TLS_CA: /etc/nextgcore/certs/ca.crt
@@ -214,6 +224,8 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
+      # Pinned to the URN of certs/nssf.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_NSSF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-0000000055f0
       TLS_CERT: /etc/nextgcore/certs/nssf.crt
       TLS_KEY: /etc/nextgcore/certs/nssf.key
       TLS_CA: /etc/nextgcore/certs/ca.crt
@@ -234,6 +246,8 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
+      # Pinned to the URN of certs/bsf.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_BSF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-000000000b0f
       TLS_CERT: /etc/nextgcore/certs/bsf.crt
       TLS_KEY: /etc/nextgcore/certs/bsf.key
       TLS_CA: /etc/nextgcore/certs/ca.crt
@@ -310,6 +324,8 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
+      # Pinned to the URN of certs/smf.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_SMF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-0000000005f0
       UPF_PFCP_ADDR: 172.23.0.7
       UPF_PFCP_PORT: "8805"
       SMF_PFCP_ADDR: 172.23.0.4
@@ -361,6 +377,8 @@ services:
       - net.ipv4.ip_forward=1
     environment:
       <<: *common-env
+      # Pinned to the URN of certs/upf.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_UPF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-0000000004f0
       RUST_LOG: info
       TLS_CERT: /etc/nextgcore/certs/upf.crt
       TLS_KEY: /etc/nextgcore/certs/upf.key
@@ -447,6 +465,8 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
+      # Pinned to the URN of certs/nwdaf.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_NWDAF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-00000000fdaf
     command: ["--sbi-addr", "172.23.0.30", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]
     volumes:
       - ./configs/5gc/nwdaf.yaml:/etc/nextgcore/nwdaf.yaml:ro
@@ -463,6 +483,9 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
+      # Pinned to the URN of certs/ees.crt (certs/nf-identities.txt, #1617).
+      # Type-agnostic: eesd resolves its one ID under both EES and AF.
+      NEXTGCORE_NF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-0000000000e5
     # No --nrf-uri: eesd registers with an ECS over EDGE-6 (--ecs-uri). --nrf-uri
     # (#1529) would register it at the NRF as an AF, for 5GC access tokens.
     command: ["--sbi-addr", "172.23.0.31", "--sbi-port", "7777"]
@@ -481,6 +504,8 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
+      # Pinned to the URN of certs/lmf.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_LMF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-0000000001f0
     command: ["--sbi-addr", "172.23.0.32", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]
     volumes:
       - ./configs/5gc/lmf.yaml:/etc/nextgcore/lmf.yaml:ro
@@ -497,6 +522,8 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
+      # Pinned to the URN of certs/mbsmf.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_MBSMF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-0000000b05f0
     command: ["--sbi-addr", "172.23.0.33", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]
     volumes:
       - ./configs/5gc/mbsmf.yaml:/etc/nextgcore/mbsmf.yaml:ro
@@ -513,6 +540,8 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
+      # Pinned to the URN of certs/nsacf.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_NSACF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-00000005acf0
     command: ["--sbi-addr", "172.23.0.34", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]
     volumes:
       - ./configs/5gc/nsacf.yaml:/etc/nextgcore/nsacf.yaml:ro
@@ -529,6 +558,8 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
+      # Pinned to the URN of certs/ucmf.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_UCMF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-00000000ac3f
     command: ["--sbi-addr", "172.23.0.39", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]
     volumes:
       - ./configs/5gc/ucmf.yaml:/etc/nextgcore/ucmf.yaml:ro
@@ -545,6 +576,8 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
+      # Pinned to the URN of certs/pin.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_AF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-00000000014a
     command: ["--sbi-addr", "172.23.0.35", "--sbi-port", "7815", "--nrf-uri", "http://172.23.0.10:7777"]
     volumes:
       - ./configs/5gc/pin.yaml:/etc/nextgcore/pin.yaml:ro
@@ -561,6 +594,8 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
+      # Pinned to the URN of certs/dccf.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_DCCF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-00000000dccf
     command: ["--sbi-addr", "172.23.0.36", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]
     volumes:
       - ./configs/5gc/dccf.yaml:/etc/nextgcore/dccf.yaml:ro
