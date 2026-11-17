@@ -223,8 +223,12 @@ print(json.dumps(d))' "${S}/ees-config.before.json" "$1" | "${K[@]}" apply -f - 
           NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE=/tmp/d443a-cca/cca.key \
           NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/tmp/d443a-cca-pub >/dev/null || bad "${nf} OAuth2 env"
       done
+      # NEXTGCORE_SBI_PROFILE=dev as on every base NF (k8s/manifests): eesd's NRF
+      # client is then cleartext h2c like theirs, not mTLS with certificates this
+      # cluster does not provision. eesd's own server and its per-operation OAuth2
+      # gate do not read the profile.
       "${K[@]}" set env deploy/ees -c ees NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE=/tmp/d443a-cca/cca.key \
-        NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/tmp/d443a-cca-pub >/dev/null || bad "ees CCA env"
+        NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/tmp/d443a-cca-pub NEXTGCORE_SBI_PROFILE=dev >/dev/null || bad "ees CCA env"
       "${K[@]}" patch deploy/ees --type=json -p "[{\"op\":\"add\",\"path\":\"/spec/template/spec/containers/0/args/-\",\"value\":\"--nrf-uri\"},{\"op\":\"add\",\"path\":\"/spec/template/spec/containers/0/args/-\",\"value\":\"http://nrf.${NAMESPACE}.svc.cluster.local:7777\"}]" \
         >/dev/null || bad "ees --nrf-uri"
       for nf in amf smf; do
