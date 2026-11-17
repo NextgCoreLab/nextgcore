@@ -999,6 +999,8 @@ mod tests {
     /// the `nextgcore_sbi_*` ones are; either fails the loop.
     #[tokio::test]
     async fn the_scraped_endpoint_serves_every_series_the_rules_and_dashboards_use_1334() {
+        // #1588: this test reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let server = nextgcore_sbi::server::SbiServer::on_listener(
@@ -1083,6 +1085,8 @@ mod tests {
     /// The census gauges render what the stores hold.
     #[test]
     fn the_census_gauges_render_the_values_given() {
+        // #1588: this test reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.blocking_lock();
         let mut out = String::new();
         render_amf_families(
             &mut out,
@@ -1116,6 +1120,8 @@ mod tests {
     /// gives them.
     #[test]
     fn the_served_global_counters_keep_their_names() {
+        // #1588: this test reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.blocking_lock();
         assert_eq!(GlobalMetric::NgResetUeIdled.name(), "amf_ng_reset_ue_idled");
         assert_eq!(
             GlobalMetric::UeAssociatedRefused.name(),

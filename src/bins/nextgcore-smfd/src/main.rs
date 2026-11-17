@@ -4021,6 +4021,33 @@ fn sm_context_create_error(
         ))
 }
 
+/// A refused UE-requested PDU session modification (#1590): an SmContextUpdateError
+/// (TS 29.502 §5.2.2.3.1 step 2b, Table 6.1.6.2.36-1) whose `n1SmMsg` is the PDU
+/// SESSION MODIFICATION REJECT the AMF forwards to the UE (TS 24.501 §6.4.2.4.1),
+/// as a 5gnas binary part referenced by RefToBinaryData.
+fn sm_context_modification_reject(
+    status: u16,
+    cause: &str,
+    psi: u8,
+    pti: u8,
+    gsm_cause_5gsm: u8,
+) -> SbiResponse {
+    use nextgcore_sbi::constants::content_type;
+    use nextgcore_sbi::message::SbiPart;
+    let n1 = policy::build_modification_reject(psi, pti, gsm_cause_5gsm);
+    let body = serde_json::json!({
+        "error": { "status": status, "cause": cause },
+        "n1SmMsg": { "contentId": "n1SmMsg" },
+    });
+    SbiResponse::with_status(status)
+        .with_body(body.to_string(), content_type::APPLICATION_JSON)
+        .with_part(SbiPart::with_content(
+            "n1SmMsg",
+            content_type::APPLICATION_5GNAS,
+            bytes::Bytes::copy_from_slice(&n1),
+        ))
+}
+
 /// The SSC modes this SMF actually implements, as the Allowed SSC mode bitmap
 /// (bit 1 = mode 1, bit 2 = mode 2, bit 3 = mode 3 — TS 24.501 §9.11.4.16).
 ///
@@ -6395,17 +6422,19 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                                     Ok(json) => answer = Some(json),
                                     Err(policy::PolicyError::Rejected { status, detail }) => {
                                         // Abnormal path: PCF rejects the
-                                        // modification → 403 + 5GSM cause 29
+                                        // modification → 403 + 5GSM cause 29, in a
+                                        // PDU SESSION MODIFICATION REJECT (#1590,
+                                        // TS 24.501 §6.4.2.4.1). Before, an
+                                        // ESTABLISHMENT REJECT (0xC3) answered it.
                                         log::error!(
                                             "PCF rejected SM policy update (status={status}): {detail}"
                                         );
-                                        return sm_context_create_error(
+                                        return sm_context_modification_reject(
                                             403,
                                             "SUBSCRIPTION_DENIED",
                                             psi,
                                             pti,
                                             policy::gsm_cause::USER_AUTHENTICATION_OR_AUTHORIZATION_FAILED,
-                                            policy::RejectTo::default(),
                                         );
                                     }
                                     Err(e) => {
@@ -22143,6 +22172,64 @@ mod tests {
                 &[],
             )),
         ))
+    }
+
+    /// #1590, TS 24.501 §6.4.2.4.1 / §8.3.8: a UE-requested modification whose
+    /// RES_MO_RE update the PCF refuses is answered 403 with an SmContextUpdateError
+    /// (TS 29.502 §5.2.2.3.1 step 2b) carrying a PDU SESSION MODIFICATION REJECT
+    /// (0xCA) with cause #29, echoing the PSI and the UE's PTI.
+    ///
+    /// REVERT-VERIFIED: with `sm_context_create_error` back on this arm, the N1 is a
+    /// PDU SESSION ESTABLISHMENT REJECT (0xC3).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pcf_refused_ue_modification_is_a_modification_reject_1590() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let pcf = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        pcf.start(|_req: SbiRequest| async move {
+            SbiResponse::with_status(403).with_body(
+                r#"{"status":403,"cause":"POLICY_CONTEXT_DENIED"}"#,
+                "application/problem+json",
+            )
+        })
+        .await
+        .expect("pcf start");
+        std::env::set_var("PCF_URI", format!("http://127.0.0.1:{}", addr.port()));
+        let psi = 27;
+        let r = seed_authorised_1399("imsi-001010000015901", psi, "pol-1590");
+        let resp = handle_sm_context_update(&r, &ue_modification_1399(&r, psi)).await;
+        std::env::remove_var("PCF_URI");
+        pcf.stop().await.ok();
+
+        assert_eq!(resp.status, 403);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
+        assert_eq!(body["error"]["cause"], "SUBSCRIPTION_DENIED");
+        assert_eq!(body["n1SmMsg"]["contentId"], "n1SmMsg");
+        let n1 = resp
+            .http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n1SmMsg"))
+            .map(|p| p.data.to_vec())
+            .expect("the N1 part");
+        assert_eq!(
+            n1,
+            vec![
+                0x2E,
+                psi,
+                5,
+                0xCA,
+                policy::gsm_cause::USER_AUTHENTICATION_OR_AUTHORIZATION_FAILED
+            ],
+            "PDU SESSION MODIFICATION REJECT #29, PSI and PTI echoed"
+        );
     }
 
     /// The RES_MO_RE leg with an UpdateNotify applied while its Update is in flight:
