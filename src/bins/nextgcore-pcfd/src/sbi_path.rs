@@ -2008,26 +2008,44 @@ pub(crate) fn remember_udr(
     });
 }
 
-/// The NRF whose last answer was that no UDR is deployed (#1639): it listed none
-/// while nothing was remembered, or the remembered UDR's NFProfile is gone
-/// (#1653). That answer is a basis for the local default when the NRF later fails,
-/// whatever `pcf.policy.udr_required` says. Set and cleared with [`UDR_CACHE`]
-/// (one of the two holds at a time), cleared by [`forget_udr`]; serialised in
-/// tests by `test_support::CONTEXT_GUARD`, as [`UDR_CACHE`] is.
-static NRF_SAID_NO_UDR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// The NRF whose last answer was that no UDR is deployed (#1639), and until when
+/// that answer may be used: it listed none while nothing was remembered, or the
+/// remembered UDR's NFProfile is gone (#1653). While in force, it is a basis for the
+/// local default when the NRF later fails, whatever `pcf.policy.udr_required` says.
+///
+/// #1718 review M1: it expires like a remembered UDR, after the SearchResult's
+/// `validityPeriod` (TS 29.510 Table 6.2.6.2.2-1), at most a day
+/// ([`udr_cache_validity`]). A "none" from before a UDR re-registered must not keep
+/// a fail-closed PCF failing open for a whole NRF outage.
+///
+/// Set and cleared with [`UDR_CACHE`] (one of the two holds at a time), cleared by
+/// [`forget_udr`]; serialised in tests by `test_support::CONTEXT_GUARD`, as
+/// [`UDR_CACHE`] is.
+static NRF_SAID_NO_UDR: std::sync::Mutex<Option<(String, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
 
-/// Record that `nrf_uri` answered that no UDR is deployed (#1639).
-fn note_no_udr(nrf_uri: &str) {
-    *NRF_SAID_NO_UDR.lock().unwrap_or_else(|e| e.into_inner()) = Some(nrf_uri.to_string());
+/// Record that `nrf_uri` answered that no UDR is deployed (#1639), for
+/// [`udr_cache_validity`]`(validity)`.
+fn note_no_udr(nrf_uri: &str, validity: Option<u64>) {
+    let Some(until) = std::time::Instant::now().checked_add(udr_cache_validity(validity)) else {
+        return;
+    };
+    *NRF_SAID_NO_UDR.lock().unwrap_or_else(|e| e.into_inner()) = Some((nrf_uri.to_string(), until));
 }
 
-/// Whether `nrf_uri`'s last answer was that no UDR is deployed (#1639).
+/// Whether `nrf_uri`'s last answer was that no UDR is deployed, and that answer is
+/// still valid (#1639, #1718 review M1).
 fn nrf_said_no_udr(nrf_uri: &str) -> bool {
     NRF_SAID_NO_UDR
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .as_deref()
-        == Some(nrf_uri)
+        .as_ref()
+        .is_some_and(|(uri, until)| uri == nrf_uri && std::time::Instant::now() < *until)
+}
+
+/// A SearchResult's `validityPeriod` in seconds (TS 29.510 Table 6.2.6.2.2-1).
+fn search_validity(json: &serde_json::Value) -> Option<u64> {
+    json.get("validityPeriod").and_then(|v| v.as_u64())
 }
 
 /// Record what a UDR SearchResult `json` from `nrf_uri` says, and return the UDR
@@ -2040,7 +2058,7 @@ fn nrf_said_no_udr(nrf_uri: &str) -> bool {
 fn note_udr_search(nrf_uri: &str, json: &serde_json::Value) -> Option<DiscoveredEndpoint> {
     let ep = remember_udr_from_search(nrf_uri, json);
     if ep.is_none() && cached_udr(nrf_uri).is_none() {
-        note_no_udr(nrf_uri);
+        note_no_udr(nrf_uri, search_validity(json));
     }
     ep
 }
@@ -2055,7 +2073,7 @@ fn remember_udr_from_search(nrf_uri: &str, json: &serde_json::Value) -> Option<D
         .iter()
         .find_map(|nf| parse_instance_endpoint(nf, "nudr-dr").map(|ep| (nf, ep)))?;
     let id = nf.get("nfInstanceId").and_then(|v| v.as_str());
-    let validity = json.get("validityPeriod").and_then(|v| v.as_u64());
+    let validity = search_validity(json);
     remember_udr(nrf_uri, id, &ep, validity);
     *NRF_SAID_NO_UDR.lock().unwrap_or_else(|e| e.into_inner()) = None;
     Some(ep)
@@ -2187,21 +2205,28 @@ async fn discover_create_udr() -> Result<Option<DiscoveredEndpoint>, UdrError> {
     };
     let deadline = tokio::time::Instant::now() + UDR_DISCOVERY_TIMEOUT;
     let search = tokio::time::timeout_at(deadline, Box::pin(nrf_search("UDR", "nudr-dr"))).await;
-    let (why, listed_none) = match search {
+    // `listing`: the NRF answered and listed no UDR, with that SearchResult's
+    // `validityPeriod`.
+    let (why, listing) = match search {
         Ok(Ok(Some(json))) => match note_udr_search(&nrf_uri, &json) {
             Some(ep) => return Ok(Some(ep)),
-            None => ("the NRF lists no UDR".to_string(), true),
+            None => (
+                "the NRF lists no UDR".to_string(),
+                Some(search_validity(&json)),
+            ),
         },
         Ok(Ok(None)) => return Ok(None),
-        Ok(Err(e)) => (format!("UDR discovery failed ({e})"), false),
+        Ok(Err(e)) => (format!("UDR discovery failed ({e})"), None),
         Err(_) => (
             format!("UDR discovery timed out after {UDR_DISCOVERY_TIMEOUT:?}"),
-            false,
+            None,
         ),
     };
+    let listed_none = listing.is_some();
     let Some(cached) = cached_udr(&nrf_uri) else {
-        // A listing of none was recorded by `note_udr_search` above.
-        if nrf_said_no_udr(&nrf_uri) {
+        // The NRF answers now that none is deployed, or said so in an answer that
+        // is still valid.
+        if listed_none || nrf_said_no_udr(&nrf_uri) {
             log::warn!("{why}, and the NRF says no UDR is deployed; local default");
             return Ok(None);
         }
@@ -2225,7 +2250,7 @@ async fn discover_create_udr() -> Result<Option<DiscoveredEndpoint>, UdrError> {
                      deregistered; forgotten, local default"
                 );
                 forget_udr();
-                note_no_udr(&nrf_uri);
+                note_no_udr(&nrf_uri, listing.flatten());
                 return Ok(None);
             }
             UdrProfile::Status(status)

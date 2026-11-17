@@ -8537,6 +8537,7 @@ mod tests {
             udr_port,
             profile: std::sync::atomic::AtomicU16::new(PROFILE_REGISTERED_1621),
             delay_ms: std::sync::atomic::AtomicU64::new(0),
+            validity_s: std::sync::atomic::AtomicU64::new(3600),
         }))
         .await
     }
@@ -8567,6 +8568,8 @@ mod tests {
         udr_port: std::sync::Arc<std::sync::atomic::AtomicU16>,
         profile: std::sync::atomic::AtomicU16,
         delay_ms: std::sync::atomic::AtomicU64,
+        /// The SearchResult's `validityPeriod` (#1718 review M1).
+        validity_s: std::sync::atomic::AtomicU64,
     }
 
     /// [`start_mock_nrf_1613`] driven by a [`NrfMock1621`].
@@ -8584,6 +8587,7 @@ mod tests {
         server
             .start(move |req: SbiRequest| {
                 let udr_port = mock.udr_port.load(Ordering::SeqCst);
+                let validity_s = mock.validity_s.load(Ordering::SeqCst);
                 let profile = mock.profile.load(Ordering::SeqCst);
                 let delay = Duration::from_millis(mock.delay_ms.load(Ordering::SeqCst));
                 async move {
@@ -8638,7 +8642,7 @@ mod tests {
                     };
                     SbiResponse::with_status(200)
                         .with_json_body(&serde_json::json!({
-                            "validityPeriod": 3600,
+                            "validityPeriod": validity_s,
                             "nfInstances": instances,
                         }))
                         .unwrap_or_else(|_| SbiResponse::with_status(500))
@@ -8890,6 +8894,7 @@ mod tests {
             udr_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(port)),
             profile: std::sync::atomic::AtomicU16::new(PROFILE_REGISTERED_1621),
             delay_ms: std::sync::atomic::AtomicU64::new(0),
+            validity_s: std::sync::atomic::AtomicU64::new(3600),
         });
         let (nrf, _nrf_uri) = start_mock_nrf_1621(mock.clone()).await;
         let rfsp = |resp: &SbiResponse| {
@@ -8957,6 +8962,7 @@ mod tests {
             udr_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(port)),
             profile: std::sync::atomic::AtomicU16::new(PROFILE_REGISTERED_1621),
             delay_ms: std::sync::atomic::AtomicU64::new(0),
+            validity_s: std::sync::atomic::AtomicU64::new(3600),
         });
         let (nrf, _nrf_uri) = start_mock_nrf_1621(mock.clone()).await;
         let rfsp = |resp: &SbiResponse| {
@@ -9033,6 +9039,7 @@ mod tests {
             udr_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(port)),
             profile: std::sync::atomic::AtomicU16::new(PROFILE_REGISTERED_1621),
             delay_ms: std::sync::atomic::AtomicU64::new(0),
+            validity_s: std::sync::atomic::AtomicU64::new(3600),
         });
         let (nrf, _nrf_uri) = start_mock_nrf_1621(mock.clone()).await;
         let resp = pcf_sbi_request_handler(am_create_1613("imsi-001010000016251")).await;
@@ -9303,7 +9310,11 @@ mod tests {
     /// answer listed a UDR, since expired, is not; nor is a fresh context. The NRF
     /// "stops answering" by answering past the 2 s discovery bound.
     ///
-    /// REVERT-VERIFIED: without `note_no_udr` in `note_udr_search`, step 2 answers
+    /// #1718 review M1: a "none" answer expires after its `validityPeriod` (step 2b).
+    ///
+    /// REVERT-VERIFIED: with the "none" record never expiring, step 2b's create
+    /// answers 201; without the current listing counted (`listed_none`), step 2b's
+    /// first create answers 500. Without `note_no_udr` in `note_udr_search`, step 2 answers
     /// 500; without it on the deregistered path, step 5 answers 500; without
     /// `remember_udr_from_search` clearing the record, step 3b answers 201; with
     /// `note_udr_search` recording a listing of none while a UDR is remembered,
@@ -9315,7 +9326,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let _ues = cleanup_1621((16380u64..=16388).map(|n| format!("imsi-0010100000{n}")));
+        let _ues = cleanup_1621((16379u64..=16389).map(|n| format!("imsi-0010100000{n}")));
         pcf_context_init(64, 64);
         let _required = crate::test_support::udr_required(true);
         let down = nextgcore_sbi::test_support::down_port();
@@ -9323,6 +9334,7 @@ mod tests {
             udr_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
             profile: std::sync::atomic::AtomicU16::new(PROFILE_REGISTERED_1621),
             delay_ms: std::sync::atomic::AtomicU64::new(0),
+            validity_s: std::sync::atomic::AtomicU64::new(3600),
         });
         let (nrf, _nrf_guard) = start_mock_nrf_1621(mock.clone()).await;
         let nrf_uri = nextgcore_sbi::context::global_context()
@@ -9343,6 +9355,25 @@ mod tests {
         silent_nrf(true);
         let resp = create(16381).await;
         assert_eq!(resp.status, 201, "2. said none: {:?}", resp.http.content);
+        // 2b. (#1718 review M1) A "none" whose validityPeriod has run out (here 0 s:
+        //     not to be cached) is no basis once the NRF stops answering: refused.
+        //     While the NRF answers "none", the local default stands.
+        silent_nrf(false);
+        mock.validity_s.store(0, Ordering::SeqCst);
+        let resp = create(16389).await;
+        assert_eq!(
+            resp.status, 201,
+            "2b. none listed now: {:?}",
+            resp.http.content
+        );
+        silent_nrf(true);
+        let resp = create(16379).await;
+        assert_eq!(
+            resp.status, 500,
+            "2b. an expired none: {:?}",
+            resp.http.content
+        );
+        mock.validity_s.store(3600, Ordering::SeqCst);
 
         // 3. The NRF lists a UDR (it refuses, so 500), which then expires, and the
         //    NRF stops answering: its last answer named a UDR, so refused.

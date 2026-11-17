@@ -238,7 +238,9 @@ data:
       {{- $udrRequired := .Values.pcf.policy.udrRequired }}
       {{- if kindIs "invalid" $udrRequired }}{{- $udrRequired = true }}{{- end }}
       {{- if not (kindIs "bool" $udrRequired) }}
-      {{- fail (printf "pcf.policy.udrRequired must be true or false, got %v" $udrRequired) }}
+      {{- /* Helm reports a fail at the first template that renders this file, often an
+           include site (the checksum annotations); the message names the file. */}}
+      {{- fail (printf "configmap.yaml, pcf.yaml: values.yaml pcf.policy.udrRequired must be true or false, got %v" $udrRequired) }}
       {{- end }}
       policy:
         session_ambr_cap: {{ $cap }}
