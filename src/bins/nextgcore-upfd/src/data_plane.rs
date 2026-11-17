@@ -2596,6 +2596,16 @@ impl DataPlaneSession {
         self.ddn_sent.store(false, Ordering::SeqCst);
     }
 
+    /// Whether the downlink packets already buffered are to be reported now (#1631,
+    /// #1635 review m3): after a [`Self::rearm_dl_notification`], a non-empty buffer
+    /// starts the new episode, so it takes the episode's one report, and a packet
+    /// buffered after it does not report again. Under the buffer lock, which
+    /// [`Self::buffer_dl_packet`] also holds, so the two cannot both report.
+    pub fn claim_dl_backlog_report(&self) -> bool {
+        let buf = self.dl_buffer.lock().unwrap();
+        !buf.is_empty() && !self.ddn_sent.swap(true, Ordering::SeqCst)
+    }
+
     /// Drain all buffered downlink packets (used when the FAR switches to
     /// FORW) and reset the buffering episode state.
     pub fn drain_dl_buffer(&self) -> Vec<Vec<u8>> {
@@ -4857,6 +4867,30 @@ impl DataPlane {
             "DL packet buffered for SEID 0x{:x} (first={first})",
             session.upf_seid
         );
+    }
+
+    /// Raise the Downlink Data Report for packets `session` buffered under FAR
+    /// `far_id` before the SMF instructed it to buffer and notify (#1631): the PDR ID
+    /// and QFI the first such packet would have been reported with.
+    pub fn report_dl_backlog(&self, session: &DataPlaneSession, far_id: u32) {
+        let (pdr_id, qfi) = {
+            let pdrs = session.pdrs.read().unwrap();
+            pdrs.iter()
+                .find(|p| p.source_interface == SRC_INTF_CORE && p.far_id == Some(far_id))
+                .map(|p| (p.pdr_id, session.qer_marking(&p.qer_ids).qfi))
+                .unwrap_or((0, None))
+        };
+        log::info!(
+            "Downlink Data Report for SEID 0x{:x}: packets buffered before the BUFF|NOCP \
+             instruction",
+            session.upf_seid
+        );
+        self.send_report_event(UpfReportEvent::DownlinkDataReport {
+            upf_seid: session.upf_seid,
+            smf_seid: session.smf_seid,
+            pdr_id,
+            qfi: qfi.or(session.qfi),
+        });
     }
 
     /// Flush DL packets buffered under a BUFF FAR after the FAR switched to

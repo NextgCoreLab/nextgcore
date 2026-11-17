@@ -12,7 +12,7 @@
 //! retained far more widely than the NF that holds the token.
 
 /// Path segments whose NEXT segment is a callback token.
-pub const CALLBACK_TOKEN_SEGMENTS: [&str; 14] = [
+pub const CALLBACK_TOKEN_SEGMENTS: [&str; 15] = [
     "nf-status-notify",
     "dereg-notify",
     "amf-location-notify",
@@ -35,6 +35,8 @@ pub const CALLBACK_TOKEN_SEGMENTS: [&str; 14] = [
     // (nextgcore#1518).
     "sm-policy-notify",
     "sdm-notify",
+    // smfd's paging n1n2FailureTxfNotifURI (nextgcore#1631).
+    "n1-n2-failure",
 ];
 
 /// What a redacted segment is replaced with.

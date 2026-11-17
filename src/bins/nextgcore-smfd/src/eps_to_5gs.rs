@@ -1316,6 +1316,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
                         callback_tokens: true,
                         sm_policy_notify_token: None,
                         sdm_notify_token: None,
+                        network_paging: None,
                     },
                 );
             }

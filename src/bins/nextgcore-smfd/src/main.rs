@@ -2583,6 +2583,20 @@ fn sm_policy_notify_uri(
     )
 }
 
+/// The `n1n2FailureTxfNotifURI` of a paging transfer for the session at
+/// `sm_context_ref` (#1631, TS 29.518 §6.1.6.2.18):
+/// `{apiRoot}/nsmf-callback/v1/{smContextRef}/n1-n2-failure/{token}`.
+fn n1n2_failure_notify_uri(
+    sm_context_ref: &str,
+    token: &nextgcore_sbi::callback_auth::CallbackToken,
+) -> String {
+    format!(
+        "{}/nsmf-callback/v1/{sm_context_ref}/n1-n2-failure/{}",
+        self_sbi_uri(),
+        token.as_str()
+    )
+}
+
 /// Whether the session at `sm_context_ref` admits a `kind` notification presenting
 /// `token` (`None`: the token-less URI of before #1518).
 /// See [`context::PolicyBinding::admits_callback`].
@@ -2622,7 +2636,15 @@ fn callback_not_admitted(sm_context_ref: &str, kind: context::SessionCallback) -
 ///   consumers can read.
 ///
 /// Without a verified certificate (plaintext, server-only TLS) they stay on the
-/// bearer. The token-less URIs of before #1518, and the `n1-n2-failure` and
+/// bearer.
+///
+/// #1631: `{ref}/n1-n2-failure/{token}` (the paging transfer's
+/// `n1n2FailureTxfNotifURI`) is admitted on its token alone. Only the AMF the transfer
+/// went to holds it: an N1N2MessageTransfer creates no resource another NF can read
+/// (TS 29.518 §6.1.3.5, POST only), and the token is minted per transfer and dropped
+/// when the paging ends.
+///
+/// The token-less URIs of before #1518, and the `n1-n2-failure/{ref}` and
 /// `amf-status` routes (whose URIs this SMF never hands out), stay bearer-only.
 fn oauth2_callback_exemptions() -> Vec<nextgcore_sbi::server::OAuth2CallbackExemption> {
     use context::SessionCallback;
@@ -2653,6 +2675,21 @@ fn oauth2_callback_exemptions() -> Vec<nextgcore_sbi::server::OAuth2CallbackExem
             SessionCallback::SdmNotify,
             "UDM",
         ),
+        // Namf_Communication N1N2TransferFailure notification (TS 29.518 §5.2.2.3.2).
+        OAuth2CallbackExemption::new(
+            "POST",
+            "/nsmf-callback/v1/{var}/n1-n2-failure/{token}",
+            |cb| {
+                let [sm_context_ref] = cb.vars.as_slice() else {
+                    return false;
+                };
+                session_admits_callback(
+                    sm_context_ref,
+                    SessionCallback::N1n2TransferFailure,
+                    Some(cb.token),
+                )
+            },
+        ),
     ]
 }
 
@@ -2681,13 +2718,19 @@ fn tokened_callback<'a>(
         ["nsmf-callback", _, r, "sdm-notify", token] => {
             Some((*r, context::SessionCallback::SdmNotify, *token, None))
         }
+        ["nsmf-callback", _, r, "n1-n2-failure", token] => Some((
+            *r,
+            context::SessionCallback::N1n2TransferFailure,
+            *token,
+            None,
+        )),
         _ => None,
     }
 }
 
 /// Whether `segment` is the keyword of a tokened `nsmf-callback` URI (#1518).
 fn is_tokened_callback_keyword(segment: &str) -> bool {
-    matches!(segment, "sm-policy-notify" | "sdm-notify")
+    matches!(segment, "sm-policy-notify" | "sdm-notify" | "n1-n2-failure")
 }
 
 /// SBI request handler for SMF
@@ -2736,6 +2779,9 @@ async fn smf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             }
             (context::SessionCallback::SdmNotify, _) => {
                 handle_sdm_notification(sm_context_ref, &request).await
+            }
+            (context::SessionCallback::N1n2TransferFailure, _) => {
+                handle_n1n2_transfer_failure_notification(sm_context_ref, token, &request).await
             }
         };
     }
@@ -5596,6 +5642,7 @@ async fn handle_sm_context_create_inner(request: &SbiRequest) -> SbiResponse {
                     callback_tokens: true,
                     sm_policy_notify_token: Some(sm_policy_notify_token.clone()),
                     sdm_notify_token: Some(sdm_notify_token.clone()),
+                    network_paging: None,
                 },
             );
         }
@@ -5744,11 +5791,228 @@ fn up_cnx_state_of(sm_context_ref: &str) -> Option<context::UpCnxState> {
 
 /// Record a session's user-plane connection state (#540). The Downlink Data
 /// Report handler reads it to decide whether to page.
+///
+/// #1631: every caller records what the AMF or the NG-RAN said about the user
+/// plane, so a network-triggered paging in progress has ended: it is dropped.
 fn mark_up_cnx_state(sm_context_ref: &str, state: context::UpCnxState) {
     if let Ok(ctx) = smf_self().read() {
         if let Some(mut sess) = ctx.sess_find_by_sm_context_ref(sm_context_ref) {
             sess.up_cnx_state = state;
             ctx.sess_update(&sess);
+        }
+        if let Ok(mut bindings) = ctx.policy_bindings.write() {
+            if let Some(b) = bindings.get_mut(sm_context_ref) {
+                b.network_paging = None;
+            }
+        }
+    }
+}
+
+/// How long the SMF waits on a network-triggered paging before it takes the paging
+/// as ended unanswered (#1631 review): `SMF_NETWORK_PAGING_GUARD_SECS`, 60 s by
+/// default. T3513 and its retransmissions are the AMF's (TS 24.501 §5.6.2.2.1,
+/// "network dependent"), and the AMF reports a paging the UE does not answer
+/// (TS 23.502 §4.2.3.3 step 5); this only bounds a paging the AMF never reports on,
+/// so it is well past amfd's own (5 s T3513, four retransmissions) and a #749
+/// resend.
+fn network_paging_guard() -> std::time::Duration {
+    let secs = std::env::var("SMF_NETWORK_PAGING_GUARD_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(60);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Whether `binding`'s network-triggered paging is in progress (#1631): it holds
+/// one within its guard, and its session, if it has one in memory, is not
+/// ACTIVATED. That covers the transfer in flight (DEACTIVATED until the AMF's 202 is
+/// settled) and its #749 resends (DEACTIVATED throughout), as well as ACTIVATING
+/// after the 202 (#1631 review M1). Every way the user plane becomes ACTIVATED, or
+/// is deactivated by the AMF, the NG-RAN or the SMF, drops the record.
+fn network_paging_in_progress(
+    state: Option<context::UpCnxState>,
+    binding: &context::PolicyBinding,
+) -> bool {
+    binding.network_paging.as_ref().is_some_and(|p| {
+        !p.expired(network_paging_guard(), std::time::Instant::now())
+            && state.is_none_or(|s| s != context::UpCnxState::Activated)
+    })
+}
+
+/// Drop `sm_context_ref`'s network-triggered paging, against a context guard the
+/// caller already holds (#1631 review M1): for a deactivation that does not go
+/// through [`mark_up_cnx_state`].
+fn drop_network_paging_in(ctx: &context::SmfContext, sm_context_ref: &str) {
+    if let Ok(mut bindings) = ctx.policy_bindings.write() {
+        if let Some(b) = bindings.get_mut(sm_context_ref) {
+            b.network_paging = None;
+        }
+    }
+}
+
+/// End `sm_context_ref`'s paging if its guard ran out (#1631 review): the record is
+/// dropped and an ACTIVATING it set falls back to DEACTIVATED, as a failure
+/// notification would have left it, so a later report pages again. (An ACTIVATING
+/// the AMF reported dropped the record, so one still held was set by the paging.)
+fn expire_network_paging(sm_context_ref: &str) {
+    let handle = smf_self();
+    let Ok(ctx) = handle.read() else {
+        return;
+    };
+    let expired = ctx
+        .policy_bindings
+        .write()
+        .ok()
+        .is_some_and(|mut bindings| {
+            let Some(b) = bindings.get_mut(sm_context_ref) else {
+                return false;
+            };
+            let expired = b
+                .network_paging
+                .as_ref()
+                .is_some_and(|p| p.expired(network_paging_guard(), std::time::Instant::now()));
+            if expired {
+                b.network_paging = None;
+            }
+            expired
+        });
+    if expired {
+        log::warn!(
+            "The network-triggered paging of ref={sm_context_ref} ran past its guard with no \
+             word from the AMF; taken as unanswered"
+        );
+        if let Some(mut sess) = ctx.sess_find_by_sm_context_ref(sm_context_ref) {
+            if sess.up_cnx_state == context::UpCnxState::Activating {
+                sess.up_cnx_state = context::UpCnxState::Deactivated;
+                ctx.sess_update(&sess);
+            }
+        }
+    }
+}
+
+/// [`network_paging_in_progress`] for `sm_context_ref`, after
+/// [`expire_network_paging`].
+fn network_paging_pending(sm_context_ref: &str) -> bool {
+    expire_network_paging(sm_context_ref);
+    let handle = smf_self();
+    let Ok(ctx) = handle.read() else {
+        return false;
+    };
+    let state = ctx
+        .sess_find_by_sm_context_ref(sm_context_ref)
+        .map(|s| s.up_cnx_state);
+    ctx.policy_bindings
+        .read()
+        .ok()
+        .and_then(|b| b.get(sm_context_ref).cloned())
+        .is_some_and(|b| network_paging_in_progress(state, &b))
+}
+
+/// Start a network-triggered paging for `sm_context_ref` at `arp_priority_level`, or
+/// refuse it (#1631, TS 23.502 §4.2.3.3 step 3a). While a paging is in progress,
+/// another Downlink Data Report pages again only for a higher priority than the one
+/// indicated to the AMF; this SMF does not support Paging Policy Differentiation
+/// (TS 23.501 §5.4.3), so it derives no Paging Policy Indicator and the other half
+/// of the rule never applies. Decided and recorded under one write guard, so two
+/// reports at once page once.
+///
+/// `Ok` with the new transfer's failure-notification token; `Err` with the level of
+/// the paging in progress, or `Err(None)` without a binding.
+fn begin_network_paging(
+    sm_context_ref: &str,
+    arp_priority_level: Option<u8>,
+) -> Result<nextgcore_sbi::callback_auth::CallbackToken, Option<u8>> {
+    let ctx = smf_self();
+    let ctx = ctx.read().map_err(|_| None)?;
+    let state = ctx
+        .sess_find_by_sm_context_ref(sm_context_ref)
+        .map(|s| s.up_cnx_state);
+    let mut bindings = ctx.policy_bindings.write().map_err(|_| None)?;
+    let binding = bindings.get_mut(sm_context_ref).ok_or(None)?;
+    if network_paging_in_progress(state, binding) {
+        if let Some(paging) = binding
+            .network_paging
+            .as_ref()
+            .filter(|p| !p.is_outranked_by(arp_priority_level))
+        {
+            return Err(paging.arp_priority_level);
+        }
+    }
+    let token = nextgcore_sbi::callback_auth::CallbackToken::mint();
+    binding.network_paging = Some(context::NetworkPaging {
+        failure_token: token.clone(),
+        arp_priority_level,
+        started: std::time::Instant::now(),
+    });
+    Ok(token)
+}
+
+/// What the AMF answered a paging transfer (#1631), for [`settle_network_paging`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PagingAnswer {
+    /// 202 ATTEMPTING_TO_REACH_UE: the UE is being paged (TS 29.518 §5.2.2.3.1).
+    Paging,
+    /// 200: the UE is CM-CONNECTED and the N2 SM information was sent to the NG-RAN.
+    Delivered,
+    /// 409 HIGHER_PRIORITY_REQUEST_ONGOING: resent after `retryAfter` (#749).
+    Retrying,
+    /// Anything else (504 UE_NOT_REACHABLE, a transport failure, ...).
+    Refused,
+}
+
+impl PagingAnswer {
+    fn of(status: u16) -> Self {
+        match status {
+            202 => Self::Paging,
+            200..=299 => Self::Delivered,
+            _ => Self::Refused,
+        }
+    }
+}
+
+/// Apply the AMF's answer to the paging transfer whose failure token is `token`
+/// (#1631). Only that transfer's record is touched; a later re-page has replaced it
+/// otherwise.
+/// - paging: ACTIVATING, the record kept until the user plane is activated,
+///   deactivated, or the paging fails;
+/// - delivered: ACTIVATING, no paging to wait on, so no record;
+/// - retrying: the record kept, the state unchanged (the resend carries the same
+///   URI, and is settled again when it is answered);
+/// - refused: the record dropped, the state unchanged (DEACTIVATED), so a later
+///   report pages again.
+fn settle_network_paging(
+    sm_context_ref: &str,
+    token: &nextgcore_sbi::callback_auth::CallbackToken,
+    answer: PagingAnswer,
+) {
+    let handle = smf_self();
+    let Ok(ctx) = handle.read() else {
+        return;
+    };
+    let ours = {
+        let Ok(mut bindings) = ctx.policy_bindings.write() else {
+            return;
+        };
+        let Some(binding) = bindings.get_mut(sm_context_ref) else {
+            return;
+        };
+        let ours = binding
+            .network_paging
+            .as_ref()
+            .is_some_and(|p| p.failure_token.matches(token.as_str()));
+        if ours && matches!(answer, PagingAnswer::Delivered | PagingAnswer::Refused) {
+            binding.network_paging = None;
+        }
+        ours
+    };
+    if ours && matches!(answer, PagingAnswer::Paging | PagingAnswer::Delivered) {
+        if let Some(mut sess) = ctx.sess_find_by_sm_context_ref(sm_context_ref) {
+            // TS 29.502 §5.2.2.3.2.1: an N3 tunnel is being established.
+            if sess.up_cnx_state == context::UpCnxState::Deactivated {
+                sess.up_cnx_state = context::UpCnxState::Activating;
+                ctx.sess_update(&sess);
+            }
         }
     }
 }
@@ -7328,6 +7592,11 @@ fn drop_release_n2_from_t3592(sm_context_ref: &str) -> bool {
 /// tell the UP connection is down, and a release missing its N2 would leave the
 /// NG-RAN's resources allocated.
 fn up_connection_active(sm_context_ref: &str) -> bool {
+    // #1631: ACTIVATING by a paging the UE has not answered set nothing up at the
+    // NG-RAN.
+    if network_paging_pending(sm_context_ref) {
+        return false;
+    }
     smf_self()
         .read()
         .ok()
@@ -8489,6 +8758,8 @@ pub(crate) async fn deactivate_up_toward_failed_path(a: &up_path::Affected, reas
         .read()
         .ok()
         .and_then(|ctx| {
+            // #1631 review M1: a paging in progress ends with the deactivation.
+            drop_network_paging_in(&ctx, reference);
             let mut sess = ctx.sess_find_by_sm_context_ref(reference)?;
             let was = sess.up_cnx_state != context::UpCnxState::Deactivated;
             sess.up_cnx_state = context::UpCnxState::Deactivated;
@@ -8633,6 +8904,8 @@ pub(crate) async fn release_for_reactivation(
     // a UP connection that is activated. Read before it is marked deactivated below.
     let n2 = up_connection_active(sm_context_ref).then(build_release_command_transfer);
     if let Ok(ctx) = smf_self().read() {
+        // #1631 review M1: a paging in progress ends with the deactivation.
+        drop_network_paging_in(&ctx, sm_context_ref);
         if let Some(mut sess) = ctx.sess_find_by_sm_context_ref(sm_context_ref) {
             sess.up_cnx_state = context::UpCnxState::Deactivated;
             ctx.sess_update(&sess);
@@ -8962,7 +9235,9 @@ async fn trigger_network_initiated_service_request(seid: u64, qfi: Option<u8>) {
         return;
     };
 
-    if !up_deactivated {
+    // #1631: or to one this SMF is paging for, where TS 23.502 §4.2.3.3 step 3a's
+    // re-paging rule decides (`begin_network_paging`).
+    if !up_deactivated && !network_paging_pending(&sm_context_ref) {
         // TS 29.244 §7.5.8.2 scopes the DLDR to a *deactivated* user-plane
         // connection. With the connection up, the UPF should be forwarding rather
         // than buffering, and paging a UE that is already connected would be a
@@ -9097,9 +9372,29 @@ async fn send_n1_n2_paging_request(
     };
 
     let path = format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages");
-    let Some((body, transfer)) = paging_n1n2_body(psi, qfi, sm_context_ref) else {
+    let Some((mut body, transfer)) = paging_n1n2_body(psi, qfi, sm_context_ref) else {
         return;
     };
+    // #1631, TS 23.502 §4.2.3.3 step 3a: the re-paging rule, and the
+    // "N1N2TransferFailure Notification Target Address" through which the AMF tells
+    // this SMF the UE did not answer (step 5).
+    let arp_priority_level = body
+        .pointer("/arp/priorityLevel")
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u8::try_from(v).ok());
+    let token = match begin_network_paging(sm_context_ref, arp_priority_level) {
+        Ok(token) => token,
+        Err(paging) => {
+            log::info!(
+                "Downlink Data Report for ref={sm_context_ref} while its paging (ARP \
+                 priority {paging:?}) is in progress: not paging again for ARP priority \
+                 {arp_priority_level:?}, not a higher one (TS 23.502 §4.2.3.3 step 3a)"
+            );
+            return;
+        }
+    };
+    body["n1n2FailureTxfNotifURI"] =
+        serde_json::json!(n1n2_failure_notify_uri(sm_context_ref, &token));
     let request = SReq::post(&path)
         .with_body(body.to_string(), content_type::APPLICATION_JSON)
         .with_part(nextgcore_sbi::message::SbiPart::with_content(
@@ -9110,20 +9405,47 @@ async fn send_n1_n2_paging_request(
     let config = nextgcore_sbi::security::sbi_peer_client_config(&host, port)
         .with_connect_timeout(std::time::Duration::from_secs(2))
         .with_request_timeout(std::time::Duration::from_secs(3));
-    match send_n1n2_honouring_paging_conflict(
-        config,
-        request,
-        sm_context_ref.to_string(),
-        PagingRetries::Spawned,
-    )
-    .await
+    // #749's retries on a 409, run here rather than through
+    // `send_n1n2_honouring_paging_conflict` so that their answer settles the paging
+    // too (#1631).
+    match namf_client(config.clone())
+        .send_request(request.clone())
+        .await
     {
-        Ok(resp) => log::info!(
-            "N1N2MessageTransfer (paging, SUPI {supi}, PSI {psi}, QFI {qfi:?}) → \
-             {host}:{port}: status={}",
-            resp.status
-        ),
-        Err(e) => log::warn!("N1N2MessageTransfer (paging) to {host}:{port} failed: {e}"),
+        Ok(resp) => {
+            log::info!(
+                "N1N2MessageTransfer (paging, SUPI {supi}, PSI {psi}, QFI {qfi:?}) → \
+                 {host}:{port}: status={}",
+                resp.status
+            );
+            match n1n2_paging_conflict_retry_after(&resp) {
+                Some(wait) => {
+                    settle_network_paging(sm_context_ref, &token, PagingAnswer::Retrying);
+                    let sm_context_ref = sm_context_ref.to_string();
+                    tokio::spawn(async move {
+                        let end = retry_n1n2_after_paging_conflict(
+                            config,
+                            request,
+                            sm_context_ref.clone(),
+                            wait,
+                        )
+                        .await;
+                        let answer = match end {
+                            N1n2RetryEnd::Sent(status) => PagingAnswer::of(status),
+                            _ => PagingAnswer::Refused,
+                        };
+                        settle_network_paging(&sm_context_ref, &token, answer);
+                    });
+                }
+                None => {
+                    settle_network_paging(sm_context_ref, &token, PagingAnswer::of(resp.status))
+                }
+            }
+        }
+        Err(e) => {
+            settle_network_paging(sm_context_ref, &token, PagingAnswer::Refused);
+            log::warn!("N1N2MessageTransfer (paging) to {host}:{port} failed: {e}");
+        }
     }
 }
 
@@ -10120,6 +10442,8 @@ async fn ran_released_session(sm_context_ref: &str, n2: Option<&[u8]>) -> SbiRes
     );
     release_user_plane(sm_context_ref).await;
     if let Ok(ctx) = smf_self().read() {
+        // #1631 review M1: a paging in progress ends with the deactivation.
+        drop_network_paging_in(&ctx, sm_context_ref);
         if let Some(mut sess) = ctx.sess_find_by_sm_context_ref(sm_context_ref) {
             sess.up_cnx_state = context::UpCnxState::Deactivated;
             ctx.sess_update(&sess);
@@ -11859,6 +12183,83 @@ async fn handle_sm_policy_terminate(sm_context_ref: &str) -> SbiResponse {
     // #78: no request body -- this release is PCF-driven, not AMF-driven, so there
     // is no SmContextReleaseData to parse.
     handle_sm_context_release(sm_context_ref, None).await;
+    SbiResponse::with_status(204)
+}
+
+/// `POST /nsmf-callback/v1/{smContextRef}/n1-n2-failure/{token}`: the AMF's
+/// Namf_Communication_N1N2TransferFailureNotification for this SMF's paging transfer
+/// (#1631, TS 29.518 §5.2.2.3.2, TS 23.502 §4.2.3.3 step 5): the UE did not answer
+/// the paging, rejected it, or cannot be reached. The user plane is DEACTIVATED
+/// again and the paging dropped, so a later Downlink Data Report pages again. The
+/// router has checked `token` already; it is checked again as the paging is taken,
+/// so a re-page in between is not ended by the failure of the transfer it replaced.
+///
+/// The UPF is not told (step 5's "if applicable"; step 3c leaves it to network
+/// policy). Its buffering episode has reported once already, so it reports again
+/// only when the SMF next instructs it to buffer and notify (TS 29.244 §5.2.3.1),
+/// after the UE's next activation: no paging storm toward a UE that does not answer.
+async fn handle_n1n2_transfer_failure_notification(
+    sm_context_ref: &str,
+    token: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
+    // TS 29.518 §6.1.6.2.30: `cause` and `n1n2MsgDataUri` are both M.
+    let body = request
+        .http
+        .content
+        .as_deref()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok());
+    let cause = body
+        .as_ref()
+        .and_then(|b| b.get("cause"))
+        .and_then(|c| c.as_str())
+        .map(str::to_string);
+    let has_uri = body
+        .as_ref()
+        .and_then(|b| b.get("n1n2MsgDataUri"))
+        .is_some_and(|u| u.is_string());
+    let (Some(cause), true) = (cause, has_uri) else {
+        return problem_400(
+            "INVALID_MSG_FORMAT",
+            "N1N2MsgTxfrFailureNotification needs cause and n1n2MsgDataUri",
+        );
+    };
+    let taken = smf_self().read().ok().is_some_and(|ctx| {
+        let Ok(mut bindings) = ctx.policy_bindings.write() else {
+            return false;
+        };
+        let Some(binding) = bindings.get_mut(sm_context_ref) else {
+            return false;
+        };
+        let ours = binding
+            .network_paging
+            .as_ref()
+            .is_some_and(|p| p.failure_token.matches(token));
+        if ours {
+            binding.network_paging = None;
+        }
+        ours
+    });
+    if !taken {
+        return callback_not_admitted(
+            sm_context_ref,
+            context::SessionCallback::N1n2TransferFailure,
+        );
+    }
+    if let Ok(ctx) = smf_self().read() {
+        if let Some(mut sess) = ctx.sess_find_by_sm_context_ref(sm_context_ref) {
+            if sess.up_cnx_state == context::UpCnxState::Activating {
+                sess.up_cnx_state = context::UpCnxState::Deactivated;
+                ctx.sess_update(&sess);
+            }
+        }
+    }
+    // The AMF's string, bounded and quoted rather than logged as sent.
+    let cause: String = cause.chars().take(64).collect();
+    log::warn!(
+        "N1N2TransferFailure for the paging of ref={sm_context_ref}: {cause:?}; the user \
+         plane is DEACTIVATED again"
+    );
     SbiResponse::with_status(204)
 }
 
@@ -17374,6 +17775,7 @@ mod tests {
                         sdm_notify_token: Some(test_callback_token(&format!(
                             "sdm-{sm_context_ref}"
                         ))),
+                        network_paging: None,
                     },
                 );
             }
@@ -17398,6 +17800,7 @@ mod tests {
                 "POST /nsmf-callback/v1/{var}/sm-policy-notify/{token}/update",
                 "POST /nsmf-callback/v1/{var}/sm-policy-notify/{token}/terminate",
                 "POST /nsmf-callback/v1/{var}/sdm-notify/{token}",
+                "POST /nsmf-callback/v1/{var}/n1-n2-failure/{token}",
             ]
         );
     }
@@ -21802,6 +22205,9 @@ mod tests {
         let (amf, amf_port, posts) = recording_amf().await;
         let reference = session_toward_gnb(&upf, "imsi-001010000009945", 8, amf_port).await;
         let seid = smf_n4_seid_for(&reference);
+        // #1631 review M1: a paging record left from before the activation, which
+        // would count as in progress once the session is DEACTIVATED.
+        let _ = begin_network_paging(&reference, Some(8)).expect("recorded");
         // Report Type ERIR; Error Indication Report { Remote F-TEID 127.0.0.9 }.
         let mut fteid = vec![0x01, 0, 0, 0, 0x99];
         fteid.extend_from_slice(&[127, 0, 0, 9]);
@@ -21823,6 +22229,7 @@ mod tests {
         pfcp_path::drain_restart_fanouts(std::time::Duration::from_secs(5)).await;
         let far2 = last_update_far_action(&upf, 2);
         let posted = posts.lock().unwrap().len();
+        let paging_left = lookup_policy_binding(&reference).and_then(|b| b.network_paging);
         up_path::reset_for_test();
         forget_seeded_session(&reference);
         amf.stop().await.ok();
@@ -21832,6 +22239,10 @@ mod tests {
             Some(n4_build::apply_action::BUFF | n4_build::apply_action::NOCP)
         );
         assert_eq!(posted, 1, "the NG-RAN is told through the AMF");
+        assert!(
+            paging_left.is_none(),
+            "the deactivation drops a paging record (#1631 review M1)"
+        );
     }
 
     /// #994, TS 23.007 §20.3.1 and §20.3.4: an EPC PDN connection whose PGW-U FAR
@@ -22231,7 +22642,13 @@ mod tests {
         seed_binding(reference, 5);
         set_policy_id(reference, pol_id);
         // The AMF is unreachable: the release command is still sent and T3592 armed.
+        // #1631 review M1: a paging record, which the deactivation drops.
+        let _ = begin_network_paging(reference, Some(8)).expect("recorded");
         release_for_reactivation(reference, "http://127.0.0.1:1", "imsi-001010000000001", 5).await;
+        assert!(
+            lookup_policy_binding(reference).is_some_and(|b| b.network_paging.is_none()),
+            "the deactivation drops a paging record (#1631 review M1)"
+        );
         assert!(
             gsm_procedure_timers()
                 .lock()
@@ -24090,6 +24507,8 @@ mod tests {
             Some(upf.upf_seid),
             Some((upf.upf_teid, upf.upf_ip)),
         );
+        // #1631 review M1: a paging record, which the deactivation drops.
+        let _ = begin_network_paging(reference, Some(8)).expect("recorded");
 
         let released = nextgcore_ngap_gen::encode_contained(
             &nextgcore_ngap_gen::generated::PDUSessionResourceNotifyReleasedTransfer {
@@ -24120,6 +24539,10 @@ mod tests {
             ));
         let resp = handle_sm_context_update(reference, &request).await;
         assert_eq!(resp.status, 200);
+        assert!(
+            lookup_policy_binding(reference).is_some_and(|b| b.network_paging.is_none()),
+            "the deactivation drops a paging record (#1631 review M1)"
+        );
 
         assert!(
             upf.seen()
@@ -27552,6 +27975,589 @@ mod tests {
             ctx.upf_ul_endpoints.write().expect("w").remove(&reference);
         }
         amf.stop().await.expect("stop");
+    }
+
+    // ==================================================================
+    // #1631: network-triggered ACTIVATING, re-paging and the failure notification.
+    // ==================================================================
+
+    /// A stand-in AMF answering the `n`-th N1N2MessageTransfer with `answers[n]` (the
+    /// last one repeated), recording each body.
+    async fn scripted_amf_1631(
+        answers: Vec<(u16, serde_json::Value)>,
+    ) -> (
+        nextgcore_sbi::server::SbiServer,
+        u16,
+        Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::default();
+        let sink = Arc::clone(&seen);
+        let answers = Arc::new(answers);
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        server
+            .start(move |req: SbiRequest| {
+                let sink = Arc::clone(&sink);
+                let answers = Arc::clone(&answers);
+                async move {
+                    let body = req
+                        .http
+                        .content
+                        .as_deref()
+                        .and_then(|c| serde_json::from_str(c).ok())
+                        .unwrap_or(serde_json::Value::Null);
+                    let n = {
+                        let mut seen = sink.lock().unwrap_or_else(|e| e.into_inner());
+                        seen.push(body);
+                        seen.len() - 1
+                    };
+                    let (status, answer) = answers[n.min(answers.len() - 1)].clone();
+                    SbiResponse::with_status(status)
+                        .with_json_body(&answer)
+                        .unwrap_or_else(|_| SbiResponse::with_status(status))
+                }
+            })
+            .await
+            .expect("stand-in AMF starts");
+        (server, addr.port(), seen)
+    }
+
+    fn attempting_1631() -> (u16, serde_json::Value) {
+        (
+            202,
+            serde_json::json!({ "cause": "ATTEMPTING_TO_REACH_UE" }),
+        )
+    }
+
+    /// A DEACTIVATED session served by the AMF at `amf_port`, whose default flow (QFI
+    /// 5) has ARP priority level 8 and whose dedicated flow (QFI 7) level 2. Returns
+    /// the reference and the CP SEID a Downlink Data Report names.
+    fn seed_paged_session_1631(supi: &str, psi: u8, amf_port: u16) -> (String, u64) {
+        let reference = seed_registered_session(supi, psi, "internet");
+        let ctx = smf_self();
+        let context = ctx.read().expect("context");
+        let mut sess = context
+            .sess_find_by_sm_context_ref(&reference)
+            .expect("session");
+        sess.up_cnx_state = context::UpCnxState::Deactivated;
+        sess.sm_context_status_uri = Some(format!("http://127.0.0.1:{amf_port}"));
+        context.sess_update(&sess);
+        let mut b = context::PolicyBinding::snapshot_default();
+        b.supi = supi.to_string();
+        b.psi = psi;
+        b.qfi = 5;
+        b.five_qi = 9;
+        b.arp_priority_level = 8;
+        b.callback_tokens = true;
+        context
+            .policy_bindings
+            .write()
+            .expect("bindings")
+            .insert(reference.clone(), b);
+        context
+            .upf_ul_endpoints
+            .write()
+            .expect("endpoints")
+            .insert(reference.clone(), (0x1631_0001, [10, 45, 16, 31]));
+        let mut dedicated = context.bearer_add(sess.id).expect("bearer");
+        dedicated.ebi = 7;
+        dedicated.qos.index = 1;
+        dedicated.qos.arp_priority_level = 2;
+        context.bearer_update(&dedicated);
+        (reference, sess.smf_n4_seid)
+    }
+
+    /// A Downlink Data Report for `seid` on QFI `qfi`, through the real PFCP Session
+    /// Report path, from the session's own associated UPF. The caller holds
+    /// `pfcp_path::N4_TEST_LOCK`.
+    async fn report_dl_data_1631(seid: u64, qfi: u8) {
+        let upf = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("upf socket");
+        let smf_sock = Arc::new(
+            tokio::net::UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("smf socket"),
+        );
+        let upf_addr = upf.local_addr().expect("upf addr");
+        pfcp_path::set_global_pool(vec![
+            pfcp_path::PfcpClient::associated_for_test(smf_sock.clone(), upf_addr).await,
+        ]);
+        handle_pfcp_session_report(&smf_sock, &dldr_report_packet(seid, qfi), upf_addr).await;
+        pfcp_path::clear_global_upf_for_test();
+    }
+
+    fn failure_token_1631(body: &serde_json::Value, reference: &str) -> String {
+        let uri = body["n1n2FailureTxfNotifURI"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the transfer names its failure URI: {body}"));
+        let marker = format!("/nsmf-callback/v1/{reference}/n1-n2-failure/");
+        let at = uri.find(&marker).unwrap_or_else(|| panic!("{uri}"));
+        uri[at + marker.len()..].to_string()
+    }
+
+    async fn notify_failure_1631(reference: &str, token: &str, body: serde_json::Value) -> u16 {
+        smf_sbi_request_handler(
+            SbiRequest::post(format!(
+                "/nsmf-callback/v1/{reference}/n1-n2-failure/{token}"
+            ))
+            .with_body(body.to_string(), "application/json"),
+        )
+        .await
+        .status
+    }
+
+    fn up_state_1631(reference: &str) -> context::UpCnxState {
+        up_cnx_state_of(reference).expect("the session")
+    }
+
+    /// #1631, TS 23.502 §4.2.3.3 step 3a and step 5, TS 29.502 §5.2.2.3.2.1:
+    /// - a paging the AMF answers 202 leaves the session ACTIVATING, and carries an
+    ///   `n1n2FailureTxfNotifURI` with a token of its own;
+    /// - while it is in progress a Downlink Data Report at the same or a lower
+    ///   priority does not page again, a higher one does, with a new token;
+    /// - the failure notification of the replaced transfer changes nothing; the
+    ///   current one's sets DEACTIVATED, after which a report pages again;
+    /// - a release meanwhile sends no N2 (nothing was set up at the NG-RAN).
+    ///
+    /// REVERT-VERIFIED: without `begin_network_paging`'s priority rule, every report
+    /// pages; without the ACTIVATING mark, the state assert fails; without the
+    /// handler's take, the failure leaves the session ACTIVATING and the next report
+    /// is not paged.
+    #[tokio::test]
+    async fn a_paging_is_activating_and_pages_again_only_for_a_higher_priority_1631() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let (amf, port, seen) = scripted_amf_1631(vec![attempting_1631()]).await;
+        let (reference, seid) = seed_paged_session_1631("imsi-001010000016311", 5, port);
+        let sent = || seen.lock().unwrap().clone();
+
+        report_dl_data_1631(seid, 5).await;
+        assert_eq!(sent().len(), 1, "the first report pages");
+        assert_eq!(sent()[0]["arp"]["priorityLevel"], 8);
+        let first = failure_token_1631(&sent()[0], &reference);
+        assert_eq!(first.len(), 32, "a minted token");
+        assert_eq!(up_state_1631(&reference), context::UpCnxState::Activating);
+        assert!(
+            !up_connection_active(&reference),
+            "a paging the UE has not answered set nothing up at the NG-RAN"
+        );
+
+        report_dl_data_1631(seid, 5).await;
+        assert_eq!(sent().len(), 1, "the same priority does not page again");
+        report_dl_data_1631(seid, 7).await;
+        assert_eq!(sent().len(), 2, "a higher priority (level 2) pages again");
+        assert_eq!(sent()[1]["arp"]["priorityLevel"], 2);
+        let second = failure_token_1631(&sent()[1], &reference);
+        assert_ne!(first, second, "one token per transfer");
+        report_dl_data_1631(seid, 7).await;
+        report_dl_data_1631(seid, 5).await;
+        assert_eq!(
+            sent().len(),
+            2,
+            "neither the same nor a lower priority pages"
+        );
+
+        let failure = serde_json::json!({
+            "cause": "UE_NOT_RESPONDING",
+            "n1n2MsgDataUri": "http://amf/namf-comm/v1/ue-contexts/x/n1-n2-messages/1",
+        });
+        assert_eq!(
+            notify_failure_1631(&reference, &first, failure.clone()).await,
+            404
+        );
+        assert_eq!(up_state_1631(&reference), context::UpCnxState::Activating);
+        assert_eq!(
+            notify_failure_1631(&reference, &second, serde_json::json!({ "cause": "X" })).await,
+            400,
+            "n1n2MsgDataUri is mandatory"
+        );
+        assert_eq!(
+            notify_failure_1631(&reference, &second, failure.clone()).await,
+            204
+        );
+        assert_eq!(up_state_1631(&reference), context::UpCnxState::Deactivated);
+        assert_eq!(
+            notify_failure_1631(&reference, &second, failure).await,
+            404,
+            "a paging ends once"
+        );
+
+        report_dl_data_1631(seid, 5).await;
+        assert_eq!(sent().len(), 3, "the failure re-enables paging");
+        assert_ne!(failure_token_1631(&sent()[2], &reference), second);
+
+        drop_session_for_retry(&reference);
+        amf.stop().await.expect("stop");
+    }
+
+    /// #1631: the paging ends when the AMF reports the user plane (the UE answered:
+    /// its ACTIVATING), when the AMF delivered the N2 to a connected UE (200), and
+    /// when it refused the transfer (504): no paging is left in progress, and the
+    /// failure token is no longer held.
+    /// - after the UE's ACTIVATING, or a 200: ACTIVATING, a report does not page,
+    ///   and a release carries its N2;
+    /// - after a 504: still DEACTIVATED, a report pages again.
+    ///
+    /// REVERT-VERIFIED: without `mark_up_cnx_state` dropping the paging, the UE's
+    /// ACTIVATING leaves it in progress (a higher priority still pages, the release
+    /// has no N2); with a 200 settled as a paging, its token stays held.
+    #[tokio::test]
+    async fn a_paging_ends_with_the_ue_s_activation_a_delivery_or_a_refusal_1631() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let failure = serde_json::json!({
+            "cause": "UE_NOT_RESPONDING",
+            "n1n2MsgDataUri": "http:",
+        });
+
+        // The UE answers: the AMF's UpdateSMContext ACTIVATING.
+        let (amf, port, seen) = scripted_amf_1631(vec![attempting_1631()]).await;
+        let (reference, seid) = seed_paged_session_1631("imsi-001010000016312", 5, port);
+        report_dl_data_1631(seid, 5).await;
+        let token = failure_token_1631(&seen.lock().unwrap()[0], &reference);
+        mark_up_cnx_state(&reference, context::UpCnxState::Activating);
+        report_dl_data_1631(seid, 7).await;
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "the UE is activating: no paging"
+        );
+        assert!(up_connection_active(&reference));
+        assert_eq!(
+            notify_failure_1631(&reference, &token, failure.clone()).await,
+            404
+        );
+        assert_eq!(up_state_1631(&reference), context::UpCnxState::Activating);
+        drop_session_for_retry(&reference);
+        amf.stop().await.expect("stop");
+
+        // A connected UE: 200, the N2 went to the NG-RAN.
+        let (amf, port, seen) = scripted_amf_1631(vec![(
+            200,
+            serde_json::json!({ "cause": "N1_N2_TRANSFER_INITIATED" }),
+        )])
+        .await;
+        let (reference, seid) = seed_paged_session_1631("imsi-001010000016313", 6, port);
+        report_dl_data_1631(seid, 5).await;
+        let token = failure_token_1631(&seen.lock().unwrap()[0], &reference);
+        assert_eq!(up_state_1631(&reference), context::UpCnxState::Activating);
+        assert!(
+            up_connection_active(&reference),
+            "the NG-RAN may hold resources"
+        );
+        report_dl_data_1631(seid, 7).await;
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(
+            notify_failure_1631(&reference, &token, failure.clone()).await,
+            404
+        );
+        drop_session_for_retry(&reference);
+        amf.stop().await.expect("stop");
+
+        // A refusal: 504 UE_NOT_REACHABLE.
+        let (amf, port, seen) = scripted_amf_1631(vec![(
+            504,
+            serde_json::json!({ "error": { "status": 504, "cause": "UE_NOT_REACHABLE" } }),
+        )])
+        .await;
+        let (reference, seid) = seed_paged_session_1631("imsi-001010000016314", 7, port);
+        report_dl_data_1631(seid, 5).await;
+        let token = failure_token_1631(&seen.lock().unwrap()[0], &reference);
+        assert_eq!(up_state_1631(&reference), context::UpCnxState::Deactivated);
+        assert_eq!(notify_failure_1631(&reference, &token, failure).await, 404);
+        report_dl_data_1631(seid, 5).await;
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "a refused paging is not in progress"
+        );
+        drop_session_for_retry(&reference);
+        amf.stop().await.expect("stop");
+    }
+
+    /// #1631: a transfer the AMF refuses with 409 HIGHER_PRIORITY_REQUEST_ONGOING is
+    /// resent after `retryAfter` (#749) with the same failure URI, and the resend's
+    /// 202 settles the paging: ACTIVATING, and its token is the one held.
+    ///
+    /// REVERT-VERIFIED: with the retry's answer not settled, the session stays
+    /// DEACTIVATED.
+    #[tokio::test]
+    async fn a_resent_paging_is_settled_by_the_resend_s_answer_1631() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let (amf, port, seen) = scripted_amf_1631(vec![
+            (
+                409,
+                serde_json::json!({
+                    "error": { "status": 409, "cause": "HIGHER_PRIORITY_REQUEST_ONGOING" },
+                    "errInfo": { "retryAfter": 0 },
+                }),
+            ),
+            attempting_1631(),
+        ])
+        .await;
+        let (reference, seid) = seed_paged_session_1631("imsi-001010000016315", 5, port);
+        report_dl_data_1631(seid, 5).await;
+        let settled = nextgcore_sbi::test_support::poll_until(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(10),
+            || {
+                let reference = reference.clone();
+                async move {
+                    (up_cnx_state_of(&reference) == Some(context::UpCnxState::Activating))
+                        .then_some(())
+                }
+            },
+        )
+        .await;
+        let bodies = seen.lock().unwrap().clone();
+        assert!(settled.is_some(), "the resend's 202 makes it ACTIVATING");
+        assert_eq!(bodies.len(), 2, "sent, then resent");
+        let token = failure_token_1631(&bodies[0], &reference);
+        assert_eq!(
+            failure_token_1631(&bodies[1], &reference),
+            token,
+            "the same URI"
+        );
+        assert!(network_paging_pending(&reference));
+        assert_eq!(
+            notify_failure_1631(
+                &reference,
+                &token,
+                serde_json::json!({ "cause": "UE_NOT_RESPONDING", "n1n2MsgDataUri": "http:" }),
+            )
+            .await,
+            204
+        );
+        drop_session_for_retry(&reference);
+        amf.stop().await.expect("stop");
+    }
+
+    /// #1631: a context restored without its in-memory session (#1230) follows the
+    /// same rule on its binding alone: a paging in progress is not repeated at the
+    /// same or a lower priority, a higher one replaces it.
+    ///
+    /// REVERT-VERIFIED: with `network_paging_in_progress` requiring a session, the
+    /// second begin is not refused.
+    #[tokio::test]
+    async fn a_restored_context_s_paging_follows_the_same_rule_1631() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let reference = "916310";
+        if let Ok(ctx) = smf_self().read() {
+            ctx.policy_bindings.write().unwrap().insert(
+                reference.to_string(),
+                context::PolicyBinding::snapshot_default(),
+            );
+        }
+        let first = begin_network_paging(reference, Some(8)).expect("pages");
+        assert_eq!(
+            begin_network_paging(reference, Some(8)).err(),
+            Some(Some(8))
+        );
+        assert_eq!(
+            begin_network_paging(reference, Some(9)).err(),
+            Some(Some(8))
+        );
+        assert_eq!(begin_network_paging(reference, None).err(), Some(Some(8)));
+        let second = begin_network_paging(reference, Some(1)).expect("a higher priority");
+        assert_ne!(first.as_str(), second.as_str());
+        assert!(network_paging_pending(reference));
+        assert!(!up_connection_active(reference));
+        settle_network_paging(reference, &first, PagingAnswer::Refused);
+        assert!(
+            network_paging_pending(reference),
+            "a replaced transfer settles nothing"
+        );
+        settle_network_paging(reference, &second, PagingAnswer::Refused);
+        assert!(!network_paging_pending(reference));
+        assert_eq!(
+            begin_network_paging("no-such-ref-1631", Some(1)).err(),
+            Some(None)
+        );
+        if let Ok(ctx) = smf_self().read() {
+            ctx.policy_bindings.write().unwrap().remove(reference);
+        }
+    }
+
+    /// #1631 review M1: a live session stays DEACTIVATED until the AMF's 202 is
+    /// settled, and throughout a #749 resend's wait; the paging is in progress all
+    /// the while, so a second report at the same priority does not page again, and a
+    /// higher one does. Before, only ACTIVATING counted: the second report replaced
+    /// the record, the AMF refused it (step 3b) and the first 202 then matched
+    /// nothing.
+    ///
+    /// REVERT-VERIFIED: with "in progress" requiring ACTIVATING again, the second
+    /// begin is not refused.
+    #[tokio::test]
+    async fn a_report_before_the_amf_answers_does_not_page_again_1631() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let (reference, _seid) = seed_paged_session_1631("imsi-001010000016316", 5, 9);
+        assert_eq!(up_state_1631(&reference), context::UpCnxState::Deactivated);
+        let first = begin_network_paging(&reference, Some(8)).expect("pages");
+        assert_eq!(
+            begin_network_paging(&reference, Some(8)).err(),
+            Some(Some(8)),
+            "the transfer is in flight: the same priority waits for it"
+        );
+        assert!(network_paging_pending(&reference));
+        assert!(!up_connection_active(&reference));
+        settle_network_paging(&reference, &first, PagingAnswer::Retrying);
+        assert_eq!(up_state_1631(&reference), context::UpCnxState::Deactivated);
+        assert_eq!(
+            begin_network_paging(&reference, Some(8)).err(),
+            Some(Some(8)),
+            "a resend is pending: the same priority waits for it"
+        );
+        let second = begin_network_paging(&reference, Some(2)).expect("a higher priority");
+        settle_network_paging(&reference, &first, PagingAnswer::Paging);
+        assert_eq!(
+            up_state_1631(&reference),
+            context::UpCnxState::Deactivated,
+            "the replaced transfer's answer settles nothing"
+        );
+        settle_network_paging(&reference, &second, PagingAnswer::Paging);
+        assert_eq!(up_state_1631(&reference), context::UpCnxState::Activating);
+        // ACTIVATED ends it.
+        mark_up_cnx_state(&reference, context::UpCnxState::Activated);
+        assert!(!network_paging_pending(&reference));
+        drop_session_for_retry(&reference);
+    }
+
+    /// #1631 review: a paging the AMF never reports on runs out on the SMF's guard:
+    /// the record goes, ACTIVATING falls back to DEACTIVATED, and the next report
+    /// pages again.
+    ///
+    /// REVERT-VERIFIED: without the guard, the paging stays in progress.
+    #[tokio::test]
+    async fn a_paging_the_amf_never_reports_on_runs_out_on_the_guard_1631() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let (reference, _seid) = seed_paged_session_1631("imsi-001010000016317", 5, 9);
+        let token = begin_network_paging(&reference, Some(8)).expect("pages");
+        settle_network_paging(&reference, &token, PagingAnswer::Paging);
+        assert_eq!(up_state_1631(&reference), context::UpCnxState::Activating);
+        if let Ok(ctx) = smf_self().read() {
+            let mut bindings = ctx.policy_bindings.write().unwrap();
+            let paging = bindings
+                .get_mut(&reference)
+                .and_then(|b| b.network_paging.as_mut())
+                .expect("the paging");
+            paging.started = std::time::Instant::now()
+                .checked_sub(network_paging_guard() + std::time::Duration::from_secs(1))
+                .expect("the clock is past the guard");
+        }
+        assert!(!network_paging_pending(&reference), "the guard ran out");
+        assert_eq!(up_state_1631(&reference), context::UpCnxState::Deactivated);
+        assert!(lookup_policy_binding(&reference).is_some_and(|b| b.network_paging.is_none()));
+        assert!(
+            begin_network_paging(&reference, Some(8)).is_ok(),
+            "pages again"
+        );
+        drop_session_for_retry(&reference);
+    }
+
+    /// #1631 review: the failure handler checks the token itself as it takes the
+    /// paging, not only through the router: a wrong token changes nothing.
+    ///
+    /// REVERT-VERIFIED: with the handler taking the paging whatever the token, the
+    /// wrong token ends it.
+    #[tokio::test]
+    async fn the_failure_handler_takes_the_paging_only_on_its_token_1631() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let (reference, _seid) = seed_paged_session_1631("imsi-001010000016318", 5, 9);
+        let token = begin_network_paging(&reference, Some(8)).expect("pages");
+        settle_network_paging(&reference, &token, PagingAnswer::Paging);
+        let request = SbiRequest::post("/x").with_body(
+            serde_json::json!({ "cause": "UE_NOT_RESPONDING", "n1n2MsgDataUri": "http:" })
+                .to_string(),
+            "application/json",
+        );
+        let wrong = handle_n1n2_transfer_failure_notification(
+            &reference,
+            "0123456789abcdef0123456789abcdef",
+            &request,
+        )
+        .await;
+        assert_eq!(wrong.status, 404);
+        assert!(
+            network_paging_pending(&reference),
+            "the paging is still in progress"
+        );
+        assert_eq!(up_state_1631(&reference), context::UpCnxState::Activating);
+        let right =
+            handle_n1n2_transfer_failure_notification(&reference, token.as_str(), &request).await;
+        assert_eq!(right.status, 204);
+        assert_eq!(up_state_1631(&reference), context::UpCnxState::Deactivated);
+        drop_session_for_retry(&reference);
+    }
+
+    /// #1631: on an OAuth2-required listener (empty JWKS), the AMF's token-less
+    /// failure notification is admitted on the paging's token alone (only that AMF
+    /// holds it), and acted on. A forged token, the token-less stub route and a
+    /// service request are 401.
+    ///
+    /// REVERT-VERIFIED: with the exemption dropped, the right token is 401 too.
+    #[tokio::test]
+    async fn an_oauth2_listener_admits_the_paging_failure_on_its_token_1631() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let reference = "916311";
+        if let Ok(ctx) = smf_self().read() {
+            ctx.policy_bindings.write().unwrap().insert(
+                reference.to_string(),
+                context::PolicyBinding::snapshot_default(),
+            );
+        }
+        let token = begin_network_paging(reference, Some(8)).expect("pages");
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let mut cfg = with_callback_exemptions(NextgcoreSbiServerConfig::new(addr));
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(serde_json::json!({"keys": []}));
+        let server = SbiServer::on_listener(cfg, listener);
+        server.start(smf_sbi_request_handler).await.expect("start");
+        let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", addr.port());
+        let body = serde_json::json!({ "cause": "UE_NOT_RESPONDING", "n1n2MsgDataUri": "http:" });
+        let mut statuses = Vec::new();
+        for path in [
+            format!("/nsmf-callback/v1/{reference}/n1-n2-failure/0123456789abcdef0123456789abcdef"),
+            format!("/nsmf-callback/v1/n1-n2-failure/{reference}"),
+            "/nsmf-pdusession/v1/sm-contexts".to_string(),
+            format!(
+                "/nsmf-callback/v1/{reference}/n1-n2-failure/{}",
+                token.as_str()
+            ),
+        ] {
+            let req =
+                SbiRequest::post(path.clone()).with_body(body.to_string(), "application/json");
+            let status = tokio::time::timeout(Duration::from_secs(5), client.send_request(req))
+                .await
+                .expect("bounded")
+                .expect("response")
+                .status;
+            statuses.push((path, status));
+        }
+        server.stop().await.expect("stop");
+        let pending = network_paging_pending(reference);
+        if let Ok(ctx) = smf_self().read() {
+            ctx.policy_bindings.write().unwrap().remove(reference);
+        }
+        let (last, refused) = statuses.split_last().expect("four");
+        for (path, status) in refused {
+            assert_eq!(*status, 401, "{path}");
+        }
+        assert_eq!(last.1, 204, "the paging's own token");
+        assert!(!pending, "and the paging ended");
     }
 
     /// #1230: an SM context restored from the snapshot keeps its UPF N3 uplink endpoint,
