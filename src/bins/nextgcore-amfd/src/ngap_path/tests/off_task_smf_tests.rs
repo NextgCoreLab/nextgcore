@@ -760,6 +760,8 @@ async fn a_downlink_setup_activated_at_a_blackholed_smf_does_not_hold_the_ngap_t
 /// its SMF.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_an_release_deactivation_at_a_blackholed_smf_does_not_hold_the_ngap_task() {
+    // #1588: this test reads the paging strategy.
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     let (_smf, port, calls) = activating_smf().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran) = (7_922_501u64, 127u32);
@@ -1036,6 +1038,8 @@ async fn an_an_release_during_the_join_sends_no_initial_context_setup() {
     // back the list it saw at install, under a test (the EPS→5GS ones) that had set its
     // own meanwhile, and that test's HandoverRequest then had no GUAMI to encode.
     let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    // #1588: this test reads the paging strategy.
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeOneGuami::install();
     let (_fast, fast_port, _calls) = activating_smf().await;

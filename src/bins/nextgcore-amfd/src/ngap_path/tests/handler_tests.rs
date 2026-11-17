@@ -2390,6 +2390,8 @@ async fn a_modify_request_missing_its_n1_or_transfer_is_refused() {
 /// and kept as a MODIFY in the paging context, not answered 200 and dropped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_modification_for_an_idle_ue_pages_it() {
+    // #1588: this page reads the paging strategy.
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     let (_smf, port, _calls) = activating_smf().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran, supi) = (7_757_005u64, 61, "imsi-001010007570005");
@@ -2425,6 +2427,8 @@ async fn a_modification_for_an_idle_ue_pages_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_transfer_queued_before_the_ue_went_idle_pages_it_instead_of_sending() {
     let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
+    // #1588: this page reads the paging strategy.
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     let (_smf, port, _calls) = activating_smf().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran, supi) = (7_757_006u64, 62, "imsi-001010007570006");
@@ -3388,6 +3392,8 @@ async fn the_plain_dispatch_service_request_arm_records_its_allocation() {
 /// it. It gets an Error Indication "Unknown local UE NGAP ID".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_released_connection_loses_its_contextless_allocation() {
+    // #1588: this test reads the paging strategy.
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     let mut server = capturing_ngap_server().await;
     let id = 7_758_021u64;
     server.forced_amf_ue_ngap_id = Some(id);
@@ -5235,6 +5241,8 @@ async fn an_update_from_cm_idle_whose_initial_context_setup_cannot_encode_still_
 #[allow(clippy::await_holding_lock)]
 async fn an_ics_failure_after_an_idle_update_keeps_the_ue_registered_and_idle() {
     let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    // #1588: this test reads the paging strategy.
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeFixtureGuami::install();
     let (_smf, port, calls) = activating_smf().await;
@@ -5826,6 +5834,8 @@ async fn an_update_that_reactivated_a_session_keeps_the_connection() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_second_downlink_data_transfer_while_paging_gets_409_with_retry_after() {
     let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
+    // #1588: this page reads the paging strategy.
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     let (_smf, port, _calls) = activating_smf().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran, supi) = (7_749_021u64, 65, "imsi-001010007490021");
