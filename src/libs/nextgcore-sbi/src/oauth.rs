@@ -1348,6 +1348,29 @@ impl OAuth2Client {
         }
     }
 
+    /// Test fixtures only: a client that neither reads nor writes process-wide
+    /// CCA state. Unlike [`OAuth2Client::new`] it resolves no signing key or
+    /// `x5c` chain (from the override or the environment, which a sibling test
+    /// may have set) and publishes no public JWK. It sends token requests
+    /// without a CCA, which only a stand-in NRF accepts.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn isolated_for_test(
+        nrf_uri: impl Into<String>,
+        nf_instance_id: impl Into<String>,
+        nf_type: NfType,
+    ) -> Self {
+        Self {
+            nrf_uri: nrf_uri.into(),
+            nf_instance_id: nf_instance_id.into(),
+            nf_type,
+            cache: TokenCache::new(),
+            tls: None,
+            token_path: Self::default_token_path().to_string(),
+            cca_signing_key: None,
+            cca_cert_chain: Arc::new(Vec::new()),
+        }
+    }
+
     /// Sign this client's access-token requests with `key`, overriding the
     /// process-wide [`cca_signing_key_default`].
     ///

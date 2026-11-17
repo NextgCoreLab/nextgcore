@@ -686,6 +686,21 @@ fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+/// #1658: the client for an Npcf_PolicyAuthorization service request to `pcf`.
+/// It follows the SBI security profile and carries the NRF-issued token when an
+/// outbound OAuth2 client is installed: an OAuth2-required PCF answers a bare
+/// request 401 (TS 33.501 §13.4.1.1.2).
+fn pcf_client(pcf: &PcfEndpoint) -> nextgcore_sbi::client::SbiClient {
+    crate::attach_oauth2(
+        nextgcore_sbi::client::SbiClient::new(
+            nextgcore_sbi::security::sbi_peer_client_config(&pcf.host, pcf.port)
+                .with_connect_timeout(std::time::Duration::from_secs(2))
+                .with_request_timeout(std::time::Duration::from_secs(3)),
+        ),
+        nextgcore_sbi::types::NfType::Pcf,
+    )
+}
+
 /// `Npcf_PolicyAuthorization_Create`: POST the app-session context and record the
 /// `appSessionId` from the `Location` header against `resource_id`.
 ///
@@ -698,11 +713,7 @@ pub async fn policy_authorization_create(
     body: &serde_json::Value,
 ) -> Option<String> {
     let pcf = resolve_pcf_endpoint().await?;
-    let client = nextgcore_sbi::client::SbiClient::new(
-        nextgcore_sbi::security::sbi_peer_client_config(&pcf.host, pcf.port)
-            .with_connect_timeout(std::time::Duration::from_secs(2))
-            .with_request_timeout(std::time::Duration::from_secs(3)),
-    );
+    let client = pcf_client(&pcf);
     let resp = match client
         .post_json("/npcf-policyauthorization/v1/app-sessions", body)
         .await
@@ -761,11 +772,7 @@ pub async fn policy_authorization_delete(resource_id: &str) -> bool {
         );
         return false;
     };
-    let client = nextgcore_sbi::client::SbiClient::new(
-        nextgcore_sbi::security::sbi_peer_client_config(&pcf.host, pcf.port)
-            .with_connect_timeout(std::time::Duration::from_secs(2))
-            .with_request_timeout(std::time::Duration::from_secs(3)),
-    );
+    let client = pcf_client(&pcf);
     let path = format!("/npcf-policyauthorization/v1/app-sessions/{app_session_id}/delete");
     match client.post_json(&path, &serde_json::json!({})).await {
         Ok(resp) if (200..300).contains(&resp.status) => {
