@@ -77,6 +77,11 @@ pub use app::{
     handle_ue_policy_delivery_failure, handle_ue_policy_update,
 };
 
+// #1518: the PolicyDataChangeNotification handler, for a test that drives a policy
+// data change in process. The route in front of it admits only the held
+// subscription's token, which an in-process test does not have.
+pub use app::handle_policy_data_change_notify;
+
 /// Helpers for in-process strict-peer tests in *other* crates. Not gated behind
 /// `#[cfg(test)]` because cfg(test) items are invisible across crate
 /// boundaries; a dev-dependency test in a peer crate must seed the
@@ -87,12 +92,6 @@ pub mod test_support {
     /// Process-wide lock so strict-peer tests that touch the global PCF context
     /// run serially (the PCF context is process-global; parallel tests race).
     pub static CONTEXT_GUARD: Mutex<()> = Mutex::new(());
-
-    /// A policy-data notification path whose token this process admits (#1518), for
-    /// a test that POSTs a PolicyDataChangeNotification to the router in process.
-    pub fn policy_data_notify_path() -> String {
-        crate::policy_data_sub::test_notify_path()
-    }
 
     /// Initialize the process-global PCF context for in-process strict-peer
     /// tests (wraps [`crate::context::pcf_context_init`] with test capacities).

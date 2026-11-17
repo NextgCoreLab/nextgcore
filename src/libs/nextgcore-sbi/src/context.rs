@@ -77,6 +77,11 @@ pub struct NfInstance {
     /// The profile's `lmfInfo` as the NRF returned it (TS 29.510 §6.1.6.2.46), for
     /// an LMF consumer's selection (TS 23.273 §5.1, #997). `None` when absent.
     pub lmf_info: Option<serde_json::Value>,
+    /// The profile's `nfSetIdList` (TS 29.510 §6.1.6.2.2): the NF sets this instance
+    /// belongs to (TS 23.501 §5.21.3). Empty when the profile names none. A consumer
+    /// that bound a context to a set reads it to tell whether another instance may
+    /// stand in for the one it bound to (#1518).
+    pub nf_set_ids: Vec<String>,
 }
 
 impl NfInstance {
@@ -96,7 +101,33 @@ impl NfInstance {
             priority: 0,
             capacity: 100,
             lmf_info: None,
+            nf_set_ids: Vec::new(),
         }
+    }
+
+    /// The `nfSetIdList` of an NFProfile as the NRF returned it (TS 29.510
+    /// §6.1.6.2.2), the non-empty string entries only.
+    pub fn set_ids_from_profile(profile: &serde_json::Value) -> Vec<String> {
+        profile
+            .get("nfSetIdList")
+            .and_then(|l| l.as_array())
+            .map(|l| {
+                l.iter()
+                    .filter_map(|s| s.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether this instance is in any of `sets` (#1518). NF Set IDs are compared
+    /// case-insensitively: "NF Set ID shall be handled as case-insensitive string"
+    /// (TS 29.571 §5.4.2 `NfSetId`, TS 23.003 §28.12).
+    pub fn in_any_set(&self, sets: &[String]) -> bool {
+        self.nf_set_ids
+            .iter()
+            .any(|mine| sets.iter().any(|s| s.eq_ignore_ascii_case(mine)))
     }
 
     /// Add a service to this NF instance

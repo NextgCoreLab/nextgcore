@@ -372,10 +372,16 @@ impl std::fmt::Display for PolicyError {
 }
 
 /// Resolved PCF endpoint
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PcfEndpoint {
     pub host: String,
     pub port: u16,
+    /// The discovered PCF's `nfInstanceId` (TS 29.510 §6.1.6.2.2), `None` when the
+    /// PCF was configured by `PCF_URI` rather than discovered (#1518).
+    pub nf_instance_id: Option<String>,
+    /// The discovered PCF's `nfSetIdList` (TS 29.510 §6.1.6.2.2), empty when it
+    /// names none or the PCF was configured by `PCF_URI` (#1518).
+    pub nf_set_ids: Vec<String>,
 }
 
 impl PcfEndpoint {
@@ -398,7 +404,11 @@ impl PcfEndpoint {
 pub async fn resolve_pcf_endpoint() -> Option<PcfEndpoint> {
     if let Ok(uri) = std::env::var("PCF_URI") {
         if let Some((host, port)) = split_host_port(&uri) {
-            return Some(PcfEndpoint { host, port });
+            return Some(PcfEndpoint {
+                host,
+                port,
+                ..Default::default()
+            });
         }
         log::warn!("PCF_URI '{uri}' is not a valid URI — ignoring");
     }
@@ -422,7 +432,16 @@ pub async fn resolve_pcf_endpoint() -> Option<PcfEndpoint> {
         return None;
     }
     let body: serde_json::Value = serde_json::from_str(resp.http.content.as_deref()?).ok()?;
-    let inst = body.get("nfInstances")?.as_array()?.first()?;
+    let instances = body.get("nfInstances")?.as_array()?;
+    // #1518: every PCF discovered, with the sets it belongs to, for the
+    // sm-policy-notify admission (`pcf_may_notify_for`): a PCF of the association's
+    // set may notify in place of the one the SMF bound to (TS 23.501 §5.21.3.2).
+    remember_discovered_pcfs(
+        instances,
+        nextgcore_sbi::context::search_result_validity(&body),
+    )
+    .await;
+    let inst = instances.first()?;
     // #1324: the smpolicycontrol endpoint's address (IPv4 or IPv6), else the PCF's
     // (IPv4, IPv6, FQDN).
     let host = nextgcore_sbi::nf_addressing::service_host(
@@ -450,7 +469,96 @@ pub async fn resolve_pcf_endpoint() -> Option<PcfEndpoint> {
         .and_then(|p| p.as_u64())
         .map(|p| p as u16)
         .unwrap_or(7777);
-    Some(PcfEndpoint { host, port })
+    Some(PcfEndpoint {
+        host,
+        port,
+        nf_instance_id: inst
+            .get("nfInstanceId")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(str::to_string),
+        nf_set_ids: nextgcore_sbi::context::NfInstance::set_ids_from_profile(inst),
+    })
+}
+
+/// Record each discovered PCF profile's instance id and NF sets in the SBI NF cache
+/// for `validity` (#1518), so the sm-policy-notify admission can tell whether a
+/// notifying PCF belongs to a session's recorded set. Only the identity is cached:
+/// the entry has no services, so no endpoint selection picks it.
+async fn remember_discovered_pcfs(instances: &[serde_json::Value], validity: Duration) {
+    let ctx = nextgcore_sbi::context::global_context();
+    for profile in instances {
+        let Some(id) = profile
+            .get("nfInstanceId")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+        else {
+            continue;
+        };
+        let mut instance = nextgcore_sbi::context::NfInstance::new(
+            normalized_instance_id(id),
+            nextgcore_sbi::types::NfType::Pcf,
+        );
+        instance.nf_set_ids = nextgcore_sbi::context::NfInstance::set_ids_from_profile(profile);
+        ctx.add_nf_instance_with_validity(instance, validity).await;
+    }
+}
+
+/// The PCF an SM policy association was created at (#1518): what the
+/// sm-policy-notify admission checks a notifying PCF against.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PcfIdentity {
+    /// Its `nfInstanceId`. `None` when it was configured by `PCF_URI`.
+    pub nf_instance_id: Option<String>,
+    /// Its `nfSetIdList`.
+    pub nf_set_ids: Vec<String>,
+}
+
+impl PcfEndpoint {
+    /// The identity to record on the session bound to this PCF.
+    pub fn identity(&self) -> PcfIdentity {
+        PcfIdentity {
+            nf_instance_id: self.nf_instance_id.clone(),
+            nf_set_ids: self.nf_set_ids.clone(),
+        }
+    }
+}
+
+/// `id` without a `urn:uuid:` prefix, lower case: a certificate's URI SAN names the
+/// instance as `urn:uuid:<uuid>` (TS 33.310 §6.1.3c), the NRF profile as the bare
+/// UUID (TS 29.571 `NfInstanceId`), and a UUID compares case-insensitively (RFC 4122).
+pub fn normalized_instance_id(id: &str) -> String {
+    let bare = id
+        .get(..9)
+        .filter(|p| p.eq_ignore_ascii_case("urn:uuid:"))
+        .map_or(id, |_| &id[9..]);
+    bare.to_ascii_lowercase()
+}
+
+/// Whether the verified PCF `peer_instance_id` may notify for a session bound to
+/// `bound` (#1518, TS 29.512 §4.2.3, TS 23.501 §5.21.3.2):
+/// - with no recorded instance (a `PCF_URI` PCF, or a session from before this
+///   change), any PCF: the NF type is all there is to check;
+/// - the recorded instance itself;
+/// - another instance only when the session recorded a set and the NRF profile this
+///   SMF last discovered for that instance (still valid) lists one of those sets.
+pub async fn pcf_may_notify_for(bound: &PcfIdentity, peer_instance_id: &str) -> bool {
+    let Some(recorded) = bound.nf_instance_id.as_deref() else {
+        return true;
+    };
+    let peer = normalized_instance_id(peer_instance_id);
+    if peer == normalized_instance_id(recorded) {
+        return true;
+    }
+    if bound.nf_set_ids.is_empty() || peer.is_empty() {
+        return false;
+    }
+    nextgcore_sbi::context::global_context()
+        .get_nf_instance(&peer)
+        .await
+        .is_some_and(|i| {
+            i.nf_type == nextgcore_sbi::types::NfType::Pcf && i.in_any_set(&bound.nf_set_ids)
+        })
 }
 
 pub(crate) fn split_host_port(uri: &str) -> Option<(String, u16)> {
@@ -2860,6 +2968,7 @@ mod tests {
         let pcf = PcfEndpoint {
             host: "127.0.0.1".into(),
             port,
+            ..Default::default()
         };
         let ctx = SmPolicyCreateContext {
             supi: "imsi-001010000000001",
@@ -2961,6 +3070,7 @@ mod tests {
         let pcf = PcfEndpoint {
             host: "127.0.0.1".into(),
             port,
+            ..Default::default()
         };
         let amf_stamp = "Fri, 23 Oct 2026 10:00:00.123 GMT";
         let origination = origination_timestamp_for_create(Some(amf_stamp));
@@ -3056,6 +3166,7 @@ mod tests {
         let pcf = PcfEndpoint {
             host: "127.0.0.1".into(),
             port,
+            ..Default::default()
         };
 
         // Both directions stated: the member is present, in TS 29.571 BitRate form.
@@ -3171,6 +3282,7 @@ mod tests {
         let pcf = PcfEndpoint {
             host: "127.0.0.1".into(),
             port: closed_port(),
+            ..Default::default()
         };
         let ctx = SmPolicyCreateContext {
             supi: "imsi-001010000000001",
@@ -3312,6 +3424,7 @@ mod tests {
         let ep = PcfEndpoint {
             host: "127.0.0.1".to_string(),
             port: 7777,
+            ..Default::default()
         };
         let _ = ep.client();
     }

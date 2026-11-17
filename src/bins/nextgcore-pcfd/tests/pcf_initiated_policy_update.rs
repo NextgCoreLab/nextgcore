@@ -209,8 +209,10 @@ fn post(path: &str, body: serde_json::Value) -> Req {
 }
 
 async fn notify_policy_data_change() {
-    let resp = pcf_sbi_request_handler(post(
-        &nextgcore_pcfd::test_support::policy_data_notify_path(),
+    // The handler itself: the route in front of it admits only the token of the
+    // subscription a running PCF holds (#1518), and its rules are pcfd's unit tests.
+    let resp = nextgcore_pcfd::handle_policy_data_change_notify(&post(
+        nextgcore_pcfd::sbi_path::POLICY_DATA_NOTIFY_PATH,
         serde_json::json!({
             "ueId": SUPI,
             "reportId": format!("/nudr-dr/v2/policy-data/ues/{SUPI}/ue-policy-set"),

@@ -1761,6 +1761,13 @@ pub struct PolicyBinding {
     /// `nsmf-pdusession/v1/easdf-dns-reports`: that URI is served for exactly that
     /// context, matched by its `dnsContextId`.
     pub easdf_report_token: Option<nextgcore_sbi::callback_auth::CallbackToken>,
+    /// The PCF the SM policy association was created at (#1518): its instance id
+    /// and NF sets, from the NRF profile the create was sent to. The
+    /// sm-policy-notify exemption admits a verified PCF only when it is that
+    /// instance or a member of one of those sets (`policy::pcf_may_notify_for`).
+    /// Default (no instance) for a config-default or `PCF_URI` session and for a
+    /// binding from before, which then admits any verified PCF.
+    pub sm_policy_pcf: crate::policy::PcfIdentity,
 }
 
 /// A network-triggered paging in progress (#1631): what step 3a's re-paging rule
@@ -1887,6 +1894,7 @@ impl PolicyBinding {
             sdm_notify_token: None,
             network_paging: None,
             easdf_report_token: None,
+            sm_policy_pcf: crate::policy::PcfIdentity::default(),
         }
     }
 }
