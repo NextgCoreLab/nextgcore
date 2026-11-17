@@ -1044,7 +1044,14 @@ pub fn build_configuration_update_command(
     Some(nextgcore_msg::build_5gmm_message(&msg).to_vec())
 }
 
-/// Build DL NAS Transport message
+/// The longest Payload container value a DL NAS TRANSPORT can carry: TS 24.501
+/// §9.11.3.39, a type 6 (TLV-E / LV-E) IE whose length field is two octets
+/// (65 535 octets, #1636).
+pub const MAX_PAYLOAD_CONTAINER_LEN: usize = u16::MAX as usize;
+
+/// Build DL NAS Transport message. `None` for a payload container longer than
+/// [`MAX_PAYLOAD_CONTAINER_LEN`] (#1636). Before, its length was truncated to 16
+/// bits, so the message was framed with a wrong length.
 pub fn build_dl_nas_transport(
     psi: Option<u8>,
     payload_container_type: u8,
@@ -1062,8 +1069,16 @@ pub fn build_dl_nas_transport(
     // Payload container type (mandatory)
     builder.write_u8(payload_container_type);
 
-    // Payload container (mandatory, LV-E)
-    builder.write_u16(payload_container.len() as u16);
+    // Payload container (mandatory, LV-E): refused, not truncated, past 65 535.
+    let Ok(len) = u16::try_from(payload_container.len()) else {
+        log::warn!(
+            "DL NAS TRANSPORT not built: a {}-byte payload container exceeds the \
+             {MAX_PAYLOAD_CONTAINER_LEN}-byte maximum (TS 24.501 §9.11.3.39)",
+            payload_container.len()
+        );
+        return None;
+    };
+    builder.write_u16(len);
     builder.write_bytes(payload_container);
 
     // PDU session ID (optional, IEI = 0x12) — only for N1 SM payloads
@@ -1973,6 +1988,22 @@ mod tests {
             build_service_accept_for_sessions(None, None),
             vec![0x7E, 0x00, 0x4E]
         );
+    }
+
+    /// #1636, TS 24.501 §9.11.3.39: the Payload container's two-octet length caps
+    /// it at 65 535 octets. A longer one is refused, not framed with its length
+    /// truncated to 16 bits. 65 535 itself is framed exactly.
+    ///
+    /// REVERT-VERIFIED: with the `as u16` cast back, 65 536 octets build a message
+    /// whose length field reads 0.
+    #[test]
+    fn a_payload_container_over_65535_octets_is_refused() {
+        let max = vec![0x2E; MAX_PAYLOAD_CONTAINER_LEN];
+        let msg = build_dl_nas_transport(Some(5), 0x01, &max, None, None).expect("65 535 fits");
+        assert_eq!(&msg[4..6], &[0xFF, 0xFF], "the length field is exact");
+        assert_eq!(msg.len(), 6 + MAX_PAYLOAD_CONTAINER_LEN + 2);
+        let over = vec![0x2E; MAX_PAYLOAD_CONTAINER_LEN + 1];
+        assert!(build_dl_nas_transport(Some(5), 0x01, &over, None, None).is_none());
     }
 
     #[test]

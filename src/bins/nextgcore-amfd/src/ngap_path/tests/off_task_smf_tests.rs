@@ -839,12 +839,7 @@ async fn a_page_for_a_session_the_ue_releases_activates_nothing_1643() {
     let _env = super::SmfEnvGuard::acquire(port).await;
     // Paging reads the strategy (#1588). Taken last.
     let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
-    let saved_guamis = crate::context::amf_self()
-        .read()
-        .expect("ctx lock")
-        .served_guami
-        .clone();
-    serve_only_local_guami();
+    let _guamis = serve_only_local_guami();
     crate::context::amf_context_init(64, 1024, 4096);
     let mut server = capturing_ngap_server().await;
     let (old_id, new_id) = (16_430_241u64, 16_430_242u64);
@@ -888,10 +883,6 @@ async fn a_page_for_a_session_the_ue_releases_activates_nothing_1643() {
         .read()
         .unwrap()
         .paging_remove(old_id);
-    let ctx = crate::context::amf_self();
-    let mut ctx = ctx.write().expect("ctx lock");
-    ctx.num_of_served_guami = saved_guamis.len();
-    ctx.served_guami = saved_guamis;
 }
 
 /// #1643 review round 2, TS 23.502 §4.3.4.2 step 4 (the NAS message only): a page for
@@ -911,12 +902,7 @@ async fn an_n1_only_page_reactivates_nothing_and_delivers_the_command_1643() {
     let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
     // Paging reads the strategy (#1588).
     let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
-    let saved_guamis = crate::context::amf_self()
-        .read()
-        .expect("ctx lock")
-        .served_guami
-        .clone();
-    serve_only_local_guami();
+    let _guamis = serve_only_local_guami();
     let command = [0x2E, 0x05, 0x07, 0xD3, 0x24];
     let has_command = |sent: &[Vec<u8>]| {
         sent.iter().any(|p| {
@@ -1023,11 +1009,6 @@ async fn an_n1_only_page_reactivates_nothing_and_delivers_the_command_1643() {
         has_command(&sent),
         "the re-page delivers the SMF's RELEASE COMMAND"
     );
-
-    let ctx = crate::context::amf_self();
-    let mut ctx = ctx.write().expect("ctx lock");
-    ctx.num_of_served_guami = saved_guamis.len();
-    ctx.served_guami = saved_guamis;
 }
 
 /// #1643 review, TS 24.501 §7.3.2 c) 2): a PDU SESSION RELEASE REQUEST for a PSI that
@@ -1076,6 +1057,59 @@ async fn a_modification_refusal_for_another_session_is_not_relayed_1637() {
         "the AMF's own #26: {nas:02x?}"
     );
     foreign.stop().await.expect("stop");
+}
+
+/// #1636: an SMF refusal whose N1 is longer than a payload container can carry
+/// (TS 24.501 §9.11.3.39) is not relayed, truncated or sent bare. The UE gets the
+/// AMF's own MODIFICATION REJECT #26.
+///
+/// REVERT-VERIFIED: without the length bound in `smf_n1_for_session`, nothing is
+/// sent to the UE at all (the builder refuses the N1), and the test times out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_over_long_smf_n1_gets_the_amfs_own_reject_1636() {
+    let mut n1 = vec![0x2E, 0x05, 0x07, 0xCA, 0x1D];
+    n1.resize(crate::gmm_build::MAX_PAYLOAD_CONTAINER_LEN + 1, 0);
+    let (smf, port) = refusing_smf(403, Some(n1)).await;
+    let nas = modification_answer(16_360_101, 201, "mod-1636-long", port).await;
+    let own = [0x2E, 0x05, 0x07, 0xCA, 0x1A];
+    assert!(
+        nas.windows(own.len()).any(|w| w == own),
+        "the AMF's own #26: {:02x?}",
+        &nas[..nas.len().min(32)]
+    );
+    assert!(nas.len() < 100, "and not the SMF's oversized N1");
+    smf.stop().await.expect("stop");
+}
+
+/// #1636: an SMF answer body larger than `MAX_SMF_RESPONSE_BODY` is refused while
+/// it is read. The UE-requested modification is then an SMF failure with no N1, and
+/// the UE gets the AMF's own #26.
+///
+/// REVERT-VERIFIED: with the SMF client uncapped (`SbiClient::for_peer`), the call
+/// returns the 200 and the UE gets a MODIFICATION COMMAND.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_smf_answer_over_the_body_cap_is_refused_1636() {
+    use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let smf = nextgcore_sbi::server::SbiServer::on_listener(
+        nextgcore_sbi::server::SbiServerConfig::new(addr),
+        listener,
+    );
+    smf.start(|_req: SReq| async move {
+        let pad = "x".repeat(crate::sbi_path::MAX_SMF_RESPONSE_BODY + 1);
+        let body = serde_json::json!({ "pad": pad }).to_string();
+        SResp::with_status(200).with_body(body, "application/json")
+    })
+    .await
+    .expect("stand-in SMF starts");
+    let nas = modification_answer(16_360_111, 202, "mod-1636-big", addr.port()).await;
+    let own = [0x2E, 0x05, 0x07, 0xCA, 0x1A];
+    assert!(
+        nas.windows(own.len()).any(|w| w == own),
+        "the AMF's own #26: {nas:02x?}"
+    );
+    smf.stop().await.expect("stop");
 }
 
 /// TS 23.502 §4.2.3.2, CM-CONNECTED: a Service Request re-activating a session at a

@@ -1376,10 +1376,7 @@ pub async fn call_smf_create_sm_context(
         dnn.unwrap_or("<omitted: SMF selects the subscribed default>")
     );
 
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(smf_host, smf_port),
-        nextgcore_sbi::types::NfType::Smf,
-    );
+    let client = smf_client(smf_host, smf_port);
 
     // redcapIndication propagates the UE's Reduced-Capability status to the SMF
     // (TS 29.502 SmContextCreateData) so the SMF can apply a reduced
@@ -1479,10 +1476,7 @@ pub async fn call_smf_deactivate_up_connection(
     smf_port: u16,
     sm_context_ref: &str,
 ) -> SbiResult<()> {
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(smf_host, smf_port),
-        nextgcore_sbi::types::NfType::Smf,
-    );
+    let client = smf_client(smf_host, smf_port);
     let body = serde_json::json!({ "upCnxState": "DEACTIVATED" });
     let path = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/modify");
     let request =
@@ -1629,10 +1623,7 @@ pub async fn call_smf_update_serving_amf(
     sm_context_ref: &str,
     serving: &serde_json::Value,
 ) -> SbiResult<()> {
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(smf_host, smf_port),
-        nextgcore_sbi::types::NfType::Smf,
-    );
+    let client = smf_client(smf_host, smf_port);
     let path = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/modify");
     let request =
         SbiRequest::post(&path).with_body(serving.to_string(), content_type::APPLICATION_JSON);
@@ -1657,10 +1648,7 @@ pub async fn call_smf_activate_up_connection(
     smf_port: u16,
     sm_context_ref: &str,
 ) -> SbiResult<Vec<u8>> {
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(smf_host, smf_port),
-        nextgcore_sbi::types::NfType::Smf,
-    );
+    let client = smf_client(smf_host, smf_port);
     let body = serde_json::json!({ "upCnxState": "ACTIVATING" });
     let path = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/modify");
     let request =
@@ -1687,6 +1675,25 @@ pub async fn call_smf_activate_up_connection(
             "SMF UP activation answered with no N2 SM information".to_string(),
         )),
     }
+}
+
+/// The largest SMF answer body the AMF reads (#1636): an N1 SM message can be at
+/// most 65 535 octets (a DL NAS TRANSPORT payload container, TS 24.501
+/// §9.11.3.39). An N2 SM transfer and the JSON and multipart framing around them
+/// fit comfortably in the rest. A larger body is refused as an invalid response
+/// while it is being read, before it is buffered whole.
+pub const MAX_SMF_RESPONSE_BODY: usize = 256 * 1024;
+
+/// An SMF client: the peer's SBI profile, OAuth2 when configured, and response
+/// bodies capped at [`MAX_SMF_RESPONSE_BODY`] (#1636).
+fn smf_client(smf_host: &str, smf_port: u16) -> SbiClient {
+    crate::attach_oauth2(
+        SbiClient::new(
+            nextgcore_sbi::security::sbi_peer_client_config(smf_host, smf_port)
+                .with_max_response_body(MAX_SMF_RESPONSE_BODY),
+        ),
+        nextgcore_sbi::types::NfType::Smf,
+    )
 }
 
 /// SM Context Update response from SMF (with optional N1/N2 info)
@@ -1741,10 +1748,7 @@ pub async fn call_smf_update_sm_context_n2(
         n2_sm_info.len()
     );
 
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(smf_host, smf_port),
-        nextgcore_sbi::types::NfType::Smf,
-    );
+    let client = smf_client(smf_host, smf_port);
 
     let body = serde_json::json!({
         "n2SmInfo": { "contentId": "n2SmInfo" },
@@ -1825,10 +1829,7 @@ pub async fn call_smf_update_sm_context_n1_at(
     n1_sm_msg: &[u8],
     ue_location: Option<serde_json::Value>,
 ) -> SbiResult<Vec<u8>> {
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(smf_host, smf_port),
-        nextgcore_sbi::types::NfType::Smf,
-    );
+    let client = smf_client(smf_host, smf_port);
     let mut body = serde_json::json!({ "n1SmMsg": { "contentId": "n1SmMsg" } });
     if let Some(loc) = ue_location {
         body["ueLocation"] = loc;
@@ -1923,10 +1924,7 @@ async fn update_sm_context_with_ue_n1(
     n1_sm_msg: &[u8],
     body: serde_json::Value,
 ) -> Result<SmContextUpdateResponse, SmContextUpdateRefusal> {
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(smf_host, smf_port),
-        nextgcore_sbi::types::NfType::Smf,
-    );
+    let client = smf_client(smf_host, smf_port);
     let path = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/modify");
     let request = SbiRequest::post(&path)
         .with_body(body.to_string(), content_type::APPLICATION_JSON)
@@ -1991,10 +1989,7 @@ pub async fn call_smf_release_sm_context(
 ) -> SbiResult<()> {
     log::info!("Calling SMF SM Context Release: ref={sm_context_ref}");
 
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(smf_host, smf_port),
-        nextgcore_sbi::types::NfType::Smf,
-    );
+    let client = smf_client(smf_host, smf_port);
 
     let body = serde_json::json!({
         "cause": "REL_DUE_TO_UE_REQUEST"
@@ -2053,10 +2048,7 @@ pub async fn call_smf_retrieve_sm_context(
 
     log::info!("Calling SMF SM Context Retrieve for N26 transfer: ref={sm_context_ref}");
 
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(smf_host, smf_port),
-        nextgcore_sbi::types::NfType::Smf,
-    );
+    let client = smf_client(smf_host, smf_port);
 
     // `smContextType: "EPS_PDN_CONNECTION"` asks for exactly the member this leg needs.
     // §6.1.6.2.27 makes `ueEpsPdnConnection` the answer when the type is absent OR names
@@ -4807,10 +4799,7 @@ pub async fn call_smf_create_sm_context_eps_handover(
     smf_port: u16,
     create: &EpsHandoverCreate,
 ) -> Result<EpsHandoverCreated, String> {
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(smf_host, smf_port),
-        nextgcore_sbi::types::NfType::Smf,
-    );
+    let client = smf_client(smf_host, smf_port);
     let response = client
         .send_request(build_eps_handover_create_request(create))
         .await
@@ -4928,10 +4917,7 @@ pub async fn call_smf_n2_handover_step(
     target_id: Option<&serde_json::Value>,
     cause: Option<&str>,
 ) -> Result<Option<(String, Vec<u8>)>, N2HandoverRefusal> {
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(smf_host, smf_port),
-        nextgcore_sbi::types::NfType::Smf,
-    );
+    let client = smf_client(smf_host, smf_port);
     let mut body = serde_json::json!({ "hoState": ho_state });
     if let Some(target_id) = target_id {
         body["targetId"] = target_id.clone();
@@ -5006,10 +4992,7 @@ async fn update_sm_context_ho_state(
     cause: Option<&str>,
     n2: Option<(&str, &[u8])>,
 ) -> Result<Vec<Vec<u8>>, String> {
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(smf_host, smf_port),
-        nextgcore_sbi::types::NfType::Smf,
-    );
+    let client = smf_client(smf_host, smf_port);
     let mut body = serde_json::json!({ "hoState": ho_state });
     if let Some(cause) = cause {
         body["cause"] = serde_json::json!(cause);
