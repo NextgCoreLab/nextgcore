@@ -261,13 +261,68 @@ tokio::task_local! {
 /// are service requests (TS 29.518 §5.2.2.3.1, §5.2.2.6), and the consumer
 /// presents its token on each (TS 33.501 §13.4.1.1.2, TS 29.500 §6.7.3). A
 /// notification to the AMF (SmContextStatusNotify) is not one and carries none.
+///
+/// With enforcement off this is a fresh client per call, as before #1648; with it
+/// on, the per-peer cached client of [`tokened_peer_client`].
 pub(crate) fn namf_client(
     config: nextgcore_sbi::client::SbiClientConfig,
-) -> nextgcore_sbi::client::SbiClient {
-    attach_oauth2(
-        nextgcore_sbi::client::SbiClient::new(config),
-        nextgcore_sbi::types::NfType::Amf,
-    )
+) -> Arc<nextgcore_sbi::client::SbiClient> {
+    tokened_peer_client(config.clone(), nextgcore_sbi::types::NfType::Amf)
+        .unwrap_or_else(|| Arc::new(nextgcore_sbi::client::SbiClient::new(config)))
+}
+
+/// What a [`tokened_peer_client`] is cached under: the target NF type, the peer
+/// (scheme, host, port), the timeouts, and the identity of the OAuth2 client it
+/// carries. That last one is fixed in production (one process-wide client); in
+/// tests it keeps a `TEST_OAUTH2_CLIENT` scope's clients apart from another test's.
+type TokenedPeerKey = (
+    nextgcore_sbi::types::NfType,
+    nextgcore_sbi::types::UriScheme,
+    String,
+    u16,
+    std::time::Duration,
+    std::time::Duration,
+    usize,
+);
+
+/// The cache behind [`tokened_peer_client`]. Bounded by the peers this SMF talks
+/// to (one entry per producer authority and NF type), like
+/// `global_context().get_client`'s.
+static TOKENED_PEER_CLIENTS: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<TokenedPeerKey, Arc<nextgcore_sbi::client::SbiClient>>,
+    >,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// #1648 review M1: the client for a service request to the `target` producer at
+/// `config`, carrying the NRF-issued token, or `None` when OAuth2 enforcement is
+/// off (the caller then keeps the client it used before #1648).
+///
+/// One client per peer, reused: its HTTP/2 connection (and, under `production`,
+/// its mTLS session) carries every request to that producer, as the shared
+/// `global_context().get_client` cache does for token-less clients. The token is
+/// still fetched and refreshed per request by the shared OAuth2 client's cache
+/// (`prepare_request`), so caching the SBI client does not pin a token.
+pub(crate) fn tokened_peer_client(
+    config: nextgcore_sbi::client::SbiClientConfig,
+    target: nextgcore_sbi::types::NfType,
+) -> Option<Arc<nextgcore_sbi::client::SbiClient>> {
+    let oauth2 = oauth2_client()?;
+    let key = (
+        target,
+        config.scheme,
+        config.host.clone(),
+        config.port,
+        config.connect_timeout,
+        config.request_timeout,
+        Arc::as_ptr(&oauth2) as usize,
+    );
+    let mut clients = TOKENED_PEER_CLIENTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    Some(Arc::clone(clients.entry(key).or_insert_with(|| {
+        Arc::new(nextgcore_sbi::client::SbiClient::new(config).with_oauth2(oauth2, target))
+    })))
 }
 
 /// Attach the process-wide OAuth2 client (when enforcement is on) so the
@@ -2417,7 +2472,7 @@ async fn fetch_subscribed_default_dnn(
     let (host, port) = discover_udm_sdm_endpoint()
         .await
         .ok_or(DefaultDnnError::NoUdmEndpoint)?;
-    let client = udm::udm_client(&host, port);
+    let client = udm::udm_client(&host, port).await;
 
     let path = smf_select_data_path(supi, sst, sd);
     let response = client.get(&path).await.map_err(|e| {
@@ -16345,6 +16400,165 @@ mod tests {
             "smf-1648",
             nextgcore_sbi::types::NfType::Smf,
         ))
+    }
+
+    /// #1648 review M1: a loopback TCP proxy to `upstream` that counts the
+    /// connections it accepts, so a test can tell one reused connection from one
+    /// per request.
+    async fn counting_proxy_1648(upstream: u16) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("proxy binds");
+        let port = listener.local_addr().expect("addr").port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    if let Ok(mut outbound) =
+                        tokio::net::TcpStream::connect(("127.0.0.1", upstream)).await
+                    {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+            }
+        });
+        (port, accepted)
+    }
+
+    /// A stand-in UDM's answers for the Nudm calls the reuse tests make.
+    fn udm_answer_1648(req: &SbiRequest) -> SbiResponse {
+        let path = req.header.uri.split('?').next().unwrap_or_default();
+        if path.ends_with("/sm-data") {
+            SbiResponse::with_status(200)
+                .with_json_body(&serde_json::json!([]))
+                .unwrap()
+        } else {
+            SbiResponse::with_status(201)
+        }
+    }
+
+    /// How many calls the reuse tests make to one peer: twice the client's pool,
+    /// so a client per call opens this many connections while a reused client
+    /// opens at most [`pool_slots_1648`].
+    const REUSE_CALLS_1648: usize = 8;
+
+    /// The connection slots of one SBI client (its HTTP/2 pool, round-robin).
+    fn pool_slots_1648() -> usize {
+        nextgcore_sbi::security::sbi_peer_client_config("127.0.0.1", 1).pool_size
+    }
+
+    /// [`REUSE_CALLS_1648`] Nudm calls: sm-data reads, then a UECM registration.
+    async fn nudm_calls_1648(supi: &str) {
+        for _ in 1..REUSE_CALLS_1648 {
+            let _ = udm::fetch_sm_data(supi, "internet", 1, Some("010203")).await;
+        }
+        udm::register_as_serving_smf(
+            supi,
+            1,
+            "internet",
+            1,
+            Some("010203"),
+            Some(("001", "01")),
+            udm::EpsInterworkingInd::None,
+        )
+        .await;
+    }
+
+    /// #1648 review M1: with OAuth2 off, successive Nudm calls to one UDM share one
+    /// connection, as they did through the shared `get_client` cache before #1648.
+    #[tokio::test]
+    async fn nudm_calls_reuse_pooled_connections_without_oauth2_1648() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let sk = p256::ecdsa::SigningKey::from_slice(&[19u8; 32]).expect("key");
+        let (_udm, udm_port, seen) = oauth2_producer_1648(
+            &sk,
+            nextgcore_sbi::types::NfType::Udm,
+            false,
+            udm_answer_1648,
+        )
+        .await;
+        let (port, accepted) = counting_proxy_1648(udm_port).await;
+        std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("UDM_SBI_PORT", port.to_string());
+        udm::set_for_test(true);
+        nudm_calls_1648("imsi-001010016480004").await;
+        udm::set_for_test(false);
+        std::env::remove_var("UDM_SBI_ADDR");
+        std::env::remove_var("UDM_SBI_PORT");
+        assert_eq!(
+            seen.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            REUSE_CALLS_1648
+        );
+        let connections = accepted.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            connections <= pool_slots_1648(),
+            "{REUSE_CALLS_1648} Nudm calls opened {connections} connections, past the \
+             {} of one reused client",
+            pool_slots_1648()
+        );
+    }
+
+    /// #1648 review M1: with OAuth2 on, the tokened Nudm and Namf clients are
+    /// cached per peer, so successive calls share one connection (and, under
+    /// `production`, one mTLS session) while each still carries the token.
+    #[tokio::test]
+    async fn tokened_calls_reuse_pooled_connections_per_peer_1648() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let sk = p256::ecdsa::SigningKey::from_slice(&[20u8; 32]).expect("key");
+        let (_nrf, nrf_port) = token_nrf_1648(sk.clone()).await;
+        let (_udm, udm_port, udm_seen) = oauth2_producer_1648(
+            &sk,
+            nextgcore_sbi::types::NfType::Udm,
+            true,
+            udm_answer_1648,
+        )
+        .await;
+        let (_amf, amf_port, amf_seen) =
+            oauth2_producer_1648(&sk, nextgcore_sbi::types::NfType::Amf, true, |_| {
+                SbiResponse::with_status(200)
+            })
+            .await;
+        let (udm_proxy, udm_accepted) = counting_proxy_1648(udm_port).await;
+        let (amf_proxy, amf_accepted) = counting_proxy_1648(amf_port).await;
+        std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("UDM_SBI_PORT", udm_proxy.to_string());
+        udm::set_for_test(true);
+        let supi = "imsi-001010016480005";
+        let amf_uri = format!("http://127.0.0.1:{amf_proxy}");
+        TEST_OAUTH2_CLIENT
+            .scope(smf_oauth2_client_1648(nrf_port), async {
+                nudm_calls_1648(supi).await;
+                for _ in 0..REUSE_CALLS_1648 {
+                    send_n2_release_transfer(&amf_uri, supi, 1, &[0x00]).await;
+                }
+            })
+            .await;
+        udm::set_for_test(false);
+        std::env::remove_var("UDM_SBI_ADDR");
+        std::env::remove_var("UDM_SBI_PORT");
+        assert_eq!(
+            bearer_requests_1648(&udm_seen, "GET", "/sm-data"),
+            REUSE_CALLS_1648 - 1
+        );
+        assert_eq!(
+            bearer_requests_1648(&udm_seen, "PUT", "/smf-registrations/1"),
+            1
+        );
+        assert_eq!(
+            bearer_requests_1648(&amf_seen, "POST", "/n1-n2-messages"),
+            REUSE_CALLS_1648
+        );
+        for (peer, accepted) in [("Nudm", udm_accepted), ("Namf", amf_accepted)] {
+            let connections = accepted.load(std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                connections <= pool_slots_1648(),
+                "{REUSE_CALLS_1648} tokened {peer} calls opened {connections} connections, \
+                 past the {} of one reused client",
+                pool_slots_1648()
+            );
+        }
     }
 
     /// #1648, found by the D443A `oauth2` arm: every Namf_Communication service

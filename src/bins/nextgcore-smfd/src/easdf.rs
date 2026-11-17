@@ -233,11 +233,15 @@ pub async fn create_dns_context(
 /// certificate under `production`; before #1648 this was a cleartext
 /// `with_host_port` client in every profile), and carries an NRF-issued token when
 /// OAuth2 enforcement is on (TS 33.501 §13.4.1.1.2, TS 29.500 §6.7.3).
-fn easdf_client(host: &str, port: u16) -> SbiClient {
-    crate::attach_oauth2(
-        SbiClient::for_peer(host, port),
+///
+/// With enforcement on it is the per-peer cached tokened client (review M1);
+/// off, a fresh client per call, as before.
+fn easdf_client(host: &str, port: u16) -> std::sync::Arc<SbiClient> {
+    crate::tokened_peer_client(
+        nextgcore_sbi::security::sbi_peer_client_config(host, port),
         nextgcore_sbi::types::NfType::Easdf,
     )
+    .unwrap_or_else(|| std::sync::Arc::new(SbiClient::for_peer(host, port)))
 }
 
 /// Delete a session's DNS context at release (#114).
