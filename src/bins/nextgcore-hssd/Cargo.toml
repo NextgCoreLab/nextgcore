@@ -29,6 +29,8 @@ serde = { workspace = true, features = ["derive"] }
 serde_yaml.workspace = true
 
 [dev-dependencies]
+# #1536 review: the capturing logger, for the freeDiameter warning test.
+nextgcore-core = { workspace = true, features = ["test-log"] }
 proptest.workspace = true
 
 [lints]
