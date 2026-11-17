@@ -7398,7 +7398,7 @@ mod tests {
             (
                 before.precedence,
                 before.far_id,
-                before.qer_ids.clone(),
+                before.qer_ids.to_vec(),
                 before.urr_ids.clone()
             ),
             (100, Some(1), vec![1], vec![1])
@@ -7424,7 +7424,7 @@ mod tests {
             (
                 p.precedence,
                 p.far_id,
-                p.qer_ids.clone(),
+                p.qer_ids.to_vec(),
                 p.urr_ids.clone(),
                 p.source_interface
             ),
@@ -7459,7 +7459,7 @@ mod tests {
             (
                 p.precedence,
                 p.far_id,
-                p.qer_ids.clone(),
+                p.qer_ids.to_vec(),
                 p.urr_ids.clone(),
                 p.outer_header_removal
             ),
@@ -7482,7 +7482,7 @@ mod tests {
         apply_next(&mut rx, &dp).await;
         let p = pdr1();
         assert_eq!(
-            (p.far_id, p.qer_ids.clone(), p.urr_ids.clone()),
+            (p.far_id, p.qer_ids.to_vec(), p.urr_ids.clone()),
             (Some(1), vec![1], vec![1])
         );
 
@@ -7629,7 +7629,7 @@ mod tests {
         establish_with_qers_1672(&smf, addr, &mut rx, &dp, &[1, 2], &[flow, ambr_closed]).await;
         let session = dp.sessions.find_by_ul_teid(0x1234).expect("held");
         assert_eq!(
-            session.pdrs.read().unwrap()[0].qer_ids,
+            session.pdrs.read().unwrap()[0].qer_ids.to_vec(),
             vec![1, 2],
             "the PDR keeps every QER ID, in order"
         );
@@ -7678,7 +7678,7 @@ mod tests {
                 .find(|p| p.pdr_id == 1)
                 .expect("PDR 1")
                 .qer_ids
-                .clone()
+                .to_vec()
         };
         assert_eq!(qers(&dp), vec![1]);
         let mut seq = 30u32;

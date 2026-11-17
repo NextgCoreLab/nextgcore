@@ -772,7 +772,8 @@ pub struct DataPlanePdr {
     pub far_id: Option<u32>,
     /// Every QER associated to the PDR (TS 29.244 Table 7.5.2.2-1); all are
     /// enforced (#1672).
-    pub qer_ids: Vec<u32>,
+    /// Shared, so matching a packet clones a pointer, not a list.
+    pub qer_ids: Arc<[u32]>,
     pub urr_ids: Vec<u32>,
     pub outer_header_removal: Option<u8>,
     /// Compiled SDF filter rule for 5-tuple matching (None = match all)
@@ -1007,6 +1008,67 @@ impl Clone for EnergySavingState {
     }
 }
 
+/// How one QER's buckets take a packet (#1685 review): the same decision as
+/// [`DataPlaneQer::check_rate`], made before anything is debited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RatePlan {
+    /// Within the GBR: debit the GBR bucket, and the MBR bucket when it has room.
+    Gbr,
+    /// Above the GBR (or none), within the MBR: debit the MBR bucket.
+    Mbr,
+    /// No MBR provisioned: unlimited.
+    Unlimited,
+    /// Above the MBR: dropped.
+    Drop,
+}
+
+/// Refill `gbr` and `mbr` and decide how they take `bytes` (#1685 review).
+fn rate_plan(gbr: Option<&mut TokenBucket>, mbr: Option<&mut TokenBucket>, bytes: u64) -> RatePlan {
+    let b = bytes as f64;
+    if let Some(g) = gbr {
+        g.refill();
+        if g.tokens >= b {
+            if let Some(m) = mbr {
+                m.refill();
+            }
+            return RatePlan::Gbr;
+        }
+    }
+    match mbr {
+        Some(m) => {
+            m.refill();
+            if m.tokens >= b {
+                RatePlan::Mbr
+            } else {
+                RatePlan::Drop
+            }
+        }
+        None => RatePlan::Unlimited,
+    }
+}
+
+/// Debit `bytes` as `plan` decided (#1685 review).
+fn debit(plan: RatePlan, gbr: Option<&mut TokenBucket>, mbr: Option<&mut TokenBucket>, bytes: u64) {
+    let b = bytes as f64;
+    match plan {
+        RatePlan::Gbr => {
+            if let Some(g) = gbr {
+                g.tokens -= b;
+            }
+            // GBR traffic counts toward the MBR too (MBR >= GBR), as in check_rate.
+            if let Some(m) = mbr.filter(|m| m.tokens >= b) {
+                m.tokens -= b;
+            }
+        }
+        RatePlan::Mbr => {
+            if let Some(m) = mbr {
+                m.tokens -= b;
+            }
+        }
+        RatePlan::Unlimited | RatePlan::Drop => {}
+    }
+}
+
 /// Lightweight QER for QoS enforcement in the data plane
 #[derive(Debug)]
 pub struct DataPlaneQer {
@@ -1154,6 +1216,21 @@ impl DataPlaneQer {
         // recomputed when either changes.
         if let Some(qfi) = u.qfi.or(self.qfi) {
             self.set_qfi(qfi);
+        }
+    }
+
+    /// This QER's (GBR, MBR) buckets for one direction (#1685 review).
+    fn rate_buckets(
+        &self,
+        is_uplink: bool,
+    ) -> (
+        &std::sync::Mutex<Option<TokenBucket>>,
+        &std::sync::Mutex<Option<TokenBucket>>,
+    ) {
+        if is_uplink {
+            (&self.ul_gbr_bucket, &self.ul_mbr_bucket)
+        } else {
+            (&self.dl_gbr_bucket, &self.dl_mbr_bucket)
         }
     }
 
@@ -2856,7 +2933,7 @@ impl DataPlaneSession {
     pub fn match_pdr(
         &self,
         source_interface: u8,
-    ) -> Option<(Option<u32>, Vec<u32>, Vec<u32>, Option<u8>)> {
+    ) -> Option<(Option<u32>, Arc<[u32]>, Vec<u32>, Option<u8>)> {
         self.match_pdr_with_packet(source_interface, None, None)
     }
 
@@ -2870,7 +2947,7 @@ impl DataPlaneSession {
         source_interface: u8,
         packet: Option<&PacketTuple>,
         pkt_qfi: Option<u8>,
-    ) -> Option<(Option<u32>, Vec<u32>, Vec<u32>, Option<u8>)> {
+    ) -> Option<(Option<u32>, Arc<[u32]>, Vec<u32>, Option<u8>)> {
         self.match_pdr_where(source_interface, packet, pkt_qfi, |_| true)
     }
 
@@ -2885,7 +2962,7 @@ impl DataPlaneSession {
         teid: u32,
         packet: Option<&PacketTuple>,
         pkt_qfi: Option<u8>,
-    ) -> Option<(Option<u32>, Vec<u32>, Vec<u32>, Option<u8>)> {
+    ) -> Option<(Option<u32>, Arc<[u32]>, Vec<u32>, Option<u8>)> {
         let tunnels = self.pdr_teids.read().unwrap().clone();
         self.match_pdr_where(SRC_INTF_ACCESS, packet, pkt_qfi, |p| {
             tunnels.get(&p.pdr_id) == Some(&teid)
@@ -2903,7 +2980,7 @@ impl DataPlaneSession {
         packet: Option<&PacketTuple>,
         pkt_qfi: Option<u8>,
         eligible: impl Fn(&DataPlanePdr) -> bool,
-    ) -> Option<(Option<u32>, Vec<u32>, Vec<u32>, Option<u8>)> {
+    ) -> Option<(Option<u32>, Arc<[u32]>, Vec<u32>, Option<u8>)> {
         let pdrs = self.pdrs.read().unwrap();
         // PDRs are sorted by precedence (lower = higher priority)
         for pdr in pdrs.iter() {
@@ -2971,33 +3048,87 @@ impl DataPlaneSession {
     }
 
     /// Enforce every QER of a PDR (#1672, TS 29.244 §5.4.1 and Table 7.5.2.2-1,
-    /// e.g. the session-AMBR QER and a QoS flow's QER). Returns the first QER that
-    /// stops the packet, or `None` when all let it through.
+    /// e.g. the session-AMBR QER and a QoS flow's QER). Returns the first QER, in
+    /// list order, that stops the packet, or `None` when all let it through.
     ///
-    /// Every gate is checked before any rate, so a packet a closed gate drops
-    /// takes no tokens from another QER's bucket. A packet one QER's MBR drops may
-    /// already have been charged to an earlier QER's bucket; it was offered to it,
-    /// and refunding would need a two-phase bucket.
+    /// Every gate is checked first. Then the rates go in two phases under one
+    /// read guard on the QER map: each QER's buckets are locked (in ascending QER
+    /// ID order, so two PDRs listing the same QERs in different orders cannot
+    /// deadlock), refilled and asked for room, and the packet's bytes are debited
+    /// from all of them only when every QER has room. A packet one QER drops is
+    /// thus charged to none: a flow over its MBR does not drain the session
+    /// AMBR its sibling flows share (TS 23.501 §5.7.2.6, #1685 review).
     pub fn check_qer_gates(&self, qer_ids: &[u32], is_uplink: bool, pkt_bytes: u64) -> Option<u32> {
-        {
-            let qers = self.qers.read().unwrap();
-            for id in qer_ids {
-                if let Some(qer) = qers.get(id) {
-                    let open = if is_uplink {
-                        qer.ul_gate_open
-                    } else {
-                        qer.dl_gate_open
-                    };
-                    if !open {
-                        return Some(*id);
-                    }
+        let qers = self.qers.read().unwrap();
+        for id in qer_ids {
+            if let Some(qer) = qers.get(id) {
+                let open = if is_uplink {
+                    qer.ul_gate_open
+                } else {
+                    qer.dl_gate_open
+                };
+                if !open {
+                    return Some(*id);
                 }
             }
         }
-        qer_ids
+        match qer_ids {
+            [] => None,
+            // One QER: nothing to keep consistent with another bucket.
+            [id] => qers
+                .get(id)
+                .filter(|q| !q.check_rate(pkt_bytes, is_uplink))
+                .map(|_| *id),
+            _ => {
+                let mut order: Vec<u32> = qer_ids.to_vec();
+                order.sort_unstable();
+                order.dedup();
+                let mut held = Vec::with_capacity(order.len());
+                for id in &order {
+                    if let Some(qer) = qers.get(id) {
+                        let (gbr, mbr) = qer.rate_buckets(is_uplink);
+                        held.push((*id, gbr.lock().unwrap(), mbr.lock().unwrap()));
+                    }
+                }
+                let mut plans = Vec::with_capacity(held.len());
+                for (id, gbr, mbr) in held.iter_mut() {
+                    plans.push((*id, rate_plan(gbr.as_mut(), mbr.as_mut(), pkt_bytes)));
+                }
+                if let Some(id) = qer_ids.iter().find(|id| {
+                    plans
+                        .iter()
+                        .any(|(p, plan)| p == *id && *plan == RatePlan::Drop)
+                }) {
+                    return Some(*id);
+                }
+                for ((_, gbr, mbr), (_, plan)) in held.iter_mut().zip(&plans) {
+                    debit(*plan, gbr.as_mut(), mbr.as_mut(), pkt_bytes);
+                }
+                None
+            }
+        }
+    }
+
+    /// The PDRs whose QERs carry more than one QFI (#1685 review), as `(PDR ID,
+    /// the QFIs)`. A packet is marked with the first QER's QFI, so the others are
+    /// not applied: a CP-function misconfiguration worth a WARN.
+    pub fn pdrs_with_several_qfis(&self) -> Vec<(u16, Vec<u8>)> {
+        let qers = self.qers.read().unwrap();
+        self.pdrs
+            .read()
+            .unwrap()
             .iter()
-            .copied()
-            .find(|id| !self.check_qer_gate(*id, is_uplink, pkt_bytes))
+            .filter_map(|p| {
+                let mut qfis: Vec<u8> = p
+                    .qer_ids
+                    .iter()
+                    .filter_map(|id| qers.get(id)?.qfi)
+                    .collect();
+                qfis.sort_unstable();
+                qfis.dedup();
+                (qfis.len() > 1).then_some((p.pdr_id, qfis))
+            })
+            .collect()
     }
 
     /// The marking a PDR's QERs give a packet (#1672): the DSCP of the first QER
@@ -4860,7 +4991,7 @@ impl DataPlane {
                 precedence: 100,
                 source_interface: SRC_INTF_ACCESS,
                 far_id: Some(1),
-                qer_ids: Vec::new(),
+                qer_ids: Default::default(),
                 urr_ids: Vec::new(),
                 outer_header_removal: Some(0), // GTP-U/UDP/IPv4
                 sdf_rule: None,                // match all
@@ -4871,7 +5002,7 @@ impl DataPlane {
                 precedence: 100,
                 source_interface: SRC_INTF_CORE,
                 far_id: Some(2),
-                qer_ids: Vec::new(),
+                qer_ids: Default::default(),
                 urr_ids: Vec::new(),
                 outer_header_removal: None,
                 sdf_rule: None, // match all
@@ -5799,17 +5930,20 @@ impl TokenBucket {
         Self::new(burst, bytes_per_sec)
     }
 
+    /// Add the tokens earned since the last refill, up to the burst size.
+    pub fn refill(&mut self) {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.last_refill = now;
+        self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.max_tokens);
+    }
+
     /// Try to consume `bytes` tokens from the bucket.
     ///
     /// Returns `true` if the packet should be forwarded, `false` if it must be
     /// dropped because the bucket is empty.
     pub fn try_consume(&mut self, bytes: usize) -> bool {
-        // Refill based on elapsed time
-        let now = std::time::Instant::now();
-        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
-        self.last_refill = now;
-        self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.max_tokens);
-
+        self.refill();
         if self.tokens >= bytes as f64 {
             self.tokens -= bytes as f64;
             true
@@ -6219,6 +6353,139 @@ mod tests {
         assert_eq!(session.check_qer_gates(&[], true, 500), None);
     }
 
+    /// A session with `qers`, for the #1685 review tests.
+    fn session_with_qers_1685(qers: Vec<DataPlaneQer>) -> DataPlaneSession {
+        let session = DataPlaneSession::new_empty(
+            1,
+            2,
+            None,
+            1,
+            2,
+            "127.0.0.1:2152".parse().unwrap(),
+            None,
+            None,
+        );
+        {
+            let mut map = session.qers.write().unwrap();
+            for q in qers {
+                map.insert(q.qer_id, q);
+            }
+        }
+        session
+    }
+
+    /// A QER whose UL MBR bucket holds `burst` bytes and refills at 1 B/s, so a
+    /// test's packets see no refill worth counting.
+    fn qer_with_ul_bucket_1685(id: u32, burst: f64) -> DataPlaneQer {
+        let qer = DataPlaneQer::new(id);
+        *qer.ul_mbr_bucket.lock().unwrap() = Some(TokenBucket::new(burst, 1.0));
+        qer
+    }
+
+    /// **#1685 review MAJOR 1 (R2's reproduction).** PDR A lists the session
+    /// AMBR QER 1 (a 4000 B bucket) and a flow QER 2 (1500 B); PDR B lists only
+    /// the AMBR. 20 x 500 B on A: the flow's MBR passes 3 and drops 17, and only
+    /// the 3 that passed are charged to the AMBR (TS 23.501 §5.7.2.6: a packet
+    /// the flow MBR dropped is not Session-AMBR traffic). So B, a sibling flow
+    /// of the session, still has 2500 B of AMBR: 5 packets pass. Charging each
+    /// QER in list order drained the AMBR with the dropped packets and B was
+    /// refused at once.
+    #[test]
+    fn a_flow_over_its_mbr_does_not_drain_the_session_ambr_1685() {
+        let session = session_with_qers_1685(vec![
+            qer_with_ul_bucket_1685(1, 4000.0),
+            qer_with_ul_bucket_1685(2, 1500.0),
+        ]);
+        let verdicts: Vec<Option<u32>> = (0..20)
+            .map(|_| session.check_qer_gates(&[1, 2], true, 500))
+            .collect();
+        assert_eq!(verdicts.iter().filter(|v| v.is_none()).count(), 3);
+        assert!(verdicts[3..].iter().all(|v| *v == Some(2)), "{verdicts:?}");
+        let sibling: Vec<Option<u32>> = (0..6)
+            .map(|_| session.check_qer_gates(&[1], true, 500))
+            .collect();
+        assert_eq!(
+            sibling,
+            [None, None, None, None, None, Some(1)],
+            "the sibling PDR gets the AMBR the dropped packets did not use"
+        );
+    }
+
+    /// **#1685 review.** In the two-phase check a packet within a QER's GBR
+    /// is charged to its MBR too (MBR >= GBR), as the single-QER path does: QER
+    /// 1 has a 1000 B GBR and a 1500 B MBR bucket, QER 2 is unlimited. Two 500 B
+    /// packets use the GBR and 1000 B of the MBR, so one more 500 B packet fits
+    /// the MBR and the next is dropped by QER 1.
+    #[test]
+    fn gbr_traffic_counts_toward_the_mbr_with_several_qers_1685() {
+        let gbr = qer_with_ul_bucket_1685(1, 1500.0);
+        *gbr.ul_gbr_bucket.lock().unwrap() = Some(TokenBucket::new(1000.0, 1.0));
+        let session = session_with_qers_1685(vec![gbr, DataPlaneQer::new(2)]);
+        let verdicts: Vec<Option<u32>> = (0..4)
+            .map(|_| session.check_qer_gates(&[1, 2], true, 500))
+            .collect();
+        assert_eq!(verdicts, [None, None, None, Some(1)]);
+    }
+
+    /// **#1685 review.** PDRs that list the same QERs in different orders,
+    /// policed from two threads at once, do not deadlock: the buckets are
+    /// locked in ascending QER ID order, whatever the list order.
+    #[test]
+    fn qer_lists_in_opposite_orders_do_not_deadlock_1685() {
+        let session = Arc::new(session_with_qers_1685(vec![
+            qer_with_ul_bucket_1685(1, 1e12),
+            qer_with_ul_bucket_1685(2, 1e12),
+        ]));
+        let (tx, rx) = std::sync::mpsc::channel();
+        for list in [[1u32, 2], [2, 1]] {
+            let (session, tx) = (session.clone(), tx.clone());
+            std::thread::spawn(move || {
+                for _ in 0..20_000 {
+                    assert_eq!(session.check_qer_gates(&list, true, 1), None);
+                }
+                tx.send(()).unwrap();
+            });
+        }
+        for _ in 0..2 {
+            rx.recv_timeout(std::time::Duration::from_secs(20))
+                .expect("both threads finish: no lock-order deadlock");
+        }
+    }
+
+    /// **#1685 review MINOR 2.** A PDR whose QERs carry more than one QFI is
+    /// reported (the WARN's source); one QFI, or none, is not.
+    #[test]
+    fn a_pdr_whose_qers_carry_several_qfis_is_reported_1685() {
+        let mut q1 = DataPlaneQer::new(1);
+        q1.set_qfi(9);
+        let mut q2 = DataPlaneQer::new(2);
+        q2.set_qfi(5);
+        let mut q3 = DataPlaneQer::new(3);
+        q3.set_qfi(9);
+        let session = session_with_qers_1685(vec![q1, q2, q3, DataPlaneQer::new(4)]);
+        let pdr = |id: u16, qers: &[u32]| DataPlanePdr {
+            pdr_id: id,
+            precedence: u32::from(id),
+            source_interface: SRC_INTF_ACCESS,
+            far_id: Some(1),
+            qer_ids: qers.into(),
+            urr_ids: Vec::new(),
+            outer_header_removal: None,
+            sdf_rule: None,
+            qfi: None,
+        };
+        *session.pdrs.write().unwrap() = vec![
+            pdr(1, &[1, 2]),
+            pdr(2, &[1, 3, 4]),
+            pdr(3, &[4]),
+            pdr(4, &[2, 1, 3]),
+        ];
+        assert_eq!(
+            session.pdrs_with_several_qfis(),
+            vec![(1, vec![5, 9]), (4, vec![5, 9])]
+        );
+    }
+
     /// **#1672.** A PDR's marking comes from its QERs: the DSCP of the first QER
     /// that sets one, and the QFI, RQI and PPI of the first that carries a QFI
     /// (the flow's QER), even when a session-AMBR QER with none is listed first.
@@ -6281,7 +6548,7 @@ mod tests {
             precedence: 100,
             source_interface: SRC_INTF_ACCESS,
             far_id: Some(1),
-            qer_ids: Vec::new(),
+            qer_ids: Default::default(),
             urr_ids: vec![],
             outer_header_removal: None,
             sdf_rule: None,
@@ -6308,7 +6575,7 @@ mod tests {
             precedence: 50,
             source_interface: SRC_INTF_ACCESS,
             far_id: Some(10),
-            qer_ids: Vec::new(),
+            qer_ids: Default::default(),
             urr_ids: vec![],
             outer_header_removal: None,
             sdf_rule: Some(rule),
@@ -6336,7 +6603,7 @@ mod tests {
                 precedence: 50,
                 source_interface: SRC_INTF_ACCESS,
                 far_id: Some(10),
-                qer_ids: Vec::new(),
+                qer_ids: Default::default(),
                 urr_ids: vec![],
                 outer_header_removal: None,
                 sdf_rule: Some(rule),
@@ -6347,7 +6614,7 @@ mod tests {
                 precedence: 100,
                 source_interface: SRC_INTF_ACCESS,
                 far_id: Some(20),
-                qer_ids: Vec::new(),
+                qer_ids: Default::default(),
                 urr_ids: vec![],
                 outer_header_removal: None,
                 sdf_rule: None, // wildcard
@@ -6375,7 +6642,7 @@ mod tests {
                 precedence: 100,
                 source_interface: SRC_INTF_ACCESS,
                 far_id: Some(20),
-                qer_ids: Vec::new(),
+                qer_ids: Default::default(),
                 urr_ids: vec![],
                 outer_header_removal: None,
                 sdf_rule: None,
@@ -6386,7 +6653,7 @@ mod tests {
                 precedence: 50,
                 source_interface: SRC_INTF_ACCESS,
                 far_id: Some(10),
-                qer_ids: Vec::new(),
+                qer_ids: Default::default(),
                 urr_ids: vec![],
                 outer_header_removal: None,
                 sdf_rule: None,
@@ -6407,7 +6674,7 @@ mod tests {
             precedence: 100,
             source_interface: SRC_INTF_ACCESS,
             far_id: Some(1),
-            qer_ids: Vec::new(),
+            qer_ids: Default::default(),
             urr_ids: vec![],
             outer_header_removal: None,
             sdf_rule: None,
@@ -6509,7 +6776,7 @@ mod tests {
             precedence: 100,
             source_interface: SRC_INTF_CORE,
             far_id: Some(2),
-            qer_ids: Vec::new(),
+            qer_ids: Default::default(),
             urr_ids: vec![],
             outer_header_removal: None,
             sdf_rule: None,
@@ -6567,7 +6834,7 @@ mod tests {
             precedence: 100,
             source_interface: SRC_INTF_CORE,
             far_id: Some(2),
-            qer_ids: Vec::new(),
+            qer_ids: Default::default(),
             urr_ids: vec![],
             outer_header_removal: None,
             sdf_rule: None,
@@ -6754,7 +7021,7 @@ mod tests {
                 precedence: 50,
                 source_interface: SRC_INTF_ACCESS,
                 far_id: Some(10),
-                qer_ids: Vec::new(),
+                qer_ids: Default::default(),
                 urr_ids: vec![],
                 outer_header_removal: None,
                 sdf_rule: None,
@@ -6765,7 +7032,7 @@ mod tests {
                 precedence: 100,
                 source_interface: SRC_INTF_ACCESS,
                 far_id: Some(20),
-                qer_ids: Vec::new(),
+                qer_ids: Default::default(),
                 urr_ids: vec![],
                 outer_header_removal: None,
                 sdf_rule: None,
@@ -6789,7 +7056,7 @@ mod tests {
             precedence: 50,
             source_interface: SRC_INTF_ACCESS,
             far_id: Some(10),
-            qer_ids: Vec::new(),
+            qer_ids: Default::default(),
             urr_ids: vec![],
             outer_header_removal: None,
             sdf_rule: Some(rule),
@@ -7107,7 +7374,7 @@ mod tests {
                 precedence: 10,
                 source_interface: SRC_INTF_ACCESS,
                 far_id: Some(0x50),
-                qer_ids: vec![0x55],
+                qer_ids: vec![0x55].into(),
                 urr_ids: Vec::new(),
                 outer_header_removal: Some(0),
                 sdf_rule: None,
@@ -8564,7 +8831,7 @@ mod tests {
         }
         for p in session.pdrs.write().unwrap().iter_mut() {
             if p.source_interface == SRC_INTF_CORE {
-                p.qer_ids = vec![5];
+                p.qer_ids = vec![5].into();
             }
         }
         let mut pkt = make_ipv4_udp_packet([8, 8, 8, 8], ue_ip.octets(), 53, 1234);
@@ -9118,7 +9385,7 @@ mod tests {
             let mut pdrs = session.pdrs.write().unwrap();
             for p in pdrs.iter_mut() {
                 if p.source_interface == SRC_INTF_CORE {
-                    p.qer_ids = vec![5];
+                    p.qer_ids = vec![5].into();
                 }
             }
         }
@@ -9869,7 +10136,7 @@ mod tests {
             let mut pdrs = session.pdrs.write().unwrap();
             for p in pdrs.iter_mut() {
                 if p.source_interface == SRC_INTF_CORE {
-                    p.qer_ids = vec![11];
+                    p.qer_ids = vec![11].into();
                 }
             }
         }
@@ -9936,7 +10203,7 @@ mod tests {
             let mut pdrs = session.pdrs.write().unwrap();
             for p in pdrs.iter_mut() {
                 if p.source_interface == SRC_INTF_CORE {
-                    p.qer_ids = vec![12];
+                    p.qer_ids = vec![12].into();
                 }
             }
         }
@@ -10188,7 +10455,7 @@ mod tests {
         qer.dl_gate_open = false;
         session.qers.write().unwrap().insert(7, qer);
         for pdr in session.pdrs.write().unwrap().iter_mut() {
-            pdr.qer_ids = vec![7];
+            pdr.qer_ids = vec![7].into();
         }
         rig.ul(&rig.ul_gpdu(rig.ue_ip)).await;
         rig.dl(&rig.dl_to(rig.ue_ip)).await;
