@@ -3626,6 +3626,20 @@ impl NgapServer {
                 )
                 .await?;
             }
+            message_type::DEREGISTRATION_REQUEST_FROM_UE => {
+                // #1703 review (a): an unprotected DEREGISTRATION REQUEST from 5GMM-IDLE.
+                // A UE with a NAS security context sends it integrity protected (§4.4.6);
+                // one without has no registration here to end (the emergency case of
+                // §4.4.4.3 NOTE 2 included: no 5G NAS security context is identified by
+                // it). Ignored as the failed-integrity case is.
+                self.ignore_idle_deregistration(
+                    association_id,
+                    amf_ue_ngap_id,
+                    initial_ue.ran_ue_ngap_id,
+                    "not integrity protected",
+                )
+                .await?;
+            }
             other => {
                 log::warn!("Unhandled NAS message type 0x{other:02x} in Initial UE Message");
             }
@@ -7537,6 +7551,28 @@ impl NgapServer {
     /// No context, or a failed integrity check: §4.4.4.3 lets the AMF ignore the
     /// request and keep the UE 5GMM-REGISTERED, which it does. No authentication is
     /// started from a bare initial DEREGISTRATION REQUEST.
+    /// #1691: an initial DEREGISTRATION REQUEST the AMF does not act on (no context
+    /// for its GUTI, a failed integrity check, or no integrity protection at all): the
+    /// UE stays 5GMM-REGISTERED (TS 24.501 §4.4.4.3), and the new N2 connection,
+    /// which serves no UE here, is released (#1703 review b).
+    async fn ignore_idle_deregistration(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        why: &str,
+    ) -> Result<()> {
+        log::warn!(
+            "Deregistration Request in Initial UE Message (UE {amf_ue_ngap_id}): {why}; \
+             ignored, the UE stays 5GMM-REGISTERED (TS 24.501 §4.4.4.3)"
+        );
+        // #758: allocated to this connection with no NAS context.
+        self.remember_contextless_ue_id(association_id, amf_ue_ngap_id, ran_ue_ngap_id);
+        // NAS cause normal-release (TS 38.413 §9.3.1.2).
+        self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 0)
+            .await
+    }
+
     async fn handle_idle_deregistration_request(
         &mut self,
         association_id: u64,
@@ -7545,17 +7581,6 @@ impl NgapServer {
         nas: &[u8],
         plain: &[u8],
     ) -> Result<()> {
-        let ignore = |server: &mut Self, why: &str| {
-            log::warn!(
-                "Deregistration Request in Initial UE Message (UE {amf_ue_ngap_id}): {why}; \
-                 ignored, the UE stays 5GMM-REGISTERED (TS 24.501 §4.4.4.3)"
-            );
-            server.remember_contextless_ue_id(
-                association_id,
-                amf_ue_ngap_id,
-                initial_ue.ran_ue_ngap_id,
-            );
-        };
         let resolved = deregistration_request_guti(plain).and_then(|guti| {
             self.ue_auth_state.snapshot().into_iter().find(|(_, st)| {
                 st.registered
@@ -7564,17 +7589,26 @@ impl NgapServer {
             })
         });
         let Some((old_id, mut state)) = resolved else {
-            ignore(self, "no security context holds its 5G-GUTI");
-            return Ok(());
+            return self
+                .ignore_idle_deregistration(
+                    association_id,
+                    amf_ue_ngap_id,
+                    initial_ue.ran_ue_ngap_id,
+                    "no security context holds its 5G-GUTI",
+                )
+                .await;
         };
         let decoded = nas_security::nas_5gs_security_decode(&mut state.amf_ue, nas[1], nas);
         let mac_failed = std::mem::take(&mut state.amf_ue.mac_failed);
         if decoded.is_err() || mac_failed {
-            ignore(
-                self,
-                &format!("integrity check failed under UE {old_id}'s context"),
-            );
-            return Ok(());
+            return self
+                .ignore_idle_deregistration(
+                    association_id,
+                    amf_ue_ngap_id,
+                    initial_ue.ran_ue_ngap_id,
+                    &format!("integrity check failed under UE {old_id}'s context"),
+                )
+                .await;
         }
         log::info!(
             "Deregistration Request from CM-IDLE: UE {old_id} resumes as {amf_ue_ngap_id} to \
@@ -7590,6 +7624,17 @@ impl NgapServer {
         state.left_cm_idle = false;
         state.cm_idle = false;
         state.mobile_reachable_expired = false;
+        // #1703 review (e): where the UE is now, so the DEREGISTERED and
+        // LOSS_OF_CONNECTIVITY reports carry this connection's location.
+        state.amf_ue.nr_tai = crate::context::Tai5gs {
+            plmn_id: initial_ue.plmn_id.clone(),
+            tac: initial_ue.tac,
+        };
+        state.amf_ue.nr_cgi = crate::context::NrCgi {
+            plmn_id: initial_ue.plmn_id.clone(),
+            cell_id: initial_ue.nr_cell_identity,
+        };
+        state.amf_ue.stamp_location_now();
         let answered = {
             let g = &state.amf_ue.current_guti;
             let ctx = crate::context::amf_self();
