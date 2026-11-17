@@ -578,6 +578,31 @@ fn initial_protected_registration_request(nas: &[u8]) -> Option<&[u8]> {
         .then(|| &nas[7..])
 }
 
+/// #1691: the cleartext DEREGISTRATION REQUEST (UE originating) inside an
+/// integrity-protected initial NAS message (security header type 1, TS 24.501 §4.4.6,
+/// §9.3.1). A UE in 5GMM-IDLE with a NAS security context deregisters by sending it as
+/// its initial NAS message (§5.5.2.2.1). It has no NAS message container: every IE of
+/// it is a cleartext IE.
+fn initial_protected_deregistration_request(nas: &[u8]) -> Option<&[u8]> {
+    (nas.len() >= 13
+        && nas[1] == 0x01
+        && nas[7] == 0x7E
+        && nas[8] == security_header::PLAIN_NAS_MESSAGE
+        && nas[9] == message_type::DEREGISTRATION_REQUEST_FROM_UE)
+        .then(|| &nas[7..])
+}
+
+/// #1691: the 5G-GUTI a plain DEREGISTRATION REQUEST (UE originating) names: its 5GS
+/// mobile identity (TS 24.501 §8.2.12.1, LV-E after the de-registration type and
+/// ngKSI octet), when that identity is a 5G-GUTI (§9.11.3.4).
+fn deregistration_request_guti(plain: &[u8]) -> Option<crate::context::Guti5gs> {
+    let len = usize::from(u16::from_be_bytes([*plain.get(4)?, *plain.get(5)?]));
+    let identity = plain.get(6..6usize.checked_add(len)?)?;
+    (identity.first()? & 0x07 == mobile_identity_type::GUTI)
+        .then(|| crate::gmm_handler::parse_guti(identity))
+        .flatten()
+}
+
 /// The NAS message container IE of a plain REGISTRATION REQUEST (IEI 0x71, TLV-E,
 /// TS 24.501 §9.11.3.33): the byte span of the whole IE in `plain`, and its value.
 /// Decoded with the shared NAS codec, so the IE is found by structure rather than by
@@ -3470,6 +3495,23 @@ impl NgapServer {
             return handled;
         }
 
+        // #1691: a DEREGISTRATION REQUEST from 5GMM-IDLE (TS 24.501 §5.5.2.2.1) is an
+        // initial NAS message too, sent integrity protected over the UE's NAS security
+        // context (§4.4.6). Before, it reached the plain dispatch below, which read a MAC
+        // octet as its message type and dropped it, so the UE stayed REGISTERED here.
+        if let Some(plain) = initial_protected_deregistration_request(&nas).map(<[u8]>::to_vec) {
+            self.note_establishment_cause(amf_ue_ngap_id, initial_ue.rrc_establishment_cause);
+            return self
+                .handle_idle_deregistration_request(
+                    association_id,
+                    amf_ue_ngap_id,
+                    &initial_ue,
+                    &nas,
+                    &plain,
+                )
+                .await;
+        }
+
         // A REGISTRATION REQUEST from 5GMM-IDLE over a NAS security context is sent
         // integrity protected too (TS 24.501 §4.4.6), with the full request in a
         // ciphered NAS message container. Opened here, before the plain dispatch,
@@ -3581,6 +3623,20 @@ impl NgapServer {
                     amf_ue_ngap_id,
                     initial_ue.ran_ue_ngap_id,
                     &reject,
+                )
+                .await?;
+            }
+            message_type::DEREGISTRATION_REQUEST_FROM_UE => {
+                // #1703 review (a): an unprotected DEREGISTRATION REQUEST from 5GMM-IDLE.
+                // A UE with a NAS security context sends it integrity protected (§4.4.6);
+                // one without has no registration here to end (the emergency case of
+                // §4.4.4.3 NOTE 2 included: no 5G NAS security context is identified by
+                // it). Ignored as the failed-integrity case is.
+                self.ignore_idle_deregistration(
+                    association_id,
+                    amf_ue_ngap_id,
+                    initial_ue.ran_ue_ngap_id,
+                    "not integrity protected",
                 )
                 .await?;
             }
@@ -7479,6 +7535,133 @@ impl NgapServer {
                 self.sm_context_smfs.insert((new_id, psi), owner);
             }
         }
+    }
+
+    /// #1691: a DEREGISTRATION REQUEST in an Initial UE Message, from a UE in
+    /// 5GMM-IDLE (TS 24.501 §5.5.2.2.1).
+    /// - The UE's context is found by the 5G-GUTI the request names, and its MAC is
+    ///   verified under that context's NAS security context (§4.4.6).
+    /// - The context moves to this connection, as a Service Request's does, and any
+    ///   page running for it is marked answered by this connection. Its
+    ///   deregistration then stops it.
+    /// - The request is then handled as a connected UE's is: its sessions are released,
+    ///   the UDM is purged, a DEREGISTRATION ACCEPT is sent unless it is a switch-off
+    ///   (§5.5.2.2.2), and the connection is released.
+    ///
+    /// No context, or a failed integrity check: §4.4.4.3 lets the AMF ignore the
+    /// request and keep the UE 5GMM-REGISTERED, which it does. No authentication is
+    /// started from a bare initial DEREGISTRATION REQUEST.
+    /// #1691: an initial DEREGISTRATION REQUEST the AMF does not act on (no context
+    /// for its GUTI, a failed integrity check, or no integrity protection at all): the
+    /// UE stays 5GMM-REGISTERED (TS 24.501 §4.4.4.3), and the new N2 connection,
+    /// which serves no UE here, is released (#1703 review b).
+    async fn ignore_idle_deregistration(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        why: &str,
+    ) -> Result<()> {
+        log::warn!(
+            "Deregistration Request in Initial UE Message (UE {amf_ue_ngap_id}): {why}; \
+             ignored, the UE stays 5GMM-REGISTERED (TS 24.501 §4.4.4.3)"
+        );
+        // #758: allocated to this connection with no NAS context.
+        self.remember_contextless_ue_id(association_id, amf_ue_ngap_id, ran_ue_ngap_id);
+        // NAS cause normal-release (TS 38.413 §9.3.1.2).
+        self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 0)
+            .await
+    }
+
+    async fn handle_idle_deregistration_request(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        initial_ue: &crate::ngap_asn1::InitialUeMessageData,
+        nas: &[u8],
+        plain: &[u8],
+    ) -> Result<()> {
+        let resolved = deregistration_request_guti(plain).and_then(|guti| {
+            self.ue_auth_state.snapshot().into_iter().find(|(_, st)| {
+                st.registered
+                    && st.amf_ue.security_context_available
+                    && st.amf_ue.current_guti == guti
+            })
+        });
+        let Some((old_id, mut state)) = resolved else {
+            return self
+                .ignore_idle_deregistration(
+                    association_id,
+                    amf_ue_ngap_id,
+                    initial_ue.ran_ue_ngap_id,
+                    "no security context holds its 5G-GUTI",
+                )
+                .await;
+        };
+        let decoded = nas_security::nas_5gs_security_decode(&mut state.amf_ue, nas[1], nas);
+        let mac_failed = std::mem::take(&mut state.amf_ue.mac_failed);
+        if decoded.is_err() || mac_failed {
+            return self
+                .ignore_idle_deregistration(
+                    association_id,
+                    amf_ue_ngap_id,
+                    initial_ue.ran_ue_ngap_id,
+                    &format!("integrity check failed under UE {old_id}'s context"),
+                )
+                .await;
+        }
+        log::info!(
+            "Deregistration Request from CM-IDLE: UE {old_id} resumes as {amf_ue_ngap_id} to \
+             deregister (integrity verified, TS 24.501 §5.5.2.2.1)"
+        );
+        // The UE's record moves to this connection, as `open_idle_registration_request`
+        // moves it, so the release and the Accept go out on it.
+        self.ue_auth_state.remove(old_id);
+        state.ran_ue_ngap_id = initial_ue.ran_ue_ngap_id;
+        state.amf_ue.id = amf_ue_ngap_id;
+        state.association_id = association_id;
+        state.reachability = None;
+        state.left_cm_idle = false;
+        state.cm_idle = false;
+        state.mobile_reachable_expired = false;
+        // #1703 review (e): where the UE is now, so the DEREGISTERED and
+        // LOSS_OF_CONNECTIVITY reports carry this connection's location.
+        state.amf_ue.nr_tai = crate::context::Tai5gs {
+            plmn_id: initial_ue.plmn_id.clone(),
+            tac: initial_ue.tac,
+        };
+        state.amf_ue.nr_cgi = crate::context::NrCgi {
+            plmn_id: initial_ue.plmn_id.clone(),
+            cell_id: initial_ue.nr_cell_identity,
+        };
+        state.amf_ue.stamp_location_now();
+        let answered = {
+            let g = &state.amf_ue.current_guti;
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.paging_mark_answered_by_s_tmsi(
+                g.amf_set_id,
+                g.amf_pointer,
+                g.tmsi,
+                amf_ue_ngap_id,
+            )
+        };
+        if let Some(p) = &answered {
+            log::info!(
+                "UE {old_id}: the Deregistration Request answers its page (PSI {:?}); PAGING \
+                 stopped",
+                p.pdu_session_id
+            );
+        }
+        self.ue_auth_state.insert(amf_ue_ngap_id, state);
+        self.rekey_ue_sessions(old_id, amf_ue_ngap_id);
+        self.handle_deregistration_request_nas(
+            association_id,
+            amf_ue_ngap_id,
+            initial_ue.ran_ue_ngap_id,
+            plain,
+        )
+        .await
     }
 
     /// Open an integrity-protected REGISTRATION REQUEST that arrived as an initial NAS

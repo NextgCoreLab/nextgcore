@@ -6090,3 +6090,206 @@ async fn the_establishment_cause_marks_a_high_priority_access_ue() {
         server.forget_ue(key);
     }
 }
+
+/// A UE-originating DEREGISTRATION REQUEST (TS 24.501 §8.2.12) naming the 5G-GUTI
+/// [`super::guti_registration_request`] names for `tmsi`, switch-off or not, integrity
+/// protected under `ue`'s context for uplink NAS COUNT `count` (security header type
+/// 1, §4.4.6), as a UE in 5GMM-IDLE sends it in an Initial UE Message.
+fn protected_idle_deregistration(
+    ue: &crate::context::AmfUe,
+    tmsi: u32,
+    switch_off: bool,
+    count: u32,
+) -> Vec<u8> {
+    let mut plain = vec![
+        0x7E,
+        security_header::PLAIN_NAS_MESSAGE,
+        message_type::DEREGISTRATION_REQUEST_FROM_UE,
+        if switch_off { 0x09 } else { 0x01 },
+        0x00,
+        0x0B,
+        0xF2,
+        0x00,
+        0xF1,
+        0x10,
+        0x02,
+        0x55,
+        0x6A,
+    ];
+    plain.extend_from_slice(&tmsi.to_be_bytes());
+    let sqn = (count & 0xFF) as u8;
+    let mut mac_input = vec![sqn];
+    mac_input.extend_from_slice(&plain);
+    let mac = nas_security::nas_mac_calculate(
+        ue.selected_int_algorithm,
+        &ue.knas_int,
+        count,
+        ue.access_type,
+        nas_security::direction::UPLINK,
+        &mac_input,
+    );
+    let mut nas = vec![0x7E, security_header::INTEGRITY_PROTECTED];
+    nas.extend_from_slice(&mac);
+    nas.push(sqn);
+    nas.extend_from_slice(&plain);
+    nas
+}
+
+/// **#1691**, TS 24.501 §5.5.2.2.1-2 / §4.4.6: a UE in 5GMM-IDLE deregisters with a
+/// DEREGISTRATION REQUEST in an Initial UE Message. The AMF finds its context by the
+/// 5G-GUTI, verifies the MAC, moves the context (and its PDU sessions) to the new
+/// connection, and deregisters it:
+/// - its session is released at the SMF that holds it;
+/// - a request that is not a switch-off gets a DEREGISTRATION ACCEPT on that
+///   connection, and both release it;
+/// - the page running for the UE stops and its requester is told, once.
+///
+/// Ignored, the UE staying registered (§4.4.4.3), and the new connection released and
+/// recorded as contextless (#758): a GUTI no context holds, a context that is not
+/// registered, a failed MAC, and an unprotected request.
+///
+/// Before #1691 the protected request reached the `Unhandled NAS message type` arm
+/// (its octet 3 is a MAC octet), and every case left the UE registered and idle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_idle_ues_deregistration_request_deregisters_it_1691() {
+    let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let (_smf, smf_port, calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    for (i, switch_off) in [false, true].into_iter().enumerate() {
+        let (old_id, new_id) = (16_910_001u64 + 10 * i as u64, 16_910_002u64 + 10 * i as u64);
+        let tmsi = 0x1691_0001u32 + i as u32;
+        let stored = idle_ue_for_update(old_id, tmsi);
+        let ue_keys = stored.amf_ue.clone();
+        server.ue_auth_state.insert(old_id, stored);
+        // Review M1: a PDU session at a recording SMF, held under the idle ID.
+        let sm_ref = format!("1691-s5-{i}");
+        hold_session(&mut server, old_id, 5, &sm_ref, smf_port);
+        let mut page = page_for(old_id, tmsi, 1);
+        page.failure_notify_uri = Some("http://127.0.0.1:9/n1n2-fail-1691".to_string());
+        assert!(crate::context::amf_self().read().unwrap().paging_add(page));
+        let notified = crate::namf_server::failure_notifications_on_this_thread();
+        take_sent_ngap(&mut server);
+        server.forced_amf_ue_ngap_id = Some(new_id);
+        let nas = protected_idle_deregistration(&ue_keys, tmsi, switch_off, 5);
+        server
+            .handle_initial_ue_message(ASSOC, &super::service_request_initial_ue(nas))
+            .await
+            .expect("handled");
+        settle_offloaded_sbi(&mut server).await;
+        assert!(
+            !server.ue_auth_state.contains(old_id) && !server.ue_auth_state.contains(new_id),
+            "switch_off={switch_off}: the UE is deregistered"
+        );
+        assert!(
+            calls
+                .lock()
+                .expect("calls")
+                .iter()
+                .any(|(uri, _)| uri.ends_with(&format!("/sm-contexts/{sm_ref}/release"))),
+            "switch_off={switch_off}: its session is released at the SMF"
+        );
+        let sent: Vec<Sent> = take_sent_ngap(&mut server)
+            .iter()
+            .map(|(_, p)| decode_sent(p))
+            .collect();
+        let accepts = sent
+            .iter()
+            .filter(|s| matches!(s, Sent::DownlinkNas { amf_ue_ngap_id, .. } if *amf_ue_ngap_id == new_id))
+            .count();
+        assert_eq!(
+            accepts,
+            usize::from(!switch_off),
+            "switch_off={switch_off}: a DEREGISTRATION ACCEPT only when not switching off \
+             (TS 24.501 §5.5.2.2.2): {sent:?}"
+        );
+        assert!(
+            sent.contains(&Sent::Other(Some(41))),
+            "switch_off={switch_off}: the new connection is released: {sent:?}"
+        );
+        assert!(
+            crate::context::amf_self()
+                .read()
+                .unwrap()
+                .paging_find(old_id)
+                .is_none(),
+            "switch_off={switch_off}: the page is stopped"
+        );
+        assert_eq!(
+            crate::namf_server::failure_notifications_on_this_thread() - notified,
+            1,
+            "switch_off={switch_off}: and its requester notified, once"
+        );
+    }
+
+    // Ignored. The UE stays registered; the new connection is released.
+    let (old_id, new_id, tmsi) = (16_910_101u64, 16_910_102u64, 0x1691_0101u32);
+    let stored = idle_ue_for_update(old_id, tmsi);
+    let ue_keys = stored.amf_ue.clone();
+    server.ue_auth_state.insert(old_id, stored);
+    let unprotected = {
+        let nas = protected_idle_deregistration(&ue_keys, tmsi, false, 5);
+        nas[7..].to_vec()
+    };
+    for (case, nas, registered) in [
+        (
+            "unknown GUTI",
+            protected_idle_deregistration(&ue_keys, tmsi + 1, false, 5),
+            true,
+        ),
+        (
+            "not registered",
+            protected_idle_deregistration(&ue_keys, tmsi, false, 5),
+            false,
+        ),
+        (
+            "bad MAC",
+            {
+                let mut nas = protected_idle_deregistration(&ue_keys, tmsi, false, 5);
+                nas[2] ^= 0xFF;
+                nas
+            },
+            true,
+        ),
+        ("unprotected", unprotected, true),
+    ] {
+        server
+            .ue_auth_state
+            .with_mut(old_id, |s| s.registered = registered);
+        take_sent_ngap(&mut server);
+        server.forced_amf_ue_ngap_id = Some(new_id);
+        server
+            .handle_initial_ue_message(ASSOC, &super::service_request_initial_ue(nas))
+            .await
+            .expect("handled");
+        assert!(
+            server
+                .ue_auth_state
+                .get(old_id)
+                .is_some_and(|s| s.registered == registered && s.is_cm_idle()),
+            "{case}: the UE's context is untouched"
+        );
+        let sent: Vec<Sent> = take_sent_ngap(&mut server)
+            .iter()
+            .map(|(_, p)| decode_sent(p))
+            .collect();
+        assert_eq!(
+            sent,
+            vec![Sent::Other(Some(41))],
+            "{case}: only the new connection's release (review b)"
+        );
+        assert!(
+            server
+                .contextless_ue_ids
+                .iter()
+                .any(|c| c.amf_ue_ngap_id == new_id),
+            "{case}: the new ID is recorded as contextless (#758)"
+        );
+        server
+            .contextless_ue_ids
+            .retain(|c| c.amf_ue_ngap_id != new_id);
+    }
+    server.forced_amf_ue_ngap_id = None;
+    server.forget_ue(old_id);
+}
