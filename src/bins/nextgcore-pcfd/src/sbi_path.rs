@@ -422,13 +422,13 @@ pub async fn send_notification_post(
     suffix: &str,
     body: &serde_json::Value,
 ) -> Result<u16, String> {
-    use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
+    use nextgcore_sbi::client::SbiClient;
     use std::time::Duration;
 
     let (host, port) = parse_uri_host_port(notification_uri)?;
     let path = format!("{}{}", uri_path(notification_uri), suffix);
     let client = SbiClient::new(
-        SbiClientConfig::new(host, port)
+        nextgcore_sbi::security::sbi_peer_client_config(&host, port)
             .with_connect_timeout(Duration::from_secs(2))
             .with_request_timeout(Duration::from_secs(3)),
     );
@@ -1797,11 +1797,11 @@ pub(crate) fn client_for(
     ep: &DiscoveredEndpoint,
     target: NfType,
 ) -> nextgcore_sbi::client::SbiClient {
-    use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
+    use nextgcore_sbi::client::SbiClient;
     use std::time::Duration;
     crate::app::attach_oauth2(
         SbiClient::new(
-            SbiClientConfig::new(ep.host.clone(), ep.port)
+            nextgcore_sbi::security::sbi_peer_client_config(&ep.host, ep.port)
                 .with_connect_timeout(Duration::from_secs(2))
                 .with_request_timeout(Duration::from_secs(3)),
         ),

@@ -718,7 +718,7 @@ async fn handle_dm_notify(req: &SbiRequest) -> SbiResponse {
             timestamp.clone(),
             body.clone(),
         );
-        let client = SbiClient::with_host_port(&host, port);
+        let client = SbiClient::for_peer(&host, port);
         tokio::spawn(async move {
             match client.post_json(&path_owned, &notif).await {
                 Ok(resp) => {
@@ -1065,6 +1065,9 @@ mod data_management_tests {
     /// whole chain (parse → store → key → deliver) is exercised.
     #[test]
     fn a_conformant_subscription_receives_its_notifications() {
+        // #1666: the notification client follows the SBI profile, and this
+        // drives it at a loopback plaintext peer, i.e. a dev deployment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         init();
         clear_subscriptions();
@@ -1134,6 +1137,9 @@ mod data_management_tests {
     /// consumer received every other consumer's collected data.
     #[test]
     fn fanout_is_keyed_on_the_subscribed_event() {
+        // #1666: the notification client follows the SBI profile, and this
+        // drives it at a loopback plaintext peer, i.e. a dev deployment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         init();
         clear_subscriptions();

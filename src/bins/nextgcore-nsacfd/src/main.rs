@@ -21,7 +21,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
+use nextgcore_sbi::client::SbiClient;
 use nextgcore_sbi::context::global_context;
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
 use nextgcore_sbi::oauth::{JwksCache, OAuth2Client};
@@ -2212,7 +2212,7 @@ async fn deliver_notification(notification_uri: String, body: serde_json::Value)
         return;
     };
     let client = SbiClient::new(
-        SbiClientConfig::new(host, port)
+        nextgcore_sbi::security::sbi_peer_client_config(&host, port)
             .with_connect_timeout(NOTIFY_CONNECT_TIMEOUT)
             .with_request_timeout(NOTIFY_REQUEST_TIMEOUT),
     );
@@ -3174,6 +3174,9 @@ nsacf:
     /// from the same `nfId` is not re-notified.
     #[tokio::test]
     async fn subscribe_time_dispatches_actually_arrive_at_the_consumer() {
+        // #1666: the notification client follows the SBI profile, and this
+        // drives it at a loopback plaintext peer, i.e. a dev deployment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (server, port, _ctx_guard) = start_nsacf_server().await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
 
@@ -3371,6 +3374,9 @@ nsacf:
 
     #[tokio::test]
     async fn test_http_slice_ee_subscription_and_eac_notification() {
+        // #1666: the notification client follows the SBI profile, and this
+        // drives it at a loopback plaintext peer, i.e. a dev deployment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (server, port, _ctx_guard) = start_nsacf_server().await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
 

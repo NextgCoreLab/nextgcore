@@ -870,7 +870,7 @@ pub async fn fetch(url: &str, timeout: Duration) -> Result<(Vec<u8>, String), Re
     let (host, port, path) = crate::notification_dispatcher::parse_notify_uri(url)
         .ok_or_else(|| Refusal::Unreachable(format!("{url:?} is not an http(s) URL")))?;
     let mut c = nextgcore_sbi::SbiClient::new(
-        nextgcore_sbi::SbiClientConfig::new(&host, port)
+        nextgcore_sbi::security::sbi_peer_client_config(&host, port)
             .with_connect_timeout(timeout)
             .with_request_timeout(timeout)
             .with_max_response_body(MAX_MODEL_BYTES),

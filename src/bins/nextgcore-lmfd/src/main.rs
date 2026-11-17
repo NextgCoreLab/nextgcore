@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
+use nextgcore_sbi::client::SbiClient;
 use nextgcore_sbi::context::global_context;
 use nextgcore_sbi::message::{ProblemDetails, SbiRequest, SbiResponse};
 use nextgcore_sbi::server::{
@@ -2173,7 +2173,7 @@ async fn post_event_notify(
         .ok_or_else(|| format!("invalid hgmlcCallBackURI: {hgmlc_uri}"))?;
     let json = serde_json::to_string(body).map_err(|e| e.to_string())?;
     let client = SbiClient::new(
-        SbiClientConfig::new(host, port)
+        nextgcore_sbi::security::sbi_peer_client_config(&host, port)
             .with_connect_timeout(Duration::from_secs(2))
             .with_request_timeout(Duration::from_secs(3)),
     );
@@ -7295,6 +7295,9 @@ mod a8_event_notify_tests {
     // receives a byte-valid EventNotifyDataExt as application/json.
     #[tokio::test]
     async fn test_post_event_notify_strict_peer_204() {
+        // #1666: the notification client follows the SBI profile, and this
+        // drives it at a loopback plaintext peer, i.e. a dev deployment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (server, port) = start_sink().await;
         let path = "/sink/a8-post/cb";
         let hgmlc = format!("http://127.0.0.1:{port}{path}");

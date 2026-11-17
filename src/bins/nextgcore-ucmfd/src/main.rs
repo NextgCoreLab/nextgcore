@@ -46,7 +46,7 @@ use context::{
     AssignError, Capabilities, DicEntry, ModeOfOperation, Notification, RacFormat, ResolveError,
     Ucmf,
 };
-use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
+use nextgcore_sbi::client::SbiClient;
 use nextgcore_sbi::context::global_context;
 use nextgcore_sbi::message::{SbiPart, SbiRequest, SbiResponse};
 use nextgcore_sbi::oauth::{JwksCache, OAuth2Client};
@@ -643,7 +643,7 @@ fn dispatch(note: Notification) {
                 return;
             };
             let mut client = SbiClient::new(
-                SbiClientConfig::new(host, port)
+                nextgcore_sbi::security::sbi_peer_client_config(&host, port)
                     .with_connect_timeout(NOTIFY_CONNECT_TIMEOUT)
                     .with_request_timeout(NOTIFY_REQUEST_TIMEOUT),
             );

@@ -2055,6 +2055,85 @@ mod audience_binding_guards {
         );
     }
 
+    /// `text` without its top-level `#[cfg(test)] mod ... { .. }` blocks, for the
+    /// source guards below. A test module ends at the first `}` in column 0.
+    fn production_text(text: &str) -> String {
+        const MARKER: &str = "#[cfg(test)]\nmod ";
+        let mut out = String::new();
+        let mut rest = text;
+        while let Some(i) = rest.find(MARKER) {
+            out.push_str(&rest[..i]);
+            let after = &rest[i..];
+            let line_end = after[MARKER.len()..]
+                .find('\n')
+                .map_or(after.len(), |j| MARKER.len() + j);
+            if after[..line_end].trim_end().ends_with(';') {
+                // `mod tests;`: the module lives in its own file.
+                rest = &after[line_end..];
+                continue;
+            }
+            rest = after.find("\n}\n").map_or("", |j| &after[j + 3..]);
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// #1666: the peer-NF clients of the peripheral NFs follow the SBI security
+    /// profile (`https` with this NF's client certificate under `production`)
+    /// rather than dialling cleartext in every profile. Service requests and
+    /// notifications alike: a notification target is an NF listener as well.
+    ///
+    /// The clients are built inside functions that the loopback tests drive with
+    /// the profile set to `dev`, so the scheme each one picks is pinned here, in
+    /// the source, the same way the #63 guard below pins the core NFs.
+    #[test]
+    fn peripheral_nf_peer_clients_follow_the_sbi_profile() {
+        let bins = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("crate is at <root>/libs/nextgcore-sbi")
+            .join("bins");
+        // Each file, and the profile-aware constructors its production code must
+        // use instead (how many of each the fix introduced).
+        let files: [(&str, usize, usize); 15] = [
+            ("nextgcore-bsfd/src/lib.rs", 0, 1),
+            ("nextgcore-dccfd/src/coordination.rs", 2, 0),
+            ("nextgcore-dccfd/src/main.rs", 1, 0),
+            ("nextgcore-easdfd/src/main.rs", 1, 0),
+            ("nextgcore-lmfd/src/main.rs", 0, 1),
+            ("nextgcore-lmfd/src/namf_client.rs", 0, 1),
+            ("nextgcore-mbsmfd/src/namf_client.rs", 0, 1),
+            ("nextgcore-nefd/src/main.rs", 0, 1),
+            ("nextgcore-nsacfd/src/main.rs", 0, 1),
+            ("nextgcore-nssfd/src/main.rs", 0, 1),
+            ("nextgcore-nwdafd/src/model_retrain.rs", 0, 1),
+            ("nextgcore-nwdafd/src/notification_dispatcher.rs", 0, 1),
+            ("nextgcore-pcfd/src/sbi_path.rs", 0, 2),
+            ("nextgcore-ucmfd/src/main.rs", 0, 1),
+            ("nextgcore-udrd/src/data_store.rs", 0, 1),
+        ];
+        for (rel, for_peer, peer_config) in files {
+            let path = bins.join(rel);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let production = production_text(&text);
+            for cleartext in ["SbiClient::with_host_port(", "SbiClientConfig::new("] {
+                assert!(
+                    !production.contains(cleartext),
+                    "{rel} builds a peer client with {cleartext}..), which is cleartext http \
+                     with no client certificate in every SBI profile (#1666). Use \
+                     SbiClient::for_peer or security::sbi_peer_client_config."
+                );
+            }
+            assert!(
+                production.matches("SbiClient::for_peer(").count() >= for_peer
+                    && production.matches("sbi_peer_client_config(").count() >= peer_config,
+                "{rel} should reach its peers through the profile-aware constructors; if \
+                 the calls moved, move this guard with them rather than deleting it"
+            );
+        }
+    }
+
     /// **Issue #63, the outbound half of criterion 1.** The files that hold the
     /// core NFs' peer-call code must not build cleartext clients.
     ///
