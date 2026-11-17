@@ -1320,6 +1320,16 @@ impl ParsedOuterHeaderCreation {
     }
 }
 
+/// The Unsigned32 at the start of `ie`'s value, or `short` when the value is
+/// under 4 octets (#1616).
+fn be_u32(ie: &ParsedIe, short: &'static str) -> Result<u32, &'static str> {
+    ie.value
+        .get(..4)
+        .and_then(|v| <[u8; 4]>::try_from(v).ok())
+        .map(u32::from_be_bytes)
+        .ok_or(short)
+}
+
 /// Parse Create PDR IE and extract relevant fields
 pub fn parse_create_pdr(data: &[u8]) -> Result<ParsedCreatePdr, &'static str> {
     let ies = ParsedIe::parse_all(data);
@@ -1336,12 +1346,10 @@ pub fn parse_create_pdr(data: &[u8]) -> Result<ParsedCreatePdr, &'static str> {
         .ok_or("PDR ID shorter than 2 octets")?;
     pdr.pdr_id = u16::from_be_bytes(id);
 
-    // Precedence (mandatory)
+    // Precedence (mandatory, §8.2.11: Unsigned32). A shorter one is refused
+    // (§7.6.8), not read as precedence 0, the highest (#1616).
     if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::PRECEDENCE) {
-        if ie.value.len() >= 4 {
-            pdr.precedence =
-                u32::from_be_bytes([ie.value[0], ie.value[1], ie.value[2], ie.value[3]]);
-        }
+        pdr.precedence = be_u32(ie, "Precedence shorter than 4 octets")?;
     }
 
     // PDI (mandatory)
@@ -1356,40 +1364,21 @@ pub fn parse_create_pdr(data: &[u8]) -> Result<ParsedCreatePdr, &'static str> {
         }
     }
 
-    // FAR ID
+    // The rules the PDR references: FAR ID (§8.2.74), URR ID (§8.2.54) and
+    // QER ID (§8.2.75), each 4 octets. A shorter reference is refused (§7.6.8)
+    // rather than skipped, which installed the PDR with no FAR, or missing a URR
+    // or QER, and accepted the request (#1616).
     if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::FAR_ID) {
-        if ie.value.len() >= 4 {
-            pdr.far_id = Some(u32::from_be_bytes([
-                ie.value[0],
-                ie.value[1],
-                ie.value[2],
-                ie.value[3],
-            ]));
-        }
+        pdr.far_id = Some(be_u32(ie, "FAR ID shorter than 4 octets")?);
     }
-
-    // URR IDs
     for ie in ParsedIe::find_all_ies(&ies, pfcp_ie::URR_ID) {
-        if ie.value.len() >= 4 {
-            pdr.urr_ids.push(u32::from_be_bytes([
-                ie.value[0],
-                ie.value[1],
-                ie.value[2],
-                ie.value[3],
-            ]));
-        }
+        pdr.urr_ids
+            .push(be_u32(ie, "URR ID shorter than 4 octets")?);
     }
-
-    // QER ID
-    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::QER_ID) {
-        if ie.value.len() >= 4 {
-            pdr.qer_id = Some(u32::from_be_bytes([
-                ie.value[0],
-                ie.value[1],
-                ie.value[2],
-                ie.value[3],
-            ]));
-        }
+    // Only the first QER ID is kept, but every one present is checked.
+    for ie in ParsedIe::find_all_ies(&ies, pfcp_ie::QER_ID) {
+        let id = be_u32(ie, "QER ID shorter than 4 octets")?;
+        pdr.qer_id.get_or_insert(id);
     }
 
     Ok(pdr)
