@@ -37734,6 +37734,9 @@ mod tests {
     /// (`reachability_reports_on_this_thread`), and read at the sinks.
     #[tokio::test]
     async fn reachability_reports_follow_the_subscriptions_filter_1641() {
+        // The reachability sweep walks the whole UE store: serialised with the other
+        // sweeping tests, its lock taken before CONTEXT_GUARD as theirs is.
+        let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let _guamis = serve_only_local_guami();
@@ -37820,6 +37823,9 @@ mod tests {
     /// echoed.
     #[tokio::test]
     async fn the_first_reachability_report_is_the_current_state_1641() {
+        // The reachability sweep walks the whole UE store: serialised with the other
+        // sweeping tests, its lock taken before CONTEXT_GUARD as theirs is.
+        let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
