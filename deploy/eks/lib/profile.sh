@@ -81,3 +81,49 @@ nextg_profile_sim_names() {
   done
   echo "${out[*]}"
 }
+
+# nextg_rollout_wait KIND/NAME TIMEOUT_SECONDS (#1651)
+#   `kubectl rollout status KIND/NAME -n NAMESPACE --timeout=TIMEOUT_SECONDSs`,
+#   which only reports a crash-looping pod once its timeout expires. Every
+#   NEXTG_ROLLOUT_POLL seconds (default 5) lib/crashloop.py checks the pods of
+#   the workload's current revision; a container in CrashLoopBackOff, or not
+#   Ready after more than NEXTG_ROLLOUT_RESTART_LIMIT restarts (default 3), ends
+#   the wait at once with the container's last log lines. The deploy then fails
+#   through `die` when the caller defines one; otherwise this returns 3. Returns
+#   the rollout's own status when it ends first. A check that cannot list the
+#   cluster gives no verdict and the wait goes on.
+NEXTG_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+nextg_rollout_wait() {
+  local target="$1" timeout="$2" poll="${NEXTG_ROLLOUT_POLL:-5}"
+  local dir pid rc=0 ticks=0 found line pod container reason restarts
+  dir="$(mktemp -d)"
+  kubectl rollout status "${target}" -n "${NAMESPACE}" --timeout="${timeout}s" &
+  pid=$!
+  while kill -0 "${pid}" 2>/dev/null; do
+    sleep 0.2
+    ticks=$((ticks + 1))
+    (( ticks % (poll * 5) == 0 )) || continue
+    kubectl get deployments,statefulsets,replicasets -n "${NAMESPACE}" -o json \
+      >"${dir}/workloads.json" 2>/dev/null || continue
+    kubectl get pods -n "${NAMESPACE}" -o json >"${dir}/pods.json" 2>/dev/null || continue
+    found="$(python3 "${NEXTG_LIB_DIR}/crashloop.py" \
+      "${dir}/workloads.json" "${dir}/pods.json" "${target}")" && continue
+    [[ -n "${found}" ]] || continue
+    kill "${pid}" 2>/dev/null
+    wait "${pid}" 2>/dev/null
+    rm -rf "${dir}"
+    while read -r pod container reason restarts; do
+      warn "${target}: pod ${pod} container ${container} is crash-looping (${reason}, ${restarts} restarts); its last log lines:"
+      kubectl logs "${pod}" -c "${container}" -n "${NAMESPACE}" --previous --tail=20 2>/dev/null \
+        || kubectl logs "${pod}" -c "${container}" -n "${NAMESPACE}" --tail=20 2>/dev/null \
+        || true
+    done <<<"${found}"
+    if declare -F die >/dev/null; then
+      die "${target} is crash-looping; not waiting out its ${timeout}s rollout timeout"
+    fi
+    return 3
+  done
+  wait "${pid}" || rc=$?
+  rm -rf "${dir}"
+  return "${rc}"
+}
