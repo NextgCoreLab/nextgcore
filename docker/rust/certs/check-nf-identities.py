@@ -104,8 +104,8 @@ def self_test():
         errs = check(table, {DEFAULT_STACK: {'services': services}})
         assert len(errs) == 1 and needle in errs[0], (services, errs)
     # Another stack may leave an NF unpinned, but not pin it wrongly.
-    assert check(table, {'docker-compose.demo.yml': {'services': {'amf': {}}}}) == []
-    errs = check(table, {'docker-compose.demo.yml': {'services': {
+    assert check(table, {'docker-compose.other.yml': {'services': {'amf': {}}}}) == []
+    errs = check(table, {'docker-compose.other.yml': {'services': {
         'amf': {'environment': ['NEXTGCORE_AMF_INSTANCE_ID=x']}}}})
     assert len(errs) == 1, errs
     print('check-nf-identities self-test: ok')
