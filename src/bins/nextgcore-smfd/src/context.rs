@@ -1786,6 +1786,14 @@ pub struct NetworkPaging {
     /// the AMF supervises the paging (step 5), and a paging it never reports on
     /// (an AMF restart, a lost notification) must not block re-paging for good.
     pub started: std::time::Instant,
+    /// The QoS flow the buffered packet was reported for, which the transfer's `arp`
+    /// and `5qi` came from: a re-invocation toward a new AMF carries the same (#1705).
+    pub qfi: Option<u8>,
+    /// The AMF the transfer was sent to, as the `smContextStatusUri` it was addressed
+    /// from; `None` when not recorded. A message from a different AMF while the
+    /// paging is in progress re-invokes the transfer there (#1705, TS 23.502
+    /// §4.2.3.3 step 3a).
+    pub amf_uri: Option<String>,
 }
 
 impl NetworkPaging {
