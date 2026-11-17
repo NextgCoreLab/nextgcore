@@ -156,6 +156,13 @@ The outbound half also covers the shared peer-client cache in
 it follow the profile too**. Their own listeners are still configured by their
 individual `--tls` flags rather than by this profile.
 
+**Every NF presents tokens under `production`** (#1665). `bsf`, `dccf`, `lmf`,
+`mbsmf`, `nsacf`, `nssf`, `nwdaf`, `pcf`, `tsctsf`, `ucmf` and `udr` install their
+outbound OAuth2 client under this profile even with their `sbi.oauth2.require` knob
+off. A consumer presents an NRF-issued token on each service request (TS 33.501
+§13.4.1.1.2), and the four NFs above require one under this profile. The knob
+still decides whether those NFs' own listeners require a token.
+
 Every artefact this repo ships — `docker/rust/docker-compose.yml`,
 `k8s/manifests/`, and the Helm chart via `global.sbiProfile` — sets the explicit
 `dev` opt-out, because none of them mount SBI certificates. Local development and

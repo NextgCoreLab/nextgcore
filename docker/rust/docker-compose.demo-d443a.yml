@@ -65,6 +65,10 @@ x-common: &common
     NEXTGCORE_SBI_PROFILE: "dev"
     TLS_ENABLED: "false"
     SBI_SCHEME: "http"
+    # NF -> NRF over TLS (#1617): the trust anchor every NRF client verifies the
+    # NRF against. Each mounts its own certificate volume tls-<name> at
+    # /etc/nextgcore/certs (the sbi-tls service fills it).
+    NEXTGCORE_NRF_TLS_CA: /etc/nextgcore/certs/ca.crt
 
 x-nf-healthcheck: &nf-healthcheck
   healthcheck:
@@ -75,6 +79,43 @@ x-nf-healthcheck: &nf-healthcheck
     start_period: 5s
 
 services:
+  # ==========================================================================
+  # SBI TLS (#1617): the certificate source. A one-shot service that issues
+  # the dev PKI (certs/generate-dev-certs.sh, from certs/nf-identities.txt)
+  # into sbi_pki, then gives each NRF client below its own volume tls-<name>
+  # with ca.crt, <name>.crt and <name>.key (0400, owned by that container's
+  # user). Every NRF client depends on it. No network.
+  # ==========================================================================
+  sbi-tls:
+    image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/nrf:${NEXTGCORE_TAG:-latest}
+    user: root
+    restart: "no"
+    network_mode: none
+    entrypoint: ["bash", "/opt/sbi-tls/compose-tls-init.sh"]
+    command: []
+    healthcheck:
+      disable: true
+    environment:
+      # nextgsim sidecars that drop to their own uid read their key as it.
+      SBI_TLS_OWNERS: "eas-local=65531 eas-regional=65532 eas-cloud=65533"
+    volumes:
+      - ./certs:/opt/sbi-tls:ro
+      - sbi_pki:/pki
+      - tls-nrf:/tls/nrf
+      - tls-ausf:/tls/ausf
+      - tls-udm:/tls/udm
+      - tls-udr:/tls/udr
+      - tls-pcf:/tls/pcf
+      - tls-nssf:/tls/nssf
+      - tls-bsf:/tls/bsf
+      - tls-amf:/tls/amf
+      - tls-smf:/tls/smf
+      - tls-ees-standin:/tls/ees-standin
+      - tls-eas-local:/tls/eas-local
+      - tls-eas-regional:/tls/eas-regional
+      - tls-eas-cloud:/tls/eas-cloud
+      - tls-eec:/tls/eec
+
   mongodb:
     image: mongo:6.0
     <<: *common
@@ -96,14 +137,21 @@ services:
   nrf:
     image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/nrf:${NEXTGCORE_TAG:-latest}
     <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+      # Pinned to the URN of certs/nrf.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_NRF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-0000000000f0
     command: ["-c", "/etc/nextgcore/nrf.yaml", "--sbi-addr", "0.0.0.0"]
     volumes:
       - ./configs/demo-d443a/nrf.yaml:/etc/nextgcore/nrf.yaml:ro
       - d443a_cca:/etc/nextgcore/cca-trusted:ro
+      - tls-nrf:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.10
     depends_on:
+      sbi-tls:
+        condition: service_completed_successfully
       mongodb:
         condition: service_healthy
 
@@ -114,13 +162,20 @@ services:
       <<: *common-env
       UDM_SBI_ADDR: 172.23.0.12
       UDM_SBI_PORT: "7777"
+      # Pinned to the URN of certs/ausf.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_AUSF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-00000000a05f
+      NEXTGCORE_NRF_TLS_CLIENT_CERT: /etc/nextgcore/certs/ausf.crt
+      NEXTGCORE_NRF_TLS_CLIENT_KEY: /etc/nextgcore/certs/ausf.key
     command: ["-c", "/etc/nextgcore/ausf.yaml"]
     volumes:
       - ./configs/5gc/ausf.yaml:/etc/nextgcore/ausf.yaml:ro
+      - tls-ausf:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.11
     depends_on:
+      sbi-tls:
+        condition: service_completed_successfully
       nrf:
         condition: service_healthy
       udm:
@@ -133,27 +188,43 @@ services:
       <<: *common-env
       UDR_SBI_ADDR: 172.23.0.20
       UDR_SBI_PORT: "7777"
+      # Pinned to the URN of certs/udm.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_UDM_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-000000000d10
+      NEXTGCORE_NRF_TLS_CLIENT_CERT: /etc/nextgcore/certs/udm.crt
+      NEXTGCORE_NRF_TLS_CLIENT_KEY: /etc/nextgcore/certs/udm.key
     command: ["-c", "/etc/nextgcore/udm.yaml"]
     volumes:
       - ./configs/5gc/udm.yaml:/etc/nextgcore/udm.yaml:ro
       - ./configs/5gc/hnet:/etc/nextgcore/hnet:ro
+      - tls-udm:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.12
     depends_on:
+      sbi-tls:
+        condition: service_completed_successfully
       nrf:
         condition: service_healthy
 
   udr:
     image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/udr:${NEXTGCORE_TAG:-latest}
     <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+      # Pinned to the URN of certs/udr.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_UDR_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-000000000d00
+      NEXTGCORE_NRF_TLS_CLIENT_CERT: /etc/nextgcore/certs/udr.crt
+      NEXTGCORE_NRF_TLS_CLIENT_KEY: /etc/nextgcore/certs/udr.key
     command: ["-c", "/etc/nextgcore/udr.yaml"]
     volumes:
       - ./configs/5gc/udr.yaml:/etc/nextgcore/udr.yaml:ro
+      - tls-udr:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.20
     depends_on:
+      sbi-tls:
+        condition: service_completed_successfully
       nrf:
         condition: service_healthy
       mongodb:
@@ -162,13 +233,22 @@ services:
   pcf:
     image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/pcf:${NEXTGCORE_TAG:-latest}
     <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+      # Pinned to the URN of certs/pcf.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_PCF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-000000000cf0
+      NEXTGCORE_NRF_TLS_CLIENT_CERT: /etc/nextgcore/certs/pcf.crt
+      NEXTGCORE_NRF_TLS_CLIENT_KEY: /etc/nextgcore/certs/pcf.key
     command: ["-c", "/etc/nextgcore/pcf.yaml"]
     volumes:
       - ./configs/5gc/pcf.yaml:/etc/nextgcore/pcf.yaml:ro
+      - tls-pcf:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.13
     depends_on:
+      sbi-tls:
+        condition: service_completed_successfully
       nrf:
         condition: service_healthy
       # #1457: pcfd opens its subscriber store at startup and refuses to start
@@ -179,26 +259,44 @@ services:
   nssf:
     image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/nssf:${NEXTGCORE_TAG:-latest}
     <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+      # Pinned to the URN of certs/nssf.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_NSSF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-0000000055f0
+      NEXTGCORE_NRF_TLS_CLIENT_CERT: /etc/nextgcore/certs/nssf.crt
+      NEXTGCORE_NRF_TLS_CLIENT_KEY: /etc/nextgcore/certs/nssf.key
     command: ["-c", "/etc/nextgcore/nssf.yaml"]
     volumes:
       - ./configs/5gc/nssf.yaml:/etc/nextgcore/nssf.yaml:ro
+      - tls-nssf:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.14
     depends_on:
+      sbi-tls:
+        condition: service_completed_successfully
       nrf:
         condition: service_healthy
 
   bsf:
     image: ${NEXTGCORE_IMAGE_PREFIX:-nextgcore-rust}/bsf:${NEXTGCORE_TAG:-latest}
     <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+      # Pinned to the URN of certs/bsf.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_BSF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-000000000b0f
+      NEXTGCORE_NRF_TLS_CLIENT_CERT: /etc/nextgcore/certs/bsf.crt
+      NEXTGCORE_NRF_TLS_CLIENT_KEY: /etc/nextgcore/certs/bsf.key
     command: ["-c", "/etc/nextgcore/bsf.yaml"]
     volumes:
       - ./configs/5gc/bsf.yaml:/etc/nextgcore/bsf.yaml:ro
+      - tls-bsf:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.15
     depends_on:
+      sbi-tls:
+        condition: service_completed_successfully
       nrf:
         condition: service_healthy
 
@@ -219,14 +317,19 @@ services:
       UDM_SBI_PORT: "7777"
       PCF_SBI_ADDR: 172.23.0.13
       PCF_SBI_PORT: "7777"
+      NEXTGCORE_NRF_TLS_CLIENT_CERT: /etc/nextgcore/certs/amf.crt
+      NEXTGCORE_NRF_TLS_CLIENT_KEY: /etc/nextgcore/certs/amf.key
     # Every container interface, inside the private network only: no publish.
     command: ["-c", "/etc/nextgcore/amf.yaml", "--ngap-addr", "0.0.0.0:38412"]
     volumes:
       - ./configs/5gc/amf.yaml:/etc/nextgcore/amf.yaml:ro
+      - tls-amf:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.5
     depends_on:
+      sbi-tls:
+        condition: service_completed_successfully
       nrf:
         condition: service_healthy
       ausf:
@@ -252,6 +355,10 @@ services:
       UDM_SBI_PORT: "7777"
       SMF_METRICS_PORT: "9090"
       D443A_MODE: ${D443A_MODE:-measured-budget}
+      # Pinned to the URN of certs/smf.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_SMF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-0000000005f0
+      NEXTGCORE_NRF_TLS_CLIENT_CERT: /etc/nextgcore/certs/smf.crt
+      NEXTGCORE_NRF_TLS_CLIENT_KEY: /etc/nextgcore/certs/smf.key
     entrypoint: ["sh", "-c"]
     command:
       - >-
@@ -259,10 +366,13 @@ services:
         exec nf-binary -c /tmp/smf.yaml
     volumes:
       - ./configs/demo-d443a/smf.yaml.in:/etc/nextgcore/smf.yaml.in:ro
+      - tls-smf:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.4
     depends_on:
+      sbi-tls:
+        condition: service_completed_successfully
       nrf:
         condition: service_healthy
       pcf:
@@ -324,11 +434,14 @@ services:
       D443A_MODE: ${D443A_MODE:-measured-budget}
       EES_METRICS_PORT: "9090"
       NEXTGCORE_METRICS_BIND: "172.23.0.31"
+      NEXTGCORE_NRF_TLS_CLIENT_CERT: /etc/nextgcore/certs/ees-standin.crt
+      NEXTGCORE_NRF_TLS_CLIENT_KEY: /etc/nextgcore/certs/ees-standin.key
     entrypoint: ["sh", "/etc/d443a/ees-entry.sh"]
     command: []
     volumes:
       - ./configs/demo-d443a/ees.yaml.in:/etc/nextgcore/ees.yaml.in:ro
       - ./configs/demo-d443a/ees-entry.sh:/etc/d443a/ees-entry.sh:ro
+      - tls-ees-standin:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.31
@@ -339,6 +452,8 @@ services:
       retries: 3
       start_period: 5s
     depends_on:
+      sbi-tls:
+        condition: service_completed_successfully
       nrf:
         condition: service_healthy
       smf:
@@ -365,12 +480,16 @@ services:
       EAS_AVL: "50"
       EAS_NF_ID: 6b1d7e3c-0000-4000-8000-0000000471a1
       EAS_ARGS: ${EAS_LOCAL_ARGS:-}
+      NEXTGCORE_NRF_TLS_CLIENT_CERT: /etc/nextgcore/certs/eas-local.crt
+      NEXTGCORE_NRF_TLS_CLIENT_KEY: /etc/nextgcore/certs/eas-local.key
+      NEXTGCORE_NRF_TLS_CA: /etc/nextgcore/certs/ca.crt
     entrypoint: ["sh", "/etc/d443a/eas-entry.sh"]
     command: []
     volumes:
       - ./configs/demo-d443a/eas-entry.sh:/etc/d443a/eas-entry.sh:ro
       - ./configs/demo-d443a/eas.yaml.in:/etc/d443a/eas.yaml.in:ro
       - d443a_cca:/var/lib/d443a/cca
+      - tls-eas-local:/etc/nextgcore/certs:ro
     networks:
       dn:
         ipv4_address: 10.60.0.11
@@ -381,6 +500,8 @@ services:
       retries: 3
       start_period: 5s
     depends_on:
+      sbi-tls:
+        condition: service_completed_successfully
       ees:
         condition: service_healthy
       upf:
@@ -407,12 +528,16 @@ services:
       EAS_AVL: "50"
       EAS_NF_ID: 6b1d7e3c-0000-4000-8000-0000000471a2
       EAS_ARGS: ""
+      NEXTGCORE_NRF_TLS_CLIENT_CERT: /etc/nextgcore/certs/eas-regional.crt
+      NEXTGCORE_NRF_TLS_CLIENT_KEY: /etc/nextgcore/certs/eas-regional.key
+      NEXTGCORE_NRF_TLS_CA: /etc/nextgcore/certs/ca.crt
     entrypoint: ["sh", "/etc/d443a/eas-entry.sh"]
     command: []
     volumes:
       - ./configs/demo-d443a/eas-entry.sh:/etc/d443a/eas-entry.sh:ro
       - ./configs/demo-d443a/eas.yaml.in:/etc/d443a/eas.yaml.in:ro
       - d443a_cca:/var/lib/d443a/cca
+      - tls-eas-regional:/etc/nextgcore/certs:ro
     networks:
       dn:
         ipv4_address: 10.60.0.12
@@ -423,6 +548,8 @@ services:
       retries: 3
       start_period: 5s
     depends_on:
+      sbi-tls:
+        condition: service_completed_successfully
       ees:
         condition: service_healthy
       upf:
@@ -449,12 +576,16 @@ services:
       EAS_AVL: "200"
       EAS_NF_ID: 6b1d7e3c-0000-4000-8000-0000000471a3
       EAS_ARGS: ""
+      NEXTGCORE_NRF_TLS_CLIENT_CERT: /etc/nextgcore/certs/eas-cloud.crt
+      NEXTGCORE_NRF_TLS_CLIENT_KEY: /etc/nextgcore/certs/eas-cloud.key
+      NEXTGCORE_NRF_TLS_CA: /etc/nextgcore/certs/ca.crt
     entrypoint: ["sh", "/etc/d443a/eas-entry.sh"]
     command: []
     volumes:
       - ./configs/demo-d443a/eas-entry.sh:/etc/d443a/eas-entry.sh:ro
       - ./configs/demo-d443a/eas.yaml.in:/etc/d443a/eas.yaml.in:ro
       - d443a_cca:/var/lib/d443a/cca
+      - tls-eas-cloud:/etc/nextgcore/certs:ro
     networks:
       dn:
         ipv4_address: 10.60.0.13
@@ -465,6 +596,8 @@ services:
       retries: 3
       start_period: 5s
     depends_on:
+      sbi-tls:
+        condition: service_completed_successfully
       ees:
         condition: service_healthy
       upf:
@@ -513,6 +646,9 @@ services:
     environment:
       RUST_LOG: info,nr_ue=warn,nextgsim_ue::rrc=warn
       D443A_MODE: ${D443A_MODE:-measured-budget}
+      NEXTGCORE_NRF_TLS_CLIENT_CERT: /etc/nextgcore/certs/eec.crt
+      NEXTGCORE_NRF_TLS_CLIENT_KEY: /etc/nextgcore/certs/eec.key
+      NEXTGCORE_NRF_TLS_CA: /etc/nextgcore/certs/ca.crt
     entrypoint: ["sh", "/etc/d443a/ue-entry.sh"]
     command: []
     cap_add:
@@ -523,6 +659,7 @@ services:
       - ${NEXTGSIM_DIR:-../../../nextgsim}/config:/etc/nextgsim:ro
       - ./configs/demo-d443a/ue-entry.sh:/etc/d443a/ue-entry.sh:ro
       - d443a_cca:/var/lib/d443a/cca
+      - tls-eec:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.101
@@ -533,6 +670,8 @@ services:
       retries: 3
       start_period: 15s
     depends_on:
+      sbi-tls:
+        condition: service_completed_successfully
       gnb:
         condition: service_healthy
       eas-local:
@@ -556,5 +695,23 @@ networks:
           gateway: 10.60.0.1
 
 volumes:
+  # #1617: the dev SBI PKI. sbi_pki holds the CA key and is mounted by the
+  # sbi-tls service only; each tls-<name> holds one NF's certificate and key
+  # and is mounted by that NF only (certs/compose-tls-init.sh).
+  sbi_pki:
+  tls-nrf:
+  tls-ausf:
+  tls-udm:
+  tls-udr:
+  tls-pcf:
+  tls-nssf:
+  tls-bsf:
+  tls-amf:
+  tls-smf:
+  tls-ees-standin:
+  tls-eas-local:
+  tls-eas-regional:
+  tls-eas-cloud:
+  tls-eec:
   mongodb_data:
   d443a_cca:

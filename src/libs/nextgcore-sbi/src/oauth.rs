@@ -1769,6 +1769,45 @@ fn url_encode(s: &str) -> String {
     crate::uri_encode::encode_form_value(s)
 }
 
+/// Whether an NF presents NRF-issued access tokens on its outbound service
+/// requests (#1665): under the `production` SBI profile, or when the NF's own
+/// `<nf>.sbi.oauth2.require` knob (or `NEXTGCORE_SBI_OAUTH2_REQUIRE`) is set.
+///
+/// The production profile makes the AMF, AUSF, SMF and UDM require a bearer on
+/// every request (#63), and a consumer presents its token on each service request
+/// (TS 33.501 §13.4.1.1.2), so a production NF that installs its token client only
+/// under the knob is refused with 401 by those producers.
+pub fn outbound_oauth2_enabled(profile: crate::security::SbiProfile, required: bool) -> bool {
+    profile.is_production() || required
+}
+
+/// The process-wide outbound OAuth2 client an NF of type `nf_type` installs at
+/// startup (#1665), or `None` when [`outbound_oauth2_enabled`] is false or no NRF
+/// is configured (there is then no Authorization Server to ask).
+///
+/// One place for every NF, so the decision cannot drift between daemons the way
+/// it had: four installed the client under the production profile and eleven
+/// only under the knob. The client is built through [`OAuth2Client::new`], so the
+/// process-wide CCA signing key is seeded as usual, under this process's
+/// `nfInstanceId`.
+pub fn outbound_oauth2_client(
+    profile: crate::security::SbiProfile,
+    required: bool,
+    nrf_uri: Option<&str>,
+    nf_type: NfType,
+) -> Option<Arc<OAuth2Client>> {
+    if !outbound_oauth2_enabled(profile, required) {
+        return None;
+    }
+    let nrf_uri = nrf_uri.map(str::trim).filter(|u| !u.is_empty())?;
+    let nf_instance_id = crate::nf_instance_id::nf_instance_id(nf_type).to_string();
+    Some(Arc::new(OAuth2Client::new(
+        nrf_uri,
+        nf_instance_id,
+        nf_type,
+    )))
+}
+
 // ============================================================================
 // JWKS client (auth stage 4b): fetch + cache the NRF's public keys
 // ============================================================================
@@ -2017,6 +2056,29 @@ mod tests {
         let g = CCA_KEY_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         reset_cca_signing_key();
         g
+    }
+
+    /// #1665: the production profile alone installs the outbound token client;
+    /// the knob alone does too; neither leaves the NF token-free.
+    #[test]
+    fn the_production_profile_installs_the_outbound_oauth2_client_without_the_knob() {
+        use crate::security::SbiProfile;
+        let nrf = Some("http://nrf.example:7777");
+
+        let production = outbound_oauth2_client(SbiProfile::Production, false, nrf, NfType::Pcf)
+            .expect("production profile, knob off: the client must be installed");
+        assert_eq!(production.self_consumer().nf_type, NfType::Pcf);
+        assert_eq!(production.nrf_uri(), "http://nrf.example:7777");
+
+        let knob = outbound_oauth2_client(SbiProfile::Dev, true, nrf, NfType::Pcf)
+            .expect("dev profile, knob on: the client must be installed");
+        assert_eq!(knob.self_consumer().nf_type, NfType::Pcf);
+
+        assert!(outbound_oauth2_client(SbiProfile::Dev, false, nrf, NfType::Pcf).is_none());
+        assert!(
+            outbound_oauth2_client(SbiProfile::Production, true, Some("  "), NfType::Pcf).is_none(),
+            "no NRF configured: there is no Authorization Server to ask"
+        );
     }
 
     /// Issue #64 gaps 1+2: `mint_cca` must produce exactly the assertion the NRF

@@ -1004,7 +1004,11 @@ jobs:
           echo "=== Container status ==="
           docker compose ps
           echo "=== NRF health ==="
-          curl -sf http://172.23.0.10:7777/healthz || echo "NRF not responding"
+          # #1617: the NRF serves TLS (client_auth optional); probe it from its own
+          # container, which holds the CA (the runner does not: the PKI lives in
+          # the stack's volumes).
+          docker compose exec -T nrf curl -sf --cacert /etc/nextgcore/certs/ca.crt \
+            https://172.23.0.10:7777/healthz || echo "NRF not responding"
           echo "=== AMF health ==="
           curl -sf http://172.23.0.5:7777/healthz || echo "AMF not responding"
 
@@ -1034,6 +1038,47 @@ jobs:
             if $ok; then echo "$nf: /metrics up ($series)"; else echo "$nf: /metrics DOWN at $addr:9090"; failed=1; fi
           done
           exit $failed
+
+      # #1617 (step d): every NF reaches the NRF over TLS and presents its own
+      # certificate. POSITIVE half: each core NF type is REGISTERED at the NRF, which
+      # since this change serves only TLS, so the registration crossed the TLS
+      # listener. NEGATIVE half, which the positive cannot give: the NRF counts every
+      # NFRegister / NFUpdate (heartbeat) / NFDeregister whose caller presented no
+      # verified certificate identity (nrf_nf_management_unverified_total); it must
+      # stay 0, so no NF registered or heartbeated without its certificate. Read
+      # after the registrations, and again at the end of the bounded wait, so a
+      # heartbeat sent without a certificate is seen too.
+      - name: Every NF registers at the NRF over TLS with its certificate (#1617)
+        run: |
+          set -euo pipefail
+          want="AUSF UDM UDR PCF NSSF BSF AMF SMF"
+          m=""
+          for _ in $(seq 1 45); do
+            m="$(curl -sf --max-time 3 http://172.23.0.10:9090/metrics || true)"
+            missing=""
+            for t in $want; do
+              grep -Eq "^nrf_registered_nf_instances\{nf_type=\"$t\",nf_status=\"REGISTERED\"\} [1-9]" <<<"$m" \
+                || missing="$missing $t"
+            done
+            [ -z "$missing" ] && break
+            sleep 2
+          done
+          grep '^nrf_registered_nf_instances' <<<"$m" || true
+          if [ -n "$missing" ]; then
+            echo "::error::not REGISTERED at the NRF over TLS:$missing"
+            docker compose logs --tail=40 nrf; exit 1
+          fi
+          # Long enough for every NF to send heartbeats (NFUpdate PATCH) too.
+          sleep 15
+          m="$(curl -sf --max-time 3 http://172.23.0.10:9090/metrics)"
+          grep '^nrf_nf_management_unverified_total' <<<"$m" \
+            || { echo "::error::the NRF did not expose nrf_nf_management_unverified_total"; exit 1; }
+          n="$(awk '/^nrf_nf_management_unverified_total /{print $2}' <<<"$m")"
+          if [ "$n" != 0 ]; then
+            echo "::error::$n NF-management requests reached the NRF without a verified client certificate"
+            docker compose logs --tail=60 nrf; exit 1
+          fi
+          echo "all of $want REGISTERED over TLS; 0 unverified NF-management requests"
 
       # ====================================================================
       # Issue #397: the Namf_EventExposure DELIVERY assertion.
@@ -1071,16 +1116,14 @@ jobs:
       #
       # SCOPE. This stage asserts the REGISTRATION fire point
       # (REGISTRATION_STATE_REPORT, LOCATION_REPORT, ACCESS_TYPE_REPORT). The
-      # SERVICE REQUEST fire point (REACHABILITY_REPORT + LOCATION_REPORT from
-      # `handle_service_request_nas`) is asserted by the SECOND PHASE below,
+      # SERVICE REQUEST (`handle_service_request_nas`; what it owes a subscriber is
+      # set out at its assert step, #1734) is asserted by the SECOND PHASE below,
       # added by #403 -- which found that the "no control surface" blocker #403
       # was filed with is FALSE: `ue-suspend` on nextgsim's own gNB CLI reaches
       # RRC_INACTIVE, so no nextgsim change was needed.
       #
-      # TWO PROBE PROCESSES, not one subscribing to five types: LOCATION_REPORT
-      # fires at BOTH sites (deliberately -- TS 29.518 §6.2's trigger is "when
-      # AMF becomes aware of a location change", and it becomes aware at each),
-      # so one probe could not attribute it. The service-request phase subscribes
+      # TWO PROBE PROCESSES, not one: the two sites fire some of the same types,
+      # so one probe could not attribute them. The service-request phase subscribes
       # only after this phase has passed.
       # ====================================================================
       - name: Start the namf-evts notification sink and SUBSCRIBE (before any UE)
@@ -1611,8 +1654,34 @@ jobs:
         # (SUPI, `reachability == REACHABLE`, mcc 999 / mnc 70 / tac 0001) with NOTHING
         # delivered to the negative control. This is the assertion #403 exists to make,
         # and it can now fail the job. See the block comment above.
+        #
+        # #1734: what it asserts changed. The suspend is RAN-local, so this Service
+        # Request comes back on the live NG connection from the cell the UE registered
+        # in, and TS 29.518 owes it no notification: no location change, so no
+        # LOCATION_REPORT (§5.3.1, #1424), and no CM or reachability change (#1593).
+        # The REACHABILITY_REPORT that used to pass here was the subscription's own
+        # first report (#1641), not the Service Request's. The probe now asserts:
+        #   1. the current location, in the subscribe response (immediateFlag,
+        #      §5.3.2.2.2), with the gNB's TAI;
+        #   2. the first REACHABILITY_REPORT notification, REACHABLE, which proves
+        #      the callback is live;
+        #   3. NO LOCATION_REPORT notification for its whole window,
+        # and this step proves the Service Request fell inside that window: the probe
+        # must still be listening now, after the step above saw the Service Accept.
+        # The header of src/libs/nextgcore-sbi/examples/namf_event_probe.rs has the
+        # spec lines.
         run: |
           cd nextgcore/docker/rust
+          if docker compose exec -T smf sh -c 'cat /tmp/probe2.rc 2>/dev/null' \
+               | grep -qE '^[0-9]+'; then
+            echo "::error::the service-request probe had already exited when the Service \
+                  Accept was seen, so its window did not cover the Service Request and \
+                  its 'no LOCATION_REPORT' verdict would prove nothing. Its log:"
+            docker compose exec -T smf sh -c 'cat /tmp/probe2.log' || true
+            exit 1
+          fi
+          echo "the probe is still listening after the Service Accept: its window covers \
+                the Service Request"
           for _ in $(seq 1 130); do
             if docker compose exec -T smf sh -c 'cat /tmp/probe2.rc 2>/dev/null' \
                  | grep -qE '^[0-9]+'; then break; fi
@@ -1638,8 +1707,9 @@ jobs:
             docker compose logs --tail=120 amf
             exit 1
           fi
-          echo "the AMF delivered REACHABILITY_REPORT (REACHABLE) and LOCATION_REPORT \
-                from handle_service_request_nas, asserted on their bodies, against \
+          echo "the AMF answered the immediateFlag LOCATION_REPORT subscription with the \
+                UE's current location, delivered the first REACHABILITY_REPORT, and \
+                notified no LOCATION_REPORT for the same-cell Service Request, against \
                 nextgsim's real gNB and UE"
 
       - name: "Drive a gNB-initiated UE Context Release through the AMF (#451)"
@@ -1834,8 +1904,10 @@ jobs:
           # POSITIVELY below. `tee` keeps it in the log for a human too, and the
           # pipefail guard means the probe's own exit code still gates the step.
           set -o pipefail
+          # #1617: the token endpoint is on the NRF's TLS listener; the probe's
+          # OAuth2 client uses the AMF's NEXTGCORE_NRF_TLS_* (CA, amf.crt pair).
           docker compose $C exec -T amf /tmp/cca_token_probe \
-            http://172.23.0.10:7777 \
+            https://172.23.0.10:7777 \
             /var/lib/nextgcore/cca/amf-cca.key \
             6b1d7e3c-0000-4000-8000-000000000af0 \
             AMF UDM nudm-sdm | tee /tmp/probe-amf.log
@@ -1878,8 +1950,13 @@ jobs:
           # authentication failure — still fails the step.
           docker cp binaries/cca_token_probe nextgcore-nrf:/tmp/cca_token_probe
           docker compose $C exec -T --user root nrf chmod 0755 /tmp/cca_token_probe
-          docker compose $C exec -T -e CCA_PROBE_AUTH_ONLY=1 nrf /tmp/cca_token_probe \
-            http://172.23.0.10:7777 \
+          # #1617: over the NRF's TLS listener, with the NRF's own pair (nrf.crt
+          # names its pinned nfInstanceId).
+          docker compose $C exec -T -e CCA_PROBE_AUTH_ONLY=1 \
+            -e NEXTGCORE_NRF_TLS_CLIENT_CERT=/etc/nextgcore/certs/nrf.crt \
+            -e NEXTGCORE_NRF_TLS_CLIENT_KEY=/etc/nextgcore/certs/nrf.key \
+            nrf /tmp/cca_token_probe \
+            https://172.23.0.10:7777 \
             /var/lib/nextgcore/cca/nrf-cca.key \
             6b1d7e3c-0000-4000-8000-0000000000f0 \
             NRF UDM nudm-sdm

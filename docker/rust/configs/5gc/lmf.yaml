@@ -9,7 +9,7 @@ lmf:
         advertise: 172.23.0.32
         port: 7777
   nrf:
-    uri: http://172.23.0.10:7777
+    uri: https://172.23.0.10:7777
   # #103: cell/TRP reference coordinates. Every geometric solver reads these; with
   # none configured DetermineLocation is refused (it does not fabricate a fix), and
   # with fewer than three only E-CID is selectable however high the requested

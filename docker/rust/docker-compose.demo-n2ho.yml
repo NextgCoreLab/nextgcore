@@ -44,6 +44,10 @@ x-common: &common
     NEXTGCORE_SBI_PROFILE: "dev"
     TLS_ENABLED: "false"
     SBI_SCHEME: "http"
+    # NF -> NRF over TLS (#1617): the trust anchor every NRF client verifies the
+    # NRF against. Each mounts its own certificate volume tls-<name> at
+    # /etc/nextgcore/certs (the sbi-tls service fills it).
+    NEXTGCORE_NRF_TLS_CA: /etc/nextgcore/certs/ca.crt
 
 x-nf-healthcheck: &nf-healthcheck
   healthcheck:
@@ -54,6 +58,35 @@ x-nf-healthcheck: &nf-healthcheck
     start_period: 5s
 
 services:
+  # ==========================================================================
+  # SBI TLS (#1617): the certificate source. A one-shot service that issues
+  # the dev PKI (certs/generate-dev-certs.sh, from certs/nf-identities.txt)
+  # into sbi_pki, then gives each NRF client below its own volume tls-<name>
+  # with ca.crt, <name>.crt and <name>.key (0400, owned by that container's
+  # user). Every NRF client depends on it. No network.
+  # ==========================================================================
+  sbi-tls:
+    image: nextgcore-rust/nrf:latest
+    user: root
+    restart: "no"
+    network_mode: none
+    entrypoint: ["bash", "/opt/sbi-tls/compose-tls-init.sh"]
+    command: []
+    healthcheck:
+      disable: true
+    volumes:
+      - ./certs:/opt/sbi-tls:ro
+      - sbi_pki:/pki
+      - tls-nrf:/tls/nrf
+      - tls-ausf:/tls/ausf
+      - tls-udm:/tls/udm
+      - tls-udr:/tls/udr
+      - tls-pcf:/tls/pcf
+      - tls-nssf:/tls/nssf
+      - tls-bsf:/tls/bsf
+      - tls-amf:/tls/amf
+      - tls-smf:/tls/smf
+
   mongodb:
     image: mongo:6.0
     <<: *common
@@ -75,13 +108,20 @@ services:
   nrf:
     image: nextgcore-rust/nrf:latest
     <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+      # Pinned to the URN of certs/nrf.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_NRF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-0000000000f0
     command: ["-c", "/etc/nextgcore/nrf.yaml", "--sbi-addr", "0.0.0.0"]
     volumes:
       - ./configs/5gc/nrf.yaml:/etc/nextgcore/nrf.yaml:ro
+      - tls-nrf:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.10
     depends_on:
+      sbi-tls:
+        condition: service_completed_successfully
       mongodb:
         condition: service_healthy
 
@@ -92,13 +132,20 @@ services:
       <<: *common-env
       UDM_SBI_ADDR: 172.23.0.12
       UDM_SBI_PORT: "7777"
+      # Pinned to the URN of certs/ausf.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_AUSF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-00000000a05f
+      NEXTGCORE_NRF_TLS_CLIENT_CERT: /etc/nextgcore/certs/ausf.crt
+      NEXTGCORE_NRF_TLS_CLIENT_KEY: /etc/nextgcore/certs/ausf.key
     command: ["-c", "/etc/nextgcore/ausf.yaml"]
     volumes:
       - ./configs/5gc/ausf.yaml:/etc/nextgcore/ausf.yaml:ro
+      - tls-ausf:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.11
     depends_on:
+      sbi-tls:
+        condition: service_completed_successfully
       nrf:
         condition: service_healthy
       udm:
@@ -111,27 +158,43 @@ services:
       <<: *common-env
       UDR_SBI_ADDR: 172.23.0.20
       UDR_SBI_PORT: "7777"
+      # Pinned to the URN of certs/udm.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_UDM_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-000000000d10
+      NEXTGCORE_NRF_TLS_CLIENT_CERT: /etc/nextgcore/certs/udm.crt
+      NEXTGCORE_NRF_TLS_CLIENT_KEY: /etc/nextgcore/certs/udm.key
     command: ["-c", "/etc/nextgcore/udm.yaml"]
     volumes:
       - ./configs/5gc/udm.yaml:/etc/nextgcore/udm.yaml:ro
       - ./configs/5gc/hnet:/etc/nextgcore/hnet:ro
+      - tls-udm:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.12
     depends_on:
+      sbi-tls:
+        condition: service_completed_successfully
       nrf:
         condition: service_healthy
 
   udr:
     image: nextgcore-rust/udr:latest
     <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+      # Pinned to the URN of certs/udr.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_UDR_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-000000000d00
+      NEXTGCORE_NRF_TLS_CLIENT_CERT: /etc/nextgcore/certs/udr.crt
+      NEXTGCORE_NRF_TLS_CLIENT_KEY: /etc/nextgcore/certs/udr.key
     command: ["-c", "/etc/nextgcore/udr.yaml"]
     volumes:
       - ./configs/5gc/udr.yaml:/etc/nextgcore/udr.yaml:ro
+      - tls-udr:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.20
     depends_on:
+      sbi-tls:
+        condition: service_completed_successfully
       nrf:
         condition: service_healthy
       mongodb:
@@ -140,13 +203,22 @@ services:
   pcf:
     image: nextgcore-rust/pcf:latest
     <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+      # Pinned to the URN of certs/pcf.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_PCF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-000000000cf0
+      NEXTGCORE_NRF_TLS_CLIENT_CERT: /etc/nextgcore/certs/pcf.crt
+      NEXTGCORE_NRF_TLS_CLIENT_KEY: /etc/nextgcore/certs/pcf.key
     command: ["-c", "/etc/nextgcore/pcf.yaml"]
     volumes:
       - ./configs/5gc/pcf.yaml:/etc/nextgcore/pcf.yaml:ro
+      - tls-pcf:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.13
     depends_on:
+      sbi-tls:
+        condition: service_completed_successfully
       nrf:
         condition: service_healthy
       # #1457: pcfd opens its subscriber store at startup and refuses to start
@@ -157,26 +229,44 @@ services:
   nssf:
     image: nextgcore-rust/nssf:latest
     <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+      # Pinned to the URN of certs/nssf.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_NSSF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-0000000055f0
+      NEXTGCORE_NRF_TLS_CLIENT_CERT: /etc/nextgcore/certs/nssf.crt
+      NEXTGCORE_NRF_TLS_CLIENT_KEY: /etc/nextgcore/certs/nssf.key
     command: ["-c", "/etc/nextgcore/nssf.yaml"]
     volumes:
       - ./configs/5gc/nssf.yaml:/etc/nextgcore/nssf.yaml:ro
+      - tls-nssf:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.14
     depends_on:
+      sbi-tls:
+        condition: service_completed_successfully
       nrf:
         condition: service_healthy
 
   bsf:
     image: nextgcore-rust/bsf:latest
     <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+      # Pinned to the URN of certs/bsf.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_BSF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-000000000b0f
+      NEXTGCORE_NRF_TLS_CLIENT_CERT: /etc/nextgcore/certs/bsf.crt
+      NEXTGCORE_NRF_TLS_CLIENT_KEY: /etc/nextgcore/certs/bsf.key
     command: ["-c", "/etc/nextgcore/bsf.yaml"]
     volumes:
       - ./configs/5gc/bsf.yaml:/etc/nextgcore/bsf.yaml:ro
+      - tls-bsf:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.15
     depends_on:
+      sbi-tls:
+        condition: service_completed_successfully
       nrf:
         condition: service_healthy
 
@@ -197,14 +287,19 @@ services:
       UDM_SBI_PORT: "7777"
       PCF_SBI_ADDR: 172.23.0.13
       PCF_SBI_PORT: "7777"
+      NEXTGCORE_NRF_TLS_CLIENT_CERT: /etc/nextgcore/certs/amf.crt
+      NEXTGCORE_NRF_TLS_CLIENT_KEY: /etc/nextgcore/certs/amf.key
     # Every container interface, inside the private network only: no publish.
     command: ["-c", "/etc/nextgcore/amf.yaml", "--ngap-addr", "0.0.0.0:38412"]
     volumes:
       - ./configs/5gc/amf.yaml:/etc/nextgcore/amf.yaml:ro
+      - tls-amf:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.5
     depends_on:
+      sbi-tls:
+        condition: service_completed_successfully
       nrf:
         condition: service_healthy
       ausf:
@@ -228,13 +323,20 @@ services:
       SMF_SHUTDOWN_BUDGET_SECS: "43"
       UDM_SBI_ADDR: 172.23.0.12
       UDM_SBI_PORT: "7777"
+      # Pinned to the URN of certs/smf.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_SMF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-0000000005f0
+      NEXTGCORE_NRF_TLS_CLIENT_CERT: /etc/nextgcore/certs/smf.crt
+      NEXTGCORE_NRF_TLS_CLIENT_KEY: /etc/nextgcore/certs/smf.key
     command: ["-c", "/etc/nextgcore/smf.yaml"]
     volumes:
       - ./configs/5gc/smf.yaml:/etc/nextgcore/smf.yaml:ro
+      - tls-smf:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.4
     depends_on:
+      sbi-tls:
+        condition: service_completed_successfully
       nrf:
         condition: service_healthy
       pcf:
@@ -361,4 +463,17 @@ networks:
           gateway: 172.23.0.1
 
 volumes:
+  # #1617: the dev SBI PKI. sbi_pki holds the CA key and is mounted by the
+  # sbi-tls service only; each tls-<name> holds one NF's certificate and key
+  # and is mounted by that NF only (certs/compose-tls-init.sh).
+  sbi_pki:
+  tls-nrf:
+  tls-ausf:
+  tls-udm:
+  tls-udr:
+  tls-pcf:
+  tls-nssf:
+  tls-bsf:
+  tls-amf:
+  tls-smf:
   mongodb_data:

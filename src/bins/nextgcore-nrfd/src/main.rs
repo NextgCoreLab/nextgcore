@@ -1044,6 +1044,11 @@ fn registers_itself(require_oauth2: bool, require_server: bool) -> bool {
 /// The one lock for tests that add or remove the NRF's own entry in the
 /// process-global registry (#1644 review M1), declared beside the function that
 /// writes it: a test deregistering the entry raced one that needs it.
+///
+/// It also covers the dev PKI's NRF row (`docker/rust/certs/nf-identities.txt`,
+/// `...0000000000f0`), the NRF's own entry in the shipped stack: the #1617
+/// listener test registers it as the NRF's self client, and the dev-PKI test
+/// needs it absent (#1733: the two overlapped and saw each other's entry).
 #[cfg(test)]
 fn self_entry_test_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -11296,10 +11301,11 @@ mod server_tls_tests_1617 {
         }
     }
 
-    /// Every shipped NRF config still parses, and still serves h2c: this step
-    /// adds the switch, the deployments turn it on (#1617 step d).
+    /// Every shipped compose NRF config parses and serves TLS with client auth
+    /// optional, from the stack's own certificate volume (#1617 step d: the
+    /// one listener, a certificate requested but not required).
     #[test]
-    fn every_shipped_nrf_config_parses_and_keeps_tls_off_1617() {
+    fn every_shipped_nrf_config_serves_tls_with_optional_client_auth_1617() {
         let dir = repo_root().join("docker/rust/configs");
         let mut checked = 0;
         for sub in std::fs::read_dir(&dir).unwrap() {
@@ -11325,14 +11331,19 @@ mod server_tls_tests_1617 {
                     .and_then(|s| s.tls.as_ref());
                 assert_eq!(
                     resolve_server_tls(&TlsFlags::default(), env(&[]), tls).unwrap(),
-                    None,
+                    Some(NrfServerTls {
+                        cert: "/etc/nextgcore/certs/nrf.crt".into(),
+                        key: "/etc/nextgcore/certs/nrf.key".into(),
+                        ca: "/etc/nextgcore/certs/ca.crt".into(),
+                        client_auth: ClientAuth::Optional,
+                    }),
                     "{}",
                     f.display()
                 );
                 checked += 1;
             }
         }
-        assert!(checked >= 4, "found {checked} NRF configs");
+        assert!(checked >= 5, "found {checked} NRF configs");
     }
 
     fn repo_root() -> PathBuf {
@@ -11458,6 +11469,8 @@ mod server_tls_tests_1617 {
         let _g = nextgcore_sbi::nrf_tls::NRF_CLIENT_TLS_TEST_LOCK
             .lock()
             .await;
+        // It registers the dev PKI's NRF ID (#1733).
+        let _self_entry = self_entry_test_lock().lock().await;
         let pki = DevPki::generate("listener");
         let foreign = DevPki::generate("foreign");
         let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
@@ -11677,6 +11690,9 @@ mod dev_pki_tests_1617 {
     /// other-type PUT is 201.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn each_dev_certificate_registers_only_itself_over_mtls_1617() {
+        // The NRF row's ID is the one the #1617 listener test registers, and
+        // every row's ID must be absent here (#1733).
+        let _self_entry = self_entry_test_lock().lock().await;
         let pki = DevPki::generate("register");
         let ids = identities();
         let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();

@@ -217,6 +217,9 @@ pub mod pfcp_ie {
     pub const UPDATE_SRR: u16 = 213;
     pub const SESSION_REPORT: u16 = 214;
     pub const SRR_ID: u16 = 215;
+    /// Updated PDR in a Session Modification Response (TS 29.244 §7.5.5.5,
+    /// Table 8.1.2-1: 256), #1682.
+    pub const UPDATED_PDR: u16 = 256;
 }
 
 /// PFCPSMReq-Flags bit values (TS 29.244 8.2.50)
@@ -602,6 +605,18 @@ impl PfcpMessageBuilder {
         self.add_tlv(pfcp_ie::CREATED_PDR, &inner.build())
     }
 
+    /// Add an Updated PDR IE (TS 29.244 §7.5.5.5, #1682): the PDR ID and the
+    /// local F-TEID the UP function allocated for an Update PDR whose PDI asked
+    /// it to (CHOOSE).
+    pub fn add_updated_pdr(&mut self, updated_pdr: &CreatedPdr) -> &mut Self {
+        let mut inner = PfcpMessageBuilder::new();
+        inner.add_pdr_id(updated_pdr.pdr_id);
+        if let Some(ref f_teid) = updated_pdr.local_f_teid {
+            inner.add_f_teid(f_teid);
+        }
+        self.add_tlv(pfcp_ie::UPDATED_PDR, &inner.build())
+    }
+
     /// Add Usage Report IE (for Session Modification/Deletion Response)
     pub fn add_usage_report(&mut self, report: &UsageReport, ie_type: u16) -> &mut Self {
         let mut inner = PfcpMessageBuilder::new();
@@ -816,7 +831,7 @@ pub fn build_session_modification_response_with_reports(
     created_pdrs: &[CreatedPdr],
     usage_reports: &[UsageReport],
 ) -> Vec<u8> {
-    build_session_modification_response_full(msg_type, created_pdrs, usage_reports, &[])
+    build_session_modification_response_full(msg_type, created_pdrs, &[], usage_reports, &[])
 }
 
 /// Build Session Modification Response, also carrying the TSC Management
@@ -828,6 +843,7 @@ pub fn build_session_modification_response_with_reports(
 pub fn build_session_modification_response_full(
     msg_type: u8,
     created_pdrs: &[CreatedPdr],
+    updated_pdrs: &[CreatedPdr],
     usage_reports: &[UsageReport],
     tsc_management_info: &[nextgcore_pfcp::types::TscManagementInformation],
 ) -> Vec<u8> {
@@ -839,6 +855,11 @@ pub fn build_session_modification_response_full(
     // Created PDRs
     for pdr in created_pdrs {
         builder.add_created_pdr(pdr);
+    }
+
+    // Updated PDRs (#1682): the F-TEIDs chosen for Update PDRs.
+    for pdr in updated_pdrs {
+        builder.add_updated_pdr(pdr);
     }
 
     for report in usage_reports {

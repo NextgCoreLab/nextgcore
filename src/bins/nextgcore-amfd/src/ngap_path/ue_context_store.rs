@@ -991,6 +991,12 @@ impl NgapServer {
             );
             return None;
         };
+        // #1692: the restored 5G-TMSIs are in use before anything can allocate one:
+        // they were allocated before the restart, or by another AMF of the set.
+        crate::context::tmsi_registry_hold(
+            [state.amf_ue.current_guti.tmsi, state.amf_ue.next_guti.tmsi],
+            std::time::Instant::now(),
+        );
         self.ue_auth_state.insert(id, state);
         for s in &rec.sessions {
             self.sm_context_refs

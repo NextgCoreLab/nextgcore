@@ -26,6 +26,21 @@
 #
 # scp and sepp do not register with the NRF; their certificates still carry
 # a URN, which TS 33.310 §6.1.3c.4 / §6.1.3c.5.2 require of them too.
+#
+# After the base stack's rows: the other compose stacks' NRF clients. Each
+# dials the NRF over TLS with its own certificate, so each is a row, pinned
+# where its stack configures it. They are TLS clients of the NRF only (no SBI
+# server TLS), so they carry no address.
+#   nef               docker-compose.demo-d445a.yml (nefd --nrf-uri)
+#   nwdaf-mtlf/-anlf  docker-compose.demo-d441e.yml (--nf-instance-id)
+#   ees-standin       docker-compose.demo-d443a.yml: configs/demo-d443a/
+#                     ees-entry.sh registers the labelled stand-in profile with
+#                     the custom nfType EES (not a TS 29.510 NF type)
+#   eec, eas-*        docker-compose.demo-d443a.yml: the UE's EEC (ue-entry.sh)
+#                     and the three nr-she-eas sidecars (EAS_NF_ID), nextgsim
+#                     AFs that register at the NRF
+#   fl-af             docker-compose.demo-d445a.yml: nr-fl-server, the FL AF
+#                     (configs/demo-d445a/af.yaml)
 nrf     NRF     6b1d7e3c-0000-4000-8000-0000000000f0  172.23.0.10
 ausf    AUSF    6b1d7e3c-0000-4000-8000-00000000a05f  172.23.0.11
 udm     UDM     6b1d7e3c-0000-4000-8000-000000000d10  172.23.0.12
@@ -46,3 +61,12 @@ pin     AF      6b1d7e3c-0000-4000-8000-00000000014a  172.23.0.35
 dccf    DCCF    6b1d7e3c-0000-4000-8000-00000000dccf  172.23.0.36
 scp     SCP     6b1d7e3c-0000-4000-8000-000000005c90  172.23.0.37
 sepp    SEPP    6b1d7e3c-0000-4000-8000-00000005e990  172.23.0.38
+nef           NEF     6b1d7e3c-0000-4000-8000-000000000ef0  -
+nwdaf-mtlf    NWDAF   d441e000-0468-4000-8000-00000000f001  -
+nwdaf-anlf    NWDAF   d441e000-0468-4000-8000-00000000a001  -
+ees-standin   EES     6b1d7e3c-0000-4000-8000-00000000471e  -
+eec           AF      6b1d7e3c-0000-4000-8000-0000000471ec  -
+eas-local     AF      6b1d7e3c-0000-4000-8000-0000000471a1  -
+eas-regional  AF      6b1d7e3c-0000-4000-8000-0000000471a2  -
+eas-cloud     AF      6b1d7e3c-0000-4000-8000-0000000471a3  -
+fl-af         AF      6b1d7e3c-0000-4000-8000-00000000480a  -

@@ -450,6 +450,8 @@ async fn chain(mode: &'static str, anlf_id: &'static str) -> Chain {
     let anlf_port = anlf_listener.port();
     let mtlf_listener = nextgcore_sbi::test_support::bound_listener();
     let mtlf_port = mtlf_listener.port();
+    // A plaintext stand-in NRF: the dev profile, or #1617's NRF client dials https.
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
     let (nrf_srv, nrf_port) = nrf(anlf_id, anlf_port).await;
     let series = Some(SERIES_NF_INSTANCE);
     let mtlf_m = leak(

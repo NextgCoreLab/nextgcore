@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
-use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
+use nextgcore_sbi::client::SbiClient;
 use serde_json::Value;
 
 /// Kind of change subscription (which resource tree it watches).
@@ -1034,7 +1034,7 @@ pub fn post_notification(notify_uri: String, payload: Value) {
     };
     tokio::spawn(async move {
         let client = SbiClient::new(
-            SbiClientConfig::new(host, port)
+            nextgcore_sbi::security::sbi_peer_client_config(&host, port)
                 .with_connect_timeout(Duration::from_secs(2))
                 .with_request_timeout(Duration::from_secs(3)),
         );

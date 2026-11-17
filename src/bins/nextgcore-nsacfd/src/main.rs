@@ -21,7 +21,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
+use nextgcore_sbi::client::SbiClient;
 use nextgcore_sbi::context::global_context;
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
 use nextgcore_sbi::oauth::{JwksCache, OAuth2Client};
@@ -105,6 +105,22 @@ static OAUTH2_CLIENT: OnceLock<Option<Arc<OAuth2Client>>> = OnceLock::new();
 /// SBI clients attach tokens via [`attach_oauth2`].
 fn oauth2_client() -> Option<Arc<OAuth2Client>> {
     OAUTH2_CLIENT.get().and_then(|opt| opt.clone())
+}
+
+/// #1665: the outbound OAuth2 client this NSACF installs at startup: under the
+/// `production` SBI profile or the `sbi.oauth2.require` knob, when an NRF is
+/// configured (see [`nextgcore_sbi::oauth::outbound_oauth2_client`]).
+fn outbound_oauth2_client(
+    profile: nextgcore_sbi::security::SbiProfile,
+    require_oauth2: bool,
+    nrf_uri: Option<&str>,
+) -> Option<Arc<OAuth2Client>> {
+    nextgcore_sbi::oauth::outbound_oauth2_client(
+        profile,
+        require_oauth2,
+        nrf_uri,
+        nextgcore_sbi::types::NfType::Nsacf,
+    )
 }
 
 /// Attach the process-wide OAuth2 client (when enforcement is on) so the
@@ -360,6 +376,14 @@ async fn main() -> Result<()> {
         sbi_server_config = sbi_server_config.with_tls(key, cert);
         log::info!("TLS enabled: cert={cert}, key={key}");
     }
+    // #1665: the outbound token client follows the SBI security profile as well
+    // as the knob. The production profile's AMF/AUSF/SMF/UDM demand a token on
+    // every service request (TS 33.501 §13.4.1.1.2), whatever this listener asks.
+    let _ = OAUTH2_CLIENT.set(outbound_oauth2_client(
+        nextgcore_sbi::security::SbiProfile::resolve(),
+        require_oauth2,
+        nrf_uri_cfg.as_deref(),
+    ));
     if require_oauth2 {
         // Server side (TS 33.501 §13.4.1): verify incoming Bearer tokens
         // against the NRF's JWKS and require the token's `aud` to include this
@@ -371,16 +395,6 @@ async fn main() -> Result<()> {
             .map(|uri| JwksCache::for_nrf(uri).jwks_uri().to_string());
         sbi_server_config = sbi_server_config.with_expected_audience_nf_type(NfType::Nsacf);
 
-        // Client side (T1.1): install the process-wide OAuth2 client so
-        // outbound SBI calls acquire and attach an NRF-issued Bearer token.
-        if let Some(nrf_uri) = nrf_uri_cfg.as_deref() {
-            let oauth2 = Arc::new(OAuth2Client::new(
-                nrf_uri,
-                nf_instance_id.clone(),
-                NfType::Nsacf,
-            ));
-            let _ = OAUTH2_CLIENT.set(Some(oauth2));
-        }
         log::info!(
             "OAuth2 enforcement enabled (JWKS: {})",
             sbi_server_config
@@ -2212,7 +2226,7 @@ async fn deliver_notification(notification_uri: String, body: serde_json::Value)
         return;
     };
     let client = SbiClient::new(
-        SbiClientConfig::new(host, port)
+        nextgcore_sbi::security::sbi_peer_client_config(&host, port)
             .with_connect_timeout(NOTIFY_CONNECT_TIMEOUT)
             .with_request_timeout(NOTIFY_REQUEST_TIMEOUT),
     );
@@ -3174,6 +3188,9 @@ nsacf:
     /// from the same `nfId` is not re-notified.
     #[tokio::test]
     async fn subscribe_time_dispatches_actually_arrive_at_the_consumer() {
+        // #1666: the notification client follows the SBI profile, and this
+        // drives it at a loopback plaintext peer, i.e. a dev deployment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (server, port, _ctx_guard) = start_nsacf_server().await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
 
@@ -3371,6 +3388,9 @@ nsacf:
 
     #[tokio::test]
     async fn test_http_slice_ee_subscription_and_eac_notification() {
+        // #1666: the notification client follows the SBI profile, and this
+        // drives it at a loopback plaintext peer, i.e. a dev deployment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (server, port, _ctx_guard) = start_nsacf_server().await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
 
@@ -5117,5 +5137,34 @@ mod tests_nf_profile_host_kind_1324 {
                 nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
             assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
         }
+    }
+}
+
+/// #1665: the outbound OAuth2 client follows the SBI security profile.
+#[cfg(test)]
+mod outbound_oauth2_1665_tests {
+    use nextgcore_sbi::security::SbiProfile;
+    use nextgcore_sbi::types::NfType;
+
+    const NRF: &str = "http://127.0.0.10:7777";
+
+    /// Under the `production` profile this NSACF installs its token client with
+    /// the `sbi.oauth2.require` knob off, so its service requests to the AMF, AUSF,
+    /// SMF and UDM (which require a bearer under that profile, #63) carry one
+    /// (TS 33.501 §13.4.1.1.2). Before #1665 it installed it only under the knob.
+    #[test]
+    fn the_production_profile_installs_the_outbound_oauth2_client_without_the_knob() {
+        let oauth2 = super::outbound_oauth2_client(SbiProfile::Production, false, Some(NRF))
+            .expect("production profile, knob off: the outbound OAuth2 client is installed");
+        assert_eq!(oauth2.self_consumer().nf_type, NfType::Nsacf);
+        assert_eq!(oauth2.nrf_uri(), NRF);
+        assert!(
+            super::outbound_oauth2_client(SbiProfile::Dev, true, Some(NRF)).is_some(),
+            "dev profile, knob on: the client is installed"
+        );
+        assert!(
+            super::outbound_oauth2_client(SbiProfile::Dev, false, Some(NRF)).is_none(),
+            "dev profile, knob off: no client, the token-free path is unchanged"
+        );
     }
 }

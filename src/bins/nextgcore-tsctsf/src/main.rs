@@ -74,6 +74,22 @@ pub use context::*;
 static OAUTH2_CLIENT: std::sync::OnceLock<Option<Arc<nextgcore_sbi::oauth::OAuth2Client>>> =
     std::sync::OnceLock::new();
 
+/// #1665: the outbound OAuth2 client this TSCTSF installs at startup: under the
+/// `production` SBI profile or the `sbi.oauth2.require` knob, when an NRF is
+/// configured (see [`nextgcore_sbi::oauth::outbound_oauth2_client`]).
+fn outbound_oauth2_client(
+    profile: nextgcore_sbi::security::SbiProfile,
+    require_oauth2: bool,
+    nrf_uri: Option<&str>,
+) -> Option<Arc<nextgcore_sbi::oauth::OAuth2Client>> {
+    nextgcore_sbi::oauth::outbound_oauth2_client(
+        profile,
+        require_oauth2,
+        nrf_uri,
+        nextgcore_sbi::types::NfType::Tsctsf,
+    )
+}
+
 /// NextGCore TSCTSF - Time Sensitive Communication and Time Synchronization Function
 #[derive(Parser, Debug)]
 #[command(name = "nextgcore-tsctsf")]
@@ -162,16 +178,6 @@ fn apply_oauth2_enforcement(mut cfg: SbiServerConfig, nrf_uri: &str) -> SbiServe
             .to_string()
     });
     cfg = cfg.with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Tsctsf);
-    if let Some(u) = uri {
-        let nf_instance_id =
-            nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Tsctsf)
-                .to_string();
-        let _ = OAUTH2_CLIENT.set(Some(Arc::new(nextgcore_sbi::oauth::OAuth2Client::new(
-            u,
-            nf_instance_id,
-            nextgcore_sbi::types::NfType::Tsctsf,
-        ))));
-    }
     log::info!(
         "OAuth2 enforcement enabled (JWKS: {})",
         cfg.oauth2_jwks_uri.as_deref().unwrap_or("UNCONFIGURED")
@@ -247,7 +253,16 @@ async fn main() -> Result<()> {
             .unwrap_or("/etc/nextgcore/tls/server.key");
         sbi_server_config = sbi_server_config.with_tls(key, cert);
     }
-    if oauth2_required(&args.config) {
+    let require_oauth2 = oauth2_required(&args.config);
+    // #1665: the outbound token client follows the SBI security profile as well
+    // as the knob. The production profile's AMF/AUSF/SMF/UDM demand a token on
+    // every service request (TS 33.501 §13.4.1.1.2), whatever this listener asks.
+    let _ = OAUTH2_CLIENT.set(outbound_oauth2_client(
+        nextgcore_sbi::security::SbiProfile::resolve(),
+        require_oauth2,
+        Some(&args.nrf_uri),
+    ));
+    if require_oauth2 {
         sbi_server_config = apply_oauth2_enforcement(sbi_server_config, &args.nrf_uri);
     }
 
@@ -2751,5 +2766,34 @@ mod tests_nf_profile_host_kind_1324 {
                 nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
             assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
         }
+    }
+}
+
+/// #1665: the outbound OAuth2 client follows the SBI security profile.
+#[cfg(test)]
+mod outbound_oauth2_1665_tests {
+    use nextgcore_sbi::security::SbiProfile;
+    use nextgcore_sbi::types::NfType;
+
+    const NRF: &str = "http://127.0.0.10:7777";
+
+    /// Under the `production` profile this TSCTSF installs its token client with
+    /// the `sbi.oauth2.require` knob off, so its service requests to the AMF, AUSF,
+    /// SMF and UDM (which require a bearer under that profile, #63) carry one
+    /// (TS 33.501 §13.4.1.1.2). Before #1665 it installed it only under the knob.
+    #[test]
+    fn the_production_profile_installs_the_outbound_oauth2_client_without_the_knob() {
+        let oauth2 = super::outbound_oauth2_client(SbiProfile::Production, false, Some(NRF))
+            .expect("production profile, knob off: the outbound OAuth2 client is installed");
+        assert_eq!(oauth2.self_consumer().nf_type, NfType::Tsctsf);
+        assert_eq!(oauth2.nrf_uri(), NRF);
+        assert!(
+            super::outbound_oauth2_client(SbiProfile::Dev, true, Some(NRF)).is_some(),
+            "dev profile, knob on: the client is installed"
+        );
+        assert!(
+            super::outbound_oauth2_client(SbiProfile::Dev, false, Some(NRF)).is_none(),
+            "dev profile, knob off: no client, the token-free path is unchanged"
+        );
     }
 }
