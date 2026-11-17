@@ -10371,6 +10371,195 @@ mod registrant_binding_tests_1611 {
     }
 }
 
+/// #1617 step 1: the shipped dev PKI (`docker/rust/certs/generate-dev-certs.sh`)
+/// issues every NF a certificate the NRF can verify a registrant by. Run the
+/// real script, then drive the real NRF handler behind a mutual-TLS listener
+/// with each issued certificate.
+#[cfg(test)]
+mod dev_pki_tests_1617 {
+    use super::*;
+    use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
+    use serde_json::json;
+    use std::path::{Path, PathBuf};
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .canonicalize()
+            .expect("repo root")
+    }
+
+    /// (cert name, nfType, nfInstanceId) rows of `nf-identities.txt`.
+    fn identities() -> Vec<(String, String, String)> {
+        let path = repo_root().join("docker/rust/certs/nf-identities.txt");
+        let text = std::fs::read_to_string(&path).expect("identity table");
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                assert!(f.len() >= 3, "malformed identity row {l:?}");
+                (f[0].to_string(), f[1].to_string(), f[2].to_string())
+            })
+            .collect()
+    }
+
+    /// The script's output, in a directory removed when this is dropped (it
+    /// holds private keys).
+    struct DevPki(PathBuf);
+
+    impl DevPki {
+        fn generate(tag: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("nrfd-1617-pki-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let pki = DevPki(dir);
+            let script = repo_root().join("docker/rust/certs/generate-dev-certs.sh");
+            let out = std::process::Command::new("bash")
+                .arg(&script)
+                .arg("--out")
+                .arg(&pki.0)
+                .output()
+                .expect("run generate-dev-certs.sh (needs bash and openssl)");
+            assert!(
+                out.status.success(),
+                "generate-dev-certs.sh failed: {}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            pki
+        }
+
+        fn file(&self, name: &str) -> String {
+            self.0.join(name).display().to_string()
+        }
+    }
+
+    impl Drop for DevPki {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Every issued certificate carries `urn:uuid:<nfInstanceId>` and RFC 9310
+    /// NFTypes `[nfType]` from its table row (TS 33.310 §6.1.3c.3), as the
+    /// NRF's own certificate parser reads them.
+    ///
+    /// REVERT-VERIFIED: with the pre-#1617 script (DNS SANs only) every
+    /// certificate yields no NF instance ID and no NF types.
+    #[test]
+    fn every_dev_certificate_names_its_nf_instance_and_type_1617() {
+        let pki = DevPki::generate("profile");
+        let ids = identities();
+        assert!(ids.len() >= 10, "the table covers the stack: {ids:?}");
+        for (name, nf_type, id) in ids {
+            let der = nextgcore_sbi::tls::load_certs(&pki.file(&format!("{name}.crt")))
+                .expect("issued certificate")
+                .remove(0);
+            assert_eq!(
+                nextgcore_sbi::peer_cert::nf_instance_id_from_der(&der).as_deref(),
+                Some(id.as_str()),
+                "{name}.crt URI SAN"
+            );
+            assert_eq!(
+                nextgcore_sbi::peer_cert::nf_types_from_der(&der),
+                vec![nf_type.clone()],
+                "{name}.crt NFTypes"
+            );
+        }
+    }
+
+    /// Over real mutual TLS, with the NRF serving `nrf.crt`, each NF's
+    /// certificate is accepted as a TLS client and registers, heartbeats and
+    /// deregisters its own nfInstanceId as its own nfType (201 / 200 / 204),
+    /// and is refused 400 INVALID_CLIENT for another NF's ID or as another
+    /// nfType (#1611 binding).
+    ///
+    /// REVERT-VERIFIED: with the pre-#1617 script, the certificates have
+    /// `extendedKeyUsage = serverAuth` only and the handshake fails as a TLS
+    /// client; with no URN, the other-ID PUT is 201; with no NFTypes, the
+    /// other-type PUT is 201.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn each_dev_certificate_registers_only_itself_over_mtls_1617() {
+        let pki = DevPki::generate("register");
+        let ids = identities();
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let mut cfg =
+            NextgcoreSbiServerConfig::new(addr).with_tls(pki.file("nrf.key"), pki.file("nrf.crt"));
+        cfg.verify_client = true;
+        cfg.verify_client_cacert = Some(pki.file("ca.crt"));
+        let server = SbiServer::on_listener(cfg, listener);
+        server
+            .start(nrf_sbi_request_handler)
+            .await
+            .expect("NRF starts with the dev nrf.crt");
+        let run = async {
+            for (i, (name, nf_type, id)) in ids.iter().enumerate() {
+                let mut client_cfg = SbiClientConfig::new("localhost", addr.port()).with_https();
+                client_cfg.ca_cert = Some(pki.file("ca.crt"));
+                client_cfg.client_cert = Some(pki.file(&format!("{name}.crt")));
+                client_cfg.client_key = Some(pki.file(&format!("{name}.key")));
+                let client = SbiClient::new(client_cfg);
+                let profile = |id: &str| {
+                    json!({
+                        "nfInstanceId": id,
+                        "nfType": nf_type,
+                        "nfStatus": "REGISTERED",
+                        "heartBeatTimer": 10,
+                        "ipv4Addresses": ["10.16.17.1"]
+                    })
+                };
+
+                // Another row's ID: the certificate does not name it.
+                let (_, _, other) = &ids[(i + 1) % ids.len()];
+                let resp = client
+                    .put_json(
+                        &format!("/nnrf-nfm/v1/nf-instances/{other}"),
+                        &profile(other),
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("{name}: PUT over mTLS: {e}"));
+                assert_eq!(resp.status, 400, "{name} registering {other}");
+                assert!(
+                    nf_manager().get(other).is_none(),
+                    "{name}: {other} not stored"
+                );
+
+                // Its own ID as a type the certificate's NFTypes do not name.
+                let mut retyped = profile(id);
+                retyped["nfType"] = json!(if nf_type == "UDM" { "UDR" } else { "UDM" });
+                let resp = client
+                    .put_json(&format!("/nnrf-nfm/v1/nf-instances/{id}"), &retyped)
+                    .await
+                    .expect("PUT completes");
+                assert_eq!(resp.status, 400, "{name} registering as another type");
+                assert!(nf_manager().get(id).is_none(), "{name}: not stored");
+
+                let resp = client
+                    .put_json(&format!("/nnrf-nfm/v1/nf-instances/{id}"), &profile(id))
+                    .await
+                    .expect("PUT completes");
+                assert_eq!(resp.status, 201, "{name}: {:?}", resp.http.content);
+                let req = SbiRequest::patch(format!("/nnrf-nfm/v1/nf-instances/{id}")).with_body(
+                    json!([{"op": "replace", "path": "/nfStatus", "value": "REGISTERED"}])
+                        .to_string(),
+                    "application/json-patch+json",
+                );
+                let resp = client.send_request(req).await.expect("PATCH completes");
+                assert_eq!(resp.status, 200, "{name}: {:?}", resp.http.content);
+                let resp = client
+                    .delete(&format!("/nnrf-nfm/v1/nf-instances/{id}"))
+                    .await
+                    .expect("DELETE completes");
+                assert_eq!(resp.status, 204, "{name}: {:?}", resp.http.content);
+            }
+        };
+        let outcome = tokio::time::timeout(Duration::from_secs(60), run).await;
+        server.stop().await.ok();
+        outcome.expect("dev PKI registrations finish");
+    }
+}
+
 /// #1633: TS 29.510 §5.2.2.2.2: an NF Instance ID UUID in upper case is handled as
 /// if it were lower case. One NF, however its ID is cased, is one registry entry.
 #[cfg(test)]
