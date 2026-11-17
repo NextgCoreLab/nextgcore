@@ -178,6 +178,22 @@ fn oauth2_client() -> Option<Arc<nextgcore_sbi::oauth::OAuth2Client>> {
     OAUTH2_CLIENT.get().and_then(|opt| opt.clone())
 }
 
+/// #1665: the outbound OAuth2 client this NWDAF installs at startup: under the
+/// `production` SBI profile or the `sbi.oauth2.require` knob, when an NRF is
+/// configured (see [`nextgcore_sbi::oauth::outbound_oauth2_client`]).
+fn outbound_oauth2_client(
+    profile: nextgcore_sbi::security::SbiProfile,
+    require_oauth2: bool,
+    nrf_uri: Option<&str>,
+) -> Option<Arc<nextgcore_sbi::oauth::OAuth2Client>> {
+    nextgcore_sbi::oauth::outbound_oauth2_client(
+        profile,
+        require_oauth2,
+        nrf_uri,
+        nextgcore_sbi::types::NfType::Nwdaf,
+    )
+}
+
 /// Parse the opt-in `sbi.oauth2.require` knob (Wave-6 H8). Default false so the
 /// matched-sim path is untouched. Honors `NEXTGCORE_SBI_OAUTH2_REQUIRE` first
 /// (overlay-friendly), then the yaml `<nf>.sbi.oauth2.require` (root-key
@@ -285,8 +301,8 @@ fn sbi_server(cfg: NextgcoreSbiServerConfig) -> SbiServer {
     SbiServer::new(cfg.with_oauth2_callback_exemptions(oauth2_callback_exemptions()))
 }
 
-/// Apply OAuth2 producer enforcement to `cfg` and install the outbound OAuth2
-/// client (Wave-6 H8). The server verifies incoming Bearer tokens against the
+/// Apply OAuth2 producer enforcement to `cfg` (Wave-6 H8). The outbound client
+/// is installed apart from it, by [`outbound_oauth2_client`] (#1665). The server verifies incoming Bearer tokens against the
 /// NRF JWKS and requires `aud` to include NfType::Nwdaf; with no NRF URI it
 /// fails closed (503). `nrf_uri` empty ⇒ unconfigured ⇒ fail-closed.
 fn apply_oauth2_enforcement(
@@ -301,16 +317,6 @@ fn apply_oauth2_enforcement(
             .to_string()
     });
     cfg = cfg.with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Nwdaf);
-    if let Some(u) = uri {
-        let nf_instance_id =
-            nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Nwdaf)
-                .to_string();
-        let _ = OAUTH2_CLIENT.set(Some(Arc::new(nextgcore_sbi::oauth::OAuth2Client::new(
-            u,
-            nf_instance_id,
-            nextgcore_sbi::types::NfType::Nwdaf,
-        ))));
-    }
     log::info!(
         "OAuth2 enforcement enabled (JWKS: {})",
         cfg.oauth2_jwks_uri.as_deref().unwrap_or("UNCONFIGURED")
@@ -576,7 +582,16 @@ async fn main() -> Result<()> {
             .unwrap_or("/etc/nextgcore/tls/server.key");
         sbi_server_config = sbi_server_config.with_tls(key, cert);
     }
-    if oauth2_required(&args.config) {
+    let require_oauth2 = oauth2_required(&args.config);
+    // #1665: the outbound token client follows the SBI security profile as well
+    // as the knob. The production profile's AMF/AUSF/SMF/UDM demand a token on
+    // every service request (TS 33.501 §13.4.1.1.2), whatever this listener asks.
+    let _ = OAUTH2_CLIENT.set(outbound_oauth2_client(
+        nextgcore_sbi::security::SbiProfile::resolve(),
+        require_oauth2,
+        Some(&args.nrf_uri),
+    ));
+    if require_oauth2 {
         sbi_server_config = apply_oauth2_enforcement(sbi_server_config, &args.nrf_uri);
     }
     // #1421: the callbacks this NWDAF subscribed for are admitted on their own
@@ -3077,5 +3092,34 @@ mod callback_oauth2_1421_tests {
         assert_eq!(status(&client, post(&"0".repeat(32))).await, 401);
         assert_eq!(status(&client, post(token)).await, 204);
         server.stop().await.expect("stop");
+    }
+}
+
+/// #1665: the outbound OAuth2 client follows the SBI security profile.
+#[cfg(test)]
+mod outbound_oauth2_1665_tests {
+    use nextgcore_sbi::security::SbiProfile;
+    use nextgcore_sbi::types::NfType;
+
+    const NRF: &str = "http://127.0.0.10:7777";
+
+    /// Under the `production` profile this NWDAF installs its token client with
+    /// the `sbi.oauth2.require` knob off, so its service requests to the AMF, AUSF,
+    /// SMF and UDM (which require a bearer under that profile, #63) carry one
+    /// (TS 33.501 §13.4.1.1.2). Before #1665 it installed it only under the knob.
+    #[test]
+    fn the_production_profile_installs_the_outbound_oauth2_client_without_the_knob() {
+        let oauth2 = super::outbound_oauth2_client(SbiProfile::Production, false, Some(NRF))
+            .expect("production profile, knob off: the outbound OAuth2 client is installed");
+        assert_eq!(oauth2.self_consumer().nf_type, NfType::Nwdaf);
+        assert_eq!(oauth2.nrf_uri(), NRF);
+        assert!(
+            super::outbound_oauth2_client(SbiProfile::Dev, true, Some(NRF)).is_some(),
+            "dev profile, knob on: the client is installed"
+        );
+        assert!(
+            super::outbound_oauth2_client(SbiProfile::Dev, false, Some(NRF)).is_none(),
+            "dev profile, knob off: no client, the token-free path is unchanged"
+        );
     }
 }

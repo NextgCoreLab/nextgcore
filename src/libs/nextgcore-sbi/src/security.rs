@@ -2134,6 +2134,53 @@ mod audience_binding_guards {
         );
     }
 
+    /// #1665: the eleven NFs that used to install their outbound OAuth2 client only
+    /// under the `sbi.oauth2.require` knob now install it through
+    /// `outbound_oauth2_client` with the RESOLVED profile, so the production profile
+    /// alone gives them tokens. Each NF's own test pins its wrapper; this pins the
+    /// one argument those tests cannot reach, the profile `main` passes.
+    #[test]
+    fn every_nf_installs_its_outbound_oauth2_client_under_the_resolved_profile() {
+        let bins = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("crate is at <root>/libs/nextgcore-sbi")
+            .join("bins");
+        let files = [
+            "nextgcore-bsfd/src/lib.rs",
+            "nextgcore-dccfd/src/main.rs",
+            "nextgcore-lmfd/src/main.rs",
+            "nextgcore-mbsmfd/src/main.rs",
+            "nextgcore-nsacfd/src/main.rs",
+            "nextgcore-nssfd/src/main.rs",
+            "nextgcore-nwdafd/src/main.rs",
+            "nextgcore-pcfd/src/app.rs",
+            "nextgcore-tsctsf/src/main.rs",
+            "nextgcore-ucmfd/src/main.rs",
+            "nextgcore-udrd/src/main.rs",
+        ];
+        for rel in files {
+            let path = bins.join(rel);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let call =
+                "outbound_oauth2_client(\n        nextgcore_sbi::security::SbiProfile::resolve(),";
+            assert_eq!(
+                text.matches(call).count(),
+                1,
+                "{rel} must install its outbound OAuth2 client exactly once, with \
+                 SbiProfile::resolve(): under the production profile the AMF, AUSF, SMF \
+                 and UDM refuse a token-less service request (#1665)"
+            );
+            assert!(
+                !text.contains("OAUTH2_CLIENT.set(Some(Arc::new(")
+                    && !text.contains("OAUTH2_CLIENT.set(Arc::new("),
+                "{rel} installs an OAuth2Client it built itself; install it through \
+                 nextgcore_sbi::oauth::outbound_oauth2_client so the profile decides (#1665)"
+            );
+        }
+    }
+
     /// Issue #64 gaps 1+2: every NF acquires its OAuth2 client through
     /// `OAuth2Client::new`, which is where the process-wide CCA signing key is
     /// seeded — so a deployment turns on client authentication in ONE place.

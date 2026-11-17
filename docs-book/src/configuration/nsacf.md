@@ -50,7 +50,7 @@ These are the fields actually deserialized by the daemon (`#[derive(Deserialize)
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `nsacf.nrf.uri` | string | falls back to CLI `--nrf-uri` (`http://127.0.0.1:7777`) | NRF base URI for NF registration, heartbeat, and (when OAuth2 is on) token issuance/JWKS. |
-| `nsacf.sbi.oauth2.require` | bool | `false` | SBI OAuth2 bearer-token enforcement. When `true`, incoming requests must carry an NRF-issued token with audience `NSACF` (verified against the NRF JWKS, TS 33.501 §13.4.1 per code comment) and outbound SBI calls attach tokens. Default off so the dev/E2E path works without tokens. Overridden by CLI `--oauth2-require`. |
+| `nsacf.sbi.oauth2.require` | bool | `false` | SBI OAuth2 bearer-token enforcement. When `true`, incoming requests must carry an NRF-issued token with audience `NSACF` (verified against the NRF JWKS, TS 33.501 §13.4.1 per code comment) and outbound SBI calls attach tokens. Default off so the dev/E2E path works without tokens. Overridden by CLI `--oauth2-require`. The outbound token client is also installed, with the knob off, under the `production` SBI profile (#1665; see [Configuration Overview](./overview.md)). |
 | `nsacf.slice_quotas` | list | *(none — see below)* | Local NSAC provisioning (TS 29.536 §6.1.3.4 per code comment). If omitted, the NSACF starts with an **empty quota table and rejects every admission request** with `SLICE_NOT_AVAILABLE`. |
 | `nsacf.slice_quotas[].sst` | u8 | **required** | Slice/Service Type of the S-NSSAI. |
 | `nsacf.slice_quotas[].sd` | string | absent (no SD) | Slice Differentiator as a 6-hex-digit string (TS 23.003 §28.4.2 form, e.g. `"000000"`). |
