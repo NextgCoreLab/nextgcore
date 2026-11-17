@@ -1775,7 +1775,7 @@ pub async fn pcf_discover_udrs(
         return Ok(Vec::new());
     };
     if let Some(nrf_uri) = nrf_uri {
-        remember_udr_from_search(&nrf_uri, &json);
+        note_udr_search(&nrf_uri, &json);
     }
     Ok(json
         .get("nfInstances")
@@ -1906,6 +1906,9 @@ pub enum UdrError {
     /// #1621 review round 2: the NRF reports the remembered UDR SUSPENDED or
     /// UNDISCOVERABLE.
     Unavailable(String),
+    /// #1639: the NRF did not answer, no UDR is known, and
+    /// `pcf.policy.udr_required` is true.
+    Unknown(String),
     /// Anything else: the NRF discovery failed, or the UDR's answer could not be
     /// read.
     Other(String),
@@ -1915,7 +1918,10 @@ impl std::fmt::Display for UdrError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             UdrError::Status(s) => write!(f, "nudr-dr GET returned status {s}"),
-            UdrError::NoAnswer(e) | UdrError::Unavailable(e) | UdrError::Other(e) => f.write_str(e),
+            UdrError::NoAnswer(e)
+            | UdrError::Unavailable(e)
+            | UdrError::Unknown(e)
+            | UdrError::Other(e) => f.write_str(e),
         }
     }
 }
@@ -2002,8 +2008,46 @@ pub(crate) fn remember_udr(
     });
 }
 
+/// The NRF whose last answer was that no UDR is deployed (#1639): it listed none
+/// while nothing was remembered, or the remembered UDR's NFProfile is gone
+/// (#1653). That answer is a basis for the local default when the NRF later fails,
+/// whatever `pcf.policy.udr_required` says. Set and cleared with [`UDR_CACHE`]
+/// (one of the two holds at a time), cleared by [`forget_udr`]; serialised in
+/// tests by `test_support::CONTEXT_GUARD`, as [`UDR_CACHE`] is.
+static NRF_SAID_NO_UDR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Record that `nrf_uri` answered that no UDR is deployed (#1639).
+fn note_no_udr(nrf_uri: &str) {
+    *NRF_SAID_NO_UDR.lock().unwrap_or_else(|e| e.into_inner()) = Some(nrf_uri.to_string());
+}
+
+/// Whether `nrf_uri`'s last answer was that no UDR is deployed (#1639).
+fn nrf_said_no_udr(nrf_uri: &str) -> bool {
+    NRF_SAID_NO_UDR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_deref()
+        == Some(nrf_uri)
+}
+
+/// Record what a UDR SearchResult `json` from `nrf_uri` says, and return the UDR
+/// it lists first (#1621 review M1, #1639):
+/// - one listed: remembered ([`remember_udr_from_search`]);
+/// - none listed, nothing remembered: the NRF says no UDR is deployed
+///   ([`note_no_udr`]);
+/// - none listed while a UDR is remembered: nothing recorded. That UDR may be
+///   SUSPENDED rather than gone; the create path's NFProfile check decides.
+fn note_udr_search(nrf_uri: &str, json: &serde_json::Value) -> Option<DiscoveredEndpoint> {
+    let ep = remember_udr_from_search(nrf_uri, json);
+    if ep.is_none() && cached_udr(nrf_uri).is_none() {
+        note_no_udr(nrf_uri);
+    }
+    ep
+}
+
 /// Remember the first UDR a SearchResult `json` from `nrf_uri` lists, with its
-/// `validityPeriod`, and return its endpoint.
+/// `validityPeriod`, and return its endpoint. Remembering one clears what
+/// [`note_no_udr`] recorded.
 fn remember_udr_from_search(nrf_uri: &str, json: &serde_json::Value) -> Option<DiscoveredEndpoint> {
     let (nf, ep) = json
         .get("nfInstances")?
@@ -2013,6 +2057,7 @@ fn remember_udr_from_search(nrf_uri: &str, json: &serde_json::Value) -> Option<D
     let id = nf.get("nfInstanceId").and_then(|v| v.as_str());
     let validity = json.get("validityPeriod").and_then(|v| v.as_u64());
     remember_udr(nrf_uri, id, &ep, validity);
+    *NRF_SAID_NO_UDR.lock().unwrap_or_else(|e| e.into_inner()) = None;
     Some(ep)
 }
 
@@ -2037,10 +2082,11 @@ pub(crate) fn cached_udr_until() -> Option<std::time::Instant> {
         .map(|c| c.until)
 }
 
-/// Forget the remembered UDR (#1621 review M1): a fresh context has discovered
-/// nothing.
+/// Forget the remembered UDR (#1621 review M1), and any "no UDR deployed" answer
+/// (#1639): a fresh context has discovered nothing.
 pub fn forget_udr() {
     *UDR_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *NRF_SAID_NO_UDR.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// What the NRF says of a remembered UDR instance it no longer lists (#1621
@@ -2130,8 +2176,11 @@ fn profile_not_found(body: Option<&str>) -> UdrProfile {
 ///   Any other status, or no usable answer: the remembered UDR is read.
 /// - The NRF fails or does not answer within [`UDR_DISCOVERY_TIMEOUT`]: the
 ///   remembered UDR, without the profile check.
-/// - Nothing remembered: `Ok(None)` (logged). A PCF that never discovered a UDR
-///   and finds the NRF down has no basis to call it an outage (decision #1639).
+/// - Nothing remembered (#1639): when the NRF listed none, or its last answer was
+///   that no UDR is deployed, `Ok(None)`. When the NRF failed with no such answer
+///   (never discovered a UDR since start-up, or what was learned expired), per
+///   `pcf.policy.udr_required`: `true` an `Err` (the create is refused, 500),
+///   `false` `Ok(None)`, the local default. Both logged.
 async fn discover_create_udr() -> Result<Option<DiscoveredEndpoint>, UdrError> {
     let Some(nrf_uri) = global_context().get_nrf_uri().await else {
         return Ok(None);
@@ -2139,7 +2188,7 @@ async fn discover_create_udr() -> Result<Option<DiscoveredEndpoint>, UdrError> {
     let deadline = tokio::time::Instant::now() + UDR_DISCOVERY_TIMEOUT;
     let search = tokio::time::timeout_at(deadline, Box::pin(nrf_search("UDR", "nudr-dr"))).await;
     let (why, listed_none) = match search {
-        Ok(Ok(Some(json))) => match remember_udr_from_search(&nrf_uri, &json) {
+        Ok(Ok(Some(json))) => match note_udr_search(&nrf_uri, &json) {
             Some(ep) => return Ok(Some(ep)),
             None => ("the NRF lists no UDR".to_string(), true),
         },
@@ -2151,7 +2200,17 @@ async fn discover_create_udr() -> Result<Option<DiscoveredEndpoint>, UdrError> {
         ),
     };
     let Some(cached) = cached_udr(&nrf_uri) else {
-        log::warn!("{why}, and no UDR has been discovered; local default");
+        // A listing of none was recorded by `note_udr_search` above.
+        if nrf_said_no_udr(&nrf_uri) {
+            log::warn!("{why}, and the NRF says no UDR is deployed; local default");
+            return Ok(None);
+        }
+        if crate::udr_required::get() {
+            return Err(UdrError::Unknown(format!(
+                "{why}, and no UDR is known (pcf.policy.udr_required: true)"
+            )));
+        }
+        log::warn!("{why}, and no UDR is known; local default (pcf.policy.udr_required: false)");
         return Ok(None);
     };
     let (host, port) = (cached.ep.host.clone(), cached.ep.port);
@@ -2166,6 +2225,7 @@ async fn discover_create_udr() -> Result<Option<DiscoveredEndpoint>, UdrError> {
                      deregistered; forgotten, local default"
                 );
                 forget_udr();
+                note_no_udr(&nrf_uri);
                 return Ok(None);
             }
             UdrProfile::Status(status)

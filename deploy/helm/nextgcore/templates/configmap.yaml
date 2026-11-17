@@ -234,8 +234,15 @@ data:
       {{- if not (has $cap (list "subscribed" "none")) }}
       {{- fail (printf "pcf.policy.sessionAmbrCap must be subscribed or none, got %q" $cap) }}
       {{- end }}
+      # #1639: values.yaml pcf.policy.udrRequired (true | false; unset: true).
+      {{- $udrRequired := .Values.pcf.policy.udrRequired }}
+      {{- if kindIs "invalid" $udrRequired }}{{- $udrRequired = true }}{{- end }}
+      {{- if not (kindIs "bool" $udrRequired) }}
+      {{- fail (printf "pcf.policy.udrRequired must be true or false, got %v" $udrRequired) }}
+      {{- end }}
       policy:
         session_ambr_cap: {{ $cap }}
+        udr_required: {{ $udrRequired }}
 
   nssf.yaml: |
     logger:

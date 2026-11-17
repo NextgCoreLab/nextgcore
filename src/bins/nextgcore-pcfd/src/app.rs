@@ -359,6 +359,21 @@ pub async fn run() -> Result<()> {
          use local policy, without a UDR subscription check"
     );
     crate::emergency_dnn::set(emergency_dnns);
+    // #1639: `pcf.policy.udr_required`, what a create does when the NRF does not
+    // answer and no UDR is known. Not a boolean: start-up fails.
+    let udr_required = crate::udr_required::from_config_root(&demo_config_root(&args.config)?)
+        .map_err(|e| anyhow::anyhow!("configuration file {}: {e}", args.config))?;
+    crate::udr_required::set(udr_required);
+    log::info!(
+        "pcf.policy.udr_required = {}: a policy create while the NRF does not answer and no \
+         UDR is known is {}",
+        crate::udr_required::get(),
+        if crate::udr_required::get() {
+            "refused, 500 SYSTEM_FAILURE"
+        } else {
+            "authorised from the local default policy"
+        }
+    );
     // #1402 review M1: logged from the global the paths read, not from the parsed
     // local, so the line proves the value is IN FORCE (the start-up test reads it).
     let in_force = crate::session_ambr_cap::get();
@@ -8841,8 +8856,9 @@ mod tests {
             resp.http.content
         );
 
-        // 5. Never discovered a UDR, NRF down: the local default (the `decision`
-        //    case, #1621 review M1).
+        // 5. Never discovered a UDR, NRF down: the local default under
+        //    `pcf.policy.udr_required: false` (#1639; true is tested there).
+        let _required = crate::test_support::udr_required(false);
         crate::sbi_path::forget_udr();
         let resp = pcf_sbi_request_handler(am_create_1613("imsi-001010000016215")).await;
         assert_eq!(resp.status, 201, "nothing known: {:?}", resp.http.content);
@@ -9181,6 +9197,216 @@ mod tests {
         );
         nrf.stop().await.ok();
         drop(refused);
+    }
+
+    /// An SM policy create request for `supi` on `dnn` with UE address `ip` (#1639).
+    fn sm_create_1639(supi: &str, dnn: &str, ip: &str) -> SbiRequest {
+        let mut body = full_create_body(supi, 5);
+        body["dnn"] = serde_json::json!(dnn);
+        body["ipv4Address"] = serde_json::json!(ip);
+        make_request("POST", "/npcf-smpolicycontrol/v1/sm-policies", Some(body))
+    }
+
+    /// #1639 (operator decision): an NRF is configured, it is down, and no UDR is
+    /// remembered. `pcf.policy.udr_required: true` refuses the AM and SM policy
+    /// creates 500 SYSTEM_FAILURE (TS 29.500 Table 5.2.7.2-1) and leaves nothing
+    /// behind, but not an Emergency DN, which never reads the UDR (TS 29.512
+    /// §4.2.2.2). `false` keeps the local default (201). A UDR remembered once
+    /// whose `validityPeriod` ran out is no UDR known: refused under `true`.
+    ///
+    /// REVERT-VERIFIED: with the `udr_required` arm of `discover_create_udr`
+    /// removed (always the local default), the three `true` creates answer 201;
+    /// with it unconditional (ignoring the setting), the `false` creates answer 500.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn no_udr_known_and_the_nrf_down_follows_udr_required_1639() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ues = cleanup_1621((16391u64..=16397).map(|n| format!("imsi-0010100000{n}")));
+        let _emergency = crate::test_support::emergency_dnns(crate::emergency_dnn::DEFAULT);
+        pcf_context_init(64, 64);
+        let down = nextgcore_sbi::test_support::down_port();
+        let nrf_uri = format!("http://127.0.0.1:{}", down.port());
+        let _nrf_uri = crate::test_support::scoped_nrf_at(nrf_uri.clone()).await;
+        crate::sbi_path::forget_udr();
+        let association = |supi: &str| pcf_self().read().unwrap().ue_am_find_by_supi(supi);
+        let session = |ip: &str| pcf_self().read().unwrap().sess_find_by_ipv4addr(ip);
+
+        {
+            let _required = crate::test_support::udr_required(true);
+            let supi = "imsi-001010000016391";
+            let resp = pcf_sbi_request_handler(am_create_1613(supi)).await;
+            assert_eq!(resp.status, 500, "AM, true: {:?}", resp.http.content);
+            assert_eq!(problem_cause_1597(&resp), "SYSTEM_FAILURE");
+            assert!(
+                association(supi).is_none(),
+                "a refused create leaves nothing"
+            );
+
+            let resp = pcf_sbi_request_handler(sm_create_1639(
+                "imsi-001010000016392",
+                "internet",
+                "10.163.9.2",
+            ))
+            .await;
+            assert_eq!(resp.status, 500, "SM, true: {:?}", resp.http.content);
+            assert_eq!(problem_cause_1597(&resp), "SYSTEM_FAILURE");
+            assert!(
+                session("10.163.9.2").is_none(),
+                "a refused create leaves nothing"
+            );
+
+            let resp = pcf_sbi_request_handler(sm_create_1639(
+                "imsi-001010000016393",
+                "sos",
+                "10.163.9.3",
+            ))
+            .await;
+            assert_eq!(resp.status, 201, "an Emergency DN: {:?}", resp.http.content);
+
+            // A UDR learned once, its validity run out: nothing known.
+            let ep = crate::sbi_path::DiscoveredEndpoint {
+                host: "127.0.0.1".to_string(),
+                port: down.port(),
+                scheme: "http".to_string(),
+            };
+            crate::sbi_path::remember_udr(&nrf_uri, Some("udr-1639"), &ep, Some(0));
+            let supi = "imsi-001010000016394";
+            let resp = pcf_sbi_request_handler(am_create_1613(supi)).await;
+            assert_eq!(resp.status, 500, "expired, true: {:?}", resp.http.content);
+            assert!(association(supi).is_none());
+        }
+        {
+            let _required = crate::test_support::udr_required(false);
+            let supi = "imsi-001010000016395";
+            let resp = pcf_sbi_request_handler(am_create_1613(supi)).await;
+            assert_eq!(resp.status, 201, "AM, false: {:?}", resp.http.content);
+            assert!(association(supi).is_some());
+
+            let resp = pcf_sbi_request_handler(sm_create_1639(
+                "imsi-001010000016396",
+                "internet",
+                "10.163.9.6",
+            ))
+            .await;
+            assert_eq!(resp.status, 201, "SM, false: {:?}", resp.http.content);
+            assert!(session("10.163.9.6").is_some());
+        }
+        drop(down);
+    }
+
+    /// #1639: an NRF whose last answer was that no UDR is deployed is a basis for
+    /// the local default when it then stops answering, even under
+    /// `pcf.policy.udr_required: true`: it listed none, or it reported the
+    /// remembered UDR deregistered (NFProfile 404, #1653). An NRF whose last
+    /// answer listed a UDR, since expired, is not; nor is a fresh context. The NRF
+    /// "stops answering" by answering past the 2 s discovery bound.
+    ///
+    /// REVERT-VERIFIED: without `note_no_udr` in `note_udr_search`, step 2 answers
+    /// 500; without it on the deregistered path, step 5 answers 500; without
+    /// `remember_udr_from_search` clearing the record, step 3b answers 201; with
+    /// `note_udr_search` recording a listing of none while a UDR is remembered,
+    /// step 3d answers 201.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn an_nrf_that_said_no_udr_keeps_the_local_default_when_it_goes_down_1639() {
+        use std::sync::atomic::Ordering;
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ues = cleanup_1621((16380u64..=16388).map(|n| format!("imsi-0010100000{n}")));
+        pcf_context_init(64, 64);
+        let _required = crate::test_support::udr_required(true);
+        let down = nextgcore_sbi::test_support::down_port();
+        let mock = std::sync::Arc::new(NrfMock1621 {
+            udr_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            profile: std::sync::atomic::AtomicU16::new(PROFILE_REGISTERED_1621),
+            delay_ms: std::sync::atomic::AtomicU64::new(0),
+        });
+        let (nrf, _nrf_guard) = start_mock_nrf_1621(mock.clone()).await;
+        let nrf_uri = nextgcore_sbi::context::global_context()
+            .get_nrf_uri()
+            .await
+            .expect("the mock NRF's URI");
+        let silent_nrf = |on: bool| {
+            mock.delay_ms
+                .store(if on { 2500 } else { 0 }, Ordering::SeqCst)
+        };
+        let create =
+            |n: u64| pcf_sbi_request_handler(am_create_1613(&format!("imsi-0010100000{n}")));
+
+        // 1. The NRF lists no UDR: the local default.
+        let resp = create(16380).await;
+        assert_eq!(resp.status, 201, "1. none listed: {:?}", resp.http.content);
+        // 2. ...and then stops answering: still the local default.
+        silent_nrf(true);
+        let resp = create(16381).await;
+        assert_eq!(resp.status, 201, "2. said none: {:?}", resp.http.content);
+
+        // 3. The NRF lists a UDR (it refuses, so 500), which then expires, and the
+        //    NRF stops answering: its last answer named a UDR, so refused.
+        silent_nrf(false);
+        mock.udr_port.store(down.port(), Ordering::SeqCst);
+        let resp = create(16382).await;
+        assert_eq!(
+            resp.status, 500,
+            "3a. a listed UDR refuses: {:?}",
+            resp.http.content
+        );
+        let ep = crate::sbi_path::DiscoveredEndpoint {
+            host: "127.0.0.1".to_string(),
+            port: down.port(),
+            scheme: "http".to_string(),
+        };
+        crate::sbi_path::remember_udr(&nrf_uri, Some("udr-1613"), &ep, Some(0));
+        silent_nrf(true);
+        let resp = create(16383).await;
+        assert_eq!(
+            resp.status, 500,
+            "3b. expired, NRF silent: {:?}",
+            resp.http.content
+        );
+        // 3c. A remembered UDR the NRF no longer lists, SUSPENDED (500), which then
+        //     expires, and the NRF stops answering: listing none while a UDR was
+        //     remembered is not "none deployed", so refused.
+        silent_nrf(false);
+        crate::sbi_path::remember_udr(&nrf_uri, Some("udr-1613"), &ep, None);
+        mock.udr_port.store(0, Ordering::SeqCst);
+        mock.profile.store(PROFILE_SUSPENDED_1621, Ordering::SeqCst);
+        let resp = create(16387).await;
+        assert_eq!(resp.status, 500, "3c. suspended: {:?}", resp.http.content);
+        crate::sbi_path::remember_udr(&nrf_uri, Some("udr-1613"), &ep, Some(0));
+        silent_nrf(true);
+        let resp = create(16388).await;
+        assert_eq!(
+            resp.status, 500,
+            "3d. expired, NRF silent: {:?}",
+            resp.http.content
+        );
+
+        // 4. The remembered UDR deregistered (NFProfile 404): the local default.
+        silent_nrf(false);
+        crate::sbi_path::remember_udr(&nrf_uri, Some("udr-1613"), &ep, None);
+        mock.udr_port.store(0, Ordering::SeqCst);
+        mock.profile.store(PROFILE_GONE_1621, Ordering::SeqCst);
+        let resp = create(16384).await;
+        assert_eq!(resp.status, 201, "4. deregistered: {:?}", resp.http.content);
+        // 5. ...and then the NRF stops answering: still the local default.
+        silent_nrf(true);
+        let resp = create(16385).await;
+        assert_eq!(resp.status, 201, "5. said gone: {:?}", resp.http.content);
+
+        // 6. A fresh context, nothing known: refused.
+        crate::sbi_path::forget_udr();
+        let resp = create(16386).await;
+        assert_eq!(
+            resp.status, 500,
+            "6. nothing known: {:?}",
+            resp.http.content
+        );
+        nrf.stop().await.ok();
+        drop(down);
     }
 
     /// AM policy Create and GET both carry the negotiated `suppFeat` and the
@@ -15124,6 +15350,23 @@ mod shipped_config_tests {
         );
     }
 
+    /// #1639 (operator decision): every shipped config states
+    /// `pcf.policy.udr_required`, `true` in the production chart and the profiles'
+    /// base manifests, `false` in the compose config.
+    fn assert_udr_required(what: &str, text: &str, expected: bool) {
+        let root: serde_yaml::Value =
+            serde_yaml::from_str(text).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert!(
+            root["pcf"]["policy"]["udr_required"].is_bool(),
+            "{what} states pcf.policy.udr_required"
+        );
+        assert_eq!(
+            crate::udr_required::from_config_root(&root),
+            Ok(expected),
+            "{what}"
+        );
+    }
+
     #[test]
     fn the_shipped_configs_parse() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
@@ -15132,6 +15375,16 @@ mod shipped_config_tests {
             let text = std::fs::read_to_string(root.join(rel)).unwrap();
             serde_yaml::from_str::<super::PcfYaml>(&text).unwrap_or_else(|e| panic!("{rel}: {e}"));
             assert_cap_ok(rel, &text);
+            assert_udr_required(rel, &text, false);
+        }
+        {
+            let rel = "deploy/eks/overlays/demo-d441a-congestion-loop/core-configs.yaml";
+            let cm: serde_yaml::Value =
+                serde_yaml::from_str(&std::fs::read_to_string(root.join(rel)).unwrap()).unwrap();
+            let text = cm["data"]["pcf.yaml"]
+                .as_str()
+                .expect("the overlay's pcf.yaml");
+            assert_udr_required(rel, text, true);
         }
         let cm: serde_yaml::Value = serde_yaml::from_str(
             &std::fs::read_to_string(root.join("k8s/manifests/configmap.yaml")).unwrap(),
@@ -15142,11 +15395,13 @@ mod shipped_config_tests {
             .expect("the ConfigMap's pcf.yaml");
         serde_yaml::from_str::<super::PcfYaml>(text).expect("k8s pcf.yaml");
         assert_cap_ok("k8s pcf.yaml", text);
+        assert_udr_required("k8s pcf.yaml", text, true);
         // #1312 (#1317 review): and as the Helm chart renders it (CI installs helm
         // and sets NEXTGCORE_HELM_REQUIRED, so this is never skipped there).
         if let Some(text) = nextgcore_core::helm_render::helm_rendered_config(&root, "pcf.yaml") {
             serde_yaml::from_str::<super::PcfYaml>(&text).expect("Helm pcf.yaml");
             assert_cap_ok("Helm pcf.yaml", &text);
+            assert_udr_required("Helm pcf.yaml", &text, true);
             assert!(
                 text.contains("session_ambr_cap: subscribed"),
                 "the Helm chart renders values.yaml pcf.policy.sessionAmbrCap: {text}"

@@ -47,6 +47,8 @@ pub mod sbi_path;
 pub mod session_ambr_cap;
 pub mod sm_policy_build;
 pub mod timer;
+/// #1639: the operator setting `pcf.policy.udr_required`.
+pub mod udr_required;
 pub mod ue_policy; // Rel-16: URSP rule provisioning (TS 23.503)
 pub mod vplmn_qos; // #1541: VPLMN-QoS-Control (TS 29.512 feature 49)
 
@@ -218,6 +220,36 @@ pub mod test_support {
         SessionAmbrCapGuard {
             previous,
             _guard: guard,
+        }
+    }
+
+    /// `pcf.policy.udr_required` pinned to `required` for as long as the returned
+    /// guard lives (#1639). Holds [`crate::udr_required::UDR_REQUIRED_LOCK`] and
+    /// restores the previous value on drop. Every test that sets the setting, or
+    /// whose assertions depend on it, takes one of these. Taken AFTER
+    /// `CONTEXT_GUARD` by tests that hold both.
+    pub fn udr_required(required: bool) -> UdrRequiredGuard {
+        let guard = crate::udr_required::UDR_REQUIRED_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = crate::udr_required::get();
+        crate::udr_required::set(required);
+        UdrRequiredGuard {
+            previous,
+            _guard: guard,
+        }
+    }
+
+    /// Guard returned by [`udr_required`].
+    pub struct UdrRequiredGuard {
+        previous: bool,
+        // Declared last so it drops after `Drop::drop` has restored the setting.
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for UdrRequiredGuard {
+        fn drop(&mut self) {
+            crate::udr_required::set(self.previous);
         }
     }
 
