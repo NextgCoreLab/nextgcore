@@ -43052,6 +43052,55 @@ mod tests {
         }
     }
 
+    /// **#1723 review M1**, TS 24.501 §5.5.1.2.8 / §5.4.4.6: a record whose new
+    /// 5G-GUTI was allocated but never acknowledged (T3550 or T3555 exhausted) keeps
+    /// it in `next_guti`, and the UE may hold and present it. Its 5G-TMSI stays held
+    /// for as long as the record holds it, past any number of graces, and is never
+    /// drawn again.
+    ///
+    /// REVERT-VERIFIED: with `live_tmsis` collecting `current_guti` only, the
+    /// pending value is released two graces in and the forced draw returns it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pending_next_guti_stays_held_for_as_long_as_its_record_holds_it_1692() {
+        let _registry = crate::context::TMSI_REGISTRY_TEST_LOCK.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let ngap = test_ngap_server().await;
+        let (id, current) = (16_920_101u64, 0x1692_0401u32);
+        let mut ue = UeNasContext::new(id, 1, 1, false);
+        ue.registered = true;
+        ue.amf_ue.current_guti.tmsi = current;
+        ngap.ue_auth_state.insert(id, ue);
+        let t0 = Instant::now();
+        let pending = ngap
+            .ue_auth_state
+            .with_mut(id, |s| {
+                s.amf_ue.generate_new_guti();
+                s.amf_ue.next_guti.tmsi
+            })
+            .expect("the record");
+        ngap.sweep_tmsi_registry(t0);
+
+        let grace = crate::context::TMSI_RELEASE_GRACE;
+        for k in 1..=3u32 {
+            ngap.sweep_tmsi_registry(t0 + grace * k + Duration::from_secs(1));
+        }
+        assert!(
+            crate::context::tmsi_registry_holds(pending),
+            "an unacknowledged next_guti is held while its record holds it"
+        );
+        assert!(crate::context::tmsi_registry_holds(current));
+        let mut draws = [pending, current, 0x1692_0402].into_iter();
+        assert_eq!(
+            crate::context::allocate_unique_tmsi_from(
+                || draws.next().expect("a draw"),
+                t0 + grace * 3
+            ),
+            0x1692_0402,
+            "the pending value is redrawn"
+        );
+        ngap.ue_auth_state.remove(id);
+    }
+
     /// **#1692**, TS 23.003 §2.10.1: the NGAP task's registry sweep holds every
     /// 5G-TMSI a live record holds (here one that was never allocated by this
     /// process, as after a takeover), so an allocation cannot hand it out;

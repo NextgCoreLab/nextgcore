@@ -5099,6 +5099,16 @@ pub fn generate_random_tmsi() -> u32 {
 ///
 /// A value no record references is therefore reused at the earliest one grace after
 /// its last use, never while a record still holds it.
+///
+/// # Scope
+///
+/// Uniqueness is per amfd process: the registry is this process's. The NOTE of TS
+/// 23.003 §2.10.1 (several AMFs sharing one AMF Pointer must not reuse a 5G-TMSI the
+/// others use) would need a set-wide registry. The shipped deployments give each AMF
+/// its own pointer (one AMF per Helm release; one per GUAMI in the manifests), so the
+/// per-process namespace is the AMF's. A 5G-GUTI of another AMF (a presented or
+/// EPS-mapped one, kept until this AMF reallocates) is in that AMF's namespace; it
+/// is held from the next sweep anyway, which only excludes a few values here.
 static TMSI_REGISTRY: std::sync::Mutex<Option<HashMap<u32, std::time::Instant>>> =
     std::sync::Mutex::new(None);
 
@@ -5177,7 +5187,7 @@ pub fn tmsi_registry_sweep(
     live: &std::collections::HashSet<u32>,
     now: std::time::Instant,
 ) -> usize {
-    with_tmsi_registry(|held| {
+    let (released, size) = with_tmsi_registry(|held| {
         for tmsi in live.iter().filter(|t| **t != 0) {
             held.insert(*tmsi, now);
         }
@@ -5185,9 +5195,28 @@ pub fn tmsi_registry_sweep(
         held.retain(|tmsi, seen| {
             live.contains(tmsi) || now.saturating_duration_since(*seen) <= TMSI_RELEASE_GRACE
         });
-        before - held.len()
-    })
+        (before - held.len(), held.len())
+    });
+    // #1723 review (b): the registry's size, against the live values it must hold
+    // (at most two per record) plus what one grace of allocations adds. Logged at
+    // debug each sweep; a size far beyond that (an allocation loop) is a warning.
+    log::debug!(
+        "5G-TMSI registry: {size} held, {} live, {released} released",
+        live.len()
+    );
+    if size > 2 * live.len() + TMSI_REGISTRY_WARN_EXCESS {
+        log::warn!(
+            "5G-TMSI registry holds {size} values for {} live ones: more than \
+             {TMSI_REGISTRY_WARN_EXCESS} allocations within one grace",
+            live.len()
+        );
+    }
+    released
 }
+
+/// The allocations within one [`TMSI_RELEASE_GRACE`] beyond which the registry's
+/// size is logged as a warning (#1723 review (b)).
+const TMSI_REGISTRY_WARN_EXCESS: usize = 100_000;
 
 /// Whether `tmsi` is in the registry (tests).
 #[cfg(test)]
