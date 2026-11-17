@@ -5,8 +5,9 @@
 # gNB-A. The arm used to rely on incidental uplink: a 48-byte IPv6 packet the
 # kernel sends as uesimtun* comes up (gNB log len=49), sent in some runs and
 # not others. Without it the first uplink is the base e2e's ping, which
-# demo-check.sh runs only after deploy-eks.sh returns (minutes after the gNBs
-# start), long after energy-1's 90 s grace window. So:
+# demo-check.sh runs only after deploy-eks.sh returns and a debug container
+# attaches: its timing is the rollout's, not the UE's (47 s into energy-1's
+# 90 s grace on devtest1 2026-11-17, with no margin guaranteed). So:
 #   - ipv6-off (init): IPv6 off in the pod's network namespace before nr-ue
 #     creates its TUN, so the kernel sends no packet of its own;
 #   - uplink-burst (sidecar, the ue image): as soon as uesimtun* has an IPv4
