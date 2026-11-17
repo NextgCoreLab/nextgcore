@@ -566,8 +566,13 @@ pub struct AmfContext {
     pub t3512_value: u64,
     /// Which (R)AN nodes a CM-IDLE UE is paged on (`amf.paging.strategy`, #1442).
     /// TS 23.501 §5.4.3.1 leaves the paging strategy to local configuration.
-    /// Tests that set it, or queue a page, hold
-    /// `test_support::PAGING_STRATEGY_LOCK` (#1588).
+    ///
+    /// Read when a page is queued (`namf_handler::initiate_paging_for_idle_ue`) and
+    /// sent (`NgapServer::send_paging`), at a UE Context Release Complete (whether to
+    /// keep the RAN's Recommended Cells for Paging), and when `/metrics` renders.
+    /// Every test that sets it or reads it holds `test_support::PAGING_STRATEGY_LOCK`
+    /// (#1588). The readers enforce this in test builds
+    /// (`test_support::assert_paging_strategy_lock_held`).
     pub paging_strategy: PagingStrategy,
 
     // ID generators

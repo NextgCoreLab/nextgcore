@@ -3375,6 +3375,8 @@ async fn the_plain_dispatch_service_request_arm_records_its_allocation() {
 /// it. It gets an Error Indication "Unknown local UE NGAP ID".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_released_connection_loses_its_contextless_allocation() {
+    // #1588: this test reads the paging strategy.
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     let mut server = capturing_ngap_server().await;
     let id = 7_758_021u64;
     server.forced_amf_ue_ngap_id = Some(id);
@@ -5226,6 +5228,8 @@ async fn an_update_from_cm_idle_whose_initial_context_setup_cannot_encode_still_
 #[allow(clippy::await_holding_lock)]
 async fn an_ics_failure_after_an_idle_update_keeps_the_ue_registered_and_idle() {
     let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    // #1588: this test reads the paging strategy.
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeFixtureGuami::install();
     let (_smf, port, calls) = activating_smf().await;

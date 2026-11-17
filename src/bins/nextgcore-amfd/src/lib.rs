@@ -102,8 +102,25 @@ pub mod test_support {
     /// process-global hint outcomes, and takes an in-flight permit; under
     /// `recommended-first` it is paged on stored cells. `CONTEXT_GUARD` does not
     /// cover it: the downlink tests that page hold their own queue locks instead.
-    /// Take it last, after any other lock, so a holder never waits on another.
+    /// Take it last, after any other lock, and take no other lock while holding it,
+    /// so a holder never waits on another. Sync tests take it with
+    /// `blocking_lock()`.
     pub static PAGING_STRATEGY_LOCK: Mutex<()> = Mutex::const_new(());
+
+    /// Test-only enforcement of [`PAGING_STRATEGY_LOCK`] (#1588 review): every reader
+    /// of the paging strategy calls this, and it panics when nobody holds the lock.
+    /// A test that reads the strategy without the lock then fails deterministically
+    /// whenever it runs alone, and in most parallel runs too.
+    #[cfg(test)]
+    #[track_caller]
+    pub(crate) fn assert_paging_strategy_lock_held() {
+        if PAGING_STRATEGY_LOCK.try_lock().is_ok() {
+            panic!(
+                "the paging strategy was read with PAGING_STRATEGY_LOCK free: take it in \
+                 this test (#1588)"
+            );
+        }
+    }
 
     /// Serialises tests that set the AUSF endpoint environment variables
     /// (`AUSF_SBI_ADDR` / `AUSF_SBI_PORT`), for the same reason as

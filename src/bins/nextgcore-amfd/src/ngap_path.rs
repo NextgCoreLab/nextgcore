@@ -541,6 +541,8 @@ fn paging_t3513() -> Duration {
 
 /// The configured paging strategy (`amf.paging.strategy`, #1442).
 fn paging_strategy() -> crate::context::PagingStrategy {
+    #[cfg(test)]
+    crate::test_support::assert_paging_strategy_lock_held();
     let ctx = crate::context::amf_self();
     let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
     guard.paging_strategy
@@ -24504,6 +24506,8 @@ mod tests {
         // The paging map is part of the process-global AMF context, and this pump
         // takes EVERY due page in it: serialised with the #1442 pump tests.
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        // #1588: this test reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;
         let ue_id = 5_120_001u64;
@@ -26018,6 +26022,8 @@ mod tests {
     async fn an_unusable_recommendation_falls_back_to_the_registration_area() {
         use crate::context::RecommendedPagingTarget;
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        // #1588: this test reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = capturing_ngap_server().await;
         let base = 14_440u64;
@@ -26907,6 +26913,8 @@ mod tests {
     /// idle UE still has, so it was never paged.
     #[tokio::test]
     async fn the_n1_release_makes_a_registered_ue_cm_idle() {
+        // #1588: this test reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;
         let id = 5_120_301u64;
@@ -29424,6 +29432,8 @@ mod tests {
     async fn a_release_complete_aborts_the_ues_nas_procedure() {
         let (_nf, port, seen) = recording_nf().await;
         let _env = SmfEnvGuard::acquire(port).await;
+        // #1588: this test reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         set_pcf_env(port);
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = capturing_ngap_server().await;
@@ -35556,6 +35566,8 @@ mod tests {
     /// idle, a `DEACTIVATED` update reaches the SMF and the timer is armed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_source_release_complete_after_a_handover_leaves_the_ue_connected() {
+        // #1588: this test reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         // (source RAN UE NGAP ID, target RAN UE NGAP ID, does the source's Complete
         // carry its RAN UE NGAP ID). The SAME id on both gNBs is the common case --
         // each gNB allocates from its own small counter -- and is what isolates the
@@ -35759,6 +35771,8 @@ mod tests {
     /// connected UE is paged and later implicitly deregistered.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_handover_notify_after_the_source_release_leaves_the_ue_connected() {
+        // #1588: this test reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut server = capturing_ngap_server().await;
         let (source, target) = (97_391u64, 97_392u64);
@@ -35809,6 +35823,8 @@ mod tests {
     /// UE no longer has there) ends that connection only.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_release_complete_for_a_stale_ran_ue_id_leaves_the_ue_connected() {
+        // #1588: this test reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut server = capturing_ngap_server().await;
         let (assoc, amf_ue_ngap_id) = (97_383u64, 7_738_002u64);
@@ -40986,6 +41002,8 @@ mod tests {
     /// original one the connected UE is too.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unusable_release_complete_never_supervises_a_connected_ue() {
+        // #1588: this test reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;
         let assoc = 98_021u64;
@@ -41063,6 +41081,8 @@ mod tests {
     /// CM-CONNECTED and unsupervised.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unusable_release_complete_answers_the_only_outstanding_command() {
+        // #1588: this test reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = capturing_ngap_server().await;
         let assoc = 99_231u64;
@@ -41115,6 +41135,8 @@ mod tests {
     /// UE keeps its entry.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_release_command_with_no_usable_complete_is_completed_at_the_guard() {
+        // #1588: this test reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = capturing_ngap_server().await;
         let assoc = 99_232u64;
@@ -41197,6 +41219,8 @@ mod tests {
     /// association -- so on the old path the other UE below is armed too.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_release_complete_listing_pdu_sessions_supervises_only_its_ue() {
+        // #1588: this test reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         use nextgcore_ngap_gen::generated as g;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;
@@ -41638,6 +41662,8 @@ mod tests {
     /// moved it: the Complete is what starts mobile-reachable supervision.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_release_complete_on_procedure_41_is_still_dispatched() {
+        // #1588: this test reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         use nextgcore_ngap_gen::generated as g;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;

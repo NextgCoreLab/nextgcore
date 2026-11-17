@@ -180,6 +180,8 @@ async fn an_initial_registration_releases_the_sessions_of_the_earlier_registrati
     let supi = "imsi-001010000774001";
     let (_ausf, ausf_port) = confirming_ausf("AUTHENTICATION_SUCCESS", supi).await;
     let _env = AusfEnvGuard::acquire(ausf_port).await;
+    // #1588: this test reads the paging strategy.
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     let mut server = capturing_ngap_server().await;
     let (old, new) = (7_774_001u64, 7_774_002u64);
     let successes = super::metrics_tests::scraped("amf_auth_success_total");
@@ -328,6 +330,8 @@ async fn a_failed_authentication_keeps_the_earlier_registration() {
     let supi = "imsi-001010000774004";
     let (_ausf, ausf_port) = confirming_ausf("AUTHENTICATION_FAILURE", supi).await;
     let _env = AusfEnvGuard::acquire(ausf_port).await;
+    // #1588: this test reads the paging strategy.
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     let mut server = capturing_ngap_server().await;
     let (old, new) = (7_774_031u64, 7_774_032u64);
     let rejects = super::metrics_tests::scraped(r#"amf_auth_failure_total{source="network"}"#);

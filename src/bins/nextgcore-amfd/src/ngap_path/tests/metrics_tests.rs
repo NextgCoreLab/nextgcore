@@ -40,6 +40,8 @@ fn downlink_nas(pdu: &[u8]) -> Option<Vec<u8>> {
 /// without the `observe_ngap` calls the NGAP counts stay; each fails its assertion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_rejected_registration_moves_the_ngap_and_registration_counters_1334() {
+    // #1588: this test reads the paging strategy.
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let mut server = capturing_ngap_server().await;
     let assoc = 13_341u64;
@@ -100,6 +102,8 @@ async fn a_rejected_registration_moves_the_ngap_and_registration_counters_1334()
 /// count stays and the assertion fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_ng_setup_failure_is_counted_as_an_ngap_failure_1334() {
+    // #1588: this test reads the paging strategy.
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     let mut server = capturing_ngap_server().await;
     let assoc = 13_342u64;
     seed_gnb_session(&server, assoc).await;
@@ -127,6 +131,8 @@ async fn an_ng_setup_failure_is_counted_as_an_ngap_failure_1334() {
 /// the count stays and the assertion fails.
 #[test]
 fn a_protected_registration_accept_is_counted_as_a_success_1334() {
+    // #1588: this test reads the paging strategy.
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.blocking_lock();
     let mut amf_ue = crate::context::AmfUe::default();
     amf_ue.selected_int_algorithm = 2;
     amf_ue.selected_enc_algorithm = 2;
@@ -149,6 +155,8 @@ fn a_protected_registration_accept_is_counted_as_a_success_1334() {
 /// REVERT-VERIFIED: without `observe_ue_authentication_failure` the count stays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_authentication_failure_from_the_ue_is_counted_1334() {
+    // #1588: this test reads the paging strategy.
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     let mut server = capturing_ngap_server().await;
     let series = r#"amf_auth_failure_total{source="ue"}"#;
     let before = scraped(series);

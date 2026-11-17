@@ -54,9 +54,11 @@ pub const PREDICTION_WINDOW: Duration = Duration::from_secs(30);
 pub const MAX_IN_FLIGHT: usize = 64;
 
 /// The in-flight bound. Process-global; a test that takes its permits sets the
-/// `nwdaf-mobility` strategy, which holds `test_support::PAGING_STRATEGY_LOCK`,
-/// as every test that queues a page does (#1588), so no other test's query
-/// competes for them or counts into [`outcome_count`].
+/// `nwdaf-mobility` strategy, which holds `test_support::PAGING_STRATEGY_LOCK`.
+/// Every test that reads the strategy holds that lock too, which the readers enforce
+/// in test builds (#1588).
+/// So no other test's query competes for the permits or counts into
+/// [`outcome_count`].
 static IN_FLIGHT: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
 
 fn in_flight() -> Arc<Semaphore> {
@@ -128,6 +130,8 @@ pub fn outcome_count(outcome: HintOutcome) -> u64 {
 /// default `/metrics` is unchanged.
 pub fn render_metrics(out: &mut String) {
     use std::fmt::Write as _;
+    #[cfg(test)]
+    crate::test_support::assert_paging_strategy_lock_held();
     let strategy = crate::context::amf_self()
         .read()
         .map(|c| c.paging_strategy)
