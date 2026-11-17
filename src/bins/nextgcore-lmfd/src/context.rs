@@ -3,6 +3,7 @@
 //! Location Management Function context (TS 23.273)
 //! Includes NRPPa (NR Positioning Protocol A) support
 
+use nextgcore_sbi::callback_auth::CallbackToken;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -281,6 +282,10 @@ pub struct PositioningSession {
     pub lpp_transaction: u8,
     /// Target SUPI when known.
     pub supi: Option<String>,
+    /// The UE context the session's N1N2 traffic goes through (the SUPI, else
+    /// the GPSI or PEI); only notifications on that UE's subscription act on it
+    /// (#1518).
+    pub ue_context_id: Option<String>,
     /// The measurement-store request id measurements are reported against.
     pub request_id: u64,
     /// Session creation instant (timeout bookkeeping).
@@ -422,8 +427,75 @@ pub struct PositioningSessionInfo {
     pub lcs_correlation_id: String,
     pub lpp_transaction: u8,
     pub supi: Option<String>,
+    pub ue_context_id: Option<String>,
     pub request_id: u64,
     pub nrppa_peer: Option<NrppaPeer>,
+}
+
+/// The most AMF notification subscriptions this LMF holds at once (#1518): one
+/// per (AMF, UE) positioned, plus one non-UE NRPPa subscription per AMF. Beyond
+/// it the oldest is evicted and unsubscribed.
+pub const MAX_AMF_SUBSCRIPTIONS: usize = 4096;
+
+/// Which of this LMF's AMF notification callbacks a notification arrived at
+/// (#1518).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyKind {
+    /// N1MessageNotify (TS 29.518 §5.2.2.3.5): `n1NotifyCallbackUri`.
+    N1,
+    /// N2InfoNotify (TS 29.518 §5.2.2.3.6) and NonUeN2InfoNotify (§5.2.2.4.4):
+    /// `n2NotifyCallbackUri`.
+    N2,
+}
+
+/// The subscription a notification's token belongs to (#1518).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotifyOwner {
+    /// The UE context of an N1N2MessageSubscribe; `None` for the non-UE NRPPa
+    /// subscription.
+    pub ue_context_id: Option<String>,
+}
+
+impl NotifyOwner {
+    /// The owner of a UE's N1N2 subscription.
+    pub fn ue(ue_context_id: &str) -> Self {
+        Self {
+            ue_context_id: Some(ue_context_id.to_string()),
+        }
+    }
+
+    /// Whether a notification on this subscription may act for the UE context
+    /// `ue_context_id`: only for its own UE.
+    pub fn serves(&self, ue_context_id: Option<&str>) -> bool {
+        self.ue_context_id.is_some() && self.ue_context_id.as_deref() == ue_context_id
+    }
+}
+
+/// One of this LMF's notification subscriptions on an AMF (#1518).
+#[derive(Debug, Clone)]
+pub struct AmfSubscription {
+    /// The AMF's id for it; `None` while the create is in flight.
+    pub subscription_id: Option<String>,
+    /// The AMF it is held on.
+    pub amf: crate::namf_client::DiscoveredAmf,
+    /// The UE context of an N1N2MessageSubscribe; `None` for the non-UE NRPPa one.
+    pub ue_context_id: Option<String>,
+    /// The token in its `n1NotifyCallbackUri` (UE subscriptions only).
+    pub n1_token: Option<CallbackToken>,
+    /// The token in its `n2NotifyCallbackUri`.
+    pub n2_token: CallbackToken,
+    /// Start order, for evicting the oldest.
+    seq: u64,
+}
+
+/// The start order of [`AmfSubscription`]s.
+static AMF_SUBSCRIPTION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The tokens minted for a subscription being created (#1518), for its URIs.
+#[derive(Debug, Clone)]
+pub struct SubscriptionStart {
+    pub n1_token: Option<CallbackToken>,
+    pub n2_token: CallbackToken,
 }
 
 /// The serving AMF and UE context an NRPPa exchange is relayed through.
@@ -494,9 +566,12 @@ pub struct LmfContext {
     positioning_txn_index: RwLock<HashMap<u8, String>>,
     /// Measurement-store request_id -> lcsCorrelationId.
     positioning_request_index: RwLock<HashMap<u64, String>>,
-    /// Cached AMF N1N2 subscription ids: "host:port|ueContextId" -> subscriptionId
-    /// (TS 29.518 §5.2.2.6; reused across DetermineLocation requests).
-    amf_subscriptions: RwLock<HashMap<String, String>>,
+    /// This LMF's notification subscriptions on AMFs (TS 29.518 §5.2.2.3.3
+    /// N1N2MessageSubscribe, §5.2.2.4.2 NonUeN2InfoSubscribe), keyed by
+    /// "host:port|ueContextId" (or "host:port|non-ue-nrppa"), with the callback
+    /// tokens their URIs carry (#1518). In memory only, and capped at
+    /// [`MAX_AMF_SUBSCRIPTIONS`].
+    amf_subscriptions: RwLock<HashMap<String, AmfSubscription>>,
     /// Advertised base URI for our A4 notify callback routes
     /// (e.g. `http://10.0.0.5:7816`), set at startup from the SBI bind args.
     callback_base: RwLock<Option<String>>,
@@ -1036,12 +1111,27 @@ impl LmfContext {
         lpp_transaction: u8,
         request_id: u64,
     ) -> (String, tokio::sync::oneshot::Receiver<PositioningOutcome>) {
+        let ue_context_id = supi.clone();
+        self.positioning_session_register_for(ue_context_id, supi, lpp_transaction, request_id)
+    }
+
+    /// [`Self::positioning_session_register`] for a session whose N1N2 traffic
+    /// goes through the UE context `ue_context_id` (#1518), which differs from the
+    /// SUPI when the target is named by GPSI or PEI.
+    pub fn positioning_session_register_for(
+        &self,
+        ue_context_id: Option<String>,
+        supi: Option<String>,
+        lpp_transaction: u8,
+        request_id: u64,
+    ) -> (String, tokio::sync::oneshot::Receiver<PositioningOutcome>) {
         let corr = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let session = PositioningSession {
             lcs_correlation_id: corr.clone(),
             lpp_transaction,
             supi,
+            ue_context_id,
             request_id,
             created_at: std::time::Instant::now(),
             nrppa_peer: None,
@@ -1134,6 +1224,7 @@ impl LmfContext {
                 lcs_correlation_id: s.lcs_correlation_id.clone(),
                 lpp_transaction: s.lpp_transaction,
                 supi: s.supi.clone(),
+                ue_context_id: s.ue_context_id.clone(),
                 request_id: s.request_id,
                 nrppa_peer: s.nrppa_peer.clone(),
             })
@@ -1614,16 +1705,104 @@ impl LmfContext {
     // A2: outbound-leg bookkeeping (AMF subscription cache + self identity).
     // -----------------------------------------------------------------------
 
-    /// Cached N1N2 subscription id for `key` = "host:port|ueContextId".
+    /// The AMF's subscription id for `key` = "host:port|ueContextId", once the AMF
+    /// has created it. `None` while the create is in flight or when there is none.
     pub fn amf_subscription_get(&self, key: &str) -> Option<String> {
-        self.amf_subscriptions.read().ok()?.get(key).cloned()
+        self.amf_subscriptions
+            .read()
+            .ok()?
+            .get(key)
+            .and_then(|s| s.subscription_id.clone())
     }
 
-    /// Cache an N1N2 subscription id (TS 29.518 §5.2.2.6) for reuse.
-    pub fn amf_subscription_set(&self, key: impl Into<String>, subscription_id: impl Into<String>) {
-        if let Ok(mut a) = self.amf_subscriptions.write() {
-            a.insert(key.into(), subscription_id.into());
+    /// Start a subscription for `key` (#1518): mint its callback tokens and hold
+    /// them, so the AMF's notifications are admitted from the moment it has the
+    /// URIs (it may notify before its 201 reaches this LMF). `None` when `key`
+    /// already has a subscription, created or in flight: one create per key at a
+    /// time, and the in-flight one serves both callers.
+    ///
+    /// At [`MAX_AMF_SUBSCRIPTIONS`] the oldest created entry is evicted (its tokens
+    /// stop being admitted) and returned, so the caller can unsubscribe it at its
+    /// AMF. Entries still in flight are never evicted; when every entry is in
+    /// flight the start is refused.
+    pub fn amf_subscription_begin(
+        &self,
+        key: &str,
+        amf: &crate::namf_client::DiscoveredAmf,
+        ue_context_id: Option<&str>,
+    ) -> Option<(SubscriptionStart, Option<AmfSubscription>)> {
+        let mut subs = self.amf_subscriptions.write().ok()?;
+        if subs.contains_key(key) {
+            return None;
         }
+        let mut evicted = None;
+        if subs.len() >= MAX_AMF_SUBSCRIPTIONS {
+            let oldest = subs
+                .iter()
+                .filter(|(_, s)| s.subscription_id.is_some())
+                .min_by_key(|(_, s)| s.seq)
+                .map(|(k, _)| k.clone())?;
+            evicted = subs.remove(&oldest);
+        }
+        let sub = AmfSubscription {
+            subscription_id: None,
+            amf: amf.clone(),
+            ue_context_id: ue_context_id.map(str::to_string),
+            n1_token: ue_context_id.map(|_| CallbackToken::mint()),
+            n2_token: CallbackToken::mint(),
+            seq: AMF_SUBSCRIPTION_SEQ.fetch_add(1, Ordering::Relaxed),
+        };
+        let start = SubscriptionStart {
+            n1_token: sub.n1_token.clone(),
+            n2_token: sub.n2_token.clone(),
+        };
+        subs.insert(key.to_string(), sub);
+        Some((start, evicted))
+    }
+
+    /// The AMF created the subscription started for `key`: record its id.
+    pub fn amf_subscription_created(&self, key: &str, subscription_id: impl Into<String>) {
+        if let Ok(mut subs) = self.amf_subscriptions.write() {
+            if let Some(s) = subs.get_mut(key) {
+                s.subscription_id = Some(subscription_id.into());
+            }
+        }
+    }
+
+    /// Forget the subscription for `key`: its create failed, or the AMF no longer
+    /// knows the UE (404, so it holds no subscription for it either). Its tokens
+    /// are no longer admitted, and the next request subscribes again.
+    pub fn amf_subscription_forget(&self, key: &str) {
+        if let Ok(mut subs) = self.amf_subscriptions.write() {
+            subs.remove(key);
+        }
+    }
+
+    /// Who a notification presented on `token` at the `kind` callback is from
+    /// (#1518): the subscription holding that token, created or in flight. `None`
+    /// for any other token, which the router answers 404, changing nothing.
+    pub fn notify_subscriber(&self, kind: NotifyKind, token: &str) -> Option<NotifyOwner> {
+        let subs = self.amf_subscriptions.read().ok()?;
+        // Every entry is compared, in constant time, so the answer's timing does
+        // not depend on which (if any) holds the token.
+        let mut found = None;
+        for s in subs.values() {
+            let held = match kind {
+                NotifyKind::N1 => s.n1_token.as_ref(),
+                NotifyKind::N2 => Some(&s.n2_token),
+            };
+            if held.is_some_and(|t| t.matches(token)) {
+                found = Some(NotifyOwner {
+                    ue_context_id: s.ue_context_id.clone(),
+                });
+            }
+        }
+        found
+    }
+
+    /// Number of held AMF subscriptions, created or in flight.
+    pub fn amf_subscription_count(&self) -> usize {
+        self.amf_subscriptions.read().map(|s| s.len()).unwrap_or(0)
     }
 
     /// Advertised base URI for the lmfd notify-callback routes.
@@ -3518,11 +3697,87 @@ mod tests_real_solve {
         assert!(ctx.positioning_session_find(&corr).is_none());
     }
 
+    /// #1518: the subscription store is capped. At the cap the oldest CREATED
+    /// entry is evicted (and handed back for unsubscribing), its tokens refused;
+    /// an in-flight entry is never evicted, and with every entry in flight a new
+    /// start is refused. One create per key at a time. No token in Debug output.
+    ///
+    /// REVERT-VERIFIED: with the cap check removed the store grows past it; with
+    /// the in-flight filter removed, an in-flight entry is evicted.
+    #[test]
+    fn the_subscription_store_is_capped_and_evicts_the_oldest_created_1518() {
+        let ctx = LmfContext::new();
+        let amf = crate::namf_client::DiscoveredAmf {
+            host: "10.0.0.1".into(),
+            port: 80,
+            scheme: "http".into(),
+            nf_instance_id: None,
+        };
+        let (first, _) = ctx
+            .amf_subscription_begin("k-in-flight", &amf, Some("imsi-0"))
+            .unwrap();
+        assert!(
+            ctx.amf_subscription_begin("k-in-flight", &amf, Some("imsi-0"))
+                .is_none(),
+            "one create per key"
+        );
+        let (oldest, _) = ctx
+            .amf_subscription_begin("k-1", &amf, Some("imsi-1"))
+            .unwrap();
+        ctx.amf_subscription_created("k-1", "s-1");
+        for i in 2..MAX_AMF_SUBSCRIPTIONS {
+            let key = format!("k-{i}");
+            ctx.amf_subscription_begin(&key, &amf, Some("imsi-x"))
+                .unwrap();
+            ctx.amf_subscription_created(&key, format!("s-{i}"));
+        }
+        assert_eq!(ctx.amf_subscription_count(), MAX_AMF_SUBSCRIPTIONS);
+        let oldest_n1 = oldest.n1_token.clone().unwrap();
+        assert!(ctx
+            .notify_subscriber(NotifyKind::N1, oldest_n1.as_str())
+            .is_some());
+
+        let (_, evicted) = ctx.amf_subscription_begin("k-new", &amf, None).unwrap();
+        let evicted = evicted.expect("the oldest created is evicted");
+        assert_eq!(evicted.subscription_id.as_deref(), Some("s-1"));
+        assert!(!format!("{evicted:?}").contains(oldest_n1.as_str()));
+        assert_eq!(ctx.amf_subscription_count(), MAX_AMF_SUBSCRIPTIONS);
+        assert!(ctx
+            .notify_subscriber(NotifyKind::N1, oldest_n1.as_str())
+            .is_none());
+        assert_eq!(
+            ctx.notify_subscriber(NotifyKind::N2, first.n2_token.as_str()),
+            Some(NotifyOwner::ue("imsi-0")),
+            "the in-flight entry stays"
+        );
+
+        // Every entry in flight: nothing can be evicted, so nothing starts.
+        let full = LmfContext::new();
+        for i in 0..MAX_AMF_SUBSCRIPTIONS {
+            full.amf_subscription_begin(&format!("p-{i}"), &amf, None)
+                .unwrap();
+        }
+        assert!(full.amf_subscription_begin("p-new", &amf, None).is_none());
+        assert_eq!(full.amf_subscription_count(), MAX_AMF_SUBSCRIPTIONS);
+    }
+
     #[test]
     fn test_amf_subscription_cache_and_identity() {
         let ctx = LmfContext::new();
         assert!(ctx.amf_subscription_get("10.0.0.1:80|imsi-1").is_none());
-        ctx.amf_subscription_set("10.0.0.1:80|imsi-1", "n1n2sub-abc");
+        let amf = crate::namf_client::DiscoveredAmf {
+            host: "10.0.0.1".into(),
+            port: 80,
+            scheme: "http".into(),
+            nf_instance_id: None,
+        };
+        ctx.amf_subscription_begin("10.0.0.1:80|imsi-1", &amf, Some("imsi-1"))
+            .expect("first start");
+        assert!(
+            ctx.amf_subscription_get("10.0.0.1:80|imsi-1").is_none(),
+            "no id while the create is in flight"
+        );
+        ctx.amf_subscription_created("10.0.0.1:80|imsi-1", "n1n2sub-abc");
         assert_eq!(
             ctx.amf_subscription_get("10.0.0.1:80|imsi-1").as_deref(),
             Some("n1n2sub-abc")
