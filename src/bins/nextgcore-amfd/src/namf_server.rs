@@ -3060,6 +3060,12 @@ impl EventSubscriptionGuard {
     /// # Panics
     ///
     /// If the response carries no `subscriptionId`.
+    /// The subscription `id`, for a test that subscribed through the handler
+    /// function rather than over HTTP (#1640).
+    pub(crate) fn id(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
     pub(crate) fn of(created: &SbiResponse) -> Self {
         let body: Value = created
             .http
@@ -12120,6 +12126,8 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status, 201);
+        // #1640: an any-UE subscription, removed when the test ends.
+        let _subscription = EventSubscriptionGuard::of(&resp);
         let body = body_json(&resp);
         let report = &body["reportList"][0];
         assert_eq!(
