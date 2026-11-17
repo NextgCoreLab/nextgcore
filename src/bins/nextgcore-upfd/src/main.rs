@@ -1520,6 +1520,13 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                         if f.apply_action & FAR_ACTION_FORW != 0 {
                             any_far_forwards = true;
                         }
+                        // #1629 review: BUFF with NOCP instructs the UP function to
+                        // notify the first downlink packet (TS 29.244 §5.2.3.1),
+                        // which starts a new buffering episode.
+                        let buff_nocp = data_plane::FAR_ACTION_BUFF | data_plane::FAR_ACTION_NOCP;
+                        if f.apply_action & buff_nocp == buff_nocp {
+                            session.rearm_dl_notification();
+                        }
                         dp_fars.insert(f.far_id, data_plane_far_from_parsed(f));
                     }
                     log::info!("Installed {} FARs for SEID={upf_seid:#x}", far_writes.len());
@@ -1962,6 +1969,90 @@ mod tests {
             ohc(1),
             Some(IpAddr::V4(v4)),
             "Update FAR, dual OHC: IPv4 wins"
+        );
+    }
+
+    /// #1629 review: a Session Modification that sets a FAR to BUFF with NOCP
+    /// instructs the UP function to notify the first downlink packet (TS 29.244
+    /// §5.2.3.1), so it starts a new buffering episode: the next buffered packet
+    /// is a first one again, though a packet was buffered before. A BUFF without
+    /// NOCP, or a FORW with no flush yet, does not re-arm.
+    ///
+    /// REVERT-VERIFIED: without the re-arm in the FAR loop, the packet after the
+    /// BUFF|NOCP modification is not a first one.
+    #[tokio::test]
+    async fn a_buff_nocp_modification_starts_a_new_buffering_episode_1629() {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        let seid = 0x1629;
+        let far = |apply_action: u16| crate::n4_build::ParsedCreateFar {
+            far_id: 2,
+            apply_action,
+            ..Default::default()
+        };
+        handle_pfcp_session_event(
+            &dp,
+            PfcpSessionEvent::SessionEstablished {
+                upf_seid: seid,
+                smf_seid: 0x1629,
+                ue_ipv4: Some(Ipv4Addr::new(10, 45, 16, 29)),
+                ul_teid: 0x1629,
+                dl_teid: 0,
+                gnb_addr: None,
+                pdrs: Vec::new(),
+                fars: vec![far(data_plane::FAR_ACTION_BUFF)],
+                qers: Vec::new(),
+                urrs: Vec::new(),
+                bars: Vec::new(),
+            },
+        )
+        .await;
+        let session = dp.sessions.find_by_seid(seid).expect("installed");
+        let modify = |f| PfcpSessionEvent::SessionModified {
+            upf_seid: seid,
+            dl_teid: None,
+            gnb_addr: None,
+            removed_pdr_ids: Vec::new(),
+            removed_far_ids: Vec::new(),
+            removed_qer_ids: Vec::new(),
+            removed_urr_ids: Vec::new(),
+            created_pdrs: Vec::new(),
+            created_fars: Vec::new(),
+            created_qers: Vec::new(),
+            created_urrs: Vec::new(),
+            updated_pdrs: Vec::new(),
+            updated_fars: vec![f],
+            updated_qers: Vec::new(),
+            updated_urrs: Vec::new(),
+            updated_bars: Vec::new(),
+            send_end_marker: false,
+            drop_buffered: false,
+            old_dl_tunnel: None,
+        };
+        let first = |n: u8| session.buffer_dl_packet(vec![n], None).1;
+
+        assert!(first(1), "the create's BUFF FAR: the first packet");
+        assert!(!first(2), "the same episode");
+        handle_pfcp_session_event(&dp, modify(far(data_plane::FAR_ACTION_BUFF))).await;
+        assert!(
+            !first(3),
+            "BUFF without NOCP asks for no report: no new episode"
+        );
+        handle_pfcp_session_event(
+            &dp,
+            modify(far(
+                data_plane::FAR_ACTION_BUFF | data_plane::FAR_ACTION_NOCP
+            )),
+        )
+        .await;
+        assert!(
+            first(4),
+            "BUFF|NOCP: a new episode, this packet is a first one"
+        );
+        assert!(!first(5), "and only one");
+        assert_eq!(
+            session.dl_buffer.lock().unwrap().len(),
+            5,
+            "the packets buffered before stay buffered"
         );
     }
 
