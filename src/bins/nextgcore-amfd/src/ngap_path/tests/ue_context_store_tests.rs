@@ -2618,3 +2618,46 @@ async fn a_restored_ue_keeps_the_time_its_location_was_acquired() {
         mongodb::bson::from_document(legacy).expect("a record without the field decodes");
     assert_eq!(old.location_timestamp, 0, "age unknown");
 }
+
+/// #1692: a restored UE's 5G-TMSI is held in the registry as soon as the UE is
+/// installed, so no allocation after a restart hands it to another UE before the
+/// first registry sweep (TS 23.003 §2.10.1).
+///
+/// REVERT-VERIFIED: without the `tmsi_registry_hold` in `install_restored`, the
+/// restored value is not held and the forced draw returns it.
+#[tokio::test]
+async fn a_restored_ues_5g_tmsi_is_held_before_any_allocation_1692() {
+    let _registry = crate::context::TMSI_REGISTRY_TEST_LOCK.lock().await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let backend = Arc::new(MemoryBackend::default());
+    let mut server = storing_server(&backend).await;
+    let (id, supi, tmsi) = (6_169_201u64, "imsi-001010016920001", 0x1692_0201u32);
+    seed_registered_ue(&mut server, id, tmsi, supi, "ref-1692", 7777, false);
+    store_now(&mut server).await;
+    crash(&mut server, id);
+    let rec = backend.get(supi).expect("stored");
+
+    let mut after = restoring_server().await;
+    let new_id = after.install_restored(&rec).expect("restored");
+    assert_eq!(
+        after
+            .ue_auth_state
+            .get(new_id)
+            .expect("installed")
+            .amf_ue
+            .current_guti
+            .tmsi,
+        tmsi
+    );
+    assert!(crate::context::tmsi_registry_holds(tmsi), "held at install");
+    let mut draws = [tmsi, 0x1692_0202].into_iter();
+    assert_eq!(
+        crate::context::allocate_unique_tmsi_from(
+            || draws.next().expect("a draw"),
+            std::time::Instant::now()
+        ),
+        0x1692_0202,
+        "the restored UE's 5G-TMSI is not handed out again"
+    );
+    crash(&mut after, new_id);
+}
