@@ -3473,11 +3473,20 @@ async fn handle_n2_info_notify(request: &SbiRequest, owner: &context::NotifyOwne
     // Information, Positioning Information, Positioning Activation, Measurement)
     // goes to its waiter, matched by procedure code and transaction id. A non-UE-
     // associated answer names no session, so this comes before the session lookup.
+    // A UE-associated one is taken only on its own UE's subscription (#1518).
     if let Some((kind, procedure, txn)) = crate::nrppa_positioning::header(&nrppa_bytes) {
         if kind != crate::nrppa_positioning::Kind::Initiating {
             let delivered = lmf_self()
                 .read()
-                .map(|c| c.nrppa_deliver(procedure, txn, lcs_correlation_id, nrppa_bytes.clone()))
+                .map(|c| {
+                    c.nrppa_deliver(
+                        procedure,
+                        txn,
+                        lcs_correlation_id,
+                        owner,
+                        nrppa_bytes.clone(),
+                    )
+                })
                 .unwrap_or(false);
             if delivered {
                 return SbiResponse::no_content();
@@ -8512,6 +8521,7 @@ mod positioning_chain_strict_peer {
                         nrppa::ID_T_RP_INFORMATION_EXCHANGE,
                         m.nrppatransaction_id.0,
                         None,
+                        &context::NotifyOwner::non_ue(),
                         answer,
                     );
                 }
@@ -8750,6 +8760,7 @@ mod positioning_chain_strict_peer {
                         nrppa::ID_T_RP_INFORMATION_EXCHANGE,
                         m.nrppatransaction_id.0,
                         None,
+                        &context::NotifyOwner::non_ue(),
                         answer,
                     );
                     answered.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -9278,7 +9289,7 @@ mod callback_tokens_1518 {
         let (start, _) = c
             .amf_subscription_begin(&key, &amf, Some(ue))
             .expect("not yet held");
-        c.amf_subscription_created(&key, format!("sub-{ue}"));
+        assert!(c.amf_subscription_created(&key, &start, format!("sub-{ue}")));
         (
             start.n1_token.unwrap().as_str().to_string(),
             start.n2_token.as_str().to_string(),
@@ -9727,5 +9738,81 @@ mod callback_tokens_1518 {
             .amf_subscription_get(&amf.amf.subscription_key(other))
             .is_none());
         amf.server.stop().await.ok();
+    }
+
+    /// #1518 (R8 M2): a subscribe whose task is cancelled mid-create (its
+    /// DetermineLocation consumer disconnected) abandons its in-flight entry, so
+    /// the key can be subscribed again and the entry holds no cap slot. Both the
+    /// UE and the non-UE paths.
+    ///
+    /// REVERT-VERIFIED: with `InFlightCreate`'s drop not abandoning, the key stays
+    /// in flight after the abort and a fresh start is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_subscribe_leaves_nothing_in_flight_1518() {
+        let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        lmf_self()
+            .read()
+            .unwrap()
+            .set_callback_base("http://127.0.0.1:7816");
+
+        // An AMF that accepts the connection and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hold = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let amf = amf_at(port);
+        let ue = "imsi-001010000015188";
+
+        // By key: other modules' tests share the store without this lock.
+        let held = |key: &str| lmf_self().read().unwrap().amf_subscription_holds(key);
+        let in_flight = |key: String| async move {
+            for _ in 0..100 {
+                if lmf_self().read().unwrap().amf_subscription_holds(&key) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("{key} never went in flight");
+        };
+
+        let ue_amf = amf.clone();
+        let task = tokio::spawn(async move {
+            namf_client::ensure_n1n2_subscription(&ue_amf, ue).await;
+        });
+        in_flight(amf.subscription_key(ue)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!held(&amf.subscription_key(ue)), "abandoned on cancel");
+        assert!(
+            lmf_self()
+                .read()
+                .unwrap()
+                .amf_subscription_begin(&amf.subscription_key(ue), &amf, Some(ue))
+                .is_some(),
+            "the UE can be subscribed again"
+        );
+        lmf_self()
+            .read()
+            .unwrap()
+            .amf_subscription_forget(&amf.subscription_key(ue));
+
+        let non_ue_amf = amf.clone();
+        let task = tokio::spawn(async move {
+            namf_client::ensure_non_ue_nrppa_subscription(&non_ue_amf, "lmf-1518").await;
+        });
+        in_flight(amf.non_ue_subscription_key()).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!held(&amf.non_ue_subscription_key()), "abandoned on cancel");
+
+        hold.abort();
+        lmf_context_final();
     }
 }

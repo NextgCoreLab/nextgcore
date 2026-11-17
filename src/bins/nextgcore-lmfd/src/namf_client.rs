@@ -393,10 +393,18 @@ pub async fn ensure_n1n2_subscription(amf: &DiscoveredAmf, ue_context_id: &str) 
     if let Some(old) = evicted {
         spawn_unsubscribe(old);
     }
-    let Some(n1_token) = start.n1_token.as_ref() else {
+    let Some(n1_token) = start.n1_token.clone() else {
         return;
     };
-    let request = build_n1n2_subscription_request(ue_context_id, &base, n1_token, &start.n2_token);
+    let request = build_n1n2_subscription_request(ue_context_id, &base, &n1_token, &start.n2_token);
+    // From here every exit, an await cancelled included, commits or abandons.
+    let in_flight = InFlightCreate {
+        key,
+        start,
+        amf: amf.clone(),
+        ue_context_id: Some(ue_context_id.to_string()),
+        armed: true,
+    };
     let client = client_for(amf);
     let created = match client.send_request(request).await {
         Ok(resp) if resp.status == 201 => {
@@ -429,14 +437,12 @@ pub async fn ensure_n1n2_subscription(amf: &DiscoveredAmf, ue_context_id: &str) 
             None
         }
     };
-    if let Ok(c) = lmf_self().read() {
-        match created {
-            Some(id) => {
-                log::info!("A2: N1N2 subscription created on AMF for [{ue_context_id}]: {id}");
-                c.amf_subscription_created(&key, id);
-            }
-            None => c.amf_subscription_forget(&key),
+    match created {
+        Some(id) => {
+            log::info!("A2: N1N2 subscription created on AMF for [{ue_context_id}]: {id}");
+            in_flight.committed(id);
         }
+        None => drop(in_flight),
     }
 }
 
@@ -450,21 +456,70 @@ pub fn forget_n1n2_subscription(amf: &DiscoveredAmf, ue_context_id: &str) {
     }
 }
 
+/// Holds a subscription create in flight (#1518, R8 M2). Dropped without
+/// [`InFlightCreate::committed`] (the create failed, or the task running it was
+/// cancelled, e.g. when the consumer of the DetermineLocation that started it
+/// disconnects), it abandons the entry, so the key can be subscribed again and the
+/// entry does not hold a cap slot forever.
+struct InFlightCreate {
+    key: String,
+    start: crate::context::SubscriptionStart,
+    amf: DiscoveredAmf,
+    ue_context_id: Option<String>,
+    /// Cleared once committed: drop then leaves the entry alone.
+    armed: bool,
+}
+
+impl InFlightCreate {
+    /// The AMF created it with `id`: record it. When the entry went while the
+    /// create was in flight (forgotten or evicted, R8 m2), unsubscribe at the AMF
+    /// instead, so the AMF holds no subscription this LMF does not know about.
+    fn committed(mut self, id: String) {
+        self.armed = false;
+        let recorded = lmf_self()
+            .read()
+            .is_ok_and(|c| c.amf_subscription_created(&self.key, &self.start, id.clone()));
+        if !recorded {
+            log::info!("A2: subscription {id} was dropped while being created; unsubscribing");
+            spawn_unsubscribe_id(&self.amf, self.ue_context_id.as_deref(), &id);
+        }
+    }
+}
+
+impl Drop for InFlightCreate {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(c) = lmf_self().read() {
+            c.amf_subscription_abandon(&self.key, &self.start);
+        }
+    }
+}
+
 /// Unsubscribe an evicted subscription at its AMF (TS 29.518 §5.2.2.3.4
 /// N1N2MessageUnSubscribe, §5.2.2.4.3 NonUeN2InfoUnSubscribe), best-effort and in
 /// the background: its tokens are already refused, so the AMF would otherwise go on
 /// notifying a URI that answers 404.
 fn spawn_unsubscribe(sub: crate::context::AmfSubscription) {
-    let Some(id) = sub.subscription_id.clone() else {
+    let Some(id) = sub.subscription_id.as_deref() else {
         return;
     };
-    let path = match sub.ue_context_id.as_deref() {
+    log::info!("A2: subscription cap reached; unsubscribing the oldest ({id}) at its AMF");
+    spawn_unsubscribe_id(&sub.amf, sub.ue_context_id.as_deref(), id);
+}
+
+/// DELETE subscription `id` (a UE's N1N2 one when `ue_context_id` is given, else
+/// the non-UE one) at `amf`, best-effort and in the background.
+fn spawn_unsubscribe_id(amf: &DiscoveredAmf, ue_context_id: Option<&str>, id: &str) {
+    let path = match ue_context_id {
         Some(ue) => format!("/namf-comm/v1/ue-contexts/{ue}/n1-n2-messages/subscriptions/{id}"),
         None => format!("/namf-comm/v1/non-ue-n2-messages/subscriptions/{id}"),
     };
-    log::info!("A2: subscription cap reached; unsubscribing the oldest ({id}) at its AMF");
+    let amf = amf.clone();
+    let id = id.to_string();
     tokio::spawn(async move {
-        match client_for(&sub.amf)
+        match client_for(&amf)
             .send_request(SbiRequest::delete(path))
             .await
         {
@@ -633,15 +688,17 @@ pub async fn ensure_non_ue_nrppa_subscription(amf: &DiscoveredAmf, nf_id: &str) 
     if let Some(old) = evicted {
         spawn_unsubscribe(old);
     }
+    let request = build_non_ue_nrppa_subscription_request(nf_id, &base, &start.n2_token);
+    // From here every exit, an await cancelled included, commits or abandons.
+    let in_flight = InFlightCreate {
+        key,
+        start,
+        amf: amf.clone(),
+        ue_context_id: None,
+        armed: true,
+    };
     let client = client_for(amf);
-    let created = match client
-        .send_request(build_non_ue_nrppa_subscription_request(
-            nf_id,
-            &base,
-            &start.n2_token,
-        ))
-        .await
-    {
+    let created = match client.send_request(request).await {
         Ok(resp) if resp.status == 201 => {
             let id = resp
                 .http
@@ -667,14 +724,12 @@ pub async fn ensure_non_ue_nrppa_subscription(amf: &DiscoveredAmf, nf_id: &str) 
             None
         }
     };
-    if let Ok(c) = lmf_self().read() {
-        match created {
-            Some(id) => {
-                log::info!("Multi-RTT: non-UE NRPPa subscription on the AMF: {id}");
-                c.amf_subscription_created(&key, id);
-            }
-            None => c.amf_subscription_forget(&key),
+    match created {
+        Some(id) => {
+            log::info!("Multi-RTT: non-UE NRPPa subscription on the AMF: {id}");
+            in_flight.committed(id);
         }
+        None => drop(in_flight),
     }
 }
 

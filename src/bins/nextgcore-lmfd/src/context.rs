@@ -395,6 +395,11 @@ struct NrppaWaiter {
     sender: tokio::sync::oneshot::Sender<Vec<u8>>,
     /// The session of a UE-associated exchange; `None` for a non-UE one.
     session: Option<String>,
+    /// The UE context that session positions, resolved when the waiter is
+    /// registered (#1518): only a notification on that UE's subscription answers
+    /// a UE-associated exchange. `None` for a non-UE exchange, or when the session
+    /// is unknown (then nothing answers it).
+    ue_context_id: Option<String>,
 }
 
 /// The most measurements one positioning session accumulates (#834 review). A
@@ -457,6 +462,13 @@ pub struct NotifyOwner {
 }
 
 impl NotifyOwner {
+    /// The owner of a non-UE NRPPa subscription (NonUeN2InfoSubscribe).
+    pub fn non_ue() -> Self {
+        Self {
+            ue_context_id: None,
+        }
+    }
+
     /// The owner of a UE's N1N2 subscription.
     pub fn ue(ue_context_id: &str) -> Self {
         Self {
@@ -496,6 +508,9 @@ static AMF_SUBSCRIPTION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 pub struct SubscriptionStart {
     pub n1_token: Option<CallbackToken>,
     pub n2_token: CallbackToken,
+    /// Which start of its key this is, so a late commit or abandon cannot act on
+    /// a later subscription of the same key.
+    pub seq: u64,
 }
 
 /// The serving AMF and UE context an NRPPa exchange is relayed through.
@@ -1508,27 +1523,43 @@ impl LmfContext {
         session: Option<&str>,
     ) -> tokio::sync::oneshot::Receiver<Vec<u8>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        // Resolved before the waiter lock is taken: the two locks are never held
+        // together.
+        let ue_context_id = session
+            .and_then(|corr| self.positioning_session_find(corr))
+            .and_then(|info| info.ue_context_id);
         if let Ok(mut w) = self.nrppa_waiters.write() {
             w.insert(
                 (procedure_code, txn),
                 NrppaWaiter {
                     sender: tx,
                     session: session.map(str::to_string),
+                    ue_context_id,
                 },
             );
         }
         rx
     }
 
-    /// Hand an answer to its waiter. `false` when nobody waits for it, or when
-    /// the waiter belongs to a UE-associated exchange of one session and the
-    /// notification names another (#903 review): the transaction id alone is not
-    /// enough to bind a UE-associated answer to its session.
+    /// Hand an answer, which arrived on `owner`'s subscription, to its waiter.
+    /// `false` when nobody waits for it, or when the waiter belongs to a
+    /// UE-associated exchange of one session and the notification names another
+    /// (#903 review): the transaction id alone is not enough to bind a
+    /// UE-associated answer to its session.
+    ///
+    /// #1518: nor is the session, which the sender names. A UE-associated answer
+    /// (Positioning Information, Positioning Activation) is delivered only when it
+    /// arrived on the subscription of the UE that session positions; on another
+    /// UE's, or on the non-UE subscription, it is refused. A non-UE answer (TRP
+    /// Information, Measurement) is accepted on any held N2 token, because the AMF
+    /// relays a non-UE NRPPa answer through a UE's N1N2 subscription when the LMF
+    /// holds no non-UE one (`n1n2_subscription_find_any_n2` in amfd).
     pub fn nrppa_deliver(
         &self,
         procedure_code: u8,
         txn: u16,
         notify_session: Option<&str>,
+        owner: &NotifyOwner,
         pdu: Vec<u8>,
     ) -> bool {
         let waiter = {
@@ -1543,6 +1574,15 @@ impl LmfContext {
                         "NRPPa answer to procedure {procedure_code} transaction {txn} names \
                          session {notify_session:?}, not the waiting {:?}; not delivered",
                         found.session
+                    );
+                    return false;
+                }
+                Some(found)
+                    if found.session.is_some() && !owner.serves(found.ue_context_id.as_deref()) =>
+                {
+                    log::warn!(
+                        "NRPPa answer to UE-associated procedure {procedure_code} transaction \
+                         {txn} arrived on another UE's subscription; not delivered"
                     );
                     return false;
                 }
@@ -1755,16 +1795,45 @@ impl LmfContext {
         let start = SubscriptionStart {
             n1_token: sub.n1_token.clone(),
             n2_token: sub.n2_token.clone(),
+            seq: sub.seq,
         };
         subs.insert(key.to_string(), sub);
         Some((start, evicted))
     }
 
-    /// The AMF created the subscription started for `key`: record its id.
-    pub fn amf_subscription_created(&self, key: &str, subscription_id: impl Into<String>) {
-        if let Ok(mut subs) = self.amf_subscriptions.write() {
-            if let Some(s) = subs.get_mut(key) {
+    /// The AMF created the subscription `start` began for `key`: record its id.
+    /// `false` when that start is no longer held (forgotten, or evicted, while the
+    /// create was in flight; R8 m2): the caller then unsubscribes it at the AMF,
+    /// which would otherwise go on notifying a URI that answers 404.
+    pub fn amf_subscription_created(
+        &self,
+        key: &str,
+        start: &SubscriptionStart,
+        subscription_id: impl Into<String>,
+    ) -> bool {
+        let Ok(mut subs) = self.amf_subscriptions.write() else {
+            return false;
+        };
+        match subs.get_mut(key) {
+            Some(s) if s.seq == start.seq && s.subscription_id.is_none() => {
                 s.subscription_id = Some(subscription_id.into());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The create `start` began for `key` ended without a subscription: it
+    /// failed, or the task running it was cancelled (#1518, R8 M2). Forget the
+    /// entry if it is still that start's and still in flight, so the key can be
+    /// subscribed again and the entry does not hold a cap slot forever.
+    pub fn amf_subscription_abandon(&self, key: &str, start: &SubscriptionStart) {
+        if let Ok(mut subs) = self.amf_subscriptions.write() {
+            if subs
+                .get(key)
+                .is_some_and(|s| s.seq == start.seq && s.subscription_id.is_none())
+            {
+                subs.remove(key);
             }
         }
     }
@@ -1798,6 +1867,13 @@ impl LmfContext {
             }
         }
         found
+    }
+
+    /// Whether `key` holds a subscription, created or in flight.
+    pub fn amf_subscription_holds(&self, key: &str) -> bool {
+        self.amf_subscriptions
+            .read()
+            .is_ok_and(|s| s.contains_key(key))
     }
 
     /// Number of held AMF subscriptions, created or in flight.
@@ -3724,12 +3800,13 @@ mod tests_real_solve {
         let (oldest, _) = ctx
             .amf_subscription_begin("k-1", &amf, Some("imsi-1"))
             .unwrap();
-        ctx.amf_subscription_created("k-1", "s-1");
+        assert!(ctx.amf_subscription_created("k-1", &oldest, "s-1"));
         for i in 2..MAX_AMF_SUBSCRIPTIONS {
             let key = format!("k-{i}");
-            ctx.amf_subscription_begin(&key, &amf, Some("imsi-x"))
+            let (start, _) = ctx
+                .amf_subscription_begin(&key, &amf, Some("imsi-x"))
                 .unwrap();
-            ctx.amf_subscription_created(&key, format!("s-{i}"));
+            assert!(ctx.amf_subscription_created(&key, &start, format!("s-{i}")));
         }
         assert_eq!(ctx.amf_subscription_count(), MAX_AMF_SUBSCRIPTIONS);
         let oldest_n1 = oldest.n1_token.clone().unwrap();
@@ -3771,13 +3848,35 @@ mod tests_real_solve {
             scheme: "http".into(),
             nf_instance_id: None,
         };
-        ctx.amf_subscription_begin("10.0.0.1:80|imsi-1", &amf, Some("imsi-1"))
+        let (start, _) = ctx
+            .amf_subscription_begin("10.0.0.1:80|imsi-1", &amf, Some("imsi-1"))
             .expect("first start");
         assert!(
             ctx.amf_subscription_get("10.0.0.1:80|imsi-1").is_none(),
             "no id while the create is in flight"
         );
-        ctx.amf_subscription_created("10.0.0.1:80|imsi-1", "n1n2sub-abc");
+        assert!(ctx.amf_subscription_created("10.0.0.1:80|imsi-1", &start, "n1n2sub-abc"));
+        assert!(
+            !ctx.amf_subscription_created("10.0.0.1:80|imsi-1", &start, "again"),
+            "a start is committed once"
+        );
+
+        // R8 m2: a create that lands after its entry went is not recorded, so the
+        // caller unsubscribes it. An abandon or a commit from an earlier start of
+        // the key does not touch a later one.
+        let (early, _) = ctx.amf_subscription_begin("k-m2", &amf, None).unwrap();
+        ctx.amf_subscription_forget("k-m2");
+        assert!(!ctx.amf_subscription_created("k-m2", &early, "orphan"));
+        let (late, _) = ctx.amf_subscription_begin("k-m2", &amf, None).unwrap();
+        ctx.amf_subscription_abandon("k-m2", &early);
+        assert!(!ctx.amf_subscription_created("k-m2", &early, "orphan"));
+        assert!(ctx
+            .notify_subscriber(NotifyKind::N2, late.n2_token.as_str())
+            .is_some());
+        ctx.amf_subscription_abandon("k-m2", &late);
+        assert!(ctx
+            .notify_subscriber(NotifyKind::N2, late.n2_token.as_str())
+            .is_none());
         assert_eq!(
             ctx.amf_subscription_get("10.0.0.1:80|imsi-1").as_deref(),
             Some("n1n2sub-abc")
@@ -4828,16 +4927,56 @@ mod tests_nrppa_waiters {
     #[test]
     fn a_ue_associated_answer_for_another_session_is_not_delivered() {
         let c = LmfContext::new();
-        let mut rx = c.nrppa_wait(9, 77, Some("corr-a"));
-        assert!(!c.nrppa_deliver(9, 77, Some("corr-b"), vec![1]));
-        assert!(!c.nrppa_deliver(9, 77, None, vec![1]));
+        let (corr_a, _done) =
+            c.positioning_session_register(Some("imsi-001010000000001".into()), 1, 1);
+        let owner = NotifyOwner::ue("imsi-001010000000001");
+        let mut rx = c.nrppa_wait(9, 77, Some(&corr_a));
+        assert!(!c.nrppa_deliver(9, 77, Some("corr-b"), &owner, vec![1]));
+        assert!(!c.nrppa_deliver(9, 77, None, &owner, vec![1]));
         assert!(rx.try_recv().is_err(), "still waiting");
-        assert!(c.nrppa_deliver(9, 77, Some("corr-a"), vec![2]));
+        assert!(c.nrppa_deliver(9, 77, Some(&corr_a), &owner, vec![2]));
         assert_eq!(rx.try_recv().unwrap(), vec![2]);
-        // A non-UE waiter takes any (or no) correlation.
+        // A non-UE waiter takes any (or no) correlation, on any held subscription.
         let mut rx = c.nrppa_wait(11, 78, None);
-        assert!(c.nrppa_deliver(11, 78, Some("whatever"), vec![3]));
+        assert!(c.nrppa_deliver(11, 78, Some("whatever"), &owner, vec![3]));
         assert_eq!(rx.try_recv().unwrap(), vec![3]);
+        let mut rx = c.nrppa_wait(11, 79, None);
+        assert!(c.nrppa_deliver(11, 79, None, &NotifyOwner::non_ue(), vec![4]));
+        assert_eq!(rx.try_recv().unwrap(), vec![4]);
+    }
+
+    /// #1518 (R8 M1): a UE-associated answer is taken only from the subscription
+    /// of the UE its session positions. Naming UE B's session on UE A's
+    /// subscription, or on the non-UE one, does not answer UE B's waiter.
+    ///
+    /// REVERT-VERIFIED: without the owner check in `nrppa_deliver`, UE A's
+    /// subscription answers UE B's waiter.
+    #[test]
+    fn a_ue_associated_answer_comes_only_from_that_ues_subscription_1518() {
+        let c = LmfContext::new();
+        let (corr_b, _done) = c.positioning_session_register_for(
+            Some("ue-ctx-b".into()),
+            Some("imsi-001010000000002".into()),
+            1,
+            2,
+        );
+        let mut rx = c.nrppa_wait(9, 80, Some(&corr_b));
+        assert!(!c.nrppa_deliver(9, 80, Some(&corr_b), &NotifyOwner::ue("ue-ctx-a"), vec![1]));
+        assert!(!c.nrppa_deliver(9, 80, Some(&corr_b), &NotifyOwner::non_ue(), vec![1]));
+        assert!(rx.try_recv().is_err(), "UE B's waiter is still waiting");
+        assert!(c.nrppa_deliver(9, 80, Some(&corr_b), &NotifyOwner::ue("ue-ctx-b"), vec![2]));
+        assert_eq!(rx.try_recv().unwrap(), vec![2]);
+
+        // A waiter for a session this LMF does not hold is answered by nobody.
+        let mut rx = c.nrppa_wait(9, 81, Some("corr-unknown"));
+        assert!(!c.nrppa_deliver(
+            9,
+            81,
+            Some("corr-unknown"),
+            &NotifyOwner::ue("ue-ctx-b"),
+            vec![3]
+        ));
+        assert!(rx.try_recv().is_err());
     }
 }
 
