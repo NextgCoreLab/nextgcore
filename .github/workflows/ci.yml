@@ -606,6 +606,11 @@ jobs:
           # nextgsim#480: profile_rollout waits on every rendered Deployment
           # (d445a's nef, d441e's nwdaf-mtlf/-anlf), against a stub kubectl.
           deploy/eks/profiles/demo/test-rollout.sh
+          # #1651: a rollout wait fails at once on a crash-looping pod of the
+          # workload's current revision (fixture rules, then the wait itself
+          # against a stub kubectl, PROFILE=5g end to end).
+          (cd deploy/eks/lib && python3 -m unittest -v test_crashloop)
+          deploy/eks/lib/test-rollout-wait.sh
           # k8s/demo-check.sh against a fake cluster: the private kubeconfig is
           # removed on every exit path, every artefact is scrubbed, and a
           # surviving token fails the run.
