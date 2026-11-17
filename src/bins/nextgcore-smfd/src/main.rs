@@ -1097,7 +1097,6 @@ async fn main() -> Result<()> {
                 .nrf_uri
                 .clone()
                 .unwrap_or_else(|| "http://127.0.0.1:7777".to_string()),
-            report_uri: format!("{advertise_uri}/nsmf-pdusession/v1/easdf-dns-reports"),
             edge_fqdn_patterns: patterns,
         });
     }
@@ -2597,6 +2596,19 @@ fn n1n2_failure_notify_uri(
     )
 }
 
+/// The EASDF DNS context `notificationUri` of the session at `sm_context_ref`
+/// (#1518): `{apiRoot}/nsmf-callback/v1/{smContextRef}/easdf-dns-report/{token}`.
+fn easdf_report_uri(
+    sm_context_ref: &str,
+    token: &nextgcore_sbi::callback_auth::CallbackToken,
+) -> String {
+    format!(
+        "{}/nsmf-callback/v1/{sm_context_ref}/easdf-dns-report/{}",
+        self_sbi_uri(),
+        token.as_str()
+    )
+}
+
 /// Whether the session at `sm_context_ref` admits a `kind` notification presenting
 /// `token` (`None`: the token-less URI of before #1518).
 /// See [`context::PolicyBinding::admits_callback`].
@@ -2644,6 +2656,13 @@ fn callback_not_admitted(sm_context_ref: &str, kind: context::SessionCallback) -
 /// (TS 29.518 §6.1.3.5, POST only), and the token is minted per transfer and dropped
 /// when the paging ends.
 ///
+/// `{ref}/easdf-dns-report/{token}` (the DNS context's `notificationUri`) is admitted
+/// on its token alone too: only the EASDF the context was created on holds it.
+/// Neasdf_DNSContext has no read of a context (easdfd serves POST, PUT and DELETE on
+/// it, and its create echoes the body to the creating SMF only), and easdfd reports
+/// over plaintext with no client certificate, so a verified-peer exemption would
+/// admit nothing.
+///
 /// The token-less URIs of before #1518, and the `n1-n2-failure/{ref}` and
 /// `amf-status` routes (whose URIs this SMF never hands out), stay bearer-only.
 fn oauth2_callback_exemptions() -> Vec<nextgcore_sbi::server::OAuth2CallbackExemption> {
@@ -2674,6 +2693,21 @@ fn oauth2_callback_exemptions() -> Vec<nextgcore_sbi::server::OAuth2CallbackExem
             "/nsmf-callback/v1/{var}/sdm-notify/{token}".to_string(),
             SessionCallback::SdmNotify,
             "UDM",
+        ),
+        // EASDF DNS message report (TS 23.548 §6.2.3.2.2), #1518.
+        OAuth2CallbackExemption::new(
+            "POST",
+            "/nsmf-callback/v1/{var}/easdf-dns-report/{token}",
+            |cb| {
+                let [sm_context_ref] = cb.vars.as_slice() else {
+                    return false;
+                };
+                session_admits_callback(
+                    sm_context_ref,
+                    SessionCallback::EasdfDnsReport,
+                    Some(cb.token),
+                )
+            },
         ),
         // Namf_Communication N1N2TransferFailure notification (TS 29.518 §5.2.2.3.2).
         OAuth2CallbackExemption::new(
@@ -2718,6 +2752,9 @@ fn tokened_callback<'a>(
         ["nsmf-callback", _, r, "sdm-notify", token] => {
             Some((*r, context::SessionCallback::SdmNotify, *token, None))
         }
+        ["nsmf-callback", _, r, "easdf-dns-report", token] => {
+            Some((*r, context::SessionCallback::EasdfDnsReport, *token, None))
+        }
         ["nsmf-callback", _, r, "n1-n2-failure", token] => Some((
             *r,
             context::SessionCallback::N1n2TransferFailure,
@@ -2730,7 +2767,10 @@ fn tokened_callback<'a>(
 
 /// Whether `segment` is the keyword of a tokened `nsmf-callback` URI (#1518).
 fn is_tokened_callback_keyword(segment: &str) -> bool {
-    matches!(segment, "sm-policy-notify" | "sdm-notify" | "n1-n2-failure")
+    matches!(
+        segment,
+        "sm-policy-notify" | "sdm-notify" | "n1-n2-failure" | "easdf-dns-report"
+    )
 }
 
 /// SBI request handler for SMF
@@ -2780,6 +2820,9 @@ async fn smf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             (context::SessionCallback::SdmNotify, _) => {
                 handle_sdm_notification(sm_context_ref, &request).await
             }
+            (context::SessionCallback::EasdfDnsReport, _) => {
+                handle_easdf_dns_report(Some(sm_context_ref), &request).await
+            }
             (context::SessionCallback::N1n2TransferFailure, _) => {
                 handle_n1n2_transfer_failure_notification(sm_context_ref, token, &request).await
             }
@@ -2795,7 +2838,12 @@ async fn smf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // the DNS context's notificationUri, so it must exist -- advertising a
         // callback that 404s is the emit-side-without-a-sink defect this repo has
         // been bitten by before.
-        ("nsmf-pdusession", "easdf-dns-reports", "POST") => handle_easdf_dns_report(&request).await,
+        //
+        // #1518: since, `{ref}/easdf-dns-report/{token}`. This token-less route is
+        // served only for a DNS context created before then.
+        ("nsmf-pdusession", "easdf-dns-reports", "POST") => {
+            handle_easdf_dns_report(None, &request).await
+        }
 
         // Create SM Context (N11)
         // POST /nsmf-pdusession/v1/sm-contexts
@@ -5461,11 +5509,16 @@ async fn handle_sm_context_create_inner(request: &SbiRequest) -> SbiResponse {
     // The UE's IP address is passed because the EASDF cannot associate a UDP
     // query with a session without it: a DNS datagram carries no context id, so
     // the source address is the only correlator (#276).
+    //
+    // #1518: the context's notificationUri names this session and carries a token
+    // minted for it, which the report route checks.
+    let easdf_report_token = nextgcore_sbi::callback_auth::CallbackToken::mint();
     let easdf_dns_context_id: Option<String> = easdf::create_dns_context(
         &supi,
         pdu_session_id,
         &dnn,
         std::net::Ipv4Addr::from(ue_ip_octets),
+        &easdf_report_uri(&sm_context_ref, &easdf_report_token),
     )
     .await;
 
@@ -5643,6 +5696,7 @@ async fn handle_sm_context_create_inner(request: &SbiRequest) -> SbiResponse {
                     sm_policy_notify_token: Some(sm_policy_notify_token.clone()),
                     sdm_notify_token: Some(sdm_notify_token.clone()),
                     network_paging: None,
+                    easdf_report_token: Some(easdf_report_token.clone()),
                 },
             );
         }
@@ -10603,10 +10657,15 @@ async fn send_sm_context_status_notification(
 /// recording the fact and saying so. `easdf_reported_eas` is where that work will
 /// read from.
 ///
-/// Always `204`: a report is a notification, and there is nothing for the EASDF to
-/// do about a report the SMF cannot attribute (it answers 204 with a log line
-/// rather than an error, so a stale context id does not make the EASDF retry).
-async fn handle_easdf_dns_report(request: &SbiRequest) -> SbiResponse {
+/// #1518: on the tokened route (`session` is the `{ref}` the router checked the
+/// token for), the report is applied only to that session, and only when its
+/// `dnsContextId` is that session's DNS context; otherwise 404 and nothing changes.
+/// On the token-less route of before (`session` None) it is applied only to a
+/// session whose DNS context was created before #1518 (no report token): that is
+/// the one context the EASDF holds the token-less URI for. Anything else is
+/// answered 204 with a log line, as before, so a stale context id does not make an
+/// EASDF retry, and changes nothing.
+async fn handle_easdf_dns_report(session: Option<&str>, request: &SbiRequest) -> SbiResponse {
     let Some(body) = request.http.content.as_deref() else {
         return problem_400(
             "MANDATORY_IE_MISSING",
@@ -10636,8 +10695,14 @@ async fn handle_easdf_dns_report(request: &SbiRequest) -> SbiResponse {
     let mut matched = false;
     if let Ok(ctx) = smf_self().read() {
         if let Ok(mut bindings) = ctx.policy_bindings.write() {
-            for binding in bindings.values_mut() {
-                if binding.easdf_dns_context_id.as_deref() == Some(ctx_id) {
+            for (reference, binding) in bindings.iter_mut() {
+                let owns = !ctx_id.is_empty()
+                    && binding.easdf_dns_context_id.as_deref() == Some(ctx_id)
+                    && match session {
+                        Some(r) => r == reference.as_str(),
+                        None => binding.easdf_report_token.is_none(),
+                    };
+                if owns {
                     binding.easdf_reported_eas = addresses.clone();
                     matched = true;
                     log::info!(
@@ -10656,9 +10721,13 @@ async fn handle_easdf_dns_report(request: &SbiRequest) -> SbiResponse {
     }
     if !matched {
         log::warn!(
-            "EASDF DNS report for context {ctx_id} ({fqdn}) matches no session: the context \
-             outlived its PDU session, or was created by another SMF"
+            "EASDF DNS report for context {ctx_id:?} ({fqdn:?}) matches no session it may \
+             name: the context outlived its PDU session, was created by another SMF, or \
+             belongs to another session than its URI"
         );
+        if let Some(reference) = session {
+            return callback_not_admitted(reference, context::SessionCallback::EasdfDnsReport);
+        }
     }
     SbiResponse::with_status(204)
 }
@@ -17522,7 +17591,6 @@ mod tests {
             .await;
         easdf::set_for_test(Some(easdf::EasdfConfig {
             nrf_uri: format!("http://127.0.0.1:{disc_port}"),
-            report_uri: "http://127.0.0.1:9/nsmf-pdusession/v1/easdf-dns-reports".to_string(),
             edge_fqdn_patterns: vec!["*.edge.example.com".to_string()],
         }));
         let supi = "imsi-001010016480003";
@@ -17533,6 +17601,7 @@ mod tests {
                     5,
                     "internet",
                     std::net::Ipv4Addr::new(10, 45, 0, 2),
+                    "http://127.0.0.1:9/nsmf-callback/v1/1/easdf-dns-report/0123456789abcdef",
                 )
                 .await
                 .expect("created past the gate");
@@ -17776,10 +17845,18 @@ mod tests {
                             "sdm-{sm_context_ref}"
                         ))),
                         network_paging: None,
+                        easdf_report_token: Some(test_callback_token(&format!(
+                            "eas-{sm_context_ref}"
+                        ))),
                     },
                 );
             }
         }
+    }
+
+    /// #1518: the EASDF's report path for a [`seed_binding`] session.
+    fn easdf_report_path(sm_context_ref: &str) -> String {
+        format!("/nsmf-callback/v1/{sm_context_ref}/easdf-dns-report/eas-{sm_context_ref}")
     }
 
     /// #1518: the routes the composition root registers as bearer-exempt: the
@@ -17800,6 +17877,7 @@ mod tests {
                 "POST /nsmf-callback/v1/{var}/sm-policy-notify/{token}/update",
                 "POST /nsmf-callback/v1/{var}/sm-policy-notify/{token}/terminate",
                 "POST /nsmf-callback/v1/{var}/sdm-notify/{token}",
+                "POST /nsmf-callback/v1/{var}/easdf-dns-report/{token}",
                 "POST /nsmf-callback/v1/{var}/n1-n2-failure/{token}",
             ]
         );
@@ -18107,7 +18185,8 @@ mod tests {
             }
         }
 
-        let req = SbiRequest::post("/nsmf-pdusession/v1/easdf-dns-reports").with_body(
+        // #1518: the session's own tokened URI.
+        let req = SbiRequest::post(easdf_report_path("easdf-report-ref")).with_body(
             serde_json::json!({
                 "dnsContextId": "ctx-report-1",
                 "fqdn": "vr.edge.example.com",
@@ -18293,6 +18372,26 @@ mod tests {
             create.2.contains("imsi-001010000000289"),
             "the DNS context must name the subscriber it belongs to, got {}",
             create.2
+        );
+        // #1518: its notificationUri is the session's own, with the binding's token.
+        let sm_context_ref = serde_json::from_str::<serde_json::Value>(
+            resp.http.content.as_deref().expect("JSON root"),
+        )
+        .expect("json")["smContextRef"]
+            .as_str()
+            .expect("smContextRef")
+            .to_string();
+        let token = lookup_policy_binding(&sm_context_ref)
+            .and_then(|b| b.easdf_report_token)
+            .expect("the binding holds the report token");
+        let body: serde_json::Value = serde_json::from_str(&create.2).expect("json");
+        let uri = body["notificationUri"].as_str().unwrap_or_default();
+        assert!(
+            uri.ends_with(&format!(
+                "/nsmf-callback/v1/{sm_context_ref}/easdf-dns-report/{}",
+                token.as_str()
+            )),
+            "got {uri}"
         );
 
         easdf::set_for_test(None);
@@ -28500,6 +28599,172 @@ mod tests {
             handle_n1n2_transfer_failure_notification(&reference, token.as_str(), &request).await;
         assert_eq!(right.status, 204);
         assert_eq!(up_state_1631(&reference), context::UpCnxState::Deactivated);
+        drop_session_for_retry(&reference);
+    }
+
+    /// #1518: the EASDF's DNS message report is acted on only for the session its
+    /// tokened URI names, with that session's token and its own DNS context:
+    /// - the right token and context: 204, recorded;
+    /// - a forged or another session's token, or another session's context under the
+    ///   right token: 404, nothing recorded;
+    /// - the token-less route of before #1518: only for a DNS context created before
+    ///   then (no report token); for one created since it records nothing.
+    /// On an OAuth2-required listener the tokened report is admitted on its token
+    /// alone (easdfd sends no bearer and no client certificate); a forged token and the
+    /// token-less route are 401.
+    ///
+    /// REVERT-VERIFIED: with the tokened arm not scoped to `{ref}`, the other
+    /// session's context is recorded; with the legacy arm not limited to token-less
+    /// contexts, the tokened session takes the token-less report; with the exemption
+    /// dropped, the listener answers 401 to the right token.
+    #[tokio::test]
+    async fn an_easdf_report_names_one_session_on_its_token_1518() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let (a, b, legacy) = ("151831", "151832", "151833");
+        for (r, psi) in [(a, 5), (b, 6), (legacy, 7)] {
+            seed_binding(r, psi);
+        }
+        if let Ok(ctx) = smf_self().read() {
+            let mut bindings = ctx.policy_bindings.write().unwrap();
+            for r in [a, b, legacy] {
+                bindings.get_mut(r).unwrap().easdf_dns_context_id = Some(format!("ctx-{r}"));
+            }
+            // A binding from before #1518: its DNS context holds the token-less URI.
+            let l = bindings.get_mut(legacy).unwrap();
+            l.callback_tokens = false;
+            l.easdf_report_token = None;
+        }
+        let report = |ctx_id: &str| {
+            serde_json::json!({
+                "dnsContextId": ctx_id,
+                "fqdn": "vr.edge.example.com",
+                "action": "RESOLVE",
+                "easIpAddresses": [format!("10.80.{}.8", ctx_id.len())],
+            })
+            .to_string()
+        };
+        let post = |path: String, body: String| async move {
+            smf_sbi_request_handler(SbiRequest::post(path).with_body(body, "application/json"))
+                .await
+                .status
+        };
+        let recorded = |r: &str| {
+            lookup_policy_binding(r)
+                .map(|b| b.easdf_reported_eas)
+                .unwrap_or_default()
+        };
+        let legacy_path = "/nsmf-pdusession/v1/easdf-dns-reports".to_string();
+
+        assert_eq!(
+            post(
+                format!("/nsmf-callback/v1/{a}/easdf-dns-report/eas-forged"),
+                report(&format!("ctx-{a}"))
+            )
+            .await,
+            404
+        );
+        assert_eq!(
+            post(
+                format!("/nsmf-callback/v1/{a}/easdf-dns-report/eas-{b}"),
+                report(&format!("ctx-{a}"))
+            )
+            .await,
+            404,
+            "another session's token"
+        );
+        assert_eq!(
+            post(easdf_report_path(a), report(&format!("ctx-{b}"))).await,
+            404,
+            "another session's context under a's token"
+        );
+        assert!(recorded(a).is_empty() && recorded(b).is_empty());
+        assert_eq!(
+            post(legacy_path.clone(), report(&format!("ctx-{a}"))).await,
+            204
+        );
+        assert!(
+            recorded(a).is_empty(),
+            "a context created since is not reported through the token-less route"
+        );
+        assert_eq!(
+            post(easdf_report_path(a), report(&format!("ctx-{a}"))).await,
+            204
+        );
+        assert_eq!(recorded(a).len(), 1, "a's own report, recorded");
+        assert!(recorded(b).is_empty());
+        assert_eq!(
+            post(legacy_path.clone(), report(&format!("ctx-{legacy}"))).await,
+            204
+        );
+        assert_eq!(recorded(legacy).len(), 1, "the pre-#1518 context's report");
+
+        // Through an OAuth2-required listener.
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let mut cfg = with_callback_exemptions(NextgcoreSbiServerConfig::new(addr));
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(serde_json::json!({"keys": []}));
+        let server = SbiServer::on_listener(cfg, listener);
+        server.start(smf_sbi_request_handler).await.expect("start");
+        let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", addr.port());
+        let mut statuses = Vec::new();
+        for (path, ctx_id) in [
+            (easdf_report_path(b), format!("ctx-{b}")),
+            (
+                format!("/nsmf-callback/v1/{b}/easdf-dns-report/eas-forged"),
+                format!("ctx-{b}"),
+            ),
+            (legacy_path.clone(), format!("ctx-{legacy}")),
+        ] {
+            let req = SbiRequest::post(path.clone()).with_body(report(&ctx_id), "application/json");
+            let status = tokio::time::timeout(Duration::from_secs(5), client.send_request(req))
+                .await
+                .expect("bounded")
+                .expect("response")
+                .status;
+            statuses.push((path, status));
+        }
+        server.stop().await.expect("stop");
+        assert_eq!(statuses[0].1, 204, "{:?}", statuses[0]);
+        assert_eq!(recorded(b).len(), 1, "admitted on its token and recorded");
+        for (path, status) in &statuses[1..] {
+            assert_eq!(*status, 401, "{path}");
+        }
+        if let Ok(ctx) = smf_self().read() {
+            let mut bindings = ctx.policy_bindings.write().unwrap();
+            for r in [a, b, legacy] {
+                bindings.remove(r);
+            }
+        }
+    }
+
+    /// #1631 review (R1 Y2): a paging past its guard does not hold a new one back
+    /// when the report reaches `begin_network_paging` without the expiry pass
+    /// `network_paging_pending` runs: the guard is part of "in progress" itself.
+    ///
+    /// REVERT-VERIFIED: with the guard check removed from
+    /// `network_paging_in_progress`, the aged paging refuses the same priority.
+    #[tokio::test]
+    async fn an_aged_paging_does_not_hold_back_a_new_one_1631() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let (reference, _seid) = seed_paged_session_1631("imsi-001010000016319", 5, 9);
+        let _first = begin_network_paging(&reference, Some(8)).expect("pages");
+        if let Ok(ctx) = smf_self().read() {
+            let mut bindings = ctx.policy_bindings.write().unwrap();
+            let paging = bindings
+                .get_mut(&reference)
+                .and_then(|b| b.network_paging.as_mut())
+                .expect("the paging");
+            paging.started = std::time::Instant::now()
+                .checked_sub(network_paging_guard() + std::time::Duration::from_secs(1))
+                .expect("the clock is past the guard");
+        }
+        assert_eq!(up_state_1631(&reference), context::UpCnxState::Deactivated);
+        assert!(
+            begin_network_paging(&reference, Some(8)).is_ok(),
+            "the aged paging is not in progress"
+        );
         drop_session_for_retry(&reference);
     }
 

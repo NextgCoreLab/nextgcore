@@ -1754,6 +1754,13 @@ pub struct PolicyBinding {
     /// still running.
     #[serde(skip)]
     pub network_paging: Option<NetworkPaging>,
+    /// The token in the EASDF DNS context's `notificationUri` (#1518, TS 23.548
+    /// §6.2.3.2.2): `{ref}/easdf-dns-report/{token}`. Minted with the binding, so a
+    /// DNS context created since always has one. `None` only for a binding from
+    /// before, whose DNS context (if any) holds the token-less
+    /// `nsmf-pdusession/v1/easdf-dns-reports`: that URI is served for exactly that
+    /// context, matched by its `dnsContextId`.
+    pub easdf_report_token: Option<nextgcore_sbi::callback_auth::CallbackToken>,
 }
 
 /// A network-triggered paging in progress (#1631): what step 3a's re-paging rule
@@ -1798,6 +1805,8 @@ pub enum SessionCallback {
     /// Namf_Communication N1N2TransferFailure notification (TS 29.518 §5.2.2.3.2),
     /// #1631: the `n1n2FailureTxfNotifURI` of a paging transfer.
     N1n2TransferFailure,
+    /// The EASDF's DNS message report (TS 23.548 §6.2.3.2.2), #1518.
+    EasdfDnsReport,
 }
 
 impl PolicyBinding {
@@ -1815,6 +1824,14 @@ impl PolicyBinding {
             SessionCallback::SmPolicyNotify => &self.sm_policy_notify_token,
             SessionCallback::SdmNotify => &self.sdm_notify_token,
             // #1631: no token-less form was ever handed out.
+            // The token-less form is matched by the DNS context, in the handler.
+            SessionCallback::EasdfDnsReport => {
+                return presented.is_some_and(|token| {
+                    self.easdf_report_token
+                        .as_ref()
+                        .is_some_and(|held| held.matches(token))
+                });
+            }
             SessionCallback::N1n2TransferFailure => {
                 return presented.is_some_and(|token| {
                     self.network_paging
@@ -1869,6 +1886,7 @@ impl PolicyBinding {
             sm_policy_notify_token: None,
             sdm_notify_token: None,
             network_paging: None,
+            easdf_report_token: None,
         }
     }
 }
@@ -5626,6 +5644,7 @@ mod tests {
             "callback_tokens",
             "sm_policy_notify_token",
             "sdm_notify_token",
+            "easdf_report_token",
         ] {
             obj.remove(member).expect("the binding writes the member");
         }
@@ -5638,6 +5657,7 @@ mod tests {
         tokened.callback_tokens = true;
         tokened.sm_policy_notify_token = Some(callback_token_1518("smp-secret-1518"));
         tokened.sdm_notify_token = Some(callback_token_1518("sdm-secret-1518"));
+        tokened.easdf_report_token = Some(callback_token_1518("eas-secret-1518"));
         let doc = serde_json::json!({
             "version": SmfContext::SNAPSHOT_VERSION,
             "pfcpSessions": {},
@@ -5658,6 +5678,8 @@ mod tests {
             assert!(new.callback_tokens);
             assert!(new.admits_callback(SessionCallback::SmPolicyNotify, Some("smp-secret-1518")));
             assert!(new.admits_callback(SessionCallback::SdmNotify, Some("sdm-secret-1518")));
+            assert!(new.admits_callback(SessionCallback::EasdfDnsReport, Some("eas-secret-1518")));
+            assert!(old.easdf_report_token.is_none(), "a pre-#1518 DNS context");
             assert!(!new.admits_callback(SessionCallback::SmPolicyNotify, None));
             assert!(!new.admits_callback(SessionCallback::SdmNotify, None));
         };

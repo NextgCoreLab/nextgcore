@@ -1317,6 +1317,8 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
                         sm_policy_notify_token: None,
                         sdm_notify_token: None,
                         network_paging: None,
+                        // No DNS context is created for a move.
+                        easdf_report_token: None,
                     },
                 );
             }
