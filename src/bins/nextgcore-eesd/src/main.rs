@@ -813,7 +813,13 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // params). There is NO individual /eec-contexts/{id} resource — a
         // path-param GET falls through to 404 below.
         ["eees-eeccontextreloc", "v1", "eec-contexts"] => {
-            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EECCONTEXTRELOC) {
+            // #1664 review M1: the token must be for this EES (AF or its own
+            // nfInstanceId), not merely carry the scope.
+            let audiences = auth::eec_context_reloc_audiences();
+            let audiences: Vec<&str> = audiences.iter().map(String::as_str).collect();
+            if let Some(resp) =
+                auth::require_oauth2_aud(&request, auth::SCOPE_EECCONTEXTRELOC, &audiences)
+            {
                 return resp;
             }
             match method {
@@ -3159,6 +3165,16 @@ mod tests {
     }
 
     fn bearer(sk: &SigningKey, kid: &str, scope: &str) -> String {
+        bearer_aud(sk, kid, scope, "EES")
+    }
+
+    /// #1664 review M1: the `eees-eeccontextreloc` route checks the audience,
+    /// which must name this EES as an AF.
+    fn reloc_bearer(sk: &SigningKey, kid: &str) -> String {
+        bearer_aud(sk, kid, "eees-eeccontextreloc", "AF")
+    }
+
+    fn bearer_aud(sk: &SigningKey, kid: &str, scope: &str, aud: &str) -> String {
         let exp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -3166,7 +3182,7 @@ mod tests {
             + 3600;
         let header = format!(r#"{{"alg":"ES256","typ":"JWT","kid":"{kid}"}}"#);
         let claims = serde_json::json!({
-            "iss":"CAPIF","sub":"eec-1","aud":"EES","scope":scope,"exp":exp,"iat":0
+            "iss":"CAPIF","sub":"eec-1","aud":aud,"scope":scope,"exp":exp,"iat":0
         })
         .to_string();
         let h = URL_SAFE_NO_PAD.encode(header.as_bytes());
@@ -4037,7 +4053,7 @@ mod tests {
         let req = SbiRequest::get(
             "/eees-eeccontextreloc/v1/eec-contexts?ees-id=peer&eec-cntx-id=cntx-105",
         )
-        .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"));
+        .with_header("Authorization", reloc_bearer(&sk, "k1"));
         let pull = block_on(ees_sbi_request_handler(req));
         assert_eq!(
             pull.status, 200,
@@ -5241,7 +5257,7 @@ mod tests {
             }
         }"#;
         let req = SbiRequest::post("/eees-eeccontextreloc/v1/eec-contexts")
-            .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"))
+            .with_header("Authorization", reloc_bearer(&sk, "k1"))
             .with_body(body, "application/json");
         let resp = block_on(ees_sbi_request_handler(req));
         assert_eq!(resp.status, 204, "spec push success is 204 No Content");
@@ -5254,7 +5270,7 @@ mod tests {
         // OLD flat bespoke push shape → 400 MANDATORY_IE_MISSING.
         let bad = r#"{"eecId":"eec1","ueId":"ue-1"}"#;
         let req = SbiRequest::post("/eees-eeccontextreloc/v1/eec-contexts")
-            .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"))
+            .with_header("Authorization", reloc_bearer(&sk, "k1"))
             .with_body(bad, "application/json");
         let resp = block_on(ees_sbi_request_handler(req));
         assert_eq!(resp.status, 400);
@@ -5268,7 +5284,7 @@ mod tests {
         // Query-form pull (T-EES side of the round trip) → 200 EECContext.
         let req =
             SbiRequest::get("/eees-eeccontextreloc/v1/eec-contexts?ees-id=ees-t&eec-cntx-id=c-1")
-                .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"));
+                .with_header("Authorization", reloc_bearer(&sk, "k1"));
         let resp = block_on(ees_sbi_request_handler(req));
         assert_eq!(resp.status, 200);
         let pulled: services::EECContext =
@@ -5282,7 +5298,7 @@ mod tests {
         let req = SbiRequest::get(format!(
             "/eees-eeccontextreloc/v1/eec-contexts?ees-id=ees-t&eec-cntx-id=c-1&sess-cntxs={filter}"
         ))
-        .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"));
+        .with_header("Authorization", reloc_bearer(&sk, "k1"));
         let resp = block_on(ees_sbi_request_handler(req));
         assert_eq!(resp.status, 200);
         let narrowed: services::EECContext =
@@ -5293,21 +5309,21 @@ mod tests {
 
         // Pull without the REQUIRED query params → 400.
         let req = SbiRequest::get("/eees-eeccontextreloc/v1/eec-contexts")
-            .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"));
+            .with_header("Authorization", reloc_bearer(&sk, "k1"));
         assert_eq!(block_on(ees_sbi_request_handler(req)).status, 400);
         let req = SbiRequest::get("/eees-eeccontextreloc/v1/eec-contexts?ees-id=ees-t")
-            .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"));
+            .with_header("Authorization", reloc_bearer(&sk, "k1"));
         assert_eq!(block_on(ees_sbi_request_handler(req)).status, 400);
 
         // Unknown eec-cntx-id → 404.
         let req =
             SbiRequest::get("/eees-eeccontextreloc/v1/eec-contexts?ees-id=ees-t&eec-cntx-id=nope")
-                .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"));
+                .with_header("Authorization", reloc_bearer(&sk, "k1"));
         assert_eq!(block_on(ees_sbi_request_handler(req)).status, 404);
 
         // The OLD path-param pull form → 404 (no individual resource in the yaml).
         let req = SbiRequest::get("/eees-eeccontextreloc/v1/eec-contexts/c-1")
-            .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"));
+            .with_header("Authorization", reloc_bearer(&sk, "k1"));
         assert_eq!(block_on(ees_sbi_request_handler(req)).status, 404);
 
         // No token → 401.
@@ -5341,7 +5357,7 @@ mod tests {
             "acrScenariosSelReq":true
         }"#;
         let req = SbiRequest::post("/eees-eeccontextreloc/v1/eec-contexts")
-            .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"))
+            .with_header("Authorization", reloc_bearer(&sk, "k1"))
             .with_body(body, "application/json");
         let resp = block_on(ees_sbi_request_handler(req));
         assert_eq!(resp.status, 200);
@@ -5359,7 +5375,7 @@ mod tests {
             "acrScenariosSelReq":true
         }"#;
         let req = SbiRequest::post("/eees-eeccontextreloc/v1/eec-contexts")
-            .with_header("Authorization", bearer(&sk, "k1", "eees-eeccontextreloc"))
+            .with_header("Authorization", reloc_bearer(&sk, "k1"))
             .with_body(body, "application/json");
         assert_eq!(block_on(ees_sbi_request_handler(req)).status, 204);
 
@@ -6490,6 +6506,22 @@ mod relocation_pull_token_1664_tests {
             .write()
             .unwrap_or_else(|e| e.into_inner()) = None;
         let without_token = pull().await;
+        // #1664 review M1: an NRF-signed token with the scope but another NF's
+        // audience is refused by the real router.
+        let smf_token = stand_in::es256_access_token(
+            &sk,
+            stand_in::TEST_NRF_KID,
+            "SMF",
+            auth::SCOPE_EECCONTEXTRELOC,
+        );
+        let wrong_aud = ees_sbi_request_handler(
+            SbiRequest::get(
+                "/eees-eeccontextreloc/v1/eec-contexts?ees-id=t-ees-1664&eec-cntx-id=cntx-unknown-1664",
+            )
+            .with_header("Authorization", format!("Bearer {smf_token}")),
+        )
+        .await
+        .status;
         auth::clear_auth_jwks();
 
         assert_eq!(
@@ -6497,6 +6529,7 @@ mod relocation_pull_token_1664_tests {
             relocation::PullOutcome::NotFound,
             "past the gate"
         );
+        assert_eq!(wrong_aud, 401, "a token for another NF's audience");
         assert_eq!(
             without_token,
             relocation::PullOutcome::Failed("S-EES answered 401".to_string())

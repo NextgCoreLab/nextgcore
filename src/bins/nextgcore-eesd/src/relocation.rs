@@ -31,7 +31,7 @@
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
-use nextgcore_sbi::security::{sbi_peer_client_config, SbiProfile};
+use nextgcore_sbi::security::{sbi_client_config_for_profile, SbiProfile};
 use nextgcore_sbi::types::NfType;
 use nextgcore_sbi::{SbiClient, SbiClientConfig, SbiRequest, UriScheme};
 
@@ -228,8 +228,19 @@ pub async fn pull_eec_context(request: PullRequest) -> PullOutcome {
 /// client (configuration/overview.md, mixed deployments are not supported).
 /// Under `dev` the scheme is the one `srcEesId` names, as before.
 fn pull_client_config(scheme: UriScheme, host: &str, port: u16) -> SbiClientConfig {
-    match SbiProfile::resolve() {
-        SbiProfile::Production => sbi_peer_client_config(host, port),
+    pull_client_config_for(SbiProfile::resolve(), scheme, host, port)
+}
+
+/// [`pull_client_config`] for an explicit `profile` (testable without the
+/// process-wide profile override).
+fn pull_client_config_for(
+    profile: SbiProfile,
+    scheme: UriScheme,
+    host: &str,
+    port: u16,
+) -> SbiClientConfig {
+    match profile {
+        SbiProfile::Production => sbi_client_config_for_profile(host, port, profile),
         SbiProfile::Dev => SbiClientConfig::new(host, port).with_scheme(scheme),
     }
 }
@@ -273,6 +284,25 @@ fn parse_api_root(uri: &str) -> Option<(UriScheme, String, u16, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1664 review m2: under `production` the pull is https with this EES's
+    /// client certificate even when `srcEesId` says http; under `dev` it keeps
+    /// the URI's scheme and presents no certificate.
+    #[test]
+    fn the_pull_follows_the_sbi_profile() {
+        let prod = pull_client_config_for(SbiProfile::Production, UriScheme::Http, "s-ees", 7777);
+        assert_eq!(prod.scheme, UriScheme::Https);
+        assert!(
+            prod.client_cert.is_some(),
+            "production presents the client certificate"
+        );
+        assert!(prod.ca_cert.is_some());
+        let dev = pull_client_config_for(SbiProfile::Dev, UriScheme::Http, "s-ees", 7777);
+        assert_eq!(dev.scheme, UriScheme::Http);
+        assert!(dev.client_cert.is_none());
+        let dev_https = pull_client_config_for(SbiProfile::Dev, UriScheme::Https, "s-ees", 7777);
+        assert_eq!(dev_https.scheme, UriScheme::Https);
+    }
 
     #[test]
     fn parse_api_root_accepts_absolute_uris_and_rejects_bare_identifiers() {
