@@ -1729,9 +1729,55 @@ pub struct PolicyBinding {
     /// `perPlmnSnssaiList` entry.
     #[serde(default)]
     pub nsac_plmn: Option<(String, String)>,
+    /// Whether this binding was made since #1518, when every callback URI this SMF
+    /// hands out for a session carries a token. `false` only for a binding restored
+    /// from a snapshot written before then (the member is absent, and serde takes
+    /// [`PolicyBinding::snapshot_default`]'s `false`): its PCF and UDM hold the
+    /// token-less URIs, which are therefore still served for it, and only while it
+    /// has no token ([`PolicyBinding::admits_callback`]). A rewrite keeps the value.
+    pub callback_tokens: bool,
+    /// The token in the `SmPolicyContextData.notificationUri` handed to the PCF
+    /// (#1518, TS 29.512 §4.2.2.2): `{ref}/sm-policy-notify/{token}`, to which the PCF
+    /// appends `/update` or `/terminate`. One per binding, so a reused `smContextRef`
+    /// inherits nothing. `None` when no URI was handed out (an EPS move, #475) and
+    /// for a pre-#1518 binding.
+    pub sm_policy_notify_token: Option<nextgcore_sbi::callback_auth::CallbackToken>,
+    /// The token in the Nudm_SDM `callbackReference` (#1518, TS 29.503 §5.2.2.3.2):
+    /// `{ref}/sdm-notify/{token}`. Its own token, not the PCF's: the UDM and the PCF
+    /// each hold only their own URI.
+    pub sdm_notify_token: Option<nextgcore_sbi::callback_auth::CallbackToken>,
+}
+
+/// The session callbacks this SMF hands out a URI for (#1518).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionCallback {
+    /// Npcf_SMPolicyControl UpdateNotify (TS 29.512 §4.2.3.2, §4.2.3.3).
+    SmPolicyNotify,
+    /// Nudm_SDM_Notification (TS 29.503 §5.2.2.5.2).
+    SdmNotify,
 }
 
 impl PolicyBinding {
+    /// Whether a notification of `kind` to this session may be acted on (#1518).
+    /// `presented` is the token in the request's path, `None` for the token-less URI
+    /// of before #1518:
+    /// - a token is accepted only when it is the one this binding holds for `kind`
+    ///   (constant time);
+    /// - the token-less URI is accepted only for a binding restored from before
+    ///   #1518, and only while it holds no token for `kind`. A binding made, adopted
+    ///   or moved here since never handed one out, so its token-less URI is refused:
+    ///   otherwise dropping the token from the path would skip it (#1625 review M1).
+    pub fn admits_callback(&self, kind: SessionCallback, presented: Option<&str>) -> bool {
+        let held = match kind {
+            SessionCallback::SmPolicyNotify => &self.sm_policy_notify_token,
+            SessionCallback::SdmNotify => &self.sdm_notify_token,
+        };
+        match presented {
+            Some(token) => held.as_ref().is_some_and(|h| h.matches(token)),
+            None => !self.callback_tokens && held.is_none(),
+        }
+    }
+
     /// Per-field fallback for deserialising a durable snapshot written before a
     /// member existed (issue #191).
     ///
@@ -1767,6 +1813,10 @@ impl PolicyBinding {
             nsac_nf_id: None,
             nsac_nsacf: None,
             nsac_plmn: None,
+            // Absent from a snapshot only when it was written before #1518.
+            callback_tokens: false,
+            sm_policy_notify_token: None,
+            sdm_notify_token: None,
         }
     }
 }
@@ -5494,6 +5544,144 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn callback_token_1518(token: &str) -> nextgcore_sbi::callback_auth::CallbackToken {
+        serde_json::from_value(serde_json::json!(token)).expect("token")
+    }
+
+    /// #1518: a binding from a snapshot written before #1518 (no `callback_tokens`,
+    /// no tokens) restores as pre-#1518, and a rewrite keeps it so; a tokened binding
+    /// restores with its marker and both tokens. The marker is what decides whether
+    /// the token-less URIs are served ([`PolicyBinding::admits_callback`]), so losing
+    /// it on a rewrite would either drop a live PCF's notifications or serve the
+    /// token-less form for a session that was handed a token.
+    ///
+    /// REVERT-VERIFIED: with `snapshot_default` marking bindings tokened, the
+    /// pre-#1518 binding restores unmarked and this fails.
+    #[test]
+    fn a_pre_1518_binding_restores_unmarked_and_a_rewrite_keeps_it_1518() {
+        let path = temp_state_path("1518-marker");
+        let mut legacy = serde_json::to_value(binding(
+            "imsi-001010000015180",
+            1,
+            [10, 45, 15, 18],
+            crate::gsm_sm::GsmState::Operational,
+        ))
+        .unwrap();
+        let obj = legacy.as_object_mut().unwrap();
+        for member in [
+            "callback_tokens",
+            "sm_policy_notify_token",
+            "sdm_notify_token",
+        ] {
+            obj.remove(member).expect("the binding writes the member");
+        }
+        let mut tokened = binding(
+            "imsi-001010000015181",
+            2,
+            [10, 45, 15, 19],
+            crate::gsm_sm::GsmState::Operational,
+        );
+        tokened.callback_tokens = true;
+        tokened.sm_policy_notify_token = Some(callback_token_1518("smp-secret-1518"));
+        tokened.sdm_notify_token = Some(callback_token_1518("sdm-secret-1518"));
+        let doc = serde_json::json!({
+            "version": SmfContext::SNAPSHOT_VERSION,
+            "pfcpSessions": {},
+            "policyBindings": { "3": legacy, "4": tokened },
+            "ipv4Allocations": [],
+            "cpN4Seids": {}
+        });
+        std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+
+        let check = |ctx: &SmfContext| {
+            let bindings = ctx.policy_bindings.read().unwrap();
+            let old = bindings.get("3").expect("the pre-#1518 binding restores");
+            assert!(!old.callback_tokens, "restored as pre-#1518");
+            assert!(old.sm_policy_notify_token.is_none() && old.sdm_notify_token.is_none());
+            assert!(old.admits_callback(SessionCallback::SmPolicyNotify, None));
+            assert!(old.admits_callback(SessionCallback::SdmNotify, None));
+            let new = bindings.get("4").expect("the tokened binding restores");
+            assert!(new.callback_tokens);
+            assert!(new.admits_callback(SessionCallback::SmPolicyNotify, Some("smp-secret-1518")));
+            assert!(new.admits_callback(SessionCallback::SdmNotify, Some("sdm-secret-1518")));
+            assert!(!new.admits_callback(SessionCallback::SmPolicyNotify, None));
+            assert!(!new.admits_callback(SessionCallback::SdmNotify, None));
+        };
+        {
+            let ctx = ctx_with_state(&path);
+            check(&ctx);
+            // A rewrite, as any later change to the session makes.
+            ctx.persist();
+        }
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["policyBindings"]["3"]["callback_tokens"], false);
+        assert_eq!(raw["policyBindings"]["4"]["callback_tokens"], true);
+        check(&ctx_with_state(&path));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #1518: the session callback rule. A token is accepted only for its own
+    /// callback and binding; the token-less URI only for a pre-#1518 binding that
+    /// holds no token for it. A binding made since without a URI handed out (the
+    /// EPS move) accepts neither form.
+    ///
+    /// REVERT-VERIFIED: with the `callback_tokens` condition dropped, the EPS-moved
+    /// binding accepts the token-less form; with `held.is_none()` dropped, the
+    /// partly tokened legacy binding does.
+    #[test]
+    fn a_session_callback_is_admitted_only_on_its_own_token_1518() {
+        use SessionCallback::{SdmNotify, SmPolicyNotify};
+        let mut b = PolicyBinding::snapshot_default();
+        b.callback_tokens = true;
+        b.sm_policy_notify_token = Some(callback_token_1518("smp-a"));
+        b.sdm_notify_token = Some(callback_token_1518("sdm-a"));
+        assert!(b.admits_callback(SmPolicyNotify, Some("smp-a")));
+        assert!(b.admits_callback(SdmNotify, Some("sdm-a")));
+        // Each callback's token is its own.
+        assert!(!b.admits_callback(SmPolicyNotify, Some("sdm-a")));
+        assert!(!b.admits_callback(SdmNotify, Some("smp-a")));
+        assert!(!b.admits_callback(SmPolicyNotify, Some("smp-b")));
+        assert!(!b.admits_callback(SmPolicyNotify, Some("")));
+        assert!(!b.admits_callback(SmPolicyNotify, None));
+        assert!(!b.admits_callback(SdmNotify, None));
+
+        // An EPS-moved binding: made since #1518, no URI handed out.
+        let mut moved = PolicyBinding::snapshot_default();
+        moved.callback_tokens = true;
+        for kind in [SmPolicyNotify, SdmNotify] {
+            assert!(!moved.admits_callback(kind, None), "{kind:?}");
+            assert!(!moved.admits_callback(kind, Some("")), "{kind:?}");
+        }
+
+        // A pre-#1518 binding: its token-less URIs, while it holds no token.
+        let mut legacy = PolicyBinding::snapshot_default();
+        assert!(legacy.admits_callback(SmPolicyNotify, None));
+        assert!(!legacy.admits_callback(SdmNotify, Some("x")));
+        legacy.sm_policy_notify_token = Some(callback_token_1518("smp-l"));
+        assert!(
+            !legacy.admits_callback(SmPolicyNotify, None),
+            "tokened since"
+        );
+        assert!(legacy.admits_callback(SmPolicyNotify, Some("smp-l")));
+        assert!(legacy.admits_callback(SdmNotify, None), "still token-less");
+    }
+
+    /// #1518: a binding's Debug output (logged on several paths) carries neither
+    /// callback token.
+    ///
+    /// REVERT-VERIFIED: with `CallbackToken`'s Debug derived, this fails.
+    #[test]
+    fn a_binding_s_debug_output_carries_no_callback_token_1518() {
+        let mut b = PolicyBinding::snapshot_default();
+        b.sm_policy_notify_token = Some(callback_token_1518("smp-secret-debug"));
+        b.sdm_notify_token = Some(callback_token_1518("sdm-secret-debug"));
+        let out = format!("{b:?}");
+        assert!(!out.contains("smp-secret-debug"), "{out}");
+        assert!(!out.contains("sdm-secret-debug"), "{out}");
+        assert!(out.contains("<redacted>"), "{out}");
     }
 
     /// The consequence that makes this a correctness fix and not just resilience:
