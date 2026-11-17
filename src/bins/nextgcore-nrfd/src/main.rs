@@ -1044,6 +1044,11 @@ fn registers_itself(require_oauth2: bool, require_server: bool) -> bool {
 /// The one lock for tests that add or remove the NRF's own entry in the
 /// process-global registry (#1644 review M1), declared beside the function that
 /// writes it: a test deregistering the entry raced one that needs it.
+///
+/// It also covers the dev PKI's NRF row (`docker/rust/certs/nf-identities.txt`,
+/// `...0000000000f0`), the NRF's own entry in the shipped stack: the #1617
+/// listener test registers it as the NRF's self client, and the dev-PKI test
+/// needs it absent (#1733: the two overlapped and saw each other's entry).
 #[cfg(test)]
 fn self_entry_test_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -11458,6 +11463,8 @@ mod server_tls_tests_1617 {
         let _g = nextgcore_sbi::nrf_tls::NRF_CLIENT_TLS_TEST_LOCK
             .lock()
             .await;
+        // It registers the dev PKI's NRF ID (#1733).
+        let _self_entry = self_entry_test_lock().lock().await;
         let pki = DevPki::generate("listener");
         let foreign = DevPki::generate("foreign");
         let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
@@ -11677,6 +11684,9 @@ mod dev_pki_tests_1617 {
     /// other-type PUT is 201.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn each_dev_certificate_registers_only_itself_over_mtls_1617() {
+        // The NRF row's ID is the one the #1617 listener test registers, and
+        // every row's ID must be absent here (#1733).
+        let _self_entry = self_entry_test_lock().lock().await;
         let pki = DevPki::generate("register");
         let ids = identities();
         let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
