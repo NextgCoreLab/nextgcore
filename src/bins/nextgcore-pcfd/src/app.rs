@@ -8399,6 +8399,36 @@ mod tests {
         udr.stop().await.ok();
     }
 
+    /// Removes the AM and SM policy UEs of `supis` when dropped (#1621 review
+    /// round 3). The PCF context is process-global and `pcf_context_init` keeps
+    /// what earlier tests left, and its UE lists are capped at 64. A test that left
+    /// its UEs behind pushed a later one (`update_notify_caps_the_session_ambr_
+    /// per_the_setting_1402`, 20 creates) over the cap in some test orders: its
+    /// create answered 400 CREATION_FAILED. Declared after `CONTEXT_GUARD`, so it
+    /// runs while the lock is still held, even when the test panics.
+    struct UeCleanup1621(Vec<String>);
+
+    fn cleanup_1621(supis: impl IntoIterator<Item = String>) -> UeCleanup1621 {
+        UeCleanup1621(supis.into_iter().collect())
+    }
+
+    impl Drop for UeCleanup1621 {
+        fn drop(&mut self) {
+            let ctx = pcf_self();
+            let Ok(context) = ctx.read() else {
+                return;
+            };
+            for supi in &self.0 {
+                if let Some(ue) = context.ue_sm_find_by_supi(supi) {
+                    context.ue_sm_remove(ue.id);
+                }
+                if let Some(ue) = context.ue_am_find_by_supi(supi) {
+                    context.ue_am_remove(ue.id);
+                }
+            }
+        }
+    }
+
     /// #1613: a mock NRF whose discovery lists one UDR at `127.0.0.1:{udr_port}`,
     /// or none when `udr_port` is 0. The UDR itself is whatever the test put on
     /// that port: nothing (refused), a listener that never answers, or
@@ -8601,6 +8631,11 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _ues = cleanup_1621(
+            ([16131u64, 16132, 16133])
+                .into_iter()
+                .map(|n| format!("imsi-0010100000{n}")),
+        );
         pcf_context_init(64, 64);
         let association = |supi: &str| pcf_self().read().unwrap().ue_am_find_by_supi(supi);
 
@@ -8663,6 +8698,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _ues = cleanup_1621((16211u64..=16215).map(|n| format!("imsi-0010100000{n}")));
         pcf_context_init(64, 64);
         let mode = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(UDR_OK_1621));
         let (udr, port) = start_udr_1621(mode.clone()).await;
@@ -8727,6 +8763,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _ues = cleanup_1621((16241u64..=16245).map(|n| format!("imsi-0010100000{n}")));
         pcf_context_init(64, 64);
         let mode = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(UDR_OK_1621));
         let (udr, port) = start_udr_1621(mode.clone()).await;
@@ -8788,6 +8825,11 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _ues = cleanup_1621(
+            ([16251u64, 16252])
+                .into_iter()
+                .map(|n| format!("imsi-0010100000{n}")),
+        );
         pcf_context_init(64, 64);
         let mode = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(UDR_OK_1621));
         let udr_delay = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -8857,6 +8899,9 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _ues = cleanup_1621(
+            ((16220u64..=16224).chain([16229])).map(|n| format!("imsi-0010100000{n}")),
+        );
         pcf_context_init(64, 64);
         let mode = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(UDR_OK_1621));
         let (udr, port) = start_udr_1621(mode.clone()).await;
@@ -8912,6 +8957,11 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _ues = cleanup_1621(
+            ([16135u64, 16136, 16137])
+                .into_iter()
+                .map(|n| format!("imsi-0010100000{n}")),
+        );
         let _emergency = crate::test_support::emergency_dnns(crate::emergency_dnn::DEFAULT);
         pcf_context_init(64, 64);
         let refused = nextgcore_sbi::test_support::down_port();
