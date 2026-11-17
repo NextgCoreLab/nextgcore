@@ -8,12 +8,17 @@
 # demo-check.sh runs only after deploy-eks.sh returns and a debug container
 # attaches: its timing is the rollout's, not the UE's (47 s into energy-1's
 # 90 s grace on devtest1 2026-11-17, with no margin guaranteed). So:
-#   - ipv6-off (init): IPv6 off in the pod's network namespace before nr-ue
-#     creates its TUN, so the kernel sends no packet of its own;
+#   - IPv6 off in the pod's network namespace before nr-ue creates its TUN,
+#     so the kernel sends no packet of its own. Done by the ue container itself
+#     (already privileged in the base) in a wrapper around nr-ue: no second
+#     privileged container. Not a pod sysctl (net.ipv6.* is unsafe: it needs a
+#     kubelet allowlist), not a NET_ADMIN-only container (/proc/sys read-only);
+#     the base args (-c /etc/nextgsim/ue.yaml) reach nr-ue as "$@";
 #   - uplink-burst (sidecar, the ue image): as soon as uesimtun* has an IPv4
 #     address, 5 pings with a 446-byte payload to the UPF's 10.45.0.1 (gNB log
 #     len=475, a size nothing else sends), then idle. scenario.sh asserts the
-#     burst on gNB-A before lb-1's IntentSubmitted, and no len=49 packet.
+#     sidecar transmitted its pings (its own log), that they arrived (gNB-A's
+#     len=475 lines) before lb-1's IntentSubmitted, and no len=49 packet.
 # The compose arm does the same (nextgsim scripts/demo/d446a-check.sh,
 # d446a.compose.yml). No port is opened; the sidecar only sends ICMP through
 # the UE's own tunnel.
@@ -28,19 +33,19 @@ spec:
       annotations:
         kubectl.kubernetes.io/default-container: ue
     spec:
-      initContainers:
-      - name: ipv6-off
-        image: busybox:1.36
-        securityContext:
-          privileged: true   # /proc/sys is read-only otherwise; net.ipv6.* is not a safe pod sysctl
+      containers:
+      - name: ue
         command:
         - sh
         - -c
         - |
-          set -eu
-          if [ ! -d /proc/sys/net/ipv6 ]; then echo "[ipv6-off] no IPv6 in this kernel"; exit 0; fi
-          sysctl -w net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1
-      containers:
+          if [ -d /proc/sys/net/ipv6 ]; then
+            echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6 \
+              && echo 1 > /proc/sys/net/ipv6/conf/default/disable_ipv6 \
+              && echo "[ue] IPv6 off in the pod network namespace (nextgcore#1630)"
+          fi
+          exec nr-ue "$@"
+        - nr-ue
       - name: uplink-burst
         image: nextgsim-ue:latest
         imagePullPolicy: IfNotPresent

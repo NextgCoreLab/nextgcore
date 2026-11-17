@@ -99,6 +99,7 @@ selftest_in_order
 # Returns non-zero (and counts a failure) when any of them does not hold.
 d446a_uplink_burst() {
     local before=${fails}
+    # Transmitted, from the sidecar's own log; that they ARRIVED is the gNB-A step below.
     grep -qE '^5 packets transmitted' "$1" \
         || fail "[ue] the uplink-burst sidecar did not send its 5 pings (see d446a/uplink-burst.log)"
     in_order "$2" gnb-a 'Uplink data \(RLC\): ue_id=[0-9]+, drb_id=1, psi=1, len=475([^0-9]|$)' \
