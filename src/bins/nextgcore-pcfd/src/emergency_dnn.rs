@@ -41,9 +41,37 @@ pub fn set(dnns: Vec<String>) {
     *EMERGENCY_DNNS.write().unwrap_or_else(|e| e.into_inner()) = Some(dnns);
 }
 
-/// Whether `dnn` is one of the Emergency DNs in force.
+/// Whether `dnn` is one of the Emergency DNs in force, compared on its Network
+/// Identifier (#1621 review round 2): the SMF may send the full DNN,
+/// `sos.mnc001.mcc001.gprs`, as well as `sos` (TS 23.003 §9.1, §9A).
 pub fn is_emergency(dnn: &str) -> bool {
-    get().iter().any(|d| d.eq_ignore_ascii_case(dnn))
+    let ni = network_identifier(dnn);
+    get()
+        .iter()
+        .any(|d| network_identifier(d).eq_ignore_ascii_case(ni))
+}
+
+/// The Network Identifier of a DNN (TS 23.003 §9.1): the DNN without a trailing
+/// Operator Identifier `mnc<MNC>.mcc<MCC>.gprs` (three-digit MNC and MCC,
+/// §9.1.2), or the whole DNN when it carries none.
+pub fn network_identifier(dnn: &str) -> &str {
+    let digits3 = |label: &str, prefix: &str| {
+        label.len() == prefix.len() + 3
+            && label[..prefix.len()].eq_ignore_ascii_case(prefix)
+            && label[prefix.len()..].bytes().all(|b| b.is_ascii_digit())
+    };
+    let labels: Vec<&str> = dnn.rsplitn(4, '.').collect();
+    match labels.as_slice() {
+        [gprs, mcc, mnc, ni]
+            if gprs.eq_ignore_ascii_case("gprs")
+                && digits3(mcc, "mcc")
+                && digits3(mnc, "mnc")
+                && !ni.is_empty() =>
+        {
+            ni
+        }
+        _ => dnn,
+    }
 }
 
 /// The list a config root states: `pcf.policy.emergency_dnns`, [`DEFAULT`] when
@@ -80,6 +108,41 @@ mod tests {
 
     fn root(yaml: &str) -> serde_yaml::Value {
         serde_yaml::from_str(yaml).unwrap()
+    }
+
+    /// #1621 review round 2: the full DNN form and any case match on the Network
+    /// Identifier (TS 23.003 §9.1).
+    #[test]
+    fn an_emergency_dn_matches_on_its_network_identifier() {
+        assert_eq!(network_identifier("sos.mnc001.mcc001.gprs"), "sos");
+        assert_eq!(network_identifier("SOS.MNC001.MCC001.GPRS"), "SOS");
+        assert_eq!(network_identifier("ims.sos.mnc123.mcc456.gprs"), "ims.sos");
+        assert_eq!(network_identifier("sos"), "sos");
+        assert_eq!(
+            network_identifier("sos.mnc01.mcc001.gprs"),
+            "sos.mnc01.mcc001.gprs"
+        );
+        assert_eq!(
+            network_identifier(".mnc001.mcc001.gprs"),
+            ".mnc001.mcc001.gprs"
+        );
+        assert_eq!(network_identifier("internet.example"), "internet.example");
+
+        let _lock = EMERGENCY_DNNS_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = get();
+        set(vec!["sos".to_string()]);
+        let results = [
+            is_emergency("sos"),
+            is_emergency("SOS"),
+            is_emergency("sos.mnc001.mcc001.gprs"),
+            is_emergency("Sos.Mnc001.Mcc001.Gprs"),
+            is_emergency("internet"),
+            is_emergency("sos.example.org"),
+        ];
+        set(previous);
+        assert_eq!(results, [true, true, true, true, false, false]);
     }
 
     #[test]

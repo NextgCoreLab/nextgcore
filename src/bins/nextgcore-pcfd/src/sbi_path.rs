@@ -1746,42 +1746,46 @@ pub async fn pcf_discover_endpoints(
     service_name: &str,
     within: std::time::Duration,
 ) -> Result<Vec<DiscoveredEndpoint>, String> {
-    let query = async {
-        let ctx = global_context();
-        let Some(nrf_uri) = ctx.get_nrf_uri().await else {
-            return Ok(Vec::new());
-        };
-        let (nrf_host, nrf_port) = parse_uri_host_port(&nrf_uri)?;
-        let client = ctx.get_client(&nrf_host, nrf_port).await;
-        let path = format!(
-            "/nnrf-disc/v1/nf-instances?target-nf-type={target_nf_type}&requester-nf-type=PCF&service-names={service_name}"
-        );
-        let response = client
-            .get(&path)
-            .await
-            .map_err(|e| format!("NRF discovery failed: {e}"))?;
-        if response.status != 200 {
-            return Err(format!("NRF discovery returned status {}", response.status));
-        }
-        let body = response
-            .http
-            .content
-            .ok_or("Empty NRF discovery response")?;
-        let json: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|e| format!("Invalid NRF discovery response: {e}"))?;
-        Ok(json
-            .get("nfInstances")
-            .and_then(|v| v.as_array())
-            .map(|nfs| {
-                nfs.iter()
-                    .filter_map(|nf| parse_instance_endpoint(nf, service_name))
-                    .collect()
-            })
-            .unwrap_or_default())
-    };
-    tokio::time::timeout(within, query)
+    let json = tokio::time::timeout(within, nrf_search(target_nf_type, service_name))
         .await
-        .map_err(|_| format!("NRF discovery did not answer within {within:?}"))?
+        .map_err(|_| format!("NRF discovery did not answer within {within:?}"))??;
+    Ok(json
+        .as_ref()
+        .and_then(|j| j.get("nfInstances"))
+        .and_then(|v| v.as_array())
+        .map(|nfs| {
+            nfs.iter()
+                .filter_map(|nf| parse_instance_endpoint(nf, service_name))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// [`pcf_discover_endpoints`] for the UDR's `nudr-dr`, which also remembers the
+/// first UDR listed, with its NF instance id and the SearchResult's
+/// `validityPeriod`, for the create path (#1621 review M1 and round 2).
+pub async fn pcf_discover_udrs(
+    within: std::time::Duration,
+) -> Result<Vec<DiscoveredEndpoint>, String> {
+    let nrf_uri = global_context().get_nrf_uri().await;
+    let json = tokio::time::timeout(within, nrf_search("UDR", "nudr-dr"))
+        .await
+        .map_err(|_| format!("NRF discovery did not answer within {within:?}"))??;
+    let Some(json) = json else {
+        return Ok(Vec::new());
+    };
+    if let Some(nrf_uri) = nrf_uri {
+        remember_udr_from_search(&nrf_uri, &json);
+    }
+    Ok(json
+        .get("nfInstances")
+        .and_then(|v| v.as_array())
+        .map(|nfs| {
+            nfs.iter()
+                .filter_map(|nf| parse_instance_endpoint(nf, "nudr-dr"))
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 /// Build a bounded-timeout SBI client for a discovered endpoint. Attaches an
@@ -1894,6 +1898,9 @@ pub enum UdrError {
     /// #1613: a UDR was discovered, but the request to it got no answer (a
     /// transport error, or the read's bound expired).
     NoAnswer(String),
+    /// #1621 review round 2: the NRF reports the remembered UDR SUSPENDED or
+    /// UNDISCOVERABLE.
+    Unavailable(String),
     /// Anything else: the NRF discovery failed, or the UDR's answer could not be
     /// read.
     Other(String),
@@ -1903,7 +1910,7 @@ impl std::fmt::Display for UdrError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             UdrError::Status(s) => write!(f, "nudr-dr GET returned status {s}"),
-            UdrError::NoAnswer(e) | UdrError::Other(e) => f.write_str(e),
+            UdrError::NoAnswer(e) | UdrError::Unavailable(e) | UdrError::Other(e) => f.write_str(e),
         }
     }
 }
@@ -1930,49 +1937,99 @@ const UDR_CREATE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 const UDR_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// #1621 review M1: how long a discovered UDR is remembered when the NRF's
-/// SearchResult carries no `validityPeriod` (TS 29.510 §6.2.6.2.2: "the time
-/// period, in seconds, during which the search result can be cached by the NF
-/// service consumer"; absent, the consumer applies its own policy).
+/// SearchResult carries no `validityPeriod` (TS 29.510 Table 6.2.6.2.2-1: "the
+/// time in seconds during which the discovery result is considered valid and can
+/// be cached by the NF Service Consumer").
 const UDR_CACHE_DEFAULT_VALIDITY: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// A UDR endpoint the NRF listed, with the NRF it was learned from and until when
-/// it may be used (#1621 review M1).
+/// #1621 review round 2, M-1: the longest a discovered UDR is remembered, whatever
+/// `validityPeriod` the NRF states: a huge value (`u64::MAX`) must neither
+/// overflow the deadline nor pin a UDR for ever.
+pub(crate) const UDR_CACHE_MAX_VALIDITY: std::time::Duration =
+    std::time::Duration::from_secs(24 * 3600);
+
+/// A UDR the NRF listed, with the NRF it was learned from, its NF instance id
+/// (for the NFProfile retrieval that tells "deregistered" from "down"), and until
+/// when it may be used (#1621 review M1).
 #[derive(Debug, Clone)]
 struct CachedUdr {
     nrf_uri: String,
+    nf_instance_id: Option<String>,
     ep: DiscoveredEndpoint,
     until: std::time::Instant,
 }
 
 /// The UDR the create path or the policy-data subscription task last discovered
-/// (#1621 review M1). An NRF that fails, or lists no UDR because the UDR it had
-/// missed its heartbeats and went SUSPENDED (TS 29.510 §5.2.2.3.2), says nothing
-/// about whether the network has a UDR; this remembers that it has one, and where.
-/// Cleared by [`forget_udr`] (`pcf_context_init`, and the tests' NRF guard).
+/// (#1621 review M1). An NRF that fails says nothing about whether the network
+/// has a UDR; this remembers that it has one, and where. An NRF that lists none is
+/// checked against the cached instance's NFProfile ([`discover_create_udr`]).
+/// Cleared by [`forget_udr`] (`pcf_context_init`, and the tests' NRF guard). It is
+/// keyed to the process-global NRF URI, so the tests that touch it hold
+/// `test_support::CONTEXT_GUARD`, the guard that serialises that URI.
 static UDR_CACHE: std::sync::Mutex<Option<CachedUdr>> = std::sync::Mutex::new(None);
 
-/// Remember `ep` as the UDR `nrf_uri` listed, for `validity` (the SearchResult's
-/// `validityPeriod`, else [`UDR_CACHE_DEFAULT_VALIDITY`]).
-pub(crate) fn remember_udr(nrf_uri: &str, ep: &DiscoveredEndpoint, validity: Option<u64>) {
-    let validity = validity
+/// How long a stated `validityPeriod` keeps a UDR remembered: as stated, at most
+/// [`UDR_CACHE_MAX_VALIDITY`], [`UDR_CACHE_DEFAULT_VALIDITY`] when absent.
+pub(crate) fn udr_cache_validity(validity: Option<u64>) -> std::time::Duration {
+    validity
         .map(std::time::Duration::from_secs)
-        .unwrap_or(UDR_CACHE_DEFAULT_VALIDITY);
+        .unwrap_or(UDR_CACHE_DEFAULT_VALIDITY)
+        .min(UDR_CACHE_MAX_VALIDITY)
+}
+
+/// Remember `ep` (NF instance `nf_instance_id`) as the UDR `nrf_uri` listed, for
+/// [`udr_cache_validity`]`(validity)`.
+pub(crate) fn remember_udr(
+    nrf_uri: &str,
+    nf_instance_id: Option<&str>,
+    ep: &DiscoveredEndpoint,
+    validity: Option<u64>,
+) {
+    let now = std::time::Instant::now();
+    let Some(until) = now.checked_add(udr_cache_validity(validity)) else {
+        return;
+    };
     *UDR_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some(CachedUdr {
         nrf_uri: nrf_uri.to_string(),
+        nf_instance_id: nf_instance_id.map(str::to_string),
         ep: ep.clone(),
-        until: std::time::Instant::now() + validity,
+        until,
     });
+}
+
+/// Remember the first UDR a SearchResult `json` from `nrf_uri` lists, with its
+/// `validityPeriod`, and return its endpoint.
+fn remember_udr_from_search(nrf_uri: &str, json: &serde_json::Value) -> Option<DiscoveredEndpoint> {
+    let (nf, ep) = json
+        .get("nfInstances")?
+        .as_array()?
+        .iter()
+        .find_map(|nf| parse_instance_endpoint(nf, "nudr-dr").map(|ep| (nf, ep)))?;
+    let id = nf.get("nfInstanceId").and_then(|v| v.as_str());
+    let validity = json.get("validityPeriod").and_then(|v| v.as_u64());
+    remember_udr(nrf_uri, id, &ep, validity);
+    Some(ep)
 }
 
 /// The remembered UDR, if `nrf_uri` is the NRF it was learned from and its
 /// validity has not run out.
-fn cached_udr(nrf_uri: &str) -> Option<DiscoveredEndpoint> {
+fn cached_udr(nrf_uri: &str) -> Option<CachedUdr> {
     UDR_CACHE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .filter(|c| c.nrf_uri == nrf_uri && std::time::Instant::now() < c.until)
-        .map(|c| c.ep.clone())
+        .cloned()
+}
+
+/// Until when the remembered UDR may be used, if one is remembered (tests).
+#[cfg(test)]
+pub(crate) fn cached_udr_until() -> Option<std::time::Instant> {
+    UDR_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|c| c.until)
 }
 
 /// Forget the remembered UDR (#1621 review M1): a fresh context has discovered
@@ -1981,50 +2038,117 @@ pub fn forget_udr() {
     *UDR_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
-/// The UDR a create-path read goes to (#1621 review M1), or `Ok(None)` when the
-/// network has none the PCF knows of.
+/// What the NRF says of a remembered UDR instance it no longer lists (#1621
+/// review round 2, m-2), from an NFProfile retrieval (TS 29.510 §5.2.2.5, `GET
+/// /nnrf-nfm/v1/nf-instances/{nfInstanceId}`).
+#[derive(Debug, PartialEq, Eq)]
+enum UdrProfile {
+    /// 404: the UDR deregistered. It is gone, not down.
+    Deregistered,
+    /// The profile's `nfStatus` (TS 29.510 Table 6.1.6.3.7-1).
+    Status(String),
+    /// No usable answer: the NRF is failing too.
+    Unknown(String),
+}
+
+/// Retrieve `nf_instance_id`'s NFProfile from the NRF at `nrf_uri`.
+async fn udr_profile(nrf_uri: &str, nf_instance_id: &str) -> UdrProfile {
+    let Ok((host, port)) = parse_uri_host_port(nrf_uri) else {
+        return UdrProfile::Unknown(format!("NRF URI {nrf_uri} does not parse"));
+    };
+    let client = global_context().get_client(&host, port).await;
+    let path = format!(
+        "/nnrf-nfm/v1/nf-instances/{}",
+        percent_encode(nf_instance_id)
+    );
+    match client.get(&path).await {
+        Ok(resp) if resp.status == 404 => UdrProfile::Deregistered,
+        Ok(resp) if resp.status == 200 => resp
+            .http
+            .content
+            .as_deref()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+            .and_then(|v| {
+                v.get("nfStatus")
+                    .and_then(|s| s.as_str())
+                    .map(str::to_string)
+            })
+            .map(UdrProfile::Status)
+            .unwrap_or_else(|| UdrProfile::Unknown("NFProfile without nfStatus".to_string())),
+        Ok(resp) => UdrProfile::Unknown(format!("NFProfile retrieval returned {}", resp.status)),
+        Err(e) => UdrProfile::Unknown(format!("NFProfile retrieval failed: {e}")),
+    }
+}
+
+/// The UDR a create-path read goes to (#1621 review M1).
 ///
 /// - No NRF configured: `Ok(None)`, no UDR deployed.
 /// - The NRF lists one: that one, remembered for the SearchResult's
-///   `validityPeriod` (TS 29.510 §6.2.6.2.2).
-/// - The NRF lists none, fails, or does not answer within
-///   [`UDR_DISCOVERY_TIMEOUT`]: the remembered UDR, else `Ok(None)` (logged). A
-///   PCF that never discovered a UDR and finds the NRF down has no basis to call
-///   it an outage; that case is a `decision` issue (#1621 review M1).
-async fn discover_create_udr() -> Option<DiscoveredEndpoint> {
-    let nrf_uri = global_context().get_nrf_uri().await?;
-    let search = tokio::time::timeout(
-        UDR_DISCOVERY_TIMEOUT,
-        Box::pin(nrf_search("UDR", "nudr-dr")),
-    )
-    .await;
-    let why = match search {
-        Ok(Ok(Some(json))) => match parse_first_endpoint(&json, "nudr-dr") {
-            Some(ep) => {
-                let validity = json.get("validityPeriod").and_then(|v| v.as_u64());
-                remember_udr(&nrf_uri, &ep, validity);
-                return Some(ep);
-            }
-            None => "the NRF lists no UDR".to_string(),
-        },
-        Ok(Ok(None)) => return None,
-        Ok(Err(e)) => format!("UDR discovery failed ({e})"),
-        Err(_) => format!("UDR discovery timed out after {UDR_DISCOVERY_TIMEOUT:?}"),
+///   `validityPeriod` (TS 29.510 Table 6.2.6.2.2-1), at most a day.
+/// - The NRF lists none, and a UDR is remembered (#1621 review round 2, m-2): its
+///   NFProfile is retrieved (TS 29.510 §5.2.2.5). 404: it deregistered, so it is
+///   forgotten and the local default applies (`Ok(None)`). `nfStatus` SUSPENDED
+///   (it missed its heartbeats, §5.2.2.3.2) or UNDISCOVERABLE: an outage, `Err`.
+///   Any other status, or no usable answer: the remembered UDR is read.
+/// - The NRF fails or does not answer within [`UDR_DISCOVERY_TIMEOUT`]: the
+///   remembered UDR, without the profile check.
+/// - Nothing remembered: `Ok(None)` (logged). A PCF that never discovered a UDR
+///   and finds the NRF down has no basis to call it an outage (decision #1639).
+async fn discover_create_udr() -> Result<Option<DiscoveredEndpoint>, UdrError> {
+    let Some(nrf_uri) = global_context().get_nrf_uri().await else {
+        return Ok(None);
     };
-    match cached_udr(&nrf_uri) {
-        Some(ep) => {
-            log::warn!(
-                "{why}; reading the UDR last discovered at {}:{}",
-                ep.host,
-                ep.port
-            );
-            Some(ep)
+    let deadline = tokio::time::Instant::now() + UDR_DISCOVERY_TIMEOUT;
+    let search = tokio::time::timeout_at(deadline, Box::pin(nrf_search("UDR", "nudr-dr"))).await;
+    let (why, listed_none) = match search {
+        Ok(Ok(Some(json))) => match remember_udr_from_search(&nrf_uri, &json) {
+            Some(ep) => return Ok(Some(ep)),
+            None => ("the NRF lists no UDR".to_string(), true),
+        },
+        Ok(Ok(None)) => return Ok(None),
+        Ok(Err(e)) => (format!("UDR discovery failed ({e})"), false),
+        Err(_) => (
+            format!("UDR discovery timed out after {UDR_DISCOVERY_TIMEOUT:?}"),
+            false,
+        ),
+    };
+    let Some(cached) = cached_udr(&nrf_uri) else {
+        log::warn!("{why}, and no UDR has been discovered; local default");
+        return Ok(None);
+    };
+    let (host, port) = (cached.ep.host.clone(), cached.ep.port);
+    if let (true, Some(id)) = (listed_none, cached.nf_instance_id.as_deref()) {
+        let profile = tokio::time::timeout_at(deadline, Box::pin(udr_profile(&nrf_uri, id)))
+            .await
+            .unwrap_or_else(|_| UdrProfile::Unknown("NFProfile retrieval timed out".to_string()));
+        match profile {
+            UdrProfile::Deregistered => {
+                log::warn!(
+                    "{why}, and the NRF no longer knows UDR {id} ({host}:{port}): it \
+                     deregistered; forgotten, local default"
+                );
+                forget_udr();
+                return Ok(None);
+            }
+            UdrProfile::Status(status)
+                if status.eq_ignore_ascii_case("SUSPENDED")
+                    || status.eq_ignore_ascii_case("UNDISCOVERABLE") =>
+            {
+                return Err(UdrError::Unavailable(format!(
+                    "the NRF reports UDR {id} ({host}:{port}) {status}"
+                )));
+            }
+            UdrProfile::Status(status) => log::warn!(
+                "{why}, though the NRF reports UDR {id} {status}; reading it at {host}:{port}"
+            ),
+            UdrProfile::Unknown(e) => log::warn!(
+                "{why}, and UDR {id}'s NFProfile is unknown ({e}); reading it at {host}:{port}"
+            ),
         }
-        None => {
-            log::warn!("{why}, and no UDR has been discovered; local default");
-            None
-        }
+    } else {
+        log::warn!("{why}; reading the UDR last discovered at {host}:{port}");
     }
+    Ok(Some(cached.ep))
 }
 
 /// #1597 / #1613: a bounded create-path read: find the UDR
@@ -2049,7 +2173,7 @@ where
     // #1607 review: boxed, so the read's state machine lives on the heap. Inline,
     // it roughly doubled the SM create future (20 -> 36 KB) and the router's, and
     // the pcfd suite overflowed a test thread's stack.
-    let Some(ep) = Box::pin(discover_create_udr()).await else {
+    let Some(ep) = Box::pin(discover_create_udr()).await? else {
         return Ok(None);
     };
     let (host, port) = (ep.host.clone(), ep.port);
