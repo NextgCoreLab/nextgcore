@@ -88,6 +88,12 @@ pub mod test_support {
     /// run serially (the PCF context is process-global; parallel tests race).
     pub static CONTEXT_GUARD: Mutex<()> = Mutex::new(());
 
+    /// A policy-data notification path whose token this process admits (#1518), for
+    /// a test that POSTs a PolicyDataChangeNotification to the router in process.
+    pub fn policy_data_notify_path() -> String {
+        crate::policy_data_sub::test_notify_path()
+    }
+
     /// Initialize the process-global PCF context for in-process strict-peer
     /// tests (wraps [`crate::context::pcf_context_init`] with test capacities).
     pub fn init_context() {

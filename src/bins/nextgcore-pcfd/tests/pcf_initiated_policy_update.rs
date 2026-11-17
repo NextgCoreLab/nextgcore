@@ -20,7 +20,6 @@ use std::time::Duration;
 
 use nextgcore_amfd::context as amf;
 use nextgcore_pcfd::pcf_sbi_request_handler;
-use nextgcore_pcfd::sbi_path::POLICY_DATA_NOTIFY_PATH;
 use nextgcore_sbi::message::{SbiRequest as Req, SbiResponse as Resp};
 
 const SUPI: &str = "imsi-001010000012610";
@@ -211,7 +210,7 @@ fn post(path: &str, body: serde_json::Value) -> Req {
 
 async fn notify_policy_data_change() {
     let resp = pcf_sbi_request_handler(post(
-        POLICY_DATA_NOTIFY_PATH,
+        &nextgcore_pcfd::test_support::policy_data_notify_path(),
         serde_json::json!({
             "ueId": SUPI,
             "reportId": format!("/nudr-dr/v2/policy-data/ues/{SUPI}/ue-policy-set"),

@@ -1810,9 +1810,10 @@ pub(crate) fn client_for(
 }
 
 /// The path this PCF serves its `Nudr_DM_Notification` (PolicyDataChangeNotification)
-/// sink on, and the path its subscription advertises. One constant, so the two cannot
-/// disagree — a subscription naming a URI nothing serves is the exact failure #293 hit
-/// and is invisible until an operator edits a subscriber.
+/// sink under, and the path its subscription advertises, followed by the
+/// subscription's token (#1518). One constant, so the two cannot disagree — a
+/// subscription naming a URI nothing serves is the exact failure #293 hit and is
+/// invisible until an operator edits a subscriber.
 pub const POLICY_DATA_NOTIFY_PATH: &str = "/npcf-callback/v1/policy-data-change-notify";
 
 /// Whether the SBI listener this PCF started is TLS-protected (#92 criterion 5,
@@ -1847,15 +1848,19 @@ pub fn advertised_sbi_scheme() -> &'static str {
     }
 }
 
-/// This PCF's policy-data notification URI, or `None` when the self identity was never
-/// published (no config) — the caller then skips the subscribe rather than subscribing
-/// with an address no one can reach.
-pub fn policy_data_notify_uri() -> Option<String> {
+/// This PCF's policy-data notification URI for the subscription holding `token`
+/// (#1518: `{POLICY_DATA_NOTIFY_PATH}/{token}`), or `None` when the self identity was
+/// never published (no config) — the caller then skips the subscribe rather than
+/// subscribing with an address no one can reach.
+pub fn policy_data_notify_uri(
+    token: &nextgcore_sbi::callback_auth::CallbackToken,
+) -> Option<String> {
     let info = pcf_self_info()?;
     Some(format!(
-        "{}://{}{POLICY_DATA_NOTIFY_PATH}",
+        "{}://{}{POLICY_DATA_NOTIFY_PATH}/{}",
         advertised_sbi_scheme(),
-        nextgcore_sbi::uri_encode::uri_authority(&info.sbi_addr, info.sbi_port)
+        nextgcore_sbi::uri_encode::uri_authority(&info.sbi_addr, info.sbi_port),
+        token.as_str()
     ))
 }
 
@@ -2541,15 +2546,13 @@ pub async fn pcf_deregister_bsf_binding(binding_id: &str) -> Result<bool, String
 /// request. Referenced by `n1MessageContent.contentId` (TS 29.500 §6.1.2.3).
 const UPDP_CONTENT_ID: &str = "updp-pdu";
 
-/// The path this PCF serves the `N1N2MsgTxfrFailureNotification` callback on
-/// (TS 29.518 §6.1.6.2.8), with `{polAssoId}` filled in by
-/// [`ue_policy_n1n2_failure_uri`]. One constant shared by the URI builder and the
-/// router arm, so the URI the AMF is told about is one this PCF actually serves —
-/// a subscription naming a path nothing serves is invisible until it fires.
+/// The path every UE-policy callback this PCF hands out sits under (TS 29.518
+/// §6.1.6.2.8 and the N1N2 / event-exposure callbacks), followed by
+/// `/{polAssoId}/{segment}/{token}` ([`ue_policy_callback_uri`], #1518). One constant
+/// shared by the URI builder and the router arm, so the URI the AMF is told about is
+/// one this PCF actually serves — a subscription naming a path nothing serves is
+/// invisible until it fires.
 pub const UE_POLICY_N1N2_FAILURE_PATH_PREFIX: &str = "/npcf-ue-policy-control/v1/notify";
-/// Trailing segment of the failure-notification callback path (see
-/// [`UE_POLICY_N1N2_FAILURE_PATH_PREFIX`]).
-pub const UE_POLICY_N1N2_FAILURE_PATH_SUFFIX: &str = "n1n2-failure-notify";
 
 /// Build pcfd's production `Namf_Communication_N1N2MessageTransfer` request
 /// carrying a UE policy container (TS 29.518 §5.2.2.3.1; TS 29.525 §4.2.2.2:
@@ -2645,11 +2648,37 @@ pub async fn pcf_deliver_ue_policy(
 /// connect to, and the failure presents on the AMF side with nothing pointing back
 /// at the PCF's own request.
 pub fn ue_policy_n1n2_failure_uri(pol_asso_id: &str) -> Option<String> {
+    ue_policy_callback_uri(pol_asso_id, crate::ue_policy::UePolicyCallback::N1n2Failure)
+}
+
+/// The URI of `callback` for association `pol_asso_id` (#1518):
+/// `{apiRoot}{UE_POLICY_N1N2_FAILURE_PATH_PREFIX}/{polAssoId}/{segment}/{token}`, with
+/// the association's token for that callback. `None` when the PCF self-identity was
+/// never published, or the association is gone (it was deleted while its delivery
+/// ran): no URI is handed out that this PCF would answer 404.
+pub fn ue_policy_callback_uri(
+    pol_asso_id: &str,
+    callback: crate::ue_policy::UePolicyCallback,
+) -> Option<String> {
     let info = pcf_self_info()?;
+    let path = ue_policy_callback_path(pol_asso_id, callback)?;
     Some(format!(
-        "{}://{}{UE_POLICY_N1N2_FAILURE_PATH_PREFIX}/{pol_asso_id}/{UE_POLICY_N1N2_FAILURE_PATH_SUFFIX}",
+        "{}://{}{path}",
         advertised_sbi_scheme(),
-        nextgcore_sbi::uri_encode::uri_authority(&info.sbi_addr, info.sbi_port)
+        nextgcore_sbi::uri_encode::uri_authority(&info.sbi_addr, info.sbi_port),
+    ))
+}
+
+/// The path of [`ue_policy_callback_uri`]: `None` when the association is gone.
+pub fn ue_policy_callback_path(
+    pol_asso_id: &str,
+    callback: crate::ue_policy::UePolicyCallback,
+) -> Option<String> {
+    let assoc = crate::ue_policy::ue_policy_find(pol_asso_id)?;
+    Some(format!(
+        "{UE_POLICY_N1N2_FAILURE_PATH_PREFIX}/{pol_asso_id}/{}/{}",
+        callback.segment(),
+        assoc.callback_tokens.get(callback).as_str(),
     ))
 }
 

@@ -166,7 +166,7 @@ mod tests {
         );
         assert_eq!(
             c(
-                "/npcf-ue-policy-control/v1/notify/x/n1-message-notify",
+                "/npcf-ue-policy-control/v1/notify/x/n1-message-notify/t",
                 "POST"
             ),
             None

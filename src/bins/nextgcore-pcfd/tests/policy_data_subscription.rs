@@ -77,6 +77,13 @@ struct UdrState {
     put_204: bool,
     /// The latest expiry confirmed (epoch seconds), and when it was confirmed.
     confirmed: Option<(u64, Instant)>,
+    /// The `notificationUri` of every POST and PUT, in order (#1518).
+    notify_uris: Vec<(&'static str, String)>,
+    /// Hold every POST's answer this long (#1518: a notification sent before the
+    /// UDR answers the subscribe).
+    post_hold: Duration,
+    /// Refuse every POST with a 500 (#1518).
+    post_fail: bool,
 }
 
 struct Udr {
@@ -92,7 +99,15 @@ impl Udr {
             ..Default::default()
         }));
         let s = state.clone();
-        let (server, addr) = serve(move |req| (Duration::ZERO, udr_answer(&s, &req))).await;
+        let (server, addr) = serve(move |req| {
+            let hold = if req.header.method == "POST" {
+                s.lock().unwrap().post_hold
+            } else {
+                Duration::ZERO
+            };
+            (hold, udr_answer(&s, &req))
+        })
+        .await;
         Udr {
             state,
             port: addr.port(),
@@ -123,7 +138,22 @@ fn udr_answer(state: &Mutex<UdrState>, req: &SbiRequest) -> SbiResponse {
         }
         b.to_string()
     };
+    let notify_uri = req
+        .http
+        .content
+        .as_deref()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+        .and_then(|b| b.get("notificationUri")?.as_str().map(str::to_string));
+    match (req.header.method.as_str(), notify_uri) {
+        ("POST", Some(uri)) => st.notify_uris.push(("POST", uri)),
+        ("PUT", Some(uri)) => st.notify_uris.push(("PUT", uri)),
+        _ => {}
+    }
     match (req.header.method.as_str(), path.as_str()) {
+        ("POST", BASE) if st.post_fail => {
+            st.posts += 1;
+            SbiResponse::with_status(500)
+        }
         ("POST", BASE) => {
             st.posts += 1;
             st.next_id += 1;
@@ -616,6 +646,167 @@ async fn a_sigterm_during_discovery_creates_no_subscription() {
         udr.with(|s| s.posts),
         0,
         "no subscribe once shutdown was requested"
+    );
+    udr.server.stop().await.ok();
+}
+
+/// POST a PolicyDataChangeNotification to `uri` as the UDR would, and answer the
+/// PCF's status.
+async fn notify(uri: &str) -> u16 {
+    let rest = uri
+        .strip_prefix("http://")
+        .expect("an http notification URI");
+    let (authority, path) = rest.split_at(rest.find('/').expect("a path"));
+    let (host, port) = authority.rsplit_once(':').expect("host:port");
+    let client = nextgcore_sbi::client::SbiClient::with_host_port(host, port.parse().unwrap());
+    let req = SbiRequest::post(path.to_string()).with_body(
+        r#"{"ueId":"imsi-001011518000099"}"#.to_string(),
+        "application/json",
+    );
+    let status = tokio::time::timeout(Duration::from_secs(5), client.send_request(req))
+        .await
+        .expect("bounded")
+        .expect("response")
+        .status;
+    client.close().await;
+    status
+}
+
+/// #1518: the subscription's `notificationUri` ends in a token minted for it, the
+/// renewal PUTs the same URI, and the PCF acts on a notification only at that URI.
+/// A subscription made after the UDR lost the first gets a new token, and the old
+/// URI is then refused.
+///
+/// REVERT-VERIFIED: with `renew` minting a fresh token, the PUT's URI differs; with
+/// the router's token check removed, the forged and token-less URIs answer 204;
+/// with `set_current` not clearing the being-created token, the lost
+/// subscription's URI answers 204 until the next subscribe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_notification_uri_keeps_its_token_across_renewals_1518() {
+    let nrf = Nrf::start().await;
+    let udr = Udr::start(Some(4)).await;
+    nrf.register_only(udr.port);
+    let _pcfd = spawn_pcfd("token", &nrf, None).await;
+    eventually(
+        Duration::from_secs(30),
+        "a subscription and its renewal",
+        || udr.with(|s| s.posts == 1 && !s.puts.is_empty()),
+    )
+    .await;
+    let uris = udr.with(|s| s.notify_uris.clone());
+    let (_, first) = uris[0].clone();
+    let token = first
+        .rsplit_once("/npcf-callback/v1/policy-data-change-notify/")
+        .map(|(_, t)| t.to_string())
+        .unwrap_or_else(|| panic!("a tokened notification URI: {first}"));
+    assert!(
+        token.len() == 32 && token.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{first}"
+    );
+    assert!(
+        uris.iter().skip(1).all(|(m, u)| *m == "PUT" && *u == first),
+        "the renewal keeps the URI: {uris:?}"
+    );
+
+    assert_eq!(notify(&first).await, 204, "the subscription's own URI");
+    let base = first.trim_end_matches(&token).trim_end_matches('/');
+    assert_eq!(
+        notify(&format!("{base}/0123456789abcdef0123456789abcdef")).await,
+        404,
+        "a forged token"
+    );
+    assert_eq!(
+        notify(base).await,
+        404,
+        "the token-less URI of before #1518"
+    );
+
+    // The UDR loses it while the NRF lists no UDR: the renewal is answered 404,
+    // and no new subscription can be made yet. The lost one's URI is refused at once.
+    *nrf.udrs.lock().unwrap() = Vec::new();
+    let discoveries = nrf.udr_discoveries();
+    udr.with(|s| s.held.clear());
+    eventually(
+        Duration::from_secs(10),
+        "a rediscovery after the loss",
+        || nrf.udr_discoveries() > discoveries + 1,
+    )
+    .await;
+    assert_eq!(udr.with(|s| s.posts), 1);
+    assert_eq!(notify(&first).await, 404, "the lost subscription's URI");
+
+    nrf.register_only(udr.port);
+    eventually(Duration::from_secs(10), "a second subscription", || {
+        udr.with(|s| s.posts) == 2
+    })
+    .await;
+    let (_, second) = udr
+        .with(|s| {
+            s.notify_uris
+                .iter()
+                .rev()
+                .find(|(m, _)| *m == "POST")
+                .cloned()
+        })
+        .unwrap();
+    assert_ne!(second, first, "a new subscription, a new token");
+    assert_eq!(notify(&second).await, 204);
+    assert_eq!(notify(&first).await, 404, "the lost subscription's URI");
+    udr.server.stop().await.ok();
+}
+
+/// #1518: a UDR may notify before it answers the subscribe (udrd records the
+/// subscription before it responds). The token of the subscription being created is
+/// admitted from the moment its POST is sent.
+///
+/// REVERT-VERIFIED: without the being-created token in `admits_notification`, the
+/// notification sent while the POST is held answers 404.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_notification_before_the_subscribe_answer_is_served_1518() {
+    let nrf = Nrf::start().await;
+    let udr = Udr::start(None).await;
+    udr.with(|s| s.post_hold = Duration::from_secs(2));
+    nrf.register_only(udr.port);
+    let _pcfd = spawn_pcfd("creating", &nrf, None).await;
+    eventually(Duration::from_secs(30), "the subscribe POST", || {
+        udr.with(|s| s.posts) == 1
+    })
+    .await;
+    let (_, uri) = udr.with(|s| s.notify_uris[0].clone());
+    assert_eq!(notify(&uri).await, 204, "while the POST is unanswered");
+    udr.server.stop().await.ok();
+}
+
+/// #1518: a subscribe the UDR refused leaves its token unadmitted; nothing holds
+/// that subscription.
+///
+/// REVERT-VERIFIED: without the `set_creating(None)` on a refused POST, the refused
+/// subscription's URI answers 204 until the next attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_subscribe_leaves_no_admitted_token_1518() {
+    let nrf = Nrf::start().await;
+    let udr = Udr::start(None).await;
+    udr.with(|s| s.post_fail = true);
+    nrf.register_only(udr.port);
+    let _pcfd = spawn_pcfd("refused", &nrf, None).await;
+    eventually(Duration::from_secs(30), "a refused subscribe POST", || {
+        udr.with(|s| s.posts) == 1
+    })
+    .await;
+    let (_, uri) = udr.with(|s| s.notify_uris[0].clone());
+    // The next attempt is a 1 s backoff away, and it would replace the token anyway:
+    // the refusal must be seen before it.
+    let mut refused = false;
+    while udr.with(|s| s.posts) == 1 {
+        if notify(&uri).await == 404 {
+            refused = udr.with(|s| s.posts) == 1;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        refused,
+        "the refused subscription's URI is 404 before the retry"
     );
     udr.server.stop().await.ok();
 }

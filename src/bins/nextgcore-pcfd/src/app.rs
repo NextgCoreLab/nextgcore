@@ -621,7 +621,7 @@ pub async fn run() -> Result<()> {
         &sbi_addr,
         "--sbi-addr (or pcf.sbi.server[0].address in the config file)",
     );
-    let mut sbi_server_config = NextgcoreSbiServerConfig::new(sbi_addr);
+    let mut sbi_server_config = with_callback_exemptions(NextgcoreSbiServerConfig::new(sbi_addr));
     if oauth2_required(&args.config) {
         sbi_server_config = apply_oauth2_enforcement(sbi_server_config).await;
     }
@@ -915,12 +915,91 @@ async fn open_subscriber_store(
     }
 }
 
+/// The callback routes admitted without an OAuth2 bearer when the listener requires
+/// one (#1518): a notification carries no access token (TS 33.501 §13.4.1, TS 29.500
+/// §6.10.7 NOTE). Each is authenticated instead by the token this PCF minted into the
+/// callback URI it handed out, checked again by the router:
+/// - `policy-data-change-notify/{token}` (the PolicyDataSubscription
+///   `notificationUri`, TS 29.519 §5.2.10) also needs a verified UDR peer: a
+///   `GET policy-data/subs-to-notify/{subsId}` returns the subscription, URI
+///   included (TS 29.519 §5.2.11.3.3), to any Nudr_DR consumer (the #1522 rule);
+/// - `notify/{polAssoId}/connectivity-state-notify/{token}` (the
+///   CONNECTIVITY_STATE_REPORT `eventNotifyUri`) also needs a verified AMF peer: the
+///   subscription travels in `UeContext.eventSubscriptionList` (TS 29.518
+///   §6.1.6.2.25) to whoever fetches the UE context;
+/// - `notify/{polAssoId}/n1-message-notify/{token}` (`n1NotifyCallbackUri`) and
+///   `notify/{polAssoId}/n1n2-failure-notify/{token}` (`n1n2FailureTxfNotifURI`) are
+///   admitted on their token alone: only the AMF the subscription or transfer went to
+///   holds them. An N1N2 individual subscription supports DELETE only and the N1N2
+///   messages collection POST only (TS 29.518 §6.1.3.4, §6.1.3.5), and neither is
+///   in `UeContext`.
+///
+/// Without a verified certificate (plaintext, server-only TLS) the two peer routes
+/// stay on the bearer, the #1522 trade.
+fn oauth2_callback_exemptions() -> Vec<nextgcore_sbi::server::OAuth2CallbackExemption> {
+    use nextgcore_sbi::server::OAuth2CallbackExemption;
+    use ue_policy::UePolicyCallback;
+    let ue_policy_path = |callback: UePolicyCallback| {
+        format!(
+            "{}/{{var}}/{}/{{token}}",
+            sbi_path::UE_POLICY_N1N2_FAILURE_PATH_PREFIX,
+            callback.segment()
+        )
+    };
+    let token_only = |callback: UePolicyCallback| {
+        OAuth2CallbackExemption::new("POST", ue_policy_path(callback), move |cb| {
+            let [pol_asso_id] = cb.vars.as_slice() else {
+                return false;
+            };
+            ue_policy::ue_policy_admits_callback(pol_asso_id, callback, cb.token)
+        })
+    };
+    vec![
+        // Nudr_DataRepository PolicyDataChangeNotification (TS 29.519 §5.2.10).
+        OAuth2CallbackExemption::for_verified_peer(
+            "POST",
+            format!("{}/{{token}}", sbi_path::POLICY_DATA_NOTIFY_PATH),
+            |cb, peer| async move {
+                peer.has_nf_type("UDR") && crate::policy_data_sub::admits_notification(&cb.token)
+            },
+        ),
+        // Namf_Communication N1MessageNotify (TS 29.518 §5.2.2.3.5).
+        token_only(UePolicyCallback::N1MessageNotify),
+        // Namf_EventExposure Notify, CONNECTIVITY_STATE_REPORT (TS 29.518 §5.3.2.4).
+        OAuth2CallbackExemption::for_verified_peer(
+            "POST",
+            ue_policy_path(UePolicyCallback::ConnectivityState),
+            |cb, peer| async move {
+                let [pol_asso_id] = cb.vars.as_slice() else {
+                    return false;
+                };
+                peer.has_nf_type("AMF")
+                    && ue_policy::ue_policy_admits_callback(
+                        pol_asso_id,
+                        UePolicyCallback::ConnectivityState,
+                        &cb.token,
+                    )
+            },
+        ),
+        // Namf_Communication N1N2TransferFailureNotification (TS 29.518 §5.2.2.3.2).
+        token_only(UePolicyCallback::N1n2Failure),
+    ]
+}
+
+/// `cfg` with this PCF's callback exemptions (#1518).
+fn with_callback_exemptions(cfg: NextgcoreSbiServerConfig) -> NextgcoreSbiServerConfig {
+    cfg.with_oauth2_callback_exemptions(oauth2_callback_exemptions())
+}
+
 /// SBI request handler for PCF
 pub async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
 
-    log::debug!("PCF SBI request: {method} {uri}");
+    log::debug!(
+        "PCF SBI request: {method} {}",
+        nextgcore_sbi::log_redact::redact_callback_tokens(uri)
+    );
 
     // Parse the URI path
     let path = uri.split('?').next().unwrap_or(uri);
@@ -989,31 +1068,11 @@ pub async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         ("npcf-ue-policy-control", "policies", "DELETE") if parts.len() >= 4 => {
             handle_ue_policy_delete(parts[3]).await
         }
-        // Wave-6 E6 delivery-result callback: the AMF POSTs an N1MessageNotify
-        // (TS 29.518 §5.2.2.4) carrying the UE's uplink MANAGE UE POLICY
-        // COMPLETE/REJECT to the callback URI this PCF registered via
-        // N1N2MessageSubscribe. Path: /npcf-ue-policy-control/v1/notify/{polAssoId}/n1-message-notify
-        ("npcf-ue-policy-control", "notify", "POST")
-            if parts.len() >= 5 && parts[4] == "n1-message-notify" =>
-        {
-            handle_ue_policy_n1_notify(parts[3], &request).await
-        }
-        // #92 UE-reachability retry: the serving AMF's CONNECTIVITY_STATE_REPORT
-        // (TS 29.518 §6.2.6.2.4). Path built by `ue_policy_connectivity_callback_uri`
-        // from the same segment constant this arm matches, so the URI the AMF is told
-        // about and the URI served here cannot drift.
-        ("npcf-ue-policy-control", "notify", "POST")
-            if parts.len() >= 5 && parts[4] == UE_POLICY_CONNECTIVITY_NOTIFY_SEGMENT =>
-        {
-            handle_ue_policy_connectivity_notify(parts[3], &request).await
-        }
-        // #92: the AMF's asynchronous N1N2MsgTxfrFailureNotification for a transfer
-        // that carried `n1n2FailureTxfNotifURI` (TS 29.518 §6.1.6.2.8). Path built by
-        // `sbi_path::ue_policy_n1n2_failure_uri` from the shared constant.
-        ("npcf-ue-policy-control", "notify", "POST")
-            if parts.len() >= 5 && parts[4] == sbi_path::UE_POLICY_N1N2_FAILURE_PATH_SUFFIX =>
-        {
-            handle_ue_policy_n1n2_failure_notify(parts[3], &request).await
+        // The three callbacks this PCF hands the serving AMF for a UE-policy
+        // association (#1518): `notify/{polAssoId}/{segment}/{token}`, built by
+        // `sbi_path::ue_policy_callback_uri`. See `route_ue_policy_callback`.
+        ("npcf-ue-policy-control", "notify", "POST") => {
+            route_ue_policy_callback(&parts, &request).await
         }
 
         // SM Policy Control Service (npcf-smpolicycontrol, TS 29.512)
@@ -1056,9 +1115,21 @@ pub async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // Its path is `sbi_path::POLICY_DATA_NOTIFY_PATH`, the same constant the
         // subscription advertises, so the URI the UDR is told about is one this router
         // serves.
-        ("npcf-callback", "policy-data-change-notify", "POST") => {
-            handle_policy_data_change_notify(&request).await
-        }
+        //
+        // #1518: the path ends in the subscription's token, and a notification is
+        // acted on only with the token of the subscription this PCF holds (or is
+        // creating), whatever admitted the request. Anything else, the token-less
+        // path of before #1518 included, is 404 and changes nothing. That path was
+        // never persisted: a PCF subscribes anew at every start.
+        ("npcf-callback", "policy-data-change-notify", "POST") => match parts.as_slice() {
+            [_, _, _, token] if crate::policy_data_sub::admits_notification(token) => {
+                handle_policy_data_change_notify(&request).await
+            }
+            _ => send_not_found(
+                "No policy-data subscription for this notification URI",
+                Some("SUBSCRIPTION_NOT_FOUND"),
+            ),
+        },
 
         // Policy Control Event Exposure Service (npcf-eventexposure, TS 29.523)
         ("npcf-eventexposure", _, _) => {
@@ -1066,7 +1137,10 @@ pub async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         }
 
         _ => {
-            log::warn!("Unknown PCF request: {method} {uri}");
+            log::warn!(
+                "Unknown PCF request: {method} {}",
+                nextgcore_sbi::log_redact::redact_callback_tokens(uri)
+            );
             send_method_not_allowed(method, uri)
         }
     };
@@ -2197,52 +2271,26 @@ async fn retry_parked_ue_policy_delivery(pol_asso_id: &str, why: &str) -> bool {
     }
 }
 
-/// Build this PCF's `n1NotifyCallbackUri` for an association's UE-policy
-/// delivery-result loop (Wave-6 E6): the AMF POSTs the uplink
-/// `N1MessageNotify` here. Path carries the `polAssoId` so the callback route
-/// correlates the COMPLETE/REJECT back to the right association. `None` when
-/// the PCF self-identity was not published (e.g. no config) — the caller then
-/// skips the subscribe.
+/// This PCF's `n1NotifyCallbackUri` for an association's UE-policy delivery-result
+/// loop (Wave-6 E6): the AMF POSTs the uplink `N1MessageNotify` here. The path
+/// carries the `polAssoId`, so the callback route correlates the COMPLETE/REJECT
+/// back to the right association, and the association's token for this callback
+/// (#1518). `None` when the PCF self-identity was not published (e.g. no config) —
+/// the caller then skips the subscribe.
 ///
 /// #92 criterion 5: the scheme is derived from the configured SBI transport
-/// security (`sbi_path::advertised_sbi_scheme`) rather than the literal `http://`
-/// this used to emit. A TLS deployment registered a cleartext URI for an `https`
-/// listener, and every `N1MessageNotify` the AMF tried to POST failed to connect —
-/// which presents at the AMF with nothing naming the PCF's own subscription
-/// (TS 29.500 §6.1).
+/// security (`sbi_path::advertised_sbi_scheme`), not a literal `http://`.
 fn ue_policy_notify_callback_uri(pol_asso_id: &str) -> Option<String> {
-    let info = sbi_path::pcf_self_info()?;
-    Some(format!(
-        "{}://{}/npcf-ue-policy-control/v1/notify/{}/n1-message-notify",
-        sbi_path::advertised_sbi_scheme(),
-        nextgcore_sbi::uri_encode::uri_authority(&info.sbi_addr, info.sbi_port),
-        pol_asso_id
-    ))
+    sbi_path::ue_policy_callback_uri(pol_asso_id, ue_policy::UePolicyCallback::N1MessageNotify)
 }
 
-/// Build this PCF's `eventNotifyUri` for an association's UE-reachability retry
-/// (#92): the serving AMF POSTs an `AmfEventNotification` carrying the
-/// `CONNECTIVITY_STATE_REPORT` here when the UE's CM state changes.
-///
-/// Same `notify/{polAssoId}/...` convention and the same scheme derivation as
-/// [`ue_policy_notify_callback_uri`], so the association a wake-up belongs to is in
-/// the path rather than having to be recovered from the body's `notifyCorrelationId`.
+/// This PCF's `eventNotifyUri` for an association's UE-reachability retry (#92):
+/// the serving AMF POSTs an `AmfEventNotification` carrying the
+/// `CONNECTIVITY_STATE_REPORT` here when the UE's CM state changes. Same shape as
+/// [`ue_policy_notify_callback_uri`], with this callback's own token.
 fn ue_policy_connectivity_callback_uri(pol_asso_id: &str) -> Option<String> {
-    let info = sbi_path::pcf_self_info()?;
-    Some(format!(
-        "{}://{}{}/{pol_asso_id}/{}",
-        sbi_path::advertised_sbi_scheme(),
-        nextgcore_sbi::uri_encode::uri_authority(&info.sbi_addr, info.sbi_port),
-        sbi_path::UE_POLICY_N1N2_FAILURE_PATH_PREFIX,
-        UE_POLICY_CONNECTIVITY_NOTIFY_SEGMENT,
-    ))
+    sbi_path::ue_policy_callback_uri(pol_asso_id, ue_policy::UePolicyCallback::ConnectivityState)
 }
-
-/// Trailing path segment of the `CONNECTIVITY_STATE_REPORT` callback (#92). One
-/// constant shared by the URI builder and the router arm below, so the URI the AMF
-/// is told about is one this PCF serves — the failure mode otherwise is a
-/// subscription that works until it fires.
-pub const UE_POLICY_CONNECTIVITY_NOTIFY_SEGMENT: &str = "connectivity-state-notify";
 
 pub async fn handle_ue_policy_get(pol_asso_id: &str) -> SbiResponse {
     match ue_policy::ue_policy_find(pol_asso_id) {
@@ -2355,6 +2403,36 @@ pub async fn handle_ue_policy_delete(pol_asso_id: &str) -> SbiResponse {
             Some("POLICY_NOT_FOUND"),
         )
     }
+}
+
+/// Route a UE-policy callback (#1518): `notify/{polAssoId}/{segment}/{token}`
+/// exactly, acted on only with that association's current token for that callback,
+/// whatever admitted the request (a bearer, the exemption, or a listener without
+/// OAuth2). Anything else is 404 and changes nothing, the token-less
+/// `notify/{polAssoId}/{segment}` of before #1518 included: UE-policy associations
+/// live in memory only, so no association holding that URI survives a restart.
+async fn route_ue_policy_callback(parts: &[&str], request: &SbiRequest) -> SbiResponse {
+    if let [_, _, _, pol_asso_id, segment, token] = parts {
+        if let Some(callback) = ue_policy::UePolicyCallback::from_segment(segment) {
+            if ue_policy::ue_policy_admits_callback(pol_asso_id, callback, token) {
+                return match callback {
+                    ue_policy::UePolicyCallback::N1MessageNotify => {
+                        handle_ue_policy_n1_notify(pol_asso_id, request).await
+                    }
+                    ue_policy::UePolicyCallback::ConnectivityState => {
+                        handle_ue_policy_connectivity_notify(pol_asso_id, request).await
+                    }
+                    ue_policy::UePolicyCallback::N1n2Failure => {
+                        handle_ue_policy_n1n2_failure_notify(pol_asso_id, request).await
+                    }
+                };
+            }
+        }
+    }
+    send_not_found(
+        "No UE policy association for this callback URI",
+        Some("POLICY_NOT_FOUND"),
+    )
 }
 
 /// `CONNECTIVITY_STATE_REPORT` callback (#92, TS 29.518 §6.2.6.2.4): the serving
@@ -7619,7 +7697,7 @@ mod tests {
 
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
-            sbi_path::POLICY_DATA_NOTIFY_PATH,
+            &crate::test_support::policy_data_notify_path(),
             Some(serde_json::json!({ "ueId": "imsi-001010000000299" })),
         ))
         .await;
@@ -7637,7 +7715,7 @@ mod tests {
         // indistinguishable from one that changed nothing.
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
-            sbi_path::POLICY_DATA_NOTIFY_PATH,
+            &crate::test_support::policy_data_notify_path(),
             Some(serde_json::json!({ "reportId": "x" })),
         ))
         .await;
@@ -7680,7 +7758,7 @@ mod tests {
 
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
-            sbi_path::POLICY_DATA_NOTIFY_PATH,
+            &crate::test_support::policy_data_notify_path(),
             Some(serde_json::json!({
                 "ueId": supi,
                 "reportId": format!("/nudr-dr/v2/policy-data/ues/{supi}/sm-data"),
@@ -7727,7 +7805,7 @@ mod tests {
         // same (unchanged) data does not re-notify.
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
-            sbi_path::POLICY_DATA_NOTIFY_PATH,
+            &crate::test_support::policy_data_notify_path(),
             Some(serde_json::json!({ "ueId": supi })),
         ))
         .await;
@@ -7817,7 +7895,7 @@ mod tests {
         // A notification for data that has not changed therefore re-authorises nothing.
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
-            sbi_path::POLICY_DATA_NOTIFY_PATH,
+            &crate::test_support::policy_data_notify_path(),
             Some(serde_json::json!({ "ueId": supi })),
         ))
         .await;
@@ -7893,7 +7971,7 @@ mod tests {
 
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
-            sbi_path::POLICY_DATA_NOTIFY_PATH,
+            &crate::test_support::policy_data_notify_path(),
             Some(serde_json::json!({ "ueId": supi })),
         ))
         .await;
@@ -7957,7 +8035,7 @@ mod tests {
 
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
-            sbi_path::POLICY_DATA_NOTIFY_PATH,
+            &crate::test_support::policy_data_notify_path(),
             Some(serde_json::json!({ "ueId": supi })),
         ))
         .await;
@@ -8027,7 +8105,7 @@ mod tests {
 
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
-            sbi_path::POLICY_DATA_NOTIFY_PATH,
+            &crate::test_support::policy_data_notify_path(),
             Some(serde_json::json!({ "ueId": supi })),
         ))
         .await;
@@ -8087,7 +8165,7 @@ mod tests {
 
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
-            sbi_path::POLICY_DATA_NOTIFY_PATH,
+            &crate::test_support::policy_data_notify_path(),
             Some(serde_json::json!({ "ueId": supi })),
         ))
         .await;
@@ -9812,7 +9890,7 @@ mod tests {
         for (supi, _) in cases {
             let resp = pcf_sbi_request_handler(make_request(
                 "POST",
-                sbi_path::POLICY_DATA_NOTIFY_PATH,
+                &crate::test_support::policy_data_notify_path(),
                 Some(serde_json::json!({ "ueId": supi })),
             ))
             .await;
@@ -13668,7 +13746,7 @@ mod tests {
 
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
-            sbi_path::POLICY_DATA_NOTIFY_PATH,
+            &crate::test_support::policy_data_notify_path(),
             Some(serde_json::json!({ "ueId": supi })),
         ))
         .await;
@@ -13824,7 +13902,7 @@ mod tests {
         let reauth_peers = start_policy_data_peers(answers).await;
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
-            sbi_path::POLICY_DATA_NOTIFY_PATH,
+            &crate::test_support::policy_data_notify_path(),
             Some(serde_json::json!({ "ueId": bare })),
         ))
         .await;
@@ -15190,5 +15268,317 @@ mod bounded_db_uri_tests_1457 {
                 "{uri}"
             );
         }
+    }
+}
+
+/// #1518: the PCF's tokened callback URIs, their bearer exemptions and the router's
+/// token check.
+#[cfg(test)]
+mod callback_tokens_1518 {
+    use super::*;
+    use nextgcore_sbi::callback_auth::VerifiedPeer;
+    use ue_policy::UePolicyCallback;
+
+    fn post(path: &str, body: serde_json::Value) -> SbiRequest {
+        SbiRequest::post(path)
+            .with_json_body(&body)
+            .expect("encode test body")
+    }
+
+    fn assoc(supi: &str) -> String {
+        ue_policy::ue_policy_add(supi, "http://127.0.0.1:9/ue-policy-notify", "").pol_asso_id
+    }
+
+    fn path(pol_asso_id: &str, callback: UePolicyCallback) -> String {
+        sbi_path::ue_policy_callback_path(pol_asso_id, callback).expect("a live association")
+    }
+
+    fn token_of(pol_asso_id: &str, callback: UePolicyCallback) -> String {
+        path(pol_asso_id, callback)
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    fn connected() -> serde_json::Value {
+        serde_json::json!({
+            "reportList": [{
+                "type": "CONNECTIVITY_STATE_REPORT",
+                "cmInfoList": [{ "cmState": "CONNECTED", "accessType": "3GPP_ACCESS" }],
+            }]
+        })
+    }
+
+    /// The routes the composition root registers as bearer-exempt.
+    #[test]
+    fn the_pcf_registers_its_callback_exemptions_1518() {
+        let cfg = with_callback_exemptions(NextgcoreSbiServerConfig::new(SocketAddr::from((
+            [127, 0, 0, 1],
+            0,
+        ))));
+        let routes: Vec<String> = cfg
+            .oauth2_callback_exemptions
+            .iter()
+            .map(|e| e.route())
+            .collect();
+        assert_eq!(
+            routes,
+            [
+                "POST /npcf-callback/v1/policy-data-change-notify/{token}",
+                "POST /npcf-ue-policy-control/v1/notify/{var}/n1-message-notify/{token}",
+                "POST /npcf-ue-policy-control/v1/notify/{var}/connectivity-state-notify/{token}",
+                "POST /npcf-ue-policy-control/v1/notify/{var}/n1n2-failure-notify/{token}",
+            ]
+        );
+    }
+
+    /// Each association's three callback URIs carry three different tokens, none of
+    /// them shared with another association, and no URI is built for a deleted one.
+    /// Debug output of the association shows none of them.
+    #[test]
+    fn each_association_s_callbacks_carry_their_own_tokens_1518() {
+        let (a, b) = (assoc("imsi-001011518000001"), assoc("imsi-001011518000002"));
+        let mut tokens = std::collections::HashSet::new();
+        for id in [&a, &b] {
+            for callback in UePolicyCallback::ALL {
+                let p = path(id, callback);
+                assert!(
+                    p.starts_with(&format!(
+                        "/npcf-ue-policy-control/v1/notify/{id}/{}/",
+                        callback.segment()
+                    )),
+                    "{p}"
+                );
+                let t = token_of(id, callback);
+                assert_eq!(t.len(), 32, "{p}");
+                assert!(tokens.insert(t), "a token is used once: {p}");
+            }
+        }
+        let debug = format!("{:?}", ue_policy::ue_policy_find(&a).unwrap());
+        for callback in UePolicyCallback::ALL {
+            assert!(!debug.contains(&token_of(&a, callback)), "{debug}");
+        }
+        assert!(ue_policy::ue_policy_remove(&a));
+        for callback in UePolicyCallback::ALL {
+            assert_eq!(sbi_path::ue_policy_callback_path(&a, callback), None);
+        }
+        ue_policy::ue_policy_remove(&b);
+    }
+
+    /// The real router behind an OAuth2-required listener with the PCF's exemptions
+    /// and an empty JWKS, so no bearer could verify. Over plaintext:
+    /// - the token-only N1 notify and N1N2 failure callbacks are admitted on their
+    ///   association's token (the handler's 204);
+    /// - the policy-data and CONNECTIVITY_STATE_REPORT callbacks, which need a
+    ///   verified peer too, are 401 even with the right token;
+    /// - a forged token, another association's, another callback's, the token-less
+    ///   URI of before #1518 and a service request are 401.
+    ///
+    /// REVERT-VERIFIED: with the peer routes registered token-only, their right-token
+    /// cases are admitted; with the token-only routes' token check dropped, the forged
+    /// and cross-association tokens are.
+    #[tokio::test]
+    async fn an_oauth2_listener_admits_the_callbacks_on_their_tokens_1518() {
+        let (a, b) = (assoc("imsi-001011518000011"), assoc("imsi-001011518000012"));
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let mut cfg = with_callback_exemptions(NextgcoreSbiServerConfig::new(addr));
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(serde_json::json!({"keys": []}));
+        let server = nextgcore_sbi::SbiServer::on_listener(cfg, listener);
+        server.start(pcf_sbi_request_handler).await.expect("start");
+        let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", addr.port());
+        let notify = |id: &str, seg: &str, token: &str| {
+            format!("/npcf-ue-policy-control/v1/notify/{id}/{seg}/{token}")
+        };
+        let mut cases = vec![
+            (path(&a, UePolicyCallback::N1MessageNotify), 204),
+            (path(&a, UePolicyCallback::N1n2Failure), 204),
+            (path(&a, UePolicyCallback::ConnectivityState), 401),
+            (crate::test_support::policy_data_notify_path(), 401),
+        ];
+        for callback in UePolicyCallback::ALL {
+            let seg = callback.segment();
+            let other = match callback {
+                UePolicyCallback::N1n2Failure => UePolicyCallback::N1MessageNotify,
+                _ => UePolicyCallback::N1n2Failure,
+            };
+            cases.extend([
+                (notify(&a, seg, "0123456789abcdef0123456789abcdef"), 401),
+                (notify(&a, seg, &token_of(&b, callback)), 401),
+                (notify(&a, seg, &token_of(&a, other)), 401),
+                (format!("/npcf-ue-policy-control/v1/notify/{a}/{seg}"), 401),
+            ]);
+        }
+        cases.extend([
+            (
+                format!(
+                    "{}/0123456789abcdef0123456789abcdef",
+                    sbi_path::POLICY_DATA_NOTIFY_PATH
+                ),
+                401,
+            ),
+            (sbi_path::POLICY_DATA_NOTIFY_PATH.to_string(), 401),
+            ("/npcf-ue-policy-control/v1/policies".to_string(), 401),
+        ]);
+        let mut statuses = Vec::new();
+        for (p, want) in cases {
+            let req = SbiRequest::post(p.clone()).with_body("{}".to_string(), "application/json");
+            let got = tokio::time::timeout(Duration::from_secs(5), client.send_request(req))
+                .await
+                .expect("bounded")
+                .expect("response")
+                .status;
+            statuses.push((p, want, got));
+        }
+        server.stop().await.expect("stop");
+        for (p, want, got) in statuses {
+            assert_eq!(got, want, "{p}");
+        }
+        ue_policy::ue_policy_remove(&a);
+        ue_policy::ue_policy_remove(&b);
+    }
+
+    /// The two peer routes admit, without a bearer, only a verified certificate of
+    /// the notifying NF type with the current token: policy-data a UDR's,
+    /// CONNECTIVITY_STATE_REPORT an AMF's. The token-only routes need no certificate
+    /// but still the token.
+    ///
+    /// REVERT-VERIFIED: without the NF-type checks, the AMF-typed (policy-data),
+    /// UDR-typed (connectivity) and untyped certificates are admitted; without the
+    /// token checks, the forged tokens are.
+    #[tokio::test]
+    async fn the_peer_callback_routes_admit_only_the_notifying_nf_type_1518() {
+        let (a, b) = (assoc("imsi-001011518000021"), assoc("imsi-001011518000022"));
+        let peer = |types: &[&str]| {
+            Some(VerifiedPeer {
+                nf_instance_id: "4e3c1518-0000-4000-8000-000000000003".to_string(),
+                nf_types: types.iter().map(|t| t.to_string()).collect(),
+            })
+        };
+        let exemptions = oauth2_callback_exemptions();
+        let exemptions = &exemptions;
+        let admits = |p: String, who: Option<VerifiedPeer>| async move {
+            nextgcore_sbi::callback_auth::admits_without_bearer_from(
+                exemptions,
+                "POST",
+                &p,
+                who.as_ref(),
+            )
+            .await
+        };
+        let forged = "0123456789abcdef0123456789abcdef";
+        let policy_data = crate::test_support::policy_data_notify_path();
+        assert!(admits(policy_data.clone(), peer(&["UDR"])).await);
+        assert!(!admits(policy_data.clone(), peer(&["AMF"])).await);
+        assert!(!admits(policy_data.clone(), peer(&[])).await);
+        assert!(!admits(policy_data, None).await);
+        let forged_pd = format!("{}/{forged}", sbi_path::POLICY_DATA_NOTIFY_PATH);
+        assert!(!admits(forged_pd, peer(&["UDR"])).await);
+
+        let conn = path(&a, UePolicyCallback::ConnectivityState);
+        assert!(admits(conn.clone(), peer(&["AMF"])).await);
+        assert!(!admits(conn.clone(), peer(&["UDR"])).await);
+        assert!(!admits(conn.clone(), peer(&[])).await);
+        assert!(!admits(conn, None).await);
+        for p in [
+            format!("/npcf-ue-policy-control/v1/notify/{a}/connectivity-state-notify/{forged}"),
+            format!(
+                "/npcf-ue-policy-control/v1/notify/{a}/connectivity-state-notify/{}",
+                token_of(&b, UePolicyCallback::ConnectivityState)
+            ),
+            format!(
+                "/npcf-ue-policy-control/v1/notify/{a}/connectivity-state-notify/{}",
+                token_of(&a, UePolicyCallback::N1MessageNotify)
+            ),
+        ] {
+            assert!(!admits(p.clone(), peer(&["AMF"])).await, "{p}");
+        }
+        for callback in [
+            UePolicyCallback::N1MessageNotify,
+            UePolicyCallback::N1n2Failure,
+        ] {
+            assert!(admits(path(&a, callback), None).await);
+            let seg = callback.segment();
+            let f = format!("/npcf-ue-policy-control/v1/notify/{a}/{seg}/{forged}");
+            assert!(!admits(f, peer(&["AMF"])).await);
+        }
+        ue_policy::ue_policy_remove(&a);
+        ue_policy::ue_policy_remove(&b);
+    }
+
+    /// Whatever admitted it (a bearer, an exemption, or a listener without OAuth2), a
+    /// callback is acted on only with its association's current token for that
+    /// callback, at exactly `notify/{id}/{segment}/{token}`; otherwise 404 and
+    /// nothing changes. A forged CONNECTED report does not take the parked delivery.
+    ///
+    /// REVERT-VERIFIED: with `route_ue_policy_callback`'s token check removed, the
+    /// forged, cross-association, cross-callback and token-less cases reach the
+    /// handlers (204) and the forged report takes the parked delivery; with the
+    /// policy-data arm's check removed, the forged and token-less policy-data
+    /// notifications reach the handler (204).
+    #[tokio::test]
+    async fn the_callback_handlers_act_only_on_the_current_token_1518() {
+        let (a, b) = (assoc("imsi-001011518000031"), assoc("imsi-001011518000032"));
+        let forged = "0123456789abcdef0123456789abcdef";
+        ue_policy::ue_policy_park_pending_delivery(&a, "imsi-001011518000031", vec![0x80]);
+        for callback in UePolicyCallback::ALL {
+            let seg = callback.segment();
+            let other = match callback {
+                UePolicyCallback::ConnectivityState => UePolicyCallback::N1n2Failure,
+                _ => UePolicyCallback::ConnectivityState,
+            };
+            for p in [
+                format!("/npcf-ue-policy-control/v1/notify/{a}/{seg}/{forged}"),
+                format!(
+                    "/npcf-ue-policy-control/v1/notify/{a}/{seg}/{}",
+                    token_of(&b, callback)
+                ),
+                format!(
+                    "/npcf-ue-policy-control/v1/notify/{a}/{seg}/{}",
+                    token_of(&a, other)
+                ),
+                format!("/npcf-ue-policy-control/v1/notify/{a}/{seg}"),
+                format!("{}/extra", path(&a, callback)),
+                format!("/npcf-ue-policy-control/v1/notify/{a}/{seg}/"),
+            ] {
+                let resp = pcf_sbi_request_handler(post(&p, connected())).await;
+                assert_eq!(resp.status, 404, "{p}");
+            }
+        }
+        assert!(
+            ue_policy::ue_policy_has_parked_delivery(&a),
+            "no refused report took the parked delivery"
+        );
+        let resp = pcf_sbi_request_handler(post(
+            &path(&a, UePolicyCallback::N1n2Failure),
+            serde_json::json!({ "cause": "UE_NOT_REACHABLE" }),
+        ))
+        .await;
+        assert_eq!(resp.status, 204, "the association's own token");
+
+        // A deleted association's URIs answer 404.
+        let gone = path(&b, UePolicyCallback::N1n2Failure);
+        ue_policy::ue_policy_remove(&b);
+        let resp = pcf_sbi_request_handler(post(&gone, serde_json::json!({}))).await;
+        assert_eq!(resp.status, 404, "{gone}");
+
+        // Policy data: only the held (or being-created) subscription's token.
+        let body = serde_json::json!({ "ueId": "imsi-001011518000039" });
+        for p in [
+            format!("{}/{forged}", sbi_path::POLICY_DATA_NOTIFY_PATH),
+            sbi_path::POLICY_DATA_NOTIFY_PATH.to_string(),
+            format!("{}/extra", crate::test_support::policy_data_notify_path()),
+        ] {
+            let resp = pcf_sbi_request_handler(post(&p, body.clone())).await;
+            assert_eq!(resp.status, 404, "{p}");
+        }
+        let resp =
+            pcf_sbi_request_handler(post(&crate::test_support::policy_data_notify_path(), body))
+                .await;
+        assert_eq!(resp.status, 204);
+
+        ue_policy::ue_policy_drop_parked_delivery(&a);
+        ue_policy::ue_policy_remove(&a);
     }
 }

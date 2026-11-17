@@ -245,6 +245,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use nextgcore_nas::fiveg::ue_policy as nas_updp;
+use nextgcore_sbi::callback_auth::CallbackToken;
 
 /// URSP-delivery outcome for one UE policy association (Wave-6 E4). The
 /// transfer is NEVER reported `Delivered` on the `Namf_Communication`
@@ -343,6 +344,9 @@ pub struct UePolicyAssociation {
     /// retransmits a superseded MANAGE UE POLICY COMMAND nor fails the
     /// association while the newer delivery is in flight.
     pub delivery_generation: u64,
+    /// The tokens in this association's three callback URIs (#1518), one per
+    /// callback, minted with the association. See [`UePolicyCallback`].
+    pub callback_tokens: UePolicyCallbackTokens,
 }
 
 /// The serving AMF's GUAMI as carried in a TS 29.525 `PolicyAssociationRequest`
@@ -406,6 +410,95 @@ impl AmfGuami {
     }
 }
 
+/// The three callbacks the PCF hands the serving AMF for a UE-policy association
+/// (#1518), each at `/npcf-ue-policy-control/v1/notify/{polAssoId}/{segment}/{token}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UePolicyCallback {
+    /// `n1NotifyCallbackUri` of the UPDP N1N2MessageSubscribe (TS 29.518 §5.2.2.3.5):
+    /// the UE's MANAGE UE POLICY COMPLETE/REJECT.
+    N1MessageNotify,
+    /// `eventNotifyUri` of the CONNECTIVITY_STATE_REPORT subscription (TS 29.518
+    /// §5.3.2.2.2): the UE's CM state.
+    ConnectivityState,
+    /// `n1n2FailureTxfNotifURI` of the UPDP N1N2MessageTransfer (TS 29.518
+    /// §6.1.6.2.8): the transfer's asynchronous failure.
+    N1n2Failure,
+}
+
+impl UePolicyCallback {
+    /// Every callback, in route order.
+    pub const ALL: [UePolicyCallback; 3] = [
+        UePolicyCallback::N1MessageNotify,
+        UePolicyCallback::ConnectivityState,
+        UePolicyCallback::N1n2Failure,
+    ];
+
+    /// The path segment before the token. Each is in
+    /// `nextgcore_sbi::log_redact::CALLBACK_TOKEN_SEGMENTS`.
+    pub fn segment(self) -> &'static str {
+        match self {
+            UePolicyCallback::N1MessageNotify => "n1-message-notify",
+            UePolicyCallback::ConnectivityState => "connectivity-state-notify",
+            UePolicyCallback::N1n2Failure => "n1n2-failure-notify",
+        }
+    }
+
+    /// The callback whose segment is `segment`.
+    pub fn from_segment(segment: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.segment() == segment)
+    }
+}
+
+/// One token per callback of an association (#1518). Separate tokens, because the
+/// callbacks are read by different parties: the CONNECTIVITY_STATE_REPORT
+/// subscription travels with the UE context to the next AMF
+/// (`UeContext.eventSubscriptionList`, TS 29.518 §6.1.6.2.25), the N1N2 ones do not.
+/// Each token lives as long as the association, so a re-subscription or a further
+/// transfer for the same association keeps the URI the AMF may still be holding.
+/// Debug output shows none of them ([`CallbackToken`]'s Debug is redacted).
+#[derive(Debug, Clone)]
+pub struct UePolicyCallbackTokens {
+    n1_message_notify: CallbackToken,
+    connectivity_state: CallbackToken,
+    n1n2_failure: CallbackToken,
+}
+
+impl UePolicyCallbackTokens {
+    fn mint() -> Self {
+        Self {
+            n1_message_notify: CallbackToken::mint(),
+            connectivity_state: CallbackToken::mint(),
+            n1n2_failure: CallbackToken::mint(),
+        }
+    }
+
+    /// The token of `callback`.
+    pub fn get(&self, callback: UePolicyCallback) -> &CallbackToken {
+        match callback {
+            UePolicyCallback::N1MessageNotify => &self.n1_message_notify,
+            UePolicyCallback::ConnectivityState => &self.connectivity_state,
+            UePolicyCallback::N1n2Failure => &self.n1n2_failure,
+        }
+    }
+}
+
+/// Whether `presented` is association `pol_asso_id`'s token for `callback` (#1518).
+/// An unknown association admits nothing.
+pub fn ue_policy_admits_callback(
+    pol_asso_id: &str,
+    callback: UePolicyCallback,
+    presented: &str,
+) -> bool {
+    ue_policy_store()
+        .lock()
+        .ok()
+        .and_then(|m| {
+            m.get(pol_asso_id)
+                .map(|a| a.callback_tokens.get(callback).matches(presented))
+        })
+        .unwrap_or(false)
+}
+
 fn ue_policy_store() -> &'static Mutex<HashMap<String, UePolicyAssociation>> {
     static STORE: OnceLock<Mutex<HashMap<String, UePolicyAssociation>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -437,6 +530,7 @@ pub fn ue_policy_add(supi: &str, notification_uri: &str, supp_feat: &str) -> UeP
         serving_nf_id: None,
         connectivity_subscription_id: None,
         delivery_generation: 0,
+        callback_tokens: UePolicyCallbackTokens::mint(),
     };
     if let Ok(mut m) = ue_policy_store().lock() {
         m.insert(assoc.pol_asso_id.clone(), assoc.clone());

@@ -167,9 +167,13 @@ fn seed_association(supi: &str) -> String {
 /// An `AmfEventNotification` carrying a `CONNECTIVITY_STATE_REPORT` with `cmState`,
 /// shaped as amfd's `build_event_report` emits it (TS 29.518 §6.2.6.2.5).
 fn cm_state_notification(pol_asso_id: &str, cm_state: &str) -> Req {
-    Req::post(format!(
-        "/npcf-ue-policy-control/v1/notify/{pol_asso_id}/connectivity-state-notify"
-    ))
+    Req::post(
+        nextgcore_pcfd::sbi_path::ue_policy_callback_path(
+            pol_asso_id,
+            nextgcore_pcfd::ue_policy::UePolicyCallback::ConnectivityState,
+        )
+        .expect("the association's tokened callback path"),
+    )
     .with_json_body(&serde_json::json!({
         "notifyCorrelationId": pol_asso_id,
         "reportList": [{
@@ -269,10 +273,18 @@ async fn cm_idle_delivery_carries_the_failure_uri_and_retries_on_cm_connected() 
         "n1n2FailureTxfNotifURI must be ABSOLUTE so the AMF can POST to it (TS 29.500 §6.1); \
          got {failure_uri}"
     );
+    // #1518: and its own token for this callback.
+    let failure_path = nextgcore_pcfd::sbi_path::ue_policy_callback_path(
+        &id,
+        nextgcore_pcfd::ue_policy::UePolicyCallback::N1n2Failure,
+    )
+    .expect("the association's tokened callback path");
     assert!(
-        failure_uri.ends_with(&format!("/{id}/n1n2-failure-notify")),
-        "the failure URI must name this association so the callback can correlate; got \
-         {failure_uri}"
+        failure_path.starts_with(&format!(
+            "/npcf-ue-policy-control/v1/notify/{id}/n1n2-failure-notify/"
+        )) && failure_uri.ends_with(&failure_path),
+        "the failure URI must name this association so the callback can correlate, and carry \
+         its token; got {failure_uri}"
     );
     // The transfer still carries the UPDP container it always did — the new member is
     // additive, not a replacement.
