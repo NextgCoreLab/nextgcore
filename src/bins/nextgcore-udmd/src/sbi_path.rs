@@ -1037,6 +1037,108 @@ impl SbiServer {
 mod tests {
     use super::*;
 
+    /// #1659, failure-path property 1 (a failed request applies nothing): when
+    /// the token cannot be obtained, Namf_MT is not sent at all, not even bare.
+    /// The caller gets the token error rather than a 401 from the AMF, and the
+    /// gated AMF stand-in serves nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
+    async fn a_failed_token_fetch_sends_nothing_1659() {
+        use nextgcore_sbi::test_support::oauth2 as stand_in;
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let sbi_ctx = global_context();
+        for inst in sbi_ctx.find_nf_instances_by_type(NfType::Amf).await {
+            sbi_ctx.remove_nf_instance(&inst.id).await;
+        }
+        let sk = nextgcore_sbi::oauth::generate_es256_key();
+        let (_amf, amf_port, seen) =
+            stand_in::oauth2_producer(&sk, NfType::Amf, |_| SbiResponse::with_status(200)).await;
+        // Port 1 on loopback: nothing listens, so the token request fails.
+        *crate::app::OAUTH2_CLIENT_TEST_OVERRIDE
+            .write()
+            .expect("override") = Some(stand_in::oauth2_client_for(1, NfType::Udm));
+        let mut instance = NfInstance::new("amf-1659-notoken", NfType::Amf);
+        instance.ipv4_addresses.push("127.0.0.1".to_string());
+        let mut svc = NfService::new("namf-mt", SbiServiceType::NamfMt);
+        svc.port = amf_port;
+        instance.add_service(svc);
+        sbi_ctx
+            .add_nf_instance_with_validity(instance, std::time::Duration::from_secs(3600))
+            .await;
+
+        let outcome = udm_amf_send_mt_ue_context_info(
+            Some("amf-1659-notoken"),
+            "imsi-001010000001659",
+            "TADS",
+        )
+        .await;
+
+        *crate::app::OAUTH2_CLIENT_TEST_OVERRIDE
+            .write()
+            .expect("override") = None;
+        sbi_ctx.remove_nf_instance("amf-1659-notoken").await;
+        let err = outcome.expect_err("no token: the request must not be sent");
+        assert!(
+            err.contains("access token"),
+            "the token error, not a 401: {err}"
+        );
+        assert!(seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+    }
+
+    /// #1659, failure-path property 4 (both peers): Namf_MT against amfd's REAL
+    /// Namf handler behind an OAuth2-required listener (nextgcore-sbi's gate,
+    /// audience AMF), the receiving peer. With the token the AMF answers its own
+    /// 404 for an unknown UE; without it the listener refuses 401.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
+    async fn namf_mt_reaches_the_real_amf_handler_behind_its_oauth2_gate_1659() {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        use nextgcore_sbi::test_support::oauth2 as stand_in;
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        nextgcore_amfd::test_support::init_context();
+        let sk = nextgcore_sbi::oauth::generate_es256_key();
+        let (_nrf, nrf_port) = stand_in::token_nrf(sk.clone()).await;
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let mut cfg = SbiServerConfig::new(addr).with_expected_audience_nf_type(NfType::Amf);
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(stand_in::jwks_for(&sk, stand_in::TEST_NRF_KID));
+        let amf = SbiServer::on_listener(cfg, listener);
+        amf.start(nextgcore_amfd::namf_request_handler)
+            .await
+            .expect("amfd Namf server starts");
+        std::env::set_var("AMF_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("AMF_SBI_PORT", addr.port().to_string());
+        let supi = "imsi-001010000001659";
+
+        let bare = udm_amf_send_mt_ue_context_info(None, supi, "TADS").await;
+        *crate::app::OAUTH2_CLIENT_TEST_OVERRIDE
+            .write()
+            .expect("override") = Some(stand_in::oauth2_client_for(nrf_port, NfType::Udm));
+        let tokened = udm_amf_send_mt_ue_context_info(None, supi, "TADS").await;
+        *crate::app::OAUTH2_CLIENT_TEST_OVERRIDE
+            .write()
+            .expect("override") = None;
+        std::env::remove_var("AMF_SBI_ADDR");
+        std::env::remove_var("AMF_SBI_PORT");
+
+        assert_eq!(
+            bare.map(|r| r.status),
+            Ok(401),
+            "the AMF's gate refuses a bare request"
+        );
+        assert_eq!(
+            tokened.map(|r| r.status),
+            Ok(404),
+            "past the gate, amfd's handler answers for the unknown UE"
+        );
+    }
+
     /// #1659: with an outbound OAuth2 client installed, the Namf_MT and the
     /// Nausf SoR/UPU service requests carry the NRF-issued token on every route:
     /// the named instance (`udm_sbi_send_request`), a cached instance of the type,

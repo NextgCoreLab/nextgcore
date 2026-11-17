@@ -283,6 +283,10 @@ pub type RediscoveryHook = Arc<
 /// The most clients [`SbiContext::get_tokened_client`] caches (#1659).
 pub const TOKENED_CLIENTS_MAX: usize = 64;
 
+/// Whether the full-cache warning of [`SbiContext::get_tokened_client`] was logged.
+static TOKENED_CLIENTS_FULL_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// SBI Context - manages NF instances and clients
 pub struct SbiContext {
     /// Self NF instance
@@ -670,11 +674,6 @@ impl SbiContext {
         self.healthy_first(found)
     }
 
-    /// Get or create a client for the given endpoint.
-    ///
-    /// The NRF's authority (from [`SbiContext::set_nrf_uri`]) gets the NRF
-    /// client TLS ([`crate::nrf_tls::nrf_client_config`], #1617); every other
-    /// peer the process-wide SBI profile (#63).
     /// The client configuration for dialling `host:port`.
     ///
     /// Issue #63: these caches hand out clients for dialling PEER NFs, so they
@@ -695,6 +694,11 @@ impl SbiContext {
         }
     }
 
+    /// Get or create a client for the given endpoint.
+    ///
+    /// The NRF's authority (from [`SbiContext::set_nrf_uri`]) gets the NRF
+    /// client TLS ([`crate::nrf_tls::nrf_client_config`], #1617); every other
+    /// peer the process-wide SBI profile (#63).
     pub async fn get_client(&self, host: &str, port: u16) -> Arc<SbiClient> {
         let key = format!("{host}:{port}");
 
@@ -727,8 +731,10 @@ impl SbiContext {
     /// request by `oauth2`'s cache, so caching the client does not pin a token.
     ///
     /// Only for discovered or configured peers, never an authority a peer
-    /// supplied (a callback URI): past [`TOKENED_CLIENTS_MAX`] entries a new peer
-    /// gets an uncached client, so the cache cannot grow without bound.
+    /// supplied (a callback URI, or a resource URI a peer handed back): build
+    /// those an uncached client instead. Past [`TOKENED_CLIENTS_MAX`] entries a
+    /// new peer gets an uncached client too, so the cache cannot grow without
+    /// bound.
     pub async fn get_tokened_client(
         &self,
         host: &str,
@@ -761,6 +767,11 @@ impl SbiContext {
         }
         if clients.len() < TOKENED_CLIENTS_MAX {
             clients.insert(key, Arc::clone(&client));
+        } else if !TOKENED_CLIENTS_FULL_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::warn!(
+                "the tokened-client cache is full ({TOKENED_CLIENTS_MAX} peers); new peers get \
+                 an uncached client, one connection per request (logged once)"
+            );
         }
         client
     }
@@ -887,6 +898,93 @@ pub async fn global_context_reset() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1659, failure-path property 3 (cancellation is safe): a
+    /// `get_tokened_client` dropped at its await (the NRF-URI read, held here by
+    /// a writer) leaves no entry, half-built or otherwise, and the next call
+    /// builds and caches the client normally.
+    #[tokio::test]
+    async fn a_cancelled_get_tokened_client_leaves_nothing_behind_1659() {
+        let ctx = SbiContext::new();
+        let oauth2 = Arc::new(crate::oauth::OAuth2Client::isolated_for_test(
+            "http://127.0.0.1:1",
+            "udm-cancel-1659",
+            NfType::Udm,
+        ));
+        let cached = || {
+            ctx.tokened_clients
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len()
+        };
+        {
+            let _writer = ctx.nrf_uri.write().await;
+            let pending =
+                ctx.get_tokened_client("127.0.0.1", 7777, NfType::Amf, Arc::clone(&oauth2));
+            let outcome = tokio::time::timeout(std::time::Duration::from_millis(20), pending).await;
+            assert!(outcome.is_err(), "the call is parked on the NRF-URI read");
+        }
+        assert_eq!(cached(), 0, "the dropped call cached nothing");
+        let client = ctx
+            .get_tokened_client("127.0.0.1", 7777, NfType::Amf, Arc::clone(&oauth2))
+            .await;
+        assert_eq!(cached(), 1);
+        let again = ctx
+            .get_tokened_client("127.0.0.1", 7777, NfType::Amf, oauth2)
+            .await;
+        assert!(Arc::ptr_eq(&client, &again));
+    }
+
+    /// #1659 review M1: past [`TOKENED_CLIENTS_MAX`] keys a new peer gets a fresh,
+    /// uncached client on every call, the cache stays at the cap, and a key
+    /// cached before the cap is still served from the cache.
+    #[tokio::test]
+    async fn past_the_cap_a_new_peer_gets_an_uncached_client_1659() {
+        let ctx = SbiContext::new();
+        let oauth2 = Arc::new(crate::oauth::OAuth2Client::isolated_for_test(
+            "http://127.0.0.1:1",
+            "udm-cap-1659",
+            NfType::Udm,
+        ));
+        let first = ctx
+            .get_tokened_client("127.0.0.1", 10_000, NfType::Amf, Arc::clone(&oauth2))
+            .await;
+        for port in 10_001..10_000 + TOKENED_CLIENTS_MAX as u16 {
+            ctx.get_tokened_client("127.0.0.1", port, NfType::Amf, Arc::clone(&oauth2))
+                .await;
+        }
+        let cached = || {
+            ctx.tokened_clients
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len()
+        };
+        assert_eq!(cached(), TOKENED_CLIENTS_MAX);
+
+        let over = 10_000 + TOKENED_CLIENTS_MAX as u16;
+        let a = ctx
+            .get_tokened_client("127.0.0.1", over, NfType::Amf, Arc::clone(&oauth2))
+            .await;
+        let b = ctx
+            .get_tokened_client("127.0.0.1", over, NfType::Amf, Arc::clone(&oauth2))
+            .await;
+        assert!(
+            !Arc::ptr_eq(&a, &b),
+            "past the cap each call gets a fresh client"
+        );
+        assert_eq!(
+            cached(),
+            TOKENED_CLIENTS_MAX,
+            "the cache does not grow past the cap"
+        );
+        let again = ctx
+            .get_tokened_client("127.0.0.1", 10_000, NfType::Amf, oauth2)
+            .await;
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "a cached peer is still served from the cache"
+        );
+    }
 
     /// #1659: a tokened client passes an OAuth2-required producer, and the cache
     /// hands the same client back for the same (target, peer, OAuth2 client), so

@@ -260,6 +260,31 @@ pub(crate) async fn peer_client(
     }
 }
 
+/// [`peer_client`] for an authority a peer supplied (#1659 review m2): a
+/// resource URI the producer handed back, such as an AMF subscription URI. With
+/// an outbound OAuth2 client it is a fresh, uncached tokened client, so a peer
+/// cannot fill the tokened-client cache; without one, the pooled client as
+/// before.
+pub(crate) async fn uncached_peer_client(
+    host: &str,
+    port: u16,
+    target: nextgcore_sbi::types::NfType,
+) -> Arc<nextgcore_sbi::client::SbiClient> {
+    match oauth2_client() {
+        Some(oauth2) => Arc::new(
+            nextgcore_sbi::client::SbiClient::new(nextgcore_sbi::security::sbi_peer_client_config(
+                host, port,
+            ))
+            .with_oauth2(oauth2, target),
+        ),
+        None => {
+            nextgcore_sbi::context::global_context()
+                .get_client(host, port)
+                .await
+        }
+    }
+}
+
 /// Parse the opt-in `sbi.oauth2.require` knob (Wave-6 H8). Default false so the
 /// matched-sim path is untouched. Honors `NEXTGCORE_SBI_OAUTH2_REQUIRE` first
 /// (overlay-friendly), then the yaml `<nf>.sbi.oauth2.require` (root-key
