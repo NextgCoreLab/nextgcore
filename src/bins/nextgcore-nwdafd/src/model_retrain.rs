@@ -449,14 +449,16 @@ pub async fn find_mtlf(
             id: uri.clone(),
         });
     }
-    let (nrf_host, nrf_port, nrf_base) = crate::notification_dispatcher::parse_notify_uri(nrf_uri)
+    let (_, _, nrf_base) = crate::notification_dispatcher::parse_notify_uri(nrf_uri)
+        .ok_or_else(|| format!("invalid NRF URI {nrf_uri:?}"))?;
+    let nrf = crate::notification_dispatcher::nrf_client(nrf_uri)
         .ok_or_else(|| format!("invalid NRF URI {nrf_uri:?}"))?;
     let disc = format!(
         "{}/nnrf-disc/v1/nf-instances?target-nf-type=NWDAF&requester-nf-type=NWDAF\
          &service-names=nnwdaf-mlmodelprovision",
         nrf_base.trim_end_matches('/')
     );
-    let resp = crate::notification_dispatcher::notify_client(&nrf_host, nrf_port)
+    let resp = nrf
         .get(&disc)
         .await
         .map_err(|e| format!("MTLF discovery at the NRF failed: {e}"))?;

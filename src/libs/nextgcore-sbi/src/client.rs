@@ -236,6 +236,16 @@ pub struct SbiClientConfig {
     /// found while reading, fails the request with `InvalidResponse`
     /// (nextgsim#468: a model download must not exhaust memory).
     pub max_response_body: Option<usize>,
+    /// Name the server certificate of `host` is verified against (and sent as
+    /// SNI) instead of `host` itself; `None` (the default) uses `host`. For a
+    /// server dialled by an address its certificate does not name, e.g. the
+    /// NRF on loopback (`NEXTGCORE_NRF_TLS_SERVER_NAME`, #1617). A redirect or
+    /// an alternate target to another host is verified against that host.
+    pub tls_server_name: Option<String>,
+    /// A TLS configuration error found while building this config (#1617:
+    /// half a client certificate/key pair). Set, every `https` connection
+    /// fails with it instead of dialling without the intended certificate.
+    pub tls_config_error: Option<String>,
 }
 
 impl Default for SbiClientConfig {
@@ -252,6 +262,8 @@ impl Default for SbiClientConfig {
             client_key: None,
             pool_size: DEFAULT_POOL_SIZE,
             max_response_body: None,
+            tls_server_name: None,
+            tls_config_error: None,
         }
     }
 }
@@ -293,6 +305,13 @@ impl SbiClientConfig {
     /// Cap response bodies at `bytes` (see [`SbiClientConfig::max_response_body`]).
     pub fn with_max_response_body(mut self, bytes: usize) -> Self {
         self.max_response_body = Some(bytes);
+        self
+    }
+
+    /// Verify the server certificate against `name` instead of the dialled host
+    /// (see [`SbiClientConfig::tls_server_name`]).
+    pub fn with_tls_server_name(mut self, name: impl Into<String>) -> Self {
+        self.tls_server_name = Some(name.into());
         self
     }
 
@@ -395,6 +414,16 @@ impl SbiClient {
     /// tests would still break.
     pub fn for_peer(host: impl Into<String>, port: u16) -> Self {
         Self::new(crate::security::sbi_peer_client_config(&host.into(), port))
+    }
+
+    /// A client for dialling **this NF's NRF** at `nrf_uri` (#1617): `https`
+    /// with the NRF client TLS ([`crate::nrf_tls`]) when the URI is `https://`
+    /// or the profile is `production`, plain `http` otherwise. `None` when the
+    /// URI does not parse. Use this, not [`SbiClient::for_peer`] or
+    /// [`SbiClient::with_host_port`], for every request to the NRF: the NRF
+    /// identifies a registrant by the client certificate this presents.
+    pub fn for_nrf_uri(nrf_uri: &str) -> Option<Self> {
+        crate::nrf_tls::nrf_client_config_for_uri(nrf_uri).map(Self::new)
     }
 
     /// Attach an OAuth2 client for automatic Bearer token attachment.
@@ -506,6 +535,9 @@ impl SbiClient {
 
     /// Build a TLS connector from the client config
     fn build_tls_connector(&self) -> SbiResult<TlsConnector> {
+        if let Some(e) = &self.config.tls_config_error {
+            return Err(SbiError::TlsError(e.clone()));
+        }
         let client_config = if let (Some(cert_path), Some(key_path)) =
             (&self.config.client_cert, &self.config.client_key)
         {
@@ -576,7 +608,13 @@ impl SbiClient {
 
         if scheme == UriScheme::Https {
             let connector = self.build_tls_connector()?;
-            let server_name = ServerName::try_from(host.to_string())
+            // The configured name stands in for the configured host only: a
+            // redirect or alternate elsewhere is verified as itself.
+            let verify_as = match &self.config.tls_server_name {
+                Some(name) if host.eq_ignore_ascii_case(&self.config.host) => name.as_str(),
+                _ => host.trim_start_matches('[').trim_end_matches(']'),
+            };
+            let server_name = ServerName::try_from(verify_as.to_string())
                 .map_err(|e| SbiError::TlsError(format!("Invalid server name: {e}")))?;
 
             let tls_stream = tokio::time::timeout(

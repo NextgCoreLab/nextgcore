@@ -1350,6 +1350,8 @@ mod data_management_tests {
     #[test]
     fn overlapping_consumers_share_one_producer_subscription() {
         let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // A plaintext NRF: the dev profile, or #1617's NRF client dials https.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         init();
         clear_subscriptions();
 

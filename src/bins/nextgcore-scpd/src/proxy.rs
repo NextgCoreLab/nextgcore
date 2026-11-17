@@ -1115,6 +1115,23 @@ impl ScpProxy {
         client
     }
 
+    /// Get or create the pooled client for this SCP's NRF (delegated
+    /// discovery). The scheme is the NRF URI's; an `https` NRF is dialled with
+    /// the NRF client TLS, i.e. the NRF's CA and this SCP's certificate
+    /// (#1617), not the generic forwarding client's public roots.
+    fn client_for_nrf(&self, nrf: &ApiRoot) -> Arc<SbiClient> {
+        let key = format!("nrf|{}", nrf.authority_key());
+        if let Some(client) = self.clients.get(&key) {
+            return client;
+        }
+        let config = nextgcore_sbi::nrf_tls::nrf_client_config(nrf.scheme, &nrf.host, nrf.port)
+            .with_connect_timeout(self.config.connect_timeout)
+            .with_request_timeout(self.config.request_timeout);
+        let client = Arc::new(SbiClient::new(config));
+        self.clients.insert(key, client.clone());
+        client
+    }
+
     /// Get or create a pooled HTTP/2 client that automatically attaches a
     /// delegated OAuth2 Bearer token for `target_nf_type` (TS 33.501 §13;
     /// TS 29.510 client-credentials grant). Returns `None` when the SCP has no
@@ -1525,7 +1542,7 @@ impl ScpProxy {
         // scpd-#211: an NRF that cannot be reached is reported as the NRF, not as
         // the target NF (TS 29.500 §6.10.8.2).
         let response = self
-            .client_for(&nrf)
+            .client_for_nrf(&nrf)
             .send_request(disc)
             .await
             .map_err(|e| nrf_unreachable_response(&nrf.to_uri(), &e))?;

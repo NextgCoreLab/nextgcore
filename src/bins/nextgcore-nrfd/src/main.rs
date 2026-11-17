@@ -5421,6 +5421,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // a std guard held to serialise globals, by design
     async fn test_shared_deregister_self_removes_the_profile_from_the_real_nrf() {
+        // A plaintext NRF: the dev profile, or #1617's NRF client dials https.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         use serde_json::json;
         let _registration_guard = nextgcore_sbi::heartbeat::lock_registration_state_for_test();
 
@@ -5535,6 +5537,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // a std guard held to serialise globals, by design
     async fn a_registration_landing_during_shutdown_is_deleted_before_deregister_self_returns() {
+        // A plaintext NRF: the dev profile, or #1617's NRF client dials https.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         use nextgcore_sbi::heartbeat as hb;
         use serde_json::json;
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -5656,6 +5660,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // a std guard held to serialise globals, by design
     async fn deregister_self_gives_up_on_a_silent_nrf_within_its_bound() {
+        // A plaintext NRF: the dev profile, or #1617's NRF client dials https.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         use nextgcore_sbi::heartbeat as hb;
         let _registration_guard = hb::lock_registration_state_for_test();
         hb::clear_registration_abandoned();
@@ -5848,6 +5854,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // a std guard held to serialise globals, by design
     async fn test_a_404_heartbeat_re_registers_the_lost_profile_with_the_real_nrf() {
+        // A plaintext NRF: the dev profile, or #1617's NRF client dials https.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         use nextgcore_sbi::heartbeat as hb;
         use serde_json::json;
         let _registration_guard = hb::lock_registration_state_for_test();
@@ -10826,7 +10834,11 @@ mod dev_pki_tests_1617 {
             .expect("NRF starts with the dev nrf.crt");
         let run = async {
             for (i, (name, nf_type, id)) in ids.iter().enumerate() {
-                let mut client_cfg = SbiClientConfig::new("localhost", addr.port()).with_https();
+                // The dev PKI names no loopback address (#1617 step a): the
+                // NRF is verified as `nrf` while dialled on 127.0.0.1.
+                let mut client_cfg = SbiClientConfig::new("127.0.0.1", addr.port())
+                    .with_https()
+                    .with_tls_server_name("nrf");
                 client_cfg.ca_cert = Some(pki.file("ca.crt"));
                 client_cfg.client_cert = Some(pki.file(&format!("{name}.crt")));
                 client_cfg.client_key = Some(pki.file(&format!("{name}.key")));

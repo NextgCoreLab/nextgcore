@@ -216,10 +216,11 @@ async fn fetch_nf_profile(
     nrf_uri: &str,
     nf_instance_id: &str,
 ) -> Result<serde_json::Value, String> {
-    let Some((host, port, _)) = split_uri(nrf_uri) else {
+    // #1617: the NRF client TLS (https + this NF's certificate) for an https
+    // NRF URI or the production profile.
+    let Some(client) = SbiClient::for_nrf_uri(nrf_uri) else {
         return Err(format!("unparseable NRF URI {nrf_uri}"));
     };
-    let client = SbiClient::with_host_port(&host, port);
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     let resp = client.get(&path).await.map_err(|e| e.to_string())?;
     if resp.status != 200 {

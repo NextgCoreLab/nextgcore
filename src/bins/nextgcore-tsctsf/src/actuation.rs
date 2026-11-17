@@ -438,9 +438,11 @@ pub async fn resolve_pcf_endpoint() -> Option<PcfEndpoint> {
     let nrf_uri = nextgcore_sbi::context::global_context()
         .get_nrf_uri()
         .await?;
-    let (nrf_host, nrf_port) = split_authority(&nrf_uri)?;
+    // #1617: the NRF client TLS for an https NRF URI or the production profile.
+    // (An NRF URI without a port is still refused, as before.)
+    split_authority(&nrf_uri)?;
     let client = nextgcore_sbi::client::SbiClient::new(
-        nextgcore_sbi::security::sbi_peer_client_config(&nrf_host, nrf_port)
+        nextgcore_sbi::nrf_tls::nrf_client_config_for_uri(&nrf_uri)?
             .with_connect_timeout(std::time::Duration::from_secs(2))
             .with_request_timeout(std::time::Duration::from_secs(3)),
     );

@@ -649,15 +649,16 @@ pub async fn subscribe_at_anlf(m: &Monitor, registration_id: &str) -> Result<Str
         .consumer_id
         .clone()
         .ok_or("a consumerSetId-only registration names no AnLF to subscribe to")?;
-    let (nrf_host, nrf_port, nrf_base) =
-        crate::notification_dispatcher::parse_notify_uri(&m.nrf_uri)
-            .ok_or_else(|| format!("invalid NRF URI {:?}", m.nrf_uri))?;
+    let (_, _, nrf_base) = crate::notification_dispatcher::parse_notify_uri(&m.nrf_uri)
+        .ok_or_else(|| format!("invalid NRF URI {:?}", m.nrf_uri))?;
+    let nrf = crate::notification_dispatcher::nrf_client(&m.nrf_uri)
+        .ok_or_else(|| format!("invalid NRF URI {:?}", m.nrf_uri))?;
     let disc = format!(
         "{}/nnrf-disc/v1/nf-instances?target-nf-type=NWDAF&requester-nf-type=NWDAF\
          &target-nf-instance-id={consumer}&service-names={SERVICE_NAME}",
         nrf_base.trim_end_matches('/')
     );
-    let resp = crate::notification_dispatcher::notify_client(&nrf_host, nrf_port)
+    let resp = nrf
         .get(&disc)
         .await
         .map_err(|e| format!("AnLF discovery at the NRF failed: {e}"))?;
