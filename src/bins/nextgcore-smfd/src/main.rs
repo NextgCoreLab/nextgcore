@@ -1247,6 +1247,7 @@ async fn main() -> Result<()> {
     // reporting (§6.4.3.4.5.2.2) is optional for an SMF and is not done here; see
     // specs/decide-oci-shedding-default-and-producer-metric-source.md.
     sbi_server_config = sbi_server_config.with_self_overload_reporting();
+    sbi_server_config = with_callback_exemptions(sbi_server_config);
     let sbi_server = SbiServer::new(sbi_server_config);
 
     sbi_server
@@ -2144,10 +2145,10 @@ async fn smf_nrf_register(sbi_addr: &str, sbi_port: u16) -> std::result::Result<
     let sbi_ctx = global_context();
 
     // Prefer the URI seeded from YAML config; fall back to NRF_URI env var
-    let nrf_uri = match sbi_ctx.get_nrf_uri().await {
-        Some(uri) => uri,
+    let (nrf_uri, from_context) = match sbi_ctx.get_nrf_uri().await {
+        Some(uri) => (uri, true),
         None => match std::env::var("NRF_URI").ok() {
-            Some(uri) => uri,
+            Some(uri) => (uri, false),
             None => {
                 log::debug!("No NRF URI configured, skipping NRF registration");
                 return Ok(String::new());
@@ -2158,7 +2159,15 @@ async fn smf_nrf_register(sbi_addr: &str, sbi_port: u16) -> std::result::Result<
     log::info!("Registering SMF with NRF at {nrf_uri}");
 
     let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
-    let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
+    // #1617: get_client knows the context's NRF; an NRF_URI-only NRF is dialled
+    // with the same NRF client TLS directly.
+    let client = if from_context {
+        sbi_ctx.get_client(&nrf_host, nrf_port).await
+    } else {
+        std::sync::Arc::new(
+            nextgcore_sbi::client::SbiClient::for_nrf_uri(&nrf_uri).ok_or("Invalid NRF URI")?,
+        )
+    };
 
     let nf_instance_id =
         nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Smf)
@@ -2320,13 +2329,21 @@ pub(crate) async fn discover_udm_uecm_endpoint() -> Option<(String, u16)> {
 async fn discover_udm_service_endpoint(service: &str) -> Option<(String, u16)> {
     let sbi_ctx = global_context();
     let nrf_uri = match sbi_ctx.get_nrf_uri().await {
-        Some(uri) => Some(uri),
-        None => std::env::var("NRF_URI").ok(),
+        Some(uri) => Some((uri, true)),
+        None => std::env::var("NRF_URI").ok().map(|uri| (uri, false)),
     };
 
-    if let Some(nrf_uri) = nrf_uri {
+    if let Some((nrf_uri, from_context)) = nrf_uri {
         if let Some((nrf_host, nrf_port)) = parse_host_port(&nrf_uri) {
-            let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
+            // #1617: as in smf_nrf_register, an NRF_URI-only NRF still gets the
+            // NRF client TLS.
+            let client = match (
+                from_context,
+                nextgcore_sbi::client::SbiClient::for_nrf_uri(&nrf_uri),
+            ) {
+                (false, Some(c)) => std::sync::Arc::new(c),
+                _ => sbi_ctx.get_client(&nrf_host, nrf_port).await,
+            };
             let path = format!(
                 "/nnrf-disc/v1/nf-instances\
                  ?target-nf-type=UDM&requester-nf-type=SMF&service-names={service}"
@@ -2535,12 +2552,154 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
     }
 }
 
+// =============================================================================
+// Callback URIs and their tokens (#1518)
+// =============================================================================
+
+/// The Nudm_SDM `callbackReference` of the session at `sm_context_ref` (#1518):
+/// `{apiRoot}/nsmf-callback/v1/{smContextRef}/sdm-notify/{token}`.
+fn sdm_notify_uri(
+    sm_context_ref: &str,
+    token: &nextgcore_sbi::callback_auth::CallbackToken,
+) -> String {
+    format!(
+        "{}/nsmf-callback/v1/{sm_context_ref}/sdm-notify/{}",
+        self_sbi_uri(),
+        token.as_str()
+    )
+}
+
+/// The `SmPolicyContextData.notificationUri` of the session at `sm_context_ref`
+/// (#1518): `{apiRoot}/nsmf-callback/v1/{smContextRef}/sm-policy-notify/{token}`.
+/// The PCF appends `/update` or `/terminate` (TS 29.512 §4.2.3.2, §4.2.3.3).
+fn sm_policy_notify_uri(
+    sm_context_ref: &str,
+    token: &nextgcore_sbi::callback_auth::CallbackToken,
+) -> String {
+    format!(
+        "{}/nsmf-callback/v1/{sm_context_ref}/sm-policy-notify/{}",
+        self_sbi_uri(),
+        token.as_str()
+    )
+}
+
+/// Whether the session at `sm_context_ref` admits a `kind` notification presenting
+/// `token` (`None`: the token-less URI of before #1518).
+/// See [`context::PolicyBinding::admits_callback`].
+fn session_admits_callback(
+    sm_context_ref: &str,
+    kind: context::SessionCallback,
+    token: Option<&str>,
+) -> bool {
+    lookup_policy_binding(sm_context_ref).is_some_and(|b| b.admits_callback(kind, token))
+}
+
+/// The answer to a notification its session does not admit (#1518): the same 404
+/// an unknown `smContextRef` gets, so a wrong token learns nothing, and nothing
+/// changes.
+fn callback_not_admitted(sm_context_ref: &str, kind: context::SessionCallback) -> SbiResponse {
+    log::warn!(
+        "{kind:?} notification for ref={sm_context_ref} without the session's current \
+         callback token: refused, nothing changed"
+    );
+    send_not_found(
+        &format!("No SM context for ref={sm_context_ref}"),
+        Some("CONTEXT_NOT_FOUND"),
+    )
+}
+
+/// The Nsmf_Callback routes admitted without an OAuth2 bearer when the listener
+/// requires one (#1518): a notification carries no access token (TS 33.501 §13.4.1,
+/// TS 29.500 §6.10.7 NOTE). Each is authenticated instead by the token this SMF
+/// minted for the session's callback URI, TOGETHER with the sender's verified
+/// mutual-TLS certificate naming the notifying NF type (RFC 9310 NFTypes, TS 33.310
+/// §6.1.3c.3), because a third party can read both URIs back (the #1522 rule):
+/// - `{ref}/sm-policy-notify/{token}/{update,terminate}` needs a PCF: an SM policy
+///   association GET returns `SmPolicyControl.context.notificationUri`
+///   (TS 29.512 §5.6.2.2);
+/// - `{ref}/sdm-notify/{token}` needs a UDM: a UDM may keep its SDM subscriptions in
+///   the UDR (`context-data/sdm-subscriptions`, TS 29.505), which other Nudr_DR
+///   consumers can read.
+///
+/// Without a verified certificate (plaintext, server-only TLS) they stay on the
+/// bearer. The token-less URIs of before #1518, and the `n1-n2-failure` and
+/// `amf-status` routes (whose URIs this SMF never hands out), stay bearer-only.
+fn oauth2_callback_exemptions() -> Vec<nextgcore_sbi::server::OAuth2CallbackExemption> {
+    use context::SessionCallback;
+    use nextgcore_sbi::server::OAuth2CallbackExemption;
+    let route = |pattern: String, kind: SessionCallback, nf_type: &'static str| {
+        OAuth2CallbackExemption::for_verified_peer("POST", pattern, move |cb, peer| async move {
+            let [sm_context_ref] = cb.vars.as_slice() else {
+                return false;
+            };
+            peer.has_nf_type(nf_type)
+                && session_admits_callback(sm_context_ref, kind, Some(&cb.token))
+        })
+    };
+    let sm_policy = |op: &str| {
+        route(
+            format!("/nsmf-callback/v1/{{var}}/sm-policy-notify/{{token}}/{op}"),
+            SessionCallback::SmPolicyNotify,
+            "PCF",
+        )
+    };
+    vec![
+        // Npcf_SMPolicyControl UpdateNotify (TS 29.512 §4.2.3.2, §4.2.3.3).
+        sm_policy("update"),
+        sm_policy("terminate"),
+        // Nudm_SDM_Notification (TS 29.503 §5.2.2.5.2).
+        route(
+            "/nsmf-callback/v1/{var}/sdm-notify/{token}".to_string(),
+            SessionCallback::SdmNotify,
+            "UDM",
+        ),
+    ]
+}
+
+/// `cfg` with this SMF's [`oauth2_callback_exemptions`] registered (#1518). The
+/// composition root builds its server config through here, so a test sees what it
+/// registers.
+fn with_callback_exemptions(cfg: NextgcoreSbiServerConfig) -> NextgcoreSbiServerConfig {
+    cfg.with_oauth2_callback_exemptions(oauth2_callback_exemptions())
+}
+
+/// The callback a tokened `nsmf-callback` path names (#1518), its token and the
+/// PCF's operation: `{ref}/sm-policy-notify/{token}/{update,terminate}` or
+/// `{ref}/sdm-notify/{token}`, exactly. `None` for any other path.
+fn tokened_callback<'a>(
+    parts: &[&'a str],
+) -> Option<(&'a str, context::SessionCallback, &'a str, Option<&'a str>)> {
+    match parts {
+        ["nsmf-callback", _, r, "sm-policy-notify", token, op @ ("update" | "terminate")] => {
+            Some((
+                *r,
+                context::SessionCallback::SmPolicyNotify,
+                *token,
+                Some(*op),
+            ))
+        }
+        ["nsmf-callback", _, r, "sdm-notify", token] => {
+            Some((*r, context::SessionCallback::SdmNotify, *token, None))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `segment` is the keyword of a tokened `nsmf-callback` URI (#1518).
+fn is_tokened_callback_keyword(segment: &str) -> bool {
+    matches!(segment, "sm-policy-notify" | "sdm-notify")
+}
+
 /// SBI request handler for SMF
 async fn smf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
 
-    log::debug!("SMF SBI request: {method} {uri}");
+    // #1518: the callback URIs carry tokens.
+    log::debug!(
+        "SMF SBI request: {method} {}",
+        nextgcore_sbi::log_redact::redact_callback_tokens(uri)
+    );
 
     // Parse the URI path
     let path = uri.split('?').next().unwrap_or(uri);
@@ -2554,6 +2713,32 @@ async fn smf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let _version = parts[1];
     let resource = parts[2];
     let resource_id = parts.get(3).copied();
+
+    // #1518: the tokened callback URIs, `{smContextRef}/{keyword}/{token}[/op]`.
+    // Acted on only with the session's current token, whatever admitted the request
+    // (a bearer, a verified peer, or a listener without OAuth2).
+    if service == "nsmf-callback" && parts.get(3).is_some_and(|k| is_tokened_callback_keyword(k)) {
+        if method != "POST" {
+            return send_not_found("Unknown endpoint", None);
+        }
+        let Some((sm_context_ref, kind, token, op)) = tokened_callback(&parts) else {
+            return send_not_found("Unknown endpoint", None);
+        };
+        if !session_admits_callback(sm_context_ref, kind, Some(token)) {
+            return callback_not_admitted(sm_context_ref, kind);
+        }
+        return match (kind, op) {
+            (context::SessionCallback::SmPolicyNotify, Some("terminate")) => {
+                handle_sm_policy_terminate(sm_context_ref).await
+            }
+            (context::SessionCallback::SmPolicyNotify, _) => {
+                handle_sm_policy_notify(sm_context_ref, &request).await
+            }
+            (context::SessionCallback::SdmNotify, _) => {
+                handle_sdm_notification(sm_context_ref, &request).await
+            }
+        };
+    }
 
     match (service, resource, method) {
         // =====================================================================
@@ -2658,8 +2843,21 @@ async fn smf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 
         // SM Policy Update/Terminate Notification (from PCF, TS 29.512
         // §4.2.3/§4.2.4: POST {notificationUri}/update | /terminate)
+        //
+        // #1518: the token-less URI of before #1518, served only for a session
+        // restored from then (`PolicyBinding::admits_callback`).
         ("nsmf-callback", "sm-policy-notify", "POST") => {
             if let Some(sm_context_ref) = resource_id {
+                if !session_admits_callback(
+                    sm_context_ref,
+                    context::SessionCallback::SmPolicyNotify,
+                    None,
+                ) {
+                    return callback_not_admitted(
+                        sm_context_ref,
+                        context::SessionCallback::SmPolicyNotify,
+                    );
+                }
                 let action = parts.get(4).copied().unwrap_or("update");
                 match action {
                     "update" => handle_sm_policy_notify(sm_context_ref, &request).await,
@@ -2677,8 +2875,21 @@ async fn smf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // exists BEFORE any subscribe is sent -- a subscription whose callback 404s
         // is strictly worse than no subscription, because the UDM then retries
         // against us.
+        //
+        // #1518: `{smContextRef}/sdm-notify/{token}` since; this token-less form is
+        // served only for a session restored from before then.
         ("nsmf-callback", "sdm-notify", "POST") => {
             if let Some(sm_context_ref) = resource_id {
+                if !session_admits_callback(
+                    sm_context_ref,
+                    context::SessionCallback::SdmNotify,
+                    None,
+                ) {
+                    return callback_not_admitted(
+                        sm_context_ref,
+                        context::SessionCallback::SdmNotify,
+                    );
+                }
                 handle_sdm_notification(sm_context_ref, &request).await
             } else {
                 send_bad_request("Missing SM context reference", None)
@@ -2705,7 +2916,10 @@ async fn smf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 
         // Default: unknown endpoint
         _ => {
-            log::warn!("Unknown SBI endpoint: {method} {path}");
+            log::warn!(
+                "Unknown SBI endpoint: {method} {}",
+                nextgcore_sbi::log_redact::redact_callback_tokens(path)
+            );
             send_not_found("Unknown endpoint", None)
         }
     }
@@ -4889,13 +5103,15 @@ async fn handle_sm_context_create_inner(request: &SbiRequest) -> SbiResponse {
     // subscription created and not recorded is an orphan on the UDM, because the
     // release path would have nothing to delete. Same shape, and same reason, as the
     // EASDF DNS context below.
+    //
+    // #1518: each callback URI carries its own token, minted here for this binding
+    // and checked by the route, so a notification needs no bearer (TS 33.501
+    // §13.4.1, TS 29.500 §6.10.7 NOTE) and a sender without the token gets nowhere.
+    let sdm_notify_token = nextgcore_sbi::callback_auth::CallbackToken::mint();
+    let sm_policy_notify_token = nextgcore_sbi::callback_auth::CallbackToken::mint();
     let sdm_subscription_id = udm::subscribe_sm_data(
         &supi,
-        &format!(
-            "{}/nsmf-callback/v1/sdm-notify/{}",
-            self_sbi_uri(),
-            sm_context_ref
-        ),
+        &sdm_notify_uri(&sm_context_ref, &sdm_notify_token),
         &dnn,
         sst,
         snssai_sd.as_deref(),
@@ -4903,11 +5119,7 @@ async fn handle_sm_context_create_inner(request: &SbiRequest) -> SbiResponse {
     .await;
 
     // ---- Npcf_SMPolicyControl_Create (TS 29.512 §4.2.2) ----
-    let notification_uri = format!(
-        "{}/nsmf-callback/v1/sm-policy-notify/{}",
-        self_sbi_uri(),
-        sm_context_ref
-    );
+    let notification_uri = sm_policy_notify_uri(&sm_context_ref, &sm_policy_notify_token);
     let mut decision = match policy::resolve_pcf_endpoint().await {
         None => {
             // Documented config-default fallback: no PCF configured.
@@ -5381,6 +5593,9 @@ async fn handle_sm_context_create_inner(request: &SbiRequest) -> SbiResponse {
                     nsac_nf_id: nsac_nf_id.clone(),
                     nsac_nsacf: nsac_nsacf.clone(),
                     nsac_plmn: nsac_plmn.clone(),
+                    callback_tokens: true,
+                    sm_policy_notify_token: Some(sm_policy_notify_token.clone()),
+                    sdm_notify_token: Some(sdm_notify_token.clone()),
                 },
             );
         }
@@ -11371,7 +11586,9 @@ fn restore_pcscf(sm_context_ref: &str, binding: &context::PolicyBinding) -> bool
     true
 }
 
-/// `POST /nsmf-callback/v1/sdm-notify/{smContextRef}` — `Nudm_SDM_Notification`
+/// `POST /nsmf-callback/v1/{smContextRef}/sdm-notify/{token}` (#1518; the token-less
+/// `sdm-notify/{smContextRef}` of before only for a session from then) —
+/// `Nudm_SDM_Notification`
 /// (issue #293, TS 29.503 §5.2.2.6).
 ///
 /// The UDM tells us the subscriber's SM data changed; this applies the change to the
@@ -16838,7 +17055,7 @@ mod tests {
                 );
                 let id = udm::subscribe_sm_data(
                     supi,
-                    "http://127.0.0.1:9/nsmf-callback/v1/sdm-notify/1",
+                    "http://127.0.0.1:9/nsmf-callback/v1/1/sdm-notify/0123456789abcdef",
                     "internet",
                     1,
                     Some("010203"),
@@ -17148,10 +17365,321 @@ mod tests {
                         nsac_nf_id: None,
                         nsac_nsacf: None,
                         nsac_plmn: None,
+                        // #1518: a session made since, holding the tokens of
+                        // `sm_policy_notify_path` and `sdm_notify_path`.
+                        callback_tokens: true,
+                        sm_policy_notify_token: Some(test_callback_token(&format!(
+                            "smp-{sm_context_ref}"
+                        ))),
+                        sdm_notify_token: Some(test_callback_token(&format!(
+                            "sdm-{sm_context_ref}"
+                        ))),
                     },
                 );
             }
         }
+    }
+
+    /// #1518: the routes the composition root registers as bearer-exempt: the
+    /// tokened SM policy and SDM notification URIs, each behind a verified peer.
+    #[test]
+    fn the_smf_registers_its_callback_exemptions_1518() {
+        let cfg = with_callback_exemptions(NextgcoreSbiServerConfig::new(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        ));
+        let routes: Vec<String> = cfg
+            .oauth2_callback_exemptions
+            .iter()
+            .map(|e| e.route())
+            .collect();
+        assert_eq!(
+            routes,
+            [
+                "POST /nsmf-callback/v1/{var}/sm-policy-notify/{token}/update",
+                "POST /nsmf-callback/v1/{var}/sm-policy-notify/{token}/terminate",
+                "POST /nsmf-callback/v1/{var}/sdm-notify/{token}",
+            ]
+        );
+    }
+
+    /// #1518: the SMF's real router behind an OAuth2-required listener with its
+    /// exemptions and an empty JWKS, so that no bearer could verify. Both callback
+    /// routes need a verified mutual-TLS peer as well as the token, so over
+    /// plaintext a notification with the session's right token is still 401, as are
+    /// a forged token, the token-less URI of before #1518 and a service request. The
+    /// verified-peer admission itself is
+    /// `the_callback_routes_admit_only_the_notifying_nf_type_1518`.
+    ///
+    /// REVERT-VERIFIED: with the routes registered as token-only
+    /// (`OAuth2CallbackExemption::new`), the right-token cases are not 401.
+    #[tokio::test]
+    async fn an_oauth2_listener_holds_the_callbacks_to_a_verified_peer_1518() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let r = "151801";
+        seed_binding(r, 5);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let mut cfg = with_callback_exemptions(NextgcoreSbiServerConfig::new(addr));
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(serde_json::json!({"keys": []}));
+        let server = SbiServer::on_listener(cfg, listener);
+        server.start(smf_sbi_request_handler).await.expect("start");
+        let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", addr.port());
+        let mut statuses = Vec::new();
+        for path in [
+            sm_policy_notify_path(r, "update"),
+            sm_policy_notify_path(r, "terminate"),
+            sdm_notify_path(r),
+            format!("/nsmf-callback/v1/{r}/sm-policy-notify/smp-forged/update"),
+            format!("/nsmf-callback/v1/{r}/sdm-notify/sdm-forged"),
+            format!("/nsmf-callback/v1/sm-policy-notify/{r}/terminate"),
+            format!("/nsmf-callback/v1/sdm-notify/{r}"),
+            "/nsmf-pdusession/v1/sm-contexts".to_string(),
+        ] {
+            let req =
+                SbiRequest::post(path.clone()).with_body("{}".to_string(), "application/json");
+            let status = tokio::time::timeout(Duration::from_secs(5), client.send_request(req))
+                .await
+                .expect("bounded")
+                .expect("response")
+                .status;
+            statuses.push((path, status));
+        }
+        server.stop().await.expect("stop");
+        for (path, status) in statuses {
+            assert_eq!(status, 401, "{path}");
+        }
+        assert!(lookup_policy_binding(r).is_some(), "nothing was acted on");
+        if let Ok(ctx) = smf_self().read() {
+            ctx.policy_bindings.write().unwrap().remove(r);
+        }
+    }
+
+    /// #1518: the callback routes admit, without a bearer, only a verified
+    /// certificate of the notifying NF type together with the session's current
+    /// token for that callback: `sm-policy-notify` a PCF's, `sdm-notify` a UDM's.
+    /// Another NF type, a certificate without NFTypes, no certificate, a forged
+    /// token, another session's token, the other callback's token, an operation the
+    /// PCF does not send, and the token-less URI of before #1518 are all held to the
+    /// bearer.
+    ///
+    /// REVERT-VERIFIED: without the NF-type check, the AMF-typed and untyped
+    /// certificates are admitted; without the token check, the forged and the
+    /// other session's tokens are.
+    #[tokio::test]
+    async fn the_callback_routes_admit_only_the_notifying_nf_type_1518() {
+        use nextgcore_sbi::callback_auth::VerifiedPeer;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let (a, b) = ("151811", "151812");
+        seed_binding(a, 5);
+        seed_binding(b, 6);
+        let peer = |types: &[&str]| {
+            Some(VerifiedPeer {
+                nf_instance_id: "4e3c1518-0000-4000-8000-000000000002".to_string(),
+                nf_types: types.iter().map(|t| t.to_string()).collect(),
+            })
+        };
+        let exemptions = oauth2_callback_exemptions();
+        let exemptions = &exemptions;
+        let admits = |path: String, p: Option<VerifiedPeer>| async move {
+            nextgcore_sbi::callback_auth::admits_without_bearer_from(
+                exemptions,
+                "POST",
+                &path,
+                p.as_ref(),
+            )
+            .await
+        };
+        for op in ["update", "terminate"] {
+            let path = sm_policy_notify_path(a, op);
+            assert!(admits(path.clone(), peer(&["PCF"])).await, "PCF {op}");
+            assert!(!admits(path.clone(), peer(&["UDM"])).await, "UDM {op}");
+            assert!(!admits(path.clone(), peer(&["AMF"])).await, "AMF {op}");
+            assert!(!admits(path.clone(), peer(&[])).await, "untyped {op}");
+            assert!(!admits(path, None).await, "no peer {op}");
+        }
+        assert!(admits(sdm_notify_path(a), peer(&["UDM"])).await);
+        assert!(!admits(sdm_notify_path(a), peer(&["PCF"])).await);
+        assert!(!admits(sdm_notify_path(a), peer(&[])).await);
+        assert!(!admits(sdm_notify_path(a), None).await);
+        for (path, who) in [
+            (
+                format!("/nsmf-callback/v1/{a}/sm-policy-notify/smp-forged/update"),
+                "PCF",
+            ),
+            (
+                format!("/nsmf-callback/v1/{a}/sm-policy-notify/smp-{b}/update"),
+                "PCF",
+            ),
+            (
+                format!("/nsmf-callback/v1/{a}/sm-policy-notify/sdm-{a}/update"),
+                "PCF",
+            ),
+            (
+                format!("/nsmf-callback/v1/{a}/sm-policy-notify/smp-{a}/delete"),
+                "PCF",
+            ),
+            (
+                format!("/nsmf-callback/v1/{a}/sm-policy-notify/smp-{a}"),
+                "PCF",
+            ),
+            (
+                format!("/nsmf-callback/v1/sm-policy-notify/{a}/update"),
+                "PCF",
+            ),
+            (
+                format!("/nsmf-callback/v1/{a}/sdm-notify/sdm-forged"),
+                "UDM",
+            ),
+            (format!("/nsmf-callback/v1/{a}/sdm-notify/sdm-{b}"), "UDM"),
+            (format!("/nsmf-callback/v1/{a}/sdm-notify/smp-{a}"), "UDM"),
+            (format!("/nsmf-callback/v1/sdm-notify/{a}"), "UDM"),
+            (
+                format!("/nsmf-callback/v1/no-such-ref/sdm-notify/sdm-{a}"),
+                "UDM",
+            ),
+        ] {
+            assert!(!admits(path.clone(), peer(&[who])).await, "{path}");
+        }
+        // Session b's own tokens name session b.
+        assert!(admits(sm_policy_notify_path(b, "update"), peer(&["PCF"])).await);
+        assert!(admits(sdm_notify_path(b), peer(&["UDM"])).await);
+        if let Ok(ctx) = smf_self().read() {
+            let mut bindings = ctx.policy_bindings.write().unwrap();
+            bindings.remove(a);
+            bindings.remove(b);
+        }
+    }
+
+    /// #1518: whatever admitted it (a bearer, a verified peer, or a listener without
+    /// OAuth2), a notification is acted on only with its session's current token for
+    /// that callback; otherwise 404 and nothing changes. The token-less URIs of
+    /// before #1518 are served only for a binding restored from then, and only while
+    /// it holds no token; a binding made since (tokened, or EPS-moved without any
+    /// callback URI) gets 404 on them.
+    ///
+    /// The malformed body tells the two apart: a request the gate passes reaches the
+    /// handler, which answers 400; one it refuses is 404.
+    ///
+    /// REVERT-VERIFIED: with the tokened arm's `session_admits_callback` check
+    /// removed, the forged and cross-session tokens reach the handler (400) and the
+    /// forged terminate releases the session; with the legacy arms' checks removed,
+    /// the tokened and EPS-moved bindings answer the token-less URIs.
+    #[tokio::test]
+    async fn the_callback_handlers_act_only_on_the_current_token_1518() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let (a, b, legacy, moved) = ("151821", "151822", "151823", "151824");
+        seed_binding(a, 5);
+        seed_binding(b, 6);
+        seed_binding(legacy, 7);
+        seed_binding(moved, 8);
+        if let Ok(ctx) = smf_self().read() {
+            let mut bindings = ctx.policy_bindings.write().unwrap();
+            let l = bindings.get_mut(legacy).unwrap();
+            l.callback_tokens = false;
+            l.sm_policy_notify_token = None;
+            l.sdm_notify_token = None;
+            let m = bindings.get_mut(moved).unwrap();
+            m.sm_policy_notify_token = None;
+            m.sdm_notify_token = None;
+        }
+        let post = |path: String| async move {
+            let req = SbiRequest::post(path).with_body("not json".to_string(), "application/json");
+            smf_sbi_request_handler(req).await.status
+        };
+        // The current token reaches the handler.
+        assert_eq!(post(sm_policy_notify_path(a, "update")).await, 400);
+        assert_eq!(post(sdm_notify_path(a)).await, 400);
+        // Anything else is 404 before the body is read.
+        for path in [
+            format!("/nsmf-callback/v1/{a}/sm-policy-notify/smp-forged/update"),
+            format!("/nsmf-callback/v1/{a}/sm-policy-notify/smp-{b}/update"),
+            format!("/nsmf-callback/v1/{a}/sm-policy-notify/sdm-{a}/update"),
+            format!("/nsmf-callback/v1/{a}/sm-policy-notify/smp-{a}/delete"),
+            format!("/nsmf-callback/v1/{a}/sm-policy-notify/smp-{a}"),
+            format!("/nsmf-callback/v1/{a}/sm-policy-notify/smp-{a}/update/x"),
+            format!("/nsmf-callback/v1/{a}/sdm-notify/sdm-forged"),
+            format!("/nsmf-callback/v1/{a}/sdm-notify/sdm-{b}"),
+            format!("/nsmf-callback/v1/{a}/sdm-notify/smp-{a}"),
+            format!("/nsmf-callback/v1/{a}/sdm-notify/sdm-{a}/x"),
+            // The token-less URIs of a session made since #1518 ...
+            format!("/nsmf-callback/v1/sm-policy-notify/{a}/update"),
+            format!("/nsmf-callback/v1/sdm-notify/{a}"),
+            // ... and of one moved from EPS, which was handed no URI at all.
+            format!("/nsmf-callback/v1/sm-policy-notify/{moved}/update"),
+            format!("/nsmf-callback/v1/sdm-notify/{moved}"),
+            format!("/nsmf-callback/v1/{moved}/sdm-notify/sdm-{moved}"),
+            // A pre-#1518 session holds no token, so no tokened URI names it.
+            format!("/nsmf-callback/v1/{legacy}/sdm-notify/sdm-{legacy}"),
+        ] {
+            assert_eq!(post(path.clone()).await, 404, "{path}");
+        }
+        // The pre-#1518 session's own token-less URIs are still served.
+        assert_eq!(
+            post(format!(
+                "/nsmf-callback/v1/sm-policy-notify/{legacy}/update"
+            ))
+            .await,
+            400
+        );
+        assert_eq!(
+            post(format!("/nsmf-callback/v1/sdm-notify/{legacy}")).await,
+            400
+        );
+        // A GET is not a notification.
+        assert_eq!(
+            smf_sbi_request_handler(SbiRequest::get(sdm_notify_path(a)))
+                .await
+                .status,
+            404
+        );
+
+        // A forged or token-less terminate releases nothing; the right one does.
+        for path in [
+            format!("/nsmf-callback/v1/{a}/sm-policy-notify/smp-{b}/terminate"),
+            format!("/nsmf-callback/v1/sm-policy-notify/{a}/terminate"),
+        ] {
+            assert_eq!(post(path.clone()).await, 404, "{path}");
+            assert!(
+                lookup_policy_binding(a).is_some(),
+                "{path} released the session"
+            );
+        }
+        assert_eq!(post(sm_policy_notify_path(a, "terminate")).await, 204);
+        assert!(
+            lookup_policy_binding(a).is_none(),
+            "the PCF's terminate releases it"
+        );
+        assert_eq!(
+            post(format!(
+                "/nsmf-callback/v1/sm-policy-notify/{legacy}/terminate"
+            ))
+            .await,
+            204
+        );
+        assert!(lookup_policy_binding(legacy).is_none());
+        if let Ok(ctx) = smf_self().read() {
+            let mut bindings = ctx.policy_bindings.write().unwrap();
+            bindings.remove(b);
+            bindings.remove(moved);
+        }
+    }
+
+    /// #1518: `token` as a held callback token, so a test knows the URI's token.
+    fn test_callback_token(token: &str) -> nextgcore_sbi::callback_auth::CallbackToken {
+        serde_json::from_value(serde_json::json!(token)).expect("token")
+    }
+
+    /// #1518: the PCF's `{notificationUri}/{op}` for a [`seed_binding`] session.
+    fn sm_policy_notify_path(sm_context_ref: &str, op: &str) -> String {
+        format!("/nsmf-callback/v1/{sm_context_ref}/sm-policy-notify/smp-{sm_context_ref}/{op}")
+    }
+
+    /// #1518: the UDM's `callbackReference` for a [`seed_binding`] session.
+    fn sdm_notify_path(sm_context_ref: &str) -> String {
+        format!("/nsmf-callback/v1/{sm_context_ref}/sdm-notify/sdm-{sm_context_ref}")
     }
 
     /// #114: the EASDF DNS-message report sink exists and attributes the report
@@ -17797,6 +18325,9 @@ mod tests {
         let (udm_srv, seen) = spawn_recording_udm(sm_data_with("100 Mbps", "500 Mbps", 7)).await;
         udm::set_for_test(true);
         smf_context_init(64, 256, 512);
+        // #1518: a PCF too, so the SM policy notificationUri is seen on the wire.
+        let (pcf, pcf_seen) =
+            spawn_recording_pcf_with(Ok(serde_json::json!({ "smPolicyId": "pol-1518" }))).await;
 
         let supi = "imsi-001010000000293";
         let psi = 8u8;
@@ -17844,10 +18375,50 @@ mod tests {
             );
         }
         let callback = body["callbackReference"].as_str().unwrap_or_default();
+        // #1518: and the token the binding holds for it, which the route checks.
+        let held = lookup_policy_binding(&sm_context_ref)
+            .and_then(|b| b.sdm_notify_token)
+            .expect("the binding holds the SDM callback token");
         assert!(
-            callback.ends_with(&format!("/nsmf-callback/v1/sdm-notify/{sm_context_ref}")),
-            "the callback must name the route this SMF serves and the session it is \
-             for, got {callback}"
+            callback.ends_with(&format!(
+                "/nsmf-callback/v1/{sm_context_ref}/sdm-notify/{}",
+                held.as_str()
+            )),
+            "the callback must name the route this SMF serves, the session it is for \
+             and its token, got {callback}"
+        );
+        // #1518: the PCF is handed `{ref}/sm-policy-notify/{token}` with the binding's
+        // own SM policy token, not the UDM's.
+        let policy_token = lookup_policy_binding(&sm_context_ref)
+            .and_then(|b| b.sm_policy_notify_token)
+            .expect("the binding holds the SM policy callback token");
+        assert_ne!(policy_token.as_str(), held.as_str());
+        // A session made since #1518 is never served the token-less URIs.
+        let binding = lookup_policy_binding(&sm_context_ref).expect("binding");
+        assert!(
+            binding.callback_tokens,
+            "the create marks its binding tokened"
+        );
+        for kind in [
+            context::SessionCallback::SmPolicyNotify,
+            context::SessionCallback::SdmNotify,
+        ] {
+            assert!(!binding.admits_callback(kind, None), "{kind:?}");
+        }
+        let created = pcf_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(u, _)| u == "/npcf-smpolicycontrol/v1/sm-policies")
+            .map(|(_, b)| b.clone())
+            .expect("the create must send Npcf_SMPolicyControl_Create");
+        let notification_uri = created["notificationUri"].as_str().unwrap_or_default();
+        assert!(
+            notification_uri.ends_with(&format!(
+                "/nsmf-callback/v1/{sm_context_ref}/sm-policy-notify/{}",
+                policy_token.as_str()
+            )),
+            "got {notification_uri}"
         );
         assert!(
             body["monitoredResourceUris"][0]
@@ -17889,7 +18460,9 @@ mod tests {
         udm::set_for_test(false);
         std::env::remove_var("UDM_SBI_ADDR");
         std::env::remove_var("UDM_SBI_PORT");
+        std::env::remove_var("PCF_URI");
         udm_srv.stop().await.expect("stop");
+        pcf.stop().await.expect("stop");
     }
 
     /// #293 criterion 3: the notification callback applies a changed session-AMBR and
@@ -17928,7 +18501,7 @@ mod tests {
         }
 
         let notify = |reference: &str| {
-            SbiRequest::post(format!("/nsmf-callback/v1/sdm-notify/{reference}")).with_body(
+            SbiRequest::post(sdm_notify_path(reference)).with_body(
                 serde_json::json!({
                     "notifyItems": [{
                         "resourceId": format!("/nudm-sdm/v2/{supi}/sm-data"),
@@ -18025,7 +18598,7 @@ mod tests {
         // A malformed body is refused rather than silently accepted.
         assert_eq!(
             smf_sbi_request_handler(
-                SbiRequest::post(format!("/nsmf-callback/v1/sdm-notify/{sm_context_ref}"))
+                SbiRequest::post(sdm_notify_path(&sm_context_ref))
                     .with_body("not json".to_string(), "application/json")
             )
             .await
@@ -22395,7 +22968,7 @@ mod tests {
 
     /// An `Nudm_SDM_Notification` body naming the `sm-data` resource.
     fn sdm_notify(sm_context_ref: &str, supi: &str) -> SbiRequest {
-        SbiRequest::post(format!("/nsmf-callback/v1/sdm-notify/{sm_context_ref}")).with_body(
+        SbiRequest::post(sdm_notify_path(sm_context_ref)).with_body(
             serde_json::json!({
                 "notifyItems": [{
                     "resourceId": format!("/nudm-sdm/v2/{supi}/sm-data"),
@@ -22887,10 +23460,7 @@ mod tests {
 
     /// The PCF's own UpdateNotify, raising the Session-AMBR to UL/DL 60/65 Mbps.
     fn notify_60_65_1399(sm_context_ref: &str) -> SbiRequest {
-        SbiRequest::post(format!(
-            "/nsmf-callback/v1/sm-policy-notify/{sm_context_ref}"
-        ))
-        .with_body(
+        SbiRequest::post(sm_policy_notify_path(sm_context_ref, "update")).with_body(
             serde_json::json!({ "smPolicyDecision": { "sessRules": { "S": {
                     "authSessAmbr": { "uplink": "60 Mbps", "downlink": "65 Mbps" } } } } })
             .to_string(),
@@ -27686,10 +28256,7 @@ mod tests {
     }
 
     fn policy_notify_1387(sm_context_ref: &str, decision: serde_json::Value) -> SbiRequest {
-        SbiRequest::post(format!(
-            "/nsmf-callback/v1/sm-policy-notify/{sm_context_ref}/update"
-        ))
-        .with_body(
+        SbiRequest::post(sm_policy_notify_path(sm_context_ref, "update")).with_body(
             serde_json::json!({
                 "resourceUri": "http://pcf/npcf-smpolicycontrol/v1/sm-policies/pol-1387",
                 "smPolicyDecision": decision,

@@ -407,9 +407,9 @@ pub async fn resolve_pcf_endpoint() -> Option<PcfEndpoint> {
     let nrf_uri = nextgcore_sbi::context::global_context()
         .get_nrf_uri()
         .await?;
-    let (nrf_host, nrf_port) = split_host_port(&nrf_uri)?;
+    // #1617: the NRF client TLS for an https NRF URI or the production profile.
     let client = SbiClient::new(
-        nextgcore_sbi::security::sbi_peer_client_config(&nrf_host, nrf_port)
+        nextgcore_sbi::nrf_tls::nrf_client_config_for_uri(&nrf_uri)?
             .with_connect_timeout(Duration::from_secs(2))
             .with_request_timeout(Duration::from_secs(3)),
     );
@@ -541,9 +541,9 @@ pub async fn resolve_nsacf_endpoint(
     if let Some(cached) = cached_nsacf(&key) {
         return Some(cached);
     }
-    let (nrf_host, nrf_port) = split_host_port(&nrf_uri)?;
+    // #1617: the NRF client TLS for an https NRF URI or the production profile.
     let client = SbiClient::new(
-        nextgcore_sbi::security::sbi_peer_client_config(&nrf_host, nrf_port)
+        nextgcore_sbi::nrf_tls::nrf_client_config_for_uri(&nrf_uri)?
             .with_connect_timeout(Duration::from_secs(2))
             .with_request_timeout(Duration::from_secs(3)),
     );
@@ -2869,7 +2869,8 @@ mod tests {
             sst: 1,
             sd: None,
             ue_ipv4: [10, 45, 0, 2],
-            notification_uri: "http://127.0.0.1:9/nsmf-callback/v1/sm-policy-notify/1",
+            notification_uri:
+                "http://127.0.0.1:9/nsmf-callback/v1/1/sm-policy-notify/0123456789abcdef",
             subs_sess_ambr: None,
             origination_timestamp: None,
         };

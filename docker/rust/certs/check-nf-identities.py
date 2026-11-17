@@ -34,8 +34,15 @@ ANY_VAR = 'NEXTGCORE_NF_INSTANCE_ID'
 PIN_VAR = re.compile(r'^NEXTGCORE_([A-Z0-9_]+)_INSTANCE_ID$')
 
 
+# The table names each nfType in the TS 29.510 §6.1.6.3.3 spelling the
+# certificate carries; the instance-ID variable is derived from
+# nextgcore_sbi::NfType::to_str(), which still spells MB_SMF "MBSMF" (#1680).
+SBI_TYPE_SPELLING = {'MB_SMF': 'MBSMF'}
+
+
 def type_env_var(nf_type):
     """nextgcore_sbi::nf_instance_id::type_env_var."""
+    nf_type = SBI_TYPE_SPELLING.get(nf_type, nf_type)
     return 'NEXTGCORE_%s_INSTANCE_ID' % re.sub(r'[^A-Za-z0-9]', '_', nf_type)
 
 
@@ -108,6 +115,14 @@ def self_test():
     errs = check(table, {'docker-compose.other.yml': {'services': {
         'amf': {'environment': ['NEXTGCORE_AMF_INSTANCE_ID=x']}}}})
     assert len(errs) == 1, errs
+    # MB_SMF (TS 29.510 spelling on the certificate) is pinned through the
+    # variable nextgcore's NfType derives, NEXTGCORE_MBSMF_INSTANCE_ID (#1680).
+    mb = {'mbsmf': ('MB_SMF', 'm')}
+    assert check(mb, {DEFAULT_STACK: {'services': {
+        'mbsmf': {'environment': {'NEXTGCORE_MBSMF_INSTANCE_ID': 'm'}}}}}) == []
+    errs = check(mb, {DEFAULT_STACK: {'services': {
+        'mbsmf': {'environment': {'NEXTGCORE_MB_SMF_INSTANCE_ID': 'm'}}}}})
+    assert len(errs) == 1 and 'NEXTGCORE_MBSMF_INSTANCE_ID' in errs[0], errs
     print('check-nf-identities self-test: ok')
 
 

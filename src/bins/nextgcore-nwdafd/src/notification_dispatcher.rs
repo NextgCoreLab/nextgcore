@@ -99,6 +99,19 @@ pub(crate) fn parse_notify_uri(uri: &str) -> Option<(String, u16, String)> {
 // Client factory (mirrors namf_server.rs:693-698)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The client for a request to the NRF at `nrf_uri` (#1617): the NRF client TLS
+/// (https + this NF's certificate) for an https NRF URI or the production
+/// profile, with the notification timeouts. `None` for an unparseable URI.
+pub(crate) fn nrf_client(nrf_uri: &str) -> Option<SbiClient> {
+    nextgcore_sbi::nrf_tls::nrf_client_config_for_uri(nrf_uri).map(|config| {
+        SbiClient::new(
+            config
+                .with_connect_timeout(Duration::from_secs(NOTIFY_CONNECT_TIMEOUT_SECS))
+                .with_request_timeout(Duration::from_secs(NOTIFY_REQUEST_TIMEOUT_SECS)),
+        )
+    })
+}
+
 pub(crate) fn notify_client(host: &str, port: u16) -> SbiClient {
     let config = SbiClientConfig::new(host, port)
         .with_connect_timeout(Duration::from_secs(NOTIFY_CONNECT_TIMEOUT_SECS))

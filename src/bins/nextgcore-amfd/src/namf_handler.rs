@@ -735,6 +735,8 @@ pub fn handle_event_subscribe(
         // `AmfEventArea` arrives and is parsed into `context::EventArea`.
         areas: Vec::new(),
         reported_presence: std::collections::HashMap::new(),
+        reachability_filter: None,
+        reported_reachability: std::collections::HashMap::new(),
         reporting_threshold: None,
         location_filters: subscription
             .location_filter_list

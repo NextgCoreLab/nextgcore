@@ -56,7 +56,7 @@ use nextgcore_sbi::datetime::{epoch_to_rfc3339, now_epoch_secs, rfc3339_to_epoch
 use nextgcore_sbi::message::SbiRequest;
 use serde_json::{json, Value};
 
-use crate::sbi_path::{advertised_sbi_base, parse_host_port, CACHED_PEER_NF_TYPES};
+use crate::sbi_path::{advertised_sbi_base, CACHED_PEER_NF_TYPES};
 
 /// The events subscribed to (`reqNotifEvents`). `NF_REGISTERED` is left out:
 /// a new instance is found by discovery when the cache misses, and the
@@ -244,11 +244,11 @@ async fn send(
     nrf_uri: &str,
     request: SbiRequest,
 ) -> Result<nextgcore_sbi::message::SbiResponse, String> {
-    let (host, port) =
-        parse_host_port(nrf_uri).ok_or_else(|| format!("NRF URI {nrf_uri:?} is unusable"))?;
-    // #1674: a subscription answer echoes the request; capped like every NRF answer.
+    // #1674: a subscription answer echoes the request; capped like every NRF
+    // answer. #1617: the NRF client TLS.
     let client =
-        crate::sbi_path::capped_client(&host, port, crate::sbi_path::MAX_NRF_RESPONSE_BODY);
+        crate::sbi_path::capped_nrf_client(nrf_uri, crate::sbi_path::MAX_NRF_RESPONSE_BODY)
+            .ok_or_else(|| format!("NRF URI {nrf_uri:?} is unusable"))?;
     match tokio::time::timeout(NRF_REQUEST_TIMEOUT, client.send_request(request)).await {
         Ok(Ok(resp)) => Ok(resp),
         Ok(Err(e)) => Err(e.to_string()),

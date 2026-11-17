@@ -1,0 +1,208 @@
+# The gNB of the D443A compose stack (nextgsim#471): nextgsim's config/gnb.yaml
+# (keep in step) plus per QoS flow QoS monitoring (QMP, #509). The RAN delays
+# are STATED values, not measurements.
+# gNB Configuration for NextGSim
+# Connects to NextGCore 5G Core Network
+#
+# Network: PLMN 999-70 (matches nextgcore AMF configuration)
+# AMF Address: 172.23.0.5:38412 (nextgcore-amf container on nextgcore-5gc network)
+# UPF Address: 172.23.0.7:2152 (nextgcore-upf container)
+
+# NR Cell Identity (36-bit value)
+# Format: gNB-ID (upper bits) + Cell-ID (lower bits)
+# With gnb_id_length=32, gNB-ID is 32 bits, Cell-ID is 4 bits
+nci: 0x000000010
+
+# gNB ID length in bits (22-32)
+gnb_id_length: 32
+
+# PLMN - Must match nextgcore AMF configuration
+plmn:
+  mcc: 999
+  mnc: 70
+  long_mnc: false
+
+# Tracking Area Code (24-bit) - Must match nextgcore AMF TAI
+tac: 1
+
+# Network Slice Selection Assistance Information
+# Must match nextgcore AMF plmn_support configuration
+nssai:
+  - sst: 1
+    sd: null  # No SD specified (default slice)
+
+# AMF Configuration - Points to nextgcore AMF
+# `address` is an IP or a hostname (e.g. a Kubernetes Service name). A hostname
+# is re-resolved while connected and on every reconnect; the gNB reconnects and
+# re-runs NG Setup on its own when the AMF goes away or moves.
+amf_configs:
+  - address: 172.23.0.5
+    port: 38412
+
+# NGAP SCTP transport backend (optional, default: userspace)
+#   userspace - in-process sctp-proto over UDP. Interoperates with the
+#               nextgcore simulator AMF, but NOT a real AMF (wire is UDP).
+#   kernel    - real kernel SCTP (IP proto 132) via lksctp/libsctp; required
+#               to associate with a real / Open5GS AMF. Only effective on a
+#               Linux build compiled with `--features kernel-sctp`; otherwise
+#               the connection fails loud at runtime.
+sctp_backend: userspace
+
+# IP addresses for gNB interfaces
+# These should be on the Docker network that can reach nextgcore
+
+# RLS link layer IP (for UE-gNB simulated radio link)
+link_ip: 172.23.0.100
+
+# NGAP interface IP (for AMF communication via SCTP)
+ngap_ip: 172.23.0.100
+
+# GTP-U interface IP (for user plane to UPF)
+gtp_ip: 172.23.0.100
+
+# Advertised GTP IP (for NAT scenarios, optional)
+# gtp_advertise_ip: null
+
+# Whether to ignore SCTP stream IDs (for compatibility)
+ignore_stream_ids: false
+
+# UPF Address for GTP-U data plane forwarding
+# If not set, gNB uses loopback mode (for testing without real UPF)
+upf_addr: 172.23.0.7
+upf_port: 2152
+
+# User-inactivity release (TS 23.502 §4.2.6, TS 38.413 §8.3.2): after this many
+# seconds with no user-plane packet for a UE with a PDU session, the gNB sends UE
+# CONTEXT RELEASE REQUEST (cause user-inactivity) and the UE goes to CM-IDLE.
+# Unset disables it: a UE then goes idle only on `ue-release` or a lost radio link.
+# inactivity_timer_secs: 10
+
+# System information broadcast period in milliseconds (TS 38.331 §5.2.1): the
+# MIB every period and SIB1 every second period, i.e. the spec's 80/160 ms
+# cadence at the default. 0 disables the BCCH broadcast entirely, which leaves
+# UEs discovering cells from RLS heartbeats only (the pre-#21 behaviour).
+si_broadcast_period_ms: 80
+
+# Idle-mode cell reselection parameters this cell broadcasts in SIB2/SIB3/SIB4
+# (TS 38.331 §6.3.1), i.e. the inputs to the TS 38.304 §5.2.4.6 R-criterion:
+#
+#   R_s = Q_meas,s + q_hyst        (serving cell)
+#   R_n = Q_meas,n - q_offset_db   (neighbour cell)
+#
+# and a neighbour is reselected once R_n > R_s has held for t_reselection_s.
+#
+# Before these were broadcast the UE took q_hyst and t_reselection from
+# compile-time constants and had no per-cell offset or reselection priority at
+# all, so a cell could not influence its own mobility. The defaults below
+# reproduce those constants, so leaving this block out broadcasts what the UE
+# used to assume.
+reselection:
+  # false restores the pre-#50 behaviour: no SIB2/3/4 on the air, and the UE
+  # falls back to its constants (and logs that it did).
+  broadcast: true
+  # dB. Must be one of the values TS 38.331 enumerates: 0-6 in 1 dB steps, then
+  # 8, 10, 12 ... 24. A value outside the set fails the SIB2 build rather than
+  # being rounded, so 7 is rejected instead of silently becoming 6 or 8.
+  q_hyst_db: 4
+  # Seconds, 0-7. 0 means no time-to-trigger: a better-ranked neighbour wins on
+  # the evaluation that first sees it.
+  t_reselection_s: 1
+  # This frequency's cellReselectionPriority, 0-7.
+  cell_reselection_priority: 4
+  # s-IntraSearchP in units of 2 dB, 0-31. 31 (62 dB) means "always measure
+  # intra-frequency neighbours".
+  s_intra_search_p: 31
+  # threshServingLowP in units of 2 dB, 0-31.
+  thresh_serving_low_p: 4
+  # SIB3 intraFreqNeighCellList: per-neighbour q-OffsetCell, SUBTRACTED from that
+  # neighbour's level in R_n, so a POSITIVE value makes it less attractive.
+  #
+  # phys_cell_id is the neighbour's PCI. This tree derives a cell's PCI from its
+  # NR Cell Identity (nci % 1008), because a real PCI comes from the SSB and
+  # there is no PHY here -- so for a neighbouring gNB with nci: 0x2000 the value
+  # is 0x2000 % 1008.
+  #
+  # Legal q_offset_db values: -24..-6 and 6..24 in 2 dB steps, -5..5 in 1 dB
+  # steps. Empty means no neighbour list, and every neighbour is ranked with
+  # Qoffset = 0.
+  intra_freq_neighbours: []
+  #  - phys_cell_id: 128
+  #    q_offset_db: -3
+  #
+  # SIB4 interFreqCarrierFreqList, and also the DEDICATED cellReselectionPriorities
+  # handed to a UE in RRCRelease. Empty means no SIB4 is broadcast at all (its
+  # list is SIZE (1..maxFreq), so a zero-length list is not encodable) and
+  # RRCRelease carries no dedicated priorities -- which is NOT the same as
+  # carrying an empty list, since an empty one tells the UE to DELETE its stored
+  # dedicated priorities (TS 38.304 §5.2.4.1).
+  inter_freq_carriers: []
+  #  - dl_carrier_freq: 632628
+  #    cell_reselection_priority: 3
+  #    thresh_x_high_p: 8
+  #    thresh_x_low_p: 4
+  #    q_rx_lev_min: -70
+  #    t_reselection_s: 1
+
+# Accept a raw NAS PDU on UL-DCCH from a UE that never sent an
+# RRCSetupComplete, auto-creating its context and forwarding the NAS as an
+# Initial UE Message.
+#
+# false (the default) is STRICT: TS 38.331 §5.3.3 carries the initial NAS inside
+# RRCSetupComplete, so a UE that skips the establishment handshake fails to
+# attach rather than being helped along. This gNB's own UE performs the real
+# handshake since #30 wired the library RrcTask into the UE binary, so the
+# leniency no longer serves the matched pair -- all it can do now is hide a
+# non-conformant peer, which is the opposite of what a conformance simulator is
+# for.
+#
+# Set true for interop with a third-party UE simulator that sends bare NAS on
+# DCCH. Transitional: the honest reading of a UE that needs it is that the UE
+# has a defect.
+accept_raw_nas_on_dcch: false
+
+# physCellId of a secondary cell to configure on each UE (sCellToAddModList,
+# TS 38.331 §5.3.5.5.9), sent once per UE after its first RRCReconfiguration.
+# Commented out means no SCell is added, which is the pre-#112 behaviour.
+#
+# The only thing the UE does with an SCell is measure event A6 against it
+# (§5.5.4.7): carrier aggregation itself -- per-SCell BWP, MAC/PHY aggregation,
+# sCellState activation, PUCCH SCell -- is not modelled, so this configures a
+# measurement reference, not a second carrier. Point it at the physCellId of
+# another cell the UE can hear; a cell is never its own SCell.
+# scell_phys_cell_id: 2
+
+# PDU sessions whose DRB uses RLC Acknowledged Mode (TS 38.322) instead of the
+# default Unacknowledged Mode: AM adds STATUS reporting, selective
+# retransmission and the ARQ timers, at the cost of feedback traffic.
+# BOTH ENDS MUST LIST THE SAME PSIs -- the RLC mode is not signalled over RRC in
+# this simulator, so a one-sided setting has the peers parsing each other's PDUs
+# with the wrong header shape. Empty means every bearer stays on UM SN12.
+rlc_am_psis: []
+
+# Rel-18 5G-Advanced features
+energy_saving_enabled: false  # Cell sleep modes and energy efficiency (Rel-18)
+
+# Rel-20 6G AI-native network function features
+# All disabled by default; enable for 6G research deployments
+she_enabled: false              # Service Hosting Environment - edge inference (Rel-20)
+nwdaf_enabled: false            # Network Data Analytics Function (Rel-20)
+nkef_enabled: false             # Network Knowledge Exposure Function (Rel-20)
+isac_enabled: false             # Integrated Sensing and Communication (Rel-20)
+agent_enabled: false            # AI Agent Framework (Rel-20)
+
+# Activate AS (Access Stratum) security end to end: SRB1 PDCP integrity
+# protection and ciphering (TS 33.501 §6.5, TS 38.331 §5.3.4).
+#
+# false by default. Since nextgsim#285 both ends protect SRB1 end to end
+# (registration, PDU sessions, RRC re-establishment, resume) when it is on. Kept
+# off because a HANDOVER with it on still loses SRB1: the target gNB does not yet
+# activate protection with the re-derived keys while the UE does (#325,
+# nextgsim). With it off the UE answers the unprotected AS SecurityModeCommand
+# with SecurityModeFailure, which is expected.
+#
+# THE gNB AND THE UE MUST BE SET THE SAME WAY. A gNB with it on and a UE with it
+qos_monitoring:
+  enabled: true
+  dummy_response_after_ms: 0
+  ran_dl_delay_ms: 1
+  ran_ul_delay_ms: 1

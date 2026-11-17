@@ -198,6 +198,10 @@
     {
       "path": "deploy/eks/overlays/demo-d445a-fl-t8/Dockerfile.ue-d445a",
       "reason": "demo image for devtest1 only, never published: the D445A UE/AF image (nextgsim#480) built and pushed by that overlay's build-images.sh"
+    },
+    {
+      "path": "deploy/eks/overlays/demo-d443a-edge-budget/Dockerfile.ue-d443a",
+      "reason": "demo image for devtest1 only, never published: the D443A UE/EAS-sidecar image (nextgsim#471) built and pushed by that overlay's build-images.sh"
     }
   ]
 }

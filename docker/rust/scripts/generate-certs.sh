@@ -9,10 +9,11 @@
 # (DNS SANs only, no extendedKeyUsage).
 #
 # Usage:
-#   ./generate-certs.sh                    # Generate all certs in ./certs/
+#   ./generate-certs.sh                    # Generate all certs in docker/rust/certs/
+#                                          # (resolved from this script, not the cwd)
 #   ./generate-certs.sh /custom/output/dir # Generate in custom directory
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec bash "$SCRIPT_DIR/../certs/generate-dev-certs.sh" --out "${1:-./certs}"
+exec bash "$SCRIPT_DIR/../certs/generate-dev-certs.sh" --out "${1:-$SCRIPT_DIR/../certs}"

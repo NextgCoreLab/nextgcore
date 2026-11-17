@@ -1310,6 +1310,12 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
                         nsac_nf_id: nsac_nf_id.clone(),
                         nsac_nsacf: nsac_nsacf.clone(),
                         nsac_plmn: nsac_plmn.clone(),
+                        // #1518: made since, and hands out no callback URI (no SM
+                        // policy association, no SDM subscription), so no token-less
+                        // URI is served for it either.
+                        callback_tokens: true,
+                        sm_policy_notify_token: None,
+                        sdm_notify_token: None,
                     },
                 );
             }
@@ -4230,6 +4236,44 @@ mod tests {
         assert_eq!(after_create, vec!["INC"], "counted in at the move");
         assert_eq!(cancelled, 200);
         assert_eq!(after_cancel, vec!["INC", "DEC"], "and out at the cancel");
+    }
+
+    /// #1518: a PDU session moved from EPS was handed no callback URI (no SM policy
+    /// association, no SDM subscription), so its binding is marked as made since
+    /// #1518 and the token-less callback URIs of before are refused for it: without
+    /// the mark, anyone could terminate it at `sm-policy-notify/{ref}/terminate`.
+    ///
+    /// REVERT-VERIFIED: with the move's binding unmarked (`callback_tokens: false`),
+    /// the token-less terminate releases the session.
+    #[tokio::test]
+    async fn an_eps_moved_session_is_served_no_token_less_callback_1518() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _upf = crate::pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        crate::context::smf_context_init(64, 256, 512);
+        let (s5, pgw_c, _) = establish_pdn(Some(&pco_with_psi(5))).await;
+        let reference = prepare_eps_to_5gs_with_forwarding(pgw_c).await;
+        let binding = crate::lookup_policy_binding(&reference).expect("the move's binding");
+        assert!(binding.callback_tokens, "a binding made since #1518");
+        assert!(binding.sm_policy_notify_token.is_none() && binding.sdm_notify_token.is_none());
+        let mut refused = Vec::new();
+        for path in [
+            format!("/nsmf-callback/v1/sm-policy-notify/{reference}/terminate"),
+            format!("/nsmf-callback/v1/sdm-notify/{reference}"),
+        ] {
+            let req =
+                SbiRequest::post(path.clone()).with_body("{}".to_string(), "application/json");
+            refused.push((path, crate::smf_sbi_request_handler(req).await.status));
+        }
+        let still_there = crate::lookup_policy_binding(&reference).is_some();
+        let cancelled = handle_cancelled(&reference).await.status;
+        s5.close();
+        for (path, status) in refused {
+            assert_eq!(status, 404, "{path}");
+        }
+        assert!(still_there, "the token-less terminate released nothing");
+        assert_eq!(cancelled, 200);
     }
 
     /// #1072 round 2 m9: a PDU session the NSACF does not admit is not transferred

@@ -21,7 +21,7 @@
 
 use crate::analytics::{NfLoadSample, NfProfileMeta};
 use crate::context::{NrfStatusSubscription, NwdafContext};
-use crate::notification_dispatcher::{notify_client, parse_notify_uri};
+use crate::notification_dispatcher::parse_notify_uri;
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
 use nextgcore_sbi::server::send_bad_request;
 use serde_json::Value;
@@ -124,7 +124,7 @@ pub async fn subscribe_nf_status(ctx: &Arc<RwLock<NwdafContext>>) {
         None => return, // collector not armed (e.g., unit tests)
     };
 
-    let (host, port, base_path) = match parse_notify_uri(&config.nrf_uri) {
+    let (_, _, base_path) = match parse_notify_uri(&config.nrf_uri) {
         Some(t) => t,
         None => {
             log::warn!(
@@ -140,7 +140,13 @@ pub async fn subscribe_nf_status(ctx: &Arc<RwLock<NwdafContext>>) {
     );
 
     let body = build_nf_status_subscription_body(&config.callback_uri);
-    let client = notify_client(&host, port);
+    let Some(client) = crate::notification_dispatcher::nrf_client(&config.nrf_uri) else {
+        log::warn!(
+            "NRF NFStatusSubscribe: invalid NRF URI '{}'",
+            config.nrf_uri
+        );
+        return;
+    };
     match client.post_json(&path, &body).await {
         Ok(resp) if resp.status == 201 || resp.status == 200 => {
             let location = resp.http.get_header("Location").map(String::from);

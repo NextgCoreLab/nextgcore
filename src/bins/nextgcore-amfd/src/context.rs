@@ -1237,6 +1237,42 @@ pub struct EventSubscription {
     /// used by the UE should be reported"*. So empty means `[TAI]`; see
     /// [`EventSubscription::wants_location_change`].
     pub location_filters: Vec<String>,
+    /// `reachabilityFilter` of the subscription's REACHABILITY_REPORT event, as sent
+    /// (#1641, TS 29.518 Table 6.2.6.2.3-1, `29518-k00.txt:21454-21482`). Absent
+    /// means "UE Reachability Status Change"; see
+    /// [`EventSubscription::reachable_for_dl_traffic`].
+    pub reachability_filter: Option<ReachabilityFilter>,
+    /// The reachability state (`REACHABLE`, `UNREACHABLE`) last REPORTED per UE
+    /// (#1641). Under "UE Reachability Status Change" the AMF reports the current
+    /// state first, then only changes between the states, so a UE that stays
+    /// REACHABLE across an idle period is not reported again. Keyed by the UE
+    /// identity reported, because one any-UE subscription tracks many UEs.
+    pub reported_reachability: std::collections::HashMap<String, String>,
+}
+
+/// The most UEs one subscription records a reported reachability for (#1641 review
+/// m6). An any-UE subscription is the only one that reaches it.
+pub const MAX_REPORTED_REACHABILITY: usize = 65_536;
+
+/// `ReachabilityFilter` (TS 29.518 §6.2.6.3.13, `29518-k00.txt:24355-24369`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReachabilityFilter {
+    /// `UE_REACHABILITY_STATUS_CHANGE`: the current state, then each change between
+    /// REACHABLE, UNREACHABLE and REGULATORY_ONLY.
+    UeReachabilityStatusChange,
+    /// `UE_REACHABLE_DL_TRAFFIC`: REACHABLE when the UE is reachable at subscription,
+    /// and when it transitions to CM-CONNECTED.
+    UeReachableDlTraffic,
+}
+
+impl ReachabilityFilter {
+    /// The enumeration value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UeReachabilityStatusChange => "UE_REACHABILITY_STATUS_CHANGE",
+            Self::UeReachableDlTraffic => "UE_REACHABLE_DL_TRAFFIC",
+        }
+    }
 }
 
 /// Which parts of a UE's location a relocation changed, for the
@@ -1260,6 +1296,13 @@ impl LocationChange {
 }
 
 impl EventSubscription {
+    /// Whether this subscription's REACHABILITY_REPORT is for "UE Reachable for DL
+    /// Traffic" (#1641). Otherwise, the IE absent included, it is for "UE
+    /// Reachability Status Change" (Table 6.2.6.2.3-1, `29518-k00.txt:21480-21482`).
+    pub fn reachable_for_dl_traffic(&self) -> bool {
+        self.reachability_filter == Some(ReachabilityFilter::UeReachableDlTraffic)
+    }
+
     /// Whether this subscription's `locationFilterList` asks for a report of
     /// `change`: any listed dimension that changed, with an absent list meaning
     /// `[TAI]` (Table 6.2.6.2.3-1). Tokens this AMF cannot observe (`N3IWF`,
@@ -2672,6 +2715,46 @@ impl AmfContext {
         }
     }
 
+    /// Record the reachability state just REPORTED for `ue` on one subscription,
+    /// answering whether it was a CHANGE (#1641): `true` for the first report, or
+    /// for a state other than the last reported one. Test-and-set under one lock,
+    /// as [`Self::event_subscription_record_presence`] is, so two concurrent fire
+    /// points cannot both report the same change.
+    pub fn event_subscription_record_reachability(
+        &self,
+        subscription_id: &str,
+        ue: &str,
+        state: &str,
+    ) -> bool {
+        let Ok(mut subs) = self.event_subscriptions.write() else {
+            return true;
+        };
+        let Some(sub) = subs.get_mut(subscription_id) else {
+            return false;
+        };
+        match sub.reported_reachability.get(ue) {
+            Some(prev) if prev == state => false,
+            Some(_) => {
+                sub.reported_reachability
+                    .insert(ue.to_string(), state.to_string());
+                true
+            }
+            None => {
+                // Review m6: an any-UE subscription records every UE it reports on, so
+                // the map is bounded. Past the bound one entry is dropped; at worst that
+                // UE's next report repeats its state once.
+                if sub.reported_reachability.len() >= MAX_REPORTED_REACHABILITY {
+                    if let Some(k) = sub.reported_reachability.keys().next().cloned() {
+                        sub.reported_reachability.remove(&k);
+                    }
+                }
+                sub.reported_reachability
+                    .insert(ue.to_string(), state.to_string());
+                true
+            }
+        }
+    }
+
     /// Find an event-exposure subscription by ID (clone-out, lock dropped)
     pub fn event_subscription_find(&self, subscription_id: &str) -> Option<EventSubscription> {
         self.event_subscriptions
@@ -2687,6 +2770,11 @@ impl AmfContext {
             if let std::collections::hash_map::Entry::Occupied(mut e) =
                 subs.entry(sub.subscription_id.clone())
             {
+                // #1641 review (m2): the reachability last reported is the store's, not
+                // the caller's clone. A PATCH never sets it, and a fire point may have
+                // recorded a report between the caller's read and this write.
+                let mut sub = sub;
+                sub.reported_reachability = std::mem::take(&mut e.get_mut().reported_reachability);
                 e.insert(sub);
                 return true;
             }
@@ -2761,7 +2849,19 @@ impl AmfContext {
     /// (`ngap_path.rs` `state.amf_ue.gpsi = am_data.gpsi.clone()`), so this is a
     /// lookup against real state and never a synthesised mapping — a SUPI cannot
     /// be converted into a GPSI (see the note on [`AmfUe::gpsi`]).
+    ///
+    /// #1641 review (m5): the live store first, as [`Self::amf_ue_find_by_supi`]
+    /// reads it (#341), then the pool. A UE registered over NGAP is only in the live
+    /// store, so a GPSI-keyed subscription missed it and got no first report.
     pub fn amf_ue_find_by_gpsi(&self, gpsi: &str) -> Option<AmfUe> {
+        if let Some((_, ue)) = self
+            .ue_store
+            .snapshot()
+            .into_iter()
+            .find(|(_, ue)| ue.amf_ue().gpsi.as_deref() == Some(gpsi))
+        {
+            return Some(ue.amf_ue().clone());
+        }
         let amf_ue_list = self.amf_ue_list.read().ok()?;
         amf_ue_list
             .values()
@@ -2771,6 +2871,15 @@ impl AmfContext {
 
     /// Find the live UE whose PEI is `pei` (#74 criterion 4).
     pub fn amf_ue_find_by_pei(&self, pei: &str) -> Option<AmfUe> {
+        // #1641 review (m5): the live store first, as for the GPSI.
+        if let Some((_, ue)) = self
+            .ue_store
+            .snapshot()
+            .into_iter()
+            .find(|(_, ue)| ue.amf_ue().pei.as_deref() == Some(pei))
+        {
+            return Some(ue.amf_ue().clone());
+        }
         let amf_ue_list = self.amf_ue_list.read().ok()?;
         amf_ue_list
             .values()

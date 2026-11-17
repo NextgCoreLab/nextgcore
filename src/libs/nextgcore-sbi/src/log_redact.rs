@@ -12,7 +12,7 @@
 //! retained far more widely than the NF that holds the token.
 
 /// Path segments whose NEXT segment is a callback token.
-pub const CALLBACK_TOKEN_SEGMENTS: [&str; 12] = [
+pub const CALLBACK_TOKEN_SEGMENTS: [&str; 14] = [
     "nf-status-notify",
     "dereg-notify",
     "amf-location-notify",
@@ -31,6 +31,10 @@ pub const CALLBACK_TOKEN_SEGMENTS: [&str; 12] = [
     "am-policy-notify",
     "ue-policy-notify",
     "sm-context-status",
+    // smfd's SmPolicyContextData notificationUri and Nudm_SDM callbackReference
+    // (nextgcore#1518).
+    "sm-policy-notify",
+    "sdm-notify",
 ];
 
 /// What a redacted segment is replaced with.
@@ -92,6 +96,21 @@ mod tests {
         assert_eq!(
             redact_callback_tokens("http://udm:7777/nudm-callback/v1/ee-1/ee-amf-subs-change/f00d"),
             "http://udm:7777/nudm-callback/v1/ee-1/ee-amf-subs-change/<redacted>"
+        );
+    }
+
+    /// nextgcore#1518: smfd's SM policy and SDM notification URIs.
+    #[test]
+    fn the_smf_policy_and_sdm_notify_tokens_are_redacted_1518() {
+        assert_eq!(
+            redact_callback_tokens(
+                "http://smf:7777/nsmf-callback/v1/7/sm-policy-notify/f00d/update"
+            ),
+            "http://smf:7777/nsmf-callback/v1/7/sm-policy-notify/<redacted>/update"
+        );
+        assert_eq!(
+            redact_callback_tokens("/nsmf-callback/v1/7/sdm-notify/f00d"),
+            "/nsmf-callback/v1/7/sdm-notify/<redacted>"
         );
     }
 

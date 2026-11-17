@@ -560,8 +560,7 @@ pub async fn amf_nrf_register(sbi_addr: &str, sbi_port: u16) -> Result<String, S
 
     log::info!("Registering AMF with NRF at {nrf_uri}");
 
-    let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
-    let client = capped_client(&nrf_host, nrf_port, MAX_NRF_RESPONSE_BODY);
+    let client = capped_nrf_client(&nrf_uri, MAX_NRF_RESPONSE_BODY).ok_or("Invalid NRF URI")?;
 
     let nf_instance_id =
         nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf)
@@ -678,17 +677,16 @@ async fn amf_nrf_discover_qualified_at(
 ) -> Result<(), String> {
     let sbi_ctx = global_context();
 
-    let nrf_uri = match nrf_uri {
-        Some(uri) => Some(uri),
-        None => sbi_ctx.get_nrf_uri().await,
-    };
+    // #1617: an NRF named here, or the context's, is dialled with the NRF client
+    // TLS; #1674: its answer is capped like every NRF answer.
     let nrf_uri = match nrf_uri {
         Some(uri) => uri,
-        None => return Ok(()),
+        None => match sbi_ctx.get_nrf_uri().await {
+            Some(uri) => uri,
+            None => return Ok(()),
+        },
     };
-
-    let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
-    let client = capped_client(&nrf_host, nrf_port, MAX_NRF_RESPONSE_BODY);
+    let client = capped_nrf_client(&nrf_uri, MAX_NRF_RESPONSE_BODY).ok_or("Invalid NRF URI")?;
 
     let mut path = format!(
         "/nnrf-disc/v1/nf-instances?target-nf-type={target_nf_type}&requester-nf-type=AMF&service-names={service_name}"
@@ -1753,6 +1751,15 @@ pub(crate) fn capped_client(host: &str, port: u16, max_response_body: usize) -> 
     )
 }
 
+/// A client for this AMF's NRF at `nrf_uri`: the NRF client TLS (https + this
+/// AMF's certificate for an https NRF URI or the production profile, #1617),
+/// with response bodies capped at `max_response_body` (#1674). `None` for an
+/// unparseable URI.
+pub(crate) fn capped_nrf_client(nrf_uri: &str, max_response_body: usize) -> Option<SbiClient> {
+    nextgcore_sbi::nrf_tls::nrf_client_config_for_uri(nrf_uri)
+        .map(|config| SbiClient::new(config.with_max_response_body(max_response_body)))
+}
+
 /// A client for a peer NF of type `nf` (#1674): the peer SBI profile, OAuth2 scoped
 /// to `nf` when configured, and response bodies capped at
 /// [`max_response_body_for`]`(nf)`. A larger body is refused while it is read.
@@ -2547,8 +2554,7 @@ async fn peer_amf_from_nrf(
 ) -> Option<(String, u16)> {
     let sbi_ctx = global_context();
     let nrf_uri = sbi_ctx.get_nrf_uri().await?;
-    let (nrf_host, nrf_port) = parse_host_port(&nrf_uri)?;
-    let client = capped_client(&nrf_host, nrf_port, MAX_NRF_RESPONSE_BODY);
+    let client = capped_nrf_client(&nrf_uri, MAX_NRF_RESPONSE_BODY)?;
 
     // `guami` is a JSON-valued query parameter (`content: application/json` in
     // TS 29.510), so it is percent-encoded rather than interpolated raw — `{`, `"`
@@ -4570,8 +4576,10 @@ pub async fn discover_smf_by_pgw(
             .await
             .ok_or_else(|| "no NRF is configured, so no SMF+PGW-C can be resolved".to_string())?,
     };
-    let (nrf_host, nrf_port) =
-        parse_host_port(&nrf_uri).ok_or_else(|| format!("NRF URI {nrf_uri:?} is unusable"))?;
+    // #1617: the NRF client TLS (https + this NF's certificate) for an https
+    // NRF URI or the production profile.
+    let client = capped_nrf_client(&nrf_uri, MAX_NRF_RESPONSE_BODY)
+        .ok_or_else(|| format!("NRF URI {nrf_uri:?} is unusable"))?;
 
     let query = match (pgw_fqdn, pgw_ipv4) {
         (Some(fqdn), _) => format!(
@@ -4598,7 +4606,6 @@ pub async fn discover_smf_by_pgw(
          &service-names={}&{query}",
         service_name::NSMF_PDUSESSION
     );
-    let client = capped_client(&nrf_host, nrf_port, MAX_NRF_RESPONSE_BODY);
     let response = client
         .get(&path)
         .await

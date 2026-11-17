@@ -40,10 +40,10 @@ pub struct DiscoveredAmf {
 /// a bearer in the wrong service area.
 pub async fn discover_amf() -> Option<DiscoveredAmf> {
     let nrf_uri = global_context().get_nrf_uri().await?;
-    let (nrf_host, nrf_port) = parse_host_port(&nrf_uri)?;
-
+    // #1617: the NRF client TLS (https + this NF's certificate) for an https
+    // NRF URI or the production profile.
     let client = SbiClient::new(
-        SbiClientConfig::new(nrf_host, nrf_port)
+        nextgcore_sbi::nrf_tls::nrf_client_config_for_uri(&nrf_uri)?
             .with_connect_timeout(Duration::from_secs(2))
             .with_request_timeout(Duration::from_secs(3)),
     );
@@ -118,20 +118,6 @@ fn parse_amf_search_result(json: &Value) -> Option<DiscoveredAmf> {
         }
     }
     None
-}
-
-/// Split `http://host:port` (or bare `host:port`) into its parts.
-fn parse_host_port(uri: &str) -> Option<(String, u16)> {
-    let authority = uri
-        .strip_prefix("http://")
-        .or_else(|| uri.strip_prefix("https://"))
-        .unwrap_or(uri)
-        .split('/')
-        .next()?;
-    match authority.rsplit_once(':') {
-        Some((host, port)) => Some((host.to_owned(), port.parse().ok()?)),
-        None => Some((authority.to_owned(), 80)),
-    }
 }
 
 /// `MbsSessionId` as TS 29.571 spells it, for a Namf request body.
@@ -271,27 +257,6 @@ mod tests {
             parse_amf_search_result(&json!({ "nfInstances": [{ "nfInstanceId": "amf-3" }] }))
                 .is_none(),
             "an instance with no address at all must not be selected"
-        );
-    }
-
-    #[test]
-    fn host_port_parsing_handles_the_uri_forms_the_nrf_returns() {
-        assert_eq!(
-            parse_host_port("http://10.0.0.1:7777"),
-            Some(("10.0.0.1".to_string(), 7777))
-        );
-        assert_eq!(
-            parse_host_port("https://nrf.example:443/some/path"),
-            Some(("nrf.example".to_string(), 443))
-        );
-        assert_eq!(
-            parse_host_port("10.0.0.1:8080"),
-            Some(("10.0.0.1".to_string(), 8080))
-        );
-        // No port: the SBI default, not a parse failure.
-        assert_eq!(
-            parse_host_port("http://nrf.example"),
-            Some(("nrf.example".to_string(), 80))
         );
     }
 }

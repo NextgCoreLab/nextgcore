@@ -1,0 +1,24 @@
+# The NRF of the D443A compose stack (nextgsim#471): configs/5gc/nrf.yaml plus
+# the CCA trusted-key directory the EAS sidecars and the UE's EEC publish their public JWKs into (the
+# d443a_cca volume), so they get NRF tokens as nfType AF consumers. The NRF
+# re-reads the directory on an unknown issuer (#187).
+logger:
+  file:
+    path: /var/log/nextgcore/nrf.log
+  level: info
+global:
+  max:
+    ue: 1024
+    peer: 64
+nrf:
+  serving:
+    - plmn_id:
+        mcc: 999
+        mnc: 70
+  sbi:
+    server:
+      - address: 0.0.0.0
+        advertise: 172.23.0.10
+        port: 7777
+    oauth2:
+      cca_trusted_keys_dir: /etc/nextgcore/cca-trusted
