@@ -6179,6 +6179,8 @@ mod tests {
     /// answer for a page already sent is not applied.
     #[test]
     fn a_page_waiting_for_the_nwdaf_is_held_alone_until_the_answer_or_the_deadline() {
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.blocking_lock();
         let mut ctx = AmfContext::new();
         ctx.init(64, 1024, 4096);
         let far = std::time::Instant::now() + std::time::Duration::from_secs(3600);
@@ -6237,6 +6239,8 @@ mod tests {
     /// Accept removes it early (`paging_take_answered`).
     #[test]
     fn an_answered_page_is_not_sent_but_still_expires() {
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.blocking_lock();
         let mut ctx = AmfContext::new();
         ctx.init(64, 1024, 4096);
         let paging = PagingContext {
@@ -6283,6 +6287,8 @@ mod tests {
 
     #[test]
     fn test_paging_add_find_remove() {
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.blocking_lock();
         let mut ctx = AmfContext::new();
         ctx.init(64, 1024, 4096);
 
@@ -6472,6 +6478,8 @@ mod tests {
 
     #[test]
     fn test_paging_retransmit_limit() {
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.blocking_lock();
         let mut ctx = AmfContext::new();
         ctx.init(64, 1024, 4096);
 
