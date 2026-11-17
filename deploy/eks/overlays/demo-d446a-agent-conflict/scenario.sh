@@ -109,6 +109,15 @@ d446a_uplink_burst() {
     (( fails == before ))
 }
 
+# d446a_ipv6_off UE_LOG: the ue container's wrapper (ue-uplink-burst.yaml)
+# logged that IPv6 is off before nr-ue started. The wrapper exits non-zero when
+# it cannot; this names the case where the wrapper did not run at all (#1630).
+d446a_ipv6_off() {
+    grep -qF '[ue] IPv6 off' "$1" && return 0
+    fail "[ue] no '[ue] IPv6 off' line in the ue log: IPv6 may be on in the UE pod (see d446a/ue.log)"
+    return 1
+}
+
 # Sourced by test-scenario.sh for the functions above; run, the checks below.
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then return 0; fi
 
@@ -130,6 +139,8 @@ west="${OUT}/d446a/gnb-b.log" east="${OUT}/d446a/gnb-a.log" amf="${OUT}/d446a/am
 # Both modes (lb-1 fires in each): the uplink burst, then lb-1's intent (#1630).
 "${K[@]}" logs deploy/ue -c uplink-burst 2>/dev/null > "${OUT}/d446a/uplink-burst.log"
 d446a_uplink_burst "${OUT}/d446a/uplink-burst.log" "${east}" || true
+"${K[@]}" logs deploy/ue -c ue 2>/dev/null > "${OUT}/d446a/ue.log"
+d446a_ipv6_off "${OUT}/d446a/ue.log" || true
 
 case "${DEMO_MODE}" in
 load-balancing)
