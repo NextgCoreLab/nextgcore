@@ -20,7 +20,7 @@ eec:
   deadline_ms: 15
   job_port: 9471
   oauth2:
-    nrf: "http://172.23.0.10:7777"
+    nrf: "https://172.23.0.10:7777"
     nf_instance_id: 6b1d7e3c-0000-4000-8000-0000000471ec
     cca_key_file: /var/lib/d443a/keys/eec.key
     public_jwk_dir: /var/lib/d443a/cca

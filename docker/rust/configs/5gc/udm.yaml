@@ -25,7 +25,7 @@ udm:
         port: 7777
     client:
       nrf:
-        - uri: http://172.23.0.10:7777
+        - uri: https://172.23.0.10:7777
     # NRF NFProfile knobs (TS 29.510 6.1.6.2.2). Both were hardcoded in the
     # profile builder before nextgcore #85: the heartbeat is a deployment-timing
     # decision and allowed_nf_types is access control, so an operator adding an

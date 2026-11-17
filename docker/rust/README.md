@@ -200,6 +200,38 @@ read by any NF. SBI TLS comes from an NF's `--tls --tls-cert --tls-key` flags or
 from the `production` SBI profile; see the
 [configuration overview](../../docs-book/src/configuration/overview.md).
 
+#### NF -> NRF over TLS (#1617)
+
+Every compose stack runs its NF -> NRF traffic over TLS, whatever
+`NEXTGCORE_SBI_PROFILE` says about the other peers. The NRF serves TLS on its
+one SBI listener and asks each client for a certificate (`client_auth:
+optional` in its `nrf.yaml`); the certificate's `urn:uuid` URI SAN and RFC 9310
+NFTypes are the identity it binds NFRegister / NFUpdate / NFDeregister to.
+
+- **Certificate source.** The one-shot `sbi-tls` service runs
+  `certs/generate-dev-certs.sh` (from `certs/nf-identities.txt`) into the
+  `sbi_pki` volume, which only it mounts (the CA key stays there), then copies
+  each NRF client's `ca.crt`, `<name>.crt` and `<name>.key` into that client's
+  own volume `tls-<name>` (`certs/compose-tls-init.sh`). The key is `0400`,
+  owned by the user that container runs as. Every NRF client depends on it, so
+  `docker compose up` needs no extra step; `docker compose down -v` drops the
+  PKI and the next `up` issues a new one.
+- **Each NRF client** mounts only its own volume at `/etc/nextgcore/certs`,
+  dials `https://172.23.0.10:7777` (or `https://nrf:7777` in the d441e stack;
+  `nrf.crt` names both), and sets:
+
+  | Variable | Value |
+  |----------|-------|
+  | `NEXTGCORE_NRF_TLS_CA` | `/etc/nextgcore/certs/ca.crt` |
+  | `NEXTGCORE_NRF_TLS_CLIENT_CERT` | `/etc/nextgcore/certs/<name>.crt` |
+  | `NEXTGCORE_NRF_TLS_CLIENT_KEY` | `/etc/nextgcore/certs/<name>.key` |
+
+- **Pinned IDs.** Each NRF client pins the nfInstanceId its certificate names
+  (`NEXTGCORE_<TYPE>_INSTANCE_ID`, `--nf-instance-id`, or the nextgsim AF's
+  `nf_instance_id`). `certs/check-nf-identities.py` (CI) fails a compose file
+  whose pins, volumes or `NEXTGCORE_NRF_TLS_*` disagree with the table, and
+  any service other than `sbi-tls` that mounts `certs/` or `sbi_pki`.
+
 #### Rel-17/18 Feature Knobs
 
 These tune the integrated Rel-17/18 features (set on the relevant NF container):
@@ -464,8 +496,9 @@ scenario needs and scopes log assertions per-scenario; pass `--down` to tear dow
 # Check container status
 docker compose ps
 
-# Check NRF health
-curl http://localhost:7777/nnrf-nfm/v1/nf-instances
+# Check NRF health (TLS, #1617: from the NRF's container, which holds the CA)
+docker compose exec nrf curl -s --cacert /etc/nextgcore/certs/ca.crt \
+  https://172.23.0.10:7777/nnrf-nfm/v1/nf-instances
 
 # Check MongoDB
 docker exec nextgcore-mongodb mongosh --eval "db.adminCommand('ping')"
@@ -494,8 +527,12 @@ docker images | grep nextgcore
 #### NFs Not Registering with NRF
 
 ```bash
-# Check NRF is accessible
-curl -v http://localhost:7777/nnrf-nfm/v1/nf-instances
+# Check NRF is accessible (TLS, #1617)
+docker compose exec nrf curl -v --cacert /etc/nextgcore/certs/ca.crt \
+  https://172.23.0.10:7777/nnrf-nfm/v1/nf-instances
+
+# Check the certificates were issued (one line per NRF client)
+docker compose logs sbi-tls
 
 # Check NF logs for registration errors
 docker logs nextgcore-amf 2>&1 | grep -i "register\|nrf"

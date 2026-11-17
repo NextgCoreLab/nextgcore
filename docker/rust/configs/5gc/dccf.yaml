@@ -9,5 +9,5 @@ dccf:
         advertise: 172.23.0.36
         port: 7777
   nrf:
-    uri: http://172.23.0.10:7777
+    uri: https://172.23.0.10:7777
   max_subscriptions: 4096
