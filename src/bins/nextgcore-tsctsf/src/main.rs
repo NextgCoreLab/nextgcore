@@ -74,6 +74,37 @@ pub use context::*;
 static OAUTH2_CLIENT: std::sync::OnceLock<Option<Arc<nextgcore_sbi::oauth::OAuth2Client>>> =
     std::sync::OnceLock::new();
 
+/// The installed outbound OAuth2 client, if any (#1658).
+pub(crate) fn oauth2_client() -> Option<Arc<nextgcore_sbi::oauth::OAuth2Client>> {
+    #[cfg(test)]
+    if let Ok(oauth2) = TEST_OAUTH2_CLIENT.try_with(Arc::clone) {
+        return Some(oauth2);
+    }
+    OAUTH2_CLIENT.get().and_then(|opt| opt.clone())
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// #1658 tests: the OAuth2 client [`oauth2_client`] returns inside
+    /// `TEST_OAUTH2_CLIENT.scope(..)`. Task-local, so the other tests in the
+    /// process keep the default (none installed).
+    pub(crate) static TEST_OAUTH2_CLIENT: Arc<nextgcore_sbi::oauth::OAuth2Client>;
+}
+
+/// #1658: `client` with the installed OAuth2 client attached, so a service
+/// request to the `target` producer carries an NRF-issued token (TS 33.501
+/// §13.4.1.1.2, TS 29.500 §6.7.3). Unchanged when no client is installed.
+/// Notifications do not go through this: they carry no token.
+pub(crate) fn attach_oauth2(
+    client: nextgcore_sbi::client::SbiClient,
+    target: nextgcore_sbi::types::NfType,
+) -> nextgcore_sbi::client::SbiClient {
+    match oauth2_client() {
+        Some(oauth2) => client.with_oauth2(oauth2, target),
+        None => client,
+    }
+}
+
 /// NextGCore TSCTSF - Time Sensitive Communication and Time Synchronization Function
 #[derive(Parser, Debug)]
 #[command(name = "nextgcore-tsctsf")]
@@ -1946,6 +1977,90 @@ mod tests {
             actuation::set_for_test(false);
             reset_actuation(None);
             pcf.stop().await.expect("stop stub PCF");
+        });
+    }
+
+    /// #1658: with an outbound OAuth2 client installed, Npcf_PolicyAuthorization
+    /// Create and Delete carry the NRF-issued token, so an OAuth2-required PCF
+    /// serves them. The stand-in PCF is gated by nextgcore-sbi's own producer check
+    /// (JWKS and audience PCF), so a request it recorded is one that passed it.
+    #[test]
+    fn policy_authorization_create_and_delete_pass_an_oauth2_required_pcf_1658() {
+        use nextgcore_sbi::test_support::oauth2 as stand_in;
+        let _g = lock_globals();
+        reset_context();
+        block_on(async {
+            nextgcore_sbi::security::set_sbi_profile_override(
+                nextgcore_sbi::security::SbiProfile::Dev,
+            );
+            let sk = nextgcore_sbi::oauth::generate_es256_key();
+            let (_nrf, nrf_port) = stand_in::token_nrf(sk.clone()).await;
+            let (pcf, pcf_port, seen) = stand_in::oauth2_producer(
+                &sk,
+                nextgcore_sbi::types::NfType::Pcf,
+                |req: &SbiRequest| {
+                    if req.header.uri == "/npcf-policyauthorization/v1/app-sessions" {
+                        return SbiResponse::with_status(201).with_header(
+                            "Location",
+                            "/npcf-policyauthorization/v1/app-sessions/asc-1658".to_string(),
+                        );
+                    }
+                    SbiResponse::with_status(204)
+                },
+            )
+            .await;
+            reset_actuation(Some(pcf_port));
+            actuation::set_for_test(true);
+            let oauth2 =
+                stand_in::oauth2_client_for(nrf_port, nextgcore_sbi::types::NfType::Tsctsf);
+
+            super::TEST_OAUTH2_CLIENT
+                .scope(oauth2, async {
+                    let created = tsctsf_sbi_request_handler(create_request(serde_json::json!({
+                        "timeDomain": 24,
+                        "gmEnable": true,
+                        "supis": ["imsi-001010000001658"],
+                        "ueMac": "00-11-22-33-44-58",
+                    })))
+                    .await;
+                    assert_eq!(created.status, 201);
+                    let body: serde_json::Value =
+                        serde_json::from_str(created.http.content.as_deref().expect("body"))
+                            .expect("json");
+                    let config_id = body["configId"].as_str().expect("configId").to_string();
+                    assert_eq!(
+                        stand_in::bearer_requests(
+                            &seen,
+                            "POST",
+                            "/npcf-policyauthorization/v1/app-sessions"
+                        ),
+                        1,
+                        "the Create must pass the OAuth2-required PCF: {:?}",
+                        seen.lock().unwrap_or_else(|e| e.into_inner())
+                    );
+                    assert_eq!(
+                        actuation::app_session_for(&config_id).as_deref(),
+                        Some("asc-1658"),
+                        "the appSessionId comes from the gated PCF's 201"
+                    );
+
+                    let deleted = tsctsf_sbi_request_handler(SbiRequest::delete(format!(
+                        "/ntsctsf-time-synchronization/v1/configuration/{config_id}"
+                    )))
+                    .await;
+                    assert_eq!(deleted.status, 204);
+                    assert_eq!(
+                        stand_in::bearer_requests(&seen, "POST", "/app-sessions/asc-1658/delete"),
+                        1,
+                        "the Delete must pass the OAuth2-required PCF: {:?}",
+                        seen.lock().unwrap_or_else(|e| e.into_inner())
+                    );
+                })
+                .await;
+
+            actuation::set_for_test(false);
+            reset_actuation(None);
+            pcf.stop().await.expect("stop stand-in PCF");
         });
     }
 
