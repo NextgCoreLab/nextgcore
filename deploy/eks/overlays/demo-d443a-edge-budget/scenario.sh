@@ -120,6 +120,17 @@ d443a_main() {
     scrape smf smf >"${a}/smf.prom"
     scrape ees ees >"${a}/ees.prom"
     date -u +%FT%TZ >"${a}/at.txt"
+    # Every UE pod there is: analyze.py requires exactly one, the same in every
+    # act, and never one a power cycle replaced (ue_cycled_from).
+    "${K[@]}" get pods -l app.kubernetes.io/name=ue -o jsonpath='{.items[*].metadata.name}' >"${a}/ue-pod.txt" 2>/dev/null
+  }
+  ue_cycle() {  # power-cycle the UE pod and wait until the old one is GONE
+    # (`--wait=false` let `rollout status` return while the old pod still ran,
+    # so a snapshot read its log: run 20261117T074344Z).
+    local old
+    old="$("${K[@]}" get pods -l app.kubernetes.io/name=ue -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)"
+    echo "ue_cycled_from=${old// /,}" >>"${S}/meta.txt"
+    "${K[@]}" delete pod -l app.kubernetes.io/name=ue --wait=true --timeout=180s >/dev/null || bad "ue power cycle"
   }
   ue_cli() {   # one nr-cli command at the base UE
     "${K[@]}" exec deploy/ue -c ue -- sh -c \
@@ -163,7 +174,7 @@ print(json.dumps(d))' "${S}/ees-config.before.json" "$1" | "${K[@]}" apply -f - 
         "${S}/modules-$3.txt" | tr ' ' ',')" >>"${S}/meta.txt"
   }
   say "arm=${ARM} mode=${DEMO_MODE}"
-  printf 'arm=%s\nmode=%s\ndeadline_ms=15\n' "${ARM}" "${DEMO_MODE}" >"${S}/meta.txt"
+  printf 'arm=%s\nmode=%s\ndeadline_ms=15\nue_pod_record=1\n' "${ARM}" "${DEMO_MODE}" >"${S}/meta.txt"
 
   # --- 1. the EEC's CCA key ------------------------------------------------------
   # Generated here, outside $OUT; its public JWK goes to the NRF's trust store
@@ -204,7 +215,7 @@ print(json.dumps(d))' "${S}/ees-config.before.json" "$1" | "${K[@]}" apply -f - 
         || bad "the new she-eas sidecar never got ready"
       "${K[@]}" rollout restart deploy/smf >/dev/null && "${K[@]}" rollout status deploy/smf --timeout=300s >/dev/null \
         || bad "smf restart"
-      "${K[@]}" delete pod -l app.kubernetes.io/name=ue --wait=false >/dev/null || bad "ue power cycle"
+      ue_cycle
       ;;
     bind-eth0)
       # The EEC bound to the pod network, not the PDU session (the UE restarts).
@@ -326,7 +337,7 @@ print(json.dumps(d))' "${S}/ees-config.before.json" "$1" | "${K[@]}" apply -f - 
     # A fresh N2 and PDU session through the OAuth2 amfd and smfd.
     "${K[@]}" delete pod -l app.kubernetes.io/name=gnb --wait=true --timeout=120s >/dev/null || bad "gnb restart"
     "${K[@]}" rollout status deploy/gnb --timeout=300s >/dev/null || bad "gnb rollout"
-    "${K[@]}" delete pod -l app.kubernetes.io/name=ue --wait=false >/dev/null || bad "ue power cycle"
+    ue_cycle
   fi
   wait_for 240 has_in upf she-eas '\[demo:d443a-edge-budget\] EAS-REG eas=[a-z-]+ registrationId=' 3 \
     || bad "the three EASes did not register at eesd within 240 s"
@@ -402,8 +413,7 @@ print(json.dumps(d))' "${S}/ees-config.before.json" "$1" | "${K[@]}" apply -f - 
     sleep 10
   elif ! wait_for 60 has_in ees ees '\[demo:d443a-edge-budget\] QOS_MON rt='; then
     echo "ue_power_cycled=true" >>"${S}/meta.txt"
-    "${K[@]}" delete pod -l app.kubernetes.io/name=ue --wait=false >/dev/null
-    sleep 5
+    ue_cycle
     "${K[@]}" rollout status deploy/ue --timeout=300s >/dev/null || bad "ue rollout after the power cycle"
     wait_for 240 sh -c "[ -n \"\$(kubectl -n ${NAMESPACE} --request-timeout=60s exec deploy/ue -c ue -- ip -4 -o addr show uesimtun0 2>/dev/null)\" ]" \
       || bad "no PDU session after the power cycle"

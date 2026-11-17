@@ -154,6 +154,20 @@ def c_acts_ordered(d):
         n = [len(lines(d, a, comp)) for a in acts]
         if any(n[i] < n[i - 1] and not restarted(d, acts[i], comp) for i in range(1, len(n))):
             return False, f'{comp} shrank between acts {n} (a restart)'
+    # Captures from ue_pod_record=1 on name the UE pod(s) at each snapshot: one,
+    # the same in every act, never one a power cycle replaced (run
+    # 20261117T074344Z read a terminating pod's log at warm).
+    m = meta(d)
+    if m.get('ue_pod_record') == '1':
+        pods = [read(d, a, 'ue-pod.txt').split() for a in acts]
+        gone = set(filter(None, m.get('ue_cycled_from', '').split(',')))
+        if any(len(p) != 1 for p in pods):
+            return False, f'not exactly one UE pod at every snapshot: {pods}'
+        if len({p[0] for p in pods}) != 1:
+            return False, f'the UE pod changed between acts: {[p[0] for p in pods]}'
+        if pods[0][0] in gone:
+            return False, f'the snapshots read {pods[0][0]}, the UE pod a power cycle replaced'
+        return True, 'every act captured, every log only grew (but for a restart the arm names); one UE pod throughout'
     return True, 'every act captured, every log only grew (but for a restart the arm names)'
 
 
@@ -870,7 +884,10 @@ def fixture(arm):
     prom['load'] = metric(2)
     for a in acts:
         acts[a]['smf.prom'] = [prom.get(a, metric(2))]
-    acts['_meta'] = f'arm={arm}\nmode={mode}\nrt_baseline=6\n' + ('restarted=ees@flip\n' if arm == 'restart-flip' else '')
+        acts[a]['ue-pod.txt'] = ['ue-6fcb95496b-new01']
+    cycled = 'ue_cycled_from=ue-6fcb95496b-old01\n' if arm in ('oauth2', 'no-upf-qos') else ''
+    acts['_meta'] = (f'arm={arm}\nmode={mode}\nrt_baseline=6\nue_pod_record=1\n' + cycled
+                     + ('restarted=ees@flip\n' if arm == 'restart-flip' else ''))
     files = {'eas-keys.txt': EAS_KEYS_OK,
              'ue-eec.txt': '      device: eth0\n' if arm == 'bind-eth0' else '      device: uesimtun0\n'}
     if arm == 'wrong-callback-token':
@@ -1146,6 +1163,14 @@ def negatives_of(arm):
         'c_acts_ordered': [
             # A restart: the warm capture of nrf-standin.log is longer than the next.
             edit_only(fx, 'warm', 'nrf-standin.log', lambda ls: ls + ls),
+            # Two UE pods at one snapshot (the old one still terminating).
+            edit_only(fx, 'warm', 'ue-pod.txt', lambda ls: ['ue-6fcb95496b-old01 ue-6fcb95496b-new01']),
+            # The UE pod changed between acts.
+            edit_only(fx, 'act1', 'ue-pod.txt', lambda ls: ['ue-6fcb95496b-new02']),
+            # A snapshot with no UE pod record.
+            edit_only(fx, 'act1', 'ue-pod.txt', lambda ls: []),
+            # Every snapshot read the pod a power cycle replaced.
+            {**fx, '_meta': fx['_meta'] + 'ue_cycled_from=ue-6fcb95496b-new01\n'},
             # (An act not captured at all also fails every check of that act, so
             # it has no single-check control; the shrink above is this check's.)
         ],
