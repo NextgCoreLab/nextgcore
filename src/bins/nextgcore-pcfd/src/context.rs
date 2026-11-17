@@ -3062,6 +3062,8 @@ pub fn pcf_self() -> Arc<RwLock<PcfContext>> {
 pub fn pcf_context_init(max_ue: usize, max_sess: usize) {
     let ctx = pcf_self();
     write_through_poison(&ctx).init(max_ue, max_sess);
+    // #1621 review M1: a fresh context has discovered no UDR yet.
+    crate::sbi_path::forget_udr();
 }
 
 /// Finalize the global PCF context
