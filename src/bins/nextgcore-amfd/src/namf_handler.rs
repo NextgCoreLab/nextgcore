@@ -1302,6 +1302,8 @@ mod tests {
         let result = handle_event_subscribe(&subscription, "http://nef.example.com/callback");
         assert!(result.is_ok());
         let sub_id = result.unwrap();
+        // #1640: a subscription for every UE, removed when the test ends.
+        let _subscription = crate::namf_server::EventSubscriptionGuard::id(sub_id.clone());
         assert!(sub_id.starts_with("sub-"));
     }
 

@@ -8,7 +8,8 @@
 # before lb-1's IntentSubmitted, and FAILS when the burst is missing (the revert
 # arm), when it comes after the intent (lb-1 fired on something else), when an
 # incidental len=49 packet is there (IPv6 not off), and when the sidecar did not
-# send its pings. Sourcing scenario.sh also runs its in_order self-test.
+# send its pings; d446a_ipv6_off fails on a ue log without the IPv6-off banner.
+# Sourcing scenario.sh also runs its in_order self-test.
 # `cond && ok ... || not_ok ...` throughout: ok only prints and cannot fail.
 # shellcheck disable=SC2015
 set -euo pipefail
@@ -50,6 +51,13 @@ breaks "len=4750 is not the burst" d446a_uplink_burst "${sent}" "$(put big.log "
 breaks "the sidecar sent no pings" d446a_uplink_burst "${unsent}" "$(put good2.log "${active}" "${burst2}" "${intent}")"
 breaks "an empty sidecar log" d446a_uplink_burst "$(put empty.log)" "$(put good3.log "${active}" "${burst2}" "${intent}")"
 breaks "no lb-1 intent at all" d446a_uplink_burst "${sent}" "$(put nointent.log "${active}" "${burst2}")"
+
+# The ue container's IPv6-off banner (fail closed, #1630).
+holds "IPv6-off banner present" d446a_ipv6_off "$(put ue.log '2026-11-17T02:15:32.506615389Z [ue] IPv6 off in the pod network namespace (nextgcore#1630)' 'nr-ue starting')"
+holds "IPv6-off banner, kernel without IPv6" d446a_ipv6_off "$(put ue0.log '[ue] IPv6 off: this kernel has no IPv6 (nextgcore#1630)')"
+breaks "no IPv6-off banner" d446a_ipv6_off "$(put ue2.log 'nr-ue starting' 'Registration Accept')"
+breaks "the wrapper's FATAL line is not the banner" d446a_ipv6_off "$(put ue3.log '[ue] FATAL: could not turn IPv6 off (nextgcore#1630)')"
+breaks "an empty ue log" d446a_ipv6_off "$(put ue4.log)"
 
 # A GNU escape reaching awk is named, not reported as a plain missing step.
 msg="$(in_order "$(put gnu.log "${burst2}")" t 'len=475\b')"

@@ -2493,6 +2493,20 @@ impl DataPlaneSession {
         (true, first)
     }
 
+    /// Start a new buffering episode (#1629 review): the next buffered downlink
+    /// packet raises a Downlink Data Report again. TS 29.244 §5.2.3.1: "When
+    /// instructed to buffer and notify the CP function about the arrival of a DL
+    /// packet, the UP function shall notify the CP function, when it receives a
+    /// first downlink packet" — so a Session Modification that gives that
+    /// instruction (a FAR set to BUFF with NOCP) makes the next packet a first
+    /// one. Without it, a packet buffered earlier (a create's BUFF FAR before
+    /// the gNB answered, or a late ACTIVATING's BUFF|NOCP while the SMF was not
+    /// paging) used up the episode's only report, and the UE was never paged.
+    /// Packets already buffered stay buffered.
+    pub fn rearm_dl_notification(&self) {
+        self.ddn_sent.store(false, Ordering::SeqCst);
+    }
+
     /// Drain all buffered downlink packets (used when the FAR switches to
     /// FORW) and reset the buffering episode state.
     pub fn drain_dl_buffer(&self) -> Vec<Vec<u8>> {
