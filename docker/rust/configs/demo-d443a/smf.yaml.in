@@ -1,0 +1,62 @@
+# SMF of the D443A compose stack (nextgsim#471): configs/5gc/smf.yaml plus the
+# N6 delay measurement block (#1502) for the three EASes on dn (STAMP on 8620)
+# and the demo: block (@MODE@ is set by the entrypoint).
+# Docker container configuration for 5G Core deployment
+
+logger:
+  file:
+    path: /var/log/nextgcore/smf.log
+  level: info
+
+global:
+  max:
+    ue: 1024
+    peer: 64
+
+smf:
+  sbi:
+    server:
+      - address: 172.23.0.4
+        port: 7777
+    client:
+      nrf:
+        - uri: http://172.23.0.10:7777
+  pfcp:
+    server:
+      - address: 172.23.0.4
+        port: 8805
+    client:
+      upf:
+        - address: 172.23.0.7
+  gtpc:
+    server:
+      - address: 172.23.0.4
+  gtpu:
+    server:
+      - address: 172.23.0.4
+  session:
+    - subnet: 10.45.0.0/16
+      gateway: 10.45.0.1
+    - subnet: 2001:db8:cafe::/48
+      gateway: 2001:db8:cafe::1
+  dns:
+    - 8.8.8.8
+    - 8.8.4.4
+    - 2001:4860:4860::8888
+    - 2001:4860:4860::8844
+  mtu: 1400
+  n6_delay_measurement:
+    endpoints:
+      - address: 10.60.0.11
+        port: 8620
+      - address: 10.60.0.12
+        port: 8620
+      - address: 10.60.0.13
+        port: 8620
+    reporting: [immediate, periodic]
+    period: 2
+demo:
+  enabled: true
+  d443a-edge-budget:
+    enabled: true
+    mode: @MODE@

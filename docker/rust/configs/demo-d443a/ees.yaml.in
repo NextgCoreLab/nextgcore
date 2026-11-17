@@ -1,0 +1,18 @@
+# eesd of the D443A compose stack (nextgsim#471), built with --features
+# demo-d443a-edge-budget. @MODE@ is set by ees-entry.sh.
+logger:
+  level: info
+ees:
+  sbi:
+    server:
+      - address: 172.23.0.31
+        port: 7777
+  edge_budget:
+    smf_uri: http://172.23.0.4:7777
+    deadline_ms: 15
+    rep_period_s: 2
+demo:
+  enabled: true
+  d443a-edge-budget:
+    enabled: true
+    mode: @MODE@

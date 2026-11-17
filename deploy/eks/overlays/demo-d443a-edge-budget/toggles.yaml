@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nextg-demo-toggles
+data:
+  key: d443a-edge-budget
+  # eesd (the ranking, the QOS_MON consumer, /metrics), smfd (the n6Delays
+  # member), the UE (the EEC client, she-offload) and the EAS sidecars.
+  targets: ees.yaml smf.yaml ue.yaml eas.yaml

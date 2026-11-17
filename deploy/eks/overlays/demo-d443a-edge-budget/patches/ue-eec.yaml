@@ -1,0 +1,28 @@
+- op: add
+  path: /spec/template/spec/initContainers/-
+  value:
+    name: d443a-eec-config
+    image: busybox:1.36
+    command: ["sh", "/d443a/eec-config.sh", "/etc/nextgsim/ue.yaml"]
+    env:
+      - name: NAMESPACE
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.namespace
+    volumeMounts:
+      - name: config-resolved
+        mountPath: /etc/nextgsim
+      - name: d443a-ue-eec
+        mountPath: /d443a
+        readOnly: true
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: NO_COLOR
+    value: "1"
+- op: add
+  path: /spec/template/spec/volumes/-
+  value:
+    name: d443a-ue-eec
+    configMap:
+      name: d443a-ue-eec
