@@ -2417,6 +2417,10 @@ pub fn fire_reachability_report(ue: &AmfUe, reachable: bool) {
 /// genuinely observes: Service Request (IDLE→CONNECTED) and N1 release
 /// (CONNECTED→IDLE).
 pub fn fire_connectivity_state_report(ue: &AmfUe, connected: bool) {
+    #[cfg(test)]
+    if connected {
+        CONNECTED_REPORTS_ON_THIS_THREAD.with(|c| c.set(c.get() + 1));
+    }
     fire_ue_event(
         ue,
         "CONNECTIVITY_STATE_REPORT",
@@ -3032,6 +3036,23 @@ pub fn fire_ues_in_area_report() {
 thread_local! {
     static UES_IN_AREA_FIRES_ON_THIS_THREAD: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
+}
+
+// Test-only attribution for [`fire_connectivity_state_report`] (#1593 review): how
+// many CONNECTED reports were fired on this thread. It makes "a handler fired no
+// CONNECTED report" a positive count on a current-thread runtime, instead of
+// silence at a sink. Per thread, as for UES_IN_AREA_FIRES_ON_THIS_THREAD.
+#[cfg(test)]
+thread_local! {
+    static CONNECTED_REPORTS_ON_THIS_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: CONNECTED [`fire_connectivity_state_report`] calls on this thread so
+/// far.
+#[cfg(test)]
+pub(crate) fn connected_reports_on_this_thread() -> u64 {
+    CONNECTED_REPORTS_ON_THIS_THREAD.with(std::cell::Cell::get)
 }
 
 /// Test-only: [`fire_ues_in_area_report`] calls on this thread so far.
@@ -7938,6 +7959,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_n1n2_updp_to_a_registered_idle_ue_pages_it() {
         let _serial = updp_queue_test_lock().lock().await;
+        // #1588: this page reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         amf_context_init(64, 1024, 4096);
         let supi = "imsi-001010000540002";
         let mut ue = AmfUe::new(987_540, NEXTGCORE_INVALID_POOL_ID);
@@ -8545,6 +8568,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_n1n2_transfer_idle_ue_paging_202() {
+        // #1588: this page reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         let supi = "imsi-001010000060021";
         let ue = setup_ue(supi, false, false);
         setup_sess(&ue, 6);

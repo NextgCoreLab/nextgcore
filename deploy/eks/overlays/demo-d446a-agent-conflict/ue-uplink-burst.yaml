@@ -1,0 +1,72 @@
+# D446A UE (nextgcore#1630, the EKS port of nextgsim#568): a deterministic
+# uplink burst, and no incidental uplink.
+#
+# lb-1 counts as load only the UEs whose bearer has carried user-plane data on
+# gNB-A. The arm used to rely on incidental uplink: a 48-byte IPv6 packet the
+# kernel sends as uesimtun* comes up (gNB log len=49), sent in some runs and
+# not others. Without it the first uplink is the base e2e's ping, which
+# demo-check.sh runs only after deploy-eks.sh returns and a debug container
+# attaches: its timing is the rollout's, not the UE's (47 s into energy-1's
+# 90 s grace on devtest1 2026-11-17, with no margin guaranteed). So:
+#   - IPv6 off in the pod's network namespace before nr-ue creates its TUN,
+#     so the kernel sends no packet of its own. Done by the ue container itself
+#     (already privileged in the base) in a wrapper around nr-ue: no second
+#     privileged container. Not a pod sysctl (net.ipv6.* is unsafe: it needs a
+#     kubelet allowlist), not a NET_ADMIN-only container (/proc/sys read-only);
+#     the base args (-c /etc/nextgsim/ue.yaml) reach nr-ue as "$@";
+#   - uplink-burst (sidecar, the ue image): as soon as uesimtun* has an IPv4
+#     address, 5 pings with a 446-byte payload to the UPF's 10.45.0.1 (gNB log
+#     len=475, a size nothing else sends), then idle. scenario.sh asserts the
+#     sidecar transmitted its pings (its own log), that they arrived (gNB-A's
+#     len=475 lines) before lb-1's IntentSubmitted, and no len=49 packet.
+# The compose arm does the same (nextgsim scripts/demo/d446a-check.sh,
+# d446a.compose.yml). No port is opened; the sidecar only sends ICMP through
+# the UE's own tunnel.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ue
+  namespace: nextg-system
+spec:
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: ue
+    spec:
+      containers:
+      - name: ue
+        command:
+        - sh
+        - -c
+        - |
+          if [ -d /proc/sys/net/ipv6 ]; then
+            echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6 \
+              && echo 1 > /proc/sys/net/ipv6/conf/default/disable_ipv6 \
+              && echo "[ue] IPv6 off in the pod network namespace (nextgcore#1630)"
+          fi
+          exec nr-ue "$@"
+        - nr-ue
+      - name: uplink-burst
+        image: nextgsim-ue:latest
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          capabilities:
+            add: ["NET_RAW"]
+        command:
+        - sh
+        - -c
+        - |
+          set -u
+          i=0
+          tun=""
+          while [ -z "$tun" ]; do
+            tun="$(ip -4 -o addr show | awk '$2 ~ /^uesimtun/ { print $2; exit }')"
+            [ -n "$tun" ] && break
+            i=$((i + 1))
+            if [ "$i" -ge 1200 ]; then echo "[uplink-burst] FATAL: no uesimtun* with an IPv4 address in 600 s"; exec sleep infinity; fi
+            sleep 0.5
+          done
+          echo "[uplink-burst] ${tun} is up: 5 pings, 446-byte payload, to 10.45.0.1"
+          ping -I "$tun" -c 5 -i 0.2 -W 2 -s 446 10.45.0.1 || echo "[uplink-burst] ping exited $?"
+          echo "[uplink-burst] done"
+          exec sleep infinity
