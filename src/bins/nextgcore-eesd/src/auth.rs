@@ -155,6 +155,18 @@ pub(crate) use crate::context::PROCESS_STATE_TEST_LOCK as GLOBAL_STATE_TEST_LOCK
 /// without a bearer (#1525, [`set_callback_exemptions`]); every other request,
 /// including that route with a wrong, stale or missing token, needs a bearer.
 pub fn require_oauth2(req: &SbiRequest, expected_scope: &str) -> Option<SbiResponse> {
+    require_oauth2_aud(req, expected_scope, &[])
+}
+
+/// [`require_oauth2`] that also requires the token's `aud` to name one of
+/// `audiences` (TS 33.501 §13.4.1.1.2: the producer checks "that the audience
+/// claim in the access token matches its own identity or the NF type of NF
+/// Service Producer"). An empty `audiences` checks no audience.
+pub fn require_oauth2_aud(
+    req: &SbiRequest,
+    expected_scope: &str,
+    audiences: &[&str],
+) -> Option<SbiResponse> {
     if callback_admitted(req) {
         return None;
     }
@@ -162,7 +174,27 @@ pub fn require_oauth2(req: &SbiRequest, expected_scope: &str) -> Option<SbiRespo
     // holding the guard.
     let jwks = auth_jwks().read().ok().and_then(|g| g.clone());
     let auth_header = req.http.get_header("authorization").map(String::as_str);
-    require_oauth2_with(auth_header, expected_scope, jwks.as_ref())
+    require_oauth2_with_aud(auth_header, expected_scope, audiences, jwks.as_ref())
+}
+
+/// The audiences the `eees-eeccontextreloc` route accepts (#1664 review M1):
+/// `AF`, the NF type every EES registers at the NRF as and the target type of
+/// the relocation pull's token, and this EES's own AF `nfInstanceId`. An
+/// NRF-signed token for any other audience is refused, even with the right
+/// scope.
+///
+/// `EES` is deliberately not accepted. nrfd sets `aud` to the requested
+/// `targetNfType` verbatim, so a profile registered with that type could obtain
+/// an NRF-signed `aud=EES` token. A CAPIF-issued token would carry `EES` (TS
+/// 29.558 §10.2), but this EES has one trust source, `--oauth2-jwks-file`, and
+/// cannot tell a CAPIF signature from an NRF one. CAPIF tokens on this route are
+/// out of scope until a separate CAPIF trust source exists.
+pub fn eec_context_reloc_audiences() -> [String; 2] {
+    let shared = nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Af);
+    [
+        nextgcore_sbi::types::NfType::Af.to_str().to_string(),
+        crate::nrf_af::af_instance_id(shared),
+    ]
 }
 
 /// Pure core of [`require_oauth2`] — takes the bearer header value and the JWKS
@@ -170,6 +202,18 @@ pub fn require_oauth2(req: &SbiRequest, expected_scope: &str) -> Option<SbiRespo
 pub(crate) fn require_oauth2_with(
     auth_header: Option<&str>,
     expected_scope: &str,
+    jwks: Option<&serde_json::Value>,
+) -> Option<SbiResponse> {
+    require_oauth2_with_aud(auth_header, expected_scope, &[], jwks)
+}
+
+/// [`require_oauth2_with`] that also requires the token's `aud` to name one of
+/// `audiences` (none checked when empty). A wrong audience is a 401: the token
+/// was not issued for this producer (RFC 6750 `invalid_token`).
+pub(crate) fn require_oauth2_with_aud(
+    auth_header: Option<&str>,
+    expected_scope: &str,
+    audiences: &[&str],
     jwks: Option<&serde_json::Value>,
 ) -> Option<SbiResponse> {
     let Some(jwks) = jwks else {
@@ -189,6 +233,17 @@ pub(crate) fn require_oauth2_with(
         }
     };
 
+    if !audiences.is_empty()
+        && !audiences
+            .iter()
+            .any(|aud| nextgcore_sbi::oauth::check_audience(&claims.aud, aud).is_ok())
+    {
+        return Some(send_unauthorized(
+            "Access token audience is not this EES",
+            Some("UNAUTHORIZED"),
+        ));
+    }
+
     if !claims.scope.split_whitespace().any(|s| s == expected_scope) {
         return Some(send_forbidden(
             &format!("Access token scope does not permit '{expected_scope}'"),
@@ -202,6 +257,41 @@ pub(crate) fn require_oauth2_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1664 review M1: with audiences required, a token with the right scope
+    /// but another NF's audience (an NRF-signed token for an SMF) is refused
+    /// 401; one for AF, or for an audience in an `aud` array, passes.
+    #[test]
+    fn a_reloc_token_for_another_audience_is_refused() {
+        use nextgcore_sbi::test_support::oauth2::{es256_access_token, jwks_for};
+        let sk = signing_key();
+        let jwks = jwks_for(&sk, "k1");
+        let header = |aud: &str| {
+            format!(
+                "Bearer {}",
+                es256_access_token(&sk, "k1", aud, SCOPE_EECCONTEXTRELOC)
+            )
+        };
+        let audiences = ["AF", "6b1d7e3c-1664-4000-8000-000000000001"];
+        let check = |h: &str| {
+            require_oauth2_with_aud(Some(h), SCOPE_EECCONTEXTRELOC, &audiences, Some(&jwks))
+                .map(|r| r.status)
+        };
+        assert_eq!(check(&header("SMF")), Some(401), "another NF's audience");
+        assert_eq!(check(&header("AF")), None);
+        assert_eq!(check(&header("6b1d7e3c-1664-4000-8000-000000000001")), None);
+        assert_eq!(
+            check(&header("EES")),
+            Some(401),
+            "EES: not distinguishable from an NRF token"
+        );
+        // Without required audiences the scope alone decides, as before.
+        assert_eq!(
+            require_oauth2_with(Some(&header("SMF")), SCOPE_EECCONTEXTRELOC, Some(&jwks))
+                .map(|r| r.status),
+            None
+        );
+    }
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     use p256::ecdsa::{signature::Signer, Signature, SigningKey};

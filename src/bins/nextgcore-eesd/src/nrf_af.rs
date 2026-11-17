@@ -30,20 +30,49 @@ static OAUTH2_CLIENT: OnceLock<Arc<OAuth2Client>> = OnceLock::new();
 /// The OAuth2 client outbound requests to 5GC NFs attach their token with, if
 /// this EES has an NRF (`--nrf-uri`).
 pub fn oauth2_client() -> Option<Arc<OAuth2Client>> {
+    #[cfg(test)]
+    if let Some(client) = OAUTH2_CLIENT_TEST_OVERRIDE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        return Some(client);
+    }
     OAUTH2_CLIENT.get().cloned()
 }
 
+/// Tests: a client [`oauth2_client`] returns instead of the once-set one.
+#[cfg(test)]
+pub(crate) static OAUTH2_CLIENT_TEST_OVERRIDE: std::sync::RwLock<Option<Arc<OAuth2Client>>> =
+    std::sync::RwLock::new(None);
+
 /// The `AF` NFProfile (TS 29.510 Table 6.1.6.2.2-1) this EES registers: the
-/// three mandatory attributes, its address, and the heartbeat timer. No
-/// `nfServices`: the EES exposes no service to 5GC consumers.
-pub fn af_profile(nf_instance_id: &str, host: &str) -> serde_json::Value {
+/// three mandatory attributes, its address, the heartbeat timer, and one
+/// `nfServices` entry, `eees-eeccontextreloc` at `scheme://host:port`, offered
+/// to AF consumers.
+///
+/// #1664: the EEC context relocation pull (EDGE-9) carries an NRF-issued token
+/// of scope `eees-eeccontextreloc` (operator decision, option 1). nrfd issues a
+/// scope only when a registered producer of the target type offers it
+/// (TS 33.501 §13.4.1.1.2 step 2), so each EES, the S-EES side of that pull,
+/// offers it here. No service is offered to 5GC consumers.
+pub fn af_profile(nf_instance_id: &str, host: &str, scheme: &str, port: u16) -> serde_json::Value {
     nextgcore_sbi::nf_addressing::classify_profile_host(
         serde_json::json!({
             "nfInstanceId": nf_instance_id,
             "nfType": NfType::Af.to_str(),
             "nfStatus": "REGISTERED",
             "ipv4Addresses": [host],
-            "heartBeatTimer": 10
+            "heartBeatTimer": 10,
+            "nfServices": [{
+                "serviceInstanceId": crate::auth::SCOPE_EECCONTEXTRELOC,
+                "serviceName": crate::auth::SCOPE_EECCONTEXTRELOC,
+                "versions": [{ "apiVersionInUri": "v1", "apiFullVersion": "1.2.0" }],
+                "scheme": scheme,
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{ "port": port }],
+                "allowedNfTypes": [NfType::Af.to_str()]
+            }]
         }),
         host,
     )
@@ -74,13 +103,19 @@ pub fn af_instance_id(shared: &str) -> String {
 }
 
 /// One NFRegister (PUT) of [`af_profile`] at `nrf_uri`.
-async fn register_once(nrf_uri: &str, nf_instance_id: &str, host: &str) -> Result<(), String> {
+async fn register_once(
+    nrf_uri: &str,
+    nf_instance_id: &str,
+    host: &str,
+    scheme: &str,
+    port: u16,
+) -> Result<(), String> {
     let (nrf_host, nrf_port) = crate::ecs_registration::parse_host_port(nrf_uri)
         .ok_or_else(|| format!("invalid --nrf-uri {nrf_uri:?}"))?;
     let client = nextgcore_sbi::context::global_context()
         .get_client(&nrf_host, nrf_port)
         .await;
-    let profile = af_profile(nf_instance_id, host);
+    let profile = af_profile(nf_instance_id, host, scheme, port);
     let resp = client
         .put_json(
             &format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}"),
@@ -107,7 +142,7 @@ async fn register_once(nrf_uri: &str, nf_instance_id: &str, host: &str) -> Resul
 /// attempt that succeeds). The client is installed first: a token request made
 /// before the registration lands is refused by the NRF and retried by the
 /// caller, which is the same state as an NRF that is down.
-pub async fn start(nrf_uri: &str, host: &str) {
+pub async fn start(nrf_uri: &str, host: &str, scheme: &str, port: u16) {
     let shared = nextgcore_sbi::nf_instance_id::nf_instance_id(NfType::Af);
     let nf_instance_id = af_instance_id(shared);
     if nf_instance_id != shared {
@@ -123,13 +158,23 @@ pub async fn start(nrf_uri: &str, host: &str) {
         nf_instance_id.clone(),
         NfType::Af,
     )));
-    let (nrf_uri, host, id) = (nrf_uri.to_string(), host.to_string(), nf_instance_id);
+    let (nrf_uri, host, id, scheme) = (
+        nrf_uri.to_string(),
+        host.to_string(),
+        nf_instance_id,
+        scheme.to_string(),
+    );
     nextgcore_sbi::heartbeat::register_or_retry(
         "EES",
         Default::default(),
         move || {
-            let (nrf_uri, host, id) = (nrf_uri.clone(), host.clone(), id.clone());
-            async move { register_once(&nrf_uri, &id, &host).await.map(|()| Some(id)) }
+            let (nrf_uri, host, id, scheme) =
+                (nrf_uri.clone(), host.clone(), id.clone(), scheme.clone());
+            async move {
+                register_once(&nrf_uri, &id, &host, &scheme, port)
+                    .await
+                    .map(|()| Some(id))
+            }
         },
         |nf_instance_id| nextgcore_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5),
     )
@@ -166,16 +211,32 @@ mod tests {
     }
 
     /// The profile nrfd needs to issue this EES a token: an AF instance, the
-    /// three mandatory attributes, no services.
+    /// three mandatory attributes, and (#1664) the one service an EES peer pulls
+    /// with a token, `eees-eeccontextreloc`, offered to AF consumers only.
     #[test]
     fn the_af_profile_is_a_minimal_af_instance() {
-        let p = af_profile("6b1d7e3c-1529-4000-8000-000000000001", "10.0.0.7");
+        let p = af_profile(
+            "6b1d7e3c-1529-4000-8000-000000000001",
+            "10.0.0.7",
+            "https",
+            7443,
+        );
         assert_eq!(p["nfType"], "AF");
         assert_eq!(p["nfStatus"], "REGISTERED");
         assert_eq!(p["nfInstanceId"], "6b1d7e3c-1529-4000-8000-000000000001");
         assert_eq!(p["ipv4Addresses"], serde_json::json!(["10.0.0.7"]));
-        assert!(p.get("nfServices").is_none());
-        let v6 = af_profile("6b1d7e3c-1529-4000-8000-000000000001", "fd00::7");
+        let svc = &p["nfServices"][0];
+        assert_eq!(p["nfServices"].as_array().map(Vec::len), Some(1));
+        assert_eq!(svc["serviceName"], "eees-eeccontextreloc");
+        assert_eq!(svc["scheme"], "https");
+        assert_eq!(svc["ipEndPoints"][0]["port"], 7443);
+        assert_eq!(svc["allowedNfTypes"], serde_json::json!(["AF"]));
+        let v6 = af_profile(
+            "6b1d7e3c-1529-4000-8000-000000000001",
+            "fd00::7",
+            "http",
+            7777,
+        );
         assert_eq!(v6["ipv6Addresses"], serde_json::json!(["fd00::7"]));
         assert!(v6.get("ipv4Addresses").is_none());
     }
