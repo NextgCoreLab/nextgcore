@@ -1778,6 +1778,9 @@ fn subscription_echo_json(sub: &EventSubscription) -> Value {
                 if t == "LOCATION_REPORT" && !sub.location_filters.is_empty() {
                     event["locationFilterList"] = json!(sub.location_filters);
                 }
+                if let Some(f) = sub.reachability_filter.filter(|_| t == "REACHABILITY_REPORT") {
+                    event["reachabilityFilter"] = json!(f.as_str());
+                }
                 if !area_list.is_empty()
                     && matches!(t.as_str(), "PRESENCE_IN_AOI_REPORT" | "UES_IN_AREA_REPORT")
                 {
@@ -1878,6 +1881,8 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
     let mut reporting_threshold: Option<i64> = None;
     // nextgsim#466: the LOCATION_REPORT event's `locationFilterList`.
     let mut location_filters: Vec<String> = Vec::new();
+    // #1641: the REACHABILITY_REPORT event's `reachabilityFilter`.
+    let mut reachability_filter = None;
     for event in event_list {
         let Some(event_type) = event.get("type").and_then(Value::as_str) else {
             return mandatory_ie_missing("subscription.eventList[].type");
@@ -1901,6 +1906,12 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
         }
         if event_type == "LOCATION_REPORT" {
             location_filters = parse_location_filters(event);
+        }
+        if event_type == "REACHABILITY_REPORT" {
+            match parse_reachability_filter(event) {
+                Ok(f) => reachability_filter = f,
+                Err(resp) => return resp,
+            }
         }
         // #400: the AOIEF filter IEs (`29518-k00.txt:21630-21707`, feature AOIEF) are
         // ACCEPTED and logged, never refused — they are optional IEs on a conformant
@@ -2081,6 +2092,8 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
         subs_change_notify_correlation_id,
         areas,
         reported_presence: std::collections::HashMap::new(),
+        reachability_filter,
+        reported_reachability: std::collections::HashMap::new(),
         reporting_threshold,
         location_filters,
     };
@@ -2103,6 +2116,12 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
             );
         }
     }
+    first_reachability_report(
+        &sub,
+        immediate_types.iter().any(|t| t == "REACHABILITY_REPORT"),
+        supi.as_deref(),
+        &report_list,
+    );
 
     log::info!(
         "Event subscription created: id={subscription_id}, events={:?}, notifyUri={notify_uri}",
@@ -2219,8 +2238,13 @@ fn build_immediate_reports(
                 "rmInfoList": [{ "rmState": "REGISTERED", "accessType": "3GPP_ACCESS" }]
             }),
             "REACHABILITY_REPORT" => {
-                let reachable = ue_ng_connected(&ue);
-                json!({ "reachability": if reachable { "REACHABLE" } else { "UNREACHABLE" } })
+                // #1641: the current state, an idle UE within its mobile reachable timer
+                // being REACHABLE. "UE Reachable for DL Traffic" reports REACHABLE only.
+                let state = current_reachability(&ue);
+                if sub.reachable_for_dl_traffic() && state != "REACHABLE" {
+                    return None;
+                }
+                json!({ "reachability": state })
             }
             "CONNECTIVITY_STATE_REPORT" => {
                 let connected = ue_ng_connected(&ue);
@@ -2303,6 +2327,16 @@ fn handle_event_subscription_modify(subscription_id: &str, request: &SbiRequest)
                     .find(|e| e.get("type").and_then(Value::as_str) == Some("LOCATION_REPORT"))
                     .map(parse_location_filters)
                     .unwrap_or_default();
+                // #1641: and its own reachabilityFilter.
+                sub.reachability_filter = match list
+                    .iter()
+                    .find(|e| e.get("type").and_then(Value::as_str) == Some("REACHABILITY_REPORT"))
+                    .map(parse_reachability_filter)
+                {
+                    Some(Ok(f)) => f,
+                    Some(Err(resp)) => return resp,
+                    None => None,
+                };
                 sub.event_types = event_types;
             }
             ("replace", "/subscription/options/expiry") => {
@@ -2614,13 +2648,190 @@ pub fn fire_registration_state_report(ue: &AmfUe, registered: bool) {
     );
 }
 
-/// Fire a REACHABILITY_REPORT (REACHABLE / UNREACHABLE)
-pub fn fire_reachability_report(ue: &AmfUe, reachable: bool) {
-    fire_ue_event(
-        ue,
+/// The `reachabilityFilter` of one REACHABILITY_REPORT `AmfEvent` (#1641, TS 29.518
+/// Table 6.2.6.2.3-1). `Ok(None)` when absent. An unknown string (the type is
+/// extensible, `anyOf` string) is read as the default, "UE Reachability Status
+/// Change"; a non-string is refused.
+#[allow(clippy::result_large_err)]
+fn parse_reachability_filter(
+    event: &Value,
+) -> Result<Option<crate::context::ReachabilityFilter>, SbiResponse> {
+    use crate::context::ReachabilityFilter;
+    match event.get("reachabilityFilter") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(f)) if f == "UE_REACHABLE_DL_TRAFFIC" => {
+            Ok(Some(ReachabilityFilter::UeReachableDlTraffic))
+        }
+        Some(Value::String(f)) => {
+            if f != "UE_REACHABILITY_STATUS_CHANGE" {
+                log::info!(
+                    "Event subscription names reachabilityFilter '{f}', which this AMF does not \
+                     know; it is read as UE_REACHABILITY_STATUS_CHANGE"
+                );
+            }
+            Ok(Some(ReachabilityFilter::UeReachabilityStatusChange))
+        }
+        Some(_) => Err(mandatory_ie_incorrect(
+            "subscription.eventList[].reachabilityFilter",
+            "not a string",
+        )),
+    }
+}
+
+/// The UE's reachability state now (#1641, TS 29.518 §5.3.1): from its live NGAP
+/// record, where an idle UE within its mobile reachable timer is REACHABLE. A UE
+/// with no NGAP record is REACHABLE only with a RAN UE context.
+fn current_reachability(ue: &AmfUe) -> &'static str {
+    let record = amf_self().read().ok().and_then(|g| g.ue_store().get(ue.id));
+    match record {
+        Some(state) => state.reachability_state(),
+        None if ue_ran_context(ue).is_some() => "REACHABLE",
+        None => "UNREACHABLE",
+    }
+}
+
+/// The UE identity the reported reachability is recorded under (#1641).
+fn reachability_key(ue: &AmfUe) -> Option<&str> {
+    ue.supi
+        .as_deref()
+        .or(ue.gpsi.as_deref())
+        .or(ue.pei.as_deref())
+}
+
+/// #1641: the first REACHABILITY_REPORT of a new subscription for `supi`, sent
+/// "regardless of whether the immediateFlag is set or not" (TS 29.518 §5.3.1,
+/// `29518-k00.txt:5042-5044` and `:5070-5076`):
+/// - "UE Reachability Status Change": the current state;
+/// - "UE Reachable for DL Traffic": REACHABLE, when the UE is reachable now.
+///
+/// With the immediateFlag the report is already in the response's `reportList`;
+/// without it, it goes in a notification. Either way it is recorded as reported.
+fn first_reachability_report(
+    sub: &EventSubscription,
+    immediate: bool,
+    supi: Option<&str>,
+    report_list: &[Value],
+) {
+    if !sub.event_types.iter().any(|t| t == "REACHABILITY_REPORT") {
+        return;
+    }
+    let Some(ue) = supi.and_then(find_ue_by_context_id) else {
+        return;
+    };
+    let Some(key) = reachability_key(&ue) else {
+        return;
+    };
+    let report = if immediate {
+        report_list
+            .iter()
+            .find(|r| r["type"] == "REACHABILITY_REPORT")
+            .cloned()
+    } else {
+        let state = current_reachability(&ue);
+        (!sub.reachable_for_dl_traffic() || state == "REACHABLE")
+            .then(|| reachability_report_for(&ue, state))
+    };
+    let Some(report) = report else {
+        return;
+    };
+    let state = report["reachability"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    if let Ok(guard) = amf_self().read() {
+        guard.event_subscription_record_reachability(&sub.subscription_id, key, &state);
+    }
+    if !immediate {
+        deliver_reachability_report(sub.clone(), report);
+    }
+}
+
+/// A REACHABILITY_REPORT of `state` for `ue`, with every identity it carries.
+fn reachability_report_for(ue: &AmfUe, state: &str) -> Value {
+    let mut report = build_event_report(
         "REACHABILITY_REPORT",
-        json!({ "reachability": if reachable { "REACHABLE" } else { "UNREACHABLE" } }),
+        ue.supi.as_deref(),
+        json!({ "reachability": state }),
     );
+    if let Some(gpsi) = ue.gpsi.as_deref() {
+        report["gpsi"] = json!(gpsi);
+    }
+    if let Some(pei) = ue.pei.as_deref() {
+        report["pei"] = json!(pei);
+    }
+    report
+}
+
+fn deliver_reachability_report(sub: EventSubscription, report: Value) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        log::debug!("REACHABILITY_REPORT: no tokio runtime, skipping delivery");
+        return;
+    };
+    #[cfg(test)]
+    REACHABILITY_REPORTS_ON_THIS_THREAD.with(|c| c.set(c.get() + 1));
+    let sub_id = sub.subscription_id.clone();
+    handle.spawn(async move {
+        if let Err(e) = deliver_event_notification(sub, report).await {
+            log::warn!("Event notification delivery failed (sub={sub_id}): {e}");
+        }
+    });
+}
+
+/// #1641: report `ue`'s reachability `state` to the subscriptions that want it
+/// (TS 29.518 §5.3.1, Table 6.2.6.2.3-1):
+/// - "UE Reachability Status Change" (the default): only a change from the state
+///   last reported to that subscription;
+/// - "UE Reachable for DL Traffic": REACHABLE, each time `on_connection` (the UE
+///   transitioned to CM-CONNECTED); never UNREACHABLE.
+fn fire_reachability(ue: &AmfUe, state: &str, on_connection: bool) {
+    let Some(key) = reachability_key(ue) else {
+        return;
+    };
+    let ctx = amf_self();
+    let subs = {
+        let Ok(guard) = ctx.read() else {
+            return;
+        };
+        guard.event_subscriptions_remove_expired();
+        guard.event_subscriptions_matching_ue(
+            "REACHABILITY_REPORT",
+            ue.supi.as_deref(),
+            ue.gpsi.as_deref(),
+            ue.pei.as_deref(),
+        )
+    };
+    for sub in subs {
+        let wanted = if sub.reachable_for_dl_traffic() {
+            on_connection && state == "REACHABLE"
+        } else {
+            true
+        };
+        if !wanted {
+            continue;
+        }
+        let changed = match ctx.read() {
+            Ok(guard) => {
+                guard.event_subscription_record_reachability(&sub.subscription_id, key, state)
+            }
+            Err(_) => true,
+        };
+        if changed || sub.reachable_for_dl_traffic() {
+            deliver_reachability_report(sub, reachability_report_for(ue, state));
+        }
+    }
+}
+
+/// #1641: the UE transitioned to CM-CONNECTED (a Service Request or a registration
+/// from CM-IDLE). REACHABLE to every "UE Reachable for DL Traffic" subscription;
+/// to a "UE Reachability Status Change" one only if it last heard otherwise.
+pub fn fire_reachable_on_connection(ue: &AmfUe) {
+    fire_reachability(ue, "REACHABLE", true);
+}
+
+/// #1641: the UE's reachability changed to `state` with no connection (the mobile
+/// reachable timer expired: UNREACHABLE).
+pub fn fire_reachability_change(ue: &AmfUe, state: &str) {
+    fire_reachability(ue, state, false);
 }
 
 /// Fire a CONNECTIVITY_STATE_REPORT (CM-CONNECTED / CM-IDLE), #74 criterion 5.
@@ -3267,6 +3478,20 @@ thread_local! {
         const { std::cell::Cell::new(0) };
 }
 
+// Test-only (#1641): REACHABILITY_REPORT notifications spawned on this thread, as
+// CONNECTED_REPORTS_ON_THIS_THREAD counts CONNECTED fires.
+#[cfg(test)]
+thread_local! {
+    static REACHABILITY_REPORTS_ON_THIS_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: REACHABILITY_REPORT notifications spawned on this thread so far.
+#[cfg(test)]
+pub(crate) fn reachability_reports_on_this_thread() -> u64 {
+    REACHABILITY_REPORTS_ON_THIS_THREAD.with(std::cell::Cell::get)
+}
+
 /// Test-only: CONNECTED [`fire_connectivity_state_report`] calls on this thread so
 /// far.
 #[cfg(test)]
@@ -3550,6 +3775,8 @@ fn take_over_transferred_event_subscriptions(
             // `AreaOfInterestEventState`'s map key is a JSON pointer into the source's
             // `areaList`, which only coincides with this AMF's ordering by luck.
             reported_presence: std::collections::HashMap::new(),
+            reachability_filter: None,
+            reported_reachability: std::collections::HashMap::new(),
             reporting_threshold: entry.get("eventList").and_then(Value::as_array).and_then(
                 |events| {
                     events
@@ -7881,6 +8108,8 @@ mod tests {
             // non-area-scoped event type, so there is nothing to be present IN.
             areas: Vec::new(),
             reported_presence: std::collections::HashMap::new(),
+            reachability_filter: None,
+            reported_reachability: std::collections::HashMap::new(),
             reporting_threshold: None,
             location_filters: Vec::new(),
         };
@@ -15162,6 +15391,8 @@ mod tests {
             subs_change_notify_correlation_id: Some("ee-1".to_string()),
             areas: Vec::new(),
             reported_presence: std::collections::HashMap::new(),
+            reachability_filter: None,
+            reported_reachability: std::collections::HashMap::new(),
             reporting_threshold: None,
             location_filters: Vec::new(),
         };
