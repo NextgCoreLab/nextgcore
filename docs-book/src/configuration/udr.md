@@ -33,7 +33,7 @@ udr:
         port: 7777
     client:
       nrf:
-        - uri: http://172.23.0.10:7777
+        - uri: https://172.23.0.10:7777
     # TLS configuration (G36: SBI TLS)
     # Enable: TLS_ENABLED=true SBI_SCHEME=https docker compose up -d
     tls:
@@ -68,7 +68,7 @@ These are the fields actually read by the daemon. The serde structs are `UdrYaml
 | `udr.sbi.server[0].port` | u16 | absent → `7777` | SBI port, after `--sbi-port` (#1312); used for both bind and NFProfile advertisement. |
 | `udr.sbi.client.nrf[]` | list | absent → NRF registration skipped | Only the **first** entry is used. With no NRF URI the daemon logs "skipping NRF registration" and runs standalone. |
 | `udr.sbi.client.nrf[0].uri` | string | required within the entry | NRF base URI for NF registration, heartbeat, and (when OAuth2 is on) JWKS fetching and token acquisition. There is **no** CLI fallback flag for the NRF URI. |
-| `udr.sbi.oauth2.require` | bool | `false` | SBI OAuth2 bearer-token enforcement. When `true`, incoming requests are verified against the NRF's JWKS (fails closed if no NRF URI is configured), and a process-wide OAuth2 client is installed so outbound SBI calls attach NRF-issued Bearer tokens (Wave-6 H8 Phase A per code comment). No CLI override exists. |
+| `udr.sbi.oauth2.require` | bool | `false` | SBI OAuth2 bearer-token enforcement. When `true`, incoming requests are verified against the NRF's JWKS (fails closed if no NRF URI is configured), and a process-wide OAuth2 client is installed so outbound SBI calls attach NRF-issued Bearer tokens (Wave-6 H8 Phase A per code comment). No CLI override exists. The outbound token client is also installed, with the knob off, under the `production` SBI profile (#1665; see [Configuration Overview](./overview.md)). |
 
 ## Parsed-but-inert / decorative YAML fields
 

@@ -2,7 +2,7 @@
 
 The DCCF (Data Collection Co-ordination Function, `nextgcore-dccfd`) is a Rel-17 optional NF, per TS 23.288 §6.7 as cited in the daemon's source comments, that brokers network data between producers (AMF, SMF, PCF, etc.) and analytics consumers (NWDAF, ADRF). It serves two SBI APIs, both routed in `dccf_request_handler` in `src/bins/nextgcore-dccfd/src/main.rs`: `Ndccf_DataManagement` (TS 29.574 §5.2 per code comment — `POST/GET/DELETE /ndccf-datamanagement/v1/subscriptions[/{id}]` plus an inbound `POST /ndccf-datamanagement/v1/notify` that fans data out to subscribers) and `Ndccf_ContextDocument` (TS 29.574 §5.3 per code comment — `POST/GET/DELETE /ndccf-contextdocument/v1/contexts[/{id}]`). A `/healthz` endpoint answers `{"status":"ok"}` to any HTTP method.
 
-Configuration is split between a YAML file (default path `/etc/nextgcore/dccf.yaml`, overridable with `-c/--config`), command-line flags, and environment variables — but for this daemon the split is extreme: **the YAML file carries exactly one live knob** (`sbi.oauth2.require`). Everything operational — bind address/port, NRF URI, TLS, the subscription cap — comes from CLI flags, and the docker deployment passes them explicitly (`--sbi-addr 172.23.0.36 --sbi-port 7777 --nrf-uri http://172.23.0.10:7777` in `docker-compose.yml`).
+Configuration is split between a YAML file (default path `/etc/nextgcore/dccf.yaml`, overridable with `-c/--config`), command-line flags, and environment variables — but for this daemon the split is extreme: **the YAML file carries exactly one live knob** (`sbi.oauth2.require`). Everything operational — bind address/port, NRF URI, TLS, the subscription cap — comes from CLI flags, and the docker deployment passes them explicitly (`--sbi-addr 172.23.0.36 --sbi-port 7777 --nrf-uri https://172.23.0.10:7777` in `docker-compose.yml`).
 
 > **Honesty note:** DCCF behavior is validated by this project's own unit tests (including an in-crate OAuth2 enforcement triplet) and the matched-simulator docker E2E only — not by third-party conformance certification. Several behaviors are bespoke: subscription creation reads only `notifyUri` from the request body (event filters are ignored), notification fan-out goes to *every* subscriber with a callback URI rather than matching subscriptions to events, and the fan-out wraps the producer's payload in a NextGCore-specific `{"data": "<body>"}` envelope that is not a normative TS 29.574 notification shape.
 
@@ -22,7 +22,7 @@ dccf:
         advertise: 172.23.0.36
         port: 7777
   nrf:
-    uri: http://172.23.0.10:7777
+    uri: https://172.23.0.10:7777
   max_subscriptions: 4096
 ```
 
@@ -34,7 +34,7 @@ Unlike most NextGCore NFs, `nextgcore-dccfd` defines **no `#[derive(Deserialize)
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `dccf.sbi.oauth2.require` | bool | `false` | SBI OAuth2 bearer-token enforcement (Wave-6 H8; TS 33.501 §13.4.1 and TS 29.510 §5.4.2 per code comments). When enabled, incoming requests must carry an NRF-issued token whose audience includes `DCCF`, verified against the NRF JWKS; with no NRF URI configured the server fails closed (503, per code comment). A missing, unreadable, or unparseable YAML file yields `false`. The environment variable `NEXTGCORE_SBI_OAUTH2_REQUIRE` is checked *first* and, when set to any value, decides the outcome in both directions (see Behavior notes). |
+| `dccf.sbi.oauth2.require` | bool | `false` | SBI OAuth2 bearer-token enforcement (Wave-6 H8; TS 33.501 §13.4.1 and TS 29.510 §5.4.2 per code comments). When enabled, incoming requests must carry an NRF-issued token whose audience includes `DCCF`, verified against the NRF JWKS; with no NRF URI configured the server fails closed (503, per code comment). A missing, unreadable, or unparseable YAML file yields `false`. The environment variable `NEXTGCORE_SBI_OAUTH2_REQUIRE` is checked *first* and, when set to any value, decides the outcome in both directions (see Behavior notes). The outbound token client is also installed, with the knob off, under the `production` SBI profile (#1665; see [Configuration Overview](./overview.md)). |
 
 That is the complete list — no other YAML field influences the daemon.
 
@@ -44,7 +44,7 @@ Every other field in the shipped example file is decorative; since the file is o
 
 - **`logger.level` is read.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691).
 - **`dccf.sbi.server[0]` is read (#1312).** The SBI bind is `--sbi-addr`/`--sbi-port`, else `address`/`port` here, else `127.0.0.1` and the default port. The advertised host is `--sbi-advertise`, else `NEXTGCORE_SBI_ADVERTISE`, else `advertise` here, else the bind address when it is not a wildcard; it is used in the NRF registration (`ipv4Addresses`, service `ipEndPoints`). A wildcard is never advertised: with a wildcard bind and nothing set to advertise, the NF does not register and logs why. A config that does not parse fails startup (#1313).
-- **`dccf.nrf.uri` is inert.** The NRF URI comes exclusively from `--nrf-uri` (default `http://127.0.0.1:7777`); the docker deployment passes `--nrf-uri http://172.23.0.10:7777` explicitly.
+- **`dccf.nrf.uri` is inert.** The NRF URI comes exclusively from `--nrf-uri` (default `http://127.0.0.1:7777`); the docker deployment passes `--nrf-uri https://172.23.0.10:7777` explicitly.
 - **`dccf.max_subscriptions` is inert.** The subscription cap comes from `--max-subscriptions`; the YAML value `4096` merely mirrors the CLI default.
 
 ## Command-line flags

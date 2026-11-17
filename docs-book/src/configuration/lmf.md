@@ -22,7 +22,7 @@ lmf:
         advertise: 172.23.0.32
         port: 7777
   nrf:
-    uri: http://172.23.0.10:7777
+    uri: https://172.23.0.10:7777
 ```
 
 ## YAML parameters
@@ -33,7 +33,7 @@ The LMF defines **no** `#[derive(Deserialize)]` configuration structs. The only 
 |---|---|---|---|
 | `lmf.positioning.cells[]` | list | absent | **Serving-cell reference coordinates (#103).** Each entry is `{ id, lat, lon, height? }`. `id` is the key measurement reports use (an NR-CGI, a `pci-<n>`, a TRP id) and is not interpreted — it must match what the RAN reports. `height` is optional (metres above the WGS-84 ellipsoid, default 0; the 2-D solvers do not read it). See *Positioning reference points* below. |
 | `lmf.positioning.trps[]` | list | absent | **TRP reference points (#103).** Same shape as `cells`. A separate list because TS 38.455 §8.2.6 makes TRP information its own exchange and an operator provisioning one is not necessarily provisioning the other; both lists land in the same registry the solvers read. |
-| `lmf.sbi.oauth2.require` | bool | `false` | SBI OAuth2 bearer-token enforcement (TS 33.501 §13.4.1, TS 29.510 §5.4.2 per code comments). The probe is root-key agnostic: it is `true` iff **any** top-level YAML section carries `sbi.oauth2.require: true`. When enabled, incoming requests must carry an NRF-issued token whose audience includes `LMF` (verified against the NRF JWKS; with no NRF URI configured the server fails closed with 503, per the code comment referencing `nextgcore-sbi` server.rs), and outbound SBI calls attach tokens. An unreadable or unparseable file, or an absent field, means `false`. The environment variable `NEXTGCORE_SBI_OAUTH2_REQUIRE` is checked **first** and, when set, decides in either direction — the YAML is not consulted at all. |
+| `lmf.sbi.oauth2.require` | bool | `false` | SBI OAuth2 bearer-token enforcement (TS 33.501 §13.4.1, TS 29.510 §5.4.2 per code comments). The probe is root-key agnostic: it is `true` iff **any** top-level YAML section carries `sbi.oauth2.require: true`. When enabled, incoming requests must carry an NRF-issued token whose audience includes `LMF` (verified against the NRF JWKS; with no NRF URI configured the server fails closed with 503, per the code comment referencing `nextgcore-sbi` server.rs), and outbound SBI calls attach tokens. An unreadable or unparseable file, or an absent field, means `false`. The environment variable `NEXTGCORE_SBI_OAUTH2_REQUIRE` is checked **first** and, when set, decides in either direction — the YAML is not consulted at all. The outbound token client is also installed, with the knob off, under the `production` SBI profile (#1665; see [Configuration Overview](./overview.md)). |
 
 ### Parsed-but-inert / decorative YAML fields
 
@@ -41,7 +41,7 @@ Everything else in the shipped example file is decorative — unknown keys are s
 
 - **`logger.level` is read.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691).
 - **`lmf.sbi.server[0]` is read (#1312).** The SBI bind is `--sbi-addr`/`--sbi-port`, else `address`/`port` here, else `127.0.0.1` and the default port. The advertised host is `--sbi-advertise`, else `NEXTGCORE_SBI_ADVERTISE`, else `advertise` here, else the bind address when it is not a wildcard; it is used in the NRF registration and the N1N2 notify callback URIs; the callbacks fall back to `127.0.0.1` only when the bind is a wildcard and nothing is set to advertise. A wildcard is never advertised: with a wildcard bind and nothing set to advertise, the NF does not register and logs why. A config that does not parse fails startup (#1313).
-- **`lmf.nrf.uri` is inert.** The NRF URI comes only from the `--nrf-uri` flag (default `http://127.0.0.1:7777`). The docker deployment passes `--nrf-uri http://172.23.0.10:7777` explicitly — setting only the YAML field has no effect.
+- **`lmf.nrf.uri` is inert.** The NRF URI comes only from the `--nrf-uri` flag (default `http://127.0.0.1:7777`). The docker deployment passes `--nrf-uri https://172.23.0.10:7777` explicitly — setting only the YAML field has no effect.
 
 ## Command-line flags
 

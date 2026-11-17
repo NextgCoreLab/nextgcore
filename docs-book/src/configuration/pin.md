@@ -22,10 +22,10 @@ pin:
         advertise: 172.23.0.35
         port: 7777
   nrf:
-    uri: http://172.23.0.10:7777
+    uri: https://172.23.0.10:7777
 ```
 
-The docker deployment mounts this file at `/etc/nextgcore/pin.yaml` (read-only) but configures the daemon entirely via its `command:` line: `--sbi-addr 172.23.0.35 --sbi-port 7815 --nrf-uri http://172.23.0.10:7777` (`docker/rust/docker-compose.yml`).
+The docker deployment mounts this file at `/etc/nextgcore/pin.yaml` (read-only) but configures the daemon entirely via its `command:` line: `--sbi-addr 172.23.0.35 --sbi-port 7815 --nrf-uri https://172.23.0.10:7777` (`docker/rust/docker-compose.yml`).
 
 ## YAML parameters
 

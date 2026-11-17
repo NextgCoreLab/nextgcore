@@ -45,7 +45,7 @@ use crate::context::{
     AnalyticsId, AnalyticsSubscription, EventSubscription, MatchingDirection, NotificationMethod,
     NwdafContext,
 };
-use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
+use nextgcore_sbi::client::SbiClient;
 use serde_json::{json, Map, Value};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -113,7 +113,7 @@ pub(crate) fn nrf_client(nrf_uri: &str) -> Option<SbiClient> {
 }
 
 pub(crate) fn notify_client(host: &str, port: u16) -> SbiClient {
-    let config = SbiClientConfig::new(host, port)
+    let config = nextgcore_sbi::security::sbi_peer_client_config(host, port)
         .with_connect_timeout(Duration::from_secs(NOTIFY_CONNECT_TIMEOUT_SECS))
         .with_request_timeout(Duration::from_secs(NOTIFY_REQUEST_TIMEOUT_SECS));
     SbiClient::new(config)
@@ -1847,6 +1847,9 @@ mod ml_prov_version_tests {
 
     #[tokio::test]
     async fn a_new_model_version_is_notified_once_and_the_old_url_keeps_its_bytes() {
+        // #1666: the notification client follows the SBI profile, and this
+        // drives it at a loopback plaintext peer, i.e. a dev deployment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (server, port, seen) = consumer().await;
         let ctx = mtlf(port, "mlsub-468-a");
 
@@ -1918,6 +1921,9 @@ mod ml_prov_version_tests {
     /// ML-provision subscriptions; the same context as an MTLF does.
     #[tokio::test]
     async fn an_anlf_role_dispatches_no_ml_provision_notifies() {
+        // #1666: the notification client follows the SBI profile, and this
+        // drives it at a loopback plaintext peer, i.e. a dev deployment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (server, port, seen) = consumer().await;
         let ctx = mtlf(port, "mlsub-468-role");
         dispatch_ml_prov_notifications_as(ctx.clone(), crate::role::Role::Anlf).await;
@@ -1963,6 +1969,9 @@ mod ml_prov_version_tests {
     /// TS 29.500 §6.2.3. The next tick sends nothing to it.
     #[tokio::test]
     async fn a_notify_answered_404_removes_the_ml_provision_subscription() {
+        // #1666: the notification client follows the SBI profile, and this
+        // drives it at a loopback plaintext peer, i.e. a dev deployment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         for (status, body) in [
             (404, None),
             (
@@ -1999,6 +2008,9 @@ mod ml_prov_version_tests {
     /// pending and the next tick notifies it again.
     #[tokio::test]
     async fn a_notify_answered_500_or_another_400_is_retried() {
+        // #1666: the notification client follows the SBI profile, and this
+        // drives it at a loopback plaintext peer, i.e. a dev deployment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         for (status, body) in [
             (500, None),
             (503, None),
@@ -2083,6 +2095,9 @@ mod ml_prov_version_tests {
     /// and the next tick sends nothing to it.
     #[tokio::test]
     async fn an_events_notify_answered_404_removes_the_subscription() {
+        // #1666: the notification client follows the SBI profile, and this
+        // drives it at a loopback plaintext peer, i.e. a dev deployment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         for (i, (status, body)) in [
             (404, None),
             (
@@ -2137,6 +2152,9 @@ mod ml_prov_version_tests {
     /// events subscription stays and the next tick notifies it again.
     #[tokio::test]
     async fn an_events_notify_answered_5xx_or_another_4xx_is_retried() {
+        // #1666: the notification client follows the SBI profile, and this
+        // drives it at a loopback plaintext peer, i.e. a dev deployment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         for (status, body) in [
             (500, None),
             (503, None),

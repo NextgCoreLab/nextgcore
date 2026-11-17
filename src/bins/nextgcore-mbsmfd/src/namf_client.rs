@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
+use nextgcore_sbi::client::SbiClient;
 use nextgcore_sbi::context::global_context;
 use serde_json::{json, Value};
 
@@ -143,7 +143,7 @@ pub type MbsContextRef = String;
 /// not have the session, which the caller reports rather than hides.
 pub async fn context_create(amf: &DiscoveredAmf, tmgi: &Tmgi) -> Option<MbsContextRef> {
     let client = SbiClient::new(
-        SbiClientConfig::new(amf.host.clone(), amf.port)
+        nextgcore_sbi::security::sbi_peer_client_config(&amf.host, amf.port)
             .with_connect_timeout(Duration::from_secs(2))
             .with_request_timeout(Duration::from_secs(3)),
     );

@@ -22,10 +22,10 @@ mbsmf:
         advertise: 172.23.0.33
         port: 7777
   nrf:
-    uri: http://172.23.0.10:7777
+    uri: https://172.23.0.10:7777
 ```
 
-Note that in the docker deployment the values that actually matter are passed as CLI flags: the compose service runs `--sbi-addr 172.23.0.33 --sbi-port 7777 --nrf-uri http://172.23.0.10:7777` (see `docker/rust/docker-compose.yml`).
+Note that in the docker deployment the values that actually matter are passed as CLI flags: the compose service runs `--sbi-addr 172.23.0.33 --sbi-port 7777 --nrf-uri https://172.23.0.10:7777` (see `docker/rust/docker-compose.yml`).
 
 ## YAML parameters
 
@@ -33,7 +33,7 @@ Note that in the docker deployment the values that actually matter are passed as
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `<section>.sbi.oauth2.require` | bool | `false` | SBI OAuth2 bearer-token enforcement (Wave-6 H8; TS 33.501 §13.4.1, TS 29.510 §5.4.2 per code comments). Root-key agnostic: it is `true` iff **any** top-level YAML section (e.g. `mbsmf:`) sets `sbi.oauth2.require: true`. A missing, unreadable, or unparsable config file means `false`. The env var `NEXTGCORE_SBI_OAUTH2_REQUIRE` takes precedence: if it is set at all, its value decides (`1`/`true`/`TRUE`/`yes` after trim = on; anything else = off) and the YAML is not consulted. When enabled, the server verifies incoming Bearer tokens against the NRF JWKS with expected audience `MBSMF`, and an outbound OAuth2 client is installed; with an empty NRF URI enforcement fails closed (503, per the code comment). |
+| `<section>.sbi.oauth2.require` | bool | `false` | SBI OAuth2 bearer-token enforcement (Wave-6 H8; TS 33.501 §13.4.1, TS 29.510 §5.4.2 per code comments). Root-key agnostic: it is `true` iff **any** top-level YAML section (e.g. `mbsmf:`) sets `sbi.oauth2.require: true`. A missing, unreadable, or unparsable config file means `false`. The env var `NEXTGCORE_SBI_OAUTH2_REQUIRE` takes precedence: if it is set at all, its value decides (`1`/`true`/`TRUE`/`yes` after trim = on; anything else = off) and the YAML is not consulted. When enabled, the server verifies incoming Bearer tokens against the NRF JWKS with expected audience `MBSMF`, and an outbound OAuth2 client is installed; with an empty NRF URI enforcement fails closed (503, per the code comment). The outbound token client is also installed, with the knob off, under the `production` SBI profile (#1665; see [Configuration Overview](./overview.md)). |
 
 ### Parsed-but-inert / decorative YAML fields
 

@@ -30,7 +30,8 @@
 #   6. rest: lmf, mbsmf, nwdaf, dccf, ees, pin
 #
 # Enablement mechanism per NF:
-#   * nrf/udr/nssf/nsacf/bsf  — config-file swap (`<nf>-oauth2.yaml`, mounts certs).
+#   * nrf/udr/nssf/nsacf/bsf  — config-file swap (`<nf>-oauth2.yaml`; each keeps
+#                               the base file's own certificate volume, tls-<nf>, #1617).
 #   * udm/ausf/pcf/amf/smf/lmf/mbsmf/nwdaf/dccf — env `NEXTGCORE_SBI_OAUTH2_REQUIRE=1`
 #     (honored by their oauth2_required() knob; sets server enforcement + installs
 #     the outbound OAUTH2_CLIENT).
@@ -118,7 +119,6 @@ services:
       - NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/etc/nextgcore/cca-public
     volumes:
       - ./configs/5gc/nrf-oauth2.yaml:/etc/nextgcore/nrf.yaml:ro
-      - ./certs:/etc/nextgcore/certs:ro
       - cca_keys:/var/lib/nextgcore/cca
       - cca_public:/etc/nextgcore/cca-public
 
@@ -130,7 +130,6 @@ services:
       - NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/etc/nextgcore/cca-public
     volumes:
       - ./configs/5gc/udr-oauth2.yaml:/etc/nextgcore/udr.yaml:ro
-      - ./certs:/etc/nextgcore/certs:ro
       - cca_keys:/var/lib/nextgcore/cca
       - cca_public:/etc/nextgcore/cca-public
 
@@ -165,7 +164,6 @@ services:
       - NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/etc/nextgcore/cca-public
     volumes:
       - ./configs/5gc/bsf-oauth2.yaml:/etc/nextgcore/bsf.yaml:ro
-      - ./certs:/etc/nextgcore/certs:ro
       - cca_keys:/var/lib/nextgcore/cca
       - cca_public:/etc/nextgcore/cca-public
   nssf:
@@ -175,7 +173,6 @@ services:
       - NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/etc/nextgcore/cca-public
     volumes:
       - ./configs/5gc/nssf-oauth2.yaml:/etc/nextgcore/nssf.yaml:ro
-      - ./certs:/etc/nextgcore/certs:ro
       - cca_keys:/var/lib/nextgcore/cca
       - cca_public:/etc/nextgcore/cca-public
   nsacf:
@@ -185,7 +182,6 @@ services:
       - NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/etc/nextgcore/cca-public
     volumes:
       - ./configs/5gc/nsacf-oauth2.yaml:/etc/nextgcore/nsacf.yaml:ro
-      - ./certs:/etc/nextgcore/certs:ro
       - cca_keys:/var/lib/nextgcore/cca
       - cca_public:/etc/nextgcore/cca-public
 

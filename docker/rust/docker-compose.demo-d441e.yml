@@ -28,6 +28,12 @@
 # 401, and nwdafd fetches tokens only when its own listener enforces. That is
 # nextgcore#1421; the OAuth2 arm waits for it.
 #
+# NF -> NRF over TLS (#1617). The NRF serves TLS with client_auth optional
+# (configs/demo-d441e/nrf.yaml); each NWDAF dials https://nrf:7777 (nrf.crt
+# names DNS:nrf) with its own certificate (certs/nf-identities.txt rows
+# nwdaf-mtlf / nwdaf-anlf, the URNs of their --nf-instance-id pins). The
+# one-shot sbi-tls service issues them into one volume per NF.
+#
 # Usage (images and config dir as check.sh sets them):
 #   D441E_NWDAF_IMAGE=... D441E_NRF_IMAGE=... \
 #     docker compose -f docker-compose.demo-d441e.yml up -d
@@ -46,20 +52,48 @@ x-nwdaf: &nwdaf
     retries: 3
     start_period: 5s
   depends_on:
+    sbi-tls:
+      condition: service_completed_successfully
     nrf:
       condition: service_healthy
   networks: [d441e]
 
 services:
+  # SBI TLS (#1617): the certificate source, as in docker-compose.yml. It
+  # issues the dev PKI (certs/generate-dev-certs.sh) into sbi_pki, which only
+  # it mounts, and gives each NRF client its own volume tls-<name> (ca.crt,
+  # <name>.crt, <name>.key 0400 owned by the NF's user). No network.
+  sbi-tls:
+    image: ${D441E_NRF_IMAGE:-nextgcore-rust/nrf:latest}
+    user: root
+    restart: "no"
+    network_mode: none
+    entrypoint: ["bash", "/opt/sbi-tls/compose-tls-init.sh"]
+    command: []
+    healthcheck:
+      disable: true
+    volumes:
+      - ./certs:/opt/sbi-tls:ro
+      - sbi_pki:/pki
+      - tls-nrf:/tls/nrf
+      - tls-nwdaf-mtlf:/tls/nwdaf-mtlf
+      - tls-nwdaf-anlf:/tls/nwdaf-anlf
+
   nrf:
     image: ${D441E_NRF_IMAGE:-nextgcore-rust/nrf:latest}
     restart: "no"
     environment:
       RUST_LOG: info
       NEXTGCORE_SBI_PROFILE: "dev"
+      # Pinned to the URN of certs/nrf.crt (certs/nf-identities.txt, #1617).
+      NEXTGCORE_NRF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-0000000000f0
     command: ["-c", "/etc/nextgcore/nrf.yaml"]
     volumes:
       - ${D441E_CONFIG_DIR:-./configs/demo-d441e}/nrf.yaml:/etc/nextgcore/nrf.yaml:ro
+      - tls-nrf:/etc/nextgcore/certs:ro
+    depends_on:
+      sbi-tls:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "kill -0 1"]
       interval: 10s
@@ -73,23 +107,39 @@ services:
     environment:
       RUST_LOG: info
       NEXTGCORE_SBI_PROFILE: "dev"
+      NEXTGCORE_NRF_TLS_CA: /etc/nextgcore/certs/ca.crt
+      NEXTGCORE_NRF_TLS_CLIENT_CERT: /etc/nextgcore/certs/nwdaf-mtlf.crt
+      NEXTGCORE_NRF_TLS_CLIENT_KEY: /etc/nextgcore/certs/nwdaf-mtlf.key
     # A pinned instance id: the AnLF registers with it as its MTLF, and the
     # MTLF finds the AnLF at the NRF by the AnLF's.
-    command: ["-c", "/etc/nextgcore/nwdaf.yaml", "--nrf-uri", "http://nrf:7777",
+    command: ["-c", "/etc/nextgcore/nwdaf.yaml", "--nrf-uri", "https://nrf:7777",
               "--nf-instance-id", "d441e000-0468-4000-8000-00000000f001"]
     volumes:
       - ${D441E_CONFIG_DIR:-./configs/demo-d441e}/nwdaf-mtlf.yaml:/etc/nextgcore/nwdaf.yaml:ro
+      - tls-nwdaf-mtlf:/etc/nextgcore/certs:ro
 
   nwdaf-anlf:
     <<: *nwdaf
     environment:
       RUST_LOG: info
       NEXTGCORE_SBI_PROFILE: "dev"
-    command: ["-c", "/etc/nextgcore/nwdaf.yaml", "--nrf-uri", "http://nrf:7777",
+      NEXTGCORE_NRF_TLS_CA: /etc/nextgcore/certs/ca.crt
+      NEXTGCORE_NRF_TLS_CLIENT_CERT: /etc/nextgcore/certs/nwdaf-anlf.crt
+      NEXTGCORE_NRF_TLS_CLIENT_KEY: /etc/nextgcore/certs/nwdaf-anlf.key
+    command: ["-c", "/etc/nextgcore/nwdaf.yaml", "--nrf-uri", "https://nrf:7777",
               "--nf-instance-id", "d441e000-0468-4000-8000-00000000a001"]
     volumes:
       - ${D441E_CONFIG_DIR:-./configs/demo-d441e}/nwdaf-anlf.yaml:/etc/nextgcore/nwdaf.yaml:ro
+      - tls-nwdaf-anlf:/etc/nextgcore/certs:ro
 
 networks:
   d441e:
     internal: true
+
+volumes:
+  # #1617: sbi_pki holds the CA key (the sbi-tls service only); each tls-<name>
+  # one NF's certificate and key (that NF only).
+  sbi_pki:
+  tls-nrf:
+  tls-nwdaf-mtlf:
+  tls-nwdaf-anlf:

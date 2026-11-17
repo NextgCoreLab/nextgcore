@@ -25,7 +25,7 @@
 
 use bytes::Bytes;
 use nextgcore_sbi::callback_auth::CallbackToken;
-use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
+use nextgcore_sbi::client::SbiClient;
 use nextgcore_sbi::context::global_context;
 use nextgcore_sbi::message::{SbiPart, SbiRequest};
 use serde::Serialize;
@@ -363,7 +363,7 @@ fn client_for(amf: &DiscoveredAmf) -> SbiClient {
     // H8 Phase A); no-op otherwise so the matched-sim default path is unchanged.
     crate::attach_oauth2(
         SbiClient::new(
-            SbiClientConfig::new(amf.host.clone(), amf.port)
+            nextgcore_sbi::security::sbi_peer_client_config(&amf.host, amf.port)
                 .with_connect_timeout(Duration::from_secs(2))
                 .with_request_timeout(Duration::from_secs(3)),
         ),
