@@ -1763,6 +1763,83 @@ pub fn build_pdu_session_resource_release_command_asn1(
     }
 }
 
+/// A PDU SESSION RESOURCE RELEASE COMMAND for one session that relays the SMF's
+/// N2 SM information and, when given, a NAS-PDU (#1637, TS 38.413 §9.2.1.3): the
+/// PDU Session Resource Release Command Transfer is the SMF's `PDU_RES_REL_CMD`
+/// octets as received (TS 23.502 §4.3.4.2 step 3a: the AMF is transparent to N2
+/// SM information), and the NAS-PDU (criticality ignore) carries the PDU SESSION
+/// RELEASE COMMAND to the UE. `None` for an empty transfer or a failed encode.
+pub fn build_pdu_session_resource_release_command_relayed(
+    amf_ue_ngap_id: u64,
+    ran_ue_ngap_id: u32,
+    pdu_session_id: u8,
+    transfer: &[u8],
+    nas_pdu: Option<&[u8]>,
+) -> Option<Vec<u8>> {
+    use ngap_gen::{
+        PDUSessionResourceReleaseCommand, PDUSessionResourceReleaseCommandProtocolIEs,
+        PDUSessionResourceReleaseCommandProtocolIEs_Entry as Entry,
+        PDUSessionResourceReleaseCommandProtocolIEs_EntryValue as Ie,
+        PDUSessionResourceToReleaseItemRelCmd,
+        PDUSessionResourceToReleaseItemRelCmdPDUSessionResourceReleaseCommandTransfer as Transfer,
+        ProtocolIE_ID, NGAP_PDU,
+    };
+    if transfer.is_empty() {
+        return None;
+    }
+    let reject = ngap_gen::Criticality(ngap_gen::Criticality::REJECT);
+    let ignore = ngap_gen::Criticality(ngap_gen::Criticality::IGNORE);
+    // IE order and criticalities as TS 38.413 §9.2.1.3 lists them.
+    let mut ies = vec![
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_AMF_UE_NGAP_ID),
+            criticality: reject.clone(),
+            value: Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(amf_ue_ngap_id)),
+        },
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_RAN_UE_NGAP_ID),
+            criticality: reject.clone(),
+            value: Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(ran_ue_ngap_id)),
+        },
+    ];
+    if let Some(nas_pdu) = nas_pdu {
+        ies.push(Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_NAS_PDU),
+            criticality: ignore,
+            value: Ie::Id_NAS_PDU(ngap_gen::NAS_PDU(nas_pdu.to_vec())),
+        });
+    }
+    ies.push(Entry {
+        id: ProtocolIE_ID(ngap_gen::ID_PDU_SESSION_RESOURCE_TO_RELEASE_LIST_REL_CMD),
+        criticality: reject.clone(),
+        value: Ie::Id_PDUSessionResourceToReleaseListRelCmd(
+            ngap_gen::PDUSessionResourceToReleaseListRelCmd(vec![
+                PDUSessionResourceToReleaseItemRelCmd {
+                    pdu_session_id: ngap_gen::PDUSessionID(pdu_session_id),
+                    pdu_session_resource_release_command_transfer: Transfer(transfer.to_vec()),
+                    ie_extensions: None,
+                },
+            ]),
+        ),
+    });
+    let pdu = NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+        procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_PDU_SESSION_RESOURCE_RELEASE),
+        criticality: reject,
+        value: ngap_gen::InitiatingMessageValue::Id_PDUSessionResourceRelease(
+            PDUSessionResourceReleaseCommand {
+                protocol_i_es: PDUSessionResourceReleaseCommandProtocolIEs(ies),
+            },
+        ),
+    });
+    match nextgcore_ngap_gen::encode(&pdu) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            log::error!("Failed to encode PDU Session Resource Release Command: {e:?}");
+            None
+        }
+    }
+}
+
 /// One session a PDU Session Resource Release Response reports released.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleasedPduSession {

@@ -1419,6 +1419,20 @@ pub(crate) enum SmfAnswer {
         /// (with the N1 of its refusal, if any, #1590).
         result: Result<(Vec<u8>, Vec<u8>), crate::sbi_path::SmContextUpdateRefusal>,
     },
+    /// #1637: the SMF's answer to a UE-requested PDU Session Release (0xD1, TS 23.502
+    /// §4.3.4.2 steps 1a-3): its PDU SESSION RELEASE COMMAND and, with an active user
+    /// plane, its N2 release transfer; or why it did not answer one.
+    ReleaseRequested {
+        amf_ue_ngap_id: u64,
+        psi: u8,
+        /// The UE's PDU SESSION RELEASE REQUEST, sent back with 5GMM #90 if the
+        /// SMF cannot be reached (TS 24.501 §5.4.5.3.1 case e)).
+        request: Vec<u8>,
+        result: Result<
+            crate::sbi_path::SmContextUpdateResponse,
+            crate::sbi_path::SmContextUpdateRefusal,
+        >,
+    },
     /// #778: the ACTIVATING for a queued downlink setup of a CM-CONNECTED UE.
     DownlinkActivation(Box<DownlinkActivation>),
     /// #922 part 3: the SMF's answer to a PDU SESSION RESOURCE NOTIFY's released
@@ -10395,7 +10409,15 @@ impl NgapServer {
                     ),
                 }
             }
-            // PDU Session Release Request
+            // PDU Session Release Request. #1637, TS 23.502 §4.3.4.2 step 1a and TS 24.501
+            // §6.4.3.3: the SMF is the 5GSM endpoint. The request goes to it in an
+            // UpdateSMContext, and it answers the PDU SESSION RELEASE COMMAND (with the
+            // UE's PTI and its own cause) and the N2 release (step 3a), which the AMF
+            // relays (`apply_release_request_answer`). The session is forgotten when
+            // the SMF reports it RELEASED, after the UE's RELEASE COMPLETE reaches it.
+            // Before, the AMF released the context itself and answered with its own
+            // RELEASE COMMAND #36, so the SMF never ran the procedure and the UE's
+            // RELEASE COMPLETE found no context to relay to.
             0xD1 => {
                 log::info!("PDU Session Release Request from UE: PSI={psi}, PTI={pti}");
                 // SMF-chosen ref, not the PSI -- see sm_context_refs.
@@ -10408,57 +10430,34 @@ impl NgapServer {
                     );
                     return Ok(());
                 };
-
-                // #922: released at the SMF off the NGAP task. Durable, keyed on
-                // the session: it reaches the SMF before any later exchange for the
-                // PSI (a new establishment of it), and the UE leaving cannot drop it.
+                let n1 = sm_pdu.to_vec();
+                // The User Location Information, as the 0xCC/0xCD relay sends it.
+                let ue_location = build_sm_context_identity(
+                    self.ue_auth_state.get(amf_ue_ngap_id).as_ref(),
+                    None,
+                )
+                .ue_location;
+                // #922: off the NGAP task, keyed on the session.
                 self.sbi_offload
-                    .spawn_keyed_durable((amf_ue_ngap_id, psi), move || async move {
+                    .spawn_keyed((amf_ue_ngap_id, psi), move || async move {
                         let (host, port) = smf_or_selected(owner).await;
-                        match crate::sbi_path::call_smf_release_sm_context(
+                        let result = crate::sbi_path::call_smf_update_sm_context_release_request(
                             &host,
                             port,
                             &sm_context_ref,
+                            &n1,
+                            ue_location,
                         )
-                        .await
-                        {
-                            Ok(()) => log::info!("SMF SM Context Released: PSI={psi}"),
-                            Err(e) => log::warn!("SMF release failed: {e}"),
-                        }
-                        None
+                        .await;
+                        Some(crate::sbi_offload::SbiOutcome::Smf(
+                            SmfAnswer::ReleaseRequested {
+                                amf_ue_ngap_id,
+                                psi,
+                                request: n1,
+                                result,
+                            },
+                        ))
                     });
-                // #756: the session is over at the AMF too. Forgotten whatever the
-                // SMF answers: the UE is told the session is released below, so
-                // nothing will address it again, and keeping the ref would leak it.
-                self.forget_session(amf_ue_ngap_id, psi);
-
-                // PDU Session Release Command (cause #36 regular deactivation)
-                let release_cmd = vec![0x2E, psi, pti, 0xD3, 0x24];
-                self.send_n1_sm_to_ue(
-                    association_id,
-                    amf_ue_ngap_id,
-                    ran_ue_ngap_id,
-                    psi,
-                    &release_cmd,
-                )
-                .await?;
-
-                let release_ngap =
-                    match crate::ngap_asn1::build_pdu_session_resource_release_command_asn1(
-                        amf_ue_ngap_id,
-                        ran_ue_ngap_id,
-                        &[psi],
-                    ) {
-                        Some(bytes) => bytes,
-                        None => {
-                            log::error!("Failed to build PDU Session Resource Release Command");
-                            return Ok(());
-                        }
-                    };
-                self.send_to_association(association_id, &release_ngap)
-                    .await?;
-                self.clear_up_active(amf_ue_ngap_id, psi);
-                log::info!("PDU Session Resource Release Command sent to gNB: PSI={psi}");
             }
             // PDU Session Release Complete (TS 24.501 Table 9.7.1: 0xD4; 0xD6 is 5GSM
             // STATUS). #582: relayed to the SMF (TS 23.502 §4.3.4.2 step 10), which
@@ -10664,7 +10663,7 @@ impl NgapServer {
             Err(crate::sbi_path::SmContextUpdateRefusal {
                 reason,
                 n1_sm_msg: Some(n1),
-            }) => {
+            }) if smf_n1_for_session(&n1, psi) => {
                 // #1590, TS 29.502 §5.2.2.3.1 step 2b / TS 24.501 §6.4.2.4.1: the SMF
                 // refused with its own N1 SM answer (its PDU SESSION MODIFICATION
                 // REJECT and 5GSM cause), which the AMF forwards. Before, the AMF
@@ -10673,10 +10672,14 @@ impl NgapServer {
                 self.send_n1_sm_to_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, psi, &n1)
                     .await?;
             }
-            Err(crate::sbi_path::SmContextUpdateRefusal {
-                reason,
-                n1_sm_msg: None,
-            }) => {
+            Err(crate::sbi_path::SmContextUpdateRefusal { reason, n1_sm_msg }) => {
+                if let Some(n1) = n1_sm_msg {
+                    log::warn!(
+                        "SMF refused the modification ({reason}) with an N1 that is not a 5GSM \
+                         message for PSI {psi} ({} bytes); not relayed",
+                        n1.len()
+                    );
+                }
                 log::warn!("SMF modification failed ({reason}), sending reject");
                 // #1546: PDU SESSION MODIFICATION REJECT (TS 24.501 §8.3.8, message type
                 // 0xCA, Table 9.7.2) with 5GSM cause #26 "insufficient resources"
@@ -10686,6 +10689,123 @@ impl NgapServer {
                 let reject = vec![0x2E, psi, pti, 0xCA, 0x1A];
                 self.send_n1_sm_to_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, psi, &reject)
                     .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// #1637: apply the SMF's answer to a UE-requested PDU Session Release.
+    ///
+    /// - Accepted (TS 24.501 §6.4.3.3, TS 23.502 §4.3.4.2 step 3): the SMF's PDU
+    ///   SESSION RELEASE COMMAND goes to the UE. With the SMF's N2 release transfer
+    ///   (an active user plane) it rides a PDU SESSION RESOURCE RELEASE COMMAND as
+    ///   its NAS-PDU, with the transfer as received (TS 38.413 §9.2.1.3); without
+    ///   one, in a DL NAS TRANSPORT.
+    /// - Refused with an N1 (§6.4.3.4, PDU SESSION RELEASE REJECT): relayed.
+    /// - Not answered (no SMF reached, or a refusal with no N1 for this session): the
+    ///   request goes back to the UE with 5GMM #90 "payload was not forwarded"
+    ///   (§5.4.5.3.1 case e)). The UE then releases the session locally and reports
+    ///   its PDU session status in a registration update (§6.4.3.5 d)).
+    ///
+    /// The session is not forgotten here: its context lives until the SMF reports
+    /// it RELEASED.
+    async fn apply_release_request_answer(
+        &mut self,
+        amf_ue_ngap_id: u64,
+        psi: u8,
+        request: &[u8],
+        result: Result<
+            crate::sbi_path::SmContextUpdateResponse,
+            crate::sbi_path::SmContextUpdateRefusal,
+        >,
+    ) -> Result<()> {
+        let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) else {
+            log::info!(
+                "PDU Session Release answer for UE {amf_ue_ngap_id} PSI {psi}: the UE is gone"
+            );
+            return Ok(());
+        };
+        if state.is_cm_idle() {
+            log::warn!(
+                "PDU Session Release answer for UE {amf_ue_ngap_id} PSI {psi}: the UE went \
+                 CM-IDLE meanwhile; nothing is sent (it retransmits on T3582)"
+            );
+            return Ok(());
+        }
+        let (association_id, ran_ue_ngap_id) = (state.association_id, state.ran_ue_ngap_id);
+        match result {
+            Ok(answer) if smf_n1_for_session(&answer.n1_sm_msg, psi) => {
+                let n1 = answer.n1_sm_msg;
+                if answer.n2_sm_info.is_empty() {
+                    self.send_n1_sm_to_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, psi, &n1)
+                        .await?;
+                    log::info!(
+                        "UE {amf_ue_ngap_id}: the SMF's PDU SESSION RELEASE COMMAND for PSI \
+                         {psi} sent (no user plane to release)"
+                    );
+                    return Ok(());
+                }
+                let plain = gmm_build::build_dl_nas_transport(
+                    Some(psi),
+                    payload_container_type::N1_SM_INFORMATION,
+                    &n1,
+                    None,
+                    None,
+                )
+                .unwrap_or_default();
+                let Some(nas_pdu) = self.protect_nas(amf_ue_ngap_id, &plain) else {
+                    log::warn!(
+                        "UE {amf_ue_ngap_id}: PDU SESSION RELEASE COMMAND for PSI {psi} not \
+                         sent: no NAS security context"
+                    );
+                    return Ok(());
+                };
+                let Some(cmd) =
+                    crate::ngap_asn1::build_pdu_session_resource_release_command_relayed(
+                        amf_ue_ngap_id,
+                        ran_ue_ngap_id,
+                        psi,
+                        &answer.n2_sm_info,
+                        Some(&nas_pdu),
+                    )
+                else {
+                    log::error!("UE {amf_ue_ngap_id}: release of PSI {psi} did not encode");
+                    return Ok(());
+                };
+                self.send_to_association(association_id, &cmd).await?;
+                self.clear_up_active(amf_ue_ngap_id, psi);
+                log::info!(
+                    "UE {amf_ue_ngap_id}: PDU Session Resource Release Command for PSI {psi} \
+                     sent with the SMF's RELEASE COMMAND"
+                );
+            }
+            Ok(answer) => {
+                log::warn!(
+                    "UE {amf_ue_ngap_id}: the SMF accepted the release of PSI {psi} without \
+                     a 5GSM answer for it ({} bytes); nothing is sent (the UE retransmits on \
+                     T3582)",
+                    answer.n1_sm_msg.len()
+                );
+            }
+            Err(crate::sbi_path::SmContextUpdateRefusal {
+                reason,
+                n1_sm_msg: Some(n1),
+            }) if smf_n1_for_session(&n1, psi) => {
+                log::warn!(
+                    "SMF refused the release of PSI {psi} ({reason}); relaying its N1 SM answer"
+                );
+                self.send_n1_sm_to_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, psi, &n1)
+                    .await?;
+            }
+            Err(crate::sbi_path::SmContextUpdateRefusal { reason, .. }) => {
+                self.answer_payload_not_forwarded(
+                    association_id,
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    request,
+                    &format!("for the PDU session release ({reason})"),
+                )
+                .await?;
             }
         }
         Ok(())
@@ -11435,8 +11555,8 @@ impl NgapServer {
     ) -> Result<()> {
         let psi = sm_pdu[1];
         log::warn!(
-            "UE {amf_ue_ngap_id}: PDU session establishment PSI={psi} not forwarded: no SMF \
-             reachable {why}; 5GMM #90 (TS 24.501 §5.4.5.3.1 e))"
+            "UE {amf_ue_ngap_id}: 5GSM message for PSI={psi} not forwarded: no SMF reachable \
+             {why}; 5GMM #90 (TS 24.501 §5.4.5.3.1 e))"
         );
         let plain = gmm_build::build_dl_nas_transport(
             Some(psi),
@@ -11663,6 +11783,15 @@ impl NgapServer {
                 result,
             } => {
                 self.apply_modification_answer(amf_ue_ngap_id, psi, pti, result)
+                    .await
+            }
+            SmfAnswer::ReleaseRequested {
+                amf_ue_ngap_id,
+                psi,
+                request,
+                result,
+            } => {
+                self.apply_release_request_answer(amf_ue_ngap_id, psi, &request, result)
                     .await
             }
             SmfAnswer::DownlinkActivation(a) => {
@@ -20883,6 +21012,13 @@ pub(crate) struct ServiceRequestSessionIes {
 /// The SMF an exchange for an existing session goes to (#669): the one holding its
 /// context, else the selected one. Resolving it can be an NRF lookup, so this runs
 /// inside the off-task exchange (#922), never on the NGAP task.
+/// Whether an N1 SM the SMF answered is a 5GSM message (EPD 0x2E, TS 24.501 §9.2)
+/// for PDU session `psi`, so the AMF may relay it to the UE for that session (#1637,
+/// #1590 review). A mismatched or foreign N1 is not relayed.
+fn smf_n1_for_session(n1: &[u8], psi: u8) -> bool {
+    n1.len() >= 4 && n1[0] == 0x2E && n1[1] == psi
+}
+
 async fn smf_or_selected(owner: Option<(String, u16)>) -> (String, u16) {
     match owner {
         Some(owner) => owner,

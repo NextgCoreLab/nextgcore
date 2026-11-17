@@ -248,6 +248,310 @@ async fn an_smf_modification_reject_is_relayed_to_the_ue_1590() {
     bare.stop().await.expect("stop");
 }
 
+/// What a release-answering stand-in SMF saw: the URI, the JSON body, and the
+/// `n1SmMsg` part.
+type ReleaseCall = (String, serde_json::Value, Vec<u8>);
+
+/// A stand-in SMF for a UE-requested PDU Session Release (#1637), answering each
+/// N1 by its SM context ref's prefix:
+/// - `rel-n2-*`: 200 with the PDU SESSION RELEASE COMMAND (`D3`, the request's PSI
+///   and PTI, #36) and N2 `transfer_for(ref)` as `PDU_RES_REL_CMD` (an active UP);
+/// - `rel-n1-*`: 200 with the command alone (no user plane to release);
+/// - `rel-rej-*`: 403 with a PDU SESSION RELEASE REJECT (`D2`, #43);
+/// - `rel-foreign-*`: 403 with a 5GSM message for another PSI.
+async fn release_answering_smf() -> (
+    nextgcore_sbi::server::SbiServer,
+    u16,
+    Arc<std::sync::Mutex<Vec<ReleaseCall>>>,
+) {
+    use base64::Engine as _;
+    use nextgcore_sbi::message::{SbiPart, SbiRequest as SReq, SbiResponse as SResp};
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let seen: Arc<std::sync::Mutex<Vec<ReleaseCall>>> = Arc::default();
+    let sink = Arc::clone(&seen);
+    let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let server = nextgcore_sbi::server::SbiServer::on_listener(
+        nextgcore_sbi::server::SbiServerConfig::new(addr),
+        listener,
+    );
+    server
+        .start(move |req: SReq| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let uri = req.header.uri.clone();
+                let body: serde_json::Value = req
+                    .http
+                    .content
+                    .as_deref()
+                    .and_then(|c| serde_json::from_str(c).ok())
+                    .unwrap_or_default();
+                let n1 = req
+                    .http
+                    .parts
+                    .iter()
+                    .find(|p| p.content_id.as_deref() == Some("n1SmMsg"))
+                    .map(|p| p.data.to_vec())
+                    .unwrap_or_default();
+                sink.lock()
+                    .expect("sink")
+                    .push((uri.clone(), body, n1.clone()));
+                let sm_ref = uri
+                    .split("/sm-contexts/")
+                    .nth(1)
+                    .and_then(|rest| rest.split('/').next())
+                    .unwrap_or_default()
+                    .to_string();
+                let (psi, pti) = (
+                    n1.get(1).copied().unwrap_or(0),
+                    n1.get(2).copied().unwrap_or(0),
+                );
+                let part = |bytes: Vec<u8>| {
+                    SbiPart::with_content(
+                        "n1SmMsg",
+                        nextgcore_sbi::constants::content_type::APPLICATION_5GNAS,
+                        bytes::Bytes::from(bytes),
+                    )
+                };
+                let command = vec![0x2E, psi, pti, 0xD3, 0x24];
+                if sm_ref.starts_with("rel-n2-") {
+                    let answer = serde_json::json!({
+                        "n1SmMsg": { "contentId": "n1SmMsg" },
+                        "n2SmInfoType": "PDU_RES_REL_CMD",
+                        "n2SmInfo": base64::engine::general_purpose::STANDARD
+                            .encode(transfer_for(&sm_ref)),
+                    });
+                    return SResp::with_status(200)
+                        .with_body(answer.to_string(), "application/json")
+                        .with_part(part(command));
+                }
+                if sm_ref.starts_with("rel-n1-") {
+                    let answer = serde_json::json!({ "n1SmMsg": { "contentId": "n1SmMsg" } });
+                    return SResp::with_status(200)
+                        .with_body(answer.to_string(), "application/json")
+                        .with_part(part(command));
+                }
+                let reject = if sm_ref.starts_with("rel-foreign-") {
+                    vec![0x2E, psi.wrapping_add(1), pti, 0xD2, 0x2B]
+                } else {
+                    vec![0x2E, psi, pti, 0xD2, 0x2B]
+                };
+                let answer = serde_json::json!({
+                    "error": { "status": 403, "cause": "INVALID_PDU_SESSION_ID" },
+                    "n1SmMsg": { "contentId": "n1SmMsg" },
+                });
+                SResp::with_status(403)
+                    .with_body(answer.to_string(), "application/json")
+                    .with_part(part(reject))
+            }
+        })
+        .await
+        .expect("stand-in SMF starts");
+    (server, addr.port(), seen)
+}
+
+/// The NAS-PDU and the `(psi, transfer)` items of a PDU SESSION RESOURCE RELEASE
+/// COMMAND, decoded with the generated codec.
+#[allow(clippy::type_complexity)]
+fn decoded_release_command_relayed(pdu: &[u8]) -> Option<(Option<Vec<u8>>, Vec<(u8, Vec<u8>)>)> {
+    use nextgcore_ngap_gen::generated as g;
+    let g::NGAP_PDU::InitiatingMessage(m) = nextgcore_ngap_gen::decode(pdu).ok()? else {
+        return None;
+    };
+    let g::InitiatingMessageValue::Id_PDUSessionResourceRelease(cmd) = m.value else {
+        return None;
+    };
+    let (mut nas, mut items) = (None, Vec::new());
+    for ie in cmd.protocol_i_es.0 {
+        use g::PDUSessionResourceReleaseCommandProtocolIEs_EntryValue as Ie;
+        match ie.value {
+            Ie::Id_NAS_PDU(n) => nas = Some(n.0),
+            Ie::Id_PDUSessionResourceToReleaseListRelCmd(list) => {
+                items = list
+                    .0
+                    .into_iter()
+                    .map(|i| {
+                        (
+                            i.pdu_session_id.0,
+                            i.pdu_session_resource_release_command_transfer.0,
+                        )
+                    })
+                    .collect()
+            }
+            _ => {}
+        }
+    }
+    Some((nas, items))
+}
+
+/// Send `ue` a UE-requested release of PSI 5 (PTI 7) held at `sm_ref` on `port`;
+/// return the raw NGAP the AMF sends the UE's gNB once the SMF has answered.
+async fn release_and_collect(
+    server: &mut NgapServer,
+    ue: u64,
+    ran: u32,
+    sm_ref: &str,
+    port: u16,
+) -> Vec<Vec<u8>> {
+    secured_registered_ue(server, ue, ran);
+    server.ue_auth_state.with_mut(ue, |s| {
+        s.amf_ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        s.amf_ue.nr_tai.tac = 0x1637;
+        s.amf_ue.nr_cgi.plmn_id = PlmnId::new("001", "01");
+        s.amf_ue.nr_cgi.cell_id = 0x0016_3701;
+    });
+    hold_session(server, ue, 5, sm_ref, port);
+    server.mark_up_active(ue, 5);
+    server
+        .handle_5gsm_message(ASSOC, ue, ran, &[0x2E, 0x05, 0x07, 0xD1], None)
+        .await
+        .expect("handled");
+    let mut raw = Vec::new();
+    for _ in 0..300 {
+        server.process_sbi_outcomes().await;
+        raw.extend(take_sent_ngap(server).into_iter().map(|(_, p)| p));
+        if !raw.is_empty() {
+            return raw;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("nothing sent for UE {ue} after 3 s");
+}
+
+/// #1637, TS 23.502 §4.3.4.2 steps 1a-3 / TS 24.501 §6.4.3.3: a UE's PDU SESSION
+/// RELEASE REQUEST goes to the SMF in an UpdateSMContext (the N1 as received, with
+/// the User Location Information). With an active user plane, the SMF's PDU SESSION
+/// RELEASE COMMAND rides a PDU SESSION RESOURCE RELEASE COMMAND as its NAS-PDU,
+/// with the SMF's N2 transfer as received (TS 38.413 §9.2.1.3). The session is kept
+/// until the SMF reports it RELEASED, so the UE's RELEASE COMPLETE still finds it.
+///
+/// REVERT-VERIFIED: with main's 0xD1 arm (the AMF's own release) back, the SMF
+/// gets no UpdateSMContext with the N1 (`left: 0`), and the UE gets the AMF's own
+/// RELEASE COMMAND #36 at once. All four #1637 tests fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ue_requested_release_is_the_smfs_to_answer_1637() {
+    let (_smf, port, calls) = release_answering_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (16_370_101u64, 163u32);
+    let raw = release_and_collect(&mut server, ue, ran, "rel-n2-1637", port).await;
+
+    let seen = calls.lock().expect("calls").clone();
+    assert_eq!(seen.len(), 1, "one SMF request: {seen:?}");
+    let (uri, body, n1) = &seen[0];
+    assert!(uri.ends_with("/sm-contexts/rel-n2-1637/modify"), "{uri}");
+    assert_eq!(
+        n1,
+        &vec![0x2E, 0x05, 0x07, 0xD1],
+        "the UE's request, as received"
+    );
+    assert_eq!(body["n1SmMsg"]["contentId"], "n1SmMsg");
+    assert_eq!(
+        body["ueLocation"]["nrLocation"]["tai"]["tac"], "001637",
+        "with the ULI: {body}"
+    );
+
+    let [pdu] = &raw[..] else {
+        panic!("one NGAP message: {raw:02x?}");
+    };
+    let (nas, items) = decoded_release_command_relayed(pdu).expect("a RELEASE COMMAND");
+    assert_eq!(
+        items,
+        vec![(5, transfer_for("rel-n2-1637"))],
+        "the SMF's transfer"
+    );
+    let nas = nas.expect("the NAS-PDU");
+    let command = [0x2E, 0x05, 0x07, 0xD3, 0x24];
+    assert!(
+        nas.windows(command.len()).any(|w| w == command),
+        "the SMF's RELEASE COMMAND, with the UE's PTI: {nas:02x?}"
+    );
+    assert!(!server.up_active.contains(&(ue, 5)));
+    assert!(
+        server.sm_context_refs.contains_key(&(ue, 5)),
+        "kept until the SMF reports RELEASED"
+    );
+    server.forget_ue(ue);
+}
+
+/// #1637: with no user plane to release (the SMF answers no N2, TS 23.502 §4.3.4.2
+/// step 3a), the SMF's RELEASE COMMAND goes in a DL NAS TRANSPORT.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_release_with_no_user_plane_relays_the_command_alone_1637() {
+    let (_smf, port, _calls) = release_answering_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (16_370_102u64, 164u32);
+    let raw = release_and_collect(&mut server, ue, ran, "rel-n1-1637", port).await;
+    let sent: Vec<Sent> = raw.iter().map(|p| decode_sent(p)).collect();
+    let [Sent::DownlinkNas { nas_pdu, .. }] = &sent[..] else {
+        panic!("one DL NAS TRANSPORT: {sent:?}");
+    };
+    let command = [0x2E, 0x05, 0x07, 0xD3, 0x24];
+    assert!(
+        nas_pdu.windows(command.len()).any(|w| w == command),
+        "{nas_pdu:02x?}"
+    );
+    server.forget_ue(ue);
+}
+
+/// #1637, TS 24.501 §6.4.3.4 and §5.4.5.3.1 case e): the SMF's PDU SESSION RELEASE
+/// REJECT is relayed. An SMF that cannot be reached, or that refuses with an N1 that
+/// is not a 5GSM message for this session (the #1590 review guard), has the request
+/// sent back with 5GMM #90 "payload was not forwarded", after which the UE releases
+/// locally (§6.4.3.5 d)).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_or_unreachable_release_is_answered_as_the_spec_says_1637() {
+    let (_smf, port, _calls) = release_answering_smf().await;
+    let down = nextgcore_sbi::test_support::down_port();
+    let request = [0x2E, 0x05, 0x07, 0xD1];
+    for (i, (sm_ref, port, want_reject)) in [
+        ("rel-rej-1637", port, true),
+        ("rel-foreign-1637", port, false),
+        ("rel-down-1637", down.port(), false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut server = capturing_ngap_server().await;
+        let (ue, ran) = (16_370_110u64 + i as u64, 170 + i as u32);
+        let raw = release_and_collect(&mut server, ue, ran, sm_ref, port).await;
+        let sent: Vec<Sent> = raw.iter().map(|p| decode_sent(p)).collect();
+        let [Sent::DownlinkNas { nas_pdu, .. }] = &sent[..] else {
+            panic!("{sm_ref}: one DL NAS TRANSPORT: {sent:?}");
+        };
+        if want_reject {
+            let reject = [0x2E, 0x05, 0x07, 0xD2, 0x2B];
+            assert!(
+                nas_pdu.windows(reject.len()).any(|w| w == reject),
+                "{sm_ref}: the SMF's RELEASE REJECT #43: {nas_pdu:02x?}"
+            );
+        } else {
+            use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+            let Ok(FiveGmmMessage::DlNasTransport(dl)) =
+                parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&nas_pdu[7..]))
+            else {
+                panic!("{sm_ref}: a DL NAS TRANSPORT: {nas_pdu:02x?}");
+            };
+            assert_eq!(dl.gmm_cause, Some(90), "{sm_ref}: #90");
+            assert_eq!(dl.payload_container.data.to_vec(), request.to_vec());
+        }
+        server.forget_ue(ue);
+    }
+}
+
+/// #1590 review guard: an SMF that refuses a UE-requested modification with an N1
+/// that is not a 5GSM message for this session does not have it relayed. The UE
+/// gets the AMF's own MODIFICATION REJECT #26.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_modification_refusal_for_another_session_is_not_relayed_1637() {
+    let (foreign, port) = refusing_smf(403, Some(vec![0x2E, 0x06, 0x07, 0xCA, 0x1D])).await;
+    let nas = modification_answer(16_370_120, 180, "mod-1637-foreign", port).await;
+    let own = [0x2E, 0x05, 0x07, 0xCA, 0x1A];
+    assert!(
+        nas.windows(own.len()).any(|w| w == own),
+        "the AMF's own #26: {nas:02x?}"
+    );
+    foreign.stop().await.expect("stop");
+}
+
 /// TS 23.502 §4.2.3.2, CM-CONNECTED: a Service Request re-activating a session at a
 /// blackholed SMF does not hold the NGAP task, and another UE's Service Request is
 /// served meanwhile. The Service Accept waits for the ACTIVATING's answer, since it
