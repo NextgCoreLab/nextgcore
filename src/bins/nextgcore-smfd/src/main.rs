@@ -262,13 +262,18 @@ tokio::task_local! {
 /// presents its token on each (TS 33.501 §13.4.1.1.2, TS 29.500 §6.7.3). A
 /// notification to the AMF (SmContextStatusNotify) is not one and carries none.
 ///
-/// With enforcement off this is a fresh client per call, as before #1648; with it
-/// on, the per-peer cached client of [`tokened_peer_client`].
+/// A fresh client per call, never cached (#1669 review M2): the AMF's authority
+/// comes from the session's `smContextStatusUri`, which the consumer supplies, so
+/// a per-authority cache would grow, with its connections, by whatever authorities
+/// an AMF names. The UDM and EASDF are discovered peers and use
+/// [`tokened_peer_client`].
 pub(crate) fn namf_client(
     config: nextgcore_sbi::client::SbiClientConfig,
-) -> Arc<nextgcore_sbi::client::SbiClient> {
-    tokened_peer_client(config.clone(), nextgcore_sbi::types::NfType::Amf)
-        .unwrap_or_else(|| Arc::new(nextgcore_sbi::client::SbiClient::new(config)))
+) -> nextgcore_sbi::client::SbiClient {
+    attach_oauth2(
+        nextgcore_sbi::client::SbiClient::new(config),
+        nextgcore_sbi::types::NfType::Amf,
+    )
 }
 
 /// What a [`tokened_peer_client`] is cached under: the target NF type, the peer
@@ -285,14 +290,27 @@ type TokenedPeerKey = (
     usize,
 );
 
-/// The cache behind [`tokened_peer_client`]. Bounded by the peers this SMF talks
-/// to (one entry per producer authority and NF type), like
-/// `global_context().get_client`'s.
+/// The cache behind [`tokened_peer_client`]. Bounded by the discovered peers
+/// (UDM, EASDF) this SMF talks to, one entry per producer authority and NF type,
+/// like `global_context().get_client`'s. Only discovered (NRF or configured)
+/// authorities may be passed in, never one a peer supplied (review M2).
 static TOKENED_PEER_CLIENTS: std::sync::LazyLock<
     std::sync::Mutex<
         std::collections::HashMap<TokenedPeerKey, Arc<nextgcore_sbi::client::SbiClient>>,
     >,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// The most clients [`TOKENED_PEER_CLIENTS`] holds (#1669 review M2). Past it,
+/// a client for a new peer is built uncached: it is used for its call and then
+/// dropped with its connections, so a long-running SMF that has seen many
+/// discovered peers (pod churn) still holds a bounded number of sockets.
+const TOKENED_PEER_CLIENTS_MAX: usize = 64;
+
+/// #1669 review M2: tests that depend on what [`TOKENED_PEER_CLIENTS`] holds take
+/// this lock (one lock per process-global, declared beside it).
+#[cfg(test)]
+pub(crate) static TOKENED_PEER_CLIENTS_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 /// #1648 review M1: the client for a service request to the `target` producer at
 /// `config`, carrying the NRF-issued token, or `None` when OAuth2 enforcement is
@@ -320,9 +338,15 @@ pub(crate) fn tokened_peer_client(
     let mut clients = TOKENED_PEER_CLIENTS
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    Some(Arc::clone(clients.entry(key).or_insert_with(|| {
-        Arc::new(nextgcore_sbi::client::SbiClient::new(config).with_oauth2(oauth2, target))
-    })))
+    if let Some(client) = clients.get(&key) {
+        return Some(Arc::clone(client));
+    }
+    let client =
+        Arc::new(nextgcore_sbi::client::SbiClient::new(config).with_oauth2(oauth2, target));
+    if clients.len() < TOKENED_PEER_CLIENTS_MAX {
+        clients.insert(key, Arc::clone(&client));
+    }
+    Some(client)
 }
 
 /// Attach the process-wide OAuth2 client (when enforcement is on) so the
@@ -16500,12 +16524,17 @@ mod tests {
         );
     }
 
-    /// #1648 review M1: with OAuth2 on, the tokened Nudm and Namf clients are
-    /// cached per peer, so successive calls share one connection (and, under
-    /// `production`, one mTLS session) while each still carries the token.
+    /// #1648 review M1: with OAuth2 on, the tokened Nudm client is cached per peer,
+    /// so successive calls share its pooled connections (and, under `production`,
+    /// their mTLS sessions) while each still carries the token.
+    ///
+    /// Review M2: the Namf client is NOT cached, because its authority is the one
+    /// the AMF supplied in `smContextStatusUri`: after tokened Namf calls the cache
+    /// holds no AMF entry, and each call still passes the OAuth2 gate.
     #[tokio::test]
-    async fn tokened_calls_reuse_pooled_connections_per_peer_1648() {
+    async fn tokened_udm_calls_reuse_pooled_connections_and_namf_is_not_cached_1648() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _cache = TOKENED_PEER_CLIENTS_TEST_LOCK.lock().await;
         let sk = p256::ecdsa::SigningKey::from_slice(&[20u8; 32]).expect("key");
         let (_nrf, nrf_port) = token_nrf_1648(sk.clone()).await;
         let (_udm, udm_port, udm_seen) = oauth2_producer_1648(
@@ -16521,17 +16550,23 @@ mod tests {
             })
             .await;
         let (udm_proxy, udm_accepted) = counting_proxy_1648(udm_port).await;
-        let (amf_proxy, amf_accepted) = counting_proxy_1648(amf_port).await;
+        // Two distinct authorities for the same AMF, as two sessions'
+        // `smContextStatusUri`s may name: neither may leave a cached client.
+        let (amf_proxy, _) = counting_proxy_1648(amf_port).await;
         std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
         std::env::set_var("UDM_SBI_PORT", udm_proxy.to_string());
         udm::set_for_test(true);
         let supi = "imsi-001010016480005";
-        let amf_uri = format!("http://127.0.0.1:{amf_proxy}");
+        let amf_uris = [
+            format!("http://127.0.0.1:{amf_port}"),
+            format!("http://127.0.0.1:{amf_proxy}"),
+        ];
         TEST_OAUTH2_CLIENT
             .scope(smf_oauth2_client_1648(nrf_port), async {
                 nudm_calls_1648(supi).await;
-                for _ in 0..REUSE_CALLS_1648 {
-                    send_n2_release_transfer(&amf_uri, supi, 1, &[0x00]).await;
+                for amf_uri in &amf_uris {
+                    send_n2_release_transfer(amf_uri, supi, 1, &[0x00]).await;
+                    send_n1_n2_release_transfer(amf_uri, supi, 1, &[0x2e], &[0x00]).await;
                 }
             })
             .await;
@@ -16546,19 +16581,84 @@ mod tests {
             bearer_requests_1648(&udm_seen, "PUT", "/smf-registrations/1"),
             1
         );
+        let connections = udm_accepted.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            connections <= pool_slots_1648(),
+            "{REUSE_CALLS_1648} tokened Nudm calls opened {connections} connections, past \
+             the {} of one reused client",
+            pool_slots_1648()
+        );
         assert_eq!(
             bearer_requests_1648(&amf_seen, "POST", "/n1-n2-messages"),
-            REUSE_CALLS_1648
+            4,
+            "the Namf calls still carry the token"
         );
-        for (peer, accepted) in [("Nudm", udm_accepted), ("Namf", amf_accepted)] {
-            let connections = accepted.load(std::sync::atomic::Ordering::SeqCst);
-            assert!(
-                connections <= pool_slots_1648(),
-                "{REUSE_CALLS_1648} tokened {peer} calls opened {connections} connections, \
-                 past the {} of one reused client",
-                pool_slots_1648()
-            );
-        }
+        assert!(
+            !TOKENED_PEER_CLIENTS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys()
+                .any(|key| key.0 == nextgcore_sbi::types::NfType::Amf),
+            "no Namf client is cached: its authority is peer-supplied"
+        );
+    }
+
+    /// #1669 review M2: the tokened-client cache stops growing at
+    /// [`TOKENED_PEER_CLIENTS_MAX`]. A client for one more peer is still returned,
+    /// tokened, but not cached; a cached peer is still served from the cache.
+    #[tokio::test]
+    async fn the_tokened_client_cache_is_capped_1648() {
+        let _cache = TOKENED_PEER_CLIENTS_TEST_LOCK.lock().await;
+        let oauth2 = smf_oauth2_client_1648(nextgcore_sbi::test_support::refused_port());
+        let mine = Arc::as_ptr(&oauth2) as usize;
+        let held = || {
+            TOKENED_PEER_CLIENTS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len()
+        };
+        TEST_OAUTH2_CLIENT
+            .scope(oauth2, async {
+                // Fill to the cap with distinct authorities (lazy clients: nothing
+                // is dialled).
+                let mut port = 20_000u16;
+                let first = tokened_peer_client(
+                    nextgcore_sbi::security::sbi_peer_client_config("127.0.0.1", port),
+                    nextgcore_sbi::types::NfType::Udm,
+                )
+                .expect("enforcement on");
+                while held() < TOKENED_PEER_CLIENTS_MAX {
+                    port += 1;
+                    let _ = tokened_peer_client(
+                        nextgcore_sbi::security::sbi_peer_client_config("127.0.0.1", port),
+                        nextgcore_sbi::types::NfType::Udm,
+                    );
+                }
+                let past = tokened_peer_client(
+                    nextgcore_sbi::security::sbi_peer_client_config("127.0.0.1", port + 1),
+                    nextgcore_sbi::types::NfType::Udm,
+                );
+                assert!(
+                    past.is_some(),
+                    "a peer past the cap still gets a tokened client"
+                );
+                assert_eq!(
+                    held(),
+                    TOKENED_PEER_CLIENTS_MAX,
+                    "the cache stops at its cap"
+                );
+                let again = tokened_peer_client(
+                    nextgcore_sbi::security::sbi_peer_client_config("127.0.0.1", 20_000),
+                    nextgcore_sbi::types::NfType::Udm,
+                )
+                .expect("enforcement on");
+                assert!(Arc::ptr_eq(&first, &again), "a cached peer is still reused");
+            })
+            .await;
+        TOKENED_PEER_CLIENTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|key, _| key.6 != mine);
     }
 
     /// #1648, found by the D443A `oauth2` arm: every Namf_Communication service
