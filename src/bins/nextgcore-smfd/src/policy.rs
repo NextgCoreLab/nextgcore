@@ -1463,6 +1463,7 @@ pub mod gsm_message_type {
     pub const ESTABLISHMENT_ACCEPT: u8 = 0xC2;
     pub const ESTABLISHMENT_REJECT: u8 = 0xC3;
     pub const MODIFICATION_REQUEST: u8 = 0xC9;
+    pub const MODIFICATION_REJECT: u8 = 0xCA;
     pub const MODIFICATION_COMMAND: u8 = 0xCB;
     #[allow(dead_code)]
     pub const RELEASE_REQUEST: u8 = 0xD1;
@@ -1962,6 +1963,20 @@ pub fn build_establishment_reject_ext(
     }
 
     msg
+}
+
+/// Build a PDU SESSION MODIFICATION REJECT (TS 24.501 §8.3.8, message type 0xCA,
+/// Table 9.7.2) echoing the UE's PSI and PTI, with 5GSM cause `cause_5gsm`
+/// (§6.4.2.4.1: the SMF sets it). No optional IE: this SMF sends no back-off timer
+/// on a modification reject.
+pub fn build_modification_reject(psi: u8, pti: u8, cause_5gsm: u8) -> Vec<u8> {
+    vec![
+        0x2E,
+        psi,
+        pti,
+        gsm_message_type::MODIFICATION_REJECT,
+        cause_5gsm,
+    ]
 }
 
 /// Build a PDU Session Modification Command echoing the UE's PTI and
