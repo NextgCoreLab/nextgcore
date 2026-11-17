@@ -3790,7 +3790,10 @@ async fn deliver_subscription_id_change(
 /// Take over a transferred event subscription and tell its consumer the new
 /// subscription ID (TS 29.518 §5.2.2.2.3.1, #397).
 ///
-/// Called from `handle_create_ue_context` for each entry of the transferred
+/// Called from `handle_create_ue_context` (the N2 handover target) and, #1699, from
+/// `NgapServer::fetch_ue_context_from_old_amf` (the UEContextTransfer response of an
+/// inter-AMF mobility registration, TS 23.502 §4.2.2.2.2 step 5), for each entry of
+/// the transferred
 /// `ueContext.eventSubscriptionList` (`TS29518_Namf_Communication.yaml:3050-3053`,
 /// items `ExtAmfEventSubscription` = `AmfEventSubscription` plus additional info,
 /// yaml:4049-4054). §5.2.2.2.3.1 requires the target AMF to *"create event
@@ -3806,7 +3809,7 @@ async fn deliver_subscription_id_change(
 ///
 /// Returns the number of subscriptions created, so the caller can log a count that
 /// reflects what happened rather than what was offered.
-fn take_over_transferred_event_subscriptions(
+pub(crate) fn take_over_transferred_event_subscriptions(
     ue_context_id: &str,
     supi: Option<&str>,
     ue_context: &Value,

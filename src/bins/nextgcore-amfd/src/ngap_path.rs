@@ -5051,11 +5051,29 @@ impl NgapServer {
             s.amf_ue.current_m_tmsi = Some(presented.tmsi);
         });
 
+        // #1699: the event subscriptions targeting the UE come over with its context
+        // (TS 29.518 §6.1.6.2.25, `eventSubscriptionList`, `29518-k00.txt:13606-13614`:
+        // "shall be present if available ... it shall indicate the event
+        // subscription(s) targeting the UE or the group the UE is part of"). This AMF
+        // creates them under new subscription IDs and tells each consumer that gave a
+        // `subsChangeNotifyUri` with SUBSCRIPTION_ID_CHANGE (or _ADDITION for a group
+        // one), as the N2 handover target's CreateUEContext does (#397), filters and
+        // areas included. Done once the SUPI is on the record, so the subscriptions
+        // match the UE they follow, and before the Registration Accept, whose
+        // CONNECTED report (#1645) they then hear. Before #1699 they were dropped: a
+        // consumer that followed the UE heard nothing more from this AMF.
+        let subscriptions = crate::namf_server::take_over_transferred_event_subscriptions(
+            &supi,
+            Some(&supi),
+            &transferred.ue_context,
+        );
+
         log::info!(
             "[{supi}] UE context transferred from the old AMF at {peer_host}:{peer_port}: \
-             {} PDU session(s) reported. The sessions are NOT re-established here -- moving the \
-             N3 tunnels is Nsmf_PDUSession_UpdateSMContext toward each SMF (TS 23.502 \
-             §4.2.2.2.2 step 21), which is the N2 relocation path and belongs to #74",
+             {} PDU session(s) reported, {subscriptions} event subscription(s) taken over. \
+             The sessions are NOT re-established here -- moving the N3 tunnels is \
+             Nsmf_PDUSession_UpdateSMContext toward each SMF (TS 23.502 §4.2.2.2.2 step \
+             21), which is the N2 relocation path and belongs to #74",
             transferred.pdu_session_ids.len()
         );
 
@@ -42198,6 +42216,156 @@ mod tests {
         ngap.ue_auth_state.remove(moved);
         ngap.ue_auth_state.remove(new_ue);
         peer.stop().await.expect("peer stop");
+    }
+
+    /// **#1699**, TS 29.518 §6.1.6.2.25 (`29518-k00.txt:13606-13614`): the
+    /// `eventSubscriptionList` of the UEContextTransfer answer is taken over at an
+    /// inter-AMF mobility registration (TS 23.502 §4.2.2.2.2 steps 4-5). A stand-in old
+    /// AMF hands over a CONNECTIVITY_STATE_REPORT subscription with a
+    /// `subsChangeNotifyUri`. A real sink first gets SUBSCRIPTION_ID_CHANGE carrying
+    /// the new subscription's URI (TS 29.518 §5.2.2.2.3.1, Table 6.2.6.2.5-1), then,
+    /// at the Registration Accept, the CONNECTED report (#1645) on the transferred
+    /// `eventNotifyUri` and `notifyCorrelationId`.
+    ///
+    /// REVERT-VERIFIED: without the takeover in `fetch_ue_context_from_old_amf`, no
+    /// SUBSCRIPTION_ID_CHANGE arrives and the CONNECTED report reaches no one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transferred_event_subscription_follows_the_ue_1699() {
+        use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _guamis = serve_only_local_guami();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let supi = "imsi-001010001699030";
+        let foreign = crate::context::Guti5gs {
+            amf_pointer: local_guami().amf_id.pointer + 1,
+            ..guti_from(&local_guami(), 0x1699_0301)
+        };
+        let (change_sink, change_port, mut change_rx) = notify_sink().await;
+        let (event_sink, event_port, mut event_rx) = notify_sink().await;
+        let transferred = serde_json::json!({ "ueContext": {
+            "supi": supi,
+            "mmContextList": [{ "accessType": "3GPP_ACCESS" }],
+            "eventSubscriptionList": [{
+                "eventList": [{ "type": "CONNECTIVITY_STATE_REPORT" }],
+                "eventNotifyUri": format!("http://127.0.0.1:{event_port}/notify/1699-evt"),
+                "notifyCorrelationId": "corr-1699",
+                "nfId": "3fa85f64-5717-4562-b3fc-2c963f661699",
+                "supi": supi,
+                "subsChangeNotifyUri":
+                    format!("http://127.0.0.1:{change_port}/notify/1699-subs-change"),
+                "subsChangeNotifyCorrelationId": "corr-1699-change",
+            }],
+        }});
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let peer_port = addr.port();
+        let peer = SbiServer::on_listener(
+            SbiServerConfig::new(format!("127.0.0.1:{peer_port}").parse().expect("addr")),
+            listener,
+        );
+        peer.start(move |req: SbiRequest| {
+            let transferred = transferred.clone();
+            async move {
+                if req.header.uri.contains("/transfer-update") {
+                    SbiResponse::ok()
+                        .with_json_body(&serde_json::json!({ "regStatusTransferComplete": true }))
+                        .expect("json")
+                } else {
+                    SbiResponse::ok()
+                        .with_json_body(&transferred)
+                        .expect("json")
+                }
+            }
+        })
+        .await
+        .expect("peer AMF start");
+        std::env::set_var("AMF_PEER_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("AMF_PEER_SBI_PORT", peer_port.to_string());
+
+        let mut ngap = capturing_ngap_server().await;
+        let id = 16_990_301u64;
+        let mut ue = UeNasContext::new(id, 55, 1, false);
+        ue.amf_ue.security_context_available = true;
+        ue.amf_ue.registration_type = crate::gmm_build::registration_type::MOBILITY_UPDATING;
+        ue.amf_ue.allowed_nssai = vec![crate::context::SNssai { sst: 1, sd: None }];
+        ue.amf_ue.old_guti = foreign.clone();
+        ngap.ue_auth_state.insert(id, ue);
+        let nas = registration_request_with_guti(
+            &foreign,
+            crate::gmm_build::registration_type::MOBILITY_UPDATING,
+        );
+        let identified = ngap
+            .resolve_registration_by_guti(
+                id,
+                &nas,
+                crate::gmm_build::registration_type::MOBILITY_UPDATING,
+            )
+            .await;
+        std::env::remove_var("AMF_PEER_SBI_ADDR");
+        std::env::remove_var("AMF_PEER_SBI_PORT");
+        assert!(identified, "the context came from the old AMF");
+
+        let body = tokio::time::timeout(Duration::from_secs(3), change_rx.recv())
+            .await
+            .expect("SUBSCRIPTION_ID_CHANGE to the subsChangeNotifyUri")
+            .expect("channel closed");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        let report = &v["reportList"][0];
+        assert_eq!(report["type"], "SUBSCRIPTION_ID_CHANGE", "{v}");
+        assert_eq!(report["supi"], supi);
+        assert_eq!(v["subsChangeNotifyCorrelationId"], "corr-1699-change");
+        let subscription_uri = report["subscriptionId"]
+            .as_str()
+            .expect("the new subscription's URI")
+            .to_string();
+        let subscription_id = subscription_uri
+            .rsplit('/')
+            .next()
+            .expect("an id")
+            .to_string();
+        let _subscription = crate::namf_server::EventSubscriptionGuard::id(&subscription_id);
+        let stored = crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .event_subscription_find(&subscription_id)
+            .expect("created here");
+        assert_eq!(stored.supi.as_deref(), Some(supi));
+        assert_eq!(
+            stored.event_types,
+            vec!["CONNECTIVITY_STATE_REPORT".to_string()]
+        );
+
+        ngap.send_registration_accept(1, id, 55)
+            .await
+            .expect("accepted");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let connected = loop {
+            let body = tokio::time::timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                event_rx.recv(),
+            )
+            .await
+            .expect("the CONNECTED report to the subscriber that followed the UE")
+            .expect("channel closed");
+            let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+            if v["reportList"][0]["type"] == "CONNECTIVITY_STATE_REPORT" {
+                break v;
+            }
+        };
+        assert_eq!(connected["notifyCorrelationId"], "corr-1699", "{connected}");
+        let report = &connected["reportList"][0];
+        assert_eq!(report["supi"], supi);
+        assert_eq!(
+            report["cmInfoList"][0]["cmState"], "CONNECTED",
+            "{connected}"
+        );
+
+        ngap.ue_auth_state.remove(id);
+        peer.stop().await.expect("peer stop");
+        change_sink.stop().await.expect("sink stop");
+        event_sink.stop().await.expect("sink stop");
     }
 
     /// The same foreign GUTI with NO old AMF reachable must fall back to the
