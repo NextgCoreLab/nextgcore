@@ -390,6 +390,8 @@ async fn apply_oauth2_enforcement(
             nf_instance_id,
             nextgcore_sbi::types::NfType::Amf,
         ))));
+        // #1667: the same client gives this NF's own NRF calls their access token.
+        nextgcore_sbi::nrf_tls::set_nrf_oauth2_client(OAUTH2_CLIENT.get().cloned().flatten());
     }
     log::info!(
         "OAuth2 enforcement enabled (JWKS: {})",

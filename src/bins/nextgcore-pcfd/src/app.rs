@@ -653,6 +653,8 @@ pub async fn run() -> Result<()> {
         require_oauth2,
         nrf_uri.as_deref(),
     ));
+    // #1667: the same client gives this NF's own NRF calls their access token.
+    nextgcore_sbi::nrf_tls::set_nrf_oauth2_client(OAUTH2_CLIENT.get().cloned().flatten());
     if require_oauth2 {
         sbi_server_config = apply_oauth2_enforcement(sbi_server_config).await;
     }
