@@ -7152,6 +7152,141 @@ mod tests {
         assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
     }
 
+    /// `body` with its `id_ie` replaced by one whose value is `short` (#1605).
+    fn with_short_id_1605(body: &[u8], id_ie: u16, short: &[u8]) -> Vec<u8> {
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(id_ie, short);
+        for ie in ParsedIe::parse_all(body) {
+            if ie.ie_type != id_ie {
+                b.add_tlv(ie.ie_type, &ie.value);
+            }
+        }
+        b.build()
+    }
+
+    /// Every too-short value of a rule ID IE of `full` octets: 0 to `full - 1`
+    /// octets, each a non-zero byte so a truncated read could not pass as id 0.
+    fn short_ids_1605(full: usize) -> Vec<Vec<u8>> {
+        (0..full).map(|n| vec![0x01; n]).collect()
+    }
+
+    /// **#1605, Session Establishment.** A Create PDR whose PDR ID is shorter
+    /// than 2 octets (TS 29.244 §8.2.36), or a Create FAR or Create URR whose
+    /// FAR ID or URR ID is shorter than 4 octets (§8.2.74, §8.2.54), carries a
+    /// semantically invalid value: the request is refused with "Mandatory IE
+    /// incorrect" and the grouped IE as the Offending IE (§7.6.8), as a short
+    /// QER ID already is. It used to be accepted with the rule installed as
+    /// rule 0. No session is created.
+    #[tokio::test]
+    async fn an_establishment_rule_with_a_short_id_is_mandatory_ie_incorrect_1605() {
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        let pdr = pdr_body(1, 100, 1, 1, 1);
+        let far = far_body(1, 0x02);
+        let urr = urr_body(1, None, Some(10), None);
+        let mut cases: Vec<(Vec<u8>, Vec<u8>, Vec<(u16, Vec<u8>)>, u16)> = Vec::new();
+        for short in short_ids_1605(2) {
+            cases.push((
+                with_short_id_1605(&pdr, pfcp_ie::PDR_ID, &short),
+                far.clone(),
+                vec![(pfcp_ie::CREATE_URR, urr.clone())],
+                pfcp_ie::CREATE_PDR,
+            ));
+        }
+        for short in short_ids_1605(4) {
+            cases.push((
+                pdr.clone(),
+                with_short_id_1605(&far, pfcp_ie::FAR_ID, &short),
+                vec![(pfcp_ie::CREATE_URR, urr.clone())],
+                pfcp_ie::CREATE_FAR,
+            ));
+            cases.push((
+                pdr.clone(),
+                far.clone(),
+                vec![(
+                    pfcp_ie::CREATE_URR,
+                    with_short_id_1605(&urr, pfcp_ie::URR_ID, &short),
+                )],
+                pfcp_ie::CREATE_URR,
+            ));
+        }
+        for (seid, (pdr, far, extra, grouped)) in (0x1605_0000u64..).zip(cases) {
+            let resp = establish_1598(&smf, addr, seid, &pdr, &far, &extra).await;
+            assert_eq!(
+                cause_and_offending_1598(&resp),
+                (PfcpCause::MandatoryIeIncorrect as u8, Some(grouped)),
+                "IE {grouped} with a short rule ID (seid {seid:#x})"
+            );
+            assert!(
+                server.sessions.read().await.is_empty(),
+                "a rejected establishment creates no session (IE {grouped})"
+            );
+        }
+        // The same message with full-length IDs is accepted.
+        let resp = establish_1598(
+            &smf,
+            addr,
+            0x1605_ffff,
+            &pdr,
+            &far,
+            &[(pfcp_ie::CREATE_URR, urr.clone())],
+        )
+        .await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+    }
+
+    /// **#1605, Session Modification.** A Create or Update PDR, FAR or URR with
+    /// a too-short rule ID is refused with "Mandatory IE incorrect" naming the
+    /// grouped IE (TS 29.244 §7.6.8), and the session gains no rule 0. It used
+    /// to be accepted, the Create installing rule 0 and the Update rewriting
+    /// whatever rule 0 was.
+    #[tokio::test]
+    async fn a_modification_rule_with_a_short_id_is_mandatory_ie_incorrect_1605() {
+        let (server, smf, addr, _rx, _dp, upf_seid) = established_session().await;
+        let mut cases: Vec<(u16, Vec<u8>)> = Vec::new();
+        for short in short_ids_1605(2) {
+            for grouped in [pfcp_ie::CREATE_PDR, pfcp_ie::UPDATE_PDR] {
+                let body = pdr_body(7, 50, 1, 1, 1);
+                cases.push((grouped, with_short_id_1605(&body, pfcp_ie::PDR_ID, &short)));
+            }
+        }
+        for short in short_ids_1605(4) {
+            for grouped in [pfcp_ie::CREATE_FAR, pfcp_ie::UPDATE_FAR] {
+                let body = far_body(7, 0x02);
+                cases.push((grouped, with_short_id_1605(&body, pfcp_ie::FAR_ID, &short)));
+            }
+            for grouped in [pfcp_ie::CREATE_URR, pfcp_ie::UPDATE_URR] {
+                let body = urr_body(7, None, Some(10), None);
+                cases.push((grouped, with_short_id_1605(&body, pfcp_ie::URR_ID, &short)));
+            }
+        }
+        for (seq, (grouped, body)) in (10u32..).zip(cases) {
+            let mut b = crate::n4_build::PfcpMessageBuilder::new();
+            b.add_tlv(grouped, &body);
+            let resp = exchange(
+                &smf,
+                addr,
+                &encode_pfcp(52, Some(upf_seid), seq, &b.build()),
+            )
+            .await;
+            assert_eq!(
+                cause_and_offending_1598(&resp),
+                (PfcpCause::MandatoryIeIncorrect as u8, Some(grouped)),
+                "IE {grouped} with a short rule ID (seq {seq})"
+            );
+            let sessions = server.sessions.read().await;
+            let rules = &sessions.get(&upf_seid).expect("session kept").rules;
+            assert_eq!(
+                (
+                    rules.pdr_ids.iter().copied().collect::<Vec<_>>(),
+                    rules.far_ids.iter().copied().collect::<Vec<_>>(),
+                    rules.urr_ids.iter().copied().collect::<Vec<_>>(),
+                ),
+                (vec![1], vec![1], vec![1]),
+                "the refused IE {grouped} added or changed no rule"
+            );
+        }
+    }
+
     /// The Usage Report Trigger octets carried by each Usage Report in a Session
     /// Report Request (#80, TS 29.244 §8.2.19).
     ///

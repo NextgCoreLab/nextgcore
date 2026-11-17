@@ -1325,14 +1325,16 @@ pub fn parse_create_pdr(data: &[u8]) -> Result<ParsedCreatePdr, &'static str> {
     let ies = ParsedIe::parse_all(data);
     let mut pdr = ParsedCreatePdr::default();
 
-    // PDR ID (mandatory)
-    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::PDR_ID) {
-        if ie.value.len() >= 2 {
-            pdr.pdr_id = u16::from_be_bytes([ie.value[0], ie.value[1]]);
-        }
-    } else {
-        return Err("PDR ID missing");
-    }
+    // PDR ID (mandatory, §8.2.36: 2 octets). A present but shorter ID is a
+    // semantically invalid value (§7.6.8), refused like a short QER ID; it used
+    // to install the rule as PDR 0 (#1605).
+    let ie = ParsedIe::find_ie(&ies, pfcp_ie::PDR_ID).ok_or("PDR ID missing")?;
+    let id: [u8; 2] = ie
+        .value
+        .get(..2)
+        .and_then(|v| v.try_into().ok())
+        .ok_or("PDR ID shorter than 2 octets")?;
+    pdr.pdr_id = u16::from_be_bytes(id);
 
     // Precedence (mandatory)
     if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::PRECEDENCE) {
@@ -1475,14 +1477,15 @@ pub fn parse_create_far(data: &[u8]) -> Result<ParsedCreateFar, &'static str> {
     let ies = ParsedIe::parse_all(data);
     let mut far = ParsedCreateFar::default();
 
-    // FAR ID (mandatory)
-    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::FAR_ID) {
-        if ie.value.len() >= 4 {
-            far.far_id = u32::from_be_bytes([ie.value[0], ie.value[1], ie.value[2], ie.value[3]]);
-        }
-    } else {
-        return Err("FAR ID missing");
-    }
+    // FAR ID (mandatory, §8.2.74: 4 octets). A shorter one is refused, not read
+    // as FAR 0 (#1605, §7.6.8).
+    let ie = ParsedIe::find_ie(&ies, pfcp_ie::FAR_ID).ok_or("FAR ID missing")?;
+    let id: [u8; 4] = ie
+        .value
+        .get(..4)
+        .and_then(|v| v.try_into().ok())
+        .ok_or("FAR ID shorter than 4 octets")?;
+    far.far_id = u32::from_be_bytes(id);
 
     // Apply Action (mandatory; TS 29.244 §8.2.26). Octet 5 (DROP, FORW, BUFF, NOCP,
     // DUPL, ...) comes first, octet 6 (EDRT, BDPN, DDPN, ...) second; the library's
@@ -1691,14 +1694,15 @@ pub fn parse_create_urr(data: &[u8]) -> Result<ParsedCreateUrr, &'static str> {
     let ies = ParsedIe::parse_all(data);
     let mut urr = ParsedCreateUrr::default();
 
-    // URR ID (mandatory)
-    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::URR_ID) {
-        if ie.value.len() >= 4 {
-            urr.urr_id = u32::from_be_bytes([ie.value[0], ie.value[1], ie.value[2], ie.value[3]]);
-        }
-    } else {
-        return Err("URR ID missing");
-    }
+    // URR ID (mandatory, §8.2.54: 4 octets). A shorter one is refused, not read
+    // as URR 0 (#1605, §7.6.8).
+    let ie = ParsedIe::find_ie(&ies, pfcp_ie::URR_ID).ok_or("URR ID missing")?;
+    let id: [u8; 4] = ie
+        .value
+        .get(..4)
+        .and_then(|v| v.try_into().ok())
+        .ok_or("URR ID shorter than 4 octets")?;
+    urr.urr_id = u32::from_be_bytes(id);
 
     // Measurement Method (IE type 62)
     if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::MEASUREMENT_METHOD) {

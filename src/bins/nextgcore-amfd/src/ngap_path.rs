@@ -1415,8 +1415,9 @@ pub(crate) enum SmfAnswer {
         amf_ue_ngap_id: u64,
         psi: u8,
         pti: u8,
-        /// The N1 and the N2 SM information the SMF answered, or why it did not.
-        result: Result<(Vec<u8>, Vec<u8>), String>,
+        /// The N1 and the N2 SM information the SMF answered, or why it did not
+        /// (with the N1 of its refusal, if any, #1590).
+        result: Result<(Vec<u8>, Vec<u8>), crate::sbi_path::SmContextUpdateRefusal>,
     },
     /// #778: the ACTIVATING for a queued downlink setup of a CM-CONNECTED UE.
     DownlinkActivation(Box<DownlinkActivation>),
@@ -10348,8 +10349,7 @@ impl NgapServer {
                             &n1,
                         )
                         .await
-                        .map(|resp| (resp.n1_sm_msg, resp.n2_sm_info))
-                        .map_err(|e| e.to_string());
+                        .map(|resp| (resp.n1_sm_msg, resp.n2_sm_info));
                         Some(crate::sbi_offload::SbiOutcome::Smf(
                             SmfAnswer::Modification {
                                 amf_ue_ngap_id,
@@ -10630,7 +10630,7 @@ impl NgapServer {
         amf_ue_ngap_id: u64,
         psi: u8,
         pti: u8,
-        result: Result<(Vec<u8>, Vec<u8>), String>,
+        result: Result<(Vec<u8>, Vec<u8>), crate::sbi_path::SmContextUpdateRefusal>,
     ) -> Result<()> {
         let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) else {
             log::info!(
@@ -10675,8 +10675,23 @@ impl NgapServer {
                     log::info!("PDU Session Resource Modify Request sent to gNB: PSI={psi}");
                 }
             }
-            Err(e) => {
-                log::warn!("SMF modification failed ({e}), sending reject");
+            Err(crate::sbi_path::SmContextUpdateRefusal {
+                reason,
+                n1_sm_msg: Some(n1),
+            }) => {
+                // #1590, TS 29.502 §5.2.2.3.1 step 2b / TS 24.501 §6.4.2.4.1: the SMF
+                // refused with its own N1 SM answer (its PDU SESSION MODIFICATION
+                // REJECT and 5GSM cause), which the AMF forwards. Before, the AMF
+                // dropped it and answered #26 itself.
+                log::warn!("SMF refused the modification ({reason}); relaying its N1 SM answer");
+                self.send_n1_sm_to_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, psi, &n1)
+                    .await?;
+            }
+            Err(crate::sbi_path::SmContextUpdateRefusal {
+                reason,
+                n1_sm_msg: None,
+            }) => {
+                log::warn!("SMF modification failed ({reason}), sending reject");
                 // #1546: PDU SESSION MODIFICATION REJECT (TS 24.501 §8.3.8, message type
                 // 0xCA, Table 9.7.2) with 5GSM cause #26 "insufficient resources"
                 // (§6.4.2.4.1). Before, the type was 0xCC, PDU SESSION MODIFICATION
@@ -36555,6 +36570,8 @@ mod tests {
         let (count_sink, count_port, mut count_rx) = notify_sink().await;
         let tai =
             |tac: &str| serde_json::json!({ "plmnId": {"mcc": "001", "mnc": "01"}, "tac": tac });
+        // #1614: the any-UE count subscription outlives the test unless removed.
+        let mut subscriptions = Vec::new();
         for (body, what) in [
             (
                 serde_json::json!({
@@ -36596,6 +36613,7 @@ mod tests {
             )
             .await;
             assert_eq!(resp.status, 201, "the {what} subscription is created");
+            subscriptions.push(crate::namf_server::EventSubscriptionGuard::of(&resp));
         }
         async fn next(rx: &mut mpsc::Receiver<String>, what: &str) -> serde_json::Value {
             let body = tokio::time::timeout(Duration::from_secs(3), rx.recv())
@@ -36677,6 +36695,7 @@ mod tests {
             }
         }
         ngap.ue_auth_state.remove(amf_ue_ngap_id);
+        drop(subscriptions);
         aoi_sink.stop().await.expect("sink stop");
         count_sink.stop().await.expect("sink stop");
     }
@@ -36864,6 +36883,8 @@ mod tests {
         let (count_sink, count_port, mut count_rx) = notify_sink().await;
         let tai =
             |tac: &str| serde_json::json!({ "plmnId": {"mcc": "001", "mnc": "01"}, "tac": tac });
+        // #1614: the any-UE count subscription outlives the test unless removed.
+        let mut subscriptions = Vec::new();
         for (body, what) in [
             (
                 serde_json::json!({
@@ -36905,6 +36926,7 @@ mod tests {
             )
             .await;
             assert_eq!(resp.status, 201, "the {what} subscription is created");
+            subscriptions.push(crate::namf_server::EventSubscriptionGuard::of(&resp));
         }
         async fn next(rx: &mut mpsc::Receiver<String>, what: &str) -> serde_json::Value {
             let body = tokio::time::timeout(Duration::from_secs(3), rx.recv())
@@ -36972,6 +36994,7 @@ mod tests {
             }
         }
         ngap.ue_auth_state.remove(new_id);
+        drop(subscriptions);
         aoi_sink.stop().await.expect("sink stop");
         count_sink.stop().await.expect("sink stop");
     }
