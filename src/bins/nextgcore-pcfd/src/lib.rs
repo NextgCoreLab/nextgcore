@@ -95,10 +95,24 @@ pub mod test_support {
     /// run serially (the PCF context is process-global; parallel tests race).
     pub static CONTEXT_GUARD: Mutex<()> = Mutex::new(());
 
-    /// Initialize the process-global PCF context for in-process strict-peer
-    /// tests (wraps [`crate::context::pcf_context_init`] with test capacities).
+    /// The UE and session capacity every test initializes the process-global PCF
+    /// context with (#1714).
+    ///
+    /// `PcfContext::init` is first-call-wins and no test finalizes the context, so
+    /// its capacity holds for the whole test binary and every UE a test creates
+    /// stays. At 64, the lib run under `demo-d441a-congestion-loop` (whose tests
+    /// add UEs) filled `max_num_of_ue`, and whichever tests ran last had their SM
+    /// policy creates refused (400 `CREATION_FAILED`). Finalizing between tests is
+    /// not safe: not every test that touches the context holds [`CONTEXT_GUARD`].
+    /// The capacity limits are tested on their own `PcfContext` instances
+    /// (`context::tests`), so the global needs only to be large enough never to
+    /// bind.
+    pub const TEST_CAPACITY: usize = 4096;
+
+    /// Initialize the process-global PCF context for tests, with
+    /// [`TEST_CAPACITY`] (wraps [`crate::context::pcf_context_init`]).
     pub fn init_context() {
-        crate::context::pcf_context_init(64, 64);
+        crate::context::pcf_context_init(TEST_CAPACITY, TEST_CAPACITY);
     }
 
     /// Point the process-global NRF URI at a test's mock, dropping every cached SBI
