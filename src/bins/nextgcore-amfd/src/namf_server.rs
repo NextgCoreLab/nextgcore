@@ -2095,6 +2095,7 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
         reachability_filter,
         reported_reachability: std::collections::HashMap::new(),
         reported_connectivity: std::collections::HashMap::new(),
+        taken_over: false,
         reporting_threshold,
         location_filters,
     };
@@ -3961,6 +3962,7 @@ pub(crate) fn take_over_transferred_event_subscriptions(
                 }),
             reported_reachability: std::collections::HashMap::new(),
             reported_connectivity: std::collections::HashMap::new(),
+            taken_over: true,
             reporting_threshold: entry.get("eventList").and_then(Value::as_array).and_then(
                 |events| {
                     events
@@ -8360,6 +8362,7 @@ mod tests {
             reachability_filter: None,
             reported_reachability: std::collections::HashMap::new(),
             reported_connectivity: std::collections::HashMap::new(),
+            taken_over: false,
             reporting_threshold: None,
             location_filters: Vec::new(),
         };
@@ -15771,6 +15774,7 @@ mod tests {
             reachability_filter: None,
             reported_reachability: std::collections::HashMap::new(),
             reported_connectivity: std::collections::HashMap::new(),
+            taken_over: false,
             reporting_threshold: None,
             location_filters: Vec::new(),
         };

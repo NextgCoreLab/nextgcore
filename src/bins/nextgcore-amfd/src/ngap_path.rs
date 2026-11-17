@@ -37501,6 +37501,7 @@ mod tests {
             reachability_filter: None,
             reported_reachability: std::collections::HashMap::new(),
             reported_connectivity: std::collections::HashMap::new(),
+            taken_over: false,
             reporting_threshold: None,
             location_filters: f.iter().map(|s| s.to_string()).collect(),
         };
@@ -38954,6 +38955,7 @@ mod tests {
             reachability_filter: None,
             reported_reachability: std::collections::HashMap::new(),
             reported_connectivity: std::collections::HashMap::new(),
+            taken_over: false,
             reporting_threshold: None,
             location_filters: Vec::new(),
         };
@@ -43003,6 +43005,7 @@ mod tests {
                 reachability_filter: None,
                 reported_reachability: std::collections::HashMap::new(),
                 reported_connectivity: std::collections::HashMap::new(),
+                taken_over: false,
                 reporting_threshold: None,
                 location_filters: Vec::new(),
             });
@@ -43133,6 +43136,7 @@ mod tests {
                 reachability_filter: None,
                 reported_reachability: std::collections::HashMap::new(),
                 reported_connectivity: std::collections::HashMap::new(),
+                taken_over: false,
                 reporting_threshold: None,
                 location_filters: Vec::new(),
             });
