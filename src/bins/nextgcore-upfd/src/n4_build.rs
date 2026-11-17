@@ -1375,10 +1375,11 @@ pub fn parse_create_pdr(data: &[u8]) -> Result<ParsedCreatePdr, &'static str> {
         pdr.urr_ids
             .push(be_u32(ie, "URR ID shorter than 4 octets")?);
     }
-    // Only the first QER ID is kept, but every one present is checked.
+    // Every QER ID (Table 7.5.2.2-1: "a list of QERs to be associated to the
+    // PDR"); only the first used to be kept (#1672).
     for ie in ParsedIe::find_all_ies(&ies, pfcp_ie::QER_ID) {
-        let id = be_u32(ie, "QER ID shorter than 4 octets")?;
-        pdr.qer_id.get_or_insert(id);
+        pdr.qer_ids
+            .push(be_u32(ie, "QER ID shorter than 4 octets")?);
     }
 
     Ok(pdr)
@@ -1401,8 +1402,8 @@ pub struct ParsedUpdatePdr {
     pub pdi: Option<ParsedPdi>,
     /// `Some(None)`: removed (null length).
     pub outer_header_removal: Option<Option<u8>>,
-    /// `Some(None)`: removed (null length).
-    pub far_id: Option<Option<u32>>,
+    /// Never removed: a null FAR ID is refused (#1672, see [`parse_update_pdr`]).
+    pub far_id: Option<u32>,
     /// The new list; empty when a null URR ID removed them all.
     pub urr_ids: Option<Vec<u32>>,
     /// The new list; empty when a null QER ID removed them all.
@@ -1462,11 +1463,17 @@ pub fn parse_update_pdr(data: &[u8]) -> Result<ParsedUpdatePdr, &'static str> {
         pdr.outer_header_removal = Some(ie.value.first().copied());
     }
     if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::FAR_ID) {
-        pdr.far_id = Some(if ie.value.is_empty() {
-            None
-        } else {
-            Some(be_u32(ie, "FAR ID shorter than 4 octets")?)
-        });
+        // Not removable (#1672): Table 7.5.2.2-1 makes the FAR ID mandatory in
+        // a PDR unless Activate Predefined Rules supplies a FAR or a MAR ID is
+        // present, and upfd supports neither. A PDR left without one has no
+        // forwarding rule at all, so a null FAR ID asks for a PDR the table does
+        // not allow: a semantically invalid value (§7.6.8), as a null
+        // Precedence is. §5.6.3's null-length removal names only the URR and
+        // QER IDs for an Update PDR.
+        if ie.value.is_empty() {
+            return Err("FAR ID is null: a PDR cannot be left without a FAR");
+        }
+        pdr.far_id = Some(be_u32(ie, "FAR ID shorter than 4 octets")?);
     }
     pdr.urr_ids = update_id_list(&ies, pfcp_ie::URR_ID, "URR ID shorter than 4 octets")?;
     pdr.qer_ids = update_id_list(&ies, pfcp_ie::QER_ID, "QER ID shorter than 4 octets")?;
@@ -1483,7 +1490,8 @@ pub struct ParsedCreatePdr {
     pub outer_header_removal: Option<u8>,
     pub far_id: Option<u32>,
     pub urr_ids: Vec<u32>,
-    pub qer_id: Option<u32>,
+    /// Every QER the PDR lists, in order (#1672).
+    pub qer_ids: Vec<u32>,
 }
 
 /// Parsed PDI (Packet Detection Information)

@@ -1099,7 +1099,7 @@ fn data_plane_pdr_from_parsed(p: &crate::n4_build::ParsedCreatePdr) -> data_plan
         precedence: p.precedence,
         source_interface: p.pdi.source_interface,
         far_id: p.far_id,
-        qer_id: p.qer_id,
+        qer_ids: p.qer_ids.clone(),
         urr_ids: p.urr_ids.clone(),
         outer_header_removal: p.outer_header_removal,
         sdf_rule,
@@ -1110,7 +1110,8 @@ fn data_plane_pdr_from_parsed(p: &crate::n4_build::ParsedCreatePdr) -> data_plan
 /// Merge an Update PDR into the PDR the data plane holds (#1673, TS 29.244
 /// §5.6.3 and Table 7.5.4.2-1): an IE the update does not carry keeps its value,
 /// a present one replaces it (a PDI whole, with its SDF filter and QFI), and a
-/// null-length FAR ID, URR ID, QER ID or Outer Header Removal removes it.
+/// null-length URR ID, QER ID or Outer Header Removal removes it (a null FAR ID
+/// is refused at parse, #1672).
 fn apply_update_pdr(pdr: &mut data_plane::DataPlanePdr, u: &crate::n4_build::ParsedUpdatePdr) {
     if let Some(precedence) = u.precedence {
         pdr.precedence = precedence;
@@ -1129,14 +1130,13 @@ fn apply_update_pdr(pdr: &mut data_plane::DataPlanePdr, u: &crate::n4_build::Par
         pdr.outer_header_removal = ohr;
     }
     if let Some(far_id) = u.far_id {
-        pdr.far_id = far_id;
+        pdr.far_id = Some(far_id);
     }
     if let Some(urr_ids) = &u.urr_ids {
         pdr.urr_ids = urr_ids.clone();
     }
     if let Some(qer_ids) = &u.qer_ids {
-        // One QER per PDR in the data plane until #1672.
-        pdr.qer_id = qer_ids.first().copied();
+        pdr.qer_ids = qer_ids.clone();
     }
 }
 
@@ -1737,7 +1737,7 @@ mod tests {
             outer_header_removal: (source == 0).then_some(0),
             far_id: Some(far_id),
             urr_ids: Vec::new(),
-            qer_id: None,
+            qer_ids: Vec::new(),
         }
     }
 

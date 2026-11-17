@@ -770,7 +770,9 @@ pub struct DataPlanePdr {
     pub precedence: u32,
     pub source_interface: u8,
     pub far_id: Option<u32>,
-    pub qer_id: Option<u32>,
+    /// Every QER associated to the PDR (TS 29.244 Table 7.5.2.2-1); all are
+    /// enforced (#1672).
+    pub qer_ids: Vec<u32>,
     pub urr_ids: Vec<u32>,
     pub outer_header_removal: Option<u8>,
     /// Compiled SDF filter rule for 5-tuple matching (None = match all)
@@ -778,6 +780,16 @@ pub struct DataPlanePdr {
     /// QFI from the PDI (TS 29.244 8.2.89) — when set, an uplink G-PDU must
     /// carry the same QFI in its PDU Session Container to match this PDR
     pub qfi: Option<u8>,
+}
+
+/// The marking a PDR's QERs give a packet (#1672): see
+/// [`DataPlaneSession::qer_marking`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct QerMarking {
+    pub dscp: Option<u8>,
+    pub qfi: Option<u8>,
+    pub rqi: bool,
+    pub ppi: Option<u8>,
 }
 
 /// Lightweight FAR for fast-path forwarding in the data plane
@@ -2840,11 +2852,11 @@ impl PacketTuple {
 
 impl DataPlaneSession {
     /// Find the best matching PDR for a packet direction with optional 5-tuple matching
-    /// Returns (far_id, qer_id, urr_ids, outer_header_removal)
+    /// Returns (far_id, qer_ids, urr_ids, outer_header_removal)
     pub fn match_pdr(
         &self,
         source_interface: u8,
-    ) -> Option<(Option<u32>, Option<u32>, Vec<u32>, Option<u8>)> {
+    ) -> Option<(Option<u32>, Vec<u32>, Vec<u32>, Option<u8>)> {
         self.match_pdr_with_packet(source_interface, None, None)
     }
 
@@ -2858,7 +2870,7 @@ impl DataPlaneSession {
         source_interface: u8,
         packet: Option<&PacketTuple>,
         pkt_qfi: Option<u8>,
-    ) -> Option<(Option<u32>, Option<u32>, Vec<u32>, Option<u8>)> {
+    ) -> Option<(Option<u32>, Vec<u32>, Vec<u32>, Option<u8>)> {
         self.match_pdr_where(source_interface, packet, pkt_qfi, |_| true)
     }
 
@@ -2873,7 +2885,7 @@ impl DataPlaneSession {
         teid: u32,
         packet: Option<&PacketTuple>,
         pkt_qfi: Option<u8>,
-    ) -> Option<(Option<u32>, Option<u32>, Vec<u32>, Option<u8>)> {
+    ) -> Option<(Option<u32>, Vec<u32>, Vec<u32>, Option<u8>)> {
         let tunnels = self.pdr_teids.read().unwrap().clone();
         self.match_pdr_where(SRC_INTF_ACCESS, packet, pkt_qfi, |p| {
             tunnels.get(&p.pdr_id) == Some(&teid)
@@ -2891,7 +2903,7 @@ impl DataPlaneSession {
         packet: Option<&PacketTuple>,
         pkt_qfi: Option<u8>,
         eligible: impl Fn(&DataPlanePdr) -> bool,
-    ) -> Option<(Option<u32>, Option<u32>, Vec<u32>, Option<u8>)> {
+    ) -> Option<(Option<u32>, Vec<u32>, Vec<u32>, Option<u8>)> {
         let pdrs = self.pdrs.read().unwrap();
         // PDRs are sorted by precedence (lower = higher priority)
         for pdr in pdrs.iter() {
@@ -2920,7 +2932,7 @@ impl DataPlaneSession {
             }
             return Some((
                 pdr.far_id,
-                pdr.qer_id,
+                pdr.qer_ids.clone(),
                 pdr.urr_ids.clone(),
                 pdr.outer_header_removal,
             ));
@@ -2956,6 +2968,56 @@ impl DataPlaneSession {
             log::trace!("FAR {far_id} not provisioned — dropping packet");
             FarDecision::Drop
         }
+    }
+
+    /// Enforce every QER of a PDR (#1672, TS 29.244 §5.4.1 and Table 7.5.2.2-1,
+    /// e.g. the session-AMBR QER and a QoS flow's QER). Returns the first QER that
+    /// stops the packet, or `None` when all let it through.
+    ///
+    /// Every gate is checked before any rate, so a packet a closed gate drops
+    /// takes no tokens from another QER's bucket. A packet one QER's MBR drops may
+    /// already have been charged to an earlier QER's bucket; it was offered to it,
+    /// and refunding would need a two-phase bucket.
+    pub fn check_qer_gates(&self, qer_ids: &[u32], is_uplink: bool, pkt_bytes: u64) -> Option<u32> {
+        {
+            let qers = self.qers.read().unwrap();
+            for id in qer_ids {
+                if let Some(qer) = qers.get(id) {
+                    let open = if is_uplink {
+                        qer.ul_gate_open
+                    } else {
+                        qer.dl_gate_open
+                    };
+                    if !open {
+                        return Some(*id);
+                    }
+                }
+            }
+        }
+        qer_ids
+            .iter()
+            .copied()
+            .find(|id| !self.check_qer_gate(*id, is_uplink, pkt_bytes))
+    }
+
+    /// The marking a PDR's QERs give a packet (#1672): the DSCP of the first QER
+    /// that sets one, and the QFI, RQI and PPI of the first QER that carries a
+    /// QFI (the QoS flow's QER; a session-AMBR QER carries none).
+    pub fn qer_marking(&self, qer_ids: &[u32]) -> QerMarking {
+        let qers = self.qers.read().unwrap();
+        let mut m = QerMarking::default();
+        for id in qer_ids {
+            let Some(qer) = qers.get(id) else { continue };
+            if m.dscp.is_none() && qer.dscp != 0 {
+                m.dscp = Some(qer.dscp);
+            }
+            if m.qfi.is_none() && qer.qfi.is_some() {
+                m.qfi = qer.qfi;
+                m.rqi = qer.rqi;
+                m.ppi = qer.ppi;
+            }
+        }
+        m
     }
 
     /// Check QER gate status and MBR for the given direction.
@@ -4107,7 +4169,7 @@ impl DataPlane {
         // the N3 Tunnel Info for data forwarding, adding the QFI information"*). Its inner
         // packets are DOWNLINK packets addressed to the UE, so the uplink anti-spoofing
         // check below does not apply to them and they never reach the TUN.
-        if let Some((Some(fid), qer_id, _, _)) = &matched {
+        if let Some((Some(fid), qer_ids, _, _)) = &matched {
             let relay = {
                 let fars = session.fars.read().unwrap();
                 fars.get(fid).and_then(|f| {
@@ -4117,7 +4179,7 @@ impl DataPlane {
                 })
             };
             if let Some((Some(teid), Some(addr))) = relay {
-                let qfi = qer_id.and_then(|q| session.qers.read().unwrap().get(&q)?.qfi);
+                let qfi = session.qer_marking(qer_ids).qfi;
                 let out = encapsulate_dl_gpdu(ip_payload, teid, qfi);
                 let to = SocketAddr::new(addr, GTPU_PORT);
                 match self.socket_for(&to) {
@@ -4186,28 +4248,20 @@ impl DataPlane {
             }
         }
 
-        let mut dscp_to_apply: Option<u8> = None;
-        if let Some((far_id, qer_id, urr_ids, _ohr)) = matched {
-            // Check QER gate and extract DSCP
-            if let Some(qid) = qer_id {
-                if !session.check_qer_gate(qid, true, payload_len) {
-                    self.stats.record_drop(DropReason::QerGate, || {
-                        format!(
-                            "UL TEID 0x{:x} QER {qid}: {}",
-                            header.teid,
-                            describe_tuple(pkt_tuple.as_ref())
-                        )
-                    });
-                    return;
-                }
-                // Get DSCP from QER for marking
-                let qers = session.qers.read().unwrap();
-                if let Some(qer) = qers.get(&qid) {
-                    if qer.dscp != 0 {
-                        dscp_to_apply = Some(qer.dscp);
-                    }
-                }
+        let dscp_to_apply: Option<u8>;
+        if let Some((far_id, qer_ids, urr_ids, _ohr)) = matched {
+            // Every QER of the PDR gates the packet (#1672); DSCP for marking.
+            if let Some(qid) = session.check_qer_gates(&qer_ids, true, payload_len) {
+                self.stats.record_drop(DropReason::QerGate, || {
+                    format!(
+                        "UL TEID 0x{:x} QER {qid}: {}",
+                        header.teid,
+                        describe_tuple(pkt_tuple.as_ref())
+                    )
+                });
+                return;
             }
+            dscp_to_apply = session.qer_marking(&qer_ids).dscp;
 
             // Apply FAR
             if let Some(fid) = far_id {
@@ -4371,12 +4425,6 @@ impl DataPlane {
         // Find session by destination UE IP
         let session = dst_ip.and_then(|ip| self.sessions.find_by_ue_ip(ip));
 
-        let mut dscp_to_apply: Option<u8> = None;
-        let mut qfi_to_apply: Option<u8> = None;
-        // Reflective QoS / paging-policy markings for the PDU Session Container,
-        // taken from the matched QER (TS 38.415 §5.5.2).
-        let mut rqi_to_apply = false;
-        let mut ppi_to_apply: Option<u8> = None;
         let dl_pkt_tuple = if ip_version == IP_VERSION_4 {
             PacketTuple::from_ipv4_packet(pkt)
         } else {
@@ -4415,8 +4463,8 @@ impl DataPlane {
         // 8.2.24). The CP function (SMF) must signal the standard Core value
         // for the downlink PDR or it will not match here. ---
         let matched = session.match_pdr_with_packet(SRC_INTF_CORE, dl_pkt_tuple.as_ref(), None);
-        let (far_id, qer_id, urr_ids) = match matched {
-            Some((far_id, qer_id, urr_ids, _ohr)) => (far_id, qer_id, urr_ids),
+        let (far_id, qer_ids, urr_ids) = match matched {
+            Some((far_id, qer_ids, urr_ids, _ohr)) => (far_id, qer_ids, urr_ids),
             None => {
                 self.stats.record_drop(DropReason::NoPdrMatch, || {
                     format!(
@@ -4429,28 +4477,24 @@ impl DataPlane {
             }
         };
 
-        // Check QER gate/rate and extract DSCP + QFI
-        if let Some(qid) = qer_id {
-            if !session.check_qer_gate(qid, false, payload_len) {
-                self.stats.record_drop(DropReason::QerGate, || {
-                    format!(
-                        "DL SEID 0x{:x} QER {qid}: {}",
-                        session.upf_seid,
-                        describe_tuple(dl_pkt_tuple.as_ref())
-                    )
-                });
-                return;
-            }
-            let qers = session.qers.read().unwrap();
-            if let Some(qer) = qers.get(&qid) {
-                if qer.dscp != 0 {
-                    dscp_to_apply = Some(qer.dscp);
-                }
-                qfi_to_apply = qer.qfi;
-                rqi_to_apply = qer.rqi;
-                ppi_to_apply = qer.ppi;
-            }
+        // Every QER of the PDR gates the packet (#1672); DSCP, QFI, RQI, PPI.
+        if let Some(qid) = session.check_qer_gates(&qer_ids, false, payload_len) {
+            self.stats.record_drop(DropReason::QerGate, || {
+                format!(
+                    "DL SEID 0x{:x} QER {qid}: {}",
+                    session.upf_seid,
+                    describe_tuple(dl_pkt_tuple.as_ref())
+                )
+            });
+            return;
         }
+        // Reflective QoS / paging-policy markings for the PDU Session Container
+        // come from the flow's QER (TS 38.415 §5.5.2).
+        let marking = session.qer_marking(&qer_ids);
+        let dscp_to_apply = marking.dscp;
+        let mut qfi_to_apply = marking.qfi;
+        let rqi_to_apply = marking.rqi;
+        let ppi_to_apply = marking.ppi;
         if qfi_to_apply.is_none() {
             qfi_to_apply = session.qfi;
         }
@@ -4816,7 +4860,7 @@ impl DataPlane {
                 precedence: 100,
                 source_interface: SRC_INTF_ACCESS,
                 far_id: Some(1),
-                qer_id: None,
+                qer_ids: Vec::new(),
                 urr_ids: Vec::new(),
                 outer_header_removal: Some(0), // GTP-U/UDP/IPv4
                 sdf_rule: None,                // match all
@@ -4827,7 +4871,7 @@ impl DataPlane {
                 precedence: 100,
                 source_interface: SRC_INTF_CORE,
                 far_id: Some(2),
-                qer_id: None,
+                qer_ids: Vec::new(),
                 urr_ids: Vec::new(),
                 outer_header_removal: None,
                 sdf_rule: None, // match all
@@ -6126,6 +6170,93 @@ mod tests {
         assert!(tuple4.matches_rule(&rule));
     }
 
+    /// **#1672.** Every QER of a PDR is enforced, gates before rates: a packet
+    /// a closed gate of QER 2 drops takes no tokens from QER 1's MBR bucket.
+    /// QER 1 polices 1 kbit/s UL (a 1500 B bucket that starts full): with QER
+    /// 2's UL gate closed, 3 packets of 500 B are dropped by QER 2; once it
+    /// opens, QER 1's full bucket passes the next 3 and drops the 4th.
+    #[test]
+    fn every_qer_gates_and_a_gate_drop_takes_no_tokens_1672() {
+        let session = DataPlaneSession::new_empty(
+            1,
+            2,
+            None,
+            1,
+            2,
+            "127.0.0.1:2152".parse().unwrap(),
+            None,
+            None,
+        );
+        {
+            let mut qers = session.qers.write().unwrap();
+            let mut ambr = DataPlaneQer::new(1);
+            ambr.set_mbr(1, 1_000_000);
+            qers.insert(1, ambr);
+            let mut flow = DataPlaneQer::new(2);
+            flow.ul_gate_open = false;
+            qers.insert(2, flow);
+        }
+        for _ in 0..3 {
+            assert_eq!(session.check_qer_gates(&[1, 2], true, 500), Some(2));
+        }
+        session
+            .qers
+            .write()
+            .unwrap()
+            .get_mut(&2)
+            .unwrap()
+            .ul_gate_open = true;
+        for i in 0..3 {
+            assert_eq!(
+                session.check_qer_gates(&[1, 2], true, 500),
+                None,
+                "packet {i}"
+            );
+        }
+        assert_eq!(session.check_qer_gates(&[1, 2], true, 500), Some(1));
+        // The downlink is gated by neither.
+        assert_eq!(session.check_qer_gates(&[1, 2], false, 500), None);
+        assert_eq!(session.check_qer_gates(&[], true, 500), None);
+    }
+
+    /// **#1672.** A PDR's marking comes from its QERs: the DSCP of the first QER
+    /// that sets one, and the QFI, RQI and PPI of the first that carries a QFI
+    /// (the flow's QER), even when a session-AMBR QER with none is listed first.
+    #[test]
+    fn the_marking_comes_from_the_flow_qer_1672() {
+        let session = DataPlaneSession::new_empty(
+            1,
+            2,
+            None,
+            1,
+            2,
+            "127.0.0.1:2152".parse().unwrap(),
+            None,
+            None,
+        );
+        {
+            let mut qers = session.qers.write().unwrap();
+            qers.insert(1, DataPlaneQer::new(1)); // session AMBR: no QFI
+            let mut flow = DataPlaneQer::new(2);
+            flow.set_qfi(9);
+            flow.rqi = true;
+            flow.ppi = Some(3);
+            qers.insert(2, flow);
+        }
+        let m = session.qer_marking(&[1, 2]);
+        assert_eq!(
+            (m.qfi, m.rqi, m.ppi, m.dscp),
+            (
+                Some(9),
+                true,
+                Some(3),
+                Some(qfi_to_dscp(9)).filter(|d| *d != 0)
+            )
+        );
+        assert_eq!(session.qer_marking(&[1]), QerMarking::default());
+        assert_eq!(session.qer_marking(&[]), QerMarking::default());
+    }
+
     // -- match_pdr_with_packet tests --
 
     fn make_test_session(pdrs: Vec<DataPlanePdr>) -> DataPlaneSession {
@@ -6150,7 +6281,7 @@ mod tests {
             precedence: 100,
             source_interface: SRC_INTF_ACCESS,
             far_id: Some(1),
-            qer_id: None,
+            qer_ids: Vec::new(),
             urr_ids: vec![],
             outer_header_removal: None,
             sdf_rule: None,
@@ -6177,7 +6308,7 @@ mod tests {
             precedence: 50,
             source_interface: SRC_INTF_ACCESS,
             far_id: Some(10),
-            qer_id: None,
+            qer_ids: Vec::new(),
             urr_ids: vec![],
             outer_header_removal: None,
             sdf_rule: Some(rule),
@@ -6205,7 +6336,7 @@ mod tests {
                 precedence: 50,
                 source_interface: SRC_INTF_ACCESS,
                 far_id: Some(10),
-                qer_id: None,
+                qer_ids: Vec::new(),
                 urr_ids: vec![],
                 outer_header_removal: None,
                 sdf_rule: Some(rule),
@@ -6216,7 +6347,7 @@ mod tests {
                 precedence: 100,
                 source_interface: SRC_INTF_ACCESS,
                 far_id: Some(20),
-                qer_id: None,
+                qer_ids: Vec::new(),
                 urr_ids: vec![],
                 outer_header_removal: None,
                 sdf_rule: None, // wildcard
@@ -6244,7 +6375,7 @@ mod tests {
                 precedence: 100,
                 source_interface: SRC_INTF_ACCESS,
                 far_id: Some(20),
-                qer_id: None,
+                qer_ids: Vec::new(),
                 urr_ids: vec![],
                 outer_header_removal: None,
                 sdf_rule: None,
@@ -6255,7 +6386,7 @@ mod tests {
                 precedence: 50,
                 source_interface: SRC_INTF_ACCESS,
                 far_id: Some(10),
-                qer_id: None,
+                qer_ids: Vec::new(),
                 urr_ids: vec![],
                 outer_header_removal: None,
                 sdf_rule: None,
@@ -6276,7 +6407,7 @@ mod tests {
             precedence: 100,
             source_interface: SRC_INTF_ACCESS,
             far_id: Some(1),
-            qer_id: None,
+            qer_ids: Vec::new(),
             urr_ids: vec![],
             outer_header_removal: None,
             sdf_rule: None,
@@ -6378,7 +6509,7 @@ mod tests {
             precedence: 100,
             source_interface: SRC_INTF_CORE,
             far_id: Some(2),
-            qer_id: None,
+            qer_ids: Vec::new(),
             urr_ids: vec![],
             outer_header_removal: None,
             sdf_rule: None,
@@ -6436,7 +6567,7 @@ mod tests {
             precedence: 100,
             source_interface: SRC_INTF_CORE,
             far_id: Some(2),
-            qer_id: None,
+            qer_ids: Vec::new(),
             urr_ids: vec![],
             outer_header_removal: None,
             sdf_rule: None,
@@ -6623,7 +6754,7 @@ mod tests {
                 precedence: 50,
                 source_interface: SRC_INTF_ACCESS,
                 far_id: Some(10),
-                qer_id: None,
+                qer_ids: Vec::new(),
                 urr_ids: vec![],
                 outer_header_removal: None,
                 sdf_rule: None,
@@ -6634,7 +6765,7 @@ mod tests {
                 precedence: 100,
                 source_interface: SRC_INTF_ACCESS,
                 far_id: Some(20),
-                qer_id: None,
+                qer_ids: Vec::new(),
                 urr_ids: vec![],
                 outer_header_removal: None,
                 sdf_rule: None,
@@ -6658,7 +6789,7 @@ mod tests {
             precedence: 50,
             source_interface: SRC_INTF_ACCESS,
             far_id: Some(10),
-            qer_id: None,
+            qer_ids: Vec::new(),
             urr_ids: vec![],
             outer_header_removal: None,
             sdf_rule: Some(rule),
@@ -6976,7 +7107,7 @@ mod tests {
                 precedence: 10,
                 source_interface: SRC_INTF_ACCESS,
                 far_id: Some(0x50),
-                qer_id: Some(0x55),
+                qer_ids: vec![0x55],
                 urr_ids: Vec::new(),
                 outer_header_removal: Some(0),
                 sdf_rule: None,
@@ -8433,7 +8564,7 @@ mod tests {
         }
         for p in session.pdrs.write().unwrap().iter_mut() {
             if p.source_interface == SRC_INTF_CORE {
-                p.qer_id = Some(5);
+                p.qer_ids = vec![5];
             }
         }
         let mut pkt = make_ipv4_udp_packet([8, 8, 8, 8], ue_ip.octets(), 53, 1234);
@@ -8987,7 +9118,7 @@ mod tests {
             let mut pdrs = session.pdrs.write().unwrap();
             for p in pdrs.iter_mut() {
                 if p.source_interface == SRC_INTF_CORE {
-                    p.qer_id = Some(5);
+                    p.qer_ids = vec![5];
                 }
             }
         }
@@ -9738,7 +9869,7 @@ mod tests {
             let mut pdrs = session.pdrs.write().unwrap();
             for p in pdrs.iter_mut() {
                 if p.source_interface == SRC_INTF_CORE {
-                    p.qer_id = Some(11);
+                    p.qer_ids = vec![11];
                 }
             }
         }
@@ -9805,7 +9936,7 @@ mod tests {
             let mut pdrs = session.pdrs.write().unwrap();
             for p in pdrs.iter_mut() {
                 if p.source_interface == SRC_INTF_CORE {
-                    p.qer_id = Some(12);
+                    p.qer_ids = vec![12];
                 }
             }
         }
@@ -10057,7 +10188,7 @@ mod tests {
         qer.dl_gate_open = false;
         session.qers.write().unwrap().insert(7, qer);
         for pdr in session.pdrs.write().unwrap().iter_mut() {
-            pdr.qer_id = Some(7);
+            pdr.qer_ids = vec![7];
         }
         rig.ul(&rig.ul_gpdu(rig.ue_ip)).await;
         rig.dl(&rig.dl_to(rig.ue_ip)).await;

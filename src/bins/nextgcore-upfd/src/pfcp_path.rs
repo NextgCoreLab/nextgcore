@@ -2323,12 +2323,12 @@ impl PfcpServer {
 
         for pdr in create_pdrs {
             log::debug!(
-                "PDR {}: src_if={}, precedence={}, far_id={:?}, qer_id={:?}, urr_ids={:?}",
+                "PDR {}: src_if={}, precedence={}, far_id={:?}, qer_ids={:?}, urr_ids={:?}",
                 pdr.pdr_id,
                 pdr.pdi.source_interface,
                 pdr.precedence,
                 pdr.far_id,
-                pdr.qer_id,
+                pdr.qer_ids,
                 pdr.urr_ids,
             );
 
@@ -7353,14 +7353,15 @@ mod tests {
     }
 
     /// **#1673.** An Update PDR changes only the IEs it carries, and a
-    /// null-length FAR ID, URR ID, QER ID or Outer Header Removal removes that
-    /// IE (TS 29.244 §5.6.3, 29244-k00.txt:6060-6095; Table 7.5.4.2-1). Each
+    /// null-length URR ID, QER ID or Outer Header Removal removes that IE (TS
+    /// 29.244 §5.6.3, 29244-k00.txt:6060-6095; Table 7.5.4.2-1). A null FAR ID
+    /// is refused instead (#1672): see `a_null_far_id_or_an_empty_pdi_in_an_update_pdr_is_refused_1672`. Each
     /// step goes through the real handler and the production event consumer,
     /// and the PDR the data plane then holds is asserted:
     /// - a precedence-only update keeps the FAR, URR, QER and PDI (it used to
     ///   replace the PDR with one holding only the new precedence);
     /// - an update without Precedence keeps it (it used to become 0);
-    /// - a null QER ID, URR ID, FAR ID or Outer Header Removal clears it (#1656
+    /// - a null QER ID, URR ID or Outer Header Removal clears it (#1656
     ///   answered these 69 Mandatory IE incorrect);
     /// - a null URR ID beside a full one leaves just the full one: the list is
     ///   "all the URR IDs to be associated";
@@ -7397,10 +7398,10 @@ mod tests {
             (
                 before.precedence,
                 before.far_id,
-                before.qer_id,
+                before.qer_ids.clone(),
                 before.urr_ids.clone()
             ),
-            (100, Some(1), Some(1), vec![1])
+            (100, Some(1), vec![1], vec![1])
         );
 
         let step = |what: &str, resp: Vec<u8>| {
@@ -7423,11 +7424,11 @@ mod tests {
             (
                 p.precedence,
                 p.far_id,
-                p.qer_id,
+                p.qer_ids.clone(),
                 p.urr_ids.clone(),
                 p.source_interface
             ),
-            (7, Some(1), Some(1), vec![1], before.source_interface),
+            (7, Some(1), vec![1], vec![1], before.source_interface),
             "a precedence-only update keeps the rest"
         );
 
@@ -7447,7 +7448,6 @@ mod tests {
         for (what, ie) in [
             ("null QER ID", pfcp_ie::QER_ID),
             ("null URR ID", pfcp_ie::URR_ID),
-            ("null FAR ID", pfcp_ie::FAR_ID),
             ("null OHR", pfcp_ie::OUTER_HEADER_REMOVAL),
         ] {
             let resp = exchange(&smf, addr, &update(&[(ie, Vec::new())])).await;
@@ -7459,11 +7459,11 @@ mod tests {
             (
                 p.precedence,
                 p.far_id,
-                p.qer_id,
+                p.qer_ids.clone(),
                 p.urr_ids.clone(),
                 p.outer_header_removal
             ),
-            (7, None, None, Vec::new(), None),
+            (7, Some(1), Vec::new(), Vec::new(), None),
             "each null IE removed only itself"
         );
 
@@ -7482,8 +7482,8 @@ mod tests {
         apply_next(&mut rx, &dp).await;
         let p = pdr1();
         assert_eq!(
-            (p.far_id, p.qer_id, p.urr_ids.clone()),
-            (Some(1), Some(1), vec![1])
+            (p.far_id, p.qer_ids.clone(), p.urr_ids.clone()),
+            (Some(1), vec![1], vec![1])
         );
 
         let mut pdi = crate::n4_build::PfcpMessageBuilder::new();
@@ -7499,6 +7499,225 @@ mod tests {
         );
     }
 
+    /// **#1672.** In an Update PDR, a null FAR ID and an empty PDI are refused
+    /// with "Mandatory IE incorrect" naming the Update PDR, and the stored PDR
+    /// keeps its FAR and PDI.
+    ///
+    /// TS 29.244 Table 7.5.2.2-1 makes the FAR ID mandatory in a PDR unless
+    /// Activate Predefined Rules supplies a FAR or a MAR ID is present, and upfd
+    /// supports neither. Removing it would leave a PDR the table does not allow,
+    /// one with no forwarding rule, so the null value is semantically invalid
+    /// (§7.6.8). §5.6.3's null-length removal names only the URR ID and QER ID
+    /// of an Update PDR. An empty PDI has no Source Interface to match on.
+    #[tokio::test]
+    async fn a_null_far_id_or_an_empty_pdi_in_an_update_pdr_is_refused_1672() {
+        let (_server, smf, addr, _rx, dp, upf_seid) = established_session().await;
+        for (seq, (what, ie)) in (20u32..).zip([
+            ("null FAR ID", pfcp_ie::FAR_ID),
+            ("empty PDI", pfcp_ie::PDI),
+        ]) {
+            let mut body = crate::n4_build::PfcpMessageBuilder::new();
+            body.add_pdr_id(1);
+            body.add_tlv(ie, &[]);
+            let mut b = crate::n4_build::PfcpMessageBuilder::new();
+            b.add_tlv(pfcp_ie::UPDATE_PDR, &body.build());
+            let resp = exchange(
+                &smf,
+                addr,
+                &encode_pfcp(52, Some(upf_seid), seq, &b.build()),
+            )
+            .await;
+            assert_eq!(
+                cause_and_offending_1598(&resp),
+                (
+                    PfcpCause::MandatoryIeIncorrect as u8,
+                    Some(pfcp_ie::UPDATE_PDR)
+                ),
+                "{what}"
+            );
+        }
+        let session = dp.sessions.find_by_seid(upf_seid).expect("session");
+        let pdrs = session.pdrs.read().unwrap();
+        let p = pdrs.iter().find(|p| p.pdr_id == 1).expect("PDR 1");
+        assert_eq!((p.far_id, p.source_interface), (Some(1), 0));
+    }
+
+    /// Establish, through the real N4 handler, the #1475 session (UL PDR 1 on
+    /// TEID 0x1234, FAR 1 FORW) whose PDR lists `qer_ids` in that order, with
+    /// the QERs `qers`; apply it to `dp` (#1672).
+    async fn establish_with_qers_1672(
+        smf: &UdpSocket,
+        addr: SocketAddr,
+        rx: &mut mpsc::Receiver<PfcpSessionEvent>,
+        dp: &crate::data_plane::DataPlane,
+        qer_ids: &[u32],
+        qers: &[Vec<u8>],
+    ) {
+        let assoc = build_association_setup_request_payload(Some(1));
+        let _ = exchange(smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        let mut pdi = crate::n4_build::PfcpMessageBuilder::new();
+        pdi.add_u8(pfcp_ie::SOURCE_INTERFACE, 0);
+        pdi.add_f_teid(&crate::n4_build::FTeid {
+            teid: 0x1234,
+            ipv4: Some(Ipv4Addr::new(127, 0, 0, 4)),
+            ipv6: None,
+            choose: false,
+            choose_id: None,
+        });
+        pdi.add_ue_ip_address(
+            &crate::n4_build::UeIpAddress {
+                ipv4: Some(Ipv4Addr::new(10, 45, 0, 42)),
+                ipv6: None,
+                ipv6_prefix_len: 0,
+            },
+            false,
+        );
+        let mut pdr = crate::n4_build::PfcpMessageBuilder::new();
+        pdr.add_pdr_id(1);
+        pdr.add_u32(pfcp_ie::PRECEDENCE, 100);
+        pdr.add_tlv(pfcp_ie::PDI, &pdi.build());
+        pdr.add_u32(pfcp_ie::FAR_ID, 1);
+        for id in qer_ids {
+            pdr.add_u32(pfcp_ie::QER_ID, *id);
+        }
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        b.add_f_seid(&crate::n4_build::FSeid {
+            seid: 0x1672,
+            ipv4: Some(Ipv4Addr::new(127, 0, 0, 9)),
+            ipv6: None,
+        });
+        b.add_tlv(pfcp_ie::CREATE_PDR, &pdr.build());
+        b.add_tlv(pfcp_ie::CREATE_FAR, &far_body(1, 0x02));
+        for q in qers {
+            b.add_tlv(pfcp_ie::CREATE_QER, q);
+        }
+        let resp = exchange(smf, addr, &encode_pfcp(50, Some(0), 2, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(rx, dp).await;
+    }
+
+    /// **#1672, TS 29.244 Table 7.5.2.2-1 and §5.4.1.** A PDR lists a QoS
+    /// flow's QER (QER 1: QFI 9, gates open, no MBR) and the session-AMBR QER
+    /// (QER 2), in that order, and every QER is enforced on its traffic. upfd
+    /// kept only the first QER ID, so the session-AMBR QER was never applied:
+    /// - QER 2's UL gate CLOSED drops every uplink packet as qer_gate, and
+    ///   opening it with an Update QER lets them through;
+    /// - QER 2's 1 kbit/s UL MBR (a 1500 B bucket) passes the first 3 of 10
+    ///   back-to-back 500 B packets and drops the rest, where QER 1 alone would
+    ///   pass all 10.
+    #[tokio::test]
+    async fn every_qer_of_a_pdr_is_enforced_session_ambr_and_flow_1672() {
+        use crate::data_plane::DropReason;
+        let (_server, smf, addr, mut rx) = spawn_test_server().await;
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        let tun = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("/dev/null stands in for the TUN");
+        let flow = qer_body_1478(1, Some(0x00), None, None, Some(9));
+        // Gate Status (§8.2.7): UL gate in bits 3-4, 1 = CLOSED.
+        let ambr_closed = qer_body_1478(
+            2,
+            Some(0x04),
+            Some(&rates_1478(1_000_000, 1_000_000)),
+            None,
+            None,
+        );
+        establish_with_qers_1672(&smf, addr, &mut rx, &dp, &[1, 2], &[flow, ambr_closed]).await;
+        let session = dp.sessions.find_by_ul_teid(0x1234).expect("held");
+        assert_eq!(
+            session.pdrs.read().unwrap()[0].qer_ids,
+            vec![1, 2],
+            "the PDR keeps every QER ID, in order"
+        );
+
+        let (drops, _) = offer_ul_1475(&dp, &tun, 200, 5, Pace1475::Flat).await;
+        assert_eq!(drops, 5, "the session-AMBR QER's closed UL gate drops all");
+
+        let open = qer_body_1478(2, Some(0x00), None, None, None);
+        let resp = update_qer_1478(&smf, addr, &mut rx, &dp, &open).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        let (drops, _) = offer_ul_1475(&dp, &tun, 200, 5, Pace1475::Flat).await;
+        assert_eq!(drops, 0, "both gates open: all pass");
+
+        let slow = qer_body_1478(2, None, Some(&rates_1478(1, 1_000_000)), None, None);
+        let resp = update_qer_1478(&smf, addr, &mut rx, &dp, &slow).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        let (drops, _) = offer_ul_1475(&dp, &tun, 500, 10, Pace1475::Flat).await;
+        assert!(
+            (6..=8).contains(&drops),
+            "a 1 kbit/s session AMBR (1500 B bucket) passes about 3 of 10 x 500 B: {drops} dropped"
+        );
+        assert_eq!(
+            dp.stats
+                .dropped_packets
+                .load(std::sync::atomic::Ordering::Relaxed),
+            dp.stats.drops(DropReason::QerGate),
+            "every drop is qer_gate: {}",
+            dp.stats.summary()
+        );
+    }
+
+    /// **#1672.** An Update PDR's QER IDs replace the PDR's whole QER list
+    /// (Table 7.5.4.2-1: "the list of all the QER IDs to be associated to the
+    /// PDR"), and a null one clears it (§5.6.3).
+    #[tokio::test]
+    async fn an_update_pdr_replaces_the_qer_list_1672() {
+        let (_server, smf, addr, mut rx, dp, upf_seid) = established_session().await;
+        let qers = |dp: &crate::data_plane::DataPlane| {
+            dp.sessions
+                .find_by_seid(upf_seid)
+                .expect("session")
+                .pdrs
+                .read()
+                .unwrap()
+                .iter()
+                .find(|p| p.pdr_id == 1)
+                .expect("PDR 1")
+                .qer_ids
+                .clone()
+        };
+        assert_eq!(qers(&dp), vec![1]);
+        let mut seq = 30u32;
+        for (ids, want) in [
+            (vec![Some(1u32), Some(2)], vec![1, 2]),
+            (vec![Some(2)], vec![2]),
+            (vec![None], vec![]),
+        ] {
+            let mut body = crate::n4_build::PfcpMessageBuilder::new();
+            body.add_pdr_id(1);
+            for id in &ids {
+                match id {
+                    Some(id) => {
+                        body.add_u32(pfcp_ie::QER_ID, *id);
+                    }
+                    None => {
+                        body.add_tlv(pfcp_ie::QER_ID, &[]);
+                    }
+                }
+            }
+            let mut b = crate::n4_build::PfcpMessageBuilder::new();
+            b.add_tlv(pfcp_ie::UPDATE_PDR, &body.build());
+            seq += 1;
+            let resp = exchange(
+                &smf,
+                addr,
+                &encode_pfcp(52, Some(upf_seid), seq, &b.build()),
+            )
+            .await;
+            assert_eq!(
+                response_cause(&resp),
+                PfcpCause::RequestAccepted as u8,
+                "{ids:?}"
+            );
+            apply_next(&mut rx, &dp).await;
+            assert_eq!(qers(&dp), want, "after {ids:?}");
+        }
+    }
+
     /// **#1616, Session Modification.** A Create PDR or an Update PDR with a
     /// too-short Precedence, FAR ID, URR ID or QER ID is refused with
     /// "Mandatory IE incorrect" naming the grouped IE (TS 29.244 §7.6.8), and
@@ -7506,23 +7725,29 @@ mod tests {
     /// installing a PDR with no FAR (or at precedence 0) and the Update
     /// rewriting PDR 1 the same way.
     ///
-    /// In an Update PDR a null (0-octet) FAR, URR or QER ID is a removal, not a
-    /// short value (TS 29.244 §5.6.3, #1673), so those cases are left out here.
+    /// In an Update PDR a null (0-octet) URR or QER ID is a removal, not a
+    /// short value (TS 29.244 §5.6.3, #1673), so those cases are left out here;
+    /// a null FAR ID is still refused (#1672).
     #[tokio::test]
     async fn a_modification_pdr_with_a_short_reference_is_mandatory_ie_incorrect_1616() {
         let (server, smf, addr, _rx, _dp, upf_seid) = established_session().await;
         let mut cases: Vec<(u16, &'static str, Vec<u8>)> = Vec::new();
         for (grouped, pdr_id) in [(pfcp_ie::CREATE_PDR, 7), (pfcp_ie::UPDATE_PDR, 1)] {
             for (name, len, body) in short_pdr_references_1616(&pdr_body(pdr_id, 50, 1, 1, 1)) {
-                // #1673: in an Update PDR a null FAR, URR or QER ID removes it
-                // (TS 29.244 §5.6.3); a null Precedence is still refused.
-                if grouped == pfcp_ie::UPDATE_PDR && len == 0 && name != "Precedence" {
+                // #1673: in an Update PDR a null URR or QER ID removes it (TS
+                // 29.244 §5.6.3); a null Precedence or FAR ID is still refused
+                // (#1672).
+                if grouped == pfcp_ie::UPDATE_PDR
+                    && len == 0
+                    && name != "Precedence"
+                    && name != "FAR ID"
+                {
                     continue;
                 }
                 cases.push((grouped, name, body));
             }
         }
-        assert_eq!(cases.len(), 43);
+        assert_eq!(cases.len(), 44);
         for (seq, (grouped, name, body)) in (10u32..).zip(cases) {
             let mut b = crate::n4_build::PfcpMessageBuilder::new();
             b.add_tlv(grouped, &body);
