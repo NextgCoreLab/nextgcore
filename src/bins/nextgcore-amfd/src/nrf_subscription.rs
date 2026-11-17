@@ -246,7 +246,9 @@ async fn send(
 ) -> Result<nextgcore_sbi::message::SbiResponse, String> {
     let (host, port) =
         parse_host_port(nrf_uri).ok_or_else(|| format!("NRF URI {nrf_uri:?} is unusable"))?;
-    let client = global_context().get_client(&host, port).await;
+    // #1674: a subscription answer echoes the request; capped like every NRF answer.
+    let client =
+        crate::sbi_path::capped_client(&host, port, crate::sbi_path::MAX_NRF_RESPONSE_BODY);
     match tokio::time::timeout(NRF_REQUEST_TIMEOUT, client.send_request(request)).await {
         Ok(Ok(resp)) => Ok(resp),
         Ok(Err(e)) => Err(e.to_string()),
