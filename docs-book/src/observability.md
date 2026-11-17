@@ -32,7 +32,7 @@ Every one of these listeners is unauthenticated, so it binds `127.0.0.1` by defa
 kubectl -n nextg-system port-forward svc/prometheus 9090:9090   # http://localhost:9090
 kubectl -n nextg-system port-forward svc/grafana 3000:3000      # http://localhost:3000
 kubectl -n nextg-system port-forward svc/jaeger 16686:16686     # http://localhost:16686
-kubectl -n nextg-system port-forward svc/nrf 7777:7777          # NRF SBI
+kubectl -n nextg-system port-forward svc/nrf 7777:7777          # NRF SBI over TLS (#1617; CA: Secret nf-tls-nrf)
 ``` The compose host-port publishes (MongoDB, NRF, PFCP, Prometheus, Grafana, Jaeger, OTLP) are bound to `127.0.0.1`; the RAN-facing NGAP/S1AP and GTP-U publishes use `${NEXTGCORE_RAN_PUBLISH_ADDR:-127.0.0.1}`, so an external gNB/eNB needs that set to the host address it reaches.
 
 `docker-compose-epc.yml` uses these endpoints as healthchecks (`curl -fsS http://localhost:9090/metrics | grep -q '^smf_up 1$'`, likewise `upf_up`, `sgwu_up`).

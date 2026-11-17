@@ -44,6 +44,20 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   No NF bind-mounts `docker/rust/certs/` any more, and the inert `TLS_CERT` / `TLS_KEY` /
   `TLS_CA` variables are gone. `nextgcore-core` now ships `openssl`. A client still dialling
   `http://` the NRF fails at the TLS handshake: point it at `https://` and give it the CA.
+- The Kubernetes deployments run NF -> NRF over TLS too (#1617): the Kind manifests
+  (`k8s/`), every EKS profile with an NRF, and the demo overlays. The NRF's `nrf.yaml` serves
+  TLS with `client_auth: optional`. `k8s/deploy.sh` and `deploy-eks.sh` run the new
+  `k8s/nf-tls-secrets.sh`, which issues one Secret `nf-tls-<name>` per NRF client and for the
+  NRF (its certificate, key and the CA certificate; never the CA key) and keeps them on a re-run
+  while they are current. Each NRF client mounts only its own Secret (`0440`, pod `fsGroup`),
+  dials `https://`, sets `NEXTGCORE_NRF_TLS_CA` / `_CLIENT_CERT` / `_CLIENT_KEY` and
+  `NEXTGCORE_NRF_TLS_SERVER_NAME=nrf` (the URIs name the cluster FQDN; `nrf.crt` names
+  `DNS:nrf`), and pins the nfInstanceId its certificate names; the NRF pins its own. New
+  `nf-identities.txt` row `gnb-exporter` (the d441a gNB congestion exporter). The demo scripts
+  that curl the NRF use `https://nrf:7777` with `--cacert`. `deploy-eks.sh`'s data-plane UPF
+  swap now keeps the volumes a sidecar mounts. `check-nf-identities.py --k8s` (CI `manifests`)
+  checks every rendered kustomization. A client still dialling `http://` the NRF fails at the
+  TLS handshake.
 - mmed binds a configured IPv6 S1-MME address. Before, a bracketed IPv6 `mme.s1ap.server`
   address without a port (`[fd00::5]`) was dropped as unparsable, and the IPv6 server list
   `s1ap_list6` was never filled or read, so such a config fell back to `127.0.0.1:36412`. IPv6

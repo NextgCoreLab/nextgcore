@@ -40,7 +40,7 @@ data:
       queue_limit_bytes: 200000
       window_ms: 1000
       prediction_horizon_ms: 5000
-      nrf_uri: http://nrf.nextg-system.svc.cluster.local:7777
+      nrf_uri: https://nrf.nextg-system.svc.cluster.local:7777
       nf_instance_id: 6b1d7e3c-0000-4000-8000-00000000465a
       cca_key_file: /tmp/d441a-cca/exporter.key
       cca_public_jwk_dir: /tmp/d441a-cca

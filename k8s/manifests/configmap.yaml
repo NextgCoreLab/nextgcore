@@ -25,6 +25,22 @@ data:
           - address: 0.0.0.0
             advertise: nrf.nextg-system.svc.cluster.local
             port: 7777
+            # TLS on the NRF's one SBI listener (#1617), as in every compose
+            # stack. The NRF asks each client for a certificate (client_auth:
+            # optional): a presented one must chain to `ca`, and its urn:uuid URI
+            # SAN and RFC 9310 NFTypes are the registrant identity NFRegister /
+            # NFUpdate / NFDeregister bind to (TS 33.310 §6.1.3c.3, TS 33.501
+            # §13.1.0); a client without one still completes the handshake. The
+            # files are Secret nf-tls-nrf, issued at deploy time from
+            # docker/rust/certs/nf-identities.txt by k8s/nf-tls-secrets.sh.
+            tls:
+              enabled: true
+              cert: /etc/nextgcore/certs/nrf.crt
+              key: /etc/nextgcore/certs/nrf.key
+              ca: /etc/nextgcore/certs/ca.crt
+              client_auth: optional
+              # Minimum TLS version per 3GPP TS 33.501 §13.2
+              min_version: "1.2"
 
   ausf.yaml: |
     logger:
@@ -42,7 +58,7 @@ data:
             port: 7777
         client:
           nrf:
-            - uri: http://nrf.nextg-system.svc.cluster.local:7777
+            - uri: https://nrf.nextg-system.svc.cluster.local:7777
 
   udm.yaml: |
     logger:
@@ -67,7 +83,7 @@ data:
             port: 7777
         client:
           nrf:
-            - uri: http://nrf.nextg-system.svc.cluster.local:7777
+            - uri: https://nrf.nextg-system.svc.cluster.local:7777
 
   udr.yaml: |
     db_uri: mongodb://mongodb.nextg-system.svc.cluster.local:27017/nextgcore
@@ -86,7 +102,7 @@ data:
             port: 7777
         client:
           nrf:
-            - uri: http://nrf.nextg-system.svc.cluster.local:7777
+            - uri: https://nrf.nextg-system.svc.cluster.local:7777
 
   pcf.yaml: |
     db_uri: mongodb://mongodb.nextg-system.svc.cluster.local:27017/nextgcore
@@ -105,7 +121,7 @@ data:
             port: 7777
         client:
           nrf:
-            - uri: http://nrf.nextg-system.svc.cluster.local:7777
+            - uri: https://nrf.nextg-system.svc.cluster.local:7777
       # Whether the subscribed Session-AMBR the SMF reports (subsSessAmbr) caps
       # the Session-AMBR the PCF authorises, on the SM policy create, the
       # UpdateNotify and the SE_AMBR_CH update alike (#1402). subscribed (the
@@ -136,9 +152,9 @@ data:
             port: 7777
         client:
           nrf:
-            - uri: http://nrf.nextg-system.svc.cluster.local:7777
+            - uri: https://nrf.nextg-system.svc.cluster.local:7777
           nsi:
-            - uri: http://nrf.nextg-system.svc.cluster.local:7777
+            - uri: https://nrf.nextg-system.svc.cluster.local:7777
               s_nssai:
                 sst: 1
         # #94: SBI OAuth2 enforcement now defaults to ENABLED. This dev/E2E
@@ -164,7 +180,7 @@ data:
             port: 7777
         client:
           nrf:
-            - uri: http://nrf.nextg-system.svc.cluster.local:7777
+            - uri: https://nrf.nextg-system.svc.cluster.local:7777
 
   amf.yaml: |
     logger:
@@ -182,7 +198,7 @@ data:
             port: 7777
         client:
           nrf:
-            - uri: http://nrf.nextg-system.svc.cluster.local:7777
+            - uri: https://nrf.nextg-system.svc.cluster.local:7777
       ngap:
         server:
           - address: 0.0.0.0
@@ -232,7 +248,7 @@ data:
             port: 7777
         client:
           nrf:
-            - uri: http://nrf.nextg-system.svc.cluster.local:7777
+            - uri: https://nrf.nextg-system.svc.cluster.local:7777
       pfcp:
         server:
           - address: 0.0.0.0

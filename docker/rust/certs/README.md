@@ -98,6 +98,19 @@ uid `SBI_TLS_OWNERS` names for a nextgsim sidecar that drops to its own). Each
 NF mounts only its own volume, read-only, at `/etc/nextgcore/certs`, so no NF
 container can read another NF's key.
 
+The Kubernetes deployments (`k8s/deploy.sh`, `deploy/eks/deploy-eks.sh`) do
+the same with Secrets: [`k8s/nf-tls-secrets.sh`](../../../k8s/nf-tls-secrets.sh)
+issues the PKI into a private temporary directory, deleted on exit (the CA key
+never enters the cluster), and creates one Secret `nf-tls-<name>` per pod that
+mounts one: `ca.crt`, `<name>.crt`, `<name>.key`. The pod mounts it read-only
+at `/etc/nextgcore/certs` with `defaultMode: 0440` and `fsGroup`, so the
+image's non-root user reads it; root-run nextgsim sidecars that drop to their
+own uid get it `0400` and hand the key to that uid. `nf-tls-ca` holds `ca.crt`
+only, for a client that only discovers. A re-run keeps the Secrets while they
+are current; otherwise it re-issues every `nf-tls-*` Secret of the namespace
+from one new CA, and the stamped pod templates (`nextg.io/nf-tls-ca`) roll.
+`check-nf-identities.py --k8s` checks every rendered kustomization.
+
 Certificates (`*.crt`, `ca.crt`) are public and written `0644`, so any
 container user can read them through a bind mount.
 

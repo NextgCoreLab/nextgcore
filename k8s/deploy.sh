@@ -98,6 +98,19 @@ else
   exit 1
 fi
 
+# #1617: the NRF serves TLS, and the NRF and each NF that dials it mount a
+# Secret nf-tls-<name> with their own certificate (URN SAN + RFC 9310 NFTypes,
+# docker/rust/certs/nf-identities.txt) and the CA certificate. Issued here,
+# kept on a re-run while current; the CA key never enters the cluster. The
+# Secret mounts are not optional: a pod without its Secret does not start.
+NF_TLS_CA="$("${SCRIPT_DIR}/nf-tls-secrets.sh" "${NAMESPACE}" "${SCRIPT_DIR}"/manifests/*.yaml)"
+# Each NF manifest is applied with its pod template stamped with that CA, so a
+# re-issued PKI rolls the NRF and every client onto it together.
+apply_nf() {
+  "${SCRIPT_DIR}/nf-tls-secrets.sh" --annotate "${NF_TLS_CA}" "${SCRIPT_DIR}/manifests/$1.yaml" \
+    | kubectl apply -f -
+}
+
 # --- Step 5: Deploy nextgcore NFs in dependency order ---
 echo ""
 echo "[5/9] Deploying nextgcore 5G Core Network Functions"
@@ -119,16 +132,16 @@ echo ""
 echo "[7/9] Deploying Core Network Functions"
 
 echo "  Deploying NRF..."
-kubectl apply -f "${SCRIPT_DIR}/manifests/nrf.yaml"
+apply_nf nrf
 kubectl rollout status deployment/nrf -n "${NAMESPACE}" --timeout=120s
 
 echo "  Deploying AUSF, UDM, UDR, PCF, NSSF, BSF..."
-kubectl apply -f "${SCRIPT_DIR}/manifests/ausf.yaml"
-kubectl apply -f "${SCRIPT_DIR}/manifests/udm.yaml"
-kubectl apply -f "${SCRIPT_DIR}/manifests/udr.yaml"
-kubectl apply -f "${SCRIPT_DIR}/manifests/pcf.yaml"
-kubectl apply -f "${SCRIPT_DIR}/manifests/nssf.yaml"
-kubectl apply -f "${SCRIPT_DIR}/manifests/bsf.yaml"
+apply_nf ausf
+apply_nf udm
+apply_nf udr
+apply_nf pcf
+apply_nf nssf
+apply_nf bsf
 
 echo "  Waiting for control plane NFs..."
 for nf in ausf udm udr pcf nssf bsf; do
@@ -136,7 +149,7 @@ for nf in ausf udm udr pcf nssf bsf; do
 done
 
 echo "  Deploying AMF..."
-kubectl apply -f "${SCRIPT_DIR}/manifests/amf.yaml"
+apply_nf amf
 kubectl rollout status deployment/amf -n "${NAMESPACE}" --timeout=120s
 
 # The UPF is applied BEFORE waiting on the SMF: the SMF's resolve-upf
@@ -145,7 +158,7 @@ kubectl rollout status deployment/amf -n "${NAMESPACE}" --timeout=120s
 # never applied. Only the UPF *Service* has to exist for DNS to resolve, not a
 # ready UPF pod, so applying both and then waiting is enough.
 echo "  Deploying SMF and UPF..."
-kubectl apply -f "${SCRIPT_DIR}/manifests/smf.yaml"
+apply_nf smf
 kubectl apply -f "${SCRIPT_DIR}/manifests/upf.yaml"
 
 kubectl rollout status deployment/smf -n "${NAMESPACE}" --timeout=120s
@@ -232,5 +245,7 @@ echo "  Grafana:    kubectl -n ${NAMESPACE} port-forward svc/grafana 3000:3000  
 echo "              (user admin; password: kubectl -n ${NAMESPACE} get secret grafana-admin -o jsonpath='{.data.password}' | base64 -d)"
 echo "  Prometheus: kubectl -n ${NAMESPACE} port-forward svc/prometheus 9090:9090    -> http://localhost:9090"
 echo "  Jaeger:     kubectl -n ${NAMESPACE} port-forward svc/jaeger 16686:16686      -> http://localhost:16686"
-echo "  NRF SBI:    kubectl -n ${NAMESPACE} port-forward svc/nrf 7777:7777           -> http://localhost:7777"
+echo "  NRF SBI:    kubectl -n ${NAMESPACE} port-forward svc/nrf 7777:7777           -> https://localhost:7777"
+echo "              (TLS: the CA certificate is ca.crt in Secret nf-tls-nrf; nrf.crt names DNS:nrf,"
+echo "               so: curl --http2 --cacert ca.crt --resolve nrf:7777:127.0.0.1 https://nrf:7777/...)"
 echo ""

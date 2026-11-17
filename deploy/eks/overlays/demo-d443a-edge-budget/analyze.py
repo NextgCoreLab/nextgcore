@@ -775,8 +775,8 @@ def notify_line(sub, status):
 
 EAS_KEYS_OK = ''.join(f'{e} uid={u} keydir=700:{u} jwk=644:{u} cross_uid={EAS_UID[EAS[(i + 1) % 3]]} cross=denied\n'
                       for i, (e, u) in enumerate(EAS_UID.items()))
-OAUTH2_OK = ('amf: 2026-11-17T10:00:00Z [INFO  nextgcore_amfd] OAuth2 enforcement enabled (JWKS: http://nrf:7777/x)\n'
-             'smf: 2026-11-17T10:00:00Z [INFO  nextgcore_smfd] OAuth2 enforcement enabled (JWKS: http://nrf:7777/x)\n'
+OAUTH2_OK = ('amf: 2026-11-17T10:00:00Z [INFO  nextgcore_amfd] OAuth2 enforcement enabled (JWKS: https://nrf:7777/x)\n'
+             'smf: 2026-11-17T10:00:00Z [INFO  nextgcore_smfd] OAuth2 enforcement enabled (JWKS: https://nrf:7777/x)\n'
              'bare-subscribe: 401\n')
 FALLBACK_ARMS = ('no-qos-mon', 'wrong-callback-token', 'no-upf-qos')
 
@@ -1323,7 +1323,7 @@ def negatives_of(arm):
         ] if arm == 'restart-flip' else [],
         'c_oauth2': [
             with_files(fx, **{'oauth2.txt': OAUTH2_OK.replace('amf: 2026', 'amf: \n#')}),
-            with_files(fx, **{'oauth2.txt': OAUTH2_OK.replace('OAuth2 enforcement enabled (JWKS: http://nrf:7777/x)\nbare',
+            with_files(fx, **{'oauth2.txt': OAUTH2_OK.replace('OAuth2 enforcement enabled (JWKS: https://nrf:7777/x)\nbare',
                                                               'started\nbare')}),
             with_files(fx, **{'oauth2.txt': OAUTH2_OK.replace('bare-subscribe: 401', 'bare-subscribe: 201')}),
             edit(fx, 'warm', 'ees.log', drop(r'EES registered at the NRF as AF')),

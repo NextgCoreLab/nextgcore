@@ -606,7 +606,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 docker/rust/certs/check-nf-identities.py --self-test
-          python3 docker/rust/certs/check-nf-identities.py
+          python3 docker/rust/certs/check-nf-identities.py --k8s
           out="$(mktemp -d)"
           bash docker/rust/certs/generate-dev-certs.sh --out "$out" >/dev/null
           rows="$(grep -cvE '^\s*(#|$)' docker/rust/certs/nf-identities.txt)"
