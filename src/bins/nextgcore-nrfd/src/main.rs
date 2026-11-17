@@ -8,6 +8,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use nextgcore_nrfd::nnrf_handler::{canonical_nf_instance_id, same_nf_instance_id};
 use nextgcore_nrfd::{
     apply_json_patch, discover_profiles, json_merge_patch, nf_manager, nrf_context_final,
     nrf_context_init, nrf_nnrf_nfm_send_nf_profile_changed_notify_all_async,
@@ -419,7 +420,10 @@ impl NrfPolicy {
                 for entry in keys {
                     match nextgcore_sbi::oauth::parse_es256_jwk(&entry.jwk) {
                         Ok(key) => {
-                            p.cca_trusted_keys.insert(entry.nf_instance_id.clone(), key);
+                            // Keyed as the registry keys an NF (#1633), so a
+                            // UUID configured in either case is found.
+                            p.cca_trusted_keys
+                                .insert(canonical_nf_instance_id(&entry.nf_instance_id), key);
                         }
                         // A malformed key is dropped (not fatal): the issuer
                         // then has no trusted key and its CCA is rejected at
@@ -547,8 +551,9 @@ impl NrfPolicy {
             };
             match nextgcore_sbi::oauth::parse_es256_jwk(&jwk) {
                 Ok(key) => {
+                    // Keyed canonically, as the inline keys are (#1633).
                     self.cca_trusted_keys
-                        .insert(nf_instance_id.to_string(), key);
+                        .insert(canonical_nf_instance_id(nf_instance_id), key);
                     loaded += 1;
                 }
                 Err(e) => log::warn!(
@@ -3164,7 +3169,7 @@ fn verify_cca_binding(
     // `sub` (and, per TS 29.510 §6.7.5, the assertion is self-issued so `iss`
     // equals `sub`) must be the NF Instance ID asserted in the token request.
     let sub = payload.get("sub").and_then(|v| v.as_str()).unwrap_or("");
-    if sub != expected_nf_instance_id {
+    if !same_nf_instance_id(sub, expected_nf_instance_id) {
         return Err((
             "invalid_client",
             format!(
@@ -3173,7 +3178,7 @@ fn verify_cca_binding(
         ));
     }
     if let Some(iss) = payload.get("iss").and_then(|v| v.as_str()) {
-        if iss != expected_nf_instance_id {
+        if !same_nf_instance_id(iss, expected_nf_instance_id) {
             return Err((
                 "invalid_client",
                 format!("CCA issuer {iss:?} does not match request nfInstanceId"),
@@ -3348,7 +3353,7 @@ fn resolve_cca_verifying_key(
             // §13.3.8.3's final bullet, the reason this issue exists. Both ids are
             // named: a mismatch is an operator-visible misissuance or an attempted
             // impersonation, and "they differ" without saying how is undiagnosable.
-            if verified.nf_instance_id != nf_instance_id {
+            if !same_nf_instance_id(&verified.nf_instance_id, nf_instance_id) {
                 return Err((
                     "invalid_client",
                     format!(
@@ -3378,9 +3383,20 @@ fn resolve_cca_verifying_key(
         CcaCertReference::Absent => {
             // No certificate reference: the pre-#393 trust-store path (issue #187).
             // Fail-closed, unchanged — an issuer with no trusted key is refused.
-            match policy.cca_trusted_keys.get(nf_instance_id) {
+            match policy
+                .cca_trusted_keys
+                .get(&canonical_nf_instance_id(nf_instance_id))
+            {
                 Some(k) => Ok(*k),
-                None => match policy.lookup_cca_trusted_key_on_disk(nf_instance_id) {
+                // The file as the request spells the ID, then in the registry's
+                // spelling (#1633).
+                None => match policy
+                    .lookup_cca_trusted_key_on_disk(nf_instance_id)
+                    .or_else(|| {
+                        policy.lookup_cca_trusted_key_on_disk(&canonical_nf_instance_id(
+                            nf_instance_id,
+                        ))
+                    }) {
                     Some(k) => Ok(k),
                     None => Err((
                         "invalid_client",
@@ -3608,13 +3624,15 @@ impl RegistrantIdentity {
     }
 
     /// The `{nfInstanceID}` the request targets must be every verified identity
-    /// of the caller. UUIDs compare case-insensitively (TS 29.510 §5.2.2.2.2).
+    /// of the caller, compared as the registry keys them: a UUID
+    /// case-insensitively (TS 29.510 §5.2.2.2.2), any other ID exactly, so a
+    /// certificate for `nf-a` cannot manage a distinct `NF-A` entry (#1633).
     /// `Some` is the refusal to send.
     fn bind_instance(&self, operation: &str, nf_instance_id: &str) -> Option<SbiResponse> {
         let (source, id) = self
             .instance_ids
             .iter()
-            .find(|(_, id)| !id.eq_ignore_ascii_case(nf_instance_id.trim()))?;
+            .find(|(_, id)| !same_nf_instance_id(id, nf_instance_id.trim()))?;
         // debug, not warn: a peer can send these at will (#1620 review m7); the
         // refusal is counted by the NRF's per-operation outcome metrics.
         log::debug!(
@@ -3673,7 +3691,7 @@ fn verify_transport_binding(
     cert_nf_instance_id: &str,
     expected_nf_instance_id: &str,
 ) -> Result<(), (&'static str, String)> {
-    if cert_nf_instance_id != expected_nf_instance_id {
+    if !same_nf_instance_id(cert_nf_instance_id, expected_nf_instance_id) {
         return Err((
             "invalid_client",
             format!(
@@ -3736,7 +3754,9 @@ fn authenticate_token_client(
 
     if let Some(cert_id) = extract_transport_client_nf_instance_id(request, policy) {
         verify_transport_binding(&cert_id, nf_instance_id)?;
-        auth.identity = Some(cert_id);
+        // The registry's spelling (#1633): the token subject is then the same
+        // whatever case the certificate and the request used.
+        auth.identity = Some(canonical_nf_instance_id(&cert_id));
         auth.via_transport = true;
     }
 
@@ -3755,7 +3775,7 @@ fn authenticate_token_client(
             // certificate identity was also present both bind to the same
             // nfInstanceId, so this does not overwrite it with anything different.
             auth.identity
-                .get_or_insert_with(|| nf_instance_id.to_string());
+                .get_or_insert_with(|| canonical_nf_instance_id(nf_instance_id));
         }
     }
 
@@ -7586,6 +7606,188 @@ mod tests {
             .expect("signature holds after the round trip");
     }
 
+    /// **#1633 review m1.** Every identity check of the token endpoint compares
+    /// NF Instance IDs as the registry keys them: a UUID case-insensitively (TS
+    /// 29.510 §5.2.2.2.2), any other ID exactly. Over the real handler, for each
+    /// proof:
+    /// - mTLS (`verify_transport_binding`): a certificate naming the UUID in
+    ///   upper case authenticates the lower-case request;
+    /// - a trust-store CCA (`verify_cca_binding` sub/iss, the key lookup): an
+    ///   upper-case `sub`/`iss` authenticates the lower-case request, and an
+    ///   upper-case request finds the key of the lower-case NF;
+    /// - an x5c CCA (`resolve_cca_verifying_key`): a leaf naming the UUID in
+    ///   upper case binds the lower-case assertion.
+    ///
+    /// Each token's `sub` is the canonical (lower-case) ID. A non-UUID ID that
+    /// differs only in case is refused, `invalid_client`, by every proof.
+    #[tokio::test]
+    async fn token_endpoint_identity_checks_fold_only_uuid_case_1633() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        use serde_json::json;
+
+        let (consumer_id, producer_id, ctype, ptype) = register_pair("nrfd1633m1");
+        let lower = "1633c0de-0000-4000-8000-0000000000a1";
+        let upper = lower.to_ascii_uppercase();
+        let legacy = "nrfd1633m1-legacy";
+        let legacy_upper = legacy.to_ascii_uppercase();
+        for id in [lower, legacy] {
+            nf_manager()
+                .register(
+                    NfProfile::from_json(&json!({
+                        "nfInstanceId": id, "nfType": ctype, "nfStatus": "REGISTERED",
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let sub_of = |resp: &SbiResponse| -> String {
+            assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+            let token = error_of(resp)["access_token"]
+                .as_str()
+                .expect("access_token")
+                .to_string();
+            let claims: serde_json::Value = serde_json::from_slice(
+                &URL_SAFE_NO_PAD
+                    .decode(token.split('.').nth(1).expect("payload"))
+                    .expect("base64url"),
+            )
+            .expect("claims");
+            claims["sub"].as_str().expect("sub").to_string()
+        };
+        let refused = |resp: &SbiResponse, what: &str| {
+            assert_eq!(resp.status, 400, "{what}: {:?}", resp.http.content);
+            assert_eq!(error_of(resp)["error"], "invalid_client", "{what}");
+        };
+        let req = |id: &str, cca: Option<&str>, xfcc: Option<&str>| {
+            auth_token_req(id, &ctype, &ptype, cca, xfcc)
+        };
+
+        // mTLS, through a declared terminator.
+        let fwd = NrfPolicy {
+            trust_forwarded_client_cert: true,
+            ..NrfPolicy::default()
+        };
+        let resp = handle_access_token_request_with_policy(
+            &req(lower, None, Some(&format!("Hash=ab;URI=urn:uuid:{upper}"))),
+            &fwd,
+        )
+        .await;
+        assert_eq!(sub_of(&resp), lower, "mTLS, upper-case certificate");
+        let resp = handle_access_token_request_with_policy(
+            &req(
+                legacy,
+                None,
+                Some(&format!("Hash=ab;URI=urn:uuid:{legacy_upper}")),
+            ),
+            &fwd,
+        )
+        .await;
+        refused(&resp, "mTLS, non-UUID differing in case");
+
+        // A CCA verified against the trust store.
+        let key = nextgcore_sbi::oauth::generate_es256_key();
+        let trusted: std::collections::HashMap<_, _> = [lower, legacy]
+            .into_iter()
+            .map(|id| (id.to_string(), *key.verifying_key()))
+            .collect();
+        let store = NrfPolicy {
+            cca_trusted_keys: trusted,
+            ..NrfPolicy::default()
+        };
+        let cca = nextgcore_sbi::oauth::mint_cca(&key, &upper, "NRF", now, 60, &[]);
+        let resp =
+            handle_access_token_request_with_policy(&req(lower, Some(&cca), None), &store).await;
+        assert_eq!(sub_of(&resp), lower, "trust store, upper-case sub/iss");
+        let cca = nextgcore_sbi::oauth::mint_cca(&key, &upper, "NRF", now, 60, &[]);
+        let resp =
+            handle_access_token_request_with_policy(&req(&upper, Some(&cca), None), &store).await;
+        assert_eq!(sub_of(&resp), lower, "trust store, upper-case request");
+        let cca = nextgcore_sbi::oauth::mint_cca(&key, &legacy_upper, "NRF", now, 60, &[]);
+        let resp =
+            handle_access_token_request_with_policy(&req(legacy, Some(&cca), None), &store).await;
+        refused(&resp, "trust store, non-UUID sub differing in case");
+
+        // A CCA carrying its x5c certificate.
+        let (ca_der, ca, ca_key) = cca_test_ca();
+        let anchored = NrfPolicy {
+            cca_trust_anchors: vec![ca_der],
+            ..NrfPolicy::default()
+        };
+        let leaf = cca_test_leaf(&key, &upper, &ca, &ca_key);
+        let cca = nextgcore_sbi::oauth::mint_cca(&key, lower, "NRF", now, 60, &[leaf]);
+        let resp =
+            handle_access_token_request_with_policy(&req(lower, Some(&cca), None), &anchored).await;
+        assert_eq!(sub_of(&resp), lower, "x5c, upper-case certificate");
+        let leaf = cca_test_leaf(&key, &legacy_upper, &ca, &ca_key);
+        let cca = nextgcore_sbi::oauth::mint_cca(&key, legacy, "NRF", now, 60, &[leaf]);
+        let resp =
+            handle_access_token_request_with_policy(&req(legacy, Some(&cca), None), &anchored)
+                .await;
+        refused(&resp, "x5c, non-UUID certificate differing in case");
+
+        for id in [lower, legacy, &consumer_id, &producer_id] {
+            nf_manager().deregister(id).ok();
+        }
+    }
+
+    /// **#1633 review m1.** A key in `cca_trusted_keys_dir` is keyed by the
+    /// canonical ID when the directory is loaded, and a key published after
+    /// start is also looked up under the canonical file name, so a UUID in
+    /// either case finds it.
+    #[test]
+    fn directory_trusted_cca_keys_are_found_in_either_uuid_case_1633() {
+        let now = 1_700_000_000u64;
+        let dir = std::env::temp_dir().join(format!("nrfd1633-jwks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let key = nextgcore_sbi::oauth::generate_es256_key();
+        let loaded = "1633e0e0-0000-4000-8000-0000000000d4";
+        nextgcore_sbi::oauth::publish_cca_public_jwk(&key, &loaded.to_ascii_uppercase(), &dir)
+            .expect("publish");
+        let yaml: NrfYaml = serde_yaml::from_str(&format!(
+            "nrf:\n  sbi:\n    oauth2:\n      cca_trusted_keys_dir: {}\n",
+            dir.display()
+        ))
+        .expect("parse yaml");
+        let policy = NrfPolicy::from_yaml(&yaml);
+        assert!(
+            policy.cca_trusted_keys.contains_key(loaded),
+            "{:?}",
+            policy.cca_trusted_keys.keys().collect::<Vec<_>>()
+        );
+
+        let late = "1633e0e0-0000-4000-8000-0000000000e5";
+        let late_upper = late.to_ascii_uppercase();
+        nextgcore_sbi::oauth::publish_cca_public_jwk(&key, late, &dir).expect("publish");
+        let cca = nextgcore_sbi::oauth::mint_cca(&key, &late_upper, "NRF", now, 60, &[]);
+        let found = resolve_cca_verifying_key(&policy, &cca, &late_upper, now);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(found.ok(), Some(*key.verifying_key()));
+    }
+
+    /// **#1633 review m1.** A configured CCA trusted key is stored under the
+    /// canonical ID, so a UUID written in upper case in the config is found.
+    #[test]
+    fn a_trusted_cca_key_is_keyed_canonically_1633() {
+        let yaml_str = "nrf:\n  sbi:\n    oauth2:\n      cca_verify_signature: true\n      \
+             cca_trusted_keys:\n        - nfInstanceId: 1633C0DE-0000-4000-8000-0000000000B2\n          \
+             jwk:\n            kty: EC\n            crv: P-256\n            \
+             x: f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\n            \
+             y: x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\n        \
+             - nfInstanceId: NF-1633\n          jwk:\n            kty: EC\n            \
+             crv: P-256\n            x: f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\n            \
+             y: x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\n";
+        let yaml: NrfYaml = serde_yaml::from_str(yaml_str).expect("parse yaml");
+        let policy = NrfPolicy::from_yaml(&yaml);
+        let mut keys: Vec<_> = policy.cca_trusted_keys.keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["1633c0de-0000-4000-8000-0000000000b2", "NF-1633"]);
+    }
+
     /// Issue #64 gap 2: `authenticate_token_client` returns an identity ONLY for
     /// proven evidence, and records HOW it was proven.
     #[test]
@@ -9497,7 +9699,7 @@ mod registrant_binding_tests_1611 {
             let upper = own.to_ascii_uppercase();
             let resp = put(&client, &upper, "CUSTOM_T1611A").await;
             assert_eq!(resp.status, 201, "{:?}", resp.http.content);
-            // The registry keys instances as written; drop the upper-case one.
+            // One entry, under the canonical ID (#1633); drop it.
             let _ = nf_manager().deregister(&upper);
             let resp = put(&client, own, "CUSTOM_T1611A").await;
             assert_eq!(resp.status, 201, "{:?}", resp.http.content);
@@ -9566,6 +9768,57 @@ mod registrant_binding_tests_1611 {
             .await
             .expect("bounded");
         let _ = nf_manager().deregister(other);
+        server.stop().await.ok();
+    }
+
+    /// **#1633 review m2.** The registrant binding compares as the registry
+    /// keys: a UUID case-insensitively, any other ID exactly. Over real mutual
+    /// TLS, a certificate for `nrfd1633-m2` cannot register `NRFD1633-M2`, a
+    /// distinct registry entry (400 INVALID_CLIENT, nothing stored), but
+    /// registers its own ID; a certificate naming a UUID in upper case manages
+    /// the lower-case instance.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_registrant_binding_folds_only_uuid_case_1633() {
+        let own = "nrfd1633-m2";
+        let other = own.to_ascii_uppercase();
+        let (server, client) = mtls_nrf("m2-1633", Some(&format!("urn:uuid:{own}")), None).await;
+        let run = async {
+            let resp = put(&client, &other, "CUSTOM_T1633M2").await;
+            assert_eq!(resp.status, 400, "{:?}", resp.http.content);
+            assert_eq!(cause(&resp), "INVALID_CLIENT");
+            assert!(stored_type(&other).is_none(), "nothing stored for {other}");
+            let resp = put(&client, own, "CUSTOM_T1633M2").await;
+            assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+            let resp = client
+                .delete(&format!("/nnrf-nfm/v1/nf-instances/{other}"))
+                .await
+                .expect("DELETE completes");
+            assert_eq!(resp.status, 400, "{:?}", resp.http.content);
+            assert_eq!(stored_type(own).as_deref(), Some("CUSTOM_T1633M2"));
+        };
+        tokio::time::timeout(Duration::from_secs(30), run)
+            .await
+            .expect("bounded");
+        let _ = nf_manager().deregister(own);
+        server.stop().await.ok();
+
+        let lower = "1633d0d0-0000-4000-8000-0000000000c3";
+        let upper = lower.to_ascii_uppercase();
+        let (server, client) =
+            mtls_nrf("m2-1633-uuid", Some(&format!("urn:uuid:{upper}")), None).await;
+        let run = async {
+            let resp = put(&client, lower, "CUSTOM_T1633M2").await;
+            assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+            let resp = client
+                .delete(&format!("/nnrf-nfm/v1/nf-instances/{lower}"))
+                .await
+                .expect("DELETE completes");
+            assert_eq!(resp.status, 204, "{:?}", resp.http.content);
+        };
+        tokio::time::timeout(Duration::from_secs(30), run)
+            .await
+            .expect("bounded");
+        let _ = nf_manager().deregister(lower);
         server.stop().await.ok();
     }
 
@@ -9661,7 +9914,7 @@ mod registrant_binding_tests_1611 {
 
         // A verified token subject.
         let token = RegistrantIdentity::of(&request_with(None, &[], None, Some("nf-a")), &plain);
-        assert!(token.bind_instance("NFRegister", "NF-A").is_none());
+        assert!(token.bind_instance("NFRegister", "nf-a").is_none());
         assert_eq!(
             token
                 .bind_instance("NFRegister", "nf-b")
