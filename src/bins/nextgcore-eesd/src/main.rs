@@ -442,7 +442,10 @@ async fn main() -> Result<()> {
     // the demo's subscriber below sends its first request to the SMF.
     if let Some(nrf_uri) = args.nrf_uri.as_deref() {
         match sbi.registration_host() {
-            Ok(host) => nrf_af::start(nrf_uri, host).await,
+            Ok(host) => {
+                let scheme = if args.tls { "https" } else { "http" };
+                nrf_af::start(nrf_uri, host, scheme, sbi_port).await
+            }
             Err(why) => log::error!("{why} (NRF registration skipped: no 5GC access tokens)"),
         }
     }
@@ -3012,7 +3015,18 @@ async fn handle_eec_context_push(request: &SbiRequest) -> SbiResponse {
 /// yaml:93-100) narrows the `sessCntxs` of the returned `EECContext` to the
 /// requested `easId`s. Success is 200 with the `EECContext`, else 404.
 async fn handle_eec_context_pull(request: &SbiRequest) -> SbiResponse {
-    let params = parse_query_params(&request.header.uri);
+    // #1664: over the wire the SBI server moves the query into `http.params`
+    // (already decoded) and leaves `header.uri` as the bare path, so reading
+    // only the URI answered every real pull 400. The URI form stays for
+    // in-process callers that hand the router a URI with its query.
+    let mut params = parse_query_params(&request.header.uri);
+    params.extend(
+        request
+            .http
+            .params
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone())),
+    );
     let ees_id = query_param(&params, "ees-id").unwrap_or("");
     let cntx_id = query_param(&params, "eec-cntx-id").unwrap_or("");
     if ees_id.trim().is_empty() || cntx_id.trim().is_empty() {
@@ -6421,5 +6435,71 @@ mod tests {
 
         notifier::set_notifier(std::sync::Arc::new(notifier::QueueNotifier::default()));
         auth::clear_auth_jwks();
+    }
+}
+
+/// #1664 (operator decision, option 1): the T-EES's EEC context pull presents an
+/// NRF-issued bearer of scope `eees-eeccontextreloc`, so it passes the S-EES's
+/// own gate (`auth::require_oauth2` on `/eees-eeccontextreloc/v1/eec-contexts`).
+#[cfg(test)]
+mod relocation_pull_token_1664_tests {
+    use super::*;
+    use nextgcore_sbi::test_support::oauth2 as stand_in;
+
+    /// The S-EES here is eesd's real router on loopback, trusting the stand-in
+    /// NRF's JWKS. An unknown context answers 404 only past the gate, so
+    /// `NotFound` is a pull that passed it; without the token the same pull is
+    /// refused 401. The stand-in NRF signs whatever scope is asked for, so the
+    /// gate's scope check (403 otherwise) is what proves the scope.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guards held across .await to serialize process-global state
+    async fn the_relocation_pull_passes_the_s_ees_gate_with_an_nrf_token() {
+        let _auth = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _hook = relocation::lock_pull_hook();
+        relocation::clear_pull_hook();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        ees_context_init(512);
+
+        let sk = nextgcore_sbi::oauth::generate_es256_key();
+        let (_nrf, nrf_port) = stand_in::token_nrf(sk.clone()).await;
+        auth::set_auth_jwks(stand_in::jwks_for(&sk, stand_in::TEST_NRF_KID));
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let s_ees = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), listener);
+        s_ees
+            .start(ees_sbi_request_handler)
+            .await
+            .expect("S-EES starts");
+
+        let pull = || {
+            relocation::pull_eec_context(relocation::PullRequest {
+                src_ees_id: format!("http://127.0.0.1:{}", addr.port()),
+                eec_cntx_id: "cntx-unknown-1664".into(),
+                self_ees_id: "t-ees-1664".into(),
+            })
+        };
+        *nrf_af::OAUTH2_CLIENT_TEST_OVERRIDE
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(stand_in::oauth2_client_for(
+            nrf_port,
+            nextgcore_sbi::types::NfType::Af,
+        ));
+        let with_token = pull().await;
+        *nrf_af::OAUTH2_CLIENT_TEST_OVERRIDE
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        let without_token = pull().await;
+        auth::clear_auth_jwks();
+
+        assert_eq!(
+            with_token,
+            relocation::PullOutcome::NotFound,
+            "past the gate"
+        );
+        assert_eq!(
+            without_token,
+            relocation::PullOutcome::Failed("S-EES answered 401".to_string())
+        );
     }
 }

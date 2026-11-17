@@ -31,6 +31,8 @@
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
+use nextgcore_sbi::security::{sbi_peer_client_config, SbiProfile};
+use nextgcore_sbi::types::NfType;
 use nextgcore_sbi::{SbiClient, SbiClientConfig, SbiRequest, UriScheme};
 
 use crate::services::EECContext;
@@ -185,12 +187,26 @@ pub async fn pull_eec_context(request: PullRequest) -> PullOutcome {
         request.self_ees_id, request.eec_cntx_id
     );
     let client = SbiClient::new(
-        SbiClientConfig::new(host, port)
-            .with_scheme(scheme)
+        pull_client_config(scheme, &host, port)
             .with_request_timeout(PULL_TIMEOUT)
             .with_pool_size(1),
     );
-    match client.send_request(SbiRequest::get(uri)).await {
+    let mut get = SbiRequest::get(uri);
+    // #1664 (operator decision, option 1): the S-EES gates this resource on a
+    // bearer of scope `eees-eeccontextreloc` (TS 29558_Eees_EECContextRelocation
+    // `oAuth2ClientCredentials`), so the pull presents an NRF-issued one when this
+    // EES has an NRF. The token is asked for the AF type, as which every EES,
+    // the S-EES included, registers (`nrf_af::af_profile`).
+    if let Some(oauth2) = crate::nrf_af::oauth2_client() {
+        match oauth2
+            .authorization_header(NfType::Af, crate::auth::SCOPE_EECCONTEXTRELOC)
+            .await
+        {
+            Ok(bearer) => get = get.with_header("authorization", bearer),
+            Err(e) => return PullOutcome::Failed(format!("no access token: {e}")),
+        }
+    }
+    match client.send_request(get).await {
         Ok(resp) if resp.status == 200 => match resp.http.content.as_deref() {
             Some(body) => match serde_json::from_str::<EECContext>(body) {
                 Ok(ctx) => PullOutcome::Retrieved(Box::new(ctx)),
@@ -201,6 +217,20 @@ pub async fn pull_eec_context(request: PullRequest) -> PullOutcome {
         Ok(resp) if resp.status == 404 => PullOutcome::NotFound,
         Ok(resp) => PullOutcome::Failed(format!("S-EES answered {}", resp.status)),
         Err(e) => PullOutcome::Failed(format!("transport error: {e}")),
+    }
+}
+
+/// The client configuration for the pull to `host:port`.
+///
+/// #1664: under the `production` SBI profile the pull is https with this EES's
+/// client certificate (`sbi_peer_client_config`, TS 33.501 §13.1.0), whatever
+/// scheme `srcEesId` names: the scheme follows the profile, as for every peer
+/// client (configuration/overview.md, mixed deployments are not supported).
+/// Under `dev` the scheme is the one `srcEesId` names, as before.
+fn pull_client_config(scheme: UriScheme, host: &str, port: u16) -> SbiClientConfig {
+    match SbiProfile::resolve() {
+        SbiProfile::Production => sbi_peer_client_config(host, port),
+        SbiProfile::Dev => SbiClientConfig::new(host, port).with_scheme(scheme),
     }
 }
 
