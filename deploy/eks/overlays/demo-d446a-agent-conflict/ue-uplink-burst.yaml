@@ -39,10 +39,18 @@ spec:
         - sh
         - -c
         - |
+          # Fail closed: a UE that would send the incidental IPv6 packet does
+          # not start (the pod restarts and the rollout reports it), and
+          # scenario.sh asserts the banner below in the ue log.
           if [ -d /proc/sys/net/ipv6 ]; then
-            echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6 \
-              && echo 1 > /proc/sys/net/ipv6/conf/default/disable_ipv6 \
-              && echo "[ue] IPv6 off in the pod network namespace (nextgcore#1630)"
+            if ! { echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6 \
+                   && echo 1 > /proc/sys/net/ipv6/conf/default/disable_ipv6; }; then
+              echo "[ue] FATAL: could not turn IPv6 off (nextgcore#1630)" >&2
+              exit 1
+            fi
+            echo "[ue] IPv6 off in the pod network namespace (nextgcore#1630)"
+          else
+            echo "[ue] IPv6 off: this kernel has no IPv6 (nextgcore#1630)"
           fi
           exec nr-ue "$@"
         - nr-ue
