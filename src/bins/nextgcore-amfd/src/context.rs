@@ -2270,6 +2270,40 @@ impl AmfContext {
         None
     }
 
+    /// #1650: take every paging context of a UE being deregistered: the one keyed by
+    /// `amf_ue_ngap_id`, and any paging its 5G-S-TMSI `(AMF Set ID, AMF Pointer,
+    /// 5G-TMSI)`, which a UE that came back on a new connection (a DEREGISTRATION
+    /// REQUEST from 5GMM-IDLE) left under its idle record's ID.
+    pub fn paging_take_for_ue(
+        &self,
+        amf_ue_ngap_id: u64,
+        s_tmsi: Option<(u16, u8, u32)>,
+    ) -> Vec<PagingContext> {
+        let Ok(mut paging_map) = self.paging_map.write() else {
+            return Vec::new();
+        };
+        let ids: Vec<u64> = paging_map
+            .iter()
+            .filter(|(id, c)| {
+                **id == amf_ue_ngap_id || s_tmsi == Some((c.amf_set_id, c.amf_pointer, c.tmsi))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| paging_map.remove(&id))
+            .collect()
+    }
+
+    /// #1650: drop the queued connected-UE transfers of these UEs. Returns how many.
+    pub fn connected_downlink_remove_for(&self, amf_ue_ngap_ids: &[u64]) -> usize {
+        let Ok(mut q) = self.connected_downlink_queue.write() else {
+            return 0;
+        };
+        let before = q.len();
+        q.retain(|item| !amf_ue_ngap_ids.contains(&item.amf_ue_ngap_id));
+        before - q.len()
+    }
+
     /// Get paging context for a UE
     pub fn paging_find(&self, amf_ue_ngap_id: u64) -> Option<PagingContext> {
         if let Ok(paging_map) = self.paging_map.read() {

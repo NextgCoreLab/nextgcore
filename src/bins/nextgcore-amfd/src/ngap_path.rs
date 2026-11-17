@@ -9409,6 +9409,9 @@ impl NgapServer {
     /// for a UE with no N2 connection.
     fn deregistered_ue_cleanup(&mut self, amf_ue_ngap_id: u64) {
         self.terminate_policy_associations(amf_ue_ngap_id);
+        // #1650: a deregistered UE is paged no more. Before the remove below, which
+        // drops the 5G-S-TMSI a page may be keyed by.
+        self.stop_paging_on_deregistration(amf_ue_ngap_id);
 
         // #291: free the UE's EPS bearer identities. Done HERE, in the common tail of
         // both deregistration directions, and BEFORE `ue_auth_state` is dropped —
@@ -14014,6 +14017,9 @@ impl NgapServer {
         // policy associations end with it (TS 23.502 §4.16.3.2). Before
         // `forget_ue`, which drops the ids.
         self.terminate_policy_associations(amf_ue_ngap_id);
+        // #1650: and the UE is paged no more. Before `forget_ue`, which drops the
+        // 5G-S-TMSI a page may be keyed by.
+        self.stop_paging_on_deregistration(amf_ue_ngap_id);
         // `forget_ue`, not a bare remove (#356): this path never reaches
         // `release_ue` -- deliberately, since no NAS message can be sent to an
         // unreachable UE -- so it is the third place an emergency context has
@@ -20411,17 +20417,61 @@ impl NgapServer {
         }
     }
 
-    /// Final T3513 expiry: notify the requester and clear the session's paging
-    /// state, so a later transfer is not refused as "paging ongoing".
-    fn paging_abandoned(&self, paging: &crate::context::PagingContext) {
+    /// #1650: the UE is being deregistered (UE-initiated, network-initiated, local or
+    /// implicit), so it is paged no more (TS 24.501 §5.6.2.2.1 pages a registered UE
+    /// only). Its paging contexts are taken, each requester owed a failure
+    /// notification gets one at once (TS 29.518 §5.2.2.3.2) with
+    /// `FAILURE_CAUSE_UNSPECIFIED`, the session paging state is cleared, and the
+    /// UE's queued connected downlinks are dropped. Taken from the paging map, so
+    /// the T3513 pump cannot also abandon them: one notification each.
+    fn stop_paging_on_deregistration(&self, amf_ue_ngap_id: u64) {
+        let s_tmsi = self.ue_auth_state.get(amf_ue_ngap_id).and_then(|s| {
+            let g = &s.amf_ue.current_guti;
+            (g.tmsi != 0).then_some((g.amf_set_id, g.amf_pointer, g.tmsi))
+        });
+        let (pages, dropped) = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            let pages = guard.paging_take_for_ue(amf_ue_ngap_id, s_tmsi);
+            let mut ids = vec![amf_ue_ngap_id];
+            ids.extend(pages.iter().map(|p| p.amf_ue_ngap_id));
+            (pages, guard.connected_downlink_remove_for(&ids))
+        };
+        for paging in &pages {
+            self.paging_ended(paging, "FAILURE_CAUSE_UNSPECIFIED");
+            log::info!(
+                "Paging stopped for UE {} on its deregistration{}",
+                paging.amf_ue_ngap_id,
+                if paging.failure_notify_uri.is_some() {
+                    ", requester notified (FAILURE_CAUSE_UNSPECIFIED)"
+                } else {
+                    ""
+                }
+            );
+        }
+        if dropped > 0 {
+            log::info!("UE {amf_ue_ngap_id} deregistered: {dropped} queued downlink(s) dropped");
+        }
+    }
+
+    /// A page ended without its UE answering: notify the requester with `cause` and
+    /// clear the session's paging state, so a later transfer is not refused as
+    /// "paging ongoing".
+    fn paging_ended(&self, paging: &crate::context::PagingContext, cause: &str) {
         if let Some(uri) = &paging.failure_notify_uri {
             crate::namf_server::send_n1n2_failure_notification(
                 uri.clone(),
-                "UE_NOT_RESPONDING",
+                cause,
                 paging.n1n2_msg_data_uri.clone(),
             );
         }
         clear_session_paging(paging);
+    }
+
+    /// Final T3513 expiry: notify the requester and clear the session's paging
+    /// state, so a later transfer is not refused as "paging ongoing".
+    fn paging_abandoned(&self, paging: &crate::context::PagingContext) {
+        self.paging_ended(paging, "UE_NOT_RESPONDING");
         log::warn!(
             "Paging abandoned for UE {}: no response after {} attempt(s){}",
             paging.amf_ue_ngap_id,
@@ -24936,6 +24986,169 @@ mod tests {
             !after.paging.ongoing,
             "abandonment clears the session's paging state"
         );
+    }
+
+    /// **#1650**, TS 24.501 §5.6.2.2.1 (only a registered UE is paged) and TS 29.518
+    /// §5.2.2.3.2: a deregistration stops the UE's paging at once, on every entry
+    /// path. For each, the page goes out first (the positive control); after the
+    /// deregistration the page is gone, the next pump passes send no PAGING, the
+    /// session's paging state is cleared, the UE's queued downlink is dropped, and
+    /// the requester's failure notification (FAILURE_CAUSE_UNSPECIFIED) arrives at
+    /// a real sink, once.
+    /// - implicit: the implicit deregistration timer expires;
+    /// - network (local): a new AMF serves the UE (UE_INITIAL_REGISTRATION). Its
+    ///   record knows no 5G-S-TMSI, so the page is found by its ID;
+    /// - UE-initiated: the UE, back on a new connection, switches off. Its page
+    ///   is keyed by its idle record's ID and found by its 5G-S-TMSI.
+    #[tokio::test]
+    async fn a_deregistration_stops_the_ues_paging_1650() {
+        const TAC_1650: u32 = 0x1650;
+        let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        let _queue = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (sink, port, mut rx) = notify_sink().await;
+        let mut ngap = capturing_ngap_server().await;
+        insert_pws_test_gnb(
+            &ngap,
+            16_501,
+            0x1650,
+            crate::context::RatType::Nr,
+            &[("001", "01", TAC_1650)],
+        )
+        .await;
+
+        for (case, paged_id, live_id) in [
+            ("implicit", 16_500_001u64, 16_500_001u64),
+            ("network", 16_500_011, 16_500_011),
+            ("ue-initiated", 16_500_021, 16_500_022),
+        ] {
+            // The idle UE, paged for PSI 5 with a requester owed a failure
+            // notification, and one downlink queued behind the page.
+            let mut idle = idle_registered_ue(paged_id);
+            idle.amf_ue.supi = Some(format!("imsi-0010100016{paged_id:05}"));
+            // The network case's record knows no 5G-S-TMSI, so its page is found by
+            // its ID alone; the UE-initiated case's only by its 5G-S-TMSI.
+            idle.amf_ue.current_guti.tmsi = if case == "network" {
+                0
+            } else {
+                paged_id as u32
+            };
+            ngap.ue_auth_state.insert(paged_id, idle);
+            let data_uri = format!("/namf-comm/v1/ue-contexts/{case}/n1-n2-messages/5");
+            {
+                let ctx = crate::context::amf_self();
+                let guard = ctx.read().expect("ctx lock");
+                let mut sess = guard.sess_add(paged_id, 5).expect("session");
+                sess.store_paging_info(&data_uri, None);
+                guard.sess_update(&sess);
+                let mut paging = paged_ue(paged_id, 4);
+                // A TAC no other test pages: the paging map is process-global, and
+                // this server's one gNB serves this TAC alone, so a sibling's page
+                // is never sent here.
+                paging.tac = TAC_1650;
+                paging.tai_list = vec![(PlmnId::new("001", "01"), TAC_1650)];
+                paging.pdu_session_id = Some(5);
+                paging.failure_notify_uri = Some(format!("http://127.0.0.1:{port}/fail/{case}"));
+                paging.n1n2_msg_data_uri = data_uri.clone();
+                guard.paging_add(paging);
+                guard.connected_downlink_add(crate::context::PendingConnectedDownlink {
+                    amf_ue_ngap_id: paged_id,
+                    pdu_session_id: 5,
+                    n1: Some(vec![0x2E, 0x05, 0x00, 0xCB]),
+                    n2: crate::context::ConnectedN2::None,
+                    failure_notify_uri: None,
+                    n1_only: true,
+                });
+            }
+            take_sent_ngap(&mut ngap);
+            ngap.process_paging_with(Duration::from_secs(3600)).await;
+            assert!(
+                !take_sent_ngap(&mut ngap).is_empty(),
+                "{case}: the page goes out"
+            );
+
+            match case {
+                "implicit" => {
+                    ngap.ue_auth_state.with_mut(paged_id, |s| {
+                        s.reachability = Some(Reachability {
+                            phase: ReachabilityPhase::ImplicitDeregistration,
+                            deadline: Instant::now(),
+                        });
+                    });
+                    ngap.process_reachability_timers().await.expect("timers");
+                }
+                "network" => ngap.local_deregistration(paged_id).await.expect("local"),
+                _ => {
+                    // Back on a new connection, the idle record taken over.
+                    let mut idle = ngap.ue_auth_state.remove(paged_id).expect("idle UE");
+                    handler_tests::secured_registered_ue(&mut ngap, live_id, 165);
+                    idle.amf_ue.supi = None;
+                    ngap.ue_auth_state.with_mut(live_id, |s| {
+                        s.amf_ue.current_guti = idle.amf_ue.current_guti.clone();
+                    });
+                    let dereg = handler_tests::ue_protect(
+                        &handler_tests::switch_off_deregistration_request(),
+                        0,
+                    );
+                    ngap.handle_uplink_nas_transport(
+                        handler_tests::ASSOC,
+                        &handler_tests::uplink_nas_transport(live_id, 165, &dereg),
+                    )
+                    .await
+                    .expect("handled");
+                }
+            }
+            assert!(
+                !ngap.ue_auth_state.contains(live_id),
+                "{case}: the UE is deregistered"
+            );
+            {
+                let ctx = crate::context::amf_self();
+                let guard = ctx.read().expect("ctx lock");
+                assert!(
+                    guard.paging_find(paged_id).is_none(),
+                    "{case}: the page is gone"
+                );
+                assert!(
+                    !guard
+                        .sess_find_by_psi(paged_id, 5)
+                        .is_some_and(|s| s.paging.ongoing),
+                    "{case}: the session's paging state is cleared"
+                );
+                assert!(
+                    !guard
+                        .connected_downlink_drain()
+                        .iter()
+                        .any(|i| i.amf_ue_ngap_id == paged_id),
+                    "{case}: the queued downlink is dropped"
+                );
+            }
+            take_sent_ngap(&mut ngap);
+            for _ in 0..3 {
+                ngap.process_paging_with(Duration::ZERO).await;
+            }
+            assert!(
+                take_sent_ngap(&mut ngap).is_empty(),
+                "{case}: no PAGING after the deregistration"
+            );
+            let body = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("{case}: a failure notification"))
+                .expect("channel open");
+            let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+            assert_eq!(v["cause"], "FAILURE_CAUSE_UNSPECIFIED", "{case}: {v}");
+            assert_eq!(v["n1n2MsgDataUri"], data_uri.as_str(), "{case}");
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
+            "one notification per page"
+        );
+        sink.stop().await.expect("sink stop");
     }
 
     // ---- nextgsim#464: nwdaf-mobility paging (TS 23.501 §5.4.3.1, TS 23.288 §6.7.2) --
