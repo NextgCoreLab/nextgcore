@@ -2100,6 +2100,15 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
 
     // Immediate reports for events with immediateFlag (current state)
     let report_list = build_immediate_reports(&immediate_types, supi.as_deref(), &sub);
+    // #1641: the first REACHABILITY_REPORT, recorded in the subscription before it is
+    // stored, so no fire point can see it without its first state (review m1).
+    let mut sub = sub;
+    let first_reach = first_reachability_report(
+        &mut sub,
+        immediate_types.iter().any(|t| t == "REACHABILITY_REPORT"),
+        supi.as_deref(),
+        &report_list,
+    );
 
     {
         let Ok(guard) = ctx.read() else {
@@ -2116,12 +2125,9 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
             );
         }
     }
-    first_reachability_report(
-        &sub,
-        immediate_types.iter().any(|t| t == "REACHABILITY_REPORT"),
-        supi.as_deref(),
-        &report_list,
-    );
+    if let Some(first) = first_reach {
+        first.deliver_and_recheck(&sub);
+    }
 
     log::info!(
         "Event subscription created: id={subscription_id}, events={:?}, notifyUri={notify_uri}",
@@ -2707,22 +2713,20 @@ fn reachability_key(ue: &AmfUe) -> Option<&str> {
 /// - "UE Reachable for DL Traffic": REACHABLE, when the UE is reachable now.
 ///
 /// With the immediateFlag the report is already in the response's `reportList`;
-/// without it, it goes in a notification. Either way it is recorded as reported.
-fn first_reachability_report(
-    sub: &EventSubscription,
+/// without it, it goes in a notification. Either way its state is recorded in `sub`
+/// here, before `sub` is stored (review m1), and [`FirstReachability::deliver_and_recheck`]
+/// runs once it is.
+pub(crate) fn first_reachability_report(
+    sub: &mut EventSubscription,
     immediate: bool,
     supi: Option<&str>,
     report_list: &[Value],
-) {
+) -> Option<FirstReachability> {
     if !sub.event_types.iter().any(|t| t == "REACHABILITY_REPORT") {
-        return;
+        return None;
     }
-    let Some(ue) = supi.and_then(find_ue_by_context_id) else {
-        return;
-    };
-    let Some(key) = reachability_key(&ue) else {
-        return;
-    };
+    let ue = supi.and_then(find_ue_by_context_id)?;
+    let key = reachability_key(&ue)?.to_string();
     let report = if immediate {
         report_list
             .iter()
@@ -2733,18 +2737,44 @@ fn first_reachability_report(
         (!sub.reachable_for_dl_traffic() || state == "REACHABLE")
             .then(|| reachability_report_for(&ue, state))
     };
-    let Some(report) = report else {
-        return;
-    };
-    let state = report["reachability"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    if let Ok(guard) = amf_self().read() {
-        guard.event_subscription_record_reachability(&sub.subscription_id, key, &state);
+    if let Some(state) = report.as_ref().and_then(|r| r["reachability"].as_str()) {
+        sub.reported_reachability
+            .insert(key.clone(), state.to_string());
     }
-    if !immediate {
-        deliver_reachability_report(sub.clone(), report);
+    Some(FirstReachability {
+        ue,
+        key,
+        notify: report.filter(|_| !immediate),
+    })
+}
+
+/// What [`first_reachability_report`] decided, for after the subscription is stored.
+pub(crate) struct FirstReachability {
+    ue: AmfUe,
+    key: String,
+    /// The first report, when it goes in a notification (no immediateFlag).
+    notify: Option<Value>,
+}
+
+impl FirstReachability {
+    /// Send the first report, then compare the state again (review m1). A change
+    /// between the first report and the store (the mobile reachable timer expired, or
+    /// the UE connected) found no subscription to report to, so it is reported here,
+    /// through the same test-and-set gate the fire points use.
+    pub(crate) fn deliver_and_recheck(self, sub: &EventSubscription) {
+        if let Some(report) = self.notify {
+            deliver_reachability_report(sub.clone(), report);
+        }
+        let state = current_reachability(&self.ue);
+        if sub.reachable_for_dl_traffic() && state != "REACHABLE" {
+            return;
+        }
+        let changed = amf_self().read().is_ok_and(|g| {
+            g.event_subscription_record_reachability(&sub.subscription_id, &self.key, state)
+        });
+        if changed {
+            deliver_reachability_report(sub.clone(), reachability_report_for(&self.ue, state));
+        }
     }
 }
 
@@ -2784,7 +2814,9 @@ fn deliver_reachability_report(sub: EventSubscription, report: Value) {
 /// - "UE Reachability Status Change" (the default): only a change from the state
 ///   last reported to that subscription;
 /// - "UE Reachable for DL Traffic": REACHABLE, each time `on_connection` (the UE
-///   transitioned to CM-CONNECTED); never UNREACHABLE.
+///   transitioned to CM-CONNECTED), so it repeats on every CM-IDLE -> CM-CONNECTED
+///   (review m7: the event is "detected when the UE transitions to CM-CONNECTED",
+///   §5.3.1 `:5064-5068`, and a continuous report reports each); never UNREACHABLE.
 fn fire_reachability(ue: &AmfUe, state: &str, on_connection: bool) {
     let Some(key) = reachability_key(ue) else {
         return;
@@ -3777,7 +3809,30 @@ fn take_over_transferred_event_subscriptions(
             // `AreaOfInterestEventState`'s map key is a JSON pointer into the source's
             // `areaList`, which only coincides with this AMF's ordering by luck.
             reported_presence: std::collections::HashMap::new(),
-            reachability_filter: None,
+            // #1641 review (M1): the REACHABILITY_REPORT filter comes over too, or a
+            // "UE Reachable for DL Traffic" subscription would turn into a status-change
+            // one here. A malformed value is read as the default, and logged: a transfer
+            // is not refused for one IE. The last-reported state starts empty, as the
+            // presence one does: this AMF has sent no report yet.
+            reachability_filter: entry
+                .get("eventList")
+                .and_then(Value::as_array)
+                .and_then(|events| {
+                    events.iter().find(|e| {
+                        e.get("type").and_then(Value::as_str) == Some("REACHABILITY_REPORT")
+                    })
+                })
+                .and_then(|event| match parse_reachability_filter(event) {
+                    Ok(f) => f,
+                    Err(_) => {
+                        log::warn!(
+                            "[{ue_context_id}] transferred REACHABILITY_REPORT subscription \
+                             with a malformed reachabilityFilter: read as \
+                             UE_REACHABILITY_STATUS_CHANGE"
+                        );
+                        None
+                    }
+                }),
             reported_reachability: std::collections::HashMap::new(),
             reporting_threshold: entry.get("eventList").and_then(Value::as_array).and_then(
                 |events| {
@@ -15533,6 +15588,51 @@ mod tests {
         assert!(!err.contains("secret1440"), "the token is logged: {err}");
         assert!(err.contains("ee-amf-subs-change/<redacted>"), "{err}");
         assert!(err.contains("failed"), "the reason is kept: {err}");
+    }
+
+    /// **#1641 review (M1)**: a transferred REACHABILITY_REPORT subscription keeps its
+    /// `reachabilityFilter` (CreateUEContext, TS 29.518 §5.2.2.2.3.1). A malformed one
+    /// is read as the default rather than refusing the transfer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transferred_subscription_keeps_its_reachability_filter_1641() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        amf_context_init(64, 1024, 4096);
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        for (i, filter, dl) in [
+            (0u32, json!("UE_REACHABLE_DL_TRAFFIC"), true),
+            (1, json!(7), false),
+        ] {
+            let supi = format!("imsi-00101000164100{i}");
+            let mut body = create_ue_context_body(&supi, &format!("imeisv-000000000164100{i}"));
+            body["ueContext"]["eventSubscriptionList"] = json!([{
+                "eventList": [{ "type": "REACHABILITY_REPORT", "reachabilityFilter": filter }],
+                "eventNotifyUri": "http://127.0.0.1:9/notify/1641",
+                "notifyCorrelationId": format!("corr-1641-transferred-{i}"),
+                "nfId": "3fa85f64-5717-4562-b3fc-2c963f661641",
+                "supi": supi,
+            }]);
+            let resp = namf_request_handler(
+                SbiRequest::put(format!("/namf-comm/v1/ue-contexts/{supi}"))
+                    .with_json_body(&body)
+                    .expect("json"),
+            )
+            .await;
+            assert_eq!(resp.status, 201, "case {i}: the context is created");
+            let stored = {
+                let ctx = amf_self();
+                let guard = ctx.read().expect("ctx lock");
+                guard
+                    .event_subscriptions_matching("REACHABILITY_REPORT", Some(&supi))
+                    .into_iter()
+                    .find(|s| s.notify_correlation_id == format!("corr-1641-transferred-{i}"))
+                    .expect("the subscription was taken over")
+            };
+            assert_eq!(stored.reachable_for_dl_traffic(), dl, "case {i}");
+            let ctx = amf_self();
+            ctx.read()
+                .expect("ctx lock")
+                .event_subscription_remove(&stored.subscription_id);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1250,6 +1250,10 @@ pub struct EventSubscription {
     pub reported_reachability: std::collections::HashMap<String, String>,
 }
 
+/// The most UEs one subscription records a reported reachability for (#1641 review
+/// m6). An any-UE subscription is the only one that reaches it.
+pub const MAX_REPORTED_REACHABILITY: usize = 65_536;
+
 /// `ReachabilityFilter` (TS 29.518 §6.2.6.3.13, `29518-k00.txt:24355-24369`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReachabilityFilter {
@@ -2697,7 +2701,20 @@ impl AmfContext {
         };
         match sub.reported_reachability.get(ue) {
             Some(prev) if prev == state => false,
-            _ => {
+            Some(_) => {
+                sub.reported_reachability
+                    .insert(ue.to_string(), state.to_string());
+                true
+            }
+            None => {
+                // Review m6: an any-UE subscription records every UE it reports on, so
+                // the map is bounded. Past the bound one entry is dropped; at worst that
+                // UE's next report repeats its state once.
+                if sub.reported_reachability.len() >= MAX_REPORTED_REACHABILITY {
+                    if let Some(k) = sub.reported_reachability.keys().next().cloned() {
+                        sub.reported_reachability.remove(&k);
+                    }
+                }
                 sub.reported_reachability
                     .insert(ue.to_string(), state.to_string());
                 true
@@ -2720,6 +2737,11 @@ impl AmfContext {
             if let std::collections::hash_map::Entry::Occupied(mut e) =
                 subs.entry(sub.subscription_id.clone())
             {
+                // #1641 review (m2): the reachability last reported is the store's, not
+                // the caller's clone. A PATCH never sets it, and a fire point may have
+                // recorded a report between the caller's read and this write.
+                let mut sub = sub;
+                sub.reported_reachability = std::mem::take(&mut e.get_mut().reported_reachability);
                 e.insert(sub);
                 return true;
             }
@@ -2794,7 +2816,19 @@ impl AmfContext {
     /// (`ngap_path.rs` `state.amf_ue.gpsi = am_data.gpsi.clone()`), so this is a
     /// lookup against real state and never a synthesised mapping — a SUPI cannot
     /// be converted into a GPSI (see the note on [`AmfUe::gpsi`]).
+    ///
+    /// #1641 review (m5): the live store first, as [`Self::amf_ue_find_by_supi`]
+    /// reads it (#341), then the pool. A UE registered over NGAP is only in the live
+    /// store, so a GPSI-keyed subscription missed it and got no first report.
     pub fn amf_ue_find_by_gpsi(&self, gpsi: &str) -> Option<AmfUe> {
+        if let Some((_, ue)) = self
+            .ue_store
+            .snapshot()
+            .into_iter()
+            .find(|(_, ue)| ue.amf_ue().gpsi.as_deref() == Some(gpsi))
+        {
+            return Some(ue.amf_ue().clone());
+        }
         let amf_ue_list = self.amf_ue_list.read().ok()?;
         amf_ue_list
             .values()
@@ -2804,6 +2838,15 @@ impl AmfContext {
 
     /// Find the live UE whose PEI is `pei` (#74 criterion 4).
     pub fn amf_ue_find_by_pei(&self, pei: &str) -> Option<AmfUe> {
+        // #1641 review (m5): the live store first, as for the GPSI.
+        if let Some((_, ue)) = self
+            .ue_store
+            .snapshot()
+            .into_iter()
+            .find(|(_, ue)| ue.amf_ue().pei.as_deref() == Some(pei))
+        {
+            return Some(ue.amf_ue().clone());
+        }
         let amf_ue_list = self.amf_ue_list.read().ok()?;
         amf_ue_list
             .values()
