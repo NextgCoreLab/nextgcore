@@ -1690,6 +1690,7 @@ pub async fn call_smf_activate_up_connection(
 }
 
 /// SM Context Update response from SMF (with optional N1/N2 info)
+#[derive(Debug)]
 pub struct SmContextUpdateResponse {
     /// N1 SM message (NAS PDU Session Modification Command) - optional
     pub n1_sm_msg: Vec<u8>,
@@ -1878,12 +1879,6 @@ pub async fn call_smf_update_sm_context_with_n1(
         sm_context_ref,
         n1_sm_msg.len()
     );
-
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(smf_host, smf_port),
-        nextgcore_sbi::types::NfType::Smf,
-    );
-
     // UE-initiated modification: the UE's N1 container is carried as a
     // multipart/related 5gnas binary part referenced by RefToBinaryData
     // (smfd-02).
@@ -1891,7 +1886,47 @@ pub async fn call_smf_update_sm_context_with_n1(
         "n1SmMsg": { "contentId": "n1SmMsg" },
         "n2SmInfoType": "PDU_RES_MOD_REQ"
     });
+    update_sm_context_with_ue_n1(smf_host, smf_port, sm_context_ref, n1_sm_msg, body).await
+}
 
+/// Forward a UE's PDU SESSION RELEASE REQUEST to its SMF (#1637): an
+/// Nsmf_PDUSession_UpdateSMContext with the N1 SM container and the User Location
+/// Information (TS 23.502 §4.3.4.2 step 1a, `23502-k20.txt`; TS 29.502 §5.2.2.3.1).
+/// The SMF answers the PDU SESSION RELEASE COMMAND, and, when the user plane is
+/// active, the N2 PDU Session Resource Release Command Transfer (`PDU_RES_REL_CMD`,
+/// step 3a). A refusal carries its PDU SESSION RELEASE REJECT (TS 24.501 §6.4.3.4).
+pub async fn call_smf_update_sm_context_release_request(
+    smf_host: &str,
+    smf_port: u16,
+    sm_context_ref: &str,
+    n1_sm_msg: &[u8],
+    ue_location: Option<serde_json::Value>,
+) -> Result<SmContextUpdateResponse, SmContextUpdateRefusal> {
+    log::info!(
+        "Calling SMF SM Context Update (UE release request): ref={sm_context_ref}, n1_len={}",
+        n1_sm_msg.len()
+    );
+    let mut body = serde_json::json!({ "n1SmMsg": { "contentId": "n1SmMsg" } });
+    if let Some(loc) = ue_location {
+        body["ueLocation"] = loc;
+    }
+    update_sm_context_with_ue_n1(smf_host, smf_port, sm_context_ref, n1_sm_msg, body).await
+}
+
+/// POST `/sm-contexts/{ref}/modify` with `body` and the UE's `n1_sm_msg` as its
+/// `n1SmMsg` part. The answer's N1 and N2 SM information on a 2xx; on a 4xx/5xx,
+/// the SmContextUpdateError's N1, if any (#1590).
+async fn update_sm_context_with_ue_n1(
+    smf_host: &str,
+    smf_port: u16,
+    sm_context_ref: &str,
+    n1_sm_msg: &[u8],
+    body: serde_json::Value,
+) -> Result<SmContextUpdateResponse, SmContextUpdateRefusal> {
+    let client = crate::attach_oauth2(
+        SbiClient::for_peer(smf_host, smf_port),
+        nextgcore_sbi::types::NfType::Smf,
+    );
     let path = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/modify");
     let request = SbiRequest::post(&path)
         .with_body(body.to_string(), content_type::APPLICATION_JSON)
@@ -1908,31 +1943,26 @@ pub async fn call_smf_update_sm_context_with_n1(
             n1_sm_msg: None,
         })?;
 
+    let response_body: serde_json::Value = response
+        .http
+        .content
+        .as_deref()
+        .and_then(|c| serde_json::from_str(c).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+
     if !response.is_success() {
         // #1590, TS 29.502 §5.2.2.3.1 step 2b: a 4xx/5xx SmContextUpdateError carries
-        // "N1 SM information, if the SMF needs and can return a response to the UE".
-        // TS 24.501 §6.4.2.4.1: that is the SMF's PDU SESSION MODIFICATION REJECT,
-        // whose 5GSM cause is the SMF's to set. It goes to the UE as it is.
-        let root: serde_json::Value = response
-            .http
-            .content
-            .as_deref()
-            .and_then(|c| serde_json::from_str(c).ok())
-            .unwrap_or_default();
-        let n1_sm_msg = extract_binary_ref(&response, &root, "n1SmMsg").filter(|n1| !n1.is_empty());
+        // "N1 SM information, if the SMF needs and can return a response to the UE":
+        // its reject, whose 5GSM cause is the SMF's to set.
+        let n1_sm_msg =
+            extract_binary_ref(&response, &response_body, "n1SmMsg").filter(|n1| !n1.is_empty());
         return Err(SmContextUpdateRefusal {
             reason: format!("SMF update returned status {}", response.status),
             n1_sm_msg,
         });
     }
 
-    let response_body: serde_json::Value = match &response.http.content {
-        Some(content) => serde_json::from_str(content).unwrap_or(serde_json::json!({})),
-        None => serde_json::json!({}),
-    };
-
-    // N1 (PDU Session Modification Command) + N2 (QoS flow mod) from the SMF:
-    // multipart binary parts or legacy base64-in-JSON.
+    // The SMF's N1 and N2: multipart binary parts or legacy base64-in-JSON.
     let n1_sm_msg = extract_binary_ref(&response, &response_body, "n1SmMsg").unwrap_or_default();
     let n2_sm_info = extract_binary_ref(&response, &response_body, "n2SmInfo").unwrap_or_default();
 
