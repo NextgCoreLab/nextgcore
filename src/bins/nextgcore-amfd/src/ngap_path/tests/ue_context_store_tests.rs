@@ -48,6 +48,10 @@ fn seed_registered_ue(
         sd: Some(SLICE_SD),
     }];
     ue.amf_ue.uecm_dereg_token = Some(format!("tok-{id}"));
+    // #1518: the callback tokens are part of the stored context.
+    ue.amf_ue.sm_context_status_key = Some(format!("smst-{supi}"));
+    ue.amf_ue.policy_association.notify_token = Some(format!("amp-{supi}"));
+    ue.amf_ue.ue_policy_association.notify_token = Some(format!("uep-{supi}"));
     ue.sdm_subscription_id = Some(format!("sdm-{id}"));
     if connected {
         ue.cm_idle = false;
@@ -68,6 +72,8 @@ fn seed_registered_ue(
         sd: Some(SLICE_SD),
     };
     sess.dnn = Some("internet".to_string());
+    // #1518: the nonce of the session's smContextStatusUri token.
+    sess.sm_context_status_nonce = Some(format!("n-{supi}"));
     guard.sess_update(&sess);
 }
 
@@ -228,6 +234,7 @@ async fn a_restored_ue_s_service_request_reactivates_its_stored_session() {
     assert_eq!(a.allowed_nssai, b.allowed_nssai);
     assert_eq!(a.ue_ambr, b.ue_ambr);
     assert_eq!(a.uecm_dereg_token, b.uecm_dereg_token);
+    assert_eq!(a.sm_context_status_key, b.sm_context_status_key);
     assert_eq!(
         after.sm_context_refs.get(&(new_id, 5)).map(String::as_str),
         Some("ref-686-a")
@@ -355,7 +362,15 @@ async fn a_restarted_amf_points_a_restored_ue_s_peers_at_itself_at_its_first_mes
     assert_eq!(body["servingNfId"], instance);
     assert_eq!(
         body["smContextStatusUri"],
-        crate::sbi_path::sm_context_status_uri(supi, 5)
+        crate::sbi_path::sm_context_status_uri(
+            supi,
+            5,
+            Some(&crate::sbi_path::sm_context_status_token(
+                &format!("smst-{supi}"),
+                5,
+                &format!("n-{supi}")
+            )),
+        )
     );
     let activating = calls
         .iter()
@@ -564,7 +579,15 @@ async fn a_restored_idle_ue_s_smf_is_given_this_amf_at_restore_so_downlink_pages
     let body: serde_json::Value = serde_json::from_str(body).expect("json");
     let instance = nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf);
     assert_eq!(body["servingNfId"], instance);
-    let status_uri = crate::sbi_path::sm_context_status_uri(supi, 5);
+    let status_uri = crate::sbi_path::sm_context_status_uri(
+        supi,
+        5,
+        Some(&crate::sbi_path::sm_context_status_token(
+            &format!("smst-{supi}"),
+            5,
+            &format!("n-{supi}"),
+        )),
+    );
     assert_eq!(body["smContextStatusUri"], status_uri);
     assert!(
         status_uri.starts_with("http"),
@@ -1048,6 +1071,165 @@ async fn the_sweep_writes_changes_only_and_deletes_ues_no_longer_held() {
     assert!(backend.inner.get(supi).is_none(), "deleted");
 }
 
+/// #1518 (#1625 review M-1, m-1): a record written before #1518 (no
+/// `callback_tokens`, no key, untokened associations) restores marked, with no key,
+/// so its peers' token-less URIs are served for it alone; a rewrite of the record
+/// keeps the marker; and the encoding without the new members still decodes. A
+/// record written since restores unmarked, with its key. Database-free: the
+/// in-memory backend.
+///
+/// REVERT-VERIFIED: forcing `pre_1518_callbacks = false` on restore, or writing
+/// `callback_tokens: true` unconditionally, fails this.
+#[tokio::test]
+async fn a_pre_1518_record_restores_marked_and_keeps_its_marker_1518() {
+    crate::context::amf_context_init(64, 1024, 4096);
+    let backend = Arc::new(MemoryBackend::default());
+    let (id, tmsi, supi) = (6_861_518u64, 0x0686_1518u32, "imsi-001010000615181");
+    let mut before = storing_server(&backend).await;
+    seed_registered_ue(&mut before, id, tmsi, supi, "ref-1518", 7777, false);
+    store_now(&mut before).await;
+    let written = backend.get(supi).expect("stored");
+    assert!(
+        written.callback_tokens,
+        "a record written since #1518 is marked so"
+    );
+    assert!(written.sm_context_status_key.is_some());
+    crash(&mut before, id);
+    drop(before);
+
+    // The record as an AMF before #1518 wrote it, through the old encoding.
+    let mut doc = serde_json::to_value(&written).expect("encodes");
+    let obj = doc.as_object_mut().expect("object");
+    obj.remove("callback_tokens");
+    obj.remove("sm_context_status_key");
+    for assoc in ["policy_association", "ue_policy_association"] {
+        obj[assoc]
+            .as_object_mut()
+            .expect("assoc")
+            .remove("notify_token");
+    }
+    for sess in obj["sessions"].as_array_mut().expect("sessions") {
+        sess.as_object_mut()
+            .expect("session")
+            .remove("status_nonce");
+    }
+    let old: StoredUeContext = serde_json::from_value(doc).expect("the old encoding decodes");
+    assert!(!old.callback_tokens && old.sm_context_status_key.is_none());
+
+    let alone = Arc::new(MemoryBackend::default());
+    alone.put(&old).expect("put");
+    let mut after = storing_server(&alone).await;
+    open_with(&mut after, Arc::clone(&alone) as Arc<dyn UeContextBackend>).await;
+    let (new_id, restored) = after.ue_auth_state.find_by_supi(supi).expect("restored");
+    assert!(restored.amf_ue.pre_1518_callbacks, "restored marked");
+    assert!(
+        restored.amf_ue.sm_context_status_key.is_none(),
+        "no key minted"
+    );
+    assert!(restored.amf_ue.policy_association.notify_token.is_none());
+
+    // m-1: a rewrite before the UE is moved over keeps the marker.
+    store_now(&mut after).await;
+    let rewritten = alone.get(supi).expect("rewritten");
+    assert!(
+        !rewritten.callback_tokens,
+        "the rewrite keeps the pre-#1518 marker"
+    );
+    assert!(rewritten.sm_context_status_key.is_none());
+
+    // #1625 review round 4: a NEW session of this legacy UE is tokened. Its key is
+    // minted at that first new session and stored, the CreateSMContext carries the
+    // tokened URI, and that session's token-less URI is refused; the legacy
+    // session's token-less URI is still served.
+    let key = after
+        .sm_context_status_key_for_new_session(new_id)
+        .expect("minted at the first new session");
+    let (_, now) = after.ue_auth_state.find_by_supi(supi).expect("held");
+    assert_eq!(
+        now.amf_ue.sm_context_status_key.as_deref(),
+        Some(key.as_str())
+    );
+    assert!(
+        now.amf_ue.pre_1518_callbacks,
+        "its legacy callbacks stay served"
+    );
+    assert_eq!(
+        after
+            .sm_context_status_key_for_new_session(new_id)
+            .as_deref(),
+        Some(key.as_str()),
+        "minted once"
+    );
+    let identity = crate::sbi_path::SmContextIdentity {
+        sm_context_status_nonce: Some("n-6".to_string()),
+        ..super::super::build_sm_context_identity(Some(&now), None)
+    };
+    let create = crate::sbi_path::build_create_sm_context_request_for_test(&identity);
+    let create: serde_json::Value = serde_json::from_str(
+        create
+            .http
+            .content
+            .as_deref()
+            .or_else(|| {
+                create
+                    .http
+                    .parts
+                    .first()
+                    .and_then(|p| std::str::from_utf8(&p.data).ok())
+            })
+            .unwrap_or("{}"),
+    )
+    .unwrap_or_default();
+    let token6 = crate::sbi_path::sm_context_status_token(&key, 5, "n-6");
+    assert_eq!(
+        create["smContextStatusUri"],
+        crate::sbi_path::sm_context_status_uri(supi, 5, Some(&token6)),
+        "the new session's URI is tokened"
+    );
+    {
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        let mut sess = guard.sess_add(new_id, 6).expect("PSI 6");
+        sess.sm_context_status_nonce = Some("n-6".to_string());
+        guard.sess_update(&sess);
+    }
+    let post = |path: String| async move {
+        crate::namf_server::namf_request_handler(
+            nextgcore_sbi::message::SbiRequest::post(path)
+                .with_json_body(&serde_json::json!({"statusInfo": {"resourceStatus": "ACTIVE"}}))
+                .expect("json"),
+        )
+        .await
+        .status
+    };
+    assert_eq!(
+        post(format!("/namf-callback/v1/{supi}/sm-context-status/6")).await,
+        404,
+        "the new session is not reached without its token"
+    );
+    assert_eq!(
+        post(format!("/namf-callback/v1/{supi}/sm-context-status/5")).await,
+        204,
+        "the legacy session's token-less URI is still served"
+    );
+    assert_eq!(
+        post(format!(
+            "/namf-callback/v1/{supi}/6/sm-context-status/{}",
+            crate::sbi_path::sm_context_status_token(&key, 6, "n-6")
+        ))
+        .await,
+        204
+    );
+
+    // A record written since #1518 restores unmarked, with its key.
+    let new = super::super::ue_context_store::restored_ue_for_tests(9, &written).expect("restores");
+    assert!(!new.amf_ue.pre_1518_callbacks);
+    assert_eq!(
+        new.amf_ue.sm_context_status_key,
+        written.sm_context_status_key
+    );
+}
+
 /// **#686.** Only this AMF instance's records of the current format, whose 5G-GUTI this
 /// AMF serves and whose SUPI it does not already hold, are restored. A record
 /// written by another AMF instance waits for the AMF Set takeover (TS 23.501 §5.21.2.3),
@@ -1201,6 +1383,8 @@ fn the_mongodb_backend_stores_loads_and_deletes() {
         ue_radio_capability_id_known_to_ue: false,
         assigned_ebis: Vec::new(),
         uecm_dereg_token: Some("tok".to_string()),
+        sm_context_status_key: None,
+        callback_tokens: false,
         sdm_subscription_id: None,
         policy_association: Default::default(),
         ue_policy_association: Default::default(),
@@ -1552,7 +1736,15 @@ async fn a_ue_of_a_failed_amf_is_taken_over_by_its_service_request() {
     assert_eq!(serving_body["servingNfId"], instance);
     assert_eq!(
         serving_body["smContextStatusUri"],
-        crate::sbi_path::sm_context_status_uri(supi, 5)
+        crate::sbi_path::sm_context_status_uri(
+            supi,
+            5,
+            Some(&crate::sbi_path::sm_context_status_token(
+                &format!("smst-{supi}"),
+                5,
+                &format!("n-{supi}")
+            )),
+        )
     );
     assert_eq!(
         serving_body["guami"]["amfId"], "02556b",
@@ -2346,7 +2538,7 @@ async fn a_takeover_points_the_sdm_subscription_and_the_policy_associations_at_t
     let am = body_of("/npcf-am-policy-control/v1/policies/am-pol-1210/update");
     assert_eq!(
         am["notificationUri"],
-        crate::sbi_path::am_policy_notification_uri(supi)
+        crate::sbi_path::am_policy_notification_uri(supi, Some(&format!("amp-{supi}")))
     );
     assert_eq!(
         am["guami"]["amfId"], "02556b",
@@ -2355,7 +2547,7 @@ async fn a_takeover_points_the_sdm_subscription_and_the_policy_associations_at_t
     let uep = body_of("/npcf-ue-policy-control/v1/policies/ue-pol-1210/update");
     assert_eq!(
         uep["notificationUri"],
-        crate::sbi_path::ue_policy_notification_uri(supi)
+        crate::sbi_path::ue_policy_notification_uri(supi, Some(&format!("uep-{supi}")))
     );
     assert_eq!(uep["guami"]["amfId"], "02556b");
     assert_eq!(uep["servingNfId"], instance);

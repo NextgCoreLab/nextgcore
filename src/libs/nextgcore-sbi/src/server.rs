@@ -3289,7 +3289,7 @@ mod oauth2_callback_exemption_tests {
     use std::time::Duration;
 
     const GOOD: &str = "0123456789abcdef0123456789abcdef";
-    const CALLBACK: &str = "/nx-callback/v1/ue-1/thing-notify";
+    const CALLBACK: &str = "/nx-callback/v1/ue-1/dereg-notify";
 
     /// Paths the handler saw, in order.
     type Seen = Arc<Mutex<Vec<String>>>;
@@ -3301,7 +3301,7 @@ mod oauth2_callback_exemption_tests {
         let mut cfg = SbiServerConfig::new(addr).with_oauth2_callback_exemption(
             OAuth2CallbackExemption::new(
                 "POST",
-                "/nx-callback/v1/{var}/thing-notify/{token}",
+                "/nx-callback/v1/{var}/dereg-notify/{token}",
                 |cb| cb.vars == ["ue-1"] && cb.token == GOOD,
             ),
         );
@@ -3385,20 +3385,20 @@ mod oauth2_callback_exemption_tests {
             CALLBACK.to_string(),
             format!("{CALLBACK}/"),
             // Another UE's callback carrying this UE's token.
-            format!("/nx-callback/v1/ue-2/thing-notify/{GOOD}"),
+            format!("/nx-callback/v1/ue-2/dereg-notify/{GOOD}"),
             // Variant spellings of the right route.
             format!("{CALLBACK}/{GOOD}/"),
             format!("/{CALLBACK}/{GOOD}"),
-            format!("/nx-callback//v1/ue-1/thing-notify/{GOOD}"),
+            format!("/nx-callback//v1/ue-1/dereg-notify/{GOOD}"),
             format!("{CALLBACK}/{GOOD}/extra"),
             format!("{CALLBACK}/{GOOD}/../../../../nx-svc/v1/ue-contexts/ue-1"),
-            format!("/nx-callback/v1/../thing-notify/{GOOD}"),
-            format!("/nx-callback/v1/./thing-notify/{GOOD}"),
-            format!("/nx%2Dcallback/v1/ue-1/thing-notify/{GOOD}"),
-            format!("/nx-callback/v1/ue%2D1/thing-notify/{GOOD}"),
+            format!("/nx-callback/v1/../dereg-notify/{GOOD}"),
+            format!("/nx-callback/v1/./dereg-notify/{GOOD}"),
+            format!("/nx%2Dcallback/v1/ue-1/dereg-notify/{GOOD}"),
+            format!("/nx-callback/v1/ue%2D1/dereg-notify/{GOOD}"),
             format!("{CALLBACK}%2F{GOOD}"),
             format!("{CALLBACK}/{GOOD}%2F..%2F..%2Fnx-svc"),
-            format!("/NX-CALLBACK/v1/ue-1/thing-notify/{GOOD}"),
+            format!("/NX-CALLBACK/v1/ue-1/dereg-notify/{GOOD}"),
         ];
         for path in &posts {
             let (status, www) = send(addr, "POST", path).await;

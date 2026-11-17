@@ -1404,7 +1404,7 @@ mod tests {
         assert!(
             note.uris
                 .iter()
-                .any(|u| u.ends_with("/namf-callback/v1/ucmf-notify")),
+                .any(|u| *u == nextgcore_amfd::racs::notification_uri()),
             "notifications go to the AMF's callback: {:?}",
             note.uris
         );

@@ -78,6 +78,8 @@ uuid.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
 sha2 = "0.10"
+# #1518: the per-session smContextStatusUri token is an HMAC-SHA-256.
+hmac.workspace = true
 bytes = "1.5"
 once_cell = "1.19"
 base64.workspace = true
