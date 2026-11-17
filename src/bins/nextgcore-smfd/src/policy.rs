@@ -484,7 +484,9 @@ pub async fn resolve_pcf_endpoint() -> Option<PcfEndpoint> {
 /// Record each discovered PCF profile's instance id and NF sets in the SBI NF cache
 /// for `validity` (#1518), so the sm-policy-notify admission can tell whether a
 /// notifying PCF belongs to a session's recorded set. Only the identity is cached:
-/// the entry has no services, so no endpoint selection picks it.
+/// the entry has no services, so no endpoint selection picks it. An entry that
+/// already carries services (put there by some other discovery) only has its sets
+/// refreshed (#1717 review), so it is never replaced by this thinner one.
 async fn remember_discovered_pcfs(instances: &[serde_json::Value], validity: Duration) {
     let ctx = nextgcore_sbi::context::global_context();
     for profile in instances {
@@ -500,6 +502,13 @@ async fn remember_discovered_pcfs(instances: &[serde_json::Value], validity: Dur
             nextgcore_sbi::types::NfType::Pcf,
         );
         instance.nf_set_ids = nextgcore_sbi::context::NfInstance::set_ids_from_profile(profile);
+        let instance = match ctx.get_nf_instance(&instance.id).await {
+            Some(mut known) if !known.services.is_empty() => {
+                known.nf_set_ids = instance.nf_set_ids;
+                known
+            }
+            _ => instance,
+        };
         ctx.add_nf_instance_with_validity(instance, validity).await;
     }
 }

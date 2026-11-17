@@ -15422,18 +15422,45 @@ mod callback_tokens_1518 {
         assert_eq!(resp.status, 204);
 
         // A change of servingNfId alone is a change of AMF too.
+        let d = assoc("imsi-001011518000044");
         assert!(!ue_policy::ue_policy_set_serving_amf(
-            &a,
+            &d,
             None,
             Some("amf-a".into())
         ));
+        let before = path(&d, UePolicyCallback::N1MessageNotify);
         assert!(ue_policy::ue_policy_set_serving_amf(
-            &a,
+            &d,
             None,
             Some("amf-b".into())
         ));
-        assert_ne!(paths()[0], second[0]);
+        assert_ne!(path(&d, UePolicyCallback::N1MessageNotify), before);
+        ue_policy::ue_policy_remove(&d);
         ue_policy::ue_policy_remove(&a);
+
+        // #1717 review: an AMF named only by the member never recorded is not shown
+        // to be the same one, so it is treated as another; one that re-sends a
+        // recorded member unchanged is the same, whatever it adds.
+        let b = assoc("imsi-001011518000042");
+        ue_policy::ue_policy_set_serving_amf(&b, Some(guami("020040")), None);
+        let before = path(&b, UePolicyCallback::N1MessageNotify);
+        assert!(ue_policy::ue_policy_set_serving_amf(
+            &b,
+            None,
+            Some("amf-x".into())
+        ));
+        assert_ne!(path(&b, UePolicyCallback::N1MessageNotify), before);
+        let c = assoc("imsi-001011518000043");
+        ue_policy::ue_policy_set_serving_amf(&c, Some(guami("020040")), None);
+        let before = path(&c, UePolicyCallback::N1MessageNotify);
+        assert!(!ue_policy::ue_policy_set_serving_amf(
+            &c,
+            Some(guami("020040")),
+            Some("amf-x".into())
+        ));
+        assert_eq!(path(&c, UePolicyCallback::N1MessageNotify), before);
+        ue_policy::ue_policy_remove(&b);
+        ue_policy::ue_policy_remove(&c);
     }
 
     /// The real router behind an OAuth2-required listener with the PCF's exemptions

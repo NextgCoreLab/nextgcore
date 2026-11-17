@@ -18150,7 +18150,22 @@ mod tests {
         global_context()
             .set_nrf_uri(format!("http://127.0.0.1:{port}"))
             .await;
+        // #1717 review: a cached profile with services (another discovery's) keeps
+        // them; only its sets are refreshed.
+        let mut known =
+            nextgcore_sbi::context::NfInstance::new(PCF_B_1518, nextgcore_sbi::types::NfType::Pcf);
+        known.add_service(nextgcore_sbi::context::NfService::new(
+            "npcf-smpolicycontrol",
+            nextgcore_sbi::types::SbiServiceType::NpcfSmpolicycontrol,
+        ));
+        global_context().add_nf_instance(known).await;
         let ep = policy::resolve_pcf_endpoint().await.expect("discovered");
+        let b = global_context()
+            .get_nf_instance(PCF_B_1518)
+            .await
+            .expect("cached");
+        assert_eq!(b.services.len(), 1, "its services are kept");
+        assert_eq!(b.nf_set_ids, [PCF_SET_1518], "its sets refreshed");
         global_context().clear_nrf_uri().await;
         nrf.stop().await.ok();
         assert_eq!(ep.nf_instance_id.as_deref(), Some(PCF_A_1518));

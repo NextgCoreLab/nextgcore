@@ -490,7 +490,8 @@ async fn main() -> Result<()> {
     // #1308: loopback by default; say which setting opens it to remote peers.
     nextgcore_core::sockaddr::warn_if_loopback_listener("SBI", &addr, "--sbi-addr");
 
-    let mut sbi_server_config = SbiServerConfig::new(addr);
+    let mut sbi_server_config =
+        SbiServerConfig::new(addr).with_oauth2_callback_exemptions(oauth2_callback_exemptions());
     if args.tls {
         let cert = args
             .tls_cert
@@ -644,7 +645,10 @@ async fn nef_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
 
-    log::debug!("NEF SBI: {method} {uri}");
+    log::debug!(
+        "NEF SBI: {method} {}",
+        nextgcore_sbi::log_redact::redact_callback_tokens(uri)
+    );
 
     let path = uri.split('?').next().unwrap_or(uri);
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
@@ -682,10 +686,18 @@ async fn nef_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             "DELETE" => handle_nnef_event_exposure_delete(sub_id, &request).await,
             _ => send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
         },
-        // Producer (AMF/UDM) notification sink; the NEF subscription ID is
-        // embedded in the callback path handed to the producer.
+        // Producer (AMF/UDM) notification sink; the NEF subscription ID and its
+        // token are embedded in the callback path handed to the producer (#1518).
+        ["nnef-eventexposure", "v1", "notify", nef_sub_id, NEF_NOTIFY_SEGMENT, token] => {
+            match method {
+                "POST" => handle_producer_notification(nef_sub_id, Some(token), &request).await,
+                _ => send_method_not_allowed(method, "notify/{subscriptionId}/..."),
+            }
+        }
+        // The token-less URI of before #1518: served only for a subscription
+        // persisted from then (`admits_notify`).
         ["nnef-eventexposure", "v1", "notify", nef_sub_id] => match method {
-            "POST" => handle_producer_notification(nef_sub_id, &request).await,
+            "POST" => handle_producer_notification(nef_sub_id, None, &request).await,
             _ => send_method_not_allowed(method, "notify/{subscriptionId}"),
         },
         // nextgsim#480: TS 29.522 UE ID retrieval. The router's own 404 unless
@@ -1036,7 +1048,7 @@ async fn handle_monitoring_subscription_create(
 
     let notify_base = notify_base.unwrap_or_else(|| "http://127.0.0.1:7817".to_string());
     let nf_instance_id = nf_instance_id.unwrap_or_else(|| "nef-unregistered".to_string());
-    let nef_notify_uri = format!("{notify_base}/nnef-eventexposure/v1/notify/{}", sub.id);
+    let nef_notify_uri = nef_notify_uri(&notify_base, &sub);
 
     // #111: a leg that CANNOT be established now rejects the northbound create;
     // one that has not been ATTEMPTED yet is accepted and retained for the
@@ -1262,18 +1274,88 @@ async fn handle_device_triggering_create(scs_as_id: &str, request: &SbiRequest) 
         .unwrap_or_else(|_| SbiResponse::with_status(201))
 }
 
-/// POST /nnef-eventexposure/v1/notify/{nefSubId} — producer notification
+/// The path segment before the token in the producer callback URI (#1518). It is
+/// in `nextgcore_sbi::log_redact::CALLBACK_TOKEN_SEGMENTS`.
+const NEF_NOTIFY_SEGMENT: &str = "nef-ee-notify";
+
+/// The callback URI handed to the producer for `sub` (#1518):
+/// `{base}/nnef-eventexposure/v1/notify/{id}/nef-ee-notify/{token}`.
+fn nef_notify_uri(notify_base: &str, sub: &NefMonitoringSubscription) -> String {
+    match &sub.notify_token {
+        Some(token) => format!(
+            "{notify_base}/nnef-eventexposure/v1/notify/{}/{NEF_NOTIFY_SEGMENT}/{}",
+            sub.id,
+            token.as_str()
+        ),
+        // Unreachable for a subscription made by this build; kept total rather
+        // than panicking.
+        None => format!("{notify_base}/nnef-eventexposure/v1/notify/{}", sub.id),
+    }
+}
+
+/// The producer notification route admitted without an OAuth2 bearer when the
+/// listener requires one (#1518): a notification carries no access token (TS 33.501
+/// §13.4.1, TS 29.500 §6.10.7 NOTE). It needs the subscription's token AND a
+/// verified mutual-TLS peer of a type that notifies for it, because third parties
+/// can read the URI back (the #1522 rule):
+/// - an AMF subscription travels in `UeContext.eventSubscriptionList` (TS 29.518
+///   §6.1.6.2.25), so only an AMF;
+/// - a UDM may keep its EE subscriptions in the UDR (`context-data/ee-subscriptions`,
+///   TS 29.505), and for an AMF-assisted event the AMF notifies the NEF directly
+///   (TS 23.502 §4.15.3.2.3 steps 3a-6), so a UDM or an AMF.
+///
+/// Without a verified certificate (plaintext, server-only TLS) the route stays on
+/// the bearer. The token-less URI of before #1518 is never exempt.
+fn oauth2_callback_exemptions() -> Vec<nextgcore_sbi::server::OAuth2CallbackExemption> {
+    vec![
+        nextgcore_sbi::server::OAuth2CallbackExemption::for_verified_peer(
+            "POST",
+            format!("/nnef-eventexposure/v1/notify/{{var}}/{NEF_NOTIFY_SEGMENT}/{{token}}"),
+            |cb, peer| async move {
+                let [nef_sub_id] = cb.vars.as_slice() else {
+                    return false;
+                };
+                let Some(sub) = nef_self()
+                    .read()
+                    .ok()
+                    .and_then(|c| c.subscription_find(nef_sub_id))
+                else {
+                    return false;
+                };
+                let notifier = match sub.producer() {
+                    Some(SouthboundProducer::Amf) => peer.has_nf_type("AMF"),
+                    Some(SouthboundProducer::Udm) => {
+                        peer.has_nf_type("UDM") || peer.has_nf_type("AMF")
+                    }
+                    None => false,
+                };
+                notifier && sub.admits_notify(Some(&cb.token))
+            },
+        ),
+    ]
+}
+
+/// POST /nnef-eventexposure/v1/notify/{nefSubId}/nef-ee-notify/{token} — producer notification
 /// sink. Correlates the AMF/UDM notification back to the northbound AF
 /// subscription and forwards it as a TS 29.122 MonitoringNotification on a
 /// background task (fire-and-forget, amfd delivery parity), so the
 /// producer's notify timeout never includes the AF round trip.
-async fn handle_producer_notification(nef_sub_id: &str, request: &SbiRequest) -> SbiResponse {
+///
+/// #1518: acted on only with the subscription's current token (or, for a
+/// subscription persisted from before #1518, on the token-less URI), whatever
+/// admitted the request; otherwise the same 404 an unknown id gets, and nothing is
+/// forwarded.
+async fn handle_producer_notification(
+    nef_sub_id: &str,
+    token: Option<&str>,
+    request: &SbiRequest,
+) -> SbiResponse {
     let ctx = nef_self();
     let sub = match ctx.read() {
         Ok(c) => c.subscription_find(nef_sub_id),
         Err(_) => return send_internal_error("NEF context lock poisoned"),
     };
-    let Some(sub) = sub else {
+    let Some(sub) = sub.filter(|s| s.admits_notify(token)) else {
         return send_not_found(
             &format!("Subscription {nef_sub_id} not found"),
             Some("SUBSCRIPTION_NOT_FOUND"),
@@ -3209,6 +3291,205 @@ mod tests {
         }
     }
 
+    /// #1518: a stored subscription with a live leg at `producer`, and its token.
+    fn insert_sub_1518(
+        id: &str,
+        producer: Option<SouthboundProducer>,
+        tokened: bool,
+    ) -> Option<String> {
+        let mut sub = NefMonitoringSubscription::new(
+            "af-1518",
+            "UE_REACHABILITY",
+            "http://127.0.0.1:9/cb",
+            "{}",
+        );
+        sub.id = id.to_string();
+        sub.southbound = producer.map(|producer| crate::context::SouthboundRef {
+            producer,
+            subscription_id: format!("p-{id}"),
+            delete_path: format!("/x/{id}"),
+        });
+        if !tokened {
+            sub.notify_token = None;
+        }
+        let token = sub.notify_token.as_ref().map(|t| t.as_str().to_string());
+        nef_self()
+            .read()
+            .unwrap()
+            .subscription_insert(sub)
+            .expect("insert");
+        token
+    }
+
+    /// #1518: the composition root registers the tokened producer route, behind a
+    /// verified peer, and nothing else.
+    #[test]
+    fn the_nef_registers_its_callback_exemption_1518() {
+        let routes: Vec<String> = oauth2_callback_exemptions()
+            .iter()
+            .map(|e| e.route())
+            .collect();
+        assert_eq!(
+            routes,
+            ["POST /nnef-eventexposure/v1/notify/{var}/nef-ee-notify/{token}"]
+        );
+    }
+
+    /// #1518: whatever admitted it, a producer notification reaches the handler only
+    /// with its subscription's current token, or token-less for a subscription
+    /// persisted from before #1518. A body-less POST tells them apart: the handler
+    /// answers 400, the gate 404.
+    ///
+    /// REVERT-VERIFIED: with `admits_notify` always true, the forged,
+    /// cross-subscription and token-less cases reach the handler; with the
+    /// token-less rule per NEF rather than per subscription, the tokened one's
+    /// token-less URI does.
+    #[test]
+    fn a_producer_notification_is_acted_on_only_on_its_token_1518() {
+        let _guard = lock_globals();
+        reset_context();
+        let a = insert_sub_1518("sub-1518-a", Some(SouthboundProducer::Amf), true).unwrap();
+        let b = insert_sub_1518("sub-1518-b", Some(SouthboundProducer::Amf), true).unwrap();
+        insert_sub_1518("sub-1518-l", Some(SouthboundProducer::Amf), false);
+        let status =
+            |path: String| block_on(nef_sbi_request_handler(SbiRequest::post(path))).status;
+        let base = "/nnef-eventexposure/v1/notify";
+        assert_eq!(status(format!("{base}/sub-1518-a/nef-ee-notify/{a}")), 400);
+        for path in [
+            format!("{base}/sub-1518-a/nef-ee-notify/0123456789abcdef0123456789abcdef"),
+            format!("{base}/sub-1518-a/nef-ee-notify/{b}"),
+            format!("{base}/sub-1518-b/nef-ee-notify/{a}"),
+            format!("{base}/sub-1518-a"),
+            format!("{base}/sub-1518-l/nef-ee-notify/{a}"),
+            format!("{base}/sub-1518-a/other-notify/{a}"),
+            format!("{base}/no-such/nef-ee-notify/{a}"),
+        ] {
+            assert_eq!(status(path.clone()), 404, "{path}");
+        }
+        assert_eq!(
+            status(format!("{base}/sub-1518-l")),
+            400,
+            "the pre-#1518 subscription"
+        );
+    }
+
+    /// #1518: the route admits, without a bearer, only a verified certificate of a
+    /// type that notifies for that subscription (an AMF leg: AMF; a UDM leg: UDM or
+    /// AMF) with its current token. Over plaintext on an OAuth2-required listener the
+    /// right token is therefore still 401.
+    ///
+    /// REVERT-VERIFIED: without the NF-type check the SMF and untyped certificates
+    /// are admitted; with the UDM leg admitting only a UDM, the AMF is refused there;
+    /// registered token-only, the plaintext right-token request is not 401.
+    #[test]
+    fn the_producer_route_admits_only_its_notifiers_1518() {
+        use nextgcore_sbi::callback_auth::VerifiedPeer;
+        let _guard = lock_globals();
+        reset_context();
+        let a = insert_sub_1518("sub-1518-pa", Some(SouthboundProducer::Amf), true).unwrap();
+        let u = insert_sub_1518("sub-1518-pu", Some(SouthboundProducer::Udm), true).unwrap();
+        let n = insert_sub_1518("sub-1518-pn", None, true).unwrap();
+        insert_sub_1518("sub-1518-pl", Some(SouthboundProducer::Amf), false);
+        let exemptions = oauth2_callback_exemptions();
+        let admits = |path: String, types: Option<&[&str]>| {
+            let peer = types.map(|t| VerifiedPeer {
+                nf_instance_id: "4e3c1518-0000-4000-8000-0000000000ee".to_string(),
+                nf_types: t.iter().map(|s| s.to_string()).collect(),
+            });
+            block_on(nextgcore_sbi::callback_auth::admits_without_bearer_from(
+                &exemptions,
+                "POST",
+                &path,
+                peer.as_ref(),
+            ))
+        };
+        let p = |id: &str, t: &str| format!("/nnef-eventexposure/v1/notify/{id}/nef-ee-notify/{t}");
+        assert!(admits(p("sub-1518-pa", &a), Some(&["AMF"])));
+        assert!(!admits(p("sub-1518-pa", &a), Some(&["UDM"])));
+        assert!(!admits(p("sub-1518-pa", &a), Some(&[])));
+        assert!(!admits(p("sub-1518-pa", &a), None));
+        assert!(admits(p("sub-1518-pu", &u), Some(&["UDM"])));
+        assert!(admits(p("sub-1518-pu", &u), Some(&["AMF"])));
+        assert!(!admits(p("sub-1518-pu", &u), Some(&["SMF"])));
+        assert!(
+            !admits(p("sub-1518-pn", &n), Some(&["AMF"])),
+            "no leg, no notifier"
+        );
+        assert!(
+            !admits(p("sub-1518-pa", &u), Some(&["AMF"])),
+            "another's token"
+        );
+        assert!(!admits(
+            p("sub-1518-pa", "0123456789abcdef0123456789abcdef"),
+            Some(&["AMF"])
+        ));
+        assert!(!admits(p("sub-1518-pl", &a), Some(&["AMF"])));
+        assert!(!admits(
+            "/nnef-eventexposure/v1/notify/sub-1518-pl".to_string(),
+            Some(&["AMF"])
+        ));
+
+        // Real HTTP: an OAuth2-required listener with an empty JWKS and the
+        // exemption. Plaintext carries no certificate, so everything is 401.
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+                let mut cfg = SbiServerConfig::new(addr)
+                    .with_oauth2_callback_exemptions(oauth2_callback_exemptions());
+                cfg.require_oauth2 = true;
+                cfg.oauth2_jwks = Some(serde_json::json!({"keys": []}));
+                let server = SbiServer::on_listener(cfg, listener);
+                server.start(nef_sbi_request_handler).await.expect("start");
+                let client =
+                    nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", addr.port());
+                let mut got = Vec::new();
+                for path in [
+                    p("sub-1518-pa", &a),
+                    p("sub-1518-pa", "0123456789abcdef0123456789abcdef"),
+                    "/nnef-eventexposure/v1/notify/sub-1518-pl".to_string(),
+                ] {
+                    let req = SbiRequest::post(path.clone())
+                        .with_body("{}".to_string(), "application/json");
+                    let status =
+                        tokio::time::timeout(Duration::from_secs(5), client.send_request(req))
+                            .await
+                            .expect("bounded")
+                            .expect("response")
+                            .status;
+                    got.push((path, status));
+                }
+                server.stop().await.ok();
+                for (path, status) in got {
+                    assert_eq!(status, 401, "{path}");
+                }
+            });
+    }
+
+    /// #1518: a subscription record persisted before #1518 (no `notify_token`)
+    /// restores token-less, and a rewrite keeps it so; one made since round-trips
+    /// its token. Debug output carries no token.
+    #[test]
+    fn a_pre_1518_subscription_restores_token_less_1518() {
+        let sub = NefMonitoringSubscription::new("af", "T", "http://af/n", "{}");
+        let token = sub.notify_token.clone().unwrap();
+        assert!(!format!("{sub:?}").contains(token.as_str()));
+        let mut json = serde_json::to_value(&sub).unwrap();
+        let back: NefMonitoringSubscription = serde_json::from_value(json.clone()).unwrap();
+        assert!(back.admits_notify(Some(token.as_str())));
+        json.as_object_mut().unwrap().remove("notify_token");
+        let old: NefMonitoringSubscription = serde_json::from_value(json).unwrap();
+        assert!(old.notify_token.is_none());
+        assert!(old.admits_notify(None));
+        let rewritten: NefMonitoringSubscription =
+            serde_json::from_value(serde_json::to_value(&old).unwrap()).unwrap();
+        assert!(rewritten.admits_notify(None) && !rewritten.admits_notify(Some(token.as_str())));
+        assert!(!back.admits_notify(None));
+    }
+
     /// **Issue #111, criteria 4 + 5.** With no producer configured the leg is
     /// DEFERRED: the create is accepted, the subscription is marked pending, and the
     /// reconciler later promotes or expires it -- never leaves it accepted and
@@ -3238,6 +3519,21 @@ mod tests {
         assert!(
             !pending.path.is_empty(),
             "the retry request must be retained"
+        );
+        // #1518: the retained body names the subscription's tokened callback, so a
+        // promotion hands the producer the URI the router admits.
+        let token = subs[0].notify_token.clone().expect("tokened");
+        assert!(
+            pending.body["subscription"]["eventNotifyUri"]
+                .as_str()
+                .unwrap_or_default()
+                .ends_with(&format!(
+                    "/nnef-eventexposure/v1/notify/{}/nef-ee-notify/{}",
+                    subs[0].id,
+                    token.as_str()
+                )),
+            "{}",
+            pending.body
         );
 
         // A sweep inside the deadline leaves it pending -- it is retried, not
@@ -3308,7 +3604,7 @@ mod tests {
         let request = SbiRequest::post("/nnef-eventexposure/v1/notify/absent")
             .with_json_body(&serde_json::json!({"reportList": []}))
             .expect("serialize test body");
-        let response = block_on(handle_producer_notification("absent", &request));
+        let response = block_on(handle_producer_notification("absent", None, &request));
         assert_eq!(response.status, 404);
     }
 
@@ -3665,6 +3961,7 @@ mod tests {
                 )
                 .with_af_target(Some(AfTarget::Msisdn("491700001443".to_string())));
                 sub.id = "sub-1443".to_string();
+                let token = sub.notify_token.clone().expect("tokened");
                 nef_self()
                     .read()
                     .expect("ctx")
@@ -3686,10 +3983,20 @@ mod tests {
                         .expect("serialize")
                 };
                 for state in ["UNREACHABLE", "REGULATORY_ONLY"] {
-                    let response = handle_producer_notification("sub-1443", &post(state)).await;
+                    let response = handle_producer_notification(
+                        "sub-1443",
+                        Some(token.as_str()),
+                        &post(state),
+                    )
+                    .await;
                     assert_eq!(response.status, 204, "{state}");
                 }
-                let response = handle_producer_notification("sub-1443", &post("REACHABLE")).await;
+                let response = handle_producer_notification(
+                    "sub-1443",
+                    Some(token.as_str()),
+                    &post("REACHABLE"),
+                )
+                .await;
                 assert_eq!(response.status, 204);
 
                 let mut delivered = Vec::new();
@@ -3853,6 +4160,7 @@ mod tests {
                 )
                 .with_af_target(Some(AfTarget::Msisdn("491700001439".to_string())));
                 sub.id = "sub-1439".to_string();
+                let token = sub.notify_token.clone().expect("tokened");
                 nef_self()
                     .read()
                     .expect("ctx")
@@ -3873,11 +4181,12 @@ mod tests {
                         .expect("serialize")
                 };
                 for event in ["UE_REACHABILITY_FOR_DATA", "PDN_CONNECTIVITY_STATUS"] {
-                    let response = handle_producer_notification("sub-1439", &post(event, None)).await;
+                    let response = handle_producer_notification("sub-1439", Some(token.as_str()), &post(event, None)).await;
                     assert_eq!(response.status, 204, "{event}");
                 }
                 let response = handle_producer_notification(
                     "sub-1439",
+                    Some(token.as_str()),
                     &post("LOSS_OF_CONNECTIVITY", Some("DEREGISTERED")),
                 )
                 .await;
