@@ -1746,6 +1746,37 @@ pub struct PolicyBinding {
     /// `{ref}/sdm-notify/{token}`. Its own token, not the PCF's: the UDM and the PCF
     /// each hold only their own URI.
     pub sdm_notify_token: Option<nextgcore_sbi::callback_auth::CallbackToken>,
+    /// The network-triggered paging in progress for this session (#1631, TS 23.502
+    /// §4.2.3.3 step 3a), from the N1N2MessageTransfer the AMF answered 202
+    /// ATTEMPTING_TO_REACH_UE until the user plane is activated, deactivated, or the
+    /// AMF's N1N2TransferFailure notification arrives. Held in memory only: after a
+    /// restart the SMF pages again rather than wait on a paging it cannot know is
+    /// still running.
+    #[serde(skip)]
+    pub network_paging: Option<NetworkPaging>,
+}
+
+/// A network-triggered paging in progress (#1631): what step 3a's re-paging rule
+/// and the failure notification need.
+#[derive(Debug, Clone)]
+pub struct NetworkPaging {
+    /// The token in the transfer's `n1n2FailureTxfNotifURI`
+    /// (`{ref}/n1-n2-failure/{token}`). One per transfer: a re-page mints a new
+    /// one, so the failure of a superseded transfer changes nothing.
+    pub failure_token: nextgcore_sbi::callback_auth::CallbackToken,
+    /// The ARP priority level the transfer indicated to the AMF (`arp`), `None` when
+    /// it carried none. A further Downlink Data Report pages again only for a higher
+    /// priority, a lower level (TS 23.502 §4.2.3.3 step 3a).
+    pub arp_priority_level: Option<u8>,
+}
+
+impl NetworkPaging {
+    /// Whether a transfer at `arp_priority_level` is of a higher priority than this
+    /// one (TS 23.501 §5.7.2.2: 1 is the highest). No ARP ranks below every ARP.
+    pub fn is_outranked_by(&self, arp_priority_level: Option<u8>) -> bool {
+        let rank = |level: Option<u8>| level.map_or(u16::MAX, u16::from);
+        rank(arp_priority_level) < rank(self.arp_priority_level)
+    }
 }
 
 /// The session callbacks this SMF hands out a URI for (#1518).
@@ -1755,6 +1786,9 @@ pub enum SessionCallback {
     SmPolicyNotify,
     /// Nudm_SDM_Notification (TS 29.503 §5.2.2.5.2).
     SdmNotify,
+    /// Namf_Communication N1N2TransferFailure notification (TS 29.518 §5.2.2.3.2),
+    /// #1631: the `n1n2FailureTxfNotifURI` of a paging transfer.
+    N1n2TransferFailure,
 }
 
 impl PolicyBinding {
@@ -1771,6 +1805,14 @@ impl PolicyBinding {
         let held = match kind {
             SessionCallback::SmPolicyNotify => &self.sm_policy_notify_token,
             SessionCallback::SdmNotify => &self.sdm_notify_token,
+            // #1631: no token-less form was ever handed out.
+            SessionCallback::N1n2TransferFailure => {
+                return presented.is_some_and(|token| {
+                    self.network_paging
+                        .as_ref()
+                        .is_some_and(|p| p.failure_token.matches(token))
+                });
+            }
         };
         match presented {
             Some(token) => held.as_ref().is_some_and(|h| h.matches(token)),
@@ -1817,6 +1859,7 @@ impl PolicyBinding {
             callback_tokens: false,
             sm_policy_notify_token: None,
             sdm_notify_token: None,
+            network_paging: None,
         }
     }
 }
