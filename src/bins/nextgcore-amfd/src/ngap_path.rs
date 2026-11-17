@@ -541,6 +541,8 @@ fn paging_t3513() -> Duration {
 
 /// The configured paging strategy (`amf.paging.strategy`, #1442).
 fn paging_strategy() -> crate::context::PagingStrategy {
+    #[cfg(test)]
+    crate::test_support::assert_paging_strategy_lock_held();
     let ctx = crate::context::amf_self();
     let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
     guard.paging_strategy
@@ -24562,6 +24564,8 @@ mod tests {
         // The paging map is part of the process-global AMF context, and this pump
         // takes EVERY due page in it: serialised with the #1442 pump tests.
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        // #1588: this test reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;
         let ue_id = 5_120_001u64;
@@ -24849,7 +24853,8 @@ mod tests {
     async fn nwdaf_mobility_pages_the_predicted_gnb_then_widens_to_the_area() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
-        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::NwdafMobility);
+        let _strategy =
+            PagingStrategyGuard::set(crate::context::PagingStrategy::NwdafMobility).await;
         let (_nwdaf, port, seen) = nwdaf_standin(
             Some(nwdafd_predicts(&nwdaf_cell_of(2))),
             Duration::ZERO,
@@ -24917,7 +24922,8 @@ mod tests {
     async fn a_stationary_ue_is_paged_at_its_own_gnb_on_the_first_attempt() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
-        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::NwdafMobility);
+        let _strategy =
+            PagingStrategyGuard::set(crate::context::PagingStrategy::NwdafMobility).await;
         let mut ngap = capturing_ngap_server().await;
         let base = 4_680u64;
         nwdaf_grid(&ngap, base).await;
@@ -24962,7 +24968,8 @@ mod tests {
     async fn a_slow_nwdaf_delays_no_other_page_and_its_own_only_until_the_deadline() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
-        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::NwdafMobility);
+        let _strategy =
+            PagingStrategyGuard::set(crate::context::PagingStrategy::NwdafMobility).await;
         let (_nwdaf, port, seen) = nwdaf_standin(
             Some(nwdafd_predicts(&nwdaf_cell_of(2))),
             Duration::from_secs(5),
@@ -25053,7 +25060,8 @@ mod tests {
     async fn no_usable_prediction_pages_the_area_on_the_first_attempt() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
-        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::NwdafMobility);
+        let _strategy =
+            PagingStrategyGuard::set(crate::context::PagingStrategy::NwdafMobility).await;
         let mut ngap = capturing_ngap_server().await;
         let base = 4_660u64;
         nwdaf_grid(&ngap, base).await;
@@ -25126,7 +25134,8 @@ mod tests {
     async fn a_full_query_cap_releases_the_page_at_once() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
-        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::NwdafMobility);
+        let _strategy =
+            PagingStrategyGuard::set(crate::context::PagingStrategy::NwdafMobility).await;
         let (_nwdaf, port, seen) = nwdaf_standin(
             Some(nwdafd_predicts(&nwdaf_cell_of(2))),
             Duration::ZERO,
@@ -25182,7 +25191,7 @@ mod tests {
     async fn the_default_strategy_makes_no_nwdaf_request() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
-        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::default());
+        let _strategy = PagingStrategyGuard::set(crate::context::PagingStrategy::default()).await;
         let (_nwdaf, port, seen) = nwdaf_standin(
             Some(nwdafd_predicts(&nwdaf_cell_of(2))),
             Duration::ZERO,
@@ -25286,7 +25295,7 @@ mod tests {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let _strategy =
-            PagingStrategyOverride::set(crate::context::PagingStrategy::RecommendedFirst);
+            PagingStrategyGuard::set(crate::context::PagingStrategy::RecommendedFirst).await;
         let mut ngap = capturing_ngap_server().await;
         let base = 14_640u64;
         reco_grid(&ngap, base).await;
@@ -25339,7 +25348,7 @@ mod tests {
 
         {
             let _strategy =
-                PagingStrategyOverride::set(crate::context::PagingStrategy::NwdafMobility);
+                PagingStrategyGuard::set(crate::context::PagingStrategy::NwdafMobility).await;
             let (_hit, hit_port, _) = nwdaf_standin(
                 Some(nwdafd_predicts(&nwdaf_cell_of(2))),
                 Duration::ZERO,
@@ -25389,7 +25398,7 @@ mod tests {
             }
         }
 
-        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::default());
+        let _strategy = PagingStrategyGuard::set(crate::context::PagingStrategy::default()).await;
         let ue = 464_211u64;
         insert_nwdaf_ue(&ngap, ue, base + 1, Some("imsi-001010000464211"), Some(1));
         queue_paging(&ngap, ue);
@@ -25520,7 +25529,8 @@ mod tests {
     async fn demo_nwdaf_mobility_sends_the_predicted_cells_on_the_first_attempt() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
-        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::NwdafMobility);
+        let _strategy =
+            PagingStrategyGuard::set(crate::context::PagingStrategy::NwdafMobility).await;
         let (_nwdaf, port, _) = nwdaf_standin(
             Some(nwdafd_predicts(&nwdaf_cell_of(2))),
             Duration::ZERO,
@@ -25607,7 +25617,8 @@ mod tests {
     async fn demo_line_names_a_last_known_only_first_attempt() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
-        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::NwdafMobility);
+        let _strategy =
+            PagingStrategyGuard::set(crate::context::PagingStrategy::NwdafMobility).await;
         let _mode =
             crate::demo_d440c::ModeOnThisThread::set(crate::demo_d440c::MODE_NWDAF_MOBILITY);
         let (_nwdaf, port, _) = nwdaf_standin(
@@ -25731,7 +25742,7 @@ mod tests {
             crate::context::PagingStrategy::NwdafMobility,
             Some(crate::demo_d440c::MODE_REGISTRATION_AREA),
         );
-        let _strategy = PagingStrategyOverride::set(forced);
+        let _strategy = PagingStrategyGuard::set(forced).await;
         let _mode =
             crate::demo_d440c::ModeOnThisThread::set(crate::demo_d440c::MODE_REGISTRATION_AREA);
         let mut ngap = capturing_ngap_server().await;
@@ -25760,21 +25771,26 @@ mod tests {
     const RECO_TAC: u32 = 0x1442;
 
     /// Sets `amf.paging.strategy` on the process-global context for one test and
-    /// puts the default back on drop, even on a panic. Hold `CONTEXT_GUARD` for as
-    /// long as it lives: the strategy is a field of that global.
-    struct PagingStrategyOverride;
+    /// puts the default back on drop, even on a panic. Holds
+    /// `test_support::PAGING_STRATEGY_LOCK` for as long as it lives (#1588): every
+    /// page any test queues reads the strategy, so a test that queues one under the
+    /// default must not run inside this one's window.
+    struct PagingStrategyGuard {
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+    }
 
-    impl PagingStrategyOverride {
-        fn set(strategy: crate::context::PagingStrategy) -> Self {
+    impl PagingStrategyGuard {
+        async fn set(strategy: crate::context::PagingStrategy) -> Self {
+            let lock = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
             crate::context::amf_self()
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
                 .paging_strategy = strategy;
-            Self
+            Self { _lock: lock }
         }
     }
 
-    impl Drop for PagingStrategyOverride {
+    impl Drop for PagingStrategyGuard {
         fn drop(&mut self) {
             crate::context::amf_self()
                 .write()
@@ -25970,7 +25986,7 @@ mod tests {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let _strategy =
-            PagingStrategyOverride::set(crate::context::PagingStrategy::RecommendedFirst);
+            PagingStrategyGuard::set(crate::context::PagingStrategy::RecommendedFirst).await;
         let mut ngap = capturing_ngap_server().await;
         let base = 14_420u64;
         reco_grid(&ngap, base).await;
@@ -26023,7 +26039,7 @@ mod tests {
     async fn the_default_strategy_ignores_the_recommendation_and_pages_the_area() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
-        let _strategy = PagingStrategyOverride::set(crate::context::PagingStrategy::default());
+        let _strategy = PagingStrategyGuard::set(crate::context::PagingStrategy::default()).await;
         let mut ngap = capturing_ngap_server().await;
         let base = 14_430u64;
         reco_grid(&ngap, base).await;
@@ -26064,6 +26080,8 @@ mod tests {
     async fn an_unusable_recommendation_falls_back_to_the_registration_area() {
         use crate::context::RecommendedPagingTarget;
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        // #1588: this test reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = capturing_ngap_server().await;
         let base = 14_440u64;
@@ -26192,7 +26210,7 @@ mod tests {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let _strategy =
-            PagingStrategyOverride::set(crate::context::PagingStrategy::RecommendedFirst);
+            PagingStrategyGuard::set(crate::context::PagingStrategy::RecommendedFirst).await;
         let (base, ue) = (14_460u64, 1_442_005u64);
         let mut ngap = connected_ue_with_a_stored_recommendation(base, ue, 65).await;
         ngap.handle_ng_reset(
@@ -26212,7 +26230,7 @@ mod tests {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let _strategy =
-            PagingStrategyOverride::set(crate::context::PagingStrategy::RecommendedFirst);
+            PagingStrategyGuard::set(crate::context::PagingStrategy::RecommendedFirst).await;
         let (base, ue) = (14_470u64, 1_442_006u64);
         let mut ngap = connected_ue_with_a_stored_recommendation(base, ue, 66).await;
         ngap.reset_ue_associations_of(base + 1, "SCTP association lost (test)")
@@ -26229,7 +26247,7 @@ mod tests {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let _strategy =
-            PagingStrategyOverride::set(crate::context::PagingStrategy::RecommendedFirst);
+            PagingStrategyGuard::set(crate::context::PagingStrategy::RecommendedFirst).await;
         let (base, ue) = (14_480u64, 1_442_007u64);
         let mut ngap = connected_ue_with_a_stored_recommendation(base, ue, 67).await;
         let failure = nextgcore_ngap::builder::build_initial_context_setup_failure(
@@ -26262,7 +26280,7 @@ mod tests {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let _strategy =
-            PagingStrategyOverride::set(crate::context::PagingStrategy::RecommendedFirst);
+            PagingStrategyGuard::set(crate::context::PagingStrategy::RecommendedFirst).await;
         let mut ngap = capturing_ngap_server().await;
         let base = 14_450u64;
         reco_grid(&ngap, base).await;
@@ -26953,6 +26971,8 @@ mod tests {
     /// idle UE still has, so it was never paged.
     #[tokio::test]
     async fn the_n1_release_makes_a_registered_ue_cm_idle() {
+        // #1588: this test reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;
         let id = 5_120_301u64;
@@ -29470,6 +29490,8 @@ mod tests {
     async fn a_release_complete_aborts_the_ues_nas_procedure() {
         let (_nf, port, seen) = recording_nf().await;
         let _env = SmfEnvGuard::acquire(port).await;
+        // #1588: this test reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         set_pcf_env(port);
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = capturing_ngap_server().await;
@@ -35602,6 +35624,8 @@ mod tests {
     /// idle, a `DEACTIVATED` update reaches the SMF and the timer is armed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_source_release_complete_after_a_handover_leaves_the_ue_connected() {
+        // #1588: this test reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         // (source RAN UE NGAP ID, target RAN UE NGAP ID, does the source's Complete
         // carry its RAN UE NGAP ID). The SAME id on both gNBs is the common case --
         // each gNB allocates from its own small counter -- and is what isolates the
@@ -35805,6 +35829,8 @@ mod tests {
     /// connected UE is paged and later implicitly deregistered.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_handover_notify_after_the_source_release_leaves_the_ue_connected() {
+        // #1588: this test reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut server = capturing_ngap_server().await;
         let (source, target) = (97_391u64, 97_392u64);
@@ -35855,6 +35881,8 @@ mod tests {
     /// UE no longer has there) ends that connection only.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_release_complete_for_a_stale_ran_ue_id_leaves_the_ue_connected() {
+        // #1588: this test reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut server = capturing_ngap_server().await;
         let (assoc, amf_ue_ngap_id) = (97_383u64, 7_738_002u64);
@@ -41241,6 +41269,8 @@ mod tests {
     /// original one the connected UE is too.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unusable_release_complete_never_supervises_a_connected_ue() {
+        // #1588: this test reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;
         let assoc = 98_021u64;
@@ -41318,6 +41348,8 @@ mod tests {
     /// CM-CONNECTED and unsupervised.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unusable_release_complete_answers_the_only_outstanding_command() {
+        // #1588: this test reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = capturing_ngap_server().await;
         let assoc = 99_231u64;
@@ -41370,6 +41402,8 @@ mod tests {
     /// UE keeps its entry.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_release_command_with_no_usable_complete_is_completed_at_the_guard() {
+        // #1588: this test reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = capturing_ngap_server().await;
         let assoc = 99_232u64;
@@ -41452,6 +41486,8 @@ mod tests {
     /// association -- so on the old path the other UE below is armed too.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_release_complete_listing_pdu_sessions_supervises_only_its_ue() {
+        // #1588: this test reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         use nextgcore_ngap_gen::generated as g;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;
@@ -41893,6 +41929,8 @@ mod tests {
     /// moved it: the Complete is what starts mobile-reachable supervision.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_release_complete_on_procedure_41_is_still_dispatched() {
+        // #1588: this test reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         use nextgcore_ngap_gen::generated as g;
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;
