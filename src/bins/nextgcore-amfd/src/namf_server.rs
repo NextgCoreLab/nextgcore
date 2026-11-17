@@ -2884,6 +2884,8 @@ pub fn fire_connectivity_state_report(ue: &AmfUe, connected: bool) {
     #[cfg(test)]
     if connected {
         CONNECTED_REPORTS_ON_THIS_THREAD.with(|c| c.set(c.get() + 1));
+    } else {
+        IDLE_REPORTS_ON_THIS_THREAD.with(|c| c.set(c.get() + 1));
     }
     fire_ue_event(
         ue,
@@ -3524,6 +3526,20 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn reachability_reports_on_this_thread() -> u64 {
     REACHABILITY_REPORTS_ON_THIS_THREAD.with(std::cell::Cell::get)
+}
+
+// Test-only (#1645): IDLE [`fire_connectivity_state_report`] calls on this thread,
+// as CONNECTED_REPORTS_ON_THIS_THREAD counts CONNECTED ones.
+#[cfg(test)]
+thread_local! {
+    static IDLE_REPORTS_ON_THIS_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: IDLE [`fire_connectivity_state_report`] calls on this thread so far.
+#[cfg(test)]
+pub(crate) fn idle_reports_on_this_thread() -> u64 {
+    IDLE_REPORTS_ON_THIS_THREAD.with(std::cell::Cell::get)
 }
 
 /// Test-only: CONNECTED [`fire_connectivity_state_report`] calls on this thread so

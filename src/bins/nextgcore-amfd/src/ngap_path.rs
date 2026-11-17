@@ -3145,7 +3145,8 @@ impl NgapServer {
                     s.registered.then(|| {
                         let went_idle = !s.cm_idle;
                         s.cm_idle = true;
-                        s.left_cm_idle = false;
+                        // #1645: `left_cm_idle` is left for the reachability
+                        // supervision below, which takes it.
                         // #1442: no Release Complete, so no recommendation.
                         s.amf_ue.recommended_paging.clear();
                         (went_idle, abort_on_ng_release(amf_ue_ngap_id, s))
@@ -4984,6 +4985,10 @@ impl NgapServer {
             }
             s.amf_ue.amf_ue_context_transfer_state =
                 crate::context::UeContextTransferState::TransferNewAmf;
+            // #1645: an inter-AMF mobility registration into this AMF (TS 23.502
+            // §4.2.2.2.2 steps 4-5) ends with the UE CM-CONNECTED here, where it had
+            // no connection. The Registration Accept reports that transition once.
+            s.left_cm_idle = true;
             // The presented GUTI stays current until this AMF issues its own in
             // `complete_registration` (which calls `generate_new_guti` and stamps
             // this AMF's GUAMI), so the UE remains addressable in the meantime.
@@ -7217,12 +7222,25 @@ impl NgapServer {
         // #91: the Registration Accept rides this ICS, so it has now egressed and the
         // UE policy association -- whose creation triggers the PCF's DL MANAGE UE
         // POLICY COMMAND -- may safely be created.
-        let first_accept = self
+        let (first_accept, left_cm_idle) = self
             .ue_auth_state
             .with_mut(amf_ue_ngap_id, |s| {
-                !std::mem::replace(&mut s.registration_accept_sent, true)
+                (
+                    !std::mem::replace(&mut s.registration_accept_sent, true),
+                    std::mem::take(&mut s.left_cm_idle),
+                )
             })
-            .unwrap_or(false);
+            .unwrap_or((false, false));
+        // #1645: a registration that brought the UE to CM-CONNECTED at this AMF from
+        // another AMF (a UE context transfer), or from CM-IDLE here, reports the
+        // transition once (TS 29.518 §6.2, "report for updated connection management
+        // state of a UE", `29518-k00.txt:24011-24017`), as a Service Request from
+        // CM-IDLE does. A registration that changes no CM state reports none.
+        if left_cm_idle {
+            if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
+                crate::namf_server::fire_connectivity_state_report(&state.amf_ue, true);
+            }
+        }
         // #1641 review (M2): an initial registration brings the UE to CM-CONNECTED and
         // REACHABLE. A status-change subscription that last heard UNREACHABLE (the
         // mobile reachable timer expired, then the UE was implicitly deregistered and
@@ -13719,7 +13737,8 @@ impl NgapServer {
                 let went_idle = s.registered && !s.cm_idle;
                 if s.registered {
                     s.cm_idle = true;
-                    s.left_cm_idle = false;
+                    // #1645: `left_cm_idle` is left for the reachability supervision
+                    // this release starts, which takes it.
                     // #1442: the recommendation of THIS release replaces any earlier
                     // one, and a release with none clears it, so a page in this
                     // idle period never follows a stale one.
@@ -13921,6 +13940,15 @@ impl NgapServer {
     /// Start mobile-reachable supervision for a registered UE whose N1 connection was
     /// just released (TS 24.501 §5.3.7).
     async fn start_reachability_supervision(&mut self, amf_ue_ngap_id: u64) {
+        // #1645 (the R5 #1624 round-3 MINOR): a release that ends a connection whose
+        // CM-IDLE -> CM-CONNECTED transition was never reported (its Service Request's
+        // or update's SMF answers had not come back, so neither finish reported
+        // CONNECTED) reports no IDLE either. A subscriber's last report was IDLE, and
+        // from its view nothing changed: never IDLE with no CONNECTED before it.
+        let unreported = self
+            .ue_auth_state
+            .with_mut(amf_ue_ngap_id, |s| std::mem::take(&mut s.left_cm_idle))
+            .unwrap_or(false);
         let Some(config) = self.timer_configs.get(AmfTimerId::MobileReachable).cloned() else {
             return;
         };
@@ -13959,7 +13987,12 @@ impl NgapServer {
                 // its counterpart (IDLE -> CONNECTED on a Service Request) fires from
                 // `gmm_handler::handle_service_request`. Read from the record rather
                 // than reconstructed, so the report carries the UE's real identities.
-                if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
+                if unreported {
+                    log::info!(
+                        "UE {amf_ue_ngap_id} released before its CM-CONNECTED was reported; \
+                         no IDLE is reported either"
+                    );
+                } else if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
                     crate::namf_server::fire_connectivity_state_report(&state.amf_ue, false);
                 }
             }
@@ -16745,6 +16778,12 @@ impl NgapServer {
         // MME gets the Forward Relocation Complete Notification. There is no source NG-RAN
         // context to release -- the source was an eNB, released by the MME.
         if let Some(in_flight) = self.eps_ho_in_flight.remove(&notify.amf_ue_ngap_id) {
+            // #1645: the UE arrived at this AMF from the EPS (TS 23.502 §4.11.1.2.2.3),
+            // so it is CM-CONNECTED here where it had no connection: reported once.
+            if let Some(state) = self.ue_auth_state.get(notify.amf_ue_ngap_id) {
+                crate::namf_server::fire_connectivity_state_report(&state.amf_ue, true);
+                crate::namf_server::fire_reachable_on_connection(&state.amf_ue);
+            }
             let sessions_relayed = self
                 .finish_eps_to_5gs_handover(notify.amf_ue_ngap_id, in_flight)
                 .await;
@@ -41541,6 +41580,117 @@ mod tests {
         );
     }
 
+    /// **#1645**, TS 23.502 §4.2.2.2.2 steps 4-5 / TS 29.518 §6.2: an inter-AMF
+    /// mobility registration into this AMF ends with the UE CM-CONNECTED here, and its
+    /// Registration Accept reports CONNECTED once. The UE context comes from a real
+    /// UEContextTransfer at a stand-in old AMF. Negative control: a new UE's initial
+    /// registration, which brought no transfer and left no CM-IDLE here, reports none.
+    /// Counted on this current-thread runtime.
+    #[tokio::test]
+    async fn an_inter_amf_registration_reports_connected_once_1645() {
+        use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _guamis = serve_only_local_guami();
+        let count = crate::namf_server::connected_reports_on_this_thread;
+        let foreign = crate::context::Guti5gs {
+            amf_pointer: local_guami().amf_id.pointer + 1,
+            ..guti_from(&local_guami(), 0x1645_0301)
+        };
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let peer_port = addr.port();
+        let peer = SbiServer::on_listener(
+            SbiServerConfig::new(format!("127.0.0.1:{peer_port}").parse().expect("addr")),
+            listener,
+        );
+        peer.start(|req: SbiRequest| async move {
+            if req.header.uri.contains("/transfer-update") {
+                SbiResponse::ok()
+                    .with_json_body(&serde_json::json!({ "regStatusTransferComplete": true }))
+                    .expect("json")
+            } else {
+                SbiResponse::ok()
+                    .with_json_body(&serde_json::json!({ "ueContext": {
+                        "supi": "imsi-001010001645030",
+                        "mmContextList": [{ "accessType": "3GPP_ACCESS" }],
+                    }}))
+                    .expect("json")
+            }
+        })
+        .await
+        .expect("peer AMF start");
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        std::env::set_var("AMF_PEER_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("AMF_PEER_SBI_PORT", peer_port.to_string());
+
+        let mut ngap = capturing_ngap_server().await;
+        // The secured, not yet registered record an authenticated new UE has here.
+        let fresh = |id: u64| {
+            let mut ue = UeNasContext::new(id, 55, 1, false);
+            ue.amf_ue.security_context_available = true;
+            ue.amf_ue.registration_type = crate::gmm_build::registration_type::MOBILITY_UPDATING;
+            ue.amf_ue.allowed_nssai = vec![crate::context::SNssai { sst: 1, sd: None }];
+            ue
+        };
+        let (moved, new_ue) = (16_450_301u64, 16_450_302u64);
+        let mut ue = fresh(moved);
+        ue.amf_ue.old_guti = foreign.clone();
+        ngap.ue_auth_state.insert(moved, ue);
+        let nas = registration_request_with_guti(
+            &foreign,
+            crate::gmm_build::registration_type::MOBILITY_UPDATING,
+        );
+        let identified = ngap
+            .resolve_registration_by_guti(
+                moved,
+                &nas,
+                crate::gmm_build::registration_type::MOBILITY_UPDATING,
+            )
+            .await;
+        std::env::remove_var("AMF_PEER_SBI_ADDR");
+        std::env::remove_var("AMF_PEER_SBI_PORT");
+        assert!(identified, "the context came from the old AMF");
+
+        let before = count();
+        ngap.send_registration_accept(1, moved, 55)
+            .await
+            .expect("accepted");
+        assert!(
+            ngap.ue_auth_state
+                .get(moved)
+                .is_some_and(|s| s.registration_accept_sent),
+            "the Accept went out"
+        );
+        assert_eq!(count() - before, 1, "the arrival reports CONNECTED once");
+        let before = count();
+        ngap.send_registration_accept(1, moved, 55)
+            .await
+            .expect("accepted");
+        assert_eq!(count() - before, 0, "and only once");
+
+        ngap.ue_auth_state.insert(new_ue, fresh(new_ue));
+        let before = count();
+        ngap.send_registration_accept(1, new_ue, 55)
+            .await
+            .expect("accepted");
+        assert!(
+            ngap.ue_auth_state
+                .get(new_ue)
+                .is_some_and(|s| s.registration_accept_sent),
+            "the Accept went out"
+        );
+        assert_eq!(
+            count() - before,
+            0,
+            "a registration with no transfer reports none"
+        );
+        ngap.ue_auth_state.remove(moved);
+        ngap.ue_auth_state.remove(new_ue);
+        peer.stop().await.expect("peer stop");
+    }
+
     /// The same foreign GUTI with NO old AMF reachable must fall back to the
     /// Identity Request, not reject the registration.
     ///
@@ -44326,7 +44476,15 @@ mod eps_to_5gs_tests {
             },
         )
         .unwrap();
+        // #1645: the UE arrived at this AMF from the EPS: one CONNECTED report, from
+        // this handler (counted on this thread).
+        let connected_before = crate::namf_server::connected_reports_on_this_thread();
         let completion = ngap.handle_handover_notify(ASSOC, &notify).await.unwrap();
+        assert_eq!(
+            crate::namf_server::connected_reports_on_this_thread() - connected_before,
+            1,
+            "the arrival reports CONNECTED once"
+        );
         assert_eq!(completion.sessions_relayed, 1);
         assert_eq!(
             completion.source_context, None,

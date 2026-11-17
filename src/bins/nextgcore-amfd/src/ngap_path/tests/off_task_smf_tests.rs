@@ -2220,3 +2220,107 @@ async fn an_over_long_n1n2_delivery_is_refused_with_an_accurate_log_1674() {
     );
     server.forget_ue(ue);
 }
+
+/// **#1645** (the R5 #1624 round-3 MINOR): a release that ends an idle Service
+/// Request's connection before its SMF answers came back (so before the CONNECTED
+/// report) reports no IDLE either, by a UE Context Release Complete or an NG Reset.
+/// A subscriber never sees IDLE with no CONNECTED before it. Positive control: the
+/// same UE's next Service Request, with no session to wait for, reports CONNECTED,
+/// and its release then reports IDLE. Counted on the test's own thread, where the
+/// handlers fire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_release_before_the_connected_report_reports_no_idle_1645() {
+    let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let _guami = ServeOneGuami::install();
+    let connected = crate::namf_server::connected_reports_on_this_thread;
+    let idle = crate::namf_server::idle_reports_on_this_thread;
+    let (_fast, fast_port, _calls) = activating_smf().await;
+    let (_slow, slow_port, _seen) = slow_up_cnx_smf(Duration::from_millis(400)).await;
+    for (i, by_reset) in [false, true].into_iter().enumerate() {
+        let mut server = capturing_ngap_server().await;
+        seed_gnb_session(&server, 1).await;
+        let base = 16_450_001u64 + 10 * i as u64;
+        let (old, new, next) = (base, base + 1, base + 2);
+        let pdu = idle_ue_with_two_sessions(
+            &mut server,
+            old,
+            new,
+            fast_port,
+            slow_port,
+            (&format!("isr-1645-fast-{i}"), &format!("isr-1645-slow-{i}")),
+        );
+        let (c0, i0) = (connected(), idle());
+        server
+            .handle_initial_ue_message(1, &pdu)
+            .await
+            .expect("handled");
+        // The connection ends while the Service Request's join waits for the SMFs.
+        if by_reset {
+            // A partial reset naming this UE alone: the UE store is process-global,
+            // and a whole-interface reset of association 1 would idle every sibling
+            // test's UE on it too.
+            let item = nextgcore_ngap::types::UeAssociatedLogicalNgConnectionItem {
+                amf_ue_ngap_id: Some(new),
+                ran_ue_ngap_id: None,
+            };
+            server
+                .handle_ng_reset(
+                    1,
+                    &ng_reset_pdu(nextgcore_ngap::types::ResetType::PartOfNgInterface(vec![
+                        item,
+                    ])),
+                )
+                .await
+                .expect("handled");
+        } else {
+            server
+                .handle_ue_context_release_complete(1, &release_complete_pdu(new, Some(512)))
+                .await
+                .expect("handled");
+        }
+        for _ in 0..300 {
+            server.process_sbi_outcomes().await;
+            if server.smf_joins.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            server.smf_joins.is_empty(),
+            "reset={by_reset}: both answers came in"
+        );
+        assert!(server.ue_auth_state.get(new).expect("ue").is_cm_idle());
+        assert_eq!(connected() - c0, 0, "reset={by_reset}: no CONNECTED");
+        assert_eq!(idle() - i0, 0, "reset={by_reset}: and so no IDLE either");
+
+        // Positive control: back with a Service Request that waits for no session.
+        server.forget_ue_sessions(new);
+        server.forced_amf_ue_ngap_id = Some(next);
+        let (c0, i0) = (connected(), idle());
+        server
+            .handle_initial_ue_message(
+                1,
+                &service_request_initial_ue(protected_service_request([0; 4], old as u32)),
+            )
+            .await
+            .expect("handled");
+        assert_eq!(
+            connected() - c0,
+            1,
+            "reset={by_reset}: the Service Request reports CONNECTED"
+        );
+        server
+            .handle_ue_context_release_complete(1, &release_complete_pdu(next, Some(512)))
+            .await
+            .expect("handled");
+        assert_eq!(
+            idle() - i0,
+            1,
+            "reset={by_reset}: and its release reports IDLE"
+        );
+        server.forced_amf_ue_ngap_id = None;
+        server.forget_ue(next);
+    }
+}
