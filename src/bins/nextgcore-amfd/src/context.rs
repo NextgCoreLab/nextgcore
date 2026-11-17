@@ -5524,6 +5524,16 @@ impl Default for AmfSess {
 static GLOBAL_AMF_CONTEXT: std::sync::OnceLock<Arc<RwLock<AmfContext>>> =
     std::sync::OnceLock::new();
 
+/// WSB-4: serialises the tests that DESTRUCTIVELY drain the process-global
+/// `AmfContext::network_dereg_queue`: the Namf router-arm tests and the NGAP
+/// `process_network_deregs` pump tests. Declared beside the global (#1711).
+///
+/// Lock order (#1711, an ABBA hang): `sbi_path::nf_cache_test_lock` first, then
+/// `SmfEnvGuard` (which takes the cache lock itself), then this one. A test that
+/// needs the SMF environment and this lock acquires `SmfEnvGuard` before it.
+#[cfg(test)]
+pub(crate) static DEREG_QUEUE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Serialises the tests that add pages to the process-global `AmfContext::paging_map` or
 /// pump it (`NgapServer::process_paging*` takes EVERY due page): one test's pump would
 /// otherwise send, retransmit or abandon a sibling's page (#1689 review). Declared beside

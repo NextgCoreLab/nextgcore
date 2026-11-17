@@ -7919,15 +7919,11 @@ async fn handle_mbs_context_create(request: &SbiRequest) -> SbiResponse {
 // Tests
 // ============================================================================
 
-/// WSB-4: shared serialize lock for tests that DESTRUCTIVELY drain the
-/// process-global `network_dereg_queue` — the router-arm tests in this module
-/// AND the NGAP `process_network_deregs` pump test in `ngap_path`. Same
-/// rationale as the positioning queue's `UPDP_QUEUE_TEST_LOCK`; module-level +
-/// `pub(crate)` so both test modules serialize against one lock.
+/// [`crate::context::DEREG_QUEUE_TEST_LOCK`], declared beside the queue it guards
+/// (#1711). Kept as a function so its callers are unchanged.
 #[cfg(test)]
 pub(crate) fn dereg_queue_test_lock() -> &'static tokio::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    &crate::context::DEREG_QUEUE_TEST_LOCK
 }
 
 /// #396: shared serialize lock for tests that DESTRUCTIVELY drain the

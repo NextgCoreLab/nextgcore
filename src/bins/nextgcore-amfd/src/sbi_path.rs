@@ -511,6 +511,9 @@ pub async fn amf_sbi_open() -> SbiResult<()> {
 /// Serialises the amfd unit tests that empty the process discovery cache
 /// ([`amf_sbi_close_async`]) against the ones that assert on entries in it
 /// (#668). Declared beside the code that clears the cache, not in a test module.
+///
+/// Lock order (#1711): this lock comes before `SmfEnvGuard`'s SMF-env lock and before
+/// `context::DEREG_QUEUE_TEST_LOCK`; take it first.
 #[doc(hidden)]
 pub fn nf_cache_test_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
