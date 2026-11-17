@@ -25548,6 +25548,8 @@ mod tests {
     async fn nwdaf_mobility_pages_the_predicted_gnb_then_widens_to_the_area() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
         let _strategy =
             PagingStrategyGuard::set(crate::context::PagingStrategy::NwdafMobility).await;
         let (_nwdaf, port, seen) = nwdaf_standin(
@@ -25617,6 +25619,8 @@ mod tests {
     async fn a_stationary_ue_is_paged_at_its_own_gnb_on_the_first_attempt() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
         let _strategy =
             PagingStrategyGuard::set(crate::context::PagingStrategy::NwdafMobility).await;
         let mut ngap = capturing_ngap_server().await;
@@ -25663,6 +25667,8 @@ mod tests {
     async fn a_slow_nwdaf_delays_no_other_page_and_its_own_only_until_the_deadline() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
         let _strategy =
             PagingStrategyGuard::set(crate::context::PagingStrategy::NwdafMobility).await;
         let (_nwdaf, port, seen) = nwdaf_standin(
@@ -25755,6 +25761,8 @@ mod tests {
     async fn no_usable_prediction_pages_the_area_on_the_first_attempt() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
         let _strategy =
             PagingStrategyGuard::set(crate::context::PagingStrategy::NwdafMobility).await;
         let mut ngap = capturing_ngap_server().await;
@@ -25829,6 +25837,8 @@ mod tests {
     async fn a_full_query_cap_releases_the_page_at_once() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
         let _strategy =
             PagingStrategyGuard::set(crate::context::PagingStrategy::NwdafMobility).await;
         let (_nwdaf, port, seen) = nwdaf_standin(
@@ -25886,6 +25896,8 @@ mod tests {
     async fn the_default_strategy_makes_no_nwdaf_request() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
         let _strategy = PagingStrategyGuard::set(crate::context::PagingStrategy::default()).await;
         let (_nwdaf, port, seen) = nwdaf_standin(
             Some(nwdafd_predicts(&nwdaf_cell_of(2))),
@@ -25989,6 +26001,8 @@ mod tests {
     async fn recommended_first_signals_the_paging_attempt_on_every_attempt() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
         let _strategy =
             PagingStrategyGuard::set(crate::context::PagingStrategy::RecommendedFirst).await;
         let mut ngap = capturing_ngap_server().await;
@@ -26042,6 +26056,8 @@ mod tests {
         let area = [base + 1, base + 2, base + 3, base + 5];
 
         {
+            // #1693: this test adds pages to, or pumps, the process-global paging map.
+            let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
             let _strategy =
                 PagingStrategyGuard::set(crate::context::PagingStrategy::NwdafMobility).await;
             let (_hit, hit_port, _) = nwdaf_standin(
@@ -26093,6 +26109,8 @@ mod tests {
             }
         }
 
+        // #1693: the default half pumps the global paging map too.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
         let _strategy = PagingStrategyGuard::set(crate::context::PagingStrategy::default()).await;
         let ue = 464_211u64;
         insert_nwdaf_ue(&ngap, ue, base + 1, Some("imsi-001010000464211"), Some(1));
@@ -26224,6 +26242,8 @@ mod tests {
     async fn demo_nwdaf_mobility_sends_the_predicted_cells_on_the_first_attempt() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
         let _strategy =
             PagingStrategyGuard::set(crate::context::PagingStrategy::NwdafMobility).await;
         let (_nwdaf, port, _) = nwdaf_standin(
@@ -26312,6 +26332,8 @@ mod tests {
     async fn demo_line_names_a_last_known_only_first_attempt() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
         let _strategy =
             PagingStrategyGuard::set(crate::context::PagingStrategy::NwdafMobility).await;
         let _mode =
@@ -26439,6 +26461,8 @@ mod tests {
             crate::context::PagingStrategy::NwdafMobility,
             Some(crate::demo_d440c::MODE_REGISTRATION_AREA),
         );
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
         let _strategy = PagingStrategyGuard::set(forced).await;
         let _mode =
             crate::demo_d440c::ModeOnThisThread::set(crate::demo_d440c::MODE_REGISTRATION_AREA);
@@ -26682,6 +26706,8 @@ mod tests {
     async fn recommended_first_pages_the_recommended_gnbs_then_widens_to_the_area() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
         let _strategy =
             PagingStrategyGuard::set(crate::context::PagingStrategy::RecommendedFirst).await;
         let mut ngap = capturing_ngap_server().await;
@@ -26736,6 +26762,8 @@ mod tests {
     async fn the_default_strategy_ignores_the_recommendation_and_pages_the_area() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
         let _strategy = PagingStrategyGuard::set(crate::context::PagingStrategy::default()).await;
         let mut ngap = capturing_ngap_server().await;
         let base = 14_430u64;
@@ -26906,6 +26934,8 @@ mod tests {
     async fn an_ng_reset_clears_a_stored_recommendation() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
         let _strategy =
             PagingStrategyGuard::set(crate::context::PagingStrategy::RecommendedFirst).await;
         let (base, ue) = (14_460u64, 1_442_005u64);
@@ -26926,6 +26956,8 @@ mod tests {
     async fn an_association_loss_clears_a_stored_recommendation() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
         let _strategy =
             PagingStrategyGuard::set(crate::context::PagingStrategy::RecommendedFirst).await;
         let (base, ue) = (14_470u64, 1_442_006u64);
@@ -26943,6 +26975,8 @@ mod tests {
     async fn an_initial_context_setup_failure_clears_a_stored_recommendation() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
         let _strategy =
             PagingStrategyGuard::set(crate::context::PagingStrategy::RecommendedFirst).await;
         let (base, ue) = (14_480u64, 1_442_007u64);

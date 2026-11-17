@@ -124,6 +124,8 @@ async fn a_connected_ue_is_reachable_for_namf_mt() {
 async fn a_cm_idle_ues_positioning_transfer_pages_it_and_waits() {
     let _q = crate::test_support::POSITIONING_DL_LOCK.lock().await;
     // #1588: this page reads the paging strategy.
+    // #1693: this test adds pages to, or pumps, the process-global paging map.
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran, supi) = (7_108_703u64, 89, "imsi-001010010870003");

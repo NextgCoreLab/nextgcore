@@ -2263,6 +2263,8 @@ const MOD_TRANSFER: [u8; 4] = [0x00, 0x00, 0x01, 0x7E];
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_downlink_data_setup_request_for_a_connected_ue_activates_and_reaches_the_gnb() {
     let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
+    // #1693: this test adds pages to, or pumps, the process-global paging map.
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     let (_smf, port, calls) = activating_smf().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran, supi) = (7_757_001u64, 57, "imsi-001010007570001");
@@ -2296,6 +2298,8 @@ async fn a_downlink_data_setup_request_for_a_connected_ue_activates_and_reaches_
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_setup_request_with_a_transfer_is_sent_without_asking_the_smf() {
     let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
+    // #1693: this test adds pages to, or pumps, the process-global paging map.
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     let (_smf, port, calls) = activating_smf().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran, supi) = (7_757_002u64, 58, "imsi-001010007570002");
@@ -2327,6 +2331,8 @@ async fn a_setup_request_with_a_transfer_is_sent_without_asking_the_smf() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_network_requested_modification_reaches_a_connected_ue_as_a_modify_request() {
     let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
+    // #1693: this test adds pages to, or pumps, the process-global paging map.
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     let (_smf, port, _calls) = activating_smf().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran, supi) = (7_757_003u64, 59, "imsi-001010007570003");
@@ -2393,6 +2399,8 @@ async fn a_modify_request_missing_its_n1_or_transfer_is_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_modification_for_an_idle_ue_pages_it() {
     // #1588: this page reads the paging strategy.
+    // #1693: this test adds pages to, or pumps, the process-global paging map.
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     let (_smf, port, _calls) = activating_smf().await;
     let mut server = capturing_ngap_server().await;
@@ -2430,6 +2438,8 @@ async fn a_modification_for_an_idle_ue_pages_it() {
 async fn a_transfer_queued_before_the_ue_went_idle_pages_it_instead_of_sending() {
     let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
     // #1588: this page reads the paging strategy.
+    // #1693: this test adds pages to, or pumps, the process-global paging map.
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     let (_smf, port, _calls) = activating_smf().await;
     let mut server = capturing_ngap_server().await;
@@ -2472,6 +2482,8 @@ async fn a_transfer_queued_before_the_ue_went_idle_pages_it_instead_of_sending()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_queued_transfer_waits_for_a_paging_already_ongoing() {
     let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
+    // #1693: this test adds pages to, or pumps, the process-global paging map.
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     let (_smf, port, _calls) = activating_smf().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran, supi) = (7_749_011u64, 64, "imsi-001010007490011");
@@ -2602,6 +2614,8 @@ fn up_cnx_states(calls: &[SmfCall], sm_ref: &str) -> Vec<String> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_queued_downlink_setup_for_a_session_the_service_request_activated_is_not_sent_again() {
     let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
+    // #1693: this test adds pages to, or pumps, the process-global paging map.
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     let (_smf, port, calls) = activating_smf().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran, supi) = (7_778_001u64, 71, "imsi-001010007780001");
@@ -2640,6 +2654,8 @@ async fn a_queued_downlink_setup_for_a_session_the_service_request_activated_is_
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn after_an_an_release_a_downlink_setup_is_sent_again() {
     let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
+    // #1693: this test adds pages to, or pumps, the process-global paging map.
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     let (_smf, port, calls) = activating_smf().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran, supi) = (7_778_002u64, 72, "imsi-001010007780002");
@@ -2673,6 +2689,8 @@ async fn after_an_an_release_a_downlink_setup_is_sent_again() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unprotectable_n1_does_not_activate_the_user_plane() {
     let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
+    // #1693: this test adds pages to, or pumps, the process-global paging map.
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     let (_smf, port, calls) = activating_smf().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran, supi) = (7_778_003u64, 73, "imsi-001010007780003");
@@ -2702,6 +2720,8 @@ async fn an_unprotectable_n1_does_not_activate_the_user_plane() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_setup_that_does_not_go_out_rolls_the_activation_back() {
     let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
+    // #1693: this test adds pages to, or pumps, the process-global paging map.
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     let (_smf, port, calls) = activating_smf().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran, supi) = (7_778_004u64, 74, "imsi-001010007780004");
@@ -2731,6 +2751,8 @@ async fn a_setup_that_does_not_go_out_rolls_the_activation_back() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_setup_requests_n1_rides_the_items_pdu_session_nas_pdu() {
     let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
+    // #1693: this test adds pages to, or pumps, the process-global paging map.
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     let (_smf, port, _calls) = activating_smf().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran, supi) = (7_778_005u64, 75, "imsi-001010007780005");
@@ -2864,6 +2886,8 @@ async fn paged_modification_answered(
 #[allow(clippy::await_holding_lock)]
 async fn a_paged_modification_rides_after_an_ics_that_set_its_session_up() {
     let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    // #1693: this test adds pages to, or pumps, the process-global paging map.
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeOneGuami::install();
     let (sent, calls) = paged_modification_answered(7_778_011, 7_778_012, "pmod-778-ok").await;
@@ -2893,6 +2917,8 @@ async fn a_paged_modification_rides_after_an_ics_that_set_its_session_up() {
 #[allow(clippy::await_holding_lock)]
 async fn a_paged_modification_of_a_session_not_set_up_sends_only_the_n1() {
     let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    // #1693: this test adds pages to, or pumps, the process-global paging map.
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeOneGuami::install();
     let (sent, _calls) = paged_modification_answered(7_778_021, 7_778_022, "fail-pmod-778").await;
@@ -4825,6 +4851,8 @@ async fn a_cm_idle_updates_ics_response_reaches_the_smf_for_the_reactivated_sess
 #[allow(clippy::await_holding_lock)]
 async fn a_registration_update_from_cm_idle_answers_the_page_and_sets_its_session_up() {
     let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    // #1693: this test adds pages to, or pumps, the process-global paging map.
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeFixtureGuami::install();
     let (_smf, port, calls) = activating_smf().await;
@@ -4900,6 +4928,8 @@ async fn a_registration_update_from_cm_idle_answers_the_page_and_sets_its_sessio
 #[allow(clippy::await_holding_lock)]
 async fn a_pages_setup_transfer_rides_the_registration_updates_initial_context_setup() {
     let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    // #1693: this test adds pages to, or pumps, the process-global paging map.
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeFixtureGuami::install();
     let (_smf, port, calls) = activating_smf().await;
@@ -4951,6 +4981,8 @@ async fn a_pages_setup_transfer_rides_the_registration_updates_initial_context_s
 #[allow(clippy::await_holding_lock)]
 async fn a_page_answered_by_an_update_without_session_ies_still_sets_its_session_up() {
     let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    // #1693: this test adds pages to, or pumps, the process-global paging map.
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeFixtureGuami::install();
     let (_smf, port, calls) = activating_smf().await;
@@ -5073,6 +5105,8 @@ async fn a_page_answered_by_an_initial_registration_is_stopped_and_notified() {
 #[allow(clippy::await_holding_lock)]
 async fn a_paged_release_follows_the_registration_updates_initial_context_setup() {
     let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    // #1693: this test adds pages to, or pumps, the process-global paging map.
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeFixtureGuami::install();
     let (_smf, port, calls) = activating_smf().await;
@@ -5508,6 +5542,8 @@ async fn a_later_update_without_session_ies_clears_earlier_ones() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_reactivated_by_a_registration_update_gets_no_second_setup() {
     let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
+    // #1693: this test adds pages to, or pumps, the process-global paging map.
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     let (_smf, port, calls) = activating_smf().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran, supi) = (7_759_301u64, 63, "imsi-001010007590301");
@@ -5844,6 +5880,8 @@ async fn an_update_that_reactivated_a_session_keeps_the_connection() {
 async fn a_second_downlink_data_transfer_while_paging_gets_409_with_retry_after() {
     let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
     // #1588: this page reads the paging strategy.
+    // #1693: this test adds pages to, or pumps, the process-global paging map.
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     let (_smf, port, _calls) = activating_smf().await;
     let mut server = capturing_ngap_server().await;

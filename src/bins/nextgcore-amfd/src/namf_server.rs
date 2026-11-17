@@ -8722,6 +8722,8 @@ mod tests {
     async fn test_n1n2_updp_to_a_registered_idle_ue_pages_it() {
         let _serial = updp_queue_test_lock().lock().await;
         // #1588: this page reads the paging strategy.
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
         let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         amf_context_init(64, 1024, 4096);
         let supi = "imsi-001010000540002";
@@ -9331,6 +9333,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_n1n2_transfer_idle_ue_paging_202() {
         // #1588: this page reads the paging strategy.
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
         let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         let supi = "imsi-001010000060021";
         let ue = setup_ue(supi, false, false);

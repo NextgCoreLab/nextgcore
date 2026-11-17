@@ -1073,6 +1073,8 @@ mod tests {
 
     #[test]
     fn test_n1n2_transfer_cause() {
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.blocking_lock();
         assert_eq!(
             N1N2MessageTransferCause::N1N2TransferInitiated.as_str(),
             "N1_N2_TRANSFER_INITIATED"
@@ -1106,6 +1108,8 @@ mod tests {
     #[test]
     fn a_second_transfer_while_paging_is_refused_and_keeps_the_first() {
         // #1588 review: this page reads the paging strategy.
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.blocking_lock();
         let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.blocking_lock();
         let mut ue = create_test_ue();
         ue.id = 7_749_001;
@@ -1142,6 +1146,8 @@ mod tests {
     #[test]
     fn an_n1_only_transfer_to_an_idle_ue_pages_and_keeps_the_n1() {
         // #1588 review: this page reads the paging strategy.
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.blocking_lock();
         let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.blocking_lock();
         let mut ue = create_test_ue();
         ue.id = 5_180_001;
@@ -1180,6 +1186,8 @@ mod tests {
     #[test]
     fn a_connected_ues_n1_and_release_are_delivered_now() {
         // #1588 review: this page reads the paging strategy.
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.blocking_lock();
         let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.blocking_lock();
         let mut ue = create_test_ue();
         ue.id = 6_660_001;
@@ -1403,6 +1411,8 @@ mod tests {
     #[test]
     fn test_n1n2_transfer_idle_ue_triggers_paging() {
         // #1588 review: this page reads the paging strategy.
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.blocking_lock();
         let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.blocking_lock();
         amf_context_init(64, 1024, 4096);
 
