@@ -33,11 +33,21 @@ nrf:
       - address: 0.0.0.0
         advertise: 172.23.0.10
         port: 7777
+        # TLS on the NRF's one SBI listener (#1617), read by nrfd. The NRF asks
+        # every client for a certificate (client_auth: optional): a presented
+        # one must chain to `ca`, and its urn:uuid URI SAN and RFC 9310 NFTypes
+        # are the registrant identity NFRegister / NFUpdate / NFDeregister bind
+        # to (TS 33.310 §6.1.3c.3, TS 33.501 §13.1.0); a client without one
+        # still completes the handshake. The files are this NRF's volume
+        # tls-nrf, issued by the compose sbi-tls service from
+        # docker/rust/certs/nf-identities.txt.
         tls:
-          enabled: false
+          enabled: true
           cert: /etc/nextgcore/certs/nrf.crt
           key: /etc/nextgcore/certs/nrf.key
           ca: /etc/nextgcore/certs/ca.crt
+          client_auth: optional
+          # Minimum TLS version per 3GPP TS 33.501 §13.2
           min_version: "1.2"
     oauth2:
       require: true

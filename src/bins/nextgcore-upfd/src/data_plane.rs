@@ -2451,8 +2451,10 @@ pub struct DataPlaneSession {
     pub upf_seid: u64,
     /// SMF SEID - peer's session ID
     pub smf_seid: u64,
-    /// UE IPv4 address
-    pub ue_ipv4: Option<Ipv4Addr>,
+    /// UE IPv4 address. Behind a lock because an Update PDR can move it (#1682),
+    /// and only ever written by [`SessionManager::rebind_ue_ip`], under the UE-IP
+    /// index's lock, so the index and the session never disagree.
+    ue_ipv4: RwLock<Option<Ipv4Addr>>,
     /// Uplink TEID (UPF receives on this TEID)
     pub ul_teid: u32,
     /// The downlink tunnel -- (DL TEID the UPF sends with, gNB/eNB address) -- as ONE
@@ -2494,6 +2496,11 @@ pub struct DataPlaneSession {
 }
 
 impl DataPlaneSession {
+    /// The session's UE IPv4 address, copied out of its lock.
+    pub fn ue_ipv4(&self) -> Option<Ipv4Addr> {
+        *self.ue_ipv4.read().unwrap()
+    }
+
     /// The downlink tunnel `(DL TEID, gNB address)`, copied out of its lock.
     pub fn dl_tunnel(&self) -> (u32, SocketAddr) {
         *self.dl_tunnel.read().unwrap()
@@ -2530,7 +2537,7 @@ impl DataPlaneSession {
         Self {
             upf_seid,
             smf_seid,
-            ue_ipv4,
+            ue_ipv4: RwLock::new(ue_ipv4),
             ul_teid,
             dl_tunnel: RwLock::new((dl_teid, gnb_addr)),
             pdu_session_id,
@@ -2674,7 +2681,7 @@ impl SessionManager {
         }
 
         // Add to UE IP map
-        if let Some(ip) = session.ue_ipv4 {
+        if let Some(ip) = session.ue_ipv4() {
             let mut ip_map = self.ue_ip_map.write().unwrap();
             ip_map.insert(ip, session.clone());
         }
@@ -2684,7 +2691,7 @@ impl SessionManager {
             session.upf_seid,
             session.ul_teid,
             session.dl_teid(),
-            session.ue_ipv4,
+            session.ue_ipv4(),
             session.gnb_addr()
         );
 
@@ -2719,6 +2726,111 @@ impl SessionManager {
             .retain(|_, s| *s != seid);
     }
 
+    /// #1682: move PDR `pdr_id` of `session` onto the local F-TEID `teid` an Update
+    /// PDR's PDI names (`None`: the new PDI has none), as a Create PDR in a
+    /// modification puts a PDR on its own tunnel (#583).
+    ///
+    /// `pdrs` is the session's PDR list as it stands after the update; the caller
+    /// holds its write lock, so no packet matches against the PDR while its tunnel
+    /// moves. In one critical section over both TEID indexes: the new TEID is
+    /// bound to the session, the PDR detects on it, and the TEID it detected on
+    /// before stops routing to the session once no PDR of the session detects on
+    /// it any more (TS 29.244 §5.5.3). An establishment PDR detects on the session's
+    /// `ul_teid` while it has no tunnel of its own, so that key goes once no Access
+    /// PDR without one is left.
+    ///
+    /// Returns `false`, changing nothing, when `teid` routes to another session.
+    /// The PFCP layer refuses that Update PDR before it gets here; this is the
+    /// index's own guard.
+    pub fn move_pdr_teid(
+        &self,
+        session: &DataPlaneSession,
+        pdrs: &[DataPlanePdr],
+        pdr_id: u16,
+        teid: Option<u32>,
+    ) -> bool {
+        let seid = session.upf_seid;
+        // Lock order: `ul_teid_map`, `extra_ul_teids`, then the session's
+        // `pdr_teids`. The packet path holds at most one of them at a time.
+        let mut ul_map = self.ul_teid_map.write().unwrap();
+        let mut extra = self.extra_ul_teids.write().unwrap();
+        let mut tunnels = session.pdr_teids.write().unwrap();
+        let before = tunnels.get(&pdr_id).copied();
+        if let Some(t) = teid {
+            let other_est = ul_map.get(&t).is_some_and(|s| s.upf_seid != seid);
+            let other_mod = extra.get(&t).is_some_and(|s| *s != seid);
+            if other_est || other_mod {
+                log::error!(
+                    "Update PDR {pdr_id} on SEID {seid:#x}: TEID {t:#x} routes to another \
+                     session; the PDR keeps its tunnel"
+                );
+                return false;
+            }
+            if before == Some(t) {
+                return true;
+            }
+            // An establishment PDR named on the TEID it already detects on stays as it is.
+            if before.is_none() && t == session.ul_teid && ul_map.contains_key(&t) {
+                return true;
+            }
+            if !(t == session.ul_teid && ul_map.contains_key(&t)) {
+                extra.insert(t, seid);
+            }
+            tunnels.insert(pdr_id, t);
+        } else {
+            tunnels.remove(&pdr_id);
+        }
+        // Release what is no longer detected on.
+        if let Some(old) = before.filter(|old| Some(*old) != teid) {
+            if !tunnels.values().any(|v| *v == old) && extra.get(&old) == Some(&seid) {
+                extra.remove(&old);
+            }
+        }
+        let ul_teid_used = pdrs
+            .iter()
+            .any(|p| p.source_interface == SRC_INTF_ACCESS && !tunnels.contains_key(&p.pdr_id))
+            || tunnels.values().any(|v| *v == session.ul_teid);
+        if !ul_teid_used
+            && ul_map
+                .get(&session.ul_teid)
+                .is_some_and(|s| s.upf_seid == seid)
+        {
+            ul_map.remove(&session.ul_teid);
+            log::info!(
+                "SEID {seid:#x}: TEID {:#x} released, no PDR detects on it (TS 29.244 §5.5.3)",
+                session.ul_teid
+            );
+        }
+        true
+    }
+
+    /// #1682: move `session`'s UE IPv4 address to `ip`, as an Update PDR's PDI
+    /// names it, in one critical section over the UE-IP index: the downlink
+    /// lookup finds the session on the new address and no longer on the old.
+    ///
+    /// Returns `false`, changing nothing, when `ip` is another session's. The PFCP
+    /// layer refuses that Update PDR before it gets here.
+    pub fn rebind_ue_ip(&self, session: &Arc<DataPlaneSession>, ip: Ipv4Addr) -> bool {
+        let seid = session.upf_seid;
+        let mut map = self.ue_ip_map.write().unwrap();
+        if map.get(&ip).is_some_and(|s| s.upf_seid != seid) {
+            log::error!(
+                "Update PDR on SEID {seid:#x}: UE IP {ip} is another session's; the \
+                 session keeps its address"
+            );
+            return false;
+        }
+        let old = session.ue_ipv4.write().unwrap().replace(ip);
+        if let Some(old) = old.filter(|old| *old != ip) {
+            if map.get(&old).is_some_and(|s| s.upf_seid == seid) {
+                map.remove(&old);
+            }
+            log::info!("SEID {seid:#x}: UE IP {old} -> {ip}");
+        }
+        map.insert(ip, session.clone());
+        true
+    }
+
     /// Find session by UE IP
     pub fn find_by_ue_ip(&self, ip: Ipv4Addr) -> Option<Arc<DataPlaneSession>> {
         let map = self.ue_ip_map.read().unwrap();
@@ -2747,14 +2859,22 @@ impl SessionManager {
         };
 
         if let Some(sess) = session {
-            // Remove from TEID map
+            // Remove from TEID map. #1682: only while the key is still this
+            // session's: an Update PDR may have released it, and another session
+            // may hold it since.
             {
                 let mut ul_map = self.ul_teid_map.write().unwrap();
-                ul_map.remove(&sess.ul_teid);
+                if ul_map
+                    .get(&sess.ul_teid)
+                    .is_some_and(|s| s.upf_seid == seid)
+                {
+                    ul_map.remove(&sess.ul_teid);
+                }
             }
 
-            // Remove from IP map
-            if let Some(ip) = sess.ue_ipv4 {
+            // Remove from IP map: the address the session holds NOW, which an
+            // Update PDR may have moved (#1682).
+            if let Some(ip) = sess.ue_ipv4() {
                 let mut ip_map = self.ue_ip_map.write().unwrap();
                 ip_map.remove(&ip);
             }
@@ -2782,7 +2902,7 @@ impl SessionManager {
             }
 
             // Remove from IP map
-            if let Some(ip) = sess.ue_ipv4 {
+            if let Some(ip) = sess.ue_ipv4() {
                 let mut ip_map = self.ue_ip_map.write().unwrap();
                 ip_map.remove(&ip);
             }
@@ -2810,7 +2930,7 @@ impl SessionManager {
             .map(|s| {
                 (
                     s.upf_seid,
-                    s.ue_ipv4,
+                    s.ue_ipv4(),
                     s.ul_packets.load(Ordering::Relaxed),
                     s.dl_packets.load(Ordering::Relaxed),
                     s.ul_bytes.load(Ordering::Relaxed),
@@ -4364,7 +4484,7 @@ impl DataPlane {
         // PDU session. A mismatch is a spoofed/misrouted packet and is dropped.
         // (Only enforced when the session has an allocated UE IPv4; IPv6 / no
         // address sessions fall through unchanged.)
-        if let Some(ue_ip) = session.ue_ipv4 {
+        if let Some(ue_ip) = session.ue_ipv4() {
             if ip_payload.len() >= 20 && (ip_payload[0] >> 4) == IP_VERSION_4 {
                 let src_ip = Ipv4Addr::new(
                     ip_payload[12],

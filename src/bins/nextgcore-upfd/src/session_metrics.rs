@@ -84,7 +84,7 @@ pub fn render(mode: Mode, sessions: &[Arc<DataPlaneSession>]) -> String {
     }
     let mut sessions: Vec<&Arc<DataPlaneSession>> = sessions.iter().collect();
     sessions.sort_by_key(|s| s.upf_seid);
-    let labels = |s: &DataPlaneSession| match (mode, s.ue_ipv4) {
+    let labels = |s: &DataPlaneSession| match (mode, s.ue_ipv4()) {
         (Mode::SeidUeIp, Some(ip)) => format!("seid=\"0x{:x}\",ue_ipv4=\"{ip}\"", s.upf_seid),
         _ => format!("seid=\"0x{:x}\"", s.upf_seid),
     };

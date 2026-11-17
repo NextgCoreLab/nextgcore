@@ -249,7 +249,7 @@ scp:
         let cfg = parse(shipped).expect("shipped scp.yaml must parse");
         assert_eq!(cfg.sbi_address().as_deref(), Some("172.22.0.50"));
         assert_eq!(cfg.sbi_port(), Some(7777));
-        assert_eq!(cfg.nrf_uri().as_deref(), Some("http://172.22.0.10:7777"));
+        assert_eq!(cfg.nrf_uri().as_deref(), Some("https://172.22.0.10:7777"));
         // The optional scp-level keys are documented commented-out, so the
         // built-in defaults still apply.
         assert!(cfg.section().fqdn.is_none());

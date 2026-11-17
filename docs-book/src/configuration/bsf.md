@@ -31,7 +31,7 @@ bsf:
         port: 7777
     client:
       nrf:
-        - uri: http://172.23.0.10:7777
+        - uri: https://172.23.0.10:7777
     # TLS configuration (G36: SBI TLS)
     # Enable: TLS_ENABLED=true SBI_SCHEME=https docker compose up -d
     tls:
@@ -61,7 +61,7 @@ These are the fields actually deserialized by the daemon (`#[derive(Deserialize)
 | `bsf.sbi.server[0].advertise` | string | absent → the bind address, unless it is a wildcard | The host registered in the NRF NFProfile and put in callback URIs (#1312). After `--sbi-advertise` and `NEXTGCORE_SBI_ADVERTISE`. A wildcard is never advertised: with a wildcard bind and nothing set here, the NF does not register with the NRF and logs why. |
 | `bsf.sbi.server[0].port` | u16 | absent → `7777` | Bind and advertised SBI port, after `--sbi-port` (#1312). |
 | `bsf.sbi.client.nrf[0].uri` | string | absent → CLI `--nrf-uri` (unset → no NRF registration) | NRF base URI, seeded into the global SBI context for NF registration, heartbeat, and (when OAuth2 is on) token issuance/JWKS. `uri` is a **required** field of the list entry — if an `nrf` entry omits it, deserialization of the whole file fails and is silently ignored (the parse is wrapped in `if let Ok(...)`), leaving the BSF unregistered. |
-| `bsf.sbi.oauth2.require` | bool | `false` | SBI OAuth2 bearer-token enforcement. When `true`, incoming requests must carry an NRF-issued token whose audience includes `BSF`, verified against the NRF JWKS (TS 33.501 §13.4.1 per code comment); with no NRF URI configured the server fails closed with 503 (per code comment). Also installs a process-wide OAuth2 client so outbound SBI calls attach tokens. Unlike NSACF, there is **no** CLI override flag for this knob. |
+| `bsf.sbi.oauth2.require` | bool | `false` | SBI OAuth2 bearer-token enforcement. When `true`, incoming requests must carry an NRF-issued token whose audience includes `BSF`, verified against the NRF JWKS (TS 33.501 §13.4.1 per code comment); with no NRF URI configured the server fails closed with 503 (per code comment). Also installs a process-wide OAuth2 client so outbound SBI calls attach tokens. Unlike NSACF, there is **no** CLI override flag for this knob. The outbound token client is also installed, with the knob off, under the `production` SBI profile (#1665; see [Configuration Overview](./overview.md)). |
 
 ### Parsed-but-inert / decorative YAML fields
 

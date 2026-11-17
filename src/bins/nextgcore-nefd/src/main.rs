@@ -43,7 +43,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
+use nextgcore_sbi::client::SbiClient;
 use nextgcore_sbi::context::SbiContext;
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
 use nextgcore_sbi::server::{
@@ -2248,7 +2248,7 @@ fn render_prometheus() -> String {
 /// Build an SBI client with bounded connect/request timeouts (amfd
 /// notification-client parity).
 fn bounded_client(host: &str, port: u16) -> SbiClient {
-    let config = SbiClientConfig::new(host, port)
+    let config = nextgcore_sbi::security::sbi_peer_client_config(host, port)
         .with_connect_timeout(Duration::from_secs(SOUTHBOUND_CONNECT_TIMEOUT_SECS))
         .with_request_timeout(Duration::from_secs(SOUTHBOUND_REQUEST_TIMEOUT_SECS));
     SbiClient::new(config)

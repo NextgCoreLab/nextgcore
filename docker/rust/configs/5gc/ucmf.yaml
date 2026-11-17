@@ -6,7 +6,7 @@ logger:
 
 ucmf:
   nrf:
-    uri: http://172.23.0.10:7777
+    uri: https://172.23.0.10:7777
   # TS 23.003 29.2 Version ID of the PLMN-assigned UE Radio Capability IDs this
   # UCMF assigns (two hex digits). Changing it makes every older PLMN-assigned
   # ID resolve as OUT_DATED_VERSION_ID_IN_RAC_ID and is notified to subscribers.

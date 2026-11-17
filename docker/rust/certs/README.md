@@ -60,7 +60,11 @@ compose stacks pin each NF's ID with `NEXTGCORE_<TYPE>_INSTANCE_ID` (see
 `src/libs/nextgcore-sbi/src/nf_instance_id.rs`); an unpinned NF generates a
 random UUID at start that no certificate names.
 [`check-nf-identities.py`](check-nf-identities.py) (run in CI) fails when a
-compose file pins an ID other than the table's.
+compose file pins an ID other than the table's, when a service with a
+certificate volume configures any nfInstanceId but its certificate's (in its
+environment, command or bind-mounted files) or does not name its pair with
+`NEXTGCORE_NRF_TLS_*`, and when a service other than `sbi-tls` mounts this
+directory or the `sbi_pki` volume.
 
 Each certificate names only its own NF in its DNS and IP SANs, so one NF's
 certificate cannot pass as another NF's server identity.
@@ -83,6 +87,16 @@ tightened to `0600`). A container whose user is not the key's owner cannot read
 it through a bind mount: the deployment must give the key to the container's
 user (for example a copy owned by that user, or a Kubernetes Secret with
 `defaultMode`/`fsGroup`), rather than widening the file mode.
+
+The compose stacks do not bind-mount this directory into any NF. Their one-shot
+`sbi-tls` service runs [`compose-tls-init.sh`](compose-tls-init.sh) as root:
+it issues the PKI into the `sbi_pki` volume (only that service mounts it, so
+the CA key stays there) and copies into each NRF client's own volume
+`tls-<name>` its `ca.crt`, `<name>.crt` (`0444`) and `<name>.key` (`0400`,
+owned by the uid that container runs as: the image's `nextgcore` user, or the
+uid `SBI_TLS_OWNERS` names for a nextgsim sidecar that drops to its own). Each
+NF mounts only its own volume, read-only, at `/etc/nextgcore/certs`, so no NF
+container can read another NF's key.
 
 Certificates (`*.crt`, `ca.crt`) are public and written `0644`, so any
 container user can read them through a bind mount.

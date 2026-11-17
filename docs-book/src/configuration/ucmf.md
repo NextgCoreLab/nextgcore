@@ -13,7 +13,7 @@ The UCMF registers with the NRF as `nfType: UCMF` with two services, `nucmf-ueca
 
 ## Example configuration
 
-From `docker/rust/configs/5gc/ucmf.yaml` (mounted by `docker-compose.yml`, which runs the daemon with `--sbi-addr 172.23.0.39 --sbi-port 7777 --nrf-uri http://172.23.0.10:7777`):
+From `docker/rust/configs/5gc/ucmf.yaml` (mounted by `docker-compose.yml`, which runs the daemon with `--sbi-addr 172.23.0.39 --sbi-port 7777 --nrf-uri https://172.23.0.10:7777`):
 
 ```yaml
 logger:
@@ -21,7 +21,7 @@ logger:
 
 ucmf:
   nrf:
-    uri: http://172.23.0.10:7777
+    uri: https://172.23.0.10:7777
   version_id: "01"
   mode: B
   purge_outdated_ids: false
@@ -42,7 +42,7 @@ Parsed by `UcmfYaml` / `UcmfSection` in `src/bins/nextgcore-ucmfd/src/main.rs`. 
 | `ucmf.limits.max_dic_entries` | integer | `10000` | Most dictionary entries, assigned plus provisioned (#786). Past it Assign answers `500 INSUFFICIENT_RESOURCES` and Provisioning reports the RACS ID `OTHER_REASON`. An ID counter (entry, subscription, provisioning) that reaches the top of its range refuses the same way rather than reissue an ID. |
 | `ucmf.limits.max_subscriptions` | integer | `10000` | Most Nucmf_UECapabilityManagement subscriptions; past it Subscribe answers `500 INSUFFICIENT_RESOURCES`. |
 | `ucmf.limits.max_subscriptions_per_consumer` | integer | `16` | Most subscriptions per consumer. A subscription counts against its `nfId` and against its notification URI's `host:port`, and either reaching the limit refuses, so a consumer cannot sidestep it by varying the self-declared `nfId` (#843 review). |
-| `ucmf.sbi.oauth2.require` | bool | `false` | Require an OAuth2 token on the SBI. `--oauth2-require` overrides it. |
+| `ucmf.sbi.oauth2.require` | bool | `false` | Require an OAuth2 token on the SBI. `--oauth2-require` overrides it. The outbound token client is also installed, with the knob off, under the `production` SBI profile (#1665; see [Configuration Overview](./overview.md)). |
 
 The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691).
 

@@ -5082,8 +5082,12 @@ impl AmfUe {
     /// Generate new GUTI with a cryptographically random 5G-TMSI
     /// (TS 23.003 Section 2.10.1: the M-TMSI must not be predictable —
     /// never an NGAP-ID cast or a timestamp).
+    ///
+    /// #1692: the 5G-TMSI is unique within this AMF (TS 23.003 §2.10.1: the 5G-TMSI
+    /// "uniquely identifies the UE within the AMF(s) that allocated the 5G-GUTI"),
+    /// drawn through [`allocate_unique_tmsi`] from the values no live UE holds.
     pub fn generate_new_guti(&mut self) {
-        self.next_guti.tmsi = generate_random_tmsi();
+        self.next_guti.tmsi = allocate_unique_tmsi();
         self.next_m_tmsi = Some(self.next_guti.tmsi);
     }
 }
@@ -5101,6 +5105,164 @@ pub fn generate_random_tmsi() -> u32 {
             return tmsi;
         }
     }
+}
+
+/// The 5G-TMSIs this AMF has allocated or holds, each with the last time it was
+/// known to be in use (#1692).
+///
+/// TS 23.003 §2.10.1 (`23003-k00.txt:2443-2449`): the 5G-TMSI part of the 5G-GUTI
+/// "uniquely identifies the UE within the AMF(s) that allocated the 5G-GUTI", and the
+/// AMFs sharing an AMF Pointer "need to ensure that the 5G-TMSI value ... is not
+/// already in use". With 32 random bits and no check, two UEs share one after about
+/// 77 000 allocations at even odds, and a Service Request, a page answer or any
+/// 5G-S-TMSI lookup then resolves the other UE's record.
+///
+/// # Why a registry beside the UE store, not a scan of it
+///
+/// [`AmfUe::generate_new_guti`] runs inside `ue_auth_state.with_mut`, under the UE
+/// store's write lock, or on a record taken out of the store. A scan from there
+/// would re-take the store's lock (a deadlock), or miss the record being worked on
+/// and every other record out of the store at that moment. So the allocation checks
+/// this registry, a leaf lock taken after the store's and never before it.
+///
+/// # When a 5G-TMSI is released
+///
+/// A record holds a 5G-TMSI as its `current_guti` or `next_guti`, but records are
+/// routinely taken out of the store and put back while a procedure runs, so leaving
+/// the store is no release point. A replaced, unacknowledged `next_guti` may still
+/// be in the UE's hands (TS 24.501 §5.5.1.2.8: a lost REGISTRATION COMPLETE). So a
+/// value is released only after it has been held by no live record for
+/// [`TMSI_RELEASE_GRACE`]:
+/// - [`tmsi_registry_sweep`], run by the NGAP task with a snapshot of the store,
+///   refreshes every value a record holds and drops those unseen for the grace;
+/// - [`tmsi_registry_hold`] enters the values of a record restored at start-up or
+///   taken over from another AMF of the set, before any allocation can draw them.
+///
+/// A value no record references is therefore reused at the earliest one grace after
+/// its last use, never while a record still holds it.
+///
+/// # Scope
+///
+/// Uniqueness is per amfd process: the registry is this process's. The NOTE of TS
+/// 23.003 §2.10.1 (several AMFs sharing one AMF Pointer must not reuse a 5G-TMSI the
+/// others use) would need a set-wide registry. The shipped deployments give each AMF
+/// its own pointer (one AMF per Helm release; one per GUAMI in the manifests), so the
+/// per-process namespace is the AMF's. A 5G-GUTI of another AMF (a presented or
+/// EPS-mapped one, kept until this AMF reallocates) is in that AMF's namespace; it
+/// is held from the next sweep anyway, which only excludes a few values here.
+static TMSI_REGISTRY: std::sync::Mutex<Option<HashMap<u32, std::time::Instant>>> =
+    std::sync::Mutex::new(None);
+
+/// Serialises the tests that assert on [`TMSI_REGISTRY`]'s contents (#1692). A sweep
+/// with a clock moved past [`TMSI_RELEASE_GRACE`] releases every other test's values,
+/// so those tests hold this; allocation itself needs no lock.
+#[cfg(test)]
+pub(crate) static TMSI_REGISTRY_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+/// How long a 5G-TMSI no live record holds stays allocated (#1692): well beyond the
+/// longest a record is out of the store during a procedure (bounded by the SBI
+/// timeouts, seconds), and beyond the T3550 retransmissions of a GUTI the UE may
+/// have received but not acknowledged (5 x 6 s, TS 24.501 §10.2).
+pub const TMSI_RELEASE_GRACE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Run `f` on the registry. A poisoned lock is read through: the registry holds no
+/// invariant a panicking holder can break half-way (each operation is one insert or
+/// one retain).
+fn with_tmsi_registry<R>(f: impl FnOnce(&mut HashMap<u32, std::time::Instant>) -> R) -> R {
+    let mut guard = TMSI_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    f(guard.get_or_insert_with(HashMap::new))
+}
+
+/// A fresh 5G-TMSI that no live UE of this AMF holds, entered in the registry as
+/// allocated now (#1692). Drawn from the OS CSPRNG ([`generate_random_tmsi`]), so it
+/// stays unpredictable (TS 33.501 §6.12.3).
+pub fn allocate_unique_tmsi() -> u32 {
+    allocate_unique_tmsi_from(generate_random_tmsi, std::time::Instant::now())
+}
+
+/// [`allocate_unique_tmsi`] with the draw and the clock given: draw until the value
+/// is not reserved and not held. The registry holds at most a few values per live
+/// UE out of 2^32 - 2, so a draw is free with overwhelming probability; the loop is
+/// bounded anyway, and after the bound the last draw is used and logged rather than
+/// looping for ever on a broken RNG.
+pub(crate) fn allocate_unique_tmsi_from(
+    mut draw: impl FnMut() -> u32,
+    now: std::time::Instant,
+) -> u32 {
+    const MAX_DRAWS: usize = 64;
+    with_tmsi_registry(|held| {
+        let mut tmsi = draw();
+        for _ in 1..MAX_DRAWS {
+            if tmsi != 0 && tmsi != u32::MAX && !held.contains_key(&tmsi) {
+                break;
+            }
+            tmsi = draw();
+        }
+        if tmsi == 0 || tmsi == u32::MAX || held.contains_key(&tmsi) {
+            log::error!(
+                "5G-TMSI allocation: {MAX_DRAWS} draws found no free value; using \
+                 0x{tmsi:08x} (TS 23.003 §2.10.1 uniqueness not ensured)"
+            );
+        }
+        held.insert(tmsi, now);
+        tmsi
+    })
+}
+
+/// Enter `tmsis` in the registry as in use at `now` (#1692): the values of a record
+/// that arrived without being allocated here (restored at start-up, taken over
+/// from another AMF of the set). 0 is no 5G-TMSI and is skipped.
+pub fn tmsi_registry_hold(tmsis: impl IntoIterator<Item = u32>, now: std::time::Instant) {
+    with_tmsi_registry(|held| {
+        for tmsi in tmsis.into_iter().filter(|t| *t != 0) {
+            held.insert(tmsi, now);
+        }
+    });
+}
+
+/// The registry sweep (#1692): every value in `live` (the 5G-TMSIs the live records
+/// hold) is in use at `now`; a value no record holds that was last in use more than
+/// [`TMSI_RELEASE_GRACE`] before `now` is released. Returns how many were released.
+pub fn tmsi_registry_sweep(
+    live: &std::collections::HashSet<u32>,
+    now: std::time::Instant,
+) -> usize {
+    let (released, size) = with_tmsi_registry(|held| {
+        for tmsi in live.iter().filter(|t| **t != 0) {
+            held.insert(*tmsi, now);
+        }
+        let before = held.len();
+        held.retain(|tmsi, seen| {
+            live.contains(tmsi) || now.saturating_duration_since(*seen) <= TMSI_RELEASE_GRACE
+        });
+        (before - held.len(), held.len())
+    });
+    // #1723 review (b): the registry's size, against the live values it must hold
+    // (at most two per record) plus what one grace of allocations adds. Logged at
+    // debug each sweep; a size far beyond that (an allocation loop) is a warning.
+    log::debug!(
+        "5G-TMSI registry: {size} held, {} live, {released} released",
+        live.len()
+    );
+    if size > 2 * live.len() + TMSI_REGISTRY_WARN_EXCESS {
+        log::warn!(
+            "5G-TMSI registry holds {size} values for {} live ones: more than \
+             {TMSI_REGISTRY_WARN_EXCESS} allocations within one grace",
+            live.len()
+        );
+    }
+    released
+}
+
+/// The allocations within one [`TMSI_RELEASE_GRACE`] beyond which the registry's
+/// size is logged as a warning (#1723 review (b)).
+const TMSI_REGISTRY_WARN_EXCESS: usize = 100_000;
+
+/// Whether `tmsi` is in the registry (tests).
+#[cfg(test)]
+pub(crate) fn tmsi_registry_holds(tmsi: u32) -> bool {
+    with_tmsi_registry(|held| held.contains_key(&tmsi))
 }
 
 /// Generate a K_AMF locally, for an unauthenticated emergency session (#361).
@@ -5759,6 +5921,70 @@ pub fn amf_instance_get_load() -> i32 {
 // ============================================================================
 // Tests
 // ============================================================================
+
+/// #1692: the 5G-TMSI registry.
+#[cfg(test)]
+mod tmsi_registry_tests_1692 {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A forced collision is redrawn: a value the registry holds, and the reserved
+    /// all-zeros / all-ones values, are drawn again until a free one comes up, which
+    /// is then held.
+    ///
+    /// REVERT-VERIFIED: with the `held.contains_key` check removed from the draw
+    /// loop, the held value is returned.
+    #[tokio::test]
+    async fn a_forced_collision_is_redrawn_1692() {
+        let _lock = TMSI_REGISTRY_TEST_LOCK.lock().await;
+        let now = Instant::now();
+        let (taken, free) = (0x1692_0001u32, 0x1692_0002u32);
+        tmsi_registry_hold([taken], now);
+        let mut draws = [taken, 0, u32::MAX, taken, free].into_iter();
+        let got = allocate_unique_tmsi_from(|| draws.next().expect("a draw"), now);
+        assert_eq!(got, free);
+        assert!(tmsi_registry_holds(free), "the allocated value is held");
+        // The next allocation cannot hand out `free` again.
+        let mut draws = [free, taken, 0x1692_0003].into_iter();
+        assert_eq!(
+            allocate_unique_tmsi_from(|| draws.next().expect("a draw"), now),
+            0x1692_0003
+        );
+    }
+
+    /// A value is released only once no live record has held it for the grace: a
+    /// sweep that finds it live refreshes it, however old its entry.
+    ///
+    /// REVERT-VERIFIED: with the retain keeping only `live` values, the unheld value
+    /// is released at once; with the live values not refreshed, the live one is
+    /// released one grace after its allocation.
+    #[tokio::test]
+    async fn a_tmsi_is_released_one_grace_after_its_last_use_1692() {
+        let _lock = TMSI_REGISTRY_TEST_LOCK.lock().await;
+        let t0 = Instant::now();
+        let (gone, live) = (0x1692_0101u32, 0x1692_0102u32);
+        tmsi_registry_hold([gone, live], t0);
+        let live_set: std::collections::HashSet<u32> = [live].into();
+        let none = std::collections::HashSet::new();
+
+        tmsi_registry_sweep(&live_set, t0 + TMSI_RELEASE_GRACE);
+        assert!(tmsi_registry_holds(gone), "within the grace: still held");
+        tmsi_registry_sweep(&live_set, t0 + TMSI_RELEASE_GRACE + Duration::from_secs(1));
+        assert!(!tmsi_registry_holds(gone), "past the grace: released");
+        assert!(tmsi_registry_holds(live), "a live value is never released");
+
+        // `live` was last seen at the sweep one grace + 1 s in; no record holds it
+        // from then on.
+        let last_seen = t0 + TMSI_RELEASE_GRACE + Duration::from_secs(1);
+        tmsi_registry_sweep(&none, last_seen + TMSI_RELEASE_GRACE);
+        assert!(tmsi_registry_holds(live), "refreshed by the live sweep");
+        tmsi_registry_sweep(
+            &none,
+            last_seen + TMSI_RELEASE_GRACE + Duration::from_secs(1),
+        );
+        assert!(!tmsi_registry_holds(live));
+    }
+}
 
 #[cfg(test)]
 mod tests {
