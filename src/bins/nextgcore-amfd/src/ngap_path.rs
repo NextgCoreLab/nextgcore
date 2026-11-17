@@ -753,6 +753,13 @@ pub struct UeNasContext {
     /// (UE Context Release Complete) and the UE has not come back with a Service
     /// Request. Independent of `reachability`, whose timer can be disabled.
     cm_idle: bool,
+    /// #1593: a new NG connection took the UE out of CM-IDLE. Set from `cm_idle`
+    /// when a Service Request or a registration request from 5GMM-IDLE moves the
+    /// context to the new connection; taken by that procedure's CM-state reports
+    /// (CONNECTIVITY_STATE_REPORT, REACHABILITY_REPORT). A UE still CM-CONNECTED
+    /// that comes in on a new gNB before its old connection is released has
+    /// changed no CM state, and neither has a later message on the same connection.
+    left_cm_idle: bool,
     /// UDM SDM subscription ID (from Nudm_SDM_Subscribe)
     sdm_subscription_id: Option<String>,
     /// PCF AM policy association ID (from Npcf_AMPolicyControl_Create)
@@ -1006,6 +1013,7 @@ impl UeNasContext {
             registration_follow_on: false,
             release_after_registration: false,
             cm_idle: false,
+            left_cm_idle: false,
             restored: false,
             taken_over: false,
             peers_stale: false,
@@ -6917,9 +6925,12 @@ impl NgapServer {
             let tmsi = state.amf_ue.next_guti.tmsi;
             let sessions = reconciled.map(|r| r.activated).unwrap_or_default();
             let reactivated = sessions.len();
-            // #1593: a new NG connection is the UE's CM-IDLE -> CM-CONNECTED.
-            let from_cm_idle = !state.initial_context_setup_request_sent;
-            if from_cm_idle {
+            // #1593: whether this update brought the UE out of CM-IDLE, from its CM
+            // state when the context moved to this connection (not from the ICS
+            // flag, which an Initial Context Setup that failed to encode leaves
+            // unset). Taken, so a later message on the connection reports nothing.
+            let from_cm_idle = std::mem::take(&mut state.left_cm_idle);
+            if !state.initial_context_setup_request_sent {
                 // A new NG connection: the UE came back from CM-IDLE (#609 resume),
                 // so the gNB holds no UE context and no AS security for it. The
                 // Accept rides an Initial Context Setup together with any session
@@ -7031,8 +7042,9 @@ impl NgapServer {
             // (TS 29.518 §6.2, "report for updated connection management state of a
             // UE", `29518-k00.txt:24011-24017`) and REACHABILITY_REPORT. Before,
             // a subscriber saw CM-IDLE at the release and nothing when the UE came
-            // back this way. A connected UE's update changes no CM state, so it fires
-            // neither.
+            // back this way. A connected UE's update changes no CM state, and neither
+            // does a UE still CM-CONNECTED that registers on a new gNB before its old
+            // connection is released, so neither fires (R5 review).
             if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
                 if from_cm_idle {
                     crate::namf_server::fire_connectivity_state_report(&state.amf_ue, true);
@@ -7481,6 +7493,8 @@ impl NgapServer {
         state.amf_ue.id = amf_ue_ngap_id;
         state.association_id = association_id;
         state.reachability = None;
+        // #1593: whether this connection is a CM-IDLE -> CM-CONNECTED transition.
+        state.left_cm_idle = state.cm_idle;
         state.cm_idle = false;
         // #759: a new NG connection, with no UE context at the gNB yet. A session
         // re-activated by this registration has to ride an Initial Context Setup.
@@ -7638,6 +7652,8 @@ impl NgapServer {
         state.amf_ue.id = amf_ue_ngap_id;
         state.association_id = association_id;
         state.reachability = None;
+        // #1593: whether this connection is a CM-IDLE -> CM-CONNECTED transition.
+        state.left_cm_idle = state.cm_idle;
         state.cm_idle = false;
         state.amf_ue.nr_tai = crate::context::Tai5gs {
             plmn_id: initial_ue.plmn_id.clone(),
@@ -7971,11 +7987,19 @@ impl NgapServer {
                 ""
             }
         );
-        // The same CM-IDLE -> CM-CONNECTED reports `handle_service_request_nas`
-        // fires, for the same reasons recorded there.
+        // The CM-IDLE -> CM-CONNECTED reports, for the reasons recorded at
+        // `handle_service_request_nas`. #1593: only for a real transition. A UE still
+        // CM-CONNECTED whose Service Request comes in on a new gNB before its old
+        // connection is released changed no CM state.
+        let left_cm_idle = self
+            .ue_auth_state
+            .with_mut(amf_ue_ngap_id, |s| std::mem::take(&mut s.left_cm_idle))
+            .unwrap_or(false);
         if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
-            crate::namf_server::fire_connectivity_state_report(&state.amf_ue, true);
-            crate::namf_server::fire_reachability_report(&state.amf_ue, true);
+            if left_cm_idle {
+                crate::namf_server::fire_connectivity_state_report(&state.amf_ue, true);
+                crate::namf_server::fire_reachability_report(&state.amf_ue, true);
+            }
             crate::namf_server::fire_presence_in_aoi_report(&state.amf_ue);
         }
         // #1424: LOCATION_REPORT diffed against the last reported location, through the
@@ -8469,10 +8493,15 @@ impl NgapServer {
         // nothing from here. So the common case — a Service Request from the same cell the
         // UE registered in — is silent, which is the outcome the clause requires.
         //
-        // Read from ONE `get`, so all five reports describe the same snapshot.
+        // Read from ONE `get`, so the reports describe the same snapshot.
+        //
+        // #1593: no CONNECTIVITY_STATE_REPORT or REACHABILITY_REPORT here. This
+        // Service Request came on the UE's live NG connection (the finish checks it
+        // is not CM-IDLE), so the CM state did not change. TS 29.518 §6.2 reports an
+        // "updated connection management state", and a CONNECTED that was already
+        // CONNECTED is none. The CM-IDLE -> CM-CONNECTED reports fire at
+        // `finish_idle_service_request` and at a registration update from CM-IDLE.
         if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
-            crate::namf_server::fire_connectivity_state_report(&state.amf_ue, true);
-            crate::namf_server::fire_reachability_report(&state.amf_ue, true);
             crate::namf_server::fire_presence_in_aoi_report(&state.amf_ue);
         }
         // #1424: LOCATION_REPORT diffed against the last reported location, through the
@@ -37033,6 +37062,7 @@ mod tests {
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let mut sinks = Vec::new();
         let mut rxs = Vec::new();
+        let mut subscriptions = Vec::new();
         for event in ["CONNECTIVITY_STATE_REPORT", "REACHABILITY_REPORT"] {
             let (sink, port, rx) = notify_sink().await;
             let body = serde_json::json!({
@@ -37049,10 +37079,13 @@ mod tests {
             )
             .await;
             assert_eq!(resp.status, 201, "the {event} subscription is created");
+            // #1614: removed when the test ends, before its sink stops.
+            subscriptions.push(crate::namf_server::EventSubscriptionGuard::of(&resp));
             sinks.push(sink);
             rxs.push(rx);
         }
 
+        let connected_before = crate::namf_server::connected_reports_on_this_thread();
         ngap.forced_amf_ue_ngap_id = Some(new_id);
         let _ = ngap
             .handle_initial_ue_message(1, &service_request_initial_ue(nas))
@@ -37062,6 +37095,11 @@ mod tests {
                 .get(new_id)
                 .is_some_and(|s| s.registration_accept_sent),
             "the periodic update was accepted"
+        );
+        assert_eq!(
+            crate::namf_server::connected_reports_on_this_thread() - connected_before,
+            1,
+            "one CONNECTED report, from this handler"
         );
 
         for (rx, (event, key, want)) in rxs.iter_mut().zip([
@@ -37084,9 +37122,111 @@ mod tests {
             assert_eq!(got, want, "{v}");
         }
         ngap.ue_auth_state.remove(new_id);
+        drop(subscriptions);
         for sink in sinks {
             sink.stop().await.expect("sink stop");
         }
+    }
+
+    /// **#1593 review (R5 MAJOR 2, MINOR a)**: an update that changes no CM state
+    /// fires no CONNECTED report. Counted per thread on this current-thread runtime
+    /// (`connected_reports_on_this_thread`), with the Accept as the positive control.
+    /// - A UE still CM-CONNECTED on gNB A that registers on gNB B before A's
+    ///   connection is released: a new NG connection, but no CM-IDLE to leave.
+    /// - An idle UE whose Initial Context Setup does not encode (no Allowed NSSAI,
+    ///   SIZE(1..8)) gets the Accept by DL NAS Transport, and the ICS flag stays
+    ///   unset. Its next update, on that same connection, is not a transition again.
+    ///
+    /// REVERT-VERIFIED: with `from_cm_idle` taken from the ICS flag again, both
+    /// cases count a CONNECTED report.
+    #[tokio::test]
+    async fn an_update_that_changes_no_cm_state_reports_no_connected_1593() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = capturing_ngap_server().await;
+        let periodic = crate::gmm_build::registration_type::PERIODIC_UPDATING;
+        let publish = |ue: &crate::context::AmfUe| {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_publish(ue, 51, 1);
+        };
+        let accepted = |ngap: &NgapServer, id: u64| {
+            ngap.ue_auth_state
+                .get(id)
+                .is_some_and(|s| s.registration_accept_sent)
+        };
+        let count = crate::namf_server::connected_reports_on_this_thread;
+
+        // Still CM-CONNECTED at gNB A, now on gNB B.
+        let (old_id, new_id) = (15_939_311u64, 15_939_312u64);
+        let tmsi = 0x1593_9311u32;
+        let mut stored = idle_ue_with_security(old_id, tmsi);
+        stored.cm_idle = false;
+        stored.amf_ue.allowed_nssai = vec![crate::context::SNssai { sst: 1, sd: None }];
+        let rr = guti_registration_request(periodic, tmsi);
+        let nas = protected_initial_registration(&stored.amf_ue, &rr, &rr, 5);
+        publish(&stored.amf_ue);
+        ngap.ue_auth_state.insert(old_id, stored);
+        let before = count();
+        ngap.forced_amf_ue_ngap_id = Some(new_id);
+        let _ = ngap
+            .handle_initial_ue_message(1, &service_request_initial_ue(nas))
+            .await;
+        assert!(accepted(&ngap, new_id), "the update was accepted");
+        assert_eq!(
+            count() - before,
+            0,
+            "a connected UE on a new gNB: no CONNECTED"
+        );
+        ngap.ue_auth_state.remove(new_id);
+
+        // Idle; the ICS does not encode; then an update on the same connection.
+        let (old_id, new_id) = (15_939_321u64, 15_939_322u64);
+        let tmsi = 0x1593_9321u32;
+        let mut stored = idle_ue_with_security(old_id, tmsi);
+        stored.amf_ue.allowed_nssai.clear();
+        let rr = guti_registration_request(periodic, tmsi);
+        let nas = protected_initial_registration(&stored.amf_ue, &rr, &rr, 5);
+        publish(&stored.amf_ue);
+        ngap.ue_auth_state.insert(old_id, stored);
+        let before = count();
+        ngap.forced_amf_ue_ngap_id = Some(new_id);
+        let _ = ngap
+            .handle_initial_ue_message(1, &service_request_initial_ue(nas))
+            .await;
+        let state = ngap.ue_auth_state.get(new_id).expect("the UE resumed");
+        assert!(
+            state.registration_accept_sent,
+            "the first update was accepted"
+        );
+        assert!(
+            !state.initial_context_setup_request_sent,
+            "precondition: the Initial Context Setup did not go"
+        );
+        assert_eq!(
+            count() - before,
+            1,
+            "the update from CM-IDLE: one CONNECTED"
+        );
+
+        let ran = state.ran_ue_ngap_id;
+        let again = protected_initial_registration(&state.amf_ue, &rr, &rr, 6);
+        ngap.ue_auth_state
+            .with_mut(new_id, |s| s.registration_accept_sent = false);
+        let before = count();
+        ngap.handle_uplink_nas_transport(
+            1,
+            &handler_tests::uplink_nas_transport(new_id, ran, &again),
+        )
+        .await
+        .expect("handled");
+        assert!(accepted(&ngap, new_id), "the second update was accepted");
+        assert_eq!(
+            count() - before,
+            0,
+            "an update on the same connection: no CONNECTED"
+        );
+        ngap.ue_auth_state.remove(new_id);
     }
 
     /// **#1424**: [`NgapServer::report_location_change`] measures each dimension from
