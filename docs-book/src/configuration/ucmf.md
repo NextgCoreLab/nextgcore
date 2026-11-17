@@ -13,7 +13,7 @@ The UCMF registers with the NRF as `nfType: UCMF` with two services, `nucmf-ueca
 
 ## Example configuration
 
-From `docker/rust/configs/5gc/ucmf.yaml` (mounted by `docker-compose.yml`, which runs the daemon with `--sbi-addr 172.23.0.39 --sbi-port 7777 --nrf-uri http://172.23.0.10:7777`):
+From `docker/rust/configs/5gc/ucmf.yaml` (mounted by `docker-compose.yml`, which runs the daemon with `--sbi-addr 172.23.0.39 --sbi-port 7777 --nrf-uri https://172.23.0.10:7777`):
 
 ```yaml
 logger:
@@ -21,7 +21,7 @@ logger:
 
 ucmf:
   nrf:
-    uri: http://172.23.0.10:7777
+    uri: https://172.23.0.10:7777
   version_id: "01"
   mode: B
   purge_outdated_ids: false

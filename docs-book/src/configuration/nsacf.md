@@ -21,7 +21,7 @@ nsacf:
       - address: 172.23.0.34
         port: 7777
   nrf:
-    uri: http://172.23.0.10:7777
+    uri: https://172.23.0.10:7777
   slice_quotas:
     - sst: 1
       max_ues: 1000

@@ -33,7 +33,7 @@ udr:
         port: 7777
     client:
       nrf:
-        - uri: http://172.23.0.10:7777
+        - uri: https://172.23.0.10:7777
     # TLS configuration (G36: SBI TLS)
     # Enable: TLS_ENABLED=true SBI_SCHEME=https docker compose up -d
     tls:

@@ -25,6 +25,11 @@ compose files in step:
      with NEXTGCORE_NRF_TLS_CLIENT_CERT / _KEY / NEXTGCORE_NRF_TLS_CA.
 4. Only sbi-tls mounts the host's certs/ directory (which may hold a host
    run's ca.key) or the sbi_pki volume (which holds the stack's CA key).
+5. No NF -> NRF URI in the compose files or under configs/ is http://: every
+   compose NRF serves TLS (#1617 step d), and an http:// NRF URI would put that
+   NF's registration, heartbeats and token requests back on h2c. Checked are
+   the `uri`s of an `nrf:` block, and any nrf-named flag, variable or key
+   (--nrf-uri, NRF_URI, nrf_uri) set to an http:// value.
 
 Usage: check-nf-identities.py [--self-test]
 """
@@ -48,6 +53,8 @@ PKI_VOLUME = 'sbi_pki'
 CERT_DIR = '/etc/nextgcore/certs'
 TLS_VOLUME = re.compile(r'^tls-([a-z0-9-]+)$')
 UUID = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
+NRF_BLOCK = re.compile(r'^(\s*)(?:-\s+)?nrf:\s*(?:#.*)?$')
+NRF_SETTING = re.compile(r'nrf[a-z0-9_-]*["\']?[ \t:=,]+["\']?http://', re.I)
 INTERP = re.compile(r'\$\{[A-Za-z_][A-Za-z0-9_]*(?::?-([^}]*))?\}')
 
 
@@ -179,6 +186,27 @@ def check_certificates(table, fname, services, read_file):
     return errors
 
 
+def plaintext_nrf_uris(fname, text):
+    """Rule 5: the lines of one file that point an NF at an http:// NRF."""
+    errors = []
+    block = None
+    for num, line in enumerate(text.splitlines(), 1):
+        code = line.split(' #')[0] if not line.lstrip().startswith('#') else ''
+        if not code.strip():
+            continue
+        indent = len(code) - len(code.lstrip())
+        if block is not None and indent <= block:
+            block = None
+        m = NRF_BLOCK.match(code)
+        if m:
+            block = len(m.group(1))
+            continue
+        if (block is not None and 'http://' in code) or NRF_SETTING.search(code):
+            errors.append('%s:%d: NRF URI over plaintext http:// (every compose NRF serves '
+                          'TLS, #1617): %s' % (fname, num, code.strip()))
+    return errors
+
+
 def check(table, stacks, read_file=lambda path: None):
     """stacks: {file name: parsed compose document}. Returns error strings."""
     errors = []
@@ -276,6 +304,26 @@ def self_test():
     for service, change, needle in cases3:
         errs = broken(service, change)
         assert any(needle in e for e in errs), (service, change, errs)
+    # Rule 5: an http:// NRF URI, in a block or a setting, is refused.
+    bad = {
+        'nrf:\n  - uri: http://nrf:7777\n': ':2:',
+        'amf:\n  sbi:\n    client:\n      nrf:\n        - uri: http://10.0.0.1:7777\n': ':5:',
+        'command: ["--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]\n': ':1:',
+        'command: --nrf-uri http://nrf:7777\n': ':1:',
+        'environment:\n  NRF_URI: "http://nrf:7777"\n': ':2:',
+        'cat <<EOF\nnrf_uri: http://nrf:7777\nEOF\n': ':2:',
+    }
+    for text, line in bad.items():
+        errs = plaintext_nrf_uris('f', text)
+        assert len(errs) == 1 and line in errs[0], (text, errs)
+    good = [
+        'nrf:\n  - uri: https://nrf:7777\nscp:\n  - uri: http://scp:7777\n',
+        'client:\n  nrf:\n    - uri: https://nrf:7777\n  scp:\n    - uri: http://scp:7777\n',
+        '# nrf: http://old:7777\n--nrf-uri https://172.23.0.10:7777 --udm-uri http://udm:7777\n',
+        'nrf:\n  - uri: https://nrf:7777  # was http://nrf:7777\n',
+    ]
+    for text in good:
+        assert plaintext_nrf_uris('f', text) == [], (text, plaintext_nrf_uris('f', text))
     print('check-nf-identities self-test: ok')
 
 
@@ -301,12 +349,18 @@ def main(argv):
         with open(full, encoding='utf-8', errors='replace') as f:
             return f.read()
     errors = check(table, stacks, read_file)
+    shipped = sorted(glob.glob(os.path.join(COMPOSE_DIR, 'docker-compose*.yml'))) + sorted(
+        p for p in glob.glob(os.path.join(COMPOSE_DIR, 'configs', '**', '*'), recursive=True)
+        if os.path.isfile(p))
+    for path in shipped:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            errors += plaintext_nrf_uris(os.path.relpath(path, COMPOSE_DIR), f.read())
     for e in errors:
         print('check-nf-identities: ' + e, file=sys.stderr)
     if errors:
         return 1
-    print('check-nf-identities: %d compose files agree with %d certificate identities'
-          % (len(stacks), len(table)))
+    print('check-nf-identities: %d compose files agree with %d certificate identities; '
+          'no http:// NRF URI in %d shipped files' % (len(stacks), len(table), len(shipped)))
     return 0
 
 

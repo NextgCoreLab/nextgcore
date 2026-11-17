@@ -31,9 +31,9 @@ nssf:
         port: 7777
     client:
       nrf:
-        - uri: http://172.23.0.10:7777
+        - uri: https://172.23.0.10:7777
       nsi:
-        - uri: http://172.23.0.10:7777
+        - uri: https://172.23.0.10:7777
           s_nssai:
             sst: 1
     # TLS configuration (G36: SBI TLS)

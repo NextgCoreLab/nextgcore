@@ -33,7 +33,7 @@ pcf:
         port: 7777
     client:
       nrf:
-        - uri: http://172.23.0.10:7777
+        - uri: https://172.23.0.10:7777
   metrics:
     server:
       - address: 172.23.0.13

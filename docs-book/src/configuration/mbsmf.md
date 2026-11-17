@@ -22,10 +22,10 @@ mbsmf:
         advertise: 172.23.0.33
         port: 7777
   nrf:
-    uri: http://172.23.0.10:7777
+    uri: https://172.23.0.10:7777
 ```
 
-Note that in the docker deployment the values that actually matter are passed as CLI flags: the compose service runs `--sbi-addr 172.23.0.33 --sbi-port 7777 --nrf-uri http://172.23.0.10:7777` (see `docker/rust/docker-compose.yml`).
+Note that in the docker deployment the values that actually matter are passed as CLI flags: the compose service runs `--sbi-addr 172.23.0.33 --sbi-port 7777 --nrf-uri https://172.23.0.10:7777` (see `docker/rust/docker-compose.yml`).
 
 ## YAML parameters
 

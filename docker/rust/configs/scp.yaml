@@ -18,7 +18,7 @@ scp:
         port: 7777
     client:
       nrf:
-        - uri: http://172.22.0.10:7777
+        - uri: https://172.22.0.10:7777
     # TLS configuration (G36: SBI TLS)
     tls:
       enabled: false

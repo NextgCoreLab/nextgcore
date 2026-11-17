@@ -22,7 +22,7 @@ lmf:
         advertise: 172.23.0.32
         port: 7777
   nrf:
-    uri: http://172.23.0.10:7777
+    uri: https://172.23.0.10:7777
 ```
 
 ## YAML parameters
@@ -41,7 +41,7 @@ Everything else in the shipped example file is decorative — unknown keys are s
 
 - **`logger.level` is read.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691).
 - **`lmf.sbi.server[0]` is read (#1312).** The SBI bind is `--sbi-addr`/`--sbi-port`, else `address`/`port` here, else `127.0.0.1` and the default port. The advertised host is `--sbi-advertise`, else `NEXTGCORE_SBI_ADVERTISE`, else `advertise` here, else the bind address when it is not a wildcard; it is used in the NRF registration and the N1N2 notify callback URIs; the callbacks fall back to `127.0.0.1` only when the bind is a wildcard and nothing is set to advertise. A wildcard is never advertised: with a wildcard bind and nothing set to advertise, the NF does not register and logs why. A config that does not parse fails startup (#1313).
-- **`lmf.nrf.uri` is inert.** The NRF URI comes only from the `--nrf-uri` flag (default `http://127.0.0.1:7777`). The docker deployment passes `--nrf-uri http://172.23.0.10:7777` explicitly — setting only the YAML field has no effect.
+- **`lmf.nrf.uri` is inert.** The NRF URI comes only from the `--nrf-uri` flag (default `http://127.0.0.1:7777`). The docker deployment passes `--nrf-uri https://172.23.0.10:7777` explicitly — setting only the YAML field has no effect.
 
 ## Command-line flags
 

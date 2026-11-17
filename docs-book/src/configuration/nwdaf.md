@@ -22,7 +22,7 @@ nwdaf:
         advertise: 172.23.0.30
         port: 7777
   nrf:
-    uri: http://172.23.0.10:7777
+    uri: https://172.23.0.10:7777
   analytics:
     ml_model_dir: /var/lib/nextgcore/models
 ```
@@ -43,7 +43,7 @@ Everything in the shipped example except an (absent) `sbi.oauth2.require` key is
 
 - **`logger.level` is read.** The log level is `-e/--log-level` when given, else this file's `logger.level`, else `info`; `RUST_LOG`, when set, overrides all three (#691).
 - **`nwdaf.sbi.server[0]` is read (#1312).** The SBI bind is `--sbi-addr`/`--sbi-port`, else `address`/`port` here, else `127.0.0.1` and the default port. The advertised host is `--sbi-advertise`, else `NEXTGCORE_SBI_ADVERTISE`, else `advertise` here, else the bind address when it is not a wildcard; it is used in the NRF registration, the NFStatusNotify callback URI and the ML model URL; the callback and model URL fall back to `127.0.0.1` only when the bind is a wildcard and nothing is set to advertise. A wildcard is never advertised: with a wildcard bind and nothing set to advertise, the NF does not register and logs why. A config that does not parse fails startup (#1313).
-- **`nwdaf.nrf.uri` is inert.** The NRF URI comes exclusively from the CLI flag `--nrf-uri`; docker passes `--nrf-uri http://172.23.0.10:7777` explicitly. The YAML value exists only for visual consistency with other NF configs.
+- **`nwdaf.nrf.uri` is inert.** The NRF URI comes exclusively from the CLI flag `--nrf-uri`; docker passes `--nrf-uri https://172.23.0.10:7777` explicitly. The YAML value exists only for visual consistency with other NF configs.
 - **`nwdaf.amf_mobility` (feature `amf-mobility`, nextgsim#466).** `enabled: true` subscribes to the AMF's `anyUE` LOCATION_REPORT and serves UE_MOBILITY. `max_ues` (default `10000`, a positive integer, or startup fails) bounds how many SUPIs' cell histories are held, each capped at 100 samples. A report for a new SUPI past the bound evicts the SUPI reported least recently, with its history. Recency follows the order reports arrive, not their timestamps. A cell's reported `UserLocation` is dropped with the last sample that names it. `/metrics` exposes `nwdaf_ue_mobility_tracked_ues`, `nwdaf_ue_mobility_max_tracked_ues`, `nwdaf_ue_mobility_tracked_cells` and `nwdaf_ue_mobility_evicted_ues_total` (#1428).
 - **`nwdaf.analytics.ml_model_dir` is inert.** No code in the binary reads a model directory (or any file other than the config itself); the ML model provision service is metadata/subscription-based, not filesystem-backed.
 
