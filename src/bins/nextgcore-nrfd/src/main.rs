@@ -759,6 +759,23 @@ fn nrf_self_profile_for(uri: &str) -> serde_json::Value {
 /// Idempotent: `NfInstanceManager::register` inserts by instance ID, and the ID
 /// is stable across restarts once pinned, so a restart overwrites its own entry
 /// rather than accumulating one per start.
+/// Whether the NRF puts itself in its own registry at startup (#187, #1644 review
+/// m4): when it requests tokens from itself (`require_oauth2`), and when its own
+/// nnrf-nfm / nnrf-disc are gated (`require_server`), because a token for them is
+/// minted only when a registered NRF offers the service.
+fn registers_itself(require_oauth2: bool, require_server: bool) -> bool {
+    require_oauth2 || require_server
+}
+
+/// The one lock for tests that add or remove the NRF's own entry in the
+/// process-global registry (#1644 review M1), declared beside the function that
+/// writes it: a test deregistering the entry raced one that needs it.
+#[cfg(test)]
+fn self_entry_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 fn register_self_with_own_registry() {
     let doc = nrf_self_profile();
     match NfProfile::from_json(&doc) {
@@ -1148,7 +1165,7 @@ async fn main() -> Result<()> {
              (token + jwks endpoints stay exempt)"
         );
     }
-    let register_self_for_its_own_apis = policy.require_oauth2_server;
+    let self_registers = registers_itself(require_oauth2, policy.require_oauth2_server);
     if policy.require_client_auth {
         log::info!(
             "nrfd-05: token-endpoint client authentication required (signature-verified CCA \
@@ -1243,7 +1260,7 @@ async fn main() -> Result<()> {
              calls (issuer/self: {})",
             nrf_self_uri()
         );
-    } else if register_self_for_its_own_apis {
+    } else if self_registers {
         // #1644 review B1: a token for nnrf-nfm / nnrf-disc is minted only when a
         // registered NRF offers the service, so the NRF must be in its own registry
         // whenever the gate requires one.
@@ -7295,7 +7312,9 @@ mod tests {
         // A producer for the NRF to ask about, so authorization has a target.
         let (_c, producer_id, _ct, ptype) = register_pair("nrfd187self");
 
-        // The NRF registers itself, exactly as startup does.
+        // The NRF registers itself, exactly as startup does. Its entry is shared with
+        // every other test of this process (#1644 review M1).
+        let _self_entry = self_entry_test_lock().lock().await;
         register_self_with_own_registry();
         let self_id = nrf_instance_id().to_string();
         assert!(
@@ -8443,6 +8462,7 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
+        let _self_entry = self_entry_test_lock().lock().await;
         register_self_with_own_registry();
         let jwks = nrf_jwks_json();
         let policy = policy_without_client_auth();
@@ -8496,6 +8516,22 @@ mod tests {
             );
         }
         nf_manager().deregister(consumer).ok();
+    }
+
+    /// #1644 review m4: the NRF registers itself whenever either its own token
+    /// requests or its gated APIs need it, and only then.
+    #[test]
+    fn the_nrf_registers_itself_when_its_tokens_need_it_1644() {
+        assert!(
+            registers_itself(true, false),
+            "it requests tokens from itself"
+        );
+        assert!(
+            registers_itself(false, true),
+            "its APIs require tokens it must issue"
+        );
+        assert!(registers_itself(true, true));
+        assert!(!registers_itself(false, false), "nothing needs the entry");
     }
 
     #[test]
