@@ -34,6 +34,16 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   MongoDB with compose `depends_on` health conditions (#420).
 
 ### Changed
+- The compose stacks run NF -> NRF over TLS (#1617). Each stack's NRF serves TLS on its one SBI
+  listener and asks every client for a certificate (`client_auth: optional`). A new one-shot
+  `sbi-tls` service issues the dev PKI (`certs/generate-dev-certs.sh`) into a volume only it
+  mounts, then gives each NRF client its own volume with its certificate and its key, `0400` and
+  owned by that container's user. Every NRF client dials `https://` with
+  `NEXTGCORE_NRF_TLS_CA` / `_CLIENT_CERT` / `_CLIENT_KEY` and pins the nfInstanceId its
+  certificate names, the nextgsim AFs of the demo stacks included (new `nf-identities.txt` rows).
+  No NF bind-mounts `docker/rust/certs/` any more, and the inert `TLS_CERT` / `TLS_KEY` /
+  `TLS_CA` variables are gone. `nextgcore-core` now ships `openssl`. A client still dialling
+  `http://` the NRF fails at the TLS handshake: point it at `https://` and give it the CA.
 - mmed binds a configured IPv6 S1-MME address. Before, a bracketed IPv6 `mme.s1ap.server`
   address without a port (`[fd00::5]`) was dropped as unparsable, and the IPv6 server list
   `s1ap_list6` was never filled or read, so such a config fell back to `127.0.0.1:36412`. IPv6

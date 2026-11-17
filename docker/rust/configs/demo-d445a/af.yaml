@@ -9,7 +9,7 @@ nef:
   api_root: http://172.23.0.31:7777
   scs_as_id: d445a-fl-af
   oauth2:
-    nrf: http://172.23.0.10:7777
+    nrf: https://172.23.0.10:7777
     nf_instance_id: 6b1d7e3c-0000-4000-8000-00000000480a
     cca_key_file: /var/lib/d445a/af.key
     public_jwk_dir: /var/lib/d445a/cca

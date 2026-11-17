@@ -4681,6 +4681,9 @@ udr:
     /// subscriber over a real local listener.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_http_amf3gpp_lifecycle_and_notify() {
+        // #1666: the notification client follows the SBI profile, and this
+        // drives it at a loopback plaintext peer, i.e. a dev deployment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (udr, client, listener, cb_port, mut rx) = start_udr_and_listener().await;
         let supi = "imsi-001019900000001";
         let resource = format!("/nudr-dr/v2/subscription-data/{supi}/context-data/amf-3gpp-access");
@@ -4903,6 +4906,9 @@ udr:
     /// merge-patch, and ExposureDataChangeNotification delivery.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_http_exposure_data_lifecycle_and_notify() {
+        // #1666: the notification client follows the SBI profile, and this
+        // drives it at a loopback plaintext peer, i.e. a dev deployment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (udr, client, listener, cb_port, mut rx) = start_udr_and_listener().await;
         let ue = "imsi-001019900000002";
         let am_path = format!("/nudr-dr/v2/exposure-data/{ue}/access-and-mobility-data");
@@ -5012,6 +5018,9 @@ udr:
     /// TrafficInfluDataNotif delivery.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_http_application_data_lifecycle_and_notify() {
+        // #1666: the notification client follows the SBI profile, and this
+        // drives it at a loopback plaintext peer, i.e. a dev deployment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (udr, client, listener, cb_port, mut rx) = start_udr_and_listener().await;
 
         // Strict-peer: PFD data without pfds -> 400.
@@ -6661,6 +6670,9 @@ udr:
     /// were absent, and a subs-to-notify round trip.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_http_policy_data_patch_filter_and_notify() {
+        // #1666: the notification client follows the SBI profile, and this
+        // drives it at a loopback plaintext peer, i.e. a dev deployment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (udr, client, listener, cb_port, mut rx) = start_udr_and_listener().await;
         let supi = "imsi-001019900008705";
         let ues = |r: &str| format!("/nudr-dr/v2/policy-data/ues/{supi}/{r}");

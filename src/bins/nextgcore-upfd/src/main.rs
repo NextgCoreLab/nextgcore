@@ -1568,6 +1568,30 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                         }
                     }
                     dp_pdrs.sort_by_key(|p| p.precedence);
+                    // #1682: a replaced PDI moves the PDR's tunnel and the session's
+                    // UE IP address with it (Table 7.5.4.2-1), still under the PDR
+                    // lock, so no packet matches the new PDI on the old keys. The
+                    // PFCP layer has already chosen any CHOOSE F-TEID and refused a
+                    // key another session holds.
+                    for u in &updated_pdrs {
+                        let Some(pdi) = u.pdi.as_ref() else {
+                            continue;
+                        };
+                        if !dp_pdrs.iter().any(|e| e.pdr_id == u.pdr_id) {
+                            continue;
+                        }
+                        let teid = pdi
+                            .local_f_teid
+                            .as_ref()
+                            .filter(|f| !f.ch && f.teid != 0)
+                            .map(|f| f.teid);
+                        data_plane
+                            .sessions
+                            .move_pdr_teid(&session, &dp_pdrs, u.pdr_id, teid);
+                        if let Some(ip) = crate::pfcp_path::update_pdr_ue_ipv4(pdi) {
+                            data_plane.sessions.rebind_ue_ip(&session, ip);
+                        }
+                    }
                 }
 
                 // Create FAR and Update FAR install the same shape, so they run

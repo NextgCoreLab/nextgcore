@@ -11,7 +11,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
+use nextgcore_sbi::client::SbiClient;
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
 use nextgcore_sbi::oauth::{JwksCache, OAuth2Client};
 use nextgcore_sbi::server::{
@@ -2950,7 +2950,7 @@ async fn send_availability_notification(
     });
 
     let client = SbiClient::new(
-        SbiClientConfig::new(host, port)
+        nextgcore_sbi::security::sbi_peer_client_config(&host, port)
             .with_connect_timeout(NOTIFY_CONNECT_TIMEOUT)
             .with_request_timeout(NOTIFY_REQUEST_TIMEOUT),
     );
@@ -4186,6 +4186,9 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn test_http_availability_lifecycle_with_notifications() {
+        // #1666: the notification client follows the SBI profile, and this
+        // drives it at a loopback plaintext peer, i.e. a dev deployment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         // Serialize against the nssfd-01 restriction tests and clear any
         // restriction so this lifecycle PUT/PATCH path sees the default
         // allow-all (matched-sim back-compat).

@@ -5,7 +5,9 @@
 //! - Analytics context bindings (pairing subscriptions with analytics consumers)
 //! - Fan-out state (which consumer URIs should receive a given notification)
 
+use nextgcore_sbi::callback_auth::CallbackToken;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::data_mgmt::{DataManagementSubsc, SubscriptionScope};
@@ -43,8 +45,16 @@ pub struct ProducerSubscription {
     pub scope: SubscriptionScope,
     /// Producer NF instance the subscription was created on.
     pub producer_id: String,
-    /// Resource URI returned by the producer, used to delete it later.
-    pub resource_uri: String,
+    /// Resource URI returned by the producer, used to delete it later. `None`
+    /// while the create is in flight.
+    pub resource_uri: Option<String>,
+    /// The token in the `notificationURI` handed to the producer (#1518): only a
+    /// notification presenting it is fanned out, and only to this subscription's
+    /// consumers.
+    pub notify_token: CallbackToken,
+    /// Which claim created this entry (#1747 review): a late record or abandon of an
+    /// earlier claim of the same scope never acts on it.
+    pub claim_seq: u64,
     /// Consumer subscription ids currently relying on it. The producer
     /// subscription is removed when this empties — refcounting, so one
     /// consumer's unsubscribe cannot cut off another's data.
@@ -220,48 +230,13 @@ pub fn dccf_context_remove_analytics_context(ctx_id: &str) {
 // Fan-out (Ndccf_DataManagement_Notify)
 // ---------------------------------------------------------------------------
 
-/// Fans out a notification to the consumers whose scope MATCHES it (#112).
-///
-/// Returns `(sub_id, notify_uri, notif_corr_id)` per matching consumer; the
-/// caller performs the POSTs, because the context lock must not be held across
-/// network I/O.
-///
-/// This used to return every subscription with a non-empty callback URI,
-/// regardless of what it had subscribed to — so any consumer that got a URI
-/// stored received every other consumer's collected data. Matching is now on
-/// `(events, target)`; see [`SubscriptionScope::matches`] for the rules, including
-/// why an indeterminate scope matches nothing rather than everything.
-///
-/// `notif_corr_id` is returned alongside because each consumer's notification
-/// must echo ITS OWN correlation id — one broadcast body cannot serve them all.
-pub fn dccf_context_fanout_notify_scoped(
-    notif_scope: &SubscriptionScope,
-) -> Vec<(String, String, String)> {
-    let mut c = ctx().lock().unwrap();
-    let total = c.subscription_map.len();
-    let targets: Vec<(String, String, String)> = c
-        .subscription_map
-        .values()
-        .filter(|s| !s.notify_uri.is_empty() && s.scope.matches(notif_scope))
-        .map(|s| (s.id.clone(), s.notify_uri.clone(), s.notif_corr_id.clone()))
-        .collect();
-    c.fanout_count += targets.len() as u64;
-    log::debug!(
-        "[DCCF] fanout: {}/{} subscribers matched events={:?} target={:?}, total_fanout={}",
-        targets.len(),
-        total,
-        notif_scope.events,
-        notif_scope.target,
-        c.fanout_count,
-    );
-    targets
-}
+// The notify path fans out with [`dccf_context_fanout_for_token`], below.
 
 /// Pre-#112 unkeyed fan-out, retained only for the `Ndccf_ContextDocument`
 /// tests that predate scoping. Returns every subscriber with a callback URI.
 ///
 /// Not used by the `Ndccf_DataManagement` notify path any more — that is
-/// [`dccf_context_fanout_notify_scoped`]. Left as `cfg(test)` so it cannot be
+/// [`dccf_context_fanout_for_token`]. Left as `cfg(test)` so it cannot be
 /// reintroduced into production by accident.
 #[cfg(test)]
 pub fn dccf_context_fanout_notify(body: &str) -> Vec<(String, String)> {
@@ -301,23 +276,39 @@ pub fn scope_key(scope: &SubscriptionScope) -> String {
 }
 
 /// Outcome of claiming a producer subscription for a consumer.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum ProducerClaim {
-    /// An existing producer subscription covers this scope; it was reused and no
-    /// producer signalling is needed. This is the de-duplication.
+    /// An existing producer subscription covers this scope (created, or being
+    /// created); it was reused and no producer signalling is needed. This is the
+    /// de-duplication.
     Reused {
         /// The producer NF instance already subscribed to.
         producer_id: String,
     },
-    /// No producer subscription covers this scope; the caller must create one and
-    /// then record it with [`dccf_context_record_producer_sub`].
-    NeedsCreate,
+    /// No producer subscription covered this scope. One is now held in flight for
+    /// it, with this token (#1518), so a concurrent claim for the same scope reuses
+    /// it rather than creating a second, and the producer's first notification is
+    /// admitted even before its 201 arrives. The caller creates it and then calls
+    /// [`dccf_context_record_producer_sub`], or [`dccf_context_abandon_producer_sub`]
+    /// on failure.
+    NeedsCreate {
+        /// The token for the subscription's `notificationURI`.
+        notify_token: CallbackToken,
+        /// This claim, for [`dccf_context_record_producer_sub`] and
+        /// [`dccf_context_abandon_producer_sub`].
+        claim_seq: u64,
+    },
+    /// No producer subscription covers this scope and the consumer named no
+    /// producer, so none can be created without guessing one.
+    NoProducer,
 }
 
-/// Claim a producer subscription for `consumer_id` at `scope`.
+/// Claim a producer subscription for `consumer_id` at `scope`, to be created on
+/// `producer_id` when none covers the scope yet.
 pub fn dccf_context_claim_producer_sub(
     consumer_id: &str,
     scope: &SubscriptionScope,
+    producer_id: Option<&str>,
 ) -> ProducerClaim {
     let key = scope_key(scope);
     let mut c = ctx().lock().unwrap();
@@ -333,29 +324,135 @@ pub fn dccf_context_claim_producer_sub(
                 producer_id: existing.producer_id.clone(),
             }
         }
-        None => ProducerClaim::NeedsCreate,
+        None => {
+            let Some(producer_id) = producer_id else {
+                return ProducerClaim::NoProducer;
+            };
+            let notify_token = CallbackToken::mint();
+            let claim_seq = CLAIM_SEQ.fetch_add(1, Ordering::Relaxed);
+            c.producer_subs.insert(
+                key,
+                ProducerSubscription {
+                    scope: scope.clone(),
+                    producer_id: producer_id.to_string(),
+                    resource_uri: None,
+                    notify_token: notify_token.clone(),
+                    claim_seq,
+                    consumers: HashSet::from([consumer_id.to_string()]),
+                },
+            );
+            ProducerClaim::NeedsCreate {
+                notify_token,
+                claim_seq,
+            }
+        }
     }
 }
 
-/// Record a producer subscription the caller has just created.
+/// Record that the producer created the subscription claim `claim_seq` made for
+/// `scope`. `false` when that claim is no longer held (its every consumer left
+/// while the create was in flight, or a later claim of the scope replaced it): the
+/// caller then deletes it at the producer.
 pub fn dccf_context_record_producer_sub(
-    consumer_id: &str,
-    scope: SubscriptionScope,
-    producer_id: String,
+    scope: &SubscriptionScope,
+    claim_seq: u64,
     resource_uri: String,
-) {
-    let key = scope_key(&scope);
+) -> bool {
+    let key = scope_key(scope);
     let mut c = ctx().lock().unwrap();
-    let entry = c.producer_subs.entry(key.clone()).or_insert_with(|| {
-        log::info!("[DCCF] created producer subscription on {producer_id} for scope {key}");
-        ProducerSubscription {
-            scope,
-            producer_id,
-            resource_uri,
-            consumers: HashSet::new(),
+    match c.producer_subs.get_mut(&key) {
+        Some(entry) if entry.claim_seq == claim_seq && entry.resource_uri.is_none() => {
+            log::info!(
+                "[DCCF] created producer subscription on {} for scope {key}",
+                entry.producer_id
+            );
+            entry.resource_uri = Some(resource_uri);
+            true
         }
-    });
-    entry.consumers.insert(consumer_id.to_string());
+        _ => false,
+    }
+}
+
+/// The create of claim `claim_seq` for `scope` failed or was cancelled: forget the
+/// entry, its token with it, if it is still that claim's and still in flight. Its
+/// consumers keep their own subscriptions, but no producer data comes for them
+/// until a later consumer's claim of the scope creates one (a Limit). Returns the
+/// consumer ids that relied on it.
+pub fn dccf_context_abandon_producer_sub(scope: &SubscriptionScope, claim_seq: u64) -> Vec<String> {
+    let key = scope_key(scope);
+    let mut c = ctx().lock().unwrap();
+    let ours = c
+        .producer_subs
+        .get(&key)
+        .is_some_and(|e| e.claim_seq == claim_seq && e.resource_uri.is_none());
+    if !ours {
+        return Vec::new();
+    }
+    c.producer_subs
+        .remove(&key)
+        .map(|e| e.consumers.into_iter().collect())
+        .unwrap_or_default()
+}
+
+/// Whether a producer subscription, created or in flight, covers `scope`.
+pub fn dccf_context_holds_producer_sub(scope: &SubscriptionScope) -> bool {
+    ctx()
+        .lock()
+        .unwrap()
+        .producer_subs
+        .contains_key(&scope_key(scope))
+}
+
+/// Claim sequence numbers (#1747 review).
+static CLAIM_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// The consumer subscriptions a producer notification presented on `token` is
+/// for (#1518): those of the producer subscription holding it, created or in
+/// flight, that the notification's scope matches. `None` when no producer
+/// subscription holds `token`. Each entry is `(id, notificURI, notifCorrId)`;
+/// the caller performs the POSTs, because the context lock must not be held
+/// across network I/O.
+///
+/// Matching is on `(events, target)` (#112); see [`SubscriptionScope::matches`]
+/// for the rules, including why an indeterminate scope matches nothing. Before
+/// #1518 any notification on the one token-less URI reached every consumer whose
+/// scope it matched, whoever sent it. `notif_corr_id` is returned because each
+/// consumer's notification must echo ITS OWN correlation id.
+pub fn dccf_context_fanout_for_token(
+    token: &str,
+    notif_scope: &SubscriptionScope,
+) -> Option<Vec<(String, String, String)>> {
+    let mut c = ctx().lock().unwrap();
+    // Every entry is compared, in constant time.
+    let mut consumers = None;
+    for p in c.producer_subs.values() {
+        if p.notify_token.matches(token) {
+            consumers = Some(p.consumers.clone());
+        }
+    }
+    let consumers = consumers?;
+    let targets: Vec<(String, String, String)> = c
+        .subscription_map
+        .values()
+        .filter(|s| {
+            consumers.contains(&s.id) && !s.notify_uri.is_empty() && s.scope.matches(notif_scope)
+        })
+        .map(|s| (s.id.clone(), s.notify_uri.clone(), s.notif_corr_id.clone()))
+        .collect();
+    c.fanout_count += targets.len() as u64;
+    Some(targets)
+}
+
+/// The producer NF instance of the producer subscription holding `token` (#1518).
+pub fn dccf_context_producer_for_token(token: &str) -> Option<String> {
+    let c = ctx().lock().unwrap();
+    let mut found = None;
+    for p in c.producer_subs.values() {
+        if p.notify_token.matches(token) {
+            found = Some(p.producer_id.clone());
+        }
+    }
+    found
 }
 
 /// Release a consumer's claim. Returns the producer subscription to DELETE when
@@ -374,7 +471,7 @@ pub fn dccf_context_release_producer_sub(consumer_id: &str) -> Option<ProducerSu
     let removed = c.producer_subs.remove(&key);
     if let Some(sub) = &removed {
         log::info!(
-            "[DCCF] last consumer for scope {key} released; deleting producer subscription {}",
+            "[DCCF] last consumer for scope {key} released; deleting producer subscription {:?}",
             sub.resource_uri
         );
     }

@@ -44,6 +44,7 @@ serde_yaml.workspace = true
 rand.workspace = true
 
 [dev-dependencies]
+nextgcore-sbi = { workspace = true, features = ["test-support"] }
 proptest.workspace = true
 base64.workspace = true
 p256.workspace = true
