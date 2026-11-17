@@ -9705,6 +9705,14 @@ impl NgapServer {
             self.offload_superseded_releases(amf_ue_ngap_id, amf_ue_ngap_id);
             self.forget_ue_sessions(amf_ue_ngap_id);
         }
+        // #1698: a page the earlier registration was answered with stops here too. A
+        // paged UE that answered with this initial registration from 5GMM-IDLE moved its
+        // record to this connection, and the page stayed keyed by the idle ID, marked
+        // answered by this one (#1102). This registration releases the sessions it was
+        // for, so its requester is told now (FAILURE_CAUSE_UNSPECIFIED). Before, it waited
+        // out T3513 and was told UE_NOT_RESPONDING, but the UE had responded (TS 29.518
+        // Table 6.1.6.3.6-1).
+        self.stop_paging_on_deregistration(amf_ue_ngap_id);
     }
 
     /// #774 review M1: release every PDU session `owner` holds at its SMF, OFF the
