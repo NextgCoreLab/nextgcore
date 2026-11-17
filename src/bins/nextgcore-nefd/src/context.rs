@@ -171,9 +171,36 @@ pub struct NefMonitoringSubscription {
     pub owner_id: Option<String>,
     /// Raw MonitoringEventSubscription JSON as received.
     pub raw: String,
+    /// The token in the callback URI handed to the producer (#1518):
+    /// `notify/{id}/nef-ee-notify/{token}`. Minted with the subscription, so every
+    /// subscription made since #1518 has one. `None` only for a record persisted
+    /// before then (serde default), whose producer holds the token-less
+    /// `notify/{id}`; that URI is served for it alone ([`Self::admits_notify`]).
+    #[serde(default)]
+    pub notify_token: Option<nextgcore_sbi::callback_auth::CallbackToken>,
 }
 
 impl NefMonitoringSubscription {
+    /// Whether a producer notification for this subscription may be acted on
+    /// (#1518). `presented` is the token in the path, `None` for the token-less
+    /// URI of before #1518, which is accepted only while this subscription holds
+    /// no token: a subscription made since never handed it out.
+    pub fn admits_notify(&self, presented: Option<&str>) -> bool {
+        match (presented, &self.notify_token) {
+            (Some(token), Some(held)) => held.matches(token),
+            (Some(_), None) => false,
+            (None, held) => held.is_none(),
+        }
+    }
+
+    /// The producer this subscription's southbound leg is (or will be) at.
+    pub fn producer(&self) -> Option<SouthboundProducer> {
+        self.southbound
+            .as_ref()
+            .map(|s| s.producer)
+            .or_else(|| self.pending.as_ref().map(|p| p.producer))
+    }
+
     pub fn new(
         scs_as_id: impl Into<String>,
         monitoring_type: impl Into<String>,
@@ -190,6 +217,7 @@ impl NefMonitoringSubscription {
             af_target: None,
             owner_id: None,
             raw: raw.into(),
+            notify_token: Some(nextgcore_sbi::callback_auth::CallbackToken::mint()),
         }
     }
 
