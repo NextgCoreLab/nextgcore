@@ -1384,6 +1384,96 @@ pub fn parse_create_pdr(data: &[u8]) -> Result<ParsedCreatePdr, &'static str> {
     Ok(pdr)
 }
 
+/// An Update PDR (TS 29.244 Table 7.5.4.2-1): the changes it carries to a stored
+/// PDR, and nothing else (#1673).
+///
+/// §5.6.3 (29244-k00.txt:6060-6095): an IE the update does not carry keeps its
+/// provisioned value, a present IE replaces it, and an IE "to be removed" is sent
+/// with a null length. For an IE that may occur several times, one null
+/// occurrence removes them all, and the URR ID and QER ID lists of an Update PDR
+/// are "the list of all the URR/QER IDs to be associated to the PDR". In every
+/// field below, `None` means "keep".
+#[derive(Debug, Clone, Default)]
+pub struct ParsedUpdatePdr {
+    pub pdr_id: u16,
+    pub precedence: Option<u32>,
+    /// Replaces the stored PDI whole (Table 7.5.4.2-1).
+    pub pdi: Option<ParsedPdi>,
+    /// `Some(None)`: removed (null length).
+    pub outer_header_removal: Option<Option<u8>>,
+    /// `Some(None)`: removed (null length).
+    pub far_id: Option<Option<u32>>,
+    /// The new list; empty when a null URR ID removed them all.
+    pub urr_ids: Option<Vec<u32>>,
+    /// The new list; empty when a null QER ID removed them all.
+    pub qer_ids: Option<Vec<u32>>,
+}
+
+/// The new list a repeatable rule-reference IE of an Update PDR gives, or
+/// `None` when the update carries none (#1673). A null occurrence contributes
+/// nothing (§5.6.3: it removes every provisioned one); a 1 to 3-octet value is
+/// refused (§7.6.8, #1616).
+fn update_id_list(
+    ies: &[ParsedIe],
+    ie_type: u16,
+    short: &'static str,
+) -> Result<Option<Vec<u32>>, &'static str> {
+    let found = ParsedIe::find_all_ies(ies, ie_type);
+    if found.is_empty() {
+        return Ok(None);
+    }
+    let mut ids = Vec::new();
+    for ie in found {
+        if !ie.value.is_empty() {
+            ids.push(be_u32(ie, short)?);
+        }
+    }
+    Ok(Some(ids))
+}
+
+/// Parse an Update PDR IE (#1673): see [`ParsedUpdatePdr`].
+pub fn parse_update_pdr(data: &[u8]) -> Result<ParsedUpdatePdr, &'static str> {
+    let ies = ParsedIe::parse_all(data);
+    let mut pdr = ParsedUpdatePdr::default();
+
+    // PDR ID (mandatory, §8.2.36). It names the rule, so it cannot be removed:
+    // a short one is refused (#1605).
+    let ie = ParsedIe::find_ie(&ies, pfcp_ie::PDR_ID).ok_or("PDR ID missing")?;
+    let id: [u8; 2] = ie
+        .value
+        .get(..2)
+        .and_then(|v| v.try_into().ok())
+        .ok_or("PDR ID shorter than 2 octets")?;
+    pdr.pdr_id = u16::from_be_bytes(id);
+
+    // Precedence and PDI have no "not set" state to remove to, so a null one is
+    // as invalid as a short one (§7.6.8).
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::PRECEDENCE) {
+        pdr.precedence = Some(be_u32(ie, "Precedence shorter than 4 octets")?);
+    }
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::PDI) {
+        if ie.value.is_empty() {
+            return Err("PDI is empty");
+        }
+        pdr.pdi = Some(parse_pdi(&ie.value)?);
+    }
+
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::OUTER_HEADER_REMOVAL) {
+        pdr.outer_header_removal = Some(ie.value.first().copied());
+    }
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::FAR_ID) {
+        pdr.far_id = Some(if ie.value.is_empty() {
+            None
+        } else {
+            Some(be_u32(ie, "FAR ID shorter than 4 octets")?)
+        });
+    }
+    pdr.urr_ids = update_id_list(&ies, pfcp_ie::URR_ID, "URR ID shorter than 4 octets")?;
+    pdr.qer_ids = update_id_list(&ies, pfcp_ie::QER_ID, "QER ID shorter than 4 octets")?;
+
+    Ok(pdr)
+}
+
 /// Parsed Create PDR structure
 #[derive(Debug, Clone, Default)]
 pub struct ParsedCreatePdr {
