@@ -1089,8 +1089,16 @@ impl UeNasContext {
     /// as the LOCATION_REPORT baseline if none has been reported yet (a context
     /// seeded or restored without a report). Its stored location was learned, so a
     /// move away from it is measured from it, not from nothing.
+    ///
+    /// #1716: only for a REGISTERED context. A context still in its initial
+    /// registration (authentication, security mode) has a location no report has
+    /// told anyone about, so its Registration Accept is where the AMF first becomes
+    /// aware of the UE's location and reports every dimension (TS 29.518 §5.3.2.4,
+    /// Table 6.2.6.3.3-1). Seeding it from the Uplink NAS Transports of that
+    /// registration made the Accept see no change, and a subscriber with no
+    /// `locationFilterList` was never told where the UE registered.
     fn seed_location_baseline(&mut self) {
-        if self.location_evaluated.is_none() {
+        if self.registered && self.location_evaluated.is_none() {
             self.location_evaluated = Some((
                 self.amf_ue.nr_tai.clone(),
                 self.amf_ue.nr_cgi.clone(),
@@ -37857,6 +37865,91 @@ mod tests {
         ngap.ue_auth_state.remove(new_id);
         plain.stop().await.expect("sink stop");
         cell.stop().await.expect("sink stop");
+    }
+
+    /// **#1716**, TS 29.518 §5.3.2.4 / Table 6.2.6.3.3-1: an initial registration's
+    /// Registration Accept reports the UE's location to a LOCATION_REPORT subscriber
+    /// with no `locationFilterList`, after the registration's own Uplink NAS
+    /// Transports (authentication, security mode) carried that same location. Those
+    /// messages arrive before the Accept on every real registration, which is how the
+    /// Docker E2E lost its LOCATION_REPORT while REGISTRATION_STATE_REPORT and
+    /// ACCESS_TYPE_REPORT still arrived.
+    ///
+    /// REVERT-VERIFIED: with `seed_location_baseline` seeding an unregistered context
+    /// again (main since #1424), the Uplink NAS Transport makes the Accept see no
+    /// change and no LOCATION_REPORT arrives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_initial_registration_reports_location_after_its_uplink_nas_1716() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        // The Initial Context Setup carrying the Accept needs a served GUAMI.
+        let _guamis = serve_only_local_guami();
+        let mut ngap = capturing_ngap_server().await;
+        let (id, ran) = (17_160_001u64, 1_716u32);
+        let supi = "imsi-001010000171601";
+        let (tac, cell) = (0x17_1601u32, 0x0017_1601u64);
+        // The secured, not yet registered record of a UE mid initial registration, at
+        // the location its Initial UE Message carried.
+        let mut ue = UeNasContext::new(id, ran, 1, false);
+        ue.amf_ue.supi = Some(supi.to_string());
+        ue.amf_ue.security_context_available = true;
+        ue.amf_ue.registration_type = crate::gmm_build::registration_type::INITIAL;
+        ue.amf_ue.allowed_nssai = vec![crate::context::SNssai { sst: 1, sd: None }];
+        ue.amf_ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        ue.amf_ue.nr_tai.tac = tac;
+        ue.amf_ue.nr_cgi.plmn_id = PlmnId::new("001", "01");
+        ue.amf_ue.nr_cgi.cell_id = cell;
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_publish(&ue.amf_ue, ran, 1);
+        }
+        let amf_ue_id = ue.amf_ue.id;
+        ngap.ue_auth_state.insert(id, ue);
+        let (plain, mut plain_rx) = location_report_sink(supi, "1716-plain").await;
+
+        // An Uplink NAS Transport of the registration, from the same cell.
+        let ul_pdu = nextgcore_ngap::builder::build_uplink_nas_transport(
+            &nextgcore_ngap::types::UplinkNasTransport {
+                amf_ue_ngap_id: id,
+                ran_ue_ngap_id: ran,
+                nas_pdu: vec![
+                    0x7E,
+                    security_header::PLAIN_NAS_MESSAGE,
+                    message_type::CONFIGURATION_UPDATE_COMPLETE,
+                ],
+                user_location_info: test_user_location(tac, cell),
+            },
+        )
+        .expect("encode an Uplink NAS Transport");
+        ngap.handle_uplink_nas_transport(1, &ul_pdu)
+            .await
+            .expect("handled");
+
+        ngap.send_registration_accept(1, id, ran)
+            .await
+            .expect("accepted");
+        assert!(
+            ngap.ue_auth_state
+                .get(id)
+                .is_some_and(|s| s.registration_accept_sent),
+            "the Accept went out"
+        );
+        let (got, got_tac, got_cell) = next_location_report(&mut plain_rx).await;
+        assert_eq!(got, supi);
+        assert_eq!(
+            (got_tac.as_str(), got_cell.as_str()),
+            ("171601", "000171601"),
+            "the location the UE registered from"
+        );
+
+        ngap.ue_auth_state.remove(id);
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_unpublish(amf_ue_id);
+        }
+        plain.stop().await.expect("sink stop");
     }
 
     /// **#1549**, TS 29.518 §5.3.1 / §6.2 (`29518-k00.txt:23968-23978`): a UE that
