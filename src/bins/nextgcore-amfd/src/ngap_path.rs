@@ -3097,6 +3097,7 @@ impl NgapServer {
                     s.registered.then(|| {
                         let went_idle = !s.cm_idle;
                         s.cm_idle = true;
+                        s.left_cm_idle = false;
                         // #1442: no Release Complete, so no recommendation.
                         s.amf_ue.recommended_paging.clear();
                         (went_idle, abort_on_ng_release(amf_ue_ngap_id, s))
@@ -6930,8 +6931,9 @@ impl NgapServer {
             // #1593: whether this update brought the UE out of CM-IDLE, from its CM
             // state when the context moved to this connection (not from the ICS
             // flag, which an Initial Context Setup that failed to encode leaves
-            // unset). Taken, so a later message on the connection reports nothing.
-            let from_cm_idle = std::mem::take(&mut state.left_cm_idle);
+            // unset). Cleared once the Accept is on the wire (below), so a later
+            // message on the connection reports nothing, and a failed send keeps it.
+            let from_cm_idle = state.left_cm_idle;
             if !state.initial_context_setup_request_sent {
                 // A new NG connection: the UE came back from CM-IDLE (#609 resume),
                 // so the gNB holds no UE context and no AS security for it. The
@@ -7022,6 +7024,7 @@ impl NgapServer {
             // #91: AFTER the Accept is on the wire, never before.
             self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
                 s.registration_accept_sent = true;
+                s.left_cm_idle = false;
             });
             // #1424: a mobility or periodic registration update is where the AMF
             // becomes aware of where an idle UE went (TS 29.518 Table 6.2.6.3.3-1,
@@ -13361,6 +13364,7 @@ impl NgapServer {
                 let went_idle = s.registered && !s.cm_idle;
                 if s.registered {
                     s.cm_idle = true;
+                    s.left_cm_idle = false;
                     // #1442: the recommendation of THIS release replaces any earlier
                     // one, and a release with none clears it, so a page in this
                     // idle period never follows a stale one.
@@ -18526,6 +18530,7 @@ impl NgapServer {
                 state.initial_context_setup_request_sent = false;
                 state.initial_context_setup_response_received = false;
                 state.cm_idle = true;
+                state.left_cm_idle = false;
                 // #1442: a recommendation from an earlier release is stale; the
                 // Release Complete answering the command below brings the new one.
                 state.amf_ue.recommended_paging.clear();
@@ -37255,6 +37260,86 @@ mod tests {
             "an update on the same connection: no CONNECTED"
         );
         ngap.ue_auth_state.remove(new_id);
+    }
+
+    /// **#1593 review round 2 (R5 MAJOR)**: the Service Request tails report CONNECTED
+    /// only for a real CM-IDLE -> CM-CONNECTED. Counted per thread on this
+    /// current-thread runtime, each case with a positive control:
+    /// - an idle UE's Service Request (Initial UE Message): 1;
+    /// - a UE still CM-CONNECTED whose Service Request comes in on a new gNB: 0;
+    /// - a Service Request over Uplink NAS Transport on the live connection: 0.
+    ///
+    /// REVERT-VERIFIED: with `finish_idle_service_request` firing on `true`, case 2
+    /// counts 1; on `false`, case 1 counts 0; with the connected tail's CONNECTED
+    /// fire put back, case 3 counts 1.
+    #[tokio::test]
+    async fn a_service_request_reports_connected_only_from_cm_idle_1593() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let count = crate::namf_server::connected_reports_on_this_thread;
+        let saved_guamis = crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .served_guami
+            .clone();
+        serve_only_local_guami();
+        let mut ngap = capturing_ngap_server().await;
+
+        // 1. Idle, back with a Service Request.
+        for (old_id, new_id, idle, want) in [
+            (15_939_401u64, 15_939_402u64, true, 1u64),
+            (15_939_411u64, 15_939_412u64, false, 0u64),
+        ] {
+            let mut stored = idle_registered_ue(old_id);
+            stored.cm_idle = idle;
+            stored.amf_ue.supi = Some(format!("imsi-00101000159{:05}", old_id % 100_000));
+            stored.amf_ue.allowed_nssai = vec![crate::context::SNssai { sst: 1, sd: None }];
+            {
+                let ctx = crate::context::amf_self();
+                let guard = ctx.read().expect("ctx lock");
+                guard.amf_ue_publish(&stored.amf_ue, 51, 1);
+            }
+            ngap.ue_auth_state.insert(old_id, stored);
+            take_sent_ngap(&mut ngap);
+            let before = count();
+            ngap.forced_amf_ue_ngap_id = Some(new_id);
+            let pdu = service_request_initial_ue(protected_service_request([0; 4], old_id as u32));
+            let _ = ngap.handle_initial_ue_message(1, &pdu).await;
+            assert!(
+                ngap.ue_auth_state.get(new_id).is_some(),
+                "idle={idle}: the Service Request moved the UE to the new connection"
+            );
+            assert!(
+                !take_sent_ngap(&mut ngap).is_empty(),
+                "idle={idle}: the Service Accept went out"
+            );
+            assert_eq!(count() - before, want, "idle={idle}: CONNECTED reports");
+            ngap.ue_auth_state.remove(new_id);
+        }
+
+        // 3. A Service Request on the UE's live connection.
+        let (ue, ran) = (15_939_421u64, 94u32);
+        handler_tests::secured_registered_ue(&mut ngap, ue, ran);
+        take_sent_ngap(&mut ngap);
+        let before = count();
+        let sr = handler_tests::ue_protect(&handler_tests::service_request(None), 0);
+        ngap.handle_uplink_nas_transport(1, &handler_tests::uplink_nas_transport(ue, ran, &sr))
+            .await
+            .expect("handled");
+        assert!(
+            !take_sent_ngap(&mut ngap).is_empty(),
+            "the connected Service Request was answered"
+        );
+        assert_eq!(
+            count() - before,
+            0,
+            "a connected Service Request: no CONNECTED"
+        );
+        ngap.ue_auth_state.remove(ue);
+        let ctx = crate::context::amf_self();
+        let mut ctx = ctx.write().expect("ctx lock");
+        ctx.num_of_served_guami = saved_guamis.len();
+        ctx.served_guami = saved_guamis;
     }
 
     /// **#1424**: [`NgapServer::report_location_change`] measures each dimension from
