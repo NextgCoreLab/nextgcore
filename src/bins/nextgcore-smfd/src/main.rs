@@ -240,7 +240,34 @@ static OAUTH2_CLIENT: std::sync::OnceLock<Option<Arc<nextgcore_sbi::oauth::OAuth
 /// The shared OAuth2 client, if SBI OAuth2 enforcement is enabled (Wave-6 H8
 /// Phase A). Outbound SBI clients attach a token via [`attach_oauth2`].
 fn oauth2_client() -> Option<Arc<nextgcore_sbi::oauth::OAuth2Client>> {
+    #[cfg(test)]
+    if let Ok(oauth2) = TEST_OAUTH2_CLIENT.try_with(Arc::clone) {
+        return Some(oauth2);
+    }
     OAUTH2_CLIENT.get().and_then(|opt| opt.clone())
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// #1648 tests: the OAuth2 client [`oauth2_client`] returns inside
+    /// `TEST_OAUTH2_CLIENT.scope(..)`, so a test can see what an outbound site
+    /// sends with enforcement on. Task-local, so the other tests in the process
+    /// keep the default (off) that `oauth2_consumer_disabled_by_default` pins.
+    pub(crate) static TEST_OAUTH2_CLIENT: Arc<nextgcore_sbi::oauth::OAuth2Client>;
+}
+
+/// #1648: a client for a Namf service operation at `config` (N1N2MessageTransfer,
+/// EBIAssignment). It carries an NRF-issued token when enforcement is on: these
+/// are service requests (TS 29.518 §5.2.2.3.1, §5.2.2.6), and the consumer
+/// presents its token on each (TS 33.501 §13.4.1.1.2, TS 29.500 §6.7.3). A
+/// notification to the AMF (SmContextStatusNotify) is not one and carries none.
+pub(crate) fn namf_client(
+    config: nextgcore_sbi::client::SbiClientConfig,
+) -> nextgcore_sbi::client::SbiClient {
+    attach_oauth2(
+        nextgcore_sbi::client::SbiClient::new(config),
+        nextgcore_sbi::types::NfType::Amf,
+    )
 }
 
 /// Attach the process-wide OAuth2 client (when enforcement is on) so the
@@ -2390,7 +2417,7 @@ async fn fetch_subscribed_default_dnn(
     let (host, port) = discover_udm_sdm_endpoint()
         .await
         .ok_or(DefaultDnnError::NoUdmEndpoint)?;
-    let client = global_context().get_client(&host, port).await;
+    let client = udm::udm_client(&host, port);
 
     let path = smf_select_data_path(supi, sst, sd);
     let response = client.get(&path).await.map_err(|e| {
@@ -8272,7 +8299,7 @@ async fn send_n2_release_transfer(amf_uri: &str, supi: &str, psi: u8, n2: &[u8])
             content_type::APPLICATION_NGAP,
             bytes::Bytes::copy_from_slice(n2),
         ));
-    let client = nextgcore_sbi::client::SbiClient::new(
+    let client = namf_client(
         nextgcore_sbi::security::sbi_peer_client_config(&host, port)
             .with_connect_timeout(std::time::Duration::from_secs(2))
             .with_request_timeout(std::time::Duration::from_secs(3)),
@@ -8381,7 +8408,7 @@ async fn send_n1_n2_release_transfer(amf_uri: &str, supi: &str, psi: u8, n1: &[u
             content_type::APPLICATION_NGAP,
             bytes::Bytes::copy_from_slice(n2),
         ));
-    let client = nextgcore_sbi::client::SbiClient::new(
+    let client = namf_client(
         nextgcore_sbi::security::sbi_peer_client_config(&host, port)
             .with_connect_timeout(std::time::Duration::from_secs(2))
             .with_request_timeout(std::time::Duration::from_secs(3)),
@@ -8858,7 +8885,7 @@ async fn send_n1n2_honouring_paging_conflict(
     sm_context_ref: String,
     retries: PagingRetries,
 ) -> nextgcore_sbi::SbiResult<nextgcore_sbi::message::SbiResponse> {
-    let resp = nextgcore_sbi::client::SbiClient::new(config.clone())
+    let resp = namf_client(config.clone())
         .send_request(request.clone())
         .await?;
     if let Some(wait) = n1n2_paging_conflict_retry_after(&resp) {
@@ -8926,7 +8953,7 @@ async fn retry_n1n2_after_paging_conflict(
     sm_context_ref: String,
     first_wait: std::time::Duration,
 ) -> N1n2RetryEnd {
-    let client = nextgcore_sbi::client::SbiClient::new(config);
+    let client = namf_client(config);
     let mut wait = first_wait;
     for attempt in 1..=N1N2_PAGING_CONFLICT_RETRIES {
         if wait > std::time::Duration::from_secs(N1N2_RETRY_AFTER_MAX_S) {
@@ -16191,6 +16218,410 @@ mod tests {
             N1n2RetryEnd::WaitTooLong(std::time::Duration::from_secs(N1N2_RETRY_AFTER_MAX_S + 1))
         );
         drop_session_for_retry(&sm_ref);
+    }
+
+    // ------------------------------------------------------------------
+    // #1648: outbound service requests carry the NRF-issued token
+    // ------------------------------------------------------------------
+
+    /// The `(method, path, Authorization)` of each request an OAuth2 stand-in saw.
+    type SeenAuth1648 = Arc<std::sync::Mutex<Vec<(String, String, Option<String>)>>>;
+
+    /// #1648: a stand-in NRF token endpoint. It mints an ES256 access token, signed
+    /// by `sk`, whose `aud` is the request's `targetNfType` and whose `scope` is the
+    /// request's `scope` (TS 29.510 §6.3.5.2.2 AccessTokenReq), so a producer that
+    /// verifies `aud` and `scope` (as nextgcore-sbi's does) accepts it. It answers
+    /// both the bespoke and the TS 29.510 standard token path.
+    async fn token_nrf_1648(sk: p256::ecdsa::SigningKey) -> (SbiServer, u16) {
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server =
+            SbiServer::on_listener(nextgcore_sbi::server::SbiServerConfig::new(addr), listener);
+        server
+            .start(move |req: SbiRequest| {
+                let sk = sk.clone();
+                async move {
+                    let path = req.header.uri.split('?').next().unwrap_or_default();
+                    if path != nextgcore_sbi::oauth::OAuth2Client::TOKEN_PATH_BESPOKE
+                        && path != nextgcore_sbi::oauth::OAuth2Client::TOKEN_PATH_STANDARD
+                    {
+                        return SbiResponse::with_status(404);
+                    }
+                    let form = req.http.content.clone().unwrap_or_default();
+                    let field = |name: &str| {
+                        form.split('&')
+                            .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+                            .unwrap_or_default()
+                            .replace("%20", " ")
+                            .replace('+', " ")
+                    };
+                    let token = super::oauth2_h8_tests::build_es256_token(
+                        &sk,
+                        "nrf-1648",
+                        &field("targetNfType"),
+                        &field("scope"),
+                    );
+                    SbiResponse::with_status(200)
+                        .with_json_body(&serde_json::json!({
+                            "access_token": token,
+                            "token_type": "Bearer",
+                            "expires_in": 3600,
+                        }))
+                        .unwrap()
+                }
+            })
+            .await
+            .expect("token NRF starts");
+        (server, addr.port())
+    }
+
+    /// #1648: a producer of NF type `nf_type` that, with `gated`, REQUIRES OAuth2
+    /// the way an OAuth2-required amfd/udmd/easdfd listens: nextgcore-sbi verifies
+    /// the bearer against the NRF's JWKS (`sk`'s public half) and checks that its
+    /// `aud` names `nf_type`, answering 401 before the handler runs otherwise.
+    ///
+    /// The handler records each request it serves with its Authorization header,
+    /// so on a gated producer a recorded request is one that PASSED the gate: a
+    /// test asserts that the request it expects is recorded, which a token-less or
+    /// wrong-audience send cannot satisfy. Ungated, it records what was sent, for
+    /// asserting that a notification carries no token.
+    async fn oauth2_producer_1648(
+        sk: &p256::ecdsa::SigningKey,
+        nf_type: nextgcore_sbi::types::NfType,
+        gated: bool,
+        respond: impl Fn(&SbiRequest) -> SbiResponse + Clone + Send + Sync + 'static,
+    ) -> (SbiServer, u16, SeenAuth1648) {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let seen: SeenAuth1648 = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let mut cfg = nextgcore_sbi::server::SbiServerConfig::new(addr);
+        if gated {
+            cfg = cfg.with_expected_audience_nf_type(nf_type);
+            cfg.require_oauth2 = true;
+            cfg.oauth2_jwks = Some(super::oauth2_h8_tests::jwks_for(sk, "nrf-1648"));
+        }
+        let server = SbiServer::on_listener(cfg, listener);
+        server
+            .start(move |req: SbiRequest| {
+                let sink = Arc::clone(&sink);
+                let respond = respond.clone();
+                async move {
+                    sink.lock().unwrap_or_else(|e| e.into_inner()).push((
+                        req.header.method.clone(),
+                        req.header
+                            .uri
+                            .split('?')
+                            .next()
+                            .unwrap_or_default()
+                            .to_string(),
+                        req.http.get_header("authorization").cloned(),
+                    ));
+                    respond(&req)
+                }
+            })
+            .await
+            .expect("producer starts");
+        (server, addr.port(), seen)
+    }
+
+    /// How many requests `seen` holds for `method` on a path containing `fragment`,
+    /// each with a bearer.
+    fn bearer_requests_1648(seen: &SeenAuth1648, method: &str, fragment: &str) -> usize {
+        seen.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(m, p, auth)| {
+                m == method
+                    && p.contains(fragment)
+                    && auth.as_deref().is_some_and(|a| a.starts_with("Bearer "))
+            })
+            .count()
+    }
+
+    /// The OAuth2 client the SMF installs under enforcement, pointed at `nrf_port`.
+    fn smf_oauth2_client_1648(nrf_port: u16) -> Arc<nextgcore_sbi::oauth::OAuth2Client> {
+        Arc::new(nextgcore_sbi::oauth::OAuth2Client::new(
+            format!("http://127.0.0.1:{nrf_port}"),
+            "smf-1648",
+            nextgcore_sbi::types::NfType::Smf,
+        ))
+    }
+
+    /// #1648, found by the D443A `oauth2` arm: every Namf_Communication service
+    /// request this SMF sends (N1N2MessageTransfer on the UP deactivation, release,
+    /// paging-conflict and retry paths, and EBIAssignment) passes an OAuth2-required
+    /// AMF's gate. They are service operations (TS 29.518 §5.2.2.3.1, §5.2.2.6), so
+    /// the consumer presents its NRF-issued token (TS 33.501 §13.4.1.1.2, TS 29.500
+    /// §6.7.3). Before the fix each one got 401 and never reached the AMF.
+    ///
+    /// The SmContextStatusNotify to the same AMF is a notification and carries no
+    /// token (TS 33.501 §13.4.1, TS 29.500 §6.10.7 NOTE): it stays token-less.
+    #[tokio::test]
+    async fn namf_service_requests_pass_an_oauth2_required_amf_1648() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let sk = p256::ecdsa::SigningKey::from_slice(&[16u8; 32]).expect("key");
+        let (_nrf, nrf_port) = token_nrf_1648(sk.clone()).await;
+        let (_amf, port, seen) =
+            oauth2_producer_1648(&sk, nextgcore_sbi::types::NfType::Amf, true, |_| {
+                SbiResponse::with_status(200)
+            })
+            .await;
+        let (_plain_amf, plain_port, plain_seen) =
+            oauth2_producer_1648(&sk, nextgcore_sbi::types::NfType::Amf, false, |_| {
+                SbiResponse::with_status(204)
+            })
+            .await;
+        let amf_uri = format!("http://127.0.0.1:{port}");
+        let supi = "imsi-001010016480001";
+        let sm_ref = held_session_for_retry(supi, 1);
+
+        // The control: without enforcement the same transfer carries no token, and
+        // the OAuth2-required AMF refuses it before its handler.
+        send_n2_release_transfer(&amf_uri, supi, 1, &[0x00]).await;
+        assert_eq!(seen.lock().unwrap_or_else(|e| e.into_inner()).len(), 0);
+
+        eps_iwk::set_for_test(true);
+        TEST_OAUTH2_CLIENT
+            .scope(smf_oauth2_client_1648(nrf_port), async {
+                send_n2_release_transfer(&amf_uri, supi, 1, &[0x00]).await;
+                assert_eq!(
+                    bearer_requests_1648(&seen, "POST", "/n1-n2-messages"),
+                    1,
+                    "the UP deactivation transfer carries the token"
+                );
+                send_n1_n2_release_transfer(&amf_uri, supi, 1, &[0x2e], &[0x00]).await;
+                assert_eq!(
+                    bearer_requests_1648(&seen, "POST", "/n1-n2-messages"),
+                    2,
+                    "the release transfer carries the token"
+                );
+                let (config, request) = n1n2_request_to(port);
+                let resp = send_n1n2_honouring_paging_conflict(
+                    config.clone(),
+                    request.clone(),
+                    sm_ref.clone(),
+                    PagingRetries::Awaited(None),
+                )
+                .await
+                .expect("answered");
+                assert_eq!(resp.status, 200, "the AMF accepted the transfer");
+                assert_eq!(
+                    bearer_requests_1648(&seen, "POST", "/n1-n2-messages"),
+                    3,
+                    "the paging-conflict-aware transfer carries the token"
+                );
+                let end = retry_n1n2_after_paging_conflict(
+                    config,
+                    request,
+                    sm_ref.clone(),
+                    std::time::Duration::ZERO,
+                )
+                .await;
+                assert_eq!(end, N1n2RetryEnd::Sent(200));
+                assert_eq!(
+                    bearer_requests_1648(&seen, "POST", "/n1-n2-messages"),
+                    4,
+                    "the paging-conflict retry carries the token"
+                );
+                let _ = eps_iwk::request_ebi(Some(&amf_uri), supi, 1, 8).await;
+                assert_eq!(
+                    bearer_requests_1648(&seen, "POST", "/assign-ebi"),
+                    1,
+                    "the EBI assignment carries the token"
+                );
+                send_sm_context_status_notification(
+                    Some(&format!(
+                        "http://127.0.0.1:{plain_port}/namf-callback/v1/{supi}/1/sm-context-status"
+                    )),
+                    "RELEASED",
+                    None,
+                )
+                .await;
+            })
+            .await;
+        eps_iwk::set_for_test(false);
+        drop_session_for_retry(&sm_ref);
+
+        let notified = plain_seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(notified.len(), 1, "the status notification was sent");
+        assert_eq!(
+            notified[0].2, None,
+            "a notification carries no access token (TS 33.501 §13.4.1)"
+        );
+    }
+
+    /// #1648: every Nudm service request (SDM get of smf-select-data and sm-data,
+    /// UECM registration and its removal, SDM subscribe and unsubscribe) passes an
+    /// OAuth2-required UDM's gate. They used the shared `get_client` cache, whose
+    /// clients carry no token.
+    #[tokio::test]
+    async fn nudm_service_requests_pass_an_oauth2_required_udm_1648() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let sk = p256::ecdsa::SigningKey::from_slice(&[17u8; 32]).expect("key");
+        let (_nrf, nrf_port) = token_nrf_1648(sk.clone()).await;
+        let sm_data = sm_data_with("40 Mbps", "80 Mbps", 6);
+        let (_udm, port, seen) =
+            oauth2_producer_1648(&sk, nextgcore_sbi::types::NfType::Udm, true, move |req| {
+                let path = req.header.uri.split('?').next().unwrap_or_default();
+                if req.header.method == "DELETE" {
+                    SbiResponse::with_status(204)
+                } else if path.ends_with("/sdm-subscriptions") {
+                    SbiResponse::with_status(201)
+                        .with_header("Location", format!("{path}/sub-1648"))
+                        .with_json_body(&serde_json::json!({ "subscriptionId": "sub-1648" }))
+                        .unwrap()
+                } else if path.ends_with("/sm-data") {
+                    SbiResponse::with_status(200)
+                        .with_json_body(&sm_data)
+                        .unwrap()
+                } else if path.ends_with("/smf-select-data") {
+                    SbiResponse::with_status(200)
+                        .with_json_body(&serde_json::json!({}))
+                        .unwrap()
+                } else {
+                    SbiResponse::with_status(201)
+                }
+            })
+            .await;
+        std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("UDM_SBI_PORT", port.to_string());
+        udm::set_for_test(true);
+        let supi = "imsi-001010016480002";
+        TEST_OAUTH2_CLIENT
+            .scope(smf_oauth2_client_1648(nrf_port), async {
+                let _ = fetch_subscribed_default_dnn(supi, 1, Some("010203")).await;
+                assert_eq!(
+                    bearer_requests_1648(&seen, "GET", "/smf-select-data"),
+                    1,
+                    "Nudm_SDM_Get smf-select-data carries the token"
+                );
+                let _ = udm::fetch_sm_data(supi, "internet", 1, Some("010203")).await;
+                assert_eq!(
+                    bearer_requests_1648(&seen, "GET", "/sm-data"),
+                    1,
+                    "Nudm_SDM_Get sm-data carries the token"
+                );
+                udm::register_as_serving_smf(
+                    supi,
+                    1,
+                    "internet",
+                    1,
+                    Some("010203"),
+                    Some(("001", "01")),
+                    udm::EpsInterworkingInd::None,
+                )
+                .await;
+                assert_eq!(
+                    bearer_requests_1648(&seen, "PUT", "/smf-registrations/1"),
+                    1,
+                    "Nudm_UECM_Registration carries the token"
+                );
+                udm::deregister_serving_smf(supi, 1).await;
+                assert_eq!(
+                    bearer_requests_1648(&seen, "DELETE", "/smf-registrations/1"),
+                    1,
+                    "Nudm_UECM_Deregistration carries the token"
+                );
+                let id = udm::subscribe_sm_data(
+                    supi,
+                    "http://127.0.0.1:9/nsmf-callback/v1/sdm-notify/1",
+                    "internet",
+                    1,
+                    Some("010203"),
+                )
+                .await
+                .expect("subscribed past the gate");
+                assert_eq!(
+                    bearer_requests_1648(&seen, "POST", "/sdm-subscriptions"),
+                    1,
+                    "Nudm_SDM_Subscribe carries the token"
+                );
+                udm::unsubscribe_sm_data(supi, &id).await;
+                assert_eq!(
+                    bearer_requests_1648(&seen, "DELETE", "/sdm-subscriptions/sub-1648"),
+                    1,
+                    "Nudm_SDM_Unsubscribe carries the token"
+                );
+            })
+            .await;
+        udm::set_for_test(false);
+        std::env::remove_var("UDM_SBI_ADDR");
+        std::env::remove_var("UDM_SBI_PORT");
+    }
+
+    /// #1648: both Neasdf_DNSContext service requests (create and delete) pass an
+    /// OAuth2-required EASDF's gate (TS 29.556 §5.2.2). The EASDF client was a
+    /// cleartext `with_host_port` client with no token.
+    #[tokio::test]
+    async fn neasdf_service_requests_pass_an_oauth2_required_easdf_1648() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let sk = p256::ecdsa::SigningKey::from_slice(&[18u8; 32]).expect("key");
+        let (_nrf, nrf_port) = token_nrf_1648(sk.clone()).await;
+        let (_easdf, easdf_port, seen) =
+            oauth2_producer_1648(&sk, nextgcore_sbi::types::NfType::Easdf, true, |req| {
+                if req.header.method == "POST" {
+                    SbiResponse::with_status(201)
+                        .with_json_body(&serde_json::json!({ "dnsContextId": "ctx-1648" }))
+                        .unwrap()
+                } else {
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await;
+        // The discovery NRF (nnrf-disc is not OAuth2-gated by default).
+        let (_disc, disc_port, _) =
+            oauth2_producer_1648(&sk, nextgcore_sbi::types::NfType::Nrf, false, move |_| {
+                SbiResponse::with_status(200)
+                    .with_json_body(&serde_json::json!({
+                        "validityPeriod": 3600,
+                        "nfInstances": [{
+                            "nfInstanceId": "easdf-1648",
+                            "nfType": "EASDF",
+                            "nfStatus": "REGISTERED",
+                            "ipv4Addresses": ["127.0.0.1"],
+                            "nfServices": [{
+                                "serviceName": "neasdf-dnscontext",
+                                "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": easdf_port }]
+                            }]
+                        }]
+                    }))
+                    .unwrap()
+            })
+            .await;
+        easdf::set_for_test(Some(easdf::EasdfConfig {
+            nrf_uri: format!("http://127.0.0.1:{disc_port}"),
+            report_uri: "http://127.0.0.1:9/nsmf-pdusession/v1/easdf-dns-reports".to_string(),
+            edge_fqdn_patterns: vec!["*.edge.example.com".to_string()],
+        }));
+        let supi = "imsi-001010016480003";
+        TEST_OAUTH2_CLIENT
+            .scope(smf_oauth2_client_1648(nrf_port), async {
+                let id = easdf::create_dns_context(
+                    supi,
+                    5,
+                    "internet",
+                    std::net::Ipv4Addr::new(10, 45, 0, 2),
+                )
+                .await
+                .expect("created past the gate");
+                assert_eq!(
+                    bearer_requests_1648(&seen, "POST", "/neasdf-dnscontext/v1/dns-contexts"),
+                    1,
+                    "the DNS context create carries the token"
+                );
+                easdf::delete_dns_context(supi, &id).await;
+                assert_eq!(
+                    bearer_requests_1648(
+                        &seen,
+                        "DELETE",
+                        "/neasdf-dnscontext/v1/dns-contexts/ctx-1648"
+                    ),
+                    1,
+                    "the DNS context delete carries the token"
+                );
+            })
+            .await;
+        easdf::set_for_test(None);
     }
 
     #[tokio::test]
@@ -30323,7 +30754,7 @@ mod oauth2_h8_tests {
     use std::time::Duration;
 
     /// Mint an ES256 access token in the NRF's shape, signed by `sk`.
-    fn build_es256_token(
+    pub(super) fn build_es256_token(
         sk: &p256::ecdsa::SigningKey,
         kid: &str,
         aud: &str,
@@ -30351,7 +30782,7 @@ mod oauth2_h8_tests {
     }
 
     /// Public JWKS for the signing key `sk` under `kid`.
-    fn jwks_for(sk: &p256::ecdsa::SigningKey, kid: &str) -> serde_json::Value {
+    pub(super) fn jwks_for(sk: &p256::ecdsa::SigningKey, kid: &str) -> serde_json::Value {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
         let point = sk.verifying_key().to_encoded_point(false);
