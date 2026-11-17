@@ -5119,7 +5119,12 @@ async fn handle_sm_context_create_inner(request: &SbiRequest) -> SbiResponse {
                         .and_then(|s| u32::from_str_radix(s, 16).ok()),
                 };
                 sess.set_ipv4_addr(std::net::Ipv4Addr::from(ue_ip_octets));
-                sess.up_cnx_state = context::UpCnxState::Activated;
+                // #1629, TS 29.502 §5.2.2.2 step 3 ("same as step 3 of figure
+                // 5.2.2.3.2.2-1"): the 201 answers upCnxState ACTIVATING with the
+                // PDUSessionResourceSetupRequestTransfer, so the session is ACTIVATING
+                // until the gNB's PDU_RES_SETUP_RSP (ACTIVATED) or PDU_RES_SETUP_FAIL
+                // (DEACTIVATED). Release and paging treat it as before (#1606).
+                sess.up_cnx_state = context::UpCnxState::Activating;
                 sess.sm_context_status_uri = sm_context_status_uri.clone();
                 sess.session_ambr = context::SessionAmbr {
                     uplink: decision.sess_ambr_ul_bps,
@@ -5377,6 +5382,16 @@ fn smf_n4_seid_for(sm_context_ref: &str) -> u64 {
             .and_then(|m| m.get(sm_context_ref).copied())
     });
     inherited.unwrap_or_else(|| context::derive_cp_n4_seid(sm_context_ref))
+}
+
+/// The user-plane connection state `sm_context_ref`'s session records, if it
+/// has a session (#1629).
+fn up_cnx_state_of(sm_context_ref: &str) -> Option<context::UpCnxState> {
+    smf_self()
+        .read()
+        .ok()?
+        .sess_find_by_sm_context_ref(sm_context_ref)
+        .map(|sess| sess.up_cnx_state)
 }
 
 /// Record a session's user-plane connection state (#540). The Downlink Data
@@ -6595,6 +6610,28 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                 // PDU_RES_SETUP_RSP carries N2 (`up_connection_active`, #1563). A
                 // refused activation (step 2b) leaves the state as it was.
                 if resp.status == 200 {
+                    // #1629, TS 29.502 §5.2.2.3.2.2 step 2a: "If the SMF finds the PDU
+                    // session already activated ..., the SMF shall delete the N3 tunnel
+                    // information and update the UPF accordingly" (TS 23.502 §4.2.3.2
+                    // step 8a: "it deletes the AN Tunnel Info and initiates an N4
+                    // Session Modification procedure to remove Tunnel Info of AN in the
+                    // UPF"). The DL FAR toward the old AN tunnel buffers until the
+                    // gNB's PDU_RES_SETUP_RSP names the new one. A UPF that does not
+                    // apply it does not refuse the activation: that response updates
+                    // the DL FAR anyway.
+                    if up_cnx_state_of(sm_context_ref) == Some(context::UpCnxState::Activated) {
+                        if let Some(upf_seid) = lookup_upf_seid(sm_context_ref) {
+                            if let Err(e) =
+                                pfcp_deactivate_dl_far(smf_n4_seid_for(sm_context_ref), upf_seid)
+                                    .await
+                            {
+                                log::warn!(
+                                    "UP activation for already-activated ref={sm_context_ref}: \
+                                     removing the old AN tunnel at the UPF failed: {e}"
+                                );
+                            }
+                        }
+                    }
                     mark_up_cnx_state(sm_context_ref, context::UpCnxState::Activating);
                 }
                 return resp;
@@ -23321,7 +23358,7 @@ mod tests {
     /// #289 converted this test: the N4 leg now fails because the stand-in UPF's
     /// association is deliberately down, not because no UPF exists. The
     /// REGISTRATION half its old comment asked for is
-    /// `a_successful_create_registers_an_activated_session_and_its_binding` below.
+    /// `a_successful_create_registers_an_activating_session_and_its_binding` below.
     /// #980 review, end to end: the CreateSMContext handler sends the AMF's
     /// `3gpp-Sbi-Origination-Timestamp` on the SM policy create unchanged
     /// (TS 29.512 §4.2.2.2). The PCF's collision rule (§4.2.7) then sees the
@@ -23651,7 +23688,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_successful_create_registers_an_activated_session_and_its_binding() {
+    async fn a_successful_create_registers_an_activating_session_and_its_binding() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _seeded = crate::context::SeededState::track();
         let upf = pfcp_path::stand_in::associated_upf().await;
@@ -23692,10 +23729,12 @@ mod tests {
             .expect("context")
             .sess_find_by_sm_context_ref(&sm_context_ref)
             .expect("the reference the AMF was handed must resolve to a session");
+        // #1629, TS 29.502 §5.2.2.2 step 3: ACTIVATING until the gNB's
+        // PDU_RES_SETUP_RSP, as the 201 says.
         assert_eq!(
             sess.up_cnx_state,
-            context::UpCnxState::Activated,
-            "upCnxState is ACTIVATED once the user plane exists"
+            context::UpCnxState::Activating,
+            "upCnxState is ACTIVATING until the gNB has set the session up"
         );
         assert_eq!(
             (sess.session_ambr.uplink, sess.session_ambr.downlink),
@@ -27913,6 +27952,149 @@ mod tests {
         assert!(cancel_gsm_timer_for_test(&r));
 
         amf.stop().await.ok();
+    }
+
+    /// #1629, TS 29.502 §5.2.2.2 step 3 (the same as §5.2.2.3.2.2 step 3): a create
+    /// answers 201 with upCnxState ACTIVATING and records ACTIVATING, until the gNB
+    /// answers. A PDU_RES_SETUP_FAIL then makes it DEACTIVATED (#1606).
+    ///
+    /// REVERT-VERIFIED: with the create recording ACTIVATED again, the first state
+    /// assertion fails.
+    #[tokio::test]
+    async fn a_created_session_is_activating_until_the_gnb_answers_1629() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let supi = "imsi-001010000001629";
+        let resp = handle_sm_context_create(&create_request(
+            supi,
+            9,
+            &n1(
+                9,
+                1,
+                gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+                &[0x91, 0x00],
+            ),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("JSON")).expect("json");
+        assert_eq!(body["upCnxState"], "ACTIVATING");
+        let r = body["smContextRef"]
+            .as_str()
+            .expect("smContextRef")
+            .to_string();
+        assert_eq!(up_state_1606(&r), context::UpCnxState::Activating);
+
+        let fail = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode([0x00])
+        };
+        let resp = update_1606(
+            &r,
+            serde_json::json!({ "n2SmInfoType": "PDU_RES_SETUP_FAIL", "n2SmInfo": fail }),
+        )
+        .await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        assert_eq!(up_state_1606(&r), context::UpCnxState::Deactivated);
+        let _ = release_sm_context_locally(&r);
+        side_effects_settled().await;
+    }
+
+    /// #1629, TS 29.502 §5.2.2.3.2.2 step 2a: an ACTIVATING for a session whose UP
+    /// connection is already ACTIVATED makes the SMF "delete the N3 tunnel
+    /// information and update the UPF accordingly" (TS 23.502 §4.2.3.2 step 8a): one
+    /// N4 Session Modification that deactivates the DL FAR (FAR 2), before the
+    /// answer. The session is then ACTIVATING. An ACTIVATING for a DEACTIVATED
+    /// session has no tunnel to remove and sends no modification.
+    ///
+    /// REVERT-VERIFIED: without the already-activated branch, no Session
+    /// Modification reaches the UPF.
+    #[tokio::test]
+    async fn a_late_activating_removes_the_old_an_tunnel_1629() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        smf_context_init(64, 256, 512);
+        let (upf, seen, upf_task) = modification_recording_upf_1387().await;
+        let (_client, listener) = client_behind_the_real_listener(upf).await;
+        let r = seed_notified_session_1387("imsi-001010000001630", 22, 0x1629);
+        smf_self()
+            .read()
+            .expect("context")
+            .upf_ul_endpoints
+            .write()
+            .expect("w")
+            .insert(r.clone(), (0x0016_2900, [10, 45, 0, 9]));
+        let update_far_ids = |bodies: &[Vec<u8>]| -> Vec<u32> {
+            bodies
+                .iter()
+                .filter_map(|b| pfcp_path::find_ie(b, n4_build::pfcp_ie::UPDATE_FAR))
+                .filter_map(|far| pfcp_path::find_ie(far, n4_build::pfcp_ie::FAR_ID))
+                .filter_map(|id| {
+                    id.get(..4)
+                        .map(|v| u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
+                })
+                .collect()
+        };
+
+        // Already ACTIVATED: the old AN tunnel is removed first.
+        mark_up_cnx_state(&r, context::UpCnxState::Activated);
+        let resp = update_1606(&r, serde_json::json!({ "upCnxState": "ACTIVATING" })).await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        let answer: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("JSON")).expect("json");
+        assert_eq!(answer["upCnxState"], "ACTIVATING");
+        assert_eq!(
+            update_far_ids(&seen.lock().unwrap()),
+            vec![2],
+            "one Session Modification deactivating the DL FAR"
+        );
+        assert_eq!(up_state_1606(&r), context::UpCnxState::Activating);
+
+        // DEACTIVATED: nothing to remove.
+        seen.lock().unwrap().clear();
+        mark_up_cnx_state(&r, context::UpCnxState::Deactivated);
+        let resp = update_1606(&r, serde_json::json!({ "upCnxState": "ACTIVATING" })).await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        assert!(seen.lock().unwrap().is_empty(), "no Session Modification");
+        assert_eq!(up_state_1606(&r), context::UpCnxState::Activating);
+
+        listener.abort();
+        upf_task.abort();
+    }
+
+    /// #1629 (review of #1618): a PATH_SWITCH_SETUP_FAIL (the target NG-RAN could not
+    /// set up the session's resources at an Xn handover) is answered and recorded
+    /// DEACTIVATED (TS 29.502 §5.2.2.3.2.2 step 3, shared with PDU_RES_SETUP_FAIL).
+    ///
+    /// REVERT-VERIFIED: without the DEACTIVATED mark in the failure arm, the state
+    /// stays ACTIVATED.
+    #[tokio::test]
+    async fn a_path_switch_setup_failure_is_deactivated_1629() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let r = seed_release_session_1430("imsi-001010000001631", 14, 9);
+        assert_eq!(up_state_1606(&r), context::UpCnxState::Activated);
+        let fail = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode([0x00])
+        };
+        let resp = update_1606(
+            &r,
+            serde_json::json!({ "n2SmInfoType": "PATH_SWITCH_SETUP_FAIL", "n2SmInfo": fail }),
+        )
+        .await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        let answer: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("JSON")).expect("json");
+        assert_eq!(answer["upCnxState"], "DEACTIVATED", "{answer}");
+        assert_eq!(up_state_1606(&r), context::UpCnxState::Deactivated);
     }
 
     /// #1385 review B1: the 5QI change is a "Create new QoS flow description" -- also
