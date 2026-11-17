@@ -737,6 +737,7 @@ pub fn handle_event_subscribe(
         reported_presence: std::collections::HashMap::new(),
         reachability_filter: None,
         reported_reachability: std::collections::HashMap::new(),
+        reported_connectivity: std::collections::HashMap::new(),
         reporting_threshold: None,
         location_filters: subscription
             .location_filter_list

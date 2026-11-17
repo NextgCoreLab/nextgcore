@@ -3145,8 +3145,7 @@ impl NgapServer {
                     s.registered.then(|| {
                         let went_idle = !s.cm_idle;
                         s.cm_idle = true;
-                        // #1645: `left_cm_idle` is left for the reachability
-                        // supervision below, which takes it.
+                        s.left_cm_idle = false;
                         // #1442: no Release Complete, so no recommendation.
                         s.amf_ue.recommended_paging.clear();
                         (went_idle, abort_on_ng_release(amf_ue_ngap_id, s))
@@ -13740,8 +13739,7 @@ impl NgapServer {
                 let went_idle = s.registered && !s.cm_idle;
                 if s.registered {
                     s.cm_idle = true;
-                    // #1645: `left_cm_idle` is left for the reachability supervision
-                    // this release starts, which takes it.
+                    s.left_cm_idle = false;
                     // #1442: the recommendation of THIS release replaces any earlier
                     // one, and a release with none clears it, so a page in this
                     // idle period never follows a stale one.
@@ -13943,15 +13941,6 @@ impl NgapServer {
     /// Start mobile-reachable supervision for a registered UE whose N1 connection was
     /// just released (TS 24.501 §5.3.7).
     async fn start_reachability_supervision(&mut self, amf_ue_ngap_id: u64) {
-        // #1645 (the R5 #1624 round-3 MINOR): a release that ends a connection whose
-        // CM-IDLE -> CM-CONNECTED transition was never reported (its Service Request's
-        // or update's SMF answers had not come back, so neither finish reported
-        // CONNECTED) reports no IDLE either. A subscriber's last report was IDLE, and
-        // from its view nothing changed: never IDLE with no CONNECTED before it.
-        let unreported = self
-            .ue_auth_state
-            .with_mut(amf_ue_ngap_id, |s| std::mem::take(&mut s.left_cm_idle))
-            .unwrap_or(false);
         let Some(config) = self.timer_configs.get(AmfTimerId::MobileReachable).cloned() else {
             return;
         };
@@ -13990,12 +13979,12 @@ impl NgapServer {
                 // its counterpart (IDLE -> CONNECTED on a Service Request) fires from
                 // `gmm_handler::handle_service_request`. Read from the record rather
                 // than reconstructed, so the report carries the UE's real identities.
-                if unreported {
-                    log::info!(
-                        "UE {amf_ue_ngap_id} released before its CM-CONNECTED was reported; \
-                         no IDLE is reported either"
-                    );
-                } else if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
+                // #1645 (the R5 #1624 round-3 MINOR): through the per-subscription
+                // change gate, so a connection that ends before its CONNECTED was
+                // reported (a release racing the Service Request's SMF answers) tells a
+                // subscriber that last heard IDLE nothing: never IDLE with no CONNECTED
+                // before it.
+                if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
                     crate::namf_server::fire_connectivity_state_report(&state.amf_ue, false);
                 }
             }
@@ -37173,6 +37162,7 @@ mod tests {
             reported_presence: std::collections::HashMap::new(),
             reachability_filter: None,
             reported_reachability: std::collections::HashMap::new(),
+            reported_connectivity: std::collections::HashMap::new(),
             reporting_threshold: None,
             location_filters: f.iter().map(|s| s.to_string()).collect(),
         };
@@ -38464,6 +38454,7 @@ mod tests {
             reported_presence: std::collections::HashMap::new(),
             reachability_filter: None,
             reported_reachability: std::collections::HashMap::new(),
+            reported_connectivity: std::collections::HashMap::new(),
             reporting_threshold: None,
             location_filters: Vec::new(),
         };
@@ -38523,6 +38514,11 @@ mod tests {
             .read()
             .expect("ctx")
             .event_subscription_record_reachability(&id, "imsi-x", "UNREACHABLE"));
+        // #1645 review: and the CM state last reported, the same way.
+        assert!(ctx
+            .read()
+            .expect("ctx")
+            .event_subscription_record_connectivity(&id, "imsi-x", "CONNECTED"));
         assert!(ctx.read().expect("ctx").event_subscription_update(stale));
         let kept = ctx
             .read()
@@ -38533,6 +38529,11 @@ mod tests {
             kept.reported_reachability.get("imsi-x").map(String::as_str),
             Some("UNREACHABLE"),
             "the write-back of a stale clone keeps what the store recorded"
+        );
+        assert_eq!(
+            kept.reported_connectivity.get("imsi-x").map(String::as_str),
+            Some("CONNECTED"),
+            "the CM state too"
         );
         for n in 0..crate::context::MAX_REPORTED_REACHABILITY {
             ctx.read()
@@ -42210,6 +42211,7 @@ mod tests {
                 reported_presence: std::collections::HashMap::new(),
                 reachability_filter: None,
                 reported_reachability: std::collections::HashMap::new(),
+                reported_connectivity: std::collections::HashMap::new(),
                 reporting_threshold: None,
                 location_filters: Vec::new(),
             });
@@ -42339,6 +42341,7 @@ mod tests {
                 reported_presence: std::collections::HashMap::new(),
                 reachability_filter: None,
                 reported_reachability: std::collections::HashMap::new(),
+                reported_connectivity: std::collections::HashMap::new(),
                 reporting_threshold: None,
                 location_filters: Vec::new(),
             });
@@ -44757,15 +44760,40 @@ mod eps_to_5gs_tests {
             },
         )
         .unwrap();
-        // #1645: the UE arrived at this AMF from the EPS: one CONNECTED report, from
-        // this handler (counted on this thread).
+        // #1645: the UE arrived at this AMF from the EPS: one CONNECTED report and one
+        // REACHABLE to a "UE Reachable for DL Traffic" subscriber, from this handler
+        // (counted on this thread).
+        let dl_traffic = crate::namf_server::namf_request_handler(
+            nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&serde_json::json!({ "subscription": {
+                    "eventList": [{
+                        "type": "REACHABILITY_REPORT",
+                        "reachabilityFilter": "UE_REACHABLE_DL_TRAFFIC",
+                    }],
+                    "eventNotifyUri": "http://127.0.0.1:9/notify/1645-eps",
+                    "notifyCorrelationId": "corr-1645-eps",
+                    "nfId": "3fa85f64-5717-4562-b3fc-2c963f661645",
+                    "supi": "imsi-001010000004180",
+                }}))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(dl_traffic.status, 201);
+        let dl_traffic = crate::namf_server::EventSubscriptionGuard::of(&dl_traffic);
         let connected_before = crate::namf_server::connected_reports_on_this_thread();
+        let reach_before = crate::namf_server::reachability_reports_on_this_thread();
         let completion = ngap.handle_handover_notify(ASSOC, &notify).await.unwrap();
         assert_eq!(
             crate::namf_server::connected_reports_on_this_thread() - connected_before,
             1,
             "the arrival reports CONNECTED once"
         );
+        assert_eq!(
+            crate::namf_server::reachability_reports_on_this_thread() - reach_before,
+            1,
+            "and REACHABLE to the DL-traffic subscriber"
+        );
+        drop(dl_traffic);
         assert_eq!(completion.sessions_relayed, 1);
         assert_eq!(
             completion.source_context, None,

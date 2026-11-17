@@ -1248,6 +1248,13 @@ pub struct EventSubscription {
     /// REACHABLE across an idle period is not reported again. Keyed by the UE
     /// identity reported, because one any-UE subscription tracks many UEs.
     pub reported_reachability: std::collections::HashMap<String, String>,
+    /// The CM state (`CONNECTED`, `IDLE`) last REPORTED per UE in a
+    /// CONNECTIVITY_STATE_REPORT (#1645 review, MINOR c). TS 29.518 §6.2 reports an
+    /// *updated* CM state, so a subscriber that last heard IDLE is not told IDLE again
+    /// when a connection whose CONNECTED was never reported ends, and a subscriber that
+    /// heard CONNECTED (in its immediate report) is told IDLE. Keyed and bounded as
+    /// [`Self::reported_reachability`] is.
+    pub reported_connectivity: std::collections::HashMap<String, String>,
 }
 
 /// The most UEs one subscription records a reported reachability for (#1641 review
@@ -2726,30 +2733,50 @@ impl AmfContext {
         ue: &str,
         state: &str,
     ) -> bool {
+        self.event_subscription_record(subscription_id, ue, state, |s| &mut s.reported_reachability)
+    }
+
+    /// [`Self::event_subscription_record_reachability`] for the CM state a
+    /// CONNECTIVITY_STATE_REPORT carries (#1645 review).
+    pub fn event_subscription_record_connectivity(
+        &self,
+        subscription_id: &str,
+        ue: &str,
+        state: &str,
+    ) -> bool {
+        self.event_subscription_record(subscription_id, ue, state, |s| &mut s.reported_connectivity)
+    }
+
+    fn event_subscription_record(
+        &self,
+        subscription_id: &str,
+        ue: &str,
+        state: &str,
+        map: impl FnOnce(&mut EventSubscription) -> &mut std::collections::HashMap<String, String>,
+    ) -> bool {
         let Ok(mut subs) = self.event_subscriptions.write() else {
             return true;
         };
         let Some(sub) = subs.get_mut(subscription_id) else {
             return false;
         };
-        match sub.reported_reachability.get(ue) {
+        let reported = map(sub);
+        match reported.get(ue) {
             Some(prev) if prev == state => false,
             Some(_) => {
-                sub.reported_reachability
-                    .insert(ue.to_string(), state.to_string());
+                reported.insert(ue.to_string(), state.to_string());
                 true
             }
             None => {
                 // Review m6: an any-UE subscription records every UE it reports on, so
                 // the map is bounded. Past the bound one entry is dropped; at worst that
                 // UE's next report repeats its state once.
-                if sub.reported_reachability.len() >= MAX_REPORTED_REACHABILITY {
-                    if let Some(k) = sub.reported_reachability.keys().next().cloned() {
-                        sub.reported_reachability.remove(&k);
+                if reported.len() >= MAX_REPORTED_REACHABILITY {
+                    if let Some(k) = reported.keys().next().cloned() {
+                        reported.remove(&k);
                     }
                 }
-                sub.reported_reachability
-                    .insert(ue.to_string(), state.to_string());
+                reported.insert(ue.to_string(), state.to_string());
                 true
             }
         }
@@ -2775,6 +2802,7 @@ impl AmfContext {
                 // recorded a report between the caller's read and this write.
                 let mut sub = sub;
                 sub.reported_reachability = std::mem::take(&mut e.get_mut().reported_reachability);
+                sub.reported_connectivity = std::mem::take(&mut e.get_mut().reported_connectivity);
                 e.insert(sub);
                 return true;
             }
