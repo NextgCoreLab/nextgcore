@@ -762,6 +762,11 @@ pub struct UeNasContext {
     /// Running reachability supervision (TS 24.501 §5.3.7). `None` while the UE has a
     /// live N1 signalling connection: a UE the AMF can reach needs no supervision.
     reachability: Option<Reachability>,
+    /// #1641: the mobile reachable timer expired during this CM-IDLE period, so the
+    /// UE is UNREACHABLE (TS 29.518 §5.3.1, `29518-k00.txt:5046-5049`). Cleared when
+    /// the timer is armed again at the next release; a CM-CONNECTED UE is REACHABLE
+    /// whatever this says.
+    mobile_reachable_expired: bool,
     /// CM-IDLE (TS 23.501 §5.3.3.2.2): the N1 signalling connection was released
     /// (UE Context Release Complete) and the UE has not come back with a Service
     /// Request. Independent of `reachability`, whose timer can be disabled.
@@ -965,6 +970,19 @@ impl UeNasContext {
         self.cm_idle
     }
 
+    /// #1641: the UE's reachability state (TS 29.518 §5.3.1): `UNREACHABLE` once
+    /// the mobile reachable timer expired in CM-IDLE, or for a deregistered UE;
+    /// otherwise `REACHABLE`, idle within the timer included (§5.3.1 NOTE 4).
+    pub(crate) fn reachability_state(&self) -> &'static str {
+        if !self.cm_idle && self.is_bound() {
+            "REACHABLE"
+        } else if !self.registered || self.mobile_reachable_expired {
+            "UNREACHABLE"
+        } else {
+            "REACHABLE"
+        }
+    }
+
     /// Whether the UE is registered: the record a CM-IDLE UE is paged by (#1087).
     pub(crate) fn is_registered(&self) -> bool {
         self.registered
@@ -1013,6 +1031,7 @@ impl UeNasContext {
             auth_failure_count: 0,
             retx: None,
             reachability: None,
+            mobile_reachable_expired: false,
             sdm_subscription_id: None,
             policy_association_id: None,
             ue_policy_association_id: None,
@@ -7086,7 +7105,7 @@ impl NgapServer {
             if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
                 if from_cm_idle {
                     crate::namf_server::fire_connectivity_state_report(&state.amf_ue, true);
-                    crate::namf_server::fire_reachability_report(&state.amf_ue, true);
+                    crate::namf_server::fire_reachable_on_connection(&state.amf_ue);
                 }
                 crate::namf_server::fire_presence_in_aoi_report(&state.amf_ue);
             }
@@ -7198,9 +7217,25 @@ impl NgapServer {
         // #91: the Registration Accept rides this ICS, so it has now egressed and the
         // UE policy association -- whose creation triggers the PCF's DL MANAGE UE
         // POLICY COMMAND -- may safely be created.
-        self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
-            s.registration_accept_sent = true;
-        });
+        let first_accept = self
+            .ue_auth_state
+            .with_mut(amf_ue_ngap_id, |s| {
+                !std::mem::replace(&mut s.registration_accept_sent, true)
+            })
+            .unwrap_or(false);
+        // #1641 review (M2): an initial registration brings the UE to CM-CONNECTED and
+        // REACHABLE. A status-change subscription that last heard UNREACHABLE (the
+        // mobile reachable timer expired, then the UE was implicitly deregistered and
+        // its subscription kept) hears REACHABLE now, through the change gate (TS 29.518
+        // §5.3.1, "when the UE reachability state changes from any of the two above
+        // states to REACHABLE", `29518-k00.txt:5055-5057`); one that last heard
+        // REACHABLE hears nothing. Once per registration: a repeated Accept is no
+        // transition.
+        if first_accept {
+            if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
+                crate::namf_server::fire_reachable_on_connection(&state.amf_ue);
+            }
+        }
         // #74 criterion 5: ACCESS_TYPE_REPORT. TS 29.518 §6.2 has the consumer receive
         // "the current access type(s) of a UE... and updated access type(s)... when AMF
         // becomes aware of the access type change of the UE" -- and a Registration
@@ -7538,6 +7573,8 @@ impl NgapServer {
         // #1593: whether this connection is a CM-IDLE -> CM-CONNECTED transition.
         state.left_cm_idle = state.cm_idle;
         state.cm_idle = false;
+        // #1641 review (m3): connected, so no longer past its mobile reachable timer.
+        state.mobile_reachable_expired = false;
         // #759: a new NG connection, with no UE context at the gNB yet. A session
         // re-activated by this registration has to ride an Initial Context Setup.
         state.initial_context_setup_request_sent = false;
@@ -7697,6 +7734,8 @@ impl NgapServer {
         // #1593: whether this connection is a CM-IDLE -> CM-CONNECTED transition.
         state.left_cm_idle = state.cm_idle;
         state.cm_idle = false;
+        // #1641 review (m3): connected, so no longer past its mobile reachable timer.
+        state.mobile_reachable_expired = false;
         state.amf_ue.nr_tai = crate::context::Tai5gs {
             plmn_id: initial_ue.plmn_id.clone(),
             tac: initial_ue.tac,
@@ -8046,7 +8085,7 @@ impl NgapServer {
         if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
             if left_cm_idle {
                 crate::namf_server::fire_connectivity_state_report(&state.amf_ue, true);
-                crate::namf_server::fire_reachability_report(&state.amf_ue, true);
+                crate::namf_server::fire_reachable_on_connection(&state.amf_ue);
             }
             crate::namf_server::fire_presence_in_aoi_report(&state.amf_ue);
         }
@@ -13905,6 +13944,7 @@ impl NgapServer {
                     phase: ReachabilityPhase::MobileReachable,
                     deadline,
                 });
+                state.mobile_reachable_expired = false;
                 true
             });
             if armed == Some(true) {
@@ -13960,11 +14000,17 @@ impl NgapServer {
                     // whether the UE became unreachable. `MAX_DETECTION_TIME_EXPIRED` is
                     // the TS 29.518 `LossOfConnectivityReason` for a timer expiry
                     // (TS29518_Namf_EventExposure.yaml:1605-1614).
+                    // #1641: and the UE is UNREACHABLE (TS 29.518 §5.3.1, "if the
+                    // Mobile Reachable Timer expires", `29518-k00.txt:5046-5049`), a
+                    // change the "UE Reachability Status Change" subscriptions hear.
+                    self.ue_auth_state
+                        .with_mut(amf_ue_ngap_id, |s| s.mobile_reachable_expired = true);
                     if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
                         crate::namf_server::fire_loss_of_connectivity(
                             &state.amf_ue,
                             "MAX_DETECTION_TIME_EXPIRED",
                         );
+                        crate::namf_server::fire_reachability_change(&state.amf_ue, "UNREACHABLE");
                     }
                     let Some(config) = self
                         .timer_configs
@@ -16608,6 +16654,8 @@ impl NgapServer {
             // implicitly deregistered.
             state.cm_idle = false;
             state.reachability = None;
+            // #1641 review (m3): connected, so no longer past its mobile reachable timer.
+            state.mobile_reachable_expired = false;
             // #406: was this same unpacking written out inline. Shared with the Uplink NAS
             // Transport and PathSwitchRequest sites now, so the three cannot reassemble the
             // big-endian TAC differently. Behaviour here is unchanged — this was the one
@@ -36803,6 +36851,8 @@ mod tests {
             subs_change_notify_correlation_id: None,
             areas: Vec::new(),
             reported_presence: std::collections::HashMap::new(),
+            reachability_filter: None,
+            reported_reachability: std::collections::HashMap::new(),
             reporting_threshold: None,
             location_filters: f.iter().map(|s| s.to_string()).collect(),
         };
@@ -37422,9 +37472,12 @@ mod tests {
         let mut rxs = Vec::new();
         let mut subscriptions = Vec::new();
         for event in ["CONNECTIVITY_STATE_REPORT", "REACHABILITY_REPORT"] {
-            let (sink, port, rx) = notify_sink().await;
+            let (sink, port, mut rx) = notify_sink().await;
+            // #1641: REACHABLE on every CM-CONNECTED transition is the "UE Reachable
+            // for DL Traffic" filter's; the default reports only changes.
+            let filter = (event == "REACHABILITY_REPORT").then_some("UE_REACHABLE_DL_TRAFFIC");
             let body = serde_json::json!({
-                "eventList": [{ "type": event }],
+                "eventList": [{ "type": event, "reachabilityFilter": filter }],
                 "eventNotifyUri": format!("http://127.0.0.1:{port}/notify/1593"),
                 "notifyCorrelationId": format!("corr-1593-{event}"),
                 "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
@@ -37439,6 +37492,11 @@ mod tests {
             assert_eq!(resp.status, 201, "the {event} subscription is created");
             // #1614: removed when the test ends, before its sink stops.
             subscriptions.push(crate::namf_server::EventSubscriptionGuard::of(&resp));
+            if filter.is_some() {
+                // #1641: the subscription's own first report (the idle UE is
+                // reachable), before the one the update fires.
+                assert_eq!(next_reachability(&mut rx).await, "REACHABLE");
+            }
             sinks.push(sink);
             rxs.push(rx);
         }
@@ -37656,6 +37714,558 @@ mod tests {
             "a connected Service Request: no CONNECTED"
         );
         ngap.ue_auth_state.remove(ue);
+    }
+
+    /// The `reachability` of the next REACHABILITY_REPORT a sink receives.
+    async fn next_reachability(rx: &mut mpsc::Receiver<String>) -> String {
+        let body = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("a REACHABILITY_REPORT within 3 s")
+            .expect("channel open");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        let report = &v["reportList"][0];
+        assert_eq!(report["type"], "REACHABILITY_REPORT", "{v}");
+        report["reachability"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Subscribe a sink on `port` to `supi`'s REACHABILITY_REPORT, with
+    /// `reachabilityFilter` when given and the immediateFlag when `immediate`.
+    async fn subscribe_reachability(
+        supi: &str,
+        port: u16,
+        filter: Option<&str>,
+        immediate: bool,
+    ) -> (
+        crate::namf_server::EventSubscriptionGuard,
+        nextgcore_sbi::SbiResponse,
+    ) {
+        let mut event = serde_json::json!({ "type": "REACHABILITY_REPORT" });
+        if let Some(f) = filter {
+            event["reachabilityFilter"] = serde_json::json!(f);
+        }
+        if immediate {
+            event["immediateFlag"] = serde_json::json!(true);
+        }
+        let resp = crate::namf_server::namf_request_handler(
+            nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&serde_json::json!({ "subscription": {
+                    "eventList": [event],
+                    "eventNotifyUri": format!("http://127.0.0.1:{port}/notify/1641"),
+                    "notifyCorrelationId": "corr-1641",
+                    "nfId": "3fa85f64-5717-4562-b3fc-2c963f661641",
+                    "supi": supi,
+                }}))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 201, "the subscription is created");
+        (crate::namf_server::EventSubscriptionGuard::of(&resp), resp)
+    }
+
+    /// **#1641**, TS 29.518 §5.3.1 (`29518-k00.txt:5037-5076`) and Table 6.2.6.2.3-1
+    /// (`:21454-21482`): REACHABILITY_REPORT follows each subscription's
+    /// `reachabilityFilter`, at real subscribers. Neither sets the immediateFlag.
+    /// - At subscription, both hear the current state, REACHABLE: the UE is idle
+    ///   within its mobile reachable timer.
+    /// - A Service Request from CM-IDLE: the "UE Reachable for DL Traffic"
+    ///   subscriber hears REACHABLE; the default ("UE Reachability Status Change")
+    ///   one hears nothing, since nothing changed. The CONNECTED report is the
+    ///   positive control that the transition was seen.
+    /// - The mobile reachable timer expires: the default subscriber hears
+    ///   UNREACHABLE; the DL-traffic one nothing.
+    /// - The next Service Request: both hear REACHABLE.
+    ///
+    /// Counted per thread on this current-thread runtime
+    /// (`reachability_reports_on_this_thread`), and read at the sinks.
+    #[tokio::test]
+    async fn reachability_reports_follow_the_subscriptions_filter_1641() {
+        // The reachability sweep walks the whole UE store: serialised with the other
+        // sweeping tests, its lock taken before CONTEXT_GUARD as theirs is.
+        let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _guamis = serve_only_local_guami();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let reach = crate::namf_server::reachability_reports_on_this_thread;
+        let connected = crate::namf_server::connected_reports_on_this_thread;
+        let mut ngap = capturing_ngap_server().await;
+        let (first, second, third) = (16_410_001u64, 16_410_002u64, 16_410_003u64);
+        let supi = "imsi-001010001641001";
+        let mut stored = idle_registered_ue(first);
+        stored.amf_ue.supi = Some(supi.to_string());
+        stored.amf_ue.allowed_nssai = vec![crate::context::SNssai { sst: 1, sd: None }];
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_publish(&stored.amf_ue, 51, 1);
+        }
+        ngap.ue_auth_state.insert(first, stored);
+
+        let (status_sink, status_port, mut status_rx) = notify_sink().await;
+        let (dl_sink, dl_port, mut dl_rx) = notify_sink().await;
+        // Review M3: a third, status-change subscriber with the immediateFlag, whose
+        // first report is in its subscribe response and recorded there.
+        let (imm_sink, imm_port, mut imm_rx) = notify_sink().await;
+        let before = reach();
+        let (status_sub, _) = subscribe_reachability(supi, status_port, None, false).await;
+        let (dl_sub, _) =
+            subscribe_reachability(supi, dl_port, Some("UE_REACHABLE_DL_TRAFFIC"), false).await;
+        let (imm_sub, imm_resp) = subscribe_reachability(supi, imm_port, None, true).await;
+        let imm_first: serde_json::Value =
+            serde_json::from_str(imm_resp.http.content.as_deref().unwrap_or("{}")).expect("JSON");
+        assert_eq!(imm_first["reportList"][0]["reachability"], "REACHABLE");
+        assert_eq!(
+            reach() - before,
+            2,
+            "the two first reports not in a response"
+        );
+        assert_eq!(next_reachability(&mut status_rx).await, "REACHABLE");
+        assert_eq!(next_reachability(&mut dl_rx).await, "REACHABLE");
+
+        // 1. A Service Request from CM-IDLE, the UE still REACHABLE.
+        let service_request =
+            || service_request_initial_ue(protected_service_request([0; 4], first as u32));
+        let (reach_before, connected_before) = (reach(), connected());
+        ngap.forced_amf_ue_ngap_id = Some(second);
+        let _ = ngap.handle_initial_ue_message(1, &service_request()).await;
+        assert!(
+            ngap.ue_auth_state.get(second).is_some(),
+            "the UE moved to the new connection"
+        );
+        assert_eq!(connected() - connected_before, 1, "the transition was seen");
+        assert_eq!(
+            reach() - reach_before,
+            1,
+            "one REACHABLE, to the DL-traffic subscriber; none to the immediate one, whose \
+             first report was recorded"
+        );
+        assert_eq!(next_reachability(&mut dl_rx).await, "REACHABLE");
+
+        // 2. Released, and the mobile reachable timer expires.
+        ngap.ue_auth_state.with_mut(second, |s| {
+            s.cm_idle = true;
+            s.reachability = Some(Reachability {
+                phase: ReachabilityPhase::MobileReachable,
+                deadline: Instant::now(),
+            });
+        });
+        let before = reach();
+        ngap.process_reachability_timers().await.expect("timers");
+        assert_eq!(
+            reach() - before,
+            2,
+            "UNREACHABLE to both status-change subscribers"
+        );
+        assert_eq!(next_reachability(&mut status_rx).await, "UNREACHABLE");
+        assert_eq!(next_reachability(&mut imm_rx).await, "UNREACHABLE");
+
+        // 3. Back with a Service Request: a change for both.
+        let before = reach();
+        ngap.forced_amf_ue_ngap_id = Some(third);
+        let _ = ngap.handle_initial_ue_message(1, &service_request()).await;
+        assert!(ngap.ue_auth_state.get(third).is_some(), "the UE came back");
+        assert_eq!(reach() - before, 3, "REACHABLE to all three");
+        assert_eq!(next_reachability(&mut status_rx).await, "REACHABLE");
+        assert_eq!(next_reachability(&mut dl_rx).await, "REACHABLE");
+        assert_eq!(next_reachability(&mut imm_rx).await, "REACHABLE");
+
+        ngap.ue_auth_state.remove(third);
+        drop((status_sub, dl_sub, imm_sub));
+        status_sink.stop().await.expect("sink stop");
+        dl_sink.stop().await.expect("sink stop");
+        imm_sink.stop().await.expect("sink stop");
+    }
+
+    /// **#1641**: with the immediateFlag, the first report is in the subscribe
+    /// response, not also notified. An idle UE within its mobile reachable timer is
+    /// REACHABLE there (it said UNREACHABLE before). A "UE Reachable for DL Traffic"
+    /// subscription for an UNREACHABLE UE gets no report at all, and the filter is
+    /// echoed.
+    #[tokio::test]
+    async fn the_first_reachability_report_is_the_current_state_1641() {
+        // The reachability sweep walks the whole UE store: serialised with the other
+        // sweeping tests, its lock taken before CONTEXT_GUARD as theirs is.
+        let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let reach = crate::namf_server::reachability_reports_on_this_thread;
+        let mut ngap = capturing_ngap_server().await;
+        let ue = 16_410_101u64;
+        let supi = "imsi-001010001641101";
+        let mut stored = idle_registered_ue(ue);
+        stored.amf_ue.supi = Some(supi.to_string());
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_publish(&stored.amf_ue, 51, 1);
+        }
+        ngap.ue_auth_state.insert(ue, stored);
+        let reports = |resp: &nextgcore_sbi::SbiResponse| -> Vec<serde_json::Value> {
+            let v: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).expect("JSON");
+            v["reportList"].as_array().cloned().unwrap_or_default()
+        };
+
+        let before = reach();
+        let (sub, resp) = subscribe_reachability(supi, 9, None, true).await;
+        let list = reports(&resp);
+        assert_eq!(list.len(), 1, "{list:?}");
+        assert_eq!(
+            list[0]["reachability"], "REACHABLE",
+            "idle within the timer"
+        );
+        assert_eq!(reach() - before, 0, "not notified as well");
+        drop(sub);
+
+        // Past the mobile reachable timer.
+        ngap.ue_auth_state.with_mut(ue, |s| {
+            s.reachability = Some(Reachability {
+                phase: ReachabilityPhase::MobileReachable,
+                deadline: Instant::now(),
+            });
+        });
+        ngap.process_reachability_timers().await.expect("timers");
+        let (sub, resp) = subscribe_reachability(supi, 9, None, true).await;
+        assert_eq!(reports(&resp)[0]["reachability"], "UNREACHABLE");
+        drop(sub);
+        let before = reach();
+        let (sub, resp) =
+            subscribe_reachability(supi, 9, Some("UE_REACHABLE_DL_TRAFFIC"), true).await;
+        assert!(
+            reports(&resp).is_empty(),
+            "DL traffic: nothing while unreachable"
+        );
+        let (sub2, _) =
+            subscribe_reachability(supi, 9, Some("UE_REACHABLE_DL_TRAFFIC"), false).await;
+        assert_eq!(reach() - before, 0, "and nothing notified");
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).expect("JSON");
+        assert_eq!(
+            v["subscription"]["eventList"][0]["reachabilityFilter"], "UE_REACHABLE_DL_TRAFFIC",
+            "the filter is echoed"
+        );
+        // A PATCH replacing the eventList carries its own filter.
+        let sub_id = v["subscriptionId"].as_str().expect("id").to_string();
+        let patch = serde_json::json!([{
+            "op": "replace",
+            "path": "/subscription/eventList",
+            "value": [{ "type": "REACHABILITY_REPORT" }],
+        }]);
+        let resp = crate::namf_server::namf_request_handler(
+            nextgcore_sbi::SbiRequest::patch(format!("/namf-evts/v1/subscriptions/{sub_id}"))
+                .with_json_body(&patch)
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        let stored = crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .event_subscription_find(&sub_id)
+            .expect("stored");
+        assert!(
+            !stored.reachable_for_dl_traffic(),
+            "the PATCH dropped the filter"
+        );
+        drop((sub, sub2));
+
+        // Released again: the mobile reachable timer restarts, and the UE is
+        // REACHABLE once more.
+        ngap.start_reachability_supervision(ue).await;
+        let (sub, resp) = subscribe_reachability(supi, 9, None, true).await;
+        assert_eq!(
+            reports(&resp)[0]["reachability"],
+            "REACHABLE",
+            "the timer restarted"
+        );
+        drop(sub);
+        ngap.ue_auth_state.remove(ue);
+    }
+
+    /// **#1641 review (M2)**, TS 29.518 §5.3.1 (`29518-k00.txt:5055-5057`): after the
+    /// mobile reachable timer expired (UNREACHABLE) and the UE was implicitly
+    /// deregistered, its next initial registration is a change back to REACHABLE, which
+    /// the status-change subscriber hears at the Registration Accept. A repeated Accept
+    /// is no further change.
+    #[tokio::test]
+    async fn an_initial_registration_after_unreachable_reports_reachable_1641() {
+        let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _guamis = serve_only_local_guami();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let reach = crate::namf_server::reachability_reports_on_this_thread;
+        let mut ngap = capturing_ngap_server().await;
+        let (idle_id, back) = (16_410_201u64, 16_410_202u64);
+        let supi = "imsi-001010001641201";
+        let mut stored = idle_registered_ue(idle_id);
+        stored.amf_ue.supi = Some(supi.to_string());
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_publish(&stored.amf_ue, 51, 1);
+        }
+        ngap.ue_auth_state.insert(idle_id, stored);
+        let (sink, port, mut rx) = notify_sink().await;
+        let (sub, _) = subscribe_reachability(supi, port, None, false).await;
+        assert_eq!(next_reachability(&mut rx).await, "REACHABLE");
+        // And a "UE Reachable for DL Traffic" subscriber, which hears REACHABLE on each
+        // transition to CM-CONNECTED, so once per registration and not per Accept.
+        let (dl_sink, dl_port, mut dl_rx) = notify_sink().await;
+        let (dl_sub, _) =
+            subscribe_reachability(supi, dl_port, Some("UE_REACHABLE_DL_TRAFFIC"), false).await;
+        assert_eq!(next_reachability(&mut dl_rx).await, "REACHABLE");
+
+        // The mobile reachable timer, then the implicit deregistration timer, expire.
+        for _ in 0..2 {
+            ngap.ue_auth_state.with_mut(idle_id, |s| {
+                if let Some(r) = s.reachability.as_mut() {
+                    r.deadline = Instant::now();
+                }
+            });
+            ngap.process_reachability_timers().await.expect("timers");
+        }
+        assert_eq!(next_reachability(&mut rx).await, "UNREACHABLE");
+        assert!(
+            !ngap.ue_auth_state.contains(idle_id),
+            "implicitly deregistered"
+        );
+
+        // Back with an initial registration: its Accept.
+        let mut ue = UeNasContext::new(back, 55, 1, false);
+        ue.amf_ue.supi = Some(supi.to_string());
+        ue.amf_ue.security_context_available = true;
+        ue.amf_ue.allowed_nssai = vec![crate::context::SNssai { sst: 1, sd: None }];
+        ngap.ue_auth_state.insert(back, ue);
+        let before = reach();
+        ngap.send_registration_accept(1, back, 55)
+            .await
+            .expect("accepted");
+        assert_eq!(
+            reach() - before,
+            2,
+            "REACHABLE, a change from UNREACHABLE, and the DL-traffic one's"
+        );
+        assert_eq!(next_reachability(&mut rx).await, "REACHABLE");
+        assert_eq!(next_reachability(&mut dl_rx).await, "REACHABLE");
+        let before = reach();
+        ngap.send_registration_accept(1, back, 55)
+            .await
+            .expect("accepted");
+        assert_eq!(reach() - before, 0, "a repeated Accept changes nothing");
+        ngap.ue_auth_state.remove(back);
+        drop((sub, dl_sub));
+        sink.stop().await.expect("sink stop");
+        dl_sink.stop().await.expect("sink stop");
+    }
+
+    /// **#1641 review (m4)**: a deregistered record is UNREACHABLE. No report says so to
+    /// an existing subscriber (§5.3.1 names no deregistration trigger); a subscription
+    /// created for it gets UNREACHABLE first.
+    #[test]
+    fn a_deregistered_record_is_unreachable_1641() {
+        let mut ue = UeNasContext::new(16_410_301, 55, 0, false);
+        ue.cm_idle = true;
+        ue.registered = true;
+        assert_eq!(
+            ue.reachability_state(),
+            "REACHABLE",
+            "idle within the timer"
+        );
+        ue.registered = false;
+        assert_eq!(ue.reachability_state(), "UNREACHABLE", "deregistered");
+        ue.registered = true;
+        ue.mobile_reachable_expired = true;
+        assert_eq!(ue.reachability_state(), "UNREACHABLE", "past the timer");
+        ue.cm_idle = false;
+        ue.association_id = 1;
+        assert_eq!(ue.reachability_state(), "REACHABLE", "connected");
+    }
+
+    /// **#1641 review (m1, m5)**: a subscription keyed by GPSI alone gets its first
+    /// report, and a state that changed between the first report and the store is
+    /// reported once the subscription is stored.
+    #[tokio::test]
+    async fn the_first_report_follows_a_change_before_the_store_1641() {
+        let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let ngap = capturing_ngap_server().await;
+        let ue_id = 16_410_401u64;
+        let (supi, gpsi) = ("imsi-001010001641401", "msisdn-491641401");
+        let mut stored = idle_registered_ue(ue_id);
+        stored.amf_ue.supi = Some(supi.to_string());
+        stored.amf_ue.gpsi = Some(gpsi.to_string());
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_publish(&stored.amf_ue, 51, 1);
+        }
+        ngap.ue_auth_state.insert(ue_id, stored);
+        let (sink, port, mut rx) = notify_sink().await;
+        let resp = crate::namf_server::namf_request_handler(
+            nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&serde_json::json!({ "subscription": {
+                    "eventList": [{ "type": "REACHABILITY_REPORT" }],
+                    "eventNotifyUri": format!("http://127.0.0.1:{port}/notify/1641"),
+                    "notifyCorrelationId": "corr-1641-gpsi",
+                    "nfId": "3fa85f64-5717-4562-b3fc-2c963f661641",
+                    "gpsi": gpsi,
+                }}))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let gpsi_sub = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        assert_eq!(next_reachability(&mut rx).await, "REACHABLE", "by GPSI too");
+
+        // The window: a first report of REACHABLE decided, then the timer expires
+        // before the subscription is stored.
+        let mut sub = crate::context::EventSubscription {
+            subscription_id: "sub-1641-window".to_string(),
+            notify_uri: format!("http://127.0.0.1:{port}/notify/1641"),
+            notify_correlation_id: "corr-1641-window".to_string(),
+            nf_id: "nf".to_string(),
+            event_types: vec!["REACHABILITY_REPORT".to_string()],
+            supi: Some(supi.to_string()),
+            gpsi: None,
+            pei: None,
+            group_id: None,
+            any_ue: false,
+            expiry: None,
+            subs_change_notify_uri: None,
+            subs_change_notify_correlation_id: None,
+            areas: Vec::new(),
+            reported_presence: std::collections::HashMap::new(),
+            reachability_filter: None,
+            reported_reachability: std::collections::HashMap::new(),
+            reporting_threshold: None,
+            location_filters: Vec::new(),
+        };
+        let immediate =
+            [serde_json::json!({ "type": "REACHABILITY_REPORT", "reachability": "REACHABLE" })];
+        let first =
+            crate::namf_server::first_reachability_report(&mut sub, true, Some(supi), &immediate)
+                .expect("decided");
+        ngap.ue_auth_state
+            .with_mut(ue_id, |s| s.mobile_reachable_expired = true);
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            assert!(guard.event_subscription_add(sub.clone()));
+        }
+        first.deliver_and_recheck(&sub);
+        assert_eq!(
+            next_reachability(&mut rx).await,
+            "UNREACHABLE",
+            "the change is reported"
+        );
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.event_subscription_remove("sub-1641-window");
+        }
+        ngap.ue_auth_state.remove(ue_id);
+        drop(gpsi_sub);
+        sink.stop().await.expect("sink stop");
+    }
+
+    /// **#1641 review (m2, m3, m6)**:
+    /// - a PATCH write-back keeps the reachability the store recorded (m2);
+    /// - a UE that connected after its timer expired is REACHABLE when idle again,
+    ///   even with no mobile reachable timer re-armed (m3);
+    /// - the per-UE record of one subscription is bounded (m6).
+    #[tokio::test]
+    async fn the_reported_reachability_is_kept_bounded_and_cleared_1641() {
+        let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK.lock().await;
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _guamis = serve_only_local_guami();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let ctx = crate::context::amf_self();
+
+        // m2 and m6, on one stored subscription.
+        let (guard, resp) = subscribe_reachability("imsi-001010001641501", 9, None, false).await;
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).expect("JSON");
+        let id = v["subscriptionId"].as_str().expect("id").to_string();
+        let stale = ctx
+            .read()
+            .expect("ctx")
+            .event_subscription_find(&id)
+            .expect("stored");
+        assert!(ctx
+            .read()
+            .expect("ctx")
+            .event_subscription_record_reachability(&id, "imsi-x", "UNREACHABLE"));
+        assert!(ctx.read().expect("ctx").event_subscription_update(stale));
+        let kept = ctx
+            .read()
+            .expect("ctx")
+            .event_subscription_find(&id)
+            .expect("stored");
+        assert_eq!(
+            kept.reported_reachability.get("imsi-x").map(String::as_str),
+            Some("UNREACHABLE"),
+            "the write-back of a stale clone keeps what the store recorded"
+        );
+        for n in 0..crate::context::MAX_REPORTED_REACHABILITY {
+            ctx.read()
+                .expect("ctx")
+                .event_subscription_record_reachability(&id, &format!("imsi-{n}"), "REACHABLE");
+        }
+        let full = ctx
+            .read()
+            .expect("ctx")
+            .event_subscription_find(&id)
+            .expect("stored");
+        assert_eq!(
+            full.reported_reachability.len(),
+            crate::context::MAX_REPORTED_REACHABILITY,
+            "bounded"
+        );
+        drop(guard);
+
+        // m3: past the timer, back with a Service Request, released again with no
+        // mobile reachable timer configured.
+        let mut ngap = capturing_ngap_server().await;
+        let (old, new) = (16_410_511u64, 16_410_512u64);
+        let supi = "imsi-001010001641511";
+        let mut stored = idle_registered_ue(old);
+        stored.amf_ue.supi = Some(supi.to_string());
+        stored.amf_ue.allowed_nssai = vec![crate::context::SNssai { sst: 1, sd: None }];
+        stored.mobile_reachable_expired = true;
+        ctx.read()
+            .expect("ctx")
+            .amf_ue_publish(&stored.amf_ue, 51, 1);
+        ngap.ue_auth_state.insert(old, stored);
+        ngap.forced_amf_ue_ngap_id = Some(new);
+        let _ = ngap
+            .handle_initial_ue_message(
+                1,
+                &service_request_initial_ue(protected_service_request([0; 4], old as u32)),
+            )
+            .await;
+        assert!(
+            ngap.ue_auth_state.get(new).is_some(),
+            "back on a new connection"
+        );
+        ngap.ue_auth_state.with_mut(new, |s| s.cm_idle = true);
+        let (sub, resp) = subscribe_reachability(supi, 9, None, true).await;
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).expect("JSON");
+        assert_eq!(
+            v["reportList"][0]["reachability"], "REACHABLE",
+            "the expiry is over once the UE connected"
+        );
+        drop(sub);
+        ngap.forced_amf_ue_ngap_id = None;
+        ngap.ue_auth_state.remove(new);
     }
 
     /// **#1424**: [`NgapServer::report_location_change`] measures each dimension from
@@ -41167,6 +41777,8 @@ mod tests {
                 // non-area-scoped event type, so there is nothing to be present IN.
                 areas: Vec::new(),
                 reported_presence: std::collections::HashMap::new(),
+                reachability_filter: None,
+                reported_reachability: std::collections::HashMap::new(),
                 reporting_threshold: None,
                 location_filters: Vec::new(),
             });
@@ -41294,6 +41906,8 @@ mod tests {
                 // non-area-scoped event type, so there is nothing to be present IN.
                 areas: Vec::new(),
                 reported_presence: std::collections::HashMap::new(),
+                reachability_filter: None,
+                reported_reachability: std::collections::HashMap::new(),
                 reporting_threshold: None,
                 location_filters: Vec::new(),
             });
