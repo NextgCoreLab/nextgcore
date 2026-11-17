@@ -1362,6 +1362,20 @@ fn enforce_oauth2_on_request(
 /// is the `sub` of an NRF-issued token whose signature verified (the consumer's
 /// NF Instance ID, TS 29.510 §6.3.5.2.4 `AccessTokenClaims`); `Ok(None)` means no
 /// token was required here.
+///
+/// #1634: a verified signature is not enough. The token must also be FOR this
+/// API on this NRF (TS 33.501 §13.4.1.1, TS 29.500 §6.7.3):
+/// - `scope` must contain the invoked service name (`nnrf-nfm` / `nnrf-disc`):
+///   TS 29.500 §6.7.3 makes the service-name scope part of every access scope,
+///   and TS 29.510 Table 6.1.8-1 defines `nnrf-nfm` for the Nnrf_NFManagement API.
+///   Otherwise 403, `WWW-Authenticate: Bearer error="insufficient_scope"`.
+/// - `aud` must name this NRF: its NF type `NRF` or its NF Instance ID (TS 29.510
+///   §6.3.5.2.4). A token minted for another producer is a claims mismatch: 403
+///   `ACCESS_TOKEN_CLAIM_MISMATCH`, `error="invalid_token"`.
+///
+/// Before, a token issued for any service of any producer (say an
+/// nsmf-pdusession token a peer obtained legitimately) was accepted here, and,
+/// since #1611, its `sub` then stood for the caller's identity.
 fn oauth2_gate(
     path: &str,
     auth_header: Option<&str>,
@@ -1371,15 +1385,68 @@ fn oauth2_gate(
     if !require || !oauth2_protected_path(path) {
         return Ok(None);
     }
-    match nextgcore_sbi::oauth::authorize_bearer(auth_header, jwks) {
-        Ok(claims) => Ok(Some(claims.sub)),
-        Err(e) => Err(Box::new(send_error(
-            401,
-            "Unauthorized",
-            &format!("OAuth2 access token required: {e}"),
-            Some("UNAUTHORIZED"),
-        ))),
+    let service = path
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    let realm = format!("{}/{service}/v1", nrf_self_uri());
+    let challenge = |error: Option<&str>, scope: Option<&str>| {
+        let mut c = format!("Bearer realm=\"{realm}\"");
+        if let Some(e) = error {
+            c.push_str(&format!(", error=\"{e}\""));
+        }
+        if let Some(s) = scope {
+            c.push_str(&format!(", scope=\"{s}\""));
+        }
+        c
+    };
+    let refuse = |status: u16, title: &str, detail: String, cause: &str, www: String| {
+        Box::new(
+            send_error(status, title, &detail, Some(cause)).with_header("WWW-Authenticate", www),
+        )
+    };
+    let claims = match nextgcore_sbi::oauth::authorize_bearer(auth_header, jwks) {
+        Ok(claims) => claims,
+        Err(e) => {
+            // TS 29.500 §6.7.3: no `error` when the request carried no token.
+            let presented = auth_header.is_some_and(|h| !h.trim().is_empty());
+            return Err(refuse(
+                401,
+                "Unauthorized",
+                format!("OAuth2 access token required: {e}"),
+                "UNAUTHORIZED",
+                challenge(presented.then_some("invalid_token"), None),
+            ));
+        }
+    };
+    let for_this_nrf = |aud: &str| aud == "NRF" || aud.eq_ignore_ascii_case(nrf_instance_id());
+    let aud_ok = match &claims.aud {
+        serde_json::Value::String(a) => for_this_nrf(a),
+        serde_json::Value::Array(items) => {
+            items.iter().filter_map(|v| v.as_str()).any(for_this_nrf)
+        }
+        _ => false,
+    };
+    if !aud_ok {
+        return Err(refuse(
+            403,
+            "Forbidden",
+            format!("the access token's audience {} is not this NRF", claims.aud),
+            "ACCESS_TOKEN_CLAIM_MISMATCH",
+            challenge(Some("invalid_token"), None),
+        ));
     }
+    if nextgcore_sbi::oauth::check_token_scope(&claims.scope, service).is_err() {
+        return Err(refuse(
+            403,
+            "Forbidden",
+            format!("the access token's scope does not include {service}"),
+            "INSUFFICIENT_SCOPE",
+            challenge(Some("insufficient_scope"), Some(service)),
+        ));
+    }
+    Ok(Some(claims.sub))
 }
 
 /// SBI request handler for NRF
@@ -8123,8 +8190,24 @@ mod tests {
     // nrfd-06: per-path server-side OAuth2 enforcement (TS 33.501 §13.4.1)
     // -----------------------------------------------------------------
 
-    /// Mint an NRF-signed ES256 access token (as the token endpoint does).
+    /// Mint an NRF-signed ES256 access token (as the token endpoint does), with
+    /// scope `nnrf-nfm nnrf-disc` (#1634).
     fn mint_nrf_token(sub: &str, aud: &str, exp_offset: i64) -> String {
+        mint_nrf_token_with(
+            sub,
+            &serde_json::json!(aud),
+            "nnrf-nfm nnrf-disc",
+            exp_offset,
+        )
+    }
+
+    /// [`mint_nrf_token`] with any `aud` and `scope`.
+    fn mint_nrf_token_with(
+        sub: &str,
+        aud: &serde_json::Value,
+        scope: &str,
+        exp_offset: i64,
+    ) -> String {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
         use p256::ecdsa::{signature::Signer, Signature};
@@ -8134,7 +8217,7 @@ mod tests {
             .as_secs() as i64;
         let header = format!(r#"{{"alg":"ES256","typ":"JWT","kid":"{NRF_KID}"}}"#);
         let claims = serde_json::json!({
-            "iss": nrf_instance_id(), "sub": sub, "aud": aud, "scope": "x",
+            "iss": nrf_instance_id(), "sub": sub, "aud": aud, "scope": scope,
             "exp": (now + exp_offset) as u64, "iat": now as u64,
         });
         let h = URL_SAFE_NO_PAD.encode(header.as_bytes());
@@ -8171,6 +8254,98 @@ mod tests {
             "not required: nothing verified, nothing recorded"
         );
         assert!(oauth2_gate("/nnrf-nfm/v1/nf-instances/x", None, true, &jwks).is_err());
+    }
+
+    /// #1634: the gate accepts only a token for this API on this NRF.
+    /// - Accepted: scope naming the invoked service, aud `NRF` or this NRF's instance
+    ///   ID (also inside an array, and in another case).
+    /// - 403 insufficient_scope (with the required scope in the challenge): another
+    ///   service's scope, or `nnrf-disc` only on nnrf-nfm, or a scope that merely
+    ///   starts with the service name.
+    /// - 403 ACCESS_TOKEN_CLAIM_MISMATCH / invalid_token: aud of another NF type or
+    ///   instance.
+    /// - 401: no token (challenge without `error`), a forged token (`invalid_token`).
+    ///
+    /// REVERT-VERIFIED: without the scope check the foreign-scope tokens pass; without
+    /// the audience check the foreign-audience tokens pass.
+    #[test]
+    fn the_oauth2_gate_requires_this_api_s_scope_and_this_nrf_as_audience_1634() {
+        use serde_json::json;
+        let jwks = nrf_jwks_json();
+        let nfm = "/nnrf-nfm/v1/nf-instances/x";
+        let gate = |path: &str, token: Option<String>| {
+            let auth = token.map(|t| format!("Bearer {t}"));
+            oauth2_gate(path, auth.as_deref(), true, &jwks)
+        };
+        let tok = |aud: serde_json::Value, scope: &str| {
+            Some(mint_nrf_token_with("nf-1634", &aud, scope, 3600))
+        };
+        let www = |r: &SbiResponse| {
+            r.http
+                .get_header("WWW-Authenticate")
+                .cloned()
+                .unwrap_or_default()
+        };
+        let cause = |r: &SbiResponse| {
+            serde_json::from_str::<serde_json::Value>(r.http.content.as_deref().unwrap_or("{}"))
+                .unwrap_or_default()["cause"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        for (aud, scope) in [
+            (json!("NRF"), "nnrf-nfm"),
+            (json!(nrf_instance_id()), "nnrf-disc nnrf-nfm"),
+            (
+                json!(["AMF", nrf_instance_id().to_ascii_uppercase()]),
+                "nnrf-nfm",
+            ),
+        ] {
+            assert_eq!(
+                gate(nfm, tok(aud.clone(), scope)).ok().flatten().as_deref(),
+                Some("nf-1634"),
+                "{aud} {scope}"
+            );
+        }
+        assert!(gate("/nnrf-disc/v1/nf-instances", tok(json!("NRF"), "nnrf-disc")).is_ok());
+
+        for (path, scope) in [
+            (nfm, "nsmf-pdusession"),
+            (nfm, "nnrf-disc"),
+            (nfm, "nnrf-nfmx"),
+            (nfm, ""),
+            ("/nnrf-disc/v1/nf-instances", "nnrf-nfm"),
+        ] {
+            let r = *gate(path, tok(json!("NRF"), scope)).expect_err(scope);
+            assert_eq!(r.status, 403, "{path} {scope:?}");
+            assert_eq!(cause(&r), "INSUFFICIENT_SCOPE");
+            assert!(
+                www(&r).contains("error=\"insufficient_scope\""),
+                "{}",
+                www(&r)
+            );
+            let service = path.split('/').nth(1).unwrap();
+            assert!(
+                www(&r).contains(&format!("scope=\"{service}\"")),
+                "{}",
+                www(&r)
+            );
+        }
+
+        for aud in [json!("SMF"), json!(["smf-instance-1"]), json!(42)] {
+            let r = *gate(nfm, tok(aud.clone(), "nnrf-nfm")).expect_err("aud");
+            assert_eq!(r.status, 403, "{aud}");
+            assert_eq!(cause(&r), "ACCESS_TOKEN_CLAIM_MISMATCH");
+            assert!(www(&r).contains("error=\"invalid_token\""));
+        }
+
+        let r = *gate(nfm, None).expect_err("no token");
+        assert_eq!(r.status, 401);
+        assert!(www(&r).starts_with("Bearer realm=") && !www(&r).contains("error="));
+        let r = *gate(nfm, Some("e30.e30.AAAA".to_string())).expect_err("forged");
+        assert_eq!(r.status, 401);
+        assert!(www(&r).contains("error=\"invalid_token\""));
     }
 
     #[test]
