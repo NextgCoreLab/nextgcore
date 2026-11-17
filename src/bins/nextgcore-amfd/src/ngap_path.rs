@@ -2055,6 +2055,11 @@ impl NgapServer {
             if dropped > 0 {
                 log::info!("Dropped {dropped} orphaned per-session entries (#756)");
             }
+            // #1692: the 5G-TMSI registry's release point.
+            let released = self.sweep_tmsi_registry(Instant::now());
+            if released > 0 {
+                log::debug!("Released {released} 5G-TMSI(s) no UE has held for the grace (#1692)");
+            }
         }
 
         // #686: store what changed in the stable UE contexts (at most once a second,
@@ -14610,6 +14615,24 @@ impl NgapServer {
         if let Some(sess) = guard.sess_find_by_psi(amf_ue_ngap_id, psi) {
             guard.sess_remove(sess.id);
         }
+    }
+
+    /// The 5G-TMSIs the live UE records hold, as `current_guti` or `next_guti`
+    /// (#1692).
+    fn live_tmsis(&self) -> std::collections::HashSet<u32> {
+        self.ue_auth_state
+            .snapshot()
+            .iter()
+            .flat_map(|(_, s)| [s.amf_ue.current_guti.tmsi, s.amf_ue.next_guti.tmsi])
+            .filter(|t| *t != 0)
+            .collect()
+    }
+
+    /// #1692: refresh the 5G-TMSI registry from the live records and release what
+    /// none has held for [`crate::context::TMSI_RELEASE_GRACE`]
+    /// ([`crate::context::tmsi_registry_sweep`]). Returns how many were released.
+    fn sweep_tmsi_registry(&self, now: Instant) -> usize {
+        crate::context::tmsi_registry_sweep(&self.live_tmsis(), now)
     }
 
     /// Backstop sweep for per-session state whose end this task never sees (#756).
@@ -43027,6 +43050,60 @@ mod tests {
                 ngap.ue_auth_state.remove(id);
             }
         }
+    }
+
+    /// **#1692**, TS 23.003 §2.10.1: the NGAP task's registry sweep holds every
+    /// 5G-TMSI a live record holds (here one that was never allocated by this
+    /// process, as after a takeover), so an allocation cannot hand it out;
+    /// `generate_new_guti` under `ue_auth_state.with_mut` (the store's write lock)
+    /// allocates through the registry without re-entering the store; and once the
+    /// record is gone its values are released one grace later.
+    ///
+    /// REVERT-VERIFIED: with `live_tmsis` returning nothing, the live record's value
+    /// is drawn again; with `generate_new_guti` back on `generate_random_tmsi`, the
+    /// new `next_guti` is not held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_registry_sweep_holds_every_live_5g_tmsi_1692() {
+        let _registry = crate::context::TMSI_REGISTRY_TEST_LOCK.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let ngap = test_ngap_server().await;
+        let (id, live) = (16_920_001u64, 0x1692_0301u32);
+        let mut ue = UeNasContext::new(id, 1, 1, false);
+        ue.registered = true;
+        ue.amf_ue.current_guti.tmsi = live;
+        ngap.ue_auth_state.insert(id, ue);
+
+        let t0 = Instant::now();
+        ngap.sweep_tmsi_registry(t0);
+        assert!(crate::context::tmsi_registry_holds(live));
+        let mut draws = [live, 0x1692_0302].into_iter();
+        assert_eq!(
+            crate::context::allocate_unique_tmsi_from(|| draws.next().expect("a draw"), t0),
+            0x1692_0302
+        );
+
+        let next = ngap
+            .ue_auth_state
+            .with_mut(id, |s| {
+                s.amf_ue.generate_new_guti();
+                s.amf_ue.next_guti.tmsi
+            })
+            .expect("the record");
+        assert_ne!(next, live);
+        assert!(
+            crate::context::tmsi_registry_holds(next),
+            "allocated under the store's lock, through the registry"
+        );
+
+        // The UE is gone: both values are released one grace after the last sweep
+        // that saw them, not before.
+        ngap.ue_auth_state.remove(id);
+        let grace = crate::context::TMSI_RELEASE_GRACE;
+        ngap.sweep_tmsi_registry(t0 + grace);
+        assert!(crate::context::tmsi_registry_holds(live));
+        ngap.sweep_tmsi_registry(t0 + grace + Duration::from_secs(1));
+        assert!(!crate::context::tmsi_registry_holds(live));
+        assert!(!crate::context::tmsi_registry_holds(next));
     }
 
     /// **#923.** The gNB asks for a UE's release; the AMF's UE Context Release
