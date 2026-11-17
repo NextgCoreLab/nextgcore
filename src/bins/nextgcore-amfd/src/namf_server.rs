@@ -7454,8 +7454,8 @@ mod tests {
     }
 
     /// [`setup_ue`]; `tokens == false` is a UE context restored from a record
-    /// written before #1518 whose policy associations still hold the token-less
-    /// URIs (its key was minted on arrival, as `restored_ue` does).
+    /// written before #1518: marked, with no key and no tokens (as `restored_ue`
+    /// restores one).
     fn setup_ue_with_tokens(supi: &str, connected: bool, security: bool, tokens: bool) -> AmfUe {
         amf_context_init(64, 1024, 4096);
         let ctx = amf_self();
@@ -7479,6 +7479,7 @@ mod tests {
             ue.ue_policy_association.notify_token = Some(format!("uep-{supi}"));
         } else {
             ue.pre_1518_callbacks = true;
+            ue.sm_context_status_key = None;
         }
         if connected {
             guard.amf_ue_associate_ran_ue(ue.id, ran_ue.id);
@@ -9749,10 +9750,9 @@ mod tests {
         assert!(!sess_held(), "the session's token released it");
         let _ = sess;
 
-        // A UE context restored from before #1518: its policy associations' peers
-        // hold the token-less URIs, which are served for it until the restore update
-        // re-issues them. Its SM context status URIs are re-issued at restore, so
-        // the token-less one is not served even for it.
+        // A UE context restored from before #1518 (marked, no key, no tokens): its
+        // peers hold the token-less URIs, which are served for it, and no tokened
+        // URI names it.
         let old = "imsi-001010000015185";
         let old_ue = setup_ue_with_tokens(old, true, true, false);
         let _old_sess = setup_sess(&old_ue, 5);
@@ -9770,7 +9770,7 @@ mod tests {
             (
                 format!("/namf-callback/v1/{old}/sm-context-status/5"),
                 released.clone(),
-                404,
+                204,
             ),
             (
                 format!("/namf-callback/v1/{old}/am-policy-notify/amp-{old}/update"),

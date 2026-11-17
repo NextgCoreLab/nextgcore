@@ -1071,6 +1071,76 @@ async fn the_sweep_writes_changes_only_and_deletes_ues_no_longer_held() {
     assert!(backend.inner.get(supi).is_none(), "deleted");
 }
 
+/// #1518 (#1625 review M-1, m-1): a record written before #1518 (no
+/// `callback_tokens`, no key, untokened associations) restores marked, with no key,
+/// so its peers' token-less URIs are served for it alone; a rewrite of the record
+/// keeps the marker; and the encoding without the new members still decodes. A
+/// record written since restores unmarked, with its key. Database-free: the
+/// in-memory backend.
+///
+/// REVERT-VERIFIED: forcing `pre_1518_callbacks = false` on restore, or writing
+/// `callback_tokens: true` unconditionally, fails this.
+#[tokio::test]
+async fn a_pre_1518_record_restores_marked_and_keeps_its_marker_1518() {
+    crate::context::amf_context_init(64, 1024, 4096);
+    let backend = Arc::new(MemoryBackend::default());
+    let (id, tmsi, supi) = (6_861_518u64, 0x0686_1518u32, "imsi-001010000615181");
+    let mut before = storing_server(&backend).await;
+    seed_registered_ue(&mut before, id, tmsi, supi, "ref-1518", 7777, false);
+    store_now(&mut before).await;
+    let written = backend.get(supi).expect("stored");
+    assert!(
+        written.callback_tokens,
+        "a record written since #1518 is marked so"
+    );
+    assert!(written.sm_context_status_key.is_some());
+    crash(&mut before, id);
+    drop(before);
+
+    // The record as an AMF before #1518 wrote it, through the old encoding.
+    let mut doc = serde_json::to_value(&written).expect("encodes");
+    let obj = doc.as_object_mut().expect("object");
+    obj.remove("callback_tokens");
+    obj.remove("sm_context_status_key");
+    for assoc in ["policy_association", "ue_policy_association"] {
+        obj[assoc]
+            .as_object_mut()
+            .expect("assoc")
+            .remove("notify_token");
+    }
+    let old: StoredUeContext = serde_json::from_value(doc).expect("the old encoding decodes");
+    assert!(!old.callback_tokens && old.sm_context_status_key.is_none());
+
+    let alone = Arc::new(MemoryBackend::default());
+    alone.put(&old).expect("put");
+    let mut after = storing_server(&alone).await;
+    open_with(&mut after, Arc::clone(&alone) as Arc<dyn UeContextBackend>).await;
+    let (_, restored) = after.ue_auth_state.find_by_supi(supi).expect("restored");
+    assert!(restored.amf_ue.pre_1518_callbacks, "restored marked");
+    assert!(
+        restored.amf_ue.sm_context_status_key.is_none(),
+        "no key minted"
+    );
+    assert!(restored.amf_ue.policy_association.notify_token.is_none());
+
+    // m-1: a rewrite before the UE is moved over keeps the marker.
+    store_now(&mut after).await;
+    let rewritten = alone.get(supi).expect("rewritten");
+    assert!(
+        !rewritten.callback_tokens,
+        "the rewrite keeps the pre-#1518 marker"
+    );
+    assert!(rewritten.sm_context_status_key.is_none());
+
+    // A record written since #1518 restores unmarked, with its key.
+    let new = super::super::ue_context_store::restored_ue_for_tests(9, &written).expect("restores");
+    assert!(!new.amf_ue.pre_1518_callbacks);
+    assert_eq!(
+        new.amf_ue.sm_context_status_key,
+        written.sm_context_status_key
+    );
+}
+
 /// **#686.** Only this AMF instance's records of the current format, whose 5G-GUTI this
 /// AMF serves and whose SUPI it does not already hold, are restored. A record
 /// written by another AMF instance waits for the AMF Set takeover (TS 23.501 §5.21.2.3),
@@ -1249,30 +1319,6 @@ fn the_mongodb_backend_stores_loads_and_deletes() {
         sessions: Vec::new(),
         cm_connected: false,
     };
-    // #1518: a record from before #1518 (no `callback_tokens`) restores with a key
-    // minted on arrival and marked pre-#1518, so only its untokened policy
-    // associations keep their token-less URIs; a record written since restores
-    // unmarked, with its key.
-    {
-        let old = super::super::ue_context_store::restored_ue_for_tests(7, &rec).expect("restores");
-        assert!(old.amf_ue.pre_1518_callbacks);
-        assert!(
-            old.amf_ue.sm_context_status_key.is_some(),
-            "a key on arrival"
-        );
-        let mut new = rec.clone();
-        new.callback_tokens = true;
-        new.sm_context_status_key = Some("k-1518".to_string());
-        let new = super::super::ue_context_store::restored_ue_for_tests(8, &new).expect("restores");
-        assert!(!new.amf_ue.pre_1518_callbacks);
-        assert_eq!(new.amf_ue.sm_context_status_key.as_deref(), Some("k-1518"));
-        // And the old encoding, without the new members, still decodes.
-        let mut doc = mongodb::bson::to_document(&rec).expect("encodes");
-        doc.remove("callback_tokens");
-        doc.remove("sm_context_status_key");
-        let back: StoredUeContext = mongodb::bson::from_document(doc).expect("decodes");
-        assert!(!back.callback_tokens && back.sm_context_status_key.is_none());
-    }
     backend.put(&rec).expect("put");
     let mut changed = rec.clone();
     changed.security.dl_count = 0x0103;

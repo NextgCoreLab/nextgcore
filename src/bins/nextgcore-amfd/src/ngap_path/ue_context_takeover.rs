@@ -277,18 +277,6 @@ impl NgapServer {
                 if !taken_over && !peers_stale {
                     return None;
                 }
-                // #1518: the policy associations' notificationUris are re-issued below;
-                // one from before #1518 gets its token here, so the re-issued URI is
-                // tokened and the token-less one stops being served.
-                for assoc in [
-                    &mut s.amf_ue.policy_association,
-                    &mut s.amf_ue.ue_policy_association,
-                ] {
-                    if assoc.id.is_some() && assoc.notify_token.is_none() {
-                        assoc.notify_token = Some(crate::sbi_path::new_callback_token());
-                    }
-                }
-                s.amf_ue.pre_1518_callbacks = false;
                 // #1329: a restart restore keeps its GUAMI, so its 5G-GUTI stays; only
                 // the peers' callback addresses moved.
                 if !taken_over {
@@ -536,10 +524,11 @@ impl NgapServer {
         let (instance, amf_id_hex, guami_mcc, guami_mnc, serving_mcc, serving_mnc) =
             self.serving_identity(state);
         for (psi, sm_ref, host, port) in self.ue_sm_contexts(amf_ue_ngap_id) {
-            // #1518: this update re-issues the session's smContextStatusUri, tokened:
-            // a session that has no nonce yet (given the token-less URI, or recorded
-            // before #1518) gets one here, so the URI the SMF is given is one the
-            // handler serves.
+            // #1518: this update re-issues the session's smContextStatusUri. For a UE
+            // context with a key, a session that has no nonce yet gets one here, so
+            // the URI is tokened. A context restored from before #1518 has no key: its
+            // sessions keep the token-less URI, which is served for it, until #1642
+            // moves them over once the SMF has accepted the new URI.
             let nonce = state.amf_ue.sm_context_status_key.as_ref().and_then(|_| {
                 let ctx = crate::context::amf_self();
                 let guard = ctx.read().unwrap_or_else(|e| e.into_inner());

@@ -3719,13 +3719,15 @@ pub struct AmfUe {
     /// SMF of one session cannot notify about another. Minted with the UE context
     /// and kept for its life (persisted, restored on takeover), so a session's URI
     /// survives the UE's re-registrations. `None` only for a context restored from a
-    /// record written before #1518: its sessions' URIs carry no token, and it keeps
-    /// handing out token-less URIs, which are served only for such a context.
+    /// record written before #1518 (`pre_1518_callbacks`): its sessions' URIs carry
+    /// no token, and it keeps handing out token-less URIs, served only for it.
     pub sm_context_status_key: Option<String>,
-    /// #1518: this context was restored from a record written before #1518 and
-    /// has not been moved to tokened callback URIs yet. Only then is a token-less
-    /// callback URI served, and only for a callback whose token is still `None`.
-    /// `false` for every context created, transferred or adopted since.
+    /// #1518: this context was restored from a record written before #1518, whose
+    /// peers hold token-less callback URIs. Only then is a token-less URI served,
+    /// and only for a callback whose token is still `None`. Kept through every
+    /// rewrite of the record (`StoredUeContext.callback_tokens`). `false` for every
+    /// context created, transferred or adopted since. Moving such a context to
+    /// tokened URIs is #1642.
     pub pre_1518_callbacks: bool,
     /// NAS state
     pub nas: NasState,

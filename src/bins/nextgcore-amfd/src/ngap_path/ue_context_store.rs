@@ -746,7 +746,9 @@ impl NgapServer {
             assigned_ebis: ue.assigned_ebis.clone(),
             uecm_dereg_token: ue.uecm_dereg_token.clone(),
             sm_context_status_key: ue.sm_context_status_key.clone(),
-            callback_tokens: true,
+            // #1518: a context restored from before #1518 keeps its marker through
+            // every rewrite until it is moved to tokened URIs (#1625 review m-1).
+            callback_tokens: !ue.pre_1518_callbacks,
             sdm_subscription_id: state.sdm_subscription_id.clone(),
             policy_association: ue.policy_association.clone(),
             ue_policy_association: ue.ue_policy_association.clone(),
@@ -1110,14 +1112,10 @@ fn restored_ue(amf_ue_ngap_id: u64, rec: &StoredUeContext) -> Option<UeNasContex
     ue.ue_radio_capability_id_known_to_ue = rec.ue_radio_capability_id_known_to_ue;
     ue.assigned_ebis = rec.assigned_ebis.clone();
     ue.uecm_dereg_token = rec.uecm_dereg_token.clone();
-    // #1518: a record from before #1518 gets a key on arrival, and its sessions'
-    // smContextStatusUris are re-issued tokened by the restore or takeover update
-    // (`spawn_smf_serving_updates`); only its policy associations keep their
-    // token-less URIs until that update (`complete_takeover`).
-    ue.sm_context_status_key = rec
-        .sm_context_status_key
-        .clone()
-        .or_else(|| Some(crate::sbi_path::new_callback_token()));
+    // #1518: a record from before #1518 restores marked, with no key: its peers
+    // hold the token-less URIs, which are served for it alone. Moving it to tokened
+    // URIs, adopting each token once the peer accepted it, is #1642.
+    ue.sm_context_status_key = rec.sm_context_status_key.clone();
     ue.pre_1518_callbacks = !rec.callback_tokens;
     ue.policy_association = rec.policy_association.clone();
     ue.ue_policy_association = rec.ue_policy_association.clone();
