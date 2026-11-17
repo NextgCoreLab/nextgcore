@@ -2,7 +2,7 @@
 
 The NRF (Network Repository Function, `nextgcore-nrfd`) handles NF registration, discovery, status notifications, and acts as the OAuth2 Authorization Server for the SBI (per code comments citing 3GPP TS 29.510 and TS 33.501). It reads a YAML file whose path defaults to `/etc/nextgcore/nrf.yaml` (override with `-c/--config`).
 
-**Important:** the NRF's typed config (`NrfYaml` in `src/bins/nextgcore-nrfd/src/main.rs`) only parses the `nrf:` section. The `logger:`, `global:`, `nrf.serving:`, and `nrf.sbi.server:` blocks in the shipped example are accepted but **not consumed by nrfd** — listen address/port and TLS come from CLI flags instead (`--sbi-addr`, `--sbi-port`, `--tls`, `--tls-cert`, `--tls-key`, `--mtls`, `--tls-ca-cert`). If the file is absent or fails to parse, conservative built-in defaults apply and startup continues.
+**Important:** the NRF's typed config (`NrfYaml` in `src/bins/nextgcore-nrfd/src/main.rs`) only parses the `nrf:` section. The `logger:`, `global:` and `nrf.serving:` blocks in the shipped example are accepted but **not consumed by nrfd**. Of `nrf.sbi.server[0]`, nrfd reads `address`, `port` and `advertise` (#1311) and the `tls` block (#1617, below); the CLI flags (`--sbi-addr`, `--sbi-port`, `--tls`, `--tls-cert`, `--tls-key`, `--mtls`, `--tls-ca-cert`) win over them. An absent file means the built-in defaults; a file that cannot be read or parsed fails startup.
 
 ## Example (`docker/rust/configs/5gc/nrf.yaml`)
 
@@ -58,9 +58,28 @@ Defaults below are the real values from `NrfPolicy::default()` and its constants
 | `nrf.sbi.oauth2.cca_trusted_keys_dir` | path | none | Directory of `<nfInstanceId>.jwk` public keys, loaded at startup in addition to `cca_trusted_keys` (#187). Each consumer NF publishes its own key there when `NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR` names the directory (its private key lives in `NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE`, generated on first use). An absent or unreadable directory is not fatal; a CCA from an NF with no key is rejected. Pin each NF's identity with `NEXTGCORE_NF_INSTANCE_ID` or `NEXTGCORE_<TYPE>_INSTANCE_ID` so the key name is stable across restarts. |
 | `nrf.sbi.oauth2.cca_trust_anchors` | path | none | PEM file of CA certificates a CCA's `x5c` chain is validated against (TS 33.501 §13.3.8.2/§13.3.8.3, #393). Set: an `x5c` certificate is authoritative, must bind the NF Instance ID, and the key store is not consulted. Unset: a CCA carrying `x5c` is `invalid_client`; a CCA without `x5c` uses the trust store above. Consumers emit `x5c` when `NEXTGCORE_SBI_CCA_CERT_FILE` is set. |
 
+## SBI listener TLS (`nrf.sbi.server[0].tls`, #1617)
+
+nrfd has **one** SBI listener. With TLS on, it serves TLS and **requests** a client certificate but, by default, does not require one: a client that presents a certificate must chain to the configured CA or its handshake fails; a client without one (a discovery consumer, a probe) still connects. NFRegister / NFUpdate / NFDeregister are bound to the presented certificate's `urn:uuid:` URI SAN and RFC 9310 NFTypes (TS 33.310 §6.1.3c.3, TS 33.501 §13.1.0). A management request from a caller with no verified certificate identity is counted in `nrf_nf_management_unverified_total`; it is not refused yet (that is #1617 step f).
+
+Each setting comes from the command line, else the environment, else the YAML, else the default:
+
+| YAML (`nrf.sbi.server[0].tls.`) | Environment | Flag | Default | Meaning |
+|---|---|---|---|---|
+| `enabled` | `NEXTGCORE_NRF_SERVER_TLS` (`true`/`false`) | `--tls` (on only) | off (h2c) | TLS on the listener. A non-boolean value fails startup. |
+| `cert` | `NEXTGCORE_NRF_SERVER_TLS_CERT` | `--tls-cert` | `/etc/nextgcore/tls/server.crt` | The NRF's certificate. |
+| `key` | `NEXTGCORE_NRF_SERVER_TLS_KEY` | `--tls-key` | `/etc/nextgcore/tls/server.key` | Its private key. |
+| `ca` | `NEXTGCORE_NRF_SERVER_TLS_CA` | `--tls-ca-cert` | `/etc/nextgcore/tls/ca.crt` | The CA a client certificate must chain to. |
+| `client_auth` | `NEXTGCORE_NRF_SERVER_TLS_CLIENT_AUTH` | `--mtls` (= `required`) | `optional` | `optional` or `required`. `--mtls` wins; any other value fails startup. |
+| `min_version` | none | none | `"1.2"` | Only `"1.2"` (TLS 1.2 or 1.3 are negotiated); any other value fails startup rather than being ignored. |
+
+The three files must exist at startup, or nrfd exits naming the missing one. `--mtls` without TLS is an error. With TLS off and the SBI profile `production`, nrfd logs a WARN: NFs on that profile dial their NRF over https.
+
+**The NRF's own token client** (`nrf.sbi.oauth2.require: true`) dials the NRF's own listener. Under TLS it uses the NRF client TLS (`NEXTGCORE_NRF_TLS_*`, see the overview), and fills what those settings leave unset from the listener: the CA above as the trust anchor, the first DNS-ID of the NRF's own certificate as the server name (the self URI's address need not be in the certificate), and the NRF's own certificate as its client certificate, but only when that certificate's `urn:uuid:` names the NRF's nfInstanceId (else a WARN, and no client certificate).
+
 ## Parsed-but-inert / non-YAML settings
 
-- `logger`, `global.max.{ue,peer}`, `nrf.serving[].plmn_id`, and `nrf.sbi.server[]` (address, advertise, port, tls block) are present in the example YAML but ignored by nrfd's config structs. Equivalent runtime behavior comes from CLI flags: `--sbi-addr` (default `127.0.0.1`, loopback since #1308; the YAML address does not set it), `--sbi-port` (default `7777`), `--max-ue` (default `1024`), `--log-level` (default `info`), `--log-file`, and the TLS/mTLS flags.
+- `logger`, `global.max.{ue,peer}` and `nrf.serving[].plmn_id` are present in the example YAML but ignored by nrfd's config structs. Equivalent runtime behavior comes from CLI flags: `--max-ue` (default `1024`), `--log-level` (default `info`) and `--log-file`. The listen address (`--sbi-addr`, else `nrf.sbi.server[0].address`, else `127.0.0.1`, loopback since #1308), port (`--sbi-port`, else the YAML, else `7777`) and TLS (above) are read.
 - The token endpoint compares NF Instance IDs as the registry keys them (#1633): a UUID case-insensitively (TS 29.510 §5.2.2.2.2), any other ID exactly. This covers the CCA `sub`/`iss`, the `x5c` certificate binding, the mTLS certificate binding and the `cca_trusted_keys`/`cca_trusted_keys_dir` lookup; the token `sub` is the lower-case UUID, with or without a proven identity. Two trust-store entries (inline, or files in `cca_trusted_keys_dir`) that spell one UUID in different case and hold different keys mean that NF has no trusted key at all: neither entry, nor a key for it from the other source, nor one in a file published later (for the NRF's life), so its CCA is refused until the stale entry is removed and the NRF restarted. The conflict is logged once as an ERROR and counted by `nrf_cca_trusted_key_conflicts_total`. A key published after start is looked up across every file whose name is that NF's ID in any case, and two different keys among them are refused the same way. The same key twice is kept.
 - `--signing-key-file <path>` holds the ES256 access-token signing key: generated on first start if absent, then reused. Mount the same file into every NRF replica, or restarts and scale-out invalidate outstanding tokens (#64). `--token-expires-in` sets the access-token lifetime in seconds (default `3600`).
 - `-k/--kill` is not supported and exits with an error; stop the NRF through its supervisor. `-m/--no-color` disables colored logs.

@@ -64,6 +64,11 @@ pub struct SbiServerConfig {
     pub verify_client: bool,
     /// CA certificate for client verification
     pub verify_client_cacert: Option<String>,
+    /// With `verify_client`: request a client certificate but admit a client
+    /// that presents none (#1617). A presented certificate must still verify
+    /// against `verify_client_cacert`. Default `false` (a certificate is
+    /// required).
+    pub verify_client_optional: bool,
     /// Require a valid OAuth2 bearer token on incoming requests (default false).
     /// When true, verification keys come from `oauth2_jwks` (static) or
     /// `oauth2_jwks_uri` (fetched live); with neither configured the server
@@ -140,6 +145,7 @@ impl Default for SbiServerConfig {
             cert: None,
             verify_client: false,
             verify_client_cacert: None,
+            verify_client_optional: false,
             require_oauth2: false,
             oauth2_jwks: None,
             oauth2_jwks_uri: None,
@@ -1214,7 +1220,11 @@ impl SbiServer {
                     "Client CA certificate required for mTLS but not configured".into(),
                 )
             })?;
-            tls::build_server_config_mtls(certs, key, ca_path)?
+            if self.config.verify_client_optional {
+                tls::build_server_config_optional_client_auth(certs, key, ca_path)?
+            } else {
+                tls::build_server_config_mtls(certs, key, ca_path)?
+            }
         } else {
             tls::build_server_config(certs, key)?
         };
