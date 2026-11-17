@@ -2491,13 +2491,11 @@ pub async fn handle_ue_policy_connectivity_notify(
 /// reports the ASYNCHRONOUS outcome of an `N1N2MessageTransfer` that carried
 /// `n1n2FailureTxfNotifURI`.
 ///
-/// The AMF side of this already existed (`namf_server.rs`'s
-/// `ue_not_reachable_error`); what did not exist was a PCF that supplied the URI and
-/// served the callback, so the notification had nowhere to go. A `UE_NOT_REACHABLE`
-/// cause parks nothing new — the synchronous 504 on the same transfer already did —
-/// but it DOES confirm the AMF agrees the transfer is dead, so the parked delivery is
-/// left in place and logged rather than retried immediately, which would just fail
-/// again.
+/// The AMF sends it for a transfer it accepted (202, the UE paged) and then failed
+/// to deliver (TS 29.518 §5.2.2.3.2), with an N1N2MessageTransferCause such as
+/// UE_NOT_RESPONDING; a transfer refused 504 gets no notification (amfd #1704).
+/// It parks nothing new: the parked delivery is left in place and logged rather
+/// than retried immediately, which would just fail again.
 ///
 /// Always 204: a consumer callback acknowledges receipt.
 pub async fn handle_ue_policy_n1n2_failure_notify(
