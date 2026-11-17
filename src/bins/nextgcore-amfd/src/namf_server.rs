@@ -57,10 +57,13 @@ const NOTIFY_REQUEST_TIMEOUT_SECS: u64 = 3;
 /// for them, followed by the operation the PCF appends:
 /// - `ucmf-notify/{token}` and `am-policy-notify/{token}/{update,terminate}` are
 ///   admitted on the token alone: only the UCMF and the PCF of the association are
-///   given them, and neither serves them back (ucmfd has no GET of a subscription,
-///   and the AM policy GET does not echo the request);
+///   given them. ucmfd has no GET of a subscription. A PCF may return the
+///   association's `request` (with `notificationUri`) on a GET (TS 29.507
+///   `PolicyAssociation.request`, optional), but the only consumer of
+///   Npcf_AMPolicyControl is the AMF itself;
 /// - `ue-policy-notify/{token}[/{update,terminate}]` and
-///   `{psi}/sm-context-status/{token}` are, like `dereg-notify`, readable by other
+///   `{psi}/sm-context-status/{token}` (one token per PDU session) are, like
+///   `dereg-notify`, readable by other
 ///   consumers (the UE policy association GET returns the request, TS 29.525
 ///   `PolicyAssociation.request`; the SMF's SM context retrieval returns
 ///   `smContextStatusUri`). They are admitted only together with the verified
@@ -115,11 +118,10 @@ pub fn oauth2_callback_exemptions() -> Vec<nextgcore_sbi::server::OAuth2Callback
             "POST",
             "/namf-callback/v1/{var}/{var}/sm-context-status/{token}",
             |cb, peer| async move {
-                let [supi, _psi] = cb.vars.as_slice() else {
+                let [supi, psi] = cb.vars.as_slice() else {
                     return false;
                 };
-                peer.has_nf_type("SMF")
-                    && holds_callback_token(supi, &cb.token, |ue| &ue.sm_context_status_token)
+                peer.has_nf_type("SMF") && holds_sm_context_status_token(supi, psi, &cb.token)
             },
         ),
         // NFStatusNotify (#940): the token names one of this AMF's NRF subscriptions.
@@ -912,19 +914,22 @@ fn handle_dereg_notify_callback(
 /// `supi` (#540): acknowledged with 204; a `RELEASED` resource status removes
 /// the AMF's record of the session.
 ///
-/// #1518: on the tokened URI, the token must be the UE's `sm_context_status_token`;
-/// otherwise 404 and nothing changes. The token-less URI of a session created
-/// before #1518 is served as before.
+/// #1518: on the tokened URI, the token must be the session's
+/// ([`crate::sbi_path::sm_context_status_token`]); otherwise 404 and nothing
+/// changes. The token-less URI is served only for a UE context restored from
+/// before #1518 (no `sm_context_status_key`), whose sessions were given it.
 fn handle_sm_context_status_callback(
     supi: &str,
     psi: &str,
     token: Option<&str>,
     request: &SbiRequest,
 ) -> SbiResponse {
-    if let Some(token) = token {
-        if !holds_callback_token(supi, token, |ue| &ue.sm_context_status_token) {
-            return unknown_callback_token(supi, "SM context status");
-        }
+    let admitted = match token {
+        Some(token) => holds_sm_context_status_token(supi, psi, token),
+        None => serves_tokenless(supi, |ue| &ue.sm_context_status_key),
+    };
+    if !admitted {
+        return unknown_callback_token(supi, "SM context status");
     }
     let state = parse_json_body(request)
         .and_then(|b| {
@@ -957,12 +962,17 @@ fn handle_ue_policy_notify_callback(
     operation: Option<&str>,
     request: &SbiRequest,
 ) -> SbiResponse {
-    // #1518: a tokened URI must carry the token of the UE's current association.
+    // #1518: a tokened URI must carry the token of the UE's current association;
+    // the token-less URI is served only for an association created before #1518.
     // A UE this AMF no longer holds keeps the 204 below (nothing is acted on).
-    if let Some(token) = token {
-        if find_ue_by_context_id(supi).is_some()
-            && !holds_callback_token(supi, token, |ue| &ue.ue_policy_association.notify_token)
-        {
+    if find_ue_by_context_id(supi).is_some() {
+        let admitted = match token {
+            Some(token) => {
+                holds_callback_token(supi, token, |ue| &ue.ue_policy_association.notify_token)
+            }
+            None => serves_tokenless(supi, |ue| &ue.ue_policy_association.notify_token),
+        };
+        if !admitted {
             return unknown_callback_token(supi, "UE policy");
         }
     }
@@ -1037,6 +1047,31 @@ fn holds_callback_token(
     })
 }
 
+/// #1518: whether `token` is the `smContextStatusUri` token of PDU session `psi`
+/// of the UE `supi` (one token per session), compared in constant time.
+fn holds_sm_context_status_token(supi: &str, psi: &str, token: &str) -> bool {
+    let Ok(psi) = psi.parse::<u8>() else {
+        return false;
+    };
+    find_ue_by_context_id(supi).is_some_and(|ue| {
+        ue.sm_context_status_key.as_deref().is_some_and(|key| {
+            nextgcore_sbi::callback_auth::token_eq(
+                &crate::sbi_path::sm_context_status_token(key, psi),
+                token,
+            )
+        })
+    })
+}
+
+/// #1518: whether the token-less callback URI of before #1518 is still served for
+/// the UE `supi`: only while the token `field` is `None` (an association or UE
+/// context created before #1518, which was handed that URI). Once a token exists,
+/// the token-less URI is not a resource of this AMF: answering it would let any
+/// sender skip the token by dropping it from the path (#1625 review M1).
+fn serves_tokenless(supi: &str, field: impl Fn(&AmfUe) -> &Option<String>) -> bool {
+    find_ue_by_context_id(supi).is_some_and(|ue| field(&ue).is_none())
+}
+
 /// #1518: 404 for a notification to a callback URI whose token this AMF does not
 /// hold for the UE. It names no resource of this AMF.
 fn unknown_callback_token(supi: &str, what: &str) -> SbiResponse {
@@ -1088,11 +1123,14 @@ fn handle_am_policy_notify_callback(
     if find_ue_by_context_id(supi).is_none() {
         return context_not_found(supi);
     }
-    // #1518: a tokened URI must carry the token of the UE's current association.
-    if let Some(token) = token {
-        if !holds_callback_token(supi, token, |ue| &ue.policy_association.notify_token) {
-            return unknown_callback_token(supi, "AM policy");
-        }
+    // #1518: a tokened URI must carry the token of the UE's current association;
+    // the token-less URI is served only for an association created before #1518.
+    let admitted = match token {
+        Some(token) => holds_callback_token(supi, token, |ue| &ue.policy_association.notify_token),
+        None => serves_tokenless(supi, |ue| &ue.policy_association.notify_token),
+    };
+    if !admitted {
+        return unknown_callback_token(supi, "AM policy");
     }
     let body = parse_json_body(request).unwrap_or_default();
     if operation == "update" {
@@ -7400,6 +7438,12 @@ mod tests {
     /// `connected` controls whether a live RAN UE context is associated
     /// (CM-CONNECTED); `security` sets security_context_available.
     fn setup_ue(supi: &str, connected: bool, security: bool) -> AmfUe {
+        setup_ue_with_tokens(supi, connected, security, true)
+    }
+
+    /// [`setup_ue`]; `tokens == false` is a UE context restored from before #1518,
+    /// with no callback tokens (its peers hold the token-less URIs).
+    fn setup_ue_with_tokens(supi: &str, connected: bool, security: bool, tokens: bool) -> AmfUe {
         amf_context_init(64, 1024, 4096);
         let ctx = amf_self();
         let guard = ctx.read().expect("ctx lock");
@@ -7416,9 +7460,13 @@ mod tests {
         // #753: the token of this UE's (stand-in) UECM registration.
         ue.uecm_dereg_token = Some(format!("tok-{supi}"));
         // #1518: and of its smContextStatusUri / policy notificationUris.
-        ue.sm_context_status_token = Some(format!("smst-{supi}"));
-        ue.policy_association.notify_token = Some(format!("amp-{supi}"));
-        ue.ue_policy_association.notify_token = Some(format!("uep-{supi}"));
+        if tokens {
+            ue.sm_context_status_key = Some(format!("smst-{supi}"));
+            ue.policy_association.notify_token = Some(format!("amp-{supi}"));
+            ue.ue_policy_association.notify_token = Some(format!("uep-{supi}"));
+        } else {
+            ue.sm_context_status_key = None;
+        }
         if connected {
             guard.amf_ue_associate_ran_ue(ue.id, ran_ue.id);
             ue.ran_ue_id = ran_ue.id;
@@ -9428,7 +9476,10 @@ mod tests {
             )
             .await,
             post(
-                format!("/namf-callback/v1/{supi}/5/sm-context-status/smst-{supi}"),
+                format!(
+                    "/namf-callback/v1/{supi}/5/sm-context-status/{}",
+                    crate::sbi_path::sm_context_status_token(&format!("smst-{supi}"), 5)
+                ),
                 json!({"statusInfo": {"resourceStatus": "RELEASED"}}),
             )
             .await,
@@ -9492,21 +9543,34 @@ mod tests {
             )
             .await
         );
-        let good = format!("smst-{supi}");
+        let good = crate::sbi_path::sm_context_status_token(&format!("smst-{supi}"), 5);
         assert!(admits(sms(&good), peer(&["SMF"])).await);
         assert!(!admits(sms(&good), peer(&["PCF"])).await);
         assert!(!admits(sms(&good), peer(&[])).await);
         assert!(!admits(sms(&good), None).await);
         assert!(!admits(sms("smst-forged"), peer(&["SMF"])).await);
+        // One token per session (#1625 review m1): PDU session 5's token, which its
+        // SMF holds, does not name session 6, nor is the key itself a token.
+        assert!(
+            !admits(
+                format!("/namf-callback/v1/{supi}/6/sm-context-status/{good}"),
+                peer(&["SMF"])
+            )
+            .await
+        );
+        assert!(!admits(sms(&format!("smst-{supi}")), peer(&["SMF"])).await);
     }
 
     /// #1518: whatever admitted it (a bearer, or a token-less listener), a
-    /// notification to a tokened callback URI is acted on only with the UE's
-    /// current token: otherwise 404 and nothing changes. The token-less URIs of
-    /// before #1518 are served as they were.
+    /// notification to a callback URI is acted on only with the current token of
+    /// its association or session: otherwise 404 and nothing changes. That includes
+    /// the token-less URI once a token exists (#1625 review M1), and another
+    /// session's token (m1). The token-less URIs are served only for a UE context
+    /// from before #1518.
     ///
     /// REVERT-VERIFIED: with the handlers' token checks removed, the forged-token
-    /// cases answer 204 and the session record is dropped.
+    /// cases answer 204 and the session record is dropped; with the token-less arms
+    /// served unconditionally, they answer 204 for the tokened UE.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_callback_handlers_act_only_on_the_current_token_1518() {
         let _serial = dereg_queue_test_lock().lock().await;
@@ -9542,10 +9606,35 @@ mod tests {
                 format!("/namf-callback/v1/{supi}/5/sm-context-status/smst-forged"),
                 released.clone(),
             ),
+            (
+                format!(
+                    "/namf-callback/v1/{supi}/5/sm-context-status/{}",
+                    crate::sbi_path::sm_context_status_token(&format!("smst-{supi}"), 6)
+                ),
+                released.clone(),
+            ),
+            // The token-less URIs, for a UE whose associations and sessions have
+            // tokens: dropping the token does not skip it (#1625 review M1).
+            (
+                format!("/namf-callback/v1/{supi}/am-policy-notify/update"),
+                json!({}),
+            ),
+            (
+                format!("/namf-callback/v1/{supi}/ue-policy-notify/update"),
+                json!({}),
+            ),
+            (
+                format!("/namf-callback/v1/{supi}/ue-policy-notify"),
+                json!({}),
+            ),
+            (
+                format!("/namf-callback/v1/{supi}/sm-context-status/5"),
+                released.clone(),
+            ),
         ] {
             assert_eq!(post(path.clone(), body).await.status, 404, "{path}");
         }
-        assert!(sess_held(), "a forged token released nothing");
+        assert!(sess_held(), "a forged or missing token released nothing");
 
         let ucmf = crate::racs::notification_uri();
         let ucmf_path = ucmf[ucmf.find("/namf-callback").expect("path")..].to_string();
@@ -9563,29 +9652,54 @@ mod tests {
                 format!("/namf-callback/v1/{supi}/ue-policy-notify/uep-{supi}"),
                 json!({}),
             ),
-            // The token-less URIs of before #1518.
+        ] {
+            assert_eq!(post(path.clone(), body).await.status, 204, "{path}");
+        }
+        assert_eq!(
+            post(
+                format!(
+                    "/namf-callback/v1/{supi}/5/sm-context-status/{}",
+                    crate::sbi_path::sm_context_status_token(&format!("smst-{supi}"), 5)
+                ),
+                released.clone()
+            )
+            .await
+            .status,
+            204
+        );
+        assert!(!sess_held(), "the session's token released it");
+        let _ = sess;
+
+        // A UE context from before #1518: its peers hold the token-less URIs, which
+        // are served for it, and no tokened URI names it.
+        let old = "imsi-001010000015185";
+        let old_ue = setup_ue_with_tokens(old, true, true, false);
+        let _old_sess = setup_sess(&old_ue, 5);
+        for (path, body) in [
             (
-                format!("/namf-callback/v1/{supi}/am-policy-notify/update"),
+                format!("/namf-callback/v1/{old}/am-policy-notify/update"),
                 json!({}),
             ),
             (
-                format!("/namf-callback/v1/{supi}/ue-policy-notify/update"),
+                format!("/namf-callback/v1/{old}/ue-policy-notify/update"),
                 json!({}),
+            ),
+            (
+                format!("/namf-callback/v1/{old}/sm-context-status/5"),
+                released.clone(),
             ),
         ] {
             assert_eq!(post(path.clone(), body).await.status, 204, "{path}");
         }
         assert_eq!(
             post(
-                format!("/namf-callback/v1/{supi}/5/sm-context-status/smst-{supi}"),
-                released
+                format!("/namf-callback/v1/{old}/am-policy-notify/amp-{old}/update"),
+                json!({})
             )
             .await
             .status,
-            204
+            404
         );
-        assert!(!sess_held(), "the current token released the session");
-        let _ = sess;
     }
 
     /// #1522: the dereg-notify exemption's check admits a token-less notification

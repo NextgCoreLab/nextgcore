@@ -3696,11 +3696,14 @@ pub struct AmfUe {
     /// longer holds (one made before a restart, under a different
     /// `amfInstanceId`). Acting on it would tear down the UE's new registration.
     pub uecm_dereg_token: Option<String>,
-    /// #1518: the token in every `smContextStatusUri` this AMF gives an SMF for
-    /// this UE (TS 29.502 §5.2.2.2.1), minted once per UE context, so the URI of a
-    /// session survives the UE's re-registrations. `None` before it is minted: a
-    /// session created then gets the token-less URI of before #1518.
-    pub sm_context_status_token: Option<String>,
+    /// #1518: the secret each PDU session's `smContextStatusUri` token is derived
+    /// from ([`crate::sbi_path::sm_context_status_token`]), one token per PSI, so the
+    /// SMF of one session cannot notify about another. Minted with the UE context
+    /// and kept for its life (persisted, restored on takeover), so a session's URI
+    /// survives the UE's re-registrations. `None` only for a context restored from a
+    /// record written before #1518: its sessions' URIs carry no token, and it keeps
+    /// handing out token-less URIs, which are served only for such a context.
+    pub sm_context_status_key: Option<String>,
     /// NAS state
     pub nas: NasState,
     /// SUCI (Subscription Concealed Identifier)
@@ -3993,7 +3996,7 @@ impl std::fmt::Debug for AmfUe {
         let mut d = f.debug_struct("AmfUe");
         d.field("id", &self.id);
         d.field("uecm_dereg_token", &self.uecm_dereg_token);
-        d.field("sm_context_status_token", &self.sm_context_status_token);
+        d.field("sm_context_status_key", &self.sm_context_status_key);
         d.field("nas", &self.nas);
         d.field("suci", &self.suci);
         d.field("supi", &self.supi);
@@ -4564,7 +4567,7 @@ impl AmfUe {
         Self {
             id,
             uecm_dereg_token: None,
-            sm_context_status_token: None,
+            sm_context_status_key: Some(uuid::Uuid::new_v4().simple().to_string()),
             nas: NasState::default(),
             suci: None,
             supi: None,

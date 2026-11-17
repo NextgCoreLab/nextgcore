@@ -529,7 +529,12 @@ impl NgapServer {
                 "smContextStatusUri": crate::sbi_path::sm_context_status_uri(
                     &supi,
                     psi,
-                    state.amf_ue.sm_context_status_token.as_deref(),
+                    state
+                        .amf_ue
+                        .sm_context_status_key
+                        .as_deref()
+                        .map(|key| crate::sbi_path::sm_context_status_token(key, psi))
+                        .as_deref(),
                 ),
                 "guami": {
                     "plmnId": { "mcc": guami_mcc, "mnc": guami_mnc },

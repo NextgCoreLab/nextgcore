@@ -49,7 +49,7 @@ fn seed_registered_ue(
     }];
     ue.amf_ue.uecm_dereg_token = Some(format!("tok-{id}"));
     // #1518: the callback tokens are part of the stored context.
-    ue.amf_ue.sm_context_status_token = Some(format!("smst-{supi}"));
+    ue.amf_ue.sm_context_status_key = Some(format!("smst-{supi}"));
     ue.amf_ue.policy_association.notify_token = Some(format!("amp-{supi}"));
     ue.amf_ue.ue_policy_association.notify_token = Some(format!("uep-{supi}"));
     ue.sdm_subscription_id = Some(format!("sdm-{id}"));
@@ -232,7 +232,7 @@ async fn a_restored_ue_s_service_request_reactivates_its_stored_session() {
     assert_eq!(a.allowed_nssai, b.allowed_nssai);
     assert_eq!(a.ue_ambr, b.ue_ambr);
     assert_eq!(a.uecm_dereg_token, b.uecm_dereg_token);
-    assert_eq!(a.sm_context_status_token, b.sm_context_status_token);
+    assert_eq!(a.sm_context_status_key, b.sm_context_status_key);
     assert_eq!(
         after.sm_context_refs.get(&(new_id, 5)).map(String::as_str),
         Some("ref-686-a")
@@ -360,7 +360,14 @@ async fn a_restarted_amf_points_a_restored_ue_s_peers_at_itself_at_its_first_mes
     assert_eq!(body["servingNfId"], instance);
     assert_eq!(
         body["smContextStatusUri"],
-        crate::sbi_path::sm_context_status_uri(supi, 5, Some(&format!("smst-{supi}")))
+        crate::sbi_path::sm_context_status_uri(
+            supi,
+            5,
+            Some(&crate::sbi_path::sm_context_status_token(
+                &format!("smst-{supi}"),
+                5
+            )),
+        )
     );
     let activating = calls
         .iter()
@@ -569,7 +576,14 @@ async fn a_restored_idle_ue_s_smf_is_given_this_amf_at_restore_so_downlink_pages
     let body: serde_json::Value = serde_json::from_str(body).expect("json");
     let instance = nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf);
     assert_eq!(body["servingNfId"], instance);
-    let status_uri = crate::sbi_path::sm_context_status_uri(supi, 5, Some(&format!("smst-{supi}")));
+    let status_uri = crate::sbi_path::sm_context_status_uri(
+        supi,
+        5,
+        Some(&crate::sbi_path::sm_context_status_token(
+            &format!("smst-{supi}"),
+            5,
+        )),
+    );
     assert_eq!(body["smContextStatusUri"], status_uri);
     assert!(
         status_uri.starts_with("http"),
@@ -1206,7 +1220,7 @@ fn the_mongodb_backend_stores_loads_and_deletes() {
         ue_radio_capability_id_known_to_ue: false,
         assigned_ebis: Vec::new(),
         uecm_dereg_token: Some("tok".to_string()),
-        sm_context_status_token: None,
+        sm_context_status_key: None,
         sdm_subscription_id: None,
         policy_association: Default::default(),
         ue_policy_association: Default::default(),
@@ -1558,7 +1572,14 @@ async fn a_ue_of_a_failed_amf_is_taken_over_by_its_service_request() {
     assert_eq!(serving_body["servingNfId"], instance);
     assert_eq!(
         serving_body["smContextStatusUri"],
-        crate::sbi_path::sm_context_status_uri(supi, 5, Some(&format!("smst-{supi}")))
+        crate::sbi_path::sm_context_status_uri(
+            supi,
+            5,
+            Some(&crate::sbi_path::sm_context_status_token(
+                &format!("smst-{supi}"),
+                5
+            )),
+        )
     );
     assert_eq!(
         serving_body["guami"]["amfId"], "02556b",

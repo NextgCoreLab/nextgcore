@@ -1154,9 +1154,10 @@ pub struct SmContextIdentity {
     /// priority establishment cause or subscription ([`priority_message_priority`]).
     /// `None` omits the header: the SMF then applies the default priority 24.
     pub message_priority: Option<u8>,
-    /// #1518: the UE's `sm_context_status_token`, carried in `smContextStatusUri`
-    /// ([`sm_context_status_uri`]). `None` sends the token-less URI.
-    pub sm_context_status_token: Option<String>,
+    /// #1518: the UE's `sm_context_status_key`, from which the session's
+    /// `smContextStatusUri` token is derived ([`sm_context_status_token`]). `None`
+    /// sends the token-less URI.
+    pub sm_context_status_key: Option<String>,
 }
 
 /// #1222: the `RequestType` of SmContextCreateData (TS 29.502 §6.1.6.3.5) for the
@@ -1298,7 +1299,11 @@ fn build_create_sm_context_request(
             serde_json::json!(sm_context_status_uri(
                 supi,
                 pdu_session_id,
-                identity.sm_context_status_token.as_deref()
+                identity
+                    .sm_context_status_key
+                    .as_deref()
+                    .map(|key| sm_context_status_token(key, pdu_session_id))
+                    .as_deref()
             )),
         );
     }
@@ -3499,7 +3504,7 @@ pub fn advertised_sbi_scheme() -> &'static str {
 /// The absolute `smContextStatusUri` the AMF gives the SMF for PDU session
 /// `psi` of `supi` (#540, TS 29.502 §5.2.2.2.1). Routed by `namf_server` at
 /// `POST /namf-callback/v1/{supi}/{psi}/sm-context-status/{token}`, `token` being
-/// the UE's `sm_context_status_token` (#1518); without one, the token-less
+/// [`sm_context_status_token`] of the session (#1518); without one, the token-less
 /// `POST /namf-callback/v1/{supi}/sm-context-status/{psi}` of before #1518.
 pub fn sm_context_status_uri(supi: &str, psi: u8, token: Option<&str>) -> String {
     match token {
@@ -3512,6 +3517,19 @@ pub fn sm_context_status_uri(supi: &str, psi: u8, token: Option<&str>) -> String
             advertised_sbi_base()
         ),
     }
+}
+
+/// The `smContextStatusUri` token of PDU session `psi` of a UE whose
+/// `sm_context_status_key` is `key` (#1518): the first 128 bits of
+/// SHA-256(`key` ":" `psi`), as 32 hex digits. One token per session, so the SMF
+/// that holds one session's URI cannot forge a notification about another; and
+/// derived, not stored, so every path that hands out the URI (CreateSMContext,
+/// the takeover's UpdateSMContext) and the handler agree without threading a
+/// per-session value through them.
+pub fn sm_context_status_token(key: &str, psi: u8) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(format!("{key}:{psi}").as_bytes());
+    digest[..16].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// A fresh callback-URI token (#753, #1518): a v4 UUID in simple form, 122
@@ -5945,7 +5963,7 @@ mod tests {
 
     fn test_identity() -> SmContextIdentity {
         SmContextIdentity {
-            sm_context_status_token: None,
+            sm_context_status_key: None,
             supi: Some("imsi-262011234567890".to_string()),
             pei: Some("imeisv-1234567890123456".to_string()),
             guami: Some(serde_json::json!({

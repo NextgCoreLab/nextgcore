@@ -6189,14 +6189,7 @@ impl NgapServer {
         )
         .await
         .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
-        // #1518: the callback tokens of this UE context. The smContextStatusUri
-        // token is minted once and kept, so the URIs the SMFs hold for the UE's
-        // sessions stay valid across its re-registrations; an AM policy
-        // association gets its own token for its notificationUri.
-        state
-            .amf_ue
-            .sm_context_status_token
-            .get_or_insert_with(crate::sbi_path::new_callback_token);
+        // #1518: the association's own token for its notificationUri.
         let am_policy_token = crate::sbi_path::new_callback_token();
         match crate::sbi_path::call_pcf_am_policy_create(
             &pcf_host,
@@ -20533,7 +20526,7 @@ fn build_sm_context_identity(
         });
     crate::sbi_path::SmContextIdentity {
         supi: state.and_then(|s| s.amf_ue.supi.clone()),
-        sm_context_status_token: state.and_then(|s| s.amf_ue.sm_context_status_token.clone()),
+        sm_context_status_key: state.and_then(|s| s.amf_ue.sm_context_status_key.clone()),
         pei: state.and_then(|s| s.amf_ue.pei.clone()),
         guami,
         serving_plmn,
