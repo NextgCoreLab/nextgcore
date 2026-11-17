@@ -10426,11 +10426,18 @@ impl NgapServer {
                 let Some(sm_context_ref) =
                     self.sm_context_refs.get(&(amf_ue_ngap_id, psi)).cloned()
                 else {
-                    log::warn!(
-                        "PDU Session Release for UE {amf_ue_ngap_id} PSI {psi} with no stored \
-                         SM context ref: dropping (no session to release)"
-                    );
-                    return Ok(());
+                    // #1643 review, TS 24.501 §7.3.2 c) 2): a PDU session identity that
+                    // matches no existing PDU session is answered with a DL NAS
+                    // TRANSPORT carrying 5GMM #90 "payload was not forwarded".
+                    return self
+                        .answer_payload_not_forwarded(
+                            association_id,
+                            amf_ue_ngap_id,
+                            ran_ue_ngap_id,
+                            sm_pdu,
+                            "for a PDU session release: no such PDU session (TS 24.501 §7.3.2 c) 2))",
+                        )
+                        .await;
                 };
                 let n1 = sm_pdu.to_vec();
                 // The User Location Information, as the 0xCC/0xCD relay sends it.
@@ -10627,11 +10634,24 @@ impl NgapServer {
             return Ok(());
         };
         if state.is_cm_idle() {
-            log::warn!(
-                "PDU Session Modification answer for UE {amf_ue_ngap_id} PSI {psi}: the UE \
-                 went CM-IDLE meanwhile; nothing is sent (it retransmits on T3581)"
-            );
-            return Ok(());
+            // #1643 review: the SMF's N1 (and N2) are paged for, not dropped.
+            let held = match result {
+                Ok((n1, n2)) if smf_n1_for_session(&n1, psi) => Some((
+                    n1,
+                    if n2.is_empty() {
+                        crate::context::ConnectedN2::None
+                    } else {
+                        crate::context::ConnectedN2::Modify(n2)
+                    },
+                )),
+                Err(crate::sbi_path::SmContextUpdateRefusal {
+                    n1_sm_msg: Some(n1),
+                    ..
+                }) if smf_n1_for_session(&n1, psi) => Some((n1, crate::context::ConnectedN2::None)),
+                _ => None,
+            };
+            let amf_ue = state.amf_ue.clone();
+            return self.page_for_smf_answer(&amf_ue, psi, "PDU Session Modification", held);
         }
         let (association_id, ran_ue_ngap_id) = (state.association_id, state.ran_ue_ngap_id);
         match result {
@@ -10728,11 +10748,26 @@ impl NgapServer {
             return Ok(());
         };
         if state.is_cm_idle() {
-            log::warn!(
-                "PDU Session Release answer for UE {amf_ue_ngap_id} PSI {psi}: the UE went \
-                 CM-IDLE meanwhile; nothing is sent (it retransmits on T3582)"
-            );
-            return Ok(());
+            // #1643 review, TS 23.502 §4.3.4.2 step 4: a UE that went CM-IDLE is paged
+            // for the SMF's RELEASE COMMAND (or REJECT), which is delivered after its
+            // Service Request.
+            let held = match result {
+                Ok(answer) if smf_n1_for_session(&answer.n1_sm_msg, psi) => Some((
+                    answer.n1_sm_msg,
+                    if answer.n2_sm_info.is_empty() {
+                        crate::context::ConnectedN2::None
+                    } else {
+                        crate::context::ConnectedN2::Release
+                    },
+                )),
+                Err(crate::sbi_path::SmContextUpdateRefusal {
+                    n1_sm_msg: Some(n1),
+                    ..
+                }) if smf_n1_for_session(&n1, psi) => Some((n1, crate::context::ConnectedN2::None)),
+                _ => None,
+            };
+            let amf_ue = state.amf_ue.clone();
+            return self.page_for_smf_answer(&amf_ue, psi, "PDU Session Release", held);
         }
         let (association_id, ran_ue_ngap_id) = (state.association_id, state.ran_ue_ngap_id);
         match result {
@@ -10968,6 +11003,47 @@ impl NgapServer {
                 log::warn!("N1N2 transfer for UE {amf_ue_ngap_id} (PSI {psi}) not sent: {e}")
             }
         }
+    }
+
+    /// #1643 review: the SMF's answer to a UE-requested modification or release found
+    /// the UE CM-IDLE. TS 23.502 §4.3.4.2 step 4 / §4.3.3.2 and §4.2.3.3: the AMF pages
+    /// it and delivers the SMF's N1 (and N2) after the Service Request. This is the
+    /// N1N2 transfer path [`Self::page_for_queued_downlink`] uses. If the page fails,
+    /// the N1 is dropped with it and the SMF's T3591/T3592 (or the UE's T3581/T3582)
+    /// recovers. With nothing to deliver (no N1 of the SMF's for this session),
+    /// nothing is paged.
+    fn page_for_smf_answer(
+        &mut self,
+        amf_ue: &AmfUe,
+        psi: u8,
+        what: &str,
+        held: Option<(Vec<u8>, crate::context::ConnectedN2)>,
+    ) -> Result<()> {
+        let Some((n1, n2)) = held else {
+            log::warn!(
+                "{what} answer for UE {} PSI {psi}: the UE went CM-IDLE meanwhile and the \
+                 SMF gave no N1 for it; nothing is paged",
+                amf_ue.id
+            );
+            return Ok(());
+        };
+        log::info!(
+            "{what} answer for UE {} PSI {psi}: the UE went CM-IDLE meanwhile; paging it \
+             for the SMF's {}-byte N1",
+            amf_ue.id,
+            n1.len()
+        );
+        self.page_for_queued_downlink(
+            amf_ue,
+            crate::context::PendingConnectedDownlink {
+                amf_ue_ngap_id: amf_ue.id,
+                pdu_session_id: psi,
+                n1: Some(n1),
+                n2,
+                failure_notify_uri: None,
+            },
+        );
+        Ok(())
     }
 
     /// Page a UE whose queued N1N2 transfer found it CM-IDLE (#757). The transfer
@@ -21008,12 +21084,6 @@ pub(crate) struct ServiceRequestSessionIes {
     pub pdu_session_status: Option<u16>,
 }
 
-/// Read them from a decoded SERVICE REQUEST. A UE in CM-IDLE sends these
-/// non-cleartext IEs only inside the NAS message container (TS 24.501 §4.4.6), so
-/// the container's full message wins when it is present.
-/// The SMF an exchange for an existing session goes to (#669): the one holding its
-/// context, else the selected one. Resolving it can be an NRF lookup, so this runs
-/// inside the off-task exchange (#922), never on the NGAP task.
 /// Whether an N1 SM the SMF answered is a 5GSM message (EPD 0x2E, TS 24.501 §9.2)
 /// for PDU session `psi`, so the AMF may relay it to the UE for that session (#1637,
 /// #1590 review). A mismatched or foreign N1 is not relayed.
@@ -21021,6 +21091,9 @@ fn smf_n1_for_session(n1: &[u8], psi: u8) -> bool {
     n1.len() >= 4 && n1[0] == 0x2E && n1[1] == psi
 }
 
+/// The SMF an exchange for an existing session goes to (#669): the one holding its
+/// context, else the selected one. Resolving it can be an NRF lookup, so this runs
+/// inside the off-task exchange (#922), never on the NGAP task.
 async fn smf_or_selected(owner: Option<(String, u16)>) -> (String, u16) {
     match owner {
         Some(owner) => owner,
@@ -21032,6 +21105,9 @@ async fn smf_or_selected(owner: Option<(String, u16)>) -> (String, u16) {
     }
 }
 
+/// Read them from a decoded SERVICE REQUEST. A UE in CM-IDLE sends these
+/// non-cleartext IEs only inside the NAS message container (TS 24.501 §4.4.6), so
+/// the container's full message wins when it is present.
 pub(crate) fn service_request_session_ies(
     plain: &[u8],
     decipher_container: &dyn Fn(&mut Vec<u8>),

@@ -537,6 +537,145 @@ async fn a_refused_or_unreachable_release_is_answered_as_the_spec_says_1637() {
     }
 }
 
+/// Handle `request` (PSI 5) for `ue`, make the UE CM-IDLE before the SMF's answer
+/// is applied, and return the page the answer queued (removed from the context).
+async fn page_after_idle_answer(
+    server: &mut NgapServer,
+    ue: u64,
+    ran: u32,
+    request: &[u8],
+) -> crate::context::PagingContext {
+    server
+        .handle_5gsm_message(ASSOC, ue, ran, request, None)
+        .await
+        .expect("handled");
+    server.ue_auth_state.with_mut(ue, |s| s.cm_idle = true);
+    for _ in 0..300 {
+        server.process_sbi_outcomes().await;
+        let paged = crate::context::amf_self().read().unwrap().paging_find(ue);
+        if let Some(paged) = paged {
+            crate::context::amf_self().read().unwrap().paging_remove(ue);
+            return paged;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("UE {ue} was not paged within 3 s");
+}
+
+/// #1643 review, TS 23.502 §4.3.4.2 step 4 and §4.2.3.3: when the UE went CM-IDLE
+/// before the SMF's answer arrived, the AMF pages it. The SMF's RELEASE COMMAND (with
+/// the N2 release) or its MODIFICATION REJECT is kept in the page and delivered after
+/// the Service Request, through the N1N2 transfer's paging path.
+///
+/// REVERT-VERIFIED: with the answer dropped for an idle UE again (no page), both
+/// cases panic "was not paged".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_smf_answer_for_a_ue_gone_idle_is_paged_for_and_delivered_1643() {
+    // The page reads the paging strategy (#1588).
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
+
+    // The release: N1 RELEASE COMMAND and the N2 release.
+    let (_smf, port, _calls) = release_answering_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (16_430_101u64, 191u32);
+    secured_registered_ue(&mut server, ue, ran);
+    hold_session(&mut server, ue, 5, "rel-n2-1643-idle", port);
+    server.mark_up_active(ue, 5);
+    let paged = page_after_idle_answer(&mut server, ue, ran, &[0x2E, 0x05, 0x07, 0xD1]).await;
+    let command = vec![0x2E, 0x05, 0x07, 0xD3, 0x24];
+    assert_eq!(
+        paged.pending_n1.as_deref(),
+        Some(&command[..]),
+        "the SMF's command is kept"
+    );
+    assert!(paged.pending_n2_release, "with the N2 release");
+    assert_eq!(paged.pdu_session_id, Some(5));
+    // The UE answers the page: the Service Request brings it back.
+    server.ue_auth_state.with_mut(ue, |s| s.cm_idle = false);
+    take_sent_ngap(&mut server);
+    server
+        .deliver_paged_after_service_request(ASSOC, ue, ran, &paged)
+        .await
+        .expect("delivered");
+    let sent: Vec<Sent> = take_sent_ngap(&mut server)
+        .into_iter()
+        .map(|(_, p)| decode_sent(&p))
+        .collect();
+    assert!(
+        sent.iter()
+            .any(|s| matches!(s, Sent::ReleaseCommand { psis, .. } if psis == &[5])),
+        "the gNB's release: {sent:?}"
+    );
+    assert!(
+        sent.iter()
+            .any(|s| matches!(s, Sent::DownlinkNas { nas_pdu, .. }
+            if nas_pdu.windows(command.len()).any(|w| w == command))),
+        "the SMF's RELEASE COMMAND reaches the UE after the Service Request: {sent:?}"
+    );
+    server.forget_ue(ue);
+
+    // The modification: the SMF's own MODIFICATION REJECT.
+    let reject = vec![0x2E, 0x05, 0x07, 0xCA, 0x1D];
+    let (refusing, port) = refusing_smf(403, Some(reject.clone())).await;
+    let (ue, ran) = (16_430_102u64, 192u32);
+    secured_registered_ue(&mut server, ue, ran);
+    hold_session(&mut server, ue, 5, "mod-1643-idle", port);
+    let paged = page_after_idle_answer(&mut server, ue, ran, &[0x2E, 0x05, 0x07, 0xC9]).await;
+    assert_eq!(paged.pending_n1.as_deref(), Some(&reject[..]));
+    assert!(!paged.pending_n2_release && !paged.pending_n2_modify);
+    server.ue_auth_state.with_mut(ue, |s| s.cm_idle = false);
+    take_sent_ngap(&mut server);
+    server
+        .deliver_paged_after_service_request(ASSOC, ue, ran, &paged)
+        .await
+        .expect("delivered");
+    let sent: Vec<Sent> = take_sent_ngap(&mut server)
+        .into_iter()
+        .map(|(_, p)| decode_sent(&p))
+        .collect();
+    assert!(
+        sent.iter()
+            .any(|s| matches!(s, Sent::DownlinkNas { nas_pdu, .. }
+            if nas_pdu.windows(reject.len()).any(|w| w == reject))),
+        "the SMF's MODIFICATION REJECT reaches the UE after the Service Request: {sent:?}"
+    );
+    server.forget_ue(ue);
+    refusing.stop().await.expect("stop");
+}
+
+/// #1643 review, TS 24.501 §7.3.2 c) 2): a PDU SESSION RELEASE REQUEST for a PSI that
+/// matches no existing PDU session is answered with a DL NAS TRANSPORT carrying the
+/// message back and 5GMM #90 "payload was not forwarded". Before, it was dropped.
+///
+/// REVERT-VERIFIED: with the drop back, nothing is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_release_request_for_no_session_gets_payload_not_forwarded_1643() {
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (16_430_111u64, 193u32);
+    secured_registered_ue(&mut server, ue, ran);
+    let request = [0x2E, 0x09, 0x07, 0xD1];
+    server
+        .handle_5gsm_message(ASSOC, ue, ran, &request, None)
+        .await
+        .expect("handled");
+    let sent: Vec<Sent> = take_sent_ngap(&mut server)
+        .into_iter()
+        .map(|(_, p)| decode_sent(&p))
+        .collect();
+    let [Sent::DownlinkNas { nas_pdu, .. }] = &sent[..] else {
+        panic!("one DL NAS TRANSPORT: {sent:?}");
+    };
+    use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+    let Ok(FiveGmmMessage::DlNasTransport(dl)) =
+        parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&nas_pdu[7..]))
+    else {
+        panic!("a DL NAS TRANSPORT: {nas_pdu:02x?}");
+    };
+    assert_eq!(dl.gmm_cause, Some(90));
+    assert_eq!(dl.payload_container.data.to_vec(), request.to_vec());
+    server.forget_ue(ue);
+}
+
 /// #1590 review guard: an SMF that refuses a UE-requested modification with an N1
 /// that is not a 5GSM message for this session does not have it relayed. The UE
 /// gets the AMF's own MODIFICATION REJECT #26.
