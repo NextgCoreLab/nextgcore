@@ -3965,15 +3965,30 @@ pub(crate) fn take_over_transferred_event_subscriptions(
                 .unwrap_or_default(),
         };
 
+        // #1726 review M1: a retried registration with the same foreign 5G-GUTI
+        // fetches the same context again from an old AMF that kept it (TS 29.518
+        // §5.2.2.2.2), and the subscription it carries is already here. The consumer
+        // was told that copy's ID, so it is kept and the consumer is not told again.
         let added = ctx
             .read()
-            .map(|guard| guard.event_subscription_add(sub.clone()))
-            .unwrap_or(false);
-        if !added {
-            log::warn!(
-                "[{ue_context_id}] transferred event subscription {subscription_id} not stored"
-            );
-            continue;
+            .map_err(|_| String::new())
+            .and_then(|guard| guard.event_subscription_add_unless_equivalent(sub.clone()));
+        match added {
+            Ok(()) => {}
+            Err(existing) if !existing.is_empty() => {
+                log::info!(
+                    "[{ue_context_id}] transferred event subscription already taken over as \
+                     {existing}: kept, not duplicated"
+                );
+                continue;
+            }
+            Err(_) => {
+                log::warn!(
+                    "[{ue_context_id}] transferred event subscription {subscription_id} not \
+                     stored"
+                );
+                continue;
+            }
         }
         created += 1;
 
