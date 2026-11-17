@@ -1107,6 +1107,39 @@ fn data_plane_pdr_from_parsed(p: &crate::n4_build::ParsedCreatePdr) -> data_plan
     }
 }
 
+/// Merge an Update PDR into the PDR the data plane holds (#1673, TS 29.244
+/// §5.6.3 and Table 7.5.4.2-1): an IE the update does not carry keeps its value,
+/// a present one replaces it (a PDI whole, with its SDF filter and QFI), and a
+/// null-length FAR ID, URR ID, QER ID or Outer Header Removal removes it.
+fn apply_update_pdr(pdr: &mut data_plane::DataPlanePdr, u: &crate::n4_build::ParsedUpdatePdr) {
+    if let Some(precedence) = u.precedence {
+        pdr.precedence = precedence;
+    }
+    if let Some(pdi) = &u.pdi {
+        let parsed = crate::n4_build::ParsedCreatePdr {
+            pdi: pdi.clone(),
+            ..Default::default()
+        };
+        let fresh = data_plane_pdr_from_parsed(&parsed);
+        pdr.source_interface = fresh.source_interface;
+        pdr.sdf_rule = fresh.sdf_rule;
+        pdr.qfi = fresh.qfi;
+    }
+    if let Some(ohr) = u.outer_header_removal {
+        pdr.outer_header_removal = ohr;
+    }
+    if let Some(far_id) = u.far_id {
+        pdr.far_id = far_id;
+    }
+    if let Some(urr_ids) = &u.urr_ids {
+        pdr.urr_ids = urr_ids.clone();
+    }
+    if let Some(qer_ids) = &u.qer_ids {
+        // One QER per PDR in the data plane until #1672.
+        pdr.qer_id = qer_ids.first().copied();
+    }
+}
+
 /// A FAR as the data plane holds it, from a PFCP Create FAR or Update FAR (#918).
 ///
 /// The Outer Header Creation endpoint is the IPv4 address when the OHC carries one,
@@ -1501,11 +1534,22 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                         }
                     }
                 }
+                // #1673: an Update PDR changes only what it carries (TS 29.244
+                // §5.6.3). It used to replace the stored PDR with one built from
+                // the update alone, so a precedence-only update dropped the PDR's
+                // FAR, URRs, QER and PDI.
                 if !updated_pdrs.is_empty() {
                     let mut dp_pdrs = session.pdrs.write().unwrap();
-                    for p in &updated_pdrs {
-                        dp_pdrs.retain(|e| e.pdr_id != p.pdr_id);
-                        dp_pdrs.push(data_plane_pdr_from_parsed(p));
+                    for u in &updated_pdrs {
+                        match dp_pdrs.iter_mut().find(|e| e.pdr_id == u.pdr_id) {
+                            Some(stored) => apply_update_pdr(stored, u),
+                            // The PFCP layer already answered this one as a rule
+                            // failure (TS 29.244 §7.5.5); nothing to merge into.
+                            None => log::warn!(
+                                "Update PDR {}: the data plane holds no such PDR",
+                                u.pdr_id
+                            ),
+                        }
                     }
                     dp_pdrs.sort_by_key(|p| p.precedence);
                 }
