@@ -898,6 +898,7 @@ pub(crate) fn initiate_paging_for_idle_ue(
         pending_n2,
         pending_n2_release: paged_n2 == PagedN2::Release,
         pending_n2_modify: paged_n2 == PagedN2::Modify,
+        pending_n1_only: false,
         pdu_session_id,
         // The registration area this AMF assigned: the single TAI the
         // Registration Accept's TAI list carries (`gmm_build`, list type 00).

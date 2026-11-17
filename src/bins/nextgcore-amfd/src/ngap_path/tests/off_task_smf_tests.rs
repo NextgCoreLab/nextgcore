@@ -563,9 +563,9 @@ async fn page_after_idle_answer(
 }
 
 /// #1643 review, TS 23.502 §4.3.4.2 step 4 and §4.2.3.3: when the UE went CM-IDLE
-/// before the SMF's answer arrived, the AMF pages it. The SMF's RELEASE COMMAND (with
-/// the N2 release) or its MODIFICATION REJECT is kept in the page and delivered after
-/// the Service Request, through the N1N2 transfer's paging path.
+/// before the SMF's answer arrived, the AMF pages it. The SMF's RELEASE COMMAND or its
+/// MODIFICATION REJECT is kept in the page, N1 only, and delivered after the Service
+/// Request, through the N1N2 transfer's paging path.
 ///
 /// REVERT-VERIFIED: with the answer dropped for an idle UE again (no page), both
 /// cases panic "was not paged".
@@ -588,7 +588,10 @@ async fn an_smf_answer_for_a_ue_gone_idle_is_paged_for_and_delivered_1643() {
         Some(&command[..]),
         "the SMF's command is kept"
     );
-    assert!(paged.pending_n2_release, "with the N2 release");
+    assert!(
+        paged.pending_n1_only && !paged.pending_n2_release && paged.pending_n2.is_none(),
+        "N1 only: a CM-IDLE UE has no AN resources to release (round 2)"
+    );
     assert_eq!(paged.pdu_session_id, Some(5));
     // The UE answers the page: the Service Request brings it back.
     server.ue_auth_state.with_mut(ue, |s| s.cm_idle = false);
@@ -602,9 +605,10 @@ async fn an_smf_answer_for_a_ue_gone_idle_is_paged_for_and_delivered_1643() {
         .map(|(_, p)| decode_sent(&p))
         .collect();
     assert!(
-        sent.iter()
-            .any(|s| matches!(s, Sent::ReleaseCommand { psis, .. } if psis == &[5])),
-        "the gNB's release: {sent:?}"
+        !sent
+            .iter()
+            .any(|s| matches!(s, Sent::ReleaseCommand { .. })),
+        "no Release Command at the gNB: {sent:?}"
     );
     assert!(
         sent.iter()
@@ -622,7 +626,7 @@ async fn an_smf_answer_for_a_ue_gone_idle_is_paged_for_and_delivered_1643() {
     hold_session(&mut server, ue, 5, "mod-1643-idle", port);
     let paged = page_after_idle_answer(&mut server, ue, ran, &[0x2E, 0x05, 0x07, 0xC9]).await;
     assert_eq!(paged.pending_n1.as_deref(), Some(&reject[..]));
-    assert!(!paged.pending_n2_release && !paged.pending_n2_modify);
+    assert!(paged.pending_n1_only && !paged.pending_n2_release && !paged.pending_n2_modify);
     server.ue_auth_state.with_mut(ue, |s| s.cm_idle = false);
     take_sent_ngap(&mut server);
     server
@@ -641,6 +645,191 @@ async fn an_smf_answer_for_a_ue_gone_idle_is_paged_for_and_delivered_1643() {
     );
     server.forget_ue(ue);
     refusing.stop().await.expect("stop");
+}
+
+/// The PSIs an INITIAL CONTEXT SETUP REQUEST sets up; `None` for any other PDU.
+fn ics_psis(pdu: &[u8]) -> Option<Vec<u8>> {
+    use g::InitialContextSetupRequestProtocolIEs_EntryValue as V;
+    use nextgcore_ngap_gen::generated as g;
+    let Ok(g::NGAP_PDU::InitiatingMessage(m)) = nextgcore_ngap_gen::decode(pdu) else {
+        return None;
+    };
+    let g::InitiatingMessageValue::Id_InitialContextSetup(req) = m.value else {
+        return None;
+    };
+    Some(
+        req.protocol_i_es
+            .0
+            .into_iter()
+            .filter_map(|ie| match ie.value {
+                V::Id_PDUSessionResourceSetupListCxtReq(l) => Some(l.0),
+                _ => None,
+            })
+            .flatten()
+            .map(|it| it.pdu_session_id.0)
+            .collect(),
+    )
+}
+
+/// The UE's release answered while it went CM-IDLE, then the UE answers the page
+/// with a real Service Request from CM-IDLE (`pss`: its PDU session status IE, if
+/// any). Returns the SMF calls and the NGAP sent after the Service Request.
+async fn release_then_idle_service_request(
+    old_id: u64,
+    new_id: u64,
+    sm_ref: &str,
+    pss: Option<[u8; 2]>,
+) -> (Vec<ReleaseCall>, Vec<Vec<u8>>) {
+    crate::context::amf_context_init(64, 1024, 4096);
+    let (_smf, port, calls) = release_answering_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let mut ue = idle_registered_ue(old_id);
+    ue.cm_idle = false;
+    ue.amf_ue.supi = Some(format!("imsi-00101000164{:05}", old_id % 100_000));
+    ue.amf_ue.allowed_nssai = vec![crate::context::SNssai { sst: 1, sd: None }];
+    {
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().expect("ctx lock");
+        guard.amf_ue_publish(&ue.amf_ue, 51, 1);
+    }
+    server.ue_auth_state.insert(old_id, ue);
+    hold_session(&mut server, old_id, 5, sm_ref, port);
+    server.mark_up_active(old_id, 5);
+    let paged = {
+        server
+            .handle_5gsm_message(ASSOC, old_id, 51, &[0x2E, 0x05, 0x07, 0xD1], None)
+            .await
+            .expect("handled");
+        server.ue_auth_state.with_mut(old_id, |s| s.cm_idle = true);
+        let mut found = None;
+        for _ in 0..300 {
+            server.process_sbi_outcomes().await;
+            found = crate::context::amf_self()
+                .read()
+                .unwrap()
+                .paging_find(old_id);
+            if found.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        found.expect("the UE is paged")
+    };
+    assert!(paged.pending_n1_only, "an N1-only page");
+    assert!(
+        paged.pending_n2.is_none() && !paged.pending_n2_release,
+        "no N2"
+    );
+    take_sent_ngap(&mut server);
+    let calls_before = calls.lock().expect("calls").len();
+
+    let mut nas = protected_service_request([0; 4], old_id as u32);
+    if let Some(bitmap) = pss {
+        nas.extend_from_slice(&[0x50, 0x02, bitmap[0], bitmap[1]]);
+    }
+    server.forced_amf_ue_ngap_id = Some(new_id);
+    let _ = server
+        .handle_initial_ue_message(1, &service_request_initial_ue(nas))
+        .await;
+    let mut sent = Vec::new();
+    for _ in 0..50 {
+        server.process_sbi_outcomes().await;
+        sent.extend(take_sent_ngap(&mut server).into_iter().map(|(_, p)| p));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let after = calls.lock().expect("calls")[calls_before..].to_vec();
+    server.forget_ue(new_id);
+    crate::context::amf_self()
+        .read()
+        .unwrap()
+        .paging_remove(old_id);
+    (after, sent)
+}
+
+/// #1643 review round 2, TS 23.502 §4.3.4.2 step 4 (the NAS message only): a page for
+/// the SMF's answer to the UE's own release is N1-only. The real Service Request from
+/// CM-IDLE that answers it re-activates no user plane for that session (no
+/// ACTIVATING at the SMF, no ICS item for the PSI), and the SMF's RELEASE COMMAND goes
+/// to the UE in a DL NAS TRANSPORT, with no Release Command at the gNB. If the UE's
+/// PDU session status already shows the session inactive, it is released toward the
+/// SMF there and the command is not sent.
+///
+/// REVERT-VERIFIED: with the page queued as before (PagedN2::Release / Setup, no
+/// N1-only mark), the #540 rule sends ACTIVATING for PSI 5 and the first case fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_n1_only_page_reactivates_nothing_and_delivers_the_command_1643() {
+    let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+    // Paging reads the strategy (#1588).
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
+    let saved_guamis = crate::context::amf_self()
+        .read()
+        .expect("ctx lock")
+        .served_guami
+        .clone();
+    serve_only_local_guami();
+    let command = [0x2E, 0x05, 0x07, 0xD3, 0x24];
+    let has_command = |sent: &[Vec<u8>]| {
+        sent.iter().any(|p| {
+            matches!(decode_sent(p), Sent::DownlinkNas { nas_pdu, .. }
+                if nas_pdu.windows(command.len()).any(|w| w == command))
+        })
+    };
+
+    // The Service Request reports no PDU session status.
+    let (calls, sent) =
+        release_then_idle_service_request(16_430_201, 16_430_202, "rel-n2-1643-sr", None).await;
+    assert!(
+        !calls
+            .iter()
+            .any(|(_, b, _)| b["upCnxState"] == "ACTIVATING"),
+        "no user-plane activation for the released session: {calls:?}"
+    );
+    assert!(
+        sent.iter()
+            .filter_map(|p| ics_psis(p))
+            .all(|psis| !psis.contains(&5)),
+        "the Initial Context Setup sets no PSI 5 up"
+    );
+    assert!(
+        !sent
+            .iter()
+            .any(|p| matches!(decode_sent(p), Sent::ReleaseCommand { .. })),
+        "no Release Command at the gNB: the UE had no AN resources"
+    );
+    assert!(
+        has_command(&sent),
+        "the SMF's RELEASE COMMAND reaches the UE"
+    );
+
+    // Its PDU session status shows PSI 5 inactive (all bits clear).
+    let (calls, sent) = release_then_idle_service_request(
+        16_430_211,
+        16_430_212,
+        "rel-n2-1643-pss",
+        Some([0x00, 0x00]),
+    )
+    .await;
+    assert!(
+        calls
+            .iter()
+            .any(|(u, _, _)| u.ends_with("/sm-contexts/rel-n2-1643-pss/release")),
+        "the session is released toward the SMF: {calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|(_, b, _)| b["upCnxState"] == "ACTIVATING"),
+        "and not activated: {calls:?}"
+    );
+    assert!(
+        !has_command(&sent),
+        "no RELEASE COMMAND for a session the UE dropped"
+    );
+
+    let ctx = crate::context::amf_self();
+    let mut ctx = ctx.write().expect("ctx lock");
+    ctx.num_of_served_guami = saved_guamis.len();
+    ctx.served_guami = saved_guamis;
 }
 
 /// #1643 review, TS 24.501 §7.3.2 c) 2): a PDU SESSION RELEASE REQUEST for a PSI that

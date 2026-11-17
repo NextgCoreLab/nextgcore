@@ -2229,6 +2229,15 @@ impl AmfContext {
     /// Initiate paging for a UE in CM-IDLE state
     /// Set the payload container type a queued paging context's pending N1 is
     /// delivered in (#540). No-op when no paging is queued for the UE.
+    /// Mark the page queued for `amf_ue_ngap_id` as N1-only (#1643 review).
+    pub fn paging_set_n1_only(&self, amf_ue_ngap_id: u64) {
+        if let Ok(mut paging_map) = self.paging_map.write() {
+            if let Some(ctx) = paging_map.get_mut(&amf_ue_ngap_id) {
+                ctx.pending_n1_only = true;
+            }
+        }
+    }
+
     pub fn paging_set_n1_container_type(&self, amf_ue_ngap_id: u64, container_type: u8) {
         if let Ok(mut paging_map) = self.paging_map.write() {
             if let Some(ctx) = paging_map.get_mut(&amf_ue_ngap_id) {
@@ -5005,6 +5014,12 @@ pub struct PagingContext {
     /// a UE that has not moved since it went idle is still under the gNB it was
     /// last seen on.
     pub nwdaf_last_cell: Option<(PlmnId, u64)>,
+    /// #1643 review: the page carries only the SMF's N1 for `pdu_session_id`, an
+    /// answer to the UE's own release or modification request. TS 23.502 §4.3.4.2
+    /// step 4: the NAS message only. The UE's answer re-activates no user plane
+    /// for it (the #540 rule does not apply), and if the UE's PDU session status
+    /// shows the session gone, the N1 is not sent.
+    pub pending_n1_only: bool,
 }
 
 /// What one paging pump pass decided (TS 24.501 §5.6.2.2.1 / §5.6.2.2.2).
@@ -5035,6 +5050,7 @@ impl Default for PagingContext {
             pending_n2: None,
             pending_n2_release: false,
             pending_n2_modify: false,
+            pending_n1_only: false,
             pdu_session_id: None,
             tai_list: Vec::new(),
             last_sent: None,

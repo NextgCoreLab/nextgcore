@@ -6462,7 +6462,7 @@ impl NgapServer {
         );
         // A page that named a session but brought no setup transfer (smfd's Downlink
         // Data Report paging) re-activates it, as the Service Request path does (#540).
-        if let Some(p) = page {
+        if let Some(p) = page.filter(|p| !p.pending_n1_only) {
             if let (Some(psi), false) = (p.pdu_session_id, p.pending_n2_release) {
                 if !already.contains(&psi)
                     && !plan.activate.contains(&psi)
@@ -7752,10 +7752,14 @@ impl NgapServer {
         // paging names the session and the IE type only -- is re-activated like
         // an uplink-data session (§4.2.3.2 step 4, upCnxState ACTIVATING), so the
         // ICS carries it and the buffered downlink is delivered.
-        if let Some(p) = &paging {
+        // #1643 review: not for an N1-only page (the SMF's answer to the UE's own
+        // release or modification), and not for a session the UE's PDU session
+        // status is releasing.
+        if let Some(p) = paging.as_ref().filter(|p| !p.pending_n1_only) {
             if let (Some(psi), false) = (p.pdu_session_id, p.pending_n2_release) {
                 if !already.contains(&psi)
                     && !plan.activate.contains(&psi)
+                    && !plan.release.contains(&psi)
                     && held.iter().any(|(h, _, _)| *h == psi)
                 {
                     plan.activate.push(psi);
@@ -8039,6 +8043,22 @@ impl NgapServer {
         ran_ue_ngap_id: u32,
         paging: &crate::context::PagingContext,
     ) -> Result<()> {
+        // #1643 review: an N1-only page answers the UE's own release or modification
+        // of a session. If the UE's Service Request or registration already reported
+        // that session inactive, the session was released toward the SMF there
+        // (its SM context is gone), so the N1 is not sent: the UE would answer 5GSM
+        // STATUS #43.
+        if paging.pending_n1_only {
+            if let Some(psi) = paging.pdu_session_id {
+                if !self.sm_context_refs.contains_key(&(amf_ue_ngap_id, psi)) {
+                    log::info!(
+                        "UE {amf_ue_ngap_id}: paged N1 for PSI {psi} not sent: the UE's PDU \
+                         session status released the session"
+                    );
+                    return Ok(());
+                }
+            }
+        }
         if paging.pending_n2_modify {
             if let (Some(psi), Some(transfer)) = (paging.pdu_session_id, &paging.pending_n2) {
                 // #778 review m4: the modification applies to a user plane the
@@ -10682,18 +10702,11 @@ impl NgapServer {
         if state.is_cm_idle() {
             // #1643 review: the SMF's N1 (and N2) are paged for, not dropped.
             let held = match result {
-                Ok((n1, n2)) if smf_n1_for_session(&n1, psi) => Some((
-                    n1,
-                    if n2.is_empty() {
-                        crate::context::ConnectedN2::None
-                    } else {
-                        crate::context::ConnectedN2::Modify(n2)
-                    },
-                )),
+                Ok((n1, _)) if smf_n1_for_session(&n1, psi) => Some(n1),
                 Err(crate::sbi_path::SmContextUpdateRefusal {
                     n1_sm_msg: Some(n1),
                     ..
-                }) if smf_n1_for_session(&n1, psi) => Some((n1, crate::context::ConnectedN2::None)),
+                }) if smf_n1_for_session(&n1, psi) => Some(n1),
                 _ => None,
             };
             let amf_ue = state.amf_ue.clone();
@@ -10795,21 +10808,14 @@ impl NgapServer {
         };
         if state.is_cm_idle() {
             // #1643 review, TS 23.502 §4.3.4.2 step 4: a UE that went CM-IDLE is paged
-            // for the SMF's RELEASE COMMAND (or REJECT), which is delivered after its
-            // Service Request.
+            // for the SMF's RELEASE COMMAND (or REJECT), the NAS message only, which is
+            // delivered after its Service Request.
             let held = match result {
-                Ok(answer) if smf_n1_for_session(&answer.n1_sm_msg, psi) => Some((
-                    answer.n1_sm_msg,
-                    if answer.n2_sm_info.is_empty() {
-                        crate::context::ConnectedN2::None
-                    } else {
-                        crate::context::ConnectedN2::Release
-                    },
-                )),
+                Ok(answer) if smf_n1_for_session(&answer.n1_sm_msg, psi) => Some(answer.n1_sm_msg),
                 Err(crate::sbi_path::SmContextUpdateRefusal {
                     n1_sm_msg: Some(n1),
                     ..
-                }) if smf_n1_for_session(&n1, psi) => Some((n1, crate::context::ConnectedN2::None)),
+                }) if smf_n1_for_session(&n1, psi) => Some(n1),
                 _ => None,
             };
             let amf_ue = state.amf_ue.clone();
@@ -11053,9 +11059,9 @@ impl NgapServer {
 
     /// #1643 review: the SMF's answer to a UE-requested modification or release found
     /// the UE CM-IDLE. TS 23.502 §4.3.4.2 step 4 / §4.3.3.2 and §4.2.3.3: the AMF pages
-    /// it and delivers the SMF's N1 (and N2) after the Service Request. This is the
-    /// N1N2 transfer path [`Self::page_for_queued_downlink`] uses. If the page fails,
-    /// the N1 is dropped with it and the SMF's T3591/T3592 (or the UE's T3581/T3582)
+    /// it and delivers the SMF's N1 after the Service Request, through the N1N2
+    /// transfer paging path, N1 only: no N2, and no user plane re-activated for the
+    /// session (`pending_n1_only`). If the page fails, the N1 is dropped with it and the SMF's T3591/T3592 (or the UE's T3581/T3582)
     /// recovers. With nothing to deliver (no N1 of the SMF's for this session),
     /// nothing is paged.
     fn page_for_smf_answer(
@@ -11063,9 +11069,9 @@ impl NgapServer {
         amf_ue: &AmfUe,
         psi: u8,
         what: &str,
-        held: Option<(Vec<u8>, crate::context::ConnectedN2)>,
+        held: Option<Vec<u8>>,
     ) -> Result<()> {
-        let Some((n1, n2)) = held else {
+        let Some(n1) = held else {
             log::warn!(
                 "{what} answer for UE {} PSI {psi}: the UE went CM-IDLE meanwhile and the \
                  SMF gave no N1 for it; nothing is paged",
@@ -11079,16 +11085,35 @@ impl NgapServer {
             amf_ue.id,
             n1.len()
         );
-        self.page_for_queued_downlink(
-            amf_ue,
-            crate::context::PendingConnectedDownlink {
+        // #1643 review, TS 23.502 §4.3.4.2 step 4: the NAS message only. A CM-IDLE
+        // UE has no AN resources, so the SMF's N2 (a release or modify transfer)
+        // has nothing to act on and is not paged for.
+        if crate::namf_handler::paging_ongoing(amf_ue.id) {
+            // As for a queued N1N2 transfer (#749): delivered once the UE answers
+            // the ongoing page and is CM-CONNECTED.
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.connected_downlink_add(crate::context::PendingConnectedDownlink {
                 amf_ue_ngap_id: amf_ue.id,
                 pdu_session_id: psi,
                 n1: Some(n1),
-                n2,
+                n2: crate::context::ConnectedN2::None,
                 failure_notify_uri: None,
-            },
+            });
+            return Ok(());
+        }
+        crate::namf_handler::initiate_paging_for_idle_ue(
+            amf_ue,
+            None,
+            Some(n1),
+            None,
+            crate::namf_handler::PagedN2::Setup,
+            Some(psi),
+            None,
         );
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        guard.paging_set_n1_only(amf_ue.id);
         Ok(())
     }
 
