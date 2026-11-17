@@ -26073,6 +26073,8 @@ mod tests {
             }
         }
 
+        // #1693: the default half pumps the global paging map too.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
         let _strategy = PagingStrategyGuard::set(crate::context::PagingStrategy::default()).await;
         let ue = 464_211u64;
         insert_nwdaf_ue(&ngap, ue, base + 1, Some("imsi-001010000464211"), Some(1));
@@ -26896,6 +26898,8 @@ mod tests {
     async fn an_ng_reset_clears_a_stored_recommendation() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
         let _strategy =
             PagingStrategyGuard::set(crate::context::PagingStrategy::RecommendedFirst).await;
         let (base, ue) = (14_460u64, 1_442_005u64);
@@ -26916,6 +26920,8 @@ mod tests {
     async fn an_association_loss_clears_a_stored_recommendation() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
         let _strategy =
             PagingStrategyGuard::set(crate::context::PagingStrategy::RecommendedFirst).await;
         let (base, ue) = (14_470u64, 1_442_006u64);
@@ -26933,6 +26939,8 @@ mod tests {
     async fn an_initial_context_setup_failure_clears_a_stored_recommendation() {
         let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
         let _strategy =
             PagingStrategyGuard::set(crate::context::PagingStrategy::RecommendedFirst).await;
         let (base, ue) = (14_480u64, 1_442_007u64);

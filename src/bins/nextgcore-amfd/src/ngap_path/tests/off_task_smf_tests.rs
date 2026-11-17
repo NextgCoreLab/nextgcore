@@ -572,6 +572,8 @@ async fn page_after_idle_answer(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_smf_answer_for_a_ue_gone_idle_is_paged_for_and_delivered_1643() {
     // The page reads the paging strategy (#1588).
+    // #1693: this test adds pages to, or pumps, the process-global paging map.
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
 
     // The release: N1 RELEASE COMMAND and the N2 release.
@@ -903,6 +905,8 @@ async fn an_n1_only_page_reactivates_nothing_and_delivers_the_command_1643() {
     // The re-page case drains the process-global connected-downlink queue.
     let _q = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
     // Paging reads the strategy (#1588).
+    // #1693: this test adds pages to, or pumps, the process-global paging map.
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     let _guamis = serve_only_local_guami();
     let command = [0x2E, 0x05, 0x07, 0xD3, 0x24];

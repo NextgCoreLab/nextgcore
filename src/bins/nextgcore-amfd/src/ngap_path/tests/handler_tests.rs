@@ -2886,6 +2886,8 @@ async fn paged_modification_answered(
 #[allow(clippy::await_holding_lock)]
 async fn a_paged_modification_rides_after_an_ics_that_set_its_session_up() {
     let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    // #1693: this test adds pages to, or pumps, the process-global paging map.
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeOneGuami::install();
     let (sent, calls) = paged_modification_answered(7_778_011, 7_778_012, "pmod-778-ok").await;
@@ -2915,6 +2917,8 @@ async fn a_paged_modification_rides_after_an_ics_that_set_its_session_up() {
 #[allow(clippy::await_holding_lock)]
 async fn a_paged_modification_of_a_session_not_set_up_sends_only_the_n1() {
     let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+    // #1693: this test adds pages to, or pumps, the process-global paging map.
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
     crate::context::amf_context_init(64, 1024, 4096);
     let _guami = ServeOneGuami::install();
     let (sent, _calls) = paged_modification_answered(7_778_021, 7_778_022, "fail-pmod-778").await;

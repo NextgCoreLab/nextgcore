@@ -2283,7 +2283,26 @@ impl AmfContext {
         }
     }
 
+    /// Test-only enforcement of [`PAGING_MAP_TEST_LOCK`] (#1709 review, as #1619 does
+    /// for the paging strategy): adding to or pumping the GLOBAL context's paging map
+    /// panics when nobody holds the lock, so a test that misses it fails on its own,
+    /// deterministically when it runs alone. A local `AmfContext::new()` is exempt.
+    #[cfg(test)]
+    #[track_caller]
+    fn assert_paging_map_lock_held(&self) {
+        let global = GLOBAL_PAGING_MAP_ADDR.get().copied();
+        let this = std::ptr::addr_of!(self.paging_map) as usize;
+        if global == Some(this) && PAGING_MAP_TEST_LOCK.try_lock().is_ok() {
+            panic!(
+                "the global paging map was used with PAGING_MAP_TEST_LOCK free: take it in \
+                 this test (#1693)"
+            );
+        }
+    }
+
     pub fn paging_add(&self, ctx: PagingContext) -> bool {
+        #[cfg(test)]
+        self.assert_paging_map_lock_held();
         if let Ok(mut paging_map) = self.paging_map.write() {
             let id = ctx.amf_ue_ngap_id;
             log::info!(
@@ -2507,6 +2526,8 @@ impl AmfContext {
     /// context is removed and returned as expired. Marks `last_sent` on every
     /// context it returns in `send`, so the caller transmits and nothing else.
     pub fn paging_take_due(&self, t3513: std::time::Duration) -> PagingDue {
+        #[cfg(test)]
+        self.assert_paging_map_lock_held();
         let mut due = PagingDue::default();
         let now = std::time::Instant::now();
         let Ok(mut paging_map) = self.paging_map.write() else {
@@ -5520,9 +5541,22 @@ pub(crate) static REACHABILITY_SWEEP_TEST_LOCK: tokio::sync::Mutex<()> =
 /// Get the global AMF context
 pub fn amf_self() -> Arc<RwLock<AmfContext>> {
     GLOBAL_AMF_CONTEXT
-        .get_or_init(|| Arc::new(RwLock::new(AmfContext::new())))
+        .get_or_init(|| {
+            let ctx = Arc::new(RwLock::new(AmfContext::new()));
+            // Test-only: where the global paging map lives, for
+            // `assert_paging_map_lock_held`. The context stays in this allocation.
+            #[cfg(test)]
+            if let Ok(guard) = ctx.read() {
+                let _ = GLOBAL_PAGING_MAP_ADDR.set(std::ptr::addr_of!(guard.paging_map) as usize);
+            }
+            ctx
+        })
         .clone()
 }
+
+/// Test-only: the address of the global context's paging map (#1709 review).
+#[cfg(test)]
+static GLOBAL_PAGING_MAP_ADDR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 /// Global MBS NGAP context (TS 23.247).
 ///
@@ -6179,8 +6213,6 @@ mod tests {
     /// answer for a page already sent is not applied.
     #[test]
     fn a_page_waiting_for_the_nwdaf_is_held_alone_until_the_answer_or_the_deadline() {
-        // #1693: this test adds pages to, or pumps, the process-global paging map.
-        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.blocking_lock();
         let mut ctx = AmfContext::new();
         ctx.init(64, 1024, 4096);
         let far = std::time::Instant::now() + std::time::Duration::from_secs(3600);
@@ -6239,8 +6271,6 @@ mod tests {
     /// Accept removes it early (`paging_take_answered`).
     #[test]
     fn an_answered_page_is_not_sent_but_still_expires() {
-        // #1693: this test adds pages to, or pumps, the process-global paging map.
-        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.blocking_lock();
         let mut ctx = AmfContext::new();
         ctx.init(64, 1024, 4096);
         let paging = PagingContext {
@@ -6287,8 +6317,6 @@ mod tests {
 
     #[test]
     fn test_paging_add_find_remove() {
-        // #1693: this test adds pages to, or pumps, the process-global paging map.
-        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.blocking_lock();
         let mut ctx = AmfContext::new();
         ctx.init(64, 1024, 4096);
 
@@ -6478,8 +6506,6 @@ mod tests {
 
     #[test]
     fn test_paging_retransmit_limit() {
-        // #1693: this test adds pages to, or pumps, the process-global paging map.
-        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.blocking_lock();
         let mut ctx = AmfContext::new();
         ctx.init(64, 1024, 4096);
 
