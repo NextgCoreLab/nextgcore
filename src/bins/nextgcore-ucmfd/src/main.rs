@@ -256,6 +256,17 @@ static UCMF: OnceLock<Arc<RwLock<Ucmf>>> = OnceLock::new();
 static API_ROOT: OnceLock<String> = OnceLock::new();
 static OAUTH2_CLIENT: OnceLock<Arc<OAuth2Client>> = OnceLock::new();
 
+/// #1665: the outbound OAuth2 client this UCMF installs at startup: under the
+/// `production` SBI profile or the `sbi.oauth2.require` knob, when an NRF is
+/// configured (see [`nextgcore_sbi::oauth::outbound_oauth2_client`]).
+fn outbound_oauth2_client(
+    profile: nextgcore_sbi::security::SbiProfile,
+    require_oauth2: bool,
+    nrf_uri: Option<&str>,
+) -> Option<Arc<OAuth2Client>> {
+    nextgcore_sbi::oauth::outbound_oauth2_client(profile, require_oauth2, nrf_uri, NfType::Ucmf)
+}
+
 /// Poisoned state locks recovered (#725 review): each one is a request that
 /// panicked under the lock, a defect to report.
 static POISON_RECOVERIES: AtomicU64 = AtomicU64::new(0);
@@ -451,6 +462,16 @@ async fn main() -> Result<()> {
             .unwrap_or("/etc/nextgcore/tls/server.key");
         sbi_config = sbi_config.with_tls(key, cert);
     }
+    // #1665: the outbound token client follows the SBI security profile as well
+    // as the knob. The production profile's AMF/AUSF/SMF/UDM demand a token on
+    // every service request (TS 33.501 §13.4.1.1.2), whatever this listener asks.
+    if let Some(oauth2) = outbound_oauth2_client(
+        nextgcore_sbi::security::SbiProfile::resolve(),
+        settings.require_oauth2,
+        Some(&settings.nrf_uri),
+    ) {
+        let _ = OAUTH2_CLIENT.set(oauth2);
+    }
     if settings.require_oauth2 {
         // TS 33.501 §13.4.1: verify Bearer tokens against the NRF JWKS, with
         // this NF's type as the required audience.
@@ -458,11 +479,6 @@ async fn main() -> Result<()> {
         sbi_config.oauth2_jwks_uri =
             Some(JwksCache::for_nrf(&settings.nrf_uri).jwks_uri().to_string());
         sbi_config = sbi_config.with_expected_audience_nf_type(NfType::Ucmf);
-        let _ = OAUTH2_CLIENT.set(Arc::new(OAuth2Client::new(
-            &settings.nrf_uri,
-            nf_instance_id.clone(),
-            NfType::Ucmf,
-        )));
         log::info!("OAuth2 enforcement enabled");
     }
 
@@ -2248,5 +2264,34 @@ mod tests_nf_profile_host_kind_1324 {
                 nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
             assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
         }
+    }
+}
+
+/// #1665: the outbound OAuth2 client follows the SBI security profile.
+#[cfg(test)]
+mod outbound_oauth2_1665_tests {
+    use nextgcore_sbi::security::SbiProfile;
+    use nextgcore_sbi::types::NfType;
+
+    const NRF: &str = "http://127.0.0.10:7777";
+
+    /// Under the `production` profile this UCMF installs its token client with
+    /// the `sbi.oauth2.require` knob off, so its service requests to the AMF, AUSF,
+    /// SMF and UDM (which require a bearer under that profile, #63) carry one
+    /// (TS 33.501 §13.4.1.1.2). Before #1665 it installed it only under the knob.
+    #[test]
+    fn the_production_profile_installs_the_outbound_oauth2_client_without_the_knob() {
+        let oauth2 = super::outbound_oauth2_client(SbiProfile::Production, false, Some(NRF))
+            .expect("production profile, knob off: the outbound OAuth2 client is installed");
+        assert_eq!(oauth2.self_consumer().nf_type, NfType::Ucmf);
+        assert_eq!(oauth2.nrf_uri(), NRF);
+        assert!(
+            super::outbound_oauth2_client(SbiProfile::Dev, true, Some(NRF)).is_some(),
+            "dev profile, knob on: the client is installed"
+        );
+        assert!(
+            super::outbound_oauth2_client(SbiProfile::Dev, false, Some(NRF)).is_none(),
+            "dev profile, knob off: no client, the token-free path is unchanged"
+        );
     }
 }
