@@ -777,6 +777,9 @@ fn self_entry_test_lock() -> &'static tokio::sync::Mutex<()> {
 }
 
 fn register_self_with_own_registry() {
+    // #1644 review M2: whatever armed one before (a restored registry), the NRF's
+    // own entry has no no-heartbeat timer.
+    disarm_heartbeat_timer(nrf_instance_id());
     let doc = nrf_self_profile();
     match NfProfile::from_json(&doc) {
         Ok(profile) => match nf_manager().register(profile) {
@@ -999,7 +1002,17 @@ fn negotiate_heartbeat(proposed: Option<u32>, default: u32, min: u32, max: u32) 
 
 /// Arm (or re-arm) the no-heartbeat expiry timer for an NF instance,
 /// cancelling any previously armed timer for the same instance.
+///
+/// Never for the NRF's own entry (#1644 review M2): the NRF does not heartbeat
+/// itself, so a timer on it (from `rearm_restored_timers` after a restart with
+/// persistence, or a PUT naming it) would suspend and then deregister it, after
+/// which its token endpoint grants no nnrf-* scope and the nrfd-06 gate refuses
+/// everyone.
 fn arm_heartbeat_timer(nf_instance_id: &str, expiry: Duration) {
+    if nf_instance_id.eq_ignore_ascii_case(nrf_instance_id()) {
+        disarm_heartbeat_timer(nf_instance_id);
+        return;
+    }
     let timer_mgr = timer_manager();
     let new_id = timer_mgr.start_timer(
         nextgcore_nrfd::NrfTimerId::NfInstanceNoHeartbeat,
@@ -8516,6 +8529,38 @@ mod tests {
             );
         }
         nf_manager().deregister(consumer).ok();
+    }
+
+    /// #1644 review M2: with persistence on, a restart restores the NRF's own entry
+    /// and re-arms every restored profile's no-heartbeat timer. The NRF's own entry
+    /// must get none, in either order of restore and self-registration, so it stays
+    /// REGISTERED past the heartbeat window and its token endpoint keeps issuing.
+    ///
+    /// REVERT-VERIFIED: without the guard in `arm_heartbeat_timer` (and the disarm in
+    /// `register_self_with_own_registry`), a timer is armed for the entry.
+    #[tokio::test]
+    async fn the_nrf_s_own_entry_never_gets_a_heartbeat_timer_1644() {
+        let _self_entry = self_entry_test_lock().lock().await;
+        let armed = || {
+            HEARTBEAT_TIMERS
+                .lock()
+                .expect("timers")
+                .contains_key(nrf_instance_id())
+        };
+        register_self_with_own_registry();
+        rearm_restored_timers();
+        assert!(!armed(), "restore after self-registration");
+        register_self_with_own_registry();
+        assert!(!armed(), "self-registration after restore");
+        arm_heartbeat_timer(nrf_instance_id(), Duration::from_secs(1));
+        assert!(!armed(), "nor through any other caller");
+        assert_eq!(
+            nf_manager()
+                .get(nrf_instance_id())
+                .expect("the entry stays")
+                .nf_status,
+            "REGISTERED"
+        );
     }
 
     /// #1644 review m4: the NRF registers itself whenever either its own token
