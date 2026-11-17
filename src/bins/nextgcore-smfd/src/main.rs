@@ -2642,7 +2642,11 @@ fn callback_not_admitted(sm_context_ref: &str, kind: context::SessionCallback) -
 /// §6.1.3c.3), because a third party can read both URIs back (the #1522 rule):
 /// - `{ref}/sm-policy-notify/{token}/{update,terminate}` needs a PCF: an SM policy
 ///   association GET returns `SmPolicyControl.context.notificationUri`
-///   (TS 29.512 §5.6.2.2);
+///   (TS 29.512 §5.6.2.2). And not any PCF: the association's own instance, or one
+///   the NRF lists in a PCF set the association's PCF belongs to (TS 23.501
+///   §5.21.3.2: the instances of a set are interchangeable). A session bound to a
+///   `PCF_URI` PCF, or created before this was recorded, has no instance to compare
+///   with, and admits any verified PCF (`policy::pcf_may_notify_for`);
 /// - `{ref}/sdm-notify/{token}` needs a UDM: a UDM may keep its SDM subscriptions in
 ///   the UDR (`context-data/sdm-subscriptions`, TS 29.505), which other Nudr_DR
 ///   consumers can read.
@@ -2673,8 +2677,19 @@ fn oauth2_callback_exemptions() -> Vec<nextgcore_sbi::server::OAuth2CallbackExem
             let [sm_context_ref] = cb.vars.as_slice() else {
                 return false;
             };
-            peer.has_nf_type(nf_type)
-                && session_admits_callback(sm_context_ref, kind, Some(&cb.token))
+            if !peer.has_nf_type(nf_type) {
+                return false;
+            }
+            let Some(binding) = lookup_policy_binding(sm_context_ref) else {
+                return false;
+            };
+            if !binding.admits_callback(kind, Some(&cb.token)) {
+                return false;
+            }
+            // #1518 (#1694 review): an SM policy notification comes from the
+            // association's PCF, or another member of its PCF set.
+            kind != SessionCallback::SmPolicyNotify
+                || policy::pcf_may_notify_for(&binding.sm_policy_pcf, &peer.nf_instance_id).await
         })
     };
     let sm_policy = |op: &str| {
@@ -5214,6 +5229,8 @@ async fn handle_sm_context_create_inner(request: &SbiRequest) -> SbiResponse {
 
     // ---- Npcf_SMPolicyControl_Create (TS 29.512 §4.2.2) ----
     let notification_uri = sm_policy_notify_uri(&sm_context_ref, &sm_policy_notify_token);
+    // #1518: the PCF the association is created at, recorded on the binding.
+    let mut sm_policy_pcf = policy::PcfIdentity::default();
     let mut decision = match policy::resolve_pcf_endpoint().await {
         None => {
             // Documented config-default fallback: no PCF configured.
@@ -5270,6 +5287,7 @@ async fn handle_sm_context_create_inner(request: &SbiRequest) -> SbiResponse {
                         decision.pcc_rules.len()
                     );
                     fsm_dispatch_policy_response(&mut fsm, 201);
+                    sm_policy_pcf = pcf.identity();
                     decision
                 }
                 Err(policy::PolicyError::Rejected { status, detail }) => {
@@ -5696,7 +5714,11 @@ async fn handle_sm_context_create_inner(request: &SbiRequest) -> SbiResponse {
                     sm_policy_notify_token: Some(sm_policy_notify_token.clone()),
                     sdm_notify_token: Some(sdm_notify_token.clone()),
                     network_paging: None,
-                    easdf_report_token: Some(easdf_report_token.clone()),
+                    // #1713 review: held only when a DNS context was created with it.
+                    easdf_report_token: easdf_dns_context_id
+                        .is_some()
+                        .then(|| easdf_report_token.clone()),
+                    sm_policy_pcf: sm_policy_pcf.clone(),
                 },
             );
         }
@@ -17848,6 +17870,7 @@ mod tests {
                         easdf_report_token: Some(test_callback_token(&format!(
                             "eas-{sm_context_ref}"
                         ))),
+                        sm_policy_pcf: crate::policy::PcfIdentity::default(),
                     },
                 );
             }
@@ -18030,6 +18053,275 @@ mod tests {
             let mut bindings = ctx.policy_bindings.write().unwrap();
             bindings.remove(a);
             bindings.remove(b);
+        }
+    }
+
+    /// #1518 (#1694 review): two PCFs of one set and one outside it, as an NRF lists
+    /// them (`nfSetIdList`, TS 29.510 §6.1.6.2.2).
+    const PCF_A_1518: &str = "4e3c1518-0000-4000-8000-00000000000a";
+    const PCF_B_1518: &str = "4e3c1518-0000-4000-8000-00000000000b";
+    const PCF_C_1518: &str = "4e3c1518-0000-4000-8000-00000000000c";
+    const PCF_SET_1518: &str = "set1518.pcfset.5gc.mnc001.mcc001";
+
+    fn pcf_profile_1518(id: &str, sets: &[&str], port: u16) -> serde_json::Value {
+        serde_json::json!({
+            "nfInstanceId": id,
+            "nfType": "PCF",
+            "nfStatus": "REGISTERED",
+            "nfSetIdList": sets,
+            "ipv4Addresses": ["127.0.0.1"],
+            "nfServices": [{
+                "serviceInstanceId": "1",
+                "serviceName": "npcf-smpolicycontrol",
+                "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": port }],
+            }],
+        })
+    }
+
+    /// A stand-in NRF that is also the PCF it lists: discovery of a PCF answers
+    /// PCF A and B (one set) and C (none), all at this server; an SM policy create
+    /// answers 201. Any other discovery finds nothing.
+    async fn nrf_and_pcf_1518() -> (nextgcore_sbi::server::SbiServer, u16) {
+        let port = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let p = port.clone();
+        let (srv, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let p = p.load(std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    let path = req.header.uri.split('?').next().unwrap_or_default();
+                    if path.starts_with("/nnrf-disc/") {
+                        let instances = if req.http.get_param("target-nf-type").map(String::as_str)
+                            == Some("PCF")
+                        {
+                            vec![
+                                pcf_profile_1518(PCF_A_1518, &[PCF_SET_1518], p),
+                                pcf_profile_1518(PCF_B_1518, &[PCF_SET_1518], p),
+                                pcf_profile_1518(PCF_C_1518, &[], p),
+                            ]
+                        } else {
+                            Vec::new()
+                        };
+                        return SbiResponse::with_status(200)
+                            .with_json_body(&serde_json::json!({
+                                "validityPeriod": 3600,
+                                "nfInstances": instances,
+                            }))
+                            .unwrap();
+                    }
+                    if path == "/npcf-smpolicycontrol/v1/sm-policies" && req.header.method == "POST"
+                    {
+                        return SbiResponse::with_status(201)
+                            .with_header(
+                                "Location",
+                                "/npcf-smpolicycontrol/v1/sm-policies/pol-1518",
+                            )
+                            .with_json_body(&serde_json::json!({
+                                "sessRules": { "s1": {
+                                    "authSessAmbr": { "uplink": "20 Mbps", "downlink": "80 Mbps" },
+                                    "authDefQos": { "5qi": 9, "arp": { "priorityLevel": 8 } }
+                                }},
+                                "pccRules": {}, "qosDecs": {},
+                            }))
+                            .unwrap();
+                    }
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await;
+        port.store(addr.port(), std::sync::atomic::Ordering::SeqCst);
+        (srv, addr.port())
+    }
+
+    /// #1518 (#1694 review): discovery records the chosen PCF's instance and sets
+    /// on the endpoint, and every discovered PCF's sets in the NF cache; a PCF may
+    /// notify for a session bound to A when it is A (in either spelling of the
+    /// id), or a cached member of A's set. With no recorded instance (a `PCF_URI`
+    /// PCF, or a session from before) any PCF may.
+    ///
+    /// REVERT-VERIFIED: without `remember_discovered_pcfs`, B is refused; without the
+    /// set check, C is admitted; without the id normalisation, `urn:uuid:` A is
+    /// refused.
+    #[tokio::test]
+    async fn a_pcf_may_notify_for_its_own_or_its_set_s_sessions_1518() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        std::env::remove_var("PCF_URI");
+        let (nrf, port) = nrf_and_pcf_1518().await;
+        global_context()
+            .set_nrf_uri(format!("http://127.0.0.1:{port}"))
+            .await;
+        let ep = policy::resolve_pcf_endpoint().await.expect("discovered");
+        global_context().clear_nrf_uri().await;
+        nrf.stop().await.ok();
+        assert_eq!(ep.nf_instance_id.as_deref(), Some(PCF_A_1518));
+        assert_eq!(ep.nf_set_ids, [PCF_SET_1518]);
+
+        let bound = ep.identity();
+        let urn_a = format!("urn:uuid:{}", PCF_A_1518.to_ascii_uppercase());
+        assert!(policy::pcf_may_notify_for(&bound, PCF_A_1518).await);
+        assert!(policy::pcf_may_notify_for(&bound, &urn_a).await);
+        assert!(
+            policy::pcf_may_notify_for(&bound, PCF_B_1518).await,
+            "a set member"
+        );
+        assert!(
+            !policy::pcf_may_notify_for(&bound, PCF_C_1518).await,
+            "no set"
+        );
+        assert!(
+            !policy::pcf_may_notify_for(&bound, "4e3c1518-0000-4000-8000-0000000000ff").await,
+            "not discovered"
+        );
+        assert!(!policy::pcf_may_notify_for(&bound, "").await);
+        let no_set = policy::PcfIdentity {
+            nf_instance_id: Some(PCF_A_1518.to_string()),
+            nf_set_ids: Vec::new(),
+        };
+        assert!(policy::pcf_may_notify_for(&no_set, PCF_A_1518).await);
+        assert!(
+            !policy::pcf_may_notify_for(&no_set, PCF_B_1518).await,
+            "no recorded set"
+        );
+        let other_set = policy::PcfIdentity {
+            nf_instance_id: Some(PCF_A_1518.to_string()),
+            nf_set_ids: vec!["SETx.pcfset.5gc.mnc001.mcc001".to_string()],
+        };
+        assert!(
+            !policy::pcf_may_notify_for(&other_set, PCF_B_1518).await,
+            "another set"
+        );
+        let upper = policy::PcfIdentity {
+            nf_instance_id: Some(PCF_A_1518.to_string()),
+            nf_set_ids: vec![PCF_SET_1518.to_ascii_uppercase()],
+        };
+        assert!(
+            policy::pcf_may_notify_for(&upper, PCF_B_1518).await,
+            "NF Set IDs compare case-insensitively"
+        );
+        let unbound = policy::PcfIdentity::default();
+        assert!(policy::pcf_may_notify_for(&unbound, PCF_C_1518).await);
+        // A cached instance of another NF type is not a PCF of the set.
+        let mut udm = nextgcore_sbi::context::NfInstance::new(
+            "4e3c1518-0000-4000-8000-0000000000dd",
+            nextgcore_sbi::types::NfType::Udm,
+        );
+        udm.nf_set_ids = vec![PCF_SET_1518.to_string()];
+        global_context().add_nf_instance(udm).await;
+        assert!(!policy::pcf_may_notify_for(&bound, "4e3c1518-0000-4000-8000-0000000000dd").await);
+        for id in [
+            PCF_A_1518,
+            PCF_B_1518,
+            PCF_C_1518,
+            "4e3c1518-0000-4000-8000-0000000000dd",
+        ] {
+            global_context().remove_nf_instance(id).await;
+        }
+    }
+
+    /// #1518 (#1694 review): a session created at a discovered PCF records it, and
+    /// its sm-policy-notify exemption admits a verified PCF only when it is that PCF
+    /// or a member of its set; the SDM route's UDM is unaffected. The session made
+    /// no EASDF DNS context, so it holds no report token (#1713 review).
+    ///
+    /// REVERT-VERIFIED: without `sm_policy_pcf = pcf.identity()`, the binding records
+    /// nothing and C is admitted; without the exemption's PCF check, C is admitted;
+    /// storing the report token unconditionally fails the last assertion.
+    #[tokio::test]
+    async fn the_session_s_pcf_and_its_set_alone_may_notify_it_1518() {
+        use nextgcore_sbi::callback_auth::VerifiedPeer;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let _upf = pfcp_path::stand_in::associated_upf().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        std::env::remove_var("PCF_URI");
+        let (nrf, port) = nrf_and_pcf_1518().await;
+        global_context()
+            .set_nrf_uri(format!("http://127.0.0.1:{port}"))
+            .await;
+        let resp = handle_sm_context_create(&create_request(
+            "imsi-001010000001518",
+            7,
+            &n1(
+                7,
+                1,
+                gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+                &[0x91, 0x00],
+            ),
+        ))
+        .await;
+        global_context().clear_nrf_uri().await;
+        nrf.stop().await.ok();
+        assert_eq!(resp.status, 201);
+        let r = serde_json::from_str::<serde_json::Value>(resp.http.content.as_deref().unwrap())
+            .unwrap()["smContextRef"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let binding = lookup_policy_binding(&r).expect("the binding");
+        assert_eq!(binding.sm_policy_id.as_deref(), Some("pol-1518"));
+        assert_eq!(
+            binding.sm_policy_pcf,
+            policy::PcfIdentity {
+                nf_instance_id: Some(PCF_A_1518.to_string()),
+                nf_set_ids: vec![PCF_SET_1518.to_string()],
+            }
+        );
+        assert!(binding.easdf_dns_context_id.is_none());
+        assert!(
+            binding.easdf_report_token.is_none(),
+            "no DNS context, no report token"
+        );
+
+        let token = binding.sm_policy_notify_token.clone().expect("tokened");
+        let policy_path = format!(
+            "/nsmf-callback/v1/{r}/sm-policy-notify/{}/update",
+            token.as_str()
+        );
+        let sdm_path = format!(
+            "/nsmf-callback/v1/{r}/sdm-notify/{}",
+            binding.sdm_notify_token.clone().expect("tokened").as_str()
+        );
+        let peer = |id: &str, t: &str| VerifiedPeer {
+            nf_instance_id: format!("urn:uuid:{id}"),
+            nf_types: vec![t.to_string()],
+        };
+        let exemptions = oauth2_callback_exemptions();
+        let admits = |p: &str, who: VerifiedPeer| {
+            let p = p.to_string();
+            let exemptions = &exemptions;
+            async move {
+                nextgcore_sbi::callback_auth::admits_without_bearer_from(
+                    exemptions,
+                    "POST",
+                    &p,
+                    Some(&who),
+                )
+                .await
+            }
+        };
+        assert!(
+            admits(&policy_path, peer(PCF_A_1518, "PCF")).await,
+            "its PCF"
+        );
+        assert!(
+            admits(&policy_path, peer(PCF_B_1518, "PCF")).await,
+            "its set"
+        );
+        assert!(
+            !admits(&policy_path, peer(PCF_C_1518, "PCF")).await,
+            "another PCF"
+        );
+        assert!(
+            admits(&sdm_path, peer(PCF_C_1518, "UDM")).await,
+            "the UDM route"
+        );
+
+        if let Ok(ctx) = smf_self().read() {
+            ctx.policy_bindings.write().unwrap().remove(&r);
+        }
+        for id in [PCF_A_1518, PCF_B_1518, PCF_C_1518] {
+            global_context().remove_nf_instance(id).await;
         }
     }
 

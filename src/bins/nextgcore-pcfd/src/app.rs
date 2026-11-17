@@ -2681,13 +2681,21 @@ pub async fn handle_ue_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
     // omits the members leaves the stored value alone (see
     // `ue_policy_set_serving_amf`): omission is not a statement that the AMF became
     // unknown.
-    ue_policy::ue_policy_set_serving_amf(
+    if ue_policy::ue_policy_set_serving_amf(
         pol_asso_id,
         data.get("guami").and_then(ue_policy::AmfGuami::from_json),
         data.get("servingNfId")
             .and_then(|v| v.as_str())
             .map(str::to_string),
-    );
+    ) {
+        // The previous AMF's N1N2 subscription is not unsubscribed here: it lives at
+        // that AMF, which this association no longer targets. Its notifications now
+        // answer 404 (#1518).
+        log::info!(
+            "[{pol_asso_id}] UE policy update: the serving AMF changed; its N1 notify and \
+             N1N2 failure callback URIs are re-minted"
+        );
+    }
 
     // `uePolReq` (§5.6.2.4, `Bytes`): a fresh UE STATE INDICATION, so the UE's
     // installed-UPSI baseline moves and the next delivery is a delta against the NEW
@@ -7697,7 +7705,7 @@ mod tests {
 
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
-            &crate::test_support::policy_data_notify_path(),
+            &crate::policy_data_sub::test_notify_path(),
             Some(serde_json::json!({ "ueId": "imsi-001010000000299" })),
         ))
         .await;
@@ -7715,7 +7723,7 @@ mod tests {
         // indistinguishable from one that changed nothing.
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
-            &crate::test_support::policy_data_notify_path(),
+            &crate::policy_data_sub::test_notify_path(),
             Some(serde_json::json!({ "reportId": "x" })),
         ))
         .await;
@@ -7758,7 +7766,7 @@ mod tests {
 
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
-            &crate::test_support::policy_data_notify_path(),
+            &crate::policy_data_sub::test_notify_path(),
             Some(serde_json::json!({
                 "ueId": supi,
                 "reportId": format!("/nudr-dr/v2/policy-data/ues/{supi}/sm-data"),
@@ -7805,7 +7813,7 @@ mod tests {
         // same (unchanged) data does not re-notify.
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
-            &crate::test_support::policy_data_notify_path(),
+            &crate::policy_data_sub::test_notify_path(),
             Some(serde_json::json!({ "ueId": supi })),
         ))
         .await;
@@ -7895,7 +7903,7 @@ mod tests {
         // A notification for data that has not changed therefore re-authorises nothing.
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
-            &crate::test_support::policy_data_notify_path(),
+            &crate::policy_data_sub::test_notify_path(),
             Some(serde_json::json!({ "ueId": supi })),
         ))
         .await;
@@ -7971,7 +7979,7 @@ mod tests {
 
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
-            &crate::test_support::policy_data_notify_path(),
+            &crate::policy_data_sub::test_notify_path(),
             Some(serde_json::json!({ "ueId": supi })),
         ))
         .await;
@@ -8035,7 +8043,7 @@ mod tests {
 
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
-            &crate::test_support::policy_data_notify_path(),
+            &crate::policy_data_sub::test_notify_path(),
             Some(serde_json::json!({ "ueId": supi })),
         ))
         .await;
@@ -8105,7 +8113,7 @@ mod tests {
 
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
-            &crate::test_support::policy_data_notify_path(),
+            &crate::policy_data_sub::test_notify_path(),
             Some(serde_json::json!({ "ueId": supi })),
         ))
         .await;
@@ -8165,7 +8173,7 @@ mod tests {
 
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
-            &crate::test_support::policy_data_notify_path(),
+            &crate::policy_data_sub::test_notify_path(),
             Some(serde_json::json!({ "ueId": supi })),
         ))
         .await;
@@ -9890,7 +9898,7 @@ mod tests {
         for (supi, _) in cases {
             let resp = pcf_sbi_request_handler(make_request(
                 "POST",
-                &crate::test_support::policy_data_notify_path(),
+                &crate::policy_data_sub::test_notify_path(),
                 Some(serde_json::json!({ "ueId": supi })),
             ))
             .await;
@@ -13746,7 +13754,7 @@ mod tests {
 
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
-            &crate::test_support::policy_data_notify_path(),
+            &crate::policy_data_sub::test_notify_path(),
             Some(serde_json::json!({ "ueId": supi })),
         ))
         .await;
@@ -13902,7 +13910,7 @@ mod tests {
         let reauth_peers = start_policy_data_peers(answers).await;
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
-            &crate::test_support::policy_data_notify_path(),
+            &crate::policy_data_sub::test_notify_path(),
             Some(serde_json::json!({ "ueId": bare })),
         ))
         .await;
@@ -15366,6 +15374,68 @@ mod callback_tokens_1518 {
         ue_policy::ue_policy_remove(&b);
     }
 
+    /// #1715 review: a change of serving AMF re-mints the N1 notify and N1N2 failure
+    /// tokens, so the AMF that served the UE before can no longer post into the
+    /// association, and keeps the connectivity token, whose subscription moves to the
+    /// new AMF with the UE context. Recording the first AMF, or the same one again,
+    /// changes nothing.
+    ///
+    /// REVERT-VERIFIED: without `rotate_amf_bound`, the old AMF's URIs still answer
+    /// 204; rotating on every call fails the same-AMF case.
+    #[tokio::test]
+    async fn a_new_serving_amf_takes_the_old_one_s_callback_tokens_1518() {
+        let a = assoc("imsi-001011518000041");
+        let guami = |amf_id: &str| ue_policy::AmfGuami {
+            mcc: "001".into(),
+            mnc: "01".into(),
+            amf_id: amf_id.into(),
+        };
+        let paths = || UePolicyCallback::ALL.map(|c| path(&a, c));
+        assert!(!ue_policy::ue_policy_set_serving_amf(
+            &a,
+            Some(guami("020040")),
+            None
+        ));
+        let first = paths();
+        assert!(!ue_policy::ue_policy_set_serving_amf(
+            &a,
+            Some(guami("020040")),
+            None
+        ));
+        assert!(!ue_policy::ue_policy_set_serving_amf(&a, None, None));
+        assert_eq!(paths(), first, "the same AMF keeps every token");
+
+        assert!(ue_policy::ue_policy_set_serving_amf(
+            &a,
+            Some(guami("020041")),
+            None
+        ));
+        let second = paths();
+        assert_ne!(second[0], first[0], "N1 notify re-minted");
+        assert_eq!(second[1], first[1], "connectivity kept");
+        assert_ne!(second[2], first[2], "N1N2 failure re-minted");
+        for old in [&first[0], &first[2]] {
+            let resp = pcf_sbi_request_handler(post(old, serde_json::json!({}))).await;
+            assert_eq!(resp.status, 404, "{old}");
+        }
+        let resp = pcf_sbi_request_handler(post(&second[2], serde_json::json!({}))).await;
+        assert_eq!(resp.status, 204);
+
+        // A change of servingNfId alone is a change of AMF too.
+        assert!(!ue_policy::ue_policy_set_serving_amf(
+            &a,
+            None,
+            Some("amf-a".into())
+        ));
+        assert!(ue_policy::ue_policy_set_serving_amf(
+            &a,
+            None,
+            Some("amf-b".into())
+        ));
+        assert_ne!(paths()[0], second[0]);
+        ue_policy::ue_policy_remove(&a);
+    }
+
     /// The real router behind an OAuth2-required listener with the PCF's exemptions
     /// and an empty JWKS, so no bearer could verify. Over plaintext:
     /// - the token-only N1 notify and N1N2 failure callbacks are admitted on their
@@ -15395,7 +15465,7 @@ mod callback_tokens_1518 {
             (path(&a, UePolicyCallback::N1MessageNotify), 204),
             (path(&a, UePolicyCallback::N1n2Failure), 204),
             (path(&a, UePolicyCallback::ConnectivityState), 401),
-            (crate::test_support::policy_data_notify_path(), 401),
+            (crate::policy_data_sub::test_notify_path(), 401),
         ];
         for callback in UePolicyCallback::ALL {
             let seg = callback.segment();
@@ -15468,7 +15538,7 @@ mod callback_tokens_1518 {
             .await
         };
         let forged = "0123456789abcdef0123456789abcdef";
-        let policy_data = crate::test_support::policy_data_notify_path();
+        let policy_data = crate::policy_data_sub::test_notify_path();
         assert!(admits(policy_data.clone(), peer(&["UDR"])).await);
         assert!(!admits(policy_data.clone(), peer(&["AMF"])).await);
         assert!(!admits(policy_data.clone(), peer(&[])).await);
@@ -15568,14 +15638,13 @@ mod callback_tokens_1518 {
         for p in [
             format!("{}/{forged}", sbi_path::POLICY_DATA_NOTIFY_PATH),
             sbi_path::POLICY_DATA_NOTIFY_PATH.to_string(),
-            format!("{}/extra", crate::test_support::policy_data_notify_path()),
+            format!("{}/extra", crate::policy_data_sub::test_notify_path()),
         ] {
             let resp = pcf_sbi_request_handler(post(&p, body.clone())).await;
             assert_eq!(resp.status, 404, "{p}");
         }
         let resp =
-            pcf_sbi_request_handler(post(&crate::test_support::policy_data_notify_path(), body))
-                .await;
+            pcf_sbi_request_handler(post(&crate::policy_data_sub::test_notify_path(), body)).await;
         assert_eq!(resp.status, 204);
 
         ue_policy::ue_policy_drop_parked_delivery(&a);

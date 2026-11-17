@@ -454,7 +454,8 @@ impl UePolicyCallback {
 /// subscription travels with the UE context to the next AMF
 /// (`UeContext.eventSubscriptionList`, TS 29.518 §6.1.6.2.25), the N1N2 ones do not.
 /// Each token lives as long as the association, so a re-subscription or a further
-/// transfer for the same association keeps the URI the AMF may still be holding.
+/// transfer for the same association keeps the URI the AMF may still be holding,
+/// except that a change of serving AMF replaces the two only that AMF held.
 /// Debug output shows none of them ([`CallbackToken`]'s Debug is redacted).
 #[derive(Debug, Clone)]
 pub struct UePolicyCallbackTokens {
@@ -470,6 +471,13 @@ impl UePolicyCallbackTokens {
             connectivity_state: CallbackToken::mint(),
             n1n2_failure: CallbackToken::mint(),
         }
+    }
+
+    /// New tokens for the two callbacks only the serving AMF holds (#1518): N1 notify
+    /// and N1N2 failure. See [`ue_policy_set_serving_amf`].
+    fn rotate_amf_bound(&mut self) {
+        self.n1_message_notify = CallbackToken::mint();
+        self.n1n2_failure = CallbackToken::mint();
     }
 
     /// The token of `callback`.
@@ -987,21 +995,38 @@ pub fn ue_policy_set_triggers(pol_asso_id: &str, triggers: Vec<String>) {
 /// simply omits the member is not a statement that the AMF became unknown, and
 /// clearing it would silently downgrade a targeted association to the
 /// first-endpoint fallback.
+///
+/// #1518 (#1715 review): when it replaces a recorded AMF with another one, the
+/// N1 notify and N1N2 failure tokens are minted anew, so the AMF that served the
+/// UE before can no longer post into this association. Those two URIs went only to
+/// that AMF (N1N2 subscriptions and transfers are not part of the UE context a new
+/// AMF takes over), and the next delivery hands the new AMF the new ones. The
+/// connectivity token is kept: its subscription moves to the new AMF in
+/// `UeContext.eventSubscriptionList`. Answers whether the AMF changed.
 pub fn ue_policy_set_serving_amf(
     pol_asso_id: &str,
     guami: Option<AmfGuami>,
     serving_nf_id: Option<String>,
-) {
-    if let Ok(mut m) = ue_policy_store().lock() {
-        if let Some(a) = m.get_mut(pol_asso_id) {
-            if let Some(g) = guami {
-                a.guami = Some(g);
-            }
-            if let Some(id) = serving_nf_id {
-                a.serving_nf_id = Some(id);
-            }
-        }
+) -> bool {
+    let Ok(mut m) = ue_policy_store().lock() else {
+        return false;
+    };
+    let Some(a) = m.get_mut(pol_asso_id) else {
+        return false;
+    };
+    let mut changed = false;
+    if let Some(g) = guami {
+        changed |= a.guami.as_ref().is_some_and(|old| *old != g);
+        a.guami = Some(g);
     }
+    if let Some(id) = serving_nf_id {
+        changed |= a.serving_nf_id.as_ref().is_some_and(|old| *old != id);
+        a.serving_nf_id = Some(id);
+    }
+    if changed {
+        a.callback_tokens.rotate_amf_bound();
+    }
+    changed
 }
 
 /// The serving AMF's `(guami, servingNfId)` for an association, or `(None, None)`

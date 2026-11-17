@@ -138,14 +138,12 @@ pub fn admits_notification(presented: &str) -> bool {
         .is_some_and(|token| token.matches(presented))
 }
 
-/// The notification path of a token admitted for the life of a test process, for
-/// the tests that drive the router in process (`test_support::policy_data_notify_path`).
-/// No in-process test creates, holds or drops a subscription (the maintainer is
-/// tested on the real binary, in `tests/policy_data_subscription.rs`), so nothing
-/// replaces it. Never called by the daemon: it is not reachable from the wire, and
-/// a running pcfd's maintainer clears it with its first subscription.
-#[doc(hidden)]
-pub fn test_notify_path() -> String {
+/// The notification path of a token admitted for the life of the unit-test process,
+/// for the unit tests that drive the router. No unit test creates, holds or drops a
+/// subscription (the maintainer is tested on the real binary, in
+/// `tests/policy_data_subscription.rs`), so nothing replaces it.
+#[cfg(test)]
+pub(crate) fn test_notify_path() -> String {
     let mut creating = CREATING.lock().unwrap_or_else(|p| p.into_inner());
     let token = creating.get_or_insert_with(CallbackToken::mint);
     format!(

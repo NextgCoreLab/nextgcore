@@ -1319,6 +1319,8 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
                         network_paging: None,
                         // No DNS context is created for a move.
                         easdf_report_token: None,
+                        // An EPS move creates no SM policy association (#475): no PCF to record.
+                        sm_policy_pcf: crate::policy::PcfIdentity::default(),
                     },
                 );
             }
