@@ -8454,8 +8454,18 @@ mod tests {
     const PROFILE_SUSPENDED_1621: u16 = 1;
     /// The UDR's NFProfile is UNDISCOVERABLE.
     const PROFILE_UNDISCOVERABLE_1621: u16 = 2;
-    /// The NRF answers the NFProfile retrieval 404: the UDR deregistered.
+    /// The NRF answers the NFProfile retrieval 404 with a ProblemDetails, as
+    /// nrfd does: the UDR deregistered.
     const PROFILE_GONE_1621: u16 = 404;
+    /// A 404 without ProblemDetails (TS 29.500 Table 5.2.7.2-1 NOTE 5, #1653).
+    const PROFILE_BARE_404_1653: u16 = 1404;
+    /// A 404 with cause RESOURCE_URI_STRUCTURE_NOT_FOUND (#1653).
+    const PROFILE_URI_404_1653: u16 = 2404;
+    /// The NFProfile retrieval answers 500 (#1653).
+    const PROFILE_ERROR_1653: u16 = 500;
+    /// The NFProfile retrieval answers after 2.5 s, past the discovery bound
+    /// (#1653); discovery itself answers at once.
+    const PROFILE_SLOW_1653: u16 = 3;
 
     /// What [`start_mock_nrf_1621`] answers (#1621 review round 2): discovery lists
     /// the UDR `udr-1613` at `udr_port` (none when 0); its NFProfile retrieval
@@ -8487,8 +8497,23 @@ mod tests {
                     tokio::time::sleep(delay).await;
                     let path = req.header.uri.split('?').next().unwrap_or("").to_string();
                     if path == "/nnrf-nfm/v1/nf-instances/udr-1613" {
+                        let problem = |cause: &str| {
+                            SbiResponse::with_status(404).with_body(
+                                serde_json::json!({ "status": 404, "cause": cause }).to_string(),
+                                "application/problem+json",
+                            )
+                        };
                         let status = match profile {
-                            PROFILE_GONE_1621 => return SbiResponse::with_status(404),
+                            PROFILE_GONE_1621 => return problem("NF_NOT_FOUND"),
+                            PROFILE_BARE_404_1653 => return SbiResponse::with_status(404),
+                            PROFILE_URI_404_1653 => {
+                                return problem("RESOURCE_URI_STRUCTURE_NOT_FOUND")
+                            }
+                            PROFILE_ERROR_1653 => return SbiResponse::with_status(500),
+                            PROFILE_SLOW_1653 => {
+                                tokio::time::sleep(Duration::from_millis(2500)).await;
+                                "REGISTERED"
+                            }
                             PROFILE_SUSPENDED_1621 => "SUSPENDED",
                             PROFILE_UNDISCOVERABLE_1621 => "UNDISCOVERABLE",
                             _ => "REGISTERED",
@@ -8747,7 +8772,7 @@ mod tests {
     }
 
     /// #1621 review round 2, m-2: a remembered UDR the NRF no longer lists is
-    /// checked against its NFProfile (TS 29.510 §5.2.2.5). SUSPENDED or
+    /// checked against its NFProfile (TS 29.510 §5.2.2.9). SUSPENDED or
     /// UNDISCOVERABLE: an outage, 500, without reading the UDR (here it would
     /// serve). 404: it deregistered, so it is forgotten and the local default
     /// applies, and stays applied (a later SUSPENDED profile finds nothing
@@ -8806,6 +8831,82 @@ mod tests {
 
         mock.profile.store(PROFILE_SUSPENDED_1621, Ordering::SeqCst);
         let resp = pcf_sbi_request_handler(am_create_1613("imsi-001010000016245")).await;
+        assert_eq!(resp.status, 201, "forgotten: {:?}", resp.http.content);
+        nrf.stop().await.ok();
+        udr.stop().await.ok();
+    }
+
+    /// #1653 (n-1, n-3): when the NRF lists no UDR and the remembered UDR's
+    /// NFProfile retrieval (TS 29.510 §5.2.2.9) gives no usable answer, the
+    /// remembered UDR is read, and the create answers its data (rfsp 5): a 500,
+    /// no answer within the discovery bound, a 404 without ProblemDetails (TS
+    /// 29.500 Table 5.2.7.2-1 NOTE 5: a URI error before the first variable
+    /// part) and a 404 RESOURCE_URI_STRUCTURE_NOT_FOUND each say nothing about
+    /// the UDR. Only a 404 with any other ProblemDetails evicts it: the local
+    /// default, and the UDR is forgotten.
+    ///
+    /// REVERT-VERIFIED: the bare and the RESOURCE_URI_STRUCTURE_NOT_FOUND 404
+    /// evicted the live UDR; an "unknown" taken as the local default fails the
+    /// 500 and the slow cases.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
+    async fn a_udr_whose_nfprofile_gives_no_usable_answer_is_still_read_1653() {
+        use std::sync::atomic::Ordering;
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _ues = cleanup_1621((16531u64..=16537).map(|n| format!("imsi-0010100000{n}")));
+        pcf_context_init(64, 64);
+        let mode = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(UDR_OK_1621));
+        let (udr, port) = start_udr_1621(mode.clone()).await;
+        let mock = std::sync::Arc::new(NrfMock1621 {
+            udr_port: std::sync::Arc::new(std::sync::atomic::AtomicU16::new(port)),
+            profile: std::sync::atomic::AtomicU16::new(PROFILE_REGISTERED_1621),
+            delay_ms: std::sync::atomic::AtomicU64::new(0),
+        });
+        let (nrf, _nrf_uri) = start_mock_nrf_1621(mock.clone()).await;
+        let rfsp = |resp: &SbiResponse| {
+            serde_json::from_str::<serde_json::Value>(resp.http.content.as_deref().unwrap_or("{}"))
+                .unwrap_or_default()["rfsp"]
+                .clone()
+        };
+
+        let resp = pcf_sbi_request_handler(am_create_1613("imsi-001010000016531")).await;
+        assert_eq!(resp.status, 201, "listed: {:?}", resp.http.content);
+        assert_eq!(rfsp(&resp), 5);
+        mock.udr_port.store(0, Ordering::SeqCst);
+
+        for (n, profile, what) in [
+            (2, PROFILE_ERROR_1653, "a 500"),
+            (3, PROFILE_SLOW_1653, "no answer in time"),
+            (4, PROFILE_BARE_404_1653, "a 404 without ProblemDetails"),
+            (
+                5,
+                PROFILE_URI_404_1653,
+                "a 404 RESOURCE_URI_STRUCTURE_NOT_FOUND",
+            ),
+        ] {
+            mock.profile.store(profile, Ordering::SeqCst);
+            let started = std::time::Instant::now();
+            let resp =
+                pcf_sbi_request_handler(am_create_1613(&format!("imsi-00101000001653{n}"))).await;
+            assert_eq!(resp.status, 201, "{what}: {:?}", resp.http.content);
+            assert_eq!(rfsp(&resp), 5, "{what}: the remembered UDR is read");
+            assert!(
+                started.elapsed() < Duration::from_millis(3200),
+                "{what}: within the bound, {:?}",
+                started.elapsed()
+            );
+        }
+
+        mock.profile.store(PROFILE_GONE_1621, Ordering::SeqCst);
+        let resp = pcf_sbi_request_handler(am_create_1613("imsi-001010000016536")).await;
+        assert_eq!(resp.status, 201, "deregistered: {:?}", resp.http.content);
+        assert_ne!(rfsp(&resp), 5, "not read from the deregistered UDR");
+
+        // Forgotten: a SUSPENDED profile is no longer even asked about.
+        mock.profile.store(PROFILE_SUSPENDED_1621, Ordering::SeqCst);
+        let resp = pcf_sbi_request_handler(am_create_1613("imsi-001010000016537")).await;
         assert_eq!(resp.status, 201, "forgotten: {:?}", resp.http.content);
         nrf.stop().await.ok();
         udr.stop().await.ok();
