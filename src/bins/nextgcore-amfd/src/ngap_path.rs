@@ -620,6 +620,17 @@ fn service_request_s_tmsi(plain: &[u8]) -> Option<(u16, u8, u32)> {
     Some((amf_set_id, amf_pointer, tmsi))
 }
 
+/// #1518: record on the session of `psi` the nonce of the `smContextStatusUri`
+/// its SMF was given (`None`: a token-less URI).
+fn record_status_nonce(amf_ue_ngap_id: u64, psi: u8, nonce: Option<&str>) {
+    let ctx = crate::context::amf_self();
+    let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+    if let Some(mut sess) = guard.sess_find_by_psi(amf_ue_ngap_id, psi) {
+        sess.sm_context_status_nonce = nonce.map(str::to_string);
+        guard.sess_update(&sess);
+    }
+}
+
 /// Record PDU session `psi` of `amf_ue_ngap_id` in the AMF context's session
 /// store -- where the Namf N1N2MessageTransfer handler and the Service Request's
 /// re-activation find it (#540) -- unless it is already there. Returns whether the
@@ -1358,6 +1369,10 @@ struct PendingEstablishment {
     /// #1222: the UE's Request type for it (TS 24.501 §9.11.3.47), sent to the SMF as
     /// `requestType` on every attempt.
     request_type: Option<u8>,
+    /// #1518: the new session's `smContextStatusUri` token nonce, minted with the
+    /// establishment and the same on every attempt; recorded on the session once
+    /// the SMF created it.
+    status_nonce: String,
 }
 
 /// #774 review M1: the earlier registration's sessions are being released at
@@ -10308,6 +10323,7 @@ impl NgapServer {
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                     origination_timestamp: origination,
                     request_type: self.ul_request_types.get(&(amf_ue_ngap_id, psi)).copied(),
+                    status_nonce: crate::sbi_path::new_callback_token(),
                 };
                 self.spawn_establishment_attempt(amf_ue_ngap_id, &pending, &state);
                 self.pending_establishments
@@ -11157,6 +11173,7 @@ impl NgapServer {
         sd: Option<u32>,
         dnn: Option<&str>,
         sm_pdu: &[u8],
+        status_nonce: Option<&str>,
         resp: crate::sbi_path::SmContextCreateResponse,
     ) -> Result<()> {
         // #796: an establishment that was waiting for an SMF is done.
@@ -11193,6 +11210,10 @@ impl NgapServer {
         let forced_full = false;
         let recorded =
             !forced_full && record_amf_session(amf_ue_ngap_id, psi, &resp.sm_context_ref, sst, sd);
+        if recorded {
+            // #1518: the nonce of the smContextStatusUri this SMF was given.
+            record_status_nonce(amf_ue_ngap_id, psi, status_nonce);
+        }
         if !recorded {
             // #756 review m1: a session the AMF cannot record is one it could never
             // page, modify, re-activate or release, and its refs would be swept within
@@ -11352,7 +11373,7 @@ impl NgapServer {
         let key = (amf_ue_ngap_id, psi);
         // A UE retransmission of the same request keeps the original window, and
         // the original origination timestamp (#980 review).
-        let (first_failure, generation, origination_timestamp, request_type) =
+        let (first_failure, generation, origination_timestamp, request_type, status_nonce) =
             self.pending_establishments.get(&key).map_or_else(
                 || {
                     (
@@ -11360,6 +11381,7 @@ impl NgapServer {
                         ESTABLISHMENT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                         origination_timestamp.to_string(),
                         self.ul_request_types.get(&key).copied(),
+                        crate::sbi_path::new_callback_token(),
                     )
                 },
                 |p| {
@@ -11368,6 +11390,7 @@ impl NgapServer {
                         p.generation,
                         p.origination_timestamp.clone(),
                         p.request_type,
+                        p.status_nonce.clone(),
                     )
                 },
             );
@@ -11410,6 +11433,7 @@ impl NgapServer {
                 generation,
                 origination_timestamp,
                 request_type,
+                status_nonce,
             },
         );
         Ok(())
@@ -11536,6 +11560,7 @@ impl NgapServer {
                 // The establishment's own stamp, not a new one: a retry is the
                 // same request (#980 review).
                 origination_timestamp: Some(p.origination_timestamp.clone()),
+                sm_context_status_nonce: Some(p.status_nonce.clone()),
                 request_type: p
                     .request_type
                     .and_then(crate::sbi_path::request_type_for_smf),
@@ -12008,6 +12033,7 @@ impl NgapServer {
                     a.sd,
                     a.dnn.as_deref(),
                     &p.sm_pdu,
+                    Some(&p.status_nonce),
                     resp,
                 )
                 .await
@@ -20527,6 +20553,7 @@ fn build_sm_context_identity(
     crate::sbi_path::SmContextIdentity {
         supi: state.and_then(|s| s.amf_ue.supi.clone()),
         sm_context_status_key: state.and_then(|s| s.amf_ue.sm_context_status_key.clone()),
+        sm_context_status_nonce: None,
         pei: state.and_then(|s| s.amf_ue.pei.clone()),
         guami,
         serving_plmn,
@@ -28417,6 +28444,9 @@ mod tests {
         ue.amf_ue.supi = Some(supi.to_string());
         ue.amf_ue.policy_association.id = Some("am-pol-1247".to_string());
         ue.amf_ue.ue_policy_association.id = Some("ue-pol-1247".to_string());
+        // #1518: the associations' notificationUri tokens.
+        ue.amf_ue.policy_association.notify_token = Some("amp-t".to_string());
+        ue.amf_ue.ue_policy_association.notify_token = Some("uep-t".to_string());
         ngap.ue_auth_state.insert(id, ue);
         let notify = |path: String, body: serde_json::Value| {
             crate::namf_server::namf_request_handler(
@@ -28428,7 +28458,7 @@ mod tests {
         let base = format!("/namf-callback/v1/{supi}");
 
         let update = notify(
-            format!("{base}/am-policy-notify/update"),
+            format!("{base}/am-policy-notify/amp-t/update"),
             serde_json::json!({ "resourceUri": "x/policies/am-pol-1247", "rfsp": 3 }),
         )
         .await;
@@ -28440,7 +28470,7 @@ mod tests {
         .await;
         assert_eq!(unknown.status, 404, "no such UE");
         let foreign = notify(
-            format!("{base}/am-policy-notify/terminate"),
+            format!("{base}/am-policy-notify/amp-t/terminate"),
             serde_json::json!({
                 "resourceUri": "http://pcf/npcf-am-policy-control/v1/policies/someone-else",
                 "cause": "UNSPECIFIED",
@@ -28453,7 +28483,7 @@ mod tests {
         );
         // The same for the UE policy: refused, and the UE's real association stays.
         let foreign_ue = notify(
-            format!("{base}/ue-policy-notify/terminate"),
+            format!("{base}/ue-policy-notify/uep-t/terminate"),
             serde_json::json!({
                 "resourceUri": "http://pcf/npcf-ue-policy-control/v1/policies/someone-else",
                 "cause": "UNSPECIFIED",
@@ -28462,7 +28492,7 @@ mod tests {
         .await;
         assert_eq!(foreign_ue.status, 404);
         let missing = notify(
-            format!("{base}/am-policy-notify/terminate"),
+            format!("{base}/am-policy-notify/amp-t/terminate"),
             serde_json::json!({ "cause": "UNSPECIFIED" }),
         )
         .await;
@@ -28478,12 +28508,12 @@ mod tests {
 
         for (op, path, kind) in [
             (
-                "am-policy-notify",
+                "am-policy-notify/amp-t",
                 "npcf-am-policy-control/v1/policies/am-pol-1247",
                 "AM",
             ),
             (
-                "ue-policy-notify",
+                "ue-policy-notify/uep-t",
                 "npcf-ue-policy-control/v1/policies/ue-pol-1247",
                 "UE",
             ),

@@ -25,6 +25,7 @@ const UE_N1_REQUEST: [u8; 14] = [
 fn test_identity() -> SmContextIdentity {
     SmContextIdentity {
         sm_context_status_key: None,
+        sm_context_status_nonce: None,
         supi: Some("imsi-262011234567890".to_string()),
         pei: Some("imeisv-1234567890123456".to_string()),
         guami: Some(serde_json::json!({

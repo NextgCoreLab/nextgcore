@@ -1158,6 +1158,9 @@ pub struct SmContextIdentity {
     /// `smContextStatusUri` token is derived ([`sm_context_status_token`]). `None`
     /// sends the token-less URI.
     pub sm_context_status_key: Option<String>,
+    /// #1518: the establishment's `sm_context_status_nonce` (one per new PDU
+    /// session). The token is sent only with both the key and the nonce.
+    pub sm_context_status_nonce: Option<String>,
 }
 
 /// #1222: the `RequestType` of SmContextCreateData (TS 29.502 §6.1.6.3.5) for the
@@ -1302,7 +1305,8 @@ fn build_create_sm_context_request(
                 identity
                     .sm_context_status_key
                     .as_deref()
-                    .map(|key| sm_context_status_token(key, pdu_session_id))
+                    .zip(identity.sm_context_status_nonce.as_deref())
+                    .map(|(key, nonce)| sm_context_status_token(key, pdu_session_id, nonce))
                     .as_deref()
             )),
         );
@@ -3519,17 +3523,24 @@ pub fn sm_context_status_uri(supi: &str, psi: u8, token: Option<&str>) -> String
     }
 }
 
-/// The `smContextStatusUri` token of PDU session `psi` of a UE whose
-/// `sm_context_status_key` is `key` (#1518): the first 128 bits of
-/// SHA-256(`key` ":" `psi`), as 32 hex digits. One token per session, so the SMF
-/// that holds one session's URI cannot forge a notification about another; and
-/// derived, not stored, so every path that hands out the URI (CreateSMContext,
-/// the takeover's UpdateSMContext) and the handler agree without threading a
-/// per-session value through them.
-pub fn sm_context_status_token(key: &str, psi: u8) -> String {
-    use sha2::Digest;
-    let digest = sha2::Sha256::digest(format!("{key}:{psi}").as_bytes());
-    digest[..16].iter().map(|b| format!("{b:02x}")).collect()
+/// The `smContextStatusUri` token of the PDU session `psi` whose
+/// `sm_context_status_nonce` is `nonce`, for a UE whose `sm_context_status_key`
+/// is `key` (#1518): the first 128 bits of HMAC-SHA-256(`key`,
+/// "sm-context-status:" `psi` ":" `nonce`), as 32 hex digits.
+///
+/// One token per session: the SMF holding one session's URI cannot forge a
+/// notification about another (#1625 review m1), and a re-created PSI gets a new
+/// nonce, so the old session's token (an old SMF's, or a late retry) does not
+/// name the new one (round 2). The key never leaves the AMF.
+pub fn sm_context_status_token(key: &str, psi: u8, nonce: &str) -> String {
+    use hmac::Mac;
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key.as_bytes())
+        .expect("HMAC takes a key of any length");
+    mac.update(format!("sm-context-status:{psi}:{nonce}").as_bytes());
+    mac.finalize().into_bytes()[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// A fresh callback-URI token (#753, #1518): a v4 UUID in simple form, 122
@@ -5964,6 +5975,7 @@ mod tests {
     fn test_identity() -> SmContextIdentity {
         SmContextIdentity {
             sm_context_status_key: None,
+            sm_context_status_nonce: None,
             supi: Some("imsi-262011234567890".to_string()),
             pei: Some("imeisv-1234567890123456".to_string()),
             guami: Some(serde_json::json!({

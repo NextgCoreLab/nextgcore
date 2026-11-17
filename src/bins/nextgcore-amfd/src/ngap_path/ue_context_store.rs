@@ -115,6 +115,10 @@ pub struct StoredSession {
     pub smf: Option<(String, u16)>,
     pub s_nssai: SNssai,
     pub dnn: Option<String>,
+    /// The nonce of the session's `smContextStatusUri` token (#1518); absent for a
+    /// session given the token-less URI, or written before #1518.
+    #[serde(default)]
+    pub status_nonce: Option<String>,
 }
 
 /// The 5G NAS security context of a stored UE (TS 33.501 §6.3, TS 24.501 §4.4.2).
@@ -186,6 +190,11 @@ pub struct StoredUeContext {
     /// a record written before #1518.
     #[serde(default)]
     pub sm_context_status_key: Option<String>,
+    /// #1518: written by an AMF that hands out tokened callback URIs. `false`
+    /// (absent) marks a record from before #1518: only its callbacks may still hold
+    /// token-less URIs, until the takeover or restore update re-issues them.
+    #[serde(default)]
+    pub callback_tokens: bool,
     pub sdm_subscription_id: Option<String>,
     pub policy_association: PolicyAssociation,
     pub ue_policy_association: PolicyAssociation,
@@ -674,6 +683,9 @@ impl NgapServer {
                 sm_context_ref: sm_ref.clone(),
                 smf: self.sm_context_smfs.get(&(*ue_id, *psi)).cloned(),
                 s_nssai: sess.as_ref().map(|s| s.s_nssai.clone()).unwrap_or_default(),
+                status_nonce: sess
+                    .as_ref()
+                    .and_then(|s| s.sm_context_status_nonce.clone()),
                 dnn: sess.and_then(|s| s.dnn),
             });
         }
@@ -734,6 +746,7 @@ impl NgapServer {
             assigned_ebis: ue.assigned_ebis.clone(),
             uecm_dereg_token: ue.uecm_dereg_token.clone(),
             sm_context_status_key: ue.sm_context_status_key.clone(),
+            callback_tokens: true,
             sdm_subscription_id: state.sdm_subscription_id.clone(),
             policy_association: ue.policy_association.clone(),
             ue_policy_association: ue.ue_policy_association.clone(),
@@ -989,6 +1002,7 @@ impl NgapServer {
                 sess.sm_context_ref = Some(s.sm_context_ref.clone());
                 sess.s_nssai = s.s_nssai.clone();
                 sess.dnn = s.dnn.clone();
+                sess.sm_context_status_nonce = s.status_nonce.clone();
                 guard.sess_update(&sess);
             }
         }
@@ -1031,6 +1045,15 @@ impl NgapServer {
 
 /// A registered UE rebuilt from its record, under `amf_ue_ngap_id`, with no NG
 /// connection. `None` when a stored key has the wrong length.
+/// [`restored_ue`], for the store tests (#1518).
+#[cfg(test)]
+pub(crate) fn restored_ue_for_tests(
+    amf_ue_ngap_id: u64,
+    rec: &StoredUeContext,
+) -> Option<UeNasContext> {
+    restored_ue(amf_ue_ngap_id, rec)
+}
+
 fn restored_ue(amf_ue_ngap_id: u64, rec: &StoredUeContext) -> Option<UeNasContext> {
     let sec = &rec.security;
     let mut state = UeNasContext::new(amf_ue_ngap_id, 0, 0, crate::context::nas_security_canary());
@@ -1087,7 +1110,15 @@ fn restored_ue(amf_ue_ngap_id: u64, rec: &StoredUeContext) -> Option<UeNasContex
     ue.ue_radio_capability_id_known_to_ue = rec.ue_radio_capability_id_known_to_ue;
     ue.assigned_ebis = rec.assigned_ebis.clone();
     ue.uecm_dereg_token = rec.uecm_dereg_token.clone();
-    ue.sm_context_status_key = rec.sm_context_status_key.clone();
+    // #1518: a record from before #1518 gets a key on arrival, and its sessions'
+    // smContextStatusUris are re-issued tokened by the restore or takeover update
+    // (`spawn_smf_serving_updates`); only its policy associations keep their
+    // token-less URIs until that update (`complete_takeover`).
+    ue.sm_context_status_key = rec
+        .sm_context_status_key
+        .clone()
+        .or_else(|| Some(crate::sbi_path::new_callback_token()));
+    ue.pre_1518_callbacks = !rec.callback_tokens;
     ue.policy_association = rec.policy_association.clone();
     ue.ue_policy_association = rec.ue_policy_association.clone();
     state.suci = rec.suci.clone();

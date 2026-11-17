@@ -72,6 +72,8 @@ fn seed_registered_ue(
         sd: Some(SLICE_SD),
     };
     sess.dnn = Some("internet".to_string());
+    // #1518: the nonce of the session's smContextStatusUri token.
+    sess.sm_context_status_nonce = Some(format!("n-{supi}"));
     guard.sess_update(&sess);
 }
 
@@ -365,7 +367,8 @@ async fn a_restarted_amf_points_a_restored_ue_s_peers_at_itself_at_its_first_mes
             5,
             Some(&crate::sbi_path::sm_context_status_token(
                 &format!("smst-{supi}"),
-                5
+                5,
+                &format!("n-{supi}")
             )),
         )
     );
@@ -582,6 +585,7 @@ async fn a_restored_idle_ue_s_smf_is_given_this_amf_at_restore_so_downlink_pages
         Some(&crate::sbi_path::sm_context_status_token(
             &format!("smst-{supi}"),
             5,
+            &format!("n-{supi}"),
         )),
     );
     assert_eq!(body["smContextStatusUri"], status_uri);
@@ -1221,6 +1225,7 @@ fn the_mongodb_backend_stores_loads_and_deletes() {
         assigned_ebis: Vec::new(),
         uecm_dereg_token: Some("tok".to_string()),
         sm_context_status_key: None,
+        callback_tokens: false,
         sdm_subscription_id: None,
         policy_association: Default::default(),
         ue_policy_association: Default::default(),
@@ -1244,6 +1249,30 @@ fn the_mongodb_backend_stores_loads_and_deletes() {
         sessions: Vec::new(),
         cm_connected: false,
     };
+    // #1518: a record from before #1518 (no `callback_tokens`) restores with a key
+    // minted on arrival and marked pre-#1518, so only its untokened policy
+    // associations keep their token-less URIs; a record written since restores
+    // unmarked, with its key.
+    {
+        let old = super::super::ue_context_store::restored_ue_for_tests(7, &rec).expect("restores");
+        assert!(old.amf_ue.pre_1518_callbacks);
+        assert!(
+            old.amf_ue.sm_context_status_key.is_some(),
+            "a key on arrival"
+        );
+        let mut new = rec.clone();
+        new.callback_tokens = true;
+        new.sm_context_status_key = Some("k-1518".to_string());
+        let new = super::super::ue_context_store::restored_ue_for_tests(8, &new).expect("restores");
+        assert!(!new.amf_ue.pre_1518_callbacks);
+        assert_eq!(new.amf_ue.sm_context_status_key.as_deref(), Some("k-1518"));
+        // And the old encoding, without the new members, still decodes.
+        let mut doc = mongodb::bson::to_document(&rec).expect("encodes");
+        doc.remove("callback_tokens");
+        doc.remove("sm_context_status_key");
+        let back: StoredUeContext = mongodb::bson::from_document(doc).expect("decodes");
+        assert!(!back.callback_tokens && back.sm_context_status_key.is_none());
+    }
     backend.put(&rec).expect("put");
     let mut changed = rec.clone();
     changed.security.dl_count = 0x0103;
@@ -1577,7 +1606,8 @@ async fn a_ue_of_a_failed_amf_is_taken_over_by_its_service_request() {
             5,
             Some(&crate::sbi_path::sm_context_status_token(
                 &format!("smst-{supi}"),
-                5
+                5,
+                &format!("n-{supi}")
             )),
         )
     );

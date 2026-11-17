@@ -1047,29 +1047,41 @@ fn holds_callback_token(
     })
 }
 
-/// #1518: whether `token` is the `smContextStatusUri` token of PDU session `psi`
-/// of the UE `supi` (one token per session), compared in constant time.
+/// #1518: whether `token` is the `smContextStatusUri` token of the current PDU
+/// session `psi` of the UE `supi` (its key and the session's nonce), compared in
+/// constant time. `false` for a session this AMF does not hold.
 fn holds_sm_context_status_token(supi: &str, psi: &str, token: &str) -> bool {
     let Ok(psi) = psi.parse::<u8>() else {
         return false;
     };
-    find_ue_by_context_id(supi).is_some_and(|ue| {
-        ue.sm_context_status_key.as_deref().is_some_and(|key| {
-            nextgcore_sbi::callback_auth::token_eq(
-                &crate::sbi_path::sm_context_status_token(key, psi),
-                token,
-            )
-        })
+    let Some(ue) = find_ue_by_context_id(supi) else {
+        return false;
+    };
+    let Some(key) = ue.sm_context_status_key.as_deref() else {
+        return false;
+    };
+    let nonce = amf_self()
+        .read()
+        .ok()
+        .and_then(|guard| guard.sess_find_by_psi(ue.id, psi))
+        .and_then(|sess| sess.sm_context_status_nonce);
+    nonce.is_some_and(|nonce| {
+        nextgcore_sbi::callback_auth::token_eq(
+            &crate::sbi_path::sm_context_status_token(key, psi, &nonce),
+            token,
+        )
     })
 }
 
 /// #1518: whether the token-less callback URI of before #1518 is still served for
-/// the UE `supi`: only while the token `field` is `None` (an association or UE
-/// context created before #1518, which was handed that URI). Once a token exists,
+/// the UE `supi`: only for a context restored from a record written before #1518
+/// (`pre_1518_callbacks`) and only while the token `field` is still `None` (it was
+/// handed that URI, and the update re-issuing it has not run). A context created,
+/// transferred in, or adopted since never serves it. Once a token exists,
 /// the token-less URI is not a resource of this AMF: answering it would let any
 /// sender skip the token by dropping it from the path (#1625 review M1).
 fn serves_tokenless(supi: &str, field: impl Fn(&AmfUe) -> &Option<String>) -> bool {
-    find_ue_by_context_id(supi).is_some_and(|ue| field(&ue).is_none())
+    find_ue_by_context_id(supi).is_some_and(|ue| ue.pre_1518_callbacks && field(&ue).is_none())
 }
 
 /// #1518: 404 for a notification to a callback URI whose token this AMF does not
@@ -7441,8 +7453,9 @@ mod tests {
         setup_ue_with_tokens(supi, connected, security, true)
     }
 
-    /// [`setup_ue`]; `tokens == false` is a UE context restored from before #1518,
-    /// with no callback tokens (its peers hold the token-less URIs).
+    /// [`setup_ue`]; `tokens == false` is a UE context restored from a record
+    /// written before #1518 whose policy associations still hold the token-less
+    /// URIs (its key was minted on arrival, as `restored_ue` does).
     fn setup_ue_with_tokens(supi: &str, connected: bool, security: bool, tokens: bool) -> AmfUe {
         amf_context_init(64, 1024, 4096);
         let ctx = amf_self();
@@ -7465,7 +7478,7 @@ mod tests {
             ue.policy_association.notify_token = Some(format!("amp-{supi}"));
             ue.ue_policy_association.notify_token = Some(format!("uep-{supi}"));
         } else {
-            ue.sm_context_status_key = None;
+            ue.pre_1518_callbacks = true;
         }
         if connected {
             guard.amf_ue_associate_ran_ue(ue.id, ran_ue.id);
@@ -7490,6 +7503,8 @@ mod tests {
         let guard = ctx.read().expect("ctx lock");
         let mut sess = guard.sess_add(ue.id, psi).expect("sess_add failed");
         sess.sm_context_ref = Some(format!("smctx-{psi}"));
+        // #1518: the nonce of the session's smContextStatusUri token.
+        sess.sm_context_status_nonce = Some(format!("n-{psi}"));
         sess.dnn = Some("internet".to_string());
         sess.s_nssai.sst = 1;
         guard.sess_update(&sess);
@@ -9377,6 +9392,69 @@ mod tests {
         assert_eq!(drain_network_deregs_for(ue.id).len(), 1);
     }
 
+    /// #1625 review round 2: a PSI released and established again gets a new nonce,
+    /// so the old session's token (its SMF's, or a late RELEASED retry) does not
+    /// name the new session: 404, and the new session stays.
+    ///
+    /// REVERT-VERIFIED: with the nonce left out of the derivation, the old token
+    /// releases the new session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_re_created_psi_does_not_inherit_the_old_session_s_token_1518() {
+        let _serial = dereg_queue_test_lock().lock().await;
+        let supi = "imsi-001010000015187";
+        let ue = setup_ue(supi, true, true);
+        let key = format!("smst-{supi}");
+        let path = |token: String| format!("/namf-callback/v1/{supi}/5/sm-context-status/{token}");
+        let released = || {
+            SbiRequest::post(String::new())
+                .with_json_body(&json!({"statusInfo": {"resourceStatus": "RELEASED"}}))
+                .expect("json")
+        };
+        let post = |token: String| async move {
+            let mut req = released();
+            req.header.uri = path(token);
+            namf_request_handler(req).await.status
+        };
+        let held = || {
+            amf_self()
+                .read()
+                .expect("ctx")
+                .sess_find_by_psi(ue.id, 5)
+                .is_some()
+        };
+        let mut first = setup_sess(&ue, 5);
+        first.sm_context_status_nonce = Some("first".to_string());
+        amf_self().read().expect("ctx").sess_update(&first);
+        let old_token = crate::sbi_path::sm_context_status_token(&key, 5, "first");
+        assert_eq!(post(old_token.clone()).await, 204);
+        assert!(!held(), "the first session is released");
+
+        let mut second = setup_sess(&ue, 5);
+        second.sm_context_status_nonce = Some("second".to_string());
+        amf_self().read().expect("ctx").sess_update(&second);
+        assert_eq!(post(old_token).await, 404, "the old session's token");
+        assert!(held(), "the new session stays");
+        assert_eq!(
+            post(crate::sbi_path::sm_context_status_token(&key, 5, "second")).await,
+            204
+        );
+    }
+
+    /// #1625 review round 2: no callback token or key shows in a UE's `{:?}`.
+    #[test]
+    fn the_ue_debug_output_carries_no_callback_secret_1518() {
+        let mut ue = AmfUe::new(1, 1);
+        ue.uecm_dereg_token = Some("dereg-secret-1518".to_string());
+        ue.sm_context_status_key = Some("key-secret-1518".to_string());
+        ue.policy_association.notify_token = Some("amp-secret-1518".to_string());
+        ue.ue_policy_association.notify_token = Some("uep-secret-1518".to_string());
+        let out = format!("{ue:?}");
+        for secret in ["dereg-secret", "key-secret", "amp-secret", "uep-secret"] {
+            assert!(!out.contains(secret), "{secret} in {out}");
+        }
+        assert!(out.contains("<redacted>"));
+    }
+
     /// #1421: the server the composition root builds registers the NFStatusNotify
     /// callback exemption and, since #1522, the dereg-notify one (verified peer).
     #[test]
@@ -9478,7 +9556,7 @@ mod tests {
             post(
                 format!(
                     "/namf-callback/v1/{supi}/5/sm-context-status/{}",
-                    crate::sbi_path::sm_context_status_token(&format!("smst-{supi}"), 5)
+                    crate::sbi_path::sm_context_status_token(&format!("smst-{supi}"), 5, "n-5")
                 ),
                 json!({"statusInfo": {"resourceStatus": "RELEASED"}}),
             )
@@ -9511,7 +9589,8 @@ mod tests {
         use nextgcore_sbi::callback_auth::VerifiedPeer;
         let _serial = dereg_queue_test_lock().lock().await;
         let supi = "imsi-001010000015183";
-        let _ue = setup_ue(supi, true, true);
+        let ue = setup_ue(supi, true, true);
+        let _sess = setup_sess(&ue, 5);
         let peer = |types: &[&str]| {
             Some(VerifiedPeer {
                 nf_instance_id: "4e3c1518-0000-4000-8000-000000000001".to_string(),
@@ -9543,7 +9622,7 @@ mod tests {
             )
             .await
         );
-        let good = crate::sbi_path::sm_context_status_token(&format!("smst-{supi}"), 5);
+        let good = crate::sbi_path::sm_context_status_token(&format!("smst-{supi}"), 5, "n-5");
         assert!(admits(sms(&good), peer(&["SMF"])).await);
         assert!(!admits(sms(&good), peer(&["PCF"])).await);
         assert!(!admits(sms(&good), peer(&[])).await);
@@ -9609,7 +9688,7 @@ mod tests {
             (
                 format!(
                     "/namf-callback/v1/{supi}/5/sm-context-status/{}",
-                    crate::sbi_path::sm_context_status_token(&format!("smst-{supi}"), 6)
+                    crate::sbi_path::sm_context_status_token(&format!("smst-{supi}"), 6, "n-5")
                 ),
                 released.clone(),
             ),
@@ -9659,7 +9738,7 @@ mod tests {
             post(
                 format!(
                     "/namf-callback/v1/{supi}/5/sm-context-status/{}",
-                    crate::sbi_path::sm_context_status_token(&format!("smst-{supi}"), 5)
+                    crate::sbi_path::sm_context_status_token(&format!("smst-{supi}"), 5, "n-5")
                 ),
                 released.clone()
             )
@@ -9670,36 +9749,57 @@ mod tests {
         assert!(!sess_held(), "the session's token released it");
         let _ = sess;
 
-        // A UE context from before #1518: its peers hold the token-less URIs, which
-        // are served for it, and no tokened URI names it.
+        // A UE context restored from before #1518: its policy associations' peers
+        // hold the token-less URIs, which are served for it until the restore update
+        // re-issues them. Its SM context status URIs are re-issued at restore, so
+        // the token-less one is not served even for it.
         let old = "imsi-001010000015185";
         let old_ue = setup_ue_with_tokens(old, true, true, false);
         let _old_sess = setup_sess(&old_ue, 5);
-        for (path, body) in [
+        for (path, body, status) in [
             (
                 format!("/namf-callback/v1/{old}/am-policy-notify/update"),
                 json!({}),
+                204,
             ),
             (
                 format!("/namf-callback/v1/{old}/ue-policy-notify/update"),
                 json!({}),
+                204,
             ),
             (
                 format!("/namf-callback/v1/{old}/sm-context-status/5"),
                 released.clone(),
+                404,
+            ),
+            (
+                format!("/namf-callback/v1/{old}/am-policy-notify/amp-{old}/update"),
+                json!({}),
+                404,
             ),
         ] {
-            assert_eq!(post(path.clone(), body).await.status, 204, "{path}");
+            assert_eq!(post(path.clone(), body).await.status, status, "{path}");
         }
-        assert_eq!(
-            post(
-                format!("/namf-callback/v1/{old}/am-policy-notify/amp-{old}/update"),
-                json!({})
-            )
-            .await
-            .status,
-            404
-        );
+
+        // A context created, transferred in or adopted since #1518, before its
+        // associations got tokens (a transferred UE carries the old AMF's
+        // associations, never its tokens): the token-less URI is NOT served.
+        let moved = "imsi-001010000015186";
+        let moved_ue = setup_ue_with_tokens(moved, true, true, true);
+        amf_self()
+            .read()
+            .expect("ctx")
+            .ue_store()
+            .with_mut(moved_ue.id, |s| {
+                s.amf_ue.policy_association.notify_token = None;
+                s.amf_ue.ue_policy_association.notify_token = None;
+            });
+        for path in [
+            format!("/namf-callback/v1/{moved}/am-policy-notify/update"),
+            format!("/namf-callback/v1/{moved}/ue-policy-notify/update"),
+        ] {
+            assert_eq!(post(path.clone(), json!({})).await.status, 404, "{path}");
+        }
     }
 
     /// #1522: the dereg-notify exemption's check admits a token-less notification

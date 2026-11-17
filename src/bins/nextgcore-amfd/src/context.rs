@@ -3587,7 +3587,7 @@ pub struct GmmCapability {
 }
 
 /// Policy association
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PolicyAssociation {
     /// Resource URI
     pub resource_uri: Option<String>,
@@ -3598,6 +3598,24 @@ pub struct PolicyAssociation {
     /// association created before #1518, whose URI carries no token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notify_token: Option<String>,
+}
+
+/// Debug without the callback token (#1625 review): a `{:?}` in a log line must
+/// not hand out what authenticates a notification.
+impl std::fmt::Debug for PolicyAssociation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PolicyAssociation")
+            .field("resource_uri", &self.resource_uri)
+            .field("id", &self.id)
+            .field("notify_token", &redacted(&self.notify_token))
+            .finish()
+    }
+}
+
+/// `Some(secret)` printed as `Some("<redacted>")`, for the Debug impls of
+/// structures carrying callback tokens and keys (#1625 review).
+pub(crate) fn redacted(secret: &Option<String>) -> Option<&'static str> {
+    secret.as_ref().map(|_| "<redacted>")
 }
 
 /// 5G AKA confirmation
@@ -3704,6 +3722,11 @@ pub struct AmfUe {
     /// record written before #1518: its sessions' URIs carry no token, and it keeps
     /// handing out token-less URIs, which are served only for such a context.
     pub sm_context_status_key: Option<String>,
+    /// #1518: this context was restored from a record written before #1518 and
+    /// has not been moved to tokened callback URIs yet. Only then is a token-less
+    /// callback URI served, and only for a callback whose token is still `None`.
+    /// `false` for every context created, transferred or adopted since.
+    pub pre_1518_callbacks: bool,
     /// NAS state
     pub nas: NasState,
     /// SUCI (Subscription Concealed Identifier)
@@ -3995,8 +4018,12 @@ impl std::fmt::Debug for AmfUe {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut d = f.debug_struct("AmfUe");
         d.field("id", &self.id);
-        d.field("uecm_dereg_token", &self.uecm_dereg_token);
-        d.field("sm_context_status_key", &self.sm_context_status_key);
+        d.field("uecm_dereg_token", &redacted(&self.uecm_dereg_token));
+        d.field(
+            "sm_context_status_key",
+            &redacted(&self.sm_context_status_key),
+        );
+        d.field("pre_1518_callbacks", &self.pre_1518_callbacks);
         d.field("nas", &self.nas);
         d.field("suci", &self.suci);
         d.field("supi", &self.supi);
@@ -4568,6 +4595,7 @@ impl AmfUe {
             id,
             uecm_dereg_token: None,
             sm_context_status_key: Some(uuid::Uuid::new_v4().simple().to_string()),
+            pre_1518_callbacks: false,
             nas: NasState::default(),
             suci: None,
             supi: None,
@@ -5183,6 +5211,11 @@ pub struct AmfSess {
     pub lbo_roaming_allowed: bool,
     /// SM context in SMF flag (for gmm_build compatibility)
     pub sm_context_in_smf: bool,
+    /// #1518: the per-session nonce of this session's `smContextStatusUri` token
+    /// ([`crate::sbi_path::sm_context_status_token`]), new for every PDU session
+    /// established, so a re-created PSI does not inherit the old session's token.
+    /// `None` until the AMF hands this session a tokened URI.
+    pub sm_context_status_nonce: Option<String>,
 }
 
 impl AmfSess {
@@ -5217,6 +5250,7 @@ impl AmfSess {
             dnn: None,
             lbo_roaming_allowed: false,
             sm_context_in_smf: false,
+            sm_context_status_nonce: None,
         }
     }
 
