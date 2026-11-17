@@ -91,6 +91,8 @@ const PROCEDURES: &[(&str, u8, u8)] = &[
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_undecodable_message_gets_a_transfer_syntax_error_indication() {
+    // #1588: this test reads the paging strategy.
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     let mut server = server_with_gnb().await;
     let mut wrong = Vec::new();
     for &(what, kind, procedure) in PROCEDURES {

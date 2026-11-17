@@ -841,6 +841,8 @@ pub fn send_event_notification(
 
 /// The configured paging strategy (`amf.paging.strategy`).
 fn paging_strategy() -> crate::context::PagingStrategy {
+    #[cfg(test)]
+    crate::test_support::assert_paging_strategy_lock_held();
     let ctx = amf_self();
     let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
     guard.paging_strategy
@@ -1094,6 +1096,8 @@ mod tests {
     /// second silently replaced the first.
     #[test]
     fn a_second_transfer_while_paging_is_refused_and_keeps_the_first() {
+        // #1588 review: this page reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.blocking_lock();
         let mut ue = create_test_ue();
         ue.id = 7_749_001;
         let setup = |psi: u8| N1N2MessageTransferReqData {
@@ -1128,6 +1132,8 @@ mod tests {
     /// N1-only case fell through as N1_N2_TRANSFER_INITIATED and nothing was sent.
     #[test]
     fn an_n1_only_transfer_to_an_idle_ue_pages_and_keeps_the_n1() {
+        // #1588 review: this page reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.blocking_lock();
         let mut ue = create_test_ue();
         ue.id = 5_180_001;
         let mut sess = create_test_sess();
@@ -1164,6 +1170,8 @@ mod tests {
     /// answered N1_N2_TRANSFER_INITIATED and never sent.
     #[test]
     fn a_connected_ues_n1_and_release_are_delivered_now() {
+        // #1588 review: this page reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.blocking_lock();
         let mut ue = create_test_ue();
         ue.id = 6_660_001;
         let mut sess = create_test_sess();
@@ -1384,6 +1392,8 @@ mod tests {
 
     #[test]
     fn test_n1n2_transfer_idle_ue_triggers_paging() {
+        // #1588 review: this page reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.blocking_lock();
         amf_context_init(64, 1024, 4096);
 
         let mut ue = AmfUe::default();

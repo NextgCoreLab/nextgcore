@@ -7944,6 +7944,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_n1n2_updp_to_a_registered_idle_ue_pages_it() {
         let _serial = updp_queue_test_lock().lock().await;
+        // #1588: this page reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         amf_context_init(64, 1024, 4096);
         let supi = "imsi-001010000540002";
         let mut ue = AmfUe::new(987_540, NEXTGCORE_INVALID_POOL_ID);
@@ -8551,6 +8553,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_n1n2_transfer_idle_ue_paging_202() {
+        // #1588: this page reads the paging strategy.
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         let supi = "imsi-001010000060021";
         let ue = setup_ue(supi, false, false);
         setup_sess(&ue, 6);
