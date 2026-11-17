@@ -1,0 +1,66 @@
+# D446A UE (nextgcore#1630, the EKS port of nextgsim#568): a deterministic
+# uplink burst, and no incidental uplink.
+#
+# lb-1 counts as load only the UEs whose bearer has carried user-plane data on
+# gNB-A. The arm used to rely on incidental uplink: a 48-byte IPv6 packet the
+# kernel sends as uesimtun* comes up (gNB log len=49), sent in some runs and
+# not others. Without it the first uplink is the base e2e's ping, which
+# demo-check.sh runs only after deploy-eks.sh returns (minutes after the gNBs
+# start), long after energy-1's 90 s grace window. So:
+#   - ipv6-off (init): IPv6 off in the pod's network namespace before nr-ue
+#     creates its TUN, so the kernel sends no packet of its own;
+#   - uplink-burst (sidecar, the ue image): as soon as uesimtun* has an IPv4
+#     address, 5 pings with a 446-byte payload to the UPF's 10.45.0.1 (gNB log
+#     len=475, a size nothing else sends), then idle. scenario.sh asserts the
+#     burst on gNB-A before lb-1's IntentSubmitted, and no len=49 packet.
+# The compose arm does the same (nextgsim scripts/demo/d446a-check.sh,
+# d446a.compose.yml). No port is opened; the sidecar only sends ICMP through
+# the UE's own tunnel.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ue
+  namespace: nextg-system
+spec:
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: ue
+    spec:
+      initContainers:
+      - name: ipv6-off
+        image: busybox:1.36
+        securityContext:
+          privileged: true   # /proc/sys is read-only otherwise; net.ipv6.* is not a safe pod sysctl
+        command:
+        - sh
+        - -c
+        - |
+          set -eu
+          if [ ! -d /proc/sys/net/ipv6 ]; then echo "[ipv6-off] no IPv6 in this kernel"; exit 0; fi
+          sysctl -w net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1
+      containers:
+      - name: uplink-burst
+        image: nextgsim-ue:latest
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          capabilities:
+            add: ["NET_RAW"]
+        command:
+        - sh
+        - -c
+        - |
+          set -u
+          i=0
+          tun=""
+          while [ -z "$tun" ]; do
+            tun="$(ip -4 -o addr show | awk '$2 ~ /^uesimtun/ { print $2; exit }')"
+            [ -n "$tun" ] && break
+            i=$((i + 1))
+            if [ "$i" -ge 1200 ]; then echo "[uplink-burst] FATAL: no uesimtun* with an IPv4 address in 600 s"; exec sleep infinity; fi
+            sleep 0.5
+          done
+          echo "[uplink-burst] ${tun} is up: 5 pings, 446-byte payload, to 10.45.0.1"
+          ping -I "$tun" -c 5 -i 0.2 -W 2 -s 446 10.45.0.1 || echo "[uplink-burst] ping exited $?"
+          echo "[uplink-burst] done"
+          exec sleep infinity

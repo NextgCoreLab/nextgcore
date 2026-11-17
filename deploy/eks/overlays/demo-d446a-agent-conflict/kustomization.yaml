@@ -17,3 +17,4 @@ resources:
 
 patches:
   - path: configs-patch.yaml
+  - path: ue-uplink-burst.yaml   # nextgcore#1630: IPv6 off, deterministic uplink burst
