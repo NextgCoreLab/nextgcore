@@ -2869,7 +2869,8 @@ mod tests {
             sst: 1,
             sd: None,
             ue_ipv4: [10, 45, 0, 2],
-            notification_uri: "http://127.0.0.1:9/nsmf-callback/v1/sm-policy-notify/1",
+            notification_uri:
+                "http://127.0.0.1:9/nsmf-callback/v1/1/sm-policy-notify/0123456789abcdef",
             subs_sess_ambr: None,
             origination_timestamp: None,
         };
