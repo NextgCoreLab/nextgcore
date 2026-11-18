@@ -913,3 +913,37 @@ async fn a_corrected_trp_position_replaces_the_old_one() {
     assert!((new.e - 2500.0).abs() < 0.5, "moved to {new:?}");
     assert_eq!(b.trps, a.trps, "the TRPs keep their DL-PRS IDs");
 }
+
+/// **#1784**: the DL-PRS IDs (#911) are process state, and a test's context init
+/// starts them afresh. The flake: main.rs's tests give IDs to the TRPs of gNBs
+/// 0x911 and 0x1013, and when they ran first,
+/// `the_assistance_data_names_each_trp_by_its_own_dl_prs_id` got [4, 5, 6, 7, 8]
+/// (or [0, 1, 2, 3, 7]) instead of the lowest free IDs. This makes that order
+/// deterministic: a foreign gNB's IDs given before the init are gone after it.
+///
+/// REVERT-VERIFIED: without the `dl_prs_ids` clear in `lmf_context_init`, the
+/// foreign gNB keeps its IDs ("the foreign IDs are gone").
+#[tokio::test]
+async fn a_test_s_context_init_starts_the_dl_prs_ids_afresh_1784() {
+    let _g = PROCESS_STATE_TEST_LOCK.lock().await;
+    setup();
+    let foreign = NgRanNode {
+        gnb_id: 0x1784,
+        ..node()
+    };
+    {
+        let ctx = lmf_self();
+        let c = ctx.read().unwrap();
+        assert!(c.dl_prs_id_assign(&foreign, 1).is_some());
+        assert!(c.dl_prs_id_assign(&foreign, 2).is_some());
+    }
+    setup();
+    let ctx = lmf_self();
+    let c = ctx.read().unwrap();
+    assert_eq!(
+        c.dl_prs_id_of(&foreign, 1),
+        None,
+        "the foreign IDs are gone"
+    );
+    assert_eq!(c.dl_prs_id_assign(&node(), 1), Some(0), "afresh");
+}
