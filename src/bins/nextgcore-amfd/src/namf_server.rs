@@ -5243,7 +5243,12 @@ fn try_positioning_relay(
         // notifies it too (TS 29.518 §5.2.2.3.1), and join-or-start is one step under
         // the paging-map lock, so a page another transfer queues meanwhile is joined,
         // never overwritten.
-        let Some(location) = crate::namf_handler::page_idle_ue_for_positioning(ue, failure_uri)
+        // #1858: this transfer's own resource id, so its failure notification is
+        // its own even when another LMF transfer shares the callback URI. The same
+        // transfer retried gets the same id, and is recorded once.
+        let transfer_id = positioning_transfer_id(body, &downlinks);
+        let Some(location) =
+            crate::namf_handler::page_idle_ue_for_positioning(ue, failure_uri, &transfer_id)
         else {
             log::info!(
                 "[{ue_context_id}] LCS: the page for the UE already carries {} other \
@@ -5280,6 +5285,30 @@ fn try_positioning_relay(
         Ok(resp) => resp,
         Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
     })
+}
+
+/// #1858: the identity of a paged positioning transfer, the `{n1N2MessageId}` of
+/// the Location it is answered with (TS 29.518 §5.2.2.3.1) and of the
+/// n1n2MsgDataUri its failure notification names. Derived from the request itself
+/// (its JSON part and the LPP/NRPPa payloads), so a retry of the same transfer
+/// maps to the same resource and is recorded once, while two transfers with
+/// different content are two resources, even when they share one
+/// n1n2FailureTxfNotifURI.
+fn positioning_transfer_id(body: &Value, downlinks: &[PendingPositioningDl]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    body.to_string().hash(&mut h);
+    for dl in downlinks {
+        match &dl.kind {
+            PositioningDlKind::LppToUe { lpp_pdu } => (0u8, lpp_pdu).hash(&mut h),
+            PositioningDlKind::NrppaToGnb {
+                routing_id,
+                nrppa_pdu,
+            } => (1u8, routing_id, nrppa_pdu).hash(&mut h),
+            PositioningDlKind::UePolicyToUe { updp_pdu } => (2u8, updp_pdu).hash(&mut h),
+        }
+    }
+    format!("lcs-{:016x}", h.finish())
 }
 
 /// UPDP (UE policy) downlink relay — Wave-6 E5 (TS 29.525 §4.2.2.2: the PCF
