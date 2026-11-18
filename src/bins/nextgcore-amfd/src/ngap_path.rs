@@ -42826,6 +42826,163 @@ mod tests {
         event_sink.stop().await.expect("sink stop");
     }
 
+    /// **#1727**: between two nextgcore AMFs, a consumer's subscription follows the UE.
+    /// AMF-1 is the real producer (`namf_request_handler` behind an SBI listener). It
+    /// holds the UE under the 5G-GUTI the UE presents to AMF-2, and a
+    /// CONNECTIVITY_STATE_REPORT subscription made through the real
+    /// Namf_EventExposure Subscribe, with a `subsChangeNotifyUri`. AMF-2 is the real
+    /// NGAP path, fetching the context.
+    /// - AMF-1's UEContextTransfer answer carries the subscription in
+    ///   `eventSubscriptionList` (TS 29.518 §6.1.6.2.25);
+    /// - AMF-2 takes it over under a new ID and tells the consumer with
+    ///   SUBSCRIPTION_ID_CHANGE (TS 29.518 §5.2.2.2.3.1);
+    /// - AMF-2's Registration Accept reports CONNECTED on the consumer's
+    ///   `eventNotifyUri` and `notifyCorrelationId`.
+    ///
+    /// The two AMFs share this process's store, which `add_unless_equivalent` allows
+    /// for (it never matches a subscription that was not taken over).
+    ///
+    /// REVERT-VERIFIED: without the `eventSubscriptionList` in
+    /// `handle_ue_context_transfer`, "SUBSCRIPTION_ID_CHANGE from AMF-2" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_subscription_at_one_amf_follows_the_ue_to_another_1727() {
+        use nextgcore_sbi::message::SbiRequest;
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _guamis = serve_only_local_guami();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let supi = "imsi-001010001727010";
+        let foreign = crate::context::Guti5gs {
+            amf_pointer: local_guami().amf_id.pointer + 1,
+            ..guti_from(&local_guami(), 0x1727_0101)
+        };
+        let (change_sink, change_port, mut change_rx) = notify_sink().await;
+        let (event_sink, event_port, mut event_rx) = notify_sink().await;
+
+        // AMF-1: the UE, under the 5G-GUTI it presents, with its NAS security context.
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx");
+            let ran_ue = guard.ran_ue_add(901_727, 1727).expect("ran_ue");
+            let mut ue = guard.amf_ue_add(ran_ue.id).expect("amf_ue");
+            ue.supi = Some(supi.to_string());
+            ue.id = 17_270_100;
+            ue.current_guti = foreign.clone();
+            ue.current_m_tmsi = Some(foreign.tmsi);
+            ue.security_context_available = true;
+            guard.amf_ue_publish(&ue, 1727, 9_727);
+        }
+        let created = crate::namf_server::namf_request_handler(
+            SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&serde_json::json!({ "subscription": {
+                    "eventList": [{ "type": "CONNECTIVITY_STATE_REPORT" }],
+                    "eventNotifyUri": format!("http://127.0.0.1:{event_port}/notify/1727-evt"),
+                    "notifyCorrelationId": "corr-1727",
+                    "nfId": "3fa85f64-5717-4562-b3fc-2c963f661727",
+                    "supi": supi,
+                    "subsChangeNotifyUri":
+                        format!("http://127.0.0.1:{change_port}/notify/1727-subs-change"),
+                    "subsChangeNotifyCorrelationId": "corr-1727-change",
+                }}))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(created.status, 201, "subscribed at AMF-1");
+        let at_amf1 = crate::namf_server::EventSubscriptionGuard::of(&created);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let amf1_port = addr.port();
+        let amf1 = SbiServer::on_listener(
+            SbiServerConfig::new(format!("127.0.0.1:{amf1_port}").parse().expect("addr")),
+            listener,
+        );
+        amf1.start(crate::namf_server::namf_request_handler)
+            .await
+            .expect("AMF-1 start");
+
+        // AMF-2: the UE's mobility registration presenting AMF-1's 5G-GUTI.
+        std::env::set_var("AMF_PEER_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("AMF_PEER_SBI_PORT", amf1_port.to_string());
+        let mut ngap = capturing_ngap_server().await;
+        let id = 17_270_101u64;
+        let mut ue = UeNasContext::new(id, 55, 1, false);
+        ue.amf_ue.security_context_available = true;
+        ue.amf_ue.registration_type = crate::gmm_build::registration_type::MOBILITY_UPDATING;
+        ue.amf_ue.allowed_nssai = vec![crate::context::SNssai { sst: 1, sd: None }];
+        ue.amf_ue.old_guti = foreign.clone();
+        ngap.ue_auth_state.insert(id, ue);
+        let nas = registration_request_with_guti(
+            &foreign,
+            crate::gmm_build::registration_type::MOBILITY_UPDATING,
+        );
+        let identified = ngap
+            .resolve_registration_by_guti(
+                id,
+                &nas,
+                crate::gmm_build::registration_type::MOBILITY_UPDATING,
+            )
+            .await;
+        std::env::remove_var("AMF_PEER_SBI_ADDR");
+        std::env::remove_var("AMF_PEER_SBI_PORT");
+        assert!(
+            identified,
+            "precondition: AMF-2 fetched the context from AMF-1"
+        );
+
+        let body = tokio::time::timeout(Duration::from_secs(3), change_rx.recv())
+            .await
+            .expect("SUBSCRIPTION_ID_CHANGE from AMF-2")
+            .expect("channel closed");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        let report = &v["reportList"][0];
+        assert_eq!(report["type"], "SUBSCRIPTION_ID_CHANGE", "{v}");
+        assert_eq!(report["supi"], supi);
+        assert_eq!(v["subsChangeNotifyCorrelationId"], "corr-1727-change");
+        let new_id = report["subscriptionId"]
+            .as_str()
+            .and_then(|u| u.rsplit('/').next())
+            .expect("the new subscription's id")
+            .to_string();
+        let _at_amf2 = crate::namf_server::EventSubscriptionGuard::id(&new_id);
+        let stored = crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .event_subscription_find(&new_id)
+            .expect("created at AMF-2");
+        assert!(stored.taken_over, "AMF-2's copy");
+        assert_eq!(stored.notify_correlation_id, "corr-1727");
+
+        ngap.send_registration_accept(1, id, 55)
+            .await
+            .expect("accepted");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let connected = loop {
+            let body = tokio::time::timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                event_rx.recv(),
+            )
+            .await
+            .expect("AMF-2's CONNECTED report to the consumer")
+            .expect("channel closed");
+            let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+            if v["reportList"][0]["type"] == "CONNECTIVITY_STATE_REPORT" {
+                break v;
+            }
+        };
+        assert_eq!(connected["notifyCorrelationId"], "corr-1727", "{connected}");
+        assert_eq!(
+            connected["reportList"][0]["cmInfoList"][0]["cmState"],
+            "CONNECTED"
+        );
+
+        drop(at_amf1);
+        ngap.ue_auth_state.remove(id);
+        amf1.stop().await.expect("AMF-1 stop");
+        change_sink.stop().await.expect("sink stop");
+        event_sink.stop().await.expect("sink stop");
+    }
+
     /// **#1726 review M1**, TS 29.518 §5.2.2.2.2: an old AMF may keep the UE context
     /// after the transfer, under its supervision timer, so a registration retried
     /// with the same foreign 5G-GUTI fetches the same `eventSubscriptionList` again.

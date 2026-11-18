@@ -2983,6 +2983,43 @@ impl AmfContext {
             .unwrap_or_default()
     }
 
+    /// The live event subscriptions that target one UE by an identity it carries
+    /// (#1727): its `eventSubscriptionList` in a UEContextTransfer answer (TS 29.518
+    /// §6.1.6.2.25, "the event subscription(s) targeting the UE or the group the UE
+    /// is part of"). Expired ones are left out. Only a subscription keyed by an
+    /// identity of the UE (SUPI, GPSI or PEI) matches, so these are not included:
+    /// - any-UE subscriptions, which carry no UE identity: they stay with this AMF,
+    ///   and a copy at the new AMF would report every UE there;
+    /// - a group subscription keyed by `groupId` alone, since this AMF cannot tell
+    ///   whether the UE is in the group (see [`EventSubscription::group_id`]).
+    ///
+    /// Sorted by subscription ID, so the list is stable across calls.
+    pub fn event_subscriptions_targeting_ue(
+        &self,
+        supi: Option<&str>,
+        gpsi: Option<&str>,
+        pei: Option<&str>,
+    ) -> Vec<EventSubscription> {
+        let now = std::time::SystemTime::now();
+        let mut subs: Vec<EventSubscription> = self
+            .event_subscriptions
+            .read()
+            .map(|subs| {
+                subs.values()
+                    .filter(|s| s.expiry.is_none_or(|e| e > now))
+                    .filter(|s| {
+                        (s.supi.is_some() && s.supi.as_deref() == supi)
+                            || (s.gpsi.is_some() && gpsi.is_some() && s.gpsi.as_deref() == gpsi)
+                            || (s.pei.is_some() && pei.is_some() && s.pei.as_deref() == pei)
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        subs.sort_by(|a, b| a.subscription_id.cmp(&b.subscription_id));
+        subs
+    }
+
     /// Find the live UE whose GPSI is `gpsi` (#74 criterion 4).
     ///
     /// `AmfUe.gpsi` is written from the UDM SDM `am-data` at registration
