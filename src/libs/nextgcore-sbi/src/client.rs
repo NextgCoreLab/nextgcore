@@ -818,7 +818,10 @@ impl SbiClient {
                 request.http.set_header("Authorization", header);
             }
         }
-        let response = self.send_with_overload_reaction(request).await?;
+        // Boxed (#1676): two inline sends doubled this future, and every peer call
+        // in an NF carries it, so a deep async test stack (amfd's
+        // an_n1_only_page_..._1643) overflowed 2 MiB with it inline.
+        let response = Box::pin(self.send_with_overload_reaction(request)).await?;
         let Some((oauth2, target, resend, header)) = resend else {
             return Ok(response);
         };
@@ -842,7 +845,7 @@ impl SbiClient {
         oauth2
             .invalidate_token_if(&oauth2.self_consumer(), target, &scope, rejected)
             .await;
-        self.send_with_overload_reaction(resend).await
+        Box::pin(self.send_with_overload_reaction(resend)).await
     }
 
     /// #65: the TS 29.500 §6.4/§6.5 reaction that used to be missing entirely.
