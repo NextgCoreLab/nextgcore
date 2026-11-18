@@ -6,7 +6,9 @@ use crate::nnrf_build::{
     nrf_nnrf_nfm_build_nf_profile_changed_notify, nrf_nnrf_nfm_build_nf_status_notify, ChangeItem,
     NotificationEventType,
 };
-use crate::nnrf_handler::{nf_manager, NfProfile, SubscrCond, SubscrCondKind, SubscriptionData};
+use crate::nnrf_handler::{
+    nf_manager, same_nf_set_id, NfProfile, SubscrCond, SubscrCondKind, SubscriptionData,
+};
 use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
 use nextgcore_sbi::message::SbiRequest;
 use nextgcore_sbi::oauth::OAuth2Client;
@@ -841,9 +843,11 @@ fn subscr_cond_matches(cond: &SubscrCond, nf: &NfProfile) -> bool {
                 .is_some_and(|wanted| wanted.iter().any(|w| held.iter().any(|g| g == w)))
         }
 
-        SubscrCondKind::NfSet => cond
-            .str_at("nfSetId")
-            .is_some_and(|want| profile_nf_set_ids(doc).iter().any(|s| s == want)),
+        SubscrCondKind::NfSet => cond.str_at("nfSetId").is_some_and(|want| {
+            profile_nf_set_ids(doc)
+                .iter()
+                .any(|s| same_nf_set_id(s, want))
+        }),
 
         // NfServiceSetCond: nfServiceSetId is mandatory, nfSetId an optional
         // additional constraint.
@@ -855,7 +859,11 @@ fn subscr_cond_matches(cond: &SubscrCond, nf: &NfProfile) -> bool {
                         services.iter().any(|s| {
                             s.get("nfServiceSetIdList")
                                 .and_then(|v| v.as_array())
-                                .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(want)))
+                                .is_some_and(|ids| {
+                                    ids.iter()
+                                        .filter_map(|id| id.as_str())
+                                        .any(|id| same_nf_set_id(id, want))
+                                })
                         })
                     })
             });
@@ -863,7 +871,9 @@ fn subscr_cond_matches(cond: &SubscrCond, nf: &NfProfile) -> bool {
                 return false;
             }
             match cond.str_at("nfSetId") {
-                Some(want) => profile_nf_set_ids(doc).iter().any(|s| s == want),
+                Some(want) => profile_nf_set_ids(doc)
+                    .iter()
+                    .any(|s| same_nf_set_id(s, want)),
                 None => true,
             }
         }
@@ -951,9 +961,15 @@ fn subscr_cond_matches(cond: &SubscrCond, nf: &NfProfile) -> bool {
         }
 
         SubscrCondKind::Dccf => {
-            for (cond_key, info_key) in [
-                ("nfTypeList", "servingNfTypeList"),
-                ("nfSetIdList", "servingNfSetIdList"),
+            // NF types compare exactly (an enum); NF Set IDs case-insensitively
+            // (TS 23.003 §28.12, #1719).
+            for (cond_key, info_key, same) in [
+                (
+                    "nfTypeList",
+                    "servingNfTypeList",
+                    (|a: &str, b: &str| a == b) as fn(&str, &str) -> bool,
+                ),
+                ("nfSetIdList", "servingNfSetIdList", same_nf_set_id),
             ] {
                 if let Some(wanted) = cond.str_list_at(cond_key) {
                     if !wanted.is_empty() {
@@ -962,7 +978,7 @@ fn subscr_cond_matches(cond: &SubscrCond, nf: &NfProfile) -> bool {
                             .and_then(|v| v.as_array())
                             .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
                             .unwrap_or_default();
-                        if !wanted.iter().any(|w| held.contains(w)) {
+                        if !wanted.iter().any(|w| held.iter().any(|h| same(h, w))) {
                             return false;
                         }
                     }
@@ -1702,6 +1718,70 @@ mod tests {
                 "the extra criterion in {raw} must narrow the match"
             );
         }
+    }
+
+    /// #1719: NF Set IDs and NF Service Set IDs compare case-insensitively
+    /// (TS 23.003 §28.12), in NfSetCond, NfServiceSetCond and DccfCond alike; a
+    /// different set still does not match.
+    ///
+    /// REVERT-VERIFIED: with `same_nf_set_id` comparing exactly, the upper-case
+    /// NfSetCond case fails first.
+    #[test]
+    fn nf_set_conditions_match_case_insensitively_1719() {
+        let amf = profile_from(serde_json::json!({
+            "nfInstanceId": "amf-1719",
+            "nfType": "AMF",
+            "nfStatus": "REGISTERED",
+            "nfSetIdList": ["set1.amfset.5gc.mnc001.mcc001"],
+            "nfServices": [{
+                "serviceInstanceId": "s1",
+                "serviceName": "namf-comm",
+                "versions": [],
+                "scheme": "http",
+                "nfServiceSetIdList": ["set1.snnamf-comm.nfi1719.5gc.mnc001.mcc001"],
+            }],
+        }));
+        for raw in [
+            serde_json::json!({ "nfSetId": "SET1.AMFSET.5GC.MNC001.MCC001" }),
+            serde_json::json!({ "nfServiceSetId": "Set1.snNamf-comm.nfi1719.5gc.mnc001.mcc001" }),
+            serde_json::json!({ "nfServiceSetId": "set1.snnamf-comm.nfi1719.5gc.mnc001.mcc001",
+                                "nfSetId": "Set1.AmfSet.5gc.mnc001.mcc001" }),
+        ] {
+            assert!(
+                subscription_matches(&sub_with_cond(raw.clone()), &amf),
+                "{raw} must match regardless of case"
+            );
+        }
+        for raw in [
+            serde_json::json!({ "nfSetId": "SET2.AMFSET.5GC.MNC001.MCC001" }),
+            serde_json::json!({ "nfServiceSetId": "set2.snnamf-comm.nfi1719.5gc.mnc001.mcc001" }),
+        ] {
+            assert!(
+                !subscription_matches(&sub_with_cond(raw.clone()), &amf),
+                "{raw} names another set"
+            );
+        }
+
+        let dccf = profile_from(serde_json::json!({
+            "nfInstanceId": "dccf-1719",
+            "nfType": "DCCF",
+            "nfStatus": "REGISTERED",
+            "dccfInfo": { "servingNfSetIdList": ["set1.amfset.5gc.mnc001.mcc001"] },
+        }));
+        let cond = |set: &str| {
+            sub_with_cond(serde_json::json!({
+                "conditionType": "DCCF_COND",
+                "nfSetIdList": [set],
+            }))
+        };
+        assert!(subscription_matches(
+            &cond("SET1.AMFSET.5gc.mnc001.mcc001"),
+            &dccf
+        ));
+        assert!(!subscription_matches(
+            &cond("set2.amfset.5gc.mnc001.mcc001"),
+            &dccf
+        ));
     }
 
     /// A group id lives inside the per-type `*Info` container, and the
