@@ -636,15 +636,24 @@ mod tests {
 
     /// With coordination off, nothing is attempted — the guard on the default
     /// posture.
-    #[tokio::test]
-    async fn coordination_is_off_by_default() {
+    #[test]
+    fn coordination_is_off_by_default() {
+        // #1785: the coordination switch is process-global, and the
+        // data-management tests switch it on under this lock; flipping it off
+        // without the lock disabled their coordination mid-test.
+        let _g = crate::context::GLOBAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         set_coordination_for_test(None);
-        let outcome = ensure_producer_subscription(
-            "c1",
-            &SubscriptionScope::default(),
-            &DataManagementSubsc::default(),
-        )
-        .await;
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(ensure_producer_subscription(
+                "c1",
+                &SubscriptionScope::default(),
+                &DataManagementSubsc::default(),
+            ));
         assert_eq!(outcome, CoordinationOutcome::Disabled);
     }
 }
