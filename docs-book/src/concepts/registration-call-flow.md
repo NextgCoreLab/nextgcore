@@ -397,7 +397,9 @@ registration:
   (TS 29.503 §5.2.2.5.2) on it updates the subscribed UE-AMBR, GPSI and
   MPS/MCX priority as registration derives them, and is answered 204. The AMF
   keeps the whole am-data, so a change of a member it does not act on is seen
-  however the UDM encodes it (its own path, or a whole-resource replacement). A
+  however the UDM encodes it (its own path, or a whole-resource replacement);
+  so even a change of a member it could safely ignore, such as
+  `supportedFeatures`, is refused. A
   change this AMF does not apply (another am-data member, the subscribed
   S-NSSAIs, a removal of the UE-AMBR, or a UE-AMBR change for a CM-CONNECTED
   UE) refuses the whole notification with 400 and a ProblemDetails, and nothing

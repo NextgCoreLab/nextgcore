@@ -201,7 +201,7 @@ pub(crate) fn applied_am_data(
             apply_change(&mut doc, change, &mut touched)?;
         }
     }
-    check_applicable(supi, current, &doc, &touched, cm_connected)?;
+    check_applicable(current, &doc, &touched, cm_connected)?;
     Ok(doc)
 }
 
@@ -293,7 +293,6 @@ fn ue_ambr_bps(doc: &Value) -> Option<(u64, u64)> {
 
 /// Refuse a result this AMF cannot apply (see the module docs).
 fn check_applicable(
-    supi: &str,
     current: &HeldAmData,
     after: &Value,
     touched: &Touched,
@@ -356,13 +355,10 @@ fn check_applicable(
                 .to_string(),
         ));
     }
-    let slices = |doc: &Value| {
-        let mut s = crate::sbi_path::parse_am_data(doc, supi).nssai;
-        s.sort_unstable();
-        s.dedup();
-        s
-    };
-    if slices(before) != slices(after) {
+    // The whole `nssai` member, not only the defaults `parse_am_data` reads: its
+    // `singleNssais` (the non-default subscribed S-NSSAIs, TS 29.503 §6.1.6.2.2) is
+    // acted on by nothing here, so a change of it must be refused too (R13 M1).
+    if before.get("nssai") != after.get("nssai") {
         return Err(NotApplied::NotAllowed(
             "a change of the subscribed S-NSSAIs: the Allowed NSSAI is decided at \
              registration, and changing it needs a UE Configuration Update"
@@ -536,6 +532,33 @@ mod tests {
         ));
         assert!(change("5 Mbps", false).is_ok(), "CM-IDLE: applied");
         assert!(change("1000 Kbps", true).is_ok(), "the same rate: applied");
+    }
+
+    /// #1748 (R13 M1): a change of `nssai.singleNssais`, the non-default subscribed
+    /// S-NSSAIs, is refused like a change of the defaults: nothing here acts on it,
+    /// so a 204 would tell the UDM an ignored change was applied. `nssai` as held
+    /// is not a change.
+    ///
+    /// REVERT-VERIFIED: with the whole-member comparison replaced by one of the
+    /// parsed defaults only, the `singleNssais` case is Ok.
+    #[test]
+    fn a_change_of_the_non_default_s_nssais_is_refused_1748() {
+        let current = held(json!({"nssai": {"defaultSingleNssais": [{"sst": 1}]}}));
+        let replace = |nssai: Value| {
+            applied_am_data(
+                SUPI,
+                &current,
+                None,
+                &notification(json!([{"op": "REPLACE", "path": "/nssai", "newValue": nssai}])),
+                false,
+            )
+        };
+        assert!(matches!(
+            replace(json!({"defaultSingleNssais": [{"sst": 1}],
+                           "singleNssais": [{"sst": 2, "sd": "000002"}]})),
+            Err(NotApplied::NotAllowed(ref d)) if d.contains("S-NSSAIs")
+        ));
+        assert!(replace(json!({"defaultSingleNssais": [{"sst": 1}]})).is_ok());
     }
 
     /// #1748: `subscriptionId` names the subscription; one this UE does not hold is
