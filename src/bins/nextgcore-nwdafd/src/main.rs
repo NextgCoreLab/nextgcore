@@ -2191,6 +2191,7 @@ mod g21_strict_peer_tests {
             validity_duration: 3600,
             req_notif_events: None,
             notif_condition: None,
+            owner: None,
         });
 
         let client = SbiClient::with_host_port("127.0.0.1", port);
@@ -3009,6 +3010,7 @@ mod callback_oauth2_1421_tests {
             validity_duration: 3600,
             req_notif_events: None,
             notif_condition: None,
+            owner: None,
         }
     }
 
