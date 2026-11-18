@@ -16,7 +16,8 @@
 #      (deploy/helm/nf-tls-secrets.sh) issues each NF the ID the chart pins
 #   8. --prune: a version that is not in the namespace is refused and nothing
 #      is deleted; a version something still mounts is kept; the others are
-#      deleted; a failure part way is finished by a re-run
+#      deleted; a failure part way is finished by a re-run; when the workloads
+#      or the Secrets cannot be listed it refuses and deletes nothing
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,6 +34,7 @@ cat > "${T}/bin/kubectl" <<'SH'
 # Fake kubectl: Secrets as JSON files in $FAKE_STORE. FAKE_FAIL_AT=N fails the
 # Nth write, FAKE_HANG_AT=N stalls it (touching $FAKE_STORE.hang first).
 if [ "$1 $2" = "get secrets" ]; then
+  [ -n "${FAKE_DENY_LIST_SECRETS:-}" ] && { echo 'Error from server (Forbidden): secrets is forbidden' >&2; exit 1; }
   python3 - "$FAKE_STORE" <<'PY'
 import json, os, sys
 d = sys.argv[1]
@@ -41,6 +43,7 @@ PY
   exit 0
 fi
 if [ "$1 $2" = "get pods,deployments,statefulsets,daemonsets,replicasets,jobs,cronjobs" ]; then
+  [ -n "${FAKE_DENY_LIST_USERS:-}" ] && { echo 'Error from server (Forbidden): daemonsets.apps is forbidden' >&2; exit 1; }
   if [ -s "${FAKE_USERS:-/dev/null}" ]; then cat "$FAKE_USERS"; else echo '{"items": []}'; fi
   exit 0
 fi
@@ -239,6 +242,18 @@ cat > "${T}/users.json" <<JSON
 ]}
 JSON
 export FAKE_USERS="${T}/users.json"
+# Neither list readable (a namespace-scoped installer without list on
+# daemonsets, say): no mount set, so nothing may be deleted.
+for deny in FAKE_DENY_LIST_USERS:workloads FAKE_DENY_LIST_SECRETS:Secrets; do
+  what="${deny#*:}"; deny="${deny%%:*}"
+  reset_writes
+  rc=0; env "${deny}=1" "${SUT}" --prune ns "${VH}" 2>"${T}/err" || rc=$?
+  [[ "${rc}" != 0 ]] || fail "8: ${deny}: an unreadable namespace was pruned (exit 0)"
+  grep -q "cannot list .*${what}.*; nothing deleted" "${T}/err" \
+    || fail "8: ${deny}: the refusal is not named: $(cat "${T}/err")"
+  [[ "$(vers)" == "${all_before}" && "$(writes)" == 0 ]] \
+    || fail "8: ${deny}: $(writes) deletes; versions $(vers), not ${all_before}"
+done
 reset_writes
 if FAKE_FAIL_AT=2 prune "${VH}"; then fail "8: an injected delete failure was not reported"; fi
 for v in "${V2}" "${V3}" "${VH}"; do [[ " $(vers) " == *" ${v} "* ]] || fail "8: version ${v} was deleted"; done
@@ -249,6 +264,6 @@ want="$(printf '%s\n' "${V2}" "${V3}" "${VH}" | sort | tr '\n' ' ' | sed 's/ $//
 grep -q "kept version ${V2}: still mounted by Pod/amf-x" "${T}/err" || fail "8: the pod's version is not named kept: $(cat "${T}/err")"
 grep -q "kept version ${V3}: still mounted by Deployment/smf" "${T}/err" || fail "8: the Deployment's version is not named kept"
 unset FAKE_USERS
-ok "--prune refuses an absent version, keeps the mounted ones (${V2} pod, ${V3} template), deletes the rest, and a re-run finishes a failed one"
+ok "--prune refuses an absent version or an unlistable namespace, keeps the mounted ones (${V2} pod, ${V3} template), deletes the rest, and a re-run finishes a failed one"
 
 echo "1..${pass} all passed"

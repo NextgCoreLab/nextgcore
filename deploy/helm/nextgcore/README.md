@@ -72,16 +72,22 @@ helm template nextg deploy/helm/nextgcore -n nextg-system --set global.siteId=<s
   identity at the NRF before NFRegister, and that proof is this certificate, so
   each NF needs its own: URI SAN `urn:uuid:<nfInstanceId>` of its line,
   RFC 9310 NFTypes `<nfType>`, keyUsage digitalSignature, EKU serverAuth and
-  clientAuth, validity 3 years or less. The NRF's certificate must also name
-  `global.nrfTls.serverName` as a DNS SAN (or set it to `""` and name the
-  Service FQDN). Create `nf-tls-<nf>-<version>` (any 16 hex digits) with keys
+  clientAuth, validity 3 years or less. Set `global.nrfTls.serverName` to
+  `""` so each NF verifies the NRF as the Service FQDN it dials, and issue the
+  NRF's certificate for that FQDN: the dev default `nrf` accepts any NRF
+  certificate of your CA that names `DNS:nrf`, which with one CA across sites
+  is every site's NRF. Create `nf-tls-<nf>-<version>` (any 16 hex digits) with keys
   `ca.crt`, `<nf>.crt`, `<nf>.key`, and set `global.nrfTls.secretVersion`. Never
   put the CA key in the cluster.
 - **Superseded versions** each still hold a private key. Once every pod runs on
   the new version, delete the others with
   `k8s/nf-tls-secrets.sh --prune <namespace> <version>`. It keeps any version a
   pod or workload template still mounts, and refuses (deleting nothing) when
-  `<version>` itself is not in the namespace.
+  `<version>` itself is not in the namespace or the namespace's workloads
+  cannot be listed. Do not run it during a `helm upgrade` or `helm rollback`:
+  it reads what mounts each version once, then deletes, so a rollback to a
+  revision whose ReplicaSet was at 0 in between loses that revision's Secrets
+  (re-issue them with `nf-tls-secrets.sh`).
 
 Each NF runs one pod (`replicas > 1` fails the render) with strategy Recreate:
 two pods under one `nfInstanceId` are one NF instance at the NRF, and a rolling

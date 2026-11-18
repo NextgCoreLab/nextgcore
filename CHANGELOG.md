@@ -74,8 +74,10 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   fails with an empty `global.siteId` unless every `nfInstanceId` is pinned (the `lookup`
   fallback to the kube-system UID is gone: it was empty under `helm template`, so certificates
   would name IDs the install does not pin; to keep an AMF ID derived that way, pin
-  `amf.nfInstanceId`); `global.sbi.scheme` other than `https` fails the render; and every NRF
-  client refuses `replicas > 1` and rolls out with strategy Recreate. `check-nf-identities.py
+  `amf.nfInstanceId`); `global.sbi.scheme` other than `https` fails the render; a pinned
+  `<nf>.nfInstanceId`, `amf.nfInstanceId` included (which used to accept any string), must be
+  a lower-case UUID version 4 (TS 29.571 §5.3.2); the NRF and every NRF client refuse
+  `replicas > 1`, and the clients roll out with strategy Recreate. `check-nf-identities.py
   --helm` (CI `manifests`) checks the renders and refusals.
 - mmed binds a configured IPv6 S1-MME address. Before, a bracketed IPv6 `mme.s1ap.server`
   address without a port (`[fd00::5]`) was dropped as unparsable, and the IPv6 server list

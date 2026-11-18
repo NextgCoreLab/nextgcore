@@ -10,6 +10,7 @@ metadata:
     {{- include "nextgcore.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.nrf.replicas }}
+  {{- include "nextgcore.singleInstance" (dict "root" . "nf" "nrf") }}
   selector:
     matchLabels:
       app.kubernetes.io/name: nrf

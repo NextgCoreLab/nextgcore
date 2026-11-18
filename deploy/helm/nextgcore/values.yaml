@@ -47,7 +47,7 @@ global:
     # The name the NRF's certificate is verified against. The dev nrf.crt
     # names DNS:nrf (not the Service FQDN the NFs dial). Empty: the dialled
     # host, <release>-nrf.<namespace>.svc.cluster.local, which your nrf.crt
-    # must then name.
+    # must then name. Use "" with your own PKI (see README.md).
     serverName: nrf
     # The Secret version the pods mount (nf-tls-<nf>-<secretVersion>), as
     # printed by nf-tls-secrets.sh. Empty: nf-tls-<nf> (what nf-tls-secrets.sh
@@ -160,7 +160,8 @@ nrf:
   replicas: 1
   # This NF's nfInstanceId (#1617): empty derives it from global.siteId, the
   # namespace, the release and the NF. nrf.crt must name it (the
-  # NRF's own OAuth2 client presents nrf.crt only then).
+  # NRF's own OAuth2 client presents nrf.crt only then). One pod per release:
+  # replicas > 1 fails the render (one ID, one certificate).
   nfInstanceId: ""
   image:
     repository: nextgcore-rust/nrf

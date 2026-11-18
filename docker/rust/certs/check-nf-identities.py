@@ -69,7 +69,9 @@ compose files in step:
    - the chart refuses to render with an empty global.siteId and an unpinned
      ID, a non-https global.sbi.scheme, a malformed secretVersion or
      nfInstanceId, and replicas > 1, and renders with an empty siteId once
-     every ID is pinned.
+     every ID is pinned;
+   - rule 5 holds over `helm install --dry-run=client`, NOTES.txt included
+     (a templated http:// URL is only recognisable rendered).
 
 Usage: check-nf-identities.py [--self-test] [--k8s] [--helm]
 """
@@ -571,6 +573,8 @@ HELM_REFUSALS = [
     (['global.siteId=ci', 'global.nrfTls.secretVersion=v1'], 'is not the 16 hex digits'),
     (['global.siteId=ci', 'udm.nfInstanceId=UDM-1'], 'is not a lower-case UUID version 4'),
     (['global.siteId=ci', 'ausf.replicas=2'], 'ausf.replicas > 1 is not supported'),
+    (['global.siteId=ci', 'amf.replicas=2'], 'amf.replicas > 1 is not supported'),
+    (['global.siteId=ci', 'nrf.replicas=2'], 'nrf.replicas > 1 is not supported'),
 ]
 
 
@@ -595,6 +599,17 @@ def helm_checks(table):
         elif needle not in r.stderr:
             errors.append('helm template --set %s failed for another reason: %s'
                           % (' --set '.join(sets), r.stderr.strip()))
+    # Rule 5 over the rendered chart, NOTES included: a templated URL
+    # (http://{{ ... }}/nnrf-...) is only recognisable once rendered, and
+    # `helm template` does not render NOTES.txt.
+    import subprocess
+    r = subprocess.run(['helm', 'install', '--dry-run=client', HELM_RELEASE, HELM_CHART,
+                        '-n', 'ns', '--set', 'global.siteId=ci'], capture_output=True, text=True)
+    if r.returncode != 0:
+        errors.append('helm install --dry-run=client failed:\n%s' % r.stderr)
+    else:
+        errors += plaintext_nrf_uris('helm install --dry-run=client (manifests and NOTES)',
+                                     r.stdout)
     # An empty siteId is fine once nothing is derived.
     pins = ['%s.nfInstanceId=6b1d7e3c-0000-4000-8000-%012x' % (nf, i) for i, nf in enumerate(
         'nrf amf smf ausf udm udr pcf nssf bsf'.split())]

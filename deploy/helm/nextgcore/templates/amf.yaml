@@ -15,9 +15,6 @@ spec:
   UDM. An overlapping rollout lets the old pod's NFDeregister remove the new
   pod's profile. Scale with a StatefulSet that gives each ordinal its own id.
   */}}
-  {{- if gt (int .Values.amf.replicas) 1 }}
-  {{- fail "amf.replicas > 1 is not supported: every AMF pod would share one nfInstanceId (#753). Run one AMF per release, or a StatefulSet with a per-ordinal NEXTGCORE_AMF_INSTANCE_ID." }}
-  {{- end }}
   replicas: {{ .Values.amf.replicas }}
   {{- include "nextgcore.singleInstance" (dict "root" . "nf" "amf") }}
   # Recreate, not RollingUpdate: the new pod must not register while the old pod,

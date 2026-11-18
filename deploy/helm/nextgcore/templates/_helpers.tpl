@@ -345,6 +345,6 @@ replacement just registered (#753, #1617).
 */}}
 {{- define "nextgcore.singleInstance" -}}
 {{- if gt (int (index .root.Values .nf).replicas) 1 -}}
-{{- fail (printf "%s.replicas > 1 is not supported: every pod would share one nfInstanceId and one certificate (#753, #1617). Run one per release." .nf) -}}
+{{- fail (printf "%s.replicas > 1 is not supported: every pod would share one nfInstanceId and one certificate (#753, #1617). Run one per release, or a StatefulSet with a per-ordinal NEXTGCORE_<TYPE>_INSTANCE_ID and certificate." .nf) -}}
 {{- end -}}
 {{- end -}}
