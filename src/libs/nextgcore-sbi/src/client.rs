@@ -806,7 +806,7 @@ impl SbiClient {
         // attached here, as `prepare_request` would, so the token the producer
         // refuses is known (review m1: only that token is evicted). A failure to
         // obtain one is left to `prepare_request`, which fails closed (#63).
-        let scope = derive_scope_from_uri(&request.header.uri);
+        let scope = request_access_scope(&request);
         let ours = request.http.get_header("Authorization").is_none() && !scope.is_empty();
         let mut resend = None;
         if let Some((oauth2, target)) = ours
@@ -1170,7 +1170,7 @@ impl SbiClient {
             // copied from a hyper (lowercased HTTP/2) message also counts.
             if request.http.get_header("Authorization").is_none() {
                 // Derive scope from the request URI service name
-                let scope = derive_scope_from_uri(&request.header.uri);
+                let scope = request_access_scope(request);
                 if !scope.is_empty() {
                     match oauth2.authorization_header(*target_nf_type, &scope).await {
                         Ok(auth_value) => {
@@ -1704,6 +1704,18 @@ fn bearer_challenge_error(www_authenticate: &str) -> Option<String> {
             .eq_ignore_ascii_case("error")
             .then(|| val.trim().trim_matches('"').to_string())
     })
+}
+
+/// #1811: the scope this client asks the NRF for to send `request`: the
+/// service-level scope plus the resource-level scope the operation needs, if
+/// any (TS 29.500 §6.7.3; [`crate::resource_scope`]). A producer that enforces
+/// a resource scope refuses a token for the service alone.
+fn request_access_scope(request: &SbiRequest) -> String {
+    crate::resource_scope::access_token_scope(
+        &derive_scope_from_uri(&request.header.uri),
+        &request.header.method,
+        &request.header.uri,
+    )
 }
 
 fn derive_scope_from_uri(uri: &str) -> String {
@@ -2361,6 +2373,25 @@ mod tests {
             .expect("its own");
         assert!(Arc::ptr_eq(&client, &own));
         assert_eq!(target, NfType::Udm);
+    }
+
+    #[test]
+    fn the_auth_subscription_token_asks_for_the_resource_scope_1811() {
+        let path = "/nudr-dr/v2/subscription-data/imsi-001010000000001/authentication-data/authentication-subscription";
+        assert_eq!(
+            request_access_scope(&SbiRequest::get(path)),
+            "nudr-dr nudr-dr:subscription-data:authentication-subscription:read"
+        );
+        assert_eq!(
+            request_access_scope(&SbiRequest::patch(path)),
+            "nudr-dr nudr-dr:subscription-data:authentication-subscription:modify"
+        );
+        assert_eq!(
+            request_access_scope(&SbiRequest::get(
+                "/nudr-dr/v2/subscription-data/imsi-001010000000001/provisioned-data/am-data"
+            )),
+            "nudr-dr"
+        );
     }
 
     #[test]

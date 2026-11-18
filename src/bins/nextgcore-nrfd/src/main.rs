@@ -3647,7 +3647,13 @@ fn producer_eligible(
 ///   2. verify each requested service-name scope is offered by — and permitted
 ///      to the consumer by — at least one registered producer of the target NF
 ///      type (`allowedNfTypes` profile- and service-level filters, TS 29.510
-///      §6.1.6.2; an empty/absent list is "no restriction").
+///      §6.1.6.2; an empty/absent list is "no restriction"); and
+///   3. (#1811) grant a resource/operation-level scope
+///      (`<service>:<resource>:<op>`) only when that producer's NFService lists
+///      it for the consumer in `allowedOperationsPerNfType` /
+///      `allowedOperationsPerNfInstance` (TS 29.510 Table 6.1.6.2.3-1 NOTE 11;
+///      TS 33.501 §13.4.1.1 "additional scope"). An ungranted scope is left out
+///      of the token, as RFC 6749 §3.3 lets the server do.
 ///
 /// Returns the granted scope subset, or an RFC 6749 §5.2 error
 /// `(code, description)` carried in the 400 `AccessTokenErr`.
@@ -3711,7 +3717,10 @@ fn authorize_access_token(
         let mut offered = false;
         let mut permitted = false;
         for p in &eligible {
-            let (o, perm) = p.authorizes_service(&consumer.nf_type, service);
+            // #1811: a resource/operation-level scope is granted only to the
+            // consumers the producer's allowedOperationsPerNf* name.
+            let (o, perm) =
+                p.authorizes_scope(&consumer.nf_type, &consumer.nf_instance_id, service);
             offered |= o;
             permitted |= perm;
             if perm {
@@ -5611,6 +5620,170 @@ mod tests {
         )
         .expect("permitted scope must be granted");
         assert_eq!(granted, vec!["nudm-sdm".to_string()]);
+    }
+
+    /// #1811: a UDR as udrd registers it -- nudr-dr open to UDM, PCF and NEF,
+    /// with `allowedOperationsPerNfType` granting the TS 29.505
+    /// AuthenticationSubscription scopes to the UDM alone.
+    fn udr_with_resource_scopes() -> NfProfile {
+        auth_producer(
+            "UDR",
+            serde_json::json!([{
+                "serviceInstanceId": "udr-dr",
+                "serviceName": "nudr-dr",
+                "allowedNfTypes": ["UDM", "PCF", "NEF"],
+                "allowedOperationsPerNfType": {
+                    "UDM": ["nudr-dr", AUTH_SUBS_READ, AUTH_SUBS_MODIFY],
+                    "PCF": ["nudr-dr"],
+                    "NEF": ["nudr-dr"]
+                }
+            }]),
+            Some(serde_json::json!(["UDM", "PCF", "NEF"])),
+        )
+    }
+
+    const AUTH_SUBS_READ: &str = "nudr-dr:subscription-data:authentication-subscription:read";
+    const AUTH_SUBS_MODIFY: &str = "nudr-dr:subscription-data:authentication-subscription:modify";
+
+    /// #1811: only the UDM is granted the AuthenticationSubscription scope.
+    /// A PCF or NEF asking for it gets the service scope alone (RFC 6749 §3.3
+    /// lets the server narrow the request), so its token cannot read K at the
+    /// UDR; asking for the resource scope ALONE gets nothing.
+    ///
+    /// REVERT-VERIFIED: with `authorize_access_token` calling
+    /// `authorizes_service(.., service)` again instead of `authorizes_scope`, the
+    /// UDM's token loses the resource scope and the first assertion fails.
+    #[test]
+    fn the_auth_subscription_scope_is_granted_to_the_udm_only_1811() {
+        let udr = udr_with_resource_scopes();
+        let requested: Vec<String> = vec!["nudr-dr".into(), AUTH_SUBS_READ.into()];
+        let udm = authorize_access_token(
+            &auth_consumer("UDM"),
+            "UDM",
+            "UDR",
+            &requested,
+            std::slice::from_ref(&udr),
+            &[],
+            &[],
+        )
+        .expect("the UDM is authorized");
+        assert_eq!(udm, requested, "the UDM gets both scopes");
+        for nf_type in ["PCF", "NEF"] {
+            let granted = authorize_access_token(
+                &auth_consumer(nf_type),
+                nf_type,
+                "UDR",
+                &requested,
+                std::slice::from_ref(&udr),
+                &[],
+                &[],
+            )
+            .expect("the service scope is still granted");
+            assert_eq!(granted, vec!["nudr-dr".to_string()], "{nf_type}");
+            let err = authorize_access_token(
+                &auth_consumer(nf_type),
+                nf_type,
+                "UDR",
+                &[AUTH_SUBS_MODIFY.into()],
+                std::slice::from_ref(&udr),
+                &[],
+                &[],
+            )
+            .expect_err("the resource scope alone is refused");
+            assert_eq!(err.0, "unauthorized_client", "{nf_type}");
+        }
+    }
+
+    /// #1811, TS 29.510 Table 6.1.6.2.3-1 NOTE 11: with neither
+    /// allowedOperationsPerNf* registered only the service scope is grantable,
+    /// even to a UDM; once one is registered, a type it does not list is barred
+    /// from the service scope too.
+    #[test]
+    fn resource_scopes_follow_note_11_of_the_nf_service_table_1811() {
+        let plain = auth_producer(
+            "UDR",
+            serde_json::json!([{"serviceInstanceId": "s0", "serviceName": "nudr-dr"}]),
+            None,
+        );
+        let granted = authorize_access_token(
+            &auth_consumer("UDM"),
+            "UDM",
+            "UDR",
+            &["nudr-dr".into(), AUTH_SUBS_READ.into()],
+            &[plain],
+            &[],
+            &[],
+        )
+        .expect("service scope granted");
+        assert_eq!(granted, vec!["nudr-dr".to_string()]);
+
+        // AUSF passes allowedNfTypes (absent) but is not in the map.
+        let unlisted = auth_producer(
+            "UDR",
+            serde_json::json!([{
+                "serviceInstanceId": "s0", "serviceName": "nudr-dr",
+                "allowedOperationsPerNfType": {"UDM": ["nudr-dr", AUTH_SUBS_READ]}
+            }]),
+            None,
+        );
+        let err = authorize_access_token(
+            &auth_consumer("AUSF"),
+            "AUSF",
+            "UDR",
+            &["nudr-dr".into()],
+            &[unlisted],
+            &[],
+            &[],
+        )
+        .expect_err("a type the map does not list is barred");
+        assert_eq!(err.0, "unauthorized_client");
+    }
+
+    /// #1811, NOTE 11's instance map: by default either map grants; with
+    /// `allowedOperationsPerNfInstanceOverrides` the instance's own entry
+    /// replaces its type's.
+    #[test]
+    fn the_instance_map_adds_to_or_overrides_the_type_map_1811() {
+        let consumer = auth_consumer("PCF");
+        let id = consumer.nf_instance_id.clone();
+        let udr = |overrides: bool, instance_scopes: serde_json::Value| {
+            auth_producer(
+                "UDR",
+                serde_json::json!([{
+                    "serviceInstanceId": "s0", "serviceName": "nudr-dr",
+                    "allowedOperationsPerNfType": {"PCF": ["nudr-dr", AUTH_SUBS_READ]},
+                    "allowedOperationsPerNfInstance": {id.clone(): instance_scopes},
+                    "allowedOperationsPerNfInstanceOverrides": overrides
+                }]),
+                None,
+            )
+        };
+        let grant = |p: NfProfile, scope: &str| {
+            authorize_access_token(
+                &consumer,
+                "PCF",
+                "UDR",
+                &[scope.to_string()],
+                &[p],
+                &[],
+                &[],
+            )
+            .is_ok()
+        };
+        let modify = serde_json::json!(["nudr-dr", AUTH_SUBS_MODIFY]);
+        assert!(
+            grant(udr(false, modify.clone()), AUTH_SUBS_MODIFY),
+            "instance map adds"
+        );
+        assert!(
+            grant(udr(false, modify.clone()), AUTH_SUBS_READ),
+            "type map still grants"
+        );
+        assert!(grant(udr(true, modify.clone()), AUTH_SUBS_MODIFY));
+        assert!(
+            !grant(udr(true, modify), AUTH_SUBS_READ),
+            "overridden: the type map no longer grants this instance"
+        );
     }
 
     #[test]

@@ -1819,11 +1819,9 @@ impl ScpProxy {
         //
         // A no-scope request (no service name and no Access-Scope) needs no token.
         let token_scope = delegated.as_ref().map(|d| {
-            d.requested_scope.clone().unwrap_or_else(|| {
-                UriComponents::parse(&request.header.uri)
-                    .api_name
-                    .unwrap_or_default()
-            })
+            d.requested_scope
+                .clone()
+                .unwrap_or_else(|| delegated_token_scope(request))
         });
 
         // scpd-07: keep a pristine (pre-token) copy for a single refresh-and-
@@ -2219,6 +2217,21 @@ impl ScpProxy {
             )),
         }
     }
+}
+
+/// #1811: the scope the SCP asks for on the consumer's behalf when the request
+/// names none in `3gpp-Sbi-Access-Scope`: the service scope plus the
+/// resource-level scope the operation needs (TS 29.500 §6.7.3), exactly what a
+/// direct consumer asks for ([`nextgcore_sbi::resource_scope`]). Empty when the
+/// request names no service.
+fn delegated_token_scope(request: &SbiRequest) -> String {
+    nextgcore_sbi::resource_scope::access_token_scope(
+        &UriComponents::parse(&request.header.uri)
+            .api_name
+            .unwrap_or_default(),
+        &request.header.method,
+        &request.header.uri,
+    )
 }
 
 #[cfg(test)]
@@ -3347,6 +3360,22 @@ mod tests {
             .await
             .expect("producer start");
         server
+    }
+
+    /// #1811: with no Access-Scope header, a delegated token for the UDR's
+    /// AuthenticationSubscription asks for its resource scope too, so a UDM
+    /// behind the SCP still reads it from a udrd enforcing that scope.
+    #[test]
+    fn the_delegated_scope_carries_the_resource_scope_1811() {
+        let path = "/nudr-dr/v2/subscription-data/imsi-001010000000001/authentication-data/authentication-subscription";
+        assert_eq!(
+            delegated_token_scope(&SbiRequest::get(path)),
+            "nudr-dr nudr-dr:subscription-data:authentication-subscription:read"
+        );
+        assert_eq!(
+            delegated_token_scope(&SbiRequest::post("/nudm-uecm/v1/registrations")),
+            "nudm-uecm"
+        );
     }
 
     /// A Model D request from consumer `amf-instance-7`, optionally attesting
