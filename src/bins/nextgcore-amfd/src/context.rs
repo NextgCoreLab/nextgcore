@@ -1270,6 +1270,17 @@ pub struct EventSubscription {
     /// de-duplication: a consumer's own subscription to this AMF is a different
     /// resource, even when it is the one the transferred copy came from.
     pub taken_over: bool,
+    /// The event reporting mode is ONE_TIME (`options.trigger`, TS 29.518
+    /// §6.2.6.2.4 AmfEventMode; #1760). Such a subscription is told once: *"the AMF
+    /// shall not do any subsequent event notification"* (`29518-k00.txt:5716-5719`).
+    /// It is removed when its one report is made (in the create response, in its
+    /// first notification, or by the first fire point that claims it).
+    pub one_time: bool,
+    /// Its first LOCATION_REPORT waits for the UE to answer paging (#1760, TS 29.518
+    /// §5.3.2.2.2, `29518-k00.txt:5719-5743`): the UE was CM-IDLE when it was made.
+    /// While set, no location change is reported to it; the page's outcome reports
+    /// the current location (the UE answered) or the last known one (it did not).
+    pub first_location_pending: bool,
 }
 
 /// A UE location as the LOCATION_REPORT change gate compares it (#1424, #1737): the
@@ -2335,21 +2346,152 @@ impl AmfContext {
         }
     }
 
-    pub fn paging_add(&self, ctx: PagingContext) -> bool {
+    /// Queue page `ctx` for its UE, as one check-and-insert under the paging-map
+    /// write lock (#1837). Returns `false`, and queues nothing, when a page that
+    /// holds a transfer (not [`PagingContext::location_only`]) is already queued for
+    /// the UE: that page's N1/N2 and failure-notify URI are never overwritten, and
+    /// the caller refuses its own transfer (TS 23.502 §4.2.3.3 step 3b, TS 29.518
+    /// §5.2.2.3.1: 409 HIGHER_PRIORITY_REQUEST_ONGOING, #749). Before #1837 the
+    /// check ran first, outside the lock, and two transfers racing past it both
+    /// queued, the second replacing the first.
+    ///
+    /// A location-only page is taken over, and what it carries is moved to `ctx`
+    /// under the same lock (#1760 review): its LOCATION_REPORT subscriptions
+    /// (`location_report_subs`), so none is left waiting on a page that no longer
+    /// exists; its `answered_by`, so a page a REGISTRATION REQUEST already answered
+    /// is not sent again and is still taken by its Accept (#1102); and the
+    /// positioning transfers that joined it (`joined_transfers`, #1837), so each is
+    /// still told if the page fails.
+    pub fn paging_add(&self, mut ctx: PagingContext) -> bool {
         #[cfg(test)]
         self.assert_paging_map_lock_held();
-        if let Ok(mut paging_map) = self.paging_map.write() {
-            let id = ctx.amf_ue_ngap_id;
+        let mut paging_map = match self.paging_map.write() {
+            Ok(m) => m,
+            Err(e) => e.into_inner(),
+        };
+        let id = ctx.amf_ue_ngap_id;
+        if paging_map.get(&id).is_some_and(|p| !p.location_only) {
             log::info!(
-                "[UE NGAP ID: {}] Paging initiated (TMSI: 0x{:08x}, TAC: {})",
-                id,
-                ctx.tmsi,
-                ctx.tac
+                "[UE NGAP ID: {id}] a page holding another transfer is already queued; \
+                 this one is not queued"
             );
-            paging_map.insert(id, ctx);
+            return false;
+        }
+        log::info!(
+            "[UE NGAP ID: {}] Paging initiated (TMSI: 0x{:08x}, TAC: {})",
+            id,
+            ctx.tmsi,
+            ctx.tac
+        );
+        if let Some(old) = paging_map.remove(&id) {
+            for sub in old.location_report_subs {
+                if !ctx.location_report_subs.contains(&sub) {
+                    ctx.location_report_subs.push(sub);
+                }
+            }
+            if ctx.answered_by.is_none() {
+                ctx.answered_by = old.answered_by;
+            }
+            for joined in old.joined_transfers {
+                ctx.join_transfer(joined);
+            }
+            log::info!("[UE NGAP ID: {id}] the new page takes over the location-only one");
+        }
+        paging_map.insert(id, ctx);
+        true
+    }
+
+    /// #1837: join-or-create for a transfer whose payloads do not live in the
+    /// paging context (a positioning transfer: the NGAP task holds its LPP/NRPPa
+    /// until the UE is connected), as one operation under the paging-map write lock.
+    ///
+    /// - A page already queued for the UE (any kind) is joined and not replaced:
+    ///   it brings the UE back just the same. `ctx`'s failure-notify URI is kept on
+    ///   it as a [`JoinedTransfer`], so a failed page notifies this requester too
+    ///   (TS 29.518 §5.2.2.3.1, TS 23.502 §4.2.3.3 step 4c). [`PagingJoin::Joined`].
+    /// - With no page, `ctx` is queued. [`PagingJoin::Started`].
+    /// - A page already holding [`MAX_JOINED_TRANSFERS`] joined requesters takes no
+    ///   more: [`PagingJoin::Full`], and nothing changes.
+    pub fn paging_join_or_add_transfer(&self, ctx: PagingContext) -> PagingJoin {
+        #[cfg(test)]
+        self.assert_paging_map_lock_held();
+        let mut paging_map = match self.paging_map.write() {
+            Ok(m) => m,
+            Err(e) => e.into_inner(),
+        };
+        let id = ctx.amf_ue_ngap_id;
+        if let Some(page) = paging_map.get_mut(&id) {
+            let Some(uri) = ctx.failure_notify_uri else {
+                return PagingJoin::Joined;
+            };
+            let joined = JoinedTransfer {
+                failure_notify_uri: uri,
+                n1n2_msg_data_uri: ctx.n1n2_msg_data_uri,
+            };
+            if page.join_transfer(joined) {
+                log::info!("[UE NGAP ID: {id}] a transfer joined the page already queued");
+                return PagingJoin::Joined;
+            }
+            return PagingJoin::Full;
+        }
+        log::info!(
+            "[UE NGAP ID: {}] Paging initiated (TMSI: 0x{:08x}, TAC: {})",
+            id,
+            ctx.tmsi,
+            ctx.tac
+        );
+        paging_map.insert(id, ctx);
+        PagingJoin::Started
+    }
+
+    /// #1760 review: join-or-create, as one operation under the paging-map write
+    /// lock. `subscription_id`'s first LOCATION_REPORT waits on the page queued for
+    /// `ctx`'s UE when there is one (`true`, `ctx` is dropped). Otherwise `ctx`,
+    /// which must be a [`PagingContext::location_only`] page, is queued with it
+    /// (`false`). No page another task queues meanwhile is overwritten.
+    pub fn paging_join_or_add_location(
+        &self,
+        mut ctx: PagingContext,
+        subscription_id: &str,
+    ) -> bool {
+        #[cfg(test)]
+        self.assert_paging_map_lock_held();
+        let mut paging_map = match self.paging_map.write() {
+            Ok(m) => m,
+            Err(e) => e.into_inner(),
+        };
+        if let Some(page) = paging_map.get_mut(&ctx.amf_ue_ngap_id) {
+            if !page
+                .location_report_subs
+                .iter()
+                .any(|s| s == subscription_id)
+            {
+                page.location_report_subs.push(subscription_id.to_string());
+            }
             return true;
         }
+        log::info!(
+            "[UE NGAP ID: {}] Paging initiated for a first LOCATION_REPORT (TMSI: 0x{:08x}, \
+             TAC: {})",
+            ctx.amf_ue_ngap_id,
+            ctx.tmsi,
+            ctx.tac
+        );
+        ctx.location_only = true;
+        ctx.location_report_subs = vec![subscription_id.to_string()];
+        paging_map.insert(ctx.amf_ue_ngap_id, ctx);
         false
+    }
+
+    /// #749, #1760 review: whether a page queued for the UE holds a transfer, which
+    /// a second transfer must not overwrite. A [`PagingContext::location_only`] page
+    /// does not.
+    pub fn paging_holds_transfer(&self, amf_ue_ngap_id: u64) -> bool {
+        self.paging_map
+            .read()
+            .ok()
+            .and_then(|m| m.get(&amf_ue_ngap_id).map(|p| !p.location_only))
+            .unwrap_or(false)
     }
 
     /// Cancel paging for a UE (e.g., Service Request received)
@@ -2892,6 +3034,58 @@ impl AmfContext {
             .take()
     }
 
+    /// #1760: the paged first LOCATION_REPORT of `subscription_id` is being made, at
+    /// location `told`: it is no longer pending, and `told` is what its next location
+    /// change is measured from. A ONE_TIME subscription is removed, as this is its one
+    /// report. The subscription as it was, or `None` when it is gone or was not
+    /// pending (so each paged first report is made at most once).
+    pub fn event_subscription_finish_first_location(
+        &self,
+        subscription_id: &str,
+        told: LocationBaseline,
+    ) -> Option<EventSubscription> {
+        let mut subs = self.event_subscriptions.write().ok()?;
+        let sub = subs.get_mut(subscription_id)?;
+        if !sub.first_location_pending {
+            return None;
+        }
+        sub.first_location_pending = false;
+        sub.reported_location = Some(told);
+        let out = sub.clone();
+        if out.one_time {
+            subs.remove(subscription_id);
+        }
+        Some(out)
+    }
+
+    /// #1760 review: the page `subscription_id`'s first LOCATION_REPORT waited on
+    /// ended with nothing to report (its UE is gone). It is no longer pending, so the
+    /// fire points report to it again, from the UE's next registration on (#1716).
+    /// Its baseline is left unset. `false` when it is gone or was not pending.
+    pub fn event_subscription_abandon_first_location(&self, subscription_id: &str) -> bool {
+        let Ok(mut subs) = self.event_subscriptions.write() else {
+            return false;
+        };
+        match subs.get_mut(subscription_id) {
+            Some(sub) if sub.first_location_pending => {
+                sub.first_location_pending = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// #1760: a fire point's claim on ONE_TIME subscription `subscription_id`: it is
+    /// removed, so the claimant's notification is its one report. `false` when it is
+    /// gone already (another report claimed it).
+    pub fn event_subscription_claim_one_time(&self, subscription_id: &str) -> bool {
+        self.event_subscriptions
+            .write()
+            .ok()
+            .and_then(|mut subs| subs.remove(subscription_id))
+            .is_some()
+    }
+
     /// Find an event-exposure subscription by ID (clone-out, lock dropped)
     pub fn event_subscription_find(&self, subscription_id: &str) -> Option<EventSubscription> {
         self.event_subscriptions
@@ -2915,6 +3109,8 @@ impl AmfContext {
                 sub.reported_connectivity = std::mem::take(&mut e.get_mut().reported_connectivity);
                 // #1737: and so is the location its first report told.
                 sub.reported_location = e.get_mut().reported_location.take();
+                // #1760: and whether its first report still waits on a page.
+                sub.first_location_pending = e.get().first_location_pending;
                 e.insert(sub);
                 return true;
             }
@@ -5564,12 +5760,55 @@ pub struct PagingContext {
     /// a UE that has not moved since it went idle is still under the gNB it was
     /// last seen on.
     pub nwdaf_last_cell: Option<(PlmnId, u64)>,
+    /// #1760: the LOCATION_REPORT subscriptions whose first report waits on this
+    /// page (`EventSubscription::first_location_pending`). The page's outcome
+    /// reports to them: the current location when the UE answers, the last known
+    /// one when it does not.
+    pub location_report_subs: Vec<String>,
+    /// #1760 review: the page was started only for `location_report_subs`, and
+    /// carries no transfer of its own (no N1, no N2, no session, no failure-notify
+    /// URI; a positioning transfer may still join it, `joined_transfers`). An
+    /// N1N2MessageTransfer, a UE-policy delivery or a queued downlink for the UE is
+    /// not refused because of it (TS 23.502 §4.2.3.3: a downlink-data request is
+    /// paged for), and takes it over ([`AmfContext::paging_add`]), keeping the
+    /// subscriptions that wait on it.
+    pub location_only: bool,
     /// #1643 review: the page carries only the SMF's N1 for `pdu_session_id`, an
     /// answer to the UE's own release or modification request. TS 23.502 §4.3.4.2
     /// step 4: the NAS message only. The UE's answer re-activates no user plane
     /// for it (the #540 rule does not apply), and if the UE's PDU session status
     /// shows the session gone, the N1 is not sent.
     pub pending_n1_only: bool,
+    /// #1837: the other transfers that joined this page instead of starting their
+    /// own (a positioning transfer, [`AmfContext::paging_join_or_add_transfer`]),
+    /// each with its own n1n2FailureTxfNotifURI. A page that ends unanswered
+    /// notifies every one of them as well as `failure_notify_uri` (TS 29.518
+    /// §5.2.2.3.1, TS 23.502 §4.2.3.3 step 4c). At most [`MAX_JOINED_TRANSFERS`].
+    pub joined_transfers: Vec<JoinedTransfer>,
+}
+
+/// #1837: the most transfers that may join one page ([`PagingContext::joined_transfers`]).
+pub const MAX_JOINED_TRANSFERS: usize = 16;
+
+/// #1837: a transfer that rides another's page and is owed a failure notification
+/// if the page fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinedTransfer {
+    /// The requester's n1n2FailureTxfNotifURI.
+    pub failure_notify_uri: String,
+    /// The transfer resource its notification names (n1n2MsgDataUri).
+    pub n1n2_msg_data_uri: String,
+}
+
+/// #1837: what [`AmfContext::paging_join_or_add_transfer`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PagingJoin {
+    /// No page was queued for the UE; this one was.
+    Started,
+    /// A page was already queued; the transfer rides it.
+    Joined,
+    /// The queued page already holds [`MAX_JOINED_TRANSFERS`]; nothing changed.
+    Full,
 }
 
 /// What one paging pump pass decided (TS 24.501 §5.6.2.2.1 / §5.6.2.2.2).
@@ -5612,11 +5851,47 @@ impl Default for PagingContext {
             nwdaf_wait_until: None,
             nwdaf_predicted: None,
             nwdaf_last_cell: None,
+            location_report_subs: Vec::new(),
+            location_only: false,
+            joined_transfers: Vec::new(),
         }
     }
 }
 
 impl PagingContext {
+    /// #1837: record `joined` as a requester owed a failure notification. A
+    /// requester already notified by this page (the same URI and resource, as the
+    /// page's own or an earlier join: a retried request) is not added twice, and
+    /// counts as joined. `false` when the page already holds
+    /// [`MAX_JOINED_TRANSFERS`] and `joined` is new.
+    pub fn join_transfer(&mut self, joined: JoinedTransfer) -> bool {
+        let own = self.failure_notify_uri.as_deref() == Some(joined.failure_notify_uri.as_str())
+            && self.n1n2_msg_data_uri == joined.n1n2_msg_data_uri;
+        if own || self.joined_transfers.contains(&joined) {
+            return true;
+        }
+        if self.joined_transfers.len() >= MAX_JOINED_TRANSFERS {
+            return false;
+        }
+        self.joined_transfers.push(joined);
+        true
+    }
+
+    /// #1837: every (n1n2FailureTxfNotifURI, n1n2MsgDataUri) this page owes a
+    /// failure notification if it ends unanswered: its own transfer's, then each
+    /// joined one's.
+    pub fn failure_notify_targets(&self) -> Vec<(String, String)> {
+        self.failure_notify_uri
+            .iter()
+            .map(|u| (u.clone(), self.n1n2_msg_data_uri.clone()))
+            .chain(
+                self.joined_transfers
+                    .iter()
+                    .map(|j| (j.failure_notify_uri.clone(), j.n1n2_msg_data_uri.clone())),
+            )
+            .collect()
+    }
+
     /// The TAIs to page in: the registration area, or the single stored TAI.
     pub fn paging_tais(&self) -> Vec<(PlmnId, u32)> {
         if self.tai_list.is_empty() {
@@ -5927,8 +6202,25 @@ static GLOBAL_PAGING_MAP_ADDR: std::sync::OnceLock<usize> = std::sync::OnceLock:
 static GLOBAL_AMF_MCAST_CONTEXT: std::sync::OnceLock<Arc<crate::ngap_mcast::NgapMcastContext>> =
     std::sync::OnceLock::new();
 
+/// The ONE lock for tests that create, read, count or delete the process-global
+/// broadcast MBS contexts in [`amf_mcast`] (Namf_MBSBroadcast ContextCreate /
+/// ContextDelete, the MBS N2 transfer, and the NGAP MBS outcomes), declared beside
+/// the global it guards (#1822 item 2). mbsmfd's tests take it too, through
+/// `test_support::MBS_CONTEXT_LOCK`, because they drive this crate's real handler
+/// (#1758): one counts the contexts while another deletes one.
+///
+/// A tokio mutex, held across `.await`; sync tests take it with `blocking_lock()`.
+/// In this crate's own tests [`amf_mcast`] panics when the lock is free, so a test
+/// that reaches MBS state without it fails whenever it runs alone.
+pub static MBS_CONTEXT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Get the global MBS NGAP context.
+#[track_caller]
 pub fn amf_mcast() -> Arc<crate::ngap_mcast::NgapMcastContext> {
+    #[cfg(test)]
+    if MBS_CONTEXT_LOCK.try_lock().is_ok() {
+        panic!("the MBS contexts were reached with MBS_CONTEXT_LOCK free: take it in this test (#1822)");
+    }
     GLOBAL_AMF_MCAST_CONTEXT
         .get_or_init(|| Arc::new(crate::ngap_mcast::NgapMcastContext::new()))
         .clone()
@@ -6737,6 +7029,296 @@ mod tests {
             Some(8)
         );
         assert_eq!(ctx.paging_count(), 0);
+    }
+
+    /// **#1760 review MAJOR-2 (b)**: a page and a LOCATION_REPORT subscription's page
+    /// never overwrite each other.
+    /// - A location subscription joins the transfer page queued for the UE in one
+    ///   operation: that page keeps its N2 and failure-notify URI.
+    /// - A transfer page queued over a location-only one takes it over and carries
+    ///   its waiting subscriptions and its `answered_by`.
+    /// - With no page queued, the location page is queued, `location_only`.
+    ///
+    /// REVERT-VERIFIED: with `paging_join_or_add_location` inserting unconditionally
+    /// (overwriting the transfer page), it fails on "joined"; with the
+    /// carry-over cut from `paging_add`, the subscription is dropped ("carried over").
+    #[test]
+    fn a_location_page_and_a_transfer_page_never_overwrite_each_other_1760() {
+        let mut ctx = AmfContext::new();
+        ctx.init(64, 1024, 4096);
+        let location_page = |id: u64| PagingContext {
+            amf_ue_ngap_id: id,
+            tmsi: id as u32,
+            ..Default::default()
+        };
+
+        // A transfer page first, then a location subscription for the same UE.
+        ctx.paging_add(PagingContext {
+            amf_ue_ngap_id: 1,
+            pending_n2: Some(vec![0xAB]),
+            pdu_session_id: Some(5),
+            failure_notify_uri: Some("http://smf/fail".to_string()),
+            ..Default::default()
+        });
+        assert!(
+            ctx.paging_join_or_add_location(location_page(1), "s1"),
+            "joined"
+        );
+        let p = ctx.paging_find(1).expect("paged");
+        assert_eq!(
+            p.pending_n2,
+            Some(vec![0xAB]),
+            "the transfer page keeps its N2"
+        );
+        assert_eq!(p.failure_notify_uri.as_deref(), Some("http://smf/fail"));
+        assert!(!p.location_only);
+        assert_eq!(p.location_report_subs, vec!["s1".to_string()]);
+        assert!(ctx.paging_holds_transfer(1));
+
+        // A location page first, then a transfer page.
+        assert!(
+            !ctx.paging_join_or_add_location(location_page(2), "s2"),
+            "queued"
+        );
+        let p = ctx.paging_find(2).expect("paged");
+        assert!(p.location_only);
+        assert!(
+            !ctx.paging_holds_transfer(2),
+            "a location-only page holds no transfer"
+        );
+        ctx.paging_mark_answered_by_s_tmsi(p.amf_set_id, p.amf_pointer, p.tmsi, 77);
+        assert_eq!(ctx.paging_find(2).and_then(|p| p.answered_by), Some(77));
+        ctx.paging_add(PagingContext {
+            amf_ue_ngap_id: 2,
+            pending_n2: Some(vec![0xCD]),
+            pdu_session_id: Some(6),
+            ..Default::default()
+        });
+        let p = ctx.paging_find(2).expect("paged");
+        assert_eq!(p.pending_n2, Some(vec![0xCD]));
+        assert!(!p.location_only);
+        assert_eq!(
+            p.location_report_subs,
+            vec!["s2".to_string()],
+            "carried over"
+        );
+        assert_eq!(p.answered_by, Some(77), "an answered page stays answered");
+        assert!(!ctx.paging_holds_transfer(3));
+    }
+
+    /// **#1837**, TS 23.502 §4.2.3.3 step 3b / TS 29.518 §5.2.2.3.1: two
+    /// N1N2MessageTransfers that race to page one CM-IDLE UE never overwrite each
+    /// other. Exactly one page is queued, it is the winner's (its N2 and its
+    /// failure-notify URI), and the loser is told so (`false`), to answer 409
+    /// HIGHER_PRIORITY_REQUEST_ONGOING. Before #1837 the "is a page holding a
+    /// transfer queued?" check ran outside the paging-map lock, then `paging_add`
+    /// replaced whatever was queued: both transfers passed the check, both queued,
+    /// and the second's N2 and URI replaced the first's.
+    ///
+    /// - Interleaved by hand at the check/insert point: both transfers have passed
+    ///   the old check before either inserts.
+    /// - Raced for real: eight threads released together by a barrier.
+    ///
+    /// REVERT-VERIFIED: with `paging_add` replacing a transfer page again (its
+    /// refusal cut), it fails on "the second transfer is refused".
+    #[test]
+    fn two_transfers_racing_for_one_idle_ue_never_overwrite_each_other_1837() {
+        let mut ctx = AmfContext::new();
+        ctx.init(64, 1024, 4096);
+        let transfer = |id: u64, psi: u8| PagingContext {
+            amf_ue_ngap_id: id,
+            pending_n2: Some(vec![0xA0, psi]),
+            pdu_session_id: Some(psi),
+            failure_notify_uri: Some(format!("http://smf-{psi}/fail")),
+            n1n2_msg_data_uri: format!("/n1-n2-messages/{psi}"),
+            ..Default::default()
+        };
+
+        // Both passed the (old, separate) check: nothing holds a transfer yet.
+        assert!(!ctx.paging_holds_transfer(1));
+        assert!(!ctx.paging_holds_transfer(1));
+        assert!(
+            ctx.paging_add(transfer(1, 5)),
+            "the first transfer is queued"
+        );
+        assert!(
+            !ctx.paging_add(transfer(1, 6)),
+            "the second transfer is refused"
+        );
+        let p = ctx.paging_find(1).expect("paged");
+        assert_eq!(p.pdu_session_id, Some(5));
+        assert_eq!(p.pending_n2, Some(vec![0xA0, 5]), "the first N2 is kept");
+        assert_eq!(p.failure_notify_uri.as_deref(), Some("http://smf-5/fail"));
+        assert_eq!(
+            p.failure_notify_targets(),
+            vec![(
+                "http://smf-5/fail".to_string(),
+                "/n1-n2-messages/5".to_string()
+            )],
+            "only the queued transfer is owed a notification"
+        );
+
+        // A real race.
+        let barrier = std::sync::Barrier::new(8);
+        let won: Vec<(u8, bool)> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8u8)
+                .map(|psi| {
+                    let (ctx, barrier) = (&ctx, &barrier);
+                    s.spawn(move || {
+                        barrier.wait();
+                        (psi, ctx.paging_add(transfer(2, psi)))
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("join"))
+                .collect()
+        });
+        let winners: Vec<u8> = won.iter().filter(|(_, w)| *w).map(|(p, _)| *p).collect();
+        assert_eq!(winners.len(), 1, "exactly one racer is queued: {won:?}");
+        let p = ctx.paging_find(2).expect("paged");
+        assert_eq!(
+            p.pdu_session_id,
+            Some(winners[0]),
+            "the page is the winner's"
+        );
+        assert_eq!(p.pending_n2, Some(vec![0xA0, winners[0]]));
+        assert_eq!(
+            p.failure_notify_uri,
+            Some(format!("http://smf-{}/fail", winners[0]))
+        );
+    }
+
+    /// **#1837**, TS 29.518 §5.2.2.3.1: a positioning transfer that joins a page
+    /// keeps its own failure-notify URI on it, so a failed page notifies it too.
+    ///
+    /// - It joins a location-only page (which carries no URI of its own): the page
+    ///   stays location-only, and owes the LMF a notification.
+    /// - A retry of the same transfer joins once: one notification, not two.
+    /// - An SM transfer that takes the location-only page over keeps the joined LMF:
+    ///   the page owes its own SMF and the LMF, each at its own URI and resource.
+    /// - A joined transfer whose URI is the page's own is not added twice.
+    /// - A page with [`MAX_JOINED_TRANSFERS`] joined takes no new one (`Full`), and
+    ///   is unchanged; a known one still joins (a retry).
+    /// - A transfer with no URI joins and is owed nothing.
+    ///
+    /// REVERT-VERIFIED: with the join not recording the URI, "the LMF is owed a
+    /// notification" fails; with `join_transfer` not deduplicating, "a retry joins
+    /// once"; with `paging_add` not carrying `joined_transfers` over, "the takeover
+    /// keeps the LMF"; with the cap check cut, "full".
+    #[test]
+    fn a_transfer_joining_a_page_is_owed_its_own_failure_notification_1837() {
+        let mut ctx = AmfContext::new();
+        ctx.init(64, 1024, 4096);
+        let positioning = |uri: &str| PagingContext {
+            amf_ue_ngap_id: 1,
+            failure_notify_uri: Some(uri.to_string()),
+            n1n2_msg_data_uri: "/ue-contexts/imsi-1/n1-n2-messages".to_string(),
+            ..Default::default()
+        };
+        let lmf = (
+            "http://lmf/fail".to_string(),
+            "/ue-contexts/imsi-1/n1-n2-messages".to_string(),
+        );
+        assert!(!ctx.paging_join_or_add_location(
+            PagingContext {
+                amf_ue_ngap_id: 1,
+                ..Default::default()
+            },
+            "s1"
+        ));
+        assert_eq!(
+            ctx.paging_join_or_add_transfer(positioning("http://lmf/fail")),
+            PagingJoin::Joined
+        );
+        let p = ctx.paging_find(1).expect("paged");
+        assert!(p.location_only, "still location-only: no SM transfer");
+        assert_eq!(
+            p.failure_notify_targets(),
+            vec![lmf.clone()],
+            "the LMF is owed a notification"
+        );
+        assert_eq!(
+            ctx.paging_join_or_add_transfer(positioning("http://lmf/fail")),
+            PagingJoin::Joined
+        );
+        assert_eq!(
+            ctx.paging_find(1).expect("paged").joined_transfers.len(),
+            1,
+            "a retry joins once"
+        );
+
+        assert!(ctx.paging_add(PagingContext {
+            amf_ue_ngap_id: 1,
+            pending_n2: Some(vec![0xAB]),
+            pdu_session_id: Some(5),
+            failure_notify_uri: Some("http://smf/fail".to_string()),
+            n1n2_msg_data_uri: "/ue-contexts/imsi-1/n1-n2-messages/5".to_string(),
+            ..Default::default()
+        }));
+        let p = ctx.paging_find(1).expect("paged");
+        assert!(!p.location_only);
+        assert_eq!(p.location_report_subs, vec!["s1".to_string()]);
+        assert_eq!(
+            p.failure_notify_targets(),
+            vec![
+                (
+                    "http://smf/fail".to_string(),
+                    "/ue-contexts/imsi-1/n1-n2-messages/5".to_string()
+                ),
+                lmf.clone()
+            ],
+            "the takeover keeps the LMF"
+        );
+
+        // A page a positioning transfer started: a second one with its URI is its own.
+        assert_eq!(
+            ctx.paging_join_or_add_transfer(PagingContext {
+                amf_ue_ngap_id: 2,
+                ..positioning("http://lmf/fail")
+            }),
+            PagingJoin::Started
+        );
+        assert_eq!(
+            ctx.paging_join_or_add_transfer(PagingContext {
+                amf_ue_ngap_id: 2,
+                ..positioning("http://lmf/fail")
+            }),
+            PagingJoin::Joined
+        );
+        assert_eq!(
+            ctx.paging_find(2).expect("paged").failure_notify_targets(),
+            vec![lmf]
+        );
+
+        for i in 1..MAX_JOINED_TRANSFERS {
+            assert_eq!(
+                ctx.paging_join_or_add_transfer(positioning(&format!("http://lmf-{i}/fail"))),
+                PagingJoin::Joined
+            );
+        }
+        let before = ctx.paging_find(1).expect("paged").joined_transfers;
+        assert_eq!(before.len(), MAX_JOINED_TRANSFERS);
+        assert_eq!(
+            ctx.paging_join_or_add_transfer(positioning("http://lmf-new/fail")),
+            PagingJoin::Full,
+            "full"
+        );
+        assert_eq!(ctx.paging_find(1).expect("paged").joined_transfers, before);
+        assert_eq!(
+            ctx.paging_join_or_add_transfer(positioning("http://lmf-1/fail")),
+            PagingJoin::Joined,
+            "a known requester still joins"
+        );
+        assert_eq!(
+            ctx.paging_join_or_add_transfer(PagingContext {
+                failure_notify_uri: None,
+                ..positioning("unused")
+            }),
+            PagingJoin::Joined
+        );
+        assert_eq!(ctx.paging_find(1).expect("paged").joined_transfers, before);
     }
 
     #[test]

@@ -523,6 +523,14 @@ pub fn clear_app_sessions_for_test() {
     if let Ok(mut m) = app_sessions().lock() {
         m.clear();
     }
+    crate::reconcile::clear_for_test();
+}
+
+#[cfg(test)]
+pub fn record_app_session_for_test(resource_id: &str, app_session_id: &str) {
+    if let Ok(mut m) = app_sessions().lock() {
+        m.insert(resource_id.to_string(), app_session_id.to_string());
+    }
 }
 
 /// The UE address a time-synchronization configuration supplies, if any, as the
@@ -779,7 +787,7 @@ async fn create_once(resource_id: &str, body: &serde_json::Value) -> Option<Stri
 
 /// How one `Npcf_PolicyAuthorization_Delete` attempt ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeleteOutcome {
+pub(crate) enum DeleteOutcome {
     /// The PCF accepted it, or answered 404 (the app session is already gone).
     Deleted,
     /// No `appSessionId` is recorded for the resource: nothing to delete.
@@ -789,9 +797,10 @@ enum DeleteOutcome {
 }
 
 /// #1754: the waits before each retry of a failed Delete. The mapping is kept across
-/// them; after the last it stays recorded (and is logged at error), never forgotten.
+/// them; after the last it stays recorded and (#1817) is handed to
+/// [`crate::reconcile`], which keeps retrying it on a slow cadence.
 #[cfg(not(test))]
-const DELETE_RETRY_DELAYS: [std::time::Duration; 5] = [
+pub(crate) const DELETE_RETRY_DELAYS: [std::time::Duration; 5] = [
     std::time::Duration::from_secs(1),
     std::time::Duration::from_secs(2),
     std::time::Duration::from_secs(4),
@@ -799,7 +808,8 @@ const DELETE_RETRY_DELAYS: [std::time::Duration; 5] = [
     std::time::Duration::from_secs(16),
 ];
 #[cfg(test)]
-const DELETE_RETRY_DELAYS: [std::time::Duration; 5] = [std::time::Duration::from_millis(20); 5];
+pub(crate) const DELETE_RETRY_DELAYS: [std::time::Duration; 5] =
+    [std::time::Duration::from_millis(20); 5];
 
 /// `Npcf_PolicyAuthorization_Delete`: POST `.../app-sessions/{id}/delete`
 /// (TS 29.514 §4.2.5 -- a custom operation, not an HTTP DELETE).
@@ -837,11 +847,27 @@ async fn delete_with_retry(resource_id: String) -> bool {
         }
         log::error!(
             "Npcf_PolicyAuthorization_Delete for {resource_id} failed {} retries; its \
-             appSessionId stays recorded",
+             appSessionId stays recorded and the reconciler retries it",
             DELETE_RETRY_DELAYS.len()
         );
+        // #1817: not left for ever. The reconciler retries it until the PCF answers.
+        crate::reconcile::park(resource_id);
     });
     false
+}
+
+/// #1817: one Delete attempt for the reconciler.
+pub(crate) async fn delete_once_for_reconciler(resource_id: &str) -> DeleteOutcome {
+    delete_once(resource_id).await
+}
+
+/// #1817: forget `resource_id`'s `appSessionId` (the reconciler abandoning it at
+/// its bound). Returns what was forgotten.
+pub(crate) fn forget_app_session(resource_id: &str) -> Option<String> {
+    app_sessions()
+        .lock()
+        .ok()
+        .and_then(|mut m| m.remove(resource_id))
 }
 
 /// One Delete attempt. The `appSessionId` is taken from the map so two attempts

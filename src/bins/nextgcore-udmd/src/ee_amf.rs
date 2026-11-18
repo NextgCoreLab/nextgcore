@@ -86,7 +86,7 @@ pub fn set_notify_base(base: Option<String>) {
     }
 }
 
-fn notify_base() -> Option<String> {
+pub(crate) fn notify_base() -> Option<String> {
     NOTIFY_BASE.read().ok().and_then(|b| b.clone())
 }
 
@@ -543,7 +543,7 @@ pub async fn release(sub: &UdmEeSubscription) {
 }
 
 /// Compare two tokens without an early exit on the first differing byte.
-fn tokens_equal(a: &str, b: &str) -> bool {
+pub(crate) fn tokens_equal(a: &str, b: &str) -> bool {
     a.len() == b.len()
         && a.bytes()
             .zip(b.bytes())
@@ -742,7 +742,8 @@ mod tests {
         svc.ip_addresses.push("127.0.0.1".to_string());
         svc.port = port;
         instance.add_service(svc);
-        global_context().add_nf_instance(instance).await;
+        // #1822 item 6: removed again when the test's guard drops.
+        crate::test_support::cache_nf_instance_for_test(instance).await;
     }
 
     /// amfd's REAL Namf handler on loopback, registered in the NF-instance cache as
@@ -862,9 +863,16 @@ mod tests {
         }
     }
 
+    /// What [`setup`] returns: the context lock, and (dropped first, so under the
+    /// lock) the removal of every AMF the test cached (#1822 item 6).
+    struct EeAmfTestGuard {
+        _cached: crate::test_support::CachedNfCleanup,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
     /// The common preamble: the guard, a plaintext dev profile, a fresh context,
     /// an AMF context, and no OAuth2 override.
-    fn setup(supi: &str) -> std::sync::MutexGuard<'static, ()> {
+    fn setup(supi: &str) -> EeAmfTestGuard {
         let guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -878,7 +886,31 @@ mod tests {
             .expect("override") = None;
         AMF_CALL_TIMEOUT_MS.store(5_000, Ordering::Relaxed);
         clear(supi);
-        guard
+        EeAmfTestGuard {
+            _cached: crate::test_support::CachedNfCleanup,
+            _lock: guard,
+        }
+    }
+
+    /// **#1822 item 6.** A test that caches an AMF through `real_amf` leaves none
+    /// behind: dropping [`setup`]'s guard removes it, under the context lock. Before,
+    /// the AMF outlived its server and #1771's Namf_MT test had to clear it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM/AMF state
+    async fn an_amf_a_test_caches_is_removed_when_it_ends_1822() {
+        let id = "amf-1822-cleanup";
+        {
+            let _guard = setup("imsi-001010000001822");
+            let (_amf, _base) = real_amf(id).await;
+            assert!(
+                global_context().get_nf_instance(id).await.is_some(),
+                "control: cached while the test runs"
+            );
+        }
+        assert!(
+            global_context().get_nf_instance(id).await.is_none(),
+            "removed when the test's guard drops"
+        );
     }
 
     /// **#1440, TS 23.502 §4.15.3.2.3 steps 3a-6, end to end against amfd's real
@@ -1636,7 +1668,11 @@ mod tests {
             .collect();
         assert_eq!(
             routes,
-            ["POST /nudm-callback/v1/{var}/ee-amf-subs-change/{token}"]
+            [
+                "POST /nudm-callback/v1/{var}/ee-amf-subs-change/{token}",
+                // #1775: the UDR's am-data DataChangeNotify.
+                "POST /nudm-callback/v1/{var}/udr-data-change/{token}",
+            ]
         );
     }
 

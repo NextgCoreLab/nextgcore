@@ -2410,6 +2410,82 @@ mod data_management_tests {
         clear_subscriptions();
     }
 
+    /// **#1822 item 5 (#1808).** A consumer subscribe cancelled mid-POST is rolled
+    /// back, but when ANOTHER consumer reused its in-flight claim first, the claim
+    /// is still held when the producer's late 201 arrives: the 201 is recorded for
+    /// the remaining consumer, not deleted, and that consumer's unsubscribe is what
+    /// finally deletes it at the producer.
+    #[test]
+    fn a_late_201_is_kept_for_the_consumer_that_reused_the_claim_1822() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        init();
+        clear_subscriptions();
+        futures_lite_block_on(async {
+            let (producer, producer_port, seen, arrived, release) = holding_producer().await;
+            let (nrf, nrf_port) = nrf_for(producer_port).await;
+            coordinate_via(nrf_port);
+            let scope = targeted_scope();
+            let deletes = || {
+                seen.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .filter(|(m, p)| m == "DELETE" && p.ends_with("/subscriptions/held"))
+                    .count()
+            };
+
+            // Consumer A claims the scope; the producer holds its create.
+            let a = tokio::spawn(dccf_request_handler(
+                SbiRequest::post("/ndccf-datamanagement/v1/subscriptions")
+                    .with_body(targeted_body("corr-a"), "application/json"),
+            ));
+            tokio::time::timeout(Duration::from_secs(5), arrived.notified())
+                .await
+                .expect("the producer receives A's create");
+            let a_id = context::dccf_context_subscription_ids()[0].clone();
+
+            // Consumer B reuses the in-flight claim.
+            let resp = dccf_request_handler(
+                SbiRequest::post("/ndccf-datamanagement/v1/subscriptions")
+                    .with_body(targeted_body("corr-b"), "application/json"),
+            )
+            .await;
+            assert_eq!(resp.status, 201, "B subscribes, reusing A's claim");
+            let b_id = context::dccf_context_subscription_ids()
+                .into_iter()
+                .find(|id| *id != a_id)
+                .expect("B's id");
+
+            // A's client goes away: A is rolled back, B keeps the claim.
+            a.abort();
+            assert!(a.await.unwrap_err().is_cancelled());
+            assert!(
+                eventually(|| !dccf_context_has_subscription(&a_id)).await,
+                "the cancelled subscribe is rolled back"
+            );
+            assert!(dccf_context_has_subscription(&b_id));
+
+            release.notify_one();
+            assert!(
+                eventually(|| context::dccf_context_producer_resource(&scope).is_some()).await,
+                "the late 201 is recorded for B"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(deletes(), 0, "and not deleted: {:?}", seen.lock().unwrap());
+
+            assert!(remove_consumer_subscription(&b_id).await);
+            assert!(
+                eventually(|| deletes() == 1).await,
+                "B's unsubscribe deletes it at the producer: {:?}",
+                seen.lock().unwrap()
+            );
+            assert!(!context::dccf_context_holds_producer_sub(&scope));
+            coordination::set_coordination_for_test(None);
+            producer.stop().await.ok();
+            nrf.stop().await.ok();
+        });
+        clear_subscriptions();
+    }
+
     /// #1808: a subscribe that answers is not rolled back (the guard is disarmed
     /// before the 201), with coordination on and a producer that answers at once.
     #[test]

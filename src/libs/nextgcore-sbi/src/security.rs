@@ -2261,63 +2261,262 @@ mod audience_binding_guards {
         }
     }
 
-    /// #1667: every NF that installs an outbound OAuth2 client also gives it to
-    /// its own NRF calls (`nrf_tls::set_nrf_oauth2_client`), exactly once, so a
-    /// deployment whose NRF gates nnrf-nfm / nnrf-disc does not lock it out of
-    /// registration. eesd and scpd are left out: their clients are installed
-    /// whenever an NRF URI is set, not under the profile or the knob, so their
-    /// NRF calls would fail closed in a deployment that never asked for OAuth2.
-    ///
-    /// REVERT-VERIFIED: deleting the install from any one daemon fails this.
-    #[test]
-    fn every_nf_with_an_outbound_oauth2_client_gives_it_to_its_nrf_calls_1667() {
-        let bins = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    /// Every `.rs` file under `dir`, recursively, as `(path relative to root, text)`.
+    fn rust_sources(root: &std::path::Path, dir: &std::path::Path) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return out;
+        };
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n == "target") {
+                    continue;
+                }
+                out.extend(rust_sources(root, &path));
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+                let rel = path
+                    .strip_prefix(root)
+                    .expect("under root")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.push((rel, text));
+            }
+        }
+        out
+    }
+
+    /// Files that install an outbound `OAUTH2_CLIENT` and deliberately do NOT
+    /// give it to their NRF calls, each with its reason. eesd: its client is
+    /// installed whenever an NRF URI is set, not under the profile or the knob,
+    /// so its NRF calls would fail closed in a deployment that never asked for
+    /// OAuth2. nrfd: it is the NRF; its own client is the self client
+    /// (`nrf_tls::set_nrf_client_tls_override`), not an NRF consumer's.
+    const NRF_OAUTH2_INSTALL_EXEMPT: [&str; 2] = [
+        "bins/nextgcore-eesd/src/nrf_af.rs",
+        "bins/nextgcore-nrfd/src/sbi_path.rs",
+    ];
+
+    /// Whether the `#[cfg(...)]` attribute starting at `at` is test-only: its
+    /// predicate names `test` (`test`, `all(test, ..)`, `any(test, ..)`) and does
+    /// not negate it. A token scan, not a cfg evaluator: `any(test, feature =
+    /// "x")` counts as test-only, which is the stricter reading for this guard.
+    fn is_test_cfg(text: &str, at: usize) -> Option<usize> {
+        let rest = &text[at..];
+        let end = rest.find(")]")? + 2;
+        let attr = &rest[..end];
+        let names_test = attr
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .any(|w| w == "test");
+        (names_test && !attr.contains("not(test")).then_some(end)
+    }
+
+    /// Byte ranges of the items a test-only `#[cfg(..)]` annotates in `text`
+    /// ([`is_test_cfg`]): from the attribute to the brace closing the item's
+    /// first `{`. An item that ends in `;` first (`#[cfg(test)] mod tests;`) has
+    /// no span here; [`out_of_line_test_modules`] covers its file. Braces are
+    /// counted naively (no string or comment awareness); good enough for source
+    /// guards over this workspace.
+    fn cfg_test_spans(text: &str) -> Vec<std::ops::Range<usize>> {
+        let mut spans = Vec::new();
+        for (at, _) in text.match_indices("#[cfg(") {
+            if is_test_cfg(text, at).is_none() {
+                continue;
+            }
+            let rest = &text[at..];
+            let (Some(open), semi) = (rest.find('{'), rest.find(';')) else {
+                continue;
+            };
+            if semi.is_some_and(|semi| semi < open) {
+                continue;
+            }
+            let mut depth = 0usize;
+            for (i, c) in rest[open..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            spans.push(at..at + open + i + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        spans
+    }
+
+    /// The files of out-of-line test modules: for `#[cfg(test)] mod NAME;` in
+    /// `rel`, `NAME.rs` and `NAME/mod.rs` beside it (or under its stem directory
+    /// when `rel` is not a `main.rs` / `lib.rs` / `mod.rs`).
+    fn out_of_line_test_modules(sources: &[(String, String)]) -> Vec<String> {
+        let mut out = Vec::new();
+        for (rel, text) in sources {
+            let (dir, file) = rel.rsplit_once('/').unwrap_or(("", rel.as_str()));
+            let base = match file {
+                "main.rs" | "lib.rs" | "mod.rs" => dir.to_string(),
+                other => format!("{dir}/{}", other.trim_end_matches(".rs")),
+            };
+            for (at, _) in text.match_indices("#[cfg(") {
+                let Some(end) = is_test_cfg(text, at) else {
+                    continue;
+                };
+                let item = text[at + end..].trim_start();
+                let item = item.strip_prefix("pub ").unwrap_or(item);
+                let Some(decl) = item.strip_prefix("mod ") else {
+                    continue;
+                };
+                let name: String = decl
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if decl[name.len()..].trim_start().starts_with(';') {
+                    out.push(format!("{base}/{name}.rs"));
+                    out.push(format!("{base}/{name}/mod.rs"));
+                }
+            }
+        }
+        out
+    }
+
+    const NRF_OAUTH2_INSTALL: &str = "nextgcore_sbi::nrf_tls::set_nrf_oauth2_client(OAUTH2_CLIENT";
+
+    /// Daemons with no `OAUTH2_CLIENT` static that install the client a helper
+    /// builds, each with its one install call (`file`, call prefix). easdfd has
+    /// no outbound SBI client of its own (#1677).
+    const NRF_OAUTH2_HELPER_INSTALLS: [(&str, &str); 1] = [(
+        "bins/nextgcore-easdfd/src/main.rs",
+        "nextgcore_sbi::nrf_tls::set_nrf_oauth2_client(easdf_nrf_oauth2_client(sbi_profile,",
+    )];
+
+    /// The workspace's `src/` directory (this crate is `src/libs/nextgcore-sbi`).
+    fn workspace_src() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .nth(2)
             .expect("crate is at <root>/libs/nextgcore-sbi")
-            .join("bins");
-        for rel in [
-            "nextgcore-amfd/src/lib.rs",
-            "nextgcore-ausfd/src/app.rs",
-            "nextgcore-bsfd/src/lib.rs",
-            "nextgcore-dccfd/src/main.rs",
-            "nextgcore-lmfd/src/main.rs",
-            "nextgcore-mbsmfd/src/main.rs",
-            "nextgcore-nefd/src/main.rs",
-            "nextgcore-nsacfd/src/main.rs",
-            "nextgcore-nssfd/src/main.rs",
-            "nextgcore-nwdafd/src/main.rs",
-            "nextgcore-pcfd/src/app.rs",
-            "nextgcore-smfd/src/main.rs",
-            "nextgcore-tsctsf/src/main.rs",
-            "nextgcore-ucmfd/src/main.rs",
-            "nextgcore-udmd/src/app.rs",
-            "nextgcore-udrd/src/main.rs",
-        ] {
-            let path = bins.join(rel);
-            let text = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            .to_path_buf()
+    }
+
+    /// #1667: every NF that installs an outbound OAuth2 client also gives it to
+    /// its own NRF calls (`nrf_tls::set_nrf_oauth2_client`), exactly once, so a
+    /// deployment whose NRF gates nnrf-nfm / nnrf-disc does not lock it out of
+    /// registration. #1750 (R7 MINOR of #1749): the installing files are derived
+    /// from the workspace (every `OAUTH2_CLIENT.set(` under `bins/`), not a
+    /// hand-kept list, so a new NF is checked the day it installs one; the named
+    /// exemptions must still install one (a stale exemption fails too).
+    ///
+    /// REVERT-VERIFIED: deleting the install from any one daemon fails this, and
+    /// so does an exemption naming a file that no longer installs a client.
+    #[test]
+    fn every_nf_with_an_outbound_oauth2_client_gives_it_to_its_nrf_calls_1667() {
+        let root = workspace_src();
+        let installing: Vec<(String, String)> = rust_sources(&root, &root.join("bins"))
+            .into_iter()
+            .filter(|(_, text)| text.contains("OAUTH2_CLIENT.set("))
+            .collect();
+        for exempt in NRF_OAUTH2_INSTALL_EXEMPT {
+            assert!(
+                installing.iter().any(|(rel, _)| rel == exempt),
+                "{exempt} is exempt but no longer installs an OAUTH2_CLIENT: drop the exemption"
+            );
+        }
+        let checked: Vec<&(String, String)> = installing
+            .iter()
+            .filter(|(rel, _)| !NRF_OAUTH2_INSTALL_EXEMPT.contains(&rel.as_str()))
+            .collect();
+        assert!(
+            checked.len() >= 16,
+            "the walk found only {} installing files: {:?}",
+            checked.len(),
+            checked.iter().map(|(r, _)| r).collect::<Vec<_>>()
+        );
+        for (rel, text) in checked {
             assert_eq!(
-                text.matches("nextgcore_sbi::nrf_tls::set_nrf_oauth2_client(OAUTH2_CLIENT")
-                    .count(),
+                text.matches(NRF_OAUTH2_INSTALL).count(),
                 1,
                 "{rel} must give its outbound OAuth2 client to its NRF calls once (#1667)"
             );
         }
         // easdfd keeps no OAUTH2_CLIENT static (it has no outbound SBI client of
         // its own), so it installs the client its helper builds (#1677).
-        let rel = "nextgcore-easdfd/src/main.rs";
-        let path = bins.join(rel);
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        assert_eq!(
-            text.matches(
-                "nextgcore_sbi::nrf_tls::set_nrf_oauth2_client(easdf_nrf_oauth2_client(sbi_profile,"
-            )
-            .count(),
-            1,
-            "{rel} must give its outbound OAuth2 client to its NRF calls once (#1667, #1677)"
-        );
+        for (rel, install) in NRF_OAUTH2_HELPER_INSTALLS {
+            let path = root.join(rel);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            assert_eq!(
+                text.matches(install).count(),
+                1,
+                "{rel} must give its outbound OAuth2 client to its NRF calls once (#1667, #1677)"
+            );
+        }
+    }
+
+    /// #1750 (R7 MINOR of #1749): `nrf_tls::set_nrf_oauth2_client` writes a
+    /// process-global with no test lock. That is safe only while no test sets
+    /// it: a test that did would make every concurrent `for_nrf_uri` in its
+    /// binary attach (or fail closed on) another client's tokens. So the only
+    /// calls in the workspace are the daemons' one install each, in a file that
+    /// installs an `OAUTH2_CLIENT` (or a named helper install,
+    /// `NRF_OAUTH2_HELPER_INSTALLS`), outside every test-only `#[cfg(..)]` item
+    /// and out-of-line test module, and none under a `tests/` directory
+    /// (the workspace-level `src/tests/` included).
+    ///
+    /// REVERT-VERIFIED: a `set_nrf_oauth2_client(None)` added to a test module
+    /// (and, separately, to an integration test) fails this.
+    #[test]
+    fn no_test_sets_the_process_global_nrf_oauth2_client_1750() {
+        let root = workspace_src();
+        let mut sources = rust_sources(&root, &root.join("bins"));
+        sources.extend(rust_sources(&root, &root.join("libs")));
+        sources.extend(rust_sources(&root, &root.join("tests")));
+        let test_files = out_of_line_test_modules(&sources);
+        let mut calls = 0;
+        for (rel, text) in &sources {
+            if rel == "libs/nextgcore-sbi/src/security.rs" {
+                continue; // this guard's own pattern literals
+            }
+            let tests = cfg_test_spans(text);
+            for (at, _) in text.match_indices("set_nrf_oauth2_client(") {
+                let line_start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+                let line = text[line_start..].lines().next().unwrap_or_default();
+                if line
+                    .trim_start()
+                    .starts_with("pub fn set_nrf_oauth2_client(")
+                    && rel == "libs/nextgcore-sbi/src/nrf_tls.rs"
+                {
+                    continue; // the definition
+                }
+                calls += 1;
+                let in_tests_dir = rel.starts_with("tests/") || rel.contains("/tests/");
+                assert!(
+                    !in_tests_dir
+                        && !test_files.contains(rel)
+                        && !tests.iter().any(|t| t.contains(&at)),
+                    "{rel}: a test sets the process-global NRF OAuth2 client: {line}"
+                );
+                let qualified = at
+                    .checked_sub("nextgcore_sbi::nrf_tls::".len())
+                    .and_then(|from| text.get(from..))
+                    .is_some_and(|t| t.starts_with(NRF_OAUTH2_INSTALL));
+                let helper = NRF_OAUTH2_HELPER_INSTALLS.iter().any(|(file, install)| {
+                    rel == file
+                        && at
+                            .checked_sub("nextgcore_sbi::nrf_tls::".len())
+                            .and_then(|from| text.get(from..))
+                            .is_some_and(|t| t.starts_with(install))
+                });
+                assert!(
+                    helper || (qualified && text.contains("OAUTH2_CLIENT.set(")),
+                    "{rel}: set_nrf_oauth2_client outside a daemon's install: {line}"
+                );
+            }
+        }
+        assert!(calls >= 16, "found only {calls} installs");
     }
 
     /// #1791: every NF that registers an NFProfile advertises, in
