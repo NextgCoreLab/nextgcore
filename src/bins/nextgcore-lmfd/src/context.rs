@@ -2848,6 +2848,13 @@ pub fn lmf_context_init(max_measurements: usize) {
             if let Ok(mut f) = context.trp_info_failed.write() {
                 f.clear();
             }
+            // #1784: and so are the DL-PRS IDs given to them (#911). Left in place,
+            // the IDs a test gave another gNB's TRPs (main.rs's gNB 0x911 and
+            // 0x1013 tests) made the lowest free ID of a later test depend on the
+            // order the tests ran in.
+            if let Ok(mut ids) = context.dl_prs_ids.write() {
+                ids.clear();
+            }
         }
     };
 }
