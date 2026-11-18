@@ -35,6 +35,8 @@ sha2.workspace = true
 # #1501: the dbi in-memory subscriber store, so the subscription-confirmed
 # selection path can be driven to its 200 without MongoDB.
 nextgcore-dbi = { workspace = true, features = ["test-helpers"] }
+# #1660: the OAuth2-required producer stand-in and the token NRF.
+nextgcore-sbi = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true
