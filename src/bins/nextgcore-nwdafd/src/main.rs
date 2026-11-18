@@ -596,6 +596,8 @@ async fn main() -> Result<()> {
     if require_oauth2 {
         sbi_server_config = apply_oauth2_enforcement(sbi_server_config, &args.nrf_uri);
     }
+    // #1791: the NFProfile advertises the scheme this listener serves.
+    let sbi_scheme = sbi_server_config.scheme;
     // #1421: the callbacks this NWDAF subscribed for are admitted on their own
     // token when the listener requires OAuth2 (a notification carries no bearer).
     let sbi_server = sbi_server(sbi_server_config);
@@ -627,7 +629,7 @@ async fn main() -> Result<()> {
                     let (ctx, host, id, allowed) =
                         (sbi_ctx.clone(), host.clone(), id.clone(), allowed.clone());
                     async move {
-                        register_with_nrf(ctx, &host, sbi_port, &id, &allowed)
+                        register_with_nrf(ctx, &host, sbi_port, sbi_scheme, &id, &allowed)
                             .await
                             .map(|()| Some(id))
                     }
@@ -965,6 +967,7 @@ fn build_nf_profile(
     nf_instance_id: &str,
     sbi_addr: &str,
     sbi_port: u16,
+    scheme: nextgcore_sbi::types::UriScheme,
     allowed_nf_types: &[String],
 ) -> serde_json::Value {
     // nextgsim#468: an AnLF-only NWDAF contains no MTLF. The role is decided
@@ -979,6 +982,7 @@ fn build_nf_profile(
         nf_instance_id,
         sbi_addr,
         sbi_port,
+        scheme,
         allowed_nf_types,
         ml_provision,
     )
@@ -990,6 +994,7 @@ fn build_nf_profile_for(
     nf_instance_id: &str,
     sbi_addr: &str,
     sbi_port: u16,
+    scheme: nextgcore_sbi::types::UriScheme,
     allowed_nf_types: &[String],
     ml_provision: MlProvision,
 ) -> serde_json::Value {
@@ -1016,7 +1021,7 @@ fn build_nf_profile_for(
         info.insert("mlAnalyticsList".to_string(), list);
     }
     #[allow(unused_mut)]
-    let mut services = nwdaf_services(nf_instance_id, sbi_addr, sbi_port, ml_provision);
+    let mut services = nwdaf_services(nf_instance_id, sbi_addr, sbi_port, scheme, ml_provision);
     // nextgsim#468: Nnwdaf_MLModelMonitor, only while the demo is on.
     #[cfg(feature = "demo-d441e-model-retrain")]
     if model_monitor::monitor().is_some() {
@@ -1024,6 +1029,7 @@ fn build_nf_profile_for(
             nf_instance_id,
             sbi_addr,
             sbi_port,
+            scheme,
         ));
     }
     // nextgsim#465: the ingest service, so the NRF can grant its token.
@@ -1033,6 +1039,7 @@ fn build_nf_profile_for(
             nf_instance_id,
             sbi_addr,
             sbi_port,
+            scheme,
         ));
     }
 
@@ -1333,6 +1340,7 @@ fn nwdaf_services(
     nf_instance_id: &str,
     sbi_addr: &str,
     sbi_port: u16,
+    scheme: nextgcore_sbi::types::UriScheme,
     ml_provision: MlProvision,
 ) -> Vec<serde_json::Value> {
     let mut services = vec![
@@ -1340,7 +1348,7 @@ fn nwdaf_services(
             "serviceInstanceId": format!("{}-nnwdaf-eventssubscription", nf_instance_id),
             "serviceName": "nnwdaf-eventssubscription",
             "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-            "scheme": "http",
+            "scheme": scheme.as_str(),
             "nfServiceStatus": "REGISTERED",
             "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
             // TS 29.520 §4.2.1.3.2 (#1415): the CEF and the UPF too.
@@ -1350,7 +1358,7 @@ fn nwdaf_services(
             "serviceInstanceId": format!("{}-nnwdaf-analyticsinfo", nf_instance_id),
             "serviceName": "nnwdaf-analyticsinfo",
             "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-            "scheme": "http",
+            "scheme": scheme.as_str(),
             "nfServiceStatus": "REGISTERED",
             "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
             // TS 29.520 §4.3.1.3.2 (#1415): the NF-level union is wider.
@@ -1362,7 +1370,7 @@ fn nwdaf_services(
             "serviceInstanceId": format!("{}-nnwdaf-mlmodelprovision", nf_instance_id),
             "serviceName": "nnwdaf-mlmodelprovision",
             "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-            "scheme": "http",
+            "scheme": scheme.as_str(),
             "nfServiceStatus": "REGISTERED",
             "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
             // TS 29.520 §4.5.1.3.2: only the NWDAF and the LMF consume this
@@ -1384,6 +1392,7 @@ async fn register_with_nrf(
     sbi_ctx: Arc<SbiContext>,
     sbi_addr: &str,
     sbi_port: u16,
+    sbi_scheme: nextgcore_sbi::types::UriScheme,
     nf_instance_id: &str,
     allowed_nf_types: &[String],
 ) -> Result<(), String> {
@@ -1401,7 +1410,13 @@ async fn register_with_nrf(
     let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
 
-    let nf_profile = build_nf_profile(nf_instance_id, sbi_addr, sbi_port, allowed_nf_types);
+    let nf_profile = build_nf_profile(
+        nf_instance_id,
+        sbi_addr,
+        sbi_port,
+        sbi_scheme,
+        allowed_nf_types,
+    );
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     log::debug!("NRF registration: PUT {path}");
@@ -1535,6 +1550,7 @@ mod tests {
             ctx,
             "127.0.0.1",
             7815,
+            nextgcore_sbi::types::UriScheme::Http,
             "nwdaf-test",
             &spec_allowed_nf_types(),
         )
@@ -1560,6 +1576,7 @@ mod tests {
             "nwdaf-contract-test",
             "127.0.0.1",
             7815,
+            nextgcore_sbi::types::UriScheme::Http,
             &spec_allowed_nf_types(),
         );
 
@@ -1932,10 +1949,16 @@ mod tests {
             } else {
                 MlProvision::NotExportable
             };
-            nwdaf_services("nwdaf-test", "10.0.0.5", 7777, ml)
-                .iter()
-                .filter_map(|s| s["serviceName"].as_str().map(String::from))
-                .collect()
+            nwdaf_services(
+                "nwdaf-test",
+                "10.0.0.5",
+                7777,
+                nextgcore_sbi::types::UriScheme::Http,
+                ml,
+            )
+            .iter()
+            .filter_map(|s| s["serviceName"].as_str().map(String::from))
+            .collect()
         };
 
         let with = names(true);
@@ -1978,10 +2001,16 @@ mod tests {
 
         // Both withheld reasons advertise the same services: only the log differs.
         let names = |ml| -> Vec<String> {
-            nwdaf_services("nwdaf-test", "10.0.0.5", 7777, ml)
-                .iter()
-                .filter_map(|s| s["serviceName"].as_str().map(String::from))
-                .collect()
+            nwdaf_services(
+                "nwdaf-test",
+                "10.0.0.5",
+                7777,
+                nextgcore_sbi::types::UriScheme::Http,
+                ml,
+            )
+            .iter()
+            .filter_map(|s| s["serviceName"].as_str().map(String::from))
+            .collect()
         };
         assert_eq!(
             names(MlProvision::NoMtlf),
@@ -1997,7 +2026,13 @@ mod tests {
     #[tokio::test]
     async fn test_default_build_advertises_mlmodelprovision() {
         nwdaf_context_init("nwdaf-test".to_string(), 1024);
-        let profile = build_nf_profile("nwdaf-test", "10.0.0.5", 7777, &spec_allowed_nf_types());
+        let profile = build_nf_profile(
+            "nwdaf-test",
+            "10.0.0.5",
+            7777,
+            nextgcore_sbi::types::UriScheme::Http,
+            &spec_allowed_nf_types(),
+        );
         let names: Vec<&str> = profile["nfServices"]
             .as_array()
             .expect("nfServices")
@@ -2425,7 +2460,13 @@ mod tests_nf_profile_host_kind_1324 {
     #[test]
     fn the_nf_profile_carries_its_host_by_type() {
         for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
-            let profile = build_nf_profile("id", host, 7777, &spec_allowed_nf_types());
+            let profile = build_nf_profile(
+                "id",
+                host,
+                7777,
+                nextgcore_sbi::types::UriScheme::Http,
+                &spec_allowed_nf_types(),
+            );
             let problems =
                 nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
             assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
@@ -2446,7 +2487,13 @@ mod allowed_nf_types_1412_tests {
     const ALREADY_ALLOWED: &[&str] = &["AMF", "SMF", "PCF", "NEF", "SCP"];
 
     fn profile_json(id: &str, allowed: &[String]) -> serde_json::Value {
-        build_nf_profile(id, "127.0.0.1", 7815, allowed)
+        build_nf_profile(
+            id,
+            "127.0.0.1",
+            7815,
+            nextgcore_sbi::types::UriScheme::Http,
+            allowed,
+        )
     }
 
     fn write_config(tag: &str, body: &str) -> std::path::PathBuf {
@@ -2506,6 +2553,7 @@ mod allowed_nf_types_1412_tests {
             "nwdaf-1415",
             "127.0.0.1",
             7815,
+            nextgcore_sbi::types::UriScheme::Http,
             MlProvision::Offered,
         ));
         let service_list = |name: &str| -> Vec<String> {
@@ -2659,6 +2707,7 @@ mod allowed_nf_types_1412_tests {
             "nwdaf-1412-mlmp",
             "127.0.0.1",
             7815,
+            nextgcore_sbi::types::UriScheme::Http,
             MlProvision::Offered,
         ));
         let producer = NfProfile::from_json(&doc).expect("nrfd accepts the profile");
@@ -2713,7 +2762,14 @@ mod allowed_nf_types_1412_tests {
             ),
         ];
         for (ml, id) in &cases {
-            let doc = build_nf_profile_for(id, "127.0.0.1", 7815, &spec_allowed_nf_types(), *ml);
+            let doc = build_nf_profile_for(
+                id,
+                "127.0.0.1",
+                7815,
+                nextgcore_sbi::types::UriScheme::Http,
+                &spec_allowed_nf_types(),
+                *ml,
+            );
             let list = doc["nwdafInfo"].get("mlAnalyticsList");
             if *ml == MlProvision::Offered {
                 let want: Vec<&str> = ml_service::PROVISIONED_ML_EVENTS
@@ -3128,5 +3184,45 @@ mod outbound_oauth2_1665_tests {
             super::outbound_oauth2_client(SbiProfile::Dev, false, Some(NRF)).is_none(),
             "dev profile, knob off: no client, the token-free path is unchanged"
         );
+    }
+}
+
+/// #1791: the registered NFProfile advertises, in every `nfServices[].scheme`,
+/// the scheme this NF's SBI listener serves (TS 29.510 §6.1.6.2.3
+/// `NFService.scheme`): `http` for the cleartext listener, `https` once `--tls`
+/// makes it TLS. This listener ignores NEXTGCORE_SBI_PROFILE (it serves TLS only with `--tls`; #1795), so `--tls` alone decides. `main` passes the listener config's scheme in; the
+/// nextgcore-sbi source guard `every_nf_advertises_its_listener_scheme_1791`
+/// pins that wiring.
+///
+/// REVERT-VERIFIED: with the builder advertising `"http"` again, the TLS case
+/// fails here.
+#[cfg(test)]
+mod tests_advertised_scheme_1791 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_advertises_the_listener_scheme_1791() {
+        let addr: std::net::SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        let plain = nextgcore_sbi::server::SbiServerConfig::new(addr);
+        let tls = nextgcore_sbi::server::SbiServerConfig::new(addr).with_tls("tls.key", "tls.crt");
+        for (cfg, want) in [(plain, "http"), (tls, "https")] {
+            let profile = build_nf_profile_for(
+                "nwdaf-1791",
+                "10.0.0.1",
+                7777,
+                cfg.scheme,
+                &["AMF".to_string()],
+                MlProvision::Offered,
+            );
+            let services = profile["nfServices"].as_array().expect("nfServices");
+            assert!(!services.is_empty(), "the profile offers services");
+            for svc in services {
+                assert_eq!(
+                    svc["scheme"], want,
+                    "{} must advertise the listener's scheme",
+                    svc["serviceName"]
+                );
+            }
+        }
     }
 }

@@ -1,0 +1,184 @@
+# D441D configs (nextgsim#467): nextgsim's config/demo-predictive-ho/
+# gnb-west.yaml (the base gnb Deployment), gnb-east.yaml (gnb-east.yaml in this
+# overlay) and ue.yaml, with Service names where the compose has addresses and
+# no demo: block (toggles.yaml has the demo post-render merge it into both
+# gNB configs with the run's mode). test-scenario.sh checks that nothing else
+# differs from the committed nextgsim files.
+#
+# The route is deployed PARKED (start_after_secs 86400 instead of 40), so the
+# deploy's UE stays at its start, on gnb-west, through the base e2e. Per seed,
+# scenario.sh writes the seed into both gNB configs' shadowing block and the
+# committed 40 back into the UE's, restarts gnb, gnb-east and ue, and scores the
+# episode (the D440C precedent).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nextgsim-configs
+  namespace: nextg-system
+data:
+  gnb.yaml: |
+    nci: 0x000000010
+    gnb_id_length: 32
+    plmn:
+      mcc: 999
+      mnc: 70
+      long_mnc: false
+    tac: 1
+    nssai:
+      - sst: 1
+        sd: null
+    amf_configs:
+      - address: amf.nextg-system.svc.cluster.local
+        port: 38412
+    sctp_backend: userspace
+    link_ip: 0.0.0.0
+    ngap_ip: 0.0.0.0
+    gtp_ip: 0.0.0.0
+    ignore_stream_ids: false
+    upf_addr: upf.nextg-system.svc.cluster.local
+    upf_port: 2152
+    si_broadcast_period_ms: 80
+    reselection:
+      broadcast: true
+      q_hyst_db: 4
+      t_reselection_s: 1
+      cell_reselection_priority: 4
+      s_intra_search_p: 31
+      thresh_serving_low_p: 4
+      intra_freq_neighbours: []
+      inter_freq_carriers: []
+    accept_raw_nas_on_dcch: false
+    rlc_am_psis: []
+    energy_saving_enabled: false
+    she_enabled: false
+    nwdaf_enabled: true
+    nkef_enabled: false
+    isac_enabled: false
+    agent_enabled: false
+    as_security_enabled: false
+    sim_position: { x: 0, y: 0, z: 0 }
+    handover_neighbours:
+      - nci: 0x000000020
+        tac: 1
+        position: { x: 120, y: 0, z: 0 }
+    shadowing:
+      sigma_db: 4
+      seed: 1
+      decorrelation_m: 20
+  gnb-east.yaml: |
+    nci: 0x000000020
+    gnb_id_length: 32
+    plmn:
+      mcc: 999
+      mnc: 70
+      long_mnc: false
+    tac: 1
+    nssai:
+      - sst: 1
+        sd: null
+    amf_configs:
+      - address: amf.nextg-system.svc.cluster.local
+        port: 38412
+    sctp_backend: userspace
+    link_ip: 0.0.0.0
+    ngap_ip: 0.0.0.0
+    gtp_ip: 0.0.0.0
+    ignore_stream_ids: false
+    upf_addr: upf.nextg-system.svc.cluster.local
+    upf_port: 2152
+    si_broadcast_period_ms: 80
+    reselection:
+      broadcast: true
+      q_hyst_db: 4
+      t_reselection_s: 1
+      cell_reselection_priority: 4
+      s_intra_search_p: 31
+      thresh_serving_low_p: 4
+      intra_freq_neighbours: []
+      inter_freq_carriers: []
+    accept_raw_nas_on_dcch: false
+    rlc_am_psis: []
+    energy_saving_enabled: false
+    she_enabled: false
+    nwdaf_enabled: true
+    nkef_enabled: false
+    isac_enabled: false
+    agent_enabled: false
+    as_security_enabled: false
+    sim_position: { x: 120, y: 0, z: 0 }
+    handover_neighbours:
+      - nci: 0x000000010
+        tac: 1
+        position: { x: 0, y: 0, z: 0 }
+    shadowing:
+      sigma_db: 4
+      seed: 1
+      decorrelation_m: 20
+  ue.yaml: |
+    supi:
+      supi_type: Imsi
+      value: "999700000000001"
+    protection_scheme: 0
+    home_network_public_key_id: 0
+    home_network_public_key: []
+    routing_indicator: "0000"
+    hplmn:
+      mcc: 999
+      mnc: 70
+      long_mnc: false
+    key: [0x46, 0x5B, 0x5C, 0xE8, 0xB1, 0x99, 0xB4, 0x9F, 0xAA, 0x5F, 0x0A, 0x2E, 0xE2, 0x38, 0xA6, 0xBC]
+    op: [0xE8, 0xED, 0x28, 0x9D, 0xEB, 0xA9, 0x52, 0xE4, 0x28, 0x3B, 0x54, 0xE8, 0x8E, 0x6D, 0x83, 0x4D]
+    op_type: Opc
+    amf: [0x80, 0x00]
+    imei: "356938035643803"
+    imei_sv: null
+    supported_algs:
+      nia1: true
+      nia2: true
+      nia3: true
+      nea1: true
+      nea2: true
+      nea3: true
+    pqc:
+      enabled: false
+    gnb_search_list:
+      - "gnb.nextg-system.svc.cluster.local"
+      - "gnb-east.nextg-system.svc.cluster.local"
+    sim_position: { x: 20, y: 17, z: 0 }
+    sim_route:
+      waypoints:
+        - { x: 30, y: 22, z: 0 }
+        - { x: 40, y: 27, z: 0 }
+        - { x: 50, y: 29, z: 0 }
+        - { x: 60, y: 30, z: 0 }
+        - { x: 70, y: 29, z: 0 }
+        - { x: 80, y: 27, z: 0 }
+        - { x: 90, y: 22, z: 0 }
+        - { x: 100, y: 17, z: 0 }
+        - { x: 110, y: 9, z: 0 }
+      speed_mps: 5
+      start_after_secs: 86400   # parked; scenario.sh restores 40 per seed
+    sessions:
+      - type: Ipv4
+        s_nssai:
+          sst: 1
+          sd: null
+        apn: "internet"
+        is_emergency: false
+    configured_nssai:
+      slices:
+        - sst: 1
+          sd: null
+    tun_name: "uesimtun"
+    redcap: false
+    racs_store_assigned_id: true
+    require_broadcast_sib1: false
+    rlc_am_psis: []
+    conditional_handover: false
+    eutra_b1_threshold_dbm: -110
+    she_enabled: false
+    ai_ml_enabled: false
+    isac_enabled: false
+    federated_learning_enabled: false
+    semantic_comm_enabled: false
+    as_security_enabled: false

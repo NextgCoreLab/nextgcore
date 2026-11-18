@@ -384,7 +384,7 @@ async fn nrf(anlf_id: &'static str, anlf_port: u16) -> (nextgcore_sbi::SbiServer
         let body = if hit {
             json!({ "nfInstances": [{
                 "nfInstanceId": anlf_id, "nfType": "NWDAF",
-                "nfServices": [mm::nf_service(anlf_id, "127.0.0.1", anlf_port)]
+                "nfServices": [mm::nf_service(anlf_id, "127.0.0.1", anlf_port, nextgcore_sbi::types::UriScheme::Http)]
             }]})
         } else {
             json!({ "nfInstances": [] })

@@ -105,6 +105,38 @@ pub(crate) fn attach_oauth2(
     }
 }
 
+/// #1754: spawn `fut` on its own task, so dropping the caller (a consumer that
+/// disconnects mid-request) does not drop it. Under test the task-local OAuth2
+/// client is carried into the task, as the caller would have seen it.
+pub(crate) fn spawn_detached<F>(fut: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    #[cfg(test)]
+    if let Ok(oauth2) = TEST_OAUTH2_CLIENT.try_with(Arc::clone) {
+        return tokio::spawn(TEST_OAUTH2_CLIENT.scope(oauth2, fut));
+    }
+    tokio::spawn(fut)
+}
+
+/// #1754: whether a time-sync configuration is still stored, for a PCF Create that
+/// lands late. A poisoned lock answers "held", so nothing is retracted on a guess.
+fn time_sync_config_held(id: &str) -> bool {
+    tsctsf_self()
+        .read()
+        .map(|c| c.config_find(id).is_some())
+        .unwrap_or(true)
+}
+
+/// #1754: the same for a QoS/TSC session.
+fn qos_tsc_session_held(id: &str) -> bool {
+    tsctsf_self()
+        .read()
+        .map(|c| c.qos_tsc_find(id).is_some())
+        .unwrap_or(true)
+}
+
 /// #1665: the outbound OAuth2 client this TSCTSF installs at startup: under the
 /// `production` SBI profile or the `sbi.oauth2.require` knob, when an NRF is
 /// configured (see [`nextgcore_sbi::oauth::outbound_oauth2_client`]).
@@ -299,6 +331,8 @@ async fn main() -> Result<()> {
         sbi_server_config = apply_oauth2_enforcement(sbi_server_config, &args.nrf_uri);
     }
 
+    // #1791: the NFProfile advertises the scheme this listener serves.
+    let sbi_scheme = sbi_server_config.scheme;
     let sbi_server = SbiServer::new(sbi_server_config);
     log::info!("Starting TSCTSF SBI server on {addr}");
     sbi_server
@@ -329,7 +363,7 @@ async fn main() -> Result<()> {
                 move || {
                     let (ctx, host, id) = (sbi_ctx.clone(), host.clone(), id.clone());
                     async move {
-                        register_with_nrf(ctx, &host, port, &id)
+                        register_with_nrf(ctx, &host, port, &id, sbi_scheme)
                             .await
                             .map(|()| Some(id))
                     }
@@ -972,7 +1006,12 @@ async fn handle_qos_tsc_create(request: &SbiRequest) -> SbiResponse {
     if actuation::enabled() {
         match actuation::build_qos_tsc_app_session(&created, &qos_tsc_notif_uri(&created)) {
             Ok(asc) => {
-                actuation::policy_authorization_create(&created.transaction_ref_id, &asc).await;
+                actuation::policy_authorization_create(
+                    &created.transaction_ref_id,
+                    &asc,
+                    qos_tsc_session_held,
+                )
+                .await;
             }
             Err(reason) => log::warn!(
                 "not actuating QoS/TSC session {}: {reason}",
@@ -1110,7 +1149,7 @@ async fn actuate_time_sync_create(config_id: &str, cfg: &context::TimeSyncExposu
     );
     match actuation::build_time_sync_app_session(cfg, &derived, &time_sync_notif_uri(cfg)) {
         Ok(asc) => {
-            actuation::policy_authorization_create(config_id, &asc).await;
+            actuation::policy_authorization_create(config_id, &asc, time_sync_config_held).await;
         }
         Err(reason) => {
             log::warn!("not actuating time-sync configuration {config_id}: {reason}")
@@ -1415,7 +1454,12 @@ async fn handle_admin_capability_change(request: &SbiRequest) -> SbiResponse {
 
 /// Build the NFProfile registered with the NRF (TS 29.510): nfType TSCTSF
 /// advertising the ntsctsf-time-synchronization service (TS 29.565).
-fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
+fn build_nf_profile(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+    scheme: nextgcore_sbi::types::UriScheme,
+) -> serde_json::Value {
     nextgcore_sbi::nf_addressing::classify_profile_host(
         serde_json::json!({
             "nfInstanceId": nf_instance_id,
@@ -1432,7 +1476,7 @@ fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serd
                     "serviceInstanceId": format!("{nf_instance_id}-ntsctsf-time-synchronization"),
                     "serviceName": "ntsctsf-time-synchronization",
                     "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                    "scheme": "http",
+                    "scheme": scheme.as_str(),
                     "nfServiceStatus": "REGISTERED",
                     "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
                 },
@@ -1440,7 +1484,7 @@ fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serd
                     "serviceInstanceId": format!("{nf_instance_id}-ntsctsf-asti"),
                     "serviceName": "ntsctsf-asti",
                     "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                    "scheme": "http",
+                    "scheme": scheme.as_str(),
                     "nfServiceStatus": "REGISTERED",
                     "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
                 },
@@ -1448,7 +1492,7 @@ fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serd
                     "serviceInstanceId": format!("{nf_instance_id}-ntsctsf-qos-tsctsf"),
                     "serviceName": "ntsctsf-qos-tsctsf",
                     "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                    "scheme": "http",
+                    "scheme": scheme.as_str(),
                     "nfServiceStatus": "REGISTERED",
                     "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
                 }
@@ -1490,6 +1534,7 @@ async fn register_with_nrf(
     sbi_addr: &str,
     sbi_port: u16,
     nf_instance_id: &str,
+    sbi_scheme: nextgcore_sbi::types::UriScheme,
 ) -> Result<(), String> {
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
     let nrf_uri = match nrf_uri {
@@ -1505,7 +1550,7 @@ async fn register_with_nrf(
     let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
 
-    let nf_profile = build_nf_profile(nf_instance_id, sbi_addr, sbi_port);
+    let nf_profile = build_nf_profile(nf_instance_id, sbi_addr, sbi_port, sbi_scheme);
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     log::debug!("NRF registration: PUT {path}");
@@ -1634,7 +1679,12 @@ mod tests {
     // ── NRF registration profile (acceptance: nfType TSCTSF) ────────────────
     #[test]
     fn nf_profile_advertises_tsctsf_and_time_sync_service() {
-        let profile = build_nf_profile("tsctsf-test-1", "10.0.0.8", 7819);
+        let profile = build_nf_profile(
+            "tsctsf-test-1",
+            "10.0.0.8",
+            7819,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
         assert_eq!(profile["nfType"], "TSCTSF");
         assert_eq!(profile["nfStatus"], "REGISTERED");
         assert_eq!(
@@ -2078,6 +2128,257 @@ mod tests {
             actuation::set_for_test(false);
             reset_actuation(None);
             pcf.stop().await.expect("stop stand-in PCF");
+        });
+    }
+
+    /// #1754: a stand-in PCF whose answers the test scripts. `hold` names one
+    /// request kind ("create" or "delete") whose FIRST instance signals `arrived`
+    /// and is then held until `release`; `delete_statuses` are the statuses the
+    /// successive Deletes get (204 once exhausted). Every request is recorded.
+    struct ScriptedPcf {
+        seen: std::sync::Mutex<Vec<String>>,
+        delete_statuses: std::sync::Mutex<std::collections::VecDeque<u16>>,
+        hold: std::sync::Mutex<Option<&'static str>>,
+        arrived: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl ScriptedPcf {
+        fn deletes(&self) -> usize {
+            self.seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|u| {
+                    u.as_str() == "/npcf-policyauthorization/v1/app-sessions/asc-1754/delete"
+                })
+                .count()
+        }
+    }
+
+    async fn spawn_scripted_pcf(
+        hold: Option<&'static str>,
+        delete_statuses: &[u16],
+    ) -> (nextgcore_sbi::server::SbiServer, u16, Arc<ScriptedPcf>) {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let pcf = Arc::new(ScriptedPcf {
+            seen: std::sync::Mutex::new(Vec::new()),
+            delete_statuses: std::sync::Mutex::new(delete_statuses.iter().copied().collect()),
+            hold: std::sync::Mutex::new(hold),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let state = pcf.clone();
+        let (server, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let state = state.clone();
+                async move {
+                    let uri = req.header.uri.clone();
+                    state
+                        .seen
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(uri.clone());
+                    let kind = if uri == "/npcf-policyauthorization/v1/app-sessions" {
+                        "create"
+                    } else {
+                        "delete"
+                    };
+                    let held = {
+                        let mut hold = state.hold.lock().unwrap_or_else(|e| e.into_inner());
+                        if *hold == Some(kind) {
+                            *hold = None;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if held {
+                        state.arrived.notify_one();
+                        state.release.notified().await;
+                    }
+                    if kind == "create" {
+                        return SbiResponse::with_status(201).with_header(
+                            "Location",
+                            "/npcf-policyauthorization/v1/app-sessions/asc-1754".to_string(),
+                        );
+                    }
+                    let status = state
+                        .delete_statuses
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .pop_front()
+                        .unwrap_or(204);
+                    SbiResponse::with_status(status)
+                }
+            })
+            .await;
+        (server, addr.port(), pcf)
+    }
+
+    /// The single stored time-sync configuration's id (the cancelled create's
+    /// consumer never saw its 201).
+    fn only_config_id() -> String {
+        let list = tsctsf_self().read().expect("context").config_list();
+        assert_eq!(list.len(), 1, "one configuration stored");
+        list[0].id.clone()
+    }
+
+    fn time_sync_create_1754() -> SbiRequest {
+        create_request(serde_json::json!({
+            "timeDomain": 24,
+            "gmEnable": true,
+            "supis": ["imsi-001010000001754"],
+            "ueMac": "00-11-22-33-44-54",
+        }))
+    }
+
+    /// Poll `cond` for up to 5 s, yielding to the runtime between checks.
+    async fn eventually(what: &str, cond: impl Fn() -> bool) {
+        for _ in 0..500 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for: {what}");
+    }
+
+    /// #1754 (failure-path check 1): a Delete the PCF refuses keeps the
+    /// `appSessionId`, and is retried until the PCF accepts it.
+    #[test]
+    fn a_failed_delete_keeps_the_app_session_and_is_retried_1754() {
+        let _g = lock_globals();
+        reset_context();
+        block_on(async {
+            let (server, port, pcf) = spawn_scripted_pcf(None, &[500, 503]).await;
+            reset_actuation(Some(port));
+            actuation::set_for_test(true);
+
+            let created = tsctsf_sbi_request_handler(time_sync_create_1754()).await;
+            assert_eq!(created.status, 201);
+            let config_id = only_config_id();
+            let deleted = tsctsf_sbi_request_handler(SbiRequest::delete(format!(
+                "/ntsctsf-time-synchronization/v1/configuration/{config_id}"
+            )))
+            .await;
+            assert_eq!(deleted.status, 204);
+            assert_eq!(pcf.deletes(), 1);
+            assert_eq!(
+                actuation::app_session_for(&config_id).as_deref(),
+                Some("asc-1754"),
+                "a refused Delete must keep the appSessionId, or the PCF session is orphaned"
+            );
+
+            eventually("the retried Delete is accepted", || {
+                pcf.deletes() == 3 && actuation::app_session_for(&config_id).is_none()
+            })
+            .await;
+
+            actuation::set_for_test(false);
+            reset_actuation(None);
+            server.stop().await.expect("stop scripted PCF");
+        });
+    }
+
+    /// #1754 (check 3): a consumer that disconnects while the PCF holds its Create
+    /// does not drop the Create: the late 201 is recorded against the stored
+    /// configuration.
+    #[test]
+    fn a_cancelled_create_is_recorded_on_its_own_task_1754() {
+        let _g = lock_globals();
+        reset_context();
+        block_on(async {
+            let (server, port, pcf) = spawn_scripted_pcf(Some("create"), &[]).await;
+            reset_actuation(Some(port));
+            actuation::set_for_test(true);
+
+            tokio::select! {
+                _ = tsctsf_sbi_request_handler(time_sync_create_1754()) => {
+                    panic!("the PCF holds the Create; the handler cannot finish")
+                }
+                _ = pcf.arrived.notified() => {}
+            }
+            // The handler's future is dropped here: the consumer has gone.
+            let config_id = only_config_id();
+            pcf.release.notify_one();
+            eventually("the late 201 is recorded", || {
+                actuation::app_session_for(&config_id).as_deref() == Some("asc-1754")
+            })
+            .await;
+
+            actuation::set_for_test(false);
+            reset_actuation(None);
+            server.stop().await.expect("stop scripted PCF");
+        });
+    }
+
+    /// #1754 (check 3): a Create whose 201 lands after its configuration was deleted
+    /// (that Delete found nothing to retract) is retracted when it lands.
+    #[test]
+    fn a_create_landing_after_its_delete_is_retracted_1754() {
+        let _g = lock_globals();
+        reset_context();
+        block_on(async {
+            let (server, port, pcf) = spawn_scripted_pcf(Some("create"), &[]).await;
+            reset_actuation(Some(port));
+            actuation::set_for_test(true);
+
+            tokio::select! {
+                _ = tsctsf_sbi_request_handler(time_sync_create_1754()) => {
+                    panic!("the PCF holds the Create; the handler cannot finish")
+                }
+                _ = pcf.arrived.notified() => {}
+            }
+            let config_id = only_config_id();
+            let deleted = tsctsf_sbi_request_handler(SbiRequest::delete(format!(
+                "/ntsctsf-time-synchronization/v1/configuration/{config_id}"
+            )))
+            .await;
+            assert_eq!(deleted.status, 204);
+            assert_eq!(pcf.deletes(), 0, "nothing was recorded yet to retract");
+
+            pcf.release.notify_one();
+            eventually("the late app session is deleted at the PCF", || {
+                pcf.deletes() == 1 && actuation::app_session_for(&config_id).is_none()
+            })
+            .await;
+
+            actuation::set_for_test(false);
+            reset_actuation(None);
+            server.stop().await.expect("stop scripted PCF");
+        });
+    }
+
+    /// #1754 (check 3): a consumer that disconnects while the PCF holds its Delete
+    /// does not lose the retraction: the refused Delete is kept and retried.
+    #[test]
+    fn a_cancelled_delete_is_still_retracted_1754() {
+        let _g = lock_globals();
+        reset_context();
+        block_on(async {
+            let (server, port, pcf) = spawn_scripted_pcf(Some("delete"), &[500]).await;
+            reset_actuation(Some(port));
+            actuation::set_for_test(true);
+
+            let created = tsctsf_sbi_request_handler(time_sync_create_1754()).await;
+            assert_eq!(created.status, 201);
+            let config_id = only_config_id();
+            tokio::select! {
+                _ = tsctsf_sbi_request_handler(SbiRequest::delete(format!(
+                    "/ntsctsf-time-synchronization/v1/configuration/{config_id}"
+                ))) => panic!("the PCF holds the Delete; the handler cannot finish"),
+                _ = pcf.arrived.notified() => {}
+            }
+            pcf.release.notify_one();
+            eventually("the Delete is retried and accepted", || {
+                pcf.deletes() == 2 && actuation::app_session_for(&config_id).is_none()
+            })
+            .await;
+
+            actuation::set_for_test(false);
+            reset_actuation(None);
+            server.stop().await.expect("stop scripted PCF");
         });
     }
 
@@ -2793,7 +3094,12 @@ mod tests {
     /// pre-#113 state for the two that did not exist.
     #[test]
     fn the_nf_profile_advertises_all_three_services() {
-        let profile = build_nf_profile("tsctsf-1", "127.0.0.1", 7777);
+        let profile = build_nf_profile(
+            "tsctsf-1",
+            "127.0.0.1",
+            7777,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
         let names: Vec<&str> = profile["nfServices"]
             .as_array()
             .expect("nfServices")
@@ -2878,7 +3184,7 @@ mod tests_nf_profile_host_kind_1324 {
     #[test]
     fn the_nf_profile_carries_its_host_by_type() {
         for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
-            let profile = build_nf_profile("id", host, 7777);
+            let profile = build_nf_profile("id", host, 7777, nextgcore_sbi::types::UriScheme::Http);
             let problems =
                 nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
             assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
@@ -2912,5 +3218,38 @@ mod outbound_oauth2_1665_tests {
             super::outbound_oauth2_client(SbiProfile::Dev, false, Some(NRF)).is_none(),
             "dev profile, knob off: no client, the token-free path is unchanged"
         );
+    }
+}
+
+/// #1791: the registered NFProfile advertises, in every `nfServices[].scheme`,
+/// the scheme this NF's SBI listener serves (TS 29.510 §6.1.6.2.3
+/// `NFService.scheme`): `http` for the cleartext listener, `https` once `--tls`
+/// makes it TLS. This listener ignores NEXTGCORE_SBI_PROFILE (it serves TLS only with `--tls`; #1795), so `--tls` alone decides. `main` passes the listener config's scheme in; the
+/// nextgcore-sbi source guard `every_nf_advertises_its_listener_scheme_1791`
+/// pins that wiring.
+///
+/// REVERT-VERIFIED: with the builder advertising `"http"` again, the TLS case
+/// fails here.
+#[cfg(test)]
+mod tests_advertised_scheme_1791 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_advertises_the_listener_scheme_1791() {
+        let addr: std::net::SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        let plain = nextgcore_sbi::server::SbiServerConfig::new(addr);
+        let tls = nextgcore_sbi::server::SbiServerConfig::new(addr).with_tls("tls.key", "tls.crt");
+        for (cfg, want) in [(plain, "http"), (tls, "https")] {
+            let profile = build_nf_profile("tsctsf-1791", "10.0.0.1", 7777, cfg.scheme);
+            let services = profile["nfServices"].as_array().expect("nfServices");
+            assert!(!services.is_empty(), "the profile offers services");
+            for svc in services {
+                assert_eq!(
+                    svc["scheme"], want,
+                    "{} must advertise the listener's scheme",
+                    svc["serviceName"]
+                );
+            }
+        }
     }
 }

@@ -194,12 +194,17 @@ fn configure(
 /// The `nfServices[]` entry the NEF profile adds while the route is served: the
 /// service the NRF authorises the `nnef-ueid` scope against, for AF consumers
 /// only.
-pub fn nf_service(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
+pub fn nf_service(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+    scheme: nextgcore_sbi::types::UriScheme,
+) -> serde_json::Value {
     serde_json::json!({
         "serviceInstanceId": format!("{nf_instance_id}-{SERVICE_NAME}"),
         "serviceName": SERVICE_NAME,
         "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.1.1"}],
-        "scheme": "http",
+        "scheme": scheme.as_str(),
         "nfServiceStatus": "REGISTERED",
         "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
         "allowedNfTypes": ["AF"]
@@ -852,7 +857,12 @@ mod tests {
         let services = |p: &serde_json::Value| -> Vec<serde_json::Value> {
             p["nfServices"].as_array().cloned().unwrap_or_default()
         };
-        let off = crate::build_nf_profile("nef-480", "10.0.0.9", 7817);
+        let off = crate::build_nf_profile(
+            "nef-480",
+            "10.0.0.9",
+            7817,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
         assert!(services(&off)
             .iter()
             .all(|s| s["serviceName"] != SERVICE_NAME));
@@ -860,7 +870,12 @@ mod tests {
         let rt = runtime();
         let st = rt.block_on(state("http://127.0.0.1:1", "http://127.0.0.1:1"));
         let _on = ServingOnThisThread::new(st);
-        let on = crate::build_nf_profile("nef-480", "10.0.0.9", 7817);
+        let on = crate::build_nf_profile(
+            "nef-480",
+            "10.0.0.9",
+            7817,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
         let svc = services(&on)
             .into_iter()
             .find(|s| s["serviceName"] == SERVICE_NAME)

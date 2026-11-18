@@ -335,19 +335,34 @@ async fn main() -> Result<()> {
         "--sbi-addr (or easdf.sbi.server[0].address in the config file)",
     );
 
-    let mut sbi_server_config = SbiServerConfig::new(addr);
-    if args.tls {
-        let cert = args
-            .tls_cert
-            .as_deref()
-            .unwrap_or("/etc/nextgcore/tls/server.crt");
-        let key = args
-            .tls_key
-            .as_deref()
-            .unwrap_or("/etc/nextgcore/tls/server.key");
-        sbi_server_config = sbi_server_config.with_tls(key, cert);
-    }
+    // #1677: the listener follows NEXTGCORE_SBI_PROFILE like the core NFs: under
+    // `production`, TLS with mTLS and OAuth2 (TS 33.501 §13.1.0, §13.4.1), which
+    // is what smfd dials since #1669. `--tls` still turns TLS on under `dev`.
+    let sbi_profile = nextgcore_sbi::security::SbiProfile::resolve();
+    let tls = args.tls.then(|| {
+        (
+            args.tls_key
+                .clone()
+                .unwrap_or_else(|| "/etc/nextgcore/tls/server.key".into()),
+            args.tls_cert
+                .clone()
+                .unwrap_or_else(|| "/etc/nextgcore/tls/server.crt".into()),
+        )
+    });
+    let sbi_server_config = easdf_server_config(
+        SbiServerConfig::new(addr),
+        tls,
+        sbi_profile,
+        &nextgcore_sbi::security::SbiSecurityPolicy::for_profile(sbi_profile),
+        &nrf_uri,
+    )
+    .map_err(|e| anyhow::anyhow!("SBI security profile: {e}"))?;
+    // The NRF calls (registration, heartbeat) carry an access token for the NRF
+    // when the profile asks for OAuth2 (#1665, #1667), as every other NF's do.
+    nextgcore_sbi::nrf_tls::set_nrf_oauth2_client(easdf_nrf_oauth2_client(sbi_profile, &nrf_uri));
 
+    // #1791: the NFProfile advertises the scheme this listener serves.
+    let sbi_scheme = sbi_server_config.scheme;
     let sbi_server = SbiServer::new(sbi_server_config);
     log::info!("Starting EASDF SBI server on {addr}");
     sbi_server
@@ -378,7 +393,7 @@ async fn main() -> Result<()> {
                 move || {
                     let (ctx, host, id) = (sbi_ctx.clone(), host.clone(), id.clone());
                     async move {
-                        register_with_nrf(ctx, &host, sbi_port, &id)
+                        register_with_nrf(ctx, &host, sbi_port, &id, sbi_scheme)
                             .await
                             .map(|()| Some(id))
                     }
@@ -931,9 +946,55 @@ async fn handle_baseline_pattern_delete(id: &str) -> SbiResponse {
     }
 }
 
+/// The EASDF's SBI listener configuration (#1677): `--tls` first, when given
+/// (`tls` is its `(key, cert)`), then the SBI security `profile`, which under
+/// `production` sets TLS from `policy`'s certificate paths, mTLS and OAuth2 with
+/// the EASDF as the expected audience, and fails, naming the path, when a
+/// certificate file is missing rather than serving cleartext. Under `dev` the
+/// config is left as `--tls` made it.
+fn easdf_server_config(
+    mut config: SbiServerConfig,
+    tls: Option<(String, String)>,
+    profile: nextgcore_sbi::security::SbiProfile,
+    policy: &nextgcore_sbi::security::SbiSecurityPolicy,
+    nrf_uri: &str,
+) -> nextgcore_sbi::SbiResult<SbiServerConfig> {
+    if let Some((key, cert)) = tls {
+        config = config.with_tls(key, cert);
+    }
+    nextgcore_sbi::security::apply_sbi_security_policy(
+        config,
+        profile,
+        policy,
+        nextgcore_sbi::types::NfType::Easdf,
+        nrf_uri,
+    )
+}
+
+/// The OAuth2 client the EASDF's own NRF calls (registration, heartbeat) use
+/// (#1665, #1667): under `production`, one that asks `nrf_uri` for an access
+/// token as consumer nfType EASDF, so an NRF that gates nnrf-nfm does not lock
+/// the EASDF out of registration. `None` under `dev`, or without an NRF.
+fn easdf_nrf_oauth2_client(
+    profile: nextgcore_sbi::security::SbiProfile,
+    nrf_uri: &str,
+) -> Option<std::sync::Arc<nextgcore_sbi::oauth::OAuth2Client>> {
+    nextgcore_sbi::oauth::outbound_oauth2_client(
+        profile,
+        false,
+        Some(nrf_uri),
+        nextgcore_sbi::types::NfType::Easdf,
+    )
+}
+
 /// Build the NFProfile registered with the NRF (TS 29.510): nfType EASDF
 /// advertising the neasdf-dnscontext service (TS 29.556).
-fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
+fn build_nf_profile(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+    scheme: nextgcore_sbi::types::UriScheme,
+) -> serde_json::Value {
     nextgcore_sbi::nf_addressing::classify_profile_host(
         serde_json::json!({
             "nfInstanceId": nf_instance_id,
@@ -945,7 +1006,7 @@ fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serd
                     "serviceInstanceId": format!("{nf_instance_id}-neasdf-dnscontext"),
                     "serviceName": "neasdf-dnscontext",
                     "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                    "scheme": "http",
+                    "scheme": scheme.as_str(),
                     "nfServiceStatus": "REGISTERED",
                     "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
                 },
@@ -956,7 +1017,7 @@ fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serd
                     "serviceInstanceId": format!("{nf_instance_id}-neasdf-baselinednspattern"),
                     "serviceName": "neasdf-baselinednspattern",
                     "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                    "scheme": "http",
+                    "scheme": scheme.as_str(),
                     "nfServiceStatus": "REGISTERED",
                     "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
                 }
@@ -998,6 +1059,7 @@ async fn register_with_nrf(
     sbi_addr: &str,
     sbi_port: u16,
     nf_instance_id: &str,
+    sbi_scheme: nextgcore_sbi::types::UriScheme,
 ) -> Result<(), String> {
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
     let nrf_uri = match nrf_uri {
@@ -1013,7 +1075,7 @@ async fn register_with_nrf(
     let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
 
-    let nf_profile = build_nf_profile(nf_instance_id, sbi_addr, sbi_port);
+    let nf_profile = build_nf_profile(nf_instance_id, sbi_addr, sbi_port, sbi_scheme);
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     log::debug!("NRF registration: PUT {path}");
@@ -1073,6 +1135,157 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1677/#1667: under `production` the EASDF's NRF calls get an OAuth2
+    /// client that asks the configured NRF for a token as consumer nfType
+    /// EASDF; under `dev`, and with no NRF configured, they get none. The source
+    /// guard `every_nf_with_an_outbound_oauth2_client_gives_it_to_its_nrf_calls_1667`
+    /// (nextgcore-sbi security.rs) pins that `main` installs this client.
+    ///
+    /// REVERT-VERIFIED: with the helper passing `SbiProfile::Dev` instead of
+    /// `profile`, the production assertion fails.
+    #[test]
+    fn production_nrf_calls_carry_an_easdf_oauth2_client_1677() {
+        use nextgcore_sbi::security::SbiProfile;
+        let nrf = "https://nrf.example:7777";
+        let client = easdf_nrf_oauth2_client(SbiProfile::Production, nrf)
+            .expect("production gives the NRF calls an OAuth2 client");
+        assert_eq!(
+            client.nrf_uri(),
+            nrf,
+            "the token is asked of the configured NRF"
+        );
+        assert_eq!(
+            client.self_consumer().nf_type,
+            nextgcore_sbi::types::NfType::Easdf,
+            "the EASDF asks for the token as itself"
+        );
+        assert!(
+            easdf_nrf_oauth2_client(SbiProfile::Dev, nrf).is_none(),
+            "dev sends no token"
+        );
+        assert!(
+            easdf_nrf_oauth2_client(SbiProfile::Production, "  ").is_none(),
+            "no NRF, no Authorization Server to ask"
+        );
+    }
+
+    /// #1677: the EASDF listener follows the SBI security profile. Under
+    /// `production`: TLS from the policy's paths, mTLS against its CA, and OAuth2
+    /// with the EASDF as audience and the NRF's JWKS, whatever `--tls` said. A
+    /// missing certificate is a startup error naming it, never cleartext. Under
+    /// `dev`: cleartext, or TLS without mTLS when `--tls` is given, as before.
+    ///
+    /// REVERT-VERIFIED: with `easdf_server_config` not applying the profile, the
+    /// production case serves cleartext and the first assertion fails.
+    #[test]
+    fn the_listener_follows_the_sbi_profile_1677() {
+        use nextgcore_sbi::security::{SbiProfile, SbiSecurityPolicy, TlsPaths};
+        use nextgcore_sbi::types::UriScheme;
+        let dir = std::env::temp_dir().join(format!(
+            "easdf-1677-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |n: &str| {
+            let p = dir.join(n);
+            std::fs::write(&p, "pem").unwrap();
+            p.display().to_string()
+        };
+        let policy = SbiSecurityPolicy {
+            tls_paths: TlsPaths {
+                cert: file("easdf.crt"),
+                key: file("easdf.key"),
+                ca_cert: file("ca.crt"),
+                client_cert: Some(file("client.crt")),
+                client_key: Some(file("client.key")),
+            },
+            ..SbiSecurityPolicy::production()
+        };
+        let addr: SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        let nrf = "http://127.0.0.10:7777";
+
+        let prod = easdf_server_config(
+            SbiServerConfig::new(addr),
+            None,
+            SbiProfile::Production,
+            &policy,
+            nrf,
+        )
+        .expect("production applies");
+        assert_eq!(prod.scheme, UriScheme::Https, "production serves TLS");
+        assert_eq!(prod.cert.as_deref(), Some(policy.tls_paths.cert.as_str()));
+        assert!(prod.verify_client, "and verifies the client certificate");
+        assert_eq!(
+            prod.verify_client_cacert.as_deref(),
+            Some(policy.tls_paths.ca_cert.as_str())
+        );
+        assert!(prod.require_oauth2, "and requires an access token");
+        assert_eq!(prod.oauth2_expected_audience.as_deref(), Some("EASDF"));
+        assert_eq!(
+            prod.oauth2_jwks_uri.as_deref(),
+            Some(nextgcore_sbi::oauth::JwksCache::for_nrf(nrf).jwks_uri())
+        );
+
+        // `--tls` under production: the profile's certificate wins.
+        let both = easdf_server_config(
+            SbiServerConfig::new(addr),
+            Some(("/x/k".into(), "/x/c".into())),
+            SbiProfile::Production,
+            &policy,
+            nrf,
+        )
+        .expect("production applies");
+        assert_eq!(both.cert.as_deref(), Some(policy.tls_paths.cert.as_str()));
+
+        // A missing certificate fails closed, naming it.
+        let missing = SbiSecurityPolicy {
+            tls_paths: TlsPaths {
+                cert: dir.join("absent.crt").display().to_string(),
+                ..policy.tls_paths.clone()
+            },
+            ..SbiSecurityPolicy::production()
+        };
+        let err = easdf_server_config(
+            SbiServerConfig::new(addr),
+            None,
+            SbiProfile::Production,
+            &missing,
+            nrf,
+        )
+        .expect_err("no cleartext fallback");
+        assert!(err.to_string().contains("absent.crt"), "{err}");
+
+        // Dev: cleartext, or `--tls` without mTLS or OAuth2.
+        let dev_policy = SbiSecurityPolicy::development();
+        let dev = easdf_server_config(
+            SbiServerConfig::new(addr),
+            None,
+            SbiProfile::Dev,
+            &dev_policy,
+            nrf,
+        )
+        .unwrap();
+        assert_eq!(dev.scheme, UriScheme::Http);
+        assert!(!dev.verify_client && !dev.require_oauth2);
+        let dev_tls = easdf_server_config(
+            SbiServerConfig::new(addr),
+            Some(("/x/k".into(), "/x/c".into())),
+            SbiProfile::Dev,
+            &dev_policy,
+            nrf,
+        )
+        .unwrap();
+        assert_eq!(dev_tls.scheme, UriScheme::Https);
+        assert_eq!(dev_tls.cert.as_deref(), Some("/x/c"));
+        assert!(!dev_tls.verify_client && !dev_tls.require_oauth2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use std::sync::Mutex;
 
     /// Serializes tests that touch the process-global EASDF context.
@@ -1150,7 +1363,12 @@ mod tests {
     // ── NRF registration profile (acceptance: nfType EASDF registered) ──────
     #[test]
     fn nf_profile_advertises_easdf_and_dnscontext_service() {
-        let profile = build_nf_profile("easdf-test-1", "10.0.0.7", 7818);
+        let profile = build_nf_profile(
+            "easdf-test-1",
+            "10.0.0.7",
+            7818,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
         assert_eq!(profile["nfType"], "EASDF");
         assert_eq!(profile["nfStatus"], "REGISTERED");
         assert_eq!(profile["nfServices"][0]["serviceName"], "neasdf-dnscontext");
@@ -1737,7 +1955,12 @@ easdf:
 
         // ...and the service is advertised to the NRF. TS 23.501 Table 7.2.25-1
         // lists both EASDF services; only the first used to appear.
-        let profile = build_nf_profile("easdf-1", "127.0.0.1", 7777);
+        let profile = build_nf_profile(
+            "easdf-1",
+            "127.0.0.1",
+            7777,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
         let names: Vec<&str> = profile["nfServices"]
             .as_array()
             .unwrap()
@@ -1792,10 +2015,43 @@ mod tests_nf_profile_host_kind_1324 {
     #[test]
     fn the_nf_profile_carries_its_host_by_type() {
         for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
-            let profile = build_nf_profile("id", host, 7777);
+            let profile = build_nf_profile("id", host, 7777, nextgcore_sbi::types::UriScheme::Http);
             let problems =
                 nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
             assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
+        }
+    }
+}
+
+/// #1791: the registered NFProfile advertises, in every `nfServices[].scheme`,
+/// the scheme this NF's SBI listener serves (TS 29.510 §6.1.6.2.3
+/// `NFService.scheme`): `http` for the cleartext listener, `https` once `--tls`
+/// makes it TLS. This listener ignores NEXTGCORE_SBI_PROFILE (it serves TLS only with `--tls`; #1795), so `--tls` alone decides. `main` passes the listener config's scheme in; the
+/// nextgcore-sbi source guard `every_nf_advertises_its_listener_scheme_1791`
+/// pins that wiring.
+///
+/// REVERT-VERIFIED: with the builder advertising `"http"` again, the TLS case
+/// fails here.
+#[cfg(test)]
+mod tests_advertised_scheme_1791 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_advertises_the_listener_scheme_1791() {
+        let addr: std::net::SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        let plain = nextgcore_sbi::server::SbiServerConfig::new(addr);
+        let tls = nextgcore_sbi::server::SbiServerConfig::new(addr).with_tls("tls.key", "tls.crt");
+        for (cfg, want) in [(plain, "http"), (tls, "https")] {
+            let profile = build_nf_profile("easdf-1791", "10.0.0.1", 7777, cfg.scheme);
+            let services = profile["nfServices"].as_array().expect("nfServices");
+            assert!(!services.is_empty(), "the profile offers services");
+            for svc in services {
+                assert_eq!(
+                    svc["scheme"], want,
+                    "{} must advertise the listener's scheme",
+                    svc["serviceName"]
+                );
+            }
         }
     }
 }

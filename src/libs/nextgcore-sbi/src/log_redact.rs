@@ -53,6 +53,8 @@ pub const CALLBACK_TOKEN_SEGMENTS: [&str; 25] = [
     "n2-info-notify",
     // dccfd's producer event-exposure notificationURI (nextgcore#1518).
     "dccf-data-notify",
+    // smfd's REACHABILITY_REPORT eventNotifyUri (nextgcore#1707).
+    "ue-reachability",
     // amfd's Nudm_SDM callbackReference (nextgcore#1748).
     "sdmsubscription-notify",
     // udmd's Nudr_DM data-change callbackReference (nextgcore#1775).

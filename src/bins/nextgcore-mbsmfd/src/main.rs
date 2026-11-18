@@ -138,6 +138,21 @@ tokio::task_local! {
     pub(crate) static TEST_OAUTH2_CLIENT: Arc<nextgcore_sbi::oauth::OAuth2Client>;
 }
 
+/// #1758: spawn `fut` on its own task, so dropping the caller (a consumer request
+/// whose client went away) does not drop it. Under test the task-local OAuth2
+/// client is carried into the task, as the caller would have seen it.
+pub(crate) fn spawn_detached<F>(fut: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    #[cfg(test)]
+    if let Ok(oauth2) = TEST_OAUTH2_CLIENT.try_with(Arc::clone) {
+        return tokio::spawn(TEST_OAUTH2_CLIENT.scope(oauth2, fut));
+    }
+    tokio::spawn(fut)
+}
+
 /// #1662: `client` with the installed OAuth2 client attached, so a service
 /// request to the `target` producer carries an NRF-issued token (TS 33.501
 /// §13.4.1.1.2, TS 29.500 §6.7.3). Unchanged when no client is installed.
@@ -296,6 +311,8 @@ async fn main() -> Result<()> {
         sbi_server_config = apply_oauth2_enforcement(sbi_server_config, &args.nrf_uri);
     }
 
+    // #1791: the NFProfile advertises the scheme this listener serves.
+    let sbi_scheme = sbi_server_config.scheme;
     let sbi_server = SbiServer::new(sbi_server_config);
 
     log::info!("Starting MB-SMF SBI server on {addr}");
@@ -322,7 +339,7 @@ async fn main() -> Result<()> {
                 move || {
                     let (host, id) = (host.clone(), id.clone());
                     async move {
-                        register_with_nrf(&host, sbi_port, &id)
+                        register_with_nrf(&host, sbi_port, &id, sbi_scheme)
                             .await
                             .map(|()| Some(id))
                     }
@@ -643,8 +660,20 @@ async fn handle_mbs_session_create(request: &SbiRequest) -> SbiResponse {
             // defines no failure cause for "the AMF leg did not complete". A
             // failure is logged and the RAN simply does not have the session,
             // which the log names rather than hides.
+            //
+            // #1758: the create and its record run on their own task, so a consumer
+            // that disconnects mid-ContextCreate cannot leave an AMF context no
+            // release will ever delete; see [`create_amf_mbs_context`].
             match namf_client::discover_amf().await {
-                Some(amf) => match namf_client::context_create(&amf, &session.tmgi).await {
+                Some(amf) => match spawn_detached(create_amf_mbs_context(
+                    session.id,
+                    session.tmgi.clone(),
+                    amf.clone(),
+                ))
+                .await
+                .ok()
+                .flatten()
+                {
                     Some(context_ref) => log::info!(
                         "MBS session {session_id}: AMF {}:{} created MBS context {context_ref}",
                         amf.host,
@@ -891,6 +920,102 @@ async fn handle_mbs_session_update(session_id: &str, request: &SbiRequest) -> Sb
     }
 }
 
+/// #1758: Namf_MBSBroadcast ContextCreate on `amf` for session `session_id`, and
+/// its record, so the session's release can delete it. When the session was
+/// released while the create was in flight (the release found nothing to delete),
+/// the new context is deleted here instead, so the AMF never keeps one this MB-SMF
+/// does not record.
+async fn create_amf_mbs_context(
+    session_id: u64,
+    tmgi: Tmgi,
+    amf: namf_client::DiscoveredAmf,
+) -> Option<namf_client::MbsContextRef> {
+    let context_ref = namf_client::context_create(&amf, &tmgi).await?;
+    let record = AmfMbsContext {
+        host: amf.host,
+        port: amf.port,
+        nf_instance_id: amf.nf_instance_id,
+        context_ref: context_ref.clone(),
+    };
+    let recorded = mbsmf_self()
+        .read()
+        .map(|c| c.record_amf_context(session_id, record.clone()))
+        .unwrap_or(false);
+    if recorded {
+        return Some(context_ref);
+    }
+    log::warn!(
+        "MBS session {session_id} was released while its ContextCreate was in flight; \
+         deleting the AMF context {context_ref}"
+    );
+    release_amf_contexts(vec![record]).await;
+    None
+}
+
+/// #1758: the waits before each retry of a failed ContextDelete.
+#[cfg(not(test))]
+const AMF_RELEASE_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+];
+#[cfg(test)]
+const AMF_RELEASE_RETRY_DELAYS: [Duration; 5] = [Duration::from_millis(20); 5];
+
+/// #1758: Namf_MBSBroadcast ContextDelete for each of `contexts`. 404 is gone. A
+/// failed delete is retried on [`AMF_RELEASE_RETRY_DELAYS`] on a detached task, and
+/// logged at error if every retry fails, rather than forgotten. Returns whether all
+/// were released on the first attempt.
+async fn release_amf_contexts(contexts: Vec<AmfMbsContext>) -> bool {
+    let mut failed = Vec::new();
+    for c in contexts {
+        match namf_client::context_delete(&c).await {
+            namf_client::ContextDeleteOutcome::Deleted
+            | namf_client::ContextDeleteOutcome::Gone => {
+                log::info!(
+                    "MBS: AMF {}:{} released MBS context {}",
+                    c.host,
+                    c.port,
+                    c.context_ref
+                );
+            }
+            namf_client::ContextDeleteOutcome::Failed => failed.push(c),
+        }
+    }
+    if failed.is_empty() {
+        return true;
+    }
+    spawn_detached(async move {
+        for delay in AMF_RELEASE_RETRY_DELAYS {
+            tokio::time::sleep(delay).await;
+            let mut still = Vec::new();
+            for c in failed {
+                if namf_client::context_delete(&c).await
+                    == namf_client::ContextDeleteOutcome::Failed
+                {
+                    still.push(c);
+                }
+            }
+            failed = still;
+            if failed.is_empty() {
+                return;
+            }
+        }
+        for c in &failed {
+            log::error!(
+                "MBS: AMF {}:{} MBS context {} could not be released after {} retries",
+                c.host,
+                c.port,
+                c.context_ref,
+                AMF_RELEASE_RETRY_DELAYS.len()
+            );
+        }
+    });
+    false
+}
+
 /// Handle MBS Session Release (TS 23.247 7.2.3)
 async fn handle_mbs_session_release(session_id: &str) -> SbiResponse {
     log::info!("MBS Session Release: {session_id}");
@@ -915,9 +1040,22 @@ async fn handle_mbs_session_release(session_id: &str) -> SbiResponse {
         }
     });
 
+    // #1758: taken in the same step as the removal (no await between), so a
+    // ContextCreate landing after it sees the session gone and deletes its own.
+    let amf_contexts = match (&removed, ctx.read()) {
+        (Some(session), Ok(context)) => context.take_amf_contexts(session.id),
+        _ => Vec::new(),
+    };
+
     match removed {
         Some(session) => {
             log::info!("MBS Session {session_id} released");
+            // #1758: release the broadcast MBS contexts this session created on its
+            // AMF(s) (TS 23.247 §7.3.2, Namf_MBSBroadcast ContextDelete). On its own
+            // task, so a consumer disconnect cannot drop it; a failure is retried.
+            if !amf_contexts.is_empty() {
+                let _ = spawn_detached(release_amf_contexts(amf_contexts)).await;
+            }
             // For Broadcast sessions: emit BROADCAST_DELIVERY_STATUS/TERMINATED to Status subs.
             if matches!(session.session_type, MbsSessionType::Broadcast) {
                 emit_status_notify(session_id);
@@ -2332,6 +2470,7 @@ fn build_mbsmf_nf_profile(
     nf_instance_id: &str,
     sbi_addr: &str,
     sbi_port: u16,
+    scheme: nextgcore_sbi::types::UriScheme,
 ) -> serde_json::Value {
     let services: Vec<serde_json::Value> = MBSMF_SERVICES
         .iter()
@@ -2341,7 +2480,7 @@ fn build_mbsmf_nf_profile(
                 "serviceInstanceId": format!("{nf_instance_id}-{name}"),
                 "serviceName": name,
                 "versions": [{"apiVersionInUri": "v1", "apiFullVersion": full_version}],
-                "scheme": "http",
+                "scheme": scheme.as_str(),
                 "nfServiceStatus": "REGISTERED",
                 "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
                 "allowedNfTypes": allowed,
@@ -2377,6 +2516,7 @@ async fn register_with_nrf(
     sbi_addr: &str,
     sbi_port: u16,
     nf_instance_id: &str,
+    sbi_scheme: nextgcore_sbi::types::UriScheme,
 ) -> Result<(), String> {
     let sbi_ctx = global_context();
 
@@ -2394,7 +2534,7 @@ async fn register_with_nrf(
     let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
 
-    let nf_profile = build_mbsmf_nf_profile(nf_instance_id, sbi_addr, sbi_port);
+    let nf_profile = build_mbsmf_nf_profile(nf_instance_id, sbi_addr, sbi_port, sbi_scheme);
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     log::debug!("NRF registration: PUT {path}");
@@ -2534,7 +2674,12 @@ mod tests {
     /// "what do I serve".
     #[test]
     fn the_mbsmf_profile_and_self_instance_advertise_one_surface() {
-        let profile = build_mbsmf_nf_profile("mbsmf-test-instance", "10.45.0.14", 7811);
+        let profile = build_mbsmf_nf_profile(
+            "mbsmf-test-instance",
+            "10.45.0.14",
+            7811,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
         let services = profile["nfServices"].as_array().expect("nfServices");
         let names: Vec<&str> = services
             .iter()
@@ -4395,7 +4540,8 @@ mod tests_nf_profile_host_kind_1324 {
     #[test]
     fn the_nf_profile_carries_its_host_by_type() {
         for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
-            let profile = build_mbsmf_nf_profile("id", host, 7777);
+            let profile =
+                build_mbsmf_nf_profile("id", host, 7777, nextgcore_sbi::types::UriScheme::Http);
             let problems =
                 nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
             assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
@@ -4429,5 +4575,38 @@ mod outbound_oauth2_1665_tests {
             super::outbound_oauth2_client(SbiProfile::Dev, false, Some(NRF)).is_none(),
             "dev profile, knob off: no client, the token-free path is unchanged"
         );
+    }
+}
+
+/// #1791: the registered NFProfile advertises, in every `nfServices[].scheme`,
+/// the scheme this NF's SBI listener serves (TS 29.510 §6.1.6.2.3
+/// `NFService.scheme`): `http` for the cleartext listener, `https` once `--tls`
+/// makes it TLS. This listener ignores NEXTGCORE_SBI_PROFILE (it serves TLS only with `--tls`; #1795), so `--tls` alone decides. `main` passes the listener config's scheme in; the
+/// nextgcore-sbi source guard `every_nf_advertises_its_listener_scheme_1791`
+/// pins that wiring.
+///
+/// REVERT-VERIFIED: with the builder advertising `"http"` again, the TLS case
+/// fails here.
+#[cfg(test)]
+mod tests_advertised_scheme_1791 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_advertises_the_listener_scheme_1791() {
+        let addr: std::net::SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        let plain = nextgcore_sbi::server::SbiServerConfig::new(addr);
+        let tls = nextgcore_sbi::server::SbiServerConfig::new(addr).with_tls("tls.key", "tls.crt");
+        for (cfg, want) in [(plain, "http"), (tls, "https")] {
+            let profile = build_mbsmf_nf_profile("mbsmf-1791", "10.0.0.1", 7777, cfg.scheme);
+            let services = profile["nfServices"].as_array().expect("nfServices");
+            assert!(!services.is_empty(), "the profile offers services");
+            for svc in services {
+                assert_eq!(
+                    svc["scheme"], want,
+                    "{} must advertise the listener's scheme",
+                    svc["serviceName"]
+                );
+            }
+        }
     }
 }

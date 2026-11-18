@@ -483,10 +483,22 @@ fn the_profile_offers_the_ingest_service_only_while_serving() {
             .as_array()
             .is_some_and(|ids| ids.iter().any(|e| e == "USER_DATA_CONGESTION"))
     };
-    let off = crate::build_nf_profile("nwdaf-465-p", "10.0.0.5", 7777, &allowed);
+    let off = crate::build_nf_profile(
+        "nwdaf-465-p",
+        "10.0.0.5",
+        7777,
+        nextgcore_sbi::types::UriScheme::Http,
+        &allowed,
+    );
     assert!(find(&off).is_none() && !udc(&off), "{off}");
     let _serving = ServingOnThisThread::new();
-    let on = crate::build_nf_profile("nwdaf-465-p", "10.0.0.5", 7777, &allowed);
+    let on = crate::build_nf_profile(
+        "nwdaf-465-p",
+        "10.0.0.5",
+        7777,
+        nextgcore_sbi::types::UriScheme::Http,
+        &allowed,
+    );
     let svc = find(&on).expect("nnwdaf-randata advertised while serving");
     assert_eq!(svc["allowedNfTypes"], json!(["AF"]));
     assert_eq!(svc["ipEndPoints"][0]["port"], 7777);

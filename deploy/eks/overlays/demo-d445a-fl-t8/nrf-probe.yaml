@@ -1,0 +1,54 @@
+# #1617 step f: the NRF refuses NFRegister from a caller with no verified
+# certificate identity, so scenario.sh's two probe consumers (AF2, an AF, and
+# NW2, a non-AF NWDAF) register with certificates of their own: rows probe-af
+# and probe-nwdaf of docker/rust/certs/nf-identities.txt, issued at deploy time
+# into Secrets nf-tls-probe-af / nf-tls-probe-nwdaf by k8s/nf-tls-secrets.sh.
+# They are mounted in this sidecar only (never the nrf container: each Secret
+# belongs to its own client), one directory per row, 0440 to the pod's fsGroup
+# (999, k8s/manifests/nrf.yaml). The sidecar runs nothing; scenario.sh execs
+# curl in it, dialling https://nrf:7777 (the name nrf.crt carries).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nrf
+  namespace: nextg-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: probe
+          image: nextgcore-rust/nrf:latest
+          command: ["sleep", "infinity"]
+          env:
+            - name: NEXTGCORE_NRF_TLS_SERVER_NAME
+              value: nrf
+            # The instance IDs its certificates name (scenario.sh AF2, NW2).
+            - name: D445A_PROBE_IDS
+              value: "6b1d7e3c-0000-4000-8000-0000000480af 6b1d7e3c-0000-4000-8000-0000000480bb"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 5m
+              memory: 8Mi
+            limits:
+              cpu: 100m
+              memory: 32Mi
+          volumeMounts:
+            - name: nf-tls-probe-af
+              mountPath: /etc/nextgcore/certs/probe-af
+              readOnly: true
+            - name: nf-tls-probe-nwdaf
+              mountPath: /etc/nextgcore/certs/probe-nwdaf
+              readOnly: true
+      volumes:
+        - name: nf-tls-probe-af
+          secret:
+            secretName: nf-tls-probe-af
+            defaultMode: 0440
+        - name: nf-tls-probe-nwdaf
+          secret:
+            secretName: nf-tls-probe-nwdaf
+            defaultMode: 0440

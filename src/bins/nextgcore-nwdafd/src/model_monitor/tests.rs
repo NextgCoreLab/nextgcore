@@ -281,7 +281,7 @@ async fn nrf(anlf_id: &'static str, anlf_port: u16) -> (nextgcore_sbi::SbiServer
         }
         let profile = json!({ "nfInstances": [{
             "nfInstanceId": anlf_id, "nfType": "NWDAF",
-            "nfServices": [nf_service(anlf_id, "127.0.0.1", anlf_port)]
+            "nfServices": [nf_service(anlf_id, "127.0.0.1", anlf_port, nextgcore_sbi::types::UriScheme::Http)]
         }]});
         SbiResponse::with_status(200)
             .with_json_body(&profile)
@@ -977,7 +977,7 @@ async fn a_deregister_during_the_subscribe_leaves_nothing() {
             release.notified().await;
             let profile = json!({ "nfInstances": [{
                 "nfInstanceId": anlf_id, "nfType": "NWDAF",
-                "nfServices": [nf_service(anlf_id, "127.0.0.1", anlf_port)]
+                "nfServices": [nf_service(anlf_id, "127.0.0.1", anlf_port, nextgcore_sbi::types::UriScheme::Http)]
             }]});
             SbiResponse::with_status(200)
                 .with_json_body(&profile)

@@ -603,6 +603,8 @@ pub async fn run() -> Result<()> {
         nextgcore_sbi::types::NfType::Udm,
         &nrf_uri,
     )?;
+    // #1791: the NFProfile advertises the scheme this listener serves.
+    let sbi_scheme = sbi_server_config.scheme;
     // #1421: the callbacks this UDM subscribed for are admitted on their own
     // token when the listener requires OAuth2 (a notification carries no bearer).
     let sbi_server = sbi_server(sbi_server_config);
@@ -642,7 +644,7 @@ pub async fn run() -> Result<()> {
                 move || {
                     let host = host.clone();
                     async move {
-                        register_with_nrf(&host, port)
+                        register_with_nrf(&host, port, sbi_scheme)
                             .await
                             .map(nextgcore_sbi::heartbeat::registered_id)
                     }
@@ -655,6 +657,7 @@ pub async fn run() -> Result<()> {
                         nf_instance_id.clone(),
                         nes_host,
                         port,
+                        sbi_scheme,
                     );
                     // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
                     // (registered UEs vs configured capacity; TS 29.510 §5.2.2.3.2).
@@ -3814,11 +3817,15 @@ async fn run_event_loop_async(udm_sm: &mut UdmSmContext, shutdown: Arc<AtomicBoo
 ///
 /// Returns the NF instance ID on success so the caller can start a heartbeat
 /// worker.
-async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, String> {
+async fn register_with_nrf(
+    sbi_addr: &str,
+    sbi_port: u16,
+    sbi_scheme: nextgcore_sbi::types::UriScheme,
+) -> Result<String, String> {
     let nf_instance_id =
         nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Udm)
             .to_string();
-    register_with_nrf_id(&nf_instance_id, sbi_addr, sbi_port).await
+    register_with_nrf_id(&nf_instance_id, sbi_addr, sbi_port, sbi_scheme).await
 }
 
 /// Register — or, for the issue #22 NES resume path, RE-register — the UDM
@@ -3834,18 +3841,24 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
 /// wrapper because the operator knobs come from the process-global context,
 /// which the callers here already have and the library builder should not reach
 /// into.
-fn build_udm_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
+fn build_udm_nf_profile(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+    scheme: nextgcore_sbi::types::UriScheme,
+) -> serde_json::Value {
     let config = udm_self()
         .read()
         .map(|ctx| ctx.nf_profile_config())
         .unwrap_or_default();
-    crate::sbi_path::build_udm_nf_profile(nf_instance_id, sbi_addr, sbi_port, &config)
+    crate::sbi_path::build_udm_nf_profile(nf_instance_id, sbi_addr, sbi_port, scheme, &config)
 }
 
 pub(crate) async fn register_with_nrf_id(
     nf_instance_id: &str,
     sbi_addr: &str,
     sbi_port: u16,
+    sbi_scheme: nextgcore_sbi::types::UriScheme,
 ) -> Result<String, String> {
     let sbi_ctx = nextgcore_sbi::context::global_context();
 
@@ -3863,7 +3876,7 @@ pub(crate) async fn register_with_nrf_id(
     let (nrf_host, nrf_port) = parse_nrf_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
 
-    let nf_profile = build_udm_nf_profile(nf_instance_id, sbi_addr, sbi_port);
+    let nf_profile = build_udm_nf_profile(nf_instance_id, sbi_addr, sbi_port, sbi_scheme);
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     let response = client
@@ -3930,7 +3943,12 @@ mod tests {
         // router discards the version segment (`let _version = parts[1]`), the
         // mismatch was invisible between our own NFs but would 404 against a
         // strict v2 producer, and discovery handed consumers the wrong URI.
-        let profile = build_udm_nf_profile("udm-test-instance", "10.45.0.10", 7777);
+        let profile = build_udm_nf_profile(
+            "udm-test-instance",
+            "10.45.0.10",
+            7777,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
 
         assert_eq!(
             advertised_version(&profile, "nudm-sdm"),
@@ -3965,7 +3983,12 @@ mod tests {
     /// where otherwise it finds no producer and says so.
     #[test]
     fn the_udm_profile_advertises_every_implemented_nudm_service() {
-        let profile = build_udm_nf_profile("udm-test-instance", "10.45.0.10", 7777);
+        let profile = build_udm_nf_profile(
+            "udm-test-instance",
+            "10.45.0.10",
+            7777,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
         let names: Vec<&str> = profile["nfServices"]
             .as_array()
             .expect("nfServices")
@@ -6700,7 +6723,12 @@ mod tests {
             context.set_nf_profile_config(crate::context::NfProfileConfig::default());
         }
 
-        let profile = build_udm_nf_profile("udm-1", "10.45.0.10", 7777);
+        let profile = build_udm_nf_profile(
+            "udm-1",
+            "10.45.0.10",
+            7777,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
         let names: Vec<String> = profile["nfServices"]
             .as_array()
             .expect("nfServices")
@@ -6738,7 +6766,12 @@ mod tests {
                 allowed_nf_types: vec!["NEF".to_string()],
             });
         }
-        let profile = build_udm_nf_profile("udm-1", "10.45.0.10", 7777);
+        let profile = build_udm_nf_profile(
+            "udm-1",
+            "10.45.0.10",
+            7777,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
         assert_eq!(profile["heartBeatTimer"], 42);
         assert_eq!(profile["allowedNfTypes"], serde_json::json!(["NEF"]));
 

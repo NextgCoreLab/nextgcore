@@ -225,6 +225,21 @@ tokio::task_local! {
     pub(crate) static TEST_OAUTH2_CLIENT: Arc<nextgcore_sbi::oauth::OAuth2Client>;
 }
 
+/// #1755: spawn `fut` on its own task, so dropping the caller (a consumer request
+/// whose client went away) does not drop it. Under test the task-local OAuth2
+/// client is carried into the task, as the caller would have seen it.
+pub(crate) fn spawn_detached<F>(fut: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    #[cfg(test)]
+    if let Ok(oauth2) = TEST_OAUTH2_CLIENT.try_with(Arc::clone) {
+        return tokio::spawn(TEST_OAUTH2_CLIENT.scope(oauth2, fut));
+    }
+    tokio::spawn(fut)
+}
+
 /// #1663: `client` with the installed OAuth2 client attached, so a service
 /// request to the `target` producer carries an NRF-issued token (TS 33.501
 /// §13.4.1.1.2, TS 29.500 §6.7.3). Unchanged when no client is installed.
@@ -369,6 +384,8 @@ async fn main() -> Result<()> {
         sbi_config = apply_oauth2_enforcement(sbi_config, &args.nrf_uri);
     }
 
+    // #1791: the NFProfile advertises the scheme this listener serves.
+    let sbi_scheme = sbi_config.scheme;
     let sbi_server = SbiServer::new(sbi_config);
     sbi_server
         .start(dccf_request_handler)
@@ -389,7 +406,7 @@ async fn main() -> Result<()> {
                 move || {
                     let (host, id) = (host.clone(), id.clone());
                     async move {
-                        register_with_nrf(&host, sbi_port, &id)
+                        register_with_nrf(&host, sbi_port, &id, sbi_scheme)
                             .await
                             .map(|()| Some(id))
                     }
@@ -482,7 +499,12 @@ fn build_dccf_nf_instance(
 /// list without standing up an NRF. Each service carries its own `ipEndPoints`
 /// and `allowedNfTypes`; the NF-level `allowedNfTypes` is the UNION over the
 /// services, since a type barred at NF level can never reach any service.
-fn build_dccf_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
+fn build_dccf_nf_profile(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+    scheme: nextgcore_sbi::types::UriScheme,
+) -> serde_json::Value {
     let services: Vec<serde_json::Value> = DCCF_SERVICES
         .iter()
         .map(|(service_type, allowed)| {
@@ -491,7 +513,7 @@ fn build_dccf_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) ->
                 "serviceInstanceId": format!("{nf_instance_id}-{name}"),
                 "serviceName": name,
                 "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                "scheme": "http",
+                "scheme": scheme.as_str(),
                 "nfServiceStatus": "REGISTERED",
                 "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
                 "allowedNfTypes": allowed,
@@ -527,6 +549,7 @@ async fn register_with_nrf(
     sbi_addr: &str,
     sbi_port: u16,
     nf_instance_id: &str,
+    sbi_scheme: nextgcore_sbi::types::UriScheme,
 ) -> Result<(), String> {
     let sbi_ctx = global_context();
 
@@ -544,7 +567,7 @@ async fn register_with_nrf(
     let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
 
-    let nf_profile = build_dccf_nf_profile(nf_instance_id, sbi_addr, sbi_port);
+    let nf_profile = build_dccf_nf_profile(nf_instance_id, sbi_addr, sbi_port, sbi_scheme);
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     log::debug!("NRF registration: PUT {path}");
@@ -782,7 +805,10 @@ const PRODUCER_NOTIFY_SEGMENT: &str = "dccf-data-notify";
 /// notification is built per target rather than once and broadcast.
 async fn handle_dm_notify(token: &str, req: &SbiRequest) -> SbiResponse {
     if dccf_context_producer_for_token(token).is_none() {
-        return send_not_found("no producer subscription holds this callback", None);
+        return send_not_found(
+            "no producer subscription holds this callback",
+            Some("SUBSCRIPTION_NOT_FOUND"),
+        );
     }
     let raw = req.http.content.as_deref().unwrap_or("{}");
     let body: serde_json::Value = match serde_json::from_str(raw) {
@@ -803,7 +829,10 @@ async fn handle_dm_notify(token: &str, req: &SbiRequest) -> SbiResponse {
     );
 
     let Some(targets) = dccf_context_fanout_for_token(token, &notif_scope) else {
-        return send_not_found("no producer subscription holds this callback", None);
+        return send_not_found(
+            "no producer subscription holds this callback",
+            Some("SUBSCRIPTION_NOT_FOUND"),
+        );
     };
     let timestamp = rfc3339_now();
     for (sub_id, notify_uri, notif_corr_id) in targets {
@@ -1037,7 +1066,14 @@ mod data_management_tests {
     /// on.
     use context::GLOBAL_TEST_LOCK as TEST_GUARD;
 
+    /// #1785: also selects the Dev SBI profile, which every test here needs for its
+    /// loopback-plaintext peers (the default is Production, whose peer clients
+    /// speak TLS). `a_consumer_answering_404_loses_its_subscription_1747` relied on
+    /// a sibling having set it: run alone, or first, its fan-out to the stand-in
+    /// consumer failed and the subscription was never removed. Set and never
+    /// reset, as the CONVENTIONS profile rule requires.
     fn init() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         dccf_context_init(256);
     }
 
@@ -1147,7 +1183,12 @@ mod data_management_tests {
     /// an analytics context could not find this DCCF by service name.
     #[test]
     fn the_dccf_profile_advertises_both_routed_ndccf_services() {
-        let profile = build_dccf_nf_profile("dccf-test-instance", "10.45.0.12", 7813);
+        let profile = build_dccf_nf_profile(
+            "dccf-test-instance",
+            "10.45.0.12",
+            7813,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
         let names: Vec<&str> = profile["nfServices"]
             .as_array()
             .expect("nfServices")
@@ -1186,7 +1227,12 @@ mod data_management_tests {
     #[test]
     fn the_dccf_self_instance_matches_the_registered_profile() {
         let instance = build_dccf_nf_instance("dccf-test-instance", "10.45.0.12", 7813);
-        let profile = build_dccf_nf_profile("dccf-test-instance", "10.45.0.12", 7813);
+        let profile = build_dccf_nf_profile(
+            "dccf-test-instance",
+            "10.45.0.12",
+            7813,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
 
         let mut from_instance: Vec<String> =
             instance.services.iter().map(|s| s.name.clone()).collect();
@@ -1727,6 +1773,18 @@ mod data_management_tests {
                 404,
                 "a token no producer subscription holds"
             );
+            // #1755: with SUBSCRIPTION_NOT_FOUND (TS 29.500 Table 5.2.7.2-1), so the
+            // producer terminates the subscription rather than retrying.
+            let refused = send(notify_path("0123456789abcdef0123456789abcdef")).await;
+            assert!(
+                refused
+                    .http
+                    .content
+                    .as_deref()
+                    .is_some_and(|b| b.contains("\"SUBSCRIPTION_NOT_FOUND\"")),
+                "the 404 names SUBSCRIPTION_NOT_FOUND: {:?}",
+                refused.http.content
+            );
             assert_eq!(
                 send("/ndccf-datamanagement/v1/notify".to_string())
                     .await
@@ -2129,7 +2187,8 @@ mod data_management_tests {
     /// reusing one that is never made.
     ///
     /// REVERT-VERIFIED: with `InFlightClaim`'s drop not abandoning, the next claim is
-    /// `Reused` onto the wedged entry.
+    /// `Reused` onto the wedged entry. Since #1755 the claim outlives the cancelled
+    /// request (its create runs on its own task) and is abandoned when that fails.
     #[test]
     fn r7_cancelled_create_wedges_scope() {
         let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
@@ -2164,9 +2223,25 @@ mod data_management_tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             task.abort();
             assert!(task.await.unwrap_err().is_cancelled());
+            // #1755: the create is owned by its own task, so cancelling the consumer's
+            // request leaves it in flight rather than abandoning it under a producer
+            // that may already have accepted it.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                context::dccf_context_holds_producer_sub(&scope),
+                "still in flight on its own task after the consumer's request is cancelled"
+            );
+            // The NRF drops its connections: discovery fails, and the task abandons.
+            hold.abort();
+            for _ in 0..300 {
+                if !context::dccf_context_holds_producer_sub(&scope) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             assert!(
                 !context::dccf_context_holds_producer_sub(&scope),
-                "abandoned on cancel"
+                "abandoned when the create fails"
             );
             assert!(matches!(
                 context::dccf_context_claim_producer_sub("next", &scope, Some("amf-1")),
@@ -2174,7 +2249,158 @@ mod data_management_tests {
             ));
             dccf_context_release_producer_sub("next");
             coordination::set_coordination_for_test(None);
-            hold.abort();
+        });
+        clear_subscriptions();
+    }
+
+    /// #1755: a producer that holds a create's 201 until `release`, signalling
+    /// `arrived` when the POST lands. DELETEs are answered 204. Every request is
+    /// recorded.
+    async fn holding_producer() -> (
+        SbiServer,
+        u16,
+        Arc<StdMutex<Vec<(String, String)>>>,
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let location: Arc<StdMutex<String>> = Arc::default();
+        let (a, r, loc) = (arrived.clone(), release.clone(), location.clone());
+        let (producer, port, seen) = stub(move |req: SbiRequest| {
+            let (a, r, loc) = (a.clone(), r.clone(), loc.clone());
+            async move {
+                if req.header.method == "POST" {
+                    a.notify_one();
+                    r.notified().await;
+                    let l = loc.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    return SbiResponse::created().with_header("Location", l);
+                }
+                SbiResponse::no_content()
+            }
+        })
+        .await;
+        *location.lock().unwrap_or_else(|e| e.into_inner()) =
+            format!("http://127.0.0.1:{port}/namf-evts/v1/subscriptions/held");
+        (producer, port, seen, arrived, release)
+    }
+
+    /// Start a targeted consumer subscribe and cancel it once the producer holds its
+    /// create: the consumer's client went away mid-POST. Returns the consumer's id.
+    async fn subscribe_then_cancel_mid_post(arrived: &tokio::sync::Notify) -> String {
+        let task = tokio::spawn(dccf_request_handler(
+            SbiRequest::post("/ndccf-datamanagement/v1/subscriptions")
+                .with_body(targeted_body("corr-1755"), "application/json"),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), arrived.notified())
+            .await
+            .expect("the producer receives the create");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        context::dccf_context_subscription_ids()[0].clone()
+    }
+
+    /// #1755 (failure-path check 3): a consumer subscribe cancelled while the
+    /// producer holds its 201 still records the producer subscription, so the
+    /// consumer's later unsubscribe deletes it at the producer.
+    ///
+    /// REVERT-VERIFIED: with the create awaited inline again, the claim is abandoned
+    /// on cancel, nothing is recorded and the unsubscribe sends no DELETE.
+    #[test]
+    fn a_subscribe_cancelled_mid_post_still_records_the_producer_subscription_1755() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        init();
+        clear_subscriptions();
+        futures_lite_block_on(async {
+            let (producer, producer_port, seen, arrived, release) = holding_producer().await;
+            let (nrf, nrf_port) = nrf_for(producer_port).await;
+            coordinate_via(nrf_port);
+            let scope = targeted_scope();
+            let id = subscribe_then_cancel_mid_post(&arrived).await;
+
+            release.notify_one();
+            let mut recorded = None;
+            for _ in 0..300 {
+                recorded = context::dccf_context_producer_resource(&scope);
+                if recorded.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                recorded.as_deref(),
+                Some(
+                    format!("http://127.0.0.1:{producer_port}/namf-evts/v1/subscriptions/held")
+                        .as_str()
+                ),
+                "the producer's late 201 is recorded against the claim"
+            );
+
+            assert!(remove_consumer_subscription(&id).await);
+            let mut deleted = false;
+            for _ in 0..300 {
+                deleted = seen
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .any(|(m, p)| m == "DELETE" && p.ends_with("/subscriptions/held"));
+                if deleted {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                deleted,
+                "the unsubscribe deletes it: {:?}",
+                seen.lock().unwrap()
+            );
+            coordination::set_coordination_for_test(None);
+            producer.stop().await.ok();
+            nrf.stop().await.ok();
+        });
+        clear_subscriptions();
+    }
+
+    /// #1755: a subscribe cancelled mid-POST whose consumer then unsubscribes while
+    /// the producer still holds the 201: the late 201 is deleted at the producer.
+    ///
+    /// REVERT-VERIFIED: with the create awaited inline again, the 201 is never read
+    /// and the producer sees no DELETE.
+    #[test]
+    fn a_subscribe_cancelled_mid_post_then_unsubscribed_deletes_the_late_201_1755() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        init();
+        clear_subscriptions();
+        futures_lite_block_on(async {
+            let (producer, producer_port, seen, arrived, release) = holding_producer().await;
+            let (nrf, nrf_port) = nrf_for(producer_port).await;
+            coordinate_via(nrf_port);
+            let scope = targeted_scope();
+            let id = subscribe_then_cancel_mid_post(&arrived).await;
+            assert!(remove_consumer_subscription(&id).await);
+
+            release.notify_one();
+            let mut deleted = false;
+            for _ in 0..300 {
+                deleted = seen
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .any(|(m, p)| m == "DELETE" && p.ends_with("/subscriptions/held"));
+                if deleted {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                deleted,
+                "the late 201 is deleted: {:?}",
+                seen.lock().unwrap()
+            );
+            assert!(!context::dccf_context_holds_producer_sub(&scope));
+            coordination::set_coordination_for_test(None);
+            producer.stop().await.ok();
+            nrf.stop().await.ok();
         });
         clear_subscriptions();
     }
@@ -2380,7 +2606,8 @@ mod tests_nf_profile_host_kind_1324 {
     #[test]
     fn the_nf_profile_carries_its_host_by_type() {
         for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
-            let profile = build_dccf_nf_profile("id", host, 7777);
+            let profile =
+                build_dccf_nf_profile("id", host, 7777, nextgcore_sbi::types::UriScheme::Http);
             let problems =
                 nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
             assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
@@ -2414,5 +2641,38 @@ mod outbound_oauth2_1665_tests {
             super::outbound_oauth2_client(SbiProfile::Dev, false, Some(NRF)).is_none(),
             "dev profile, knob off: no client, the token-free path is unchanged"
         );
+    }
+}
+
+/// #1791: the registered NFProfile advertises, in every `nfServices[].scheme`,
+/// the scheme this NF's SBI listener serves (TS 29.510 §6.1.6.2.3
+/// `NFService.scheme`): `http` for the cleartext listener, `https` once `--tls`
+/// makes it TLS. This listener ignores NEXTGCORE_SBI_PROFILE (it serves TLS only with `--tls`; #1795), so `--tls` alone decides. `main` passes the listener config's scheme in; the
+/// nextgcore-sbi source guard `every_nf_advertises_its_listener_scheme_1791`
+/// pins that wiring.
+///
+/// REVERT-VERIFIED: with the builder advertising `"http"` again, the TLS case
+/// fails here.
+#[cfg(test)]
+mod tests_advertised_scheme_1791 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_advertises_the_listener_scheme_1791() {
+        let addr: std::net::SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        let plain = nextgcore_sbi::server::SbiServerConfig::new(addr);
+        let tls = nextgcore_sbi::server::SbiServerConfig::new(addr).with_tls("tls.key", "tls.crt");
+        for (cfg, want) in [(plain, "http"), (tls, "https")] {
+            let profile = build_dccf_nf_profile("dccf-1791", "10.0.0.1", 7777, cfg.scheme);
+            let services = profile["nfServices"].as_array().expect("nfServices");
+            assert!(!services.is_empty(), "the profile offers services");
+            for svc in services {
+                assert_eq!(
+                    svc["scheme"], want,
+                    "{} must advertise the listener's scheme",
+                    svc["serviceName"]
+                );
+            }
+        }
     }
 }

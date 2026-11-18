@@ -34,6 +34,14 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   MongoDB with compose `depends_on` health conditions (#420).
 
 ### Changed
+- **Breaking:** nrfd refuses NFRegister / NFUpdate / NFDeregister from a caller with no verified
+  client certificate identity (`urn:uuid:` URI SAN, TS 33.310 §6.1.3c.3), plaintext included:
+  `400 INVALID_CLIENT`, nothing stored (#1617 step f, operator decision). There is no opt-out.
+  Every shipped stack (compose, Kind, EKS overlays, Helm) already presents NF certificates; a
+  cleartext NRF now serves discovery and tokens only, and WARNs at startup. The d445a scenario's
+  probe consumers register from a `probe` sidecar on the nrf pod with their own certificates (rows
+  `probe-af`, `probe-nwdaf`). An NRF that does not register itself drops its own entry restored
+  from the state file. Tests that run a real nrfd use `nextgcore_sbi::test_support::DevPki`.
 - The compose stacks run NF -> NRF over TLS (#1617). Each stack's NRF serves TLS on its one SBI
   listener and asks every client for a certificate (`client_auth: optional`). A new one-shot
   `sbi-tls` service issues the dev PKI (`certs/generate-dev-certs.sh`) into a volume only it
