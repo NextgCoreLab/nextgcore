@@ -583,7 +583,7 @@ services:
     environment:
       <<: *common-env
       # Pinned to the URN of certs/mbsmf.crt (certs/nf-identities.txt, #1617).
-      NEXTGCORE_MBSMF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-0000000b05f0
+      NEXTGCORE_MB_SMF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-0000000b05f0
       NEXTGCORE_NRF_TLS_CLIENT_CERT: /etc/nextgcore/certs/mbsmf.crt
       NEXTGCORE_NRF_TLS_CLIENT_KEY: /etc/nextgcore/certs/mbsmf.key
     command: ["--sbi-addr", "172.23.0.33", "--sbi-port", "7777", "--nrf-uri", "https://172.23.0.10:7777"]

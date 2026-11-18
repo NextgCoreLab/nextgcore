@@ -196,7 +196,40 @@ static OAUTH2_CLIENT: OnceLock<Option<Arc<OAuth2Client>>> = OnceLock::new();
 /// The shared OAuth2 client, if SBI OAuth2 enforcement is enabled. Outbound
 /// SBI clients attach tokens via [`attach_oauth2`].
 fn oauth2_client() -> Option<Arc<OAuth2Client>> {
+    #[cfg(test)]
+    if let Some(client) = OAUTH2_CLIENT_TEST_OVERRIDE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    {
+        return Some(client);
+    }
     OAUTH2_CLIENT.get().and_then(|opt| opt.clone())
+}
+
+/// Tests: an OAuth2 client that [`oauth2_client`] returns instead of the once-set
+/// production one, so a test can drive the enforcement-on path without turning it
+/// on for the whole process. Test lock: `context::NSSF_TEST_LOCK`, taken through
+/// `context::nssf_test_guard`.
+#[cfg(test)]
+static OAUTH2_CLIENT_TEST_OVERRIDE: std::sync::RwLock<Option<Arc<OAuth2Client>>> =
+    std::sync::RwLock::new(None);
+
+/// The outbound client for a **service request** to the `target` producer at
+/// `host:port` (#1660).
+///
+/// With an outbound OAuth2 client installed, it carries an NRF-issued Bearer token
+/// scoped to `target` (TS 33.501 §13.4.1.1.2, TS 29.500 §6.7.3). It is cached per
+/// peer, so its connection is reused (`SbiContext::get_tokened_client`, #1659).
+/// Without one it is the process-wide pooled client. Only for discovered or
+/// configured peers: a notification to a callback URI carries no token and does
+/// not come through here.
+async fn peer_client(host: &str, port: u16, target: NfType) -> Arc<SbiClient> {
+    let ctx = nextgcore_sbi::context::global_context();
+    match oauth2_client() {
+        Some(oauth2) => ctx.get_tokened_client(host, port, target, oauth2).await,
+        None => ctx.get_client(host, port).await,
+    }
 }
 
 /// #1665: the outbound OAuth2 client this NSSF installs at startup: under the
@@ -3158,12 +3191,17 @@ async fn handle_subscription_patch(subscription_id: &str, request: &SbiRequest) 
 /// §6.1.6.3.3 constrains, and it was previously the non-normative `HOME_ROUTED`
 /// with no test able to see it (#93).
 fn build_hnssf_query_path(param: &nnssf_handler::NsSelectionParam) -> String {
+    // #1660: every value is percent-encoded (RFC 3986 query component). The JSON
+    // slice-info value carries `{`, `"` and `:`, which no URI may hold raw, so
+    // before this the client refused the URI ("invalid uri character") and the
+    // query never left the process.
+    use nextgcore_sbi::uri_encode::encode_query_value;
     let mut query_parts = vec![format!(
         "nf-type={}",
-        param.nf_type.as_deref().unwrap_or("AMF")
+        encode_query_value(param.nf_type.as_deref().unwrap_or("AMF"))
     )];
     if let Some(ref nf_id) = param.nf_id {
-        query_parts.push(format!("nf-id={nf_id}"));
+        query_parts.push(format!("nf-id={}", encode_query_value(nf_id)));
     }
     if let Some(ref snssai) = param.slice_info_for_pdu_session.snssai {
         // TS 29.531 §6.1.6.3.3: the normative token. This emitted the
@@ -3176,7 +3214,10 @@ fn build_hnssf_query_path(param: &nnssf_handler::NsSelectionParam) -> String {
         if let Some(sd) = snssai.sd {
             si["sNssai"]["sd"] = serde_json::json!(format!("{:06x}", sd));
         }
-        query_parts.push(format!("slice-info-request-for-pdu-session={si}"));
+        query_parts.push(format!(
+            "slice-info-request-for-pdu-session={}",
+            encode_query_value(&si.to_string())
+        ));
     }
     format!(
         "/nnssf-nsselection/v2/network-slice-information?{}",
@@ -3214,7 +3255,9 @@ async fn send_hnssf_query(
         .ok_or("No H-NSSF endpoint address available")?;
     let port = nssf_service.port;
 
-    let client = sbi_ctx.get_client(host, port).await;
+    // #1660: the H-NSSF is an NSSF producer like any other: the query carries the
+    // NRF-issued token scoped to NSSF, or an OAuth2-required H-NSSF answers 401.
+    let client = peer_client(host, port, NfType::Nssf).await;
 
     let path = build_hnssf_query_path(param);
 
@@ -5623,7 +5666,13 @@ nssf:
         param.slice_info_for_pdu_session.presence = true;
         param.slice_info_for_pdu_session.snssai = Some(context::SNssai::new(1, Some(0x0000AB)));
 
-        let path = build_hnssf_query_path(&param);
+        let wire = build_hnssf_query_path(&param);
+        // #1660: the URI is percent-encoded, as the H-NSSF's server decodes it.
+        let path = nextgcore_sbi::uri_encode::decode_query_value(&wire);
+        assert!(
+            wire.bytes().all(|b| b.is_ascii_graphic()) && !wire.contains(['{', '"']),
+            "every query value is percent-encoded: {wire}"
+        );
         assert!(
             path.contains("\"roamingIndication\":\"HOME_ROUTED_ROAMING\""),
             "the H-NSSF query must carry the normative token, got: {path}"
@@ -5639,6 +5688,225 @@ nssf:
             path.contains("\"sd\":\"0000ab\""),
             "sd must be 6 hex digits: {path}"
         );
+    }
+
+    /// #1660: an H-NSSF stand-in on `port` for [`send_hnssf_query`]'s tests, found
+    /// the way the query finds it: an NSSF instance with an `nnssf-nsselection`
+    /// service in the SBI context. Any other NSSF instance is removed first, so
+    /// the query cannot pick a sibling's.
+    async fn hnssf_instance_1660(id: &str, port: u16) {
+        use nextgcore_sbi::context::{NfInstance, NfService};
+        use nextgcore_sbi::types::SbiServiceType;
+        let sbi_ctx = nextgcore_sbi::context::global_context();
+        for inst in sbi_ctx.find_nf_instances_by_type(NfType::Nssf).await {
+            sbi_ctx.remove_nf_instance(&inst.id).await;
+        }
+        let mut instance = NfInstance::new(id, NfType::Nssf);
+        instance.ipv4_addresses.push("127.0.0.1".to_string());
+        let mut svc = NfService::new("nnssf-nsselection", SbiServiceType::NnssfNsselection);
+        svc.port = port;
+        instance.add_service(svc);
+        sbi_ctx
+            .add_nf_instance_with_validity(instance, Duration::from_secs(3600))
+            .await;
+    }
+
+    /// #1660: a home-routed NSSelection that needs the H-NSSF: one home entry, and
+    /// the parameters that name it.
+    fn hnssf_home_1660(sst: u8) -> (u64, nnssf_handler::NsSelectionParam) {
+        let home_id = with_nssf_context(|c| {
+            c.home_add(
+                &context::PlmnId::new("001", "01"),
+                &context::SNssai::new(sst, None),
+            )
+            .expect("home added")
+            .id
+        })
+        .expect("context available");
+        let mut param = nnssf_handler::NsSelectionParam {
+            nf_id: Some("vnssf-1660".to_string()),
+            nf_type: Some("NSSF".to_string()),
+            ..Default::default()
+        };
+        param.slice_info_for_pdu_session.presence = true;
+        param.slice_info_for_pdu_session.snssai = Some(context::SNssai::new(sst, None));
+        (home_id, param)
+    }
+
+    fn home_nrf_1660(home_id: u64) -> Option<String> {
+        with_nssf_context(|c| c.home_find_by_id(home_id))
+            .flatten()
+            .and_then(|home| home.nrf_id)
+    }
+
+    /// #1660, TS 33.501 §13.4.1.1.2 and TS 29.500 §6.7.3: the H-NSSF NSSelection
+    /// query presents the NRF-issued token, scoped to NSSF, so an OAuth2-required
+    /// H-NSSF serves it and the answer is stored. The H-NSSF stand-in is gated by
+    /// nextgcore-sbi's own producer check (JWKS, audience NSSF), so a recorded
+    /// request is one that passed it. The same query with no outbound OAuth2 client
+    /// is refused 401 and stores nothing, which shows that the gate is live.
+    ///
+    /// REVERT-VERIFIED: with `send_hnssf_query` back on the token-less
+    /// `get_client`, the tokened query fails "H-NSSF returned status 401" here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
+    async fn the_hnssf_query_passes_an_oauth2_required_hnssf_1660() {
+        use nextgcore_sbi::test_support::oauth2 as stand_in;
+        let _guard = context::nssf_test_guard(512);
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let sk = nextgcore_sbi::oauth::generate_es256_key();
+        let (_nrf, nrf_port) = stand_in::token_nrf(sk.clone()).await;
+        let (hnssf, hnssf_port, seen) = stand_in::oauth2_producer(&sk, NfType::Nssf, |_| {
+            SbiResponse::with_status(200)
+                .with_json_body(&json!({
+                    "nsiInformation": {
+                        "nrfId": "http://nrf-home-1660:7777",
+                        "nsiId": "nsi-home-1660"
+                    }
+                }))
+                .expect("json")
+        })
+        .await;
+        hnssf_instance_1660("hnssf-1660", hnssf_port).await;
+        let (home_id, param) = hnssf_home_1660(16);
+
+        let bare = send_hnssf_query(home_id, &param).await;
+        let bare_stored = home_nrf_1660(home_id);
+        *OAUTH2_CLIENT_TEST_OVERRIDE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(stand_in::oauth2_client_for(nrf_port, NfType::Nssf));
+        let tokened = send_hnssf_query(home_id, &param).await;
+        *OAUTH2_CLIENT_TEST_OVERRIDE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let tokened_stored = home_nrf_1660(home_id);
+        nextgcore_sbi::context::global_context()
+            .remove_nf_instance("hnssf-1660")
+            .await;
+        with_nssf_context(|c| c.home_remove_all());
+        hnssf.stop().await.expect("stop");
+
+        let bare_err = bare.expect_err("a bare query is refused");
+        assert!(bare_err.contains("401"), "the gate's 401: {bare_err}");
+        assert_eq!(bare_stored, None, "a refused query stores nothing");
+        let nsi = tokened.expect("the tokened query is served");
+        assert_eq!(nsi.nrf_id, "http://nrf-home-1660:7777");
+        assert_eq!(nsi.nsi_id, "nsi-home-1660");
+        assert_eq!(
+            tokened_stored.as_deref(),
+            Some("http://nrf-home-1660:7777"),
+            "the H-NSSF's answer is stored against the home entry"
+        );
+        assert_eq!(
+            stand_in::bearer_requests(
+                &seen,
+                "GET",
+                "/nnssf-nsselection/v2/network-slice-information"
+            ),
+            1,
+            "exactly one query passed the gate, with a bearer"
+        );
+    }
+
+    /// #1660, failure-path property 4 (both peers): the query against nssfd's REAL
+    /// NSSelection handler as the H-NSSF, behind an OAuth2-required listener
+    /// (nextgcore-sbi's gate, audience NSSF). The H-NSSF decodes the
+    /// percent-encoded slice-info value and answers from its own NSI for the
+    /// S-NSSAI. Without the token the listener refuses with 401.
+    ///
+    /// REVERT-VERIFIED: with `send_hnssf_query` back on `get_client`, the tokened
+    /// query fails "H-NSSF returned status 401"; with the slice-info value sent
+    /// unencoded, the query fails "invalid uri character" before it is sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
+    async fn the_hnssf_query_reaches_the_real_nssf_handler_behind_its_gate_1660() {
+        use nextgcore_sbi::test_support::oauth2 as stand_in;
+        let _guard = context::nssf_test_guard(512);
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let sk = nextgcore_sbi::oauth::generate_es256_key();
+        let (_nrf, nrf_port) = stand_in::token_nrf(sk.clone()).await;
+        let (hnssf, hnssf_port) =
+            start_nssf_server_oauth2(stand_in::jwks_for(&sk, stand_in::TEST_NRF_KID)).await;
+        with_nssf_context(|c| c.nsi_add("http://nrf-home-1660b:7777", 18, None))
+            .expect("context available");
+        hnssf_instance_1660("hnssf-1660-real", hnssf_port).await;
+        let (home_id, param) = hnssf_home_1660(18);
+
+        let bare = send_hnssf_query(home_id, &param).await;
+        *OAUTH2_CLIENT_TEST_OVERRIDE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(stand_in::oauth2_client_for(nrf_port, NfType::Nssf));
+        let tokened = send_hnssf_query(home_id, &param).await;
+        *OAUTH2_CLIENT_TEST_OVERRIDE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let stored = home_nrf_1660(home_id);
+        nextgcore_sbi::context::global_context()
+            .remove_nf_instance("hnssf-1660-real")
+            .await;
+        with_nssf_context(|c| {
+            c.nsi_remove_all();
+            c.home_remove_all();
+        });
+        hnssf.stop().await.expect("stop");
+
+        let bare_err = bare.expect_err("a bare query is refused");
+        assert!(bare_err.contains("401"), "the gate's 401: {bare_err}");
+        let nsi = tokened.expect("the real H-NSSF serves the tokened query");
+        assert_eq!(nsi.nrf_id, "http://nrf-home-1660b:7777");
+        assert_eq!(stored.as_deref(), Some("http://nrf-home-1660b:7777"));
+    }
+
+    /// #1660, failure-path property 1 (a failed request applies nothing): when the
+    /// token cannot be obtained, the H-NSSF query is not sent at all, not even
+    /// bare. The caller gets the token error rather than a 401, the H-NSSF serves
+    /// nothing, and the home entry learns no NRF.
+    ///
+    /// REVERT-VERIFIED: with `send_hnssf_query` back on `get_client`, the error is
+    /// the H-NSSF's 401 instead ("the token error").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
+    async fn a_failed_token_fetch_sends_no_hnssf_query_1660() {
+        use nextgcore_sbi::test_support::oauth2 as stand_in;
+        let _guard = context::nssf_test_guard(512);
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let sk = nextgcore_sbi::oauth::generate_es256_key();
+        let (hnssf, hnssf_port, seen) =
+            stand_in::oauth2_producer(&sk, NfType::Nssf, |_| SbiResponse::with_status(200)).await;
+        hnssf_instance_1660("hnssf-1660-notoken", hnssf_port).await;
+        let (home_id, param) = hnssf_home_1660(17);
+        // Port 1 on loopback: nothing listens, so the token request fails.
+        *OAUTH2_CLIENT_TEST_OVERRIDE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(stand_in::oauth2_client_for(1, NfType::Nssf));
+
+        let outcome = send_hnssf_query(home_id, &param).await;
+
+        *OAUTH2_CLIENT_TEST_OVERRIDE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let stored = home_nrf_1660(home_id);
+        nextgcore_sbi::context::global_context()
+            .remove_nf_instance("hnssf-1660-notoken")
+            .await;
+        with_nssf_context(|c| c.home_remove_all());
+        hnssf.stop().await.expect("stop");
+
+        let err = outcome.expect_err("no token: the query must not be sent");
+        assert!(
+            err.contains("access token"),
+            "the token error, not a 401: {err}"
+        );
+        assert!(
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "the H-NSSF served nothing"
+        );
+        assert_eq!(stored, None, "the home entry learned no NRF");
     }
 
     // ── #94: authz binding, expiry lifecycle, create validation, wire shape ──

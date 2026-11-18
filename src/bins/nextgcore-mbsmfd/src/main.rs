@@ -4251,7 +4251,7 @@ mod oauth2_h8_tests {
     //! `mbsmf_sbi_request_handler` is mounted behind nextgcore-sbi's server-side
     //! OAuth2 verification (TS 33.501 §13.4.1). A missing or wrong-audience
     //! Bearer is rejected (401) before the handler runs; a valid NRF-audience
-    //! token (aud=MBSMF, ES256-signed against the served JWKS) passes through.
+    //! token (aud=MB_SMF, ES256-signed against the served JWKS) passes through.
     use nextgcore_sbi::client::SbiClient;
     use nextgcore_sbi::message::SbiRequest;
     use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
@@ -4367,7 +4367,7 @@ mod oauth2_h8_tests {
         let sk = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
         let (server, port) = start_server(jwks_for(&sk, "nrf-es256")).await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
-        let token = build_es256_token(&sk, "nrf-es256", "MBSMF", "nmbsmf-mbssession");
+        let token = build_es256_token(&sk, "nrf-es256", "MB_SMF", "nmbsmf-mbssession");
         let req = SbiRequest::get("/nmbsmf-mbssession/v1/mbs-sessions/does-not-exist")
             .with_header("Authorization", format!("Bearer {token}"));
         let resp = tokio::time::timeout(Duration::from_secs(5), client.send_request(req))
