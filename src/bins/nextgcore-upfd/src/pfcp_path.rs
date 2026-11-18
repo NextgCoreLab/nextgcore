@@ -2852,6 +2852,23 @@ impl PfcpServer {
             .iter()
             .filter_map(|ie| parse_rule_id_u32(&ie.value, pfcp_ie::URR_ID))
             .collect();
+        // #1835: Query URR Reference (IE 125, §8.2.90, an Unsigned32). Optional,
+        // beside a Query URR or QAURR (Table 7.5.4.1-1), and echoed in every usage
+        // report sent in response to the query (§5.2.2.3.1, Table 7.5.5.2-1), so the
+        // SMF can tell which query a report answers. It was not parsed at all. One
+        // too short to hold its value is an optional IE with an invalid value, so it
+        // is discarded and the message processed as if it were absent (§7.6.8).
+        let query_urr_reference: Option<u32> =
+            ParsedIe::find_ie(&ies, pfcp_ie::QUERY_URR_REFERENCE).and_then(|ie| {
+                let value = ie.value.get(..4).and_then(|v| <[u8; 4]>::try_from(v).ok());
+                if value.is_none() {
+                    log::warn!(
+                        "Query URR Reference shorter than its 4-octet value; discarded \
+                         (TS 29.244 §7.6.8)"
+                    );
+                }
+                value.map(u32::from_be_bytes)
+            });
 
         // A Remove IE whose rule-id sub-IE is missing or short is malformed, and is
         // reported rather than skipped: silently dropping it is the defect #306 is
@@ -3666,7 +3683,14 @@ impl PfcpServer {
                     .into_iter()
                     // A URR removed by this same message has already reported with
                     // TERMR; reporting it twice would double-count it.
-                    .filter(|r| !already.contains(&r.urr_id)),
+                    .filter(|r| !already.contains(&r.urr_id))
+                    // #1835: each report answering the query carries its reference.
+                    // A TERMR report for a removed URR answers the removal, not the
+                    // query, so it carries none.
+                    .map(|mut r| {
+                        r.query_urr_reference = query_urr_reference;
+                        r
+                    }),
             );
         }
 
@@ -4304,6 +4328,7 @@ impl PfcpServer {
                     duration_measurement: times.2,
                     time_of_first_packet: times.3,
                     time_of_last_packet: times.4,
+                    query_urr_reference: None,
                 }
             })
             .collect()
@@ -4665,6 +4690,7 @@ impl PfcpServer {
                     duration_measurement: times.2,
                     time_of_first_packet: times.3,
                     time_of_last_packet: times.4,
+                    query_urr_reference: None,
                 }
             })
             .collect();
@@ -4780,6 +4806,7 @@ impl PfcpServer {
                 duration_measurement: times.2,
                 time_of_first_packet: times.3,
                 time_of_last_packet: times.4,
+                query_urr_reference: None,
             }],
             ..Default::default()
         };
@@ -10004,6 +10031,111 @@ mod tests {
             vec![(1, 777)],
             "QAURR must produce a Usage Report per URR"
         );
+    }
+
+    /// `(urr_id, Query URR Reference)` of each Usage Report in a Session
+    /// Modification Response (#1835).
+    fn report_references_1835(resp: &[u8]) -> Vec<(u32, Option<u32>)> {
+        let (_, body) = ParsedPfcpHeader::parse(resp).unwrap();
+        let mut out: Vec<(u32, Option<u32>)> =
+            ParsedIe::find_all_ies(&ParsedIe::parse_all(body), pfcp_ie::USAGE_REPORT_SMR)
+                .iter()
+                .map(|ur| {
+                    let inner = ParsedIe::parse_all(&ur.value);
+                    let u32_of = |t: u16| {
+                        ParsedIe::find_ie(&inner, t)
+                            .map(|ie| u32::from_be_bytes(ie.value[..4].try_into().unwrap()))
+                    };
+                    (
+                        u32_of(pfcp_ie::URR_ID).unwrap(),
+                        u32_of(pfcp_ie::QUERY_URR_REFERENCE),
+                    )
+                })
+                .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// **#1835, TS 29.244 §5.2.2.3.1, Table 7.5.4.1-1 and Table 7.5.5.2-1.** A
+    /// Query URR Reference in a Session Modification Request is echoed in every
+    /// usage report sent in response to its query, Query URR or QAURR alike, and
+    /// in no other: a URR removed by the same message reports TERMR without it, and
+    /// a query without a reference carries none. A reference too short for its
+    /// value is discarded (§7.6.8). upfd never parsed the IE.
+    #[tokio::test]
+    async fn query_urr_reference_is_echoed_in_the_reports_it_triggers_1835() {
+        let (_server, smf, addr, mut rx, dp, upf_seid) = established_session().await;
+        assert_eq!(
+            pfcp_ie::QUERY_URR_REFERENCE,
+            125,
+            "TS 29.244 Table 8.1.2-1 (29244-k00.txt:27160)"
+        );
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        for id in [2, 3] {
+            b.add_tlv(
+                pfcp_ie::CREATE_URR,
+                &urr_body(id, Some(1_000_000), None, None),
+            );
+        }
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        let modify = |seq: u32, build: &dyn Fn(&mut crate::n4_build::PfcpMessageBuilder)| {
+            let mut b = crate::n4_build::PfcpMessageBuilder::new();
+            build(&mut b);
+            encode_pfcp(52, Some(upf_seid), seq, &b.build())
+        };
+
+        // Query URR 2 with a reference, and remove URR 1 in the same message.
+        let resp = exchange(
+            &smf,
+            addr,
+            &modify(4, &|b| {
+                b.add_tlv(pfcp_ie::QUERY_URR, &remove_body_u32(pfcp_ie::URR_ID, 2));
+                b.add_tlv(pfcp_ie::REMOVE_URR, &remove_body_u32(pfcp_ie::URR_ID, 1));
+                b.add_u32(pfcp_ie::QUERY_URR_REFERENCE, 0xCAFE_1835);
+            }),
+        )
+        .await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(
+            report_references_1835(&resp),
+            vec![(1, None), (2, Some(0xCAFE_1835))],
+            "the queried URR echoes the reference; the removed one's TERMR does not"
+        );
+        apply_next(&mut rx, &dp).await;
+
+        // QAURR with a reference: every report answers the query.
+        let resp = exchange(
+            &smf,
+            addr,
+            &modify(5, &|b| {
+                b.add_u8(pfcp_ie::PFCPSMREQ_FLAGS, pfcpsmreq_flags::QAURR);
+                b.add_u32(pfcp_ie::QUERY_URR_REFERENCE, 7);
+            }),
+        )
+        .await;
+        assert_eq!(
+            report_references_1835(&resp),
+            vec![(2, Some(7)), (3, Some(7))]
+        );
+
+        // No reference, and a reference too short for its value: none echoed.
+        for (seq, reference) in [(6, None), (7, Some(&[0x00, 0x01][..]))] {
+            let resp = exchange(
+                &smf,
+                addr,
+                &modify(seq, &|b| {
+                    b.add_tlv(pfcp_ie::QUERY_URR, &remove_body_u32(pfcp_ie::URR_ID, 3));
+                    if let Some(r) = reference {
+                        b.add_tlv(pfcp_ie::QUERY_URR_REFERENCE, r);
+                    }
+                }),
+            )
+            .await;
+            assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+            assert_eq!(report_references_1835(&resp), vec![(3, None)], "seq {seq}");
+        }
     }
 
     /// Query URR (IE 77, TS 29.244 §7.5.4.10): report the URRs the SMF NAMED, and
