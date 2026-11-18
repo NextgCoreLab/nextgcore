@@ -792,8 +792,47 @@ impl SbiClient {
     ///   [`RetryPolicy`]; with the default `max_attempts == 1` the retry loop is
     ///   skipped entirely (fast path), so a normal request is byte-for-byte and
     ///   call-sequence identical to the pre-sbi-04/05 client.
+    /// * **#1676**: when this client attached the Bearer token itself and the
+    ///   producer answers 401 with `error="invalid_token"` (RFC 6750 §3.1), the
+    ///   cached token for that target and scope is evicted and the request is sent
+    ///   ONCE more with a freshly fetched token. A rotated NRF signing key, a
+    ///   restarted NRF or a revoked token otherwise kept every request to that
+    ///   producer failing until the cached token expired. `insufficient_scope`
+    ///   (a fresh token carries the same scope) and a caller-supplied
+    ///   `Authorization` are left alone.
     pub async fn send_request(&self, request: SbiRequest) -> SbiResult<SbiResponse> {
-        self.send_with_overload_reaction(request).await
+        // The token is ours to replace only when this client attaches it: OAuth2
+        // applies to the request, and the caller set no Authorization.
+        let scope = derive_scope_from_uri(&request.header.uri);
+        let ours = request.http.get_header("Authorization").is_none() && !scope.is_empty();
+        let resend = ours
+            .then(|| self.oauth2_for(&request.header.uri, crate::nrf_tls::nrf_oauth2_client()))
+            .flatten()
+            .map(|oauth2| (oauth2, request.clone()));
+        let response = self.send_with_overload_reaction(request).await?;
+        let Some(((oauth2, target), resend)) = resend else {
+            return Ok(response);
+        };
+        if response.status != 401
+            || response
+                .http
+                .get_header("WWW-Authenticate")
+                .and_then(|v| bearer_challenge_error(v))
+                .is_none_or(|e| e != "invalid_token")
+        {
+            return Ok(response);
+        }
+        log::warn!(
+            "{} {}: the producer refused our access token (401 invalid_token); evicting \
+             the cached {} token for scope '{scope}' and resending once with a fresh one",
+            resend.header.method,
+            crate::log_redact::redact_callback_tokens(&resend.header.uri),
+            target.to_str()
+        );
+        oauth2
+            .invalidate_token(&oauth2.self_consumer(), target, &scope)
+            .await;
+        self.send_with_overload_reaction(resend).await
     }
 
     /// #65: the TS 29.500 §6.4/§6.5 reaction that used to be missing entirely.
@@ -1637,6 +1676,23 @@ fn is_nrf_token_api(uri: &str) -> bool {
     )
 }
 
+/// The `error` parameter of a `Bearer` challenge (RFC 6750 §3): `invalid_token`,
+/// `insufficient_scope` or `invalid_request`. `None` for another scheme or a
+/// challenge with no `error` (#1676).
+fn bearer_challenge_error(www_authenticate: &str) -> Option<String> {
+    let v = www_authenticate.trim_start();
+    let (scheme, params) = v.split_once(char::is_whitespace).unwrap_or((v, ""));
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return None;
+    }
+    params.split(',').find_map(|p| {
+        let (k, val) = p.split_once('=')?;
+        k.trim()
+            .eq_ignore_ascii_case("error")
+            .then(|| val.trim().trim_matches('"').to_string())
+    })
+}
+
 fn derive_scope_from_uri(uri: &str) -> String {
     crate::message::UriComponents::parse(uri)
         .api_name
@@ -2401,6 +2457,299 @@ mod tests {
         assert!(
             body.contains("<none>"),
             "expected no authorization header, got: {body}"
+        );
+    }
+
+    // --- #1676: a producer's 401 invalid_token evicts the cached token ---
+
+    /// Counters of a [`serve_rotating_token_producer`] stub.
+    #[derive(Default)]
+    struct TokenStubCounts1676 {
+        token_fetches: std::sync::atomic::AtomicUsize,
+        producer_hits: std::sync::atomic::AtomicUsize,
+    }
+
+    /// A stub that is both the NRF token endpoint and the producer. The token
+    /// endpoint hands out `token-1`, `token-2`, ... in turn. The producer refuses
+    /// every token in `refused` with `status` and a `WWW-Authenticate: Bearer`
+    /// challenge carrying `error`, and answers 200 echoing the header otherwise.
+    async fn serve_rotating_token_producer(
+        refused: &'static [&'static str],
+        status: u16,
+        error: &'static str,
+    ) -> (std::net::SocketAddr, Arc<TokenStubCounts1676>) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let counts = Arc::new(TokenStubCounts1676::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let c = counts.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let c = c.clone();
+                tokio::spawn(async move {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let svc = hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
+                        let c = c.clone();
+                        let path = req.uri().path().to_string();
+                        let auth = req
+                            .headers()
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("<none>")
+                            .to_string();
+                        async move {
+                            let mut resp = if path == "/nnrf-oauth2/v1/access-token" {
+                                let n = c.token_fetches.fetch_add(1, SeqCst) + 1;
+                                hyper::Response::new(http_body_util::Full::new(bytes::Bytes::from(
+                                    format!(
+                                        r#"{{"access_token":"token-{n}","token_type":"Bearer","expires_in":3600}}"#
+                                    ),
+                                )))
+                            } else {
+                                c.producer_hits.fetch_add(1, SeqCst);
+                                let token = auth.strip_prefix("Bearer ").unwrap_or("");
+                                if refused.contains(&token) {
+                                    let mut r = hyper::Response::new(http_body_util::Full::new(
+                                        bytes::Bytes::from_static(b"{}"),
+                                    ));
+                                    *r.status_mut() = hyper::StatusCode::from_u16(status).unwrap();
+                                    r.headers_mut().insert(
+                                        "www-authenticate",
+                                        format!(
+                                            "Bearer realm=\"5gc\", error=\"{error}\", \
+                                             error_description=\"refused, by the stub\""
+                                        )
+                                        .parse()
+                                        .unwrap(),
+                                    );
+                                    r
+                                } else {
+                                    hyper::Response::new(http_body_util::Full::new(
+                                        bytes::Bytes::from(format!(
+                                            r#"{{"authorization":"{auth}"}}"#
+                                        )),
+                                    ))
+                                }
+                            };
+                            resp.headers_mut()
+                                .insert("content-type", "application/json".parse().unwrap());
+                            Ok::<_, std::convert::Infallible>(resp)
+                        }
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(io, svc)
+                    .await;
+                });
+            }
+        });
+        (addr, counts)
+    }
+
+    fn client_1676(addr: std::net::SocketAddr) -> (SbiClient, Arc<OAuth2Client>) {
+        let oauth2 = Arc::new(OAuth2Client::new(
+            format!("http://{addr}"),
+            "amf-1676",
+            NfType::Amf,
+        ));
+        let client = SbiClient::with_host_port("127.0.0.1", addr.port())
+            .with_oauth2(oauth2.clone(), NfType::Udm);
+        (client, oauth2)
+    }
+
+    /// **#1676, RFC 6750 §3.1.** A producer that refuses the cached token with
+    /// 401 `invalid_token` (a rotated NRF key, say) gets the request again, once,
+    /// with a fresh token, and the fresh token replaces the cached one. The
+    /// client kept sending the refused token until it expired.
+    ///
+    /// REVERT-VERIFIED: without the eviction, the resend carries token-1 and fails.
+    #[tokio::test]
+    async fn a_401_invalid_token_evicts_the_token_and_resends_once_1676() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let _paths = crate::oauth::lock_path_mode_async().await;
+        let (addr, counts) =
+            serve_rotating_token_producer(&["token-1"], 401, "invalid_token").await;
+        let (client, oauth2) = client_1676(addr);
+
+        let response = client
+            .send_request(SbiRequest::get("/nudm-sdm/v2/imsi-1/am-data"))
+            .await
+            .expect("sent");
+        assert_eq!(
+            response.status, 200,
+            "the resend with a fresh token succeeds"
+        );
+        assert!(
+            response
+                .http
+                .content
+                .as_deref()
+                .is_some_and(|b| b.contains("Bearer token-2")),
+            "the resend carried the fresh token: {:?}",
+            response.http.content
+        );
+        assert_eq!(
+            (
+                counts.token_fetches.load(SeqCst),
+                counts.producer_hits.load(SeqCst)
+            ),
+            (2, 2)
+        );
+        assert_eq!(
+            oauth2.get_token(NfType::Udm, "nudm-sdm").await.unwrap(),
+            "token-2",
+            "the fresh token is the cached one now"
+        );
+
+        // A later request reuses it: no third fetch.
+        let response = client
+            .send_request(SbiRequest::get("/nudm-sdm/v2/imsi-1/am-data"))
+            .await
+            .expect("sent");
+        assert_eq!(response.status, 200);
+        assert_eq!(counts.token_fetches.load(SeqCst), 2);
+    }
+
+    /// **#1676.** The resend happens once: a producer that refuses every token
+    /// gets two requests, and the caller gets its 401.
+    ///
+    /// REVERT-VERIFIED: with a second evict-and-resend, three fetches.
+    #[tokio::test]
+    async fn a_second_invalid_token_is_returned_not_retried_1676() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let _paths = crate::oauth::lock_path_mode_async().await;
+        let (addr, counts) =
+            serve_rotating_token_producer(&["token-1", "token-2", "token-3"], 401, "invalid_token")
+                .await;
+        let (client, _) = client_1676(addr);
+        let response = client
+            .send_request(SbiRequest::get("/nudm-sdm/v2/imsi-1/am-data"))
+            .await
+            .expect("sent");
+        assert_eq!(response.status, 401);
+        assert_eq!(
+            (
+                counts.token_fetches.load(SeqCst),
+                counts.producer_hits.load(SeqCst)
+            ),
+            (2, 2)
+        );
+    }
+
+    /// **#1676.** `insufficient_scope` is not a stale token: a fresh one carries
+    /// the same scope, so nothing is evicted and nothing is resent. Neither is
+    /// a 401 to a request whose `Authorization` the caller set: that token is
+    /// not the client's to replace.
+    ///
+    /// REVERT-VERIFIED: retrying any 4xx, or replacing a caller's token, adds a fetch.
+    #[tokio::test]
+    async fn insufficient_scope_and_a_caller_token_are_not_retried_1676() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let _paths = crate::oauth::lock_path_mode_async().await;
+        let (addr, counts) =
+            serve_rotating_token_producer(&["token-1"], 403, "insufficient_scope").await;
+        let (client, oauth2) = client_1676(addr);
+        let response = client
+            .send_request(SbiRequest::get("/nudm-sdm/v2/imsi-1/am-data"))
+            .await
+            .expect("sent");
+        assert_eq!(response.status, 403);
+        assert_eq!(
+            (
+                counts.token_fetches.load(SeqCst),
+                counts.producer_hits.load(SeqCst)
+            ),
+            (1, 1)
+        );
+        assert_eq!(
+            oauth2.get_token(NfType::Udm, "nudm-sdm").await.unwrap(),
+            "token-1"
+        );
+
+        let (addr, counts) = serve_rotating_token_producer(&["mine"], 401, "invalid_token").await;
+        let (client, _) = client_1676(addr);
+        let mut request = SbiRequest::get("/nudm-sdm/v2/imsi-1/am-data");
+        request.http.set_header("Authorization", "Bearer mine");
+        let response = client.send_request(request).await.expect("sent");
+        assert_eq!(response.status, 401);
+        assert_eq!(
+            (
+                counts.token_fetches.load(SeqCst),
+                counts.producer_hits.load(SeqCst)
+            ),
+            (0, 1)
+        );
+    }
+
+    #[test]
+    fn bearer_challenge_error_reads_the_error_parameter_1676() {
+        assert_eq!(
+            bearer_challenge_error(r#"Bearer realm="x", error="invalid_token""#).as_deref(),
+            Some("invalid_token")
+        );
+        assert_eq!(
+            bearer_challenge_error(r#"bearer error=insufficient_scope"#).as_deref(),
+            Some("insufficient_scope")
+        );
+        assert_eq!(bearer_challenge_error(r#"Bearer realm="x""#), None);
+        assert_eq!(
+            bearer_challenge_error(r#"Basic error="invalid_token""#),
+            None
+        );
+    }
+
+    /// **#1676, both peers.** This crate's own SBI server answers a bearer it
+    /// cannot verify with 401 and `WWW-Authenticate: Bearer ... error="invalid_token"`
+    /// (server.rs, RFC 6750 §3). The client reads that challenge as a stale token:
+    /// it evicts token-1, fetches token-2 and resends once; the server refuses that
+    /// too (its JWKS is empty), so the caller gets the 401 after exactly two fetches.
+    ///
+    /// REVERT-VERIFIED: with the `invalid_token` comparison changed, one fetch.
+    #[tokio::test]
+    async fn the_sbi_server_s_invalid_token_challenge_gets_one_fresh_token_1676() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let _paths = crate::oauth::lock_path_mode_async().await;
+        let (nrf, counts) = serve_rotating_token_producer(&[], 401, "invalid_token").await;
+        let (listener, addr) = crate::test_support::bound_listener().into_parts();
+        let mut cfg = crate::server::SbiServerConfig::new(addr);
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(serde_json::json!({"keys": []}));
+        let server = crate::server::SbiServer::on_listener(cfg, listener);
+        server
+            .start(|_req: SbiRequest| async { SbiResponse::with_status(200) })
+            .await
+            .expect("producer starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let oauth2 = Arc::new(OAuth2Client::new(
+            format!("http://{nrf}"),
+            "amf-1676",
+            NfType::Amf,
+        ));
+        let client =
+            SbiClient::with_host_port("127.0.0.1", addr.port()).with_oauth2(oauth2, NfType::Udm);
+        let response = client
+            .send_request(SbiRequest::get("/nudm-sdm/v2/imsi-1/am-data"))
+            .await
+            .expect("sent");
+        server.stop().await.expect("stop");
+        assert_eq!(response.status, 401);
+        assert!(response
+            .http
+            .get_header("WWW-Authenticate")
+            .is_some_and(|v| v.contains("error=\"invalid_token\"")));
+        assert_eq!(
+            counts.token_fetches.load(SeqCst),
+            2,
+            "token-1 evicted on the challenge, token-2 fetched for the one resend"
         );
     }
 
