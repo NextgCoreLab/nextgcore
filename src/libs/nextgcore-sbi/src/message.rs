@@ -805,6 +805,23 @@ impl SbiResponse {
         (200..300).contains(&self.status)
     }
 
+    /// Whether this is the producer's OAuth2 gate refusing the ACCESS TOKEN
+    /// rather than the service refusing the request: a 401 or 403 carrying a
+    /// `WWW-Authenticate: Bearer` challenge (TS 29.500 §6.7.3, RFC 6750 §3).
+    ///
+    /// #1766: a scope or audience refusal is a 403, the same status several
+    /// services use for a business outcome (an NSACF total failure, an LMF's
+    /// LOCATION_SESSION_UNKNOWN). A consumer that gives 403 a service meaning
+    /// must test this first, or a token misconfiguration reads as that outcome.
+    pub fn is_bearer_refusal(&self) -> bool {
+        matches!(self.status, 401 | 403)
+            && self.http.get_header("www-authenticate").is_some_and(|v| {
+                v.trim_start()
+                    .get(..6)
+                    .is_some_and(|s| s.eq_ignore_ascii_case("bearer"))
+            })
+    }
+
     /// Parse JSON body
     pub fn json_body<T: for<'de> Deserialize<'de>>(&self) -> Result<T, serde_json::Error> {
         let content = self.http.content.as_deref().unwrap_or("{}");
