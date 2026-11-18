@@ -200,6 +200,68 @@ fn refuse_lab_flags_under_production(
     ))
 }
 
+/// #1848: the client TLS every peer SEPP is dialled with. Under the
+/// `production` SBI profile, with any `--peer-sepp`:
+/// - each peer apiRoot must be `https`: N32-c is mutually authenticated TLS
+///   between the SEPPs (TS 33.501 §13.1, §13.2.2.2), so an `http` peer is a
+///   startup error rather than a cleartext N32;
+/// - the SEPP presents its own client certificate, `--n32-client-cert` /
+///   `--n32-client-key`, else the profile's (`NEXTGCORE_SBI_TLS_CLIENT_*`);
+/// - the peer is verified against `--n32-ca-cert`, else the profile's CA,
+///   and only that CA: with a CA configured the client never falls back to
+///   the public web roots;
+/// - each of those files must exist, named when one does not.
+///
+/// `Ok(Some)` is the TLS to dial with (whatever `--tls` says, which governs the
+/// listener). `Ok(None)` under `dev` or with no peer: as before.
+fn n32_peer_client_tls(
+    profile: nextgcore_sbi::security::SbiProfile,
+    peers: &[String],
+    given: &n32_server::N32TlsConfig,
+    defaults: &nextgcore_sbi::security::TlsPaths,
+) -> Result<Option<n32_server::N32TlsConfig>, String> {
+    if !profile.is_production() || peers.is_empty() {
+        return Ok(None);
+    }
+    for peer in peers {
+        let api_root = peer.split_once('=').map_or(peer.as_str(), |(_, r)| r);
+        if !api_root
+            .get(..8)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+        {
+            return Err(format!(
+                "the SBI profile is production and --peer-sepp {peer} is not https: N32-c is \
+                 mutually authenticated TLS between the SEPPs (TS 33.501 §13.2.2.2)"
+            ));
+        }
+    }
+    let mut tls = given.clone();
+    tls.client_cert = tls.client_cert.or_else(|| defaults.client_cert.clone());
+    tls.client_key = tls.client_key.or_else(|| defaults.client_key.clone());
+    tls.ca_cert = tls.ca_cert.or_else(|| Some(defaults.ca_cert.clone()));
+    for (label, path) in [
+        ("client certificate (--n32-client-cert)", &tls.client_cert),
+        ("client key (--n32-client-key)", &tls.client_key),
+        ("peer CA (--n32-ca-cert)", &tls.ca_cert),
+    ] {
+        match path {
+            Some(p) if std::path::Path::new(p).is_file() => {}
+            Some(p) => {
+                return Err(format!(
+                    "the SBI profile is production and the N32 {label} {p} does not exist"
+                ))
+            }
+            None => {
+                return Err(format!(
+                    "the SBI profile is production and no N32 {label} is configured, so the \
+                     peer SEPPs could not be dialled with mutual TLS"
+                ))
+            }
+        }
+    }
+    Ok(Some(tls))
+}
+
 /// Parse "mcc:mnc" into a PlmnId
 fn parse_plmn(spec: &str) -> Option<PlmnId> {
     let (mcc, mnc) = spec.split_once(':')?;
@@ -355,6 +417,18 @@ async fn main() -> Result<()> {
         allow_insecure_no_mtls: args.n32_allow_insecure_no_mtls,
     };
     let n32_tls_opt = if args.tls { Some(&n32_tls) } else { None };
+    // #1848: under production every peer SEPP is dialled over mutually
+    // authenticated TLS with this SEPP's own certificate and a configured CA,
+    // never cleartext and never the public web roots. Checked before anything
+    // listens or dials.
+    let peer_tls = n32_peer_client_tls(
+        nextgcore_sbi::security::SbiProfile::resolve(),
+        &args.peer_sepp,
+        &n32_tls,
+        &nextgcore_sbi::security::TlsPaths::from_env(),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    let peer_tls_opt = peer_tls.as_ref().or(n32_tls_opt);
 
     // Start the consumer-facing SBI server (C8): home-PLMN NFs send outbound
     // roaming requests here; the handler runs the forwarding pipeline through
@@ -400,7 +474,7 @@ async fn main() -> Result<()> {
             fqdn,
             api_root,
             local_api_root.as_deref(),
-            n32_tls_opt,
+            peer_tls_opt,
         )
         .await
         {
@@ -525,8 +599,108 @@ async fn run_event_loop_async(
 
 #[cfg(test)]
 mod lab_flag_tests_1848 {
-    use super::refuse_lab_flags_under_production;
-    use nextgcore_sbi::security::SbiProfile;
+    use super::{n32_peer_client_tls, refuse_lab_flags_under_production};
+    use crate::n32_server::N32TlsConfig;
+    use nextgcore_sbi::security::{SbiProfile, TlsPaths};
+
+    fn files() -> (std::path::PathBuf, TlsPaths) {
+        let dir = std::env::temp_dir().join(format!(
+            "seppd-1848-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |n: &str| {
+            let p = dir.join(n);
+            std::fs::write(&p, "pem").unwrap();
+            p.display().to_string()
+        };
+        let paths = TlsPaths {
+            cert: file("server.crt"),
+            key: file("server.key"),
+            ca_cert: file("profile-ca.crt"),
+            client_cert: Some(file("profile-client.crt")),
+            client_key: Some(file("profile-client.key")),
+        };
+        (dir, paths)
+    }
+
+    /// REVERT-VERIFIED: with the scheme check removed, an `http` peer is
+    /// admitted under production and the first assertion fails.
+    #[test]
+    fn production_refuses_a_cleartext_peer_sepp_1848() {
+        let (dir, paths) = files();
+        let peers = vec!["sepp.peer.example=http://10.0.0.9:7777".to_string()];
+        let err = n32_peer_client_tls(SbiProfile::Production, &peers, &Default::default(), &paths)
+            .expect_err("no cleartext N32 under production");
+        assert!(err.contains("is not https"), "{err}");
+        assert!(
+            n32_peer_client_tls(SbiProfile::Dev, &peers, &Default::default(), &paths)
+                .unwrap()
+                .is_none(),
+            "dev dials as before"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REVERT-VERIFIED: with the profile defaults not filled in, the client
+    /// certificate is `None` and the first assertion fails; with the file
+    /// check removed, a missing CA is admitted.
+    #[test]
+    fn production_dials_peers_with_its_own_certificate_and_a_configured_ca_1848() {
+        let (dir, paths) = files();
+        let peers = vec!["sepp.peer.example=https://10.0.0.9:443".to_string()];
+        let tls = n32_peer_client_tls(SbiProfile::Production, &peers, &Default::default(), &paths)
+            .unwrap()
+            .expect("production dials with TLS whatever --tls says");
+        assert_eq!(
+            tls.client_cert, paths.client_cert,
+            "the SEPP's own certificate"
+        );
+        assert_eq!(tls.client_key, paths.client_key);
+        assert_eq!(
+            tls.ca_cert.as_deref(),
+            Some(paths.ca_cert.as_str()),
+            "a configured CA, so never the public web roots"
+        );
+
+        // Explicit N32 material wins over the profile's.
+        let n32_ca = dir.join("inter-plmn-ca.crt");
+        std::fs::write(&n32_ca, "pem").unwrap();
+        let given = N32TlsConfig {
+            ca_cert: Some(n32_ca.display().to_string()),
+            ..Default::default()
+        };
+        let tls = n32_peer_client_tls(SbiProfile::Production, &peers, &given, &paths)
+            .unwrap()
+            .unwrap();
+        assert_eq!(tls.ca_cert, given.ca_cert);
+
+        // A missing file is named.
+        let absent = TlsPaths {
+            ca_cert: dir.join("absent-ca.crt").display().to_string(),
+            ..paths.clone()
+        };
+        let err = n32_peer_client_tls(SbiProfile::Production, &peers, &Default::default(), &absent)
+            .expect_err("a missing CA is refused");
+        assert!(err.contains("absent-ca.crt"), "{err}");
+        let no_client = TlsPaths {
+            client_cert: None,
+            ..paths.clone()
+        };
+        let err = n32_peer_client_tls(
+            SbiProfile::Production,
+            &peers,
+            &Default::default(),
+            &no_client,
+        )
+        .expect_err("no client certificate is refused");
+        assert!(err.contains("client certificate"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// REVERT-VERIFIED: with the production check short-circuited to `Ok(())`,
     /// both flags start under production and the first assertion fails.

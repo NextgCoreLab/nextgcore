@@ -54,3 +54,19 @@ fn production_seppd_refuses_to_start_with_a_lab_flag_1848() {
         );
     }
 }
+
+/// R26 on #1881: an `http` peer SEPP is a cleartext N32 too.
+///
+/// REVERT-VERIFIED: with the scheme check in `n32_peer_client_tls` removed,
+/// seppd keeps running under production and this fails.
+#[test]
+fn production_seppd_refuses_to_start_with_a_cleartext_peer_1848() {
+    let flag = "--peer-sepp=sepp.peer.example=http://127.0.0.1:1";
+    let (ok, stderr) =
+        run(flag, "production").unwrap_or_else(|| panic!("seppd started with an http peer"));
+    assert!(!ok, "a non-zero exit");
+    assert!(
+        stderr.contains("is not https"),
+        "the refusal names it: {stderr}"
+    );
+}
