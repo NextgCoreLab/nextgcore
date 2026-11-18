@@ -341,6 +341,15 @@ jobs:
         # meet (for example sbi's `6g-extensions` with `http3`). Clippy does not
         # link, so the kernel-sctp features need no libsctp here.
         run: cd src && cargo clippy --workspace --all-features --all-targets -- -D warnings
+      - name: amfd paging demos together (nextgsim#462)
+        # The per-feature loops never build amfd with both paging demos, so the
+        # test that refuses them together (both_paging_demos_at_once_fail_startup,
+        # PagingDemoConflict) would run nowhere. Every push: amfd's demo_config
+        # binary tests with both features, a few seconds once built.
+        run: >-
+          cd src && cargo test -p nextgcore-amfd
+          --features demo-d440a-ai-paging,demo-d440c-nwdaf-paging
+          --test demo_config
       - name: cargo test (per crate and feature)
         if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
         run: |

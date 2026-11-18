@@ -80,7 +80,6 @@ expect() {   # <mode> <mutation> <check that must fail> [variant]
 expect ct no-paged ue
 expect ct empty-ue ue
 expect ct no-base-scope amf
-expect ct revert amf revert
 expect ct no-strategy amf-demo
 expect ct no-demo-sent amf-demo
 expect ct no-demo-answer amf-demo
@@ -95,6 +94,31 @@ expect off off-demo-line gnbs
 expect ct metric-zero metrics
 expect page-all page-all-metric metrics
 expect ct no-ping upf
+# The revert arm HOLDS only on a failure at exactly [amf] step 1 with every other
+# check holding (R14 MAJOR on #1783): an unrelated failure must not pass for it.
+revert_case() {   # <label> <want: holds|not> <mode> <mutation> [sed-script file-in-capture]
+  local d="${T}/rev-$1" out rc
+  rm -rf "${d}"
+  python3 "${HERE}/fixtures.py" "${d}" "$3" "$4" || { nok "revert $1: fixture"; return; }
+  if [[ $# -ge 6 ]]; then sed -i -E "$5" "${d}/$6"; fi
+  out="$(python3 "${HERE}/analyze.py" "${d}" "$3" revert)"; rc=$?
+  FAILED_CHECKS+=" $(grep -oE '^FAIL \[[a-z-]+\]' <<<"${out}" | grep -oE '[a-z-]+\]' | tr -d ']' | tr '\n' ' ')"
+  if [[ "$2" == holds ]]; then
+    if [[ ${rc} == 0 ]] && grep -q '^VERDICT: REVERT HOLDS' <<<"${out}"; then ok "revert $1: holds"; else nok "revert $1: does not hold: $(grep VERDICT <<<"${out}")"; fi
+  else
+    if [[ ${rc} != 0 ]] && grep -q '^VERDICT: REVERT DOES NOT HOLD\|^VERDICT: FAIL (arm)' <<<"${out}"; then ok "revert $1: does not hold"; else nok "revert $1: holds, but must not: $(grep VERDICT <<<"${out}")"; fi
+  fi
+}
+revert_case bites                 holds ct revert
+revert_case lsq-bites             holds lsq revert
+revert_case plus-no-ping          not   ct revert 's/ [0-9]+ received/ 0 received/' ping.txt
+revert_case plus-ue-not-paged     not   ct revert '/Paged by cell/d' ue.log
+revert_case plus-no-recommendation not  ct revert '/paging recommendation/d' gnb-6.log
+revert_case plus-lost-banner      not   ct revert '/DEMO MODE ACTIVE/d' gnb-3.log
+revert_case at-step-2             not   ct revert '/page answered, T3513 stopped/d' amf.log
+revert_case no-area-page          not   ct revert '/serving the registration area/d' amf.log
+revert_case still-recommended     not   ct revert-still-recommended
+revert_case not-a-predictor       not   page-all revert
 # Every check analyze.py names has a control that fails it.
 for c in $(grep -oE 'r\.check\("[a-z-]+"|chain\(r, "[a-z-]+"' "${HERE}/analyze.py" | grep -oE '"[a-z-]+"' | tr -d '"' | sort -u); do
   if [[ " ${FAILED_CHECKS} " == *" ${c} "* ]]; then ok "check [${c}] has a failing control"; else nok "check [${c}] has no failing control"; fi

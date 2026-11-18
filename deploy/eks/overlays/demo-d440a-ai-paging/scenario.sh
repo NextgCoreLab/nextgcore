@@ -10,9 +10,12 @@
 #   DEMO_VARIANT=revert k8s/demo-check.sh d440a-ai-paging ct
 #                     amfd's demo block removed and amfd restarted, so its
 #                     paging.strategy is the default registration-area: the gNB
-#                     still recommends, amfd pages the area, and the success
-#                     chain must FAIL at the amf step that wants the
-#                     recommended gNBs paged first
+#                     still recommends and amfd pages the area. scenario.sh
+#                     exits 0 only when the revert HOLDS: the success chain
+#                     fails at exactly [amf] step 1 and every other check holds
+#                     (analyze.py). demo-check.sh's own verdict is then FAIL on
+#                     one line only, the missing nextg_demo_enabled series:
+#                     amfd's demo is off and no gNB serves /metrics.
 #
 # The same run in every arm, on live seed 1 (seed.env, generated from nextgsim's
 # config/demo-ai-paging/d440a-live-seeds.yaml; times from the UE's `Simulated
@@ -178,7 +181,10 @@ done
 [[ -n "${SERVING}" ]] || die "no gNB holds the UE's context at +${RELEASE_AT_S} s"
 cli "${SERVING}" "ue-release ${UE_ID}" >"${S}/ue-release.txt"
 echo "${SERVING}" >"${S}/serving.txt"
-say "ue-release ${UE_ID} on ${SERVING} at +$(python3 -c "import time; print('%.1f' % (time.time() - ${T0}))") s"
+# The release's actual offset on the route's clock (wanted: RELEASE_AT_S),
+# recorded in result.txt.
+python3 -c "import time; print('%.1f' % (time.time() - ${T0}))" >"${S}/release-offset.txt"
+say "ue-release ${UE_ID} on ${SERVING} at +$(cat "${S}/release-offset.txt") s (wanted +${RELEASE_AT_S} s)"
 wait_for 30 grep_log "${UE_POD}" ue 'RRC connection released' || die "the UE never got its RRC Release"
 
 # --- 4. downlink data ----------------------------------------------------------------------

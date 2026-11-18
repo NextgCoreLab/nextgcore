@@ -20,7 +20,7 @@ MUTATIONS = (
     "no-paged", "no-base-scope", "no-demo-sent", "no-demo-answer", "no-strategy",
     "no-recommendation", "wrong-visited", "targets-differ", "no-banner", "no-grid",
     "metric-zero", "no-ping", "empty-ue", "revert", "page-all-recommends", "off-demo-line",
-    "page-all-metric", "wrong-mode-banner",
+    "page-all-metric", "wrong-mode-banner", "revert-still-recommended",
 )
 
 
@@ -37,8 +37,9 @@ def capture(d, mode, mut=None):
     os.makedirs(d, exist_ok=True)
     predictor = mode in ("last-served", "ct", "lsq")
     on = mode != "off"
-    demo_amf = on and mut != "revert"
-    reco = predictor and mut != "revert" and mut != "no-base-scope"
+    revert = mut is not None and mut.startswith("revert")
+    demo_amf = on and not revert
+    reco = predictor and (not revert or mut == "revert-still-recommended") and mut != "no-base-scope"
     p = f"[demo:{KEY}] "
 
     ue = [
@@ -99,6 +100,7 @@ def capture(d, mode, mut=None):
             log.append(p + "paging grid: this gNB 0x3 at (0, 0, 0), 5 neighbour cell(s): [..]")
         write(d, f"{g}.log", stamp(log))
     write(d, "serving.txt", ["gnb-6"])
+    write(d, "release-offset.txt", ["15.2"])
 
     prom = []
     if demo_amf:
