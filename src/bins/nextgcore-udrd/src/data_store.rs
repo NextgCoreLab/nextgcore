@@ -1011,15 +1011,64 @@ fn uri_path(uri: &str) -> &str {
     }
 }
 
-/// True when a monitored resource URI covers a changed resource path:
-/// exact match, monitored-is-ancestor, or suffix match (apiRoot-agnostic).
+/// A resource URI as (service, resource segments) for [`uri_covers`] (#1814).
+///
+/// The scheme and authority are dropped (an absolute URI and an absolute-path
+/// reference are both allowed, TS 29.505 `SubscriptionDataSubscription`
+/// `monitoredResourceUris`), and so are the query and fragment. The apiRoot,
+/// including any deployment prefix, ends at the `nudr-*/<version>` pair: the
+/// service is that name, and the resource is the segments after the version. A
+/// path without that pair is taken as already relative to the API root.
+/// `None` for a path with a `.` or `..` segment, which names no resource.
+fn resource_segments(uri: &str) -> Option<(Option<&str>, Vec<&str>)> {
+    let path = uri_path(uri);
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.iter().any(|s| *s == "." || *s == "..") {
+        return None;
+    }
+    let is_version = |s: &str| {
+        s.strip_prefix('v')
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let api = segments
+        .windows(2)
+        .position(|w| w[0].starts_with("nudr-") && is_version(w[1]));
+    Some(match api {
+        Some(i) => (Some(segments[i]), segments[i + 2..].to_vec()),
+        None => (None, segments),
+    })
+}
+
+/// Whether a monitored resource URI covers a changed resource path (#1814).
+///
+/// Whole segments are compared on the apiRoot-relative resource
+/// ([`resource_segments`]). The URI covers the change when it names the same
+/// resource or an ancestor of it (a collection such as `/policy-data/ues`, or one
+/// UE's `/subscription-data/{ueId}`), or when the change replaced an ancestor of
+/// what it monitors. Both URIs must name the same Nudr service when both name one.
+/// So a UE's resource is covered only through a URI that carries that UE's
+/// segment, or one that explicitly monitors a collection above every UE.
+///
+/// This used to accept any raw string suffix as well. A subscription without a
+/// `ueId` that monitored `/pp-data` then matched every UE's pp-data and was
+/// notified with each UE's data.
 pub fn uri_covers(monitored: &str, changed_path: &str) -> bool {
-    let mp = uri_path(monitored).trim_end_matches('/');
-    let cp = changed_path.trim_end_matches('/');
-    if mp.is_empty() {
+    let (Some((m_service, m)), Some((c_service, c))) = (
+        resource_segments(monitored),
+        resource_segments(changed_path),
+    ) else {
+        return false;
+    };
+    if m.is_empty() || c.is_empty() {
         return false;
     }
-    mp == cp || cp.starts_with(&format!("{mp}/")) || mp.ends_with(cp) || cp.ends_with(mp)
+    if let (Some(ms), Some(cs)) = (m_service, c_service) {
+        if ms != cs {
+            return false;
+        }
+    }
+    c.starts_with(&m) || m.starts_with(&c)
 }
 
 /// POST a JSON notification to a notify URI as a detached task with bounded
@@ -1351,6 +1400,57 @@ mod tests {
         assert!(!uri_covers(
             "http://udr:7777/nudr-dr/v2/subscription-data/imsi-2/context-data",
             changed
+        ));
+    }
+
+    /// #1814: no raw suffix matching. A resource of one UE is covered only by a
+    /// URI carrying that UE's segment, or by a collection above every UE.
+    #[test]
+    fn a_monitored_uri_covers_by_whole_segments_only_1814() {
+        let pp = "/nudr-dr/v2/subscription-data/imsi-001010000000002/pp-data";
+        // The defect: these suffixes of UE 2's resource matched it.
+        for monitored in [
+            "/pp-data",
+            "pp-data",
+            "/imsi-001010000000002/pp-data",
+            "http://udr/pp-data",
+            "/nudr-dr/v2/subscription-data/imsi-001010000000001/pp-data",
+            "/nudr-dr/v2/subscription-data/imsi-00101000000000/pp-data",
+            "/nudr-dr/v2/subscription-data/imsi-001010000000002/pp",
+            "/nudr-dr/v2/subscription-data/imsi-001010000000002/pp-data/../../imsi-001010000000002",
+            "/nudr-group-id-map/v1/subscription-data/imsi-001010000000002/pp-data",
+            "/nudr-dr/v2",
+            "/",
+            "",
+        ] {
+            assert!(
+                !uri_covers(monitored, pp),
+                "{monitored:?} must not cover {pp}"
+            );
+        }
+        for monitored in [
+            pp.to_string(),
+            format!("http://udr.example:7777{pp}"),
+            format!("https://udr.example/prefix{pp}"),
+            format!("{pp}/"),
+            format!("{pp}?supported-features=1"),
+            "/nudr-dr/v2/subscription-data/imsi-001010000000002".to_string(),
+            // Relative to the API root (no `nudr-dr/<version>` pair): still anchored.
+            "/subscription-data/imsi-001010000000002/pp-data".to_string(),
+            // An explicit collection above every UE.
+            "/nudr-dr/v2/subscription-data".to_string(),
+        ] {
+            assert!(uri_covers(&monitored, pp), "{monitored:?} must cover {pp}");
+        }
+        // pcfd's subscription: the per-UE policy-data collection.
+        assert!(uri_covers(
+            "/nudr-dr/v2/policy-data/ues",
+            "/nudr-dr/v2/policy-data/ues/imsi-001010000000002/am-data"
+        ));
+        // A change that replaces an ancestor of the monitored resource covers it.
+        assert!(uri_covers(
+            pp,
+            "/nudr-dr/v2/subscription-data/imsi-001010000000002"
         ));
     }
 
