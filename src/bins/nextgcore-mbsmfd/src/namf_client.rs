@@ -870,9 +870,8 @@ mod tests {
             .expect("B's context");
         release.await.expect("release");
 
-        let live = b_ref
-            .parse::<u64>()
-            .ok()
+        // #1856: the ref is `<epoch>-<id>`.
+        let live = nextgcore_amfd::ngap_mcast::parse_context_ref(&b_ref)
             .and_then(|r| nextgcore_amfd::context::amf_mcast().broadcast_context_find(r));
         assert!(
             live.is_some(),
@@ -960,9 +959,8 @@ mod tests {
         let b_ref = create.await.expect("create").expect("B's context");
         release.await.expect("release");
         assert_eq!(a_ref, b_ref, "the AMF handed B the context A held");
-        let live = b_ref
-            .parse::<u64>()
-            .ok()
+        // #1856: the ref is `<epoch>-<id>`.
+        let live = nextgcore_amfd::ngap_mcast::parse_context_ref(&b_ref)
             .and_then(|r| nextgcore_amfd::context::amf_mcast().broadcast_context_find(r));
         assert!(live.is_some(), "B keeps the context A released");
         assert_eq!(deletes.load(std::sync::atomic::Ordering::SeqCst), 0);
