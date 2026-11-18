@@ -70,8 +70,11 @@ compose files in step:
      ID, a non-https global.sbi.scheme, a malformed secretVersion or
      nfInstanceId, and replicas > 1, and renders with an empty siteId once
      every ID is pinned;
-   - rule 5 holds over `helm install --dry-run=client`, NOTES.txt included
-     (a templated http:// URL is only recognisable rendered).
+   - rule 5 holds over the rendered chart, NOTES.txt included (a templated
+     http:// URL is only recognisable rendered). Every helm call is offline:
+     `helm template` only, with KUBECONFIG pointing at an empty file, so no
+     kube context (devtest1 included) is ever contacted; NOTES.txt is rendered
+     by `helm template` from a copy of the chart that wraps it in a ConfigMap.
 
 Usage: check-nf-identities.py [--self-test] [--k8s] [--helm]
 """
@@ -555,12 +558,68 @@ def check_helm(release, docs, version=None, types=None, derived=None):
     return errors
 
 
-def helm_template(release, sets):
+def helm_offline_env():
+    """The environment of every helm call: no kube context to reach. KUBECONFIG
+    names an empty file and no context or API server is set, so even a chart
+    that did a `lookup` would see an empty cluster rather than devtest1."""
+    import tempfile
+    env = {k: v for k, v in os.environ.items()
+           if k not in ('HELM_KUBECONTEXT', 'HELM_KUBEAPISERVER', 'HELM_KUBETOKEN')}
+    fd, path = tempfile.mkstemp(prefix='check-nf-identities-kubeconfig-')
+    os.close(fd)
+    env['KUBECONFIG'] = path
+    return env, path
+
+
+def helm_template(release, sets, chart=None):
     import subprocess
-    args = ['helm', 'template', release, HELM_CHART, '-n', 'ns']
+    args = ['helm', 'template', release, chart or HELM_CHART, '-n', 'ns']
     for x in sets:
         args += ['--set', x]
-    return subprocess.run(args, capture_output=True, text=True)
+    env, kubeconfig = helm_offline_env()
+    try:
+        return subprocess.run(args, capture_output=True, text=True, env=env)
+    finally:
+        os.unlink(kubeconfig)
+
+
+NOTES_WRAPPER = """apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: check-nf-identities-notes
+data:
+  NOTES.txt: {{ include "check-nf-identities.notes" . | quote }}
+"""
+
+
+def helm_render_notes(sets):
+    """NOTES.txt as `helm install` would print it, rendered offline: `helm
+    template` does not render NOTES, so a copy of the chart defines its text as
+    a named template and a ConfigMap includes it. (subprocess result, NOTES text)"""
+    import shutil
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix='check-nf-identities-chart-')
+    try:
+        chart = os.path.join(tmp, 'nextgcore')
+        shutil.copytree(HELM_CHART, chart)
+        notes = os.path.join(chart, 'templates', 'NOTES.txt')
+        with open(notes) as f:
+            text = f.read()
+        os.unlink(notes)
+        with open(os.path.join(chart, 'templates', '_check-nf-identities-notes.tpl'), 'w') as f:
+            f.write('{{- define "check-nf-identities.notes" -}}\n' + text + '\n{{- end -}}\n')
+        with open(os.path.join(chart, 'templates', 'check-nf-identities-notes.yaml'), 'w') as f:
+            f.write(NOTES_WRAPPER)
+        r = helm_template(HELM_RELEASE, sets, chart)
+        rendered = ''
+        if r.returncode == 0:
+            for d in yaml.safe_load_all(r.stdout):
+                if isinstance(d, dict) and (d.get('metadata') or {}).get('name') == \
+                        'check-nf-identities-notes':
+                    rendered = (d.get('data') or {}).get('NOTES.txt') or ''
+        return r, rendered
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 HELM_REFUSALS = [
@@ -597,15 +656,16 @@ def helm_checks(table):
                           % (' --set '.join(sets), r.stderr.strip()))
     # Rule 5 over the rendered chart, NOTES included: a templated URL
     # (http://{{ ... }}/nnrf-...) is only recognisable once rendered, and
-    # `helm template` does not render NOTES.txt.
-    import subprocess
-    r = subprocess.run(['helm', 'install', '--dry-run=client', HELM_RELEASE, HELM_CHART,
-                        '-n', 'ns', '--set', 'global.siteId=ci'], capture_output=True, text=True)
+    # `helm template` does not render NOTES.txt. Offline (helm_render_notes).
+    r, notes = helm_render_notes(['global.siteId=ci'])
     if r.returncode != 0:
-        errors.append('helm install --dry-run=client failed:\n%s' % r.stderr)
+        errors.append('helm template of the chart with NOTES.txt failed:\n%s' % r.stderr)
+    elif 'nnrf-nfm' not in notes:
+        errors.append('the rendered NOTES.txt is empty or names no NRF URL: %r' % notes[:200])
     else:
-        errors += plaintext_nrf_uris('helm install --dry-run=client (manifests and NOTES)',
-                                     r.stdout)
+        errors += plaintext_nrf_uris('helm NOTES.txt (rendered)', notes)
+        errors += plaintext_nrf_uris('helm template (manifests)',
+                                     helm_template(HELM_RELEASE, ['global.siteId=ci']).stdout)
     # An empty siteId is fine once nothing is derived.
     pins = ['%s.nfInstanceId=6b1d7e3c-0000-4000-8000-%012x' % (nf, i) for i, nf in enumerate(
         'nrf amf smf ausf udm udr pcf nssf bsf'.split())]

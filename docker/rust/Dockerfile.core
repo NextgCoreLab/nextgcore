@@ -57,5 +57,10 @@ USER nextgcore
 
 EXPOSE 7777 38412 9090 8805/udp 2152/udp
 
+# #1617: /health over HTTP/2, h2c first, then TLS verified against the CA (the
+# NRF serves only TLS). The SBI server speaks h2 only, so the old HTTP/1.1
+# `curl -sf http://localhost:7777/health` could never pass. See the script for
+# NF_HEALTH_ADDR / _PORT / _TLS_NAME / _TLS_CA.
+COPY nf-healthcheck.sh /usr/local/bin/nf-healthcheck
 HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -sf http://localhost:7777/health || exit 1
+    CMD ["/usr/local/bin/nf-healthcheck"]
