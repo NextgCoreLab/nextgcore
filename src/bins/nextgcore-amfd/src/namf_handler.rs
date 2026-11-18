@@ -332,14 +332,22 @@ pub enum NamfHandlerError {
 /// retried transfer goes to a CM-CONNECTED UE) or is still being paged.
 pub const PAGING_ONGOING_RETRY_AFTER_S: u64 = 2;
 
-/// Whether a paging procedure is ongoing for `amf_ue_ngap_id` (#749). The AMF
-/// keeps no ARP priority per paging, so every transfer counts as the same
-/// priority as the one being paged for.
+/// Whether a paging procedure holding a transfer is ongoing for `amf_ue_ngap_id`
+/// (#749). The AMF keeps no ARP priority per paging, so every transfer counts as
+/// the same priority as the one being paged for.
+///
+/// #1760 review: a page started only for a LOCATION_REPORT subscription
+/// ([`PagingContext::location_only`]) holds no transfer and does not count. TS
+/// 23.502 §4.2.3.3 pages the UE for the SMF's downlink data, and refusing it with
+/// HIGHER_PRIORITY_REQUEST_ONGOING would claim a priority no transfer has. The
+/// transfer takes that page over instead (`AmfContext::paging_add` keeps the
+/// waiting subscriptions), so the UE's answer both reactivates the session and is
+/// reported.
 pub(crate) fn paging_ongoing(amf_ue_ngap_id: u64) -> bool {
     amf_self()
         .read()
         .ok()
-        .is_some_and(|c| c.paging_find(amf_ue_ngap_id).is_some())
+        .is_some_and(|c| c.paging_holds_transfer(amf_ue_ngap_id))
 }
 
 /// Namf handler result
@@ -740,6 +748,8 @@ pub fn handle_event_subscribe(
         reported_connectivity: std::collections::HashMap::new(),
         reported_location: None,
         taken_over: false,
+        one_time: false,
+        first_location_pending: false,
         reporting_threshold: None,
         location_filters: subscription
             .location_filter_list
@@ -884,6 +894,72 @@ pub(crate) fn initiate_paging_for_idle_ue(
     pdu_session_id: Option<u8>,
     failure_notify_uri: Option<&str>,
 ) {
+    let paging_ctx = idle_ue_paging_context(
+        amf_ue,
+        pending_n1,
+        pending_n2,
+        paged_n2,
+        pdu_session_id,
+        failure_notify_uri,
+    );
+    let (tmsi, tac) = (paging_ctx.tmsi, paging_ctx.tac);
+
+    // Mark session as paging ongoing; keep the consumer's failure-notify
+    // URI so a paging timeout can trigger N1N2MsgTxfrFailureNotification
+    let location = paging_ctx.n1n2_msg_data_uri.clone();
+
+    // Store paging context in AMF global context. The NGAP server's paging pump
+    // (`NgapServer::process_paging`) sends the PAGING and runs T3513.
+    if let Ok(context) = amf_self().read() {
+        context.paging_add(paging_ctx);
+    }
+    start_paging_nwdaf_hint(amf_ue);
+    if let Some(sess) = sess {
+        sess.store_paging_info(&location, failure_notify_uri);
+    }
+
+    log::info!(
+        "[{}] Paging initiated: TMSI=0x{:08x}, TAC={}, PSI={:?}",
+        amf_ue.supi.as_deref().unwrap_or("unknown"),
+        tmsi,
+        tac,
+        pdu_session_id
+    );
+}
+
+/// The SUPI to ask the NWDAF about for a page of `amf_ue`, under `nwdaf-mobility`
+/// (nextgsim#464, TS 23.501 §5.4.3.1); `None` otherwise.
+fn paging_nwdaf_supi(amf_ue: &AmfUe) -> Option<String> {
+    match (paging_strategy(), amf_ue.supi.as_deref()) {
+        (crate::context::PagingStrategy::NwdafMobility, Some(supi)) => Some(supi.to_string()),
+        _ => None,
+    }
+}
+
+/// nextgsim#464: start the NWDAF query for the page just queued for `amf_ue`. It
+/// starts once the context is queued, so its answer always finds it. When it does
+/// not start, the first PAGING is released now, to the registration area.
+pub(crate) fn start_paging_nwdaf_hint(amf_ue: &AmfUe) {
+    let Some(supi) = paging_nwdaf_supi(amf_ue) else {
+        return;
+    };
+    if !crate::nwdaf_mobility::spawn_hint(amf_ue.id, supi) {
+        if let Ok(context) = amf_self().read() {
+            context.paging_set_nwdaf_hint(amf_ue.id, None);
+        }
+    }
+}
+
+/// The paging context for CM-IDLE `amf_ue`, not yet queued (see
+/// [`initiate_paging_for_idle_ue`]).
+pub(crate) fn idle_ue_paging_context(
+    amf_ue: &AmfUe,
+    pending_n1: Option<Vec<u8>>,
+    pending_n2: Option<Vec<u8>>,
+    paged_n2: PagedN2,
+    pdu_session_id: Option<u8>,
+    failure_notify_uri: Option<&str>,
+) -> PagingContext {
     // Extract 5G-S-TMSI components from current GUTI
     let tmsi = amf_ue.current_guti.tmsi;
     let amf_set_id = amf_ue.current_guti.amf_set_id;
@@ -927,16 +1003,15 @@ pub(crate) fn initiate_paging_for_idle_ue(
         nwdaf_wait_until: None,
         nwdaf_predicted: None,
         nwdaf_last_cell: None,
+        location_report_subs: Vec::new(),
+        location_only: false,
     };
     let mut paging_ctx = paging_ctx;
     // nextgsim#464, TS 23.501 §5.4.3.1: under `nwdaf-mobility`, the first PAGING
     // waits (bounded) for the NWDAF's UE mobility prediction. The query starts
-    // below, once the context is queued, so its answer always finds it.
-    let ask_nwdaf = match (paging_strategy(), amf_ue.supi.as_deref()) {
-        (crate::context::PagingStrategy::NwdafMobility, Some(supi)) => Some(supi.to_string()),
-        _ => None,
-    };
-    if ask_nwdaf.is_some() {
+    // once the context is queued (`start_paging_nwdaf_hint`), so its answer always
+    // finds it.
+    if paging_nwdaf_supi(amf_ue).is_some() {
         paging_ctx.nwdaf_wait_until =
             Some(std::time::Instant::now() + crate::nwdaf_mobility::HINT_TIMEOUT);
         // 0 is the never-learned default NCI (`namf_server::parse_ncgi`).
@@ -946,35 +1021,7 @@ pub(crate) fn initiate_paging_for_idle_ue(
         }
     }
 
-    // Mark session as paging ongoing; keep the consumer's failure-notify
-    // URI so a paging timeout can trigger N1N2MsgTxfrFailureNotification
-    let location = paging_ctx.n1n2_msg_data_uri.clone();
-
-    // Store paging context in AMF global context. The NGAP server's paging pump
-    // (`NgapServer::process_paging`) sends the PAGING and runs T3513.
-    let ctx = amf_self();
-    if let Ok(context) = ctx.read() {
-        context.paging_add(paging_ctx);
-    }
-    if let Some(supi) = ask_nwdaf {
-        if !crate::nwdaf_mobility::spawn_hint(amf_ue.id, supi) {
-            // Not started: release the first PAGING now, to the registration area.
-            if let Ok(context) = ctx.read() {
-                context.paging_set_nwdaf_hint(amf_ue.id, None);
-            }
-        }
-    }
-    if let Some(sess) = sess {
-        sess.store_paging_info(&location, failure_notify_uri);
-    }
-
-    log::info!(
-        "[{}] Paging initiated: TMSI=0x{:08x}, TAC={}, PSI={:?}",
-        amf_ue.supi.as_deref().unwrap_or("unknown"),
-        tmsi,
-        tac,
-        pdu_session_id
-    );
+    paging_ctx
 }
 
 /// Page a CM-IDLE UE for an LMF's positioning transfer (#1087, TS 23.273: LPP to

@@ -1961,11 +1961,19 @@ fn subscription_echo_json(sub: &EventSubscription) -> Value {
     if sub.any_ue {
         subscription["anyUE"] = json!(true);
     }
+    // #1760: the reporting mode the AMF applies.
+    let trigger = if sub.one_time {
+        "ONE_TIME"
+    } else {
+        "CONTINUOUS"
+    };
     if let Some(expiry) = sub.expiry {
         subscription["options"] = json!({
-            "trigger": "CONTINUOUS",
+            "trigger": trigger,
             "expiry": system_time_to_rfc3339(expiry),
         });
+    } else if sub.one_time {
+        subscription["options"] = json!({ "trigger": trigger });
     }
     subscription
 }
@@ -2209,6 +2217,14 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
         None => None,
     };
 
+    // #1760: the reporting mode (AmfEventMode.trigger, TS 29.518 §6.2.6.2.4). ONE_TIME
+    // is told once; CONTINUOUS and PERIODIC are reported as CONTINUOUS (periodic
+    // reporting is not implemented).
+    let one_time = subscription
+        .pointer("/options/trigger")
+        .and_then(Value::as_str)
+        == Some("ONE_TIME");
+
     let subscription_id = format!("sub-{}", uuid::Uuid::new_v4());
     let sub = EventSubscription {
         subscription_id: subscription_id.clone(),
@@ -2231,6 +2247,8 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
         reported_connectivity: std::collections::HashMap::new(),
         reported_location: None,
         taken_over: false,
+        one_time,
+        first_location_pending: false,
         reporting_threshold,
         location_filters,
     };
@@ -2286,11 +2304,33 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
             );
         }
     }
+    // #1760: a ONE_TIME subscription is told once, by whichever report comes first.
+    let mut reported = !report_list.is_empty();
     if let Some(first) = first_reach {
-        first.deliver_and_recheck(&sub);
+        if sub.one_time {
+            if let Some(report) = first.notify {
+                reported = true;
+                deliver_reachability_report(sub.clone(), report);
+            }
+        } else {
+            first.deliver_and_recheck(&sub);
+        }
     }
-    if let Some(report) = first_location {
-        deliver_location_report(sub.clone(), report);
+    match first_location {
+        FirstLocation::Notify(report) if !(sub.one_time && reported) => {
+            reported = true;
+            deliver_location_report(sub.clone(), report);
+        }
+        FirstLocation::Page(ue) if !(sub.one_time && reported) => {
+            page_for_first_location(&ue, &subscription_id);
+        }
+        _ => {}
+    }
+    if sub.one_time && reported {
+        if let Ok(guard) = ctx.read() {
+            guard.event_subscription_remove(&subscription_id);
+        }
+        log::info!("Event subscription {subscription_id} is ONE_TIME and was reported: removed");
     }
 
     log::info!(
@@ -2722,7 +2762,12 @@ fn fire_amf_event_matching(
         guard
             .event_subscriptions_matching_ue(event_type, supi, gpsi, pei)
             .into_iter()
+            // #1760: a first LOCATION_REPORT waiting on a page is made by the page.
+            .filter(|s| !(s.first_location_pending && event_type == "LOCATION_REPORT"))
             .filter(|s| wants(&guard, s))
+            // #1760: a ONE_TIME subscription is told once: the fire point that claims
+            // it (removes it) is the one that reports.
+            .filter(|s| !s.one_time || guard.event_subscription_claim_one_time(&s.subscription_id))
             .collect()
     };
     if subs.is_empty() {
@@ -2927,51 +2972,84 @@ pub(crate) fn first_reachability_report(
     })
 }
 
+/// What a new subscription's first LOCATION_REPORT is (#1737, #1760).
+#[derive(Debug)]
+pub(crate) enum FirstLocation {
+    /// None to make here: no LOCATION_REPORT, no registered UE, or the immediateFlag
+    /// (whose report is already in the response's `reportList`).
+    None,
+    /// This notification, once the subscription is stored.
+    Notify(Value),
+    /// The UE is CM-IDLE over 3GPP access: it is paged first, and the page's outcome
+    /// makes the report ([`page_for_first_location`]).
+    Page(Box<AmfUe>),
+}
+
 /// #1737: the first LOCATION_REPORT of a new subscription for `supi`, TS 29.518
-/// §5.3.2.2.2 (`29518-k00.txt:5731-5737`): with the CONTINUOUS or PERIODIC mode and
+/// §5.3.2.2.2 (`29518-k00.txt:5731-5743`): with the CONTINUOUS or PERIODIC mode and
 /// no immediateFlag, *"the AMF shall send a first event notification to notify the
 /// current location of the UE after the subscription is created"*. The ONE_TIME
-/// mode without the immediateFlag gets the same notification (`:5719-5724`). This
-/// AMF does not read the mode (`options.trigger`), so every such subscription gets
-/// it.
+/// mode without the immediateFlag gets the same notification (`:5719-5724`).
 ///
-/// Returns the notification to send once the subscription is stored, or `None`
-/// with the immediateFlag, whose report is already in the response's `reportList`.
-/// Either way the location reported is recorded in `sub.reported_location`, so the
-/// next location evaluation measures this subscription's change from what it was
-/// told (see [`fire_location_change_report`]).
+/// For a CM-CONNECTED UE the notification is made now, with its location
+/// ([`FirstLocation::Notify`]), and that location is recorded in
+/// `sub.reported_location`, so the next location evaluation measures this
+/// subscription's change from what it was told (see [`fire_location_change_report`]).
+/// With the immediateFlag only the location is recorded.
+///
+/// #1760: the last known location is for a UE that *"does not respond to the
+/// paging"*, so a CM-IDLE UE that can be paged is paged first
+/// ([`FirstLocation::Page`], `sub.first_location_pending` set). A CM-IDLE UE that
+/// cannot be paged (its record has no registration area) gets the last known
+/// location now, with `ageOfLocationInformation` the minutes since it was acquired
+/// and at least 1.
 ///
 /// A UE that is not yet registered gets no first report here: its Registration
 /// Accept is where the AMF first reports its location, every dimension counting as
-/// changed (#1716). For a CM-IDLE UE the location is the last known one, with
-/// `ageOfLocationInformation` the minutes since it was acquired and at least 1, as
-/// the clause requires for a UE that does not answer paging. This AMF does not page
-/// the UE for it.
+/// changed (#1716).
 pub(crate) fn first_location_report(
     sub: &mut EventSubscription,
     immediate: bool,
     supi: Option<&str>,
-) -> Option<Value> {
+) -> FirstLocation {
     if !sub.event_types.iter().any(|t| t == "LOCATION_REPORT") {
-        return None;
+        return FirstLocation::None;
     }
-    let ue = supi.and_then(find_ue_by_context_id)?;
-    let record = amf_self()
+    let Some(ue) = supi.and_then(find_ue_by_context_id) else {
+        return FirstLocation::None;
+    };
+    let Some(record) = amf_self()
         .read()
         .ok()
         .and_then(|g| g.ue_store().get(ue.id))
-        .filter(|r| r.is_registered())?;
-    sub.reported_location = Some((
+        .filter(|r| r.is_registered())
+    else {
+        return FirstLocation::None;
+    };
+    let baseline = (
         ue.nr_tai.clone(),
         ue.nr_cgi.clone(),
         record.association_id(),
-    ));
+    );
     if immediate {
-        return None;
+        sub.reported_location = Some(baseline);
+        return FirstLocation::None;
     }
-    let mut location = nr_location_json(&ue);
-    if record.is_cm_idle() {
-        let minutes = location_acquired_at(&ue)
+    if record.is_cm_idle() && ue_pageable(&ue) {
+        sub.first_location_pending = true;
+        return FirstLocation::Page(Box::new(ue));
+    }
+    sub.reported_location = Some(baseline);
+    FirstLocation::Notify(location_report(&ue, record.is_cm_idle()))
+}
+
+/// A LOCATION_REPORT of `ue`'s location: the last known one when `last_known`, with
+/// `ageOfLocationInformation` the minutes since it was acquired and at least 1
+/// (TS 29.518 §5.3.2.2.2: "a value other than 0"), else the current one.
+fn location_report(ue: &AmfUe, last_known: bool) -> Value {
+    let mut location = nr_location_json(ue);
+    if last_known {
+        let minutes = location_acquired_at(ue)
             .and_then(|t| t.elapsed().ok())
             .map(|d| d.as_secs() / 60)
             .unwrap_or(0)
@@ -2989,7 +3067,104 @@ pub(crate) fn first_location_report(
     if let Some(pei) = ue.pei.as_deref() {
         report["pei"] = json!(pei);
     }
-    Some(report)
+    report
+}
+
+/// #1760: page CM-IDLE `ue` for subscription `subscription_id`'s first
+/// LOCATION_REPORT. A page already running for the UE (for a downlink, or for
+/// another subscription) is joined rather than replaced, since it brings the UE back
+/// just the same. Otherwise a [`PagingContext::location_only`] page is started.
+///
+/// #1760 review: join-or-create is one operation under the paging-map write lock
+/// (`paging_join_or_add_location`), so a page another task queues between a check
+/// and an insert is never overwritten, and its N2 or failure-notify URI never lost.
+///
+/// [`PagingContext::location_only`]: crate::context::PagingContext::location_only
+pub(crate) fn page_for_first_location(ue: &AmfUe, subscription_id: &str) {
+    let page = crate::namf_handler::idle_ue_paging_context(
+        ue,
+        None,
+        None,
+        crate::namf_handler::PagedN2::Setup,
+        None,
+        None,
+    );
+    let joined = amf_self()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .paging_join_or_add_location(page, subscription_id);
+    if !joined {
+        crate::namf_handler::start_paging_nwdaf_hint(ue);
+    }
+    log::info!(
+        "[{}] LOCATION_REPORT {subscription_id}: the UE is CM-IDLE, paging it for its \
+         current location (TS 29.518 §5.3.2.2.2)",
+        ue.supi.as_deref().unwrap_or("?")
+    );
+}
+
+/// #1760: the page `paging` ended, and the first LOCATION_REPORTs waiting on it are
+/// made. `answered`: the UE answered it, at this location and on this NGAP
+/// association, and its current location is reported. `None`: it did not answer
+/// (T3513 ran out, or the UE was deregistered), and its last known location is
+/// reported with its age. A subscription gone meanwhile is skipped. A ONE_TIME one is
+/// removed with its report.
+pub(crate) fn first_locations_after_page(
+    paging: &crate::context::PagingContext,
+    answered: Option<(&AmfUe, u64)>,
+) {
+    if paging.location_report_subs.is_empty() {
+        return;
+    }
+    let (ue, association, last_known) = match answered {
+        Some((ue, association)) => (ue.clone(), association, false),
+        None => {
+            let Some(ue) = paging.supi.as_deref().and_then(find_ue_by_context_id) else {
+                // #1760 review: there is no UE to report the location of. Each
+                // waiting subscription still stops waiting, or the fire points would
+                // skip it for good; its next report is the UE's next registration
+                // (#1716).
+                if let Ok(g) = amf_self().read() {
+                    for id in &paging.location_report_subs {
+                        if g.event_subscription_abandon_first_location(id) {
+                            log::info!(
+                                "LOCATION_REPORT {id}: the page ended and its UE is gone; \
+                                 nothing is reported, and the subscription waits no longer"
+                            );
+                        }
+                    }
+                }
+                return;
+            };
+            let association = amf_self()
+                .read()
+                .ok()
+                .and_then(|g| g.ue_store().get(ue.id))
+                .map_or(0, |r| r.association_id());
+            (ue, association, true)
+        }
+    };
+    let told = (ue.nr_tai.clone(), ue.nr_cgi.clone(), association);
+    for id in &paging.location_report_subs {
+        let sub = amf_self()
+            .read()
+            .ok()
+            .and_then(|g| g.event_subscription_finish_first_location(id, told.clone()));
+        let Some(sub) = sub else {
+            continue;
+        };
+        log::info!(
+            "[{}] LOCATION_REPORT {id}: the page {}, its {} location is reported",
+            ue.supi.as_deref().unwrap_or("?"),
+            if last_known {
+                "was not answered"
+            } else {
+                "was answered"
+            },
+            if last_known { "last known" } else { "current" },
+        );
+        deliver_location_report(sub, location_report(&ue, last_known));
+    }
 }
 
 /// Send a LOCATION_REPORT notification `report` to `sub` (#1737).
@@ -4206,6 +4381,9 @@ pub(crate) fn take_over_transferred_event_subscriptions(
             reported_connectivity: std::collections::HashMap::new(),
             reported_location: None,
             taken_over: true,
+            // #1760: the mode travels with it (the echo carries `options.trigger`).
+            one_time: entry.pointer("/options/trigger").and_then(Value::as_str) == Some("ONE_TIME"),
+            first_location_pending: false,
             reporting_threshold: entry.get("eventList").and_then(Value::as_array).and_then(
                 |events| {
                     events
@@ -8691,6 +8869,8 @@ mod tests {
             reported_connectivity: std::collections::HashMap::new(),
             reported_location: None,
             taken_over: false,
+            one_time: false,
+            first_location_pending: false,
             reporting_threshold: None,
             location_filters: Vec::new(),
         };
@@ -16806,6 +16986,8 @@ mod tests {
             reported_connectivity: std::collections::HashMap::new(),
             reported_location: None,
             taken_over: false,
+            one_time: false,
+            first_location_pending: false,
             reporting_threshold: None,
             location_filters: Vec::new(),
         };
