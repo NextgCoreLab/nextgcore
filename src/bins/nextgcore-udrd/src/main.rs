@@ -8343,6 +8343,139 @@ udr:
             .expect("array")
         );
     }
+
+    // ========================================================================
+    // #1797: no key material in a DataChangeNotify.
+    // ========================================================================
+
+    /// The next notification `rx` receives within `ms`, as (path, body).
+    async fn next_notification(
+        rx: &mut mpsc::UnboundedReceiver<(String, String)>,
+        ms: u64,
+    ) -> Option<(String, String)> {
+        tokio::time::timeout(Duration::from_millis(ms), rx.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// **#1797**, TS 33.501 §6.1.1 / TS 29.505 §5.2.2: an authentication-subscription
+    /// provisioning PUT is notified to a subscriber monitoring that resource as a
+    /// REPLACE of the whole resource with NO `newValue`: the change is told, the
+    /// long-term key and the operator key are not. A subscriber that names the UE's
+    /// `ueId` but monitors only its pp-data is not told of the authentication
+    /// subscription at all, and is told of a pp-data change (the positive control).
+    ///
+    /// REVERT-VERIFIED: with `notified_value` returning the document for every
+    /// resource, the notification carries `encPermanentKey` ("no key material");
+    /// with the `ueId` match widening the subscription again (`ue_ok || uri_match`),
+    /// the pp-data subscriber is told of the authentication subscription ("a ueId
+    /// does not widen").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_authentication_subscription_change_is_notified_without_its_keys_1797() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _store = DbiTestStore::enable().await;
+        let (udr, client, _listener, cb_port, mut rx) = start_udr_and_listener().await;
+        let supi = "imsi-001019900017971";
+        let auth = format!(
+            "/nudr-dr/v2/subscription-data/{supi}/authentication-data/authentication-subscription"
+        );
+        let pp = format!("/nudr-dr/v2/subscription-data/{supi}/pp-data");
+        let mut ids = Vec::new();
+        for (tag, monitored) in [("auth", &auth), ("pp", &pp)] {
+            let resp = client
+                .post_json(
+                    "/nudr-dr/v2/subscription-data/subs-to-notify",
+                    &json!({
+                        "ueId": supi,
+                        "callbackReference": format!("http://127.0.0.1:{cb_port}/cb-1797/{tag}"),
+                        "monitoredResourceUris": [monitored],
+                    }),
+                )
+                .await
+                .expect("subscribe");
+            assert_eq!(resp.status, 201);
+            ids.push(
+                json_of(&resp)["subscriptionId"]
+                    .as_str()
+                    .expect("id")
+                    .to_string(),
+            );
+        }
+
+        wsb6_provision(&client, supi, 0x40).await;
+        let (path, body) = next_notification(&mut rx, 3000)
+            .await
+            .expect("the authentication-subscription change is notified");
+        assert_eq!(
+            path, "/cb-1797/auth",
+            "to the subscriber monitoring it only"
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(v["notifyItems"][0]["resourceId"], auth);
+        assert_eq!(
+            v["notifyItems"][0]["changes"],
+            json!([{"op": "REPLACE", "path": ""}]),
+            "no key material: the change is told without its value: {body}"
+        );
+        for secret in [
+            "465b5ce8b199b49faa5f0a2ee238a6bc",
+            "e8ed289deba952e4283b54e88e6183ca",
+        ]
+        .iter()
+        .chain(nextgcore_udrd::data_store::KEY_MATERIAL_MEMBERS.iter())
+        {
+            assert!(!body.contains(secret), "{secret} leaked: {body}");
+        }
+        assert!(
+            next_notification(&mut rx, 300).await.is_none(),
+            "a ueId does not widen a pp-data subscription to the authentication data"
+        );
+
+        let resp = client
+            .put_json(&pp, &json!({"communicationCharacteristics": {}}))
+            .await
+            .expect("PUT pp-data");
+        assert_eq!(resp.status, 201);
+        let (path, body) = next_notification(&mut rx, 3000)
+            .await
+            .expect("the pp-data change is notified");
+        assert_eq!(path, "/cb-1797/pp");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(
+            v["notifyItems"][0]["changes"][0]["newValue"],
+            json!({"communicationCharacteristics": {}}),
+            "other resources still carry their value"
+        );
+
+        for id in ids {
+            data_store::store().sub_remove(&id);
+        }
+        udr.stop().await.expect("stop");
+    }
+
+    /// #1797: key material is removed from any notified document at any depth, and an
+    /// authentication subscription carries no value at all.
+    #[test]
+    fn notified_values_never_carry_key_material_1797() {
+        use nextgcore_udrd::data_store::notified_value;
+        let doc = json!({
+            "keep": 1,
+            "encPermanentKey": "k",
+            "nested": [{"encOpcKey": "o", "encTopcKey": "t", "x": true}],
+        });
+        assert_eq!(
+            notified_value("/nudr-dr/v2/subscription-data/imsi-1/pp-data", &doc),
+            Some(json!({"keep": 1, "nested": [{"x": true}]}))
+        );
+        assert_eq!(
+            notified_value(
+                "/nudr-dr/v2/subscription-data/imsi-1/authentication-data/authentication-subscription",
+                &json!({"sequenceNumber": {}})
+            ),
+            None
+        );
+    }
 }
 
 /// #1313 review: a config that does not parse now fails startup, so every
