@@ -66,7 +66,15 @@ async fn nrfd(bin: &Path, tag: &str, trust: &Path) -> NfProcess {
 }
 
 /// smfd enforcing OAuth2 on its service routes, JWKS and registration at `nrf`.
-async fn smfd(bin: &Path, tag: &str, nrf: u16) -> NfProcess {
+///
+/// With OAuth2 on, smfd's own NRF calls carry an `nnrf-nfm` token too, which it
+/// obtains before NFRegister (TS 29.510 §6.1.8, #1667). nrfd grants that token to
+/// a not-yet-registered NF only on a proven identity (here a CCA, TS 33.501
+/// §13.3.8), so smfd gets a CCA key whose public half is published into nrfd's
+/// trust directory `trust`, as eesd's is. Without one its token request is
+/// `invalid_client` and, failing closed, it never registers.
+async fn smfd(bin: &Path, tag: &str, nrf: u16, trust: &Path) -> NfProcess {
+    let trust = trust.to_path_buf();
     NfSpawn::new(bin, &format!("{tag}-smfd"))
         .ready_when_logged("SBI HTTP/2 server listening on")
         .spawn_async(move |cmd, port, dir| {
@@ -83,6 +91,8 @@ async fn smfd(bin: &Path, tag: &str, nrf: u16) -> NfProcess {
             cmd.arg("-c")
                 .arg(&config)
                 .env("NEXTGCORE_SBI_OAUTH2_REQUIRE", "1")
+                .env("NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE", dir.join("cca.key"))
+                .env("NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR", &trust)
                 .env("SMF_PFCP_ADDR", "127.0.0.1")
                 .env("SMF_PFCP_PORT", "0")
                 .env("SMF_METRICS_PORT", "0");
@@ -219,7 +229,7 @@ async fn the_subscribe_carries_an_nrf_token_the_oauth2_smf_accepts() {
     let trust = &trust.0;
 
     let nrf = nrfd(&nrfd_bin, "eesd-1529-token", trust).await;
-    let smf = smfd(&smfd_bin, "eesd-1529-token", nrf.port()).await;
+    let smf = smfd(&smfd_bin, "eesd-1529-token", nrf.port(), trust).await;
     smf_registered(&smf).await;
 
     // Token arm: held, never refused. The eesId is not a UUID, so the AF

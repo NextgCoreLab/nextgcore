@@ -4176,8 +4176,9 @@ impl RegistrantIdentity {
     /// certificate this process verified, or of one a declared trusted
     /// terminator forwarded. An access-token subject is not one: the operator
     /// decision on #1617 makes NF management need a certificate identity
-    /// (TS 33.310 §6.1.3c.3, TS 33.501 §13.1.0), and a first NFRegister cannot
-    /// carry a token at all.
+    /// (TS 33.310 §6.1.3c.3, TS 33.501 §13.1.0). Since #1667 a first NFRegister
+    /// can carry a token, but that token was itself granted on a proven identity,
+    /// so the certificate stays the identity NF management is bound to.
     fn certificate_identity(&self) -> Option<&str> {
         self.instance_ids
             .iter()
@@ -4582,6 +4583,83 @@ async fn handle_access_token_request(request: &SbiRequest) -> SbiResponse {
 /// is a `OnceLock`, so a single test process can otherwise only ever see one
 /// policy, and the security-relevant cases here (authenticated vs not, trusted
 /// terminator vs not) each need a different one.
+/// #1667: the consumer a token for THIS NRF's own APIs is authorized for, when it
+/// is not (yet) in the registry.
+///
+/// TS 29.510 §6.1.8 (`29510-k00.txt:18897-18902`) and §6.2.8 (`:25345-25349`):
+/// when OAuth2 is used on Nnrf_NFManagement or Nnrf_NFDiscovery, the consumer
+/// "prior to consuming services offered by the" API "shall obtain a token". So
+/// the token for its first NFRegister is requested before it is registered, and
+/// refusing every unregistered consumer would make that impossible (TS 33.501
+/// §13.3.1.3, `33501-k20.txt:14183`, makes the token optional there, not
+/// forbidden). Without a profile, the grant rests on what was PROVEN instead:
+///
+/// - an identity, from a verified client certificate or a signature-verified
+///   CCA (never a self-asserted `nfInstanceId`);
+/// - the target is this NRF: `targetNfType` NRF, or this NRF's instance ID;
+/// - every scope is an Nnrf_NFManagement or Nnrf_NFDiscovery one (Tables
+///   6.1.8-1, 6.2.8-1): `nnrf-nfm`, `nnrf-disc`, or a `nnrf-nfm:` / `nnrf-disc:`
+///   resource scope;
+/// - when the caller's verified certificate names NF types (RFC 9310), the
+///   asserted `nfType` is one of them. A certificate naming none, or a CCA,
+///   leaves `nfType` asserted, as the registration that follows is: #1611 binds
+///   that registration to the certificate, and the NRF's own profile decides
+///   which types its services allow, as for any producer.
+///
+/// `Err` is the reason appended to the `invalid_client` description.
+fn unregistered_nrf_api_consumer(
+    request: &SbiRequest,
+    authentication: &ClientAuthentication,
+    nf_type: &str,
+    target_nf_type: &str,
+    target_nf_instance_id: &str,
+    scope: &str,
+) -> Result<NfProfile, String> {
+    let Some(identity) = authentication.identity.as_deref() else {
+        return Err(String::new());
+    };
+    let to_this_nrf = if target_nf_instance_id.is_empty() {
+        target_nf_type.eq_ignore_ascii_case("NRF")
+    } else {
+        nextgcore_nrfd::nnrf_handler::same_nf_instance_id(target_nf_instance_id, nrf_instance_id())
+            && (target_nf_type.is_empty() || target_nf_type.eq_ignore_ascii_case("NRF"))
+    };
+    if !to_this_nrf {
+        return Err(String::new());
+    }
+    let nrf_api_scope = |s: &str| {
+        ["nnrf-nfm", "nnrf-disc"]
+            .iter()
+            .any(|api| s == *api || s.strip_prefix(api).is_some_and(|r| r.starts_with(':')))
+    };
+    if !scope.split_whitespace().all(nrf_api_scope) {
+        return Err(String::new());
+    }
+    // A forwarded identity's connection certificate is the terminator's, so its
+    // NF types are not the caller's (as in `RegistrantIdentity::of`).
+    let direct = request
+        .peer_cert_nf_instance_id
+        .as_deref()
+        .is_some_and(|id| !id.trim().is_empty());
+    let cert_types = &request.peer_cert_nf_types;
+    if authentication.via_transport
+        && direct
+        && !cert_types.is_empty()
+        && !cert_types.iter().any(|t| t.eq_ignore_ascii_case(nf_type))
+    {
+        return Err(format!(
+            ", and nfType {nf_type:?} is not among the NF types of its client certificate \
+             ({cert_types:?})"
+        ));
+    }
+    NfProfile::from_json(&serde_json::json!({
+        "nfInstanceId": identity,
+        "nfType": nf_type,
+        "nfStatus": "REGISTERED",
+    }))
+    .map_err(|missing| format!(" (profile for the token: {missing:?})"))
+}
+
 async fn handle_access_token_request_with_policy(
     request: &SbiRequest,
     policy: &NrfPolicy,
@@ -4659,13 +4737,27 @@ async fn handle_access_token_request_with_policy(
 
     // Verify that the requesting NF is registered: an unknown client is an
     // invalid_client error (RFC 6749 §5.2; TS 29.510 carries it in a 400
-    // AccessTokenErr rather than a bare 401).
+    // AccessTokenErr rather than a bare 401). The one exception is a token for
+    // this NRF's own APIs (#1667): see `unregistered_nrf_api_consumer`.
     let manager = nf_manager();
-    let Some(consumer) = manager.get(&nf_instance_id) else {
-        return token_error(
-            "invalid_client",
-            &format!("NF instance {nf_instance_id} is not registered with this NRF"),
-        );
+    let consumer = match manager.get(&nf_instance_id) {
+        Some(consumer) => consumer,
+        None => match unregistered_nrf_api_consumer(
+            request,
+            &authentication,
+            &nf_type,
+            &target_nf_type,
+            &target_nf_instance_id,
+            &req.scope,
+        ) {
+            Ok(consumer) => consumer,
+            Err(why) => {
+                return token_error(
+                    "invalid_client",
+                    &format!("NF instance {nf_instance_id} is not registered with this NRF{why}"),
+                );
+            }
+        },
     };
 
     // nrfd-04/-07: resolve the producer set. With targetNfInstanceId, pin the
@@ -4679,7 +4771,7 @@ async fn handle_access_token_request_with_policy(
     // already bound to it must be able to refresh its token); SUSPENDED is "not
     // operative" (e.g. heartbeat failure), so it cannot vouch for a token. An
     // unknown status is treated as not operative.
-    let all: Vec<NfProfile> = manager
+    let mut all: Vec<NfProfile> = manager
         .list()
         .into_iter()
         .filter(|p| {
@@ -4688,6 +4780,18 @@ async fn handle_access_token_request_with_policy(
                 .any(|s| p.nf_status.eq_ignore_ascii_case(s))
         })
         .collect();
+    // #1667: this NRF produces its own APIs whether or not its registry holds its
+    // own entry (it does only when `registers_itself`). Without this, an NF that
+    // attaches tokens to its NRF calls (its `sbi.oauth2.require` on) would be
+    // refused `invalid_scope` for nnrf-nfm by an NRF that does not gate its own
+    // APIs, and, the client failing closed (#63), could not register at all.
+    if !all.iter().any(|p| {
+        nextgcore_nrfd::nnrf_handler::same_nf_instance_id(&p.nf_instance_id, nrf_instance_id())
+    }) {
+        if let Ok(own) = NfProfile::from_json(&nrf_self_profile()) {
+            all.push(own);
+        }
+    }
     let target_instance: Option<NfProfile> = if !target_nf_instance_id.is_empty() {
         let inst = all
             .iter()
@@ -11883,5 +11987,168 @@ mod registry_uuid_case_tests_1633 {
             .expect("bounded");
         let _ = nf_manager().deregister(lower);
         server.stop().await.ok();
+    }
+}
+
+/// #1667: an NF obtains its token for this NRF's own APIs BEFORE its first
+/// NFRegister (TS 29.510 §6.1.8 / §6.2.8), so the token endpoint grants
+/// `nnrf-nfm` / `nnrf-disc` to a consumer the registry does not hold yet, on the
+/// identity it proved, and the nrfd-06 gate admits that token.
+#[cfg(test)]
+mod nrf_api_tokens_tests_1667 {
+    use super::*;
+    use serde_json::json;
+
+    /// A token request for `nf_type` `id`, targeting `target`, presented over a
+    /// connection whose verified client certificate is `cert` (URN, NFTypes).
+    fn token_req(
+        id: &str,
+        nf_type: &str,
+        target: serde_json::Value,
+        scope: &str,
+        cert: Option<(&str, &[&str])>,
+    ) -> SbiRequest {
+        let mut body = json!({
+            "grant_type": "client_credentials", "nfInstanceId": id, "nfType": nf_type,
+            "scope": scope,
+        });
+        for (k, v) in target.as_object().expect("target fields") {
+            body[k] = v.clone();
+        }
+        let mut r = SbiRequest::post("/oauth2/token");
+        r.http.set_content(body.to_string());
+        if let Some((cert_id, types)) = cert {
+            r.peer_cert_nf_instance_id = Some(cert_id.to_string());
+            r.peer_cert_nf_types = types.iter().map(|t| t.to_string()).collect();
+        }
+        r
+    }
+
+    fn error_of(resp: &SbiResponse) -> String {
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap();
+        format!(
+            "{} {}",
+            v["error"].as_str().unwrap_or_default(),
+            v["error_description"].as_str().unwrap_or_default()
+        )
+    }
+
+    /// An NF the registry does not hold, authenticated by its client
+    /// certificate under the default policy (client authentication required),
+    /// gets a token for each NRF API, aimed at `targetNfType: NRF` or at this
+    /// NRF's instance ID; the gate admits it as that NF; without it, NFRegister
+    /// is 401. This holds with the NRF's own entry ABSENT from its registry.
+    ///
+    /// REVERT-VERIFIED: without `unregistered_nrf_api_consumer`, and separately
+    /// without the self-profile fallback in the producer set, no token is
+    /// granted (the first request is refused, not 200).
+    #[tokio::test]
+    async fn an_unregistered_nf_gets_an_nrf_token_on_its_certificate_1667() {
+        let _self_entry = self_entry_test_lock().lock().await;
+        nf_manager().deregister(nrf_instance_id()).ok();
+        let id = "1667c0c0-0000-4000-8000-00000000000c";
+        assert!(nf_manager().get(id).is_none(), "unregistered");
+        let policy = NrfPolicy::default();
+        assert!(policy.require_client_auth, "the real default");
+        let jwks = nrf_jwks_json();
+        let nfm = format!("/nnrf-nfm/v1/nf-instances/{id}");
+        let disc = "/nnrf-disc/v1/nf-instances?target-nf-type=SMF&requester-nf-type=AMF";
+
+        for (target, scope, path) in [
+            (json!({"targetNfType": "NRF"}), "nnrf-nfm", nfm.as_str()),
+            (json!({"targetNfType": "NRF"}), "nnrf-disc", disc),
+            (
+                json!({"targetNfInstanceId": nrf_instance_id()}),
+                "nnrf-nfm",
+                nfm.as_str(),
+            ),
+        ] {
+            let resp = handle_access_token_request_with_policy(
+                &token_req(id, "AMF", target.clone(), scope, Some((id, &["AMF"]))),
+                &policy,
+            )
+            .await;
+            assert_eq!(resp.status, 200, "{target} {scope}: {}", error_of(&resp));
+            let v: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            let token = v["access_token"].as_str().expect("access_token");
+            let sub = oauth2_gate(path, Some(&format!("Bearer {token}")), true, &jwks)
+                .unwrap_or_else(|r| panic!("{target} {scope}: gate refused {}", r.status));
+            assert_eq!(sub.as_deref(), Some(id), "the token's subject is the NF");
+        }
+        assert!(nf_manager().get(id).is_none(), "a token registers nothing");
+
+        let refused = *oauth2_gate(&nfm, None, true, &jwks).expect_err("no token");
+        assert_eq!(refused.status, 401, "NFRegister without a token");
+    }
+
+    /// The bootstrap grant is only for this NRF's APIs, and only on proof: an
+    /// unregistered NF is still refused `invalid_client` with no proven
+    /// identity, for another target, for a non-NRF scope, or as an nfType its
+    /// certificate does not name.
+    ///
+    /// REVERT-VERIFIED: with the scope check removed, the `namf-comm` request
+    /// is not refused 400 `invalid_client`; with the NFTypes check removed,
+    /// neither is the AMF request over an SMF certificate.
+    #[tokio::test]
+    async fn an_unregistered_nf_gets_no_other_token_and_none_without_proof_1667() {
+        let _self_entry = self_entry_test_lock().lock().await;
+        let id = "1667d0d0-0000-4000-8000-00000000000d";
+        let cert: Option<(&str, &[&str])> = Some((id, &["AMF"]));
+        let nrf = json!({"targetNfType": "NRF"});
+        for (what, req, policy) in [
+            (
+                "no proven identity",
+                token_req(id, "AMF", nrf.clone(), "nnrf-nfm", None),
+                NrfPolicy {
+                    require_client_auth: false,
+                    ..NrfPolicy::default()
+                },
+            ),
+            (
+                "another target type",
+                token_req(
+                    id,
+                    "AMF",
+                    json!({"targetNfType": "SMF"}),
+                    "nsmf-pdusession",
+                    cert,
+                ),
+                NrfPolicy::default(),
+            ),
+            (
+                "another target instance",
+                token_req(
+                    id,
+                    "AMF",
+                    json!({"targetNfInstanceId": "1667e0e0-0000-4000-8000-00000000000e"}),
+                    "nnrf-nfm",
+                    cert,
+                ),
+                NrfPolicy::default(),
+            ),
+            (
+                "a scope that is not an NRF API",
+                token_req(id, "AMF", nrf.clone(), "nnrf-nfm namf-comm", cert),
+                NrfPolicy::default(),
+            ),
+            (
+                "an nfType the certificate does not name",
+                token_req(id, "AMF", nrf.clone(), "nnrf-nfm", Some((id, &["SMF"]))),
+                NrfPolicy::default(),
+            ),
+        ] {
+            let resp = handle_access_token_request_with_policy(&req, &policy).await;
+            assert_eq!(resp.status, 400, "{what}");
+            let err = error_of(&resp);
+            assert!(
+                err.starts_with("invalid_client ") && err.contains("not registered"),
+                "{what}: {err}"
+            );
+            if what.starts_with("an nfType") {
+                assert!(err.contains("NF types of its client certificate"), "{err}");
+            }
+        }
     }
 }

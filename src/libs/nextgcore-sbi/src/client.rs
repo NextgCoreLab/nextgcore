@@ -246,6 +246,13 @@ pub struct SbiClientConfig {
     /// half a client certificate/key pair). Set, every `https` connection
     /// fails with it instead of dialling without the intended certificate.
     pub tls_config_error: Option<String>,
+    /// #1667: this config dials this NF's NRF ([`crate::nrf_tls::nrf_client_config`]
+    /// sets it). A client built from it with no OAuth2 client of its own
+    /// attaches, at send time, the process's NRF OAuth2 client
+    /// ([`crate::nrf_tls::nrf_oauth2_client`]) with target NF type NRF. Read at
+    /// send time rather than when the client is built, because NRF clients are
+    /// cached (`GlobalContext::get_client`) and can predate the installation.
+    pub nrf_oauth2: bool,
 }
 
 impl Default for SbiClientConfig {
@@ -264,6 +271,7 @@ impl Default for SbiClientConfig {
             max_response_body: None,
             tls_server_name: None,
             tls_config_error: None,
+            nrf_oauth2: false,
         }
     }
 }
@@ -422,8 +430,21 @@ impl SbiClient {
     /// URI does not parse. Use this, not [`SbiClient::for_peer`] or
     /// [`SbiClient::with_host_port`], for every request to the NRF: the NRF
     /// identifies a registrant by the client certificate this presents.
+    ///
+    /// #1667: when this NF has installed an NRF OAuth2 client
+    /// ([`crate::nrf_tls::set_nrf_oauth2_client`], its `sbi.oauth2.require` or
+    /// the `production` profile on), every request also carries an access token
+    /// for the NRF, scoped to the invoked API (`nnrf-nfm` / `nnrf-disc`) and
+    /// fail-closed as any OAuth2 client. So does any client built from
+    /// [`crate::nrf_tls::nrf_client_config`] ([`SbiClientConfig::nrf_oauth2`]).
     pub fn for_nrf_uri(nrf_uri: &str) -> Option<Self> {
         crate::nrf_tls::nrf_client_config_for_uri(nrf_uri).map(Self::new)
+    }
+
+    /// [`SbiClient::for_nrf_uri`] carrying `oauth2`'s token for the NRF, rather
+    /// than the process's (tests: they never install the process-wide one).
+    pub fn for_nrf_uri_with(nrf_uri: &str, oauth2: Arc<OAuth2Client>) -> Option<Self> {
+        Self::for_nrf_uri(nrf_uri).map(|c| c.with_oauth2(oauth2, NfType::Nrf))
     }
 
     /// Attach an OAuth2 client for automatic Bearer token attachment.
@@ -1060,6 +1081,27 @@ impl SbiClient {
         self.bindings.lock().ok()?.get(target_key).cloned()
     }
 
+    /// The OAuth2 client, and its target NF type, a request to `uri` takes its
+    /// token from: this client's own ([`SbiClient::with_oauth2`]), else, for a
+    /// client of this NF's NRF ([`SbiClientConfig::nrf_oauth2`]) invoking one of
+    /// the two NRF APIs a token is used on (TS 29.510 §6.1.8, §6.2.8), the
+    /// process's NRF client `process_nrf` with target NRF (#1667). Read at send
+    /// time, as NRF clients are cached and can predate its installation. Never
+    /// for the NRF's token or JWKS endpoints, which stay reachable without one.
+    fn oauth2_for(
+        &self,
+        uri: &str,
+        process_nrf: Option<Arc<OAuth2Client>>,
+    ) -> Option<(Arc<OAuth2Client>, NfType)> {
+        match (&self.oauth2, &self.target_nf_type) {
+            (Some(oauth2), Some(target)) => Some((oauth2.clone(), *target)),
+            _ if self.config.nrf_oauth2 && is_nrf_token_api(uri) => {
+                process_nrf.map(|c| (c, NfType::Nrf))
+            }
+            _ => None,
+        }
+    }
+
     /// Stamp the standard outbound headers on `request` exactly once before the
     /// (possibly retried / redirected) send. Mutations are identical, and in the
     /// same order, to the pre-refactor inline code.
@@ -1069,7 +1111,9 @@ impl SbiClient {
     async fn prepare_request(&self, request: &mut SbiRequest) -> SbiResult<()> {
         // Automatically attach Bearer token if OAuth2 is configured
         // and the request does not already carry an Authorization header
-        if let (Some(oauth2), Some(target_nf_type)) = (&self.oauth2, &self.target_nf_type) {
+        let oauth2_target =
+            self.oauth2_for(&request.header.uri, crate::nrf_tls::nrf_oauth2_client());
+        if let Some((oauth2, target_nf_type)) = &oauth2_target {
             // get_header() is case-insensitive: an "authorization" header
             // copied from a hyper (lowercased HTTP/2) message also counts.
             if request.http.get_header("Authorization").is_none() {
@@ -1584,6 +1628,15 @@ pub type ClientCallback = Box<dyn Fn(SbiResult<SbiResponse>) + Send + Sync>;
 /// The scope is the SBI service name (the apiName of the TS 29.501 §4.4
 /// URI structure). For example, `/nsmf-pdusession/v1/sm-contexts` yields
 /// `nsmf-pdusession`.
+/// #1667: whether `uri` invokes Nnrf_NFManagement or Nnrf_NFDiscovery, the NRF
+/// APIs an access token is used on (TS 29.510 §6.1.8, §6.2.8).
+fn is_nrf_token_api(uri: &str) -> bool {
+    matches!(
+        derive_scope_from_uri(uri).as_str(),
+        "nnrf-nfm" | "nnrf-disc"
+    )
+}
+
 fn derive_scope_from_uri(uri: &str) -> String {
     crate::message::UriComponents::parse(uri)
         .api_name
@@ -2167,6 +2220,78 @@ mod tests {
         // which would panic on the modulo in get_connection).
         let client0 = SbiClient::new(SbiClientConfig::new("h", 1).with_pool_size(0));
         assert_eq!(client0.pool.len(), 1);
+    }
+
+    #[test]
+    /// #1667: a client built from the NRF client config takes the process's NRF
+    /// OAuth2 client, target NRF, for Nnrf_NFManagement and Nnrf_NFDiscovery
+    /// (relative or absolute URI), and not for the token or JWKS endpoints. A
+    /// peer client never does, and a client's own OAuth2 client wins.
+    ///
+    /// REVERT-VERIFIED: with `nrf_oauth2` not set by `nrf_client_config`, the NRF
+    /// client takes no token for NFRegister.
+    fn an_nrf_client_takes_the_process_nrf_token_for_the_nrf_apis_only_1667() {
+        let process = Arc::new(OAuth2Client::new(
+            "http://127.0.0.1:7777",
+            "1667a0a0-0000-4000-8000-00000000000a",
+            NfType::Amf,
+        ));
+        let nrf = SbiClient::new(crate::nrf_tls::nrf_client_config(
+            UriScheme::Http,
+            "127.0.0.1",
+            7777,
+        ));
+        for uri in [
+            "/nnrf-nfm/v1/nf-instances/1667a0a0-0000-4000-8000-00000000000a",
+            "/nnrf-disc/v1/nf-instances?target-nf-type=SMF&requester-nf-type=AMF",
+            "http://127.0.0.1:7777/nnrf-nfm/v1/subscriptions",
+        ] {
+            let (client, target) = nrf
+                .oauth2_for(uri, Some(process.clone()))
+                .unwrap_or_else(|| panic!("{uri}: takes the NRF token"));
+            assert!(Arc::ptr_eq(&client, &process), "{uri}");
+            assert_eq!(target, NfType::Nrf, "{uri}");
+        }
+        for uri in [
+            "/oauth2/token",
+            "/nnrf-oauth2/v1/access-token",
+            "/nnrf-oauth2/v1/jwks",
+            "/",
+        ] {
+            assert!(
+                nrf.oauth2_for(uri, Some(process.clone())).is_none(),
+                "{uri}: no token"
+            );
+        }
+        assert!(
+            nrf.oauth2_for("/nnrf-nfm/v1/nf-instances/x", None)
+                .is_none(),
+            "none installed: no token, as before"
+        );
+
+        let peer = SbiClient::with_host_port("127.0.0.1", 7777);
+        assert!(
+            peer.oauth2_for("/nnrf-nfm/v1/nf-instances/x", Some(process.clone()))
+                .is_none(),
+            "a peer client does not take the NRF token"
+        );
+
+        let own = Arc::new(OAuth2Client::new(
+            "http://127.0.0.1:7777",
+            "1667b0b0-0000-4000-8000-00000000000b",
+            NfType::Amf,
+        ));
+        let explicit = SbiClient::new(crate::nrf_tls::nrf_client_config(
+            UriScheme::Http,
+            "127.0.0.1",
+            7777,
+        ))
+        .with_oauth2(own.clone(), NfType::Udm);
+        let (client, target) = explicit
+            .oauth2_for("/nnrf-nfm/v1/nf-instances/x", Some(process))
+            .expect("its own");
+        assert!(Arc::ptr_eq(&client, &own));
+        assert_eq!(target, NfType::Udm);
     }
 
     #[test]

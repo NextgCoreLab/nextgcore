@@ -2,9 +2,10 @@
 //!
 //! The NRF binds NFRegister / NFUpdate / NFDeregister to the caller's verified
 //! client certificate: the `urn:uuid:<nfInstanceId>` URI SAN and the RFC 9310
-//! NFTypes (TS 33.310 §6.1.3c.3, TS 33.501 §13.1.0; nrfd #1611). A first
-//! NFRegister cannot carry a token, so the certificate is the only identity it
-//! can have. Every request an NF sends to its NRF therefore has to go over TLS
+//! NFTypes (TS 33.310 §6.1.3c.3, TS 33.501 §13.1.0; nrfd #1611). Even when a
+//! first NFRegister carries a token (#1667), that token was granted on a proven
+//! identity, so the certificate is the identity the registration binds to.
+//! Every request an NF sends to its NRF therefore has to go over TLS
 //! with this NF's client certificate, whatever the SBI profile says about the
 //! other peers.
 //!
@@ -171,6 +172,32 @@ pub fn set_nrf_client_tls_override(tls: Option<NrfClientTls>) {
         .unwrap_or_else(|e| e.into_inner()) = tls;
 }
 
+/// #1667: the OAuth2 client this NF's own NRF calls (Nnrf_NFManagement,
+/// Nnrf_NFDiscovery) take their access token from, with target NF type NRF.
+/// Installed by a daemon when its `sbi.oauth2.require` is on, beside the one it
+/// gives its peer clients; `None` (the default) sends NRF calls without a token,
+/// as before. TS 29.510 §6.1.8 / §6.2.8: when OAuth2 is used on these APIs the
+/// consumer obtains the token before consuming them, so before NFRegister.
+///
+/// No test lock: tests do not set it. They drive
+/// [`crate::client::SbiClient::for_nrf_uri_with`] instead, because any test that
+/// set this would make every concurrent [`crate::client::SbiClient::for_nrf_uri`]
+/// in its binary attach tokens, and fail closed without a token endpoint.
+static NRF_OAUTH2_CLIENT: RwLock<Option<Arc<crate::oauth::OAuth2Client>>> = RwLock::new(None);
+
+/// Install (or, with `None`, remove) the OAuth2 client of this NF's NRF calls.
+pub fn set_nrf_oauth2_client(client: Option<Arc<crate::oauth::OAuth2Client>>) {
+    *NRF_OAUTH2_CLIENT.write().unwrap_or_else(|e| e.into_inner()) = client;
+}
+
+/// The OAuth2 client of this NF's NRF calls, if one is installed.
+pub fn nrf_oauth2_client() -> Option<Arc<crate::oauth::OAuth2Client>> {
+    NRF_OAUTH2_CLIENT
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 /// The NRF client TLS in force: the override, else the environment.
 pub fn nrf_client_tls() -> NrfClientTls {
     NRF_CLIENT_TLS_OVERRIDE
@@ -242,7 +269,10 @@ pub fn nrf_scheme(uri_scheme: UriScheme, profile: SbiProfile) -> UriScheme {
 /// `scheme` (already decided by [`nrf_scheme`]). `http` is exactly
 /// `SbiClientConfig::new`; `https` carries [`nrf_client_tls`].
 pub fn nrf_client_config(scheme: UriScheme, host: &str, port: u16) -> SbiClientConfig {
-    let config = SbiClientConfig::new(host, port);
+    let mut config = SbiClientConfig::new(host, port);
+    // #1667: whatever builds the client from this, its requests to the NRF carry
+    // the process's NRF access token when one is installed.
+    config.nrf_oauth2 = true;
     if scheme == UriScheme::Http {
         return config;
     }
