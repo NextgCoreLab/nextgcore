@@ -22,11 +22,6 @@
 //!   the ones held);
 //! - a removal of the subscribed UE-AMBR (the AMF has no other UE-AMBR to fall back
 //!   to);
-//! - a change of the subscribed UE-AMBR for a CM-CONNECTED UE: NG-RAN enforces the
-//!   UE-AMBR it was given, and moving it needs a UE Context Modification
-//!   (TS 23.502 §4.5.1, TS 38.413 §8.3.4), which this AMF does not send. For a
-//!   CM-IDLE UE the change is applied and reaches NG-RAN in the next Initial
-//!   Context Setup;
 //! - a change of the subscribed S-NSSAIs (the Allowed NSSAI is decided at
 //!   registration and a change needs a UE Configuration Update, which this handler
 //!   does not drive).
@@ -41,6 +36,12 @@
 //! Retries are idempotent: `ADD`/`REPLACE` set a member to the new value, and a
 //! `REMOVE` of a member already absent changes nothing. `MOVE`, and a path into an
 //! array, are refused: §5.2.2.5.2 has the UDM replace arrays whole.
+//!
+//! A change of the subscribed UE-AMBR is applied whatever the UE's CM state (#1776).
+//! TS 23.502 §4.5.1 has the AMF update "UE context stored at AN to modify the
+//! UE-AMBR": the Namf handler queues the UE, and the NGAP task sends a CM-CONNECTED
+//! UE's NG-RAN node a UE CONTEXT MODIFICATION REQUEST with the UE-AMBR it then
+//! holds (TS 38.413 §8.3.4). A CM-IDLE UE's next Initial Context Setup carries it.
 
 use std::collections::BTreeSet;
 
@@ -155,13 +156,11 @@ struct Touched {
 ///
 /// `held_subscription` is the id of the UE's SDM subscription: a notification
 /// naming another `subscriptionId` is for a subscription this AMF does not hold.
-/// `cm_connected`: the UE has an NG connection now, so NG-RAN holds its UE-AMBR.
 pub(crate) fn applied_am_data(
     supi: &str,
     current: &HeldAmData,
     held_subscription: Option<&str>,
     notification: &Value,
-    cm_connected: bool,
 ) -> Result<Value, NotApplied> {
     let items = notification
         .get("notifyItems")
@@ -201,7 +200,7 @@ pub(crate) fn applied_am_data(
             apply_change(&mut doc, change, &mut touched)?;
         }
     }
-    check_applicable(current, &doc, &touched, cm_connected)?;
+    check_applicable(current, &doc, &touched)?;
     Ok(doc)
 }
 
@@ -296,7 +295,6 @@ fn check_applicable(
     current: &HeldAmData,
     after: &Value,
     touched: &Touched,
-    cm_connected: bool,
 ) -> Result<(), NotApplied> {
     let before = &current.doc;
     let not_acted_on = |m: &str| !AM_DATA_APPLIED_MEMBERS.contains(&m);
@@ -347,14 +345,8 @@ fn check_applicable(
         }
         None => {}
     }
-    if cm_connected && ue_ambr_bps(before) != ue_ambr_bps(after) {
-        return Err(NotApplied::NotAllowed(
-            "a change of subscribedUeAmbr for a CM-CONNECTED UE: NG-RAN holds the UE-AMBR, \
-             and this AMF does not send the UE Context Modification that would change it \
-             (TS 23.502 §4.5.1, TS 38.413 §8.3.4)"
-                .to_string(),
-        ));
-    }
+    // #1776: a change of the UE-AMBR is not refused for a CM-CONNECTED UE; the Namf
+    // handler has the NGAP task modify its UE context at NG-RAN (TS 23.502 §4.5.1).
     // The whole `nssai` member, not only the defaults `parse_am_data` reads: its
     // `singleNssais` (the non-default subscribed S-NSSAIs, TS 29.503 §6.1.6.2.2) is
     // acted on by nothing here, so a change of it must be refused too (R13 M1).
@@ -434,7 +426,6 @@ mod tests {
                 &current,
                 Some("sub-1"),
                 &notification(json!([{"op": "REPLACE", "path": "", "newValue": doc}])),
-                false,
             )
         };
         let same = json!({"gpsis": ["msisdn-222222"], "mpsPriority": true, "rfspIndex": 7});
@@ -467,7 +458,6 @@ mod tests {
                 &current,
                 None,
                 &notification(json!([{"op": "REPLACE", "path": "/rfspIndex", "newValue": v}])),
-                false,
             )
         };
         assert!(matches!(member(json!(8)), Err(NotApplied::NotAllowed(_))));
@@ -489,8 +479,7 @@ mod tests {
         ue.gpsi = Some("msisdn-333333".to_string());
         let current = current_am_data(&ue);
         assert!(!current.complete);
-        let apply =
-            |changes: Value| applied_am_data(SUPI, &current, None, &notification(changes), false);
+        let apply = |changes: Value| applied_am_data(SUPI, &current, None, &notification(changes));
         for changes in [
             json!([{"op": "REPLACE", "path": "", "newValue": {"gpsis": ["msisdn-1"], "rfspIndex": 7}}]),
             json!([{"op": "REMOVE", "path": "/rfspIndex"}]),
@@ -506,32 +495,31 @@ mod tests {
         );
     }
 
-    /// #1748 (R11 MAJOR-2): a change of the UE-AMBR is refused for a CM-CONNECTED UE,
-    /// whose UE-AMBR NG-RAN holds and this AMF does not modify, and applied for a
-    /// CM-IDLE one. A change that leaves the UE-AMBR as it was (another encoding of
-    /// the same rate) is applied either way.
+    /// #1776 (lifts #1748 R11 MAJOR-2): a change of the UE-AMBR is applied; the pure
+    /// check no longer depends on the CM state, since the Namf handler has a
+    /// CM-CONNECTED UE's context at NG-RAN modified (TS 23.502 §4.5.1). Another
+    /// encoding of the same rate is applied too.
     ///
-    /// REVERT-VERIFIED: with the `cm_connected` check in `check_applicable` skipped,
-    /// the connected case is Ok.
+    /// REVERT-VERIFIED: with the #1748 refusal of a UE-AMBR change restored in
+    /// `check_applicable` (unconditionally), the "5 Mbps" assertion fails.
     #[test]
-    fn a_ue_ambr_change_is_refused_for_a_cm_connected_ue_1748() {
+    fn a_ue_ambr_change_is_applied_1776() {
         let current = held(json!({"subscribedUeAmbr": {"uplink": "1 Mbps", "downlink": "2 Mbps"}}));
-        let change = |ul: &str, connected: bool| {
+        let change = |ul: &str| {
             applied_am_data(
                 SUPI,
                 &current,
                 None,
                 &notification(json!([{"op": "REPLACE", "path": "/subscribedUeAmbr",
                     "newValue": {"uplink": ul, "downlink": "2 Mbps"}}])),
-                connected,
             )
         };
-        assert!(matches!(
-            change("5 Mbps", true),
-            Err(NotApplied::NotAllowed(ref d)) if d.contains("CM-CONNECTED")
-        ));
-        assert!(change("5 Mbps", false).is_ok(), "CM-IDLE: applied");
-        assert!(change("1000 Kbps", true).is_ok(), "the same rate: applied");
+        assert_eq!(
+            change("5 Mbps").map(|doc| ue_ambr_bps(&doc)),
+            Ok(Some((5_000_000, 2_000_000))),
+            "the new UE-AMBR"
+        );
+        assert!(change("1000 Kbps").is_ok(), "the same rate: applied");
     }
 
     /// #1748 (R13 M1): a change of `nssai.singleNssais`, the non-default subscribed
@@ -550,7 +538,6 @@ mod tests {
                 &current,
                 None,
                 &notification(json!([{"op": "REPLACE", "path": "/nssai", "newValue": nssai}])),
-                false,
             )
         };
         assert!(matches!(
@@ -570,7 +557,7 @@ mod tests {
         let body = notification(json!([{"op": "ADD", "path": "/mpsPriority", "newValue": true}]));
         let empty = held(json!({}));
         assert!(matches!(
-            applied_am_data(SUPI, &empty, Some("sub-2"), &body, false),
+            applied_am_data(SUPI, &empty, Some("sub-2"), &body),
             Err(NotApplied::NotSubscribed(_))
         ));
         let mut unnamed = body.clone();
@@ -579,14 +566,14 @@ mod tests {
             .expect("object")
             .remove("subscriptionId");
         assert_eq!(
-            applied_am_data(SUPI, &empty, Some("sub-2"), &unnamed, false),
+            applied_am_data(SUPI, &empty, Some("sub-2"), &unnamed),
             Ok(json!({"mpsPriority": true}))
         );
         // Another UE's am-data.
         let mut other = body;
         other["notifyItems"][0]["resourceId"] = json!("/nudm-sdm/v2/imsi-999/am-data");
         assert!(matches!(
-            applied_am_data(SUPI, &empty, Some("sub-1"), &other, false),
+            applied_am_data(SUPI, &empty, Some("sub-1"), &other),
             Err(NotApplied::NotSubscribed(_))
         ));
     }
@@ -599,7 +586,7 @@ mod tests {
             let body = notification(json!([{"op": "ADD", "path": path, "newValue": "msisdn-1"}]));
             assert!(
                 matches!(
-                    applied_am_data(SUPI, &held(json!({"gpsis": []})), None, &body, false),
+                    applied_am_data(SUPI, &held(json!({"gpsis": []})), None, &body),
                     Err(NotApplied::Malformed(_))
                 ),
                 "{path}"
@@ -633,7 +620,6 @@ mod tests {
                 {"op": "REPLACE", "path": "/mpsPriority", "newValue": false},
                 {"op": "REPLACE", "path": "/mcsPriority", "newValue": false},
             ])),
-            false,
         )
         .expect("applied");
         adopt_am_data(SUPI, &mut ue, withdrawn);
@@ -659,8 +645,7 @@ mod tests {
         ue.priority_subscription = true;
         let rebuilt = current_am_data(&ue);
         assert!(rebuilt.priority_assumed);
-        let apply =
-            |changes: Value| applied_am_data(SUPI, &rebuilt, None, &notification(changes), false);
+        let apply = |changes: Value| applied_am_data(SUPI, &rebuilt, None, &notification(changes));
         assert!(matches!(
             apply(json!([{"op": "REPLACE", "path": "/mcsPriority", "newValue": false}])),
             Err(NotApplied::NotAllowed(ref d)) if d.contains("mcsPriority")
