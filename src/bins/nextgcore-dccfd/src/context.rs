@@ -91,6 +91,14 @@ static CONTEXT: OnceLock<Mutex<DccfContext>> = OnceLock::new();
 /// held a subscription it was about to assert on. One green run proved nothing;
 /// the failure was order-dependent.
 ///
+/// It also guards the process-global coordination switch, `coordination.rs`'s
+/// `COORDINATION_ENABLED` and `COORDINATION_CONFIG`, which tests flip with
+/// `coordination::set_coordination_for_test` (#1785, #1822 item 3): the
+/// data-management tests switch coordination on under this lock, and
+/// `coordination_is_off_by_default` switched it off without the lock, mid-way
+/// through their coordination. `set_coordination_for_test` panics when this lock
+/// is free.
+///
 /// A single lock is the fix, not a second one. `unwrap_or_else(|e| e.into_inner())`
 /// at every acquisition, so one panicking test does not poison the rest.
 pub static GLOBAL_TEST_LOCK: Mutex<()> = Mutex::new(());

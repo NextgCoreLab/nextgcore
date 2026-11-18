@@ -796,18 +796,34 @@ fn unmatched(allowed: Option<&[&str]>, method: &str, uri: &str) -> SbiResponse {
 /// its `subsChangeNotifyUri` instead; the server admits it only when that token
 /// is the named leg's current one. Any other request still needs a bearer.
 pub fn oauth2_callback_exemptions() -> Vec<nextgcore_sbi::server::OAuth2CallbackExemption> {
-    vec![nextgcore_sbi::server::OAuth2CallbackExemption::new(
-        "POST",
-        format!(
-            "/nudm-callback/v1/{{var}}/{}/{{token}}",
-            crate::ee_amf::SUBS_CHANGE_SEGMENT
+    vec![
+        nextgcore_sbi::server::OAuth2CallbackExemption::new(
+            "POST",
+            format!(
+                "/nudm-callback/v1/{{var}}/{}/{{token}}",
+                crate::ee_amf::SUBS_CHANGE_SEGMENT
+            ),
+            |cb| {
+                cb.vars
+                    .first()
+                    .is_some_and(|id| crate::ee_amf::token_matches(id, cb.token))
+            },
         ),
-        |cb| {
-            cb.vars
-                .first()
-                .is_some_and(|id| crate::ee_amf::token_matches(id, cb.token))
-        },
-    )]
+        // #1775: the UDR's DataChangeNotify on this UDM's am-data leg, admitted by
+        // the leg's token (a notification carries no access token, TS 33.501 §13.4.1).
+        nextgcore_sbi::server::OAuth2CallbackExemption::new(
+            "POST",
+            format!(
+                "/nudm-callback/v1/{{var}}/{}/{{token}}",
+                crate::sdm_udr::UDR_DATA_CHANGE_SEGMENT
+            ),
+            |cb| {
+                cb.vars
+                    .first()
+                    .is_some_and(|supi| crate::sdm_udr::token_matches(supi, cb.token))
+            },
+        ),
+    ]
 }
 
 /// The UDM SBI server for `cfg`, with [`oauth2_callback_exemptions`] registered
@@ -1149,6 +1165,12 @@ async fn route_nudm_callback(
             crate::ee_amf::handle_subs_change(ee_id, token, request).await
         }
         ([_, "v1", _, crate::ee_amf::SUBS_CHANGE_SEGMENT, _], _) => {
+            unmatched(Some(&["POST"]), method, uri)
+        }
+        ([_, "v1", supi, crate::sdm_udr::UDR_DATA_CHANGE_SEGMENT, token], "POST") => {
+            crate::sdm_udr::handle_udr_data_change(supi, token, request).await
+        }
+        ([_, "v1", _, crate::sdm_udr::UDR_DATA_CHANGE_SEGMENT, _], _) => {
             unmatched(Some(&["POST"]), method, uri)
         }
         _ => unmatched(None, method, uri),
@@ -2503,6 +2525,8 @@ pub async fn handle_sdm_subscribe(supi: &str, request: &SbiRequest) -> SbiRespon
             context.sdm_subscription_insert(sub);
         };
     }
+    // #1775: an am-data subscription needs this UDM's leg at the UDR.
+    crate::sdm_udr::spawn_reconcile(supi);
 
     SbiResponse::with_status(201)
         .with_header(
@@ -2541,6 +2565,8 @@ pub async fn handle_sdm_unsubscribe(supi: &str, subscription_id: &str) -> SbiRes
     if let Ok(context) = ctx.read() {
         context.sdm_subscription_remove(subscription_id);
     };
+    // #1775: the last am-data subscription of the SUPI takes the UDR leg with it.
+    crate::sdm_udr::spawn_reconcile(supi);
     SbiResponse::with_status(204)
 }
 
@@ -4722,6 +4748,8 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(handle_sdm_subscribe(supi, &request).await.status, 201);
+        // #1775: the UDR-leg reconcile it spawned finishes under this test's locks.
+        crate::sdm_udr::wait_idle().await;
         let stored = {
             let ctx = udm_self();
             let context = ctx.read().expect("udm ctx");
@@ -4804,6 +4832,8 @@ mod tests {
         // Subscribe → 201 + Location header.
         let resp = handle_sdm_subscribe(supi, &request).await;
         assert_eq!(resp.status, 201, "subscribe must return 201");
+        // #1775: the UDR-leg reconcile it spawned finishes under this test's locks.
+        crate::sdm_udr::wait_idle().await;
         // set_header lowercases header keys (HTTP/2 convention).
         let loc = resp
             .http
@@ -4849,6 +4879,8 @@ mod tests {
         // Unsubscribe with the real id → 204.
         let resp = handle_sdm_unsubscribe(supi, &sub_id).await;
         assert_eq!(resp.status, 204, "valid unsubscribe must return 204");
+        // #1775: the UDR-leg reconcile it spawned finishes under this test's locks.
+        crate::sdm_udr::wait_idle().await;
 
         // Must be removed from context.
         {
@@ -5488,6 +5520,8 @@ mod tests {
         // A complete body is still accepted, with the v2 Location.
         let resp = handle_sdm_subscribe(supi, &sdm_subscribe_request(full)).await;
         assert_eq!(resp.status, 201);
+        // #1775: the UDR-leg reconcile it spawned finishes under this test's locks.
+        crate::sdm_udr::wait_idle().await;
         let location = resp
             .http
             .get_header("location")
@@ -6921,13 +6955,16 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
     async fn test_http_nudm_pp_and_mt_are_served() {
         let _udr_env = crate::sbi_path::UDR_ENV_TEST_LOCK.lock().await;
-        use nextgcore_sbi::context::{global_context, NfInstance, NfService};
+        use nextgcore_sbi::context::{NfInstance, NfService};
         use nextgcore_sbi::types::{NfType, SbiServiceType};
 
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // #1822 item 6: removes the AMF this test caches when it ends (dropped
+        // before `_guard`, so under it).
+        let _cached = crate::test_support::CachedNfCleanup;
         nextgcore_core::test_log::init();
         udm_context_init(64, 64);
         let (udr_server, store) = start_mock_udr_context_data().await;
@@ -7048,7 +7085,7 @@ mod tests {
         svc.versions = vec!["v1".to_string()];
         svc.port = amf_port;
         instance.add_service(svc);
-        global_context().add_nf_instance(instance).await;
+        crate::test_support::cache_nf_instance_for_test(instance).await;
 
         // Seed amfd's UE context so its real handler resolves the SUPI.
         nextgcore_amfd::test_support::init_context();

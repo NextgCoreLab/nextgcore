@@ -776,6 +776,29 @@ fn strip_unallowed_restored_nf_sets(
     changed
 }
 
+/// #1719 (R19): what `main` does with the profiles the state file restored, once
+/// the allowlist is known: strip each set it may not claim
+/// ([`strip_unallowed_restored_nf_sets`]) and tell the subscribers to each changed
+/// profile NF_PROFILE_CHANGED with its change items (TS 29.510 §5.2.2.6). One
+/// function rather than a loop in `main`, so the notification is tested
+/// (#1822 item 4).
+fn enforce_nf_set_allowlist_at_restore(policy: &NrfPolicy, restored: Vec<NfProfile>) {
+    for (profile, changes) in strip_unallowed_restored_nf_sets(policy, restored) {
+        let server_uri = nrf_self_uri().to_string();
+        tokio::spawn(async move {
+            if let Err(e) = nrf_nnrf_nfm_send_nf_profile_changed_notify_all_async(
+                &profile,
+                &server_uri,
+                changes,
+            )
+            .await
+            {
+                log::error!("Failed to send NF_PROFILE_CHANGED (nf_set_allowlist): {e}");
+            }
+        });
+    }
+}
+
 /// The `nfSetIdList` strings of an NFProfile document (TS 29.510 §6.1.6.2.2).
 fn nf_set_ids_of(doc: &serde_json::Value) -> Vec<&str> {
     doc.get("nfSetIdList")
@@ -1258,16 +1281,38 @@ fn self_entry_test_lock() -> &'static tokio::sync::Mutex<()> {
 /// otherwise stay REGISTERED and discoverable for the life of the state file,
 /// naming an NRF profile this process does not maintain. Returns whether an
 /// entry was removed.
+///
+/// #1821: the removal is a deregistration like any other, so the subscribers
+/// whose conditions match the entry are told NF_DEREGISTERED (TS 29.510
+/// §5.2.2.6.1), as `handle_nf_deregister` and the no-heartbeat expiry tell
+/// theirs. Before, the entry vanished silently and a subscriber kept it cached.
+/// The subscriptions restored from the same state file are already in the
+/// registry when `main` calls this.
 fn drop_restored_self_entry() -> bool {
-    if nf_manager().get(nrf_instance_id()).is_none() {
+    let Some(profile) = nf_manager().get(nrf_instance_id()) else {
         return false;
-    }
+    };
     match nf_manager().deregister(nrf_instance_id()) {
         Ok(_) => {
             log::info!(
-                "nrfd-187: removed the NRF's own entry {} restored from the state file;                  this configuration does not register the NRF in its own registry",
+                "nrfd-187: removed the NRF's own entry {} restored from the state file; \
+                 this configuration does not register the NRF in its own registry",
                 nrf_instance_id()
             );
+            let server_uri = nrf_self_uri().to_string();
+            tokio::spawn(async move {
+                if let Err(e) = nrf_nnrf_nfm_send_nf_status_notify_all_async(
+                    NotificationEventType::NfDeregistered,
+                    &profile,
+                    &server_uri,
+                )
+                .await
+                {
+                    log::error!(
+                        "Failed to send NF_DEREGISTERED for the NRF's dropped own entry: {e}"
+                    );
+                }
+            });
             true
         }
         Err(e) => {
@@ -1783,22 +1828,8 @@ async fn main() -> Result<()> {
     }
     // #1719 (R19): a profile restored from the state file was never checked
     // against this allowlist, and a heartbeating NF never re-registers, so the
-    // claim is enforced here: the unallowed sets are stripped and subscribers are
-    // told NF_PROFILE_CHANGED.
-    for (profile, changes) in strip_unallowed_restored_nf_sets(&policy, nf_manager().list()) {
-        let server_uri = nrf_self_uri().to_string();
-        tokio::spawn(async move {
-            if let Err(e) = nrf_nnrf_nfm_send_nf_profile_changed_notify_all_async(
-                &profile,
-                &server_uri,
-                changes,
-            )
-            .await
-            {
-                log::error!("Failed to send NF_PROFILE_CHANGED (nf_set_allowlist): {e}");
-            }
-        });
-    }
+    // claim is enforced here, before the policy is published.
+    enforce_nf_set_allowlist_at_restore(&policy, nf_manager().list());
     NRF_POLICY.set(policy).ok();
 
     // Client side (T1.1): when SBI OAuth2 is enabled, the NRF acquires and
@@ -13167,6 +13198,115 @@ mod tests_nf_set_ids_1719 {
         }
     }
 
+    /// **#1822 item 4.** The restore-time enforcement `main` runs strips the
+    /// disallowed set and tells a subscriber to the profile NF_PROFILE_CHANGED over
+    /// the wire, naming `nfSetIdList`; a profile it leaves alone notifies nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_enforcement_notifies_the_stripped_profile_1822() {
+        use std::sync::Mutex as StdMutex;
+        let own = "18220a0a-0000-4000-8000-00000000000a";
+        let mixed = "18220b0b-0000-4000-8000-00000000000b";
+        let received: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::clone(&received);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let subscriber = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), listener);
+        subscriber
+            .start(move |req: SbiRequest| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    if let Some(body) = req.http.content.clone() {
+                        sink.lock().expect("sink lock").push(body);
+                    }
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await
+            .expect("subscriber server starts");
+        for (id, sets) in [(own, vec![SET1]), (mixed, vec![SET1, SET2])] {
+            let p = NfProfile::from_json(&json!({
+                "nfInstanceId": id,
+                "nfType": "PCF",
+                "nfStatus": "REGISTERED",
+                "nfSetIdList": sets,
+            }))
+            .expect("a valid profile");
+            nf_manager().register(p).expect("stored");
+            nf_manager().add_subscription(nextgcore_nrfd::SubscriptionData {
+                id: format!("nrfd1822-{id}"),
+                req_nf_type: None,
+                req_nf_instance_id: None,
+                notification_uri: format!("http://127.0.0.1:{}/callback", addr.port()),
+                subscr_cond: Some(nextgcore_nrfd::nnrf_handler::SubscrCond::nf_instance_id(id)),
+                validity_duration: 3600,
+                req_notif_events: None,
+                notif_condition: None,
+            });
+        }
+        let policy = NrfPolicy {
+            nf_set_allowlist: allowlist(own),
+            ..NrfPolicy::default()
+        };
+        let restored: Vec<NfProfile> = [own, mixed]
+            .iter()
+            .filter_map(|id| nf_manager().get(id))
+            .collect();
+        enforce_nf_set_allowlist_at_restore(&policy, restored);
+
+        for _ in 0..100 {
+            if !received.lock().expect("sink lock").is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Long enough for a second, wrong, notification to arrive too.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let got = received.lock().expect("sink lock").clone();
+        assert_eq!(
+            got.len(),
+            1,
+            "one notification, for the stripped PCF: {got:?}"
+        );
+        let body: serde_json::Value = serde_json::from_str(&got[0]).expect("JSON");
+        assert_eq!(body["event"], "NF_PROFILE_CHANGED");
+        assert!(
+            body["nfInstanceUri"]
+                .as_str()
+                .is_some_and(|u| u.ends_with(&format!("/nf-instances/{mixed}"))),
+            "{body}"
+        );
+        assert!(
+            body["profileChanges"]
+                .as_array()
+                .is_some_and(|c| c.iter().any(|i| i["path"] == "/nfSetIdList")),
+            "the change names nfSetIdList: {body}"
+        );
+        assert_eq!(stored_sets(mixed), Some(vec![SET2.to_string()]));
+        for id in [own, mixed] {
+            nf_manager().remove_subscription(&format!("nrfd1822-{id}"));
+            let _ = nf_manager().deregister(id);
+        }
+    }
+
+    /// **#1822 item 4.** `main` runs the restore-time enforcement on every restored
+    /// profile, before it publishes the policy. A source guard, because `main`
+    /// itself cannot run in a unit test.
+    #[test]
+    fn main_enforces_the_allowlist_on_restored_profiles_1822() {
+        let source = include_str!("main.rs");
+        let main = &source[source.find("async fn main()").expect("main")..];
+        let main = &main[..main.find("\n}\n").expect("its end")];
+        let call = main
+            .find("\n    enforce_nf_set_allowlist_at_restore(&policy, nf_manager().list());\n")
+            .expect("main enforces the allowlist on every restored profile");
+        let publish = main
+            .find("\n    NRF_POLICY.set(policy).ok();\n")
+            .expect("main publishes the policy");
+        assert!(
+            call < publish,
+            "the enforcement runs before the policy is published"
+        );
+    }
+
     /// Without an allowlist (the default), a registrant's sets are accepted as
     /// sent, so existing deployments keep working; startup warns.
     #[tokio::test]
@@ -13388,5 +13528,106 @@ mod unverified_registrant_tests_1617 {
             "the NRF's own entry is gone"
         );
         assert!(!drop_restored_self_entry(), "nothing left to remove");
+    }
+
+    /// **#1821, TS 29.510 §5.2.2.6.1.** Dropping the restored self entry tells a
+    /// subscriber to that entry NF_DEREGISTERED, over the wire, exactly once: the
+    /// second call finds nothing and sends nothing. Before, the entry vanished
+    /// with no notification.
+    ///
+    /// The subscription names the NRF's own instance, and every test that adds or
+    /// removes that entry holds `self_entry_test_lock`, so no other test's change
+    /// reaches this sink.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_the_restored_self_entry_notifies_nf_deregistered_1821() {
+        use std::sync::Mutex as StdMutex;
+        let _self_entry = self_entry_test_lock().lock().await;
+
+        let received: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::clone(&received);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let subscriber = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), listener);
+        subscriber
+            .start(move |req: SbiRequest| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    if let Some(body) = req.http.content.clone() {
+                        sink.lock().expect("sink lock").push(body);
+                    }
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await
+            .expect("subscriber server starts");
+
+        register_self_with_own_registry();
+        let manager = nf_manager();
+        let sub_id = "nrfd1821-self-entry-sub";
+        manager.add_subscription(nextgcore_nrfd::SubscriptionData {
+            id: sub_id.to_string(),
+            req_nf_type: None,
+            req_nf_instance_id: None,
+            notification_uri: format!("http://127.0.0.1:{}/callback", addr.port()),
+            subscr_cond: Some(nextgcore_nrfd::nnrf_handler::SubscrCond::nf_instance_id(
+                nrf_instance_id(),
+            )),
+            validity_duration: 3600,
+            req_notif_events: None,
+            notif_condition: None,
+        });
+
+        let wait_for = |want: usize| {
+            let received = Arc::clone(&received);
+            async move {
+                for _ in 0..100 {
+                    if received.lock().expect("sink lock").len() >= want {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                received.lock().expect("sink lock").clone()
+            }
+        };
+
+        assert!(drop_restored_self_entry(), "the restored entry is removed");
+        let got = wait_for(1).await;
+        assert_eq!(got.len(), 1, "one notification, got {got:?}");
+        let body: serde_json::Value = serde_json::from_str(&got[0]).expect("JSON");
+        assert_eq!(body["event"], "NF_DEREGISTERED");
+        assert!(
+            body["nfInstanceUri"]
+                .as_str()
+                .is_some_and(|u| u.ends_with(&format!("/nf-instances/{}", nrf_instance_id()))),
+            "it names the NRF's own instance: {body}"
+        );
+
+        assert!(!drop_restored_self_entry(), "nothing left to remove");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            received.lock().expect("sink lock").len(),
+            1,
+            "a second call finds nothing and sends nothing"
+        );
+        manager.remove_subscription(sub_id);
+    }
+
+    /// **#1821.** `main` drops the restored self entry exactly when the NRF does
+    /// not register itself: the `else` of the self-registration choice. A source
+    /// guard, because `main` itself cannot run in a unit test.
+    #[test]
+    fn main_drops_the_restored_self_entry_when_it_does_not_register_itself_1821() {
+        let source = include_str!("main.rs");
+        let main = &source[source.find("async fn main()").expect("main")..];
+        let main = &main[..main.find("\n}\n").expect("its end")];
+        let choice = "    } else if self_registers {\n";
+        let at = main.find(choice).expect("the self-registration choice");
+        let branch = &main[at + choice.len()..];
+        let branch = &branch[..branch.find("\n    }\n").expect("its end")];
+        assert!(
+            branch.trim_end().ends_with(
+                "register_self_with_own_registry();\n    } else {\n        drop_restored_self_entry();"
+            ),
+            "the else branch drops the restored entry: {branch}"
+        );
     }
 }
