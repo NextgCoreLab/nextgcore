@@ -7,6 +7,11 @@
 //!    capability, then Resolve it in EPS format. This proves the transcoding (#585
 //!    item 1) over the wire.
 //!
+//! Since #1617 step f nrfd refuses NF management from a caller with no verified
+//! certificate identity, so both run over TLS from the shipped dev PKI
+//! (`DevPki`): nrfd serves `nrf.crt`, and ucmfd registers with `ucmf.crt`,
+//! whose `urn:uuid` is the instance ID it is pinned to.
+//!
 //! The nrfd binary is a sibling of this crate's binary in the target directory.
 //! `cargo test --workspace` (CI) always builds it. A `cargo test -p
 //! nextgcore-ucmfd` that never built nrfd skips with a message saying so, rather
@@ -17,7 +22,10 @@ use std::time::{Duration, Instant};
 
 use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
 use nextgcore_sbi::message::SbiRequest;
-use nextgcore_sbi::test_support::NfSpawn;
+use nextgcore_sbi::test_support::{DevPki, NfSpawn};
+
+const NRF_ID: &str = "585f0000-0000-4000-8000-0000000000f0";
+const UCMF_ID: &str = "585f0000-0000-4000-8000-00000000ac3f";
 use serde_json::Value;
 
 /// The env every child gets.
@@ -76,6 +84,7 @@ async fn ucmfd_registers_with_a_live_nrfd_and_serves_a_transcoded_resolve() {
         return;
     };
     let ucmfd = PathBuf::from(env!("CARGO_BIN_EXE_nextgcore-ucmfd"));
+    let pki = DevPki::generate(NRF_ID, &[("ucmf", "UCMF", UCMF_ID)]);
     // #1521: both children through the shared `NfSpawn`, which waits for each
     // SBI listener and respawns on a fresh port if a child loses its probed one
     // to another process (the #1497 race). nrfd is up before the UCMF starts, so
@@ -84,17 +93,20 @@ async fn ucmfd_registers_with_a_live_nrfd_and_serves_a_transcoded_resolve() {
         .ready_when_logged("server listening on")
         .spawn_async(|cmd, port, _| {
             child_env(cmd);
+            pki.nrf_server_env(cmd);
             cmd.args(["-c", "/nonexistent/nrf.yaml", "--sbi-addr", "127.0.0.1"])
                 .args(["--sbi-port", &port.to_string()]);
         })
         .await;
-    let nrf_uri = format!("http://127.0.0.1:{}", nrfd.port());
-    let nrf = SbiClient::new(SbiClientConfig::new("127.0.0.1", nrfd.port()));
+    let nrf_uri = format!("https://127.0.0.1:{}", nrfd.port());
+    let nrf = SbiClient::new(pki.nrf_client_config(nrfd.port()));
 
     let ucmf_proc = NfSpawn::new(&ucmfd, "ucmf-live-ucmfd")
         .ready_when_logged("SBI server listening on")
         .spawn_async(|cmd, port, _| {
             child_env(cmd);
+            pki.nrf_client_env(cmd, "ucmf");
+            cmd.env("NEXTGCORE_UCMF_INSTANCE_ID", UCMF_ID);
             cmd.args(["-c", "/nonexistent/ucmf.yaml", "--sbi-addr", "127.0.0.1"])
                 .args(["--sbi-port", &port.to_string()])
                 .args(["--nrf-uri", &nrf_uri, "--mode", "B"]);

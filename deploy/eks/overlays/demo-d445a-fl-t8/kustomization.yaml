@@ -17,6 +17,8 @@
 #   ue-members.yaml     UEs 2-5, replicas 0 until scenario.sh scales them.
 #   patches/ue-*.yaml   the base UE as member 1, at info.
 #   core-configs.yaml, nrf-cca*.yaml   the NRF trusts the AF's CCA key.
+#   nrf-probe.yaml      the nrf pod's `probe` sidecar: scenario.sh's probe
+#                       consumers register from it with their own certificates.
 #
 # Images (build-images.sh): every core NF at demo-d445a-fl-t8-<nextgcore sha>
 # (the 6G profile's features, nefd with demo-d445a-fl-t8), and gnb/ue at
@@ -41,6 +43,7 @@ resources:
 patches:
   - path: core-configs.yaml
   - path: nrf-cca-mount.yaml
+  - path: nrf-probe.yaml
   - path: patches/ue-log-level.yaml
     target:
       kind: Deployment

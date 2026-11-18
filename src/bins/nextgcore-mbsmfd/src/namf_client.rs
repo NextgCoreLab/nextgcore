@@ -190,6 +190,59 @@ pub async fn context_create(amf: &DiscoveredAmf, tmgi: &Tmgi) -> Option<MbsConte
     context_ref
 }
 
+/// How one Namf_MBSBroadcast ContextDelete ended (#1758).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextDeleteOutcome {
+    /// 204: the AMF deleted the context.
+    Deleted,
+    /// 404: the AMF holds no such context, so it is already gone.
+    Gone,
+    /// Not delivered, or refused otherwise: worth retrying.
+    Failed,
+}
+
+/// `DELETE /namf-mbs-bc/v1/mbs-contexts/{mbsContextRef}` — Namf_MBSBroadcast
+/// ContextDelete (TS 29.518 §5.6, `TS29518_Namf_MBSBroadcast.yaml` operationId
+/// `ContextDelete`), TS 23.247 §7.3.2's broadcast session release toward the AMF.
+/// Carries the NRF-issued token, as ContextCreate does (#1662).
+pub async fn context_delete(context: &crate::context::AmfMbsContext) -> ContextDeleteOutcome {
+    let client = crate::attach_oauth2(
+        SbiClient::new(
+            nextgcore_sbi::security::sbi_peer_client_config(&context.host, context.port)
+                .with_connect_timeout(Duration::from_secs(2))
+                .with_request_timeout(Duration::from_secs(3)),
+        ),
+        nextgcore_sbi::types::NfType::Amf,
+    );
+    let path = format!(
+        "/namf-mbs-bc/v1/mbs-contexts/{}",
+        nextgcore_sbi::uri_encode::encode_query_value(&context.context_ref)
+    );
+    match client.delete(&path).await {
+        Ok(r) if r.status == 204 || r.status == 200 => ContextDeleteOutcome::Deleted,
+        Ok(r) if r.status == 404 => ContextDeleteOutcome::Gone,
+        Ok(r) => {
+            log::warn!(
+                "MBS: Namf_MBSBroadcast ContextDelete of {} returned status {} from {}:{}",
+                context.context_ref,
+                r.status,
+                context.host,
+                context.port
+            );
+            ContextDeleteOutcome::Failed
+        }
+        Err(e) => {
+            log::warn!(
+                "MBS: Namf_MBSBroadcast ContextDelete of {} to {}:{} failed: {e}",
+                context.context_ref,
+                context.host,
+                context.port
+            );
+            ContextDeleteOutcome::Failed
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,6 +353,8 @@ mod tests {
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
         use nextgcore_sbi::test_support::oauth2 as stand_in;
         use nextgcore_sbi::types::NfType;
+        // #1758: counts amfd's process-global contexts, which the release tests delete.
+        let _g = nextgcore_amfd::test_support::MBS_CONTEXT_LOCK.lock().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         nextgcore_amfd::test_support::init_context();
         let sk = nextgcore_sbi::oauth::generate_es256_key();
@@ -348,6 +403,261 @@ mod tests {
             "a retry returns the same ref"
         );
         assert_eq!(sessions(), before + 1, "and creates no second context");
+    }
+
+    /// #1758: amfd's real Namf handler behind an OAuth2-required listener, and the
+    /// OAuth2 client the MB-SMF uses toward it.
+    async fn gated_real_amf() -> (
+        nextgcore_sbi::server::SbiServer,
+        nextgcore_sbi::server::SbiServer,
+        DiscoveredAmf,
+        std::sync::Arc<nextgcore_sbi::oauth::OAuth2Client>,
+    ) {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        use nextgcore_sbi::test_support::oauth2 as stand_in;
+        use nextgcore_sbi::types::NfType;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        nextgcore_amfd::test_support::init_context();
+        crate::mbsmf_context_init(256);
+        let sk = nextgcore_sbi::oauth::generate_es256_key();
+        let (nrf, nrf_port) = stand_in::token_nrf(sk.clone()).await;
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let mut cfg = SbiServerConfig::new(addr).with_expected_audience_nf_type(NfType::Amf);
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(stand_in::jwks_for(&sk, stand_in::TEST_NRF_KID));
+        let amf_server = SbiServer::on_listener(cfg, listener);
+        amf_server
+            .start(nextgcore_amfd::namf_request_handler)
+            .await
+            .expect("amfd Namf server starts");
+        let amf = DiscoveredAmf {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            nf_instance_id: None,
+        };
+        (
+            nrf,
+            amf_server,
+            amf,
+            stand_in::oauth2_client_for(nrf_port, NfType::Mbsmf),
+        )
+    }
+
+    fn tmgi_1758(svc: [u8; 3]) -> Tmgi {
+        Tmgi {
+            mbs_service_id: svc,
+            plmn_id: PlmnId {
+                mcc: "001".to_string(),
+                mnc: "01".to_string(),
+            },
+        }
+    }
+
+    fn amf_holds(context_ref: &str) -> bool {
+        nextgcore_amfd::context::amf_mcast()
+            .session_find(context_ref.parse().expect("numeric ref"))
+            .is_some()
+    }
+
+    /// #1758: releasing an MBS session deletes the broadcast MBS context it created
+    /// at amfd's real, OAuth2-gated handler (so the ContextDelete carries the
+    /// token), and a repeated release is a 404 that touches nothing.
+    ///
+    /// REVERT-VERIFIED: with the release sending no ContextDelete, or sending it
+    /// without the token, the AMF still holds the context.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_released_session_deletes_its_context_at_the_real_amf_1758() {
+        let _g = nextgcore_amfd::test_support::MBS_CONTEXT_LOCK.lock().await;
+        let (_nrf, _amf_server, amf, oauth2) = gated_real_amf().await;
+        let tmgi = tmgi_1758([0x00, 0x17, 0x58]);
+        let session = crate::mbsmf_self()
+            .read()
+            .unwrap()
+            .session_add(tmgi.clone(), crate::MbsSessionType::Broadcast)
+            .expect("session");
+
+        crate::TEST_OAUTH2_CLIENT
+            .scope(oauth2, async {
+                let context_ref = crate::create_amf_mbs_context(session.id, tmgi, amf)
+                    .await
+                    .expect("the AMF creates the context");
+                assert!(amf_holds(&context_ref));
+                assert_eq!(
+                    crate::mbsmf_self()
+                        .read()
+                        .unwrap()
+                        .amf_contexts_of(session.id)[0]
+                        .context_ref,
+                    context_ref,
+                    "the MB-SMF records the context it created"
+                );
+
+                let id = format!("mbs-sess-{}", session.id);
+                assert_eq!(crate::handle_mbs_session_release(&id).await.status, 204);
+                assert!(
+                    !amf_holds(&context_ref),
+                    "after release the AMF holds no context for the session"
+                );
+                assert_eq!(
+                    crate::handle_mbs_session_release(&id).await.status,
+                    404,
+                    "a repeated release is idempotent"
+                );
+            })
+            .await;
+    }
+
+    /// #1758: a ContextCreate that lands after its session was released (that release
+    /// found nothing to delete) deletes its own context at the AMF.
+    ///
+    /// REVERT-VERIFIED: without that delete, the AMF keeps the context.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_context_created_after_its_release_is_deleted_1758() {
+        let _g = nextgcore_amfd::test_support::MBS_CONTEXT_LOCK.lock().await;
+        let (_nrf, _amf_server, amf, oauth2) = gated_real_amf().await;
+        let tmgi = tmgi_1758([0x01, 0x17, 0x58]);
+        let ctx = crate::mbsmf_self();
+        let session = ctx
+            .read()
+            .unwrap()
+            .session_add(tmgi.clone(), crate::MbsSessionType::Broadcast)
+            .expect("session");
+        ctx.read().unwrap().session_remove(session.id);
+
+        crate::TEST_OAUTH2_CLIENT
+            .scope(oauth2, async {
+                assert_eq!(
+                    crate::create_amf_mbs_context(session.id, tmgi.clone(), amf).await,
+                    None
+                );
+            })
+            .await;
+        let amf_tmgi = nextgcore_amfd::ngap_mcast::Tmgi::new(0x011758, [0x00, 0xF1, 0x10]);
+        assert!(
+            nextgcore_amfd::context::amf_mcast()
+                .session_find_by_tmgi(&amf_tmgi)
+                .is_none(),
+            "the late context is deleted at the AMF"
+        );
+    }
+
+    /// #1758: a stand-in AMF that holds the FIRST ContextDelete until `release`
+    /// (signalling `arrived`), and answers the successive deletes `statuses` (204
+    /// once exhausted). Counts the deletes.
+    async fn scripted_amf(
+        hold_first: bool,
+        statuses: &[u16],
+    ) -> (
+        nextgcore_sbi::server::SbiServer,
+        crate::context::AmfMbsContext,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let held = Arc::new(AtomicBool::new(!hold_first));
+        let statuses = Arc::new(Mutex::new(
+            statuses
+                .iter()
+                .copied()
+                .collect::<std::collections::VecDeque<u16>>(),
+        ));
+        let (d, a, r, h, st) = (
+            deletes.clone(),
+            arrived.clone(),
+            release.clone(),
+            held.clone(),
+            statuses.clone(),
+        );
+        let (server, addr) = nextgcore_sbi::test_support::sbi_server_on_free_port(
+            move |_req: nextgcore_sbi::message::SbiRequest| {
+                let (d, a, r, h, st) = (d.clone(), a.clone(), r.clone(), h.clone(), st.clone());
+                async move {
+                    d.fetch_add(1, Ordering::SeqCst);
+                    if !h.swap(true, Ordering::SeqCst) {
+                        a.notify_one();
+                        r.notified().await;
+                    }
+                    let status = st.lock().unwrap().pop_front().unwrap_or(204);
+                    nextgcore_sbi::message::SbiResponse::with_status(status)
+                }
+            },
+        )
+        .await;
+        let context = crate::context::AmfMbsContext {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            nf_instance_id: None,
+            context_ref: "7".to_string(),
+        };
+        (server, context, deletes, arrived, release)
+    }
+
+    async fn eventually(what: &str, cond: impl Fn() -> bool) {
+        for _ in 0..500 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for: {what}");
+    }
+
+    /// #1758 (failure-path check 1): a ContextDelete the AMF refuses is retried,
+    /// not forgotten.
+    ///
+    /// REVERT-VERIFIED: with no retry, the AMF sees one delete only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_context_delete_is_retried_1758() {
+        use std::sync::atomic::Ordering;
+        let (_server, context, deletes, _arrived, _release) =
+            scripted_amf(false, &[500, 503]).await;
+        assert!(!crate::release_amf_contexts(vec![context]).await);
+        eventually("the AMF accepts a retried delete", || {
+            deletes.load(Ordering::SeqCst) == 3
+        })
+        .await;
+    }
+
+    /// #1758 (check 3): a session release whose consumer disconnects while the AMF
+    /// holds its ContextDelete still releases the context: the refused delete is
+    /// retried on its own task.
+    ///
+    /// REVERT-VERIFIED: with the release awaited inline, dropping the handler drops
+    /// the retry and the AMF sees one delete only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_release_still_releases_the_amf_context_1758() {
+        use std::sync::atomic::Ordering;
+        let (_server, context, deletes, arrived, release) = scripted_amf(true, &[500]).await;
+        crate::mbsmf_context_init(256);
+        let ctx = crate::mbsmf_self();
+        let session = ctx
+            .read()
+            .unwrap()
+            .session_add(
+                tmgi_1758([0x02, 0x17, 0x58]),
+                crate::MbsSessionType::Broadcast,
+            )
+            .expect("session");
+        assert!(ctx.read().unwrap().record_amf_context(session.id, context));
+
+        let id = format!("mbs-sess-{}", session.id);
+        tokio::select! {
+            _ = crate::handle_mbs_session_release(&id) => {
+                panic!("the AMF holds the delete; the release cannot finish")
+            }
+            _ = arrived.notified() => {}
+        }
+        release.notify_one();
+        eventually("the refused delete is retried", || {
+            deletes.load(Ordering::SeqCst) == 2
+        })
+        .await;
     }
 
     /// The `mbsServiceId` is 6 hex digits, which is what the OpenAPI's

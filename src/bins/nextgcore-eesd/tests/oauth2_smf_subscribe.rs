@@ -12,6 +12,10 @@
 //! - Without it, the same Subscribe carries no token and smfd refuses it: the
 //!   refused counter rises and nothing is held.
 //!
+//! Since #1617 step f nrfd refuses NF management from a caller with no verified
+//! certificate identity, so nrfd serves TLS from the shipped dev PKI
+//! (`DevPki`) and smfd and eesd register with their own certificates.
+//!
 //! nrfd and smfd are siblings of this crate's binary in the target directory.
 //! The CI steps that run this test (feature `demo-d443a-edge-budget`) build
 //! them first; outside CI a run without them skips with a message, and in CI
@@ -22,9 +26,19 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use nextgcore_sbi::test_support::{spawn_port, NfProcess, NfSpawn};
+use nextgcore_sbi::test_support::{spawn_port, DevPki, NfProcess, NfSpawn};
 
 const EESD: &str = env!("CARGO_BIN_EXE_nextgcore-eesd");
+
+/// The dev PKI rows: the NRF, smfd and the token arm's eesd (registered as AF
+/// under its UUID eesId).
+const NRF_ID: &str = "1529f000-0000-4000-8000-0000000000f0";
+const SMF_ID: &str = "1529f000-0000-4000-8000-0000000005f0";
+const EES_ID: &str = "1529f000-0000-4000-8000-0000000000e5";
+
+fn dev_pki() -> DevPki {
+    DevPki::generate(NRF_ID, &[("smf", "SMF", SMF_ID), ("ees", "AF", EES_ID)])
+}
 
 fn sibling(name: &str) -> Option<PathBuf> {
     let p = PathBuf::from(EESD).with_file_name(name);
@@ -44,13 +58,14 @@ fn child_env(cmd: &mut std::process::Command) {
         .env_remove("NEXTGCORE_SBI_ADVERTISE");
 }
 
-/// nrfd, trusting the CCA public keys NFs publish into `trust`.
-async fn nrfd(bin: &Path, tag: &str, trust: &Path) -> NfProcess {
+/// nrfd over TLS (`pki`), trusting the CCA public keys NFs publish into `trust`.
+async fn nrfd(bin: &Path, tag: &str, trust: &Path, pki: &DevPki) -> NfProcess {
     let trust = trust.display().to_string();
     NfSpawn::new(bin, &format!("{tag}-nrfd"))
         .ready_when_logged("server listening on")
         .spawn_async(move |cmd, port, dir| {
             child_env(cmd);
+            pki.nrf_server_env(cmd);
             let config = dir.join("nrf.yaml");
             std::fs::write(
                 &config,
@@ -73,24 +88,26 @@ async fn nrfd(bin: &Path, tag: &str, trust: &Path) -> NfProcess {
 /// §13.3.8), so smfd gets a CCA key whose public half is published into nrfd's
 /// trust directory `trust`, as eesd's is. Without one its token request is
 /// `invalid_client` and, failing closed, it never registers.
-async fn smfd(bin: &Path, tag: &str, nrf: u16, trust: &Path) -> NfProcess {
+async fn smfd(bin: &Path, tag: &str, nrf: u16, trust: &Path, pki: &DevPki) -> NfProcess {
     let trust = trust.to_path_buf();
     NfSpawn::new(bin, &format!("{tag}-smfd"))
         .ready_when_logged("SBI HTTP/2 server listening on")
         .spawn_async(move |cmd, port, dir| {
             child_env(cmd);
+            pki.nrf_client_env(cmd, "smf");
             let config = dir.join("smf.yaml");
             std::fs::write(
                 &config,
                 format!(
                     "smf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n        port: {port}\n    \
-                     client:\n      nrf:\n        - uri: http://127.0.0.1:{nrf}\n"
+                     client:\n      nrf:\n        - uri: https://127.0.0.1:{nrf}\n"
                 ),
             )
             .unwrap();
             cmd.arg("-c")
                 .arg(&config)
                 .env("NEXTGCORE_SBI_OAUTH2_REQUIRE", "1")
+                .env("NEXTGCORE_SMF_INSTANCE_ID", SMF_ID)
                 .env("NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE", dir.join("cca.key"))
                 .env("NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR", &trust)
                 .env("SMF_PFCP_ADDR", "127.0.0.1")
@@ -103,11 +120,15 @@ async fn smfd(bin: &Path, tag: &str, nrf: u16, trust: &Path) -> NfProcess {
 /// How eesd reaches the NRF.
 enum Arm<'a> {
     /// `--nrf-uri` at this nrfd, a CCA key whose public half is published into
-    /// the nrfd's trust directory, and a non-UUID `--ees-id` (the AF id is then
-    /// derived from it).
-    Token(u16, &'a Path),
-    /// `--nrf-uri` but no CCA key: nrfd's default policy refuses the token.
-    NoCca(u16),
+    /// the nrfd's trust directory, the `ees` certificate, and the UUID eesId
+    /// that certificate names (the AF id is then the eesId; the derivation from
+    /// a non-UUID eesId is `nrf_af`'s unit test, since a certificate must name
+    /// the ID it registers).
+    Token(u16, &'a Path, &'a DevPki),
+    /// `--nrf-uri` but no CCA key and no certificate (the CA only): nrfd's
+    /// default policy refuses the token, and since #1617 step f the
+    /// registration too.
+    NoCca(u16, &'a DevPki),
     /// No `--nrf-uri`.
     Bare,
 }
@@ -134,14 +155,17 @@ async fn eesd(tag: &str, smf: u16, arm: Arm<'_>) -> (NfProcess, SocketAddr) {
                 .arg(&config)
                 .env("EES_METRICS_PORT", metrics.to_string());
             match &arm {
-                Arm::Token(nrf, trust) => {
-                    cmd.args(["--nrf-uri", &format!("http://127.0.0.1:{nrf}")])
-                        .args(["--ees-id", "ees1529.example.com"])
+                Arm::Token(nrf, trust, pki) => {
+                    pki.nrf_client_env(cmd, "ees");
+                    cmd.args(["--nrf-uri", &format!("https://127.0.0.1:{nrf}")])
+                        .args(["--ees-id", EES_ID])
                         .env("NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE", dir.join("cca.key"))
                         .env("NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR", trust);
                 }
-                Arm::NoCca(nrf) => {
-                    cmd.args(["--nrf-uri", &format!("http://127.0.0.1:{nrf}")]);
+                Arm::NoCca(nrf, pki) => {
+                    cmd.env("NEXTGCORE_NRF_TLS_CA", pki.file("ca.crt"))
+                        .env("NEXTGCORE_NRF_TLS_SERVER_NAME", "nrf")
+                        .args(["--nrf-uri", &format!("https://127.0.0.1:{nrf}")]);
                 }
                 Arm::Bare => {}
             }
@@ -228,27 +252,34 @@ async fn the_subscribe_carries_an_nrf_token_the_oauth2_smf_accepts() {
     std::fs::create_dir_all(&trust.0).unwrap();
     let trust = &trust.0;
 
-    let nrf = nrfd(&nrfd_bin, "eesd-1529-token", trust).await;
-    let smf = smfd(&smfd_bin, "eesd-1529-token", nrf.port(), trust).await;
+    let pki = dev_pki();
+    let nrf = nrfd(&nrfd_bin, "eesd-1529-token", trust, &pki).await;
+    let smf = smfd(&smfd_bin, "eesd-1529-token", nrf.port(), trust, &pki).await;
     smf_registered(&smf).await;
 
-    // Token arm: held, never refused. The eesId is not a UUID, so the AF
-    // registers (and its CCA key is trusted) under the UUID derived from it.
-    let (ees, metrics) = eesd("eesd-1529-token", smf.port(), Arm::Token(nrf.port(), trust)).await;
+    // Token arm: held, never refused. The AF registers (and its CCA key is
+    // trusted) under the eesId its certificate names.
+    let (ees, metrics) = eesd(
+        "eesd-1529-token",
+        smf.port(),
+        Arm::Token(nrf.port(), trust, &pki),
+    )
+    .await;
     let body = scrape_until(metrics, &ees, |b| sample(b, SUBSCRIBED) == Some(1.0)).await;
     assert_eq!(sample(&body, REFUSED).unwrap_or(0.0), 0.0, "{body}");
     assert_eq!(sample(&body, NO_TOKEN).unwrap_or(0.0), 0.0, "{body}");
     let log = ees.log();
-    assert!(log.contains("registered at the NRF as AF"), "{log}");
     assert!(
-        log.contains("derived from the eesId \"ees1529.example.com\""),
+        log.contains(&format!(
+            "registered at the NRF as AF nfInstanceId {EES_ID}"
+        )),
         "{log}"
     );
     drop(ees);
 
     // An NRF that issues no token (no client authentication): nothing is sent
     // bare, the failure is counted as no-token, nothing is held.
-    let (no_cca, metrics) = eesd("eesd-1529-nocca", smf.port(), Arm::NoCca(nrf.port())).await;
+    let (no_cca, metrics) = eesd("eesd-1529-nocca", smf.port(), Arm::NoCca(nrf.port(), &pki)).await;
     let body = scrape_until(metrics, &no_cca, |b| {
         sample(b, NO_TOKEN).unwrap_or(0.0) >= 1.0
     })
