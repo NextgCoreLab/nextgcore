@@ -800,17 +800,26 @@ impl SbiClient {
     ///   producer failing until the cached token expired. `insufficient_scope`
     ///   (a fresh token carries the same scope) and a caller-supplied
     ///   `Authorization` are left alone.
-    pub async fn send_request(&self, request: SbiRequest) -> SbiResult<SbiResponse> {
+    pub async fn send_request(&self, mut request: SbiRequest) -> SbiResult<SbiResponse> {
         // The token is ours to replace only when this client attaches it: OAuth2
-        // applies to the request, and the caller set no Authorization.
+        // applies to the request, and the caller set no Authorization. It is
+        // attached here, as `prepare_request` would, so the token the producer
+        // refuses is known (review m1: only that token is evicted). A failure to
+        // obtain one is left to `prepare_request`, which fails closed (#63).
         let scope = derive_scope_from_uri(&request.header.uri);
         let ours = request.http.get_header("Authorization").is_none() && !scope.is_empty();
-        let resend = ours
+        let mut resend = None;
+        if let Some((oauth2, target)) = ours
             .then(|| self.oauth2_for(&request.header.uri, crate::nrf_tls::nrf_oauth2_client()))
             .flatten()
-            .map(|oauth2| (oauth2, request.clone()));
+        {
+            if let Ok(header) = oauth2.authorization_header(target, &scope).await {
+                resend = Some((oauth2, target, request.clone(), header.clone()));
+                request.http.set_header("Authorization", header);
+            }
+        }
         let response = self.send_with_overload_reaction(request).await?;
-        let Some(((oauth2, target), resend)) = resend else {
+        let Some((oauth2, target, resend, header)) = resend else {
             return Ok(response);
         };
         if response.status != 401
@@ -829,8 +838,9 @@ impl SbiClient {
             crate::log_redact::redact_callback_tokens(&resend.header.uri),
             target.to_str()
         );
+        let rejected = header.strip_prefix("Bearer ").unwrap_or(&header);
         oauth2
-            .invalidate_token(&oauth2.self_consumer(), target, &scope)
+            .invalidate_token_if(&oauth2.self_consumer(), target, &scope, rejected)
             .await;
         self.send_with_overload_reaction(resend).await
     }
@@ -2516,15 +2526,17 @@ mod tests {
                                         bytes::Bytes::from_static(b"{}"),
                                     ));
                                     *r.status_mut() = hyper::StatusCode::from_u16(status).unwrap();
-                                    r.headers_mut().insert(
-                                        "www-authenticate",
+                                    // An empty `error`: a challenge with none.
+                                    let challenge = if error.is_empty() {
+                                        "Bearer realm=\"5gc\"".to_string()
+                                    } else {
                                         format!(
                                             "Bearer realm=\"5gc\", error=\"{error}\", \
                                              error_description=\"refused, by the stub\""
                                         )
-                                        .parse()
-                                        .unwrap(),
-                                    );
+                                    };
+                                    r.headers_mut()
+                                        .insert("www-authenticate", challenge.parse().unwrap());
                                     r
                                 } else {
                                     hyper::Response::new(http_body_util::Full::new(
@@ -2683,6 +2695,41 @@ mod tests {
             ),
             (0, 1)
         );
+    }
+
+    /// **#1676 review M1.** Only `invalid_token` evicts: a 401 whose challenge has
+    /// no `error` (RFC 6750 §3.1: the request lacked authentication) or
+    /// `error="invalid_request"` is returned to the caller after one producer hit,
+    /// with no token refetched and the cached token kept.
+    ///
+    /// REVERT-VERIFIED: resending on any 401 (the `invalid_token` comparison
+    /// dropped) makes both cases two hits and two fetches.
+    #[tokio::test]
+    async fn a_401_other_than_invalid_token_is_returned_not_retried_1676() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let _paths = crate::oauth::lock_path_mode_async().await;
+        for error in ["", "invalid_request"] {
+            let (addr, counts) = serve_rotating_token_producer(&["token-1"], 401, error).await;
+            let (client, oauth2) = client_1676(addr);
+            let response = client
+                .send_request(SbiRequest::get("/nudm-sdm/v2/imsi-1/am-data"))
+                .await
+                .expect("sent");
+            assert_eq!(response.status, 401, "{error:?}");
+            assert_eq!(
+                (
+                    counts.token_fetches.load(SeqCst),
+                    counts.producer_hits.load(SeqCst)
+                ),
+                (1, 1),
+                "{error:?}: one hit, no refetch"
+            );
+            assert_eq!(
+                oauth2.get_token(NfType::Udm, "nudm-sdm").await.unwrap(),
+                "token-1",
+                "{error:?}: the cached token is kept"
+            );
+        }
     }
 
     #[test]

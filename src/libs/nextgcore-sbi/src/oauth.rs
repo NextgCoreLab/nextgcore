@@ -957,6 +957,28 @@ impl TokenCache {
         tokens.remove(&key);
     }
 
+    /// #1676 (review m1): drop the token for one consumer, target and scope only
+    /// while it is still `rejected`, the token a producer refused. Two requests
+    /// refused concurrently then evict the refused token once: the second finds the
+    /// fresh token the first one fetched, and keeps it. Returns whether it evicted.
+    pub async fn invalidate_if(
+        &self,
+        consumer_id: &str,
+        target_nf_type: NfType,
+        scope: &str,
+        rejected: &str,
+    ) -> bool {
+        let key = Self::key(consumer_id, target_nf_type, scope);
+        let mut tokens = self.tokens.write().await;
+        let held = tokens
+            .get(&key)
+            .is_some_and(|t| t.response.access_token == rejected);
+        if held {
+            tokens.remove(&key);
+        }
+        held
+    }
+
     /// Remove expired entries from the cache.
     pub async fn purge_expired(&self) {
         let mut tokens = self.tokens.write().await;
@@ -1546,6 +1568,20 @@ impl OAuth2Client {
         self.cache
             .invalidate(&consumer.nf_instance_id, target_nf_type, scope)
             .await;
+    }
+
+    /// #1676: [`TokenCache::invalidate_if`] for `consumer`: evict the cached token
+    /// only while it is still the `rejected` one.
+    pub async fn invalidate_token_if(
+        &self,
+        consumer: &TokenConsumer,
+        target_nf_type: NfType,
+        scope: &str,
+        rejected: &str,
+    ) -> bool {
+        self.cache
+            .invalidate_if(&consumer.nf_instance_id, target_nf_type, scope, rejected)
+            .await
     }
 
     /// Request a new access token from the NRF.
@@ -2468,6 +2504,46 @@ mod tests {
         assert!(publish_cca_public_jwk(&second, "  ", &jwk_dir).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **#1676 review m1.** A refused token is evicted only while it is still the
+    /// cached one: a second request refused with the same old token finds the
+    /// fresh token the first one fetched, and keeps it.
+    ///
+    /// REVERT-VERIFIED: with `invalidate_if` removing unconditionally, the fresh
+    /// token is evicted and the assertion names it.
+    #[tokio::test]
+    async fn only_the_refused_token_is_evicted_1676() {
+        let cache = TokenCache::new();
+        let token = |t: &str| AccessTokenResponse {
+            access_token: t.to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: Some(3600),
+            scope: None,
+        };
+        cache
+            .put("c", NfType::Udm, "nudm-sdm", token("fresh"))
+            .await;
+        assert!(
+            !cache
+                .invalidate_if("c", NfType::Udm, "nudm-sdm", "old")
+                .await,
+            "another token is not evicted"
+        );
+        assert_eq!(
+            cache
+                .get("c", NfType::Udm, "nudm-sdm")
+                .await
+                .map(|t| t.access_token),
+            Some("fresh".to_string()),
+            "the fresh token is kept"
+        );
+        assert!(
+            cache
+                .invalidate_if("c", NfType::Udm, "nudm-sdm", "fresh")
+                .await
+        );
+        assert!(cache.get("c", NfType::Udm, "nudm-sdm").await.is_none());
     }
 
     #[test]
