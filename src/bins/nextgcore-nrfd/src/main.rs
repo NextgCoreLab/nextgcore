@@ -587,9 +587,11 @@ struct NrfPolicy {
     /// overwrites the header, any client can set it.
     trust_forwarded_client_cert: bool,
     /// #1617: refuse NFRegister / NFUpdate / NFDeregister from a caller with no
-    /// verified certificate identity ([`RegistrantIdentity::require_certificate`]).
-    /// OFF until the shipped deployments present certificates (#1617 step f
-    /// turns it on by default); until then such a request is only counted.
+    /// verified certificate identity ([`RegistrantIdentity::require_certificate`]),
+    /// `400 INVALID_CLIENT`. Always ON: the operator decision on #1617 refuses
+    /// such a caller on every listener, plaintext included, and there is no
+    /// opt-out (every shipped deployment presents NF certificates since steps
+    /// d1-d3). A field rather than a constant only so the handlers read one policy.
     require_registrant_identity: bool,
     /// I1 (TS 33.501 §13.3.8.3): cryptographically verify the CCA ES256 JWS
     /// signature (not just the claim binding). Default ON (issue #64 gap 2).
@@ -654,7 +656,9 @@ impl Default for NrfPolicy {
             // The forwarded-cert header is only as trustworthy as the terminator
             // that sets it, and nothing here guarantees one exists.
             trust_forwarded_client_cert: false,
-            require_registrant_identity: false,
+            // #1617 step f: no knob. TS 33.501 §13.3.1.1 permits implicit NF-NRF
+            // authentication; the operator chose not to rely on it.
+            require_registrant_identity: true,
             cca_trusted_keys: std::collections::HashMap::new(),
             cca_conflicted: std::collections::HashSet::new(),
             cca_trusted_keys_dir: None,
@@ -1248,6 +1252,31 @@ fn self_entry_test_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+/// #1617 step f: when nothing needs the NRF's own entry (`registers_itself` is
+/// false) but the state file restored one from a run that did, remove it.
+/// The entry never gets a no-heartbeat timer (#1644 review M2), so it would
+/// otherwise stay REGISTERED and discoverable for the life of the state file,
+/// naming an NRF profile this process does not maintain. Returns whether an
+/// entry was removed.
+fn drop_restored_self_entry() -> bool {
+    if nf_manager().get(nrf_instance_id()).is_none() {
+        return false;
+    }
+    match nf_manager().deregister(nrf_instance_id()) {
+        Ok(_) => {
+            log::info!(
+                "nrfd-187: removed the NRF's own entry {} restored from the state file;                  this configuration does not register the NRF in its own registry",
+                nrf_instance_id()
+            );
+            true
+        }
+        Err(e) => {
+            log::warn!("nrfd-187: could not remove the restored NRF entry: {e}");
+            false
+        }
+    }
+}
+
 fn register_self_with_own_registry() {
     // #1644 review M2: whatever armed one before (a restored registry), the NRF's
     // own entry has no no-heartbeat timer.
@@ -1620,12 +1649,21 @@ async fn main() -> Result<()> {
     )?;
     if let Some(tls) = &server_tls {
         tls.check_files()?;
-    } else if nextgcore_sbi::security::SbiProfile::resolve().is_production() {
+    } else {
+        // #1617 step f: no caller of a cleartext listener can present a
+        // certificate, so this NRF serves discovery and tokens but refuses every
+        // NF-management request. Said once at startup, not per refusal.
         log::warn!(
-            "the NRF serves cleartext h2c, but the SBI profile is production: every NF on \
-             that profile dials its NRF over https and cannot reach this one. Enable TLS \
-             (nrf.sbi.server[0].tls.enabled, {NRF_SERVER_TLS_ENV}=true or --tls), or set \
-             NEXTGCORE_SBI_PROFILE=dev for a cleartext development core."
+            "the NRF serves cleartext h2c: no NF can present a client certificate, so every \
+             NFRegister / NFUpdate / NFDeregister is refused 400 INVALID_CLIENT (#1617). \
+             Enable TLS (nrf.sbi.server[0].tls.enabled, {NRF_SERVER_TLS_ENV}=true or --tls) \
+             with the NFs' certificates (docker/rust/certs/generate-dev-certs.sh).{}",
+            if nextgcore_sbi::security::SbiProfile::resolve().is_production() {
+                " The SBI profile is production too: every NF on it dials its NRF over https \
+                 and cannot reach this one."
+            } else {
+                ""
+            }
         );
     }
 
@@ -1836,6 +1874,8 @@ async fn main() -> Result<()> {
         // registered NRF offers the service, so the NRF must be in its own registry
         // whenever the gate requires one.
         register_self_with_own_registry();
+    } else {
+        drop_restored_self_entry();
     }
 
     // Build SBI server configuration (legacy, for context)
@@ -2081,6 +2121,27 @@ fn oauth2_gate(
 }
 
 /// SBI request handler for NRF
+/// #1617 step f: the plaintext test listeners of NF-management lifecycles stand
+/// in for a TLS terminator that verified the caller's certificate for the
+/// nfInstanceID the request names. Those tests exercise registration, heartbeat
+/// and deregistration, not caller identity; the refusal of an unverified caller
+/// is tested over real TLS (`server_tls_tests_1617`, `dev_pki_tests_1617`) and
+/// at the handlers (`unverified_registrant_tests_1617`). Test-only: nothing in
+/// the daemon can attach an identity a handshake did not verify.
+#[cfg(test)]
+async fn nrf_handler_as_path_certificate(mut request: SbiRequest) -> SbiResponse {
+    if request.peer_cert_nf_instance_id.is_none() {
+        request.peer_cert_nf_instance_id = request
+            .header
+            .uri
+            .strip_prefix("/nnrf-nfm/v1/nf-instances/")
+            .and_then(|rest| rest.split(['/', '?']).next())
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+    }
+    nrf_sbi_request_handler(request).await
+}
+
 async fn nrf_sbi_request_handler(mut request: SbiRequest) -> SbiResponse {
     // nrfd-06: per-path server-side OAuth2 enforcement (default OFF). The token
     // and jwks endpoints stay exempt so the core can always obtain a token.
@@ -4459,12 +4520,12 @@ fn extract_transport_client_nf_instance_id(
 /// Only identities that cannot be forged count: the URI SAN of a client
 /// certificate this process verified, a forwarded certificate identity when the
 /// operator declared a trusted terminator, and the `sub` of an NRF-issued token
-/// whose signature this process verified. With none of them (a plaintext or
-/// TLS-only listener, a certificate without a URI SAN) the instance is not bound
-/// and the request proceeds as before: TS 33.501 §13.3.1.1 lets NF-NRF
-/// authentication be implicit (NDS/IP, physical security) when the PLMN does
-/// not use transport-layer protection, and whether to refuse such registrations
-/// is operator policy.
+/// whose signature this process verified. NF management additionally needs a
+/// CERTIFICATE identity ([`Self::require_certificate`]): with none (a plaintext
+/// connection, a TLS client without a certificate, a certificate without a URI
+/// SAN) NFRegister / NFUpdate / NFDeregister are refused `400 INVALID_CLIENT`.
+/// TS 33.501 §13.3.1.1 would let NF-NRF authentication be implicit (NDS/IP,
+/// physical security); the operator decision on #1617 does not rely on that.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct RegistrantIdentity {
     /// Each verified NF Instance ID of the caller, with where it came from.
@@ -4527,10 +4588,11 @@ impl RegistrantIdentity {
             .map(|(_, id)| id.as_str())
     }
 
-    /// #1617: the enforcement point every NF-management operation passes first.
-    /// A caller with no verified certificate identity is counted, and refused
-    /// `400 INVALID_CLIENT` (TS 29.510 Table 6.1.7.3-1) when `enforce` is on.
-    /// `Some` is the refusal to send.
+    /// #1617: the enforcement point every NF-management operation passes first,
+    /// before anything is read or stored. A caller with no verified certificate
+    /// identity is counted and refused `400 INVALID_CLIENT` (TS 29.510
+    /// Table 6.1.7.3-1); `enforce` is the policy, which is always on outside
+    /// tests of the counter. `Some` is the refusal to send.
     fn require_certificate(
         &self,
         operation: &str,
@@ -5927,7 +5989,7 @@ mod tests {
 
         let server = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), addr_listener);
         server
-            .start(nrf_sbi_request_handler)
+            .start(nrf_handler_as_path_certificate)
             .await
             .expect("SBI server starts");
 
@@ -6266,7 +6328,7 @@ mod tests {
         let (addr_listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let server = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), addr_listener);
         server
-            .start(nrf_sbi_request_handler)
+            .start(nrf_handler_as_path_certificate)
             .await
             .expect("SBI server starts");
 
@@ -6386,7 +6448,7 @@ mod tests {
         let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let server = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), listener);
         server
-            .start(nrf_sbi_request_handler)
+            .start(nrf_handler_as_path_certificate)
             .await
             .expect("SBI server starts");
         nextgcore_sbi::context::global_context()
@@ -6552,7 +6614,7 @@ mod tests {
         let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let server = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), listener);
         server
-            .start(nrf_sbi_request_handler)
+            .start(nrf_handler_as_path_certificate)
             .await
             .expect("SBI server starts");
         let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", addr.port());
@@ -6700,7 +6762,7 @@ mod tests {
         let (addr_listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let server = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), addr_listener);
         server
-            .start(nrf_sbi_request_handler)
+            .start(nrf_handler_as_path_certificate)
             .await
             .expect("SBI server starts");
 
@@ -7121,6 +7183,7 @@ mod tests {
         req.http.set_content(
             json!({"nfInstanceId": id, "nfType": "SMF", "nfStatus": "REGISTERED"}).to_string(),
         );
+        req.peer_cert_nf_instance_id = Some(id.into());
         let resp = handle_nf_register(id, &req).await;
         assert_eq!(resp.status, 201);
         let body: serde_json::Value =
@@ -7140,6 +7203,7 @@ mod tests {
                    "heartBeatTimer": 99999})
             .to_string(),
         );
+        req2.peer_cert_nf_instance_id = Some(id2.into());
         let resp2 = handle_nf_register(id2, &req2).await;
         let body2: serde_json::Value =
             serde_json::from_str(resp2.http.content.as_deref().unwrap()).unwrap();
@@ -7188,6 +7252,7 @@ mod tests {
         };
         let mut put = SbiRequest::put(format!("/nnrf-nfm/v1/nf-instances/{rogue_id}"));
         put.http.set_content(profile(rogue_id, "EES").to_string());
+        put.peer_cert_nf_instance_id = Some(rogue_id.into());
         let resp = handle_nf_register(rogue_id, &put).await;
         assert_eq!(
             resp.status, 201,
@@ -10730,6 +10795,7 @@ mod tests {
         });
         let mut req = SbiRequest::put(format!("/nnrf-nfm/v1/nf-instances/{nf_id}"));
         req.http.set_content(profile.to_string());
+        req.peer_cert_nf_instance_id = Some(nf_id.into());
 
         // --- First PUT: a new instance -> 201 and NF_REGISTERED -------------
         let first = handle_nf_register(nf_id, &req).await;
@@ -10749,6 +10815,7 @@ mod tests {
         replacement_body["capacity"] = json!(90);
         let mut replacement = SbiRequest::put(format!("/nnrf-nfm/v1/nf-instances/{nf_id}"));
         replacement.http.set_content(replacement_body.to_string());
+        replacement.peer_cert_nf_instance_id = Some(nf_id.into());
 
         let second = handle_nf_register(nf_id, &replacement).await;
         assert_eq!(second.status, 200, "a replacement is 200 OK");
@@ -11608,20 +11675,35 @@ mod registrant_binding_tests_1611 {
         server.stop().await.ok();
     }
 
-    /// A verified certificate with NFTypes but no URI SAN binds the type, and
-    /// leaves the instance unbound (there is no NF Instance ID to compare).
+    /// A verified certificate with NFTypes but no URI SAN names no NF instance,
+    /// so since #1617 step f it cannot manage one: NFRegister is refused
+    /// `400 INVALID_CLIENT` whatever type the profile names (nothing stored), and
+    /// NFDeregister of a stored instance is refused with the entry kept.
+    ///
+    /// REVERT-VERIFIED (#1617 step f): with `require_registrant_identity: false`
+    /// the first PUT is refused only for its type (the identity refusal is gone)
+    /// and this test names it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_certificate_without_a_uri_san_binds_only_the_type_1611() {
+    async fn a_certificate_without_a_uri_san_manages_no_instance_1617() {
         let id = "1611e0e0-0000-4000-8000-00000000000e";
         let other = "1611f0f0-0000-4000-8000-00000000000f";
         let (server, client) = mtls_nrf("no-uri", None, Some(&["CUSTOM_T1611E"])).await;
         let run = async {
-            let resp = put(&client, id, "CUSTOM_T1611F").await;
-            assert_eq!(resp.status, 400, "{:?}", resp.http.content);
-            assert_eq!(cause(&resp), "INVALID_CLIENT");
-            let resp = put(&client, id, "CUSTOM_T1611E").await;
-            assert_eq!(resp.status, 201, "{:?}", resp.http.content);
-            // Nor may it deregister an instance of a type it does not name.
+            for nf_type in ["CUSTOM_T1611F", "CUSTOM_T1611E"] {
+                let resp = put(&client, id, nf_type).await;
+                assert_eq!(resp.status, 400, "{nf_type}: {:?}", resp.http.content);
+                assert_eq!(cause(&resp), "INVALID_CLIENT");
+                assert!(
+                    resp.http
+                        .content
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("no verified client certificate identity"),
+                    "{:?}",
+                    resp.http.content
+                );
+                assert_eq!(stored_type(id), None, "{nf_type}: nothing stored");
+            }
             let theirs = NfProfile::from_json(&profile(other, "CUSTOM_T1611F")).expect("profile");
             nf_manager().register(theirs).expect("stored");
             let resp = client
@@ -12100,8 +12182,12 @@ mod server_tls_tests_1617 {
     }
 
     /// Over the real handler behind `NrfServerTls::apply` (optional client auth):
-    /// - a client with no certificate completes the handshake: discovery is 200
-    ///   and, until step f, its NFRegister is still 201 but counted unverified;
+    /// - a client with no certificate completes the handshake and discovery is
+    ///   200, but since step f its NFRegister, NFUpdate and NFDeregister are each
+    ///   refused 400 INVALID_CLIENT and counted unverified, and none of them
+    ///   applies anything (no entry created; a stored entry neither patched nor
+    ///   removed). REVERT-VERIFIED: with `require_registrant_identity: false`
+    ///   the PUT is 201 and the first refusal assertion names it;
     /// - a client whose certificate does not chain to the CA is refused at the
     ///   handshake;
     /// - the NRF's self client (`self_client_tls`, dialling `127.0.0.1`) is
@@ -12142,6 +12228,15 @@ mod server_tls_tests_1617 {
                 .await
                 .expect("no certificate: the handshake completes");
             assert_eq!(r.status, 200);
+            let refused = |r: &SbiResponse, what: &str| {
+                assert_eq!(r.status, 400, "{what} refused: {:?}", r.http.content);
+                let body = r.http.content.as_deref().unwrap_or_default();
+                assert!(body.contains("INVALID_CLIENT"), "{what}: {body}");
+                assert!(
+                    body.contains("no verified client certificate identity"),
+                    "{what}: {body}"
+                );
+            };
             let before = nextgcore_nrfd::metrics::unverified_nf_management_total();
             let r = anon
                 .put_json(
@@ -12151,30 +12246,43 @@ mod server_tls_tests_1617 {
                 )
                 .await
                 .expect("PUT completes");
-            assert_eq!(
-                r.status, 201,
-                "not refused before step f: {:?}",
-                r.http.content
-            );
+            refused(&r, "NFRegister");
+            assert!(nf_manager().get(anon_id).is_none(), "nothing registered");
             let after_put = nextgcore_nrfd::metrics::unverified_nf_management_total();
             assert!(after_put > before, "NFRegister counted");
+            // An entry its owner registered: the anonymous caller may neither
+            // patch nor remove it.
+            nf_manager()
+                .register(
+                    NfProfile::from_json(&json!({"nfInstanceId": anon_id,
+                        "nfType": "CUSTOM_T1617B", "nfStatus": "REGISTERED"}))
+                    .expect("profile"),
+                )
+                .expect("stored");
             let req = SbiRequest::patch(format!("/nnrf-nfm/v1/nf-instances/{anon_id}")).with_body(
-                json!([{"op": "replace", "path": "/nfStatus", "value": "REGISTERED"}]).to_string(),
+                json!([{"op": "replace", "path": "/nfStatus", "value": "SUSPENDED"}]).to_string(),
                 "application/json-patch+json",
             );
             let r = anon.send_request(req).await.expect("PATCH completes");
-            assert_eq!(r.status, 200, "{:?}", r.http.content);
+            refused(&r, "NFUpdate");
+            assert_eq!(
+                nf_manager().get(anon_id).map(|p| p.nf_status).as_deref(),
+                Some("REGISTERED"),
+                "not patched"
+            );
             let after_patch = nextgcore_nrfd::metrics::unverified_nf_management_total();
             assert!(after_patch > after_put, "NFUpdate counted");
             let r = anon
                 .delete(&format!("/nnrf-nfm/v1/nf-instances/{anon_id}"))
                 .await
                 .expect("DELETE completes");
-            assert_eq!(r.status, 204, "{:?}", r.http.content);
+            refused(&r, "NFDeregister");
+            assert!(nf_manager().get(anon_id).is_some(), "not removed");
             assert!(
                 nextgcore_nrfd::metrics::unverified_nf_management_total() > after_patch,
                 "NFDeregister counted"
             );
+            nf_manager().deregister(anon_id).ok();
 
             let forged = client_with(Some((foreign.file("amf.crt"), foreign.file("amf.key"))));
             let err = forged
@@ -12440,7 +12548,10 @@ mod registry_uuid_case_tests_1633 {
         let upper = lower.to_ascii_uppercase();
         let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let server = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), listener);
-        server.start(nrf_sbi_request_handler).await.expect("starts");
+        server
+            .start(nrf_handler_as_path_certificate)
+            .await
+            .expect("starts");
         let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", addr.port());
         let profile = |id: &str| {
             json!({
@@ -12735,14 +12846,19 @@ mod tests_nf_set_ids_1719 {
             "ipv4Addresses": ["10.17.19.1"],
             "nfSetIdList": sets,
         });
-        let req = SbiRequest::put(format!("/nnrf-nfm/v1/nf-instances/{id}"))
+        let mut req = SbiRequest::put(format!("/nnrf-nfm/v1/nf-instances/{id}"))
             .with_body(body.to_string(), "application/json");
+        // #1617 step f: NF management needs a verified certificate identity, so
+        // each request carries one naming its own instance (no NF types, so the
+        // nfType binding admits any type). The allowlist check runs after it.
+        req.peer_cert_nf_instance_id = Some(id.to_string());
         handle_nf_register(id, &req).await
     }
 
     async fn patch(id: &str, ops: serde_json::Value) -> SbiResponse {
-        let req = SbiRequest::patch(format!("/nnrf-nfm/v1/nf-instances/{id}"))
+        let mut req = SbiRequest::patch(format!("/nnrf-nfm/v1/nf-instances/{id}"))
             .with_body(ops.to_string(), "application/json-patch+json");
+        req.peer_cert_nf_instance_id = Some(id.to_string());
         handle_nf_update(id, &req).await
     }
 
@@ -12772,6 +12888,22 @@ mod tests_nf_set_ids_1719 {
         let smf = "17190c0c-0000-4000-8000-00000000000c";
         ALLOWLIST
             .scope(allowlist(own), async {
+                // #1617 step f runs first: with no verified identity the claim
+                // is refused 400 INVALID_CLIENT before the allowlist is consulted.
+                let bare = SbiRequest::put(format!("/nnrf-nfm/v1/nf-instances/{rogue}")).with_body(
+                    json!({"nfInstanceId": rogue, "nfType": "PCF",
+                               "nfStatus": "REGISTERED", "nfSetIdList": [SET1]})
+                    .to_string(),
+                    "application/json",
+                );
+                let resp = handle_nf_register(rogue, &bare).await;
+                assert_eq!(
+                    resp.status, 400,
+                    "identity before the allowlist: {:?}",
+                    resp.http.content
+                );
+                assert!(stored_sets(rogue).is_none());
+
                 // A PCF of no allowed set: refused, nothing stored.
                 let resp = put(rogue, "PCF", &[SET1]).await;
                 assert_eq!(resp.status, 403, "{:?}", resp.http.content);
@@ -12956,5 +13088,194 @@ mod tests_nf_set_ids_1719 {
         );
         let none: NrfYaml = serde_yaml::from_str("nrf: {}\n").expect("parses");
         assert!(NrfPolicy::from_yaml(&none).nf_set_allowlist.is_none());
+    }
+}
+
+/// #1617 step f: the NRF refuses NFRegister / NFUpdate / NFDeregister from a
+/// caller with no verified certificate identity, plaintext included (operator
+/// decision; TS 33.310 §6.1.3c.3, TS 33.501 §13.1.0), with `400 INVALID_CLIENT`
+/// (TS 29.510 Table 6.1.7.3-1), and a refused request applies nothing.
+#[cfg(test)]
+mod unverified_registrant_tests_1617 {
+    use super::*;
+    use serde_json::json;
+
+    fn assert_refused(r: &SbiResponse, what: &str) {
+        assert_eq!(r.status, 400, "{what}: {:?}", r.http.content);
+        let body = r.http.content.as_deref().unwrap_or_default();
+        let problem: serde_json::Value = serde_json::from_str(body).expect("ProblemDetails");
+        assert_eq!(problem["cause"], "INVALID_CLIENT", "{what}: {body}");
+        assert!(
+            body.contains("no verified client certificate identity"),
+            "{what}: {body}"
+        );
+    }
+
+    fn put_req(id: &str, nf_type: &str) -> SbiRequest {
+        let mut req = SbiRequest::put(format!("/nnrf-nfm/v1/nf-instances/{id}"));
+        req.http.set_content(
+            json!({"nfInstanceId": id, "nfType": nf_type, "nfStatus": "REGISTERED"}).to_string(),
+        );
+        req
+    }
+
+    fn patch_req(id: &str) -> SbiRequest {
+        SbiRequest::patch(format!("/nnrf-nfm/v1/nf-instances/{id}")).with_body(
+            json!([{"op": "replace", "path": "/nfStatus", "value": "SUSPENDED"}]).to_string(),
+            "application/json-patch+json",
+        )
+    }
+
+    fn stored(id: &str, nf_type: &str) {
+        nf_manager()
+            .register(
+                NfProfile::from_json(
+                    &json!({"nfInstanceId": id, "nfType": nf_type, "nfStatus": "REGISTERED"}),
+                )
+                .expect("profile"),
+            )
+            .expect("stored");
+    }
+
+    /// No knob: the shipped policy enforces, and the YAML/env loader has no key
+    /// that turns it off.
+    ///
+    /// REVERT-VERIFIED: with the default flipped back to false this fails.
+    #[test]
+    fn the_nrf_requires_a_registrant_certificate_by_default_1617() {
+        assert!(NrfPolicy::default().require_registrant_identity);
+        assert!(nrf_policy().require_registrant_identity);
+    }
+
+    /// Over a real plaintext h2c listener (the dev SBI profile's transport): no
+    /// certificate can be presented, so every NF-management operation is refused
+    /// and counted; nothing is created, patched or removed. Discovery still
+    /// answers (it keeps today's auth).
+    ///
+    /// REVERT-VERIFIED: with `require_registrant_identity: false` the PUT is
+    /// 201 and the `NFRegister` assertion names it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_plaintext_caller_manages_no_nf_instance_1617() {
+        let id = "1617f000-0000-4000-8000-0000000000f1";
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), listener);
+        server.start(nrf_sbi_request_handler).await.expect("starts");
+        let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", addr.port());
+        let run = async {
+            let before = nextgcore_nrfd::metrics::unverified_nf_management_total();
+            let r = client
+                .put_json(
+                    &format!("/nnrf-nfm/v1/nf-instances/{id}"),
+                    &json!({"nfInstanceId": id, "nfType": "CUSTOM_T1617F",
+                            "nfStatus": "REGISTERED", "heartBeatTimer": 10}),
+                )
+                .await
+                .expect("PUT completes");
+            assert_refused(&r, "NFRegister");
+            assert!(nf_manager().get(id).is_none(), "nothing registered");
+            assert!(
+                !HEARTBEAT_TIMERS.lock().expect("timers").contains_key(id),
+                "no supervision timer armed"
+            );
+            let after_put = nextgcore_nrfd::metrics::unverified_nf_management_total();
+            assert!(after_put > before, "NFRegister counted");
+
+            stored(id, "CUSTOM_T1617F");
+            let r = client.send_request(patch_req(id)).await.expect("PATCH");
+            assert_refused(&r, "NFUpdate");
+            assert_eq!(
+                nf_manager().get(id).map(|p| p.nf_status).as_deref(),
+                Some("REGISTERED"),
+                "not patched"
+            );
+            let r = client
+                .delete(&format!("/nnrf-nfm/v1/nf-instances/{id}"))
+                .await
+                .expect("DELETE completes");
+            assert_refused(&r, "NFDeregister");
+            assert!(nf_manager().get(id).is_some(), "not removed");
+
+            let r = client
+                .get(
+                    "/nnrf-disc/v1/nf-instances?target-nf-type=CUSTOM_T1617F&requester-nf-type=SMF",
+                )
+                .await
+                .expect("discovery completes");
+            assert_eq!(r.status, 200, "discovery keeps today's auth");
+        };
+        let outcome = tokio::time::timeout(Duration::from_secs(30), run).await;
+        nf_manager().deregister(id).ok();
+        server.stop().await.ok();
+        outcome.expect("bounded");
+    }
+
+    /// A caller naming the NRF's own nfInstanceId (#1617 step f bullet): with no
+    /// certificate it is refused like any other unverified caller, and with
+    /// another NF's verified certificate `bind_instance` refuses it. The NRF's
+    /// own entry is untouched either way. Only `nrf.crt` binds the NRF's ID.
+    ///
+    /// REVERT-VERIFIED: with `bind_instance` ignored in `handle_nf_register`,
+    /// the AMF certificate's PUT replaces the NRF's entry (200) and this fails.
+    #[tokio::test]
+    async fn a_foreign_caller_cannot_manage_the_nrf_s_own_entry_1617() {
+        let _self_entry = self_entry_test_lock().lock().await;
+        register_self_with_own_registry();
+        let nrf = nrf_instance_id();
+        let amf = "1617f000-0000-4000-8000-0000000000a5";
+        let before = nf_manager().get(nrf).expect("self entry");
+
+        let r = handle_nf_register(nrf, &put_req(nrf, "AMF")).await;
+        assert_refused(&r, "anonymous NFRegister");
+        let r = handle_nf_update(nrf, &patch_req(nrf)).await;
+        assert_refused(&r, "anonymous NFUpdate");
+        let r = handle_nf_deregister(
+            nrf,
+            &SbiRequest::delete(format!("/nnrf-nfm/v1/nf-instances/{nrf}")),
+        )
+        .await;
+        assert_refused(&r, "anonymous NFDeregister");
+
+        let as_amf = |mut req: SbiRequest| {
+            req.peer_cert_nf_instance_id = Some(amf.into());
+            req.peer_cert_nf_types = vec!["AMF".into()];
+            req
+        };
+        for r in [
+            handle_nf_register(nrf, &as_amf(put_req(nrf, "AMF"))).await,
+            handle_nf_update(nrf, &as_amf(patch_req(nrf))).await,
+            handle_nf_deregister(
+                nrf,
+                &as_amf(SbiRequest::delete(format!(
+                    "/nnrf-nfm/v1/nf-instances/{nrf}"
+                ))),
+            )
+            .await,
+        ] {
+            assert_eq!(r.status, 400, "{:?}", r.http.content);
+            let body = r.http.content.as_deref().unwrap_or_default();
+            assert!(body.contains("INVALID_CLIENT"), "{body}");
+            assert!(body.contains("does not match"), "{body}");
+        }
+        let after = nf_manager().get(nrf).expect("the NRF's entry is kept");
+        assert_eq!(after.nf_type, before.nf_type);
+        assert_eq!(after.nf_status, "REGISTERED");
+    }
+
+    /// A state file restored the NRF's own entry from a run that registered
+    /// itself; this run does not (`registers_itself` false), so startup removes
+    /// it, once.
+    ///
+    /// REVERT-VERIFIED: with `drop_restored_self_entry` returning before the
+    /// deregister, the entry stays and the second assertion names it.
+    #[tokio::test]
+    async fn a_restored_self_entry_is_dropped_when_the_nrf_does_not_register_itself_1617() {
+        let _self_entry = self_entry_test_lock().lock().await;
+        register_self_with_own_registry();
+        assert!(drop_restored_self_entry(), "the restored entry is removed");
+        assert!(
+            nf_manager().get(nrf_instance_id()).is_none(),
+            "the NRF's own entry is gone"
+        );
+        assert!(!drop_restored_self_entry(), "nothing left to remove");
     }
 }

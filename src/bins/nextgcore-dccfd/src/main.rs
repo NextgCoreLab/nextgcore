@@ -1058,7 +1058,14 @@ mod data_management_tests {
     /// on.
     use context::GLOBAL_TEST_LOCK as TEST_GUARD;
 
+    /// #1785: also selects the Dev SBI profile, which every test here needs for its
+    /// loopback-plaintext peers (the default is Production, whose peer clients
+    /// speak TLS). `a_consumer_answering_404_loses_its_subscription_1747` relied on
+    /// a sibling having set it: run alone, or first, its fan-out to the stand-in
+    /// consumer failed and the subscription was never removed. Set and never
+    /// reset, as the CONVENTIONS profile rule requires.
     fn init() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         dccf_context_init(256);
     }
 

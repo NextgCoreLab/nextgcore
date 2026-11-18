@@ -126,6 +126,17 @@ pub struct MbsGroupMember {
     pub joined_at: u64,
 }
 
+/// A broadcast MBS context an AMF created for a session on Namf_MBSBroadcast
+/// ContextCreate (#1758): where it lives, so the session's release can delete it
+/// (ContextDelete, TS 29.518 §5.6; TS 23.247 §7.3.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmfMbsContext {
+    pub host: String,
+    pub port: u16,
+    pub nf_instance_id: Option<String>,
+    pub context_ref: String,
+}
+
 /// MBS Session Context (TS 23.247 5.3)
 #[derive(Debug, Clone)]
 pub struct MbsSession {
@@ -585,6 +596,11 @@ pub struct MbSmfContext {
     status_subs: Mutex<SubscriptionStore>,
     /// ContextStatus subscription store (SMF-facing). [mbsmfd-05]
     context_status_subs: Mutex<SubscriptionStore>,
+    /// #1758: the AMF broadcast MBS contexts each session created, by session id.
+    /// Kept beside `session_list` rather than in [`MbsSession`], so no stale session
+    /// clone written back by `session_update` can erase one. Lock order:
+    /// `session_list` before this.
+    amf_contexts: Mutex<HashMap<u64, Vec<AmfMbsContext>>>,
 }
 
 impl MbSmfContext {
@@ -600,7 +616,48 @@ impl MbSmfContext {
             tmgi_pool: Mutex::new(TmgiPool::new()),
             status_subs: Mutex::new(SubscriptionStore::new()),
             context_status_subs: Mutex::new(SubscriptionStore::new()),
+            amf_contexts: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// #1758: record an AMF MBS context for session `id`, only while the session
+    /// exists. Holding `session_list` across the insert serialises it with
+    /// [`Self::session_remove`]: either the release that removes the session then
+    /// takes this context, or this sees the session gone and returns false, and the
+    /// caller deletes the context itself.
+    pub fn record_amf_context(&self, id: u64, context: AmfMbsContext) -> bool {
+        let Ok(session_list) = self.session_list.read() else {
+            return false;
+        };
+        if !session_list.contains_key(&id) {
+            return false;
+        }
+        let Ok(mut map) = self.amf_contexts.lock() else {
+            return false;
+        };
+        let list = map.entry(id).or_default();
+        if !list.contains(&context) {
+            list.push(context);
+        }
+        true
+    }
+
+    /// #1758: take every AMF MBS context recorded for session `id`, for its release.
+    pub fn take_amf_contexts(&self, id: u64) -> Vec<AmfMbsContext> {
+        self.amf_contexts
+            .lock()
+            .ok()
+            .and_then(|mut m| m.remove(&id))
+            .unwrap_or_default()
+    }
+
+    /// #1758: the AMF MBS contexts recorded for session `id`.
+    pub fn amf_contexts_of(&self, id: u64) -> Vec<AmfMbsContext> {
+        self.amf_contexts
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&id).cloned())
+            .unwrap_or_default()
     }
 
     pub fn init(&mut self, max_sessions: usize) {
@@ -724,6 +781,9 @@ impl MbSmfContext {
         {
             session_list.clear();
             tmgi_hash.clear();
+        }
+        if let Ok(mut m) = self.amf_contexts.lock() {
+            m.clear();
         }
     }
 

@@ -352,8 +352,14 @@ d445a_gates() {
       --data-urlencode "nfType=$2" --data-urlencode "targetNfType=$3" --data-urlencode "scope=$4" \
       --data-urlencode "cca=${cca}" "${nrf}/nnrf-oauth2/v1/access-token" 2>&1
   }
-  register() {   # ID TYPE
-    "${K[@]}" exec deploy/nrf -c nrf -- curl -s -o /dev/null -w '%{http_code}' --http2 --cacert /etc/nextgcore/certs/ca.crt --max-time 10 \
+  # #1617 step f: the NRF refuses NFRegister without a verified certificate
+  # identity, so each probe registers with its own (row ROW of
+  # nf-identities.txt, mounted in the nrf pod's probe sidecar, nrf-probe.yaml).
+  register() {   # ROW ID TYPE
+    local row="$1" c="/etc/nextgcore/certs/$1"
+    shift
+    "${K[@]}" exec deploy/nrf -c probe -- curl -s -o /dev/null -w '%{http_code}' --http2 --cacert "${c}/ca.crt" \
+      --cert "${c}/${row}.crt" --key "${c}/${row}.key" --max-time 10 \
       -X PUT -H 'Content-Type: application/json' \
       -d "{\"nfInstanceId\":\"$1\",\"nfType\":\"$2\",\"nfStatus\":\"REGISTERED\",\"heartBeatTimer\":600}" \
       "${nrf}/nnrf-nfm/v1/nf-instances/$1" 2>&1
@@ -363,7 +369,11 @@ d445a_gates() {
   local r t
   # Positive control first, so the refusals below are not a broken route.
   local AF2=6b1d7e3c-0000-4000-8000-0000000480af NW2=6b1d7e3c-0000-4000-8000-0000000480bb
-  gate INFO "register AF probe consumer: $(register "${AF2}" AF); NWDAF probe consumer: $(register "${NW2}" NWDAF)"
+  r="$(register probe-af "${AF2}" AF) $(register probe-nwdaf "${NW2}" NWDAF)"
+  # 201, or 200 when a rerun replaces the profile.
+  if [[ "${r}" =~ ^20[01]\ 20[01]$ ]]; then
+    gate PASS "probe consumers register with their certificates: AF ${r% *}, NWDAF ${r#* }"
+  else gate FAIL "probe consumer registration (AF NWDAF): ${r}"; fi
   t="$(token "${AF2}" AF NEF nnef-ueid | access)"
   r="$(retrieve "${t:--}")"
   if [[ "$(status "${r}")" == 200 ]] && grep -q "\"externalId\":\"ue001@fl.nextg\"" <<<"${r}"; then
