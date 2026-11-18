@@ -2320,6 +2320,195 @@ mod audience_binding_guards {
         );
     }
 
+    /// #1791: every NF that registers an NFProfile advertises, in
+    /// `nfServices[].scheme`, the scheme its SBI listener serves (TS 29.510
+    /// `NFService.scheme`), not a hard-coded `http`. Each daemon captures its
+    /// final listener config's scheme just before building the server, and hands
+    /// it to the NRF registration. Each NF's own
+    /// `the_nf_profile_advertises_the_listener_scheme_1791` test pins that its
+    /// builder honours the scheme; this guard pins `main`'s wiring.
+    ///
+    /// REVERT-VERIFIED: `let sbi_scheme = UriScheme::Http;` in any one daemon, a
+    /// capture moved above `apply_sbi_security_profile` (udmd, R19), a shadowing
+    /// `let sbi_scheme`, the NES driver passing `Http`, or a builder advertising
+    /// `"http"` again, fails this.
+    #[test]
+    fn every_nf_advertises_its_listener_scheme_1791() {
+        let bins = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("crate is at <root>/libs/nextgcore-sbi")
+            .join("bins");
+        let read = |rel: &str| {
+            let path = bins.join(rel);
+            std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+        };
+        // (main file, listener config variable, the registration call in main)
+        for (rel, cfg, register) in [
+            (
+                "nextgcore-ausfd/src/app.rs",
+                "sbi_server_config",
+                "register_with_nrf(&host, port, sbi_scheme)",
+            ),
+            (
+                "nextgcore-dccfd/src/main.rs",
+                "sbi_config",
+                "register_with_nrf(&host, sbi_port, &id, sbi_scheme)",
+            ),
+            (
+                "nextgcore-easdfd/src/main.rs",
+                "sbi_server_config",
+                "register_with_nrf(ctx, &host, sbi_port, &id, sbi_scheme)",
+            ),
+            (
+                "nextgcore-lmfd/src/main.rs",
+                "sbi_server_config",
+                "register_with_nrf(&host, sbi_port, &id, sbi_scheme)",
+            ),
+            (
+                "nextgcore-mbsmfd/src/main.rs",
+                "sbi_server_config",
+                "register_with_nrf(&host, sbi_port, &id, sbi_scheme)",
+            ),
+            (
+                "nextgcore-nefd/src/main.rs",
+                "sbi_server_config",
+                "register_with_nrf(ctx, &host, port, &id, sbi_scheme)",
+            ),
+            (
+                "nextgcore-nsacfd/src/main.rs",
+                "sbi_server_config",
+                "register_with_nrf(&host, sbi_port, &id, sbi_scheme)",
+            ),
+            (
+                "nextgcore-nssfd/src/main.rs",
+                "sbi_server_config",
+                "register_with_nrf(&host, port, sbi_scheme)",
+            ),
+            (
+                "nextgcore-nwdafd/src/main.rs",
+                "sbi_server_config",
+                "register_with_nrf(ctx, &host, sbi_port, sbi_scheme, &id, &allowed)",
+            ),
+            (
+                "nextgcore-smfd/src/main.rs",
+                "sbi_server_config",
+                "smf_nrf_register(&host, port, sbi_scheme)",
+            ),
+            (
+                "nextgcore-tsctsf/src/main.rs",
+                "sbi_server_config",
+                "register_with_nrf(ctx, &host, port, &id, sbi_scheme)",
+            ),
+            (
+                "nextgcore-udmd/src/app.rs",
+                "sbi_server_config",
+                "register_with_nrf(&host, port, sbi_scheme)",
+            ),
+            (
+                "nextgcore-udrd/src/main.rs",
+                "sbi_server_config",
+                "register_with_nrf(&host, port, sbi_scheme)",
+            ),
+        ] {
+            let text = read(rel);
+            let capture = format!("let sbi_scheme = {cfg}.scheme;");
+            assert_eq!(
+                text.matches(&capture).count(),
+                1,
+                "{rel} must take the advertised scheme from its listener config `{cfg}` (#1791)"
+            );
+            assert_eq!(
+                text.matches("let sbi_scheme").count(),
+                1,
+                "{rel} must bind `sbi_scheme` once, so nothing shadows the captured scheme (#1791)"
+            );
+            // R19: the capture must be of the FINAL config, so the next code line
+            // (blank and comment lines skipped) builds the server from it. A
+            // capture above `apply_sbi_security_profile` or any later `{cfg} = ...`
+            // would advertise http while the listener serves https.
+            let after = &text[text.find(&capture).expect("found above") + capture.len()..];
+            let next = after
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty() && !l.starts_with("//"))
+                .unwrap_or_default();
+            assert!(
+                next.starts_with(&format!("let sbi_server = SbiServer::new({cfg}"))
+                    || next.starts_with(&format!("let sbi_server = sbi_server({cfg}")),
+                "{rel} must capture the scheme immediately before building the server from \
+                 `{cfg}`, so it is the scheme the listener serves; the next line is {next:?} (#1791)"
+            );
+            assert_eq!(
+                text.matches(register).count(),
+                1,
+                "{rel} must hand the listener's scheme to its NRF registration (#1791)"
+            );
+        }
+        // udmd's NES resume re-registers with the scheme `main` handed it.
+        let app = read("nextgcore-udmd/src/app.rs");
+        assert!(
+            app.contains(
+                "nes_host,\n                        port,\n                        sbi_scheme,\n"
+            ),
+            "nextgcore-udmd/src/app.rs must hand the listener's scheme to the NES driver (#1791)"
+        );
+        let nes = read("nextgcore-udmd/src/nes_driver.rs");
+        for needle in [
+            "let sbi_scheme = self.sbi_scheme;",
+            "register_with_nrf_id(&id, &sbi_addr, sbi_port, sbi_scheme)",
+            "        sbi_port,\n        sbi_scheme,\n    };",
+        ] {
+            assert_eq!(
+                nes.matches(needle).count(),
+                1,
+                "nextgcore-udmd/src/nes_driver.rs must re-register with the listener's scheme: \
+                 {needle:?} (#1791)"
+            );
+        }
+        // (file, NFService builder): each takes `scheme` and advertises it.
+        for (rel, builder) in [
+            ("nextgcore-ausfd/src/app.rs", "fn build_nf_profile("),
+            ("nextgcore-dccfd/src/main.rs", "fn build_dccf_nf_profile("),
+            ("nextgcore-easdfd/src/main.rs", "fn build_nf_profile("),
+            ("nextgcore-lmfd/src/main.rs", "fn build_lmf_nf_profile("),
+            ("nextgcore-mbsmfd/src/main.rs", "fn build_mbsmf_nf_profile("),
+            ("nextgcore-nefd/src/main.rs", "fn build_nf_profile("),
+            ("nextgcore-nefd/src/ueid.rs", "pub fn nf_service("),
+            ("nextgcore-nsacfd/src/main.rs", "fn build_nsacf_nf_profile("),
+            ("nextgcore-nssfd/src/main.rs", "fn build_nssf_nf_profile("),
+            ("nextgcore-nwdafd/src/main.rs", "fn nwdaf_services("),
+            (
+                "nextgcore-nwdafd/src/model_monitor.rs",
+                "pub fn nf_service(",
+            ),
+            (
+                "nextgcore-nwdafd/src/ran_congestion.rs",
+                "pub fn nf_service(",
+            ),
+            ("nextgcore-smfd/src/main.rs", "fn build_smf_nf_profile("),
+            ("nextgcore-tsctsf/src/main.rs", "fn build_nf_profile("),
+            (
+                "nextgcore-udmd/src/sbi_path.rs",
+                "pub fn build_udm_nf_profile(",
+            ),
+            ("nextgcore-udrd/src/main.rs", "fn build_udr_nf_profile("),
+        ] {
+            let text = read(rel);
+            let start = text
+                .find(builder)
+                .unwrap_or_else(|| panic!("{rel}: `{builder}` not found"));
+            let body = &text[start..];
+            let body = &body[..body.find("\n}\n").expect("fn end")];
+            assert!(
+                !body.contains("\"scheme\": \"http\"")
+                    && body.contains("\"scheme\": scheme.as_str()"),
+                "{rel} `{builder}` must advertise the listener's scheme, not a literal (#1791)"
+            );
+        }
+    }
+
     /// Issue #64 gaps 1+2: every NF acquires its OAuth2 client through
     /// `OAuth2Client::new`, which is where the process-wide CCA signing key is
     /// seeded — so a deployment turns on client authentication in ONE place.

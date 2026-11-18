@@ -86,6 +86,7 @@ pub fn build_udm_nf_profile(
     nf_instance_id: &str,
     sbi_addr: &str,
     sbi_port: u16,
+    scheme: nextgcore_sbi::types::UriScheme,
     config: &NfProfileConfig,
 ) -> serde_json::Value {
     let services: Vec<serde_json::Value> = UDM_ADVERTISED_SERVICES
@@ -99,7 +100,7 @@ pub fn build_udm_nf_profile(
                     // apiFullVersion must agree with the URI version, not lag it.
                     "apiFullVersion": format!("{}.0.0", version.trim_start_matches('v')),
                 }],
-                "scheme": "http",
+                "scheme": scheme.as_str(),
                 "nfServiceStatus": "REGISTERED",
                 "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
             })
@@ -1601,11 +1602,84 @@ mod tests_nf_profile_host_kind_1324 {
                 "id",
                 host,
                 7777,
+                nextgcore_sbi::types::UriScheme::Http,
                 &crate::context::NfProfileConfig::default(),
             );
             let problems =
                 nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
             assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
         }
+    }
+}
+
+/// #1791: the registered NFProfile advertises, in every `nfServices[].scheme`,
+/// the scheme this NF's SBI listener serves (TS 29.510 §6.1.6.2.3
+/// `NFService.scheme`). The listener follows the SBI security profile, so under
+/// `production` that is `https` and under `dev` `http`. The listener config here
+/// comes from `apply_sbi_security_policy`, the step `main` runs; `main` passes the
+/// config's scheme in, and the nextgcore-sbi source guard
+/// `every_nf_advertises_its_listener_scheme_1791` pins that wiring.
+///
+/// REVERT-VERIFIED: with the builder advertising `"http"` again, the production
+/// case fails here.
+#[cfg(test)]
+mod tests_advertised_scheme_1791 {
+    use super::*;
+    use nextgcore_sbi::security::{SbiProfile, SbiSecurityPolicy, TlsPaths};
+
+    #[test]
+    fn the_nf_profile_advertises_the_listener_scheme_1791() {
+        let dir = std::env::temp_dir().join(format!(
+            "scheme-1791-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |n: &str| {
+            let p = dir.join(n);
+            std::fs::write(&p, "pem").unwrap();
+            p.display().to_string()
+        };
+        let policy = SbiSecurityPolicy {
+            tls_paths: TlsPaths {
+                cert: file("nf.crt"),
+                key: file("nf.key"),
+                ca_cert: file("ca.crt"),
+                client_cert: Some(file("client.crt")),
+                client_key: Some(file("client.key")),
+            },
+            ..SbiSecurityPolicy::production()
+        };
+        let addr: std::net::SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        for (profile, want) in [(SbiProfile::Production, "https"), (SbiProfile::Dev, "http")] {
+            let cfg = nextgcore_sbi::security::apply_sbi_security_policy(
+                nextgcore_sbi::server::SbiServerConfig::new(addr),
+                profile,
+                &policy,
+                nextgcore_sbi::types::NfType::Udm,
+                "http://127.0.0.10:7777",
+            )
+            .expect("the profile applies");
+            let nf_profile = build_udm_nf_profile(
+                "udm-1791",
+                "10.0.0.1",
+                7777,
+                cfg.scheme,
+                &NfProfileConfig::default(),
+            );
+            let services = nf_profile["nfServices"].as_array().expect("nfServices");
+            assert!(!services.is_empty(), "the profile offers services");
+            for svc in services {
+                assert_eq!(
+                    svc["scheme"], want,
+                    "under {profile:?}, {} must advertise the listener's scheme",
+                    svc["serviceName"]
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -416,10 +416,22 @@ async fn not_serving_is_204_even_with_history() {
 #[test]
 fn the_profile_advertises_ue_mobility_only_while_served() {
     let ids = |p: &Value| p["nwdafInfo"]["eventIds"].clone();
-    let off = crate::build_nf_profile("nwdaf-466", "127.0.0.1", 7815, &[]);
+    let off = crate::build_nf_profile(
+        "nwdaf-466",
+        "127.0.0.1",
+        7815,
+        nextgcore_sbi::types::UriScheme::Http,
+        &[],
+    );
     assert_eq!(ids(&off), json!(["NF_LOAD"]));
     let _serving = ServingOnThisThread::new();
-    let on = crate::build_nf_profile("nwdaf-466", "127.0.0.1", 7815, &[]);
+    let on = crate::build_nf_profile(
+        "nwdaf-466",
+        "127.0.0.1",
+        7815,
+        nextgcore_sbi::types::UriScheme::Http,
+        &[],
+    );
     assert_eq!(ids(&on), json!(["NF_LOAD", "UE_MOBILITY"]));
     assert_eq!(on["nwdafInfo"]["nwdafEvents"], json!(["NF_LOAD"]));
 }
@@ -747,6 +759,7 @@ async fn amfd_discovers_this_nwdaf_and_gets_a_ue_mobility_prediction() {
         "15040000-0000-4000-8000-000000001504",
         "127.0.0.1",
         nwdaf_port,
+        nextgcore_sbi::types::UriScheme::Http,
         &crate::spec_allowed_nf_types(),
     );
     let (nrf, nrf_port) = serve(move |req: SbiRequest| {

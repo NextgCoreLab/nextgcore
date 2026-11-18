@@ -101,6 +101,8 @@ pub struct NrfNesActions {
     pub nf_instance_id: String,
     pub sbi_addr: String,
     pub sbi_port: u16,
+    /// #1791: the scheme the listener serves, advertised on re-registration.
+    pub sbi_scheme: nextgcore_sbi::types::UriScheme,
 }
 
 impl NesActions for NrfNesActions {
@@ -153,6 +155,7 @@ impl NesActions for NrfNesActions {
             NesAction::Deregister => {
                 let sbi_addr = self.sbi_addr.clone();
                 let sbi_port = self.sbi_port;
+                let sbi_scheme = self.sbi_scheme;
                 tokio::spawn(async move {
                     // Review fix (issue #22): a one-shot re-registration
                     // could strand the NF deregistered with paused
@@ -161,7 +164,9 @@ impl NesActions for NrfNesActions {
                     // once the NRF has accepted the profile again.
                     let mut backoff = std::time::Duration::from_secs(1);
                     for attempt in 1u32..=8 {
-                        match crate::app::register_with_nrf_id(&id, &sbi_addr, sbi_port).await {
+                        match crate::app::register_with_nrf_id(&id, &sbi_addr, sbi_port, sbi_scheme)
+                            .await
+                        {
                             Ok(_) => {
                                 log::info!(
                                     "NES: re-registered with NRF (resume, attempt {attempt})"
@@ -217,6 +222,7 @@ pub fn spawn_if_enabled(
     nf_instance_id: String,
     sbi_addr: String,
     sbi_port: u16,
+    sbi_scheme: nextgcore_sbi::types::UriScheme,
 ) {
     let Some(settings) = settings else {
         log::debug!("NES: no nes: config block; disabled");
@@ -242,6 +248,7 @@ pub fn spawn_if_enabled(
         nf_instance_id,
         sbi_addr,
         sbi_port,
+        sbi_scheme,
     };
 
     tokio::spawn(run_nes_loop(settings, gauges, actions));

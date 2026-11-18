@@ -529,6 +529,8 @@ async fn main() -> Result<()> {
                 .unwrap_or("UNCONFIGURED")
         );
     }
+    // #1791: the NFProfile advertises the scheme this listener serves.
+    let sbi_scheme = sbi_server_config.scheme;
     let sbi_server = SbiServer::new(sbi_server_config);
 
     sbi_server
@@ -559,7 +561,7 @@ async fn main() -> Result<()> {
                 move || {
                     let host = host.clone();
                     async move {
-                        register_with_nrf(&host, port)
+                        register_with_nrf(&host, port, sbi_scheme)
                             .await
                             .map(nextgcore_sbi::heartbeat::registered_id)
                     }
@@ -4165,7 +4167,12 @@ const UDR_SERVICES: &[(&str, &str, &[&str])] = &[
 /// port to dial) and `allowedNfTypes`; the NF-level `allowedNfTypes` is the UNION
 /// over the services, since a type barred at NF level can never reach any
 /// service.
-fn build_udr_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
+fn build_udr_nf_profile(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+    scheme: nextgcore_sbi::types::UriScheme,
+) -> serde_json::Value {
     let services: Vec<serde_json::Value> = UDR_SERVICES
         .iter()
         .map(|(name, version, allowed)| {
@@ -4177,7 +4184,7 @@ fn build_udr_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> 
                     "apiVersionInUri": version,
                     "apiFullVersion": format!("{}.0.0", version.trim_start_matches('v')),
                 }],
-                "scheme": "http",
+                "scheme": scheme.as_str(),
                 "nfServiceStatus": "REGISTERED",
                 "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
                 "allowedNfTypes": allowed,
@@ -4212,7 +4219,11 @@ fn build_udr_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> 
 ///
 /// Returns the NF instance ID on success so the caller can start a heartbeat
 /// worker.
-async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, String> {
+async fn register_with_nrf(
+    sbi_addr: &str,
+    sbi_port: u16,
+    sbi_scheme: nextgcore_sbi::types::UriScheme,
+) -> Result<String, String> {
     let sbi_ctx = nextgcore_sbi::context::global_context();
 
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
@@ -4233,7 +4244,7 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
         nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Udr)
             .to_string();
 
-    let nf_profile = build_udr_nf_profile(&nf_instance_id, sbi_addr, sbi_port);
+    let nf_profile = build_udr_nf_profile(&nf_instance_id, sbi_addr, sbi_port, sbi_scheme);
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     let response = client
@@ -4297,7 +4308,12 @@ mod tests {
         // the UDR's live router discards the version segment
         // (`let _version = parts[1]`), so both spellings routed. Against a
         // strict peer, or once the version is ever enforced, one side breaks.
-        let profile = build_udr_nf_profile("udr-test-instance", "10.45.0.11", 7777);
+        let profile = build_udr_nf_profile(
+            "udr-test-instance",
+            "10.45.0.11",
+            7777,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
 
         let service = profile["nfServices"]
             .as_array()
@@ -4329,7 +4345,12 @@ mod tests {
     /// version for both would break whichever side is enforced.
     #[test]
     fn the_udr_profile_advertises_both_routed_nudr_services() {
-        let profile = build_udr_nf_profile("udr-test-instance", "10.45.0.11", 7777);
+        let profile = build_udr_nf_profile(
+            "udr-test-instance",
+            "10.45.0.11",
+            7777,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
         let services = profile["nfServices"].as_array().expect("nfServices");
         let names: Vec<&str> = services
             .iter()
@@ -7521,7 +7542,8 @@ mod tests_nf_profile_host_kind_1324 {
     #[test]
     fn the_nf_profile_carries_its_host_by_type() {
         for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
-            let profile = build_udr_nf_profile("id", host, 7777);
+            let profile =
+                build_udr_nf_profile("id", host, 7777, nextgcore_sbi::types::UriScheme::Http);
             let problems =
                 nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
             assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
@@ -7602,5 +7624,38 @@ mod outbound_oauth2_1665_tests {
             super::outbound_oauth2_client(SbiProfile::Dev, false, Some(NRF)).is_none(),
             "dev profile, knob off: no client, the token-free path is unchanged"
         );
+    }
+}
+
+/// #1791: the registered NFProfile advertises, in every `nfServices[].scheme`,
+/// the scheme this NF's SBI listener serves (TS 29.510 §6.1.6.2.3
+/// `NFService.scheme`): `http` for the cleartext listener, `https` once `--tls`
+/// makes it TLS. This listener is cleartext only today (it has no TLS option and ignores NEXTGCORE_SBI_PROFILE; #1795), so this pins that the profile follows the config should it gain one. `main` passes the listener config's scheme in; the
+/// nextgcore-sbi source guard `every_nf_advertises_its_listener_scheme_1791`
+/// pins that wiring.
+///
+/// REVERT-VERIFIED: with the builder advertising `"http"` again, the TLS case
+/// fails here.
+#[cfg(test)]
+mod tests_advertised_scheme_1791 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_advertises_the_listener_scheme_1791() {
+        let addr: std::net::SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        let plain = nextgcore_sbi::server::SbiServerConfig::new(addr);
+        let tls = nextgcore_sbi::server::SbiServerConfig::new(addr).with_tls("tls.key", "tls.crt");
+        for (cfg, want) in [(plain, "http"), (tls, "https")] {
+            let profile = build_udr_nf_profile("udr-1791", "10.0.0.1", 7777, cfg.scheme);
+            let services = profile["nfServices"].as_array().expect("nfServices");
+            assert!(!services.is_empty(), "the profile offers services");
+            for svc in services {
+                assert_eq!(
+                    svc["scheme"], want,
+                    "{} must advertise the listener's scheme",
+                    svc["serviceName"]
+                );
+            }
+        }
     }
 }

@@ -1055,12 +1055,17 @@ pub fn udc_response(
 }
 
 /// The `nnwdaf-randata` `NFService` for the NRF profile.
-pub fn nf_service(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> Value {
+pub fn nf_service(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+    scheme: nextgcore_sbi::types::UriScheme,
+) -> Value {
     json!({
         "serviceInstanceId": format!("{nf_instance_id}-{SERVICE_NAME}"),
         "serviceName": SERVICE_NAME,
         "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-        "scheme": "http",
+        "scheme": scheme.as_str(),
         "nfServiceStatus": "REGISTERED",
         "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
         "allowedNfTypes": SERVICE_ALLOWED_NF_TYPES,
