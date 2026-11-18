@@ -7199,6 +7199,13 @@ impl NgapServer {
         } else {
             None
         };
+        // #1760: the UE answered the page with this registration.
+        if let Some(p) = &page {
+            crate::namf_server::first_locations_after_page(
+                p,
+                Some((&state.amf_ue, association_id)),
+            );
+        }
         let ies = match (state.registration_session_ies.take(), &page) {
             (Some(ies), _) if update => Some(ies),
             (None, Some(_)) if update => Some(ServiceRequestSessionIes::default()),
@@ -8260,6 +8267,13 @@ impl NgapServer {
             let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
             guard.paging_take_by_s_tmsi(g.amf_set_id, g.amf_pointer, g.tmsi)
         };
+        // #1760: the UE answered, at the location its InitialUEMessage just gave.
+        if let Some(p) = &paging {
+            crate::namf_server::first_locations_after_page(
+                p,
+                Some((&state.amf_ue, association_id)),
+            );
+        }
         let mut sessions = Vec::new();
         if let Some(p) = &paging {
             clear_session_paging(p);
@@ -21307,6 +21321,8 @@ impl NgapServer {
     /// clear the session's paging state, so a later transfer is not refused as
     /// "paging ongoing".
     fn paging_ended(&self, paging: &crate::context::PagingContext, cause: &str) {
+        // #1760: the UE did not answer; its last known location is reported.
+        crate::namf_server::first_locations_after_page(paging, None);
         if let Some(uri) = &paging.failure_notify_uri {
             crate::namf_server::send_n1n2_failure_notification(
                 uri.clone(),
@@ -26949,6 +26965,7 @@ mod tests {
         let area = vec![base + 1, base + 2, base + 3, base + 5];
         let paging = |last: Option<u32>| crate::context::PagingContext {
             nwdaf_last_cell: last.map(|g| (PlmnId::new("001", "01"), nwdaf_nci(g))),
+            location_report_subs: Vec::new(),
             ..Default::default()
         };
         let cell = |gnb: u32| crate::context::PredictedCell {
@@ -38123,16 +38140,33 @@ mod tests {
         tag: &str,
         filters: Option<&[&str]>,
     ) -> (nextgcore_sbi::SbiServer, mpsc::Receiver<String>) {
+        // #1760: a CM-IDLE UE would be paged for the first report, which the page's
+        // outcome then makes. These helpers serve tests of the change reports that
+        // FOLLOW the first one, so the subscription is made with the UE counted
+        // CM-CONNECTED for that moment, and its first report is taken below. The
+        // paged first report has its own tests (`*_1760`).
+        let store = crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .ue_store();
+        let idle = store
+            .find_by_supi(supi)
+            .filter(|(_, r)| r.is_cm_idle())
+            .map(|(id, _)| id);
+        if let Some(id) = idle {
+            store.with_mut(id, |s| s.cm_idle = false);
+        }
         let (sink, rx, resp) = location_report_subscription(supi, tag, filters, false).await;
+        if let Some(id) = idle {
+            store.with_mut(id, |s| s.cm_idle = true);
+        }
         assert_eq!(resp.status, 201, "the subscription must be created first");
         // #1737: a UE registered when the subscription is made is first told where it
         // is now (TS 29.518 §5.3.2.2.2). That report is taken here, so the caller's
         // next one is the one its own step causes.
         let mut rx = rx;
-        let registered = crate::context::amf_self()
-            .read()
-            .ok()
-            .and_then(|g| g.ue_store().find_by_supi(supi))
+        let registered = store
+            .find_by_supi(supi)
             .is_some_and(|(_, r)| r.is_registered());
         if registered {
             let (got, _, _) = next_location_report(&mut rx).await;
@@ -38363,6 +38397,8 @@ mod tests {
             reported_connectivity: std::collections::HashMap::new(),
             reported_location: None,
             taken_over: false,
+            one_time: false,
+            first_location_pending: false,
             reporting_threshold: None,
             location_filters: f.iter().map(|s| s.to_string()).collect(),
         };
@@ -38736,22 +38772,31 @@ mod tests {
         cell.stop().await.expect("sink stop");
     }
 
-    /// **#1737**, TS 29.518 §5.3.2.2.2 (`29518-k00.txt:5731-5737`): a LOCATION_REPORT
+    /// **#1737**, TS 29.518 §5.3.2.2.2 (`29518-k00.txt:5731-5743`): a LOCATION_REPORT
     /// subscription without the immediateFlag gets a first notification of the UE's
     /// current location once it is created.
     /// - A CM-CONNECTED UE: its TAI and cell, with no `ageOfLocationInformation`.
-    /// - A CM-IDLE UE: its last known location, with `ageOfLocationInformation` other
-    ///   than 0.
+    /// - A CM-IDLE UE (#1760): it is paged first, and nothing is reported before the
+    ///   page's outcome. The page is not answered (T3513 runs out on every attempt),
+    ///   so its last known location is reported, with `ageOfLocationInformation`
+    ///   other than 0.
     /// - With the immediateFlag the report is in the subscribe response, and is not
     ///   notified as well.
     ///
     /// REVERT-VERIFIED: without the `deliver_location_report` call in
     /// `handle_event_subscription_create`, no first notification arrives ("a
     /// LOCATION_REPORT must be delivered"); with the age left out, the idle UE's
-    /// report has none ("the last known location").
+    /// report has none ("the last known location"). #1760: with the CM-IDLE UE not
+    /// paged (`FirstLocation::Page` not chosen), it is told at once ("not told before
+    /// the page's outcome"); with `first_locations_after_page` not called from
+    /// `paging_ended`, the abandoned page reports nothing ("a LOCATION_REPORT must be
+    /// delivered").
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_location_subscription_is_first_told_where_the_ue_is_1737() {
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        // #1760: the idle UE is paged.
+        let _pages = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let (id, supi) = (17_370_101u64, "imsi-001010001737101");
         let mut stored = idle_registered_ue(id);
@@ -38794,11 +38839,35 @@ mod tests {
         );
         sink.stop().await.expect("sink stop");
 
-        // CM-IDLE: the last known location.
+        // CM-IDLE (#1760): paged first, and the page is not answered.
         store.with_mut(id, |s| s.cm_idle = true);
         let (sink, mut rx, resp) =
             location_report_subscription(supi, "1737-idle", None, false).await;
         let _sub_idle = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
+            "not told before the page's outcome"
+        );
+        let page = || {
+            crate::context::amf_self()
+                .read()
+                .expect("ctx")
+                .paging_find(id)
+        };
+        assert_eq!(
+            page().expect("the UE is paged").location_report_subs,
+            vec![_sub_idle.subscription_id().to_string()]
+        );
+        let mut ngap = capturing_ngap_server().await;
+        for _ in 0..10 {
+            if page().is_none() {
+                break;
+            }
+            ngap.process_paging_with(Duration::ZERO).await;
+        }
+        assert!(page().is_none(), "the page was abandoned");
         let first = report(recv(&mut rx).await);
         let nr = &first["location"]["nrLocation"];
         assert_eq!(nr["ncgi"]["nrCellId"], "000017371", "{first}");
@@ -38831,20 +38900,28 @@ mod tests {
         store.remove(id);
     }
 
-    /// **#1737**: the first report is the subscription's own baseline. The UE's
-    /// baseline (#1424) is the cell 0x5_1200 of TAC 0x74 it was last reported in, and
-    /// it has since been seen in TAC 0x75, which is what a new subscription is told.
-    /// When the UE then comes back from cell 0x5_1200, nothing changed against the
-    /// UE's baseline, but against what this subscriber was told the TA did, so it is
-    /// told. A second Service Request from the same cell tells it nothing more.
+    /// **#1737, #1760**: the first report is the subscription's own baseline, and for
+    /// a CM-IDLE UE it is made when the UE answers the page (TS 29.518 §5.3.2.2.2:
+    /// the last known location is only for a UE that does not respond to paging). The
+    /// UE's baseline (#1424) is the cell 0x5_1200 of TAC 0x74 it was last reported
+    /// in, and it has since been seen in TAC 0x75, cell 0x5_1300.
+    /// - At the subscription nothing is reported: the UE is paged.
+    /// - It answers with a Service Request from cell 0x5_1200 of TAC 0x74. That
+    ///   current location is reported, with no `ageOfLocationInformation`, although
+    ///   nothing changed against the UE's own baseline.
+    /// - Idle again, and a second Service Request from the same cell tells it
+    ///   nothing more: the paged report is its baseline.
     ///
-    /// REVERT-VERIFIED: with the change measured from the UE's baseline only (the
-    /// `reported_location` ignored in `fire_location_change_report`), the subscriber
-    /// is never told the UE is back in TAC 0x74 ("a LOCATION_REPORT must be
-    /// delivered").
+    /// REVERT-VERIFIED: with `first_locations_after_page` not called on the Service
+    /// Request that answers the page, nothing is reported ("a LOCATION_REPORT must be
+    /// delivered"). The baseline a paged report records is guarded by
+    /// `an_unanswered_page_s_report_is_the_subscription_s_baseline_1760`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_first_location_report_is_the_subscription_s_baseline_1737() {
         let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        // #1760: the idle UE is paged.
+        let _pages = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
         crate::context::amf_context_init(64, 1024, 4096);
         let _guamis = serve_only_local_guami();
         let mut ngap = capturing_ngap_server().await;
@@ -38873,20 +38950,41 @@ mod tests {
             location_report_subscription(supi, "1737-baseline", None, false).await;
         assert_eq!(resp.status, 201);
         let _sub = crate::namf_server::EventSubscriptionGuard::of(&resp);
-        let (got, tac, nci) = next_location_report(&mut rx).await;
-        assert_eq!(got, supi);
-        assert_eq!(
-            (tac.as_str(), nci.as_str()),
-            ("0075", "000051300"),
-            "told where the UE was last seen"
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
+            "paged, not told the last known location at once"
         );
 
         ngap.forced_amf_ue_ngap_id = Some(new_id);
         let pdu = service_request_initial_ue(protected_service_request([0; 4], old_id as u32));
         let _ = ngap.handle_initial_ue_message(1, &pdu).await;
         assert!(ngap.ue_auth_state.get(new_id).is_some(), "the UE is back");
-        let (_, tac, nci) = next_location_report(&mut rx).await;
-        assert_eq!((tac.as_str(), nci.as_str()), ("0074", "000051200"));
+        let body = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("a LOCATION_REPORT must be delivered")
+            .expect("channel closed");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        let nr = &v["reportList"][0]["location"]["nrLocation"];
+        assert_eq!(v["reportList"][0]["supi"], supi);
+        assert_eq!(
+            (nr["tai"]["tac"].as_str(), nr["ncgi"]["nrCellId"].as_str()),
+            (Some("0074"), Some("000051200")),
+            "the UE answered: its current location"
+        );
+        assert!(
+            nr.get("ageOfLocationInformation").is_none(),
+            "a current location carries no age: {v}"
+        );
+        assert!(
+            crate::context::amf_self()
+                .read()
+                .expect("ctx")
+                .paging_find(old_id)
+                .is_none(),
+            "the page was answered"
+        );
 
         // Idle again, and back from the same cell: the baseline was taken.
         ngap.ue_auth_state.with_mut(new_id, |s| s.cm_idle = true);
@@ -38902,6 +39000,609 @@ mod tests {
         );
         ngap.ue_auth_state.remove(newer_id);
         sink.stop().await.expect("sink stop");
+    }
+
+    /// **#1760**: the last known location an unanswered page reports is what the
+    /// subscription's next change is measured from. The UE's own baseline (#1424) is
+    /// cell 0x5_1200 of TAC 0x74; it was last seen in TAC 0x75, cell 0x5_1300. The
+    /// page runs out, and the subscription is told TAC 0x75 with its age. When the UE
+    /// later comes back from cell 0x5_1200 of TAC 0x74, nothing changed against the
+    /// UE's baseline, but against what this subscriber was told the TA did, so it is
+    /// told.
+    ///
+    /// REVERT-VERIFIED: with `event_subscription_finish_first_location` not recording
+    /// the location told, the return to TAC 0x74 is not reported ("a LOCATION_REPORT
+    /// must be delivered").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unanswered_page_s_report_is_the_subscription_s_baseline_1760() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        let _pages = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _guamis = serve_only_local_guami();
+        let mut ngap = capturing_ngap_server().await;
+        let (old_id, new_id) = (17_600_301u64, 17_600_302u64);
+        let supi = "imsi-001010001760301";
+        let mut stored = idle_registered_ue(old_id);
+        stored.amf_ue.supi = Some(supi.to_string());
+        stored.amf_ue.allowed_nssai = vec![crate::context::SNssai { sst: 1, sd: None }];
+        let plmn = PlmnId::new("001", "01");
+        let mut reported_tai = stored.amf_ue.nr_tai.clone();
+        reported_tai.plmn_id = plmn.clone();
+        reported_tai.tac = 0x74;
+        let mut reported_cgi = stored.amf_ue.nr_cgi.clone();
+        reported_cgi.plmn_id = plmn.clone();
+        reported_cgi.cell_id = 0x0005_1200;
+        stored.location_evaluated = Some((reported_tai.clone(), reported_cgi, 1));
+        stored.association_id = 1;
+        stored.amf_ue.nr_tai = reported_tai;
+        stored.amf_ue.nr_tai.tac = 0x75;
+        stored.amf_ue.nr_cgi.plmn_id = plmn;
+        stored.amf_ue.nr_cgi.cell_id = 0x0005_1300;
+        ngap.ue_auth_state.insert(old_id, stored);
+
+        let (sink, mut rx, resp) =
+            location_report_subscription(supi, "1760-unanswered", None, false).await;
+        let _sub = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        let page = || {
+            crate::context::amf_self()
+                .read()
+                .expect("ctx")
+                .paging_find(old_id)
+        };
+        assert!(page().is_some(), "the UE is paged");
+        for _ in 0..10 {
+            if page().is_none() {
+                break;
+            }
+            ngap.process_paging_with(Duration::ZERO).await;
+        }
+        let (_, tac, nci) = next_location_report(&mut rx).await;
+        assert_eq!(
+            (tac.as_str(), nci.as_str()),
+            ("0075", "000051300"),
+            "the last known location"
+        );
+
+        ngap.forced_amf_ue_ngap_id = Some(new_id);
+        let pdu = service_request_initial_ue(protected_service_request([0; 4], old_id as u32));
+        let _ = ngap.handle_initial_ue_message(1, &pdu).await;
+        assert!(ngap.ue_auth_state.get(new_id).is_some(), "the UE is back");
+        let (_, tac, nci) = next_location_report(&mut rx).await;
+        assert_eq!((tac.as_str(), nci.as_str()), ("0074", "000051200"));
+        ngap.ue_auth_state.remove(new_id);
+        sink.stop().await.expect("sink stop");
+    }
+
+    /// A ONE_TIME LOCATION_REPORT subscription for `supi` (#1760), with a sink, and the
+    /// subscribe response.
+    async fn one_time_location_subscription(
+        supi: &str,
+        tag: &str,
+        immediate: bool,
+    ) -> (
+        nextgcore_sbi::SbiServer,
+        mpsc::Receiver<String>,
+        nextgcore_sbi::SbiResponse,
+    ) {
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let (tx, rx) = mpsc::channel::<String>(16);
+        let sink = nextgcore_sbi::SbiServer::on_listener(
+            nextgcore_sbi::SbiServerConfig::new(format!("127.0.0.1:{port}").parse().expect("addr")),
+            listener,
+        );
+        sink.start(move |req: nextgcore_sbi::SbiRequest| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(req.http.content.clone().unwrap_or_default()).await;
+                nextgcore_sbi::SbiResponse::no_content()
+            }
+        })
+        .await
+        .expect("sink start");
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let resp = crate::namf_server::namf_request_handler(
+            nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&serde_json::json!({
+                    "subscription": {
+                        "eventList": [{ "type": "LOCATION_REPORT", "immediateFlag": immediate }],
+                        "eventNotifyUri": format!("http://127.0.0.1:{port}/notify/{tag}"),
+                        "notifyCorrelationId": format!("corr-{tag}"),
+                        "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                        "supi": supi,
+                        "options": { "trigger": "ONE_TIME" },
+                    }
+                }))
+                .expect("json"),
+        )
+        .await;
+        (sink, rx, resp)
+    }
+
+    /// **#1760**, TS 29.518 §5.3.2.2.2 (`29518-k00.txt:5716-5724`): a ONE_TIME
+    /// LOCATION_REPORT subscription is told once.
+    /// - Without the immediateFlag, for a CM-CONNECTED UE, its first notification is
+    ///   that one report. The subscription is echoed with trigger ONE_TIME and is gone
+    ///   once told. A later location change is not reported to it, while a CONTINUOUS
+    ///   subscription made beside it (the positive control) is told.
+    /// - With the immediateFlag the report in the response is the one: the
+    ///   subscription is not kept, and nothing is notified.
+    /// - For a UE not registered at the subscription there is no first report; the
+    ///   first fire point claims the subscription, and a second one finds it gone.
+    ///
+    /// REVERT-VERIFIED: with `options.trigger` not read (`one_time` always false), the
+    /// echo names no ONE_TIME trigger (the `options.trigger` assertion); with the fire
+    /// points' ONE_TIME claim removed, the unregistered UE's subscription is told
+    /// twice ("told once by the fire points").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_one_time_location_subscription_is_told_once_1760() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (id, supi) = (17_600_101u64, "imsi-001010001760101");
+        let mut stored = idle_registered_ue(id);
+        stored.cm_idle = false;
+        stored.amf_ue.supi = Some(supi.to_string());
+        stored.amf_ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        stored.amf_ue.nr_tai.tac = 0x1760;
+        stored.amf_ue.nr_cgi.plmn_id = PlmnId::new("001", "01");
+        stored.amf_ue.nr_cgi.cell_id = 0x0001_7601;
+        let store = crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .ue_store();
+        store.insert(id, stored);
+        async fn recv(rx: &mut mpsc::Receiver<String>) -> serde_json::Value {
+            let body = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .expect("a LOCATION_REPORT must be delivered")
+                .expect("channel closed");
+            serde_json::from_str(&body).expect("JSON")
+        }
+        let held = |sub: &str| {
+            crate::context::amf_self()
+                .read()
+                .expect("ctx")
+                .event_subscription_find(sub)
+                .is_some()
+        };
+
+        let (cont_sink, mut cont_rx, resp) =
+            location_report_subscription(supi, "1760-continuous", None, false).await;
+        let cont = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        recv(&mut cont_rx).await;
+        let (once_sink, mut once_rx, resp) =
+            one_time_location_subscription(supi, "1760-once", false).await;
+        assert_eq!(resp.status, 201);
+        let echo: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("JSON");
+        assert_eq!(
+            echo["subscription"]["options"]["trigger"], "ONE_TIME",
+            "{echo}"
+        );
+        let once = echo["subscriptionId"].as_str().expect("id").to_string();
+        let first = recv(&mut once_rx).await;
+        assert_eq!(first["reportList"][0]["type"], "LOCATION_REPORT");
+        assert!(!held(&once), "gone once told");
+        assert!(held(cont.subscription_id()), "a CONTINUOUS one is kept");
+
+        // The UE moves to another TA.
+        let mut ue = store.get(id).expect("record").amf_ue;
+        ue.nr_tai.tac = 0x1761;
+        let now = (ue.nr_tai.clone(), ue.nr_cgi.clone(), 1);
+        crate::namf_server::fire_location_change_report(
+            &ue,
+            crate::context::LocationChange {
+                tai: true,
+                cell: false,
+                ran_node: false,
+            },
+            &now,
+        );
+        let moved = recv(&mut cont_rx).await;
+        assert_eq!(
+            moved["reportList"][0]["location"]["nrLocation"]["tai"]["tac"], "1761",
+            "the positive control is told"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), once_rx.recv())
+                .await
+                .is_err(),
+            "no subsequent notification for a ONE_TIME subscription"
+        );
+
+        // With the immediateFlag: the response's report is the one.
+        let (imm_sink, mut imm_rx, resp) =
+            one_time_location_subscription(supi, "1760-once-immediate", true).await;
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("JSON");
+        assert_eq!(v["reportList"][0]["type"], "LOCATION_REPORT", "{v}");
+        assert!(
+            !held(v["subscriptionId"].as_str().expect("id")),
+            "not kept after its report"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), imm_rx.recv())
+                .await
+                .is_err(),
+            "and not notified as well"
+        );
+        // A UE not registered at the subscription: the fire points' claim.
+        let (late_sink, mut late_rx, resp) =
+            one_time_location_subscription("imsi-001010001760109", "1760-once-late", false).await;
+        let late = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        let mut far = ue.clone();
+        far.supi = Some("imsi-001010001760109".to_string());
+        for tac in [0x1762, 0x1763] {
+            far.nr_tai.tac = tac;
+            let now = (far.nr_tai.clone(), far.nr_cgi.clone(), 1);
+            crate::namf_server::fire_location_change_report(
+                &far,
+                crate::context::LocationChange {
+                    tai: true,
+                    cell: false,
+                    ran_node: false,
+                },
+                &now,
+            );
+        }
+        recv(&mut late_rx).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), late_rx.recv())
+                .await
+                .is_err(),
+            "told once by the fire points"
+        );
+        assert!(!held(late.subscription_id()));
+        drop(cont);
+        for s in [cont_sink, once_sink, imm_sink, late_sink] {
+            s.stop().await.expect("sink stop");
+        }
+        store.remove(id);
+    }
+
+    /// **#1760**: a ONE_TIME subscription made while the UE is CM-IDLE waits for the
+    /// page, as a CONTINUOUS one does, and both wait on the one page. A location
+    /// change fired while the page runs is reported to neither pending subscription.
+    /// When the UE answers, both are told its current location once, and the
+    /// ONE_TIME one is then gone.
+    ///
+    /// REVERT-VERIFIED: with the pending filter removed from
+    /// `fire_amf_event_matching`, the change fired during the page is reported
+    /// ("nothing before the page's outcome"); with the ONE_TIME removal cut from
+    /// `event_subscription_finish_first_location`, the subscription is still held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_paged_one_time_subscription_is_told_once_1760() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        let _pages = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _guamis = serve_only_local_guami();
+        let mut ngap = capturing_ngap_server().await;
+        let (old_id, new_id) = (17_600_201u64, 17_600_202u64);
+        let supi = "imsi-001010001760201";
+        let mut stored = idle_registered_ue(old_id);
+        stored.amf_ue.supi = Some(supi.to_string());
+        stored.amf_ue.allowed_nssai = vec![crate::context::SNssai { sst: 1, sd: None }];
+        stored.amf_ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        stored.amf_ue.nr_tai.tac = 0x75;
+        stored.amf_ue.nr_cgi.plmn_id = PlmnId::new("001", "01");
+        stored.amf_ue.nr_cgi.cell_id = 0x0005_1300;
+        ngap.ue_auth_state.insert(old_id, stored.clone());
+
+        let (once_sink, mut once_rx, resp) =
+            one_time_location_subscription(supi, "1760-paged-once", false).await;
+        assert_eq!(resp.status, 201);
+        let once = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        let (cont_sink, mut cont_rx, resp) =
+            location_report_subscription(supi, "1760-paged-cont", None, false).await;
+        let _cont = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        let page = crate::context::amf_self()
+            .read()
+            .expect("ctx")
+            .paging_find(old_id)
+            .expect("the UE is paged once, for both");
+        assert_eq!(page.location_report_subs.len(), 2, "both wait on one page");
+
+        // A location change fired while the page runs reaches neither.
+        let mut moved = stored.amf_ue.clone();
+        moved.nr_tai.tac = 0x76;
+        let now = (moved.nr_tai.clone(), moved.nr_cgi.clone(), 1);
+        crate::namf_server::fire_location_change_report(
+            &moved,
+            crate::context::LocationChange {
+                tai: true,
+                cell: true,
+                ran_node: true,
+            },
+            &now,
+        );
+        for rx in [&mut once_rx, &mut cont_rx] {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), rx.recv())
+                    .await
+                    .is_err(),
+                "nothing before the page's outcome"
+            );
+        }
+
+        // The UE answers from TAC 0x74, cell 0x5_1200.
+        ngap.forced_amf_ue_ngap_id = Some(new_id);
+        let pdu = service_request_initial_ue(protected_service_request([0; 4], old_id as u32));
+        let _ = ngap.handle_initial_ue_message(1, &pdu).await;
+        assert!(ngap.ue_auth_state.get(new_id).is_some(), "the UE is back");
+        for rx in [&mut once_rx, &mut cont_rx] {
+            let (got, tac, nci) = next_location_report(rx).await;
+            assert_eq!(got, supi);
+            assert_eq!((tac.as_str(), nci.as_str()), ("0074", "000051200"));
+        }
+        assert!(
+            crate::context::amf_self()
+                .read()
+                .expect("ctx")
+                .event_subscription_find(once.subscription_id())
+                .is_none(),
+            "the ONE_TIME subscription is gone once told"
+        );
+        ngap.ue_auth_state.remove(new_id);
+        once_sink.stop().await.expect("sink stop");
+        cont_sink.stop().await.expect("sink stop");
+    }
+
+    /// The PDU session IDs of the Initial Context Setup Requests in `sent`, in order
+    /// (`PDUSessionResourceSetupListCxtReq`, id 71).
+    fn ics_session_ids(sent: &[(u64, Vec<u8>)]) -> Vec<u8> {
+        use nextgcore_ngap_gen::generated as g;
+        let mut out = Vec::new();
+        for (_, pdu) in sent {
+            let Ok(g::NGAP_PDU::InitiatingMessage(m)) = nextgcore_ngap_gen::decode(pdu) else {
+                continue;
+            };
+            let g::InitiatingMessageValue::Id_InitialContextSetup(req) = m.value else {
+                continue;
+            };
+            for ie in req.protocol_i_es.0 {
+                if let g::InitialContextSetupRequestProtocolIEs_EntryValue::Id_PDUSessionResourceSetupListCxtReq(list) = ie.value {
+                    out.extend(list.0.iter().map(|item| item.pdu_session_id.0));
+                }
+            }
+        }
+        out
+    }
+
+    /// **#1760 review MAJOR-1**, TS 23.502 §4.2.3.3: a page started only for a
+    /// LOCATION_REPORT subscription does not make the AMF refuse the SMF's downlink.
+    /// The UE is CM-IDLE, and a subscription pages it. The SMF's N1N2MessageTransfer
+    /// with a PDU_RES_SETUP_REQ for PDU session 5 is then answered 202
+    /// ATTEMPTING_TO_REACH_UE (not 409 HIGHER_PRIORITY_REQUEST_ONGOING), and takes
+    /// the page over: the page holds its N2, and the subscription still waits on it.
+    /// When the UE answers with a Service Request, the Initial Context Setup carries
+    /// session 5, and the subscription is told the UE's current location.
+    ///
+    /// REVERT-VERIFIED: with `paging_ongoing` counting a location-only page again
+    /// (`paging_holds_transfer` ignoring `location_only`), the transfer is refused
+    /// ("not refused for a location-only page"); with `paging_add` not carrying the
+    /// waiting subscriptions over, nothing is reported ("a LOCATION_REPORT must be
+    /// delivered" via "the subscription still waits on the page").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_smf_downlink_takes_over_a_location_only_page_1760() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        let _pages = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _guamis = serve_only_local_guami();
+        let mut ngap = capturing_ngap_server().await;
+        let (old_id, new_id) = (17_600_401u64, 17_600_402u64);
+        let supi = "imsi-001010001760401";
+        let mut stored = idle_registered_ue(old_id);
+        stored.amf_ue.supi = Some(supi.to_string());
+        stored.amf_ue.allowed_nssai = vec![crate::context::SNssai { sst: 1, sd: None }];
+        stored.amf_ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        stored.amf_ue.nr_tai.tac = 0x74;
+        stored.amf_ue.nr_cgi.plmn_id = PlmnId::new("001", "01");
+        stored.amf_ue.nr_cgi.cell_id = 0x0005_1200;
+        ngap.ue_auth_state.insert(old_id, stored);
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx");
+            let mut sess = guard.sess_add(old_id, 5).expect("session");
+            sess.sm_context_ref = Some("smctx-1760-5".to_string());
+            sess.s_nssai.sst = 1;
+            guard.sess_update(&sess);
+        }
+        let page = || {
+            crate::context::amf_self()
+                .read()
+                .expect("ctx")
+                .paging_find(old_id)
+        };
+
+        let (sink, mut rx, resp) =
+            location_report_subscription(supi, "1760-takeover", None, false).await;
+        assert_eq!(resp.status, 201);
+        let sub = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        let first = page().expect("the subscription pages the UE");
+        assert!(first.location_only, "a page for the subscription only");
+
+        let transfer = [0x00u8, 0x1d, 0x00, 0x03];
+        let req = nextgcore_sbi::SbiRequest::post(format!(
+            "/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"
+        ))
+        .with_json_body(&serde_json::json!({
+            "pduSessionId": 5,
+            "n2InfoContainer": {
+                "n2InformationClass": "SM",
+                "smInfo": {
+                    "pduSessionId": 5,
+                    "n2InfoContent": {
+                        "ngapIeType": "PDU_RES_SETUP_REQ",
+                        "ngapData": { "contentId": "ngap-sm" },
+                    },
+                },
+            },
+        }))
+        .expect("json")
+        .with_part(nextgcore_sbi::SbiPart::with_content(
+            "ngap-sm",
+            "application/vnd.3gpp.ngap",
+            bytes::Bytes::copy_from_slice(&transfer),
+        ));
+        let resp = crate::namf_server::namf_request_handler(req).await;
+        assert_eq!(
+            resp.status, 202,
+            "not refused for a location-only page: {:?}",
+            resp.http.content
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).expect("JSON");
+        assert_eq!(v["cause"], "ATTEMPTING_TO_REACH_UE");
+        let taken = page().expect("still paged");
+        assert!(!taken.location_only, "the page now holds the transfer");
+        assert_eq!(taken.pdu_session_id, Some(5));
+        assert_eq!(taken.pending_n2.as_deref(), Some(&transfer[..]));
+        assert_eq!(
+            taken.location_report_subs,
+            vec![sub.subscription_id().to_string()],
+            "the subscription still waits on the page"
+        );
+
+        let _ = take_sent_ngap(&mut ngap);
+        ngap.forced_amf_ue_ngap_id = Some(new_id);
+        let pdu = service_request_initial_ue(protected_service_request([0; 4], old_id as u32));
+        let _ = ngap.handle_initial_ue_message(1, &pdu).await;
+        assert!(ngap.ue_auth_state.get(new_id).is_some(), "the UE is back");
+        assert_eq!(
+            ics_session_ids(&take_sent_ngap(&mut ngap)),
+            vec![5],
+            "the Service Request reactivates the SMF's session"
+        );
+        let (got, tac, nci) = next_location_report(&mut rx).await;
+        assert_eq!(got, supi);
+        assert_eq!((tac.as_str(), nci.as_str()), ("0074", "000051200"));
+        assert!(page().is_none(), "the page was answered");
+        ngap.ue_auth_state.remove(new_id);
+        sink.stop().await.expect("sink stop");
+    }
+
+    /// **#1760 review MAJOR-2 (a)**: a page whose UE is gone when it ends (it is
+    /// found by `paging.supi`) still releases the subscriptions waiting on it. Before,
+    /// `first_locations_after_page` returned early and left them pending, so the
+    /// fire points skipped them for good, after the UE re-registered as well.
+    ///
+    /// REVERT-VERIFIED: with the abandon loop cut from that early return, the
+    /// subscription is still pending ("waits no longer").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_page_whose_ue_is_gone_releases_its_waiting_subscription_1760() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (supi, id) = ("imsi-001010001760501", "1760-gone-sub");
+        let ctx = crate::context::amf_self();
+        {
+            let guard = ctx.read().expect("ctx");
+            guard.event_subscription_remove(id);
+            assert!(
+                guard.event_subscription_add(crate::context::EventSubscription {
+                    subscription_id: id.to_string(),
+                    notify_uri: "http://127.0.0.1:1/n".to_string(),
+                    notify_correlation_id: String::new(),
+                    nf_id: String::new(),
+                    event_types: vec!["LOCATION_REPORT".to_string()],
+                    supi: Some(supi.to_string()),
+                    gpsi: None,
+                    pei: None,
+                    group_id: None,
+                    any_ue: false,
+                    expiry: None,
+                    subs_change_notify_uri: None,
+                    subs_change_notify_correlation_id: None,
+                    areas: Vec::new(),
+                    reported_presence: std::collections::HashMap::new(),
+                    reachability_filter: None,
+                    reported_reachability: std::collections::HashMap::new(),
+                    reported_connectivity: std::collections::HashMap::new(),
+                    reported_location: None,
+                    taken_over: false,
+                    one_time: false,
+                    first_location_pending: true,
+                    reporting_threshold: None,
+                    location_filters: Vec::new(),
+                })
+            );
+        }
+        let page = crate::context::PagingContext {
+            amf_ue_ngap_id: 17_600_501,
+            supi: Some(supi.to_string()),
+            location_only: true,
+            location_report_subs: vec![id.to_string()],
+            ..Default::default()
+        };
+        crate::namf_server::first_locations_after_page(&page, None);
+        let after = ctx
+            .read()
+            .expect("ctx")
+            .event_subscription_find(id)
+            .expect("kept: nothing was reported to it");
+        assert!(!after.first_location_pending, "waits no longer");
+        assert!(after.reported_location.is_none(), "it was told nothing");
+        ctx.read().expect("ctx").event_subscription_remove(id);
+    }
+
+    /// **#1760 review minor-1**, TS 29.518 §5.3.2.2.2: a CM-IDLE UE that cannot be
+    /// paged (no registration area: it is bound to no NG association and was not
+    /// restored) is not paged, and its subscription is told the last known location
+    /// at once, with `ageOfLocationInformation` at least 1.
+    ///
+    /// REVERT-VERIFIED: with that branch reporting `location_report(&ue, false)`,
+    /// the report carries no age ("the last known location, with its age").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unpageable_idle_ue_is_told_its_last_known_location_at_once_1760() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        let _pages = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
+        let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (id, supi) = (17_600_601u64, "imsi-001010001760601");
+        let mut stored = idle_registered_ue(id);
+        stored.amf_ue.supi = Some(supi.to_string());
+        stored.amf_ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        stored.amf_ue.nr_tai.tac = 0x1760;
+        stored.amf_ue.nr_cgi.plmn_id = PlmnId::new("001", "01");
+        stored.amf_ue.nr_cgi.cell_id = 0x0001_7601;
+        stored.association_id = 0;
+        stored.restored = false;
+        assert!(!stored.has_registration_area());
+        let store = crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .ue_store();
+        store.insert(id, stored);
+
+        let (sink, mut rx, resp) =
+            location_report_subscription(supi, "1760-unpageable", None, false).await;
+        assert_eq!(resp.status, 201);
+        let _sub = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        assert!(
+            crate::context::amf_self()
+                .read()
+                .expect("ctx")
+                .paging_find(id)
+                .is_none(),
+            "a UE with no registration area is not paged"
+        );
+        let body = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("a LOCATION_REPORT must be delivered")
+            .expect("channel closed");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        let nr = &v["reportList"][0]["location"]["nrLocation"];
+        assert_eq!(nr["ncgi"]["nrCellId"], "000017601", "{v}");
+        assert!(
+            nr["ageOfLocationInformation"]
+                .as_u64()
+                .is_some_and(|m| m >= 1),
+            "the last known location, with its age: {v}"
+        );
+        sink.stop().await.expect("sink stop");
+        store.remove(id);
     }
 
     /// **#1424**: a registration update's Registration Accept reports the UE's
@@ -39986,6 +40687,8 @@ mod tests {
             reported_connectivity: std::collections::HashMap::new(),
             reported_location: None,
             taken_over: false,
+            one_time: false,
+            first_location_pending: false,
             reporting_threshold: None,
             location_filters: Vec::new(),
         };
@@ -44746,6 +45449,8 @@ mod tests {
                 reported_connectivity: std::collections::HashMap::new(),
                 reported_location: None,
                 taken_over: false,
+                one_time: false,
+                first_location_pending: false,
                 reporting_threshold: None,
                 location_filters: Vec::new(),
             });
@@ -44878,6 +45583,8 @@ mod tests {
                 reported_connectivity: std::collections::HashMap::new(),
                 reported_location: None,
                 taken_over: false,
+                one_time: false,
+                first_location_pending: false,
                 reporting_threshold: None,
                 location_filters: Vec::new(),
             });

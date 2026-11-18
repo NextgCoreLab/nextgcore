@@ -36,6 +36,8 @@ chrono = "0.4"
 workspace = true
 
 [dev-dependencies]
+# #1617: tests/live_nrf.rs runs nrfd over TLS with test_support::DevPki.
+nextgcore-sbi = { workspace = true, features = ["test-support"] }
 # #570: drive the AMF's Nucmf consumer against this UCMF over real HTTP/2.
 nextgcore-amfd = { path = "../nextgcore-amfd" }
 # #725: property-based fuzzing of the request decoders.
