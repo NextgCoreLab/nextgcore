@@ -263,8 +263,9 @@ for seed in "${SEEDS[@]}"; do
     if [[ "${DEMO_MODE}" == onnx ]]; then
         grep -q 'NWDAF: model verified' "${S}/gnb-west.log" || fail "[gnb-west] onnx without 'NWDAF: model verified'"
     fi
+    # bash 4.2 (the cloud desktop) treats "${header[@]}" of an empty array as unbound under set -u.
     header=(); [[ -s "${rows}" ]] || header=(--header)
-    python3 -I "${score_py}" score --arm "${SCORE_ARM}" --seed "${seed}" "${header[@]}" \
+    python3 -I "${score_py}" score --arm "${SCORE_ARM}" --seed "${seed}" ${header[@]+"${header[@]}"} \
         --west "${S}/gnb-west.log" --east "${S}/gnb-east.log" --amf "${S}/amf.log" \
         --ue "${S}/ue.log" --window-ms "$((EPISODE_S * 1000))" \
         --pingpong-ms "${PINGPONG_MS}" --a3-slack-ms "${A3_SLACK_MS}" | tee -a "${rows}"
