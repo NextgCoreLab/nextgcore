@@ -2184,6 +2184,14 @@ fn spawn_periodic_reports(sub: &EventSubscription) {
     let Some(period) = sub.rep_period else {
         return;
     };
+    // R27: nothing for a period to report when no event has a state.
+    if !sub
+        .event_types
+        .iter()
+        .any(|t| crate::context::periodic_reports_state(t))
+    {
+        return;
+    }
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         log::debug!("PERIODIC LOCATION_REPORT: no tokio runtime, no timer");
         return;
@@ -2234,14 +2242,30 @@ fn spawn_periodic_reports(sub: &EventSubscription) {
             // #1832: every other event with a current state, as its immediate
             // report would carry it (TS 29.518 §5.3.2.2.2: "the current status of
             // the events subscribed").
-            let others: Vec<String> = sub
+            // R27: per targeted UE, resolved as the location reports resolve it
+            // (every UE of an any-UE subscription, the UE a GPSI or PEI names),
+            // and the area-level UES_IN_AREA_REPORT once.
+            let per_ue: Vec<String> = sub
                 .event_types
                 .iter()
-                .filter(|t| *t != "LOCATION_REPORT")
+                .filter(|t| {
+                    *t != "LOCATION_REPORT"
+                        && *t != "UES_IN_AREA_REPORT"
+                        && crate::context::periodic_reports_state(t)
+                })
                 .cloned()
                 .collect();
-            if !others.is_empty() {
-                reports.extend(build_immediate_reports(&others, sub.supi.as_deref(), &sub));
+            if !per_ue.is_empty() {
+                for supi in periodic_target_supis(&sub) {
+                    reports.extend(build_immediate_reports(&per_ue, Some(&supi), &sub));
+                }
+            }
+            if sub.event_types.iter().any(|t| t == "UES_IN_AREA_REPORT") {
+                reports.extend(build_immediate_reports(
+                    &["UES_IN_AREA_REPORT".to_string()],
+                    None,
+                    &sub,
+                ));
             }
             // R27: one notification per period, its reportList carrying every report
             // (every UE of an any-UE subscription). #1832: each is claimed against
@@ -2280,16 +2304,59 @@ fn spawn_periodic_reports(sub: &EventSubscription) {
 /// Table 6.2.6.2.6-1). For a CM-IDLE UE that is the last known location, with
 /// `ageOfLocationInformation` the minutes since it was acquired (at least 1), as
 /// the first report does. The UE is not paged for a periodic report.
+/// R27: the SUPIs of the registered UEs a PERIODIC tick reports on for `sub`: every
+/// UE for an any-UE subscription, else the one UE its SUPI, GPSI or PEI names.
+fn periodic_target_supis(sub: &EventSubscription) -> Vec<String> {
+    let ctx = amf_self();
+    let Ok(guard) = ctx.read() else {
+        return Vec::new();
+    };
+    // R27: every UE the live store holds (a UE published by the NGAP path is in
+    // the store, not necessarily in `amf_ue_list`).
+    let ues: Vec<AmfUe> = if sub.any_ue {
+        guard
+            .ue_store()
+            .snapshot()
+            .into_iter()
+            .map(|(_, record)| record.amf_ue)
+            .collect()
+    } else {
+        sub.supi
+            .as_deref()
+            .and_then(|s| guard.amf_ue_find_by_supi(s))
+            .or_else(|| {
+                sub.gpsi
+                    .as_deref()
+                    .and_then(|g| guard.amf_ue_find_by_gpsi(g))
+            })
+            .or_else(|| sub.pei.as_deref().and_then(|p| guard.amf_ue_find_by_pei(p)))
+            .into_iter()
+            .collect()
+    };
+    ues.into_iter()
+        .filter(|ue| {
+            guard
+                .ue_store()
+                .get(ue.id)
+                .is_some_and(|r| r.is_registered())
+        })
+        .filter_map(|ue| ue.supi.clone())
+        .collect()
+}
+
 fn periodic_location_reports(sub: &EventSubscription) -> Vec<Value> {
     let ctx = amf_self();
     let Ok(guard) = ctx.read() else {
         return Vec::new();
     };
+    // R27: every UE the live store holds (a UE published by the NGAP path is in
+    // the store, not necessarily in `amf_ue_list`).
     let ues: Vec<AmfUe> = if sub.any_ue {
         guard
-            .amf_ue_ids()
+            .ue_store()
+            .snapshot()
             .into_iter()
-            .filter_map(|id| guard.amf_ue_find_by_id(id))
+            .map(|(_, record)| record.amf_ue)
             .collect()
     } else {
         sub.supi
@@ -3081,7 +3148,10 @@ async fn deliver_event_notification(sub: EventSubscription, report: Value) -> Re
 /// One notification carrying `reports` in its `reportList` (R27: a periodic tick of
 /// an any-UE subscription is one POST, not one per UE).
 ///
-/// #1832: every notification goes through here, so maxReports is enforced here:
+/// #1832: every notification goes through here, so maxReports is enforced here.
+/// A report counts when it is GENERATED, as Table 6.2.6.2.6-1 words it ("the
+/// maximum number of reports that can be generated"), not when it is delivered:
+/// a consumer that cannot be reached does not get more reports for it (R27).
 /// each report is claimed, and a refused one is left out. Nothing left, nothing
 /// is sent.
 async fn deliver_event_notifications(

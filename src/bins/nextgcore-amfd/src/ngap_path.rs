@@ -39241,6 +39241,147 @@ mod tests {
             .remove(id);
     }
 
+    /// **#1832, R27**: a PERIODIC subscription to an event with no state for a
+    /// period to report (LOSS_OF_CONNECTIVITY: an occurrence) is notified when the
+    /// event occurs, and runs no timer.
+    ///
+    /// REVERT-VERIFIED: with the matcher skipping every PERIODIC subscription, "a
+    /// PERIODIC LOSS_OF_CONNECTIVITY subscriber is told the loss" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_periodic_stateless_event_is_reported_when_it_occurs_1832() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (id, supi) = (18_320_501u64, "imsi-001010001832501");
+        store_connected_ue_1819(id, supi);
+        let (sink, mut rx, resp, sub_id) = subscription_1832(
+            Some(supi),
+            "1832-loss",
+            serde_json::json!([{ "type": "LOSS_OF_CONNECTIVITY" }]),
+            serde_json::json!({ "trigger": "PERIODIC", "repPeriod": 1 }),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let _sub = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        assert!(!crate::namf_server::periodic_location_timer_running(
+            &sub_id
+        ));
+        let ue = crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .amf_ue_find_by_supi(supi)
+            .expect("ue");
+        crate::namf_server::fire_loss_of_connectivity(&ue, "UE_DETACHED");
+        let body = tokio::time::timeout(Duration::from_millis(1500), rx.recv())
+            .await
+            .expect("a PERIODIC LOSS_OF_CONNECTIVITY subscriber is told the loss")
+            .expect("channel");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(v["reportList"][0]["type"], "LOSS_OF_CONNECTIVITY", "{v}");
+        sink.stop().await.expect("sink stop");
+        crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .ue_store()
+            .remove(id);
+    }
+
+    /// **#1832, R27**: an any-UE PERIODIC CONNECTIVITY_STATE_REPORT reports each
+    /// registered UE on its period (the tick resolves the UEs, as for location).
+    ///
+    /// REVERT-VERIFIED: with the tick passing the subscription's own SUPI (none
+    /// here), "an any-UE PERIODIC subscription reports its UEs" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_any_ue_periodic_state_report_covers_its_ues_1832() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (id, supi) = (18_320_601u64, "imsi-001010001832601");
+        store_connected_ue_1819(id, supi);
+        let (sink, mut rx, resp, _sub_id) = subscription_1832(
+            None,
+            "1832-any-cm",
+            serde_json::json!([{ "type": "CONNECTIVITY_STATE_REPORT" }]),
+            serde_json::json!({ "trigger": "PERIODIC", "repPeriod": 1 }),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let _sub = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        let body = tokio::time::timeout(Duration::from_millis(2500), rx.recv())
+            .await
+            .expect("an any-UE PERIODIC subscription reports its UEs")
+            .expect("channel");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        let supis: Vec<&str> = v["reportList"]
+            .as_array()
+            .expect("reportList")
+            .iter()
+            .filter_map(|r| r["supi"].as_str())
+            .collect();
+        assert!(supis.contains(&supi), "{v}");
+        sink.stop().await.expect("sink stop");
+        crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .ue_store()
+            .remove(id);
+    }
+
+    /// **#1832, R27**: at the count map's bound, a NEW (event, UE) is refused
+    /// rather than a count evicted, so no UE's count restarts.
+    ///
+    /// REVERT-VERIFIED: with an arbitrary count evicted at the bound, the new UE's
+    /// claim is granted ("a new UE at the bound is refused").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn max_reports_counts_are_not_evicted_1832() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (sink, _rx, resp, sub_id) = subscription_1832(
+            None,
+            "1832-bound",
+            serde_json::json!([{ "type": "LOCATION_REPORT" }]),
+            serde_json::json!({ "trigger": "CONTINUOUS", "maxReports": 1 }),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let _sub = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        use crate::context::ReportClaim;
+        let ctx = crate::context::amf_self();
+        {
+            let guard = ctx.read().expect("ctx lock");
+            for n in 0..crate::context::MAX_REPORTED_REACHABILITY {
+                assert_eq!(
+                    guard.event_subscription_claim_report(
+                        &sub_id,
+                        Some(1),
+                        "LOCATION_REPORT",
+                        &format!("imsi-b{n}")
+                    ),
+                    ReportClaim::Granted { ended: false }
+                );
+            }
+            assert_eq!(
+                guard.event_subscription_claim_report(
+                    &sub_id,
+                    Some(1),
+                    "LOCATION_REPORT",
+                    "imsi-new"
+                ),
+                ReportClaim::Refused,
+                "a new UE at the bound is refused"
+            );
+            assert_eq!(
+                guard.event_subscription_claim_report(
+                    &sub_id,
+                    Some(1),
+                    "LOCATION_REPORT",
+                    "imsi-b0"
+                ),
+                ReportClaim::Refused,
+                "and a counted UE keeps its count"
+            );
+        }
+        sink.stop().await.expect("sink stop");
+    }
+
     /// **#1832**: maxReports applies to each member UE of an any-UE subscription
     /// (Table 6.2.6.2.6-1), and such a subscription is not ended by one UE's
     /// maximum.

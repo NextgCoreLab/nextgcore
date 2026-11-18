@@ -1300,6 +1300,23 @@ pub struct EventSubscription {
     pub first_location_pending: bool,
 }
 
+/// #1832 (R27): the events a PERIODIC timer reports the current state of (its tick
+/// builds them, as an immediate report would). Any other event has no state to
+/// report on a period, only occurrences, which are notified as they occur.
+pub const PERIODIC_STATE_EVENTS: [&str; 6] = [
+    "LOCATION_REPORT",
+    "REGISTRATION_STATE_REPORT",
+    "REACHABILITY_REPORT",
+    "CONNECTIVITY_STATE_REPORT",
+    "PRESENCE_IN_AOI_REPORT",
+    "UES_IN_AREA_REPORT",
+];
+
+/// Whether a PERIODIC timer reports `event_type` (see [`PERIODIC_STATE_EVENTS`]).
+pub fn periodic_reports_state(event_type: &str) -> bool {
+    PERIODIC_STATE_EVENTS.contains(&event_type)
+}
+
 /// #1832: what [`AmfContext::event_subscription_claim_report`] decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReportClaim {
@@ -3098,12 +3115,12 @@ impl AmfContext {
         if made >= max {
             return ReportClaim::Refused;
         }
+        // R27: at the bound a NEW (event, UE) is refused, rather than evicting a
+        // count, which would let that UE exceed its maximum.
         if !sub.reports_made.contains_key(&key)
             && sub.reports_made.len() >= MAX_REPORTED_REACHABILITY
         {
-            if let Some(k) = sub.reports_made.keys().next().cloned() {
-                sub.reports_made.remove(&k);
-            }
+            return ReportClaim::Refused;
         }
         sub.reports_made.insert(key, made + 1);
         let individual = !sub.any_ue && sub.group_id.is_none();
@@ -3202,8 +3219,11 @@ impl AmfContext {
                         }
                         // #1832: what the fire points report is a change; a
                         // PERIODIC subscription is reported on its period instead
-                        // (TS 29.518 §5.3.2.2.2; AmfEventTrigger PERIODIC).
-                        if s.rep_period.is_some() {
+                        // (TS 29.518 §5.3.2.2.2; AmfEventTrigger PERIODIC). R27:
+                        // only for an event with a state a period can report; an
+                        // occurrence (LOSS_OF_CONNECTIVITY, COMMUNICATION_FAILURE,
+                        // ...) has none, so it is reported when it occurs.
+                        if s.rep_period.is_some() && periodic_reports_state(event_type) {
                             return false;
                         }
                         // UE filter: any-UE subscriptions match everything; a
