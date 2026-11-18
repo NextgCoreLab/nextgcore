@@ -8227,31 +8227,29 @@ async fn handle_mbs_context_create(request: &SbiRequest) -> SbiResponse {
         Err(resp) => return *resp,
     };
 
-    let mcast = crate::context::amf_mcast();
-    // Idempotent on the TMGI: a repeated ContextCreate returns the existing
-    // context rather than allocating a second one for the same session.
-    let session = match mcast.session_find_by_tmgi(&tmgi) {
-        Some(existing) => existing,
-        None => {
-            let Some(created) = mcast.session_create(tmgi.clone(), 1, None, Vec::new()) else {
-                return send_error(
-                    500,
-                    "Internal Server Error",
-                    "could not create the MBS session context",
-                    None,
-                );
-            };
-            created
-        }
+    // #1818: each ContextCreate gets a context of its own on the MBS session the
+    // TMGI names, so its ContextDelete releases only what it created. A repeat
+    // from the same MB-SMF (`mbsmfId`) for the same TMGI is a retry and gets the
+    // same context back rather than a second one.
+    let mbsmf_id = body.get("mbsmfId").and_then(Value::as_str);
+    let Some((context_ref, session)) =
+        crate::context::amf_mcast().broadcast_context_create(&tmgi, mbsmf_id)
+    else {
+        return send_error(
+            500,
+            "Internal Server Error",
+            "could not create the MBS session context",
+            None,
+        );
     };
 
     log::info!(
-        "Namf_MBSBroadcast ContextCreate: tmgi_svc={:#x} ref={}",
+        "Namf_MBSBroadcast ContextCreate: tmgi_svc={:#x} ref={context_ref} session={}",
         tmgi.service_id_u32(),
         session.mbs_session_id,
     );
 
-    let context_ref = format!("{}", session.mbs_session_id);
+    let context_ref = format!("{context_ref}");
     let response_body = json!({ "mbsContextRef": context_ref });
 
     // 201 with a Location header naming the created resource (TS 29.518 §6.5).
@@ -8273,16 +8271,23 @@ async fn handle_mbs_context_create(request: &SbiRequest) -> SbiResponse {
 /// does not hold, which the MB-SMF treats as already gone, so a repeated delete is
 /// harmless. As ContextCreate drives no N2 Broadcast Session Setup in this tree, the
 /// delete drives no Broadcast Session Release either.
+///
+/// #1818: it removes the CONTEXT, and the MBS session under it only when no other
+/// broadcast context rides on it and a ContextCreate created it. It used to remove
+/// the session by its id outright, tearing down a TMGI-shared session another
+/// context or an NGAP multicast session still used.
 fn handle_mbs_context_delete(context_ref: &str) -> SbiResponse {
-    let removed = context_ref
+    let released = context_ref
         .parse::<u64>()
         .ok()
-        .and_then(|id| crate::context::amf_mcast().session_remove(id));
-    match removed {
-        Some(session) => {
+        .and_then(|id| crate::context::amf_mcast().broadcast_context_delete(id));
+    match released {
+        Some(release) => {
             log::info!(
-                "Namf_MBSBroadcast ContextDelete: ref={context_ref} tmgi_svc={:#x}",
-                session.tmgi.service_id_u32()
+                "Namf_MBSBroadcast ContextDelete: ref={context_ref} tmgi_svc={:#x?} \
+                 session_removed={}",
+                release.tmgi.as_ref().map(Tmgi::service_id_u32),
+                release.session_removed
             );
             SbiResponse::with_status(204)
         }
@@ -12337,8 +12342,9 @@ mod tests {
         assert_eq!(body_json(&resp)["result"], json!("N2_NOT_SENT"));
     }
 
-    /// ContextCreate allocates a context, and a REPEAT for the same TMGI returns
-    /// the SAME ref rather than leaking a second session.
+    /// ContextCreate allocates a context, and a REPEAT for the same TMGI (from the
+    /// same MB-SMF: neither names an `mbsmfId`, #1818) returns the SAME ref rather
+    /// than leaking a second context.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mbs_context_create_is_idempotent_on_the_tmgi() {
         let body = mbs_tmgi_body("001", "01", "00CAFE");
@@ -12400,13 +12406,17 @@ mod tests {
             .expect("mbsContextRef")
             .to_string();
         let id: u64 = context_ref.parse().expect("numeric ref");
-        assert!(crate::context::amf_mcast().session_find(id).is_some());
+        assert!(crate::context::amf_mcast()
+            .broadcast_context_find(id)
+            .is_some());
 
         let path = format!("/namf-mbs-bc/v1/mbs-contexts/{context_ref}");
         let deleted = namf_request_handler(SbiRequest::delete(&path)).await;
         assert_eq!(deleted.status, 204);
         assert!(
-            crate::context::amf_mcast().session_find(id).is_none(),
+            crate::context::amf_mcast()
+                .broadcast_context_find(id)
+                .is_none(),
             "the AMF holds no context after ContextDelete"
         );
         assert!(crate::context::amf_mcast()
@@ -12421,6 +12431,109 @@ mod tests {
             assert_eq!(resp.status, 404, "{again}");
             assert_eq!(body_json(&resp)["cause"], "CONTEXT_NOT_FOUND", "{again}");
         }
+    }
+
+    /// POST a ContextCreate for `svc` (mcc 001, mnc 01), from `mbsmf_id` if given,
+    /// and return its `mbsContextRef`.
+    async fn create_mbs_context_1818(svc: &str, mbsmf_id: Option<&str>) -> String {
+        let mut body = mbs_tmgi_body("001", "01", svc);
+        if let Some(id) = mbsmf_id {
+            body["mbsmfId"] = json!(id);
+        }
+        let req = SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
+            .with_json_body(&body)
+            .expect("json");
+        let created = namf_request_handler(req).await;
+        assert_eq!(created.status, 201);
+        body_json(&created)["mbsContextRef"]
+            .as_str()
+            .expect("mbsContextRef")
+            .to_string()
+    }
+
+    async fn delete_mbs_context_1818(context_ref: &str) -> u16 {
+        namf_request_handler(SbiRequest::delete(format!(
+            "/namf-mbs-bc/v1/mbs-contexts/{context_ref}"
+        )))
+        .await
+        .status
+    }
+
+    /// #1818: a ContextDelete does not remove an MBS session the NGAP multicast
+    /// path created and shares by TMGI. The broadcast context joins it, and its
+    /// delete releases the context only; the multicast session (and its gNB
+    /// state) is still held.
+    ///
+    /// REVERT-VERIFIED: with the `owned` check dropped from
+    /// `broadcast_context_delete`, the multicast session is removed and the
+    /// "multicast session survives" assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn context_delete_keeps_a_multicast_session_sharing_the_tmgi_1818() {
+        let tmgi = Tmgi::new(0x181800, [0x00, 0xF1, 0x10]);
+        let mcast = crate::context::amf_mcast();
+        let multicast = mcast
+            .session_create(tmgi.clone(), 1, None, vec![1])
+            .expect("multicast session");
+        mcast.session_activate(
+            multicast.mbs_session_id,
+            crate::ngap_mcast::McastTransportInfo {
+                dl_teid: 0x1818,
+                transport_addr: std::net::Ipv4Addr::new(239, 0, 18, 18),
+            },
+            &[1818],
+        );
+
+        let context_ref = create_mbs_context_1818("181800", None).await;
+        let joined = mcast
+            .broadcast_context_find(context_ref.parse().expect("numeric ref"))
+            .expect("the broadcast context is held");
+        assert_eq!(
+            joined.session_id, multicast.mbs_session_id,
+            "the broadcast context joins the multicast session sharing its TMGI"
+        );
+        assert_eq!(delete_mbs_context_1818(&context_ref).await, 204);
+
+        let kept = mcast
+            .session_find(multicast.mbs_session_id)
+            .expect("the multicast session survives the broadcast ContextDelete");
+        assert_eq!(kept.gnb_sessions.len(), 1, "with its gNB state");
+        assert_eq!(
+            mcast.session_find_by_tmgi(&tmgi).map(|s| s.mbs_session_id),
+            Some(multicast.mbs_session_id)
+        );
+        assert_eq!(delete_mbs_context_1818(&context_ref).await, 404);
+        mcast.session_remove(multicast.mbs_session_id);
+    }
+
+    /// #1818: two MB-SMFs' contexts on one TMGI share the session; the first
+    /// delete keeps it for the second, the last delete removes it. A repeat from
+    /// the same MB-SMF is a retry and gets its own context back.
+    ///
+    /// REVERT-VERIFIED: with the `shared` check dropped, the first delete removes
+    /// the session and the "kept for the other context" assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_last_broadcast_context_on_a_tmgi_removes_its_session_1818() {
+        let tmgi = Tmgi::new(0x181801, [0x00, 0xF1, 0x10]);
+        let mcast = crate::context::amf_mcast();
+        let a = create_mbs_context_1818("181801", Some("mbsmf-a")).await;
+        let a_again = create_mbs_context_1818("181801", Some("mbsmf-a")).await;
+        assert_eq!(
+            a, a_again,
+            "a retry from the same MB-SMF is the same context"
+        );
+        let b = create_mbs_context_1818("181801", Some("mbsmf-b")).await;
+        assert_ne!(a, b, "another MB-SMF gets a context of its own");
+
+        assert_eq!(delete_mbs_context_1818(&a).await, 204);
+        assert!(
+            mcast.session_find_by_tmgi(&tmgi).is_some(),
+            "kept for the other context"
+        );
+        assert_eq!(delete_mbs_context_1818(&b).await, 204);
+        assert!(
+            mcast.session_find_by_tmgi(&tmgi).is_none(),
+            "the last context removes the session it created"
+        );
     }
 
     /// An SSM-only `mbsSessionId` is REFUSED, not silently mapped. The schema is
