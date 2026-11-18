@@ -8663,7 +8663,8 @@ fn mbs_context_create_response(answer: crate::mbs_broadcast::CreateAnswer) -> Sb
             containers,
             complete,
         } => {
-            let context_ref = context_ref.to_string();
+            // #1856: `<epoch>-<id>`, unique across restarts of this AMF.
+            let context_ref = crate::ngap_mcast::context_ref_string(context_ref);
             // `mbsSessionId` is ContextCreateRspData's one required member;
             // `mbsContextRef` repeats the Location's last segment for consumers
             // that read it from the body.
@@ -8782,7 +8783,8 @@ async fn handle_mbs_context_delete(context_ref: &str) -> SbiResponse {
             Some("CONTEXT_NOT_FOUND"),
         )
     };
-    let Ok(ref_num) = context_ref.parse::<u64>() else {
+    // #1856: a ref of another epoch (issued before a restart) is not found.
+    let Some(ref_num) = crate::ngap_mcast::parse_context_ref(context_ref) else {
         return not_found();
     };
     let mcast = crate::context::amf_mcast();
@@ -8813,7 +8815,7 @@ async fn handle_mbs_context_delete(context_ref: &str) -> SbiResponse {
                 let (list, parts) = crate::mbs_broadcast::n2_mbs_sm_info_list(chunk.to_vec());
                 let notify = crate::mbs_broadcast::BroadcastNotify {
                     context_ref: ref_num,
-                    uri: notify_uri.clone(),
+                    callback_uri: notify_uri.clone(),
                     body: json!({ "mbsSessionId": mbs_session_id, "n2MbsSmInfoList": list }),
                     parts,
                 };

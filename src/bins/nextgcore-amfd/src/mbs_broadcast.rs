@@ -42,9 +42,10 @@ use tokio::sync::oneshot;
 use crate::context::PlmnId;
 use crate::ngap_mcast::{NgapMcastContext, Tmgi};
 
-/// The most broadcast MBS session contexts the AMF holds. A ContextCreate past
-/// it is refused before anything is stored.
-pub const MAX_BROADCAST_CONTEXTS: usize = 1024;
+/// The most broadcast MBS session contexts the AMF holds (#1856). A ContextCreate
+/// past it (other than a retry of a held context) is refused, 500
+/// INSUFFICIENT_RESOURCES, before anything is stored.
+pub const MAX_BROADCAST_CONTEXTS: usize = 4096;
 
 /// The most released contexts whose NG-RAN Release Responses are still awaited.
 /// Past it the oldest stops being tracked: its nodes were already sent the
@@ -280,7 +281,8 @@ pub struct BroadcastNotify {
     /// The context (`mbsContextRef`) it is for; one context's notifications are
     /// delivered in order.
     pub context_ref: u64,
-    pub uri: String,
+    /// The MB-SMF's `notifyUri`, a callback URI: log it only redacted.
+    pub callback_uri: String,
     pub body: Value,
     /// `(content id, NGAP octets)` for each `n2MbsSmInfoList` entry.
     pub parts: Vec<(String, Vec<u8>)>,
@@ -626,7 +628,7 @@ impl Releasing {
 /// with the `ranId` of the node that generated it (TS 29.518 §5.6.2.5 step 1).
 fn status_notify(
     context_ref: u64,
-    uri: &str,
+    callback_uri: &str,
     mbs_session_id: &Value,
     containers: Vec<N2MbsSmContainer>,
 ) -> BroadcastNotify {
@@ -637,7 +639,7 @@ fn status_notify(
     }
     BroadcastNotify {
         context_ref,
-        uri: uri.to_string(),
+        callback_uri: callback_uri.to_string(),
         body,
         parts,
     }
@@ -1596,8 +1598,8 @@ async fn notify_worker(session_id: u64) {
 /// Returns the HTTP status, or `None` when it was not delivered.
 pub async fn send_notify(n: &BroadcastNotify) -> Option<u16> {
     use nextgcore_sbi::message::{SbiPart, SbiRequest};
-    let redacted = nextgcore_sbi::log_redact::redact_last_segment(&n.uri);
-    let Some((host, port, path)) = crate::namf_server::parse_http_uri(&n.uri) else {
+    let redacted = nextgcore_sbi::log_redact::redact_last_segment(&n.callback_uri);
+    let Some((host, port, path)) = crate::namf_server::parse_http_uri(&n.callback_uri) else {
         log::warn!("ContextStatusNotify: invalid notifyUri {redacted}");
         return None;
     };

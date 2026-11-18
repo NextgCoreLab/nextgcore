@@ -129,6 +129,29 @@ pub struct NgapMbsSession {
     pub area_tacs: Vec<u32>,
 }
 
+/// #1856: this AMF instance's epoch, the first part of every `mbsContextRef` it
+/// hands out. TS 29.518 makes MbsContextRef an opaque string. A per-process random
+/// epoch makes a ref unique across restarts: the counter after it restarts at 1,
+/// and a pre-restart ref (another epoch) is unknown here, never another context.
+fn context_ref_epoch() -> &'static str {
+    static EPOCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(|| format!("{:08x}", uuid::Uuid::new_v4().as_u128() as u32))
+}
+
+/// #1856: the `mbsContextRef` of context `id`: `<epoch>-<id>`.
+pub fn context_ref_string(id: u64) -> String {
+    format!("{}-{id}", context_ref_epoch())
+}
+
+/// #1856: the context id an `mbsContextRef` names, when this AMF instance issued
+/// it. A ref from another epoch (an earlier run of this AMF), or not of this form,
+/// is `None`, so it is not found rather than taken for a new context.
+pub fn parse_context_ref(context_ref: &str) -> Option<u64> {
+    let (epoch, id) = context_ref.split_once('-')?;
+    (epoch == context_ref_epoch()).then_some(())?;
+    id.parse().ok()
+}
+
 /// AMF NGAP Multicast Context
 pub struct NgapMcastContext {
     /// MBS sessions (session_id -> session)
@@ -668,6 +691,7 @@ fn build_mcast_group_paging(tmgi: &Tmgi, area_tacs: &[u32]) -> Option<Vec<u8>> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
     use nextgcore_asn1c::ngap::types::ProcedureCode;
     use nextgcore_ngap::ie::MulticastGroupPagingArea;
     use nextgcore_ngap::mbs_transfer::MbsSessionId;

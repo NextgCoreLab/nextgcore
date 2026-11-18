@@ -176,16 +176,10 @@ pub async fn context_create(
     amf: &DiscoveredAmf,
     tmgi: &Tmgi,
     leg: &AmfLeg,
-    notify_uri: &str,
+    notify_base: &str,
+    notify_token: &str,
 ) -> Option<MbsContextRef> {
-    let transfer = match crate::n2_mbs_transfer::setup_or_mod_request_transfer(leg.qfi, leg.five_qi)
-    {
-        Ok(t) => t,
-        Err(e) => {
-            log::warn!("MBS: no ContextCreate: the N2 MBS SM container could not be built: {e}");
-            return None;
-        }
-    };
+    let request = context_create_request(tmgi, leg, notify_base, notify_token)?;
     // #1662: a service request to the AMF, so it carries the NRF-issued token.
     let client = crate::attach_oauth2(
         SbiClient::new(
@@ -195,30 +189,6 @@ pub async fn context_create(
         ),
         nextgcore_sbi::types::NfType::Amf,
     );
-
-    let body = json!({
-        "mbsSessionId": mbs_session_id_json(tmgi),
-        "mbsServiceArea": leg.mbs_service_area,
-        "n2MbsSmInfo": {
-            "ngapIeType": "MBS_SES_REQ",
-            "ngapData": { "contentId": N2_CONTENT_ID },
-        },
-        "notifyUri": notify_uri,
-        "snssai": leg.snssai,
-    });
-    let request = match nextgcore_sbi::message::SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
-        .with_json_body(&body)
-    {
-        Ok(r) => r.with_part(nextgcore_sbi::message::SbiPart::with_content(
-            N2_CONTENT_ID,
-            nextgcore_sbi::constants::content_type::APPLICATION_NGAP,
-            bytes::Bytes::from(transfer),
-        )),
-        Err(e) => {
-            log::warn!("MBS: ContextCreate body build failed: {e}");
-            return None;
-        }
-    };
     let response = match client.send_request(request).await {
         Ok(r) => r,
         Err(e) => {
@@ -258,6 +228,47 @@ pub async fn context_create(
         json.get("operationStatus").and_then(Value::as_str)
     );
     context_ref
+}
+
+/// The multipart ContextCreate request (`ContextCreateReqData` and the N2 MBS SM
+/// container part), with the `notifyUri` for `notify_token` under `notify_base`.
+/// Built here so the notifyUri, a callback URI, stays out of everything the
+/// caller logs.
+fn context_create_request(
+    tmgi: &Tmgi,
+    leg: &AmfLeg,
+    notify_base: &str,
+    notify_token: &str,
+) -> Option<nextgcore_sbi::message::SbiRequest> {
+    let transfer = match crate::n2_mbs_transfer::setup_or_mod_request_transfer(leg.qfi, leg.five_qi)
+    {
+        Ok(t) => t,
+        Err(e) => {
+            log::warn!("MBS: no ContextCreate: the N2 MBS SM container could not be built: {e}");
+            return None;
+        }
+    };
+    let body = json!({
+        "mbsSessionId": mbs_session_id_json(tmgi),
+        "mbsServiceArea": leg.mbs_service_area,
+        "n2MbsSmInfo": {
+            "ngapIeType": "MBS_SES_REQ",
+            "ngapData": { "contentId": N2_CONTENT_ID },
+        },
+        "notifyUri": amf_notify_uri(notify_base, notify_token),
+        "snssai": leg.snssai,
+    });
+    match nextgcore_sbi::message::SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts").with_json_body(&body) {
+        Ok(r) => Some(r.with_part(nextgcore_sbi::message::SbiPart::with_content(
+            N2_CONTENT_ID,
+            nextgcore_sbi::constants::content_type::APPLICATION_NGAP,
+            bytes::Bytes::from(transfer),
+        ))),
+        Err(e) => {
+            log::warn!("MBS: ContextCreate body build failed: {e}");
+            None
+        }
+    }
 }
 
 /// How one Namf_MBSBroadcast ContextDelete ended (#1758).
@@ -342,7 +353,7 @@ mod tests {
         }
     }
 
-    const NOTIFY: &str = "http://127.0.0.1:1/nmbsmf-mbssession/v1/amf-context-status/t";
+    const NOTIFY_BASE: &str = "http://127.0.0.1:1";
 
     /// #1796: a gNB of the AMF serving [`AREA_TAC`], as amfd's NGAP task sees it.
     fn stand_in_gnb(association_id: u64) -> nextgcore_amfd::mbs_broadcast::LiveGnb {
@@ -433,11 +444,11 @@ mod tests {
             nf_instance_id: None,
         };
 
-        let without = context_create(&amf, &tmgi(), &leg(), NOTIFY).await;
+        let without = context_create(&amf, &tmgi(), &leg(), NOTIFY_BASE, "t").await;
         let with = crate::TEST_OAUTH2_CLIENT
             .scope(
                 stand_in::oauth2_client_for(nrf_port, NfType::Mbsmf),
-                context_create(&amf, &tmgi(), &leg(), NOTIFY),
+                context_create(&amf, &tmgi(), &leg(), NOTIFY_BASE, "t"),
             )
             .await;
 
@@ -482,7 +493,7 @@ mod tests {
         let outcome = crate::TEST_OAUTH2_CLIENT
             .scope(
                 stand_in::oauth2_client_for(1, NfType::Mbsmf),
-                context_create(&amf, &tmgi(), &leg(), NOTIFY),
+                context_create(&amf, &tmgi(), &leg(), NOTIFY_BASE, "t"),
             )
             .await;
 
@@ -530,18 +541,18 @@ mod tests {
         let sessions = || nextgcore_amfd::context::amf_mcast().session_count();
         let before = sessions();
 
-        let bare = context_create(&amf, &tmgi(), &leg(), NOTIFY).await;
+        let bare = context_create(&amf, &tmgi(), &leg(), NOTIFY_BASE, "t").await;
         let after_bare = sessions();
         let oauth2 = stand_in::oauth2_client_for(nrf_port, NfType::Mbsmf);
         let first = crate::TEST_OAUTH2_CLIENT
             .scope(
                 std::sync::Arc::clone(&oauth2),
-                context_create(&amf, &tmgi(), &leg(), NOTIFY),
+                context_create(&amf, &tmgi(), &leg(), NOTIFY_BASE, "t"),
             )
             .await;
         let after_first = sessions();
         let retry = crate::TEST_OAUTH2_CLIENT
-            .scope(oauth2, context_create(&amf, &tmgi(), &leg(), NOTIFY))
+            .scope(oauth2, context_create(&amf, &tmgi(), &leg(), NOTIFY_BASE, "t"))
             .await;
 
         assert_eq!(bare, None, "the AMF's gate refuses a bare ContextCreate");
@@ -612,8 +623,9 @@ mod tests {
     }
 
     fn amf_holds(context_ref: &str) -> bool {
-        nextgcore_amfd::context::amf_mcast()
-            .broadcast_context_find(context_ref.parse().expect("numeric ref"))
+        // #1856: the ref is `<epoch>-<id>` and names the context, not the session.
+        nextgcore_amfd::ngap_mcast::parse_context_ref(context_ref)
+            .and_then(|id| nextgcore_amfd::context::amf_mcast().broadcast_context_find(id))
             .is_some()
     }
 
@@ -1139,7 +1151,7 @@ mod tests {
         let tmgi = tmgi_1758([0x02, 0x17, 0x96]);
 
         let context_ref = crate::TEST_OAUTH2_CLIENT
-            .scope(oauth2.clone(), context_create(&amf, &tmgi, &leg(), NOTIFY))
+            .scope(oauth2.clone(), context_create(&amf, &tmgi, &leg(), NOTIFY_BASE, "t"))
             .await
             .expect("amfd creates the context");
         let sent = ngap.sent.lock().unwrap().clone();

@@ -447,7 +447,7 @@ mod tests {
         let task = tokio::spawn(crate::namf_request_handler(SbiRequest::delete(format!(
             "/namf-mbs-bc/v1/mbs-contexts/{context_ref}"
         ))));
-        if let Ok(id) = context_ref.parse::<u64>() {
+        if let Some(id) = crate::ngap_mcast::parse_context_ref(context_ref) {
             for _ in 0..200 {
                 if crate::context::amf_mcast()
                     .broadcast_context_find(id)
@@ -801,7 +801,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        let id: u64 = r.parse().unwrap();
+        let id = crate::ngap_mcast::parse_context_ref(&r).unwrap();
         let mut states = crate::context::amf_mcast()
             .broadcast_gnb_states(id)
             .expect("held");
@@ -870,7 +870,7 @@ mod tests {
         assert_eq!(assocs(&take_sent_ngap(&mut server)), vec![1, 2]);
         let id = mcast.broadcast_refs_of(&t)[0];
 
-        let deleted = delete(&id.to_string()).await;
+        let deleted = delete(&crate::ngap_mcast::context_ref_string(id)).await;
         let created = create.await.unwrap();
         assert_eq!(created.status, 500, "the waiting create is answered");
         server.process_mbs_broadcast().await;
@@ -1080,7 +1080,7 @@ mod tests {
             .to_string();
         assert_ne!(new_ref, old);
         let mut states = mcast
-            .broadcast_gnb_states(new_ref.parse().unwrap())
+            .broadcast_gnb_states(crate::ngap_mcast::parse_context_ref(&new_ref).unwrap())
             .unwrap();
         states.sort_unstable_by_key(|(a, _)| *a);
         assert_eq!(
@@ -1130,12 +1130,12 @@ mod tests {
                     .await
                     .unwrap();
             }
-            let r: u64 = body_json(&create.await.unwrap())["mbsContextRef"]
+            let r_str = body_json(&create.await.unwrap())["mbsContextRef"]
                 .as_str()
                 .unwrap()
-                .parse()
-                .unwrap();
-            deletes.push(delete(&r.to_string()).await);
+                .to_string();
+            let r = crate::ngap_mcast::parse_context_ref(&r_str).unwrap();
+            deletes.push(delete(&r_str).await);
             server.process_mbs_broadcast().await;
             take_sent_ngap(&mut server);
             refs.push(r);
@@ -1207,7 +1207,7 @@ mod tests {
         mcast.broadcast_rescan();
         server.process_mbs_broadcast().await;
         assert!(
-            !mcast.broadcast_releasing(r.parse().unwrap()),
+            !mcast.broadcast_releasing(crate::ngap_mcast::parse_context_ref(&r).unwrap()),
             "the unanswered release is over"
         );
         let notes = wait_notifies(&seen, before + 1).await;
@@ -1265,7 +1265,7 @@ mod tests {
             .to_string();
         assert_eq!(
             mcast
-                .broadcast_context_find(r.parse().unwrap())
+                .broadcast_context_find(crate::ngap_mcast::parse_context_ref(&r).unwrap())
                 .unwrap()
                 .session_id,
             multicast.mbs_session_id,
@@ -1364,6 +1364,109 @@ mod tests {
             mcast.session_find_by_tmgi(&t).is_none(),
             "the last context removes the session it created"
         );
+    }
+
+    /// #1856 (ported): at most MAX_BROADCAST_CONTEXTS contexts are held. One more
+    /// is refused `Full` (the handler's 500 INSUFFICIENT_RESOURCES) without making
+    /// a session for it, while a retry of a held context is still answered.
+    ///
+    /// REVERT-VERIFIED: with the bound removed from `broadcast_create`, the extra
+    /// create is stored ("one more is refused").
+    #[test]
+    fn broadcast_contexts_are_bounded_1856() {
+        use crate::mbs_broadcast::MAX_BROADCAST_CONTEXTS;
+        let mcast = crate::ngap_mcast::NgapMcastContext::new();
+        let req = |svc, mbsmf: String| crate::mbs_broadcast::BroadcastCreate {
+            tmgi: tmgi(svc),
+            mbs_session_id: json!({}),
+            sst: 1,
+            sd: None,
+            area: Default::default(),
+            setup_transfer: Vec::new(),
+            notify_uri: "http://127.0.0.1:9/n".into(),
+            max_response_time: None,
+            mbsmf_id: Some(mbsmf),
+        };
+        let now = std::time::Instant::now();
+        for n in 0..MAX_BROADCAST_CONTEXTS {
+            assert!(
+                !matches!(
+                    mcast.broadcast_create(req(0x18_5600, format!("mbsmf-{n}")), now),
+                    CreateStart::Full
+                ),
+                "under the bound"
+            );
+        }
+        assert!(
+            matches!(
+                mcast.broadcast_create(req(0x18_5601, "mbsmf-x".into()), now),
+                CreateStart::Full
+            ),
+            "one more is refused"
+        );
+        assert!(
+            mcast.session_find_by_tmgi(&tmgi(0x18_5601)).is_none(),
+            "no session is made for a refused create"
+        );
+        assert!(
+            !matches!(
+                mcast.broadcast_create(req(0x18_5600, "mbsmf-0".into()), now),
+                CreateStart::Full
+            ),
+            "a retry of a held context is still answered"
+        );
+    }
+
+    /// #1856 (ported): an `mbsContextRef` is `<epoch>-<id>`, the epoch this AMF
+    /// instance's own. A ref of another epoch (issued by an earlier run, whose
+    /// counter restarted at 1) is 404 CONTEXT_NOT_FOUND and releases nothing, even
+    /// when its number names a live context now.
+    ///
+    /// REVERT-VERIFIED: with `parse_context_ref` ignoring the epoch, the stale ref
+    /// deletes the live context ("a pre-restart ref is not found").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ref_from_before_a_restart_deletes_nothing_1856() {
+        let _g = crate::test_support::MBS_CONTEXT_LOCK.lock().await;
+        crate::test_support::init_context();
+        let mut server = server_with_area_gnbs().await;
+        let t = tmgi(0x18_5602);
+        let uri = "http://127.0.0.1:9/notify";
+        let mcast = crate::context::amf_mcast();
+
+        let create = start_create(create_request("185602", uri, json!({}))).await;
+        server.process_mbs_broadcast().await;
+        take_sent_ngap(&mut server);
+        for a in [1, 2] {
+            server.process_ngap_message(a, &setup_response(&t, None)).await.unwrap();
+        }
+        let r = body_json(&create.await.unwrap())["mbsContextRef"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (epoch, id) = r.split_once('-').expect("<epoch>-<id>");
+        assert_eq!(epoch.len(), 8, "{r}");
+        let stale_epoch = if epoch == "00000000" { "00000001" } else { "00000000" };
+        let stale = crate::namf_request_handler(SbiRequest::delete(format!(
+            "/namf-mbs-bc/v1/mbs-contexts/{stale_epoch}-{id}"
+        )))
+        .await;
+        assert_eq!(stale.status, 404, "a pre-restart ref is not found");
+        assert_eq!(body_json(&stale)["cause"], "CONTEXT_NOT_FOUND");
+        server.process_mbs_broadcast().await;
+        assert!(take_sent_ngap(&mut server).is_empty(), "and releases nothing");
+        assert!(
+            mcast
+                .broadcast_context_find(crate::ngap_mcast::parse_context_ref(&r).unwrap())
+                .is_some(),
+            "the live context is untouched"
+        );
+
+        let deleted = delete(&r).await;
+        server.process_mbs_broadcast().await;
+        for (a, _) in take_sent_ngap(&mut server) {
+            server.process_ngap_message(a, &release_response(&t, None)).await.unwrap();
+        }
+        assert_eq!(deleted.await.unwrap().status, 204);
     }
 
     /// The context map is capped: past the cap a ContextCreate stores nothing.

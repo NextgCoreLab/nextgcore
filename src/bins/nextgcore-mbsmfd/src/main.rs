@@ -1038,8 +1038,7 @@ async fn create_amf_mbs_context(
             c.forget_amf_notify_token(token);
         }
     };
-    let notify_uri = namf_client::amf_notify_uri(&base, &token);
-    let Some(context_ref) = namf_client::context_create(&amf, &tmgi, &leg, &notify_uri).await
+    let Some(context_ref) = namf_client::context_create(&amf, &tmgi, &leg, &base, &token).await
     else {
         forget(&token);
         return None;
