@@ -390,6 +390,17 @@ registration:
   updates, the AMF re-issues each URI with a fresh token. It records the token
   only once that peer answered 2xx; until then the token-less URI stays served
   (#1642). Once none is token-less, the context is written as tokened.
+- **The UDM's am-data changes are applied (#1748).** The SDM subscription's
+  `callbackReference` is `.../{supi}/sdmsubscription-notify/{token}`, one token
+  per subscription, the UE's once the UDM accepted it (registration, and the
+  takeover or restore re-subscription). A `ModificationNotification`
+  (TS 29.503 §5.2.2.5.2) on it updates the subscribed UE-AMBR, GPSI and
+  MPS/MCX priority as registration derives them, and is answered 204. A change
+  this AMF does not apply (another am-data member, the subscribed S-NSSAIs, a
+  removal of the UE-AMBR) refuses the whole notification with 501, and nothing
+  is applied. On an OAuth2-required listener it skips the bearer only from a
+  verified UDM. The new values reach the gNB at the UE's next Initial Context
+  Setup; no UE Context Modification is sent for them.
 - **Config loading is lenient.** An unreadable/unparsable `amf.yaml` logs a
   warning and continues with built-in defaults (`load_config` in
   `lib.rs`) — a running AMF is not proof your config was applied. See the

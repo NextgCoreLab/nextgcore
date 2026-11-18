@@ -34,6 +34,7 @@ pub mod positioning; // LCS: LMF positioning relay (NRPPa N2 / LPP N1) — TS 23
 pub mod racs; // #570: RACS on the AMF (TS 23.501 §5.4.4.1a, TS 29.673)
 pub(crate) mod sbi_offload; // #796: SBI work off the NGAP task
 pub mod sbi_path;
+pub(crate) mod sdm_notify; // #1748: Nudm_SDM data change notification (TS 29.503 §5.2.2.5.2)
 pub mod snpn; // Rel-16: SNPN authentication (TS 23.501 §5.30)
 pub mod timer;
 pub mod ue_store; // #341: the one authoritative live-UE store

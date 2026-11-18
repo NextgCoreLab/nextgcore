@@ -3967,6 +3967,21 @@ pub struct AmfUe {
     /// longer holds (one made before a restart, under a different
     /// `amfInstanceId`). Acting on it would tear down the UE's new registration.
     pub uecm_dereg_token: Option<String>,
+    /// #1748: the token in the `callbackReference` of this UE's CURRENT Nudm_SDM
+    /// subscription (`.../sdmsubscription-notify/{token}`), minted per subscription
+    /// and the UE's only once the UDM accepted it (TS 29.503 §5.2.2.3.2). A data
+    /// change notification naming another token is for no subscription this AMF
+    /// holds. `None` for a context whose subscription carries no token (one
+    /// restored from before #1518 serves the token-less URI meanwhile).
+    pub sdm_notify_token: Option<String>,
+    /// #1748: the members of the UE's `AccessAndMobilitySubscriptionData` this AMF
+    /// keeps, as the UDM last gave them (Nudm_SDM_Get, or a data change
+    /// notification applied since): `subscribedUeAmbr`, `gpsis`, `mpsPriority`,
+    /// `mcsPriority` and `nssai` (`sbi_path::AM_DATA_KEPT_MEMBERS`). A notification's
+    /// changes are applied to it and the UE's fields derived from it again.
+    /// `None` for a context whose am-data was never read here (one restored from
+    /// a record without it): it is then rebuilt from those fields.
+    pub am_data: Option<serde_json::Value>,
     /// #1518: the secret each PDU session's `smContextStatusUri` token is derived
     /// from ([`crate::sbi_path::sm_context_status_token`]), one token per PSI, so the
     /// SMF of one session cannot notify about another. Minted with the UE context
@@ -4274,6 +4289,9 @@ impl std::fmt::Debug for AmfUe {
         let mut d = f.debug_struct("AmfUe");
         d.field("id", &self.id);
         d.field("uecm_dereg_token", &redacted(&self.uecm_dereg_token));
+        d.field("sdm_notify_token", &redacted(&self.sdm_notify_token));
+        // The kept am-data carries the GPSIs: only whether it is held.
+        d.field("am_data", &self.am_data.is_some());
         d.field(
             "sm_context_status_key",
             &redacted(&self.sm_context_status_key),
@@ -4849,6 +4867,8 @@ impl AmfUe {
         Self {
             id,
             uecm_dereg_token: None,
+            sdm_notify_token: None,
+            am_data: None,
             sm_context_status_key: Some(uuid::Uuid::new_v4().simple().to_string()),
             pre_1518_callbacks: false,
             nas: NasState::default(),
