@@ -5952,6 +5952,11 @@ fn is_temporary_reject_cause(cause: &str) -> bool {
 /// the session falls back to DEACTIVATED (nothing is being set up). The next
 /// message from an AMF re-invokes the transfer there (`begin_repaging_toward`);
 /// the guard's expiry ends the paging, "the SMF takes the step 3c".
+///
+/// A `retryAfter` on the temporary reject is not waited out (#1706 review m2): step
+/// 3b has the SMF re-invoke "upon reception of a message from an AMF" (a shall),
+/// where TS 29.518 §5.2.2.3.1's `retryAfter` is a should. The AMF's message is the
+/// sign that the procedure it named has moved on.
 fn hold_temporarily_rejected_paging(sm_context_ref: &str, token: &str) -> bool {
     let handle = smf_self();
     let Ok(ctx) = handle.read() else {
@@ -5962,12 +5967,20 @@ fn hold_temporarily_rejected_paging(sm_context_ref: &str, token: &str) -> bool {
             .get_mut(sm_context_ref)
             .and_then(|b| b.network_paging.as_mut())
             .filter(|p| p.failure_token.matches(token))?;
+        // #1706 review m3: a retransmitted temporary reject for the paging already
+        // held under this token is a duplicate. Its guard keeps the deadline the first
+        // one set, and no second guard is started.
+        if p.temporarily_rejected {
+            return Some(None);
+        }
         p.temporarily_rejected = true;
         p.started = std::time::Instant::now();
-        Some(p.failure_token.clone())
+        Some(Some(p.failure_token.clone()))
     });
-    let Some(token) = held else {
-        return false;
+    let token = match held {
+        None => return false,
+        Some(None) => return true,
+        Some(Some(token)) => token,
     };
     if let Some(mut sess) = ctx.sess_find_by_sm_context_ref(sm_context_ref) {
         if sess.up_cnx_state == context::UpCnxState::Activating {
@@ -9833,6 +9846,9 @@ async fn send_n1_n2_paging_request(
                         )
                         .await;
                         let answer = match end {
+                            // #1706 review m1: the retried transfer can be temporarily
+                            // rejected too, and is held as the first answer would be.
+                            N1n2RetryEnd::TemporarilyRejected => PagingAnswer::TemporarilyRejected,
                             N1n2RetryEnd::Sent(status) => PagingAnswer::of(status),
                             _ => PagingAnswer::Refused,
                         };
@@ -9950,6 +9966,10 @@ enum PagingRetries {
 enum N1n2RetryEnd {
     /// The AMF took it (any answer but the 409), with this status.
     Sent(u16),
+    /// The AMF answered the resend with a temporary reject (#1706 review m1: TS
+    /// 29.518 §5.2.2.3.1, 409 TEMPORARY_REJECT_REGISTRATION_ONGOING or
+    /// _HANDOVER_ONGOING), which a paging holds rather than drops.
+    TemporarilyRejected,
     /// The session was released before the resend (#1079 review m1).
     SessionGone,
     /// The AMF asked for a longer wait than [`N1N2_RETRY_AFTER_MAX_S`] (m2).
@@ -10021,6 +10041,9 @@ async fn retry_n1n2_after_paging_conflict(
                 Some(next) => wait = next,
                 None => {
                     log::info!("N1N2MessageTransfer retried: status={}", resp.status);
+                    if PagingAnswer::of_response(&resp) == PagingAnswer::TemporarilyRejected {
+                        return N1n2RetryEnd::TemporarilyRejected;
+                    }
                     return N1n2RetryEnd::Sent(resp.status);
                 }
             },
@@ -29463,6 +29486,228 @@ mod tests {
         assert_eq!(up_state_1631(&reference), context::UpCnxState::Activating);
 
         *TEMP_REJECT_GUARD_FOR_TEST.lock().unwrap() = None;
+        drop_session_for_retry(&reference);
+        amf.stop().await.expect("stop");
+    }
+
+    /// **#1706 review (R10 M1)**: the hook re-invokes a waiting paging on an AMF's
+    /// message, but not on one that carries `upCnxState`: that message settles the
+    /// paging itself. Here the new AMF B's ACTIVATING is REFUSED (the SMF has no
+    /// uplink endpoint to activate), so the paging does not end, and the token
+    /// re-check in the spawned send cannot hide a re-invocation: the paging must
+    /// still be A's, and B is sent nothing.
+    ///
+    /// REVERT-VERIFIED: with the gate removed (`req_body["upCnxState"].is_null() &&`
+    /// -> `true &&`), the paging moves to B: "the paging is still A's" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_activation_from_a_new_amf_does_not_move_the_paging_1706() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let (amf_a, port_a, seen_a) = scripted_amf_1631(vec![attempting_1631()]).await;
+        let (amf_b, port_b, seen_b) = scripted_amf_1631(vec![attempting_1631()]).await;
+        let supi = "imsi-001010000017063";
+        let (reference, seid) = seed_paged_session_1631(supi, 5, port_a);
+
+        report_dl_data_1631(seid, 7).await;
+        assert_eq!(
+            seen_a.lock().unwrap().len(),
+            1,
+            "the report pages through A"
+        );
+        let token = failure_token_1631(&seen_a.lock().unwrap()[0], &reference);
+        // Nothing to activate: no uplink endpoint, and no UPF to recover one from.
+        smf_self()
+            .read()
+            .expect("context")
+            .upf_ul_endpoints
+            .write()
+            .expect("endpoints")
+            .remove(&reference);
+
+        let body = serde_json::json!({
+            "servingNfId": "00000000-0000-4000-8000-000000001706",
+            "smContextStatusUri": format!(
+                "http://127.0.0.1:{port_b}/namf-callback/v1/{supi}/sm-context-status/5"
+            ),
+            "upCnxState": "ACTIVATING",
+        });
+        let resp = handle_sm_context_update(&reference, &ho_update(&reference, body, None)).await;
+        assert_eq!(resp.status, 500, "precondition: the activation is refused");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            lookup_policy_binding(&reference)
+                .and_then(|b| b.network_paging)
+                .is_some_and(|p| p.failure_token.matches(&token)),
+            "the paging is still A's"
+        );
+        assert!(seen_b.lock().unwrap().is_empty(), "B is sent nothing");
+        let failure = serde_json::json!({
+            "cause": "UE_NOT_RESPONDING",
+            "n1n2MsgDataUri": "http://amf/namf-comm/v1/ue-contexts/x/n1-n2-messages/1",
+        });
+        assert_eq!(
+            notify_failure_1631(&reference, &token, failure).await,
+            204,
+            "A's transfer is the one held"
+        );
+
+        drop_session_for_retry(&reference);
+        amf_a.stop().await.expect("stop");
+        amf_b.stop().await.expect("stop");
+    }
+
+    /// **#1706 review (R10 M1)**: nor does an Update with `release: true` re-invoke a
+    /// held paging. It is a message from an AMF, but one asking the SMF to release
+    /// the PDU session (TS 29.502 Table 6.1.6.2.2-1), so paging the UE for it would
+    /// set up what is being released.
+    ///
+    /// REVERT-VERIFIED: with the gate's `release` arm removed
+    /// (`req_body["release"].as_bool() != Some(true)` -> `true`), the AMF receives a
+    /// second transfer ("no transfer for a release").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_release_update_does_not_re_invoke_a_held_paging_1706() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let (amf, port, seen) = scripted_amf_1631(vec![
+            temporary_reject_1706("TEMPORARY_REJECT_REGISTRATION_ONGOING"),
+            attempting_1631(),
+        ])
+        .await;
+        let supi = "imsi-001010000017064";
+        let (reference, seid) = seed_paged_session_1631(supi, 5, port);
+
+        report_dl_data_1631(seid, 5).await;
+        assert_eq!(seen.lock().unwrap().len(), 1, "the report pages");
+        let token = failure_token_1631(&seen.lock().unwrap()[0], &reference);
+        assert!(
+            lookup_policy_binding(&reference)
+                .and_then(|b| b.network_paging)
+                .is_some_and(|p| p.temporarily_rejected),
+            "precondition: the paging is held, temporarily rejected"
+        );
+
+        let body = serde_json::json!({
+            "servingNfId": "00000000-0000-4000-8000-000000001706",
+            "smContextStatusUri": format!(
+                "http://127.0.0.1:{port}/namf-callback/v1/{supi}/sm-context-status/5"
+            ),
+            "release": true,
+        });
+        let _ = handle_sm_context_update(&reference, &ho_update(&reference, body, None)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(seen.lock().unwrap().len(), 1, "no transfer for a release");
+        assert!(
+            lookup_policy_binding(&reference)
+                .and_then(|b| b.network_paging)
+                .is_some_and(|p| p.failure_token.matches(&token)),
+            "the held paging is untouched"
+        );
+
+        drop_session_for_retry(&reference);
+        amf.stop().await.expect("stop");
+    }
+
+    /// **#1706 review (m1)**: a transfer refused with 409 HIGHER_PRIORITY_REQUEST_ONGOING
+    /// is resent after its `retryAfter`, and the resend can be temporarily rejected in
+    /// turn. That answer holds the paging as a first answer would (step 3b), and the
+    /// AMF's next message re-invokes it.
+    ///
+    /// REVERT-VERIFIED: with the resend's answer settled by status alone
+    /// (`PagingAnswer::of`), the paging is dropped: "the resend's temporary reject
+    /// holds the paging" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_temporarily_rejected_conflict_retry_holds_the_paging_1706() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let (amf, port, seen) = scripted_amf_1631(vec![
+            (
+                409,
+                serde_json::json!({
+                    "error": { "status": 409, "cause": "HIGHER_PRIORITY_REQUEST_ONGOING" },
+                    "errInfo": { "retryAfter": 1 },
+                }),
+            ),
+            temporary_reject_1706("TEMPORARY_REJECT_HANDOVER_ONGOING"),
+            attempting_1631(),
+        ])
+        .await;
+        let supi = "imsi-001010000017065";
+        let (reference, seid) = seed_paged_session_1631(supi, 5, port);
+
+        report_dl_data_1631(seid, 5).await;
+        let sent = wait_for_transfers_1706(&seen, 2).await;
+        assert_eq!(sent.len(), 2, "precondition: resent after the retryAfter");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let held = || {
+            lookup_policy_binding(&reference)
+                .and_then(|b| b.network_paging)
+                .is_some_and(|p| p.temporarily_rejected)
+        };
+        while !held() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(held(), "the resend's temporary reject holds the paging");
+
+        amf_message_1706(&reference, supi, port).await;
+        let sent = wait_for_transfers_1706(&seen, 3).await;
+        assert_eq!(sent.len(), 3, "and the AMF's next message re-invokes it");
+
+        drop_session_for_retry(&reference);
+        amf.stop().await.expect("stop");
+    }
+
+    /// **#1706 review (m3)**: a temporary reject retransmitted on the failure
+    /// notification, under the token already held, is a duplicate. It is answered
+    /// 204, and the paging keeps the guard deadline the first one set.
+    ///
+    /// REVERT-VERIFIED: with the duplicate re-held, `started` moves: "the guard keeps
+    /// its first deadline" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repeated_temporary_reject_keeps_the_first_guard_1706() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let (amf, port, seen) = scripted_amf_1631(vec![attempting_1631()]).await;
+        let supi = "imsi-001010000017066";
+        let (reference, seid) = seed_paged_session_1631(supi, 5, port);
+
+        report_dl_data_1631(seid, 5).await;
+        assert_eq!(seen.lock().unwrap().len(), 1, "the report pages");
+        let token = failure_token_1631(&seen.lock().unwrap()[0], &reference);
+        let failure = serde_json::json!({
+            "cause": "TEMPORARY_REJECT_REGISTRATION_ONGOING",
+            "n1n2MsgDataUri": "http://amf/namf-comm/v1/ue-contexts/x/n1-n2-messages/1",
+        });
+        assert_eq!(
+            notify_failure_1631(&reference, &token, failure.clone()).await,
+            204
+        );
+        let started = |r: &str| {
+            lookup_policy_binding(r)
+                .and_then(|b| b.network_paging)
+                .filter(|p| p.temporarily_rejected)
+                .map(|p| p.started)
+        };
+        let first = started(&reference).expect("held");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            notify_failure_1631(&reference, &token, failure).await,
+            204,
+            "the duplicate is answered"
+        );
+        assert_eq!(
+            started(&reference),
+            Some(first),
+            "the guard keeps its first deadline"
+        );
+
         drop_session_for_retry(&reference);
         amf.stop().await.expect("stop");
     }
