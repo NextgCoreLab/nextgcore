@@ -425,6 +425,7 @@ fn spawn_registration_status_update(
         }
         let mut resends = 0;
         loop {
+            let sent_at = tokio::time::Instant::now();
             let answered = match crate::sbi_path::call_amf_registration_status_update(
                 &pending.peer_host,
                 pending.peer_port,
@@ -443,13 +444,18 @@ fn spawn_registration_status_update(
                         pending.peer_host,
                         pending.peer_port
                     );
-                    matches!(e, crate::sbi_path::SbiError::PeerStatus { .. })
+                    // #1857: a 502/503/504 may come from an SCP or proxy, not the old
+                    // AMF (TS 29.500 §6.10), so the update may never have reached
+                    // it: not an answer.
+                    answered_by_the_peer(&e)
                 }
             };
-            // An unanswered send leaves the lane unsettled; an answered one settles
+            // An unanswered send leaves the key unsettled; an answered one settles
             // it only when no earlier unanswered send can still land after it.
-            let unsettled = ticket.record(answered, resends > 0);
-            if !unsettled || resends >= MAX_SETTLE_RESENDS {
+            let Some(wait) = ticket.record(answered, sent_at) else {
+                break;
+            };
+            if resends >= MAX_SETTLE_RESENDS {
                 break;
             }
             // A later status supersedes this one: wait out the window in which an
@@ -464,7 +470,7 @@ fn spawn_registration_status_update(
                 break;
             }
             tokio::select! {
-                _ = tokio::time::sleep(STATUS_UPDATE_SETTLE) => {}
+                _ = tokio::time::sleep(wait) => {}
                 _ = superseded => break,
             }
             if !ticket.is_latest() {
@@ -488,6 +494,33 @@ fn spawn_registration_status_update(
 const STATUS_UPDATE_SETTLE: std::time::Duration = std::time::Duration::from_millis(
     2 * crate::sbi_path::REGISTRATION_STATUS_UPDATE_TIMEOUT.as_millis() as u64,
 );
+
+/// #1857: whether a failed RegistrationStatusUpdate was answered by the old AMF
+/// (so it did not apply it, and will not later): a non-2xx other than 502, 503 or
+/// 504, which an SCP or proxy answers for a request it could not deliver
+/// (TS 29.500 §6.10).
+fn answered_by_the_peer(e: &crate::sbi_path::SbiError) -> bool {
+    matches!(
+        e,
+        crate::sbi_path::SbiError::PeerStatus { status, .. }
+            if !matches!(*status, 502..=504)
+    )
+}
+
+/// #1857: until when an abandoned (unanswered) RegistrationStatusUpdate to a key
+/// may still be applied by the old AMF: its send time plus [`STATUS_UPDATE_SETTLE`].
+/// Kept apart from the lane, so it outlives the lane's entry: once the re-sends
+/// run out and the lane is gone, a later outcome on the key still knows to send
+/// again after this time. Bounded: past entries are pruned on every write.
+fn status_update_unsettled(
+) -> std::sync::MutexGuard<'static, HashMap<StatusUpdateKey, tokio::time::Instant>> {
+    static UNSETTLED: std::sync::LazyLock<
+        std::sync::Mutex<HashMap<StatusUpdateKey, tokio::time::Instant>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+    UNSETTLED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// #1820: re-sends of the latest update an unsettled lane makes at most. Past them
 /// the old AMF's guard timer is the remedy (TS 23.502 §4.2.2.2.2 step 5).
@@ -539,9 +572,6 @@ impl StatusUpdateKey {
 struct StatusUpdateLane {
     latest: u64,
     lane: Arc<Mutex<()>>,
-    /// #1820: an earlier send got no answer and may still be applied after a later
-    /// one, so the latest update has to be sent again once answered.
-    unsettled: bool,
     /// #1820: woken when a newer outcome is issued, so a settle wait yields to it.
     superseded: Arc<tokio::sync::Notify>,
 }
@@ -585,7 +615,6 @@ impl StatusUpdateTicket {
             .or_insert_with(|| StatusUpdateLane {
                 latest: seq,
                 lane: Arc::new(Mutex::new(())),
-                unsettled: false,
                 superseded: Arc::new(tokio::sync::Notify::new()),
             });
         entry.latest = seq;
@@ -601,22 +630,34 @@ impl StatusUpdateTicket {
         }
     }
 
-    /// #1820: record how this ticket's send ended, and return whether the lane is
-    /// still unsettled. An unanswered send unsettles it. An answered one settles it
-    /// when it is a re-send (sent after the settle wait), or when the lane was
-    /// already settled; a first answered send on an unsettled lane leaves it
-    /// unsettled, because the earlier unanswered one can still land after it.
-    fn record(&self, answered: bool, resend: bool) -> bool {
-        let mut lanes = status_update_lanes();
-        let Some(entry) = lanes.get_mut(&self.key) else {
-            return false;
-        };
+    /// #1820, #1857: record how this ticket's send, started at `sent_at`, ended,
+    /// and return how long to wait before sending it again, or `None` when the key
+    /// is settled.
+    /// - Unanswered: an abandoned request may land up to [`STATUS_UPDATE_SETTLE`]
+    ///   later, so the key is unsettled until then, and this one is sent again then.
+    /// - Answered, and started after every abandoned request's window closed:
+    ///   nothing earlier can land after it, so the key is settled.
+    /// - Answered within such a window: sent again once it closes.
+    ///
+    /// The window is kept beside the lanes, not in one, so it holds across a lane's
+    /// removal (#1857).
+    fn record(&self, answered: bool, sent_at: tokio::time::Instant) -> Option<std::time::Duration> {
+        let now = tokio::time::Instant::now();
+        let mut unsettled = status_update_unsettled();
+        unsettled.retain(|_, until| *until > now);
         if !answered {
-            entry.unsettled = true;
-        } else if resend {
-            entry.unsettled = false;
+            let until = sent_at.max(now) + STATUS_UPDATE_SETTLE;
+            let entry = unsettled.entry(self.key.clone()).or_insert(until);
+            *entry = (*entry).max(until);
+            return Some(*entry - now);
         }
-        entry.unsettled
+        match unsettled.get(&self.key).copied() {
+            Some(until) if sent_at < until => Some(until - now),
+            _ => {
+                unsettled.remove(&self.key);
+                None
+            }
+        }
     }
 
     /// Whether no later outcome for the same key has been decided since this one.
@@ -45030,6 +45071,90 @@ mod tests {
             "the TRANSFERRED is applied last"
         );
         assert_eq!(lane_count_1769(port), 0, "no lane is left behind");
+        peer.stop().await.expect("stop");
+    }
+
+    /// **#1857** (1): the unsettled window outlives the lane. A send to a key goes
+    /// unanswered and its ticket is dropped, so the lane entry is removed. A later
+    /// outcome on the key, answered within the window, is still told to send again
+    /// once the window closes; one sent after it is settled.
+    ///
+    /// REVERT-VERIFIED: with the window kept in the lane entry (dropped with it),
+    /// "a later outcome still re-sends after the lane is gone" fails.
+    #[tokio::test]
+    async fn the_unsettled_window_outlives_the_lane_1857() {
+        let port = 18_571;
+        let key = || StatusUpdateKey::new("127.0.0.1", port, "5g-guti-1857".to_string());
+        let first = StatusUpdateTicket::issue(key());
+        assert!(first.record(false, tokio::time::Instant::now()).is_some());
+        drop(first);
+        assert_eq!(lane_count_1769(port), 0, "the lane itself is gone");
+        let later = StatusUpdateTicket::issue(key());
+        let wait = later.record(true, tokio::time::Instant::now());
+        assert!(
+            wait.is_some_and(|w| w > std::time::Duration::ZERO),
+            "a later outcome still re-sends after the lane is gone"
+        );
+        let after_window = tokio::time::Instant::now() + STATUS_UPDATE_SETTLE;
+        assert_eq!(
+            later.record(true, after_window),
+            None,
+            "sent after the window: settled"
+        );
+    }
+
+    /// **#1857** (2): a 502 (an SCP or proxy that could not deliver the update,
+    /// TS 29.500 §6.10) is not an answer: the update is sent again, and the old AMF
+    /// gets it.
+    ///
+    /// REVERT-VERIFIED: with 502-504 counted as answered, the mapping assertion
+    /// (504 is not an answer) fails first; past it, the update is sent once
+    /// ("the update the proxy did not deliver is sent again").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_proxy_502_is_not_an_answer_1857() {
+        use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        assert!(!answered_by_the_peer(
+            &crate::sbi_path::SbiError::PeerStatus {
+                what: String::new(),
+                status: 504,
+                retry_after: None,
+            }
+        ));
+        assert!(answered_by_the_peer(
+            &crate::sbi_path::SbiError::PeerStatus {
+                what: String::new(),
+                status: 404,
+                retry_after: None,
+            }
+        ));
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let s = seen.clone();
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let peer = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        peer.start(move |_req: SbiRequest| {
+            let s = s.clone();
+            async move {
+                if s.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    SbiResponse::with_status(502)
+                } else {
+                    SbiResponse::ok()
+                        .with_json_body(&serde_json::json!({ "regStatusTransferComplete": true }))
+                        .expect("json")
+                }
+            }
+        })
+        .await
+        .expect("peer");
+        let task =
+            spawn_registration_status_update(pending_1769(addr.port(), 18572), true).expect("rt");
+        task.await.expect("task");
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the update the proxy did not deliver is sent again"
+        );
         peer.stop().await.expect("stop");
     }
 
