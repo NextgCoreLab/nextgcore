@@ -13,6 +13,7 @@ metadata:
     {{- include "nextgcore.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.smf.replicas }}
+  {{- include "nextgcore.singleInstance" (dict "root" . "nf" "smf") }}
   # #718: never two SMF pods at once. Both signal the same PFCP Node ID (the
   # Service FQDN, #797), and a UPF that receives an Association Setup for a Node
   # ID it already has an association with replaces it, deleting the existing
@@ -33,6 +34,7 @@ spec:
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
+      {{- include "nextgcore.nrfTlsPodSecurity" . | nindent 6 }}
       # #718: a graceful SMF shutdown releases each UPF association (up to
       # T1 x (N1+1) = 12 s when a UPF is gone), sends every UE #39 and keeps
       # retransmitting its S5/S8 Delete Bearer Requests for up to 12 s.
@@ -65,8 +67,10 @@ spec:
             {{- end }}
           {{- include "nextgcore.sbiProbes" . | nindent 10 }}
           volumeMounts:
+            {{- include "nextgcore.nrfTlsMount" . | nindent 12 }}
             {{- include "nextgcore.configMounts" (dict "nf" "smf" "rewritten" true) | nindent 12 }}
           env:
+            {{- include "nextgcore.nrfTlsEnv" (dict "root" . "nf" "smf") | nindent 12 }}
             - name: NEXTGCORE_SBI_PROFILE
               # Issue #63: this NF defaults to the PRODUCTION SBI profile
               # (mutually-authenticated TLS + a required OAuth2 access token) and
@@ -116,6 +120,7 @@ spec:
             - name: UPF_PFCP_PORT
               value: "{{ .Values.upf.service.pfcpPort }}"
       volumes:
+        {{- include "nextgcore.nrfTlsVolume" (dict "root" . "nf" "smf") | nindent 8 }}
         {{- include "nextgcore.configVolumes" . | nindent 8 }}
 ---
 apiVersion: v1
