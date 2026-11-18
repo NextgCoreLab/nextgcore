@@ -1823,9 +1823,9 @@ async fn main() -> Result<()> {
         if unbound > 0 {
             log::warn!(
                 "{unbound} restored subscription(s) carry no verified owner (written before \
-                 #1809): they keep their notifications until their validity lapses, but no \
-                 caller can update or remove them; their consumers re-subscribe on the 404 \
-                 that follows expiry"
+                 #1809): they keep their notifications until their validity lapses (at most \
+                 24 h after this restart), but no caller can update or remove them; their \
+                 consumers re-subscribe on the 404 that follows expiry"
             );
         }
     }
@@ -3426,9 +3426,14 @@ fn rearm_restored_timers() {
     let mut sub_count = 0usize;
     for id in manager.subscription_ids() {
         if let Some(sub) = manager.find_subscription(&id) {
+            let validity = restored_validity(&sub);
+            if validity != sub.validity_duration {
+                // Stored too, so what the NRF holds matches what it enforces.
+                manager.set_subscription_validity(&id, validity);
+            }
             timer_mgr.start_timer(
                 nextgcore_nrfd::NrfTimerId::SubscriptionValidity,
-                Duration::from_secs(sub.validity_duration),
+                Duration::from_secs(validity),
                 id.clone(),
             );
             sub_count += 1;
@@ -3453,6 +3458,21 @@ fn rearm_restored_timers() {
 // the two are semantically identical. Wire timestamps belong in one place: a
 // leap-year or offset fix applied here would otherwise stay unapplied in the other
 // five copies.
+
+/// #1809 (R26 on #1831): the validity a restored subscription is re-armed
+/// with. An ownerless one (written before #1809) is frozen under production,
+/// so it must not outlive the NRF's own maximum: it is capped at
+/// [`NRF_SUBSCRIPTION_DEFAULT_VALIDITY`] (24 h), after which its consumer
+/// re-subscribes, bound. Before that cap a PATCH could set any validity, so a
+/// frozen subscription could otherwise have lasted indefinitely. An owned
+/// subscription keeps what was stored: its owner can still extend or cancel it.
+fn restored_validity(sub: &nextgcore_nrfd::SubscriptionData) -> u64 {
+    if sub.owner.is_none() {
+        sub.validity_duration.min(NRF_SUBSCRIPTION_DEFAULT_VALIDITY)
+    } else {
+        sub.validity_duration
+    }
+}
 
 /// Handle Subscription Delete request
 async fn handle_subscription_delete(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
@@ -3550,7 +3570,12 @@ async fn handle_subscription_update(subscription_id: &str, request: &SbiRequest)
             Some("INVALID_MSG_FORMAT"),
         );
     }
-    let validity_duration = absolute - now;
+    // R26 on #1831: the same maximum as Subscribe, so a PATCH cannot pin a
+    // subscription open past what the NRF would grant a new one.
+    let validity_duration = (absolute - now).min(NRF_SUBSCRIPTION_DEFAULT_VALIDITY);
+    // The validity the NRF grants, which the response returns (TS 29.510
+    // §5.2.2.5.6), not the proposal it narrowed.
+    let validity_time = epoch_to_rfc3339(now + validity_duration);
 
     if !manager.set_subscription_validity(subscription_id, validity_duration) {
         return send_error(
@@ -13709,6 +13734,78 @@ mod subscription_owner_tests_1809 {
             nothing_stored_for(uri),
             "a refused Subscribe stores nothing"
         );
+    }
+
+    /// R26 on #1831: a restart re-arms an ownerless subscription for at most
+    /// 24 h, whatever validity an old PATCH stored, and leaves an owned one as
+    /// stored; and a PATCH is capped at 24 h like a Subscribe.
+    ///
+    /// REVERT-VERIFIED: with `restored_validity` returning the stored value,
+    /// the ownerless subscription keeps its 10 days and the first assertion
+    /// fails; with the PATCH cap removed, the PATCH stores 10 days.
+    #[tokio::test]
+    async fn validity_is_capped_at_24_hours_for_restored_ownerless_and_patched_1809() {
+        const TEN_DAYS: u64 = 10 * 86400;
+        let sub = |id: &str, owner: Option<&str>| nextgcore_nrfd::SubscriptionData {
+            id: id.to_string(),
+            req_nf_type: None,
+            req_nf_instance_id: None,
+            notification_uri: format!("http://{id}.invalid/notify"),
+            subscr_cond: None,
+            validity_duration: TEN_DAYS,
+            req_notif_events: None,
+            notif_condition: None,
+            owner: owner.map(str::to_string),
+        };
+        let m = nf_manager();
+        m.add_subscription(sub("cap-ownerless-1809", None));
+        m.add_subscription(sub("cap-owned-1809", Some(OWNER)));
+        rearm_restored_timers();
+        assert_eq!(
+            m.find_subscription("cap-ownerless-1809")
+                .unwrap()
+                .validity_duration,
+            NRF_SUBSCRIPTION_DEFAULT_VALIDITY,
+            "an ownerless subscription lapses within 24 h of the restart"
+        );
+        assert_eq!(
+            m.find_subscription("cap-owned-1809")
+                .unwrap()
+                .validity_duration,
+            TEN_DAYS,
+            "an owned one keeps what was stored"
+        );
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let req = as_caller(
+            SbiRequest::patch("/nnrf-nfm/v1/subscriptions/cap-owned-1809").with_body(
+                json!({ "validityTime": epoch_to_rfc3339(now + TEN_DAYS) }).to_string(),
+                "application/json",
+            ),
+            Some(OWNER),
+            None,
+        );
+        let r = nrf_sbi_request_handler(req).await;
+        assert_eq!(r.status, 200, "{:?}", r.http.content);
+        let body: serde_json::Value =
+            serde_json::from_str(r.http.content.as_deref().unwrap()).unwrap();
+        let granted = rfc3339_to_epoch(body["validityTime"].as_str().unwrap()).unwrap();
+        assert!(
+            granted <= now + NRF_SUBSCRIPTION_DEFAULT_VALIDITY + 5,
+            "the response returns the granted validity, not the proposal"
+        );
+        assert_eq!(
+            m.find_subscription("cap-owned-1809")
+                .unwrap()
+                .validity_duration,
+            NRF_SUBSCRIPTION_DEFAULT_VALIDITY,
+            "a PATCH is capped like a Subscribe"
+        );
+        m.remove_subscription("cap-ownerless-1809");
+        m.remove_subscription("cap-owned-1809");
     }
 
     /// Under production an ownerless subscription (restored from a state file
