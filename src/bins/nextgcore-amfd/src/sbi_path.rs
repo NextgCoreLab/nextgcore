@@ -133,6 +133,16 @@ pub enum SbiError {
         status: u16,
         retry_after: Option<std::time::Duration>,
     },
+    /// The peer's OAuth2 gate refused this AMF's access token for `what`: a 401, or
+    /// since #1766 a 403 for a scope or audience mismatch, carrying a `Bearer`
+    /// challenge (TS 29.500 §6.7.3, [`SbiResponse::is_bearer_refusal`]).
+    ///
+    /// #1779 review M1: kept apart from a service's own refusal because a 403 is
+    /// also how the UDM, the PCF or the SMF says "this UE may not", which the AMF
+    /// answers with 5GMM #7. A token misconfiguration must not read as that: #7 has
+    /// the UE treat its USIM as invalid for 5GS until switched off (TS 24.501
+    /// §5.5.1.2.5).
+    TokenRefused { what: String, status: u16 },
 }
 
 impl std::fmt::Display for SbiError {
@@ -152,6 +162,10 @@ impl std::fmt::Display for SbiError {
             SbiError::PeerStatus { what, status, .. } => {
                 write!(f, "Request failed: {what} returned status {status}")
             }
+            SbiError::TokenRefused { what, status } => write!(
+                f,
+                "Request failed: {what}: the peer refused this AMF's access token (HTTP {status})"
+            ),
         }
     }
 }
@@ -1398,6 +1412,9 @@ pub async fn call_smf_create_sm_context(
         .await
         .map_err(|e| SbiError::RequestFailed(format!("SMF request failed: {e}")))?;
 
+    if response.is_bearer_refusal() {
+        return Err(token_refused("SMF", &response));
+    }
     if !response.is_success() {
         return Err(SbiError::SmfRefused {
             status: response.status,
@@ -1487,10 +1504,7 @@ pub async fn call_smf_deactivate_up_connection(
         .await
         .map_err(|e| SbiError::RequestFailed(format!("SMF UP deactivation failed: {e}")))?;
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "SMF UP deactivation returned status {}",
-            response.status
-        )));
+        return Err(status_failure("SMF UP deactivation", &response));
     }
     Ok(())
 }
@@ -1517,9 +1531,31 @@ pub(crate) const PEER_UPDATE_RETRY_AFTER_CAP: std::time::Duration =
 pub(crate) const PEER_UPDATE_RETRY_AFTER_CAP: std::time::Duration =
     std::time::Duration::from_millis(300);
 
+/// #1779 review M1: the error for a peer's non-success `response` to `what`,
+/// [`SbiError::TokenRefused`] when the peer's OAuth2 gate refused the token.
+fn token_refused(what: &str, response: &SbiResponse) -> SbiError {
+    SbiError::TokenRefused {
+        what: what.to_string(),
+        status: response.status,
+    }
+}
+
+/// The error for a peer's non-success `response` to the request `what`:
+/// `"{what} returned status {status}"`, or [`SbiError::TokenRefused`] when the
+/// peer's OAuth2 gate refused this AMF's token (#1779 review M1).
+fn status_failure(what: &str, response: &SbiResponse) -> SbiError {
+    if response.is_bearer_refusal() {
+        return token_refused(what, response);
+    }
+    SbiError::RequestFailed(format!("{what} returned status {}", response.status))
+}
+
 /// The error for a peer's non-success `response` to the request `what`, with its
 /// status and its `Retry-After` (delta-seconds; an HTTP-date is not parsed).
 fn peer_status(what: &str, response: &SbiResponse) -> SbiError {
+    if response.is_bearer_refusal() {
+        return token_refused(what, response);
+    }
     SbiError::PeerStatus {
         what: what.to_string(),
         status: response.status,
@@ -1563,7 +1599,10 @@ pub(crate) fn peer_update_retry_wait(n: u32, e: &SbiError) -> Option<std::time::
             }
         }
         SbiError::SmfRefused { status, .. } => retryable_status(*status).then_some(backoff),
-        SbiError::ResponseParseError(_) | SbiError::InvalidState => None,
+        // A 401/403 status was never retried (#1779 review M1 keeps that).
+        SbiError::ResponseParseError(_)
+        | SbiError::InvalidState
+        | SbiError::TokenRefused { .. } => None,
         SbiError::RequestFailed(_)
         | SbiError::Timeout
         | SbiError::GatewayTimeout
@@ -1659,10 +1698,7 @@ pub async fn call_smf_activate_up_connection(
         .await
         .map_err(|e| SbiError::RequestFailed(format!("SMF UP activation failed: {e}")))?;
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "SMF UP activation returned status {}",
-            response.status
-        )));
+        return Err(status_failure("SMF UP activation", &response));
     }
     let response_body: serde_json::Value = response
         .http
@@ -1927,10 +1963,7 @@ pub async fn call_smf_update_sm_context_n1_at(
         .await
         .map_err(|e| SbiError::RequestFailed(format!("SMF update (N1) failed: {e}")))?;
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "SMF update (N1) returned status {}",
-            response.status
-        )));
+        return Err(status_failure("SMF update (N1)", &response));
     }
     let response_body: serde_json::Value = response
         .http
@@ -2082,10 +2115,7 @@ pub async fn call_smf_release_sm_context(
         .map_err(|e| SbiError::RequestFailed(format!("SMF release failed: {e}")))?;
 
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "SMF release returned status {}",
-            response.status
-        )));
+        return Err(status_failure("SMF release", &response));
     }
 
     log::info!("SMF SM Context Released: ref={sm_context_ref}");
@@ -2144,10 +2174,7 @@ pub async fn call_smf_retrieve_sm_context(
         .map_err(|e| SbiError::RequestFailed(format!("SMF retrieve failed: {e}")))?;
 
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "SMF retrieve returned status {}",
-            response.status
-        )));
+        return Err(status_failure("SMF retrieve", &response));
     }
 
     let Some(content) = response.http.content.as_deref() else {
@@ -2250,10 +2277,7 @@ pub async fn call_ausf_authenticate_with_resync(
         .map_err(|e| SbiError::RequestFailed(format!("AUSF request failed: {e}")))?;
 
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "AUSF returned status {}",
-            response.status
-        )));
+        return Err(status_failure("AUSF", &response));
     }
 
     let response_body: serde_json::Value = match &response.http.content {
@@ -2328,10 +2352,7 @@ pub async fn call_ausf_5g_aka_confirm(
         .map_err(|e| SbiError::RequestFailed(format!("AUSF confirmation failed: {e}")))?;
 
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "AUSF confirmation returned status {}",
-            response.status
-        )));
+        return Err(status_failure("AUSF confirmation", &response));
     }
 
     let response_body: serde_json::Value = match &response.http.content {
@@ -3869,10 +3890,7 @@ pub async fn call_udm_sdm_get_am_data(
         .map_err(|e| SbiError::RequestFailed(format!("SDM am-data failed: {e}")))?;
 
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "SDM am-data returned status {}",
-            response.status
-        )));
+        return Err(status_failure("SDM am-data", &response));
     }
 
     let out = response
@@ -3971,10 +3989,7 @@ pub async fn call_udm_sdm_subscribe(
         .map_err(|e| SbiError::RequestFailed(format!("SDM subscribe failed: {e}")))?;
 
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "SDM subscribe returned status {}",
-            response.status
-        )));
+        return Err(status_failure("SDM subscribe", &response));
     }
 
     let sub_id = response
@@ -4021,10 +4036,7 @@ pub async fn call_pcf_am_policy_create(
         .map_err(|e| SbiError::RequestFailed(format!("AM policy create failed: {e}")))?;
 
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "AM policy create returned status {}",
-            response.status
-        )));
+        return Err(status_failure("AM policy create", &response));
     }
 
     let assoc_id = response
@@ -4124,10 +4136,7 @@ pub async fn call_pcf_ue_policy_create(
         .map_err(|e| SbiError::RequestFailed(format!("UE policy create failed: {e}")))?;
 
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "UE policy create returned status {}",
-            response.status
-        )));
+        return Err(status_failure("UE policy create", &response));
     }
 
     let assoc_id = response
@@ -4170,10 +4179,7 @@ pub async fn call_pcf_ue_policy_delete(
         .map_err(|e| SbiError::RequestFailed(format!("UE policy delete failed: {e}")))?;
 
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "UE policy delete returned status {}",
-            response.status
-        )));
+        return Err(status_failure("UE policy delete", &response));
     }
 
     log::info!("Npcf_UEPolicyControl_Delete OK (polAssoId={pol_asso_id})");
@@ -4285,10 +4291,7 @@ pub async fn call_udm_sdm_unsubscribe(
         .await
         .map_err(|e| SbiError::RequestFailed(format!("SDM unsubscribe failed: {e}")))?;
     if !response.is_success() && response.status != 404 {
-        return Err(SbiError::RequestFailed(format!(
-            "SDM unsubscribe returned status {}",
-            response.status
-        )));
+        return Err(status_failure("SDM unsubscribe", &response));
     }
     log::info!("[{supi}] Nudm_SDM_Unsubscribe OK (subscriptionId={subscription_id})");
     Ok(())
@@ -4312,10 +4315,7 @@ pub async fn call_pcf_am_policy_delete(
         .map_err(|e| SbiError::RequestFailed(format!("AM policy delete failed: {e}")))?;
 
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "AM policy delete returned status {}",
-            response.status
-        )));
+        return Err(status_failure("AM policy delete", &response));
     }
 
     log::info!("Npcf_AMPolicyControl_Delete OK (polAssoId={pol_asso_id})");
@@ -4440,10 +4440,7 @@ pub async fn call_udm_uecm_deregistration(
         .map_err(|e| SbiError::RequestFailed(format!("UECM deregistration failed: {e}")))?;
 
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "UECM deregistration returned status {}",
-            response.status
-        )));
+        return Err(status_failure("UECM deregistration", &response));
     }
     log::info!("[{supi}] Nudm_UECM amf-3gpp-access purge OK");
     Ok(())

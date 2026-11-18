@@ -22963,6 +22963,11 @@ fn gmm_cause_from_sbi_error(err: &crate::sbi_path::SbiError) -> GmmCause {
         SbiError::PeerStatus { what, status, .. } => gmm_cause_from_sbi_error(
             &SbiError::RequestFailed(format!("{what} returned status {status}")),
         ),
+        // #1779 review M1: the peer refused this AMF's access token. That is the
+        // core's misconfiguration, not the UE's subscription, so it gets the cause
+        // the 401 it used to be got, never #7 (which has the UE treat its USIM as
+        // invalid for 5GS until switched off, TS 24.501 §5.5.1.2.5).
+        SbiError::TokenRefused { .. } => GmmCause::PayloadWasNotForwarded,
     }
 }
 
@@ -24608,6 +24613,70 @@ mod tests {
             gmm_cause_from_sbi_error(&SbiError::GatewayTimeout),
             GmmCause::PayloadWasNotForwarded
         );
+    }
+
+    /// #1779 review M1: a UDM whose OAuth2 gate refuses the AMF's token for scope
+    /// (a 403 since #1766) must not turn into Registration Reject #7, which has the
+    /// UE treat its USIM as invalid for 5GS until switched off (TS 24.501
+    /// §5.5.1.2.5). The UDM's own 403 still does. Drives the real SDM am-data call
+    /// against a stub UDM, then the mapping the registration path applies to its
+    /// error (ngap_path.rs, the am-data arm of the Registration Reject).
+    #[tokio::test]
+    async fn a_udm_token_refusal_is_not_registration_reject_7_1779() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        server
+            .start(|req: nextgcore_sbi::message::SbiRequest| async move {
+                let forbidden = nextgcore_sbi::message::SbiResponse::with_status(403);
+                if req.header.uri.contains("imsi-scope") {
+                    forbidden
+                        .with_body(r#"{"status":403}"#, "application/problem+json")
+                        .with_header(
+                            "WWW-Authenticate",
+                            r#"Bearer realm="5gc-sbi", error="insufficient_scope", scope="nudm-sdm""#,
+                        )
+                } else {
+                    forbidden.with_body(
+                        r#"{"status":403,"cause":"ROAMING_NOT_ALLOWED"}"#,
+                        "application/problem+json",
+                    )
+                }
+            })
+            .await
+            .expect("start stub UDM");
+        let run = async {
+            let port = addr.port();
+            let err = crate::sbi_path::call_udm_sdm_get_am_data("127.0.0.1", port, "imsi-scope")
+                .await
+                .expect_err("refused");
+            assert!(
+                matches!(
+                    err,
+                    crate::sbi_path::SbiError::TokenRefused { status: 403, .. }
+                ),
+                "{err:?}"
+            );
+            assert_eq!(
+                gmm_cause_from_sbi_error(&err),
+                GmmCause::PayloadWasNotForwarded
+            );
+            // Control: the UDM's own 403 is still #7.
+            let err = crate::sbi_path::call_udm_sdm_get_am_data("127.0.0.1", port, "imsi-barred")
+                .await
+                .expect_err("refused");
+            assert_eq!(
+                gmm_cause_from_sbi_error(&err),
+                GmmCause::FiveGsServicesNotAllowed
+            );
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("round trip timed out");
+        server.stop().await.ok();
     }
 
     #[test]
