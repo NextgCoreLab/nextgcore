@@ -1077,7 +1077,8 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
         );
     };
 
-    let sm_context_ref = format!("{}", sess.index);
+    // #1860: unguessable, like every other SM context reference.
+    let sm_context_ref = context::mint_sm_context_ref(sess.index);
     // #894 review m1: serialised with PREPARED, COMPLETED and CANCELLED of the same SM
     // context, and the session re-read under the lock.
     let _procedure = handover_lock(&sm_context_ref).await;
@@ -1299,6 +1300,7 @@ async fn handle_create_inner(body: &serde_json::Value) -> SbiResponse {
                         ambr_ul_bps: sess.session_ambr.uplink,
                         ambr_dl_bps: sess.session_ambr.downlink,
                         sm_context_status_uri: sess.sm_context_status_uri.clone(),
+                        serving_amf: None,
                         fsm,
                         easdf_dns_context_id: None,
                         easdf_reported_eas: Vec::new(),

@@ -330,6 +330,17 @@ reference is read back out of the session rather than computed alongside it beca
 `sess_add_by_psi` mints it from the *same* counter — computing both would consume the
 counter twice and leave the handler's reference one behind the session's.
 
+**Serving-AMF binding (#1860).** The `smContextRef` is `{index}-{32 random hex}`, so
+one reference says nothing about another, and only the full string resolves. Each SM
+context is bound to the verified identity of the AMF that created it: the access
+token's `sub`, or its client certificate's NF Instance ID (not an SCP's). The binding
+is persisted with the policy binding. Modify, release and retrieve from any other
+caller are refused `403` before the handler runs. An AMF change (TS 29.502 Table
+6.1.6.2.3-1: `servingNfId` with the new `smContextStatusUri`) is admitted only from the
+new AMF itself, whose verified identity must be that `servingNfId`. A context created
+with no verified identity (the `dev` profile), or restored from a snapshot written
+before #1860, is not bound.
+
 A create that fails after registration **rolls the registration back**. An abandoned
 registration would be an SM context the AMF never learned about and will never
 release.
