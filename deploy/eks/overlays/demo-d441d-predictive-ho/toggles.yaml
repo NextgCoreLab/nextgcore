@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nextg-demo-toggles
+data:
+  key: d441d-predictive-ho
+  # Both gNBs, with the same mode: gnb-west is the source the demo is measured
+  # at, and gnb-east runs the same arm so a hand-back is the arm's too. amfd
+  # reads no block (its HandoverNotify line is base core, nextgcore#1414).
+  targets: gnb.yaml gnb-east.yaml
