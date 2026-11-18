@@ -749,6 +749,8 @@ pub fn handle_event_subscribe(
         reported_location: None,
         taken_over: false,
         rep_period: None,
+        max_reports: None,
+        reports_made: std::collections::HashMap::new(),
         one_time: false,
         first_location_pending: false,
         reporting_threshold: None,

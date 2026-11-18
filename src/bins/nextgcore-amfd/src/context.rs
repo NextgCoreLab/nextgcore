@@ -1278,6 +1278,15 @@ pub struct EventSubscription {
     /// or according to the requested period respectively"). `None` for ONE_TIME and
     /// CONTINUOUS.
     pub rep_period: Option<std::time::Duration>,
+    /// #1832: the maximum number of reports each subscribed event may generate
+    /// (TS 29.518 Table 6.2.6.2.6-1 `options.maxReports`, which has precedence over
+    /// `AmfEvent.maxReports`, NOTE 2 of Table 6.2.6.2.3-1; `29518-k00.txt:21777-21779`),
+    /// per member UE of a group or any-UE subscription. `None`: no maximum.
+    pub max_reports: Option<u32>,
+    /// #1832: the reports generated so far, per (event type, reported UE identity;
+    /// empty for an area-level report). Owned by the store: an update keeps the
+    /// stored counts. Bounded as [`Self::reported_reachability`] is.
+    pub reports_made: std::collections::HashMap<(String, String), u32>,
     /// The event reporting mode is ONE_TIME (`options.trigger`, TS 29.518
     /// §6.2.6.2.4 AmfEventMode; #1760). Such a subscription is told once: *"the AMF
     /// shall not do any subsequent event notification"* (`29518-k00.txt:5716-5719`).
@@ -1289,6 +1298,16 @@ pub struct EventSubscription {
     /// While set, no location change is reported to it; the page's outcome reports
     /// the current location (the UE answered) or the last known one (it did not).
     pub first_location_pending: bool,
+}
+
+/// #1832: what [`AmfContext::event_subscription_claim_report`] decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportClaim {
+    /// The report may be sent. `ended`: it was the subscription's last, and the
+    /// subscription was removed.
+    Granted { ended: bool },
+    /// The event has made its maximum number of reports for this UE: not sent.
+    Refused,
 }
 
 /// A UE location as the LOCATION_REPORT change gate compares it (#1424, #1737): the
@@ -3045,6 +3064,61 @@ impl AmfContext {
             .is_some()
     }
 
+    /// #1832: claim one report of `event_type` about `ue` (its reported identity,
+    /// empty for an area-level report) for subscription `subscription_id`, against
+    /// its `maxReports`. A subscription that is gone claims what its clone `max`
+    /// says: unlimited without a maximum (a ONE_TIME one claimed and removed), else
+    /// refused (it ended on its maximum).
+    ///
+    /// An individual-UE subscription whose every event has made its maximum ends
+    /// (*"until the subscription to this event ends, due to ... the maximum number of
+    /// reports"*, Table 6.2.6.3.3-1), so it is removed, and the claim says so.
+    pub fn event_subscription_claim_report(
+        &self,
+        subscription_id: &str,
+        max: Option<u32>,
+        event_type: &str,
+        ue: &str,
+    ) -> ReportClaim {
+        let Ok(mut subs) = self.event_subscriptions.write() else {
+            return ReportClaim::Granted { ended: false };
+        };
+        let Some(sub) = subs.get_mut(subscription_id) else {
+            return if max.is_some() {
+                ReportClaim::Refused
+            } else {
+                ReportClaim::Granted { ended: false }
+            };
+        };
+        let Some(max) = sub.max_reports else {
+            return ReportClaim::Granted { ended: false };
+        };
+        let key = (event_type.to_string(), ue.to_string());
+        let made = sub.reports_made.get(&key).copied().unwrap_or(0);
+        if made >= max {
+            return ReportClaim::Refused;
+        }
+        if !sub.reports_made.contains_key(&key)
+            && sub.reports_made.len() >= MAX_REPORTED_REACHABILITY
+        {
+            if let Some(k) = sub.reports_made.keys().next().cloned() {
+                sub.reports_made.remove(&k);
+            }
+        }
+        sub.reports_made.insert(key, made + 1);
+        let individual = !sub.any_ue && sub.group_id.is_none();
+        let ended = individual
+            && sub.event_types.iter().all(|t| {
+                sub.reports_made
+                    .iter()
+                    .any(|((e, _), n)| e == t && *n >= max)
+            });
+        if ended {
+            subs.remove(subscription_id);
+        }
+        ReportClaim::Granted { ended }
+    }
+
     /// Find an event-exposure subscription by ID (clone-out, lock dropped)
     pub fn event_subscription_find(&self, subscription_id: &str) -> Option<EventSubscription> {
         self.event_subscriptions
@@ -3070,6 +3144,8 @@ impl AmfContext {
                 sub.reported_location = e.get_mut().reported_location.take();
                 // #1760: and whether its first report still waits on a page.
                 sub.first_location_pending = e.get().first_location_pending;
+                // #1832: and the reports it has generated.
+                sub.reports_made = std::mem::take(&mut e.get_mut().reports_made);
                 e.insert(sub);
                 return true;
             }
@@ -3122,6 +3198,12 @@ impl AmfContext {
                             }
                         }
                         if !s.event_types.iter().any(|t| t == event_type) {
+                            return false;
+                        }
+                        // #1832: what the fire points report is a change; a
+                        // PERIODIC subscription is reported on its period instead
+                        // (TS 29.518 §5.3.2.2.2; AmfEventTrigger PERIODIC).
+                        if s.rep_period.is_some() {
                             return false;
                         }
                         // UE filter: any-UE subscriptions match everything; a
