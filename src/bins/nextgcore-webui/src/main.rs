@@ -8,6 +8,7 @@
 //! nextgcore-webui --db-uri mongodb://localhost:27017 --db-name nextgcore --port 3000
 //! ```
 
+use nextgcore_sbi::security::{SbiProfile, SBI_PROFILE_ENV};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -87,7 +88,8 @@ struct Args {
     ///
     /// The insecure path is the explicit opt-in and secure is the default, never
     /// the other way round: this interface can read and write permanent
-    /// subscriber key material.
+    /// subscriber key material. Refused unless NEXTGCORE_SBI_PROFILE selects the
+    /// dev profile (#1871): unset is production.
     #[arg(long)]
     insecure_dev: bool,
 }
@@ -101,6 +103,27 @@ const API_TOKEN_ENV: &str = "NEXTGCORE_WEBUI_API_TOKEN";
 /// Not a strength estimate — just a floor that rejects obviously-placeholder
 /// values like `test` or `secret` that would otherwise pass for a credential.
 const MIN_API_TOKEN_LEN: usize = 16;
+
+/// Refuse `--insecure-dev` under the production SBI profile (#1871).
+///
+/// `--insecure-dev` drops both TLS and the `/api` token, and that API reads and
+/// writes K / OPc. TS 33.117 §4.2.5.1 (no cleartext authentication material) and
+/// §4.2.3.2.4 (no unauthenticated management access) leave no production use for
+/// it, so a deployment whose profile is production, which an unset
+/// `NEXTGCORE_SBI_PROFILE` is, cannot start with it. A lab opts in by name with
+/// `NEXTGCORE_SBI_PROFILE=dev`, as every NF does.
+fn check_insecure_dev_allowed(args: &Args, profile: SbiProfile) -> Result<()> {
+    if args.insecure_dev && profile.is_production() {
+        anyhow::bail!(
+            "refusing to start: --insecure-dev disables TLS and the /api token on the \
+             subscriber key provisioning API, and the SBI profile is production \
+             ({SBI_PROFILE_ENV} unset or production). Drop --insecure-dev and supply \
+             --tls-cert/--tls-key and an API token, or set {SBI_PROFILE_ENV}=dev for \
+             local development."
+        );
+    }
+    Ok(())
+}
 
 /// Resolve the `/api` bearer token, or explain why startup must fail.
 ///
@@ -1068,6 +1091,10 @@ async fn main() -> Result<()> {
 
     log::info!("Starting NextGCore WebUI on {}:{}", args.listen, args.port);
 
+    // #1871: --insecure-dev is a dev-profile flag; production refuses it before
+    // anything else is resolved.
+    check_insecure_dev_allowed(&args, SbiProfile::resolve())?;
+
     // Issue #118: resolve credentials BEFORE binding, so an unauthenticated
     // provisioning API never reaches the point of accepting a connection.
     let api_token = resolve_api_token(&args)?;
@@ -1598,6 +1625,8 @@ mod tests {
         // --insecure-dev is the ONLY way to get there.
         let mut dev = base();
         dev.insecure_dev = true;
+        // #1871: and only under the dev SBI profile.
+        assert!(check_insecure_dev_allowed(&dev, SbiProfile::Dev).is_ok());
         assert!(matches!(resolve_api_token(&dev), Ok(None)));
         assert!(matches!(resolve_tls(&dev), Ok(None)));
 
@@ -1807,6 +1836,30 @@ mod tests {
             "API calls must go through api(), which attaches the bearer token"
         );
         assert!(html.contains("'Authorization':'Bearer '+apiToken()"));
+    }
+
+    /// #1871: `--insecure-dev` is refused under the production SBI profile, which
+    /// an unset `NEXTGCORE_SBI_PROFILE` resolves to; dev allows it, and a secure
+    /// start is unaffected by the profile.
+    #[test]
+    fn insecure_dev_is_refused_under_the_production_profile_1871() {
+        let args = |insecure_dev| Args {
+            db_uri: "mongodb://localhost:27017".to_string(),
+            db_name: "nextgcore".to_string(),
+            port: 3000,
+            listen: "127.0.0.1".to_string(),
+            api_token_file: None,
+            tls_cert: Some("/tls/webui.crt".to_string()),
+            tls_key: Some("/tls/webui.key".to_string()),
+            insecure_dev,
+        };
+        let unset = SbiProfile::from_env_value(None);
+        assert_eq!(unset, SbiProfile::Production);
+        let err = check_insecure_dev_allowed(&args(true), unset).unwrap_err();
+        assert!(err.to_string().contains("--insecure-dev"), "{err}");
+        assert!(check_insecure_dev_allowed(&args(true), SbiProfile::Production).is_err());
+        assert!(check_insecure_dev_allowed(&args(true), SbiProfile::Dev).is_ok());
+        assert!(check_insecure_dev_allowed(&args(false), SbiProfile::Production).is_ok());
     }
 }
 
