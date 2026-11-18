@@ -5220,7 +5220,17 @@ impl NgapServer {
         ran_ue_ngap_id: u32,
         resync: Option<([u8; 16], [u8; 14])>,
     ) -> Result<()> {
-        let Some(mut state) = self.ue_auth_state.remove(amf_ue_ngap_id) else {
+        // #1774: the record stays in the store while the AUSF answers. An SBI callback
+        // in that window (a PCF termination, an EBI assignment) is applied to it and is
+        // in the record taken after the answer, rather than refused for an unknown UE.
+        let Some((suci, snn)) = self.ue_auth_state.get(amf_ue_ngap_id).map(|state| {
+            // Serving network name from the serving PLMN (TS 24.501 / TS 33.501
+            // 6.1.1.4), augmented with the NID when this is an SNPN (Annex I.3.2, #115).
+            (
+                state.suci.clone(),
+                serving_network_name_for_ue(&state.amf_ue),
+            )
+        }) else {
             return Ok(());
         };
 
@@ -5229,19 +5239,14 @@ impl NgapServer {
                 .await
                 .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
 
-        // Serving network name from the serving PLMN (TS 24.501 / TS 33.501 6.1.1.4),
-        // augmented with the NID when this is an SNPN (Annex I.3.2, #115).
-        let snn = serving_network_name_for_ue(&state.amf_ue);
-
-        match crate::sbi_path::call_ausf_authenticate_with_resync(
-            &ausf_host,
-            ausf_port,
-            &state.suci,
-            &snn,
-            resync,
+        let answer = crate::sbi_path::call_ausf_authenticate_with_resync(
+            &ausf_host, ausf_port, &suci, &snn, resync,
         )
-        .await
-        {
+        .await;
+        let Some(mut state) = self.ue_auth_state.remove(amf_ue_ngap_id) else {
+            return Ok(());
+        };
+        match answer {
             Ok(auth_resp) => {
                 state.auth_ctx_id = auth_resp.auth_ctx_id;
                 state.amf_ue.rand = auth_resp.rand;
@@ -5584,20 +5589,26 @@ impl NgapServer {
         // so it is exactly as diagnostic as the reject branch above.
         log::info!("UE {amf_ue_ngap_id} HXRES* verification passed");
 
-        // 5G-AKA confirmation toward AUSF -> KSEAF + SUPI
+        // 5G-AKA confirmation toward AUSF -> KSEAF + SUPI.
+        //
+        // #1774: the record goes back in the store while the AUSF confirms, and is taken
+        // again after, so an SBI callback in that window is applied to the record this
+        // procedure goes on with, rather than refused for an unknown UE.
+        let auth_ctx_id = state.auth_ctx_id.clone();
+        self.ue_auth_state.insert(amf_ue_ngap_id, state);
         let (ausf_host, ausf_port) =
             crate::sbi_path::resolve_nf_endpoint_async(crate::sbi_path::SbiServiceType::NausfAuth)
                 .await
                 .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
+        let confirmed =
+            crate::sbi_path::call_ausf_5g_aka_confirm(&ausf_host, ausf_port, &auth_ctx_id, &rs)
+                .await;
+        let Some(mut state) = self.ue_auth_state.remove(amf_ue_ngap_id) else {
+            log::warn!("UE {amf_ue_ngap_id} gone while the AUSF confirmed its authentication");
+            return Ok(());
+        };
 
-        let confirm = match crate::sbi_path::call_ausf_5g_aka_confirm(
-            &ausf_host,
-            ausf_port,
-            &state.auth_ctx_id,
-            &rs,
-        )
-        .await
-        {
+        let confirm = match confirmed {
             Ok(c) => c,
             Err(e) => {
                 log::error!("AUSF 5G-AKA confirmation failed: {e}");

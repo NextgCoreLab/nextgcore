@@ -132,12 +132,15 @@ impl<T: Clone + UeIdentity> UeStore<T> {
 
     /// Replace an existing record, returning whether one was there to replace.
     ///
-    /// The read-modify-write partner of [`UeStore::get`], for a caller that had
-    /// to `.await` in between and so could not hold a lock. Note the semantics
-    /// that follow: a concurrent mutation between the `get` and the `update` is
-    /// overwritten. Every caller in `ngap_path` is on the single-threaded NGAP
-    /// receive loop for one UE's procedure, so there is no second writer for the
-    /// same key — but this is the reason `with_mut` is preferred where it fits.
+    /// The read-modify-write partner of [`UeStore::get`]. Note the semantics that
+    /// follow: a mutation between the `get` and the `update` is overwritten. The
+    /// NGAP task is NOT the record's only writer: the Namf SBI handlers write it
+    /// too, through [`UeStore::with_mut`] (a PCF termination, an EBI assignment,
+    /// `AmfContext::amf_ue_update`), on other tasks and at any time. So never hold
+    /// a clone across an `.await` and write it back: a callback applied in between,
+    /// and already answered, would be lost (#1774). Write the fields a procedure
+    /// owns with `with_mut`, or put the record back before the `.await` and take
+    /// it again after.
     pub fn update(&self, amf_ue_ngap_id: u64, ue: T) -> bool {
         let mut guard = self.write();
         if let std::collections::hash_map::Entry::Occupied(mut e) = guard.entry(amf_ue_ngap_id) {

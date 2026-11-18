@@ -670,3 +670,219 @@ async fn a_successful_initial_registration_stops_the_answered_page_1698() {
     );
     server.forget_ue(new);
 }
+
+// ---- #1774: an SBI callback while the procedure waits on the AUSF ----
+
+/// A stand-in AUSF that holds each answer until `release` is notified, and
+/// notifies `seen` when a request arrives. It answers an authentication with a
+/// vector whose HXRES* is that of [`RES_STAR`] for RAND `0x3C..`, and a 5G-AKA
+/// confirmation with AUTHENTICATION_SUCCESS for `supi`. Keep the server alive.
+async fn holding_ausf_1774(
+    supi: &str,
+) -> (
+    nextgcore_sbi::server::SbiServer,
+    u16,
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+) {
+    use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+    use sha2::{Digest, Sha256};
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+    let rand = [0x3Cu8; 16];
+    let digest = Sha256::new()
+        .chain_update(rand)
+        .chain_update(RES_STAR)
+        .finalize();
+    let vector = serde_json::json!({
+        "authType": "5G_AKA",
+        "5gAuthData": {
+            "rand": hex::encode(rand),
+            "autn": hex::encode([0x11u8; 16]),
+            "hxresStar": hex::encode(&digest[16..32]),
+        },
+    })
+    .to_string();
+    let confirmation = serde_json::json!({
+        "authResult": "AUTHENTICATION_SUCCESS",
+        "supi": supi,
+        "kseaf": hex::encode([0x77u8; 32]),
+    })
+    .to_string();
+    let (seen, release) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let server = nextgcore_sbi::server::SbiServer::on_listener(
+        nextgcore_sbi::server::SbiServerConfig::new(addr),
+        listener,
+    );
+    let (arrived, gate) = (seen.clone(), release.clone());
+    server
+        .start(move |req: SReq| {
+            let (vector, confirmation) = (vector.clone(), confirmation.clone());
+            let (arrived, gate) = (arrived.clone(), gate.clone());
+            async move {
+                let uri = req.header.uri.clone();
+                let answer = if uri.ends_with("/5g-aka-confirmation") {
+                    SResp::with_status(200).with_body(confirmation, "application/json")
+                } else if uri.ends_with("/ue-authentications") {
+                    SResp::with_status(201)
+                        .with_body(vector, "application/json")
+                        .with_header(
+                            "location",
+                            "http://127.0.0.1/nausf-auth/v1/ue-authentications/ctx-1774",
+                        )
+                } else {
+                    return SResp::with_status(404);
+                };
+                arrived.notify_one();
+                gate.notified().await;
+                answer
+            }
+        })
+        .await
+        .expect("stand-in AUSF starts");
+    for _ in 0..200 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    (server, addr.port(), seen, release)
+}
+
+/// Give `amf_ue_ngap_id` the SUPI `supi` and an AM policy association `pa-1774`
+/// whose notificationUri carries the token `amp-1774` (#1518).
+fn hold_am_policy_1774(server: &mut NgapServer, amf_ue_ngap_id: u64, supi: &str) {
+    server.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
+        s.amf_ue.supi = Some(supi.to_string());
+        s.policy_association_id = Some("pa-1774".to_string());
+        s.amf_ue.policy_association.id = Some("pa-1774".to_string());
+        s.amf_ue.policy_association.notify_token = Some("amp-1774".to_string());
+    });
+}
+
+/// The PCF's Npcf_AMPolicyControl TerminationNotification for `pa-1774`, once the
+/// AUSF has the procedure's request; then the AUSF answers. The status it got.
+async fn terminate_while_the_ausf_holds_1774(
+    supi: &str,
+    seen: &tokio::sync::Notify,
+    release: &tokio::sync::Notify,
+) -> u16 {
+    seen.notified().await;
+    let status = crate::namf_server::namf_request_handler(
+        nextgcore_sbi::message::SbiRequest::post(format!(
+            "/namf-callback/v1/{supi}/am-policy-notify/amp-1774/terminate"
+        ))
+        .with_body(
+            serde_json::json!({
+                "resourceUri": "http://127.0.0.1:9/npcf-am-policy-control/v1/policies/pa-1774",
+                "cause": "UE_SUBSCRIPTION",
+            })
+            .to_string(),
+            "application/json",
+        ),
+    )
+    .await
+    .status;
+    release.notify_one();
+    status
+}
+
+fn am_policy_of_1774(server: &NgapServer, amf_ue_ngap_id: u64) -> (Option<String>, Option<String>) {
+    let s = server.ue_auth_state.get(amf_ue_ngap_id).expect("the UE");
+    (
+        s.policy_association_id.clone(),
+        s.amf_ue.policy_association.id.clone(),
+    )
+}
+
+/// #1774: a PCF termination that arrives while `start_authentication` waits on the
+/// AUSF is applied and answered 204, and its effect is still on the record once
+/// the procedure has gone on (the Authentication Request is sent). Before, the
+/// procedure held the record out of the store across the AUSF call: the
+/// termination found no UE (404), and the association the PCF ended stayed on
+/// the record.
+///
+/// REVERT-VERIFIED: with `start_authentication` taking the record out before the
+/// AUSF call, "applied while the AUSF answers" fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_callback_while_authentication_waits_on_the_ausf_is_kept_1774() {
+    let supi = "imsi-001010000177401";
+    let (_ausf, ausf_port, seen, release) = holding_ausf_1774(supi).await;
+    let _env = AusfEnvGuard::acquire(ausf_port).await;
+    // The context first: the server shares its UE store with the Namf router, and an
+    // init after the server is built would leave the two on different stores.
+    crate::context::amf_context_init(64, 1024, 4096);
+    let mut server = capturing_ngap_server().await;
+    let id = 7_774_401u64;
+    secured_registered_ue(&mut server, id, 71);
+    hold_am_policy_1774(&mut server, id, supi);
+
+    let (auth, status) = tokio::join!(
+        server.start_authentication(ASSOC, id, 71, None),
+        terminate_while_the_ausf_holds_1774(supi, &seen, &release),
+    );
+    auth.expect("start_authentication");
+    assert_eq!(status, 204, "applied while the AUSF answers");
+    assert_eq!(
+        am_policy_of_1774(&server, id),
+        (None, None),
+        "and kept after it"
+    );
+    let s = server.ue_auth_state.get(id).expect("the UE");
+    assert_eq!(
+        s.auth_ctx_id, "ctx-1774",
+        "the procedure went on with the AUSF's answer"
+    );
+    assert!(
+        s.retx.is_some(),
+        "the Authentication Request is sent, under T3560"
+    );
+    server.ue_auth_state.remove(id);
+}
+
+/// #1774: the same for the 5G-AKA confirmation `handle_authentication_response_nas`
+/// waits on: the termination is applied, and the registration goes on from the
+/// record that holds it.
+///
+/// REVERT-VERIFIED: with the record kept out of the store across the confirmation,
+/// "applied while the AUSF confirms" fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_callback_while_the_ausf_confirms_is_kept_1774() {
+    let supi = "imsi-001010000177402";
+    let (_ausf, ausf_port, seen, release) = holding_ausf_1774(supi).await;
+    let _env = AusfEnvGuard::acquire(ausf_port).await;
+    // The context first: the server shares its UE store with the Namf router, and an
+    // init after the server is built would leave the two on different stores.
+    crate::context::amf_context_init(64, 1024, 4096);
+    let mut server = capturing_ngap_server().await;
+    let id = 7_774_402u64;
+    authenticating_ue(
+        &mut server,
+        id,
+        72,
+        crate::gmm_build::registration_type::MOBILITY_UPDATING,
+    );
+    hold_am_policy_1774(&mut server, id, supi);
+
+    let response = authentication_response();
+    let (auth, status) = tokio::join!(
+        server.handle_authentication_response_nas(ASSOC, id, 72, &response),
+        terminate_while_the_ausf_holds_1774(supi, &seen, &release),
+    );
+    auth.expect("handle_authentication_response_nas");
+    assert_eq!(status, 204, "applied while the AUSF confirms");
+    assert_eq!(
+        am_policy_of_1774(&server, id),
+        (None, None),
+        "and kept after it"
+    );
+    let s = server.ue_auth_state.get(id).expect("the UE");
+    assert_ne!(
+        s.amf_ue.kamf, [0u8; 32],
+        "the procedure went on: K_AMF is derived"
+    );
+    server.ue_auth_state.remove(id);
+}
