@@ -358,28 +358,148 @@ impl OAuthVerifier {
     /// producer can bind an authorization decision to the caller rather than
     /// merely to "a valid token exists" (issue #94). The claims used to be
     /// dropped here.
+    ///
+    /// #1766: a refusal says WHICH of TS 29.500 §6.7.3's cases it is, so the
+    /// server can answer each with its own status and challenge. The signature
+    /// and expiry are checked first and alone, so only a token that is genuinely
+    /// this NRF's and current can reach the audience and scope checks.
     async fn authorize(
         &self,
         auth_header: Option<&str>,
         required_scope: Option<&str>,
-    ) -> SbiResult<String> {
-        let aud = self.expected_audience.as_deref();
+    ) -> Result<String, BearerRefusal> {
         let claims = match &self.keys {
-            OAuthKeySource::Static(jwks) => {
-                crate::oauth::authorize_bearer_aud(auth_header, jwks, aud)?
-            }
-            OAuthKeySource::Remote(cache) => cache.authorize_aud(auth_header, aud).await?,
-            OAuthKeySource::Unconfigured => {
-                return Err(SbiError::ServerError(
-                    "require_oauth2 is enabled but neither oauth2_jwks nor oauth2_jwks_uri is configured".into(),
-                ))
-            }
+            OAuthKeySource::Static(jwks) => crate::oauth::authorize_bearer_aud(auth_header, jwks, None),
+            OAuthKeySource::Remote(cache) => cache.authorize_aud(auth_header, None).await,
+            OAuthKeySource::Unconfigured => Err(SbiError::ServerError(
+                "require_oauth2 is enabled but neither oauth2_jwks nor oauth2_jwks_uri is configured"
+                    .into(),
+            )),
         };
+        let claims = match claims {
+            Ok(claims) => claims,
+            Err(e @ SbiError::AuthorizationFailed(_)) if !bearer_presented(auth_header) => {
+                return Err(BearerRefusal::Absent(e.to_string()))
+            }
+            Err(e @ SbiError::AuthorizationFailed(_)) => {
+                return Err(BearerRefusal::InvalidToken(e.to_string()))
+            }
+            Err(e) => return Err(BearerRefusal::KeysUnavailable(e.to_string())),
+        };
+        if let Some(aud) = self.expected_audience.as_deref() {
+            if let Err(e) = crate::oauth::check_audience(&claims.aud, aud) {
+                return Err(BearerRefusal::ClaimMismatch {
+                    claim: "aud",
+                    detail: e.to_string(),
+                });
+            }
+        }
         if let Some(scope) = required_scope {
-            crate::oauth::check_token_scope(&claims.scope, scope)?;
+            if let Err(e) = crate::oauth::check_token_scope(&claims.scope, scope) {
+                return Err(BearerRefusal::InsufficientScope {
+                    scope: scope.to_string(),
+                    detail: e.to_string(),
+                });
+            }
         }
         Ok(claims.sub)
     }
+}
+
+/// Whether the request presented a Bearer token at all (#1766). TS 29.500
+/// §6.7.3: a request that "did not contain a token" is answered without an
+/// `error` attribute. A request using another scheme carries no Bearer token
+/// either (RFC 6750 §3.1), and nor does a bare `Bearer` with nothing after it.
+/// Same test as nrfd's `oauth2_gate`.
+fn bearer_presented(auth_header: Option<&str>) -> bool {
+    auth_header.is_some_and(|h| {
+        h.trim()
+            .get(..7)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("bearer "))
+    })
+}
+
+/// Why the OAuth2 gate refused a request (#1766). Each case has its own answer
+/// in TS 29.500 §6.7.3, and a consumer tells them apart by status and the
+/// challenge's `error` (RFC 6750 §3.1): only `invalid_token` means a fresh token
+/// may succeed, which is what nextgcore's own client acts on (#1676).
+#[derive(Debug)]
+enum BearerRefusal {
+    /// No Bearer token: 401, challenge without `error`.
+    Absent(String),
+    /// Malformed, forged, unknown-key or expired: 401 `invalid_token`.
+    InvalidToken(String),
+    /// A valid token whose `claim` names another producer: 403
+    /// `ACCESS_TOKEN_CLAIM_MISMATCH` naming the claim.
+    ClaimMismatch { claim: &'static str, detail: String },
+    /// A valid token whose scope lacks the invoked service: 403
+    /// `insufficient_scope` naming the scope needed.
+    InsufficientScope { scope: String, detail: String },
+    /// The verification keys could not be obtained: our fault, 503.
+    KeysUnavailable(String),
+}
+
+impl BearerRefusal {
+    /// The response TS 29.500 §6.7.3 prescribes for this refusal.
+    fn into_response(self) -> SbiResponse {
+        let challenge = |error: Option<&str>, extra: Option<String>| {
+            let mut c = String::from("Bearer realm=\"5gc-sbi\"");
+            if let Some(e) = error {
+                c.push_str(&format!(", error=\"{e}\""));
+            }
+            if let Some(x) = extra {
+                c.push_str(&x);
+            }
+            c
+        };
+        let problem = |status: u16, title: &str, detail: &str| serde_json::json!({ "title": title, "status": status, "detail": detail });
+        let (status, body, www) = match self {
+            Self::Absent(detail) => (
+                401,
+                problem(401, "Unauthorized", &detail),
+                Some(challenge(None, None)),
+            ),
+            Self::InvalidToken(detail) => {
+                let description = format!(", error_description=\"{}\"", challenge_text(&detail));
+                let www = challenge(Some("invalid_token"), Some(description));
+                (401, problem(401, "Unauthorized", &detail), Some(www))
+            }
+            Self::ClaimMismatch { claim, detail } => {
+                let mut body = problem(403, "Forbidden", &detail);
+                body["cause"] = "ACCESS_TOKEN_CLAIM_MISMATCH".into();
+                body["invalidParams"] = serde_json::json!([{ "param": claim }]);
+                (403, body, Some(challenge(Some("invalid_token"), None)))
+            }
+            Self::InsufficientScope { scope, detail } => {
+                let scope = format!(", scope=\"{}\"", challenge_text(&scope));
+                let www = challenge(Some("insufficient_scope"), Some(scope));
+                (403, problem(403, "Forbidden", &detail), Some(www))
+            }
+            Self::KeysUnavailable(detail) => {
+                (503, problem(503, "Service Unavailable", &detail), None)
+            }
+        };
+        let resp = SbiResponse::with_status(status)
+            .with_body(body.to_string(), "application/problem+json");
+        match www {
+            Some(www) => resp.with_header("WWW-Authenticate", www),
+            None => resp,
+        }
+    }
+}
+
+/// `text` restricted to what an RFC 6750 §3 challenge attribute may carry
+/// (%x20-21 / %x23-5B / %x5D-7E): a double quote or backslash would end or
+/// escape the quoted string, so each becomes a single quote. A token's `aud`
+/// is quoted JSON, and used to break the header.
+fn challenge_text(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '"' | '\\' => '\'',
+            ' '..='~' => c,
+            _ => '?',
+        })
+        .collect()
 }
 
 /// Hyper service wrapper
@@ -566,28 +686,11 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
                     // Record the identity THIS PROCESS verified, so a producer can
                     // bind authorization to the caller (issue #94).
                     Ok(sub) => sbi_request.oauth2_subject = Some(sub),
-                    Err(e) => {
-                        let (status, title) = match e {
-                            SbiError::AuthorizationFailed(_) => (401, "Unauthorized"),
-                            _ => (503, "Service Unavailable"),
-                        };
-                        let body = serde_json::json!({
-                            "title": title, "status": status, "detail": e.to_string()
-                        })
-                        .to_string();
-                        let mut resp = SbiResponse::with_status(status)
-                            .with_body(body, "application/problem+json");
-                        if status == 401 {
-                            // RFC 6750 §3 (TS 29.500 Table 5.2.2.2-1): a rejected or
-                            // absent bearer token MUST carry a WWW-Authenticate: Bearer
-                            // challenge so the consumer/SCP can classify and retry.
-                            resp = resp.with_header(
-                            "WWW-Authenticate",
-                            format!(
-                                "Bearer realm=\"5gc-sbi\", error=\"invalid_token\", error_description=\"{e}\""
-                            ),
-                        );
-                        }
+                    Err(refusal) => {
+                        // #1766: TS 29.500 §6.7.3 / RFC 6750 §3.1 -- 401 with no
+                        // `error` for no token, 401 invalid_token for a bad one,
+                        // 403 for a good token that is not for this request.
+                        let resp = refusal.into_response();
                         return Ok(convert_response_with_identity(
                             resp,
                             server_identity.as_ref(),
@@ -1998,17 +2101,22 @@ mod tests {
             .authorize(Some("Bearer a.b.c"), None)
             .await
             .unwrap_err();
-        assert!(!matches!(err, SbiError::AuthorizationFailed(_)));
+        assert!(matches!(err, BearerRefusal::KeysUnavailable(_)), "{err:?}");
 
         // A static JWKS that can't verify the token is the caller's fault
-        // (AuthorizationFailed, mapped to 401).
+        // (401); with no token at all it is #1766's `Absent`.
         let static_v = OAuthVerifier {
             keys: OAuthKeySource::Static(serde_json::json!({"keys": []})),
             expected_audience: None,
             callback_exemptions: Vec::new(),
         };
         let err = static_v.authorize(None, None).await.unwrap_err();
-        assert!(matches!(err, SbiError::AuthorizationFailed(_)));
+        assert!(matches!(err, BearerRefusal::Absent(_)), "{err:?}");
+        let err = static_v
+            .authorize(Some("Bearer a.b.c"), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BearerRefusal::InvalidToken(_)), "{err:?}");
 
         // A remote source that can't be reached is our fault (mapped to 503).
         let remote = OAuthVerifier {
@@ -2022,7 +2130,7 @@ mod tests {
             .authorize(Some("Bearer a.b.c"), None)
             .await
             .unwrap_err();
-        assert!(!matches!(err, SbiError::AuthorizationFailed(_)));
+        assert!(matches!(err, BearerRefusal::KeysUnavailable(_)), "{err:?}");
     }
 
     // --- sbi-02: Server response header ---
@@ -2556,15 +2664,18 @@ mod tests {
         let header = format!("Bearer {token}");
         assert!(verifier.authorize(Some(&header), None).await.is_ok());
 
-        // Same token, but the verifier expects "AMF": rejected as
-        // AuthorizationFailed (mapped to 401 on the wire).
+        // Same token, but the verifier expects "AMF": a claims mismatch
+        // (#1766: 403 ACCESS_TOKEN_CLAIM_MISMATCH on the wire).
         let wrong = OAuthVerifier {
             keys: OAuthKeySource::Static(jwks.clone()),
             expected_audience: Some("AMF".into()),
             callback_exemptions: Vec::new(),
         };
         let err = wrong.authorize(Some(&header), None).await.unwrap_err();
-        assert!(matches!(err, SbiError::AuthorizationFailed(_)));
+        assert!(
+            matches!(err, BearerRefusal::ClaimMismatch { claim: "aud", .. }),
+            "{err:?}"
+        );
 
         // No expectation: audience not checked (current behaviour preserved).
         let none = OAuthVerifier {
@@ -2592,12 +2703,16 @@ mod tests {
             .await
             .is_ok());
 
-        // A different service the token is not scoped for -> 401.
+        // A different service the token is not scoped for -> #1766: 403
+        // insufficient_scope naming the scope needed.
         let err = verifier
             .authorize(Some(&header), Some("nudm-uecm"))
             .await
             .unwrap_err();
-        assert!(matches!(err, SbiError::AuthorizationFailed(_)));
+        assert!(
+            matches!(&err, BearerRefusal::InsufficientScope { scope, .. } if scope == "nudm-uecm"),
+            "{err:?}"
+        );
 
         // No required scope (e.g. a non-service path) -> scope check skipped.
         assert!(verifier.authorize(Some(&header), None).await.is_ok());
@@ -2668,6 +2783,139 @@ mod tests {
         );
 
         server.stop().await.expect("stop");
+    }
+
+    /// #1766: each TS 29.500 §6.7.3 refusal reaches the wire with its own status,
+    /// challenge and ProblemDetails, and none reaches the handler. Before, every
+    /// one of them was 401 `error="invalid_token"`, so a consumer could not tell
+    /// a stale token from a wrong scope, and nextgcore's own client (#1676)
+    /// fetched a fresh token and resent on a scope mismatch it could not fix.
+    #[tokio::test]
+    async fn each_bearer_refusal_gets_its_own_status_and_challenge_1766() {
+        let (token, jwks) = token_jwks_with_aud("UDM");
+        let reached = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits = Arc::clone(&reached);
+        let (listener, addr) = crate::test_support::bound_listener().into_parts();
+        let mut cfg = SbiServerConfig::new(addr);
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(jwks);
+        cfg.oauth2_expected_audience = Some("UDM".into());
+        let server = SbiServer::on_listener(cfg, listener);
+        server
+            .start(move |_req: SbiRequest| {
+                let hits = Arc::clone(&hits);
+                async move {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await
+            .expect("server starts");
+        let client = crate::client::SbiClient::new(crate::client::SbiClientConfig::new(
+            "127.0.0.1".to_string(),
+            addr.port(),
+        ));
+        let send = |path: &str, auth: Option<String>| {
+            let mut req = SbiRequest::get(path);
+            if let Some(a) = auth {
+                req = req.with_header("authorization", a);
+            }
+            let client = &client;
+            async move {
+                let resp = client.send_request(req).await.expect("response");
+                let www = resp.http.get_header("www-authenticate").cloned();
+                let body: serde_json::Value =
+                    serde_json::from_str(resp.http.content.as_deref().unwrap_or("null"))
+                        .unwrap_or_default();
+                (resp.status, www, body)
+            }
+        };
+        let bearer = format!("Bearer {token}");
+
+        // No token, or no BEARER token: 401 with a challenge carrying no `error`.
+        for auth in [
+            None,
+            Some("Basic dXNlcjpwYXNz".to_string()),
+            Some("Bearer ".into()),
+        ] {
+            let (status, www, _) = send("/nudm-sdm/v1/x", auth.clone()).await;
+            assert_eq!(status, 401, "{auth:?}");
+            assert_eq!(www.as_deref(), Some("Bearer realm=\"5gc-sbi\""), "{auth:?}");
+        }
+
+        // A token that does not verify: 401 invalid_token.
+        let forged = format!("{}AAAA", &bearer[..bearer.len() - 4]);
+        for auth in [forged, "Bearer not-a-jwt".to_string()] {
+            let (status, www, _) = send("/nudm-sdm/v1/x", Some(auth.clone())).await;
+            assert_eq!(status, 401, "{auth}");
+            let www = www.unwrap_or_default();
+            assert!(
+                www.starts_with(
+                    "Bearer realm=\"5gc-sbi\", error=\"invalid_token\", error_description=\""
+                ),
+                "{www}"
+            );
+        }
+
+        // A good token whose scope lacks the invoked service: 403 insufficient_scope
+        // naming the scope needed, no ProblemDetails cause (TS 29.500 defines none).
+        let (status, www, body) = send("/nudm-uecm/v1/x", Some(bearer.clone())).await;
+        assert_eq!(status, 403);
+        assert_eq!(
+            www.as_deref(),
+            Some("Bearer realm=\"5gc-sbi\", error=\"insufficient_scope\", scope=\"nudm-uecm\"")
+        );
+        assert_eq!(body["status"], 403);
+        assert!(body.get("cause").is_none(), "{body}");
+
+        // Control: the same token on the service it is scoped for is admitted.
+        assert_eq!(send("/nudm-sdm/v1/x", Some(bearer)).await.0, 204);
+        assert_eq!(reached.load(std::sync::atomic::Ordering::SeqCst), 1);
+        server.stop().await.expect("stop");
+
+        // A good token minted for another producer: 403 ACCESS_TOKEN_CLAIM_MISMATCH
+        // naming `aud`.
+        let (other, other_jwks) = token_jwks_with_aud("AMF");
+        let (listener, addr) = crate::test_support::bound_listener().into_parts();
+        let mut cfg = SbiServerConfig::new(addr);
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(other_jwks);
+        cfg.oauth2_expected_audience = Some("UDM".into());
+        let server = SbiServer::on_listener(cfg, listener);
+        server
+            .start(|_req: SbiRequest| async { SbiResponse::with_status(204) })
+            .await
+            .expect("server starts");
+        let client = crate::client::SbiClient::new(crate::client::SbiClientConfig::new(
+            "127.0.0.1".to_string(),
+            addr.port(),
+        ));
+        let req = SbiRequest::get("/nudm-sdm/v1/x")
+            .with_header("authorization", format!("Bearer {other}"));
+        let resp = client.send_request(req).await.expect("response");
+        assert_eq!(resp.status, 403);
+        assert_eq!(
+            resp.http.get_header("www-authenticate").map(String::as_str),
+            Some("Bearer realm=\"5gc-sbi\", error=\"invalid_token\"")
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
+        assert_eq!(body["cause"], "ACCESS_TOKEN_CLAIM_MISMATCH");
+        assert_eq!(
+            body["invalidParams"],
+            serde_json::json!([{ "param": "aud" }])
+        );
+        server.stop().await.expect("stop");
+    }
+
+    /// #1766: a challenge attribute never carries a raw double quote or
+    /// backslash, which would end the quoted string early.
+    #[test]
+    fn challenge_text_keeps_the_quoted_string_closed_1766() {
+        assert_eq!(
+            challenge_text("audience \"AMF\" \\ é"),
+            "audience 'AMF' ' ?"
+        );
     }
 
     /// A request that carries no token at all leaves `oauth2_subject` unset —

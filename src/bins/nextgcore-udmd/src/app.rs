@@ -7070,7 +7070,7 @@ mod oauth2_h8_tests {
 
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    async fn test_oauth2_wrong_audience_rejected_401() {
+    async fn test_oauth2_wrong_audience_rejected_403() {
         // Serialize on the shared context guard: this test mutates the
         // process-global UDM context (udm_context_init/udm_self) and must
         // not interleave with other guarded tests (CI flake root cause).
@@ -7087,7 +7087,12 @@ mod oauth2_h8_tests {
             .await
             .expect("bounded")
             .expect("response");
-        assert_eq!(resp.status, 401, "wrong-audience token must be 401");
+        assert_eq!(resp.status, 403, "wrong-audience token must be 403 (#1766)");
+        // #1779 review m2: the gate's claim mismatch, not a handler's own 403.
+        let problem: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap_or_default();
+        assert_eq!(problem["cause"], "ACCESS_TOKEN_CLAIM_MISMATCH", "{problem}");
+        assert_eq!(problem["invalidParams"][0]["param"], "aud", "{problem}");
         server.stop().await.expect("stop");
     }
 

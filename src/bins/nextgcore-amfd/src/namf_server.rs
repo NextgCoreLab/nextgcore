@@ -3787,6 +3787,11 @@ impl EventSubscriptionGuard {
         Self(id.into())
     }
 
+    /// The ID of the subscription this guards.
+    pub(crate) fn subscription_id(&self) -> &str {
+        &self.0
+    }
+
     /// The subscription a `201 Created` from `/namf-evts/v1/subscriptions` names.
     ///
     /// # Panics
@@ -5520,6 +5525,21 @@ fn nea_name(alg: u8) -> &'static str {
     }
 }
 
+/// The live subscriptions that target `ue` (#1727, TS 29.518 §6.1.6.2.25
+/// `eventSubscriptionList`;
+/// [`crate::context::AmfContext::event_subscriptions_targeting_ue`]).
+fn event_subscriptions_handed_over(ue: &AmfUe) -> Vec<crate::context::EventSubscription> {
+    let ctx = amf_self();
+    let Ok(guard) = ctx.read() else {
+        return Vec::new();
+    };
+    guard.event_subscriptions_targeting_ue(
+        ue.supi.as_deref(),
+        ue.gpsi.as_deref(),
+        ue.pei.as_deref(),
+    )
+}
+
 /// Build the UeContext JSON for UEContextTransfer responses
 /// (TS 29.518 Table 6.1.6.2.50-1)
 fn build_ue_context_json(ue: &AmfUe, sessions: &[AmfSess]) -> Value {
@@ -5970,6 +5990,14 @@ fn handle_ue_context_transfer(ue_context_id: &str, request: &SbiRequest) -> SbiR
         guard.sess_list_for_ue(ue.id)
     };
 
+    // #1727 review M2: what is handed over is recorded, so a RegistrationStatusUpdate
+    // TRANSFERRED releases exactly these and NOT_TRANSFERRED keeps them. A retried
+    // transfer (#1726 M1) records the same set again.
+    let handed_over = event_subscriptions_handed_over(&ue);
+    ue.handed_over_event_subscriptions = handed_over
+        .iter()
+        .map(|s| s.subscription_id.clone())
+        .collect();
     ue.amf_ue_context_transfer_state = UeContextTransferState::TransferOldAmf;
     {
         let Ok(guard) = ctx.read() else {
@@ -5978,11 +6006,23 @@ fn handle_ue_context_transfer(ue_context_id: &str, request: &SbiRequest) -> SbiR
         guard.amf_ue_update(&ue);
     }
 
-    let response_body = json!({
-        "ueContext": build_ue_context_json(&ue, &sessions),
-    });
+    let mut ue_context = build_ue_context_json(&ue, &sessions);
+    // #1727: the event subscriptions targeting the UE go with its context (TS 29.518
+    // §6.1.6.2.25 `eventSubscriptionList`, `29518-k00.txt:13606-13614`: "shall be
+    // present if available"), each as its AmfEventSubscription echo. That echo
+    // carries the consumer's `subsChangeNotifyUri`, where the new AMF sends
+    // SUBSCRIPTION_ID_CHANGE once it has taken the subscription over (#1699).
+    // Before, the list was never sent, so between two nextgcore AMFs a consumer's
+    // subscription stayed at the old AMF and the UE's reports stopped.
+    let subscriptions: Vec<Value> = handed_over.iter().map(subscription_echo_json).collect();
+    let subscription_count = subscriptions.len();
+    if !subscriptions.is_empty() {
+        ue_context["eventSubscriptionList"] = json!(subscriptions);
+    }
+    let response_body = json!({ "ueContext": ue_context });
     log::info!(
-        "[{}] UEContextTransfer: reason={reason}, accessType={access_type}, {} sessions",
+        "[{}] UEContextTransfer: reason={reason}, accessType={access_type}, {} sessions, \
+         {subscription_count} event subscription(s)",
         ue_context_id,
         sessions.len()
     );
@@ -6019,11 +6059,27 @@ fn handle_registration_status_update(ue_context_id: &str, request: &SbiRequest) 
     let ctx = amf_self();
     if transfer_status == "TRANSFERRED" {
         ue.amf_ue_context_transfer_state = UeContextTransferState::RegistrationStatusUpdateOldAmf;
+        // #1727 review M2: the new AMF has created the UE-specific event
+        // subscriptions this AMF handed over (TS 29.518 §5.2.2.2.1.1) and serves
+        // them now, so they are released here; left in place, they would report
+        // on a UE this AMF no longer serves, beside the new AMF's copies. Only
+        // what was handed over: a group subscription is not (it was never
+        // carried, `event_subscriptions_targeting_ue`), and §5.2.2.2.1.1 keeps it
+        // until its expiry (`29518-k00.txt:2446-2449`).
+        let released = std::mem::take(&mut ue.handed_over_event_subscriptions);
         {
             let Ok(guard) = ctx.read() else {
                 return send_error(500, "Internal Server Error", "context lock poisoned", None);
             };
             guard.amf_ue_update(&ue);
+            for id in &released {
+                if guard.event_subscription_remove(id).is_some() {
+                    log::info!(
+                        "[{ue_context_id}] event subscription {id} released: transferred to \
+                         the new AMF"
+                    );
+                }
+            }
         }
 
         // toReleaseSessionList: PDU sessions the new AMF could not accept
@@ -6051,8 +6107,10 @@ fn handle_registration_status_update(ue_context_id: &str, request: &SbiRequest) 
         }
     } else {
         // NOT_TRANSFERRED: registration at the new AMF failed; keep the
-        // context and clear any transfer state.
+        // context and clear any transfer state. The event subscriptions handed
+        // over stay here (#1727 review M2): this AMF goes on serving the UE.
         ue.amf_ue_context_transfer_state = UeContextTransferState::Initial;
+        ue.handed_over_event_subscriptions.clear();
         if let Ok(guard) = ctx.read() {
             guard.amf_ue_update(&ue);
         }
@@ -9805,6 +9863,183 @@ mod tests {
             .expect("json");
         let resp = namf_request_handler(req).await;
         assert_eq!(resp.status, 404);
+    }
+
+    /// **#1727**, the old AMF's half: the UEContextTransfer answer's UeContext carries
+    /// `eventSubscriptionList` (TS 29.518 §6.1.6.2.25, "shall be present if
+    /// available") with the subscriptions that target the UE, each with its
+    /// `subsChangeNotifyUri`. Left out: another UE's, an any-UE one (it targets no
+    /// UE, and stays here), and an expired one.
+    ///
+    /// REVERT-VERIFIED: without the member in `handle_ue_context_transfer`, "the
+    /// UE's subscription goes with it" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ue_context_transfer_carries_the_ue_s_event_subscriptions_1727() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        let supi = "imsi-001010000172701";
+        let _ue = setup_ue(supi, true, true);
+        let subscription_request = |target: Value, corr: &str, expiry: Option<&str>| {
+            let mut sub = json!({
+                "eventList": [{ "type": "CONNECTIVITY_STATE_REPORT" }],
+                "eventNotifyUri": format!("http://127.0.0.1:9/notify/{corr}"),
+                "notifyCorrelationId": corr,
+                "nfId": "3fa85f64-5717-4562-b3fc-2c963f661727",
+                "subsChangeNotifyUri": format!("http://127.0.0.1:9/subs-change/{corr}"),
+            });
+            for (k, v) in target.as_object().expect("object") {
+                sub[k] = v.clone();
+            }
+            if let Some(e) = expiry {
+                sub["options"] = json!({ "trigger": "CONTINUOUS", "expiry": e });
+            }
+            SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&json!({ "subscription": sub }))
+                .expect("json")
+        };
+        let mut guards = Vec::new();
+        for (target, corr) in [
+            (json!({ "supi": supi }), "corr-1727-ue"),
+            (json!({ "supi": "imsi-001010000172799" }), "corr-1727-other"),
+            (json!({ "anyUE": true }), "corr-1727-any"),
+        ] {
+            let resp = namf_request_handler(subscription_request(target, corr, None)).await;
+            assert_eq!(resp.status, 201, "{corr}");
+            guards.push(EventSubscriptionGuard::of(&resp));
+        }
+        // An expired one, stored directly: the producer would refuse a past expiry.
+        let expired = EventSubscription {
+            subscription_id: "sub-1727-expired".to_string(),
+            notify_uri: "http://127.0.0.1:9/notify/corr-1727-expired".to_string(),
+            notify_correlation_id: "corr-1727-expired".to_string(),
+            event_types: vec!["CONNECTIVITY_STATE_REPORT".to_string()],
+            supi: Some(supi.to_string()),
+            expiry: Some(std::time::SystemTime::now() - std::time::Duration::from_secs(1)),
+            ..amf_self()
+                .read()
+                .unwrap()
+                .event_subscription_find(&guards[0].0)
+                .expect("stored")
+        };
+        assert!(amf_self().read().unwrap().event_subscription_add(expired));
+        let _expired = EventSubscriptionGuard::id("sub-1727-expired");
+
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/transfer"))
+            .with_json_body(&json!({ "reason": "INIT_REG", "accessType": "3GPP_ACCESS" }))
+            .expect("json");
+        let resp = namf_request_handler(req).await;
+        assert_eq!(resp.status, 200);
+        let list = body_json(&resp)["ueContext"]["eventSubscriptionList"].clone();
+        let corrs: Vec<&str> = list
+            .as_array()
+            .map(|l| {
+                l.iter()
+                    .filter_map(|s| s["notifyCorrelationId"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            corrs,
+            vec!["corr-1727-ue"],
+            "the UE's subscription goes with it: {list}"
+        );
+        assert_eq!(list[0]["supi"], supi);
+        assert_eq!(
+            list[0]["subsChangeNotifyUri"], "http://127.0.0.1:9/subs-change/corr-1727-ue",
+            "so the new AMF can send SUBSCRIPTION_ID_CHANGE"
+        );
+        assert_eq!(list[0]["eventList"][0]["type"], "CONNECTIVITY_STATE_REPORT");
+    }
+
+    /// #1727 review M2: the old AMF's side of a transfer that the new AMF then reports
+    /// with `transfer_status`. The UE `supi` has a UE-specific subscription and
+    /// there is an any-UE one; the UEContextTransfer answer hands over the first,
+    /// then the RegistrationStatusUpdate is sent. Returns whether each is still
+    /// stored afterwards (UE-specific, any-UE).
+    async fn handed_over_subscriptions_after(supi: &str, transfer_status: &str) -> (bool, bool) {
+        let _ue = setup_ue(supi, true, true);
+        let subscription_request = |target: Value, corr: &str| {
+            let mut sub = json!({
+                "eventList": [{ "type": "CONNECTIVITY_STATE_REPORT" }],
+                "eventNotifyUri": format!("http://127.0.0.1:9/notify/{corr}"),
+                "notifyCorrelationId": corr,
+                "nfId": "3fa85f64-5717-4562-b3fc-2c963f661727",
+                "subsChangeNotifyUri": format!("http://127.0.0.1:9/subs-change/{corr}"),
+            });
+            for (k, v) in target.as_object().expect("object") {
+                sub[k] = v.clone();
+            }
+            SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&json!({ "subscription": sub }))
+                .expect("json")
+        };
+        let ue_sub =
+            namf_request_handler(subscription_request(json!({ "supi": supi }), "corr-m2-ue")).await;
+        assert_eq!(ue_sub.status, 201);
+        let ue_sub = EventSubscriptionGuard::of(&ue_sub);
+        let any = namf_request_handler(subscription_request(
+            json!({ "anyUE": true }),
+            "corr-m2-any",
+        ))
+        .await;
+        assert_eq!(any.status, 201);
+        let any = EventSubscriptionGuard::of(&any);
+
+        let transfer = namf_request_handler(
+            SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/transfer"))
+                .with_json_body(&json!({ "reason": "INIT_REG", "accessType": "3GPP_ACCESS" }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(transfer.status, 200);
+        assert_eq!(
+            body_json(&transfer)["ueContext"]["eventSubscriptionList"][0]["notifyCorrelationId"],
+            "corr-m2-ue",
+            "precondition: the UE's subscription is handed over"
+        );
+        let update = namf_request_handler(
+            SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/transfer-update"))
+                .with_json_body(&json!({ "transferStatus": transfer_status }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(update.status, 200);
+        let ctx = amf_self();
+        let guard = ctx.read().unwrap();
+        (
+            guard.event_subscription_find(&ue_sub.0).is_some(),
+            guard.event_subscription_find(&any.0).is_some(),
+        )
+    }
+
+    /// **#1727 review M2**, TS 29.518 §5.2.2.2.1.1: once the new AMF reports
+    /// TRANSFERRED it has created the UE-specific event subscriptions the old AMF
+    /// handed over, so the old AMF releases them; otherwise both AMFs would report
+    /// on the UE. The any-UE subscription, which was not handed over, stays.
+    ///
+    /// REVERT-VERIFIED: with the release loop in `handle_registration_status_update`
+    /// removed, "the handed-over subscription is released" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transferred_status_update_releases_the_handed_over_subscriptions_1727() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        let (ue_sub, any) =
+            handed_over_subscriptions_after("imsi-001010000172711", "TRANSFERRED").await;
+        assert!(!ue_sub, "the handed-over subscription is released");
+        assert!(any, "the any-UE subscription stays");
+    }
+
+    /// **#1727 review M2**: NOT_TRANSFERRED means the old AMF goes on serving the UE
+    /// (TS 23.502 §4.2.2.2.2 step 10), so the subscriptions it handed over stay.
+    ///
+    /// REVERT-VERIFIED: with the NOT_TRANSFERRED arm releasing the handed-over
+    /// subscriptions as TRANSFERRED does, "the handed-over subscription stays"
+    /// fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_not_transferred_status_update_keeps_the_handed_over_subscriptions_1727() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        let (ue_sub, any) =
+            handed_over_subscriptions_after("imsi-001010000172712", "NOT_TRANSFERRED").await;
+        assert!(ue_sub, "the handed-over subscription stays");
+        assert!(any, "the any-UE subscription stays");
     }
 
     /// **#1731, the old AMF's half.** A new AMF whose UE then failed authentication
