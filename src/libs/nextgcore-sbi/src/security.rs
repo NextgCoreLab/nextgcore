@@ -2314,8 +2314,10 @@ mod audience_binding_guards {
     /// `the_nf_profile_advertises_the_listener_scheme_1791` test pins that its
     /// builder honours the scheme; this guard pins `main`'s wiring.
     ///
-    /// REVERT-VERIFIED: `let sbi_scheme = UriScheme::Http;` in any one daemon, or
-    /// a builder advertising `"http"` again, fails this.
+    /// REVERT-VERIFIED: `let sbi_scheme = UriScheme::Http;` in any one daemon, a
+    /// capture moved above `apply_sbi_security_profile` (udmd, R19), a shadowing
+    /// `let sbi_scheme`, the NES driver passing `Http`, or a builder advertising
+    /// `"http"` again, fails this.
     #[test]
     fn every_nf_advertises_its_listener_scheme_1791() {
         let bins = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2397,16 +2399,58 @@ mod audience_binding_guards {
             ),
         ] {
             let text = read(rel);
+            let capture = format!("let sbi_scheme = {cfg}.scheme;");
             assert_eq!(
-                text.matches(&format!("let sbi_scheme = {cfg}.scheme;"))
-                    .count(),
+                text.matches(&capture).count(),
                 1,
                 "{rel} must take the advertised scheme from its listener config `{cfg}` (#1791)"
+            );
+            assert_eq!(
+                text.matches("let sbi_scheme").count(),
+                1,
+                "{rel} must bind `sbi_scheme` once, so nothing shadows the captured scheme (#1791)"
+            );
+            // R19: the capture must be of the FINAL config, so the next code line
+            // (blank and comment lines skipped) builds the server from it. A
+            // capture above `apply_sbi_security_profile` or any later `{cfg} = ...`
+            // would advertise http while the listener serves https.
+            let after = &text[text.find(&capture).expect("found above") + capture.len()..];
+            let next = after
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty() && !l.starts_with("//"))
+                .unwrap_or_default();
+            assert!(
+                next.starts_with(&format!("let sbi_server = SbiServer::new({cfg}"))
+                    || next.starts_with(&format!("let sbi_server = sbi_server({cfg}")),
+                "{rel} must capture the scheme immediately before building the server from \
+                 `{cfg}`, so it is the scheme the listener serves; the next line is {next:?} (#1791)"
             );
             assert_eq!(
                 text.matches(register).count(),
                 1,
                 "{rel} must hand the listener's scheme to its NRF registration (#1791)"
+            );
+        }
+        // udmd's NES resume re-registers with the scheme `main` handed it.
+        let app = read("nextgcore-udmd/src/app.rs");
+        assert!(
+            app.contains(
+                "nes_host,\n                        port,\n                        sbi_scheme,\n"
+            ),
+            "nextgcore-udmd/src/app.rs must hand the listener's scheme to the NES driver (#1791)"
+        );
+        let nes = read("nextgcore-udmd/src/nes_driver.rs");
+        for needle in [
+            "let sbi_scheme = self.sbi_scheme;",
+            "register_with_nrf_id(&id, &sbi_addr, sbi_port, sbi_scheme)",
+            "        sbi_port,\n        sbi_scheme,\n    };",
+        ] {
+            assert_eq!(
+                nes.matches(needle).count(),
+                1,
+                "nextgcore-udmd/src/nes_driver.rs must re-register with the listener's scheme: \
+                 {needle:?} (#1791)"
             );
         }
         // (file, NFService builder): each takes `scheme` and advertises it.

@@ -603,10 +603,10 @@ pub async fn run() -> Result<()> {
         nextgcore_sbi::types::NfType::Udm,
         &nrf_uri,
     )?;
-    // #1421: the callbacks this UDM subscribed for are admitted on their own
-    // token when the listener requires OAuth2 (a notification carries no bearer).
     // #1791: the NFProfile advertises the scheme this listener serves.
     let sbi_scheme = sbi_server_config.scheme;
+    // #1421: the callbacks this UDM subscribed for are admitted on their own
+    // token when the listener requires OAuth2 (a notification carries no bearer).
     let sbi_server = sbi_server(sbi_server_config);
 
     sbi_server

@@ -596,10 +596,10 @@ async fn main() -> Result<()> {
     if require_oauth2 {
         sbi_server_config = apply_oauth2_enforcement(sbi_server_config, &args.nrf_uri);
     }
-    // #1421: the callbacks this NWDAF subscribed for are admitted on their own
-    // token when the listener requires OAuth2 (a notification carries no bearer).
     // #1791: the NFProfile advertises the scheme this listener serves.
     let sbi_scheme = sbi_server_config.scheme;
+    // #1421: the callbacks this NWDAF subscribed for are admitted on their own
+    // token when the listener requires OAuth2 (a notification carries no bearer).
     let sbi_server = sbi_server(sbi_server_config);
 
     log::info!("Starting NWDAF SBI server on {addr}");

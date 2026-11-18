@@ -386,7 +386,6 @@ async fn main() -> Result<()> {
 
     // #1791: the NFProfile advertises the scheme this listener serves.
     let sbi_scheme = sbi_config.scheme;
-
     let sbi_server = SbiServer::new(sbi_config);
     sbi_server
         .start(dccf_request_handler)

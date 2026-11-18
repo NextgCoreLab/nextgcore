@@ -350,7 +350,6 @@ async fn main() -> Result<()> {
 
     // #1791: the NFProfile advertises the scheme this listener serves.
     let sbi_scheme = sbi_server_config.scheme;
-
     let sbi_server = SbiServer::new(sbi_server_config);
     log::info!("Starting EASDF SBI server on {addr}");
     sbi_server
