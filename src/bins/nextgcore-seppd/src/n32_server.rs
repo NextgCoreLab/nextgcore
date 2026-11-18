@@ -1225,6 +1225,32 @@ pub fn set_n32_client_tls(tls: Option<N32TlsConfig>) {
     *N32_CLIENT_TLS.write().unwrap_or_else(|e| e.into_inner()) = tls;
 }
 
+/// The TLS this SEPP dials its PEER SEPPs with under `profile` (#1870, R26 on
+/// #1881).
+///
+/// Under production the SEPP presents its own client certificate,
+/// `--n32-client-cert` / `--n32-client-key` (in `given`), else the profile's
+/// (`NEXTGCORE_SBI_TLS_CLIENT_*` in `defaults`), and verifies the peer against
+/// `--n32-ca-cert`, else the profile CA, so a CA is always configured and the
+/// client never falls back to the public web roots. This is the same fallback
+/// #1881's `n32_peer_client_tls` applies to the N32-c handshake; that one also
+/// validates the peers and the files at startup. Under dev `given` is returned
+/// as it is.
+pub fn n32_peer_tls_for_profile(
+    profile: SbiProfile,
+    given: Option<&N32TlsConfig>,
+    defaults: &TlsPaths,
+) -> Option<N32TlsConfig> {
+    if !profile.is_production() {
+        return given.cloned();
+    }
+    let mut tls = given.cloned().unwrap_or_default();
+    tls.client_cert = tls.client_cert.or_else(|| defaults.client_cert.clone());
+    tls.client_key = tls.client_key.or_else(|| defaults.client_key.clone());
+    tls.ca_cert = tls.ca_cert.or_else(|| Some(defaults.ca_cert.clone()));
+    Some(tls)
+}
+
 /// A client for the PEER SEPP at `api_root`, with `tls` or, when the caller has
 /// none, the installed [`set_n32_client_tls`] material.
 fn n32_client(
@@ -2443,5 +2469,101 @@ mod tests {
         set_n32_client_tls(None);
         assert_eq!(config.client_cert.as_deref(), Some("/tls/n32/client.crt"));
         assert_eq!(config.ca_cert.as_deref(), Some("/tls/n32/ca.crt"));
+    }
+
+    /// #1870 / R26 on #1881: under production the peer-SEPP TLS falls back to
+    /// the profile's client certificate and CA, so a CA is always set (never the
+    /// public web roots); the flags win; dev is untouched.
+    #[test]
+    fn production_peer_sepp_tls_falls_back_to_the_profile_1870() {
+        let defaults = TlsPaths {
+            cert: "/tls/sepp/server.crt".to_string(),
+            key: "/tls/sepp/server.key".to_string(),
+            ca_cert: "/tls/ca/ca.crt".to_string(),
+            client_cert: Some("/tls/sepp/client.crt".to_string()),
+            client_key: Some("/tls/sepp/client.key".to_string()),
+        };
+        let tls = n32_peer_tls_for_profile(SbiProfile::Production, None, &defaults).unwrap();
+        assert_eq!(tls.client_cert.as_deref(), Some("/tls/sepp/client.crt"));
+        assert_eq!(tls.client_key.as_deref(), Some("/tls/sepp/client.key"));
+        assert_eq!(tls.ca_cert.as_deref(), Some("/tls/ca/ca.crt"));
+
+        let flags = N32TlsConfig {
+            client_cert: Some("/tls/n32/client.crt".to_string()),
+            client_key: Some("/tls/n32/client.key".to_string()),
+            ca_cert: Some("/tls/n32/ca.crt".to_string()),
+            ..Default::default()
+        };
+        let tls =
+            n32_peer_tls_for_profile(SbiProfile::Production, Some(&flags), &defaults).unwrap();
+        assert_eq!(tls.client_cert.as_deref(), Some("/tls/n32/client.crt"));
+        assert_eq!(tls.ca_cert.as_deref(), Some("/tls/n32/ca.crt"));
+
+        assert!(n32_peer_tls_for_profile(SbiProfile::Dev, None, &defaults).is_none());
+    }
+
+    /// The installed peer TLS for the two site tests: a client certificate that
+    /// does not exist, so a dial that USES it fails naming it.
+    fn install_missing_peer_cert() -> &'static str {
+        const CERT: &str = "/nonexistent/h2-1870/peer-client.crt";
+        set_n32_client_tls(Some(N32TlsConfig {
+            client_cert: Some(CERT.to_string()),
+            client_key: Some("/nonexistent/h2-1870/peer-client.key".to_string()),
+            ca_cert: Some("/nonexistent/h2-1870/peer-ca.crt".to_string()),
+            ..Default::default()
+        }));
+        CERT
+    }
+
+    /// #1870 / R26 MAJOR 2 on #1881: the N32-f error report to the peer SEPP is
+    /// dialled with the SEPP's own client certificate.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // a std guard held to serialise globals, by design
+    async fn the_n32f_error_report_presents_the_sepp_certificate_1870() {
+        let _g = crate::context::lock_global_test_state();
+        let cert = install_missing_peer_cert();
+        let (_listener, addr) = bare_listener();
+        let info = N32fErrorInfo {
+            n32f_message_id: "m-1870".to_string(),
+            n32f_error_type: N32fErrorType::IntegrityCheckFailed,
+            failed_modification_list: Vec::new(),
+            error_details_list: Vec::new(),
+            n32f_context_id: None,
+        };
+        let err = send_n32f_error(&format!("https://{addr}"), &info)
+            .await
+            .unwrap_err();
+        set_n32_client_tls(None);
+        assert!(
+            err.contains(cert),
+            "the report must dial with the SEPP certificate: {err}"
+        );
+    }
+
+    /// #1870 / R26 MAJOR 1 on #1881: forwarded roaming traffic (the SBI-side
+    /// forward, which passes no TLS of its own) is dialled with the SEPP's own
+    /// client certificate.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // a std guard held to serialise globals, by design
+    async fn forwarded_roaming_traffic_presents_the_sepp_certificate_1870() {
+        let _g = crate::context::lock_global_test_state();
+        let cert = install_missing_peer_cert();
+        let (_listener, addr) = bare_listener();
+        let id = tls_peer_with_context("sepp-1870.peer.example", "ctx-1870");
+        {
+            let ctx = sepp_self();
+            let c = ctx.read().unwrap();
+            let mut node = c.node_find(id).unwrap();
+            node.peer_api_root = Some(format!("https://{addr}"));
+            c.node_update(&node);
+        }
+        let err = forward_via_n32f(id, "GET", "/nudm-sdm/v2/x/am-data", &[], None, None)
+            .await
+            .unwrap_err();
+        set_n32_client_tls(None);
+        assert!(
+            err.contains(cert),
+            "the forward must dial with the SEPP certificate: {err}"
+        );
     }
 }

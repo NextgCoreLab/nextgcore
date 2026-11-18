@@ -315,9 +315,21 @@ async fn main() -> Result<()> {
         allow_insecure_no_mtls: args.n32_allow_insecure_no_mtls,
     };
     let n32_tls_opt = if args.tls { Some(&n32_tls) } else { None };
-    // #1870: the n32f-error report and the SBI-side forward dial the peer SEPP
-    // with this SEPP's client certificate too, not only the N32-c handshake.
-    n32_server::set_n32_client_tls(n32_tls_opt.cloned());
+    // #1870 (R26 on #1881): the n32f-error report and the SBI-side forward dial
+    // the peer SEPP with this SEPP's client certificate and a configured CA too,
+    // not only the N32-c handshake. Under production that is the flags, else the
+    // profile's material (`n32_peer_tls_for_profile`), whatever --tls says.
+    let profile = nextgcore_sbi::security::SbiProfile::resolve();
+    let given = if profile.is_production() {
+        Some(&n32_tls)
+    } else {
+        n32_tls_opt
+    };
+    n32_server::set_n32_client_tls(n32_server::n32_peer_tls_for_profile(
+        profile,
+        given,
+        &nextgcore_sbi::security::TlsPaths::from_env(),
+    ));
 
     // #1870: where a peer-supplied N32-f target may point, and over what.
     let home_domains: Vec<String> = sepp_self()
