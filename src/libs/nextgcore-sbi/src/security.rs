@@ -387,8 +387,12 @@ pub fn apply_sbi_security_policy(
     let mut required: Vec<(&str, &str)> = vec![
         ("certificate", paths.cert.as_str()),
         ("private key", paths.key.as_str()),
-        ("client CA certificate", paths.ca_cert.as_str()),
     ];
+    // The CA is what client certificates are verified against, so only a
+    // policy that verifies them needs it (#1848: `server_tls_only` does not).
+    if policy.mtls_required {
+        required.push(("client CA certificate", paths.ca_cert.as_str()));
+    }
     if let Some(cc) = paths.client_cert.as_deref() {
         required.push(("client certificate (for outbound peer calls)", cc));
     }

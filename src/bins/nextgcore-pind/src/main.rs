@@ -1585,7 +1585,8 @@ mod sbi_profile_tests_1795 {
             tls_paths: TlsPaths {
                 cert: file("pin.crt"),
                 key: file("pin.key"),
-                ca_cert: file("ca.crt"),
+                // No CA on disk either: a TLS-only server verifies no client (#1848).
+                ca_cert: dir.join("absent-ca.crt").display().to_string(),
                 client_cert: Some(dir.join("absent-client.crt").display().to_string()),
                 client_key: Some(dir.join("absent-client.key").display().to_string()),
             },
