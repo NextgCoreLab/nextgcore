@@ -32,6 +32,14 @@ pub fn same_nf_instance_id(a: &str, b: &str) -> bool {
     canonical_nf_instance_id(a) == canonical_nf_instance_id(b)
 }
 
+/// Whether two NF Set IDs, or two NF Service Set IDs, name the same set (#1719).
+/// Both are FQDN-style identifiers (TS 23.003 §28.12, TS 29.571 §5.4.2
+/// `NfSetId`/`NfServiceSetId`) that "shall be handled as case-insensitive
+/// string", so the comparison folds ASCII case and nothing else.
+pub fn same_nf_set_id(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
 /// NF Profile data structure
 #[derive(Debug, Clone, Default)]
 pub struct NfProfile {
@@ -1883,6 +1891,9 @@ pub struct DiscoveryQuery {
     pub target_nf_instance_id: Option<String>,
     /// target-nf-fqdn
     pub target_nf_fqdn: Option<String>,
+    /// target-nf-set-id (TS 29.510 §6.2.3.2.3.1, `NfSetId`): only profiles whose
+    /// `nfSetIdList` holds this set, compared case-insensitively (#1719).
+    pub target_nf_set_id: Option<String>,
     /// limit (minimum 1)
     pub limit: Option<usize>,
     /// supi — select the UDM/UDR/AUSF instance whose `supiRanges` cover this
@@ -2183,6 +2194,21 @@ fn profile_matches(doc: &serde_json::Value, status: &str, query: &DiscoveryQuery
 
     if let Some(ref target_fqdn) = query.target_nf_fqdn {
         if doc.get("fqdn").and_then(|v| v.as_str()) != Some(target_fqdn.as_str()) {
+            return false;
+        }
+    }
+
+    // #1719: NF Set IDs are case-insensitive (TS 23.003 §28.12).
+    if let Some(ref want) = query.target_nf_set_id {
+        let in_set = doc
+            .get("nfSetIdList")
+            .and_then(|v| v.as_array())
+            .is_some_and(|sets| {
+                sets.iter()
+                    .filter_map(|s| s.as_str())
+                    .any(|s| same_nf_set_id(s, want))
+            });
+        if !in_set {
             return false;
         }
     }
@@ -2573,6 +2599,49 @@ mod tests {
         // Auto-deregister after grace period
         manager.deregister("nf-suspend-test").unwrap();
         assert!(manager.get("nf-suspend-test").is_none());
+    }
+
+    /// #1719: discovery's `target-nf-set-id` returns only the profiles in that
+    /// NF Set, compared case-insensitively (TS 23.003 §28.12).
+    ///
+    /// REVERT-VERIFIED: with the filter removed, the other-set PCF is returned;
+    /// with `same_nf_set_id` exact, the upper-case query returns nothing.
+    #[test]
+    fn discovery_filters_on_the_target_nf_set_id_1719() {
+        let manager = nf_manager();
+        for (id, set) in [
+            ("pcf-1719-a", "set1.pcfset.5gc.mnc001.mcc001"),
+            ("pcf-1719-b", "set2.pcfset.5gc.mnc001.mcc001"),
+        ] {
+            let p = NfProfile::from_json(&serde_json::json!({
+                "nfInstanceId": id,
+                "nfType": "PCF",
+                "nfStatus": "REGISTERED",
+                "nfSetIdList": [set],
+            }))
+            .expect("a valid profile");
+            manager.register(p).unwrap();
+        }
+        let found = |set: &str| -> Vec<String> {
+            let query = DiscoveryQuery {
+                target_nf_type: "PCF".to_string(),
+                requester_nf_type: "SMF".to_string(),
+                target_nf_set_id: Some(set.to_string()),
+                ..Default::default()
+            };
+            discover_profiles(&query)
+                .iter()
+                .filter_map(|p| p.get("nfInstanceId").and_then(|v| v.as_str()))
+                .filter(|id| id.starts_with("pcf-1719-"))
+                .map(String::from)
+                .collect()
+        };
+        assert_eq!(found("SET1.PcfSet.5gc.mnc001.mcc001"), vec!["pcf-1719-a"]);
+        assert_eq!(found("set2.pcfset.5gc.mnc001.mcc001"), vec!["pcf-1719-b"]);
+        assert!(found("set3.pcfset.5gc.mnc001.mcc001").is_empty());
+        for id in ["pcf-1719-a", "pcf-1719-b"] {
+            manager.deregister(id).unwrap();
+        }
     }
 
     #[test]
