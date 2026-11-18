@@ -86,7 +86,16 @@ struct Args {
     /// Maximum number of sessions
     #[arg(long, default_value = "4096")]
     max_sess: usize,
+
+    /// The state file (#1836): SDM subscriptions, the UDR am-data subscriptions and
+    /// the am-data changes waiting for delivery survive a restart in it. Without it
+    /// (and without NEXTGCORE_UDM_STATE_FILE) they are memory-only.
+    #[arg(long)]
+    state_file: Option<String>,
 }
+
+/// The env var naming the UDM state file when `--state-file` is not given (#1836).
+pub const STATE_FILE_ENV: &str = "NEXTGCORE_UDM_STATE_FILE";
 
 // ---------------------------------------------------------------------------
 // Typed YAML configuration structs for NRF URI seeding
@@ -563,6 +572,25 @@ pub async fn run() -> Result<()> {
             nextgcore_sbi::uri_encode::uri_authority(host, sbi.port)
         )
     }));
+    // #1836: restore the SDM subscriptions, the UDR legs and the queued am-data
+    // changes before the listener opens, so the UDR's first notification on a
+    // restored leg is admitted. A state file that cannot be read fails the start:
+    // overwriting it would lose what it holds.
+    let state_file = args
+        .state_file
+        .clone()
+        .or_else(|| std::env::var(STATE_FILE_ENV).ok())
+        .filter(|p| !p.trim().is_empty());
+    match &state_file {
+        Some(path) => log::info!("UDM state file: {path}"),
+        None => log::warn!(
+            "no UDM state file (--state-file / {STATE_FILE_ENV}): SDM subscriptions and \
+             queued am-data changes are lost on restart"
+        ),
+    }
+    crate::sdm_udr::init_state(state_file.map(std::path::PathBuf::from))
+        .await
+        .map_err(|e| anyhow::anyhow!("UDM state file: {e}"))?;
     let sbi_config = SbiServerConfig {
         addr: sbi.host.clone(),
         port: sbi.port,
@@ -615,6 +643,8 @@ pub async fn run() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
+    // #1836: audit the restored UDR legs now, then refresh them periodically.
+    crate::sdm_udr::spawn_leg_refresh();
 
     // #1334: the Prometheus endpoint, on NEXTGCORE_METRICS_BIND (loopback by default,
     // #837) and UDM_METRICS_PORT (9090). Non-fatal, like smfd's. With the `nes`
@@ -2520,10 +2550,32 @@ pub async fn handle_sdm_subscribe(supi: &str, request: &SbiRequest) -> SbiRespon
     );
     let subscription_id = sub.id.clone();
     {
-        let ctx = udm_self();
-        if let Ok(context) = ctx.read() {
-            context.sdm_subscription_insert(sub);
-        };
+        // #1836: stored and written to the state file before the 201, so a
+        // restart after the answer still serves it; neither, or both.
+        let held = crate::sdm_udr::state_lock().await;
+        let inserted = udm_self()
+            .read()
+            .map(|context| context.sdm_subscription_insert(sub))
+            .unwrap_or(false);
+        if !inserted {
+            // TS 29.500 Table 5.2.7.2-1: 500 INSUFFICIENT_RESOURCES.
+            return send_problem(
+                500,
+                "INSUFFICIENT_RESOURCES",
+                "SDM subscription limit reached",
+            );
+        }
+        if let Err(e) = crate::sdm_udr::persist_locked(&held).await {
+            log::error!("[{supi}] SDM subscription not written to the state file: {e}");
+            if let Ok(context) = udm_self().read() {
+                context.sdm_subscription_remove(&subscription_id);
+            }
+            return send_problem(
+                500,
+                "INSUFFICIENT_RESOURCES",
+                "the SDM subscription could not be stored",
+            );
+        }
     }
     // #1775: an am-data subscription needs this UDM's leg at the UDR.
     crate::sdm_udr::spawn_reconcile(supi);
@@ -2560,11 +2612,16 @@ pub async fn handle_sdm_unsubscribe(supi: &str, subscription_id: &str) -> SbiRes
     if !exists {
         return send_problem(404, "NOT_FOUND", "Subscription not found");
     }
-    // Remove it from context.
-    let ctx = udm_self();
-    if let Ok(context) = ctx.read() {
-        context.sdm_subscription_remove(subscription_id);
-    };
+    // Remove it from context, and from the state file (#1836).
+    {
+        let held = crate::sdm_udr::state_lock().await;
+        if let Ok(context) = udm_self().read() {
+            context.sdm_subscription_remove(subscription_id);
+        };
+        if let Err(e) = crate::sdm_udr::persist_locked(&held).await {
+            log::error!("[{supi}] SDM unsubscribe not written to the state file: {e}");
+        }
+    }
     // #1775: the last am-data subscription of the SUPI takes the UDR leg with it.
     crate::sdm_udr::spawn_reconcile(supi);
     SbiResponse::with_status(204)
