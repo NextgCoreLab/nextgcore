@@ -2097,7 +2097,7 @@ mod audience_binding_guards {
         // use instead (how many of each the fix introduced).
         let files: [(&str, usize, usize); 15] = [
             ("nextgcore-bsfd/src/lib.rs", 0, 1),
-            ("nextgcore-dccfd/src/coordination.rs", 2, 0),
+            ("nextgcore-dccfd/src/coordination.rs", 1, 0),
             ("nextgcore-dccfd/src/main.rs", 1, 0),
             ("nextgcore-easdfd/src/main.rs", 1, 0),
             ("nextgcore-lmfd/src/main.rs", 0, 1),
