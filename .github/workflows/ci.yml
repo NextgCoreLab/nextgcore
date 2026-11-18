@@ -77,6 +77,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v4
+        with:
+          # Pinned, not `latest` (#1617 d3 R15): the chart checks and the
+          # shipped-config tests render with a known helm.
+          version: v3.17.0
       - name: Add swap headroom
         # Absorbs whatever lib/test overlap is left. On ubuntu-24.04, /mnt is
         # on the 145 GB root disk.
@@ -382,6 +386,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v4
+        with:
+          # Pinned, not `latest` (#1617 d3 R15): the chart checks and the
+          # shipped-config tests render with a known helm.
+          version: v3.17.0
       - name: helm lint
         run: helm lint deploy/helm/nextgcore --set global.siteId=ci
       - name: helm template renders
@@ -539,6 +547,10 @@ jobs:
           python3 deploy/eks/lib/check_service_ports.py \
             "$RUNNER_TEMP/base.yaml" "$RUNNER_TEMP/eks-5g.yaml" deploy/eks/profiles/5g/patches/*.yaml
       - uses: azure/setup-helm@v4
+        with:
+          # Pinned, not `latest` (#1617 d3 R15): the chart checks and the
+          # shipped-config tests render with a known helm.
+          version: v3.17.0
       - name: Nothing publishes a port (ClusterIP only)
         # #1365: the base NRF and monitoring Services were NodePort, so
         # applying k8s/ opened the unauthenticated NRF SBI, Prometheus,
@@ -614,6 +626,10 @@ jobs:
           # Helm wrapper issues the IDs the chart pins, and --prune deletes
           # only unreferenced versions (#1617).
           bash k8s/test-nf-tls-secrets.sh
+          # k8s/nrf-tls-gate.sh (the e2e TLS-registration gate) and the image
+          # HEALTHCHECK script, each against a stub (no cluster, no curl run).
+          bash k8s/test-nrf-tls-gate.sh
+          bash docker/rust/test-nf-healthcheck.sh
           out="$(mktemp -d)"
           bash docker/rust/certs/generate-dev-certs.sh --out "$out" >/dev/null
           rows="$(grep -cvE '^\s*(#|$)' docker/rust/certs/nf-identities.txt)"

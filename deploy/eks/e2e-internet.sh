@@ -368,6 +368,18 @@ print(up[0] if up else "")' 2>/dev/null)"
   fi
 fi
 
+# ---- NF -> NRF over TLS (#1617) ----------------------------------------------
+# Every core NF REGISTERED at the NRF, which serves only TLS, and no NF-management
+# request without a verified client certificate (k8s/nrf-tls-gate.sh). The epc
+# profile has no NRF.
+if [[ "${PROFILE}" != epc ]]; then
+  if gate_out="$(bash "${SCRIPT_DIR}/../../k8s/nrf-tls-gate.sh" "${NAMESPACE}" 2>&1)"; then
+    pass "${gate_out}"
+  else
+    fail "NF -> NRF over TLS: ${gate_out}"
+  fi
+fi
+
 echo
 if (( FAILS == 0 )); then
   echo "e2e-internet PROFILE=${PROFILE}: PASS"
