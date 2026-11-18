@@ -5233,20 +5233,24 @@ fn try_positioning_relay(
     if !connected {
         // Paged. The downlinks are enqueued as usual, and the NGAP task holds them
         // while the UE is being paged, then delivers them once its Service Request
-        // has connected it. A page already running (for another transfer) is not
-        // replaced: it brings the UE back just the same. This differs on purpose from
-        // #749's 409 HIGHER_PRIORITY_REQUEST_ONGOING for an SM transfer during a page:
-        // that rule protects the one SM N2 the paging context holds, and these
-        // downlinks are held by the NGAP task, not in the paging context, so they
-        // can ride a page in progress.
-        let paging = amf_self()
-            .read()
-            .ok()
-            .is_some_and(|g| g.paging_find(ue.id).is_some());
-        let location = if paging {
-            format!("/namf-comm/v1/ue-contexts/{ue_context_id}/n1-n2-messages")
-        } else {
-            crate::namf_handler::page_idle_ue_for_positioning(ue, failure_uri)
+        // has connected it. A page already running (for another transfer, or
+        // location-only) is joined, not replaced: it brings the UE back just the
+        // same. This differs on purpose from #749's 409 HIGHER_PRIORITY_REQUEST_ONGOING
+        // for an SM transfer during a page: that rule protects the one SM N2 the
+        // paging context holds, and these downlinks are held by the NGAP task, not in
+        // the paging context, so they can ride a page in progress. #1837: the join
+        // keeps this LMF's n1n2FailureTxfNotifURI on the page, so a page that fails
+        // notifies it too (TS 29.518 §5.2.2.3.1), and join-or-start is one step under
+        // the paging-map lock, so a page another transfer queues meanwhile is joined,
+        // never overwritten.
+        let Some(location) = crate::namf_handler::page_idle_ue_for_positioning(ue, failure_uri)
+        else {
+            log::info!(
+                "[{ue_context_id}] LCS: the page for the UE already carries {} other \
+                 transfers; 409",
+                crate::context::MAX_JOINED_TRANSFERS
+            );
+            return Some(paging_ongoing_error());
         };
         if let Ok(context) = amf_self().read() {
             for dl in downlinks {
@@ -5334,17 +5338,18 @@ fn try_ue_policy_relay(
             return Some(ue_not_reachable_error());
         }
         // #749: paging is ongoing for another transfer; overwriting its context
-        // would lose that one, so this one is refused for the PCF to retry.
-        if crate::namf_handler::paging_ongoing(ue.id) {
-            log::info!("[{ue_context_id}] UE policy: the UE is already being paged; 409");
-            return Some(paging_ongoing_error());
-        }
-        let location = crate::namf_handler::page_idle_ue_for_n1(
+        // would lose that one, so this one is refused for the PCF to retry. #1837:
+        // checked and queued as one step, so a transfer racing this one cannot slip
+        // in between.
+        let Some(location) = crate::namf_handler::page_idle_ue_for_n1(
             ue,
             updp_pdu,
             crate::gmm_handler::payload_container_type::UE_POLICY_CONTAINER,
             failure_uri,
-        );
+        ) else {
+            log::info!("[{ue_context_id}] UE policy: the UE is already being paged; 409");
+            return Some(paging_ongoing_error());
+        };
         log::info!("[{ue_context_id}] UE policy: UE is CM-IDLE, paging it for the UPDP");
         let body = json!({ "cause": "ATTEMPTING_TO_REACH_UE" });
         return Some(match SbiResponse::with_status(202).with_json_body(&body) {
