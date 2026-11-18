@@ -230,6 +230,32 @@ fn apply_oauth2_enforcement(
     cfg
 }
 
+/// The AMF notify callbacks admitted without an OAuth2 bearer when the listener
+/// requires one (#1518): a notification carries no access token (TS 33.501
+/// §13.4.1, TS 29.500 §6.10.7 NOTE). Each is admitted on its subscription's token
+/// alone, because no third party can read the URI back: an N1N2 subscription
+/// (TS 29.518 §6.1.3.4) and a non-UE N2 information subscription (§6.1.3.10) have
+/// no GET, and neither is part of `UeContext`.
+fn oauth2_callback_exemptions() -> Vec<nextgcore_sbi::server::OAuth2CallbackExemption> {
+    [
+        (namf_client::N1_NOTIFY_SEGMENT, context::NotifyKind::N1),
+        (namf_client::N2_NOTIFY_SEGMENT, context::NotifyKind::N2),
+    ]
+    .into_iter()
+    .map(|(segment, kind)| {
+        nextgcore_sbi::server::OAuth2CallbackExemption::new(
+            "POST",
+            format!("{}/{segment}/{{token}}", namf_client::NOTIFY_PREFIX),
+            move |cb| {
+                lmf_self()
+                    .read()
+                    .is_ok_and(|c| c.notify_subscriber(kind, cb.token).is_some())
+            },
+        )
+    })
+    .collect()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -342,7 +368,8 @@ async fn main() -> Result<()> {
     // #1308: loopback by default; say which setting opens it to remote peers.
     nextgcore_core::sockaddr::warn_if_loopback_listener("SBI", &addr, "--sbi-addr");
 
-    let mut sbi_server_config = NextgcoreSbiServerConfig::new(addr);
+    let mut sbi_server_config = NextgcoreSbiServerConfig::new(addr)
+        .with_oauth2_callback_exemptions(oauth2_callback_exemptions());
     if args.tls {
         let cert = args
             .tls_cert
@@ -446,7 +473,10 @@ async fn lmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
 
-    log::debug!("LMF SBI: {method} {uri}");
+    log::debug!(
+        "LMF SBI: {method} {}",
+        nextgcore_sbi::log_redact::redact_callback_tokens(uri)
+    );
 
     let path = uri.split('?').next().unwrap_or(uri);
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
@@ -542,21 +572,41 @@ async fn lmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             "DELETE" => handle_up_unsubscribe(subscription_id).await,
             _ => send_method_not_allowed(method, "up-subscriptions/{subscriptionId}"),
         },
-        // A4: Namf_Communication notify callbacks (TS 29.518 §5.2.2.4
-        // N1MessageNotify / §5.2.2.3.3 N2InfoNotify). These are consumer-chosen
+        // A4: Namf_Communication notify callbacks (TS 29.518 §5.2.2.3.5
+        // N1MessageNotify / §5.2.2.3.6 N2InfoNotify, §5.2.2.4.4 NonUeN2InfoNotify). These are consumer-chosen
         // callback URIs — NOT TS 29.572 resources — registered by the A2
-        // N1N2MessageSubscribe (see namf_client::{N1_NOTIFY_PATH, N2_NOTIFY_PATH}).
-        // They correlate an uplink LPP (N1) / NRPPa (N2) report to a pending
-        // DetermineLocation session (A2) and complete it (fail-closed: an unknown
-        // correlation is never ingested).
-        ["nlmf-loc", "v1", "notify", "n1"] => match method {
-            "POST" => handle_n1_message_notify(&request).await,
-            _ => send_method_not_allowed(method, "notify/n1"),
-        },
-        ["nlmf-loc", "v1", "notify", "n2"] => match method {
-            "POST" => handle_n2_info_notify(&request).await,
-            _ => send_method_not_allowed(method, "notify/n2"),
-        },
+        // N1N2MessageSubscribe and NonUeN2InfoSubscribe, each carrying its
+        // subscription's token (#1518, namf_client::notify_path). They correlate
+        // an uplink LPP (N1) / NRPPa (N2) report to a pending DetermineLocation
+        // session (A2) and complete it (fail-closed: an unknown correlation is
+        // never ingested). A token no subscription holds is 404 and changes
+        // nothing, whatever admitted the request. The token-less URIs of before
+        // #1518 are gone: subscriptions are held in memory only, so none made
+        // before a restart is honoured anyway.
+        ["nlmf-loc", "v1", "notify", segment, token]
+            if *segment == namf_client::N1_NOTIFY_SEGMENT
+                || *segment == namf_client::N2_NOTIFY_SEGMENT =>
+        {
+            let kind = if *segment == namf_client::N1_NOTIFY_SEGMENT {
+                context::NotifyKind::N1
+            } else {
+                context::NotifyKind::N2
+            };
+            if method != "POST" {
+                return send_method_not_allowed(method, segment);
+            }
+            let Some(owner) = lmf_self()
+                .read()
+                .ok()
+                .and_then(|c| c.notify_subscriber(kind, token))
+            else {
+                return send_not_found("No subscription holds this callback", None);
+            };
+            match kind {
+                context::NotifyKind::N1 => handle_n1_message_notify(&request, &owner).await,
+                context::NotifyKind::N2 => handle_n2_info_notify(&request, &owner).await,
+            }
+        }
         // ---- #104: Nlmf_Broadcast (TS 29.572 §5.3) --------------------------
         ["nlmf-broadcast", "v1", "cipher-key-data"] => match method {
             "POST" => handle_cipher_key_data(&request).await,
@@ -1026,7 +1076,12 @@ async fn initiate_positioning(
         Ok(context) => context
             .measurement_request(0, stored_method, None, None, qos)
             .map(|req| {
-                context.positioning_session_register(input.supi.clone(), txn, req.request_id)
+                context.positioning_session_register_for(
+                    Some(target.to_string()),
+                    input.supi.clone(),
+                    txn,
+                    req.request_id,
+                )
             }),
         Err(_) => None,
     };
@@ -3094,35 +3149,43 @@ async fn handle_lpp_binary_report(request: &SbiRequest) -> SbiResponse {
 /// Separate function rather than a widened return type: the session resolution is on
 /// the hot path of every notify, and a caller that wants the request id must not be
 /// made to care about a SUPI that may legitimately be absent.
-fn resolve_notify_supi(lcs_correlation_id: Option<&str>, lpp_txn: Option<u8>) -> Option<String> {
+/// The pending positioning session a notification names, by its
+/// `lcsCorrelationId`, else by its LPP transaction, and only if it is `owner`'s
+/// UE's (#1518): a subscription's notification never acts on another UE's
+/// session, however it guessed the correlation.
+fn resolve_notify_info(
+    lcs_correlation_id: Option<&str>,
+    lpp_txn: Option<u8>,
+    owner: &context::NotifyOwner,
+) -> Option<context::PositioningSessionInfo> {
     let ctx = lmf_self();
     let context = ctx.read().ok()?;
+    let serves =
+        |info: &context::PositioningSessionInfo| owner.serves(info.ue_context_id.as_deref());
     if let Some(corr) = lcs_correlation_id {
-        if let Some(info) = context.positioning_session_find(corr) {
-            return info.supi;
+        if let Some(info) = context.positioning_session_find(corr).filter(serves) {
+            return Some(info);
         }
     }
     let txn = lpp_txn?;
     let corr = context.positioning_session_find_by_transaction(txn)?;
-    context.positioning_session_find(&corr)?.supi
+    context.positioning_session_find(&corr).filter(serves)
 }
 
-fn resolve_notify_session(lcs_correlation_id: Option<&str>, lpp_txn: Option<u8>) -> Option<u64> {
-    let ctx = lmf_self();
-    let context = ctx.read().ok()?;
-    if let Some(corr) = lcs_correlation_id {
-        if let Some(info) = context.positioning_session_find(corr) {
-            return Some(info.request_id);
-        }
-    }
-    if let Some(txn) = lpp_txn {
-        if let Some(corr) = context.positioning_session_find_by_transaction(txn) {
-            if let Some(info) = context.positioning_session_find(&corr) {
-                return Some(info.request_id);
-            }
-        }
-    }
-    None
+fn resolve_notify_supi(
+    lcs_correlation_id: Option<&str>,
+    lpp_txn: Option<u8>,
+    owner: &context::NotifyOwner,
+) -> Option<String> {
+    resolve_notify_info(lcs_correlation_id, lpp_txn, owner)?.supi
+}
+
+fn resolve_notify_session(
+    lcs_correlation_id: Option<&str>,
+    lpp_txn: Option<u8>,
+    owner: &context::NotifyOwner,
+) -> Option<u64> {
+    Some(resolve_notify_info(lcs_correlation_id, lpp_txn, owner)?.request_id)
 }
 
 /// Send an NRPPa ERROR INDICATION to the gNB that sent an erroneous report
@@ -3160,7 +3223,7 @@ async fn send_nrppa_error_indication(lcs_correlation_id: Option<&str>, pdu: Vec<
     log::info!("NRPPa ERROR INDICATION toward the serving gNB: {outcome:?}");
 }
 
-/// Callback: `POST /nlmf-loc/v1/notify/n1` — Namf_Communication N1MessageNotify
+/// Callback: `POST /nlmf-loc/v1/notify/n1-message-notify/{token}` — Namf_Communication N1MessageNotify
 /// (A4; TS 29.518 §5.2.2.4, TS29518_Namf_Communication.yaml:1540-1596). The AMF
 /// relays an uplink LPP N1 message (TS 23.273 §6.11.2) as `multipart/related`:
 /// jsonData `N1MessageNotification` + a `binaryDataN1Message` part
@@ -3178,7 +3241,14 @@ async fn send_nrppa_error_indication(lcs_correlation_id: Option<&str>, pdu: Vec<
 /// `MANDATORY_IE_MISSING`. An undecodable or empty LPP body for a KNOWN session
 /// completes it as SolverFailed so the DetermineLocation leg returns 500
 /// `POSITIONING_FAILED` (never a fabricated fix).
-async fn handle_n1_message_notify(request: &SbiRequest) -> SbiResponse {
+///
+/// #1518: reached only on a token a subscription holds, and `owner` is that
+/// subscription. A report acts only for its UE: a session, capability exchange or
+/// sidelink report of another UE is not touched.
+async fn handle_n1_message_notify(
+    request: &SbiRequest,
+    owner: &context::NotifyOwner,
+) -> SbiResponse {
     let Some(json) = request.http.content.as_deref() else {
         return problem(
             400,
@@ -3229,7 +3299,7 @@ async fn handle_n1_message_notify(request: &SbiRequest) -> SbiResponse {
     // it into a position. Read BEFORE the session lookup because a report is worth
     // keeping even when it arrives outside a session -- the alternative is dropping
     // a measurement the UE went to the trouble of making.
-    let sidelink_supi = resolve_notify_supi(lcs_correlation_id, lpp_txn);
+    let sidelink_supi = resolve_notify_supi(lcs_correlation_id, lpp_txn, owner);
     match codec_glue::decode_lpp_sidelink_ranging(&lpp_bytes) {
         Ok((_txn, ranges)) if !ranges.is_empty() => match sidelink_supi.as_deref() {
             Some(supi) => {
@@ -3268,10 +3338,12 @@ async fn handle_n1_message_notify(request: &SbiRequest) -> SbiResponse {
     // positioning request wait out its capability wait. The UE is backed off as
     // for no answer. On any other transaction it is the location request's.
     if let Some((txn, what)) = codec_glue::decode_lpp_abort_or_error(&lpp_bytes) {
-        let exchange = lmf_self()
-            .read()
-            .ok()
-            .and_then(|c| c.capability_exchange_on(lcs_correlation_id, txn));
+        let exchange = lmf_self().read().ok().and_then(|c| {
+            c.capability_exchange_on(lcs_correlation_id, txn)
+                .filter(|corr| {
+                    owner.serves(c.capability_exchange_supi(Some(corr), None).as_deref())
+                })
+        });
         if let Some(corr) = exchange {
             log::warn!(
                 "LPP {what} on the RequestCapabilities transaction {txn}: the Capability \
@@ -3293,16 +3365,19 @@ async fn handle_n1_message_notify(request: &SbiRequest) -> SbiResponse {
     // transaction (TS 37.355 §5.1.1). An unsolicited one (§5.1.2) is filed
     // against the positioning session's UE, as before.
     if let Some(caps) = codec_glue::decode_lpp_provide_capabilities(&lpp_bytes) {
+        let mine = |supi: &String| owner.serves(Some(supi));
         let supi = lmf_self()
             .read()
             .ok()
             .and_then(|c| c.capability_exchange_supi(lcs_correlation_id, None))
-            .or_else(|| resolve_notify_supi(lcs_correlation_id, lpp_txn))
+            .filter(mine)
+            .or_else(|| resolve_notify_supi(lcs_correlation_id, lpp_txn, owner))
             .or_else(|| {
                 lmf_self()
                     .read()
                     .ok()
                     .and_then(|c| c.capability_exchange_supi(None, caps.transaction))
+                    .filter(mine)
             });
         match supi {
             Some(supi) => {
@@ -3327,7 +3402,7 @@ async fn handle_n1_message_notify(request: &SbiRequest) -> SbiResponse {
         return SbiResponse::no_content();
     }
 
-    let Some(request_id) = resolve_notify_session(lcs_correlation_id, lpp_txn) else {
+    let Some(request_id) = resolve_notify_session(lcs_correlation_id, lpp_txn, owner) else {
         log::warn!(
             "N1MessageNotify with no matching positioning session \
              (lcsCorrelationId={lcs_correlation_id:?}, lppTxn={lpp_txn:?}); dropped"
@@ -3354,7 +3429,7 @@ async fn handle_n1_message_notify(request: &SbiRequest) -> SbiResponse {
     SbiResponse::no_content()
 }
 
-/// Callback: `POST /nlmf-loc/v1/notify/n2` — Namf_Communication N2InfoNotify
+/// Callback: `POST /nlmf-loc/v1/notify/n2-info-notify/{token}` — Namf_Communication N2InfoNotify
 /// (A1/A4; TS 29.518 §5.2.2.3.3, TS29518_Namf_Communication.yaml:1597-1661). The
 /// AMF relays an uplink NRPPa PDU (TS 38.413 §8.15.3/§8.15.5, TS 23.273 §6.11) as
 /// `multipart/related`: jsonData `N2InformationNotification` + a
@@ -3365,7 +3440,14 @@ async fn handle_n1_message_notify(request: &SbiRequest) -> SbiResponse {
 /// transaction), decodes the NRPPa E-CID report and feeds the measurements to
 /// the session. **204** on success; **404** unknown correlation; **400** missing
 /// binary part.
-async fn handle_n2_info_notify(request: &SbiRequest) -> SbiResponse {
+///
+/// #1518: reached only on a token a subscription holds, and `owner` is that
+/// subscription. A UE-associated report acts only on its UE's session. The answer
+/// to a waiting NRPPa exchange is taken on any of this LMF's N2 callbacks: it is
+/// matched to its exchange by procedure and transaction, and amfd relays a non-UE
+/// answer through a UE's N2 subscription when this LMF has no non-UE one
+/// (`n1n2_subscription_find_any_n2`).
+async fn handle_n2_info_notify(request: &SbiRequest, owner: &context::NotifyOwner) -> SbiResponse {
     let Some(json) = request.http.content.as_deref() else {
         return problem(
             400,
@@ -3408,11 +3490,20 @@ async fn handle_n2_info_notify(request: &SbiRequest) -> SbiResponse {
     // Information, Positioning Information, Positioning Activation, Measurement)
     // goes to its waiter, matched by procedure code and transaction id. A non-UE-
     // associated answer names no session, so this comes before the session lookup.
+    // A UE-associated one is taken only on its own UE's subscription (#1518).
     if let Some((kind, procedure, txn)) = crate::nrppa_positioning::header(&nrppa_bytes) {
         if kind != crate::nrppa_positioning::Kind::Initiating {
             let delivered = lmf_self()
                 .read()
-                .map(|c| c.nrppa_deliver(procedure, txn, lcs_correlation_id, nrppa_bytes.clone()))
+                .map(|c| {
+                    c.nrppa_deliver(
+                        procedure,
+                        txn,
+                        lcs_correlation_id,
+                        owner,
+                        nrppa_bytes.clone(),
+                    )
+                })
                 .unwrap_or(false);
             if delivered {
                 return SbiResponse::no_content();
@@ -3420,7 +3511,7 @@ async fn handle_n2_info_notify(request: &SbiRequest) -> SbiResponse {
         }
     }
 
-    let Some(request_id) = resolve_notify_session(lcs_correlation_id, None) else {
+    let Some(request_id) = resolve_notify_session(lcs_correlation_id, None, owner) else {
         log::warn!(
             "N2InfoNotify with no matching positioning session \
              (lcsCorrelationId={lcs_correlation_id:?}); dropped"
@@ -3802,6 +3893,45 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
         let default_port = if uri.starts_with("https://") { 443 } else { 80 };
         Some((host_port.to_string(), default_port))
     }
+}
+
+/// Test-only: the subscription an AMF would have sent `request` on, i.e. that of
+/// the UE it names (its `supi`), else of the UE whose session its
+/// `lcsCorrelationId` names. Tests of the token gate itself go through the router
+/// with a real subscription (`a_notification_acts_only_on_its_subscriptions_token_1518`).
+#[cfg(test)]
+fn test_owner(request: &SbiRequest) -> context::NotifyOwner {
+    let body: serde_json::Value = request
+        .http
+        .content
+        .as_deref()
+        .and_then(|b| serde_json::from_str(b).ok())
+        .unwrap_or_default();
+    let named = body
+        .get("supi")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let ue_context_id = named.or_else(|| {
+        let corr = body.get("lcsCorrelationId")?.as_str()?;
+        lmf_self()
+            .read()
+            .ok()?
+            .positioning_session_find(corr)?
+            .ue_context_id
+    });
+    context::NotifyOwner { ue_context_id }
+}
+
+/// Test-only: [`handle_n1_message_notify`] on the subscription [`test_owner`] names.
+#[cfg(test)]
+async fn notify_n1(request: &SbiRequest) -> SbiResponse {
+    handle_n1_message_notify(request, &test_owner(request)).await
+}
+
+/// Test-only: [`handle_n2_info_notify`] on the subscription [`test_owner`] names.
+#[cfg(test)]
+async fn notify_n2(request: &SbiRequest) -> SbiResponse {
+    handle_n2_info_notify(request, &test_owner(request)).await
 }
 
 #[cfg(test)]
@@ -6514,7 +6644,7 @@ lmf:
         }
 
         // lmfd's REAL callback handler consumes it.
-        let resp = handle_n1_message_notify(&req).await;
+        let resp = notify_n1(&req).await;
         assert_eq!(
             resp.status, 204,
             "successful N1MessageNotify callback → 204"
@@ -6558,7 +6688,7 @@ lmf:
             "application/vnd.3gpp.5gnas",
             lpp,
         );
-        let resp = handle_n1_message_notify(&req).await;
+        let resp = notify_n1(&req).await;
         assert_eq!(resp.status, 404);
         assert_eq!(
             content_type(&resp).as_deref(),
@@ -6598,7 +6728,7 @@ lmf:
 
         let lpp = crate::sidelink_epdu::build_message(181, &epdu_golden_report());
         let notify = nextgcore_amfd::namf_server::build_n1_message_notify_request(
-            namf_client::N1_NOTIFY_PATH,
+            "/nlmf-loc/v1/notify/n1-message-notify/test",
             Some("sub-sidelink"),
             "LPP",
             Some(&corr),
@@ -6606,7 +6736,7 @@ lmf:
             &lpp,
         )
         .expect("amfd builds N1MessageNotify");
-        assert_eq!(handle_n1_message_notify(&notify).await.status, 204);
+        assert_eq!(notify_n1(&notify).await.status, 204);
 
         let held = ctx.read().unwrap().sidelink_ranges(supi);
         assert_eq!(held.len(), 1, "the report must be stored");
@@ -6668,7 +6798,7 @@ lmf:
         );
         // The notification itself is still refused for the unknown session (404) --
         // that behaviour is unchanged -- and no ranges are filed anywhere.
-        assert_eq!(handle_n1_message_notify(&req).await.status, 404);
+        assert_eq!(notify_n1(&req).await.status, 404);
         let ctx = lmf_self();
         assert!(
             ctx.read().unwrap().sidelink_ranges(supi).is_empty(),
@@ -6718,7 +6848,7 @@ lmf:
         // No binary part attached at all.
         let mut req = SbiRequest::post("/nlmf-loc/v1/notify/n1");
         req.http.set_content(json.to_string());
-        let resp = handle_n1_message_notify(&req).await;
+        let resp = notify_n1(&req).await;
         assert_eq!(resp.status, 400);
         let v = body_json(&resp);
         assert_eq!(v["cause"], "MANDATORY_IE_MISSING");
@@ -6763,7 +6893,7 @@ lmf:
             "application/vnd.3gpp.ngap",
             nrppa,
         );
-        let resp = handle_n2_info_notify(&req).await;
+        let resp = notify_n2(&req).await;
         assert_eq!(resp.status, 204, "successful N2InfoNotify callback → 204");
         // #715 review: the NRPPa leg alone does not end a session that also waits
         // for the UE's LPP report; that report completes it.
@@ -6842,7 +6972,7 @@ lmf:
             "application/vnd.3gpp.ngap",
             nrppa,
         );
-        assert_eq!(handle_n2_info_notify(&req).await.status, 204);
+        assert_eq!(notify_n2(&req).await.status, 204);
         lmf_self().read().unwrap().measurement_leg_report(
             request_id,
             crate::context::MeasurementLeg::Lpp,
@@ -6885,7 +7015,7 @@ lmf:
             "application/vnd.3gpp.ngap",
             nrppa,
         );
-        let resp = handle_n2_info_notify(&req).await;
+        let resp = notify_n2(&req).await;
         assert_eq!(resp.status, 404);
         let v = body_json(&resp);
         assert_eq!(v["cause"], "LOCATION_SESSION_UNKNOWN");
@@ -7532,7 +7662,7 @@ mod positioning_chain_strict_peer {
         );
         let caps = crate::lpp_fixtures::ecid_capabilities(txn, eutra, nr);
         assert_eq!(
-            handle_n1_message_notify(&amfd_notify_request(&corr, supi, &caps))
+            notify_n1(&amfd_notify_request(&corr, supi, &caps))
                 .await
                 .status,
             204
@@ -7582,7 +7712,7 @@ mod positioning_chain_strict_peer {
     /// PDU survives the amfd→lmfd relay byte-exact (transparent relay).
     fn amfd_notify_request(corr: &str, supi: &str, lpp: &[u8]) -> SbiRequest {
         let amf_req = nextgcore_amfd::namf_server::build_n1_message_notify_request(
-            namf_client::N1_NOTIFY_PATH,
+            "/nlmf-loc/v1/notify/n1-message-notify/test",
             Some("sub-strict-peer"),
             "LPP",
             Some(corr),
@@ -7603,7 +7733,7 @@ mod positioning_chain_strict_peer {
             lpp,
             "UL LPP must survive the amfd→lmfd notify relay byte-exact"
         );
-        let mut req = SbiRequest::post(namf_client::N1_NOTIFY_PATH);
+        let mut req = SbiRequest::post("/nlmf-loc/v1/notify/n1-message-notify/test");
         req.http.set_content(decoded.json.expect("jsonData root"));
         req.http.set_header("Content-Type", ct);
         for p in decoded.parts {
@@ -7794,7 +7924,7 @@ mod positioning_chain_strict_peer {
                 "application/vnd.3gpp.ngap",
                 bytes::Bytes::from(nrppa),
             ));
-        let resp = handle_n2_info_notify(&req).await;
+        let resp = notify_n2(&req).await;
         assert_eq!(resp.status, 204);
         assert!(
             lmf_self()
@@ -7915,7 +8045,7 @@ mod positioning_chain_strict_peer {
         // for the seeded serving cell (pci 77), via amfd's REAL notify producer.
         let ul_lpp = build_ecid_lpp(77, 60, 800, txn);
         let notify = amfd_notify_request(&corr, &supi, &ul_lpp);
-        let notify_resp = handle_n1_message_notify(&notify).await;
+        let notify_resp = notify_n1(&notify).await;
         assert_eq!(notify_resp.status, 204, "N1MessageNotify callback → 204");
 
         // DetermineLocation now completes with the computed fix — NOT 504.
@@ -8050,7 +8180,7 @@ mod positioning_chain_strict_peer {
         );
         let aborted = std::time::Instant::now();
         assert_eq!(
-            handle_n1_message_notify(&amfd_notify_request(
+            notify_n1(&amfd_notify_request(
                 &cap_corr,
                 &supi,
                 &crate::lpp_fixtures::target_abort(cap_txn)
@@ -8119,7 +8249,7 @@ mod positioning_chain_strict_peer {
         // positioning session's correlation (amfd keeps the latest one per UE).
         let late = crate::lpp_fixtures::ecid_capabilities(cap_txn, false, true);
         assert_eq!(
-            handle_n1_message_notify(&amfd_notify_request(&corr, &supi, &late))
+            notify_n1(&amfd_notify_request(&corr, &supi, &late))
                 .await
                 .status,
             204
@@ -8195,7 +8325,7 @@ mod positioning_chain_strict_peer {
 
         let ul_lpp = crate::lpp_fixtures::nr_ecid_lpp(77, 80, 60, &[], txn);
         let notify = amfd_notify_request(&corr, &supi, &ul_lpp);
-        assert_eq!(handle_n1_message_notify(&notify).await.status, 204);
+        assert_eq!(notify_n1(&notify).await.status, 204);
         let resp = tokio::time::timeout(Duration::from_secs(10), det)
             .await
             .expect("DetermineLocation did not hang")
@@ -8256,7 +8386,7 @@ mod positioning_chain_strict_peer {
         // 1. The UE's leg first.
         let ul_lpp = crate::lpp_fixtures::nr_ecid_lpp(77, 80, 60, &[], txn);
         assert_eq!(
-            handle_n1_message_notify(&amfd_notify_request(&corr, &supi, &ul_lpp))
+            notify_n1(&amfd_notify_request(&corr, &supi, &ul_lpp))
                 .await
                 .status,
             204
@@ -8291,7 +8421,7 @@ mod positioning_chain_strict_peer {
                 "application/vnd.3gpp.ngap",
                 bytes::Bytes::from(nrppa),
             ));
-        assert_eq!(handle_n2_info_notify(&n2).await.status, 204);
+        assert_eq!(notify_n2(&n2).await.status, 204);
 
         let resp = tokio::time::timeout(Duration::from_secs(10), det)
             .await
@@ -8411,6 +8541,7 @@ mod positioning_chain_strict_peer {
                         nrppa::ID_T_RP_INFORMATION_EXCHANGE,
                         m.nrppatransaction_id.0,
                         None,
+                        &context::NotifyOwner::non_ue(),
                         answer,
                     );
                 }
@@ -8499,7 +8630,7 @@ mod positioning_chain_strict_peer {
             .collect();
         let ul = crate::lpp_fixtures::dl_tdoa_lpp(ref_id, &neighbours, txn);
         assert_eq!(
-            handle_n1_message_notify(&amfd_notify_request(&corr, &supi, &ul))
+            notify_n1(&amfd_notify_request(&corr, &supi, &ul))
                 .await
                 .status,
             204
@@ -8649,6 +8780,7 @@ mod positioning_chain_strict_peer {
                         nrppa::ID_T_RP_INFORMATION_EXCHANGE,
                         m.nrppatransaction_id.0,
                         None,
+                        &context::NotifyOwner::non_ue(),
                         answer,
                     );
                     answered.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -8722,9 +8854,22 @@ mod positioning_chain_strict_peer {
             bit_length: 22,
         };
 
+        // #1518: the subscription's N2 token, held from the moment it is minted.
+        let amf_peer = namf_client::DiscoveredAmf {
+            host: "127.0.0.1".into(),
+            port: 9,
+            scheme: "http".into(),
+            nf_instance_id: None,
+        };
+        let (start, _) = lmf_self()
+            .read()
+            .unwrap()
+            .amf_subscription_begin(&amf_peer.non_ue_subscription_key(), &amf_peer, None)
+            .expect("no subscription yet");
         let sub = namf_client::build_non_ue_nrppa_subscription_request(
             "lmf-807",
             "http://127.0.0.1:7816",
+            &start.n2_token,
         );
         let resp = nextgcore_amfd::namf_request_handler(sub).await;
         assert_eq!(resp.status, 201, "{:?}", resp.http.content);
@@ -8747,8 +8892,9 @@ mod positioning_chain_strict_peer {
             txn.0,
             &[(1, 201, 0, 0, 0)],
         );
+        let n2_path = namf_client::notify_path(context::NotifyKind::N2, start.n2_token.as_str());
         let notify = nextgcore_amfd::namf_server::build_non_ue_nrppa_info_notify_request(
-            "/nlmf-loc/v1/notify/n2",
+            &n2_path,
             "nonuen2sub-x",
             Some("lmf-807"),
             Some(&serde_json::json!({"plmnId": {"mcc": "001", "mnc": "01"},
@@ -8761,7 +8907,7 @@ mod positioning_chain_strict_peer {
             txn.0,
             None,
         );
-        assert_eq!(handle_n2_info_notify(&notify).await.status, 204);
+        assert_eq!(lmf_sbi_request_handler(notify.clone()).await.status, 204);
         let got = tokio::time::timeout(Duration::from_secs(1), waiter)
             .await
             .expect("delivered")
@@ -8769,7 +8915,7 @@ mod positioning_chain_strict_peer {
         assert_eq!(got, answer);
 
         // An answer nobody waits for, with no session, is still unknown: 404.
-        assert_eq!(handle_n2_info_notify(&notify).await.status, 404);
+        assert_eq!(lmf_sbi_request_handler(notify).await.status, 404);
     }
 
     /// #907 review MAJOR: an unsolicited ProvideCapabilities during a session is
@@ -8799,7 +8945,7 @@ mod positioning_chain_strict_peer {
         };
         let caps = crate::lpp_equivalence_tests::unhex("9203084858");
         assert_eq!(
-            handle_n1_message_notify(&amfd_notify_request(&corr, supi, &caps))
+            notify_n1(&amfd_notify_request(&corr, supi, &caps))
                 .await
                 .status,
             204
@@ -8819,7 +8965,7 @@ mod positioning_chain_strict_peer {
         );
         let report = crate::lpp_fixtures::ecid_lpp(7, 60, 500, 3);
         assert_eq!(
-            handle_n1_message_notify(&amfd_notify_request(&corr, supi, &report))
+            notify_n1(&amfd_notify_request(&corr, supi, &report))
                 .await
                 .status,
             204
@@ -8912,7 +9058,7 @@ mod positioning_chain_strict_peer {
         // is expected — a KNOWN session, but no decodable measurement.
         let corrupt: Vec<u8> = vec![0xFF, 0x13, 0x37, 0xAB, 0xCD];
         let notify = nextgcore_amfd::namf_server::build_n1_message_notify_request(
-            namf_client::N1_NOTIFY_PATH,
+            "/nlmf-loc/v1/notify/n1-message-notify/test",
             Some("sub-corrupt"),
             "LPP",
             Some(&corr),
@@ -8921,7 +9067,7 @@ mod positioning_chain_strict_peer {
         )
         .expect("amfd builds N1MessageNotify");
         // Delivered to a matched session (204), but yields no fix.
-        assert_eq!(handle_n1_message_notify(&notify).await.status, 204);
+        assert_eq!(notify_n1(&notify).await.status, 204);
 
         let resp = tokio::time::timeout(Duration::from_secs(10), det)
             .await
@@ -8990,7 +9136,7 @@ mod positioning_chain_strict_peer {
         // A notify correlated to A only.
         let ul = build_ecid_lpp(88, 60, 800, 111);
         let notify = nextgcore_amfd::namf_server::build_n1_message_notify_request(
-            namf_client::N1_NOTIFY_PATH,
+            "/nlmf-loc/v1/notify/n1-message-notify/test",
             Some("sub-iso"),
             "LPP",
             Some(&corr_a),
@@ -8998,7 +9144,7 @@ mod positioning_chain_strict_peer {
             &ul,
         )
         .expect("amfd builds N1MessageNotify");
-        assert_eq!(handle_n1_message_notify(&notify).await.status, 204);
+        assert_eq!(notify_n1(&notify).await.status, 204);
 
         // A completed with a real fix.
         let out_a = tokio::time::timeout(Duration::from_secs(2), rx_a)
@@ -9130,6 +9276,564 @@ mod tests_nf_profile_host_kind_1324 {
                 nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
             assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
         }
+    }
+}
+
+/// #1518: the AMF notify callbacks carry a per-subscription token, and only that
+/// token admits a notification, and only for that subscription's UE.
+#[cfg(test)]
+mod callback_tokens_1518 {
+    use super::*;
+    use crate::context::{NotifyKind, PROCESS_STATE_TEST_LOCK};
+    use crate::namf_client::DiscoveredAmf;
+    use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+    use std::sync::Mutex;
+
+    const FORGED: &str = "0123456789abcdef0123456789abcdef";
+
+    fn amf_at(port: u16) -> DiscoveredAmf {
+        DiscoveredAmf {
+            host: "127.0.0.1".into(),
+            port,
+            scheme: "http".into(),
+            nf_instance_id: None,
+        }
+    }
+
+    /// A UE subscription held for `ue` on a (never contacted) AMF, as created.
+    fn subscribe(port: u16, ue: &str) -> (String, String) {
+        let amf = amf_at(port);
+        let key = amf.subscription_key(ue);
+        let c = lmf_self();
+        let c = c.read().unwrap();
+        let (start, _) = c
+            .amf_subscription_begin(&key, &amf, Some(ue))
+            .expect("not yet held");
+        assert!(c.amf_subscription_created(&key, &start, format!("sub-{ue}")));
+        (
+            start.n1_token.unwrap().as_str().to_string(),
+            start.n2_token.as_str().to_string(),
+        )
+    }
+
+    /// A pending E-CID session for `ue` on LPP transaction `txn`, solvable on pci-42.
+    fn session(
+        ue: &str,
+        txn: u8,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<crate::context::PositioningOutcome>,
+    ) {
+        let c = lmf_self();
+        let c = c.read().unwrap();
+        c.set_cell_coord(
+            "pci-42".to_string(),
+            crate::positioning::TrpCoord::new(37.5, -122.3, 0.0),
+        );
+        let req = c
+            .measurement_request(
+                0,
+                PositioningMethod::Ecid,
+                None,
+                None,
+                PositioningQos::BestEffort,
+            )
+            .expect("measurement request");
+        c.positioning_session_register_for(Some(ue.into()), Some(ue.into()), txn, req.request_id)
+    }
+
+    /// amfd's N1MessageNotify for `corr` (when given), as amfd builds it, at `path`.
+    fn n1(path: &str, corr: Option<&str>, supi: &str, txn: u8) -> SbiRequest {
+        nextgcore_amfd::namf_server::build_n1_message_notify_request(
+            path,
+            Some("sub"),
+            "LPP",
+            corr,
+            Some(supi),
+            &crate::lpp_fixtures::ecid_lpp(42, 60, 800, txn),
+        )
+        .expect("amfd builds N1MessageNotify")
+    }
+
+    fn n1_path(token: &str) -> String {
+        namf_client::notify_path(NotifyKind::N1, token)
+    }
+
+    /// #1518: a notification reaches its handler only on a token one of this LMF's
+    /// subscriptions holds for that callback, and acts only on that subscription's
+    /// UE. Every refusal is 404 with the session untouched, and the right token then
+    /// completes it.
+    ///
+    /// REVERT-VERIFIED: with `notify_subscriber` returning an owner for any token,
+    /// the forged and wrong-callback cases complete the session; with
+    /// `NotifyOwner::serves` always true, the other UE's token does (by correlation
+    /// and by LPP transaction).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_notification_acts_only_on_its_subscriptions_token_1518() {
+        let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        let (a_ue, b_ue) = ("imsi-001010000015181", "imsi-001010000015182");
+        let (a_n1, a_n2) = subscribe(15181, a_ue);
+        let (b_n1, _) = subscribe(15182, b_ue);
+        let (corr, mut rx) = session(a_ue, 151);
+
+        for (label, req) in [
+            ("forged token", n1(&n1_path(FORGED), Some(&corr), a_ue, 151)),
+            (
+                "the N2 token at N1",
+                n1(&n1_path(&a_n2), Some(&corr), a_ue, 151),
+            ),
+            (
+                "the N1 token at N2",
+                n1(
+                    &namf_client::notify_path(NotifyKind::N2, &a_n1),
+                    Some(&corr),
+                    a_ue,
+                    151,
+                ),
+            ),
+            (
+                "the legacy URI",
+                n1("/nlmf-loc/v1/notify/n1", Some(&corr), a_ue, 151),
+            ),
+            (
+                "another UE's token",
+                n1(&n1_path(&b_n1), Some(&corr), a_ue, 151),
+            ),
+            (
+                "another UE's token, by LPP transaction",
+                n1(&n1_path(&b_n1), None, a_ue, 151),
+            ),
+        ] {
+            assert_eq!(lmf_sbi_request_handler(req).await.status, 404, "{label}");
+            assert!(
+                matches!(
+                    rx.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ),
+                "{label}: the session must be untouched"
+            );
+        }
+        assert!(lmf_self()
+            .read()
+            .unwrap()
+            .positioning_session_find(&corr)
+            .is_some());
+
+        let resp = lmf_sbi_request_handler(n1(&n1_path(&a_n1), Some(&corr), a_ue, 151)).await;
+        assert_eq!(resp.status, 204, "{:?}", resp.http.content);
+        let outcome = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("completed")
+            .expect("sender kept");
+        assert!(
+            matches!(outcome, crate::context::PositioningOutcome::Fix(_)),
+            "{outcome:?}"
+        );
+    }
+
+    /// #1518: a UE-associated NRPPa report on another UE's N2 subscription, or on
+    /// the non-UE one, is 404 and not attached to the session; on its UE's N2
+    /// subscription it is.
+    ///
+    /// REVERT-VERIFIED: with the N2 session lookup not scoped to `owner`, the other
+    /// UE's report is attached.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_nrppa_report_counts_only_on_its_ue_s_subscription_1518() {
+        use crate::nrppa_uplink::test_support::{ecid_report, nr_cgi, rsrp, ta1};
+        let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        let (a_ue, b_ue) = ("imsi-001010000015188", "imsi-001010000015189");
+        let (_, a_n2) = subscribe(15188, a_ue);
+        let (_, b_n2) = subscribe(15189, b_ue);
+        let non_ue = amf_at(15188);
+        let (non_ue_start, _) = lmf_self()
+            .read()
+            .unwrap()
+            .amf_subscription_begin(&non_ue.non_ue_subscription_key(), &non_ue, None)
+            .unwrap();
+        let (corr, mut rx) = session(a_ue, 152);
+        // The session waits for the gNB's E-CID report alone, so that report ends it.
+        {
+            let c = lmf_self();
+            let c = c.read().unwrap();
+            c.positioning_session_expect_leg(&corr, crate::context::MeasurementLeg::NrppaEcid);
+            c.positioning_session_withdraw_leg(&corr, crate::context::MeasurementLeg::Lpp);
+        }
+        let report = |token: &str| {
+            let json = serde_json::json!({
+                "n2NotifySubscriptionId": "sub",
+                "n2InfoContainer": {"n2InformationClass": "NRPPa", "nrppaInfo": {
+                    "nrppaPdu": {"ngapIeType": "NRPPA_PDU", "ngapData": {"contentId": "nrppa"}}}},
+                "lcsCorrelationId": corr,
+            });
+            let pdu = ecid_report(
+                1,
+                42,
+                7,
+                nr_cgi([0x02, 0xF8, 0x39], 0x000000001),
+                [0x00, 0x12, 0x34],
+                Some(vec![ta1(500), rsrp(&[60])]),
+            );
+            let mut req = SbiRequest::post(namf_client::notify_path(NotifyKind::N2, token))
+                .with_body(json.to_string(), "application/json");
+            req.http
+                .add_part(nextgcore_sbi::message::SbiPart::with_content(
+                    "nrppa",
+                    "application/vnd.3gpp.ngap",
+                    bytes::Bytes::from(pdu),
+                ));
+            req
+        };
+        assert_eq!(lmf_sbi_request_handler(report(&b_n2)).await.status, 404);
+        assert_eq!(
+            lmf_sbi_request_handler(report(non_ue_start.n2_token.as_str()))
+                .await
+                .status,
+            404
+        );
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "another subscription's report must not end the session"
+        );
+        assert_eq!(lmf_sbi_request_handler(report(&a_n2)).await.status, 204);
+        tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("the session ends on its own UE's report")
+            .expect("sender kept");
+    }
+
+    /// #1518: a ProvideCapabilities on another UE's subscription is not filed
+    /// against the UE whose capability exchange it names; on the right one it is.
+    ///
+    /// REVERT-VERIFIED: with the capability lookups not filtered by `owner`, the
+    /// other UE's report is recorded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_capability_report_counts_only_on_its_ue_s_subscription_1518() {
+        let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        let (a_ue, b_ue) = ("imsi-001010000015183", "imsi-001010000015184");
+        let (a_n1, _) = subscribe(15183, a_ue);
+        let (b_n1, _) = subscribe(15184, b_ue);
+        let (corr, _rx, _) = lmf_self()
+            .read()
+            .unwrap()
+            .capability_exchange_begin(a_ue, 77)
+            .expect("exchange starts");
+        let caps = crate::lpp_fixtures::ecid_capabilities(77, false, true);
+        let body = |path: &str| {
+            nextgcore_amfd::namf_server::build_n1_message_notify_request(
+                path,
+                Some("sub"),
+                "LPP",
+                Some(&corr),
+                None,
+                &caps,
+            )
+            .expect("amfd builds N1MessageNotify")
+        };
+        assert_eq!(
+            lmf_sbi_request_handler(body(&n1_path(&b_n1))).await.status,
+            204
+        );
+        assert!(
+            !lmf_self().read().unwrap().ue_capabilities_reported(a_ue),
+            "another UE's subscription must not file A's capabilities"
+        );
+        assert_eq!(
+            lmf_sbi_request_handler(body(&n1_path(&a_n1))).await.status,
+            204
+        );
+        assert!(lmf_self().read().unwrap().ue_capabilities_reported(a_ue));
+    }
+
+    /// #1518: the composition root exempts exactly the two tokened callbacks,
+    /// token-only, and an OAuth2-required listener (empty JWKS) admits a token-less
+    /// notification on a held token only: a forged token, the legacy URI and a
+    /// service request stay 401.
+    ///
+    /// REVERT-VERIFIED: with the exemption's check always true, the forged token
+    /// and the N2 token at N1 are admitted (404 from the router, not 401).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_oauth2_listener_admits_the_callbacks_only_on_held_tokens_1518() {
+        let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        let routes: Vec<String> = oauth2_callback_exemptions()
+            .iter()
+            .map(|e| e.route())
+            .collect();
+        assert_eq!(
+            routes,
+            [
+                "POST /nlmf-loc/v1/notify/n1-message-notify/{token}",
+                "POST /nlmf-loc/v1/notify/n2-info-notify/{token}",
+            ]
+        );
+        let (n1_tok, n2_tok) = subscribe(15185, "imsi-001010000015185");
+
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let mut cfg = SbiServerConfig::new(addr)
+            .with_oauth2_callback_exemptions(oauth2_callback_exemptions());
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(serde_json::json!({"keys": []}));
+        let server = SbiServer::on_listener(cfg, listener);
+        server.start(lmf_sbi_request_handler).await.expect("start");
+        let client = SbiClient::with_host_port("127.0.0.1", addr.port());
+        let mut got = Vec::new();
+        for path in [
+            n1_path(&n1_tok),
+            namf_client::notify_path(NotifyKind::N2, &n2_tok),
+            n1_path(FORGED),
+            n1_path(&n2_tok),
+            "/nlmf-loc/v1/notify/n1".to_string(),
+            "/nlmf-loc/v1/determine-location".to_string(),
+        ] {
+            // A body-less POST: the handler answers 400, the gate 401.
+            let status = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.send_request(SbiRequest::post(path.clone())),
+            )
+            .await
+            .expect("bounded")
+            .expect("response")
+            .status;
+            got.push((path, status));
+        }
+        server.stop().await.ok();
+        let statuses: Vec<u16> = got.iter().map(|(_, s)| *s).collect();
+        assert_eq!(statuses, [400, 400, 401, 401, 401, 401], "{got:?}");
+    }
+
+    /// A stand-in AMF that records each request and answers a subscribe with
+    /// `subscribe_status` (201 with a fresh id) and a transfer with
+    /// `transfer_status`.
+    struct StandInAmf {
+        server: SbiServer,
+        amf: DiscoveredAmf,
+        seen: Arc<Mutex<Vec<(String, String)>>>,
+        subscribe_status: Arc<std::sync::atomic::AtomicU16>,
+        transfer_status: Arc<std::sync::atomic::AtomicU16>,
+    }
+
+    async fn stand_in_amf() -> StandInAmf {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+        let subscribe_status = Arc::new(std::sync::atomic::AtomicU16::new(201));
+        let transfer_status = Arc::new(std::sync::atomic::AtomicU16::new(200));
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        let (s, sub, tr) = (
+            seen.clone(),
+            subscribe_status.clone(),
+            transfer_status.clone(),
+        );
+        server
+            .start(move |req: SbiRequest| {
+                let (s, sub, tr) = (s.clone(), sub.clone(), tr.clone());
+                async move {
+                    let uri = req.header.uri.clone();
+                    let mut seen = s.lock().unwrap();
+                    seen.push((uri.clone(), req.http.content.clone().unwrap_or_default()));
+                    if uri.ends_with("/subscriptions") {
+                        let status = sub.load(Ordering::SeqCst);
+                        SbiResponse::with_status(status)
+                            .with_json_body(&serde_json::json!({
+                                "n1n2NotifySubscriptionId": format!("s{}", seen.len()),
+                            }))
+                            .unwrap()
+                    } else {
+                        SbiResponse::with_status(tr.load(Ordering::SeqCst))
+                            .with_json_body(
+                                &serde_json::json!({"cause": "N1_N2_TRANSFER_INITIATED"}),
+                            )
+                            .unwrap()
+                    }
+                }
+            })
+            .await
+            .expect("stand-in AMF starts");
+        StandInAmf {
+            server,
+            amf: amf_at(addr.port()),
+            seen,
+            subscribe_status,
+            transfer_status,
+        }
+    }
+
+    impl StandInAmf {
+        /// The N1 token of each subscribe this AMF has received, in order.
+        fn subscribed_n1_tokens(&self) -> Vec<String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(uri, _)| uri.ends_with("/subscriptions"))
+                .map(|(_, body)| {
+                    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+                    let uri = v["n1NotifyCallbackUri"].as_str().unwrap().to_string();
+                    uri.rsplit('/').next().unwrap().to_string()
+                })
+                .collect()
+        }
+    }
+
+    /// Whether this LMF acts on an N1 notification on `token` (it reaches the
+    /// handler, which answers a body-less POST 400) rather than refusing it (404).
+    async fn admitted(token: &str) -> bool {
+        match lmf_sbi_request_handler(SbiRequest::post(n1_path(token)))
+            .await
+            .status
+        {
+            400 => true,
+            404 => false,
+            other => panic!("unexpected {other}"),
+        }
+    }
+
+    /// #1518, restarts of both peers. The subscription is made once and reused;
+    /// after the AMF loses it (it answers a transfer 404) the LMF forgets it and the
+    /// next request subscribes again with a new token, the old one now refused;
+    /// after the LMF restarts, its old token is refused and it subscribes again; a
+    /// subscribe the AMF refuses leaves no token admitted.
+    ///
+    /// REVERT-VERIFIED: without the 404 forget, the lost subscription's token is
+    /// still admitted; with `fini` not clearing the store, the pre-restart token is;
+    /// with a refused create not forgotten, its token is; without one create per
+    /// key, the second call subscribes again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn both_peers_restarting_leave_only_live_tokens_admitted_1518() {
+        let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        lmf_self()
+            .read()
+            .unwrap()
+            .set_callback_base("http://127.0.0.1:7816");
+        let ue = "imsi-001010000015186";
+        let amf = stand_in_amf().await;
+
+        namf_client::ensure_n1n2_subscription(&amf.amf, ue).await;
+        namf_client::ensure_n1n2_subscription(&amf.amf, ue).await;
+        let tokens = amf.subscribed_n1_tokens();
+        assert_eq!(tokens.len(), 1, "made once, then reused");
+        assert!(admitted(&tokens[0]).await);
+
+        // The AMF restarted: it no longer knows the UE.
+        amf.transfer_status.store(404, Ordering::SeqCst);
+        let outcome = namf_client::send_n1n2_transfer(&amf.amf, ue, "c", "lmf", vec![0x90]).await;
+        assert!(matches!(outcome, namf_client::TransferOutcome::Failed(_)));
+        assert!(!admitted(&tokens[0]).await, "the lost subscription's token");
+        namf_client::ensure_n1n2_subscription(&amf.amf, ue).await;
+        let tokens = amf.subscribed_n1_tokens();
+        assert_eq!(tokens.len(), 2, "subscribed again");
+        assert_ne!(tokens[0], tokens[1]);
+        assert!(admitted(&tokens[1]).await);
+
+        // The LMF restarts: nothing it held survives.
+        lmf_context_final();
+        lmf_context_init(1024);
+        lmf_self()
+            .read()
+            .unwrap()
+            .set_callback_base("http://127.0.0.1:7816");
+        assert!(!admitted(&tokens[1]).await, "the pre-restart token");
+        namf_client::ensure_n1n2_subscription(&amf.amf, ue).await;
+        let tokens = amf.subscribed_n1_tokens();
+        assert_eq!(tokens.len(), 3);
+        assert!(admitted(&tokens[2]).await);
+
+        // A subscribe the AMF refuses is forgotten, its token with it.
+        let other = "imsi-001010000015187";
+        amf.subscribe_status.store(500, Ordering::SeqCst);
+        namf_client::ensure_n1n2_subscription(&amf.amf, other).await;
+        let tokens = amf.subscribed_n1_tokens();
+        assert_eq!(tokens.len(), 4);
+        assert!(!admitted(&tokens[3]).await, "a refused create's token");
+        assert!(lmf_self()
+            .read()
+            .unwrap()
+            .amf_subscription_get(&amf.amf.subscription_key(other))
+            .is_none());
+        amf.server.stop().await.ok();
+    }
+
+    /// #1518 (R8 M2): a subscribe whose task is cancelled mid-create (its
+    /// DetermineLocation consumer disconnected) abandons its in-flight entry, so
+    /// the key can be subscribed again and the entry holds no cap slot. Both the
+    /// UE and the non-UE paths.
+    ///
+    /// REVERT-VERIFIED: with `InFlightCreate`'s drop not abandoning, the key stays
+    /// in flight after the abort and a fresh start is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_subscribe_leaves_nothing_in_flight_1518() {
+        let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        lmf_self()
+            .read()
+            .unwrap()
+            .set_callback_base("http://127.0.0.1:7816");
+
+        // An AMF that accepts the connection and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hold = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let amf = amf_at(port);
+        let ue = "imsi-001010000015188";
+
+        // By key: other modules' tests share the store without this lock.
+        let held = |key: &str| lmf_self().read().unwrap().amf_subscription_holds(key);
+        let in_flight = |key: String| async move {
+            for _ in 0..100 {
+                if lmf_self().read().unwrap().amf_subscription_holds(&key) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("{key} never went in flight");
+        };
+
+        let ue_amf = amf.clone();
+        let task = tokio::spawn(async move {
+            namf_client::ensure_n1n2_subscription(&ue_amf, ue).await;
+        });
+        in_flight(amf.subscription_key(ue)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!held(&amf.subscription_key(ue)), "abandoned on cancel");
+        assert!(
+            lmf_self()
+                .read()
+                .unwrap()
+                .amf_subscription_begin(&amf.subscription_key(ue), &amf, Some(ue))
+                .is_some(),
+            "the UE can be subscribed again"
+        );
+        lmf_self()
+            .read()
+            .unwrap()
+            .amf_subscription_forget(&amf.subscription_key(ue));
+
+        let non_ue_amf = amf.clone();
+        let task = tokio::spawn(async move {
+            namf_client::ensure_non_ue_nrppa_subscription(&non_ue_amf, "lmf-1518").await;
+        });
+        in_flight(amf.non_ue_subscription_key()).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!held(&amf.non_ue_subscription_key()), "abandoned on cancel");
+
+        hold.abort();
+        lmf_context_final();
     }
 }
 
