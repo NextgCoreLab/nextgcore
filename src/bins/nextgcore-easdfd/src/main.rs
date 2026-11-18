@@ -359,12 +359,7 @@ async fn main() -> Result<()> {
     .map_err(|e| anyhow::anyhow!("SBI security profile: {e}"))?;
     // The NRF calls (registration, heartbeat) carry an access token for the NRF
     // when the profile asks for OAuth2 (#1665, #1667), as every other NF's do.
-    nextgcore_sbi::nrf_tls::set_nrf_oauth2_client(nextgcore_sbi::oauth::outbound_oauth2_client(
-        sbi_profile,
-        false,
-        Some(&nrf_uri),
-        nextgcore_sbi::types::NfType::Easdf,
-    ));
+    nextgcore_sbi::nrf_tls::set_nrf_oauth2_client(easdf_nrf_oauth2_client(sbi_profile, &nrf_uri));
 
     let sbi_server = SbiServer::new(sbi_server_config);
     log::info!("Starting EASDF SBI server on {addr}");
@@ -949,8 +944,6 @@ async fn handle_baseline_pattern_delete(id: &str) -> SbiResponse {
     }
 }
 
-/// Build the NFProfile registered with the NRF (TS 29.510): nfType EASDF
-/// advertising the neasdf-dnscontext service (TS 29.556).
 /// The EASDF's SBI listener configuration (#1677): `--tls` first, when given
 /// (`tls` is its `(key, cert)`), then the SBI security `profile`, which under
 /// `production` sets TLS from `policy`'s certificate paths, mTLS and OAuth2 with
@@ -976,6 +969,24 @@ fn easdf_server_config(
     )
 }
 
+/// The OAuth2 client the EASDF's own NRF calls (registration, heartbeat) use
+/// (#1665, #1667): under `production`, one that asks `nrf_uri` for an access
+/// token as consumer nfType EASDF, so an NRF that gates nnrf-nfm does not lock
+/// the EASDF out of registration. `None` under `dev`, or without an NRF.
+fn easdf_nrf_oauth2_client(
+    profile: nextgcore_sbi::security::SbiProfile,
+    nrf_uri: &str,
+) -> Option<std::sync::Arc<nextgcore_sbi::oauth::OAuth2Client>> {
+    nextgcore_sbi::oauth::outbound_oauth2_client(
+        profile,
+        false,
+        Some(nrf_uri),
+        nextgcore_sbi::types::NfType::Easdf,
+    )
+}
+
+/// Build the NFProfile registered with the NRF (TS 29.510): nfType EASDF
+/// advertising the neasdf-dnscontext service (TS 29.556).
 fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
     nextgcore_sbi::nf_addressing::classify_profile_host(
         serde_json::json!({
@@ -1116,6 +1127,40 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1677/#1667: under `production` the EASDF's NRF calls get an OAuth2
+    /// client that asks the configured NRF for a token as consumer nfType
+    /// EASDF; under `dev`, and with no NRF configured, they get none. The source
+    /// guard `every_nf_with_an_outbound_oauth2_client_gives_it_to_its_nrf_calls_1667`
+    /// (nextgcore-sbi security.rs) pins that `main` installs this client.
+    ///
+    /// REVERT-VERIFIED: with the helper passing `SbiProfile::Dev` instead of
+    /// `profile`, the production assertion fails.
+    #[test]
+    fn production_nrf_calls_carry_an_easdf_oauth2_client_1677() {
+        use nextgcore_sbi::security::SbiProfile;
+        let nrf = "https://nrf.example:7777";
+        let client = easdf_nrf_oauth2_client(SbiProfile::Production, nrf)
+            .expect("production gives the NRF calls an OAuth2 client");
+        assert_eq!(
+            client.nrf_uri(),
+            nrf,
+            "the token is asked of the configured NRF"
+        );
+        assert_eq!(
+            client.self_consumer().nf_type,
+            nextgcore_sbi::types::NfType::Easdf,
+            "the EASDF asks for the token as itself"
+        );
+        assert!(
+            easdf_nrf_oauth2_client(SbiProfile::Dev, nrf).is_none(),
+            "dev sends no token"
+        );
+        assert!(
+            easdf_nrf_oauth2_client(SbiProfile::Production, "  ").is_none(),
+            "no NRF, no Authorization Server to ask"
+        );
+    }
 
     /// #1677: the EASDF listener follows the SBI security profile. Under
     /// `production`: TLS from the policy's paths, mTLS against its CA, and OAuth2
