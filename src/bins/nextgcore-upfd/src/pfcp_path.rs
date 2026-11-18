@@ -877,6 +877,9 @@ pub struct PfcpServer {
     allowed_peers: std::sync::RwLock<PeerAllowlist>,
     /// The IPv6 N3 GTP-U address, set once the IPv6 GTP-U socket is bound (#985).
     n3_ipv6: std::sync::RwLock<Option<Ipv6Addr>>,
+    /// #1851: recent responses, so a retransmitted request is answered with the
+    /// response its original got and is not executed again (TS 29.244 §6.4).
+    replies: std::sync::Mutex<crate::pfcp_dup::ResponseCache>,
 }
 
 /// Outstanding-heartbeat bookkeeping for peer-failure detection.
@@ -1305,6 +1308,7 @@ impl PfcpServer {
                 list.resolve_hosts();
             }),
             n3_ipv6: std::sync::RwLock::new(None),
+            replies: std::sync::Mutex::new(crate::pfcp_dup::ResponseCache::default()),
         })
     }
 
@@ -1470,6 +1474,11 @@ impl PfcpServer {
         self.clear_n6_delay_control();
         // #1513: the CP function's sessions are gone, and with them what it was told.
         *self.path_ledger.lock().unwrap() = PathReportLedger::default();
+        // #1851: and the responses it was given -- a restarted peer's requests are new.
+        self.replies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.delete_association_sessions(peer, reason).await;
     }
 
@@ -1635,6 +1644,38 @@ impl PfcpServer {
         // The source is matched by IP, never by port: the association is between Node
         // IDs (§6.2.6), so any of the association's host addresses qualifies (its Setup
         // source, its IPv4/IPv6 Node ID, or the addresses its FQDN Node ID resolves to).
+        // #1851, TS 29.244 §6.4: a retransmitted request (same Sequence Number, same
+        // content, same peer address and port) is answered with the response its
+        // original got, and NOT executed again. Checked before the association gate:
+        // a retransmitted Association Release must get its success again, not the
+        // cause 72 the release it repeats has since made true.
+        let is_request = is_request_type(header.msg_type);
+        if is_request {
+            let cached = self
+                .replies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .replay(
+                    src_addr,
+                    header.sequence_number,
+                    data,
+                    std::time::Instant::now(),
+                );
+            if let Some(response) = cached {
+                log::debug!(
+                    "PFCP request type={} seq={} from {src_addr} is a retransmission: \
+                     resending its response, not executing it again",
+                    header.msg_type,
+                    header.sequence_number
+                );
+                self.socket
+                    .send_to(&response, src_addr)
+                    .await
+                    .map_err(|e| format!("Send error: {e}"))?;
+                return Ok(());
+            }
+        }
+
         let src_ip = src_addr.ip();
         let from_peer = self
             .association
@@ -1681,7 +1722,7 @@ impl PfcpServer {
                         &resp_payload,
                         session_level,
                     );
-                    let _ = self.socket.send_to(&response, src_addr).await;
+                    let _ = self.reply(&response, src_addr).await;
                     return Ok(());
                 }
                 t => {
@@ -1695,9 +1736,57 @@ impl PfcpServer {
             }
         }
 
+        if !is_request {
+            return self.dispatch(&header, payload, data, src_addr).await;
+        }
+        self.replies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .begin(src_addr, header.sequence_number, data);
+        let result = self.dispatch(&header, payload, data, src_addr).await;
+        // Kept only for the CP function this UPF is associated with -- before the
+        // request (from_peer) or because of it (an accepted Setup). Anyone else got a
+        // refusal that is answered the same way again without state, so caching it
+        // would only let strangers push the CP function's responses out.
+        let keep = from_peer
+            || self
+                .association
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|a| a.owns(src_ip));
+        let mut replies = self.replies.lock().unwrap_or_else(|e| e.into_inner());
+        if keep && header.msg_type == pfcp_type::ASSOCIATION_SETUP_REQUEST {
+            // A Setup that is not a retransmission starts a new association: what
+            // the previous one was answered is no answer to the new one's requests,
+            // which a restarted CP function numbers from the start again.
+            replies.clear();
+        }
+        replies.finish(keep, std::time::Instant::now());
+        result
+    }
+
+    /// Send `response` to `to`, keeping it for a retransmission of the request it
+    /// answers (#1851). Every response to a request goes out through here.
+    async fn reply(&self, response: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+        self.replies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(to, response);
+        self.socket.send_to(response, to).await
+    }
+
+    /// Handle one PFCP message the association gate admitted.
+    async fn dispatch(
+        &self,
+        header: &ParsedPfcpHeader,
+        payload: &[u8],
+        data: &[u8],
+        src_addr: SocketAddr,
+    ) -> Result<(), String> {
         match header.msg_type {
             pfcp_type::HEARTBEAT_REQUEST => {
-                self.handle_heartbeat_request(&header, payload, src_addr)
+                self.handle_heartbeat_request(header, payload, src_addr)
                     .await?;
             }
             pfcp_type::HEARTBEAT_RESPONSE => {
@@ -1710,27 +1799,27 @@ impl PfcpServer {
                 }
             }
             pfcp_type::ASSOCIATION_SETUP_REQUEST => {
-                self.handle_association_setup_request(&header, payload, data, src_addr)
+                self.handle_association_setup_request(header, payload, data, src_addr)
                     .await?;
             }
             pfcp_type::ASSOCIATION_RELEASE_REQUEST => {
-                self.handle_association_release_request(&header, src_addr)
+                self.handle_association_release_request(header, src_addr)
                     .await?;
             }
             pfcp_type::ASSOCIATION_UPDATE_REQUEST => {
-                self.handle_association_update_request(&header, payload, src_addr)
+                self.handle_association_update_request(header, payload, src_addr)
                     .await?;
             }
             pfcp_type::SESSION_ESTABLISHMENT_REQUEST => {
-                self.handle_session_establishment_request(&header, payload, src_addr)
+                self.handle_session_establishment_request(header, payload, src_addr)
                     .await?;
             }
             pfcp_type::SESSION_MODIFICATION_REQUEST => {
-                self.handle_session_modification_request(&header, payload, src_addr)
+                self.handle_session_modification_request(header, payload, src_addr)
                     .await?;
             }
             pfcp_type::SESSION_DELETION_REQUEST => {
-                self.handle_session_deletion_request(&header, payload, src_addr)
+                self.handle_session_deletion_request(header, payload, src_addr)
                     .await?;
             }
             pfcp_type::NODE_REPORT_RESPONSE => {
@@ -1850,8 +1939,7 @@ impl PfcpServer {
             false, // No SEID in header
         );
 
-        self.socket
-            .send_to(&response, src_addr)
+        self.reply(&response, src_addr)
             .await
             .map_err(|e| format!("Send error: {e}"))?;
 
@@ -1983,8 +2071,7 @@ impl PfcpServer {
                 &resp_payload,
                 false,
             );
-            self.socket
-                .send_to(&response, src_addr)
+            self.reply(&response, src_addr)
                 .await
                 .map_err(|e| format!("Send error: {e}"))?;
             return Ok(());
@@ -2118,8 +2205,7 @@ impl PfcpServer {
             false,
         );
 
-        self.socket
-            .send_to(&response, src_addr)
+        self.reply(&response, src_addr)
             .await
             .map_err(|e| format!("Send error: {e}"))?;
 
@@ -2144,8 +2230,7 @@ impl PfcpServer {
             &resp_payload,
             false,
         );
-        self.socket
-            .send_to(&response, src_addr)
+        self.reply(&response, src_addr)
             .await
             .map_err(|e| format!("Send error: {e}"))?;
         Ok(())
@@ -2169,8 +2254,7 @@ impl PfcpServer {
             &resp_payload,
             false,
         );
-        self.socket
-            .send_to(&response, src_addr)
+        self.reply(&response, src_addr)
             .await
             .map_err(|e| format!("Send error: {e}"))?;
 
@@ -2300,8 +2384,7 @@ impl PfcpServer {
                 &resp_payload,
                 true,
             );
-            self.socket
-                .send_to(&response, src_addr)
+            self.reply(&response, src_addr)
                 .await
                 .map_err(|e| format!("Send error: {e}"))?;
             return Ok(());
@@ -2333,8 +2416,7 @@ impl PfcpServer {
                 &resp_payload,
                 true,
             );
-            self.socket
-                .send_to(&response, src_addr)
+            self.reply(&response, src_addr)
                 .await
                 .map_err(|e| format!("Send error: {e}"))?;
             return Ok(());
@@ -2359,8 +2441,7 @@ impl PfcpServer {
                     &resp_payload,
                     true,
                 );
-                self.socket
-                    .send_to(&response, src_addr)
+                self.reply(&response, src_addr)
                     .await
                     .map_err(|e| format!("Send error: {e}"))?;
                 return Ok(());
@@ -2412,8 +2493,7 @@ impl PfcpServer {
                         &resp_payload,
                         true,
                     );
-                    self.socket
-                        .send_to(&response, src_addr)
+                    self.reply(&response, src_addr)
                         .await
                         .map_err(|e| format!("Send error: {e}"))?;
                     return Ok(());
@@ -2464,8 +2544,7 @@ impl PfcpServer {
                 &resp_payload,
                 true,
             );
-            self.socket
-                .send_to(&response, src_addr)
+            self.reply(&response, src_addr)
                 .await
                 .map_err(|e| format!("Send error: {e}"))?;
             return Ok(());
@@ -2535,8 +2614,7 @@ impl PfcpServer {
                             &resp_payload,
                             true,
                         );
-                        self.socket
-                            .send_to(&response, src_addr)
+                        self.reply(&response, src_addr)
                             .await
                             .map_err(|e| format!("Send error: {e}"))?;
                         return Ok(());
@@ -2722,7 +2800,7 @@ impl PfcpServer {
             true,
         );
 
-        if let Err(e) = self.socket.send_to(&response, src_addr).await {
+        if let Err(e) = self.reply(&response, src_addr).await {
             // #1815: the session is not stored, so nothing would ever give its TEIDs
             // back; the CP function's retransmission chooses afresh.
             self.release_teids(chosen_teids);
@@ -3630,8 +3708,7 @@ impl PfcpServer {
                     &resp_payload,
                     true,
                 );
-                self.socket
-                    .send_to(&response, src_addr)
+                self.reply(&response, src_addr)
                     .await
                     .map_err(|e| format!("Send error: {e}"))?;
                 return Ok(());
@@ -3722,8 +3799,7 @@ impl PfcpServer {
             true,
         );
 
-        self.socket
-            .send_to(&response, src_addr)
+        self.reply(&response, src_addr)
             .await
             .map_err(|e| format!("Send error: {e}"))?;
 
@@ -3832,8 +3908,7 @@ impl PfcpServer {
                     &resp_payload,
                     true,
                 );
-                self.socket
-                    .send_to(&response, src_addr)
+                self.reply(&response, src_addr)
                     .await
                     .map_err(|e| format!("Send error: {e}"))?;
                 return Ok(());
@@ -3857,8 +3932,7 @@ impl PfcpServer {
             true,
         );
 
-        self.socket
-            .send_to(&response, src_addr)
+        self.reply(&response, src_addr)
             .await
             .map_err(|e| format!("Send error: {e}"))?;
 
@@ -4245,8 +4319,7 @@ impl PfcpServer {
             &resp_payload,
             false,
         );
-        self.socket
-            .send_to(&response, src_addr)
+        self.reply(&response, src_addr)
             .await
             .map_err(|e| format!("Send error: {e}"))?;
         Ok(())
@@ -13342,5 +13415,172 @@ mod tests {
             .await
             .is_err());
         assert!(!dp.with_qos_flow_monitor(|m| m.is_active()));
+    }
+
+    // ------------------------------------------------------------------
+    // #1851, TS 29.244 §6.4: a retransmitted request is answered with the
+    // response its original got and is not executed again.
+    // ------------------------------------------------------------------
+
+    /// An establishment whose one PDR asks the UPF to CHOOSE its F-TEID, so a
+    /// second execution would show as a second TEID and a second session.
+    fn choosing_establishment_1851() -> Vec<u8> {
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        b.add_f_seid(&crate::n4_build::FSeid {
+            seid: 0x1851,
+            ipv4: Some(Ipv4Addr::new(127, 0, 0, 9)),
+            ipv6: None,
+        });
+        b.add_tlv(pfcp_ie::CREATE_PDR, &create_pdr_1815(1, &[0x05]));
+        b.add_tlv(pfcp_ie::CREATE_FAR, &far_body(1, 0x02));
+        b.build()
+    }
+
+    /// **#1851.** A retransmitted Session Establishment Request (same Sequence
+    /// Number, same content, same peer) gets the original response byte for byte
+    /// -- the same UP F-SEID and chosen F-TEID -- and creates nothing: one session,
+    /// one TEID, one SessionEstablished event.
+    #[tokio::test]
+    async fn a_retransmitted_establishment_gets_the_original_response_1851() {
+        let (server, smf, addr, mut rx) = spawn_test_server().await;
+        let assoc = build_association_setup_request_payload(Some(1));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+
+        let request = encode_pfcp(50, Some(0), 2, &choosing_establishment_1851());
+        let first = exchange(&smf, addr, &request).await;
+        assert_eq!(response_cause(&first), PfcpCause::RequestAccepted as u8);
+        let again = exchange(&smf, addr, &request).await;
+        assert_eq!(
+            again, first,
+            "a retransmission must be answered with the original response"
+        );
+        assert_eq!(
+            server.sessions.read().await.len(),
+            1,
+            "one session, not two"
+        );
+        assert_eq!(server.teids.in_use(), 1, "the retransmission chose no TEID");
+        assert!(matches!(
+            rx.recv().await,
+            Some(PfcpSessionEvent::SessionEstablished { .. })
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "the retransmission must not reach the data plane"
+        );
+    }
+
+    /// **#1851.** A retransmitted Session Modification Request is answered with
+    /// the original response and not applied twice. A DIFFERENT modification
+    /// reusing the Sequence Number is a new request and is executed (§6.4 matches
+    /// a retransmission by its content, not only by its number).
+    #[tokio::test]
+    async fn a_retransmitted_modification_is_not_applied_twice_1851() {
+        let (server, smf, addr, mut rx, _dp, upf_seid) = established_session().await;
+        // Relative to what the establishment holds (an SMF-named TEID is reserved
+        // too once #1834 lands), so the count is the modification's alone.
+        let base = server.teids.in_use();
+        let request = encode_pfcp(52, Some(upf_seid), 3, &choosing_modification_1815(false));
+        let first = exchange(&smf, addr, &request).await;
+        assert_eq!(response_cause(&first), PfcpCause::RequestAccepted as u8);
+        assert_eq!(server.teids.in_use(), base + 2);
+        assert!(
+            rx.recv().await.is_some(),
+            "the modification reaches the data plane"
+        );
+
+        let again = exchange(&smf, addr, &request).await;
+        assert_eq!(again, first, "answered with the original response");
+        assert_eq!(
+            server.teids.in_use(),
+            base + 2,
+            "and not applied a second time"
+        );
+        assert!(rx.try_recv().is_err(), "nothing new reaches the data plane");
+
+        // Same Sequence Number, new content: executed.
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::CREATE_PDR, &create_pdr_1815(0x74, &[0x05]));
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(server.teids.in_use(), base + 3, "a new request is executed");
+    }
+
+    /// **#1851.** A retransmitted Association Release Request gets its success
+    /// again, not the cause 72 the release it repeats has since made true: the
+    /// replay is checked before the association gate.
+    #[tokio::test]
+    async fn a_retransmitted_release_gets_its_success_again_1851() {
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        let assoc = build_association_setup_request_payload(Some(1));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        let mut rel = crate::n4_build::PfcpMessageBuilder::new();
+        rel.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        let request = encode_pfcp(9, None, 2, &rel.build());
+        let first = exchange(&smf, addr, &request).await;
+        assert_eq!(response_cause(&first), PfcpCause::RequestAccepted as u8);
+        assert!(!server.is_associated().await);
+        let again = exchange(&smf, addr, &request).await;
+        assert_eq!(
+            response_cause(&again),
+            PfcpCause::RequestAccepted as u8,
+            "the retransmitted release must not be refused with cause 72"
+        );
+        assert_eq!(again, first);
+    }
+
+    /// **#1851.** Only the associated CP function's responses are kept: a
+    /// heartbeat from a host with no association is answered but not cached (its
+    /// answer needs no state to repeat), while an accepted Setup -- whose source
+    /// owns the association only BECAUSE of it -- is kept.
+    #[tokio::test]
+    async fn only_the_associated_cp_function_s_responses_are_kept_1851() {
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        let mut hb = crate::n4_build::PfcpMessageBuilder::new();
+        hb.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, 1);
+        let resp = exchange(&smf, addr, &encode_pfcp(1, None, 1, &hb.build())).await;
+        assert_eq!(resp[1], pfcp_type::HEARTBEAT_RESPONSE);
+        assert_eq!(
+            server.replies.lock().unwrap().len(),
+            0,
+            "a stranger's is not kept"
+        );
+
+        let assoc = build_association_setup_request_payload(Some(1));
+        let resp = exchange(&smf, addr, &encode_pfcp(5, None, 2, &assoc)).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(
+            server.replies.lock().unwrap().len(),
+            1,
+            "the accepted Setup's is"
+        );
+    }
+
+    /// **#1851.** A peer restart detected from a heartbeat's new Recovery Time
+    /// Stamp forgets the responses its previous incarnation was given: the same
+    /// establishment bytes under the same Sequence Number are now the restarted
+    /// peer's request and are judged afresh (no association: cause 72), not
+    /// answered with the session the old incarnation got.
+    #[tokio::test]
+    async fn a_detected_peer_restart_forgets_the_old_responses_1851() {
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        let assoc = build_association_setup_request_payload(Some(1));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        let request = encode_pfcp(50, Some(0), 2, &choosing_establishment_1851());
+        let first = exchange(&smf, addr, &request).await;
+        assert_eq!(response_cause(&first), PfcpCause::RequestAccepted as u8);
+
+        let mut hb = crate::n4_build::PfcpMessageBuilder::new();
+        hb.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, 2);
+        let _ = exchange(&smf, addr, &encode_pfcp(1, None, 3, &hb.build())).await;
+        assert!(!server.is_associated().await, "the restart was detected");
+
+        let again = exchange(&smf, addr, &request).await;
+        assert_eq!(
+            response_cause(&again),
+            PfcpCause::NoEstablishedPfcpAssociation as u8,
+            "the old incarnation's response must not be replayed to the new one"
+        );
     }
 }
