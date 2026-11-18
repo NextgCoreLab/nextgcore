@@ -143,11 +143,10 @@ pub mod test_support {
     /// [`SMF_ENV_LOCK`].
     pub static UCMF_ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
-    /// Serialises tests that create, count or delete the process-global broadcast
-    /// MBS contexts (`crate::context::amf_mcast`, served by Namf_MBSBroadcast
-    /// ContextCreate / ContextDelete), notably mbsmfd's tests against this crate's
-    /// real handler (#1758): one counts the contexts while another deletes one.
-    pub static MBS_CONTEXT_LOCK: Mutex<()> = Mutex::const_new(());
+    /// The lock for the process-global broadcast MBS contexts, declared beside
+    /// them in `crate::context` (#1822 item 2) and re-exported here for the peer
+    /// crates' tests (mbsmfd, #1758).
+    pub use crate::context::MBS_CONTEXT_LOCK;
 
     /// Initialize the process-global AMF context for in-process strict-peer
     /// tests (wraps [`crate::context::amf_context_init`] with test capacities).

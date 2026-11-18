@@ -5108,6 +5108,67 @@ udr:
     /// amf-3gpp-access: strict-peer rejection, full registration round-trip,
     /// PATCH, DELETE, and DataChangeNotify delivery to a subs-to-notify
     /// subscriber over a real local listener.
+    /// #1814: a subscription receives only the UEs its `monitoredResourceUris`
+    /// name. UE A's subscription and a ueId-less one monitoring the bare suffix
+    /// `/pp-data` are both created, then UE B's pp-data and UE A's pp-data change.
+    /// UE A's subscription gets exactly UE A's change, and nothing reaches either
+    /// callback for UE B.
+    ///
+    /// REVERT-VERIFIED: with `uri_covers`'s raw suffix match restored, the
+    /// `/pp-data` subscription is notified of UE B's change. That notification
+    /// arrives first, at `/cb/suffix`, so the first assertion (`path == "/cb/a"`)
+    /// fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_subscription_gets_only_the_ues_it_monitors_1814() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (udr, client, listener, cb_port, mut rx) = start_udr_and_listener().await;
+        let ue_a = "imsi-001010000018141";
+        let ue_b = "imsi-001010000018142";
+        let pp = |ue: &str| format!("/nudr-dr/v2/subscription-data/{ue}/pp-data");
+        for (cb, monitored) in [("a", pp(ue_a)), ("suffix", "/pp-data".to_string())] {
+            let resp = client
+                .post_json(
+                    "/nudr-dr/v2/subscription-data/subs-to-notify",
+                    &json!({
+                        "callbackReference": format!("http://127.0.0.1:{cb_port}/cb/{cb}"),
+                        "monitoredResourceUris": [monitored]
+                    }),
+                )
+                .await
+                .expect("POST sub");
+            assert_eq!(resp.status, 201, "{cb}");
+        }
+
+        let doc = json!({"communicationCharacteristics": {"ppSubsRegTimer": {"subsRegTimer": 60}}});
+        for ue in [ue_b, ue_a] {
+            let resp = client.put_json(&pp(ue), &doc).await.expect("PUT pp-data");
+            assert!(
+                resp.status == 201 || resp.status == 204,
+                "{ue}: {}",
+                resp.status
+            );
+        }
+
+        let (path, notify) = recv_notification(&mut rx).await;
+        let mut others = Vec::new();
+        while let Ok(Some(n)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            others.push(n);
+        }
+        udr.stop().await.expect("udr stops");
+        listener.stop().await.expect("listener stops");
+
+        assert_eq!(
+            path, "/cb/a",
+            "UE A's subscription is told of UE A's change"
+        );
+        assert_eq!(notify["ueId"], ue_a);
+        assert_eq!(notify["notifyItems"][0]["resourceId"], pp(ue_a));
+        assert!(
+            others.is_empty(),
+            "no other notification, UE B's change included: {others:?}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_http_amf3gpp_lifecycle_and_notify() {
         // #1666: the notification client follows the SBI profile, and this

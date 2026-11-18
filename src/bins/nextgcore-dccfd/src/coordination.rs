@@ -100,8 +100,18 @@ pub fn coordination_enabled() -> bool {
 }
 
 /// Test-only: set the config and toggle without going through startup.
+///
+/// The switch is process-global, so the caller must hold
+/// `context::GLOBAL_TEST_LOCK`; this panics when the lock is free (#1822 item 3).
 #[cfg(test)]
+#[track_caller]
 pub fn set_coordination_for_test(config: Option<CoordinationConfig>) {
+    if crate::context::GLOBAL_TEST_LOCK.try_lock().is_ok() {
+        panic!(
+            "the coordination switch was flipped with GLOBAL_TEST_LOCK free: take it in \
+             this test (#1822)"
+        );
+    }
     match config {
         Some(c) => {
             // Replaced per test: each runs its own loopback NRF.
