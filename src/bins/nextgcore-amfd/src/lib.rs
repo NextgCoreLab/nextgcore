@@ -9,6 +9,8 @@
 pub mod amf_sm;
 pub mod congestion; // NAS-level congestion control posture (TS 24.501 §5.3.5)
 pub mod context;
+#[cfg(feature = "demo-d440a-ai-paging")]
+pub mod demo_d440a; // nextgsim#462: demo d440a-ai-paging over paging.strategy recommended-first
 #[cfg(feature = "demo-d440c-nwdaf-paging")]
 pub mod demo_d440c; // nextgsim#464: demo d440c-nwdaf-paging over paging.strategy nwdaf-mobility
 pub mod emergency; // #203: Emergency services (TS 23.167)
@@ -1208,13 +1210,16 @@ impl Default for AmfApp {
 /// The environment variable naming the AMF's `/metrics` port (#1334).
 pub const METRICS_PORT_ENV: &str = "AMF_METRICS_PORT";
 
-/// The demos this build can run: `d440c-nwdaf-paging` under its feature, none
-/// otherwise.
+/// The demos this build can run: `d440a-ai-paging` and `d440c-nwdaf-paging`,
+/// each under its feature; none in a default build.
 pub fn demo_registry() -> nextgcore_demo::DemoRegistry {
+    #[allow(unused_mut)]
+    let mut specs: Vec<nextgcore_demo::DemoSpec> = Vec::new();
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    specs.push(demo_d440a::DEMO_SPEC);
     #[cfg(feature = "demo-d440c-nwdaf-paging")]
-    return nextgcore_demo::DemoRegistry::new(&[demo_d440c::DEMO_SPEC]);
-    #[cfg(not(feature = "demo-d440c-nwdaf-paging"))]
-    nextgcore_demo::DemoRegistry::default()
+    specs.push(demo_d440c::DEMO_SPEC);
+    nextgcore_demo::DemoRegistry::new(&specs)
 }
 
 /// The config file's root, for the `demo:` block. A missing file is no block,
@@ -1229,12 +1234,31 @@ fn config_root(config_path: &str) -> Result<serde_yaml::Value> {
 }
 
 /// Validate and install the `demo:` block, once per process, then apply what an
-/// active demo changes: `d440c-nwdaf-paging` forces the effective paging
-/// strategy, which is logged.
+/// active demo changes: `d440a-ai-paging` and `d440c-nwdaf-paging` each force the
+/// effective paging strategy, which is logged. Both at once fail startup: each
+/// would supersede the other's strategy.
 fn init_demos(config_path: &str) -> Result<()> {
     let root = config_root(config_path)?;
+    let active = nextgcore_demo::DemoConfig::from_root(&root)
+        .and_then(|c| c.validate(&demo_registry()))
+        .map_err(|e| anyhow::anyhow!("{e} ({e:?})"))?;
+    check_one_paging_demo(&active)?;
     nextgcore_demo::init_from_root(&root, &demo_registry())
         .map_err(|e| anyhow::anyhow!("{e} ({e:?})"))?;
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    if let Some(mode) = demo_d440a::mode() {
+        let ctx = context::amf_self();
+        let mut guard = ctx.write().unwrap_or_else(|e| e.into_inner());
+        let configured = guard.paging_strategy;
+        guard.paging_strategy = demo_d440a::effective_strategy(configured, Some(mode));
+        nextgcore_demo::demo_log!(
+            warn,
+            demo_d440a::DEMO_KEY,
+            "Paging strategy: {} (mode {mode} supersedes amf.paging.strategy: {})",
+            guard.paging_strategy.as_str(),
+            configured.as_str()
+        );
+    }
     #[cfg(feature = "demo-d440c-nwdaf-paging")]
     if let Some(mode) = demo_d440c::mode() {
         let ctx = context::amf_self();
@@ -1247,6 +1271,23 @@ fn init_demos(config_path: &str) -> Result<()> {
             "Paging strategy: {} (mode {mode} supersedes amf.paging.strategy: {})",
             guard.paging_strategy.as_str(),
             configured.as_str()
+        );
+    }
+    Ok(())
+}
+
+/// The paging demos this build has, in `active`: at most one may run, since each
+/// forces the effective paging strategy. Checked before anything is installed.
+fn check_one_paging_demo(active: &nextgcore_demo::ActiveDemos) -> Result<()> {
+    let paging: Vec<&str> = active
+        .entries()
+        .map(|(k, _)| k)
+        .filter(|k| ["d440a-ai-paging", "d440c-nwdaf-paging"].contains(k))
+        .collect();
+    if paging.len() > 1 {
+        anyhow::bail!(
+            "demos {} both set the paging strategy; enable one (PagingDemoConflict)",
+            paging.join(" and ")
         );
     }
     Ok(())

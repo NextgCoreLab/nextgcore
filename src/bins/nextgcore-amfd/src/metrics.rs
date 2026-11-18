@@ -948,6 +948,9 @@ pub fn render_amf_families(out: &mut String, census: &AmfCensus) {
     );
     // nextgsim#464: rendered only under `paging.strategy: nwdaf-mobility`.
     crate::nwdaf_mobility::render_metrics(out);
+    // nextgsim#462: rendered only while demo d440a-ai-paging is active.
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    crate::demo_d440a::render_metrics(out);
 }
 
 /// The whole AMF `/metrics` body.

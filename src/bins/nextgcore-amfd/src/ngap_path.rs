@@ -8426,6 +8426,25 @@ impl NgapServer {
                 )
             );
         }
+        #[cfg(feature = "demo-d440a-ai-paging")]
+        if let (Some(p), Some(_)) = (&paging, crate::demo_d440a::mode()) {
+            let gnb = self
+                .gnb_ids_of(&[association_id])
+                .await
+                .first()
+                .copied()
+                .flatten();
+            nextgcore_demo::demo_log!(
+                info,
+                crate::demo_d440a::DEMO_KEY,
+                "{}",
+                crate::demo_d440a::page_answered_line(
+                    p.supi.as_deref().unwrap_or("unknown"),
+                    gnb,
+                    u32::from(p.retransmit_count) + 1
+                )
+            );
+        }
         log::info!(
             "Service Request from CM-IDLE: UE {old_id} -> {amf_ue_ngap_id}, Service Accept in \
              Initial Context Setup with {} PDU session(s){}",
@@ -20657,6 +20676,8 @@ impl NgapServer {
             _ => (Vec::new(), None),
         };
         let area_len = area.len();
+        #[cfg(feature = "demo-d440a-ai-paging")]
+        let d440a_scope = crate::demo_d440a::Scope::of(!recommended.is_empty());
         #[cfg(feature = "demo-d440c-nwdaf-paging")]
         let demo_scope = if !recommended.is_empty() {
             crate::demo_d440c::Scope::Recommended
@@ -20780,12 +20801,30 @@ impl NgapServer {
                 )
             );
         }
+        #[cfg(feature = "demo-d440a-ai-paging")]
+        if crate::demo_d440a::mode().is_some() {
+            crate::demo_d440a::count_attempt(d440a_scope);
+            let gnb_ids = self.gnb_ids_of(&targets).await;
+            nextgcore_demo::demo_log!(
+                info,
+                crate::demo_d440a::DEMO_KEY,
+                "{}",
+                crate::demo_d440a::paging_sent_line(
+                    sent,
+                    paging.supi.as_deref().unwrap_or("unknown"),
+                    d440a_scope,
+                    &gnb_ids,
+                    u32::from(paging.retransmit_count) + 1
+                )
+            );
+        }
         Ok(sent)
     }
 
     /// The Global gNB ID of each association in `assocs`, in order; `None` for
-    /// one that is gone or gave no gNB ID (demo d440c-nwdaf-paging log lines).
-    #[cfg(feature = "demo-d440c-nwdaf-paging")]
+    /// one that is gone or gave no gNB ID (demo d440a-ai-paging and
+    /// d440c-nwdaf-paging log lines).
+    #[cfg(any(feature = "demo-d440a-ai-paging", feature = "demo-d440c-nwdaf-paging"))]
     async fn gnb_ids_of(&self, assocs: &[u64]) -> Vec<Option<u32>> {
         let sessions = self.sessions.read().await;
         assocs
@@ -26989,6 +27028,212 @@ mod tests {
             .iter()
             .all(|(_, p)| p.is_none()));
         crate::context::amf_self().read().unwrap().paging_remove(ue);
+    }
+
+    /// **nextgsim#462, demo d440a-ai-paging**, mode `ct`, through the real Release
+    /// Complete handler (NEXTGSIM's encoding of the recommendation), the N1N2
+    /// builder and the pump. With the demo on, attempt 1 logs `scope=recommended`
+    /// naming the RAN's gNBs in its order, the retransmission logs
+    /// `scope=registration-area`, and `amf_paging_attempts_total` counts one of
+    /// each. With the demo off the same page writes no `[demo:` line and counts
+    /// nothing.
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    #[tokio::test]
+    async fn demo_d440a_logs_and_counts_the_recommended_then_the_area_attempt() {
+        use crate::demo_d440a::{attempt_count, Scope};
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        // #1693: this test adds pages to, or pumps, the process-global paging map.
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
+        let _strategy =
+            PagingStrategyGuard::set(crate::context::PagingStrategy::RecommendedFirst).await;
+        let mut ngap = capturing_ngap_server().await;
+        let base = 14_620u64;
+        reco_grid(&ngap, base).await;
+        nextgcore_core::test_log::init();
+        for (i, demo_on) in [true, false].into_iter().enumerate() {
+            let _mode = demo_on.then(|| crate::demo_d440a::ModeOnThisThread::set("ct"));
+            let ue = 4_620_001u64 + i as u64;
+            let ran = 71 + i as u32;
+            let supi = format!("imsi-00101000046200{i}");
+            insert_connected_ue(&ngap, ue, ran, base + 1);
+            ngap.ue_auth_state
+                .with_mut(ue, |s| s.amf_ue.supi = Some(supi.clone()));
+            let lines = nextgcore_core::test_log::watch(format!("ue={supi} "));
+            ngap.handle_ue_context_release_complete(
+                base + 1,
+                &release_complete_with(ue, ran, Some(nextgsim_recommendation())),
+            )
+            .await
+            .expect("handled");
+            settle_offloaded_sbi(&mut ngap).await;
+            let (reco0, area0) = (
+                attempt_count(Scope::Recommended),
+                attempt_count(Scope::RegistrationArea),
+            );
+            queue_paging(&ngap, ue);
+            take_sent_ngap(&mut ngap);
+            ngap.process_paging_with(Duration::from_secs(3600)).await;
+            assert_eq!(
+                paged_on(&take_sent_ngap(&mut ngap), ue as u32),
+                vec![base + 1, base + 2],
+                "demo on={demo_on}: the base strategy pages the recommendation first"
+            );
+            ngap.process_paging_with(Duration::ZERO).await;
+            take_sent_ngap(&mut ngap);
+            let demo: Vec<String> = lines
+                .records()
+                .into_iter()
+                .filter(|r| r.contains("[demo:d440a-ai-paging]"))
+                .collect();
+            // CONTEXT_GUARD and the paging-map lock serialise every pump, so the
+            // counters moved only for this UE's attempts.
+            let counted = (
+                attempt_count(Scope::Recommended) - reco0,
+                attempt_count(Scope::RegistrationArea) - area0,
+            );
+            if demo_on {
+                assert_eq!(demo.len(), 2, "{demo:?}");
+                assert!(
+                    demo[0].ends_with(&format!(
+                        "[demo:d440a-ai-paging] Paging sent to 2/2 ue={supi} \
+                         scope=recommended targets=[gNB 0x1,gNB 0x2] attempt 1"
+                    )),
+                    "{demo:?}"
+                );
+                assert!(
+                    demo[1].contains(&format!(
+                        "[demo:d440a-ai-paging] Paging sent to 3/3 ue={supi} \
+                         scope=registration-area targets=["
+                    )) && demo[1].ends_with("] attempt 2"),
+                    "{demo:?}"
+                );
+                assert_eq!(counted, (1, 1), "one attempt of each scope");
+            } else {
+                assert!(demo.is_empty(), "demo off: no [demo: line: {demo:?}");
+                assert_eq!(counted, (0, 0), "demo off counts nothing");
+            }
+            crate::context::amf_self().read().unwrap().paging_remove(ue);
+            ngap.ue_auth_state.remove(ue);
+        }
+    }
+
+    /// **demo d440a-ai-paging**, mode `page-all`: the gNB sends no recommendation,
+    /// so the forced `recommended-first` pages the whole area from attempt 1 and
+    /// the demo line names it `scope=registration-area`.
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    #[tokio::test]
+    async fn demo_d440a_page_all_names_the_area_from_attempt_1() {
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
+        let forced = crate::demo_d440a::effective_strategy(
+            crate::context::PagingStrategy::RegistrationArea,
+            Some("page-all"),
+        );
+        assert_eq!(forced, crate::context::PagingStrategy::RecommendedFirst);
+        let _strategy = PagingStrategyGuard::set(forced).await;
+        let _mode = crate::demo_d440a::ModeOnThisThread::set("page-all");
+        let mut ngap = capturing_ngap_server().await;
+        let base = 14_630u64;
+        reco_grid(&ngap, base).await;
+        let ue = 4_620_011u64;
+        let supi = "imsi-001010000462011";
+        insert_connected_ue(&ngap, ue, 73, base + 1);
+        ngap.ue_auth_state
+            .with_mut(ue, |s| s.amf_ue.supi = Some(supi.to_string()));
+        nextgcore_core::test_log::init();
+        let lines = nextgcore_core::test_log::watch(format!("ue={supi} "));
+        ngap.handle_ue_context_release_complete(base + 1, &release_complete_with(ue, 73, None))
+            .await
+            .expect("handled");
+        settle_offloaded_sbi(&mut ngap).await;
+        queue_paging(&ngap, ue);
+        take_sent_ngap(&mut ngap);
+        ngap.process_paging_with(Duration::from_secs(3600)).await;
+        let mut paged = paged_on(&take_sent_ngap(&mut ngap), ue as u32);
+        paged.sort_unstable();
+        assert_eq!(paged, vec![base + 1, base + 2, base + 3]);
+        let demo: Vec<String> = lines
+            .records()
+            .into_iter()
+            .filter(|r| r.contains("[demo:d440a-ai-paging]"))
+            .collect();
+        assert_eq!(demo.len(), 1, "{demo:?}");
+        assert!(
+            demo[0].contains(&format!(
+                "[demo:d440a-ai-paging] Paging sent to 3/3 ue={supi} scope=registration-area \
+                 targets=["
+            )) && demo[0].ends_with("] attempt 1"),
+            "{demo:?}"
+        );
+        crate::context::amf_self().read().unwrap().paging_remove(ue);
+        ngap.ue_auth_state.remove(ue);
+    }
+
+    /// **demo d440a-ai-paging**, the success signal's last line, through a real
+    /// Service Request in an Initial UE Message from gNB 0x6: `page answered
+    /// ue=<supi> via gNB 0x6 attempt 1`. With the demo off, no `[demo:` line.
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    #[tokio::test]
+    async fn demo_d440a_logs_the_gnb_and_attempt_that_answered_the_page() {
+        let _ctx = crate::test_support::CONTEXT_GUARD.lock().await;
+        let _pages = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _guamis = serve_only_local_guami();
+        nextgcore_core::test_log::init();
+        for (i, demo_on) in [true, false].into_iter().enumerate() {
+            let _mode = demo_on.then(|| crate::demo_d440a::ModeOnThisThread::set("lsq"));
+            let mut ngap = capturing_ngap_server().await;
+            let assoc = 4_640u64 + i as u64;
+            insert_pws_test_gnb(
+                &ngap,
+                assoc,
+                0x6,
+                crate::context::RatType::Nr,
+                &[("001", "01", 0x76)],
+            )
+            .await;
+            let old_id = 4_620_501u64 + 10 * i as u64;
+            let new_id = old_id + 1;
+            let supi = format!("imsi-00101000046250{i}");
+            ngap.forced_amf_ue_ngap_id = Some(new_id);
+            let mut idle = idle_registered_ue(old_id);
+            idle.amf_ue.allowed_nssai = vec![crate::context::SNssai { sst: 1, sd: None }];
+            ngap.ue_auth_state.insert(old_id, idle);
+            let mut paging = paged_ue(old_id, 4);
+            paging.supi = Some(supi.clone());
+            crate::context::amf_self()
+                .read()
+                .unwrap()
+                .paging_add(paging);
+            let lines = nextgcore_core::test_log::watch(format!("page answered ue={supi} "));
+
+            let pdu = service_request_initial_ue(protected_service_request([0; 4], old_id as u32));
+            let _ = ngap.handle_initial_ue_message(assoc, &pdu).await;
+            assert!(
+                crate::context::amf_self()
+                    .read()
+                    .unwrap()
+                    .paging_find(old_id)
+                    .is_none(),
+                "precondition: the Service Request answered the page"
+            );
+            let answered = lines.records();
+            if demo_on {
+                assert_eq!(answered.len(), 1, "{answered:?}");
+                assert!(
+                    answered[0].ends_with(&format!(
+                        "[demo:d440a-ai-paging] page answered ue={supi} via gNB 0x6 attempt 1"
+                    )),
+                    "{answered:?}"
+                );
+            } else {
+                assert!(answered.is_empty(), "demo off: {answered:?}");
+            }
+            ngap.ue_auth_state.remove(new_id);
+            ngap.ue_auth_state.remove(old_id);
+        }
     }
 
     // ---- #1442: recommended-first paging (TS 38.413 §8.3.3.2, TS 23.502 §4.2.3.3) --
