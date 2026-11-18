@@ -9807,6 +9807,75 @@ mod tests {
         assert_eq!(resp.status, 404);
     }
 
+    /// **#1731, the old AMF's half.** A new AMF whose UE then failed authentication
+    /// answers NOT_TRANSFERRED, and the old AMF "continues as if the UE context
+    /// transfer service operation was never received" (TS 23.502 §4.2.2.2.2 step 10,
+    /// `23502-k20.txt:4180-4185`): the UE context leaves its transfer state, its PDU
+    /// sessions are not released, and the event subscriptions targeting it stay.
+    ///
+    /// REVERT-VERIFIED: with the NOT_TRANSFERRED arm leaving the transfer state as it
+    /// was, "back to no transfer" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_old_amf_told_not_transferred_keeps_the_ue_context_1731() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        let supi = "imsi-001010000173101";
+        let mut ue = setup_ue(supi, true, true);
+        let _sess = setup_sess(&ue, 7);
+        ue.amf_ue_context_transfer_state = UeContextTransferState::TransferOldAmf;
+        amf_self().read().unwrap().amf_ue_update(&ue);
+        let resp = namf_request_handler(
+            SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&json!({ "subscription": {
+                    "eventList": [{ "type": "CONNECTIVITY_STATE_REPORT" }],
+                    "eventNotifyUri": "http://127.0.0.1:9/notify/1731-old",
+                    "notifyCorrelationId": "corr-1731-old",
+                    "nfId": "3fa85f64-5717-4562-b3fc-2c963f661731",
+                    "supi": supi,
+                }}))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let _subscription = EventSubscriptionGuard::of(&resp);
+
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/transfer-update"))
+            .with_json_body(&json!({
+                "transferStatus": "NOT_TRANSFERRED",
+                "toReleaseSessionList": [7],
+            }))
+            .expect("json");
+        let resp = namf_request_handler(req).await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            body_json(&resp)["regStatusTransferComplete"].as_bool(),
+            Some(true)
+        );
+        let ctx = amf_self();
+        let guard = ctx.read().unwrap();
+        let stored = guard
+            .amf_ue_find_by_supi(supi)
+            .expect("the UE context is kept");
+        assert_eq!(
+            stored.amf_ue_context_transfer_state,
+            UeContextTransferState::Initial,
+            "back to no transfer"
+        );
+        let sess = guard
+            .sess_find_by_psi(ue.id, 7)
+            .expect("the session is kept");
+        assert!(
+            !sess.n1_released && !sess.n2_released,
+            "a session is released only on TRANSFERRED"
+        );
+        assert_eq!(
+            guard
+                .event_subscriptions_matching("CONNECTIVITY_STATE_REPORT", Some(supi))
+                .len(),
+            1,
+            "the subscription targeting the UE stays"
+        );
+    }
+
     /// #352 criterion 5: a `UEContextTransfer` addressed by **5G-GUTI** reaches the
     /// UE, through the real HTTP router.
     ///
