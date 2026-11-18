@@ -1983,6 +1983,13 @@ fn subscription_echo_json(sub: &EventSubscription) -> Value {
     } else if sub.one_time {
         subscription["options"] = json!({ "trigger": trigger });
     }
+    // #1832: the maximum number of reports round-trips.
+    if let Some(max) = sub.max_reports {
+        if subscription.get("options").is_none() {
+            subscription["options"] = json!({ "trigger": trigger });
+        }
+        subscription["options"]["maxReports"] = json!(max);
+    }
     subscription
 }
 
@@ -2010,6 +2017,113 @@ fn parse_rep_period(subscription: &Value) -> Result<Option<std::time::Duration>,
             ))),
         },
     }
+}
+
+/// #1832: the identity a report is about, as the maxReports count keys it: the
+/// SUPI, else the GPSI, else the PEI it carries; empty for an area-level report.
+fn report_ue_key(report: &Value) -> String {
+    ["supi", "gpsi", "pei"]
+        .iter()
+        .find_map(|k| report.get(*k).and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// #1832: claim `report` against `sub`'s maxReports.
+fn claim_report(sub: &EventSubscription, report: &Value) -> crate::context::ReportClaim {
+    let event_type = report.get("type").and_then(Value::as_str).unwrap_or("");
+    match amf_self().read() {
+        Ok(guard) => guard.event_subscription_claim_report(
+            &sub.subscription_id,
+            sub.max_reports,
+            event_type,
+            &report_ue_key(report),
+        ),
+        Err(_) => crate::context::ReportClaim::Granted { ended: false },
+    }
+}
+
+/// #1832: `options.maxReports`, else an `AmfEvent.maxReports` (Table 6.2.6.2.3-1
+/// NOTE 2: the same for every event, and the options' value has precedence). An
+/// integer of at least 1; `Ok(None)` when neither is present.
+#[allow(clippy::result_large_err)]
+fn parse_max_reports(subscription: &Value) -> Result<Option<u32>, Box<SbiResponse>> {
+    let from_events = subscription
+        .get("eventList")
+        .and_then(Value::as_array)
+        .and_then(|l| l.iter().find_map(|e| e.get("maxReports")));
+    let (attr, value) = match subscription.pointer("/options/maxReports") {
+        Some(v) if !v.is_null() => ("subscription.options.maxReports", v),
+        _ => match from_events {
+            Some(v) if !v.is_null() => ("subscription.eventList[].maxReports", v),
+            _ => return Ok(None),
+        },
+    };
+    value
+        .as_u64()
+        .filter(|n| *n >= 1)
+        .and_then(|n| u32::try_from(n).ok())
+        .map(Some)
+        .ok_or_else(|| Box::new(mandatory_ie_incorrect(attr, "not an integer of at least 1")))
+}
+
+/// #1832: a transferred subscription's maxReports. Its `options.maxReports` is the
+/// REMAINING number of reports (Table 6.2.6.2.6-1), so it becomes this AMF's
+/// maximum, counted from zero here. An unusable value is taken over as no maximum,
+/// logged.
+fn transferred_max_reports(entry: &Value) -> Option<u32> {
+    match parse_max_reports(entry) {
+        Ok(m) => m,
+        Err(_) => {
+            log::warn!(
+                "transferred event subscription carries no usable maxReports; taken over \
+                 without one"
+            );
+            None
+        }
+    }
+}
+
+/// #1832: `sub` as a transferred `eventSubscriptionList` entry for `ue`: its echo,
+/// with `options.maxReports` the REMAINING number of reports for the UE (Table
+/// 6.2.6.2.6-1) and the events that have made their maximum left out (they ended).
+pub(crate) fn subscription_transfer_json(sub: &EventSubscription, ue: &AmfUe) -> Value {
+    let mut out = subscription_echo_json(sub);
+    let Some(max) = sub.max_reports else {
+        return out;
+    };
+    let key = ue
+        .supi
+        .as_deref()
+        .or(ue.gpsi.as_deref())
+        .or(ue.pei.as_deref())
+        .unwrap_or("");
+    let remaining = |t: &str| {
+        max.saturating_sub(
+            sub.reports_made
+                .get(&(t.to_string(), key.to_string()))
+                .copied()
+                .unwrap_or(0),
+        )
+    };
+    if let Some(events) = out.get_mut("eventList").and_then(Value::as_array_mut) {
+        events.retain(|e| {
+            e.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|t| remaining(t) > 0)
+        });
+        for e in events.iter_mut() {
+            e.as_object_mut().map(|o| o.remove("maxReports"));
+        }
+    }
+    let left = sub
+        .event_types
+        .iter()
+        .map(|t| remaining(t))
+        .max()
+        .unwrap_or(0);
+    out["options"]["maxReports"] = json!(left);
+    out
 }
 
 /// #1819: the period of a transferred subscription (an `eventSubscriptionList`
@@ -2060,16 +2174,22 @@ pub(crate) fn periodic_location_timer_running(subscription_id: &str) -> bool {
         .is_ok_and(|t| t.contains_key(subscription_id))
 }
 
-/// #1819: start `sub`'s PERIODIC LOCATION_REPORT timer when it is a PERIODIC
-/// LOCATION_REPORT subscription. Every `rep_period` it reports the current
-/// location of each UE the subscription targets, until the subscription expires,
-/// is unsubscribed, or is otherwise gone. The first report (at the subscription)
-/// is made by the subscribe path, so the first tick is one period in.
-fn spawn_periodic_location_reports(sub: &EventSubscription) {
+/// #1819: start `sub`'s PERIODIC timer when it is a PERIODIC subscription. Every
+/// `rep_period` it reports the current state of each subscribed event (#1832: not
+/// only LOCATION_REPORT) for the UE(s) the subscription targets, until the
+/// subscription expires, is unsubscribed, makes its maxReports, or is otherwise
+/// gone. The first LOCATION_REPORT (at the subscription) is made by the subscribe
+/// path, so the first tick is one period in.
+fn spawn_periodic_reports(sub: &EventSubscription) {
     let Some(period) = sub.rep_period else {
         return;
     };
-    if !sub.event_types.iter().any(|t| t == "LOCATION_REPORT") {
+    // R27: nothing for a period to report when no event has a state.
+    if !sub
+        .event_types
+        .iter()
+        .any(|t| crate::context::periodic_reports_state(t))
+    {
         return;
     }
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -2111,19 +2231,48 @@ fn spawn_periodic_location_reports(sub: &EventSubscription) {
             else {
                 break;
             };
-            // #1760: while its first report waits on a page, the period does not
-            // report either; the page's outcome is the first report. R27: and a
-            // PATCH may have removed LOCATION_REPORT from the subscription.
-            if sub.first_location_pending || !sub.event_types.iter().any(|t| t == "LOCATION_REPORT")
+            // #1760: while its first LOCATION_REPORT waits on a page, the period does
+            // not report a location either; the page's outcome is the first report.
+            // R27: and a PATCH may have removed LOCATION_REPORT from the subscription.
+            let mut reports = Vec::new();
+            if sub.event_types.iter().any(|t| t == "LOCATION_REPORT") && !sub.first_location_pending
             {
-                continue;
+                reports.extend(periodic_location_reports(&sub));
             }
-            // R27: one notification per period, its reportList carrying every UE
-            // (an any-UE subscription), so a tick is one POST per subscription.
-            let reports = periodic_location_reports(&sub);
+            // #1832: every other event with a current state, as its immediate
+            // report would carry it (TS 29.518 §5.3.2.2.2: "the current status of
+            // the events subscribed").
+            // R27: per targeted UE, resolved as the location reports resolve it
+            // (every UE of an any-UE subscription, the UE a GPSI or PEI names),
+            // and the area-level UES_IN_AREA_REPORT once.
+            let per_ue: Vec<String> = sub
+                .event_types
+                .iter()
+                .filter(|t| {
+                    *t != "LOCATION_REPORT"
+                        && *t != "UES_IN_AREA_REPORT"
+                        && crate::context::periodic_reports_state(t)
+                })
+                .cloned()
+                .collect();
+            if !per_ue.is_empty() {
+                for supi in periodic_target_supis(&sub) {
+                    reports.extend(build_immediate_reports(&per_ue, Some(&supi), &sub));
+                }
+            }
+            if sub.event_types.iter().any(|t| t == "UES_IN_AREA_REPORT") {
+                reports.extend(build_immediate_reports(
+                    &["UES_IN_AREA_REPORT".to_string()],
+                    None,
+                    &sub,
+                ));
+            }
+            // R27: one notification per period, its reportList carrying every report
+            // (every UE of an any-UE subscription). #1832: each is claimed against
+            // maxReports, in order.
             if !reports.is_empty() {
                 if let Err(e) = deliver_event_notifications(sub.clone(), reports).await {
-                    log::warn!("Periodic LOCATION_REPORT delivery failed (sub={task_id}): {e}");
+                    log::warn!("Periodic event notification delivery failed (sub={task_id}): {e}");
                 }
             }
         }
@@ -2135,7 +2284,7 @@ fn spawn_periodic_location_reports(sub: &EventSubscription) {
                 t.remove(&task_id);
             }
         }
-        log::debug!("PERIODIC LOCATION_REPORT timer of {task_id} stopped");
+        log::debug!("PERIODIC timer of {task_id} stopped");
     };
     // R27: spawned with the map locked, so the handle is in the map before the
     // task can reach its own removal (a task finding its subscription gone at once
@@ -2155,16 +2304,59 @@ fn spawn_periodic_location_reports(sub: &EventSubscription) {
 /// Table 6.2.6.2.6-1). For a CM-IDLE UE that is the last known location, with
 /// `ageOfLocationInformation` the minutes since it was acquired (at least 1), as
 /// the first report does. The UE is not paged for a periodic report.
+/// R27: the SUPIs of the registered UEs a PERIODIC tick reports on for `sub`: every
+/// UE for an any-UE subscription, else the one UE its SUPI, GPSI or PEI names.
+fn periodic_target_supis(sub: &EventSubscription) -> Vec<String> {
+    let ctx = amf_self();
+    let Ok(guard) = ctx.read() else {
+        return Vec::new();
+    };
+    // R27: every UE the live store holds (a UE published by the NGAP path is in
+    // the store, not necessarily in `amf_ue_list`).
+    let ues: Vec<AmfUe> = if sub.any_ue {
+        guard
+            .ue_store()
+            .snapshot()
+            .into_iter()
+            .map(|(_, record)| record.amf_ue)
+            .collect()
+    } else {
+        sub.supi
+            .as_deref()
+            .and_then(|s| guard.amf_ue_find_by_supi(s))
+            .or_else(|| {
+                sub.gpsi
+                    .as_deref()
+                    .and_then(|g| guard.amf_ue_find_by_gpsi(g))
+            })
+            .or_else(|| sub.pei.as_deref().and_then(|p| guard.amf_ue_find_by_pei(p)))
+            .into_iter()
+            .collect()
+    };
+    ues.into_iter()
+        .filter(|ue| {
+            guard
+                .ue_store()
+                .get(ue.id)
+                .is_some_and(|r| r.is_registered())
+        })
+        .filter_map(|ue| ue.supi.clone())
+        .collect()
+}
+
 fn periodic_location_reports(sub: &EventSubscription) -> Vec<Value> {
     let ctx = amf_self();
     let Ok(guard) = ctx.read() else {
         return Vec::new();
     };
+    // R27: every UE the live store holds (a UE published by the NGAP path is in
+    // the store, not necessarily in `amf_ue_list`).
     let ues: Vec<AmfUe> = if sub.any_ue {
         guard
-            .amf_ue_ids()
+            .ue_store()
+            .snapshot()
             .into_iter()
-            .filter_map(|id| guard.amf_ue_find_by_id(id))
+            .map(|(_, record)| record.amf_ue)
             .collect()
     } else {
         sub.supi
@@ -2469,6 +2661,12 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
         .pointer("/options/trigger")
         .and_then(Value::as_str)
         == Some("ONE_TIME");
+    // #1832: the maximum number of reports per event (and per member UE). A
+    // ONE_TIME subscription is told once, so it carries none.
+    let max_reports = match parse_max_reports(subscription) {
+        Ok(m) => m.filter(|_| !one_time),
+        Err(resp) => return *resp,
+    };
 
     let subscription_id = format!("sub-{}", uuid::Uuid::new_v4());
     let sub = EventSubscription {
@@ -2493,6 +2691,8 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
         reported_location: None,
         taken_over: false,
         rep_period,
+        max_reports,
+        reports_made: std::collections::HashMap::new(),
         one_time,
         first_location_pending: false,
         reporting_threshold,
@@ -2578,8 +2778,16 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
         }
         log::info!("Event subscription {subscription_id} is ONE_TIME and was reported: removed");
     }
-    // #1819: a PERIODIC LOCATION_REPORT is then made every repPeriod.
-    spawn_periodic_location_reports(&sub);
+    // #1832: the reports in the response count against maxReports; the last one
+    // ends the subscription.
+    let mut ended = false;
+    for report in &report_list {
+        ended |= claim_report(&sub, report) == crate::context::ReportClaim::Granted { ended: true };
+    }
+    // #1819, #1832: a PERIODIC subscription is then reported every repPeriod.
+    if !ended {
+        spawn_periodic_reports(&sub);
+    }
 
     log::info!(
         "Event subscription created: id={subscription_id}, events={:?}, notifyUri={notify_uri}",
@@ -2829,10 +3037,10 @@ fn handle_event_subscription_modify(subscription_id: &str, request: &SbiRequest)
             Some("SUBSCRIPTION_NOT_FOUND"),
         );
     }
-    // R27: the PERIODIC timer follows the modified subscription: an eventList that
-    // gained LOCATION_REPORT starts it, one that lost it stops it.
+    // R27: the PERIODIC timer follows the modified subscription (its eventList and
+    // its expiry).
     cancel_periodic_location_reports(subscription_id);
-    spawn_periodic_location_reports(&sub);
+    spawn_periodic_reports(&sub);
 
     let response_body = json!({ "subscription": subscription_echo_json(&sub) });
     match SbiResponse::ok().with_json_body(&response_body) {
@@ -2939,10 +3147,44 @@ async fn deliver_event_notification(sub: EventSubscription, report: Value) -> Re
 
 /// One notification carrying `reports` in its `reportList` (R27: a periodic tick of
 /// an any-UE subscription is one POST, not one per UE).
+///
+/// #1832: every notification goes through here, so maxReports is enforced here.
+/// A report counts when it is GENERATED, as Table 6.2.6.2.6-1 words it ("the
+/// maximum number of reports that can be generated"), not when it is delivered:
+/// a consumer that cannot be reached does not get more reports for it (R27).
+/// each report is claimed, and a refused one is left out. Nothing left, nothing
+/// is sent.
 async fn deliver_event_notifications(
     sub: EventSubscription,
     reports: Vec<Value>,
 ) -> Result<(), String> {
+    let mut granted = Vec::with_capacity(reports.len());
+    for report in reports {
+        match claim_report(&sub, &report) {
+            crate::context::ReportClaim::Refused => {
+                log::debug!(
+                    "Event report not sent (sub={}): its maxReports is reached",
+                    sub.subscription_id
+                );
+            }
+            crate::context::ReportClaim::Granted { ended } => {
+                if ended {
+                    // A PERIODIC timer stops at its next tick, finding the
+                    // subscription gone; aborting it here could cancel this, its
+                    // last report.
+                    log::info!(
+                        "Event subscription {} made its maxReports: ended",
+                        sub.subscription_id
+                    );
+                }
+                granted.push(report);
+            }
+        }
+    }
+    if granted.is_empty() {
+        return Ok(());
+    }
+    let reports = granted;
     let (host, port, path) =
         parse_http_uri(&sub.notify_uri).ok_or_else(|| format!("bad URI {}", sub.notify_uri))?;
 
@@ -4650,6 +4892,8 @@ pub(crate) fn take_over_transferred_event_subscriptions(
             reported_location: None,
             taken_over: true,
             rep_period: transferred_rep_period(entry),
+            max_reports: transferred_max_reports(entry),
+            reports_made: std::collections::HashMap::new(),
             // #1760: the mode travels with it (the echo carries `options.trigger`).
             one_time: entry.pointer("/options/trigger").and_then(Value::as_str) == Some("ONE_TIME"),
             first_location_pending: false,
@@ -4699,7 +4943,7 @@ pub(crate) fn take_over_transferred_event_subscriptions(
         }
         created += 1;
         // #1819: a transferred PERIODIC subscription keeps reporting on its period.
-        spawn_periodic_location_reports(&sub);
+        spawn_periodic_reports(&sub);
 
         // §6.2.6.2.5: an ABSOLUTE URI to the created resource, per §6.2.3.3.2.
         // It was the bare path, which a consumer (udmd, nextgcore#1440) cannot
@@ -6597,7 +6841,16 @@ fn handle_ue_context_transfer(ue_context_id: &str, request: &SbiRequest) -> SbiR
     // SUBSCRIPTION_ID_CHANGE once it has taken the subscription over (#1699).
     // Before, the list was never sent, so between two nextgcore AMFs a consumer's
     // subscription stayed at the old AMF and the UE's reports stopped.
-    let subscriptions: Vec<Value> = handed_over.iter().map(subscription_echo_json).collect();
+    // #1832: with the remaining maxReports for this UE.
+    let subscriptions: Vec<Value> = handed_over
+        .iter()
+        .map(|s| subscription_transfer_json(s, &ue))
+        .filter(|s| {
+            s.get("eventList")
+                .and_then(Value::as_array)
+                .is_none_or(|l| !l.is_empty())
+        })
+        .collect();
     let subscription_count = subscriptions.len();
     if !subscriptions.is_empty() {
         ue_context["eventSubscriptionList"] = json!(subscriptions);
@@ -9143,6 +9396,8 @@ mod tests {
             reported_location: None,
             taken_over: false,
             rep_period: None,
+            max_reports: None,
+            reports_made: std::collections::HashMap::new(),
             one_time: false,
             first_location_pending: false,
             reporting_threshold: None,
@@ -10482,6 +10737,49 @@ mod tests {
             .expect("json");
         let resp = namf_request_handler(req).await;
         assert_eq!(resp.status, 404);
+    }
+
+    /// **#1832**, through the UEContextTransfer answer: a handed-over subscription
+    /// carries the REMAINING number of reports as `options.maxReports`.
+    ///
+    /// REVERT-VERIFIED: with `handle_ue_context_transfer` listing the plain echo,
+    /// "the remaining number of reports" fails (3, not 2).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ue_context_transfer_carries_the_remaining_max_reports_1832() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        let supi = "imsi-001010000183201";
+        let _ue = setup_ue(supi, true, true);
+        let resp = namf_request_handler(
+            SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&json!({ "subscription": {
+                    "eventList": [{ "type": "CONNECTIVITY_STATE_REPORT" }],
+                    "eventNotifyUri": "http://127.0.0.1:9/notify/corr-1832",
+                    "notifyCorrelationId": "corr-1832",
+                    "nfId": "3fa85f64-5717-4562-b3fc-2c963f661832",
+                    "supi": supi,
+                    "options": { "trigger": "CONTINUOUS", "maxReports": 3 },
+                }}))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let guard = EventSubscriptionGuard::of(&resp);
+        amf_self().read().unwrap().event_subscription_claim_report(
+            &guard.0,
+            Some(3),
+            "CONNECTIVITY_STATE_REPORT",
+            supi,
+        );
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/transfer"))
+            .with_json_body(&json!({ "reason": "INIT_REG", "accessType": "3GPP_ACCESS" }))
+            .expect("json");
+        let resp = namf_request_handler(req).await;
+        assert_eq!(resp.status, 200);
+        let list = body_json(&resp)["ueContext"]["eventSubscriptionList"].clone();
+        assert_eq!(
+            list[0]["options"]["maxReports"], 2,
+            "the remaining number of reports: {list}"
+        );
     }
 
     /// **#1727**, the old AMF's half: the UEContextTransfer answer's UeContext carries
@@ -17261,6 +17559,8 @@ mod tests {
             reported_location: None,
             taken_over: false,
             rep_period: None,
+            max_reports: None,
+            reports_made: std::collections::HashMap::new(),
             one_time: false,
             first_location_pending: false,
             reporting_threshold: None,
