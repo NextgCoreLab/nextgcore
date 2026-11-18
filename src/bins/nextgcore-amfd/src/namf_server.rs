@@ -12662,6 +12662,8 @@ mod tests {
     /// "multicast session survives" assertion fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_delete_keeps_a_multicast_session_sharing_the_tmgi_1818() {
+        // #1822: the process-global MBS contexts (main left this test without it).
+        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
         let tmgi = Tmgi::new(0x181800, [0x00, 0xF1, 0x10]);
         let mcast = crate::context::amf_mcast();
         let multicast = mcast
@@ -12706,6 +12708,8 @@ mod tests {
     /// the session and the "kept for the other context" assertion fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_last_broadcast_context_on_a_tmgi_removes_its_session_1818() {
+        // #1822: the process-global MBS contexts (main left this test without it).
+        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
         let tmgi = Tmgi::new(0x181801, [0x00, 0xF1, 0x10]);
         let mcast = crate::context::amf_mcast();
         let a = create_mbs_context_1818("181801", Some("mbsmf-a")).await;
