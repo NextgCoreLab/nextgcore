@@ -35,7 +35,9 @@ pub fn same_nf_instance_id(a: &str, b: &str) -> bool {
 /// Whether two NF Set IDs, or two NF Service Set IDs, name the same set (#1719).
 /// Both are FQDN-style identifiers (TS 23.003 §28.12, TS 29.571 §5.4.2
 /// `NfSetId`/`NfServiceSetId`) that "shall be handled as case-insensitive
-/// string", so the comparison folds ASCII case and nothing else.
+/// string", so the comparison folds ASCII case. It also trims surrounding
+/// whitespace, which neither format admits, so a padded spelling compares as the
+/// set it pads.
 pub fn same_nf_set_id(a: &str, b: &str) -> bool {
     a.trim().eq_ignore_ascii_case(b.trim())
 }

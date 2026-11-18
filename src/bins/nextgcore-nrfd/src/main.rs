@@ -688,6 +688,90 @@ impl NrfPolicy {
     }
 }
 
+/// #1719 (R19): strip from each of `profiles` (at startup, every profile restored
+/// from the state file) each NF Set `policy` does not allow it, and store the
+/// result. Returns each changed profile with its change items, for the
+/// NF_PROFILE_CHANGED notification.
+///
+/// Stripping, not deregistering, is the spec-safe choice: the issue's option 1
+/// allows "refuses or strips", and the NF keeps serving its services, which are
+/// not in question. Only the unauthorised membership claim goes. A deregistered
+/// NF would get 404 on its next heartbeat, re-register with the same claim, and
+/// be refused 403, so it would leave service altogether. A stripped NF that
+/// re-sends the claim on a later NFRegister or NFUpdate is refused as any other
+/// registrant is.
+fn strip_unallowed_restored_nf_sets(
+    policy: &NrfPolicy,
+    profiles: Vec<NfProfile>,
+) -> Vec<(NfProfile, Vec<ChangeItem>)> {
+    let manager = nf_manager();
+    let mut changed = Vec::new();
+    for profile in profiles {
+        let pre = profile.to_json();
+        let refused: Vec<String> = policy
+            .unallowed_nf_sets(
+                nf_set_ids_of(&pre),
+                &profile.nf_type,
+                &profile.nf_instance_id,
+            )
+            .into_iter()
+            .map(String::from)
+            .collect();
+        if refused.is_empty() {
+            continue;
+        }
+        let kept: Vec<serde_json::Value> = pre
+            .get("nfSetIdList")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter(|v| v.as_str().is_none_or(|s| !refused.iter().any(|r| r == s)))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut post = pre.clone();
+        let patch = if kept.is_empty() {
+            if let Some(obj) = post.as_object_mut() {
+                obj.remove("nfSetIdList");
+            }
+            serde_json::json!([{"op": "remove", "path": "/nfSetIdList"}])
+        } else {
+            post["nfSetIdList"] = serde_json::Value::Array(kept.clone());
+            serde_json::json!([{"op": "replace", "path": "/nfSetIdList", "value": kept}])
+        };
+        let updated = match NfProfile::from_json(&post) {
+            Ok(p) => p,
+            Err(missing) => {
+                log::error!(
+                    "nrfd-1719: restored NF instance {} no longer parses after stripping \
+                     NF Set(s) {refused:?} (missing {missing:?}); left unchanged",
+                    profile.nf_instance_id
+                );
+                continue;
+            }
+        };
+        if let Err(e) = manager.register(updated.clone()) {
+            log::error!(
+                "nrfd-1719: cannot store restored NF instance {} without NF Set(s) \
+                 {refused:?}: {e}",
+                profile.nf_instance_id
+            );
+            continue;
+        }
+        log::warn!(
+            "nrfd-1719: restored NF instance {} ({}) claimed NF Set(s) {refused:?} that \
+             nrf.nf_set_allowlist does not allow for it; the claim is removed from its \
+             profile, and an NFRegister or NFUpdate re-adding it is refused 403",
+            profile.nf_instance_id,
+            profile.nf_type
+        );
+        let changes = compute_profile_changes(&pre, &post, &patch, true);
+        changed.push((updated, changes));
+    }
+    changed
+}
+
 /// The `nfSetIdList` strings of an NFProfile document (TS 29.510 §6.1.6.2.2).
 fn nf_set_ids_of(doc: &serde_json::Value) -> Vec<&str> {
     doc.get("nfSetIdList")
@@ -1659,24 +1743,23 @@ async fn main() -> Result<()> {
             allow.len()
         ),
     }
-    // #1719: a profile restored from the state file was not checked against this
-    // allowlist. Name each claim it would refuse; NFUpdate refuses only a set a
-    // patch ADDS, so the next NFRegister (PUT) is where it is enforced.
-    for profile in nf_manager().list() {
-        let doc = profile.to_json();
-        let refused = policy.unallowed_nf_sets(
-            nf_set_ids_of(&doc),
-            &profile.nf_type,
-            &profile.nf_instance_id,
-        );
-        if !refused.is_empty() {
-            log::warn!(
-                "nrfd-1719: restored NF instance {} ({}) claims NF Set(s) {refused:?} that \
-                 nrf.nf_set_allowlist does not allow; its next NFRegister will be refused",
-                profile.nf_instance_id,
-                profile.nf_type
-            );
-        }
+    // #1719 (R19): a profile restored from the state file was never checked
+    // against this allowlist, and a heartbeating NF never re-registers, so the
+    // claim is enforced here: the unallowed sets are stripped and subscribers are
+    // told NF_PROFILE_CHANGED.
+    for (profile, changes) in strip_unallowed_restored_nf_sets(&policy, nf_manager().list()) {
+        let server_uri = nrf_self_uri().to_string();
+        tokio::spawn(async move {
+            if let Err(e) = nrf_nnrf_nfm_send_nf_profile_changed_notify_all_async(
+                &profile,
+                &server_uri,
+                changes,
+            )
+            .await
+            {
+                log::error!("Failed to send NF_PROFILE_CHANGED (nf_set_allowlist): {e}");
+            }
+        });
     }
     NRF_POLICY.set(policy).ok();
 
@@ -12720,6 +12803,24 @@ mod tests_nf_set_ids_1719 {
                 assert_eq!(resp.status, 403, "{:?}", resp.http.content);
                 assert_eq!(stored_sets(rogue), Some(vec![SET2.to_string()]));
 
+                // R19: NFUpdate re-typing the rogue to SMF while it keeps set 2,
+                // which only PCFs may claim: refused, type and sets unchanged.
+                let resp = patch(
+                    rogue,
+                    json!([{"op": "replace", "path": "/nfType", "value": "SMF"}]),
+                )
+                .await;
+                assert_eq!(
+                    resp.status, 403,
+                    "a re-typing patch re-checks every held set: {:?}",
+                    resp.http.content
+                );
+                assert_eq!(
+                    nf_manager().get(rogue).map(|p| p.nf_type).as_deref(),
+                    Some("PCF")
+                );
+                assert_eq!(stored_sets(rogue), Some(vec![SET2.to_string()]));
+
                 // A heartbeat patch keeps working.
                 let resp = patch(
                     own,
@@ -12735,6 +12836,90 @@ mod tests_nf_set_ids_1719 {
             })
             .await;
         for id in [own, rogue, smf] {
+            let _ = nf_manager().deregister(id);
+        }
+    }
+
+    /// R19: a profile restored from the state file is held to the allowlist at
+    /// startup. Its unallowed sets are stripped and stored, so `target-nf-set-id`
+    /// discovery no longer returns it for them. An allowed set is kept, a profile
+    /// left with no set loses `nfSetIdList`, an allowed profile is untouched, and
+    /// each changed profile comes back with change items for NF_PROFILE_CHANGED.
+    ///
+    /// REVERT-VERIFIED: with the strip skipped (every profile `continue`s), the
+    /// rogue is still discovered in set 1 and the first assertion fails.
+    #[test]
+    fn a_restored_profile_loses_the_sets_it_may_not_claim_1719() {
+        let own = "17190e0e-0000-4000-8000-00000000000e";
+        let mixed = "17190f0f-0000-4000-8000-00000000000f";
+        let only = "17191010-0000-4000-8000-000000000010";
+        let restore = |id: &str, sets: &[&str]| {
+            let p = NfProfile::from_json(&json!({
+                "nfInstanceId": id,
+                "nfType": "PCF",
+                "nfStatus": "REGISTERED",
+                "nfSetIdList": sets,
+            }))
+            .expect("a valid profile");
+            nf_manager().register(p).expect("stored");
+        };
+        restore(own, &[SET1]);
+        restore(mixed, &[SET1, SET2]);
+        restore(only, &[SET1]);
+        let policy = NrfPolicy {
+            nf_set_allowlist: allowlist(own),
+            ..NrfPolicy::default()
+        };
+        let ours: Vec<NfProfile> = [own, mixed, only]
+            .iter()
+            .filter_map(|id| nf_manager().get(id))
+            .collect();
+        let changed = strip_unallowed_restored_nf_sets(&policy, ours);
+
+        let discovered = |set: &str| -> Vec<String> {
+            discover_profiles(&DiscoveryQuery {
+                target_nf_type: "PCF".to_string(),
+                requester_nf_type: "SMF".to_string(),
+                target_nf_set_id: Some(set.to_string()),
+                ..Default::default()
+            })
+            .iter()
+            .filter_map(|p| p.get("nfInstanceId").and_then(|v| v.as_str()))
+            .filter(|id| [own, mixed, only].contains(id))
+            .map(String::from)
+            .collect()
+        };
+        assert_eq!(
+            discovered(SET1),
+            vec![own.to_string()],
+            "only the provisioned PCF is in set 1"
+        );
+        assert_eq!(
+            discovered(SET2),
+            vec![mixed.to_string()],
+            "the allowed set is kept"
+        );
+        assert_eq!(stored_sets(mixed), Some(vec![SET2.to_string()]));
+        assert_eq!(stored_sets(only), Some(Vec::new()));
+        assert!(nf_manager()
+            .get(only)
+            .is_some_and(|p| p.to_json().get("nfSetIdList").is_none()));
+        assert_eq!(
+            stored_sets(own),
+            Some(vec![SET1.to_string()]),
+            "the allowed one is untouched"
+        );
+        let mut ids: Vec<&str> = changed
+            .iter()
+            .map(|(p, _)| p.nf_instance_id.as_str())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![mixed, only]);
+        assert!(
+            changed.iter().all(|(_, c)| !c.is_empty()),
+            "each change is notified"
+        );
+        for id in [own, mixed, only] {
             let _ = nf_manager().deregister(id);
         }
     }
