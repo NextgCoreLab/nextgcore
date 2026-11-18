@@ -74,7 +74,7 @@ Each setting comes from the command line, else the environment, else the YAML, e
 | `client_auth` | `NEXTGCORE_NRF_SERVER_TLS_CLIENT_AUTH` | `--mtls` (= `required`) | `optional` | `optional` or `required`. `--mtls` wins; any other value fails startup. |
 | `min_version` | none | none | `"1.2"` | Only `"1.2"` (TLS 1.2 or 1.3 are negotiated); any other value fails startup rather than being ignored. |
 
-The three files must exist at startup, or nrfd exits naming the missing one. `--mtls` without TLS is an error. With TLS off and the SBI profile `production`, nrfd logs a WARN: NFs on that profile dial their NRF over https.
+The three files must exist at startup, or nrfd exits naming the missing one. `--mtls` without TLS is an error. With TLS off and the SBI profile `production` (the default), nrfd refuses to start (#1795): it does not serve cleartext under that profile. Select `NEXTGCORE_SBI_PROFILE=dev` for a cleartext NRF.
 
 **The NRF's own token client** (`nrf.sbi.oauth2.require: true`) dials the NRF's own listener. Under TLS it uses the NRF client TLS (`NEXTGCORE_NRF_TLS_*`, see the overview), and fills what those settings leave unset from the listener: the CA above as the trust anchor, the first DNS-ID of the NRF's own certificate as the server name (the self URI's address need not be in the certificate), and the NRF's own certificate as its client certificate, but only when that certificate's `urn:uuid:` names the NRF's nfInstanceId (else a WARN, and no client certificate).
 

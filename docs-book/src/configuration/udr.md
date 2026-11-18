@@ -92,7 +92,7 @@ From the clap `Args` struct in `src/bins/nextgcore-udrd/src/main.rs`:
 | `--sbi-addr` | string | `udr.sbi.server[0].address`, else `127.0.0.1` (#1308) | SBI server bind address; beats the YAML (#1312). |
 | `--sbi-advertise` | string | unset | The SBI host advertised to the NRF and in callback URIs (#1312); then `NEXTGCORE_SBI_ADVERTISE`, then `udr.sbi.server[0].advertise`, then the bind address when it is not a wildcard. |
 | `--sbi-port` | u16 | `udr.sbi.server[0].port`, else `7777` | SBI server port; beats the YAML (#1312). |
-| `--tls` | flag | off | Enable TLS on the SBI server. |
+| `--tls` | flag | off | Serve the SBI listener over TLS under the `dev` SBI profile (#1795; before it, the flag never reached the listener). Under `production` (the default) the listener serves mutually-authenticated TLS and requires a token whatever this says. |
 | `--tls-cert` | path | unset | TLS certificate file. |
 | `--tls-key` | path | unset | TLS private key file. |
 | `--state-file` | path | unset (but **set in the shipped Docker compose**, see below) | JSON snapshot file for the non-subscriber resource trees (exposure-data, application-data, smf-registrations, subs-to-notify, policy provisioning, amf-3gpp-access). Falls back to `NEXTGCORE_UDR_STATE_FILE`; empty strings are treated as unset. When neither is set the trees are in-memory only and lost on restart. |

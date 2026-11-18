@@ -311,7 +311,21 @@ async fn main() -> Result<()> {
     // Start the consumer-facing SBI server (C8): home-PLMN NFs send outbound
     // roaming requests here; the handler runs the forwarding pipeline through
     // the selected peer SEPP over N32-f.
-    let sbi_server = n32_server::start_sbi_server(&args.sbi_addr, args.sbi_port, n32_tls_opt)
+    // #1795: the listener follows the SBI security profile.
+    let sbi_profile = nextgcore_sbi::security::SbiProfile::resolve();
+    let sbi_config = n32_server::sbi_server_config(
+        &args.sbi_addr,
+        args.sbi_port,
+        n32_tls_opt,
+        sbi_profile,
+        &nextgcore_sbi::security::SbiSecurityPolicy::for_profile(sbi_profile),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    if args.n32_addr.is_some() && args.n32_port.is_some() {
+        n32_server::check_n32_transport(sbi_profile, n32_tls_opt)
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
+    let sbi_server = n32_server::start_sbi_server(sbi_config)
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
     // #1308: loopback by default; say which setting opens it to remote peers.
