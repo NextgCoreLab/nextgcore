@@ -335,18 +335,36 @@ async fn main() -> Result<()> {
         "--sbi-addr (or easdf.sbi.server[0].address in the config file)",
     );
 
-    let mut sbi_server_config = SbiServerConfig::new(addr);
-    if args.tls {
-        let cert = args
-            .tls_cert
-            .as_deref()
-            .unwrap_or("/etc/nextgcore/tls/server.crt");
-        let key = args
-            .tls_key
-            .as_deref()
-            .unwrap_or("/etc/nextgcore/tls/server.key");
-        sbi_server_config = sbi_server_config.with_tls(key, cert);
-    }
+    // #1677: the listener follows NEXTGCORE_SBI_PROFILE like the core NFs: under
+    // `production`, TLS with mTLS and OAuth2 (TS 33.501 §13.1.0, §13.4.1), which
+    // is what smfd dials since #1669. `--tls` still turns TLS on under `dev`.
+    let sbi_profile = nextgcore_sbi::security::SbiProfile::resolve();
+    let tls = args.tls.then(|| {
+        (
+            args.tls_key
+                .clone()
+                .unwrap_or_else(|| "/etc/nextgcore/tls/server.key".into()),
+            args.tls_cert
+                .clone()
+                .unwrap_or_else(|| "/etc/nextgcore/tls/server.crt".into()),
+        )
+    });
+    let sbi_server_config = easdf_server_config(
+        SbiServerConfig::new(addr),
+        tls,
+        sbi_profile,
+        &nextgcore_sbi::security::SbiSecurityPolicy::for_profile(sbi_profile),
+        &nrf_uri,
+    )
+    .map_err(|e| anyhow::anyhow!("SBI security profile: {e}"))?;
+    // The NRF calls (registration, heartbeat) carry an access token for the NRF
+    // when the profile asks for OAuth2 (#1665, #1667), as every other NF's do.
+    nextgcore_sbi::nrf_tls::set_nrf_oauth2_client(nextgcore_sbi::oauth::outbound_oauth2_client(
+        sbi_profile,
+        false,
+        Some(&nrf_uri),
+        nextgcore_sbi::types::NfType::Easdf,
+    ));
 
     let sbi_server = SbiServer::new(sbi_server_config);
     log::info!("Starting EASDF SBI server on {addr}");
@@ -933,6 +951,31 @@ async fn handle_baseline_pattern_delete(id: &str) -> SbiResponse {
 
 /// Build the NFProfile registered with the NRF (TS 29.510): nfType EASDF
 /// advertising the neasdf-dnscontext service (TS 29.556).
+/// The EASDF's SBI listener configuration (#1677): `--tls` first, when given
+/// (`tls` is its `(key, cert)`), then the SBI security `profile`, which under
+/// `production` sets TLS from `policy`'s certificate paths, mTLS and OAuth2 with
+/// the EASDF as the expected audience, and fails, naming the path, when a
+/// certificate file is missing rather than serving cleartext. Under `dev` the
+/// config is left as `--tls` made it.
+fn easdf_server_config(
+    mut config: SbiServerConfig,
+    tls: Option<(String, String)>,
+    profile: nextgcore_sbi::security::SbiProfile,
+    policy: &nextgcore_sbi::security::SbiSecurityPolicy,
+    nrf_uri: &str,
+) -> nextgcore_sbi::SbiResult<SbiServerConfig> {
+    if let Some((key, cert)) = tls {
+        config = config.with_tls(key, cert);
+    }
+    nextgcore_sbi::security::apply_sbi_security_policy(
+        config,
+        profile,
+        policy,
+        nextgcore_sbi::types::NfType::Easdf,
+        nrf_uri,
+    )
+}
+
 fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
     nextgcore_sbi::nf_addressing::classify_profile_host(
         serde_json::json!({
@@ -1073,6 +1116,123 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1677: the EASDF listener follows the SBI security profile. Under
+    /// `production`: TLS from the policy's paths, mTLS against its CA, and OAuth2
+    /// with the EASDF as audience and the NRF's JWKS, whatever `--tls` said. A
+    /// missing certificate is a startup error naming it, never cleartext. Under
+    /// `dev`: cleartext, or TLS without mTLS when `--tls` is given, as before.
+    ///
+    /// REVERT-VERIFIED: with `easdf_server_config` not applying the profile, the
+    /// production case serves cleartext and the first assertion fails.
+    #[test]
+    fn the_listener_follows_the_sbi_profile_1677() {
+        use nextgcore_sbi::security::{SbiProfile, SbiSecurityPolicy, TlsPaths};
+        use nextgcore_sbi::types::UriScheme;
+        let dir = std::env::temp_dir().join(format!(
+            "easdf-1677-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |n: &str| {
+            let p = dir.join(n);
+            std::fs::write(&p, "pem").unwrap();
+            p.display().to_string()
+        };
+        let policy = SbiSecurityPolicy {
+            tls_paths: TlsPaths {
+                cert: file("easdf.crt"),
+                key: file("easdf.key"),
+                ca_cert: file("ca.crt"),
+                client_cert: Some(file("client.crt")),
+                client_key: Some(file("client.key")),
+            },
+            ..SbiSecurityPolicy::production()
+        };
+        let addr: SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        let nrf = "http://127.0.0.10:7777";
+
+        let prod = easdf_server_config(
+            SbiServerConfig::new(addr),
+            None,
+            SbiProfile::Production,
+            &policy,
+            nrf,
+        )
+        .expect("production applies");
+        assert_eq!(prod.scheme, UriScheme::Https, "production serves TLS");
+        assert_eq!(prod.cert.as_deref(), Some(policy.tls_paths.cert.as_str()));
+        assert!(prod.verify_client, "and verifies the client certificate");
+        assert_eq!(
+            prod.verify_client_cacert.as_deref(),
+            Some(policy.tls_paths.ca_cert.as_str())
+        );
+        assert!(prod.require_oauth2, "and requires an access token");
+        assert_eq!(prod.oauth2_expected_audience.as_deref(), Some("EASDF"));
+        assert_eq!(
+            prod.oauth2_jwks_uri.as_deref(),
+            Some(nextgcore_sbi::oauth::JwksCache::for_nrf(nrf).jwks_uri())
+        );
+
+        // `--tls` under production: the profile's certificate wins.
+        let both = easdf_server_config(
+            SbiServerConfig::new(addr),
+            Some(("/x/k".into(), "/x/c".into())),
+            SbiProfile::Production,
+            &policy,
+            nrf,
+        )
+        .expect("production applies");
+        assert_eq!(both.cert.as_deref(), Some(policy.tls_paths.cert.as_str()));
+
+        // A missing certificate fails closed, naming it.
+        let missing = SbiSecurityPolicy {
+            tls_paths: TlsPaths {
+                cert: dir.join("absent.crt").display().to_string(),
+                ..policy.tls_paths.clone()
+            },
+            ..SbiSecurityPolicy::production()
+        };
+        let err = easdf_server_config(
+            SbiServerConfig::new(addr),
+            None,
+            SbiProfile::Production,
+            &missing,
+            nrf,
+        )
+        .expect_err("no cleartext fallback");
+        assert!(err.to_string().contains("absent.crt"), "{err}");
+
+        // Dev: cleartext, or `--tls` without mTLS or OAuth2.
+        let dev_policy = SbiSecurityPolicy::development();
+        let dev = easdf_server_config(
+            SbiServerConfig::new(addr),
+            None,
+            SbiProfile::Dev,
+            &dev_policy,
+            nrf,
+        )
+        .unwrap();
+        assert_eq!(dev.scheme, UriScheme::Http);
+        assert!(!dev.verify_client && !dev.require_oauth2);
+        let dev_tls = easdf_server_config(
+            SbiServerConfig::new(addr),
+            Some(("/x/k".into(), "/x/c".into())),
+            SbiProfile::Dev,
+            &dev_policy,
+            nrf,
+        )
+        .unwrap();
+        assert_eq!(dev_tls.scheme, UriScheme::Https);
+        assert_eq!(dev_tls.cert.as_deref(), Some("/x/c"));
+        assert!(!dev_tls.verify_client && !dev_tls.require_oauth2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use std::sync::Mutex;
 
     /// Serializes tests that touch the process-global EASDF context.
