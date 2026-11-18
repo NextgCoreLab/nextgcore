@@ -10114,6 +10114,81 @@ mod tests {
         buf.to_vec()
     }
 
+    /// **#1822 item 1 (#1741, TS 29.244 §6.3.3).** A well-formed TSC Management
+    /// Information in a modification REJECTED for another reason (Update FAR 99,
+    /// which the session does not hold) is not applied: no bridge is created, an
+    /// existing bridge gains no port, and the response echoes no TSC IE. The
+    /// malformed-PMIC test above never reaches this gate, because a malformed IE
+    /// is not collected at all.
+    #[tokio::test]
+    async fn a_rejected_modification_applies_no_tsc_management_information_1822() {
+        let (server, smf, addr, _rx, _dp, upf_seid) = established_session().await;
+        let bridge_ports = |server: &PfcpServer| {
+            let sessions = server.sessions.try_read().expect("sessions");
+            sessions
+                .get(&upf_seid)
+                .expect("session")
+                .tsn_bridge
+                .as_ref()
+                .map(|b| {
+                    let mut ports: Vec<u32> =
+                        b.port_management_containers.keys().copied().collect();
+                    ports.sort_unstable();
+                    ports
+                })
+        };
+        let rejected = |seq: u32, port: u32| {
+            let mut b = crate::n4_build::PfcpMessageBuilder::new();
+            b.add_tlv(
+                pfcp_ie::TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_MODIFICATION_REQUEST,
+                &tsc_ie(Some((&[0x77], port)), None),
+            );
+            b.add_tlv(pfcp_ie::UPDATE_FAR, &far_body(99, 0x02));
+            encode_pfcp(52, Some(upf_seid), seq, &b.build())
+        };
+
+        let resp = exchange(&smf, addr, &rejected(20, 8)).await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::RuleCreationModificationFailure as u8
+        );
+        assert_eq!(
+            bridge_ports(&server),
+            None,
+            "no bridge from a rejected message"
+        );
+        let (_h, payload) = ParsedPfcpHeader::parse(&resp).unwrap();
+        assert!(
+            ParsedIe::find_all_ies(
+                &ParsedIe::parse_all(payload),
+                pfcp_ie::TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_MODIFICATION_RESPONSE,
+            )
+            .is_empty(),
+            "a rejected response echoes no TSC configuration"
+        );
+
+        // With a bridge in place, a rejected message adds no port to it.
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(
+            pfcp_ie::TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_MODIFICATION_REQUEST,
+            &tsc_ie(Some((&[0x55], 3)), None),
+        );
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 21, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(bridge_ports(&server), Some(vec![3]), "control: applied");
+
+        let resp = exchange(&smf, addr, &rejected(22, 9)).await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::RuleCreationModificationFailure as u8
+        );
+        assert_eq!(
+            bridge_ports(&server),
+            Some(vec![3]),
+            "the rejected message's port 9 is not applied"
+        );
+    }
+
     /// A modification with no TSC IE leaves `tsn_bridge` alone, so no existing
     /// session acquires a bridge as a side effect of this feature.
     #[tokio::test]
