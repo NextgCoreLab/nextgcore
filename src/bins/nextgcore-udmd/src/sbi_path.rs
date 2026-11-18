@@ -409,7 +409,8 @@ pub async fn udm_sbi_send_request(
     // Determine port from first service or default
     let port = nf_instance.services.first().map(|s| s.port).unwrap_or(80);
 
-    let client = sbi_ctx.get_client(host, port).await;
+    // #1659: a service request, so it carries the token when OAuth2 is on.
+    let client = crate::app::peer_client(host, port, nf_instance.nf_type).await;
 
     log::debug!(
         "Sending SBI request to NF [{}] at {}:{} ({})",
@@ -752,7 +753,7 @@ pub async fn udm_amf_send_mt_ue_context_info(
     if let Some(amf) = amf_instances.first() {
         let host = amf.host().ok_or("AMF instance has no address")?;
         let port = amf.services.first().map(|s| s.port).unwrap_or(80);
-        let client = sbi_ctx.get_client(host, port).await;
+        let client = crate::app::peer_client(host, port, NfType::Amf).await;
         return client
             .send_request(build_request())
             .await
@@ -765,7 +766,7 @@ pub async fn udm_amf_send_mt_ue_context_info(
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(7777);
-    let client = sbi_ctx.get_client(&host, port).await;
+    let client = crate::app::peer_client(&host, port, NfType::Amf).await;
     client
         .send_request(build_request())
         .await
@@ -888,7 +889,7 @@ pub async fn udm_ausf_send_sor_protect(
     if let Some(ausf) = ausf_instances.first() {
         let host = ausf.host().ok_or("AUSF instance has no address")?;
         let port = ausf.services.first().map(|s| s.port).unwrap_or(80);
-        let client = sbi_ctx.get_client(host, port).await;
+        let client = crate::app::peer_client(host, port, NfType::Ausf).await;
         return client
             .send_request(build_request()?)
             .await
@@ -902,7 +903,7 @@ pub async fn udm_ausf_send_sor_protect(
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(7777);
-    let client = sbi_ctx.get_client(&host, port).await;
+    let client = crate::app::peer_client(&host, port, NfType::Ausf).await;
     client
         .send_request(build_request()?)
         .await
@@ -947,7 +948,7 @@ pub async fn udm_ausf_send_upu_protect(
     if let Some(ausf) = ausf_instances.first() {
         let host = ausf.host().ok_or("AUSF instance has no address")?;
         let port = ausf.services.first().map(|s| s.port).unwrap_or(80);
-        let client = sbi_ctx.get_client(host, port).await;
+        let client = crate::app::peer_client(host, port, NfType::Ausf).await;
         return client
             .send_request(build_request()?)
             .await
@@ -961,7 +962,7 @@ pub async fn udm_ausf_send_upu_protect(
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(7777);
-    let client = sbi_ctx.get_client(&host, port).await;
+    let client = crate::app::peer_client(&host, port, NfType::Ausf).await;
     client
         .send_request(build_request()?)
         .await
@@ -1035,6 +1036,219 @@ impl SbiServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1659, failure-path property 1 (a failed request applies nothing): when
+    /// the token cannot be obtained, Namf_MT is not sent at all, not even bare.
+    /// The caller gets the token error rather than a 401 from the AMF, and the
+    /// gated AMF stand-in serves nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
+    async fn a_failed_token_fetch_sends_nothing_1659() {
+        use nextgcore_sbi::test_support::oauth2 as stand_in;
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let sbi_ctx = global_context();
+        for inst in sbi_ctx.find_nf_instances_by_type(NfType::Amf).await {
+            sbi_ctx.remove_nf_instance(&inst.id).await;
+        }
+        let sk = nextgcore_sbi::oauth::generate_es256_key();
+        let (_amf, amf_port, seen) =
+            stand_in::oauth2_producer(&sk, NfType::Amf, |_| SbiResponse::with_status(200)).await;
+        // Port 1 on loopback: nothing listens, so the token request fails.
+        *crate::app::OAUTH2_CLIENT_TEST_OVERRIDE
+            .write()
+            .expect("override") = Some(stand_in::oauth2_client_for(1, NfType::Udm));
+        let mut instance = NfInstance::new("amf-1659-notoken", NfType::Amf);
+        instance.ipv4_addresses.push("127.0.0.1".to_string());
+        let mut svc = NfService::new("namf-mt", SbiServiceType::NamfMt);
+        svc.port = amf_port;
+        instance.add_service(svc);
+        sbi_ctx
+            .add_nf_instance_with_validity(instance, std::time::Duration::from_secs(3600))
+            .await;
+
+        let outcome = udm_amf_send_mt_ue_context_info(
+            Some("amf-1659-notoken"),
+            "imsi-001010000001659",
+            "TADS",
+        )
+        .await;
+
+        *crate::app::OAUTH2_CLIENT_TEST_OVERRIDE
+            .write()
+            .expect("override") = None;
+        sbi_ctx.remove_nf_instance("amf-1659-notoken").await;
+        let err = outcome.expect_err("no token: the request must not be sent");
+        assert!(
+            err.contains("access token"),
+            "the token error, not a 401: {err}"
+        );
+        assert!(seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+    }
+
+    /// #1659, failure-path property 4 (both peers): Namf_MT against amfd's REAL
+    /// Namf handler behind an OAuth2-required listener (nextgcore-sbi's gate,
+    /// audience AMF), the receiving peer. With the token the AMF answers its own
+    /// 404 for an unknown UE; without it the listener refuses 401.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
+    async fn namf_mt_reaches_the_real_amf_handler_behind_its_oauth2_gate_1659() {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        use nextgcore_sbi::test_support::oauth2 as stand_in;
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        nextgcore_amfd::test_support::init_context();
+        let sk = nextgcore_sbi::oauth::generate_es256_key();
+        let (_nrf, nrf_port) = stand_in::token_nrf(sk.clone()).await;
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let mut cfg = SbiServerConfig::new(addr).with_expected_audience_nf_type(NfType::Amf);
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(stand_in::jwks_for(&sk, stand_in::TEST_NRF_KID));
+        let amf = SbiServer::on_listener(cfg, listener);
+        amf.start(nextgcore_amfd::namf_request_handler)
+            .await
+            .expect("amfd Namf server starts");
+        std::env::set_var("AMF_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("AMF_SBI_PORT", addr.port().to_string());
+        let supi = "imsi-001010000001659";
+
+        let bare = udm_amf_send_mt_ue_context_info(None, supi, "TADS").await;
+        *crate::app::OAUTH2_CLIENT_TEST_OVERRIDE
+            .write()
+            .expect("override") = Some(stand_in::oauth2_client_for(nrf_port, NfType::Udm));
+        let tokened = udm_amf_send_mt_ue_context_info(None, supi, "TADS").await;
+        *crate::app::OAUTH2_CLIENT_TEST_OVERRIDE
+            .write()
+            .expect("override") = None;
+        std::env::remove_var("AMF_SBI_ADDR");
+        std::env::remove_var("AMF_SBI_PORT");
+
+        assert_eq!(
+            bare.map(|r| r.status),
+            Ok(401),
+            "the AMF's gate refuses a bare request"
+        );
+        assert_eq!(
+            tokened.map(|r| r.status),
+            Ok(404),
+            "past the gate, amfd's handler answers for the unknown UE"
+        );
+    }
+
+    /// #1659: with an outbound OAuth2 client installed, the Namf_MT and the
+    /// Nausf SoR/UPU service requests carry the NRF-issued token on every route:
+    /// the named instance (`udm_sbi_send_request`), a cached instance of the type,
+    /// and the `*_SBI_ADDR` fallback. The stand-in AMF and AUSF are gated by
+    /// nextgcore-sbi's own producer check (JWKS, audience AMF / AUSF), so a 200
+    /// is a request that passed it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
+    async fn namf_mt_and_nausf_requests_pass_oauth2_required_producers_1659() {
+        use nextgcore_sbi::test_support::oauth2 as stand_in;
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let sbi_ctx = global_context();
+        for nf_type in [NfType::Amf, NfType::Ausf] {
+            for inst in sbi_ctx.find_nf_instances_by_type(nf_type).await {
+                sbi_ctx.remove_nf_instance(&inst.id).await;
+            }
+        }
+        let sk = nextgcore_sbi::oauth::generate_es256_key();
+        let (_nrf, nrf_port) = stand_in::token_nrf(sk.clone()).await;
+        let ok = |_: &SbiRequest| SbiResponse::with_status(200);
+        let (_amf, amf_port, amf_seen) = stand_in::oauth2_producer(&sk, NfType::Amf, ok).await;
+        let (_ausf, ausf_port, ausf_seen) = stand_in::oauth2_producer(&sk, NfType::Ausf, ok).await;
+        *crate::app::OAUTH2_CLIENT_TEST_OVERRIDE
+            .write()
+            .expect("override") = Some(stand_in::oauth2_client_for(nrf_port, NfType::Udm));
+
+        let supi = "imsi-001010000001659";
+        let sor = serde_json::json!({ "ackInd": false });
+        let upu = serde_json::json!({ "upuHeader": "00" });
+        let status = |r: Result<SbiResponse, String>| r.map(|r| r.status);
+
+        // 1. The `*_SBI_ADDR` fallback: nothing cached.
+        std::env::set_var("AMF_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("AMF_SBI_PORT", amf_port.to_string());
+        std::env::set_var("AUSF_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("AUSF_SBI_PORT", ausf_port.to_string());
+        let fallback = (
+            status(udm_amf_send_mt_ue_context_info(None, supi, "TADS").await),
+            status(udm_ausf_send_sor_protect(supi, None, &sor).await),
+            status(udm_ausf_send_upu_protect(supi, None, &upu).await),
+        );
+        for var in [
+            "AMF_SBI_ADDR",
+            "AMF_SBI_PORT",
+            "AUSF_SBI_ADDR",
+            "AUSF_SBI_PORT",
+        ] {
+            std::env::remove_var(var);
+        }
+
+        // 2. A cached instance of the type, and 3. that instance by its id.
+        for (id, nf_type, name, svc_type, port) in [
+            (
+                "amf-1659",
+                NfType::Amf,
+                "namf-mt",
+                SbiServiceType::NamfMt,
+                amf_port,
+            ),
+            (
+                "ausf-1659",
+                NfType::Ausf,
+                "nausf-sorprotection",
+                SbiServiceType::NausfSorprotection,
+                ausf_port,
+            ),
+        ] {
+            let mut instance = NfInstance::new(id, nf_type);
+            instance.ipv4_addresses.push("127.0.0.1".to_string());
+            let mut svc = NfService::new(name, svc_type);
+            svc.port = port;
+            instance.add_service(svc);
+            sbi_ctx
+                .add_nf_instance_with_validity(instance, std::time::Duration::from_secs(3600))
+                .await;
+        }
+        let cached = (
+            status(udm_amf_send_mt_ue_context_info(None, supi, "TADS").await),
+            status(udm_ausf_send_sor_protect(supi, None, &sor).await),
+            status(udm_ausf_send_upu_protect(supi, None, &upu).await),
+        );
+        let named = (
+            status(udm_amf_send_mt_ue_context_info(Some("amf-1659"), supi, "TADS").await),
+            status(udm_ausf_send_sor_protect(supi, Some("ausf-1659"), &sor).await),
+            status(udm_ausf_send_upu_protect(supi, Some("ausf-1659"), &upu).await),
+        );
+
+        *crate::app::OAUTH2_CLIENT_TEST_OVERRIDE
+            .write()
+            .expect("override") = None;
+        sbi_ctx.remove_nf_instance("amf-1659").await;
+        sbi_ctx.remove_nf_instance("ausf-1659").await;
+
+        let passed = (Ok(200), Ok(200), Ok(200));
+        assert_eq!(
+            fallback, passed,
+            "the *_SBI_ADDR fallback must pass the gate"
+        );
+        assert_eq!(cached, passed, "a cached instance must pass the gate");
+        assert_eq!(named, passed, "the named instance must pass the gate");
+        assert_eq!(
+            stand_in::bearer_requests(&amf_seen, "GET", "/namf-mt/v1/ue-contexts/"),
+            3
+        );
+        assert_eq!(stand_in::bearer_requests(&ausf_seen, "POST", "/ue-sor"), 3);
+        assert_eq!(stand_in::bearer_requests(&ausf_seen, "POST", "/ue-upu"), 3);
+    }
 
     /// #235: a TRANSPORT failure to a cached NF must evict that cached profile,
     /// so the next call re-discovers instead of retrying an endpoint the NRF may

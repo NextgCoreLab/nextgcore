@@ -10,7 +10,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use nextgcore_pcfd::context::{pcf_context_init, pcf_self, DemoAmbrCap, SNssai, SessCreateRequest};
+use nextgcore_pcfd::context::{pcf_self, DemoAmbrCap, SNssai, SessCreateRequest};
 use nextgcore_pcfd::nudr_handler::SessionData;
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
 use nextgcore_sbi::test_support::NfSpawn;
@@ -44,7 +44,7 @@ async fn a_restarted_pcfd_restores_a_demo_capped_session() {
     std::fs::create_dir_all(&dir).unwrap();
     let state = dir.join("pcf-state.json");
     let _ = std::fs::remove_file(&state);
-    pcf_context_init(64, 64);
+    nextgcore_pcfd::test_support::init_context();
     pcf_self()
         .write()
         .unwrap()

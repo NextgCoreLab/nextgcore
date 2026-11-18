@@ -1122,9 +1122,15 @@ async fn a_pre_1518_record_restores_marked_and_keeps_its_marker_1518() {
     open_with(&mut after, Arc::clone(&alone) as Arc<dyn UeContextBackend>).await;
     let (new_id, restored) = after.ue_auth_state.find_by_supi(supi).expect("restored");
     assert!(restored.amf_ue.pre_1518_callbacks, "restored marked");
+    // #1642: the restore's SMF update may mint the UE's key, but its session gets a
+    // nonce only from the SMF's 2xx (none here: no SMF answers).
     assert!(
-        restored.amf_ue.sm_context_status_key.is_none(),
-        "no key minted"
+        crate::context::amf_self()
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .sess_find_by_psi(new_id, 5)
+            .is_some_and(|s| s.sm_context_status_nonce.is_none()),
+        "no nonce without the SMF's 2xx"
     );
     assert!(restored.amf_ue.policy_association.notify_token.is_none());
 
@@ -1135,7 +1141,7 @@ async fn a_pre_1518_record_restores_marked_and_keeps_its_marker_1518() {
         !rewritten.callback_tokens,
         "the rewrite keeps the pre-#1518 marker"
     );
-    assert!(rewritten.sm_context_status_key.is_none());
+    assert!(rewritten.sessions.iter().all(|s| s.status_nonce.is_none()));
 
     // #1625 review round 4: a NEW session of this legacy UE is tokened. Its key is
     // minted at that first new session and stored, the CreateSMContext carries the
@@ -2660,4 +2666,469 @@ async fn a_restored_ues_5g_tmsi_is_held_before_any_allocation_1692() {
         "the restored UE's 5G-TMSI is not handed out again"
     );
     crash(&mut after, new_id);
+}
+
+/// `written` as an AMF before #1518 stored it: no `callback_tokens` marker, no key,
+/// untokened associations and sessions.
+fn as_pre_1518(written: &StoredUeContext) -> StoredUeContext {
+    let mut doc = serde_json::to_value(written).expect("encodes");
+    let obj = doc.as_object_mut().expect("object");
+    obj.remove("callback_tokens");
+    obj.remove("sm_context_status_key");
+    for assoc in ["policy_association", "ue_policy_association"] {
+        obj[assoc]
+            .as_object_mut()
+            .expect("assoc")
+            .remove("notify_token");
+    }
+    for sess in obj["sessions"].as_array_mut().expect("sessions") {
+        sess.as_object_mut()
+            .expect("session")
+            .remove("status_nonce");
+    }
+    serde_json::from_value(doc).expect("the old encoding decodes")
+}
+
+/// A stand-in NF answering every request with `status`, recording (path, body).
+async fn answering_nf(status: u16) -> (nextgcore_sbi::server::SbiServer, u16, Seen) {
+    use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+    use nextgcore_sbi::server::{SbiServer as NSbiServer, SbiServerConfig as NSbiCfg};
+    let seen: Seen = Arc::default();
+    let sink = Arc::clone(&seen);
+    let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let server = NSbiServer::on_listener(NSbiCfg::new(addr), listener);
+    server
+        .start(move |req: SReq| {
+            let sink = Arc::clone(&sink);
+            async move {
+                sink.lock().unwrap().push((
+                    req.header.uri.clone(),
+                    req.http.content.clone().unwrap_or_default(),
+                ));
+                SResp::with_status(status)
+            }
+        })
+        .await
+        .expect("stand-in starts");
+    for _ in 0..200 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    (server, addr.port(), seen)
+}
+
+/// A pre-#1518 UE (marked, no key, untokened associations and session) restored on
+/// a fresh AMF whose SMF, UDM and PCF stand-ins are on the given ports, with both
+/// policy associations. Returns the AMF, the restored UE's id and the UE as stored.
+async fn restored_pre_1518(
+    id: u64,
+    tmsi: u32,
+    supi: &str,
+    smf_port: u16,
+    udm_port: u16,
+    pcf_port: u16,
+) -> (NgapServer, Arc<MemoryBackend>, u64, UeNasContext) {
+    crate::context::amf_context_init(64, 1024, 4096);
+    let backend = Arc::new(MemoryBackend::default());
+    let mut before = storing_server(&backend).await;
+    seed_registered_ue(&mut before, id, tmsi, supi, "ref-1642", smf_port, false);
+    before.ue_auth_state.with_mut(id, |s| {
+        s.amf_ue.policy_association.id = Some("am-pol-1642".to_string());
+        s.policy_association_id = Some("am-pol-1642".to_string());
+        s.amf_ue.ue_policy_association.id = Some("ue-pol-1642".to_string());
+        s.ue_policy_association_id = Some("ue-pol-1642".to_string());
+    });
+    let original = before.ue_auth_state.get(id).expect("seeded");
+    store_now(&mut before).await;
+    let written = backend.get(supi).expect("stored");
+    crash(&mut before, id);
+    drop(before);
+
+    let alone = Arc::new(MemoryBackend::default());
+    alone.put(&as_pre_1518(&written)).expect("put");
+    let mut after = storing_server(&alone).await;
+    after.udm_override = Some(("127.0.0.1".to_string(), udm_port));
+    after.pcf_override = Some(("127.0.0.1".to_string(), pcf_port));
+    open_with(&mut after, Arc::clone(&alone) as Arc<dyn UeContextBackend>).await;
+    let (new_id, restored) = after.ue_auth_state.find_by_supi(supi).expect("restored");
+    assert!(restored.amf_ue.pre_1518_callbacks, "restored marked");
+    (after, alone, new_id, original)
+}
+
+/// The PSI-5 nonce `id` holds, if any.
+fn psi5_nonce(id: u64) -> Option<String> {
+    let ctx = crate::context::amf_self();
+    let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+    guard
+        .sess_find_by_psi(id, 5)
+        .and_then(|s| s.sm_context_status_nonce)
+}
+
+/// The status of a POST of `body` to `path` on this AMF's SBI router.
+async fn namf_post(path: String, body: serde_json::Value) -> u16 {
+    crate::namf_server::namf_request_handler(
+        nextgcore_sbi::message::SbiRequest::post(path)
+            .with_json_body(&body)
+            .expect("json"),
+    )
+    .await
+    .status
+}
+
+/// The `smContextStatusUri` / `notificationUri` values `seen` carried, in order.
+fn uris_sent(seen: &Seen, member: &str) -> Vec<String> {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter_map(|(_, body)| {
+            serde_json::from_str::<serde_json::Value>(body)
+                .ok()?
+                .get(member)?
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// **#1642.** A UE context restored from before #1518 moves to tokened callbacks at
+/// the updates that re-issue them, each once its peer accepted it: at restore the SMF
+/// is given a tokened `smContextStatusUri` and, on its 2xx, the UE's key and the
+/// session's nonce are recorded, after which the session's token-less URI is 404; at
+/// the UE's first message the PCF is given tokened `notificationUri`s and, on its
+/// 2xx, they are the associations'. With nothing token-less left, the context is no
+/// longer pre-#1518, and its record is written as tokened.
+///
+/// REVERT-VERIFIED: without `apply_status_token` or `apply_policy_token` (nothing
+/// adopted), or without `clear_pre_1518_once_migrated`, this fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pre_1518_ue_moves_to_tokened_callbacks_once_its_peers_accept_1642() {
+    let (_smf, smf_port, smf_seen, _) =
+        scripted_smf(|_| nextgcore_sbi::message::SbiResponse::no_content()).await;
+    let (_udm, udm_port, _) = answering_nf(204).await;
+    let (_pcf, pcf_port, pcf_seen) = answering_nf(204).await;
+    // Plaintext stand-ins: the dev profile, held with the SMF env lock.
+    let _env = SmfEnvGuard::acquire(smf_port).await;
+    let (id, sr_id, tmsi) = (16_420_101u64, 16_420_103u64, 0x1642_0101u32);
+    let supi = "imsi-001010001642101";
+    let (mut after, alone, restored_id, original) =
+        restored_pre_1518(id, tmsi, supi, smf_port, udm_port, pcf_port).await;
+
+    // At restore: the SMF accepts the tokened smContextStatusUri.
+    settle_until(&mut after, || psi5_nonce(restored_id).is_some()).await;
+    let ue = after.ue_auth_state.get(restored_id).expect("held");
+    let key = ue
+        .amf_ue
+        .sm_context_status_key
+        .clone()
+        .expect("the UE's key");
+    let nonce = psi5_nonce(restored_id).expect("the nonce, adopted");
+    let token = crate::sbi_path::sm_context_status_token(&key, 5, &nonce);
+    assert_eq!(
+        uris_sent(&smf_seen, "smContextStatusUri"),
+        vec![crate::sbi_path::sm_context_status_uri(
+            supi,
+            5,
+            Some(&token)
+        )],
+        "the SMF was given the URI whose token was adopted"
+    );
+    let status = || serde_json::json!({"statusInfo": {"resourceStatus": "ACTIVE"}});
+    assert_eq!(
+        namf_post(
+            format!("/namf-callback/v1/{supi}/sm-context-status/5"),
+            status()
+        )
+        .await,
+        404,
+        "the session's token-less URI is no longer served"
+    );
+    assert_eq!(
+        namf_post(
+            format!("/namf-callback/v1/{supi}/5/sm-context-status/{token}"),
+            status()
+        )
+        .await,
+        204
+    );
+    assert!(
+        ue.amf_ue.pre_1518_callbacks,
+        "its policy associations are still token-less"
+    );
+
+    // The UE's first message: the PCF accepts the tokened notificationUris.
+    after.forced_amf_ue_ngap_id = Some(sr_id);
+    let restored = after.ue_auth_state.get(restored_id).expect("held");
+    let nas = protected_idle_service_request(&restored.amf_ue, tmsi, original.amf_ue.ul_count + 1);
+    after
+        .handle_initial_ue_message(1, &service_request_initial_ue(nas))
+        .await
+        .expect("handled");
+    let migrated = || {
+        crate::context::amf_self()
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .amf_ue_find_by_supi(supi)
+            .is_some_and(|ue| !ue.pre_1518_callbacks)
+    };
+    settle_until(&mut after, migrated).await;
+    let (now_id, ue) = after.ue_auth_state.find_by_supi(supi).expect("held");
+    assert!(!ue.amf_ue.pre_1518_callbacks, "nothing token-less is left");
+    let am = ue
+        .amf_ue
+        .policy_association
+        .notify_token
+        .clone()
+        .expect("AM token");
+    let uep = ue
+        .amf_ue
+        .ue_policy_association
+        .notify_token
+        .clone()
+        .expect("UE policy token");
+    let sent = uris_sent(&pcf_seen, "notificationUri");
+    assert!(
+        sent.contains(&crate::sbi_path::am_policy_notification_uri(
+            supi,
+            Some(&am)
+        )) && sent.contains(&crate::sbi_path::ue_policy_notification_uri(
+            supi,
+            Some(&uep)
+        )),
+        "the PCF was given the URIs whose tokens were adopted: {sent:?}"
+    );
+    for path in [
+        format!("/namf-callback/v1/{supi}/am-policy-notify/update"),
+        format!("/namf-callback/v1/{supi}/ue-policy-notify/update"),
+    ] {
+        assert_eq!(
+            namf_post(path.clone(), serde_json::json!({})).await,
+            404,
+            "{path}: no longer served"
+        );
+    }
+
+    store_now(&mut after).await;
+    assert!(
+        alone.get(supi).expect("rewritten").callback_tokens,
+        "the record is written as tokened"
+    );
+    crash(&mut after, now_id);
+}
+
+/// **#1642** (and #1625 round 5's untested takeover rule): until its peer accepted
+/// the re-issued URI, a pre-#1518 UE's session and associations keep their
+/// token-less URIs, served as before. An SMF and a PCF that refuse the update
+/// (definitively) leave the UE as it was restored: no key, no nonce, no association
+/// token, still marked, and its record still written as pre-#1518.
+///
+/// REVERT-VERIFIED: adopting the nonce and key when the update is sent (not on its
+/// 2xx), or the association token likewise, fails this.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_update_leaves_a_pre_1518_ue_on_its_token_less_callbacks_1642() {
+    let (_smf, smf_port, smf_seen, _) =
+        scripted_smf(|_| nextgcore_sbi::message::SbiResponse::with_status(403)).await;
+    let (_udm, udm_port, _) = answering_nf(403).await;
+    let (_pcf, pcf_port, pcf_seen) = answering_nf(403).await;
+    let _env = SmfEnvGuard::acquire(smf_port).await;
+    let (id, sr_id, tmsi) = (16_420_201u64, 16_420_203u64, 0x1642_0201u32);
+    let supi = "imsi-001010001642201";
+    let (mut after, alone, restored_id, original) =
+        restored_pre_1518(id, tmsi, supi, smf_port, udm_port, pcf_port).await;
+
+    settle_until(&mut after, || serving_updates(&smf_seen) >= 1).await;
+    for _ in 0..3 {
+        settle_offloaded_sbi(&mut after).await;
+    }
+    let sent = uris_sent(&smf_seen, "smContextStatusUri");
+    assert!(!sent.is_empty(), "the SMF was asked");
+    assert!(
+        sent.iter()
+            .all(|u| *u != crate::sbi_path::sm_context_status_uri(supi, 5, None)),
+        "the SMF was offered a tokened URI: {sent:?}"
+    );
+    let ue = after.ue_auth_state.get(restored_id).expect("held");
+    assert!(psi5_nonce(restored_id).is_none(), "no nonce adopted");
+    let status = || serde_json::json!({"statusInfo": {"resourceStatus": "ACTIVE"}});
+    assert_eq!(
+        namf_post(
+            format!("/namf-callback/v1/{supi}/sm-context-status/5"),
+            status()
+        )
+        .await,
+        204,
+        "the legacy session's token-less URI is still served"
+    );
+
+    after.forced_amf_ue_ngap_id = Some(sr_id);
+    let nas = protected_idle_service_request(&ue.amf_ue, tmsi, original.amf_ue.ul_count + 1);
+    after
+        .handle_initial_ue_message(1, &service_request_initial_ue(nas))
+        .await
+        .expect("handled");
+    settle_until(&mut after, || {
+        uris_sent(&pcf_seen, "notificationUri").len() >= 2
+    })
+    .await;
+    for _ in 0..3 {
+        settle_offloaded_sbi(&mut after).await;
+    }
+    assert!(
+        uris_sent(&pcf_seen, "notificationUri")
+            .iter()
+            .all(|u| u.contains("-policy-notify/") && !u.ends_with("-policy-notify")),
+        "the PCF was offered tokened URIs"
+    );
+    let (now_id, ue) = after.ue_auth_state.find_by_supi(supi).expect("held");
+    assert!(ue.amf_ue.policy_association.notify_token.is_none());
+    assert!(ue.amf_ue.ue_policy_association.notify_token.is_none());
+    assert!(ue.amf_ue.pre_1518_callbacks, "still a pre-#1518 context");
+    assert_ne!(
+        namf_post(
+            format!("/namf-callback/v1/{supi}/am-policy-notify/update"),
+            serde_json::json!({})
+        )
+        .await,
+        404,
+        "the token-less AM policy URI is still served"
+    );
+    store_now(&mut after).await;
+    assert!(
+        !alone.get(supi).expect("rewritten").callback_tokens,
+        "the record stays pre-#1518"
+    );
+    crash(&mut after, now_id);
+}
+
+/// **#1642** (retries are idempotent): a refused serving-AMF update is retried with
+/// the same tokened URI, and the one accepted is the one adopted. An answer applied
+/// again, or another answer for a session or association that already took a token
+/// (a later takeover's), changes nothing: the first accepted token stays.
+///
+/// REVERT-VERIFIED: with `apply_status_token` or `apply_policy_token` overwriting a
+/// recorded token, this fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retried_or_repeated_migration_answer_has_one_effect_1642() {
+    let (_smf, smf_port, smf_seen) = flaky_smf(1).await;
+    let (_udm, udm_port, _) = answering_nf(204).await;
+    let (_pcf, pcf_port, _) = answering_nf(204).await;
+    let _env = SmfEnvGuard::acquire(smf_port).await;
+    let (id, tmsi) = (16_420_301u64, 0x1642_0301u32);
+    let supi = "imsi-001010001642301";
+    let (mut after, _alone, rid, _) =
+        restored_pre_1518(id, tmsi, supi, smf_port, udm_port, pcf_port).await;
+
+    settle_until(&mut after, || psi5_nonce(rid).is_some()).await;
+    let sent = uris_sent(&smf_seen, "smContextStatusUri");
+    assert_eq!(sent.len(), 2, "refused once, then retried: {sent:?}");
+    assert_eq!(sent[0], sent[1], "the retry carries the same URI");
+    let key = after
+        .ue_auth_state
+        .get(rid)
+        .and_then(|s| s.amf_ue.sm_context_status_key.clone())
+        .expect("key");
+    let nonce = psi5_nonce(rid).expect("adopted");
+    assert_eq!(
+        sent[1],
+        crate::sbi_path::sm_context_status_uri(
+            supi,
+            5,
+            Some(&crate::sbi_path::sm_context_status_token(&key, 5, &nonce))
+        )
+    );
+
+    // The same session's answer again, with another nonce: the first stays.
+    let again = super::super::ue_context_takeover::StatusTokenAnswer {
+        supi: supi.to_string(),
+        psi: 5,
+        sm_ref: "ref-1642".to_string(),
+        key: key.clone(),
+        nonce: "another-nonce".to_string(),
+    };
+    after.apply_status_token(again.clone());
+    after.apply_status_token(again);
+    assert_eq!(psi5_nonce(rid).as_deref(), Some(nonce.as_str()));
+
+    // An association's token, applied twice and then superseded: one effect.
+    let policy = |token: &str| super::super::ue_context_takeover::PolicyTokenAnswer {
+        supi: supi.to_string(),
+        kind: super::super::ue_context_takeover::PolicyKind::Am,
+        pol_asso_id: "am-pol-1642".to_string(),
+        token: token.to_string(),
+    };
+    after.apply_policy_token(policy("first"));
+    after.apply_policy_token(policy("first"));
+    after.apply_policy_token(policy("second"));
+    let ue = after.ue_auth_state.get(rid).expect("held");
+    assert_eq!(
+        ue.amf_ue.policy_association.notify_token.as_deref(),
+        Some("first")
+    );
+    crash(&mut after, rid);
+}
+
+/// **#1642** (cancellation and late answers): a token is adopted only from the
+/// answer to its own update, applied on the NGAP task; an update dropped before its
+/// answer adopts nothing (there is no state to undo). A late answer whose session or
+/// association is gone, is another SM context or another association now, or was
+/// derived under a key the UE does not hold, changes nothing, and the token-less
+/// URIs stay served.
+///
+/// REVERT-VERIFIED: without the SM-context and association-id checks, or the key
+/// check, in the apply functions, this fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_answer_for_another_session_or_association_changes_nothing_1642() {
+    let (_smf, smf_port, _) = answering_nf(403).await;
+    let (_udm, udm_port, _) = answering_nf(403).await;
+    let (_pcf, pcf_port, _) = answering_nf(403).await;
+    let _env = SmfEnvGuard::acquire(smf_port).await;
+    let (id, tmsi) = (16_420_401u64, 0x1642_0401u32);
+    let supi = "imsi-001010001642401";
+    let (mut after, _alone, rid, _) =
+        restored_pre_1518(id, tmsi, supi, smf_port, udm_port, pcf_port).await;
+    for _ in 0..5 {
+        settle_offloaded_sbi(&mut after).await;
+    }
+    assert!(psi5_nonce(rid).is_none(), "the SMF refused");
+    let key = after
+        .ue_auth_state
+        .get(rid)
+        .and_then(|s| s.amf_ue.sm_context_status_key.clone())
+        .expect("key");
+    let status = |sm_ref: &str, key: &str| super::super::ue_context_takeover::StatusTokenAnswer {
+        supi: supi.to_string(),
+        psi: 5,
+        sm_ref: sm_ref.to_string(),
+        key: key.to_string(),
+        nonce: "late".to_string(),
+    };
+    after.apply_status_token(status("ref-of-another-context", &key));
+    after.apply_status_token(status("ref-1642", "a-key-the-ue-does-not-hold"));
+    assert!(psi5_nonce(rid).is_none(), "neither is this session's");
+    let policy = |pol: &str| super::super::ue_context_takeover::PolicyTokenAnswer {
+        supi: supi.to_string(),
+        kind: super::super::ue_context_takeover::PolicyKind::Ue,
+        pol_asso_id: pol.to_string(),
+        token: "late".to_string(),
+    };
+    after.apply_policy_token(policy("ue-pol-of-before"));
+    let ue = after.ue_auth_state.get(rid).expect("held");
+    assert!(ue.amf_ue.ue_policy_association.notify_token.is_none());
+    assert!(ue.amf_ue.pre_1518_callbacks);
+
+    // The session is released meanwhile: its late answer finds nothing.
+    after.sm_context_refs.remove(&(rid, 5));
+    after.apply_status_token(status("ref-1642", &key));
+    assert!(psi5_nonce(rid).is_none());
+    assert_ne!(
+        namf_post(
+            format!("/namf-callback/v1/{supi}/ue-policy-notify/update"),
+            serde_json::json!({})
+        )
+        .await,
+        404,
+        "the token-less UE policy URI is still served"
+    );
+    crash(&mut after, rid);
 }

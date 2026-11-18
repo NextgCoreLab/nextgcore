@@ -34,6 +34,8 @@ ctrlc.workspace = true
 bytes.workspace = true
 
 [dev-dependencies]
+nextgcore-sbi = { workspace = true, features = ["test-support"] }
+nextgcore-amfd = { path = "../nextgcore-amfd" }
 proptest.workspace = true
 p256 = { workspace = true, features = ["ecdsa"] }
 base64.workspace = true

@@ -396,7 +396,13 @@ mod tests {
     /// none cached, no env) → the response carries NO `upuInfo` and NO
     /// `upuDataList` anywhere, yet the rest of am-data survives.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the AUSF env and NF cache
     async fn ausf_unreachable_withholds_upu_info() {
+        // #1659 review m4: these read the AUSF env vars and NF-instance cache
+        // that other tests set under CONTEXT_GUARD, so they take it too.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let raw = r#"{"gpsis":["msisdn-9"]}"#;
         let out = inject_upu_info(
             "imsi-001010000000009",
@@ -422,7 +428,13 @@ mod tests {
     /// unprotected `upuInfo.upuDataList` must NOT leak it when the AUSF cannot
     /// protect it — the pre-existing upuInfo is stripped.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the AUSF env and NF cache
     async fn udr_provisioned_unprotected_upu_is_stripped_when_ausf_down() {
+        // #1659 review m4: these read the AUSF env vars and NF-instance cache
+        // that other tests set under CONTEXT_GUARD, so they take it too.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let raw = r#"{"gpsis":["msisdn-3"],"upuInfo":{"upuDataList":[{"routingId":"9999"}],"upuAckInd":true}}"#;
         let out = inject_upu_info("imsi-001010000000003", raw.to_string(), None, None).await;
         assert!(

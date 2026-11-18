@@ -28425,6 +28425,52 @@ mod tests {
         assert_eq!(sess.sm_context_status_uri.as_deref(), Some(new_uri));
     }
 
+    /// **#1642, the SMF half.** An AMF moving a session made before #1518 to a
+    /// tokened `smContextStatusUri` sends it in the serving-AMF UpdateSMContext (the
+    /// body amfd's `spawn_smf_serving_updates` builds). The SMF answers 2xx, which is
+    /// what the AMF adopts the token on, keeps the URI verbatim, token included, and
+    /// a retry of the same update changes nothing more. The AMF half is amfd's
+    /// `ue_context_store_tests::*_1642`.
+    #[tokio::test]
+    async fn a_re_issued_tokened_status_uri_is_kept_verbatim_and_a_retry_is_one_effect_1642() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _seeded = crate::context::SeededState::track();
+        let reference = seed_registered_session("imsi-001010000016422", 5, "internet");
+        seed_user_plane(&reference, (0x0016_4220, [10, 45, 0, 164]));
+        let tokened = "http://amf-b.example/namf-callback/v1/imsi-001010000016422/5/\
+                       sm-context-status/9f2c1642aa55e0b1d7c3e4f5a6b7c8d9";
+        let update = || {
+            ho_update(
+                &reference,
+                serde_json::json!({
+                    "servingNfId": "00000000-0000-4000-8000-000000001642",
+                    "smContextStatusUri": tokened,
+                    "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "02556b" },
+                    "servingNetwork": { "mcc": "001", "mnc": "01" },
+                }),
+                None,
+            )
+        };
+        for attempt in 1..=2 {
+            let resp = handle_sm_context_update(&reference, &update()).await;
+            assert_eq!(resp.status, 204, "attempt {attempt}");
+            let ctx = smf_self();
+            let ctx = ctx.read().unwrap();
+            let binding = ctx
+                .policy_bindings
+                .read()
+                .unwrap()
+                .get(&reference)
+                .cloned()
+                .expect("binding");
+            assert_eq!(binding.sm_context_status_uri.as_deref(), Some(tokened));
+            let sess = ctx
+                .sess_find_by_sm_context_ref(&reference)
+                .expect("session");
+            assert_eq!(sess.sm_context_status_uri.as_deref(), Some(tokened));
+        }
+    }
+
     /// A COMPLETED the SMF cannot carry out -- no target endpoint was learned at
     /// PREPARED, and no N4 session -- is an error, not `200 COMPLETED` (#964 review): the
     /// downlink was not switched, and a success would hide that from the AMF, which

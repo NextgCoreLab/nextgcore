@@ -251,6 +251,45 @@ impl NorthboundAuth {
 /// The northbound auth posture, set once by `main()`.
 static NORTHBOUND_AUTH: std::sync::OnceLock<NorthboundAuth> = std::sync::OnceLock::new();
 
+/// The outbound OAuth2 client (#1661): the NEF presents an NRF-issued token on
+/// its southbound service requests to the UDM, AMF and BSF (TS 33.501
+/// §13.4.1.1.2). Installed at startup by [`outbound_oauth2_client`].
+static OAUTH2_CLIENT: std::sync::OnceLock<Option<Arc<nextgcore_sbi::oauth::OAuth2Client>>> =
+    std::sync::OnceLock::new();
+
+/// The installed outbound OAuth2 client, if any (#1661).
+pub(crate) fn oauth2_client() -> Option<Arc<nextgcore_sbi::oauth::OAuth2Client>> {
+    #[cfg(test)]
+    if let Ok(oauth2) = TEST_OAUTH2_CLIENT.try_with(Arc::clone) {
+        return Some(oauth2);
+    }
+    OAUTH2_CLIENT.get().and_then(|opt| opt.clone())
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// #1661 tests: the OAuth2 client [`oauth2_client`] returns inside
+    /// `TEST_OAUTH2_CLIENT.scope(..)`. Task-local, so the other tests in the
+    /// process keep the default (none installed).
+    pub(crate) static TEST_OAUTH2_CLIENT: Arc<nextgcore_sbi::oauth::OAuth2Client>;
+}
+
+/// #1661: the outbound OAuth2 client this NEF installs at startup: under the
+/// `production` SBI profile or the `sbi.oauth2.require` knob, when an NRF is
+/// configured (see [`nextgcore_sbi::oauth::outbound_oauth2_client`]).
+fn outbound_oauth2_client(
+    profile: nextgcore_sbi::security::SbiProfile,
+    require_oauth2: bool,
+    nrf_uri: Option<&str>,
+) -> Option<Arc<nextgcore_sbi::oauth::OAuth2Client>> {
+    nextgcore_sbi::oauth::outbound_oauth2_client(
+        profile,
+        require_oauth2,
+        nrf_uri,
+        nextgcore_sbi::types::NfType::Nef,
+    )
+}
+
 fn northbound_auth() -> NorthboundAuth {
     NORTHBOUND_AUTH.get().copied().unwrap_or_default()
 }
@@ -508,6 +547,13 @@ async fn main() -> Result<()> {
     // the shipped matched-sim path is byte-unchanged; the privacy fixes in this
     // same change are unconditional.
     let oauth2 = oauth2_required(&args.config);
+    let _ = OAUTH2_CLIENT.set(outbound_oauth2_client(
+        nextgcore_sbi::security::SbiProfile::resolve(),
+        oauth2,
+        (!args.nrf_uri.is_empty()).then_some(args.nrf_uri.as_str()),
+    ));
+    // #1667: the same client gives this NF's own NRF calls their access token.
+    nextgcore_sbi::nrf_tls::set_nrf_oauth2_client(OAUTH2_CLIENT.get().cloned().flatten());
     if oauth2 {
         sbi_server_config = apply_oauth2_enforcement(sbi_server_config, &args.nrf_uri);
     }
@@ -1661,7 +1707,7 @@ async fn resolve_gpsi_to_supi(udm_uri: Option<String>, gpsi: &str) -> Option<Str
         log::warn!("invalid UDM URI '{uri}'; GPSI '{gpsi}' not resolved");
         return None;
     };
-    let client = bounded_client(&host, port);
+    let client = service_client(&host, port, nextgcore_sbi::types::NfType::Udm);
     let path = format!("/nudm-sdm/v2/{gpsi}/id-translation-result");
     match client.get(&path).await {
         Ok(response) if response.status == 200 => {
@@ -1780,7 +1826,7 @@ async fn attempt_southbound_subscribe(
             detail: format!("invalid {} URI '{uri}'", producer.as_str()),
         };
     };
-    let client = bounded_client(&host, port);
+    let client = service_client(&host, port, producer.nf_type());
     match client.post_json(&req.path, &req.body).await {
         Ok(response) if response.status == 200 || response.status == 201 => {
             match extract_southbound_ref(producer, &req.path, &response) {
@@ -1883,7 +1929,7 @@ async fn southbound_unsubscribe(producer_uri: Option<String>, southbound: Southb
         );
         return;
     };
-    let client = bounded_client(&host, port);
+    let client = service_client(&host, port, producer.nf_type());
     match client.delete(&southbound.delete_path).await {
         Ok(response) if response.is_success() => {
             log::debug!(
@@ -2252,6 +2298,28 @@ fn bounded_client(host: &str, port: u16) -> SbiClient {
         .with_connect_timeout(Duration::from_secs(SOUTHBOUND_CONNECT_TIMEOUT_SECS))
         .with_request_timeout(Duration::from_secs(SOUTHBOUND_REQUEST_TIMEOUT_SECS));
     SbiClient::new(config)
+}
+
+/// [`bounded_client`] for a southbound **service request** to the `target`
+/// producer (#1661): it carries the NRF-issued token when an outbound OAuth2
+/// client is installed (TS 33.501 §13.4.1.1.2, TS 29.500 §6.7.3). Notifications
+/// to an AF use [`bounded_client`] itself: they carry no token.
+fn service_client(host: &str, port: u16, target: nextgcore_sbi::types::NfType) -> SbiClient {
+    let client = bounded_client(host, port);
+    match oauth2_client() {
+        Some(oauth2) => client.with_oauth2(oauth2, target),
+        None => client,
+    }
+}
+
+impl context::SouthboundProducer {
+    /// The producer's NF type, the audience of its access token.
+    fn nf_type(self) -> nextgcore_sbi::types::NfType {
+        match self {
+            Self::Amf => nextgcore_sbi::types::NfType::Amf,
+            Self::Udm => nextgcore_sbi::types::NfType::Udm,
+        }
+    }
 }
 
 /// Build the NFProfile registered with the NRF (TS 29.510): nfType NEF
@@ -4765,5 +4833,201 @@ mod tests_nf_profile_host_kind_1324 {
                 nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
             assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
         }
+    }
+}
+
+/// #1661: the NEF's southbound service requests carry the NRF-issued token, so
+/// they pass OAuth2-required producers. The stand-ins are gated by nextgcore-sbi's
+/// own check (JWKS, audience), so a recorded request passed it.
+#[cfg(test)]
+mod southbound_oauth2_1661_tests {
+    use super::*;
+    use context::{SouthboundProducer, SouthboundRef};
+    use nextgcore_sbi::test_support::oauth2 as stand_in;
+    use nextgcore_sbi::types::NfType;
+
+    const NRF: &str = "http://127.0.0.10:7777";
+
+    /// The production profile installs the client without the knob (#1665's rule,
+    /// now for the NEF too), and dev without the knob installs none.
+    #[test]
+    fn the_production_profile_installs_the_outbound_oauth2_client_without_the_knob() {
+        use nextgcore_sbi::security::SbiProfile;
+        let oauth2 = outbound_oauth2_client(SbiProfile::Production, false, Some(NRF))
+            .expect("production profile, knob off: the outbound OAuth2 client is installed");
+        assert_eq!(oauth2.self_consumer().nf_type, NfType::Nef);
+        assert_eq!(oauth2.nrf_uri(), NRF);
+        assert!(outbound_oauth2_client(SbiProfile::Dev, true, Some(NRF)).is_some());
+        assert!(outbound_oauth2_client(SbiProfile::Dev, false, Some(NRF)).is_none());
+    }
+
+    /// #1661, failure-path property 1 (a failed request applies nothing): when
+    /// the token cannot be obtained, the GPSI resolution, the southbound subscribe
+    /// and its unsubscribe are not sent, not even bare. The subscribe is not
+    /// Live, so no southbound reference is stored for it. The recorder here is
+    /// UNGATED, so it would see a bare send.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_token_fetch_sends_nothing_1661() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = std::sync::Arc::clone(&seen);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let recorder = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        recorder
+            .start(move |_req| {
+                let sink = std::sync::Arc::clone(&sink);
+                async move {
+                    sink.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    nextgcore_sbi::message::SbiResponse::with_status(201)
+                        .with_header("location", "/x/v1/subscriptions/s-1")
+                }
+            })
+            .await
+            .expect("recorder starts");
+        let uri = format!("http://127.0.0.1:{}", addr.port());
+        let subscribe = SouthboundSubscribe {
+            producer: SouthboundProducer::Amf,
+            path: "/namf-evts/v1/subscriptions".to_string(),
+            body: serde_json::json!({ "subscription": {} }),
+        };
+        // Port 1 on loopback: nothing listens, so the token request fails.
+        let (gpsi, sub) = TEST_OAUTH2_CLIENT
+            .scope(stand_in::oauth2_client_for(1, NfType::Nef), async {
+                let gpsi = resolve_gpsi_to_supi(Some(uri.clone()), "msisdn-1661").await;
+                let sub = attempt_southbound_subscribe(Some(uri.clone()), &subscribe).await;
+                southbound_unsubscribe(
+                    Some(uri.clone()),
+                    SouthboundRef {
+                        producer: SouthboundProducer::Amf,
+                        subscription_id: "s-1".to_string(),
+                        delete_path: "/namf-evts/v1/subscriptions/s-1".to_string(),
+                    },
+                )
+                .await;
+                (gpsi, sub)
+            })
+            .await;
+
+        assert_eq!(gpsi, None);
+        assert!(!matches!(sub, SouthboundOutcome::Live(_)), "{sub:?}");
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no token: nothing is sent, not even bare"
+        );
+    }
+
+    /// #1661: the GPSI resolution (UDM), and the AMF and UDM southbound
+    /// subscriptions and their unsubscribes, pass OAuth2-required producers of the
+    /// right NF type with the installed client, and are refused 401 without one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gpsi_resolution_and_the_amf_and_udm_subscriptions_pass_oauth2_required_producers_1661()
+    {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let sk = nextgcore_sbi::oauth::generate_es256_key();
+        let (_nrf, nrf_port) = stand_in::token_nrf(sk.clone()).await;
+        let (_udm, udm_port, udm_seen) =
+            stand_in::oauth2_producer(&sk, NfType::Udm, |req| match req.header.method.as_str() {
+                "DELETE" => SbiResponse::with_status(204),
+                "POST" => SbiResponse::with_status(201).with_header(
+                    "location",
+                    "/nudm-ee/v1/imsi-001010000001661/ee-subscriptions/ee-1661",
+                ),
+                _ => SbiResponse::with_status(200)
+                    .with_json_body(&serde_json::json!({ "supi": "imsi-001010000001661" }))
+                    .expect("json"),
+            })
+            .await;
+        let (_amf, amf_port, amf_seen) = stand_in::oauth2_producer(&sk, NfType::Amf, |req| {
+            if req.header.method == "DELETE" {
+                SbiResponse::with_status(204)
+            } else {
+                SbiResponse::with_status(201)
+                    .with_header("location", "/namf-evts/v1/subscriptions/s-1661")
+            }
+        })
+        .await;
+        let udm_uri = format!("http://127.0.0.1:{udm_port}");
+        let amf_uri = format!("http://127.0.0.1:{amf_port}");
+        let subscribe = SouthboundSubscribe {
+            producer: SouthboundProducer::Amf,
+            path: "/namf-evts/v1/subscriptions".to_string(),
+            body: serde_json::json!({ "subscription": {} }),
+        };
+        let udm_subscribe = SouthboundSubscribe {
+            producer: SouthboundProducer::Udm,
+            path: "/nudm-ee/v1/imsi-001010000001661/ee-subscriptions".to_string(),
+            body: serde_json::json!({ "callbackReference": "http://nef/cb" }),
+        };
+
+        let bare_gpsi = resolve_gpsi_to_supi(Some(udm_uri.clone()), "msisdn-1661").await;
+        let bare_sub = attempt_southbound_subscribe(Some(amf_uri.clone()), &subscribe).await;
+        let bare_udm_sub =
+            attempt_southbound_subscribe(Some(udm_uri.clone()), &udm_subscribe).await;
+        let (gpsi, sub, udm_sub) = TEST_OAUTH2_CLIENT
+            .scope(stand_in::oauth2_client_for(nrf_port, NfType::Nef), async {
+                let gpsi = resolve_gpsi_to_supi(Some(udm_uri.clone()), "msisdn-1661").await;
+                let sub = attempt_southbound_subscribe(Some(amf_uri.clone()), &subscribe).await;
+                if let SouthboundOutcome::Live(southbound) = &sub {
+                    southbound_unsubscribe(Some(amf_uri.clone()), southbound.clone()).await;
+                }
+                let udm_sub =
+                    attempt_southbound_subscribe(Some(udm_uri.clone()), &udm_subscribe).await;
+                if let SouthboundOutcome::Live(southbound) = &udm_sub {
+                    southbound_unsubscribe(Some(udm_uri.clone()), southbound.clone()).await;
+                }
+                (gpsi, sub, udm_sub)
+            })
+            .await;
+
+        assert_eq!(bare_gpsi, None, "refused 401 without a token");
+        assert!(
+            !matches!(bare_sub, SouthboundOutcome::Live(_)),
+            "{bare_sub:?}"
+        );
+        assert!(
+            !matches!(bare_udm_sub, SouthboundOutcome::Live(_)),
+            "{bare_udm_sub:?}"
+        );
+        match udm_sub {
+            SouthboundOutcome::Live(SouthboundRef {
+                subscription_id, ..
+            }) => {
+                assert_eq!(subscription_id, "ee-1661")
+            }
+            other => panic!("the tokened UDM subscribe must be live: {other:?}"),
+        }
+        assert_eq!(
+            stand_in::bearer_requests(&udm_seen, "POST", "/ee-subscriptions"),
+            1
+        );
+        assert_eq!(
+            stand_in::bearer_requests(&udm_seen, "DELETE", "/ee-subscriptions/ee-1661"),
+            1
+        );
+        assert_eq!(gpsi.as_deref(), Some("imsi-001010000001661"));
+        match sub {
+            SouthboundOutcome::Live(SouthboundRef {
+                subscription_id, ..
+            }) => {
+                assert_eq!(subscription_id, "s-1661")
+            }
+            other => panic!("the tokened subscribe must be live: {other:?}"),
+        }
+        assert_eq!(
+            stand_in::bearer_requests(&udm_seen, "GET", "/id-translation-result"),
+            1
+        );
+        assert_eq!(
+            stand_in::bearer_requests(&amf_seen, "POST", "/namf-evts/v1/subscriptions"),
+            1
+        );
+        assert_eq!(
+            stand_in::bearer_requests(&amf_seen, "DELETE", "/namf-evts/v1/subscriptions/s-1661"),
+            1
+        );
     }
 }

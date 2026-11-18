@@ -9,7 +9,8 @@
 //!    when the consumer supplied it.
 //! 2. `Namf_Communication_N1N2MessageSubscribe` (TS 29.518 §5.2.2.6) so the
 //!    AMF can deliver uplink LPP/NRPPa to our A4 notify-callback routes
-//!    (`/nlmf-loc/v1/notify/n1`, `/nlmf-loc/v1/notify/n2`); the returned
+//!    (`/nlmf-loc/v1/notify/n1-message-notify/{token}`,
+//!    `/nlmf-loc/v1/notify/n2-info-notify/{token}`, #1518); the returned
 //!    subscription id is cached per (AMF, ueContextId) and reused.
 //! 3. `Namf_Communication_N1N2MessageTransfer` (TS 29.518 §5.2.2.3.1) as a
 //!    `multipart/related` POST (TS 29.500 §6.1.2.3): jsonData =
@@ -23,6 +24,7 @@
 //! location is NEVER fabricated.
 
 use bytes::Bytes;
+use nextgcore_sbi::callback_auth::CallbackToken;
 use nextgcore_sbi::client::SbiClient;
 use nextgcore_sbi::context::global_context;
 use nextgcore_sbi::message::{SbiPart, SbiRequest};
@@ -40,9 +42,23 @@ pub const LPP_CONTENT_ID: &str = "lpp-req";
 pub const N1_CONTENT_TYPE: &str = "application/vnd.3gpp.5gnas";
 
 /// lmfd notify-callback routes registered in the A3 subscription (consumer-
-/// chosen callback URIs, served by the A4 handlers — NOT TS 29.572 resources).
-pub const N1_NOTIFY_PATH: &str = "/nlmf-loc/v1/notify/n1";
-pub const N2_NOTIFY_PATH: &str = "/nlmf-loc/v1/notify/n2";
+/// chosen callback URIs, served by the A4 handlers — NOT TS 29.572 resources):
+/// `{NOTIFY_PREFIX}/{segment}/{token}`, where the token is the subscription's
+/// (#1518). Both segments are in `nextgcore_sbi::log_redact::CALLBACK_TOKEN_SEGMENTS`.
+pub const NOTIFY_PREFIX: &str = "/nlmf-loc/v1/notify";
+/// The segment before the token of the `n1NotifyCallbackUri`.
+pub const N1_NOTIFY_SEGMENT: &str = "n1-message-notify";
+/// The segment before the token of the `n2NotifyCallbackUri`.
+pub const N2_NOTIFY_SEGMENT: &str = "n2-info-notify";
+
+/// The path of this LMF's `kind` notify callback for `token` (#1518).
+pub fn notify_path(kind: crate::context::NotifyKind, token: &str) -> String {
+    let segment = match kind {
+        crate::context::NotifyKind::N1 => N1_NOTIFY_SEGMENT,
+        crate::context::NotifyKind::N2 => N2_NOTIFY_SEGMENT,
+    };
+    format!("{NOTIFY_PREFIX}/{segment}/{token}")
+}
 
 /// A discovered serving-AMF `namf-comm` endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,8 +71,13 @@ pub struct DiscoveredAmf {
 
 impl DiscoveredAmf {
     /// Cache key for the per-(AMF, UE) subscription store.
-    fn subscription_key(&self, ue_context_id: &str) -> String {
+    pub fn subscription_key(&self, ue_context_id: &str) -> String {
         format!("{}:{}|{}", self.host, self.port, ue_context_id)
+    }
+
+    /// Cache key for this AMF's non-UE NRPPa subscription.
+    pub fn non_ue_subscription_key(&self) -> String {
+        format!("{}:{}|non-ue-nrppa", self.host, self.port)
     }
 }
 
@@ -216,15 +237,22 @@ pub fn build_n2_nrppa_transfer_request(
 
 /// Build the N1N2MessageSubscribe request:
 /// `POST /namf-comm/v1/ue-contexts/{ueContextId}/n1-n2-messages/subscriptions`
-/// registering both the LPP (N1) and NRPPa (N2) notify callbacks.
-pub fn build_n1n2_subscription_request(ue_context_id: &str, callback_base: &str) -> SbiRequest {
+/// registering both the LPP (N1) and NRPPa (N2) notify callbacks, each carrying
+/// its own token from `start` (#1518).
+pub fn build_n1n2_subscription_request(
+    ue_context_id: &str,
+    callback_base: &str,
+    n1_token: &CallbackToken,
+    n2_token: &CallbackToken,
+) -> SbiRequest {
+    use crate::context::NotifyKind;
     let base = callback_base.trim_end_matches('/');
     let body = UeN1N2InfoSubscriptionCreateData {
         n1_message_class: "LPP",
-        n1_notify_callback_uri: format!("{base}{N1_NOTIFY_PATH}"),
+        n1_notify_callback_uri: format!("{base}{}", notify_path(NotifyKind::N1, n1_token.as_str())),
         // Class spelling matches the amfd A3 store/producer contract.
         n2_information_class: "NRPPa",
-        n2_notify_callback_uri: format!("{base}{N2_NOTIFY_PATH}"),
+        n2_notify_callback_uri: format!("{base}{}", notify_path(NotifyKind::N2, n2_token.as_str())),
     };
     let json = serde_json::to_string(&body).unwrap_or_default();
     SbiRequest::post(format!(
@@ -344,27 +372,41 @@ fn client_for(amf: &DiscoveredAmf) -> SbiClient {
 }
 
 /// Ensure an N1N2 subscription (TS 29.518 §5.2.2.6) exists on `amf` for
-/// `ue_context_id`, registering our A4 callback routes. The subscription id
-/// is cached per (AMF, ueContextId) and reused across requests. Best-effort:
-/// on failure the transfer still proceeds (the lcsCorrelationId fallback
-/// recorded by the AMF's transfer handler routes the uplink), and a missing
-/// uplink simply times the session out → 504, never a fabricated fix.
+/// `ue_context_id`, registering our A4 callback routes with fresh tokens (#1518).
+/// The subscription is held per (AMF, ueContextId) and reused across requests;
+/// only one create per key is in flight at a time. Best-effort: on failure the
+/// transfer still proceeds, and a missing uplink simply times the session out →
+/// 504, never a fabricated fix.
 pub async fn ensure_n1n2_subscription(amf: &DiscoveredAmf, ue_context_id: &str) {
     let key = amf.subscription_key(ue_context_id);
-    let (cached, callback_base) = match lmf_self().read() {
-        Ok(c) => (c.amf_subscription_get(&key), c.callback_base()),
-        Err(_) => (None, None),
-    };
-    if cached.is_some() {
-        return;
-    }
-    let Some(base) = callback_base else {
+    let Some(base) = lmf_self().read().ok().and_then(|c| c.callback_base()) else {
         log::warn!("A2: no callback base configured; skipping N1N2 subscription");
         return;
     };
-    let request = build_n1n2_subscription_request(ue_context_id, &base);
+    let Some((start, evicted)) = lmf_self()
+        .read()
+        .ok()
+        .and_then(|c| c.amf_subscription_begin(&key, amf, Some(ue_context_id)))
+    else {
+        return;
+    };
+    if let Some(old) = evicted {
+        spawn_unsubscribe(old);
+    }
+    let Some(n1_token) = start.n1_token.clone() else {
+        return;
+    };
+    let request = build_n1n2_subscription_request(ue_context_id, &base, &n1_token, &start.n2_token);
+    // From here every exit, an await cancelled included, commits or abandons.
+    let in_flight = InFlightCreate {
+        key,
+        start,
+        amf: amf.clone(),
+        ue_context_id: Some(ue_context_id.to_string()),
+        armed: true,
+    };
     let client = client_for(amf);
-    match client.send_request(request).await {
+    let created = match client.send_request(request).await {
         Ok(resp) if resp.status == 201 => {
             let sub_id = resp
                 .http
@@ -376,24 +418,115 @@ pub async fn ensure_n1n2_subscription(amf: &DiscoveredAmf, ue_context_id: &str) 
                         .and_then(Value::as_str)
                         .map(String::from)
                 });
-            match sub_id {
-                Some(id) => {
-                    log::info!("A2: N1N2 subscription created on AMF for [{ue_context_id}]: {id}");
-                    if let Ok(c) = lmf_self().read() {
-                        c.amf_subscription_set(key, id);
-                    }
-                }
-                None => log::warn!(
+            if sub_id.is_none() {
+                log::warn!(
                     "A2: N1N2 subscription 201 without n1n2NotifySubscriptionId (not cached)"
-                ),
+                );
             }
+            sub_id
         }
-        Ok(resp) => log::warn!(
-            "A2: N1N2 subscription create for [{ue_context_id}] returned {}",
-            resp.status
-        ),
-        Err(e) => log::warn!("A2: N1N2 subscription create failed: {e}"),
+        Ok(resp) => {
+            log::warn!(
+                "A2: N1N2 subscription create for [{ue_context_id}] returned {}",
+                resp.status
+            );
+            None
+        }
+        Err(e) => {
+            log::warn!("A2: N1N2 subscription create failed: {e}");
+            None
+        }
+    };
+    match created {
+        Some(id) => {
+            log::info!("A2: N1N2 subscription created on AMF for [{ue_context_id}]: {id}");
+            in_flight.committed(id);
+        }
+        None => drop(in_flight),
     }
+}
+
+/// The AMF no longer knows `ue_context_id` (it answered 404, TS 29.518
+/// Table 6.1.7.3-1 CONTEXT_NOT_FOUND), so it holds no subscription for it
+/// either, e.g. after an AMF restart (#1518): forget ours, so the next request
+/// subscribes again rather than relying on one that is gone.
+pub fn forget_n1n2_subscription(amf: &DiscoveredAmf, ue_context_id: &str) {
+    if let Ok(c) = lmf_self().read() {
+        c.amf_subscription_forget(&amf.subscription_key(ue_context_id));
+    }
+}
+
+/// Holds a subscription create in flight (#1518, R8 M2). Dropped without
+/// [`InFlightCreate::committed`] (the create failed, or the task running it was
+/// cancelled, e.g. when the consumer of the DetermineLocation that started it
+/// disconnects), it abandons the entry, so the key can be subscribed again and the
+/// entry does not hold a cap slot forever.
+struct InFlightCreate {
+    key: String,
+    start: crate::context::SubscriptionStart,
+    amf: DiscoveredAmf,
+    ue_context_id: Option<String>,
+    /// Cleared once committed: drop then leaves the entry alone.
+    armed: bool,
+}
+
+impl InFlightCreate {
+    /// The AMF created it with `id`: record it. When the entry went while the
+    /// create was in flight (forgotten or evicted, R8 m2), unsubscribe at the AMF
+    /// instead, so the AMF holds no subscription this LMF does not know about.
+    fn committed(mut self, id: String) {
+        self.armed = false;
+        let recorded = lmf_self()
+            .read()
+            .is_ok_and(|c| c.amf_subscription_created(&self.key, &self.start, id.clone()));
+        if !recorded {
+            log::info!("A2: subscription {id} was dropped while being created; unsubscribing");
+            spawn_unsubscribe_id(&self.amf, self.ue_context_id.as_deref(), &id);
+        }
+    }
+}
+
+impl Drop for InFlightCreate {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(c) = lmf_self().read() {
+            c.amf_subscription_abandon(&self.key, &self.start);
+        }
+    }
+}
+
+/// Unsubscribe an evicted subscription at its AMF (TS 29.518 §5.2.2.3.4
+/// N1N2MessageUnSubscribe, §5.2.2.4.3 NonUeN2InfoUnSubscribe), best-effort and in
+/// the background: its tokens are already refused, so the AMF would otherwise go on
+/// notifying a URI that answers 404.
+fn spawn_unsubscribe(sub: crate::context::AmfSubscription) {
+    let Some(id) = sub.subscription_id.as_deref() else {
+        return;
+    };
+    log::info!("A2: subscription cap reached; unsubscribing the oldest ({id}) at its AMF");
+    spawn_unsubscribe_id(&sub.amf, sub.ue_context_id.as_deref(), id);
+}
+
+/// DELETE subscription `id` (a UE's N1N2 one when `ue_context_id` is given, else
+/// the non-UE one) at `amf`, best-effort and in the background.
+fn spawn_unsubscribe_id(amf: &DiscoveredAmf, ue_context_id: Option<&str>, id: &str) {
+    let path = match ue_context_id {
+        Some(ue) => format!("/namf-comm/v1/ue-contexts/{ue}/n1-n2-messages/subscriptions/{id}"),
+        None => format!("/namf-comm/v1/non-ue-n2-messages/subscriptions/{id}"),
+    };
+    let amf = amf.clone();
+    let id = id.to_string();
+    tokio::spawn(async move {
+        match client_for(&amf)
+            .send_request(SbiRequest::delete(path))
+            .await
+        {
+            Ok(resp) => log::debug!("A2: unsubscribe of {id} returned {}", resp.status),
+            Err(e) => log::warn!("A2: unsubscribe of {id} failed: {e}"),
+        }
+    });
 }
 
 /// POST the multipart N1N2MessageTransfer to the serving AMF
@@ -516,39 +649,56 @@ pub async fn send_non_ue_nrppa_transfer(
 /// Build a `NonUeN2InfoSubscribe` (TS 29.518 §5.2.2.4.2) for the NRPPa class, so
 /// the AMF has a notification URI for this LMF's non-UE-associated NRPPa answers
 /// (§5.2.2.4.4.2). The nfId lets the AMF pick this LMF's subscription by the NGAP
-/// Routing ID the answer comes back with.
-pub fn build_non_ue_nrppa_subscription_request(nf_id: &str, callback_base: &str) -> SbiRequest {
+/// Routing ID the answer comes back with. The URI carries the subscription's
+/// token (#1518).
+pub fn build_non_ue_nrppa_subscription_request(
+    nf_id: &str,
+    callback_base: &str,
+    n2_token: &CallbackToken,
+) -> SbiRequest {
     let base = callback_base.trim_end_matches('/');
     let body = serde_json::json!({
         "n2InformationClass": "NRPPa",
-        "n2NotifyCallbackUri": format!("{base}{N2_NOTIFY_PATH}"),
+        "n2NotifyCallbackUri": format!(
+            "{base}{}",
+            notify_path(crate::context::NotifyKind::N2, n2_token.as_str())
+        ),
         "nfId": nf_id,
     });
     SbiRequest::post("/namf-comm/v1/non-ue-n2-messages/subscriptions")
         .with_body(body.to_string(), "application/json")
 }
 
-/// Ensure this LMF has a non-UE NRPPa subscription on `amf`, cached per AMF.
-/// Best-effort: without one the AMF falls back to a UE's N1N2 NRPPa subscription,
-/// whose callback is the same route.
+/// Ensure this LMF has a non-UE NRPPa subscription on `amf`, held per AMF with its
+/// own token (#1518). Best-effort: without one the AMF falls back to a UE's N1N2
+/// NRPPa subscription, whose N2 callback this LMF also admits for non-UE answers.
 pub async fn ensure_non_ue_nrppa_subscription(amf: &DiscoveredAmf, nf_id: &str) {
-    let key = format!("{}:{}|non-ue-nrppa", amf.host, amf.port);
-    let (cached, callback_base) = match lmf_self().read() {
-        Ok(c) => (c.amf_subscription_get(&key), c.callback_base()),
-        Err(_) => (None, None),
-    };
-    if cached.is_some() {
-        return;
-    }
-    let Some(base) = callback_base else {
+    let key = amf.non_ue_subscription_key();
+    let Some(base) = lmf_self().read().ok().and_then(|c| c.callback_base()) else {
         log::warn!("Multi-RTT: no callback base configured; no non-UE NRPPa subscription");
         return;
     };
+    let Some((start, evicted)) = lmf_self()
+        .read()
+        .ok()
+        .and_then(|c| c.amf_subscription_begin(&key, amf, None))
+    else {
+        return;
+    };
+    if let Some(old) = evicted {
+        spawn_unsubscribe(old);
+    }
+    let request = build_non_ue_nrppa_subscription_request(nf_id, &base, &start.n2_token);
+    // From here every exit, an await cancelled included, commits or abandons.
+    let in_flight = InFlightCreate {
+        key,
+        start,
+        amf: amf.clone(),
+        ue_context_id: None,
+        armed: true,
+    };
     let client = client_for(amf);
-    match client
-        .send_request(build_non_ue_nrppa_subscription_request(nf_id, &base))
-        .await
-    {
+    let created = match client.send_request(request).await {
         Ok(resp) if resp.status == 201 => {
             let id = resp
                 .http
@@ -560,20 +710,26 @@ pub async fn ensure_non_ue_nrppa_subscription(amf: &DiscoveredAmf, nf_id: &str) 
                         .and_then(Value::as_str)
                         .map(String::from)
                 });
-            match id {
-                Some(id) => {
-                    log::info!("Multi-RTT: non-UE NRPPa subscription on the AMF: {id}");
-                    if let Ok(c) = lmf_self().read() {
-                        c.amf_subscription_set(key, id);
-                    }
-                }
-                None => {
-                    log::warn!("Multi-RTT: NonUeN2InfoSubscribe 201 without n2NotifySubscriptionId")
-                }
+            if id.is_none() {
+                log::warn!("Multi-RTT: NonUeN2InfoSubscribe 201 without n2NotifySubscriptionId");
             }
+            id
         }
-        Ok(resp) => log::warn!("Multi-RTT: NonUeN2InfoSubscribe returned {}", resp.status),
-        Err(e) => log::warn!("Multi-RTT: NonUeN2InfoSubscribe failed: {e}"),
+        Ok(resp) => {
+            log::warn!("Multi-RTT: NonUeN2InfoSubscribe returned {}", resp.status);
+            None
+        }
+        Err(e) => {
+            log::warn!("Multi-RTT: NonUeN2InfoSubscribe failed: {e}");
+            None
+        }
+    };
+    match created {
+        Some(id) => {
+            log::info!("Multi-RTT: non-UE NRPPa subscription on the AMF: {id}");
+            in_flight.committed(id);
+        }
+        None => drop(in_flight),
     }
 }
 
@@ -616,6 +772,12 @@ pub async fn send_n1n2_transfer(
                     return TransferOutcome::Initiated;
                 }
                 504 => return TransferOutcome::UeNotReachable,
+                // The AMF does not know the UE context, so no subscription for it
+                // survives there either (#1518).
+                404 => {
+                    forget_n1n2_subscription(amf, ue_context_id);
+                    return TransferOutcome::Failed("AMF returned status 404".to_string());
+                }
                 409 if attempt == 0 => {
                     log::warn!("A2: N1N2MessageTransfer 409 (temporary); retrying once");
                     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -752,8 +914,13 @@ mod tests {
     // -- Subscription create body: both (class, callback) pairs complete -----
     #[test]
     fn subscription_request_registers_both_callback_pairs() {
-        let request =
-            build_n1n2_subscription_request("imsi-001010000000042", "http://10.0.0.5:7816/");
+        let (n1, n2) = (CallbackToken::mint(), CallbackToken::mint());
+        let request = build_n1n2_subscription_request(
+            "imsi-001010000000042",
+            "http://10.0.0.5:7816/",
+            &n1,
+            &n2,
+        );
         assert_eq!(
             request.header.uri,
             "/namf-comm/v1/ue-contexts/imsi-001010000000042/n1-n2-messages/subscriptions"
@@ -763,15 +930,23 @@ mod tests {
         // amfd's A3 handler rejects 400 unless each present class carries its
         // callback URI — assert complete pairs with resolvable HTTP URIs.
         assert_eq!(v["n1MessageClass"], "LPP");
+        // #1518: each URI carries its own token, after the redacted segment.
         assert_eq!(
             v["n1NotifyCallbackUri"],
-            "http://10.0.0.5:7816/nlmf-loc/v1/notify/n1"
+            format!(
+                "http://10.0.0.5:7816/nlmf-loc/v1/notify/n1-message-notify/{}",
+                n1.as_str()
+            )
         );
         assert_eq!(v["n2InformationClass"], "NRPPa");
         assert_eq!(
             v["n2NotifyCallbackUri"],
-            "http://10.0.0.5:7816/nlmf-loc/v1/notify/n2"
+            format!(
+                "http://10.0.0.5:7816/nlmf-loc/v1/notify/n2-info-notify/{}",
+                n2.as_str()
+            )
         );
+        assert_ne!(n1.as_str(), n2.as_str());
     }
 
     // -- NRF SearchResult parsing: amfId preference + fallback ---------------

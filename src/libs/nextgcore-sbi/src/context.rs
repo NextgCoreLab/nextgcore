@@ -280,6 +280,13 @@ pub type RediscoveryHook = Arc<
         + Sync,
 >;
 
+/// The most clients [`SbiContext::get_tokened_client`] caches (#1659).
+pub const TOKENED_CLIENTS_MAX: usize = 64;
+
+/// Whether the full-cache warning of [`SbiContext::get_tokened_client`] was logged.
+static TOKENED_CLIENTS_FULL_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// SBI Context - manages NF instances and clients
 pub struct SbiContext {
     /// Self NF instance
@@ -288,6 +295,10 @@ pub struct SbiContext {
     nf_instances: RwLock<HashMap<String, CachedNfInstance>>,
     /// Clients by endpoint
     clients: RwLock<HashMap<String, Arc<SbiClient>>>,
+    /// Token-carrying clients by (target NF type, endpoint, OAuth2 client), for
+    /// [`SbiContext::get_tokened_client`] (#1659). Bounded by
+    /// [`TOKENED_CLIENTS_MAX`].
+    tokened_clients: std::sync::Mutex<HashMap<(NfType, String, usize), Arc<SbiClient>>>,
     /// Subscriptions
     subscriptions: RwLock<HashMap<String, NfSubscription>>,
     /// NRF URI
@@ -306,6 +317,7 @@ impl SbiContext {
             self_instance: RwLock::new(None),
             nf_instances: RwLock::new(HashMap::new()),
             clients: RwLock::new(HashMap::new()),
+            tokened_clients: std::sync::Mutex::new(HashMap::new()),
             subscriptions: RwLock::new(HashMap::new()),
             nrf_uri: RwLock::new(None),
             failed_endpoints: std::sync::RwLock::new(HashMap::new()),
@@ -662,6 +674,26 @@ impl SbiContext {
         self.healthy_first(found)
     }
 
+    /// The client configuration for dialling `host:port`.
+    ///
+    /// Issue #63: these caches hand out clients for dialling PEER NFs, so they
+    /// must honour the SBI security profile. Left cleartext they would silently
+    /// undo the outbound half for every NF that resolves peers through them.
+    async fn peer_client_config(&self, host: &str, port: u16) -> crate::client::SbiClientConfig {
+        let nrf_scheme = self.nrf_uri.read().await.as_deref().and_then(|uri| {
+            crate::nrf_tls::is_nrf_authority(uri, host, port)
+                .then(|| crate::nrf_tls::parse_nrf_uri(uri))
+                .flatten()
+                .map(|(scheme, _, _)| {
+                    crate::nrf_tls::nrf_scheme(scheme, crate::security::SbiProfile::resolve())
+                })
+        });
+        match nrf_scheme {
+            Some(scheme) => crate::nrf_tls::nrf_client_config(scheme, host, port),
+            None => crate::security::sbi_peer_client_config(host, port),
+        }
+    }
+
     /// Get or create a client for the given endpoint.
     ///
     /// The NRF's authority (from [`SbiContext::set_nrf_uri`]) gets the NRF
@@ -679,26 +711,68 @@ impl SbiContext {
         }
 
         // Create new client
-        // Issue #63: this cache hands out clients for dialling PEER NFs, so it
-        // must honour the SBI security profile. Left cleartext it would silently
-        // undo the outbound half for every NF that resolves peers through it.
-        let nrf_scheme = self.nrf_uri.read().await.as_deref().and_then(|uri| {
-            crate::nrf_tls::is_nrf_authority(uri, host, port)
-                .then(|| crate::nrf_tls::parse_nrf_uri(uri))
-                .flatten()
-                .map(|(scheme, _, _)| {
-                    crate::nrf_tls::nrf_scheme(scheme, crate::security::SbiProfile::resolve())
-                })
-        });
-        let config = match nrf_scheme {
-            Some(scheme) => crate::nrf_tls::nrf_client_config(scheme, host, port),
-            None => crate::security::sbi_peer_client_config(host, port),
-        };
-        let client = Arc::new(SbiClient::new(config));
+        let client = Arc::new(SbiClient::new(self.peer_client_config(host, port).await));
 
         let mut clients = self.clients.write().await;
         clients.insert(key, client.clone());
 
+        client
+    }
+
+    /// The client for a **service request** to the `target` producer at
+    /// `host:port`, carrying an NRF-issued token from `oauth2` (#1659): the
+    /// consumer presents its token on each service request (TS 33.501
+    /// §13.4.1.1.2, TS 29.500 §6.7.3). The token-carrying twin of
+    /// [`SbiContext::get_client`], with the same SBI security profile.
+    ///
+    /// One client per (target, peer, OAuth2 client), reused, so its HTTP/2
+    /// connection carries every request to that producer, the way `get_client`'s
+    /// do (the #1669 review M1 point). The token is fetched and refreshed per
+    /// request by `oauth2`'s cache, so caching the client does not pin a token.
+    ///
+    /// Only for discovered or configured peers, never an authority a peer
+    /// supplied (a callback URI, or a resource URI a peer handed back): build
+    /// those an uncached client instead. Past [`TOKENED_CLIENTS_MAX`] entries a
+    /// new peer gets an uncached client too, so the cache cannot grow without
+    /// bound.
+    pub async fn get_tokened_client(
+        &self,
+        host: &str,
+        port: u16,
+        target: NfType,
+        oauth2: Arc<crate::oauth::OAuth2Client>,
+    ) -> Arc<SbiClient> {
+        let key = (
+            target,
+            format!("{host}:{port}"),
+            Arc::as_ptr(&oauth2) as usize,
+        );
+        if let Some(client) = self
+            .tokened_clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            return Arc::clone(client);
+        }
+        // The same configuration `get_client` would choose (profile, or the NRF's TLS).
+        let config = self.peer_client_config(host, port).await;
+        let client = Arc::new(SbiClient::new(config).with_oauth2(oauth2, target));
+        let mut clients = self
+            .tokened_clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = clients.get(&key) {
+            return Arc::clone(existing);
+        }
+        if clients.len() < TOKENED_CLIENTS_MAX {
+            clients.insert(key, Arc::clone(&client));
+        } else if !TOKENED_CLIENTS_FULL_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::warn!(
+                "the tokened-client cache is full ({TOKENED_CLIENTS_MAX} peers); new peers get \
+                 an uncached client, one connection per request (logged once)"
+            );
+        }
         client
     }
 
@@ -730,6 +804,10 @@ impl SbiContext {
     pub async fn clear_clients(&self) {
         let mut clients = self.clients.write().await;
         clients.clear();
+        self.tokened_clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Get the number of **selectable** NF instances.
@@ -820,6 +898,144 @@ pub async fn global_context_reset() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1659, failure-path property 3 (cancellation is safe): a
+    /// `get_tokened_client` dropped at its await (the NRF-URI read, held here by
+    /// a writer) leaves no entry, half-built or otherwise, and the next call
+    /// builds and caches the client normally.
+    #[tokio::test]
+    async fn a_cancelled_get_tokened_client_leaves_nothing_behind_1659() {
+        let ctx = SbiContext::new();
+        let oauth2 = Arc::new(crate::oauth::OAuth2Client::isolated_for_test(
+            "http://127.0.0.1:1",
+            "udm-cancel-1659",
+            NfType::Udm,
+        ));
+        let cached = || {
+            ctx.tokened_clients
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len()
+        };
+        {
+            let _writer = ctx.nrf_uri.write().await;
+            let pending =
+                ctx.get_tokened_client("127.0.0.1", 7777, NfType::Amf, Arc::clone(&oauth2));
+            let outcome = tokio::time::timeout(std::time::Duration::from_millis(20), pending).await;
+            assert!(outcome.is_err(), "the call is parked on the NRF-URI read");
+        }
+        assert_eq!(cached(), 0, "the dropped call cached nothing");
+        let client = ctx
+            .get_tokened_client("127.0.0.1", 7777, NfType::Amf, Arc::clone(&oauth2))
+            .await;
+        assert_eq!(cached(), 1);
+        let again = ctx
+            .get_tokened_client("127.0.0.1", 7777, NfType::Amf, oauth2)
+            .await;
+        assert!(Arc::ptr_eq(&client, &again));
+    }
+
+    /// #1659 review M1: past [`TOKENED_CLIENTS_MAX`] keys a new peer gets a fresh,
+    /// uncached client on every call, the cache stays at the cap, and a key
+    /// cached before the cap is still served from the cache.
+    #[tokio::test]
+    async fn past_the_cap_a_new_peer_gets_an_uncached_client_1659() {
+        let ctx = SbiContext::new();
+        let oauth2 = Arc::new(crate::oauth::OAuth2Client::isolated_for_test(
+            "http://127.0.0.1:1",
+            "udm-cap-1659",
+            NfType::Udm,
+        ));
+        let first = ctx
+            .get_tokened_client("127.0.0.1", 10_000, NfType::Amf, Arc::clone(&oauth2))
+            .await;
+        for port in 10_001..10_000 + TOKENED_CLIENTS_MAX as u16 {
+            ctx.get_tokened_client("127.0.0.1", port, NfType::Amf, Arc::clone(&oauth2))
+                .await;
+        }
+        let cached = || {
+            ctx.tokened_clients
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len()
+        };
+        assert_eq!(cached(), TOKENED_CLIENTS_MAX);
+
+        let over = 10_000 + TOKENED_CLIENTS_MAX as u16;
+        let a = ctx
+            .get_tokened_client("127.0.0.1", over, NfType::Amf, Arc::clone(&oauth2))
+            .await;
+        let b = ctx
+            .get_tokened_client("127.0.0.1", over, NfType::Amf, Arc::clone(&oauth2))
+            .await;
+        assert!(
+            !Arc::ptr_eq(&a, &b),
+            "past the cap each call gets a fresh client"
+        );
+        assert_eq!(
+            cached(),
+            TOKENED_CLIENTS_MAX,
+            "the cache does not grow past the cap"
+        );
+        let again = ctx
+            .get_tokened_client("127.0.0.1", 10_000, NfType::Amf, oauth2)
+            .await;
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "a cached peer is still served from the cache"
+        );
+    }
+
+    /// #1659: a tokened client passes an OAuth2-required producer, and the cache
+    /// hands the same client back for the same (target, peer, OAuth2 client), so
+    /// its connection is reused; another target or OAuth2 client is another client.
+    #[tokio::test]
+    async fn a_tokened_client_passes_an_oauth2_required_producer_and_is_reused_1659() {
+        use crate::test_support::oauth2 as stand_in;
+        crate::security::set_sbi_profile_override(crate::security::SbiProfile::Dev);
+        let sk = crate::oauth::generate_es256_key();
+        let (_nrf, nrf_port) = stand_in::token_nrf(sk.clone()).await;
+        let (_amf, amf_port, seen) = stand_in::oauth2_producer(&sk, NfType::Amf, |_| {
+            crate::message::SbiResponse::with_status(200)
+        })
+        .await;
+        let ctx = SbiContext::new();
+        let oauth2 = stand_in::oauth2_client_for(nrf_port, NfType::Udm);
+
+        let client = ctx
+            .get_tokened_client("127.0.0.1", amf_port, NfType::Amf, Arc::clone(&oauth2))
+            .await;
+        let resp = client
+            .get("/namf-mt/v1/ue-contexts/imsi-001011659")
+            .await
+            .expect("send");
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            stand_in::bearer_requests(&seen, "GET", "/namf-mt/v1/ue-contexts/"),
+            1
+        );
+
+        let again = ctx
+            .get_tokened_client("127.0.0.1", amf_port, NfType::Amf, Arc::clone(&oauth2))
+            .await;
+        assert!(
+            Arc::ptr_eq(&client, &again),
+            "the same peer reuses its client"
+        );
+        let other_target = ctx
+            .get_tokened_client("127.0.0.1", amf_port, NfType::Ausf, Arc::clone(&oauth2))
+            .await;
+        assert!(!Arc::ptr_eq(&client, &other_target));
+        let other_oauth2 = ctx
+            .get_tokened_client(
+                "127.0.0.1",
+                amf_port,
+                NfType::Amf,
+                stand_in::oauth2_client_for(nrf_port, NfType::Udm),
+            )
+            .await;
+        assert!(!Arc::ptr_eq(&client, &other_oauth2));
+    }
 
     #[tokio::test]
     async fn test_nf_instance() {

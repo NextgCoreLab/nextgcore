@@ -45,6 +45,7 @@ clap.workspace = true
 ctrlc.workspace = true
 
 [dev-dependencies]
+nextgcore-sbi = { workspace = true, features = ["test-support"] }
 proptest.workspace = true
 # The capturing logger for log-content tests (#1026).
 nextgcore-core = { workspace = true, features = ["test-log"] }

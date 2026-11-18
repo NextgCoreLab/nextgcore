@@ -2810,6 +2810,7 @@ dependencies = [
  "env_logger 0.11.8",
  "hex",
  "log",
+ "nextgcore-amfd",
  "nextgcore-app",
  "nextgcore-core",
  "nextgcore-metrics",

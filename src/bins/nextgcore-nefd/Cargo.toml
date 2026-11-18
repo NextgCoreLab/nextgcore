@@ -42,6 +42,7 @@ ctrlc.workspace = true
 nextgcore-demo = { workspace = true }
 
 [dev-dependencies]
+nextgcore-sbi = { workspace = true, features = ["test-support"] }
 proptest.workspace = true
 # Issue #110: the strict-peer northbound OAuth2 test signs an ES256 token
 # against a served JWKS, so the real listener verification path runs.
