@@ -1132,6 +1132,9 @@ pub struct SessionModificationParams {
     )>,
     /// FARs to update-deactivate
     pub update_fars_deactivate: Vec<u32>,
+    /// FARs whose Apply Action alone is updated (far_id, [`apply_action`] flags):
+    /// #1707's step 3c policy toward a UE the AMF reported unreachable.
+    pub update_fars_apply_action: Vec<(u32, u16)>,
     /// FARs to remove
     pub remove_far_ids: Vec<u32>,
     /// QERs to create
@@ -1221,6 +1224,12 @@ pub fn build_session_modification_request(params: &SessionModificationParams) ->
     // Update FARs (deactivate)
     for far_id in &params.update_fars_deactivate {
         let far_bytes = build_update_far_deactivate(*far_id);
+        builder.add_tlv(pfcp_ie::UPDATE_FAR, &far_bytes);
+    }
+
+    // Update FARs (Apply Action only)
+    for (far_id, action) in &params.update_fars_apply_action {
+        let far_bytes = build_update_far_apply_action(*far_id, *action);
         builder.add_tlv(pfcp_ie::UPDATE_FAR, &far_bytes);
     }
 
@@ -1609,6 +1618,15 @@ pub fn build_update_far_deactivate(far_id: u32) -> Vec<u8> {
     // Apply Action - BUFF | NOCP
     builder.add_apply_action(apply_action::BUFF | apply_action::NOCP);
 
+    builder.build()
+}
+
+/// Build an Update FAR IE that changes the Apply Action only (#1707, TS 29.244
+/// §7.5.4.3): the FAR keeps its Forwarding and Buffering parameters.
+pub fn build_update_far_apply_action(far_id: u32, action: u16) -> Vec<u8> {
+    let mut builder = PfcpMessageBuilder::new();
+    builder.add_far_id(far_id);
+    builder.add_apply_action(action);
     builder.build()
 }
 

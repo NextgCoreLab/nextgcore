@@ -1,0 +1,16 @@
+# The UE's log level in this overlay (nextgsim#462), as d440c-nwdaf-paging does:
+# the base ue.yaml runs nextgsim_ue at debug, and nextgsim_ue::rrc logs every MIB
+# and SIB of each of the six gNBs at debug, so kubelet would rotate the UE's log
+# away mid-run. Every UE line scenario.sh and analyze.py read is info.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ue
+spec:
+  template:
+    spec:
+      containers:
+        - name: ue
+          env:
+            - name: RUST_LOG
+              value: info

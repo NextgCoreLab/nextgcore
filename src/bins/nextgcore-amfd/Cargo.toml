@@ -37,6 +37,14 @@ ntn = ["dep:nextgcore-proto"]
 ## prediction on a targeted first attempt. Active only with the `demo:` block on
 ## as well. Off by default.
 demo-d440c-nwdaf-paging = []
+## nextgsim#462 (demo d440a-ai-paging): the demo layer over the base
+## `paging.strategy: recommended-first` (#1442). Accepts the gNB's modes
+## (`page-all`, `last-served`, `ct`, `lsq`, `onnx`), each forcing the effective
+## strategy to `recommended-first`, and adds the `[demo:d440a-ai-paging]` log
+## lines (scope, targets, the answering gNB) and
+## `amf_paging_attempts_total{scope}`. Active only with the `demo:` block on as
+## well. Off by default.
+demo-d440a-ai-paging = []
 
 [dependencies]
 nextgcore-core = { workspace = true }
