@@ -2095,6 +2095,7 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
         reachability_filter,
         reported_reachability: std::collections::HashMap::new(),
         reported_connectivity: std::collections::HashMap::new(),
+        taken_over: false,
         reporting_threshold,
         location_filters,
     };
@@ -3805,7 +3806,10 @@ async fn deliver_subscription_id_change(
 /// Take over a transferred event subscription and tell its consumer the new
 /// subscription ID (TS 29.518 §5.2.2.2.3.1, #397).
 ///
-/// Called from `handle_create_ue_context` for each entry of the transferred
+/// Called from `handle_create_ue_context` (the N2 handover target) and, #1699, from
+/// `NgapServer::fetch_ue_context_from_old_amf` (the UEContextTransfer response of an
+/// inter-AMF mobility registration, TS 23.502 §4.2.2.2.2 step 5), for each entry of
+/// the transferred
 /// `ueContext.eventSubscriptionList` (`TS29518_Namf_Communication.yaml:3050-3053`,
 /// items `ExtAmfEventSubscription` = `AmfEventSubscription` plus additional info,
 /// yaml:4049-4054). §5.2.2.2.3.1 requires the target AMF to *"create event
@@ -3821,7 +3825,7 @@ async fn deliver_subscription_id_change(
 ///
 /// Returns the number of subscriptions created, so the caller can log a count that
 /// reflects what happened rather than what was offered.
-fn take_over_transferred_event_subscriptions(
+pub(crate) fn take_over_transferred_event_subscriptions(
     ue_context_id: &str,
     supi: Option<&str>,
     ue_context: &Value,
@@ -3958,6 +3962,7 @@ fn take_over_transferred_event_subscriptions(
                 }),
             reported_reachability: std::collections::HashMap::new(),
             reported_connectivity: std::collections::HashMap::new(),
+            taken_over: true,
             reporting_threshold: entry.get("eventList").and_then(Value::as_array).and_then(
                 |events| {
                     events
@@ -3977,15 +3982,30 @@ fn take_over_transferred_event_subscriptions(
                 .unwrap_or_default(),
         };
 
+        // #1726 review M1: a retried registration with the same foreign 5G-GUTI
+        // fetches the same context again from an old AMF that kept it (TS 29.518
+        // §5.2.2.2.2), and the subscription it carries is already here. The consumer
+        // was told that copy's ID, so it is kept and the consumer is not told again.
         let added = ctx
             .read()
-            .map(|guard| guard.event_subscription_add(sub.clone()))
-            .unwrap_or(false);
-        if !added {
-            log::warn!(
-                "[{ue_context_id}] transferred event subscription {subscription_id} not stored"
-            );
-            continue;
+            .map_err(|_| String::new())
+            .and_then(|guard| guard.event_subscription_add_unless_equivalent(sub.clone()));
+        match added {
+            Ok(()) => {}
+            Err(existing) if !existing.is_empty() => {
+                log::info!(
+                    "[{ue_context_id}] transferred event subscription already taken over as \
+                     {existing}: kept, not duplicated"
+                );
+                continue;
+            }
+            Err(_) => {
+                log::warn!(
+                    "[{ue_context_id}] transferred event subscription {subscription_id} not \
+                     stored"
+                );
+                continue;
+            }
         }
         created += 1;
 
@@ -8342,6 +8362,7 @@ mod tests {
             reachability_filter: None,
             reported_reachability: std::collections::HashMap::new(),
             reported_connectivity: std::collections::HashMap::new(),
+            taken_over: false,
             reporting_threshold: None,
             location_filters: Vec::new(),
         };
@@ -15753,6 +15774,7 @@ mod tests {
             reachability_filter: None,
             reported_reachability: std::collections::HashMap::new(),
             reported_connectivity: std::collections::HashMap::new(),
+            taken_over: false,
             reporting_threshold: None,
             location_filters: Vec::new(),
         };

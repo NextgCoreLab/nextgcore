@@ -1255,6 +1255,12 @@ pub struct EventSubscription {
     /// heard CONNECTED (in its immediate report) is told IDLE. Keyed and bounded as
     /// [`Self::reported_reachability`] is.
     pub reported_connectivity: std::collections::HashMap<String, String>,
+    /// Created by this AMF from a transferred UE context's `eventSubscriptionList`
+    /// (#397, #1699), not by a consumer's subscribe. Only such a subscription is a
+    /// candidate for [`AmfContext::event_subscription_add_unless_equivalent`]'s
+    /// de-duplication: a consumer's own subscription to this AMF is a different
+    /// resource, even when it is the one the transferred copy came from.
+    pub taken_over: bool,
 }
 
 /// The most UEs one subscription records a reported reachability for (#1641 review
@@ -2687,6 +2693,52 @@ impl AmfContext {
         } else {
             false
         }
+    }
+
+    /// #1726 review M1: store a subscription taken over from a transferred UE
+    /// context, unless an equivalent one is already stored. Equivalent means the
+    /// same consumer (`nfId`, `eventNotifyUri`, `notifyCorrelationId`), the same
+    /// target (`supi`, `groupId`) and the same event types, among the subscriptions
+    /// that were themselves taken over (`taken_over`). A consumer's own subscription
+    /// here is never matched: with source and target AMF sharing one store (the udmd
+    /// `amfd_take_over_moves_the_leg` test runs both in one process), matching it
+    /// would swallow the takeover and its SUBSCRIPTION_ID_CHANGE. Returns `Ok(())` when
+    /// `sub` was stored, `Err(id)` with the stored equivalent's ID when it was not,
+    /// and `Err(String::new())` when the store is unusable.
+    ///
+    /// One write lock covers the check and the insert, so two takeovers of the same
+    /// transferred subscription cannot both store it. A registration retried with
+    /// the same foreign 5G-GUTI fetches the same context from an old AMF that kept
+    /// it (TS 29.518 §5.2.2.2.2), and without this each retry added a second copy.
+    pub fn event_subscription_add_unless_equivalent(
+        &self,
+        sub: EventSubscription,
+    ) -> Result<(), String> {
+        let Ok(mut subs) = self.event_subscriptions.write() else {
+            return Err(String::new());
+        };
+        let mut types = sub.event_types.clone();
+        types.sort();
+        if let Some(existing) = subs.values().find(|s| {
+            s.taken_over
+                && s.nf_id == sub.nf_id
+                && s.notify_uri == sub.notify_uri
+                && s.notify_correlation_id == sub.notify_correlation_id
+                && s.supi == sub.supi
+                && s.group_id == sub.group_id
+                && {
+                    let mut t = s.event_types.clone();
+                    t.sort();
+                    t == types
+                }
+        }) {
+            return Err(existing.subscription_id.clone());
+        }
+        if subs.contains_key(&sub.subscription_id) {
+            return Err(String::new());
+        }
+        subs.insert(sub.subscription_id.clone(), sub);
+        Ok(())
     }
 
     /// Remove an event-exposure subscription by ID

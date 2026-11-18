@@ -15,9 +15,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use nextgcore_pcfd::context::{
-    pcf_context_init, pcf_self, Ambr, DemoAmbrCap, SNssai, SessCreateRequest,
-};
+use nextgcore_pcfd::context::{pcf_self, Ambr, DemoAmbrCap, SNssai, SessCreateRequest};
 use nextgcore_pcfd::nudr_handler::SessionData;
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
 use nextgcore_sbi::test_support::NfSpawn;
@@ -121,7 +119,7 @@ async fn the_boot_restoration_authorises_under_the_configured_cap_1402() {
     std::fs::create_dir_all(&dir).unwrap();
     let snapshot = dir.join("pcf-state.json");
     let _ = std::fs::remove_file(&snapshot);
-    pcf_context_init(64, 64);
+    nextgcore_pcfd::test_support::init_context();
     pcf_self()
         .write()
         .unwrap()

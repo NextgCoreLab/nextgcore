@@ -471,6 +471,8 @@ async fn main() -> Result<()> {
         Some(&settings.nrf_uri),
     ) {
         let _ = OAUTH2_CLIENT.set(oauth2);
+        // #1667: the same client gives this NF's own NRF calls their access token.
+        nextgcore_sbi::nrf_tls::set_nrf_oauth2_client(OAUTH2_CLIENT.get().cloned());
     }
     if settings.require_oauth2 {
         // TS 33.501 §13.4.1: verify Bearer tokens against the NRF JWKS, with

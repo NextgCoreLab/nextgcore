@@ -502,6 +502,8 @@ async fn main() -> Result<()> {
         require_oauth2,
         nrf_uri_cfg.as_deref(),
     ));
+    // #1667: the same client gives this NF's own NRF calls their access token.
+    nextgcore_sbi::nrf_tls::set_nrf_oauth2_client(OAUTH2_CLIENT.get().cloned().flatten());
     if require_oauth2 {
         // Verify bearer tokens against the NRF's published keys (auth stage
         // 4b). With no NRF URI configured the server fails closed.

@@ -150,7 +150,13 @@ mod tests {
             sd(1_000_000, 22_000_000),
             "uplink lowered; downlink stays at the subscribed value it is below"
         );
-        assert_eq!(held_by(WRITERS[0]), vec![id.to_string()]);
+        // #1714 review M1: CAPS is process-global, and the demo-d441a congestion-loop
+        // tests hold caps of their own under the same writer at the same time, so only
+        // this test's entry is asserted, never the whole set.
+        assert!(
+            held_by(WRITERS[0]).contains(&id.to_string()),
+            "the writer holds a cap on this session"
+        );
         assert!(clear(id, WRITERS[0]));
         assert!(!clear(id, WRITERS[0]));
         assert_eq!(get(id), None);

@@ -653,6 +653,8 @@ pub async fn run() -> Result<()> {
         require_oauth2,
         nrf_uri.as_deref(),
     ));
+    // #1667: the same client gives this NF's own NRF calls their access token.
+    nextgcore_sbi::nrf_tls::set_nrf_oauth2_client(OAUTH2_CLIENT.get().cloned().flatten());
     if require_oauth2 {
         sbi_server_config = apply_oauth2_enforcement(sbi_server_config).await;
     }
@@ -6006,7 +6008,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let (bound, handle) = nextgcore_metrics::nes_energy::serve_metrics(
             "127.0.0.1:0".parse().unwrap(),
             std::sync::Arc::new(crate::metrics::render_prometheus),
@@ -6123,7 +6125,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let mut body = full_create_body("imsi-001010000000050", 5);
         body.as_object_mut().unwrap().remove("notificationUri");
         let req = make_request("POST", "/npcf-smpolicycontrol/v1/sm-policies", Some(body));
@@ -6139,7 +6141,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         // Create
         let req = make_request(
             "POST",
@@ -6248,7 +6250,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         // #1402: these assertions are the default setting's.
         let _cap = crate::test_support::session_ambr_cap(
             crate::session_ambr_cap::SessionAmbrCap::default(),
@@ -6322,7 +6324,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         // #1402: these assertions are the default setting's.
         let _cap = crate::test_support::session_ambr_cap(
             crate::session_ambr_cap::SessionAmbrCap::default(),
@@ -6394,7 +6396,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
 
         let supi = "imsi-001010000000316";
         let pol = create_with_subs_ambr(supi, 16, None).await;
@@ -6439,7 +6441,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         // #1402: these assertions are the default setting's.
         let _cap = crate::test_support::session_ambr_cap(
             crate::session_ambr_cap::SessionAmbrCap::default(),
@@ -6534,7 +6536,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let req = make_request(
             "POST",
             "/npcf-smpolicycontrol/v1/sm-policies",
@@ -6577,7 +6579,7 @@ mod tests {
         use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
 
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
 
         // Start a real SbiServer on an ephemeral port. The probe-then-rebind
         // pattern has a small TOCTOU window and SbiServer startup can race under
@@ -6677,7 +6679,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let req = make_request(
             "POST",
             "/npcf-am-policy-control/v1/policies",
@@ -6714,7 +6716,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
 
         // Bind a PDU session with a known UE IP via SM policy create.
         let mut create = full_create_body("imsi-001010000000088", 11);
@@ -6837,7 +6839,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         provision_session_with_ipv4("imsi-001010000000250", 12, "10.45.0.250").await;
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
@@ -6876,7 +6878,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         // #1583: the session is the emergency (DNN "sos") one the AF names: all
         // binding attributes must match (TS 29.514 §4.2.2.2 NOTE 7).
         let mut create = full_create_body("imsi-001010000000251", 13);
@@ -6968,7 +6970,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
             "/npcf-am-policy-control/v1/policies",
@@ -6995,7 +6997,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
             "/npcf-am-policy-control/v1/policies",
@@ -7026,7 +7028,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let mut body = full_create_body("imsi-001010000000202", 12);
         // Consumer requests every bit; producer supports only PCF_SM mask.
         body.as_object_mut()
@@ -7061,7 +7063,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let mut body = full_create_body("imsi-001010000015961", 12);
         let supp_feat = format!("8000000000000000{PCF_SM_POLICY_SUPPORTED_FEATURES:016x}");
         assert_eq!(supp_feat.len(), 32);
@@ -7200,7 +7202,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _delivery = crate::test_support::ue_policy_delivery(true);
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
             "/npcf-ue-policy-control/v1/policies",
@@ -7239,7 +7241,7 @@ mod tests {
         // The PTI assertion below holds only while delivery is ON, which is the default
         // but a process-global any sibling can flip (#541): pin it for this test.
         let _delivery = crate::test_support::ue_policy_delivery(true);
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         // Missing mandatory suppFeat -> 400
         let bad = serde_json::json!({
             "notificationUri": "http://127.0.0.1:9/namf-callback/v1/ue-policy/1",
@@ -7358,7 +7360,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
             "/npcf-smpolicycontrol/v1/sm-policies",
@@ -7772,7 +7774,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let supi = "imsi-001010000000299";
 
         // The UDR now says online charging is ON for slice 1 / internet.
@@ -7876,7 +7878,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let supi = "imsi-001010000000296";
 
         let mut answers = std::collections::HashMap::new();
@@ -7959,7 +7961,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let supi = "imsi-001010000000295";
 
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
@@ -8048,7 +8050,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let supi = "imsi-001010000000298";
 
         // Only slice 2's data is provisioned/changed; slice 1's read 404s, which is
@@ -8121,7 +8123,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let supi = "imsi-001010000000529";
 
         let mut answers = std::collections::HashMap::new();
@@ -8190,7 +8192,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let supi = "imsi-001010000000297";
 
         // A stub SMF only: no NRF URI is set, so discovery yields nothing.
@@ -8323,7 +8325,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(500));
         let (udr, _nrf) =
             start_mock_udr_1597(status.clone(), serde_json::json!({ "rfspIndex": 5 })).await;
@@ -8373,7 +8375,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
         let (udr, _nrf) =
             start_mock_udr_1597(status.clone(), serde_json::json!({ "rfspIndex": 5 })).await;
@@ -8430,7 +8432,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let status = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(503));
         let (udr, _nrf) = start_mock_udr_1597(status.clone(), serde_json::json!({})).await;
         let supi = "imsi-001010000035971";
@@ -8480,7 +8482,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _delivery = crate::test_support::ue_policy_delivery(true);
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         nextgcore_core::test_log::init();
         let supi = "imsi-001010000045971";
         let watch = nextgcore_core::test_log::watch(format!("[{supi}] UE policy delivery for"));
@@ -8780,7 +8782,7 @@ mod tests {
                 .into_iter()
                 .map(|n| format!("imsi-0010100000{n}")),
         );
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let association = |supi: &str| pcf_self().read().unwrap().ue_am_find_by_supi(supi);
 
         // No UDR deployed: the NRF lists none, the local default applies.
@@ -8843,7 +8845,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _ues = cleanup_1621((16211u64..=16215).map(|n| format!("imsi-0010100000{n}")));
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let mode = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(UDR_OK_1621));
         let (udr, port) = start_udr_1621(mode.clone()).await;
         let udr_port = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(port));
@@ -8909,7 +8911,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _ues = cleanup_1621((16241u64..=16245).map(|n| format!("imsi-0010100000{n}")));
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let mode = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(UDR_OK_1621));
         let (udr, port) = start_udr_1621(mode.clone()).await;
         let mock = std::sync::Arc::new(NrfMock1621 {
@@ -8977,7 +8979,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _ues = cleanup_1621((16531u64..=16537).map(|n| format!("imsi-0010100000{n}")));
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let mode = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(UDR_OK_1621));
         let (udr, port) = start_udr_1621(mode.clone()).await;
         let mock = std::sync::Arc::new(NrfMock1621 {
@@ -9053,7 +9055,7 @@ mod tests {
                 .into_iter()
                 .map(|n| format!("imsi-0010100000{n}")),
         );
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let mode = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(UDR_OK_1621));
         let udr_delay = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (udr, port) = start_udr_delayed_1621(mode, udr_delay.clone()).await;
@@ -9126,7 +9128,7 @@ mod tests {
         let _ues = cleanup_1621(
             ((16220u64..=16224).chain([16229])).map(|n| format!("imsi-0010100000{n}")),
         );
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let mode = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(UDR_OK_1621));
         let (udr, port) = start_udr_1621(mode.clone()).await;
         let (nrf, _nrf_uri) =
@@ -9187,7 +9189,7 @@ mod tests {
                 .map(|n| format!("imsi-0010100000{n}")),
         );
         let _emergency = crate::test_support::emergency_dnns(crate::emergency_dnn::DEFAULT);
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let refused = nextgcore_sbi::test_support::down_port();
         let udr_port = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(refused.port()));
         let (nrf, _nrf_uri) = start_mock_nrf_1613(udr_port).await;
@@ -9254,7 +9256,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let _ues = cleanup_1621((16391u64..=16397).map(|n| format!("imsi-0010100000{n}")));
         let _emergency = crate::test_support::emergency_dnns(crate::emergency_dnn::DEFAULT);
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let down = nextgcore_sbi::test_support::down_port();
         let nrf_uri = format!("http://127.0.0.1:{}", down.port());
         let _nrf_uri = crate::test_support::scoped_nrf_at(nrf_uri.clone()).await;
@@ -9349,7 +9351,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let _ues = cleanup_1621((16379u64..=16389).map(|n| format!("imsi-0010100000{n}")));
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let _required = crate::test_support::udr_required(true);
         let down = nextgcore_sbi::test_support::down_port();
         let mock = std::sync::Arc::new(NrfMock1621 {
@@ -9470,7 +9472,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let udr = start_mock_nrf_udr_am_data(serde_json::json!({
             "subscribedUeAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" },
             "rfspIndex": 7,
@@ -9544,7 +9546,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let sar = serde_json::json!({
             "restrictionType": "ALLOWED_AREAS",
             "areas": [{ "tacs": ["000001"] }]
@@ -9644,7 +9646,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         // am-data with no rfspIndex and a HALF-populated serviceAreaRestriction
         // (restrictionType without areas), which TS 29.571 forbids.
         let udr = start_mock_nrf_udr_am_data(serde_json::json!({
@@ -9729,7 +9731,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let (created, got) = am_create_without_udr_ue_ambr_1460("imsi-001010000001460").await;
         for body in [&created, &got] {
             assert_eq!(body["rfsp"], 5, "the UDR's policy is provisioned: {body}");
@@ -9750,7 +9752,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let supi = "imsi-001010000031460";
         nextgcore_dbi::test_store::provision_subscriber_document(
             supi,
@@ -9783,7 +9785,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let supi = "imsi-001010000041460";
         nextgcore_dbi::test_store::provision_subscriber_document(
             supi,
@@ -9816,7 +9818,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let supi = "imsi-001010000011460";
         nextgcore_dbi::test_store::provision_subscriber(supi, &[]);
         let (created, got) = am_create_without_udr_ue_ambr_1460(supi).await;
@@ -9893,7 +9895,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let (created, got) = am_create_1524("imsi-001010000001524", "4", true).await;
         for body in [&created, &got] {
             assert_eq!(body["suppFeat"], "4", "{body}");
@@ -9923,7 +9925,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         for (i, supp_feat) in ["0", "", "3"].into_iter().enumerate() {
             let supi = format!("imsi-00101000001152{i}");
             let (created, got) = am_create_1524(&supi, supp_feat, true).await;
@@ -9954,7 +9956,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let (created, got) = am_create_1524("imsi-001010000021524", "4", false).await;
         for body in [&created, &got] {
             assert_eq!(body["suppFeat"], "4", "{body}");
@@ -9979,7 +9981,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let udr = start_mock_nrf_udr_am_data(serde_json::json!({
             "subscribedUeAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" },
             "rfspIndex": 5
@@ -10141,7 +10143,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let am_data = |rfsp: u64, ul: &str, dl: &str| {
             serde_json::json!({
                 "subscribedUeAmbr": { "uplink": ul, "downlink": dl },
@@ -10215,7 +10217,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let udr = start_mock_nrf_udr_am_data(serde_json::json!({
             "subscribedUeAmbr": { "uplink": "1 Gbps", "downlink": "2 Gbps" },
             "rfspIndex": 3
@@ -10491,7 +10493,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let supi = "imsi-001010000000893";
         let mut create = full_create_body(supi, 30);
         create
@@ -10587,7 +10589,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         provision_session_with_ipv4("imsi-001010000000880", 20, "10.45.0.180").await;
 
         let resp = pcf_sbi_request_handler(make_request(
@@ -10651,7 +10653,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         provision_session_with_ipv4("imsi-001010000000881", 21, "10.45.0.181").await;
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
@@ -10684,7 +10686,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         for address in [
             ("ueIpv4", "10.99.99.99"),
             ("ueIpv6", "2001:db8:dead::1"),
@@ -10726,7 +10728,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let cases: [(&str, serde_json::Value); 4] = [
             (
                 "missing notifUri",
@@ -10784,7 +10786,7 @@ mod tests {
         use std::sync::Mutex as StdMutex;
 
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let supi = "imsi-001010000000980";
         let create = |ts: &str| {
             let mut body = full_create_body(supi, 5);
@@ -10893,7 +10895,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let supi = "imsi-001010000000744";
         let create = |ts: &str| {
             make_request(
@@ -10987,7 +10989,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let supi = "imsi-001010000000892";
         for round in 0..2 {
             provision_session_with_ipv4(supi, 5, "10.45.0.192").await;
@@ -11032,7 +11034,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let mut create = full_create_body("imsi-001010000000882", 22);
         create.as_object_mut().unwrap().insert(
             "ipv6AddressPrefix".to_string(),
@@ -11159,7 +11161,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         provision_session_with_ipv4("imsi-001010000000768", 8, "10.45.0.168").await;
         let (seen, port, af) = recording_af().await;
         create_app_session(&format!("http://127.0.0.1:{port}/af-768"), "10.45.0.168").await;
@@ -11208,7 +11210,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         provision_session_with_ipv4("imsi-001010000000769", 9, "10.45.0.169").await;
         // A port with nothing listening that no `bind(:0)` can be handed (#1316); a
         // bound-then-dropped port could be.
@@ -11251,7 +11253,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         provision_session_with_ipv4("imsi-001010000000770", 10, "10.45.0.170").await;
         let (seen, port, af) = recording_af().await;
         create_app_session(&format!("http://127.0.0.1:{port}/af-770"), "10.45.0.170").await;
@@ -11289,7 +11291,7 @@ mod tests {
         use std::sync::Mutex as StdMutex;
 
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         provision_session_with_ipv4("imsi-001010000000767", 7, "10.45.0.167").await;
         let sm_policy_id = pcf_self()
             .read()
@@ -11424,7 +11426,7 @@ mod tests {
         // notification client may attempt TLS and the delivery count reads as
         // "the PCF sent nothing" (the recorded stub-transport lesson).
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         provision_session_with_ipv4("imsi-001010000000883", 23, "10.45.0.183").await;
 
         // A local AF that records every notification it receives.
@@ -11585,7 +11587,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         provision_session_with_ipv4("imsi-001010000000884", 24, "10.45.0.184").await;
 
         // oneOf: neither address is a 400.
@@ -11708,7 +11710,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let ip = "10.158.3.1";
         let a = sm_create_1527(
             "imsi-001010000015831",
@@ -11786,7 +11788,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let ip = "10.158.4.1";
         let only = sm_create_1527(
             "imsi-001010000025831",
@@ -11844,7 +11846,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let ip = "10.152.7.1";
         let a = sm_create_1527(
             "imsi-001010000015271",
@@ -11954,7 +11956,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
         let supi = "imsi-001010000025271";
         let ims = sm_create_1527(
@@ -12052,7 +12054,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
         let v6_only = sm_create_1527(
             "imsi-001010000045271",
@@ -12130,7 +12132,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let ip = "10.152.11.1";
         let _in_dom_a = sm_create_1527(
             "imsi-001010000055271",
@@ -12165,7 +12167,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let ip = "10.152.12.1";
         let holder = sm_create_1527(
             "imsi-001010000065271",
@@ -12214,7 +12216,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let ip = "10.152.9.1";
         let a = sm_create_1527(
             "imsi-001010000035271",
@@ -12308,7 +12310,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let (_amf, amf_uri, recorded) = start_stub_event_consumer().await;
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
@@ -12423,7 +12425,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
 
         // CREATE -> 201 + Location
         let resp = pcf_sbi_request_handler(make_request(
@@ -12510,7 +12512,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
 
         for (label, body) in [
             (
@@ -12558,7 +12560,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
 
         // Every requested event is real per the spec enum but has no producer here.
         let resp = pcf_sbi_request_handler(make_request(
@@ -12613,7 +12615,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let (consumer, notif_uri, recorded) = start_stub_event_consumer().await;
 
         // Subscribe to PLMN_CH.
@@ -12733,7 +12735,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let (consumer, notif_uri, recorded) = start_stub_event_consumer().await;
 
         // Subscribed to a DIFFERENT event than the one that will fire.
@@ -12816,7 +12818,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
 
         let context = ctx.read().expect("ctx");
         let sub = context
@@ -12974,7 +12976,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         // The UAV inputs are process-global env; cleared under the same guard
         // every other context-touching test takes, so a sibling cannot see them.
         std::env::remove_var("PCF_UAV_AUTHORIZATION");
@@ -13042,7 +13044,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         std::env::set_var("PCF_UAV_DNN", "uav");
 
         const AUTH: &str = "CAA-OPERATOR-1,7200";
@@ -13120,7 +13122,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         std::env::set_var("PCF_UAV_DNN", "uav");
         std::env::set_var("PCF_UAV_AUTHORIZATION", "CAA-OPERATOR-1,7200");
         std::env::set_var("PCF_UAV_ZONE", "37.0,38.0,-123.0,-122.0");
@@ -13205,7 +13207,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let (consumer, notif_uri, recorded) = start_stub_event_consumer().await;
 
         let resp = pcf_sbi_request_handler(make_request(
@@ -13318,7 +13320,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
 
         let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
@@ -13452,7 +13454,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let (consumer, notif_uri, recorded) = start_stub_event_consumer().await;
 
         let resp = pcf_sbi_request_handler(make_request(
@@ -13652,7 +13654,7 @@ mod tests {
         let _cap = crate::test_support::session_ambr_cap(
             crate::session_ambr_cap::SessionAmbrCap::Subscribed,
         );
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let (status, body, id) = sm_create_1541(
             "imsi-001010000015411",
             VPLMN_QOS_FEAT_1541,
@@ -13719,7 +13721,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let _cap =
             crate::test_support::session_ambr_cap(crate::session_ambr_cap::SessionAmbrCap::None);
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let (status, body, id) =
             sm_create_1541("imsi-001010000025411", VPLMN_QOS_FEAT_1541, None).await;
         assert_eq!(status, 201, "{body}");
@@ -13863,7 +13865,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let empty_supi_reads = empty_supi_read_watch_1383();
         let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
         let supi = "imsi-001010000001383";
@@ -13942,7 +13944,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
         let (supi, psi, ipv4) = ("imsi-001010000001398", 11, "10.45.13.98");
         let mut create = full_create_body(supi, psi);
@@ -14004,7 +14006,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let empty_supi_reads = empty_supi_read_watch_1383();
         let supi = "imsi-001010000011383";
         seed_subscriber_1383(supi);
@@ -14061,7 +14063,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let empty_supi_reads = empty_supi_read_watch_1383();
         let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
         let supi = "imsi-001010000021383";
@@ -14112,7 +14114,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
         let supi = "imsi-001010000041383";
         seed_subscriber_1383(supi);
@@ -14218,7 +14220,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let empty_supi_reads = empty_supi_read_watch_1383();
         let supi = "imsi-001010000031383";
         seed_subscriber_1383(supi);
@@ -14276,7 +14278,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
         let (ue_v, ue_b) = ("imsi-001010000465001", "imsi-001010000465002");
         seed_subscriber_1383(ue_v);
@@ -14441,7 +14443,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
         let ue_b = "imsi-001010000014531";
         seed_subscriber_1383(ue_b);
@@ -14555,7 +14557,7 @@ mod tests {
     #[cfg(feature = "demo-d441a-congestion-loop")]
     async fn restore_crossed_1453(rethrottled: bool, ue_b: &str, psi: u8, ipv4: &str) {
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
         seed_subscriber_1383(ue_b);
         let pol = create_for_1383(ue_b, psi, ipv4, peers.smf_port).await;
@@ -14715,7 +14717,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
         let ue_b = "imsi-001010000465012";
         seed_subscriber_1383(ue_b);
@@ -14921,7 +14923,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         for (pass, (cap, expect_as)) in [
             (SessionAmbrCap::Subscribed, SessionAmbrCap::Subscribed),
             (SessionAmbrCap::None, SessionAmbrCap::None),
@@ -14967,7 +14969,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
         let mut notified = 0;
         for (pass, cap) in [SessionAmbrCap::Subscribed, SessionAmbrCap::None]
@@ -15037,7 +15039,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         for (pass, cap) in [SessionAmbrCap::Subscribed, SessionAmbrCap::None]
             .into_iter()
             .enumerate()
@@ -15078,7 +15080,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         for (n, (cap, ul, dl)) in [
             (SessionAmbrCap::Subscribed, "5 Mbps", "7 Mbps"),
             (SessionAmbrCap::None, "100 Mbps", "100 Mbps"),
@@ -15131,7 +15133,7 @@ mod tests {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let _cap = crate::test_support::session_ambr_cap(SessionAmbrCap::Subscribed);
         let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
         let rule = |ul: &str, dl: &str| (SEEDED_5QI_1383 as i64, ul.to_string(), dl.to_string());
@@ -15269,7 +15271,7 @@ mod oauth2_h8_tests {
     }
 
     async fn start_server(jwks: serde_json::Value) -> (SbiServer, u16) {
-        super::pcf_context_init(64, 64);
+        crate::test_support::init_context();
         let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let port = port_addr.port();
         let mut cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));

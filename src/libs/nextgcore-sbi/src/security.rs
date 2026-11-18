@@ -2260,6 +2260,50 @@ mod audience_binding_guards {
         }
     }
 
+    /// #1667: every NF that installs an outbound OAuth2 client also gives it to
+    /// its own NRF calls (`nrf_tls::set_nrf_oauth2_client`), exactly once, so a
+    /// deployment whose NRF gates nnrf-nfm / nnrf-disc does not lock it out of
+    /// registration. eesd and scpd are left out: their clients are installed
+    /// whenever an NRF URI is set, not under the profile or the knob, so their
+    /// NRF calls would fail closed in a deployment that never asked for OAuth2.
+    ///
+    /// REVERT-VERIFIED: deleting the install from any one daemon fails this.
+    #[test]
+    fn every_nf_with_an_outbound_oauth2_client_gives_it_to_its_nrf_calls_1667() {
+        let bins = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("crate is at <root>/libs/nextgcore-sbi")
+            .join("bins");
+        for rel in [
+            "nextgcore-amfd/src/lib.rs",
+            "nextgcore-ausfd/src/app.rs",
+            "nextgcore-bsfd/src/lib.rs",
+            "nextgcore-dccfd/src/main.rs",
+            "nextgcore-lmfd/src/main.rs",
+            "nextgcore-mbsmfd/src/main.rs",
+            "nextgcore-nsacfd/src/main.rs",
+            "nextgcore-nssfd/src/main.rs",
+            "nextgcore-nwdafd/src/main.rs",
+            "nextgcore-pcfd/src/app.rs",
+            "nextgcore-smfd/src/main.rs",
+            "nextgcore-tsctsf/src/main.rs",
+            "nextgcore-ucmfd/src/main.rs",
+            "nextgcore-udmd/src/app.rs",
+            "nextgcore-udrd/src/main.rs",
+        ] {
+            let path = bins.join(rel);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            assert_eq!(
+                text.matches("nextgcore_sbi::nrf_tls::set_nrf_oauth2_client(OAUTH2_CLIENT")
+                    .count(),
+                1,
+                "{rel} must give its outbound OAuth2 client to its NRF calls once (#1667)"
+            );
+        }
+    }
+
     /// Issue #64 gaps 1+2: every NF acquires its OAuth2 client through
     /// `OAuth2Client::new`, which is where the process-wide CCA signing key is
     /// seeded — so a deployment turns on client authentication in ONE place.
