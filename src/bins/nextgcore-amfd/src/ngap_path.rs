@@ -39034,6 +39034,119 @@ mod tests {
             .remove(id);
     }
 
+    /// **#1819, R27**: a PERIODIC timer outlives an expiry that was extended
+    /// before it came: at the expiry it re-reads the subscription instead of
+    /// stopping. (The extension here is a store update, a path that does not
+    /// respawn the timer; PATCH respawns it as well.)
+    ///
+    /// REVERT-VERIFIED: with the expiry arm `break`ing, "the timer survives an
+    /// extended expiry" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_periodic_timer_survives_an_extended_expiry_1819() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (id, supi) = (18_190_501u64, "imsi-001010001819501");
+        store_connected_ue_1819(id, supi);
+        let expiry = crate::namf_server::system_time_to_rfc3339(
+            std::time::SystemTime::now() + Duration::from_secs(1),
+        );
+        let (sink, mut rx, resp) = periodic_location_subscription(
+            supi,
+            "1819-extend",
+            serde_json::json!({ "trigger": "PERIODIC", "repPeriod": 2, "expiry": expiry }),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let _sub = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).expect("JSON");
+        let sub_id = v["subscriptionId"].as_str().expect("id").to_string();
+        next_location_report(&mut rx).await;
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            let mut sub = guard.event_subscription_find(&sub_id).expect("stored");
+            sub.expiry = Some(std::time::SystemTime::now() + Duration::from_secs(60));
+            assert!(guard.event_subscription_update(sub));
+        }
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert!(
+            crate::namf_server::periodic_location_timer_running(&sub_id),
+            "the timer survives an extended expiry"
+        );
+        next_location_report(&mut rx).await;
+        sink.stop().await.expect("sink stop");
+        crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .ue_store()
+            .remove(id);
+    }
+
+    /// **#1819, R27**: a PATCH of `eventList` drives the PERIODIC timer. Without
+    /// LOCATION_REPORT the timer stops and reports no location; with it again, the
+    /// timer runs and reports.
+    ///
+    /// REVERT-VERIFIED: without the cancel/spawn after the modify, "a PATCH that
+    /// removes LOCATION_REPORT stops the timer" fails. (The tick's own
+    /// `event_types` check is a second guard for a store update that does not go
+    /// through the modify handler; a PATCH cannot reach it.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_patched_event_list_drives_the_periodic_timer_1819() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (id, supi) = (18_190_601u64, "imsi-001010001819601");
+        store_connected_ue_1819(id, supi);
+        let (sink, mut rx, resp) = periodic_location_subscription(
+            supi,
+            "1819-patch",
+            serde_json::json!({ "trigger": "PERIODIC", "repPeriod": 1 }),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let _sub = crate::namf_server::EventSubscriptionGuard::of(&resp);
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).expect("JSON");
+        let sub_id = v["subscriptionId"].as_str().expect("id").to_string();
+        next_location_report(&mut rx).await;
+        let patch = |events: serde_json::Value| {
+            nextgcore_sbi::SbiRequest::patch(format!("/namf-evts/v1/subscriptions/{sub_id}"))
+                .with_json_body(&serde_json::json!([
+                    { "op": "replace", "path": "/subscription/eventList", "value": events }
+                ]))
+                .expect("json")
+        };
+        let resp = crate::namf_server::namf_request_handler(patch(
+            serde_json::json!([{ "type": "REGISTRATION_STATE_REPORT" }]),
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+        assert!(
+            !crate::namf_server::periodic_location_timer_running(&sub_id),
+            "a PATCH that removes LOCATION_REPORT stops the timer"
+        );
+        while rx.try_recv().is_ok() {}
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1500), rx.recv())
+                .await
+                .is_err(),
+            "no location after LOCATION_REPORT is removed"
+        );
+        let resp = crate::namf_server::namf_request_handler(patch(
+            serde_json::json!([{ "type": "LOCATION_REPORT" }]),
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+        assert!(crate::namf_server::periodic_location_timer_running(&sub_id));
+        next_location_report(&mut rx).await;
+        sink.stop().await.expect("sink stop");
+        crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .ue_store()
+            .remove(id);
+    }
+
     /// **#1819**: PERIODIC without `repPeriod` (Table 6.2.6.2.6-1: "shall be present
     /// if the trigger is set to PERIODIC") is refused 400 MANDATORY_IE_MISSING, and a
     /// zero period MANDATORY_IE_INCORRECT; nothing is stored.

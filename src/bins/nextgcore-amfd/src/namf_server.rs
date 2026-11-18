@@ -2078,7 +2078,7 @@ fn spawn_periodic_location_reports(sub: &EventSubscription) {
     };
     let id = sub.subscription_id.clone();
     let task_id = id.clone();
-    let task = handle.spawn(async move {
+    let task = async move {
         let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -2090,13 +2090,18 @@ fn spawn_periodic_location_reports(sub: &EventSubscription) {
             let Some(expiry) = expiry else {
                 break;
             };
+            if expiry.is_some_and(|e| e <= std::time::SystemTime::now()) {
+                break;
+            }
             let until_expiry = expiry.map(|e| {
                 e.duration_since(std::time::SystemTime::now())
                     .unwrap_or_default()
             });
+            // R27: at the expiry the loop re-reads the subscription rather than
+            // stopping, so a PATCH that extended it keeps the timer.
             tokio::select! {
                 _ = timer.tick() => {}
-                _ = tokio::time::sleep(until_expiry.unwrap_or_default()), if until_expiry.is_some() => break,
+                _ = tokio::time::sleep(until_expiry.unwrap_or_default()), if until_expiry.is_some() => continue,
             }
             let Some(sub) = amf_self()
                 .read()
@@ -2107,23 +2112,40 @@ fn spawn_periodic_location_reports(sub: &EventSubscription) {
                 break;
             };
             // #1760: while its first report waits on a page, the period does not
-            // report either; the page's outcome is the first report.
-            if sub.first_location_pending {
+            // report either; the page's outcome is the first report. R27: and a
+            // PATCH may have removed LOCATION_REPORT from the subscription.
+            if sub.first_location_pending || !sub.event_types.iter().any(|t| t == "LOCATION_REPORT")
+            {
                 continue;
             }
-            for report in periodic_location_reports(&sub) {
-                deliver_location_report(sub.clone(), report);
+            // R27: one notification per period, its reportList carrying every UE
+            // (an any-UE subscription), so a tick is one POST per subscription.
+            let reports = periodic_location_reports(&sub);
+            if !reports.is_empty() {
+                if let Err(e) = deliver_event_notifications(sub.clone(), reports).await {
+                    log::warn!("Periodic LOCATION_REPORT delivery failed (sub={task_id}): {e}");
+                }
             }
         }
+        // R27: only this task's own entry (a respawn may have replaced it).
         if let Ok(mut t) = periodic_location_timers().lock() {
-            t.remove(&task_id);
+            if t.get(&task_id)
+                .is_some_and(|h| Some(h.id()) == tokio::task::try_id())
+            {
+                t.remove(&task_id);
+            }
         }
         log::debug!("PERIODIC LOCATION_REPORT timer of {task_id} stopped");
-    });
-    if let Ok(mut t) = periodic_location_timers().lock() {
-        if let Some(old) = t.insert(id, task.abort_handle()) {
-            old.abort();
-        }
+    };
+    // R27: spawned with the map locked, so the handle is in the map before the
+    // task can reach its own removal (a task finding its subscription gone at once
+    // no longer leaves a stale entry).
+    let Ok(mut timers) = periodic_location_timers().lock() else {
+        return;
+    };
+    let task = handle.spawn(task);
+    if let Some(old) = timers.insert(id, task.abort_handle()) {
+        old.abort();
     }
 }
 
@@ -2807,6 +2829,10 @@ fn handle_event_subscription_modify(subscription_id: &str, request: &SbiRequest)
             Some("SUBSCRIPTION_NOT_FOUND"),
         );
     }
+    // R27: the PERIODIC timer follows the modified subscription: an eventList that
+    // gained LOCATION_REPORT starts it, one that lost it stops it.
+    cancel_periodic_location_reports(subscription_id);
+    spawn_periodic_location_reports(&sub);
 
     let response_body = json!({ "subscription": subscription_echo_json(&sub) });
     match SbiResponse::ok().with_json_body(&response_body) {
@@ -2908,13 +2934,22 @@ fn build_event_report(event_type: &str, supi: Option<&str>, extra: Value) -> Val
 /// POST one AmfEventNotification to a subscriber's notify URI with bounded
 /// timeouts. Returns Err on any delivery failure.
 async fn deliver_event_notification(sub: EventSubscription, report: Value) -> Result<(), String> {
+    deliver_event_notifications(sub, vec![report]).await
+}
+
+/// One notification carrying `reports` in its `reportList` (R27: a periodic tick of
+/// an any-UE subscription is one POST, not one per UE).
+async fn deliver_event_notifications(
+    sub: EventSubscription,
+    reports: Vec<Value>,
+) -> Result<(), String> {
     let (host, port, path) =
         parse_http_uri(&sub.notify_uri).ok_or_else(|| format!("bad URI {}", sub.notify_uri))?;
 
     let body = json!({
         "notifyCorrelationId": sub.notify_correlation_id,
         "subsChangeNotifyCorrelationId": Value::Null,
-        "reportList": [report],
+        "reportList": reports,
     });
     // Strip the null field (serde_json keeps explicit nulls)
     let mut body = body;
@@ -6621,6 +6656,8 @@ fn handle_registration_status_update(ue_context_id: &str, request: &SbiRequest) 
             };
             guard.amf_ue_update(&ue);
             for id in &released {
+                // R27: and its PERIODIC timer with it.
+                cancel_periodic_location_reports(id);
                 if guard.event_subscription_remove(id).is_some() {
                     log::info!(
                         "[{ue_context_id}] event subscription {id} released: transferred to \
