@@ -196,6 +196,14 @@ pub struct StoredUeContext {
     #[serde(default)]
     pub callback_tokens: bool,
     pub sdm_subscription_id: Option<String>,
+    /// #1748: the token in the SDM subscription's `callbackReference`. Absent in a
+    /// record written before #1748, whose subscription carries none.
+    #[serde(default)]
+    pub sdm_notify_token: Option<String>,
+    /// #1748: the am-data members this AMF keeps (`AmfUe::am_data`). Absent in a
+    /// record written before #1748.
+    #[serde(default)]
+    pub am_data: Option<serde_json::Value>,
     pub policy_association: PolicyAssociation,
     pub ue_policy_association: PolicyAssociation,
     pub security: StoredSecurity,
@@ -750,6 +758,8 @@ impl NgapServer {
             // every rewrite until it is moved to tokened URIs (#1625 review m-1).
             callback_tokens: !ue.pre_1518_callbacks,
             sdm_subscription_id: state.sdm_subscription_id.clone(),
+            sdm_notify_token: ue.sdm_notify_token.clone(),
+            am_data: ue.am_data.clone(),
             policy_association: ue.policy_association.clone(),
             ue_policy_association: ue.ue_policy_association.clone(),
             security: StoredSecurity {
@@ -1118,6 +1128,8 @@ fn restored_ue(amf_ue_ngap_id: u64, rec: &StoredUeContext) -> Option<UeNasContex
     ue.ue_radio_capability_id_known_to_ue = rec.ue_radio_capability_id_known_to_ue;
     ue.assigned_ebis = rec.assigned_ebis.clone();
     ue.uecm_dereg_token = rec.uecm_dereg_token.clone();
+    ue.sdm_notify_token = rec.sdm_notify_token.clone();
+    ue.am_data = rec.am_data.clone();
     // #1518: a record from before #1518 restores marked, with no key: its peers
     // hold the token-less URIs, which are served for it alone. Moving it to tokened
     // URIs, adopting each token once the peer accepted it, is #1642.

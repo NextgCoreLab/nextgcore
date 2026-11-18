@@ -10,6 +10,11 @@ metadata:
     {{- include "nextgcore.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.ausf.replicas }}
+  {{- include "nextgcore.singleInstance" (dict "root" . "nf" "ausf") }}
+  # Recreate: the new pod must not register while the old one, holding the
+  # same nfInstanceId, still shuts down and NFDeregisters it (#753, #1617).
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: ausf
@@ -25,6 +30,7 @@ spec:
         # running, since the Deployment spec is unchanged.
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
+      {{- include "nextgcore.nrfTlsPodSecurity" . | nindent 6 }}
       initContainers:
         {{- include "nextgcore.advertiseInit" (dict "nf" "ausf") | nindent 8 }}
         {{- include "nextgcore.waitForNrf" . | nindent 8 }}
@@ -44,8 +50,10 @@ spec:
             {{- end }}
           {{- include "nextgcore.sbiProbes" . | nindent 10 }}
           volumeMounts:
+            {{- include "nextgcore.nrfTlsMount" . | nindent 12 }}
             {{- include "nextgcore.configMounts" (dict "nf" "ausf" "rewritten" true) | nindent 12 }}
           env:
+            {{- include "nextgcore.nrfTlsEnv" (dict "root" . "nf" "ausf") | nindent 12 }}
             - name: NEXTGCORE_SBI_PROFILE
               # Issue #63: this NF defaults to the PRODUCTION SBI profile
               # (mutually-authenticated TLS + a required OAuth2 access token) and
@@ -75,6 +83,7 @@ spec:
             - name: UDM_SBI_PORT
               value: "{{ .Values.udm.service.port }}"
       volumes:
+        {{- include "nextgcore.nrfTlsVolume" (dict "root" . "nf" "ausf") | nindent 8 }}
         {{- include "nextgcore.configVolumes" . | nindent 8 }}
 ---
 apiVersion: v1

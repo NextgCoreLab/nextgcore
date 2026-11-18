@@ -10,6 +10,11 @@ metadata:
     {{- include "nextgcore.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.udm.replicas }}
+  {{- include "nextgcore.singleInstance" (dict "root" . "nf" "udm") }}
+  # Recreate: the new pod must not register while the old one, holding the
+  # same nfInstanceId, still shuts down and NFDeregisters it (#753, #1617).
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: udm
@@ -25,6 +30,7 @@ spec:
         # running, since the Deployment spec is unchanged.
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
+      {{- include "nextgcore.nrfTlsPodSecurity" . | nindent 6 }}
       initContainers:
         {{- include "nextgcore.advertiseInit" (dict "nf" "udm") | nindent 8 }}
         {{- include "nextgcore.waitForNrf" . | nindent 8 }}
@@ -44,6 +50,7 @@ spec:
             {{- end }}
           {{- include "nextgcore.sbiProbes" . | nindent 10 }}
           volumeMounts:
+            {{- include "nextgcore.nrfTlsMount" . | nindent 12 }}
             {{- include "nextgcore.configMounts" (dict "nf" "udm" "rewritten" true) | nindent 12 }}
             # SUCI de-concealment keys. optional: the null scheme works without
             # them; ECIES profile A/B does not. Secret is created out-of-band
@@ -52,6 +59,7 @@ spec:
               mountPath: /etc/nextgcore/hnet
               readOnly: true
           env:
+            {{- include "nextgcore.nrfTlsEnv" (dict "root" . "nf" "udm") | nindent 12 }}
             - name: NEXTGCORE_SBI_PROFILE
               # Issue #63: this NF defaults to the PRODUCTION SBI profile
               # (mutually-authenticated TLS + a required OAuth2 access token) and
@@ -81,6 +89,7 @@ spec:
             - name: UDR_SBI_PORT
               value: "{{ .Values.udr.service.port }}"
       volumes:
+        {{- include "nextgcore.nrfTlsVolume" (dict "root" . "nf" "udm") | nindent 8 }}
         {{- include "nextgcore.configVolumes" . | nindent 8 }}
         - name: hnet-keys
           secret:

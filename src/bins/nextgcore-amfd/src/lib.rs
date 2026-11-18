@@ -34,6 +34,7 @@ pub mod positioning; // LCS: LMF positioning relay (NRPPa N2 / LPP N1) — TS 23
 pub mod racs; // #570: RACS on the AMF (TS 23.501 §5.4.4.1a, TS 29.673)
 pub(crate) mod sbi_offload; // #796: SBI work off the NGAP task
 pub mod sbi_path;
+pub(crate) mod sdm_notify; // #1748: Nudm_SDM data change notification (TS 29.503 §5.2.2.5.2)
 pub mod snpn; // Rel-16: SNPN authentication (TS 23.501 §5.30)
 pub mod timer;
 pub mod ue_store; // #341: the one authoritative live-UE store
@@ -2504,7 +2505,7 @@ mod oauth2_h8_tests {
     }
 
     #[tokio::test]
-    async fn test_oauth2_wrong_audience_rejected_401() {
+    async fn test_oauth2_wrong_audience_rejected_403() {
         let sk = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
         let (server, port) = start_server(jwks_for(&sk, "nrf-es256")).await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
@@ -2515,7 +2516,12 @@ mod oauth2_h8_tests {
             .await
             .expect("bounded")
             .expect("response");
-        assert_eq!(resp.status, 401, "wrong-audience token must be 401");
+        assert_eq!(resp.status, 403, "wrong-audience token must be 403 (#1766)");
+        // #1779 review m2: the gate's claim mismatch, not a handler's own 403.
+        let problem: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap_or_default();
+        assert_eq!(problem["cause"], "ACCESS_TOKEN_CLAIM_MISMATCH", "{problem}");
+        assert_eq!(problem["invalidParams"][0]["param"], "aud", "{problem}");
         server.stop().await.expect("stop");
     }
 

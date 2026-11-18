@@ -8,9 +8,27 @@ It does NOT ship the gNB/UE simulator or the monitoring stack.
 Check the rollout:
   kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/part-of=nextgcore
 
-Confirm every NF registered with a ROUTABLE address (never 0.0.0.0):
+Confirm every NF registered with a ROUTABLE address (never 0.0.0.0). The NRF
+serves TLS (#1617); verify its certificate, never skip verification:
   kubectl exec -n {{ .Release.Namespace }} deploy/{{ .Release.Name }}-nrf -- \
-    curl -s --http2-prior-knowledge http://127.0.0.1:{{ .Values.global.sbi.port }}/nnrf-nfm/v1/nf-instances
+    curl -s --http2 --cacert /etc/nextgcore/certs/ca.crt \
+    --resolve {{ .Values.global.nrfTls.serverName | default (include "nextgcore.nrfHost" .) }}:{{ .Values.global.sbi.port }}:127.0.0.1 \
+    https://{{ .Values.global.nrfTls.serverName | default (include "nextgcore.nrfHost" .) }}:{{ .Values.global.sbi.port }}/nnrf-nfm/v1/nf-instances
+{{ if not .Values.global.nrfTls.secretVersion }}
+ACTION REQUIRED — the NF TLS Secrets are not selected (#1617).
+
+The NRF and every NF mount Secret nf-tls-<nf>[-<version>] (their certificate,
+key and the CA certificate); global.nrfTls.secretVersion is empty, so they wait
+for nf-tls-<nf>, which nf-tls-secrets.sh never creates, and stay in
+ContainerCreating. From the repo root, with the same values flags as this
+release (DEVELOPMENT certificates; the CA key never enters the cluster):
+
+  ver="$(deploy/helm/nf-tls-secrets.sh {{ .Release.Name }} {{ .Release.Namespace }} <your values flags>)"
+  helm upgrade {{ .Release.Name }} deploy/helm/nextgcore -n {{ .Release.Namespace }} \
+    <your values flags> --set global.nrfTls.secretVersion="$ver"
+
+For your own PKI see the chart README ("NF -> NRF TLS").
+{{- end }}
 {{ if not .Values.hnetKeys.existingSecret }}
 ACTION REQUIRED — SUCI de-concealment keys are not installed.
 
