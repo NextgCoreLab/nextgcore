@@ -12,58 +12,68 @@
 # for a client that only discovers (it has no identity to present).
 #
 # Usage:
-#   nf-tls-secrets.sh <namespace> <manifest>...   create or keep the Secrets
+#   nf-tls-secrets.sh <namespace> <manifest>...   create or keep the Secrets;
+#                                                 prints the CA version
 #   nf-tls-secrets.sh --dry-run <namespace> <manifest>...
 #                                                 list them; no cluster access
-#   nf-tls-secrets.sh --annotate <ca-sha> <manifest>
-#                                                 print the manifest with each
-#                                                 pod template that mounts an
-#                                                 nf-tls-* Secret annotated
-#                                                 nextg.io/nf-tls-ca: <ca-sha>
+#   nf-tls-secrets.sh --stamp <version> <manifest>
+#                                                 print the manifest pointed at
+#                                                 that version (below)
 #
-# The Secrets needed are the nf-tls-* secretNames the manifests' pod templates
-# mount. The CA key never enters the cluster: the PKI is issued into a private
-# temporary directory that is deleted on exit. So the Secrets are the state:
-#   - every needed Secret exists, all of them carry one ca.crt, and each
-#     <name>.crt chains to it, names its row's urn:uuid and is valid for 30
-#     more days: they are kept and nothing is written;
-#   - otherwise a fresh CA is issued and EVERY nf-tls-* Secret of the namespace
-#     (needed now or already there) is rewritten from it, so a namespace never
-#     holds two CAs.
-# The last line of stdout is the sha256 of the ca.crt in force (nothing when no
-# manifest mounts one). The deploy
-# scripts stamp it on each pod template that mounts one (--annotate), so a
-# re-issue rolls the NRF and every client onto the new CA together.
+# One CA, one version. The Secrets of a CA are named nf-tls-<name>-<version>,
+# <version> being the first 16 hex digits of the sha256 of its ca.crt, and
+# labelled nextg.io/nf-tls-ca=<version>. The manifests mount nf-tls-<name>;
+# --stamp rewrites each such secretName to nf-tls-<name>-<version> and stamps
+# the pod template with annotation nextg.io/nf-tls-ca=<version>, so applying
+# the stamped manifests moves the NRF and every client to that CA together.
 #
-# Secrets are written with kubectl create / replace, never apply, so no
+# The CA key never enters the cluster: the PKI is issued into a private
+# temporary directory that is deleted on exit (also on SIGINT / SIGTERM / SIGHUP).
+# So the Secrets are the state:
+#   - a version that has every needed Secret, each certificate chaining to its
+#     ca.crt, matching its key, naming its row's urn:uuid and valid for 30 more
+#     days, is kept (the newest such version) and nothing is written;
+#   - otherwise a new CA is issued and its whole set is created under the new
+#     version. Nothing a running pod mounts is touched: the old version's
+#     Secrets stay as they were. A failure or an interrupt part way therefore
+#     leaves the running stack on its one CA, and the incomplete new version is
+#     never printed, never stamped, and not kept by the next run (which issues
+#     a fresh one). Older versions are left in place, unreferenced once the
+#     stamped manifests are applied; the script names them, it deletes nothing.
+#
+# Secrets are written with kubectl create, never apply, so no
 # last-applied-configuration annotation copies a private key.
-# shellcheck disable=SC2086  # ${needed} / ${existing}: row names ([a-z0-9-]), split on purpose
+# shellcheck disable=SC2086  # ${needed}: row names ([a-z0-9-]), split on purpose
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CERTS_DIR="$(cd "${SCRIPT_DIR}/../docker/rust/certs" && pwd)"
 TABLE="${CERTS_DIR}/nf-identities.txt"
-ANNOTATION="nextg.io/nf-tls-ca"
+LABEL="nextg.io/nf-tls-ca"
 # Re-issue when a certificate expires within this many seconds (30 days).
 MIN_VALIDITY=2592000
 
 die() { printf 'nf-tls-secrets: %s\n' "$*" >&2; exit 1; }
 say() { printf 'nf-tls-secrets: %s\n' "$*" >&2; }
 
-if [[ "${1:-}" == --annotate ]]; then
-  [[ $# -eq 3 ]] || die "usage: $0 --annotate <ca-sha> <manifest>"
-  exec python3 - "$2" "$3" "${ANNOTATION}" <<'PY'
+if [[ "${1:-}" == --stamp ]]; then
+  [[ $# -eq 3 && "$2" =~ ^[0-9a-f]{16}$ ]] || die "usage: $0 --stamp <version> <manifest>"
+  exec python3 - "$2" "$3" "${LABEL}" <<'PY'
 import re, sys, yaml
-sha, path, key = sys.argv[1:4]
+ver, path, key = sys.argv[1:4]
 out = []
 for d in yaml.safe_load_all(open(path)):
     if not d:
         continue
     tmpl = (d.get('spec') or {}).get('template') if isinstance(d, dict) else None
-    vols = ((tmpl or {}).get('spec') or {}).get('volumes') or []
-    if any(re.fullmatch(r'nf-tls-[a-z0-9-]+', (v.get('secret') or {}).get('secretName') or '')
-           for v in vols):
-        tmpl.setdefault('metadata', {}).setdefault('annotations', {})[key] = sha
+    stamped = False
+    for v in ((tmpl or {}).get('spec') or {}).get('volumes') or []:
+        s = v.get('secret') or {}
+        if re.fullmatch(r'nf-tls-[a-z0-9-]+', s.get('secretName') or ''):
+            s['secretName'] = '%s-%s' % (s['secretName'], ver)
+            stamped = True
+    if stamped:
+        tmpl.setdefault('metadata', {}).setdefault('annotations', {})[key] = ver
     out.append(d)
 yaml.safe_dump_all(out, sys.stdout, default_flow_style=False)
 PY
@@ -116,78 +126,99 @@ command -v kubectl >/dev/null || die "kubectl not found"
 command -v openssl >/dev/null || die "openssl not found (needed to issue the dev PKI)"
 
 WORK="$(umask 077 && mktemp -d -t nf-tls-XXXXXX)"
-trap 'rm -rf "${WORK}"' EXIT
+cleanup() { rm -rf "${WORK}"; }
+# bash runs the EXIT trap on INT, TERM and HUP too (test-nf-tls-secrets.sh 5).
+# Only a SIGKILL leaves WORK (0700, under TMPDIR) behind.
+trap cleanup EXIT
 
-# --- keep the Secrets when they are current --------------------------------
-existing="$(kubectl get secrets -n "${NS}" -o name 2>/dev/null | sed -n 's|^secret/nf-tls-||p')" \
+# --- keep a complete, current version ---------------------------------------
+kubectl get secrets -n "${NS}" -l "${LABEL}" -o json > "${WORK}/all.json" \
   || die "cannot list Secrets in ${NS}"
-
-current() {
-  local n ca="" json="${WORK}/cur.json" id
-  mkdir -p "${WORK}/cur"
-  for n in ${needed}; do
-    kubectl get secret "nf-tls-${n}" -n "${NS}" -o json > "${json}" 2>/dev/null \
-      || { say "nf-tls-${n} is absent"; return 1; }
-    python3 - "${json}" "${WORK}/cur" "${n}" <<'PY' || { say "nf-tls-${n} lacks a file"; return 1; }
+# Versions, newest first; each one's Secrets unpacked into WORK/v/<version>/.
+versions="$(python3 - "${WORK}/all.json" "${WORK}/v" "${LABEL}" <<'PY'
 import base64, json, os, sys
-data = json.load(open(sys.argv[1])).get('data') or {}
-n = sys.argv[3]
-want = ['ca.crt'] if n == 'ca' else ['ca.crt', n + '.crt', n + '.key']
-if sorted(data) != sorted(want):
-    sys.exit(1)
-for k in want:
-    if k.endswith('.key'):
+items = json.load(open(sys.argv[1])).get('items') or []
+newest = {}
+for s in items:
+    meta = s.get('metadata') or {}
+    ver = (meta.get('labels') or {}).get(sys.argv[3], '')
+    name = meta.get('name', '')
+    if len(ver) != 16 or not name.startswith('nf-tls-') or not name.endswith('-' + ver):
         continue
-    with open(os.path.join(sys.argv[2], n + '-' + k), 'wb') as f:
-        f.write(base64.b64decode(data[k]))
+    row = name[len('nf-tls-'):-len(ver) - 1]
+    d = os.path.join(sys.argv[2], ver, row)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    for k, b in (s.get('data') or {}).items():
+        with open(os.path.join(d, k), 'wb') as f:
+            f.write(base64.b64decode(b))
+    newest[ver] = max(newest.get(ver, ''), meta.get('creationTimestamp', ''))
+print(' '.join(sorted(newest, key=lambda v: newest[v], reverse=True)))
 PY
-    if [[ -z "${ca}" ]]; then
-      ca="${WORK}/cur/${n}-ca.crt"
-    elif ! cmp -s "${ca}" "${WORK}/cur/${n}-ca.crt"; then
-      say "nf-tls-${n} carries another CA"
-      return 1
+)" || die "cannot read the nf-tls Secrets of ${NS}"
+
+current() {  # current <version>: every needed Secret of that version is good
+  local ver="$1" n d id ca
+  for n in ${needed}; do
+    d="${WORK}/v/${ver}/${n}"
+    ca="${d}/ca.crt"
+    [[ -f "${ca}" ]] || { say "version ${ver}: nf-tls-${n} is absent"; return 1; }
+    [[ "$(sha256sum "${ca}" | cut -c1-16)" == "${ver}" ]] \
+      || { say "version ${ver}: nf-tls-${n} carries another CA"; return 1; }
+    if [[ "${n}" == ca ]]; then
+      [[ "$(find "${d}" -mindepth 1 -printf '%f\n')" == ca.crt ]] || { say "version ${ver}: nf-tls-ca holds more than ca.crt"; return 1; }
+      continue
     fi
-    [[ "${n}" == ca ]] && continue
+    [[ "$(find "${d}" -mindepth 1 -printf '%f\n' | sort | tr '\n' ' ')" == "$(printf '%s\n' ca.crt "${n}.crt" "${n}.key" | sort | tr '\n' ' ')" ]] \
+      || { say "version ${ver}: nf-tls-${n} does not hold exactly ca.crt ${n}.crt ${n}.key"; return 1; }
     id="$(row_id "${n}")"
-    openssl verify -CAfile "${ca}" "${WORK}/cur/${n}-${n}.crt" >/dev/null 2>&1 \
-      || { say "nf-tls-${n}: ${n}.crt does not chain to its ca.crt"; return 1; }
-    openssl x509 -in "${WORK}/cur/${n}-${n}.crt" -noout -checkend "${MIN_VALIDITY}" >/dev/null \
-      || { say "nf-tls-${n}: ${n}.crt expires within 30 days"; return 1; }
-    openssl x509 -in "${WORK}/cur/${n}-${n}.crt" -noout -text | grep -qi "URI:urn:uuid:${id}" \
-      || { say "nf-tls-${n}: ${n}.crt does not name urn:uuid:${id}"; return 1; }
+    openssl verify -CAfile "${ca}" "${d}/${n}.crt" >/dev/null 2>&1 \
+      || { say "version ${ver}: ${n}.crt does not chain to its ca.crt"; return 1; }
+    openssl x509 -in "${d}/${n}.crt" -noout -checkend "${MIN_VALIDITY}" >/dev/null \
+      || { say "version ${ver}: ${n}.crt expires within 30 days"; return 1; }
+    openssl x509 -in "${d}/${n}.crt" -noout -text | grep -qi "URI:urn:uuid:${id}" \
+      || { say "version ${ver}: ${n}.crt does not name urn:uuid:${id}"; return 1; }
+    # The key is the certificate's: compare the public keys.
+    [[ "$(openssl x509 -in "${d}/${n}.crt" -noout -pubkey 2>/dev/null)" \
+       == "$(openssl pkey -in "${d}/${n}.key" -pubout 2>/dev/null)" ]] \
+      || { say "version ${ver}: ${n}.key is not the key of ${n}.crt"; return 1; }
   done
-  openssl x509 -in "${ca}" -noout -checkend "${MIN_VALIDITY}" >/dev/null \
-    || { say "the CA expires within 30 days"; return 1; }
-  cp "${ca}" "${WORK}/ca.crt"
+  openssl x509 -in "${WORK}/v/${ver}/$(printf '%s\n' ${needed} | head -1)/ca.crt" -noout \
+    -checkend "${MIN_VALIDITY}" >/dev/null || { say "version ${ver}: the CA expires within 30 days"; return 1; }
 }
 
-if current; then
-  say "kept $(printf 'nf-tls-%s ' ${needed})(current, one CA)"
+keep=""
+for ver in ${versions}; do
+  if current "${ver}"; then
+    keep="${ver}"
+    break
+  fi
+done
+
+if [[ -n "${keep}" ]]; then
+  say "kept version ${keep}: $(printf 'nf-tls-%s ' ${needed})(current)"
+  ver="${keep}"
 else
-  # --- issue a fresh PKI and rewrite every nf-tls-* Secret -----------------
+  # --- issue a new CA and create its whole set under a new version ---------
   say "issuing a new dev PKI for ${NS} (the CA key stays in ${WORK} and is deleted on exit)"
   bash "${CERTS_DIR}/generate-dev-certs.sh" --out "${WORK}/pki" >/dev/null \
     || die "generate-dev-certs.sh failed"
-  cp "${WORK}/pki/ca.crt" "${WORK}/ca.crt"
-  for n in $(printf '%s\n' ${needed} ${existing} | sort -u); do
-    if [[ "${n}" != ca && -z "$(row_id "${n}")" ]]; then
-      say "WARN: leaving nf-tls-${n} alone: no row ${n} in ${TABLE}"
-      continue
-    fi
+  ver="$(sha256sum "${WORK}/pki/ca.crt" | cut -c1-16)"
+  for n in ${needed}; do
     files=(--from-file="ca.crt=${WORK}/pki/ca.crt")
     if [[ "${n}" != ca ]]; then
       files+=(--from-file="${n}.crt=${WORK}/pki/${n}.crt"
               --from-file="${n}.key=${WORK}/pki/${n}.key")
     fi
-    verb=create
-    printf '%s\n' ${existing} | grep -qx "${n}" && verb=replace
-    kubectl create secret generic "nf-tls-${n}" -n "${NS}" "${files[@]}" \
+    kubectl create secret generic "nf-tls-${n}-${ver}" -n "${NS}" "${files[@]}" \
       --dry-run=client -o yaml \
-      | kubectl label --local -f - -o yaml app.kubernetes.io/part-of=nextgcore \
-      | kubectl "${verb}" -f - >/dev/null \
-      || die "could not ${verb} Secret nf-tls-${n}"
-    say "${verb}d nf-tls-${n}"
+      | kubectl label --local -f - -o yaml "${LABEL}=${ver}" app.kubernetes.io/part-of=nextgcore \
+      | kubectl create -f - >/dev/null \
+      || die "could not create Secret nf-tls-${n}-${ver}; the running stack keeps its CA (version ${ver} is incomplete and will not be used)"
+    say "created nf-tls-${n}-${ver}"
   done
   say "these are DEVELOPMENT certificates. Replace them for any real use."
 fi
-sha256sum "${WORK}/ca.crt" | cut -c1-16
+others="$(printf '%s\n' ${versions} | grep -vx "${ver}" | tr '\n' ' ' || true)"
+[[ -z "${others// /}" ]] \
+  || say "older versions left in place (unreferenced once the stamped manifests are applied): ${others}"
+printf '%s\n' "${ver}"

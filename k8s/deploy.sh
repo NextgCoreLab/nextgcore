@@ -104,10 +104,12 @@ fi
 # kept on a re-run while current; the CA key never enters the cluster. The
 # Secret mounts are not optional: a pod without its Secret does not start.
 NF_TLS_CA="$("${SCRIPT_DIR}/nf-tls-secrets.sh" "${NAMESPACE}" "${SCRIPT_DIR}"/manifests/*.yaml)"
-# Each NF manifest is applied with its pod template stamped with that CA, so a
-# re-issued PKI rolls the NRF and every client onto it together.
+# Each NF manifest is applied pointed at that CA's Secrets (nf-tls-<name> ->
+# nf-tls-<name>-<version>) and stamped with it, so a new CA moves the NRF and
+# every client together, and a failed issue leaves the running pods' Secrets
+# untouched.
 apply_nf() {
-  "${SCRIPT_DIR}/nf-tls-secrets.sh" --annotate "${NF_TLS_CA}" "${SCRIPT_DIR}/manifests/$1.yaml" \
+  "${SCRIPT_DIR}/nf-tls-secrets.sh" --stamp "${NF_TLS_CA}" "${SCRIPT_DIR}/manifests/$1.yaml" \
     | kubectl apply -f -
 }
 
@@ -245,7 +247,8 @@ echo "  Grafana:    kubectl -n ${NAMESPACE} port-forward svc/grafana 3000:3000  
 echo "              (user admin; password: kubectl -n ${NAMESPACE} get secret grafana-admin -o jsonpath='{.data.password}' | base64 -d)"
 echo "  Prometheus: kubectl -n ${NAMESPACE} port-forward svc/prometheus 9090:9090    -> http://localhost:9090"
 echo "  Jaeger:     kubectl -n ${NAMESPACE} port-forward svc/jaeger 16686:16686      -> http://localhost:16686"
-echo "  NRF SBI:    kubectl -n ${NAMESPACE} port-forward svc/nrf 7777:7777           -> https://localhost:7777"
-echo "              (TLS: the CA certificate is ca.crt in Secret nf-tls-nrf; nrf.crt names DNS:nrf,"
-echo "               so: curl --http2 --cacert ca.crt --resolve nrf:7777:127.0.0.1 https://nrf:7777/...)"
+echo "  NRF SBI:    kubectl -n ${NAMESPACE} port-forward svc/nrf 7777:7777           -> https://nrf:7777 (TLS)"
+echo "              nrf.crt names DNS:nrf, not localhost: verify it, never skip verification:"
+echo "              curl --http2 --cacert ca.crt --resolve nrf:7777:127.0.0.1 https://nrf:7777/..."
+echo "              (ca.crt: the ca.crt key of the nf-tls-nrf-${NF_TLS_CA} Secret)"
 echo ""

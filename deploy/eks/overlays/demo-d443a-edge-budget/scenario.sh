@@ -337,6 +337,17 @@ print(json.dumps(d))' "${S}/ees-config.before.json" "$1" | "${K[@]}" apply -f - 
       wait_for 180 "${K[@]}" exec deploy/nrf -c nrf -- test -s "/etc/nextgcore/cca-trusted/${nfid}.jwk" \
         || bad "the NRF does not see ${nf}'s JWK within 180 s"
     done <"${S}/oauth2-ids.txt"
+    # amfd and smfd need an nnrf-nfm token before NFRegister (#1667), which the
+    # NRF grants only once it trusts their CCA JWK (above). Until then their
+    # registration retries back off to a 30 s cap, so wait for both profiles
+    # at the NRF before the fresh N2 below depends on them. Over TLS (#1617).
+    while read -r nf nfid; do
+      [[ "${nf}" == ees ]] && continue
+      wait_for 120 sh -c "[ \"\$(kubectl -n ${NAMESPACE} --request-timeout=30s exec deploy/nrf -c nrf -- \
+        curl -s --http2 --cacert /etc/nextgcore/certs/ca.crt --max-time 5 -o /dev/null -w '%{http_code}' \
+        https://nrf:7777/nnrf-nfm/v1/nf-instances/${nfid})\" = 200 ]" \
+        || bad "${nf} (${nfid}) did not re-register at the NRF within 120 s of its JWK being trusted"
+    done <"${S}/oauth2-ids.txt"
     # A fresh N2 and PDU session through the OAuth2 amfd and smfd.
     "${K[@]}" delete pod -l app.kubernetes.io/name=gnb --wait=true --timeout=120s >/dev/null || bad "gnb restart"
     "${K[@]}" rollout status deploy/gnb --timeout=300s >/dev/null || bad "gnb rollout"

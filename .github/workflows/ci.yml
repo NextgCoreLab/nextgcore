@@ -607,6 +607,9 @@ jobs:
           set -euo pipefail
           python3 docker/rust/certs/check-nf-identities.py --self-test
           python3 docker/rust/certs/check-nf-identities.py --k8s
+          # k8s/nf-tls-secrets.sh against a fake kubectl: idempotent, a refused
+          # or failed or interrupted issue leaves the CA in use untouched (#1617).
+          bash k8s/test-nf-tls-secrets.sh
           out="$(mktemp -d)"
           bash docker/rust/certs/generate-dev-certs.sh --out "$out" >/dev/null
           rows="$(grep -cvE '^\s*(#|$)' docker/rust/certs/nf-identities.txt)"

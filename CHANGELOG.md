@@ -47,9 +47,10 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 - The Kubernetes deployments run NF -> NRF over TLS too (#1617): the Kind manifests
   (`k8s/`), every EKS profile with an NRF, and the demo overlays. The NRF's `nrf.yaml` serves
   TLS with `client_auth: optional`. `k8s/deploy.sh` and `deploy-eks.sh` run the new
-  `k8s/nf-tls-secrets.sh`, which issues one Secret `nf-tls-<name>` per NRF client and for the
-  NRF (its certificate, key and the CA certificate; never the CA key) and keeps them on a re-run
-  while they are current. Each NRF client mounts only its own Secret (`0440`, pod `fsGroup`),
+  `k8s/nf-tls-secrets.sh`, which issues the Secrets for each NRF client and the NRF (its
+  certificate, key and the CA certificate; never the CA key) under names versioned by their CA
+  (`nf-tls-<name>-<version>`), keeps them on a re-run while they are current, and never
+  modifies a version in use, so a failed or interrupted re-issue leaves the stack on its CA. Each NRF client mounts only its own Secret (`0440`, pod `fsGroup`),
   dials `https://`, sets `NEXTGCORE_NRF_TLS_CA` / `_CLIENT_CERT` / `_CLIENT_KEY` and
   `NEXTGCORE_NRF_TLS_SERVER_NAME=nrf` (the URIs name the cluster FQDN; `nrf.crt` names
   `DNS:nrf`), and pins the nfInstanceId its certificate names; the NRF pins its own. New

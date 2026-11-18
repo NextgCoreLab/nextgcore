@@ -659,14 +659,16 @@ fi
 # URI SAN + RFC 9310 NFTypes from docker/rust/certs/nf-identities.txt, TS 33.310
 # §6.1.3c.3) and the CA certificate. k8s/nf-tls-secrets.sh issues them from
 # the dev PKI generator, or keeps them while they are current; the CA key never
-# enters the cluster. The render's pod templates that mount one are stamped
-# with the CA in force, so a re-issue rolls the NRF and its clients together.
+# enters the cluster. Each CA's Secrets carry its version in their names
+# (nf-tls-<name>-<version>); the render is pointed at the version in force and
+# stamped with it, so a new CA moves the NRF and its clients together, and a
+# failed or interrupted issue leaves the running pods' Secrets untouched.
 NF_TLS_CA="$("${CORE_DIR}/k8s/nf-tls-secrets.sh" "${NAMESPACE}" "${RENDERED}")" \
   || die "could not create the nf-tls Secrets"
 if [[ -n "${NF_TLS_CA}" ]]; then
-  log "nf-tls Secrets current (CA ${NF_TLS_CA}); stamping the pod templates that mount them"
-  "${CORE_DIR}/k8s/nf-tls-secrets.sh" --annotate "${NF_TLS_CA}" "${RENDERED}" > "${RENDERED}.tmp" \
-    || die "nf-tls annotation failed"
+  log "nf-tls Secrets current (CA version ${NF_TLS_CA}); pointing the pod templates at them"
+  "${CORE_DIR}/k8s/nf-tls-secrets.sh" --stamp "${NF_TLS_CA}" "${RENDERED}" > "${RENDERED}.tmp" \
+    || die "nf-tls stamp failed"
   mv "${RENDERED}.tmp" "${RENDERED}"
   warn "the nf-tls certificates are DEVELOPMENT certificates. Replace them for any real use."
 fi
