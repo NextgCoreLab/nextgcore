@@ -754,6 +754,26 @@ impl TeidPool {
         }
     }
 
+    /// #1834: hold `teid`, which the CP function named itself (TS 29.244 §5.5.3:
+    /// F-TEID allocation by the UP function is optional), so [`Self::alloc`] never
+    /// hands it to another session. `false` when it is already held.
+    fn reserve(&self, teid: u32) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .in_use
+            .insert(teid)
+    }
+
+    /// #1834: whether `teid` is held, by any session or by a request in flight.
+    fn is_held(&self, teid: u32) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .in_use
+            .contains(&teid)
+    }
+
     /// Give `teid` back. A TEID the pool did not hand out is ignored.
     fn release(&self, teid: u32) {
         self.inner
@@ -1170,10 +1190,12 @@ pub struct SessionRuleIds {
     /// checked against: a TEID another session holds is refused, because it
     /// routes that session's uplink.
     pub pdr_teids: HashMap<u16, u32>,
-    /// #1815: the TEIDs of [`Self::pdr_teids`] this UPF chose from its pool, as
-    /// opposed to ones the CP function named. Each goes back to the pool once no
-    /// PDR of the session detects on it, or with the session.
-    pub chosen_teids: std::collections::HashSet<u32>,
+    /// #1815: the TEIDs of [`Self::pdr_teids`] the session holds in the UPF's
+    /// TEID pool: the ones this UPF chose, and (#1834) the ones the CP function
+    /// named itself, reserved so the pool never hands them to another session.
+    /// Each goes back to the pool once no PDR of the session detects on it, or
+    /// with the session.
+    pub held_teids: std::collections::HashSet<u32>,
 }
 
 /// #1741: whether a Session Modification leaves `id` held: created by it, or held
@@ -1462,7 +1484,7 @@ impl PfcpServer {
             let n = sessions.len();
             // #1815: the sessions' TEIDs go back with them.
             for info in sessions.values() {
-                self.release_teids(info.rules.chosen_teids.iter().copied());
+                self.release_teids(info.rules.held_teids.iter().copied());
             }
             sessions.clear();
             self.publish_session_count(&sessions);
@@ -1516,7 +1538,7 @@ impl PfcpServer {
             for (seid, _) in &dropped {
                 // #1815: a dropped session's TEIDs go back with it.
                 if let Some(info) = sessions.remove(seid) {
-                    self.release_teids(info.rules.chosen_teids);
+                    self.release_teids(info.rules.held_teids);
                 }
             }
             for info in sessions.values_mut() {
@@ -2460,7 +2482,8 @@ impl PfcpServer {
         let mut parsed_pdrs = Vec::new();
         // #1682: the TEID each PDR detects on, for `SessionRuleIds::pdr_teids`.
         let mut pdr_teids: HashMap<u16, u32> = HashMap::new();
-        // #1815: the TEIDs chosen for this request, given back if it is refused.
+        // #1815: the TEIDs this request holds in the pool, chosen or (#1834) named
+        // by the CP function and reserved; given back if it is refused.
         let mut chosen_teids: Vec<u32> = Vec::new();
 
         for pdr in create_pdrs {
@@ -2532,7 +2555,40 @@ impl PfcpServer {
                         choose_id: None,
                     })
                 } else {
-                    ul_teid = fteid.teid;
+                    // #1834: a TEID the SMF named itself is held in the pool like a
+                    // chosen one, so no later CHOOSE hands it to another session. One
+                    // another session (or request) already holds would route that
+                    // session's uplink here: refused as a rule failure (§7.5.3.1),
+                    // and the TEIDs earlier PDRs took go back. PDRs of this one
+                    // establishment may share it.
+                    let teid = fteid.teid;
+                    if !chosen_teids.contains(&teid) {
+                        if !self.teids.reserve(teid) {
+                            log::warn!(
+                                "PDR {}: F-TEID {teid:#x} named by the CP function is \
+                                 another session's; the establishment is refused",
+                                pdr.pdr_id
+                            );
+                            self.release_teids(chosen_teids.drain(..));
+                            let resp_payload = crate::n4_build::build_rule_failure_response(
+                                crate::n4_build::FailedRule::Pdr(pdr.pdr_id),
+                            );
+                            let response = self.build_response(
+                                pfcp_type::SESSION_ESTABLISHMENT_RESPONSE,
+                                smf_seid,
+                                header.sequence_number,
+                                &resp_payload,
+                                true,
+                            );
+                            self.socket
+                                .send_to(&response, src_addr)
+                                .await
+                                .map_err(|e| format!("Send error: {e}"))?;
+                            return Ok(());
+                        }
+                        chosen_teids.push(teid);
+                    }
+                    ul_teid = teid;
                     pdr_teids.insert(pdr.pdr_id, ul_teid);
                     None
                 }
@@ -2697,7 +2753,7 @@ impl PfcpServer {
                 ),
                 srr_ids: parsed_srrs.iter().map(|r| r.srr_id).collect(),
                 pdr_teids,
-                chosen_teids: chosen_teids.into_iter().collect(),
+                held_teids: chosen_teids.into_iter().collect(),
             },
             // #321: no bridge until the SMF configures one. An establishment
             // deliberately does not create an empty one — `Some(empty bridge)` and
@@ -3230,6 +3286,47 @@ impl PfcpServer {
                     // "no such rule" refusals below are judged against the rule set the
                     // message WOULD leave (held, minus its removals, plus its creates, in
                     // §7.5.4's order), and only an accepted modification then writes it.
+                    // #1834: a TEID the CP function names itself in a Create PDR or
+                    // an Update PDR must not be one the pool holds for another
+                    // session (or for this message's own CHOOSE): that would route
+                    // the other session's uplink here. One this session already
+                    // holds is fine, since its PDRs may share an F-TEID. The rest are
+                    // reserved below, only if the modification is accepted.
+                    let mut cp_teids: Vec<u32> = Vec::new();
+                    let named = created_pdrs
+                        .iter()
+                        .map(|p| (p.pdr_id, p.pdi.local_f_teid.as_ref()))
+                        .chain(updated_pdrs.iter().map(|u| {
+                            (
+                                u.pdr_id,
+                                u.pdi.as_ref().and_then(|p| p.local_f_teid.as_ref()),
+                            )
+                        }));
+                    for (pdr_id, fteid) in named {
+                        let Some(teid) = fteid.filter(|f| !f.ch && f.teid != 0).map(|f| f.teid)
+                        else {
+                            continue;
+                        };
+                        if chosen_teids.contains(&teid)
+                            || session.rules.held_teids.contains(&teid)
+                            || cp_teids.contains(&teid)
+                        {
+                            continue;
+                        }
+                        if self.teids.is_held(teid) {
+                            log::warn!(
+                                "PDR {pdr_id} on SEID {upf_seid:#x}: F-TEID {teid:#x} named \
+                                 by the CP function is another session's; refused"
+                            );
+                            note_first_rule_failure(
+                                &mut failure,
+                                crate::n4_build::FailedRule::Pdr(pdr_id),
+                            );
+                        } else {
+                            cp_teids.push(teid);
+                        }
+                    }
+
                     for r in &mod_srrs {
                         if !held_after(
                             &session.rules.srr_ids,
@@ -3432,8 +3529,13 @@ impl PfcpServer {
                         // #1815: the session now holds what this message chose, and a
                         // chosen TEID no PDR detects on any more (removed, or moved by
                         // an Update PDR) goes back to the pool.
-                        let chosen = &mut session.rules.chosen_teids;
+                        let chosen = &mut session.rules.held_teids;
                         chosen.extend(chosen_teids.drain(..));
+                        // #1834: and the CP-named TEIDs it now detects on.
+                        for teid in cp_teids {
+                            self.teids.reserve(teid);
+                            chosen.insert(teid);
+                        }
                         let held: std::collections::HashSet<u32> =
                             teids.values().copied().collect();
                         let freed: Vec<u32> = chosen
@@ -3690,7 +3792,7 @@ impl PfcpServer {
         };
         // #1815: the session's TEIDs go back with it.
         if let Some(info) = &session_info {
-            self.release_teids(info.rules.chosen_teids.iter().copied());
+            self.release_teids(info.rules.held_teids.iter().copied());
         }
 
         // Unknown SEID → Session Context Not Found (TS 29.244 7.5.7, cause 65)
@@ -5701,10 +5803,23 @@ mod tests {
     }
 
     fn pdr_body(pdr_id: u16, precedence: u32, far_id: u32, qer_id: u32, urr_id: u32) -> Vec<u8> {
+        pdr_body_on(pdr_id, precedence, far_id, qer_id, urr_id, 0x1234)
+    }
+
+    /// [`pdr_body`] on the SMF-named TEID `teid`. Two sessions cannot share one
+    /// (#1834), so a test establishing several gives each its own.
+    fn pdr_body_on(
+        pdr_id: u16,
+        precedence: u32,
+        far_id: u32,
+        qer_id: u32,
+        urr_id: u32,
+        teid: u32,
+    ) -> Vec<u8> {
         let mut pdi = crate::n4_build::PfcpMessageBuilder::new();
         pdi.add_u8(pfcp_ie::SOURCE_INTERFACE, 0); // Access
         pdi.add_f_teid(&crate::n4_build::FTeid {
-            teid: 0x1234,
+            teid,
             ipv4: Some(Ipv4Addr::new(127, 0, 0, 4)),
             ipv6: None,
             choose: false,
@@ -6615,7 +6730,9 @@ mod tests {
     #[tokio::test]
     async fn a_rejected_modification_gives_back_the_teids_it_chose_1815() {
         let (server, smf, addr, _rx, _dp, upf_seid) = established_session().await;
-        assert_eq!(server.teids.in_use(), 0, "PDR 1's TEID is the SMF's");
+        // #1834: PDR 1's SMF-named TEID 0x1234 is reserved, so the pool holds one.
+        assert_eq!(server.teids.in_use(), 1, "PDR 1's SMF-named TEID");
+        let base = server.teids.in_use();
 
         for seq in 10..15 {
             let resp = exchange(
@@ -6629,7 +6746,7 @@ mod tests {
                 PfcpCause::RuleCreationModificationFailure as u8,
                 "Update FAR 99 names no rule of the session"
             );
-            assert_eq!(server.teids.in_use(), 0, "rejection {seq} holds no TEID");
+            assert_eq!(server.teids.in_use(), base, "rejection {seq} holds no TEID");
         }
 
         // An Update PDR's CHOOSE in a rejected message is given back too.
@@ -6644,7 +6761,7 @@ mod tests {
             response_cause(&resp),
             PfcpCause::RuleCreationModificationFailure as u8
         );
-        assert_eq!(server.teids.in_use(), 0, "the Update PDR's TEID is back");
+        assert_eq!(server.teids.in_use(), base, "the Update PDR's TEID is back");
 
         // An unknown SEID: the TEIDs were chosen before the lookup failed.
         let resp = exchange(
@@ -6657,7 +6774,11 @@ mod tests {
             response_cause(&resp),
             PfcpCause::SessionContextNotFound as u8
         );
-        assert_eq!(server.teids.in_use(), 0, "nothing held for an unknown SEID");
+        assert_eq!(
+            server.teids.in_use(),
+            base,
+            "nothing held for an unknown SEID"
+        );
 
         // Control: accepted, the same PDRs hold two TEIDs (one per CHOOSE ID).
         let resp = exchange(
@@ -6667,7 +6788,7 @@ mod tests {
         )
         .await;
         assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
-        assert_eq!(server.teids.in_use(), 2, "CHOOSE ID 7 and PDR 0x72");
+        assert_eq!(server.teids.in_use(), base + 2, "CHOOSE ID 7 and PDR 0x72");
     }
 
     /// **#1815.** A chosen TEID is held while a PDR detects on it and given back
@@ -6677,6 +6798,8 @@ mod tests {
     #[tokio::test]
     async fn a_chosen_teid_is_held_until_no_pdr_detects_on_it_1815() {
         let (server, smf, addr, _rx, _dp, upf_seid) = established_session().await;
+        // #1834: PDR 1's SMF-named TEID is held too.
+        let base = server.teids.in_use();
         let modify = |seq: u32, body: Vec<u8>| encode_pfcp(52, Some(upf_seid), seq, &body);
         let remove_pdr = |id: u16| {
             let mut r = crate::n4_build::PfcpMessageBuilder::new();
@@ -6688,21 +6811,26 @@ mod tests {
 
         let resp = exchange(&smf, addr, &modify(10, choosing_modification_1815(false))).await;
         assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
-        assert_eq!(server.teids.in_use(), 2);
+        assert_eq!(server.teids.in_use(), base + 2);
 
         let resp = exchange(&smf, addr, &modify(11, remove_pdr(0x70))).await;
         assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
         assert_eq!(
             server.teids.in_use(),
-            2,
+            base + 2,
             "PDR 0x71 still detects on CHOOSE ID 7's TEID"
         );
 
         let resp = exchange(&smf, addr, &modify(12, remove_pdr(0x71))).await;
         assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
-        assert_eq!(server.teids.in_use(), 1, "no PDR detects on it any more");
+        assert_eq!(
+            server.teids.in_use(),
+            base + 1,
+            "no PDR detects on it any more"
+        );
 
-        // PDR 0x72 moves to a TEID the SMF names: its chosen one goes back.
+        // PDR 0x72 moves to a TEID the SMF names: its chosen one goes back, and
+        // the SMF's 0x7777 is held in its place (#1834).
         let mut upd = crate::n4_build::PfcpMessageBuilder::new();
         upd.add_pdr_id(0x72);
         upd.add_tlv(pfcp_ie::PDI, &pdi_1682(0, Some(f_teid_1682(0x7777)), None));
@@ -6712,8 +6840,8 @@ mod tests {
         assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
         assert_eq!(
             server.teids.in_use(),
-            0,
-            "the moved PDR's chosen TEID is back"
+            base + 1,
+            "the moved PDR's chosen TEID is back, and 0x7777 is held"
         );
 
         // A fresh CHOOSE, then the session goes, and its TEID with it.
@@ -6721,13 +6849,13 @@ mod tests {
         b.add_tlv(pfcp_ie::CREATE_PDR, &create_pdr_1815(0x73, &[0x05]));
         let resp = exchange(&smf, addr, &modify(14, b.build())).await;
         assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
-        assert_eq!(server.teids.in_use(), 1);
+        assert_eq!(server.teids.in_use(), base + 2);
         let resp = exchange(&smf, addr, &encode_pfcp(54, Some(upf_seid), 15, &[])).await;
         assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
         assert_eq!(
             server.teids.in_use(),
             0,
-            "the deleted session's TEID is back"
+            "every TEID the deleted session held is back, the SMF-named ones too"
         );
     }
 
@@ -6801,6 +6929,175 @@ mod tests {
             0,
             "the association's sessions' TEIDs are back"
         );
+    }
+
+    /// An establishment from the test SMF (CP F-SEID `cp_seid`) whose PDRs name
+    /// the F-TEIDs `teids` (`None` means CH: the UPF chooses).
+    fn establishment_1834(cp_seid: u64, teids: &[Option<u32>]) -> Vec<u8> {
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        b.add_f_seid(&crate::n4_build::FSeid {
+            seid: cp_seid,
+            ipv4: Some(Ipv4Addr::new(127, 0, 0, 9)),
+            ipv6: None,
+        });
+        for (i, teid) in teids.iter().enumerate() {
+            let f = match teid {
+                Some(t) => f_teid_1682(*t),
+                None => vec![0x05],
+            };
+            b.add_tlv(pfcp_ie::CREATE_PDR, &create_pdr_1815(1 + i as u16, &f));
+        }
+        b.add_tlv(pfcp_ie::CREATE_FAR, &far_body(1, 0x02));
+        b.build()
+    }
+
+    /// The F-TEID of the Created PDR `pdr_id` in a response.
+    fn created_teid_1834(resp: &[u8], pdr_id: u16) -> Option<u32> {
+        let (_, body) = ParsedPfcpHeader::parse(resp).ok()?;
+        ParsedIe::find_all_ies(&ParsedIe::parse_all(body), pfcp_ie::CREATED_PDR)
+            .iter()
+            .find_map(|c| {
+                let inner = ParsedIe::parse_all(&c.value);
+                let id = ParsedIe::find_ie(&inner, pfcp_ie::PDR_ID)?;
+                (u16::from_be_bytes([id.value[0], id.value[1]]) == pdr_id).then_some(())?;
+                let f = ParsedIe::find_ie(&inner, pfcp_ie::F_TEID)?;
+                crate::n4_build::ParsedFTeid::parse(&f.value)
+                    .ok()
+                    .map(|f| f.teid)
+            })
+    }
+
+    /// **#1834, TS 29.244 §5.5.3.** A TEID the SMF names itself is held in the
+    /// pool, so a later CHOOSE skips it: session A names the very TEID the pool
+    /// would hand out next, and session B's CHOOSE gets a different one. Before,
+    /// the pool knew only the TEIDs it chose, and gave B session A's tunnel.
+    #[tokio::test]
+    async fn an_smf_named_teid_is_never_chosen_for_another_session_1834() {
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        let assoc = build_association_setup_request_payload(Some(1));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        let next = TeidPool::FIRST;
+        let resp = exchange(
+            &smf,
+            addr,
+            &encode_pfcp(50, Some(0), 2, &establishment_1834(0xA, &[Some(next)])),
+        )
+        .await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(server.teids.in_use(), 1, "A's SMF-named TEID is held");
+
+        let resp = exchange(
+            &smf,
+            addr,
+            &encode_pfcp(50, Some(0), 3, &establishment_1834(0xB, &[None])),
+        )
+        .await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        let chosen = created_teid_1834(&resp, 1).expect("B's chosen F-TEID");
+        assert_ne!(chosen, next, "the pool skips the TEID session A named");
+        assert_eq!(chosen, next + 1);
+    }
+
+    /// **#1834.** A TEID another session holds, named by the SMF, is refused with
+    /// a rule failure naming the PDR and applies nothing: in an establishment
+    /// (no session stored, no TEID kept), and in a modification's Create PDR. PDRs
+    /// of ONE session may share an SMF-named TEID, at establishment and later. Once
+    /// the holder is deleted, the TEID may be named again.
+    #[tokio::test]
+    async fn a_teid_another_session_holds_is_refused_1834() {
+        let (server, smf, addr, _rx, _dp, a_seid) = established_session().await;
+        let held = server.teids.in_use();
+        let sessions = || server.sessions.try_read().expect("sessions").len();
+
+        // An establishment naming A's 0x1234 (after a CHOOSE, which goes back).
+        let resp = exchange(
+            &smf,
+            addr,
+            &encode_pfcp(
+                50,
+                Some(0),
+                20,
+                &establishment_1834(0xB, &[None, Some(0x1234)]),
+            ),
+        )
+        .await;
+        assert_eq!(
+            (response_cause(&resp), failed_rule_id(&resp)),
+            (
+                PfcpCause::RuleCreationModificationFailure as u8,
+                Some(vec![0x00, 0x00, 0x02])
+            ),
+            "PDR 2 names session A's TEID"
+        );
+        assert_eq!(sessions(), 1, "no session B");
+        assert_eq!(server.teids.in_use(), held, "and no TEID kept for it");
+
+        // Two PDRs of one session sharing an SMF-named TEID is fine.
+        let resp = exchange(
+            &smf,
+            addr,
+            &encode_pfcp(
+                50,
+                Some(0),
+                21,
+                &establishment_1834(0xC, &[Some(0x5555), Some(0x5555)]),
+            ),
+        )
+        .await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(server.teids.in_use(), held + 1);
+        let c_seid = *server
+            .sessions
+            .try_read()
+            .unwrap()
+            .keys()
+            .find(|k| **k != a_seid)
+            .unwrap();
+
+        // A modification of C creating a PDR on A's TEID: refused, nothing applied.
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(
+            pfcp_ie::CREATE_PDR,
+            &create_pdr_1815(0x77, &f_teid_1682(0x1234)),
+        );
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(c_seid), 22, &b.build())).await;
+        assert_eq!(
+            (response_cause(&resp), failed_rule_id(&resp)),
+            (
+                PfcpCause::RuleCreationModificationFailure as u8,
+                Some(vec![0x00, 0x00, 0x77])
+            )
+        );
+        assert!(!server.sessions.try_read().unwrap()[&c_seid]
+            .rules
+            .pdr_ids
+            .contains(&0x77));
+
+        // ... while a PDR on C's own 0x5555, and one on a free TEID, are accepted.
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(
+            pfcp_ie::CREATE_PDR,
+            &create_pdr_1815(0x78, &f_teid_1682(0x5555)),
+        );
+        b.add_tlv(
+            pfcp_ie::CREATE_PDR,
+            &create_pdr_1815(0x79, &f_teid_1682(0x6666)),
+        );
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(c_seid), 23, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(server.teids.in_use(), held + 2, "0x6666 is now C's");
+
+        // A goes; its TEID may be named again.
+        let resp = exchange(&smf, addr, &encode_pfcp(54, Some(a_seid), 24, &[])).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        let resp = exchange(
+            &smf,
+            addr,
+            &encode_pfcp(50, Some(0), 25, &establishment_1834(0xD, &[Some(0x1234)])),
+        )
+        .await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
     }
 
     /// **#1815.** The pool skips a TEID still held when its cursor wraps, and
@@ -10114,6 +10411,81 @@ mod tests {
         buf.to_vec()
     }
 
+    /// **#1822 item 1 (#1741, TS 29.244 §6.3.3).** A well-formed TSC Management
+    /// Information in a modification REJECTED for another reason (Update FAR 99,
+    /// which the session does not hold) is not applied: no bridge is created, an
+    /// existing bridge gains no port, and the response echoes no TSC IE. The
+    /// malformed-PMIC test above never reaches this gate, because a malformed IE
+    /// is not collected at all.
+    #[tokio::test]
+    async fn a_rejected_modification_applies_no_tsc_management_information_1822() {
+        let (server, smf, addr, _rx, _dp, upf_seid) = established_session().await;
+        let bridge_ports = |server: &PfcpServer| {
+            let sessions = server.sessions.try_read().expect("sessions");
+            sessions
+                .get(&upf_seid)
+                .expect("session")
+                .tsn_bridge
+                .as_ref()
+                .map(|b| {
+                    let mut ports: Vec<u32> =
+                        b.port_management_containers.keys().copied().collect();
+                    ports.sort_unstable();
+                    ports
+                })
+        };
+        let rejected = |seq: u32, port: u32| {
+            let mut b = crate::n4_build::PfcpMessageBuilder::new();
+            b.add_tlv(
+                pfcp_ie::TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_MODIFICATION_REQUEST,
+                &tsc_ie(Some((&[0x77], port)), None),
+            );
+            b.add_tlv(pfcp_ie::UPDATE_FAR, &far_body(99, 0x02));
+            encode_pfcp(52, Some(upf_seid), seq, &b.build())
+        };
+
+        let resp = exchange(&smf, addr, &rejected(20, 8)).await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::RuleCreationModificationFailure as u8
+        );
+        assert_eq!(
+            bridge_ports(&server),
+            None,
+            "no bridge from a rejected message"
+        );
+        let (_h, payload) = ParsedPfcpHeader::parse(&resp).unwrap();
+        assert!(
+            ParsedIe::find_all_ies(
+                &ParsedIe::parse_all(payload),
+                pfcp_ie::TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_MODIFICATION_RESPONSE,
+            )
+            .is_empty(),
+            "a rejected response echoes no TSC configuration"
+        );
+
+        // With a bridge in place, a rejected message adds no port to it.
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(
+            pfcp_ie::TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_MODIFICATION_REQUEST,
+            &tsc_ie(Some((&[0x55], 3)), None),
+        );
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 21, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(bridge_ports(&server), Some(vec![3]), "control: applied");
+
+        let resp = exchange(&smf, addr, &rejected(22, 9)).await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::RuleCreationModificationFailure as u8
+        );
+        assert_eq!(
+            bridge_ports(&server),
+            Some(vec![3]),
+            "the rejected message's port 9 is not applied"
+        );
+    }
+
     /// A modification with no TSC IE leaves `tsn_bridge` alone, so no existing
     /// session acquires a bridge as a side effect of this feature.
     #[tokio::test]
@@ -10514,7 +10886,11 @@ mod tests {
             ipv4: Some(SMF_NODE),
             ipv6: None,
         });
-        b.add_tlv(pfcp_ie::CREATE_PDR, &pdr_body(1, 100, 1, 1, 1));
+        // #1834: each session on its own SMF-named TEID.
+        b.add_tlv(
+            pfcp_ie::CREATE_PDR,
+            &pdr_body_on(1, 100, 1, 1, 1, 0x2000 + cp_seid as u32),
+        );
         b.add_tlv(pfcp_ie::CREATE_FAR, &far_body(1, 0x02));
         let resp = exchange(smf, upf, &encode_pfcp(50, Some(0), 50, &b.build())).await;
         assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
