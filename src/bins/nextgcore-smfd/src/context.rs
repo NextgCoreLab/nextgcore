@@ -1794,6 +1794,11 @@ pub struct NetworkPaging {
     /// paging is in progress re-invokes the transfer there (#1705, TS 23.502
     /// §4.2.3.3 step 3a).
     pub amf_uri: Option<String>,
+    /// The AMF temporarily rejected the transfer (#1706, TS 23.502 §4.2.3.3 step 3b:
+    /// a registration or handover is ongoing). `started` is then when the guard
+    /// timer started; the next message from an AMF re-invokes the transfer there,
+    /// and the guard's expiry ends the paging (step 3c).
+    pub temporarily_rejected: bool,
 }
 
 impl NetworkPaging {
