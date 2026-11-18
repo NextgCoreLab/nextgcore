@@ -38216,6 +38216,7 @@ mod tests {
             reported_connectivity: std::collections::HashMap::new(),
             reported_location: None,
             taken_over: false,
+            rep_period: None,
             reporting_threshold: None,
             location_filters: f.iter().map(|s| s.to_string()).collect(),
         };
@@ -38682,6 +38683,266 @@ mod tests {
         );
         sink.stop().await.expect("sink stop");
         store.remove(id);
+    }
+
+    /// #1819: a LOCATION_REPORT subscription with `options` `trigger` and, when
+    /// given, `repPeriod`, plus an `expiry` when given. Returns the sink, its
+    /// receiver and the subscribe response.
+    async fn periodic_location_subscription(
+        supi: &str,
+        tag: &str,
+        options: serde_json::Value,
+    ) -> (
+        nextgcore_sbi::SbiServer,
+        mpsc::Receiver<String>,
+        nextgcore_sbi::SbiResponse,
+    ) {
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let (tx, rx) = mpsc::channel::<String>(16);
+        let sink = nextgcore_sbi::SbiServer::on_listener(
+            nextgcore_sbi::SbiServerConfig::new(format!("127.0.0.1:{port}").parse().expect("addr")),
+            listener,
+        );
+        sink.start(move |req: nextgcore_sbi::SbiRequest| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(req.http.content.clone().unwrap_or_default()).await;
+                nextgcore_sbi::SbiResponse::no_content()
+            }
+        })
+        .await
+        .expect("sink start");
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let resp = crate::namf_server::namf_request_handler(
+            nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&serde_json::json!({
+                    "subscription": {
+                        "eventList": [{ "type": "LOCATION_REPORT" }],
+                        "eventNotifyUri": format!("http://127.0.0.1:{port}/notify/{tag}"),
+                        "notifyCorrelationId": format!("corr-{tag}"),
+                        "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                        "supi": supi,
+                        "options": options,
+                    }
+                }))
+                .expect("json"),
+        )
+        .await;
+        (sink, rx, resp)
+    }
+
+    /// A CM-CONNECTED registered UE `supi` at TAC 0x1819, cell 0x1_8191, stored as
+    /// `id`.
+    fn store_connected_ue_1819(id: u64, supi: &str) {
+        let mut stored = idle_registered_ue(id);
+        stored.cm_idle = false;
+        stored.amf_ue.supi = Some(supi.to_string());
+        stored.amf_ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        stored.amf_ue.nr_tai.tac = 0x1819;
+        stored.amf_ue.nr_cgi.plmn_id = PlmnId::new("001", "01");
+        stored.amf_ue.nr_cgi.cell_id = 0x0001_8191;
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().expect("ctx lock");
+        guard.amf_ue_publish(&stored.amf_ue, 51, 1);
+        guard.ue_store().insert(id, stored);
+    }
+
+    /// **#1819**, TS 29.518 §5.3.2.2.2 (`29518-k00.txt:5731-5737`) and Table
+    /// 6.2.6.2.6-1: a PERIODIC LOCATION_REPORT subscription is told the UE's
+    /// location at the subscription and then every `repPeriod`, with nothing
+    /// changing in between. Its unsubscribe stops the timer at once, and no report
+    /// follows.
+    ///
+    /// REVERT-VERIFIED: with the `spawn_periodic_location_reports` call in
+    /// `handle_event_subscription_create` removed, only the first report arrives
+    /// ("a periodic LOCATION_REPORT with no location change"); with the
+    /// `cancel_periodic_location_reports` call removed from the unsubscribe, the
+    /// timer still runs ("the unsubscribe stops the timer").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_periodic_location_subscription_is_told_every_period_1819() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (id, supi) = (18_190_101u64, "imsi-001010001819101");
+        store_connected_ue_1819(id, supi);
+        let (sink, mut rx, resp) = periodic_location_subscription(
+            supi,
+            "1819-periodic",
+            serde_json::json!({ "trigger": "PERIODIC", "repPeriod": 1 }),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).expect("JSON");
+        assert_eq!(v["subscription"]["options"]["trigger"], "PERIODIC", "{v}");
+        assert_eq!(v["subscription"]["options"]["repPeriod"], 1, "{v}");
+        let sub_id = v["subscriptionId"].as_str().expect("id").to_string();
+
+        let (got, tac, nci) = next_location_report(&mut rx).await;
+        assert_eq!(got, supi);
+        assert_eq!((tac.as_str(), nci.as_str()), ("1819", "000018191"));
+        let started = std::time::Instant::now();
+        let body = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("a periodic LOCATION_REPORT with no location change")
+            .expect("channel closed");
+        assert!(
+            started.elapsed() >= Duration::from_millis(500),
+            "on the period, not at once"
+        );
+        let report: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(
+            report["reportList"][0]["location"]["nrLocation"]["ncgi"]["nrCellId"], "000018191",
+            "{report}"
+        );
+
+        let deleted = crate::namf_server::namf_request_handler(nextgcore_sbi::SbiRequest::delete(
+            format!("/namf-evts/v1/subscriptions/{sub_id}"),
+        ))
+        .await;
+        assert_eq!(deleted.status, 204);
+        assert!(
+            !crate::namf_server::periodic_location_timer_running(&sub_id),
+            "the unsubscribe stops the timer"
+        );
+        while rx.try_recv().is_ok() {}
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1500), rx.recv())
+                .await
+                .is_err(),
+            "no report after the unsubscribe"
+        );
+        sink.stop().await.expect("sink stop");
+        crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .ue_store()
+            .remove(id);
+    }
+
+    /// **#1819**: a location change is reported to a CONTINUOUS subscription (the
+    /// positive control) and not to a PERIODIC one, which is told on its period
+    /// only. And a PERIODIC subscription's timer stops at its expiry.
+    ///
+    /// REVERT-VERIFIED: with the `rep_period` gate removed from
+    /// `fire_location_change_report`, the PERIODIC subscriber is told the change
+    /// ("a PERIODIC subscription is not told a change"); with the expiry arm removed
+    /// from the timer, it still runs ("the timer stops at the expiry").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_periodic_location_subscription_is_not_told_changes_1819() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (id, supi) = (18_190_201u64, "imsi-001010001819201");
+        store_connected_ue_1819(id, supi);
+        let expiry = crate::namf_server::system_time_to_rfc3339(
+            std::time::SystemTime::now() + Duration::from_secs(2),
+        );
+        let (psink, mut prx, presp) = periodic_location_subscription(
+            supi,
+            "1819-p",
+            serde_json::json!({ "trigger": "PERIODIC", "repPeriod": 60, "expiry": expiry }),
+        )
+        .await;
+        assert_eq!(presp.status, 201);
+        let pv: serde_json::Value =
+            serde_json::from_str(presp.http.content.as_deref().unwrap_or("{}")).expect("JSON");
+        let p_id = pv["subscriptionId"].as_str().expect("id").to_string();
+        let (csink, mut crx, cresp) = periodic_location_subscription(
+            supi,
+            "1819-c",
+            serde_json::json!({ "trigger": "CONTINUOUS" }),
+        )
+        .await;
+        assert_eq!(cresp.status, 201);
+        let _c = crate::namf_server::EventSubscriptionGuard::of(&cresp);
+        let _p = crate::namf_server::EventSubscriptionGuard::of(&presp);
+        // Both first reports.
+        next_location_report(&mut prx).await;
+        next_location_report(&mut crx).await;
+
+        // The UE moves to TAC 0x181A.
+        let ue = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            let mut ue = guard.amf_ue_find_by_supi(supi).expect("ue");
+            ue.nr_tai.tac = 0x181A;
+            guard.amf_ue_update(&ue);
+            ue
+        };
+        let now = (ue.nr_tai.clone(), ue.nr_cgi.clone(), 1);
+        crate::namf_server::fire_location_change_report(
+            &ue,
+            crate::context::LocationChange {
+                tai: true,
+                cell: false,
+                ran_node: false,
+            },
+            &now,
+        );
+        let (_, tac, _) = next_location_report(&mut crx).await;
+        assert_eq!(tac, "181A", "the CONTINUOUS subscriber is told the change");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), prx.recv())
+                .await
+                .is_err(),
+            "a PERIODIC subscription is not told a change"
+        );
+
+        assert!(crate::namf_server::periodic_location_timer_running(&p_id));
+        let mut stopped = false;
+        for _ in 0..40 {
+            if !crate::namf_server::periodic_location_timer_running(&p_id) {
+                stopped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(stopped, "the timer stops at the expiry");
+        psink.stop().await.expect("sink stop");
+        csink.stop().await.expect("sink stop");
+        crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .ue_store()
+            .remove(id);
+    }
+
+    /// **#1819**: PERIODIC without `repPeriod` (Table 6.2.6.2.6-1: "shall be present
+    /// if the trigger is set to PERIODIC") is refused 400 MANDATORY_IE_MISSING, and a
+    /// zero period MANDATORY_IE_INCORRECT; nothing is stored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_periodic_subscription_needs_a_rep_period_1819() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let before = crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .event_subscription_count();
+        for (options, cause) in [
+            (
+                serde_json::json!({ "trigger": "PERIODIC" }),
+                "MANDATORY_IE_MISSING",
+            ),
+            (
+                serde_json::json!({ "trigger": "PERIODIC", "repPeriod": 0 }),
+                "MANDATORY_IE_INCORRECT",
+            ),
+        ] {
+            let (sink, _rx, resp) =
+                periodic_location_subscription("imsi-001010001819301", "1819-bad", options).await;
+            assert_eq!(resp.status, 400);
+            let v: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).expect("JSON");
+            assert_eq!(v["cause"], cause, "{v}");
+            sink.stop().await.expect("sink stop");
+        }
+        assert_eq!(
+            crate::context::amf_self()
+                .read()
+                .expect("ctx lock")
+                .event_subscription_count(),
+            before
+        );
     }
 
     /// **#1737**: the first report is the subscription's own baseline. The UE's
@@ -39839,6 +40100,7 @@ mod tests {
             reported_connectivity: std::collections::HashMap::new(),
             reported_location: None,
             taken_over: false,
+            rep_period: None,
             reporting_threshold: None,
             location_filters: Vec::new(),
         };
@@ -44599,6 +44861,7 @@ mod tests {
                 reported_connectivity: std::collections::HashMap::new(),
                 reported_location: None,
                 taken_over: false,
+                rep_period: None,
                 reporting_threshold: None,
                 location_filters: Vec::new(),
             });
@@ -44731,6 +44994,7 @@ mod tests {
                 reported_connectivity: std::collections::HashMap::new(),
                 reported_location: None,
                 taken_over: false,
+                rep_period: None,
                 reporting_threshold: None,
                 location_filters: Vec::new(),
             });

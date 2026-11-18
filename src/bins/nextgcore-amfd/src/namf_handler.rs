@@ -740,6 +740,7 @@ pub fn handle_event_subscribe(
         reported_connectivity: std::collections::HashMap::new(),
         reported_location: None,
         taken_over: false,
+        rep_period: None,
         reporting_threshold: None,
         location_filters: subscription
             .location_filter_list

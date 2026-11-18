@@ -1270,6 +1270,14 @@ pub struct EventSubscription {
     /// de-duplication: a consumer's own subscription to this AMF is a different
     /// resource, even when it is the one the transferred copy came from.
     pub taken_over: bool,
+    /// #1819: `options.repPeriod` of a PERIODIC subscription (TS 29.518 Table
+    /// 6.2.6.2.6-1 AmfEventMode, `29518-k00.txt:22306-22307`: "shall be present if
+    /// the trigger is set to PERIODIC"). Set, its LOCATION_REPORT is made every
+    /// period after the first report rather than on a location change (§5.3.2.2.2,
+    /// `:5731-5737`: "subsequent event notifications when the user location changes
+    /// or according to the requested period respectively"). `None` for ONE_TIME and
+    /// CONTINUOUS.
+    pub rep_period: Option<std::time::Duration>,
 }
 
 /// A UE location as the LOCATION_REPORT change gate compares it (#1424, #1737): the
@@ -2150,6 +2158,14 @@ impl AmfContext {
     }
 
     /// Get number of AMF UEs
+    /// #1819: the ids of every AMF UE, for an any-UE PERIODIC LOCATION_REPORT.
+    pub fn amf_ue_ids(&self) -> Vec<u64> {
+        self.amf_ue_list
+            .read()
+            .map(|l| l.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
     pub fn amf_ue_count(&self) -> usize {
         self.amf_ue_list.read().map(|l| l.len()).unwrap_or(0)
     }

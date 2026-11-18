@@ -1961,13 +1961,225 @@ fn subscription_echo_json(sub: &EventSubscription) -> Value {
     if sub.any_ue {
         subscription["anyUE"] = json!(true);
     }
-    if let Some(expiry) = sub.expiry {
+    // #1819: a PERIODIC subscription echoes (and transfers) its mode and period,
+    // so a target AMF taking it over keeps reporting on the period.
+    if let Some(period) = sub.rep_period {
+        let mut options = json!({ "trigger": "PERIODIC", "repPeriod": period.as_secs() });
+        if let Some(expiry) = sub.expiry {
+            options["expiry"] = json!(system_time_to_rfc3339(expiry));
+        }
+        subscription["options"] = options;
+    } else if let Some(expiry) = sub.expiry {
         subscription["options"] = json!({
             "trigger": "CONTINUOUS",
             "expiry": system_time_to_rfc3339(expiry),
         });
     }
     subscription
+}
+
+/// #1819: `options.repPeriod` when `options.trigger` is PERIODIC (TS 29.518 Table
+/// 6.2.6.2.6-1, `29518-k00.txt:22306-22307`): required then, a `DurationSec` of at
+/// least 1. `Ok(None)` for any other trigger, whose repPeriod is not read.
+#[allow(clippy::result_large_err)]
+fn parse_rep_period(subscription: &Value) -> Result<Option<std::time::Duration>, Box<SbiResponse>> {
+    if subscription
+        .pointer("/options/trigger")
+        .and_then(Value::as_str)
+        != Some("PERIODIC")
+    {
+        return Ok(None);
+    }
+    match subscription.pointer("/options/repPeriod") {
+        None | Some(Value::Null) => Err(Box::new(mandatory_ie_missing(
+            "subscription.options.repPeriod",
+        ))),
+        Some(v) => match v.as_u64().filter(|s| *s >= 1) {
+            Some(secs) => Ok(Some(std::time::Duration::from_secs(secs))),
+            None => Err(Box::new(mandatory_ie_incorrect(
+                "subscription.options.repPeriod",
+                "not a DurationSec of at least 1",
+            ))),
+        },
+    }
+}
+
+/// #1819: the period of a transferred subscription (an `eventSubscriptionList`
+/// entry, TS 29.518 §6.1.6.2.25), read as the subscribe path reads it. A PERIODIC
+/// entry without a usable repPeriod is taken over as CONTINUOUS and logged: the
+/// subscription is still the consumer's, and refusing it would drop its reports.
+fn transferred_rep_period(entry: &Value) -> Option<std::time::Duration> {
+    match parse_rep_period(entry) {
+        Ok(period) => period,
+        Err(_) => {
+            log::warn!(
+                "transferred PERIODIC event subscription carries no usable repPeriod; taken \
+                 over as CONTINUOUS"
+            );
+            None
+        }
+    }
+}
+
+/// #1819: the running PERIODIC LOCATION_REPORT timers, by subscription id, so the
+/// unsubscribe can stop one at once. Each timer also stops by itself at the
+/// subscription's expiry, and at its next period once the subscription is gone by
+/// any other path. At most one per stored subscription.
+fn periodic_location_timers(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, tokio::task::AbortHandle>> {
+    static TIMERS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, tokio::task::AbortHandle>>,
+    > = std::sync::OnceLock::new();
+    TIMERS.get_or_init(Default::default)
+}
+
+/// #1819: stop `subscription_id`'s PERIODIC LOCATION_REPORT timer, if it runs.
+fn cancel_periodic_location_reports(subscription_id: &str) {
+    if let Some(timer) = periodic_location_timers()
+        .lock()
+        .ok()
+        .and_then(|mut t| t.remove(subscription_id))
+    {
+        timer.abort();
+    }
+}
+
+/// #1819: whether `subscription_id`'s PERIODIC LOCATION_REPORT timer runs.
+#[cfg(test)]
+pub(crate) fn periodic_location_timer_running(subscription_id: &str) -> bool {
+    periodic_location_timers()
+        .lock()
+        .is_ok_and(|t| t.contains_key(subscription_id))
+}
+
+/// #1819: start `sub`'s PERIODIC LOCATION_REPORT timer when it is a PERIODIC
+/// LOCATION_REPORT subscription. Every `rep_period` it reports the current
+/// location of each UE the subscription targets, until the subscription expires,
+/// is unsubscribed, or is otherwise gone. The first report (at the subscription)
+/// is made by the subscribe path, so the first tick is one period in.
+fn spawn_periodic_location_reports(sub: &EventSubscription) {
+    let Some(period) = sub.rep_period else {
+        return;
+    };
+    if !sub.event_types.iter().any(|t| t == "LOCATION_REPORT") {
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        log::debug!("PERIODIC LOCATION_REPORT: no tokio runtime, no timer");
+        return;
+    };
+    let id = sub.subscription_id.clone();
+    let task_id = id.clone();
+    let task = handle.spawn(async move {
+        let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let expiry = amf_self()
+                .read()
+                .ok()
+                .and_then(|g| g.event_subscription_find(&task_id))
+                .map(|s| s.expiry);
+            let Some(expiry) = expiry else {
+                break;
+            };
+            let until_expiry = expiry.map(|e| {
+                e.duration_since(std::time::SystemTime::now())
+                    .unwrap_or_default()
+            });
+            tokio::select! {
+                _ = timer.tick() => {}
+                _ = tokio::time::sleep(until_expiry.unwrap_or_default()), if until_expiry.is_some() => break,
+            }
+            let Some(sub) = amf_self()
+                .read()
+                .ok()
+                .and_then(|g| g.event_subscription_find(&task_id))
+                .filter(|s| s.expiry.is_none_or(|e| e > std::time::SystemTime::now()))
+            else {
+                break;
+            };
+            for report in periodic_location_reports(&sub) {
+                deliver_location_report(sub.clone(), report);
+            }
+        }
+        if let Ok(mut t) = periodic_location_timers().lock() {
+            t.remove(&task_id);
+        }
+        log::debug!("PERIODIC LOCATION_REPORT timer of {task_id} stopped");
+    });
+    if let Ok(mut t) = periodic_location_timers().lock() {
+        if let Some(old) = t.insert(id, task.abort_handle()) {
+            old.abort();
+        }
+    }
+}
+
+/// #1819: one period's LOCATION_REPORTs for `sub`: the current location of each
+/// registered UE it targets (the one UE it names, or every UE for an any-UE
+/// subscription; repPeriod "shall be applied to each individual member UE",
+/// Table 6.2.6.2.6-1). For a CM-IDLE UE that is the last known location, with
+/// `ageOfLocationInformation` the minutes since it was acquired (at least 1), as
+/// the first report does. The UE is not paged for a periodic report.
+fn periodic_location_reports(sub: &EventSubscription) -> Vec<Value> {
+    let ctx = amf_self();
+    let Ok(guard) = ctx.read() else {
+        return Vec::new();
+    };
+    let ues: Vec<AmfUe> = if sub.any_ue {
+        guard
+            .amf_ue_ids()
+            .into_iter()
+            .filter_map(|id| guard.amf_ue_find_by_id(id))
+            .collect()
+    } else {
+        sub.supi
+            .as_deref()
+            .and_then(|s| guard.amf_ue_find_by_supi(s))
+            .or_else(|| {
+                sub.gpsi
+                    .as_deref()
+                    .and_then(|g| guard.amf_ue_find_by_gpsi(g))
+            })
+            .or_else(|| sub.pei.as_deref().and_then(|p| guard.amf_ue_find_by_pei(p)))
+            .into_iter()
+            .collect()
+    };
+    let registered: Vec<(AmfUe, bool)> = ues
+        .into_iter()
+        .filter_map(|ue| {
+            let record = guard.ue_store().get(ue.id).filter(|r| r.is_registered())?;
+            Some((ue, record.is_cm_idle()))
+        })
+        .collect();
+    drop(guard);
+    registered
+        .iter()
+        .map(|(ue, idle)| periodic_location_report(ue, *idle))
+        .collect()
+}
+
+fn periodic_location_report(ue: &AmfUe, cm_idle: bool) -> Value {
+    let mut location = nr_location_json(ue);
+    if cm_idle {
+        let minutes = location_acquired_at(ue)
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| d.as_secs() / 60)
+            .unwrap_or(0)
+            .clamp(1, 32_767);
+        location["nrLocation"]["ageOfLocationInformation"] = json!(minutes);
+    }
+    let mut report = build_event_report(
+        "LOCATION_REPORT",
+        ue.supi.as_deref(),
+        json!({ "location": location }),
+    );
+    if let Some(gpsi) = ue.gpsi.as_deref() {
+        report["gpsi"] = json!(gpsi);
+    }
+    if let Some(pei) = ue.pei.as_deref() {
+        report["pei"] = json!(pei);
+    }
+    report
 }
 
 /// POST /namf-evts/v1/subscriptions — Namf_EventExposure_Subscribe
@@ -2209,6 +2421,12 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
         None => None,
     };
 
+    // #1819: the PERIODIC mode's period. Refused before anything is stored.
+    let rep_period = match parse_rep_period(subscription) {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+
     let subscription_id = format!("sub-{}", uuid::Uuid::new_v4());
     let sub = EventSubscription {
         subscription_id: subscription_id.clone(),
@@ -2231,6 +2449,7 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
         reported_connectivity: std::collections::HashMap::new(),
         reported_location: None,
         taken_over: false,
+        rep_period,
         reporting_threshold,
         location_filters,
     };
@@ -2292,6 +2511,8 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
     if let Some(report) = first_location {
         deliver_location_report(sub.clone(), report);
     }
+    // #1819: a PERIODIC LOCATION_REPORT is then made every repPeriod.
+    spawn_periodic_location_reports(&sub);
 
     log::info!(
         "Event subscription created: id={subscription_id}, events={:?}, notifyUri={notify_uri}",
@@ -2560,6 +2781,8 @@ fn handle_event_subscription_delete(subscription_id: &str) -> SbiResponse {
         };
         guard.event_subscription_remove(subscription_id)
     };
+    // #1819: its PERIODIC LOCATION_REPORT timer stops with it.
+    cancel_periodic_location_reports(subscription_id);
     match removed {
         Some(_) => {
             log::info!("Event subscription removed: {subscription_id}");
@@ -2795,6 +3018,11 @@ pub fn fire_location_change_report(
         ue.pei.as_deref(),
         json!({ "location": nr_location_json(ue) }),
         |ctx, sub| {
+            // #1819: a PERIODIC subscription is reported on its period, not on a
+            // change (TS 29.518 §5.3.2.2.2, `29518-k00.txt:5731-5737`).
+            if sub.rep_period.is_some() {
+                return false;
+            }
             let change = match ctx.event_subscription_take_reported_location(&sub.subscription_id) {
                 Some(told) => crate::context::LocationChange::between(&told, now),
                 None => change,
@@ -4206,6 +4434,7 @@ pub(crate) fn take_over_transferred_event_subscriptions(
             reported_connectivity: std::collections::HashMap::new(),
             reported_location: None,
             taken_over: true,
+            rep_period: transferred_rep_period(entry),
             reporting_threshold: entry.get("eventList").and_then(Value::as_array).and_then(
                 |events| {
                     events
@@ -4251,6 +4480,8 @@ pub(crate) fn take_over_transferred_event_subscriptions(
             }
         }
         created += 1;
+        // #1819: a transferred PERIODIC subscription keeps reporting on its period.
+        spawn_periodic_location_reports(&sub);
 
         // §6.2.6.2.5: an ABSOLUTE URI to the created resource, per §6.2.3.3.2.
         // It was the bare path, which a consumer (udmd, nextgcore#1440) cannot
@@ -8691,6 +8922,7 @@ mod tests {
             reported_connectivity: std::collections::HashMap::new(),
             reported_location: None,
             taken_over: false,
+            rep_period: None,
             reporting_threshold: None,
             location_filters: Vec::new(),
         };
@@ -16806,6 +17038,7 @@ mod tests {
             reported_connectivity: std::collections::HashMap::new(),
             reported_location: None,
             taken_over: false,
+            rep_period: None,
             reporting_threshold: None,
             location_filters: Vec::new(),
         };
