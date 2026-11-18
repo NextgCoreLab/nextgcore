@@ -1,0 +1,25 @@
+# D441D gNB patch (nextgsim#467), applied to both gNB Deployments (gnb, gnb-east):
+# the d440b reference model mounted read-only and the pinned ONNX Runtime path
+# the image ships (build-gnb-image.sh). Used only in mode onnx; inert otherwise
+# (no model is loaded unless gnb-d441d-onnx.yaml wrote nwdaf_model_path).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gnb
+  namespace: nextg-demo
+spec:
+  template:
+    spec:
+      containers:
+        - name: gnb
+          env:
+            - name: ORT_DYLIB_PATH
+              value: /usr/local/lib/onnxruntime/libonnxruntime.so.1.23.2
+          volumeMounts:
+            - name: d441d-model
+              mountPath: /opt/nextgsim/models
+              readOnly: true
+      volumes:
+        - name: d441d-model
+          configMap:
+            name: d441d-model

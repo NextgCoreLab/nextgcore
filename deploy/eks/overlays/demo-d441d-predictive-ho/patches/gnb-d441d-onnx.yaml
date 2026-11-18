@@ -1,0 +1,35 @@
+# Appended (JSON patch `/-`), so it runs AFTER resolve-dns, which writes the
+# final /etc/nextgsim/gnb.yaml (the d440b precedent). Mode onnx only: d441d onnx
+# needs d440b-model-verify in mode verify on the same gNB (DemoConfigError::
+# MissingDependency otherwise) and a model path. The demo post-render merges one
+# key, so the d440b block is added here: before the `  d441d-predictive-ho:`
+# line, inside the same `demo:` mapping. Any other mode leaves the file as it is.
+# A config that already names d440b or a model path fails here rather than run
+# with two values.
+- op: add
+  path: /spec/template/spec/initContainers/-
+  value:
+    name: d441d-onnx
+    image: busybox:1.36
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        f=/etc/nextgsim/gnb.yaml
+        if ! grep -qx '    mode: onnx' "$f"; then
+          echo "[d441d-onnx] mode is not onnx: nothing to add"
+          exit 0
+        fi
+        if grep -qE '^nwdaf_model_path:|^  d440b-model-verify:' "$f"; then
+          echo "[d441d-onnx] FATAL: $f already sets nwdaf_model_path or d440b-model-verify" >&2
+          exit 1
+        fi
+        n="$(grep -cx '  d441d-predictive-ho:' "$f" || true)"
+        [ "$n" = 1 ] || { echo "[d441d-onnx] FATAL: $n d441d-predictive-ho blocks in $f" >&2; exit 1; }
+        sed -i 's/^  d441d-predictive-ho:$/  d440b-model-verify:\n    enabled: true\n    mode: verify\n  d441d-predictive-ho:/' "$f"
+        printf '\n# d441d onnx (nextgsim#467): the d440b reference model\nnwdaf_model_path: /opt/nextgsim/models/nwdaf-trajectory-cv.onnx\n' >>"$f"
+        grep -nE '^(nwdaf_|demo:)' -A6 "$f"
+    volumeMounts:
+      - name: config-resolved
+        mountPath: /etc/nextgsim
