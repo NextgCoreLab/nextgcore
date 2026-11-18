@@ -86,7 +86,7 @@ pub fn set_notify_base(base: Option<String>) {
     }
 }
 
-fn notify_base() -> Option<String> {
+pub(crate) fn notify_base() -> Option<String> {
     NOTIFY_BASE.read().ok().and_then(|b| b.clone())
 }
 
@@ -543,7 +543,7 @@ pub async fn release(sub: &UdmEeSubscription) {
 }
 
 /// Compare two tokens without an early exit on the first differing byte.
-fn tokens_equal(a: &str, b: &str) -> bool {
+pub(crate) fn tokens_equal(a: &str, b: &str) -> bool {
     a.len() == b.len()
         && a.bytes()
             .zip(b.bytes())
@@ -1636,7 +1636,11 @@ mod tests {
             .collect();
         assert_eq!(
             routes,
-            ["POST /nudm-callback/v1/{var}/ee-amf-subs-change/{token}"]
+            [
+                "POST /nudm-callback/v1/{var}/ee-amf-subs-change/{token}",
+                // #1775: the UDR's am-data DataChangeNotify.
+                "POST /nudm-callback/v1/{var}/udr-data-change/{token}",
+            ]
         );
     }
 

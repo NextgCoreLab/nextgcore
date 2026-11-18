@@ -1258,16 +1258,38 @@ fn self_entry_test_lock() -> &'static tokio::sync::Mutex<()> {
 /// otherwise stay REGISTERED and discoverable for the life of the state file,
 /// naming an NRF profile this process does not maintain. Returns whether an
 /// entry was removed.
+///
+/// #1821: the removal is a deregistration like any other, so the subscribers
+/// whose conditions match the entry are told NF_DEREGISTERED (TS 29.510
+/// §5.2.2.6.1), as `handle_nf_deregister` and the no-heartbeat expiry tell
+/// theirs. Before, the entry vanished silently and a subscriber kept it cached.
+/// The subscriptions restored from the same state file are already in the
+/// registry when `main` calls this.
 fn drop_restored_self_entry() -> bool {
-    if nf_manager().get(nrf_instance_id()).is_none() {
+    let Some(profile) = nf_manager().get(nrf_instance_id()) else {
         return false;
-    }
+    };
     match nf_manager().deregister(nrf_instance_id()) {
         Ok(_) => {
             log::info!(
-                "nrfd-187: removed the NRF's own entry {} restored from the state file;                  this configuration does not register the NRF in its own registry",
+                "nrfd-187: removed the NRF's own entry {} restored from the state file; \
+                 this configuration does not register the NRF in its own registry",
                 nrf_instance_id()
             );
+            let server_uri = nrf_self_uri().to_string();
+            tokio::spawn(async move {
+                if let Err(e) = nrf_nnrf_nfm_send_nf_status_notify_all_async(
+                    NotificationEventType::NfDeregistered,
+                    &profile,
+                    &server_uri,
+                )
+                .await
+                {
+                    log::error!(
+                        "Failed to send NF_DEREGISTERED for the NRF's dropped own entry: {e}"
+                    );
+                }
+            });
             true
         }
         Err(e) => {
@@ -5080,7 +5102,7 @@ async fn handle_access_token_request_with_policy(
     let nf_instance_id = req.nf_instance_id;
     let nf_type = req.nf_type;
     let mut target_nf_type = req.target_nf_type;
-    let target_nf_instance_id = req.target_nf_instance_id;
+    let mut target_nf_instance_id = req.target_nf_instance_id;
 
     // RFC 6749 §5.2 error responses, carried as TS 29.510 AccessTokenErr.
     if req.grant_type != "client_credentials" {
@@ -5169,7 +5191,17 @@ async fn handle_access_token_request_with_policy(
             &target_nf_instance_id,
             &req.scope,
         ) {
-            Ok(consumer) => consumer,
+            Ok(consumer) => {
+                // #1750: this grant was authorized on "the target is THIS NRF", so
+                // the exact producer instance is known, and TS 29.510 Table
+                // 6.3.5.2.4-1 then makes `aud` "the NF service producer's NF
+                // instance ID(s) (if the exact NF instance(s) ... is known)", not
+                // the NF type: pin the target to this NRF, so the token names
+                // this NRF's instance and no other NRF trusting this issuer
+                // (another NRF of a set, a peer in the PLMN) accepts it.
+                target_nf_instance_id = nrf_instance_id().to_string();
+                consumer
+            }
             Err(why) => {
                 return token_error(
                     "invalid_client",
@@ -9936,7 +9968,7 @@ mod tests {
     }
 
     /// [`mint_nrf_token`] with any `aud` and `scope`.
-    fn mint_nrf_token_with(
+    pub(super) fn mint_nrf_token_with(
         sub: &str,
         aud: &serde_json::Value,
         scope: &str,
@@ -12802,6 +12834,107 @@ mod nrf_api_tokens_tests_1667 {
             }
         }
     }
+
+    /// The claims of a token the endpoint answered with.
+    fn claims_of(resp: &SbiResponse) -> (String, serde_json::Value) {
+        use base64::Engine;
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap();
+        let token = v["access_token"]
+            .as_str()
+            .expect("access_token")
+            .to_string();
+        let payload = token.split('.').nth(1).expect("JWS payload");
+        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .expect("base64url");
+        (token, serde_json::from_slice(&claims).expect("claims JSON"))
+    }
+
+    /// #1750: the bootstrap grant is authorized on "the target is this NRF", so
+    /// the exact producer is known and `aud` is this NRF's instance ID (TS 29.510
+    /// Table 6.3.5.2.4-1), however the target was named: by `targetNfType: NRF`
+    /// or by this NRF's instance ID. The gate admits it; a token naming another
+    /// NRF's instance, or the NRF type of a peer set, is not one for this NRF
+    /// unless it names this instance or the type. A registered consumer asking
+    /// by type still gets the type: its producer set is every registered NRF.
+    ///
+    /// REVERT-VERIFIED: without the pin in `handle_access_token_request`, the
+    /// `targetNfType: NRF` grant has `aud: "NRF"` and the first assertion names it.
+    #[tokio::test]
+    async fn the_bootstrap_token_names_this_nrf_instance_as_audience_1750() {
+        let _self_entry = self_entry_test_lock().lock().await;
+        let id = "1750c0c0-0000-4000-8000-00000000000c";
+        assert!(nf_manager().get(id).is_none(), "unregistered");
+        let policy = NrfPolicy::default();
+        let jwks = nrf_jwks_json();
+        let nfm = format!("/nnrf-nfm/v1/nf-instances/{id}");
+        for target in [
+            json!({"targetNfType": "NRF"}),
+            json!({"targetNfInstanceId": nrf_instance_id()}),
+            json!({"targetNfType": "NRF", "targetNfInstanceId": nrf_instance_id()}),
+        ] {
+            let resp = handle_access_token_request_with_policy(
+                &token_req(id, "AMF", target.clone(), "nnrf-nfm", Some((id, &["AMF"]))),
+                &policy,
+            )
+            .await;
+            assert_eq!(resp.status, 200, "{target}: {}", error_of(&resp));
+            let (token, claims) = claims_of(&resp);
+            assert_eq!(
+                claims["aud"],
+                json!([nrf_instance_id()]),
+                "{target}: the bootstrap token's audience is this NRF instance"
+            );
+            assert_eq!(claims["sub"], json!(id));
+            let sub = oauth2_gate(&nfm, Some(&format!("Bearer {token}")), true, &jwks)
+                .unwrap_or_else(|r| panic!("{target}: gate refused {}", r.status));
+            assert_eq!(sub.as_deref(), Some(id));
+        }
+        assert!(nf_manager().get(id).is_none(), "a token registers nothing");
+
+        // Another NRF's instance ID: signed by this NRF's key, still not a token
+        // for this NRF.
+        let other_nrf = "1750eeee-0000-4000-8000-0000000000f0";
+        let foreign = super::tests::mint_nrf_token_with(id, &json!([other_nrf]), "nnrf-nfm", 3600);
+        let refused = *oauth2_gate(&nfm, Some(&format!("Bearer {foreign}")), true, &jwks)
+            .expect_err("another NRF's audience");
+        assert_eq!(refused.status, 403, "{:?}", refused.http.content);
+        assert!(
+            refused
+                .http
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("ACCESS_TOKEN_CLAIM_MISMATCH"),
+            "{:?}",
+            refused.http.content
+        );
+
+        // A registered consumer asking by type: unchanged, the NF type.
+        let registered = "1750d0d0-0000-4000-8000-00000000000d";
+        nf_manager()
+            .register(
+                NfProfile::from_json(&json!({"nfInstanceId": registered, "nfType": "AMF",
+                    "nfStatus": "REGISTERED"}))
+                .expect("profile"),
+            )
+            .expect("stored");
+        let resp = handle_access_token_request_with_policy(
+            &token_req(
+                registered,
+                "AMF",
+                json!({"targetNfType": "NRF"}),
+                "nnrf-nfm",
+                Some((registered, &["AMF"])),
+            ),
+            &policy,
+        )
+        .await;
+        nf_manager().deregister(registered).ok();
+        assert_eq!(resp.status, 200, "{}", error_of(&resp));
+        assert_eq!(claims_of(&resp).1["aud"], json!("NRF"));
+    }
 }
 
 /// #1719: the registrant's `nfSetIdList` under `nrf.nf_set_allowlist`, through
@@ -13277,5 +13410,106 @@ mod unverified_registrant_tests_1617 {
             "the NRF's own entry is gone"
         );
         assert!(!drop_restored_self_entry(), "nothing left to remove");
+    }
+
+    /// **#1821, TS 29.510 §5.2.2.6.1.** Dropping the restored self entry tells a
+    /// subscriber to that entry NF_DEREGISTERED, over the wire, exactly once: the
+    /// second call finds nothing and sends nothing. Before, the entry vanished
+    /// with no notification.
+    ///
+    /// The subscription names the NRF's own instance, and every test that adds or
+    /// removes that entry holds `self_entry_test_lock`, so no other test's change
+    /// reaches this sink.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_the_restored_self_entry_notifies_nf_deregistered_1821() {
+        use std::sync::Mutex as StdMutex;
+        let _self_entry = self_entry_test_lock().lock().await;
+
+        let received: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::clone(&received);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let subscriber = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), listener);
+        subscriber
+            .start(move |req: SbiRequest| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    if let Some(body) = req.http.content.clone() {
+                        sink.lock().expect("sink lock").push(body);
+                    }
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await
+            .expect("subscriber server starts");
+
+        register_self_with_own_registry();
+        let manager = nf_manager();
+        let sub_id = "nrfd1821-self-entry-sub";
+        manager.add_subscription(nextgcore_nrfd::SubscriptionData {
+            id: sub_id.to_string(),
+            req_nf_type: None,
+            req_nf_instance_id: None,
+            notification_uri: format!("http://127.0.0.1:{}/callback", addr.port()),
+            subscr_cond: Some(nextgcore_nrfd::nnrf_handler::SubscrCond::nf_instance_id(
+                nrf_instance_id(),
+            )),
+            validity_duration: 3600,
+            req_notif_events: None,
+            notif_condition: None,
+        });
+
+        let wait_for = |want: usize| {
+            let received = Arc::clone(&received);
+            async move {
+                for _ in 0..100 {
+                    if received.lock().expect("sink lock").len() >= want {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                received.lock().expect("sink lock").clone()
+            }
+        };
+
+        assert!(drop_restored_self_entry(), "the restored entry is removed");
+        let got = wait_for(1).await;
+        assert_eq!(got.len(), 1, "one notification, got {got:?}");
+        let body: serde_json::Value = serde_json::from_str(&got[0]).expect("JSON");
+        assert_eq!(body["event"], "NF_DEREGISTERED");
+        assert!(
+            body["nfInstanceUri"]
+                .as_str()
+                .is_some_and(|u| u.ends_with(&format!("/nf-instances/{}", nrf_instance_id()))),
+            "it names the NRF's own instance: {body}"
+        );
+
+        assert!(!drop_restored_self_entry(), "nothing left to remove");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            received.lock().expect("sink lock").len(),
+            1,
+            "a second call finds nothing and sends nothing"
+        );
+        manager.remove_subscription(sub_id);
+    }
+
+    /// **#1821.** `main` drops the restored self entry exactly when the NRF does
+    /// not register itself: the `else` of the self-registration choice. A source
+    /// guard, because `main` itself cannot run in a unit test.
+    #[test]
+    fn main_drops_the_restored_self_entry_when_it_does_not_register_itself_1821() {
+        let source = include_str!("main.rs");
+        let main = &source[source.find("async fn main()").expect("main")..];
+        let main = &main[..main.find("\n}\n").expect("its end")];
+        let choice = "    } else if self_registers {\n";
+        let at = main.find(choice).expect("the self-registration choice");
+        let branch = &main[at + choice.len()..];
+        let branch = &branch[..branch.find("\n    }\n").expect("its end")];
+        assert!(
+            branch.trim_end().ends_with(
+                "register_self_with_own_registry();\n    } else {\n        drop_restored_self_entry();"
+            ),
+            "the else branch drops the restored entry: {branch}"
+        );
     }
 }

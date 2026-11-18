@@ -677,6 +677,13 @@ async fn handle_dm_subscribe(req: &SbiRequest) -> SbiResponse {
         );
     }
 
+    // #1808: from here until the 201 is returned, a cancelled request (the
+    // consumer's client went away) rolls the subscription back: the consumer never
+    // learns its resource URI, so nothing could ever delete it.
+    let rollback = SubscribeRollback {
+        sub_id: Some(sub_id.clone()),
+    };
+
     // TS 23.288 §5A.2: collect once, share to many. Off by default; see
     // `coordination.rs` for why this is a runtime switch and not a cargo feature.
     // A coordination failure does not fail the consumer's subscription: the
@@ -685,10 +692,45 @@ async fn handle_dm_subscribe(req: &SbiRequest) -> SbiResponse {
     let outcome = coordination::ensure_producer_subscription(&sub_id, &scope, &sub).await;
     log::debug!("[DCCF] coordination for {sub_id}: {outcome:?}");
 
+    rollback.disarm();
     SbiResponse::created()
         .with_header("Location", format!("{DM_SUBSCRIPTIONS_PATH}/{sub_id}"))
         .with_json_body(&sub)
         .unwrap_or_else(|_| SbiResponse::created())
+}
+
+/// #1808 (failure-path check 3, cancellation after a side effect): a stored consumer
+/// subscription whose subscribe request is dropped before it answers. On drop while
+/// armed, the subscription is removed and its producer claim released, on a task
+/// of its own ([`remove_consumer_subscription`]): a producer subscription still
+/// being created for it is deleted when that create completes (#1755). Disarmed
+/// once the 201 is built. Outside a runtime there is nothing to cancel.
+struct SubscribeRollback {
+    sub_id: Option<String>,
+}
+
+impl SubscribeRollback {
+    fn disarm(mut self) {
+        self.sub_id = None;
+    }
+}
+
+impl Drop for SubscribeRollback {
+    fn drop(&mut self) {
+        let Some(sub_id) = self.sub_id.take() else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        log::info!(
+            "[DCCF] subscribe {sub_id} cancelled before it answered; the subscription is \
+             rolled back"
+        );
+        spawn_detached(async move {
+            remove_consumer_subscription(&sub_id).await;
+        });
+    }
 }
 
 /// `PUT /ndccf-datamanagement/v1/subscriptions/{subscriptionId}` —
@@ -2186,9 +2228,14 @@ mod data_management_tests {
     /// the next consumer of the scope creates a producer subscription instead of
     /// reusing one that is never made.
     ///
-    /// REVERT-VERIFIED: with `InFlightClaim`'s drop not abandoning, the next claim is
-    /// `Reused` onto the wedged entry. Since #1755 the claim outlives the cancelled
-    /// request (its create runs on its own task) and is abandoned when that fails.
+    /// #1808: the cancelled subscribe is rolled back, which releases its claim at
+    /// once, so the scope is free for the next consumer before the create fails.
+    ///
+    /// REVERT-VERIFIED (#1808): with `SubscribeRollback` disarmed, the claim stays
+    /// held after the cancel ("the cancelled subscribe's claim is released"). The
+    /// abandon-on-failure that #1747 added here is now guarded by
+    /// `a_failed_create_is_abandoned_on_every_path_1747`: a cancelled subscribe no
+    /// longer reaches it with a claim still held.
     #[test]
     fn r7_cancelled_create_wedges_scope() {
         let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
@@ -2223,13 +2270,12 @@ mod data_management_tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             task.abort();
             assert!(task.await.unwrap_err().is_cancelled());
-            // #1755: the create is owned by its own task, so cancelling the consumer's
-            // request leaves it in flight rather than abandoning it under a producer
-            // that may already have accepted it.
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // #1808: the cancelled subscribe is rolled back, and with it its claim, so
+            // the scope is free at once; its create still runs on its own task (#1755)
+            // and deletes what it made when it completes.
             assert!(
-                context::dccf_context_holds_producer_sub(&scope),
-                "still in flight on its own task after the consumer's request is cancelled"
+                eventually(|| !context::dccf_context_holds_producer_sub(&scope)).await,
+                "the cancelled subscribe's claim is released"
             );
             // The NRF drops its connections: discovery fails, and the task abandons.
             hold.abort();
@@ -2295,19 +2341,36 @@ mod data_management_tests {
         tokio::time::timeout(Duration::from_secs(5), arrived.notified())
             .await
             .expect("the producer receives the create");
+        let id = context::dccf_context_subscription_ids()[0].clone();
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        context::dccf_context_subscription_ids()[0].clone()
+        id
     }
 
-    /// #1755 (failure-path check 3): a consumer subscribe cancelled while the
-    /// producer holds its 201 still records the producer subscription, so the
-    /// consumer's later unsubscribe deletes it at the producer.
+    /// Wait (bounded) until `cond` holds.
+    async fn eventually(mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..300 {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cond()
+    }
+
+    /// #1808, #1755 (failure-path check 3, cancellation after a side effect): a
+    /// consumer subscribe cancelled while the producer holds its 201 never answered
+    /// the consumer, which so never learned its resource URI. The stored consumer
+    /// subscription is rolled back at once, and the producer subscription it claimed
+    /// is deleted when the producer's late 201 arrives, so neither is orphaned. A
+    /// later unsubscribe of that id finds nothing.
     ///
-    /// REVERT-VERIFIED: with the create awaited inline again, the claim is abandoned
-    /// on cancel, nothing is recorded and the unsubscribe sends no DELETE.
+    /// REVERT-VERIFIED: with `SubscribeRollback` disarmed at once, the consumer
+    /// subscription outlives the cancelled request ("rolled back") and no DELETE
+    /// reaches the producer; with the create awaited inline again (#1755), the late
+    /// 201 is never read and the producer sees no DELETE.
     #[test]
-    fn a_subscribe_cancelled_mid_post_still_records_the_producer_subscription_1755() {
+    fn a_subscribe_cancelled_mid_post_is_rolled_back_and_its_late_201_deleted_1808() {
         let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         init();
         clear_subscriptions();
@@ -2317,42 +2380,28 @@ mod data_management_tests {
             coordinate_via(nrf_port);
             let scope = targeted_scope();
             let id = subscribe_then_cancel_mid_post(&arrived).await;
-
-            release.notify_one();
-            let mut recorded = None;
-            for _ in 0..300 {
-                recorded = context::dccf_context_producer_resource(&scope);
-                if recorded.is_some() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            assert_eq!(
-                recorded.as_deref(),
-                Some(
-                    format!("http://127.0.0.1:{producer_port}/namf-evts/v1/subscriptions/held")
-                        .as_str()
-                ),
-                "the producer's late 201 is recorded against the claim"
+            assert!(
+                eventually(|| !dccf_context_has_subscription(&id)).await,
+                "the cancelled subscribe is rolled back"
             );
 
-            assert!(remove_consumer_subscription(&id).await);
-            let mut deleted = false;
-            for _ in 0..300 {
-                deleted = seen
-                    .lock()
+            release.notify_one();
+            let deleted = eventually(|| {
+                seen.lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .iter()
-                    .any(|(m, p)| m == "DELETE" && p.ends_with("/subscriptions/held"));
-                if deleted {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+                    .any(|(m, p)| m == "DELETE" && p.ends_with("/subscriptions/held"))
+            })
+            .await;
             assert!(
                 deleted,
-                "the unsubscribe deletes it: {:?}",
+                "the late 201 is deleted: {:?}",
                 seen.lock().unwrap()
+            );
+            assert!(!context::dccf_context_holds_producer_sub(&scope));
+            assert!(
+                !remove_consumer_subscription(&id).await,
+                "nothing is left to unsubscribe"
             );
             coordination::set_coordination_for_test(None);
             producer.stop().await.ok();
@@ -2361,43 +2410,30 @@ mod data_management_tests {
         clear_subscriptions();
     }
 
-    /// #1755: a subscribe cancelled mid-POST whose consumer then unsubscribes while
-    /// the producer still holds the 201: the late 201 is deleted at the producer.
-    ///
-    /// REVERT-VERIFIED: with the create awaited inline again, the 201 is never read
-    /// and the producer sees no DELETE.
+    /// #1808: a subscribe that answers is not rolled back (the guard is disarmed
+    /// before the 201), with coordination on and a producer that answers at once.
     #[test]
-    fn a_subscribe_cancelled_mid_post_then_unsubscribed_deletes_the_late_201_1755() {
+    fn an_answered_subscribe_is_kept_1808() {
         let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         init();
         clear_subscriptions();
         futures_lite_block_on(async {
-            let (producer, producer_port, seen, arrived, release) = holding_producer().await;
+            let (producer, producer_port, _seen) = stub(|_req: SbiRequest| async move {
+                SbiResponse::created().with_header("Location", "http://127.0.0.1:9/s/1")
+            })
+            .await;
             let (nrf, nrf_port) = nrf_for(producer_port).await;
             coordinate_via(nrf_port);
-            let scope = targeted_scope();
-            let id = subscribe_then_cancel_mid_post(&arrived).await;
+            let resp = dccf_request_handler(
+                SbiRequest::post("/ndccf-datamanagement/v1/subscriptions")
+                    .with_body(targeted_body("corr-1808"), "application/json"),
+            )
+            .await;
+            assert_eq!(resp.status, 201);
+            let id = context::dccf_context_subscription_ids()[0].clone();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(dccf_context_has_subscription(&id), "kept after its 201");
             assert!(remove_consumer_subscription(&id).await);
-
-            release.notify_one();
-            let mut deleted = false;
-            for _ in 0..300 {
-                deleted = seen
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .iter()
-                    .any(|(m, p)| m == "DELETE" && p.ends_with("/subscriptions/held"));
-                if deleted {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            assert!(
-                deleted,
-                "the late 201 is deleted: {:?}",
-                seen.lock().unwrap()
-            );
-            assert!(!context::dccf_context_holds_producer_sub(&scope));
             coordination::set_coordination_for_test(None);
             producer.stop().await.ok();
             nrf.stop().await.ok();

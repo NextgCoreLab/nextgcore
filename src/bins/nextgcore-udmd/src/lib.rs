@@ -19,6 +19,7 @@ pub mod nes_driver; // issue #22 Network Energy Saving runtime (off by default)
 pub mod notify; // #83 Nudm_SDM Data Change Notification / Nudm_EE Event Occurrence
 pub mod nudm_handler;
 pub mod sbi_path;
+pub mod sdm_udr; // #1775 TS 23.502 §4.5.1: the UDR's am-data change, notified to the AMF
 /// Wave-6 F-04: Steering-of-Roaming injection into Nudm_SDM am-data via the
 /// real Nausf_SoRProtection producer (TS 33.501 §6.14.2.1, TS 29.503/29.509).
 pub mod sor;
