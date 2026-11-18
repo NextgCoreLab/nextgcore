@@ -8482,6 +8482,50 @@ mod tests {
         assert_eq!(claims["sub"], lower);
     }
 
+    /// #1684, the NRF's half: its trust-store loader (`TrustedKeySet::read_dir`),
+    /// reading the directory over and over while an NF republishes its key there,
+    /// finds that NF's key on every pass, and never takes the publisher's temporary
+    /// file for an entry.
+    ///
+    /// REVERT-VERIFIED: with `publish_cca_public_jwk` writing in place
+    /// (`std::fs::write`), a pass misses the key.
+    #[test]
+    fn the_trust_store_loader_always_finds_a_key_being_republished_1684() {
+        let dir = std::env::temp_dir().join(format!(
+            "nrfd1684-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        let id = "16841684-0000-4000-8000-000000000001";
+        let key = nextgcore_sbi::oauth::generate_es256_key();
+        nextgcore_sbi::oauth::publish_cca_public_jwk(&key, id, &dir).expect("publish");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (dir, stop, key) = (dir.clone(), std::sync::Arc::clone(&stop), key.clone());
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    nextgcore_sbi::oauth::publish_cca_public_jwk(&key, id, &dir)
+                        .expect("republish");
+                }
+            })
+        };
+        for pass in 0..500 {
+            let found = TrustedKeySet::read_dir(&dir, None).expect("readable");
+            assert_eq!(found.keys.len(), 1, "pass {pass}: exactly the one entry");
+            assert_eq!(
+                found.keys.get(id),
+                Some(key.verifying_key()),
+                "pass {pass}: the key is found"
+            );
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().expect("writer");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// **#1657 review m2.** Two trust-store entries that spell one UUID in
     /// different case and hold DIFFERENT keys are trusted neither, in the inline
     /// list, in `cca_trusted_keys_dir` at load, and in the on-disk lookup of a
