@@ -3385,7 +3385,9 @@ pub async fn call_lmf_cancel_location(
     // 403 LOCATION_SESSION_UNKNOWN is the LMF saying the LDR is already gone, which is
     // the outcome the consumer asked for. Treated as success so a duplicate
     // cancellation is not reported as a failure.
-    if response.status == 403 {
+    // #1766: unless it is the LMF's OAuth2 gate refusing our token, which is not
+    // the LDR being gone.
+    if response.status == 403 && !response.is_bearer_refusal() {
         log::debug!(
             "LMF has no active LDR [{ldr_reference}]; the cancellation is already in effect"
         );
@@ -4381,6 +4383,15 @@ pub async fn call_nsacf_ue_admission(
     let admitted = match response.status {
         // All requested S-NSSAIs admitted.
         204 => true,
+        // #1766: the NSACF's OAuth2 gate refusing our token is not an admission
+        // decision; it degrades open like any other unexpected answer.
+        401 | 403 if response.is_bearer_refusal() => {
+            log::warn!(
+                "NSACF refused the AMF's access token ({}), admitting (degrade-open)",
+                response.status
+            );
+            true
+        }
         // Total failure (ProblemDetails) -> not admitted.
         403 => false,
         // Partial failure: UeACResponseData.acuFailureList keyed by SUPI. Our
@@ -5672,6 +5683,14 @@ mod tests {
         assert!(op["snssai"]["sst"].is_u64(), "op carries snssai");
 
         match supi.as_str() {
+            // #1766: what the NSACF's OAuth2 gate answers for a token whose scope
+            // lacks nnsacf-nsac.
+            "imsi-scope" => nextgcore_sbi::message::SbiResponse::with_status(403)
+                .with_body(r#"{"status":403}"#, "application/problem+json")
+                .with_header(
+                    "WWW-Authenticate",
+                    r#"Bearer realm="5gc-sbi", error="insufficient_scope", scope="nnsacf-nsac""#,
+                ),
             "imsi-reject" => nextgcore_sbi::message::SbiResponse::with_status(403).with_body(
                 serde_json::json!({"status": 403, "cause": "ALL_SLICE_FAILED"}).to_string(),
                 "application/problem+json",
@@ -5736,6 +5755,25 @@ mod tests {
             .expect("ok");
             assert!(!r.admitted, "403 -> not admitted");
 
+            // #1766: a 403 from the NSACF's OAuth2 gate is not an admission
+            // decision, so it degrades open like any other unexpected answer.
+            let r = call_nsacf_ue_admission(
+                "127.0.0.1",
+                port,
+                "amf-1",
+                "imsi-scope",
+                1,
+                None,
+                "3GPP_ACCESS",
+                true,
+            )
+            .await
+            .expect("ok");
+            assert!(
+                r.admitted,
+                "403 insufficient_scope -> degrade-open, admitted"
+            );
+
             // 200 acuFailureList naming our SUPI -> not admitted.
             let r = call_nsacf_ue_admission(
                 "127.0.0.1",
@@ -5750,6 +5788,59 @@ mod tests {
             .await
             .expect("ok");
             assert!(!r.admitted, "200 acuFailureList[supi] -> not admitted");
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("round trip timed out");
+        server.stop().await.ok();
+    }
+
+    /// #1766: CancelLocation treats the LMF's 403 LOCATION_SESSION_UNKNOWN as the
+    /// cancellation already being in effect, and must not read the LMF's OAuth2
+    /// gate refusing our token (also a 403, since #1766) the same way.
+    #[tokio::test]
+    async fn lmf_cancel_location_403_bearer_refusal_is_not_already_gone_1766() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        server
+            .start(|req: nextgcore_sbi::message::SbiRequest| async move {
+                let body: serde_json::Value = req
+                    .http
+                    .content
+                    .as_deref()
+                    .and_then(|c| serde_json::from_str(c).ok())
+                    .unwrap_or_default();
+                let problem = nextgcore_sbi::message::SbiResponse::with_status(403);
+                match body["ldrReference"].as_str() {
+                    Some("ldr-gone") => problem.with_body(
+                        r#"{"status":403,"cause":"LOCATION_SESSION_UNKNOWN"}"#,
+                        "application/problem+json",
+                    ),
+                    Some("ldr-scope") => problem
+                        .with_body(r#"{"status":403}"#, "application/problem+json")
+                        .with_header(
+                            "WWW-Authenticate",
+                            r#"Bearer realm="5gc-sbi", error="insufficient_scope", scope="nlmf-loc""#,
+                        ),
+                    _ => nextgcore_sbi::message::SbiResponse::with_status(204),
+                }
+            })
+            .await
+            .expect("start stub LMF");
+        let lmf = ("127.0.0.1", addr.port());
+        let cancel = |ldr: &'static str| {
+            call_lmf_cancel_location(lmf, "imsi-1", ldr, "http://gmlc/cb", None)
+        };
+        let run = async {
+            assert_eq!(cancel("ldr-gone").await, Ok(()), "LOCATION_SESSION_UNKNOWN");
+            let err = cancel("ldr-scope")
+                .await
+                .expect_err("a refused token is a failure");
+            assert!(err.contains("status 403"), "{err}");
         };
         tokio::time::timeout(std::time::Duration::from_secs(10), run)
             .await

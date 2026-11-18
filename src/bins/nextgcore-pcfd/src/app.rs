@@ -15320,7 +15320,7 @@ mod oauth2_h8_tests {
     }
 
     #[tokio::test]
-    async fn test_oauth2_wrong_audience_rejected_401() {
+    async fn test_oauth2_wrong_audience_rejected_403() {
         let sk = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
         let (server, port) = start_server(jwks_for(&sk, "nrf-es256")).await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
@@ -15331,7 +15331,7 @@ mod oauth2_h8_tests {
             .await
             .expect("bounded")
             .expect("response");
-        assert_eq!(resp.status, 401, "wrong-audience token must be 401");
+        assert_eq!(resp.status, 403, "wrong-audience token must be 403 (#1766)");
         server.stop().await.expect("stop");
     }
 

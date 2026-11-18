@@ -34423,7 +34423,7 @@ mod oauth2_h8_tests {
     }
 
     #[tokio::test]
-    async fn test_oauth2_wrong_audience_rejected_401() {
+    async fn test_oauth2_wrong_audience_rejected_403() {
         // #779: this test reads and writes the process-wide SMF context (sessions,
         // policy bindings), so it holds the ambient lock like every other reader and
         // writer (the #308 rule); `smf_context_init` checks that it is held.
@@ -34438,7 +34438,7 @@ mod oauth2_h8_tests {
             .await
             .expect("bounded")
             .expect("response");
-        assert_eq!(resp.status, 401, "wrong-audience token must be 401");
+        assert_eq!(resp.status, 403, "wrong-audience token must be 403 (#1766)");
         server.stop().await.expect("stop");
     }
 

@@ -7129,7 +7129,7 @@ mod oauth2_h8_tests {
     }
 
     #[tokio::test]
-    async fn test_oauth2_wrong_audience_rejected_401() {
+    async fn test_oauth2_wrong_audience_rejected_403() {
         // `start_server` re-initialises the process-global LMF context, which
         // empties the cell registry: without the lock that raced every test
         // that seeds coordinates (the a_capability_report_is_recorded_and_is_not_
@@ -7145,7 +7145,7 @@ mod oauth2_h8_tests {
             .await
             .expect("bounded")
             .expect("response");
-        assert_eq!(resp.status, 401, "wrong-audience token must be 401");
+        assert_eq!(resp.status, 403, "wrong-audience token must be 403 (#1766)");
         server.stop().await.expect("stop");
     }
 

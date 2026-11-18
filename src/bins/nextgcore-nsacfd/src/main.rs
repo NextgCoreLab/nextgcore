@@ -2848,7 +2848,7 @@ nsacf:
             .await
             .expect("bounded")
             .expect("response");
-        assert_eq!(resp.status, 401, "wrong-audience token must be 401");
+        assert_eq!(resp.status, 403, "wrong-audience token must be 403 (#1766)");
 
         server.stop().await.expect("stop");
     }
