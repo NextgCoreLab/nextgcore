@@ -12,8 +12,8 @@
 #     not match any certificate.
 #   - <nfType> is the nfType the daemon puts in its NFProfile, in the
 #     TS 29.510 §6.1.6.3.3 enumeration that TS 33.310 §6.1.3c.3 requires for
-#     NFTypes (mbsmfd registers "MB_SMF"; #1680 tracks the "MBSMF" spelling
-#     still used by nextgcore_sbi::NfType and its instance-ID variable).
+#     NFTypes (mbsmfd registers "MB_SMF", which nextgcore_sbi::NfType and its
+#     instance-ID variable NEXTGCORE_MB_SMF_INSTANCE_ID also use since #1680).
 # check-nf-identities.py fails CI when a compose file pins a different ID.
 #
 # <addresses> is a comma-separated list of the NF's IP addresses on the
