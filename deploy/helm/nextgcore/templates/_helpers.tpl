@@ -43,8 +43,17 @@ namespace do not cross-register.
 {{ .Release.Name }}-nrf.{{ .Release.Namespace }}.svc.cluster.local
 {{- end }}
 
+{{/*
+The NRF serves TLS (#1617): every NF dials it over https, presenting its own
+certificate. There is no plaintext NRF to opt back into: the NRF refuses NF
+management from a client without a verified certificate identity. An explicit
+global.sbi.scheme other than https fails the render rather than being ignored.
+*/}}
 {{- define "nextgcore.nrfUri" -}}
-{{ .Values.global.sbi.scheme }}://{{ include "nextgcore.nrfHost" . }}:{{ .Values.global.sbi.port }}
+{{- if and .Values.global.sbi.scheme (ne .Values.global.sbi.scheme "https") -}}
+{{- fail (printf "global.sbi.scheme=%s: the NRF serves TLS only (#1617), so every NF dials https://; unset it" .Values.global.sbi.scheme) -}}
+{{- end -}}
+https://{{ include "nextgcore.nrfHost" . }}:{{ .Values.global.sbi.port }}
 {{- end }}
 
 {{/*
@@ -210,23 +219,132 @@ livenessProbe:
 {{- end }}
 
 {{/*
-The AMF's nfInstanceId (#753): .Values.amf.nfInstanceId, or a UUID derived from
-the cluster (global.siteId, else the kube-system namespace UID), the release
-namespace and its name. Stable across pod restarts and upgrades, unlike uuidv4.
-Offline rendering (`helm template`) has no cluster to look up: set
-global.siteId or amf.nfInstanceId there, or the id differs from the one a
-`helm install` would render.
+The nfType each NF registers (TS 29.510 §6.1.6.3.3), the one its certificate
+names in RFC 9310 NFTypes, and so the <TYPE> of its NEXTGCORE_<TYPE>_INSTANCE_ID.
 */}}
-{{- define "nextgcore.amfInstanceId" -}}
-{{- if .Values.amf.nfInstanceId -}}
-{{- .Values.amf.nfInstanceId -}}
+{{- define "nextgcore.nfType" -}}
+{{- $t := dict "nrf" "NRF" "amf" "AMF" "smf" "SMF" "ausf" "AUSF" "udm" "UDM" "udr" "UDR" "pcf" "PCF" "nssf" "NSSF" "bsf" "BSF" -}}
+{{- required (printf "no nfType for %s" .) (get $t .) -}}
+{{- end -}}
+
+{{/*
+The NFs of this chart that dial the NRF (all but the UPF), and the NRF. Each
+pins an nfInstanceId and mounts Secret nf-tls-<nf> (#1617).
+*/}}
+{{- define "nextgcore.nrfNfs" -}}
+nrf amf smf ausf udm udr pcf nssf bsf
+{{- end -}}
+
+{{/*
+An NF's nfInstanceId: .Values.<nf>.nfInstanceId, or a UUID (version 4 layout)
+derived from global.siteId, the release namespace, its name and the NF (#753,
+#1617). Stable across pod restarts and upgrades, unlike uuidv4, and the same
+under `helm template`, `helm install` and GitOps renderers, so the certificate
+issued for it (deploy/helm/nf-tls-secrets.sh reads the rendered
+<release>-nf-identities ConfigMap) names the ID the NF registers.
+
+The chart used to fall back to the kube-system namespace UID through `lookup`
+when global.siteId was empty. `lookup` is empty under `helm template`, so the
+identities a certificate is issued from would differ from what `helm install`
+pins, and every NF would be refused at the NRF. An empty siteId now fails the
+render for any NF whose id is not pinned.
+
+Call with a dict: {{ include "nextgcore.nfInstanceId" (dict "root" . "nf" "ausf") }}
+*/}}
+{{- define "nextgcore.nfInstanceId" -}}
+{{- $v := index .root.Values .nf -}}
+{{- if $v.nfInstanceId -}}
+{{- if not (regexMatch "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" $v.nfInstanceId) -}}
+{{- fail (printf "%s.nfInstanceId=%s is not a lower-case UUID version 4 (TS 29.571 §5.3.2)" .nf $v.nfInstanceId) -}}
+{{- end -}}
+{{- $v.nfInstanceId -}}
 {{- else -}}
-{{- /* Cluster-unique salt: the kube-system namespace UID (stable for the
-cluster's life), or global.siteId. Two clusters installed with the same
-namespace and release name then still get different AMF ids. */ -}}
-{{- $ks := lookup "v1" "Namespace" "" "kube-system" -}}
-{{- $site := .Values.global.siteId | default (dig "metadata" "uid" "" $ks) -}}
-{{- $h := sha256sum (printf "%s/%s/%s/amf" $site .Release.Namespace .Release.Name) -}}
+{{- if not .root.Values.global.siteId -}}
+{{- fail (printf "global.siteId is empty and %s.nfInstanceId is unset: set global.siteId (unique per cluster, stable for its life). It salts every derived nfInstanceId, and each NF's certificate must name that ID (#753, #1617)" .nf) -}}
+{{- end -}}
+{{- $h := sha256sum (printf "%s/%s/%s/%s" .root.Values.global.siteId .root.Release.Namespace .root.Release.Name .nf) -}}
 {{- printf "%s-%s-4%s-8%s-%s" (substr 0 8 $h) (substr 8 12 $h) (substr 13 16 $h) (substr 17 20 $h) (substr 20 32 $h) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The name of NF <nf>'s Secret: nf-tls-<nf>, or nf-tls-<nf>-<version> once
+global.nrfTls.secretVersion names the version deploy/helm/nf-tls-secrets.sh
+(or k8s/nf-tls-secrets.sh) printed.
+*/}}
+{{- define "nextgcore.nrfTlsSecret" -}}
+{{- $ver := .root.Values.global.nrfTls.secretVersion -}}
+{{- if $ver -}}
+{{- if not (regexMatch "^[0-9a-f]{16}$" $ver) -}}
+{{- fail (printf "global.nrfTls.secretVersion=%s is not the 16 hex digits nf-tls-secrets.sh prints" $ver) -}}
+{{- end -}}
+nf-tls-{{ .nf }}-{{ $ver }}
+{{- else -}}
+nf-tls-{{ .nf }}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Pod securityContext for an NF that mounts its nf-tls Secret: the files are
+mode 0440 to group fsGroup, and every container of the pod runs with fsGroup
+as a supplementary group, so the image's non-root nextgcore user reads its key.
+*/}}
+{{- define "nextgcore.nrfTlsPodSecurity" -}}
+securityContext:
+  fsGroup: 999
+{{- end -}}
+
+{{/*
+The nf-tls volume: NF <nf>'s certificate, its key and the CA certificate (never
+the CA key), mode 0440. Not optional: a pod whose Secret does not exist does not
+start, rather than starting without an identity the NRF would refuse.
+*/}}
+{{- define "nextgcore.nrfTlsVolume" -}}
+- name: nf-tls
+  secret:
+    secretName: {{ include "nextgcore.nrfTlsSecret" . }}
+    defaultMode: 0440
+{{- end -}}
+
+{{- define "nextgcore.nrfTlsMount" -}}
+- name: nf-tls
+  mountPath: /etc/nextgcore/certs
+  readOnly: true
+{{- end -}}
+
+{{/*
+The pinned nfInstanceId, and for an NRF client the NRF TLS client settings: its
+own pair, the CA, and the name the NRF's certificate is verified against
+(global.nrfTls.serverName; the dev nrf.crt names DNS:nrf, not the Service FQDN).
+*/}}
+{{- define "nextgcore.nrfTlsEnv" -}}
+{{- $type := include "nextgcore.nfType" .nf -}}
+# The urn:uuid its certificate names (#753, #1617); listed in ConfigMap
+# <release>-nf-identities.
+- name: NEXTGCORE_{{ $type }}_INSTANCE_ID
+  value: {{ include "nextgcore.nfInstanceId" . | quote }}
+{{- if ne .nf "nrf" }}
+# NF -> NRF over TLS with this pod's own certificate (#1617).
+- name: NEXTGCORE_NRF_TLS_CA
+  value: /etc/nextgcore/certs/ca.crt
+- name: NEXTGCORE_NRF_TLS_CLIENT_CERT
+  value: /etc/nextgcore/certs/{{ .nf }}.crt
+- name: NEXTGCORE_NRF_TLS_CLIENT_KEY
+  value: /etc/nextgcore/certs/{{ .nf }}.key
+{{- with .root.Values.global.nrfTls.serverName }}
+- name: NEXTGCORE_NRF_TLS_SERVER_NAME
+  value: {{ . | quote }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
+One pod per pinned nfInstanceId: two pods under one ID are one NF instance at
+the NRF, and a rolling update's old pod would NFDeregister the ID its
+replacement just registered (#753, #1617).
+*/}}
+{{- define "nextgcore.singleInstance" -}}
+{{- if gt (int (index .root.Values .nf).replicas) 1 -}}
+{{- fail (printf "%s.replicas > 1 is not supported: every pod would share one nfInstanceId and one certificate (#753, #1617). Run one per release." .nf) -}}
 {{- end -}}
 {{- end -}}

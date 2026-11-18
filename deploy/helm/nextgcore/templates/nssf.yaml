@@ -10,6 +10,11 @@ metadata:
     {{- include "nextgcore.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.nssf.replicas }}
+  {{- include "nextgcore.singleInstance" (dict "root" . "nf" "nssf") }}
+  # Recreate: the new pod must not register while the old one, holding the
+  # same nfInstanceId, still shuts down and NFDeregisters it (#753, #1617).
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: nssf
@@ -25,6 +30,7 @@ spec:
         # running, since the Deployment spec is unchanged.
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
+      {{- include "nextgcore.nrfTlsPodSecurity" . | nindent 6 }}
       initContainers:
         {{- include "nextgcore.advertiseInit" (dict "nf" "nssf") | nindent 8 }}
         {{- include "nextgcore.waitForNrf" . | nindent 8 }}
@@ -44,8 +50,10 @@ spec:
             {{- end }}
           {{- include "nextgcore.sbiProbes" . | nindent 10 }}
           volumeMounts:
+            {{- include "nextgcore.nrfTlsMount" . | nindent 12 }}
             {{- include "nextgcore.configMounts" (dict "nf" "nssf" "rewritten" true) | nindent 12 }}
           env:
+            {{- include "nextgcore.nrfTlsEnv" (dict "root" . "nf" "nssf") | nindent 12 }}
             - name: NEXTGCORE_SBI_PROFILE
               # Issue #63: every NF's outbound SBI calls -- including its own NRF
               # registration and discovery -- follow the SBI profile, which
@@ -72,6 +80,7 @@ spec:
                 fieldRef:
                   fieldPath: status.podIP
       volumes:
+        {{- include "nextgcore.nrfTlsVolume" (dict "root" . "nf" "nssf") | nindent 8 }}
         {{- include "nextgcore.configVolumes" . | nindent 8 }}
 ---
 apiVersion: v1

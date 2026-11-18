@@ -5,31 +5,63 @@
 # k8s/monitoring/. Rationale in specs/fix-helm-chart-control-plane.md.
 
 global:
-  # A site/cluster identifier salted into derived NF instance ids (#753). SET
-  # IT: it is the first choice. The fallback when it is empty reads the
-  # kube-system namespace UID with `lookup`, which:
-  #   - needs cluster-wide read on Namespaces (a namespace-scoped installer
-  #     cannot do it);
-  #   - always yields an empty salt under `helm template` and GitOps renderers
-  #     (ArgoCD, `helm template | kubectl apply`), so their ids differ from what
-  #     `helm install` derives for the same release.
-  # Use a value unique per cluster and stable for its life. Required when
-  # several clusters share one UDM/NRF.
+  # A site/cluster identifier salted into every derived NF instance id (#753,
+  # #1617). REQUIRED unless every NF's nfInstanceId is pinned: the render fails
+  # while it is empty. Each NF's certificate names its nfInstanceId, so the ID
+  # must be the same under `helm template` (where certificates are issued from,
+  # see global.nrfTls) as under `helm install`; the old fallback to the
+  # kube-system namespace UID (`lookup`) was empty under `helm template` and is
+  # gone. Use a value unique per cluster and stable for its life. Changing it
+  # changes every derived ID, so every certificate must be re-issued.
   siteId: ""
   image:
     registry: ""
     pullPolicy: IfNotPresent
   sbi:
-    scheme: http
+    # No `scheme`: the NRF serves TLS and every NF dials it over https (#1617).
+    # Setting global.sbi.scheme to anything but https fails the render.
     port: 7777
+  # NF -> NRF over TLS (#1617). The NRF serves its one SBI listener with TLS and
+  # asks each client for a certificate (client auth optional): NFRegister /
+  # NFUpdate / NFDeregister bind to the verified certificate identity, the
+  # urn:uuid:<nfInstanceId> URI SAN and RFC 9310 NFTypes of TS 33.310
+  # §6.1.3c.3. Each NF (and the NRF) mounts Secret nf-tls-<nf>[-<version>]
+  # holding ca.crt, <nf>.crt and <nf>.key (never the CA key), mode 0440 to the
+  # pod's fsGroup. The chart creates no Secret; a pod whose Secret is missing
+  # stays in ContainerCreating rather than starting without an identity.
+  #
+  # Dev certificates: deploy/helm/nf-tls-secrets.sh <release> <namespace>
+  # [your helm values flags] renders the chart, issues one Secret per NF from
+  # the rendered <release>-nf-identities ConfigMap and prints the version to
+  # set below. The CA key never enters the cluster. See README.md.
+  #
+  # Your own PKI (production): issue each NF's certificate for the line of
+  # <release>-nf-identities that names it (URI SAN urn:uuid:<nfInstanceId>,
+  # NFTypes <nfType>, EKU serverAuth+clientAuth), with the NRF's naming
+  # serverName below as a DNS SAN, and create Secret nf-tls-<nf>-<version>
+  # (any 16 hex digits) with keys ca.crt, <nf>.crt, <nf>.key. This is also
+  # what global.sbiProfile=production with OAuth2 needs: since #1667 an NF
+  # needs a proven identity at the NRF before NFRegister, and that proof is
+  # this certificate.
+  nrfTls:
+    # The name the NRF's certificate is verified against. The dev nrf.crt
+    # names DNS:nrf (not the Service FQDN the NFs dial). Empty: the dialled
+    # host, <release>-nrf.<namespace>.svc.cluster.local, which your nrf.crt
+    # must then name.
+    serverName: nrf
+    # The Secret version the pods mount (nf-tls-<nf>-<secretVersion>), as
+    # printed by nf-tls-secrets.sh. Empty: nf-tls-<nf> (what nf-tls-secrets.sh
+    # reads to know which Secrets are needed).
+    secretVersion: ""
   # SBI security profile for amf/smf/ausf/udm (issue #63). Those four default in
   # CODE to "production": mutually-authenticated TLS plus a required OAuth2
   # access token, and they REFUSE TO START without the certificates named by
   # SbiSecurityPolicy::production() rather than falling back to cleartext.
   #
-  # This chart mounts no SBI certificates, so it ships the explicit "dev"
-  # opt-out: cleartext h2c, no client-certificate verification, no token
-  # verification. Set to "production" only once those certs are provisioned and
+  # This chart mounts no SBI server certificates (only the NRF client pair of
+  # global.nrfTls), so it ships the explicit "dev" opt-out for the NF-to-NF SBI:
+  # cleartext h2c, no client-certificate verification, no token verification.
+  # NF -> NRF is TLS regardless (global.nrfTls). Set to "production" only once those certs are provisioned and
   # mounted at /etc/nextgcore/tls/{server.crt,server.key,ca.crt} -- plus the
   # CLIENT pair those NFs present when they DIAL a peer
   # (/etc/nextgcore/tls/{client.crt,client.key}), since under mTLS an NF is both
@@ -126,6 +158,10 @@ hnetKeys:
 nrf:
   enabled: true
   replicas: 1
+  # This NF's nfInstanceId (#1617): empty derives it from global.siteId, the
+  # namespace, the release and the NF. nrf.crt must name it (the
+  # NRF's own OAuth2 client presents nrf.crt only then).
+  nfInstanceId: ""
   image:
     repository: nextgcore-rust/nrf
     tag: latest
@@ -186,6 +222,10 @@ amf:
 smf:
   enabled: true
   replicas: 1
+  # This NF's nfInstanceId (#1617): empty derives it from global.siteId, the
+  # namespace, the release and the NF. Its certificate must name it. One pod
+  # per release: replicas > 1 fails the render (one ID, one certificate).
+  nfInstanceId: ""
   # A graceful SMF shutdown tells every UE (#39) and every SGW and releases each UPF
   # association; SMF_SHUTDOWN_BUDGET_SECS is derived from this (less 2 s).
   terminationGracePeriodSeconds: 45
@@ -245,6 +285,10 @@ upf:
 ausf:
   enabled: true
   replicas: 1
+  # This NF's nfInstanceId (#1617): empty derives it from global.siteId, the
+  # namespace, the release and the NF. Its certificate must name it. One pod
+  # per release: replicas > 1 fails the render (one ID, one certificate).
+  nfInstanceId: ""
   image:
     repository: nextgcore-rust/ausf
     tag: latest
@@ -260,6 +304,10 @@ ausf:
 udm:
   enabled: true
   replicas: 1
+  # This NF's nfInstanceId (#1617): empty derives it from global.siteId, the
+  # namespace, the release and the NF. Its certificate must name it. One pod
+  # per release: replicas > 1 fails the render (one ID, one certificate).
+  nfInstanceId: ""
   image:
     repository: nextgcore-rust/udm
     tag: latest
@@ -275,6 +323,10 @@ udm:
 udr:
   enabled: true
   replicas: 1
+  # This NF's nfInstanceId (#1617): empty derives it from global.siteId, the
+  # namespace, the release and the NF. Its certificate must name it. One pod
+  # per release: replicas > 1 fails the render (one ID, one certificate).
+  nfInstanceId: ""
   image:
     repository: nextgcore-rust/udr
     tag: latest
@@ -290,6 +342,10 @@ udr:
 pcf:
   enabled: true
   replicas: 1
+  # This NF's nfInstanceId (#1617): empty derives it from global.siteId, the
+  # namespace, the release and the NF. Its certificate must name it. One pod
+  # per release: replicas > 1 fails the render (one ID, one certificate).
+  nfInstanceId: ""
   image:
     repository: nextgcore-rust/pcf
     tag: latest
@@ -316,6 +372,10 @@ pcf:
 nssf:
   enabled: true
   replicas: 1
+  # This NF's nfInstanceId (#1617): empty derives it from global.siteId, the
+  # namespace, the release and the NF. Its certificate must name it. One pod
+  # per release: replicas > 1 fails the render (one ID, one certificate).
+  nfInstanceId: ""
   image:
     repository: nextgcore-rust/nssf
     tag: latest
@@ -331,6 +391,10 @@ nssf:
 bsf:
   enabled: true
   replicas: 1
+  # This NF's nfInstanceId (#1617): empty derives it from global.siteId, the
+  # namespace, the release and the NF. Its certificate must name it. One pod
+  # per release: replicas > 1 fails the render (one ID, one certificate).
+  nfInstanceId: ""
   image:
     repository: nextgcore-rust/bsf
     tag: latest

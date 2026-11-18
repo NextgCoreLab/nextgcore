@@ -22,6 +22,7 @@ spec:
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
+      {{- include "nextgcore.nrfTlsPodSecurity" . | nindent 6 }}
       {{- if .Values.mongodb.enabled }}
       initContainers:
         {{- include "nextgcore.waitForMongo" . | nindent 8 }}
@@ -45,8 +46,10 @@ spec:
             {{- end }}
           {{- include "nextgcore.sbiProbes" . | nindent 10 }}
           volumeMounts:
+            {{- include "nextgcore.nrfTlsMount" . | nindent 12 }}
             {{- include "nextgcore.configMounts" (dict "nf" "nrf" "rewritten" false) | nindent 12 }}
           env:
+            {{- include "nextgcore.nrfTlsEnv" (dict "root" . "nf" "nrf") | nindent 12 }}
             - name: RUST_LOG
               value: {{ .Values.global.logLevel }}
             {{- if .Values.nrf.metrics.enabled }}
@@ -58,6 +61,7 @@ spec:
               value: "{{ .Values.nrf.metrics.port }}"
             {{- end }}
       volumes:
+        {{- include "nextgcore.nrfTlsVolume" (dict "root" . "nf" "nrf") | nindent 8 }}
         {{- include "nextgcore.configVolumes" . | nindent 8 }}
 ---
 apiVersion: v1

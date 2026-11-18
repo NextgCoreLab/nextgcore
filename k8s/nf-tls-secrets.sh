@@ -19,6 +19,16 @@
 #   nf-tls-secrets.sh --stamp <version> <manifest>
 #                                                 print the manifest pointed at
 #                                                 that version (below)
+#   nf-tls-secrets.sh --ids <table> [--dry-run] <namespace> <manifest>...
+#                                                 the rows and IDs come from
+#                                                 <table> (same format), not
+#                                                 nf-identities.txt: the Helm
+#                                                 chart's derived IDs
+#                                                 (deploy/helm/nf-tls-secrets.sh)
+#   nf-tls-secrets.sh --prune <namespace> <version>
+#                                                 delete the other versions'
+#                                                 Secrets that nothing mounts
+#                                                 (below)
 #
 # One CA, one version. The Secrets of a CA are named nf-tls-<name>-<version>,
 # <version> being the first 16 hex digits of the sha256 of its ca.crt, and
@@ -39,7 +49,19 @@
 #     leaves the running stack on its one CA, and the incomplete new version is
 #     never printed, never stamped, and not kept by the next run (which issues
 #     a fresh one). Older versions are left in place, unreferenced once the
-#     stamped manifests are applied; the script names them, it deletes nothing.
+#     stamped manifests are applied; the script names them, and deletes them
+#     only when asked (--prune).
+#
+# --prune <namespace> <version> deletes the Secrets of every version other
+# than <version> -- each one holds a private key -- unless something in the
+# namespace still mounts one of them: a pod (any phase), the pod template of a
+# Deployment, StatefulSet, DaemonSet, Job or CronJob, or of a ReplicaSet with
+# replicas > 0. Such a version is kept and named. It refuses, deleting nothing,
+# when <version> itself has no Secret in the namespace (a mistyped version
+# would otherwise delete every CA's Secrets) or when the namespace cannot be
+# read. Versions are deleted one at a time by label; a failure part way leaves
+# only unreferenced Secrets behind, and a re-run deletes them. A rollback to an
+# old ReplicaSet (replicas 0) whose version was pruned needs a re-issue.
 #
 # Secrets are written with kubectl create, never apply, so no
 # last-applied-configuration annotation copies a private key.
@@ -79,12 +101,84 @@ yaml.safe_dump_all(out, sys.stdout, default_flow_style=False)
 PY
 fi
 
-DRY_RUN=false
-if [[ "${1:-}" == --dry-run ]]; then
-  DRY_RUN=true
-  shift
+if [[ "${1:-}" == --prune ]]; then
+  [[ $# -eq 3 && "$3" =~ ^[0-9a-f]{16}$ ]] || die "usage: $0 --prune <namespace> <version>"
+  NS="$2"
+  KEEP="$3"
+  command -v kubectl >/dev/null || die "kubectl not found"
+  WORK="$(umask 077 && mktemp -d -t nf-tls-XXXXXX)"
+  trap 'rm -rf "${WORK}"' EXIT
+  kubectl get secrets -n "${NS}" -l "${LABEL}" -o json > "${WORK}/secrets.json" \
+    || die "cannot list Secrets in ${NS}; nothing deleted"
+  kubectl get pods,deployments,statefulsets,daemonsets,replicasets,jobs,cronjobs \
+    -n "${NS}" -o json > "${WORK}/users.json" \
+    || die "cannot list the workloads of ${NS}; nothing deleted"
+  # One line per version to delete; the kept ones are reported on stderr.
+  doomed="$(python3 - "${WORK}/secrets.json" "${WORK}/users.json" "${LABEL}" "${KEEP}" <<'PY2'
+import json, sys
+secrets = json.load(open(sys.argv[1])).get('items') or []
+users = json.load(open(sys.argv[2])).get('items') or []
+label, keep = sys.argv[3], sys.argv[4]
+by_ver = {}
+for s in secrets:
+    meta = s.get('metadata') or {}
+    ver = (meta.get('labels') or {}).get(label, '')
+    by_ver.setdefault(ver, set()).add(meta.get('name', ''))
+if keep not in by_ver:
+    sys.exit('nf-tls-secrets: version %s has no Secret here; refusing to prune '
+             '(nothing deleted)' % keep)
+def pod_specs(u):
+    kind, spec = u.get('kind'), u.get('spec') or {}
+    if kind == 'Pod':
+        return [spec]
+    if kind == 'ReplicaSet' and int(spec.get('replicas') or 0) == 0:
+        return []
+    if kind == 'CronJob':
+        spec = (spec.get('jobTemplate') or {}).get('spec') or {}
+    return [((spec.get('template') or {}).get('spec')) or {}]
+mounted = {}
+for u in users:
+    where = '%s/%s' % (u.get('kind'), (u.get('metadata') or {}).get('name'))
+    for ps in pod_specs(u):
+        for v in ps.get('volumes') or []:
+            names = [(v.get('secret') or {}).get('secretName')]
+            names += [((x.get('secret') or {}).get('name'))
+                      for x in (v.get('projected') or {}).get('sources') or []]
+            for n in names:
+                if n:
+                    mounted.setdefault(n, where)
+for ver in sorted(by_ver):
+    if ver == keep:
+        continue
+    users_of = sorted({mounted[n] for n in by_ver[ver] if n in mounted})
+    if users_of:
+        print('nf-tls-secrets: kept version %s: still mounted by %s'
+              % (ver, ', '.join(users_of)), file=sys.stderr)
+    else:
+        print(ver)
+PY2
+)" || exit 1
+  for ver in ${doomed}; do
+    kubectl delete secret -n "${NS}" -l "${LABEL}=${ver}" >/dev/null \
+      || die "could not delete version ${ver}; its Secrets are unreferenced, re-run --prune to finish"
+    say "deleted version ${ver}"
+  done
+  [[ -n "${doomed}" ]] || say "no unreferenced version other than ${KEEP}"
+  exit 0
 fi
-[[ $# -ge 2 ]] || die "usage: $0 [--dry-run] <namespace> <manifest>..."
+
+DRY_RUN=false
+while [[ "${1:-}" == --dry-run || "${1:-}" == --ids ]]; do
+  if [[ "$1" == --dry-run ]]; then
+    DRY_RUN=true
+    shift
+  else
+    [[ -n "${2:-}" && -f "$2" ]] || die "--ids needs an identity table file"
+    TABLE="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
+    shift 2
+  fi
+done
+[[ $# -ge 2 ]] || die "usage: $0 [--ids <table>] [--dry-run] <namespace> <manifest>..."
 NS="$1"
 shift
 
@@ -200,7 +294,7 @@ if [[ -n "${keep}" ]]; then
 else
   # --- issue a new CA and create its whole set under a new version ---------
   say "issuing a new dev PKI for ${NS} (the CA key stays in ${WORK} and is deleted on exit)"
-  bash "${CERTS_DIR}/generate-dev-certs.sh" --out "${WORK}/pki" >/dev/null \
+  bash "${CERTS_DIR}/generate-dev-certs.sh" --ids "${TABLE}" --out "${WORK}/pki" >/dev/null \
     || die "generate-dev-certs.sh failed"
   ver="$(sha256sum "${WORK}/pki/ca.crt" | cut -c1-16)"
   for n in ${needed}; do
@@ -220,5 +314,5 @@ else
 fi
 others="$(printf '%s\n' ${versions} | grep -vx "${ver}" | tr '\n' ' ' || true)"
 [[ -z "${others// /}" ]] \
-  || say "older versions left in place (unreferenced once the stamped manifests are applied): ${others}"
+  || say "older versions left in place (unreferenced once the stamped manifests are applied; delete them with $0 --prune ${NS} ${ver}): ${others}"
 printf '%s\n' "${ver}"
