@@ -613,7 +613,7 @@ mod tests {
 
     fn amf_holds(context_ref: &str) -> bool {
         nextgcore_amfd::context::amf_mcast()
-            .session_find(context_ref.parse().expect("numeric ref"))
+            .broadcast_context_find(context_ref.parse().expect("numeric ref"))
             .is_some()
     }
 
@@ -626,6 +626,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_released_session_deletes_its_context_at_the_real_amf_1758() {
         let _g = nextgcore_amfd::test_support::MBS_CONTEXT_LOCK.lock().await;
+        // R24: after MBS_CONTEXT_LOCK, the order every holder of both takes them in.
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
         // #1796: the AMF answers ContextCreate on the NG-RAN's response.
         let _ngap = stand_in_ngap();
         let (_nrf, _amf_server, amf, oauth2) = gated_real_amf().await;
@@ -674,6 +676,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_context_created_after_its_release_is_deleted_1758() {
         let _g = nextgcore_amfd::test_support::MBS_CONTEXT_LOCK.lock().await;
+        // R24: after MBS_CONTEXT_LOCK, the order every holder of both takes them in.
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
         // #1796: the AMF answers ContextCreate on the NG-RAN's response.
         let _ngap = stand_in_ngap();
         let (_nrf, _amf_server, amf, oauth2) = gated_real_amf().await;
@@ -778,6 +782,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_failed_context_delete_is_retried_1758() {
         use std::sync::atomic::Ordering;
+        // R24: `release_amf_contexts` can park into the reconciler's set.
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
         let (_server, context, deletes, _arrived, _release) =
             scripted_amf(false, &[500, 503]).await;
         assert!(!crate::release_amf_contexts(vec![context]).await);
@@ -785,6 +791,181 @@ mod tests {
             deletes.load(Ordering::SeqCst) == 3
         })
         .await;
+    }
+
+    /// #1817: an AMF that comes back AFTER the retry budget still gets the delete.
+    /// Every fast retry is refused, the record is parked, a reconcile pass that is
+    /// still refused keeps it, and the next pass delivers it.
+    ///
+    /// REVERT-VERIFIED: with `reconcile::park(failed)` removed from the retry task,
+    /// nothing is parked and the "parked after the budget" wait times out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_amf_back_after_the_retry_budget_still_gets_the_delete_1817() {
+        use std::sync::atomic::Ordering;
+        let _g = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        crate::reconcile::clear_for_test();
+        let budget = crate::AMF_RELEASE_RETRY_DELAYS.len() + 1;
+        // The first attempt, every retry, and one reconcile pass are refused.
+        let refusals = vec![503u16; budget + 1];
+        let (_server, context, deletes, _arrived, _release) = scripted_amf(false, &refusals).await;
+        let before = crate::reconcile::RECONCILED.get(&["deleted"]);
+        assert!(!crate::release_amf_contexts(vec![context.clone()]).await);
+        eventually("the record is parked after the budget", || {
+            crate::reconcile::pending_count() == 1
+        })
+        .await;
+        assert_eq!(deletes.load(Ordering::SeqCst), budget);
+
+        assert_eq!(crate::reconcile::reconcile_once().await, 0, "still refused");
+        assert_eq!(crate::reconcile::pending_count(), 1, "kept, not dropped");
+
+        assert_eq!(
+            crate::reconcile::reconcile_once().await,
+            1,
+            "the AMF accepts"
+        );
+        assert_eq!(deletes.load(Ordering::SeqCst), budget + 2);
+        assert_eq!(crate::reconcile::pending_count(), 0);
+        assert_eq!(crate::reconcile::RECONCILED.get(&["deleted"]), before + 1);
+    }
+
+    /// R24 (#1817 review): a parked ContextDelete is not sent for a context a live
+    /// session holds again. The AMF's ContextCreate is idempotent on the TMGI, so a
+    /// new session reusing a released one's TMGI is handed the same
+    /// `mbsContextRef`. Recording it unparks the delete; and a delete parked while
+    /// the context is held is dropped by the pass rather than sent.
+    ///
+    /// REVERT-VERIFIED: with the `unpark` call removed from `record_amf_context`,
+    /// "recording the reused context unparks its delete" fails; with the
+    /// `held_by_a_live_session` check removed from `reconcile_once`, the AMF sees
+    /// the delete ("the live context is not deleted").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parked_delete_spares_a_context_a_live_session_reuses_1817() {
+        use std::sync::atomic::Ordering;
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        crate::reconcile::clear_for_test();
+        let (_server, context, deletes, _arrived, _release) = scripted_amf(false, &[]).await;
+        crate::mbsmf_context_init(256);
+        let ctx = crate::mbsmf_self();
+        let before = crate::reconcile::RECONCILED.get(&["reused"]);
+
+        // Session A was released while the AMF was down: its delete is parked.
+        crate::reconcile::park(vec![context.clone()]);
+        // Session B reuses the TMGI and gets the same context back.
+        let b = ctx
+            .read()
+            .unwrap()
+            .session_add(
+                tmgi_1758([0x03, 0x18, 0x17]),
+                crate::MbsSessionType::Broadcast,
+            )
+            .expect("session");
+        assert!(ctx
+            .read()
+            .unwrap()
+            .record_amf_context(b.id, context.clone()));
+        assert_eq!(
+            crate::reconcile::pending_count(),
+            0,
+            "recording the reused context unparks its delete"
+        );
+
+        // A delete parked while B holds it is dropped by the pass, not sent.
+        crate::reconcile::park(vec![context.clone()]);
+        let accepted = crate::reconcile::reconcile_once().await;
+        assert_eq!(
+            deletes.load(Ordering::SeqCst),
+            0,
+            "the live context is not deleted"
+        );
+        assert_eq!(accepted, 0);
+        assert_eq!(crate::reconcile::pending_count(), 0);
+        assert_eq!(crate::reconcile::RECONCILED.get(&["reused"]), before + 2);
+        ctx.read().unwrap().take_amf_contexts(b.id);
+        ctx.read().unwrap().session_remove(b.id);
+    }
+
+    /// R24: the fast retries of a refused ContextDelete stop once a live session
+    /// holds that context again, and nothing is parked for it.
+    ///
+    /// REVERT-VERIFIED: with the `amf_context_in_use` check removed from the retry
+    /// loop in `release_amf_contexts`, the retry deletes the live context ("no
+    /// retry deletes the reused context").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_fast_retries_spare_a_context_a_live_session_reuses_1817() {
+        use std::sync::atomic::Ordering;
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        crate::reconcile::clear_for_test();
+        let (_server, context, deletes, _arrived, _release) = scripted_amf(false, &[500]).await;
+        crate::mbsmf_context_init(256);
+        let ctx = crate::mbsmf_self();
+        assert!(!crate::release_amf_contexts(vec![context.clone()]).await);
+        let b = ctx
+            .read()
+            .unwrap()
+            .session_add(
+                tmgi_1758([0x04, 0x18, 0x17]),
+                crate::MbsSessionType::Broadcast,
+            )
+            .expect("session");
+        assert!(ctx
+            .read()
+            .unwrap()
+            .record_amf_context(b.id, context.clone()));
+        tokio::time::sleep(crate::AMF_RELEASE_RETRY_DELAYS[0] * 10).await;
+        assert_eq!(
+            deletes.load(Ordering::SeqCst),
+            1,
+            "no retry deletes the reused context"
+        );
+        assert_eq!(crate::reconcile::pending_count(), 0);
+        ctx.read().unwrap().take_amf_contexts(b.id);
+        ctx.read().unwrap().session_remove(b.id);
+    }
+
+    /// R24: one pass sends for at most `MAX_PASS`. Against a blackholed AMF the
+    /// records it does not reach are re-parked, in order, for the next pass.
+    ///
+    /// REVERT-VERIFIED: with the deadline check removed, the pass runs for every
+    /// record's client timeout ("the pass is bounded").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pass_against_a_blackholed_amf_is_bounded_1817() {
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        crate::reconcile::clear_for_test();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        // Accepts connections and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hole = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = listener.accept().await {
+                held.push(s);
+            }
+        });
+        let parked: Vec<_> = (0..8)
+            .map(|n| crate::context::AmfMbsContext {
+                host: "127.0.0.1".to_string(),
+                port,
+                nf_instance_id: None,
+                context_ref: format!("hole-{n}"),
+                notify_token: String::new(),
+            })
+            .collect();
+        crate::reconcile::park(parked);
+        let started = std::time::Instant::now();
+        assert_eq!(crate::reconcile::reconcile_once().await, 0);
+        assert!(
+            started.elapsed() < crate::reconcile::MAX_PASS + Duration::from_secs(4),
+            "the pass is bounded: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            crate::reconcile::pending_count(),
+            8,
+            "every record re-parked"
+        );
+        crate::reconcile::clear_for_test();
+        hole.abort();
     }
 
     /// #1758 (check 3): a session release whose consumer disconnects while the AMF
@@ -796,6 +977,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_cancelled_release_still_releases_the_amf_context_1758() {
         use std::sync::atomic::Ordering;
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
         let (_server, context, deletes, arrived, release) = scripted_amf(true, &[500]).await;
         crate::mbsmf_context_init(256);
         let ctx = crate::mbsmf_self();
@@ -880,6 +1062,64 @@ mod tests {
                 .is_none(),
             "an instance with no address at all must not be selected"
         );
+    }
+
+    /// #1796 (R29): after the AMF's 204 to ContextDelete the notify token is still
+    /// admitted for the grace, so a Release Response Transfer the AMF reports late
+    /// is accepted; after the grace it is refused. On a 404 it goes at once.
+    ///
+    /// REVERT-VERIFIED: with the token forgotten at the 204, the late notification
+    /// is refused and "a late Release Response Transfer is still accepted" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_release_transfer_is_still_admitted_after_the_204_1796() {
+        let (_server, mut context, _deletes, _arrived, _release) = scripted_amf(false, &[]).await;
+        crate::mbsmf_context_init(256);
+        let ctx = crate::mbsmf_self();
+        let token = ctx
+            .read()
+            .unwrap()
+            .mint_amf_notify_token(1796)
+            .expect("a token");
+        context.notify_token = token.clone();
+        let late = || {
+            nextgcore_sbi::message::SbiRequest::post(format!("{AMF_NOTIFY_PREFIX}/{token}"))
+                .with_json_body(&json!({
+                    "mbsSessionId": {},
+                    "n2MbsSmInfoList": [ { "ngapIeType": "MBS_SES_REL_RSP",
+                                           "ngapData": { "contentId": "n2-1" } } ],
+                }))
+                .unwrap()
+        };
+
+        assert!(crate::release_amf_contexts(vec![context]).await, "204");
+        assert_eq!(
+            crate::handle_amf_context_status_notify(&token, &late())
+                .await
+                .status,
+            204,
+            "a late Release Response Transfer is still accepted"
+        );
+        eventually("the token goes after the grace", || {
+            ctx.read().unwrap().amf_notify_session(&token).is_none()
+        })
+        .await;
+        assert_eq!(
+            crate::handle_amf_context_status_notify(&token, &late())
+                .await
+                .status,
+            404
+        );
+
+        // A 404 from the AMF: nothing left to notify, so the token goes at once.
+        let (_server, mut gone, _d, _a, _r) = scripted_amf(false, &[404]).await;
+        let token = ctx
+            .read()
+            .unwrap()
+            .mint_amf_notify_token(1797)
+            .expect("a token");
+        gone.notify_token = token.clone();
+        assert!(crate::release_amf_contexts(vec![gone]).await);
+        assert!(ctx.read().unwrap().amf_notify_session(&token).is_none());
     }
 
     /// #1796, MB-SMF -> AMF: the ContextCreate this MB-SMF sends passes amfd's

@@ -30,7 +30,7 @@
 //! is reported with a ContextStatusNotify, the last one carrying the completion
 //! indication.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -75,6 +75,13 @@ const SCAN_INTERVAL: Duration = Duration::from_secs(1);
 pub const CREATE_ANSWER_WAIT: Duration = Duration::from_secs(2);
 #[cfg(test)]
 pub const CREATE_ANSWER_WAIT: Duration = Duration::from_millis(300);
+
+/// How long a release waits for its NG-RAN Release Responses before it is over
+/// and the unanswered nodes are reported (TS 29.518 §5.6.2.4).
+#[cfg(not(test))]
+pub const RELEASE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+pub const RELEASE_RESPONSE_TIMEOUT: Duration = Duration::from_millis(400);
 
 /// How long a ContextRelease waits for the NG-RAN Release Responses before it
 /// answers (TS 23.247 §7.3.2 steps 7-8: the AMF answers after the NG-RAN).
@@ -166,6 +173,9 @@ pub struct BroadcastCreate {
     pub setup_transfer: Vec<u8>,
     pub notify_uri: String,
     pub max_response_time: Option<Duration>,
+    /// The ContextCreate's `mbsmfId`: a repeat from the same MB-SMF for the TMGI
+    /// is a retry of the same context (#1818).
+    pub mbsmf_id: Option<String>,
 }
 
 /// Where one NG-RAN node stands in a broadcast MBS session.
@@ -204,13 +214,33 @@ pub enum CreateFailure {
 #[derive(Debug, Clone, PartialEq)]
 pub enum CreateAnswer {
     Created {
-        session_id: u64,
+        /// The context's own `mbsContextRef` (#1818).
+        context_ref: u64,
         mbs_session_id: Value,
         containers: Vec<N2MbsSmContainer>,
         /// Every NG-RAN node has answered (`MBS_SESSION_START_COMPLETE`).
         complete: bool,
     },
     Failed(CreateFailure),
+}
+
+impl CreateAnswer {
+    /// The same answer, for the waiter of context `context_ref`.
+    fn for_member(&self, member: &Member) -> Self {
+        match self {
+            Self::Created {
+                containers,
+                complete,
+                ..
+            } => Self::Created {
+                context_ref: member.context_ref,
+                mbs_session_id: member.mbs_session_id.clone(),
+                containers: containers.clone(),
+                complete: *complete,
+            },
+            Self::Failed(f) => Self::Failed(*f),
+        }
+    }
 }
 
 /// What [`NgapMcastContext::broadcast_create`] did.
@@ -220,7 +250,7 @@ pub enum CreateStart {
     Answered(CreateAnswer),
     /// Wait on `rx` for the answer (then [`NgapMcastContext::broadcast_answer_on_timeout`]).
     Wait {
-        session_id: u64,
+        context_ref: u64,
         rx: oneshot::Receiver<CreateAnswer>,
     },
     /// [`MAX_BROADCAST_CONTEXTS`] reached: nothing was stored.
@@ -231,12 +261,13 @@ pub enum CreateStart {
 #[derive(Debug)]
 pub enum DeleteStart {
     NotFound,
-    /// Removed, and no NG-RAN node holds anything to release.
+    /// Removed, and no NG-RAN node is to be released: none holds the session,
+    /// or another broadcast context still rides on it (#1818).
     Released,
     /// Removed; the Release goes to the nodes set up. Wait on `rx` for their
     /// Release Response Transfers (then [`NgapMcastContext::broadcast_release_answer_on_timeout`]).
     Wait {
-        session_id: u64,
+        release_id: u64,
         rx: oneshot::Receiver<Vec<N2MbsSmContainer>>,
         notify_uri: String,
         mbs_session_id: Value,
@@ -246,7 +277,9 @@ pub enum DeleteStart {
 /// One Namf_MBSBroadcast_ContextStatusNotify request (TS 29.518 §5.6.2.5).
 #[derive(Debug, Clone, PartialEq)]
 pub struct BroadcastNotify {
-    pub session_id: u64,
+    /// The context (`mbsContextRef`) it is for; one context's notifications are
+    /// delivered in order.
+    pub context_ref: u64,
     pub uri: String,
     pub body: Value,
     /// `(content id, NGAP octets)` for each `n2MbsSmInfoList` entry.
@@ -259,21 +292,33 @@ pub enum BroadcastProcedure {
     Release,
 }
 
-/// One NGAP PDU for the NGAP task to send on `associations`.
+/// One NGAP PDU for the NGAP task to send on `associations`. `id` is the MBS
+/// session id for a Setup and the release id for a Release.
 #[derive(Debug, Clone)]
 pub struct BroadcastSend {
-    pub session_id: u64,
+    pub id: u64,
     pub tmgi: Tmgi,
     pub procedure: BroadcastProcedure,
     pub pdu: Vec<u8>,
     pub associations: Vec<u64>,
 }
 
-/// What the NGAP task must do now.
+/// What the NGAP task must do now. Every Release precedes every Setup, so a
+/// released session is gone at a gNB before a new one for the same TMGI is set
+/// up on the same (ordered) association.
 #[derive(Debug, Default)]
 pub struct BroadcastPlan {
     pub sends: Vec<BroadcastSend>,
     pub notifies: Vec<BroadcastNotify>,
+}
+
+/// #1818: one Namf_MBSBroadcast context (`mbsContextRef`), as it was found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BroadcastContext {
+    /// The MBS session (by TMGI) the context rides on.
+    pub session_id: u64,
+    /// The ContextCreate's `mbsmfId`, if it sent one.
+    pub mbsmf_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -286,9 +331,25 @@ struct Gnb {
     loss_reported: bool,
 }
 
+/// #1818: one ContextCreate resource riding on a broadcast session: whom it is
+/// for and where its notifications go.
+#[derive(Debug)]
+struct Member {
+    context_ref: u64,
+    mbsmf_id: Option<String>,
+    notify_uri: String,
+    mbs_session_id: Value,
+    waiters: Vec<oneshot::Sender<CreateAnswer>>,
+}
+
+/// A broadcast MBS session at the NG-RAN (one per TMGI), with the contexts on it.
 #[derive(Debug)]
 struct Ctx {
     session_id: u64,
+    /// #1818: whether a ContextCreate created the MBS session (rather than
+    /// joining one another path holds), so only then is it removed with the
+    /// last context.
+    owned: bool,
     req: BroadcastCreate,
     received_at: Instant,
     dispatched: bool,
@@ -296,15 +357,18 @@ struct Ctx {
     answered: bool,
     complete_reported: bool,
     incomplete_reported: bool,
-    waiters: Vec<oneshot::Sender<CreateAnswer>>,
+    members: Vec<Member>,
 }
 
 #[derive(Debug)]
 struct Releasing {
+    /// The context whose release this is.
+    context_ref: u64,
     tmgi: Tmgi,
     mbs_session_id: Value,
     notify_uri: String,
     targets: Vec<(u64, RanNode)>,
+    started: Instant,
     dispatched: bool,
     containers: Vec<N2MbsSmContainer>,
     answered: bool,
@@ -314,8 +378,24 @@ struct Releasing {
 #[derive(Debug, Default)]
 struct Inner {
     contexts: HashMap<u64, Ctx>,
-    releasing: HashMap<u64, Releasing>,
+    /// By release id, ascending: the oldest outstanding release of a TMGI on a
+    /// gNB is the one its Release Response answers.
+    releasing: BTreeMap<u64, Releasing>,
+    next_ref: u64,
+    next_release: u64,
     last_scan: Option<Instant>,
+}
+
+impl Inner {
+    fn member_count(&self) -> usize {
+        self.contexts.values().map(|c| c.members.len()).sum()
+    }
+
+    fn ctx_of_ref(&mut self, context_ref: u64) -> Option<&mut Ctx> {
+        self.contexts
+            .values_mut()
+            .find(|c| c.members.iter().any(|m| m.context_ref == context_ref))
+    }
 }
 
 /// The broadcast half of [`NgapMcastContext`].
@@ -355,11 +435,12 @@ impl Ctx {
             .any(|g| g.state == BroadcastGnbState::Established)
     }
 
-    /// Every node response container, for an answer to a repeated ContextCreate.
-    fn snapshot(&self) -> CreateAnswer {
+    /// Every node response container, for an answer to a repeated or joining
+    /// ContextCreate.
+    fn snapshot(&self, member: &Member) -> CreateAnswer {
         CreateAnswer::Created {
-            session_id: self.session_id,
-            mbs_session_id: self.req.mbs_session_id.clone(),
+            context_ref: member.context_ref,
+            mbs_session_id: member.mbs_session_id.clone(),
             containers: self
                 .gnbs
                 .iter()
@@ -386,23 +467,32 @@ impl Ctx {
     }
 
     fn answer_waiters(&mut self, answer: &CreateAnswer) {
-        for w in self.waiters.drain(..) {
-            let _ = w.send(answer.clone());
+        for m in self.members.iter_mut() {
+            let mine = answer.for_member(m);
+            for w in m.waiters.drain(..) {
+                let _ = w.send(mine.clone());
+            }
         }
     }
 
-    fn notify(&self, containers: Vec<N2MbsSmContainer>) -> BroadcastNotify {
-        status_notify(
-            self.session_id,
-            &self.req.notify_uri,
-            &self.req.mbs_session_id,
-            containers,
-        )
+    /// One notification per context on the session, each to its own notifyUri.
+    fn notify(&self, containers: &[N2MbsSmContainer]) -> Vec<BroadcastNotify> {
+        self.members
+            .iter()
+            .map(|m| {
+                status_notify(
+                    m.context_ref,
+                    &m.notify_uri,
+                    &m.mbs_session_id,
+                    containers.to_vec(),
+                )
+            })
+            .collect()
     }
 
     /// Bring the MB-SMF up to date after a change: answer the ContextCreate when
     /// TS 29.518 §5.6.2.2 says so, otherwise notify what it has not been told.
-    /// Returns whether the context is over and must be removed.
+    /// Returns whether the session is over and must be removed.
     fn settle(&mut self, notifies: &mut Vec<BroadcastNotify>) -> bool {
         if !self.dispatched {
             return false;
@@ -419,8 +509,8 @@ impl Ctx {
                 let complete = responded && !leftovers;
                 self.complete_reported = complete;
                 let answer = CreateAnswer::Created {
-                    session_id: self.session_id,
-                    mbs_session_id: self.req.mbs_session_id.clone(),
+                    context_ref: 0,
+                    mbs_session_id: Value::Null,
                     containers,
                     complete,
                 };
@@ -441,13 +531,13 @@ impl Ctx {
         }
 
         // Answered: what the MB-SMF has not been told goes in notifications.
-        let mut batch: Vec<BroadcastNotify> = Vec::new();
+        let mut batches: Vec<Vec<N2MbsSmContainer>> = Vec::new();
         loop {
             let containers = self.take_unreported(N2_MBS_SM_INFO_LIST_MAX);
             if containers.is_empty() {
                 break;
             }
-            batch.push(self.notify(containers));
+            batches.push(containers);
         }
         let lost: Vec<Value> = self
             .gnbs
@@ -455,43 +545,55 @@ impl Ctx {
             .filter(|g| g.state == BroadcastGnbState::Lost && !g.loss_reported)
             .map(|g| {
                 g.loss_reported = true;
-                json!({
-                    "ngranId": g.node.json(),
-                    "ngranFailureIndication": "NG_RAN_NOT_REACHABLE",
-                })
+                lost_event(&g.node)
             })
             .collect();
         let complete_now = responded && !self.complete_reported;
         let released = responded && !self.any_established();
-        if complete_now || !lost.is_empty() || released {
-            if batch.is_empty() {
-                batch.push(self.notify(Vec::new()));
-            }
-            let last = batch.last_mut().expect("one notification");
-            if complete_now {
-                self.complete_reported = true;
-                last.body["operationStatus"] = json!("MBS_SESSION_START_COMPLETE");
-            }
-            if !lost.is_empty() {
-                last.body["operationEvents"] = json!([{
-                    "opEventType": "NG_RAN_EVENT",
-                    "ngranFailureEventList": lost,
-                }]);
-            }
-            if released {
-                // No NG-RAN node holds the session any more: the context is
-                // released and the MB-SMF told so (TS 29.518 §5.6.2.5, releasedInd).
-                last.body["releasedInd"] = json!(true);
+        if (complete_now || !lost.is_empty() || released) && batches.is_empty() {
+            batches.push(Vec::new());
+        }
+        let last = batches.len().saturating_sub(1);
+        for (i, batch) in batches.iter().enumerate() {
+            for mut n in self.notify(batch) {
+                if i == last {
+                    if complete_now {
+                        n.body["operationStatus"] = json!("MBS_SESSION_START_COMPLETE");
+                    }
+                    if !lost.is_empty() {
+                        n.body["operationEvents"] = ng_ran_events(&lost);
+                    }
+                    if released {
+                        // No NG-RAN node holds the session any more: it is released
+                        // and the MB-SMF told so (TS 29.518 §5.6.2.5, releasedInd).
+                        n.body["releasedInd"] = json!(true);
+                    }
+                }
+                notifies.push(n);
             }
         }
-        notifies.extend(batch);
+        if complete_now {
+            self.complete_reported = true;
+        }
         released
     }
 }
 
+fn lost_event(node: &RanNode) -> Value {
+    json!({
+        "ngranId": node.json(),
+        "ngranFailureIndication": "NG_RAN_NOT_REACHABLE",
+    })
+}
+
+/// `operationEvents` reporting `list` NG-RAN failures (TS 29.518 §5.6.2.4/5.6.2.5).
+fn ng_ran_events(list: &[Value]) -> Value {
+    json!([{ "opEventType": "NG_RAN_EVENT", "ngranFailureEventList": list }])
+}
+
 impl Releasing {
     /// Returns whether the release is over and must be forgotten.
-    fn settle(&mut self, session_id: u64, notifies: &mut Vec<BroadcastNotify>) -> bool {
+    fn settle(&mut self, notifies: &mut Vec<BroadcastNotify>) -> bool {
         if !self.dispatched {
             return false;
         }
@@ -509,7 +611,7 @@ impl Releasing {
                 let n = self.containers.len().min(N2_MBS_SM_INFO_LIST_MAX);
                 let chunk: Vec<_> = self.containers.drain(..n).collect();
                 notifies.push(status_notify(
-                    session_id,
+                    self.context_ref,
                     &self.notify_uri,
                     &self.mbs_session_id,
                     chunk,
@@ -523,7 +625,7 @@ impl Releasing {
 /// A ContextStatusNotification carrying `containers` in `n2MbsSmInfoList`, each
 /// with the `ranId` of the node that generated it (TS 29.518 §5.6.2.5 step 1).
 fn status_notify(
-    session_id: u64,
+    context_ref: u64,
     uri: &str,
     mbs_session_id: &Value,
     containers: Vec<N2MbsSmContainer>,
@@ -534,7 +636,7 @@ fn status_notify(
         body["n2MbsSmInfoList"] = Value::Array(list);
     }
     BroadcastNotify {
-        session_id,
+        context_ref,
         uri: uri.to_string(),
         body,
         parts,
@@ -570,45 +672,86 @@ impl NgapMcastContext {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// ContextCreate (TS 29.518 §5.6.2.2). One context per TMGI: a repeated
-    /// create joins (or is answered with) the existing one and sends nothing.
-    /// A new context is stored only below the cap, and its Setup Request goes out
-    /// from the NGAP task.
-    pub fn broadcast_create(&self, req: BroadcastCreate, now: Instant) -> CreateStart {
-        let mut inner = self.broadcast_inner();
-        if let Some(ctx) = inner.contexts.values_mut().find(|c| c.req.tmgi == req.tmgi) {
-            if ctx.answered {
-                return CreateStart::Answered(ctx.snapshot());
+    /// Remove the broadcast session `session_id` (every context on it gone, or
+    /// its setup failed): the MBS session goes with it only when a ContextCreate
+    /// created it (#1818).
+    fn drop_broadcast_session(&self, inner: &mut Inner, session_id: u64) {
+        if let Some(ctx) = inner.contexts.remove(&session_id) {
+            if ctx.owned {
+                self.session_remove(session_id);
             }
-            ctx.waiters.retain(|w| !w.is_closed());
-            if ctx.waiters.len() >= MAX_WAITERS {
-                return CreateStart::Answered(ctx.snapshot());
-            }
-            let (tx, rx) = oneshot::channel();
-            ctx.waiters.push(tx);
-            return CreateStart::Wait {
-                session_id: ctx.session_id,
-                rx,
-            };
         }
-        if inner.contexts.len() >= self.broadcast.capacity {
+    }
+
+    /// ContextCreate (TS 29.518 §5.6.2.2). Each ContextCreate gets a context of
+    /// its own (#1818) on the TMGI's broadcast session; a repeat from the same
+    /// `mbsmfId` is a retry and gets the same context. Only the first context on a
+    /// TMGI sends a Setup (from the NGAP task); a later one rides on the session
+    /// the NG-RAN already holds. A new context is stored only below the cap.
+    pub fn broadcast_create(&self, req: BroadcastCreate, now: Instant) -> CreateStart {
+        let mbsmf_id = req.mbsmf_id.clone();
+        let mut inner = self.broadcast_inner();
+        let total = inner.member_count();
+        let capacity = self.broadcast.capacity;
+        let next_ref = inner.next_ref + 1;
+        let joined = inner
+            .contexts
+            .iter()
+            .find(|(_, c)| c.req.tmgi == req.tmgi)
+            .map(|(sid, c)| (*sid, c.members.iter().position(|m| m.mbsmf_id == mbsmf_id)));
+        if let Some((sid, existing)) = joined {
+            let idx = match existing {
+                Some(i) => i,
+                None => {
+                    if total >= capacity {
+                        return CreateStart::Full;
+                    }
+                    inner.next_ref = next_ref;
+                    let ctx = inner.contexts.get_mut(&sid).expect("found above");
+                    ctx.members.push(Member {
+                        context_ref: next_ref,
+                        mbsmf_id,
+                        notify_uri: req.notify_uri.clone(),
+                        mbs_session_id: req.mbs_session_id.clone(),
+                        waiters: Vec::new(),
+                    });
+                    ctx.members.len() - 1
+                }
+            };
+            return join(inner.contexts.get_mut(&sid).expect("found above"), idx);
+        }
+        if total >= capacity {
             log::warn!(
-                "Namf_MBSBroadcast ContextCreate refused: {} broadcast MBS contexts held",
-                inner.contexts.len()
+                "Namf_MBSBroadcast ContextCreate refused: {total} broadcast MBS contexts held"
             );
             return CreateStart::Full;
         }
-        let area_tacs = req.area.tais.iter().map(|(_, tac)| *tac).collect();
-        let Some(session) = self.session_create(req.tmgi.clone(), req.sst, req.sd, area_tacs)
-        else {
-            return CreateStart::Full;
+        // #1818: join the MBS session another path holds for the TMGI, or create one.
+        let (session, owned) = match self.session_find_by_tmgi(&req.tmgi) {
+            Some(s) => (s, false),
+            None => {
+                let area_tacs = req.area.tais.iter().map(|(_, tac)| *tac).collect();
+                match self.session_create(req.tmgi.clone(), req.sst, req.sd, area_tacs) {
+                    Some(s) => (s, true),
+                    None => return CreateStart::Full,
+                }
+            }
         };
+        inner.next_ref = next_ref;
         let (tx, rx) = oneshot::channel();
         let session_id = session.mbs_session_id;
+        let member = Member {
+            context_ref: next_ref,
+            mbsmf_id,
+            notify_uri: req.notify_uri.clone(),
+            mbs_session_id: req.mbs_session_id.clone(),
+            waiters: vec![tx],
+        };
         inner.contexts.insert(
             session_id,
             Ctx {
                 session_id,
+                owned,
                 req,
                 received_at: now,
                 dispatched: false,
@@ -616,46 +759,67 @@ impl NgapMcastContext {
                 answered: false,
                 complete_reported: false,
                 incomplete_reported: false,
-                waiters: vec![tx],
+                members: vec![member],
             },
         );
         self.broadcast.dirty.store(true, Ordering::SeqCst);
-        CreateStart::Wait { session_id, rx }
+        CreateStart::Wait {
+            context_ref: next_ref,
+            rx,
+        }
     }
 
     /// The ContextCreate answer when [`CREATE_ANSWER_WAIT`] ran out before the
     /// first NG-RAN success: the context exists, its setup is in progress, and
     /// what arrives later is notified. `None` when it was already answered (the
     /// waiter has the answer) or is gone.
-    pub fn broadcast_answer_on_timeout(&self, session_id: u64) -> Option<CreateAnswer> {
+    pub fn broadcast_answer_on_timeout(&self, context_ref: u64) -> Option<CreateAnswer> {
         let mut inner = self.broadcast_inner();
-        let ctx = inner.contexts.get_mut(&session_id)?;
+        let ctx = inner.ctx_of_ref(context_ref)?;
         if ctx.answered {
             return None;
         }
         ctx.answered = true;
         let answer = CreateAnswer::Created {
-            session_id,
-            mbs_session_id: ctx.req.mbs_session_id.clone(),
+            context_ref: 0,
+            mbs_session_id: Value::Null,
             containers: ctx.take_unreported(N2_MBS_SM_INFO_LIST_MAX),
             complete: false,
         };
+        let mine = ctx
+            .members
+            .iter()
+            .find(|m| m.context_ref == context_ref)
+            .map(|m| answer.for_member(m));
         ctx.answer_waiters(&answer);
         // Anything past the 10 the answer carried is notified on the next scan.
         self.broadcast.dirty.store(true, Ordering::SeqCst);
-        Some(answer)
+        mine
     }
 
-    /// ContextRelease (TS 29.518 §5.6.2.4). The context is removed at once (so a
-    /// new ContextCreate for the TMGI starts afresh) and the Release goes to every
-    /// node that was sent the Setup and did not fail it.
-    pub fn broadcast_delete(&self, session_id: u64) -> DeleteStart {
+    /// ContextRelease (TS 29.518 §5.6.2.4) of context `context_ref` (#1818: only
+    /// that context). While another context rides on the broadcast session, the
+    /// NG-RAN keeps it. When this was the last one, the session is removed at once
+    /// (so a new ContextCreate for the TMGI starts afresh) and the Release goes to
+    /// every node that was sent the Setup and did not fail it.
+    pub fn broadcast_delete(&self, context_ref: u64) -> DeleteStart {
         let mut inner = self.broadcast_inner();
-        let Some(mut ctx) = inner.contexts.remove(&session_id) else {
+        let Some(ctx) = inner.ctx_of_ref(context_ref) else {
             return DeleteStart::NotFound;
         };
-        self.session_remove(session_id);
-        ctx.answer_waiters(&CreateAnswer::Failed(CreateFailure::Deleted));
+        let pos = ctx
+            .members
+            .iter()
+            .position(|m| m.context_ref == context_ref)
+            .expect("found above");
+        let mut member = ctx.members.remove(pos);
+        for w in member.waiters.drain(..) {
+            let _ = w.send(CreateAnswer::Failed(CreateFailure::Deleted));
+        }
+        if !ctx.members.is_empty() {
+            return DeleteStart::Released;
+        }
+        let session_id = ctx.session_id;
         let targets: Vec<(u64, RanNode)> = ctx
             .gnbs
             .iter()
@@ -667,28 +831,31 @@ impl NgapMcastContext {
             })
             .map(|g| (g.association_id, g.node.clone()))
             .collect();
+        let tmgi = ctx.req.tmgi.clone();
+        self.drop_broadcast_session(&mut inner, session_id);
         if targets.is_empty() {
             return DeleteStart::Released;
         }
         if inner.releasing.len() >= MAX_RELEASING {
-            if let Some(oldest) = inner.releasing.keys().min().copied() {
+            if let Some((oldest, _)) = inner.releasing.pop_first() {
                 log::warn!(
                     "{MAX_RELEASING} broadcast MBS releases awaiting NG-RAN responses; no longer \
-                     tracking the responses of context {oldest}"
+                     tracking release {oldest}"
                 );
-                inner.releasing.remove(&oldest);
             }
         }
+        inner.next_release += 1;
+        let release_id = inner.next_release;
         let (tx, rx) = oneshot::channel();
-        let notify_uri = ctx.req.notify_uri.clone();
-        let mbs_session_id = ctx.req.mbs_session_id.clone();
         inner.releasing.insert(
-            session_id,
+            release_id,
             Releasing {
-                tmgi: ctx.req.tmgi.clone(),
-                mbs_session_id: mbs_session_id.clone(),
-                notify_uri: notify_uri.clone(),
+                context_ref,
+                tmgi,
+                mbs_session_id: member.mbs_session_id.clone(),
+                notify_uri: member.notify_uri.clone(),
                 targets,
+                started: Instant::now(),
                 dispatched: false,
                 containers: Vec::new(),
                 answered: false,
@@ -697,18 +864,18 @@ impl NgapMcastContext {
         );
         self.broadcast.dirty.store(true, Ordering::SeqCst);
         DeleteStart::Wait {
-            session_id,
+            release_id,
             rx,
-            notify_uri,
-            mbs_session_id,
+            notify_uri: member.notify_uri,
+            mbs_session_id: member.mbs_session_id,
         }
     }
 
     /// The Release Response Transfers received so far, when
     /// [`DELETE_ANSWER_WAIT`] ran out; later ones are notified.
-    pub fn broadcast_release_answer_on_timeout(&self, session_id: u64) -> Vec<N2MbsSmContainer> {
+    pub fn broadcast_release_answer_on_timeout(&self, release_id: u64) -> Vec<N2MbsSmContainer> {
         let mut inner = self.broadcast_inner();
-        let Some(r) = inner.releasing.get_mut(&session_id) else {
+        let Some(r) = inner.releasing.get_mut(&release_id) else {
             return Vec::new();
         };
         if r.answered {
@@ -737,13 +904,71 @@ impl NgapMcastContext {
         false
     }
 
-    /// The NGAP task's step: send the Setup Request of every new context to the
-    /// `live` nodes serving its area, the Release Request of every released one,
-    /// mark nodes whose association is gone as lost, report a passed
-    /// `maxResponseTime`, and answer / notify the MB-SMF accordingly.
+    /// The NGAP task's step: send the Release Request of every released session
+    /// and then the Setup Request of every new one (so a gNB drops an old session
+    /// before it sets up a new one for the same TMGI), mark nodes whose association
+    /// is gone as lost, report a passed `maxResponseTime`, end a release no gNB
+    /// answered within [`RELEASE_RESPONSE_TIMEOUT`], and answer / notify the MB-SMF.
     pub fn broadcast_plan(&self, live: &[LiveGnb], now: Instant) -> BroadcastPlan {
         let mut plan = BroadcastPlan::default();
         let mut inner = self.broadcast_inner();
+
+        let mut done = Vec::new();
+        for (id, r) in inner.releasing.iter_mut() {
+            r.targets.retain(|(assoc, node)| {
+                live.iter()
+                    .any(|l| l.association_id == *assoc && l.node == *node)
+            });
+            if !r.dispatched {
+                r.dispatched = true;
+                if !r.targets.is_empty() {
+                    match build_broadcast_session_release_request(&r.tmgi) {
+                        Some(pdu) => plan.sends.push(BroadcastSend {
+                            id: *id,
+                            tmgi: r.tmgi.clone(),
+                            procedure: BroadcastProcedure::Release,
+                            pdu,
+                            associations: r.targets.iter().map(|(a, _)| *a).collect(),
+                        }),
+                        None => {
+                            log::error!(
+                                "BroadcastSessionReleaseRequest for release {id} could not be \
+                                 encoded"
+                            );
+                            r.targets.clear();
+                        }
+                    }
+                }
+            } else if !r.targets.is_empty()
+                && now.saturating_duration_since(r.started) >= RELEASE_RESPONSE_TIMEOUT
+            {
+                // TS 29.518 §5.6.2.4: the AMF may report the NG-RANs it failed to
+                // reach. The release is over either way: nothing is kept for them.
+                let unanswered: Vec<Value> = r
+                    .targets
+                    .drain(..)
+                    .map(|(_, node)| lost_event(&node))
+                    .collect();
+                log::warn!(
+                    "Broadcast MBS release {id}: {} NG-RAN node(s) did not answer the Release \
+                     within {RELEASE_RESPONSE_TIMEOUT:?}",
+                    unanswered.len()
+                );
+                let mut n =
+                    status_notify(r.context_ref, &r.notify_uri, &r.mbs_session_id, Vec::new());
+                n.body["operationEvents"] = ng_ran_events(&unanswered);
+                // The containers already received go first.
+                r.settle(&mut plan.notifies);
+                plan.notifies.push(n);
+            }
+            if r.settle(&mut plan.notifies) {
+                done.push(*id);
+            }
+        }
+        for id in done {
+            inner.releasing.remove(&id);
+        }
+
         let mut over = Vec::new();
         for ctx in inner.contexts.values_mut() {
             if !ctx.dispatched {
@@ -765,7 +990,7 @@ impl NgapMcastContext {
                                 })
                                 .collect();
                             plan.sends.push(BroadcastSend {
-                                session_id: ctx.session_id,
+                                id: ctx.session_id,
                                 tmgi: ctx.req.tmgi.clone(),
                                 procedure: BroadcastProcedure::Setup,
                                 pdu,
@@ -773,14 +998,14 @@ impl NgapMcastContext {
                             });
                         }
                         None => log::error!(
-                            "BroadcastSessionSetupRequest for MBS context {} could not be \
+                            "BroadcastSessionSetupRequest for MBS session {} could not be \
                              encoded; no NG-RAN node was sent it",
                             ctx.session_id
                         ),
                     }
                 } else {
                     log::warn!(
-                        "Broadcast MBS context {}: no connected NG-RAN node serves its MBS \
+                        "Broadcast MBS session {}: no connected NG-RAN node serves its MBS \
                          service area",
                         ctx.session_id
                     );
@@ -795,7 +1020,7 @@ impl NgapMcastContext {
                         .any(|l| l.association_id == g.association_id && l.node == g.node)
                     {
                         log::warn!(
-                            "Broadcast MBS context {}: NG-RAN node {:#x} (association {}) is \
+                            "Broadcast MBS session {}: NG-RAN node {:#x} (association {}) is \
                              gone ({:?})",
                             ctx.session_id,
                             g.node.gnb_id,
@@ -815,9 +1040,10 @@ impl NgapMcastContext {
                     // TS 29.518 §5.6.2.2 step 2a: one notification of the
                     // incompletion once maxResponseTime has elapsed.
                     ctx.incomplete_reported = true;
-                    let mut n = ctx.notify(Vec::new());
-                    n.body["operationStatus"] = json!("MBS_SESSION_START_INCOMPLETE");
-                    plan.notifies.push(n);
+                    for mut n in ctx.notify(&[]) {
+                        n.body["operationStatus"] = json!("MBS_SESSION_START_INCOMPLETE");
+                        plan.notifies.push(n);
+                    }
                 }
             }
             if ctx.settle(&mut plan.notifies) {
@@ -825,52 +1051,16 @@ impl NgapMcastContext {
             }
         }
         for id in over {
-            inner.contexts.remove(&id);
-            self.session_remove(id);
-        }
-
-        let mut done = Vec::new();
-        for (id, r) in inner.releasing.iter_mut() {
-            r.targets.retain(|(assoc, node)| {
-                live.iter()
-                    .any(|l| l.association_id == *assoc && l.node == *node)
-            });
-            if !r.dispatched {
-                r.dispatched = true;
-                if !r.targets.is_empty() {
-                    match build_broadcast_session_release_request(&r.tmgi) {
-                        Some(pdu) => plan.sends.push(BroadcastSend {
-                            session_id: *id,
-                            tmgi: r.tmgi.clone(),
-                            procedure: BroadcastProcedure::Release,
-                            pdu,
-                            associations: r.targets.iter().map(|(a, _)| *a).collect(),
-                        }),
-                        None => {
-                            log::error!(
-                                "BroadcastSessionReleaseRequest for MBS context {id} could not \
-                                 be encoded"
-                            );
-                            r.targets.clear();
-                        }
-                    }
-                }
-            }
-            if r.settle(*id, &mut plan.notifies) {
-                done.push(*id);
-            }
-        }
-        for id in done {
-            inner.releasing.remove(&id);
+            self.drop_broadcast_session(&mut inner, id);
         }
         plan
     }
 
     /// The NGAP task could not send `procedure` to `association_id`: the node is
-    /// treated as gone for that context.
+    /// treated as gone for that session (`id` as in [`BroadcastSend`]).
     pub fn broadcast_send_failed(
         &self,
-        session_id: u64,
+        id: u64,
         procedure: BroadcastProcedure,
         association_id: u64,
     ) -> Vec<BroadcastNotify> {
@@ -878,7 +1068,7 @@ impl NgapMcastContext {
         let mut inner = self.broadcast_inner();
         match procedure {
             BroadcastProcedure::Setup => {
-                let Some(ctx) = inner.contexts.get_mut(&session_id) else {
+                let Some(ctx) = inner.contexts.get_mut(&id) else {
                     return notifies;
                 };
                 for g in ctx.gnbs.iter_mut() {
@@ -888,17 +1078,16 @@ impl NgapMcastContext {
                     }
                 }
                 if ctx.settle(&mut notifies) {
-                    inner.contexts.remove(&session_id);
-                    self.session_remove(session_id);
+                    self.drop_broadcast_session(&mut inner, id);
                 }
             }
             BroadcastProcedure::Release => {
-                let Some(r) = inner.releasing.get_mut(&session_id) else {
+                let Some(r) = inner.releasing.get_mut(&id) else {
                     return notifies;
                 };
                 r.targets.retain(|(a, _)| *a != association_id);
-                if r.settle(session_id, &mut notifies) {
-                    inner.releasing.remove(&session_id);
+                if r.settle(&mut notifies) {
+                    inner.releasing.remove(&id);
                 }
             }
         }
@@ -920,7 +1109,7 @@ impl NgapMcastContext {
         let Some(ctx) = inner.contexts.values_mut().find(|c| c.req.tmgi == *tmgi) else {
             log::warn!(
                 "Broadcast Session Setup outcome for tmgi_svc={:#x} from association \
-                 {association_id}: the AMF holds no such broadcast MBS context",
+                 {association_id}: the AMF holds no such broadcast MBS session",
                 tmgi.service_id_u32()
             );
             return notifies;
@@ -929,7 +1118,7 @@ impl NgapMcastContext {
             g.association_id == association_id && g.state == BroadcastGnbState::SetupSent
         }) else {
             log::warn!(
-                "Broadcast Session Setup outcome for MBS context {} from association \
+                "Broadcast Session Setup outcome for MBS session {} from association \
                  {association_id}, which has no Setup outstanding; ignored",
                 ctx.session_id
             );
@@ -950,7 +1139,7 @@ impl NgapMcastContext {
             ran_node: g.node.clone(),
         });
         log::info!(
-            "Broadcast MBS context {}: NG-RAN node {:#x} {}",
+            "Broadcast MBS session {}: NG-RAN node {:#x} {}",
             ctx.session_id,
             g.node.gnb_id,
             if success {
@@ -961,14 +1150,15 @@ impl NgapMcastContext {
         );
         let session_id = ctx.session_id;
         if ctx.settle(&mut notifies) {
-            inner.contexts.remove(&session_id);
-            self.session_remove(session_id);
+            self.drop_broadcast_session(&mut inner, session_id);
         }
         notifies
     }
 
     /// A BROADCAST SESSION RELEASE RESPONSE from `association_id` for `tmgi`. Its
-    /// Release Response Transfer goes to the MB-SMF (TS 38.413 §8.17.3.2).
+    /// Release Response Transfer goes to the MB-SMF (TS 38.413 §8.17.3.2). When
+    /// two releases of the TMGI are outstanding at the gNB, it answers the oldest:
+    /// the gNB answers Release Requests in the order the association carried them.
     pub fn broadcast_release_outcome(
         &self,
         tmgi: &Tmgi,
@@ -977,11 +1167,9 @@ impl NgapMcastContext {
     ) -> Vec<BroadcastNotify> {
         let mut notifies = Vec::new();
         let mut inner = self.broadcast_inner();
-        let Some((&id, r)) = inner
-            .releasing
-            .iter_mut()
-            .find(|(_, r)| r.tmgi == *tmgi && r.targets.iter().any(|(a, _)| *a == association_id))
-        else {
+        let Some((&id, r)) = inner.releasing.iter_mut().find(|(_, r)| {
+            r.dispatched && r.tmgi == *tmgi && r.targets.iter().any(|(a, _)| *a == association_id)
+        }) else {
             log::warn!(
                 "Broadcast Session Release Response for tmgi_svc={:#x} from association \
                  {association_id}, which has no Release outstanding; ignored",
@@ -1002,16 +1190,17 @@ impl NgapMcastContext {
                 ran_node: node,
             });
         }
-        if r.settle(id, &mut notifies) {
+        if r.settle(&mut notifies) {
             inner.releasing.remove(&id);
         }
         notifies
     }
 
-    /// Each node of a broadcast context and where it stands.
-    pub fn broadcast_gnb_states(&self, session_id: u64) -> Option<Vec<(u64, BroadcastGnbState)>> {
-        let inner = self.broadcast_inner();
-        let ctx = inner.contexts.get(&session_id)?;
+    /// Each node of the broadcast session context `context_ref` rides on, and
+    /// where it stands.
+    pub fn broadcast_gnb_states(&self, context_ref: u64) -> Option<Vec<(u64, BroadcastGnbState)>> {
+        let mut inner = self.broadcast_inner();
+        let ctx = inner.ctx_of_ref(context_ref)?;
         Some(
             ctx.gnbs
                 .iter()
@@ -1020,9 +1209,38 @@ impl NgapMcastContext {
         )
     }
 
-    /// Whether a released context still awaits NG-RAN Release Responses.
-    pub fn broadcast_releasing(&self, session_id: u64) -> bool {
-        self.broadcast_inner().releasing.contains_key(&session_id)
+    /// #1818: the broadcast context `context_ref`, if held.
+    pub fn broadcast_context_find(&self, context_ref: u64) -> Option<BroadcastContext> {
+        let mut inner = self.broadcast_inner();
+        let ctx = inner.ctx_of_ref(context_ref)?;
+        let session_id = ctx.session_id;
+        ctx.members
+            .iter()
+            .find(|m| m.context_ref == context_ref)
+            .map(|m| BroadcastContext {
+                session_id,
+                mbsmf_id: m.mbsmf_id.clone(),
+            })
+    }
+
+    /// The contexts held on `tmgi`'s broadcast session.
+    pub fn broadcast_refs_of(&self, tmgi: &Tmgi) -> Vec<u64> {
+        let inner = self.broadcast_inner();
+        inner
+            .contexts
+            .values()
+            .filter(|c| c.req.tmgi == *tmgi)
+            .flat_map(|c| c.members.iter().map(|m| m.context_ref))
+            .collect()
+    }
+
+    /// Whether the release of context `context_ref` still awaits NG-RAN Release
+    /// Responses.
+    pub fn broadcast_releasing(&self, context_ref: u64) -> bool {
+        self.broadcast_inner()
+            .releasing
+            .values()
+            .any(|r| r.context_ref == context_ref)
     }
 
     /// Have the next [`Self::broadcast_has_work`] re-check every context now
@@ -1033,7 +1251,32 @@ impl NgapMcastContext {
 
     /// How many broadcast MBS contexts are held.
     pub fn broadcast_count(&self) -> usize {
-        self.broadcast_inner().contexts.len()
+        self.broadcast_inner().member_count()
+    }
+}
+
+/// A repeated or joining ContextCreate on `ctx` for member `idx`: answered with
+/// the session's state, or waiting on its first NG-RAN answer.
+fn join(ctx: &mut Ctx, idx: usize) -> CreateStart {
+    if ctx.answered {
+        return CreateStart::Answered(ctx.snapshot(&ctx.members[idx]));
+    }
+    let member = &mut ctx.members[idx];
+    member.waiters.retain(|w| !w.is_closed());
+    if member.waiters.len() >= MAX_WAITERS {
+        let answer = CreateAnswer::Created {
+            context_ref: member.context_ref,
+            mbs_session_id: member.mbs_session_id.clone(),
+            containers: Vec::new(),
+            complete: false,
+        };
+        return CreateStart::Answered(answer);
+    }
+    let (tx, rx) = oneshot::channel();
+    member.waiters.push(tx);
+    CreateStart::Wait {
+        context_ref: member.context_ref,
+        rx,
     }
 }
 
@@ -1283,7 +1526,7 @@ static NOTIFY_QUEUES: Mutex<Option<HashMap<u64, VecDeque<BroadcastNotify>>>> = M
 /// Queue `notifies` for delivery, each context's in order on its own task.
 pub fn dispatch_notifies(notifies: Vec<BroadcastNotify>) {
     for n in notifies {
-        let session_id = n.session_id;
+        let session_id = n.context_ref;
         let start = {
             let mut guard = NOTIFY_QUEUES
                 .lock()
@@ -1380,12 +1623,12 @@ pub async fn send_notify(n: &BroadcastNotify) -> Option<u16> {
             if resp.is_success() {
                 log::info!(
                     "ContextStatusNotify for broadcast MBS context {} delivered to {redacted}",
-                    n.session_id
+                    n.context_ref
                 );
             } else {
                 log::warn!(
                     "ContextStatusNotify for broadcast MBS context {} to {redacted} returned {}",
-                    n.session_id,
+                    n.context_ref,
                     resp.status
                 );
             }

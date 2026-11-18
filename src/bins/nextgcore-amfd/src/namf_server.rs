@@ -8640,6 +8640,11 @@ fn parse_mbs_context_create(
         setup_transfer,
         notify_uri: notify_uri.to_string(),
         max_response_time,
+        // #1818: who the context is for.
+        mbsmf_id: body
+            .get("mbsmfId")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 
@@ -8648,12 +8653,12 @@ fn mbs_context_create_response(answer: crate::mbs_broadcast::CreateAnswer) -> Sb
     use crate::mbs_broadcast::{CreateAnswer, CreateFailure};
     match answer {
         CreateAnswer::Created {
-            session_id,
+            context_ref,
             mbs_session_id,
             containers,
             complete,
         } => {
-            let context_ref = session_id.to_string();
+            let context_ref = context_ref.to_string();
             // `mbsSessionId` is ContextCreateRspData's one required member;
             // `mbsContextRef` repeats the Location's last segment for consumers
             // that read it from the body.
@@ -8738,15 +8743,16 @@ async fn handle_mbs_context_create(request: &SbiRequest) -> SbiResponse {
             )
         }
         CreateStart::Answered(answer) => answer,
-        CreateStart::Wait { session_id, mut rx } => {
-            match tokio::time::timeout(crate::mbs_broadcast::CREATE_ANSWER_WAIT, &mut rx).await {
-                Ok(Ok(answer)) => answer,
-                _ => mcast
-                    .broadcast_answer_on_timeout(session_id)
-                    .or_else(|| rx.try_recv().ok())
-                    .unwrap_or(CreateAnswer::Failed(CreateFailure::Deleted)),
-            }
-        }
+        CreateStart::Wait {
+            context_ref: session_id,
+            mut rx,
+        } => match tokio::time::timeout(crate::mbs_broadcast::CREATE_ANSWER_WAIT, &mut rx).await {
+            Ok(Ok(answer)) => answer,
+            _ => mcast
+                .broadcast_answer_on_timeout(session_id)
+                .or_else(|| rx.try_recv().ok())
+                .unwrap_or(CreateAnswer::Failed(CreateFailure::Deleted)),
+        },
     };
     log::info!("Namf_MBSBroadcast ContextCreate: tmgi_svc={tmgi_svc:#x} answer={answer:?}");
     mbs_context_create_response(answer)
@@ -8771,18 +8777,18 @@ async fn handle_mbs_context_delete(context_ref: &str) -> SbiResponse {
             Some("CONTEXT_NOT_FOUND"),
         )
     };
-    let Ok(session_id) = context_ref.parse::<u64>() else {
+    let Ok(ref_num) = context_ref.parse::<u64>() else {
         return not_found();
     };
     let mcast = crate::context::amf_mcast();
-    match mcast.broadcast_delete(session_id) {
+    match mcast.broadcast_delete(ref_num) {
         DeleteStart::NotFound => not_found(),
         DeleteStart::Released => {
             log::info!("Namf_MBSBroadcast ContextDelete: ref={context_ref} (no NG-RAN to release)");
             SbiResponse::with_status(204)
         }
         DeleteStart::Wait {
-            session_id,
+            release_id,
             mut rx,
             notify_uri,
             mbs_session_id,
@@ -8791,7 +8797,7 @@ async fn handle_mbs_context_delete(context_ref: &str) -> SbiResponse {
                 match tokio::time::timeout(crate::mbs_broadcast::DELETE_ANSWER_WAIT, &mut rx).await
                 {
                     Ok(Ok(c)) => c,
-                    _ => mcast.broadcast_release_answer_on_timeout(session_id),
+                    _ => mcast.broadcast_release_answer_on_timeout(release_id),
                 };
             log::info!(
                 "Namf_MBSBroadcast ContextDelete: ref={context_ref} ({} Release Response \
@@ -8801,7 +8807,7 @@ async fn handle_mbs_context_delete(context_ref: &str) -> SbiResponse {
             for chunk in containers.chunks(crate::mbs_broadcast::N2_MBS_SM_INFO_LIST_MAX) {
                 let (list, parts) = crate::mbs_broadcast::n2_mbs_sm_info_list(chunk.to_vec());
                 let notify = crate::mbs_broadcast::BroadcastNotify {
-                    session_id,
+                    context_ref: ref_num,
                     uri: notify_uri.clone(),
                     body: json!({ "mbsSessionId": mbs_session_id, "n2MbsSmInfoList": list }),
                     parts,
@@ -12847,6 +12853,8 @@ mod tests {
     /// MB-SMF consumer got 404 RESOURCE_URI_STRUCTURE_NOT_FOUND here.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mbs_n2_message_transfer_is_served_rather_than_404() {
+        // #1822 item 2: the process-global MBS contexts.
+        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
         let req = SbiRequest::post("/namf-mbs-comm/v1/n2-messages/transfer")
             .with_json_body(&mbs_tmgi_body("001", "01", "0000AB"))
             .expect("json")
@@ -12868,12 +12876,18 @@ mod tests {
     // `ngap_path::mbs_broadcast::tests`: a create now answers on the NG-RAN's
     // response, so it cannot be exercised without one.
 
+    // #1818's ContextDelete-ownership tests drive a create that now answers on
+    // the NG-RAN's response; they moved to `ngap_path::mbs_broadcast::tests`
+    // (`*_1818`), with a stand-in gNB.
+
     /// An SSM-only `mbsSessionId` is REFUSED, not silently mapped. The schema is
     /// `anyOf [tmgi, ssm]`, but the AMF's NGAP `MBS-SessionID` carries a TMGI and
     /// no SSM-to-TMGI mapping is defined -- inventing one would drive the wrong
     /// session.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_ssm_only_mbs_session_id_is_refused_rather_than_mapped() {
+        // #1822 item 2: the process-global MBS contexts.
+        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
         let req = SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
             .with_json_body(&json!({
                 "mbsSessionId": {
@@ -12891,6 +12905,8 @@ mod tests {
     /// The OpenAPI pins `pattern: '^[A-Fa-f0-9]{6}$'`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_malformed_mbs_service_id_is_a_400() {
+        // #1822 item 2: the process-global MBS contexts.
+        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
         for bad in ["ZZZZZZ", "ABC", "0000ABCD"] {
             let req = SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
                 .with_json_body(&json!({

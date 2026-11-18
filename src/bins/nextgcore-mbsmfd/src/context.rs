@@ -708,9 +708,24 @@ impl MbSmfContext {
         };
         let list = map.entry(id).or_default();
         if !list.contains(&context) {
-            list.push(context);
+            list.push(context.clone());
         }
+        drop(map);
+        drop(session_list);
+        // R24: the AMF hands a session reusing a released session's TMGI the same
+        // `mbsContextRef`, so a parked delete of it must not run.
+        crate::reconcile::unpark(&context);
         true
+    }
+
+    /// R24: whether a live session holds the AMF context `c` (same AMF, same
+    /// `mbsContextRef`).
+    pub fn amf_context_in_use(&self, c: &AmfMbsContext) -> bool {
+        self.amf_contexts.lock().is_ok_and(|m| {
+            m.values()
+                .flatten()
+                .any(|h| h.host == c.host && h.port == c.port && h.context_ref == c.context_ref)
+        })
     }
 
     /// #1758: take every AMF MBS context recorded for session `id`, for its release.

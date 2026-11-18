@@ -60,18 +60,18 @@ impl NgapServer {
                     Ok(()) => log::info!(
                         "Broadcast MBS context {}: {:?} Request sent to association \
                          {association_id}",
-                        send.session_id,
+                        send.id,
                         send.procedure
                     ),
                     Err(e) => {
                         log::warn!(
                             "Broadcast MBS context {}: {:?} Request to association \
                              {association_id} failed: {e}",
-                            send.session_id,
+                            send.id,
                             send.procedure
                         );
                         notifies.extend(mcast.broadcast_send_failed(
-                            send.session_id,
+                            send.id,
                             send.procedure,
                             association_id,
                         ));
@@ -449,7 +449,10 @@ mod tests {
         ))));
         if let Ok(id) = context_ref.parse::<u64>() {
             for _ in 0..200 {
-                if crate::context::amf_mcast().session_find(id).is_none() {
+                if crate::context::amf_mcast()
+                    .broadcast_context_find(id)
+                    .is_none()
+                {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(2)).await;
@@ -865,10 +868,7 @@ mod tests {
         let create = start_create(create_request("017965", uri, json!({}))).await;
         server.process_mbs_broadcast().await;
         assert_eq!(assocs(&take_sent_ngap(&mut server)), vec![1, 2]);
-        let id = mcast
-            .session_find_by_tmgi(&t)
-            .expect("context")
-            .mbs_session_id;
+        let id = mcast.broadcast_refs_of(&t)[0];
 
         let deleted = delete(&id.to_string()).await;
         let created = create.await.unwrap();
@@ -1006,6 +1006,366 @@ mod tests {
         assert_eq!(deleted.await.unwrap().status, 204);
     }
 
+    /// The (procedure, TMGI) of every Broadcast Session PDU sent on `assoc`, in order.
+    fn sent_on(sent: &[(u64, Vec<u8>)], assoc: u64) -> Vec<(&'static str, Tmgi)> {
+        sent.iter()
+            .filter(|(a, _)| *a == assoc)
+            .map(|(_, pdu)| {
+                if let Some(r) = decoded_release(pdu) {
+                    ("release", r.0)
+                } else {
+                    ("setup", decoded_setup(pdu).expect("a Setup or a Release").0)
+                }
+            })
+            .collect()
+    }
+
+    /// R29: a ContextDelete and a ContextCreate re-creating the same TMGI that both
+    /// land before one pump pass: each gNB receives the Release of the old session
+    /// BEFORE the Setup of the new one, so the Release cannot tear the new one down.
+    ///
+    /// REVERT-VERIFIED: with the Setup loop of `broadcast_plan` run before the
+    /// Release loop, gNB 1 receives [setup, release].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_release_precedes_the_setup_of_a_recreated_tmgi_1796() {
+        let _g = crate::test_support::MBS_CONTEXT_LOCK.lock().await;
+        crate::test_support::init_context();
+        let mut server = server_with_area_gnbs().await;
+        let t = tmgi(0x01_7968);
+        let uri = "http://127.0.0.1:9/notify";
+        let mcast = crate::context::amf_mcast();
+
+        let create = start_create(create_request("017968", uri, json!({}))).await;
+        server.process_mbs_broadcast().await;
+        take_sent_ngap(&mut server);
+        for a in [1, 2] {
+            server
+                .process_ngap_message(a, &setup_response(&t, None))
+                .await
+                .unwrap();
+        }
+        let old = body_json(&create.await.unwrap())["mbsContextRef"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Both before the next pass.
+        let deleted = delete(&old).await;
+        let recreated = start_create(create_request("017968", uri, json!({}))).await;
+        server.process_mbs_broadcast().await;
+        let sent = take_sent_ngap(&mut server);
+        for a in [1, 2] {
+            assert_eq!(
+                sent_on(&sent, a),
+                vec![("release", t.clone()), ("setup", t.clone())],
+                "gNB {a}: the old session's Release goes before the new one's Setup"
+            );
+        }
+        for a in [1, 2] {
+            server
+                .process_ngap_message(a, &release_response(&t, None))
+                .await
+                .unwrap();
+            server
+                .process_ngap_message(a, &setup_response(&t, None))
+                .await
+                .unwrap();
+        }
+        assert_eq!(deleted.await.unwrap().status, 204);
+        let new = recreated.await.unwrap();
+        assert_eq!(new.status, 201);
+        let new_ref = body_json(&new)["mbsContextRef"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(new_ref, old);
+        let mut states = mcast
+            .broadcast_gnb_states(new_ref.parse().unwrap())
+            .unwrap();
+        states.sort_unstable_by_key(|(a, _)| *a);
+        assert_eq!(
+            states,
+            vec![
+                (1, BroadcastGnbState::Established),
+                (2, BroadcastGnbState::Established)
+            ],
+            "the new session is up at both gNBs"
+        );
+        let last = delete(&new_ref).await;
+        server.process_mbs_broadcast().await;
+        for (a, _) in take_sent_ngap(&mut server) {
+            server
+                .process_ngap_message(a, &release_response(&t, None))
+                .await
+                .unwrap();
+        }
+        assert_eq!(last.await.unwrap().status, 204);
+    }
+
+    /// R29: with two releases of one TMGI outstanding at a gNB, its Release
+    /// Response settles the OLDEST (the gNB answers in the order the association
+    /// carried the Requests), every time.
+    ///
+    /// REVERT-VERIFIED: with the release map searched newest first, the first
+    /// response settles the second release and "the older release is settled first"
+    /// fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_release_response_settles_the_oldest_release_of_its_tmgi_1796() {
+        let _g = crate::test_support::MBS_CONTEXT_LOCK.lock().await;
+        crate::test_support::init_context();
+        let mut server = server_with_area_gnbs().await;
+        let t = tmgi(0x01_7969);
+        let uri = "http://127.0.0.1:9/notify";
+        let mcast = crate::context::amf_mcast();
+
+        let mut refs = Vec::new();
+        let mut deletes = Vec::new();
+        for _ in 0..2 {
+            let create = start_create(create_request("017969", uri, json!({}))).await;
+            server.process_mbs_broadcast().await;
+            take_sent_ngap(&mut server);
+            for a in [1, 2] {
+                server
+                    .process_ngap_message(a, &setup_response(&t, None))
+                    .await
+                    .unwrap();
+            }
+            let r: u64 = body_json(&create.await.unwrap())["mbsContextRef"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            deletes.push(delete(&r.to_string()).await);
+            server.process_mbs_broadcast().await;
+            take_sent_ngap(&mut server);
+            refs.push(r);
+        }
+        assert!(mcast.broadcast_releasing(refs[0]) && mcast.broadcast_releasing(refs[1]));
+        for a in [1, 2] {
+            server
+                .process_ngap_message(a, &release_response(&t, None))
+                .await
+                .unwrap();
+        }
+        assert!(
+            !mcast.broadcast_releasing(refs[0]) && mcast.broadcast_releasing(refs[1]),
+            "the older release is settled first"
+        );
+        for a in [1, 2] {
+            server
+                .process_ngap_message(a, &release_response(&t, None))
+                .await
+                .unwrap();
+        }
+        assert!(!mcast.broadcast_releasing(refs[1]));
+        for d in deletes {
+            assert_eq!(d.await.unwrap().status, 204);
+        }
+    }
+
+    /// R29: a release whose gNB stays connected and never answers ends after
+    /// RELEASE_RESPONSE_TIMEOUT, and the MB-SMF is told which NG-RAN it could not
+    /// reach (TS 29.518 §5.6.2.4) -- the entry is not left for the cap to evict.
+    ///
+    /// REVERT-VERIFIED: with the timeout check removed, the release is still
+    /// tracked and no report is sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unanswered_release_ends_and_is_reported_1796() {
+        let _g = crate::test_support::MBS_CONTEXT_LOCK.lock().await;
+        crate::test_support::init_context();
+        let (_sink, uri, seen) = notify_sink().await;
+        let mut server = server_with_area_gnbs().await;
+        let t = tmgi(0x01_7970);
+        let mcast = crate::context::amf_mcast();
+
+        let create = start_create(create_request("017970", &uri, json!({}))).await;
+        server.process_mbs_broadcast().await;
+        take_sent_ngap(&mut server);
+        server
+            .process_ngap_message(1, &setup_response(&t, None))
+            .await
+            .unwrap();
+        server
+            .process_ngap_message(2, &setup_failure(&t))
+            .await
+            .unwrap();
+        let r = body_json(&create.await.unwrap())["mbsContextRef"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let before = wait_notifies(&seen, 1).await.len();
+
+        let deleted = delete(&r).await;
+        server.process_mbs_broadcast().await;
+        assert_eq!(assocs(&take_sent_ngap(&mut server)), vec![1]);
+        assert_eq!(
+            deleted.await.unwrap().status,
+            204,
+            "answered after its wait"
+        );
+        tokio::time::sleep(crate::mbs_broadcast::RELEASE_RESPONSE_TIMEOUT).await;
+        mcast.broadcast_rescan();
+        server.process_mbs_broadcast().await;
+        assert!(
+            !mcast.broadcast_releasing(r.parse().unwrap()),
+            "the unanswered release is over"
+        );
+        let notes = wait_notifies(&seen, before + 1).await;
+        assert_eq!(notes.len(), before + 1, "the MB-SMF is told");
+        let ev = &notes[before].0["operationEvents"][0];
+        assert_eq!(
+            ev["ngranFailureEventList"][0]["ngranFailureIndication"],
+            "NG_RAN_NOT_REACHABLE"
+        );
+        assert_eq!(
+            ev["ngranFailureEventList"][0]["ngranId"]["gNbId"]["gNBValue"],
+            "00000001"
+        );
+    }
+
+    /// #1818 (ported, now with a gNB): a ContextDelete keeps an MBS session the
+    /// multicast path holds under the same TMGI. The broadcast context joins it;
+    /// its delete releases the broadcast session at the gNB and leaves the
+    /// multicast session, with its gNB state, in place.
+    ///
+    /// REVERT-VERIFIED: with `drop_broadcast_session` removing a session the
+    /// context did not create, "the multicast session survives" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn context_delete_keeps_a_multicast_session_sharing_the_tmgi_1818() {
+        let _g = crate::test_support::MBS_CONTEXT_LOCK.lock().await;
+        crate::test_support::init_context();
+        let mut server = server_with_area_gnbs().await;
+        let t = tmgi(0x18_1800);
+        let uri = "http://127.0.0.1:9/notify";
+        let mcast = crate::context::amf_mcast();
+        let multicast = mcast
+            .session_create(t.clone(), 1, None, vec![1])
+            .expect("multicast session");
+        mcast.session_activate(
+            multicast.mbs_session_id,
+            crate::ngap_mcast::McastTransportInfo {
+                dl_teid: 0x1818,
+                transport_addr: std::net::Ipv4Addr::new(239, 0, 18, 18),
+            },
+            &[1818],
+        );
+
+        let create = start_create(create_request("181800", uri, json!({}))).await;
+        server.process_mbs_broadcast().await;
+        take_sent_ngap(&mut server);
+        for a in [1, 2] {
+            server
+                .process_ngap_message(a, &setup_response(&t, None))
+                .await
+                .unwrap();
+        }
+        let r = body_json(&create.await.unwrap())["mbsContextRef"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            mcast
+                .broadcast_context_find(r.parse().unwrap())
+                .unwrap()
+                .session_id,
+            multicast.mbs_session_id,
+            "the broadcast context joins the multicast session sharing its TMGI"
+        );
+        let deleted = delete(&r).await;
+        server.process_mbs_broadcast().await;
+        let sent = take_sent_ngap(&mut server);
+        assert_eq!(
+            assocs(&sent),
+            vec![1, 2],
+            "the broadcast session is released"
+        );
+        for (a, _) in &sent {
+            server
+                .process_ngap_message(*a, &release_response(&t, None))
+                .await
+                .unwrap();
+        }
+        assert_eq!(deleted.await.unwrap().status, 204);
+        let kept = mcast
+            .session_find(multicast.mbs_session_id)
+            .expect("the multicast session survives the broadcast ContextDelete");
+        assert_eq!(kept.gnb_sessions.len(), 1, "with its gNB state");
+        assert_eq!(delete(&r).await.await.unwrap().status, 404);
+        mcast.session_remove(multicast.mbs_session_id);
+    }
+
+    /// #1818 (ported, now with a gNB): two MB-SMFs' contexts on one TMGI share the
+    /// broadcast session -- one Setup per gNB. The first delete releases its
+    /// context only (no Release on N2, the session kept for the other); the last
+    /// delete releases it at the gNBs and removes it. A repeat from the same
+    /// MB-SMF is a retry and gets its own context back.
+    ///
+    /// REVERT-VERIFIED: with the "other context rides on it" check removed from
+    /// `broadcast_delete`, the first delete sends a Release and "no Release while
+    /// the other context rides on it" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_last_broadcast_context_on_a_tmgi_releases_its_session_1818() {
+        let _g = crate::test_support::MBS_CONTEXT_LOCK.lock().await;
+        crate::test_support::init_context();
+        let mut server = server_with_area_gnbs().await;
+        let t = tmgi(0x18_1801);
+        let uri = "http://127.0.0.1:9/notify";
+        let mcast = crate::context::amf_mcast();
+        let from = |id: &str| json!({ "mbsmfId": id });
+
+        let create = start_create(create_request("181801", uri, from("mbsmf-a"))).await;
+        server.process_mbs_broadcast().await;
+        assert_eq!(assocs(&take_sent_ngap(&mut server)), vec![1, 2]);
+        for a in [1, 2] {
+            server
+                .process_ngap_message(a, &setup_response(&t, None))
+                .await
+                .unwrap();
+        }
+        let a = body_json(&create.await.unwrap())["mbsContextRef"].clone();
+        let a_again =
+            crate::namf_request_handler(create_request("181801", uri, from("mbsmf-a"))).await;
+        assert_eq!(
+            body_json(&a_again)["mbsContextRef"],
+            a,
+            "a retry is the same context"
+        );
+        let b = crate::namf_request_handler(create_request("181801", uri, from("mbsmf-b"))).await;
+        assert_eq!(b.status, 201, "answered with the session's state");
+        let b = body_json(&b)["mbsContextRef"].clone();
+        assert_ne!(a, b, "another MB-SMF gets a context of its own");
+        server.process_mbs_broadcast().await;
+        assert!(take_sent_ngap(&mut server).is_empty(), "no second Setup");
+
+        let first = delete(a.as_str().unwrap()).await.await.unwrap();
+        assert_eq!(first.status, 204);
+        server.process_mbs_broadcast().await;
+        assert!(
+            take_sent_ngap(&mut server).is_empty(),
+            "no Release while the other context rides on it"
+        );
+        assert!(
+            mcast.session_find_by_tmgi(&t).is_some(),
+            "kept for the other context"
+        );
+
+        let last = delete(b.as_str().unwrap()).await;
+        server.process_mbs_broadcast().await;
+        let sent = take_sent_ngap(&mut server);
+        assert_eq!(assocs(&sent), vec![1, 2], "the last context releases it");
+        for (a, _) in &sent {
+            server
+                .process_ngap_message(*a, &release_response(&t, None))
+                .await
+                .unwrap();
+        }
+        assert_eq!(last.await.unwrap().status, 204);
+        assert!(
+            mcast.session_find_by_tmgi(&t).is_none(),
+            "the last context removes the session it created"
+        );
+    }
+
     /// The context map is capped: past the cap a ContextCreate stores nothing.
     ///
     /// REVERT-VERIFIED: with the capacity check removed, the second context is stored.
@@ -1021,6 +1381,7 @@ mod tests {
             setup_transfer: setup_transfer(),
             notify_uri: "http://127.0.0.1:9/n".into(),
             max_response_time: None,
+            mbsmf_id: None,
         };
         let now = std::time::Instant::now();
         assert!(matches!(

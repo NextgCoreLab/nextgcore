@@ -47049,6 +47049,8 @@ mod tests {
     /// names no session the AMF holds, and changes nothing.
     #[tokio::test]
     async fn an_mbs_activation_response_completes_the_session_it_names() {
+        // #1822 item 2: the process-global MBS contexts.
+        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
         use crate::ngap_mcast::{MbsSessionState, McastTransportInfo, Tmgi};
         let mut server = test_ngap_server().await;
         let assoc = 9417u64;
