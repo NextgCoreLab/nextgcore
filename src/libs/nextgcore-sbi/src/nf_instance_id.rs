@@ -69,6 +69,24 @@ pub fn type_env_var(nf_type: NfType) -> String {
     format!("NEXTGCORE_{t}_INSTANCE_ID")
 }
 
+/// #1680: the per-type variable's name before `NfType::Mbsmf` was spelled
+/// `MB_SMF` (TS 29.510 §6.1.6.3.3), still read after [`type_env_var`]'s, so a
+/// deployment that sets the old name keeps its pinned ID.
+pub fn legacy_type_env_var(nf_type: NfType) -> Option<&'static str> {
+    match nf_type {
+        NfType::Mbsmf => Some("NEXTGCORE_MBSMF_INSTANCE_ID"),
+        _ => None,
+    }
+}
+
+/// The ID pinned for `nf_type` by its per-type variable, and the variable's name:
+/// [`type_env_var`], else [`legacy_type_env_var`]. `env` reads one variable.
+fn per_type_pin(nf_type: NfType, env: impl Fn(&str) -> Option<String>) -> Option<(String, String)> {
+    std::iter::once(type_env_var(nf_type))
+        .chain(legacy_type_env_var(nf_type).map(str::to_string))
+        .find_map(|var| env(&var).map(|id| (id, var)))
+}
+
 /// Pin this NF's instance ID before anything reads it, overriding both
 /// environment sources.
 ///
@@ -103,8 +121,15 @@ pub fn nf_instance_id(nf_type: NfType) -> &'static str {
             return id;
         }
         let per_type = type_env_var(nf_type);
-        if let Some(id) = non_empty_env(&per_type) {
-            log::info!("nfInstanceId {id} pinned by {per_type}");
+        if let Some((id, var)) = per_type_pin(nf_type, non_empty_env) {
+            if var == per_type {
+                log::info!("nfInstanceId {id} pinned by {per_type}");
+            } else {
+                log::warn!(
+                    "nfInstanceId {id} pinned by {var}, the name this variable had before \
+                     #1680; set {per_type} instead"
+                );
+            }
             return id;
         }
         let id = uuid::Uuid::new_v4().to_string();
@@ -152,6 +177,46 @@ mod tests {
         assert!(type_env_var(NfType::Smf)
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_'));
+    }
+
+    /// #1680: the MB-SMF's variable follows its TS 29.510 name, MB_SMF, and the name
+    /// it had before (`NEXTGCORE_MBSMF_INSTANCE_ID`) still pins it when the new one
+    /// is unset. The new name wins when both are set. No other type has an alias.
+    ///
+    /// REVERT-VERIFIED: with `legacy_type_env_var` answering `None`, the legacy-only
+    /// case is `None`.
+    #[test]
+    fn the_mb_smf_instance_id_variable_and_its_legacy_name_1680() {
+        assert_eq!(type_env_var(NfType::Mbsmf), "NEXTGCORE_MB_SMF_INSTANCE_ID");
+        let env = |set: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                set.iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert_eq!(
+            per_type_pin(
+                NfType::Mbsmf,
+                env(&[("NEXTGCORE_MBSMF_INSTANCE_ID", "old")])
+            ),
+            Some(("old".to_string(), "NEXTGCORE_MBSMF_INSTANCE_ID".to_string()))
+        );
+        assert_eq!(
+            per_type_pin(
+                NfType::Mbsmf,
+                env(&[
+                    ("NEXTGCORE_MBSMF_INSTANCE_ID", "old"),
+                    ("NEXTGCORE_MB_SMF_INSTANCE_ID", "new"),
+                ])
+            ),
+            Some((
+                "new".to_string(),
+                "NEXTGCORE_MB_SMF_INSTANCE_ID".to_string()
+            ))
+        );
+        assert_eq!(legacy_type_env_var(NfType::Smf), None);
+        assert_eq!(per_type_pin(NfType::Smf, env(&[])), None);
     }
 
     /// An empty pin must fall through rather than register this NF under "".

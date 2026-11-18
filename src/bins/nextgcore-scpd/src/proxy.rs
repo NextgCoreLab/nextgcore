@@ -331,7 +331,8 @@ fn nf_type_from_str(s: &str) -> Option<NfType> {
         "SCP" => NfType::Scp,
         "NSSAAF" => NfType::Nssaaf,
         "MFAF" => NfType::Mfaf,
-        "MBSMF" => NfType::Mbsmf,
+        // #1680: TS 29.510 spells it MB_SMF; "MBSMF" is accepted on input only.
+        "MB_SMF" | "MBSMF" => NfType::Mbsmf,
         "MBSTF" => NfType::Mbstf,
         "PANF" => NfType::Panf,
         "TSCTSF" => NfType::Tsctsf,
@@ -2223,6 +2224,16 @@ impl ScpProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1680: the SCP scopes a token for the MB-SMF from either spelling, and maps
+    /// it to the library's `MB_SMF`.
+    #[test]
+    fn the_scp_maps_both_mb_smf_spellings_1680() {
+        for raw in ["MB_SMF", "mb_smf", "MBSMF"] {
+            assert_eq!(nf_type_from_str(raw), Some(NfType::Mbsmf), "{raw}");
+        }
+        assert_eq!(NfType::Mbsmf.to_str(), "MB_SMF");
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
 
     // ------------------------------------------------------------------

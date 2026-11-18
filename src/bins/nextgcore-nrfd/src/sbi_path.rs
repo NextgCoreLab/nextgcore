@@ -1527,13 +1527,16 @@ mod tests {
         assert_eq!(nf_type_from_str("EASDF"), Some(NfType::Easdf));
         assert_eq!(nf_type_from_str("TSCTSF"), Some(NfType::Tsctsf));
         assert_eq!(nf_type_from_str("NSACF"), Some(NfType::Nsacf));
+        // #1680: TS 29.510 spells it MB_SMF; the legacy MBSMF still parses.
+        assert_eq!(nf_type_from_str("MB_SMF"), Some(NfType::Mbsmf));
         assert_eq!(nf_type_from_str("MBSMF"), Some(NfType::Mbsmf));
         // Underscored spellings from TS 29.510 must parse too.
         assert_eq!(nf_type_from_str("5G_EIR"), Some(NfType::FiveGEir));
         assert_eq!(nf_type_from_str("SMSF_5G"), Some(NfType::Smsf5G));
         // None of them may resolve to AMF.
         for raw in [
-            "SEPP", "UPF", "NWDAF", "CHF", "EASDF", "TSCTSF", "NSACF", "MBSMF", "5G_EIR", "SMSF_5G",
+            "SEPP", "UPF", "NWDAF", "CHF", "EASDF", "TSCTSF", "NSACF", "MB_SMF", "MBSMF", "5G_EIR",
+            "SMSF_5G",
         ] {
             assert_ne!(
                 nf_type_from_str(raw),
