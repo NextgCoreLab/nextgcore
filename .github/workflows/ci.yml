@@ -309,6 +309,7 @@ jobs:
         nextgcore-pcfd:intent-loop
         nextgcore-pcfd:demo-d441a-congestion-loop
         nextgcore-amfd:ntn
+        nextgcore-amfd:demo-d440a-ai-paging
         nextgcore-amfd:demo-d440c-nwdaf-paging
         nextgcore-nefd:demo-d445a-fl-t8
         nextgcore-nsacfd:sla-observe

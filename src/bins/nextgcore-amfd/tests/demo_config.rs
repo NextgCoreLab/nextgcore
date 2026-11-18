@@ -2,7 +2,9 @@
 //! binary. An unknown key or mode fails start-up, with no fallback. An active
 //! `d440c-nwdaf-paging` logs the banner and the effective paging strategy and
 //! exports `nextg_demo_enabled`. The kill switch and an absent block leave the
-//! process unchanged.
+//! process unchanged. nextgsim#462: an active `d440a-ai-paging` forces
+//! `recommended-first` and exports `amf_paging_attempts_total`; it and
+//! `d440c-nwdaf-paging` together fail start-up.
 
 use std::io::Read;
 use std::net::{TcpListener, UdpSocket};
@@ -93,7 +95,7 @@ fn run_to_exit(config: &std::path::Path) -> (bool, String) {
 }
 
 /// The `/metrics` body once it answers.
-#[cfg(feature = "demo-d440c-nwdaf-paging")]
+#[cfg(any(feature = "demo-d440a-ai-paging", feature = "demo-d440c-nwdaf-paging"))]
 fn scrape(port: u16, within: Duration) -> Option<String> {
     use std::io::Write;
     let deadline = Instant::now() + within;
@@ -111,7 +113,7 @@ fn scrape(port: u16, within: Duration) -> Option<String> {
 }
 
 /// Kill a running amfd and return its stderr.
-#[cfg(feature = "demo-d440c-nwdaf-paging")]
+#[cfg(any(feature = "demo-d440a-ai-paging", feature = "demo-d440c-nwdaf-paging"))]
 fn stop(mut child: Killed) -> String {
     let _ = child.0.kill();
     let _ = child.0.wait();
@@ -220,4 +222,117 @@ fn the_kill_switch_and_an_absent_block_are_demo_off() {
         assert!(!err.contains("[demo:"), "{tag}: {err}");
         assert!(err.contains("Paging strategy: registration-area"), "{tag}: {err}");
     }
+}
+
+fn d440a_block(mode: &str) -> String {
+    format!("demo:\n  enabled: true\n  d440a-ai-paging:\n    enabled: true\n    mode: {mode}\n")
+}
+
+/// Without the feature, `d440a-ai-paging` is an unknown key.
+#[cfg(not(feature = "demo-d440a-ai-paging"))]
+#[test]
+fn the_d440a_key_fails_startup_in_a_build_without_its_feature() {
+    let (ok, err) = run_to_exit(&config("d440a-no-feature", &d440a_block("ct")));
+    assert!(!ok, "start-up must fail");
+    assert!(err.contains("UnknownKey"), "{err}");
+}
+
+/// nextgsim#462's invalid-mode arm: no fallback, and amfd's own strategy names
+/// are not demo modes.
+#[cfg(feature = "demo-d440a-ai-paging")]
+#[test]
+fn a_d440a_mode_the_gnb_does_not_have_fails_startup_with_unknown_mode() {
+    for mode in ["bogus", "recommended-first"] {
+        let (ok, err) = run_to_exit(&config(&format!("d440a-{mode}"), &d440a_block(mode)));
+        assert!(!ok, "{mode}: start-up must fail");
+        assert!(
+            err.contains(&format!(
+                r#"UnknownMode {{ demo: "d440a-ai-paging", mode: "{mode}""#
+            )),
+            "{mode}: {err}"
+        );
+    }
+}
+
+/// Mode `ct` (and `page-all`, the baseline arm): the banner, the forced
+/// `recommended-first` line, `nextg_demo_enabled` and the attempts counter.
+#[cfg(feature = "demo-d440a-ai-paging")]
+#[test]
+fn a_d440a_mode_logs_the_banner_and_the_forced_strategy_and_exports_the_metrics() {
+    for mode in ["ct", "page-all"] {
+        let port = free_tcp();
+        let child = spawn(
+            &config(&format!("d440a-on-{mode}"), &d440a_block(mode)),
+            port,
+        );
+        let body = scrape(port, Duration::from_secs(30)).expect("/metrics");
+        assert!(
+            body.contains(&format!(
+                r#"nextg_demo_enabled{{demo="d440a-ai-paging",mode="{mode}"}} 1"#
+            )),
+            "{mode}: {body}"
+        );
+        assert!(
+            body.contains(r#"amf_paging_attempts_total{scope="recommended"} 0"#)
+                && body.contains(r#"amf_paging_attempts_total{scope="registration-area"} 0"#),
+            "{mode}: {body}"
+        );
+        let err = stop(child);
+        assert!(
+            err.contains(&format!("DEMO MODE ACTIVE: d440a-ai-paging={mode}")),
+            "{mode}: {err}"
+        );
+        assert!(
+            err.contains(&format!(
+                "[demo:d440a-ai-paging] Paging strategy: recommended-first (mode {mode} \
+                 supersedes amf.paging.strategy: registration-area)"
+            )),
+            "{mode}: {err}"
+        );
+    }
+}
+
+/// The demo-off arms in a d440a build: the kill switch off, and no block with
+/// `paging.strategy: recommended-first` set (the base feature on its own). No
+/// banner, no `[demo:` line, no `nextg_demo_enabled`, no attempts counter.
+#[cfg(feature = "demo-d440a-ai-paging")]
+#[test]
+fn d440a_demo_off_exports_nothing_of_the_demo() {
+    for (tag, demo) in [
+        (
+            "d440a-killswitch",
+            "demo:\n  enabled: false\n  d440a-ai-paging:\n    enabled: true\n    mode: ct\n",
+        ),
+        (
+            "d440a-base-feature",
+            "  paging:\n    strategy: recommended-first\n",
+        ),
+    ] {
+        let port = free_tcp();
+        let child = spawn(&config(tag, demo), port);
+        let body = scrape(port, Duration::from_secs(30)).expect("/metrics");
+        assert!(!body.contains("nextg_demo_enabled"), "{tag}: {body}");
+        assert!(!body.contains("amf_paging_attempts_total"), "{tag}: {body}");
+        let err = stop(child);
+        assert!(!err.contains("DEMO MODE ACTIVE"), "{tag}: {err}");
+        assert!(!err.contains("[demo:"), "{tag}: {err}");
+    }
+}
+
+/// Both paging demos at once: each would supersede the other's strategy, so
+/// start-up fails by name before either is installed.
+#[cfg(all(feature = "demo-d440a-ai-paging", feature = "demo-d440c-nwdaf-paging"))]
+#[test]
+fn both_paging_demos_at_once_fail_startup() {
+    let (ok, err) = run_to_exit(&config(
+        "both",
+        "demo:\n  enabled: true\n  d440a-ai-paging:\n    enabled: true\n    mode: ct\n  \
+         d440c-nwdaf-paging:\n    enabled: true\n    mode: nwdaf-mobility\n",
+    ));
+    assert!(!ok, "start-up must fail");
+    assert!(err.contains("PagingDemoConflict"), "{err}");
+    assert!(
+        !err.contains("DEMO MODE ACTIVE"),
+        "nothing installed: {err}"
+    );
 }
