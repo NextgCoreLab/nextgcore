@@ -295,6 +295,27 @@ async fn main() -> Result<()> {
     // Open SBI server (lifecycle state)
     scp_sbi_open(Some(sbi_config)).map_err(|e| anyhow::anyhow!(e))?;
 
+    // #1868: say how producers are dialled. Under production the forwarding
+    // client is https-only with the SCP's own client certificate and the profile
+    // CA, and an `http` target is refused rather than dialled.
+    if defaults.sbi_profile.is_production() {
+        log::info!(
+            "SCP forwarding: production SBI profile, https only; CA={} client \
+             certificate={}",
+            defaults.forward_tls.ca_cert,
+            defaults
+                .forward_tls
+                .client_cert
+                .as_deref()
+                .unwrap_or("NONE (an mTLS producer will refuse the SCP)")
+        );
+    } else {
+        log::warn!(
+            "SCP forwarding: dev SBI profile, each target's own scheme (http allowed); a \
+             consumer's bearer token can be forwarded in cleartext"
+        );
+    }
+
     // Start the actual HTTP/2 proxy (TS 29.500 §6.10: Model C + Model D)
     let scp_proxy = Arc::new(ScpProxy::new(ScpProxyConfig {
         nrf_uri,

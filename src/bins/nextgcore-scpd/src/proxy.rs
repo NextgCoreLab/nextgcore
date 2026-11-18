@@ -32,6 +32,7 @@ use nextgcore_sbi::message::{
     ProblemDetails, SbiHttpMessage, SbiRequest, SbiResponse, UriComponents,
 };
 use nextgcore_sbi::oauth::{OAuth2Client, TokenConsumer};
+use nextgcore_sbi::security::{SbiProfile, TlsPaths};
 use nextgcore_sbi::types::{NfType, UriScheme};
 use nextgcore_sbi::SbiError;
 
@@ -157,6 +158,19 @@ pub struct ScpProxyConfig {
     /// Clamped to at least 1. Only reached on a *provably undelivered* forward, so
     /// this is not a retry budget for a producer that answered.
     pub max_producer_attempts: usize,
+    /// The SBI security profile the forwarding client follows (#1868,
+    /// TS 33.501 §13.1.0). Under [`SbiProfile::Production`] every forwarded
+    /// request goes over `https` with [`Self::forward_tls`]; a target whose
+    /// apiRoot is `http` is refused, never dialled, so a consumer's bearer (Model
+    /// C) or a delegated one (Model D) cannot leave the SCP in cleartext. Under
+    /// [`SbiProfile::Dev`] the target's own scheme is used, as before. Defaults to
+    /// [`SbiProfile::resolve`].
+    pub sbi_profile: SbiProfile,
+    /// The TLS material the forwarding client uses under production: the profile
+    /// CA verifies the producer and the SCP's own client certificate is presented
+    /// to it (mTLS, TS 33.501 §13.1.0). Defaults to [`TlsPaths::from_env`], the
+    /// same files and `NEXTGCORE_SBI_TLS_*` overrides every NF dials peers with.
+    pub forward_tls: TlsPaths,
 }
 
 /// Default number of producers one Model D request may be forwarded to
@@ -178,6 +192,8 @@ impl Default for ScpProxyConfig {
             circuit_open_timeout: DEFAULT_CIRCUIT_OPEN_TIMEOUT,
             trust_requester_identity: false,
             max_producer_attempts: DEFAULT_MAX_PRODUCER_ATTEMPTS,
+            sbi_profile: SbiProfile::resolve(),
+            forward_tls: TlsPaths::from_env(),
         }
     }
 }
@@ -646,6 +662,24 @@ fn upstream_error_response(target: &str, err: &SbiError) -> SbiResponse {
     }
 }
 
+/// The 400 for a pinned `http` target under the production profile (#1868).
+///
+/// TS 33.501 §13.1.0 puts every SBI hop on TLS, and the request names a target
+/// the SCP may not dial, so the header the consumer supplied is incorrect:
+/// `MANDATORY_IE_INCORRECT` (TS 29.500 Table 5.2.7.2-1), as for any other
+/// unusable `3gpp-Sbi-Target-apiRoot`.
+fn cleartext_target_response(target: &str) -> SbiResponse {
+    problem_response(
+        400,
+        "Bad Request",
+        &format!(
+            "Target {target} is not https; under the production SBI profile the SCP \
+             forwards over TLS only (TS 33.501 §13.1.0)"
+        ),
+        "MANDATORY_IE_INCORRECT",
+    )
+}
+
 /// Map a transport failure while querying the NRF for delegated discovery
 /// (scpd-#211, TS 29.500 §6.10.8.2).
 ///
@@ -1107,13 +1141,41 @@ impl ScpProxy {
         if let Some(client) = self.clients.get(&key) {
             return client;
         }
+        let client = Arc::new(SbiClient::new(self.forward_client_config(target)));
+        self.clients.insert(key, client.clone());
+        client
+    }
+
+    /// Whether the profile forbids dialling `target`: under production the SCP
+    /// forwards over `https` only (#1868, TS 33.501 §13.1.0). Checked before any
+    /// client is built, so a refused target is never contacted.
+    fn refuses_cleartext(&self, target: &ApiRoot) -> bool {
+        self.config.sbi_profile.is_production() && target.scheme == UriScheme::Http
+    }
+
+    /// The client configuration for forwarding to `target` (#1868).
+    ///
+    /// Under [`SbiProfile::Dev`] it is the target's own scheme with no TLS
+    /// material, exactly as before. Under [`SbiProfile::Production`] it is
+    /// `https`, verifies the producer against the profile CA and presents the
+    /// SCP's own client certificate: an mTLS producer refuses a client with no
+    /// certificate, and public roots do not anchor an operator PKI. Only reached
+    /// for an `https` target there; [`Self::refuses_cleartext`] stops `http`
+    /// first.
+    fn forward_client_config(&self, target: &ApiRoot) -> SbiClientConfig {
         let mut config = SbiClientConfig::new(target.host.clone(), target.port)
             .with_connect_timeout(self.config.connect_timeout)
             .with_request_timeout(self.config.request_timeout);
-        config.scheme = target.scheme;
-        let client = Arc::new(SbiClient::new(config));
-        self.clients.insert(key, client.clone());
-        client
+        if !self.config.sbi_profile.is_production() {
+            config.scheme = target.scheme;
+            return config;
+        }
+        let tls = &self.config.forward_tls;
+        let mut config = config.with_https();
+        config.ca_cert = Some(tls.ca_cert.clone());
+        config.client_cert = tls.client_cert.clone();
+        config.client_key = tls.client_key.clone();
+        config
     }
 
     /// Get or create the pooled client for this SCP's NRF (delegated
@@ -1149,10 +1211,7 @@ impl ScpProxy {
         if let Some(client) = self.oauth_clients.get(&key) {
             return Some(client);
         }
-        let mut config = SbiClientConfig::new(target.host.clone(), target.port)
-            .with_connect_timeout(self.config.connect_timeout)
-            .with_request_timeout(self.config.request_timeout);
-        config.scheme = target.scheme;
+        let config = self.forward_client_config(target);
         let client = Arc::new(SbiClient::new(config).with_oauth2(oauth2, target_nf_type));
         self.oauth_clients.insert(key, client.clone());
         Some(client)
@@ -1380,9 +1439,15 @@ impl ScpProxy {
             return None;
         }
 
-        // A bare authority carries no scheme. `http` matches the scheme the SCP
-        // listens on and the one ApiRoot::parse defaults elsewhere in this file.
-        ApiRoot::parse(&format!("http://{authority}"))
+        // A bare authority carries no scheme. Under dev `http` matches the scheme
+        // the SCP listens on; under production the SBI is TLS end to end, so the
+        // callback is dialled over `https` (#1868).
+        let scheme = if self.config.sbi_profile.is_production() {
+            "https"
+        } else {
+            "http"
+        };
+        ApiRoot::parse(&format!("{scheme}://{authority}"))
             .ok()
             .map(|t| (t, Some(request.header.uri.clone())))
     }
@@ -1654,6 +1719,18 @@ impl ScpProxy {
         relay: RelayContext<'_>,
         delegated: Option<DelegatedAuth>,
     ) -> SbiResponse {
+        // #1868: a pinned target (Model C Target-apiRoot, a callback URI, a learnt
+        // binding) is the consumer's or producer's choice, so naming an `http`
+        // one under production is a bad request, refused before anything is
+        // dialled. Its bearer, if any, never leaves the SCP.
+        if self.refuses_cleartext(target) {
+            log::warn!(
+                "SCP: refusing to forward to cleartext target {} under the production \
+                 SBI profile",
+                target.to_uri()
+            );
+            return self.stamp_server(cleartext_target_response(&target.to_uri()));
+        }
         match self.forward_once(request, target, relay, delegated).await {
             ForwardOutcome::Answered(response) | ForwardOutcome::Final(response) => response,
             // A single pinned target has no alternates, so "undeliverable" is the
@@ -1745,6 +1822,24 @@ impl ScpProxy {
         // gap #209 names: the breaker stopped us hammering a dead producer but did
         // not send us to a live one, so the first request after the circuit opened
         // still failed.
+        // #1868: under production a discovered producer advertising `http` is not
+        // a usable endpoint. Reported undeliverable (nothing was sent), so Model D
+        // reselection moves on to an `https` candidate instead of leaking the
+        // delegated token in cleartext. Pinned targets were refused in `forward`.
+        if self.refuses_cleartext(target) {
+            log::warn!(
+                "SCP: skipping cleartext producer {} under the production SBI profile",
+                target.to_uri()
+            );
+            return ForwardOutcome::Undeliverable(Undeliverable {
+                target: target.to_uri(),
+                error: Some(SbiError::TlsError(format!(
+                    "{} is not https; the production SBI profile forwards over TLS only",
+                    target.to_uri()
+                ))),
+            });
+        }
+
         let target_key = target.authority_key();
         if !self.circuit_allows(&target_key) {
             return ForwardOutcome::Undeliverable(Undeliverable {
@@ -2225,6 +2320,17 @@ impl ScpProxy {
 mod tests {
     use super::*;
 
+    /// The proxy config these tests run under: the dev profile, because every
+    /// peer here is a loopback cleartext stand-in (#1868). Set on the config
+    /// rather than through the process-global override, so the production tests
+    /// below can sit beside them without a lock.
+    fn dev_config() -> ScpProxyConfig {
+        ScpProxyConfig {
+            sbi_profile: SbiProfile::Dev,
+            ..ScpProxyConfig::default()
+        }
+    }
+
     /// #1680: the SCP scopes a token for the MB-SMF from either spelling, and maps
     /// it to the library's `MB_SMF`.
     #[test]
@@ -2391,7 +2497,7 @@ mod tests {
             "bl=nf-instance;nfinst=54804518"
         );
 
-        let proxy = ScpProxy::new(ScpProxyConfig::default());
+        let proxy = ScpProxy::new(dev_config());
         let target = ApiRoot::parse("http://smf1:7778").unwrap();
         proxy.binding_store("bl=nf-instance; nfinst=54804518", &target);
         // Lookup with different casing/whitespace still hits.
@@ -2404,7 +2510,7 @@ mod tests {
 
     #[test]
     fn test_route_decision_priority() {
-        let proxy = ScpProxy::new(ScpProxyConfig::default());
+        let proxy = ScpProxy::new(dev_config());
 
         // Target-apiRoot wins even when discovery headers are present.
         let mut req = SbiRequest::get("/nudm-sdm/v1/x");
@@ -2441,7 +2547,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reject_without_routing_headers_is_400_problem() {
-        let proxy = ScpProxy::new(ScpProxyConfig::default());
+        let proxy = ScpProxy::new(dev_config());
         let response = proxy.handle(SbiRequest::get("/nudm-sdm/v1/x")).await;
         assert_eq!(response.status, 400);
         assert_eq!(
@@ -2457,7 +2563,7 @@ mod tests {
     async fn test_discovery_missing_requester_nf_type_is_400() {
         let proxy = ScpProxy::new(ScpProxyConfig {
             nrf_uri: Some("http://127.0.0.1:1".into()),
-            ..Default::default()
+            ..dev_config()
         });
         let mut req = SbiRequest::get("/nudm-sdm/v1/x");
         req.http.set_header(discovery_header::TARGET_NF_TYPE, "UDM");
@@ -2474,7 +2580,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_discovery_without_nrf_configured_is_503() {
-        let proxy = ScpProxy::new(ScpProxyConfig::default());
+        let proxy = ScpProxy::new(dev_config());
         let mut req = SbiRequest::get("/nudm-sdm/v1/x");
         req.http.set_header(discovery_header::TARGET_NF_TYPE, "UDM");
         req.http
@@ -2487,7 +2593,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_invalid_target_apiroot_is_400() {
-        let proxy = ScpProxy::new(ScpProxyConfig::default());
+        let proxy = ScpProxy::new(dev_config());
         let mut req = SbiRequest::get("/nudm-sdm/v1/x");
         req.http.set_target_apiroot("not-a-uri");
         let response = proxy.handle(req).await;
@@ -2605,7 +2711,7 @@ mod tests {
         let scp_listener = reserve_port();
         let scp_port = scp_listener.port();
         let producer = start_mock_producer(producer_listener).await;
-        let scp = start_scp(scp_listener, ScpProxyConfig::default()).await;
+        let scp = start_scp(scp_listener, dev_config()).await;
 
         let request = SbiRequest::post("/nudm-uecm/v1/registrations")
             .with_body(r#"{"hello":"world"}"#, "application/json")
@@ -2735,7 +2841,7 @@ mod tests {
             scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -2806,7 +2912,7 @@ mod tests {
             })
             .await
             .expect("producer start");
-        let scp = start_scp(scp_listener, ScpProxyConfig::default()).await;
+        let scp = start_scp(scp_listener, dev_config()).await;
 
         let request = SbiRequest::post("/nudm-uecm/v1/registrations").with_header(
             "3gpp-Sbi-Target-apiRoot",
@@ -2835,7 +2941,7 @@ mod tests {
         let proxy = ScpProxy::new(ScpProxyConfig {
             connect_timeout: Duration::from_millis(500),
             request_timeout: Duration::from_millis(500),
-            ..Default::default()
+            ..dev_config()
         });
         let mut req = SbiRequest::get("/nudm-sdm/v1/x");
         req.http.set_target_apiroot("http://127.0.0.1:1");
@@ -2865,7 +2971,7 @@ mod tests {
         let proxy = ScpProxy::new(ScpProxyConfig {
             connect_timeout: Duration::from_millis(500),
             request_timeout: Duration::from_millis(300),
-            ..Default::default()
+            ..dev_config()
         });
         let mut req = SbiRequest::get("/nudm-sdm/v1/x");
         req.http
@@ -2911,7 +3017,7 @@ mod tests {
             nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
             connect_timeout: Duration::from_millis(500),
             request_timeout: Duration::from_millis(500),
-            ..Default::default()
+            ..dev_config()
         });
         let mut req = SbiRequest::get("/nudm-sdm/v1/x");
         req.http.set_header(discovery_header::TARGET_NF_TYPE, "UDM");
@@ -2953,7 +3059,7 @@ mod tests {
             nrf_uri: Some(nrf_uri),
             connect_timeout: Duration::from_millis(500),
             request_timeout: Duration::from_millis(500),
-            ..Default::default()
+            ..dev_config()
         })
     }
 
@@ -3072,7 +3178,7 @@ mod tests {
         let proxy = ScpProxy::new(ScpProxyConfig {
             connect_timeout: Duration::from_millis(500),
             request_timeout: Duration::from_millis(500),
-            ..Default::default()
+            ..dev_config()
         });
         let mut req = SbiRequest::get("/nudm-sdm/v1/x");
         req.http.set_target_apiroot("http://127.0.0.1:1");
@@ -3229,7 +3335,7 @@ mod tests {
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 nf_instance_id: Some("scp-instance-1".into()),
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -3398,7 +3504,7 @@ mod tests {
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 nf_instance_id: Some("scp-instance-1".into()),
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -3466,7 +3572,7 @@ mod tests {
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 nf_instance_id: Some("scp-instance-1".into()),
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -3513,7 +3619,7 @@ mod tests {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 nf_instance_id: Some("scp-instance-1".into()),
                 trust_requester_identity: true,
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -3561,7 +3667,7 @@ mod tests {
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 nf_instance_id: Some("scp-instance-1".into()),
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -3610,7 +3716,7 @@ mod tests {
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 nf_instance_id: Some("scp-instance-1".into()),
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -3857,7 +3963,7 @@ mod tests {
             scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -3927,7 +4033,7 @@ mod tests {
             scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -4028,7 +4134,7 @@ mod tests {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 connect_timeout: Duration::from_millis(500),
                 request_timeout: Duration::from_millis(500),
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -4074,7 +4180,7 @@ mod tests {
             nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
             connect_timeout: Duration::from_millis(500),
             request_timeout: Duration::from_millis(500),
-            ..Default::default()
+            ..dev_config()
         });
         let exhausted = proxy.handle(model_d_uecm_request()).await;
         let problem: ProblemDetails = exhausted.json_body().unwrap();
@@ -4096,7 +4202,7 @@ mod tests {
             nrf_uri: Some(format!("http://127.0.0.1:{broken_port}")),
             connect_timeout: Duration::from_millis(500),
             request_timeout: Duration::from_millis(500),
-            ..Default::default()
+            ..dev_config()
         });
         let discovery_error = proxy.handle(model_d_uecm_request()).await;
         let problem: ProblemDetails = discovery_error.json_body().unwrap();
@@ -4141,7 +4247,7 @@ mod tests {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 connect_timeout: Duration::from_millis(500),
                 request_timeout: Duration::from_millis(500),
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -4187,7 +4293,7 @@ mod tests {
             connect_timeout: Duration::from_millis(500),
             request_timeout: Duration::from_millis(500),
             max_producer_attempts: 2,
-            ..Default::default()
+            ..dev_config()
         });
         let response = bounded.handle(model_d_uecm_request()).await;
         assert_eq!(response.status, 504, "the bound stopped the walk short");
@@ -4204,7 +4310,7 @@ mod tests {
             connect_timeout: Duration::from_millis(500),
             request_timeout: Duration::from_millis(500),
             max_producer_attempts: 3,
-            ..Default::default()
+            ..dev_config()
         });
         let response = unbounded.handle(model_d_uecm_request()).await;
         assert_eq!(response.status, 200);
@@ -4246,7 +4352,7 @@ mod tests {
                 request_timeout: Duration::from_millis(500),
                 circuit_failure_threshold: 2,
                 circuit_open_timeout: Duration::from_secs(30),
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -4343,7 +4449,7 @@ mod tests {
             nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
             connect_timeout: Duration::from_millis(500),
             request_timeout: Duration::from_millis(300),
-            ..Default::default()
+            ..dev_config()
         });
         let response = proxy.handle(model_d_uecm_request()).await;
         assert_eq!(response.status, 504);
@@ -4440,7 +4546,7 @@ mod tests {
             scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -4507,7 +4613,7 @@ mod tests {
             scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -4555,7 +4661,7 @@ mod tests {
             scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -4621,7 +4727,7 @@ mod tests {
             scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -4664,7 +4770,7 @@ mod tests {
             None,
         )
         .await;
-        let scp = start_scp(scp_listener, ScpProxyConfig::default()).await;
+        let scp = start_scp(scp_listener, dev_config()).await;
 
         let request = SbiRequest::post("/nudm-uecm/v1/registrations").with_header(
             custom_header::TARGET_APIROOT,
@@ -4772,7 +4878,7 @@ mod tests {
             nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
             connect_timeout: Duration::from_millis(500),
             request_timeout: Duration::from_millis(500),
-            ..Default::default()
+            ..dev_config()
         });
 
         let request = SbiRequest::post(format!(
@@ -4849,7 +4955,7 @@ mod tests {
             scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -4936,7 +5042,7 @@ mod tests {
             nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
             connect_timeout: Duration::from_millis(500),
             request_timeout: Duration::from_millis(500),
-            ..Default::default()
+            ..dev_config()
         });
 
         let request = SbiRequest::post(format!(
@@ -4969,7 +5075,7 @@ mod tests {
     /// falls through to ordinary routing when it names no destination at all.
     #[test]
     fn test_callback_route_precedence() {
-        let proxy = ScpProxy::new(ScpProxyConfig::default());
+        let proxy = ScpProxy::new(dev_config());
 
         // Callback + Target-apiRoot + Discovery headers -> Callback, addressed by
         // the Target-apiRoot, with no URI rewrite (the request URI is relative).
@@ -5034,7 +5140,7 @@ mod tests {
     fn a_callback_authority_names_the_target_when_no_target_apiroot_is_sent() {
         let proxy = ScpProxy::new(ScpProxyConfig {
             own_fqdn: "scp.5gc.local".to_string(),
-            ..Default::default()
+            ..dev_config()
         });
 
         // What convert_request now produces for
@@ -5067,7 +5173,7 @@ mod tests {
     fn a_callback_authority_naming_the_scp_itself_is_not_a_target() {
         let proxy = ScpProxy::new(ScpProxyConfig {
             own_fqdn: "scp.5gc.local".to_string(),
-            ..Default::default()
+            ..dev_config()
         });
 
         for authority in [
@@ -5096,7 +5202,7 @@ mod tests {
     /// destination explicitly must win over one inferred from the transport.
     #[test]
     fn target_apiroot_still_outranks_the_authority() {
-        let proxy = ScpProxy::new(ScpProxyConfig::default());
+        let proxy = ScpProxy::new(dev_config());
 
         let mut req = SbiRequest::post("/namf-comm/v1/callback");
         req.header.authority = Some("wrong.example:9999".to_string());
@@ -5152,7 +5258,7 @@ mod tests {
         let scp_listener = reserve_port();
         let scp_port = scp_listener.port();
         let producer = start_auth_echo_producer(producer_listener).await;
-        let scp = start_scp(scp_listener, ScpProxyConfig::default()).await;
+        let scp = start_scp(scp_listener, dev_config()).await;
 
         let request = SbiRequest::post("/nudm-uecm/v1/registrations")
             .with_header(
@@ -5292,7 +5398,7 @@ mod tests {
     /// SCP's own identity in the `Server` header.
     #[tokio::test]
     async fn test_scp_originated_error_carries_server_header() {
-        let proxy = ScpProxy::new(ScpProxyConfig::default());
+        let proxy = ScpProxy::new(dev_config());
         let response = proxy.handle(SbiRequest::get("/nudm-sdm/v1/x")).await;
         assert_eq!(response.status, 400);
         assert_eq!(
@@ -5310,7 +5416,7 @@ mod tests {
         let scp_listener = reserve_port();
         let scp_port = scp_listener.port();
         let producer = start_status_producer(producer_listener, 409).await;
-        let scp = start_scp(scp_listener, ScpProxyConfig::default()).await;
+        let scp = start_scp(scp_listener, dev_config()).await;
 
         let request = SbiRequest::post("/nudm-uecm/v1/registrations").with_header(
             "3gpp-Sbi-Target-apiRoot",
@@ -5344,7 +5450,7 @@ mod tests {
     /// MSG_LOOP_DETECTED before any forwarding.
     #[tokio::test]
     async fn test_ingress_via_loop_detected() {
-        let proxy = ScpProxy::new(ScpProxyConfig::default());
+        let proxy = ScpProxy::new(dev_config());
         let req = SbiRequest::get("/nudm-sdm/v1/x")
             .with_header("Via", "2.0 SCP-scp.5gc.local")
             .with_header("3gpp-Sbi-Target-apiRoot", "http://127.0.0.1:1");
@@ -5362,7 +5468,7 @@ mod tests {
     /// MAX_SCP_HOPS_REACHED.
     #[tokio::test]
     async fn test_ingress_max_hops_reached() {
-        let proxy = ScpProxy::new(ScpProxyConfig::default());
+        let proxy = ScpProxy::new(dev_config());
         let req = SbiRequest::get("/nudm-sdm/v1/x")
             .with_header(MAX_FORWARD_HOPS_HEADER, "0; nodetype=scp")
             .with_header("3gpp-Sbi-Target-apiRoot", "http://127.0.0.1:1");
@@ -5381,7 +5487,7 @@ mod tests {
         let scp_listener = reserve_port();
         let scp_port = scp_listener.port();
         let producer = start_mock_producer(producer_listener).await;
-        let scp = start_scp(scp_listener, ScpProxyConfig::default()).await;
+        let scp = start_scp(scp_listener, dev_config()).await;
 
         let request = SbiRequest::get("/nudm-uecm/v1/registrations")
             .with_header(
@@ -5415,7 +5521,7 @@ mod tests {
         let scp_listener = reserve_port();
         let scp_port = scp_listener.port();
         let producer = start_mock_producer(producer_listener).await;
-        let scp = start_scp(scp_listener, ScpProxyConfig::default()).await;
+        let scp = start_scp(scp_listener, dev_config()).await;
 
         let request = SbiRequest::get("/nudm-uecm/v1/registrations")
             .with_param("ck", "cache-key-abc")
@@ -5459,7 +5565,7 @@ mod tests {
             scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -5540,7 +5646,7 @@ mod tests {
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 nf_instance_id: Some("scp-instance-1".into()),
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -5592,7 +5698,7 @@ mod tests {
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 nf_instance_id: Some("scp-instance-1".into()),
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -5630,7 +5736,7 @@ mod tests {
             scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -5704,7 +5810,7 @@ mod tests {
             scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -5776,7 +5882,7 @@ mod tests {
             scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -5812,7 +5918,7 @@ mod tests {
             scp_listener,
             ScpProxyConfig {
                 next_hop_scp: true,
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -5874,7 +5980,7 @@ mod tests {
             scp_listener,
             ScpProxyConfig {
                 next_hop_scp: true,
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -5898,7 +6004,7 @@ mod tests {
     /// an unknown instance does not fall through to a set.
     #[test]
     fn test_set_aware_binding_reselection() {
-        let proxy = ScpProxy::new(ScpProxyConfig::default());
+        let proxy = ScpProxy::new(dev_config());
         let member = ApiRoot::parse("http://smf-setmember:7778").unwrap();
         let pinned = ApiRoot::parse("http://smf-pinned:7778").unwrap();
 
@@ -5946,7 +6052,7 @@ mod tests {
             scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -6025,7 +6131,7 @@ mod tests {
             scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -6076,7 +6182,7 @@ mod tests {
             scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -6164,7 +6270,7 @@ mod tests {
     #[test]
     fn test_via_loop_detection_is_tokenised() {
         // Default identity is SCP-scp.5gc.local.
-        let proxy = ScpProxy::new(ScpProxyConfig::default());
+        let proxy = ScpProxy::new(dev_config());
 
         // Exact self-token -> loop.
         assert!(proxy.via_lists_self("2.0 SCP-scp.5gc.local"));
@@ -6188,7 +6294,7 @@ mod tests {
         let proxy = ScpProxy::new(ScpProxyConfig {
             connect_timeout: Duration::from_millis(300),
             request_timeout: Duration::from_millis(300),
-            ..Default::default()
+            ..dev_config()
         });
 
         // Superstring peer identity: not a loop, so it forwards and fails to
@@ -6219,7 +6325,7 @@ mod tests {
         // cache_ttl of zero => every entry is immediately expired.
         let proxy = ScpProxy::new(ScpProxyConfig {
             cache_ttl: Duration::ZERO,
-            ..Default::default()
+            ..dev_config()
         });
         let target = ApiRoot::parse("http://smf1:7778").unwrap();
         proxy.binding_store("bl=nf-instance; nfinst=x", &target);
@@ -6234,7 +6340,7 @@ mod tests {
     fn test_binding_cache_is_bounded() {
         let proxy = ScpProxy::new(ScpProxyConfig {
             max_cache_entries: 2,
-            ..Default::default()
+            ..dev_config()
         });
         let t = ApiRoot::parse("http://smf:7778").unwrap();
         proxy.binding_store("bl=nf-instance; nfinst=a", &t);
@@ -6295,7 +6401,7 @@ mod tests {
             ScpProxyConfig {
                 circuit_failure_threshold: 2,
                 circuit_open_timeout: Duration::from_secs(3600),
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -6381,7 +6487,7 @@ mod tests {
             scp_listener,
             ScpProxyConfig {
                 circuit_failure_threshold: 2,
-                ..Default::default()
+                ..dev_config()
             },
         )
         .await;
@@ -6397,5 +6503,166 @@ mod tests {
 
         scp.stop().await.expect("scp stop");
         producer.stop().await.expect("producer stop");
+    }
+
+    // ------------------------------------------------------------------
+    // #1868: under the production profile the SCP forwards over TLS only
+    // ------------------------------------------------------------------
+
+    fn production_config() -> ScpProxyConfig {
+        ScpProxyConfig {
+            sbi_profile: SbiProfile::Production,
+            forward_tls: TlsPaths {
+                cert: "/tls/scp/server.crt".to_string(),
+                key: "/tls/scp/server.key".to_string(),
+                ca_cert: "/tls/ca/ca.crt".to_string(),
+                client_cert: Some("/tls/scp/client.crt".to_string()),
+                client_key: Some("/tls/scp/client.key".to_string()),
+            },
+            ..dev_config()
+        }
+    }
+
+    fn model_c_with_bearer(target: &str) -> SbiRequest {
+        let mut req = SbiRequest::get("/nudm-sdm/v2/imsi-001010000000001/am-data");
+        req.http.set_target_apiroot(target);
+        req.http
+            .set_header("Authorization", "Bearer consumer-secret-token");
+        req
+    }
+
+    /// #1868: a Model C `http` Target-apiRoot under production is a 400
+    /// ProblemDetails, and the producer is never dialled, so the consumer's
+    /// bearer does not leave the SCP in cleartext. The dev half proves the same
+    /// request does reach the same producer, so the zero is the guard's.
+    #[tokio::test]
+    async fn production_refuses_a_cleartext_model_c_target_without_dialling_it_1868() {
+        let listener = reserve_port();
+        let port = listener.port();
+        let hits = Arc::new(AtomicU64::new(0));
+        let producer = start_named_producer(listener, "cleartext", hits.clone()).await;
+        let target = format!("http://127.0.0.1:{port}");
+
+        let production = ScpProxy::new(production_config());
+        let response = production.handle(model_c_with_bearer(&target)).await;
+        assert_eq!(
+            response.status, 400,
+            "an http target is refused under production"
+        );
+        let problem: serde_json::Value = response.json_body().unwrap();
+        assert_eq!(problem["cause"], "MANDATORY_IE_INCORRECT");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the producer must not be dialled over http under production"
+        );
+
+        let dev = ScpProxy::new(dev_config());
+        let response = dev.handle(model_c_with_bearer(&target)).await;
+        assert_eq!(response.status, 200, "dev keeps the target's own scheme");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        producer.stop().await.expect("producer stop");
+    }
+
+    /// #1868: Model D under production skips a discovered `http` producer
+    /// without opening so much as a TCP connection to it (not even an upgraded
+    /// TLS one), and reselection moves on to the next candidate rather than
+    /// putting the delegated token on a cleartext hop.
+    #[tokio::test]
+    async fn production_model_d_skips_a_cleartext_candidate_1868() {
+        // A bare listener nobody accepts on: any dial, http or https, leaves a
+        // connection in its backlog for `accept` to find afterwards.
+        let (cleartext, addr) = reserve_port().into_parts();
+        cleartext.set_nonblocking(true).unwrap();
+
+        let proxy = ScpProxy::new(ScpProxyConfig {
+            connect_timeout: Duration::from_millis(500),
+            request_timeout: Duration::from_millis(500),
+            ..production_config()
+        });
+        let candidate = |uri: &str, id: &str| DiscoveredProducer {
+            target: ApiRoot::parse(uri).unwrap(),
+            nf_instance_id: id.to_string(),
+            nf_set_id: None,
+            nf_group_id: None,
+        };
+        let outcome = DiscoveryOutcome {
+            primary: candidate(&format!("http://{addr}"), "udm-cleartext"),
+            // Nothing listens on port 1: the attempt is observable as the last
+            // undeliverable target, which is how the test sees the walk moved on.
+            alternates: vec![candidate("https://127.0.0.1:1", "udm-tls")],
+        };
+        let response = proxy
+            .forward_with_reselection(&model_d_uecm_request(), outcome, None)
+            .await;
+
+        assert_eq!(
+            cleartext.accept().map(|_| ()).map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::WouldBlock),
+            "the http candidate must not be dialled at all under production"
+        );
+        assert_eq!(response.status, 504);
+        let problem: serde_json::Value = response.json_body().unwrap();
+        assert_eq!(problem["cause"], "TARGET_NF_NOT_REACHABLE");
+        assert!(
+            problem["detail"]
+                .as_str()
+                .unwrap()
+                .contains("https://127.0.0.1:1"),
+            "reselection reached the https candidate: {problem}"
+        );
+    }
+
+    /// #1868: the production forwarding client, with and without OAuth2, is
+    /// https, verifies the producer against the profile CA and presents the
+    /// SCP's own client certificate (mTLS). Dev keeps the target's scheme and
+    /// carries no TLS material.
+    #[test]
+    fn production_forwarding_client_presents_the_scp_certificate_1868() {
+        let proxy = ScpProxy::new(ScpProxyConfig {
+            nrf_uri: Some("https://nrf.5gc.example:7777".to_string()),
+            ..production_config()
+        });
+        let target = ApiRoot::parse("https://udm.5gc.example:8443").unwrap();
+        let plain = proxy.client_for(&target);
+        let tokened = proxy.oauth_client_for(&target, NfType::Udm).unwrap();
+        for config in [plain.config(), tokened.config()] {
+            assert_eq!(config.scheme, UriScheme::Https);
+            assert_eq!(config.ca_cert.as_deref(), Some("/tls/ca/ca.crt"));
+            assert_eq!(config.client_cert.as_deref(), Some("/tls/scp/client.crt"));
+            assert_eq!(config.client_key.as_deref(), Some("/tls/scp/client.key"));
+            assert!(!config.insecure_skip_verify);
+        }
+
+        let dev = ScpProxy::new(dev_config());
+        let config = dev
+            .client_for(&ApiRoot::parse("http://udm:7777").unwrap())
+            .config()
+            .clone();
+        assert_eq!(config.scheme, UriScheme::Http);
+        assert_eq!(config.ca_cert, None);
+        assert_eq!(config.client_cert, None);
+    }
+
+    /// #1868: a callback addressed by a bare authority is dialled over https
+    /// under production (it was always http), and over http under dev.
+    #[test]
+    fn production_dials_a_bare_callback_authority_over_https_1868() {
+        let callback = || {
+            let mut req = SbiRequest::post("/namf-comm/v1/callback");
+            req.header.authority = Some("amf.5gc.local:8080".to_string());
+            req.http.set_header(custom_header::CALLBACK, "Notify");
+            req
+        };
+        let scheme_of = |config: ScpProxyConfig| {
+            ScpProxy::new(config)
+                .callback_target(&callback())
+                .expect("callback target")
+                .0
+                .scheme
+        };
+        assert_eq!(scheme_of(production_config()), UriScheme::Https);
+        assert_eq!(scheme_of(dev_config()), UriScheme::Http);
     }
 }
