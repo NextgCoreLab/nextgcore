@@ -137,6 +137,41 @@ pub struct NgapMcastContext {
     tmgi_index: RwLock<HashMap<Tmgi, u64>>,
     /// Next MBS session ID allocator
     next_session_id: AtomicU64,
+    /// #1818: the Namf_MBSBroadcast contexts (ContextCreate resources), kept apart
+    /// from the MBS sessions they ride on. Taken BEFORE `sessions` and
+    /// `tmgi_index` wherever both are held, and only by the broadcast methods.
+    broadcast: std::sync::Mutex<BroadcastContexts>,
+}
+
+/// #1818: one Namf_MBSBroadcast context (TS 29.518 §5.6, `mbsContextRef`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BroadcastContext {
+    /// The MBS session (by TMGI) the context rides on.
+    pub session_id: u64,
+    /// The ContextCreate's `mbsmfId`, if it sent one: who the context is for. A
+    /// repeated ContextCreate from the same MB-SMF for the same TMGI is a retry and
+    /// gets the same context back.
+    pub mbsmf_id: Option<String>,
+}
+
+/// #1818: the broadcast contexts, and which MBS sessions a ContextCreate created
+/// (so a ContextDelete removes only a session that broadcast contexts own).
+#[derive(Debug, Default)]
+struct BroadcastContexts {
+    contexts: HashMap<u64, BroadcastContext>,
+    owned_sessions: std::collections::HashSet<u64>,
+    next_ref: u64,
+}
+
+/// #1818: what a ContextDelete did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BroadcastContextRelease {
+    /// The TMGI of the session the context rode on (`None` if another path had
+    /// already removed the session).
+    pub tmgi: Option<Tmgi>,
+    /// Whether the MBS session itself was removed: only when this was the last
+    /// broadcast context on it AND a ContextCreate had created it.
+    pub session_removed: bool,
 }
 
 impl NgapMcastContext {
@@ -145,7 +180,84 @@ impl NgapMcastContext {
             sessions: RwLock::new(HashMap::new()),
             tmgi_index: RwLock::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
+            broadcast: std::sync::Mutex::new(BroadcastContexts::default()),
         }
+    }
+
+    /// #1818: Namf_MBSBroadcast ContextCreate. Joins the MBS session already held
+    /// for `tmgi` (created by another context or by another path, such as an NGAP
+    /// multicast session) or creates one, and returns a context reference of its
+    /// own with the session. A repeat from the same `mbsmf_id` for the same TMGI
+    /// returns the context it already has, so a retry allocates nothing.
+    pub fn broadcast_context_create(
+        &self,
+        tmgi: &Tmgi,
+        mbsmf_id: Option<&str>,
+    ) -> Option<(u64, NgapMbsSession)> {
+        let mut bc = self.broadcast.lock().ok()?;
+        let existing = self.session_find_by_tmgi(tmgi);
+        if let Some(session) = &existing {
+            let retry = bc.contexts.iter().find(|(_, c)| {
+                c.session_id == session.mbs_session_id && c.mbsmf_id.as_deref() == mbsmf_id
+            });
+            if let Some((context_ref, _)) = retry {
+                return Some((*context_ref, session.clone()));
+            }
+        }
+        let session = match existing {
+            Some(s) => s,
+            None => {
+                let created = self.session_create(tmgi.clone(), 1, None, Vec::new())?;
+                bc.owned_sessions.insert(created.mbs_session_id);
+                created
+            }
+        };
+        bc.next_ref += 1;
+        let context_ref = bc.next_ref;
+        bc.contexts.insert(
+            context_ref,
+            BroadcastContext {
+                session_id: session.mbs_session_id,
+                mbsmf_id: mbsmf_id.map(str::to_string),
+            },
+        );
+        Some((context_ref, session))
+    }
+
+    /// #1818: Namf_MBSBroadcast ContextDelete. Removes the context `context_ref`
+    /// and nothing it did not create: the MBS session is removed only when no
+    /// other broadcast context rides on it and a ContextCreate created it. A
+    /// session another path created (an NGAP multicast session sharing the TMGI)
+    /// outlives every broadcast context on it. `None` for an unknown reference.
+    pub fn broadcast_context_delete(&self, context_ref: u64) -> Option<BroadcastContextRelease> {
+        let mut bc = self.broadcast.lock().ok()?;
+        let context = bc.contexts.remove(&context_ref)?;
+        let shared = bc
+            .contexts
+            .values()
+            .any(|c| c.session_id == context.session_id);
+        let owned = bc.owned_sessions.contains(&context.session_id);
+        let tmgi = self.session_find(context.session_id).map(|s| s.tmgi);
+        let session_removed = if !shared && owned {
+            bc.owned_sessions.remove(&context.session_id);
+            self.session_remove(context.session_id).is_some()
+        } else {
+            false
+        };
+        Some(BroadcastContextRelease {
+            tmgi,
+            session_removed,
+        })
+    }
+
+    /// #1818: the broadcast context `context_ref`, if held.
+    pub fn broadcast_context_find(&self, context_ref: u64) -> Option<BroadcastContext> {
+        self.broadcast
+            .lock()
+            .ok()?
+            .contexts
+            .get(&context_ref)
+            .cloned()
     }
 
     /// Create a new MBS session (triggered by MB-SMF via Namf)
