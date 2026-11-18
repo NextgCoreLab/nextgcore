@@ -1765,7 +1765,7 @@ mod tests {
     /// **#1775 review MAJOR-1** (failure-path check 2, both peers): the UDR's real
     /// delivery (`deliver_notification`, which waits 3 s) is answered 204 as soon as
     /// the UDM has accepted the notification, although its two consumers each take
-    /// 2.5 s to answer, so trying them first would take 5 s, longer than the UDR
+    /// 2 s to answer, so trying them first would take 4 s, longer than the UDR
     /// waits. So the UDR advances and does not
     /// resend, and each consumer gets exactly one POST.
     ///
@@ -1779,11 +1779,12 @@ mod tests {
         let _locks = setup(&udr_base).await;
         let (_udm, udm_base) = udm_server().await;
         set_notify_base(Some(udm_base.clone()));
-        // 2.5 s each: within the UDM's 3 s bound on a consumer (#1836 resends a
-        // timed-out one), and 5 s one after the other, longer than the UDR waits.
-        let (_slow, slow_base, seen) = slow_consumer(|_| Duration::from_millis(2500), true).await;
+        // 2 s each: 1 s inside the UDM's 3 s bound on a consumer (#1836 resends a
+        // timed-out one), and 4 s one after the other, 1 s longer than the UDR
+        // waits (R28: the margin either way is 1 s).
+        let (_slow, slow_base, seen) = slow_consumer(|_| Duration::from_secs(2), true).await;
         let (_slower, slower_base, seen_too) =
-            slow_consumer(|_| Duration::from_millis(2500), true).await;
+            slow_consumer(|_| Duration::from_secs(2), true).await;
         let supi = "imsi-001010000017754";
         sdm_subscribe(supi, &format!("{slow_base}/cb/sdm-notify/slow")).await;
         sdm_subscribe(supi, &format!("{slower_base}/cb/sdm-notify/slower")).await;
@@ -1799,7 +1800,7 @@ mod tests {
             nextgcore_udrd::data_store::deliver_notification(&udm_callback, &notify).await;
         assert_eq!(answered, Ok(204), "answered before the consumer");
         // Each answers within the UDM's bound, and is told once.
-        tokio::time::sleep(Duration::from_millis(3000)).await;
+        tokio::time::sleep(Duration::from_millis(2500)).await;
         wait_idle().await;
         for seen in [&seen, &seen_too] {
             assert_eq!(
@@ -2457,5 +2458,172 @@ mod tests {
             "on the udm_state volume"
         );
         assert!(text.contains("\n  udm_state:"), "the volume is declared");
+    }
+
+    /// An SDM subscribe of `supi`'s am-data with `callback`, as the handler
+    /// answers it (status, ProblemDetails cause).
+    async fn try_sdm_subscribe(supi: &str, callback: &str) -> (u16, Value) {
+        let mut req = SbiRequest::post(format!("/nudm-sdm/v2/{supi}/sdm-subscriptions"));
+        req.http.content = Some(
+            json!({
+                "nfInstanceId": "amf-1836",
+                "callbackReference": callback,
+                "monitoredResourceUris": [format!("/nudm-sdm/v2/{supi}/am-data")],
+            })
+            .to_string(),
+        );
+        let resp = crate::app::handle_sdm_subscribe(supi, &req).await;
+        let cause = json_body(&resp).map_or(Value::Null, |b| b["cause"].clone());
+        (resp.status, cause)
+    }
+
+    /// The ids of the SDM subscriptions the UDM holds for `supi`.
+    fn held_ids(supi: &str) -> Vec<String> {
+        udm_self()
+            .read()
+            .expect("ctx")
+            .sdm_subscriptions_for_supi(supi)
+            .into_iter()
+            .map(|s| s.id)
+            .collect()
+    }
+
+    /// Requests of `method` the programmable UDR got.
+    fn udr_requests(udr: &Arc<Mutex<UdrState>>, method: &str) -> usize {
+        udr.lock()
+            .expect("udr")
+            .seen
+            .iter()
+            .filter(|(m, _, _)| m == method)
+            .count()
+    }
+
+    /// A state file whose writes fail from `break_it()` on: its directory is
+    /// replaced by a regular file. Returns the directory path (a file afterwards).
+    async fn breakable_state(tag: &str) -> std::path::PathBuf {
+        let dir = temp_state_path(tag);
+        std::fs::create_dir_all(&dir).expect("dir");
+        init_state(Some(dir.join("state.json")))
+            .await
+            .expect("state file");
+        dir
+    }
+
+    fn break_it(dir: &std::path::Path) {
+        std::fs::remove_dir_all(dir).expect("rm");
+        std::fs::write(dir, b"x").expect("file");
+    }
+
+    /// **#1836 (R28 MAJOR 1), failure-path check 1 at the SDM subscribe.** When the
+    /// state file cannot be written, the subscribe is answered 500
+    /// INSUFFICIENT_RESOURCES and nothing of it is kept: no SDM subscription, so a
+    /// later snapshot cannot write it either, and no UDR leg (no reconcile is
+    /// started, so no subscribe reaches the UDR).
+    ///
+    /// REVERT-VERIFIED: with the rollback's `sdm_subscription_remove` skipped, the
+    /// subscription is still held ("stores nothing"); with the failed write
+    /// ignored, the subscribe is answered 201 ("refused").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn a_subscribe_that_cannot_be_stored_keeps_nothing_1836() {
+        let (_udr, udr_base, udr) = programmable_udr(gpsis(1)).await;
+        let _locks = setup(&udr_base).await;
+        let (_udm, udm_base) = udm_server().await;
+        set_notify_base(Some(udm_base));
+        let dir = breakable_state("1836-sub").await;
+        break_it(&dir);
+        let supi = "imsi-001010000018366";
+        assert_eq!(
+            try_sdm_subscribe(supi, "http://127.0.0.1:9/cb/sdm-notify/n").await,
+            (500, json!("INSUFFICIENT_RESOURCES")),
+            "refused"
+        );
+        wait_idle().await;
+        assert!(held_ids(supi).is_empty(), "stores nothing");
+        assert!(leg_token(supi).is_none(), "no leg");
+        assert_eq!(udr_requests(&udr, "POST"), 0, "no reconcile");
+        clear_legs();
+        init_state(None).await.expect("memory-only");
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    /// **#1836 (R28 MAJOR 2).** A subscribe while the context holds its most SDM
+    /// subscriptions is answered 500 INSUFFICIENT_RESOURCES (TS 29.500 Table
+    /// 5.2.7.2-1), not 201 for a subscription that was never stored, and no leg is
+    /// made for it.
+    ///
+    /// REVERT-VERIFIED: with the `!inserted` check skipped, the subscribe is
+    /// answered 201 ("a full context").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn a_full_sdm_context_is_answered_500_1836() {
+        let (_udr, udr_base, udr) = programmable_udr(gpsis(1)).await;
+        let _locks = setup(&udr_base).await;
+        let (_udm, udm_base) = udm_server().await;
+        set_notify_base(Some(udm_base));
+        {
+            let ctx = udm_self();
+            let context = ctx.read().expect("ctx");
+            let mut n = 0;
+            while context.sdm_subscription_insert(UdmSdmSubscription::for_supi(
+                format!("imsi-filler-{n}"),
+                None,
+                None,
+                vec!["/nudm-sdm/v2/x/sm-data".to_string()],
+            )) {
+                n += 1;
+                assert!(n < 100_000, "the context has a cap");
+            }
+        }
+        let supi = "imsi-001010000018367";
+        assert_eq!(
+            try_sdm_subscribe(supi, "http://127.0.0.1:9/cb/sdm-notify/f").await,
+            (500, json!("INSUFFICIENT_RESOURCES")),
+            "a full context"
+        );
+        wait_idle().await;
+        assert!(held_ids(supi).is_empty());
+        assert_eq!(udr_requests(&udr, "POST"), 0, "no leg");
+        udm_self().read().expect("ctx").ue_remove_all();
+        clear_legs();
+    }
+
+    /// **#1836 (R28 minor), failure-path check 1 at the SDM unsubscribe.** When the
+    /// state file cannot be written, the unsubscribe is undone and answered 500
+    /// INSUFFICIENT_RESOURCES, as the subscribe is: the subscription is still held
+    /// (it is still on disk, so a 204 would have it come back after a restart) and
+    /// its UDR leg is kept (no DELETE reaches the UDR). The consumer can retry.
+    ///
+    /// REVERT-VERIFIED: with the removed subscription not put back, it is gone from
+    /// memory ("undone"); with the failed write ignored, the unsubscribe is
+    /// answered 204 ("refused").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn an_unsubscribe_that_cannot_be_stored_is_undone_1836() {
+        let (_udr, udr_base, udr) = programmable_udr(gpsis(1)).await;
+        let _locks = setup(&udr_base).await;
+        let (_udm, udm_base) = udm_server().await;
+        set_notify_base(Some(udm_base));
+        let dir = breakable_state("1836-unsub").await;
+        let supi = "imsi-001010000018368";
+        let id = sdm_subscribe(supi, "http://127.0.0.1:9/cb/sdm-notify/u").await;
+        let token = leg_token(supi).expect("leg");
+        break_it(&dir);
+        let resp = crate::app::handle_sdm_unsubscribe(supi, &id).await;
+        assert_eq!(
+            (
+                resp.status,
+                json_body(&resp).map_or(Value::Null, |b| b["cause"].clone())
+            ),
+            (500, json!("INSUFFICIENT_RESOURCES")),
+            "refused"
+        );
+        wait_idle().await;
+        assert_eq!(held_ids(supi), vec![id], "undone");
+        assert_eq!(leg_token(supi), Some(token), "the leg is kept");
+        assert_eq!(udr_requests(&udr, "DELETE"), 0, "no DELETE at the UDR");
+        clear_legs();
+        init_state(None).await.expect("memory-only");
+        let _ = std::fs::remove_file(&dir);
     }
 }

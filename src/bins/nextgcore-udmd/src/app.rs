@@ -2612,14 +2612,27 @@ pub async fn handle_sdm_unsubscribe(supi: &str, subscription_id: &str) -> SbiRes
     if !exists {
         return send_problem(404, "NOT_FOUND", "Subscription not found");
     }
-    // Remove it from context, and from the state file (#1836).
+    // Remove it from context, and from the state file (#1836): neither, or both.
+    // A removal that could not be written is undone and answered 500, as the
+    // subscribe is: answering 204 would let a restart bring the subscription back,
+    // and this UDM would notify a consumer that left. The consumer may retry the
+    // DELETE.
     {
         let held = crate::sdm_udr::state_lock().await;
-        if let Ok(context) = udm_self().read() {
-            context.sdm_subscription_remove(subscription_id);
-        };
+        let removed = udm_self()
+            .read()
+            .ok()
+            .and_then(|context| context.sdm_subscription_remove(subscription_id));
         if let Err(e) = crate::sdm_udr::persist_locked(&held).await {
             log::error!("[{supi}] SDM unsubscribe not written to the state file: {e}");
+            if let (Some(sub), Ok(context)) = (removed, udm_self().read()) {
+                context.sdm_subscription_insert(sub);
+            }
+            return send_problem(
+                500,
+                "INSUFFICIENT_RESOURCES",
+                "the SDM unsubscribe could not be stored",
+            );
         }
     }
     // #1775: the last am-data subscription of the SUPI takes the UDR leg with it.
