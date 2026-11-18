@@ -42,10 +42,26 @@
 //!   the consumer refusing the change (amfd answers it for a change it cannot apply,
 //!   DECISIONS 2026-11-18-030000), and resending it would only be refused again.
 //!
-//! The notifications of one SUPI are delivered one at a time, in the order the UDR
-//! sent them, so an earlier change cannot overtake a later one; the UDR sends each
-//! subscription's changes one at a time too. The UDR is answered 204 once the
-//! consumers were tried.
+//! # Accepted, then delivered (#1775 review MAJOR-1)
+//!
+//! The UDR is answered 204 as soon as the notification is validated (token, body)
+//! and queued, before any consumer is tried. The UDR bounds its wait for the answer
+//! (3 s) and resends a change it saw no 2xx for, so an answer that waited for the
+//! consumers (each also bounded to 3 s) let one slow AMF, or two subscriptions,
+//! make the UDR resend, and every consumer that had taken the change got it twice.
+//! Acknowledging on acceptance is the option taken over making delivery idempotent:
+//! a `ModificationNotification` carries no sequence number or change id the AMF
+//! could deduplicate on (TS 29.503 §6.1.6.2.21), and a REPLACE applied twice is
+//! harmless but an ADD/REMOVE pair resent out of order is not.
+//!
+//! Each SUPI has one queue and at most one worker draining it
+//! ([`enqueue_changes`]), so the notifications of one SUPI are delivered one at a
+//! time, in the order the UDR sent them: a later change cannot overtake an earlier
+//! one. The UDR sends each subscription's changes one at a time too (it sends the
+//! next only after this 204). The consumers of one notification are tried
+//! concurrently, and the next notification waits for all of them. A queue holds at
+//! most [`MAX_QUEUED_PER_SUPI`] notifications; one more is answered 503, which the
+//! UDR resends at its next pass, so nothing is lost and nothing is told twice.
 //!
 //! # Restart
 //!
@@ -56,7 +72,7 @@
 use crate::context::{udm_self, UdmSdmSubscription};
 use nextgcore_sbi::message::{SbiRequest, SbiResponse};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -83,12 +99,26 @@ struct UdrLeg {
 /// Test lock: `crate::test_support::CONTEXT_GUARD`.
 static LEGS: Mutex<Option<HashMap<String, UdrLeg>>> = Mutex::new(None);
 
-/// SUPI -> the lock its reconciles and deliveries take. An entry is dropped when no
+/// SUPI -> the lock its reconciles take (deliveries are ordered by the SUPI's
+/// single worker instead, [`QUEUES`]). An entry is dropped when no
 /// one else holds it, so the map does not outgrow [`LEGS`]'s SUPIs.
 static SUPI_LOCKS: Mutex<Option<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = Mutex::new(None);
 
-/// Spawned reconciles not yet finished; tests wait for none ([`wait_idle`]).
+/// Spawned reconciles and delivery workers not yet finished; tests wait for none
+/// ([`wait_idle`]).
 static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// The most accepted notifications of one SUPI waiting for delivery. One more is
+/// answered 503, and the UDR resends it at its next pass.
+pub const MAX_QUEUED_PER_SUPI: usize = 32;
+
+/// SUPI -> the accepted am-data changes waiting for delivery, oldest first. An entry
+/// exists exactly while that SUPI's worker runs ([`enqueue_changes`]), so the map is
+/// bounded by the SUPIs with a leg ([`LEGS`]: only a leg's token is accepted), and
+/// each queue by [`MAX_QUEUED_PER_SUPI`].
+///
+/// Test lock: `crate::test_support::CONTEXT_GUARD`.
+static QUEUES: Mutex<Option<HashMap<String, VecDeque<Vec<Value>>>>> = Mutex::new(None);
 
 fn leg(supi: &str) -> Option<UdrLeg> {
     LEGS.lock()
@@ -234,11 +264,41 @@ async fn udr_unsubscribe(supi: &str, leg: &UdrLeg) {
 /// Reconcile `supi`'s leg after the answer to the operation that changed what it
 /// needs.
 pub fn spawn_reconcile(supi: &str) {
-    let supi = supi.to_string();
+    spawn_reconcile_attempt(supi.to_string(), 0);
+}
+
+/// The most reconciles of one SUPI in a row whose UDR subscribe failed; after them
+/// the leg is left unmade until the SUPI's next SDM subscribe.
+const MAX_RECONCILE_ATTEMPTS: u32 = 8;
+
+/// The wait before reconcile attempt `attempt` (1-based retry): 1 s doubling, at
+/// most 60 s, so the eight attempts span about three minutes.
+fn reconcile_backoff(attempt: u32) -> Duration {
+    Duration::from_secs((1u64 << attempt.min(6).saturating_sub(1)).min(60))
+}
+
+/// Run reconcile `attempt` of `supi` now. A failed UDR subscribe is retried with
+/// backoff (#1775 review minor): the AMF subscribes once per registration, so
+/// without the retry a UDR that was down at that moment left the UE without am-data
+/// notifications until it registered again.
+fn spawn_reconcile_attempt(supi: String, attempt: u32) {
     IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
     tokio::spawn(async move {
-        reconcile(&supi).await;
+        let retry = reconcile(&supi).await;
         IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        if !retry {
+            return;
+        }
+        let next = attempt + 1;
+        if next >= MAX_RECONCILE_ATTEMPTS {
+            log::error!(
+                "[{supi}] UDR am-data subscription not made after {next} attempts; am-data \
+                 changes are not notified until the next SDM subscribe"
+            );
+            return;
+        }
+        tokio::time::sleep(reconcile_backoff(next)).await;
+        spawn_reconcile_attempt(supi, next);
     });
 }
 
@@ -253,9 +313,11 @@ pub async fn wait_idle() {
 }
 
 /// Make `supi`'s leg exist exactly while an SDM subscription of `supi` monitors its
-/// am-data and this UDM has a callback address to give.
-pub async fn reconcile(supi: &str) {
+/// am-data and this UDM has a callback address to give. `true` when the leg is
+/// wanted and the UDR subscribe failed, so it is worth retrying.
+pub async fn reconcile(supi: &str) -> bool {
     let lock = supi_lock(supi);
+    let mut retry = false;
     {
         let _serial = lock.lock().await;
         let want = !am_data_subscriptions(supi).is_empty();
@@ -268,8 +330,11 @@ pub async fn reconcile(supi: &str) {
                     );
                     set_leg(supi, Some(new_leg));
                 }
-                // The SDM subscription stands; the next subscribe retries.
-                Err(e) => log::warn!("[{supi}] UDR am-data subscription not made: {e}"),
+                // The SDM subscription stands; the leg is retried with backoff.
+                Err(e) => {
+                    log::warn!("[{supi}] UDR am-data subscription not made: {e}; retried");
+                    retry = true;
+                }
             },
             (true, None, None) => log::warn!(
                 "[{supi}] no advertised SBI address: am-data changes are not subscribed at the UDR"
@@ -282,6 +347,7 @@ pub async fn reconcile(supi: &str) {
         }
     }
     release_supi_lock(supi, lock);
+    retry
 }
 
 /// The am-data `ChangeItem`s of a `DataChangeNotify` (TS 29.505 §5.4.2.6) for
@@ -408,22 +474,83 @@ pub async fn handle_udr_data_change(supi: &str, token: &str, request: &SbiReques
     if changes.is_empty() {
         return SbiResponse::with_status(204);
     }
-    let lock = supi_lock(supi);
-    {
-        let _in_order = lock.lock().await;
-        let subs = am_data_subscriptions(supi);
-        if subs.is_empty() {
-            // Its subscriptions went without an unsubscribe (the UE was removed).
-            spawn_reconcile(supi);
-        }
-        if crate::notify::notifications_enabled() {
-            for sub in &subs {
-                Box::pin(deliver(supi, sub, &changes)).await;
-            }
+    match enqueue_changes(supi, changes) {
+        Ok(()) => SbiResponse::with_status(204),
+        Err(()) => {
+            log::warn!(
+                "[{supi}] {MAX_QUEUED_PER_SUPI} am-data changes already wait for delivery: \
+                 503, the UDR resends this one"
+            );
+            nextgcore_sbi::server::send_error(
+                503,
+                "Service Unavailable",
+                "too many am-data changes waiting for delivery",
+                None,
+            )
         }
     }
-    release_supi_lock(supi, lock);
-    SbiResponse::with_status(204)
+}
+
+/// Accept `changes` for delivery to `supi`'s consumers. They join the SUPI's
+/// queue, behind every change accepted before them, and the SUPI's worker is
+/// started when none runs. `Err` when the queue is full ([`MAX_QUEUED_PER_SUPI`]).
+fn enqueue_changes(supi: &str, changes: Vec<Value>) -> Result<(), ()> {
+    {
+        let mut map = QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+        let map = map.get_or_insert_with(HashMap::new);
+        if let Some(queue) = map.get_mut(supi) {
+            // A worker runs for the SUPI and takes this one after the others.
+            if queue.len() >= MAX_QUEUED_PER_SUPI {
+                return Err(());
+            }
+            queue.push_back(changes);
+            return Ok(());
+        }
+        map.insert(supi.to_string(), VecDeque::from([changes]));
+    }
+    let supi = supi.to_string();
+    IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+    tokio::spawn(async move {
+        while let Some(changes) = next_queued(&supi) {
+            Box::pin(deliver_to_consumers(&supi, &changes)).await;
+        }
+        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    });
+    Ok(())
+}
+
+/// The oldest change waiting for `supi`'s worker. When none waits the queue is
+/// removed, under the same lock, so the worker ends and the next accepted change
+/// starts a new one.
+fn next_queued(supi: &str) -> Option<Vec<Value>> {
+    let mut map = QUEUES.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.as_mut()?;
+    let queue = map.get_mut(supi)?;
+    match queue.pop_front() {
+        Some(changes) => Some(changes),
+        None => {
+            map.remove(supi);
+            None
+        }
+    }
+}
+
+/// Tell every SDM subscription of `supi` that monitors am-data of `changes`,
+/// concurrently; returns once each has answered or timed out.
+async fn deliver_to_consumers(supi: &str, changes: &[Value]) {
+    let subs = am_data_subscriptions(supi);
+    if subs.is_empty() {
+        // Its subscriptions went without an unsubscribe (the UE was removed).
+        spawn_reconcile(supi);
+    }
+    if crate::notify::notifications_enabled() {
+        let mut each = tokio::task::JoinSet::new();
+        for sub in subs {
+            let (supi, changes) = (supi.to_string(), changes.to_vec());
+            each.spawn(async move { deliver(&supi, &sub, &changes).await });
+        }
+        while each.join_next().await.is_some() {}
+    }
 }
 
 /// Forget every leg (tests).
@@ -664,6 +791,8 @@ mod tests {
         });
         let notify = udr_notify(supi, &udm_callback, &old, &new);
         assert_eq!(post(&udm_callback, &notify).await, 204);
+        // Accepted, then delivered (#1775 review MAJOR-1).
+        wait_idle().await;
         let ue = nextgcore_amfd::context::amf_self()
             .read()
             .expect("amf ctx")
@@ -770,6 +899,199 @@ mod tests {
         );
         wait_idle().await;
         assert_eq!(requests(&udr_seen, "DELETE").len(), 1);
+    }
+
+    /// A consumer that answers 204 to each notification after `delay(body)`. It
+    /// records the body when the answer is made (so the record is in answer order),
+    /// or on arrival when `on_arrival`. Its base URI.
+    async fn slow_consumer(
+        delay: fn(&Value) -> Duration,
+        on_arrival: bool,
+    ) -> (SbiServer, String, Arc<Mutex<Vec<Value>>>) {
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        let log = seen.clone();
+        server
+            .start(move |req: SbiRequest| {
+                let log = log.clone();
+                async move {
+                    let body: Value = req
+                        .http
+                        .content
+                        .as_deref()
+                        .and_then(|b| serde_json::from_str(b).ok())
+                        .unwrap_or(Value::Null);
+                    if on_arrival {
+                        log.lock().expect("seen").push(body.clone());
+                    }
+                    tokio::time::sleep(delay(&body)).await;
+                    if !on_arrival {
+                        log.lock().expect("seen").push(body);
+                    }
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await
+            .expect("consumer starts");
+        wait_listening(addr).await;
+        (server, format!("http://127.0.0.1:{}", addr.port()), seen)
+    }
+
+    /// The `newValue` of the first change of each recorded ModificationNotification.
+    fn told_values(seen: &Arc<Mutex<Vec<Value>>>) -> Vec<Value> {
+        seen.lock()
+            .expect("seen")
+            .iter()
+            .map(|n| n["notifyItems"][0]["changes"][0]["newValue"].clone())
+            .collect()
+    }
+
+    /// **#1775 review MAJOR-1** (failure-path check 2, both peers): the UDR's real
+    /// delivery (`deliver_notification`, which waits 3 s) is answered 204 as soon as
+    /// the UDM has accepted the notification, although its two consumers each take
+    /// longer to answer than the UDM waits for them (3 s), so trying them first
+    /// would take 6 s, longer than the UDR waits. So the UDR advances and does not
+    /// resend, and each consumer gets exactly one POST.
+    ///
+    /// REVERT-VERIFIED: with the consumers tried one after another before the UDR is
+    /// answered (the code under review), the UDR's delivery times out ("answered
+    /// before the consumer").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn the_udr_is_answered_before_a_slow_consumer_1775() {
+        let (_udr, udr_base, _udr_seen) = stub(201).await;
+        let _locks = setup(&udr_base).await;
+        let (_udm, udm_base) = udm_server().await;
+        set_notify_base(Some(udm_base.clone()));
+        let (_slow, slow_base, seen) = slow_consumer(|_| Duration::from_secs(4), true).await;
+        let (_slower, slower_base, seen_too) =
+            slow_consumer(|_| Duration::from_secs(4), true).await;
+        let supi = "imsi-001010000017754";
+        sdm_subscribe(supi, &format!("{slow_base}/cb/sdm-notify/slow")).await;
+        sdm_subscribe(supi, &format!("{slower_base}/cb/sdm-notify/slower")).await;
+        let token = leg_token(supi).expect("leg");
+        let udm_callback = format!("{udm_base}{}", data_change_path(supi, &token));
+        let notify = udr_notify(
+            supi,
+            &udm_callback,
+            &json!({"gpsis": ["msisdn-1"]}),
+            &json!({"gpsis": ["msisdn-2"]}),
+        );
+        let answered =
+            nextgcore_udrd::data_store::deliver_notification(&udm_callback, &notify).await;
+        assert_eq!(answered, Ok(204), "answered before the consumer");
+        // The UDM gives up on each after 3 s, and resends nothing.
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        wait_idle().await;
+        for seen in [&seen, &seen_too] {
+            assert_eq!(
+                told_values(seen),
+                vec![json!(["msisdn-2"])],
+                "exactly one POST"
+            );
+        }
+        clear_legs();
+    }
+
+    /// **#1775 review MAJOR-3**: two DataChangeNotify of one SUPI that overlap reach
+    /// the consumer in the order the UDR sent them, although the first is the slow
+    /// one: the consumer takes 800 ms over the first and none over the second. Both
+    /// are accepted (204) at once.
+    ///
+    /// REVERT-VERIFIED: with a second worker started for the SUPI while one runs
+    /// (`enqueue_changes` not joining the running worker's queue), the second
+    /// change is told first ("in the order the UDR sent them").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn overlapping_changes_of_one_supi_arrive_in_order_1775() {
+        let (_udr, udr_base, _udr_seen) = stub(201).await;
+        let _locks = setup(&udr_base).await;
+        let (_udm, udm_base) = udm_server().await;
+        set_notify_base(Some(udm_base.clone()));
+        let (_slow, slow_base, seen) = slow_consumer(
+            |body| {
+                if body["notifyItems"][0]["changes"][0]["newValue"] == json!(["msisdn-2"]) {
+                    Duration::from_millis(800)
+                } else {
+                    Duration::ZERO
+                }
+            },
+            false,
+        )
+        .await;
+        let supi = "imsi-001010000017755";
+        sdm_subscribe(supi, &format!("{slow_base}/cb/sdm-notify/order")).await;
+        let token = leg_token(supi).expect("leg");
+        let udm_callback = format!("{udm_base}{}", data_change_path(supi, &token));
+        let first = udr_notify(
+            supi,
+            &udm_callback,
+            &json!({"gpsis": ["msisdn-1"]}),
+            &json!({"gpsis": ["msisdn-2"]}),
+        );
+        let second = udr_notify(
+            supi,
+            &udm_callback,
+            &json!({"gpsis": ["msisdn-2"]}),
+            &json!({"gpsis": ["msisdn-3"]}),
+        );
+        assert_eq!(post(&udm_callback, &first).await, 204);
+        assert_eq!(post(&udm_callback, &second).await, 204);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        wait_idle().await;
+        assert_eq!(
+            told_values(&seen),
+            vec![json!(["msisdn-2"]), json!(["msisdn-3"])],
+            "in the order the UDR sent them"
+        );
+        clear_legs();
+    }
+
+    /// **#1775 review MAJOR-1**: a SUPI's queue is bounded. While its consumer is
+    /// slow, the notification after `MAX_QUEUED_PER_SUPI` waiting ones is answered
+    /// 503 (the UDR resends it at its next pass); every accepted one is delivered.
+    ///
+    /// REVERT-VERIFIED: with the bound not checked, that notification is answered
+    /// 204 ("bounded").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn a_full_queue_is_answered_503_1775() {
+        let (_udr, udr_base, _udr_seen) = stub(201).await;
+        let _locks = setup(&udr_base).await;
+        let (_udm, udm_base) = udm_server().await;
+        set_notify_base(Some(udm_base.clone()));
+        let (_slow, slow_base, seen) = slow_consumer(
+            |body| {
+                if body["notifyItems"][0]["changes"][0]["newValue"] == json!(0) {
+                    Duration::from_millis(1500)
+                } else {
+                    Duration::ZERO
+                }
+            },
+            false,
+        )
+        .await;
+        let supi = "imsi-001010000017756";
+        sdm_subscribe(supi, &format!("{slow_base}/cb/sdm-notify/full")).await;
+        let token = leg_token(supi).expect("leg");
+        let udm_callback = format!("{udm_base}{}", data_change_path(supi, &token));
+        let change =
+            |n: usize| udr_notify(supi, &udm_callback, &json!({"n": n + 1}), &json!({"n": n}));
+        // The first is taken by the worker and held by the slow consumer; the
+        // next MAX_QUEUED_PER_SUPI wait.
+        for n in 0..=MAX_QUEUED_PER_SUPI {
+            assert_eq!(post(&udm_callback, &change(n)).await, 204, "{n}");
+        }
+        assert_eq!(
+            post(&udm_callback, &change(MAX_QUEUED_PER_SUPI + 1)).await,
+            503,
+            "bounded"
+        );
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        wait_idle().await;
+        assert_eq!(seen.lock().expect("seen").len(), MAX_QUEUED_PER_SUPI + 1);
+        clear_legs();
     }
 
     /// #1775: only the am-data items of a DataChangeNotify are passed on, with their

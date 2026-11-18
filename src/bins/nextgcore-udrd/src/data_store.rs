@@ -411,6 +411,33 @@ impl UdrDataStore {
         created
     }
 
+    /// [`Self::doc_put`] without the snapshot write (#1775 review MAJOR-2): a caller
+    /// making many writes in one go (the am-data watch pass) persists once, with
+    /// [`Self::persist_now`], instead of rewriting the whole state file per write.
+    pub fn doc_put_deferred(&self, collection: &str, key: &str, doc: Value) {
+        self.docs
+            .write()
+            .expect("lock")
+            .insert((collection.to_string(), key.to_string()), doc);
+    }
+
+    /// [`Self::doc_remove`] without the snapshot write; see
+    /// [`Self::doc_put_deferred`]. Whether a document was removed.
+    pub fn doc_remove_deferred(&self, collection: &str, key: &str) -> bool {
+        self.docs
+            .write()
+            .expect("lock")
+            .remove(&(collection.to_string(), key.to_string()))
+            .is_some()
+    }
+
+    /// Write the snapshot now, after deferred writes. No-op when no path is
+    /// configured. Synchronous file I/O: an async caller runs it on a blocking
+    /// thread.
+    pub fn persist_now(&self) {
+        self.persist();
+    }
+
     /// Read the document at `(collection, key)`.
     pub fn doc_get(&self, collection: &str, key: &str) -> Option<Value> {
         self.docs
@@ -1226,6 +1253,22 @@ pub fn am_data_changes(old: &Value, new: &Value) -> Vec<Value> {
         .collect()
 }
 
+/// The `expiry` (TS 29.504 §5.2.2.6.2, TS 29.505 `SubscriptionDataSubscriptions`)
+/// of subscription `s`, in seconds since the epoch, when it has one (#1775 review
+/// MAJOR-2). "After which the subscription becomes invalid": it is not notified,
+/// and is removed.
+pub fn sub_expiry_epoch(s: &StoredSub) -> Option<i64> {
+    s.body
+        .get("expiry")
+        .and_then(Value::as_str)
+        .and_then(nextgcore_sbi::datetime::rfc3339_to_epoch_signed)
+}
+
+/// Whether subscription `s` has expired at `now_epoch` (seconds since the epoch).
+pub fn sub_expired(s: &StoredSub, now_epoch: i64) -> bool {
+    sub_expiry_epoch(s).is_some_and(|e| e <= now_epoch)
+}
+
 /// POST `payload` to `notify_uri` and wait for the answer, bounded by 2 s to connect
 /// and 3 s for the request. The status on an answer; an error when there was none.
 pub async fn deliver_notification(notify_uri: &str, payload: &Value) -> Result<u16, String> {
@@ -1736,6 +1779,37 @@ mod tests {
 
     /// PUT a value, then re-open the store from the same path and confirm the
     /// value survived the simulated restart (across every resource tree).
+    /// **#1775 review MAJOR-2**: the deferred writes the am-data watch makes do not
+    /// rewrite the state file each; the one `persist_now` at the end of the pass
+    /// writes them all, and they survive a restart.
+    ///
+    /// REVERT-VERIFIED: with `doc_put_deferred` persisting, the file exists before
+    /// `persist_now` ("no snapshot per write").
+    #[test]
+    fn deferred_writes_are_persisted_once_1775() {
+        let path = temp_state_path("deferred");
+        let _ = std::fs::remove_file(&path);
+        {
+            let s = UdrDataStore::with_state_path(&path);
+            for i in 0..3 {
+                s.doc_put_deferred(AM_DATA_NOTIFIED_COLLECTION, &i.to_string(), json!({"i": i}));
+            }
+            assert!(s.doc_remove_deferred(AM_DATA_NOTIFIED_COLLECTION, "0"));
+            assert!(!path.exists(), "no snapshot per write");
+            s.persist_now();
+            assert!(path.exists());
+        }
+        let s = UdrDataStore::with_state_path(&path);
+        assert_eq!(
+            s.doc_list(AM_DATA_NOTIFIED_COLLECTION)
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect::<Vec<_>>(),
+            vec!["1".to_string(), "2".to_string()]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn test_persistence_survives_restart() {
         let path = temp_state_path("restart");
