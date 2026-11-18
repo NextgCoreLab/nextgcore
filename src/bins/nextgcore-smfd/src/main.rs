@@ -22501,6 +22501,29 @@ mod tests {
         assert_eq!(order, vec!["INC", "DEC"], "counted out once");
     }
 
+    /// #1072 review M3: a DECREASE the NSACF refuses is logged and counted.
+    #[tokio::test]
+    async fn a_refused_nsacf_decrease_is_counted() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (nsacf, seen) = recording_nsacf(
+            204,
+            500,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let before = policy::NSAC_DECREASE_FAILURES.load(Ordering::SeqCst);
+        rollback_nsac(true, "imsi-001010000010722", 5, 1, None).await;
+        let after = policy::NSAC_DECREASE_FAILURES.load(Ordering::SeqCst);
+        let n = seen.lock().unwrap().len();
+        std::env::remove_var("NSACF_URI");
+        nsacf.stop().await.ok();
+
+        assert_eq!(n, 1);
+        assert_eq!(after - before, 1, "a 500 is a failed DECREASE");
+    }
+
     // ---- #1875: release-side cleanups that fail are parked and reconciled ----
 
     type Seen1875 = std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
@@ -22751,29 +22774,6 @@ mod tests {
         );
         assert!(!live_parked, "and they are no longer parked");
         assert!(deferred, "a create in flight defers them");
-    }
-
-    /// #1072 review M3: a DECREASE the NSACF refuses is logged and counted.
-    #[tokio::test]
-    async fn a_refused_nsacf_decrease_is_counted() {
-        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
-        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-        let (nsacf, seen) = recording_nsacf(
-            204,
-            500,
-            std::time::Duration::ZERO,
-            std::time::Duration::ZERO,
-        )
-        .await;
-        let before = policy::NSAC_DECREASE_FAILURES.load(Ordering::SeqCst);
-        rollback_nsac(true, "imsi-001010000010722", 5, 1, None).await;
-        let after = policy::NSAC_DECREASE_FAILURES.load(Ordering::SeqCst);
-        let n = seen.lock().unwrap().len();
-        std::env::remove_var("NSACF_URI");
-        nsacf.stop().await.ok();
-
-        assert_eq!(n, 1);
-        assert_eq!(after - before, 1, "a 500 is a failed DECREASE");
     }
 
     /// #1072 review m2: an INCREASE that is never answered fails open and is
