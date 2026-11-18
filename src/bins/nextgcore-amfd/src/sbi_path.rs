@@ -3831,6 +3831,32 @@ pub struct AmDataResponse {
     /// #1222: `mpsPriority` or `mcsPriority` is true (TS 29.503 §6.1.6.2.4): the
     /// subscriber has an MPS or MCX priority subscription.
     pub priority_subscription: bool,
+    /// #1748: the whole am-data body as the UDM gave it ([`am_data_document`]),
+    /// which a data change notification is applied to.
+    pub document: serde_json::Value,
+}
+
+/// #1748: the `AccessAndMobilitySubscriptionData` members (TS 29.503 §6.1.6.2.4) this
+/// AMF acts on, i.e. the ones [`parse_am_data`] reads. A data change notification
+/// (TS 29.503 §5.2.2.5.2) that changes any other member is refused as a whole, so
+/// the UDM is never told a change was applied that the AMF ignored.
+pub const AM_DATA_APPLIED_MEMBERS: [&str; 5] = [
+    "subscribedUeAmbr",
+    "gpsis",
+    "mpsPriority",
+    "mcsPriority",
+    "nssai",
+];
+
+/// #1748: the whole am-data body, kept so a data change notification can tell a
+/// change of a member this AMF does not act on from one that leaves it as it was
+/// (an empty object for a body that is not one).
+pub fn am_data_document(json: &serde_json::Value) -> serde_json::Value {
+    if json.is_object() {
+        json.clone()
+    } else {
+        serde_json::Value::Object(serde_json::Map::new())
+    }
 }
 
 /// Accept a TS 29.571 `Gpsi` only in one of its two NAMED forms —
@@ -3920,8 +3946,11 @@ pub async fn call_udm_sdm_get_am_data(
 /// without standing up a UDM: `gpsis` selection in particular has more than one
 /// interesting input (several entries, a malformed entry, an empty array) and
 /// none of them are expressible through the async caller.
-fn parse_am_data(json: &serde_json::Value, supi: &str) -> AmDataResponse {
-    let mut out = AmDataResponse::default();
+pub(crate) fn parse_am_data(json: &serde_json::Value, supi: &str) -> AmDataResponse {
+    let mut out = AmDataResponse {
+        document: am_data_document(json),
+        ..AmDataResponse::default()
+    };
     out.ue_ambr_uplink = json["subscribedUeAmbr"]["uplink"]
         .as_str()
         .map(String::from);
@@ -3966,18 +3995,21 @@ fn parse_am_data(json: &serde_json::Value, supi: &str) -> AmDataResponse {
 
 /// Nudm_SDM_Subscribe: POST /nudm-sdm/v2/{supi}/sdm-subscriptions (TS 29.503 5.2.2.3.2)
 ///
-/// Returns the subscription ID assigned by UDM.
+/// Returns the subscription ID assigned by UDM. #1748: the `callbackReference` ends
+/// in `notify_token`, which the caller keeps for the subscription only once this
+/// returns `Ok` ([`sdm_callback_reference`]).
 pub async fn call_udm_sdm_subscribe(
     udm_host: &str,
     udm_port: u16,
     supi: &str,
     amf_instance_id: &str,
+    notify_token: &str,
 ) -> SbiResult<String> {
     let client = peer_client(nextgcore_sbi::types::NfType::Udm, udm_host, udm_port);
 
     let body = serde_json::json!({
         "nfInstanceId": amf_instance_id,
-        "callbackReference": sdm_callback_reference(supi),
+        "callbackReference": sdm_callback_reference(supi, Some(notify_token)),
         "monitoredResourceUris": [format!("/nudm-sdm/v2/{supi}/am-data")],
         "implicitUnsubscribe": true
     });
@@ -4190,11 +4222,19 @@ pub async fn call_pcf_ue_policy_delete(
 /// (TS 29.503 §6.1.6.2.3 `SdmSubscription`), built from [`advertised_sbi_base`] as
 /// [`ue_policy_notification_uri`] is (#1210). It used to be a relative path, which a UDM
 /// cannot POST to.
-pub fn sdm_callback_reference(supi: &str) -> String {
-    format!(
+///
+/// #1748: ending in the subscription's token (`AmfUe::sdm_notify_token`) when it has
+/// one, as [`am_policy_notification_uri`]: `.../sdmsubscription-notify/{token}`. The
+/// token-less form is the URI of a subscription made before #1748.
+pub fn sdm_callback_reference(supi: &str, token: Option<&str>) -> String {
+    let base = format!(
         "{}/namf-callback/v1/{supi}/sdmsubscription-notify",
         advertised_sbi_base()
-    )
+    );
+    match token {
+        Some(token) => format!("{base}/{token}"),
+        None => base,
+    }
 }
 
 /// The absolute AM policy `notificationUri` for `supi` (TS 29.507 §5.6.2.3), as
@@ -5638,6 +5678,69 @@ mod tests {
             "{cb}"
         );
         server.stop().await.expect("stop");
+    }
+
+    /// #1748: the Nudm_SDM subscription's `callbackReference` is absolute and ends
+    /// in the subscription's token, which the route and the exemption check.
+    ///
+    /// REVERT-VERIFIED: with `sdm_callback_reference(supi, None)` in the body, the
+    /// token assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_sdm_subscription_s_callback_reference_carries_its_token_1748() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let sink = std::sync::Arc::clone(&seen);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        server
+            .start(move |req: nextgcore_sbi::message::SbiRequest| {
+                let sink = std::sync::Arc::clone(&sink);
+                async move {
+                    let body = req
+                        .http
+                        .content
+                        .as_deref()
+                        .and_then(|c| serde_json::from_str(c).ok())
+                        .unwrap_or_default();
+                    sink.lock().expect("sink").push(body);
+                    nextgcore_sbi::message::SbiResponse::with_status(201)
+                        .with_header("Location", "/nudm-sdm/v2/x/sdm-subscriptions/s-1748")
+                }
+            })
+            .await
+            .expect("stand-in UDM starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let supi = "imsi-001010000017491";
+        let token = new_callback_token();
+        let id = call_udm_sdm_subscribe("127.0.0.1", addr.port(), supi, "amf", &token)
+            .await
+            .expect("subscribed");
+        server.stop().await.expect("stop");
+        assert_eq!(id, "s-1748");
+        let seen = seen.lock().expect("seen").clone();
+        let cb = seen[0]["callbackReference"]
+            .as_str()
+            .expect("callbackReference");
+        assert!(cb.starts_with("http"), "absolute: {cb}");
+        assert!(
+            cb.ends_with(&format!(
+                "/namf-callback/v1/{supi}/sdmsubscription-notify/{token}"
+            )),
+            "{cb}"
+        );
+        assert_eq!(
+            nextgcore_sbi::log_redact::redact_callback_tokens(cb),
+            sdm_callback_reference(supi, Some(nextgcore_sbi::log_redact::REDACTED)),
+            "the token is redacted in a log line"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -7336,7 +7439,8 @@ mod tests_no_wildcard_uri_1322 {
             sm_context_status_uri("imsi-001010000000001", 5, None),
             dereg_callback_uri("imsi-001010000000001", "t"),
             ue_policy_notification_uri("imsi-001010000000001", Some("t")),
-            sdm_callback_reference("imsi-001010000000001"),
+            sdm_callback_reference("imsi-001010000000001", Some("t")),
+            sdm_callback_reference("imsi-001010000000001", None),
             am_policy_notification_uri("imsi-001010000000001", Some("t")),
             crate::racs::notification_uri(),
             crate::nrf_subscription::notification_uri(),
@@ -7646,7 +7750,7 @@ mod body_cap_tests {
         })
         .await;
         assert_capped_at("SDM subscribe", &len, cap, || async {
-            s(call_udm_sdm_subscribe("127.0.0.1", port, "imsi-1674", "amf").await)
+            s(call_udm_sdm_subscribe("127.0.0.1", port, "imsi-1674", "amf", "t").await)
         })
         .await;
         assert_capped_at("SDM unsubscribe", &len, cap, || async {

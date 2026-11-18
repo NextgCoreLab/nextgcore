@@ -4624,6 +4624,120 @@ mod tests {
     }
 
     // ========================================================================
+    // #1748: both peers of the AMF's SDM data change notification
+    // ========================================================================
+
+    /// #1748, both peers: the UDM stores the AMF's tokened `callbackReference`
+    /// (`.../sdmsubscription-notify/{token}`, built by amfd) verbatim, and a
+    /// `ModificationNotification` the UDM delivers there through its real callback
+    /// client (`udm_sbi_send_callback_notification`) is applied by amfd's REAL
+    /// router: 204, and the UE's GPSI is the new one. The same delivery with a token
+    /// the UE does not hold is 404 and changes nothing.
+    ///
+    /// REVERT-VERIFIED: with amfd's `sdmsubscription-notify` route removed, the
+    /// delivery answers 404 and the 204 assertion fails.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state (current-thread test)
+    async fn the_amf_s_tokened_sdm_callback_is_stored_and_its_notification_applied_1748() {
+        let _udr_env = crate::sbi_path::UDR_ENV_TEST_LOCK.lock().await;
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        use nextgcore_sbi::message::{SbiHeader, SbiHttpMessage, SbiRequest};
+        udm_context_init(64, 64);
+        let supi = "imsi-001010000017492";
+        let token = "0123456789abcdef0123456789ab1748";
+
+        // amfd's REAL Namf router, and a UE it holds with that SDM token.
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let amf = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), listener);
+        amf.start(nextgcore_amfd::namf_request_handler)
+            .await
+            .expect("amfd starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        nextgcore_amfd::test_support::init_context();
+        {
+            let ctx = nextgcore_amfd::context::amf_self();
+            let guard = ctx.read().expect("amf ctx");
+            let ran = guard.ran_ue_add(900_748, 61_748).expect("ran_ue_add");
+            let mut ue = guard.amf_ue_add(ran.id).expect("amf_ue_add");
+            ue.supi = Some(supi.to_string());
+            ue.sdm_notify_token = Some(token.to_string());
+            guard.amf_ue_publish(&ue, 61_748, 900_748);
+            guard.amf_ue_update(&ue);
+        }
+        // amfd's own callbackReference shape, at this listener.
+        let built = nextgcore_amfd::sbi_path::sdm_callback_reference(supi, Some(token));
+        let callback = format!(
+            "http://127.0.0.1:{}{}",
+            addr.port(),
+            &built[built.find("/namf-callback").expect("path")..]
+        );
+
+        let request = SbiRequest {
+            header: SbiHeader::with_method_uri(
+                "POST",
+                format!("/nudm-sdm/v2/{supi}/sdm-subscriptions"),
+            ),
+            http: SbiHttpMessage {
+                content: Some(
+                    serde_json::json!({
+                        "nfInstanceId": "amf-1748",
+                        "callbackReference": callback,
+                        "monitoredResourceUris": [format!("/nudm-sdm/v2/{supi}/am-data")],
+                    })
+                    .to_string(),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(handle_sdm_subscribe(supi, &request).await.status, 201);
+        let stored = {
+            let ctx = udm_self();
+            let context = ctx.read().expect("udm ctx");
+            context.sdm_subscriptions_for_supi(supi)
+        };
+        assert_eq!(stored.len(), 1);
+        let stored_cb = stored[0].callback_reference.clone().expect("stored");
+        assert_eq!(stored_cb, callback, "the token is kept verbatim");
+
+        let notification = serde_json::json!({
+            "subscriptionId": stored[0].id,
+            "notifyItems": [{
+                "resourceId": format!("/nudm-sdm/v2/{supi}/am-data"),
+                "changes": [{"op": "REPLACE", "path": "/gpsis", "newValue": ["msisdn-4917492"]}],
+            }],
+        });
+        let forged = format!("{}{}", &stored_cb[..stored_cb.len() - 4], "0000");
+        let refused = crate::sbi_path::udm_sbi_send_callback_notification(&forged, &notification)
+            .await
+            .expect("delivered");
+        let gpsi = || {
+            nextgcore_amfd::context::amf_self()
+                .read()
+                .expect("amf ctx")
+                .amf_ue_find_by_supi(supi)
+                .and_then(|ue| ue.gpsi.clone())
+        };
+        assert_eq!(refused.status, 404, "another token");
+        assert_eq!(gpsi(), None, "nothing applied");
+        let applied =
+            crate::sbi_path::udm_sbi_send_callback_notification(&stored_cb, &notification)
+                .await
+                .expect("delivered");
+        amf.stop().await.expect("stop");
+        assert_eq!(applied.status, 204, "{:?}", applied.http.content);
+        assert_eq!(gpsi().as_deref(), Some("msisdn-4917492"));
+    }
+
+    // ========================================================================
     // udmd-07: SDM subscribe persists; unsubscribe 404-on-missing
     // ========================================================================
 

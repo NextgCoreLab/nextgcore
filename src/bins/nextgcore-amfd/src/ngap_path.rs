@@ -999,6 +999,11 @@ impl UeNasContext {
 }
 
 impl UeNasContext {
+    /// #1748: the id of the UE's current Nudm_SDM subscription, if it has one.
+    pub(crate) fn sdm_subscription_id(&self) -> Option<&str> {
+        self.sdm_subscription_id.as_deref()
+    }
+
     /// #1247: forget the AM policy association `pol_asso_id` after the PCF terminated it
     /// (TS 29.507 §4.2.4.3), in both places it is held. False when the UE holds another
     /// association, or none.
@@ -6410,15 +6415,8 @@ impl NgapServer {
                 return Ok(());
             }
         };
-        match crate::sbi_path::call_udm_sdm_subscribe(
-            &udm_host,
-            udm_port,
-            &supi,
-            &amf_instance_id(),
-        )
-        .await
-        {
-            Ok(sub_id) => state.sdm_subscription_id = Some(sub_id),
+        match subscribe_to_udm_sdm(&mut state, &udm_host, udm_port, &supi).await {
+            Ok(()) => {}
             Err(e) => {
                 log::error!("[{supi}] Nudm_SDM_Subscribe failed: {e}");
                 let reject = gmm_build::build_registration_reject(gmm_cause_from_sbi_error(&e));
@@ -6609,6 +6607,8 @@ impl NgapServer {
         state.amf_ue.gpsi = am_data.gpsi.clone();
         // #1222: likewise for an MPS/MCX subscription that is withdrawn.
         state.amf_ue.priority_subscription = am_data.priority_subscription;
+        // #1748: what a data change notification is applied to.
+        state.amf_ue.am_data = Some(am_data.document.clone()).filter(serde_json::Value::is_object);
 
         // New 5G-GUTI: GUAMI of this AMF + CSPRNG 5G-TMSI (TS 23.003 2.10.1)
         state.amf_ue.generate_new_guti();
@@ -21210,6 +21210,29 @@ async fn register_with_udm_uecm(
     Ok(())
 }
 
+/// Nudm_SDM_Subscribe to the UE's am-data at registration (TS 29.503 §5.2.2.3.2), with
+/// a fresh token in its `callbackReference` (#1748). The subscription's id and token
+/// are the UE's only once the UDM accepted it; a refused one leaves both as they were.
+async fn subscribe_to_udm_sdm(
+    state: &mut UeNasContext,
+    udm_host: &str,
+    udm_port: u16,
+    supi: &str,
+) -> crate::sbi_path::SbiResult<()> {
+    let token = crate::sbi_path::new_callback_token();
+    let id = crate::sbi_path::call_udm_sdm_subscribe(
+        udm_host,
+        udm_port,
+        supi,
+        &amf_instance_id(),
+        &token,
+    )
+    .await?;
+    state.sdm_subscription_id = Some(id);
+    state.amf_ue.sdm_notify_token = Some(token);
+    Ok(())
+}
+
 /// [`amf_instance_id`], for the UECM wire test in `sbi_path`.
 #[cfg(test)]
 pub(crate) fn amf_instance_id_for_tests() -> String {
@@ -22630,7 +22653,7 @@ fn plmn_mcc_mnc_strings(plmn: &PlmnId) -> (String, String) {
 /// Parse a TS 29.571 BitRate string ("<number> <unit>", e.g. "1 Gbps") into
 /// bits per second. Supported units: bps, Kbps, Mbps, Gbps, Tbps (decimal,
 /// 10^3 steps per TS 29.571 §5.5). Returns None for malformed input.
-fn parse_bitrate_bps(s: &str) -> Option<u64> {
+pub(crate) fn parse_bitrate_bps(s: &str) -> Option<u64> {
     let mut parts = s.split_whitespace();
     let value: f64 = parts.next()?.parse().ok()?;
     if !value.is_finite() || value < 0.0 {
@@ -29534,6 +29557,115 @@ mod tests {
         .await
         .is_err());
         assert_eq!(refused.uecm_dereg_token.as_deref(), Some("tok-previous"));
+        udm.stop().await.expect("stop");
+    }
+
+    /// #1748: registration's SDM subscription hands the UDM a `callbackReference` ending
+    /// in a fresh token, which is the UE's once the UDM accepted it; a data change
+    /// notification POSTed to exactly that URI is applied. A refused subscription
+    /// leaves the UE's previous subscription and token in place.
+    ///
+    /// REVERT-VERIFIED: with `subscribe_to_udm_sdm` not storing the token, the
+    /// notification is 404 and the token assertion fails; with it storing the token
+    /// before the UDM's answer, the refused case keeps the new token.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_registered_sdm_callback_reference_is_the_one_that_acts_1748() {
+        let _serial = crate::namf_server::dereg_queue_test_lock().lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        crate::context::amf_context_init(64, 1024, 4096);
+        let posts: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let sink = Arc::clone(&posts);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let udm = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        udm.start(move |req: nextgcore_sbi::message::SbiRequest| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let body: serde_json::Value = req
+                    .http
+                    .content
+                    .as_deref()
+                    .and_then(|c| serde_json::from_str(c).ok())
+                    .unwrap_or_default();
+                let refuse = req.header.uri.contains("imsi-001010000174899");
+                sink.lock().expect("sink").push(body);
+                if refuse {
+                    nextgcore_sbi::message::SbiResponse::with_status(500)
+                } else {
+                    nextgcore_sbi::message::SbiResponse::with_status(201)
+                        .with_header("Location", "/nudm-sdm/v2/x/sdm-subscriptions/sub-1748")
+                }
+            }
+        })
+        .await
+        .expect("stand-in UDM");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let supi = "imsi-001010000174801";
+        let id = 7_174_801u64;
+        let mut ue = UeNasContext::new(id, 48, 1, false);
+        ue.registered = true;
+        ue.amf_ue.supi = Some(supi.to_string());
+        subscribe_to_udm_sdm(&mut ue, "127.0.0.1", addr.port(), supi)
+            .await
+            .expect("subscribed");
+        let uri = posts.lock().expect("posts")[0]["callbackReference"]
+            .as_str()
+            .expect("callbackReference")
+            .to_string();
+        let token = uri.rsplit('/').next().expect("a last segment").to_string();
+        assert_eq!(ue.amf_ue.sdm_notify_token.as_deref(), Some(token.as_str()));
+        assert_eq!(ue.sdm_subscription_id.as_deref(), Some("sub-1748"));
+        let ngap = test_ngap_server().await;
+        ngap.ue_auth_state.insert(id, ue);
+
+        // The path of the URI the UDM holds, POSTed verbatim.
+        let path = &uri[uri.find("/namf-callback/").expect("callback path")..];
+        let resp = crate::namf_server::namf_request_handler(
+            nextgcore_sbi::message::SbiRequest::post(path.to_string())
+                .with_json_body(&serde_json::json!({
+                    "subscriptionId": "sub-1748",
+                    "notifyItems": [{
+                        "resourceId": format!("/nudm-sdm/v2/{supi}/am-data"),
+                        "changes": [{"op": "REPLACE", "path": "/gpsis",
+                                     "newValue": ["msisdn-4917480"]}],
+                    }],
+                }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 204, "{:?}", resp.http.content);
+        let gpsi = ngap
+            .ue_auth_state
+            .get(id)
+            .and_then(|s| s.amf_ue.gpsi.clone());
+        assert_eq!(gpsi.as_deref(), Some("msisdn-4917480"));
+        ngap.ue_auth_state.remove(id);
+
+        // A refused subscription leaves the previous one in place.
+        let mut refused = UeNasContext::new(7_174_899, 49, 1, false);
+        refused.sdm_subscription_id = Some("sub-previous".to_string());
+        refused.amf_ue.sdm_notify_token = Some("sdm-previous".to_string());
+        assert!(subscribe_to_udm_sdm(
+            &mut refused,
+            "127.0.0.1",
+            addr.port(),
+            "imsi-001010000174899"
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            refused.amf_ue.sdm_notify_token.as_deref(),
+            Some("sdm-previous")
+        );
+        assert_eq!(refused.sdm_subscription_id.as_deref(), Some("sub-previous"));
         udm.stop().await.expect("stop");
     }
 
