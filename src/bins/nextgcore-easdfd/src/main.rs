@@ -348,6 +348,9 @@ async fn main() -> Result<()> {
         sbi_server_config = sbi_server_config.with_tls(key, cert);
     }
 
+    // #1791: the NFProfile advertises the scheme this listener serves.
+    let sbi_scheme = sbi_server_config.scheme;
+
     let sbi_server = SbiServer::new(sbi_server_config);
     log::info!("Starting EASDF SBI server on {addr}");
     sbi_server
@@ -378,7 +381,7 @@ async fn main() -> Result<()> {
                 move || {
                     let (ctx, host, id) = (sbi_ctx.clone(), host.clone(), id.clone());
                     async move {
-                        register_with_nrf(ctx, &host, sbi_port, &id)
+                        register_with_nrf(ctx, &host, sbi_port, &id, sbi_scheme)
                             .await
                             .map(|()| Some(id))
                     }
@@ -933,7 +936,12 @@ async fn handle_baseline_pattern_delete(id: &str) -> SbiResponse {
 
 /// Build the NFProfile registered with the NRF (TS 29.510): nfType EASDF
 /// advertising the neasdf-dnscontext service (TS 29.556).
-fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
+fn build_nf_profile(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+    scheme: nextgcore_sbi::types::UriScheme,
+) -> serde_json::Value {
     nextgcore_sbi::nf_addressing::classify_profile_host(
         serde_json::json!({
             "nfInstanceId": nf_instance_id,
@@ -945,7 +953,7 @@ fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serd
                     "serviceInstanceId": format!("{nf_instance_id}-neasdf-dnscontext"),
                     "serviceName": "neasdf-dnscontext",
                     "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                    "scheme": "http",
+                    "scheme": scheme.as_str(),
                     "nfServiceStatus": "REGISTERED",
                     "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
                 },
@@ -956,7 +964,7 @@ fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serd
                     "serviceInstanceId": format!("{nf_instance_id}-neasdf-baselinednspattern"),
                     "serviceName": "neasdf-baselinednspattern",
                     "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                    "scheme": "http",
+                    "scheme": scheme.as_str(),
                     "nfServiceStatus": "REGISTERED",
                     "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
                 }
@@ -998,6 +1006,7 @@ async fn register_with_nrf(
     sbi_addr: &str,
     sbi_port: u16,
     nf_instance_id: &str,
+    sbi_scheme: nextgcore_sbi::types::UriScheme,
 ) -> Result<(), String> {
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
     let nrf_uri = match nrf_uri {
@@ -1013,7 +1022,7 @@ async fn register_with_nrf(
     let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
 
-    let nf_profile = build_nf_profile(nf_instance_id, sbi_addr, sbi_port);
+    let nf_profile = build_nf_profile(nf_instance_id, sbi_addr, sbi_port, sbi_scheme);
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     log::debug!("NRF registration: PUT {path}");
@@ -1150,7 +1159,12 @@ mod tests {
     // ── NRF registration profile (acceptance: nfType EASDF registered) ──────
     #[test]
     fn nf_profile_advertises_easdf_and_dnscontext_service() {
-        let profile = build_nf_profile("easdf-test-1", "10.0.0.7", 7818);
+        let profile = build_nf_profile(
+            "easdf-test-1",
+            "10.0.0.7",
+            7818,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
         assert_eq!(profile["nfType"], "EASDF");
         assert_eq!(profile["nfStatus"], "REGISTERED");
         assert_eq!(profile["nfServices"][0]["serviceName"], "neasdf-dnscontext");
@@ -1737,7 +1751,12 @@ easdf:
 
         // ...and the service is advertised to the NRF. TS 23.501 Table 7.2.25-1
         // lists both EASDF services; only the first used to appear.
-        let profile = build_nf_profile("easdf-1", "127.0.0.1", 7777);
+        let profile = build_nf_profile(
+            "easdf-1",
+            "127.0.0.1",
+            7777,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
         let names: Vec<&str> = profile["nfServices"]
             .as_array()
             .unwrap()
@@ -1792,10 +1811,43 @@ mod tests_nf_profile_host_kind_1324 {
     #[test]
     fn the_nf_profile_carries_its_host_by_type() {
         for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
-            let profile = build_nf_profile("id", host, 7777);
+            let profile = build_nf_profile("id", host, 7777, nextgcore_sbi::types::UriScheme::Http);
             let problems =
                 nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
             assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
+        }
+    }
+}
+
+/// #1791: the registered NFProfile advertises, in every `nfServices[].scheme`,
+/// the scheme this NF's SBI listener serves (TS 29.510 §6.1.6.2.3
+/// `NFService.scheme`): `http` for the cleartext listener, `https` once `--tls`
+/// makes it TLS. This listener ignores NEXTGCORE_SBI_PROFILE (it serves TLS only with `--tls`; #1795), so `--tls` alone decides. `main` passes the listener config's scheme in; the
+/// nextgcore-sbi source guard `every_nf_advertises_its_listener_scheme_1791`
+/// pins that wiring.
+///
+/// REVERT-VERIFIED: with the builder advertising `"http"` again, the TLS case
+/// fails here.
+#[cfg(test)]
+mod tests_advertised_scheme_1791 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_advertises_the_listener_scheme_1791() {
+        let addr: std::net::SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        let plain = nextgcore_sbi::server::SbiServerConfig::new(addr);
+        let tls = nextgcore_sbi::server::SbiServerConfig::new(addr).with_tls("tls.key", "tls.crt");
+        for (cfg, want) in [(plain, "http"), (tls, "https")] {
+            let profile = build_nf_profile("easdf-1791", "10.0.0.1", 7777, cfg.scheme);
+            let services = profile["nfServices"].as_array().expect("nfServices");
+            assert!(!services.is_empty(), "the profile offers services");
+            for svc in services {
+                assert_eq!(
+                    svc["scheme"], want,
+                    "{} must advertise the listener's scheme",
+                    svc["serviceName"]
+                );
+            }
         }
     }
 }

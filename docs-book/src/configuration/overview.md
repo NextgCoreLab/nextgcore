@@ -173,6 +173,13 @@ from a peer's advertised URI, so run either a uniformly `production` or a
 uniformly `dev` core. (Before this, the scheme was hardcoded `http` regardless of
 what a peer advertised, so mixed was already broken.)
 
+The NFProfile each NF registers advertises, in `nfServices[].scheme`, the scheme
+its own SBI listener serves (#1791): `https` once the listener is TLS, `http`
+otherwise. Only `amf`, `ausf`, `smf` and `udm` take their listener's TLS from this
+profile. The other NFs still take it from their own `--tls` flag or TLS config,
+or serve cleartext only (`nssf`, `udr`), whatever the profile says (#1795). Their
+advertised scheme follows the listener in either case.
+
 ### NEF northbound exposure (issue #110)
 
 `nefd` is the only NF whose consumers are **outside** the operator — third-party

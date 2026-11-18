@@ -369,6 +369,9 @@ async fn main() -> Result<()> {
         sbi_config = apply_oauth2_enforcement(sbi_config, &args.nrf_uri);
     }
 
+    // #1791: the NFProfile advertises the scheme this listener serves.
+    let sbi_scheme = sbi_config.scheme;
+
     let sbi_server = SbiServer::new(sbi_config);
     sbi_server
         .start(dccf_request_handler)
@@ -389,7 +392,7 @@ async fn main() -> Result<()> {
                 move || {
                     let (host, id) = (host.clone(), id.clone());
                     async move {
-                        register_with_nrf(&host, sbi_port, &id)
+                        register_with_nrf(&host, sbi_port, &id, sbi_scheme)
                             .await
                             .map(|()| Some(id))
                     }
@@ -482,7 +485,12 @@ fn build_dccf_nf_instance(
 /// list without standing up an NRF. Each service carries its own `ipEndPoints`
 /// and `allowedNfTypes`; the NF-level `allowedNfTypes` is the UNION over the
 /// services, since a type barred at NF level can never reach any service.
-fn build_dccf_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
+fn build_dccf_nf_profile(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+    scheme: nextgcore_sbi::types::UriScheme,
+) -> serde_json::Value {
     let services: Vec<serde_json::Value> = DCCF_SERVICES
         .iter()
         .map(|(service_type, allowed)| {
@@ -491,7 +499,7 @@ fn build_dccf_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) ->
                 "serviceInstanceId": format!("{nf_instance_id}-{name}"),
                 "serviceName": name,
                 "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                "scheme": "http",
+                "scheme": scheme.as_str(),
                 "nfServiceStatus": "REGISTERED",
                 "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
                 "allowedNfTypes": allowed,
@@ -527,6 +535,7 @@ async fn register_with_nrf(
     sbi_addr: &str,
     sbi_port: u16,
     nf_instance_id: &str,
+    sbi_scheme: nextgcore_sbi::types::UriScheme,
 ) -> Result<(), String> {
     let sbi_ctx = global_context();
 
@@ -544,7 +553,7 @@ async fn register_with_nrf(
     let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
 
-    let nf_profile = build_dccf_nf_profile(nf_instance_id, sbi_addr, sbi_port);
+    let nf_profile = build_dccf_nf_profile(nf_instance_id, sbi_addr, sbi_port, sbi_scheme);
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     log::debug!("NRF registration: PUT {path}");
@@ -1147,7 +1156,12 @@ mod data_management_tests {
     /// an analytics context could not find this DCCF by service name.
     #[test]
     fn the_dccf_profile_advertises_both_routed_ndccf_services() {
-        let profile = build_dccf_nf_profile("dccf-test-instance", "10.45.0.12", 7813);
+        let profile = build_dccf_nf_profile(
+            "dccf-test-instance",
+            "10.45.0.12",
+            7813,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
         let names: Vec<&str> = profile["nfServices"]
             .as_array()
             .expect("nfServices")
@@ -1186,7 +1200,12 @@ mod data_management_tests {
     #[test]
     fn the_dccf_self_instance_matches_the_registered_profile() {
         let instance = build_dccf_nf_instance("dccf-test-instance", "10.45.0.12", 7813);
-        let profile = build_dccf_nf_profile("dccf-test-instance", "10.45.0.12", 7813);
+        let profile = build_dccf_nf_profile(
+            "dccf-test-instance",
+            "10.45.0.12",
+            7813,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
 
         let mut from_instance: Vec<String> =
             instance.services.iter().map(|s| s.name.clone()).collect();
@@ -2380,7 +2399,8 @@ mod tests_nf_profile_host_kind_1324 {
     #[test]
     fn the_nf_profile_carries_its_host_by_type() {
         for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
-            let profile = build_dccf_nf_profile("id", host, 7777);
+            let profile =
+                build_dccf_nf_profile("id", host, 7777, nextgcore_sbi::types::UriScheme::Http);
             let problems =
                 nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
             assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
@@ -2414,5 +2434,38 @@ mod outbound_oauth2_1665_tests {
             super::outbound_oauth2_client(SbiProfile::Dev, false, Some(NRF)).is_none(),
             "dev profile, knob off: no client, the token-free path is unchanged"
         );
+    }
+}
+
+/// #1791: the registered NFProfile advertises, in every `nfServices[].scheme`,
+/// the scheme this NF's SBI listener serves (TS 29.510 §6.1.6.2.3
+/// `NFService.scheme`): `http` for the cleartext listener, `https` once `--tls`
+/// makes it TLS. This listener ignores NEXTGCORE_SBI_PROFILE (it serves TLS only with `--tls`; #1795), so `--tls` alone decides. `main` passes the listener config's scheme in; the
+/// nextgcore-sbi source guard `every_nf_advertises_its_listener_scheme_1791`
+/// pins that wiring.
+///
+/// REVERT-VERIFIED: with the builder advertising `"http"` again, the TLS case
+/// fails here.
+#[cfg(test)]
+mod tests_advertised_scheme_1791 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_advertises_the_listener_scheme_1791() {
+        let addr: std::net::SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        let plain = nextgcore_sbi::server::SbiServerConfig::new(addr);
+        let tls = nextgcore_sbi::server::SbiServerConfig::new(addr).with_tls("tls.key", "tls.crt");
+        for (cfg, want) in [(plain, "http"), (tls, "https")] {
+            let profile = build_dccf_nf_profile("dccf-1791", "10.0.0.1", 7777, cfg.scheme);
+            let services = profile["nfServices"].as_array().expect("nfServices");
+            assert!(!services.is_empty(), "the profile offers services");
+            for svc in services {
+                assert_eq!(
+                    svc["scheme"], want,
+                    "{} must advertise the listener's scheme",
+                    svc["serviceName"]
+                );
+            }
+        }
     }
 }

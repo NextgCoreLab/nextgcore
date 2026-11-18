@@ -2304,7 +2304,12 @@ mod tests {
     async fn start_nrf(smf_port: u16) -> (SbiServer, u16) {
         let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let port = addr.port();
-        let profile = crate::build_smf_nf_profile("smf-475", "127.0.0.1", smf_port);
+        let profile = crate::build_smf_nf_profile(
+            "smf-475",
+            "127.0.0.1",
+            smf_port,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
         let server = SbiServer::on_listener(
             SbiServerConfig::new(format!("127.0.0.1:{port}").parse().unwrap()),
             listener,
@@ -4507,11 +4512,17 @@ mod tests {
     fn the_nf_profile_advertises_the_pgw_fqdn_only_when_configured() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.blocking_lock();
         std::env::remove_var("SMF_PGW_FQDN");
-        assert!(crate::build_smf_nf_profile("i", "127.0.0.1", 1)
-            .get("smfInfo")
-            .is_none());
+        assert!(crate::build_smf_nf_profile(
+            "i",
+            "127.0.0.1",
+            1,
+            nextgcore_sbi::types::UriScheme::Http
+        )
+        .get("smfInfo")
+        .is_none());
         std::env::set_var("SMF_PGW_FQDN", PGW_FQDN);
-        let profile = crate::build_smf_nf_profile("i", "127.0.0.1", 1);
+        let profile =
+            crate::build_smf_nf_profile("i", "127.0.0.1", 1, nextgcore_sbi::types::UriScheme::Http);
         std::env::remove_var("SMF_PGW_FQDN");
         assert_eq!(profile["smfInfo"]["pgwFqdn"], PGW_FQDN);
         assert_eq!(
