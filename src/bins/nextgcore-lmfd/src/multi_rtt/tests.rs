@@ -167,10 +167,13 @@ impl FakeNgRan {
                     .expect("LMF-Measurement-ID");
                 if self.measurement_fails {
                     let answer = gnb::measurement_failure(txn, lmf_id);
-                    lmf_self()
-                        .read()
-                        .unwrap()
-                        .nrppa_deliver(procedure, txn, None, answer);
+                    lmf_self().read().unwrap().nrppa_deliver(
+                        procedure,
+                        txn,
+                        None,
+                        &crate::context::NotifyOwner::non_ue(),
+                        answer,
+                    );
                     return true;
                 }
                 // gNB Rx-Tx_i = (gap - offset) + t_i, as a k1 code:
@@ -209,10 +212,13 @@ impl FakeNgRan {
             other => panic!("unexpected NRPPa request {other:?}"),
         };
         assert!(
-            lmf_self()
-                .read()
-                .unwrap()
-                .nrppa_deliver(procedure, txn, None, answer),
+            lmf_self().read().unwrap().nrppa_deliver(
+                procedure,
+                txn,
+                None,
+                &crate::context::NotifyOwner::non_ue(),
+                answer
+            ),
             "nobody waited for the answer to procedure {procedure} transaction {txn}"
         );
         true
@@ -433,10 +439,13 @@ async fn no_srs_configuration_means_no_gnb_half() {
                         },
                     ),
                 );
-                lmf_self()
-                    .read()
-                    .unwrap()
-                    .nrppa_deliver(procedure, txn, None, answer);
+                lmf_self().read().unwrap().nrppa_deliver(
+                    procedure,
+                    txn,
+                    None,
+                    &crate::context::NotifyOwner::non_ue(),
+                    answer,
+                );
                 return true;
             }
             self.0.answer(&pdu, true)

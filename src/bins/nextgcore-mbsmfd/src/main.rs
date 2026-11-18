@@ -121,11 +121,35 @@ fn setup_signal_handlers(shutdown: Arc<AtomicBool>) {
 static OAUTH2_CLIENT: std::sync::OnceLock<Option<Arc<nextgcore_sbi::oauth::OAuth2Client>>> =
     std::sync::OnceLock::new();
 
-/// The shared OAuth2 client, if SBI OAuth2 enforcement is enabled (Wave-6 H8
-/// Phase A). Outbound SBI clients attach a token via `client.with_oauth2`.
-#[allow(dead_code)]
-fn oauth2_client() -> Option<Arc<nextgcore_sbi::oauth::OAuth2Client>> {
+/// The installed outbound OAuth2 client, if any (Wave-6 H8 Phase A, #1662).
+pub(crate) fn oauth2_client() -> Option<Arc<nextgcore_sbi::oauth::OAuth2Client>> {
+    #[cfg(test)]
+    if let Ok(oauth2) = TEST_OAUTH2_CLIENT.try_with(Arc::clone) {
+        return Some(oauth2);
+    }
     OAUTH2_CLIENT.get().and_then(|opt| opt.clone())
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// #1662 tests: the OAuth2 client [`oauth2_client`] returns inside
+    /// `TEST_OAUTH2_CLIENT.scope(..)`. Task-local, so the other tests in the
+    /// process keep the default (none installed).
+    pub(crate) static TEST_OAUTH2_CLIENT: Arc<nextgcore_sbi::oauth::OAuth2Client>;
+}
+
+/// #1662: `client` with the installed OAuth2 client attached, so a service
+/// request to the `target` producer carries an NRF-issued token (TS 33.501
+/// §13.4.1.1.2, TS 29.500 §6.7.3). Unchanged when no client is installed.
+/// Notifications do not go through this: they carry no token.
+pub(crate) fn attach_oauth2(
+    client: nextgcore_sbi::client::SbiClient,
+    target: nextgcore_sbi::types::NfType,
+) -> nextgcore_sbi::client::SbiClient {
+    match oauth2_client() {
+        Some(oauth2) => client.with_oauth2(oauth2, target),
+        None => client,
+    }
 }
 
 /// #1665: the outbound OAuth2 client this MBSMF installs at startup: under the

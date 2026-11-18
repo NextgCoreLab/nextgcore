@@ -2212,6 +2212,7 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
         reachability_filter,
         reported_reachability: std::collections::HashMap::new(),
         reported_connectivity: std::collections::HashMap::new(),
+        reported_location: None,
         taken_over: false,
         reporting_threshold,
         location_filters,
@@ -2245,6 +2246,13 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
         supi.as_deref(),
         &report_list,
     );
+    // #1737: the first LOCATION_REPORT, its location recorded as the subscription's
+    // baseline before the subscription is stored.
+    let first_location = first_location_report(
+        &mut sub,
+        immediate_types.iter().any(|t| t == "LOCATION_REPORT"),
+        supi.as_deref(),
+    );
 
     {
         let Ok(guard) = ctx.read() else {
@@ -2263,6 +2271,9 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
     }
     if let Some(first) = first_reach {
         first.deliver_and_recheck(&sub);
+    }
+    if let Some(report) = first_location {
+        deliver_location_report(sub.clone(), report);
     }
 
     log::info!(
@@ -2672,7 +2683,7 @@ pub fn fire_amf_event_for(
     pei: Option<&str>,
     extra: Value,
 ) {
-    fire_amf_event_matching(event_type, supi, gpsi, pei, extra, |_| true);
+    fire_amf_event_matching(event_type, supi, gpsi, pei, extra, |_, _| true);
 }
 
 /// [`fire_amf_event_for`], delivered only to the matching subscriptions that
@@ -2683,7 +2694,7 @@ fn fire_amf_event_matching(
     gpsi: Option<&str>,
     pei: Option<&str>,
     extra: Value,
-    wants: impl Fn(&EventSubscription) -> bool,
+    wants: impl Fn(&crate::context::AmfContext, &EventSubscription) -> bool,
 ) {
     let ctx = amf_self();
     let subs: Vec<EventSubscription> = {
@@ -2694,7 +2705,7 @@ fn fire_amf_event_matching(
         guard
             .event_subscriptions_matching_ue(event_type, supi, gpsi, pei)
             .into_iter()
-            .filter(|s| wants(s))
+            .filter(|s| wants(&guard, s))
             .collect()
     };
     if subs.is_empty() {
@@ -2749,17 +2760,30 @@ pub fn fire_location_report(ue: &AmfUe) {
 /// TS 29.518 Table 6.2.6.2.3-1 (`29518-k00.txt:21398-21404`): an absent filter
 /// means *"the change of the TA used by the UE should be reported"*, so an
 /// intra-TA handover reaches only `CELL_ID` / `RAN_NODE` subscribers.
-pub fn fire_location_change_report(ue: &AmfUe, change: crate::context::LocationChange) {
-    if !change.any() {
-        return;
-    }
+///
+/// `change` is measured from the UE's baseline. #1737: a subscription whose first
+/// report told it a location (`reported_location`) has its change measured from
+/// that location instead, here `now`, and the location is taken. So a UE that is
+/// back where the UE's baseline was, but not where this subscriber was told, is
+/// reported to it, even when `change` is empty.
+pub fn fire_location_change_report(
+    ue: &AmfUe,
+    change: crate::context::LocationChange,
+    now: &crate::context::LocationBaseline,
+) {
     fire_amf_event_matching(
         "LOCATION_REPORT",
         ue.supi.as_deref(),
         ue.gpsi.as_deref(),
         ue.pei.as_deref(),
         json!({ "location": nr_location_json(ue) }),
-        |sub| sub.wants_location_change(change),
+        |ctx, sub| {
+            let change = match ctx.event_subscription_take_reported_location(&sub.subscription_id) {
+                Some(told) => crate::context::LocationChange::between(&told, now),
+                None => change,
+            };
+            change.any() && sub.wants_location_change(change)
+        },
     );
 }
 
@@ -2884,6 +2908,85 @@ pub(crate) fn first_reachability_report(
         key,
         notify: report.filter(|_| !immediate),
     })
+}
+
+/// #1737: the first LOCATION_REPORT of a new subscription for `supi`, TS 29.518
+/// §5.3.2.2.2 (`29518-k00.txt:5731-5737`): with the CONTINUOUS or PERIODIC mode and
+/// no immediateFlag, *"the AMF shall send a first event notification to notify the
+/// current location of the UE after the subscription is created"*. The ONE_TIME
+/// mode without the immediateFlag gets the same notification (`:5719-5724`). This
+/// AMF does not read the mode (`options.trigger`), so every such subscription gets
+/// it.
+///
+/// Returns the notification to send once the subscription is stored, or `None`
+/// with the immediateFlag, whose report is already in the response's `reportList`.
+/// Either way the location reported is recorded in `sub.reported_location`, so the
+/// next location evaluation measures this subscription's change from what it was
+/// told (see [`fire_location_change_report`]).
+///
+/// A UE that is not yet registered gets no first report here: its Registration
+/// Accept is where the AMF first reports its location, every dimension counting as
+/// changed (#1716). For a CM-IDLE UE the location is the last known one, with
+/// `ageOfLocationInformation` the minutes since it was acquired and at least 1, as
+/// the clause requires for a UE that does not answer paging. This AMF does not page
+/// the UE for it.
+pub(crate) fn first_location_report(
+    sub: &mut EventSubscription,
+    immediate: bool,
+    supi: Option<&str>,
+) -> Option<Value> {
+    if !sub.event_types.iter().any(|t| t == "LOCATION_REPORT") {
+        return None;
+    }
+    let ue = supi.and_then(find_ue_by_context_id)?;
+    let record = amf_self()
+        .read()
+        .ok()
+        .and_then(|g| g.ue_store().get(ue.id))
+        .filter(|r| r.is_registered())?;
+    sub.reported_location = Some((
+        ue.nr_tai.clone(),
+        ue.nr_cgi.clone(),
+        record.association_id(),
+    ));
+    if immediate {
+        return None;
+    }
+    let mut location = nr_location_json(&ue);
+    if record.is_cm_idle() {
+        let minutes = location_acquired_at(&ue)
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| d.as_secs() / 60)
+            .unwrap_or(0)
+            .clamp(1, 32_767);
+        location["nrLocation"]["ageOfLocationInformation"] = json!(minutes);
+    }
+    let mut report = build_event_report(
+        "LOCATION_REPORT",
+        ue.supi.as_deref(),
+        json!({ "location": location }),
+    );
+    if let Some(gpsi) = ue.gpsi.as_deref() {
+        report["gpsi"] = json!(gpsi);
+    }
+    if let Some(pei) = ue.pei.as_deref() {
+        report["pei"] = json!(pei);
+    }
+    Some(report)
+}
+
+/// Send a LOCATION_REPORT notification `report` to `sub` (#1737).
+fn deliver_location_report(sub: EventSubscription, report: Value) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        log::debug!("LOCATION_REPORT: no tokio runtime, skipping delivery");
+        return;
+    };
+    let sub_id = sub.subscription_id.clone();
+    handle.spawn(async move {
+        if let Err(e) = deliver_event_notification(sub, report).await {
+            log::warn!("Event notification delivery failed (sub={sub_id}): {e}");
+        }
+    });
 }
 
 /// What [`first_reachability_report`] decided, for after the subscription is stored.
@@ -4079,6 +4182,7 @@ pub(crate) fn take_over_transferred_event_subscriptions(
                 }),
             reported_reachability: std::collections::HashMap::new(),
             reported_connectivity: std::collections::HashMap::new(),
+            reported_location: None,
             taken_over: true,
             reporting_threshold: entry.get("eventList").and_then(Value::as_array).and_then(
                 |events| {
@@ -8481,6 +8585,7 @@ mod tests {
             reachability_filter: None,
             reported_reachability: std::collections::HashMap::new(),
             reported_connectivity: std::collections::HashMap::new(),
+            reported_location: None,
             taken_over: false,
             reporting_threshold: None,
             location_filters: Vec::new(),
@@ -16237,6 +16342,7 @@ mod tests {
             reachability_filter: None,
             reported_reachability: std::collections::HashMap::new(),
             reported_connectivity: std::collections::HashMap::new(),
+            reported_location: None,
             taken_over: false,
             reporting_threshold: None,
             location_filters: Vec::new(),

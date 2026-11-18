@@ -142,10 +142,14 @@ pub type MbsContextRef = String;
 /// succeeded locally by the time it runs. A failed AMF leg means the RAN does
 /// not have the session, which the caller reports rather than hides.
 pub async fn context_create(amf: &DiscoveredAmf, tmgi: &Tmgi) -> Option<MbsContextRef> {
-    let client = SbiClient::new(
-        nextgcore_sbi::security::sbi_peer_client_config(&amf.host, amf.port)
-            .with_connect_timeout(Duration::from_secs(2))
-            .with_request_timeout(Duration::from_secs(3)),
+    // #1662: a service request to the AMF, so it carries the NRF-issued token.
+    let client = crate::attach_oauth2(
+        SbiClient::new(
+            nextgcore_sbi::security::sbi_peer_client_config(&amf.host, amf.port)
+                .with_connect_timeout(Duration::from_secs(2))
+                .with_request_timeout(Duration::from_secs(3)),
+        ),
+        nextgcore_sbi::types::NfType::Amf,
     );
 
     let body = json!({ "mbsSessionId": mbs_session_id_json(tmgi) });
@@ -199,6 +203,151 @@ mod tests {
                 mnc: "01".to_string(),
             },
         }
+    }
+
+    /// #1662: ContextCreate passes an OAuth2-required AMF with the installed
+    /// client, and is refused 401 without one. The stand-in AMF is gated by
+    /// nextgcore-sbi's own check (JWKS, audience AMF), so `Some(ref)` is a
+    /// request that passed it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn context_create_passes_an_oauth2_required_amf_1662() {
+        use nextgcore_sbi::test_support::oauth2 as stand_in;
+        use nextgcore_sbi::types::NfType;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let sk = nextgcore_sbi::oauth::generate_es256_key();
+        let (_nrf, nrf_port) = stand_in::token_nrf(sk.clone()).await;
+        let (_amf, amf_port, seen) = stand_in::oauth2_producer(&sk, NfType::Amf, |_| {
+            nextgcore_sbi::message::SbiResponse::with_status(201)
+                .with_json_body(&json!({ "mbsContextRef": "ctx-1662" }))
+                .expect("json")
+        })
+        .await;
+        let amf = DiscoveredAmf {
+            host: "127.0.0.1".to_string(),
+            port: amf_port,
+            nf_instance_id: None,
+        };
+
+        let without = context_create(&amf, &tmgi()).await;
+        let with = crate::TEST_OAUTH2_CLIENT
+            .scope(
+                stand_in::oauth2_client_for(nrf_port, NfType::Mbsmf),
+                context_create(&amf, &tmgi()),
+            )
+            .await;
+
+        assert_eq!(without, None, "refused 401 without a token");
+        assert_eq!(with.as_deref(), Some("ctx-1662"));
+        assert_eq!(
+            stand_in::bearer_requests(&seen, "POST", "/namf-mbs-bc/v1/mbs-contexts"),
+            1
+        );
+    }
+
+    /// #1662, failure-path property 1 (a failed request applies nothing): when
+    /// the token cannot be obtained, ContextCreate is not sent at all, not even
+    /// bare. The recorder here is UNGATED, so it would see a bare send.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_token_fetch_sends_nothing_1662() {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        use nextgcore_sbi::test_support::oauth2 as stand_in;
+        use nextgcore_sbi::types::NfType;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = std::sync::Arc::clone(&seen);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let recorder = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        recorder
+            .start(move |_req| {
+                let sink = std::sync::Arc::clone(&sink);
+                async move {
+                    sink.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    nextgcore_sbi::message::SbiResponse::with_status(201)
+                }
+            })
+            .await
+            .expect("recorder starts");
+        let amf = DiscoveredAmf {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            nf_instance_id: None,
+        };
+
+        // Port 1 on loopback: nothing listens, so the token request fails.
+        let outcome = crate::TEST_OAUTH2_CLIENT
+            .scope(
+                stand_in::oauth2_client_for(1, NfType::Mbsmf),
+                context_create(&amf, &tmgi()),
+            )
+            .await;
+
+        assert_eq!(outcome, None);
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no token: nothing is sent, not even bare"
+        );
+    }
+
+    /// #1662, failure-path properties 1, 2 and 4 against the RECEIVING peer:
+    /// amfd's real Namf handler behind an OAuth2-required listener (nextgcore-sbi's
+    /// gate, audience AMF).
+    /// - A bare ContextCreate is refused 401 and creates no MBS context (1).
+    /// - With the token it creates one, and a retry of the same request returns
+    ///   the same ref without a second context (2).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn context_create_reaches_the_real_amf_handler_behind_its_oauth2_gate_1662() {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        use nextgcore_sbi::test_support::oauth2 as stand_in;
+        use nextgcore_sbi::types::NfType;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        nextgcore_amfd::test_support::init_context();
+        let sk = nextgcore_sbi::oauth::generate_es256_key();
+        let (_nrf, nrf_port) = stand_in::token_nrf(sk.clone()).await;
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let mut cfg = SbiServerConfig::new(addr).with_expected_audience_nf_type(NfType::Amf);
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(stand_in::jwks_for(&sk, stand_in::TEST_NRF_KID));
+        let amf_server = SbiServer::on_listener(cfg, listener);
+        amf_server
+            .start(nextgcore_amfd::namf_request_handler)
+            .await
+            .expect("amfd Namf server starts");
+        let amf = DiscoveredAmf {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            nf_instance_id: None,
+        };
+        let sessions = || nextgcore_amfd::context::amf_mcast().session_count();
+        let before = sessions();
+
+        let bare = context_create(&amf, &tmgi()).await;
+        let after_bare = sessions();
+        let oauth2 = stand_in::oauth2_client_for(nrf_port, NfType::Mbsmf);
+        let first = crate::TEST_OAUTH2_CLIENT
+            .scope(
+                std::sync::Arc::clone(&oauth2),
+                context_create(&amf, &tmgi()),
+            )
+            .await;
+        let after_first = sessions();
+        let retry = crate::TEST_OAUTH2_CLIENT
+            .scope(oauth2, context_create(&amf, &tmgi()))
+            .await;
+
+        assert_eq!(bare, None, "the AMF's gate refuses a bare ContextCreate");
+        assert_eq!(
+            after_bare, before,
+            "a refused ContextCreate creates nothing"
+        );
+        let first = first.expect("with the token amfd creates the MBS context");
+        assert_eq!(after_first, before + 1);
+        assert_eq!(
+            retry.as_deref(),
+            Some(first.as_str()),
+            "a retry returns the same ref"
+        );
+        assert_eq!(sessions(), before + 1, "and creates no second context");
     }
 
     /// The `mbsServiceId` is 6 hex digits, which is what the OpenAPI's
