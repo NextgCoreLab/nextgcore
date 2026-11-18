@@ -52,6 +52,7 @@
 //! notifications without a token (TS 33.501 §13.4.1; nextgcore#1421). It would
 //! also require the path's API name (`3gpp-ueid`) as the scope.
 
+use nextgcore_sbi::server::BearerRefusal;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -264,34 +265,22 @@ pub async fn route(method: &str, path: &str, request: &SbiRequest) -> SbiRespons
     retrieve(&state, request).await
 }
 
-/// Why a request was refused before any identity was looked up.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Refusal {
-    /// No, malformed or unverifiable bearer token (401).
-    Unauthorized(String),
-    /// A valid token whose scope does not cover [`SERVICE_NAME`] (403).
-    Forbidden(String),
-    /// The keys to verify with are unavailable (503).
-    Unavailable(String),
-}
-
 /// Verify the bearer token: signature against the NRF's keys, audience NEF,
 /// expiry, and scope [`SERVICE_NAME`]. Returns the token's `sub` (the AF's
 /// nfInstanceId).
+///
+/// #1780: the decision and its answer are the shared server gate's
+/// (`nextgcore_sbi::server::bearer_decision`, TS 29.500 §6.7.3): no token is 401
+/// without `error`, an invalid one 401 `invalid_token`, another producer's
+/// audience 403 ACCESS_TOKEN_CLAIM_MISMATCH, a missing scope 403
+/// `insufficient_scope` naming it, unavailable keys 503.
 pub async fn verify_token(
     jwks: &nextgcore_sbi::oauth::JwksCache,
     request: &SbiRequest,
-) -> Result<String, Refusal> {
-    use nextgcore_sbi::error::SbiError;
+) -> Result<String, BearerRefusal> {
     let header = request.http.get_header("authorization").map(|s| s.as_str());
-    let claims = match jwks.authorize_aud(header, Some("NEF")).await {
-        Ok(c) => c,
-        Err(SbiError::AuthorizationFailed(m)) => return Err(Refusal::Unauthorized(m)),
-        Err(e) => return Err(Refusal::Unavailable(e.to_string())),
-    };
-    nextgcore_sbi::oauth::check_token_scope(&claims.scope, SERVICE_NAME)
-        .map_err(|e| Refusal::Forbidden(e.to_string()))?;
-    Ok(claims.sub)
+    let claims = jwks.authorize_aud(header, None).await;
+    nextgcore_sbi::server::bearer_decision(claims, header, Some("NEF"), Some(SERVICE_NAME))
 }
 
 fn problem(counter: &AtomicU64, response: SbiResponse) -> SbiResponse {
@@ -343,26 +332,13 @@ pub async fn retrieve(state: &UeIdState, request: &SbiRequest) -> SbiResponse {
                 DEMO_KEY,
                 "ueid refused: {refusal:?}; no identity returned"
             );
-            return match refusal {
-                Refusal::Unauthorized(m) => problem(
-                    &UNAUTHORIZED,
-                    nextgcore_sbi::server::send_unauthorized(&m, None).with_header(
-                        "WWW-Authenticate",
-                        "Bearer realm=\"5gc-sbi\", error=\"invalid_token\"",
-                    ),
-                ),
-                Refusal::Forbidden(m) => problem(
-                    &FORBIDDEN,
-                    nextgcore_sbi::server::send_forbidden(&m, None).with_header(
-                        "WWW-Authenticate",
-                        format!("Bearer realm=\"5gc-sbi\", error=\"insufficient_scope\", scope=\"{SERVICE_NAME}\""),
-                    ),
-                ),
-                Refusal::Unavailable(m) => problem(
-                    &UNAVAILABLE,
-                    send_error(503, "Service Unavailable", &m, None),
-                ),
+            let response = refusal.into_response();
+            let counter = match response.status {
+                401 => &UNAUTHORIZED,
+                403 => &FORBIDDEN,
+                _ => &UNAVAILABLE,
             };
+            return problem(counter, response);
         }
     };
     let req = match parse_ue_id_req(request.http.content.as_deref()) {
@@ -782,6 +758,14 @@ mod tests {
     /// forged signature, or a token without the `nnef-ueid` scope (what any
     /// non-AF consumer holds, since the NRF grants that scope to AF types only)
     /// is 401/403, returns no identity, and reaches neither the BSF nor the UDM.
+    ///
+    /// #1780, TS 29.500 §6.7.3 (the shared server gate's answers): no token is
+    /// 401 with no `error`; garbage or a forged signature 401 `invalid_token`;
+    /// another audience 403 ACCESS_TOKEN_CLAIM_MISMATCH; a missing scope 403
+    /// `insufficient_scope` with `scope="nnef-ueid"`.
+    ///
+    /// REVERT-VERIFIED (#1780): with the local gate's old answers back (every 401
+    /// `invalid_token`), "no token" fails ("challenge").
     #[test]
     fn an_unauthorised_caller_gets_401_or_403_and_no_identity() {
         runtime().block_on(async {
@@ -789,29 +773,60 @@ mod tests {
             let (_u, udm_uri, udm_seen) = stub(udm).await;
             let st = state(&bsf_uri, &udm_uri).await;
             let other = p256::ecdsa::SigningKey::from_slice(&[0x11; 32]).unwrap();
-            let cases: Vec<(&str, Option<String>, u16)> = vec![
-                ("no token", None, 401),
-                ("garbage", Some("not.a.jwt".to_string()), 401),
+            let invalid = "Bearer realm=\"5gc-sbi\", error=\"invalid_token\"";
+            let scope = format!(
+                "Bearer realm=\"5gc-sbi\", error=\"insufficient_scope\", scope=\"{SERVICE_NAME}\""
+            );
+            let cases: Vec<(&str, Option<String>, u16, String)> = vec![
+                (
+                    "no token",
+                    None,
+                    401,
+                    "Bearer realm=\"5gc-sbi\"".to_string(),
+                ),
+                (
+                    "garbage",
+                    Some("not.a.jwt".to_string()),
+                    401,
+                    invalid.to_string(),
+                ),
                 (
                     "audience AMF",
                     Some(token(&signing_key(), "AMF", SERVICE_NAME)),
-                    401,
+                    403,
+                    invalid.to_string(),
                 ),
-                ("forged", Some(token(&other, "NEF", SERVICE_NAME)), 401),
+                (
+                    "forged",
+                    Some(token(&other, "NEF", SERVICE_NAME)),
+                    401,
+                    invalid.to_string(),
+                ),
                 (
                     "T8 scope only",
                     Some(token(&signing_key(), "NEF", "nnef-eventexposure")),
                     403,
+                    scope.clone(),
                 ),
                 (
                     "the API name, not the service",
                     Some(token(&signing_key(), "NEF", API_NAME)),
                     403,
+                    scope.clone(),
                 ),
             ];
-            for (what, t, status) in cases {
+            for (what, t, status, challenge) in cases {
                 let resp = retrieve(&st, &request(IP, t.as_deref())).await;
                 assert_eq!(resp.status, status, "{what}: {:?}", resp.http.content);
+                let www = resp
+                    .http
+                    .get_header("www-authenticate")
+                    .cloned()
+                    .unwrap_or_default();
+                assert!(www.starts_with(&challenge), "{what}: challenge {www:?}");
+                if t.is_none() {
+                    assert!(!www.contains("error="), "{what}: challenge has no error");
+                }
                 let text = resp.http.content.clone().unwrap_or_default();
                 assert!(
                     !text.contains(EXT) && !text.contains(SUPI),
