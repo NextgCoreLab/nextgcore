@@ -42957,10 +42957,14 @@ mod tests {
     ///   `eventNotifyUri` and `notifyCorrelationId`.
     ///
     /// The two AMFs share this process's store, which `add_unless_equivalent` allows
-    /// for (it never matches a subscription that was not taken over).
+    /// for (it never matches a subscription that was not taken over). Because of
+    /// that, AMF-1's original is gone before the Registration Accept (review M1):
+    /// the CONNECTED report can then only come from AMF-2's copy.
     ///
     /// REVERT-VERIFIED: without the `eventSubscriptionList` in
-    /// `handle_ue_context_transfer`, "SUBSCRIPTION_ID_CHANGE from AMF-2" fails.
+    /// `handle_ue_context_transfer`, "SUBSCRIPTION_ID_CHANGE from AMF-2" fails; with
+    /// AMF-2's copy removed before the Registration Accept, "AMF-2's CONNECTED
+    /// report to the consumer" fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_subscription_at_one_amf_follows_the_ue_to_another_1727() {
         use nextgcore_sbi::message::SbiRequest;
@@ -43072,6 +43076,15 @@ mod tests {
         assert!(stored.taken_over, "AMF-2's copy");
         assert_eq!(stored.notify_correlation_id, "corr-1727");
 
+        // Review M1: AMF-1's original is removed before the Registration Accept, so
+        // the CONNECTED report can only come from AMF-2's copy. In production AMF-1
+        // releases it itself on AMF-2's TRANSFERRED (review M2), but here both AMFs
+        // share one store, and that update, on its own task, resolves the 5G-GUTI to
+        // either UE, so the release is proven by the producer tests
+        // `a_transferred_status_update_releases_the_handed_over_subscriptions_1727`
+        // and `a_not_transferred_status_update_keeps_the_handed_over_subscriptions_1727`.
+        drop(at_amf1);
+
         ngap.send_registration_accept(1, id, 55)
             .await
             .expect("accepted");
@@ -43095,7 +43108,6 @@ mod tests {
             "CONNECTED"
         );
 
-        drop(at_amf1);
         ngap.ue_auth_state.remove(id);
         amf1.stop().await.expect("AMF-1 stop");
         change_sink.stop().await.expect("sink stop");

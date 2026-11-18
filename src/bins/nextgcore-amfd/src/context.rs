@@ -4116,6 +4116,12 @@ pub struct AmfUe {
     pub mapped_eps_guti: Option<nextgcore_nas::eps::types::EpsGuti>,
     /// UE context transfer state
     pub amf_ue_context_transfer_state: UeContextTransferState,
+    /// #1727 review M2: the IDs of the event subscriptions this AMF, as the old AMF,
+    /// handed over in its last UEContextTransfer answer (`eventSubscriptionList`).
+    /// A RegistrationStatusUpdate of TRANSFERRED releases them, since the new AMF
+    /// now serves them; NOT_TRANSFERRED keeps them and clears this list
+    /// (TS 29.518 §5.2.2.2.1.1, §5.2.2.2.2).
+    pub handed_over_event_subscriptions: Vec<String>,
     /// GUAMI pointer index
     pub guami_index: Option<usize>,
     /// gNB output stream ID
@@ -4376,6 +4382,10 @@ impl std::fmt::Debug for AmfUe {
         d.field(
             "amf_ue_context_transfer_state",
             &self.amf_ue_context_transfer_state,
+        );
+        d.field(
+            "handed_over_event_subscriptions",
+            &self.handed_over_event_subscriptions,
         );
         d.field("guami_index", &self.guami_index);
         d.field("gnb_ostream_id", &self.gnb_ostream_id);
@@ -4946,6 +4956,7 @@ impl AmfUe {
             old_guti: Guti5gs::default(),
             mapped_eps_guti: None,
             amf_ue_context_transfer_state: UeContextTransferState::Initial,
+            handed_over_event_subscriptions: Vec::new(),
             guami_index: None,
             gnb_ostream_id: 0,
             nr_tai: Tai5gs::default(),
