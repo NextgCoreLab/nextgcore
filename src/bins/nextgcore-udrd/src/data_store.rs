@@ -1068,6 +1068,52 @@ pub fn post_notification(notify_uri: String, payload: Value) {
 // Change-notification builders/dispatchers (spec payload shapes)
 // ---------------------------------------------------------------------------
 
+/// Whether subscription-data subscription `s` is told of a change to
+/// `changed_path` of `ue_id`: its `ueId` is the UE, or one of its
+/// `monitoredResourceUris` covers the path.
+fn subscription_data_sub_covers(s: &StoredSub, ue_id: &str, changed_path: &str) -> bool {
+    let ue_match = s.body.get("ueId").and_then(Value::as_str) == Some(ue_id);
+    let uri_match = s
+        .body
+        .get("monitoredResourceUris")
+        .and_then(Value::as_array)
+        .is_some_and(|uris| {
+            uris.iter()
+                .filter_map(Value::as_str)
+                .any(|u| uri_covers(u, changed_path))
+        });
+    ue_match || uri_match
+}
+
+/// The TS 29.505 §5.4.2.6 `DataChangeNotify` telling `sub` of `changes` (TS 29.571
+/// `ChangeItem`s) to `resource_id` of `ue_id`.
+///
+/// Only the spec members are emitted: `ueId`, `originalCallbackReference` (only when
+/// the subscription carried a `callbackReference`) and `notifyItems` (udrd-11).
+pub fn data_change_notify(
+    sub: &StoredSub,
+    ue_id: &str,
+    resource_id: &str,
+    changes: Vec<Value>,
+) -> Value {
+    let mut payload_map = serde_json::Map::new();
+    payload_map.insert("ueId".to_string(), Value::String(ue_id.to_string()));
+    if let Some(cb) = sub.body.get("callbackReference").and_then(Value::as_str) {
+        payload_map.insert(
+            "originalCallbackReference".to_string(),
+            serde_json::json!([cb]),
+        );
+    }
+    payload_map.insert(
+        "notifyItems".to_string(),
+        serde_json::json!([{
+            "resourceId": resource_id,
+            "changes": changes
+        }]),
+    );
+    Value::Object(payload_map)
+}
+
 /// TS 29.505 DataChangeNotify to subscription-data subscribers whose
 /// monitoredResourceUris cover the changed resource (or whose ueId matches).
 ///
@@ -1078,17 +1124,7 @@ pub fn post_notification(notify_uri: String, payload: Value) {
 /// included (udrd-11).
 pub fn notify_subscription_data_change(ue_id: &str, changed_path: &str, new_value: Option<&Value>) {
     let subs = store().subs_matching(SubKind::SubscriptionData, |s| {
-        let ue_match = s.body.get("ueId").and_then(Value::as_str) == Some(ue_id);
-        let uri_match = s
-            .body
-            .get("monitoredResourceUris")
-            .and_then(Value::as_array)
-            .is_some_and(|uris| {
-                uris.iter()
-                    .filter_map(Value::as_str)
-                    .any(|u| uri_covers(u, changed_path))
-            });
-        ue_match || uri_match
+        subscription_data_sub_covers(s, ue_id, changed_path)
     });
     for sub in subs {
         // TS 29.571 §5.2.4.8: ChangeItem.path is MANDATORY. Use "" (whole
@@ -1098,26 +1134,114 @@ pub fn notify_subscription_data_change(ue_id: &str, changed_path: &str, new_valu
             Some(v) => serde_json::json!({"op": "REPLACE", "path": "", "newValue": v}),
             None => serde_json::json!({"op": "REMOVE", "path": ""}),
         };
-        // `originalCallbackReference` is conditional per TS 29.505 DataChangeNotify:
-        // include it only when the subscription body carried a `callbackReference`.
-        let orig_cb = sub.body.get("callbackReference").and_then(Value::as_str);
-        let mut payload_map = serde_json::Map::new();
-        payload_map.insert("ueId".to_string(), Value::String(ue_id.to_string()));
-        if let Some(cb) = orig_cb {
-            payload_map.insert(
-                "originalCallbackReference".to_string(),
-                serde_json::json!([cb]),
-            );
-        }
-        payload_map.insert(
-            "notifyItems".to_string(),
-            serde_json::json!([{
-                "resourceId": changed_path,
-                "changes": [change]
-            }]),
-        );
-        post_notification(sub.notify_uri.clone(), Value::Object(payload_map));
+        let payload = data_change_notify(&sub, ue_id, changed_path, vec![change]);
+        post_notification(sub.notify_uri.clone(), payload);
     }
+}
+
+// ---------------------------------------------------------------------------
+// am-data change detection (#1775)
+// ---------------------------------------------------------------------------
+
+/// The doc collection holding, per subscription id, the am-data that subscription
+/// was last told of (#1775). Persisted with the rest of the store, so a change
+/// provisioned while the UDR was down is still reported after it restarts.
+pub const AM_DATA_NOTIFIED_COLLECTION: &str = "am-data-notified";
+
+/// The UDR resource of `supi`'s access and mobility subscription data (TS 29.505
+/// §5.2.2, `/subscription-data/{ueId}/provisioned-data/am-data`).
+pub fn am_data_path(supi: &str) -> String {
+    format!("/nudr-dr/v2/subscription-data/{supi}/provisioned-data/am-data")
+}
+
+/// The UE a subscription-data subscription names: its `ueId`, else the
+/// `{ueId}` of the first monitored `/subscription-data/{ueId}/...` resource.
+fn subscription_ue(s: &StoredSub) -> Option<String> {
+    if let Some(ue) = s.body.get("ueId").and_then(Value::as_str) {
+        return Some(ue.to_string());
+    }
+    s.body
+        .get("monitoredResourceUris")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .find_map(|u| {
+            let path = uri_path(u);
+            let rest = path.split("/subscription-data/").nth(1)?;
+            let ue = rest.split('/').next()?;
+            (!ue.is_empty() && ue != "subs-to-notify").then(|| ue.to_string())
+        })
+}
+
+/// Every subscription-data subscription told of a change to its UE's am-data,
+/// with that UE (#1775). The provisioning watcher reads only these UEs' data.
+pub fn am_data_watchers() -> Vec<(String, StoredSub)> {
+    let mut out: Vec<(String, StoredSub)> = store()
+        .subs_matching(SubKind::SubscriptionData, |_| true)
+        .into_iter()
+        .filter_map(|s| {
+            let ue = subscription_ue(&s)?;
+            subscription_data_sub_covers(&s, &ue, &am_data_path(&ue)).then_some((ue, s))
+        })
+        .collect();
+    out.sort_by(|a, b| a.1.id.cmp(&b.1.id));
+    out
+}
+
+/// RFC 6901 escaping of one JSON-pointer token.
+fn pointer_token(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
+}
+
+/// The TS 29.571 `ChangeItem`s that take am-data `old` to `new`, one per top-level
+/// member that differs (#1775): `ADD` a member `old` lacks, `REMOVE` one `new` lacks,
+/// `REPLACE` one whose value changed. A member's value is carried whole, so an array
+/// such as `gpsis` is always replaced whole (TS 29.503 §5.2.2.5.2, TS 29.501 Annex
+/// E), and `origValue` is carried on `REPLACE` and `REMOVE`: §5.2.2.5.2 requires it
+/// when every element of an array was removed, and it lets the consumer detect that
+/// it holds something else (NOTE 1).
+pub fn am_data_changes(old: &Value, new: &Value) -> Vec<Value> {
+    let empty = serde_json::Map::new();
+    let old = old.as_object().unwrap_or(&empty);
+    let new = new.as_object().unwrap_or(&empty);
+    let mut keys: Vec<&String> = old.keys().chain(new.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    keys.into_iter()
+        .filter_map(|k| {
+            let path = format!("/{}", pointer_token(k));
+            match (old.get(k), new.get(k)) {
+                (None, Some(n)) => {
+                    Some(serde_json::json!({"op": "ADD", "path": path, "newValue": n}))
+                }
+                (Some(o), None) => {
+                    Some(serde_json::json!({"op": "REMOVE", "path": path, "origValue": o}))
+                }
+                (Some(o), Some(n)) if o != n => Some(serde_json::json!({
+                    "op": "REPLACE", "path": path, "newValue": n, "origValue": o
+                })),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// POST `payload` to `notify_uri` and wait for the answer, bounded by 2 s to connect
+/// and 3 s for the request. The status on an answer; an error when there was none.
+pub async fn deliver_notification(notify_uri: &str, payload: &Value) -> Result<u16, String> {
+    let logged = || nextgcore_sbi::log_redact::redact_last_segment(notify_uri);
+    let (host, port, path) =
+        parse_notify_uri(notify_uri).ok_or_else(|| format!("invalid notify URI {}", logged()))?;
+    let client = SbiClient::new(
+        nextgcore_sbi::security::sbi_peer_client_config(&host, port)
+            .with_connect_timeout(Duration::from_secs(2))
+            .with_request_timeout(Duration::from_secs(3)),
+    );
+    let result = client.post_json(&path, payload).await;
+    client.close().await;
+    result
+        .map(|resp| resp.status)
+        .map_err(|e| format!("notification to {} failed: {e}", logged()))
 }
 
 /// TS 29.519 ExposureDataChangeNotification (array) to exposure-data

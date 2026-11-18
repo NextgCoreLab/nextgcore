@@ -64,6 +64,11 @@ nextgcore-amfd = { path = "../nextgcore-amfd" }
 # MAC producers over a loopback SBI HTTP/2 server, not a lenient mock.
 # Dev-only edge; the binary graph is unchanged.
 nextgcore-ausfd = { path = "../nextgcore-ausfd" }
+# #1775 (both peers): build the UDR's am-data DataChangeNotify with udrd's REAL
+# builders (`data_store::am_data_changes` / `data_change_notify`), so the test
+# from udmd's notify path to amfd's handler starts from what the UDR sends.
+# Dev-only edge; the binary graph is unchanged.
+nextgcore-udrd = { path = "../nextgcore-udrd" }
 # F-07 independent MAC oracle: recompute the Annex A.17-A.20 MACs from a
 # raw HMAC-SHA-256 S-string assembly, NOT via nextgcore-crypt's KDF (which
 # the ausfd producer uses) — so the strict-peer equality is a genuine

@@ -538,6 +538,9 @@ async fn main() -> Result<()> {
 
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
 
+    // #1775: report provisioning changes of a watched UE's am-data.
+    spawn_am_data_watch();
+
     // #1334: the Prometheus endpoint, on NEXTGCORE_METRICS_BIND (loopback by default,
     // #837) and UDR_METRICS_PORT (9090). Non-fatal, like smfd's.
     let _metrics = nextgcore_metrics::nf::serve_nf_metrics(
@@ -3089,6 +3092,9 @@ async fn handle_subscription_data_subs(
                     );
                 }
                 ds.sub_set_body(&sub.id, stored_body.clone(), None);
+                // #1775: what a subscriber to am-data is told of is measured from
+                // the am-data as it is now, not from the first watch pass.
+                am_data_watch_baseline(&sub.id).await;
                 SbiResponse::with_status(201)
                     .with_header(
                         "Location",
@@ -3180,6 +3186,146 @@ async fn handle_subscription_data_subs(
             _ => send_method_not_allowed(method, "subscription-data/subs-to-notify/{subsId}"),
         },
     }
+}
+
+// ============================================================================
+// am-data provisioning watch (#1775)
+// ============================================================================
+//
+// TS 23.502 §4.5.1 / §4.5.2: when a subscriber's profile changes in the UDR, the
+// UDR notifies the UDM (Nudr_DM_Notify, TS 29.505 §5.4.2.6) and the UDM notifies
+// the AMF (Nudm_SDM_Notification). The am-data this UDR serves is built from the
+// subscriber database, which an operator provisions directly (the WebUI writes
+// MongoDB, not this UDR), so no UDR write path sees the change. The watcher reads
+// the am-data of each UE a subscription-data subscription watches, every
+// `UDR_AM_DATA_WATCH_MS`, and tells each subscription what changed since the
+// am-data it was last told of.
+//
+// Per-subscription state (`AM_DATA_NOTIFIED_COLLECTION`): the am-data the
+// subscription was last told of, persisted with the store. It advances when the
+// subscriber answers 2xx, or a 4xx other than 404 (a refusal: the same change is
+// not resent, so a subscriber answering 400 is not sent it in a loop). A 404 means
+// the subscription is gone at the subscriber, and it is removed here. No answer, or
+// a 5xx, leaves the state, so the change is resent at the next pass, never sooner.
+// Each subscription's notifications are sent one at a time, in pass order, so a
+// later change cannot overtake an earlier one.
+
+/// The watch period env var, in milliseconds; `0` turns the watch off.
+const AM_DATA_WATCH_ENV: &str = "UDR_AM_DATA_WATCH_MS";
+/// The default watch period: the longest a provisioning change waits to be told.
+const DEFAULT_AM_DATA_WATCH_MS: u64 = 5_000;
+
+fn am_data_watch_period() -> Option<std::time::Duration> {
+    let ms = std::env::var(AM_DATA_WATCH_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_AM_DATA_WATCH_MS);
+    (ms > 0).then(|| std::time::Duration::from_millis(ms))
+}
+
+/// Start the am-data watch, unless `UDR_AM_DATA_WATCH_MS` is 0.
+fn spawn_am_data_watch() {
+    let Some(period) = am_data_watch_period() else {
+        log::info!("{AM_DATA_WATCH_ENV}=0: am-data provisioning changes are not reported");
+        return;
+    };
+    log::info!("am-data provisioning watch every {} ms", period.as_millis());
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            am_data_watch_pass().await;
+        }
+    });
+}
+
+/// `supi`'s am-data as this UDR serves it, or `None` when it cannot be read now.
+async fn read_am_data(supi: &str) -> Option<serde_json::Value> {
+    match nextgcore_dbi::subscription::nextgcore_dbi_subscription_data_async(supi.to_string()).await
+    {
+        Ok(data) => Some(build_am_data(&data)),
+        Err(e) => {
+            log::debug!("[{supi}] am-data watch: subscriber data not read: {e:?}");
+            None
+        }
+    }
+}
+
+/// Record the am-data subscription `sub_id` starts from, if it watches am-data.
+async fn am_data_watch_baseline(sub_id: &str) {
+    let Some((supi, _)) = data_store::am_data_watchers()
+        .into_iter()
+        .find(|(_, s)| s.id == sub_id)
+    else {
+        return;
+    };
+    if let Some(now) = read_am_data(&supi).await {
+        data_store::store().doc_put(data_store::AM_DATA_NOTIFIED_COLLECTION, sub_id, now);
+    }
+}
+
+/// One watch pass: tell each am-data subscription of a change since what it was
+/// last told. Returns how many notifications were answered 2xx.
+async fn am_data_watch_pass() -> usize {
+    use data_store::AM_DATA_NOTIFIED_COLLECTION as NOTIFIED;
+    let ds = data_store::store();
+    let watchers = data_store::am_data_watchers();
+    // State of a subscription that is gone, or no longer watches am-data, goes.
+    let live: std::collections::HashSet<&str> =
+        watchers.iter().map(|(_, s)| s.id.as_str()).collect();
+    for (id, _) in ds.doc_list(NOTIFIED) {
+        if !live.contains(id.as_str()) {
+            ds.doc_remove(NOTIFIED, &id);
+        }
+    }
+    let mut read: std::collections::HashMap<String, Option<serde_json::Value>> =
+        std::collections::HashMap::new();
+    let mut delivered = 0;
+    for (supi, sub) in &watchers {
+        if !read.contains_key(supi) {
+            let now = read_am_data(supi).await;
+            read.insert(supi.clone(), now);
+        }
+        let Some(now) = read.get(supi).cloned().flatten() else {
+            continue;
+        };
+        let Some(told) = ds.doc_get(NOTIFIED, &sub.id) else {
+            ds.doc_put(NOTIFIED, &sub.id, now);
+            continue;
+        };
+        if told == now {
+            continue;
+        }
+        let changes = data_store::am_data_changes(&told, &now);
+        let payload =
+            data_store::data_change_notify(sub, supi, &data_store::am_data_path(supi), changes);
+        let target = nextgcore_sbi::log_redact::redact_last_segment(&sub.notify_uri);
+        match data_store::deliver_notification(&sub.notify_uri, &payload).await {
+            Ok(status) if (200..300).contains(&status) => {
+                log::info!("[{supi}] am-data change notified to {target}: {status}");
+                ds.doc_put(NOTIFIED, &sub.id, now);
+                delivered += 1;
+            }
+            Ok(404) => {
+                log::info!(
+                    "[{supi}] {target} answered 404: subscription {} is gone, removed",
+                    sub.id
+                );
+                ds.sub_remove(&sub.id);
+                ds.doc_remove(NOTIFIED, &sub.id);
+            }
+            Ok(status) if (400..500).contains(&status) => {
+                log::warn!("[{supi}] {target} refused the am-data change ({status}); not resent");
+                ds.doc_put(NOTIFIED, &sub.id, now);
+            }
+            Ok(status) => {
+                log::warn!("[{supi}] {target} answered {status}; resent next pass");
+            }
+            Err(e) => log::warn!("[{supi}] {e}; resent next pass"),
+        }
+    }
+    delivered
 }
 
 // ============================================================================
@@ -7478,6 +7624,223 @@ udr:
                 "{dnn} must carry no indicator when the operator flagged none"
             );
         }
+    }
+
+    // ========================================================================
+    // #1775: am-data provisioning changes reach the subscription-data subscriber.
+    // ========================================================================
+
+    /// A subscriber document with UE-AMBR `ul_mbps`/`dl_mbps` (unit 2 = Mbps).
+    fn ambr_document(
+        imsi: &str,
+        ul_mbps: i32,
+        dl_mbps: i32,
+    ) -> nextgcore_dbi::mongodb::bson::Document {
+        nextgcore_dbi::mongodb::bson::doc! {
+            "imsi": imsi,
+            "ambr": {
+                "uplink": { "value": ul_mbps, "unit": 2 },
+                "downlink": { "value": dl_mbps, "unit": 2 },
+            },
+        }
+    }
+
+    /// A notify listener answering every POST with `status`, sending what it
+    /// received into the channel.
+    async fn status_listener(
+        status: u16,
+    ) -> (SbiServer, u16, mpsc::UnboundedReceiver<serde_json::Value>) {
+        let (l, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let server = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), l);
+        server
+            .start(move |req: SbiRequest| {
+                let tx = tx.clone();
+                async move {
+                    let body = req.http.content.clone().unwrap_or_default();
+                    let _ = tx.send(serde_json::from_str(&body).unwrap_or_default());
+                    SbiResponse::with_status(status)
+                }
+            })
+            .await
+            .expect("listener starts");
+        (server, addr.port(), rx)
+    }
+
+    /// Subscribe at the UDR for `supi`'s am-data, notifying `port`; the id.
+    async fn subscribe_am_data(client: &SbiClient, supi: &str, port: u16) -> String {
+        let body = json!({
+            "callbackReference":
+                format!("http://127.0.0.1:{port}/nudm-callback/v1/{supi}/udr-data-change/t"),
+            "monitoredResourceUris": [data_store::am_data_path(supi)],
+        });
+        let resp = client
+            .post_json("/nudr-dr/v2/subscription-data/subs-to-notify", &body)
+            .await
+            .expect("POST subs-to-notify");
+        assert_eq!(resp.status, 201);
+        json_of(&resp)["subscriptionId"]
+            .as_str()
+            .expect("subscriptionId")
+            .to_string()
+    }
+
+    /// The notifications that `pass` sent `rx`, without waiting for more.
+    fn drain(rx: &mut mpsc::UnboundedReceiver<serde_json::Value>) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        while let Ok(v) = rx.try_recv() {
+            out.push(v);
+        }
+        out
+    }
+
+    /// #1775, TS 23.502 §4.5.1 / TS 29.505 §5.4.2.6: a provisioning change of a
+    /// watched UE's subscribed UE-AMBR and GPSI is told to the subscription-data
+    /// subscriber as a DataChangeNotify on the am-data resource, one ChangeItem per
+    /// changed member, the array replaced whole, each with its origValue. Told once:
+    /// the next pass, with nothing changed, sends nothing; and nothing is sent before
+    /// the change (the baseline is the am-data as it was at subscribe).
+    ///
+    /// REVERT-VERIFIED: with `am_data_watch_baseline` not called at subscribe the
+    /// first pass records the baseline and the change made before it is never told
+    /// (0 notifications); with the 2xx arm not advancing the state, the third pass
+    /// sends the change again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provisioned_am_data_change_is_told_once_member_by_member_1775() {
+        // Loopback plaintext peers; set and never reset (CONVENTIONS).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (udr, client, _l, _p, _rx) = start_udr_and_listener().await;
+        let _dbi = DbiTestStore::enable().await;
+        let supi = "imsi-001019900017751";
+        nextgcore_dbi::test_store::provision_subscriber_document(
+            supi,
+            ambr_document("001019900017751", 1, 2),
+        );
+        nextgcore_dbi::test_store::provision_subscriber(supi, &["4917751"]);
+        let (udm, port, mut rx) = status_listener(204).await;
+        let sub_id = subscribe_am_data(&client, supi, port).await;
+
+        // The operator provisions a new UE-AMBR and MSISDN.
+        nextgcore_dbi::test_store::provision_subscriber_document(
+            supi,
+            ambr_document("001019900017751", 5, 10),
+        );
+        nextgcore_dbi::test_store::provision_subscriber(supi, &["4917759"]);
+        assert_eq!(am_data_watch_pass().await, 1, "the change is told");
+        let told = drain(&mut rx);
+        assert_eq!(told.len(), 1, "{told:?}");
+        let n = &told[0];
+        assert_eq!(n["ueId"], supi);
+        let item = &n["notifyItems"][0];
+        assert_eq!(item["resourceId"], data_store::am_data_path(supi));
+        assert_eq!(
+            item["changes"],
+            json!([
+                {"op": "REPLACE", "path": "/gpsis",
+                 "newValue": ["msisdn-4917759"], "origValue": ["msisdn-4917751"]},
+                {"op": "REPLACE", "path": "/subscribedUeAmbr",
+                 "newValue": {"uplink": "5 Mbps", "downlink": "10 Mbps"},
+                 "origValue": {"uplink": "1 Mbps", "downlink": "2 Mbps"}},
+            ]),
+            "one ChangeItem per changed member, arrays whole"
+        );
+
+        assert_eq!(am_data_watch_pass().await, 0, "told once");
+        assert!(drain(&mut rx).is_empty());
+
+        let resp = client
+            .delete(&format!(
+                "/nudr-dr/v2/subscription-data/subs-to-notify/{sub_id}"
+            ))
+            .await
+            .expect("DELETE");
+        assert_eq!(resp.status, 204);
+        am_data_watch_pass().await;
+        assert!(
+            data_store::store()
+                .doc_get(data_store::AM_DATA_NOTIFIED_COLLECTION, &sub_id)
+                .is_none(),
+            "a removed subscription's state goes with it"
+        );
+        udm.stop().await.expect("stop");
+        udr.stop().await.expect("stop");
+    }
+
+    /// #1775 (TS 29.503 Table 6.1.5.2-3 at the subscriber): a 400 is a refusal and
+    /// the same change is not resent, so a subscriber that keeps answering 400 is not
+    /// sent it in a loop; a 503 is resent at the next pass; a 404 says the
+    /// subscription is gone, and it is removed here.
+    ///
+    /// REVERT-VERIFIED: with the 4xx arm leaving the state, the second pass to the
+    /// 400 subscriber sends the change again; with the 404 arm not removing the
+    /// subscription, it is still stored after the pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_change_is_not_resent_and_a_gone_subscription_is_removed_1775() {
+        // Loopback plaintext peers; set and never reset (CONVENTIONS).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (udr, client, _l, _p, _rx) = start_udr_and_listener().await;
+        let _dbi = DbiTestStore::enable().await;
+        let supi = "imsi-001019900017752";
+        let imsi = "001019900017752";
+        nextgcore_dbi::test_store::provision_subscriber_document(supi, ambr_document(imsi, 1, 2));
+        let (refusing, refusing_port, mut refused) = status_listener(400).await;
+        let (busy, busy_port, mut busy_rx) = status_listener(503).await;
+        let (gone, gone_port, mut gone_rx) = status_listener(404).await;
+        let _refusing_sub = subscribe_am_data(&client, supi, refusing_port).await;
+        let busy_sub = subscribe_am_data(&client, supi, busy_port).await;
+        let gone_sub = subscribe_am_data(&client, supi, gone_port).await;
+
+        nextgcore_dbi::test_store::provision_subscriber_document(supi, ambr_document(imsi, 3, 4));
+        assert_eq!(am_data_watch_pass().await, 0, "none answered 2xx");
+        assert_eq!(drain(&mut refused).len(), 1);
+        assert_eq!(drain(&mut busy_rx).len(), 1);
+        assert_eq!(drain(&mut gone_rx).len(), 1);
+        assert!(
+            data_store::store().sub_get(&gone_sub).is_none(),
+            "a 404 removes the subscription"
+        );
+
+        am_data_watch_pass().await;
+        assert!(drain(&mut refused).is_empty(), "a refusal is not resent");
+        assert_eq!(drain(&mut busy_rx).len(), 1, "a 503 is resent next pass");
+        assert!(
+            drain(&mut gone_rx).is_empty(),
+            "a removed subscription is not sent to"
+        );
+
+        for id in data_store::am_data_watchers()
+            .into_iter()
+            .filter(|(ue, _)| ue == supi)
+            .map(|(_, s)| s.id)
+        {
+            data_store::store().sub_remove(&id);
+        }
+        let _ = busy_sub;
+        for s in [refusing, busy, gone] {
+            s.stop().await.expect("stop");
+        }
+        udr.stop().await.expect("stop");
+    }
+
+    /// #1775: the ChangeItems between two am-data documents: ADD, REMOVE (with the
+    /// whole original array, TS 29.503 §5.2.2.5.2) and REPLACE, member by member, and
+    /// none for an unchanged member; a member name is escaped as an RFC 6901 token.
+    #[test]
+    fn am_data_changes_are_member_by_member_1775() {
+        let old = json!({"gpsis": ["msisdn-1"], "mpsPriority": true, "a/b": 1, "same": 2});
+        let new = json!({"mcsPriority": true, "mpsPriority": false, "a/b": 2, "same": 2});
+        assert_eq!(
+            data_store::am_data_changes(&old, &new),
+            json!([
+                {"op": "REPLACE", "path": "/a~1b", "newValue": 2, "origValue": 1},
+                {"op": "REMOVE", "path": "/gpsis", "origValue": ["msisdn-1"]},
+                {"op": "ADD", "path": "/mcsPriority", "newValue": true},
+                {"op": "REPLACE", "path": "/mpsPriority", "newValue": false, "origValue": true},
+            ])
+            .as_array()
+            .cloned()
+            .expect("array")
+        );
     }
 }
 
