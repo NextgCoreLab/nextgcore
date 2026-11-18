@@ -708,10 +708,37 @@ fn pcf_client(pcf: &PcfEndpoint) -> nextgcore_sbi::client::SbiClient {
 /// does not fail the consumer's request -- the configuration is stored either way,
 /// which is #113's behaviour -- but it is logged at warn with the status, because a
 /// deployment that turned actuation ON and is getting silence needs to know.
+///
+/// #1754: the POST runs on its OWN task, so a consumer that disconnects mid-request
+/// (dropping the handler's future) cannot drop it: a PCF 201 is always read and
+/// recorded. And a 201 that lands after its resource was deleted (the consumer's
+/// Delete found no `appSessionId` to retract) is retracted here, so the PCF never
+/// holds an app session tsctsf does not record. `still_held` says whether the
+/// resource is still stored; it is asked AFTER the mapping is recorded, so either
+/// the resource's Delete sees the mapping or this sees the resource gone.
 pub async fn policy_authorization_create(
     resource_id: &str,
     body: &serde_json::Value,
+    still_held: fn(&str) -> bool,
 ) -> Option<String> {
+    let (resource_id, body) = (resource_id.to_string(), body.clone());
+    crate::spawn_detached(async move {
+        let app_session_id = create_once(&resource_id, &body).await?;
+        if still_held(&resource_id) {
+            return Some(app_session_id);
+        }
+        log::warn!(
+            "Npcf_PolicyAuthorization_Create for {resource_id} landed after the resource was \
+             deleted; retracting appSessionId={app_session_id}"
+        );
+        delete_with_retry(resource_id).await;
+        None
+    })
+    .await
+    .unwrap_or(None)
+}
+
+async fn create_once(resource_id: &str, body: &serde_json::Value) -> Option<String> {
     let pcf = resolve_pcf_endpoint().await?;
     let client = pcf_client(&pcf);
     let resp = match client
@@ -750,13 +777,76 @@ pub async fn policy_authorization_create(
     Some(app_session_id)
 }
 
+/// How one `Npcf_PolicyAuthorization_Delete` attempt ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteOutcome {
+    /// The PCF accepted it, or answered 404 (the app session is already gone).
+    Deleted,
+    /// No `appSessionId` is recorded for the resource: nothing to delete.
+    NothingRecorded,
+    /// Not delivered or refused: the mapping is kept, so it can be retried.
+    Failed,
+}
+
+/// #1754: the waits before each retry of a failed Delete. The mapping is kept across
+/// them; after the last it stays recorded (and is logged at error), never forgotten.
+#[cfg(not(test))]
+const DELETE_RETRY_DELAYS: [std::time::Duration; 5] = [
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(4),
+    std::time::Duration::from_secs(8),
+    std::time::Duration::from_secs(16),
+];
+#[cfg(test)]
+const DELETE_RETRY_DELAYS: [std::time::Duration; 5] = [std::time::Duration::from_millis(20); 5];
+
 /// `Npcf_PolicyAuthorization_Delete`: POST `.../app-sessions/{id}/delete`
 /// (TS 29.514 §4.2.5 -- a custom operation, not an HTTP DELETE).
 ///
 /// Returns true when the PCF accepted it. A resource that was never actuated has
 /// no `appSessionId` and is not an error: with the switch off at create time there
 /// is nothing to delete.
+///
+/// #1754: a failed Delete (no PCF, a transport error, a non-2xx other than 404)
+/// KEEPS the resource's `appSessionId` and is retried on [`DELETE_RETRY_DELAYS`];
+/// it used to forget it before the send, orphaning the PCF app session. The first
+/// attempt runs on its own task, so a consumer disconnect cannot drop it between
+/// taking the mapping and restoring it.
 pub async fn policy_authorization_delete(resource_id: &str) -> bool {
+    let resource_id = resource_id.to_string();
+    crate::spawn_detached(delete_with_retry(resource_id))
+        .await
+        .unwrap_or(false)
+}
+
+/// One attempt now; on failure the retries go on a detached task and this returns
+/// false.
+async fn delete_with_retry(resource_id: String) -> bool {
+    match delete_once(&resource_id).await {
+        DeleteOutcome::Deleted => return true,
+        DeleteOutcome::NothingRecorded => return false,
+        DeleteOutcome::Failed => {}
+    }
+    crate::spawn_detached(async move {
+        for delay in DELETE_RETRY_DELAYS {
+            tokio::time::sleep(delay).await;
+            if delete_once(&resource_id).await != DeleteOutcome::Failed {
+                return;
+            }
+        }
+        log::error!(
+            "Npcf_PolicyAuthorization_Delete for {resource_id} failed {} retries; its \
+             appSessionId stays recorded",
+            DELETE_RETRY_DELAYS.len()
+        );
+    });
+    false
+}
+
+/// One Delete attempt. The `appSessionId` is taken from the map so two attempts
+/// cannot both send it, and put back on any failure.
+async fn delete_once(resource_id: &str) -> DeleteOutcome {
     let Some(app_session_id) = ({
         match app_sessions().lock() {
             Ok(mut m) => m.remove(resource_id),
@@ -764,13 +854,19 @@ pub async fn policy_authorization_delete(resource_id: &str) -> bool {
         }
     }) else {
         log::debug!("no PCF app session recorded for {resource_id}; nothing to delete");
-        return false;
+        return DeleteOutcome::NothingRecorded;
+    };
+    let keep = |app_session_id: String| {
+        if let Ok(mut m) = app_sessions().lock() {
+            m.entry(resource_id.to_string()).or_insert(app_session_id);
+        }
+        DeleteOutcome::Failed
     };
     let Some(pcf) = resolve_pcf_endpoint().await else {
         log::warn!(
             "cannot delete PCF app session {app_session_id} for {resource_id}: no PCF resolved"
         );
-        return false;
+        return keep(app_session_id);
     };
     let client = pcf_client(&pcf);
     let path = format!("/npcf-policyauthorization/v1/app-sessions/{app_session_id}/delete");
@@ -781,18 +877,28 @@ pub async fn policy_authorization_delete(resource_id: &str) -> bool {
                  status={}",
                 resp.status
             );
-            true
+            DeleteOutcome::Deleted
+        }
+        Ok(resp) if resp.status == 404 => {
+            log::info!(
+                "Npcf_PolicyAuthorization_Delete for {resource_id}: the PCF holds no \
+                 appSessionId={app_session_id} (404), treated as deleted"
+            );
+            DeleteOutcome::Deleted
         }
         Ok(resp) => {
             log::warn!(
-                "Npcf_PolicyAuthorization_Delete for {resource_id} returned status {}",
+                "Npcf_PolicyAuthorization_Delete for {resource_id} returned status {}; kept for \
+                 retry",
                 resp.status
             );
-            false
+            keep(app_session_id)
         }
         Err(e) => {
-            log::warn!("Npcf_PolicyAuthorization_Delete for {resource_id} failed: {e}");
-            false
+            log::warn!(
+                "Npcf_PolicyAuthorization_Delete for {resource_id} failed: {e}; kept for retry"
+            );
+            keep(app_session_id)
         }
     }
 }
