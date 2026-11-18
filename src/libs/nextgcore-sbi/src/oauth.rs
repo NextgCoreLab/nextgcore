@@ -288,24 +288,61 @@ pub fn publish_cca_public_jwk(
     let jwk = es256_public_jwk(key.verifying_key(), nf_instance_id);
     let body = serde_json::to_string_pretty(&jwk)
         .map_err(|e| SbiError::ClientError(format!("failed to serialise the CCA JWK: {e}")))?;
-    std::fs::write(&path, body)
-        .map_err(|e| SbiError::ClientError(format!("failed to write {}: {e}", path.display())))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // World-readable on purpose: the NRF reads this, and it is a public key.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).map_err(|e| {
-            SbiError::ClientError(format!(
-                "failed to set permissions on {}: {e}",
-                path.display()
-            ))
-        })?;
-    }
+    write_atomically(&path, body.as_bytes())?;
     log::info!(
         "published the CCA public key for nfInstanceId {nf_instance_id} to {}",
         path.display()
     );
     Ok(path)
+}
+
+/// Write `body` to `path` so that a reader sees the old file or the new one, never
+/// a partial one (#1684): the NRF reads the trust-store directory while NFs start
+/// and publish into it. The body goes to a temporary file in the same directory
+/// (same filesystem, so the rename is atomic on POSIX), made world-readable (0644:
+/// the NRF reads it, and it is a public key), flushed, and renamed over `path`. The
+/// temporary name ends in neither `.jwk` nor anything a reader takes for an entry,
+/// and it is removed when any step fails, so a failed publish leaves `path` as it was
+/// and nothing beside it.
+fn write_atomically(path: &std::path::Path, body: &[u8]) -> SbiResult<()> {
+    use std::io::Write as _;
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("cca");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let tmp = dir.join(format!(".{name}.{}.{nanos}.tmp", std::process::id()));
+    /// Removes the temporary file unless it was renamed into place.
+    struct Pending<'a>(Option<&'a std::path::Path>);
+    impl Drop for Pending<'_> {
+        fn drop(&mut self) {
+            if let Some(tmp) = self.0 {
+                let _ = std::fs::remove_file(tmp);
+            }
+        }
+    }
+    let mut pending = Pending(Some(&tmp));
+    let fail = |what: &str, e: std::io::Error| {
+        SbiError::ClientError(format!("failed to {what} {}: {e}", path.display()))
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|e| fail("create a temporary file for", e))?;
+    file.write_all(body).map_err(|e| fail("write", e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o644))
+            .map_err(|e| fail("set permissions on", e))?;
+    }
+    file.sync_all().map_err(|e| fail("flush", e))?;
+    drop(file);
+    std::fs::rename(&tmp, path).map_err(|e| fail("rename into", e))?;
+    pending.0 = None;
+    Ok(())
 }
 
 /// Environment variable naming the directory this NF publishes its CCA PUBLIC
@@ -2467,6 +2504,97 @@ mod tests {
         );
         assert!(publish_cca_public_jwk(&second, "  ", &jwk_dir).is_err());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1684: a reader looping on the trust-store entry while it is republished
+    /// (with alternating keys, so every write changes it) always reads a whole,
+    /// usable ES256 JWK, through the NRF's own parser, and it is one of the two keys.
+    /// The directory holds only the entry afterwards (no temporary file left), and
+    /// the entry is world-readable.
+    ///
+    /// REVERT-VERIFIED: with `write_atomically` replaced by `std::fs::write`, the
+    /// reader sees an empty or truncated file and the assertion names it.
+    #[test]
+    fn a_reader_never_sees_a_partial_cca_jwk_while_it_is_republished_1684() {
+        let dir = std::env::temp_dir().join(format!(
+            "sbi-cca-atomic-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        let (a, b) = (generate_es256_key(), generate_es256_key());
+        let path = publish_cca_public_jwk(&a, "nf-1684", &dir).expect("publish");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let (path, stop) = (path.clone(), std::sync::Arc::clone(&stop));
+            let keys = (*a.verifying_key(), *b.verifying_key());
+            std::thread::spawn(move || {
+                let mut reads = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let text = std::fs::read_to_string(&path).expect("the entry always exists");
+                    let jwk: serde_json::Value = serde_json::from_str(&text)
+                        .unwrap_or_else(|e| panic!("a partial JWK was read ({e}): {text:?}"));
+                    let key = parse_es256_jwk(&jwk).expect("a usable JWK");
+                    assert!(key == keys.0 || key == keys.1, "one of the two keys");
+                    reads += 1;
+                }
+                reads
+            })
+        };
+        for i in 0..2_000 {
+            let key = if i % 2 == 0 { &b } else { &a };
+            publish_cca_public_jwk(key, "nf-1684", &dir).expect("republish");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let reads = reader.join().expect("the reader saw only whole JWKs");
+        assert!(reads > 0, "the reader ran");
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .expect("dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["nf-1684.jwk"], "no temporary file is left behind");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).expect("meta").permissions().mode();
+            assert_eq!(mode & 0o777, 0o644, "a public key the NRF reads");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1684 (failure path): a publish that cannot complete leaves the published
+    /// entry as it was and no temporary file beside it. Here the rename fails
+    /// because a directory sits where the entry goes.
+    ///
+    /// REVERT-VERIFIED: with the `Pending` guard's removal dropped, the temporary
+    /// file is left and the listing assertion names it.
+    #[test]
+    fn a_failed_cca_jwk_publish_leaves_no_temporary_file_1684() {
+        let dir = std::env::temp_dir().join(format!(
+            "sbi-cca-fail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(dir.join("nf-1684b.jwk").join("occupied")).expect("blocker");
+        let err = publish_cca_public_jwk(&generate_es256_key(), "nf-1684b", &dir);
+        assert!(err.is_err(), "the rename onto a non-empty directory fails");
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .expect("dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            left,
+            ["nf-1684b.jwk"],
+            "only the blocker: no temporary file"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
