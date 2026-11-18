@@ -25,15 +25,20 @@ nok() { echo "FAIL $*"; bad=1; }
 # --- 1. parity ---------------------------------------------------------------------------
 if python3 "${HERE}/gen.py" --check "${SIM}"; then ok "gen.py --check: the grid files match nextgsim"; else nok "gen.py --check"; fi
 mkdir -p "${T}/sim/config"
-cp -r "${SIM}/config/demo-ai-paging" "${T}/sim/config/"
-python3 - "${T}/sim/config/demo-ai-paging/ue-seed-1.yaml" <<'PY'
+# The control needs nextgsim's real files, then exactly one moved waypoint: a
+# missing copy would fail gen.py --check for the wrong reason.
+if cp -r "${SIM}/config/demo-ai-paging" "${T}/sim/config/" && python3 - "${T}/sim/config/demo-ai-paging/ue-seed-1.yaml" <<'PY'
 import re, sys
 p = sys.argv[1]; s = open(p).read()
 s, n = re.subn(r"(?m)^(    - \{ x: )(-?\d+)", lambda m: m.group(1) + str(int(m.group(2)) + 1), s, count=1)
 assert n == 1
 open(p, "w").write(s)
 PY
-if python3 "${HERE}/gen.py" --check "${T}/sim" 2>/dev/null; then nok "a moved waypoint passes gen.py --check"; else ok "a moved waypoint fails gen.py --check"; fi
+then
+  if python3 "${HERE}/gen.py" --check "${T}/sim" 2>/dev/null; then nok "a moved waypoint passes gen.py --check"; else ok "a moved waypoint fails gen.py --check"; fi
+else
+  nok "cannot build the moved-waypoint control from ${SIM}/config/demo-ai-paging"
+fi
 
 # --- 2. the parked route -----------------------------------------------------------------
 if python3 - "${HERE}/sim-grid.yaml" "${SIM}/config/demo-ai-paging/ue-seed-1.yaml" "${HERE}/seed.env" <<'PY'
