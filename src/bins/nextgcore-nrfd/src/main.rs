@@ -502,6 +502,41 @@ struct NrfSection {
     #[serde(rename = "heartBeatTimerMax")]
     heart_beat_timer_max: Option<u32>,
     discovery: Option<DiscoveryYaml>,
+    /// #1719: the NF Set IDs a registrant may claim in its `nfSetIdList`, and
+    /// who may claim each. Absent: every set is accepted as registered (the
+    /// behaviour before #1719), with a startup warning. Present, even empty:
+    /// NFRegister and NFUpdate refuse any set not listed for the registrant.
+    nf_set_allowlist: Option<Vec<NfSetAllowYaml>>,
+}
+
+/// #1719: one `nrf.nf_set_allowlist` entry. The NF Set ID itself names the PLMN
+/// (`set<Set ID>.<nftype>set.5gc.mnc<MNC>.mcc<MCC>`, TS 23.003 §28.12), so an
+/// entry per set is already per PLMN.
+#[derive(Debug, Clone, Deserialize)]
+struct NfSetAllowYaml {
+    /// The NF Set ID, compared case-insensitively (TS 23.003 §28.12).
+    nf_set_id: String,
+    /// The NF types that may claim it; any type when absent.
+    nf_types: Option<Vec<String>>,
+    /// The NF instances that may claim it; any instance when absent. An NF
+    /// Instance ID compares as the registry keys it (#1633).
+    nf_instance_ids: Option<Vec<String>>,
+}
+
+impl NfSetAllowYaml {
+    /// Whether this entry lets NF instance `nf_instance_id` of type `nf_type`
+    /// claim set `set_id`.
+    fn admits(&self, set_id: &str, nf_type: &str, nf_instance_id: &str) -> bool {
+        nextgcore_nrfd::nnrf_handler::same_nf_set_id(&self.nf_set_id, set_id)
+            && self
+                .nf_types
+                .as_ref()
+                .is_none_or(|types| types.iter().any(|t| t.trim().eq_ignore_ascii_case(nf_type)))
+            && self.nf_instance_ids.as_ref().is_none_or(|ids| {
+                ids.iter()
+                    .any(|id| same_nf_instance_id(id.trim(), nf_instance_id))
+            })
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -592,6 +627,9 @@ struct NrfPolicy {
     /// is then REFUSED rather than downgraded to the trust store — see the
     /// precedence rules on the YAML field.
     cca_trust_anchors: Vec<Vec<u8>>,
+    /// #1719: `nrf.nf_set_allowlist`. `None` accepts every registrant's
+    /// `nfSetIdList` as sent.
+    nf_set_allowlist: Option<Vec<NfSetAllowYaml>>,
 }
 
 impl Default for NrfPolicy {
@@ -629,8 +667,185 @@ impl Default for NrfPolicy {
             // the trust-store path — so the shipped default is byte-compatible
             // with #187's overlay.
             cca_trust_anchors: Vec::new(),
+            // #1719: existing deployments keep working; startup warns.
+            nf_set_allowlist: None,
         }
     }
+}
+
+impl NrfPolicy {
+    /// #1719: the NF Set IDs in `sets` that NF instance `nf_instance_id` of type
+    /// `nf_type` may not claim under `nrf.nf_set_allowlist`; empty when every one
+    /// is allowed, or when no allowlist is configured.
+    fn unallowed_nf_sets<'a>(
+        &self,
+        sets: impl IntoIterator<Item = &'a str>,
+        nf_type: &str,
+        nf_instance_id: &str,
+    ) -> Vec<&'a str> {
+        let Some(allow) = self.nf_set_allowlist.as_ref() else {
+            return Vec::new();
+        };
+        sets.into_iter()
+            .filter(|set| !allow.iter().any(|a| a.admits(set, nf_type, nf_instance_id)))
+            .collect()
+    }
+}
+
+/// #1719 (R19): strip from each of `profiles` (at startup, every profile restored
+/// from the state file) each NF Set `policy` does not allow it, and store the
+/// result. Returns each changed profile with its change items, for the
+/// NF_PROFILE_CHANGED notification.
+///
+/// Stripping, not deregistering, is the spec-safe choice: the issue's option 1
+/// allows "refuses or strips", and the NF keeps serving its services, which are
+/// not in question. Only the unauthorised membership claim goes. A deregistered
+/// NF would get 404 on its next heartbeat, re-register with the same claim, and
+/// be refused 403, so it would leave service altogether. A stripped NF that
+/// re-sends the claim on a later NFRegister or NFUpdate is refused as any other
+/// registrant is.
+fn strip_unallowed_restored_nf_sets(
+    policy: &NrfPolicy,
+    profiles: Vec<NfProfile>,
+) -> Vec<(NfProfile, Vec<ChangeItem>)> {
+    let manager = nf_manager();
+    let mut changed = Vec::new();
+    for profile in profiles {
+        let pre = profile.to_json();
+        let refused: Vec<String> = policy
+            .unallowed_nf_sets(
+                nf_set_ids_of(&pre),
+                &profile.nf_type,
+                &profile.nf_instance_id,
+            )
+            .into_iter()
+            .map(String::from)
+            .collect();
+        if refused.is_empty() {
+            continue;
+        }
+        let kept: Vec<serde_json::Value> = pre
+            .get("nfSetIdList")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter(|v| v.as_str().is_none_or(|s| !refused.iter().any(|r| r == s)))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut post = pre.clone();
+        let patch = if kept.is_empty() {
+            if let Some(obj) = post.as_object_mut() {
+                obj.remove("nfSetIdList");
+            }
+            serde_json::json!([{"op": "remove", "path": "/nfSetIdList"}])
+        } else {
+            post["nfSetIdList"] = serde_json::Value::Array(kept.clone());
+            serde_json::json!([{"op": "replace", "path": "/nfSetIdList", "value": kept}])
+        };
+        let updated = match NfProfile::from_json(&post) {
+            Ok(p) => p,
+            Err(missing) => {
+                log::error!(
+                    "nrfd-1719: restored NF instance {} no longer parses after stripping \
+                     NF Set(s) {refused:?} (missing {missing:?}); left unchanged",
+                    profile.nf_instance_id
+                );
+                continue;
+            }
+        };
+        if let Err(e) = manager.register(updated.clone()) {
+            log::error!(
+                "nrfd-1719: cannot store restored NF instance {} without NF Set(s) \
+                 {refused:?}: {e}",
+                profile.nf_instance_id
+            );
+            continue;
+        }
+        log::warn!(
+            "nrfd-1719: restored NF instance {} ({}) claimed NF Set(s) {refused:?} that \
+             nrf.nf_set_allowlist does not allow for it; the claim is removed from its \
+             profile, and an NFRegister or NFUpdate re-adding it is refused 403",
+            profile.nf_instance_id,
+            profile.nf_type
+        );
+        let changes = compute_profile_changes(&pre, &post, &patch, true);
+        changed.push((updated, changes));
+    }
+    changed
+}
+
+/// #1719 (R19): what `main` does with the profiles the state file restored, once
+/// the allowlist is known: strip each set it may not claim
+/// ([`strip_unallowed_restored_nf_sets`]) and tell the subscribers to each changed
+/// profile NF_PROFILE_CHANGED with its change items (TS 29.510 §5.2.2.6). One
+/// function rather than a loop in `main`, so the notification is tested
+/// (#1822 item 4).
+fn enforce_nf_set_allowlist_at_restore(policy: &NrfPolicy, restored: Vec<NfProfile>) {
+    for (profile, changes) in strip_unallowed_restored_nf_sets(policy, restored) {
+        let server_uri = nrf_self_uri().to_string();
+        tokio::spawn(async move {
+            if let Err(e) = nrf_nnrf_nfm_send_nf_profile_changed_notify_all_async(
+                &profile,
+                &server_uri,
+                changes,
+            )
+            .await
+            {
+                log::error!("Failed to send NF_PROFILE_CHANGED (nf_set_allowlist): {e}");
+            }
+        });
+    }
+}
+
+/// The `nfSetIdList` strings of an NFProfile document (TS 29.510 §6.1.6.2.2).
+fn nf_set_ids_of(doc: &serde_json::Value) -> Vec<&str> {
+    doc.get("nfSetIdList")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default()
+}
+
+/// #1719: refuse an NFRegister or NFUpdate whose profile claims an NF Set the
+/// registrant is not provisioned for in `nrf.nf_set_allowlist`. 403, because the
+/// request is well formed and the operator's policy forbids it; nothing is
+/// stored. `Some` is the refusal to send.
+fn refuse_unallowed_nf_sets(
+    operation: &str,
+    nf_instance_id: &str,
+    nf_type: &str,
+    claimed: Vec<&str>,
+) -> Option<SbiResponse> {
+    #[cfg(test)]
+    let test_policy = tests_nf_set_ids_1719::ALLOWLIST
+        .try_with(|allow| NrfPolicy {
+            nf_set_allowlist: allow.clone(),
+            ..NrfPolicy::default()
+        })
+        .ok();
+    #[cfg(not(test))]
+    let test_policy: Option<NrfPolicy> = None;
+    let refused = test_policy
+        .as_ref()
+        .unwrap_or_else(|| nrf_policy())
+        .unallowed_nf_sets(claimed, nf_type, nf_instance_id);
+    if refused.is_empty() {
+        return None;
+    }
+    log::warn!(
+        "{operation} for NF instance {nf_instance_id} ({nf_type}) refused: nfSetIdList claims \
+         {refused:?}, which nrf.nf_set_allowlist does not allow for it"
+    );
+    Some(send_error(
+        403,
+        "Forbidden",
+        &format!(
+            "{operation}: NF instance {nf_instance_id:?} ({nf_type}) may not claim NF Set(s) \
+             {refused:?} (nrf.nf_set_allowlist)"
+        ),
+        None,
+    ))
 }
 
 /// The CCA trusted keys one source configures, keyed canonically (#1633).
@@ -748,6 +963,7 @@ impl NrfPolicy {
         if let Some(max) = nrf.heart_beat_timer_max {
             p.hb_max = max;
         }
+        p.nf_set_allowlist = nrf.nf_set_allowlist.clone();
         if let Some(d) = nrf.discovery.as_ref() {
             if let Some(v) = d.validity_period {
                 p.disc_validity_period = v;
@@ -1065,16 +1281,38 @@ fn self_entry_test_lock() -> &'static tokio::sync::Mutex<()> {
 /// otherwise stay REGISTERED and discoverable for the life of the state file,
 /// naming an NRF profile this process does not maintain. Returns whether an
 /// entry was removed.
+///
+/// #1821: the removal is a deregistration like any other, so the subscribers
+/// whose conditions match the entry are told NF_DEREGISTERED (TS 29.510
+/// §5.2.2.6.1), as `handle_nf_deregister` and the no-heartbeat expiry tell
+/// theirs. Before, the entry vanished silently and a subscriber kept it cached.
+/// The subscriptions restored from the same state file are already in the
+/// registry when `main` calls this.
 fn drop_restored_self_entry() -> bool {
-    if nf_manager().get(nrf_instance_id()).is_none() {
+    let Some(profile) = nf_manager().get(nrf_instance_id()) else {
         return false;
-    }
+    };
     match nf_manager().deregister(nrf_instance_id()) {
         Ok(_) => {
             log::info!(
-                "nrfd-187: removed the NRF's own entry {} restored from the state file;                  this configuration does not register the NRF in its own registry",
+                "nrfd-187: removed the NRF's own entry {} restored from the state file; \
+                 this configuration does not register the NRF in its own registry",
                 nrf_instance_id()
             );
+            let server_uri = nrf_self_uri().to_string();
+            tokio::spawn(async move {
+                if let Err(e) = nrf_nnrf_nfm_send_nf_status_notify_all_async(
+                    NotificationEventType::NfDeregistered,
+                    &profile,
+                    &server_uri,
+                )
+                .await
+                {
+                    log::error!(
+                        "Failed to send NF_DEREGISTERED for the NRF's dropped own entry: {e}"
+                    );
+                }
+            });
             true
         }
         Err(e) => {
@@ -1575,6 +1813,23 @@ async fn main() -> Result<()> {
              attacker-chosen claims, so it proves nothing about the requester's identity."
         );
     }
+    match &policy.nf_set_allowlist {
+        None => log::warn!(
+            "nrfd-1719: nrf.nf_set_allowlist is not configured, so a registrant's nfSetIdList \
+             is accepted as sent. Any NF that can register can claim membership of any NF Set, \
+             and a consumer that admits a peer by set membership (smfd's sm-policy-notify, \
+             #1717) can be misled. List each NF Set and who may claim it."
+        ),
+        Some(allow) => log::info!(
+            "nrfd-1719: {} NF Set allowlist entr(y/ies) configured; NFRegister and NFUpdate \
+             refuse any other set",
+            allow.len()
+        ),
+    }
+    // #1719 (R19): a profile restored from the state file was never checked
+    // against this allowlist, and a heartbeating NF never re-registers, so the
+    // claim is enforced here, before the policy is published.
+    enforce_nf_set_allowlist_at_restore(&policy, nf_manager().list());
     NRF_POLICY.set(policy).ok();
 
     // Client side (T1.1): when SBI OAuth2 is enabled, the NRF acquires and
@@ -2136,6 +2391,15 @@ async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiRe
     {
         return refused;
     }
+    // #1719: and claims only the NF Sets the operator provisioned it for.
+    if let Some(refused) = refuse_unallowed_nf_sets(
+        "NFRegister",
+        nf_instance_id,
+        &nf_profile.nf_type,
+        nf_set_ids_of(&profile),
+    ) {
+        return refused;
+    }
 
     // nrfd-03: negotiate the heartBeatTimer the NRF will enforce and stamp it
     // onto the stored AND returned profile (TS 29.510 Table 6.1.6.2.2-1: the
@@ -2510,6 +2774,30 @@ async fn handle_nf_update(nf_instance_id: &str, request: &SbiRequest) -> SbiResp
     // #1611: the patched profile's nfType must still be one the verified
     // certificate names (a patch must not re-type the instance either).
     if let Some(refused) = registrant.bind_nf_type("NFUpdate", nf_instance_id, &updated.nf_type) {
+        return refused;
+    }
+    // #1719: a patch may not add an NF Set the registrant is not provisioned for.
+    // Only the sets it ADDS are checked, so a heartbeat of a profile restored
+    // from before the allowlist is not refused (startup names that profile). A
+    // patch that changes nfType re-checks every set, as the entitlement may be
+    // per type.
+    let retyped = !profile.nf_type.eq_ignore_ascii_case(&updated.nf_type);
+    let held = if retyped {
+        Vec::new()
+    } else {
+        nf_set_ids_of(&pre_patch_doc)
+    };
+    let added: Vec<&str> = nf_set_ids_of(&doc)
+        .into_iter()
+        .filter(|set| {
+            !held
+                .iter()
+                .any(|h| nextgcore_nrfd::nnrf_handler::same_nf_set_id(h, set))
+        })
+        .collect();
+    if let Some(refused) =
+        refuse_unallowed_nf_sets("NFUpdate", nf_instance_id, &updated.nf_type, added)
+    {
         return refused;
     }
 
@@ -3388,6 +3676,7 @@ async fn handle_nf_discover(request: &SbiRequest) -> SbiResponse {
         target_plmn_list,
         target_nf_instance_id: param("target-nf-instance-id"),
         target_nf_fqdn: param("target-nf-fqdn"),
+        target_nf_set_id: param("target-nf-set-id"),
         // Page in the handler; ask discover_profiles for the full match set.
         limit: None,
         // Identity selection for UDM/UDR/AUSF (TS 29.510 §5.3.2.2.2): route the
@@ -4831,7 +5120,7 @@ async fn handle_access_token_request_with_policy(
     let nf_instance_id = req.nf_instance_id;
     let nf_type = req.nf_type;
     let mut target_nf_type = req.target_nf_type;
-    let target_nf_instance_id = req.target_nf_instance_id;
+    let mut target_nf_instance_id = req.target_nf_instance_id;
 
     // RFC 6749 §5.2 error responses, carried as TS 29.510 AccessTokenErr.
     if req.grant_type != "client_credentials" {
@@ -4920,7 +5209,17 @@ async fn handle_access_token_request_with_policy(
             &target_nf_instance_id,
             &req.scope,
         ) {
-            Ok(consumer) => consumer,
+            Ok(consumer) => {
+                // #1750: this grant was authorized on "the target is THIS NRF", so
+                // the exact producer instance is known, and TS 29.510 Table
+                // 6.3.5.2.4-1 then makes `aud` "the NF service producer's NF
+                // instance ID(s) (if the exact NF instance(s) ... is known)", not
+                // the NF type: pin the target to this NRF, so the token names
+                // this NRF's instance and no other NRF trusting this issuer
+                // (another NRF of a set, a peer in the PLMN) accepts it.
+                target_nf_instance_id = nrf_instance_id().to_string();
+                consumer
+            }
             Err(why) => {
                 return token_error(
                     "invalid_client",
@@ -9851,7 +10150,7 @@ mod tests {
     }
 
     /// [`mint_nrf_token`] with any `aud` and `scope`.
-    fn mint_nrf_token_with(
+    pub(super) fn mint_nrf_token_with(
         sub: &str,
         aud: &serde_json::Value,
         scope: &str,
@@ -12717,6 +13016,503 @@ mod nrf_api_tokens_tests_1667 {
             }
         }
     }
+
+    /// The claims of a token the endpoint answered with.
+    fn claims_of(resp: &SbiResponse) -> (String, serde_json::Value) {
+        use base64::Engine;
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap();
+        let token = v["access_token"]
+            .as_str()
+            .expect("access_token")
+            .to_string();
+        let payload = token.split('.').nth(1).expect("JWS payload");
+        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .expect("base64url");
+        (token, serde_json::from_slice(&claims).expect("claims JSON"))
+    }
+
+    /// #1750: the bootstrap grant is authorized on "the target is this NRF", so
+    /// the exact producer is known and `aud` is this NRF's instance ID (TS 29.510
+    /// Table 6.3.5.2.4-1), however the target was named: by `targetNfType: NRF`
+    /// or by this NRF's instance ID. The gate admits it; a token naming another
+    /// NRF's instance, or the NRF type of a peer set, is not one for this NRF
+    /// unless it names this instance or the type. A registered consumer asking
+    /// by type still gets the type: its producer set is every registered NRF.
+    ///
+    /// REVERT-VERIFIED: without the pin in `handle_access_token_request`, the
+    /// `targetNfType: NRF` grant has `aud: "NRF"` and the first assertion names it.
+    #[tokio::test]
+    async fn the_bootstrap_token_names_this_nrf_instance_as_audience_1750() {
+        let _self_entry = self_entry_test_lock().lock().await;
+        let id = "1750c0c0-0000-4000-8000-00000000000c";
+        assert!(nf_manager().get(id).is_none(), "unregistered");
+        let policy = NrfPolicy::default();
+        let jwks = nrf_jwks_json();
+        let nfm = format!("/nnrf-nfm/v1/nf-instances/{id}");
+        for target in [
+            json!({"targetNfType": "NRF"}),
+            json!({"targetNfInstanceId": nrf_instance_id()}),
+            json!({"targetNfType": "NRF", "targetNfInstanceId": nrf_instance_id()}),
+        ] {
+            let resp = handle_access_token_request_with_policy(
+                &token_req(id, "AMF", target.clone(), "nnrf-nfm", Some((id, &["AMF"]))),
+                &policy,
+            )
+            .await;
+            assert_eq!(resp.status, 200, "{target}: {}", error_of(&resp));
+            let (token, claims) = claims_of(&resp);
+            assert_eq!(
+                claims["aud"],
+                json!([nrf_instance_id()]),
+                "{target}: the bootstrap token's audience is this NRF instance"
+            );
+            assert_eq!(claims["sub"], json!(id));
+            let sub = oauth2_gate(&nfm, Some(&format!("Bearer {token}")), true, &jwks)
+                .unwrap_or_else(|r| panic!("{target}: gate refused {}", r.status));
+            assert_eq!(sub.as_deref(), Some(id));
+        }
+        assert!(nf_manager().get(id).is_none(), "a token registers nothing");
+
+        // Another NRF's instance ID: signed by this NRF's key, still not a token
+        // for this NRF.
+        let other_nrf = "1750eeee-0000-4000-8000-0000000000f0";
+        let foreign = super::tests::mint_nrf_token_with(id, &json!([other_nrf]), "nnrf-nfm", 3600);
+        let refused = *oauth2_gate(&nfm, Some(&format!("Bearer {foreign}")), true, &jwks)
+            .expect_err("another NRF's audience");
+        assert_eq!(refused.status, 403, "{:?}", refused.http.content);
+        assert!(
+            refused
+                .http
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("ACCESS_TOKEN_CLAIM_MISMATCH"),
+            "{:?}",
+            refused.http.content
+        );
+
+        // A registered consumer asking by type: unchanged, the NF type.
+        let registered = "1750d0d0-0000-4000-8000-00000000000d";
+        nf_manager()
+            .register(
+                NfProfile::from_json(&json!({"nfInstanceId": registered, "nfType": "AMF",
+                    "nfStatus": "REGISTERED"}))
+                .expect("profile"),
+            )
+            .expect("stored");
+        let resp = handle_access_token_request_with_policy(
+            &token_req(
+                registered,
+                "AMF",
+                json!({"targetNfType": "NRF"}),
+                "nnrf-nfm",
+                Some((registered, &["AMF"])),
+            ),
+            &policy,
+        )
+        .await;
+        nf_manager().deregister(registered).ok();
+        assert_eq!(resp.status, 200, "{}", error_of(&resp));
+        assert_eq!(claims_of(&resp).1["aud"], json!("NRF"));
+    }
+}
+
+/// #1719: the registrant's `nfSetIdList` under `nrf.nf_set_allowlist`, through
+/// the real NFRegister and NFUpdate handlers.
+#[cfg(test)]
+mod tests_nf_set_ids_1719 {
+    use super::*;
+    use serde_json::json;
+
+    tokio::task_local! {
+        /// The allowlist the handlers see inside `ALLOWLIST.scope(..)`, in place of
+        /// the process policy. Task-local, so the other tests in this binary keep
+        /// the default (no allowlist).
+        pub(super) static ALLOWLIST: Option<Vec<NfSetAllowYaml>>;
+    }
+
+    const SET1: &str = "set1.pcfset.5gc.mnc001.mcc001";
+    const SET2: &str = "set2.pcfset.5gc.mnc001.mcc001";
+
+    fn allowlist(own: &str) -> Option<Vec<NfSetAllowYaml>> {
+        Some(vec![
+            NfSetAllowYaml {
+                nf_set_id: SET1.to_string(),
+                nf_types: Some(vec!["PCF".to_string()]),
+                nf_instance_ids: Some(vec![own.to_ascii_uppercase()]),
+            },
+            // Any PCF may claim set 2.
+            NfSetAllowYaml {
+                nf_set_id: SET2.to_string(),
+                nf_types: Some(vec!["PCF".to_string()]),
+                nf_instance_ids: None,
+            },
+        ])
+    }
+
+    async fn put(id: &str, nf_type: &str, sets: &[&str]) -> SbiResponse {
+        let body = json!({
+            "nfInstanceId": id,
+            "nfType": nf_type,
+            "nfStatus": "REGISTERED",
+            "heartBeatTimer": 10,
+            "ipv4Addresses": ["10.17.19.1"],
+            "nfSetIdList": sets,
+        });
+        let mut req = SbiRequest::put(format!("/nnrf-nfm/v1/nf-instances/{id}"))
+            .with_body(body.to_string(), "application/json");
+        // #1617 step f: NF management needs a verified certificate identity, so
+        // each request carries one naming its own instance (no NF types, so the
+        // nfType binding admits any type). The allowlist check runs after it.
+        req.peer_cert_nf_instance_id = Some(id.to_string());
+        handle_nf_register(id, &req).await
+    }
+
+    async fn patch(id: &str, ops: serde_json::Value) -> SbiResponse {
+        let mut req = SbiRequest::patch(format!("/nnrf-nfm/v1/nf-instances/{id}"))
+            .with_body(ops.to_string(), "application/json-patch+json");
+        req.peer_cert_nf_instance_id = Some(id.to_string());
+        handle_nf_update(id, &req).await
+    }
+
+    fn stored_sets(id: &str) -> Option<Vec<String>> {
+        nf_manager().get(id).map(|p| {
+            nf_set_ids_of(&p.to_json())
+                .into_iter()
+                .map(String::from)
+                .collect()
+        })
+    }
+
+    /// With an allowlist, NFRegister and NFUpdate admit only the NF Sets the
+    /// registrant is provisioned for, matched case-insensitively (TS 23.003
+    /// §28.12). A refused request is 403 and stores nothing: a rogue PCF that
+    /// claims another PCF's set is not registered, an NF of another type is not
+    /// either, and a patch that adds a set leaves the stored profile as it was.
+    /// A heartbeat patch of an allowed profile still succeeds, and a retried
+    /// NFRegister stores one record.
+    ///
+    /// REVERT-VERIFIED: with `refuse_unallowed_nf_sets` returning `None`, the
+    /// rogue registration is 201 and the first refusal assertion fails.
+    #[tokio::test]
+    async fn only_provisioned_nf_sets_are_registered_1719() {
+        let own = "17190a0a-0000-4000-8000-00000000000a";
+        let rogue = "17190b0b-0000-4000-8000-00000000000b";
+        let smf = "17190c0c-0000-4000-8000-00000000000c";
+        ALLOWLIST
+            .scope(allowlist(own), async {
+                // #1617 step f runs first: with no verified identity the claim
+                // is refused 400 INVALID_CLIENT before the allowlist is consulted.
+                let bare = SbiRequest::put(format!("/nnrf-nfm/v1/nf-instances/{rogue}")).with_body(
+                    json!({"nfInstanceId": rogue, "nfType": "PCF",
+                               "nfStatus": "REGISTERED", "nfSetIdList": [SET1]})
+                    .to_string(),
+                    "application/json",
+                );
+                let resp = handle_nf_register(rogue, &bare).await;
+                assert_eq!(
+                    resp.status, 400,
+                    "identity before the allowlist: {:?}",
+                    resp.http.content
+                );
+                assert!(stored_sets(rogue).is_none());
+
+                // A PCF of no allowed set: refused, nothing stored.
+                let resp = put(rogue, "PCF", &[SET1]).await;
+                assert_eq!(resp.status, 403, "{:?}", resp.http.content);
+                assert!(stored_sets(rogue).is_none(), "nothing stored for {rogue}");
+                // Another type claiming the set: refused.
+                let resp = put(smf, "SMF", &[SET2]).await;
+                assert_eq!(resp.status, 403, "{:?}", resp.http.content);
+                assert!(stored_sets(smf).is_none());
+
+                // The provisioned PCF, spelling the set in upper case: admitted.
+                let upper = SET1.to_ascii_uppercase();
+                let resp = put(own, "PCF", &[&upper]).await;
+                assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+                // A retry is one record (200, a replacement).
+                let resp = put(own, "PCF", &[&upper]).await;
+                assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+                assert_eq!(stored_sets(own), Some(vec![upper.clone()]));
+
+                // Any PCF may claim set 2.
+                let resp = put(rogue, "PCF", &[SET2]).await;
+                assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+
+                // NFUpdate adding set 1 to the rogue: refused, profile unchanged.
+                let resp = patch(
+                    rogue,
+                    json!([{"op": "add", "path": "/nfSetIdList/-", "value": SET1}]),
+                )
+                .await;
+                assert_eq!(resp.status, 403, "{:?}", resp.http.content);
+                assert_eq!(stored_sets(rogue), Some(vec![SET2.to_string()]));
+
+                // R19: NFUpdate re-typing the rogue to SMF while it keeps set 2,
+                // which only PCFs may claim: refused, type and sets unchanged.
+                let resp = patch(
+                    rogue,
+                    json!([{"op": "replace", "path": "/nfType", "value": "SMF"}]),
+                )
+                .await;
+                assert_eq!(
+                    resp.status, 403,
+                    "a re-typing patch re-checks every held set: {:?}",
+                    resp.http.content
+                );
+                assert_eq!(
+                    nf_manager().get(rogue).map(|p| p.nf_type).as_deref(),
+                    Some("PCF")
+                );
+                assert_eq!(stored_sets(rogue), Some(vec![SET2.to_string()]));
+
+                // A heartbeat patch keeps working.
+                let resp = patch(
+                    own,
+                    json!([{"op": "replace", "path": "/nfStatus", "value": "REGISTERED"}]),
+                )
+                .await;
+                assert!(
+                    resp.status == 200 || resp.status == 204,
+                    "{} {:?}",
+                    resp.status,
+                    resp.http.content
+                );
+            })
+            .await;
+        for id in [own, rogue, smf] {
+            let _ = nf_manager().deregister(id);
+        }
+    }
+
+    /// R19: a profile restored from the state file is held to the allowlist at
+    /// startup. Its unallowed sets are stripped and stored, so `target-nf-set-id`
+    /// discovery no longer returns it for them. An allowed set is kept, a profile
+    /// left with no set loses `nfSetIdList`, an allowed profile is untouched, and
+    /// each changed profile comes back with change items for NF_PROFILE_CHANGED.
+    ///
+    /// REVERT-VERIFIED: with the strip skipped (every profile `continue`s), the
+    /// rogue is still discovered in set 1 and the first assertion fails.
+    #[test]
+    fn a_restored_profile_loses_the_sets_it_may_not_claim_1719() {
+        let own = "17190e0e-0000-4000-8000-00000000000e";
+        let mixed = "17190f0f-0000-4000-8000-00000000000f";
+        let only = "17191010-0000-4000-8000-000000000010";
+        let restore = |id: &str, sets: &[&str]| {
+            let p = NfProfile::from_json(&json!({
+                "nfInstanceId": id,
+                "nfType": "PCF",
+                "nfStatus": "REGISTERED",
+                "nfSetIdList": sets,
+            }))
+            .expect("a valid profile");
+            nf_manager().register(p).expect("stored");
+        };
+        restore(own, &[SET1]);
+        restore(mixed, &[SET1, SET2]);
+        restore(only, &[SET1]);
+        let policy = NrfPolicy {
+            nf_set_allowlist: allowlist(own),
+            ..NrfPolicy::default()
+        };
+        let ours: Vec<NfProfile> = [own, mixed, only]
+            .iter()
+            .filter_map(|id| nf_manager().get(id))
+            .collect();
+        let changed = strip_unallowed_restored_nf_sets(&policy, ours);
+
+        let discovered = |set: &str| -> Vec<String> {
+            discover_profiles(&DiscoveryQuery {
+                target_nf_type: "PCF".to_string(),
+                requester_nf_type: "SMF".to_string(),
+                target_nf_set_id: Some(set.to_string()),
+                ..Default::default()
+            })
+            .iter()
+            .filter_map(|p| p.get("nfInstanceId").and_then(|v| v.as_str()))
+            .filter(|id| [own, mixed, only].contains(id))
+            .map(String::from)
+            .collect()
+        };
+        assert_eq!(
+            discovered(SET1),
+            vec![own.to_string()],
+            "only the provisioned PCF is in set 1"
+        );
+        assert_eq!(
+            discovered(SET2),
+            vec![mixed.to_string()],
+            "the allowed set is kept"
+        );
+        assert_eq!(stored_sets(mixed), Some(vec![SET2.to_string()]));
+        assert_eq!(stored_sets(only), Some(Vec::new()));
+        assert!(nf_manager()
+            .get(only)
+            .is_some_and(|p| p.to_json().get("nfSetIdList").is_none()));
+        assert_eq!(
+            stored_sets(own),
+            Some(vec![SET1.to_string()]),
+            "the allowed one is untouched"
+        );
+        let mut ids: Vec<&str> = changed
+            .iter()
+            .map(|(p, _)| p.nf_instance_id.as_str())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![mixed, only]);
+        assert!(
+            changed.iter().all(|(_, c)| !c.is_empty()),
+            "each change is notified"
+        );
+        for id in [own, mixed, only] {
+            let _ = nf_manager().deregister(id);
+        }
+    }
+
+    /// **#1822 item 4.** The restore-time enforcement `main` runs strips the
+    /// disallowed set and tells a subscriber to the profile NF_PROFILE_CHANGED over
+    /// the wire, naming `nfSetIdList`; a profile it leaves alone notifies nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_enforcement_notifies_the_stripped_profile_1822() {
+        use std::sync::Mutex as StdMutex;
+        let own = "18220a0a-0000-4000-8000-00000000000a";
+        let mixed = "18220b0b-0000-4000-8000-00000000000b";
+        let received: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::clone(&received);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let subscriber = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), listener);
+        subscriber
+            .start(move |req: SbiRequest| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    if let Some(body) = req.http.content.clone() {
+                        sink.lock().expect("sink lock").push(body);
+                    }
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await
+            .expect("subscriber server starts");
+        for (id, sets) in [(own, vec![SET1]), (mixed, vec![SET1, SET2])] {
+            let p = NfProfile::from_json(&json!({
+                "nfInstanceId": id,
+                "nfType": "PCF",
+                "nfStatus": "REGISTERED",
+                "nfSetIdList": sets,
+            }))
+            .expect("a valid profile");
+            nf_manager().register(p).expect("stored");
+            nf_manager().add_subscription(nextgcore_nrfd::SubscriptionData {
+                id: format!("nrfd1822-{id}"),
+                req_nf_type: None,
+                req_nf_instance_id: None,
+                notification_uri: format!("http://127.0.0.1:{}/callback", addr.port()),
+                subscr_cond: Some(nextgcore_nrfd::nnrf_handler::SubscrCond::nf_instance_id(id)),
+                validity_duration: 3600,
+                req_notif_events: None,
+                notif_condition: None,
+            });
+        }
+        let policy = NrfPolicy {
+            nf_set_allowlist: allowlist(own),
+            ..NrfPolicy::default()
+        };
+        let restored: Vec<NfProfile> = [own, mixed]
+            .iter()
+            .filter_map(|id| nf_manager().get(id))
+            .collect();
+        enforce_nf_set_allowlist_at_restore(&policy, restored);
+
+        for _ in 0..100 {
+            if !received.lock().expect("sink lock").is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Long enough for a second, wrong, notification to arrive too.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let got = received.lock().expect("sink lock").clone();
+        assert_eq!(
+            got.len(),
+            1,
+            "one notification, for the stripped PCF: {got:?}"
+        );
+        let body: serde_json::Value = serde_json::from_str(&got[0]).expect("JSON");
+        assert_eq!(body["event"], "NF_PROFILE_CHANGED");
+        assert!(
+            body["nfInstanceUri"]
+                .as_str()
+                .is_some_and(|u| u.ends_with(&format!("/nf-instances/{mixed}"))),
+            "{body}"
+        );
+        assert!(
+            body["profileChanges"]
+                .as_array()
+                .is_some_and(|c| c.iter().any(|i| i["path"] == "/nfSetIdList")),
+            "the change names nfSetIdList: {body}"
+        );
+        assert_eq!(stored_sets(mixed), Some(vec![SET2.to_string()]));
+        for id in [own, mixed] {
+            nf_manager().remove_subscription(&format!("nrfd1822-{id}"));
+            let _ = nf_manager().deregister(id);
+        }
+    }
+
+    /// **#1822 item 4.** `main` runs the restore-time enforcement on every restored
+    /// profile, before it publishes the policy. A source guard, because `main`
+    /// itself cannot run in a unit test.
+    #[test]
+    fn main_enforces_the_allowlist_on_restored_profiles_1822() {
+        let source = include_str!("main.rs");
+        let main = &source[source.find("async fn main()").expect("main")..];
+        let main = &main[..main.find("\n}\n").expect("its end")];
+        let call = main
+            .find("\n    enforce_nf_set_allowlist_at_restore(&policy, nf_manager().list());\n")
+            .expect("main enforces the allowlist on every restored profile");
+        let publish = main
+            .find("\n    NRF_POLICY.set(policy).ok();\n")
+            .expect("main publishes the policy");
+        assert!(
+            call < publish,
+            "the enforcement runs before the policy is published"
+        );
+    }
+
+    /// Without an allowlist (the default), a registrant's sets are accepted as
+    /// sent, so existing deployments keep working; startup warns.
+    #[tokio::test]
+    async fn without_an_allowlist_sets_are_accepted_as_registered_1719() {
+        let id = "17190d0d-0000-4000-8000-00000000000d";
+        let resp = ALLOWLIST.scope(None, put(id, "PCF", &[SET1])).await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+        assert_eq!(stored_sets(id), Some(vec![SET1.to_string()]));
+        let _ = nf_manager().deregister(id);
+    }
+
+    /// The allowlist is parsed from `nrf.nf_set_allowlist`, absent means none.
+    #[test]
+    fn the_allowlist_comes_from_the_config_1719() {
+        let yaml: NrfYaml = serde_yaml::from_str(
+            "nrf:\n  nf_set_allowlist:\n    - nf_set_id: set1.pcfset.5gc.mnc001.mcc001\n      \
+             nf_types: [PCF]\n",
+        )
+        .expect("parses");
+        let policy = NrfPolicy::from_yaml(&yaml);
+        let allow = policy.nf_set_allowlist.as_ref().expect("configured");
+        assert_eq!(allow.len(), 1);
+        assert!(policy
+            .unallowed_nf_sets(["SET1.pcfset.5gc.mnc001.mcc001"], "pcf", "any")
+            .is_empty());
+        assert_eq!(
+            policy.unallowed_nf_sets([SET2], "PCF", "any"),
+            vec![SET2],
+            "a set not listed is refused"
+        );
+        let none: NrfYaml = serde_yaml::from_str("nrf: {}\n").expect("parses");
+        assert!(NrfPolicy::from_yaml(&none).nf_set_allowlist.is_none());
+    }
 }
 
 /// #1617 step f: the NRF refuses NFRegister / NFUpdate / NFDeregister from a
@@ -12905,5 +13701,106 @@ mod unverified_registrant_tests_1617 {
             "the NRF's own entry is gone"
         );
         assert!(!drop_restored_self_entry(), "nothing left to remove");
+    }
+
+    /// **#1821, TS 29.510 §5.2.2.6.1.** Dropping the restored self entry tells a
+    /// subscriber to that entry NF_DEREGISTERED, over the wire, exactly once: the
+    /// second call finds nothing and sends nothing. Before, the entry vanished
+    /// with no notification.
+    ///
+    /// The subscription names the NRF's own instance, and every test that adds or
+    /// removes that entry holds `self_entry_test_lock`, so no other test's change
+    /// reaches this sink.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_the_restored_self_entry_notifies_nf_deregistered_1821() {
+        use std::sync::Mutex as StdMutex;
+        let _self_entry = self_entry_test_lock().lock().await;
+
+        let received: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::clone(&received);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let subscriber = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), listener);
+        subscriber
+            .start(move |req: SbiRequest| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    if let Some(body) = req.http.content.clone() {
+                        sink.lock().expect("sink lock").push(body);
+                    }
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await
+            .expect("subscriber server starts");
+
+        register_self_with_own_registry();
+        let manager = nf_manager();
+        let sub_id = "nrfd1821-self-entry-sub";
+        manager.add_subscription(nextgcore_nrfd::SubscriptionData {
+            id: sub_id.to_string(),
+            req_nf_type: None,
+            req_nf_instance_id: None,
+            notification_uri: format!("http://127.0.0.1:{}/callback", addr.port()),
+            subscr_cond: Some(nextgcore_nrfd::nnrf_handler::SubscrCond::nf_instance_id(
+                nrf_instance_id(),
+            )),
+            validity_duration: 3600,
+            req_notif_events: None,
+            notif_condition: None,
+        });
+
+        let wait_for = |want: usize| {
+            let received = Arc::clone(&received);
+            async move {
+                for _ in 0..100 {
+                    if received.lock().expect("sink lock").len() >= want {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                received.lock().expect("sink lock").clone()
+            }
+        };
+
+        assert!(drop_restored_self_entry(), "the restored entry is removed");
+        let got = wait_for(1).await;
+        assert_eq!(got.len(), 1, "one notification, got {got:?}");
+        let body: serde_json::Value = serde_json::from_str(&got[0]).expect("JSON");
+        assert_eq!(body["event"], "NF_DEREGISTERED");
+        assert!(
+            body["nfInstanceUri"]
+                .as_str()
+                .is_some_and(|u| u.ends_with(&format!("/nf-instances/{}", nrf_instance_id()))),
+            "it names the NRF's own instance: {body}"
+        );
+
+        assert!(!drop_restored_self_entry(), "nothing left to remove");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            received.lock().expect("sink lock").len(),
+            1,
+            "a second call finds nothing and sends nothing"
+        );
+        manager.remove_subscription(sub_id);
+    }
+
+    /// **#1821.** `main` drops the restored self entry exactly when the NRF does
+    /// not register itself: the `else` of the self-registration choice. A source
+    /// guard, because `main` itself cannot run in a unit test.
+    #[test]
+    fn main_drops_the_restored_self_entry_when_it_does_not_register_itself_1821() {
+        let source = include_str!("main.rs");
+        let main = &source[source.find("async fn main()").expect("main")..];
+        let main = &main[..main.find("\n}\n").expect("its end")];
+        let choice = "    } else if self_registers {\n";
+        let at = main.find(choice).expect("the self-registration choice");
+        let branch = &main[at + choice.len()..];
+        let branch = &branch[..branch.find("\n    }\n").expect("its end")];
+        assert!(
+            branch.trim_end().ends_with(
+                "register_self_with_own_registry();\n    } else {\n        drop_restored_self_entry();"
+            ),
+            "the else branch drops the restored entry: {branch}"
+        );
     }
 }

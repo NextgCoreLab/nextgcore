@@ -169,12 +169,20 @@ fn the_contract_body_parses_and_bad_fields_are_named() {
 }
 
 /// Criterion: "An unauthenticated POST to /nnwdaf-randata/v1/cell-reports returns
-/// 401 and creates no throttle". No token, a wrong-audience token and a bad
-/// signature are 401; a token without the scope is 403; no keys is 503. None of
-/// them ingests anything, and a valid token is 204 and ingested.
+/// 401 and creates no throttle". None of the refusals ingests anything, and a
+/// valid token is 204 and ingested. #1780, TS 29.500 §6.7.3 (the shared server
+/// gate's answers, `bearer_decision`):
+/// - no token: 401, challenge without `error`;
+/// - a bad signature: 401 `invalid_token`;
+/// - another producer's audience: 403 ACCESS_TOKEN_CLAIM_MISMATCH;
+/// - a token without the scope: 403 `insufficient_scope` with
+///   `scope="nnwdaf-randata"`;
+/// - no keys: 503.
 ///
 /// REVERT-VERIFIED: skipping `verify_token` in `ingest_report` turns the first
-/// assertion into 204 and fills the store.
+/// assertion into 204 and fills the store. #1780: with the local gate's old
+/// answers back (every 401 `invalid_token`, `insufficient_scope` without
+/// `scope`), the "no token" and "scope" challenges fail ("challenge").
 #[tokio::test]
 async fn only_a_scoped_nrf_token_gets_a_report_in() {
     let _serving = ServingOnThisThread::new();
@@ -183,14 +191,44 @@ async fn only_a_scoped_nrf_token_gets_a_report_in() {
     let now = unix_now_ms();
     let body = report_body("000000465", "000465", 96.0, now, false);
 
-    for (bearer, status) in [
-        (None, 401),
-        (Some(token("AMF", SERVICE_NAME)), 401),
-        (Some(format!("{}x", token("NWDAF", SERVICE_NAME))), 401),
-        (Some(token("NWDAF", "nnwdaf-analyticsinfo")), 403),
+    let scope_challenge =
+        format!("Bearer realm=\"5gc-sbi\", error=\"insufficient_scope\", scope=\"{SERVICE_NAME}\"");
+    for (bearer, status, challenge) in [
+        (None, 401, "Bearer realm=\"5gc-sbi\"".to_string()),
+        (
+            Some(token("AMF", SERVICE_NAME)),
+            403,
+            "Bearer realm=\"5gc-sbi\", error=\"invalid_token\"".to_string(),
+        ),
+        (
+            Some(format!("{}x", token("NWDAF", SERVICE_NAME))),
+            401,
+            "Bearer realm=\"5gc-sbi\", error=\"invalid_token\"".to_string(),
+        ),
+        (
+            Some(token("NWDAF", "nnwdaf-analyticsinfo")),
+            403,
+            scope_challenge,
+        ),
     ] {
         let out = ingest_report(&store, Some(&jwks), &post(&body, bearer.as_deref())).await;
         assert_eq!(out.response.status, status, "bearer {bearer:?}");
+        let www = out
+            .response
+            .http
+            .get_header("www-authenticate")
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            www.starts_with(&challenge),
+            "challenge: {www:?} for {bearer:?}"
+        );
+        if bearer.is_none() {
+            assert!(
+                !www.contains("error="),
+                "challenge: no error without a token"
+            );
+        }
         assert!(store.latest().is_empty(), "nothing ingested on {status}");
         assert!(out.new_tai.is_none());
     }
@@ -483,10 +521,22 @@ fn the_profile_offers_the_ingest_service_only_while_serving() {
             .as_array()
             .is_some_and(|ids| ids.iter().any(|e| e == "USER_DATA_CONGESTION"))
     };
-    let off = crate::build_nf_profile("nwdaf-465-p", "10.0.0.5", 7777, &allowed);
+    let off = crate::build_nf_profile(
+        "nwdaf-465-p",
+        "10.0.0.5",
+        7777,
+        nextgcore_sbi::types::UriScheme::Http,
+        &allowed,
+    );
     assert!(find(&off).is_none() && !udc(&off), "{off}");
     let _serving = ServingOnThisThread::new();
-    let on = crate::build_nf_profile("nwdaf-465-p", "10.0.0.5", 7777, &allowed);
+    let on = crate::build_nf_profile(
+        "nwdaf-465-p",
+        "10.0.0.5",
+        7777,
+        nextgcore_sbi::types::UriScheme::Http,
+        &allowed,
+    );
     let svc = find(&on).expect("nnwdaf-randata advertised while serving");
     assert_eq!(svc["allowedNfTypes"], json!(["AF"]));
     assert_eq!(svc["ipEndPoints"][0]["port"], 7777);

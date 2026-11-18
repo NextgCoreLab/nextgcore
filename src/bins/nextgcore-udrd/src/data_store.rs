@@ -411,6 +411,33 @@ impl UdrDataStore {
         created
     }
 
+    /// [`Self::doc_put`] without the snapshot write (#1775 review MAJOR-2): a caller
+    /// making many writes in one go (the am-data watch pass) persists once, with
+    /// [`Self::persist_now`], instead of rewriting the whole state file per write.
+    pub fn doc_put_deferred(&self, collection: &str, key: &str, doc: Value) {
+        self.docs
+            .write()
+            .expect("lock")
+            .insert((collection.to_string(), key.to_string()), doc);
+    }
+
+    /// [`Self::doc_remove`] without the snapshot write; see
+    /// [`Self::doc_put_deferred`]. Whether a document was removed.
+    pub fn doc_remove_deferred(&self, collection: &str, key: &str) -> bool {
+        self.docs
+            .write()
+            .expect("lock")
+            .remove(&(collection.to_string(), key.to_string()))
+            .is_some()
+    }
+
+    /// Write the snapshot now, after deferred writes. No-op when no path is
+    /// configured. Synchronous file I/O: an async caller runs it on a blocking
+    /// thread.
+    pub fn persist_now(&self) {
+        self.persist();
+    }
+
     /// Read the document at `(collection, key)`.
     pub fn doc_get(&self, collection: &str, key: &str) -> Option<Value> {
         self.docs
@@ -1011,15 +1038,64 @@ fn uri_path(uri: &str) -> &str {
     }
 }
 
-/// True when a monitored resource URI covers a changed resource path:
-/// exact match, monitored-is-ancestor, or suffix match (apiRoot-agnostic).
+/// A resource URI as (service, resource segments) for [`uri_covers`] (#1814).
+///
+/// The scheme and authority are dropped (an absolute URI and an absolute-path
+/// reference are both allowed, TS 29.505 `SubscriptionDataSubscription`
+/// `monitoredResourceUris`), and so are the query and fragment. The apiRoot,
+/// including any deployment prefix, ends at the `nudr-*/<version>` pair: the
+/// service is that name, and the resource is the segments after the version. A
+/// path without that pair is taken as already relative to the API root.
+/// `None` for a path with a `.` or `..` segment, which names no resource.
+fn resource_segments(uri: &str) -> Option<(Option<&str>, Vec<&str>)> {
+    let path = uri_path(uri);
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.iter().any(|s| *s == "." || *s == "..") {
+        return None;
+    }
+    let is_version = |s: &str| {
+        s.strip_prefix('v')
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let api = segments
+        .windows(2)
+        .position(|w| w[0].starts_with("nudr-") && is_version(w[1]));
+    Some(match api {
+        Some(i) => (Some(segments[i]), segments[i + 2..].to_vec()),
+        None => (None, segments),
+    })
+}
+
+/// Whether a monitored resource URI covers a changed resource path (#1814).
+///
+/// Whole segments are compared on the apiRoot-relative resource
+/// ([`resource_segments`]). The URI covers the change when it names the same
+/// resource or an ancestor of it (a collection such as `/policy-data/ues`, or one
+/// UE's `/subscription-data/{ueId}`), or when the change replaced an ancestor of
+/// what it monitors. Both URIs must name the same Nudr service when both name one.
+/// So a UE's resource is covered only through a URI that carries that UE's
+/// segment, or one that explicitly monitors a collection above every UE.
+///
+/// This used to accept any raw string suffix as well. A subscription without a
+/// `ueId` that monitored `/pp-data` then matched every UE's pp-data and was
+/// notified with each UE's data.
 pub fn uri_covers(monitored: &str, changed_path: &str) -> bool {
-    let mp = uri_path(monitored).trim_end_matches('/');
-    let cp = changed_path.trim_end_matches('/');
-    if mp.is_empty() {
+    let (Some((m_service, m)), Some((c_service, c))) = (
+        resource_segments(monitored),
+        resource_segments(changed_path),
+    ) else {
+        return false;
+    };
+    if m.is_empty() || c.is_empty() {
         return false;
     }
-    mp == cp || cp.starts_with(&format!("{mp}/")) || mp.ends_with(cp) || cp.ends_with(mp)
+    if let (Some(ms), Some(cs)) = (m_service, c_service) {
+        if ms != cs {
+            return false;
+        }
+    }
+    c.starts_with(&m) || m.starts_with(&c)
 }
 
 /// POST a JSON notification to a notify URI as a detached task with bounded
@@ -1068,56 +1144,300 @@ pub fn post_notification(notify_uri: String, payload: Value) {
 // Change-notification builders/dispatchers (spec payload shapes)
 // ---------------------------------------------------------------------------
 
-/// TS 29.505 DataChangeNotify to subscription-data subscribers whose
-/// monitoredResourceUris cover the changed resource (or whose ueId matches).
+/// The members of a TS 29.505 `AuthenticationSubscription` (§5.4.2.2) that are key
+/// material: the subscriber's long-term key K and the operator keys OPc and TOPc
+/// (#1797). They are read by the UDM over the authentication-subscription GET; TS
+/// 33.501 §6.1.1 keeps K inside the ARPF/UDM, so no notification may carry them.
+pub const KEY_MATERIAL_MEMBERS: [&str; 3] = ["encPermanentKey", "encOpcKey", "encTopcKey"];
+
+/// Whether `changed_path` is a UE's authentication subscription (TS 29.505 §5.2.2),
+/// the resource that holds key material.
+fn is_authentication_subscription(changed_path: &str) -> bool {
+    changed_path
+        .trim_end_matches('/')
+        .ends_with("/authentication-data/authentication-subscription")
+}
+
+/// `v` with every [`KEY_MATERIAL_MEMBERS`] member removed, at any depth.
+fn without_key_material(v: &Value) -> Value {
+    match v {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(k, _)| !KEY_MATERIAL_MEMBERS.contains(&k.as_str()))
+                .map(|(k, v)| (k.clone(), without_key_material(v)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(without_key_material).collect()),
+        other => other.clone(),
+    }
+}
+
+/// The `newValue` a DataChangeNotify may carry for a change of `changed_path` to `v`
+/// (#1797). An authentication subscription carries none: the ChangeItem says the
+/// resource changed (`newValue` is optional, TS 29.571 §5.2.4.8), and a consumer
+/// entitled to it reads it with its own authorization. Anything else carries `v`
+/// without key material, as defence in depth.
+pub fn notified_value(changed_path: &str, v: &Value) -> Option<Value> {
+    (!is_authentication_subscription(changed_path)).then(|| without_key_material(v))
+}
+
+/// Whether subscription-data subscription `s` is told of a change to `changed_path`
+/// of `ue_id` (#1797): one of its `monitoredResourceUris` covers the path, and its
+/// `ueId`, when it names one, is this UE. `monitoredResourceUris` is mandatory and
+/// says what the subscription monitors (TS 29.505 §5.4.2.5); a `ueId` narrows it to
+/// a UE and never widens it to every resource of that UE.
+fn subscription_data_sub_covers(s: &StoredSub, ue_id: &str, changed_path: &str) -> bool {
+    let ue_ok = s
+        .body
+        .get("ueId")
+        .and_then(Value::as_str)
+        .is_none_or(|ue| ue == ue_id);
+    let uri_match = s
+        .body
+        .get("monitoredResourceUris")
+        .and_then(Value::as_array)
+        .is_some_and(|uris| {
+            uris.iter()
+                .filter_map(Value::as_str)
+                .any(|u| uri_covers(u, changed_path))
+        });
+    ue_ok && uri_match
+}
+
+/// The TS 29.505 §5.4.2.6 `DataChangeNotify` telling `sub` of `changes` (TS 29.571
+/// `ChangeItem`s) to `resource_id` of `ue_id`.
+///
+/// Only the spec members are emitted: `ueId`, `originalCallbackReference` (only when
+/// the subscription carried a `callbackReference`) and `notifyItems` (udrd-11).
+pub fn data_change_notify(
+    sub: &StoredSub,
+    ue_id: &str,
+    resource_id: &str,
+    changes: Vec<Value>,
+) -> Value {
+    // #1797 / #1812 review: every value goes through `notified_value`, and a change
+    // whose path names a key-material member is not told at all, so this path
+    // carries no K, OPc or TOPc whatever the resource holds.
+    let changes: Vec<Value> = changes
+        .into_iter()
+        .filter_map(|mut change| {
+            let path = change.get("path").and_then(Value::as_str).unwrap_or("");
+            if path
+                .split('/')
+                .any(|token| KEY_MATERIAL_MEMBERS.contains(&token))
+            {
+                return None;
+            }
+            for member in ["newValue", "origValue"] {
+                let Some(v) = change.get(member).cloned() else {
+                    continue;
+                };
+                match notified_value(resource_id, &v) {
+                    Some(told) => change[member] = told,
+                    None => {
+                        if let Some(o) = change.as_object_mut() {
+                            o.remove(member);
+                        }
+                    }
+                }
+            }
+            Some(change)
+        })
+        .collect();
+    let mut payload_map = serde_json::Map::new();
+    payload_map.insert("ueId".to_string(), Value::String(ue_id.to_string()));
+    if let Some(cb) = sub.body.get("callbackReference").and_then(Value::as_str) {
+        payload_map.insert(
+            "originalCallbackReference".to_string(),
+            serde_json::json!([cb]),
+        );
+    }
+    payload_map.insert(
+        "notifyItems".to_string(),
+        serde_json::json!([{
+            "resourceId": resource_id,
+            "changes": changes
+        }]),
+    );
+    Value::Object(payload_map)
+}
+
+/// The TS 29.505 §5.4.2.6 `DataChangeNotify` telling `sub` that `changed_path` of
+/// `ue_id` changed to `new_value` (`None`: removed).
 ///
 /// Payload shape strictly follows TS 29.505 §5.4.2.6 DataChangeNotify +
 /// NotifyItem/ChangeItem: only `ueId`, optional `originalCallbackReference`,
 /// and `notifyItems[]` with `resourceId`/`changes` are emitted.
 /// Non-standard members such as `subscriptionDataSubscriptions` are NOT
-/// included (udrd-11).
+/// included (udrd-11). Key material is never included (#1797, [`notified_value`]).
+pub fn subscription_data_change_notify(
+    sub: &StoredSub,
+    ue_id: &str,
+    changed_path: &str,
+    new_value: Option<&Value>,
+) -> Value {
+    // TS 29.571 §5.2.4.8: ChangeItem.path is MANDATORY. Use "" (whole
+    // resource, per the ChangeItem NOTE / RFC 6901) for a full-resource
+    // replace or remove.
+    let change = match new_value {
+        Some(v) => match notified_value(changed_path, v) {
+            Some(nv) => serde_json::json!({"op": "REPLACE", "path": "", "newValue": nv}),
+            None => serde_json::json!({"op": "REPLACE", "path": ""}),
+        },
+        None => serde_json::json!({"op": "REMOVE", "path": ""}),
+    };
+    // `originalCallbackReference` is conditional per TS 29.505 DataChangeNotify:
+    // include it only when the subscription body carried a `callbackReference`.
+    let mut payload_map = serde_json::Map::new();
+    payload_map.insert("ueId".to_string(), Value::String(ue_id.to_string()));
+    if let Some(cb) = sub.body.get("callbackReference").and_then(Value::as_str) {
+        payload_map.insert(
+            "originalCallbackReference".to_string(),
+            serde_json::json!([cb]),
+        );
+    }
+    payload_map.insert(
+        "notifyItems".to_string(),
+        serde_json::json!([{
+            "resourceId": changed_path,
+            "changes": [change]
+        }]),
+    );
+    Value::Object(payload_map)
+}
+
+/// TS 29.505 DataChangeNotify to the subscription-data subscribers that monitor the
+/// changed resource ([`subscription_data_sub_covers`]), built by
+/// [`subscription_data_change_notify`].
 pub fn notify_subscription_data_change(ue_id: &str, changed_path: &str, new_value: Option<&Value>) {
     let subs = store().subs_matching(SubKind::SubscriptionData, |s| {
-        let ue_match = s.body.get("ueId").and_then(Value::as_str) == Some(ue_id);
-        let uri_match = s
-            .body
-            .get("monitoredResourceUris")
-            .and_then(Value::as_array)
-            .is_some_and(|uris| {
-                uris.iter()
-                    .filter_map(Value::as_str)
-                    .any(|u| uri_covers(u, changed_path))
-            });
-        ue_match || uri_match
+        subscription_data_sub_covers(s, ue_id, changed_path)
     });
     for sub in subs {
-        // TS 29.571 §5.2.4.8: ChangeItem.path is MANDATORY. Use "" (whole
-        // resource, per the ChangeItem NOTE / RFC 6901) for a full-resource
-        // replace or remove.
-        let change = match new_value {
-            Some(v) => serde_json::json!({"op": "REPLACE", "path": "", "newValue": v}),
-            None => serde_json::json!({"op": "REMOVE", "path": ""}),
-        };
-        // `originalCallbackReference` is conditional per TS 29.505 DataChangeNotify:
-        // include it only when the subscription body carried a `callbackReference`.
-        let orig_cb = sub.body.get("callbackReference").and_then(Value::as_str);
-        let mut payload_map = serde_json::Map::new();
-        payload_map.insert("ueId".to_string(), Value::String(ue_id.to_string()));
-        if let Some(cb) = orig_cb {
-            payload_map.insert(
-                "originalCallbackReference".to_string(),
-                serde_json::json!([cb]),
-            );
-        }
-        payload_map.insert(
-            "notifyItems".to_string(),
-            serde_json::json!([{
-                "resourceId": changed_path,
-                "changes": [change]
-            }]),
-        );
-        post_notification(sub.notify_uri.clone(), Value::Object(payload_map));
+        let payload = subscription_data_change_notify(&sub, ue_id, changed_path, new_value);
+        post_notification(sub.notify_uri.clone(), payload);
     }
+}
+
+// ---------------------------------------------------------------------------
+// am-data change detection (#1775)
+// ---------------------------------------------------------------------------
+
+/// The doc collection holding, per subscription id, the am-data that subscription
+/// was last told of (#1775). Persisted with the rest of the store, so a change
+/// provisioned while the UDR was down is still reported after it restarts.
+pub const AM_DATA_NOTIFIED_COLLECTION: &str = "am-data-notified";
+
+/// The UDR resource of `supi`'s access and mobility subscription data (TS 29.505
+/// §5.2.2, `/subscription-data/{ueId}/provisioned-data/am-data`).
+pub fn am_data_path(supi: &str) -> String {
+    format!("/nudr-dr/v2/subscription-data/{supi}/provisioned-data/am-data")
+}
+
+/// The UE a subscription-data subscription names: its `ueId`, else the
+/// `{ueId}` of the first monitored `/subscription-data/{ueId}/...` resource.
+fn subscription_ue(s: &StoredSub) -> Option<String> {
+    if let Some(ue) = s.body.get("ueId").and_then(Value::as_str) {
+        return Some(ue.to_string());
+    }
+    s.body
+        .get("monitoredResourceUris")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .find_map(|u| {
+            let path = uri_path(u);
+            let rest = path.split("/subscription-data/").nth(1)?;
+            let ue = rest.split('/').next()?;
+            (!ue.is_empty() && ue != "subs-to-notify").then(|| ue.to_string())
+        })
+}
+
+/// Every subscription-data subscription told of a change to its UE's am-data,
+/// with that UE (#1775). The provisioning watcher reads only these UEs' data.
+pub fn am_data_watchers() -> Vec<(String, StoredSub)> {
+    let mut out: Vec<(String, StoredSub)> = store()
+        .subs_matching(SubKind::SubscriptionData, |_| true)
+        .into_iter()
+        .filter_map(|s| {
+            let ue = subscription_ue(&s)?;
+            subscription_data_sub_covers(&s, &ue, &am_data_path(&ue)).then_some((ue, s))
+        })
+        .collect();
+    out.sort_by(|a, b| a.1.id.cmp(&b.1.id));
+    out
+}
+
+/// RFC 6901 escaping of one JSON-pointer token.
+fn pointer_token(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
+}
+
+/// The TS 29.571 `ChangeItem`s that take am-data `old` to `new`, one per top-level
+/// member that differs (#1775): `ADD` a member `old` lacks, `REMOVE` one `new` lacks,
+/// `REPLACE` one whose value changed. A member's value is carried whole, so an array
+/// such as `gpsis` is always replaced whole (TS 29.503 §5.2.2.5.2, TS 29.501 Annex
+/// E), and `origValue` is carried on `REPLACE` and `REMOVE`: §5.2.2.5.2 requires it
+/// when every element of an array was removed, and it lets the consumer detect that
+/// it holds something else (NOTE 1).
+pub fn am_data_changes(old: &Value, new: &Value) -> Vec<Value> {
+    let empty = serde_json::Map::new();
+    let old = old.as_object().unwrap_or(&empty);
+    let new = new.as_object().unwrap_or(&empty);
+    let mut keys: Vec<&String> = old.keys().chain(new.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    keys.into_iter()
+        .filter_map(|k| {
+            let path = format!("/{}", pointer_token(k));
+            match (old.get(k), new.get(k)) {
+                (None, Some(n)) => {
+                    Some(serde_json::json!({"op": "ADD", "path": path, "newValue": n}))
+                }
+                (Some(o), None) => {
+                    Some(serde_json::json!({"op": "REMOVE", "path": path, "origValue": o}))
+                }
+                (Some(o), Some(n)) if o != n => Some(serde_json::json!({
+                    "op": "REPLACE", "path": path, "newValue": n, "origValue": o
+                })),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// The `expiry` (TS 29.504 §5.2.2.6.2, TS 29.505 `SubscriptionDataSubscriptions`)
+/// of subscription `s`, in seconds since the epoch, when it has one (#1775 review
+/// MAJOR-2). "After which the subscription becomes invalid": it is not notified,
+/// and is removed.
+pub fn sub_expiry_epoch(s: &StoredSub) -> Option<i64> {
+    s.body
+        .get("expiry")
+        .and_then(Value::as_str)
+        .and_then(nextgcore_sbi::datetime::rfc3339_to_epoch_signed)
+}
+
+/// Whether subscription `s` has expired at `now_epoch` (seconds since the epoch).
+pub fn sub_expired(s: &StoredSub, now_epoch: i64) -> bool {
+    sub_expiry_epoch(s).is_some_and(|e| e <= now_epoch)
+}
+
+/// POST `payload` to `notify_uri` and wait for the answer, bounded by 2 s to connect
+/// and 3 s for the request. The status on an answer; an error when there was none.
+pub async fn deliver_notification(notify_uri: &str, payload: &Value) -> Result<u16, String> {
+    let logged = || nextgcore_sbi::log_redact::redact_last_segment(notify_uri);
+    let (host, port, path) =
+        parse_notify_uri(notify_uri).ok_or_else(|| format!("invalid notify URI {}", logged()))?;
+    let client = SbiClient::new(
+        nextgcore_sbi::security::sbi_peer_client_config(&host, port)
+            .with_connect_timeout(Duration::from_secs(2))
+            .with_request_timeout(Duration::from_secs(3)),
+    );
+    let result = client.post_json(&path, payload).await;
+    client.close().await;
+    result
+        .map(|resp| resp.status)
+        .map_err(|e| format!("notification to {} failed: {e}", logged()))
 }
 
 /// TS 29.519 ExposureDataChangeNotification (array) to exposure-data
@@ -1286,6 +1606,57 @@ mod tests {
         assert!(!uri_covers(
             "http://udr:7777/nudr-dr/v2/subscription-data/imsi-2/context-data",
             changed
+        ));
+    }
+
+    /// #1814: no raw suffix matching. A resource of one UE is covered only by a
+    /// URI carrying that UE's segment, or by a collection above every UE.
+    #[test]
+    fn a_monitored_uri_covers_by_whole_segments_only_1814() {
+        let pp = "/nudr-dr/v2/subscription-data/imsi-001010000000002/pp-data";
+        // The defect: these suffixes of UE 2's resource matched it.
+        for monitored in [
+            "/pp-data",
+            "pp-data",
+            "/imsi-001010000000002/pp-data",
+            "http://udr/pp-data",
+            "/nudr-dr/v2/subscription-data/imsi-001010000000001/pp-data",
+            "/nudr-dr/v2/subscription-data/imsi-00101000000000/pp-data",
+            "/nudr-dr/v2/subscription-data/imsi-001010000000002/pp",
+            "/nudr-dr/v2/subscription-data/imsi-001010000000002/pp-data/../../imsi-001010000000002",
+            "/nudr-group-id-map/v1/subscription-data/imsi-001010000000002/pp-data",
+            "/nudr-dr/v2",
+            "/",
+            "",
+        ] {
+            assert!(
+                !uri_covers(monitored, pp),
+                "{monitored:?} must not cover {pp}"
+            );
+        }
+        for monitored in [
+            pp.to_string(),
+            format!("http://udr.example:7777{pp}"),
+            format!("https://udr.example/prefix{pp}"),
+            format!("{pp}/"),
+            format!("{pp}?supported-features=1"),
+            "/nudr-dr/v2/subscription-data/imsi-001010000000002".to_string(),
+            // Relative to the API root (no `nudr-dr/<version>` pair): still anchored.
+            "/subscription-data/imsi-001010000000002/pp-data".to_string(),
+            // An explicit collection above every UE.
+            "/nudr-dr/v2/subscription-data".to_string(),
+        ] {
+            assert!(uri_covers(&monitored, pp), "{monitored:?} must cover {pp}");
+        }
+        // pcfd's subscription: the per-UE policy-data collection.
+        assert!(uri_covers(
+            "/nudr-dr/v2/policy-data/ues",
+            "/nudr-dr/v2/policy-data/ues/imsi-001010000000002/am-data"
+        ));
+        // A change that replaces an ancestor of the monitored resource covers it.
+        assert!(uri_covers(
+            pp,
+            "/nudr-dr/v2/subscription-data/imsi-001010000000002"
         ));
     }
 
@@ -1612,6 +1983,78 @@ mod tests {
 
     /// PUT a value, then re-open the store from the same path and confirm the
     /// value survived the simulated restart (across every resource tree).
+    /// **#1775 review MAJOR-2**: the deferred writes the am-data watch makes do not
+    /// rewrite the state file each; the one `persist_now` at the end of the pass
+    /// writes them all, and they survive a restart.
+    ///
+    /// REVERT-VERIFIED: with `doc_put_deferred` persisting, the file exists before
+    /// `persist_now` ("no snapshot per write").
+    #[test]
+    fn deferred_writes_are_persisted_once_1775() {
+        let path = temp_state_path("deferred");
+        let _ = std::fs::remove_file(&path);
+        {
+            let s = UdrDataStore::with_state_path(&path);
+            for i in 0..3 {
+                s.doc_put_deferred(AM_DATA_NOTIFIED_COLLECTION, &i.to_string(), json!({"i": i}));
+            }
+            assert!(s.doc_remove_deferred(AM_DATA_NOTIFIED_COLLECTION, "0"));
+            assert!(!path.exists(), "no snapshot per write");
+            s.persist_now();
+            assert!(path.exists());
+        }
+        let s = UdrDataStore::with_state_path(&path);
+        assert_eq!(
+            s.doc_list(AM_DATA_NOTIFIED_COLLECTION)
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect::<Vec<_>>(),
+            vec!["1".to_string(), "2".to_string()]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **#1775 x #1797**: the am-data notify path carries no key material. A value
+    /// holding `encPermanentKey`/`encOpcKey`/`encTopcKey` at any depth is told
+    /// without it, a change of a member so named is not told, and the other changes
+    /// are told as before (the positive control). An authentication-subscription
+    /// resource is told with no values at all.
+    ///
+    /// REVERT-VERIFIED: with the `notified_value` filter cut from
+    /// `data_change_notify`, the notification carries the keys ("no key material").
+    #[test]
+    fn an_am_data_notify_carries_no_key_material_1775() {
+        let sub = StoredSub {
+            id: "k1".to_string(),
+            kind: SubKind::SubscriptionData,
+            notify_uri: "http://udm:1/cb".to_string(),
+            body: json!({"callbackReference": "http://udm:1/cb"}),
+        };
+        let supi = "imsi-001010000017758";
+        let old = json!({"gpsis": ["msisdn-1"], "x": {"encPermanentKey": "k-old"}});
+        let new = json!({
+            "gpsis": ["msisdn-2"],
+            "x": {"encPermanentKey": "k-new", "deep": [{"encTopcKey": "t"}]},
+            "encOpcKey": "o",
+        });
+        let n = data_change_notify(&sub, supi, &am_data_path(supi), am_data_changes(&old, &new));
+        let text = n.to_string();
+        for key in KEY_MATERIAL_MEMBERS {
+            assert!(!text.contains(key), "no key material: {key} in {text}");
+        }
+        let changes = &n["notifyItems"][0]["changes"];
+        assert_eq!(changes[0]["path"], "/gpsis");
+        assert_eq!(changes[0]["newValue"], json!(["msisdn-2"]), "{text}");
+        assert_eq!(changes.as_array().map(Vec::len), Some(2), "{text}");
+
+        let auth = format!(
+            "/nudr-dr/v2/subscription-data/{supi}/authentication-data/authentication-subscription"
+        );
+        let n = data_change_notify(&sub, supi, &auth, am_data_changes(&old, &new));
+        let item = &n["notifyItems"][0]["changes"][0];
+        assert!(item.get("newValue").is_none() && item.get("origValue").is_none());
+    }
+
     #[test]
     fn test_persistence_survives_restart() {
         let path = temp_state_path("restart");

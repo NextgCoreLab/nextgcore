@@ -3446,6 +3446,7 @@ dependencies = [
  "nextgcore-dbi",
  "nextgcore-metrics",
  "nextgcore-sbi",
+ "nextgcore-udrd",
  "p256",
  "proptest",
  "serde",

@@ -25,6 +25,7 @@ mod context;
 mod n2_mbs_transfer; // #417: the N2 MBS SM transfers, on the generated NGAP codec
 mod n4mb;
 mod namf_client;
+mod reconcile; // #1817: ContextDeletes that outlived their retry budget
 mod subscription;
 mod types;
 
@@ -311,6 +312,8 @@ async fn main() -> Result<()> {
         sbi_server_config = apply_oauth2_enforcement(sbi_server_config, &args.nrf_uri);
     }
 
+    // #1791: the NFProfile advertises the scheme this listener serves.
+    let sbi_scheme = sbi_server_config.scheme;
     let sbi_server = SbiServer::new(sbi_server_config);
 
     log::info!("Starting MB-SMF SBI server on {addr}");
@@ -337,7 +340,7 @@ async fn main() -> Result<()> {
                 move || {
                     let (host, id) = (host.clone(), id.clone());
                     async move {
-                        register_with_nrf(&host, sbi_port, &id)
+                        register_with_nrf(&host, sbi_port, &id, sbi_scheme)
                             .await
                             .map(|()| Some(id))
                     }
@@ -360,6 +363,19 @@ async fn main() -> Result<()> {
         }
         Err(e) => log::warn!("NRF registration not attempted (will operate without NRF): {e}"),
     }
+
+    // #1817: retry the ContextDeletes that outlived their retry budget.
+    let _reconciler = reconcile::spawn_reconciler();
+
+    // #1817: the Prometheus endpoint (the reconciler's gauge and counter beside the
+    // common families), on NEXTGCORE_METRICS_BIND (loopback by default) and
+    // MBSMF_METRICS_PORT (9090). Non-fatal, like every NF's.
+    let _metrics = nextgcore_metrics::nf::serve_nf_metrics(
+        "MB-SMF",
+        "MBSMF_METRICS_PORT",
+        Arc::new(render_prometheus),
+    )
+    .await;
 
     log::info!("NextGCore MB-SMF ready (instance: {nf_instance_id})");
 
@@ -950,6 +966,17 @@ async fn create_amf_mbs_context(
     None
 }
 
+/// #1817: what `/metrics` serves: the families every NF shares and the reconciler's.
+fn render_prometheus() -> String {
+    let mut out = nextgcore_metrics::nf::render_common(&nextgcore_metrics::nf::NfIdentity {
+        nf: "mbsmf",
+        version: env!("CARGO_PKG_VERSION"),
+        nrf_client: true,
+    });
+    reconcile::render(&mut out);
+    out
+}
+
 /// #1758: the waits before each retry of a failed ContextDelete.
 #[cfg(not(test))]
 const AMF_RELEASE_RETRY_DELAYS: [Duration; 5] = [
@@ -964,7 +991,7 @@ const AMF_RELEASE_RETRY_DELAYS: [Duration; 5] = [Duration::from_millis(20); 5];
 
 /// #1758: Namf_MBSBroadcast ContextDelete for each of `contexts`. 404 is gone. A
 /// failed delete is retried on [`AMF_RELEASE_RETRY_DELAYS`] on a detached task, and
-/// logged at error if every retry fails, rather than forgotten. Returns whether all
+/// (#1817) parked for [`reconcile`] if every retry fails, rather than forgotten. Returns whether all
 /// were released on the first attempt.
 async fn release_amf_contexts(contexts: Vec<AmfMbsContext>) -> bool {
     let mut failed = Vec::new();
@@ -990,6 +1017,20 @@ async fn release_amf_contexts(contexts: Vec<AmfMbsContext>) -> bool {
             tokio::time::sleep(delay).await;
             let mut still = Vec::new();
             for c in failed {
+                // R24: a session reusing the TMGI got this same context back.
+                if mbsmf_self()
+                    .read()
+                    .is_ok_and(|ctx| ctx.amf_context_in_use(&c))
+                {
+                    log::info!(
+                        "MBS: AMF {}:{} MBS context {} is in use again; its ContextDelete is \
+                         dropped",
+                        c.host,
+                        c.port,
+                        c.context_ref
+                    );
+                    continue;
+                }
                 if namf_client::context_delete(&c).await
                     == namf_client::ContextDeleteOutcome::Failed
                 {
@@ -1003,13 +1044,16 @@ async fn release_amf_contexts(contexts: Vec<AmfMbsContext>) -> bool {
         }
         for c in &failed {
             log::error!(
-                "MBS: AMF {}:{} MBS context {} could not be released after {} retries",
+                "MBS: AMF {}:{} MBS context {} could not be released after {} retries; \
+                 handing it to the reconciler",
                 c.host,
                 c.port,
                 c.context_ref,
                 AMF_RELEASE_RETRY_DELAYS.len()
             );
         }
+        // #1817: not dropped. The reconciler keeps retrying until the AMF answers.
+        reconcile::park(failed);
     });
     false
 }
@@ -2468,6 +2512,7 @@ fn build_mbsmf_nf_profile(
     nf_instance_id: &str,
     sbi_addr: &str,
     sbi_port: u16,
+    scheme: nextgcore_sbi::types::UriScheme,
 ) -> serde_json::Value {
     let services: Vec<serde_json::Value> = MBSMF_SERVICES
         .iter()
@@ -2477,7 +2522,7 @@ fn build_mbsmf_nf_profile(
                 "serviceInstanceId": format!("{nf_instance_id}-{name}"),
                 "serviceName": name,
                 "versions": [{"apiVersionInUri": "v1", "apiFullVersion": full_version}],
-                "scheme": "http",
+                "scheme": scheme.as_str(),
                 "nfServiceStatus": "REGISTERED",
                 "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
                 "allowedNfTypes": allowed,
@@ -2513,6 +2558,7 @@ async fn register_with_nrf(
     sbi_addr: &str,
     sbi_port: u16,
     nf_instance_id: &str,
+    sbi_scheme: nextgcore_sbi::types::UriScheme,
 ) -> Result<(), String> {
     let sbi_ctx = global_context();
 
@@ -2530,7 +2576,7 @@ async fn register_with_nrf(
     let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
 
-    let nf_profile = build_mbsmf_nf_profile(nf_instance_id, sbi_addr, sbi_port);
+    let nf_profile = build_mbsmf_nf_profile(nf_instance_id, sbi_addr, sbi_port, sbi_scheme);
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     log::debug!("NRF registration: PUT {path}");
@@ -2670,7 +2716,12 @@ mod tests {
     /// "what do I serve".
     #[test]
     fn the_mbsmf_profile_and_self_instance_advertise_one_surface() {
-        let profile = build_mbsmf_nf_profile("mbsmf-test-instance", "10.45.0.14", 7811);
+        let profile = build_mbsmf_nf_profile(
+            "mbsmf-test-instance",
+            "10.45.0.14",
+            7811,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
         let services = profile["nfServices"].as_array().expect("nfServices");
         let names: Vec<&str> = services
             .iter()
@@ -4531,7 +4582,8 @@ mod tests_nf_profile_host_kind_1324 {
     #[test]
     fn the_nf_profile_carries_its_host_by_type() {
         for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
-            let profile = build_mbsmf_nf_profile("id", host, 7777);
+            let profile =
+                build_mbsmf_nf_profile("id", host, 7777, nextgcore_sbi::types::UriScheme::Http);
             let problems =
                 nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
             assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
@@ -4565,5 +4617,38 @@ mod outbound_oauth2_1665_tests {
             super::outbound_oauth2_client(SbiProfile::Dev, false, Some(NRF)).is_none(),
             "dev profile, knob off: no client, the token-free path is unchanged"
         );
+    }
+}
+
+/// #1791: the registered NFProfile advertises, in every `nfServices[].scheme`,
+/// the scheme this NF's SBI listener serves (TS 29.510 §6.1.6.2.3
+/// `NFService.scheme`): `http` for the cleartext listener, `https` once `--tls`
+/// makes it TLS. This listener ignores NEXTGCORE_SBI_PROFILE (it serves TLS only with `--tls`; #1795), so `--tls` alone decides. `main` passes the listener config's scheme in; the
+/// nextgcore-sbi source guard `every_nf_advertises_its_listener_scheme_1791`
+/// pins that wiring.
+///
+/// REVERT-VERIFIED: with the builder advertising `"http"` again, the TLS case
+/// fails here.
+#[cfg(test)]
+mod tests_advertised_scheme_1791 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_advertises_the_listener_scheme_1791() {
+        let addr: std::net::SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        let plain = nextgcore_sbi::server::SbiServerConfig::new(addr);
+        let tls = nextgcore_sbi::server::SbiServerConfig::new(addr).with_tls("tls.key", "tls.crt");
+        for (cfg, want) in [(plain, "http"), (tls, "https")] {
+            let profile = build_mbsmf_nf_profile("mbsmf-1791", "10.0.0.1", 7777, cfg.scheme);
+            let services = profile["nfServices"].as_array().expect("nfServices");
+            assert!(!services.is_empty(), "the profile offers services");
+            for svc in services {
+                assert_eq!(
+                    svc["scheme"], want,
+                    "{} must advertise the listener's scheme",
+                    svc["serviceName"]
+                );
+            }
+        }
     }
 }

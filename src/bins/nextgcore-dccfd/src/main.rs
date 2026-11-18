@@ -384,6 +384,8 @@ async fn main() -> Result<()> {
         sbi_config = apply_oauth2_enforcement(sbi_config, &args.nrf_uri);
     }
 
+    // #1791: the NFProfile advertises the scheme this listener serves.
+    let sbi_scheme = sbi_config.scheme;
     let sbi_server = SbiServer::new(sbi_config);
     sbi_server
         .start(dccf_request_handler)
@@ -404,7 +406,7 @@ async fn main() -> Result<()> {
                 move || {
                     let (host, id) = (host.clone(), id.clone());
                     async move {
-                        register_with_nrf(&host, sbi_port, &id)
+                        register_with_nrf(&host, sbi_port, &id, sbi_scheme)
                             .await
                             .map(|()| Some(id))
                     }
@@ -497,7 +499,12 @@ fn build_dccf_nf_instance(
 /// list without standing up an NRF. Each service carries its own `ipEndPoints`
 /// and `allowedNfTypes`; the NF-level `allowedNfTypes` is the UNION over the
 /// services, since a type barred at NF level can never reach any service.
-fn build_dccf_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
+fn build_dccf_nf_profile(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+    scheme: nextgcore_sbi::types::UriScheme,
+) -> serde_json::Value {
     let services: Vec<serde_json::Value> = DCCF_SERVICES
         .iter()
         .map(|(service_type, allowed)| {
@@ -506,7 +513,7 @@ fn build_dccf_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) ->
                 "serviceInstanceId": format!("{nf_instance_id}-{name}"),
                 "serviceName": name,
                 "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                "scheme": "http",
+                "scheme": scheme.as_str(),
                 "nfServiceStatus": "REGISTERED",
                 "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
                 "allowedNfTypes": allowed,
@@ -542,6 +549,7 @@ async fn register_with_nrf(
     sbi_addr: &str,
     sbi_port: u16,
     nf_instance_id: &str,
+    sbi_scheme: nextgcore_sbi::types::UriScheme,
 ) -> Result<(), String> {
     let sbi_ctx = global_context();
 
@@ -559,7 +567,7 @@ async fn register_with_nrf(
     let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
 
-    let nf_profile = build_dccf_nf_profile(nf_instance_id, sbi_addr, sbi_port);
+    let nf_profile = build_dccf_nf_profile(nf_instance_id, sbi_addr, sbi_port, sbi_scheme);
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     log::debug!("NRF registration: PUT {path}");
@@ -669,6 +677,13 @@ async fn handle_dm_subscribe(req: &SbiRequest) -> SbiResponse {
         );
     }
 
+    // #1808: from here until the 201 is returned, a cancelled request (the
+    // consumer's client went away) rolls the subscription back: the consumer never
+    // learns its resource URI, so nothing could ever delete it.
+    let rollback = SubscribeRollback {
+        sub_id: Some(sub_id.clone()),
+    };
+
     // TS 23.288 §5A.2: collect once, share to many. Off by default; see
     // `coordination.rs` for why this is a runtime switch and not a cargo feature.
     // A coordination failure does not fail the consumer's subscription: the
@@ -677,10 +692,45 @@ async fn handle_dm_subscribe(req: &SbiRequest) -> SbiResponse {
     let outcome = coordination::ensure_producer_subscription(&sub_id, &scope, &sub).await;
     log::debug!("[DCCF] coordination for {sub_id}: {outcome:?}");
 
+    rollback.disarm();
     SbiResponse::created()
         .with_header("Location", format!("{DM_SUBSCRIPTIONS_PATH}/{sub_id}"))
         .with_json_body(&sub)
         .unwrap_or_else(|_| SbiResponse::created())
+}
+
+/// #1808 (failure-path check 3, cancellation after a side effect): a stored consumer
+/// subscription whose subscribe request is dropped before it answers. On drop while
+/// armed, the subscription is removed and its producer claim released, on a task
+/// of its own ([`remove_consumer_subscription`]): a producer subscription still
+/// being created for it is deleted when that create completes (#1755). Disarmed
+/// once the 201 is built. Outside a runtime there is nothing to cancel.
+struct SubscribeRollback {
+    sub_id: Option<String>,
+}
+
+impl SubscribeRollback {
+    fn disarm(mut self) {
+        self.sub_id = None;
+    }
+}
+
+impl Drop for SubscribeRollback {
+    fn drop(&mut self) {
+        let Some(sub_id) = self.sub_id.take() else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        log::info!(
+            "[DCCF] subscribe {sub_id} cancelled before it answered; the subscription is \
+             rolled back"
+        );
+        spawn_detached(async move {
+            remove_consumer_subscription(&sub_id).await;
+        });
+    }
 }
 
 /// `PUT /ndccf-datamanagement/v1/subscriptions/{subscriptionId}` —
@@ -1175,7 +1225,12 @@ mod data_management_tests {
     /// an analytics context could not find this DCCF by service name.
     #[test]
     fn the_dccf_profile_advertises_both_routed_ndccf_services() {
-        let profile = build_dccf_nf_profile("dccf-test-instance", "10.45.0.12", 7813);
+        let profile = build_dccf_nf_profile(
+            "dccf-test-instance",
+            "10.45.0.12",
+            7813,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
         let names: Vec<&str> = profile["nfServices"]
             .as_array()
             .expect("nfServices")
@@ -1214,7 +1269,12 @@ mod data_management_tests {
     #[test]
     fn the_dccf_self_instance_matches_the_registered_profile() {
         let instance = build_dccf_nf_instance("dccf-test-instance", "10.45.0.12", 7813);
-        let profile = build_dccf_nf_profile("dccf-test-instance", "10.45.0.12", 7813);
+        let profile = build_dccf_nf_profile(
+            "dccf-test-instance",
+            "10.45.0.12",
+            7813,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
 
         let mut from_instance: Vec<String> =
             instance.services.iter().map(|s| s.name.clone()).collect();
@@ -2168,9 +2228,14 @@ mod data_management_tests {
     /// the next consumer of the scope creates a producer subscription instead of
     /// reusing one that is never made.
     ///
-    /// REVERT-VERIFIED: with `InFlightClaim`'s drop not abandoning, the next claim is
-    /// `Reused` onto the wedged entry. Since #1755 the claim outlives the cancelled
-    /// request (its create runs on its own task) and is abandoned when that fails.
+    /// #1808: the cancelled subscribe is rolled back, which releases its claim at
+    /// once, so the scope is free for the next consumer before the create fails.
+    ///
+    /// REVERT-VERIFIED (#1808): with `SubscribeRollback` disarmed, the claim stays
+    /// held after the cancel ("the cancelled subscribe's claim is released"). The
+    /// abandon-on-failure that #1747 added here is now guarded by
+    /// `a_failed_create_is_abandoned_on_every_path_1747`: a cancelled subscribe no
+    /// longer reaches it with a claim still held.
     #[test]
     fn r7_cancelled_create_wedges_scope() {
         let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
@@ -2205,13 +2270,12 @@ mod data_management_tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             task.abort();
             assert!(task.await.unwrap_err().is_cancelled());
-            // #1755: the create is owned by its own task, so cancelling the consumer's
-            // request leaves it in flight rather than abandoning it under a producer
-            // that may already have accepted it.
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // #1808: the cancelled subscribe is rolled back, and with it its claim, so
+            // the scope is free at once; its create still runs on its own task (#1755)
+            // and deletes what it made when it completes.
             assert!(
-                context::dccf_context_holds_producer_sub(&scope),
-                "still in flight on its own task after the consumer's request is cancelled"
+                eventually(|| !context::dccf_context_holds_producer_sub(&scope)).await,
+                "the cancelled subscribe's claim is released"
             );
             // The NRF drops its connections: discovery fails, and the task abandons.
             hold.abort();
@@ -2277,19 +2341,36 @@ mod data_management_tests {
         tokio::time::timeout(Duration::from_secs(5), arrived.notified())
             .await
             .expect("the producer receives the create");
+        let id = context::dccf_context_subscription_ids()[0].clone();
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        context::dccf_context_subscription_ids()[0].clone()
+        id
     }
 
-    /// #1755 (failure-path check 3): a consumer subscribe cancelled while the
-    /// producer holds its 201 still records the producer subscription, so the
-    /// consumer's later unsubscribe deletes it at the producer.
+    /// Wait (bounded) until `cond` holds.
+    async fn eventually(mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..300 {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cond()
+    }
+
+    /// #1808, #1755 (failure-path check 3, cancellation after a side effect): a
+    /// consumer subscribe cancelled while the producer holds its 201 never answered
+    /// the consumer, which so never learned its resource URI. The stored consumer
+    /// subscription is rolled back at once, and the producer subscription it claimed
+    /// is deleted when the producer's late 201 arrives, so neither is orphaned. A
+    /// later unsubscribe of that id finds nothing.
     ///
-    /// REVERT-VERIFIED: with the create awaited inline again, the claim is abandoned
-    /// on cancel, nothing is recorded and the unsubscribe sends no DELETE.
+    /// REVERT-VERIFIED: with `SubscribeRollback` disarmed at once, the consumer
+    /// subscription outlives the cancelled request ("rolled back") and no DELETE
+    /// reaches the producer; with the create awaited inline again (#1755), the late
+    /// 201 is never read and the producer sees no DELETE.
     #[test]
-    fn a_subscribe_cancelled_mid_post_still_records_the_producer_subscription_1755() {
+    fn a_subscribe_cancelled_mid_post_is_rolled_back_and_its_late_201_deleted_1808() {
         let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         init();
         clear_subscriptions();
@@ -2299,42 +2380,28 @@ mod data_management_tests {
             coordinate_via(nrf_port);
             let scope = targeted_scope();
             let id = subscribe_then_cancel_mid_post(&arrived).await;
-
-            release.notify_one();
-            let mut recorded = None;
-            for _ in 0..300 {
-                recorded = context::dccf_context_producer_resource(&scope);
-                if recorded.is_some() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            assert_eq!(
-                recorded.as_deref(),
-                Some(
-                    format!("http://127.0.0.1:{producer_port}/namf-evts/v1/subscriptions/held")
-                        .as_str()
-                ),
-                "the producer's late 201 is recorded against the claim"
+            assert!(
+                eventually(|| !dccf_context_has_subscription(&id)).await,
+                "the cancelled subscribe is rolled back"
             );
 
-            assert!(remove_consumer_subscription(&id).await);
-            let mut deleted = false;
-            for _ in 0..300 {
-                deleted = seen
-                    .lock()
+            release.notify_one();
+            let deleted = eventually(|| {
+                seen.lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .iter()
-                    .any(|(m, p)| m == "DELETE" && p.ends_with("/subscriptions/held"));
-                if deleted {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+                    .any(|(m, p)| m == "DELETE" && p.ends_with("/subscriptions/held"))
+            })
+            .await;
             assert!(
                 deleted,
-                "the unsubscribe deletes it: {:?}",
+                "the late 201 is deleted: {:?}",
                 seen.lock().unwrap()
+            );
+            assert!(!context::dccf_context_holds_producer_sub(&scope));
+            assert!(
+                !remove_consumer_subscription(&id).await,
+                "nothing is left to unsubscribe"
             );
             coordination::set_coordination_for_test(None);
             producer.stop().await.ok();
@@ -2343,13 +2410,13 @@ mod data_management_tests {
         clear_subscriptions();
     }
 
-    /// #1755: a subscribe cancelled mid-POST whose consumer then unsubscribes while
-    /// the producer still holds the 201: the late 201 is deleted at the producer.
-    ///
-    /// REVERT-VERIFIED: with the create awaited inline again, the 201 is never read
-    /// and the producer sees no DELETE.
+    /// **#1822 item 5 (#1808).** A consumer subscribe cancelled mid-POST is rolled
+    /// back, but when ANOTHER consumer reused its in-flight claim first, the claim
+    /// is still held when the producer's late 201 arrives: the 201 is recorded for
+    /// the remaining consumer, not deleted, and that consumer's unsubscribe is what
+    /// finally deletes it at the producer.
     #[test]
-    fn a_subscribe_cancelled_mid_post_then_unsubscribed_deletes_the_late_201_1755() {
+    fn a_late_201_is_kept_for_the_consumer_that_reused_the_claim_1822() {
         let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         init();
         clear_subscriptions();
@@ -2358,28 +2425,91 @@ mod data_management_tests {
             let (nrf, nrf_port) = nrf_for(producer_port).await;
             coordinate_via(nrf_port);
             let scope = targeted_scope();
-            let id = subscribe_then_cancel_mid_post(&arrived).await;
-            assert!(remove_consumer_subscription(&id).await);
-
-            release.notify_one();
-            let mut deleted = false;
-            for _ in 0..300 {
-                deleted = seen
-                    .lock()
+            let deletes = || {
+                seen.lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .iter()
-                    .any(|(m, p)| m == "DELETE" && p.ends_with("/subscriptions/held"));
-                if deleted {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+                    .filter(|(m, p)| m == "DELETE" && p.ends_with("/subscriptions/held"))
+                    .count()
+            };
+
+            // Consumer A claims the scope; the producer holds its create.
+            let a = tokio::spawn(dccf_request_handler(
+                SbiRequest::post("/ndccf-datamanagement/v1/subscriptions")
+                    .with_body(targeted_body("corr-a"), "application/json"),
+            ));
+            tokio::time::timeout(Duration::from_secs(5), arrived.notified())
+                .await
+                .expect("the producer receives A's create");
+            let a_id = context::dccf_context_subscription_ids()[0].clone();
+
+            // Consumer B reuses the in-flight claim.
+            let resp = dccf_request_handler(
+                SbiRequest::post("/ndccf-datamanagement/v1/subscriptions")
+                    .with_body(targeted_body("corr-b"), "application/json"),
+            )
+            .await;
+            assert_eq!(resp.status, 201, "B subscribes, reusing A's claim");
+            let b_id = context::dccf_context_subscription_ids()
+                .into_iter()
+                .find(|id| *id != a_id)
+                .expect("B's id");
+
+            // A's client goes away: A is rolled back, B keeps the claim.
+            a.abort();
+            assert!(a.await.unwrap_err().is_cancelled());
             assert!(
-                deleted,
-                "the late 201 is deleted: {:?}",
+                eventually(|| !dccf_context_has_subscription(&a_id)).await,
+                "the cancelled subscribe is rolled back"
+            );
+            assert!(dccf_context_has_subscription(&b_id));
+
+            release.notify_one();
+            assert!(
+                eventually(|| context::dccf_context_producer_resource(&scope).is_some()).await,
+                "the late 201 is recorded for B"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(deletes(), 0, "and not deleted: {:?}", seen.lock().unwrap());
+
+            assert!(remove_consumer_subscription(&b_id).await);
+            assert!(
+                eventually(|| deletes() == 1).await,
+                "B's unsubscribe deletes it at the producer: {:?}",
                 seen.lock().unwrap()
             );
             assert!(!context::dccf_context_holds_producer_sub(&scope));
+            coordination::set_coordination_for_test(None);
+            producer.stop().await.ok();
+            nrf.stop().await.ok();
+        });
+        clear_subscriptions();
+    }
+
+    /// #1808: a subscribe that answers is not rolled back (the guard is disarmed
+    /// before the 201), with coordination on and a producer that answers at once.
+    #[test]
+    fn an_answered_subscribe_is_kept_1808() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        init();
+        clear_subscriptions();
+        futures_lite_block_on(async {
+            let (producer, producer_port, _seen) = stub(|_req: SbiRequest| async move {
+                SbiResponse::created().with_header("Location", "http://127.0.0.1:9/s/1")
+            })
+            .await;
+            let (nrf, nrf_port) = nrf_for(producer_port).await;
+            coordinate_via(nrf_port);
+            let resp = dccf_request_handler(
+                SbiRequest::post("/ndccf-datamanagement/v1/subscriptions")
+                    .with_body(targeted_body("corr-1808"), "application/json"),
+            )
+            .await;
+            assert_eq!(resp.status, 201);
+            let id = context::dccf_context_subscription_ids()[0].clone();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(dccf_context_has_subscription(&id), "kept after its 201");
+            assert!(remove_consumer_subscription(&id).await);
             coordination::set_coordination_for_test(None);
             producer.stop().await.ok();
             nrf.stop().await.ok();
@@ -2588,7 +2718,8 @@ mod tests_nf_profile_host_kind_1324 {
     #[test]
     fn the_nf_profile_carries_its_host_by_type() {
         for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
-            let profile = build_dccf_nf_profile("id", host, 7777);
+            let profile =
+                build_dccf_nf_profile("id", host, 7777, nextgcore_sbi::types::UriScheme::Http);
             let problems =
                 nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
             assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
@@ -2622,5 +2753,38 @@ mod outbound_oauth2_1665_tests {
             super::outbound_oauth2_client(SbiProfile::Dev, false, Some(NRF)).is_none(),
             "dev profile, knob off: no client, the token-free path is unchanged"
         );
+    }
+}
+
+/// #1791: the registered NFProfile advertises, in every `nfServices[].scheme`,
+/// the scheme this NF's SBI listener serves (TS 29.510 §6.1.6.2.3
+/// `NFService.scheme`): `http` for the cleartext listener, `https` once `--tls`
+/// makes it TLS. This listener ignores NEXTGCORE_SBI_PROFILE (it serves TLS only with `--tls`; #1795), so `--tls` alone decides. `main` passes the listener config's scheme in; the
+/// nextgcore-sbi source guard `every_nf_advertises_its_listener_scheme_1791`
+/// pins that wiring.
+///
+/// REVERT-VERIFIED: with the builder advertising `"http"` again, the TLS case
+/// fails here.
+#[cfg(test)]
+mod tests_advertised_scheme_1791 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_advertises_the_listener_scheme_1791() {
+        let addr: std::net::SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        let plain = nextgcore_sbi::server::SbiServerConfig::new(addr);
+        let tls = nextgcore_sbi::server::SbiServerConfig::new(addr).with_tls("tls.key", "tls.crt");
+        for (cfg, want) in [(plain, "http"), (tls, "https")] {
+            let profile = build_dccf_nf_profile("dccf-1791", "10.0.0.1", 7777, cfg.scheme);
+            let services = profile["nfServices"].as_array().expect("nfServices");
+            assert!(!services.is_empty(), "the profile offers services");
+            for svc in services {
+                assert_eq!(
+                    svc["scheme"], want,
+                    "{} must advertise the listener's scheme",
+                    svc["serviceName"]
+                );
+            }
+        }
     }
 }

@@ -137,6 +137,78 @@ pub struct NgapMcastContext {
     tmgi_index: RwLock<HashMap<Tmgi, u64>>,
     /// Next MBS session ID allocator
     next_session_id: AtomicU64,
+    /// #1818: the Namf_MBSBroadcast contexts (ContextCreate resources), kept apart
+    /// from the MBS sessions they ride on. Taken BEFORE `sessions` and
+    /// `tmgi_index` wherever both are held, and only by the broadcast methods.
+    broadcast: std::sync::Mutex<BroadcastContexts>,
+}
+
+/// #1818: one Namf_MBSBroadcast context (TS 29.518 §5.6, `mbsContextRef`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BroadcastContext {
+    /// The MBS session (by TMGI) the context rides on.
+    pub session_id: u64,
+    /// The ContextCreate's `mbsmfId`, if it sent one: who the context is for. A
+    /// repeated ContextCreate from the same MB-SMF for the same TMGI is a retry and
+    /// gets the same context back.
+    pub mbsmf_id: Option<String>,
+}
+
+/// #1818: the broadcast contexts, and which MBS sessions a ContextCreate created
+/// (so a ContextDelete removes only a session that broadcast contexts own).
+#[derive(Debug, Default)]
+struct BroadcastContexts {
+    contexts: HashMap<u64, BroadcastContext>,
+    owned_sessions: std::collections::HashSet<u64>,
+    next_ref: u64,
+}
+
+/// #1856: the broadcast contexts one AMF holds at most. One more ContextCreate
+/// (other than a retry of one it holds) is refused, 500 INSUFFICIENT_RESOURCES
+/// (TS 29.500 Table 5.2.7.2-1), rather than growing the map without bound.
+pub const MAX_BROADCAST_CONTEXTS: usize = 4096;
+
+/// #1856: why a ContextCreate was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BroadcastCreateRefused {
+    /// [`MAX_BROADCAST_CONTEXTS`] are held.
+    Full,
+    /// The context store could not be used (a poisoned lock, a session not made).
+    Failed,
+}
+
+/// #1856: this AMF instance's epoch, the first part of every `mbsContextRef` it
+/// hands out. TS 29.518 makes MbsContextRef an opaque string. A per-process random
+/// epoch makes a ref unique across restarts: the counter after it restarts at 1,
+/// and a pre-restart ref (another epoch) is unknown here, never another context.
+fn context_ref_epoch() -> &'static str {
+    static EPOCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(|| format!("{:08x}", uuid::Uuid::new_v4().as_u128() as u32))
+}
+
+/// #1856: the `mbsContextRef` of context `id`: `<epoch>-<id>`.
+pub fn context_ref_string(id: u64) -> String {
+    format!("{}-{id}", context_ref_epoch())
+}
+
+/// #1856: the context id an `mbsContextRef` names, when this AMF instance issued
+/// it. A ref from another epoch (an earlier run of this AMF), or not of this form,
+/// is `None`, so it is not found rather than taken for a new context.
+pub fn parse_context_ref(context_ref: &str) -> Option<u64> {
+    let (epoch, id) = context_ref.split_once('-')?;
+    (epoch == context_ref_epoch()).then_some(())?;
+    id.parse().ok()
+}
+
+/// #1818: what a ContextDelete did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BroadcastContextRelease {
+    /// The TMGI of the session the context rode on (`None` if another path had
+    /// already removed the session).
+    pub tmgi: Option<Tmgi>,
+    /// Whether the MBS session itself was removed: only when this was the last
+    /// broadcast context on it AND a ContextCreate had created it.
+    pub session_removed: bool,
 }
 
 impl NgapMcastContext {
@@ -145,7 +217,93 @@ impl NgapMcastContext {
             sessions: RwLock::new(HashMap::new()),
             tmgi_index: RwLock::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
+            broadcast: std::sync::Mutex::new(BroadcastContexts::default()),
         }
+    }
+
+    /// #1818: Namf_MBSBroadcast ContextCreate. Joins the MBS session already held
+    /// for `tmgi` (created by another context or by another path, such as an NGAP
+    /// multicast session) or creates one, and returns a context reference of its
+    /// own with the session. A repeat from the same `mbsmf_id` for the same TMGI
+    /// returns the context it already has, so a retry allocates nothing.
+    pub fn broadcast_context_create(
+        &self,
+        tmgi: &Tmgi,
+        mbsmf_id: Option<&str>,
+    ) -> Result<(u64, NgapMbsSession), BroadcastCreateRefused> {
+        let mut bc = self
+            .broadcast
+            .lock()
+            .map_err(|_| BroadcastCreateRefused::Failed)?;
+        let existing = self.session_find_by_tmgi(tmgi);
+        if let Some(session) = &existing {
+            let retry = bc.contexts.iter().find(|(_, c)| {
+                c.session_id == session.mbs_session_id && c.mbsmf_id.as_deref() == mbsmf_id
+            });
+            if let Some((context_ref, _)) = retry {
+                return Ok((*context_ref, session.clone()));
+            }
+        }
+        // #1856: bounded; checked before a session is made for it.
+        if bc.contexts.len() >= MAX_BROADCAST_CONTEXTS {
+            return Err(BroadcastCreateRefused::Full);
+        }
+        let session = match existing {
+            Some(s) => s,
+            None => {
+                let created = self
+                    .session_create(tmgi.clone(), 1, None, Vec::new())
+                    .ok_or(BroadcastCreateRefused::Failed)?;
+                bc.owned_sessions.insert(created.mbs_session_id);
+                created
+            }
+        };
+        bc.next_ref += 1;
+        let context_ref = bc.next_ref;
+        bc.contexts.insert(
+            context_ref,
+            BroadcastContext {
+                session_id: session.mbs_session_id,
+                mbsmf_id: mbsmf_id.map(str::to_string),
+            },
+        );
+        Ok((context_ref, session))
+    }
+
+    /// #1818: Namf_MBSBroadcast ContextDelete. Removes the context `context_ref`
+    /// and nothing it did not create: the MBS session is removed only when no
+    /// other broadcast context rides on it and a ContextCreate created it. A
+    /// session another path created (an NGAP multicast session sharing the TMGI)
+    /// outlives every broadcast context on it. `None` for an unknown reference.
+    pub fn broadcast_context_delete(&self, context_ref: u64) -> Option<BroadcastContextRelease> {
+        let mut bc = self.broadcast.lock().ok()?;
+        let context = bc.contexts.remove(&context_ref)?;
+        let shared = bc
+            .contexts
+            .values()
+            .any(|c| c.session_id == context.session_id);
+        let owned = bc.owned_sessions.contains(&context.session_id);
+        let tmgi = self.session_find(context.session_id).map(|s| s.tmgi);
+        let session_removed = if !shared && owned {
+            bc.owned_sessions.remove(&context.session_id);
+            self.session_remove(context.session_id).is_some()
+        } else {
+            false
+        };
+        Some(BroadcastContextRelease {
+            tmgi,
+            session_removed,
+        })
+    }
+
+    /// #1818: the broadcast context `context_ref`, if held.
+    pub fn broadcast_context_find(&self, context_ref: u64) -> Option<BroadcastContext> {
+        self.broadcast
+            .lock()
+            .ok()?
+            .contexts
+            .get(&context_ref)
+            .cloned()
     }
 
     /// Create a new MBS session (triggered by MB-SMF via Namf)
@@ -657,6 +815,37 @@ fn build_mcast_group_paging(tmgi: &Tmgi, area_tacs: &[u32]) -> Option<Vec<u8>> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// **#1856**: at most [`MAX_BROADCAST_CONTEXTS`] contexts are held. One more
+    /// is refused `Full` (the handler's 500 INSUFFICIENT_RESOURCES) without making
+    /// a session for it, while a retry of a held context is still answered.
+    ///
+    /// REVERT-VERIFIED: with the bound removed, the extra create succeeds
+    /// ("one more is refused").
+    #[test]
+    fn broadcast_contexts_are_bounded_1856() {
+        let ctx = NgapMcastContext::new();
+        let tmgi = Tmgi::new(0x185600, [0x00, 0xF1, 0x10]);
+        for n in 0..MAX_BROADCAST_CONTEXTS {
+            ctx.broadcast_context_create(&tmgi, Some(&format!("mbsmf-{n}")))
+                .expect("under the bound");
+        }
+        let other = Tmgi::new(0x185601, [0x00, 0xF1, 0x10]);
+        assert_eq!(
+            ctx.broadcast_context_create(&other, Some("mbsmf-x"))
+                .map(|_| ()),
+            Err(BroadcastCreateRefused::Full),
+            "one more is refused"
+        );
+        assert!(
+            ctx.session_find_by_tmgi(&other).is_none(),
+            "no session is made for a refused create"
+        );
+        assert!(
+            ctx.broadcast_context_create(&tmgi, Some("mbsmf-0")).is_ok(),
+            "a retry of a held context is still answered"
+        );
+    }
     use nextgcore_asn1c::ngap::types::ProcedureCode;
     use nextgcore_ngap::ie::MulticastGroupPagingArea;
     use nextgcore_ngap::mbs_transfer::MbsSessionId;

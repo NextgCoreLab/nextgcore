@@ -67,6 +67,7 @@ use std::time::Duration;
 
 mod actuation; // #284: derivation + PCF actuation for stored TSC configurations
 mod context;
+mod reconcile; // #1817: PCF app-session Deletes that outlived their retry budget
 
 pub use context::*;
 
@@ -103,6 +104,17 @@ pub(crate) fn attach_oauth2(
         Some(oauth2) => client.with_oauth2(oauth2, target),
         None => client,
     }
+}
+
+/// #1817: what `/metrics` serves: the families every NF shares and the reconciler's.
+fn render_prometheus() -> String {
+    let mut out = nextgcore_metrics::nf::render_common(&nextgcore_metrics::nf::NfIdentity {
+        nf: "tsctsf",
+        version: env!("CARGO_PKG_VERSION"),
+        nrf_client: true,
+    });
+    reconcile::render(&mut out);
+    out
 }
 
 /// #1754: spawn `fut` on its own task, so dropping the caller (a consumer that
@@ -331,6 +343,8 @@ async fn main() -> Result<()> {
         sbi_server_config = apply_oauth2_enforcement(sbi_server_config, &args.nrf_uri);
     }
 
+    // #1791: the NFProfile advertises the scheme this listener serves.
+    let sbi_scheme = sbi_server_config.scheme;
     let sbi_server = SbiServer::new(sbi_server_config);
     log::info!("Starting TSCTSF SBI server on {addr}");
     sbi_server
@@ -361,7 +375,7 @@ async fn main() -> Result<()> {
                 move || {
                     let (ctx, host, id) = (sbi_ctx.clone(), host.clone(), id.clone());
                     async move {
-                        register_with_nrf(ctx, &host, port, &id)
+                        register_with_nrf(ctx, &host, port, &id, sbi_scheme)
                             .await
                             .map(|()| Some(id))
                     }
@@ -383,6 +397,19 @@ async fn main() -> Result<()> {
         }
         Err(e) => log::warn!("NRF registration not attempted (will operate without NRF): {e}"),
     }
+
+    // #1817: retry the PCF app-session Deletes that outlived their retry budget.
+    let _reconciler = reconcile::spawn_reconciler();
+
+    // #1817: the Prometheus endpoint (the reconciler's gauge and counter beside the
+    // common families), on NEXTGCORE_METRICS_BIND (loopback by default) and
+    // TSCTSF_METRICS_PORT (9090). Non-fatal, like every NF's.
+    let _metrics = nextgcore_metrics::nf::serve_nf_metrics(
+        "TSCTSF",
+        "TSCTSF_METRICS_PORT",
+        Arc::new(render_prometheus),
+    )
+    .await;
 
     log::info!("NextGCore TSCTSF ready (instance: {nf_instance_id})");
 
@@ -1452,7 +1479,12 @@ async fn handle_admin_capability_change(request: &SbiRequest) -> SbiResponse {
 
 /// Build the NFProfile registered with the NRF (TS 29.510): nfType TSCTSF
 /// advertising the ntsctsf-time-synchronization service (TS 29.565).
-fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
+fn build_nf_profile(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+    scheme: nextgcore_sbi::types::UriScheme,
+) -> serde_json::Value {
     nextgcore_sbi::nf_addressing::classify_profile_host(
         serde_json::json!({
             "nfInstanceId": nf_instance_id,
@@ -1469,7 +1501,7 @@ fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serd
                     "serviceInstanceId": format!("{nf_instance_id}-ntsctsf-time-synchronization"),
                     "serviceName": "ntsctsf-time-synchronization",
                     "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                    "scheme": "http",
+                    "scheme": scheme.as_str(),
                     "nfServiceStatus": "REGISTERED",
                     "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
                 },
@@ -1477,7 +1509,7 @@ fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serd
                     "serviceInstanceId": format!("{nf_instance_id}-ntsctsf-asti"),
                     "serviceName": "ntsctsf-asti",
                     "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                    "scheme": "http",
+                    "scheme": scheme.as_str(),
                     "nfServiceStatus": "REGISTERED",
                     "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
                 },
@@ -1485,7 +1517,7 @@ fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serd
                     "serviceInstanceId": format!("{nf_instance_id}-ntsctsf-qos-tsctsf"),
                     "serviceName": "ntsctsf-qos-tsctsf",
                     "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                    "scheme": "http",
+                    "scheme": scheme.as_str(),
                     "nfServiceStatus": "REGISTERED",
                     "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
                 }
@@ -1527,6 +1559,7 @@ async fn register_with_nrf(
     sbi_addr: &str,
     sbi_port: u16,
     nf_instance_id: &str,
+    sbi_scheme: nextgcore_sbi::types::UriScheme,
 ) -> Result<(), String> {
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
     let nrf_uri = match nrf_uri {
@@ -1542,7 +1575,7 @@ async fn register_with_nrf(
     let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
 
-    let nf_profile = build_nf_profile(nf_instance_id, sbi_addr, sbi_port);
+    let nf_profile = build_nf_profile(nf_instance_id, sbi_addr, sbi_port, sbi_scheme);
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     log::debug!("NRF registration: PUT {path}");
@@ -1671,7 +1704,12 @@ mod tests {
     // ── NRF registration profile (acceptance: nfType TSCTSF) ────────────────
     #[test]
     fn nf_profile_advertises_tsctsf_and_time_sync_service() {
-        let profile = build_nf_profile("tsctsf-test-1", "10.0.0.8", 7819);
+        let profile = build_nf_profile(
+            "tsctsf-test-1",
+            "10.0.0.8",
+            7819,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
         assert_eq!(profile["nfType"], "TSCTSF");
         assert_eq!(profile["nfStatus"], "REGISTERED");
         assert_eq!(
@@ -2265,6 +2303,100 @@ mod tests {
             actuation::set_for_test(false);
             reset_actuation(None);
             server.stop().await.expect("stop scripted PCF");
+        });
+    }
+
+    /// #1817: a PCF that comes back AFTER the Delete's retry budget still gets the
+    /// Delete. Every fast retry is refused, the resource is parked with its
+    /// `appSessionId` kept, a reconcile pass that is still refused keeps it, and the
+    /// next pass delivers it.
+    ///
+    /// REVERT-VERIFIED: with `crate::reconcile::park(resource_id)` removed from the
+    /// retry task, nothing is parked and the "parked after the budget" wait times
+    /// out.
+    #[test]
+    fn a_pcf_back_after_the_retry_budget_still_gets_the_delete_1817() {
+        let _g = lock_globals();
+        reset_context();
+        block_on(async {
+            let budget = actuation::DELETE_RETRY_DELAYS.len() + 1;
+            let refusals = vec![503u16; budget + 1];
+            let (server, port, pcf) = spawn_scripted_pcf(None, &refusals).await;
+            reset_actuation(Some(port));
+            actuation::set_for_test(true);
+            let before = reconcile::RECONCILED.get(&["deleted"]);
+
+            let created = tsctsf_sbi_request_handler(time_sync_create_1754()).await;
+            assert_eq!(created.status, 201);
+            let config_id = only_config_id();
+            let deleted = tsctsf_sbi_request_handler(SbiRequest::delete(format!(
+                "/ntsctsf-time-synchronization/v1/configuration/{config_id}"
+            )))
+            .await;
+            assert_eq!(deleted.status, 204);
+            eventually("the Delete is parked after the budget", || {
+                reconcile::pending_count() == 1
+            })
+            .await;
+            assert_eq!(pcf.deletes(), budget);
+            assert_eq!(
+                actuation::app_session_for(&config_id).as_deref(),
+                Some("asc-1754")
+            );
+
+            assert_eq!(reconcile::reconcile_once().await, 0, "still refused");
+            assert_eq!(reconcile::pending_count(), 1, "kept, not dropped");
+
+            assert_eq!(reconcile::reconcile_once().await, 1, "the PCF accepts");
+            assert_eq!(pcf.deletes(), budget + 2);
+            assert_eq!(reconcile::pending_count(), 0);
+            assert!(actuation::app_session_for(&config_id).is_none());
+            assert_eq!(reconcile::RECONCILED.get(&["deleted"]), before + 1);
+
+            actuation::set_for_test(false);
+            reset_actuation(None);
+            server.stop().await.expect("stop scripted PCF");
+        });
+    }
+
+    /// R24 (#1817 review): one pass sends for at most `MAX_PASS`. Against a
+    /// blackholed PCF the resources it does not reach are re-parked for the next.
+    ///
+    /// REVERT-VERIFIED: with the deadline check removed, the pass runs for every
+    /// resource's client timeout ("the pass is bounded").
+    #[test]
+    fn a_pass_against_a_blackholed_pcf_is_bounded_1817() {
+        let _g = lock_globals();
+        reset_context();
+        block_on(async {
+            // Accepts connections and never answers.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let hole = tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((s, _)) = listener.accept().await {
+                    held.push(s);
+                }
+            });
+            nextgcore_sbi::security::set_sbi_profile_override(
+                nextgcore_sbi::security::SbiProfile::Dev,
+            );
+            reset_actuation(Some(port));
+            for n in 0..6 {
+                let id = format!("hole-{n}");
+                actuation::record_app_session_for_test(&id, &format!("asc-{n}"));
+                reconcile::park(id);
+            }
+            let started = std::time::Instant::now();
+            assert_eq!(reconcile::reconcile_once().await, 0);
+            assert!(
+                started.elapsed() < reconcile::MAX_PASS + Duration::from_secs(4),
+                "the pass is bounded: {:?}",
+                started.elapsed()
+            );
+            assert_eq!(reconcile::pending_count(), 6, "every resource re-parked");
+            hole.abort();
+            reset_actuation(None);
         });
     }
 
@@ -3081,7 +3213,12 @@ mod tests {
     /// pre-#113 state for the two that did not exist.
     #[test]
     fn the_nf_profile_advertises_all_three_services() {
-        let profile = build_nf_profile("tsctsf-1", "127.0.0.1", 7777);
+        let profile = build_nf_profile(
+            "tsctsf-1",
+            "127.0.0.1",
+            7777,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
         let names: Vec<&str> = profile["nfServices"]
             .as_array()
             .expect("nfServices")
@@ -3166,7 +3303,7 @@ mod tests_nf_profile_host_kind_1324 {
     #[test]
     fn the_nf_profile_carries_its_host_by_type() {
         for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
-            let profile = build_nf_profile("id", host, 7777);
+            let profile = build_nf_profile("id", host, 7777, nextgcore_sbi::types::UriScheme::Http);
             let problems =
                 nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
             assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
@@ -3200,5 +3337,38 @@ mod outbound_oauth2_1665_tests {
             super::outbound_oauth2_client(SbiProfile::Dev, false, Some(NRF)).is_none(),
             "dev profile, knob off: no client, the token-free path is unchanged"
         );
+    }
+}
+
+/// #1791: the registered NFProfile advertises, in every `nfServices[].scheme`,
+/// the scheme this NF's SBI listener serves (TS 29.510 §6.1.6.2.3
+/// `NFService.scheme`): `http` for the cleartext listener, `https` once `--tls`
+/// makes it TLS. This listener ignores NEXTGCORE_SBI_PROFILE (it serves TLS only with `--tls`; #1795), so `--tls` alone decides. `main` passes the listener config's scheme in; the
+/// nextgcore-sbi source guard `every_nf_advertises_its_listener_scheme_1791`
+/// pins that wiring.
+///
+/// REVERT-VERIFIED: with the builder advertising `"http"` again, the TLS case
+/// fails here.
+#[cfg(test)]
+mod tests_advertised_scheme_1791 {
+    use super::*;
+
+    #[test]
+    fn the_nf_profile_advertises_the_listener_scheme_1791() {
+        let addr: std::net::SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        let plain = nextgcore_sbi::server::SbiServerConfig::new(addr);
+        let tls = nextgcore_sbi::server::SbiServerConfig::new(addr).with_tls("tls.key", "tls.crt");
+        for (cfg, want) in [(plain, "http"), (tls, "https")] {
+            let profile = build_nf_profile("tsctsf-1791", "10.0.0.1", 7777, cfg.scheme);
+            let services = profile["nfServices"].as_array().expect("nfServices");
+            assert!(!services.is_empty(), "the profile offers services");
+            for svc in services {
+                assert_eq!(
+                    svc["scheme"], want,
+                    "{} must advertise the listener's scheme",
+                    svc["serviceName"]
+                );
+            }
+        }
     }
 }

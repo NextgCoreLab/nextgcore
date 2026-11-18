@@ -407,45 +407,79 @@ impl OAuthVerifier {
                     .into(),
             )),
         };
-        let claims = match claims {
-            Ok(claims) => claims,
-            Err(e @ SbiError::AuthorizationFailed(_)) if !bearer_presented(auth_header) => {
-                return Err(BearerRefusal::Absent(e.to_string()))
-            }
-            Err(e @ SbiError::AuthorizationFailed(_)) => {
-                return Err(BearerRefusal::InvalidToken(e.to_string()))
-            }
-            Err(e) => return Err(BearerRefusal::KeysUnavailable(e.to_string())),
-        };
-        if let Some(aud) = self.expected_audience.as_deref() {
-            if let Err(e) = crate::oauth::check_audience(&claims.aud, aud) {
-                return Err(BearerRefusal::ClaimMismatch {
-                    claim: "aud",
-                    detail: e.to_string(),
-                });
-            }
-        }
-        if let Some(scope) = required_scope {
-            if let Err(e) = crate::oauth::check_token_scope(&claims.scope, scope) {
-                return Err(BearerRefusal::InsufficientScope {
-                    scope: scope.to_string(),
-                    detail: e.to_string(),
-                });
-            }
-        }
-        if let Some(scope) = resource_scope {
-            if crate::oauth::check_token_scope(&claims.scope, scope).is_err() {
-                return Err(BearerRefusal::InsufficientScope {
+        // #1811: the resource scope is read before `bearer_decision` consumes the
+        // claims, and refused only after it, so the refusal order is unchanged:
+        // token, audience, service scope, then resource scope.
+        let resource_refusal = match (&claims, resource_scope) {
+            (Ok(c), Some(scope)) if crate::oauth::check_token_scope(&c.scope, scope).is_err() => {
+                Some(BearerRefusal::InsufficientScope {
                     scope: scope.to_string(),
                     detail: format!(
                         "the access token's scope does not include {scope}, which this \
                          resource requires in addition to the service scope"
                     ),
-                });
+                })
             }
+            _ => None,
+        };
+        let sub = bearer_decision(
+            claims,
+            auth_header,
+            self.expected_audience.as_deref(),
+            required_scope,
+        )?;
+        match resource_refusal {
+            Some(refusal) => Err(refusal),
+            None => Ok(sub),
         }
-        Ok(claims.sub)
     }
+}
+
+/// TS 29.500 §6.7.3's decision on a verified (or refused) bearer token, shared by
+/// the server's OAuth2 gate and by every handler that runs its own (#1780): nefd's
+/// `ueid`, nwdafd's `ran_congestion`.
+/// - `claims` is the signature/expiry verification's result, checked with no
+///   audience (`authorize_aud(header, None)`), so the audience is judged here.
+/// - No Bearer token: [`BearerRefusal::Absent`] (401, no `error`).
+/// - A token that does not verify: [`BearerRefusal::InvalidToken`].
+/// - Another producer's `aud`: [`BearerRefusal::ClaimMismatch`].
+/// - A scope without `required_scope`: [`BearerRefusal::InsufficientScope`].
+/// - The keys unavailable: [`BearerRefusal::KeysUnavailable`].
+///
+/// Returns the token's `sub`.
+pub fn bearer_decision(
+    claims: SbiResult<crate::oauth::AccessTokenClaims>,
+    auth_header: Option<&str>,
+    expected_audience: Option<&str>,
+    required_scope: Option<&str>,
+) -> Result<String, BearerRefusal> {
+    let claims = match claims {
+        Ok(claims) => claims,
+        Err(e @ SbiError::AuthorizationFailed(_)) if !bearer_presented(auth_header) => {
+            return Err(BearerRefusal::Absent(e.to_string()))
+        }
+        Err(e @ SbiError::AuthorizationFailed(_)) => {
+            return Err(BearerRefusal::InvalidToken(e.to_string()))
+        }
+        Err(e) => return Err(BearerRefusal::KeysUnavailable(e.to_string())),
+    };
+    if let Some(aud) = expected_audience {
+        if let Err(e) = crate::oauth::check_audience(&claims.aud, aud) {
+            return Err(BearerRefusal::ClaimMismatch {
+                claim: "aud",
+                detail: e.to_string(),
+            });
+        }
+    }
+    if let Some(scope) = required_scope {
+        if let Err(e) = crate::oauth::check_token_scope(&claims.scope, scope) {
+            return Err(BearerRefusal::InsufficientScope {
+                scope: scope.to_string(),
+                detail: e.to_string(),
+            });
+        }
+    }
+    Ok(claims.sub)
 }
 
 /// Whether the request presented a Bearer token at all (#1766). TS 29.500
@@ -466,7 +500,7 @@ fn bearer_presented(auth_header: Option<&str>) -> bool {
 /// challenge's `error` (RFC 6750 §3.1): only `invalid_token` means a fresh token
 /// may succeed, which is what nextgcore's own client acts on (#1676).
 #[derive(Debug)]
-enum BearerRefusal {
+pub enum BearerRefusal {
     /// No Bearer token: 401, challenge without `error`.
     Absent(String),
     /// Malformed, forged, unknown-key or expired: 401 `invalid_token`.
@@ -483,7 +517,7 @@ enum BearerRefusal {
 
 impl BearerRefusal {
     /// The response TS 29.500 §6.7.3 prescribes for this refusal.
-    fn into_response(self) -> SbiResponse {
+    pub fn into_response(self) -> SbiResponse {
         let challenge = |error: Option<&str>, extra: Option<String>| {
             let mut c = String::from("Bearer realm=\"5gc-sbi\"");
             if let Some(e) = error {

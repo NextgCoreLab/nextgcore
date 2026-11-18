@@ -363,6 +363,8 @@ pub async fn run() -> Result<()> {
         nextgcore_sbi::types::NfType::Ausf,
         &nrf_uri,
     )?;
+    // #1791: the NFProfile advertises the scheme this listener serves.
+    let sbi_scheme = sbi_server_config.scheme;
     let sbi_server = SbiServer::new(sbi_server_config);
 
     sbi_server
@@ -392,7 +394,7 @@ pub async fn run() -> Result<()> {
                 move || {
                     let host = host.clone();
                     async move {
-                        register_with_nrf(&host, port)
+                        register_with_nrf(&host, port, sbi_scheme)
                             .await
                             .map(nextgcore_sbi::heartbeat::registered_id)
                     }
@@ -1913,7 +1915,12 @@ fn build_ausf_nf_instance(
 ///
 /// #392: rendered from [`AUSF_SERVICES`], with per-service `allowedNfTypes` and an
 /// NF-level union, so the profile and the self instance cannot drift.
-fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
+fn build_nf_profile(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+    scheme: nextgcore_sbi::types::UriScheme,
+) -> serde_json::Value {
     let services: Vec<serde_json::Value> = AUSF_SERVICES
         .iter()
         .map(|(service_type, allowed)| {
@@ -1922,7 +1929,7 @@ fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serd
                 "serviceInstanceId": format!("{nf_instance_id}-{name}"),
                 "serviceName": name,
                 "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                "scheme": "http",
+                "scheme": scheme.as_str(),
                 "nfServiceStatus": "REGISTERED",
                 "ipEndPoints": [{
                     "ipv4Address": sbi_addr,
@@ -1960,7 +1967,11 @@ fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serd
 ///
 /// Returns the NF instance ID that was registered, so callers can start a
 /// heartbeat worker for the same instance.
-async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, String> {
+async fn register_with_nrf(
+    sbi_addr: &str,
+    sbi_port: u16,
+    sbi_scheme: nextgcore_sbi::types::UriScheme,
+) -> Result<String, String> {
     let sbi_ctx = nextgcore_sbi::context::global_context();
 
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
@@ -1984,7 +1995,7 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
             .to_string();
 
     // Build NF Profile for registration
-    let nf_profile = build_nf_profile(&nf_instance_id, sbi_addr, sbi_port);
+    let nf_profile = build_nf_profile(&nf_instance_id, sbi_addr, sbi_port, sbi_scheme);
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     log::debug!("NRF registration: PUT {path}");
@@ -3776,7 +3787,12 @@ mod tests {
     /// allow UDM, their consumer (TS 33.501 §6.14.2.1 step 8).
     #[test]
     fn test_nf_profile_advertises_sor_and_upu_protection_services() {
-        let profile = build_nf_profile("test-instance", "127.0.0.1", 7777);
+        let profile = build_nf_profile(
+            "test-instance",
+            "127.0.0.1",
+            7777,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
 
         let service_names: Vec<&str> = profile["nfServices"]
             .as_array()
@@ -3829,7 +3845,12 @@ mod tests {
     #[test]
     fn the_ausf_self_instance_matches_the_registered_profile() {
         let instance = build_ausf_nf_instance("ausf-test-instance", "10.45.0.16", 7777);
-        let profile = build_nf_profile("ausf-test-instance", "10.45.0.16", 7777);
+        let profile = build_nf_profile(
+            "ausf-test-instance",
+            "10.45.0.16",
+            7777,
+            nextgcore_sbi::types::UriScheme::Http,
+        );
 
         let mut from_instance: Vec<String> =
             instance.services.iter().map(|s| s.name.clone()).collect();
@@ -4233,10 +4254,76 @@ mod tests_nf_profile_host_kind_1324 {
     #[test]
     fn the_nf_profile_carries_its_host_by_type() {
         for host in nextgcore_sbi::nf_addressing::SAMPLE_HOSTS {
-            let profile = build_nf_profile("id", host, 7777);
+            let profile = build_nf_profile("id", host, 7777, nextgcore_sbi::types::UriScheme::Http);
             let problems =
                 nextgcore_sbi::nf_addressing::profile_addressing_problems(&profile, host);
             assert!(problems.is_empty(), "{host}: {problems:?}\n{profile}");
         }
+    }
+}
+
+/// #1791: the registered NFProfile advertises, in every `nfServices[].scheme`,
+/// the scheme this NF's SBI listener serves (TS 29.510 §6.1.6.2.3
+/// `NFService.scheme`). The listener follows the SBI security profile, so under
+/// `production` that is `https` and under `dev` `http`. The listener config here
+/// comes from `apply_sbi_security_policy`, the step `main` runs; `main` passes the
+/// config's scheme in, and the nextgcore-sbi source guard
+/// `every_nf_advertises_its_listener_scheme_1791` pins that wiring.
+///
+/// REVERT-VERIFIED: with the builder advertising `"http"` again, the production
+/// case fails here.
+#[cfg(test)]
+mod tests_advertised_scheme_1791 {
+    use super::*;
+    use nextgcore_sbi::security::{SbiProfile, SbiSecurityPolicy, TlsPaths};
+
+    #[test]
+    fn the_nf_profile_advertises_the_listener_scheme_1791() {
+        let dir = std::env::temp_dir().join(format!(
+            "scheme-1791-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |n: &str| {
+            let p = dir.join(n);
+            std::fs::write(&p, "pem").unwrap();
+            p.display().to_string()
+        };
+        let policy = SbiSecurityPolicy {
+            tls_paths: TlsPaths {
+                cert: file("nf.crt"),
+                key: file("nf.key"),
+                ca_cert: file("ca.crt"),
+                client_cert: Some(file("client.crt")),
+                client_key: Some(file("client.key")),
+            },
+            ..SbiSecurityPolicy::production()
+        };
+        let addr: std::net::SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        for (profile, want) in [(SbiProfile::Production, "https"), (SbiProfile::Dev, "http")] {
+            let cfg = nextgcore_sbi::security::apply_sbi_security_policy(
+                nextgcore_sbi::server::SbiServerConfig::new(addr),
+                profile,
+                &policy,
+                nextgcore_sbi::types::NfType::Ausf,
+                "http://127.0.0.10:7777",
+            )
+            .expect("the profile applies");
+            let nf_profile = build_nf_profile("ausf-1791", "10.0.0.1", 7777, cfg.scheme);
+            let services = nf_profile["nfServices"].as_array().expect("nfServices");
+            assert!(!services.is_empty(), "the profile offers services");
+            for svc in services {
+                assert_eq!(
+                    svc["scheme"], want,
+                    "under {profile:?}, {} must advertise the listener's scheme",
+                    svc["serviceName"]
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

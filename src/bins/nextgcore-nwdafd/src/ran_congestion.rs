@@ -47,6 +47,7 @@
 //! NSI derivation, which TS 23.288 leaves unspecified. The prediction is the
 //! gNB's 8-sample least-squares fit, not a model trained here.
 
+use nextgcore_sbi::server::BearerRefusal;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -445,39 +446,26 @@ impl CellStore {
     }
 }
 
-/// Why a cell report was refused, and its answer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Refusal {
-    /// No, malformed or unverifiable bearer token (401).
-    Unauthorized(String),
-    /// A valid token whose scope does not cover [`SERVICE_NAME`] (403).
-    Forbidden(String),
-    /// The keys to verify with are unavailable (503).
-    Unavailable(String),
-}
-
 /// Verify the request's bearer token: audience NWDAF, scope [`SERVICE_NAME`].
 /// Returns the token's `sub` (the exporter's nfInstanceId).
+///
+/// #1780: the decision and its answer are the shared server gate's
+/// (`nextgcore_sbi::server::bearer_decision`, TS 29.500 §6.7.3): no token is 401
+/// without `error`, an invalid one 401 `invalid_token`, another producer's
+/// audience 403 ACCESS_TOKEN_CLAIM_MISMATCH, a missing scope 403
+/// `insufficient_scope` with `scope="<service>"`, unavailable keys 503.
 pub async fn verify_token(
     jwks: Option<&nextgcore_sbi::oauth::JwksCache>,
     request: &SbiRequest,
-) -> Result<String, Refusal> {
-    use nextgcore_sbi::error::SbiError;
+) -> Result<String, BearerRefusal> {
     let Some(jwks) = jwks else {
-        return Err(Refusal::Unavailable(
+        return Err(BearerRefusal::KeysUnavailable(
             "no NRF is configured, so no token can be verified".into(),
         ));
     };
     let header = request.http.get_header("authorization").map(|s| s.as_str());
-    let claims = match jwks.authorize_aud(header, Some("NWDAF")).await {
-        Ok(c) => c,
-        Err(SbiError::AuthorizationFailed(m)) => return Err(Refusal::Unauthorized(m)),
-        Err(e) => return Err(Refusal::Unavailable(e.to_string())),
-    };
-    if let Err(e) = nextgcore_sbi::oauth::check_token_scope(&claims.scope, SERVICE_NAME) {
-        return Err(Refusal::Forbidden(e.to_string()));
-    }
-    Ok(claims.sub)
+    let claims = jwks.authorize_aud(header, None).await;
+    nextgcore_sbi::server::bearer_decision(claims, header, Some("NWDAF"), Some(SERVICE_NAME))
 }
 
 /// What [`ingest_report`] decided, for the caller (the route) to act on.
@@ -507,31 +495,18 @@ pub async fn ingest_report(
     let sub = match verify_token(jwks, request).await {
         Ok(sub) => sub,
         Err(refusal) => {
-            let (counter, resp) = match &refusal {
-                Refusal::Unauthorized(m) => (
-                    &UNAUTHORIZED,
-                    nextgcore_sbi::server::send_unauthorized(m, None).with_header(
-                        "WWW-Authenticate",
-                        "Bearer realm=\"5gc-sbi\", error=\"invalid_token\"",
-                    ),
-                ),
-                Refusal::Forbidden(m) => (
-                    &FORBIDDEN,
-                    nextgcore_sbi::server::send_forbidden(m, None).with_header(
-                        "WWW-Authenticate",
-                        "Bearer realm=\"5gc-sbi\", error=\"insufficient_scope\"",
-                    ),
-                ),
-                Refusal::Unavailable(m) => (
-                    &UNAVAILABLE,
-                    nextgcore_sbi::server::send_error(503, "Service Unavailable", m, None),
-                ),
+            let summary = format!("{refusal:?}");
+            let resp = refusal.into_response();
+            let counter = match resp.status {
+                401 => &UNAUTHORIZED,
+                403 => &FORBIDDEN,
+                _ => &UNAVAILABLE,
             };
             counter.fetch_add(1, Ordering::Relaxed);
             nextgcore_demo::demo_log!(
                 warn,
                 DEMO_KEY,
-                "ran-ingest refused ({}): {refusal:?}; nothing ingested",
+                "ran-ingest refused ({}): {summary}; nothing ingested",
                 resp.status
             );
             return done(resp);
@@ -1055,12 +1030,17 @@ pub fn udc_response(
 }
 
 /// The `nnwdaf-randata` `NFService` for the NRF profile.
-pub fn nf_service(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> Value {
+pub fn nf_service(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+    scheme: nextgcore_sbi::types::UriScheme,
+) -> Value {
     json!({
         "serviceInstanceId": format!("{nf_instance_id}-{SERVICE_NAME}"),
         "serviceName": SERVICE_NAME,
         "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-        "scheme": "http",
+        "scheme": scheme.as_str(),
         "nfServiceStatus": "REGISTERED",
         "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
         "allowedNfTypes": SERVICE_ALLOWED_NF_TYPES,
