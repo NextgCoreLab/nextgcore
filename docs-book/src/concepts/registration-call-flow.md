@@ -395,12 +395,16 @@ registration:
   per subscription, the UE's once the UDM accepted it (registration, and the
   takeover or restore re-subscription). A `ModificationNotification`
   (TS 29.503 §5.2.2.5.2) on it updates the subscribed UE-AMBR, GPSI and
-  MPS/MCX priority as registration derives them, and is answered 204. A change
-  this AMF does not apply (another am-data member, the subscribed S-NSSAIs, a
-  removal of the UE-AMBR) refuses the whole notification with 501, and nothing
-  is applied. On an OAuth2-required listener it skips the bearer only from a
-  verified UDM. The new values reach the gNB at the UE's next Initial Context
-  Setup; no UE Context Modification is sent for them.
+  MPS/MCX priority as registration derives them, and is answered 204. The AMF
+  keeps the whole am-data, so a change of a member it does not act on is seen
+  however the UDM encodes it (its own path, or a whole-resource replacement). A
+  change this AMF does not apply (another am-data member, the subscribed
+  S-NSSAIs, a removal of the UE-AMBR, or a UE-AMBR change for a CM-CONNECTED
+  UE) refuses the whole notification with 400 and a ProblemDetails, and nothing
+  is applied; it is never answered 204. On an OAuth2-required listener it skips
+  the bearer only from a verified UDM. No UE Context Modification is sent: a
+  UE-AMBR change is applied only for a CM-IDLE UE, and reaches the gNB at its
+  next Initial Context Setup.
 - **Config loading is lenient.** An unreadable/unparsable `amf.yaml` logs a
   warning and continues with built-in defaults (`load_config` in
   `lib.rs`) — a running AMF is not proof your config was applied. See the

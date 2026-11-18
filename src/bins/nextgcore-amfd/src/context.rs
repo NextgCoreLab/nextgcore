@@ -4013,11 +4013,12 @@ pub struct AmfUe {
     /// holds. `None` for a context whose subscription carries no token (one
     /// restored from before #1518 serves the token-less URI meanwhile).
     pub sdm_notify_token: Option<String>,
-    /// #1748: the members of the UE's `AccessAndMobilitySubscriptionData` this AMF
-    /// keeps, as the UDM last gave them (Nudm_SDM_Get, or a data change
-    /// notification applied since): `subscribedUeAmbr`, `gpsis`, `mpsPriority`,
-    /// `mcsPriority` and `nssai` (`sbi_path::AM_DATA_KEPT_MEMBERS`). A notification's
-    /// changes are applied to it and the UE's fields derived from it again.
+    /// #1748: the UE's whole `AccessAndMobilitySubscriptionData`, as the UDM last
+    /// gave it (Nudm_SDM_Get, or a data change notification applied since). A
+    /// notification's changes are applied to it and the UE's fields derived from
+    /// it again; it is whole so a change of a member this AMF does not act on
+    /// (`sbi_path::AM_DATA_APPLIED_MEMBERS`) is seen, and refused, however the UDM
+    /// encodes it.
     /// `None` for a context whose am-data was never read here (one restored from
     /// a record without it): it is then rebuilt from those fields.
     pub am_data: Option<serde_json::Value>,

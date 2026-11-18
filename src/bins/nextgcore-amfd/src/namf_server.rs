@@ -1082,7 +1082,8 @@ fn handle_ue_policy_notify_callback(
 ///   token-less URI is served only for a context restored from before #1518 whose
 ///   subscription has no token yet ([`serves_tokenless`]).
 /// - Otherwise the notification is applied ([`crate::sdm_notify`]) and answered 204,
-///   or refused as a whole with nothing applied. The check, the changes and the
+///   or refused as a whole with nothing applied: 400 with a ProblemDetails for a
+///   change this AMF does not apply (DECISIONS 2026-11-18-030000), never a 204. The check, the changes and the
 ///   derived fields are one step under the store's lock, so a concurrent
 ///   re-subscription cannot interleave and nothing is left half applied.
 fn handle_sdm_notify_callback(
@@ -1121,9 +1122,17 @@ fn handle_sdm_notify_callback(
             return None;
         }
         let current = crate::sdm_notify::current_am_data(&state.amf_ue);
+        // CM-CONNECTED as `ue_ng_connected` reads it, under the same lock.
+        let cm_connected = !state.is_cm_idle() && state.is_bound();
         Some(
-            crate::sdm_notify::applied_am_data(supi, &current, state.sdm_subscription_id(), &body)
-                .map(|kept| crate::sdm_notify::adopt_am_data(supi, &mut state.amf_ue, kept)),
+            crate::sdm_notify::applied_am_data(
+                supi,
+                &current,
+                state.sdm_subscription_id(),
+                &body,
+                cm_connected,
+            )
+            .map(|doc| crate::sdm_notify::adopt_am_data(supi, &mut state.amf_ue, doc)),
         )
     });
     drop(guard);
@@ -1140,12 +1149,16 @@ fn handle_sdm_notify_callback(
                 refusal.status(),
                 refusal.detail()
             );
-            let (title, cause) = match refusal.status() {
-                400 => ("Bad Request", Some("INVALID_MSG_FORMAT")),
-                404 => ("Not Found", Some("CONTEXT_NOT_FOUND")),
-                _ => ("Not Implemented", None),
+            let title = match refusal.status() {
+                404 => "Not Found",
+                _ => "Bad Request",
             };
-            send_error(refusal.status(), title, refusal.detail(), cause)
+            send_error(
+                refusal.status(),
+                title,
+                refusal.detail(),
+                Some(refusal.cause()),
+            )
         }
     }
 }
@@ -10905,7 +10918,8 @@ mod tests {
     /// #1748, TS 29.503 §5.2.2.5.2: a data change notification on the UE's current
     /// SDM subscription token is applied: the UE-AMBR, the GPSI and the priority
     /// subscription are what the changed am-data now says, derived as registration
-    /// derives them, and the kept am-data holds the new values. Answered 204.
+    /// derives them, and the held am-data holds the new values. Answered 204, for a
+    /// CM-IDLE UE (its next Initial Context Setup carries the new UE-AMBR).
     ///
     /// REVERT-VERIFIED: with the route removed the POST is 404; with
     /// `adopt_am_data` not called, 204 is answered and the fields keep their old
@@ -10914,7 +10928,9 @@ mod tests {
     async fn a_tokened_sdm_data_change_notification_is_applied_to_the_ue_1748() {
         let _serial = dereg_queue_test_lock().lock().await;
         let supi = "imsi-001010000017481";
-        let _ue = setup_ue(supi, true, true);
+        // CM-IDLE: a UE-AMBR change for a CM-CONNECTED UE is refused (see
+        // `a_ue_ambr_change_for_a_connected_ue_is_refused_and_applies_nothing_1748`).
+        let _ue = setup_ue(supi, false, true);
         let body = am_data_change(
             supi,
             json!([
@@ -10979,19 +10995,23 @@ mod tests {
     }
 
     /// #1748 (failure-path check 1): a notification is applied whole or not at all.
-    /// One change this AMF cannot apply (an am-data member it does not keep, a
-    /// change of the subscribed S-NSSAIs, a removal of the UE-AMBR) refuses all of
-    /// it with 501, so the UE-AMBR change beside it is not applied either; a
-    /// malformed one is 400, and one for another resource 404. The UE is unchanged.
+    /// One change this AMF cannot apply (an am-data member it does not act on, on
+    /// its path or in a whole-resource replacement, a change of the subscribed
+    /// S-NSSAIs, a removal of the UE-AMBR) refuses all of it with 400
+    /// UNSPECIFIED_MSG_FAILURE (DECISIONS 2026-11-18-030000), so the UE-AMBR change
+    /// beside it is not applied either; a malformed one is 400 INVALID_MSG_FORMAT,
+    /// and one for another resource 404. The UE is unchanged.
     ///
-    /// REVERT-VERIFIED: with the member check dropped from `apply_change`, the
-    /// first case answers 204 and the UE-AMBR changes; with `check_applicable`
-    /// skipped, the S-NSSAI and removal cases answer 204.
+    /// REVERT-VERIFIED: with the other-member comparison in `check_applicable`
+    /// skipped, the `rfspIndex` cases answer 204 and the UE-AMBR changes; with
+    /// `check_applicable` skipped, the S-NSSAI and removal cases answer 204; with
+    /// `NotAllowed` answered 501 again, the first case's status assertion fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refused_sdm_data_change_notification_applies_nothing_1748() {
         let _serial = dereg_queue_test_lock().lock().await;
         let supi = "imsi-001010000017483";
-        let _ue = setup_ue(supi, true, true);
+        // CM-IDLE, so the UE-AMBR change beside each refused one is applicable.
+        let _ue = setup_ue(supi, false, true);
         let token = format!("sdm-{supi}");
         let kept = json!({
             "subscribedUeAmbr": {"uplink": "1 Mbps", "downlink": "2 Mbps"},
@@ -11009,32 +11029,49 @@ mod tests {
         assert_eq!((before.0, before.1), (1_000_000, 2_000_000), "seeded");
         let ambr = json!({"op": "REPLACE", "path": "/subscribedUeAmbr",
                           "newValue": {"uplink": "9 Mbps", "downlink": "9 Mbps"}});
+        const NOT_ALLOWED: (u16, &str) = (400, "UNSPECIFIED_MSG_FAILURE");
+        const MALFORMED: (u16, &str) = (400, "INVALID_MSG_FORMAT");
         let cases = [
             (
                 json!([ambr, {"op": "REPLACE", "path": "/rfspIndex", "newValue": 3}]),
-                501,
+                NOT_ALLOWED,
+            ),
+            (
+                json!([{"op": "REPLACE", "path": "", "newValue": {
+                    "subscribedUeAmbr": {"uplink": "9 Mbps", "downlink": "9 Mbps"},
+                    "nssai": {"defaultSingleNssais": [{"sst": 1}]},
+                    "rfspIndex": 3,
+                }}]),
+                NOT_ALLOWED,
             ),
             (
                 json!([ambr, {"op": "REPLACE", "path": "/nssai",
                               "newValue": {"defaultSingleNssais": [{"sst": 2}]}}]),
-                501,
+                NOT_ALLOWED,
             ),
-            (json!([{"op": "REMOVE", "path": "/subscribedUeAmbr"}]), 501),
+            (
+                json!([{"op": "REMOVE", "path": "/subscribedUeAmbr"}]),
+                NOT_ALLOWED,
+            ),
             (
                 json!([ambr, {"op": "MOVE", "path": "/gpsis", "from": "/x"}]),
-                501,
+                NOT_ALLOWED,
             ),
-            (json!([ambr, {"op": "REPLACE", "path": "/gpsis"}]), 400),
+            (
+                json!([ambr, {"op": "REPLACE", "path": "/gpsis"}]),
+                MALFORMED,
+            ),
             (
                 json!([ambr, {"op": "REPLACE", "path": "/subscribedUeAmbr/uplink",
                               "newValue": "fast"}]),
-                400,
+                MALFORMED,
             ),
         ];
-        for (changes, status) in cases {
+        for (changes, (status, cause)) in cases {
             let resp =
                 post_sdm_notify(supi, Some(&token), &am_data_change(supi, changes.clone())).await;
             assert_eq!(resp.status, status, "{changes}");
+            assert_eq!(problem_cause(&resp), cause, "{changes}");
             assert_eq!(sdm_view(supi), before, "nothing applied: {changes}");
         }
         let other = json!({"notifyItems": [{
@@ -11059,6 +11096,56 @@ mod tests {
         );
         assert_eq!(post_sdm_notify(supi, Some(&token), &same).await.status, 204);
         assert_eq!(sdm_view(supi).0, 9_000_000, "applied");
+    }
+
+    /// #1748 (R11 MAJOR-2, TS 23.502 §4.5.1): for a CM-CONNECTED UE, NG-RAN enforces
+    /// the UE-AMBR it was given, and this AMF does not send the UE Context
+    /// Modification that would move it, so a change of the subscribed UE-AMBR is
+    /// refused with 400 and nothing is applied, the GPSI change beside it included.
+    /// A change that leaves the UE-AMBR as it is is applied.
+    ///
+    /// REVERT-VERIFIED: with `cm_connected` passed as `false` from the handler, the
+    /// refusal is a 204 and the UE-AMBR changes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ue_ambr_change_for_a_connected_ue_is_refused_and_applies_nothing_1748() {
+        let _serial = dereg_queue_test_lock().lock().await;
+        let supi = "imsi-001010000017488";
+        let ue = setup_ue(supi, true, true);
+        {
+            let ctx = amf_self();
+            let guard = ctx.read().expect("ctx");
+            guard.ue_store().with_mut(ue.id, |s| {
+                crate::sdm_notify::adopt_am_data(
+                    supi,
+                    &mut s.amf_ue,
+                    json!({"subscribedUeAmbr": {"uplink": "1 Mbps", "downlink": "2 Mbps"}}),
+                );
+            });
+        }
+        assert!(ue_ng_connected(&ue), "CM-CONNECTED");
+        let before = sdm_view(supi);
+        let token = format!("sdm-{supi}");
+        let body = am_data_change(
+            supi,
+            json!([
+                {"op": "REPLACE", "path": "/subscribedUeAmbr",
+                 "newValue": {"uplink": "5 Mbps", "downlink": "10 Mbps"}},
+                {"op": "REPLACE", "path": "/gpsis", "newValue": ["msisdn-4917488"]},
+            ]),
+        );
+        let resp = post_sdm_notify(supi, Some(&token), &body).await;
+        assert_eq!(resp.status, 400, "{:?}", resp.http.content);
+        assert_eq!(problem_cause(&resp), "UNSPECIFIED_MSG_FAILURE");
+        assert_eq!(sdm_view(supi), before, "nothing applied");
+        let gpsi_only = am_data_change(
+            supi,
+            json!([{"op": "REPLACE", "path": "/gpsis", "newValue": ["msisdn-4917488"]}]),
+        );
+        assert_eq!(
+            post_sdm_notify(supi, Some(&token), &gpsi_only).await.status,
+            204
+        );
+        assert_eq!(sdm_view(supi).2.as_deref(), Some("msisdn-4917488"));
     }
 
     /// #1748: a notification is acted on only with the UE's current SDM subscription

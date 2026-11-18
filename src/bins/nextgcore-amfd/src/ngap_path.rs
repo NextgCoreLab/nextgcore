@@ -6519,7 +6519,7 @@ impl NgapServer {
         // #1222: likewise for an MPS/MCX subscription that is withdrawn.
         state.amf_ue.priority_subscription = am_data.priority_subscription;
         // #1748: what a data change notification is applied to.
-        state.amf_ue.am_data = Some(am_data.kept.clone()).filter(serde_json::Value::is_object);
+        state.amf_ue.am_data = Some(am_data.document.clone()).filter(serde_json::Value::is_object);
 
         // New 5G-GUTI: GUAMI of this AMF + CSPRNG 5G-TMSI (TS 23.003 2.10.1)
         state.amf_ue.generate_new_guti();

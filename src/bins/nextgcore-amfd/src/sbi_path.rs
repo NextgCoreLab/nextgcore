@@ -3808,15 +3808,16 @@ pub struct AmDataResponse {
     /// #1222: `mpsPriority` or `mcsPriority` is true (TS 29.503 §6.1.6.2.4): the
     /// subscriber has an MPS or MCX priority subscription.
     pub priority_subscription: bool,
-    /// #1748: the members of the body this AMF keeps ([`kept_am_data`]), which a
-    /// data change notification is applied to.
-    pub kept: serde_json::Value,
+    /// #1748: the whole am-data body as the UDM gave it ([`am_data_document`]),
+    /// which a data change notification is applied to.
+    pub document: serde_json::Value,
 }
 
 /// #1748: the `AccessAndMobilitySubscriptionData` members (TS 29.503 §6.1.6.2.4) this
-/// AMF keeps, i.e. the ones [`parse_am_data`] reads. A data change notification
-/// (TS 29.503 §5.2.2.5.2) changing any other member is not applied, and refused.
-pub const AM_DATA_KEPT_MEMBERS: [&str; 5] = [
+/// AMF acts on, i.e. the ones [`parse_am_data`] reads. A data change notification
+/// (TS 29.503 §5.2.2.5.2) that changes any other member is refused as a whole, so
+/// the UDM is never told a change was applied that the AMF ignored.
+pub const AM_DATA_APPLIED_MEMBERS: [&str; 5] = [
     "subscribedUeAmbr",
     "gpsis",
     "mpsPriority",
@@ -3824,14 +3825,15 @@ pub const AM_DATA_KEPT_MEMBERS: [&str; 5] = [
     "nssai",
 ];
 
-/// #1748: the [`AM_DATA_KEPT_MEMBERS`] of an am-data body, as an object (empty for a
-/// body that is not one).
-pub fn kept_am_data(json: &serde_json::Value) -> serde_json::Value {
-    let kept: serde_json::Map<String, serde_json::Value> = AM_DATA_KEPT_MEMBERS
-        .iter()
-        .filter_map(|m| json.get(*m).map(|v| ((*m).to_string(), v.clone())))
-        .collect();
-    serde_json::Value::Object(kept)
+/// #1748: the whole am-data body, kept so a data change notification can tell a
+/// change of a member this AMF does not act on from one that leaves it as it was
+/// (an empty object for a body that is not one).
+pub fn am_data_document(json: &serde_json::Value) -> serde_json::Value {
+    if json.is_object() {
+        json.clone()
+    } else {
+        serde_json::Value::Object(serde_json::Map::new())
+    }
 }
 
 /// Accept a TS 29.571 `Gpsi` only in one of its two NAMED forms —
@@ -3926,7 +3928,7 @@ pub async fn call_udm_sdm_get_am_data(
 /// none of them are expressible through the async caller.
 pub(crate) fn parse_am_data(json: &serde_json::Value, supi: &str) -> AmDataResponse {
     let mut out = AmDataResponse {
-        kept: kept_am_data(json),
+        document: am_data_document(json),
         ..AmDataResponse::default()
     };
     out.ue_ambr_uplink = json["subscribedUeAmbr"]["uplink"]
