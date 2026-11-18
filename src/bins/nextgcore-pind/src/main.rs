@@ -39,6 +39,27 @@ static OAUTH2_ENABLED: AtomicBool = AtomicBool::new(false);
 /// transports (PIND-10).
 static TRUST_CALLER_SUPI_HEADER: AtomicBool = AtomicBool::new(false);
 
+/// #1849: `--trust-caller-supi-header` takes the caller's SUPI from a request
+/// header nobody verified, so under the `production` SBI profile starting with
+/// it is an error: there the caller identity must come from an authenticated
+/// source (the verified token `sub`, PIND-10; TS 33.501 §13.4.1, TS 23.542
+/// §8). Under `dev` it still works, for lab stacks.
+fn refuse_trusted_supi_header_under_production(
+    profile: nextgcore_sbi::security::SbiProfile,
+    trust_caller_supi_header: bool,
+) -> Result<(), String> {
+    if profile.is_production() && trust_caller_supi_header {
+        return Err(format!(
+            "the SBI profile is production, which does not run the lab-only \
+             --trust-caller-supi-header: it lets any client that completes TLS claim any \
+             SUPI. Take the caller identity from a verified token (--require-oauth2), or \
+             select {}=dev explicitly",
+            nextgcore_sbi::security::SBI_PROFILE_ENV
+        ));
+    }
+    Ok(())
+}
+
 fn oauth2_enabled() -> bool {
     OAUTH2_ENABLED.load(Ordering::Relaxed)
 }
@@ -100,8 +121,11 @@ struct Args {
     require_oauth2: bool,
 
     /// PIND-10: trust the bespoke `x-caller-supi` header as a caller-identity
-    /// source. Default false (the header is unverified and forgeable); enable
-    /// only on a mutually-authenticated intra-core transport.
+    /// source. LAB USE ONLY. Default false (the header is unverified and
+    /// forgeable): with it on, any client that completes TLS can act as any
+    /// subscriber. Refused at startup under the `production` SBI profile
+    /// (#1849), where the caller identity comes from a verified access token
+    /// (`--require-oauth2`).
     #[arg(long, default_value = "false")]
     trust_caller_supi_header: bool,
 
@@ -188,7 +212,13 @@ async fn main() -> Result<()> {
         };
     }
 
-    // PIND-10: caller-identity trust policy.
+    // PIND-10: caller-identity trust policy. #1849: the forgeable header
+    // source is lab-only and does not run under production.
+    refuse_trusted_supi_header_under_production(
+        nextgcore_sbi::security::SbiProfile::resolve(),
+        args.trust_caller_supi_header,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
     OAUTH2_ENABLED.store(args.require_oauth2, Ordering::Relaxed);
     TRUST_CALLER_SUPI_HEADER.store(args.trust_caller_supi_header, Ordering::Relaxed);
 
@@ -957,6 +987,25 @@ async fn handle_element_relay(element_id: &str, request: &SbiRequest) -> SbiResp
 // PIN server (TS 23.542 §6.4.7-6.4.9 PIN-6/7/8), not a discoverable 5GC SBI
 // NF, so it no longer registers with the NRF. The `--nrf-uri` flag is now
 // used only to locate the NRF JWKS endpoint when OAuth2 is enforced (PIND-10).
+
+#[cfg(test)]
+mod supi_header_tests_1849 {
+    use super::refuse_trusted_supi_header_under_production;
+    use nextgcore_sbi::security::SbiProfile;
+
+    /// REVERT-VERIFIED: with the production arm removed, the header source is
+    /// admitted under production and the first assertion fails.
+    #[test]
+    fn production_refuses_the_trusted_supi_header_1849() {
+        let err = refuse_trusted_supi_header_under_production(SbiProfile::Production, true)
+            .expect_err("a forgeable caller identity is refused under production");
+        assert!(err.contains("--trust-caller-supi-header"), "{err}");
+        refuse_trusted_supi_header_under_production(SbiProfile::Production, false)
+            .expect("production without the flag starts");
+        refuse_trusted_supi_header_under_production(SbiProfile::Dev, true)
+            .expect("dev keeps the lab flag");
+    }
+}
 
 #[cfg(test)]
 mod tests {
