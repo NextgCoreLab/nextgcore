@@ -3148,6 +3148,15 @@ fn query_params(uri: &str) -> Vec<(String, String)> {
 
 /// Handle Subscription Create request
 async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
+    handle_subscription_create_under(request, nextgcore_sbi::security::SbiProfile::resolve()).await
+}
+
+/// [`handle_subscription_create`] under an explicit SBI profile, so a test can
+/// drive the production path without the process-global override (#1869).
+async fn handle_subscription_create_under(
+    request: &SbiRequest,
+    profile: nextgcore_sbi::security::SbiProfile,
+) -> SbiResponse {
     log::info!("Subscription Create");
 
     let body = match &request.http.content {
@@ -3173,6 +3182,22 @@ async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
             )
         }
     };
+    // #1869: under production the notification is sent over TLS with a token, so
+    // a cleartext callback is refused here, before anything is stored (TS 29.500
+    // §5.2.7.2: 400 with `invalidParams` naming the attribute).
+    if let Err(reason) =
+        nextgcore_nrfd::sbi_path::check_notification_uri(&notification_uri, profile)
+    {
+        let body = serde_json::json!({
+            "title": "Bad Request",
+            "status": 400,
+            "detail": reason,
+            "cause": "MANDATORY_IE_INCORRECT",
+            "invalidParams": [{ "param": "/nfStatusNotificationUri", "reason": reason }],
+        });
+        return SbiResponse::with_status(400)
+            .with_body(body.to_string(), "application/problem+json");
+    }
 
     // Generate subscription ID
     let subscription_id = uuid::Uuid::new_v4().to_string();
@@ -11178,11 +11203,49 @@ mod tests {
     async fn subscribe(body: serde_json::Value) -> SbiResponse {
         let mut req = SbiRequest::post("/nnrf-nfm/v1/subscriptions");
         req.http.set_content(body.to_string());
-        handle_subscription_create(&req).await
+        // These tests subscribe http callbacks: the dev profile, set on the call
+        // rather than through the process-global override.
+        handle_subscription_create_under(&req, nextgcore_sbi::security::SbiProfile::Dev).await
     }
 
     fn problem_of(resp: &SbiResponse) -> serde_json::Value {
         serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("JSON")
+    }
+
+    /// #1869: under production an http nfStatusNotificationUri is a 400 with
+    /// `invalidParams` naming it, and nothing is stored; https is accepted.
+    #[tokio::test]
+    async fn production_subscribe_refuses_an_http_notification_uri_1869() {
+        use nextgcore_sbi::security::SbiProfile;
+        let uri = format!("http://amf-1869-{}.example/cb", uuid::Uuid::new_v4());
+        let mut req = SbiRequest::post("/nnrf-nfm/v1/subscriptions");
+        req.http
+            .set_content(serde_json::json!({ "nfStatusNotificationUri": uri }).to_string());
+        let resp = handle_subscription_create_under(&req, SbiProfile::Production).await;
+        assert_eq!(resp.status, 400);
+        let problem = problem_of(&resp);
+        assert_eq!(problem["cause"], "MANDATORY_IE_INCORRECT");
+        assert_eq!(
+            problem["invalidParams"][0]["param"],
+            "/nfStatusNotificationUri"
+        );
+        assert!(
+            !nextgcore_nrfd::nnrf_handler::nf_manager()
+                .list_subscriptions()
+                .iter()
+                .any(|s| s.notification_uri == uri),
+            "a refused subscription must not be stored"
+        );
+
+        let https = uri.replacen("http://", "https://", 1);
+        let mut req = SbiRequest::post("/nnrf-nfm/v1/subscriptions");
+        req.http
+            .set_content(serde_json::json!({ "nfStatusNotificationUri": https }).to_string());
+        let resp = handle_subscription_create_under(&req, SbiProfile::Production).await;
+        assert_eq!(
+            resp.status, 201,
+            "an https callback is accepted under production"
+        );
     }
 
     #[tokio::test]
