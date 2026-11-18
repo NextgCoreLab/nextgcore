@@ -740,6 +740,8 @@ pub fn handle_event_subscribe(
         reported_connectivity: std::collections::HashMap::new(),
         reported_location: None,
         taken_over: false,
+        one_time: false,
+        first_location_pending: false,
         reporting_threshold: None,
         location_filters: subscription
             .location_filter_list
@@ -927,6 +929,7 @@ pub(crate) fn initiate_paging_for_idle_ue(
         nwdaf_wait_until: None,
         nwdaf_predicted: None,
         nwdaf_last_cell: None,
+        location_report_subs: Vec::new(),
     };
     let mut paging_ctx = paging_ctx;
     // nextgsim#464, TS 23.501 §5.4.3.1: under `nwdaf-mobility`, the first PAGING

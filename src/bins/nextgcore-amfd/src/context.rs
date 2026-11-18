@@ -1270,6 +1270,17 @@ pub struct EventSubscription {
     /// de-duplication: a consumer's own subscription to this AMF is a different
     /// resource, even when it is the one the transferred copy came from.
     pub taken_over: bool,
+    /// The event reporting mode is ONE_TIME (`options.trigger`, TS 29.518
+    /// §6.2.6.2.4 AmfEventMode; #1760). Such a subscription is told once: *"the AMF
+    /// shall not do any subsequent event notification"* (`29518-k00.txt:5716-5719`).
+    /// It is removed when its one report is made (in the create response, in its
+    /// first notification, or by the first fire point that claims it).
+    pub one_time: bool,
+    /// Its first LOCATION_REPORT waits for the UE to answer paging (#1760, TS 29.518
+    /// §5.3.2.2.2, `29518-k00.txt:5719-5743`): the UE was CM-IDLE when it was made.
+    /// While set, no location change is reported to it; the page's outcome reports
+    /// the current location (the UE answered) or the last known one (it did not).
+    pub first_location_pending: bool,
 }
 
 /// A UE location as the LOCATION_REPORT change gate compares it (#1424, #1737): the
@@ -2892,6 +2903,64 @@ impl AmfContext {
             .take()
     }
 
+    /// #1760: the paged first LOCATION_REPORT of `subscription_id` is being made, at
+    /// location `told`: it is no longer pending, and `told` is what its next location
+    /// change is measured from. A ONE_TIME subscription is removed, as this is its one
+    /// report. The subscription as it was, or `None` when it is gone or was not
+    /// pending (so each paged first report is made at most once).
+    pub fn event_subscription_finish_first_location(
+        &self,
+        subscription_id: &str,
+        told: LocationBaseline,
+    ) -> Option<EventSubscription> {
+        let mut subs = self.event_subscriptions.write().ok()?;
+        let sub = subs.get_mut(subscription_id)?;
+        if !sub.first_location_pending {
+            return None;
+        }
+        sub.first_location_pending = false;
+        sub.reported_location = Some(told);
+        let out = sub.clone();
+        if out.one_time {
+            subs.remove(subscription_id);
+        }
+        Some(out)
+    }
+
+    /// #1760: a fire point's claim on ONE_TIME subscription `subscription_id`: it is
+    /// removed, so the claimant's notification is its one report. `false` when it is
+    /// gone already (another report claimed it).
+    pub fn event_subscription_claim_one_time(&self, subscription_id: &str) -> bool {
+        self.event_subscriptions
+            .write()
+            .ok()
+            .and_then(|mut subs| subs.remove(subscription_id))
+            .is_some()
+    }
+
+    /// #1760: attach `subscription_id`'s pending first LOCATION_REPORT to the page
+    /// running for UE `amf_ue_ngap_id`. `false` when no page runs for it.
+    pub fn paging_add_location_report(&self, amf_ue_ngap_id: u64, subscription_id: &str) -> bool {
+        #[cfg(test)]
+        self.assert_paging_map_lock_held();
+        let Ok(mut paging_map) = self.paging_map.write() else {
+            return false;
+        };
+        match paging_map.get_mut(&amf_ue_ngap_id) {
+            Some(page) => {
+                if !page
+                    .location_report_subs
+                    .iter()
+                    .any(|s| s == subscription_id)
+                {
+                    page.location_report_subs.push(subscription_id.to_string());
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Find an event-exposure subscription by ID (clone-out, lock dropped)
     pub fn event_subscription_find(&self, subscription_id: &str) -> Option<EventSubscription> {
         self.event_subscriptions
@@ -2915,6 +2984,8 @@ impl AmfContext {
                 sub.reported_connectivity = std::mem::take(&mut e.get_mut().reported_connectivity);
                 // #1737: and so is the location its first report told.
                 sub.reported_location = e.get_mut().reported_location.take();
+                // #1760: and whether its first report still waits on a page.
+                sub.first_location_pending = e.get().first_location_pending;
                 e.insert(sub);
                 return true;
             }
@@ -5564,6 +5635,11 @@ pub struct PagingContext {
     /// a UE that has not moved since it went idle is still under the gNB it was
     /// last seen on.
     pub nwdaf_last_cell: Option<(PlmnId, u64)>,
+    /// #1760: the LOCATION_REPORT subscriptions whose first report waits on this
+    /// page (`EventSubscription::first_location_pending`). The page's outcome
+    /// reports to them: the current location when the UE answers, the last known
+    /// one when it does not.
+    pub location_report_subs: Vec<String>,
     /// #1643 review: the page carries only the SMF's N1 for `pdu_session_id`, an
     /// answer to the UE's own release or modification request. TS 23.502 §4.3.4.2
     /// step 4: the NAS message only. The UE's answer re-activates no user plane
@@ -5612,6 +5688,7 @@ impl Default for PagingContext {
             nwdaf_wait_until: None,
             nwdaf_predicted: None,
             nwdaf_last_cell: None,
+            location_report_subs: Vec::new(),
         }
     }
 }
