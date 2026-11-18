@@ -6921,13 +6921,16 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
     async fn test_http_nudm_pp_and_mt_are_served() {
         let _udr_env = crate::sbi_path::UDR_ENV_TEST_LOCK.lock().await;
-        use nextgcore_sbi::context::{global_context, NfInstance, NfService};
+        use nextgcore_sbi::context::{NfInstance, NfService};
         use nextgcore_sbi::types::{NfType, SbiServiceType};
 
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // #1822 item 6: removes the AMF this test caches when it ends (dropped
+        // before `_guard`, so under it).
+        let _cached = crate::test_support::CachedNfCleanup;
         nextgcore_core::test_log::init();
         udm_context_init(64, 64);
         let (udr_server, store) = start_mock_udr_context_data().await;
@@ -7048,7 +7051,7 @@ mod tests {
         svc.versions = vec!["v1".to_string()];
         svc.port = amf_port;
         instance.add_service(svc);
-        global_context().add_nf_instance(instance).await;
+        crate::test_support::cache_nf_instance_for_test(instance).await;
 
         // Seed amfd's UE context so its real handler resolves the SUPI.
         nextgcore_amfd::test_support::init_context();

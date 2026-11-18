@@ -12321,6 +12321,8 @@ mod tests {
     /// MB-SMF consumer got 404 RESOURCE_URI_STRUCTURE_NOT_FOUND here.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mbs_n2_message_transfer_is_served_rather_than_404() {
+        // #1822 item 2: the process-global MBS contexts.
+        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
         let req = SbiRequest::post("/namf-mbs-comm/v1/n2-messages/transfer")
             .with_json_body(&mbs_tmgi_body("001", "01", "0000AB"))
             .expect("json")
@@ -12341,6 +12343,8 @@ mod tests {
     /// the SAME ref rather than leaking a second session.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mbs_context_create_is_idempotent_on_the_tmgi() {
+        // #1822 item 2: the process-global MBS contexts.
+        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
         let body = mbs_tmgi_body("001", "01", "00CAFE");
         let post = || {
             SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
@@ -12369,6 +12373,8 @@ mod tests {
     /// 201 status alone cannot.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_created_mbs_context_is_reachable_by_its_ngap_tmgi() {
+        // #1822 item 2: the process-global MBS contexts.
+        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
         let req = SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
             .with_json_body(&mbs_tmgi_body("001", "01", "00BEEF"))
             .expect("json");
@@ -12390,6 +12396,8 @@ mod tests {
     /// the MB-SMF treats as gone.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_delete_removes_the_broadcast_mbs_context_1758() {
+        // #1822 item 2: the process-global MBS contexts.
+        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
         let req = SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
             .with_json_body(&mbs_tmgi_body("001", "01", "001758"))
             .expect("json");
@@ -12429,6 +12437,8 @@ mod tests {
     /// session.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_ssm_only_mbs_session_id_is_refused_rather_than_mapped() {
+        // #1822 item 2: the process-global MBS contexts.
+        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
         let req = SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
             .with_json_body(&json!({
                 "mbsSessionId": {
@@ -12446,6 +12456,8 @@ mod tests {
     /// The OpenAPI pins `pattern: '^[A-Fa-f0-9]{6}$'`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_malformed_mbs_service_id_is_a_400() {
+        // #1822 item 2: the process-global MBS contexts.
+        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
         for bad in ["ZZZZZZ", "ABC", "0000ABCD"] {
             let req = SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
                 .with_json_body(&json!({

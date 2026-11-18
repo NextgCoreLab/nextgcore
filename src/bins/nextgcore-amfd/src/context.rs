@@ -5927,8 +5927,25 @@ static GLOBAL_PAGING_MAP_ADDR: std::sync::OnceLock<usize> = std::sync::OnceLock:
 static GLOBAL_AMF_MCAST_CONTEXT: std::sync::OnceLock<Arc<crate::ngap_mcast::NgapMcastContext>> =
     std::sync::OnceLock::new();
 
+/// The ONE lock for tests that create, read, count or delete the process-global
+/// broadcast MBS contexts in [`amf_mcast`] (Namf_MBSBroadcast ContextCreate /
+/// ContextDelete, the MBS N2 transfer, and the NGAP MBS outcomes), declared beside
+/// the global it guards (#1822 item 2). mbsmfd's tests take it too, through
+/// `test_support::MBS_CONTEXT_LOCK`, because they drive this crate's real handler
+/// (#1758): one counts the contexts while another deletes one.
+///
+/// A tokio mutex, held across `.await`; sync tests take it with `blocking_lock()`.
+/// In this crate's own tests [`amf_mcast`] panics when the lock is free, so a test
+/// that reaches MBS state without it fails whenever it runs alone.
+pub static MBS_CONTEXT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Get the global MBS NGAP context.
+#[track_caller]
 pub fn amf_mcast() -> Arc<crate::ngap_mcast::NgapMcastContext> {
+    #[cfg(test)]
+    if MBS_CONTEXT_LOCK.try_lock().is_ok() {
+        panic!("the MBS contexts were reached with MBS_CONTEXT_LOCK free: take it in this test (#1822)");
+    }
     GLOBAL_AMF_MCAST_CONTEXT
         .get_or_init(|| Arc::new(crate::ngap_mcast::NgapMcastContext::new()))
         .clone()

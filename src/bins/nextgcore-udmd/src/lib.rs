@@ -75,6 +75,53 @@ pub mod test_support {
     pub fn init_context() {
         crate::context::udm_context_init(64, 64);
     }
+
+    /// #1822 item 6: the NF instances udmd's own tests cached in the process-global
+    /// SBI NF-instance cache through [`cache_nf_instance_for_test`], not yet removed.
+    #[cfg(test)]
+    static CACHED_FOR_TEST: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// Cache `instance` in the process-global SBI NF-instance cache for the
+    /// running test only: the test's [`CachedNfCleanup`] removes it. Before
+    /// #1822 the AMFs the ee_amf and app tests cached outlived them, pointing at
+    /// servers that were gone, and #1771's Namf_MT test had to clear them first.
+    #[cfg(test)]
+    pub(crate) async fn cache_nf_instance_for_test(instance: nextgcore_sbi::context::NfInstance) {
+        CACHED_FOR_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(instance.id.clone());
+        nextgcore_sbi::context::global_context()
+            .add_nf_instance(instance)
+            .await;
+    }
+
+    /// Removes, when dropped, every NF instance [`cache_nf_instance_for_test`]
+    /// cached, so a test leaves the cache as it found it even when it panics. Hold
+    /// it while holding [`CONTEXT_GUARD`] (declared after it, so it drops first).
+    /// Needs a multi-thread runtime: the removal is async and runs in
+    /// `block_in_place`.
+    #[cfg(test)]
+    pub(crate) struct CachedNfCleanup;
+
+    #[cfg(test)]
+    impl Drop for CachedNfCleanup {
+        fn drop(&mut self) {
+            let ids =
+                std::mem::take(&mut *CACHED_FOR_TEST.lock().unwrap_or_else(|e| e.into_inner()));
+            if ids.is_empty() {
+                return;
+            }
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    let ctx = nextgcore_sbi::context::global_context();
+                    for id in &ids {
+                        ctx.remove_nf_instance(id).await;
+                    }
+                })
+            });
+        }
+    }
 }
 
 // Re-export SBI path functions

@@ -776,6 +776,29 @@ fn strip_unallowed_restored_nf_sets(
     changed
 }
 
+/// #1719 (R19): what `main` does with the profiles the state file restored, once
+/// the allowlist is known: strip each set it may not claim
+/// ([`strip_unallowed_restored_nf_sets`]) and tell the subscribers to each changed
+/// profile NF_PROFILE_CHANGED with its change items (TS 29.510 §5.2.2.6). One
+/// function rather than a loop in `main`, so the notification is tested
+/// (#1822 item 4).
+fn enforce_nf_set_allowlist_at_restore(policy: &NrfPolicy, restored: Vec<NfProfile>) {
+    for (profile, changes) in strip_unallowed_restored_nf_sets(policy, restored) {
+        let server_uri = nrf_self_uri().to_string();
+        tokio::spawn(async move {
+            if let Err(e) = nrf_nnrf_nfm_send_nf_profile_changed_notify_all_async(
+                &profile,
+                &server_uri,
+                changes,
+            )
+            .await
+            {
+                log::error!("Failed to send NF_PROFILE_CHANGED (nf_set_allowlist): {e}");
+            }
+        });
+    }
+}
+
 /// The `nfSetIdList` strings of an NFProfile document (TS 29.510 §6.1.6.2.2).
 fn nf_set_ids_of(doc: &serde_json::Value) -> Vec<&str> {
     doc.get("nfSetIdList")
@@ -1783,22 +1806,8 @@ async fn main() -> Result<()> {
     }
     // #1719 (R19): a profile restored from the state file was never checked
     // against this allowlist, and a heartbeating NF never re-registers, so the
-    // claim is enforced here: the unallowed sets are stripped and subscribers are
-    // told NF_PROFILE_CHANGED.
-    for (profile, changes) in strip_unallowed_restored_nf_sets(&policy, nf_manager().list()) {
-        let server_uri = nrf_self_uri().to_string();
-        tokio::spawn(async move {
-            if let Err(e) = nrf_nnrf_nfm_send_nf_profile_changed_notify_all_async(
-                &profile,
-                &server_uri,
-                changes,
-            )
-            .await
-            {
-                log::error!("Failed to send NF_PROFILE_CHANGED (nf_set_allowlist): {e}");
-            }
-        });
-    }
+    // claim is enforced here, before the policy is published.
+    enforce_nf_set_allowlist_at_restore(&policy, nf_manager().list());
     NRF_POLICY.set(policy).ok();
 
     // Client side (T1.1): when SBI OAuth2 is enabled, the NRF acquires and
@@ -13054,6 +13063,115 @@ mod tests_nf_set_ids_1719 {
         for id in [own, mixed, only] {
             let _ = nf_manager().deregister(id);
         }
+    }
+
+    /// **#1822 item 4.** The restore-time enforcement `main` runs strips the
+    /// disallowed set and tells a subscriber to the profile NF_PROFILE_CHANGED over
+    /// the wire, naming `nfSetIdList`; a profile it leaves alone notifies nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_enforcement_notifies_the_stripped_profile_1822() {
+        use std::sync::Mutex as StdMutex;
+        let own = "18220a0a-0000-4000-8000-00000000000a";
+        let mixed = "18220b0b-0000-4000-8000-00000000000b";
+        let received: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::clone(&received);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let subscriber = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), listener);
+        subscriber
+            .start(move |req: SbiRequest| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    if let Some(body) = req.http.content.clone() {
+                        sink.lock().expect("sink lock").push(body);
+                    }
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await
+            .expect("subscriber server starts");
+        for (id, sets) in [(own, vec![SET1]), (mixed, vec![SET1, SET2])] {
+            let p = NfProfile::from_json(&json!({
+                "nfInstanceId": id,
+                "nfType": "PCF",
+                "nfStatus": "REGISTERED",
+                "nfSetIdList": sets,
+            }))
+            .expect("a valid profile");
+            nf_manager().register(p).expect("stored");
+            nf_manager().add_subscription(nextgcore_nrfd::SubscriptionData {
+                id: format!("nrfd1822-{id}"),
+                req_nf_type: None,
+                req_nf_instance_id: None,
+                notification_uri: format!("http://127.0.0.1:{}/callback", addr.port()),
+                subscr_cond: Some(nextgcore_nrfd::nnrf_handler::SubscrCond::nf_instance_id(id)),
+                validity_duration: 3600,
+                req_notif_events: None,
+                notif_condition: None,
+            });
+        }
+        let policy = NrfPolicy {
+            nf_set_allowlist: allowlist(own),
+            ..NrfPolicy::default()
+        };
+        let restored: Vec<NfProfile> = [own, mixed]
+            .iter()
+            .filter_map(|id| nf_manager().get(id))
+            .collect();
+        enforce_nf_set_allowlist_at_restore(&policy, restored);
+
+        for _ in 0..100 {
+            if !received.lock().expect("sink lock").is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Long enough for a second, wrong, notification to arrive too.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let got = received.lock().expect("sink lock").clone();
+        assert_eq!(
+            got.len(),
+            1,
+            "one notification, for the stripped PCF: {got:?}"
+        );
+        let body: serde_json::Value = serde_json::from_str(&got[0]).expect("JSON");
+        assert_eq!(body["event"], "NF_PROFILE_CHANGED");
+        assert!(
+            body["nfInstanceUri"]
+                .as_str()
+                .is_some_and(|u| u.ends_with(&format!("/nf-instances/{mixed}"))),
+            "{body}"
+        );
+        assert!(
+            body["profileChanges"]
+                .as_array()
+                .is_some_and(|c| c.iter().any(|i| i["path"] == "/nfSetIdList")),
+            "the change names nfSetIdList: {body}"
+        );
+        assert_eq!(stored_sets(mixed), Some(vec![SET2.to_string()]));
+        for id in [own, mixed] {
+            nf_manager().remove_subscription(&format!("nrfd1822-{id}"));
+            let _ = nf_manager().deregister(id);
+        }
+    }
+
+    /// **#1822 item 4.** `main` runs the restore-time enforcement on every restored
+    /// profile, before it publishes the policy. A source guard, because `main`
+    /// itself cannot run in a unit test.
+    #[test]
+    fn main_enforces_the_allowlist_on_restored_profiles_1822() {
+        let source = include_str!("main.rs");
+        let main = &source[source.find("async fn main()").expect("main")..];
+        let main = &main[..main.find("\n}\n").expect("its end")];
+        let call = main
+            .find("\n    enforce_nf_set_allowlist_at_restore(&policy, nf_manager().list());\n")
+            .expect("main enforces the allowlist on every restored profile");
+        let publish = main
+            .find("\n    NRF_POLICY.set(policy).ok();\n")
+            .expect("main publishes the policy");
+        assert!(
+            call < publish,
+            "the enforcement runs before the policy is published"
+        );
     }
 
     /// Without an allowlist (the default), a registrant's sets are accepted as
