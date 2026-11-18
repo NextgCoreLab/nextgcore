@@ -1101,6 +1101,16 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        // #1771: the `AMF_SBI_*` fallback is reached only when NO AMF instance is
+        // cached, and the NF-instance cache is process-global: the ee_amf and app
+        // tests cache AMFs (permanently, under this same guard) whose servers are
+        // gone when they end. One of those was picked instead, and the request was
+        // refused by a port nothing listened on. Cleared here, as the sibling
+        // tests below do, so the request reaches this test's AMF.
+        let sbi_ctx = global_context();
+        for inst in sbi_ctx.find_nf_instances_by_type(NfType::Amf).await {
+            sbi_ctx.remove_nf_instance(&inst.id).await;
+        }
         nextgcore_amfd::test_support::init_context();
         let sk = nextgcore_sbi::oauth::generate_es256_key();
         let (_nrf, nrf_port) = stand_in::token_nrf(sk.clone()).await;
