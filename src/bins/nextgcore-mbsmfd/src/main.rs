@@ -25,6 +25,7 @@ mod context;
 mod n2_mbs_transfer; // #417: the N2 MBS SM transfers, on the generated NGAP codec
 mod n4mb;
 mod namf_client;
+mod reconcile; // #1817: ContextDeletes that outlived their retry budget
 mod subscription;
 mod types;
 
@@ -362,6 +363,19 @@ async fn main() -> Result<()> {
         }
         Err(e) => log::warn!("NRF registration not attempted (will operate without NRF): {e}"),
     }
+
+    // #1817: retry the ContextDeletes that outlived their retry budget.
+    let _reconciler = reconcile::spawn_reconciler();
+
+    // #1817: the Prometheus endpoint (the reconciler's gauge and counter beside the
+    // common families), on NEXTGCORE_METRICS_BIND (loopback by default) and
+    // MBSMF_METRICS_PORT (9090). Non-fatal, like every NF's.
+    let _metrics = nextgcore_metrics::nf::serve_nf_metrics(
+        "MB-SMF",
+        "MBSMF_METRICS_PORT",
+        Arc::new(render_prometheus),
+    )
+    .await;
 
     log::info!("NextGCore MB-SMF ready (instance: {nf_instance_id})");
 
@@ -952,6 +966,17 @@ async fn create_amf_mbs_context(
     None
 }
 
+/// #1817: what `/metrics` serves: the families every NF shares and the reconciler's.
+fn render_prometheus() -> String {
+    let mut out = nextgcore_metrics::nf::render_common(&nextgcore_metrics::nf::NfIdentity {
+        nf: "mbsmf",
+        version: env!("CARGO_PKG_VERSION"),
+        nrf_client: true,
+    });
+    reconcile::render(&mut out);
+    out
+}
+
 /// #1758: the waits before each retry of a failed ContextDelete.
 #[cfg(not(test))]
 const AMF_RELEASE_RETRY_DELAYS: [Duration; 5] = [
@@ -966,7 +991,7 @@ const AMF_RELEASE_RETRY_DELAYS: [Duration; 5] = [Duration::from_millis(20); 5];
 
 /// #1758: Namf_MBSBroadcast ContextDelete for each of `contexts`. 404 is gone. A
 /// failed delete is retried on [`AMF_RELEASE_RETRY_DELAYS`] on a detached task, and
-/// logged at error if every retry fails, rather than forgotten. Returns whether all
+/// (#1817) parked for [`reconcile`] if every retry fails, rather than forgotten. Returns whether all
 /// were released on the first attempt.
 async fn release_amf_contexts(contexts: Vec<AmfMbsContext>) -> bool {
     let mut failed = Vec::new();
@@ -1005,13 +1030,16 @@ async fn release_amf_contexts(contexts: Vec<AmfMbsContext>) -> bool {
         }
         for c in &failed {
             log::error!(
-                "MBS: AMF {}:{} MBS context {} could not be released after {} retries",
+                "MBS: AMF {}:{} MBS context {} could not be released after {} retries; \
+                 handing it to the reconciler",
                 c.host,
                 c.port,
                 c.context_ref,
                 AMF_RELEASE_RETRY_DELAYS.len()
             );
         }
+        // #1817: not dropped. The reconciler keeps retrying until the AMF answers.
+        reconcile::park(failed);
     });
     false
 }

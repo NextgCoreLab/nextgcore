@@ -156,9 +156,22 @@ Each NF's `metrics.rs`. Every `result` is `success` for a 2xx answer, else `fail
 | `nssf_availability_operations_total` | counter | `operation` (`update`, `patch`, `delete`, `subscribe`, `unsubscribe`, `modify_subscription`), `result` | Nnssf_NSSAIAvailability operations (§5.3) |
 | `nssf_nssai_availability_nfs`, `nssf_subscriptions`, `nssf_network_slice_instances` | gauge | | stored availability documents, subscriptions, configured slice instances |
 
+### TSCTSF and MB-SMF delete reconcilers (#1817)
+
+`nextgcore-tsctsf` and `nextgcore-mbsmfd` serve `/metrics` on `NEXTGCORE_METRICS_BIND` (loopback by default) and `TSCTSF_METRICS_PORT` / `MBSMF_METRICS_PORT` (9090), with the shared families above plus their delete reconciler's. A delete toward a peer (the PCF's app session, the AMF's broadcast MBS context) that fails its first attempt and its five retries (about 31 s) is parked and retried every 30 s until the peer answers 2xx or 404. At most 4096 are parked; one more evicts the oldest.
+
+| Metric | Type | Labels | Counts |
+|---|---|---|---|
+| `nextgcore_tsctsf_pcf_app_session_deletes_pending` | gauge | | Npcf_PolicyAuthorization_Deletes parked |
+| `nextgcore_tsctsf_pcf_app_session_delete_reconciled_total` | counter | `result` (`deleted`, `abandoned`) | parked Deletes the PCF accepted, or evicted at the bound |
+| `nextgcore_mbsmf_amf_context_deletes_pending` | gauge | | Namf_MBSBroadcast ContextDeletes parked |
+| `nextgcore_mbsmf_amf_context_delete_reconciled_total` | counter | `result` (`deleted`, `abandoned`) | parked ContextDeletes the AMF accepted, or evicted at the bound |
+
+The parked set is in memory: neither daemon has a durable store, so a restart forgets it together with the sessions it belongs to.
+
 ### No `metrics.server` in the YAML (#1312)
 
-No daemon reads a `metrics.server` block, and several have no metrics listener at all (hssd, pcrfd). The shipped configs used to carry one anyway (docker `5gc` amf/pcf/smf/upf, `epc` mme/hss/pcrf/pgwc/pgwu, and the k8s and Helm ConfigMaps). A key that is documented but has no effect is misleading, so the blocks were removed rather than wired up: a daemon's metrics listener is set by its environment variable, `MME_METRICS_ADDR`, `NEXTGCORE_METRICS_BIND` (loopback by default, #1308), `SMF_METRICS_PORT`, `AMF_METRICS_PORT`, `NRF_METRICS_PORT`, `PCF_METRICS_PORT`, `AUSF_METRICS_PORT`, `UDM_METRICS_PORT`, `UDR_METRICS_PORT`, `BSF_METRICS_PORT`, `NSSF_METRICS_PORT`, `UPF_METRICS_PORT`, `SGWC_METRICS_PORT`, `SGWU_METRICS_PORT` or `UCMF_METRICS_ADDR`, and nothing else.
+No daemon reads a `metrics.server` block, and several have no metrics listener at all (hssd, pcrfd). The shipped configs used to carry one anyway (docker `5gc` amf/pcf/smf/upf, `epc` mme/hss/pcrf/pgwc/pgwu, and the k8s and Helm ConfigMaps). A key that is documented but has no effect is misleading, so the blocks were removed rather than wired up: a daemon's metrics listener is set by its environment variable, `MME_METRICS_ADDR`, `NEXTGCORE_METRICS_BIND` (loopback by default, #1308), `SMF_METRICS_PORT`, `AMF_METRICS_PORT`, `NRF_METRICS_PORT`, `PCF_METRICS_PORT`, `AUSF_METRICS_PORT`, `UDM_METRICS_PORT`, `UDR_METRICS_PORT`, `BSF_METRICS_PORT`, `NSSF_METRICS_PORT`, `UPF_METRICS_PORT`, `SGWC_METRICS_PORT`, `SGWU_METRICS_PORT`, `TSCTSF_METRICS_PORT`, `MBSMF_METRICS_PORT` (#1817) or `UCMF_METRICS_ADDR`, and nothing else.
 
 ### MongoDB exporter (#1369)
 

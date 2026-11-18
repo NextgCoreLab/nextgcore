@@ -624,6 +624,42 @@ mod tests {
         .await;
     }
 
+    /// #1817: an AMF that comes back AFTER the retry budget still gets the delete.
+    /// Every fast retry is refused, the record is parked, a reconcile pass that is
+    /// still refused keeps it, and the next pass delivers it.
+    ///
+    /// REVERT-VERIFIED: with `reconcile::park(failed)` removed from the retry task,
+    /// nothing is parked and the "parked after the budget" wait times out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_amf_back_after_the_retry_budget_still_gets_the_delete_1817() {
+        use std::sync::atomic::Ordering;
+        let _g = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        crate::reconcile::clear_for_test();
+        let budget = crate::AMF_RELEASE_RETRY_DELAYS.len() + 1;
+        // The first attempt, every retry, and one reconcile pass are refused.
+        let refusals = vec![503u16; budget + 1];
+        let (_server, context, deletes, _arrived, _release) = scripted_amf(false, &refusals).await;
+        let before = crate::reconcile::RECONCILED.get(&["deleted"]);
+        assert!(!crate::release_amf_contexts(vec![context.clone()]).await);
+        eventually("the record is parked after the budget", || {
+            crate::reconcile::pending_count() == 1
+        })
+        .await;
+        assert_eq!(deletes.load(Ordering::SeqCst), budget);
+
+        assert_eq!(crate::reconcile::reconcile_once().await, 0, "still refused");
+        assert_eq!(crate::reconcile::pending_count(), 1, "kept, not dropped");
+
+        assert_eq!(
+            crate::reconcile::reconcile_once().await,
+            1,
+            "the AMF accepts"
+        );
+        assert_eq!(deletes.load(Ordering::SeqCst), budget + 2);
+        assert_eq!(crate::reconcile::pending_count(), 0);
+        assert_eq!(crate::reconcile::RECONCILED.get(&["deleted"]), before + 1);
+    }
+
     /// #1758 (check 3): a session release whose consumer disconnects while the AMF
     /// holds its ContextDelete still releases the context: the refused delete is
     /// retried on its own task.
