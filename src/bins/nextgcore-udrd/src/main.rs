@@ -246,7 +246,14 @@ fn handle_group_id_map(parts: &[&str], method: &str, request: &SbiRequest) -> Sb
                     else {
                         return missing_mandatory("callbackReference");
                     };
-                    let sub = ds.sub_create(SubKind::GroupIdMap, uri, body.clone());
+                    let owner = match nextgcore_udrd::owner_binding::owner_for_new_resource(
+                        request,
+                        "Subscribe",
+                    ) {
+                        Ok(owner) => owner,
+                        Err(refused) => return *refused,
+                    };
+                    let sub = ds.sub_create_owned(SubKind::GroupIdMap, uri, body.clone(), owner);
                     SbiResponse::with_status(201)
                         .with_header(
                             "Location",
@@ -257,11 +264,13 @@ fn handle_group_id_map(parts: &[&str], method: &str, request: &SbiRequest) -> Sb
                         )
                         .with_body(body.to_string(), "application/json")
                 }
-                (false, "GET") => match ds.sub_get(subs_id) {
-                    Some(sub) if sub.kind == SubKind::GroupIdMap => SbiResponse::with_status(200)
-                        .with_body(sub.body.to_string(), "application/json"),
-                    _ => send_not_found("Subscription not found", Some("DATA_NOT_FOUND")),
-                },
+                (false, "GET") => {
+                    match sub_for_caller(subs_id, SubKind::GroupIdMap, request, "Get") {
+                        Ok(sub) => SbiResponse::with_status(200)
+                            .with_body(sub.body.to_string(), "application/json"),
+                        Err(refused) => *refused,
+                    }
+                }
                 (false, "PUT") => {
                     let body = match parse_json_body(request) {
                         Ok(v) => v,
@@ -274,6 +283,11 @@ fn handle_group_id_map(parts: &[&str], method: &str, request: &SbiRequest) -> Sb
                     else {
                         return missing_mandatory("callbackReference");
                     };
+                    if let Err(refused) =
+                        sub_for_caller(subs_id, SubKind::GroupIdMap, request, "Modify")
+                    {
+                        return *refused;
+                    }
                     if ds.sub_replace(subs_id, SubKind::GroupIdMap, uri, body.clone()) {
                         SbiResponse::with_status(200)
                             .with_body(body.to_string(), "application/json")
@@ -282,11 +296,13 @@ fn handle_group_id_map(parts: &[&str], method: &str, request: &SbiRequest) -> Sb
                     }
                 }
                 (false, "DELETE") => {
-                    if ds.sub_remove(subs_id).is_some() {
-                        SbiResponse::with_status(204)
-                    } else {
-                        send_not_found("Subscription not found", Some("DATA_NOT_FOUND"))
+                    if let Err(refused) =
+                        sub_for_caller(subs_id, SubKind::GroupIdMap, request, "Unsubscribe")
+                    {
+                        return *refused;
                     }
+                    ds.sub_remove(subs_id);
+                    SbiResponse::with_status(204)
                 }
                 _ => send_method_not_allowed(method, "nf-group-ids/subscriptions"),
             }
@@ -691,6 +707,33 @@ async fn udr_sbi_route(request: SbiRequest) -> SbiResponse {
 }
 
 /// 400 ProblemDetails for a missing mandatory attribute.
+/// #1861 (TS 29.504 §5.2, TS 29.519 §5.2, TS 33.501 §13.4.1): the
+/// subscription `id` of `kind`, if the caller may act on it. `404` when there is
+/// none of that kind (a PolicyData id is not reachable through the exposure-data
+/// path), `403` when it belongs to another NF. Checked before the body is used,
+/// so a refusal changes nothing.
+fn sub_for_caller(
+    id: &str,
+    kind: SubKind,
+    request: &SbiRequest,
+    operation: &str,
+) -> Result<data_store::StoredSub, Box<SbiResponse>> {
+    let sub = data_store::store()
+        .sub_get(id)
+        .filter(|s| s.kind == kind)
+        .ok_or_else(|| {
+            Box::new(send_not_found(
+                "Subscription not found",
+                Some("DATA_NOT_FOUND"),
+            ))
+        })?;
+    match nextgcore_udrd::owner_binding::refuse_non_owner(sub.owner.as_deref(), request, operation)
+    {
+        Some(refused) => Err(Box::new(refused)),
+        None => Ok(sub),
+    }
+}
+
 fn missing_mandatory(attr: &str) -> SbiResponse {
     send_error(
         400,
@@ -2782,7 +2825,12 @@ fn handle_policy_subs_to_notify(parts: &[&str], method: &str, request: &SbiReque
             {
                 return missing_mandatory("monitoredResourceUris");
             }
-            let sub = ds.sub_create(SubKind::PolicyData, uri, body.clone());
+            let owner =
+                match nextgcore_udrd::owner_binding::owner_for_new_resource(request, "Subscribe") {
+                    Ok(owner) => owner,
+                    Err(refused) => return *refused,
+                };
+            let sub = ds.sub_create_owned(SubKind::PolicyData, uri, body.clone(), owner);
             SbiResponse::with_status(201)
                 .with_header(
                     "Location",
@@ -2790,11 +2838,11 @@ fn handle_policy_subs_to_notify(parts: &[&str], method: &str, request: &SbiReque
                 )
                 .with_body(body.to_string(), "application/json")
         }
-        (false, "GET") => match ds.sub_get(subs_id) {
-            Some(sub) if sub.kind == SubKind::PolicyData => {
+        (false, "GET") => match sub_for_caller(subs_id, SubKind::PolicyData, request, "Get") {
+            Ok(sub) => {
                 SbiResponse::with_status(200).with_body(sub.body.to_string(), "application/json")
             }
-            _ => send_not_found("Subscription not found", Some("DATA_NOT_FOUND")),
+            Err(refused) => *refused,
         },
         (false, "PUT") => {
             let body = match parse_json_body(request) {
@@ -2804,6 +2852,9 @@ fn handle_policy_subs_to_notify(parts: &[&str], method: &str, request: &SbiReque
             let Some(uri) = body.get("notificationUri").and_then(|v| v.as_str()) else {
                 return missing_mandatory("notificationUri");
             };
+            if let Err(refused) = sub_for_caller(subs_id, SubKind::PolicyData, request, "Modify") {
+                return *refused;
+            }
             if ds.sub_replace(subs_id, SubKind::PolicyData, uri, body.clone()) {
                 SbiResponse::with_status(200).with_body(body.to_string(), "application/json")
             } else {
@@ -2811,11 +2862,13 @@ fn handle_policy_subs_to_notify(parts: &[&str], method: &str, request: &SbiReque
             }
         }
         (false, "DELETE") => {
-            if ds.sub_remove(subs_id).is_some() {
-                SbiResponse::with_status(204)
-            } else {
-                send_not_found("Subscription not found", Some("DATA_NOT_FOUND"))
+            if let Err(refused) =
+                sub_for_caller(subs_id, SubKind::PolicyData, request, "Unsubscribe")
+            {
+                return *refused;
             }
+            ds.sub_remove(subs_id);
+            SbiResponse::with_status(204)
         }
         _ => send_method_not_allowed(method, "policy-data/subs-to-notify"),
     }
@@ -3110,7 +3163,19 @@ async fn handle_subscription_data_subs(
                 }
                 let cb = cb.to_string();
                 let mut stored_body = body;
-                let sub = ds.sub_create(SubKind::SubscriptionData, &cb, serde_json::Value::Null);
+                let owner = match nextgcore_udrd::owner_binding::owner_for_new_resource(
+                    request,
+                    "Subscribe",
+                ) {
+                    Ok(owner) => owner,
+                    Err(refused) => return *refused,
+                };
+                let sub = ds.sub_create_owned(
+                    SubKind::SubscriptionData,
+                    &cb,
+                    serde_json::Value::Null,
+                    owner,
+                );
                 if let Some(obj) = stored_body.as_object_mut() {
                     obj.insert(
                         "subscriptionId".to_string(),
@@ -3135,8 +3200,15 @@ async fn handle_subscription_data_subs(
                         Some("MANDATORY_QUERY_PARAM_MISSING"),
                     );
                 };
+                // #1861: the caller's own subscriptions only; another NF's
+                // callbackReference is not this caller's to read.
                 let subs = ds.subs_matching(SubKind::SubscriptionData, |s| {
                     s.body.get("ueId").and_then(|v| v.as_str()) == Some(ue_id.as_str())
+                        && nextgcore_udrd::owner_binding::non_owner_refusal(
+                            s.owner.as_deref(),
+                            request,
+                        )
+                        .is_none()
                 });
                 let list: Vec<serde_json::Value> = subs.into_iter().map(|s| s.body).collect();
                 SbiResponse::with_status(200).with_body(
@@ -3151,25 +3223,35 @@ async fn handle_subscription_data_subs(
                         Some("MANDATORY_QUERY_PARAM_MISSING"),
                     );
                 };
-                ds.subs_remove_by_ue(&ue_id);
+                // #1861: removes the caller's own subscriptions for the UE, not
+                // every NF's.
+                for sub in ds.subs_matching(SubKind::SubscriptionData, |s| {
+                    s.body.get("ueId").and_then(|v| v.as_str()) == Some(ue_id.as_str())
+                        && nextgcore_udrd::owner_binding::non_owner_refusal(
+                            s.owner.as_deref(),
+                            request,
+                        )
+                        .is_none()
+                }) {
+                    ds.sub_remove(&sub.id);
+                }
                 SbiResponse::with_status(204)
             }
             _ => send_method_not_allowed(method, "subscription-data/subs-to-notify"),
         },
         // Document: /subscription-data/subs-to-notify/{subsId}
         Some(subs_id) => match method {
-            "GET" => match ds.sub_get(subs_id) {
-                Some(sub) if sub.kind == SubKind::SubscriptionData => SbiResponse::with_status(200)
+            "GET" => match sub_for_caller(subs_id, SubKind::SubscriptionData, request, "Get") {
+                Ok(sub) => SbiResponse::with_status(200)
                     .with_body(sub.body.to_string(), "application/json"),
-                _ => send_not_found("Subscription not found", Some("DATA_NOT_FOUND")),
+                Err(refused) => *refused,
             },
             "PATCH" => {
-                let Some(sub) = ds.sub_get(subs_id) else {
-                    return send_not_found("Subscription not found", Some("DATA_NOT_FOUND"));
-                };
-                if sub.kind != SubKind::SubscriptionData {
-                    return send_not_found("Subscription not found", Some("DATA_NOT_FOUND"));
-                }
+                let sub =
+                    match sub_for_caller(subs_id, SubKind::SubscriptionData, request, "Modify") {
+                        Ok(sub) => sub,
+                        Err(refused) => return *refused,
+                    };
                 let patch_body = match parse_json_body(request) {
                     Ok(v) => v,
                     Err(resp) => return *resp,
@@ -3203,11 +3285,13 @@ async fn handle_subscription_data_subs(
                 SbiResponse::with_status(204)
             }
             "DELETE" => {
-                if ds.sub_remove(subs_id).is_some() {
-                    SbiResponse::with_status(204)
-                } else {
-                    send_not_found("Subscription not found", Some("DATA_NOT_FOUND"))
+                if let Err(refused) =
+                    sub_for_caller(subs_id, SubKind::SubscriptionData, request, "Unsubscribe")
+                {
+                    return *refused;
                 }
+                ds.sub_remove(subs_id);
+                SbiResponse::with_status(204)
             }
             _ => send_method_not_allowed(method, "subscription-data/subs-to-notify/{subsId}"),
         },
@@ -3615,7 +3699,14 @@ async fn handle_exposure_data(parts: &[&str], method: &str, request: &SbiRequest
                 {
                     return missing_mandatory("monitoredResourceUris");
                 }
-                let sub = ds.sub_create(SubKind::ExposureData, uri, body.clone());
+                let owner = match nextgcore_udrd::owner_binding::owner_for_new_resource(
+                    request,
+                    "Subscribe",
+                ) {
+                    Ok(owner) => owner,
+                    Err(refused) => return *refused,
+                };
+                let sub = ds.sub_create_owned(SubKind::ExposureData, uri, body.clone(), owner);
                 SbiResponse::with_status(201)
                     .with_header(
                         "Location",
@@ -3631,6 +3722,11 @@ async fn handle_exposure_data(parts: &[&str], method: &str, request: &SbiRequest
                 let Some(uri) = body.get("notificationUri").and_then(|v| v.as_str()) else {
                     return missing_mandatory("notificationUri");
                 };
+                if let Err(refused) =
+                    sub_for_caller(sub_id, SubKind::ExposureData, request, "Modify")
+                {
+                    return *refused;
+                }
                 if ds.sub_replace(sub_id, SubKind::ExposureData, uri, body.clone()) {
                     SbiResponse::with_status(200).with_body(body.to_string(), "application/json")
                 } else {
@@ -3638,11 +3734,13 @@ async fn handle_exposure_data(parts: &[&str], method: &str, request: &SbiRequest
                 }
             }
             (Some(sub_id), "DELETE") => {
-                if ds.sub_remove(sub_id).is_some() {
-                    SbiResponse::with_status(204)
-                } else {
-                    send_not_found("Subscription not found", Some("DATA_NOT_FOUND"))
+                if let Err(refused) =
+                    sub_for_caller(sub_id, SubKind::ExposureData, request, "Unsubscribe")
+                {
+                    return *refused;
                 }
+                ds.sub_remove(sub_id);
+                SbiResponse::with_status(204)
             }
             _ => send_method_not_allowed(method, "exposure-data/subs-to-notify"),
         };
@@ -3887,7 +3985,14 @@ async fn handle_application_data(
                     {
                         return missing_mandatory("dnns|snssais|internalGroupIds|supis");
                     }
-                    let sub = ds.sub_create(SubKind::AppInfluence, uri, body.clone());
+                    let owner = match nextgcore_udrd::owner_binding::owner_for_new_resource(
+                        request,
+                        "Subscribe",
+                    ) {
+                        Ok(owner) => owner,
+                        Err(refused) => return *refused,
+                    };
+                    let sub = ds.sub_create_owned(SubKind::AppInfluence, uri, body.clone(), owner);
                     SbiResponse::with_status(201)
                         .with_header(
                             "Location",
@@ -3899,18 +4004,27 @@ async fn handle_application_data(
                         .with_body(body.to_string(), "application/json")
                 }
                 (None, "GET") => {
-                    let subs = ds.subs_matching(SubKind::AppInfluence, |_| true);
+                    // #1861: the caller's own subscriptions only.
+                    let subs = ds.subs_matching(SubKind::AppInfluence, |s| {
+                        nextgcore_udrd::owner_binding::non_owner_refusal(
+                            s.owner.as_deref(),
+                            request,
+                        )
+                        .is_none()
+                    });
                     let list: Vec<serde_json::Value> = subs.into_iter().map(|s| s.body).collect();
                     SbiResponse::with_status(200).with_body(
                         serde_json::Value::Array(list).to_string(),
                         "application/json",
                     )
                 }
-                (Some(sub_id), "GET") => match ds.sub_get(sub_id) {
-                    Some(sub) if sub.kind == SubKind::AppInfluence => SbiResponse::with_status(200)
-                        .with_body(sub.body.to_string(), "application/json"),
-                    _ => send_not_found("Subscription not found", Some("DATA_NOT_FOUND")),
-                },
+                (Some(sub_id), "GET") => {
+                    match sub_for_caller(sub_id, SubKind::AppInfluence, request, "Get") {
+                        Ok(sub) => SbiResponse::with_status(200)
+                            .with_body(sub.body.to_string(), "application/json"),
+                        Err(refused) => *refused,
+                    }
+                }
                 (Some(sub_id), "PUT") => {
                     let body = match parse_json_body(request) {
                         Ok(v) => v,
@@ -3919,6 +4033,11 @@ async fn handle_application_data(
                     let Some(uri) = body.get("notificationUri").and_then(|v| v.as_str()) else {
                         return missing_mandatory("notificationUri");
                     };
+                    if let Err(refused) =
+                        sub_for_caller(sub_id, SubKind::AppInfluence, request, "Modify")
+                    {
+                        return *refused;
+                    }
                     if ds.sub_replace(sub_id, SubKind::AppInfluence, uri, body.clone()) {
                         SbiResponse::with_status(200)
                             .with_body(body.to_string(), "application/json")
@@ -3927,11 +4046,13 @@ async fn handle_application_data(
                     }
                 }
                 (Some(sub_id), "DELETE") => {
-                    if ds.sub_remove(sub_id).is_some() {
-                        SbiResponse::with_status(204)
-                    } else {
-                        send_not_found("Subscription not found", Some("DATA_NOT_FOUND"))
+                    if let Err(refused) =
+                        sub_for_caller(sub_id, SubKind::AppInfluence, request, "Unsubscribe")
+                    {
+                        return *refused;
                     }
+                    ds.sub_remove(sub_id);
+                    SbiResponse::with_status(204)
                 }
                 _ => send_method_not_allowed(method, "influenceData/subs-to-notify"),
             },
@@ -4007,7 +4128,14 @@ async fn handle_application_data(
                 let Some(uri) = body.get("notificationUri").and_then(|v| v.as_str()) else {
                     return missing_mandatory("notificationUri");
                 };
-                let sub = ds.sub_create(SubKind::AppData, uri, body.clone());
+                let owner = match nextgcore_udrd::owner_binding::owner_for_new_resource(
+                    request,
+                    "Subscribe",
+                ) {
+                    Ok(owner) => owner,
+                    Err(refused) => return *refused,
+                };
+                let sub = ds.sub_create_owned(SubKind::AppData, uri, body.clone(), owner);
                 SbiResponse::with_status(201)
                     .with_header(
                         "Location",
@@ -4023,6 +4151,9 @@ async fn handle_application_data(
                 let Some(uri) = body.get("notificationUri").and_then(|v| v.as_str()) else {
                     return missing_mandatory("notificationUri");
                 };
+                if let Err(refused) = sub_for_caller(sub_id, SubKind::AppData, request, "Modify") {
+                    return *refused;
+                }
                 if ds.sub_replace(sub_id, SubKind::AppData, uri, body.clone()) {
                     SbiResponse::with_status(200).with_body(body.to_string(), "application/json")
                 } else {
@@ -4030,11 +4161,13 @@ async fn handle_application_data(
                 }
             }
             (Some(sub_id), "DELETE") => {
-                if ds.sub_remove(sub_id).is_some() {
-                    SbiResponse::with_status(204)
-                } else {
-                    send_not_found("Subscription not found", Some("DATA_NOT_FOUND"))
+                if let Err(refused) =
+                    sub_for_caller(sub_id, SubKind::AppData, request, "Unsubscribe")
+                {
+                    return *refused;
                 }
+                ds.sub_remove(sub_id);
+                SbiResponse::with_status(204)
             }
             _ => send_method_not_allowed(method, "application-data/subs-to-notify"),
         },
@@ -4692,6 +4825,234 @@ fn parse_nrf_host_port(uri: &str) -> Option<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PCF_A_1861: &str = "aaaaaaaa-1861-4000-8000-00000000000a";
+    const PCF_B_1861: &str = "bbbbbbbb-1861-4000-8000-00000000000b";
+
+    fn as_nf_1861(
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+        who: Option<&str>,
+    ) -> SbiRequest {
+        let mut r = SbiRequest {
+            header: nextgcore_sbi::message::SbiHeader::with_method_uri(method, uri),
+            ..SbiRequest::default()
+        };
+        if let Some(b) = body {
+            r.http.set_content(b.to_string());
+            r.http.set_header("Content-Type", "application/json");
+        }
+        r.oauth2_subject = who.map(str::to_string);
+        r
+    }
+
+    /// #1861, TS 29.504 §5.2 / TS 29.519 §5.2 / TS 33.501 §13.4.1: every
+    /// subs-to-notify tree binds a subscription to the verified identity that
+    /// created it. Another NF, or an anonymous caller, is refused 403 on read,
+    /// modify and delete with the subscription unchanged; the owner manages it;
+    /// and the id is not the next integer.
+    #[tokio::test]
+    async fn a_subscription_is_managed_by_its_creator_only_1861() {
+        let ue = "imsi-001010000001861";
+        let cb = "http://pcf-a.example/cb";
+        let evil = "http://evil.example/cb";
+        // (collection, create body, PUT/PATCH method, modify body, GET doc served)
+        let trees: Vec<(&str, serde_json::Value, &str, serde_json::Value, bool)> = vec![
+            (
+                "/nudr-dr/v2/policy-data/subs-to-notify",
+                json!({"notificationUri": cb, "monitoredResourceUris": ["/x"]}),
+                "PUT",
+                json!({"notificationUri": evil, "monitoredResourceUris": ["/x"]}),
+                true,
+            ),
+            (
+                "/nudr-dr/v2/subscription-data/subs-to-notify",
+                json!({"ueId": ue, "callbackReference": cb, "monitoredResourceUris": ["/y"]}),
+                "PATCH",
+                json!([{"op": "replace", "path": "/callbackReference", "value": evil}]),
+                true,
+            ),
+            (
+                "/nudr-dr/v2/exposure-data/subs-to-notify",
+                json!({"notificationUri": cb, "monitoredResourceUris": ["/z"]}),
+                "PUT",
+                json!({"notificationUri": evil, "monitoredResourceUris": ["/z"]}),
+                false,
+            ),
+            (
+                "/nudr-dr/v2/application-data/subs-to-notify",
+                json!({"notificationUri": cb}),
+                "PUT",
+                json!({"notificationUri": evil}),
+                false,
+            ),
+            (
+                "/nudr-dr/v2/application-data/influenceData/subs-to-notify",
+                json!({"notificationUri": cb, "dnns": ["internet"]}),
+                "PUT",
+                json!({"notificationUri": evil, "dnns": ["internet"]}),
+                true,
+            ),
+            (
+                "/nudr-group-id-map/v1/nf-group-ids/subscriptions",
+                json!({"callbackReference": cb}),
+                "PUT",
+                json!({"callbackReference": evil}),
+                true,
+            ),
+        ];
+        let ds = data_store::store();
+        for (collection, create, modify_method, modify, has_get) in trees {
+            let resp = udr_sbi_route(as_nf_1861(
+                "POST",
+                collection,
+                Some(create),
+                Some(PCF_A_1861),
+            ))
+            .await;
+            assert_eq!(resp.status, 201, "{collection}: {:?}", resp.http.content);
+            let location = resp.http.get_header("Location").expect("Location").clone();
+            let id = location.rsplit('/').next().unwrap().to_string();
+            assert!(
+                id.len() == 32 && id.parse::<u64>().is_err(),
+                "{collection}: {id}"
+            );
+            assert_eq!(
+                ds.sub_get(&id).and_then(|s| s.owner).as_deref(),
+                Some(PCF_A_1861)
+            );
+            let doc = format!("{collection}/{id}");
+
+            for who in [Some(PCF_B_1861), None] {
+                let mut ops = vec![(modify_method, Some(modify.clone())), ("DELETE", None)];
+                if has_get {
+                    ops.push(("GET", None));
+                }
+                for (method, body) in ops {
+                    let resp = udr_sbi_route(as_nf_1861(method, &doc, body, who)).await;
+                    assert_eq!(resp.status, 403, "{who:?} {method} {doc}");
+                    let pd: serde_json::Value =
+                        serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap();
+                    assert!(
+                        pd["detail"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .contains(&format!("belongs to NF instance {PCF_A_1861}")),
+                        "{who:?} {method} {doc}: {pd}"
+                    );
+                }
+                let sub = ds.sub_get(&id).expect("a refused request removes nothing");
+                assert_eq!(sub.notify_uri, cb, "a refused request redirects nothing");
+            }
+
+            // The owner modifies and then removes it.
+            let resp = udr_sbi_route(as_nf_1861(
+                modify_method,
+                &doc,
+                Some(modify),
+                Some(PCF_A_1861),
+            ))
+            .await;
+            assert!(matches!(resp.status, 200 | 204), "{doc}: {}", resp.status);
+            assert_eq!(ds.sub_get(&id).unwrap().notify_uri, evil);
+            let resp = udr_sbi_route(as_nf_1861("DELETE", &doc, None, Some(PCF_A_1861))).await;
+            assert_eq!(resp.status, 204, "{doc}");
+            assert!(ds.sub_get(&id).is_none());
+        }
+    }
+
+    /// #1861: the ue-id collection operations of subscription-data subs-to-notify
+    /// see and remove the caller's own subscriptions only, and an id of another
+    /// kind is not reachable through a different tree.
+    #[tokio::test]
+    async fn collection_operations_and_other_trees_respect_the_owner_1861() {
+        let ue = "imsi-001010000011861";
+        let coll = "/nudr-dr/v2/subscription-data/subs-to-notify";
+        let create = |cb: &str| json!({"ueId": ue, "callbackReference": cb, "monitoredResourceUris": ["/y"]});
+        let ds = data_store::store();
+        let a = udr_sbi_route(as_nf_1861(
+            "POST",
+            coll,
+            Some(create("http://a/cb")),
+            Some(PCF_A_1861),
+        ))
+        .await;
+        assert_eq!(a.status, 201);
+        let a_id = a
+            .http
+            .get_header("Location")
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string();
+
+        let mut req = as_nf_1861("GET", coll, None, Some(PCF_B_1861));
+        req.http.params.insert("ue-id".to_string(), ue.to_string());
+        let listed = udr_sbi_route(req).await;
+        assert_eq!(listed.status, 200);
+        assert_eq!(
+            listed.http.content.as_deref(),
+            Some("[]"),
+            "B sees none of A's"
+        );
+
+        let mut req = as_nf_1861("DELETE", coll, None, Some(PCF_B_1861));
+        req.http.params.insert("ue-id".to_string(), ue.to_string());
+        assert_eq!(udr_sbi_route(req).await.status, 204);
+        assert!(
+            ds.sub_get(&a_id).is_some(),
+            "B's bulk delete left A's subscription"
+        );
+
+        let mut req = as_nf_1861("GET", coll, None, Some(PCF_A_1861));
+        req.http.params.insert("ue-id".to_string(), ue.to_string());
+        let listed = udr_sbi_route(req).await;
+        assert!(listed
+            .http
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .contains(&a_id));
+
+        // A SubscriptionData id through the exposure-data tree: 404, still there.
+        let resp = udr_sbi_route(as_nf_1861(
+            "DELETE",
+            &format!("/nudr-dr/v2/exposure-data/subs-to-notify/{a_id}"),
+            None,
+            Some(PCF_A_1861),
+        ))
+        .await;
+        assert_eq!(resp.status, 404);
+        assert!(ds.sub_get(&a_id).is_some());
+
+        let mut req = as_nf_1861("DELETE", coll, None, Some(PCF_A_1861));
+        req.http.params.insert("ue-id".to_string(), ue.to_string());
+        assert_eq!(udr_sbi_route(req).await.status, 204);
+        assert!(
+            ds.sub_get(&a_id).is_none(),
+            "the owner's bulk delete removed it"
+        );
+    }
+
+    /// #1861: a caller whose token and certificate disagree subscribes nothing.
+    #[tokio::test]
+    async fn a_subscribe_with_disagreeing_identities_creates_nothing_1861() {
+        let cb = "http://disagree-1861.example/cb";
+        let mut req = as_nf_1861(
+            "POST",
+            "/nudr-dr/v2/policy-data/subs-to-notify",
+            Some(json!({"notificationUri": cb, "monitoredResourceUris": ["/x"]})),
+            Some(PCF_A_1861),
+        );
+        req.peer_cert_nf_instance_id = Some(PCF_B_1861.to_string());
+        let resp = udr_sbi_route(req).await;
+        assert_eq!(resp.status, 403);
+        assert!(data_store::store()
+            .subs_matching(SubKind::PolicyData, |s| s.notify_uri == cb)
+            .is_empty());
+    }
 
     #[test]
     fn pct_decode_never_panics_on_a_multi_byte_character() {
@@ -8364,6 +8725,7 @@ udr:
                         kind: SubKind::SubscriptionData,
                         notify_uri: String::new(),
                         body: serde_json::Value::Null,
+                        owner: None,
                     },
                 )
             })

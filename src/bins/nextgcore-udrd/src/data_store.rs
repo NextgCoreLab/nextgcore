@@ -76,6 +76,11 @@ pub struct StoredSub {
     pub notify_uri: String,
     /// Full subscription document as received
     pub body: Value,
+    /// #1861: the verified NF Instance ID of the consumer that created it, the
+    /// only one that may read, modify or remove it (TS 29.504 §5.2, TS 33.501
+    /// §13.4.1). `None` when it was created with no verified identity (the `dev`
+    /// profile) or restored from a state file written before #1861.
+    pub owner: Option<String>,
 }
 
 /// In-memory UDR data store for non-subscriber-DB resource trees.
@@ -212,6 +217,7 @@ impl UdrDataStore {
                     "kind": s.kind.as_tag(),
                     "notify_uri": s.notify_uri,
                     "body": s.body,
+                    "owner": s.owner,
                 })
             })
             .collect();
@@ -388,6 +394,7 @@ impl UdrDataStore {
                             kind,
                             notify_uri: uri.to_string(),
                             body: s.get("body").cloned().unwrap_or(Value::Null),
+                            owner: s.get("owner").and_then(Value::as_str).map(str::to_string),
                         },
                     );
                 }
@@ -842,14 +849,31 @@ impl UdrDataStore {
 
     // -- subscriptions -----------------------------------------------------
 
-    /// Create a subscription; returns the stored record with allocated id.
+    /// Create an ownerless subscription; see [`Self::sub_create_owned`].
     pub fn sub_create(&self, kind: SubKind, notify_uri: &str, body: Value) -> StoredSub {
-        let id = format!("{}", self.next_sub_id.fetch_add(1, Ordering::SeqCst) + 1);
+        self.sub_create_owned(kind, notify_uri, body, None)
+    }
+
+    /// Create a subscription bound to `owner`; returns the stored record.
+    ///
+    /// #1861: the id is 128 random bits, not the next integer, so holding one
+    /// subscription's id tells a peer nothing about another's.
+    pub fn sub_create_owned(
+        &self,
+        kind: SubKind,
+        notify_uri: &str,
+        body: Value,
+        owner: Option<String>,
+    ) -> StoredSub {
+        // Still counted, so a state file keeps the field older builds read.
+        self.next_sub_id.fetch_add(1, Ordering::SeqCst);
+        let id = crate::owner_binding::unguessable_id();
         let sub = StoredSub {
             id: id.clone(),
             kind,
             notify_uri: notify_uri.to_string(),
             body,
+            owner,
         };
         self.subs.write().expect("lock").insert(id, sub.clone());
         self.persist();
@@ -2029,6 +2053,7 @@ mod tests {
             kind: SubKind::SubscriptionData,
             notify_uri: "http://udm:1/cb".to_string(),
             body: json!({"callbackReference": "http://udm:1/cb"}),
+            owner: None,
         };
         let supi = "imsi-001010000017758";
         let old = json!({"gpsis": ["msisdn-1"], "x": {"encPermanentKey": "k-old"}});
@@ -2061,6 +2086,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         // First lifetime: populate every tree, then drop the store.
+        let sub_id;
         {
             let s = UdrDataStore::with_state_path(&path);
             assert!(s.amf_3gpp_put("imsi-1", json!({"amfInstanceId": "amf-x"})));
@@ -2073,7 +2099,8 @@ mod tests {
                 "http://cb:1/x",
                 json!({"monitoredResourceUris": ["/a"]}),
             );
-            assert_eq!(sub.id, "1");
+            assert_eq!(sub.id.len(), 32, "#1861: an unguessable id");
+            sub_id = sub.id;
         }
 
         // Second lifetime: a brand-new store re-opened from the same file must
@@ -2094,14 +2121,45 @@ mod tests {
             );
             assert_eq!(s.pfd_get("app-1"), Some(json!({"pfds": []})));
             assert_eq!(s.influence_get("inf-1"), Some(json!({"dnn": "ims"})));
-            let restored = s.sub_get("1").expect("subscription restored");
+            let restored = s.sub_get(&sub_id).expect("subscription restored");
             assert_eq!(restored.kind, SubKind::ExposureData);
             assert_eq!(restored.notify_uri, "http://cb:1/x");
-            // Allocator continues past the restored id (no collision).
+            // A new id never collides with the restored one.
             let next = s.sub_create(SubKind::AppData, "http://cb:2/y", json!({}));
-            assert_eq!(next.id, "2");
+            assert_ne!(next.id, sub_id);
         }
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #1861: a subscription's verified owner survives a restart; a state file
+    /// written before #1861 (no `owner`) restores it ownerless.
+    #[test]
+    fn the_subscription_owner_survives_a_restart_1861() {
+        let path = temp_state_path("owner-1861");
+        let _ = std::fs::remove_file(&path);
+        let owner = "aaaaaaaa-1861-4000-8000-00000000000a";
+        let id = {
+            let s = UdrDataStore::with_state_path(&path);
+            s.sub_create_owned(
+                SubKind::PolicyData,
+                "http://cb/x",
+                json!({}),
+                Some(owner.into()),
+            )
+            .id
+        };
+        let s = UdrDataStore::with_state_path(&path);
+        assert_eq!(s.sub_get(&id).and_then(|x| x.owner).as_deref(), Some(owner));
+        drop(s);
+        let mut doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for sub in doc["subs"].as_array_mut().unwrap() {
+            sub.as_object_mut().unwrap().remove("owner");
+        }
+        std::fs::write(&path, doc.to_string()).unwrap();
+        let s = UdrDataStore::with_state_path(&path);
+        assert_eq!(s.sub_get(&id).unwrap().owner, None);
         let _ = std::fs::remove_file(&path);
     }
 
