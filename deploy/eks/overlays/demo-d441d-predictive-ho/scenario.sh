@@ -164,13 +164,20 @@ modules "${D}/modules-before.txt"
 
 "${K[@]}" get configmap nextgsim-configs -o json > "${D}/nextgsim-configs.deployed.json" \
     || die "cannot read nextgsim-configs"
+# The restore copy has no resourceVersion: the deployed one is stale after the
+# first replace, and replaying it conflicts (replace and apply both refuse).
+python3 -I -c 'import json, sys
+cm = json.load(open(sys.argv[1]))
+for k in ("resourceVersion", "uid", "creationTimestamp", "managedFields"):
+    cm["metadata"].pop(k, None)
+json.dump(cm, open(sys.argv[2], "w"))' "${D}/nextgsim-configs.deployed.json" "${D}/nextgsim-configs.restore.json" \
+    || die "cannot stage the restore copy of nextgsim-configs"
 restore_configs() {
     modules "${D}/modules-after.txt"
-    "${K[@]}" replace -f "${D}/nextgsim-configs.deployed.json" >/dev/null 2>&1 \
-        || "${K[@]}" apply -f "${D}/nextgsim-configs.deployed.json" >/dev/null 2>&1 || true
+    "${K[@]}" replace -f "${D}/nextgsim-configs.restore.json" >/dev/null
 }
 # The run leaves the deployed configs as it found them, on every exit path.
-trap restore_configs EXIT
+trap 'restore_configs || say "WARN: cannot restore nextgsim-configs"' EXIT
 
 # --- invalid, conflict: a refused restart of gnb-west ---------------------------
 if [[ "${VARIANT}" == invalid || "${VARIANT}" == conflict ]]; then
@@ -179,23 +186,36 @@ if [[ "${VARIANT}" == invalid || "${VARIANT}" == conflict ]]; then
     d441d_rewrite "${D}/nextgsim-configs.deployed.json" "${S}/nextgsim-configs.json" "${seed}" "${VARIANT}" \
         || die "cannot stage the ${VARIANT} config"
     since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    old="$(pod_of gnb)"
     "${K[@]}" replace -f "${S}/nextgsim-configs.json" >/dev/null || die "cannot replace nextgsim-configs"
     "${K[@]}" rollout restart deployment/gnb >/dev/null
+    # gnb is Recreate: the old pod terminates first (about 30 s), so the newest
+    # pod is the old one until the new one exists. The refused pod never turns
+    # Ready, so rollout status cannot be the wait.
+    west=""
+    for _ in $(seq 1 36); do
+        west="$(pod_of gnb)"
+        [[ -n "${west}" && "${west}" != "${old}" ]] && break
+        sleep 5
+    done
+    [[ -n "${west}" && "${west}" != "${old}" ]] || die "[gnb-west] no new pod within 180 s of the restart"
     if [[ "${VARIANT}" == invalid ]]; then
         re='unknown mode "bogus" for demo "d441d-predictive-ho"'
     else
         re='HandoverDemoConflict: demos d441d-predictive-ho and d446a-agent-conflict both trigger handovers'
     fi
-    sleep 10
-    wait_log "$(pod_of gnb)" gnb "${since}" "${re}" 180 "${S}/gnb-west.log" \
+    wait_log "${west}" gnb "${since}" "${re}" 180 "${S}/gnb-west.log" \
         || fail "[gnb-west] never logged /${re}/ within 180 s"
-    ready="$("${K[@]}" get pod "$(pod_of gnb)" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null)"
+    ready="$("${K[@]}" get pod "${west}" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null)"
     [[ "${ready}" != true ]] || fail "[gnb-west] became Ready with a refused config"
     ! grep -q 'Sent Handover Required' "${S}/gnb-west.log" || fail "[gnb-west] handed a UE over with a refused config"
     say "gnb-west refused the ${VARIANT} config (ready=${ready:-false}); restoring the deployed config"
-    restore_configs
+    restore_configs || fail "cannot restore nextgsim-configs"
     "${K[@]}" rollout restart deployment/gnb >/dev/null
     "${K[@]}" rollout status deployment/gnb --timeout=300s >/dev/null || fail "gnb-west did not come back after the restore"
+    # demo-check's nextg_demo_enabled assertion, from the restored gnb-west (the
+    # deployed mode): the refused pod never served a metric.
+    cli_west "${OUT}/metrics/gnb.prom" demo metrics
     (( fails == 0 )) && echo "D441D ${VARIANT}: every assertion holds"
     (( fails == 0 )); exit
 fi
@@ -263,8 +283,9 @@ for seed in "${SEEDS[@]}"; do
     if [[ "${DEMO_MODE}" == onnx ]]; then
         grep -q 'NWDAF: model verified' "${S}/gnb-west.log" || fail "[gnb-west] onnx without 'NWDAF: model verified'"
     fi
+    # bash 4.2 (the cloud desktop) treats "${header[@]}" of an empty array as unbound under set -u.
     header=(); [[ -s "${rows}" ]] || header=(--header)
-    python3 -I "${score_py}" score --arm "${SCORE_ARM}" --seed "${seed}" "${header[@]}" \
+    python3 -I "${score_py}" score --arm "${SCORE_ARM}" --seed "${seed}" ${header[@]+"${header[@]}"} \
         --west "${S}/gnb-west.log" --east "${S}/gnb-east.log" --amf "${S}/amf.log" \
         --ue "${S}/ue.log" --window-ms "$((EPISODE_S * 1000))" \
         --pingpong-ms "${PINGPONG_MS}" --a3-slack-ms "${A3_SLACK_MS}" | tee -a "${rows}"
