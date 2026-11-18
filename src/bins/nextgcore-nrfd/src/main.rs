@@ -1258,16 +1258,38 @@ fn self_entry_test_lock() -> &'static tokio::sync::Mutex<()> {
 /// otherwise stay REGISTERED and discoverable for the life of the state file,
 /// naming an NRF profile this process does not maintain. Returns whether an
 /// entry was removed.
+///
+/// #1821: the removal is a deregistration like any other, so the subscribers
+/// whose conditions match the entry are told NF_DEREGISTERED (TS 29.510
+/// §5.2.2.6.1), as `handle_nf_deregister` and the no-heartbeat expiry tell
+/// theirs. Before, the entry vanished silently and a subscriber kept it cached.
+/// The subscriptions restored from the same state file are already in the
+/// registry when `main` calls this.
 fn drop_restored_self_entry() -> bool {
-    if nf_manager().get(nrf_instance_id()).is_none() {
+    let Some(profile) = nf_manager().get(nrf_instance_id()) else {
         return false;
-    }
+    };
     match nf_manager().deregister(nrf_instance_id()) {
         Ok(_) => {
             log::info!(
-                "nrfd-187: removed the NRF's own entry {} restored from the state file;                  this configuration does not register the NRF in its own registry",
+                "nrfd-187: removed the NRF's own entry {} restored from the state file; \
+                 this configuration does not register the NRF in its own registry",
                 nrf_instance_id()
             );
+            let server_uri = nrf_self_uri().to_string();
+            tokio::spawn(async move {
+                if let Err(e) = nrf_nnrf_nfm_send_nf_status_notify_all_async(
+                    NotificationEventType::NfDeregistered,
+                    &profile,
+                    &server_uri,
+                )
+                .await
+                {
+                    log::error!(
+                        "Failed to send NF_DEREGISTERED for the NRF's dropped own entry: {e}"
+                    );
+                }
+            });
             true
         }
         Err(e) => {
@@ -13277,5 +13299,106 @@ mod unverified_registrant_tests_1617 {
             "the NRF's own entry is gone"
         );
         assert!(!drop_restored_self_entry(), "nothing left to remove");
+    }
+
+    /// **#1821, TS 29.510 §5.2.2.6.1.** Dropping the restored self entry tells a
+    /// subscriber to that entry NF_DEREGISTERED, over the wire, exactly once: the
+    /// second call finds nothing and sends nothing. Before, the entry vanished
+    /// with no notification.
+    ///
+    /// The subscription names the NRF's own instance, and every test that adds or
+    /// removes that entry holds `self_entry_test_lock`, so no other test's change
+    /// reaches this sink.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_the_restored_self_entry_notifies_nf_deregistered_1821() {
+        use std::sync::Mutex as StdMutex;
+        let _self_entry = self_entry_test_lock().lock().await;
+
+        let received: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::clone(&received);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let subscriber = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), listener);
+        subscriber
+            .start(move |req: SbiRequest| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    if let Some(body) = req.http.content.clone() {
+                        sink.lock().expect("sink lock").push(body);
+                    }
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await
+            .expect("subscriber server starts");
+
+        register_self_with_own_registry();
+        let manager = nf_manager();
+        let sub_id = "nrfd1821-self-entry-sub";
+        manager.add_subscription(nextgcore_nrfd::SubscriptionData {
+            id: sub_id.to_string(),
+            req_nf_type: None,
+            req_nf_instance_id: None,
+            notification_uri: format!("http://127.0.0.1:{}/callback", addr.port()),
+            subscr_cond: Some(nextgcore_nrfd::nnrf_handler::SubscrCond::nf_instance_id(
+                nrf_instance_id(),
+            )),
+            validity_duration: 3600,
+            req_notif_events: None,
+            notif_condition: None,
+        });
+
+        let wait_for = |want: usize| {
+            let received = Arc::clone(&received);
+            async move {
+                for _ in 0..100 {
+                    if received.lock().expect("sink lock").len() >= want {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                received.lock().expect("sink lock").clone()
+            }
+        };
+
+        assert!(drop_restored_self_entry(), "the restored entry is removed");
+        let got = wait_for(1).await;
+        assert_eq!(got.len(), 1, "one notification, got {got:?}");
+        let body: serde_json::Value = serde_json::from_str(&got[0]).expect("JSON");
+        assert_eq!(body["event"], "NF_DEREGISTERED");
+        assert!(
+            body["nfInstanceUri"]
+                .as_str()
+                .is_some_and(|u| u.ends_with(&format!("/nf-instances/{}", nrf_instance_id()))),
+            "it names the NRF's own instance: {body}"
+        );
+
+        assert!(!drop_restored_self_entry(), "nothing left to remove");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            received.lock().expect("sink lock").len(),
+            1,
+            "a second call finds nothing and sends nothing"
+        );
+        manager.remove_subscription(sub_id);
+    }
+
+    /// **#1821.** `main` drops the restored self entry exactly when the NRF does
+    /// not register itself: the `else` of the self-registration choice. A source
+    /// guard, because `main` itself cannot run in a unit test.
+    #[test]
+    fn main_drops_the_restored_self_entry_when_it_does_not_register_itself_1821() {
+        let source = include_str!("main.rs");
+        let main = &source[source.find("async fn main()").expect("main")..];
+        let main = &main[..main.find("\n}\n").expect("its end")];
+        let choice = "    } else if self_registers {\n";
+        let at = main.find(choice).expect("the self-registration choice");
+        let branch = &main[at + choice.len()..];
+        let branch = &branch[..branch.find("\n    }\n").expect("its end")];
+        assert!(
+            branch.trim_end().ends_with(
+                "register_self_with_own_registry();\n    } else {\n        drop_restored_self_entry();"
+            ),
+            "the else branch drops the restored entry: {branch}"
+        );
     }
 }
