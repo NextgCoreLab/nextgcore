@@ -6448,6 +6448,109 @@ mod tests {
         (server, hits)
     }
 
+    /// #1811: the UDM's real 5G AKA (Nudm_UEAU generate-auth-data: the
+    /// authentication-subscription GET, then the SQN PATCH) against a UDR whose
+    /// listener is udrd's: OAuth2 required, audience UDR, and the TS 29.505
+    /// resource scopes enforced by nextgcore-sbi's gate
+    /// (`resource_scope::required_resource_scope`). The UDM asks the NRF for
+    /// `nudr-dr` plus the resource scope each request needs, so the AV is issued;
+    /// with no token client the gate refuses the GET and no AV is issued.
+    ///
+    /// REVERT-VERIFIED: with the client's `request_access_scope` returning the
+    /// service scope alone, the UDR refuses the GET 403 insufficient_scope and the
+    /// tokened generate-auth-data is not 200.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
+    async fn the_aka_passes_a_udr_enforcing_the_auth_subscription_scope_1811() {
+        use nextgcore_sbi::test_support::oauth2 as stand_in;
+        let _udr_env = crate::sbi_path::UDR_ENV_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        nextgcore_core::test_log::init();
+        udm_context_init(64, 64);
+        let sbi_ctx = nextgcore_sbi::context::global_context();
+        for inst in sbi_ctx
+            .find_nf_instances_by_type(nextgcore_sbi::types::NfType::Udr)
+            .await
+        {
+            sbi_ctx.remove_nf_instance(&inst.id).await;
+        }
+
+        let sk = nextgcore_sbi::oauth::generate_es256_key();
+        let (_nrf, nrf_port) = stand_in::token_nrf(sk.clone()).await;
+        let state = Arc::new(UeauUdrState::default());
+        state
+            .patch_status
+            .store(204, std::sync::atomic::Ordering::SeqCst);
+        let (udr_listener, udr_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let mut cfg = NextgcoreSbiServerConfig::new(udr_addr)
+            .with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Udr)
+            .with_oauth2_resource_scopes(nextgcore_sbi::resource_scope::required_resource_scope);
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(stand_in::jwks_for(&sk, stand_in::TEST_NRF_KID));
+        let udr_server = SbiServer::on_listener(cfg, udr_listener);
+        let handler_state = Arc::clone(&state);
+        udr_server
+            .start(move |req: SbiRequest| {
+                let state = Arc::clone(&handler_state);
+                async move { mock_udr_ueau(state, req).await }
+            })
+            .await
+            .expect("gated UDR starts");
+        std::env::set_var("UDR_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("UDR_SBI_PORT", udr_addr.port().to_string());
+
+        let (udm_server, client) = start_real_udm().await;
+        let gen = |supi: &str| {
+            let path = format!("/nudm-ueau/v1/{supi}/security-information/generate-auth-data");
+            let client = &client;
+            async move {
+                client
+                    .post_json(
+                        &path,
+                        &serde_json::json!({
+                            "servingNetworkName": TEST_SNN,
+                            "ausfInstanceId": "ausf-1811"
+                        }),
+                    )
+                    .await
+                    .expect("generate-auth-data")
+            }
+        };
+        let bare = gen("imsi-001010000018111").await;
+        *OAUTH2_CLIENT_TEST_OVERRIDE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
+            stand_in::oauth2_client_for(nrf_port, nextgcore_sbi::types::NfType::Udm),
+        );
+        let tokened = gen("imsi-001010000018112").await;
+        *OAUTH2_CLIENT_TEST_OVERRIDE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        std::env::remove_var("UDR_SBI_ADDR");
+        std::env::remove_var("UDR_SBI_PORT");
+        udm_server.stop().await.expect("stop udm");
+        udr_server.stop().await.expect("stop udr");
+
+        assert_ne!(
+            bare.status, 200,
+            "no token: the UDR's gate refuses the GET: {:?}",
+            bare.http.content
+        );
+        assert_eq!(
+            tokened.status, 200,
+            "the AV is issued past the resource-scope gate: {:?}",
+            tokened.http.content
+        );
+        assert!(
+            json_body(&tokened)["authenticationVector"]["autn"].is_string(),
+            "{:?}",
+            tokened.http.content
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
     async fn test_http_ueau_ausf_pinning_delete_auth_and_sqn_withholding() {
