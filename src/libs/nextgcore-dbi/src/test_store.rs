@@ -24,6 +24,16 @@ use crate::mongoc::{DbiError, DbiResult};
 use crate::subscription::{NextgcoreDbiAuthInfo, NextgcoreDbiAuthProvision};
 use crate::types::{nextgcore_ascii_to_hex, NEXTGCORE_MAX_SQN};
 
+/// Serialises every test that enables, disables or depends on whether this store
+/// is enabled (#1686). Declared beside the store it guards, so every test module of
+/// a crate takes the same lock: udrd's `test_varueid_routing`, which asserts the
+/// no-DB 404, held none while a WSB-6 test had the store enabled, and saw a 500
+/// (an enabled store answers an unprovisioned SUPI differently). Take it before
+/// [`enable`] and hold it until [`disable`]; a test that asserts the store is off
+/// takes it too. A tokio mutex, as the holders are async tests that hold it across
+/// `.await` (sync tests take it with `blocking_lock()`).
+pub static TEST_STORE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// `None` = store disabled (production Mongo path is used).
 static STORE: Mutex<Option<HashMap<String, NextgcoreDbiAuthInfo>>> = Mutex::new(None);
 

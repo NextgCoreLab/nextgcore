@@ -17,6 +17,12 @@
 #                   initContainer copies nr-cli from the UE image (nextgsim's
 #                   Dockerfile.ue-local ships it when binaries/nr-cli is built).
 #                   Without it the pod fails to start, loudly.
+#   nf-tls          the congestion exporter is an AF that registers at the NRF
+#                   over TLS (#1617) with its own certificate, Secret
+#                   nf-tls-gnb-exporter (row gnb-exporter of
+#                   docker/rust/certs/nf-identities.txt: the nf_instance_id
+#                   gnb-config.yaml pins). The gNB runs as root, the files' owner,
+#                   so mode 0440 needs no fsGroup here. nrf.crt names DNS:nrf.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -44,6 +50,14 @@ spec:
           env:
             - name: RUST_LOG
               value: info
+            - name: NEXTGCORE_NRF_TLS_CA
+              value: /etc/nextgcore/certs/ca.crt
+            - name: NEXTGCORE_NRF_TLS_CLIENT_CERT
+              value: /etc/nextgcore/certs/gnb-exporter.crt
+            - name: NEXTGCORE_NRF_TLS_CLIENT_KEY
+              value: /etc/nextgcore/certs/gnb-exporter.key
+            - name: NEXTGCORE_NRF_TLS_SERVER_NAME
+              value: nrf
           resources:
             limits:
               cpu: 1000m
@@ -51,6 +65,13 @@ spec:
             - name: d441a-tools
               mountPath: /opt/d441a
               readOnly: true
+            - name: nf-tls
+              mountPath: /etc/nextgcore/certs
+              readOnly: true
       volumes:
         - name: d441a-tools
           emptyDir: {}
+        - name: nf-tls
+          secret:
+            secretName: nf-tls-gnb-exporter
+            defaultMode: 0440

@@ -974,6 +974,15 @@ pub async fn nsac_pdu_session_admit(
     match resp.status {
         // All requested S-NSSAIs for this PDU session admitted.
         204 => NsacAdmission::Admitted,
+        // #1766: the NSACF's OAuth2 gate refusing our token is not an admission
+        // decision; the NSACF is as good as unavailable.
+        401 | 403 if resp.is_bearer_refusal() => {
+            log::warn!(
+                "NSACF refused the SMF's access token (HTTP {}); treating it as unavailable",
+                resp.status
+            );
+            NsacAdmission::Unavailable
+        }
         // Total failure (ProblemDetails) -> reject with 5GSM cause #69.
         403 => {
             log::info!(
@@ -3344,7 +3353,16 @@ mod tests {
         );
         assert_eq!(op["snssai"]["sst"], 1, "op carries snssai");
 
-        if psi == 99 {
+        if psi == 98 {
+            // #1766: what the NSACF's OAuth2 gate answers for a token whose scope
+            // lacks nnsacf-nsac.
+            nextgcore_sbi::message::SbiResponse::with_status(403)
+                .with_body(r#"{"status":403}"#, "application/problem+json")
+                .with_header(
+                    "WWW-Authenticate",
+                    r#"Bearer realm="5gc-sbi", error="insufficient_scope", scope="nnsacf-nsac""#,
+                )
+        } else if psi == 99 {
             nextgcore_sbi::message::SbiResponse::with_status(403).with_body(
                 serde_json::json!({"status": 403, "cause": "ALL_SLICE_FAILED"}).to_string(),
                 "application/problem+json",
@@ -3384,6 +3402,11 @@ mod tests {
             // Over-limit marker (psi 99) -> Rejected (NSACF 403 total failure)
             let res = nsac_pdu_session_admit(&nsacf, "smf-1", "imsi-2", 99, 1, None).await;
             assert_eq!(res, NsacAdmission::Rejected);
+
+            // #1766: a 403 from the NSACF's OAuth2 gate (psi 98) is not a quota
+            // decision: Unavailable, not Rejected.
+            let res = nsac_pdu_session_admit(&nsacf, "smf-1", "imsi-3", 98, 1, None).await;
+            assert_eq!(res, NsacAdmission::Unavailable);
 
             // DECREASE release is best-effort and must not panic
             nsac_pdu_session_release(&nsacf, "smf-1", "imsi-1", 5, 1, None).await;

@@ -212,7 +212,7 @@ services:
   mbsmf:
     environment:
       - NEXTGCORE_SBI_OAUTH2_REQUIRE=1
-      - NEXTGCORE_MBSMF_INSTANCE_ID=6b1d7e3c-0000-4000-8000-0000000b05f0
+      - NEXTGCORE_MB_SMF_INSTANCE_ID=6b1d7e3c-0000-4000-8000-0000000b05f0
       - NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE=/var/lib/nextgcore/cca/mbsmf-cca.key
       - NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/etc/nextgcore/cca-public
     volumes: *cca-volumes

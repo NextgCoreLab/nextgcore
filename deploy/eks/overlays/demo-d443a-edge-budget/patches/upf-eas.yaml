@@ -66,6 +66,11 @@
       # ip netns exec and setpriv).
       - name: NO_COLOR
         value: "1"
+      # The EASes dial the NRF (eas.yaml oauth2.nrf) over TLS (#1617) at its
+      # cluster FQDN; nrf.crt names DNS:nrf. The CA and each EAS's own pair are
+      # set per EAS by sidecar.sh (eas.yaml).
+      - name: NEXTGCORE_NRF_TLS_SERVER_NAME
+        value: nrf
     # Not privileged: every capability dropped, then exactly the four the
     # operator approved (2026-11-16) for the sidecar's root shell:
     #   NET_ADMIN  the bridge, veths, addresses, routes, iptables, tc (netem);
@@ -90,6 +95,19 @@
           - SYS_ADMIN
           - SETUID
           - SETGID
+    # #1617: each EAS's own certificate, Secret nf-tls-<eas_id>, one directory
+    # each. The key is 0400 to root (this shell), which hands it to its EAS on
+    # stdin (sidecar.sh); no EAS uid can read another's.
+    volumeMounts:
+      - name: nf-tls-eas-local
+        mountPath: /etc/nextgcore/certs/eas-local
+        readOnly: true
+      - name: nf-tls-eas-regional
+        mountPath: /etc/nextgcore/certs/eas-regional
+        readOnly: true
+      - name: nf-tls-eas-cloud
+        mountPath: /etc/nextgcore/certs/eas-cloud
+        readOnly: true
     resources:
       requests:
         cpu: 100m
@@ -97,3 +115,33 @@
       limits:
         cpu: 1000m
         memory: 256Mi
+- op: add
+  path: /spec/template/spec/volumes/-
+  value:
+    name: nf-tls-eas-local
+    secret:
+      secretName: nf-tls-eas-local
+      items:
+        - {key: ca.crt, path: ca.crt, mode: 0444}
+        - {key: eas-local.crt, path: eas-local.crt, mode: 0444}
+        - {key: eas-local.key, path: eas-local.key, mode: 0400}
+- op: add
+  path: /spec/template/spec/volumes/-
+  value:
+    name: nf-tls-eas-regional
+    secret:
+      secretName: nf-tls-eas-regional
+      items:
+        - {key: ca.crt, path: ca.crt, mode: 0444}
+        - {key: eas-regional.crt, path: eas-regional.crt, mode: 0444}
+        - {key: eas-regional.key, path: eas-regional.key, mode: 0400}
+- op: add
+  path: /spec/template/spec/volumes/-
+  value:
+    name: nf-tls-eas-cloud
+    secret:
+      secretName: nf-tls-eas-cloud
+      items:
+        - {key: ca.crt, path: ca.crt, mode: 0444}
+        - {key: eas-cloud.crt, path: eas-cloud.crt, mode: 0444}
+        - {key: eas-cloud.key, path: eas-cloud.key, mode: 0400}

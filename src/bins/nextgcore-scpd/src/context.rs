@@ -94,7 +94,8 @@ impl NfType {
             NfType::Scp => "SCP",
             NfType::Nssaaf => "NSSAAF",
             NfType::Mfaf => "MFAF",
-            NfType::Mbsmf => "MBSMF",
+            // TS 29.510 §6.1.6.3.3 (#1680).
+            NfType::Mbsmf => "MB_SMF",
             NfType::Easdf => "EASDF",
             NfType::Dccf => "DCCF",
             NfType::Mbstf => "MBSTF",
@@ -145,7 +146,8 @@ impl NfType {
             "SCP" => NfType::Scp,
             "NSSAAF" => NfType::Nssaaf,
             "MFAF" => NfType::Mfaf,
-            "MBSMF" => NfType::Mbsmf,
+            // #1680: "MBSMF", the spelling this tree used to emit, on input only.
+            "MB_SMF" | "MBSMF" => NfType::Mbsmf,
             "EASDF" => NfType::Easdf,
             "DCCF" => NfType::Dccf,
             "MBSTF" => NfType::Mbstf,
@@ -239,6 +241,17 @@ pub fn scp_context_final() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1680: scpd's NF type names the MB-SMF `MB_SMF` (TS 29.510 §6.1.6.3.3), and
+    /// still reads the `MBSMF` it used to write.
+    ///
+    /// REVERT-VERIFIED: with `to_string` back to "MBSMF", the first assertion fails.
+    #[test]
+    fn the_mb_smf_is_spelled_as_ts_29510_spells_it_1680() {
+        assert_eq!(NfType::Mbsmf.to_string(), "MB_SMF");
+        assert_eq!(NfType::from_string("MB_SMF"), NfType::Mbsmf);
+        assert_eq!(NfType::from_string("MBSMF"), NfType::Mbsmf);
+    }
 
     #[test]
     fn test_scp_context_new() {

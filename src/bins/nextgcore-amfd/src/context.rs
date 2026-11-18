@@ -2983,6 +2983,43 @@ impl AmfContext {
             .unwrap_or_default()
     }
 
+    /// The live event subscriptions that target one UE by an identity it carries
+    /// (#1727): its `eventSubscriptionList` in a UEContextTransfer answer (TS 29.518
+    /// §6.1.6.2.25, "the event subscription(s) targeting the UE or the group the UE
+    /// is part of"). Expired ones are left out. Only a subscription keyed by an
+    /// identity of the UE (SUPI, GPSI or PEI) matches, so these are not included:
+    /// - any-UE subscriptions, which carry no UE identity: they stay with this AMF,
+    ///   and a copy at the new AMF would report every UE there;
+    /// - a group subscription keyed by `groupId` alone, since this AMF cannot tell
+    ///   whether the UE is in the group (see [`EventSubscription::group_id`]).
+    ///
+    /// Sorted by subscription ID, so the list is stable across calls.
+    pub fn event_subscriptions_targeting_ue(
+        &self,
+        supi: Option<&str>,
+        gpsi: Option<&str>,
+        pei: Option<&str>,
+    ) -> Vec<EventSubscription> {
+        let now = std::time::SystemTime::now();
+        let mut subs: Vec<EventSubscription> = self
+            .event_subscriptions
+            .read()
+            .map(|subs| {
+                subs.values()
+                    .filter(|s| s.expiry.is_none_or(|e| e > now))
+                    .filter(|s| {
+                        (s.supi.is_some() && s.supi.as_deref() == supi)
+                            || (s.gpsi.is_some() && gpsi.is_some() && s.gpsi.as_deref() == gpsi)
+                            || (s.pei.is_some() && pei.is_some() && s.pei.as_deref() == pei)
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        subs.sort_by(|a, b| a.subscription_id.cmp(&b.subscription_id));
+        subs
+    }
+
     /// Find the live UE whose GPSI is `gpsi` (#74 criterion 4).
     ///
     /// `AmfUe.gpsi` is written from the UDM SDM `am-data` at registration
@@ -4006,6 +4043,22 @@ pub struct AmfUe {
     /// longer holds (one made before a restart, under a different
     /// `amfInstanceId`). Acting on it would tear down the UE's new registration.
     pub uecm_dereg_token: Option<String>,
+    /// #1748: the token in the `callbackReference` of this UE's CURRENT Nudm_SDM
+    /// subscription (`.../sdmsubscription-notify/{token}`), minted per subscription
+    /// and the UE's only once the UDM accepted it (TS 29.503 §5.2.2.3.2). A data
+    /// change notification naming another token is for no subscription this AMF
+    /// holds. `None` for a context whose subscription carries no token (one
+    /// restored from before #1518 serves the token-less URI meanwhile).
+    pub sdm_notify_token: Option<String>,
+    /// #1748: the UE's whole `AccessAndMobilitySubscriptionData`, as the UDM last
+    /// gave it (Nudm_SDM_Get, or a data change notification applied since). A
+    /// notification's changes are applied to it and the UE's fields derived from
+    /// it again; it is whole so a change of a member this AMF does not act on
+    /// (`sbi_path::AM_DATA_APPLIED_MEMBERS`) is seen, and refused, however the UDM
+    /// encodes it.
+    /// `None` for a context whose am-data was never read here (one restored from
+    /// a record without it): it is then rebuilt from those fields.
+    pub am_data: Option<serde_json::Value>,
     /// #1518: the secret each PDU session's `smContextStatusUri` token is derived
     /// from ([`crate::sbi_path::sm_context_status_token`]), one token per PSI, so the
     /// SMF of one session cannot notify about another. Minted with the UE context
@@ -4079,6 +4132,12 @@ pub struct AmfUe {
     pub mapped_eps_guti: Option<nextgcore_nas::eps::types::EpsGuti>,
     /// UE context transfer state
     pub amf_ue_context_transfer_state: UeContextTransferState,
+    /// #1727 review M2: the IDs of the event subscriptions this AMF, as the old AMF,
+    /// handed over in its last UEContextTransfer answer (`eventSubscriptionList`).
+    /// A RegistrationStatusUpdate of TRANSFERRED releases them, since the new AMF
+    /// now serves them; NOT_TRANSFERRED keeps them and clears this list
+    /// (TS 29.518 §5.2.2.2.1.1, §5.2.2.2.2).
+    pub handed_over_event_subscriptions: Vec<String>,
     /// GUAMI pointer index
     pub guami_index: Option<usize>,
     /// gNB output stream ID
@@ -4313,6 +4372,9 @@ impl std::fmt::Debug for AmfUe {
         let mut d = f.debug_struct("AmfUe");
         d.field("id", &self.id);
         d.field("uecm_dereg_token", &redacted(&self.uecm_dereg_token));
+        d.field("sdm_notify_token", &redacted(&self.sdm_notify_token));
+        // The kept am-data carries the GPSIs: only whether it is held.
+        d.field("am_data", &self.am_data.is_some());
         d.field(
             "sm_context_status_key",
             &redacted(&self.sm_context_status_key),
@@ -4339,6 +4401,10 @@ impl std::fmt::Debug for AmfUe {
         d.field(
             "amf_ue_context_transfer_state",
             &self.amf_ue_context_transfer_state,
+        );
+        d.field(
+            "handed_over_event_subscriptions",
+            &self.handed_over_event_subscriptions,
         );
         d.field("guami_index", &self.guami_index);
         d.field("gnb_ostream_id", &self.gnb_ostream_id);
@@ -4888,6 +4954,8 @@ impl AmfUe {
         Self {
             id,
             uecm_dereg_token: None,
+            sdm_notify_token: None,
+            am_data: None,
             sm_context_status_key: Some(uuid::Uuid::new_v4().simple().to_string()),
             pre_1518_callbacks: false,
             nas: NasState::default(),
@@ -4909,6 +4977,7 @@ impl AmfUe {
             old_guti: Guti5gs::default(),
             mapped_eps_guti: None,
             amf_ue_context_transfer_state: UeContextTransferState::Initial,
+            handed_over_event_subscriptions: Vec::new(),
             guami_index: None,
             gnb_ostream_id: 0,
             nr_tai: Tai5gs::default(),

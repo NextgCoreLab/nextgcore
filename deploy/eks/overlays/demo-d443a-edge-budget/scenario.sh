@@ -234,13 +234,14 @@ print(json.dumps(d))' "${S}/ees-config.before.json" "$1" | "${K[@]}" apply -f - 
           NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE=/tmp/d443a-cca/cca.key \
           NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/tmp/d443a-cca-pub >/dev/null || bad "${nf} OAuth2 env"
       done
-      # NEXTGCORE_SBI_PROFILE=dev as on every base NF (k8s/manifests): eesd's NRF
-      # client is then cleartext h2c like theirs, not mTLS with certificates this
-      # cluster does not provision. eesd's own server and its per-operation OAuth2
+      # NEXTGCORE_SBI_PROFILE=dev as on every base NF (k8s/manifests): eesd's SBI
+      # client is then h2c like theirs, except toward the NRF, which it dials over
+      # TLS with its own certificate (Secret nf-tls-ees and the NEXTGCORE_NRF_TLS_*
+      # env of ees.yaml, #1617). eesd's own server and its per-operation OAuth2
       # gate do not read the profile.
       "${K[@]}" set env deploy/ees -c ees NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE=/tmp/d443a-cca/cca.key \
         NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/tmp/d443a-cca-pub NEXTGCORE_SBI_PROFILE=dev >/dev/null || bad "ees CCA env"
-      "${K[@]}" patch deploy/ees --type=json -p "[{\"op\":\"add\",\"path\":\"/spec/template/spec/containers/0/args/-\",\"value\":\"--nrf-uri\"},{\"op\":\"add\",\"path\":\"/spec/template/spec/containers/0/args/-\",\"value\":\"http://nrf.${NAMESPACE}.svc.cluster.local:7777\"}]" \
+      "${K[@]}" patch deploy/ees --type=json -p "[{\"op\":\"add\",\"path\":\"/spec/template/spec/containers/0/args/-\",\"value\":\"--nrf-uri\"},{\"op\":\"add\",\"path\":\"/spec/template/spec/containers/0/args/-\",\"value\":\"https://nrf.${NAMESPACE}.svc.cluster.local:7777\"}]" \
         >/dev/null || bad "ees --nrf-uri"
       for nf in amf smf; do
         "${K[@]}" rollout status "deploy/${nf}" --timeout=300s >/dev/null || bad "${nf} rollout"
@@ -251,8 +252,10 @@ print(json.dumps(d))' "${S}/ees-config.before.json" "$1" | "${K[@]}" apply -f - 
 
   # --- 2. eesd, with the NRF's JWKS -----------------------------------------------
   local jw
-  jw="$("${K[@]}" exec deploy/nrf -c nrf -- curl -s --http2-prior-knowledge --max-time 5 \
-    http://127.0.0.1:7777/nnrf-oauth2/v1/jwks 2>/dev/null)"
+  # The NRF serves TLS (#1617): checked against the CA under the name nrf.crt
+  # carries (DNS:nrf), on the pod's own loopback.
+  jw="$("${K[@]}" exec deploy/nrf -c nrf -- curl -s --http2 --cacert /etc/nextgcore/certs/ca.crt \
+    --resolve nrf:7777:127.0.0.1 --max-time 5 https://nrf:7777/nnrf-oauth2/v1/jwks 2>/dev/null)"
   python3 -c 'import json,sys; k=json.loads(sys.argv[1])["keys"]; assert k' "${jw}" 2>/dev/null \
     || bad "no JWKS from the NRF"
   printf '%s' "${jw}" >"${S}/nrf-jwks.json"
@@ -333,6 +336,17 @@ print(json.dumps(d))' "${S}/ees-config.before.json" "$1" | "${K[@]}" apply -f - 
     while read -r nf nfid; do
       wait_for 180 "${K[@]}" exec deploy/nrf -c nrf -- test -s "/etc/nextgcore/cca-trusted/${nfid}.jwk" \
         || bad "the NRF does not see ${nf}'s JWK within 180 s"
+    done <"${S}/oauth2-ids.txt"
+    # amfd and smfd need an nnrf-nfm token before NFRegister (#1667), which the
+    # NRF grants only once it trusts their CCA JWK (above). Until then their
+    # registration retries back off to a 30 s cap, so wait for both profiles
+    # at the NRF before the fresh N2 below depends on them. Over TLS (#1617).
+    while read -r nf nfid; do
+      [[ "${nf}" == ees ]] && continue
+      wait_for 120 sh -c "[ \"\$(kubectl -n ${NAMESPACE} --request-timeout=30s exec deploy/nrf -c nrf -- \
+        curl -s --http2 --cacert /etc/nextgcore/certs/ca.crt --max-time 5 -o /dev/null -w '%{http_code}' \
+        https://nrf:7777/nnrf-nfm/v1/nf-instances/${nfid})\" = 200 ]" \
+        || bad "${nf} (${nfid}) did not re-register at the NRF within 120 s of its JWK being trusted"
     done <"${S}/oauth2-ids.txt"
     # A fresh N2 and PDU session through the OAuth2 amfd and smfd.
     "${K[@]}" delete pod -l app.kubernetes.io/name=gnb --wait=true --timeout=120s >/dev/null || bad "gnb restart"

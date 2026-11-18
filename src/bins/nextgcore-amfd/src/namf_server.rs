@@ -141,6 +141,21 @@ pub fn oauth2_callback_exemptions() -> Vec<nextgcore_sbi::server::OAuth2Callback
                 dereg_notify_from_the_udm(supi, &cb.token, &peer).await
             },
         ),
+        // Nudm_SDM Data Change Notification (TS 29.503 §5.2.2.5.2), #1748: as
+        // dereg-notify, a verified UDM and the UE's current subscription token. The
+        // token alone does not show the sender: a UDM may keep SDM subscriptions in
+        // the UDR (TS 29.505 §5.2.16), which other Nudr_DR consumers can read.
+        OAuth2CallbackExemption::for_verified_peer(
+            "POST",
+            "/namf-callback/v1/{var}/sdmsubscription-notify/{token}",
+            |cb, peer| async move {
+                let [supi] = cb.vars.as_slice() else {
+                    return false;
+                };
+                is_verified_udm(supi, "sdmsubscription-notify", &peer).await
+                    && holds_callback_token(supi, &cb.token, |ue| &ue.sdm_notify_token)
+            },
+        ),
     ]
 }
 
@@ -166,9 +181,25 @@ pub(crate) async fn dereg_notify_from_the_udm(
     token: &str,
     peer: &nextgcore_sbi::callback_auth::VerifiedPeer,
 ) -> bool {
+    if !is_verified_udm(supi, "dereg-notify", peer).await {
+        return false;
+    }
+    find_ue_by_context_id(supi)
+        .and_then(|ue| ue.uecm_dereg_token.clone())
+        .is_some_and(|held| nextgcore_sbi::callback_auth::token_eq(&held, token))
+}
+
+/// Whether `peer` is a UDM (#1522, and #1748 for `sdmsubscription-notify`): its
+/// certificate's RFC 9310 NFTypes name UDM, and its NF Instance ID is a UDM in this
+/// AMF's NRF discovery cache, unexpired. See [`dereg_notify_from_the_udm`].
+async fn is_verified_udm(
+    supi: &str,
+    route: &str,
+    peer: &nextgcore_sbi::callback_auth::VerifiedPeer,
+) -> bool {
     if !peer.has_nf_type("UDM") {
         log::debug!(
-            "[{supi}] dereg-notify without a bearer from TLS peer {} whose certificate \
+            "[{supi}] {route} without a bearer from TLS peer {} whose certificate \
              names no UDM NF type ({:?}): the bearer is required",
             peer.nf_instance_id,
             peer.nf_types
@@ -182,15 +213,12 @@ pub(crate) async fn dereg_notify_from_the_udm(
         .any(|udm| udm.id.eq_ignore_ascii_case(&peer.nf_instance_id));
     if !is_udm {
         log::debug!(
-            "[{supi}] dereg-notify without a bearer from TLS peer {}, which this AMF does \
+            "[{supi}] {route} without a bearer from TLS peer {}, which this AMF does \
              not know as a UDM: the bearer is required",
             peer.nf_instance_id
         );
-        return false;
     }
-    find_ue_by_context_id(supi)
-        .and_then(|ue| ue.uecm_dereg_token.clone())
-        .is_some_and(|held| nextgcore_sbi::callback_auth::token_eq(&held, token))
+    is_udm
 }
 
 /// The Namf SBI server for `cfg`, with this AMF's [`oauth2_callback_exemptions`]
@@ -448,6 +476,19 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
             if parts.len() == 4 && parts[2] == "nf-status-notify" && method == "POST" =>
         {
             handle_nf_status_notify_callback(parts[3], &request).await
+        }
+        // Namf_Callback: Nudm_SDM Data Change Notification (#1748, TS 29.503
+        // §5.2.2.5.2), POSTed to the callbackReference of the UE's SDM subscription
+        // (`sbi_path::sdm_callback_reference`).
+        //   POST /namf-callback/v1/{supi}/sdmsubscription-notify/{token}
+        //   POST /namf-callback/v1/{supi}/sdmsubscription-notify   (a subscription
+        //                                                         of before #1518)
+        "namf-callback"
+            if (parts.len() == 4 || parts.len() == 5)
+                && parts[3] == "sdmsubscription-notify"
+                && method == "POST" =>
+        {
+            handle_sdm_notify_callback(parts[2], parts.get(4).copied(), &request)
         }
         //   POST /namf-callback/v1/{supi}/dereg-notify/{token}   (#753)
         //   POST /namf-callback/v1/{supi}/dereg-notify           (registrations
@@ -1031,6 +1072,95 @@ fn handle_ue_policy_notify_callback(
     }
 
     SbiResponse::no_content()
+}
+
+/// Nudm_SDM Data Change Notification (#1748, TS 29.503 §5.2.2.5.2) for the UE `supi`,
+/// on its SDM subscription's `callbackReference` (`token`: the URI's last segment).
+///
+/// - No UE context: 404 CONTEXT_NOT_FOUND (Table 6.1.5.2-3).
+/// - A token the UE does not hold for its subscription: 404 and nothing changes. The
+///   token-less URI is served only for a context restored from before #1518 whose
+///   subscription has no token yet ([`serves_tokenless`]).
+/// - Otherwise the notification is applied ([`crate::sdm_notify`]) and answered 204,
+///   or refused as a whole with nothing applied: 400 with a ProblemDetails for a
+///   change this AMF does not apply (DECISIONS 2026-11-18-030000), never a 204. The check, the changes and the
+///   derived fields are one step under the store's lock, so a concurrent
+///   re-subscription cannot interleave and nothing is left half applied.
+fn handle_sdm_notify_callback(
+    supi: &str,
+    token: Option<&str>,
+    request: &SbiRequest,
+) -> SbiResponse {
+    let Some(ue) = find_ue_by_context_id(supi) else {
+        return context_not_found(supi);
+    };
+    let admitted = |ue: &AmfUe| match token {
+        Some(token) => ue
+            .sdm_notify_token
+            .as_deref()
+            .is_some_and(|held| nextgcore_sbi::callback_auth::token_eq(held, token)),
+        None => ue.pre_1518_callbacks && ue.sdm_notify_token.is_none(),
+    };
+    if !admitted(&ue) {
+        return unknown_callback_token(supi, "SDM data change");
+    }
+    let Some(body) = parse_json_body(request) else {
+        return send_error(
+            400,
+            "Bad Request",
+            "a ModificationNotification body is required",
+            Some("INVALID_MSG_FORMAT"),
+        );
+    };
+    let ctx = amf_self();
+    let Ok(guard) = ctx.read() else {
+        return context_not_found(supi);
+    };
+    let outcome = guard.ue_store().with_mut(ue.id, |state| {
+        // Again under the lock: a re-subscription may have replaced the token.
+        if !admitted(&state.amf_ue) {
+            return None;
+        }
+        let current = crate::sdm_notify::current_am_data(&state.amf_ue);
+        // CM-CONNECTED as `ue_ng_connected` reads it, under the same lock.
+        let cm_connected = !state.is_cm_idle() && state.is_bound();
+        Some(
+            crate::sdm_notify::applied_am_data(
+                supi,
+                &current,
+                state.sdm_subscription_id(),
+                &body,
+                cm_connected,
+            )
+            .map(|doc| crate::sdm_notify::adopt_am_data(supi, &mut state.amf_ue, doc)),
+        )
+    });
+    drop(guard);
+    match outcome {
+        None => context_not_found(supi),
+        Some(None) => unknown_callback_token(supi, "SDM data change"),
+        Some(Some(Ok(()))) => {
+            log::info!("[{supi}] Nudm_SDM data change notification applied to the am-data");
+            SbiResponse::no_content()
+        }
+        Some(Some(Err(refusal))) => {
+            log::warn!(
+                "[{supi}] Nudm_SDM data change notification not applied ({}): {}",
+                refusal.status(),
+                refusal.detail()
+            );
+            let title = match refusal.status() {
+                404 => "Not Found",
+                _ => "Bad Request",
+            };
+            send_error(
+                refusal.status(),
+                title,
+                refusal.detail(),
+                Some(refusal.cause()),
+            )
+        }
+    }
 }
 
 /// #1518: whether `token` is the callback token `field` of the UE `supi` holds now,
@@ -3787,6 +3917,11 @@ impl EventSubscriptionGuard {
         Self(id.into())
     }
 
+    /// The ID of the subscription this guards.
+    pub(crate) fn subscription_id(&self) -> &str {
+        &self.0
+    }
+
     /// The subscription a `201 Created` from `/namf-evts/v1/subscriptions` names.
     ///
     /// # Panics
@@ -5520,6 +5655,21 @@ fn nea_name(alg: u8) -> &'static str {
     }
 }
 
+/// The live subscriptions that target `ue` (#1727, TS 29.518 §6.1.6.2.25
+/// `eventSubscriptionList`;
+/// [`crate::context::AmfContext::event_subscriptions_targeting_ue`]).
+fn event_subscriptions_handed_over(ue: &AmfUe) -> Vec<crate::context::EventSubscription> {
+    let ctx = amf_self();
+    let Ok(guard) = ctx.read() else {
+        return Vec::new();
+    };
+    guard.event_subscriptions_targeting_ue(
+        ue.supi.as_deref(),
+        ue.gpsi.as_deref(),
+        ue.pei.as_deref(),
+    )
+}
+
 /// Build the UeContext JSON for UEContextTransfer responses
 /// (TS 29.518 Table 6.1.6.2.50-1)
 fn build_ue_context_json(ue: &AmfUe, sessions: &[AmfSess]) -> Value {
@@ -5970,6 +6120,14 @@ fn handle_ue_context_transfer(ue_context_id: &str, request: &SbiRequest) -> SbiR
         guard.sess_list_for_ue(ue.id)
     };
 
+    // #1727 review M2: what is handed over is recorded, so a RegistrationStatusUpdate
+    // TRANSFERRED releases exactly these and NOT_TRANSFERRED keeps them. A retried
+    // transfer (#1726 M1) records the same set again.
+    let handed_over = event_subscriptions_handed_over(&ue);
+    ue.handed_over_event_subscriptions = handed_over
+        .iter()
+        .map(|s| s.subscription_id.clone())
+        .collect();
     ue.amf_ue_context_transfer_state = UeContextTransferState::TransferOldAmf;
     {
         let Ok(guard) = ctx.read() else {
@@ -5978,11 +6136,23 @@ fn handle_ue_context_transfer(ue_context_id: &str, request: &SbiRequest) -> SbiR
         guard.amf_ue_update(&ue);
     }
 
-    let response_body = json!({
-        "ueContext": build_ue_context_json(&ue, &sessions),
-    });
+    let mut ue_context = build_ue_context_json(&ue, &sessions);
+    // #1727: the event subscriptions targeting the UE go with its context (TS 29.518
+    // §6.1.6.2.25 `eventSubscriptionList`, `29518-k00.txt:13606-13614`: "shall be
+    // present if available"), each as its AmfEventSubscription echo. That echo
+    // carries the consumer's `subsChangeNotifyUri`, where the new AMF sends
+    // SUBSCRIPTION_ID_CHANGE once it has taken the subscription over (#1699).
+    // Before, the list was never sent, so between two nextgcore AMFs a consumer's
+    // subscription stayed at the old AMF and the UE's reports stopped.
+    let subscriptions: Vec<Value> = handed_over.iter().map(subscription_echo_json).collect();
+    let subscription_count = subscriptions.len();
+    if !subscriptions.is_empty() {
+        ue_context["eventSubscriptionList"] = json!(subscriptions);
+    }
+    let response_body = json!({ "ueContext": ue_context });
     log::info!(
-        "[{}] UEContextTransfer: reason={reason}, accessType={access_type}, {} sessions",
+        "[{}] UEContextTransfer: reason={reason}, accessType={access_type}, {} sessions, \
+         {subscription_count} event subscription(s)",
         ue_context_id,
         sessions.len()
     );
@@ -6019,11 +6189,27 @@ fn handle_registration_status_update(ue_context_id: &str, request: &SbiRequest) 
     let ctx = amf_self();
     if transfer_status == "TRANSFERRED" {
         ue.amf_ue_context_transfer_state = UeContextTransferState::RegistrationStatusUpdateOldAmf;
+        // #1727 review M2: the new AMF has created the UE-specific event
+        // subscriptions this AMF handed over (TS 29.518 §5.2.2.2.1.1) and serves
+        // them now, so they are released here; left in place, they would report
+        // on a UE this AMF no longer serves, beside the new AMF's copies. Only
+        // what was handed over: a group subscription is not (it was never
+        // carried, `event_subscriptions_targeting_ue`), and §5.2.2.2.1.1 keeps it
+        // until its expiry (`29518-k00.txt:2446-2449`).
+        let released = std::mem::take(&mut ue.handed_over_event_subscriptions);
         {
             let Ok(guard) = ctx.read() else {
                 return send_error(500, "Internal Server Error", "context lock poisoned", None);
             };
             guard.amf_ue_update(&ue);
+            for id in &released {
+                if guard.event_subscription_remove(id).is_some() {
+                    log::info!(
+                        "[{ue_context_id}] event subscription {id} released: transferred to \
+                         the new AMF"
+                    );
+                }
+            }
         }
 
         // toReleaseSessionList: PDU sessions the new AMF could not accept
@@ -6051,8 +6237,10 @@ fn handle_registration_status_update(ue_context_id: &str, request: &SbiRequest) 
         }
     } else {
         // NOT_TRANSFERRED: registration at the new AMF failed; keep the
-        // context and clear any transfer state.
+        // context and clear any transfer state. The event subscriptions handed
+        // over stay here (#1727 review M2): this AMF goes on serving the UE.
         ue.amf_ue_context_transfer_state = UeContextTransferState::Initial;
+        ue.handed_over_event_subscriptions.clear();
         if let Ok(guard) = ctx.read() {
             guard.amf_ue_update(&ue);
         }
@@ -8145,6 +8333,8 @@ mod tests {
         ue.uecm_dereg_token = Some(format!("tok-{supi}"));
         // #1518: and of its smContextStatusUri / policy notificationUris.
         if tokens {
+            // #1748: and of its SDM subscription's callbackReference.
+            ue.sdm_notify_token = Some(format!("sdm-{supi}"));
             ue.sm_context_status_key = Some(format!("smst-{supi}"));
             ue.policy_association.notify_token = Some(format!("amp-{supi}"));
             ue.ue_policy_association.notify_token = Some(format!("uep-{supi}"));
@@ -9807,6 +9997,183 @@ mod tests {
         assert_eq!(resp.status, 404);
     }
 
+    /// **#1727**, the old AMF's half: the UEContextTransfer answer's UeContext carries
+    /// `eventSubscriptionList` (TS 29.518 §6.1.6.2.25, "shall be present if
+    /// available") with the subscriptions that target the UE, each with its
+    /// `subsChangeNotifyUri`. Left out: another UE's, an any-UE one (it targets no
+    /// UE, and stays here), and an expired one.
+    ///
+    /// REVERT-VERIFIED: without the member in `handle_ue_context_transfer`, "the
+    /// UE's subscription goes with it" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ue_context_transfer_carries_the_ue_s_event_subscriptions_1727() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        let supi = "imsi-001010000172701";
+        let _ue = setup_ue(supi, true, true);
+        let subscription_request = |target: Value, corr: &str, expiry: Option<&str>| {
+            let mut sub = json!({
+                "eventList": [{ "type": "CONNECTIVITY_STATE_REPORT" }],
+                "eventNotifyUri": format!("http://127.0.0.1:9/notify/{corr}"),
+                "notifyCorrelationId": corr,
+                "nfId": "3fa85f64-5717-4562-b3fc-2c963f661727",
+                "subsChangeNotifyUri": format!("http://127.0.0.1:9/subs-change/{corr}"),
+            });
+            for (k, v) in target.as_object().expect("object") {
+                sub[k] = v.clone();
+            }
+            if let Some(e) = expiry {
+                sub["options"] = json!({ "trigger": "CONTINUOUS", "expiry": e });
+            }
+            SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&json!({ "subscription": sub }))
+                .expect("json")
+        };
+        let mut guards = Vec::new();
+        for (target, corr) in [
+            (json!({ "supi": supi }), "corr-1727-ue"),
+            (json!({ "supi": "imsi-001010000172799" }), "corr-1727-other"),
+            (json!({ "anyUE": true }), "corr-1727-any"),
+        ] {
+            let resp = namf_request_handler(subscription_request(target, corr, None)).await;
+            assert_eq!(resp.status, 201, "{corr}");
+            guards.push(EventSubscriptionGuard::of(&resp));
+        }
+        // An expired one, stored directly: the producer would refuse a past expiry.
+        let expired = EventSubscription {
+            subscription_id: "sub-1727-expired".to_string(),
+            notify_uri: "http://127.0.0.1:9/notify/corr-1727-expired".to_string(),
+            notify_correlation_id: "corr-1727-expired".to_string(),
+            event_types: vec!["CONNECTIVITY_STATE_REPORT".to_string()],
+            supi: Some(supi.to_string()),
+            expiry: Some(std::time::SystemTime::now() - std::time::Duration::from_secs(1)),
+            ..amf_self()
+                .read()
+                .unwrap()
+                .event_subscription_find(&guards[0].0)
+                .expect("stored")
+        };
+        assert!(amf_self().read().unwrap().event_subscription_add(expired));
+        let _expired = EventSubscriptionGuard::id("sub-1727-expired");
+
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/transfer"))
+            .with_json_body(&json!({ "reason": "INIT_REG", "accessType": "3GPP_ACCESS" }))
+            .expect("json");
+        let resp = namf_request_handler(req).await;
+        assert_eq!(resp.status, 200);
+        let list = body_json(&resp)["ueContext"]["eventSubscriptionList"].clone();
+        let corrs: Vec<&str> = list
+            .as_array()
+            .map(|l| {
+                l.iter()
+                    .filter_map(|s| s["notifyCorrelationId"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            corrs,
+            vec!["corr-1727-ue"],
+            "the UE's subscription goes with it: {list}"
+        );
+        assert_eq!(list[0]["supi"], supi);
+        assert_eq!(
+            list[0]["subsChangeNotifyUri"], "http://127.0.0.1:9/subs-change/corr-1727-ue",
+            "so the new AMF can send SUBSCRIPTION_ID_CHANGE"
+        );
+        assert_eq!(list[0]["eventList"][0]["type"], "CONNECTIVITY_STATE_REPORT");
+    }
+
+    /// #1727 review M2: the old AMF's side of a transfer that the new AMF then reports
+    /// with `transfer_status`. The UE `supi` has a UE-specific subscription and
+    /// there is an any-UE one; the UEContextTransfer answer hands over the first,
+    /// then the RegistrationStatusUpdate is sent. Returns whether each is still
+    /// stored afterwards (UE-specific, any-UE).
+    async fn handed_over_subscriptions_after(supi: &str, transfer_status: &str) -> (bool, bool) {
+        let _ue = setup_ue(supi, true, true);
+        let subscription_request = |target: Value, corr: &str| {
+            let mut sub = json!({
+                "eventList": [{ "type": "CONNECTIVITY_STATE_REPORT" }],
+                "eventNotifyUri": format!("http://127.0.0.1:9/notify/{corr}"),
+                "notifyCorrelationId": corr,
+                "nfId": "3fa85f64-5717-4562-b3fc-2c963f661727",
+                "subsChangeNotifyUri": format!("http://127.0.0.1:9/subs-change/{corr}"),
+            });
+            for (k, v) in target.as_object().expect("object") {
+                sub[k] = v.clone();
+            }
+            SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&json!({ "subscription": sub }))
+                .expect("json")
+        };
+        let ue_sub =
+            namf_request_handler(subscription_request(json!({ "supi": supi }), "corr-m2-ue")).await;
+        assert_eq!(ue_sub.status, 201);
+        let ue_sub = EventSubscriptionGuard::of(&ue_sub);
+        let any = namf_request_handler(subscription_request(
+            json!({ "anyUE": true }),
+            "corr-m2-any",
+        ))
+        .await;
+        assert_eq!(any.status, 201);
+        let any = EventSubscriptionGuard::of(&any);
+
+        let transfer = namf_request_handler(
+            SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/transfer"))
+                .with_json_body(&json!({ "reason": "INIT_REG", "accessType": "3GPP_ACCESS" }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(transfer.status, 200);
+        assert_eq!(
+            body_json(&transfer)["ueContext"]["eventSubscriptionList"][0]["notifyCorrelationId"],
+            "corr-m2-ue",
+            "precondition: the UE's subscription is handed over"
+        );
+        let update = namf_request_handler(
+            SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/transfer-update"))
+                .with_json_body(&json!({ "transferStatus": transfer_status }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(update.status, 200);
+        let ctx = amf_self();
+        let guard = ctx.read().unwrap();
+        (
+            guard.event_subscription_find(&ue_sub.0).is_some(),
+            guard.event_subscription_find(&any.0).is_some(),
+        )
+    }
+
+    /// **#1727 review M2**, TS 29.518 §5.2.2.2.1.1: once the new AMF reports
+    /// TRANSFERRED it has created the UE-specific event subscriptions the old AMF
+    /// handed over, so the old AMF releases them; otherwise both AMFs would report
+    /// on the UE. The any-UE subscription, which was not handed over, stays.
+    ///
+    /// REVERT-VERIFIED: with the release loop in `handle_registration_status_update`
+    /// removed, "the handed-over subscription is released" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transferred_status_update_releases_the_handed_over_subscriptions_1727() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        let (ue_sub, any) =
+            handed_over_subscriptions_after("imsi-001010000172711", "TRANSFERRED").await;
+        assert!(!ue_sub, "the handed-over subscription is released");
+        assert!(any, "the any-UE subscription stays");
+    }
+
+    /// **#1727 review M2**: NOT_TRANSFERRED means the old AMF goes on serving the UE
+    /// (TS 23.502 §4.2.2.2.2 step 10), so the subscriptions it handed over stay.
+    ///
+    /// REVERT-VERIFIED: with the NOT_TRANSFERRED arm releasing the handed-over
+    /// subscriptions as TRANSFERRED does, "the handed-over subscription stays"
+    /// fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_not_transferred_status_update_keeps_the_handed_over_subscriptions_1727() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        let (ue_sub, any) =
+            handed_over_subscriptions_after("imsi-001010000172712", "NOT_TRANSFERRED").await;
+        assert!(ue_sub, "the handed-over subscription stays");
+        assert!(any, "the any-UE subscription stays");
+    }
+
     /// **#1731, the old AMF's half.** A new AMF whose UE then failed authentication
     /// answers NOT_TRANSFERRED, and the old AMF "continues as if the UE context
     /// transfer service operation was never received" (TS 23.502 §4.2.2.2.2 step 10,
@@ -10325,8 +10692,18 @@ mod tests {
         ue.sm_context_status_key = Some("key-secret-1518".to_string());
         ue.policy_association.notify_token = Some("amp-secret-1518".to_string());
         ue.ue_policy_association.notify_token = Some("uep-secret-1518".to_string());
+        // #1748: nor the SDM subscription's token, nor the kept am-data's GPSI.
+        ue.sdm_notify_token = Some("sdm-secret-1748".to_string());
+        ue.am_data = Some(json!({"gpsis": ["msisdn-gpsi-secret"]}));
         let out = format!("{ue:?}");
-        for secret in ["dereg-secret", "key-secret", "amp-secret", "uep-secret"] {
+        for secret in [
+            "dereg-secret",
+            "key-secret",
+            "amp-secret",
+            "uep-secret",
+            "sdm-secret",
+            "gpsi-secret",
+        ] {
             assert!(!out.contains(secret), "{secret} in {out}");
         }
         assert!(out.contains("<redacted>"));
@@ -10356,7 +10733,8 @@ mod tests {
                 "POST /namf-callback/v1/{var}/ue-policy-notify/{token}/terminate",
                 "POST /namf-callback/v1/{var}/{var}/sm-context-status/{token}",
                 "POST /namf-callback/v1/nf-status-notify/{token}",
-                "POST /namf-callback/v1/{var}/dereg-notify/{token}"
+                "POST /namf-callback/v1/{var}/dereg-notify/{token}",
+                "POST /namf-callback/v1/{var}/sdmsubscription-notify/{token}"
             ]
         );
     }
@@ -10441,6 +10819,19 @@ mod tests {
             post(
                 format!("/namf-callback/v1/{supi}/sm-context-status/5"),
                 json!({"statusInfo": {"resourceStatus": "RELEASED"}}),
+            )
+            .await,
+            // #1748: the SDM data change notification needs a verified UDM, and
+            // this listener has no client certificate; nor is the token-less URI
+            // exempt.
+            post(
+                format!("/namf-callback/v1/{supi}/sdmsubscription-notify/sdm-{supi}"),
+                update.clone(),
+            )
+            .await,
+            post(
+                format!("/namf-callback/v1/{supi}/sdmsubscription-notify"),
+                update.clone(),
             )
             .await,
             post("/namf-comm/v1/subscriptions".to_string(), update).await,
@@ -10795,6 +11186,400 @@ mod tests {
         assert!(!route_amf, "and not a verified AMF's");
         assert!(!route_untyped, "nor the UDM's identity without NFTypes");
         assert!(!route_none, "nor anything without a verified peer");
+    }
+
+    /// The UE-AMBR, GPSI and priority subscription of `supi`'s context, and its kept
+    /// am-data (#1748).
+    fn sdm_view(supi: &str) -> (u64, u64, Option<String>, bool, Option<Value>) {
+        let ue = find_ue_by_context_id(supi).expect("held");
+        (
+            ue.ue_ambr.uplink,
+            ue.ue_ambr.downlink,
+            ue.gpsi.clone(),
+            ue.priority_subscription,
+            ue.am_data.clone(),
+        )
+    }
+
+    /// An am-data `ModificationNotification` for `supi` with `changes` (#1748).
+    fn am_data_change(supi: &str, changes: Value) -> Value {
+        json!({
+            "notifyItems": [{
+                "resourceId": format!("http://udm.example.org/nudm-sdm/v2/{supi}/am-data"),
+                "changes": changes,
+            }],
+        })
+    }
+
+    async fn post_sdm_notify(supi: &str, token: Option<&str>, body: &Value) -> SbiResponse {
+        let path = match token {
+            Some(t) => format!("/namf-callback/v1/{supi}/sdmsubscription-notify/{t}"),
+            None => format!("/namf-callback/v1/{supi}/sdmsubscription-notify"),
+        };
+        namf_request_handler(SbiRequest::post(path).with_json_body(body).expect("json")).await
+    }
+
+    /// #1748, TS 29.503 §5.2.2.5.2: a data change notification on the UE's current
+    /// SDM subscription token is applied: the UE-AMBR, the GPSI and the priority
+    /// subscription are what the changed am-data now says, derived as registration
+    /// derives them, and the held am-data holds the new values. Answered 204, for a
+    /// CM-IDLE UE (its next Initial Context Setup carries the new UE-AMBR).
+    ///
+    /// REVERT-VERIFIED: with the route removed the POST is 404; with
+    /// `adopt_am_data` not called, 204 is answered and the fields keep their old
+    /// values.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tokened_sdm_data_change_notification_is_applied_to_the_ue_1748() {
+        let _serial = dereg_queue_test_lock().lock().await;
+        let supi = "imsi-001010000017481";
+        // CM-IDLE: a UE-AMBR change for a CM-CONNECTED UE is refused (see
+        // `a_ue_ambr_change_for_a_connected_ue_is_refused_and_applies_nothing_1748`).
+        let _ue = setup_ue(supi, false, true);
+        let body = am_data_change(
+            supi,
+            json!([
+                {"op": "REPLACE", "path": "/subscribedUeAmbr",
+                 "newValue": {"uplink": "5 Mbps", "downlink": "10 Mbps"}},
+                {"op": "REPLACE", "path": "/gpsis", "newValue": ["msisdn-4917481"]},
+                {"op": "ADD", "path": "/mcsPriority", "newValue": true},
+            ]),
+        );
+        let resp = post_sdm_notify(supi, Some(&format!("sdm-{supi}")), &body).await;
+        assert_eq!(resp.status, 204, "{:?}", resp.http.content);
+        let (ul, dl, gpsi, priority, kept) = sdm_view(supi);
+        assert_eq!((ul, dl), (5_000_000, 10_000_000), "the new UE-AMBR");
+        assert_eq!(gpsi.as_deref(), Some("msisdn-4917481"), "the new GPSI");
+        assert!(priority, "an MCX priority subscription");
+        assert_eq!(
+            kept.expect("kept")["subscribedUeAmbr"]["downlink"],
+            "10 Mbps"
+        );
+    }
+
+    /// #1748 (failure-path check 2): the same notification delivered twice (a UDM
+    /// retry) is applied once: both answers are 204 and the UE is left as after the
+    /// first. A REMOVE of a member already removed changes nothing.
+    ///
+    /// REVERT-VERIFIED: with a REMOVE of an absent member refused (the
+    /// `doc.pointer(path).is_none()` early return dropped), the retry is a 400.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retried_sdm_data_change_notification_is_applied_once_1748() {
+        let _serial = dereg_queue_test_lock().lock().await;
+        let supi = "imsi-001010000017482";
+        let _ue = setup_ue(supi, true, true);
+        let token = format!("sdm-{supi}");
+        let first = am_data_change(
+            supi,
+            json!([{"op": "REPLACE", "path": "/gpsis", "newValue": ["msisdn-4917482"]}]),
+        );
+        assert_eq!(
+            post_sdm_notify(supi, Some(&token), &first).await.status,
+            204
+        );
+        let once = sdm_view(supi);
+        assert_eq!(
+            post_sdm_notify(supi, Some(&token), &first).await.status,
+            204
+        );
+        assert_eq!(sdm_view(supi), once, "the retry changes nothing more");
+
+        let removal = am_data_change(supi, json!([{"op": "REMOVE", "path": "/gpsis"}]));
+        assert_eq!(
+            post_sdm_notify(supi, Some(&token), &removal).await.status,
+            204
+        );
+        let removed = sdm_view(supi);
+        assert_eq!(removed.2, None, "the GPSI is withdrawn");
+        assert_eq!(
+            post_sdm_notify(supi, Some(&token), &removal).await.status,
+            204,
+            "a retried removal"
+        );
+        assert_eq!(sdm_view(supi), removed);
+    }
+
+    /// #1748 (failure-path check 1): a notification is applied whole or not at all.
+    /// One change this AMF cannot apply (an am-data member it does not act on, on
+    /// its path or in a whole-resource replacement, a change of the subscribed
+    /// S-NSSAIs, a removal of the UE-AMBR) refuses all of it with 400
+    /// UNSPECIFIED_MSG_FAILURE (DECISIONS 2026-11-18-030000), so the UE-AMBR change
+    /// beside it is not applied either; a malformed one is 400 INVALID_MSG_FORMAT,
+    /// and one for another resource 404. The UE is unchanged.
+    ///
+    /// REVERT-VERIFIED: with the other-member comparison in `check_applicable`
+    /// skipped, the `rfspIndex` cases answer 204 and the UE-AMBR changes; with
+    /// `check_applicable` skipped, the S-NSSAI and removal cases answer 204; with
+    /// `NotAllowed` answered 501 again, the first case's status assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_sdm_data_change_notification_applies_nothing_1748() {
+        let _serial = dereg_queue_test_lock().lock().await;
+        let supi = "imsi-001010000017483";
+        // CM-IDLE, so the UE-AMBR change beside each refused one is applicable.
+        let _ue = setup_ue(supi, false, true);
+        let token = format!("sdm-{supi}");
+        let kept = json!({
+            "subscribedUeAmbr": {"uplink": "1 Mbps", "downlink": "2 Mbps"},
+            "nssai": {"defaultSingleNssais": [{"sst": 1}]},
+        });
+        {
+            let ue = find_ue_by_context_id(supi).expect("held");
+            let ctx = amf_self();
+            let guard = ctx.read().expect("ctx");
+            guard.ue_store().with_mut(ue.id, |s| {
+                crate::sdm_notify::adopt_am_data(supi, &mut s.amf_ue, kept.clone());
+            });
+        }
+        let before = sdm_view(supi);
+        assert_eq!((before.0, before.1), (1_000_000, 2_000_000), "seeded");
+        let ambr = json!({"op": "REPLACE", "path": "/subscribedUeAmbr",
+                          "newValue": {"uplink": "9 Mbps", "downlink": "9 Mbps"}});
+        const NOT_ALLOWED: (u16, &str) = (400, "UNSPECIFIED_MSG_FAILURE");
+        const MALFORMED: (u16, &str) = (400, "INVALID_MSG_FORMAT");
+        let cases = [
+            (
+                json!([ambr, {"op": "REPLACE", "path": "/rfspIndex", "newValue": 3}]),
+                NOT_ALLOWED,
+            ),
+            (
+                json!([{"op": "REPLACE", "path": "", "newValue": {
+                    "subscribedUeAmbr": {"uplink": "9 Mbps", "downlink": "9 Mbps"},
+                    "nssai": {"defaultSingleNssais": [{"sst": 1}]},
+                    "rfspIndex": 3,
+                }}]),
+                NOT_ALLOWED,
+            ),
+            (
+                json!([ambr, {"op": "REPLACE", "path": "/nssai",
+                              "newValue": {"defaultSingleNssais": [{"sst": 2}]}}]),
+                NOT_ALLOWED,
+            ),
+            (
+                json!([{"op": "REMOVE", "path": "/subscribedUeAmbr"}]),
+                NOT_ALLOWED,
+            ),
+            (
+                json!([ambr, {"op": "MOVE", "path": "/gpsis", "from": "/x"}]),
+                NOT_ALLOWED,
+            ),
+            (
+                json!([ambr, {"op": "REPLACE", "path": "/gpsis"}]),
+                MALFORMED,
+            ),
+            (
+                json!([ambr, {"op": "REPLACE", "path": "/subscribedUeAmbr/uplink",
+                              "newValue": "fast"}]),
+                MALFORMED,
+            ),
+        ];
+        for (changes, (status, cause)) in cases {
+            let resp =
+                post_sdm_notify(supi, Some(&token), &am_data_change(supi, changes.clone())).await;
+            assert_eq!(resp.status, status, "{changes}");
+            assert_eq!(problem_cause(&resp), cause, "{changes}");
+            assert_eq!(sdm_view(supi), before, "nothing applied: {changes}");
+        }
+        let other = json!({"notifyItems": [{
+            "resourceId": format!("/nudm-sdm/v2/{supi}/smf-select-data"),
+            "changes": [ambr],
+        }]});
+        assert_eq!(
+            post_sdm_notify(supi, Some(&token), &other).await.status,
+            404
+        );
+        let empty = json!({"notifyItems": []});
+        assert_eq!(
+            post_sdm_notify(supi, Some(&token), &empty).await.status,
+            400
+        );
+        assert_eq!(sdm_view(supi), before, "nothing applied");
+        // The S-NSSAIs unchanged: applied (the slices are compared, not the body).
+        let same = am_data_change(
+            supi,
+            json!([ambr, {"op": "REPLACE", "path": "/nssai",
+                          "newValue": {"defaultSingleNssais": [{"sst": 1}]}}]),
+        );
+        assert_eq!(post_sdm_notify(supi, Some(&token), &same).await.status, 204);
+        assert_eq!(sdm_view(supi).0, 9_000_000, "applied");
+    }
+
+    /// #1748 (R11 MAJOR-2, TS 23.502 §4.5.1): for a CM-CONNECTED UE, NG-RAN enforces
+    /// the UE-AMBR it was given, and this AMF does not send the UE Context
+    /// Modification that would move it, so a change of the subscribed UE-AMBR is
+    /// refused with 400 and nothing is applied, the GPSI change beside it included.
+    /// A change that leaves the UE-AMBR as it is is applied.
+    ///
+    /// REVERT-VERIFIED: with `cm_connected` passed as `false` from the handler, the
+    /// refusal is a 204 and the UE-AMBR changes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ue_ambr_change_for_a_connected_ue_is_refused_and_applies_nothing_1748() {
+        let _serial = dereg_queue_test_lock().lock().await;
+        let supi = "imsi-001010000017488";
+        let ue = setup_ue(supi, true, true);
+        {
+            let ctx = amf_self();
+            let guard = ctx.read().expect("ctx");
+            guard.ue_store().with_mut(ue.id, |s| {
+                crate::sdm_notify::adopt_am_data(
+                    supi,
+                    &mut s.amf_ue,
+                    json!({"subscribedUeAmbr": {"uplink": "1 Mbps", "downlink": "2 Mbps"}}),
+                );
+            });
+        }
+        assert!(ue_ng_connected(&ue), "CM-CONNECTED");
+        let before = sdm_view(supi);
+        let token = format!("sdm-{supi}");
+        let body = am_data_change(
+            supi,
+            json!([
+                {"op": "REPLACE", "path": "/subscribedUeAmbr",
+                 "newValue": {"uplink": "5 Mbps", "downlink": "10 Mbps"}},
+                {"op": "REPLACE", "path": "/gpsis", "newValue": ["msisdn-4917488"]},
+            ]),
+        );
+        let resp = post_sdm_notify(supi, Some(&token), &body).await;
+        assert_eq!(resp.status, 400, "{:?}", resp.http.content);
+        assert_eq!(problem_cause(&resp), "UNSPECIFIED_MSG_FAILURE");
+        assert_eq!(sdm_view(supi), before, "nothing applied");
+        let gpsi_only = am_data_change(
+            supi,
+            json!([{"op": "REPLACE", "path": "/gpsis", "newValue": ["msisdn-4917488"]}]),
+        );
+        assert_eq!(
+            post_sdm_notify(supi, Some(&token), &gpsi_only).await.status,
+            204
+        );
+        assert_eq!(sdm_view(supi).2.as_deref(), Some("msisdn-4917488"));
+    }
+
+    /// #1748: a notification is acted on only with the UE's current SDM subscription
+    /// token: a forged token, another UE's token and, for a UE whose subscription
+    /// has a token, the token-less URI are 404 and change nothing, as is a UE this
+    /// AMF does not hold. The token-less URI is served for a context restored from
+    /// before #1518 whose subscription has no token yet, and no longer once it has
+    /// one (the takeover or restore re-subscription's, `apply_takeover_uecm`).
+    ///
+    /// REVERT-VERIFIED: with the handler's token check removed, the forged-token
+    /// case answers 204 and the GPSI changes; with the token-less form served
+    /// whatever the token, the tokened UE's token-less case answers 204.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_sdm_notification_on_another_token_is_404_and_changes_nothing_1748() {
+        let _serial = dereg_queue_test_lock().lock().await;
+        let supi = "imsi-001010000017484";
+        let other = "imsi-001010000017485";
+        let legacy = "imsi-001010000017486";
+        let _ue = setup_ue(supi, true, true);
+        let _other = setup_ue(other, true, true);
+        let legacy_ue = setup_ue_with_tokens(legacy, true, true, false);
+        let change = |s: &str| {
+            am_data_change(
+                s,
+                json!([{"op": "REPLACE", "path": "/gpsis", "newValue": ["msisdn-4917484"]}]),
+            )
+        };
+        let before = sdm_view(supi);
+        for token in [
+            Some("sdm-forged".to_string()),
+            Some(format!("sdm-{other}")),
+            None,
+        ] {
+            let resp = post_sdm_notify(supi, token.as_deref(), &change(supi)).await;
+            assert_eq!(resp.status, 404, "{token:?}");
+        }
+        assert_eq!(sdm_view(supi), before, "nothing applied");
+        let unknown = "imsi-001010000017489";
+        let resp = post_sdm_notify(unknown, Some("sdm-x"), &change(unknown)).await;
+        assert_eq!(resp.status, 404);
+
+        // A context from before #1518: its subscription's token-less URI is served.
+        assert_eq!(
+            post_sdm_notify(legacy, None, &change(legacy)).await.status,
+            204
+        );
+        assert_eq!(sdm_view(legacy).2.as_deref(), Some("msisdn-4917484"));
+        // Re-subscribed with a token: the token-less URI no longer is.
+        {
+            let ctx = amf_self();
+            let guard = ctx.read().expect("ctx");
+            guard.ue_store().with_mut(legacy_ue.id, |s| {
+                s.amf_ue.sdm_notify_token = Some("sdm-adopted".to_string());
+            });
+        }
+        assert_eq!(
+            post_sdm_notify(legacy, None, &change(legacy)).await.status,
+            404
+        );
+        assert_eq!(
+            post_sdm_notify(legacy, Some("sdm-adopted"), &change(legacy))
+                .await
+                .status,
+            204
+        );
+    }
+
+    /// #1748, the #1522 rule: on an OAuth2-required listener the SDM data change
+    /// notification skips the bearer only from a verified UDM (RFC 9310 NFTypes UDM,
+    /// and a UDM in this AMF's NRF cache) on the UE's current token. Another NF
+    /// type, a certificate without NFTypes, a peer never discovered as a UDM, no
+    /// certificate, or a stale token is held to the bearer.
+    ///
+    /// REVERT-VERIFIED: with the exemption's `is_verified_udm` check dropped, the
+    /// AMF-typed and undiscovered peers are admitted; with its token check dropped,
+    /// the stale token is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_sdm_notify_exemption_admits_only_a_verified_udm_with_the_current_token_1748() {
+        use nextgcore_sbi::callback_auth::VerifiedPeer;
+        let _cache = crate::sbi_path::nf_cache_test_lock().lock().await;
+        let _serial = dereg_queue_test_lock().lock().await;
+        let supi = "imsi-001010000017487";
+        let _ue = setup_ue(supi, true, true);
+        let sbi = nextgcore_sbi::context::global_context();
+        let (udm, amf) = (
+            "4e3c1748-0000-4000-8000-00000000ud01",
+            "4e3c1748-0000-4000-8000-0000000am001",
+        );
+        sbi.add_nf_instance(nextgcore_sbi::context::NfInstance::new(
+            udm,
+            nextgcore_sbi::types::NfType::Udm,
+        ))
+        .await;
+        sbi.add_nf_instance(nextgcore_sbi::context::NfInstance::new(
+            amf,
+            nextgcore_sbi::types::NfType::Amf,
+        ))
+        .await;
+        let peer = |id: &str, types: &[&str]| {
+            Some(VerifiedPeer {
+                nf_instance_id: id.to_string(),
+                nf_types: types.iter().map(|t| t.to_string()).collect(),
+            })
+        };
+        let admits = |token: String, p: Option<VerifiedPeer>| async move {
+            nextgcore_sbi::callback_auth::admits_without_bearer_from(
+                &oauth2_callback_exemptions(),
+                "POST",
+                &format!("/namf-callback/v1/{supi}/sdmsubscription-notify/{token}"),
+                p.as_ref(),
+            )
+            .await
+        };
+        let token = format!("sdm-{supi}");
+        let admitted = admits(token.clone(), peer(udm, &["UDM"])).await;
+        let typed_amf = admits(token.clone(), peer(udm, &["AMF"])).await;
+        let untyped = admits(token.clone(), peer(udm, &[])).await;
+        let other_nf = admits(token.clone(), peer(amf, &["UDM"])).await;
+        let undiscovered = admits(token.clone(), peer("not-discovered", &["UDM"])).await;
+        let no_peer = admits(token.clone(), None).await;
+        let stale = admits("sdm-stale".to_string(), peer(udm, &["UDM"])).await;
+        sbi.remove_nf_instance(udm).await;
+        sbi.remove_nf_instance(amf).await;
+        assert!(admitted, "the discovered UDM with the current token");
+        assert!(!typed_amf, "NFTypes=AMF");
+        assert!(!untyped, "no NFTypes");
+        assert!(!other_nf, "a peer the NRF cache holds as an AMF");
+        assert!(!undiscovered, "a peer never discovered");
+        assert!(!no_peer, "no verified certificate");
+        assert!(!stale, "a stale token");
     }
 
     /// #753: after an AMF restart the UE registers again (new UECM registration,

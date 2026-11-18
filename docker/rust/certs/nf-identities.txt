@@ -12,8 +12,8 @@
 #     not match any certificate.
 #   - <nfType> is the nfType the daemon puts in its NFProfile, in the
 #     TS 29.510 §6.1.6.3.3 enumeration that TS 33.310 §6.1.3c.3 requires for
-#     NFTypes (mbsmfd registers "MB_SMF"; #1680 tracks the "MBSMF" spelling
-#     still used by nextgcore_sbi::NfType and its instance-ID variable).
+#     NFTypes (mbsmfd registers "MB_SMF", which nextgcore_sbi::NfType and its
+#     instance-ID variable NEXTGCORE_MB_SMF_INSTANCE_ID also use since #1680).
 # check-nf-identities.py fails CI when a compose file pins a different ID.
 #
 # <addresses> is a comma-separated list of the NF's IP addresses on the
@@ -41,6 +41,9 @@
 #                     AFs that register at the NRF
 #   fl-af             docker-compose.demo-d445a.yml: nr-fl-server, the FL AF
 #                     (configs/demo-d445a/af.yaml)
+# Kubernetes only (k8s/nf-tls-secrets.sh issues Secret nf-tls-<cert name>):
+#   gnb-exporter      deploy/eks/overlays/demo-d441a-congestion-loop: the gNB's
+#                     congestion exporter, an AF (gnb-config.yaml nf_instance_id)
 nrf     NRF     6b1d7e3c-0000-4000-8000-0000000000f0  172.23.0.10
 ausf    AUSF    6b1d7e3c-0000-4000-8000-00000000a05f  172.23.0.11
 udm     UDM     6b1d7e3c-0000-4000-8000-000000000d10  172.23.0.12
@@ -70,3 +73,4 @@ eas-local     AF      6b1d7e3c-0000-4000-8000-0000000471a1  -
 eas-regional  AF      6b1d7e3c-0000-4000-8000-0000000471a2  -
 eas-cloud     AF      6b1d7e3c-0000-4000-8000-0000000471a3  -
 fl-af         AF      6b1d7e3c-0000-4000-8000-00000000480a  -
+gnb-exporter  AF      6b1d7e3c-0000-4000-8000-00000000465a  -

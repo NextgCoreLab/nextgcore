@@ -133,6 +133,16 @@ pub enum SbiError {
         status: u16,
         retry_after: Option<std::time::Duration>,
     },
+    /// The peer's OAuth2 gate refused this AMF's access token for `what`: a 401, or
+    /// since #1766 a 403 for a scope or audience mismatch, carrying a `Bearer`
+    /// challenge (TS 29.500 §6.7.3, [`SbiResponse::is_bearer_refusal`]).
+    ///
+    /// #1779 review M1: kept apart from a service's own refusal because a 403 is
+    /// also how the UDM, the PCF or the SMF says "this UE may not", which the AMF
+    /// answers with 5GMM #7. A token misconfiguration must not read as that: #7 has
+    /// the UE treat its USIM as invalid for 5GS until switched off (TS 24.501
+    /// §5.5.1.2.5).
+    TokenRefused { what: String, status: u16 },
 }
 
 impl std::fmt::Display for SbiError {
@@ -152,6 +162,10 @@ impl std::fmt::Display for SbiError {
             SbiError::PeerStatus { what, status, .. } => {
                 write!(f, "Request failed: {what} returned status {status}")
             }
+            SbiError::TokenRefused { what, status } => write!(
+                f,
+                "Request failed: {what}: the peer refused this AMF's access token (HTTP {status})"
+            ),
         }
     }
 }
@@ -1398,6 +1412,9 @@ pub async fn call_smf_create_sm_context(
         .await
         .map_err(|e| SbiError::RequestFailed(format!("SMF request failed: {e}")))?;
 
+    if response.is_bearer_refusal() {
+        return Err(token_refused("SMF", &response));
+    }
     if !response.is_success() {
         return Err(SbiError::SmfRefused {
             status: response.status,
@@ -1487,10 +1504,7 @@ pub async fn call_smf_deactivate_up_connection(
         .await
         .map_err(|e| SbiError::RequestFailed(format!("SMF UP deactivation failed: {e}")))?;
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "SMF UP deactivation returned status {}",
-            response.status
-        )));
+        return Err(status_failure("SMF UP deactivation", &response));
     }
     Ok(())
 }
@@ -1517,9 +1531,31 @@ pub(crate) const PEER_UPDATE_RETRY_AFTER_CAP: std::time::Duration =
 pub(crate) const PEER_UPDATE_RETRY_AFTER_CAP: std::time::Duration =
     std::time::Duration::from_millis(300);
 
+/// #1779 review M1: the error for a peer's non-success `response` to `what`,
+/// [`SbiError::TokenRefused`] when the peer's OAuth2 gate refused the token.
+fn token_refused(what: &str, response: &SbiResponse) -> SbiError {
+    SbiError::TokenRefused {
+        what: what.to_string(),
+        status: response.status,
+    }
+}
+
+/// The error for a peer's non-success `response` to the request `what`:
+/// `"{what} returned status {status}"`, or [`SbiError::TokenRefused`] when the
+/// peer's OAuth2 gate refused this AMF's token (#1779 review M1).
+fn status_failure(what: &str, response: &SbiResponse) -> SbiError {
+    if response.is_bearer_refusal() {
+        return token_refused(what, response);
+    }
+    SbiError::RequestFailed(format!("{what} returned status {}", response.status))
+}
+
 /// The error for a peer's non-success `response` to the request `what`, with its
 /// status and its `Retry-After` (delta-seconds; an HTTP-date is not parsed).
 fn peer_status(what: &str, response: &SbiResponse) -> SbiError {
+    if response.is_bearer_refusal() {
+        return token_refused(what, response);
+    }
     SbiError::PeerStatus {
         what: what.to_string(),
         status: response.status,
@@ -1563,7 +1599,10 @@ pub(crate) fn peer_update_retry_wait(n: u32, e: &SbiError) -> Option<std::time::
             }
         }
         SbiError::SmfRefused { status, .. } => retryable_status(*status).then_some(backoff),
-        SbiError::ResponseParseError(_) | SbiError::InvalidState => None,
+        // A 401/403 status was never retried (#1779 review M1 keeps that).
+        SbiError::ResponseParseError(_)
+        | SbiError::InvalidState
+        | SbiError::TokenRefused { .. } => None,
         SbiError::RequestFailed(_)
         | SbiError::Timeout
         | SbiError::GatewayTimeout
@@ -1659,10 +1698,7 @@ pub async fn call_smf_activate_up_connection(
         .await
         .map_err(|e| SbiError::RequestFailed(format!("SMF UP activation failed: {e}")))?;
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "SMF UP activation returned status {}",
-            response.status
-        )));
+        return Err(status_failure("SMF UP activation", &response));
     }
     let response_body: serde_json::Value = response
         .http
@@ -1927,10 +1963,7 @@ pub async fn call_smf_update_sm_context_n1_at(
         .await
         .map_err(|e| SbiError::RequestFailed(format!("SMF update (N1) failed: {e}")))?;
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "SMF update (N1) returned status {}",
-            response.status
-        )));
+        return Err(status_failure("SMF update (N1)", &response));
     }
     let response_body: serde_json::Value = response
         .http
@@ -2082,10 +2115,7 @@ pub async fn call_smf_release_sm_context(
         .map_err(|e| SbiError::RequestFailed(format!("SMF release failed: {e}")))?;
 
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "SMF release returned status {}",
-            response.status
-        )));
+        return Err(status_failure("SMF release", &response));
     }
 
     log::info!("SMF SM Context Released: ref={sm_context_ref}");
@@ -2144,10 +2174,7 @@ pub async fn call_smf_retrieve_sm_context(
         .map_err(|e| SbiError::RequestFailed(format!("SMF retrieve failed: {e}")))?;
 
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "SMF retrieve returned status {}",
-            response.status
-        )));
+        return Err(status_failure("SMF retrieve", &response));
     }
 
     let Some(content) = response.http.content.as_deref() else {
@@ -2250,10 +2277,7 @@ pub async fn call_ausf_authenticate_with_resync(
         .map_err(|e| SbiError::RequestFailed(format!("AUSF request failed: {e}")))?;
 
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "AUSF returned status {}",
-            response.status
-        )));
+        return Err(status_failure("AUSF", &response));
     }
 
     let response_body: serde_json::Value = match &response.http.content {
@@ -2328,10 +2352,7 @@ pub async fn call_ausf_5g_aka_confirm(
         .map_err(|e| SbiError::RequestFailed(format!("AUSF confirmation failed: {e}")))?;
 
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "AUSF confirmation returned status {}",
-            response.status
-        )));
+        return Err(status_failure("AUSF confirmation", &response));
     }
 
     let response_body: serde_json::Value = match &response.http.content {
@@ -3385,7 +3406,9 @@ pub async fn call_lmf_cancel_location(
     // 403 LOCATION_SESSION_UNKNOWN is the LMF saying the LDR is already gone, which is
     // the outcome the consumer asked for. Treated as success so a duplicate
     // cancellation is not reported as a failure.
-    if response.status == 403 {
+    // #1766: unless it is the LMF's OAuth2 gate refusing our token, which is not
+    // the LDR being gone.
+    if response.status == 403 && !response.is_bearer_refusal() {
         log::debug!(
             "LMF has no active LDR [{ldr_reference}]; the cancellation is already in effect"
         );
@@ -3808,6 +3831,32 @@ pub struct AmDataResponse {
     /// #1222: `mpsPriority` or `mcsPriority` is true (TS 29.503 §6.1.6.2.4): the
     /// subscriber has an MPS or MCX priority subscription.
     pub priority_subscription: bool,
+    /// #1748: the whole am-data body as the UDM gave it ([`am_data_document`]),
+    /// which a data change notification is applied to.
+    pub document: serde_json::Value,
+}
+
+/// #1748: the `AccessAndMobilitySubscriptionData` members (TS 29.503 §6.1.6.2.4) this
+/// AMF acts on, i.e. the ones [`parse_am_data`] reads. A data change notification
+/// (TS 29.503 §5.2.2.5.2) that changes any other member is refused as a whole, so
+/// the UDM is never told a change was applied that the AMF ignored.
+pub const AM_DATA_APPLIED_MEMBERS: [&str; 5] = [
+    "subscribedUeAmbr",
+    "gpsis",
+    "mpsPriority",
+    "mcsPriority",
+    "nssai",
+];
+
+/// #1748: the whole am-data body, kept so a data change notification can tell a
+/// change of a member this AMF does not act on from one that leaves it as it was
+/// (an empty object for a body that is not one).
+pub fn am_data_document(json: &serde_json::Value) -> serde_json::Value {
+    if json.is_object() {
+        json.clone()
+    } else {
+        serde_json::Value::Object(serde_json::Map::new())
+    }
 }
 
 /// Accept a TS 29.571 `Gpsi` only in one of its two NAMED forms —
@@ -3867,10 +3916,7 @@ pub async fn call_udm_sdm_get_am_data(
         .map_err(|e| SbiError::RequestFailed(format!("SDM am-data failed: {e}")))?;
 
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "SDM am-data returned status {}",
-            response.status
-        )));
+        return Err(status_failure("SDM am-data", &response));
     }
 
     let out = response
@@ -3900,8 +3946,11 @@ pub async fn call_udm_sdm_get_am_data(
 /// without standing up a UDM: `gpsis` selection in particular has more than one
 /// interesting input (several entries, a malformed entry, an empty array) and
 /// none of them are expressible through the async caller.
-fn parse_am_data(json: &serde_json::Value, supi: &str) -> AmDataResponse {
-    let mut out = AmDataResponse::default();
+pub(crate) fn parse_am_data(json: &serde_json::Value, supi: &str) -> AmDataResponse {
+    let mut out = AmDataResponse {
+        document: am_data_document(json),
+        ..AmDataResponse::default()
+    };
     out.ue_ambr_uplink = json["subscribedUeAmbr"]["uplink"]
         .as_str()
         .map(String::from);
@@ -3946,18 +3995,21 @@ fn parse_am_data(json: &serde_json::Value, supi: &str) -> AmDataResponse {
 
 /// Nudm_SDM_Subscribe: POST /nudm-sdm/v2/{supi}/sdm-subscriptions (TS 29.503 5.2.2.3.2)
 ///
-/// Returns the subscription ID assigned by UDM.
+/// Returns the subscription ID assigned by UDM. #1748: the `callbackReference` ends
+/// in `notify_token`, which the caller keeps for the subscription only once this
+/// returns `Ok` ([`sdm_callback_reference`]).
 pub async fn call_udm_sdm_subscribe(
     udm_host: &str,
     udm_port: u16,
     supi: &str,
     amf_instance_id: &str,
+    notify_token: &str,
 ) -> SbiResult<String> {
     let client = peer_client(nextgcore_sbi::types::NfType::Udm, udm_host, udm_port);
 
     let body = serde_json::json!({
         "nfInstanceId": amf_instance_id,
-        "callbackReference": sdm_callback_reference(supi),
+        "callbackReference": sdm_callback_reference(supi, Some(notify_token)),
         "monitoredResourceUris": [format!("/nudm-sdm/v2/{supi}/am-data")],
         "implicitUnsubscribe": true
     });
@@ -3969,10 +4021,7 @@ pub async fn call_udm_sdm_subscribe(
         .map_err(|e| SbiError::RequestFailed(format!("SDM subscribe failed: {e}")))?;
 
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "SDM subscribe returned status {}",
-            response.status
-        )));
+        return Err(status_failure("SDM subscribe", &response));
     }
 
     let sub_id = response
@@ -4019,10 +4068,7 @@ pub async fn call_pcf_am_policy_create(
         .map_err(|e| SbiError::RequestFailed(format!("AM policy create failed: {e}")))?;
 
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "AM policy create returned status {}",
-            response.status
-        )));
+        return Err(status_failure("AM policy create", &response));
     }
 
     let assoc_id = response
@@ -4122,10 +4168,7 @@ pub async fn call_pcf_ue_policy_create(
         .map_err(|e| SbiError::RequestFailed(format!("UE policy create failed: {e}")))?;
 
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "UE policy create returned status {}",
-            response.status
-        )));
+        return Err(status_failure("UE policy create", &response));
     }
 
     let assoc_id = response
@@ -4168,10 +4211,7 @@ pub async fn call_pcf_ue_policy_delete(
         .map_err(|e| SbiError::RequestFailed(format!("UE policy delete failed: {e}")))?;
 
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "UE policy delete returned status {}",
-            response.status
-        )));
+        return Err(status_failure("UE policy delete", &response));
     }
 
     log::info!("Npcf_UEPolicyControl_Delete OK (polAssoId={pol_asso_id})");
@@ -4182,11 +4222,19 @@ pub async fn call_pcf_ue_policy_delete(
 /// (TS 29.503 §6.1.6.2.3 `SdmSubscription`), built from [`advertised_sbi_base`] as
 /// [`ue_policy_notification_uri`] is (#1210). It used to be a relative path, which a UDM
 /// cannot POST to.
-pub fn sdm_callback_reference(supi: &str) -> String {
-    format!(
+///
+/// #1748: ending in the subscription's token (`AmfUe::sdm_notify_token`) when it has
+/// one, as [`am_policy_notification_uri`]: `.../sdmsubscription-notify/{token}`. The
+/// token-less form is the URI of a subscription made before #1748.
+pub fn sdm_callback_reference(supi: &str, token: Option<&str>) -> String {
+    let base = format!(
         "{}/namf-callback/v1/{supi}/sdmsubscription-notify",
         advertised_sbi_base()
-    )
+    );
+    match token {
+        Some(token) => format!("{base}/{token}"),
+        None => base,
+    }
 }
 
 /// The absolute AM policy `notificationUri` for `supi` (TS 29.507 §5.6.2.3), as
@@ -4283,10 +4331,7 @@ pub async fn call_udm_sdm_unsubscribe(
         .await
         .map_err(|e| SbiError::RequestFailed(format!("SDM unsubscribe failed: {e}")))?;
     if !response.is_success() && response.status != 404 {
-        return Err(SbiError::RequestFailed(format!(
-            "SDM unsubscribe returned status {}",
-            response.status
-        )));
+        return Err(status_failure("SDM unsubscribe", &response));
     }
     log::info!("[{supi}] Nudm_SDM_Unsubscribe OK (subscriptionId={subscription_id})");
     Ok(())
@@ -4310,10 +4355,7 @@ pub async fn call_pcf_am_policy_delete(
         .map_err(|e| SbiError::RequestFailed(format!("AM policy delete failed: {e}")))?;
 
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "AM policy delete returned status {}",
-            response.status
-        )));
+        return Err(status_failure("AM policy delete", &response));
     }
 
     log::info!("Npcf_AMPolicyControl_Delete OK (polAssoId={pol_asso_id})");
@@ -4381,6 +4423,15 @@ pub async fn call_nsacf_ue_admission(
     let admitted = match response.status {
         // All requested S-NSSAIs admitted.
         204 => true,
+        // #1766: the NSACF's OAuth2 gate refusing our token is not an admission
+        // decision; it degrades open like any other unexpected answer.
+        401 | 403 if response.is_bearer_refusal() => {
+            log::warn!(
+                "NSACF refused the AMF's access token ({}), admitting (degrade-open)",
+                response.status
+            );
+            true
+        }
         // Total failure (ProblemDetails) -> not admitted.
         403 => false,
         // Partial failure: UeACResponseData.acuFailureList keyed by SUPI. Our
@@ -4429,10 +4480,7 @@ pub async fn call_udm_uecm_deregistration(
         .map_err(|e| SbiError::RequestFailed(format!("UECM deregistration failed: {e}")))?;
 
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "UECM deregistration returned status {}",
-            response.status
-        )));
+        return Err(status_failure("UECM deregistration", &response));
     }
     log::info!("[{supi}] Nudm_UECM amf-3gpp-access purge OK");
     Ok(())
@@ -5632,6 +5680,69 @@ mod tests {
         server.stop().await.expect("stop");
     }
 
+    /// #1748: the Nudm_SDM subscription's `callbackReference` is absolute and ends
+    /// in the subscription's token, which the route and the exemption check.
+    ///
+    /// REVERT-VERIFIED: with `sdm_callback_reference(supi, None)` in the body, the
+    /// token assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_sdm_subscription_s_callback_reference_carries_its_token_1748() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let sink = std::sync::Arc::clone(&seen);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        server
+            .start(move |req: nextgcore_sbi::message::SbiRequest| {
+                let sink = std::sync::Arc::clone(&sink);
+                async move {
+                    let body = req
+                        .http
+                        .content
+                        .as_deref()
+                        .and_then(|c| serde_json::from_str(c).ok())
+                        .unwrap_or_default();
+                    sink.lock().expect("sink").push(body);
+                    nextgcore_sbi::message::SbiResponse::with_status(201)
+                        .with_header("Location", "/nudm-sdm/v2/x/sdm-subscriptions/s-1748")
+                }
+            })
+            .await
+            .expect("stand-in UDM starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let supi = "imsi-001010000017491";
+        let token = new_callback_token();
+        let id = call_udm_sdm_subscribe("127.0.0.1", addr.port(), supi, "amf", &token)
+            .await
+            .expect("subscribed");
+        server.stop().await.expect("stop");
+        assert_eq!(id, "s-1748");
+        let seen = seen.lock().expect("seen").clone();
+        let cb = seen[0]["callbackReference"]
+            .as_str()
+            .expect("callbackReference");
+        assert!(cb.starts_with("http"), "absolute: {cb}");
+        assert!(
+            cb.ends_with(&format!(
+                "/namf-callback/v1/{supi}/sdmsubscription-notify/{token}"
+            )),
+            "{cb}"
+        );
+        assert_eq!(
+            nextgcore_sbi::log_redact::redact_callback_tokens(cb),
+            sdm_callback_reference(supi, Some(nextgcore_sbi::log_redact::REDACTED)),
+            "the token is redacted in a log line"
+        );
+    }
+
     // ------------------------------------------------------------------
     // nsacf-01/02 pairing: call_nsacf_ue_admission sends a nested
     // UeACRequestData and maps 204 / 200-acuFailureList / 403, degrade-open.
@@ -5672,6 +5783,14 @@ mod tests {
         assert!(op["snssai"]["sst"].is_u64(), "op carries snssai");
 
         match supi.as_str() {
+            // #1766: what the NSACF's OAuth2 gate answers for a token whose scope
+            // lacks nnsacf-nsac.
+            "imsi-scope" => nextgcore_sbi::message::SbiResponse::with_status(403)
+                .with_body(r#"{"status":403}"#, "application/problem+json")
+                .with_header(
+                    "WWW-Authenticate",
+                    r#"Bearer realm="5gc-sbi", error="insufficient_scope", scope="nnsacf-nsac""#,
+                ),
             "imsi-reject" => nextgcore_sbi::message::SbiResponse::with_status(403).with_body(
                 serde_json::json!({"status": 403, "cause": "ALL_SLICE_FAILED"}).to_string(),
                 "application/problem+json",
@@ -5736,6 +5855,25 @@ mod tests {
             .expect("ok");
             assert!(!r.admitted, "403 -> not admitted");
 
+            // #1766: a 403 from the NSACF's OAuth2 gate is not an admission
+            // decision, so it degrades open like any other unexpected answer.
+            let r = call_nsacf_ue_admission(
+                "127.0.0.1",
+                port,
+                "amf-1",
+                "imsi-scope",
+                1,
+                None,
+                "3GPP_ACCESS",
+                true,
+            )
+            .await
+            .expect("ok");
+            assert!(
+                r.admitted,
+                "403 insufficient_scope -> degrade-open, admitted"
+            );
+
             // 200 acuFailureList naming our SUPI -> not admitted.
             let r = call_nsacf_ue_admission(
                 "127.0.0.1",
@@ -5750,6 +5888,59 @@ mod tests {
             .await
             .expect("ok");
             assert!(!r.admitted, "200 acuFailureList[supi] -> not admitted");
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("round trip timed out");
+        server.stop().await.ok();
+    }
+
+    /// #1766: CancelLocation treats the LMF's 403 LOCATION_SESSION_UNKNOWN as the
+    /// cancellation already being in effect, and must not read the LMF's OAuth2
+    /// gate refusing our token (also a 403, since #1766) the same way.
+    #[tokio::test]
+    async fn lmf_cancel_location_403_bearer_refusal_is_not_already_gone_1766() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        server
+            .start(|req: nextgcore_sbi::message::SbiRequest| async move {
+                let body: serde_json::Value = req
+                    .http
+                    .content
+                    .as_deref()
+                    .and_then(|c| serde_json::from_str(c).ok())
+                    .unwrap_or_default();
+                let problem = nextgcore_sbi::message::SbiResponse::with_status(403);
+                match body["ldrReference"].as_str() {
+                    Some("ldr-gone") => problem.with_body(
+                        r#"{"status":403,"cause":"LOCATION_SESSION_UNKNOWN"}"#,
+                        "application/problem+json",
+                    ),
+                    Some("ldr-scope") => problem
+                        .with_body(r#"{"status":403}"#, "application/problem+json")
+                        .with_header(
+                            "WWW-Authenticate",
+                            r#"Bearer realm="5gc-sbi", error="insufficient_scope", scope="nlmf-loc""#,
+                        ),
+                    _ => nextgcore_sbi::message::SbiResponse::with_status(204),
+                }
+            })
+            .await
+            .expect("start stub LMF");
+        let lmf = ("127.0.0.1", addr.port());
+        let cancel = |ldr: &'static str| {
+            call_lmf_cancel_location(lmf, "imsi-1", ldr, "http://gmlc/cb", None)
+        };
+        let run = async {
+            assert_eq!(cancel("ldr-gone").await, Ok(()), "LOCATION_SESSION_UNKNOWN");
+            let err = cancel("ldr-scope")
+                .await
+                .expect_err("a refused token is a failure");
+            assert!(err.contains("status 403"), "{err}");
         };
         tokio::time::timeout(std::time::Duration::from_secs(10), run)
             .await
@@ -7248,7 +7439,8 @@ mod tests_no_wildcard_uri_1322 {
             sm_context_status_uri("imsi-001010000000001", 5, None),
             dereg_callback_uri("imsi-001010000000001", "t"),
             ue_policy_notification_uri("imsi-001010000000001", Some("t")),
-            sdm_callback_reference("imsi-001010000000001"),
+            sdm_callback_reference("imsi-001010000000001", Some("t")),
+            sdm_callback_reference("imsi-001010000000001", None),
             am_policy_notification_uri("imsi-001010000000001", Some("t")),
             crate::racs::notification_uri(),
             crate::nrf_subscription::notification_uri(),
@@ -7558,7 +7750,7 @@ mod body_cap_tests {
         })
         .await;
         assert_capped_at("SDM subscribe", &len, cap, || async {
-            s(call_udm_sdm_subscribe("127.0.0.1", port, "imsi-1674", "amf").await)
+            s(call_udm_sdm_subscribe("127.0.0.1", port, "imsi-1674", "amf", "t").await)
         })
         .await;
         assert_capped_at("SDM unsubscribe", &len, cap, || async {

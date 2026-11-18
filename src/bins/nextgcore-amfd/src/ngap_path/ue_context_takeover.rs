@@ -65,8 +65,16 @@ pub(crate) struct TakeoverUecmAnswer {
     pub(crate) token: String,
     pub(crate) accepted: bool,
     /// #1210: the SDM subscription this AMF made after the registration, if the UDM
-    /// accepted it.
-    pub(crate) sdm_subscription_id: Option<String>,
+    /// accepted it. #1748: with the token its `callbackReference` ends in, the UE's
+    /// from now on (a context from before #1518 is moved to a tokened URI this way).
+    pub(crate) sdm_subscription: Option<SdmResubscription>,
+}
+
+/// #1748: the SDM subscription a takeover or restore made, as the UDM accepted it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SdmResubscription {
+    pub(crate) id: String,
+    pub(crate) notify_token: String,
 }
 
 /// Which of a UE's policy associations a re-issued `notificationUri` is for (#1642).
@@ -405,7 +413,7 @@ impl NgapServer {
             }
             // #1210: the SDM subscription, after the registration: with
             // `implicitUnsubscribe` the UDM ends the old AMF's when this AMF registers.
-            let sdm_subscription_id = if result.is_ok() {
+            let sdm_subscription = if result.is_ok() {
                 takeover_sdm_resubscribe(
                     &host,
                     port,
@@ -422,7 +430,7 @@ impl NgapServer {
                     supi: uecm_supi,
                     token,
                     accepted: result.is_ok(),
-                    sdm_subscription_id,
+                    sdm_subscription,
                 },
             ))
         });
@@ -625,7 +633,10 @@ impl NgapServer {
                     .is_none_or(|sess| sess.sm_context_status_nonce.is_some())
             })
         };
-        if policies && sessions && state.amf_ue.sm_context_status_key.is_some() {
+        // #1748: and the SDM subscription's callbackReference, which a takeover or
+        // restore re-subscription tokens (`apply_takeover_uecm`).
+        let sdm = state.sdm_subscription_id.is_none() || state.amf_ue.sdm_notify_token.is_some();
+        if policies && sessions && sdm && state.amf_ue.sm_context_status_key.is_some() {
             self.ue_auth_state
                 .with_mut(id, |s| s.amf_ue.pre_1518_callbacks = false);
             log::info!("UE {id}: every callback is tokened now; no longer a pre-#1518 context");
@@ -778,10 +789,16 @@ impl NgapServer {
             self.ue_auth_state.with_mut(id, |s| {
                 s.amf_ue.uecm_dereg_token = Some(answer.token.clone());
                 // #1210: this AMF's own SDM subscription replaces the old AMF's.
-                if let Some(sub) = &answer.sdm_subscription_id {
-                    s.sdm_subscription_id = Some(sub.clone());
+                // #1748: and its token replaces the old one, so a notification on the
+                // old subscription's URI is refused from now on.
+                if let Some(sub) = &answer.sdm_subscription {
+                    s.sdm_subscription_id = Some(sub.id.clone());
+                    s.amf_ue.sdm_notify_token = Some(sub.notify_token.clone());
                 }
             });
+            if answer.sdm_subscription.is_some() {
+                self.clear_pre_1518_once_migrated(id);
+            }
         }
     }
 
@@ -933,25 +950,35 @@ async fn takeover_pcf(pinned: Option<(String, u16)>) -> (String, u16) {
 
 /// #1210: subscribe to a taken-over UE's SDM data under this AMF's callback, then remove
 /// the old AMF's subscription `old` (TS 29.503 §5.2.2.3.2, §5.2.2.4.2). Returns the new
-/// subscription's id, or `None` when the UDM refused it. The old one is then left
-/// alone, so the UE keeps the notifications it has.
+/// subscription's id and the token of its `callbackReference` (#1748), or `None` when
+/// the UDM refused it. The old one is then left alone, so the UE keeps the
+/// notifications it has, on the token it holds.
 async fn takeover_sdm_resubscribe(
     udm_host: &str,
     udm_port: u16,
     supi: &str,
     amf_instance_id: &str,
     old: Option<&str>,
-) -> Option<String> {
-    let new =
-        match crate::sbi_path::call_udm_sdm_subscribe(udm_host, udm_port, supi, amf_instance_id)
-            .await
-        {
-            Ok(id) => id,
-            Err(e) => {
-                log::warn!("[{supi}] takeover SDM subscription failed: {e}");
-                return None;
-            }
-        };
+) -> Option<SdmResubscription> {
+    // #1748: a fresh token for the new subscription's callbackReference. It is the
+    // UE's only once the answer is applied (`apply_takeover_uecm`); until then the
+    // UE keeps the token of the subscription it had.
+    let notify_token = crate::sbi_path::new_callback_token();
+    let new = match crate::sbi_path::call_udm_sdm_subscribe(
+        udm_host,
+        udm_port,
+        supi,
+        amf_instance_id,
+        &notify_token,
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            log::warn!("[{supi}] takeover SDM subscription failed: {e}");
+            return None;
+        }
+    };
     if let Some(old) = old.filter(|old| *old != new) {
         if let Err(e) =
             crate::sbi_path::call_udm_sdm_unsubscribe(udm_host, udm_port, supi, old).await
@@ -959,7 +986,10 @@ async fn takeover_sdm_resubscribe(
             log::warn!("[{supi}] the old AMF's SDM subscription {old} not removed: {e}");
         }
     }
-    Some(new)
+    Some(SdmResubscription {
+        id: new,
+        notify_token,
+    })
 }
 
 /// #1329 review: the bound on restart-restore serving-AMF updates in flight, overall

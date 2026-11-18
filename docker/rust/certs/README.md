@@ -98,6 +98,25 @@ uid `SBI_TLS_OWNERS` names for a nextgsim sidecar that drops to its own). Each
 NF mounts only its own volume, read-only, at `/etc/nextgcore/certs`, so no NF
 container can read another NF's key.
 
+The Kubernetes deployments (`k8s/deploy.sh`, `deploy/eks/deploy-eks.sh`) do
+the same with Secrets: [`k8s/nf-tls-secrets.sh`](../../../k8s/nf-tls-secrets.sh)
+issues the PKI into a private temporary directory, deleted on exit (the CA key
+never enters the cluster), and creates one Secret per `nf-tls-<name>` the pods
+mount: `ca.crt`, `<name>.crt`, `<name>.key`, named `nf-tls-<name>-<version>`
+after its CA (the first 16 hex digits of the sha256 of `ca.crt`). The pod mounts it read-only
+at `/etc/nextgcore/certs` with `defaultMode: 0440` and `fsGroup`, so the
+image's non-root user reads it; root-run nextgsim sidecars that drop to their
+own uid get it `0400` and hand the key to that uid. `nf-tls-ca` holds `ca.crt`
+only, for a client that only discovers. A re-run keeps the newest complete,
+current version (each certificate chains, matches its key, names its row and is
+valid 30 more days). Otherwise it creates a whole new version beside the old
+one, which it never modifies: a failed or interrupted issue leaves the running
+pods on their CA, and its partial version is never used. The deploy scripts
+point the manifests at the version in force (`--stamp`: `secretName` and the
+`nextg.io/nf-tls-ca` annotation), so applying them rolls the NRF and its clients
+together. Older versions are left in place, unreferenced; nothing deletes them.
+`check-nf-identities.py --k8s` checks every rendered kustomization.
+
 Certificates (`*.crt`, `ca.crt`) are public and written `0644`, so any
 container user can read them through a bind mount.
 

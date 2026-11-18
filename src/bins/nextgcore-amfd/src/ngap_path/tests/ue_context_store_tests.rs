@@ -53,6 +53,10 @@ fn seed_registered_ue(
     ue.amf_ue.policy_association.notify_token = Some(format!("amp-{supi}"));
     ue.amf_ue.ue_policy_association.notify_token = Some(format!("uep-{supi}"));
     ue.sdm_subscription_id = Some(format!("sdm-{id}"));
+    ue.amf_ue.sdm_notify_token = Some(format!("sdmtok-{id}"));
+    ue.amf_ue.am_data = Some(serde_json::json!({
+        "subscribedUeAmbr": { "uplink": "1 Mbps", "downlink": "2 Mbps" },
+    }));
     if connected {
         ue.cm_idle = false;
         ue.reachability = None;
@@ -235,6 +239,13 @@ async fn a_restored_ue_s_service_request_reactivates_its_stored_session() {
     assert_eq!(a.ue_ambr, b.ue_ambr);
     assert_eq!(a.uecm_dereg_token, b.uecm_dereg_token);
     assert_eq!(a.sm_context_status_key, b.sm_context_status_key);
+    // #1748: the SDM subscription's token and the kept am-data are stored too.
+    assert!(
+        b.sdm_notify_token.is_some() && b.am_data.is_some(),
+        "seeded"
+    );
+    assert_eq!(a.sdm_notify_token, b.sdm_notify_token);
+    assert_eq!(a.am_data, b.am_data);
     assert_eq!(
         after.sm_context_refs.get(&(new_id, 5)).map(String::as_str),
         Some("ref-686-a")
@@ -1102,6 +1113,9 @@ async fn a_pre_1518_record_restores_marked_and_keeps_its_marker_1518() {
     let obj = doc.as_object_mut().expect("object");
     obj.remove("callback_tokens");
     obj.remove("sm_context_status_key");
+    // #1748: nor the SDM subscription's token and the kept am-data.
+    obj.remove("sdm_notify_token");
+    obj.remove("am_data");
     for assoc in ["policy_association", "ue_policy_association"] {
         obj[assoc]
             .as_object_mut()
@@ -1392,6 +1406,8 @@ fn the_mongodb_backend_stores_loads_and_deletes() {
         sm_context_status_key: None,
         callback_tokens: false,
         sdm_subscription_id: None,
+        sdm_notify_token: None,
+        am_data: None,
         policy_association: Default::default(),
         ue_policy_association: Default::default(),
         security: super::super::ue_context_store::StoredSecurity {
@@ -1974,6 +1990,94 @@ async fn refusing_nf() -> (
     (server, addr.port(), seen)
 }
 
+/// A stand-in UDM that answers 500 to an SDM subscribe and 204 to everything else,
+/// recording what it was sent (#1748).
+async fn sdm_refusing_udm() -> (
+    nextgcore_sbi::server::SbiServer,
+    u16,
+    Arc<std::sync::Mutex<Vec<(String, String)>>>,
+) {
+    use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+    use nextgcore_sbi::server::{SbiServer as NSbiServer, SbiServerConfig as NSbiCfg};
+    let seen: Arc<std::sync::Mutex<Vec<(String, String)>>> = Arc::default();
+    let sink = Arc::clone(&seen);
+    let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let server = NSbiServer::on_listener(NSbiCfg::new(addr), listener);
+    server
+        .start(move |req: SReq| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let uri = req.header.uri.clone();
+                sink.lock()
+                    .unwrap()
+                    .push((uri.clone(), req.http.content.clone().unwrap_or_default()));
+                if uri.ends_with("/sdm-subscriptions") {
+                    SResp::with_status(500)
+                } else {
+                    SResp::no_content()
+                }
+            }
+        })
+        .await
+        .expect("stand-in starts");
+    for _ in 0..200 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    (server, addr.port(), seen)
+}
+
+/// **#1748.** The UDM accepts the takeover's UECM registration and refuses its SDM
+/// subscription: the UE keeps the SDM subscription and token it had, because the
+/// UDM's subscription is still that one (the new token, which the refused request
+/// carried, is never the UE's).
+///
+/// REVERT-VERIFIED: with `takeover_sdm_resubscribe` answering its new token on the
+/// UDM's refusal too, the old token is gone and the assertion names it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_takeover_sdm_subscription_keeps_the_old_token_1748() {
+    let (_smf, port, _seen) = fake_activating_smf().await;
+    let (_udm, udm_port, udm_seen) = sdm_refusing_udm().await;
+    let _env = SmfEnvGuard::acquire(port).await;
+    crate::context::amf_context_init(64, 1024, 4096);
+    let (tmsi, supi) = (0x0174_8101u32, "imsi-001010000174811");
+    let (_backend, original, mut peer) =
+        ue_of_a_failed_amf(1_748_101, tmsi, supi, "ref-1748-a", port, false).await;
+    peer.udm_override = Some(("127.0.0.1".to_string(), udm_port));
+    peer.sent_ngap = Some(Vec::new());
+    let nas = protected_idle_service_request(&original.amf_ue, tmsi, original.amf_ue.ul_count + 1);
+    peer.handle_initial_ue_message(1, &service_request_initial_ue(nas))
+        .await
+        .expect("handled");
+    for _ in 0..3 {
+        settle_offloaded_sbi(&mut peer).await;
+    }
+    let udm = udm_seen.lock().unwrap().clone();
+    let (_, sub) = udm
+        .iter()
+        .find(|(uri, _)| uri.ends_with(&format!("/nudm-sdm/v2/{supi}/sdm-subscriptions")))
+        .unwrap_or_else(|| panic!("the SDM subscription was tried: {udm:?}"));
+    let sub: serde_json::Value = serde_json::from_str(sub).expect("json");
+    let old = original.amf_ue.sdm_notify_token.clone().expect("seeded");
+    let tried = sub["callbackReference"]
+        .as_str()
+        .expect("callbackReference");
+    assert!(
+        tried.contains("/sdmsubscription-notify/") && !tried.ends_with(&old),
+        "a fresh token: {tried}"
+    );
+    let (id, ue) = peer.ue_auth_state.find_by_supi(supi).expect("taken over");
+    assert_eq!(
+        ue.amf_ue.sdm_notify_token.as_deref(),
+        Some(old.as_str()),
+        "the refused subscription's token is not the UE's"
+    );
+    assert_eq!(ue.sdm_subscription_id, original.sdm_subscription_id);
+    crash(&mut peer, id);
+}
+
 /// The UE of the "failed" AMF, stored under `dead`, and a peer of the set about to take
 /// it over. Returns (backend, the UE as stored, peer).
 async fn ue_of_a_failed_amf(
@@ -2518,10 +2622,6 @@ async fn a_takeover_points_the_sdm_subscription_and_the_policy_associations_at_t
     );
     let sub: serde_json::Value = serde_json::from_str(&udm[subscribe].1).expect("json");
     assert_eq!(sub["nfInstanceId"], instance);
-    assert_eq!(
-        sub["callbackReference"],
-        crate::sbi_path::sdm_callback_reference(supi)
-    );
     assert!(
         sub["callbackReference"]
             .as_str()
@@ -2533,6 +2633,14 @@ async fn a_takeover_points_the_sdm_subscription_and_the_policy_associations_at_t
         ue.sdm_subscription_id.as_deref(),
         Some("1"),
         "the stand-in's subscription id replaces the old AMF's"
+    );
+    // #1748: the new subscription's callbackReference ends in a fresh token, which
+    // is the UE's once the UDM accepted it.
+    let token = ue.amf_ue.sdm_notify_token.clone().expect("adopted");
+    assert_ne!(token, format!("sdmtok-{old_id}"), "a fresh token");
+    assert_eq!(
+        sub["callbackReference"],
+        crate::sbi_path::sdm_callback_reference(supi, Some(&token))
     );
 
     let pcf = pcf_seen.lock().unwrap().clone();
@@ -2675,6 +2783,9 @@ fn as_pre_1518(written: &StoredUeContext) -> StoredUeContext {
     let obj = doc.as_object_mut().expect("object");
     obj.remove("callback_tokens");
     obj.remove("sm_context_status_key");
+    // #1748: nor the SDM subscription's token and the kept am-data.
+    obj.remove("sdm_notify_token");
+    obj.remove("am_data");
     for assoc in ["policy_association", "ue_policy_association"] {
         obj[assoc]
             .as_object_mut()
@@ -2901,6 +3012,8 @@ async fn a_pre_1518_ue_moves_to_tokened_callbacks_once_its_peers_accept_1642() {
     for path in [
         format!("/namf-callback/v1/{supi}/am-policy-notify/update"),
         format!("/namf-callback/v1/{supi}/ue-policy-notify/update"),
+        // #1748: the SDM subscription was re-made with a token at restore.
+        format!("/namf-callback/v1/{supi}/sdmsubscription-notify"),
     ] {
         assert_eq!(
             namf_post(path.clone(), serde_json::json!({})).await,
@@ -2908,11 +3021,90 @@ async fn a_pre_1518_ue_moves_to_tokened_callbacks_once_its_peers_accept_1642() {
             "{path}: no longer served"
         );
     }
+    assert!(ue.amf_ue.sdm_notify_token.is_some(), "#1748: the SDM token");
 
     store_now(&mut after).await;
     assert!(
         alone.get(supi).expect("rewritten").callback_tokens,
         "the record is written as tokened"
+    );
+    crash(&mut after, now_id);
+}
+
+/// **#1748 with #1642.** A pre-#1518 UE whose SMF and PCF accept the re-issued URIs
+/// but whose UDM refuses the SDM re-subscription stays a pre-#1518 context: its SDM
+/// subscription's token-less callbackReference is still the one the UDM holds, so it
+/// is still served (a notification on it is applied), and the record is still
+/// written as pre-#1518.
+///
+/// REVERT-VERIFIED: with the SDM condition dropped from
+/// `clear_pre_1518_once_migrated`, the marker is cleared and the token-less SDM
+/// notification is 404.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_sdm_resubscription_keeps_a_pre_1518_ue_marked_1748() {
+    let (_smf, smf_port, _smf_seen, _) =
+        scripted_smf(|_| nextgcore_sbi::message::SbiResponse::no_content()).await;
+    let (_udm, udm_port, udm_seen) = sdm_refusing_udm().await;
+    let (_pcf, pcf_port, pcf_seen) = answering_nf(204).await;
+    let _env = SmfEnvGuard::acquire(smf_port).await;
+    let (id, sr_id, tmsi) = (17_480_301u64, 17_480_303u64, 0x1748_0301u32);
+    let supi = "imsi-001010001748301";
+    let (mut after, alone, restored_id, original) =
+        restored_pre_1518(id, tmsi, supi, smf_port, udm_port, pcf_port).await;
+    settle_until(&mut after, || psi5_nonce(restored_id).is_some()).await;
+    after.forced_amf_ue_ngap_id = Some(sr_id);
+    let restored = after.ue_auth_state.get(restored_id).expect("held");
+    let nas = protected_idle_service_request(&restored.amf_ue, tmsi, original.amf_ue.ul_count + 1);
+    after
+        .handle_initial_ue_message(1, &service_request_initial_ue(nas))
+        .await
+        .expect("handled");
+    let tokened = || {
+        crate::context::amf_self()
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .amf_ue_find_by_supi(supi)
+            .is_some_and(|ue| {
+                ue.policy_association.notify_token.is_some()
+                    && ue.ue_policy_association.notify_token.is_some()
+            })
+    };
+    settle_until(&mut after, tokened).await;
+    for _ in 0..3 {
+        settle_offloaded_sbi(&mut after).await;
+    }
+    assert!(
+        udm_seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(uri, _)| uri.ends_with("/sdm-subscriptions")),
+        "the SDM re-subscription was tried"
+    );
+    assert!(!uris_sent(&pcf_seen, "notificationUri").is_empty());
+    let (now_id, ue) = after.ue_auth_state.find_by_supi(supi).expect("held");
+    assert!(ue.amf_ue.sdm_notify_token.is_none(), "no SDM token adopted");
+    assert!(
+        ue.amf_ue.pre_1518_callbacks,
+        "its SDM callback is still token-less, so still a pre-#1518 context"
+    );
+    let change = serde_json::json!({"notifyItems": [{
+        "resourceId": format!("/nudm-sdm/v2/{supi}/am-data"),
+        "changes": [{"op": "REPLACE", "path": "/gpsis", "newValue": ["msisdn-4917483"]}],
+    }]});
+    assert_eq!(
+        namf_post(
+            format!("/namf-callback/v1/{supi}/sdmsubscription-notify"),
+            change
+        )
+        .await,
+        204,
+        "the token-less SDM URI the UDM holds is still served"
+    );
+    store_now(&mut after).await;
+    assert!(
+        !alone.get(supi).expect("rewritten").callback_tokens,
+        "still written as pre-#1518"
     );
     crash(&mut after, now_id);
 }
@@ -2983,6 +3175,7 @@ async fn a_refused_update_leaves_a_pre_1518_ue_on_its_token_less_callbacks_1642(
     let (now_id, ue) = after.ue_auth_state.find_by_supi(supi).expect("held");
     assert!(ue.amf_ue.policy_association.notify_token.is_none());
     assert!(ue.amf_ue.ue_policy_association.notify_token.is_none());
+    assert!(ue.amf_ue.sdm_notify_token.is_none(), "#1748: no SDM token");
     assert!(ue.amf_ue.pre_1518_callbacks, "still a pre-#1518 context");
     assert_ne!(
         namf_post(

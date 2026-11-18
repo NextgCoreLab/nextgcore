@@ -1,0 +1,25 @@
+{{- /*
+The NF identities of this release (#1617): one line per NF that the NRF
+verifies, in the format of docker/rust/certs/nf-identities.txt:
+  <cert name> <nfType> <nfInstanceId> -
+Each NF pins the nfInstanceId of its line, and its certificate (Secret
+nf-tls-<cert name>) must name urn:uuid:<nfInstanceId> and RFC 9310 NFTypes
+<nfType> (TS 33.310 §6.1.3c.3). deploy/helm/nf-tls-secrets.sh issues dev
+certificates from this table; an operator's own PKI issues from it too:
+  kubectl get configmap <release>-nf-identities -o jsonpath='{.data.nf-identities\.txt}'
+No secret material: the IDs are what each NF registers at the NRF anyway.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-nf-identities
+  labels:
+    {{- include "nextgcore.labels" . | nindent 4 }}
+    nextg.io/nf-identities: "true"
+data:
+  nf-identities.txt: |
+    {{- range $nf := splitList " " (include "nextgcore.nrfNfs" .) }}
+    {{- if (index $.Values $nf).enabled }}
+    {{ $nf }} {{ include "nextgcore.nfType" $nf }} {{ include "nextgcore.nfInstanceId" (dict "root" $ "nf" $nf) }} -
+    {{- end }}
+    {{- end }}

@@ -26,3 +26,41 @@
     name: d443a-ue-eec
     configMap:
       name: d443a-ue-eec
+# #1617: the EEC registers at the NRF over TLS with its own certificate, Secret
+# nf-tls-eec (row eec of docker/rust/certs/nf-identities.txt: the
+# nf_instance_id ue-eec.yaml pins). It dials the NRF's ClusterIP (a literal,
+# see ue-eec.yaml); nrf.crt names DNS:nrf, which NEXTGCORE_NRF_TLS_SERVER_NAME
+# checks for that address. The UE runs as root, the files' owner.
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: NEXTGCORE_NRF_TLS_CA
+    value: /etc/nextgcore/certs/ca.crt
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: NEXTGCORE_NRF_TLS_CLIENT_CERT
+    value: /etc/nextgcore/certs/eec.crt
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: NEXTGCORE_NRF_TLS_CLIENT_KEY
+    value: /etc/nextgcore/certs/eec.key
+- op: add
+  path: /spec/template/spec/containers/0/env/-
+  value:
+    name: NEXTGCORE_NRF_TLS_SERVER_NAME
+    value: nrf
+- op: add
+  path: /spec/template/spec/containers/0/volumeMounts/-
+  value:
+    name: nf-tls
+    mountPath: /etc/nextgcore/certs
+    readOnly: true
+- op: add
+  path: /spec/template/spec/volumes/-
+  value:
+    name: nf-tls
+    secret:
+      secretName: nf-tls-eec
+      defaultMode: 0440

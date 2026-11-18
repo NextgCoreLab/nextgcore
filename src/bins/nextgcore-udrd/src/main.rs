@@ -4512,11 +4512,12 @@ udr:
     use std::time::Duration;
     use tokio::sync::mpsc;
 
-    /// Serializes tests that depend on the global nextgcore-dbi backend
-    /// state: the WSB-6 tests enable the in-memory dbi test store while
-    /// `test_http_auth_provisioning_and_plmn_validation` asserts the
-    /// fail-closed no-DB 503 path — the two must not overlap in time.
-    static DBI_BACKEND_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// The lock of the global nextgcore-dbi test store, declared beside it
+    /// (`nextgcore_dbi::test_store::TEST_STORE_LOCK`, #1686): the WSB-6 tests
+    /// enable the store, and `test_http_auth_provisioning_and_plmn_validation`
+    /// (the fail-closed no-DB 503) and `test_varueid_routing` (the no-DB 404)
+    /// assert it is off, so none may overlap.
+    use nextgcore_dbi::test_store::TEST_STORE_LOCK as DBI_BACKEND_LOCK;
 
     /// RAII guard (WSB-6): holds `DBI_BACKEND_LOCK` with the nextgcore-dbi
     /// in-memory test store enabled, and disables the store again on drop —
@@ -5438,11 +5439,44 @@ udr:
     // udrd-06: VarUeId routing
     // ------------------------------------------------------------------
 
+    /// #1686, why `test_varueid_routing` enables the dbi test store: with no
+    /// subscriber store at all, an `imsi-` read is the #1534 outage, 500
+    /// SYSTEM_FAILURE, which is the CI failure. The 404 that test asserts is a
+    /// reachable store's answer for an unprovisioned subscriber. Takes the store's
+    /// lock, so no test has the store enabled meanwhile.
+    ///
+    /// REVERT-VERIFIED: with `test_varueid_routing` back on the bare lock (store
+    /// off), it fails with the same 500 when run alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn with_no_subscriber_store_an_imsi_read_is_the_outage_500_1686() {
+        let _backend = DBI_BACKEND_LOCK.lock().await;
+        let (udr_listener, udr_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let udr = SbiServer::on_listener(NextgcoreSbiServerConfig::new(udr_addr), udr_listener);
+        udr.start(udr_sbi_request_handler)
+            .await
+            .expect("UDR SBI server starts");
+        let client = SbiClient::with_host_port("127.0.0.1", udr_addr.port());
+        let resp = client
+            .get("/nudr-dr/v2/subscription-data/imsi-001010000016861/authentication-data/authentication-subscription")
+            .await
+            .expect("GET imsi");
+        udr.stop().await.expect("stop");
+        assert_eq!(resp.status, 500, "no store: the #1534 outage");
+        let problem: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap_or_default();
+        assert_eq!(problem["cause"], "SYSTEM_FAILURE");
+    }
+
     /// Recognized VarUeId forms that are not DB-backed must return 404,
     /// not 400 INVALID_SUPI.  extgroupid- must return 501.
     /// imsi- and suci- must be unchanged.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_varueid_routing() {
+        // #1686: the 404s below are a reachable store's "no such subscriber". With
+        // no store at all the read is the #1534 outage (500), so this test used to
+        // pass only while another test happened to have the dbi test store enabled.
+        // It enables the store itself, under the store's lock.
+        let _store = DbiTestStore::enable().await;
         let (udr_listener, udr_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let udr = SbiServer::on_listener(NextgcoreSbiServerConfig::new(udr_addr), udr_listener);
         udr.start(udr_sbi_request_handler)
@@ -5450,12 +5484,15 @@ udr:
             .expect("UDR SBI server starts");
         let client = SbiClient::with_host_port("127.0.0.1", udr_addr.port());
 
-        // imsi- is unchanged (404 when no DB, not 400)
+        // imsi- is unchanged (404 for an unprovisioned subscriber, not 400)
         let resp = client
             .get("/nudr-dr/v2/subscription-data/imsi-001010000000001/authentication-data/authentication-subscription")
             .await
             .expect("GET imsi");
-        assert_eq!(resp.status, 404, "imsi- should 404 (no DB), not 400");
+        assert_eq!(
+            resp.status, 404,
+            "imsi- should 404 (not provisioned), not 400"
+        );
 
         // nai- is a valid VarUeId, returns 404 (not 400 INVALID_SUPI)
         let resp = client

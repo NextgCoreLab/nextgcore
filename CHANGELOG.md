@@ -44,6 +44,54 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   No NF bind-mounts `docker/rust/certs/` any more, and the inert `TLS_CERT` / `TLS_KEY` /
   `TLS_CA` variables are gone. `nextgcore-core` now ships `openssl`. A client still dialling
   `http://` the NRF fails at the TLS handshake: point it at `https://` and give it the CA.
+- The Kubernetes deployments run NF -> NRF over TLS too (#1617): the Kind manifests
+  (`k8s/`), every EKS profile with an NRF, and the demo overlays. The NRF's `nrf.yaml` serves
+  TLS with `client_auth: optional`. `k8s/deploy.sh` and `deploy-eks.sh` run the new
+  `k8s/nf-tls-secrets.sh`, which issues the Secrets for each NRF client and the NRF (its
+  certificate, key and the CA certificate; never the CA key) under names versioned by their CA
+  (`nf-tls-<name>-<version>`), keeps them on a re-run while they are current, and never
+  modifies a version in use, so a failed or interrupted re-issue leaves the stack on its CA. Each NRF client mounts only its own Secret (`0440`, pod `fsGroup`),
+  dials `https://`, sets `NEXTGCORE_NRF_TLS_CA` / `_CLIENT_CERT` / `_CLIENT_KEY` and
+  `NEXTGCORE_NRF_TLS_SERVER_NAME=nrf` (the URIs name the cluster FQDN; `nrf.crt` names
+  `DNS:nrf`), and pins the nfInstanceId its certificate names; the NRF pins its own. New
+  `nf-identities.txt` row `gnb-exporter` (the d441a gNB congestion exporter). The demo scripts
+  that curl the NRF use `https://nrf:7777` with `--cacert`. `deploy-eks.sh`'s data-plane UPF
+  swap now keeps the volumes a sidecar mounts. `check-nf-identities.py --k8s` (CI `manifests`)
+  checks every rendered kustomization. A client still dialling `http://` the NRF fails at the
+  TLS handshake.
+- The Helm chart runs NF -> NRF over TLS (#1617). Its NRF serves TLS with `client_auth:
+  optional`; every NF dials `https://<release>-nrf...` and mounts Secret
+  `nf-tls-<nf>-<global.nrfTls.secretVersion>` (`0440`, pod `fsGroup`) with
+  `NEXTGCORE_NRF_TLS_*` and server name `global.nrfTls.serverName` (default `nrf`). Every NF,
+  the NRF included, now pins a derived `nfInstanceId` (the AMF's is unchanged for the same
+  `global.siteId`), overridable per NF with `<nf>.nfInstanceId`, and the rendered ConfigMap
+  `<release>-nf-identities` lists each NF's ID and type. The new
+  `deploy/helm/nf-tls-secrets.sh` issues the dev Secrets for those IDs and prints the version;
+  production PKIs issue each NF a certificate naming its `urn:uuid` (also required for
+  `global.sbiProfile=production` with OAuth2, #1667). `k8s/nf-tls-secrets.sh` gains `--ids`
+  (another identity table) and `--prune <namespace> <version>`, which deletes superseded
+  Secret versions unless something still mounts them. **Breaking for Helm users:** the render
+  fails with an empty `global.siteId` unless every `nfInstanceId` is pinned (the `lookup`
+  fallback to the kube-system UID is gone: it was empty under `helm template`, so certificates
+  would name IDs the install does not pin; to keep an AMF ID derived that way, pin
+  `amf.nfInstanceId`); `global.sbi.scheme` other than `https` fails the render; a pinned
+  `<nf>.nfInstanceId`, `amf.nfInstanceId` included (which used to accept any string), must be
+  a lower-case UUID version 4 (TS 29.571 §5.3.2); the NRF and every NRF client refuse
+  `replicas > 1`, and the clients roll out with strategy Recreate. `check-nf-identities.py
+  --helm` (CI `manifests`) checks the renders and refusals.
+- The image HEALTHCHECK works (#1617). `Dockerfile.core` probed `curl -sf
+  http://localhost:7777/health`, an HTTP/1.1 request the h2-only SBI server never answers, so a
+  plain `docker run` of any NF image reported unhealthy, and the NRF now serves only TLS. The new
+  `/usr/local/bin/nf-healthcheck` asks for `/health` over HTTP/2: h2c first, then TLS verified
+  against `/etc/nextgcore/certs/ca.crt` as `nrf` for the NRF (`NF_HEALTH_TLS_NAME` / `_TLS_CA` /
+  `NF_HEALTH_ADDR` / `_PORT` for others); it never skips verification. The compose stacks and
+  the Kubernetes probes keep their own checks.
+- The Kubernetes e2e checks NF -> NRF over TLS (#1617): `k8s/e2e-test.sh` and
+  `deploy/eks/e2e-internet.sh` (every profile with an NRF, so every `k8s/demo-check.sh` run) run
+  the new `k8s/nrf-tls-gate.sh`: each core NF type REGISTERED at the NRF and
+  `nrf_nf_management_unverified_total` 0 at registration and after heartbeats, read inside the
+  NRF pod. `check-nf-identities.py --helm` renders NOTES.txt offline (no kube context is ever
+  contacted), and CI pins helm v3.17.0.
 - mmed binds a configured IPv6 S1-MME address. Before, a bracketed IPv6 `mme.s1ap.server`
   address without a port (`[fd00::5]`) was dropped as unparsable, and the IPv6 server list
   `s1ap_list6` was never filled or read, so such a config fell back to `127.0.0.1:36412`. IPv6

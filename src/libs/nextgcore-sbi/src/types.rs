@@ -346,7 +346,9 @@ impl NfType {
             "SCP" => Some(Self::Scp),
             "NSSAAF" => Some(Self::Nssaaf),
             "MFAF" => Some(Self::Mfaf),
-            "MBSMF" => Some(Self::Mbsmf),
+            // TS 29.510 §6.1.6.3.3 spells it MB_SMF (#1680); "MBSMF", which this
+            // tree used to emit, is still accepted on input.
+            "MB_SMF" | "MBSMF" => Some(Self::Mbsmf),
             "MBSTF" => Some(Self::Mbstf),
             "PANF" => Some(Self::Panf),
             "TSCTSF" => Some(Self::Tsctsf),
@@ -391,7 +393,7 @@ impl NfType {
             Self::Scp => "SCP",
             Self::Nssaaf => "NSSAAF",
             Self::Mfaf => "MFAF",
-            Self::Mbsmf => "MBSMF",
+            Self::Mbsmf => "MB_SMF",
             Self::Mbstf => "MBSTF",
             Self::Panf => "PANF",
             Self::Tsctsf => "TSCTSF",
@@ -457,7 +459,7 @@ impl NfType {
             "SCP" => Self::Scp,
             "NSSAAF" => Self::Nssaaf,
             "MFAF" => Self::Mfaf,
-            "MBSMF" => Self::Mbsmf,
+            "MB_SMF" | "MBSMF" => Self::Mbsmf,
             "MBSTF" => Self::Mbstf,
             "PANF" => Self::Panf,
             "TSCTSF" => Self::Tsctsf,
@@ -740,6 +742,28 @@ mod tests {
         // Unrecognised values must stay None rather than resolving to anything.
         assert_eq!(NfType::from_nf_type_str("NOT_AN_NF"), None);
         assert_eq!(NfType::from_nf_type_str(""), None);
+    }
+
+    /// #1680: the MB-SMF's NFType is `MB_SMF` (TS 29.510 §6.1.6.3.3,
+    /// TS29510_Nnrf_NFManagement.yaml NFType enum), which mbsmfd registers. All
+    /// three parsers take it, and the `MBSMF` this tree used to emit is still
+    /// accepted on input (a stored profile or a peer of an older build); it is
+    /// never emitted.
+    ///
+    /// REVERT-VERIFIED: with `to_str` back to "MBSMF", the first assertion fails.
+    #[test]
+    fn the_mb_smf_is_spelled_as_ts_29510_spells_it_1680() {
+        assert_eq!(NfType::Mbsmf.to_str(), "MB_SMF");
+        for spelling in ["MB_SMF", "mb_smf", "MBSMF"] {
+            assert_eq!(
+                NfType::from_nf_type_str(spelling),
+                Some(NfType::Mbsmf),
+                "{spelling}"
+            );
+        }
+        assert_eq!(NfType::from_name("MB_SMF"), Some(NfType::Mbsmf));
+        assert_eq!(NfType::from_name("MBSMF"), Some(NfType::Mbsmf));
+        assert_ne!(NfType::Mbsmf.to_str(), NfType::Smf.to_str());
     }
 
     /// Issue #23: the TSCTSF service name round-trips through the enum

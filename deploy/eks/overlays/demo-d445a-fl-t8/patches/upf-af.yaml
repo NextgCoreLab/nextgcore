@@ -51,6 +51,23 @@
             fieldPath: status.podIP
       - name: RUST_LOG
         value: info
+      # #1617: the AF registers at the NRF (af.yaml oauth2.nrf) over TLS with
+      # its own certificate, Secret nf-tls-fl-af (row fl-af). sidecar.sh copies
+      # it from /etc/nextgcore/certs, readable by root only, into /tmp/d445a/tls,
+      # owned by the AF's uid 65534 (key 0400), like its CCA key. nrf.crt names
+      # DNS:nrf, not the cluster FQDN the AF dials.
+      - name: NEXTGCORE_NRF_TLS_CA
+        value: /tmp/d445a/tls/ca.crt
+      - name: NEXTGCORE_NRF_TLS_CLIENT_CERT
+        value: /tmp/d445a/tls/fl-af.crt
+      - name: NEXTGCORE_NRF_TLS_CLIENT_KEY
+        value: /tmp/d445a/tls/fl-af.key
+      - name: NEXTGCORE_NRF_TLS_SERVER_NAME
+        value: nrf
+    volumeMounts:
+      - name: nf-tls
+        mountPath: /etc/nextgcore/certs
+        readOnly: true
     # Not privileged: every capability dropped, then only what the sidecar's root
     # shell uses:
     #   NET_ADMIN  veth, addresses, routes, iptables in the pod's network namespace;
@@ -90,3 +107,10 @@
       limits:
         cpu: 1000m
         memory: 256Mi
+- op: add
+  path: /spec/template/spec/volumes/-
+  value:
+    name: nf-tls
+    secret:
+      secretName: nf-tls-fl-af
+      defaultMode: 0400

@@ -201,6 +201,19 @@ assert_log_contains "upf" "NextGCore UPF ready" \
 assert_log_contains "udr" "MongoDB connected" \
     "UDR connected to MongoDB"
 
+# --- #1617: every NF registered at the NRF over TLS with its certificate ---
+# nrf-tls-gate.sh: each core type REGISTERED at the NRF (which serves only TLS)
+# and nrf_nf_management_unverified_total 0, read at registration and again
+# after heartbeats.
+TOTAL=$((TOTAL + 1))
+if gate_out="$(bash "${SCRIPT_DIR}/nrf-tls-gate.sh" "${NAMESPACE}" 2>&1)"; then
+    PASSED=$((PASSED + 1))
+    log_info "PASS: ${gate_out}"
+else
+    FAILED=$((FAILED + 1))
+    log_error "FAIL: NF -> NRF over TLS: ${gate_out}"
+fi
+
 # --- AMF NGAP setup ---
 assert_log_contains "amf" "Configured GUAMI" \
     "AMF GUAMI configured"

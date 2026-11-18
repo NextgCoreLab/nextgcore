@@ -17,3 +17,7 @@ resources:
   - toggles.yaml
 patches:
   - path: gnb-nkef-config.yaml
+  - path: gnb-nrf-ca.yaml
+    target:
+      kind: Deployment
+      name: gnb

@@ -999,6 +999,11 @@ impl UeNasContext {
 }
 
 impl UeNasContext {
+    /// #1748: the id of the UE's current Nudm_SDM subscription, if it has one.
+    pub(crate) fn sdm_subscription_id(&self) -> Option<&str> {
+        self.sdm_subscription_id.as_deref()
+    }
+
     /// #1247: forget the AM policy association `pol_asso_id` after the PCF terminated it
     /// (TS 29.507 §4.2.4.3), in both places it is held. False when the UE holds another
     /// association, or none.
@@ -5215,7 +5220,17 @@ impl NgapServer {
         ran_ue_ngap_id: u32,
         resync: Option<([u8; 16], [u8; 14])>,
     ) -> Result<()> {
-        let Some(mut state) = self.ue_auth_state.remove(amf_ue_ngap_id) else {
+        // #1774: the record stays in the store while the AUSF answers. An SBI callback
+        // in that window (a PCF termination, an EBI assignment) is applied to it and is
+        // in the record taken after the answer, rather than refused for an unknown UE.
+        let Some((suci, snn)) = self.ue_auth_state.get(amf_ue_ngap_id).map(|state| {
+            // Serving network name from the serving PLMN (TS 24.501 / TS 33.501
+            // 6.1.1.4), augmented with the NID when this is an SNPN (Annex I.3.2, #115).
+            (
+                state.suci.clone(),
+                serving_network_name_for_ue(&state.amf_ue),
+            )
+        }) else {
             return Ok(());
         };
 
@@ -5224,19 +5239,14 @@ impl NgapServer {
                 .await
                 .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
 
-        // Serving network name from the serving PLMN (TS 24.501 / TS 33.501 6.1.1.4),
-        // augmented with the NID when this is an SNPN (Annex I.3.2, #115).
-        let snn = serving_network_name_for_ue(&state.amf_ue);
-
-        match crate::sbi_path::call_ausf_authenticate_with_resync(
-            &ausf_host,
-            ausf_port,
-            &state.suci,
-            &snn,
-            resync,
+        let answer = crate::sbi_path::call_ausf_authenticate_with_resync(
+            &ausf_host, ausf_port, &suci, &snn, resync,
         )
-        .await
-        {
+        .await;
+        let Some(mut state) = self.ue_auth_state.remove(amf_ue_ngap_id) else {
+            return Ok(());
+        };
+        match answer {
             Ok(auth_resp) => {
                 state.auth_ctx_id = auth_resp.auth_ctx_id;
                 state.amf_ue.rand = auth_resp.rand;
@@ -5579,20 +5589,26 @@ impl NgapServer {
         // so it is exactly as diagnostic as the reject branch above.
         log::info!("UE {amf_ue_ngap_id} HXRES* verification passed");
 
-        // 5G-AKA confirmation toward AUSF -> KSEAF + SUPI
+        // 5G-AKA confirmation toward AUSF -> KSEAF + SUPI.
+        //
+        // #1774: the record goes back in the store while the AUSF confirms, and is taken
+        // again after, so an SBI callback in that window is applied to the record this
+        // procedure goes on with, rather than refused for an unknown UE.
+        let auth_ctx_id = state.auth_ctx_id.clone();
+        self.ue_auth_state.insert(amf_ue_ngap_id, state);
         let (ausf_host, ausf_port) =
             crate::sbi_path::resolve_nf_endpoint_async(crate::sbi_path::SbiServiceType::NausfAuth)
                 .await
                 .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
+        let confirmed =
+            crate::sbi_path::call_ausf_5g_aka_confirm(&ausf_host, ausf_port, &auth_ctx_id, &rs)
+                .await;
+        let Some(mut state) = self.ue_auth_state.remove(amf_ue_ngap_id) else {
+            log::warn!("UE {amf_ue_ngap_id} gone while the AUSF confirmed its authentication");
+            return Ok(());
+        };
 
-        let confirm = match crate::sbi_path::call_ausf_5g_aka_confirm(
-            &ausf_host,
-            ausf_port,
-            &state.auth_ctx_id,
-            &rs,
-        )
-        .await
-        {
+        let confirm = match confirmed {
             Ok(c) => c,
             Err(e) => {
                 log::error!("AUSF 5G-AKA confirmation failed: {e}");
@@ -6410,15 +6426,8 @@ impl NgapServer {
                 return Ok(());
             }
         };
-        match crate::sbi_path::call_udm_sdm_subscribe(
-            &udm_host,
-            udm_port,
-            &supi,
-            &amf_instance_id(),
-        )
-        .await
-        {
-            Ok(sub_id) => state.sdm_subscription_id = Some(sub_id),
+        match subscribe_to_udm_sdm(&mut state, &udm_host, udm_port, &supi).await {
+            Ok(()) => {}
             Err(e) => {
                 log::error!("[{supi}] Nudm_SDM_Subscribe failed: {e}");
                 let reject = gmm_build::build_registration_reject(gmm_cause_from_sbi_error(&e));
@@ -6609,6 +6618,8 @@ impl NgapServer {
         state.amf_ue.gpsi = am_data.gpsi.clone();
         // #1222: likewise for an MPS/MCX subscription that is withdrawn.
         state.amf_ue.priority_subscription = am_data.priority_subscription;
+        // #1748: what a data change notification is applied to.
+        state.amf_ue.am_data = Some(am_data.document.clone()).filter(serde_json::Value::is_object);
 
         // New 5G-GUTI: GUAMI of this AMF + CSPRNG 5G-TMSI (TS 23.003 2.10.1)
         state.amf_ue.generate_new_guti();
@@ -21210,6 +21221,29 @@ async fn register_with_udm_uecm(
     Ok(())
 }
 
+/// Nudm_SDM_Subscribe to the UE's am-data at registration (TS 29.503 §5.2.2.3.2), with
+/// a fresh token in its `callbackReference` (#1748). The subscription's id and token
+/// are the UE's only once the UDM accepted it; a refused one leaves both as they were.
+async fn subscribe_to_udm_sdm(
+    state: &mut UeNasContext,
+    udm_host: &str,
+    udm_port: u16,
+    supi: &str,
+) -> crate::sbi_path::SbiResult<()> {
+    let token = crate::sbi_path::new_callback_token();
+    let id = crate::sbi_path::call_udm_sdm_subscribe(
+        udm_host,
+        udm_port,
+        supi,
+        &amf_instance_id(),
+        &token,
+    )
+    .await?;
+    state.sdm_subscription_id = Some(id);
+    state.amf_ue.sdm_notify_token = Some(token);
+    Ok(())
+}
+
 /// [`amf_instance_id`], for the UECM wire test in `sbi_path`.
 #[cfg(test)]
 pub(crate) fn amf_instance_id_for_tests() -> String {
@@ -22630,7 +22664,7 @@ fn plmn_mcc_mnc_strings(plmn: &PlmnId) -> (String, String) {
 /// Parse a TS 29.571 BitRate string ("<number> <unit>", e.g. "1 Gbps") into
 /// bits per second. Supported units: bps, Kbps, Mbps, Gbps, Tbps (decimal,
 /// 10^3 steps per TS 29.571 §5.5). Returns None for malformed input.
-fn parse_bitrate_bps(s: &str) -> Option<u64> {
+pub(crate) fn parse_bitrate_bps(s: &str) -> Option<u64> {
     let mut parts = s.split_whitespace();
     let value: f64 = parts.next()?.parse().ok()?;
     if !value.is_finite() || value < 0.0 {
@@ -22963,6 +22997,11 @@ fn gmm_cause_from_sbi_error(err: &crate::sbi_path::SbiError) -> GmmCause {
         SbiError::PeerStatus { what, status, .. } => gmm_cause_from_sbi_error(
             &SbiError::RequestFailed(format!("{what} returned status {status}")),
         ),
+        // #1779 review M1: the peer refused this AMF's access token. That is the
+        // core's misconfiguration, not the UE's subscription, so it gets the cause
+        // the 401 it used to be got, never #7 (which has the UE treat its USIM as
+        // invalid for 5GS until switched off, TS 24.501 §5.5.1.2.5).
+        SbiError::TokenRefused { .. } => GmmCause::PayloadWasNotForwarded,
     }
 }
 
@@ -24608,6 +24647,70 @@ mod tests {
             gmm_cause_from_sbi_error(&SbiError::GatewayTimeout),
             GmmCause::PayloadWasNotForwarded
         );
+    }
+
+    /// #1779 review M1: a UDM whose OAuth2 gate refuses the AMF's token for scope
+    /// (a 403 since #1766) must not turn into Registration Reject #7, which has the
+    /// UE treat its USIM as invalid for 5GS until switched off (TS 24.501
+    /// §5.5.1.2.5). The UDM's own 403 still does. Drives the real SDM am-data call
+    /// against a stub UDM, then the mapping the registration path applies to its
+    /// error (ngap_path.rs, the am-data arm of the Registration Reject).
+    #[tokio::test]
+    async fn a_udm_token_refusal_is_not_registration_reject_7_1779() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        server
+            .start(|req: nextgcore_sbi::message::SbiRequest| async move {
+                let forbidden = nextgcore_sbi::message::SbiResponse::with_status(403);
+                if req.header.uri.contains("imsi-scope") {
+                    forbidden
+                        .with_body(r#"{"status":403}"#, "application/problem+json")
+                        .with_header(
+                            "WWW-Authenticate",
+                            r#"Bearer realm="5gc-sbi", error="insufficient_scope", scope="nudm-sdm""#,
+                        )
+                } else {
+                    forbidden.with_body(
+                        r#"{"status":403,"cause":"ROAMING_NOT_ALLOWED"}"#,
+                        "application/problem+json",
+                    )
+                }
+            })
+            .await
+            .expect("start stub UDM");
+        let run = async {
+            let port = addr.port();
+            let err = crate::sbi_path::call_udm_sdm_get_am_data("127.0.0.1", port, "imsi-scope")
+                .await
+                .expect_err("refused");
+            assert!(
+                matches!(
+                    err,
+                    crate::sbi_path::SbiError::TokenRefused { status: 403, .. }
+                ),
+                "{err:?}"
+            );
+            assert_eq!(
+                gmm_cause_from_sbi_error(&err),
+                GmmCause::PayloadWasNotForwarded
+            );
+            // Control: the UDM's own 403 is still #7.
+            let err = crate::sbi_path::call_udm_sdm_get_am_data("127.0.0.1", port, "imsi-barred")
+                .await
+                .expect_err("refused");
+            assert_eq!(
+                gmm_cause_from_sbi_error(&err),
+                GmmCause::FiveGsServicesNotAllowed
+            );
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("round trip timed out");
+        server.stop().await.ok();
     }
 
     #[test]
@@ -29465,6 +29568,115 @@ mod tests {
         .await
         .is_err());
         assert_eq!(refused.uecm_dereg_token.as_deref(), Some("tok-previous"));
+        udm.stop().await.expect("stop");
+    }
+
+    /// #1748: registration's SDM subscription hands the UDM a `callbackReference` ending
+    /// in a fresh token, which is the UE's once the UDM accepted it; a data change
+    /// notification POSTed to exactly that URI is applied. A refused subscription
+    /// leaves the UE's previous subscription and token in place.
+    ///
+    /// REVERT-VERIFIED: with `subscribe_to_udm_sdm` not storing the token, the
+    /// notification is 404 and the token assertion fails; with it storing the token
+    /// before the UDM's answer, the refused case keeps the new token.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_registered_sdm_callback_reference_is_the_one_that_acts_1748() {
+        let _serial = crate::namf_server::dereg_queue_test_lock().lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        crate::context::amf_context_init(64, 1024, 4096);
+        let posts: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let sink = Arc::clone(&posts);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let udm = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        udm.start(move |req: nextgcore_sbi::message::SbiRequest| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let body: serde_json::Value = req
+                    .http
+                    .content
+                    .as_deref()
+                    .and_then(|c| serde_json::from_str(c).ok())
+                    .unwrap_or_default();
+                let refuse = req.header.uri.contains("imsi-001010000174899");
+                sink.lock().expect("sink").push(body);
+                if refuse {
+                    nextgcore_sbi::message::SbiResponse::with_status(500)
+                } else {
+                    nextgcore_sbi::message::SbiResponse::with_status(201)
+                        .with_header("Location", "/nudm-sdm/v2/x/sdm-subscriptions/sub-1748")
+                }
+            }
+        })
+        .await
+        .expect("stand-in UDM");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let supi = "imsi-001010000174801";
+        let id = 7_174_801u64;
+        let mut ue = UeNasContext::new(id, 48, 1, false);
+        ue.registered = true;
+        ue.amf_ue.supi = Some(supi.to_string());
+        subscribe_to_udm_sdm(&mut ue, "127.0.0.1", addr.port(), supi)
+            .await
+            .expect("subscribed");
+        let uri = posts.lock().expect("posts")[0]["callbackReference"]
+            .as_str()
+            .expect("callbackReference")
+            .to_string();
+        let token = uri.rsplit('/').next().expect("a last segment").to_string();
+        assert_eq!(ue.amf_ue.sdm_notify_token.as_deref(), Some(token.as_str()));
+        assert_eq!(ue.sdm_subscription_id.as_deref(), Some("sub-1748"));
+        let ngap = test_ngap_server().await;
+        ngap.ue_auth_state.insert(id, ue);
+
+        // The path of the URI the UDM holds, POSTed verbatim.
+        let path = &uri[uri.find("/namf-callback/").expect("callback path")..];
+        let resp = crate::namf_server::namf_request_handler(
+            nextgcore_sbi::message::SbiRequest::post(path.to_string())
+                .with_json_body(&serde_json::json!({
+                    "subscriptionId": "sub-1748",
+                    "notifyItems": [{
+                        "resourceId": format!("/nudm-sdm/v2/{supi}/am-data"),
+                        "changes": [{"op": "REPLACE", "path": "/gpsis",
+                                     "newValue": ["msisdn-4917480"]}],
+                    }],
+                }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 204, "{:?}", resp.http.content);
+        let gpsi = ngap
+            .ue_auth_state
+            .get(id)
+            .and_then(|s| s.amf_ue.gpsi.clone());
+        assert_eq!(gpsi.as_deref(), Some("msisdn-4917480"));
+        ngap.ue_auth_state.remove(id);
+
+        // A refused subscription leaves the previous one in place.
+        let mut refused = UeNasContext::new(7_174_899, 49, 1, false);
+        refused.sdm_subscription_id = Some("sub-previous".to_string());
+        refused.amf_ue.sdm_notify_token = Some("sdm-previous".to_string());
+        assert!(subscribe_to_udm_sdm(
+            &mut refused,
+            "127.0.0.1",
+            addr.port(),
+            "imsi-001010000174899"
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            refused.amf_ue.sdm_notify_token.as_deref(),
+            Some("sdm-previous")
+        );
+        assert_eq!(refused.sdm_subscription_id.as_deref(), Some("sub-previous"));
         udm.stop().await.expect("stop");
     }
 
@@ -42939,6 +43151,177 @@ mod tests {
 
         ngap.ue_auth_state.remove(id);
         peer.stop().await.expect("peer stop");
+        change_sink.stop().await.expect("sink stop");
+        event_sink.stop().await.expect("sink stop");
+    }
+
+    /// **#1727**: between two nextgcore AMFs, a consumer's subscription follows the UE.
+    /// AMF-1 is the real producer (`namf_request_handler` behind an SBI listener). It
+    /// holds the UE under the 5G-GUTI the UE presents to AMF-2, and a
+    /// CONNECTIVITY_STATE_REPORT subscription made through the real
+    /// Namf_EventExposure Subscribe, with a `subsChangeNotifyUri`. AMF-2 is the real
+    /// NGAP path, fetching the context.
+    /// - AMF-1's UEContextTransfer answer carries the subscription in
+    ///   `eventSubscriptionList` (TS 29.518 §6.1.6.2.25);
+    /// - AMF-2 takes it over under a new ID and tells the consumer with
+    ///   SUBSCRIPTION_ID_CHANGE (TS 29.518 §5.2.2.2.3.1);
+    /// - AMF-2's Registration Accept reports CONNECTED on the consumer's
+    ///   `eventNotifyUri` and `notifyCorrelationId`.
+    ///
+    /// The two AMFs share this process's store, which `add_unless_equivalent` allows
+    /// for (it never matches a subscription that was not taken over). Because of
+    /// that, AMF-1's original is gone before the Registration Accept (review M1):
+    /// the CONNECTED report can then only come from AMF-2's copy.
+    ///
+    /// REVERT-VERIFIED: without the `eventSubscriptionList` in
+    /// `handle_ue_context_transfer`, "SUBSCRIPTION_ID_CHANGE from AMF-2" fails; with
+    /// AMF-2's copy removed before the Registration Accept, "AMF-2's CONNECTED
+    /// report to the consumer" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_subscription_at_one_amf_follows_the_ue_to_another_1727() {
+        use nextgcore_sbi::message::SbiRequest;
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _guamis = serve_only_local_guami();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let supi = "imsi-001010001727010";
+        let foreign = crate::context::Guti5gs {
+            amf_pointer: local_guami().amf_id.pointer + 1,
+            ..guti_from(&local_guami(), 0x1727_0101)
+        };
+        let (change_sink, change_port, mut change_rx) = notify_sink().await;
+        let (event_sink, event_port, mut event_rx) = notify_sink().await;
+
+        // AMF-1: the UE, under the 5G-GUTI it presents, with its NAS security context.
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx");
+            let ran_ue = guard.ran_ue_add(901_727, 1727).expect("ran_ue");
+            let mut ue = guard.amf_ue_add(ran_ue.id).expect("amf_ue");
+            ue.supi = Some(supi.to_string());
+            ue.id = 17_270_100;
+            ue.current_guti = foreign.clone();
+            ue.current_m_tmsi = Some(foreign.tmsi);
+            ue.security_context_available = true;
+            guard.amf_ue_publish(&ue, 1727, 9_727);
+        }
+        let created = crate::namf_server::namf_request_handler(
+            SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&serde_json::json!({ "subscription": {
+                    "eventList": [{ "type": "CONNECTIVITY_STATE_REPORT" }],
+                    "eventNotifyUri": format!("http://127.0.0.1:{event_port}/notify/1727-evt"),
+                    "notifyCorrelationId": "corr-1727",
+                    "nfId": "3fa85f64-5717-4562-b3fc-2c963f661727",
+                    "supi": supi,
+                    "subsChangeNotifyUri":
+                        format!("http://127.0.0.1:{change_port}/notify/1727-subs-change"),
+                    "subsChangeNotifyCorrelationId": "corr-1727-change",
+                }}))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(created.status, 201, "subscribed at AMF-1");
+        let at_amf1 = crate::namf_server::EventSubscriptionGuard::of(&created);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let amf1_port = addr.port();
+        let amf1 = SbiServer::on_listener(
+            SbiServerConfig::new(format!("127.0.0.1:{amf1_port}").parse().expect("addr")),
+            listener,
+        );
+        amf1.start(crate::namf_server::namf_request_handler)
+            .await
+            .expect("AMF-1 start");
+
+        // AMF-2: the UE's mobility registration presenting AMF-1's 5G-GUTI.
+        std::env::set_var("AMF_PEER_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("AMF_PEER_SBI_PORT", amf1_port.to_string());
+        let mut ngap = capturing_ngap_server().await;
+        let id = 17_270_101u64;
+        let mut ue = UeNasContext::new(id, 55, 1, false);
+        ue.amf_ue.security_context_available = true;
+        ue.amf_ue.registration_type = crate::gmm_build::registration_type::MOBILITY_UPDATING;
+        ue.amf_ue.allowed_nssai = vec![crate::context::SNssai { sst: 1, sd: None }];
+        ue.amf_ue.old_guti = foreign.clone();
+        ngap.ue_auth_state.insert(id, ue);
+        let nas = registration_request_with_guti(
+            &foreign,
+            crate::gmm_build::registration_type::MOBILITY_UPDATING,
+        );
+        let identified = ngap
+            .resolve_registration_by_guti(
+                id,
+                &nas,
+                crate::gmm_build::registration_type::MOBILITY_UPDATING,
+            )
+            .await;
+        std::env::remove_var("AMF_PEER_SBI_ADDR");
+        std::env::remove_var("AMF_PEER_SBI_PORT");
+        assert!(
+            identified,
+            "precondition: AMF-2 fetched the context from AMF-1"
+        );
+        // #1731: AMF-2 takes the context over once the UE is authenticated there.
+        ngap.commit_context_transfer(id);
+
+        let body = tokio::time::timeout(Duration::from_secs(3), change_rx.recv())
+            .await
+            .expect("SUBSCRIPTION_ID_CHANGE from AMF-2")
+            .expect("channel closed");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        let report = &v["reportList"][0];
+        assert_eq!(report["type"], "SUBSCRIPTION_ID_CHANGE", "{v}");
+        assert_eq!(report["supi"], supi);
+        assert_eq!(v["subsChangeNotifyCorrelationId"], "corr-1727-change");
+        let new_id = report["subscriptionId"]
+            .as_str()
+            .and_then(|u| u.rsplit('/').next())
+            .expect("the new subscription's id")
+            .to_string();
+        let _at_amf2 = crate::namf_server::EventSubscriptionGuard::id(&new_id);
+        let stored = crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .event_subscription_find(&new_id)
+            .expect("created at AMF-2");
+        assert!(stored.taken_over, "AMF-2's copy");
+        assert_eq!(stored.notify_correlation_id, "corr-1727");
+
+        // Review M1: AMF-1's original is removed before the Registration Accept, so
+        // the CONNECTED report can only come from AMF-2's copy. In production AMF-1
+        // releases it itself on AMF-2's TRANSFERRED (review M2), but here both AMFs
+        // share one store, and that update, on its own task, resolves the 5G-GUTI to
+        // either UE, so the release is proven by the producer tests
+        // `a_transferred_status_update_releases_the_handed_over_subscriptions_1727`
+        // and `a_not_transferred_status_update_keeps_the_handed_over_subscriptions_1727`.
+        drop(at_amf1);
+
+        ngap.send_registration_accept(1, id, 55)
+            .await
+            .expect("accepted");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let connected = loop {
+            let body = tokio::time::timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                event_rx.recv(),
+            )
+            .await
+            .expect("AMF-2's CONNECTED report to the consumer")
+            .expect("channel closed");
+            let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+            if v["reportList"][0]["type"] == "CONNECTIVITY_STATE_REPORT" {
+                break v;
+            }
+        };
+        assert_eq!(connected["notifyCorrelationId"], "corr-1727", "{connected}");
+        assert_eq!(
+            connected["reportList"][0]["cmInfoList"][0]["cmState"],
+            "CONNECTED"
+        );
+
+        ngap.ue_auth_state.remove(id);
+        amf1.stop().await.expect("AMF-1 stop");
         change_sink.stop().await.expect("sink stop");
         event_sink.stop().await.expect("sink stop");
     }

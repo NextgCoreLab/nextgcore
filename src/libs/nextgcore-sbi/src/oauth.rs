@@ -288,24 +288,61 @@ pub fn publish_cca_public_jwk(
     let jwk = es256_public_jwk(key.verifying_key(), nf_instance_id);
     let body = serde_json::to_string_pretty(&jwk)
         .map_err(|e| SbiError::ClientError(format!("failed to serialise the CCA JWK: {e}")))?;
-    std::fs::write(&path, body)
-        .map_err(|e| SbiError::ClientError(format!("failed to write {}: {e}", path.display())))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // World-readable on purpose: the NRF reads this, and it is a public key.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).map_err(|e| {
-            SbiError::ClientError(format!(
-                "failed to set permissions on {}: {e}",
-                path.display()
-            ))
-        })?;
-    }
+    write_atomically(&path, body.as_bytes())?;
     log::info!(
         "published the CCA public key for nfInstanceId {nf_instance_id} to {}",
         path.display()
     );
     Ok(path)
+}
+
+/// Write `body` to `path` so that a reader sees the old file or the new one, never
+/// a partial one (#1684): the NRF reads the trust-store directory while NFs start
+/// and publish into it. The body goes to a temporary file in the same directory
+/// (same filesystem, so the rename is atomic on POSIX), made world-readable (0644:
+/// the NRF reads it, and it is a public key), flushed, and renamed over `path`. The
+/// temporary name ends in neither `.jwk` nor anything a reader takes for an entry,
+/// and it is removed when any step fails, so a failed publish leaves `path` as it was
+/// and nothing beside it.
+fn write_atomically(path: &std::path::Path, body: &[u8]) -> SbiResult<()> {
+    use std::io::Write as _;
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("cca");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let tmp = dir.join(format!(".{name}.{}.{nanos}.tmp", std::process::id()));
+    /// Removes the temporary file unless it was renamed into place.
+    struct Pending<'a>(Option<&'a std::path::Path>);
+    impl Drop for Pending<'_> {
+        fn drop(&mut self) {
+            if let Some(tmp) = self.0 {
+                let _ = std::fs::remove_file(tmp);
+            }
+        }
+    }
+    let mut pending = Pending(Some(&tmp));
+    let fail = |what: &str, e: std::io::Error| {
+        SbiError::ClientError(format!("failed to {what} {}: {e}", path.display()))
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|e| fail("create a temporary file for", e))?;
+    file.write_all(body).map_err(|e| fail("write", e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o644))
+            .map_err(|e| fail("set permissions on", e))?;
+    }
+    file.sync_all().map_err(|e| fail("flush", e))?;
+    drop(file);
+    std::fs::rename(&tmp, path).map_err(|e| fail("rename into", e))?;
+    pending.0 = None;
+    Ok(())
 }
 
 /// Environment variable naming the directory this NF publishes its CCA PUBLIC
@@ -957,6 +994,28 @@ impl TokenCache {
         tokens.remove(&key);
     }
 
+    /// #1676 (review m1): drop the token for one consumer, target and scope only
+    /// while it is still `rejected`, the token a producer refused. Two requests
+    /// refused concurrently then evict the refused token once: the second finds the
+    /// fresh token the first one fetched, and keeps it. Returns whether it evicted.
+    pub async fn invalidate_if(
+        &self,
+        consumer_id: &str,
+        target_nf_type: NfType,
+        scope: &str,
+        rejected: &str,
+    ) -> bool {
+        let key = Self::key(consumer_id, target_nf_type, scope);
+        let mut tokens = self.tokens.write().await;
+        let held = tokens
+            .get(&key)
+            .is_some_and(|t| t.response.access_token == rejected);
+        if held {
+            tokens.remove(&key);
+        }
+        held
+    }
+
     /// Remove expired entries from the cache.
     pub async fn purge_expired(&self) {
         let mut tokens = self.tokens.write().await;
@@ -1548,6 +1607,20 @@ impl OAuth2Client {
             .await;
     }
 
+    /// #1676: [`TokenCache::invalidate_if`] for `consumer`: evict the cached token
+    /// only while it is still the `rejected` one.
+    pub async fn invalidate_token_if(
+        &self,
+        consumer: &TokenConsumer,
+        target_nf_type: NfType,
+        scope: &str,
+        rejected: &str,
+    ) -> bool {
+        self.cache
+            .invalidate_if(&consumer.nf_instance_id, target_nf_type, scope, rejected)
+            .await
+    }
+
     /// Request a new access token from the NRF.
     pub async fn request_token(
         &self,
@@ -1624,10 +1697,9 @@ impl OAuth2Client {
                 .map_err(|e| SbiError::HyperError(e.to_string()))?;
 
         let status = response.status().as_u16();
-        let body_bytes = http_body_util::BodyExt::collect(response.into_body())
-            .await
-            .map_err(|e| SbiError::InvalidResponse(e.to_string()))?
-            .to_bytes();
+        // #1681: an AccessTokenRsp (TS 29.510 §6.3.5.2.2) is a few KiB.
+        let body_bytes =
+            read_bounded_body(response, TOKEN_RESPONSE_MAX_BODY, "token response").await?;
 
         if status != 200 {
             let error_body = String::from_utf8_lossy(&body_bytes);
@@ -2010,6 +2082,44 @@ pub async fn fetch_jwks_with(
     fetch_jwks_from(jwks_uri, tls, nrf_uri.as_deref()).await
 }
 
+/// #1681: the largest access-token answer read from the NRF. An AccessTokenRsp
+/// (TS 29.510 §6.3.5.2.2) is a JWS of a few claims plus three short members.
+pub const TOKEN_RESPONSE_MAX_BODY: usize = 64 * 1024;
+
+/// #1681: the largest JWKS document read from the NRF: a handful of public keys.
+pub const JWKS_MAX_BODY: usize = 256 * 1024;
+
+/// Read `response`'s body, refusing one over `max` bytes (#1681): up front on a
+/// larger `Content-Length`, and while reading otherwise, so a peer that streams
+/// without a length cannot make this NF buffer it. The NRF's answers used to be
+/// collected whole, with no limit.
+async fn read_bounded_body(
+    response: hyper::Response<hyper::body::Incoming>,
+    max: usize,
+    what: &str,
+) -> SbiResult<bytes::Bytes> {
+    use http_body_util::BodyExt;
+    let announced = response
+        .headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    if let Some(n) = announced.filter(|n| *n > max as u64) {
+        return Err(SbiError::InvalidResponse(format!(
+            "{what} of {n} bytes exceeds the {max}-byte limit"
+        )));
+    }
+    Ok(http_body_util::Limited::new(response.into_body(), max)
+        .collect()
+        .await
+        .map_err(|e| {
+            SbiError::InvalidResponse(format!(
+                "{what} over the {max}-byte limit or unreadable: {e}"
+            ))
+        })?
+        .to_bytes())
+}
+
 /// [`fetch_jwks_with`] where `nrf_uri` names the NRF whose client TLS server
 /// name may stand in for the JWKS host (only when the two authorities match).
 async fn fetch_jwks_from(
@@ -2031,10 +2141,7 @@ async fn fetch_jwks_from(
         .map_err(|e| SbiError::HyperError(e.to_string()))?;
 
     let status = response.status().as_u16();
-    let body_bytes = http_body_util::BodyExt::collect(response.into_body())
-        .await
-        .map_err(|e| SbiError::InvalidResponse(e.to_string()))?
-        .to_bytes();
+    let body_bytes = read_bounded_body(response, JWKS_MAX_BODY, "JWKS").await?;
 
     if status != 200 {
         return Err(SbiError::HttpError {
@@ -2467,6 +2574,137 @@ mod tests {
         );
         assert!(publish_cca_public_jwk(&second, "  ", &jwk_dir).is_err());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **#1676 review m1.** A refused token is evicted only while it is still the
+    /// cached one: a second request refused with the same old token finds the
+    /// fresh token the first one fetched, and keeps it.
+    ///
+    /// REVERT-VERIFIED: with `invalidate_if` removing unconditionally, the fresh
+    /// token is evicted and the assertion names it.
+    #[tokio::test]
+    async fn only_the_refused_token_is_evicted_1676() {
+        let cache = TokenCache::new();
+        let token = |t: &str| AccessTokenResponse {
+            access_token: t.to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: Some(3600),
+            scope: None,
+        };
+        cache
+            .put("c", NfType::Udm, "nudm-sdm", token("fresh"))
+            .await;
+        assert!(
+            !cache
+                .invalidate_if("c", NfType::Udm, "nudm-sdm", "old")
+                .await,
+            "another token is not evicted"
+        );
+        assert_eq!(
+            cache
+                .get("c", NfType::Udm, "nudm-sdm")
+                .await
+                .map(|t| t.access_token),
+            Some("fresh".to_string()),
+            "the fresh token is kept"
+        );
+        assert!(
+            cache
+                .invalidate_if("c", NfType::Udm, "nudm-sdm", "fresh")
+                .await
+        );
+        assert!(cache.get("c", NfType::Udm, "nudm-sdm").await.is_none());
+    }
+
+    /// #1684: a reader looping on the trust-store entry while it is republished
+    /// (with alternating keys, so every write changes it) always reads a whole,
+    /// usable ES256 JWK, through the NRF's own parser, and it is one of the two keys.
+    /// The directory holds only the entry afterwards (no temporary file left), and
+    /// the entry is world-readable.
+    ///
+    /// REVERT-VERIFIED: with `write_atomically` replaced by `std::fs::write`, the
+    /// reader sees an empty or truncated file and the assertion names it.
+    #[test]
+    fn a_reader_never_sees_a_partial_cca_jwk_while_it_is_republished_1684() {
+        let dir = std::env::temp_dir().join(format!(
+            "sbi-cca-atomic-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        let (a, b) = (generate_es256_key(), generate_es256_key());
+        let path = publish_cca_public_jwk(&a, "nf-1684", &dir).expect("publish");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let (path, stop) = (path.clone(), std::sync::Arc::clone(&stop));
+            let keys = (*a.verifying_key(), *b.verifying_key());
+            std::thread::spawn(move || {
+                let mut reads = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let text = std::fs::read_to_string(&path).expect("the entry always exists");
+                    let jwk: serde_json::Value = serde_json::from_str(&text)
+                        .unwrap_or_else(|e| panic!("a partial JWK was read ({e}): {text:?}"));
+                    let key = parse_es256_jwk(&jwk).expect("a usable JWK");
+                    assert!(key == keys.0 || key == keys.1, "one of the two keys");
+                    reads += 1;
+                }
+                reads
+            })
+        };
+        for i in 0..2_000 {
+            let key = if i % 2 == 0 { &b } else { &a };
+            publish_cca_public_jwk(key, "nf-1684", &dir).expect("republish");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let reads = reader.join().expect("the reader saw only whole JWKs");
+        assert!(reads > 0, "the reader ran");
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .expect("dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["nf-1684.jwk"], "no temporary file is left behind");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).expect("meta").permissions().mode();
+            assert_eq!(mode & 0o777, 0o644, "a public key the NRF reads");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1684 (failure path): a publish that cannot complete leaves the published
+    /// entry as it was and no temporary file beside it. Here the rename fails
+    /// because a directory sits where the entry goes.
+    ///
+    /// REVERT-VERIFIED: with the `Pending` guard's removal dropped, the temporary
+    /// file is left and the listing assertion names it.
+    #[test]
+    fn a_failed_cca_jwk_publish_leaves_no_temporary_file_1684() {
+        let dir = std::env::temp_dir().join(format!(
+            "sbi-cca-fail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(dir.join("nf-1684b.jwk").join("occupied")).expect("blocker");
+        let err = publish_cca_public_jwk(&generate_es256_key(), "nf-1684b", &dir);
+        assert!(err.is_err(), "the rename onto a non-empty directory fails");
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .expect("dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            left,
+            ["nf-1684b.jwk"],
+            "only the blocker: no temporary file"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3233,6 +3471,114 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// A body streamed in chunks with no size hint, so hyper sends no
+    /// `Content-Length` and only the streamed cap can stop it (#1681).
+    struct Chunked1681(std::collections::VecDeque<bytes::Bytes>);
+
+    impl hyper::body::Body for Chunked1681 {
+        type Data = bytes::Bytes;
+        type Error = std::convert::Infallible;
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+            std::task::Poll::Ready(self.0.pop_front().map(|b| Ok(hyper::body::Frame::data(b))))
+        }
+    }
+
+    /// An NRF stand-in answering every request 200 with `json` padded with
+    /// trailing spaces (still valid JSON) to `total` bytes, streamed in 4 KiB
+    /// chunks with no `Content-Length` (#1681).
+    async fn serve_padded_json_1681(json: &'static str, total: usize) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let svc = hyper::service::service_fn(
+                        move |_req: hyper::Request<hyper::body::Incoming>| async move {
+                            let mut body = json.as_bytes().to_vec();
+                            body.resize(total.max(json.len()), b' ');
+                            let chunks = body
+                                .chunks(4096)
+                                .map(bytes::Bytes::copy_from_slice)
+                                .collect();
+                            let mut resp = hyper::Response::new(Chunked1681(chunks));
+                            resp.headers_mut().insert(
+                                hyper::header::CONTENT_TYPE,
+                                "application/json".parse().unwrap(),
+                            );
+                            Ok::<_, std::convert::Infallible>(resp)
+                        },
+                    );
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(io, svc)
+                    .await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// #1681: the NRF's access-token answer is read with a bound, while streaming:
+    /// a valid AccessTokenRsp padded one byte past [`TOKEN_RESPONSE_MAX_BODY`] is
+    /// refused, the same answer at the bound is accepted.
+    ///
+    /// REVERT-VERIFIED: with the token read back to an unbounded `collect`, the
+    /// over-cap answer parses and `expect_err` fails.
+    #[tokio::test]
+    async fn the_nrf_token_answer_is_read_with_a_bound_1681() {
+        const TOKEN: &str = r#"{"access_token":"tok","token_type":"Bearer","expires_in":3600}"#;
+        let client = |addr: std::net::SocketAddr| {
+            OAuth2Client::new(format!("http://{addr}"), "amf-1", NfType::Amf)
+        };
+        let at = serve_padded_json_1681(TOKEN, TOKEN_RESPONSE_MAX_BODY).await;
+        let ok = client(at)
+            .request_token(NfType::Udm, "nudm-sdm")
+            .await
+            .expect("an answer at the bound is read");
+        assert_eq!(ok.access_token, "tok");
+        let over = serve_padded_json_1681(TOKEN, TOKEN_RESPONSE_MAX_BODY + 1).await;
+        let err = client(over)
+            .request_token(NfType::Udm, "nudm-sdm")
+            .await
+            .expect_err("one byte over the bound is refused");
+        assert!(
+            err.to_string().contains(&format!(
+                "token response over the {TOKEN_RESPONSE_MAX_BODY}-byte limit"
+            )),
+            "{err}"
+        );
+    }
+
+    /// #1681: the JWKS document is read with a bound too.
+    ///
+    /// REVERT-VERIFIED: with the JWKS read back to an unbounded `collect`, the
+    /// over-cap document is accepted and `expect_err` fails.
+    #[tokio::test]
+    async fn the_nrf_jwks_is_read_with_a_bound_1681() {
+        const JWKS: &str = r#"{"keys":[]}"#;
+        let at = serve_padded_json_1681(JWKS, JWKS_MAX_BODY).await;
+        let uri = format!("http://{at}/nnrf-oauth2/v1/jwks");
+        let doc = fetch_jwks_from(&uri, None, None)
+            .await
+            .expect("at the bound");
+        assert_eq!(doc["keys"], serde_json::json!([]));
+        let over = serve_padded_json_1681(JWKS, JWKS_MAX_BODY + 1).await;
+        let uri = format!("http://{over}/nnrf-oauth2/v1/jwks");
+        let err = fetch_jwks_from(&uri, None, None)
+            .await
+            .expect_err("one byte over the bound is refused");
+        assert!(
+            err.to_string()
+                .contains(&format!("JWKS over the {JWKS_MAX_BODY}-byte limit")),
+            "{err}"
+        );
     }
 
     #[tokio::test]
