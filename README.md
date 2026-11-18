@@ -476,7 +476,8 @@ Two subscriber-management front ends ship, and neither has a default account
 - **`nextgcore-webui`** (Rust, `src/bins/nextgcore-webui`). Listens on
   `127.0.0.1:3000` by default (`--listen`, `--port`) and requires an API token
   (`--api-token-file` or `NEXTGCORE_WEBUI_API_TOKEN`); `--tls-cert`/`--tls-key`
-  for HTTPS, `--insecure-dev` only for local development.
+  for HTTPS, `--insecure-dev` only for local development, and refused unless
+  `NEXTGCORE_SBI_PROFILE=dev` (unset is production, #1871).
 
 Both read and write the `nextgcore` MongoDB database the UDR uses.
 
