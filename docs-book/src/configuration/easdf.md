@@ -82,6 +82,19 @@ refused**, with a warning: the EASDF would have to ask a resolver to find its ow
 `--nf-instance-id`, `--enabled`, `--max-dns-contexts` (default 4096, and also the ceiling on stored
 baseline patterns), and — with `dns-udp` — `--dns-udp-addr` and `--dns-udp-port`.
 
+## SBI security profile (#1677)
+
+The SBI listener follows `NEXTGCORE_SBI_PROFILE`, as the core NFs do. The default is `production`.
+
+- **`production`:** the listener uses TLS with the profile's certificate (`NEXTGCORE_SBI_TLS_CERT`, `_KEY`, `_CA`).
+  - It requires a client certificate signed by that CA (mTLS), and an NRF-issued access token whose `aud` is `EASDF` (TS 33.501 §13.1.0, §13.4.1). The token is checked against the NRF's JWKS.
+  - A missing certificate file is a startup error that names the path. The EASDF never falls back to cleartext.
+  - `--tls`/`--tls-cert`/`--tls-key` are overridden by the profile's paths.
+  - This is what smfd dials under the same profile, since #1669.
+- **`dev`:** cleartext h2c, with no client-certificate or token check. `--tls` still serves TLS with `--tls-cert`/`--tls-key` (default `/etc/nextgcore/tls/server.{crt,key}`), still without mTLS or tokens.
+
+The EASDF's own NRF calls (registration and heartbeat) carry an access token for the NRF under `production`.
+
 ## Port 53 needs a capability
 
 Binding UDP/53 requires `CAP_NET_BIND_SERVICE` or root. A **bind failure is fatal**: the operator

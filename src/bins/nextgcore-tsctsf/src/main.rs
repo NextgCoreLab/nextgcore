@@ -105,6 +105,38 @@ pub(crate) fn attach_oauth2(
     }
 }
 
+/// #1754: spawn `fut` on its own task, so dropping the caller (a consumer that
+/// disconnects mid-request) does not drop it. Under test the task-local OAuth2
+/// client is carried into the task, as the caller would have seen it.
+pub(crate) fn spawn_detached<F>(fut: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    #[cfg(test)]
+    if let Ok(oauth2) = TEST_OAUTH2_CLIENT.try_with(Arc::clone) {
+        return tokio::spawn(TEST_OAUTH2_CLIENT.scope(oauth2, fut));
+    }
+    tokio::spawn(fut)
+}
+
+/// #1754: whether a time-sync configuration is still stored, for a PCF Create that
+/// lands late. A poisoned lock answers "held", so nothing is retracted on a guess.
+fn time_sync_config_held(id: &str) -> bool {
+    tsctsf_self()
+        .read()
+        .map(|c| c.config_find(id).is_some())
+        .unwrap_or(true)
+}
+
+/// #1754: the same for a QoS/TSC session.
+fn qos_tsc_session_held(id: &str) -> bool {
+    tsctsf_self()
+        .read()
+        .map(|c| c.qos_tsc_find(id).is_some())
+        .unwrap_or(true)
+}
+
 /// #1665: the outbound OAuth2 client this TSCTSF installs at startup: under the
 /// `production` SBI profile or the `sbi.oauth2.require` knob, when an NRF is
 /// configured (see [`nextgcore_sbi::oauth::outbound_oauth2_client`]).
@@ -972,7 +1004,12 @@ async fn handle_qos_tsc_create(request: &SbiRequest) -> SbiResponse {
     if actuation::enabled() {
         match actuation::build_qos_tsc_app_session(&created, &qos_tsc_notif_uri(&created)) {
             Ok(asc) => {
-                actuation::policy_authorization_create(&created.transaction_ref_id, &asc).await;
+                actuation::policy_authorization_create(
+                    &created.transaction_ref_id,
+                    &asc,
+                    qos_tsc_session_held,
+                )
+                .await;
             }
             Err(reason) => log::warn!(
                 "not actuating QoS/TSC session {}: {reason}",
@@ -1110,7 +1147,7 @@ async fn actuate_time_sync_create(config_id: &str, cfg: &context::TimeSyncExposu
     );
     match actuation::build_time_sync_app_session(cfg, &derived, &time_sync_notif_uri(cfg)) {
         Ok(asc) => {
-            actuation::policy_authorization_create(config_id, &asc).await;
+            actuation::policy_authorization_create(config_id, &asc, time_sync_config_held).await;
         }
         Err(reason) => {
             log::warn!("not actuating time-sync configuration {config_id}: {reason}")
@@ -2078,6 +2115,257 @@ mod tests {
             actuation::set_for_test(false);
             reset_actuation(None);
             pcf.stop().await.expect("stop stand-in PCF");
+        });
+    }
+
+    /// #1754: a stand-in PCF whose answers the test scripts. `hold` names one
+    /// request kind ("create" or "delete") whose FIRST instance signals `arrived`
+    /// and is then held until `release`; `delete_statuses` are the statuses the
+    /// successive Deletes get (204 once exhausted). Every request is recorded.
+    struct ScriptedPcf {
+        seen: std::sync::Mutex<Vec<String>>,
+        delete_statuses: std::sync::Mutex<std::collections::VecDeque<u16>>,
+        hold: std::sync::Mutex<Option<&'static str>>,
+        arrived: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl ScriptedPcf {
+        fn deletes(&self) -> usize {
+            self.seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|u| {
+                    u.as_str() == "/npcf-policyauthorization/v1/app-sessions/asc-1754/delete"
+                })
+                .count()
+        }
+    }
+
+    async fn spawn_scripted_pcf(
+        hold: Option<&'static str>,
+        delete_statuses: &[u16],
+    ) -> (nextgcore_sbi::server::SbiServer, u16, Arc<ScriptedPcf>) {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let pcf = Arc::new(ScriptedPcf {
+            seen: std::sync::Mutex::new(Vec::new()),
+            delete_statuses: std::sync::Mutex::new(delete_statuses.iter().copied().collect()),
+            hold: std::sync::Mutex::new(hold),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let state = pcf.clone();
+        let (server, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let state = state.clone();
+                async move {
+                    let uri = req.header.uri.clone();
+                    state
+                        .seen
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(uri.clone());
+                    let kind = if uri == "/npcf-policyauthorization/v1/app-sessions" {
+                        "create"
+                    } else {
+                        "delete"
+                    };
+                    let held = {
+                        let mut hold = state.hold.lock().unwrap_or_else(|e| e.into_inner());
+                        if *hold == Some(kind) {
+                            *hold = None;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if held {
+                        state.arrived.notify_one();
+                        state.release.notified().await;
+                    }
+                    if kind == "create" {
+                        return SbiResponse::with_status(201).with_header(
+                            "Location",
+                            "/npcf-policyauthorization/v1/app-sessions/asc-1754".to_string(),
+                        );
+                    }
+                    let status = state
+                        .delete_statuses
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .pop_front()
+                        .unwrap_or(204);
+                    SbiResponse::with_status(status)
+                }
+            })
+            .await;
+        (server, addr.port(), pcf)
+    }
+
+    /// The single stored time-sync configuration's id (the cancelled create's
+    /// consumer never saw its 201).
+    fn only_config_id() -> String {
+        let list = tsctsf_self().read().expect("context").config_list();
+        assert_eq!(list.len(), 1, "one configuration stored");
+        list[0].id.clone()
+    }
+
+    fn time_sync_create_1754() -> SbiRequest {
+        create_request(serde_json::json!({
+            "timeDomain": 24,
+            "gmEnable": true,
+            "supis": ["imsi-001010000001754"],
+            "ueMac": "00-11-22-33-44-54",
+        }))
+    }
+
+    /// Poll `cond` for up to 5 s, yielding to the runtime between checks.
+    async fn eventually(what: &str, cond: impl Fn() -> bool) {
+        for _ in 0..500 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for: {what}");
+    }
+
+    /// #1754 (failure-path check 1): a Delete the PCF refuses keeps the
+    /// `appSessionId`, and is retried until the PCF accepts it.
+    #[test]
+    fn a_failed_delete_keeps_the_app_session_and_is_retried_1754() {
+        let _g = lock_globals();
+        reset_context();
+        block_on(async {
+            let (server, port, pcf) = spawn_scripted_pcf(None, &[500, 503]).await;
+            reset_actuation(Some(port));
+            actuation::set_for_test(true);
+
+            let created = tsctsf_sbi_request_handler(time_sync_create_1754()).await;
+            assert_eq!(created.status, 201);
+            let config_id = only_config_id();
+            let deleted = tsctsf_sbi_request_handler(SbiRequest::delete(format!(
+                "/ntsctsf-time-synchronization/v1/configuration/{config_id}"
+            )))
+            .await;
+            assert_eq!(deleted.status, 204);
+            assert_eq!(pcf.deletes(), 1);
+            assert_eq!(
+                actuation::app_session_for(&config_id).as_deref(),
+                Some("asc-1754"),
+                "a refused Delete must keep the appSessionId, or the PCF session is orphaned"
+            );
+
+            eventually("the retried Delete is accepted", || {
+                pcf.deletes() == 3 && actuation::app_session_for(&config_id).is_none()
+            })
+            .await;
+
+            actuation::set_for_test(false);
+            reset_actuation(None);
+            server.stop().await.expect("stop scripted PCF");
+        });
+    }
+
+    /// #1754 (check 3): a consumer that disconnects while the PCF holds its Create
+    /// does not drop the Create: the late 201 is recorded against the stored
+    /// configuration.
+    #[test]
+    fn a_cancelled_create_is_recorded_on_its_own_task_1754() {
+        let _g = lock_globals();
+        reset_context();
+        block_on(async {
+            let (server, port, pcf) = spawn_scripted_pcf(Some("create"), &[]).await;
+            reset_actuation(Some(port));
+            actuation::set_for_test(true);
+
+            tokio::select! {
+                _ = tsctsf_sbi_request_handler(time_sync_create_1754()) => {
+                    panic!("the PCF holds the Create; the handler cannot finish")
+                }
+                _ = pcf.arrived.notified() => {}
+            }
+            // The handler's future is dropped here: the consumer has gone.
+            let config_id = only_config_id();
+            pcf.release.notify_one();
+            eventually("the late 201 is recorded", || {
+                actuation::app_session_for(&config_id).as_deref() == Some("asc-1754")
+            })
+            .await;
+
+            actuation::set_for_test(false);
+            reset_actuation(None);
+            server.stop().await.expect("stop scripted PCF");
+        });
+    }
+
+    /// #1754 (check 3): a Create whose 201 lands after its configuration was deleted
+    /// (that Delete found nothing to retract) is retracted when it lands.
+    #[test]
+    fn a_create_landing_after_its_delete_is_retracted_1754() {
+        let _g = lock_globals();
+        reset_context();
+        block_on(async {
+            let (server, port, pcf) = spawn_scripted_pcf(Some("create"), &[]).await;
+            reset_actuation(Some(port));
+            actuation::set_for_test(true);
+
+            tokio::select! {
+                _ = tsctsf_sbi_request_handler(time_sync_create_1754()) => {
+                    panic!("the PCF holds the Create; the handler cannot finish")
+                }
+                _ = pcf.arrived.notified() => {}
+            }
+            let config_id = only_config_id();
+            let deleted = tsctsf_sbi_request_handler(SbiRequest::delete(format!(
+                "/ntsctsf-time-synchronization/v1/configuration/{config_id}"
+            )))
+            .await;
+            assert_eq!(deleted.status, 204);
+            assert_eq!(pcf.deletes(), 0, "nothing was recorded yet to retract");
+
+            pcf.release.notify_one();
+            eventually("the late app session is deleted at the PCF", || {
+                pcf.deletes() == 1 && actuation::app_session_for(&config_id).is_none()
+            })
+            .await;
+
+            actuation::set_for_test(false);
+            reset_actuation(None);
+            server.stop().await.expect("stop scripted PCF");
+        });
+    }
+
+    /// #1754 (check 3): a consumer that disconnects while the PCF holds its Delete
+    /// does not lose the retraction: the refused Delete is kept and retried.
+    #[test]
+    fn a_cancelled_delete_is_still_retracted_1754() {
+        let _g = lock_globals();
+        reset_context();
+        block_on(async {
+            let (server, port, pcf) = spawn_scripted_pcf(Some("delete"), &[500]).await;
+            reset_actuation(Some(port));
+            actuation::set_for_test(true);
+
+            let created = tsctsf_sbi_request_handler(time_sync_create_1754()).await;
+            assert_eq!(created.status, 201);
+            let config_id = only_config_id();
+            tokio::select! {
+                _ = tsctsf_sbi_request_handler(SbiRequest::delete(format!(
+                    "/ntsctsf-time-synchronization/v1/configuration/{config_id}"
+                ))) => panic!("the PCF holds the Delete; the handler cannot finish"),
+                _ = pcf.arrived.notified() => {}
+            }
+            pcf.release.notify_one();
+            eventually("the Delete is retried and accepted", || {
+                pcf.deletes() == 2 && actuation::app_session_for(&config_id).is_none()
+            })
+            .await;
+
+            actuation::set_for_test(false);
+            reset_actuation(None);
+            server.stop().await.expect("stop scripted PCF");
         });
     }
 

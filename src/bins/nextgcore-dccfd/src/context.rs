@@ -478,6 +478,17 @@ pub fn dccf_context_release_producer_sub(consumer_id: &str) -> Option<ProducerSu
     removed
 }
 
+/// Test-only (#1755): the producer resource URI recorded for `scope`, once the
+/// create has been committed.
+#[cfg(test)]
+pub fn dccf_context_producer_resource(scope: &SubscriptionScope) -> Option<String> {
+    let c = ctx().lock().unwrap();
+    c.producer_subs
+        .values()
+        .find(|p| &p.scope == scope)
+        .and_then(|p| p.resource_uri.clone())
+}
+
 /// How many producer subscriptions the DCCF currently holds. The de-duplication
 /// assertion: two overlapping consumers must leave this at 1.
 pub fn dccf_context_producer_sub_count() -> usize {
