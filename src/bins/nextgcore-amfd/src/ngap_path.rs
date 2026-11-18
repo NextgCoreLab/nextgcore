@@ -11867,12 +11867,34 @@ impl NgapServer {
     ) {
         use crate::context::ConnectedN2;
         use crate::namf_handler::PagedN2;
+        let (n2, paged) = match &item.n2 {
+            // #1643 review: the SMF's answer to the UE's own procedure, N1 only.
+            _ if item.n1_only => (None, PagedN2::N1Only),
+            ConnectedN2::None => (None, PagedN2::Setup),
+            ConnectedN2::Release => (None, PagedN2::Release),
+            ConnectedN2::Setup(t) => (t.clone(), PagedN2::Setup),
+            ConnectedN2::Modify(t) => (Some(t.clone()), PagedN2::Modify),
+        };
+        let mut sess = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.sess_find_by_psi(item.amf_ue_ngap_id, item.pdu_session_id)
+        };
         // #749: the UE is already being paged for another transfer. Its paging
         // context holds that one, and this transfer was already answered 200, so
         // it can neither overwrite it nor be refused. It waits in the queue: once
         // the UE answers it is CM-CONNECTED and delivered as such, and if the page
-        // fails it pages for itself.
-        if crate::namf_handler::paging_ongoing(item.amf_ue_ngap_id) {
+        // fails it pages for itself. #1837: checked and queued as one step, so an
+        // SBI transfer racing this one is never overwritten.
+        if !crate::namf_handler::initiate_paging_for_idle_ue(
+            amf_ue,
+            sess.as_mut(),
+            item.n1.clone(),
+            n2,
+            paged,
+            Some(item.pdu_session_id),
+            item.failure_notify_uri.as_deref(),
+        ) {
             log::info!(
                 "UE {}: N1N2 transfer for PSI {} waits for the paging already ongoing",
                 item.amf_ue_ngap_id,
@@ -11883,28 +11905,6 @@ impl NgapServer {
             guard.connected_downlink_add(item);
             return;
         }
-        let (n2, paged) = match item.n2 {
-            // #1643 review: the SMF's answer to the UE's own procedure, N1 only.
-            _ if item.n1_only => (None, PagedN2::N1Only),
-            ConnectedN2::None => (None, PagedN2::Setup),
-            ConnectedN2::Release => (None, PagedN2::Release),
-            ConnectedN2::Setup(t) => (t, PagedN2::Setup),
-            ConnectedN2::Modify(t) => (Some(t), PagedN2::Modify),
-        };
-        let mut sess = {
-            let ctx = crate::context::amf_self();
-            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
-            guard.sess_find_by_psi(item.amf_ue_ngap_id, item.pdu_session_id)
-        };
-        crate::namf_handler::initiate_paging_for_idle_ue(
-            amf_ue,
-            sess.as_mut(),
-            item.n1,
-            n2,
-            paged,
-            Some(item.pdu_session_id),
-            item.failure_notify_uri.as_deref(),
-        );
         if let Some(sess) = &sess {
             let ctx = crate::context::amf_self();
             let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
@@ -21269,7 +21269,7 @@ impl NgapServer {
             log::info!(
                 "Paging stopped for UE {} on its deregistration{}",
                 paging.amf_ue_ngap_id,
-                if paging.failure_notify_uri.is_some() {
+                if !paging.failure_notify_targets().is_empty() {
                     ", requester notified (FAILURE_CAUSE_UNSPECIFIED)"
                 } else {
                     ""
@@ -21302,15 +21302,15 @@ impl NgapServer {
     /// A page ended without its UE answering: notify the requester with `cause` and
     /// clear the session's paging state, so a later transfer is not refused as
     /// "paging ongoing".
+    ///
+    /// #1837: every requester the page holds is notified, each at its own URI: the
+    /// page's own transfer and each transfer that joined it
+    /// (`PagingContext::failure_notify_targets`, TS 29.518 §5.2.2.3.1).
     fn paging_ended(&self, paging: &crate::context::PagingContext, cause: &str) {
         // #1760: the UE did not answer; its last known location is reported.
         crate::namf_server::first_locations_after_page(paging, None);
-        if let Some(uri) = &paging.failure_notify_uri {
-            crate::namf_server::send_n1n2_failure_notification(
-                uri.clone(),
-                cause,
-                paging.n1n2_msg_data_uri.clone(),
-            );
+        for (uri, n1n2_msg_data_uri) in paging.failure_notify_targets() {
+            crate::namf_server::send_n1n2_failure_notification(uri, cause, n1n2_msg_data_uri);
         }
         clear_session_paging(paging);
     }
@@ -21323,7 +21323,7 @@ impl NgapServer {
             "Paging abandoned for UE {}: no response after {} attempt(s){}",
             paging.amf_ue_ngap_id,
             u32::from(paging.retransmit_count) + 1,
-            if paging.failure_notify_uri.is_some() {
+            if !paging.failure_notify_targets().is_empty() {
                 ", requester notified (UE_NOT_RESPONDING)"
             } else {
                 ""
@@ -27675,7 +27675,7 @@ mod tests {
     /// builder, so the copy from the UE context is the one under test.
     fn queue_paging(ngap: &NgapServer, ue: u64) {
         let amf_ue = ngap.ue_auth_state.get(ue).expect("UE").amf_ue;
-        crate::namf_handler::initiate_paging_for_idle_ue(
+        assert!(crate::namf_handler::initiate_paging_for_idle_ue(
             &amf_ue,
             None,
             None,
@@ -27683,7 +27683,7 @@ mod tests {
             crate::namf_handler::PagedN2::Setup,
             None,
             None,
-        );
+        ));
     }
 
     /// The associations the PAGINGs for 5G-TMSI `tmsi` went out on, in send order.
@@ -39361,7 +39361,8 @@ mod tests {
     /// session 5, and the subscription is told the UE's current location.
     ///
     /// REVERT-VERIFIED: with `paging_ongoing` counting a location-only page again
-    /// (`paging_holds_transfer` ignoring `location_only`), the transfer is refused
+    /// (`paging_holds_transfer` ignoring `location_only`; since #1837 the same
+    /// check is `paging_add`'s refusal), the transfer is refused
     /// ("not refused for a location-only page"); with `paging_add` not carrying the
     /// waiting subscriptions over, nothing is reported ("a LOCATION_REPORT must be
     /// delivered" via "the subscription still waits on the page").
