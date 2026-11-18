@@ -354,6 +354,49 @@ fn handover_failure_log_line(
     )
 }
 
+/// #1731: a UE context transfer from the old AMF that waits for the UE to be
+/// authenticated here (see `UeNasContext::pending_context_transfer`).
+#[derive(Clone, Debug)]
+pub(crate) struct PendingContextTransfer {
+    /// The old AMF's SBI host and port.
+    peer_host: String,
+    peer_port: u16,
+    /// The 5G-GUTI the UE presented, which names the context at the old AMF.
+    presented: crate::context::Guti5gs,
+    /// The SUPI the transfer gave.
+    supi: String,
+    /// The transferred `UeContext`, whose `eventSubscriptionList` is taken over.
+    ue_context: serde_json::Value,
+}
+
+/// #1731: Namf_Communication_RegistrationStatusUpdate toward the old AMF of
+/// `pending` (TS 29.518 §5.2.2.2.2), TRANSFERRED or NOT_TRANSFERRED, on its own task:
+/// an SBI call on the NGAP task holds N2 for every gNB. Best-effort: on a failure the
+/// old AMF releases its copy on its own guard timer (TS 23.502 §4.2.2.2.2 step 5).
+fn spawn_registration_status_update(pending: PendingContextTransfer, transferred: bool) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async move {
+        if let Err(e) = crate::sbi_path::call_amf_registration_status_update(
+            &pending.peer_host,
+            pending.peer_port,
+            &pending.presented,
+            transferred,
+        )
+        .await
+        {
+            log::warn!(
+                "[{}] RegistrationStatusUpdate to {}:{} failed ({e}); the old AMF releases \
+                 its copy on its own guard timer (TS 23.502 §4.2.2.2.2 step 5)",
+                pending.supi,
+                pending.peer_host,
+                pending.peer_port
+            );
+        }
+    });
+}
+
 /// Connected gNB session
 #[derive(Debug)]
 pub struct GnbSession {
@@ -803,6 +846,15 @@ pub struct UeNasContext {
     /// that comes in on a new gNB before its old connection is released has
     /// changed no CM state, and neither has a later message on the same connection.
     left_cm_idle: bool,
+    /// #1731: a UE context transferred from the old AMF (TS 23.502 §4.2.2.2.2 steps
+    /// 4-5) that this AMF has not yet committed to. It is committed once the UE is
+    /// authenticated here, at the Security Mode Complete: the old AMF is told
+    /// TRANSFERRED and the subscriptions in the context are taken over. A UE context
+    /// that ends before then (an authentication failure, a Security Mode Reject, a
+    /// release) tells the old AMF NOT_TRANSFERRED and takes nothing over, since
+    /// step 10 has the old AMF continue "as if the UE context transfer service
+    /// operation was never received".
+    pending_context_transfer: Option<PendingContextTransfer>,
     /// #1700: the UE arrived by an EPS->5GS handover (TS 23.502 §4.11.1.2.2) and
     /// its step-12 mobility registration has not been accepted yet. Set with
     /// `registered` at the HandoverNotify; taken by the first Registration Accept,
@@ -1076,6 +1128,7 @@ impl UeNasContext {
             release_after_registration: false,
             cm_idle: false,
             left_cm_idle: false,
+            pending_context_transfer: None,
             arrived_from_eps: false,
             restored: false,
             taken_over: false,
@@ -4946,6 +4999,46 @@ impl NgapServer {
         true
     }
 
+    /// #1731: commit the context transfer UE `amf_ue_ngap_id` holds, once the UE is
+    /// authenticated here (TS 23.502 §4.2.2.2.2 step 10). Taken from the record, so a
+    /// repeated Security Mode Complete commits nothing more.
+    ///
+    /// - #1699: the event subscriptions targeting the UE come over with its context
+    ///   (TS 29.518 §6.1.6.2.25, `eventSubscriptionList`, `29518-k00.txt:13606-13614`:
+    ///   "shall be present if available ... it shall indicate the event
+    ///   subscription(s) targeting the UE or the group the UE is part of"). This AMF
+    ///   creates them under new subscription IDs and tells each consumer that gave a
+    ///   `subsChangeNotifyUri` with SUBSCRIPTION_ID_CHANGE (or _ADDITION for a group
+    ///   one), as the N2 handover target's CreateUEContext does (#397), filters and
+    ///   areas included. Before the Registration Accept, whose CONNECTED report
+    ///   (#1645) they then hear.
+    /// - The procedure is closed at the old AMF with TRANSFERRED (TS 29.518
+    ///   §5.2.2.2.2). Without it the old AMF holds the context until the guard timer
+    ///   TS 23.502 step 5 licenses expires, and never learns whether the UE registered
+    ///   here. Best-effort, and off the NGAP task.
+    fn commit_context_transfer(&mut self, amf_ue_ngap_id: u64) {
+        let Some(pending) = self
+            .ue_auth_state
+            .with_mut(amf_ue_ngap_id, |s| s.pending_context_transfer.take())
+            .flatten()
+        else {
+            return;
+        };
+        let subscriptions = crate::namf_server::take_over_transferred_event_subscriptions(
+            &pending.supi,
+            Some(&pending.supi),
+            &pending.ue_context,
+        );
+        log::info!(
+            "[{}] UE authenticated: the context transfer from {}:{} is committed, \
+             {subscriptions} event subscription(s) taken over (TS 23.502 §4.2.2.2.2 step 10)",
+            pending.supi,
+            pending.peer_host,
+            pending.peer_port
+        );
+        spawn_registration_status_update(pending, true);
+    }
+
     /// Fetch a UE context from the AMF that issued the presented 5G-GUTI
     /// (#352; TS 23.502 §4.2.2.2.2 steps 4-5, TS 29.518 §5.2.2.2.1).
     ///
@@ -5052,66 +5145,61 @@ impl NgapServer {
         // authenticates, so importing the old NAS keys would seed a context that
         // is about to be replaced -- and doing it half-way (algorithms without
         // keys) is how a security context ends up self-inconsistent.
-        self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
-            s.amf_ue.supi = Some(supi.clone());
-            if let Some(ref pei) = transferred.pei {
-                s.amf_ue.pei = Some(pei.clone());
+        let replaced = self
+            .ue_auth_state
+            .with_mut(amf_ue_ngap_id, |s| {
+                s.amf_ue.supi = Some(supi.clone());
+                if let Some(ref pei) = transferred.pei {
+                    s.amf_ue.pei = Some(pei.clone());
+                }
+                s.amf_ue.amf_ue_context_transfer_state =
+                    crate::context::UeContextTransferState::TransferNewAmf;
+                // #1645: an inter-AMF mobility registration into this AMF (TS 23.502
+                // §4.2.2.2.2 steps 4-5) ends with the UE CM-CONNECTED here, where it had
+                // no connection. The Registration Accept reports that transition once.
+                s.left_cm_idle = true;
+                // The presented GUTI stays current until this AMF issues its own in
+                // `complete_registration` (which calls `generate_new_guti` and stamps
+                // this AMF's GUAMI), so the UE remains addressable in the meantime.
+                s.amf_ue.current_guti = presented.clone();
+                s.amf_ue.current_m_tmsi = Some(presented.tmsi);
+                // #1731: held until the UE is authenticated here. Committing it now, the
+                // old AMF told TRANSFERRED and the subscriptions taken over, would leave
+                // both done for a UE whose authentication then fails, where TS 23.502
+                // §4.2.2.2.2 step 10 has the old AMF continue "as if the UE context
+                // transfer service operation was never received" (`23502-k20.txt:
+                // 4180-4185`). A retried registration replaces it.
+                s.pending_context_transfer.replace(PendingContextTransfer {
+                    peer_host: peer_host.clone(),
+                    peer_port,
+                    presented: presented.clone(),
+                    supi: supi.clone(),
+                    ue_context: transferred.ue_context.clone(),
+                })
+            })
+            .flatten();
+        // #1731: a retried registration that names a DIFFERENT context (another
+        // 5G-GUTI, or another old AMF) leaves the one it replaced uncommitted for
+        // good, so that old AMF is told NOT_TRANSFERRED now. The same context fetched
+        // again is the one this record will commit, so it is not handed back.
+        if let Some(replaced) = replaced {
+            if replaced.presented != *presented
+                || replaced.peer_host != peer_host
+                || replaced.peer_port != peer_port
+            {
+                spawn_registration_status_update(replaced, false);
             }
-            s.amf_ue.amf_ue_context_transfer_state =
-                crate::context::UeContextTransferState::TransferNewAmf;
-            // #1645: an inter-AMF mobility registration into this AMF (TS 23.502
-            // §4.2.2.2.2 steps 4-5) ends with the UE CM-CONNECTED here, where it had
-            // no connection. The Registration Accept reports that transition once.
-            s.left_cm_idle = true;
-            // The presented GUTI stays current until this AMF issues its own in
-            // `complete_registration` (which calls `generate_new_guti` and stamps
-            // this AMF's GUAMI), so the UE remains addressable in the meantime.
-            s.amf_ue.current_guti = presented.clone();
-            s.amf_ue.current_m_tmsi = Some(presented.tmsi);
-        });
-
-        // #1699: the event subscriptions targeting the UE come over with its context
-        // (TS 29.518 §6.1.6.2.25, `eventSubscriptionList`, `29518-k00.txt:13606-13614`:
-        // "shall be present if available ... it shall indicate the event
-        // subscription(s) targeting the UE or the group the UE is part of"). This AMF
-        // creates them under new subscription IDs and tells each consumer that gave a
-        // `subsChangeNotifyUri` with SUBSCRIPTION_ID_CHANGE (or _ADDITION for a group
-        // one), as the N2 handover target's CreateUEContext does (#397), filters and
-        // areas included. Done once the SUPI is on the record, so the subscriptions
-        // match the UE they follow, and before the Registration Accept, whose
-        // CONNECTED report (#1645) they then hear. Before #1699 they were dropped: a
-        // consumer that followed the UE heard nothing more from this AMF.
-        let subscriptions = crate::namf_server::take_over_transferred_event_subscriptions(
-            &supi,
-            Some(&supi),
-            &transferred.ue_context,
-        );
+        }
 
         log::info!(
             "[{supi}] UE context transferred from the old AMF at {peer_host}:{peer_port}: \
-             {} PDU session(s) reported, {subscriptions} event subscription(s) taken over. \
-             The sessions are NOT re-established here -- moving the N3 tunnels is \
-             Nsmf_PDUSession_UpdateSMContext toward each SMF (TS 23.502 §4.2.2.2.2 step \
-             21), which is the N2 relocation path and belongs to #74",
+             {} PDU session(s) reported. It is committed, the old AMF told and its event \
+             subscriptions taken over, once the UE is authenticated here (TS 23.502 \
+             §4.2.2.2.2 step 10). The sessions are NOT re-established here -- moving the N3 \
+             tunnels is Nsmf_PDUSession_UpdateSMContext toward each SMF (TS 23.502 \
+             §4.2.2.2.2 step 21), which is the N2 relocation path and belongs to #74",
             transferred.pdu_session_ids.len()
         );
-
-        // Close the procedure at the old AMF (TS 29.518 §5.2.2.2.2). Without this
-        // the old AMF holds the context until the implementation-specific guard
-        // timer TS 23.502 step 5 licenses it to start expires, and never learns
-        // whether the UE registered here. Best-effort: the transfer has already
-        // succeeded, so a failure to report it must not undo the registration.
-        if let Err(e) = crate::sbi_path::call_amf_registration_status_update(
-            &peer_host, peer_port, presented, true,
-        )
-        .await
-        {
-            log::warn!(
-                "[{supi}] RegistrationStatusUpdate to {peer_host}:{peer_port} failed ({e}). The \
-                 context transfer already succeeded, so the registration continues; the old AMF \
-                 will release its copy on its own guard timer (TS 23.502 §4.2.2.2.2 step 5)"
-            );
-        }
 
         // The caller authenticates, with the SUPI now known -- which is what the
         // transfer bought: no Identity Request, no SUCI over the air.
@@ -5234,19 +5322,17 @@ impl NgapServer {
                 }
                 let cause = gmm_cause_from_sbi_error(&e);
                 let reject = gmm_build::build_registration_reject(cause);
-                // The state is deliberately NOT put back here, unlike in every sibling
-                // failure arm (#359). Those arms re-insert because they refuse a UE the
-                // caller may still be holding; this one has already decided the UE is gone,
-                // and `reject_and_release` reads nothing from the map -- it builds the reject
-                // from `cause`, and `release_ue` takes the ids as arguments. Re-inserting
-                // would be one line whose removal changes no observable behaviour, which is
-                // the kind of line that reads as load-bearing and is not.
-                //
-                // What makes that safe is that `release_ue` now runs unconditionally: before
-                // this fix the `?` on the reject send returned first, so the state was gone
-                // AND nothing had released it. `forget_ue`'s removal is a no-op on this arm
-                // and its `release_emergency` is not, which is why the emergency context is
-                // the observable in the test.
+                // The state is put back before the release, as in every sibling failure
+                // arm (#359), so that `forget_ue` -- reached through `reject_and_release`
+                // -> `release_ue` -- sees the whole record. Before #1731 this arm left it
+                // out, which was unobservable: `reject_and_release` reads nothing from the
+                // map. It is observable now. A context transferred from the old AMF and
+                // not yet committed is on the record, and `forget_ue` is what hands it
+                // back with NOT_TRANSFERRED (TS 23.502 §4.2.2.2.2 step 10: "If the
+                // authentication/security procedure fails ... the new AMF invokes the
+                // Namf_Communication_RegistrationStatusUpdate service operation with a
+                // reject indication"). Without the record, the old AMF heard nothing.
+                self.ue_auth_state.insert(amf_ue_ngap_id, state);
                 self.reject_and_release(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject, 1)
                     .await?;
             }
@@ -6136,6 +6222,9 @@ impl NgapServer {
         }) else {
             return Ok(());
         };
+        // #1731: the UE is authenticated and the NAS security context is in use, so a
+        // context transferred from the old AMF is committed now.
+        self.commit_context_transfer(amf_ue_ngap_id);
 
         if need_pei {
             // PEI not provided: Identity Request for IMEISV (protected),
@@ -10179,9 +10268,10 @@ impl NgapServer {
                 }
                 None
             });
+        // Read before `forget_session`, which clears it (#1728).
+        let user_plane_up = self.up_active.contains(&key);
         self.forget_session(amf_ue_ngap_id, psi);
-        if self.up_active.contains(&key) {
-            self.clear_up_active(amf_ue_ngap_id, psi);
+        if user_plane_up {
             match crate::ngap_asn1::build_pdu_session_resource_release_command_asn1(
                 amf_ue_ngap_id,
                 ran_ue_ngap_id,
@@ -14617,7 +14707,17 @@ impl NgapServer {
         // a deregistration aborted by a release or an NG Reset (TS 24.501 §5.5.2.3.5 b),
         // §5.5.2.3.6), stops its paging. Before the record goes.
         self.stop_paging_on_deregistration(amf_ue_ngap_id);
-        self.ue_auth_state.remove(amf_ue_ngap_id);
+        // #1731: a context transferred from the old AMF and not yet committed (the UE
+        // was never authenticated here: an authentication failure, a Security Mode
+        // Reject, a release) is handed back. The old AMF is told NOT_TRANSFERRED and
+        // keeps it (TS 29.518 §5.2.2.2.2), and nothing was taken over.
+        if let Some(pending) = self
+            .ue_auth_state
+            .remove(amf_ue_ngap_id)
+            .and_then(|s| s.pending_context_transfer)
+        {
+            spawn_registration_status_update(pending, false);
+        }
         self.clear_up_active_for_ue(amf_ue_ngap_id);
         // #756: the UE's per-session state goes with it. AMF UE NGAP IDs are never
         // reused, so an entry left here is never overwritten. Before this, every
@@ -14677,7 +14777,14 @@ impl NgapServer {
 
     /// Drop one PDU session's state (#756): released at the SMF, so nothing will
     /// address it again.
+    ///
+    /// #1728 (review m2 on #1744): its user-plane-active flag goes too. A flag left
+    /// behind is consequential since #1728: a registration update reads it as "the
+    /// user plane is already up" and does not activate the PSI, so a session released
+    /// here and then established again under the same PSI on the same NG connection
+    /// would never have its user plane set up.
     fn forget_session(&mut self, amf_ue_ngap_id: u64, psi: u8) {
+        self.clear_up_active(amf_ue_ngap_id, psi);
         self.sm_context_refs.remove(&(amf_ue_ngap_id, psi));
         self.sm_context_smfs.remove(&(amf_ue_ngap_id, psi));
         self.handover_target_transfers
@@ -42348,9 +42455,17 @@ mod tests {
              tree's own producer requires before it will accept a MOBI_REG"
         );
 
-        let (update_uri, update_body, _) = rx
-            .try_recv()
-            .expect("the procedure must be CLOSED at the old AMF (TS 29.518 §5.2.2.2.2)");
+        // #1731: the procedure is closed at the old AMF once the UE is authenticated
+        // here, not at the transfer.
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing more before the UE is authenticated"
+        );
+        ngap.commit_context_transfer(ngap_id);
+        let (update_uri, update_body, _) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("the procedure must be CLOSED at the old AMF (TS 29.518 §5.2.2.2.2)")
+            .expect("channel closed");
         assert!(
             update_uri.contains(&format!(
                 "/ue-contexts/{}/transfer-update",
@@ -42568,6 +42683,8 @@ mod tests {
         std::env::remove_var("AMF_PEER_SBI_ADDR");
         std::env::remove_var("AMF_PEER_SBI_PORT");
         assert!(identified, "the context came from the old AMF");
+        // #1731: taken over once the UE is authenticated here.
+        ngap.commit_context_transfer(id);
 
         let body = tokio::time::timeout(Duration::from_secs(3), change_rx.recv())
             .await
@@ -42719,6 +42836,8 @@ mod tests {
                 identified,
                 "attempt {attempt}: the context came from the old AMF"
             );
+            // #1731: each attempt authenticated, so each commits its transfer.
+            ngap.commit_context_transfer(id);
         }
         std::env::remove_var("AMF_PEER_SBI_ADDR");
         std::env::remove_var("AMF_PEER_SBI_PORT");
@@ -42770,6 +42889,390 @@ mod tests {
         peer.stop().await.expect("peer stop");
         change_sink.stop().await.expect("sink stop");
         event_sink.stop().await.expect("sink stop");
+    }
+
+    /// A stand-in old AMF for #1731: it hands over `supi`'s context, for whatever
+    /// 5G-GUTI it is asked, with one CONNECTIVITY_STATE_REPORT subscription whose
+    /// `subsChangeNotifyUri` is `change_port`. It sends the URI and body of every
+    /// `transfer-update` it receives on the returned channel.
+    async fn old_amf_1731(
+        supi: &str,
+        change_port: u16,
+    ) -> (
+        nextgcore_sbi::SbiServer,
+        u16,
+        mpsc::Receiver<(String, String)>,
+    ) {
+        use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        let transferred = serde_json::json!({ "ueContext": {
+            "supi": supi,
+            "mmContextList": [{ "accessType": "3GPP_ACCESS" }],
+            "eventSubscriptionList": [{
+                "eventList": [{ "type": "CONNECTIVITY_STATE_REPORT" }],
+                "eventNotifyUri": "http://127.0.0.1:9/notify/1731-evt",
+                "notifyCorrelationId": "corr-1731",
+                "nfId": "3fa85f64-5717-4562-b3fc-2c963f661731",
+                "supi": supi,
+                "subsChangeNotifyUri":
+                    format!("http://127.0.0.1:{change_port}/notify/1731-subs-change"),
+            }],
+        }});
+        let (tx, rx) = mpsc::channel::<(String, String)>(8);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let peer_port = addr.port();
+        let peer = SbiServer::on_listener(
+            SbiServerConfig::new(format!("127.0.0.1:{peer_port}").parse().expect("addr")),
+            listener,
+        );
+        peer.start(move |req: SbiRequest| {
+            let (transferred, tx) = (transferred.clone(), tx.clone());
+            async move {
+                if req.header.uri.contains("/transfer-update") {
+                    let _ = tx
+                        .send((
+                            req.header.uri.clone(),
+                            req.http.content.clone().unwrap_or_default(),
+                        ))
+                        .await;
+                    SbiResponse::ok()
+                        .with_json_body(&serde_json::json!({ "regStatusTransferComplete": true }))
+                        .expect("json")
+                } else {
+                    SbiResponse::ok()
+                        .with_json_body(&transferred)
+                        .expect("json")
+                }
+            }
+        })
+        .await
+        .expect("peer AMF start");
+        (peer, peer_port, rx)
+    }
+
+    /// The foreign 5G-GUTI of #1731's tests: issued by another AMF of this AMF's set.
+    fn foreign_guti_1731(tmsi: u32) -> crate::context::Guti5gs {
+        crate::context::Guti5gs {
+            amf_pointer: local_guami().amf_id.pointer + 1,
+            ..guti_from(&local_guami(), tmsi)
+        }
+    }
+
+    /// Resolve UE `id`'s mobility registration presenting `foreign`, with the old AMF
+    /// at `peer_port`.
+    async fn resolve_foreign_1731(
+        ngap: &mut NgapServer,
+        id: u64,
+        foreign: &crate::context::Guti5gs,
+        peer_port: u16,
+    ) {
+        ngap.ue_auth_state.with_mut(id, |ue| {
+            ue.amf_ue.old_guti = foreign.clone();
+        });
+        std::env::set_var("AMF_PEER_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("AMF_PEER_SBI_PORT", peer_port.to_string());
+        let nas = registration_request_with_guti(
+            foreign,
+            crate::gmm_build::registration_type::MOBILITY_UPDATING,
+        );
+        let identified = ngap
+            .resolve_registration_by_guti(
+                id,
+                &nas,
+                crate::gmm_build::registration_type::MOBILITY_UPDATING,
+            )
+            .await;
+        std::env::remove_var("AMF_PEER_SBI_ADDR");
+        std::env::remove_var("AMF_PEER_SBI_PORT");
+        assert!(identified, "the context came from the old AMF");
+    }
+
+    /// The new AMF's record for #1731, its UE context fetched from the old AMF at
+    /// `peer_port` for the foreign 5G-GUTI `tmsi`.
+    async fn transferred_ue_1731(ngap: &mut NgapServer, id: u64, tmsi: u32, peer_port: u16) {
+        let mut ue = UeNasContext::new(id, 55, 1, false);
+        ue.amf_ue.registration_type = crate::gmm_build::registration_type::MOBILITY_UPDATING;
+        ue.amf_ue.ue_security_capability = UeSecurityCapability {
+            ea: 0xF0,
+            ia: 0xF0,
+            eea: 0,
+            eia: 0,
+        };
+        ngap.ue_auth_state.insert(id, ue);
+        resolve_foreign_1731(ngap, id, &foreign_guti_1731(tmsi), peer_port).await;
+    }
+
+    /// The `transferStatus` of the next `transfer-update` the old AMF receives, and
+    /// the URI it came on.
+    async fn next_status_1731(
+        rx: &mut mpsc::Receiver<(String, String)>,
+        what: &str,
+    ) -> (String, String) {
+        let (uri, body) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("{what}"))
+            .expect("channel closed");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        (
+            uri,
+            v["transferStatus"].as_str().unwrap_or_default().to_string(),
+        )
+    }
+
+    /// No `transfer-update` reaches the old AMF within `ms`.
+    async fn no_status_1731(rx: &mut mpsc::Receiver<(String, String)>, ms: u64) -> bool {
+        tokio::time::timeout(Duration::from_millis(ms), rx.recv())
+            .await
+            .is_err()
+    }
+
+    fn taken_over_1731(supi: &str) -> Vec<crate::context::EventSubscription> {
+        crate::context::amf_self()
+            .read()
+            .expect("ctx lock")
+            .event_subscriptions_matching("CONNECTIVITY_STATE_REPORT", Some(supi))
+    }
+
+    /// **#1731**, TS 23.502 §4.2.2.2.2 step 10 (`23502-k20.txt:4180-4185`): when the
+    /// UE fails authentication at the new AMF, "The old AMF continues as if the UE
+    /// context transfer service operation was never received". So a transfer that the
+    /// UE's authentication then fails takes over no subscription, and the old AMF is
+    /// told NOT_TRANSFERRED (TS 29.518 §5.2.2.2.2), through the real Authentication
+    /// Failure handler and its Authentication Reject and release.
+    ///
+    /// REVERT-VERIFIED: with the transfer committed at the fetch, as before, the old
+    /// AMF's first status is TRANSFERRED; with no status update from `forget_ue`, none
+    /// arrives ("the old AMF is told").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_authentication_failure_after_a_transfer_hands_the_context_back_1731() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _guamis = serve_only_local_guami();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let supi = "imsi-001010001731010";
+        let (change_sink, change_port, mut change_rx) = notify_sink().await;
+        let (peer, peer_port, mut status_rx) = old_amf_1731(supi, change_port).await;
+        let mut ngap = capturing_ngap_server().await;
+        let id = 17_310_101u64;
+        transferred_ue_1731(&mut ngap, id, 0x1731_0101, peer_port).await;
+
+        // An Authentication Failure with a cause the AMF does not retry (#111,
+        // "Protocol error, unspecified"): Authentication Reject and release.
+        let failure = [0x7E, 0x00, message_type::AUTHENTICATION_FAILURE, 0x6F];
+        ngap.handle_authentication_failure_nas(1, id, 55, &failure)
+            .await
+            .expect("handled");
+        assert!(!ngap.ue_auth_state.contains(id), "the UE was released");
+
+        let (uri, status) = next_status_1731(&mut status_rx, "the old AMF is told").await;
+        assert_eq!(status, "NOT_TRANSFERRED");
+        assert!(
+            uri.contains(&format!(
+                "/ue-contexts/{}/transfer-update",
+                foreign_guti_1731(0x1731_0101).to_context_id()
+            )),
+            "about the context it transferred: {uri}"
+        );
+        let stored = taken_over_1731(supi);
+        assert!(stored.is_empty(), "nothing taken over: {stored:?}");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), change_rx.recv())
+                .await
+                .is_err(),
+            "no SUBSCRIPTION_ID_CHANGE"
+        );
+        assert!(no_status_1731(&mut status_rx, 100).await, "one status");
+        peer.stop().await.expect("peer stop");
+        change_sink.stop().await.expect("sink stop");
+    }
+
+    /// **#1731**: an authentication that cannot be run at all (the AUSF unreachable)
+    /// is an authentication failure too (TS 23.502 §4.2.2.2.2 step 10), and that arm
+    /// of `start_authentication` releases the UE having taken its record out of the
+    /// map. The record goes back first, so `forget_ue` hands the transfer back.
+    ///
+    /// REVERT-VERIFIED: without the re-insert in that arm, no status arrives ("the old
+    /// AMF is told").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreachable_ausf_after_a_transfer_hands_the_context_back_1731() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _guamis = serve_only_local_guami();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let supi = "imsi-001010001731030";
+        let (change_sink, change_port, _change_rx) = notify_sink().await;
+        let (peer, peer_port, mut status_rx) = old_amf_1731(supi, change_port).await;
+        let mut ngap = capturing_ngap_server().await;
+        let id = 17_310_301u64;
+        transferred_ue_1731(&mut ngap, id, 0x1731_0301, peer_port).await;
+
+        // No AUSF is configured, so the call goes to a port nothing listens on.
+        ngap.start_authentication(1, id, 55, None)
+            .await
+            .expect("handled");
+        assert!(!ngap.ue_auth_state.contains(id), "the UE was released");
+        let (_, status) = next_status_1731(&mut status_rx, "the old AMF is told").await;
+        assert_eq!(status, "NOT_TRANSFERRED");
+        assert!(taken_over_1731(supi).is_empty(), "nothing taken over");
+        peer.stop().await.expect("peer stop");
+        change_sink.stop().await.expect("sink stop");
+    }
+
+    /// **#1731**: a transfer is committed once the UE is authenticated, at the
+    /// Security Mode Complete, through the real handler: the old AMF is told
+    /// TRANSFERRED and the subscription is taken over (its consumer told
+    /// SUBSCRIPTION_ID_CHANGE). Before the Security Mode Complete neither has
+    /// happened, and a second Security Mode Complete repeats neither. The UE then
+    /// leaving tells the old AMF nothing more.
+    ///
+    /// REVERT-VERIFIED: without the `commit_context_transfer` call in
+    /// `handle_security_mode_complete_nas`, no status arrives ("TRANSFERRED at the
+    /// Security Mode Complete"); with the pending transfer cloned rather than taken,
+    /// the second Security Mode Complete sends a second status ("once").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transfer_is_committed_once_at_the_security_mode_complete_1731() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _guamis = serve_only_local_guami();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let supi = "imsi-001010001731020";
+        let (change_sink, change_port, mut change_rx) = notify_sink().await;
+        let (peer, peer_port, mut status_rx) = old_amf_1731(supi, change_port).await;
+        let mut ngap = capturing_ngap_server().await;
+        let id = 17_310_201u64;
+        transferred_ue_1731(&mut ngap, id, 0x1731_0201, peer_port).await;
+
+        assert!(
+            no_status_1731(&mut status_rx, 300).await,
+            "the old AMF is not told before the UE is authenticated"
+        );
+        assert!(
+            taken_over_1731(supi).is_empty(),
+            "nor is anything taken over"
+        );
+
+        let smc = smc_with_replayed_caps(0xF0, 0xF0);
+        ngap.handle_security_mode_complete_nas(1, id, 55, &smc)
+            .await
+            .expect("handled");
+        let (_, status) =
+            next_status_1731(&mut status_rx, "TRANSFERRED at the Security Mode Complete").await;
+        assert_eq!(status, "TRANSFERRED");
+        let body = tokio::time::timeout(Duration::from_secs(3), change_rx.recv())
+            .await
+            .expect("SUBSCRIPTION_ID_CHANGE to the subsChangeNotifyUri")
+            .expect("channel closed");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(v["reportList"][0]["type"], "SUBSCRIPTION_ID_CHANGE", "{v}");
+        let stored = taken_over_1731(supi);
+        assert_eq!(stored.len(), 1, "taken over: {stored:?}");
+        let _subscription =
+            crate::namf_server::EventSubscriptionGuard::id(&stored[0].subscription_id);
+
+        // The SMC carried no IMEISV, so the AMF asked for it and the UE is still here.
+        assert!(
+            ngap.ue_auth_state.contains(id),
+            "precondition: the UE is live"
+        );
+        ngap.handle_security_mode_complete_nas(1, id, 55, &smc)
+            .await
+            .expect("handled");
+        assert!(no_status_1731(&mut status_rx, 500).await, "once");
+        assert_eq!(taken_over_1731(supi).len(), 1, "one subscription");
+
+        // A committed transfer is not handed back when the UE later goes.
+        ngap.forget_ue(id);
+        assert!(
+            no_status_1731(&mut status_rx, 300).await,
+            "nothing at the release"
+        );
+        peer.stop().await.expect("peer stop");
+        change_sink.stop().await.expect("sink stop");
+    }
+
+    /// **#1731**: a retried registration that presents ANOTHER 5G-GUTI replaces the
+    /// pending transfer, and the context it replaced is never committed, so its old
+    /// AMF is told NOT_TRANSFERRED at once (TS 23.502 §4.2.2.2.2 step 10). The same
+    /// 5G-GUTI fetched again is the context this record will commit, and is not
+    /// handed back.
+    ///
+    /// REVERT-VERIFIED: with the replaced record dropped silently (no hand-back), the
+    /// first context's status never arrives ("the replaced context is handed back");
+    /// with every replacement handed back, the same-GUTI retry sends one ("the same
+    /// context fetched again").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retry_with_another_guti_hands_the_replaced_context_back_1731() {
+        let _guard = crate::test_support::CONTEXT_GUARD.lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _guamis = serve_only_local_guami();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let supi = "imsi-001010001731040";
+        let (change_sink, change_port, _change_rx) = notify_sink().await;
+        let (peer, peer_port, mut status_rx) = old_amf_1731(supi, change_port).await;
+        let mut ngap = capturing_ngap_server().await;
+        let id = 17_310_401u64;
+        transferred_ue_1731(&mut ngap, id, 0x1731_0401, peer_port).await;
+
+        // The same 5G-GUTI again.
+        resolve_foreign_1731(&mut ngap, id, &foreign_guti_1731(0x1731_0401), peer_port).await;
+        assert!(
+            no_status_1731(&mut status_rx, 300).await,
+            "the same context fetched again is not handed back"
+        );
+
+        // Another 5G-GUTI.
+        resolve_foreign_1731(&mut ngap, id, &foreign_guti_1731(0x1731_0402), peer_port).await;
+        let (uri, status) =
+            next_status_1731(&mut status_rx, "the replaced context is handed back").await;
+        assert_eq!(status, "NOT_TRANSFERRED");
+        assert!(
+            uri.contains(&foreign_guti_1731(0x1731_0401).to_context_id()),
+            "the FIRST context: {uri}"
+        );
+
+        // And the one now pending is the second.
+        ngap.forget_ue(id);
+        let (uri, status) = next_status_1731(&mut status_rx, "the second at the release").await;
+        assert_eq!(status, "NOT_TRANSFERRED");
+        assert!(
+            uri.contains(&foreign_guti_1731(0x1731_0402).to_context_id()),
+            "the SECOND context: {uri}"
+        );
+        assert!(taken_over_1731(supi).is_empty(), "nothing taken over");
+        peer.stop().await.expect("peer stop");
+        change_sink.stop().await.expect("sink stop");
+    }
+
+    /// **#1728** (review m2 on #1744): `forget_session`, the funnel for a session that
+    /// is over, ends its user-plane-active flag with it. A flag left behind would have
+    /// a later registration update on the same NG connection read a new session under
+    /// the same PSI as already set up, and never activate it.
+    ///
+    /// REVERT-VERIFIED: without the `clear_up_active` in `forget_session`, "the
+    /// released session's user plane is not up" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forgetting_a_session_ends_its_up_active_flag_1728() {
+        let mut ngap = capturing_ngap_server().await;
+        let ue = 17_280_501u64;
+        for psi in [5u8, 6] {
+            ngap.sm_context_refs
+                .insert((ue, psi), format!("up1728-{psi}"));
+            ngap.mark_up_active(ue, psi);
+        }
+        ngap.forget_session(ue, 5);
+        assert!(
+            !ngap.sm_context_refs.contains_key(&(ue, 5)),
+            "precondition: the session was forgotten"
+        );
+        assert!(
+            !ngap.up_active.contains(&(ue, 5)),
+            "the released session's user plane is not up"
+        );
+        assert!(
+            ngap.up_active.contains(&(ue, 6)),
+            "the UE's other session keeps its flag"
+        );
+        ngap.forget_ue(ue);
     }
 
     /// The same foreign GUTI with NO old AMF reachable must fall back to the
