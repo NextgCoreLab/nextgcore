@@ -262,6 +262,8 @@ const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 /// Non-3GPP access uses 0x02; both match the stored `AmfUe::access_type`.
 const ACCESS_TYPE_3GPP: u8 = 0x01;
 
+/// #1796: Broadcast Session Setup / Release toward NG-RAN for Namf_MBSBroadcast.
+mod mbs_broadcast;
 /// NGAP elementary-procedure codes (TS 38.413 Section 9.3.1.2) used by the
 /// procedure dispatch. Sourced from the generated ASN.1 constants (#417) so
 /// the wire byte we read at `data[1]` is matched against spec constants, not
@@ -2217,6 +2219,11 @@ impl NgapServer {
         // (#807, TS 29.518 §5.2.2.4.1.2 / TS 38.413 §8.15.4). Dormant when none.
         self.process_non_ue_nrppa_transfers().await;
 
+        // #1796: BROADCAST SESSION SETUP / RELEASE REQUESTs for the broadcast MBS
+        // contexts Namf_MBSBroadcast created or released (TS 23.247 §7.3.1 step 3 /
+        // §7.3.2 step 4), node loss and maxResponseTime. Dormant when none is held.
+        self.process_mbs_broadcast().await;
+
         // Page every CM-IDLE UE a Namf N1N2MessageTransfer queued (#512, TS 23.502
         // §4.2.3.3): PAGING to the gNBs serving its registration area, T3513
         // retransmission, and the failure notification on final expiry.
@@ -2732,9 +2739,16 @@ impl NgapServer {
                     );
                 }
             }
-            Some(68) | Some(71) | Some(72) | Some(73) | Some(74) => {
-                // MBS procedures (TS 23.247, TS 38.413 §9.2.9): BroadcastSessionSetup
-                // (68), MulticastSession{Activation,Deactivation,Update} (71/72/73)
+            Some(67) | Some(68) => {
+                // #1796: BroadcastSessionRelease (67) and BroadcastSessionSetup (68),
+                // TS 38.413 §8.17: AMF-initiated, so what arrives is the gNB's
+                // Release Response or Setup Response / Failure.
+                Box::pin(self.handle_broadcast_outcome(association_id, procedure_code, data))
+                    .await?;
+            }
+            Some(71) | Some(72) | Some(73) | Some(74) => {
+                // MBS procedures (TS 23.247, TS 38.413 §9.2.9):
+                // MulticastSession{Activation,Deactivation,Update} (71/72/73)
                 // and MulticastGroupPaging (74). All are AMF->NG-RAN initiating
                 // messages, so what arrives here is the gNB's OUTCOME.
                 //
@@ -20481,7 +20495,7 @@ impl NgapServer {
             _ => {
                 log::warn!(
                     "MBS procedure {procedure_code:?} arrived as an initiating message from \
-                     association {association_id}; the AMF is the initiator for 68/71/72/73/74"
+                     association {association_id}; the AMF is the initiator for 71/72/73/74"
                 );
                 return Ok(());
             }
@@ -20530,11 +20544,10 @@ impl NgapServer {
                      all_inactive={all}"
                 );
             }
-            // 68 (BroadcastSessionSetup), 73 (MulticastSessionUpdate) and 74
-            // (MulticastGroupPaging) have no state transition to record yet:
-            // broadcast sessions are not modelled in NgapMcastContext, update has
-            // no AMF-side driver, and paging is fire-and-forget with criticality
-            // ignore. Logged so the outcome is visible rather than silently
+            // 73 (MulticastSessionUpdate) and 74 (MulticastGroupPaging) have no
+            // state transition to record yet: update has no AMF-side driver, and
+            // paging is fire-and-forget with criticality ignore. (68, broadcast,
+            // is handled by `handle_broadcast_outcome`, #1796.) Logged so the outcome is visible rather than silently
             // dropped, and deliberately not invented into a state change.
             other => {
                 log::info!(
@@ -28712,7 +28725,7 @@ mod tests {
 
     /// Register a gNB session on `ngap` with a chosen gNB ID, RAT and supported
     /// TA list, so the targeting resolver has real nodes to select over.
-    async fn insert_pws_test_gnb(
+    pub(super) async fn insert_pws_test_gnb(
         ngap: &NgapServer,
         association_id: u64,
         gnb_id: u32,
@@ -36732,14 +36745,14 @@ mod tests {
     /// A test server whose `send_to_association` records each NGAP PDU as
     /// `(association_id, sctp_stream_id, pdu)` instead of writing it to SCTP (see
     /// `sent_ngap`).
-    async fn capturing_ngap_server() -> NgapServer {
+    pub(super) async fn capturing_ngap_server() -> NgapServer {
         let mut server = test_ngap_server().await;
         server.sent_ngap = Some(Vec::new());
         server
     }
 
     /// Everything sent since the last call, in send order, as `(association_id, pdu)`.
-    fn take_sent_ngap(server: &mut NgapServer) -> Vec<(u64, Vec<u8>)> {
+    pub(super) fn take_sent_ngap(server: &mut NgapServer) -> Vec<(u64, Vec<u8>)> {
         take_sent_ngap_with_streams(server)
             .into_iter()
             .map(|(assoc, _stream, pdu)| (assoc, pdu))

@@ -594,7 +594,7 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
         }
         //   DELETE /namf-mbs-bc/v1/mbs-contexts/{mbsContextRef} (ContextDelete, #1758)
         "namf-mbs-bc" if method == "DELETE" && parts.len() == 4 && parts[2] == "mbs-contexts" => {
-            handle_mbs_context_delete(parts[3])
+            handle_mbs_context_delete(parts[3]).await
         }
 
         _ => {
@@ -2619,7 +2619,7 @@ fn handle_event_subscription_delete(subscription_id: &str) -> SbiResponse {
 // ============================================================================
 
 /// Build a notification SBI client with bounded connect/request timeouts
-fn notify_client(host: &str, port: u16) -> SbiClient {
+pub(crate) fn notify_client(host: &str, port: u16) -> SbiClient {
     let config = nextgcore_sbi::security::sbi_peer_client_config(host, port)
         .with_connect_timeout(std::time::Duration::from_secs(NOTIFY_CONNECT_TIMEOUT_SECS))
         .with_request_timeout(std::time::Duration::from_secs(NOTIFY_REQUEST_TIMEOUT_SECS))
@@ -8387,87 +8387,433 @@ fn handle_non_ue_n2_message_transfer(request: &SbiRequest) -> SbiResponse {
     }
 }
 
-/// `POST /namf-mbs-bc/v1/mbs-contexts` — Namf_MBSBroadcast ContextCreate
-/// (TS 29.518 §5.6, TS 23.247 §7.3.1).
-///
-/// The MB-SMF asks the AMF to create a broadcast MBS context, which the AMF
-/// then drives toward the NG-RAN with BroadcastSessionSetup (procedure 68).
-async fn handle_mbs_context_create(request: &SbiRequest) -> SbiResponse {
-    let Some(body) = parse_json_body(request) else {
-        return malformed_body();
-    };
+/// A TS 29.571 `PlmnId` (`mcc` 3 digits, `mnc` 2 or 3 digits).
+fn plmn_id_from_json(plmn: &Value) -> Option<crate::context::PlmnId> {
+    let mcc = plmn.get("mcc").and_then(Value::as_str)?;
+    let mnc = plmn.get("mnc").and_then(Value::as_str)?;
+    let digits = |s: &str| s.chars().all(|c| c.is_ascii_digit());
+    (mcc.len() == 3 && (2..=3).contains(&mnc.len()) && digits(mcc) && digits(mnc))
+        .then(|| crate::context::PlmnId::new(mcc, mnc))
+}
 
-    let Some(session_value) = body.get("mbsSessionId") else {
-        return mandatory_ie_missing("mbsSessionId");
-    };
-    let tmgi = match parse_mbs_session_id(session_value) {
-        Ok(t) => t,
-        Err(resp) => return *resp,
-    };
+/// A TS 29.571 `Tai`: `plmnId` and a 4- or 6-hex-digit `tac`.
+fn tai_from_json(
+    tai: &Value,
+    attr: &str,
+) -> Result<(crate::context::PlmnId, u32), Box<SbiResponse>> {
+    let plmn = tai
+        .get("plmnId")
+        .and_then(plmn_id_from_json)
+        .ok_or_else(|| {
+            Box::new(mandatory_ie_incorrect(
+                &format!("{attr}.plmnId"),
+                "not a PlmnId",
+            ))
+        })?;
+    let tac = tai
+        .get("tac")
+        .and_then(Value::as_str)
+        .filter(|t| t.len() == 4 || t.len() == 6)
+        .and_then(|t| u32::from_str_radix(t, 16).ok())
+        .ok_or_else(|| {
+            Box::new(mandatory_ie_incorrect(
+                &format!("{attr}.tac"),
+                "must be 4 or 6 hexadecimal digits",
+            ))
+        })?;
+    Ok((plmn, tac))
+}
 
-    let mcast = crate::context::amf_mcast();
-    // Idempotent on the TMGI: a repeated ContextCreate returns the existing
-    // context rather than allocating a second one for the same session.
-    let session = match mcast.session_find_by_tmgi(&tmgi) {
-        Some(existing) => existing,
-        None => {
-            let Some(created) = mcast.session_create(tmgi.clone(), 1, None, Vec::new()) else {
-                return send_error(
-                    500,
-                    "Internal Server Error",
-                    "could not create the MBS session context",
-                    None,
-                );
-            };
-            created
+/// The location-independent `mbsServiceArea` (TS 29.571 `MbsServiceArea`):
+/// `ncgiList` (cells with their TAI) and/or `taiList`, at least one entry, within
+/// the NGAP bounds of the MBS Service Area IE.
+fn parse_mbs_service_area(
+    area: &Value,
+) -> Result<crate::mbs_broadcast::BroadcastServiceArea, Box<SbiResponse>> {
+    use crate::mbs_broadcast::{
+        BroadcastCell, BroadcastServiceArea, MAX_SERVICE_AREA_CELLS, MAX_SERVICE_AREA_TAIS,
+    };
+    let mut out = BroadcastServiceArea::default();
+    if let Some(tais) = area.get("taiList") {
+        let Some(tais) = tais.as_array() else {
+            return Err(Box::new(mandatory_ie_incorrect(
+                "mbsServiceArea.taiList",
+                "not an array",
+            )));
+        };
+        for t in tais {
+            out.tais.push(tai_from_json(t, "mbsServiceArea.taiList")?);
         }
+    }
+    if let Some(ncgis) = area.get("ncgiList") {
+        let Some(ncgis) = ncgis.as_array() else {
+            return Err(Box::new(mandatory_ie_incorrect(
+                "mbsServiceArea.ncgiList",
+                "not an array",
+            )));
+        };
+        for entry in ncgis {
+            let Some(tai) = entry.get("tai") else {
+                return Err(Box::new(mandatory_ie_missing(
+                    "mbsServiceArea.ncgiList.tai",
+                )));
+            };
+            let tai = tai_from_json(tai, "mbsServiceArea.ncgiList.tai")?;
+            let Some(cells) = entry.get("cellList").and_then(Value::as_array) else {
+                return Err(Box::new(mandatory_ie_missing(
+                    "mbsServiceArea.ncgiList.cellList",
+                )));
+            };
+            for cell in cells {
+                let plmn = cell.get("plmnId").and_then(plmn_id_from_json);
+                let nci = cell
+                    .get("nrCellId")
+                    .and_then(Value::as_str)
+                    .filter(|c| c.len() == 9)
+                    .and_then(|c| u64::from_str_radix(c, 16).ok());
+                let (Some(plmn), Some(nci)) = (plmn, nci) else {
+                    return Err(Box::new(mandatory_ie_incorrect(
+                        "mbsServiceArea.ncgiList.cellList",
+                        "each Ncgi needs a PlmnId and a 9-hex-digit nrCellId",
+                    )));
+                };
+                out.cells.push(BroadcastCell {
+                    tai: tai.clone(),
+                    plmn,
+                    nci,
+                });
+            }
+        }
+    }
+    if out.tais.is_empty() && out.cells.is_empty() {
+        return Err(Box::new(mandatory_ie_incorrect(
+            "mbsServiceArea",
+            "names no TAI and no cell",
+        )));
+    }
+    if out.tais.len() > MAX_SERVICE_AREA_TAIS || out.cells.len() > MAX_SERVICE_AREA_CELLS {
+        return Err(Box::new(mandatory_ie_incorrect(
+            "mbsServiceArea",
+            &format!(
+                "at most {MAX_SERVICE_AREA_TAIS} TAIs and {MAX_SERVICE_AREA_CELLS} cells \
+                 (TS 38.413 MBS Service Area)"
+            ),
+        )));
+    }
+    Ok(out)
+}
+
+/// Validate a ContextCreate (`ContextCreateReqData`, TS 29.518 §6.5.6.2.2) in
+/// full before anything is stored.
+fn parse_mbs_context_create(
+    request: &SbiRequest,
+) -> Result<crate::mbs_broadcast::BroadcastCreate, Box<SbiResponse>> {
+    use crate::mbs_broadcast::ngap_ie_type;
+    let Some(body) = parse_json_body(request) else {
+        return Err(Box::new(malformed_body()));
+    };
+    let Some(session_value) = body.get("mbsSessionId") else {
+        return Err(Box::new(mandatory_ie_missing("mbsSessionId")));
+    };
+    let tmgi = parse_mbs_session_id(session_value)?;
+
+    // `oneOf: [required: [mbsServiceArea], required: [mbsServiceAreaInfoList]]`.
+    let area = match (
+        body.get("mbsServiceArea"),
+        body.get("mbsServiceAreaInfoList"),
+    ) {
+        (Some(_), Some(_)) => {
+            return Err(Box::new(mandatory_ie_incorrect(
+                "mbsServiceArea",
+                "mbsServiceArea and mbsServiceAreaInfoList are mutually exclusive",
+            )))
+        }
+        (None, Some(_)) => {
+            return Err(Box::new(send_error(
+                501,
+                "Not Implemented",
+                "mbsServiceAreaInfoList (a location dependent broadcast MBS service) is not \
+                 supported by this AMF",
+                Some("UNSPECIFIED_NF_FAILURE"),
+            )))
+        }
+        (None, None) => return Err(Box::new(mandatory_ie_missing("mbsServiceArea"))),
+        (Some(area), None) => parse_mbs_service_area(area)?,
     };
 
-    log::info!(
-        "Namf_MBSBroadcast ContextCreate: tmgi_svc={:#x} ref={}",
-        tmgi.service_id_u32(),
-        session.mbs_session_id,
-    );
+    let Some(n2) = body.get("n2MbsSmInfo") else {
+        return Err(Box::new(mandatory_ie_missing("n2MbsSmInfo")));
+    };
+    if n2.get("ngapIeType").and_then(Value::as_str) != Some(ngap_ie_type::MBS_SES_REQ) {
+        return Err(Box::new(mandatory_ie_incorrect(
+            "n2MbsSmInfo.ngapIeType",
+            "ContextCreate carries an MBS Session Setup or Modification Request Transfer \
+             (MBS_SES_REQ)",
+        )));
+    }
+    let Some(content_id) = n2
+        .get("ngapData")
+        .and_then(|d| d.get("contentId"))
+        .and_then(Value::as_str)
+    else {
+        return Err(Box::new(mandatory_ie_missing(
+            "n2MbsSmInfo.ngapData.contentId",
+        )));
+    };
+    let Some(setup_transfer) = find_binary_part(request, content_id) else {
+        return Err(Box::new(mandatory_ie_incorrect(
+            "n2MbsSmInfo.ngapData",
+            &format!("no binary part with Content-ID '{content_id}'"),
+        )));
+    };
+    // The NG-RAN rejects the Setup Request outright on a transfer it cannot
+    // decode (criticality reject), so a malformed one is refused here instead.
+    if let Err(e) = nextgcore_ngap_gen::decode_contained::<
+        nextgcore_ngap_gen::generated::MBSSessionSetupOrModRequestTransfer,
+    >(&setup_transfer)
+    {
+        return Err(Box::new(mandatory_ie_incorrect(
+            "n2MbsSmInfo.ngapData",
+            &format!("not an MBS Session Setup or Modification Request Transfer: {e:?}"),
+        )));
+    }
 
-    let context_ref = format!("{}", session.mbs_session_id);
-    let response_body = json!({ "mbsContextRef": context_ref });
+    let Some(notify_uri) = body.get("notifyUri").and_then(Value::as_str) else {
+        return Err(Box::new(mandatory_ie_missing("notifyUri")));
+    };
+    if parse_http_uri(notify_uri).is_none() {
+        return Err(Box::new(mandatory_ie_incorrect(
+            "notifyUri",
+            "not an absolute http(s) URI",
+        )));
+    }
 
-    // 201 with a Location header naming the created resource (TS 29.518 §6.5).
-    match SbiResponse::created().with_json_body(&response_body) {
-        Ok(resp) => resp.with_header(
-            "Location",
-            format!("/namf-mbs-bc/v1/mbs-contexts/{context_ref}"),
-        ),
-        Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
+    let Some(snssai) = body.get("snssai") else {
+        return Err(Box::new(mandatory_ie_missing("snssai")));
+    };
+    let Some(sst) = snssai
+        .get("sst")
+        .and_then(Value::as_u64)
+        .and_then(|v| u8::try_from(v).ok())
+    else {
+        return Err(Box::new(mandatory_ie_incorrect(
+            "snssai.sst",
+            "must be 0..255",
+        )));
+    };
+    let sd = match snssai.get("sd") {
+        None => None,
+        Some(sd) => match sd
+            .as_str()
+            .filter(|s| s.len() == 6)
+            .and_then(|s| u32::from_str_radix(s, 16).ok())
+        {
+            Some(v) => Some(v),
+            None => {
+                return Err(Box::new(mandatory_ie_incorrect(
+                    "snssai.sd",
+                    "must be 6 hexadecimal digits",
+                )))
+            }
+        },
+    };
+
+    let max_response_time = match body.get("maxResponseTime") {
+        None => None,
+        Some(v) => match v.as_u64() {
+            Some(secs) => Some(std::time::Duration::from_secs(secs)),
+            None => {
+                return Err(Box::new(mandatory_ie_incorrect(
+                    "maxResponseTime",
+                    "must be a non-negative number of seconds",
+                )))
+            }
+        },
+    };
+
+    Ok(crate::mbs_broadcast::BroadcastCreate {
+        tmgi,
+        mbs_session_id: session_value.clone(),
+        sst,
+        sd,
+        area,
+        setup_transfer,
+        notify_uri: notify_uri.to_string(),
+        max_response_time,
+    })
+}
+
+/// The ContextCreate response for `answer`.
+fn mbs_context_create_response(answer: crate::mbs_broadcast::CreateAnswer) -> SbiResponse {
+    use crate::mbs_broadcast::{CreateAnswer, CreateFailure};
+    match answer {
+        CreateAnswer::Created {
+            session_id,
+            mbs_session_id,
+            containers,
+            complete,
+        } => {
+            let context_ref = session_id.to_string();
+            // `mbsSessionId` is ContextCreateRspData's one required member;
+            // `mbsContextRef` repeats the Location's last segment for consumers
+            // that read it from the body.
+            let mut body = json!({
+                "mbsSessionId": mbs_session_id,
+                "mbsContextRef": context_ref,
+            });
+            let (list, parts) = crate::mbs_broadcast::n2_mbs_sm_info_list(containers);
+            if !list.is_empty() {
+                body["n2MbsSmInfoList"] = Value::Array(list);
+            }
+            if complete {
+                body["operationStatus"] = json!("MBS_SESSION_START_COMPLETE");
+            }
+            match SbiResponse::created().with_json_body(&body) {
+                Ok(mut resp) => {
+                    for (cid, data) in parts {
+                        resp = resp.with_part(SbiPart::with_content(
+                            &cid,
+                            nextgcore_sbi::constants::content_type::APPLICATION_NGAP,
+                            bytes::Bytes::from(data),
+                        ));
+                    }
+                    // 201 with a Location header naming the created resource (TS 29.518 §6.5).
+                    resp.with_header(
+                        "Location",
+                        format!("/namf-mbs-bc/v1/mbs-contexts/{context_ref}"),
+                    )
+                }
+                Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
+            }
+        }
+        CreateAnswer::Failed(reason) => {
+            let detail = match reason {
+                CreateFailure::NoNgRan => {
+                    "no NG-RAN node served by this AMF is in the MBS service area"
+                }
+                CreateFailure::AllRefused => {
+                    "every NG-RAN node of the MBS service area failed the Broadcast Session Setup"
+                }
+                CreateFailure::Deleted => {
+                    "the broadcast MBS context was released while its setup was in progress"
+                }
+            };
+            send_error(
+                500,
+                "Internal Server Error",
+                detail,
+                Some("UNSPECIFIED_NF_FAILURE"),
+            )
+        }
     }
 }
 
+/// `POST /namf-mbs-bc/v1/mbs-contexts` — Namf_MBSBroadcast ContextCreate
+/// (TS 29.518 §5.6.2.2, TS 23.247 §7.3.1).
+///
+/// #1796: the AMF sends a BROADCAST SESSION SETUP REQUEST carrying the MB-SMF's
+/// N2 MBS SM container to every NG-RAN node of the MBS service area (step 3), from
+/// the NGAP task, and answers on the first successful node response (step 7) --
+/// or failure when every node failed or none serves the area, or after
+/// [`crate::mbs_broadcast::CREATE_ANSWER_WAIT`] with what arrived. Later node
+/// responses reach the MB-SMF in ContextStatusNotify requests.
+///
+/// Everything is validated before anything is stored; a repeated ContextCreate
+/// for the TMGI joins the existing context and sends no second Setup.
+async fn handle_mbs_context_create(request: &SbiRequest) -> SbiResponse {
+    use crate::mbs_broadcast::{CreateAnswer, CreateFailure, CreateStart};
+    let create = match parse_mbs_context_create(request) {
+        Ok(c) => c,
+        Err(resp) => return *resp,
+    };
+    let tmgi_svc = create.tmgi.service_id_u32();
+    let mcast = crate::context::amf_mcast();
+    let answer = match mcast.broadcast_create(create, std::time::Instant::now()) {
+        CreateStart::Full => {
+            return send_error(
+                500,
+                "Internal Server Error",
+                "the AMF holds as many broadcast MBS contexts as it can",
+                Some("INSUFFICIENT_RESOURCES"),
+            )
+        }
+        CreateStart::Answered(answer) => answer,
+        CreateStart::Wait { session_id, mut rx } => {
+            match tokio::time::timeout(crate::mbs_broadcast::CREATE_ANSWER_WAIT, &mut rx).await {
+                Ok(Ok(answer)) => answer,
+                _ => mcast
+                    .broadcast_answer_on_timeout(session_id)
+                    .or_else(|| rx.try_recv().ok())
+                    .unwrap_or(CreateAnswer::Failed(CreateFailure::Deleted)),
+            }
+        }
+    };
+    log::info!("Namf_MBSBroadcast ContextCreate: tmgi_svc={tmgi_svc:#x} answer={answer:?}");
+    mbs_context_create_response(answer)
+}
+
 /// `DELETE /namf-mbs-bc/v1/mbs-contexts/{mbsContextRef}` — Namf_MBSBroadcast
-/// ContextDelete (TS 29.518 §5.6, `TS29518_Namf_MBSBroadcast.yaml` operationId
+/// ContextRelease (TS 29.518 §5.6.2.4, `TS29518_Namf_MBSBroadcast.yaml` operationId
 /// `ContextDelete`; TS 23.247 §7.3.2 broadcast MBS session release).
 ///
-/// #1758: the MB-SMF's release of a broadcast MBS context this AMF created on its
-/// ContextCreate. 204 on deletion; 404 `CONTEXT_NOT_FOUND` for a reference this AMF
-/// does not hold, which the MB-SMF treats as already gone, so a repeated delete is
-/// harmless. As ContextCreate drives no N2 Broadcast Session Setup in this tree, the
-/// delete drives no Broadcast Session Release either.
-fn handle_mbs_context_delete(context_ref: &str) -> SbiResponse {
-    let removed = context_ref
-        .parse::<u64>()
-        .ok()
-        .and_then(|id| crate::context::amf_mcast().session_remove(id));
-    match removed {
-        Some(session) => {
-            log::info!(
-                "Namf_MBSBroadcast ContextDelete: ref={context_ref} tmgi_svc={:#x}",
-                session.tmgi.service_id_u32()
-            );
-            SbiResponse::with_status(204)
-        }
-        None => send_not_found(
+/// #1758: 204 on deletion; 404 `CONTEXT_NOT_FOUND` for a reference this AMF does
+/// not hold, which the MB-SMF treats as already gone, so a repeated delete is
+/// harmless. #1796: the BROADCAST SESSION RELEASE REQUEST goes to every NG-RAN
+/// node the Setup was sent to (step 4), and the 204 follows their responses
+/// (steps 7-8), bounded by [`crate::mbs_broadcast::DELETE_ANSWER_WAIT`]. Their
+/// Release Response Transfers reach the MB-SMF in a ContextStatusNotify
+/// (TS 38.413 §8.17.3.2) before the 204.
+async fn handle_mbs_context_delete(context_ref: &str) -> SbiResponse {
+    use crate::mbs_broadcast::DeleteStart;
+    let not_found = || {
+        send_not_found(
             &format!("No broadcast MBS context {context_ref}"),
             Some("CONTEXT_NOT_FOUND"),
-        ),
+        )
+    };
+    let Ok(session_id) = context_ref.parse::<u64>() else {
+        return not_found();
+    };
+    let mcast = crate::context::amf_mcast();
+    match mcast.broadcast_delete(session_id) {
+        DeleteStart::NotFound => not_found(),
+        DeleteStart::Released => {
+            log::info!("Namf_MBSBroadcast ContextDelete: ref={context_ref} (no NG-RAN to release)");
+            SbiResponse::with_status(204)
+        }
+        DeleteStart::Wait {
+            session_id,
+            mut rx,
+            notify_uri,
+            mbs_session_id,
+        } => {
+            let containers =
+                match tokio::time::timeout(crate::mbs_broadcast::DELETE_ANSWER_WAIT, &mut rx).await
+                {
+                    Ok(Ok(c)) => c,
+                    _ => mcast.broadcast_release_answer_on_timeout(session_id),
+                };
+            log::info!(
+                "Namf_MBSBroadcast ContextDelete: ref={context_ref} ({} Release Response \
+                 Transfer(s))",
+                containers.len()
+            );
+            for chunk in containers.chunks(crate::mbs_broadcast::N2_MBS_SM_INFO_LIST_MAX) {
+                let (list, parts) = crate::mbs_broadcast::n2_mbs_sm_info_list(chunk.to_vec());
+                let notify = crate::mbs_broadcast::BroadcastNotify {
+                    session_id,
+                    uri: notify_uri.clone(),
+                    body: json!({ "mbsSessionId": mbs_session_id, "n2MbsSmInfoList": list }),
+                    parts,
+                };
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    crate::mbs_broadcast::send_notify(&notify),
+                )
+                .await;
+            }
+            SbiResponse::with_status(204)
+        }
     }
 }
 
@@ -12517,91 +12863,10 @@ mod tests {
         assert_eq!(body_json(&resp)["result"], json!("N2_NOT_SENT"));
     }
 
-    /// ContextCreate allocates a context, and a REPEAT for the same TMGI returns
-    /// the SAME ref rather than leaking a second session.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn mbs_context_create_is_idempotent_on_the_tmgi() {
-        let body = mbs_tmgi_body("001", "01", "00CAFE");
-        let post = || {
-            SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
-                .with_json_body(&body)
-                .expect("json")
-        };
-
-        let first = namf_request_handler(post()).await;
-        assert_eq!(first.status, 201);
-        let first_ref = body_json(&first)["mbsContextRef"].clone();
-        assert_ne!(first_ref, Value::Null, "201 must name the created resource");
-
-        let second = namf_request_handler(post()).await;
-        assert_eq!(
-            body_json(&second)["mbsContextRef"],
-            first_ref,
-            "a repeated ContextCreate for one TMGI must not allocate a second session"
-        );
-    }
-
-    /// The TMGI reaches the NGAP layer intact: the context the SBI created is
-    /// findable by the SAME `Tmgi` the NGAP builders encode, with the PLMN
-    /// BCD-packed per TS 24.008 §10.5.1.13 (mcc=001 mnc=01 -> 00 F1 10).
-    ///
-    /// This is the assertion that would catch a JSON->NGAP boundary bug, which a
-    /// 201 status alone cannot.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_created_mbs_context_is_reachable_by_its_ngap_tmgi() {
-        let req = SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
-            .with_json_body(&mbs_tmgi_body("001", "01", "00BEEF"))
-            .expect("json");
-        assert_eq!(namf_request_handler(req).await.status, 201);
-
-        let expected = Tmgi::new(0x00BEEF, [0x00, 0xF1, 0x10]);
-        assert!(
-            crate::context::amf_mcast()
-                .session_find_by_tmgi(&expected)
-                .is_some(),
-            "the SBI-created context must be findable by the TMGI the NGAP \
-             builders encode; a miss here means the boundary mangled the PLMN \
-             or the service id"
-        );
-    }
-
-    /// #1758: ContextDelete removes the broadcast MBS context ContextCreate made,
-    /// and a second delete (or an unknown reference) is 404 CONTEXT_NOT_FOUND, which
-    /// the MB-SMF treats as gone.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn context_delete_removes_the_broadcast_mbs_context_1758() {
-        let req = SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
-            .with_json_body(&mbs_tmgi_body("001", "01", "001758"))
-            .expect("json");
-        let created = namf_request_handler(req).await;
-        assert_eq!(created.status, 201);
-        let context_ref = body_json(&created)["mbsContextRef"]
-            .as_str()
-            .expect("mbsContextRef")
-            .to_string();
-        let id: u64 = context_ref.parse().expect("numeric ref");
-        assert!(crate::context::amf_mcast().session_find(id).is_some());
-
-        let path = format!("/namf-mbs-bc/v1/mbs-contexts/{context_ref}");
-        let deleted = namf_request_handler(SbiRequest::delete(&path)).await;
-        assert_eq!(deleted.status, 204);
-        assert!(
-            crate::context::amf_mcast().session_find(id).is_none(),
-            "the AMF holds no context after ContextDelete"
-        );
-        assert!(crate::context::amf_mcast()
-            .session_find_by_tmgi(&Tmgi::new(0x001758, [0x00, 0xF1, 0x10]))
-            .is_none());
-
-        for again in [
-            path.clone(),
-            "/namf-mbs-bc/v1/mbs-contexts/not-a-ref".to_string(),
-        ] {
-            let resp = namf_request_handler(SbiRequest::delete(&again)).await;
-            assert_eq!(resp.status, 404, "{again}");
-            assert_eq!(body_json(&resp)["cause"], "CONTEXT_NOT_FOUND", "{again}");
-        }
-    }
+    // #1796: ContextCreate / ContextDelete (idempotency, the TMGI reaching the
+    // NGAP layer, 404 on a repeated delete) are tested with a stand-in gNB in
+    // `ngap_path::mbs_broadcast::tests`: a create now answers on the NG-RAN's
+    // response, so it cannot be exercised without one.
 
     /// An SSM-only `mbsSessionId` is REFUSED, not silently mapped. The schema is
     /// `anyOf [tmgi, ssm]`, but the AMF's NGAP `MBS-SessionID` carries a TMGI and

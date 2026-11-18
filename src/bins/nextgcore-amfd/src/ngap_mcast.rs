@@ -137,6 +137,8 @@ pub struct NgapMcastContext {
     tmgi_index: RwLock<HashMap<Tmgi, u64>>,
     /// Next MBS session ID allocator
     next_session_id: AtomicU64,
+    /// Broadcast MBS session contexts and their N2 procedures (#1796).
+    pub(crate) broadcast: crate::mbs_broadcast::BroadcastState,
 }
 
 impl NgapMcastContext {
@@ -145,6 +147,15 @@ impl NgapMcastContext {
             sessions: RwLock::new(HashMap::new()),
             tmgi_index: RwLock::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
+            broadcast: crate::mbs_broadcast::BroadcastState::default(),
+        }
+    }
+
+    /// A context holding at most `capacity` broadcast MBS session contexts.
+    pub fn with_broadcast_capacity(capacity: usize) -> Self {
+        Self {
+            broadcast: crate::mbs_broadcast::BroadcastState::new(capacity),
+            ..Self::new()
         }
     }
 
@@ -454,7 +465,7 @@ pub(crate) fn tmgi_from_generated(id: &ngap_gen::MBS_SessionID) -> Option<Tmgi> 
 }
 
 /// Encode an AMF-initiated MBS message, logging what failed.
-fn encode_initiating(
+pub(crate) fn encode_initiating(
     procedure_code: u8,
     criticality: u8,
     value: ngap_gen::InitiatingMessageValue,
