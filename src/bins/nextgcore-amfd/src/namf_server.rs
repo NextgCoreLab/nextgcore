@@ -592,6 +592,10 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
         "namf-mbs-bc" if method == "POST" && parts.len() == 3 && parts[2] == "mbs-contexts" => {
             handle_mbs_context_create(&request).await
         }
+        //   DELETE /namf-mbs-bc/v1/mbs-contexts/{mbsContextRef} (ContextDelete, #1758)
+        "namf-mbs-bc" if method == "DELETE" && parts.len() == 4 && parts[2] == "mbs-contexts" => {
+            handle_mbs_context_delete(parts[3])
+        }
 
         _ => {
             // The path may be one of this AMF's token-bearing callbacks (#940).
@@ -8421,6 +8425,35 @@ async fn handle_mbs_context_create(request: &SbiRequest) -> SbiResponse {
     }
 }
 
+/// `DELETE /namf-mbs-bc/v1/mbs-contexts/{mbsContextRef}` — Namf_MBSBroadcast
+/// ContextDelete (TS 29.518 §5.6, `TS29518_Namf_MBSBroadcast.yaml` operationId
+/// `ContextDelete`; TS 23.247 §7.3.2 broadcast MBS session release).
+///
+/// #1758: the MB-SMF's release of a broadcast MBS context this AMF created on its
+/// ContextCreate. 204 on deletion; 404 `CONTEXT_NOT_FOUND` for a reference this AMF
+/// does not hold, which the MB-SMF treats as already gone, so a repeated delete is
+/// harmless. As ContextCreate drives no N2 Broadcast Session Setup in this tree, the
+/// delete drives no Broadcast Session Release either.
+fn handle_mbs_context_delete(context_ref: &str) -> SbiResponse {
+    let removed = context_ref
+        .parse::<u64>()
+        .ok()
+        .and_then(|id| crate::context::amf_mcast().session_remove(id));
+    match removed {
+        Some(session) => {
+            log::info!(
+                "Namf_MBSBroadcast ContextDelete: ref={context_ref} tmgi_svc={:#x}",
+                session.tmgi.service_id_u32()
+            );
+            SbiResponse::with_status(204)
+        }
+        None => send_not_found(
+            &format!("No broadcast MBS context {context_ref}"),
+            Some("CONTEXT_NOT_FOUND"),
+        ),
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -12513,6 +12546,44 @@ mod tests {
              builders encode; a miss here means the boundary mangled the PLMN \
              or the service id"
         );
+    }
+
+    /// #1758: ContextDelete removes the broadcast MBS context ContextCreate made,
+    /// and a second delete (or an unknown reference) is 404 CONTEXT_NOT_FOUND, which
+    /// the MB-SMF treats as gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn context_delete_removes_the_broadcast_mbs_context_1758() {
+        let req = SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
+            .with_json_body(&mbs_tmgi_body("001", "01", "001758"))
+            .expect("json");
+        let created = namf_request_handler(req).await;
+        assert_eq!(created.status, 201);
+        let context_ref = body_json(&created)["mbsContextRef"]
+            .as_str()
+            .expect("mbsContextRef")
+            .to_string();
+        let id: u64 = context_ref.parse().expect("numeric ref");
+        assert!(crate::context::amf_mcast().session_find(id).is_some());
+
+        let path = format!("/namf-mbs-bc/v1/mbs-contexts/{context_ref}");
+        let deleted = namf_request_handler(SbiRequest::delete(&path)).await;
+        assert_eq!(deleted.status, 204);
+        assert!(
+            crate::context::amf_mcast().session_find(id).is_none(),
+            "the AMF holds no context after ContextDelete"
+        );
+        assert!(crate::context::amf_mcast()
+            .session_find_by_tmgi(&Tmgi::new(0x001758, [0x00, 0xF1, 0x10]))
+            .is_none());
+
+        for again in [
+            path.clone(),
+            "/namf-mbs-bc/v1/mbs-contexts/not-a-ref".to_string(),
+        ] {
+            let resp = namf_request_handler(SbiRequest::delete(&again)).await;
+            assert_eq!(resp.status, 404, "{again}");
+            assert_eq!(body_json(&resp)["cause"], "CONTEXT_NOT_FOUND", "{again}");
+        }
     }
 
     /// An SSM-only `mbsSessionId` is REFUSED, not silently mapped. The schema is

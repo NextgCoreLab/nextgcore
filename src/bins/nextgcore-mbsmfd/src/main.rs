@@ -138,6 +138,21 @@ tokio::task_local! {
     pub(crate) static TEST_OAUTH2_CLIENT: Arc<nextgcore_sbi::oauth::OAuth2Client>;
 }
 
+/// #1758: spawn `fut` on its own task, so dropping the caller (a consumer request
+/// whose client went away) does not drop it. Under test the task-local OAuth2
+/// client is carried into the task, as the caller would have seen it.
+pub(crate) fn spawn_detached<F>(fut: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    #[cfg(test)]
+    if let Ok(oauth2) = TEST_OAUTH2_CLIENT.try_with(Arc::clone) {
+        return tokio::spawn(TEST_OAUTH2_CLIENT.scope(oauth2, fut));
+    }
+    tokio::spawn(fut)
+}
+
 /// #1662: `client` with the installed OAuth2 client attached, so a service
 /// request to the `target` producer carries an NRF-issued token (TS 33.501
 /// §13.4.1.1.2, TS 29.500 §6.7.3). Unchanged when no client is installed.
@@ -643,8 +658,20 @@ async fn handle_mbs_session_create(request: &SbiRequest) -> SbiResponse {
             // defines no failure cause for "the AMF leg did not complete". A
             // failure is logged and the RAN simply does not have the session,
             // which the log names rather than hides.
+            //
+            // #1758: the create and its record run on their own task, so a consumer
+            // that disconnects mid-ContextCreate cannot leave an AMF context no
+            // release will ever delete; see [`create_amf_mbs_context`].
             match namf_client::discover_amf().await {
-                Some(amf) => match namf_client::context_create(&amf, &session.tmgi).await {
+                Some(amf) => match spawn_detached(create_amf_mbs_context(
+                    session.id,
+                    session.tmgi.clone(),
+                    amf.clone(),
+                ))
+                .await
+                .ok()
+                .flatten()
+                {
                     Some(context_ref) => log::info!(
                         "MBS session {session_id}: AMF {}:{} created MBS context {context_ref}",
                         amf.host,
@@ -891,6 +918,102 @@ async fn handle_mbs_session_update(session_id: &str, request: &SbiRequest) -> Sb
     }
 }
 
+/// #1758: Namf_MBSBroadcast ContextCreate on `amf` for session `session_id`, and
+/// its record, so the session's release can delete it. When the session was
+/// released while the create was in flight (the release found nothing to delete),
+/// the new context is deleted here instead, so the AMF never keeps one this MB-SMF
+/// does not record.
+async fn create_amf_mbs_context(
+    session_id: u64,
+    tmgi: Tmgi,
+    amf: namf_client::DiscoveredAmf,
+) -> Option<namf_client::MbsContextRef> {
+    let context_ref = namf_client::context_create(&amf, &tmgi).await?;
+    let record = AmfMbsContext {
+        host: amf.host,
+        port: amf.port,
+        nf_instance_id: amf.nf_instance_id,
+        context_ref: context_ref.clone(),
+    };
+    let recorded = mbsmf_self()
+        .read()
+        .map(|c| c.record_amf_context(session_id, record.clone()))
+        .unwrap_or(false);
+    if recorded {
+        return Some(context_ref);
+    }
+    log::warn!(
+        "MBS session {session_id} was released while its ContextCreate was in flight; \
+         deleting the AMF context {context_ref}"
+    );
+    release_amf_contexts(vec![record]).await;
+    None
+}
+
+/// #1758: the waits before each retry of a failed ContextDelete.
+#[cfg(not(test))]
+const AMF_RELEASE_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+];
+#[cfg(test)]
+const AMF_RELEASE_RETRY_DELAYS: [Duration; 5] = [Duration::from_millis(20); 5];
+
+/// #1758: Namf_MBSBroadcast ContextDelete for each of `contexts`. 404 is gone. A
+/// failed delete is retried on [`AMF_RELEASE_RETRY_DELAYS`] on a detached task, and
+/// logged at error if every retry fails, rather than forgotten. Returns whether all
+/// were released on the first attempt.
+async fn release_amf_contexts(contexts: Vec<AmfMbsContext>) -> bool {
+    let mut failed = Vec::new();
+    for c in contexts {
+        match namf_client::context_delete(&c).await {
+            namf_client::ContextDeleteOutcome::Deleted
+            | namf_client::ContextDeleteOutcome::Gone => {
+                log::info!(
+                    "MBS: AMF {}:{} released MBS context {}",
+                    c.host,
+                    c.port,
+                    c.context_ref
+                );
+            }
+            namf_client::ContextDeleteOutcome::Failed => failed.push(c),
+        }
+    }
+    if failed.is_empty() {
+        return true;
+    }
+    spawn_detached(async move {
+        for delay in AMF_RELEASE_RETRY_DELAYS {
+            tokio::time::sleep(delay).await;
+            let mut still = Vec::new();
+            for c in failed {
+                if namf_client::context_delete(&c).await
+                    == namf_client::ContextDeleteOutcome::Failed
+                {
+                    still.push(c);
+                }
+            }
+            failed = still;
+            if failed.is_empty() {
+                return;
+            }
+        }
+        for c in &failed {
+            log::error!(
+                "MBS: AMF {}:{} MBS context {} could not be released after {} retries",
+                c.host,
+                c.port,
+                c.context_ref,
+                AMF_RELEASE_RETRY_DELAYS.len()
+            );
+        }
+    });
+    false
+}
+
 /// Handle MBS Session Release (TS 23.247 7.2.3)
 async fn handle_mbs_session_release(session_id: &str) -> SbiResponse {
     log::info!("MBS Session Release: {session_id}");
@@ -915,9 +1038,22 @@ async fn handle_mbs_session_release(session_id: &str) -> SbiResponse {
         }
     });
 
+    // #1758: taken in the same step as the removal (no await between), so a
+    // ContextCreate landing after it sees the session gone and deletes its own.
+    let amf_contexts = match (&removed, ctx.read()) {
+        (Some(session), Ok(context)) => context.take_amf_contexts(session.id),
+        _ => Vec::new(),
+    };
+
     match removed {
         Some(session) => {
             log::info!("MBS Session {session_id} released");
+            // #1758: release the broadcast MBS contexts this session created on its
+            // AMF(s) (TS 23.247 §7.3.2, Namf_MBSBroadcast ContextDelete). On its own
+            // task, so a consumer disconnect cannot drop it; a failure is retried.
+            if !amf_contexts.is_empty() {
+                let _ = spawn_detached(release_amf_contexts(amf_contexts)).await;
+            }
             // For Broadcast sessions: emit BROADCAST_DELIVERY_STATUS/TERMINATED to Status subs.
             if matches!(session.session_type, MbsSessionType::Broadcast) {
                 emit_status_notify(session_id);

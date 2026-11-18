@@ -373,11 +373,45 @@ pub(crate) struct PendingContextTransfer {
 /// `pending` (TS 29.518 §5.2.2.2.2), TRANSFERRED or NOT_TRANSFERRED, on its own task:
 /// an SBI call on the NGAP task holds N2 for every gNB. Best-effort: on a failure the
 /// old AMF releases its copy on its own guard timer (TS 23.502 §4.2.2.2.2 step 5).
-fn spawn_registration_status_update(pending: PendingContextTransfer, transferred: bool) {
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return;
-    };
-    handle.spawn(async move {
+///
+/// #1769: the updates about one context at one old AMF go out in the order they were
+/// decided, one at a time, and an update that a later one supersedes before its turn
+/// is not sent. TS 29.518 gives the request no sequence number, so the old AMF applies
+/// whatever arrives last. Without this, a slow NOT_TRANSFERRED from a failed first
+/// registration could land after the TRANSFERRED of the retry that succeeded. The old
+/// AMF would then keep a context the UE has moved away from (TS 23.502 §4.2.2.2.2
+/// step 10). See [`StatusUpdateTicket`].
+///
+/// Returns the task, which only the tests use.
+fn spawn_registration_status_update(
+    pending: PendingContextTransfer,
+    transferred: bool,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let handle = tokio::runtime::Handle::try_current().ok()?;
+    // Issued here on the caller's task, not inside the spawned one, so that the
+    // order of the tickets is the order in which the outcomes were decided.
+    let ticket = StatusUpdateTicket::issue(StatusUpdateKey {
+        peer_host: pending.peer_host.clone(),
+        peer_port: pending.peer_port,
+        context_id: pending.presented.to_context_id(),
+    });
+    Some(handle.spawn(async move {
+        let _turn = ticket.lane.lock().await;
+        if !ticket.is_latest() {
+            log::debug!(
+                "[{}] RegistrationStatusUpdate ({}) to {}:{} superseded by a later outcome \
+                 for the same context; not sent (#1769)",
+                pending.supi,
+                if transferred {
+                    "TRANSFERRED"
+                } else {
+                    "NOT_TRANSFERRED"
+                },
+                pending.peer_host,
+                pending.peer_port
+            );
+            return;
+        }
         if let Err(e) = crate::sbi_path::call_amf_registration_status_update(
             &pending.peer_host,
             pending.peer_port,
@@ -394,7 +428,90 @@ fn spawn_registration_status_update(pending: PendingContextTransfer, transferred
                 pending.peer_port
             );
         }
-    });
+    }))
+}
+
+/// #1769: which context, at which old AMF, a RegistrationStatusUpdate is about.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct StatusUpdateKey {
+    peer_host: String,
+    peer_port: u16,
+    /// The `ueContextId` of the presented 5G-GUTI, as the request URI carries it.
+    context_id: String,
+}
+
+/// #1769: one key's lane. `lane` is held while an update is sent, so the sends are
+/// one at a time. `latest` is the newest ticket issued for the key.
+struct StatusUpdateLane {
+    latest: u64,
+    lane: Arc<Mutex<()>>,
+}
+
+/// #1769: the per-key lanes. An entry lives while some ticket for its key does, so
+/// the map holds only the keys whose updates are in flight or queued.
+static STATUS_UPDATE_LANES: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<StatusUpdateKey, StatusUpdateLane>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// #1769: one ticket's number, issued under the [`STATUS_UPDATE_LANES`] lock.
+static STATUS_UPDATE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn status_update_lanes(
+) -> std::sync::MutexGuard<'static, HashMap<StatusUpdateKey, StatusUpdateLane>> {
+    STATUS_UPDATE_LANES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// #1769: one RegistrationStatusUpdate's place in its key's lane.
+///
+/// The ticket is released on drop, whether the update was sent, superseded, or its
+/// task was aborted while waiting or mid-send. The last ticket of a key removes the
+/// key's entry. It does so only when no other ticket shares the lane, because any
+/// task still queued or sending holds the lane through its own ticket. A cancelled
+/// update therefore neither blocks the next one nor leaves an entry behind.
+struct StatusUpdateTicket {
+    key: StatusUpdateKey,
+    seq: u64,
+    lane: Arc<Mutex<()>>,
+}
+
+impl StatusUpdateTicket {
+    fn issue(key: StatusUpdateKey) -> Self {
+        let mut lanes = status_update_lanes();
+        let seq = STATUS_UPDATE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let entry = lanes
+            .entry(key.clone())
+            .or_insert_with(|| StatusUpdateLane {
+                latest: seq,
+                lane: Arc::new(Mutex::new(())),
+            });
+        entry.latest = seq;
+        let lane = Arc::clone(&entry.lane);
+        Self { key, seq, lane }
+    }
+
+    /// Whether no later outcome for the same key has been decided since this one.
+    fn is_latest(&self) -> bool {
+        status_update_lanes()
+            .get(&self.key)
+            .is_some_and(|entry| entry.latest == self.seq)
+    }
+}
+
+impl Drop for StatusUpdateTicket {
+    fn drop(&mut self) {
+        let mut lanes = status_update_lanes();
+        // Two references: the map's and this ticket's. Any more is a ticket still
+        // queued or sending, and the entry stays for it.
+        if lanes
+            .get(&self.key)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.lane, &self.lane))
+            && Arc::strong_count(&self.lane) == 2
+        {
+            lanes.remove(&self.key);
+        }
+    }
 }
 
 /// Connected gNB session
@@ -44295,6 +44412,148 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(ms), rx.recv())
             .await
             .is_err()
+    }
+
+    /// A stand-in old AMF for #1769 holding one UE context. It applies each
+    /// `transfer-update` as it finishes handling it: TRANSFERRED removes the context,
+    /// NOT_TRANSFERRED keeps it. A NOT_TRANSFERRED is handled `slow_ms` late, as one
+    /// delayed in the network would be. Returns the server, its port, whether it
+    /// holds the context, and the statuses in the order they were applied.
+    async fn old_amf_1769(
+        slow_ms: u64,
+    ) -> (
+        nextgcore_sbi::SbiServer,
+        u16,
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        let holds = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let applied = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let peer = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        let (h, a) = (holds.clone(), applied.clone());
+        peer.start(move |req: SbiRequest| {
+            let (holds, applied) = (h.clone(), a.clone());
+            async move {
+                let body: serde_json::Value =
+                    serde_json::from_str(req.http.content.as_deref().unwrap_or("{}"))
+                        .unwrap_or_default();
+                let status = body["transferStatus"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                if status == "NOT_TRANSFERRED" {
+                    tokio::time::sleep(Duration::from_millis(slow_ms)).await;
+                }
+                holds.store(status != "TRANSFERRED", std::sync::atomic::Ordering::SeqCst);
+                applied.lock().expect("applied").push(status);
+                SbiResponse::ok()
+                    .with_json_body(&serde_json::json!({ "regStatusTransferComplete": true }))
+                    .expect("json")
+            }
+        })
+        .await
+        .expect("old AMF starts");
+        (peer, addr.port(), holds, applied)
+    }
+
+    fn pending_1769(peer_port: u16, tmsi: u32) -> PendingContextTransfer {
+        PendingContextTransfer {
+            peer_host: "127.0.0.1".to_string(),
+            peer_port,
+            presented: foreign_guti_1731(tmsi),
+            supi: format!("imsi-0010100017{tmsi:05}"),
+            ue_context: serde_json::json!({}),
+        }
+    }
+
+    fn lane_count_1769(peer_port: u16) -> usize {
+        status_update_lanes()
+            .keys()
+            .filter(|k| k.peer_port == peer_port)
+            .count()
+    }
+
+    /// **#1769**, TS 23.502 §4.2.2.2.2 step 10: a NOT_TRANSFERRED decided for a
+    /// first registration (connection 1), and delayed on its way, is followed by the
+    /// TRANSFERRED of the retry that succeeded (connection 2) for the same context at
+    /// the same old AMF. The old AMF applies the TRANSFERRED last and so no longer
+    /// holds the context, and no lane is left behind.
+    ///
+    /// REVERT-VERIFIED: with the update sent without waiting for its lane (the
+    /// `ticket.lane.lock()` removed), the TRANSFERRED is applied first and the late
+    /// NOT_TRANSFERRED leaves the old AMF holding the context.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_not_transferred_cannot_undo_a_later_transferred_1769() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (peer, port, holds, applied) = old_amf_1769(300).await;
+        let first =
+            spawn_registration_status_update(pending_1769(port, 17691), false).expect("runtime");
+        // Connection 1's NOT_TRANSFERRED is on its way when connection 2 commits.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let second =
+            spawn_registration_status_update(pending_1769(port, 17691), true).expect("runtime");
+        first.await.expect("first");
+        second.await.expect("second");
+        assert_eq!(
+            *applied.lock().expect("applied"),
+            ["NOT_TRANSFERRED", "TRANSFERRED"],
+            "applied in the order decided"
+        );
+        assert!(
+            !holds.load(std::sync::atomic::Ordering::SeqCst),
+            "the old AMF no longer holds the context the UE moved away from"
+        );
+        assert_eq!(lane_count_1769(port), 0, "no lane is left behind");
+        peer.stop().await.expect("stop");
+    }
+
+    /// **#1769**: an update superseded before its turn is not sent (only the latest
+    /// outcome applies), an update cancelled while queued neither blocks the next one
+    /// nor leaves its lane behind, and another context at the same old AMF has a lane
+    /// of its own.
+    ///
+    /// REVERT-VERIFIED: with `is_latest` not checked, the superseded
+    /// NOT_TRANSFERRED is sent as well (three applied); with the ticket's `Drop` not
+    /// removing the entry, a lane is left behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_the_latest_outcome_is_sent_and_a_cancelled_one_frees_its_lane_1769() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (peer, port, _holds, applied) = old_amf_1769(300).await;
+        // A slow NOT_TRANSFERRED holds the lane.
+        let busy =
+            spawn_registration_status_update(pending_1769(port, 17692), false).expect("runtime");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Queued behind it: one superseded, one cancelled, then the latest.
+        let superseded =
+            spawn_registration_status_update(pending_1769(port, 17692), false).expect("runtime");
+        let cancelled =
+            spawn_registration_status_update(pending_1769(port, 17692), false).expect("runtime");
+        let latest =
+            spawn_registration_status_update(pending_1769(port, 17692), true).expect("runtime");
+        // Another context at the same old AMF is not held up by this lane.
+        let other =
+            spawn_registration_status_update(pending_1769(port, 17693), true).expect("runtime");
+        cancelled.abort();
+        other.await.expect("other");
+        assert_eq!(
+            *applied.lock().expect("applied"),
+            ["TRANSFERRED"],
+            "the other context's update did not wait for the busy lane"
+        );
+        busy.await.expect("busy");
+        superseded.await.expect("superseded");
+        latest.await.expect("latest");
+        assert!(cancelled.await.is_err(), "cancelled");
+        assert_eq!(
+            *applied.lock().expect("applied"),
+            ["TRANSFERRED", "NOT_TRANSFERRED", "TRANSFERRED"],
+            "the superseded and the cancelled updates were not sent"
+        );
+        assert_eq!(lane_count_1769(port), 0, "no lane is left behind");
+        peer.stop().await.expect("stop");
     }
 
     fn taken_over_1731(supi: &str) -> Vec<crate::context::EventSubscription> {

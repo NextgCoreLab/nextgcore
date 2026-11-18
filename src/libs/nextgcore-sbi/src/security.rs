@@ -2304,6 +2304,20 @@ mod audience_binding_guards {
                 "{rel} must give its outbound OAuth2 client to its NRF calls once (#1667)"
             );
         }
+        // easdfd keeps no OAUTH2_CLIENT static (it has no outbound SBI client of
+        // its own), so it installs the client its helper builds (#1677).
+        let rel = "nextgcore-easdfd/src/main.rs";
+        let path = bins.join(rel);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        assert_eq!(
+            text.matches(
+                "nextgcore_sbi::nrf_tls::set_nrf_oauth2_client(easdf_nrf_oauth2_client(sbi_profile,"
+            )
+            .count(),
+            1,
+            "{rel} must give its outbound OAuth2 client to its NRF calls once (#1667, #1677)"
+        );
     }
 
     /// Issue #64 gaps 1+2: every NF acquires its OAuth2 client through
