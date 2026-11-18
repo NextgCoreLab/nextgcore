@@ -3012,6 +3012,29 @@ impl PfcpServer {
         let send_end_marker = smreq_flags & pfcpsmreq_flags::SNDEM != 0;
         let drop_buffered = smreq_flags & pfcpsmreq_flags::DROBU != 0;
         let query_all_urrs = smreq_flags & pfcpsmreq_flags::QAURR != 0;
+        // #1816: QAURR and the Query URR IE are EXCLUSIVE in one Session Modification
+        // Request (TS 29.244 Table 7.5.4.1-1 NOTE 3, `29244-k00.txt:22672`), so a
+        // request carrying both is not one the CP function may send. It is REJECTED,
+        // here with the rest of the message's checks so that nothing of it is applied
+        // (§6.3.3): no rule changes, and no URR reports or resets its counters.
+        // Before, it was answered Request accepted with no Usage Report at all, which
+        // told the SMF its query had been honoured. Cause "Mandatory IE incorrect"
+        // with the PFCPSMReq-Flags as the offending IE (§7.6.8): each Query URR is
+        // well formed on its own, and it is the QAURR bit that NOTE 3 rules out
+        // beside them.
+        if query_all_urrs && !queried_urr_ids.is_empty() {
+            log::warn!(
+                "Session Modification for SEID {upf_seid:#x} carries BOTH the QAURR flag \
+                 and {} Query URR IE(s), which TS 29.244 Table 7.5.4.1-1 NOTE 3 makes \
+                 exclusive; rejected, nothing applied",
+                queried_urr_ids.len()
+            );
+            note_first_failure(
+                &mut failure,
+                PfcpCause::MandatoryIeIncorrect,
+                pfcp_ie::PFCPSMREQ_FLAGS,
+            );
+        }
 
         // Update session info; respond Session Context Not Found for an
         // unknown SEID (TS 29.244 7.5.5, cause 65)
@@ -3367,19 +3390,9 @@ impl PfcpServer {
                 UsageReportReason::Termination,
             ));
         }
-        // QAURR and the Query URR IE are EXCLUSIVE -- Table 7.5.4.1-1 NOTE 3
-        // (`29244-k00.txt:22672`). Refused rather than resolved: an immediate report
-        // RESETS the measurement period, so guessing which the SMF meant is
-        // unrecoverable if wrong, whereas refusing lets it retry with a well-formed
-        // request. Neither form is honoured, and no counter is touched.
-        if query_all_urrs && !queried_urr_ids.is_empty() {
-            log::warn!(
-                "Session Modification for SEID {upf_seid:#x} carries BOTH the QAURR flag \
-                 and {} Query URR IE(s), which TS 29.244 Table 7.5.4.1-1 NOTE 3 makes \
-                 exclusive; no usage is reported and no counter is reset",
-                queried_urr_ids.len()
-            );
-        } else if failure.is_none() && (query_all_urrs || !queried_urr_ids.is_empty()) {
+        // QAURR together with a Query URR IE was rejected above (#1816, NOTE 3), so
+        // at most one of the two forms reaches here.
+        if failure.is_none() && (query_all_urrs || !queried_urr_ids.is_empty()) {
             let already: std::collections::HashSet<u32> =
                 usage_reports.iter().map(|r| r.urr_id).collect();
             // `None` means every URR of the session (QAURR); `Some(ids)` means the
@@ -9343,11 +9356,16 @@ mod tests {
     }
 
     /// NOTE 3 (`29244-k00.txt:22672`) makes QAURR and the Query URR IE **exclusive**.
-    /// Refused rather than resolved, because an immediate report RESETS the
-    /// measurement period and a wrong guess cannot be undone.
+    ///
+    /// **#1816.** A request carrying both is rejected, Mandatory IE incorrect with
+    /// the PFCPSMReq-Flags as the offending IE (§7.6.8), and applies NOTHING
+    /// (§6.3.3): its Create FAR is not stored, its Remove URR neither removes nor
+    /// reports URR 1, and no counter is reset, so a well-formed retry still
+    /// collects the usage. Before, it was answered Request accepted with no Usage
+    /// Report, and its other rule changes were applied.
     #[tokio::test]
-    async fn qaurr_and_an_explicit_query_urr_together_are_refused() {
-        let (_server, smf, addr, _rx, dp, upf_seid) = established_session().await;
+    async fn qaurr_beside_a_query_urr_is_rejected_and_applies_nothing_1816() {
+        let (server, smf, addr, mut rx, dp, upf_seid) = established_session().await;
         {
             let session = dp.sessions.find_by_seid(upf_seid).unwrap();
             let urrs = session.urrs.read().unwrap();
@@ -9357,20 +9375,38 @@ mod tests {
         let mut b = crate::n4_build::PfcpMessageBuilder::new();
         b.add_u8(pfcp_ie::PFCPSMREQ_FLAGS, pfcpsmreq_flags::QAURR);
         b.add_tlv(pfcp_ie::QUERY_URR, &remove_body_u32(pfcp_ie::URR_ID, 1));
+        b.add_tlv(pfcp_ie::REMOVE_URR, &remove_body_u32(pfcp_ie::URR_ID, 1));
+        b.add_tlv(pfcp_ie::CREATE_FAR, &far_body(7, 0x02));
         let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
-        // The MODIFICATION still succeeds: the rules it asked to change were applied,
-        // and only the ambiguous query is declined.
-        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(
+            (response_cause(&resp), offending_ie_1478(&resp)),
+            (
+                PfcpCause::MandatoryIeIncorrect as u8,
+                Some(pfcp_ie::PFCPSMREQ_FLAGS)
+            ),
+            "QAURR beside a Query URR is rejected, naming the PFCPSMReq-Flags"
+        );
+        assert_eq!(pfcp_ie::PFCPSMREQ_FLAGS, 49, "TS 29.244 Table 8.1.2-1");
         assert!(
             usage_reports_in(&resp).is_empty(),
-            "neither query form is honoured when both are present"
+            "a rejected response carries no Usage Report"
+        );
+        {
+            let sessions = server.sessions.read().await;
+            let rules = &sessions.get(&upf_seid).unwrap().rules;
+            assert!(!rules.far_ids.contains(&7), "the Create FAR is not applied");
+            assert!(rules.urr_ids.contains(&1), "the Remove URR is not applied");
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "the data plane is told nothing of a rejected modification"
         );
 
-        // And NOTHING was reset, so a retry still collects the usage. This is the
-        // assertion that makes the refusal safe rather than merely strict.
+        // NOTHING was reset, so a well-formed retry still collects the usage.
         let mut b = crate::n4_build::PfcpMessageBuilder::new();
         b.add_u8(pfcp_ie::PFCPSMREQ_FLAGS, pfcpsmreq_flags::QAURR);
-        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 4, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
         assert_eq!(
             usage_reports_in(&resp),
             vec![(1, 444)],
