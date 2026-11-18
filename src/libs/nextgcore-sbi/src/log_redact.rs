@@ -12,7 +12,7 @@
 //! retained far more widely than the NF that holds the token.
 
 /// Path segments whose NEXT segment is a callback token.
-pub const CALLBACK_TOKEN_SEGMENTS: [&str; 24] = [
+pub const CALLBACK_TOKEN_SEGMENTS: [&str; 25] = [
     "nf-status-notify",
     "dereg-notify",
     "amf-location-notify",
@@ -53,6 +53,8 @@ pub const CALLBACK_TOKEN_SEGMENTS: [&str; 24] = [
     "n2-info-notify",
     // dccfd's producer event-exposure notificationURI (nextgcore#1518).
     "dccf-data-notify",
+    // smfd's REACHABILITY_REPORT eventNotifyUri (nextgcore#1707).
+    "ue-reachability",
     // amfd's Nudm_SDM callbackReference (nextgcore#1748).
     "sdmsubscription-notify",
 ];
