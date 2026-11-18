@@ -649,6 +649,17 @@ pub struct AmfContext {
     /// N1N2MessageTransfers for CM-CONNECTED UEs awaiting NGAP egress (#666).
     /// Same shape and reason as `network_dereg_queue`.
     connected_downlink_queue: RwLock<Vec<PendingConnectedDownlink>>,
+    /// #1776: the UEs (AMF-UE-NGAP-IDs) whose held subscribed UE-AMBR a Nudm_SDM
+    /// data change notification changed, for the NGAP task to send each a UE
+    /// CONTEXT MODIFICATION REQUEST (TS 23.502 §4.5.1, TS 38.413 §8.3.4) if it is
+    /// CM-CONNECTED when the pump drains them. Same reason as
+    /// `connected_downlink_queue`: the SBI handler cannot reach SCTP.
+    ///
+    /// A set, so a UE is queued once however many notifications change its UE-AMBR
+    /// before the drain: the request carries the UE-AMBR held at send time, the
+    /// latest. Bounded by the UE contexts: one entry per UE, and only a UE in the
+    /// store is ever added.
+    ue_ambr_modification_queue: RwLock<std::collections::BTreeSet<u64>>,
     /// The RAT of each NG-RAN node's association, as its NG Setup established it
     /// (#997 review m2): an ng-eNB is E-UTRA. Read with a UE's live association to
     /// tell the LMF selection what serves the UE.
@@ -1448,6 +1459,7 @@ impl AmfContext {
             amf_status_subscriptions: RwLock::new(HashMap::new()),
             network_dereg_queue: RwLock::new(Vec::new()),
             connected_downlink_queue: RwLock::new(Vec::new()),
+            ue_ambr_modification_queue: RwLock::new(std::collections::BTreeSet::new()),
             association_rat: RwLock::new(HashMap::new()),
             pws_n2_queue: RwLock::new(Vec::new()),
             non_ue_nrppa_queue: RwLock::new(Vec::new()),
@@ -2610,6 +2622,42 @@ impl AmfContext {
             Ok(mut q) => std::mem::take(&mut *q),
             Err(_) => Vec::new(),
         }
+    }
+
+    /// #1776: queue a UE Context Modification of the UE's UE-AMBR for the NGAP task.
+    /// A UE already queued stays queued once.
+    pub fn ue_ambr_modification_add(&self, amf_ue_ngap_id: u64) {
+        let mut q = self
+            .ue_ambr_modification_queue
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        q.insert(amf_ue_ngap_id);
+    }
+
+    /// #1776: take every queued UE-AMBR modification (called by the NGAP server pump).
+    pub fn ue_ambr_modification_drain(&self) -> Vec<u64> {
+        let mut q = self
+            .ue_ambr_modification_queue
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *q).into_iter().collect()
+    }
+
+    /// #1776: drop the queued UE-AMBR modifications of these UEs (a deregistration).
+    pub fn ue_ambr_modification_remove_for(&self, amf_ue_ngap_ids: &[u64]) {
+        let mut q = self
+            .ue_ambr_modification_queue
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        q.retain(|id| !amf_ue_ngap_ids.contains(id));
+    }
+
+    /// #1776: whether a UE-AMBR modification is queued for the UE.
+    pub fn ue_ambr_modification_queued(&self, amf_ue_ngap_id: u64) -> bool {
+        self.ue_ambr_modification_queue
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&amf_ue_ngap_id)
     }
 
     /// Drain all pending network-initiated deregistrations (called by the NGAP
@@ -5122,7 +5170,21 @@ pub struct AmfSessRef {
     pub sm_context_in_smf: bool,
 }
 
+/// The UE-AMBR (DL, UL) in bit/s a RedCap UE is held to (Rel-17, TS 38.101): the
+/// subscribed UE-AMBR is capped at these at registration, and again whenever the
+/// subscription changes it (#1776 review).
+pub const REDCAP_UE_AMBR_CAP_BPS: (u64, u64) = (150_000_000, 50_000_000);
+
 impl AmfUe {
+    /// Cap the held UE-AMBR at [`REDCAP_UE_AMBR_CAP_BPS`] for a RedCap UE; no-op for
+    /// any other UE.
+    pub fn cap_ue_ambr_for_redcap(&mut self) {
+        if self.redcap_indication {
+            self.ue_ambr.downlink = self.ue_ambr.downlink.min(REDCAP_UE_AMBR_CAP_BPS.0);
+            self.ue_ambr.uplink = self.ue_ambr.uplink.min(REDCAP_UE_AMBR_CAP_BPS.1);
+        }
+    }
+
     /// Seed the {NH, NCC} forward-security chain from KgNB when the AS security
     /// context is established (TS 33.501 Annex A.10, Section 6.9.2.3.3).
     ///
