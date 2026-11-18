@@ -3438,6 +3438,89 @@ fn handle_jwks() -> SbiResponse {
 /// 400 Bad Request with an AccessTokenErr body (`{"error": "..."}`) as
 /// `application/json`, with mandatory `Cache-Control: no-store` and
 /// `Pragma: no-cache` headers.
+/// The NFType values TS 29.510 defines (TS29510_Nnrf_NFManagement.yaml `NFType`,
+/// 29510-k00), in the yaml's order (#1753). The schema's second `anyOf`
+/// alternative, a free string, is only "for forward compatibility with future
+/// extensions" (TS 29.501 §5.3.12), so it is not in this list.
+const TS29510_NF_TYPES: &[&str] = &[
+    "NRF",
+    "UDM",
+    "AMF",
+    "SMF",
+    "AUSF",
+    "NEF",
+    "PCF",
+    "SMSF",
+    "NSSF",
+    "UDR",
+    "LMF",
+    "GMLC",
+    "5G_EIR",
+    "SEPP",
+    "UPF",
+    "N3IWF",
+    "AF",
+    "UDSF",
+    "BSF",
+    "CHF",
+    "NWDAF",
+    "PCSCF",
+    "CBCF",
+    "HSS",
+    "UCMF",
+    "SOR_AF",
+    "SPAF",
+    "MME",
+    "SCSAS",
+    "SCEF",
+    "SCP",
+    "NSSAAF",
+    "ICSCF",
+    "SCSCF",
+    "DRA",
+    "IMS_AS",
+    "AANF",
+    "5G_DDNMF",
+    "NSACF",
+    "MFAF",
+    "EASDF",
+    "DCCF",
+    "MB_SMF",
+    "TSCTSF",
+    "ADRF",
+    "GBA_BSF",
+    "CEF",
+    "MB_UPF",
+    "NSWOF",
+    "PKMF",
+    "MNPF",
+    "SMS_GMSC",
+    "SMS_IWMSC",
+    "MBSF",
+    "MBSTF",
+    "PANF",
+    "IP_SM_GW",
+    "SMS_ROUTER",
+    "DCSF",
+    "MRF",
+    "MRFP",
+    "MF",
+    "SLPKMF",
+    "RH",
+    "EIF",
+    "AIOTF",
+    "ADM",
+    "SENF",
+];
+
+/// Whether `nf_type` is one of [`TS29510_NF_TYPES`] (case-insensitive, as nrfd
+/// compares NF types everywhere else).
+fn is_ts29510_nf_type(nf_type: &str) -> bool {
+    TS29510_NF_TYPES
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case(nf_type.trim()))
+}
+
 fn token_error(error: &str, description: &str) -> SbiResponse {
     let body = serde_json::json!({
         "error": error,
@@ -4707,6 +4790,22 @@ async fn handle_access_token_request_with_policy(
     if req.scope.is_empty() {
         return token_error("invalid_scope", "Missing scope");
     }
+    // #1753: never mint a token whose audience is an NF type no NF of the current
+    // release can be. NFType is extensible (TS 29.501 §5.3.12: the free-string
+    // alternative exists "only ... for forward compatibility"), so NFRegister keeps
+    // a profile with an unknown nfType; but `aud` = targetNfType means "any
+    // producer of this type", and for a type outside the enum that class is
+    // whatever a registrant chose to call itself. A pinned instance
+    // (targetNfInstanceId alone) is still served: its `aud` names that instance.
+    if !target_nf_type.is_empty() && !is_ts29510_nf_type(&target_nf_type) {
+        return token_error(
+            "invalid_request",
+            &format!(
+                "targetNfType {target_nf_type:?} is not a TS 29.510 NFType, so no access token \
+                 is issued for it"
+            ),
+        );
+    }
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -5780,7 +5879,7 @@ mod tests {
             nf_manager()
                 .register(
                     NfProfile::from_json(&json!({
-                        "nfInstanceId": producer_id, "nfType": "NRFDLIFEP",
+                        "nfInstanceId": producer_id, "nfType": "SLPKMF",
                         "nfStatus": "REGISTERED",
                         "nfServices": [{"serviceInstanceId": "s0",
                                         "serviceName": "nrfdlife-svc"}],
@@ -5794,7 +5893,7 @@ mod tests {
                     "grant_type": "client_credentials",
                     "nfInstanceId": nf_id,
                     "nfType": "SMF",
-                    "targetNfType": "NRFDLIFEP",
+                    "targetNfType": "SLPKMF",
                     "scope": "nrfdlife-svc"
                 })
                 .to_string(),
@@ -6798,6 +6897,136 @@ mod tests {
     // nrfd-04: conditional AccessTokenReq IEs (TS 29.510 Table 6.3.5.2.2-1)
     // -----------------------------------------------------------------
 
+    /// #1753: the #1751 attack. A provisioned NF registers a profile whose nfType
+    /// is outside the TS 29.510 enum (`EES`), offering a service only to itself,
+    /// and asks for a token with `targetNfType: EES`. NFRegister still accepts
+    /// the profile (NFType is extensible, TS 29.501 §5.3.12), but no token whose
+    /// `aud` is `EES` is issued: 400 `invalid_request`. A pinned instance gets a
+    /// token whose `aud` is that instance, and a real type is served as before.
+    ///
+    /// REVERT-VERIFIED: with the #1753 check removed, the `EES` request is 200
+    /// with `aud: "EES"`, and the first assertion names it.
+    #[tokio::test]
+    async fn no_token_is_issued_for_a_target_type_outside_ts29510_1753() {
+        use serde_json::json;
+        let mgr = nf_manager();
+        let consumer_id = "nrfd1753-consumer";
+        let rogue_id = "1753aaaa-0000-4000-8000-000000000001";
+        let real_id = "1753aaaa-0000-4000-8000-000000000002";
+        mgr.register(
+            NfProfile::from_json(&json!({
+                "nfInstanceId": consumer_id, "nfType": "NRFD1753C", "nfStatus": "REGISTERED",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // NFRegister itself accepts the extensible value.
+        let profile = |id: &str, nf_type: &str| {
+            json!({
+                "nfInstanceId": id, "nfType": nf_type, "nfStatus": "REGISTERED",
+                "nfServices": [{"serviceInstanceId": "s0", "serviceName": "nrfd1753-svc",
+                                "allowedNfTypes": ["NRFD1753C"]}],
+            })
+        };
+        let mut put = SbiRequest::put(format!("/nnrf-nfm/v1/nf-instances/{rogue_id}"));
+        put.http.set_content(profile(rogue_id, "EES").to_string());
+        let resp = handle_nf_register(rogue_id, &put).await;
+        assert_eq!(
+            resp.status, 201,
+            "an unknown nfType still registers: {:?}",
+            resp.http.content
+        );
+        // Control producer of a TS 29.510 type no other test registers.
+        mgr.register(NfProfile::from_json(&profile(real_id, "MRFP")).unwrap())
+            .unwrap();
+
+        let policy = policy_without_client_auth();
+        let ask = |target: serde_json::Value| {
+            let mut body = json!({
+                "grant_type": "client_credentials", "nfInstanceId": consumer_id,
+                "nfType": "NRFD1753C", "scope": "nrfd1753-svc"
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(target.as_object().unwrap().clone());
+            let mut r = SbiRequest::post("/nnrf-oauth2/v1/access-token");
+            r.http.set_content(body.to_string());
+            r
+        };
+        let claims = |resp: &SbiResponse| -> serde_json::Value {
+            use base64::Engine;
+            let body: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            let token = body["access_token"].as_str().unwrap().to_string();
+            let payload = token.split('.').nth(1).unwrap().to_string();
+            serde_json::from_slice(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(payload)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+
+        for target in ["EES", "ees"] {
+            let resp = handle_access_token_request_with_policy(
+                &ask(json!({"targetNfType": target})),
+                &policy,
+            )
+            .await;
+            assert_eq!(resp.status, 400, "{target}: {:?}", resp.http.content);
+            let err: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(err["error"], "invalid_request", "{err}");
+            assert!(
+                err["error_description"]
+                    .as_str()
+                    .is_some_and(|d| d.contains("is not a TS 29.510 NFType")),
+                "{err}"
+            );
+        }
+
+        // The same rogue profile pinned by instance: aud names that instance only.
+        let resp = handle_access_token_request_with_policy(
+            &ask(json!({"targetNfInstanceId": rogue_id})),
+            &policy,
+        )
+        .await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        assert_eq!(claims(&resp)["aud"], json!([rogue_id]));
+
+        // Control: a TS 29.510 type is served, aud = the type.
+        let resp =
+            handle_access_token_request_with_policy(&ask(json!({"targetNfType": "MRFP"})), &policy)
+                .await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        assert_eq!(claims(&resp)["aud"], "MRFP");
+
+        for id in [consumer_id, rogue_id, real_id] {
+            mgr.deregister(id).ok();
+        }
+    }
+
+    /// #1753: the list is the vendored enum, exactly. Pinned against the
+    /// TS29510_Nnrf_NFManagement.yaml `NFType` values (29510-k00), with this
+    /// tree's non-3GPP spellings as controls.
+    #[test]
+    fn the_ts29510_nf_type_list_is_the_vendored_enum_1753() {
+        assert_eq!(TS29510_NF_TYPES.len(), 68);
+        let mut seen = std::collections::HashSet::new();
+        assert!(
+            TS29510_NF_TYPES.iter().all(|t| seen.insert(*t)),
+            "duplicates"
+        );
+        for t in [
+            "MB_SMF", "mb_smf", "5G_EIR", "NRF", "SENF", "ADM", "AF", "EASDF",
+        ] {
+            assert!(is_ts29510_nf_type(t), "{t}");
+        }
+        for t in ["EES", "MBSMF", "SMSF_5G", "", "NRFD04P"] {
+            assert!(!is_ts29510_nf_type(t), "{t}");
+        }
+    }
+
     #[tokio::test]
     async fn test_nrfd_04_target_instance_and_requester_snssai() {
         use serde_json::json;
@@ -6814,7 +7043,7 @@ mod tests {
         .unwrap();
         mgr.register(
             NfProfile::from_json(&json!({
-                "nfInstanceId": producer_id, "nfType": "NRFD04P", "nfStatus": "REGISTERED",
+                "nfInstanceId": producer_id, "nfType": "RH", "nfStatus": "REGISTERED",
                 "sNssais": [{"sst": 1, "sd": "010203"}],
                 "nfServices": [{"serviceInstanceId": "s0", "serviceName": "nrfd04-svc"}],
             }))
@@ -6865,7 +7094,7 @@ mod tests {
         let resp = handle_access_token_request_with_policy(
             &token_req(json!({
                 "grant_type": "client_credentials", "nfInstanceId": consumer_id,
-                "nfType": "NRFD04C", "targetNfType": "NRFD04P", "scope": "nrfd04-svc",
+                "nfType": "NRFD04C", "targetNfType": "RH", "scope": "nrfd04-svc",
                 "requesterSnssaiList": [{"sst": 9}]
             })),
             &policy,
@@ -6900,7 +7129,7 @@ mod tests {
         .unwrap();
         let producer = |allowed: serde_json::Value| {
             NfProfile::from_json(&json!({
-                "nfInstanceId": producer_id, "nfType": "NRFD1391P", "nfStatus": "REGISTERED",
+                "nfInstanceId": producer_id, "nfType": "EIF", "nfStatus": "REGISTERED",
                 "allowedNfTypes": allowed,
                 "nfServices": [{"serviceInstanceId": "s0", "serviceName": "nrfd1391-svc"}],
             }))
@@ -6910,7 +7139,7 @@ mod tests {
         req.http.set_content(
             json!({
                 "grant_type": "client_credentials", "nfInstanceId": consumer_id,
-                "nfType": "NRFD1391C", "targetNfType": "NRFD1391P", "scope": "nrfd1391-svc"
+                "nfType": "NRFD1391C", "targetNfType": "EIF", "scope": "nrfd1391-svc"
             })
             .to_string(),
         );
@@ -6974,7 +7203,7 @@ mod tests {
         .unwrap();
         mgr.register(
             NfProfile::from_json(&json!({
-                "nfInstanceId": producer_id, "nfType": "NRFD1391BP", "nfStatus": "REGISTERED",
+                "nfInstanceId": producer_id, "nfType": "AIOTF", "nfStatus": "REGISTERED",
                 "nfServices": [{"serviceInstanceId": "s0", "serviceName": "nrfd1391b-svc"}],
             }))
             .unwrap(),
@@ -6994,7 +7223,7 @@ mod tests {
                    "scope": "nrfd1391b-svc"}),
             json!({"grant_type": "client_credentials", "nfInstanceId": consumer_id,
                    "nfType": "NRFD1391BC", "targetNfInstanceId": absent,
-                   "targetNfType": "NRFD1391BP", "scope": "nrfd1391b-svc"}),
+                   "targetNfType": "AIOTF", "scope": "nrfd1391b-svc"}),
         ] {
             let resp = handle_access_token_request_with_policy(&ask(body.clone()), &policy).await;
             let b: serde_json::Value =
@@ -7043,7 +7272,7 @@ mod tests {
         .unwrap();
         let producer = |status: &str| {
             NfProfile::from_json(&json!({
-                "nfInstanceId": producer_id, "nfType": "NRFD1391CP", "nfStatus": status,
+                "nfInstanceId": producer_id, "nfType": "ADM", "nfStatus": status,
                 "nfServices": [{"serviceInstanceId": "s0", "serviceName": "nrfd1391c-svc"}],
             }))
             .unwrap()
@@ -7083,9 +7312,9 @@ mod tests {
             }
         };
 
-        // (a) Pinned instance is an NRFD1391CO, the request says NRFD1391CP.
+        // (a) Pinned instance is an NRFD1391CO, the request says ADM.
         let (st, b) = call(with(
-            json!({"targetNfInstanceId": other_id, "targetNfType": "NRFD1391CP"}),
+            json!({"targetNfInstanceId": other_id, "targetNfType": "ADM"}),
         ))
         .await;
         assert_eq!(
@@ -7095,11 +7324,11 @@ mod tests {
         );
         assert!(b.get("access_token").is_none(), "{b}");
 
-        // (b) The only NRFD1391CP producer is SUSPENDED: by type and pinned.
+        // (b) The only ADM producer is SUSPENDED: by type and pinned.
         mgr.deregister(producer_id).ok();
         mgr.register(producer("SUSPENDED")).unwrap();
         for extra in [
-            json!({"targetNfType": "NRFD1391CP"}),
+            json!({"targetNfType": "ADM"}),
             json!({"targetNfInstanceId": producer_id}),
         ] {
             let (st, b) = call(with(extra.clone())).await;
@@ -7118,7 +7347,7 @@ mod tests {
             mgr.deregister(producer_id).ok();
             mgr.register(producer(status)).unwrap();
             for extra in [
-                json!({"targetNfType": "NRFD1391CP"}),
+                json!({"targetNfType": "ADM"}),
                 json!({"targetNfInstanceId": producer_id}),
             ] {
                 let (st, b) = call(with(extra.clone())).await;
@@ -7564,7 +7793,7 @@ mod tests {
         .unwrap();
         mgr.register(
             NfProfile::from_json(&json!({
-                "nfInstanceId": producer_id, "nfType": "NRFDI2P", "nfStatus": "REGISTERED",
+                "nfInstanceId": producer_id, "nfType": "SENF", "nfStatus": "REGISTERED",
                 "nfServices": [{"serviceInstanceId": "s0", "serviceName": "nrfdi2-svc"}],
             }))
             .unwrap(),
@@ -7576,7 +7805,7 @@ mod tests {
             r.http.set_content(
                 json!({
                     "grant_type": "client_credentials", "nfInstanceId": consumer_id,
-                    "nfType": "NRFDI2C", "targetNfType": "NRFDI2P", "scope": "nrfdi2-svc"
+                    "nfType": "NRFDI2C", "targetNfType": "SENF", "scope": "nrfdi2-svc"
                 })
                 .to_string(),
             );
@@ -7679,11 +7908,14 @@ mod tests {
     }
 
     /// Build a token request for a pair from [`register_pair`], optionally
-    /// carrying a CCA and/or a forwarded-client-cert header.
+    /// carrying a CCA and/or a forwarded-client-cert header. The producer is
+    /// pinned by instance (#1753): its per-test NF type keeps it out of every other
+    /// test's producer set, and is outside the TS 29.510 enum, so a request by type
+    /// would be refused before authentication is what decides.
     fn auth_token_req(
         consumer_id: &str,
         consumer_type: &str,
-        producer_type: &str,
+        producer_id: &str,
         cca: Option<&str>,
         xfcc: Option<&str>,
     ) -> SbiRequest {
@@ -7692,7 +7924,7 @@ mod tests {
             "grant_type": "client_credentials",
             "nfInstanceId": consumer_id,
             "nfType": consumer_type,
-            "targetNfType": producer_type,
+            "targetNfInstanceId": producer_id,
             "scope": "svc",
         });
         if let Some(c) = cca {
@@ -7731,7 +7963,7 @@ mod tests {
     /// the file stem fails it the same way.
     #[tokio::test]
     async fn a_cca_signed_by_a_directory_published_key_is_accepted_and_an_unpublished_one_is_not() {
-        let (consumer_id, producer_id, ctype, ptype) = register_pair("nrfd187dir");
+        let (consumer_id, producer_id, ctype, _ptype) = register_pair("nrfd187dir");
 
         // The consumer generates its own key and publishes the PUBLIC half, as
         // `init_cca_client_credentials` does at NF startup. Nothing private is
@@ -7766,7 +7998,7 @@ mod tests {
         // POSITIVE: signed with the published key -> authenticated, token issued.
         let good = nextgcore_sbi::oauth::mint_cca(&trusted, &consumer_id, "NRF", now, 60, &[]);
         let resp = handle_access_token_request_with_policy(
-            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&good), None),
+            &auth_token_req(&consumer_id, &ctype, &producer_id, Some(&good), None),
             &policy,
         )
         .await;
@@ -7800,7 +8032,7 @@ mod tests {
         let untrusted = nextgcore_sbi::oauth::generate_es256_key();
         let forged = nextgcore_sbi::oauth::mint_cca(&untrusted, &consumer_id, "NRF", now, 60, &[]);
         let resp = handle_access_token_request_with_policy(
-            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&forged), None),
+            &auth_token_req(&consumer_id, &ctype, &producer_id, Some(&forged), None),
             &policy,
         )
         .await;
@@ -7819,10 +8051,10 @@ mod tests {
 
         // And an NF with no published key at all is refused for the other
         // fail-closed reason: no trusted key exists to verify against.
-        let (other_id, other_producer, otype, optype) = register_pair("nrfd187nokey");
+        let (other_id, other_producer, otype, _optype) = register_pair("nrfd187nokey");
         let other_cca = nextgcore_sbi::oauth::mint_cca(&untrusted, &other_id, "NRF", now, 60, &[]);
         let resp = handle_access_token_request_with_policy(
-            &auth_token_req(&other_id, &otype, &optype, Some(&other_cca), None),
+            &auth_token_req(&other_id, &otype, &other_producer, Some(&other_cca), None),
             &policy,
         )
         .await;
@@ -7859,7 +8091,7 @@ mod tests {
     /// "no trusted ES256 key configured".
     #[tokio::test]
     async fn a_key_published_after_the_nrf_started_is_still_trusted() {
-        let (consumer_id, producer_id, ctype, ptype) = register_pair("nrfd187late");
+        let (consumer_id, producer_id, ctype, _ptype) = register_pair("nrfd187late");
         let dir = std::env::temp_dir().join(format!("nrfd187-late-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
@@ -7886,7 +8118,7 @@ mod tests {
 
         // Before the NF published: refused, fail-closed.
         let resp = handle_access_token_request_with_policy(
-            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&cca), None),
+            &auth_token_req(&consumer_id, &ctype, &producer_id, Some(&cca), None),
             &policy,
         )
         .await;
@@ -7900,7 +8132,7 @@ mod tests {
         nextgcore_sbi::oauth::publish_cca_public_jwk(&key, &consumer_id, &dir).expect("publish");
 
         let resp = handle_access_token_request_with_policy(
-            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&cca), None),
+            &auth_token_req(&consumer_id, &ctype, &producer_id, Some(&cca), None),
             &policy,
         )
         .await;
@@ -7929,7 +8161,7 @@ mod tests {
     #[tokio::test]
     async fn the_nrf_can_obtain_a_token_from_its_own_endpoint_under_its_own_policy() {
         // A producer for the NRF to ask about, so authorization has a target.
-        let (_c, producer_id, _ct, ptype) = register_pair("nrfd187self");
+        let (_c, producer_id, _ct, _ptype) = register_pair("nrfd187self");
 
         // The NRF registers itself, exactly as startup does. Its entry is shared with
         // every other test of this process (#1644 review M1).
@@ -7962,7 +8194,7 @@ mod tests {
             .as_secs();
         let cca = nextgcore_sbi::oauth::mint_cca(&key, &self_id, "NRF", now, 60, &[]);
         let resp = handle_access_token_request_with_policy(
-            &auth_token_req(&self_id, "NRF", &ptype, Some(&cca), None),
+            &auth_token_req(&self_id, "NRF", &producer_id, Some(&cca), None),
             &policy,
         )
         .await;
@@ -7989,9 +8221,9 @@ mod tests {
     /// `NrfPolicy::default` fails this.
     #[tokio::test]
     async fn default_policy_rejects_unauthenticated_token_request() {
-        let (consumer_id, producer_id, ctype, ptype) = register_pair("nrfd64a");
+        let (consumer_id, producer_id, ctype, _ptype) = register_pair("nrfd64a");
         let resp = handle_access_token_request_with_policy(
-            &auth_token_req(&consumer_id, &ctype, &ptype, None, None),
+            &auth_token_req(&consumer_id, &ctype, &producer_id, None, None),
             &NrfPolicy::default(),
         )
         .await;
@@ -8025,7 +8257,7 @@ mod tests {
     async fn unsigned_cca_does_not_authenticate() {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
-        let (consumer_id, producer_id, ctype, ptype) = register_pair("nrfd64b");
+        let (consumer_id, producer_id, ctype, _ptype) = register_pair("nrfd64b");
 
         // A CCA whose CLAIMS are all correct, with a garbage signature.
         let now = std::time::SystemTime::now()
@@ -8057,7 +8289,7 @@ mod tests {
             ..NrfPolicy::default()
         };
         let resp = handle_access_token_request_with_policy(
-            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&forged), None),
+            &auth_token_req(&consumer_id, &ctype, &producer_id, Some(&forged), None),
             &policy,
         )
         .await;
@@ -8078,7 +8310,7 @@ mod tests {
             ..NrfPolicy::default()
         };
         let resp = handle_access_token_request_with_policy(
-            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&forged), None),
+            &auth_token_req(&consumer_id, &ctype, &producer_id, Some(&forged), None),
             &unchecked,
         )
         .await;
@@ -8108,12 +8340,12 @@ mod tests {
     /// `extract_transport_client_nf_instance_id` fails this.
     #[tokio::test]
     async fn xfcc_header_is_ignored_unless_trusted() {
-        let (consumer_id, producer_id, ctype, ptype) = register_pair("nrfd64c");
+        let (consumer_id, producer_id, ctype, _ptype) = register_pair("nrfd64c");
         let xfcc = format!("Hash=ab;URI=urn:uuid:{consumer_id}");
 
         // Default policy: the header is not evidence, so the request is
         // unauthenticated and refused.
-        let req = auth_token_req(&consumer_id, &ctype, &ptype, None, Some(&xfcc));
+        let req = auth_token_req(&consumer_id, &ctype, &producer_id, None, Some(&xfcc));
         assert!(
             extract_transport_client_nf_instance_id(&req, &NrfPolicy::default()).is_none(),
             "an untrusted forwarded-cert header must confer no identity"
@@ -8132,7 +8364,7 @@ mod tests {
             ..NrfPolicy::default()
         };
         let resp = handle_access_token_request_with_policy(
-            &auth_token_req(&consumer_id, &ctype, &ptype, None, Some(&xfcc)),
+            &auth_token_req(&consumer_id, &ctype, &producer_id, None, Some(&xfcc)),
             &trusting,
         )
         .await;
@@ -8151,7 +8383,7 @@ mod tests {
     /// the requester is rejected, and so is a mismatched certificate identity.
     #[tokio::test]
     async fn subject_mismatch_is_rejected() {
-        let (consumer_id, producer_id, ctype, ptype) = register_pair("nrfd64d");
+        let (consumer_id, producer_id, ctype, _ptype) = register_pair("nrfd64d");
         let key = nextgcore_sbi::oauth::generate_es256_key();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -8169,7 +8401,7 @@ mod tests {
             ..NrfPolicy::default()
         };
         let resp = handle_access_token_request_with_policy(
-            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&other_cca), None),
+            &auth_token_req(&consumer_id, &ctype, &producer_id, Some(&other_cca), None),
             &policy,
         )
         .await;
@@ -8181,7 +8413,7 @@ mod tests {
             &auth_token_req(
                 &consumer_id,
                 &ctype,
-                &ptype,
+                &producer_id,
                 None,
                 Some("Hash=ab;URI=urn:uuid:a-different-nf"),
             ),
@@ -8207,7 +8439,7 @@ mod tests {
     async fn signed_cca_authenticates_and_binds_the_token_subject() {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
-        let (consumer_id, producer_id, ctype, ptype) = register_pair("nrfd64e");
+        let (consumer_id, producer_id, ctype, _ptype) = register_pair("nrfd64e");
 
         let key = nextgcore_sbi::oauth::generate_es256_key();
         let now = std::time::SystemTime::now()
@@ -8225,7 +8457,7 @@ mod tests {
         };
 
         let resp = handle_access_token_request_with_policy(
-            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&cca), None),
+            &auth_token_req(&consumer_id, &ctype, &producer_id, Some(&cca), None),
             &policy,
         )
         .await;
@@ -8254,7 +8486,7 @@ mod tests {
         let rogue = nextgcore_sbi::oauth::generate_es256_key();
         let rogue_cca = nextgcore_sbi::oauth::mint_cca(&rogue, &consumer_id, "NRF", now, 60, &[]);
         let resp = handle_access_token_request_with_policy(
-            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&rogue_cca), None),
+            &auth_token_req(&consumer_id, &ctype, &producer_id, Some(&rogue_cca), None),
             &policy,
         )
         .await;
@@ -8329,7 +8561,7 @@ mod tests {
         use base64::Engine;
         use serde_json::json;
 
-        let (consumer_id, producer_id, ctype, ptype) = register_pair("nrfd1633m1");
+        let (consumer_id, producer_id, ctype, _ptype) = register_pair("nrfd1633m1");
         let lower = "1633c0de-0000-4000-8000-0000000000a1";
         let upper = lower.to_ascii_uppercase();
         let legacy = "nrfd1633m1-legacy";
@@ -8367,7 +8599,7 @@ mod tests {
             assert_eq!(error_of(resp)["error"], "invalid_client", "{what}");
         };
         let req = |id: &str, cca: Option<&str>, xfcc: Option<&str>| {
-            auth_token_req(id, &ctype, &ptype, cca, xfcc)
+            auth_token_req(id, &ctype, &producer_id, cca, xfcc)
         };
 
         // mTLS, through a declared terminator.
@@ -8445,7 +8677,7 @@ mod tests {
     async fn an_unproven_token_subject_is_canonical_1633() {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
-        let (consumer_id, producer_id, ctype, ptype) = register_pair("nrfd1633m3");
+        let (consumer_id, producer_id, ctype, _ptype) = register_pair("nrfd1633m3");
         let lower = "1633f0f0-0000-4000-8000-0000000000f6";
         let upper = lower.to_ascii_uppercase();
         nf_manager()
@@ -8461,7 +8693,7 @@ mod tests {
             ..NrfPolicy::default()
         };
         let resp = handle_access_token_request_with_policy(
-            &auth_token_req(&upper, &ctype, &ptype, None, None),
+            &auth_token_req(&upper, &ctype, &producer_id, None, None),
             &open,
         )
         .await;
@@ -8939,7 +9171,7 @@ mod tests {
     /// returns 200 where 400 is asserted.
     #[tokio::test]
     async fn a_cca_whose_certificate_names_another_nf_is_refused_and_its_own_is_accepted() {
-        let (consumer_id, producer_id, ctype, ptype) = register_pair("nrfd393bind");
+        let (consumer_id, producer_id, ctype, _ptype) = register_pair("nrfd393bind");
         let (ca_der, ca, ca_key) = cca_test_ca();
 
         let key = nextgcore_sbi::oauth::generate_es256_key();
@@ -8964,7 +9196,7 @@ mod tests {
             std::slice::from_ref(&own_leaf),
         );
         let resp = handle_access_token_request_with_policy(
-            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&good), None),
+            &auth_token_req(&consumer_id, &ctype, &producer_id, Some(&good), None),
             &policy,
         )
         .await;
@@ -8992,7 +9224,13 @@ mod tests {
             std::slice::from_ref(&other_leaf),
         );
         let resp = handle_access_token_request_with_policy(
-            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&impersonating), None),
+            &auth_token_req(
+                &consumer_id,
+                &ctype,
+                &producer_id,
+                Some(&impersonating),
+                None,
+            ),
             &policy,
         )
         .await;
@@ -9031,7 +9269,7 @@ mod tests {
     /// trust store makes this fail with status 200.
     #[tokio::test]
     async fn an_x5c_bearing_cca_is_refused_rather_than_downgraded_to_the_trust_store() {
-        let (consumer_id, producer_id, ctype, ptype) = register_pair("nrfd393down");
+        let (consumer_id, producer_id, ctype, _ptype) = register_pair("nrfd393down");
         let (_, ca, ca_key) = cca_test_ca();
 
         let key = nextgcore_sbi::oauth::generate_es256_key();
@@ -9055,7 +9293,7 @@ mod tests {
         // the refusal below is attributable to x5c and not to a bad key.
         let plain = nextgcore_sbi::oauth::mint_cca(&key, &consumer_id, "NRF", now, 60, &[]);
         let resp = handle_access_token_request_with_policy(
-            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&plain), None),
+            &auth_token_req(&consumer_id, &ctype, &producer_id, Some(&plain), None),
             &policy,
         )
         .await;
@@ -9076,7 +9314,7 @@ mod tests {
             std::slice::from_ref(&leaf),
         );
         let resp = handle_access_token_request_with_policy(
-            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&with_chain), None),
+            &auth_token_req(&consumer_id, &ctype, &producer_id, Some(&with_chain), None),
             &policy,
         )
         .await;
@@ -9117,7 +9355,7 @@ mod tests {
     /// this fail with status 200.
     #[tokio::test]
     async fn a_cca_signed_by_a_key_its_certificate_does_not_certify_is_refused() {
-        let (consumer_id, producer_id, ctype, ptype) = register_pair("nrfd393auth");
+        let (consumer_id, producer_id, ctype, _ptype) = register_pair("nrfd393auth");
         let (ca_der, ca, ca_key) = cca_test_ca();
 
         let certified = nextgcore_sbi::oauth::generate_es256_key();
@@ -9150,7 +9388,7 @@ mod tests {
         };
 
         let resp = handle_access_token_request_with_policy(
-            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&cca), None),
+            &auth_token_req(&consumer_id, &ctype, &producer_id, Some(&cca), None),
             &policy,
         )
         .await;
@@ -9173,7 +9411,7 @@ mod tests {
     /// strictly weaker than the trust store it takes precedence over.
     #[tokio::test]
     async fn a_cca_chain_from_an_unconfigured_ca_is_refused() {
-        let (consumer_id, producer_id, ctype, ptype) = register_pair("nrfd393ca");
+        let (consumer_id, producer_id, ctype, _ptype) = register_pair("nrfd393ca");
         let (_, rogue_ca, rogue_key) = cca_test_ca();
         let (trusted_ca_der, _, _) = cca_test_ca();
 
@@ -9198,7 +9436,7 @@ mod tests {
             ..NrfPolicy::default()
         };
         let resp = handle_access_token_request_with_policy(
-            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&cca), None),
+            &auth_token_req(&consumer_id, &ctype, &producer_id, Some(&cca), None),
             &policy,
         )
         .await;
@@ -9227,7 +9465,7 @@ mod tests {
     async fn a_cca_using_x5u_is_refused_with_a_reason_naming_it() {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
-        let (consumer_id, producer_id, ctype, ptype) = register_pair("nrfd393x5u");
+        let (consumer_id, producer_id, ctype, _ptype) = register_pair("nrfd393x5u");
 
         let key = nextgcore_sbi::oauth::generate_es256_key();
         let now = std::time::SystemTime::now()
@@ -9268,7 +9506,7 @@ mod tests {
         };
 
         let resp = handle_access_token_request_with_policy(
-            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&cca), None),
+            &auth_token_req(&consumer_id, &ctype, &producer_id, Some(&cca), None),
             &policy,
         )
         .await;
