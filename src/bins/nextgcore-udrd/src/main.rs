@@ -3158,18 +3158,18 @@ async fn handle_subscription_data_subs(
         },
         // Document: /subscription-data/subs-to-notify/{subsId}
         Some(subs_id) => match method {
-            "GET" => match ds.sub_get(subs_id) {
-                Some(sub) if sub.kind == SubKind::SubscriptionData => SbiResponse::with_status(200)
+            "GET" => match live_subscription_data_sub(subs_id) {
+                Some(sub) => SbiResponse::with_status(200)
                     .with_body(sub.body.to_string(), "application/json"),
-                _ => send_not_found("Subscription not found", Some("DATA_NOT_FOUND")),
+                None => send_not_found("Subscription not found", Some("DATA_NOT_FOUND")),
             },
             "PATCH" => {
-                let Some(sub) = ds.sub_get(subs_id) else {
+                // #1836: an expired subscription is gone (TS 29.504 §5.2.2.6.2:
+                // "after which the subscription becomes invalid"), so the UDM's
+                // refresh learns it must subscribe again.
+                let Some(sub) = live_subscription_data_sub(subs_id) else {
                     return send_not_found("Subscription not found", Some("DATA_NOT_FOUND"));
                 };
-                if sub.kind != SubKind::SubscriptionData {
-                    return send_not_found("Subscription not found", Some("DATA_NOT_FOUND"));
-                }
                 let patch_body = match parse_json_body(request) {
                     Ok(v) => v,
                     Err(resp) => return *resp,
@@ -3180,6 +3180,7 @@ async fn handle_subscription_data_subs(
                         Some("INVALID_MSG_FORMAT"),
                     );
                 };
+                // Every item is checked before any is applied (#1836).
                 let mut body = sub.body;
                 for patch in items {
                     let op = patch.get("op").and_then(|v| v.as_str()).unwrap_or("");
@@ -3191,7 +3192,16 @@ async fn handle_subscription_data_subs(
                             Some("INVALID_MSG_FORMAT"),
                         );
                     }
-                    if let (Some(obj), Some(value)) = (body.as_object_mut(), patch.get("value")) {
+                    let Some(value) = patch.get("value") else {
+                        return send_bad_request(
+                            &format!("{op} {path} without a value"),
+                            Some("INVALID_MSG_FORMAT"),
+                        );
+                    };
+                    if let Err(resp) = check_subscription_data_member(key, value) {
+                        return *resp;
+                    }
+                    if let Some(obj) = body.as_object_mut() {
                         obj.insert(key.to_string(), value.clone());
                     }
                 }
@@ -3211,6 +3221,59 @@ async fn handle_subscription_data_subs(
             }
             _ => send_method_not_allowed(method, "subscription-data/subs-to-notify/{subsId}"),
         },
+    }
+}
+
+/// Subscription-data subscription `id`, unless it is not one or has expired
+/// (TS 29.504 §5.2.2.6.2). An expired one is removed on the way (#1836).
+fn live_subscription_data_sub(id: &str) -> Option<data_store::StoredSub> {
+    let ds = data_store::store();
+    let sub = ds
+        .sub_get(id)
+        .filter(|s| s.kind == SubKind::SubscriptionData)?;
+    if data_store::sub_expired(&sub, nextgcore_sbi::datetime::now_epoch_secs() as i64) {
+        log::info!("subscription-data subscription {id} expired: removed");
+        ds.sub_remove(id);
+        return None;
+    }
+    Some(sub)
+}
+
+/// Whether a PATCH may set member `key` of a `SubscriptionDataSubscriptions`
+/// (TS 29.505) to `value` (#1836): an `expiry` must be a future DateTime, as at the
+/// subscribe; `callbackReference` a string; `monitoredResourceUris` a non-empty
+/// array of strings (mandatory members, so not unset by a PATCH either).
+fn check_subscription_data_member(
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<(), Box<SbiResponse>> {
+    let bad = |what: &str, cause: &str| Err(Box::new(send_bad_request(what, Some(cause))));
+    match key {
+        "expiry" => match value
+            .as_str()
+            .and_then(nextgcore_sbi::datetime::rfc3339_to_epoch_signed)
+        {
+            None => bad("expiry is not a DateTime (RFC 3339)", "INVALID_MSG_FORMAT"),
+            Some(at) if at <= nextgcore_sbi::datetime::now_epoch_secs() as i64 => {
+                bad("expiry has passed already", "MANDATORY_IE_INCORRECT")
+            }
+            Some(_) => Ok(()),
+        },
+        "callbackReference" if !value.is_string() => {
+            bad("callbackReference is not a URI", "MANDATORY_IE_INCORRECT")
+        }
+        "monitoredResourceUris"
+            if !value
+                .as_array()
+                .is_some_and(|a| !a.is_empty() && a.iter().all(serde_json::Value::is_string)) =>
+        {
+            bad(
+                "monitoredResourceUris is not a non-empty array of URIs",
+                "MANDATORY_IE_INCORRECT",
+            )
+        }
+        "subscriptionId" => bad("subscriptionId is not modifiable", "MANDATORY_IE_INCORRECT"),
+        _ => Ok(()),
     }
 }
 
@@ -8342,6 +8405,145 @@ udr:
         remove_watchers_of(supi);
         udm.stop().await.expect("stop");
         udr.stop().await.expect("stop");
+    }
+
+    /// **#1836, TS 29.504 §5.2.2.6.2, the UDR peer of the UDM's leg refresh.** A
+    /// PATCH of `/expiry` extends the subscription's life: a pass after the first
+    /// expiry keeps it. A PATCH whose expiry has passed or cannot be read is refused
+    /// 400 and changes nothing, with a valid item beside it (validate before
+    /// mutating). Once the expiry passes, the subscription is gone: the refresh is
+    /// answered 404 (so the UDM subscribes again), also before a pass removed it.
+    ///
+    /// REVERT-VERIFIED: with `check_subscription_data_member` not checking `expiry`,
+    /// the past one is answered 204 ("a past expiry is refused"); with
+    /// `live_subscription_data_sub` not checking the expiry, the refresh of an
+    /// expired subscription is answered 204 ("an expired leg answers 404").
+    #[tokio::test]
+    async fn a_leg_refresh_extends_it_and_a_gone_leg_answers_404_1836() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (udr, client, _l, _p, _rx) = start_udr_and_listener().await;
+        let _dbi = DbiTestStore::enable().await;
+        let (supi, imsi) = ("imsi-001019900018361", "001019900018361");
+        nextgcore_dbi::test_store::provision_subscriber_document(supi, ambr_document(imsi, 1, 2));
+        let now = nextgcore_sbi::datetime::now_epoch_secs();
+        let at = |secs: u64| nextgcore_sbi::datetime::epoch_to_rfc3339(secs);
+        let resp = client
+            .post_json(
+                "/nudr-dr/v2/subscription-data/subs-to-notify",
+                &json!({
+                    "callbackReference": "http://127.0.0.1:9/cb/1836",
+                    "monitoredResourceUris": [data_store::am_data_path(supi)],
+                    "expiry": at(now + 60),
+                }),
+            )
+            .await
+            .expect("POST");
+        assert_eq!(resp.status, 201);
+        let id = json_of(&resp)["subscriptionId"]
+            .as_str()
+            .expect("id")
+            .to_string();
+        let path = format!("/nudr-dr/v2/subscription-data/subs-to-notify/{id}");
+        let patch = |items: serde_json::Value| {
+            let mut req = SbiRequest::patch(&path);
+            req.http.content = Some(items.to_string());
+            req
+        };
+        let refresh = |secs: u64| json!([{"op": "replace", "path": "/expiry", "value": at(secs)}]);
+        let send = |req: SbiRequest| {
+            let client = &client;
+            async move { client.send_request(req).await.expect("answered").status }
+        };
+
+        assert_eq!(send(patch(refresh(now + 600))).await, 204, "refreshed");
+        am_data_watch_pass_at(std::time::Instant::now(), now as i64 + 61).await;
+        assert!(
+            data_store::store().sub_get(&id).is_some(),
+            "kept past its first expiry"
+        );
+
+        for bad in [
+            json!([
+                {"op": "replace", "path": "/callbackReference", "value": "http://127.0.0.1:9/x"},
+                {"op": "replace", "path": "/expiry", "value": at(now - 1)},
+            ]),
+            json!([{"op": "replace", "path": "/expiry", "value": "soon"}]),
+        ] {
+            assert_eq!(
+                send(patch(bad.clone())).await,
+                400,
+                "a past expiry is refused: {bad}"
+            );
+        }
+        let held = data_store::store().sub_get(&id).expect("held");
+        assert_eq!(held.body["expiry"], at(now + 600), "nothing applied");
+        assert_eq!(held.body["callbackReference"], "http://127.0.0.1:9/cb/1836");
+
+        // The expiry passes (set back, as time would), with no pass since.
+        let mut body = held.body;
+        body["expiry"] = json!(at(now - 5));
+        data_store::store().sub_set_body(&id, body, None);
+        assert_eq!(
+            send(patch(refresh(now + 900))).await,
+            404,
+            "an expired leg answers 404"
+        );
+        assert!(data_store::store().sub_get(&id).is_none(), "and is removed");
+        assert_eq!(send(patch(refresh(now + 900))).await, 404, "gone");
+        remove_watchers_of(supi);
+        udr.stop().await.expect("stop");
+    }
+
+    /// **#1836, UDR restart.** A leg's refreshed expiry and its am-data baseline are
+    /// in the UDR's state file: a UDR started on that file still holds the
+    /// subscription with the refreshed expiry, so the UDM's leg outlives the UDR
+    /// restart and its refreshes go on being answered.
+    ///
+    /// REVERT-VERIFIED: with `sub_set_body` not persisting, the reloaded
+    /// subscription has its first expiry ("the refreshed expiry").
+    #[test]
+    fn a_refreshed_leg_survives_a_udr_restart_1836() {
+        let path = std::env::temp_dir().join(format!(
+            "udr-1836-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let now = nextgcore_sbi::datetime::now_epoch_secs();
+        let at = nextgcore_sbi::datetime::epoch_to_rfc3339;
+        let id = {
+            let ds = data_store::UdrDataStore::with_state_path(&path);
+            let sub = ds.sub_create(SubKind::SubscriptionData, "http://udm/cb", json!({}));
+            let body = json!({
+                "callbackReference": "http://udm/cb",
+                "monitoredResourceUris": ["/nudr-dr/v2/subscription-data/imsi-1/provisioned-data/am-data"],
+                "expiry": at(now + 60),
+                "subscriptionId": sub.id,
+            });
+            ds.sub_set_body(&sub.id, body.clone(), None);
+            ds.doc_put(
+                data_store::AM_DATA_NOTIFIED_COLLECTION,
+                &sub.id,
+                json!({"gpsis": ["1"]}),
+            );
+            let mut refreshed = body;
+            refreshed["expiry"] = json!(at(now + 900));
+            ds.sub_set_body(&sub.id, refreshed, None);
+            sub.id
+        };
+        let restarted = data_store::UdrDataStore::with_state_path(&path);
+        let sub = restarted
+            .sub_get(&id)
+            .expect("the leg survives the restart");
+        assert_eq!(sub.body["expiry"], at(now + 900), "the refreshed expiry");
+        assert_eq!(
+            restarted.doc_get(data_store::AM_DATA_NOTIFIED_COLLECTION, &id),
+            Some(json!({"gpsis": ["1"]})),
+            "and its baseline"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// **#1775 review MAJOR-2**: one pass serves at most its bound of subscriptions,
