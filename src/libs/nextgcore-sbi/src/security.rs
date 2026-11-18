@@ -2299,13 +2299,32 @@ mod audience_binding_guards {
         "bins/nextgcore-nrfd/src/sbi_path.rs",
     ];
 
-    /// Byte ranges of the items `#[cfg(test)]` annotates in `text`: from the
-    /// attribute to the brace closing the item's first `{` (an item that ends in
-    /// `;` first has no body). Braces are counted naively; good enough for
-    /// source guards over this workspace.
+    /// Whether the `#[cfg(...)]` attribute starting at `at` is test-only: its
+    /// predicate names `test` (`test`, `all(test, ..)`, `any(test, ..)`) and does
+    /// not negate it. A token scan, not a cfg evaluator: `any(test, feature =
+    /// "x")` counts as test-only, which is the stricter reading for this guard.
+    fn is_test_cfg(text: &str, at: usize) -> Option<usize> {
+        let rest = &text[at..];
+        let end = rest.find(")]")? + 2;
+        let attr = &rest[..end];
+        let names_test = attr
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .any(|w| w == "test");
+        (names_test && !attr.contains("not(test")).then_some(end)
+    }
+
+    /// Byte ranges of the items a test-only `#[cfg(..)]` annotates in `text`
+    /// ([`is_test_cfg`]): from the attribute to the brace closing the item's
+    /// first `{`. An item that ends in `;` first (`#[cfg(test)] mod tests;`) has
+    /// no span here; [`out_of_line_test_modules`] covers its file. Braces are
+    /// counted naively (no string or comment awareness); good enough for source
+    /// guards over this workspace.
     fn cfg_test_spans(text: &str) -> Vec<std::ops::Range<usize>> {
         let mut spans = Vec::new();
-        for (at, _) in text.match_indices("#[cfg(test)]") {
+        for (at, _) in text.match_indices("#[cfg(") {
+            if is_test_cfg(text, at).is_none() {
+                continue;
+            }
             let rest = &text[at..];
             let (Some(open), semi) = (rest.find('{'), rest.find(';')) else {
                 continue;
@@ -2331,7 +2350,48 @@ mod audience_binding_guards {
         spans
     }
 
+    /// The files of out-of-line test modules: for `#[cfg(test)] mod NAME;` in
+    /// `rel`, `NAME.rs` and `NAME/mod.rs` beside it (or under its stem directory
+    /// when `rel` is not a `main.rs` / `lib.rs` / `mod.rs`).
+    fn out_of_line_test_modules(sources: &[(String, String)]) -> Vec<String> {
+        let mut out = Vec::new();
+        for (rel, text) in sources {
+            let (dir, file) = rel.rsplit_once('/').unwrap_or(("", rel.as_str()));
+            let base = match file {
+                "main.rs" | "lib.rs" | "mod.rs" => dir.to_string(),
+                other => format!("{dir}/{}", other.trim_end_matches(".rs")),
+            };
+            for (at, _) in text.match_indices("#[cfg(") {
+                let Some(end) = is_test_cfg(text, at) else {
+                    continue;
+                };
+                let item = text[at + end..].trim_start();
+                let item = item.strip_prefix("pub ").unwrap_or(item);
+                let Some(decl) = item.strip_prefix("mod ") else {
+                    continue;
+                };
+                let name: String = decl
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if decl[name.len()..].trim_start().starts_with(';') {
+                    out.push(format!("{base}/{name}.rs"));
+                    out.push(format!("{base}/{name}/mod.rs"));
+                }
+            }
+        }
+        out
+    }
+
     const NRF_OAUTH2_INSTALL: &str = "nextgcore_sbi::nrf_tls::set_nrf_oauth2_client(OAUTH2_CLIENT";
+
+    /// Daemons with no `OAUTH2_CLIENT` static that install the client a helper
+    /// builds, each with its one install call (`file`, call prefix). easdfd has
+    /// no outbound SBI client of its own (#1677).
+    const NRF_OAUTH2_HELPER_INSTALLS: [(&str, &str); 1] = [(
+        "bins/nextgcore-easdfd/src/main.rs",
+        "nextgcore_sbi::nrf_tls::set_nrf_oauth2_client(easdf_nrf_oauth2_client(sbi_profile,",
+    )];
 
     /// The workspace's `src/` directory (this crate is `src/libs/nextgcore-sbi`).
     fn workspace_src() -> std::path::PathBuf {
@@ -2384,18 +2444,16 @@ mod audience_binding_guards {
         }
         // easdfd keeps no OAUTH2_CLIENT static (it has no outbound SBI client of
         // its own), so it installs the client its helper builds (#1677).
-        let rel = "nextgcore-easdfd/src/main.rs";
-        let path = bins.join(rel);
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        assert_eq!(
-            text.matches(
-                "nextgcore_sbi::nrf_tls::set_nrf_oauth2_client(easdf_nrf_oauth2_client(sbi_profile,"
-            )
-            .count(),
-            1,
-            "{rel} must give its outbound OAuth2 client to its NRF calls once (#1667, #1677)"
-        );
+        for (rel, install) in NRF_OAUTH2_HELPER_INSTALLS {
+            let path = root.join(rel);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            assert_eq!(
+                text.matches(install).count(),
+                1,
+                "{rel} must give its outbound OAuth2 client to its NRF calls once (#1667, #1677)"
+            );
+        }
     }
 
     /// #1750 (R7 MINOR of #1749): `nrf_tls::set_nrf_oauth2_client` writes a
@@ -2403,8 +2461,10 @@ mod audience_binding_guards {
     /// it: a test that did would make every concurrent `for_nrf_uri` in its
     /// binary attach (or fail closed on) another client's tokens. So the only
     /// calls in the workspace are the daemons' one install each, in a file that
-    /// installs an `OAUTH2_CLIENT`, outside every `#[cfg(test)]` item, and none
-    /// under a `tests/` directory.
+    /// installs an `OAUTH2_CLIENT` (or a named helper install,
+    /// `NRF_OAUTH2_HELPER_INSTALLS`), outside every test-only `#[cfg(..)]` item
+    /// and out-of-line test module, and none under a `tests/` directory
+    /// (the workspace-level `src/tests/` included).
     ///
     /// REVERT-VERIFIED: a `set_nrf_oauth2_client(None)` added to a test module
     /// (and, separately, to an integration test) fails this.
@@ -2414,6 +2474,7 @@ mod audience_binding_guards {
         let mut sources = rust_sources(&root, &root.join("bins"));
         sources.extend(rust_sources(&root, &root.join("libs")));
         sources.extend(rust_sources(&root, &root.join("tests")));
+        let test_files = out_of_line_test_modules(&sources);
         let mut calls = 0;
         for (rel, text) in &sources {
             if rel == "libs/nextgcore-sbi/src/security.rs" {
@@ -2431,16 +2492,26 @@ mod audience_binding_guards {
                     continue; // the definition
                 }
                 calls += 1;
+                let in_tests_dir = rel.starts_with("tests/") || rel.contains("/tests/");
                 assert!(
-                    !rel.contains("/tests/") && !tests.iter().any(|t| t.contains(&at)),
+                    !in_tests_dir
+                        && !test_files.contains(rel)
+                        && !tests.iter().any(|t| t.contains(&at)),
                     "{rel}: a test sets the process-global NRF OAuth2 client: {line}"
                 );
                 let qualified = at
                     .checked_sub("nextgcore_sbi::nrf_tls::".len())
                     .and_then(|from| text.get(from..))
                     .is_some_and(|t| t.starts_with(NRF_OAUTH2_INSTALL));
+                let helper = NRF_OAUTH2_HELPER_INSTALLS.iter().any(|(file, install)| {
+                    rel == file
+                        && at
+                            .checked_sub("nextgcore_sbi::nrf_tls::".len())
+                            .and_then(|from| text.get(from..))
+                            .is_some_and(|t| t.starts_with(install))
+                });
                 assert!(
-                    qualified && text.contains("OAUTH2_CLIENT.set("),
+                    helper || (qualified && text.contains("OAUTH2_CLIENT.set(")),
                     "{rel}: set_nrf_oauth2_client outside a daemon's install: {line}"
                 );
             }
