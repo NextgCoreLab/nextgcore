@@ -174,15 +174,46 @@ pub async fn ensure_producer_subscription(
                 claim_seq,
             } => (notify_token, claim_seq),
         };
-    let target = target.unwrap_or_default();
-    // From here every exit, an await cancelled included (the consumer's subscribe
-    // request this runs in is dropped when its client goes away), records or
-    // abandons this claim.
+    let target = target.unwrap_or_default().to_string();
+    // From here every exit, an await cancelled included, records or abandons this
+    // claim.
     let claim = InFlightClaim {
         scope: scope.clone(),
         claim_seq,
         armed: true,
     };
+    // #1755: the discovery, the producer POST and its commit run on a task that owns
+    // the claim, NOT in the consumer's request future. That future is dropped when
+    // the consumer's client goes away; dropping it mid-POST used to drop the claim
+    // after the producer had accepted, so the claim was abandoned and its token
+    // forgotten while the producer subscription lived on, recorded nowhere and
+    // deleted by no one. Now the task reads the producer's answer whatever the
+    // consumer does, and commits it (or deletes a 201 no claim wants, below).
+    let task = crate::spawn_detached(create_producer_subscription(
+        cfg,
+        claim,
+        target,
+        consumer_id.to_string(),
+        notify_token,
+        sub.clone(),
+    ));
+    match task.await {
+        Ok(outcome) => outcome,
+        Err(e) => CoordinationOutcome::Failed(format!("producer coordination task failed: {e}")),
+    }
+}
+
+/// #1755: everything after the claim: discover the producer, POST the subscription
+/// and commit it. Owns `claim`, so every exit of this task records or abandons it.
+async fn create_producer_subscription(
+    cfg: CoordinationConfig,
+    claim: InFlightClaim,
+    target: String,
+    consumer_id: String,
+    notify_token: nextgcore_sbi::callback_auth::CallbackToken,
+    sub: DataManagementSubsc,
+) -> CoordinationOutcome {
+    let target = target.as_str();
     let failed = CoordinationOutcome::Failed;
 
     let profile = match fetch_nf_profile(&cfg.nrf_uri, target).await {
@@ -254,7 +285,7 @@ impl InFlightClaim {
                 "[DCCF] producer subscription {resource_uri} created for a claim no longer \
                  held; deleting it"
             );
-            tokio::spawn(async move { delete_producer_subscription(&resource_uri).await });
+            crate::spawn_detached(async move { delete_producer_subscription(&resource_uri).await });
         }
     }
 }
