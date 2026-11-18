@@ -213,6 +213,9 @@ if [[ "${VARIANT}" == invalid || "${VARIANT}" == conflict ]]; then
     restore_configs || fail "cannot restore nextgsim-configs"
     "${K[@]}" rollout restart deployment/gnb >/dev/null
     "${K[@]}" rollout status deployment/gnb --timeout=300s >/dev/null || fail "gnb-west did not come back after the restore"
+    # demo-check's nextg_demo_enabled assertion, from the restored gnb-west (the
+    # deployed mode): the refused pod never served a metric.
+    cli_west "${OUT}/metrics/gnb.prom" demo metrics
     (( fails == 0 )) && echo "D441D ${VARIANT}: every assertion holds"
     (( fails == 0 )); exit
 fi
