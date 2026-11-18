@@ -454,8 +454,9 @@ mod tests {
     }
 
     fn amf_holds(context_ref: &str) -> bool {
-        nextgcore_amfd::context::amf_mcast()
-            .session_find(context_ref.parse().expect("numeric ref"))
+        // #1856: the ref is `<epoch>-<id>` and names the context, not the session.
+        nextgcore_amfd::ngap_mcast::parse_context_ref(context_ref)
+            .and_then(|id| nextgcore_amfd::context::amf_mcast().broadcast_context_find(id))
             .is_some()
     }
 
