@@ -5233,20 +5233,24 @@ fn try_positioning_relay(
     if !connected {
         // Paged. The downlinks are enqueued as usual, and the NGAP task holds them
         // while the UE is being paged, then delivers them once its Service Request
-        // has connected it. A page already running (for another transfer) is not
-        // replaced: it brings the UE back just the same. This differs on purpose from
-        // #749's 409 HIGHER_PRIORITY_REQUEST_ONGOING for an SM transfer during a page:
-        // that rule protects the one SM N2 the paging context holds, and these
-        // downlinks are held by the NGAP task, not in the paging context, so they
-        // can ride a page in progress.
-        let paging = amf_self()
-            .read()
-            .ok()
-            .is_some_and(|g| g.paging_find(ue.id).is_some());
-        let location = if paging {
-            format!("/namf-comm/v1/ue-contexts/{ue_context_id}/n1-n2-messages")
-        } else {
-            crate::namf_handler::page_idle_ue_for_positioning(ue, failure_uri)
+        // has connected it. A page already running (for another transfer, or
+        // location-only) is joined, not replaced: it brings the UE back just the
+        // same. This differs on purpose from #749's 409 HIGHER_PRIORITY_REQUEST_ONGOING
+        // for an SM transfer during a page: that rule protects the one SM N2 the
+        // paging context holds, and these downlinks are held by the NGAP task, not in
+        // the paging context, so they can ride a page in progress. #1837: the join
+        // keeps this LMF's n1n2FailureTxfNotifURI on the page, so a page that fails
+        // notifies it too (TS 29.518 §5.2.2.3.1), and join-or-start is one step under
+        // the paging-map lock, so a page another transfer queues meanwhile is joined,
+        // never overwritten.
+        let Some(location) = crate::namf_handler::page_idle_ue_for_positioning(ue, failure_uri)
+        else {
+            log::info!(
+                "[{ue_context_id}] LCS: the page for the UE already carries {} other \
+                 transfers; 409",
+                crate::context::MAX_JOINED_TRANSFERS
+            );
+            return Some(paging_ongoing_error());
         };
         if let Ok(context) = amf_self().read() {
             for dl in downlinks {
@@ -5334,17 +5338,18 @@ fn try_ue_policy_relay(
             return Some(ue_not_reachable_error());
         }
         // #749: paging is ongoing for another transfer; overwriting its context
-        // would lose that one, so this one is refused for the PCF to retry.
-        if crate::namf_handler::paging_ongoing(ue.id) {
-            log::info!("[{ue_context_id}] UE policy: the UE is already being paged; 409");
-            return Some(paging_ongoing_error());
-        }
-        let location = crate::namf_handler::page_idle_ue_for_n1(
+        // would lose that one, so this one is refused for the PCF to retry. #1837:
+        // checked and queued as one step, so a transfer racing this one cannot slip
+        // in between.
+        let Some(location) = crate::namf_handler::page_idle_ue_for_n1(
             ue,
             updp_pdu,
             crate::gmm_handler::payload_container_type::UE_POLICY_CONTAINER,
             failure_uri,
-        );
+        ) else {
+            log::info!("[{ue_context_id}] UE policy: the UE is already being paged; 409");
+            return Some(paging_ongoing_error());
+        };
         log::info!("[{ue_context_id}] UE policy: UE is CM-IDLE, paging it for the UPDP");
         let body = json!({ "cause": "ATTEMPTING_TO_REACH_UE" });
         return Some(match SbiResponse::with_status(202).with_json_body(&body) {
@@ -8410,16 +8415,30 @@ async fn handle_mbs_context_create(request: &SbiRequest) -> SbiResponse {
     // from the same MB-SMF (`mbsmfId`) for the same TMGI is a retry and gets the
     // same context back rather than a second one.
     let mbsmf_id = body.get("mbsmfId").and_then(Value::as_str);
-    let Some((context_ref, session)) =
-        crate::context::amf_mcast().broadcast_context_create(&tmgi, mbsmf_id)
-    else {
-        return send_error(
-            500,
-            "Internal Server Error",
-            "could not create the MBS session context",
-            None,
-        );
-    };
+    let (context_ref, session) =
+        match crate::context::amf_mcast().broadcast_context_create(&tmgi, mbsmf_id) {
+            Ok(created) => created,
+            // #1856: bounded, with the TS 29.500 cause for it.
+            Err(crate::ngap_mcast::BroadcastCreateRefused::Full) => {
+                return send_error(
+                    500,
+                    "Internal Server Error",
+                    &format!(
+                        "this AMF holds {} broadcast MBS contexts",
+                        crate::ngap_mcast::MAX_BROADCAST_CONTEXTS
+                    ),
+                    Some("INSUFFICIENT_RESOURCES"),
+                );
+            }
+            Err(crate::ngap_mcast::BroadcastCreateRefused::Failed) => {
+                return send_error(
+                    500,
+                    "Internal Server Error",
+                    "could not create the MBS session context",
+                    None,
+                );
+            }
+        };
 
     log::info!(
         "Namf_MBSBroadcast ContextCreate: tmgi_svc={:#x} ref={context_ref} session={}",
@@ -8427,7 +8446,8 @@ async fn handle_mbs_context_create(request: &SbiRequest) -> SbiResponse {
         session.mbs_session_id,
     );
 
-    let context_ref = format!("{context_ref}");
+    // #1856: `<epoch>-<id>`, unique across restarts of this AMF.
+    let context_ref = crate::ngap_mcast::context_ref_string(context_ref);
     let response_body = json!({ "mbsContextRef": context_ref });
 
     // 201 with a Location header naming the created resource (TS 29.518 §6.5).
@@ -8455,9 +8475,8 @@ async fn handle_mbs_context_create(request: &SbiRequest) -> SbiResponse {
 /// the session by its id outright, tearing down a TMGI-shared session another
 /// context or an NGAP multicast session still used.
 fn handle_mbs_context_delete(context_ref: &str) -> SbiResponse {
-    let released = context_ref
-        .parse::<u64>()
-        .ok()
+    // #1856: a ref of another epoch (issued before a restart) is not found.
+    let released = crate::ngap_mcast::parse_context_ref(context_ref)
         .and_then(|id| crate::context::amf_mcast().broadcast_context_delete(id));
     match released {
         Some(release) => {
@@ -12577,6 +12596,51 @@ mod tests {
         );
     }
 
+    /// **#1856**: an `mbsContextRef` is `<epoch>-<id>`, the epoch this AMF
+    /// instance's own. A ref of another epoch (one an earlier run of this AMF
+    /// issued, whose counter restarted at 1) is 404 CONTEXT_NOT_FOUND and deletes
+    /// nothing, even when its number names a live context now.
+    ///
+    /// REVERT-VERIFIED: with `parse_context_ref` ignoring the epoch, the stale ref
+    /// deletes the live context ("a pre-restart ref is not found").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ref_from_before_a_restart_deletes_nothing_1856() {
+        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
+        let created = namf_request_handler(
+            SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
+                .with_json_body(&mbs_tmgi_body("001", "01", "001856"))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(created.status, 201);
+        let context_ref = body_json(&created)["mbsContextRef"]
+            .as_str()
+            .expect("mbsContextRef")
+            .to_string();
+        let (epoch, id) = context_ref.split_once('-').expect("<epoch>-<id>");
+        assert_eq!(epoch.len(), 8, "{context_ref}");
+        let stale_epoch = if epoch == "00000000" {
+            "00000001"
+        } else {
+            "00000000"
+        };
+        let stale = format!("{stale_epoch}-{id}");
+        let resp = namf_request_handler(SbiRequest::delete(format!(
+            "/namf-mbs-bc/v1/mbs-contexts/{stale}"
+        )))
+        .await;
+        assert_eq!(resp.status, 404, "a pre-restart ref is not found");
+        assert_eq!(body_json(&resp)["cause"], "CONTEXT_NOT_FOUND");
+        let held = crate::ngap_mcast::parse_context_ref(&context_ref)
+            .and_then(|id| crate::context::amf_mcast().broadcast_context_find(id));
+        assert!(held.is_some(), "the live context is untouched");
+        let resp = namf_request_handler(SbiRequest::delete(format!(
+            "/namf-mbs-bc/v1/mbs-contexts/{context_ref}"
+        )))
+        .await;
+        assert_eq!(resp.status, 204);
+    }
+
     /// #1758: ContextDelete removes the broadcast MBS context ContextCreate made,
     /// and a second delete (or an unknown reference) is 404 CONTEXT_NOT_FOUND, which
     /// the MB-SMF treats as gone.
@@ -12593,7 +12657,7 @@ mod tests {
             .as_str()
             .expect("mbsContextRef")
             .to_string();
-        let id: u64 = context_ref.parse().expect("numeric ref");
+        let id = crate::ngap_mcast::parse_context_ref(&context_ref).expect("this AMF's ref");
         assert!(crate::context::amf_mcast()
             .broadcast_context_find(id)
             .is_some());
@@ -12657,6 +12721,8 @@ mod tests {
     /// "multicast session survives" assertion fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_delete_keeps_a_multicast_session_sharing_the_tmgi_1818() {
+        // #1822: the process-global MBS contexts (main left this test without it).
+        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
         let tmgi = Tmgi::new(0x181800, [0x00, 0xF1, 0x10]);
         let mcast = crate::context::amf_mcast();
         let multicast = mcast
@@ -12673,7 +12739,9 @@ mod tests {
 
         let context_ref = create_mbs_context_1818("181800", None).await;
         let joined = mcast
-            .broadcast_context_find(context_ref.parse().expect("numeric ref"))
+            .broadcast_context_find(
+                crate::ngap_mcast::parse_context_ref(&context_ref).expect("ref"),
+            )
             .expect("the broadcast context is held");
         assert_eq!(
             joined.session_id, multicast.mbs_session_id,
@@ -12701,6 +12769,8 @@ mod tests {
     /// the session and the "kept for the other context" assertion fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_last_broadcast_context_on_a_tmgi_removes_its_session_1818() {
+        // #1822: the process-global MBS contexts (main left this test without it).
+        let _mbs = crate::context::MBS_CONTEXT_LOCK.lock().await;
         let tmgi = Tmgi::new(0x181801, [0x00, 0xF1, 0x10]);
         let mcast = crate::context::amf_mcast();
         let a = create_mbs_context_1818("181801", Some("mbsmf-a")).await;
