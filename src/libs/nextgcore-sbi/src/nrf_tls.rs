@@ -268,8 +268,14 @@ pub fn nrf_scheme(uri_scheme: UriScheme, profile: SbiProfile) -> UriScheme {
 /// The client configuration for dialling the NRF at `host:port` with
 /// `scheme` (already decided by [`nrf_scheme`]). `http` is exactly
 /// `SbiClientConfig::new`; `https` carries [`nrf_client_tls`].
+/// #1681: the largest NRF answer a client built from [`nrf_client_config`] reads:
+/// an NFProfile echo is a few tens of KiB and a discovery SearchResult a few MiB at
+/// most (amfd's own NRF discovery bound, #1674). A larger body, announced or
+/// streamed, is refused rather than buffered.
+pub const NRF_MAX_RESPONSE_BODY: usize = 4 * 1024 * 1024;
+
 pub fn nrf_client_config(scheme: UriScheme, host: &str, port: u16) -> SbiClientConfig {
-    let mut config = SbiClientConfig::new(host, port);
+    let mut config = SbiClientConfig::new(host, port).with_max_response_body(NRF_MAX_RESPONSE_BODY);
     // #1667: whatever builds the client from this, its requests to the NRF carry
     // the process's NRF access token when one is installed.
     config.nrf_oauth2 = true;
@@ -348,6 +354,27 @@ pub fn nrf_client_tls_log_level(tls: &NrfClientTls) -> log::Level {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// #1681: a client for the NRF (heartbeat, NFUpdate, deregistration,
+    /// discovery: every `SbiClient::for_nrf_uri`) reads the NRF's answers with a
+    /// bound, over plain `http` and `https` alike.
+    ///
+    /// REVERT-VERIFIED: with `with_max_response_body` dropped from
+    /// `nrf_client_config`, both are `None`.
+    #[test]
+    fn nrf_clients_read_answers_with_a_bound_1681() {
+        for scheme in [UriScheme::Http, UriScheme::Https] {
+            assert_eq!(
+                nrf_client_config(scheme, "127.0.0.10", 7777).max_response_body,
+                Some(NRF_MAX_RESPONSE_BODY),
+                "{scheme:?}"
+            );
+        }
+        assert_eq!(
+            nrf_client_config_for_uri("http://127.0.0.10:7777").and_then(|c| c.max_response_body),
+            Some(NRF_MAX_RESPONSE_BODY)
+        );
+    }
 
     fn resolve(env: &[(&str, &str)], files: &[&str]) -> NrfClientTls {
         let env: HashMap<String, String> = env

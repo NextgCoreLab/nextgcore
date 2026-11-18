@@ -79,6 +79,19 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   a lower-case UUID version 4 (TS 29.571 §5.3.2); the NRF and every NRF client refuse
   `replicas > 1`, and the clients roll out with strategy Recreate. `check-nf-identities.py
   --helm` (CI `manifests`) checks the renders and refusals.
+- The image HEALTHCHECK works (#1617). `Dockerfile.core` probed `curl -sf
+  http://localhost:7777/health`, an HTTP/1.1 request the h2-only SBI server never answers, so a
+  plain `docker run` of any NF image reported unhealthy, and the NRF now serves only TLS. The new
+  `/usr/local/bin/nf-healthcheck` asks for `/health` over HTTP/2: h2c first, then TLS verified
+  against `/etc/nextgcore/certs/ca.crt` as `nrf` for the NRF (`NF_HEALTH_TLS_NAME` / `_TLS_CA` /
+  `NF_HEALTH_ADDR` / `_PORT` for others); it never skips verification. The compose stacks and
+  the Kubernetes probes keep their own checks.
+- The Kubernetes e2e checks NF -> NRF over TLS (#1617): `k8s/e2e-test.sh` and
+  `deploy/eks/e2e-internet.sh` (every profile with an NRF, so every `k8s/demo-check.sh` run) run
+  the new `k8s/nrf-tls-gate.sh`: each core NF type REGISTERED at the NRF and
+  `nrf_nf_management_unverified_total` 0 at registration and after heartbeats, read inside the
+  NRF pod. `check-nf-identities.py --helm` renders NOTES.txt offline (no kube context is ever
+  contacted), and CI pins helm v3.17.0.
 - mmed binds a configured IPv6 S1-MME address. Before, a bracketed IPv6 `mme.s1ap.server`
   address without a port (`[fd00::5]`) was dropped as unparsable, and the IPv6 server list
   `s1ap_list6` was never filled or read, so such a config fell back to `127.0.0.1:36412`. IPv6

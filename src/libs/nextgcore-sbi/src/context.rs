@@ -310,6 +310,12 @@ pub struct SbiContext {
     rediscovery: std::sync::RwLock<Option<RediscoveryHook>>,
 }
 
+/// #1681: the largest answer a client from [`SbiContext::get_client`] or
+/// [`SbiContext::get_tokened_client`] reads from a peer that is not the NRF: the
+/// NRF discovery bound amfd uses (#1674). A larger body is refused, announced or
+/// streamed, so a faulty or compromised peer cannot make the NF buffer it.
+pub const PEER_MAX_RESPONSE_BODY: usize = 4 * 1024 * 1024;
+
 impl SbiContext {
     /// Create a new SBI context
     pub fn new() -> Self {
@@ -688,10 +694,15 @@ impl SbiContext {
                     crate::nrf_tls::nrf_scheme(scheme, crate::security::SbiProfile::resolve())
                 })
         });
-        match nrf_scheme {
+        let mut config = match nrf_scheme {
             Some(scheme) => crate::nrf_tls::nrf_client_config(scheme, host, port),
             None => crate::security::sbi_peer_client_config(host, port),
-        }
+        };
+        // #1681: a shared client never buffers an unbounded answer.
+        config
+            .max_response_body
+            .get_or_insert(PEER_MAX_RESPONSE_BODY);
+        config
     }
 
     /// Get or create a client for the given endpoint.
@@ -898,6 +909,40 @@ pub async fn global_context_reset() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1681: every client the shared caches hand out reads a peer's answer with a
+    /// bound: [`PEER_MAX_RESPONSE_BODY`] for a peer, [`crate::nrf_tls::NRF_MAX_RESPONSE_BODY`]
+    /// for this NF's NRF. They used to read any body whole.
+    ///
+    /// REVERT-VERIFIED: with the `get_or_insert` in `peer_client_config` removed,
+    /// the peer client's bound is `None`.
+    #[tokio::test]
+    async fn the_shared_clients_read_answers_with_a_bound_1681() {
+        let ctx = SbiContext::new();
+        let peer = ctx.get_client("127.0.0.1", 7001).await;
+        assert_eq!(
+            peer.config().max_response_body,
+            Some(PEER_MAX_RESPONSE_BODY)
+        );
+        let oauth2 = Arc::new(crate::oauth::OAuth2Client::isolated_for_test(
+            "http://127.0.0.1:1",
+            "amf-1681",
+            NfType::Amf,
+        ));
+        let tokened = ctx
+            .get_tokened_client("127.0.0.1", 7002, NfType::Udm, oauth2)
+            .await;
+        assert_eq!(
+            tokened.config().max_response_body,
+            Some(PEER_MAX_RESPONSE_BODY)
+        );
+        ctx.set_nrf_uri("http://127.0.0.1:7003").await;
+        let nrf = ctx.get_client("127.0.0.1", 7003).await;
+        assert_eq!(
+            nrf.config().max_response_body,
+            Some(crate::nrf_tls::NRF_MAX_RESPONSE_BODY)
+        );
+    }
 
     /// #1659, failure-path property 3 (cancellation is safe): a
     /// `get_tokened_client` dropped at its await (the NRF-URI read, held here by
