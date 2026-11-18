@@ -94,6 +94,11 @@ pub(crate) enum SbiOutcome {
     TakeoverUecm(crate::ngap_path::ue_context_takeover::TakeoverUecmAnswer),
     /// #1185 review M1: whose a UE's stored record is, before a local deregistration.
     DeregOwner(crate::ngap_path::ue_context_takeover::DeregOwnerAnswer),
+    /// #1642: the PCF accepted a policy association's re-issued, tokened
+    /// `notificationUri`.
+    PolicyTokenAdopted(crate::ngap_path::ue_context_takeover::PolicyTokenAnswer),
+    /// #1642: the SMF accepted a session's re-issued, tokened `smContextStatusUri`.
+    StatusTokenAdopted(crate::ngap_path::ue_context_takeover::StatusTokenAnswer),
 }
 
 /// What keyed work is serialised on: (AMF UE NGAP ID, PDU session ID).

@@ -69,6 +69,38 @@ pub(crate) struct TakeoverUecmAnswer {
     pub(crate) sdm_subscription_id: Option<String>,
 }
 
+/// Which of a UE's policy associations a re-issued `notificationUri` is for (#1642).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PolicyKind {
+    /// Npcf_AMPolicyControl.
+    Am,
+    /// Npcf_UEPolicyControl.
+    Ue,
+}
+
+/// #1642: the PCF accepted the tokened `notificationUri` a takeover or restore
+/// re-issued for a policy association that had none (made before #1518, or carried
+/// over without one). The token is the association's from now on.
+#[derive(Debug)]
+pub(crate) struct PolicyTokenAnswer {
+    pub(crate) supi: String,
+    pub(crate) kind: PolicyKind,
+    pub(crate) pol_asso_id: String,
+    pub(crate) token: String,
+}
+
+/// #1642: the SMF accepted the tokened `smContextStatusUri` a takeover or restore
+/// re-issued for a session that had none. `key` is the UE's key the token was
+/// derived with; the nonce is recorded only while the UE still holds that key.
+#[derive(Debug, Clone)]
+pub(crate) struct StatusTokenAnswer {
+    pub(crate) supi: String,
+    pub(crate) psi: u8,
+    pub(crate) sm_ref: String,
+    pub(crate) key: String,
+    pub(crate) nonce: String,
+}
+
 /// Whether another AMF instance's record holds a UE this AMF was told to deregister
 /// locally (#1185 review M1).
 #[derive(Debug)]
@@ -408,19 +440,25 @@ impl NgapServer {
             "amfId": amf_id_hex,
         });
         let pcf = self.pcf_for_takeover();
+        // #1518: the association's token, restored with it. #1642: an association
+        // without one (made before #1518, or carried over without it) is re-issued a
+        // tokened URI here, and the token is its own only once the PCF accepted it:
+        // until then the PCF may still notify the URI it holds.
+        let token_for = |held: &Option<String>| match held {
+            Some(token) => (token.clone(), false),
+            None => (crate::sbi_path::new_callback_token(), true),
+        };
         if let Some(pol_asso_id) = state.policy_association_id.clone() {
-            let (uri, guami, pcf) = (
-                // #1518: the association's token, restored with it.
-                crate::sbi_path::am_policy_notification_uri(
-                    &supi,
-                    state.amf_ue.policy_association.notify_token.as_deref(),
-                ),
+            let (token, adopt) = token_for(&state.amf_ue.policy_association.notify_token);
+            let (uri, guami, pcf, supi) = (
+                crate::sbi_path::am_policy_notification_uri(&supi, Some(&token)),
                 guami.clone(),
                 pcf.clone(),
+                supi.clone(),
             );
             self.sbi_offload.spawn(async move {
                 let (host, port) = takeover_pcf(pcf).await;
-                if let Err(e) = crate::sbi_path::retry_peer_update("AM policy update", || {
+                match crate::sbi_path::retry_peer_update("AM policy update", || {
                     crate::sbi_path::call_pcf_am_policy_update_serving_amf(
                         &host,
                         port,
@@ -431,22 +469,30 @@ impl NgapServer {
                 })
                 .await
                 {
-                    log::warn!(
-                        "UE {amf_ue_ngap_id}: AM policy association {pol_asso_id} not pointed \
-                         at the new serving AMF: {e}"
-                    );
+                    Ok(()) => adopt.then_some(crate::sbi_offload::SbiOutcome::PolicyTokenAdopted(
+                        PolicyTokenAnswer {
+                            supi,
+                            kind: PolicyKind::Am,
+                            pol_asso_id,
+                            token,
+                        },
+                    )),
+                    Err(e) => {
+                        log::warn!(
+                            "UE {amf_ue_ngap_id}: AM policy association {pol_asso_id} not \
+                             pointed at the new serving AMF: {e}"
+                        );
+                        None
+                    }
                 }
-                None
             });
         }
         if let Some(pol_asso_id) = state.ue_policy_association_id.clone() {
-            let uri = crate::sbi_path::ue_policy_notification_uri(
-                &supi,
-                state.amf_ue.ue_policy_association.notify_token.as_deref(),
-            );
+            let (token, adopt) = token_for(&state.amf_ue.ue_policy_association.notify_token);
+            let uri = crate::sbi_path::ue_policy_notification_uri(&supi, Some(&token));
             self.sbi_offload.spawn(async move {
                 let (host, port) = takeover_pcf(pcf).await;
-                if let Err(e) = crate::sbi_path::retry_peer_update("UE policy update", || {
+                match crate::sbi_path::retry_peer_update("UE policy update", || {
                     crate::sbi_path::call_pcf_ue_policy_update_serving_amf(
                         &host,
                         port,
@@ -458,13 +504,131 @@ impl NgapServer {
                 })
                 .await
                 {
-                    log::warn!(
-                        "UE {amf_ue_ngap_id}: UE policy association {pol_asso_id} not pointed \
-                         at the new serving AMF: {e}"
-                    );
+                    Ok(()) => adopt.then_some(crate::sbi_offload::SbiOutcome::PolicyTokenAdopted(
+                        PolicyTokenAnswer {
+                            supi,
+                            kind: PolicyKind::Ue,
+                            pol_asso_id,
+                            token,
+                        },
+                    )),
+                    Err(e) => {
+                        log::warn!(
+                            "UE {amf_ue_ngap_id}: UE policy association {pol_asso_id} not \
+                             pointed at the new serving AMF: {e}"
+                        );
+                        None
+                    }
                 }
-                None
             });
+        }
+    }
+
+    /// #1642: the PCF accepted a policy association's tokened `notificationUri`:
+    /// the token is the association's, and its token-less URI is no longer served.
+    /// Nothing changes when the UE no longer holds that association, or it got a
+    /// token meanwhile.
+    pub(super) fn apply_policy_token(&mut self, answer: PolicyTokenAnswer) {
+        let Some((id, _)) = self.ue_auth_state.find_by_supi(&answer.supi) else {
+            return;
+        };
+        let adopted = self
+            .ue_auth_state
+            .with_mut(id, |s| {
+                let (held_id, assoc) = match answer.kind {
+                    PolicyKind::Am => (&s.policy_association_id, &mut s.amf_ue.policy_association),
+                    PolicyKind::Ue => (
+                        &s.ue_policy_association_id,
+                        &mut s.amf_ue.ue_policy_association,
+                    ),
+                };
+                if held_id.as_deref() != Some(answer.pol_asso_id.as_str())
+                    || assoc.notify_token.is_some()
+                {
+                    return false;
+                }
+                assoc.notify_token = Some(answer.token);
+                true
+            })
+            .unwrap_or(false);
+        if adopted {
+            log::info!(
+                "UE {id}: {:?} policy association {} moved to a tokened notificationUri",
+                answer.kind,
+                answer.pol_asso_id
+            );
+            self.clear_pre_1518_once_migrated(id);
+        }
+    }
+
+    /// #1642: the SMF accepted a session's tokened `smContextStatusUri`: its nonce
+    /// is recorded, and the session's token-less URI is no longer served. Nothing
+    /// changes when the session is gone, is another SM context now, or was given a
+    /// nonce meanwhile (a retry's or another update's answer: the first accepted
+    /// wins), or the UE no longer holds the key the token was derived with.
+    pub(super) fn apply_status_token(&mut self, answer: StatusTokenAnswer) {
+        let Some((id, _)) = self.ue_auth_state.find_by_supi(&answer.supi) else {
+            return;
+        };
+        if self.sm_context_refs.get(&(id, answer.psi)) != Some(&answer.sm_ref) {
+            return;
+        }
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        let Some(mut sess) = guard
+            .sess_find_by_psi(id, answer.psi)
+            .filter(|sess| sess.sm_context_status_nonce.is_none())
+        else {
+            return;
+        };
+        let key_held = self.ue_auth_state.get(id).is_some_and(|s| {
+            s.amf_ue.sm_context_status_key.as_deref() == Some(answer.key.as_str())
+        });
+        if !key_held {
+            log::warn!(
+                "UE {id}: PSI {}'s tokened smContextStatusUri was accepted under a key the \
+                 UE no longer holds; the session keeps the URI it had",
+                answer.psi
+            );
+            return;
+        }
+        sess.sm_context_status_nonce = Some(answer.nonce);
+        guard.sess_update(&sess);
+        drop(guard);
+        log::info!(
+            "UE {id}: PSI {} moved to a tokened smContextStatusUri",
+            answer.psi
+        );
+        self.clear_pre_1518_once_migrated(id);
+    }
+
+    /// #1642: a UE context from before #1518 stops being one once none of its
+    /// callbacks is token-less: every policy association it holds has a token, and
+    /// every session a nonce. Its record is then written as tokened.
+    fn clear_pre_1518_once_migrated(&mut self, id: u64) {
+        let Some(state) = self.ue_auth_state.get(id) else {
+            return;
+        };
+        if !state.amf_ue.pre_1518_callbacks {
+            return;
+        }
+        let policies = (state.policy_association_id.is_none()
+            || state.amf_ue.policy_association.notify_token.is_some())
+            && (state.ue_policy_association_id.is_none()
+                || state.amf_ue.ue_policy_association.notify_token.is_some());
+        let sessions = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            self.ue_sm_contexts(id).iter().all(|(psi, ..)| {
+                guard
+                    .sess_find_by_psi(id, *psi)
+                    .is_none_or(|sess| sess.sm_context_status_nonce.is_some())
+            })
+        };
+        if policies && sessions && state.amf_ue.sm_context_status_key.is_some() {
+            self.ue_auth_state
+                .with_mut(id, |s| s.amf_ue.pre_1518_callbacks = false);
+            log::info!("UE {id}: every callback is tokened now; no longer a pre-#1518 context");
         }
     }
 
@@ -523,37 +687,53 @@ impl NgapServer {
         };
         let (instance, amf_id_hex, guami_mcc, guami_mnc, serving_mcc, serving_mnc) =
             self.serving_identity(state);
-        for (psi, sm_ref, host, port) in self.ue_sm_contexts(amf_ue_ngap_id) {
-            // #1518: this update re-issues the session's smContextStatusUri. For a UE
-            // context with a key, a session that has no nonce yet gets one here, so
-            // the URI is tokened. A context restored from before #1518 has no key: its
-            // sessions keep the token-less URI, which is served for it, until #1642
-            // moves them over once the SMF has accepted the new URI.
-            let legacy_ue = state.amf_ue.pre_1518_callbacks;
-            let nonce = state.amf_ue.sm_context_status_key.as_ref().and_then(|_| {
+        // #1518: this update re-issues each session's smContextStatusUri, tokened.
+        // #1642: a session without a nonce (made before #1518, or carried over
+        // without one) is given a fresh one here, recorded only once that SMF
+        // accepted the URI (`apply_status_token`). Until then the session's
+        // token-less URI stays served for a pre-#1518 context, since its SMF may
+        // still notify it. A UE without a key (a context from before #1518) has
+        // one minted and stored now, as at its first new session: a key admits
+        // nothing without a session's nonce, and holding it from the start means
+        // every session's token, accepted in any order, is derived from the key
+        // the UE keeps.
+        let contexts = self.ue_sm_contexts(amf_ue_ngap_id);
+        if contexts.is_empty() {
+            return;
+        }
+        let have_key = state.amf_ue.sm_context_status_key.is_some();
+        let Some(key) = self.sm_context_status_key_for_new_session(amf_ue_ngap_id) else {
+            return;
+        };
+        for (psi, sm_ref, host, port) in contexts {
+            let held = {
                 let ctx = crate::context::amf_self();
                 let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
-                let mut sess = guard.sess_find_by_psi(amf_ue_ngap_id, psi)?;
-                // A legacy session of a pre-#1518 context keeps its token-less URI
-                // until #1642 moves it over (the token adopted on the SMF's 2xx).
-                if sess.sm_context_status_nonce.is_none() && !legacy_ue {
-                    sess.sm_context_status_nonce = Some(crate::sbi_path::new_callback_token());
-                    guard.sess_update(&sess);
+                guard
+                    .sess_find_by_psi(amf_ue_ngap_id, psi)
+                    .and_then(|sess| sess.sm_context_status_nonce)
+                    .filter(|_| have_key)
+            };
+            let (nonce, adopt) = match held {
+                Some(nonce) => (nonce, None),
+                None => {
+                    let nonce = crate::sbi_path::new_callback_token();
+                    let adopt = StatusTokenAnswer {
+                        supi: supi.clone(),
+                        psi,
+                        sm_ref: sm_ref.clone(),
+                        key: key.clone(),
+                        nonce: nonce.clone(),
+                    };
+                    (nonce, Some(adopt))
                 }
-                sess.sm_context_status_nonce
-            });
+            };
             let serving = serde_json::json!({
                 "servingNfId": instance,
                 "smContextStatusUri": crate::sbi_path::sm_context_status_uri(
                     &supi,
                     psi,
-                    state
-                        .amf_ue
-                        .sm_context_status_key
-                        .as_deref()
-                        .zip(nonce.as_deref())
-                        .map(|(key, nonce)| crate::sbi_path::sm_context_status_token(key, psi, nonce))
-                        .as_deref(),
+                    Some(&crate::sbi_path::sm_context_status_token(&key, psi, &nonce)),
                 ),
                 "guami": {
                     "plmnId": { "mcc": guami_mcc, "mnc": guami_mnc },
@@ -570,6 +750,7 @@ impl NgapServer {
                 serving,
                 attempt: 1,
                 limits: at_restore.then(|| Arc::clone(&self.restore_peer_limits)),
+                adopt,
             };
             self.sbi_offload
                 .spawn_keyed_requeueable((amf_ue_ngap_id, psi), update.job(None));
@@ -847,6 +1028,8 @@ struct ServingUpdate {
     attempt: u32,
     /// A restore-time update's limits.
     limits: Option<Arc<RestorePeerLimits>>,
+    /// #1642: the token this update re-issues, recorded only when the SMF accepts it.
+    adopt: Option<StatusTokenAnswer>,
 }
 
 impl ServingUpdate {
@@ -888,7 +1071,9 @@ impl ServingUpdate {
         .await;
         drop(permits);
         let Err(e) = result else {
-            return None;
+            return self
+                .adopt
+                .map(crate::sbi_offload::SbiOutcome::StatusTokenAdopted);
         };
         let what = format!("UE {amf_ue_ngap_id}: PSI {psi}'s SMF serving-AMF update");
         match crate::sbi_path::peer_update_retry_wait(self.attempt, &e) {

@@ -12291,6 +12291,12 @@ impl NgapServer {
                 crate::sbi_offload::SbiOutcome::DeregOwner(answer) => {
                     Box::pin(self.apply_dereg_owner(answer)).await;
                 }
+                crate::sbi_offload::SbiOutcome::PolicyTokenAdopted(answer) => {
+                    self.apply_policy_token(answer);
+                }
+                crate::sbi_offload::SbiOutcome::StatusTokenAdopted(answer) => {
+                    self.apply_status_token(answer);
+                }
             }
         }
     }
