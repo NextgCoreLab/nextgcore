@@ -1068,55 +1068,120 @@ pub fn post_notification(notify_uri: String, payload: Value) {
 // Change-notification builders/dispatchers (spec payload shapes)
 // ---------------------------------------------------------------------------
 
-/// TS 29.505 DataChangeNotify to subscription-data subscribers whose
-/// monitoredResourceUris cover the changed resource (or whose ueId matches).
+/// The members of a TS 29.505 `AuthenticationSubscription` (§5.4.2.2) that are key
+/// material: the subscriber's long-term key K and the operator keys OPc and TOPc
+/// (#1797). They are read by the UDM over the authentication-subscription GET; TS
+/// 33.501 §6.1.1 keeps K inside the ARPF/UDM, so no notification may carry them.
+pub const KEY_MATERIAL_MEMBERS: [&str; 3] = ["encPermanentKey", "encOpcKey", "encTopcKey"];
+
+/// Whether `changed_path` is a UE's authentication subscription (TS 29.505 §5.2.2),
+/// the resource that holds key material.
+fn is_authentication_subscription(changed_path: &str) -> bool {
+    changed_path
+        .trim_end_matches('/')
+        .ends_with("/authentication-data/authentication-subscription")
+}
+
+/// `v` with every [`KEY_MATERIAL_MEMBERS`] member removed, at any depth.
+fn without_key_material(v: &Value) -> Value {
+    match v {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(k, _)| !KEY_MATERIAL_MEMBERS.contains(&k.as_str()))
+                .map(|(k, v)| (k.clone(), without_key_material(v)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(without_key_material).collect()),
+        other => other.clone(),
+    }
+}
+
+/// The `newValue` a DataChangeNotify may carry for a change of `changed_path` to `v`
+/// (#1797). An authentication subscription carries none: the ChangeItem says the
+/// resource changed (`newValue` is optional, TS 29.571 §5.2.4.8), and a consumer
+/// entitled to it reads it with its own authorization. Anything else carries `v`
+/// without key material, as defence in depth.
+pub fn notified_value(changed_path: &str, v: &Value) -> Option<Value> {
+    (!is_authentication_subscription(changed_path)).then(|| without_key_material(v))
+}
+
+/// Whether subscription-data subscription `s` is told of a change to `changed_path`
+/// of `ue_id` (#1797): one of its `monitoredResourceUris` covers the path, and its
+/// `ueId`, when it names one, is this UE. `monitoredResourceUris` is mandatory and
+/// says what the subscription monitors (TS 29.505 §5.4.2.5); a `ueId` narrows it to
+/// a UE and never widens it to every resource of that UE.
+fn subscription_data_sub_covers(s: &StoredSub, ue_id: &str, changed_path: &str) -> bool {
+    let ue_ok = s
+        .body
+        .get("ueId")
+        .and_then(Value::as_str)
+        .is_none_or(|ue| ue == ue_id);
+    let uri_match = s
+        .body
+        .get("monitoredResourceUris")
+        .and_then(Value::as_array)
+        .is_some_and(|uris| {
+            uris.iter()
+                .filter_map(Value::as_str)
+                .any(|u| uri_covers(u, changed_path))
+        });
+    ue_ok && uri_match
+}
+
+/// The TS 29.505 §5.4.2.6 `DataChangeNotify` telling `sub` that `changed_path` of
+/// `ue_id` changed to `new_value` (`None`: removed).
 ///
 /// Payload shape strictly follows TS 29.505 §5.4.2.6 DataChangeNotify +
 /// NotifyItem/ChangeItem: only `ueId`, optional `originalCallbackReference`,
 /// and `notifyItems[]` with `resourceId`/`changes` are emitted.
 /// Non-standard members such as `subscriptionDataSubscriptions` are NOT
-/// included (udrd-11).
+/// included (udrd-11). Key material is never included (#1797, [`notified_value`]).
+pub fn subscription_data_change_notify(
+    sub: &StoredSub,
+    ue_id: &str,
+    changed_path: &str,
+    new_value: Option<&Value>,
+) -> Value {
+    // TS 29.571 §5.2.4.8: ChangeItem.path is MANDATORY. Use "" (whole
+    // resource, per the ChangeItem NOTE / RFC 6901) for a full-resource
+    // replace or remove.
+    let change = match new_value {
+        Some(v) => match notified_value(changed_path, v) {
+            Some(nv) => serde_json::json!({"op": "REPLACE", "path": "", "newValue": nv}),
+            None => serde_json::json!({"op": "REPLACE", "path": ""}),
+        },
+        None => serde_json::json!({"op": "REMOVE", "path": ""}),
+    };
+    // `originalCallbackReference` is conditional per TS 29.505 DataChangeNotify:
+    // include it only when the subscription body carried a `callbackReference`.
+    let mut payload_map = serde_json::Map::new();
+    payload_map.insert("ueId".to_string(), Value::String(ue_id.to_string()));
+    if let Some(cb) = sub.body.get("callbackReference").and_then(Value::as_str) {
+        payload_map.insert(
+            "originalCallbackReference".to_string(),
+            serde_json::json!([cb]),
+        );
+    }
+    payload_map.insert(
+        "notifyItems".to_string(),
+        serde_json::json!([{
+            "resourceId": changed_path,
+            "changes": [change]
+        }]),
+    );
+    Value::Object(payload_map)
+}
+
+/// TS 29.505 DataChangeNotify to the subscription-data subscribers that monitor the
+/// changed resource ([`subscription_data_sub_covers`]), built by
+/// [`subscription_data_change_notify`].
 pub fn notify_subscription_data_change(ue_id: &str, changed_path: &str, new_value: Option<&Value>) {
     let subs = store().subs_matching(SubKind::SubscriptionData, |s| {
-        let ue_match = s.body.get("ueId").and_then(Value::as_str) == Some(ue_id);
-        let uri_match = s
-            .body
-            .get("monitoredResourceUris")
-            .and_then(Value::as_array)
-            .is_some_and(|uris| {
-                uris.iter()
-                    .filter_map(Value::as_str)
-                    .any(|u| uri_covers(u, changed_path))
-            });
-        ue_match || uri_match
+        subscription_data_sub_covers(s, ue_id, changed_path)
     });
     for sub in subs {
-        // TS 29.571 §5.2.4.8: ChangeItem.path is MANDATORY. Use "" (whole
-        // resource, per the ChangeItem NOTE / RFC 6901) for a full-resource
-        // replace or remove.
-        let change = match new_value {
-            Some(v) => serde_json::json!({"op": "REPLACE", "path": "", "newValue": v}),
-            None => serde_json::json!({"op": "REMOVE", "path": ""}),
-        };
-        // `originalCallbackReference` is conditional per TS 29.505 DataChangeNotify:
-        // include it only when the subscription body carried a `callbackReference`.
-        let orig_cb = sub.body.get("callbackReference").and_then(Value::as_str);
-        let mut payload_map = serde_json::Map::new();
-        payload_map.insert("ueId".to_string(), Value::String(ue_id.to_string()));
-        if let Some(cb) = orig_cb {
-            payload_map.insert(
-                "originalCallbackReference".to_string(),
-                serde_json::json!([cb]),
-            );
-        }
-        payload_map.insert(
-            "notifyItems".to_string(),
-            serde_json::json!([{
-                "resourceId": changed_path,
-                "changes": [change]
-            }]),
-        );
-        post_notification(sub.notify_uri.clone(), Value::Object(payload_map));
+        let payload = subscription_data_change_notify(&sub, ue_id, changed_path, new_value);
+        post_notification(sub.notify_uri.clone(), payload);
     }
 }
 
