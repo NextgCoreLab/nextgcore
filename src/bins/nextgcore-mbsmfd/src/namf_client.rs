@@ -778,6 +778,7 @@ mod tests {
             nf_instance_id: None,
             context_ref: "7".to_string(),
             notify_token: String::new(),
+            tmgi: None,
         };
         (server, context, deletes, arrived, release)
     }
@@ -854,7 +855,7 @@ mod tests {
     ///
     /// REVERT-VERIFIED: with the `unpark` call removed from `record_amf_context`,
     /// "recording the reused context unparks its delete" fails; with the
-    /// `held_by_a_live_session` check removed from `reconcile_once`, the AMF sees
+    /// in-use check removed from `delete_in_lane`, the AMF sees
     /// the delete ("the live context is not deleted").
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_parked_delete_spares_a_context_a_live_session_reuses_1817() {
@@ -966,6 +967,7 @@ mod tests {
                 nf_instance_id: None,
                 context_ref: format!("hole-{n}"),
                 notify_token: String::new(),
+                tmgi: None,
             })
             .collect();
         crate::reconcile::park(parked);
@@ -983,6 +985,179 @@ mod tests {
         );
         crate::reconcile::clear_for_test();
         hole.abort();
+    }
+
+    /// **#1854**: a ContextCreate for session B lands while session A's ContextDelete
+    /// for the same TMGI is in flight at the (real, TMGI-idempotent) AMF. B's create
+    /// waits for the delete in their (AMF, TMGI) lane, so the AMF hands it a FRESH
+    /// context rather than A's, and B's recorded context is live at the AMF
+    /// afterwards. No lane is left behind.
+    ///
+    /// REVERT-VERIFIED: with the create taking no lane, B is handed A's context,
+    /// the delete then removes it, and "B's context is live at the AMF" fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_create_racing_a_delete_on_one_tmgi_gets_a_live_context_1854() {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        let _g = nextgcore_amfd::test_support::MBS_CONTEXT_LOCK.lock().await;
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        // #1796: the AMF answers ContextCreate on the NG-RAN's response.
+        let _ngap = stand_in_ngap();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        nextgcore_amfd::test_support::init_context();
+        crate::mbsmf_context_init(256);
+        crate::mbsmf_self()
+            .read()
+            .unwrap()
+            .set_amf_notify_base("http://127.0.0.1:1");
+        // The real amfd handler, its ContextDelete held 400 ms on the way in.
+        let arrived = std::sync::Arc::new(tokio::sync::Notify::new());
+        let a = arrived.clone();
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let amf_server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        amf_server
+            .start(move |req: nextgcore_sbi::message::SbiRequest| {
+                let a = a.clone();
+                async move {
+                    if req.header.method == "DELETE" {
+                        a.notify_one();
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                    }
+                    nextgcore_amfd::namf_request_handler(req).await
+                }
+            })
+            .await
+            .expect("AMF starts");
+        let amf = DiscoveredAmf {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            nf_instance_id: None,
+        };
+        let tmgi = tmgi_1758([0x05, 0x18, 0x54]);
+        let ctx = crate::mbsmf_self();
+        let session = |ctx: &std::sync::Arc<std::sync::RwLock<crate::MbSmfContext>>| {
+            ctx.read()
+                .unwrap()
+                .session_add(tmgi.clone(), crate::MbsSessionType::Broadcast)
+                .expect("session")
+        };
+        let a_session = session(&ctx);
+        let a_ref = crate::create_amf_mbs_context(a_session.id, tmgi.clone(), amf.clone(), leg())
+            .await
+            .expect("A's context");
+
+        // A is released; its ContextDelete is held at the AMF.
+        let a_id = format!("mbs-sess-{}", a_session.id);
+        let release = tokio::spawn(async move { crate::handle_mbs_session_release(&a_id).await });
+        arrived.notified().await;
+        // B, on the same TMGI, is created while that delete is in flight.
+        let b_session = session(&ctx);
+        let b_ref = crate::create_amf_mbs_context(b_session.id, tmgi.clone(), amf.clone(), leg())
+            .await
+            .expect("B's context");
+        release.await.expect("release");
+
+        // #1856: the ref is `<epoch>-<id>`.
+        let live = nextgcore_amfd::ngap_mcast::parse_context_ref(&b_ref)
+            .and_then(|r| nextgcore_amfd::context::amf_mcast().broadcast_context_find(r));
+        assert!(
+            live.is_some(),
+            "B's context is live at the AMF (A's was {a_ref}, B's is {b_ref})"
+        );
+        assert_eq!(
+            crate::lane::count_for_port(addr.port()),
+            0,
+            "no lane is left behind"
+        );
+        ctx.read().unwrap().take_amf_contexts(b_session.id);
+        ctx.read().unwrap().session_remove(b_session.id);
+    }
+
+    /// **#1854**, the other order: session B's ContextCreate on the TMGI takes the
+    /// lane first (the AMF holds it), and released session A's ContextDelete waits
+    /// behind it. B is handed A's context (the AMF is idempotent on the TMGI) and
+    /// records it, so A's delete, in the lane, sees B holding it and is not sent.
+    ///
+    /// REVERT-VERIFIED: with the in-use check removed from `delete_in_lane`, A's
+    /// delete removes B's live context ("B keeps the context A released").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_release_spares_the_context_a_later_session_holds_1854() {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        let _g = nextgcore_amfd::test_support::MBS_CONTEXT_LOCK.lock().await;
+        let _p = crate::reconcile::PENDING_TEST_LOCK.lock().await;
+        // #1796: the AMF answers ContextCreate on the NG-RAN's response.
+        let _ngap = stand_in_ngap();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        nextgcore_amfd::test_support::init_context();
+        crate::mbsmf_context_init(256);
+        crate::mbsmf_self()
+            .read()
+            .unwrap()
+            .set_amf_notify_base("http://127.0.0.1:1");
+        // The real amfd handler; once armed, the next ContextCreate is held 400 ms.
+        let arm = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let arrived = std::sync::Arc::new(tokio::sync::Notify::new());
+        let deletes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (ar, a2, d2) = (arm.clone(), arrived.clone(), deletes.clone());
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let amf_server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        amf_server
+            .start(move |req: nextgcore_sbi::message::SbiRequest| {
+                let (ar, a2, d2) = (ar.clone(), a2.clone(), d2.clone());
+                async move {
+                    if req.header.method == "DELETE" {
+                        d2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    if req.header.method == "POST"
+                        && ar.swap(false, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        a2.notify_one();
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                    }
+                    nextgcore_amfd::namf_request_handler(req).await
+                }
+            })
+            .await
+            .expect("AMF starts");
+        let amf = DiscoveredAmf {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            nf_instance_id: None,
+        };
+        let tmgi = tmgi_1758([0x06, 0x18, 0x54]);
+        let ctx = crate::mbsmf_self();
+        let a = ctx
+            .read()
+            .unwrap()
+            .session_add(tmgi.clone(), crate::MbsSessionType::Broadcast)
+            .expect("A");
+        let a_ref = crate::create_amf_mbs_context(a.id, tmgi.clone(), amf.clone(), leg())
+            .await
+            .expect("A's context");
+        // A's release, up to its ContextDelete: removed here, contexts taken.
+        ctx.read().unwrap().session_remove(a.id);
+        let a_contexts = ctx.read().unwrap().take_amf_contexts(a.id);
+        // B's ContextCreate takes the lane first; the AMF holds it.
+        let b = ctx
+            .read()
+            .unwrap()
+            .session_add(tmgi.clone(), crate::MbsSessionType::Broadcast)
+            .expect("B");
+        arm.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (b_id, b_tmgi, b_amf) = (b.id, tmgi.clone(), amf.clone());
+        let create = tokio::spawn(crate::create_amf_mbs_context(b_id, b_tmgi, b_amf, leg()));
+        arrived.notified().await;
+        // A's delete now waits behind B's create in the lane.
+        let release = tokio::spawn(crate::release_amf_contexts(a_contexts));
+        let b_ref = create.await.expect("create").expect("B's context");
+        release.await.expect("release");
+        assert_eq!(a_ref, b_ref, "the AMF handed B the context A held");
+        // #1856: the ref is `<epoch>-<id>`.
+        let live = nextgcore_amfd::ngap_mcast::parse_context_ref(&b_ref)
+            .and_then(|r| nextgcore_amfd::context::amf_mcast().broadcast_context_find(r));
+        assert!(live.is_some(), "B keeps the context A released");
+        assert_eq!(deletes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        ctx.read().unwrap().take_amf_contexts(b.id);
+        ctx.read().unwrap().session_remove(b.id);
     }
 
     /// #1758 (check 3): a session release whose consumer disconnects while the AMF
@@ -1207,6 +1382,7 @@ mod tests {
             nf_instance_id: None,
             context_ref,
             notify_token: String::new(),
+            tmgi: None,
         };
         crate::TEST_OAUTH2_CLIENT
             .scope(oauth2, async {

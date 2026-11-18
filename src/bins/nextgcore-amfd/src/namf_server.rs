@@ -1090,6 +1090,9 @@ fn handle_ue_policy_notify_callback(
 ///   change this AMF does not apply (DECISIONS 2026-11-18-030000), never a 204. The check, the changes and the
 ///   derived fields are one step under the store's lock, so a concurrent
 ///   re-subscription cannot interleave and nothing is left half applied.
+/// - An applied change of the UE-AMBR queues the UE for a UE Context Modification
+///   at NG-RAN (#1776, TS 23.502 §4.5.1), which the NGAP task sends if the UE is
+///   CM-CONNECTED.
 fn handle_sdm_notify_callback(
     supi: &str,
     token: Option<&str>,
@@ -1126,25 +1129,39 @@ fn handle_sdm_notify_callback(
             return None;
         }
         let current = crate::sdm_notify::current_am_data(&state.amf_ue);
-        // CM-CONNECTED as `ue_ng_connected` reads it, under the same lock.
-        let cm_connected = !state.is_cm_idle() && state.is_bound();
         Some(
-            crate::sdm_notify::applied_am_data(
-                supi,
-                &current,
-                state.sdm_subscription_id(),
-                &body,
-                cm_connected,
-            )
-            .map(|doc| crate::sdm_notify::adopt_am_data(supi, &mut state.amf_ue, doc)),
+            crate::sdm_notify::applied_am_data(supi, &current, state.sdm_subscription_id(), &body)
+                .map(|doc| {
+                    let before = (state.amf_ue.ue_ambr.downlink, state.amf_ue.ue_ambr.uplink);
+                    crate::sdm_notify::adopt_am_data(supi, &mut state.amf_ue, doc);
+                    before != (state.amf_ue.ue_ambr.downlink, state.amf_ue.ue_ambr.uplink)
+                }),
         )
     });
+    // #1776, TS 23.502 §4.5.1: a changed UE-AMBR is the UE context at NG-RAN to
+    // modify. Queued for the NGAP task, which owns SCTP and reads the CM state at
+    // send time: a CM-CONNECTED UE's node gets a UE CONTEXT MODIFICATION REQUEST
+    // with the UE-AMBR then held; for a CM-IDLE UE nothing is sent, and its next
+    // Initial Context Setup carries it. Queued whatever the CM state now, so a UE
+    // that connects before the drain, on an Initial Context Setup built from what it
+    // held before this change, is still brought up to date. Only an applied change
+    // is queued, and a retry that changes nothing queues nothing.
+    if let Some(Some(Ok(true))) = outcome {
+        guard.ue_ambr_modification_add(ue.id);
+    }
     drop(guard);
     match outcome {
         None => context_not_found(supi),
         Some(None) => unknown_callback_token(supi, "SDM data change"),
-        Some(Some(Ok(()))) => {
-            log::info!("[{supi}] Nudm_SDM data change notification applied to the am-data");
+        Some(Some(Ok(ue_ambr_changed))) => {
+            log::info!(
+                "[{supi}] Nudm_SDM data change notification applied to the am-data{}",
+                if ue_ambr_changed {
+                    "; the UE-AMBR changed, queued for NG-RAN (UE Context Modification)"
+                } else {
+                    ""
+                }
+            );
             SbiResponse::no_content()
         }
         Some(Some(Err(refusal))) => {
@@ -5243,7 +5260,12 @@ fn try_positioning_relay(
         // notifies it too (TS 29.518 §5.2.2.3.1), and join-or-start is one step under
         // the paging-map lock, so a page another transfer queues meanwhile is joined,
         // never overwritten.
-        let Some(location) = crate::namf_handler::page_idle_ue_for_positioning(ue, failure_uri)
+        // #1858: this transfer's own resource id, so its failure notification is
+        // its own even when another LMF transfer shares the callback URI. The same
+        // transfer retried gets the same id, and is recorded once.
+        let transfer_id = positioning_transfer_id(body, &downlinks);
+        let Some(location) =
+            crate::namf_handler::page_idle_ue_for_positioning(ue, failure_uri, &transfer_id)
         else {
             log::info!(
                 "[{ue_context_id}] LCS: the page for the UE already carries {} other \
@@ -5280,6 +5302,30 @@ fn try_positioning_relay(
         Ok(resp) => resp,
         Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
     })
+}
+
+/// #1858: the identity of a paged positioning transfer, the `{n1N2MessageId}` of
+/// the Location it is answered with (TS 29.518 §5.2.2.3.1) and of the
+/// n1n2MsgDataUri its failure notification names. Derived from the request itself
+/// (its JSON part and the LPP/NRPPa payloads), so a retry of the same transfer
+/// maps to the same resource and is recorded once, while two transfers with
+/// different content are two resources, even when they share one
+/// n1n2FailureTxfNotifURI.
+fn positioning_transfer_id(body: &Value, downlinks: &[PendingPositioningDl]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    body.to_string().hash(&mut h);
+    for dl in downlinks {
+        match &dl.kind {
+            PositioningDlKind::LppToUe { lpp_pdu } => (0u8, lpp_pdu).hash(&mut h),
+            PositioningDlKind::NrppaToGnb {
+                routing_id,
+                nrppa_pdu,
+            } => (1u8, routing_id, nrppa_pdu).hash(&mut h),
+            PositioningDlKind::UePolicyToUe { updp_pdu } => (2u8, updp_pdu).hash(&mut h),
+        }
+    }
+    format!("lcs-{:016x}", h.finish())
 }
 
 /// UPDP (UE policy) downlink relay — Wave-6 E5 (TS 29.525 §4.2.2.2: the PCF
@@ -11804,8 +11850,8 @@ mod tests {
     async fn a_tokened_sdm_data_change_notification_is_applied_to_the_ue_1748() {
         let _serial = dereg_queue_test_lock().lock().await;
         let supi = "imsi-001010000017481";
-        // CM-IDLE: a UE-AMBR change for a CM-CONNECTED UE is refused (see
-        // `a_ue_ambr_change_for_a_connected_ue_is_refused_and_applies_nothing_1748`).
+        // CM-IDLE (a CM-CONNECTED UE: see
+        // `a_ue_ambr_change_for_a_connected_ue_is_applied_and_queued_1776`).
         let _ue = setup_ue(supi, false, true);
         let body = am_data_change(
             supi,
@@ -11885,9 +11931,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refused_sdm_data_change_notification_applies_nothing_1748() {
         let _serial = dereg_queue_test_lock().lock().await;
+        let _queue = crate::test_support::UE_AMBR_MODIFICATION_LOCK.lock().await;
         let supi = "imsi-001010000017483";
-        // CM-IDLE, so the UE-AMBR change beside each refused one is applicable.
-        let _ue = setup_ue(supi, false, true);
+        // #1776: CM-CONNECTED, so the UE-AMBR change beside each refused one would be
+        // queued for a UE Context Modification were it applied.
+        let ue = setup_ue(supi, true, true);
+        let queued = || {
+            amf_self()
+                .read()
+                .expect("ctx")
+                .ue_ambr_modification_queued(ue.id)
+        };
         let token = format!("sdm-{supi}");
         let kept = json!({
             "subscribedUeAmbr": {"uplink": "1 Mbps", "downlink": "2 Mbps"},
@@ -11964,6 +12018,10 @@ mod tests {
             400
         );
         assert_eq!(sdm_view(supi), before, "nothing applied");
+        assert!(
+            !queued(),
+            "#1776: a refused notification queues no modification"
+        );
         // The S-NSSAIs unchanged: applied (the slices are compared, not the body).
         let same = am_data_change(
             supi,
@@ -11972,19 +12030,26 @@ mod tests {
         );
         assert_eq!(post_sdm_notify(supi, Some(&token), &same).await.status, 204);
         assert_eq!(sdm_view(supi).0, 9_000_000, "applied");
+        assert!(queued(), "#1776: and its UE-AMBR change queued");
+        amf_self()
+            .read()
+            .expect("ctx")
+            .ue_ambr_modification_remove_for(&[ue.id]);
     }
 
-    /// #1748 (R11 MAJOR-2, TS 23.502 §4.5.1): for a CM-CONNECTED UE, NG-RAN enforces
-    /// the UE-AMBR it was given, and this AMF does not send the UE Context
-    /// Modification that would move it, so a change of the subscribed UE-AMBR is
-    /// refused with 400 and nothing is applied, the GPSI change beside it included.
-    /// A change that leaves the UE-AMBR as it is is applied.
+    /// #1776 (lifts #1748 R11 MAJOR-2, TS 23.502 §4.5.1): a change of the subscribed
+    /// UE-AMBR for a CM-CONNECTED UE is applied and answered 204, with the GPSI
+    /// change beside it, and the UE is queued once for the NGAP task's UE Context
+    /// Modification. A change that leaves the UE-AMBR as it is (a GPSI-only change,
+    /// a retry of the same notification) queues nothing.
     ///
-    /// REVERT-VERIFIED: with `cm_connected` passed as `false` from the handler, the
-    /// refusal is a 204 and the UE-AMBR changes.
+    /// REVERT-VERIFIED: with the `ue_ambr_modification_add` call removed from the
+    /// handler, the "queued" assertion fails; with it made unconditional (any applied
+    /// change), the "a GPSI-only change" assertion fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_ue_ambr_change_for_a_connected_ue_is_refused_and_applies_nothing_1748() {
+    async fn a_ue_ambr_change_for_a_connected_ue_is_applied_and_queued_1776() {
         let _serial = dereg_queue_test_lock().lock().await;
+        let _queue = crate::test_support::UE_AMBR_MODIFICATION_LOCK.lock().await;
         let supi = "imsi-001010000017488";
         let ue = setup_ue(supi, true, true);
         {
@@ -11999,8 +12064,29 @@ mod tests {
             });
         }
         assert!(ue_ng_connected(&ue), "CM-CONNECTED");
-        let before = sdm_view(supi);
+        let queued = || {
+            amf_self()
+                .read()
+                .expect("ctx")
+                .ue_ambr_modification_queued(ue.id)
+        };
+        let dequeue = || {
+            amf_self()
+                .read()
+                .expect("ctx")
+                .ue_ambr_modification_remove_for(&[ue.id])
+        };
+        dequeue();
         let token = format!("sdm-{supi}");
+        let gpsi_only = am_data_change(
+            supi,
+            json!([{"op": "REPLACE", "path": "/gpsis", "newValue": ["msisdn-4917489"]}]),
+        );
+        assert_eq!(
+            post_sdm_notify(supi, Some(&token), &gpsi_only).await.status,
+            204
+        );
+        assert!(!queued(), "a GPSI-only change queues no modification");
         let body = am_data_change(
             supi,
             json!([
@@ -12010,18 +12096,15 @@ mod tests {
             ]),
         );
         let resp = post_sdm_notify(supi, Some(&token), &body).await;
-        assert_eq!(resp.status, 400, "{:?}", resp.http.content);
-        assert_eq!(problem_cause(&resp), "UNSPECIFIED_MSG_FAILURE");
-        assert_eq!(sdm_view(supi), before, "nothing applied");
-        let gpsi_only = am_data_change(
-            supi,
-            json!([{"op": "REPLACE", "path": "/gpsis", "newValue": ["msisdn-4917488"]}]),
-        );
-        assert_eq!(
-            post_sdm_notify(supi, Some(&token), &gpsi_only).await.status,
-            204
-        );
-        assert_eq!(sdm_view(supi).2.as_deref(), Some("msisdn-4917488"));
+        assert_eq!(resp.status, 204, "{:?}", resp.http.content);
+        let (ul, dl, gpsi, _, _) = sdm_view(supi);
+        assert_eq!((ul, dl), (5_000_000, 10_000_000), "the new UE-AMBR is held");
+        assert_eq!(gpsi.as_deref(), Some("msisdn-4917488"));
+        assert!(queued(), "queued for the UE Context Modification");
+        dequeue();
+        // The UDM's retry of the same notification: 204, and nothing more to send.
+        assert_eq!(post_sdm_notify(supi, Some(&token), &body).await.status, 204);
+        assert!(!queued(), "a retry queues no second modification");
     }
 
     /// #1748: a notification is acted on only with the UE's current SDM subscription

@@ -1449,6 +1449,18 @@ impl UdmContext {
         }
     }
 
+    /// Every SDM subscription (#1836: the state file holds them all).
+    pub fn sdm_subscriptions_all(&self) -> Vec<UdmSdmSubscription> {
+        match self.sdm_subscription_list.read() {
+            Ok(list) => {
+                let mut all: Vec<UdmSdmSubscription> = list.values().cloned().collect();
+                all.sort_by(|a, b| a.id.cmp(&b.id));
+                all
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Every EE subscription whose scope covers `supi` (#83).
     ///
     /// A subscription's `ue_identity` is a SUPI, a GPSI, an external group id or

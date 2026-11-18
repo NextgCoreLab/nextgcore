@@ -138,6 +138,10 @@ pub struct AmfMbsContext {
     /// #1796: the token ending the `notifyUri` this ContextCreate gave the AMF,
     /// by which its ContextStatusNotify is admitted and matched to the session.
     pub notify_token: String,
+    /// #1854: the TMGI it was created for, so its delete takes the same
+    /// (AMF, TMGI) lane as a create for that TMGI ([`crate::lane`]). `None` when
+    /// unknown.
+    pub tmgi: Option<Tmgi>,
 }
 
 /// #1796: the most AMF ContextStatusNotify tokens held at once. One is minted per
