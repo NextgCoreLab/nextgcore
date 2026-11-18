@@ -2359,6 +2359,47 @@ mod tests {
         });
     }
 
+    /// R24 (#1817 review): one pass sends for at most `MAX_PASS`. Against a
+    /// blackholed PCF the resources it does not reach are re-parked for the next.
+    ///
+    /// REVERT-VERIFIED: with the deadline check removed, the pass runs for every
+    /// resource's client timeout ("the pass is bounded").
+    #[test]
+    fn a_pass_against_a_blackholed_pcf_is_bounded_1817() {
+        let _g = lock_globals();
+        reset_context();
+        block_on(async {
+            // Accepts connections and never answers.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let hole = tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((s, _)) = listener.accept().await {
+                    held.push(s);
+                }
+            });
+            nextgcore_sbi::security::set_sbi_profile_override(
+                nextgcore_sbi::security::SbiProfile::Dev,
+            );
+            reset_actuation(Some(port));
+            for n in 0..6 {
+                let id = format!("hole-{n}");
+                actuation::record_app_session_for_test(&id, &format!("asc-{n}"));
+                reconcile::park(id);
+            }
+            let started = std::time::Instant::now();
+            assert_eq!(reconcile::reconcile_once().await, 0);
+            assert!(
+                started.elapsed() < reconcile::MAX_PASS + Duration::from_secs(4),
+                "the pass is bounded: {:?}",
+                started.elapsed()
+            );
+            assert_eq!(reconcile::pending_count(), 6, "every resource re-parked");
+            hole.abort();
+            reset_actuation(None);
+        });
+    }
+
     /// #1754 (check 3): a consumer that disconnects while the PCF holds its Create
     /// does not drop the Create: the late 201 is recorded against the stored
     /// configuration.

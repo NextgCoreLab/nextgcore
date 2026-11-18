@@ -33,7 +33,8 @@ pub const RECONCILE_PERIOD: Duration = Duration::from_secs(30);
 pub const RECONCILE_PERIOD: Duration = Duration::from_millis(20);
 
 /// `nextgcore_mbsmf_amf_context_delete_reconciled_total{result}`: parked deletes
-/// that the reconciler delivered (`deleted`) or evicted at the bound (`abandoned`).
+/// that the reconciler delivered (`deleted`), evicted at the bound (`abandoned`),
+/// or dropped because a live session holds the context again (`reused`, R24).
 pub static RECONCILED: nextgcore_metrics::nf::CounterFamily =
     nextgcore_metrics::nf::CounterFamily::new(
         "nextgcore_mbsmf_amf_context_delete_reconciled_total",
@@ -95,16 +96,80 @@ pub fn pending_count() -> usize {
     pending().lock().map(|s| s.len()).unwrap_or(0)
 }
 
-/// One reconcile pass: retry every parked delete once. A 2xx or 404 ends it; a
-/// failure re-parks it (behind anything parked meanwhile). Returns how many ended.
+/// R24: whether `a` and `b` name the same context at the same AMF (the instance
+/// id is not part of the AMF's resource).
+fn same_context(a: &AmfMbsContext, b: &AmfMbsContext) -> bool {
+    a.host == b.host && a.port == b.port && a.context_ref == b.context_ref
+}
+
+/// R24: whether a live MBS session holds `c`. The AMF's ContextCreate is
+/// idempotent on the TMGI, so a new session reusing a released one's TMGI is
+/// handed the SAME `mbsContextRef`; deleting it then would tear down the new
+/// session's live context.
+fn held_by_a_live_session(c: &AmfMbsContext) -> bool {
+    crate::mbsmf_self()
+        .read()
+        .is_ok_and(|ctx| ctx.amf_context_in_use(c))
+}
+
+/// R24: a session recorded `c` as its own: a parked delete of the same context is
+/// dropped, as it would delete that session's live context. Called by
+/// `record_amf_context` after the record is made.
+pub fn unpark(c: &AmfMbsContext) {
+    let removed = match pending().lock() {
+        Ok(mut set) => {
+            let before = set.len();
+            set.retain(|p| !same_context(p, c));
+            before - set.len()
+        }
+        Err(_) => 0,
+    };
+    if removed > 0 {
+        log::info!(
+            "MBS: AMF {}:{} MBS context {} is in use again; its parked ContextDelete is dropped",
+            c.host,
+            c.port,
+            c.context_ref
+        );
+        RECONCILED.inc(&["reused"]);
+    }
+}
+
+/// The longest one pass sends for. A pass against a blackholed AMF costs a client
+/// timeout per record, so past this the rest are re-parked for the next pass.
+#[cfg(not(test))]
+pub const MAX_PASS: Duration = Duration::from_secs(30);
+#[cfg(test)]
+pub const MAX_PASS: Duration = Duration::from_millis(500);
+
+/// One reconcile pass: retry parked deletes, oldest first, for at most
+/// [`MAX_PASS`]. A 2xx or 404 ends one; a failure, or not reaching it within the
+/// pass, re-parks it (ahead of anything parked meanwhile). A record a live session
+/// holds again is dropped, not sent (R24). Returns how many the AMF accepted.
 pub async fn reconcile_once() -> usize {
     let batch: Vec<AmfMbsContext> = match pending().lock() {
         Ok(mut set) => set.drain(..).collect(),
         Err(_) => return 0,
     };
+    let deadline = tokio::time::Instant::now() + MAX_PASS;
     let mut ended = 0;
     let mut still = Vec::new();
     for c in batch {
+        if tokio::time::Instant::now() >= deadline {
+            still.push(c);
+            continue;
+        }
+        if held_by_a_live_session(&c) {
+            log::info!(
+                "MBS: AMF {}:{} MBS context {} is in use again; its parked ContextDelete is \
+                 dropped",
+                c.host,
+                c.port,
+                c.context_ref
+            );
+            RECONCILED.inc(&["reused"]);
+            continue;
+        }
         match namf_client::context_delete(&c).await {
             ContextDeleteOutcome::Deleted | ContextDeleteOutcome::Gone => {
                 log::info!(
@@ -129,7 +194,15 @@ pub async fn reconcile_once() -> usize {
                 }
             }
             while set.len() > MAX_PENDING {
-                if set.pop_front().is_some() {
+                if let Some(old) = set.pop_front() {
+                    log::error!(
+                        "MBS: abandoning the ContextDelete of AMF {}:{} MBS context {}: {} \
+                         deletes are already pending",
+                        old.host,
+                        old.port,
+                        old.context_ref,
+                        MAX_PENDING
+                    );
                     RECONCILED.inc(&["abandoned"]);
                 }
             }

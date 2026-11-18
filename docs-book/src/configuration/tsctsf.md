@@ -197,8 +197,8 @@ source and anything relying on it in a deployment is relying on a shim.
 
 **A Delete the PCF never accepts is not forgotten (#1754, #1817).** A refused or
 undelivered Delete keeps the `appSessionId` and is retried 5 times (1, 2, 4, 8,
-16 s). After that it is parked and retried every 30 s until the PCF answers 2xx or
-404. At most 4096 are parked, and one more evicts (and forgets) the oldest, logged
+16 s). After that it is parked and retried every 30 s (one pass sends for at most
+30 s) until the PCF answers 2xx or 404. At most 4096 are parked, and one more evicts (and forgets) the oldest, logged
 at error. The `nextgcore_tsctsf_pcf_app_session_deletes_pending` gauge and
 `..._delete_reconciled_total{result}` counter are on `/metrics`
 (`NEXTGCORE_METRICS_BIND`, loopback by default, : `TSCTSF_METRICS_PORT`, 9090). The

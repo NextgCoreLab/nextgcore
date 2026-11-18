@@ -158,14 +158,14 @@ Each NF's `metrics.rs`. Every `result` is `success` for a 2xx answer, else `fail
 
 ### TSCTSF and MB-SMF delete reconcilers (#1817)
 
-`nextgcore-tsctsf` and `nextgcore-mbsmfd` serve `/metrics` on `NEXTGCORE_METRICS_BIND` (loopback by default) and `TSCTSF_METRICS_PORT` / `MBSMF_METRICS_PORT` (9090), with the shared families above plus their delete reconciler's. A delete toward a peer (the PCF's app session, the AMF's broadcast MBS context) that fails its first attempt and its five retries (about 31 s) is parked and retried every 30 s until the peer answers 2xx or 404. At most 4096 are parked; one more evicts the oldest.
+`nextgcore-tsctsf` and `nextgcore-mbsmfd` serve `/metrics` on `NEXTGCORE_METRICS_BIND` (loopback by default) and `TSCTSF_METRICS_PORT` / `MBSMF_METRICS_PORT` (9090), with the shared families above plus their delete reconciler's. A delete toward a peer (the PCF's app session, the AMF's broadcast MBS context) that fails its first attempt and its five retries (about 31 s) is parked and retried every 30 s until the peer answers 2xx or 404. At most 4096 are parked; one more evicts the oldest. One pass sends for at most 30 s, oldest first, and leaves the rest for the next pass, so against a blackholed peer (a 3 s client timeout per delete) a full set takes many passes to cycle. mbsmfd drops a parked ContextDelete, without sending it, once a live session holds that context again (the AMF hands a session reusing a TMGI the same `mbsContextRef`).
 
 | Metric | Type | Labels | Counts |
 |---|---|---|---|
 | `nextgcore_tsctsf_pcf_app_session_deletes_pending` | gauge | | Npcf_PolicyAuthorization_Deletes parked |
 | `nextgcore_tsctsf_pcf_app_session_delete_reconciled_total` | counter | `result` (`deleted`, `abandoned`) | parked Deletes the PCF accepted, or evicted at the bound |
 | `nextgcore_mbsmf_amf_context_deletes_pending` | gauge | | Namf_MBSBroadcast ContextDeletes parked |
-| `nextgcore_mbsmf_amf_context_delete_reconciled_total` | counter | `result` (`deleted`, `abandoned`) | parked ContextDeletes the AMF accepted, or evicted at the bound |
+| `nextgcore_mbsmf_amf_context_delete_reconciled_total` | counter | `result` (`deleted`, `abandoned`, `reused`) | parked ContextDeletes the AMF accepted, evicted at the bound, or dropped because a live session holds the context again |
 
 The parked set is in memory: neither daemon has a durable store, so a restart forgets it together with the sessions it belongs to.
 

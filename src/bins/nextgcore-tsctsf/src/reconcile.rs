@@ -94,17 +94,33 @@ pub fn pending_count() -> usize {
     pending().lock().map(|s| s.len()).unwrap_or(0)
 }
 
-/// One reconcile pass: retry every parked Delete once. A 2xx or 404 (or no
-/// `appSessionId` left to send) ends it; a failure re-parks it, ahead of anything
+/// The longest one pass sends for. A pass against a blackholed PCF costs a client
+/// timeout per resource, so past this the rest are re-parked for the next pass.
+#[cfg(not(test))]
+pub const MAX_PASS: Duration = Duration::from_secs(30);
+#[cfg(test)]
+pub const MAX_PASS: Duration = Duration::from_millis(500);
+
+/// One reconcile pass: retry parked Deletes, oldest first, for at most
+/// [`MAX_PASS`]. A 2xx or 404 (or no `appSessionId` left to send) ends one; a
+/// failure, or not reaching it within the pass, re-parks it, ahead of anything
 /// parked meanwhile. Returns how many the PCF accepted.
+///
+/// Unlike mbsmfd's, a parked id cannot come back into use: resource ids are
+/// UUIDs, never reissued.
 pub async fn reconcile_once() -> usize {
     let batch: Vec<String> = match pending().lock() {
         Ok(mut set) => set.drain(..).collect(),
         Err(_) => return 0,
     };
+    let deadline = tokio::time::Instant::now() + MAX_PASS;
     let mut deleted = 0;
     let mut still = Vec::new();
     for resource_id in batch {
+        if tokio::time::Instant::now() >= deadline {
+            still.push(resource_id);
+            continue;
+        }
         match crate::actuation::delete_once_for_reconciler(&resource_id).await {
             crate::actuation::DeleteOutcome::Deleted => {
                 log::info!("reconciler deleted the PCF app session of {resource_id}");

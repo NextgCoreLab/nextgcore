@@ -1017,6 +1017,20 @@ async fn release_amf_contexts(contexts: Vec<AmfMbsContext>) -> bool {
             tokio::time::sleep(delay).await;
             let mut still = Vec::new();
             for c in failed {
+                // R24: a session reusing the TMGI got this same context back.
+                if mbsmf_self()
+                    .read()
+                    .is_ok_and(|ctx| ctx.amf_context_in_use(&c))
+                {
+                    log::info!(
+                        "MBS: AMF {}:{} MBS context {} is in use again; its ContextDelete is \
+                         dropped",
+                        c.host,
+                        c.port,
+                        c.context_ref
+                    );
+                    continue;
+                }
                 if namf_client::context_delete(&c).await
                     == namf_client::ContextDeleteOutcome::Failed
                 {
