@@ -2346,7 +2346,13 @@ impl AmfContext {
         }
     }
 
-    pub fn paging_add(&self, ctx: PagingContext) -> bool {
+    /// Queue page `ctx` for its UE. A page already queued for the UE is replaced,
+    /// and what does not belong to the replaced transfer is carried over to `ctx`
+    /// under the same write lock (#1760 review): the LOCATION_REPORT subscriptions
+    /// waiting on it (`location_report_subs`), so none is left waiting on a page
+    /// that no longer exists, and `answered_by`, so a page a REGISTRATION REQUEST
+    /// already answered is not sent again and is still taken by its Accept (#1102).
+    pub fn paging_add(&self, mut ctx: PagingContext) -> bool {
         #[cfg(test)]
         self.assert_paging_map_lock_held();
         if let Ok(mut paging_map) = self.paging_map.write() {
@@ -2357,10 +2363,78 @@ impl AmfContext {
                 ctx.tmsi,
                 ctx.tac
             );
+            if let Some(old) = paging_map.remove(&id) {
+                for sub in old.location_report_subs {
+                    if !ctx.location_report_subs.contains(&sub) {
+                        ctx.location_report_subs.push(sub);
+                    }
+                }
+                if ctx.answered_by.is_none() {
+                    ctx.answered_by = old.answered_by;
+                }
+                log::info!(
+                    "[UE NGAP ID: {id}] the new page takes over the {} one queued for the UE",
+                    if old.location_only {
+                        "location-only"
+                    } else {
+                        "transfer"
+                    }
+                );
+            }
             paging_map.insert(id, ctx);
             return true;
         }
         false
+    }
+
+    /// #1760 review: join-or-create, as one operation under the paging-map write
+    /// lock. `subscription_id`'s first LOCATION_REPORT waits on the page queued for
+    /// `ctx`'s UE when there is one (`true`, `ctx` is dropped). Otherwise `ctx`,
+    /// which must be a [`PagingContext::location_only`] page, is queued with it
+    /// (`false`). No page another task queues meanwhile is overwritten.
+    pub fn paging_join_or_add_location(
+        &self,
+        mut ctx: PagingContext,
+        subscription_id: &str,
+    ) -> bool {
+        #[cfg(test)]
+        self.assert_paging_map_lock_held();
+        let mut paging_map = match self.paging_map.write() {
+            Ok(m) => m,
+            Err(e) => e.into_inner(),
+        };
+        if let Some(page) = paging_map.get_mut(&ctx.amf_ue_ngap_id) {
+            if !page
+                .location_report_subs
+                .iter()
+                .any(|s| s == subscription_id)
+            {
+                page.location_report_subs.push(subscription_id.to_string());
+            }
+            return true;
+        }
+        log::info!(
+            "[UE NGAP ID: {}] Paging initiated for a first LOCATION_REPORT (TMSI: 0x{:08x}, \
+             TAC: {})",
+            ctx.amf_ue_ngap_id,
+            ctx.tmsi,
+            ctx.tac
+        );
+        ctx.location_only = true;
+        ctx.location_report_subs = vec![subscription_id.to_string()];
+        paging_map.insert(ctx.amf_ue_ngap_id, ctx);
+        false
+    }
+
+    /// #749, #1760 review: whether a page queued for the UE holds a transfer, which
+    /// a second transfer must not overwrite. A [`PagingContext::location_only`] page
+    /// does not.
+    pub fn paging_holds_transfer(&self, amf_ue_ngap_id: u64) -> bool {
+        self.paging_map
+            .read()
+            .ok()
+            .and_then(|m| m.get(&amf_ue_ngap_id).map(|p| !p.location_only))
+            .unwrap_or(false)
     }
 
     /// Cancel paging for a UE (e.g., Service Request received)
@@ -2927,6 +3001,23 @@ impl AmfContext {
         Some(out)
     }
 
+    /// #1760 review: the page `subscription_id`'s first LOCATION_REPORT waited on
+    /// ended with nothing to report (its UE is gone). It is no longer pending, so the
+    /// fire points report to it again, from the UE's next registration on (#1716).
+    /// Its baseline is left unset. `false` when it is gone or was not pending.
+    pub fn event_subscription_abandon_first_location(&self, subscription_id: &str) -> bool {
+        let Ok(mut subs) = self.event_subscriptions.write() else {
+            return false;
+        };
+        match subs.get_mut(subscription_id) {
+            Some(sub) if sub.first_location_pending => {
+                sub.first_location_pending = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// #1760: a fire point's claim on ONE_TIME subscription `subscription_id`: it is
     /// removed, so the claimant's notification is its one report. `false` when it is
     /// gone already (another report claimed it).
@@ -2936,29 +3027,6 @@ impl AmfContext {
             .ok()
             .and_then(|mut subs| subs.remove(subscription_id))
             .is_some()
-    }
-
-    /// #1760: attach `subscription_id`'s pending first LOCATION_REPORT to the page
-    /// running for UE `amf_ue_ngap_id`. `false` when no page runs for it.
-    pub fn paging_add_location_report(&self, amf_ue_ngap_id: u64, subscription_id: &str) -> bool {
-        #[cfg(test)]
-        self.assert_paging_map_lock_held();
-        let Ok(mut paging_map) = self.paging_map.write() else {
-            return false;
-        };
-        match paging_map.get_mut(&amf_ue_ngap_id) {
-            Some(page) => {
-                if !page
-                    .location_report_subs
-                    .iter()
-                    .any(|s| s == subscription_id)
-                {
-                    page.location_report_subs.push(subscription_id.to_string());
-                }
-                true
-            }
-            None => false,
-        }
     }
 
     /// Find an event-exposure subscription by ID (clone-out, lock dropped)
@@ -5640,6 +5708,13 @@ pub struct PagingContext {
     /// reports to them: the current location when the UE answers, the last known
     /// one when it does not.
     pub location_report_subs: Vec<String>,
+    /// #1760 review: the page was started only for `location_report_subs`, and
+    /// carries no transfer (no N1, no N2, no session, no failure-notify URI). An
+    /// N1N2MessageTransfer, a UE-policy delivery or a queued downlink for the UE is
+    /// not refused because of it (TS 23.502 §4.2.3.3: a downlink-data request is
+    /// paged for), and takes it over ([`AmfContext::paging_add`]), keeping the
+    /// subscriptions that wait on it.
+    pub location_only: bool,
     /// #1643 review: the page carries only the SMF's N1 for `pdu_session_id`, an
     /// answer to the UE's own release or modification request. TS 23.502 §4.3.4.2
     /// step 4: the NAS message only. The UE's answer re-activates no user plane
@@ -5689,6 +5764,7 @@ impl Default for PagingContext {
             nwdaf_predicted: None,
             nwdaf_last_cell: None,
             location_report_subs: Vec::new(),
+            location_only: false,
         }
     }
 }
@@ -6814,6 +6890,81 @@ mod tests {
             Some(8)
         );
         assert_eq!(ctx.paging_count(), 0);
+    }
+
+    /// **#1760 review MAJOR-2 (b)**: a page and a LOCATION_REPORT subscription's page
+    /// never overwrite each other.
+    /// - A location subscription joins the transfer page queued for the UE in one
+    ///   operation: that page keeps its N2 and failure-notify URI.
+    /// - A transfer page queued over a location-only one takes it over and carries
+    ///   its waiting subscriptions and its `answered_by`.
+    /// - With no page queued, the location page is queued, `location_only`.
+    ///
+    /// REVERT-VERIFIED: with `paging_join_or_add_location` inserting unconditionally
+    /// (overwriting the transfer page), it fails on "joined"; with the
+    /// carry-over cut from `paging_add`, the subscription is dropped ("carried over").
+    #[test]
+    fn a_location_page_and_a_transfer_page_never_overwrite_each_other_1760() {
+        let mut ctx = AmfContext::new();
+        ctx.init(64, 1024, 4096);
+        let location_page = |id: u64| PagingContext {
+            amf_ue_ngap_id: id,
+            tmsi: id as u32,
+            ..Default::default()
+        };
+
+        // A transfer page first, then a location subscription for the same UE.
+        ctx.paging_add(PagingContext {
+            amf_ue_ngap_id: 1,
+            pending_n2: Some(vec![0xAB]),
+            pdu_session_id: Some(5),
+            failure_notify_uri: Some("http://smf/fail".to_string()),
+            ..Default::default()
+        });
+        assert!(
+            ctx.paging_join_or_add_location(location_page(1), "s1"),
+            "joined"
+        );
+        let p = ctx.paging_find(1).expect("paged");
+        assert_eq!(
+            p.pending_n2,
+            Some(vec![0xAB]),
+            "the transfer page keeps its N2"
+        );
+        assert_eq!(p.failure_notify_uri.as_deref(), Some("http://smf/fail"));
+        assert!(!p.location_only);
+        assert_eq!(p.location_report_subs, vec!["s1".to_string()]);
+        assert!(ctx.paging_holds_transfer(1));
+
+        // A location page first, then a transfer page.
+        assert!(
+            !ctx.paging_join_or_add_location(location_page(2), "s2"),
+            "queued"
+        );
+        let p = ctx.paging_find(2).expect("paged");
+        assert!(p.location_only);
+        assert!(
+            !ctx.paging_holds_transfer(2),
+            "a location-only page holds no transfer"
+        );
+        ctx.paging_mark_answered_by_s_tmsi(p.amf_set_id, p.amf_pointer, p.tmsi, 77);
+        assert_eq!(ctx.paging_find(2).and_then(|p| p.answered_by), Some(77));
+        ctx.paging_add(PagingContext {
+            amf_ue_ngap_id: 2,
+            pending_n2: Some(vec![0xCD]),
+            pdu_session_id: Some(6),
+            ..Default::default()
+        });
+        let p = ctx.paging_find(2).expect("paged");
+        assert_eq!(p.pending_n2, Some(vec![0xCD]));
+        assert!(!p.location_only);
+        assert_eq!(
+            p.location_report_subs,
+            vec!["s2".to_string()],
+            "carried over"
+        );
+        assert_eq!(p.answered_by, Some(77), "an answered page stays answered");
+        assert!(!ctx.paging_holds_transfer(3));
     }
 
     #[test]

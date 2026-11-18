@@ -3073,25 +3073,28 @@ fn location_report(ue: &AmfUe, last_known: bool) -> Value {
 /// #1760: page CM-IDLE `ue` for subscription `subscription_id`'s first
 /// LOCATION_REPORT. A page already running for the UE (for a downlink, or for
 /// another subscription) is joined rather than replaced, since it brings the UE back
-/// just the same.
+/// just the same. Otherwise a [`PagingContext::location_only`] page is started.
+///
+/// #1760 review: join-or-create is one operation under the paging-map write lock
+/// (`paging_join_or_add_location`), so a page another task queues between a check
+/// and an insert is never overwritten, and its N2 or failure-notify URI never lost.
+///
+/// [`PagingContext::location_only`]: crate::context::PagingContext::location_only
 pub(crate) fn page_for_first_location(ue: &AmfUe, subscription_id: &str) {
-    let ctx = amf_self();
-    let joined = ctx
+    let page = crate::namf_handler::idle_ue_paging_context(
+        ue,
+        None,
+        None,
+        crate::namf_handler::PagedN2::Setup,
+        None,
+        None,
+    );
+    let joined = amf_self()
         .read()
-        .is_ok_and(|g| g.paging_add_location_report(ue.id, subscription_id));
+        .unwrap_or_else(|e| e.into_inner())
+        .paging_join_or_add_location(page, subscription_id);
     if !joined {
-        crate::namf_handler::initiate_paging_for_idle_ue(
-            ue,
-            None,
-            None,
-            None,
-            crate::namf_handler::PagedN2::Setup,
-            None,
-            None,
-        );
-        if let Ok(g) = ctx.read() {
-            g.paging_add_location_report(ue.id, subscription_id);
-        }
+        crate::namf_handler::start_paging_nwdaf_hint(ue);
     }
     log::info!(
         "[{}] LOCATION_REPORT {subscription_id}: the UE is CM-IDLE, paging it for its \
@@ -3117,6 +3120,20 @@ pub(crate) fn first_locations_after_page(
         Some((ue, association)) => (ue.clone(), association, false),
         None => {
             let Some(ue) = paging.supi.as_deref().and_then(find_ue_by_context_id) else {
+                // #1760 review: there is no UE to report the location of. Each
+                // waiting subscription still stops waiting, or the fire points would
+                // skip it for good; its next report is the UE's next registration
+                // (#1716).
+                if let Ok(g) = amf_self().read() {
+                    for id in &paging.location_report_subs {
+                        if g.event_subscription_abandon_first_location(id) {
+                            log::info!(
+                                "LOCATION_REPORT {id}: the page ended and its UE is gone; \
+                                 nothing is reported, and the subscription waits no longer"
+                            );
+                        }
+                    }
+                }
                 return;
             };
             let association = amf_self()
