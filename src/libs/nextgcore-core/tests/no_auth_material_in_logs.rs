@@ -881,6 +881,12 @@ fn manual_debug_impls_redact_authentication_material() {
 /// `callback_reference`. A bare `uri` is not judged (it is mostly a request
 /// URI); a local that holds a callback is bound under a callback-style name.
 fn is_callback_uri(ident: &str) -> bool {
+    // #1867: a request's own URI (`request.header.uri`) IS a callback URI when
+    // the request is a notification (`.../dereg-notify/{token}`), and the code
+    // logging it rarely knows which, so it is judged like one.
+    if ident == "header.uri" || ident.ends_with(".header.uri") {
+        return true;
+    }
     let last = ident.rsplit('.').next().unwrap_or(ident);
     if !last.chars().any(|c| c.is_ascii_lowercase()) {
         return false; // a constant (`custom_header::CALLBACK`), not a URI value
@@ -1219,6 +1225,9 @@ fn the_callback_uri_scan_sees_its_shapes() {
         "ucmf_notification_uri",
         "notification_destination",
         "sm_context_status_uri",
+        // #1867: a request URI, which may be a callback's.
+        "request.header.uri",
+        "resend.header.uri",
     ] {
         assert!(is_callback_uri(flagged), "{flagged}");
     }

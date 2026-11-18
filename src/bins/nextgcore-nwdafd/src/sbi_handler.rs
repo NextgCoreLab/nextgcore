@@ -1080,7 +1080,10 @@ pub async fn handle_nwdaf_context_query_with_ctx(
     ctx: &Arc<RwLock<NwdafContext>>,
     request: &SbiRequest,
 ) -> SbiResponse {
-    log::info!("NWDAF Context Transfer: {}", request.header.uri);
+    log::info!(
+        "NWDAF Context Transfer: {}",
+        nextgcore_sbi::log_redact::redact_callback_tokens(&request.header.uri)
+    );
 
     let params = request_query_params(request);
     let requested_ids = match parse_context_id_list(params.get("context-ids")) {
