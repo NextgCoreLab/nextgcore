@@ -109,8 +109,8 @@ From the clap `Args` struct in `src/bins/nextgcore-seppd/src/main.rs`:
 | `--n32-client-cert` | path | unset | Client certificate presented on outgoing N32 connections (mTLS). |
 | `--n32-client-key` | path | unset | Client private key for outgoing N32 connections. |
 | `--n32-ca-cert` | path | unset | CA bundle for verifying peer-SEPP *server* certificates. |
-| `--n32-allow-insecure-no-mtls` | flag | off | LAB USE ONLY: disable mandatory mTLS on the N32-c listener. Per the code comment, N32-c is mutually-authenticated TLS per TS 33.501, so mTLS is on by default whenever `--tls` is set and a client CA is available. |
-| `--allow-insecure-no-tls` | flag | off | LAB/TEST ONLY: permit deriving the N32-f key hierarchy from a deterministic no-TLS fallback when the RFC 5705 exporter secret is unavailable. Strict by default: without it, `exchange-params` fails when no TLS exporter exists (TS 33.501 §13.2.4.4.1 per code comment). |
+| `--n32-allow-insecure-no-mtls` | flag | off | LAB USE ONLY: disable mandatory mTLS on the N32-c listener. Per the code comment, N32-c is mutually-authenticated TLS per TS 33.501, so mTLS is on by default whenever `--tls` is set and a client CA is available. Refused at startup under the `production` SBI profile (#1848). |
+| `--allow-insecure-no-tls` | flag | off | LAB/TEST ONLY: permit deriving the N32-f key hierarchy from a deterministic no-TLS fallback when the RFC 5705 exporter secret is unavailable. Strict by default: without it, `exchange-params` fails when no TLS exporter exists (TS 33.501 §13.2.4.4.1 per code comment). Refused at startup under the `production` SBI profile (#1848). |
 
 ## Behavior notes
 

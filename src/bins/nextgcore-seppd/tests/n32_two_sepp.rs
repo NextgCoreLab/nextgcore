@@ -105,6 +105,9 @@ impl ChildSepp {
                 // In production this is off and exchange-params requires the TLS
                 // exporter.
                 cmd.arg("--allow-insecure-no-tls");
+                // #1795: a cleartext SEPP is the dev profile; under the default
+                // production profile seppd refuses to start without TLS.
+                cmd.env("NEXTGCORE_SBI_PROFILE", "dev");
                 if let Some(peer) = peer {
                     cmd.args(["--peer-sepp", peer]);
                 }

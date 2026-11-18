@@ -146,7 +146,8 @@ struct Args {
 
     /// Disable mandatory mTLS on the N32-c listener (LAB USE ONLY). N32-c is
     /// a mutually-authenticated TLS connection per TS 33.501; mTLS is on by
-    /// default whenever --tls is set and a client CA is available.
+    /// default whenever --tls is set and a client CA is available. Refused at
+    /// startup under the `production` SBI profile (#1848).
     #[arg(long)]
     n32_allow_insecure_no_mtls: bool,
 
@@ -154,9 +155,49 @@ struct Args {
     /// fallback when the N32-c TLS RFC 5705 exporter secret is unavailable
     /// (LAB/TEST ONLY). Strict-by-default (off): in production the N32-f master
     /// MUST come from the TLS exporter per TS 33.501 §13.2.4.4.1, else
-    /// exchange-params fails (sepp-10).
+    /// exchange-params fails (sepp-10). Refused at startup under the
+    /// `production` SBI profile (#1848).
     #[arg(long)]
     allow_insecure_no_tls: bool,
+}
+
+/// #1848: the SEPP's lab/test flags weaken N32 below what TS 33.501 requires,
+/// so under the `production` SBI profile starting with any of them is an
+/// error, not a warning: N32-c is mutually authenticated TLS between the SEPPs
+/// (§13.1, §13.2.2.2), and the N32-f key hierarchy comes from that TLS
+/// session's exporter (§13.2.4.4.1). Under `dev` they still work, for the
+/// plaintext lab stacks.
+fn refuse_lab_flags_under_production(
+    profile: nextgcore_sbi::security::SbiProfile,
+    n32_allow_insecure_no_mtls: bool,
+    allow_insecure_no_tls: bool,
+) -> Result<(), String> {
+    if !profile.is_production() {
+        return Ok(());
+    }
+    let set: Vec<&str> = [
+        (
+            n32_allow_insecure_no_mtls,
+            "--n32-allow-insecure-no-mtls (N32-c without mutual TLS, TS 33.501 §13.2.2.2)",
+        ),
+        (
+            allow_insecure_no_tls,
+            "--allow-insecure-no-tls (N32-f keys without the N32-c TLS exporter, TS 33.501 \
+             §13.2.4.4.1)",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(on, name)| on.then_some(name))
+    .collect();
+    if set.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "the SBI profile is production, which does not run the SEPP's lab-only flags: {}. \
+         Remove them, or select {}=dev explicitly",
+        set.join(", "),
+        nextgcore_sbi::security::SBI_PROFILE_ENV
+    ))
 }
 
 /// Parse "mcc:mnc" into a PlmnId
@@ -178,6 +219,13 @@ async fn main() -> Result<()> {
 
     // Initialize logging
     init_logging(&args)?;
+    // #1848: the lab flags that weaken N32 do not run under production.
+    refuse_lab_flags_under_production(
+        nextgcore_sbi::security::SbiProfile::resolve(),
+        args.n32_allow_insecure_no_mtls,
+        args.allow_insecure_no_tls,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = nextgcore_metrics::otel::init_otel(
         nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
@@ -473,6 +521,34 @@ async fn run_event_loop_async(
     timer_mgr.clear();
     log::debug!("Exiting async main event loop");
     Ok(())
+}
+
+#[cfg(test)]
+mod lab_flag_tests_1848 {
+    use super::refuse_lab_flags_under_production;
+    use nextgcore_sbi::security::SbiProfile;
+
+    /// REVERT-VERIFIED: with the production check short-circuited to `Ok(())`,
+    /// both flags start under production and the first assertion fails.
+    #[test]
+    fn production_refuses_the_lab_flags_1848() {
+        let err = refuse_lab_flags_under_production(SbiProfile::Production, true, false)
+            .expect_err("no N32-c without mutual TLS under production");
+        assert!(err.contains("--n32-allow-insecure-no-mtls"), "{err}");
+        let err = refuse_lab_flags_under_production(SbiProfile::Production, false, true)
+            .expect_err("no exporter-less N32-f keys under production");
+        assert!(err.contains("--allow-insecure-no-tls"), "{err}");
+        let err = refuse_lab_flags_under_production(SbiProfile::Production, true, true)
+            .expect_err("both");
+        assert!(
+            err.contains("--n32-allow-insecure-no-mtls") && err.contains("--allow-insecure-no-tls"),
+            "both are named: {err}"
+        );
+        refuse_lab_flags_under_production(SbiProfile::Production, false, false)
+            .expect("production without the flags starts");
+        refuse_lab_flags_under_production(SbiProfile::Dev, true, true)
+            .expect("dev keeps the lab flags");
+    }
 }
 
 #[cfg(test)]
