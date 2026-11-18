@@ -239,13 +239,33 @@ pub(crate) static OAUTH2_CLIENT_TEST_OVERRIDE: std::sync::RwLock<
     Option<Arc<nextgcore_sbi::oauth::OAuth2Client>>,
 > = std::sync::RwLock::new(None);
 
-/// Build an outbound peer SBI client for `host:port` (Wave-6 H8 Phase A).
+/// The outbound client for a **service request** to the `target` producer at
+/// `host:port` (Wave-6 H8 Phase A, #1659).
 ///
-/// When OAuth2 enforcement is ON, returns a fresh client carrying an NRF-issued
-/// Bearer token scoped to `target` (TS 33.501 §13.4.1, TS 29.510 §5.4.2). When
-/// OFF (the default), returns the process-wide pooled client unchanged, so the
-/// matched-sim default path is byte-identical.
+/// With an outbound OAuth2 client installed, it carries an NRF-issued Bearer
+/// token scoped to `target` (TS 33.501 §13.4.1.1.2, TS 29.500 §6.7.3), and is
+/// cached per peer so its connection is reused
+/// (`global_context().get_tokened_client`). Without one it is the process-wide
+/// pooled client. Only for discovered or configured peers: a notification to a
+/// callback URI carries no token and does not come through here.
 pub(crate) async fn peer_client(
+    host: &str,
+    port: u16,
+    target: nextgcore_sbi::types::NfType,
+) -> Arc<nextgcore_sbi::client::SbiClient> {
+    let ctx = nextgcore_sbi::context::global_context();
+    match oauth2_client() {
+        Some(oauth2) => ctx.get_tokened_client(host, port, target, oauth2).await,
+        None => ctx.get_client(host, port).await,
+    }
+}
+
+/// [`peer_client`] for an authority a peer supplied (#1659 review m2): a
+/// resource URI the producer handed back, such as an AMF subscription URI. With
+/// an outbound OAuth2 client it is a fresh, uncached tokened client, so a peer
+/// cannot fill the tokened-client cache; without one, the pooled client as
+/// before.
+pub(crate) async fn uncached_peer_client(
     host: &str,
     port: u16,
     target: nextgcore_sbi::types::NfType,
