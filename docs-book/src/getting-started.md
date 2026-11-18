@@ -124,7 +124,7 @@ bash e2e-test.sh                   # run the E2E suite against the cluster
 kubectl port-forward -n nextg-system svc/grafana 3000:3000     # dashboards
 kubectl port-forward -n nextg-system svc/prometheus 9090:9090  # metrics
 kubectl port-forward -n nextg-system svc/jaeger 16686:16686    # traces
-kubectl port-forward -n nextg-system svc/nrf 7777:7777         # NRF SBI
+kubectl port-forward -n nextg-system svc/nrf 7777:7777         # NRF SBI, TLS (#1617): https://nrf:7777 with --resolve nrf:7777:127.0.0.1 and ca.crt of Secret nf-tls-nrf
 ```
 
 Every Service is ClusterIP: nothing is published on a node port, a load

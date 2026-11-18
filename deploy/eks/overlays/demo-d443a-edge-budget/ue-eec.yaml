@@ -50,7 +50,7 @@ data:
       job_port: 9471
       job_timeout_ms: 1000
       oauth2:
-        nrf: "http://${nrf}:7777"
+        nrf: "https://${nrf}:7777"
         nf_instance_id: 6b1d7e3c-0000-4000-8000-0000000471ec
         cca_key_file: /tmp/d443a-cca/eec.key
         register: true

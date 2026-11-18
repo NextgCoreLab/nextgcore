@@ -47,10 +47,16 @@ data:
     id=6b1d7e3c-0000-4000-8000-00000000471e
     svc() { printf '{"serviceInstanceId":"%s","serviceName":"%s","versions":[{"apiVersionInUri":"v1","apiFullVersion":"1.0.0"}],"scheme":"http","nfServiceStatus":"REGISTERED"}' "$1" "$1"; }
     body="{\"nfInstanceId\":\"${id}\",\"nfType\":\"EES\",\"nfStatus\":\"REGISTERED\",\"heartBeatTimer\":60,\"ipv4Addresses\":[\"${POD_IP}\"],\"nfServices\":[$(svc eees-easregistration),$(svc eees-eecregistration)]}"
+    # Over TLS with the stand-in's own certificate (#1617): Secret
+    # nf-tls-ees-standin, whose urn:uuid is ${id} and whose NFTypes is EES (the
+    # container's NEXTGCORE_NRF_TLS_* env). The NRF is dialled by the name
+    # nrf.crt carries, `nrf`: the Service, in this pod's namespace.
     while :; do
-      code="$(curl -s --http2-prior-knowledge --max-time 5 -o /dev/null -w '%{http_code}' -X PUT \
+      code="$(curl -s --http2 --cacert "${NEXTGCORE_NRF_TLS_CA}" \
+        --cert "${NEXTGCORE_NRF_TLS_CLIENT_CERT}" --key "${NEXTGCORE_NRF_TLS_CLIENT_KEY}" \
+        --max-time 5 -o /dev/null -w '%{http_code}' -X PUT \
         -H 'Content-Type: application/json' -d "${body}" \
-        "http://nrf.nextg-system.svc.cluster.local:7777/nnrf-nfm/v1/nf-instances/${id}")"
+        "https://${NEXTGCORE_NRF_TLS_SERVER_NAME}:7777/nnrf-nfm/v1/nf-instances/${id}")"
       echo "$(date -u +%FT%TZ) [d443a nrf-standin] stand-in EES profile ${id} (nfType EES, eees-easregistration, eees-eecregistration) PUT -> ${code}"
       sleep 30
     done
@@ -94,6 +100,11 @@ spec:
         app.kubernetes.io/name: ees
         app.kubernetes.io/part-of: nextgcore
     spec:
+      # #1617: the nf-tls files are group fsGroup, mode 0440, and every container
+      # of the pod runs with fsGroup as a supplementary group, so the NF reads
+      # its key as the image's non-root user (any gid works; 999 is the image's).
+      securityContext:
+        fsGroup: 999
       automountServiceAccountToken: false
       containers:
         - name: ees
@@ -114,6 +125,20 @@ spec:
             - containerPort: 9090
               name: metrics
           env:
+            # #1617: NF -> NRF over TLS with this pod's own certificate (Secret
+            # nf-tls-ees, issued at deploy time by k8s/nf-tls-secrets.sh). The NRF URI
+            # dials the cluster FQDN; nrf.crt names DNS:nrf, so that is the name checked.
+            - name: NEXTGCORE_NRF_TLS_CA
+              value: /etc/nextgcore/certs/ca.crt
+            - name: NEXTGCORE_NRF_TLS_CLIENT_CERT
+              value: /etc/nextgcore/certs/ees.crt
+            - name: NEXTGCORE_NRF_TLS_CLIENT_KEY
+              value: /etc/nextgcore/certs/ees.key
+            - name: NEXTGCORE_NRF_TLS_SERVER_NAME
+              value: nrf
+            # Pinned to the urn:uuid of ees.crt (docker/rust/certs/nf-identities.txt).
+            - name: NEXTGCORE_NF_INSTANCE_ID
+              value: "6b1d7e3c-0000-4000-8000-0000000000e5"
             - name: RUST_LOG
               value: info
             - name: EES_METRICS_PORT
@@ -134,6 +159,10 @@ spec:
               cpu: 300m
               memory: 128Mi
           volumeMounts:
+            # Its own Secret only (#1617).
+            - name: nf-tls
+              mountPath: /etc/nextgcore/certs
+              readOnly: true
             - name: config
               mountPath: /etc/nextgcore/ees.yaml
               subPath: ees.yaml
@@ -155,6 +184,14 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            - name: NEXTGCORE_NRF_TLS_CA
+              value: /etc/nextgcore/certs/ca.crt
+            - name: NEXTGCORE_NRF_TLS_CLIENT_CERT
+              value: /etc/nextgcore/certs/ees-standin.crt
+            - name: NEXTGCORE_NRF_TLS_CLIENT_KEY
+              value: /etc/nextgcore/certs/ees-standin.key
+            - name: NEXTGCORE_NRF_TLS_SERVER_NAME
+              value: nrf
           securityContext:
             runAsUser: 65534
             runAsGroup: 65534
@@ -173,7 +210,22 @@ spec:
               mountPath: /d443a/nrf-standin.sh
               subPath: nrf-standin.sh
               readOnly: true
+            # Its own Secret only (#1617): uid 65534 reads it through the pod's
+            # fsGroup.
+            - name: nf-tls-standin
+              mountPath: /etc/nextgcore/certs
+              readOnly: true
       volumes:
+        - name: nf-tls-standin
+          secret:
+            secretName: nf-tls-ees-standin
+            defaultMode: 0440
+        # #1617: this pod's certificate and key and the CA certificate, mode 0440
+        # to the pod's fsGroup. Never the CA key: it does not leave the deploy host.
+        - name: nf-tls
+          secret:
+            secretName: nf-tls-ees
+            defaultMode: 0440
         - name: config
           configMap:
             name: ees-config

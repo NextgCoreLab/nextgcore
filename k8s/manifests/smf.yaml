@@ -70,6 +70,11 @@ spec:
         app.kubernetes.io/name: smf
         app.kubernetes.io/part-of: nextgcore
     spec:
+      # #1617: the nf-tls files are group fsGroup, mode 0440, and every container
+      # of the pod runs with fsGroup as a supplementary group, so the NF reads
+      # its key as the image's non-root user (any gid works; 999 is the image's).
+      securityContext:
+        fsGroup: 999
       # #718: a graceful SMF shutdown releases each UPF association (up to
       # T1 x (N1+1) = 12 s when a UPF is gone), sends every UE #39 and keeps
       # retransmitting its S5/S8 Delete Bearer Requests for up to 12 s.
@@ -129,6 +134,20 @@ spec:
             - containerPort: 9090
               name: metrics
           env:
+            # #1617: NF -> NRF over TLS with this pod's own certificate (Secret
+            # nf-tls-smf, issued at deploy time by k8s/nf-tls-secrets.sh). The NRF URI
+            # dials the cluster FQDN; nrf.crt names DNS:nrf, so that is the name checked.
+            - name: NEXTGCORE_NRF_TLS_CA
+              value: /etc/nextgcore/certs/ca.crt
+            - name: NEXTGCORE_NRF_TLS_CLIENT_CERT
+              value: /etc/nextgcore/certs/smf.crt
+            - name: NEXTGCORE_NRF_TLS_CLIENT_KEY
+              value: /etc/nextgcore/certs/smf.key
+            - name: NEXTGCORE_NRF_TLS_SERVER_NAME
+              value: nrf
+            # Pinned to the urn:uuid of smf.crt (docker/rust/certs/nf-identities.txt).
+            - name: NEXTGCORE_SMF_INSTANCE_ID
+              value: "6b1d7e3c-0000-4000-8000-0000000005f0"
             - name: NEXTGCORE_SBI_PROFILE
               # Issue #63: this NF defaults to the PRODUCTION SBI profile
               # (mutually-authenticated TLS + a required OAuth2 access token) and
@@ -188,6 +207,10 @@ spec:
               cpu: 500m
               memory: 256Mi
           volumeMounts:
+            # Its own Secret only (#1617).
+            - name: nf-tls
+              mountPath: /etc/nextgcore/certs
+              readOnly: true
             - name: config-resolved
               mountPath: /etc/nextgcore/smf.yaml
               subPath: smf.yaml
@@ -205,6 +228,12 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 30
       volumes:
+        # #1617: this pod's certificate and key and the CA certificate, mode 0440
+        # to the pod's fsGroup. Never the CA key: it does not leave the deploy host.
+        - name: nf-tls
+          secret:
+            secretName: nf-tls-smf
+            defaultMode: 0440
         - name: config
           configMap:
             name: nextgcore-configs

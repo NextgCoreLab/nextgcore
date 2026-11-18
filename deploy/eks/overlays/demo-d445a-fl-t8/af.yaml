@@ -46,7 +46,7 @@ data:
       api_root: http://nef.nextg-system.svc.cluster.local:7777
       scs_as_id: d445a-fl-af
       oauth2:
-        nrf: http://nrf.nextg-system.svc.cluster.local:7777
+        nrf: https://nrf.nextg-system.svc.cluster.local:7777
         nf_instance_id: 6b1d7e3c-0000-4000-8000-00000000480a
         cca_key_file: /tmp/d445a/cca/af.key
         register: true
@@ -111,6 +111,13 @@ data:
     # no supplementary groups and no_new_privs. It reads its config and key only.
     chmod 0711 "$D"; chmod 0644 "$D/af.yaml"
     chown -R 65534:65534 "$D/cca"
+    # Its NRF TLS pair (#1617): Secret nf-tls-fl-af is 0400 to root; the AF's
+    # own copy is 0400 to uid 65534 in a 0700 directory (the container env
+    # NEXTGCORE_NRF_TLS_* names these paths).
+    mkdir -m 0700 "$D/tls"
+    cp /etc/nextgcore/certs/ca.crt /etc/nextgcore/certs/fl-af.crt /etc/nextgcore/certs/fl-af.key "$D/tls/"
+    chmod 0444 "$D/tls/ca.crt" "$D/tls/fl-af.crt"; chmod 0400 "$D/tls/fl-af.key"
+    chown -R 65534:65534 "$D/tls"
     say "starting $bin ${flags:-} in fl-dn as uid 65534"
     # shellcheck disable=SC2086
     exec ip netns exec fl-dn setpriv --reuid=65534 --regid=65534 --clear-groups \

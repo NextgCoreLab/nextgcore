@@ -80,7 +80,7 @@ sbi_get "/nnwdaf-analyticsinfo/v1/analytics?event-id=UE_MOBILITY&tgt-ue=${TGT}" 
 STATUS="$(head -1 "${S}/ue-mobility.http")"
 tail -n +2 "${S}/ue-mobility.http" >"${S}/ue-mobility.json"
 say "UE_MOBILITY GET: ${STATUS}"
-in_nwdaf sh -c "curl -s --http2-prior-knowledge --max-time 10 'http://nrf.${NAMESPACE}.svc.cluster.local:7777/nnrf-disc/v1/nf-instances?target-nf-type=NWDAF&requester-nf-type=AMF'" \
+in_nwdaf sh -c "curl -s --http2 --cacert /etc/nextgcore/certs/ca.crt --max-time 10 'https://nrf:7777/nnrf-disc/v1/nf-instances?target-nf-type=NWDAF&requester-nf-type=AMF'" \
   >"${S}/nrf-nwdaf-profile.json" 2>/dev/null
 FORGED="$(in_nwdaf sh -c "curl -s --http2-prior-knowledge --max-time 10 -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' --data '{\"reportList\":[]}' http://127.0.0.1:7777/nnwdaf-callback/v1/amf-location-notify/00000000000000000000000000000000")"
 echo "${FORGED}" >"${S}/forged-notify.status"

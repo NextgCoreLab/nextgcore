@@ -60,6 +60,11 @@ spec:
         app.kubernetes.io/name: nwdaf
         app.kubernetes.io/part-of: nextgcore
     spec:
+      # #1617: the nf-tls files are group fsGroup, mode 0440, and every container
+      # of the pod runs with fsGroup as a supplementary group, so the NF reads
+      # its key as the image's non-root user (any gid works; 999 is the image's).
+      securityContext:
+        fsGroup: 999
       initContainers:
         - name: wait-nrf
           image: busybox:1.36
@@ -72,13 +77,27 @@ spec:
             - "-c"
             - "/etc/nextgcore/nwdaf.yaml"
             - "--nrf-uri"
-            - "http://nrf.nextg-system.svc.cluster.local:7777"
+            - "https://nrf.nextg-system.svc.cluster.local:7777"
           ports:
             - containerPort: 7777
               name: sbi
             - containerPort: 9090
               name: metrics
           env:
+            # #1617: NF -> NRF over TLS with this pod's own certificate (Secret
+            # nf-tls-nwdaf, issued at deploy time by k8s/nf-tls-secrets.sh). The NRF URI
+            # dials the cluster FQDN; nrf.crt names DNS:nrf, so that is the name checked.
+            - name: NEXTGCORE_NRF_TLS_CA
+              value: /etc/nextgcore/certs/ca.crt
+            - name: NEXTGCORE_NRF_TLS_CLIENT_CERT
+              value: /etc/nextgcore/certs/nwdaf.crt
+            - name: NEXTGCORE_NRF_TLS_CLIENT_KEY
+              value: /etc/nextgcore/certs/nwdaf.key
+            - name: NEXTGCORE_NRF_TLS_SERVER_NAME
+              value: nrf
+            # Pinned to the urn:uuid of nwdaf.crt (docker/rust/certs/nf-identities.txt).
+            - name: NEXTGCORE_NWDAF_INSTANCE_ID
+              value: "6b1d7e3c-0000-4000-8000-00000000fdaf"
             - name: NEXTGCORE_SBI_PROFILE
               value: "dev"
             - name: RUST_LOG
@@ -102,6 +121,10 @@ spec:
               cpu: 200m
               memory: 128Mi
           volumeMounts:
+            # Its own Secret only (#1617).
+            - name: nf-tls
+              mountPath: /etc/nextgcore/certs
+              readOnly: true
             - name: config
               mountPath: /etc/nextgcore/nwdaf.yaml
               subPath: nwdaf.yaml
@@ -117,6 +140,12 @@ spec:
             initialDelaySeconds: 15
             periodSeconds: 30
       volumes:
+        # #1617: this pod's certificate and key and the CA certificate, mode 0440
+        # to the pod's fsGroup. Never the CA key: it does not leave the deploy host.
+        - name: nf-tls
+          secret:
+            secretName: nf-tls-nwdaf
+            defaultMode: 0440
         - name: config
           configMap:
             name: nwdaf-config
