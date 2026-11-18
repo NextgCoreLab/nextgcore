@@ -157,6 +157,14 @@ struct Args {
     /// exchange-params fails (sepp-10).
     #[arg(long)]
     allow_insecure_no_tls: bool,
+
+    /// A target NF inside this PLMN that a reconstructed N32-f request may be
+    /// forwarded to under the production SBI profile, besides hosts under the
+    /// serving PLMNs' 5gc.mnc<MNC>.mcc<MCC>.3gppnetwork.org domains (#1870):
+    /// `host`, `host:port`, `[v6]:port`, or `.domain` for every host under it.
+    /// Repeatable. Every target must also be https.
+    #[arg(long = "n32f-target-allow")]
+    n32f_target_allow: Vec<String>,
 }
 
 /// Parse "mcc:mnc" into a PlmnId
@@ -307,6 +315,47 @@ async fn main() -> Result<()> {
         allow_insecure_no_mtls: args.n32_allow_insecure_no_mtls,
     };
     let n32_tls_opt = if args.tls { Some(&n32_tls) } else { None };
+    // #1870: the n32f-error report and the SBI-side forward dial the peer SEPP
+    // with this SEPP's client certificate too, not only the N32-c handshake.
+    n32_server::set_n32_client_tls(n32_tls_opt.cloned());
+
+    // #1870: where a peer-supplied N32-f target may point, and over what.
+    let home_domains: Vec<String> = sepp_self()
+        .read()
+        .map(|c| {
+            c.serving_plmn_ids
+                .iter()
+                .map(n32_server::home_network_domain)
+                .collect()
+        })
+        .unwrap_or_default();
+    let forward_policy = n32_server::N32fForwardPolicy::new(
+        nextgcore_sbi::security::SbiProfile::resolve(),
+        home_domains,
+        args.n32f_target_allow.clone(),
+    );
+    if forward_policy.profile.is_production() {
+        log::info!(
+            "N32-f forwarding: production SBI profile, https targets only, under {:?} or in \
+             --n32f-target-allow {:?}; CA={} client certificate={}",
+            forward_policy.home_domains,
+            forward_policy.allowed_targets,
+            forward_policy.tls.ca_cert,
+            forward_policy.tls.client_cert.as_deref().unwrap_or("NONE"),
+        );
+        if forward_policy.home_domains.is_empty() && forward_policy.allowed_targets.is_empty() {
+            log::warn!(
+                "N32-f forwarding: no --serving-plmn and no --n32f-target-allow, so every \
+                 reconstructed N32-f request will be refused"
+            );
+        }
+    } else {
+        log::warn!(
+            "N32-f forwarding: dev SBI profile, any peer-supplied target is dialled over its \
+             own scheme"
+        );
+    }
+    n32_server::set_n32f_forward_policy(forward_policy);
 
     // Start the consumer-facing SBI server (C8): home-PLMN NFs send outbound
     // roaming requests here; the handler runs the forwarding pipeline through
