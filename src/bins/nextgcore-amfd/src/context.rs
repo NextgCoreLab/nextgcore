@@ -5089,7 +5089,21 @@ pub struct AmfSessRef {
     pub sm_context_in_smf: bool,
 }
 
+/// The UE-AMBR (DL, UL) in bit/s a RedCap UE is held to (Rel-17, TS 38.101): the
+/// subscribed UE-AMBR is capped at these at registration, and again whenever the
+/// subscription changes it (#1776 review).
+pub const REDCAP_UE_AMBR_CAP_BPS: (u64, u64) = (150_000_000, 50_000_000);
+
 impl AmfUe {
+    /// Cap the held UE-AMBR at [`REDCAP_UE_AMBR_CAP_BPS`] for a RedCap UE; no-op for
+    /// any other UE.
+    pub fn cap_ue_ambr_for_redcap(&mut self) {
+        if self.redcap_indication {
+            self.ue_ambr.downlink = self.ue_ambr.downlink.min(REDCAP_UE_AMBR_CAP_BPS.0);
+            self.ue_ambr.uplink = self.ue_ambr.uplink.min(REDCAP_UE_AMBR_CAP_BPS.1);
+        }
+    }
+
     /// Seed the {NH, NCC} forward-security chain from KgNB when the AS security
     /// context is established (TS 33.501 Annex A.10, Section 6.9.2.3.3).
     ///

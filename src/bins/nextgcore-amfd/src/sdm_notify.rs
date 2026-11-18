@@ -378,6 +378,9 @@ pub(crate) fn adopt_am_data(supi: &str, ue: &mut AmfUe, doc: Value) {
     {
         ue.ue_ambr.downlink = dl;
     }
+    // #1776 review: a RedCap UE stays capped, as at registration; the held value is
+    // also what a UE Context Modification sends.
+    ue.cap_ue_ambr_for_redcap();
     ue.gpsi = derived.gpsi;
     ue.priority_subscription = derived.priority_subscription;
     ue.am_data = Some(doc);

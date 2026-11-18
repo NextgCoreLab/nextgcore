@@ -2186,24 +2186,7 @@ impl NgapServer {
         // A no-op unless the posture just changed, and the posture is off by default.
         self.sync_ngap_overload().await?;
 
-        // Deliver any LCS positioning downlinks the Namf SBI handler enqueued
-        // (TS 23.273): NRPPa→gNB (N2) / LPP→UE (N1). Dormant when none pending.
-        self.process_positioning_downlinks().await;
-
-        // Execute any network-initiated deregistrations the Namf_Callback
-        // dereg-notify handler enqueued (WSB-4, TS 23.502 §4.2.2.3.3 /
-        // TS 24.501 §5.5.2.3): protected DEREGISTRATION REQUEST + T3522.
-        // Dormant when none pending.
-        self.process_network_deregs().await;
-
-        // Deliver every N1N2MessageTransfer the Namf handler queued for a
-        // CM-CONNECTED UE (#666): PDU SESSION RESOURCE RELEASE COMMAND and/or the
-        // N1 in a DOWNLINK NAS TRANSPORT. Dormant when none pending.
-        self.process_connected_downlinks().await;
-
-        // Send the UE Context Modifications the Nudm_SDM notify handler queued for
-        // a changed subscribed UE-AMBR (#1776, TS 23.502 §4.5.1). Dormant when none.
-        self.process_ue_ambr_modifications().await;
+        self.process_ue_associated_handoffs().await;
 
         self.process_racs_reassignments();
         self.process_sbi_outcomes().await;
@@ -2269,6 +2252,32 @@ impl NgapServer {
 
         let outcome = self.receive_n2_or_sbi_report().await?;
         Ok(poll_again_at_once(outcome))
+    }
+
+    /// The step of [`Self::poll`] that sends the UE-associated work the Namf SBI
+    /// handlers queued, in this order. #1776 review: one step, so that a test can
+    /// drive the production wiring of each queue. The rest of `poll` drains
+    /// process-global queues that sibling tests fill and wait on, so tests do not
+    /// call `poll` itself (see `poll_wake_tests`).
+    pub(crate) async fn process_ue_associated_handoffs(&mut self) {
+        // Deliver any LCS positioning downlinks the Namf SBI handler enqueued
+        // (TS 23.273): NRPPa→gNB (N2) / LPP→UE (N1). Dormant when none pending.
+        self.process_positioning_downlinks().await;
+
+        // Execute any network-initiated deregistrations the Namf_Callback
+        // dereg-notify handler enqueued (WSB-4, TS 23.502 §4.2.2.3.3 /
+        // TS 24.501 §5.5.2.3): protected DEREGISTRATION REQUEST + T3522.
+        // Dormant when none pending.
+        self.process_network_deregs().await;
+
+        // Deliver every N1N2MessageTransfer the Namf handler queued for a
+        // CM-CONNECTED UE (#666): PDU SESSION RESOURCE RELEASE COMMAND and/or the
+        // N1 in a DOWNLINK NAS TRANSPORT. Dormant when none pending.
+        self.process_connected_downlinks().await;
+
+        // Send the UE Context Modifications the Nudm_SDM notify handler queued for
+        // a changed subscribed UE-AMBR (#1776, TS 23.502 §4.5.1). Dormant when none.
+        self.process_ue_ambr_modifications().await;
     }
 
     /// Wait for N2 for up to [`SCTP_RECV_TIMEOUT`], ended early by an off-task SBI
@@ -4780,12 +4789,7 @@ impl NgapServer {
                 // the N11 SM Context Create so the session-AMBR is reduced too.
                 if req.redcap_indication {
                     state.amf_ue.redcap_indication = true;
-                    if state.amf_ue.ue_ambr.downlink > 150_000_000 {
-                        state.amf_ue.ue_ambr.downlink = 150_000_000; // 150 Mbps DL
-                    }
-                    if state.amf_ue.ue_ambr.uplink > 50_000_000 {
-                        state.amf_ue.ue_ambr.uplink = 50_000_000; // 50 Mbps UL
-                    }
+                    state.amf_ue.cap_ue_ambr_for_redcap();
                     log::info!("UE indicates RedCap (Reduced Capability) device");
                 }
 
@@ -6752,6 +6756,9 @@ impl NgapServer {
         {
             state.amf_ue.ue_ambr.uplink = ul;
         }
+        // #1776 review: the subscribed value replaced the RedCap cap the Registration
+        // Request set; a RedCap UE stays capped.
+        state.amf_ue.cap_ue_ambr_for_redcap();
 
         // GPSI (UDM am-data `gpsis`, TS 29.503 §5.2.2.2.1) — the UE's external
         // identity, conveyed onward on N11 (issue #205). Assigned unconditionally

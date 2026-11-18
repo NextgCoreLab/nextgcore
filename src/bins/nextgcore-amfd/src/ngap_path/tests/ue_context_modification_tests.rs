@@ -219,22 +219,35 @@ fn the_request_carries_both_ids_and_the_ue_ambr_1776() {
     );
 }
 
-/// #1776 acceptance: a UE-AMBR change for a CM-CONNECTED UE is answered 204, and its
-/// gNB receives one UE CONTEXT MODIFICATION REQUEST naming the UE with the new
-/// UE-AMBR.
+/// #1776 acceptance, through the production wiring: the UDM's notification arrives
+/// over the Namf router and is answered 204; the NGAP server's poll step that sends
+/// the SBI handlers' queued UE-associated work
+/// (`process_ue_associated_handoffs`, called by `poll`, see
+/// `poll_sends_the_ue_associated_handoffs_1776`) sends the UE's gNB one UE CONTEXT
+/// MODIFICATION REQUEST naming the UE with the new UE-AMBR.
 ///
-/// REVERT-VERIFIED: with the `send_to_association` call in
+/// That step drains the positioning, network-deregistration and connected-downlink
+/// queues too, so their locks are held (in the order their own tests take them:
+/// the dereg lock first, the paging locks last).
+///
+/// REVERT-VERIFIED: with the `process_ue_ambr_modifications` call deleted from the
+/// poll step, and separately with the `send_to_association` call in
 /// `send_ue_ambr_modification` removed, the "one request" assertion fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_connected_ues_ue_ambr_change_reaches_its_gnb_1776() {
+    let _dereg = crate::context::DEREG_QUEUE_TEST_LOCK.lock().await;
+    let _connected = crate::test_support::CONNECTED_DOWNLINK_LOCK.lock().await;
+    let _positioning = crate::test_support::POSITIONING_DL_LOCK.lock().await;
     let _q = crate::test_support::UE_AMBR_MODIFICATION_LOCK.lock().await;
+    let _paging_map = crate::context::PAGING_MAP_TEST_LOCK.lock().await;
+    let _strategy = crate::test_support::PAGING_STRATEGY_LOCK.lock().await;
     let mut server = capturing_ngap_server().await;
     let (ue, ran, supi) = (1_776_001u64, 76, "imsi-001010017760001");
     subscribed_ue(&mut server, ue, ran, supi);
 
     assert_eq!(notify_ue_ambr(supi, "5 Mbps", "10 Mbps").await, 204);
     assert_eq!(held_ue_ambr(&server, ue), (10_000_000, 5_000_000), "held");
-    server.process_ue_ambr_modifications().await;
+    server.process_ue_associated_handoffs().await;
     let (requests, _) = modifications_sent(&mut server, ue);
     assert_eq!(
         requests,
@@ -370,5 +383,63 @@ async fn the_gnbs_response_and_failure_are_handled_1776() {
             "{what}: the subscribed UE-AMBR is kept"
         );
     }
+    server.forget_ue(ue);
+}
+
+/// #1776 review (MAJOR): `poll`, the NGAP task's loop body, runs the step that
+/// sends the queued UE-AMBR modifications. A unit test cannot drive `poll` itself:
+/// the rest of it drains process-global queues sibling tests fill and wait on (the
+/// reason `poll_wake_tests` drives only its receive step). So the wiring is read
+/// from the source: `poll`'s body calls `process_ue_associated_handoffs`, which
+/// [`a_connected_ues_ue_ambr_change_reaches_its_gnb_1776`] drives end to end.
+///
+/// REVERT-VERIFIED: with the `process_ue_associated_handoffs` call deleted from
+/// `poll`, the "poll runs the step" assertion fails.
+#[test]
+fn poll_sends_the_ue_associated_handoffs_1776() {
+    let source = include_str!("../../ngap_path.rs");
+    let start = source
+        .find("    pub async fn poll(&mut self) -> Result<bool> {\n")
+        .expect("poll is defined");
+    let len = source[start..].find("\n    }\n").expect("poll's body ends");
+    let body = &source[start..start + len];
+    assert!(
+        body.contains("\n        self.process_ue_associated_handoffs().await;\n"),
+        "poll runs the step"
+    );
+}
+
+/// #1776 review (minor): a RedCap UE's UE-AMBR stays capped at
+/// `REDCAP_UE_AMBR_CAP_BPS` when the UDM changes it, as at registration: the value
+/// held and the value its gNB receives. A change within the cap goes through.
+///
+/// REVERT-VERIFIED: with the `cap_ue_ambr_for_redcap` call in `adopt_am_data`
+/// removed, the "capped: held" assertion fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_redcap_ues_ue_ambr_change_stays_capped_1776() {
+    let _q = crate::test_support::UE_AMBR_MODIFICATION_LOCK.lock().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran, supi) = (1_776_005u64, 80, "imsi-001010017760005");
+    subscribed_ue(&mut server, ue, ran, supi);
+    server
+        .ue_auth_state
+        .with_mut(ue, |s| s.amf_ue.redcap_indication = true);
+    let cap = crate::context::REDCAP_UE_AMBR_CAP_BPS;
+
+    assert_eq!(notify_ue_ambr(supi, "100 Mbps", "1 Gbps").await, 204);
+    assert_eq!(held_ue_ambr(&server, ue), cap, "capped: held");
+    server.process_ue_ambr_modifications().await;
+    assert_eq!(
+        modifications_sent(&mut server, ue).0,
+        vec![(ran, Some(cap))],
+        "capped: sent"
+    );
+
+    assert_eq!(notify_ue_ambr(supi, "20 Mbps", "40 Mbps").await, 204);
+    assert_eq!(
+        held_ue_ambr(&server, ue),
+        (40_000_000, 20_000_000),
+        "within"
+    );
     server.forget_ue(ue);
 }
