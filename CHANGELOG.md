@@ -59,6 +59,26 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   swap now keeps the volumes a sidecar mounts. `check-nf-identities.py --k8s` (CI `manifests`)
   checks every rendered kustomization. A client still dialling `http://` the NRF fails at the
   TLS handshake.
+- The Helm chart runs NF -> NRF over TLS (#1617). Its NRF serves TLS with `client_auth:
+  optional`; every NF dials `https://<release>-nrf...` and mounts Secret
+  `nf-tls-<nf>-<global.nrfTls.secretVersion>` (`0440`, pod `fsGroup`) with
+  `NEXTGCORE_NRF_TLS_*` and server name `global.nrfTls.serverName` (default `nrf`). Every NF,
+  the NRF included, now pins a derived `nfInstanceId` (the AMF's is unchanged for the same
+  `global.siteId`), overridable per NF with `<nf>.nfInstanceId`, and the rendered ConfigMap
+  `<release>-nf-identities` lists each NF's ID and type. The new
+  `deploy/helm/nf-tls-secrets.sh` issues the dev Secrets for those IDs and prints the version;
+  production PKIs issue each NF a certificate naming its `urn:uuid` (also required for
+  `global.sbiProfile=production` with OAuth2, #1667). `k8s/nf-tls-secrets.sh` gains `--ids`
+  (another identity table) and `--prune <namespace> <version>`, which deletes superseded
+  Secret versions unless something still mounts them. **Breaking for Helm users:** the render
+  fails with an empty `global.siteId` unless every `nfInstanceId` is pinned (the `lookup`
+  fallback to the kube-system UID is gone: it was empty under `helm template`, so certificates
+  would name IDs the install does not pin; to keep an AMF ID derived that way, pin
+  `amf.nfInstanceId`); `global.sbi.scheme` other than `https` fails the render; a pinned
+  `<nf>.nfInstanceId`, `amf.nfInstanceId` included (which used to accept any string), must be
+  a lower-case UUID version 4 (TS 29.571 §5.3.2); the NRF and every NRF client refuse
+  `replicas > 1`, and the clients roll out with strategy Recreate. `check-nf-identities.py
+  --helm` (CI `manifests`) checks the renders and refusals.
 - mmed binds a configured IPv6 S1-MME address. Before, a bracketed IPv6 `mme.s1ap.server`
   address without a port (`[fd00::5]`) was dropped as unparsable, and the IPv6 server list
   `s1ap_list6` was never filled or read, so such a config fell back to `127.0.0.1:36412`. IPv6

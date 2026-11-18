@@ -50,10 +50,30 @@ compose files in step:
    - a container that names an NRF URI mounts an nf-tls Secret, and no NRF
      URI is http://;
    - nothing committed is an nf-tls Secret or holds a ca.key.
-   Rule 5 also covers every file under k8s/ and deploy/eks, including scripts
-   that curl the NRF (http://nrf..., any http:// .../nnrf-... path).
+   Rule 5 also covers every file under k8s/, deploy/eks and deploy/helm,
+   including scripts that curl the NRF (http://nrf..., any http://
+   .../nnrf-... path).
 
-Usage: check-nf-identities.py [--self-test] [--k8s]
+7. Helm (deploy/helm/nextgcore; --helm): the chart derives each NF's
+   nfInstanceId and lists it in the rendered <release>-nf-identities
+   ConfigMap, the table deploy/helm/nf-tls-secrets.sh issues the certificates
+   from. In `helm template` renders:
+   - the table is well formed (one UUID version 4 per row, no ID twice) and
+     every row is a Deployment <release>-<row> whose container pins
+     NEXTGCORE_<TYPE>_INSTANCE_ID (the row's nfType) to the row's ID;
+   - rule 6 holds with that table (own Secret, IDs, NRF TLS env, 0440 +
+     fsGroup, the NRF's nrf.yaml TLS with client_auth optional);
+   - each NRF client runs one pod, Recreate (one ID, one certificate);
+   - with global.nrfTls.secretVersion set, each pod mounts
+     nf-tls-<row>-<version> and nothing else of nf-tls-*;
+   - the chart refuses to render with an empty global.siteId and an unpinned
+     ID, a non-https global.sbi.scheme, a malformed secretVersion or
+     nfInstanceId, and replicas > 1, and renders with an empty siteId once
+     every ID is pinned;
+   - rule 5 holds over `helm install --dry-run=client`, NOTES.txt included
+     (a templated http:// URL is only recognisable rendered).
+
+Usage: check-nf-identities.py [--self-test] [--k8s] [--helm]
 """
 
 import glob
@@ -80,6 +100,11 @@ NRF_SETTING = re.compile(r'nrf[a-z0-9_-]*["\']?[ \t:=,]+["\']?http://', re.I)
 NRF_PATH = re.compile(r'http://(?:nrf[.:]|[^\s"\'`]*/nnrf-)', re.I)
 REPO_DIR = os.path.dirname(os.path.dirname(COMPOSE_DIR))
 K8S_DIRS = ('k8s', os.path.join('deploy', 'eks'))
+HELM_DIR = os.path.join('deploy', 'helm')
+HELM_CHART = os.path.join(REPO_DIR, HELM_DIR, 'nextgcore')
+HELM_RELEASE = 'ci'
+HELM_VERSION = '0123456789abcdef'
+UUID4 = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
 K8S_SECRET = re.compile(r'^nf-tls-([a-z0-9-]+)$')
 K8S_URI = re.compile(r'(https?)://([^\s"\'/]*nrf[^\s"\'/]*)', re.I)
 POD_KINDS = ('Deployment', 'StatefulSet', 'DaemonSet', 'Job')
@@ -457,6 +482,140 @@ def k8s_renders():
         out[d] = [x for x in yaml.safe_load_all(r.stdout) if isinstance(x, dict)]
     return out
 
+def helm_table(release, docs):
+    """The rendered <release>-nf-identities table: {row: (nfType, id)}, or an error string."""
+    want = release + '-nf-identities'
+    for d in docs:
+        if d.get('kind') == 'ConfigMap' and (d.get('metadata') or {}).get('name') == want:
+            rows, seen = {}, set()
+            for line in ((d.get('data') or {}).get('nf-identities.txt') or '').splitlines():
+                f = line.split()
+                if not f:
+                    continue
+                if len(f) != 4 or not UUID4.match(f[2]) or f[0] in rows or f[2] in seen:
+                    return '%s: malformed or repeated line %r' % (want, line)
+                rows[f[0]] = (f[1], f[2])
+                seen.add(f[2])
+            return rows or '%s lists no NF' % want
+    return 'no ConfigMap %s' % want
+
+
+def helm_derived_id(site, namespace, release, nf):
+    """_helpers.tpl nextgcore.nfInstanceId with nothing pinned: the AMF's is the
+    #753 derivation, so an existing release keeps its AMF ID."""
+    import hashlib
+    h = hashlib.sha256(('%s/%s/%s/%s' % (site, namespace, release, nf)).encode()).hexdigest()
+    return '%s-%s-4%s-8%s-%s' % (h[0:8], h[8:12], h[13:16], h[17:20], h[20:32])
+
+
+def check_helm(release, docs, version=None, types=None, derived=None):
+    """Rule 7 for one `helm template` render (a list of documents). types: the
+    nfType of each row of nf-identities.txt, which the render's must match (it
+    is what the daemon registers); derived: (siteId, namespace) when nothing is
+    pinned, to check each ID is the documented derivation."""
+    where = 'helm %s' % release
+    table = helm_table(release, docs)
+    if isinstance(table, str):
+        return ['%s: %s' % (where, table)]
+    errors = []
+    for row, (nf_type, got) in sorted(table.items()):
+        if types is not None and types.get(row) != nf_type:
+            errors.append('%s: row %s has nfType %s; nf-identities.txt row %s registers as %s'
+                          % (where, row, nf_type, row, types.get(row)))
+        if derived is not None and got != helm_derived_id(derived[0], derived[1], release, row):
+            errors.append('%s: row %s ID %s is not the derivation sha256(%s/%s/%s/%s)'
+                          % (where, row, got, derived[0], derived[1], release, row))
+    deps = {d['metadata'].get('name'): d for d in docs if d.get('kind') == 'Deployment'}
+    for row, (nf_type, want) in sorted(table.items()):
+        d = deps.get('%s-%s' % (release, row))
+        if d is None:
+            errors.append('%s: row %s has no Deployment %s-%s' % (where, row, release, row))
+            continue
+        spec = d.get('spec') or {}
+        pod = (spec.get('template') or {}).get('spec') or {}
+        c = next((c for c in pod.get('containers') or [] if c.get('name') == row), None)
+        var = type_env_var(nf_type)
+        got = k8s_env(c or {}).get(var)
+        if got != want:
+            errors.append('%s: Deployment %s-%s pins %s=%r, not the table\'s %s'
+                          % (where, release, row, var, got, want))
+        if nf_type != 'NRF' and (spec.get('replicas') != 1
+                                 or (spec.get('strategy') or {}).get('type') != 'Recreate'):
+            errors.append('%s: Deployment %s-%s must run one pod, strategy Recreate (one '
+                          'nfInstanceId, one certificate)' % (where, release, row))
+    if version is None:
+        return errors + check_k8s(table, where, docs)
+    for name, d in sorted(deps.items()):
+        row = name[len(release) + 1:]
+        for v in ((d.get('spec') or {}).get('template') or {}).get('spec', {}).get('volumes') or []:
+            sn = (v.get('secret') or {}).get('secretName') or ''
+            if sn.startswith('nf-tls-') and sn != 'nf-tls-%s-%s' % (row, version):
+                errors.append('%s: Deployment %s mounts %s, not nf-tls-%s-%s'
+                              % (where, name, sn, row, version))
+    return errors
+
+
+def helm_template(release, sets):
+    import subprocess
+    args = ['helm', 'template', release, HELM_CHART, '-n', 'ns']
+    for x in sets:
+        args += ['--set', x]
+    return subprocess.run(args, capture_output=True, text=True)
+
+
+HELM_REFUSALS = [
+    (['global.siteId='], 'global.siteId is empty'),
+    (['global.siteId=ci', 'global.sbi.scheme=http'], 'the NRF serves TLS only'),
+    (['global.siteId=ci', 'global.nrfTls.secretVersion=v1'], 'is not the 16 hex digits'),
+    (['global.siteId=ci', 'udm.nfInstanceId=UDM-1'], 'is not a lower-case UUID version 4'),
+    (['global.siteId=ci', 'ausf.replicas=2'], 'ausf.replicas > 1 is not supported'),
+    (['global.siteId=ci', 'amf.replicas=2'], 'amf.replicas > 1 is not supported'),
+    (['global.siteId=ci', 'nrf.replicas=2'], 'nrf.replicas > 1 is not supported'),
+]
+
+
+def helm_checks(table):
+    """Rule 7 over the chart: two renders and the refusals."""
+    errors = []
+    types = {row: t for row, (t, _) in table.items()}
+    for sets, version in ((['global.siteId=ci'], None),
+                          (['global.siteId=ci', 'global.nrfTls.secretVersion=' + HELM_VERSION],
+                           HELM_VERSION)):
+        r = helm_template(HELM_RELEASE, sets)
+        if r.returncode != 0:
+            errors.append('helm template %s failed:\n%s' % (' '.join(sets), r.stderr))
+            continue
+        docs = [x for x in yaml.safe_load_all(r.stdout) if isinstance(x, dict)]
+        errors += check_helm(HELM_RELEASE, docs, version, types, ('ci', 'ns'))
+    for sets, needle in HELM_REFUSALS:
+        r = helm_template(HELM_RELEASE, sets)
+        if r.returncode == 0:
+            errors.append('helm template --set %s rendered; it must fail (%s)'
+                          % (' --set '.join(sets), needle))
+        elif needle not in r.stderr:
+            errors.append('helm template --set %s failed for another reason: %s'
+                          % (' --set '.join(sets), r.stderr.strip()))
+    # Rule 5 over the rendered chart, NOTES included: a templated URL
+    # (http://{{ ... }}/nnrf-...) is only recognisable once rendered, and
+    # `helm template` does not render NOTES.txt.
+    import subprocess
+    r = subprocess.run(['helm', 'install', '--dry-run=client', HELM_RELEASE, HELM_CHART,
+                        '-n', 'ns', '--set', 'global.siteId=ci'], capture_output=True, text=True)
+    if r.returncode != 0:
+        errors.append('helm install --dry-run=client failed:\n%s' % r.stderr)
+    else:
+        errors += plaintext_nrf_uris('helm install --dry-run=client (manifests and NOTES)',
+                                     r.stdout)
+    # An empty siteId is fine once nothing is derived.
+    pins = ['%s.nfInstanceId=6b1d7e3c-0000-4000-8000-%012x' % (nf, i) for i, nf in enumerate(
+        'nrf amf smf ausf udm udr pcf nssf bsf'.split())]
+    r = helm_template(HELM_RELEASE, ['global.siteId='] + pins)
+    if r.returncode != 0:
+        errors.append('helm template with every nfInstanceId pinned and no siteId failed:\n%s'
+                      % r.stderr)
+    return errors
+
+
 def self_test():
     table = {'amf': ('AMF', 'a'), 'scp': ('SCP', 's'), 'ees': ('AF', 'e')}
     ok = {DEFAULT_STACK: {'services': {
@@ -629,6 +788,53 @@ def self_test():
     for edit, needle in cases6:
         errs = broken6(edit)
         assert any(needle in e for e in errs), (needle, errs)
+    # Rule 7: a Helm render, as rule 6 plus the rendered identity table.
+    t7 = {'amf': t6['amf'], 'nrf': t6['nrf']}
+    ids = {'kind': 'ConfigMap', 'metadata': {'name': 'r-nf-identities'}, 'data': {
+        'nf-identities.txt': ''.join('%s %s %s -\n' % (k, v[0], v[1]) for k, v in t7.items())}}
+    good7 = copy.deepcopy(good6[:3]) + [ids]
+    good7[1]['metadata']['name'] = 'r-amf'
+    good7[1]['spec'].update(replicas=1, strategy={'type': 'Recreate'})
+    good7[2]['metadata']['name'] = 'r-nrf'
+    assert check_helm('r', good7) == [], check_helm('r', good7)
+    versioned = copy.deepcopy(good7)
+    for d in versioned[1:3]:
+        v = d['spec']['template']['spec']['volumes'][0]['secret']
+        v['secretName'] += '-' + HELM_VERSION
+    assert check_helm('r', versioned, HELM_VERSION) == [], check_helm('r', versioned, HELM_VERSION)
+
+    def broken7(edit, version=None):
+        docs = copy.deepcopy(versioned if version else good7)
+        edit(docs)
+        return check_helm('r', docs, version)
+    amf7 = lambda d: d[1]['spec']['template']['spec']['containers'][0]['env'][0]
+    cases7 = [
+        (lambda d: amf7(d).update(name='NEXTGCORE_SMF_INSTANCE_ID'), None,
+         'pins NEXTGCORE_AMF_INSTANCE_ID=None'),
+        (lambda d: d[1]['spec'].pop('strategy'), None, 'strategy Recreate'),
+        (lambda d: d[1]['spec'].update(replicas=2), None, 'one pod'),
+        (lambda d: d[1]['metadata'].update(name='r-amf2'), None, 'no Deployment r-amf'),
+        (lambda d: d[3]['data'].update({'nf-identities.txt': 'amf AMF %s -\nnrf NRF %s -\n'
+                                        % (t6['amf'][1], t6['amf'][1])}), None, 'repeated'),
+        (lambda d: d[3]['data'].update({'nf-identities.txt': 'amf AMF not-a-uuid -\n'}), None,
+         'malformed'),
+        (lambda d: d.pop(3), None, 'no ConfigMap r-nf-identities'),
+        (lambda d: amf7(d).update(value=t6['nrf'][1]), None, 'pins NEXTGCORE_AMF_INSTANCE_ID'),
+        (lambda d: d[1]['spec']['template']['spec'].pop('securityContext'), None, 'fsGroup'),
+        (lambda d: d[2]['spec']['template']['spec']['volumes'][0]['secret'].update(
+            secretName='nf-tls-amf-' + HELM_VERSION), HELM_VERSION, 'mounts nf-tls-amf-'),
+        (lambda d: d[1]['spec']['template']['spec']['volumes'][0]['secret'].update(
+            secretName='nf-tls-amf'), HELM_VERSION, 'mounts nf-tls-amf, not'),
+    ]
+    for edit, version, needle in cases7:
+        errs = broken7(edit, version)
+        assert any(needle in e for e in errs), (needle, errs)
+    errs = check_helm('r', good7, types={'amf': 'SMF', 'nrf': 'NRF'})
+    assert any('registers as SMF' in e for e in errs), errs
+    errs = check_helm('r', good7, derived=('s', 'ns'))
+    assert any('is not the derivation' in e for e in errs), errs
+    # The derivation of #753 (the AMF ID a release already registered).
+    assert helm_derived_id('ci', 'default', 't', 'amf') == '03380045-d486-4346-85eb-95c03918bf9f'
     print('check-nf-identities self-test: ok')
 
 
@@ -636,7 +842,8 @@ def main(argv):
     if argv[1:] == ['--self-test']:
         self_test()
         return 0
-    if argv[1:] not in ([], ['--k8s']):
+    flags = set(argv[1:])
+    if not flags <= {'--k8s', '--helm'} or len(flags) != len(argv[1:]):
         print(__doc__, file=sys.stderr)
         return 2
     table = read_table(TABLE)
@@ -660,16 +867,18 @@ def main(argv):
     for path in shipped:
         with open(path, encoding='utf-8', errors='replace') as f:
             errors += plaintext_nrf_uris(os.path.relpath(path, COMPOSE_DIR), f.read())
-    k8s_files = sorted(p for d in K8S_DIRS
+    k8s_files = sorted(p for d in K8S_DIRS + (HELM_DIR,)
                        for p in glob.glob(os.path.join(REPO_DIR, d, '**', '*'), recursive=True)
                        if os.path.isfile(p) and not p.endswith('.dryrun.yaml')
                        and '.dryrun.' not in os.path.basename(p))
     for path in k8s_files:
         with open(path, encoding='utf-8', errors='replace') as f:
             errors += plaintext_nrf_uris(os.path.relpath(path, REPO_DIR), f.read())
-    renders = k8s_renders() if argv[1:] == ['--k8s'] else {}
+    renders = k8s_renders() if '--k8s' in flags else {}
     for d, docs in sorted(renders.items()):
         errors += check_k8s(table, d, docs)
+    if '--helm' in flags:
+        errors += helm_checks(table)
     for e in errors:
         print('check-nf-identities: ' + e, file=sys.stderr)
     if errors:
@@ -680,6 +889,10 @@ def main(argv):
     if renders:
         print('check-nf-identities: %d rendered kustomizations mount only their own nf-tls '
               'Secrets' % len(renders))
+    if '--helm' in flags:
+        print('check-nf-identities: the Helm chart pins the IDs of its rendered identity table, '
+              'mounts only each NF\'s own nf-tls Secret and refuses %d bad value sets'
+              % len(HELM_REFUSALS))
     return 0
 
 

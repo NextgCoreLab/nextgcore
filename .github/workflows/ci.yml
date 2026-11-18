@@ -606,9 +606,13 @@ jobs:
         run: |
           set -euo pipefail
           python3 docker/rust/certs/check-nf-identities.py --self-test
-          python3 docker/rust/certs/check-nf-identities.py --k8s
+          # --helm: the chart pins the IDs of its rendered identity table and
+          # mounts each NF's own Secret, and refuses an empty siteId (#1617 d3).
+          python3 docker/rust/certs/check-nf-identities.py --k8s --helm
           # k8s/nf-tls-secrets.sh against a fake kubectl: idempotent, a refused
-          # or failed or interrupted issue leaves the CA in use untouched (#1617).
+          # or failed or interrupted issue leaves the CA in use untouched, the
+          # Helm wrapper issues the IDs the chart pins, and --prune deletes
+          # only unreferenced versions (#1617).
           bash k8s/test-nf-tls-secrets.sh
           out="$(mktemp -d)"
           bash docker/rust/certs/generate-dev-certs.sh --out "$out" >/dev/null
