@@ -2849,8 +2849,22 @@ pub async fn call_amf_registration_status_update(
          {ue_context_id} (transferStatus={status})"
     );
 
-    let client = peer_client(nextgcore_sbi::types::NfType::Amf, peer_host, peer_port);
+    // #1820: its own, short request timeout, so an update queued behind one to an
+    // unreachable old AMF waits [`REGISTRATION_STATUS_UPDATE_TIMEOUT`], not the
+    // 30 s client default.
+    let client = crate::attach_oauth2(
+        SbiClient::new(
+            nextgcore_sbi::security::sbi_peer_client_config(peer_host, peer_port)
+                .with_max_response_body(max_response_body_for(nextgcore_sbi::types::NfType::Amf))
+                .with_connect_timeout(REGISTRATION_STATUS_UPDATE_TIMEOUT)
+                .with_request_timeout(REGISTRATION_STATUS_UPDATE_TIMEOUT),
+        ),
+        nextgcore_sbi::types::NfType::Amf,
+    );
 
+    // #1820: a transport failure or timeout is `RequestFailed` (the old AMF may or
+    // may not have the request), and an answer that is not a 2xx is `PeerStatus`
+    // (it answered, so it did not apply it late), so the caller can tell them apart.
     let response = client
         .post_json(
             &format!("/namf-comm/v1/ue-contexts/{ue_context_id}/transfer-update"),
@@ -2862,13 +2876,22 @@ pub async fn call_amf_registration_status_update(
         })?;
 
     if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "peer AMF returned status {} for RegistrationStatusUpdate of {ue_context_id}",
-            response.status
-        )));
+        return Err(SbiError::PeerStatus {
+            what: format!("RegistrationStatusUpdate of {ue_context_id}"),
+            status: response.status,
+            retry_after: None,
+        });
     }
     Ok(())
 }
+
+/// #1820: the connect and request timeout of a RegistrationStatusUpdate.
+#[cfg(not(test))]
+pub(crate) const REGISTRATION_STATUS_UPDATE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+#[cfg(test)]
+pub(crate) const REGISTRATION_STATUS_UPDATE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(1000);
 
 // ============================================================================
 // Nlmf_Location consumer (#74, TS 29.518 §5.5.2.2 / TS 23.273 §6.1)
