@@ -1768,6 +1768,35 @@ pub struct PolicyBinding {
     /// Default (no instance) for a config-default or `PCF_URI` session and for a
     /// binding from before, which then admits any verified PCF.
     pub sm_policy_pcf: crate::policy::PcfIdentity,
+    /// The AMF said the UE is unreachable (#1707, TS 23.502 §4.2.3.3 step 3c), and
+    /// this session holds the record: while it does, a Downlink Data Report pages
+    /// nothing (step 3a), for this session or, when it is UE-wide, for any session of
+    /// the UE. Held in memory only, like `network_paging`: after a restart the SMF
+    /// pages again, and the AMF answers again.
+    #[serde(skip)]
+    pub ue_unreachable: Option<UeUnreachable>,
+}
+
+/// The AMF's indication that a UE is unreachable (#1707, TS 23.502 §4.2.3.3 step 3c),
+/// and what the SMF did about it: the step 3c policy toward the UPF, and the
+/// Namf_EventExposure REACHABILITY_REPORT subscription it waits on.
+#[derive(Debug, Clone)]
+pub struct UeUnreachable {
+    /// From a 504 UE_NOT_REACHABLE (the UE is not reachable for paging): every
+    /// session of the UE. A failure notification with UE_NOT_REACHABLE_FOR_SESSION
+    /// names this non-3GPP session only (TS 29.518 Table 6.1.6.3.x), so `false`.
+    pub ue_wide: bool,
+    /// The token in the subscription's `eventNotifyUri`
+    /// (`{ref}/ue-reachability/{token}`). One per record, so a notification for a
+    /// record already cleared changes nothing.
+    pub notify_token: nextgcore_sbi::callback_auth::CallbackToken,
+    /// The serving AMF the subscription is created at, as its `smContextStatusUri`.
+    pub amf_uri: String,
+    /// The AMF's `subscriptionId`, once it answered the subscription.
+    pub subscription_id: Option<String>,
+    /// The step 3c Apply Action the downlink FAR was set to, once the UPF took it;
+    /// `None` while it buffers and notifies as before.
+    pub upf_action: Option<u16>,
 }
 
 /// A network-triggered paging in progress (#1631): what step 3a's re-paging rule
@@ -1827,6 +1856,10 @@ pub enum SessionCallback {
     N1n2TransferFailure,
     /// The EASDF's DNS message report (TS 23.548 §6.2.3.2.2), #1518.
     EasdfDnsReport,
+    /// The AMF's Namf_EventExposure REACHABILITY_REPORT notification (TS 29.518
+    /// §5.3.2.4.1), #1707: the `eventNotifyUri` of the subscription a UE-unreachable
+    /// record waits on.
+    UeReachabilityNotify,
 }
 
 impl PolicyBinding {
@@ -1850,6 +1883,13 @@ impl PolicyBinding {
                     self.easdf_report_token
                         .as_ref()
                         .is_some_and(|held| held.matches(token))
+                });
+            }
+            SessionCallback::UeReachabilityNotify => {
+                return presented.is_some_and(|token| {
+                    self.ue_unreachable
+                        .as_ref()
+                        .is_some_and(|u| u.notify_token.matches(token))
                 });
             }
             SessionCallback::N1n2TransferFailure => {
@@ -1908,6 +1948,7 @@ impl PolicyBinding {
             network_paging: None,
             easdf_report_token: None,
             sm_policy_pcf: crate::policy::PcfIdentity::default(),
+            ue_unreachable: None,
         }
     }
 }
