@@ -1265,7 +1265,8 @@ fn drop_restored_self_entry() -> bool {
     match nf_manager().deregister(nrf_instance_id()) {
         Ok(_) => {
             log::info!(
-                "nrfd-187: removed the NRF's own entry {} restored from the state file;                  this configuration does not register the NRF in its own registry",
+                "nrfd-187: removed the NRF's own entry {} restored from the state file; \
+                 this configuration does not register the NRF in its own registry",
                 nrf_instance_id()
             );
             true

@@ -13,11 +13,15 @@ use std::time::Duration;
 
 use crate::server::{SbiServer, SbiServerConfig};
 
+/// The shipped dev PKI for tests that run a real nrfd (#1617): issues private
+/// keys, so never in a production build.
+#[cfg(any(test, feature = "test-support"))]
 mod dev_pki;
 mod nf_process;
 /// Token-minting OAuth2 stand-ins: never in a production build.
 #[cfg(any(test, feature = "test-support"))]
 pub mod oauth2;
+#[cfg(any(test, feature = "test-support"))]
 pub use dev_pki::DevPki;
 pub use nf_process::{claim_port, free_port_on, spawn_port, NfProcess, NfSpawn, ADDR_IN_USE};
 
