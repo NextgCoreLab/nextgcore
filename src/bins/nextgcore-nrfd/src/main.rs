@@ -5080,7 +5080,7 @@ async fn handle_access_token_request_with_policy(
     let nf_instance_id = req.nf_instance_id;
     let nf_type = req.nf_type;
     let mut target_nf_type = req.target_nf_type;
-    let target_nf_instance_id = req.target_nf_instance_id;
+    let mut target_nf_instance_id = req.target_nf_instance_id;
 
     // RFC 6749 §5.2 error responses, carried as TS 29.510 AccessTokenErr.
     if req.grant_type != "client_credentials" {
@@ -5169,7 +5169,17 @@ async fn handle_access_token_request_with_policy(
             &target_nf_instance_id,
             &req.scope,
         ) {
-            Ok(consumer) => consumer,
+            Ok(consumer) => {
+                // #1750: this grant was authorized on "the target is THIS NRF", so
+                // the exact producer instance is known, and TS 29.510 Table
+                // 6.3.5.2.4-1 then makes `aud` "the NF service producer's NF
+                // instance ID(s) (if the exact NF instance(s) ... is known)", not
+                // the NF type: pin the target to this NRF, so the token names
+                // this NRF's instance and no other NRF trusting this issuer
+                // (another NRF of a set, a peer in the PLMN) accepts it.
+                target_nf_instance_id = nrf_instance_id().to_string();
+                consumer
+            }
             Err(why) => {
                 return token_error(
                     "invalid_client",
@@ -9936,7 +9946,7 @@ mod tests {
     }
 
     /// [`mint_nrf_token`] with any `aud` and `scope`.
-    fn mint_nrf_token_with(
+    pub(super) fn mint_nrf_token_with(
         sub: &str,
         aud: &serde_json::Value,
         scope: &str,
@@ -12801,6 +12811,107 @@ mod nrf_api_tokens_tests_1667 {
                 assert!(err.contains("NF types of its client certificate"), "{err}");
             }
         }
+    }
+
+    /// The claims of a token the endpoint answered with.
+    fn claims_of(resp: &SbiResponse) -> (String, serde_json::Value) {
+        use base64::Engine;
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap();
+        let token = v["access_token"]
+            .as_str()
+            .expect("access_token")
+            .to_string();
+        let payload = token.split('.').nth(1).expect("JWS payload");
+        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .expect("base64url");
+        (token, serde_json::from_slice(&claims).expect("claims JSON"))
+    }
+
+    /// #1750: the bootstrap grant is authorized on "the target is this NRF", so
+    /// the exact producer is known and `aud` is this NRF's instance ID (TS 29.510
+    /// Table 6.3.5.2.4-1), however the target was named: by `targetNfType: NRF`
+    /// or by this NRF's instance ID. The gate admits it; a token naming another
+    /// NRF's instance, or the NRF type of a peer set, is not one for this NRF
+    /// unless it names this instance or the type. A registered consumer asking
+    /// by type still gets the type: its producer set is every registered NRF.
+    ///
+    /// REVERT-VERIFIED: without the pin in `handle_access_token_request`, the
+    /// `targetNfType: NRF` grant has `aud: "NRF"` and the first assertion names it.
+    #[tokio::test]
+    async fn the_bootstrap_token_names_this_nrf_instance_as_audience_1750() {
+        let _self_entry = self_entry_test_lock().lock().await;
+        let id = "1750c0c0-0000-4000-8000-00000000000c";
+        assert!(nf_manager().get(id).is_none(), "unregistered");
+        let policy = NrfPolicy::default();
+        let jwks = nrf_jwks_json();
+        let nfm = format!("/nnrf-nfm/v1/nf-instances/{id}");
+        for target in [
+            json!({"targetNfType": "NRF"}),
+            json!({"targetNfInstanceId": nrf_instance_id()}),
+            json!({"targetNfType": "NRF", "targetNfInstanceId": nrf_instance_id()}),
+        ] {
+            let resp = handle_access_token_request_with_policy(
+                &token_req(id, "AMF", target.clone(), "nnrf-nfm", Some((id, &["AMF"]))),
+                &policy,
+            )
+            .await;
+            assert_eq!(resp.status, 200, "{target}: {}", error_of(&resp));
+            let (token, claims) = claims_of(&resp);
+            assert_eq!(
+                claims["aud"],
+                json!([nrf_instance_id()]),
+                "{target}: the bootstrap token's audience is this NRF instance"
+            );
+            assert_eq!(claims["sub"], json!(id));
+            let sub = oauth2_gate(&nfm, Some(&format!("Bearer {token}")), true, &jwks)
+                .unwrap_or_else(|r| panic!("{target}: gate refused {}", r.status));
+            assert_eq!(sub.as_deref(), Some(id));
+        }
+        assert!(nf_manager().get(id).is_none(), "a token registers nothing");
+
+        // Another NRF's instance ID: signed by this NRF's key, still not a token
+        // for this NRF.
+        let other_nrf = "1750eeee-0000-4000-8000-0000000000f0";
+        let foreign = super::tests::mint_nrf_token_with(id, &json!([other_nrf]), "nnrf-nfm", 3600);
+        let refused = *oauth2_gate(&nfm, Some(&format!("Bearer {foreign}")), true, &jwks)
+            .expect_err("another NRF's audience");
+        assert_eq!(refused.status, 403, "{:?}", refused.http.content);
+        assert!(
+            refused
+                .http
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("ACCESS_TOKEN_CLAIM_MISMATCH"),
+            "{:?}",
+            refused.http.content
+        );
+
+        // A registered consumer asking by type: unchanged, the NF type.
+        let registered = "1750d0d0-0000-4000-8000-00000000000d";
+        nf_manager()
+            .register(
+                NfProfile::from_json(&json!({"nfInstanceId": registered, "nfType": "AMF",
+                    "nfStatus": "REGISTERED"}))
+                .expect("profile"),
+            )
+            .expect("stored");
+        let resp = handle_access_token_request_with_policy(
+            &token_req(
+                registered,
+                "AMF",
+                json!({"targetNfType": "NRF"}),
+                "nnrf-nfm",
+                Some((registered, &["AMF"])),
+            ),
+            &policy,
+        )
+        .await;
+        nf_manager().deregister(registered).ok();
+        assert_eq!(resp.status, 200, "{}", error_of(&resp));
+        assert_eq!(claims_of(&resp).1["aud"], json!("NRF"));
     }
 }
 
